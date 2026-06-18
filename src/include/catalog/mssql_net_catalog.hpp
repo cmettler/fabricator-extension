@@ -1,0 +1,64 @@
+//===----------------------------------------------------------------------===//
+//                         mssql_net — catalog
+//===----------------------------------------------------------------------===//
+
+#pragma once
+
+#include "arrownet/abi.h"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/common/case_insensitive_map.hpp"
+#include "duckdb/common/mutex.hpp"
+
+namespace duckdb {
+
+class MssqlNetSchemaEntry;
+
+//! Read-only catalog backed by a SQL Server connection (via the C# bridge).
+//! Owns the bridge catalog handle for its lifetime.
+class MssqlNetCatalog : public Catalog {
+public:
+	MssqlNetCatalog(AttachedDatabase &db, string internal_name, ArrowNetHandle handle, string db_path);
+	~MssqlNetCatalog() override;
+
+	//! Discovers schemas + tables from SQL Server (called once at attach time).
+	void LoadCatalog(ClientContext &context);
+
+	//! Re-discovers schemas + tables and drops cached entries (so out-of-band DDL
+	//! via mssql_net_exec becomes visible). Backs mssql_refresh_cache().
+	void RefreshCache(ClientContext &context);
+
+	ArrowNetHandle GetHandle() const {
+		return handle_;
+	}
+
+	void Initialize(bool load_builtin) override;
+	string GetCatalogType() override;
+
+	optional_ptr<CatalogEntry> CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) override;
+	optional_ptr<SchemaCatalogEntry> LookupSchema(CatalogTransaction transaction,
+	                                              const EntryLookupInfo &schema_lookup,
+	                                              OnEntryNotFound if_not_found) override;
+	void ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) override;
+
+	PhysicalOperator &PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
+	                                    LogicalCreateTable &op, PhysicalOperator &plan) override;
+	PhysicalOperator &PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,
+	                             optional_ptr<PhysicalOperator> plan) override;
+	PhysicalOperator &PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,
+	                             PhysicalOperator &plan) override;
+	PhysicalOperator &PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
+	                             PhysicalOperator &plan) override;
+
+	DatabaseSize GetDatabaseSize(ClientContext &context) override;
+	bool InMemory() override;
+	string GetDBPath() override;
+	void DropSchema(ClientContext &context, DropInfo &info) override;
+
+private:
+	ArrowNetHandle handle_;
+	string db_path_;
+	mutex schema_lock_;
+	case_insensitive_map_t<unique_ptr<MssqlNetSchemaEntry>> schemas_;
+};
+
+} // namespace duckdb

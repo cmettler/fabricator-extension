@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <RootNamespace>ArrowNet.SqlServer</RootNamespace>
+    <AssemblyName>ArrowNet.SqlServer</AssemblyName>
+    <Description>
+      SQL Server backend for the ArrowNet bridge: executes T-SQL via
+      Microsoft.Data.SqlClient and streams results to DuckDB as Apache Arrow.
+      This is the composition root published beside the mssql_net extension.
+    </Description>
+    <!-- This assembly is the published "app" the CoreCLR host initializes against. -->
+    <GenerateRuntimeConfigurationFiles>true</GenerateRuntimeConfigurationFiles>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\ArrowNet.Bridge\ArrowNet.Bridge.csproj" />
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="6.0.2" />
+  </ItemGroup>
+
+</Project>

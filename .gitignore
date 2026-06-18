@@ -1,0 +1,34 @@
+# Build output
+/build/
+build/
+cmake-build-*/
+
+# .NET
+[Bb]in/
+[Oo]bj/
+*.user
+
+# DuckDB / extension submodules (added via .gitmodules; checkouts not committed)
+/duckdb/
+/extension-ci-tools/
+
+# Local managed publish placed next to the extension
+**/arrownet/
+
+# Python scaffold leftovers (uv) — superseded by the C++/C# project
+__pycache__/
+*.py[oc]
+dist/
+wheels/
+*.egg-info
+.venv/
+
+# mssql-extension compatibility corpus — generated from the sibling mssql-extension
+# repo by scripts/gen_mssqlcompat_tests.sh (not committed; regenerate on demand).
+/test/mssqlcompat/
+
+# Editor / tooling (machine-local)
+.vscode/
+.serena/
+.DS_Store
+*.swp

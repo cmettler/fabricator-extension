@@ -1,0 +1,48 @@
+# name: test/verify_filter_pushdown.test
+# description: Verify filter pushdown emits a parameterized WHERE to SQL Server (best-effort)
+# group: [mssql_net]
+
+require mssql_net
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql_net);
+
+# Numeric equality pushes down + returns the correct row.
+query T
+SELECT name FROM db.dbo.TestSimplePK WHERE id = 1;
+----
+First Record
+
+# String equality is superset-safe (SQL collation is looser); DuckDB re-checks exactly.
+query I
+SELECT id FROM db.dbo.TestSimplePK WHERE name = 'First Record';
+----
+1
+
+# Range + AND pushes; correctness must hold (DuckDB re-applies). Partition identity:
+query I
+SELECT (CASE WHEN
+  (SELECT count(*) FROM db.dbo.TestSimplePK WHERE id >= 2)
+  = (SELECT count(*) FROM db.dbo.TestSimplePK) - (SELECT count(*) FROM db.dbo.TestSimplePK WHERE id < 2)
+  THEN 1 ELSE 0 END);
+----
+1
+
+# Proof the WHERE reached SQL Server as a parameterized statement on TestSimplePK.
+query I
+SELECT pushed FROM mssql_net_query('db',
+  'SELECT CAST(CASE WHEN EXISTS (
+     SELECT 1 FROM sys.dm_exec_query_stats qs
+     CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
+     WHERE CHARINDEX(''FROM [dbo].[TestSimplePK]'', st.text) > 0
+       AND CHARINDEX(''WHERE'', st.text) > 0
+       AND CHARINDEX(''@p0'', st.text) > 0
+       AND CHARINDEX(''dm_exec'', st.text) = 0
+   ) THEN 1 ELSE 0 END AS INT) AS pushed');
+----
+1
+
+statement ok
+DETACH db;

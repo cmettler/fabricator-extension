@@ -1,0 +1,452 @@
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using Apache.Arrow;
+using Apache.Arrow.C;
+using Apache.Arrow.Ipc;
+
+namespace ArrowNet.Bridge;
+
+/// <summary>
+/// Native entry point of the managed bridge. The C++ host loads this assembly
+/// via hostfxr and calls <see cref="Initialize"/> to populate the
+/// <c>ArrowNetVTable</c> with function pointers to the static methods below.
+/// All boundary methods are <c>[UnmanagedCallersOnly]</c> (cdecl) and never let
+/// exceptions cross the ABI — they translate failures into a status code plus an
+/// owned UTF-8 error string.
+/// </summary>
+public static unsafe class Bootstrap
+{
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    public static int Initialize(ArrowNetVTable* vtable, int size)
+    {
+        // Guard against a host built against a newer/larger struct than we know.
+        if (vtable is null || size < sizeof(ArrowNetVTable))
+        {
+            return ArrowNetStatus.InvalidArgument;
+        }
+
+        vtable->AbiVersion = 12;
+        vtable->OpenCatalog = &OpenCatalog;
+        vtable->CloseCatalog = &CloseCatalog;
+        vtable->ExecuteQuery = &ExecuteQuery;
+        vtable->FreeError = &FreeError;
+        vtable->ExecuteDml = &ExecuteDml;
+        vtable->BulkInsert = &BulkInsert;
+        vtable->ExecuteDelete = &ExecuteDelete;
+        vtable->ExecuteUpdate = &ExecuteUpdate;
+        vtable->GetMetadata = &GetMetadata;
+        vtable->ScanTable = &ScanTable;
+        vtable->CreateTable = &CreateTable;
+        vtable->DropTable = &DropTable;
+        vtable->CreateSchema = &CreateSchema;
+        vtable->DropSchema = &DropSchema;
+        vtable->AlterTable = &AlterTable;
+        vtable->BeginTransaction = &BeginTransaction;
+        vtable->CommitTransaction = &CommitTransaction;
+        vtable->RollbackTransaction = &RollbackTransaction;
+        vtable->InsertReturning = &InsertReturning;
+        return ArrowNetStatus.Ok;
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int OpenCatalog(byte* conn, nint* outHandle, byte** err)
+    {
+        try
+        {
+            if (outHandle is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            var connStr = Marshal.PtrToStringUTF8((nint)conn) ?? string.Empty;
+            var catalog = BackendRegistry.Active.OpenCatalog(connStr);
+            *outHandle = Handles.Alloc(catalog);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static void CloseCatalog(nint handle) => Handles.Free(handle);
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int ExecuteQuery(nint handle, byte* sql, CArrowArrayStream* outStream, byte** err)
+    {
+        try
+        {
+            if (outStream is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+            var query = Marshal.PtrToStringUTF8((nint)sql) ?? string.Empty;
+
+            IArrowArrayStream stream = catalog.ExecuteQuery(query);
+            CArrowArrayStreamExporter.ExportArrayStream(stream, outStream);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int ExecuteDml(nint handle, byte* sql, long* affected, byte** err)
+    {
+        try
+        {
+            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+            var statement = Marshal.PtrToStringUTF8((nint)sql) ?? string.Empty;
+            long rows = catalog.ExecuteNonQuery(statement);
+            if (affected is not null)
+            {
+                *affected = rows;
+            }
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int BulkInsert(nint handle, byte* schema, byte* table, int createTable, int replace,
+                                  CArrowArrayStream* input, long* affected, byte** err)
+    {
+        try
+        {
+            if (input is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
+
+            // We take ownership of the C stream (consume + release on dispose).
+            var stream = CArrowArrayStreamImporter.ImportArrayStream(input);
+            long rows = catalog.BulkInsert(schemaName, tableName, stream, createTable != 0, replace != 0);
+            if (affected is not null)
+            {
+                *affected = rows;
+            }
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int ExecuteDelete(nint handle, byte* schema, byte* table, CArrowArrayStream* keys, long* affected,
+                                     byte** err)
+    {
+        try
+        {
+            if (keys is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
+            var stream = CArrowArrayStreamImporter.ImportArrayStream(keys);
+            long rows = catalog.ExecuteDelete(schemaName, tableName, stream);
+            if (affected is not null)
+            {
+                *affected = rows;
+            }
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int ExecuteUpdate(nint handle, byte* schema, byte* table, int setCount, CArrowArrayStream* data,
+                                     long* affected, byte** err)
+    {
+        try
+        {
+            if (data is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
+            var stream = CArrowArrayStreamImporter.ImportArrayStream(data);
+            long rows = catalog.ExecuteUpdate(schemaName, tableName, setCount, stream);
+            if (affected is not null)
+            {
+                *affected = rows;
+            }
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int GetMetadata(nint handle, int kind, byte* arg1, byte* arg2, CArrowArrayStream* outStream,
+                                   byte** err)
+    {
+        try
+        {
+            if (outStream is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+            var a1 = Marshal.PtrToStringUTF8((nint)arg1);
+            var a2 = Marshal.PtrToStringUTF8((nint)arg2);
+
+            IArrowArrayStream stream = catalog.GetMetadata(kind, a1, a2);
+            CArrowArrayStreamExporter.ExportArrayStream(stream, outStream);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int ScanTable(nint handle, byte* schema, byte* table, byte* specJson,
+                                 CArrowArrayStream* filterValues, CArrowArrayStream* outStream, byte** err)
+    {
+        try
+        {
+            if (outStream is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
+            var spec = Marshal.PtrToStringUTF8((nint)specJson); // null => full SELECT *
+
+            // Import the typed constant values (if any) the filter tree references.
+            IArrowArrayStream? values = filterValues is null
+                ? null
+                : CArrowArrayStreamImporter.ImportArrayStream(filterValues);
+
+            IArrowArrayStream stream = catalog.ScanTable(schemaName, tableName, spec, values);
+            CArrowArrayStreamExporter.ExportArrayStream(stream, outStream);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int CreateTable(nint handle, byte* schema, byte* table, CArrowArrayStream* columns, int ifNotExists,
+                                   byte* pkColumns, byte* uniqueColumns, byte* defaults, byte** err)
+    {
+        try
+        {
+            if (columns is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
+            var pk = Marshal.PtrToStringUTF8((nint)pkColumns);
+            var uniques = Marshal.PtrToStringUTF8((nint)uniqueColumns);
+            var defaultSpec = Marshal.PtrToStringUTF8((nint)defaults);
+
+            // We own the C stream; read its schema (the column layout) and release it.
+            using var stream = CArrowArrayStreamImporter.ImportArrayStream(columns);
+            catalog.CreateTable(schemaName, tableName, stream.Schema, ifNotExists != 0, pk, uniques, defaultSpec);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int DropTable(nint handle, byte* schema, byte* table, int ifExists, byte** err)
+    {
+        try
+        {
+            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
+            catalog.DropTable(schemaName, tableName, ifExists != 0);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int CreateSchema(nint handle, byte* schema, int ifNotExists, byte** err)
+    {
+        try
+        {
+            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            catalog.CreateSchema(schemaName, ifNotExists != 0);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int DropSchema(nint handle, byte* schema, int ifExists, byte** err)
+    {
+        try
+        {
+            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            catalog.DropSchema(schemaName, ifExists != 0);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int AlterTable(nint handle, byte* schema, byte* table, int alterKind, byte* arg1, byte* arg2,
+                                  CArrowArrayStream* column, int flags, byte** err)
+    {
+        try
+        {
+            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
+            var a1 = Marshal.PtrToStringUTF8((nint)arg1);
+            var a2 = Marshal.PtrToStringUTF8((nint)arg2);
+
+            // ADD_COLUMN / COLUMN_TYPE carry the new column's type as a one-field schema.
+            Field? columnField = null;
+            if (column is not null)
+            {
+                using var stream = CArrowArrayStreamImporter.ImportArrayStream(column);
+                columnField = stream.Schema.FieldsList.Count > 0 ? stream.Schema.FieldsList[0] : null;
+            }
+            catalog.AlterTable(alterKind, schemaName, tableName, a1, a2, columnField, flags);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int InsertReturning(nint handle, byte* schema, byte* table, CArrowArrayStream* input,
+                                       CArrowArrayStream* outStream, byte** err)
+    {
+        try
+        {
+            if (input is null || outStream is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
+
+            var rows = CArrowArrayStreamImporter.ImportArrayStream(input);
+            IArrowArrayStream returned = catalog.InsertReturning(schemaName, tableName, rows);
+            CArrowArrayStreamExporter.ExportArrayStream(returned, outStream);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int BeginTransaction(nint handle, byte** err) => RunTransactionOp(handle, c => c.BeginTransaction(), err);
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int CommitTransaction(nint handle, byte** err) => RunTransactionOp(handle, c => c.CommitTransaction(), err);
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int RollbackTransaction(nint handle, byte** err) => RunTransactionOp(handle, c => c.RollbackTransaction(), err);
+
+    private static int RunTransactionOp(nint handle, Action<IBackendCatalog> op, byte** err)
+    {
+        try
+        {
+            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+            op(catalog);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static void FreeError(byte* err)
+    {
+        if (err is not null)
+        {
+            Marshal.FreeCoTaskMem((nint)err);
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void SetError(byte** err, Exception ex)
+    {
+        if (err is not null)
+        {
+            *err = (byte*)Marshal.StringToCoTaskMemUTF8(ex.Message);
+        }
+    }
+}

@@ -1,0 +1,36 @@
+# name: test/verify_projection_pushdown.test
+# description: Verify projection pushdown emits SELECT <subset> (not SELECT *) to SQL Server
+# group: [mssql_net]
+
+require mssql_net
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql_net);
+
+# A projected scan: ask for id + name only (NOT value / created_at). Correctness:
+query IT
+SELECT id, name FROM db.dbo.TestSimplePK ORDER BY id LIMIT 1;
+----
+1	First Record
+
+# Proof the projection reached SQL Server: the plan cache must contain a recent
+# statement that scans TestSimplePK selecting [name] but NOT [value]/[created_at].
+# (CHARINDEX, not LIKE, so the [] brackets are matched literally.)
+query I
+SELECT proj_ok FROM mssql_net_query('db',
+  'SELECT CAST(CASE WHEN EXISTS (
+     SELECT 1 FROM sys.dm_exec_query_stats qs
+     CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
+     WHERE CHARINDEX(''FROM [dbo].[TestSimplePK]'', st.text) > 0
+       AND CHARINDEX(''[name]'', st.text) > 0
+       AND CHARINDEX(''[value]'', st.text) = 0
+       AND CHARINDEX(''[created_at]'', st.text) = 0
+       AND CHARINDEX(''dm_exec'', st.text) = 0
+   ) THEN 1 ELSE 0 END AS INT) AS proj_ok');
+----
+1
+
+statement ok
+DETACH db;
