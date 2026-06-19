@@ -15,6 +15,8 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/storage/statistics/base_statistics.hpp"
+#include "duckdb/storage/statistics/node_statistics.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
 
 namespace duckdb {
@@ -372,12 +374,61 @@ MssqlNetTableEntry::MssqlNetTableEntry(Catalog &catalog, SchemaCatalogEntry &sch
       rowid_type_(std::move(rowid_type)) {
 }
 
+// Cardinality callback: hands the optimizer the table's approximate row count so
+// join ordering has a real estimate. Unknown (-1) => no statistics reported.
+static unique_ptr<NodeStatistics> MssqlNetScanCardinality(ClientContext &context, const FunctionData *bind_data_p) {
+	auto &bind_data = bind_data_p->Cast<arrownet::ArrowStreamBindData>();
+	if (bind_data.row_count < 0) {
+		return nullptr;
+	}
+	return make_uniq<NodeStatistics>(static_cast<idx_t>(bind_data.row_count));
+}
+
+// Per-column statistics callback: reports ONLY the distinct-value estimate (NDV) for
+// the optimizer's selectivity. min/max is deliberately left UNKNOWN (CreateUnknown):
+// DuckDB prunes filters on min/max (FILTER_ALWAYS_FALSE), and SQL Server's sampled,
+// possibly-stale stats are not exact bounds on a live table — so reporting them could
+// drop rows. NDV only affects cardinality estimation, never correctness.
+static unique_ptr<BaseStatistics> MssqlNetScanStatistics(ClientContext &context, const FunctionData *bind_data_p,
+                                                         column_t column_index) {
+	auto &bind_data = bind_data_p->Cast<arrownet::ArrowStreamBindData>();
+	if (column_index >= bind_data.column_ndv.size() || bind_data.column_ndv[column_index] <= 0 ||
+	    column_index >= bind_data.return_types.size()) {
+		return nullptr;
+	}
+	auto stats = BaseStatistics::CreateUnknown(bind_data.return_types[column_index]);
+	stats.SetDistinctCount(static_cast<idx_t>(bind_data.column_ndv[column_index]));
+	return make_uniq<BaseStatistics>(std::move(stats));
+}
+
 TableFunction MssqlNetTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) {
 	auto data = make_uniq<arrownet::ArrowStreamBindData>();
 	auto handle = handle_;
 	// The managed side builds the provider SELECT for the whole table.
 	string schema_name = schema.name;
 	string table_name = name;
+
+	// Approximate row count for the optimizer (fetched once, cached on the entry).
+	// A stats failure (e.g. missing VIEW DATABASE STATE) must not break the scan.
+	if (row_count_ == -2) {
+		try {
+			row_count_ = FetchRowCount(handle_, schema_name, table_name);
+		} catch (...) {
+			row_count_ = -1;
+		}
+	}
+	data->row_count = row_count_;
+
+	// Per-column NDV for selectivity (fetched once, cached). Best-effort: a stats
+	// failure leaves all columns unknown. Aligned to the column order by name.
+	if (!ndv_fetched_) {
+		ndv_fetched_ = true;
+		try {
+			column_ndv_ = FetchColumnNdv(handle_, schema_name, table_name);
+		} catch (...) {
+			column_ndv_.clear();
+		}
+	}
 	data->factory = [handle, schema_name, table_name](const arrownet::ArrowScanRequest &req, ArrowArrayStream &out) {
 		arrownet::ScanTable(handle, schema_name, table_name, req.spec_json, req.filter_values, out);
 	};
@@ -387,6 +438,15 @@ TableFunction MssqlNetTableEntry::GetScanFunction(ClientContext &context, unique
 	vector<LogicalType> return_types;
 	vector<string> names;
 	arrownet::PopulateReturnSchema(context, *data, return_types, names);
+
+	// Align the cached NDV map to the column order (parallel to names; -1 = unknown).
+	data->column_ndv.assign(data->names.size(), -1);
+	for (idx_t i = 0; i < data->names.size(); i++) {
+		auto it = column_ndv_.find(data->names[i]);
+		if (it != column_ndv_.end()) {
+			data->column_ndv[i] = it->second;
+		}
+	}
 
 	// Propagate rowid info so the scan can synthesize the rowid column.
 	data->rowid_source_columns = rowid_columns_;
@@ -403,6 +463,8 @@ TableFunction MssqlNetTableEntry::GetScanFunction(ClientContext &context, unique
 	// filter_pushdown stays false (its TableFilterSet path removes filters from the
 	// plan, which would be unsafe for partial/approximate pushdown).
 	function.pushdown_complex_filter = MssqlNetComplexFilterPushdown;
+	function.cardinality = MssqlNetScanCardinality;
+	function.statistics = MssqlNetScanStatistics;
 	function.get_bind_info = arrownet::ArrowStreamGetBindInfo;
 	return function;
 }

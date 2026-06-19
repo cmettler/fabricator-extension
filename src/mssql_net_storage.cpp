@@ -79,12 +79,26 @@ static unique_ptr<Catalog> MssqlNetAttach(optional_ptr<StorageExtensionInfo> sto
                                           AttachedDatabase &db, const string &name, AttachInfo &info,
                                           AttachOptions &options) {
 	// A SECRET option supplies the connection from a stored mssql_net secret;
-	// otherwise the first ATTACH argument is the connection string.
+	// otherwise the first ATTACH argument is the connection string. schema_filter /
+	// table_filter restrict catalog discovery. Recognized options are erased so
+	// DuckDB's StorageOptions doesn't reject them as unrecognized.
 	string secret_name;
-	for (auto &option : options.options) {
-		if (StringUtil::Lower(option.first) == "secret") {
-			secret_name = option.second.ToString();
+	string schema_filter;
+	string table_filter;
+	for (auto it = options.options.begin(); it != options.options.end();) {
+		auto lower = StringUtil::Lower(it->first);
+		if (lower == "secret") {
+			secret_name = it->second.ToString();
+		} else if (lower == "schema_filter") {
+			schema_filter = it->second.ToString();
+			it = options.options.erase(it);
+			continue;
+		} else if (lower == "table_filter") {
+			table_filter = it->second.ToString();
+			it = options.options.erase(it);
+			continue;
 		}
+		++it;
 	}
 
 	string connection_string;
@@ -99,6 +113,10 @@ static unique_ptr<Catalog> MssqlNetAttach(optional_ptr<StorageExtensionInfo> sto
 		                      "or ATTACH '' AS db (TYPE mssql_net, SECRET my_secret)");
 	}
 
+	// Validate the filter regexes up front so a bad pattern reports a clean "Invalid
+	// regex" error rather than being wrapped as a connection failure below.
+	MssqlNetCatalog::ValidateCatalogFilters(schema_filter, table_filter);
+
 	ValidateConnectionPort(connection_string);
 
 	// ATTACH must validate the connection up front and create NO catalog on failure;
@@ -107,6 +125,7 @@ static unique_ptr<Catalog> MssqlNetAttach(optional_ptr<StorageExtensionInfo> sto
 	try {
 		auto handle = arrownet::OpenCatalog(connection_string);
 		auto catalog = make_uniq<MssqlNetCatalog>(db, name, handle, RedactConnectionString(connection_string));
+		catalog->SetCatalogFilters(schema_filter, table_filter);
 		catalog->LoadCatalog(context); // discover schemas + tables (also validates the connection)
 		return std::move(catalog);
 	} catch (const std::exception &ex) {

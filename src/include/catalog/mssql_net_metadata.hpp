@@ -10,6 +10,8 @@
 #include "arrownet/abi.h"
 #include "duckdb/main/client_context.hpp"
 
+#include <unordered_map>
+
 namespace duckdb {
 
 //! A discovered SQL Server table (or view).
@@ -39,5 +41,16 @@ void FetchTableColumns(ClientContext &context, ArrowNetHandle handle, const stri
 //! key if present, else the unique index with the fewest columns. Returns empty
 //! if the table has no PK or unique index.
 vector<string> FetchRowIdColumns(ArrowNetHandle handle, const string &schema_name, const string &table_name);
+
+//! Approximate table row count (from partition stats) for the optimizer's
+//! cardinality estimate. Returns -1 if unknown (e.g. a view or no stats).
+int64_t FetchRowCount(ArrowNetHandle handle, const string &schema_name, const string &table_name);
+
+//! Per-column distinct-value estimate (NDV) from existing statistics, keyed by
+//! column name. Only columns that are a leading stat key appear; others are absent
+//! (=> unknown). Used solely for selectivity estimation (never pruning), so an
+//! approximate/stale value is safe.
+std::unordered_map<string, int64_t> FetchColumnNdv(ArrowNetHandle handle, const string &schema_name,
+                                                   const string &table_name);
 
 } // namespace duckdb

@@ -8,6 +8,8 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 
+#include <unordered_map>
+
 namespace duckdb {
 
 class MssqlNetTableEntry : public TableCatalogEntry {
@@ -41,6 +43,14 @@ private:
 	vector<idx_t> rowid_columns_;
 	//! rowid type: scalar (single column) or STRUCT (compound key).
 	LogicalType rowid_type_;
+	//! Lazily-fetched approximate row count for the optimizer (-2 = not yet fetched,
+	//! -1 = unknown). Cached for the entry's lifetime (refreshed by RefreshCache).
+	int64_t row_count_ = -2;
+	//! Lazily-fetched per-column NDV (distinct count) keyed by column name; columns
+	//! absent => unknown. Cached for the entry's lifetime. `ndv_fetched_` guards the
+	//! one-time fetch (the map may legitimately be empty).
+	std::unordered_map<string, int64_t> column_ndv_;
+	bool ndv_fetched_ = false;
 };
 
 } // namespace duckdb

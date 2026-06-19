@@ -26,6 +26,10 @@ ATTACH 'Server=host,1433;Database=db;User Id=sa;Password=***;TrustServerCertific
 -- ...or a mssql:// connection URI (encrypt defaults on; ?encrypt=false to disable):
 ATTACH 'mssql://sa:***@host:1433/db' AS mssql (TYPE mssql_net);
 
+-- schema_filter / table_filter (case-insensitive regex) restrict catalog discovery
+-- to matching schemas/tables — useful on large servers:
+ATTACH 'Server=...;Database=...' AS mssql (TYPE mssql_net, schema_filter '^(dbo|sales)$', table_filter '^fact_');
+
 -- ...or store the connection as a secret and reference it by name. The
 -- connection string is assembled from the secret's parts (password/access_token
 -- redacted in duckdb_secrets()). Works for ATTACH and the query/exec functions.
@@ -65,6 +69,13 @@ SELECT id, name FROM mssql.dbo.people WHERE id >= 10 AND name = 'Bob';
 -- A bare LIMIT (no ORDER BY, no filter) is pushed as SELECT TOP (n), so previews
 -- fetch only n rows instead of the whole table:
 SELECT * FROM mssql.dbo.big_table LIMIT 100;
+
+-- ORDER BY + LIMIT (top-N) is pushed as SELECT TOP (n) ... ORDER BY when the keys
+-- are safe (non-string, NULL-order compatible) — e.g. fetch only the 10 newest:
+SELECT * FROM mssql.dbo.events ORDER BY id DESC LIMIT 10;
+
+-- The optimizer also gets each table's approximate row count (from partition stats)
+-- for better join ordering.
 
 INSERT INTO mssql.dbo.target (id, name) VALUES (1, 'Alice'), (2, 'Bob');  -- INSERT
 INSERT INTO mssql.dbo.target SELECT id, name FROM read_csv('data.csv');  -- INSERT … SELECT
@@ -107,7 +118,8 @@ The COPY target is registered in the catalog (queryable immediately afterwards),
 and `IDENTITY` columns are auto-preserved when the source includes them
 (`SqlBulkCopy KeepIdentity`) or auto-generated when it doesn't. For compatibility
 with the C++ `mssql` extension, `mssql_version()` and the `SET mssql_*` settings
-are accepted.
+are accepted; `SET mssql_ctas_text_type = 'VARCHAR(64)'` overrides the SQL type
+used for text columns when creating tables (default `NVARCHAR(MAX)`).
 
 ```sql
 -- DDL: CREATE/DROP TABLE and CREATE/DROP SCHEMA go through the catalog.
@@ -175,8 +187,15 @@ SELECT mssql_net_exec('db', 'UPDATE dbo.people SET salary = salary + 1');
 -- After creating/dropping tables out-of-band (e.g. via mssql_net_exec), refresh
 -- the cached catalog metadata so the new/removed tables are visible to SQL:
 SELECT mssql_net_exec('db', 'CREATE TABLE dbo.t (id INT)');
-SELECT mssql_refresh_cache('db');     -- re-discovers schemas/tables for catalog 'db'
+SELECT mssql_refresh_cache('db');     -- re-discovers schemas/tables (alias: mssql_invalidate_cache)
 SELECT * FROM db.dbo.t;
+
+-- ...or have DDL run via mssql_net_exec auto-invalidate the cache (off by default,
+-- matching the Postgres scanner). Whether a statement is DDL is detected in the C#
+-- layer (CREATE/DROP/ALTER/TRUNCATE/RENAME/EXEC):
+SET mssql_exec_invalidate_cache = true;
+SELECT mssql_net_exec('db', 'CREATE TABLE dbo.t2 (id INT)');
+SELECT * FROM db.dbo.t2;               -- visible immediately, no manual refresh
 ```
 
 Verified against SQL Server 2022: ATTACH catalog discovery (multi-schema, views),

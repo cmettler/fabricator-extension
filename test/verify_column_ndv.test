@@ -1,0 +1,36 @@
+# name: test/verify_column_ndv.test
+# description: Verify per-column NDV statistics are fetched (selectivity only; no min/max pruning)
+# group: [mssql_net]
+
+require mssql_net
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql_net);
+
+# Binding the table fetches per-column NDV from existing statistics.
+statement ok
+SELECT id, name, value FROM db.dbo.TestSimplePK LIMIT 1;
+
+# The NDV query (sys.dm_db_stats_histogram) reached SQL Server.
+query I
+SELECT hit FROM mssql_net_query('db',
+  'SELECT CAST(CASE WHEN EXISTS (
+     SELECT 1 FROM sys.dm_exec_query_stats qs
+     CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
+     WHERE CHARINDEX(''dm_db_stats_histogram'', st.text) > 0
+       AND CHARINDEX(''dm_exec'', st.text) = 0
+   ) THEN 1 ELSE 0 END AS INT) AS hit');
+----
+1
+
+# Correctness is unaffected (stats are an optimizer hint; columns without stats
+# simply report no NDV).
+query IT
+SELECT id, name FROM db.dbo.TestSimplePK WHERE id = 1;
+----
+1	First Record
+
+statement ok
+DETACH db;

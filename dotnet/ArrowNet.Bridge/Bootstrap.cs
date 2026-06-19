@@ -25,7 +25,7 @@ public static unsafe class Bootstrap
             return ArrowNetStatus.InvalidArgument;
         }
 
-        vtable->AbiVersion = 12;
+        vtable->AbiVersion = 14;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -97,13 +97,19 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int ExecuteDml(nint handle, byte* sql, long* affected, byte** err)
+    private static int ExecuteDml(nint handle, byte* sql, long* affected, int* schemaMayChange, byte** err)
     {
         try
         {
             var catalog = Handles.Resolve<IBackendCatalog>(handle)
                           ?? BackendRegistry.Active.OpenCatalog(string.Empty);
             var statement = Marshal.PtrToStringUTF8((nint)sql) ?? string.Empty;
+            // DDL detection lives here (C#); the host invalidates its catalog cache
+            // when this is set (and the mssql_exec_invalidate_cache setting is on).
+            if (schemaMayChange is not null)
+            {
+                *schemaMayChange = SqlDdl.MayChangeSchema(statement) ? 1 : 0;
+            }
             long rows = catalog.ExecuteNonQuery(statement);
             if (affected is not null)
             {
@@ -267,7 +273,7 @@ public static unsafe class Bootstrap
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static int CreateTable(nint handle, byte* schema, byte* table, CArrowArrayStream* columns, int ifNotExists,
-                                   byte* pkColumns, byte* uniqueColumns, byte* defaults, byte** err)
+                                   byte* pkColumns, byte* uniqueColumns, byte* defaults, byte* textType, byte** err)
     {
         try
         {
@@ -282,10 +288,12 @@ public static unsafe class Bootstrap
             var pk = Marshal.PtrToStringUTF8((nint)pkColumns);
             var uniques = Marshal.PtrToStringUTF8((nint)uniqueColumns);
             var defaultSpec = Marshal.PtrToStringUTF8((nint)defaults);
+            var textTypeName = Marshal.PtrToStringUTF8((nint)textType);
 
             // We own the C stream; read its schema (the column layout) and release it.
             using var stream = CArrowArrayStreamImporter.ImportArrayStream(columns);
-            catalog.CreateTable(schemaName, tableName, stream.Schema, ifNotExists != 0, pk, uniques, defaultSpec);
+            catalog.CreateTable(schemaName, tableName, stream.Schema, ifNotExists != 0, pk, uniques, defaultSpec,
+                                textTypeName);
             return ArrowNetStatus.Ok;
         }
         catch (Exception ex)

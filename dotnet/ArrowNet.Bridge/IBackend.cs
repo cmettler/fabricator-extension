@@ -77,9 +77,11 @@ public interface IBackendCatalog : IDisposable
     /// indices, one UNIQUE constraint per group. <paramref name="defaults"/>
     /// carries literal column DEFAULTs as space-separated "<index> <payload>"
     /// pairs, payload = base64(value-text) or "-" for DEFAULT NULL.
+    /// <paramref name="textType"/> (null/empty => NVARCHAR(MAX)) overrides the SQL
+    /// type for text (VARCHAR) columns — the mssql_ctas_text_type setting.
     /// </summary>
     void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists, string? primaryKey,
-                     string? uniques, string? defaults);
+                     string? uniques, string? defaults, string? textType);
 
     /// <summary>Drops a table; <paramref name="ifExists"/> suppresses the missing-table error.</summary>
     void DropTable(string schemaName, string tableName, bool ifExists);

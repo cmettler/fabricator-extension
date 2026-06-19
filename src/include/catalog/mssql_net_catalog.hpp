@@ -20,6 +20,16 @@ public:
 	MssqlNetCatalog(AttachedDatabase &db, string internal_name, ArrowNetHandle handle, string db_path);
 	~MssqlNetCatalog() override;
 
+	//! Restricts catalog discovery to schemas/tables matching these (icase regex,
+	//! substring) patterns. Empty => no filter. Validates the patterns (throws on a
+	//! bad regex). Must be called before LoadCatalog. Mirrors the C++ mssql extension's
+	//! schema_filter / table_filter ATTACH options.
+	void SetCatalogFilters(const string &schema_filter, const string &table_filter);
+
+	//! Validates the filter regex patterns (throws "Invalid regex …" on a bad one).
+	//! Static so ATTACH can validate before opening the connection.
+	static void ValidateCatalogFilters(const string &schema_filter, const string &table_filter);
+
 	//! Discovers schemas + tables from SQL Server (called once at attach time).
 	void LoadCatalog(ClientContext &context);
 
@@ -57,6 +67,9 @@ public:
 private:
 	ArrowNetHandle handle_;
 	string db_path_;
+	//! Catalog visibility filters (icase regex, substring match); empty => match all.
+	string schema_filter_;
+	string table_filter_;
 	mutex schema_lock_;
 	case_insensitive_map_t<unique_ptr<MssqlNetSchemaEntry>> schemas_;
 };

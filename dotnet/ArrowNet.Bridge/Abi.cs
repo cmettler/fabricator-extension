@@ -25,8 +25,8 @@ public unsafe struct ArrowNetVTable
     // void free_error(char* err)
     public delegate* unmanaged[Cdecl]<byte*, void> FreeError;
 
-    // int32 execute_dml(void* handle, const char* sql, int64* affected, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, long*, byte**, int> ExecuteDml;
+    // int32 execute_dml(void* handle, const char* sql, int64* affected, int32* schema_may_change, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte*, long*, int*, byte**, int> ExecuteDml;
 
     // int32 bulk_insert(void* handle, const char* schema, const char* table,
     //                   int32 create_table, int32 replace, ArrowArrayStream* in, int64* affected, char** err)
@@ -48,7 +48,7 @@ public unsafe struct ArrowNetVTable
     // int32 create_table(void* handle, const char* schema, const char* table, ArrowArrayStream* columns,
     //                    int32 if_not_exists, const char* pk_columns, const char* unique_columns,
     //                    const char* defaults, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, int, byte*, byte*, byte*, byte**, int> CreateTable;
+    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, int, byte*, byte*, byte*, byte*, byte**, int> CreateTable;
 
     // int32 drop_table(void* handle, const char* schema, const char* table, int32 if_exists, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte*, byte*, int, byte**, int> DropTable;
@@ -99,6 +99,8 @@ public static class MetadataKind
     public const int Tables = 1;
     public const int Columns = 2;
     public const int RowId = 3;
+    public const int RowCount = 4;
+    public const int ColumnNdv = 5;
 }
 
 internal static class ArrowNetStatus

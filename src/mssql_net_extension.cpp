@@ -14,8 +14,10 @@
 #include "mssql_net_optimizer.hpp"
 #include "mssql_net_secret.hpp"
 #include "mssql_net_storage.hpp"
+#include "duckdb/function/function_set.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -105,6 +107,13 @@ static void RegisterCompatSettings(DBConfig &config) {
 	                          LogicalType::BIGINT, Value::BIGINT(8388608), RequireAtLeastOne);
 	config.AddExtensionOption("mssql_insert_use_returning_output", "mssql_net: use OUTPUT INSERTED for RETURNING",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+
+	// Auto-invalidate the catalog cache after DDL run via mssql_net_exec(). Defaults
+	// to FALSE (Postgres-scanner parity): by default invalidate manually with
+	// mssql_invalidate_cache()/mssql_refresh_cache(); set true to auto-invalidate.
+	config.AddExtensionOption("mssql_exec_invalidate_cache",
+	                          "mssql_net: invalidate the catalog cache after DDL run via mssql_net_exec()",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
 }
 
 // --- arrownet_managed_dir() --------------------------------------------------
@@ -174,10 +183,21 @@ static unique_ptr<FunctionData> QueryBind(ClientContext &context, TableFunctionB
 // Executes arbitrary T-SQL (DDL/DML/EXEC) against SQL Server and returns the
 // number of rows affected. Volatile (always executed, never constant-folded).
 static void MssqlNetExecFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
 	auto count = args.size();
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto result_data = FlatVector::GetData<int64_t>(result);
 	auto &validity = FlatVector::Validity(result);
+
+	// Opt-in: invalidate the attached catalog's cache after a DDL statement so a later
+	// read / CREATE IF NOT EXISTS sees the real server-side state. Whether a statement
+	// is DDL is decided in C# (see SqlDdl.MayChangeSchema); here we only act on the flag.
+	bool invalidate_on_ddl = false;
+	Value invalidate_value;
+	if (context.TryGetCurrentSetting("mssql_exec_invalidate_cache", invalidate_value) && !invalidate_value.IsNull()) {
+		invalidate_on_ddl = invalidate_value.GetValue<bool>();
+	}
+
 	for (idx_t i = 0; i < count; i++) {
 		auto conn_value = args.GetValue(0, i);
 		auto sql_value = args.GetValue(1, i);
@@ -185,10 +205,12 @@ static void MssqlNetExecFunction(DataChunk &args, ExpressionState &state, Vector
 			validity.SetInvalid(i);
 			continue;
 		}
+		auto conn_name = StringValue::Get(conn_value);
 		bool owns = true;
-		auto handle = ResolveConnection(state.GetContext(), StringValue::Get(conn_value), owns);
+		auto handle = ResolveConnection(context, conn_name, owns);
+		bool schema_may_change = false;
 		try {
-			result_data[i] = arrownet::ExecuteDml(handle, StringValue::Get(sql_value));
+			result_data[i] = arrownet::ExecuteDml(handle, StringValue::Get(sql_value), &schema_may_change);
 		} catch (...) {
 			if (owns) {
 				arrownet::CloseCatalog(handle);
@@ -197,6 +219,14 @@ static void MssqlNetExecFunction(DataChunk &args, ExpressionState &state, Vector
 		}
 		if (owns) {
 			arrownet::CloseCatalog(handle);
+		}
+
+		// owns == false => the arg named an attached mssql_net catalog whose cache we own.
+		if (invalidate_on_ddl && schema_may_change && !owns) {
+			auto db = DatabaseManager::Get(context).GetDatabase(context, conn_name);
+			if (db && db->GetCatalog().GetCatalogType() == "mssql_net") {
+				db->GetCatalog().Cast<MssqlNetCatalog>().RefreshCache(context);
+			}
 		}
 	}
 }
@@ -258,12 +288,29 @@ static void LoadInternal(ExtensionLoader &loader) {
 	exec_fn.stability = FunctionStability::VOLATILE;
 	loader.RegisterFunction(exec_fn);
 
-	// mssql_refresh_cache(catalog) — registered under the compat name and the
-	// native-prefixed alias; both refresh the attached catalog's metadata cache.
+	// mssql_refresh_cache(catalog) re-discovers the attached catalog's metadata.
 	for (const char *fn_name : {"mssql_refresh_cache", "mssql_net_refresh_cache"}) {
 		ScalarFunction refresh_fn(fn_name, {LogicalType::VARCHAR}, LogicalType::BOOLEAN, MssqlRefreshCacheFunction);
 		refresh_fn.stability = FunctionStability::VOLATILE;
 		loader.RegisterFunction(refresh_fn);
+	}
+
+	// mssql_invalidate_cache(catalog [, schema [, table]]) — compatibility alias.
+	// Our cache is catalog-granular, so every arity re-discovers the whole catalog
+	// (a valid superset of point invalidation); the schema/table args are accepted
+	// but coarsened. Only arg0 (the catalog) is read.
+	for (const char *fn_name : {"mssql_invalidate_cache", "mssql_net_invalidate_cache"}) {
+		ScalarFunctionSet set(fn_name);
+		const vector<vector<LogicalType>> signatures = {
+		    {LogicalType::VARCHAR},
+		    {LogicalType::VARCHAR, LogicalType::VARCHAR},
+		    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}};
+		for (auto &arg_types : signatures) {
+			ScalarFunction fn(fn_name, arg_types, LogicalType::BOOLEAN, MssqlRefreshCacheFunction);
+			fn.stability = FunctionStability::VOLATILE;
+			set.AddFunction(fn);
+		}
+		loader.RegisterFunction(set);
 	}
 }
 

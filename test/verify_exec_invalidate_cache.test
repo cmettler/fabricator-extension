@@ -1,0 +1,43 @@
+# name: test/verify_exec_invalidate_cache.test
+# description: Verify mssql_exec_invalidate_cache auto-invalidates the catalog cache after DDL
+# group: [mssql_net]
+
+require mssql_net
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql_net);
+
+statement ok
+SELECT mssql_net_exec('db', 'DROP TABLE IF EXISTS dbo.exec_invalidate_test');
+
+# Opt in to auto-invalidation after DDL via mssql_net_exec.
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
+# Create a table out-of-band — the CREATE (DDL, detected in C#) auto-invalidates
+# the catalog cache, so no manual mssql_refresh_cache() is needed.
+statement ok
+SELECT mssql_net_exec('db', 'CREATE TABLE dbo.exec_invalidate_test (id INT, v NVARCHAR(20))');
+
+statement ok
+SELECT mssql_net_exec('db', 'INSERT INTO dbo.exec_invalidate_test VALUES (1, ''hi'')');
+
+# Visible immediately, without a manual refresh.
+query IT
+SELECT id, v FROM db.dbo.exec_invalidate_test;
+----
+1	hi
+
+# The compatibility alias mssql_invalidate_cache(catalog) also works.
+query I
+SELECT mssql_invalidate_cache('db')::INTEGER;
+----
+1
+
+statement ok
+SELECT mssql_net_exec('db', 'DROP TABLE dbo.exec_invalidate_test');
+
+statement ok
+DETACH db;

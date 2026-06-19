@@ -593,8 +593,41 @@ public sealed class SqlServerCatalog : IBackendCatalog
         MetadataKind.Columns => ExecuteQuery($"SELECT * FROM {Quote(Require(schema, table).schema)}." +
                                              $"{Quote(Require(schema, table).table)} WHERE 1 = 0"),
         MetadataKind.RowId => ExecuteQuery(RowIdSql(Require(schema, table).schema, Require(schema, table).table)),
+        MetadataKind.RowCount => ExecuteQuery(RowCountSql(Require(schema, table).schema, Require(schema, table).table)),
+        MetadataKind.ColumnNdv => ExecuteQuery(ColumnNdvSql(Require(schema, table).schema, Require(schema, table).table)),
         _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "mssql_net: unknown metadata kind"),
     };
+
+    // Per-column distinct-value estimate (NDV) from existing statistics — (column,
+    // ndv) rows. Derived from the leading-column histogram of each stats object:
+    // sum of distinct values strictly inside the steps + one per step boundary. Cheap
+    // (metadata, no scan); only columns that are a leading stat key appear (others =>
+    // no row => unknown). Used ONLY for selectivity estimation, so stale/approximate
+    // is safe (never drives pruning); min/max is deliberately not exposed.
+    private static string ColumnNdvSql(string schema, string table)
+    {
+        string objectLiteral = "N'" + (schema + "." + table).Replace("'", "''") + "'";
+        return
+            "SELECT c.name AS column_name, CAST(MAX(h.ndv) AS VARCHAR(32)) AS ndv " +
+            "FROM sys.stats s " +
+            "JOIN sys.stats_columns sc ON sc.object_id = s.object_id AND sc.stats_id = s.stats_id AND sc.stats_column_id = 1 " +
+            "JOIN sys.columns c ON c.object_id = sc.object_id AND c.column_id = sc.column_id " +
+            "CROSS APPLY (SELECT SUM(hist.distinct_range_rows) + COUNT_BIG(*) AS ndv " +
+            "             FROM sys.dm_db_stats_histogram(s.object_id, s.stats_id) hist) h " +
+            "WHERE s.object_id = OBJECT_ID(" + objectLiteral + ") AND h.ndv > 0 " +
+            "GROUP BY c.name";
+    }
+
+    // Approximate row count (one VARCHAR cell) from partition stats — a cheap
+    // metadata read (not COUNT(*)) used for the optimizer's cardinality estimate.
+    // Views / tables with no partition rows yield 0.
+    private static string RowCountSql(string schema, string table)
+    {
+        string objectLiteral = "N'" + (schema + "." + table).Replace("'", "''") + "'";
+        return "SELECT CAST(COALESCE(SUM(p.row_count), 0) AS VARCHAR(32)) AS n " +
+               "FROM sys.dm_db_partition_stats p " +
+               "WHERE p.object_id = OBJECT_ID(" + objectLiteral + ") AND p.index_id IN (0, 1)";
+    }
 
     public IArrowArrayStream ScanTable(string schemaName, string tableName, string? specJson,
                                        IArrowArrayStream? filterValues)
@@ -611,6 +644,12 @@ public sealed class SqlServerCatalog : IBackendCatalog
         // pushed filter and no offset, so it is safe (DuckDB still re-applies LIMIT).
         var top = spec?.Top is long n and >= 0 ? $"TOP ({n}) " : "";
 
+        // ORDER BY pushdown (paired with TOP for TopN). The host only sets this for
+        // safe keys (non-string, NULL-order compatible, no filter); DuckDB re-sorts.
+        var orderBy = spec?.OrderBy is { Count: > 0 } keys
+            ? " ORDER BY " + string.Join(", ", keys.Select(k => $"{Quote(k.Col)}{(k.Desc ? " DESC" : " ASC")}"))
+            : "";
+
         // Filter pushdown: render spec.Filter into a parameterized WHERE. This is
         // best-effort — DuckDB re-applies every predicate above the scan — so if we
         // can't read a value or render a node, omit the WHERE and let DuckDB filter.
@@ -622,7 +661,7 @@ public sealed class SqlServerCatalog : IBackendCatalog
                 filterValues = null; // consumed + disposed by ReadFilterValues
                 var builder = new FilterWhereBuilder(values);
                 var where = builder.Build(spec.Filter);
-                return ExecuteQuery($"SELECT {top}{columns} FROM {qualified} WHERE {where}", builder.Parameters);
+                return ExecuteQuery($"SELECT {top}{columns} FROM {qualified} WHERE {where}{orderBy}", builder.Parameters);
             }
             catch
             {
@@ -631,7 +670,7 @@ public sealed class SqlServerCatalog : IBackendCatalog
         }
 
         filterValues?.Dispose();
-        return ExecuteQuery($"SELECT {top}{columns} FROM {qualified}");
+        return ExecuteQuery($"SELECT {top}{columns} FROM {qualified}{orderBy}");
     }
 
     // Reads the one-row filter value batch (column i == value i) into CLR values.
@@ -661,7 +700,7 @@ public sealed class SqlServerCatalog : IBackendCatalog
     }
 
     public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists, string? primaryKey,
-                            string? uniques, string? defaults)
+                            string? uniques, string? defaults, string? textType)
     {
         // Route through BeginWrite so this participates in the pinned transaction
         // when one is active — without it, CREATE OR REPLACE (DROP pinned + CREATE
@@ -670,7 +709,7 @@ public sealed class SqlServerCatalog : IBackendCatalog
         try
         {
             string qualified = Quote(schemaName) + "." + Quote(tableName);
-            string create = BuildCreateTable(qualified, columns, primaryKey, uniques, defaults);
+            string create = BuildCreateTable(qualified, columns, primaryKey, uniques, defaults, textType);
             using var cmd = connection.CreateCommand();
             cmd.Transaction = transaction;
             cmd.CommandText = ifNotExists
@@ -977,10 +1016,10 @@ public sealed class SqlServerCatalog : IBackendCatalog
     private static string Quote(string identifier) => "[" + identifier.Replace("]", "]]") + "]";
 
     private static string BuildCreateTable(string qualified, Schema schema) =>
-        BuildCreateTable(qualified, schema, null, null, null);
+        BuildCreateTable(qualified, schema, null, null, null, null);
 
     private static string BuildCreateTable(string qualified, Schema schema, string? primaryKey, string? uniques,
-                                           string? defaults)
+                                           string? defaults, string? textType)
     {
         var defaultMap = ParseDefaults(defaults);
         var sb = new StringBuilder();
@@ -992,7 +1031,7 @@ public sealed class SqlServerCatalog : IBackendCatalog
             {
                 sb.Append(", ");
             }
-            sb.Append(Quote(field.Name)).Append(' ').Append(MapArrowToSqlType(field.DataType))
+            sb.Append(Quote(field.Name)).Append(' ').Append(MapArrowToSqlType(field.DataType, textType))
               .Append(field.IsNullable ? " NULL" : " NOT NULL");
             if (defaultMap.TryGetValue(i, out var defaultValue))
             {
@@ -1080,7 +1119,7 @@ public sealed class SqlServerCatalog : IBackendCatalog
     }
 
     // Arrow type -> SQL Server column type (provider-specific).
-    private static string MapArrowToSqlType(IArrowType type)
+    private static string MapArrowToSqlType(IArrowType type, string? textType = null)
     {
         switch (type.TypeId)
         {
@@ -1112,7 +1151,7 @@ public sealed class SqlServerCatalog : IBackendCatalog
                 return "VARBINARY(MAX)";
             case ArrowTypeId.String:
             default:
-                return "NVARCHAR(MAX)";
+                return string.IsNullOrWhiteSpace(textType) ? "NVARCHAR(MAX)" : textType!;
         }
     }
 

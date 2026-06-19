@@ -23,6 +23,9 @@ internal sealed class ScanSpec
     [JsonPropertyName("top")]
     public long? Top { get; set; }
 
+    [JsonPropertyName("order_by")]
+    public List<OrderKey>? OrderBy { get; set; }
+
     private static readonly JsonSerializerOptions Options = new()
     {
         PropertyNameCaseInsensitive = true,
@@ -31,4 +34,14 @@ internal sealed class ScanSpec
 
     public static ScanSpec? Parse(string? json) =>
         string.IsNullOrWhiteSpace(json) ? null : JsonSerializer.Deserialize<ScanSpec>(json, Options);
+}
+
+/// <summary>One ORDER BY key: a column name + direction.</summary>
+internal sealed class OrderKey
+{
+    [JsonPropertyName("col")]
+    public string Col { get; set; } = "";
+
+    [JsonPropertyName("desc")]
+    public bool Desc { get; set; }
 }

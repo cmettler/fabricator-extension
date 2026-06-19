@@ -1,0 +1,39 @@
+# name: test/verify_orderby_pushdown.test
+# description: Verify ORDER BY + LIMIT (TopN) pushes as SELECT TOP (n) ... ORDER BY for safe keys
+# group: [mssql_net]
+
+require mssql_net
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql_net);
+
+# ORDER BY a NOT NULL int PK + LIMIT: pushes TOP + ORDER BY; result is correct.
+query IT
+SELECT id, name FROM db.dbo.TestSimplePK ORDER BY id LIMIT 1;
+----
+1	First Record
+
+# Proof: TOP (n) + ORDER BY [id] reached SQL Server.
+query I
+SELECT pushed FROM mssql_net_query('db',
+  'SELECT CAST(CASE WHEN EXISTS (
+     SELECT 1 FROM sys.dm_exec_query_stats qs
+     CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
+     WHERE CHARINDEX(''FROM [dbo].[TestSimplePK]'', st.text) > 0
+       AND CHARINDEX(''ORDER BY [id]'', st.text) > 0
+       AND CHARINDEX(''TOP ('', st.text) > 0
+       AND CHARINDEX(''dm_exec'', st.text) = 0
+   ) THEN 1 ELSE 0 END AS INT) AS pushed');
+----
+1
+
+# ORDER BY a string column + LIMIT must NOT push order (collation) yet stay correct.
+query I
+SELECT count(*) FROM (SELECT name FROM db.dbo.TestSimplePK ORDER BY name LIMIT 3);
+----
+3
+
+statement ok
+DETACH db;

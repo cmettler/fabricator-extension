@@ -25,8 +25,60 @@
 #include "duckdb/storage/database_size.hpp"
 
 #include <algorithm>
+#include <regex>
 
 namespace duckdb {
+
+namespace {
+
+// Compiles the (optional) icase catalog filters once and matches names by substring
+// regex search — mirrors the C++ mssql extension's schema_filter / table_filter.
+struct CatalogFilters {
+	bool has_schema = false;
+	bool has_table = false;
+	std::regex schema_re;
+	std::regex table_re;
+
+	CatalogFilters(const string &schema_filter, const string &table_filter) {
+		if (!schema_filter.empty()) {
+			schema_re = std::regex(schema_filter, std::regex::icase);
+			has_schema = true;
+		}
+		if (!table_filter.empty()) {
+			table_re = std::regex(table_filter, std::regex::icase);
+			has_table = true;
+		}
+	}
+	bool MatchSchema(const string &n) const {
+		return !has_schema || std::regex_search(n, schema_re);
+	}
+	bool MatchTable(const string &n) const {
+		return !has_table || std::regex_search(n, table_re);
+	}
+};
+
+} // namespace
+
+void MssqlNetCatalog::ValidateCatalogFilters(const string &schema_filter, const string &table_filter) {
+	auto check = [](const string &pattern) {
+		if (pattern.empty()) {
+			return;
+		}
+		try {
+			std::regex(pattern, std::regex::icase);
+		} catch (const std::regex_error &e) {
+			throw InvalidInputException("mssql_net: Invalid regex in catalog filter '%s': %s", pattern, e.what());
+		}
+	};
+	check(schema_filter);
+	check(table_filter);
+}
+
+void MssqlNetCatalog::SetCatalogFilters(const string &schema_filter, const string &table_filter) {
+	ValidateCatalogFilters(schema_filter, table_filter);
+	schema_filter_ = schema_filter;
+	table_filter_ = table_filter;
+}
 
 MssqlNetCatalog::MssqlNetCatalog(AttachedDatabase &db, string internal_name, ArrowNetHandle handle, string db_path)
     : Catalog(db), handle_(handle), db_path_(std::move(db_path)) {
@@ -52,11 +104,16 @@ void MssqlNetCatalog::LoadCatalog(ClientContext &context) {
 		return ref;
 	};
 
+	CatalogFilters filters(schema_filter_, table_filter_);
 	for (auto &schema_name : DiscoverSchemas(handle_)) {
-		ensure_schema(schema_name);
+		if (filters.MatchSchema(schema_name)) {
+			ensure_schema(schema_name);
+		}
 	}
 	for (auto &table : DiscoverTables(handle_)) {
-		ensure_schema(table.schema_name).AddTable(table.table_name, table.table_type);
+		if (filters.MatchSchema(table.schema_name) && filters.MatchTable(table.table_name)) {
+			ensure_schema(table.schema_name).AddTable(table.table_name, table.table_type);
+		}
 	}
 }
 
@@ -81,11 +138,16 @@ void MssqlNetCatalog::RefreshCache(ClientContext &context) {
 	for (auto &entry : schemas_) {
 		entry.second->ClearTables();
 	}
+	CatalogFilters filters(schema_filter_, table_filter_);
 	for (auto &schema_name : DiscoverSchemas(handle_)) {
-		ensure_schema(schema_name);
+		if (filters.MatchSchema(schema_name)) {
+			ensure_schema(schema_name);
+		}
 	}
 	for (auto &table : DiscoverTables(handle_)) {
-		ensure_schema(table.schema_name).AddTable(table.table_name, table.table_type);
+		if (filters.MatchSchema(table.schema_name) && filters.MatchTable(table.table_name)) {
+			ensure_schema(table.schema_name).AddTable(table.table_name, table.table_type);
+		}
 	}
 }
 

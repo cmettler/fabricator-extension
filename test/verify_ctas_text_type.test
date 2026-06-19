@@ -1,0 +1,35 @@
+# name: test/verify_ctas_text_type.test
+# description: Verify mssql_ctas_text_type overrides the SQL type for text columns on CREATE TABLE
+# group: [mssql_net]
+
+require mssql_net
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql_net);
+
+statement ok
+DROP TABLE IF EXISTS db.dbo.ctas_text_type_test;
+
+# Override the default NVARCHAR(MAX) with an indexable fixed-width type.
+statement ok
+SET mssql_ctas_text_type = 'VARCHAR(64)';
+
+statement ok
+CREATE TABLE db.dbo.ctas_text_type_test (id INTEGER, label VARCHAR);
+
+# The text column was created as VARCHAR(64), not NVARCHAR(MAX).
+query TI
+SELECT * FROM mssql_net_query('db',
+  'SELECT CAST(DATA_TYPE AS VARCHAR(32)) AS dt, CHARACTER_MAXIMUM_LENGTH AS len
+   FROM INFORMATION_SCHEMA.COLUMNS
+   WHERE TABLE_NAME = ''ctas_text_type_test'' AND COLUMN_NAME = ''label''');
+----
+varchar	64
+
+statement ok
+DROP TABLE db.dbo.ctas_text_type_test;
+
+statement ok
+DETACH db;

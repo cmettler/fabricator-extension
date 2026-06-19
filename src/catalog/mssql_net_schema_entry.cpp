@@ -244,12 +244,20 @@ optional_ptr<CatalogEntry> MssqlNetSchemaEntry::CreateTable(CatalogTransaction t
 		arrownet::DropTable(handle_, name, base.table, /*if_exists=*/true);
 	}
 
+	// The `mssql_ctas_text_type` setting overrides the SQL type for text columns
+	// (default NVARCHAR(MAX)) — useful for indexable string keys.
+	string text_type;
+	Value text_type_value;
+	if (context.TryGetCurrentSetting("mssql_ctas_text_type", text_type_value) && !text_type_value.IsNull()) {
+		text_type = text_type_value.ToString();
+	}
+
 	// A schema-only Arrow stream carries the column definitions to the backend.
 	arrownet::ArrowProducer producer(types, names, context.GetClientProperties());
 	producer.SetNullability(nullable);
 	producer.Finish();
 	arrownet::CreateTable(handle_, name, base.table, *producer.Stream(), if_not_exists, pk_arg, unique_arg,
-	                      defaults_arg);
+	                      defaults_arg, text_type);
 
 	// Register the new table (also invalidates any cached entry) and return it.
 	AddTable(base.table, "BASE TABLE");

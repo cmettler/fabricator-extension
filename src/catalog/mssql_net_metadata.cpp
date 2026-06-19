@@ -104,6 +104,45 @@ vector<string> FetchRowIdColumns(ArrowNetHandle handle, const string &schema_nam
 	return rows[0];
 }
 
+int64_t FetchRowCount(ArrowNetHandle handle, const string &schema_name, const string &table_name) {
+	// Approximate row count from partition stats (cheap metadata read); -1 if unknown.
+	ArrowArrayStream stream;
+	std::memset(&stream, 0, sizeof(stream));
+	arrownet::GetMetadata(handle, ARROWNET_META_ROWCOUNT, schema_name, table_name, stream);
+	auto rows = ReadStringTable(stream, 1);
+	if (rows.empty() || rows[0].empty()) {
+		return -1;
+	}
+	try {
+		return std::stoll(rows[0][0]);
+	} catch (...) {
+		return -1;
+	}
+}
+
+std::unordered_map<string, int64_t> FetchColumnNdv(ArrowNetHandle handle, const string &schema_name,
+                                                   const string &table_name) {
+	// Two columns: column name, NDV (as text). Columns without a leading-key stat are
+	// simply absent (=> unknown). Errors (e.g. permissions) bubble up; the caller may
+	// swallow them — NDV is an optimizer hint, not required for correctness.
+	ArrowArrayStream stream;
+	std::memset(&stream, 0, sizeof(stream));
+	arrownet::GetMetadata(handle, ARROWNET_META_COLUMN_NDV, schema_name, table_name, stream);
+	auto rows = ReadStringTable(stream, 2);
+	std::unordered_map<string, int64_t> result;
+	if (rows.size() < 2) {
+		return result;
+	}
+	for (idx_t i = 0; i < rows[0].size() && i < rows[1].size(); i++) {
+		try {
+			result[rows[0][i]] = std::stoll(rows[1][i]);
+		} catch (...) {
+			// skip unparseable rows
+		}
+	}
+	return result;
+}
+
 void FetchTableColumns(ClientContext &context, ArrowNetHandle handle, const string &schema_name,
                        const string &table_name, vector<string> &names, vector<LogicalType> &types) {
 	// The COLUMNS metadata stream carries zero rows; its Arrow schema describes

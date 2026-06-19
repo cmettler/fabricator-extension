@@ -48,7 +48,7 @@ public sealed class StubBackend : IBackend
             ExecuteQuery($"SELECT * FROM {schemaName}.{tableName}");
 
         public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists,
-                                string? primaryKey, string? uniques, string? defaults)
+                                string? primaryKey, string? uniques, string? defaults, string? textType)
         {
         }
 
