@@ -86,7 +86,9 @@ current code still uses the single-provider `mssql_net` naming):
   **(4d) attach-time catalog-bound stored procedures DONE** (procs with a determinable result set resolved
   as table functions — `sp_describe` schema, `EXEC` execution, no pushdown — ABI v22; **named/optional
   params DONE (4d-2)**; **OUTPUT params + RETURN value as flat columns DONE (4d-3)**; multi-result-set +
-  INPUT/OUTPUT deferred); next: load-time global, then table-in-out.
+  INPUT/OUTPUT deferred); **(4e) attach-time custom C#-authored scalar functions DONE** (`ArrowScalarFunction`,
+  reuses the catalog scalar path — C#-only, no ABI; chosen over load-time global, which is deferred);
+  next: table-in-out.
 
 ## Implementation status (current)
 
@@ -123,8 +125,9 @@ non-data: error-WORDING/number assertions (corpus expects native-extension text)
 syntax, and catalog-after-rollback staleness.
 
 **Not yet / out of scope:** Airport-style **table-in-out** functions and **load-time global** functions
-(Phase 3 — scalar UDFs, TVFs + stored procs done, see "Callable scalar UDFs (4b)" / "table functions (4c)" /
-"stored procedures (4d)"; proc multi-result-set + INPUT/OUTPUT still deferred); connection
+(Phase 3 — scalar UDFs, TVFs, stored procs + custom C#-authored functions done, see "Callable scalar UDFs
+(4b)" / "table functions (4c)" / "stored procedures (4d)" / "custom functions (4e)"; proc multi-result-set
++ INPUT/OUTPUT still deferred; load-time global deferred in favor of attach-time custom functions); connection
 pooling knobs / `mssql_pool_stats` (ADO.NET pools by connstr already); COPY to temp tables
 (`mssql://cat//#t`, `cat..#t` — `ParseTarget` only accepts strict 3-part names); CHECK constraints +
 non-literal/expression DEFAULTs on CREATE; UPDATE/DELETE…RETURNING; length-aware VARCHAR mapping (so
@@ -256,6 +259,25 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
   omitted → proc `DEFAULT` (`usp_opt(base:=10)`→60) and supplied → override (`…, bonus:=5`→15); **OUTPUT
   params** flat (`usp_outp(a:=10,b:=3)` → `sum=13, diff=7, return_value=42`). Committed test:
   `test/verify_stored_procs.test`.
+
+### Custom (provider-authored) functions (4e)
+- Beyond functions *discovered* from SQL Server, a provider can **author custom scalar functions in C#**:
+  `ArrowScalarFunction` (in the Bridge) = `SchemaName`/`Name`/`Parameters`(arg fields)/`Result`(field)/
+  `Invoke(RecordBatch)→IArrowArray`. The SqlServer provider lists them in `CustomFunctions.Scalar` (demo:
+  `dbo.cf_add(a,b)=a+b`, computed in C#).
+- **Reuses the entire catalog scalar path — C#-only, no ABI/C++ change** (the lean alternative to load-time
+  global functions): `GetMetadata(Functions)` appends the custom functions to `FunctionsSql` via `UNION ALL`,
+  so the existing C++ discovery registers them as a `ScalarFunctionCatalogEntry` exactly like a discovered
+  UDF. `GetFunctionParamSchema`/`GetFunctionReturnSchema`/`ExecuteScalar` consult a `CustomScalar` registry
+  (keyed `schema.name`, case-insensitive) **first** → declared schema / run the C# `Invoke` over the Arrow
+  batch; otherwise the SQL path. A custom function shadows a same-named SQL object (custom wins).
+- **Attach-time + catalog-bound** (`db.schema.fn`), not connection-free globals — chosen over load-time
+  global functions because it avoids booting the CLR at `Extension::Load()` and needs no new ABI. (Load-time
+  global via `loader.RegisterFunction` remains an option if connection-free functions are ever needed; the
+  same `ArrowScalarFunction` authoring + the existing `execute_scalar` with a handle-less marker would reuse
+  this path.)
+- **Verified**: `db.dbo.cf_add(2,3)=5`, vectorized (`+100` over a range), NULL→NULL, discovered as `scalar`,
+  with **no SQL object** (`sys.objects` count 0 for `cf_add`). Committed test: `test/verify_custom_functions.test`.
 
 - **Filtering**: discovered scalar UDFs + TVFs/procs are gated by the ATTACH `schema_filter` (icase
   `std::regex`, applied in `LoadCatalog`/`RefreshCache`); `table_filter` is table-only and does NOT apply to functions.

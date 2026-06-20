@@ -1,0 +1,46 @@
+# name: test/verify_custom_functions.test
+# description: Provider-authored custom C# scalar functions are callable as db.schema.fn(args) at attach time
+# group: [mssql]
+
+require mssql_net
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS cdb (TYPE mssql_net);
+
+# dbo.cf_add is a custom C# function (an ArrowScalarFunction baked into the provider), NOT a
+# SQL Server object — surfaced into the attached catalog like a discovered function.
+query I
+SELECT cdb.dbo.cf_add(2, 3);
+----
+5
+
+# Vectorized over a batch (cast to the registered INTEGER signature).
+query II
+SELECT i, cdb.dbo.cf_add(i::INTEGER, 100) AS r FROM range(1, 4) t(i) ORDER BY i;
+----
+1	101
+2	102
+3	103
+
+# The C# Invoke sees NULL argument rows (registered VOLATILE + SPECIAL_HANDLING).
+query I
+SELECT cdb.dbo.cf_add(NULL::INTEGER, 5);
+----
+NULL
+
+# It is discovered like any catalog function...
+query TTT
+SELECT schema_name, name, kind FROM mssql_net_functions('cdb') WHERE name = 'cf_add';
+----
+dbo	cf_add	scalar
+
+# ...yet there is NO such object in SQL Server — proving it is the C#-authored custom function.
+query I
+SELECT cnt FROM mssql_net_query('cdb', 'SELECT COUNT(*) AS cnt FROM sys.objects WHERE name = ''cf_add''');
+----
+0
+
+statement ok
+DETACH cdb;

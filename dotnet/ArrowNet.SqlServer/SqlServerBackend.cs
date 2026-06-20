@@ -130,6 +130,12 @@ public sealed class SqlServerCatalog : IBackendCatalog
     // applied via SqlConnection.AccessToken.
     internal const string AccessTokenKeyword = ";ArrowNetAccessToken=";
 
+    // Provider-authored custom scalar functions, keyed "schema.name" (case-insensitive). Surfaced into
+    // the catalog like discovered functions (see GetMetadata) but dispatched to C# (see ExecuteScalar /
+    // GetFunctionParamSchema / GetFunctionReturnSchema) instead of generating SQL.
+    private static readonly IReadOnlyDictionary<string, ArrowScalarFunction> CustomScalar =
+        CustomFunctions.Scalar.ToDictionary(f => $"{f.SchemaName}.{f.Name}", StringComparer.OrdinalIgnoreCase);
+
     private readonly string _connectionString;
     private readonly string? _accessToken;
 
@@ -704,9 +710,31 @@ public sealed class SqlServerCatalog : IBackendCatalog
         MetadataKind.RowId => ExecuteQuery(RowIdSql(Require(schema, table).schema, Require(schema, table).table)),
         MetadataKind.RowCount => ExecuteQuery(RowCountSql(Require(schema, table).schema, Require(schema, table).table)),
         MetadataKind.ColumnNdv => ExecuteQuery(ColumnNdvSql(Require(schema, table).schema, Require(schema, table).table)),
-        MetadataKind.Functions => ExecuteQuery(FunctionsSql),
+        MetadataKind.Functions => ExecuteQuery(FunctionsMetadataSql()),
         _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "mssql_net: unknown metadata kind"),
     };
+
+    // Discovered SQL Server routines + the provider's custom scalar functions, appended via UNION ALL so
+    // the C++ catalog discovers + registers them uniformly (then dispatches custom ones to C#).
+    private static string FunctionsMetadataSql()
+    {
+        if (CustomScalar.Count == 0)
+        {
+            return FunctionsSql;
+        }
+        // FunctionsSql ends with ORDER BY; strip it so the UNION ALL is valid (the diagnostic /
+        // discovery callers sort themselves, so dropping the ordering here is harmless).
+        int orderIdx = FunctionsSql.LastIndexOf(" ORDER BY ", StringComparison.Ordinal);
+        var sb = new StringBuilder(orderIdx >= 0 ? FunctionsSql.Substring(0, orderIdx) : FunctionsSql);
+        foreach (var f in CustomScalar.Values)
+        {
+            string esc(string s) => s.Replace("'", "''");
+            sb.Append(" UNION ALL SELECT '").Append(esc(f.SchemaName)).Append("', '").Append(esc(f.Name))
+              .Append("', 'scalar', ").Append(f.Parameters.FieldsList.Count).Append(", '")
+              .Append(esc(f.Result.DataType.Name)).Append('\'');
+        }
+        return sb.ToString();
+    }
 
     // Discovered routines (user scalar/table functions + procedures), uniform shape
     // (schema_name, name, kind, param_count, return_type). For scalar functions the
@@ -1046,6 +1074,10 @@ public sealed class SqlServerCatalog : IBackendCatalog
 
     public IArrowArrayStream GetFunctionParamSchema(string schemaName, string functionName)
     {
+        if (CustomScalar.TryGetValue($"{schemaName}.{functionName}", out var custom))
+        {
+            return new InMemoryArrayStream(custom.Parameters, System.Array.Empty<RecordBatch>());
+        }
         var parms = FunctionParameters(schemaName, functionName, wantReturn: false);
         if (parms.Count == 0)
         {
@@ -1067,6 +1099,11 @@ public sealed class SqlServerCatalog : IBackendCatalog
 
     public IArrowArrayStream GetFunctionReturnSchema(string schemaName, string functionName)
     {
+        if (CustomScalar.TryGetValue($"{schemaName}.{functionName}", out var custom))
+        {
+            return new InMemoryArrayStream(new Schema(new[] { custom.Result }, null),
+                                           System.Array.Empty<RecordBatch>());
+        }
         var ret = FunctionParameters(schemaName, functionName, wantReturn: true);
         if (ret.Count == 0)
         {
@@ -1080,6 +1117,21 @@ public sealed class SqlServerCatalog : IBackendCatalog
     // function's return type. Chunked to stay under SQL Server's ~2100-parameter limit.
     public IArrowArrayStream ExecuteScalar(string schemaName, string functionName, IArrowArrayStream args)
     {
+        // Provider-authored custom function: run the C# delegate over the input batch instead of SQL.
+        if (CustomScalar.TryGetValue($"{schemaName}.{functionName}", out var custom))
+        {
+            var customSchema = new Schema(new[] { custom.Result }, null);
+            using var input = args; // input stream disposed when done (result must be independent)
+            var inBatch = input.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+            if (inBatch is null)
+            {
+                return new InMemoryArrayStream(customSchema, System.Array.Empty<RecordBatch>());
+            }
+            var resultArray = custom.Invoke(inBatch);
+            var outBatch = new RecordBatch(customSchema, new[] { resultArray }, resultArray.Length);
+            return new InMemoryArrayStream(customSchema, new[] { outBatch });
+        }
+
         var qualified = Quote(schemaName) + "." + Quote(functionName);
         var rows = new List<object?[]>();
         int paramCount;
