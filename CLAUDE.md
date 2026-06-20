@@ -81,7 +81,8 @@ current code still uses the single-provider `mssql_net` naming):
   fn + `ARROWNET_META_FUNCTIONS`); **(4b) attach-time catalog-bound scalar UDFs DONE** (discovered scalar
   UDFs become `ScalarFunctionCatalogEntry` in `ArrowNetSchemaEntry`, resolved as `db.schema.fn(args)` and
   executed over Arrow — ABI v19); **(4c) attach-time catalog-bound table-valued functions DONE** (discovered
-  TVFs become `TableFunctionCatalogEntry`, resolved as `SELECT * FROM db.schema.tvf(args)` — ABI v20);
+  TVFs become `TableFunctionCatalogEntry`, resolved as `SELECT * FROM db.schema.tvf(args)`, with real
+  SQL-level projection + best-effort filter pushdown reusing the table scan's machinery — ABI v21);
   next: stored procs (sp_describe/EXEC/named params/_OUTPUT_), then load-time global, then table-in-out.
 
 ## Implementation status (current)
@@ -151,9 +152,11 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
   schema, func, out)` + `get_function_return_schema(…)` (each a zero-row Arrow stream whose schema gives
   the arg/return `LogicalType`s, via `PopulateReturnSchema`) + `execute_scalar(handle, schema, func, args,
   out)` (runs the UDF over an N-row arg batch; the managed side consumes `args`).
-- **ABI v20** entries (table functions): `get_function_output_schema(handle, schema, func, out)` (zero-row
-  Arrow stream = the TVF's output columns) + `execute_table(handle, schema, func, args, out)` (`args` =
-  1-row batch of the constant call args; `out` = the result rows).
+- **ABI v20/v21** entries (table functions): `get_function_output_schema(handle, schema, func, out)`
+  (zero-row Arrow stream = the TVF's output columns) + `execute_table(handle, schema, func, args, spec_json,
+  filter_values, out)` (`args` = 1-row batch of the constant call args; `spec_json`+`filter_values` carry
+  projection + best-effort filter pushdown exactly like `scan_table`; `out` = the result rows). The
+  `spec_json`/`filter_values` params were added at **v21**.
 
 ### Callable scalar UDFs (4b)
 - **Discovery**: `ArrowNetCatalog::LoadCatalog`/`RefreshCache` call `DiscoverFunctions` (reads
@@ -181,8 +184,7 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
 ### Callable table functions (4c)
 - **Scope**: inline + multi-statement **TVFs** (`kind=='table'`), output schema **static** from
   `INFORMATION_SCHEMA.ROUTINE_COLUMNS`. **Deferred**: stored procs (need `sp_describe_first_result_set`/
-  `EXEC`/named params/`_OUTPUT_`) and SQL-level projection/filter pushdown (today: local projection via
-  `arrow_ingest`, like `mssql_net_query`).
+  `EXEC`/named params/`_OUTPUT_`).
 - **Discovery + registration**: `LoadCatalog`/`RefreshCache` `AddTableFunction(name)` for every
   `kind=='table'` in a matched schema (`table_functions_`). `ArrowNetSchemaEntry::LookupEntry`/`Scan` handle
   `CatalogType::TABLE_FUNCTION_ENTRY` → `GetOrCreateTableFunction` builds a `TableFunctionCatalogEntry` and
@@ -193,13 +195,23 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
   (zero-row → `PopulateReturnSchema`, so the TVF isn't executed just to bind), then (2) installs a capturing
   `StreamFactory` (which **is** `std::function`) that marshals the constant call args (`input.inputs`) into a
   1-row Arrow batch (`ArrowAppender`+`ArrowProducer`) and calls `execute_table`. Reuses `ArrowStreamScan`/
-  `ArrowStreamInitGlobal`/`Local`; `projection_pushdown=true` (arrow_ingest maps requested columns locally).
+  `ArrowStreamInitGlobal`/`Local`.
+- **Projection + filter pushdown (real, SQL-level)**: the TVF reuses the **catalog table scan's** pushdown
+  machinery. `push_projection=true` on the bind_data + `projection_pushdown=true` + `pushdown_complex_filter
+  = ArrowNetComplexFilterPushdown` (extracted from `arrownet_table_entry.cpp` out of its anon namespace,
+  declared in `arrownet_table_entry.hpp`, shared by both scans). The scan factory forwards the request's
+  `spec_json`+`filter_values` to `execute_table`. So C# emits `SELECT <cols> FROM [s].[f](@a0,…) WHERE
+  <filter>` — inline TVFs get inlined by SQL Server → genuine pushdown. Best-effort + never-erase (DuckDB
+  re-applies every predicate), like the table scan.
 - **C# execution** (`SqlServerCatalog`): `GetFunctionOutputSchema` = typed-NULL `SELECT` reconstructed from
-  `INFORMATION_SCHEMA.ROUTINE_COLUMNS` (shared `BuildSqlType`); `ExecuteTable` reads row 0 of the args and
-  runs `SELECT * FROM [s].[f](@p0,…)` — streamed lazily (no buffering).
+  `INFORMATION_SCHEMA.ROUTINE_COLUMNS` (shared `BuildSqlType`); `ExecuteTable` binds the constant args as
+  `@a0…` (disjoint from the filter's `@p0…`) and delegates to the shared **`ScanFromSource`** helper (also
+  used by `ScanTable`), which builds the projected/filtered `SELECT … FROM <source> WHERE …` — streamed lazily.
 - **Verified**: inline TVF (`tf_nums(3)`→1,2,3), multi-column (`tf_pair(7,'hi')`), multi-statement
-  (`tf_ms`→squares), projection+filter (`sq>4`), and aggregation over a TVF. Committed test:
-  `test/verify_table_functions.test`.
+  (`tf_ms`→squares), and aggregation over a TVF. **Pushdown proven via the plan cache**: the statement that
+  reached SQL Server was `SELECT [id],[name],[salary] FROM [dbo].[tf_emp](@a0) WHERE [id] <> @p0` (column
+  list, not `*`; parameterized `WHERE`). Committed test: `test/verify_table_functions.test` (incl. a
+  `dm_exec_query_stats` proof that `FROM [dbo].[tf_ms] … WHERE …` reached the server).
 - **Filtering**: discovered scalar UDFs + TVFs are gated by the ATTACH `schema_filter` (icase `std::regex`,
   applied in `LoadCatalog`/`RefreshCache`); `table_filter` is table-only and does NOT apply to functions.
 - **Open design items (filters + refresh)** — deliberated, not yet built:
@@ -225,7 +237,7 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v20.** **Bump rule:** when you add a vtable entry OR change a signature, bump
+- **Current version: ABI v21.** **Bump rule:** when you add a vtable entry OR change a signature, bump
   **BOTH** `ARROWNET_ABI_VERSION` in `abi.h` AND `vtable->AbiVersion = N` in `Bootstrap.Initialize`,
   else the host throws "ABI version mismatch". Adding an *enum value* (e.g. a new metadata/alter kind)
   is additive and needs NO bump.

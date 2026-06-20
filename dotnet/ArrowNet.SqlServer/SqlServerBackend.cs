@@ -758,6 +758,18 @@ public sealed class SqlServerCatalog : IBackendCatalog
                                        IArrowArrayStream? filterValues)
     {
         var qualified = $"{Quote(schemaName)}.{Quote(tableName)}";
+        return ScanFromSource(qualified, System.Array.Empty<SqlParameter>(), specJson, filterValues);
+    }
+
+    // Builds + runs a projected/filtered SELECT over an arbitrary FROM <source> — a table
+    // (`[s].[t]`) or a parameterized TVF call (`[s].[f](@a0, ...)`). `sourceParams` are
+    // bound for the source (TVF args, named @a* so they never collide with the filter's
+    // @p*). Projection / TOP / ORDER BY / filter come from the scan spec; the filter is
+    // best-effort — on any failure we fall back to no WHERE (DuckDB re-applies every
+    // predicate, so correctness holds).
+    private IArrowArrayStream ScanFromSource(string source, IReadOnlyList<SqlParameter> sourceParams, string? specJson,
+                                             IArrowArrayStream? filterValues)
+    {
         var spec = ScanSpec.Parse(specJson);
 
         // Projection: SELECT only the requested columns (absent/empty => SELECT *).
@@ -786,7 +798,9 @@ public sealed class SqlServerCatalog : IBackendCatalog
                 filterValues = null; // consumed + disposed by ReadFilterValues
                 var builder = new FilterWhereBuilder(values);
                 var where = builder.Build(spec.Filter);
-                return ExecuteQuery($"SELECT {top}{columns} FROM {qualified} WHERE {where}{orderBy}", builder.Parameters);
+                var allParams = new List<SqlParameter>(sourceParams);
+                allParams.AddRange(builder.Parameters); // source @a* + filter @p* are disjoint
+                return ExecuteQuery($"SELECT {top}{columns} FROM {source} WHERE {where}{orderBy}", allParams);
             }
             catch
             {
@@ -795,7 +809,8 @@ public sealed class SqlServerCatalog : IBackendCatalog
         }
 
         filterValues?.Dispose();
-        return ExecuteQuery($"SELECT {top}{columns} FROM {qualified}{orderBy}");
+        return ExecuteQuery($"SELECT {top}{columns} FROM {source}{orderBy}",
+                            sourceParams.Count > 0 ? sourceParams : null);
     }
 
     // Reads the one-row filter value batch (column i == value i) into CLR values.
@@ -1172,37 +1187,32 @@ public sealed class SqlServerCatalog : IBackendCatalog
     }
 
     // Executes a TVF over its constant arguments (row 0 of the args stream, in param
-    // order) as `SELECT * FROM [s].[f](@p0, ...)` — streams the result lazily.
-    public IArrowArrayStream ExecuteTable(string schemaName, string functionName, IArrowArrayStream args)
+    // order) as `SELECT <cols> FROM [s].[f](@a0, ...) WHERE <filter>` — args bound as
+    // @a* (disjoint from the filter's @p*); projection + filter pushed via the spec.
+    public IArrowArrayStream ExecuteTable(string schemaName, string functionName, IArrowArrayStream args,
+                                          string? specJson, IArrowArrayStream? filterValues)
     {
         var qualified = Quote(schemaName) + "." + Quote(functionName);
-        object?[] argValues = System.Array.Empty<object?>();
+        var argParams = new List<SqlParameter>();
+        var argList = new StringBuilder();
         using (var reader = new ArrowDataReader(args))
         {
             int paramCount = reader.FieldCount;
             if (reader.Read())
             {
-                argValues = new object?[paramCount];
                 for (int c = 0; c < paramCount; c++)
                 {
-                    argValues[c] = reader.IsDBNull(c) ? null : reader.GetValue(c);
+                    if (c > 0)
+                    {
+                        argList.Append(", ");
+                    }
+                    var pn = $"@a{c}";
+                    argList.Append(pn);
+                    argParams.Add(new SqlParameter(pn, (reader.IsDBNull(c) ? null : reader.GetValue(c)) ?? (object)DBNull.Value));
                 }
             }
         }
-        var sb = new StringBuilder("SELECT * FROM ").Append(qualified).Append('(');
-        var sqlParams = new List<SqlParameter>();
-        for (int c = 0; c < argValues.Length; c++)
-        {
-            if (c > 0)
-            {
-                sb.Append(", ");
-            }
-            var pn = $"@p{c}";
-            sb.Append(pn);
-            sqlParams.Add(new SqlParameter(pn, argValues[c] ?? (object)DBNull.Value));
-        }
-        sb.Append(')');
-        return ExecuteQuery(sb.ToString(), sqlParams);
+        return ScanFromSource($"{qualified}({argList})", argParams, specJson, filterValues);
     }
 
     // Drops any DEFAULT constraint bound to a column (no-op if none).

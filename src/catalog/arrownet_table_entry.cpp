@@ -328,8 +328,12 @@ private:
 	vector<Value> &constants_;
 };
 
+} // namespace
+
 // pushdown_complex_filter: serialize the superset-safe predicates into bind_data and
 // LEAVE every expression in `filters` (best-effort) so DuckDB still applies them all.
+// Shared with the table-function scan (arrownet_schema_entry.cpp); declared in
+// arrownet_table_entry.hpp.
 void ArrowNetComplexFilterPushdown(ClientContext &, LogicalGet &get, FunctionData *bind_data_p,
                                    vector<unique_ptr<Expression>> &filters) {
 	auto &bind_data = bind_data_p->Cast<arrownet::ArrowStreamBindData>();
@@ -365,8 +369,6 @@ void ArrowNetComplexFilterPushdown(ClientContext &, LogicalGet &get, FunctionDat
 	json += "]}";
 	bind_data.filter_json = std::move(json);
 }
-
-} // namespace
 
 ArrowNetTableEntry::ArrowNetTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
                                        ArrowNetHandle handle, vector<idx_t> rowid_columns, LogicalType rowid_type)

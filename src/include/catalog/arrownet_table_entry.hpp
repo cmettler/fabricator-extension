@@ -12,6 +12,16 @@
 
 namespace duckdb {
 
+class LogicalGet;
+class Expression;
+
+//! pushdown_complex_filter callback shared by the catalog table scan AND the table-
+//! function (TVF) scan: serializes the superset-safe predicates into the scan's
+//! ArrowStreamBindData (filter_json + filter_constants) and LEAVES every filter in
+//! `filters` (best-effort — DuckDB re-applies them all, so an over-approximation is safe).
+void ArrowNetComplexFilterPushdown(ClientContext &context, LogicalGet &get, FunctionData *bind_data,
+                                   vector<unique_ptr<Expression>> &filters);
+
 class ArrowNetTableEntry : public TableCatalogEntry {
 public:
 	ArrowNetTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info, ArrowNetHandle handle,

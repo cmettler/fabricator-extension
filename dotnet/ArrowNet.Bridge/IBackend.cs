@@ -109,9 +109,12 @@ public interface IBackendCatalog : IDisposable
 
     /// <summary>
     /// Executes a table-valued function over its constant arguments: <paramref name="args"/> is a 1-row
-    /// stream of the argument values (in parameter order); returns the function's result rows.
+    /// stream of the argument values (in parameter order). <paramref name="specJson"/> (null => SELECT *)
+    /// + <paramref name="filterValues"/> (null => no filter) carry projection + best-effort filter
+    /// pushdown, exactly like <see cref="ScanTable"/>. Returns the function's result rows.
     /// </summary>
-    IArrowArrayStream ExecuteTable(string schemaName, string functionName, IArrowArrayStream args);
+    IArrowArrayStream ExecuteTable(string schemaName, string functionName, IArrowArrayStream args, string? specJson,
+                                   IArrowArrayStream? filterValues);
 
     /// <summary>
     /// Creates a table whose columns are described by <paramref name="columns"/>

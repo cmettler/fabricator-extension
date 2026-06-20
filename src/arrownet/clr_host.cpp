@@ -495,13 +495,14 @@ void GetFunctionOutputSchema(ArrowNetHandle handle, const std::string &schema, c
 }
 
 void ExecuteTable(ArrowNetHandle handle, const std::string &schema, const std::string &func, ArrowArrayStream &args,
-                  ArrowArrayStream &out) {
+                  const std::string &spec_json, ArrowArrayStream *filter_values, ArrowArrayStream &out) {
 	const ArrowNetVTable &vt = GetBridge();
 	if (!vt.execute_table) {
 		throw duckdb::IOException("ArrowNet: bridge does not provide execute_table");
 	}
 	char *err = nullptr;
-	int32_t rc = vt.execute_table(handle, schema.c_str(), func.c_str(), &args, &out, &err);
+	const char *spec = spec_json.empty() ? nullptr : spec_json.c_str();
+	int32_t rc = vt.execute_table(handle, schema.c_str(), func.c_str(), &args, spec, filter_values, &out, &err);
 	if (rc != ARROWNET_OK) {
 		ThrowManagedError(vt, err, "ArrowNet: execute_table failed");
 	}

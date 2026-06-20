@@ -46,12 +46,26 @@ SELECT n, sq FROM tfdb.dbo.tf_ms(3) ORDER BY n;
 2	4
 3	9
 
-# Projection (only sq) + a filter applied above the scan by DuckDB.
+# Projection (only sq) + filter (sq > 4) pushed INTO the TVF call.
 query I
 SELECT sq FROM tfdb.dbo.tf_ms(4) WHERE sq > 4 ORDER BY sq;
 ----
 9
 16
+
+# Proof the projection + filter were pushed to SQL Server (not just applied locally by
+# DuckDB): a statement `... FROM [dbo].[tf_ms](@a0) WHERE ...` reached the server.
+query I
+SELECT hit FROM mssql_net_query('tfdb',
+  'SELECT CAST(CASE WHEN EXISTS (
+     SELECT 1 FROM sys.dm_exec_query_stats qs
+     CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
+     WHERE CHARINDEX(''FROM [dbo].[tf_ms]'', st.text) > 0
+       AND CHARINDEX(''WHERE'', st.text) > 0
+       AND CHARINDEX(''dm_exec'', st.text) = 0
+   ) THEN 1 ELSE 0 END AS INT) AS hit');
+----
+1
 
 # A TVF composes with normal query operators (aggregate over its rows).
 query II

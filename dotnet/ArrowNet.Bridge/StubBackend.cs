@@ -64,8 +64,12 @@ public sealed class StubBackend : IBackend
         public IArrowArrayStream GetFunctionOutputSchema(string schemaName, string functionName) =>
             EmptyStringTable("result");
 
-        public IArrowArrayStream ExecuteTable(string schemaName, string functionName, IArrowArrayStream args) =>
-            EmptyStringTable("result");
+        public IArrowArrayStream ExecuteTable(string schemaName, string functionName, IArrowArrayStream args,
+                                              string? specJson, IArrowArrayStream? filterValues)
+        {
+            filterValues?.Dispose();
+            return EmptyStringTable("result");
+        }
 
         public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists,
                                 string? primaryKey, string? uniques, string? defaults, string? textType)

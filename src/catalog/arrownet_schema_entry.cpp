@@ -245,10 +245,12 @@ unique_ptr<FunctionData> ArrowNetTableFunctionBind(ClientContext &context, Table
 	arrownet::PopulateReturnSchema(context, *bind_data, return_types, names);
 
 	// 2) Scan factory: constant args -> 1-row Arrow batch -> execute_table (streams rows).
+	// The request carries projection + best-effort filter pushdown (spec_json/filter_values),
+	// built by the scan machinery from the projected column ids + the pushed filter tree.
 	auto properties = context.GetClientProperties();
 	auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(context, arg_types);
 	bind_data->factory = [handle, schema_name, func_name, arg_types, arg_names, arg_values, properties,
-	                      extension_types](const arrownet::ArrowScanRequest &, ArrowArrayStream &out) {
+	                      extension_types](const arrownet::ArrowScanRequest &req, ArrowArrayStream &out) {
 		DataChunk chunk;
 		chunk.Initialize(Allocator::DefaultAllocator(), arg_types);
 		for (idx_t c = 0; c < arg_values.size(); c++) {
@@ -261,8 +263,12 @@ unique_ptr<FunctionData> ArrowNetTableFunctionBind(ClientContext &context, Table
 		arrownet::ArrowProducer producer(arg_types, arg_names, properties);
 		producer.AddBatch(array);
 		producer.Finish();
-		arrownet::ExecuteTable(handle, schema_name, func_name, *producer.Stream(), out);
+		arrownet::ExecuteTable(handle, schema_name, func_name, *producer.Stream(), req.spec_json, req.filter_values,
+		                       out);
 	};
+	// Push the projected column list (mapped by name) + filters to SQL Server, like the
+	// catalog table scan — inline TVFs get inlined, so this is genuine pushdown.
+	bind_data->push_projection = true;
 	return std::move(bind_data);
 }
 
@@ -292,7 +298,11 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateTableFunction(ClientC
 
 	TableFunction tf(func_name, arg_types, arrownet::ArrowStreamScan, ArrowNetTableFunctionBind,
 	                 arrownet::ArrowStreamInitGlobal, arrownet::ArrowStreamInitLocal);
-	tf.projection_pushdown = true; // arrow_ingest maps requested columns (local projection)
+	tf.projection_pushdown = true;
+	// Best-effort filter pushdown into the TVF (reuses the table scan's serializer; the
+	// predicates are left in the plan so DuckDB re-applies them — an over-approximation
+	// is safe). `SELECT <cols> FROM tvf(@args) WHERE <filter>` is emitted by C#.
+	tf.pushdown_complex_filter = ArrowNetComplexFilterPushdown;
 	auto fn_info = make_shared_ptr<ArrowNetTableFunctionInfo>();
 	fn_info->handle = handle_;
 	fn_info->schema = name;

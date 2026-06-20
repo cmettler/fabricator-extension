@@ -25,7 +25,7 @@ public static unsafe class Bootstrap
             return ArrowNetStatus.InvalidArgument;
         }
 
-        vtable->AbiVersion = 20;
+        vtable->AbiVersion = 21;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -651,8 +651,8 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int ExecuteTable(nint handle, byte* schema, byte* func, CArrowArrayStream* args,
-                                    CArrowArrayStream* outStream, byte** err)
+    private static int ExecuteTable(nint handle, byte* schema, byte* func, CArrowArrayStream* args, byte* specJson,
+                                    CArrowArrayStream* filterValues, CArrowArrayStream* outStream, byte** err)
     {
         try
         {
@@ -663,8 +663,11 @@ public static unsafe class Bootstrap
             var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty);
             var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
+            var spec = Marshal.PtrToStringUTF8((nint)specJson); // null => SELECT *
             var argStream = CArrowArrayStreamImporter.ImportArrayStream(args); // we own it
-            CArrowArrayStreamExporter.ExportArrayStream(catalog.ExecuteTable(s, f, argStream), outStream);
+            IArrowArrayStream? filters =
+                filterValues is null ? null : CArrowArrayStreamImporter.ImportArrayStream(filterValues);
+            CArrowArrayStreamExporter.ExportArrayStream(catalog.ExecuteTable(s, f, argStream, spec, filters), outStream);
             return ArrowNetStatus.Ok;
         }
         catch (Exception ex)
