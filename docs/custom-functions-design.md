@@ -15,8 +15,9 @@ multi-provider architecture (see `CLAUDE.md` → target architecture).
   2. **Discovered** SQL Server stored procs / table-valued + scalar UDFs, mapped at ATTACH (catalog-bound).
 - A **nice C# authoring API** (lambda / attribute / derived-class — see §5), all lowering to one contract.
 
-Non-goals (now): aggregate / window functions; non-Arrow execution; the in/out pump protocol (Phase 4,
-sketched in §7).
+Non-goals (now): non-Arrow execution; the in/out pump protocol (Phase 4, sketched in §7); window
+functions. **Aggregate functions are future (after table-in-out) and get a separate, stateful contract —
+sketched in §9.**
 
 ## 1. Why not DuckDB's C API from C# (DuckDB.NET style)
 
@@ -46,13 +47,23 @@ Every custom function — authored or discovered — reduces to:
 // ArrowNet.Bridge (provider-agnostic)
 public enum FunctionKind { Scalar, Table, TableInOut }
 
+// Mirror DuckDB's enums (duckdb/function/function.hpp) 1:1 — C++ sets ScalarFunction.stability /
+// .null_handling straight from these.
+public enum FunctionStability    { Consistent, Volatile, ConsistentWithinQuery }   // = CONSISTENT / VOLATILE / CONSISTENT_WITHIN_QUERY
+public enum FunctionNullHandling { Default, Special }                              // = DEFAULT_NULL_HANDLING / SPECIAL_HANDLING
+
 public sealed record FunctionDeclaration(
     string  DeclId,            // stable id the ABI uses to invoke (e.g. "sqlserver:dbo.usp_orders")
-    string  Name,              // DuckDB-facing name (global) or catalog entry name
+    string  Name,              // bare function name (no schema prefix)
+    string? TargetSchema,      // DuckDB schema to place it in (see §3.1); null => main (global) | SQL schema (discovered)
     FunctionKind Kind,
-    Schema  ParamSchema,       // ordered params as an Arrow schema (field name = param name)
+    Schema  ParamSchema,       // ordered params; field name = param name; field metadata = named/optional (§3.4)
     Schema? OutputSchema,      // scalar: 1-field schema; table: fixed schema, or null = late-bound (call Bind)
     bool    LateBound,         // table: resolve OutputSchema via Bind(constArgs) at DuckDB bind time
+    bool    SupportsProjection,// table only (see §3.3): advertise projection pushdown — TVFs yes, EXEC procs no
+    bool    SupportsFilter,    // table only (see §3.3): accept best-effort pushed filters (never-erase)
+    FunctionStability    Stability,     // scalar only (see §3.2); table fns are opaque/volatile
+    FunctionNullHandling NullHandling,  // scalar only (see §3.2)
     string? Metadata);         // opaque provider JSON (e.g. how to invoke: EXEC vs SELECT, proc id)
 
 public interface IArrowFunction {
@@ -73,6 +84,117 @@ public interface IArrowFunction {
 Discovered SQL Server functions implement this **data-drivenly** (the provider synthesizes the
 declaration from `sys.*` and implements `Bind`/`Execute` via `sp_describe_first_result_set` + `EXEC` /
 `SELECT`). Authored functions get the sugar in §5, which compiles to the same interface.
+
+### 3.1 Placement: catalog & schema
+
+The **catalog is implicit by registration phase — never a declaration field, and never auto-created**
+(a DuckDB catalog is a database, not a function namespace). Only the **schema** (`TargetSchema`) is
+explicit:
+
+- **Catalog-bound (attach-time, the main path):** the catalog *is* the attached database (implicit from
+  the handle `list_catalog_functions` was called on). `TargetSchema` = the **SQL Server schema** the
+  proc/UDF lives in (`dbo`, `sales`), so `dbo.usp_orders` → `mssql.dbo.usp_orders`. C++ adds the function
+  to the matching `ArrowNetSchemaEntry`. No auto-create — schema discovery already produced those entries
+  (ensure discovery includes schemas that contain *only* procs/functions).
+- **Global (load-time):** the catalog is the **system catalog** (implicit; the only sensible target — a
+  function in an attached catalog would disappear on `DETACH`). `TargetSchema` defaults to `main` →
+  callable unqualified (`arrownet_query()`). A non-default schema in the system catalog *may* be
+  auto-created (a schema is a cheap namespace, unlike a catalog), but for **collision-avoidance across
+  providers prefer prefixing the name** (`mssql_query`, `dax_query`) over schema namespacing — a system
+  schema named `mssql` collides conceptually with an attached catalog named `mssql`. Generic functions
+  stay `arrownet_*`.
+
+### 3.2 Scalar semantics: stability & null handling
+
+C++ sets `ScalarFunction.stability` / `.null_handling` directly from the declaration. Both are
+**scalar-only** (table functions ignore them; a proc-as-TVF is opaque/volatile by nature).
+
+- **`Stability`** — `Consistent` (default): pure/deterministic, so DuckDB may constant-fold, cache, and
+  reorder it. `Volatile`: side effects or non-deterministic → always re-evaluated, never folded/reordered
+  (use for anything that writes, or reads changing state). `ConsistentWithinQuery`: stable for one query.
+  *Discovered SQL Server functions:* read `OBJECTPROPERTY(object_id,'IsDeterministic')` → deterministic
+  scalar UDF ⇒ `Consistent`, else `Volatile`. Anything proc-shaped / side-effecting ⇒ `Volatile`. *Authored:*
+  the author declares it (default `Consistent`).
+- **`NullHandling`** — `Default`: if **any** argument is NULL, DuckDB yields NULL **without invoking** the
+  function for that row (efficient; correct only for NULL-propagating functions). `Special`: the function
+  is invoked with NULL args and decides (needed for `coalesce`/`isnull`-style logic).
+  *Discovered SQL Server scalar UDFs:* SQL Server **does** call a UDF with NULL inputs and it may return
+  non-NULL, so to mirror semantics faithfully default discovered UDFs to **`Special`**; pick `Default`
+  only when the UDF is known NULL-propagating (it then skips NULL-arg rows *and* the per-batch round trip).
+  Since our scalar execution is **batched** (a `RecordBatch` of inputs → one `execute_scalar` → one column
+  back), `Special` just keeps NULL rows in the batch — no per-row cost.
+
+### 3.3 Table function pushdown (projection + optional filter)
+
+A custom table function is just a scan whose FROM source is a function invocation, so it **reuses the
+catalog-scan pushdown machinery** (`ScanSpec` / `FilterWhereBuilder` / projection-by-name in
+`arrow_ingest`) — no new pushdown code.
+
+- **DuckDB side:** the registered `TableFunction` sets `projection_pushdown = true`, and — when the decl
+  advertises `SupportsFilter` — `pushdown_complex_filter` using the **same never-erase, best-effort** model
+  as catalog scans (DuckDB always re-applies every predicate, so pushing a superset is always correct).
+  The output schema is still the **full** result set at bind (§6); projection trims columns and filters
+  trim rows at execute.
+- **Execution:** `execute_table` carries the same `spec_json` (`{columns, filter, top}`) + `filter_values`
+  as `scan_table`. C# applies them by **wrapping the invocation**:
+  `SELECT <cols> FROM schema.tvf(@args) WHERE <filter>` — SQL Server does the projection + filtering
+  (inline TVFs get inlined/optimized, so it's real pushdown). The same best-effort guard applies: any
+  filter node C# can't render is omitted and DuckDB re-applies it.
+- **TVF vs stored proc — the key distinction:** a **table-valued function** is wrappable in
+  `SELECT … FROM tvf(@args) WHERE …`, so it advertises `SupportsProjection = SupportsFilter = true` and
+  gets full pushdown. A **stored procedure** (`EXEC`) is *not* wrappable inline (nowhere to add a column
+  list / WHERE), so a proc-backed function sets both `false` and DuckDB applies projection + filters
+  locally. (`INSERT … EXEC #tmp` then filtering `#tmp` materializes server-side first — no pushdown win;
+  skip unless justified.)
+- `LateBound` composes: `bind_function` reports the full output schema; pushdown only changes which
+  rows/columns cross the wire at `execute_table`.
+- **Scope: scan-shaped table functions only** (scalar-arg TVFs/procs that plan as a `LogicalGet`).
+  **Table-in-out** functions are *operators*, not scans — they get **no** filter/projection pushdown; a
+  `WHERE`/projection on their output is applied by DuckDB above the operator (see §11).
+
+### 3.4 Parameters: positional, named, optional (stored procs)
+
+DuckDB distinguishes **positional arguments** (`fn(a, b)` — all required, matched by type) from **named
+parameters** (`fn(x := 1)` — supplied by name, optional by nature). Stored procs need the latter: they're
+called `EXEC proc @p = val`, their parameters are frequently **optional (have defaults)**, and DuckDB has
+no "optional positional" — so any optional parameter *must* be a named parameter.
+
+**Per-parameter attributes ride `ParamSchema` as Arrow field metadata** (the Airport convention — no extra
+ABI surface):
+- `arrownet:named` = `1` → register as a DuckDB **named parameter** (else a positional argument).
+- `arrownet:optional` = `1` → has a SQL Server default; not required (implies named).
+
+**Mapping by source:**
+- **Scalar UDF / table-valued function** → **positional** (`SELECT dbo.f(x, y)`,
+  `SELECT * FROM dbo.tvf(1, 'x')` — SQL Server TVFs are called positionally in a FROM clause; their args
+  can't be named there).
+- **Stored procedure** → **named parameters** (mirrors `EXEC @name = val` and handles optionals: the caller
+  supplies a subset; omitted optional params fall back to the proc's own `DEFAULT`). Discovered from
+  `sys.parameters` (name, type, `has_default_value`, `is_output`).
+
+**Flow:** C++ reads the field metadata → builds the `TableFunction`'s positional `arguments` vector and/or
+`named_parameters` map. At bind it gathers supplied values — positional from `input.inputs`, named from
+`input.named_parameters` — into the 1-row args batch whose **field names = the parameter names** (only
+supplied params present). C# reads those names → builds the parameterized call: `EXEC dbo.usp_orders
+@region=@p0, @top=@p1` (proc, only supplied params) or `SELECT … FROM dbo.tvf(@p0, @p1)` (TVF, positional).
+`bind_function` receives the same args batch, so `sp_describe_first_result_set` runs with the right
+`@params` declaration + values.
+
+**`OUTPUT` parameters** are surfaced as an extra **`_OUTPUT_` STRUCT column** appended to the result
+schema — one struct field per OUTPUT param (`sys.parameters.is_output = 1`; field name = param name, type
+from the param). Its value is the proc's post-execution output, identical for every row (broadcast). This
+is known at **bind** (from `sys.parameters`), so it composes with §6: bound schema = the `sp_describe`
+result columns **+** `_OUTPUT_`.
+
+> **Timing caveat:** SqlClient populates OUTPUT `SqlParameter` values only **after the reader is fully
+> consumed/closed** — so a proc *with* OUTPUT params can't stream while broadcasting `_OUTPUT_`. It must
+> **buffer its result set**, read the outputs, then emit rows with `_OUTPUT_` filled. Procs *without*
+> OUTPUT params still stream. (Acceptable: OUTPUT-param procs are typically small compute/status results,
+> not large scans.)
+
+Notes: the proc's integer **RETURN value** can ride the same struct as a conventional field (e.g.
+`_return`); an **INPUT/OUTPUT** param appears both in the args and in `_OUTPUT_`; a result column literally
+named `_OUTPUT_` would collide → detect and suffix. Variadic procs are out of scope.
 
 ## 4. The ABI (additions to `abi.h`)
 
@@ -102,8 +224,11 @@ int32_t (*bind_function)(ArrowNetHandle handle, const char *decl_id,
 //          Table:  args = 1-row batch of the constants    -> out = stream of result batches.
 int32_t (*execute_scalar)(ArrowNetHandle handle, const char *decl_id,
                           ArrowArrayStream *args, ArrowArrayStream *out, char **err);
-int32_t (*execute_table)(ArrowNetHandle handle, const char *decl_id,
-                         ArrowArrayStream *args, ArrowArrayStream *out, char **err);
+// Table: spec_json {columns, filter, top} + filter_values mirror scan_table (§3.3) — projection +
+// best-effort filter pushdown into the TVF. Both nullable => no pushdown (full result).
+int32_t (*execute_table)(ArrowNetHandle handle, const char *decl_id, ArrowArrayStream *args,
+                         const char *spec_json, ArrowArrayStream *filter_values,
+                         ArrowArrayStream *out, char **err);
 // execute_inout: Phase 4 (see §7).
 ```
 
@@ -208,13 +333,15 @@ TOPN(0, …)` to infer columns).
   `bind_function(decl_id, args)` → zero-row stream → `PopulateReturnSchema` → `return_types`/`names`.
 - **Execute callback**: marshal the arg chunk → Arrow (`arrow_produce`) → `execute_scalar`/`execute_table`
   → ingest the result (`arrow_ingest`; scalar = one column into the result vector, table = the scan loop).
+  Table functions also build the projection/filter `spec_json` + `filter_values` from `column_ids` + the
+  pushed filters and pass them to `execute_table` — the same code path as catalog scans (§3.3).
 - New core files `src/arrownet/arrow_functions.{hpp,cpp}` (or `src/include/arrownet/`) hold this — generic,
   reused by every provider.
 
 **Table-in-out (Phase 4):** DuckDB's `in_out_function` + `OperatorResultType` (`NEED_INPUT` /
 `HAVE_OUTPUT` / `FINISHED`). The ABI gets an `execute_inout` with an explicit framed protocol (push an
 input chunk as Arrow, pull output batches, status enum) — replacing Airport's fragile magic-string
-buffer signals. Designed when we get there.
+buffer signals. The hard part is **reliably detecting end-of-input** for cleanup/commit — see §11.
 
 ## 8. Open decisions
 
@@ -230,11 +357,158 @@ buffer signals. Designed when we get there.
 5. **Param passing** — named vs positional; how DuckDB named params (`fn(region := 'US')`) map to the
    proc's `@params`.
 
-## 9. Build-on points (already in the repo)
+## 9. Aggregate functions (future — after table-in-out)
+
+Aggregates are the heaviest function type and get a **separate, stateful contract** (not `IArrowFunction`).
+Two distinct features get conflated here — decide which is actually needed:
+
+**(a) Aggregate pushdown — recommended first; low plumbing, high value for SQL-resident data.** For
+`SELECT g, agg(x) FROM mssql.dbo.t GROUP BY g`, rewrite to server-side `SELECT g, agg(x) FROM t GROUP BY g`
+and stream the grouped result. **No state crosses the ABI** — SQL Server's engine does the work, including
+built-in and SQL Server CLR aggregates that already exist server-side. This is an optimizer / scan-rewrite
+feature (sibling to filter/TopN pushdown), not function registration, and it's the right path whenever the
+data lives in SQL Server.
+
+**(b) DuckDB-side custom aggregate — SQLCLR-style; heaviest.** Runs in DuckDB's engine over *any* data
+(local + remote mixed), backed by C#. DuckDB's lifecycle (`aggregate_function.hpp`) maps 1:1 onto SQLCLR's
+user-defined aggregate, so a **derived class is the right fit**:
+
+| DuckDB callback | SQLCLR | C# `ArrowAggregateFunction` |
+|---|---|---|
+| `initialize` / `size` | `Init` | `CreateState()` |
+| `update` (grouped, vectorized) | `Accumulate` | `Update(state, RecordBatch)` |
+| `combine` | `Merge` | `Combine(target, source)` |
+| `finalize` | `Terminate` | `Finalize(states) -> IArrowArray` |
+| `serialize` / `deserialize` | `Write` / `Read` | `Serialize` / `Deserialize(state)` (spill / distributed) |
+
+The hard parts (why it's last):
+- **State ownership across the ABI.** DuckDB allocates a raw state blob per group in its hash table; a C#
+  state is a managed object. So the blob holds only a **handle** (`aggregate_size` = 8 bytes) and C# owns a
+  state table keyed by it. Every `update`/`combine`/`finalize` crosses the boundary.
+- **Grouped `update` scatters vectorization.** DuckDB hands N input rows + N state pointers, and rows for
+  one group are *not* contiguous. ABI shape: `agg_update(ctx, input_batch, state_handles[])`; C# routes
+  rows to states — vectorized *across* the batch but scattered *within* a group.
+- **Spill/serialize.** Without `serialize`/`deserialize`, a large GROUP BY that spills to disk fails —
+  implement them (C# state → bytes) for robustness, or accept in-memory-only for v1. Window support
+  (`aggregate_window_t`) left null initially.
+
+**Recommendation:** do **(a) pushdown first** — most aggregation over SQL Server data wants server-side
+GROUP BY anyway, and it sidesteps the entire state-plumbing problem. Tackle **(b)** only when a genuine
+client-side / cross-source aggregate need appears; it's a separate `ArrowAggregateFunction` base + the
+state-handle ABI above, sequenced after table-in-out. (`FunctionKind` gains an `Aggregate` value, but
+aggregates do not use the `IArrowFunction` scalar/table contract.)
+
+## 10. Build-on points (already in the repo)
 
 `arrow_produce` (DataChunk→Arrow, for args), `arrow_ingest` / `PopulateReturnSchema` (Arrow→DuckDB, for
 results + schema-from-zero-row-stream), `ArrowNetSchemaEntry` (hang catalog function entries here),
 `ArrowDataReader` / `DbDataReaderArrowStream` (C# query→Arrow streaming for `Execute`), the
 SqlClient→Arrow type mapping (reused by `Bind`/describe). The handle/`BackendRegistry` dispatch (once
 multi-provider) routes each `execute_*` to the right backend automatically.
+
+## 11. Table-in-out functions (Phase 4) — reliable end-of-input
+
+(Reasoned from DuckDB internals + the described problem in `duckdb/duckdb#18222` — the issue wasn't
+fetchable from this build env.) Table-in-out streams a TABLE in and a TABLE out (e.g. push rows to a
+proc/TVP and read results back). Execution is the easy part; the hard part is reliably knowing **when the
+input stream has ended**, for cleanup / commit on the C# side.
+
+**What v1.5.4 exposes (verified):**
+- `TableFunction.in_out_function` (per input chunk) + `in_out_function_final` (flush final output). The
+  final callback is **not reliably invoked** on LIMIT short-circuit or error — the crux of #18222.
+- `PhysicalOperator::OperatorFinalize(Pipeline&, Event&, …)` (gated by `RequiresOperatorFinalize()`) is the
+  reliable pipeline-level finalize Mytherin points to — but it's a *physical-operator* hook;
+  `PhysicalTableInOutFunction` doesn't surface it through the `TableFunction` API.
+- `LogicalExtensionOperator::CreatePlan(ClientContext&, PhysicalPlanGenerator&)` lets an extension inject a
+  custom physical operator.
+
+**Two end signals — don't conflate:** **clean end** (input consumed, or finished early via a still-*successful*
+LIMIT) → `finish` (flush + commit); **abort** (error / cancellation) → `abort` (release + roll back).
+
+**Design (public hooks + RAII — no vgi code):**
+1. **Inject a pass-through operator above the in-out via `LogicalExtensionOperator`** (the supported form of
+   your idea B). An `OptimizerExtension` wraps the logical in-out node; the extension op's `CreatePlan`
+   builds a thin `PhysicalOperator` that forwards `Execute` to the in-out's output and implements
+   **`OperatorFinalize`** → C# `inout_finish`. Sitting above the in-out, by the time *its* finalize runs the
+   in-out's input is exhausted → a reliable clean-end signal, without subclassing/replacing
+   `PhysicalTableInOutFunction` (your idea A needs a physical-plan hook we don't have; this is the supported
+   equivalent).
+2. **Operator-state destructor = abort backstop (RAII).** The in-out's operator state is *ours*
+   (`GetOperatorState` returns our `unique_ptr`), and its destructor runs on **every** teardown path —
+   normal, LIMIT, error/cancel. On destruction, if `inout_finish` wasn't already signalled → C#
+   `inout_abort`. This catches the error path even `OperatorFinalize` misses.
+3. **Idempotent C# protocol** so correctness never hinges on a perfect event: `inout_finish` / `inout_abort`
+   are idempotent; the exchange cleans up on either; an optional server-side timeout reclaims an abandoned
+   exchange. (This robustness-by-design is the "creative" part — vgi solves it with bespoke operator
+   machinery; we lean on the documented `LogicalExtensionOperator` + RAII + an idempotent protocol.)
+
+**ABI sketch:** `inout_open(handle, decl_id, input_schema) -> session`; `inout_push(session, in_chunk, out)
+-> ResultType` (NEED_INPUT / HAVE_OUTPUT); `inout_finish(session, out)` (flush + commit, idempotent);
+`inout_abort(session)` (idempotent). C++ wiring: `in_out_function` → `inout_push`; the injected operator's
+`OperatorFinalize` → `inout_finish`; the operator-state destructor → `inout_abort` if not finished.
+
+**Parallel input — the UNION-ALL trap (the query that breaks Airport).** A table-in-out's table argument
+can be parallelizable, e.g.:
+
+```sql
+SELECT * FROM test1.utils.test_table_in_out(
+    'Sloane',
+    (SELECT txt:'hello', num:12 UNION ALL SELECT txt:'world', num:15));
 ```
+
+DuckDB runs the two `UNION ALL` branches as **separate input pipelines, possibly on different threads**,
+both feeding the one in-out operator → the function sees **multiple per-thread local states feeding one
+logical call**. Airport already holds the exchange in a **global** state (`AirportExchangeGlobalState`,
+confirmed in `storage/airport_exchange.hpp`) — so the failure is *not* "two exchanges." It's that **one**
+exchange/writer is fed and closed by **parallel, uncoordinated** local states: concurrent writes to the
+single Flight writer aren't thread-safe, and the writer tends to be finished/closed when the *first*
+branch ends rather than after *all* do. In other words a global session is **necessary but not
+sufficient** — you also need (1) **thread-safe / serialized feeding** into it and (2) a reliable
+**"all local states exhausted"** finalize before closing.
+
+**Streaming by default — the framework never buffers the input.** The parallel local states' input chunks
+are fed into **one global, bounded multi-producer channel** (the same `Channel<RecordBatch>` + backpressure
+pattern as the streaming bulk-write), which the single C# in-out session consumes as an
+`IAsyncEnumerable<RecordBatch>` and yields output back the same way (the Flight-style contract you liked).
+This **serializes the concurrent feed without buffering the whole input** — memory is bounded by the
+channel + backpressure — and the channel is **completed at the single all-inputs-done finalize** (§11's
+`OperatorFinalize` / global-state destructor, firing once after *every* branch/thread is exhausted). A
+per-operator active-producer count over the parallel local states, plus that global finalize, decide when
+the channel is complete. The `'Sloane' + UNION ALL` query then streams **both** branches' rows through the
+one session (interleaved — order across `UNION ALL` is undefined anyway) and returns one coherent result.
+
+**Internal buffering is the function's opt-in, never the framework's.** A particular C# in-out *may* choose
+to drain its input enumerable fully before emitting output — e.g. to send the whole table as a
+**Table-Valued Parameter** in one `EXEC`, or because its logic needs all rows first. It just
+`await foreach`-es to the end; the framework neither knows nor cares. (A buffered-TVP in-out is then simply
+one implementation; for a *bounded* input it can equivalently be written as a plain §3 table function with
+a table-valued argument.)
+
+The invariant: **one session in the global state, fed thread-safely through the bounded channel, closed by
+a single all-inputs-done finalize.** Global state alone (what Airport has) isn't enough without that
+coordination — the channel supplies the thread-safe serialized feed while staying fully streaming.
+
+> *Future throughput option:* a stateless/partitionable in-out could instead get an **independent session
+> per local state** (parallel branches processed concurrently, outputs concatenated) — more throughput, no
+> coordination. Not needed for the proc/exchange case, which requires one coherent input stream; revisit if
+> a partitionable workload appears.
+
+**No pushdown into an in-out.** Unlike scan-shaped table functions (§3.3), a table-in-out is an *operator*,
+not a `LogicalGet`, so it does **not** participate in filter/projection pushdown. A `WHERE` or column list
+on its **output** is applied by DuckDB *above* the operator (a `LogicalFilter`/projection on the in-out's
+result), never pushed into the function. (§3.3's `SELECT <cols> … WHERE <filter>` wrapping is only for
+scalar-arg TVFs/procs that plan as a scan.) So `SupportsProjection`/`SupportsFilter` are scan-table-only;
+they don't apply to in-out declarations.
+
+**Test matrix — operators *around* the in-out (these have historically broken it; regression-test each):**
+- **`UNION ALL` input** (parallel feed) — the query above; expect one coherent result with **both** rows.
+- **`ORDER BY` on the output** — a sort above the in-out is a pipeline-breaker that changes the
+  finalize / end-of-input timing; this **broke before**, so test it explicitly (e.g. add `ORDER BY num` to
+  the `'Sloane' + UNION ALL` query).
+- **`LIMIT` on the output** — short-circuit: `in_out_function_final` / `OperatorFinalize` may not fire, so
+  the destructor abort backstop must still clean up exactly once.
+- **`WHERE` on the output** — applied locally (no pushdown); verify correctness *and* that the in-out still
+  finalizes.
+- **aggregation / join above** the in-out.
+- **error / cancellation mid-stream** — abort path fires exactly once; the session/connection is released.
+- **empty input** and **large / unbounded input** (backpressure holds, memory stays bounded).
