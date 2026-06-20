@@ -167,9 +167,19 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
   typed Arrow, no hand-built array). Chunked to ≤ ~`2000/param_count` rows/query to stay under SQL Server's
   ~2100-parameter cap. Param/return schemas via typed-NULL `SELECT CAST(NULL AS <type>) …` reconstructed
   from `INFORMATION_SCHEMA.PARAMETERS` (shared `BuildSqlType` with `ColumnTypeInfo`).
-- **Verified**: `db.dbo.vf_add(1,2)=3`, string returns, NULL handling (`vf_inc(NULL)=0`), and a 5000-row
-  batch summing exactly (exercises 2048-row vectors × the C# param-limit chunking). Strict typing: a
-  BIGINT arg to an `INTEGER` UDF errors (no implicit narrowing) — cast required.
+- **Verified**: `db.dbo.vf_add(1,2)=3`, string returns, NULL handling (`vf_inc(NULL)=0`), NULL-in→NULL-out
+  (`vf_add(NULL,2)` IS NULL; per-row null bitmap round-trips), and a 5000-row batch summing exactly
+  (exercises 2048-row vectors × the C# param-limit chunking). Strict typing: a BIGINT arg to an `INTEGER`
+  UDF errors (no implicit narrowing) — cast required. Committed test: `test/verify_scalar_functions.test`.
+- **Filtering**: discovered scalar UDFs are gated by the ATTACH `schema_filter` (icase `std::regex`,
+  applied in `LoadCatalog`/`RefreshCache`); `table_filter` is table-only and does NOT apply to functions.
+- **Open design items (filters + refresh)** — deliberated, not yet built:
+  - A **`function_filter`** ATTACH option (icase regex on the function name), symmetric with `table_filter`,
+    to gate which UDFs register when a catalog has many. Today functions are schema-filtered only.
+  - **Targeted/scoped refresh.** `mssql_refresh_cache` is arity-1 (whole catalog); `mssql_invalidate_cache
+    (catalog[,schema[,table]])` accepts the schema/table args for native-extension compat but **ignores
+    them** (always a full refresh — a valid superset). Idea: rename the `table` arg to a generic **object
+    name** and implement scoped re-discovery for whichever kind it is (table/view/function/proc).
 
 ## C ABI contract (`src/include/arrownet/abi.h`)
 

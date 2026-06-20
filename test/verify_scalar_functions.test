@@ -1,0 +1,84 @@
+# name: test/verify_scalar_functions.test
+# description: Discovered scalar UDFs are callable as db.schema.fn(args) over Arrow, incl. NULL round-trips (4b)
+# group: [mssql]
+
+require mssql_net
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS scdb (TYPE mssql_net);
+
+# Scalar UDFs to call: sc_add (NULL-propagating), sc_inc (returns non-NULL for a NULL
+# arg), sc_greet (string). Distinct names so this can't clash with verify_functions.test.
+statement ok
+SELECT mssql_net_exec('scdb', 'CREATE OR ALTER FUNCTION dbo.sc_add(@a INT, @b INT) RETURNS INT AS BEGIN RETURN @a + @b END');
+
+statement ok
+SELECT mssql_net_exec('scdb', 'CREATE OR ALTER FUNCTION dbo.sc_inc(@a INT) RETURNS INT AS BEGIN RETURN ISNULL(@a, -1) + 1 END');
+
+statement ok
+SELECT mssql_net_exec('scdb', 'CREATE OR ALTER FUNCTION dbo.sc_greet(@n NVARCHAR(50)) RETURNS NVARCHAR(100) AS BEGIN RETURN ''Hello, '' + @n END');
+
+# Newly-created UDFs are picked up on a cache refresh (DDL via mssql_net_exec does not
+# auto-invalidate the catalog cache by default).
+statement ok
+SELECT mssql_refresh_cache('scdb');
+
+# Basic scalar call.
+query I
+SELECT scdb.dbo.sc_add(1, 2);
+----
+3
+
+# String return.
+query T
+SELECT scdb.dbo.sc_greet('World');
+----
+Hello, World
+
+# NULL in -> NULL out: T-SQL propagates NULL (NULL + 2 = NULL); the result null bit
+# survives the round-trip back into the DuckDB vector.
+query I
+SELECT scdb.dbo.sc_add(NULL::INTEGER, 2);
+----
+NULL
+
+# The NULL arg is still passed to the UDF (SPECIAL_HANDLING, not short-circuited to
+# NULL by DuckDB), so a UDF that handles NULL returns a non-NULL value.
+query I
+SELECT scdb.dbo.sc_inc(NULL::INTEGER);
+----
+0
+
+# Vectorized over a batch with mixed NULL args: the per-row null bitmap is preserved
+# (even i -> NULL arg -> NULL result; odd i -> i + 10).
+query II
+SELECT i, scdb.dbo.sc_add(CASE WHEN i % 2 = 0 THEN NULL ELSE i END::INTEGER, 10) AS r
+FROM range(1, 7) t(i) ORDER BY i;
+----
+1	11
+2	NULL
+3	13
+4	NULL
+5	15
+6	NULL
+
+# Strict typing: a BIGINT argument to an INTEGER UDF needs an explicit cast (DuckDB does
+# not implicitly narrow BIGINT -> INTEGER), so range()'s int64 fails to bind without one.
+statement error
+SELECT scdb.dbo.sc_add(i, 1) FROM range(1, 3) t(i);
+----
+No function matches
+
+statement ok
+SELECT mssql_net_exec('scdb', 'DROP FUNCTION IF EXISTS dbo.sc_add');
+
+statement ok
+SELECT mssql_net_exec('scdb', 'DROP FUNCTION IF EXISTS dbo.sc_inc');
+
+statement ok
+SELECT mssql_net_exec('scdb', 'DROP FUNCTION IF EXISTS dbo.sc_greet');
+
+statement ok
+DETACH scdb;
