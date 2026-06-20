@@ -117,6 +117,13 @@ public interface IBackendCatalog : IDisposable
                                    IArrowArrayStream? filterValues);
 
     /// <summary>
+    /// Executes a stored procedure over its constant arguments (<paramref name="args"/> = a 1-row stream of
+    /// the positional argument values); returns the procedure's first result set. No pushdown — a proc's
+    /// EXEC is not inline-wrappable, so DuckDB applies projection + filters above the scan.
+    /// </summary>
+    IArrowArrayStream ExecuteProc(string schemaName, string functionName, IArrowArrayStream args);
+
+    /// <summary>
     /// Creates a table whose columns are described by <paramref name="columns"/>
     /// (a non-nullable field maps to NOT NULL). The backend maps Arrow types to
     /// provider types and runs the provider CREATE TABLE. When

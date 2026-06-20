@@ -26,10 +26,11 @@ public:
 	//! the body are resolved lazily on first lookup.
 	void AddScalarFunction(const string &func_name);
 
-	//! Registers a discovered table-valued function name (called at attach time). Exposed
-	//! as a DuckDB table function so `SELECT * FROM db.schema.tvf(args)` resolves; arg +
-	//! output schemas are resolved lazily on first lookup.
-	void AddTableFunction(const string &func_name);
+	//! Registers a discovered table-returning routine (called at attach time): a TVF
+	//! (`is_proc=false`) or a stored procedure (`is_proc=true`). Both are exposed as a
+	//! DuckDB table function so `SELECT * FROM db.schema.fn(args)` resolves; arg + output
+	//! schemas are resolved lazily on first lookup (procs use sp_describe + EXEC).
+	void AddTableFunction(const string &func_name, bool is_proc);
 
 	//! Drops all cached table + function names and materialized entries (cache refresh).
 	void ClearTables();
@@ -65,7 +66,7 @@ private:
 	ArrowNetHandle handle_;
 	case_insensitive_map_t<string> table_types_; // table name -> "BASE TABLE" | "VIEW"
 	case_insensitive_set_t scalar_functions_;    // discovered scalar UDF names
-	case_insensitive_set_t table_functions_;     // discovered table-valued function names
+	case_insensitive_map_t<bool> table_functions_; // table-returning routine name -> is_proc (TVF=false)
 	mutex entry_lock_;
 	case_insensitive_map_t<unique_ptr<ArrowNetTableEntry>> entries_;
 	case_insensitive_map_t<unique_ptr<ScalarFunctionCatalogEntry>> function_entries_;

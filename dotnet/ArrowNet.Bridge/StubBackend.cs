@@ -71,6 +71,9 @@ public sealed class StubBackend : IBackend
             return EmptyStringTable("result");
         }
 
+        public IArrowArrayStream ExecuteProc(string schemaName, string functionName, IArrowArrayStream args) =>
+            EmptyStringTable("result");
+
         public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists,
                                 string? primaryKey, string? uniques, string? defaults, string? textType)
         {

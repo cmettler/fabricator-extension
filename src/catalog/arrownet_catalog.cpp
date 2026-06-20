@@ -115,8 +115,9 @@ void ArrowNetCatalog::LoadCatalog(ClientContext &context) {
 			ensure_schema(table.schema_name).AddTable(table.table_name, table.table_type);
 		}
 	}
-	// Expose discovered scalar UDFs + table-valued functions as callable catalog functions
-	// (db.schema.func(args) / SELECT * FROM db.schema.tvf(args)). Procedures are a later phase.
+	// Expose discovered routines as callable catalog functions: scalar UDFs
+	// (db.schema.fn(args)), table-valued functions and stored procedures
+	// (SELECT * FROM db.schema.fn(args) — procs run via EXEC, see AddTableFunction).
 	for (auto &func : DiscoverFunctions(handle_)) {
 		if (!filters.MatchSchema(func.schema_name)) {
 			continue;
@@ -124,7 +125,9 @@ void ArrowNetCatalog::LoadCatalog(ClientContext &context) {
 		if (func.kind == "scalar") {
 			ensure_schema(func.schema_name).AddScalarFunction(func.name);
 		} else if (func.kind == "table") {
-			ensure_schema(func.schema_name).AddTableFunction(func.name);
+			ensure_schema(func.schema_name).AddTableFunction(func.name, /*is_proc=*/false);
+		} else if (func.kind == "proc") {
+			ensure_schema(func.schema_name).AddTableFunction(func.name, /*is_proc=*/true);
 		}
 	}
 }
@@ -161,8 +164,9 @@ void ArrowNetCatalog::RefreshCache(ClientContext &context) {
 			ensure_schema(table.schema_name).AddTable(table.table_name, table.table_type);
 		}
 	}
-	// Expose discovered scalar UDFs + table-valued functions as callable catalog functions
-	// (db.schema.func(args) / SELECT * FROM db.schema.tvf(args)). Procedures are a later phase.
+	// Expose discovered routines as callable catalog functions: scalar UDFs
+	// (db.schema.fn(args)), table-valued functions and stored procedures
+	// (SELECT * FROM db.schema.fn(args) — procs run via EXEC, see AddTableFunction).
 	for (auto &func : DiscoverFunctions(handle_)) {
 		if (!filters.MatchSchema(func.schema_name)) {
 			continue;
@@ -170,7 +174,9 @@ void ArrowNetCatalog::RefreshCache(ClientContext &context) {
 		if (func.kind == "scalar") {
 			ensure_schema(func.schema_name).AddScalarFunction(func.name);
 		} else if (func.kind == "table") {
-			ensure_schema(func.schema_name).AddTableFunction(func.name);
+			ensure_schema(func.schema_name).AddTableFunction(func.name, /*is_proc=*/false);
+		} else if (func.kind == "proc") {
+			ensure_schema(func.schema_name).AddTableFunction(func.name, /*is_proc=*/true);
 		}
 	}
 }

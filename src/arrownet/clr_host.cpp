@@ -508,6 +508,19 @@ void ExecuteTable(ArrowNetHandle handle, const std::string &schema, const std::s
 	}
 }
 
+void ExecuteProc(ArrowNetHandle handle, const std::string &schema, const std::string &func, ArrowArrayStream &args,
+                 ArrowArrayStream &out) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.execute_proc) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide execute_proc");
+	}
+	char *err = nullptr;
+	int32_t rc = vt.execute_proc(handle, schema.c_str(), func.c_str(), &args, &out, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: execute_proc failed");
+	}
+}
+
 void ScanTable(ArrowNetHandle handle, const std::string &schema, const std::string &table, const std::string &spec_json,
                ArrowArrayStream *filter_values, ArrowArrayStream &out) {
 	const ArrowNetVTable &vt = GetBridge();

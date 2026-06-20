@@ -1,0 +1,46 @@
+# name: test/verify_stored_procs.test
+# description: Discovered stored procedures are callable as SELECT * FROM db.schema.proc(args) over Arrow
+# group: [mssql]
+
+require mssql_net
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS spdb (TYPE mssql_net);
+
+# A proc with a determinable first result set + a positional input parameter. Distinct
+# usp_sc name so this can't clash with other tests.
+statement ok
+SELECT mssql_net_exec('spdb', 'CREATE OR ALTER PROCEDURE dbo.usp_sc(@minSalary INT) AS BEGIN SET NOCOUNT ON; SELECT v.id, v.name, v.salary FROM (VALUES(1,''Alice'',100),(2,''Bob'',200),(3,''Carol'',300)) v(id,name,salary) WHERE v.salary >= @minSalary ORDER BY v.id; END');
+
+# New routines are picked up on a cache refresh (DDL via mssql_net_exec does not auto-invalidate).
+statement ok
+SELECT mssql_refresh_cache('spdb');
+
+# Proc resolved as a table function: output schema via sp_describe_first_result_set,
+# executed via EXEC dbo.usp_sc @p0.
+query ITI
+SELECT id, name, salary FROM spdb.dbo.usp_sc(200) ORDER BY id;
+----
+2	Bob	200
+3	Carol	300
+
+# Projection + filter are applied locally by DuckDB (a proc's EXEC is not inline-wrappable,
+# so there is no pushdown) — the result is still correct.
+query T
+SELECT name FROM spdb.dbo.usp_sc(100) WHERE salary > 200 ORDER BY name;
+----
+Carol
+
+# Aggregation over the proc's result set.
+query II
+SELECT count(*), sum(salary) FROM spdb.dbo.usp_sc(100);
+----
+3	600
+
+statement ok
+SELECT mssql_net_exec('spdb', 'DROP PROCEDURE IF EXISTS dbo.usp_sc');
+
+statement ok
+DETACH spdb;

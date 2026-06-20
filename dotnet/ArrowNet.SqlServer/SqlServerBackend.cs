@@ -1165,13 +1165,42 @@ public sealed class SqlServerCatalog : IBackendCatalog
         return result;
     }
 
+    // A stored procedure's first result-set columns via sp_describe_first_result_set
+    // (late-binding). system_type_name is the full SQL type, used directly. Empty =>
+    // no determinable result set (e.g. a proc that only does work / has OUTPUT params).
+    private List<(string name, string sqlType)> ProcResultColumns(string schemaName, string functionName)
+    {
+        using var connection = OpenConnection();
+        connection.Open();
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText =
+            "SELECT name, system_type_name FROM sys.dm_exec_describe_first_result_set_for_object(OBJECT_ID(@obj), 0) " +
+            "WHERE is_hidden = 0 ORDER BY column_ordinal";
+        cmd.Parameters.AddWithValue("@obj", $"{schemaName}.{functionName}");
+        var result = new List<(string, string)>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            var name = reader.IsDBNull(0) ? $"col{result.Count}" : reader.GetString(0);
+            var sqlType = reader.IsDBNull(1) ? "sql_variant" : reader.GetString(1);
+            result.Add((name, sqlType));
+        }
+        return result;
+    }
+
     public IArrowArrayStream GetFunctionOutputSchema(string schemaName, string functionName)
     {
+        // TVFs expose their result columns in ROUTINE_COLUMNS; stored procs don't, so fall
+        // back to sp_describe_first_result_set (late-binding) — this auto-routes by object kind.
         var cols = FunctionOutputColumns(schemaName, functionName);
         if (cols.Count == 0)
         {
+            cols = ProcResultColumns(schemaName, functionName);
+        }
+        if (cols.Count == 0)
+        {
             throw new ArgumentException(
-                $"mssql_net: '{schemaName}.{functionName}' has no table output columns (is it a table-valued function?)");
+                $"mssql_net: '{schemaName}.{functionName}' has no describable result set");
         }
         var sb = new StringBuilder("SELECT ");
         for (int i = 0; i < cols.Count; i++)
@@ -1213,6 +1242,35 @@ public sealed class SqlServerCatalog : IBackendCatalog
             }
         }
         return ScanFromSource($"{qualified}({argList})", argParams, specJson, filterValues);
+    }
+
+    // Executes a stored procedure over its constant arguments (row 0, positional) as
+    // `EXEC [s].[p] @p0, ...` — streams the first result set lazily. No pushdown (EXEC
+    // is not inline-wrappable); DuckDB applies projection + filters above the scan.
+    public IArrowArrayStream ExecuteProc(string schemaName, string functionName, IArrowArrayStream args)
+    {
+        var qualified = Quote(schemaName) + "." + Quote(functionName);
+        var argParams = new List<SqlParameter>();
+        var argList = new StringBuilder();
+        using (var reader = new ArrowDataReader(args))
+        {
+            int paramCount = reader.FieldCount;
+            if (reader.Read())
+            {
+                for (int c = 0; c < paramCount; c++)
+                {
+                    if (c > 0)
+                    {
+                        argList.Append(", ");
+                    }
+                    var pn = $"@p{c}";
+                    argList.Append(pn);
+                    argParams.Add(new SqlParameter(pn, (reader.IsDBNull(c) ? null : reader.GetValue(c)) ?? (object)DBNull.Value));
+                }
+            }
+        }
+        var sql = argList.Length > 0 ? $"EXEC {qualified} {argList}" : $"EXEC {qualified}";
+        return ExecuteQuery(sql, argParams);
     }
 
     // Drops any DEFAULT constraint bound to a column (no-op if none).

@@ -332,9 +332,16 @@ typedef struct ArrowNetVTable {
 	int32_t (*execute_table)(ArrowNetHandle handle, const char *schema, const char *func,
 	                         struct ArrowArrayStream *args, const char *spec_json,
 	                         struct ArrowArrayStream *filter_values, struct ArrowArrayStream *out, char **err);
+
+	// Execute a stored procedure over its constant arguments: `args` is a 1-row stream
+	// of the argument values (positional, in param order; consumed by the managed side);
+	// *out receives the procedure's first result set. No projection/filter pushdown — a
+	// proc's EXEC is not inline-wrappable, so DuckDB applies projection + filters locally.
+	int32_t (*execute_proc)(ArrowNetHandle handle, const char *schema, const char *func,
+	                        struct ArrowArrayStream *args, struct ArrowArrayStream *out, char **err);
 } ArrowNetVTable;
 
-#define ARROWNET_ABI_VERSION 21
+#define ARROWNET_ABI_VERSION 22
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

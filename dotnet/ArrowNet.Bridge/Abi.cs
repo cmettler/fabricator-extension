@@ -99,6 +99,9 @@ public unsafe struct ArrowNetVTable
     // int32 execute_table(void* handle, const char* schema, const char* func, ArrowArrayStream* args,
     //                     const char* spec_json, ArrowArrayStream* filter_values, ArrowArrayStream* out, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, byte*, CArrowArrayStream*, CArrowArrayStream*, byte**, int> ExecuteTable;
+
+    // int32 execute_proc(void* handle, const char* schema, const char* func, ArrowArrayStream* args, ArrowArrayStream* out, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, CArrowArrayStream*, byte**, int> ExecuteProc;
 }
 
 /// <summary>Mirrors <c>ArrowNetAlterKind</c> in abi.h.</summary>

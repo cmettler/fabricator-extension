@@ -83,7 +83,9 @@ current code still uses the single-provider `mssql_net` naming):
   executed over Arrow — ABI v19); **(4c) attach-time catalog-bound table-valued functions DONE** (discovered
   TVFs become `TableFunctionCatalogEntry`, resolved as `SELECT * FROM db.schema.tvf(args)`, with real
   SQL-level projection + best-effort filter pushdown reusing the table scan's machinery — ABI v21);
-  next: stored procs (sp_describe/EXEC/named params/_OUTPUT_), then load-time global, then table-in-out.
+  **(4d) attach-time catalog-bound stored procedures DONE** (procs with a determinable result set +
+  positional params resolved as table functions — `sp_describe` schema, `EXEC` execution, no pushdown —
+  ABI v22; named/optional params + `_OUTPUT_` deferred); next: load-time global, then table-in-out.
 
 ## Implementation status (current)
 
@@ -119,9 +121,9 @@ non-data: error-WORDING/number assertions (corpus expects native-extension text)
 (`mssql_pool_stats`/`mssql_open` diagnostics, krb5 connstr parser), COPY-to-temp-table empty-schema
 syntax, and catalog-after-rollback staleness.
 
-**Not yet / out of scope:** Airport-style **stored-proc** + **table-in-out** functions and **load-time
-global** functions (Phase 3 — scalar UDFs + TVFs done, see "Callable scalar UDFs (4b)" / "table functions
-(4c)"); connection
+**Not yet / out of scope:** Airport-style **table-in-out** functions and **load-time global** functions
+(Phase 3 — scalar UDFs, TVFs + stored procs done, see "Callable scalar UDFs (4b)" / "table functions (4c)" /
+"stored procedures (4d)"; proc **named/optional params** + **`_OUTPUT_`** still deferred); connection
 pooling knobs / `mssql_pool_stats` (ADO.NET pools by connstr already); COPY to temp tables
 (`mssql://cat//#t`, `cat..#t` — `ParseTarget` only accepts strict 3-part names); CHECK constraints +
 non-literal/expression DEFAULTs on CREATE; UPDATE/DELETE…RETURNING; length-aware VARCHAR mapping (so
@@ -157,6 +159,10 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
   filter_values, out)` (`args` = 1-row batch of the constant call args; `spec_json`+`filter_values` carry
   projection + best-effort filter pushdown exactly like `scan_table`; `out` = the result rows). The
   `spec_json`/`filter_values` params were added at **v21**.
+- **ABI v22** entry (stored procs): `execute_proc(handle, schema, func, args, out)` — runs `EXEC [s].[p]
+  @p0,…` over the 1-row positional args, `out` = the proc's first result set. No `spec_json` (a proc's EXEC
+  isn't inline-wrappable → no pushdown). Procs reuse `get_function_param_schema` (input params) +
+  `get_function_output_schema` (which auto-detects proc vs TVF — `sp_describe` vs `ROUTINE_COLUMNS`).
 
 ### Callable scalar UDFs (4b)
 - **Discovery**: `ArrowNetCatalog::LoadCatalog`/`RefreshCache` call `DiscoverFunctions` (reads
@@ -212,8 +218,25 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
   reached SQL Server was `SELECT [id],[name],[salary] FROM [dbo].[tf_emp](@a0) WHERE [id] <> @p0` (column
   list, not `*`; parameterized `WHERE`). Committed test: `test/verify_table_functions.test` (incl. a
   `dm_exec_query_stats` proof that `FROM [dbo].[tf_ms] … WHERE …` reached the server).
-- **Filtering**: discovered scalar UDFs + TVFs are gated by the ATTACH `schema_filter` (icase `std::regex`,
-  applied in `LoadCatalog`/`RefreshCache`); `table_filter` is table-only and does NOT apply to functions.
+### Callable stored procedures (4d)
+- **Scope**: procs with a **determinable first result set** + **positional required params**, resolved as
+  table functions (`SELECT * FROM db.schema.proc(args)`). **Deferred**: named/optional params (the design's
+  preferred shape — `EXEC @name=val`), `OUTPUT` params → `_OUTPUT_` struct, multiple result sets.
+- **Unified with TVFs**: `table_functions_` is now a `name -> is_proc` map; discovery routes `kind=='proc'`
+  → `AddTableFunction(name, true)`. Procs reuse the **same** `TableFunctionCatalogEntry` registration +
+  static bind via an `is_proc` flag on `ArrowNetTableFunctionInfo`. Proc branch: factory calls
+  `execute_proc` (not `execute_table`), `push_projection=false`, and **no** `pushdown_complex_filter` — a
+  proc's `EXEC` isn't inline-wrappable, so DuckDB projects + filters locally.
+- **Output schema** (`SqlServerCatalog.GetFunctionOutputSchema`): TVFs use `INFORMATION_SCHEMA.ROUTINE_COLUMNS`;
+  empty ⇒ a proc ⇒ `sys.dm_exec_describe_first_result_set_for_object(OBJECT_ID(@obj),0)` (`system_type_name`
+  is the full SQL type, used directly). Auto-routes by object kind. Empty ⇒ "no describable result set".
+- **Execution** (`ExecuteProc`): `EXEC [s].[p] @p0,…` over the 1-row positional args; streams the first
+  result set lazily. Input param types come from `INFORMATION_SCHEMA.PARAMETERS` (reused `get_function_param_schema`).
+- **Verified**: `SELECT * FROM db.dbo.usp_emp(200)` → rows; local projection+filter; aggregation. Committed
+  test: `test/verify_stored_procs.test`.
+
+- **Filtering**: discovered scalar UDFs + TVFs/procs are gated by the ATTACH `schema_filter` (icase
+  `std::regex`, applied in `LoadCatalog`/`RefreshCache`); `table_filter` is table-only and does NOT apply to functions.
 - **Open design items (filters + refresh)** — deliberated, not yet built:
   - A **`function_filter`** ATTACH option (icase regex on the function name), symmetric with `table_filter`,
     to gate which UDFs/TVFs register when a catalog has many. Today functions are schema-filtered only.
@@ -237,7 +260,7 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v21.** **Bump rule:** when you add a vtable entry OR change a signature, bump
+- **Current version: ABI v22.** **Bump rule:** when you add a vtable entry OR change a signature, bump
   **BOTH** `ARROWNET_ABI_VERSION` in `abi.h` AND `vtable->AbiVersion = N` in `Bootstrap.Initialize`,
   else the host throws "ABI version mismatch". Adding an *enum value* (e.g. a new metadata/alter kind)
   is additive and needs NO bump.

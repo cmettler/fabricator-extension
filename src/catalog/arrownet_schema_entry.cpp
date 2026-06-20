@@ -48,9 +48,9 @@ void ArrowNetSchemaEntry::AddScalarFunction(const string &func_name) {
 	function_entries_.erase(func_name);
 }
 
-void ArrowNetSchemaEntry::AddTableFunction(const string &func_name) {
+void ArrowNetSchemaEntry::AddTableFunction(const string &func_name, bool is_proc) {
 	lock_guard<mutex> lock(entry_lock_);
-	table_functions_.insert(func_name);
+	table_functions_[func_name] = is_proc;
 	table_function_entries_.erase(func_name);
 }
 
@@ -221,6 +221,7 @@ struct ArrowNetTableFunctionInfo : public TableFunctionInfo {
 	string func;
 	vector<LogicalType> arg_types;
 	vector<string> arg_names;
+	bool is_proc = false; // stored procedure (EXEC, no pushdown) vs TVF (FROM, pushdown)
 };
 
 // Bind a catalog-bound TVF: resolve the (fixed) output schema for the return types, then
@@ -235,6 +236,7 @@ unique_ptr<FunctionData> ArrowNetTableFunctionBind(ClientContext &context, Table
 	vector<LogicalType> arg_types = info.arg_types;
 	vector<string> arg_names = info.arg_names;
 	vector<Value> arg_values = input.inputs; // positional constant args
+	bool is_proc = info.is_proc;
 
 	auto bind_data = make_uniq<arrownet::ArrowStreamBindData>();
 
@@ -249,8 +251,8 @@ unique_ptr<FunctionData> ArrowNetTableFunctionBind(ClientContext &context, Table
 	// built by the scan machinery from the projected column ids + the pushed filter tree.
 	auto properties = context.GetClientProperties();
 	auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(context, arg_types);
-	bind_data->factory = [handle, schema_name, func_name, arg_types, arg_names, arg_values, properties,
-	                      extension_types](const arrownet::ArrowScanRequest &req, ArrowArrayStream &out) {
+	bind_data->factory = [handle, schema_name, func_name, arg_types, arg_names, arg_values, properties, extension_types,
+	                      is_proc](const arrownet::ArrowScanRequest &req, ArrowArrayStream &out) {
 		DataChunk chunk;
 		chunk.Initialize(Allocator::DefaultAllocator(), arg_types);
 		for (idx_t c = 0; c < arg_values.size(); c++) {
@@ -263,12 +265,17 @@ unique_ptr<FunctionData> ArrowNetTableFunctionBind(ClientContext &context, Table
 		arrownet::ArrowProducer producer(arg_types, arg_names, properties);
 		producer.AddBatch(array);
 		producer.Finish();
-		arrownet::ExecuteTable(handle, schema_name, func_name, *producer.Stream(), req.spec_json, req.filter_values,
-		                       out);
+		if (is_proc) {
+			// Procs run via EXEC (not inline-wrappable) → no projection/filter pushdown.
+			arrownet::ExecuteProc(handle, schema_name, func_name, *producer.Stream(), out);
+		} else {
+			arrownet::ExecuteTable(handle, schema_name, func_name, *producer.Stream(), req.spec_json,
+			                       req.filter_values, out);
+		}
 	};
-	// Push the projected column list (mapped by name) + filters to SQL Server, like the
-	// catalog table scan — inline TVFs get inlined, so this is genuine pushdown.
-	bind_data->push_projection = true;
+	// TVFs push the projected column list (by name) + filters to SQL Server (inline TVFs
+	// get inlined → genuine pushdown). Procs can't, so DuckDB projects/filters locally.
+	bind_data->push_projection = !is_proc;
 	return std::move(bind_data);
 }
 
@@ -281,9 +288,11 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateTableFunction(ClientC
 	if (cached != table_function_entries_.end()) {
 		return cached->second.get();
 	}
-	if (table_functions_.find(func_name) == table_functions_.end()) {
+	auto kind_it = table_functions_.find(func_name);
+	if (kind_it == table_functions_.end()) {
 		return nullptr;
 	}
+	bool is_proc = kind_it->second;
 
 	vector<string> arg_names;
 	vector<LogicalType> arg_types;
@@ -299,16 +308,20 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateTableFunction(ClientC
 	TableFunction tf(func_name, arg_types, arrownet::ArrowStreamScan, ArrowNetTableFunctionBind,
 	                 arrownet::ArrowStreamInitGlobal, arrownet::ArrowStreamInitLocal);
 	tf.projection_pushdown = true;
-	// Best-effort filter pushdown into the TVF (reuses the table scan's serializer; the
-	// predicates are left in the plan so DuckDB re-applies them — an over-approximation
-	// is safe). `SELECT <cols> FROM tvf(@args) WHERE <filter>` is emitted by C#.
-	tf.pushdown_complex_filter = ArrowNetComplexFilterPushdown;
+	if (!is_proc) {
+		// Best-effort filter pushdown into the TVF (reuses the table scan's serializer; the
+		// predicates are left in the plan so DuckDB re-applies them — an over-approximation
+		// is safe). `SELECT <cols> FROM tvf(@args) WHERE <filter>` is emitted by C#. Procs
+		// are not inline-wrappable, so they get no filter pushdown (DuckDB filters locally).
+		tf.pushdown_complex_filter = ArrowNetComplexFilterPushdown;
+	}
 	auto fn_info = make_shared_ptr<ArrowNetTableFunctionInfo>();
 	fn_info->handle = handle_;
 	fn_info->schema = name;
 	fn_info->func = func_name;
 	fn_info->arg_types = arg_types;
 	fn_info->arg_names = arg_names;
+	fn_info->is_proc = is_proc;
 	tf.function_info = std::move(fn_info);
 
 	CreateTableFunctionInfo info(std::move(tf));
@@ -372,7 +385,7 @@ void ArrowNetSchemaEntry::Scan(ClientContext &context, CatalogType type,
 		{
 			lock_guard<mutex> lock(entry_lock_);
 			for (auto &fn : table_functions_) {
-				names.push_back(fn);
+				names.push_back(fn.first);
 			}
 		}
 		for (auto &fn : names) {
