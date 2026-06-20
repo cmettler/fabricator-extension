@@ -1021,7 +1021,9 @@ public sealed class SqlServerCatalog : IBackendCatalog
             "SELECT PARAMETER_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE, " +
             "DATETIME_PRECISION FROM INFORMATION_SCHEMA.PARAMETERS " +
             "WHERE SPECIFIC_SCHEMA = @s AND SPECIFIC_NAME = @f AND ORDINAL_POSITION " +
-            (wantReturn ? "= 0" : "> 0 ORDER BY ORDINAL_POSITION");
+            // Input params only: PARAMETER_MODE='IN'. Functions are always IN (no-op); for
+            // a proc this excludes OUTPUT params (mode 'INOUT'), which are handled separately.
+            (wantReturn ? "= 0" : "> 0 AND PARAMETER_MODE = 'IN' ORDER BY ORDINAL_POSITION");
         cmd.Parameters.AddWithValue("@s", schemaName);
         cmd.Parameters.AddWithValue("@f", functionName);
         var result = new List<(string, string)>();
@@ -1188,14 +1190,56 @@ public sealed class SqlServerCatalog : IBackendCatalog
         return result;
     }
 
+    // A stored procedure's OUTPUT parameters (PARAMETER_MODE 'INOUT'), each with a
+    // reconstructed SQL type, in ordinal order. De-@'d names. Empty => none.
+    private List<(string name, string sqlType)> ProcOutputParams(string schemaName, string functionName)
+    {
+        using var connection = OpenConnection();
+        connection.Open();
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText =
+            "SELECT PARAMETER_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE, " +
+            "DATETIME_PRECISION FROM INFORMATION_SCHEMA.PARAMETERS " +
+            "WHERE SPECIFIC_SCHEMA = @s AND SPECIFIC_NAME = @f AND PARAMETER_MODE = 'INOUT' ORDER BY ORDINAL_POSITION";
+        cmd.Parameters.AddWithValue("@s", schemaName);
+        cmd.Parameters.AddWithValue("@f", functionName);
+        var result = new List<(string, string)>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            var name = (reader.IsDBNull(0) ? "" : reader.GetString(0)).TrimStart('@');
+            if (string.IsNullOrEmpty(name))
+            {
+                name = $"out{result.Count}";
+            }
+            int? charLen = reader.IsDBNull(2) ? null : Convert.ToInt32(reader.GetValue(2));
+            int? numPrec = reader.IsDBNull(3) ? null : Convert.ToInt32(reader.GetValue(3));
+            int numScale = reader.IsDBNull(4) ? 0 : Convert.ToInt32(reader.GetValue(4));
+            int? dtPrec = reader.IsDBNull(5) ? null : Convert.ToInt32(reader.GetValue(5));
+            result.Add((name, BuildSqlType(reader.GetString(1), charLen, numPrec, numScale, dtPrec)));
+        }
+        return result;
+    }
+
     public IArrowArrayStream GetFunctionOutputSchema(string schemaName, string functionName)
     {
-        // TVFs expose their result columns in ROUTINE_COLUMNS; stored procs don't, so fall
-        // back to sp_describe_first_result_set (late-binding) — this auto-routes by object kind.
+        // TVFs expose their result columns in ROUTINE_COLUMNS; stored procs don't.
         var cols = FunctionOutputColumns(schemaName, functionName);
         if (cols.Count == 0)
         {
-            cols = ProcResultColumns(schemaName, functionName);
+            // A proc with OUTPUT params returns the outputs (+ the integer RETURN value) as
+            // flat columns — its own result set, if any, is ignored; otherwise (no outputs)
+            // its first result set via sp_describe_first_result_set (late-binding).
+            var outs = ProcOutputParams(schemaName, functionName);
+            if (outs.Count > 0)
+            {
+                outs.Add(("return_value", "int"));
+                cols = outs;
+            }
+            else
+            {
+                cols = ProcResultColumns(schemaName, functionName);
+            }
         }
         if (cols.Count == 0)
         {
@@ -1253,7 +1297,7 @@ public sealed class SqlServerCatalog : IBackendCatalog
     {
         var qualified = Quote(schemaName) + "." + Quote(functionName);
         var argParams = new List<SqlParameter>();
-        var assignments = new List<string>();
+        var assignments = new List<string>(); // @<inputParamName> = @p<c>, from the supplied named args
         using (var reader = new ArrowDataReader(args))
         {
             int paramCount = reader.FieldCount;
@@ -1263,13 +1307,36 @@ public sealed class SqlServerCatalog : IBackendCatalog
                 {
                     var pn = $"@p{c}";
                     argParams.Add(new SqlParameter(pn, (reader.IsDBNull(c) ? null : reader.GetValue(c)) ?? (object)DBNull.Value));
-                    // Named: @<paramName> = @p<c>. The field name is the proc's parameter name.
                     assignments.Add($"@{reader.GetName(c)} = {pn}");
                 }
             }
         }
-        var sql = assignments.Count > 0 ? $"EXEC {qualified} {string.Join(", ", assignments)}" : $"EXEC {qualified}";
-        return ExecuteQuery(sql, argParams);
+
+        var outs = ProcOutputParams(schemaName, functionName);
+        if (outs.Count == 0)
+        {
+            // No OUTPUT params: return the proc's first result set.
+            var exec = assignments.Count > 0 ? $"EXEC {qualified} {string.Join(", ", assignments)}" : $"EXEC {qualified}";
+            return ExecuteQuery(exec, argParams);
+        }
+
+        // OUTPUT params: capture them (+ the integer RETURN value) via T-SQL locals and
+        // SELECT them as a flat 1-row result set (the proc's own result set is ignored).
+        // Avoids the SqlParameter Direction=Output timing caveat (no buffering needed).
+        var decls = new List<string>();
+        foreach (var (name, sqlType) in outs)
+        {
+            decls.Add($"@{name} {sqlType}");
+            assignments.Add($"@{name} = @{name} OUTPUT");
+        }
+        decls.Add("@_rv int");
+        var selects = outs.Select(o => $"@{o.name} AS {Quote(o.name)}").ToList();
+        selects.Add("@_rv AS [return_value]");
+        var batch =
+            $"DECLARE {string.Join(", ", decls)}; " +
+            $"EXEC @_rv = {qualified} {string.Join(", ", assignments)}; " +
+            $"SELECT {string.Join(", ", selects)};";
+        return ExecuteQuery(batch, argParams);
     }
 
     // Drops any DEFAULT constraint bound to a column (no-op if none).

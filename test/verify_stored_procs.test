@@ -17,6 +17,10 @@ SELECT mssql_net_exec('spdb', 'CREATE OR ALTER PROCEDURE dbo.usp_sc(@minSalary I
 statement ok
 SELECT mssql_net_exec('spdb', 'CREATE OR ALTER PROCEDURE dbo.usp_opt(@base INT, @bonus INT = 50) AS BEGIN SET NOCOUNT ON; SELECT @base + @bonus AS total; END');
 
+# A proc with OUTPUT params (+ an integer RETURN value) and no meaningful result set.
+statement ok
+SELECT mssql_net_exec('spdb', 'CREATE OR ALTER PROCEDURE dbo.usp_outp(@a INT, @b INT, @sum INT OUTPUT, @diff INT OUTPUT) AS BEGIN SET NOCOUNT ON; SET @sum=@a+@b; SET @diff=@a-@b; RETURN 42; END');
+
 # New routines are picked up on a cache refresh (DDL via mssql_net_exec does not auto-invalidate).
 statement ok
 SELECT mssql_refresh_cache('spdb');
@@ -54,11 +58,27 @@ SELECT total FROM spdb.dbo.usp_opt(base := 10, bonus := 5);
 ----
 15
 
+# OUTPUT params are returned as flat columns (no struct nesting) plus the integer RETURN
+# value; the proc's own result set, if any, is ignored. Inputs are still named.
+query III
+SELECT sum, diff, return_value FROM spdb.dbo.usp_outp(a := 10, b := 3);
+----
+13	7	42
+
+# A non-output column projects locally (no pushdown for procs).
+query I
+SELECT diff FROM spdb.dbo.usp_outp(a := 20, b := 5);
+----
+15
+
 statement ok
 SELECT mssql_net_exec('spdb', 'DROP PROCEDURE IF EXISTS dbo.usp_sc');
 
 statement ok
 SELECT mssql_net_exec('spdb', 'DROP PROCEDURE IF EXISTS dbo.usp_opt');
+
+statement ok
+SELECT mssql_net_exec('spdb', 'DROP PROCEDURE IF EXISTS dbo.usp_outp');
 
 statement ok
 DETACH spdb;
