@@ -57,9 +57,10 @@ public sealed record FunctionDeclaration(
     string  Name,              // bare function name (no schema prefix)
     string? TargetSchema,      // DuckDB schema to place it in (see §3.1); null => main (global) | SQL schema (discovered)
     FunctionKind Kind,
-    Schema  ParamSchema,       // ordered params; field name = param name; field metadata = named/optional (§3.4)
+    Schema  ParamSchema,       // ordered params — EMPTY schema (0 fields) = no args, never null; field
+                               // name = param name, field metadata = named/optional (§3.4)
     Schema? OutputSchema,      // scalar: 1-field schema; table: fixed schema, or null = late-bound (call Bind)
-    bool    LateBound,         // table: resolve OutputSchema via Bind(constArgs) at DuckDB bind time
+    bool    LateBound,         // table: resolve OutputSchema via Bind(args) at DuckDB bind time
     bool    SupportsProjection,// table only (see §3.3): advertise projection pushdown — TVFs yes, EXEC procs no
     bool    SupportsFilter,    // table only (see §3.3): accept best-effort pushed filters (never-erase)
     FunctionStability    Stability,     // scalar only (see §3.2); table fns are opaque/volatile
@@ -69,17 +70,32 @@ public sealed record FunctionDeclaration(
 public interface IArrowFunction {
     FunctionDeclaration Declaration { get; }
 
-    // Table (late-bound) only: compute the output schema from the constant args. Scalars/fixed tables
-    // return Declaration.OutputSchema. May run a provider round trip (e.g. sp_describe_first_result_set).
-    Schema Bind(IReadOnlyList<object?> constantArgs);
+    // Args are always a RecordBatch — never marshalled to object[] (keeps it all-Arrow, typed, named).
+    //   • Table (constant args): a 0-or-1-row batch — one column per SUPPLIED parameter, field NAME = param
+    //     name, field METADATA = named/optional (§3.4). 1 row carries the constant values; 0 rows conveys
+    //     just the schema/types (for binds that only need types). Named vs positional is read off the schema.
+    //   • Scalar: an N-row batch (the input vectors), columns = ParamSchema order.
 
-    // Scalar: args = one RecordBatch (N rows, ParamSchema columns) -> one IArrowArray (N rows).
+    // Table (late-bound) only: compute the output schema from the constant-args batch. Scalars/fixed tables
+    // return Declaration.OutputSchema. May run a provider round trip (e.g. sp_describe_first_result_set).
+    Schema Bind(RecordBatch args);
+
+    // Scalar: N-row args batch -> one IArrowArray (N rows).
     IArrowArray  ExecuteScalar(RecordBatch args);
 
-    // Table: constant args -> a stream of result batches (matching the bound output schema).
-    IArrowArrayStream ExecuteTable(IReadOnlyList<object?> constantArgs);
+    // Table: the 0-or-1-row constant-args batch -> a stream of result batches (matching the bound schema).
+    IArrowArrayStream ExecuteTable(RecordBatch args);
 }
 ```
+
+**Args are a `RecordBatch`, and named args ride the schema** (your question). The args batch's **field
+names = parameter names** and **field metadata = the named/optional attributes** (§3.4), so the function
+reads which column is which param off `args.Schema` rather than relying on position — and only *supplied*
+params are present (omitted optionals are simply absent → the proc's `DEFAULT` applies). C++ builds this
+batch from `input.inputs` (positional) + `input.named_parameters` (named), naming each column after its
+parameter. (A small typed accessor — `args.GetString("region")`, `args.GetInt32(0)` — can wrap the batch
+for authoring ergonomics, but the contract is the `RecordBatch`.) This is the same Arrow object the ABI
+already carries as the `args` stream, so there's no `object[]` conversion layer on either side.
 
 Discovered SQL Server functions implement this **data-drivenly** (the provider synthesizes the
 declaration from `sys.*` and implements `Bind`/`Execute` via `sp_describe_first_result_set` + `EXEC` /
