@@ -1,0 +1,40 @@
+# name: test/verify_functions.test
+# description: mssql_net_functions(catalog) discovers SQL Server routines (scalar/table UDFs, procs)
+# group: [mssql]
+
+require mssql_net
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS fdb (TYPE mssql_net);
+
+# A scalar UDF and an inline table-valued UDF to discover.
+statement ok
+SELECT mssql_net_exec('fdb', 'CREATE OR ALTER FUNCTION dbo.vf_add(@a INT, @b INT) RETURNS INT AS BEGIN RETURN @a + @b END');
+
+statement ok
+SELECT mssql_net_exec('fdb', 'CREATE OR ALTER FUNCTION dbo.tvf_one(@n INT) RETURNS TABLE AS RETURN (SELECT @n AS value)');
+
+# Discovery: kind + param_count for both (ordered by name).
+query TTI
+SELECT name, kind, param_count FROM mssql_net_functions('fdb')
+WHERE schema_name = 'dbo' AND name IN ('vf_add', 'tvf_one') ORDER BY name;
+----
+tvf_one	table	1
+vf_add	scalar	2
+
+# Scalar return type is surfaced.
+query T
+SELECT return_type FROM mssql_net_functions('fdb') WHERE schema_name = 'dbo' AND name = 'vf_add';
+----
+int
+
+statement ok
+SELECT mssql_net_exec('fdb', 'DROP FUNCTION IF EXISTS dbo.vf_add');
+
+statement ok
+SELECT mssql_net_exec('fdb', 'DROP FUNCTION IF EXISTS dbo.tvf_one');
+
+statement ok
+DETACH fdb;

@@ -704,8 +704,24 @@ public sealed class SqlServerCatalog : IBackendCatalog
         MetadataKind.RowId => ExecuteQuery(RowIdSql(Require(schema, table).schema, Require(schema, table).table)),
         MetadataKind.RowCount => ExecuteQuery(RowCountSql(Require(schema, table).schema, Require(schema, table).table)),
         MetadataKind.ColumnNdv => ExecuteQuery(ColumnNdvSql(Require(schema, table).schema, Require(schema, table).table)),
+        MetadataKind.Functions => ExecuteQuery(FunctionsSql),
         _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "mssql_net: unknown metadata kind"),
     };
+
+    // Discovered routines (user scalar/table functions + procedures), uniform shape
+    // (schema_name, name, kind, param_count, return_type). For scalar functions the
+    // return value is sys.parameters.parameter_id = 0; input params are parameter_id > 0.
+    private const string FunctionsSql =
+        "SELECT s.name AS schema_name, o.name AS name, " +
+        "CASE o.type WHEN 'FN' THEN 'scalar' WHEN 'FS' THEN 'scalar' " +
+        "WHEN 'IF' THEN 'table' WHEN 'TF' THEN 'table' WHEN 'FT' THEN 'table' " +
+        "WHEN 'P' THEN 'proc' WHEN 'PC' THEN 'proc' ELSE 'other' END AS kind, " +
+        "(SELECT COUNT(*) FROM sys.parameters p WHERE p.object_id = o.object_id AND p.parameter_id > 0) AS param_count, " +
+        "ISNULL((SELECT t.name FROM sys.parameters p JOIN sys.types t ON p.user_type_id = t.user_type_id " +
+        "WHERE p.object_id = o.object_id AND p.parameter_id = 0), '') AS return_type " +
+        "FROM sys.objects o JOIN sys.schemas s ON o.schema_id = s.schema_id " +
+        "WHERE o.type IN ('FN','FS','IF','TF','FT','P','PC') AND o.is_ms_shipped = 0 " +
+        "ORDER BY s.name, o.name";
 
     // Per-column distinct-value estimate (NDV) from existing statistics — (column,
     // ndv) rows. Derived from the leading-column histogram of each stats object:

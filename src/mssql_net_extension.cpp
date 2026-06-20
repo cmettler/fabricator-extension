@@ -179,6 +179,35 @@ static unique_ptr<FunctionData> QueryBind(ClientContext &context, TableFunctionB
 	return std::move(bind_data);
 }
 
+// --- mssql_net_functions(connection VARCHAR) ---------------------------------
+// Lists the routines (user scalar/table functions + procedures) discovered in the
+// attached catalog / connection: (schema_name, name, kind, param_count, return_type).
+// Diagnostic / introspection; the discovery SQL lives entirely in the C# backend.
+struct MssqlNetFunctionsBindData : public arrownet::ArrowStreamBindData {
+	ArrowNetHandle handle = nullptr;
+	bool owns_handle = true; // false when borrowed from an attached catalog
+	~MssqlNetFunctionsBindData() override {
+		if (owns_handle) {
+			arrownet::CloseCatalog(handle);
+		}
+	}
+};
+
+static unique_ptr<FunctionData> FunctionsBind(ClientContext &context, TableFunctionBindInput &input,
+                                              vector<LogicalType> &return_types, vector<string> &names) {
+	auto connection = input.inputs[0].GetValue<string>();
+
+	auto bind_data = make_uniq<MssqlNetFunctionsBindData>();
+	bind_data->handle = ResolveConnection(context, connection, bind_data->owns_handle);
+	auto handle = bind_data->handle;
+	bind_data->factory = [handle](const arrownet::ArrowScanRequest &, ArrowArrayStream &out) {
+		arrownet::GetMetadata(handle, ARROWNET_META_FUNCTIONS, "", "", out);
+	};
+
+	arrownet::PopulateReturnSchema(context, *bind_data, return_types, names);
+	return std::move(bind_data);
+}
+
 // --- mssql_net_exec(connection_string VARCHAR, sql VARCHAR) -> BIGINT --------
 // Executes arbitrary T-SQL (DDL/DML/EXEC) against SQL Server and returns the
 // number of rows affected. Volatile (always executed, never constant-folded).
@@ -282,6 +311,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                       arrownet::ArrowStreamInitLocal);
 	query_fn.projection_pushdown = true;
 	loader.RegisterFunction(query_fn);
+
+	// mssql_net_functions(catalog|connstr) — lists discovered routines (diagnostic).
+	TableFunction functions_fn("mssql_net_functions", {LogicalType::VARCHAR}, arrownet::ArrowStreamScan,
+	                           FunctionsBind, arrownet::ArrowStreamInitGlobal, arrownet::ArrowStreamInitLocal);
+	functions_fn.projection_pushdown = true; // arrow_ingest maps requested columns; required (see mssql_net_query)
+	loader.RegisterFunction(functions_fn);
 
 	ScalarFunction exec_fn("mssql_net_exec", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BIGINT,
 	                       MssqlNetExecFunction);

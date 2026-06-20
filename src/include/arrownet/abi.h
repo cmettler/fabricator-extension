@@ -103,6 +103,7 @@ typedef enum {
 	ARROWNET_META_ROWID = 3,   // one column: row-identity column names, in key order
 	ARROWNET_META_ROWCOUNT = 4, // one column, one row: approximate table row count (as text)
 	ARROWNET_META_COLUMN_NDV = 5, // two columns: column name, distinct-value estimate (NDV, as text)
+	ARROWNET_META_FUNCTIONS = 6,  // discovered routines: schema, name, kind, param_count, return_type
 } ArrowNetMetadataKind;
 
 // -----------------------------------------------------------------------------
