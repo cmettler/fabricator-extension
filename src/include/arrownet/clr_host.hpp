@@ -127,9 +127,11 @@ void InsertReturning(ArrowNetHandle handle, const std::string &schema, const std
 
 // Begin a streaming bulk-load session. `schema_in` describes the columns (the
 // pushed batches must match it); the managed side consumes it (imports + releases).
+// `check_constraints` validates CHECK/FOREIGN KEY constraints during load (INSERT
+// semantics; SqlBulkCopy skips them by default — pass false for COPY/CTAS bulk speed).
 // Returns an opaque session handle to push batches into and complete later.
 ArrowNetHandle BeginBulk(ArrowNetHandle handle, const std::string &schema, const std::string &table, bool create_table,
-                         bool replace, ArrowSchema &schema_in);
+                         bool replace, bool check_constraints, ArrowSchema &schema_in);
 
 // Push one record batch into the session; the managed side imports + releases it
 // (the caller never releases it). Blocks while the channel is full (backpressure).

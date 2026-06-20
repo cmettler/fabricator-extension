@@ -262,8 +262,12 @@ typedef struct ArrowNetVTable {
 	// (create_table / replace), maps Arrow->provider types, and starts the
 	// background load. On success *out_session receives an opaque session handle.
 	// The managed side CONSUMES `schema_in` (imports + releases it).
+	// `check_constraints` (1/0): when set, the bulk-copy validates CHECK / FOREIGN
+	// KEY constraints during load (INSERT semantics); when 0 they are skipped for
+	// bulk-load speed (COPY/CTAS). SqlBulkCopy skips constraints by default.
 	int32_t (*begin_bulk)(ArrowNetHandle handle, const char *schema, const char *table, int32_t create_table,
-	                      int32_t replace, struct ArrowSchema *schema_in, ArrowNetHandle *out_session, char **err);
+	                      int32_t replace, int32_t check_constraints, struct ArrowSchema *schema_in,
+	                      ArrowNetHandle *out_session, char **err);
 
 	// push_batch enqueues one record batch into the session. The managed side
 	// imports `batch` (taking ownership and releasing it); the caller never
@@ -279,7 +283,7 @@ typedef struct ArrowNetVTable {
 	int32_t (*complete_bulk)(ArrowNetHandle session, int32_t abort, int64_t *affected, char **err);
 } ArrowNetVTable;
 
-#define ARROWNET_ABI_VERSION 15
+#define ARROWNET_ABI_VERSION 16
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

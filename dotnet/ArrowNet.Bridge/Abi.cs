@@ -72,8 +72,8 @@ public unsafe struct ArrowNetVTable
     public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, CArrowArrayStream*, byte**, int> InsertReturning;
 
     // int32 begin_bulk(void* handle, const char* schema, const char* table, int32 create_table, int32 replace,
-    //                  ArrowSchema* schema_in, void** out_session, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, int, int, CArrowSchema*, nint*, byte**, int> BeginBulk;
+    //                  int32 check_constraints, ArrowSchema* schema_in, void** out_session, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, int, int, int, CArrowSchema*, nint*, byte**, int> BeginBulk;
 
     // int32 push_batch(void* session, ArrowArray* batch, char** err)
     public delegate* unmanaged[Cdecl]<nint, CArrowArray*, byte**, int> PushBatch;

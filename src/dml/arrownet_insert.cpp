@@ -75,7 +75,8 @@ unique_ptr<GlobalSinkState> ArrowNetPhysicalInsert::GetGlobalSinkState(ClientCon
 		auto *stream = gstate->producer->Stream();
 		stream->get_schema(stream, &schema);
 		gstate->bulk_session = arrownet::BeginBulk(handle_, target_.schema_name, target_.table_name,
-		                                           /*create_table=*/false, /*replace=*/false, schema);
+		                                           /*create_table=*/false, /*replace=*/false,
+		                                           /*check_constraints=*/true, schema);
 	}
 	return std::move(gstate);
 }

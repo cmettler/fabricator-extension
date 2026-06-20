@@ -552,15 +552,15 @@ void InsertReturning(ArrowNetHandle handle, const std::string &schema, const std
 }
 
 ArrowNetHandle BeginBulk(ArrowNetHandle handle, const std::string &schema, const std::string &table, bool create_table,
-                         bool replace, ArrowSchema &schema_in) {
+                         bool replace, bool check_constraints, ArrowSchema &schema_in) {
 	const ArrowNetVTable &vt = GetBridge();
 	if (!vt.begin_bulk) {
 		throw duckdb::IOException("ArrowNet: bridge does not provide begin_bulk");
 	}
 	ArrowNetHandle session = nullptr;
 	char *err = nullptr;
-	int32_t rc = vt.begin_bulk(handle, schema.c_str(), table.c_str(), create_table ? 1 : 0, replace ? 1 : 0, &schema_in,
-	                           &session, &err);
+	int32_t rc = vt.begin_bulk(handle, schema.c_str(), table.c_str(), create_table ? 1 : 0, replace ? 1 : 0,
+	                           check_constraints ? 1 : 0, &schema_in, &session, &err);
 	if (rc != ARROWNET_OK) {
 		ThrowManagedError(vt, err, "ArrowNet: begin_bulk failed");
 	}

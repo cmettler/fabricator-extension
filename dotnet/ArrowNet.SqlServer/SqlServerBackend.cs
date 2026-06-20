@@ -308,7 +308,8 @@ public sealed class SqlServerCatalog : IBackendCatalog
         }
     }
 
-    public long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable, bool replace)
+    public long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable, bool replace,
+                           bool checkConstraints)
     {
         var (connection, transaction, owns) = BeginWrite();
         try
@@ -343,6 +344,13 @@ public sealed class SqlServerCatalog : IBackendCatalog
                 {
                     options |= SqlBulkCopyOptions.KeepIdentity;
                 }
+            }
+            // INSERT enforces CHECK / FOREIGN KEY constraints (SqlBulkCopy skips them by
+            // default — a bulk-load optimization that would silently accept rows a
+            // classic INSERT would reject). COPY/CTAS pass false for bulk-load speed.
+            if (checkConstraints)
+            {
+                options |= SqlBulkCopyOptions.CheckConstraints;
             }
 
             using var reader = new ArrowDataReader(data);

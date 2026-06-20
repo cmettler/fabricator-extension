@@ -25,7 +25,7 @@ public static unsafe class Bootstrap
             return ArrowNetStatus.InvalidArgument;
         }
 
-        vtable->AbiVersion = 15;
+        vtable->AbiVersion = 16;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -144,7 +144,8 @@ public static unsafe class Bootstrap
 
             // We take ownership of the C stream (consume + release on dispose).
             var stream = CArrowArrayStreamImporter.ImportArrayStream(input);
-            long rows = catalog.BulkInsert(schemaName, tableName, stream, createTable != 0, replace != 0);
+            long rows = catalog.BulkInsert(schemaName, tableName, stream, createTable != 0, replace != 0,
+                                           checkConstraints: false);
             if (affected is not null)
             {
                 *affected = rows;
@@ -420,7 +421,7 @@ public static unsafe class Bootstrap
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static int BeginBulk(nint handle, byte* schema, byte* table, int createTable, int replace,
-                                 CArrowSchema* schemaIn, nint* outSession, byte** err)
+                                 int checkConstraints, CArrowSchema* schemaIn, nint* outSession, byte** err)
     {
         try
         {
@@ -436,7 +437,8 @@ public static unsafe class Bootstrap
             var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
 
-            var session = new BulkSession(catalog, schemaName, tableName, arrowSchema, createTable != 0, replace != 0);
+            var session = new BulkSession(catalog, schemaName, tableName, arrowSchema, createTable != 0, replace != 0,
+                                          checkConstraints != 0);
             *outSession = Handles.Alloc(session);
             return ArrowNetStatus.Ok;
         }

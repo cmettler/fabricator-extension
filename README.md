@@ -1,278 +1,357 @@
 # mssql_net — DuckDB ⇄ SQL Server via a C# (CoreCLR) Arrow bridge
 
-A DuckDB extension that connects to Microsoft SQL Server by hosting a C# layer
-(via CoreCLR) **in-process** and exchanging data and metadata as **Apache Arrow**
-over the Arrow C Stream Interface (`ArrowArrayStream`). It is a direct, in-process
-replacement for the Arrow-Flight transport used by the "Airport" extension.
+A DuckDB extension that connects to **Microsoft SQL Server** by hosting a C# layer (via **CoreCLR**)
+**in-process** and exchanging data + metadata as **Apache Arrow** over the Arrow C Stream Interface
+(`ArrowArrayStream`). It is a direct, in-process replacement for the Arrow-Flight transport used by
+the "Airport" extension.
 
-Unlike the native-TDS `mssql-extension`, all SQL Server I/O happens in C# using
-`Microsoft.Data.SqlClient`; the C++ extension only registers DuckDB functions and
-ingests the Arrow streams the bridge produces.
+**How it differs from the native-TDS [`mssql` extension](https://github.com/hugr-lab/mssql-extension):**
+that extension speaks the TDS wire protocol directly in C++. This one delegates *all* SQL Server I/O
+to C# using **`Microsoft.Data.SqlClient`** — the C++ extension only registers DuckDB functions and
+ingests the Arrow streams the bridge produces. Connection strings are therefore plain
+`Microsoft.Data.SqlClient` strings, and connection pooling / Windows & Azure auth come from SqlClient
+natively. The C++ core (`arrownet`) and managed `ArrowNet.Bridge` are transport- and backend-agnostic,
+intended for reuse by a future Power BI / DAX connector.
 
-See `C:\Users\c.mettler\.claude\plans\i-want-to-create-soft-crown.md` for the full
-phased plan.
+> Project knowledge & build notes for contributors live in [`CLAUDE.md`](CLAUDE.md).
 
-## Status
+## Feature Status
 
-**Phase 1 — complete and verified against real SQL Server (DuckDB v1.5.3).**
+| Area | Feature | Status |
+|------|---------|--------|
+| **Connect** | `ATTACH (TYPE mssql_net)` — connection string, `mssql://` URI, `CREATE SECRET` | ✅ |
+| | Azure Entra ID / Fabric auth (service principal, managed identity, default, token, …) | ✅ |
+| | `schema_filter` / `table_filter` (regex) | ✅ |
+| | ATTACH-time connection validation (no orphan catalog on failure) | ✅ |
+| | Kerberos / Windows SSPI integrated auth | ⚠️ via SqlClient (`Trusted_Connection` / `Integrated Security`); no bespoke `krb5` parser |
+| **Catalog** | Schemas / tables / views, three-part naming, cross-catalog joins | ✅ |
+| | `rowid` from PK / smallest unique index (scalar + composite) | ✅ |
+| | Metadata cache + manual / auto (after-DDL) invalidation | ✅ |
+| **Read** | Streaming SELECT | ✅ |
+| | Projection + filter pushdown (best-effort, parameterized WHERE) | ✅ |
+| | `LIMIT` → `TOP n`; `ORDER BY`+`LIMIT` → TopN (safe keys only) | ✅ |
+| | Statistics → optimizer: cardinality + per-column NDV | ✅ (NDV only; min/max intentionally not reported) |
+| **Write** | INSERT, INSERT…SELECT, INSERT…RETURNING (`OUTPUT INSERTED.*`) | ✅ |
+| | UPDATE / DELETE (rowid-based, parameterized) | ✅ |
+| | CREATE TABLE AS / COPY TO (streaming bulk via `SqlBulkCopy`) | ✅ |
+| | Bounded-memory streaming bulk write (INSERT/CTAS/COPY) | ✅ |
+| | CHECK/FK constraint enforcement on INSERT | ✅ (`SqlBulkCopyOptions.CheckConstraints`; COPY/CTAS skip for speed) |
+| **DDL** | CREATE/DROP TABLE, CREATE/DROP SCHEMA, ALTER TABLE | ✅ |
+| | PRIMARY KEY / UNIQUE / NOT NULL / literal DEFAULT on CREATE | ✅ |
+| | CHECK constraints, non-literal DEFAULTs | ❌ (use `mssql_net_exec`) |
+| **Tx** | BEGIN / COMMIT / ROLLBACK (connection pinning, read-your-writes) | ✅ |
+| **Functions** | `mssql_net_query`, `mssql_net_exec`, `mssql_refresh_cache`, `mssql_invalidate_cache`, `mssql_version` | ✅ |
+| | Custom scalar / table / table-in-out functions (Airport-style) | ❌ planned (Phase 3) |
+| | Connection-pool diagnostics (`mssql_pool_stats`, `mssql_open/close/ping`) | ❌ |
+| | COPY to temp tables (`#t` / empty-schema syntax) | ❌ |
 
-`ATTACH` exposes SQL Server schemas/tables/views as a DuckDB catalog and scans
-them automatically:
+✅ implemented & verified · ⚠️ partial / via SqlClient · ❌ not yet
+
+## Quick Start
+
+This extension is not (yet) in the DuckDB community repository — build it from source (see
+[Build](#build)), then load the unsigned extension. The managed bridge is published self-contained
+next to the extension (no .NET install required on the host).
 
 ```sql
+-- Connection string (a valid Microsoft.Data.SqlClient string)
 ATTACH 'Server=host,1433;Database=db;User Id=sa;Password=***;TrustServerCertificate=true;Encrypt=true'
   AS mssql (TYPE mssql_net);
 
--- ...or a mssql:// connection URI (encrypt defaults on; ?encrypt=false to disable):
+SELECT * FROM mssql.dbo.people WHERE id > 1;   -- automatic streaming scan + filter pushdown
+SELECT count(*) FROM mssql.dbo.people;
+
+DETACH mssql;
+```
+
+## Connection Configuration
+
+A `mssql_net` connection is given **either** a `Microsoft.Data.SqlClient` connection string, the
+`mssql://` URI convenience form, **or** a stored secret.
+
+```sql
+-- ADO.NET / SqlClient connection string
+ATTACH 'Server=host,1433;Database=db;User Id=sa;Password=***;TrustServerCertificate=true;Encrypt=true'
+  AS mssql (TYPE mssql_net);
+
+-- mssql:// URI (encrypt defaults on; ?encrypt=false to disable)
 ATTACH 'mssql://sa:***@host:1433/db' AS mssql (TYPE mssql_net);
 
--- schema_filter / table_filter (case-insensitive regex) restrict catalog discovery
--- to matching schemas/tables — useful on large servers:
-ATTACH 'Server=...;Database=...' AS mssql (TYPE mssql_net, schema_filter '^(dbo|sales)$', table_filter '^fact_');
+-- Restrict catalog discovery on large servers (case-insensitive regex, partial match)
+ATTACH 'Server=...;Database=...' AS mssql
+  (TYPE mssql_net, schema_filter '^(dbo|sales)$', table_filter '^fact_');
+```
 
--- ...or store the connection as a secret and reference it by name. The
--- connection string is assembled from the secret's parts (password/access_token
--- redacted in duckdb_secrets()). Works for ATTACH and the query/exec functions.
+### Secrets
+
+```sql
+-- SQL auth. Password/access_token are redacted in duckdb_secrets().
 CREATE SECRET sql1 (TYPE mssql_net,
   host 'host', port 1433, database 'db', user 'sa', password '***', use_encrypt true);
 ATTACH '' AS mssql (TYPE mssql_net, SECRET sql1);
 SELECT * FROM mssql_net_query('sql1', 'SELECT 1');
+```
 
--- Azure Entra ID auth (e.g. Microsoft Fabric SQL endpoints, which require Entra).
--- `authentication` maps to the Microsoft.Data.SqlClient Authentication keyword;
--- field names mirror the C++ mssql extension's secret for cross-compatibility.
-CREATE SECRET fab_sp (TYPE mssql_net,           -- service principal
+Secret field names mirror the native `mssql` extension for cross-compatibility:
+`host`, `port`, `database`, `user`, `password`, `use_encrypt`, `access_token`, `authentication`,
+`azure_secret`, `schema_filter`, `table_filter`, `application_name`.
+
+### Azure Entra ID (Microsoft Fabric SQL endpoints, which require Entra)
+
+`Microsoft.Data.SqlClient` handles Entra natively via the `Authentication=` keyword, so most variants
+need no extra code:
+
+```sql
+CREATE SECRET fab_sp (TYPE mssql_net,            -- service principal
   host 'xxx.datawarehouse.fabric.microsoft.com', database 'wh',
   authentication 'service_principal', user '<app-client-id>', password '<client-secret>');
-CREATE SECRET fab_mi (TYPE mssql_net,           -- (user-assigned) managed identity
+CREATE SECRET fab_mi (TYPE mssql_net,            -- (user-assigned) managed identity
   host '...', database 'wh', authentication 'managed_identity', user '<mi-client-id>');
-CREATE SECRET fab_def (TYPE mssql_net,          -- DefaultAzureCredential chain
+CREATE SECRET fab_def (TYPE mssql_net,           -- DefaultAzureCredential chain
   host '...', database 'wh', authentication 'default');
-CREATE SECRET fab_tok (TYPE mssql_net,          -- bring-your-own Entra token
+CREATE SECRET fab_tok (TYPE mssql_net,           -- bring-your-own Entra token
   host '...', database 'wh', access_token '<jwt>');
 -- also: interactive, device_code, workload_identity, password.
 ATTACH '' AS fab (TYPE mssql_net, SECRET fab_sp);
+```
 
-SELECT * FROM mssql.dbo.people WHERE id > 1;       -- automatic table scan
-SELECT count(*) FROM mssql.dbo.people;             -- aggregates
-SELECT s.name, o.amount                            -- joins across SQL Server tables
+### Integrated / Windows authentication
+
+Use SqlClient's native keywords directly — `Trusted_Connection=true` or `Integrated Security=SSPI`
+(Windows). We do **not** implement the native extension's bespoke `authenticator=krb5` / `krb5-*`
+connection-string dialect (see [Differences](#differences-from-the-native-mssql-extension)).
+
+### Connection validation
+
+ATTACH validates the connection up front and creates **no** catalog on failure (fail-fast, password
+never leaked):
+
+```sql
+ATTACH 'Server=nonexistent.host,1433;Database=db;User Id=sa;Password=pass' AS db (TYPE mssql_net);
+-- Error: MSSQL connection validation failed: <cause>
+```
+
+## Catalog Integration
+
+```sql
+-- Browse with standard DuckDB catalog functions
+SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'mssql';
+SELECT table_name  FROM duckdb_tables()  WHERE database_name = 'mssql' AND schema_name = 'dbo';
+
+-- Three-part naming + cross-catalog joins with local DuckDB tables
+SELECT s.name, o.amount
   FROM mssql.dbo.people s JOIN mssql.sales.orders o ON o.order_id = 1000 + s.id;
+```
 
--- Projection + filter pushdown: only the referenced columns are SELECTed from SQL
--- Server, and a parameterized WHERE is pushed for the supported predicates
--- (=, <>, <, <=, >, >=, IS [NOT] DISTINCT FROM, IS [NOT] NULL, IN, BETWEEN, AND/OR).
--- Pushdown is best-effort: DuckDB always re-applies every predicate, so anything
--- not pushed is still filtered correctly. Below, only [id]/[name] cross the wire
--- and `id >= 10 AND name = 'Bob'` is sent as a parameterized WHERE:
+## Query Execution & Pushdown
+
+Results stream directly into DuckDB. The extension pushes work to SQL Server:
+
+```sql
+-- Projection + filter pushdown: only [id]/[name] cross the wire and
+-- `id >= 10 AND name = 'Bob'` is sent as a parameterized WHERE.
 SELECT id, name FROM mssql.dbo.people WHERE id >= 10 AND name = 'Bob';
 
--- A bare LIMIT (no ORDER BY, no filter) is pushed as SELECT TOP (n), so previews
--- fetch only n rows instead of the whole table:
+-- Bare LIMIT (no ORDER BY / filter) → SELECT TOP (100)
 SELECT * FROM mssql.dbo.big_table LIMIT 100;
 
--- ORDER BY + LIMIT (top-N) is pushed as SELECT TOP (n) ... ORDER BY when the keys
--- are safe (non-string, NULL-order compatible) — e.g. fetch only the 10 newest:
+-- ORDER BY + LIMIT (top-N) → SELECT TOP (10) ... ORDER BY, when keys are safe
 SELECT * FROM mssql.dbo.events ORDER BY id DESC LIMIT 10;
-
--- The optimizer also gets each table's approximate row count (from partition stats)
--- for better join ordering.
-
-INSERT INTO mssql.dbo.target (id, name) VALUES (1, 'Alice'), (2, 'Bob');  -- INSERT
-INSERT INTO mssql.dbo.target SELECT id, name FROM read_csv('data.csv');  -- INSERT … SELECT
-
--- INSERT … RETURNING uses SQL Server's OUTPUT INSERTED clause, so server-side
--- IDENTITY values and DEFAULTs come back with the inserted rows.
-INSERT INTO mssql.dbo.target (name) VALUES ('Carol') RETURNING id, name;
 ```
 
-```sql
--- UPDATE / DELETE use a rowid derived from the PK (or smallest unique index;
--- compound keys supported). SELECT rowid is also available.
-UPDATE mssql.dbo.people SET salary = salary * 1.1 WHERE id = 1;
-DELETE FROM mssql.dbo.people WHERE id = 3;
-```
+**Filter pushdown is best-effort:** DuckDB always re-applies every predicate, so anything not pushed is
+still filtered correctly. Pushed shapes: `=`, `<>`, `<`, `<=`, `>`, `>=`, `IS [NOT] DISTINCT FROM`,
+`IS [NOT] NULL`, `IN`, `BETWEEN`, `AND`/`OR`. `VARCHAR` predicates push only `=` / `IN` /
+`IS NOT DISTINCT FROM` (SQL Server collation is a looser superset; ordering comparisons stay local).
+**TopN** is pushed only when all order keys are non-string and NULL-ordering-compatible (SQL Server
+ASC = NULLS FIRST, DESC = NULLS LAST), and there is no pushed filter; the DuckDB sort node is kept, so
+results are always correct.
+
+The optimizer also receives each table's approximate **row count** (from partition stats) and
+**per-column NDV** (distinct-value estimate) for better join ordering. Min/max bounds are intentionally
+*not* reported (DuckDB would prune filters on them, and SQL Server stats are sampled/stale).
+
+### Row identity (`rowid`)
+
+Tables with a primary key (or unique index) expose a virtual `rowid` (scalar for a single key column,
+`STRUCT` for a composite key). It backs UPDATE/DELETE and can be selected:
 
 ```sql
--- BEGIN/COMMIT/ROLLBACK map to a real SQL Server transaction: a connection is
--- pinned (lazily, on the first write) and all DML — catalog INSERT/UPDATE/DELETE
--- and mssql_net_exec — runs on it, so ROLLBACK undoes everything. Reads inside
--- the transaction use the pinned connection too (read-your-writes / uncommitted).
+SELECT rowid, name FROM mssql.dbo.products LIMIT 5;
+```
+
+## Transactions
+
+`BEGIN`/`COMMIT`/`ROLLBACK` map to a real SQL Server transaction. A connection is pinned (lazily, on
+the first write); all DML — catalog INSERT/UPDATE/DELETE and `mssql_net_exec` — runs on it, and reads
+inside the transaction use it too (read-your-writes), so `ROLLBACK` undoes everything.
+
+```sql
 BEGIN;
 INSERT INTO mssql.dbo.people (id, name) VALUES (9, 'temp');
 SELECT mssql_net_exec('mssql', 'UPDATE dbo.people SET salary = 0 WHERE id = 1');
 SELECT count(*) FROM mssql.dbo.people;   -- sees the uncommitted INSERT
-ROLLBACK;                                -- both the INSERT and UPDATE are undone
+ROLLBACK;                                -- both statements undone
 ```
 
+## INSERT / UPDATE / DELETE
+
 ```sql
--- CREATE TABLE AS and COPY TO use SqlBulkCopy (table auto-created from the
--- Arrow schema). The C++ side stays provider-agnostic (produces Arrow); the
--- C# backend maps types, creates the table, and bulk-loads.
+INSERT INTO mssql.dbo.target (id, name) VALUES (1, 'Alice'), (2, 'Bob');
+INSERT INTO mssql.dbo.target SELECT id, name FROM read_csv('data.csv');
+
+-- INSERT … RETURNING uses OUTPUT INSERTED, so server-side IDENTITY/DEFAULT values come back.
+INSERT INTO mssql.dbo.target (name) VALUES ('Carol') RETURNING id, name;
+
+-- UPDATE / DELETE need a rowid (PK or unique index; compound keys supported).
+UPDATE mssql.dbo.people SET salary = salary * 1.1 WHERE id = 1;
+DELETE FROM mssql.dbo.people WHERE id = 3;
+```
+
+INSERT streams through `SqlBulkCopy` with `CheckConstraints` enabled, so a CHECK / FOREIGN KEY
+violation fails just like a classic INSERT (CTAS/COPY skip constraint checking for bulk-load speed).
+`IDENTITY` columns are preserved when the source supplies them (`KeepIdentity`) and auto-generated
+otherwise. UPDATE/DELETE require a primary key or unique index (otherwise use `mssql_net_exec`); they do
+not support RETURNING.
+
+## CREATE TABLE AS / COPY TO
+
+`CREATE TABLE AS` and `COPY TO` stream the result to SQL Server via `SqlBulkCopy`, auto-creating the
+table from the Arrow schema. Both are bounded-memory (the dataset is never fully buffered).
+
+```sql
 CREATE TABLE mssql.dbo.summary AS SELECT region, count(*) AS n FROM big GROUP BY region;
+
 COPY (SELECT * FROM src) TO 'mssql://mssql/dbo/target' (FORMAT mssql_net);
-COPY src TO 'mssql.dbo.target' (FORMAT mssql_net);
-COPY src TO 'mssql.dbo.target' (FORMAT 'bcp');   -- 'bcp' is an accepted alias
+COPY src TO 'mssql.dbo.target'  (FORMAT mssql_net);
+COPY src TO 'mssql.dbo.target'  (FORMAT 'bcp');               -- 'bcp' is an accepted alias
+COPY src TO 'mssql.dbo.target'  (FORMAT 'bcp', REPLACE true); -- drop + recreate
 ```
 
-The COPY target is registered in the catalog (queryable immediately afterwards),
-and `IDENTITY` columns are auto-preserved when the source includes them
-(`SqlBulkCopy KeepIdentity`) or auto-generated when it doesn't. For compatibility
-with the C++ `mssql` extension, `mssql_version()` and the `SET mssql_*` settings
-are accepted; `SET mssql_ctas_text_type = 'VARCHAR(64)'` overrides the SQL type
-used for text columns when creating tables (default `NVARCHAR(MAX)`).
+COPY target = `mssql://catalog/schema/table` or `catalog.schema.table` (3-part only — temp-table /
+empty-schema syntax is not supported). Options: `CREATE_TABLE` (default true), `REPLACE` (default
+false). The target is registered in the catalog (queryable immediately).
+
+### Type mapping (DuckDB → SQL Server, for CREATE / CTAS / COPY)
+
+| DuckDB | SQL Server |
+|--------|------------|
+| `BOOLEAN` | `BIT` |
+| `TINYINT`/`SMALLINT`/`INTEGER`/`BIGINT` | `TINYINT`/`SMALLINT`/`INT`/`BIGINT` |
+| `FLOAT` / `DOUBLE` | `REAL` / `FLOAT` |
+| `DECIMAL(p,s)` | `DECIMAL(p,s)` |
+| `VARCHAR` | `NVARCHAR(MAX)` (override with `mssql_ctas_text_type` on `CREATE TABLE`) |
+| `BLOB` | `VARBINARY(MAX)` |
+| `DATE` / `TIME` / `TIMESTAMP` | `DATE` / `TIME` / `DATETIME2` |
+| `TIMESTAMP WITH TIME ZONE` | `DATETIMEOFFSET` |
+| `UUID` | `UNIQUEIDENTIFIER` |
+
+> A `VARCHAR` maps to `NVARCHAR(MAX)`, which SQL Server cannot use as a `PRIMARY KEY`/`UNIQUE` key
+> column — use a fixed-width/indexable type for keys.
+
+On reads, SQL Server types are mapped to DuckDB via SqlClient + Arrow (int/tinyint→uint8/decimal/
+money→`DECIMAL(19,4)`/bit→`BOOLEAN`/date/time/datetime2→`TIMESTAMP`/datetimeoffset→`TIMESTAMP_TZ`/
+**uniqueidentifier→`VARCHAR`**/varbinary→`BLOB`/…).
+
+## DDL
 
 ```sql
--- DDL: CREATE/DROP TABLE and CREATE/DROP SCHEMA go through the catalog.
--- Column types map DuckDB -> SQL Server; NOT NULL is honored.
 CREATE SCHEMA mssql.staging;
 CREATE TABLE mssql.staging.t (id INTEGER NOT NULL, name VARCHAR, amount DECIMAL(10,2));
-CREATE TABLE IF NOT EXISTS mssql.staging.t (id INTEGER);   -- no-op if present
+CREATE TABLE IF NOT EXISTS mssql.staging.t (id INTEGER);
 
--- PRIMARY KEY / UNIQUE are honored (a PK enables rowid → UPDATE/DELETE);
--- literal DEFAULTs are carried to the SQL Server table.
+-- PRIMARY KEY / UNIQUE (a PK enables rowid → UPDATE/DELETE); literal DEFAULTs are carried over.
 CREATE TABLE mssql.staging.k (
   id INTEGER PRIMARY KEY, a INTEGER, b INTEGER,
   status VARCHAR DEFAULT 'active', qty INTEGER DEFAULT 0,
   UNIQUE (a, b));
 
--- ALTER TABLE: rename table/column, add/drop column, change type,
--- toggle NOT NULL, and set/drop a literal DEFAULT.
+-- ALTER TABLE: rename table/column, add/drop column, change type, toggle NOT NULL, set/drop DEFAULT.
 ALTER TABLE mssql.staging.t ADD COLUMN note VARCHAR;
 ALTER TABLE mssql.staging.t ALTER COLUMN id TYPE BIGINT;
 ALTER TABLE mssql.staging.t ALTER COLUMN note SET NOT NULL;
-ALTER TABLE mssql.staging.t ALTER COLUMN note DROP NOT NULL;
 ALTER TABLE mssql.staging.t ALTER COLUMN note SET DEFAULT 'n/a';
-ALTER TABLE mssql.staging.t ALTER COLUMN note DROP DEFAULT;
 ALTER TABLE mssql.staging.t RENAME COLUMN note TO comment;
-ALTER TABLE mssql.staging.t DROP COLUMN comment;
 ALTER TABLE mssql.staging.t RENAME TO t_renamed;
 
 DROP TABLE mssql.staging.t_renamed;
 DROP SCHEMA mssql.staging;
 ```
 
-Catalog `INSERT`/`UPDATE`/`DELETE`, `CREATE TABLE AS`, `COPY TO`, and DDL
-(`CREATE`/`DROP TABLE`, `CREATE`/`DROP SCHEMA`, `ALTER TABLE`) are supported. All
-of them are **provider-agnostic in C++** — the operators only produce Arrow +
-table/column identity; the C# backend owns every SQL Server specific (SqlBulkCopy,
-parameterized UPDATE/DELETE, type mapping, DDL generation). `CREATE TABLE`
-honors `NOT NULL`, `PRIMARY KEY`, `UNIQUE`, and literal `DEFAULT`s (a PK/unique
-index gives the table a rowid, so `UPDATE`/`DELETE` work on tables you create);
-`ALTER COLUMN … TYPE` preserves the column's nullability, and `ALTER TABLE`
-supports `SET`/`DROP NOT NULL` and `SET`/`DROP DEFAULT` (literal). `UPDATE`/
-`DELETE` need a primary key or unique index (else use `mssql_net_exec`).
-`INSERT … RETURNING` is supported (via `OUTPUT INSERTED.*`); non-literal
-(expression) `DEFAULT`s and `CHECK` constraints are upcoming. Note: a `VARCHAR`
-column maps to `NVARCHAR(MAX)`, which SQL Server
-cannot use as a `PRIMARY KEY`/`UNIQUE` key column — use a fixed-width/indexable
-type for keys.
+For SQL Server-specific features (IDENTITY, CHECK, indexes, FKs, non-literal DEFAULTs), use
+`mssql_net_exec`.
 
-The raw-query table function and a write/exec function are also available:
+## Function Reference
+
+### `mssql_net_query(context, sql) -> TABLE`
+
+Stream a raw T-SQL query. `context` may be a connection string, a secret name, or an attached-catalog
+name (reuses that catalog's connection).
 
 ```sql
-SELECT id, name FROM mssql_net_query(
-  'Server=...;Database=...;...', 'SELECT id, name FROM dbo.people');
+SELECT id, name FROM mssql_net_query('Server=...;Database=...', 'SELECT id, name FROM dbo.people');
+SELECT * FROM mssql_net_query('mssql', 'SELECT id, name FROM dbo.people');   -- attached catalog
+```
 
--- arbitrary T-SQL (DDL/DML/EXEC); returns rows affected (0 for DDL/no-row stmts)
-SELECT mssql_net_exec('Server=...;Database=...;...',
-                      'UPDATE dbo.people SET salary = salary + 1 WHERE id <= 2');
+### `mssql_net_exec(context, sql) -> BIGINT`
 
--- The first argument may also be the name of an already-ATTACHed mssql_net
--- catalog — the function reuses that catalog's connection (no need to repeat
--- the connection string):
-ATTACH 'Server=...;Database=...;...' AS db (TYPE mssql_net);
-SELECT * FROM mssql_net_query('db', 'SELECT id, name FROM dbo.people');
-SELECT mssql_net_exec('db', 'UPDATE dbo.people SET salary = salary + 1');
+Execute arbitrary T-SQL (DDL/DML/EXEC); returns rows affected (0 for DDL / no-row statements).
 
--- After creating/dropping tables out-of-band (e.g. via mssql_net_exec), refresh
--- the cached catalog metadata so the new/removed tables are visible to SQL:
-SELECT mssql_net_exec('db', 'CREATE TABLE dbo.t (id INT)');
-SELECT mssql_refresh_cache('db');     -- re-discovers schemas/tables (alias: mssql_invalidate_cache)
-SELECT * FROM db.dbo.t;
+```sql
+SELECT mssql_net_exec('mssql', 'UPDATE dbo.people SET salary = salary + 1 WHERE id <= 2');
+```
 
--- ...or have DDL run via mssql_net_exec auto-invalidate the cache (off by default,
--- matching the Postgres scanner). Whether a statement is DDL is detected in the C#
--- layer (CREATE/DROP/ALTER/TRUNCATE/RENAME/EXEC):
+### `mssql_refresh_cache(catalog)` / `mssql_invalidate_cache(catalog [, schema [, table]])`
+
+Refresh cached catalog metadata after creating/dropping tables out-of-band (e.g. via
+`mssql_net_exec`). `mssql_net_refresh_cache` / `mssql_net_invalidate_cache` are aliases.
+
+```sql
+SELECT mssql_net_exec('mssql', 'CREATE TABLE dbo.t (id INT)');
+SELECT mssql_refresh_cache('mssql');
+SELECT * FROM mssql.dbo.t;
+
+-- ...or auto-invalidate after DDL run via mssql_net_exec (off by default; DDL detected in C#):
 SET mssql_exec_invalidate_cache = true;
-SELECT mssql_net_exec('db', 'CREATE TABLE dbo.t2 (id INT)');
-SELECT * FROM db.dbo.t2;               -- visible immediately, no manual refresh
+SELECT mssql_net_exec('mssql', 'CREATE TABLE dbo.t2 (id INT)');
+SELECT * FROM mssql.dbo.t2;   -- visible immediately
 ```
 
-Verified against SQL Server 2022: ATTACH catalog discovery (multi-schema, views),
-automatic scans, projection, WHERE filtering, joins; 12+ type mappings (int/decimal/
-money/bit→boolean/date/time/datetime2→timestamp/datetimeoffset→timestamptz/
-uniqueidentifier→varchar/varbinary→blob/…), and NULLs. The catalog is read-only in
-Phase 1 (DML/DDL raise a clear "not supported" error).
+### `mssql_version() -> VARCHAR`
 
-`arrownet_test_scan('hello')` (Phase 0) remains as a stub-backed smoke test of the
-C++ → CoreCLR → Arrow → DuckDB spine.
+Extension version (compatibility shim). `arrownet_managed_dir()` / `arrownet_test_scan('x')` are
+diagnostics for the CoreCLR + Arrow spine.
 
-Phase 2 (done): `mssql_net_exec`, catalog `INSERT`/`UPDATE`/`DELETE` (rowid from
-PK / smallest unique index, scalar + compound), and `CREATE TABLE AS` + `COPY TO`
-via a generic Arrow→`SqlBulkCopy` bulk path (C++ provider-agnostic; SQL Server
-specifics in C#). Metadata discovery (schemas/tables/columns/rowid) and the table
-scan were then moved entirely to C# behind `get_metadata`/`scan_table` ABI calls —
-**the C++ extension now contains no T-SQL at all**; every provider SQL string
-(`sys.*`, PK/unique-index rowid lookup, `SELECT … WHERE 1=0` type probe, table
-scans) lives in `ArrowNet.SqlServer`. Catalog DDL (`CREATE`/`DROP TABLE`,
-`CREATE`/`DROP SCHEMA`, `ALTER TABLE`) followed the same split: C++ carries
-column identity (a zero-row Arrow schema, NOT NULL encoded as Arrow field
-nullability) and the C# backend generates the provider DDL. Next: Airport-style
-custom scalar/table/table-in-out functions.
+## Settings
 
-```
-┌───────┬─────────┬───────────────────┐
-│  id   │  name   │       query       │
-├───────┼─────────┼───────────────────┤
-│     1 │ alpha   │ hello from duckdb │
-│     2 │ beta    │ hello from duckdb │
-│     3 │ gamma   │ hello from duckdb │
-└───────┴─────────┴───────────────────┘
-```
+`SET mssql_*` settings are accepted for compatibility with the native extension. Two are **active**;
+the rest are accepted but currently no-ops (the C# backend uses `SqlBulkCopy` and SqlClient pooling, so
+the native extension's batching/pooling/TDS knobs don't apply).
 
-Next: Phase 1 (`ATTACH … (TYPE mssql_net)` + catalog + read-only table scan via
-`Microsoft.Data.SqlClient`).
+| Setting | Status | Description |
+|---------|--------|-------------|
+| `mssql_ctas_text_type` | **Active** | SQL type for text columns on `CREATE TABLE` (default `NVARCHAR(MAX)`); e.g. `'VARCHAR(64)'` for indexable string keys |
+| `mssql_exec_invalidate_cache` | **Active** | Auto-invalidate the catalog cache after DDL run via `mssql_net_exec` (default `false`) |
+| `mssql_insert_batch_size`, `mssql_insert_max_rows_per_statement`, `mssql_insert_max_sql_bytes`, `mssql_insert_use_returning_output` | Accepted | Registered with defaults + `>= 1` validation; no-op (INSERT streams via SqlBulkCopy) |
+| `mssql_connection_*`, `mssql_*_timeout`, `mssql_min_connections`, `mssql_connection_cache` | Accepted | No-op (SqlClient pools by connection string) |
+| `mssql_order_pushdown` | Accepted | No-op — TopN is pushed automatically when safe (always-on, not gated) |
+| `mssql_copy_tablock`, `mssql_copy_flush_rows`, `mssql_ctas_use_bcp`, `mssql_convert_varchar_max`, `mssql_catalog_cache_ttl` | Accepted | No-op |
 
-## Layout
+## Differences from the native `mssql` extension
 
-```
-src/                         C++ DuckDB extension
-  include/arrownet/abi.h     C ABI vtable + Arrow C structs (shared contract)
-  include/arrownet/clr_host.hpp  CoreCLR bootstrap + vtable wrappers
-  include/arrownet/arrow_ingest.hpp  reusable ArrowArrayStream -> DataChunk
-  arrownet/clr_host.cpp      hostfxr loader (self-contained, command-line init)
-  arrownet/arrow_ingest.cpp  scan loop (ports adbc_scanner pattern)
-  mssql_net_extension.cpp    extension entry; arrownet_test_scan + mssql_net_query
-  mssql_net_storage.cpp      ATTACH (TYPE mssql_net) storage-extension registration
-  catalog/                   read-only catalog (Catalog/SchemaEntry/TableEntry/Transaction)
-                             + metadata helpers that call get_metadata/scan_table (all provider
-                             SQL — sys.*, rowid discovery, scans — lives in C#; C++ has no T-SQL)
-dotnet/ArrowNet.Bridge/      reusable managed bridge (C ABI exports, Arrow export,
-                             handle table, IBackend, DbDataReader→Arrow converter, StubBackend)
-dotnet/ArrowNet.SqlServer/   SqlClient backend + composition root (published beside the extension)
-scripts/publish-managed.ps1  self-contained publish of ArrowNet.SqlServer (+ bridge + runtime)
-test/host_smoke/             standalone CLR+Arrow round-trip test (no DuckDB)
-CMakeLists.txt, Makefile, extension_config.cmake, vcpkg.json
-```
-
-The C++ core (`arrownet/`) and the managed `ArrowNet.Bridge` are **transport- and
-backend-agnostic**, intended for reuse by a future Power BI / DAX extension.
-
-## Key technical decisions
-
-- **DuckDB v1.5.3** (new C++ extension API: `Extension::Load(ExtensionLoader&)` +
-  `loader.RegisterFunction(...)` + `DUCKDB_CPP_EXTENSION_ENTRY(mssql_net, loader)`).
-  Submodules pinned to `duckdb@v1.5.3` + `extension-ci-tools@v1.5.3`.
-- **Self-contained .NET 10** runtime shipped beside the extension (no prerequisite
-  on the host). The CoreCLR host loads the bundled `hostfxr` and initializes via
-  **`hostfxr_initialize_for_dotnet_command_line`** — `initialize_for_runtime_config`
-  rejects self-contained components ("Initialization for self-contained components
-  is not supported").
-- **Arrow C Stream Interface** for all tabular data; the bridge exports via
-  `Apache.Arrow.C.CArrowArrayStreamExporter`; the host ingests with DuckDB's
-  internal `ArrowTableFunction::PopulateArrowTableType` / `ArrowToDuckDB`.
-- The managed bridge finds its files via `ARROWNET_MANAGED_DIR`, else an
-  `arrownet/` folder beside the loaded extension binary.
+- **Transport:** C# (`Microsoft.Data.SqlClient`) in-process via CoreCLR, **not** native TDS. So:
+  connection strings are SqlClient strings; pooling, Windows/Kerberos and Azure Entra auth come from
+  SqlClient; there is no `authenticator=krb5` / `krb5-*` connstr dialect or client-side conflict
+  validator (use SqlClient keywords like `Trusted_Connection`, `Integrated Security`,
+  `Authentication=Active Directory …`).
+- **Bulk write:** INSERT/CTAS/COPY use `SqlBulkCopy` streamed over a bounded channel; INSERT enables
+  `CheckConstraints` (CTAS/COPY do not). The native extension uses classic batched INSERT statements +
+  TDS BCP.
+- **`uniqueidentifier` → `VARCHAR`** on reads (the native extension maps it to DuckDB `UUID`).
+- **ORDER BY pushdown** is always attempted when safe (the native extension gates it behind
+  `mssql_order_pushdown`, default off).
+- **Not implemented here:** connection-pool diagnostics (`mssql_pool_stats`, `mssql_open/close/ping`),
+  COPY to temp tables, multi-statement batches, Airport-style custom functions (planned).
 
 ## Build
 
@@ -280,22 +359,21 @@ backend-agnostic**, intended for reuse by a future Power BI / DAX extension.
 
 ```bash
 dotnet build dotnet/ArrowNet.Bridge -c Release
-# self-contained publish next to a built extension:
-pwsh scripts/publish-managed.ps1 -ExtensionDir build/release/extension/mssql_net
+pwsh scripts/publish-managed.ps1     # self-contained publish next to the built extension
 ```
 
 ### Extension
 
-Requires the submodules (`duckdb@v1.5.3` + `extension-ci-tools@v1.5.3`):
+Requires the submodules (`duckdb@v1.5.4` + `extension-ci-tools@v1.5.3`):
 
 ```bash
 git submodule update --init --recursive
-make                                # builds DuckDB + the extension (POSIX/CI)
-pwsh scripts/publish-managed.ps1    # publish the bridge beside the extension
+make                                 # builds DuckDB + the extension (POSIX/CI)
+pwsh scripts/publish-managed.ps1     # publish the bridge beside the extension
 ```
 
-On Windows, Phase 0 built directly with CMake + Ninja inside a VS dev environment
-(`vcvars64.bat`):
+On Windows, build with CMake + Ninja inside a VS dev environment (`vcvars64.bat` — a plain shell fails
+with `Cannot open include file: 'stdint.h'`):
 
 ```powershell
 cmake -G Ninja -DEXTENSION_STATIC_BUILD=1 `
@@ -307,19 +385,23 @@ cmake -G Ninja -DEXTENSION_STATIC_BUILD=1 `
 cmake --build build/release --target mssql_net_loadable_extension duckdb shell
 ```
 
-Produces `build/release/extension/mssql_net/mssql_net.duckdb_extension` (metadata
-footer auto-appended) and the matching `build/release/duckdb.exe`.
-`extension_config.cmake` sets `EXTENSION_VERSION` so the build needs no git commit.
+Produces `build/release/extension/mssql_net/mssql_net.duckdb_extension` and a matching `duckdb.exe`.
+Run: `duckdb -unsigned -c "LOAD 'path/to/mssql_net.duckdb_extension'; SELECT ..."`. The bridge is
+located via `ARROWNET_MANAGED_DIR`, else an `arrownet/` folder next to the extension binary.
 
-### Run the round-trip
+## Layout
 
-```bash
-duckdb -unsigned -c "LOAD 'path/to/mssql_net.duckdb_extension';
-                     SELECT * FROM arrownet_test_scan('hello');"
 ```
-
-### Smoke test (CLR + Arrow spine, no DuckDB)
-
-Compile `test/host_smoke/host_smoke.cpp` (only needs `src/include`), set
-`ARROWNET_MANAGED_DIR` to a published bridge directory, and run it. It boots
-CoreCLR, fills the vtable, executes a query, and reads the exported Arrow stream.
+src/                         C++ DuckDB extension
+  include/arrownet/abi.h     C ABI vtable + Arrow C structs (shared contract)
+  arrownet/                  CoreCLR host + Arrow ingest/produce (generic core, namespace arrownet)
+  catalog/  dml/  copy/      catalog, DML, COPY operators (provider-agnostic — no T-SQL in C++)
+  arrownet_optimizer.cpp     LIMIT / TopN pushdown optimizer extension
+  mssql_net_extension.cpp    extension entry + mssql_net_query / _exec / cache / version functions
+  mssql_net_storage.cpp      ATTACH (TYPE mssql_net); mssql_net_secret.cpp  secret type
+dotnet/ArrowNet.Bridge/      backend-agnostic managed bridge (ABI, Arrow, IBackend, streaming bulk)
+dotnet/ArrowNet.SqlServer/   Microsoft.Data.SqlClient backend + composition root
+scripts/publish-managed.ps1  self-contained publish of the bridge + .NET runtime
+test/                        verify_*.test + mssqlcompat/ (regenerated from the native extension)
+CMakeLists.txt, Makefile, extension_config.cmake, vcpkg.json, CLAUDE.md
+```

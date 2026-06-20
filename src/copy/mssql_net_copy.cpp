@@ -136,7 +136,8 @@ static unique_ptr<GlobalFunctionData> CopyToInitGlobal(ClientContext &context, F
 	auto *stream = gstate->producer->Stream();
 	stream->get_schema(stream, &schema);
 	gstate->bulk_session = arrownet::BeginBulk(bind_data.handle, bind_data.schema_name, bind_data.table_name,
-	                                           bind_data.create_table, bind_data.replace, schema);
+	                                           bind_data.create_table, bind_data.replace,
+	                                           /*check_constraints=*/false, schema);
 	return std::move(gstate);
 }
 

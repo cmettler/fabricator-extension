@@ -28,10 +28,14 @@ public interface IBackendCatalog : IDisposable
     /// <summary>
     /// Bulk-loads an Arrow stream into a table. If <paramref name="createTable"/>,
     /// the target is created from the stream's Arrow schema (mapping Arrow types
-    /// to provider types); <paramref name="replace"/> drops it first. Returns rows
-    /// written. This is the provider-specific bulk path (e.g. SqlBulkCopy).
+    /// to provider types); <paramref name="replace"/> drops it first. When
+    /// <paramref name="checkConstraints"/> is set, CHECK / FOREIGN KEY constraints
+    /// are validated during the load (INSERT semantics); otherwise they are skipped
+    /// for bulk-load speed (COPY/CTAS) — SqlBulkCopy skips them by default. Returns
+    /// rows written. This is the provider-specific bulk path (e.g. SqlBulkCopy).
     /// </summary>
-    long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable, bool replace);
+    long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable, bool replace,
+                    bool checkConstraints);
 
     /// <summary>
     /// rowid-based DELETE. <paramref name="keys"/> columns (named by Arrow field)
