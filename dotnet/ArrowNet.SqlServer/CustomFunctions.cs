@@ -12,27 +12,27 @@ namespace ArrowNet.SqlServer;
 /// </summary>
 internal static class CustomFunctions
 {
-    public static readonly IReadOnlyList<ArrowScalarFunction> Scalar = new ArrowScalarFunction[]
+    public static readonly IReadOnlyList<IArrowScalarFunction> Scalar = new IArrowScalarFunction[]
     {
         new CfAddFunction(),
     };
 }
 
 // Demo: dbo.cf_add(a, b) -> a + b, computed in C# (no such object exists in SQL Server).
-internal sealed class CfAddFunction : ArrowScalarFunction
+internal sealed class CfAddFunction : IArrowScalarFunction
 {
-    public override string SchemaName => "dbo";
-    public override string Name => "cf_add";
+    public string SchemaName => "dbo";
+    public string Name => "cf_add";
 
-    public override Schema Parameters => new(new[]
+    public Schema Parameters => new(new[]
     {
         new Field("a", Int32Type.Default, nullable: true),
         new Field("b", Int32Type.Default, nullable: true),
     }, metadata: null);
 
-    public override Field Result => new("result", Int32Type.Default, nullable: true);
+    public Field Result => new("result", Int32Type.Default, nullable: true);
 
-    public override IArrowArray Invoke(RecordBatch args)
+    public IArrowArray Invoke(RecordBatch args)
     {
         var a = (Int32Array)args.Column(0);
         var b = (Int32Array)args.Column(1);

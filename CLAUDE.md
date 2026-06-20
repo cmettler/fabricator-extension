@@ -86,7 +86,7 @@ current code still uses the single-provider `mssql_net` naming):
   **(4d) attach-time catalog-bound stored procedures DONE** (procs with a determinable result set resolved
   as table functions — `sp_describe` schema, `EXEC` execution, no pushdown — ABI v22; **named/optional
   params DONE (4d-2)**; **OUTPUT params + RETURN value as flat columns DONE (4d-3)**; multi-result-set +
-  INPUT/OUTPUT deferred); **(4e) attach-time custom C#-authored scalar functions DONE** (`ArrowScalarFunction`,
+  INPUT/OUTPUT deferred); **(4e) attach-time custom C#-authored scalar functions DONE** (`IArrowScalarFunction`,
   reuses the catalog scalar path — C#-only, no ABI; chosen over load-time global, which is deferred);
   next: table-in-out.
 
@@ -262,7 +262,7 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
 
 ### Custom (provider-authored) functions (4e)
 - Beyond functions *discovered* from SQL Server, a provider can **author custom scalar functions in C#**:
-  `ArrowScalarFunction` (in the Bridge) = `SchemaName`/`Name`/`Parameters`(arg fields)/`Result`(field)/
+  `IArrowScalarFunction` (in the Bridge) = `SchemaName`/`Name`/`Parameters`(arg fields)/`Result`(field)/
   `Invoke(RecordBatch)→IArrowArray`. The SqlServer provider lists them in `CustomFunctions.Scalar` (demo:
   `dbo.cf_add(a,b)=a+b`, computed in C#).
 - **Reuses the entire catalog scalar path — C#-only, no ABI/C++ change** (the lean alternative to load-time
@@ -274,7 +274,7 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
 - **Attach-time + catalog-bound** (`db.schema.fn`), not connection-free globals — chosen over load-time
   global functions because it avoids booting the CLR at `Extension::Load()` and needs no new ABI. (Load-time
   global via `loader.RegisterFunction` remains an option if connection-free functions are ever needed; the
-  same `ArrowScalarFunction` authoring + the existing `execute_scalar` with a handle-less marker would reuse
+  same `IArrowScalarFunction` authoring + the existing `execute_scalar` with a handle-less marker would reuse
   this path.)
 - **Verified**: `db.dbo.cf_add(2,3)=5`, vectorized (`+100` over a range), NULL→NULL, discovered as `scalar`,
   with **no SQL object** (`sys.objects` count 0 for `cf_add`). Committed test: `test/verify_custom_functions.test`.

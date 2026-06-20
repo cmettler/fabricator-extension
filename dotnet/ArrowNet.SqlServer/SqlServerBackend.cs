@@ -133,7 +133,7 @@ public sealed class SqlServerCatalog : IBackendCatalog
     // Provider-authored custom scalar functions, keyed "schema.name" (case-insensitive). Surfaced into
     // the catalog like discovered functions (see GetMetadata) but dispatched to C# (see ExecuteScalar /
     // GetFunctionParamSchema / GetFunctionReturnSchema) instead of generating SQL.
-    private static readonly IReadOnlyDictionary<string, ArrowScalarFunction> CustomScalar =
+    private static readonly IReadOnlyDictionary<string, IArrowScalarFunction> CustomScalar =
         CustomFunctions.Scalar.ToDictionary(f => $"{f.SchemaName}.{f.Name}", StringComparer.OrdinalIgnoreCase);
 
     private readonly string _connectionString;
