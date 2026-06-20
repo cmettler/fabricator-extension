@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-//                         mssql_net — DELETE / UPDATE physical operators
+//                         arrownet — DELETE / UPDATE physical operators
 //===----------------------------------------------------------------------===//
 
 #pragma once
@@ -11,7 +11,7 @@
 namespace duckdb {
 
 //! Shared target metadata for rowid-based DELETE/UPDATE.
-struct MssqlNetModifyTarget {
+struct ArrowNetModifyTarget {
 	string schema_name;
 	string table_name;
 	//! rowid/PK column names + types, in key order (1 = scalar rowid, >1 = compound).
@@ -24,12 +24,12 @@ struct MssqlNetModifyTarget {
 };
 
 //! DELETE FROM [schema].[table] WHERE <rowid predicates>, batched.
-class MssqlNetPhysicalDelete : public PhysicalOperator {
+class ArrowNetPhysicalDelete : public PhysicalOperator {
 public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXTENSION;
 
-	MssqlNetPhysicalDelete(PhysicalPlan &plan, vector<LogicalType> types, idx_t estimated_cardinality,
-	                       MssqlNetModifyTarget target, ArrowNetHandle handle);
+	ArrowNetPhysicalDelete(PhysicalPlan &plan, vector<LogicalType> types, idx_t estimated_cardinality,
+	                       ArrowNetModifyTarget target, ArrowNetHandle handle);
 
 	string GetName() const override {
 		return "MSSQL_NET_DELETE";
@@ -51,17 +51,17 @@ public:
 	                                 OperatorSourceInput &input) const override;
 
 private:
-	MssqlNetModifyTarget target_;
+	ArrowNetModifyTarget target_;
 	ArrowNetHandle handle_;
 };
 
 //! UPDATE [schema].[table] SET <cols> = <vals> WHERE <rowid predicate>, per-row batched.
-class MssqlNetPhysicalUpdate : public PhysicalOperator {
+class ArrowNetPhysicalUpdate : public PhysicalOperator {
 public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXTENSION;
 
-	MssqlNetPhysicalUpdate(PhysicalPlan &plan, vector<LogicalType> types, idx_t estimated_cardinality,
-	                       MssqlNetModifyTarget target, ArrowNetHandle handle);
+	ArrowNetPhysicalUpdate(PhysicalPlan &plan, vector<LogicalType> types, idx_t estimated_cardinality,
+	                       ArrowNetModifyTarget target, ArrowNetHandle handle);
 
 	string GetName() const override {
 		return "MSSQL_NET_UPDATE";
@@ -83,7 +83,7 @@ public:
 	                                 OperatorSourceInput &input) const override;
 
 private:
-	MssqlNetModifyTarget target_;
+	ArrowNetModifyTarget target_;
 	ArrowNetHandle handle_;
 };
 

@@ -25,7 +25,7 @@ public static unsafe class Bootstrap
             return ArrowNetStatus.InvalidArgument;
         }
 
-        vtable->AbiVersion = 14;
+        vtable->AbiVersion = 15;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -45,6 +45,9 @@ public static unsafe class Bootstrap
         vtable->CommitTransaction = &CommitTransaction;
         vtable->RollbackTransaction = &RollbackTransaction;
         vtable->InsertReturning = &InsertReturning;
+        vtable->BeginBulk = &BeginBulk;
+        vtable->PushBatch = &PushBatch;
+        vtable->CompleteBulk = &CompleteBulk;
         return ArrowNetStatus.Ok;
     }
 
@@ -416,6 +419,87 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int BeginBulk(nint handle, byte* schema, byte* table, int createTable, int replace,
+                                 CArrowSchema* schemaIn, nint* outSession, byte** err)
+    {
+        try
+        {
+            if (schemaIn is null || outSession is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            // Take ownership of the C schema (materialized into a managed Schema; the
+            // C struct is released by the importer).
+            var arrowSchema = CArrowSchemaImporter.ImportSchema(schemaIn);
+            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
+
+            var session = new BulkSession(catalog, schemaName, tableName, arrowSchema, createTable != 0, replace != 0);
+            *outSession = Handles.Alloc(session);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int PushBatch(nint session, CArrowArray* batch, byte** err)
+    {
+        if (batch is null)
+        {
+            return ArrowNetStatus.InvalidArgument;
+        }
+        RecordBatch? imported = null;
+        try
+        {
+            var s = Handles.Resolve<BulkSession>(session);
+            if (s is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            // Take ownership of the C array (zero-copy; released when the batch is disposed).
+            imported = CArrowArrayImporter.ImportRecordBatch(batch, s.Schema);
+            s.Push(imported); // ownership moves into the channel (or disposed if the consumer is gone)
+            imported = null;
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            imported?.Dispose();
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int CompleteBulk(nint session, int abort, long* affected, byte** err)
+    {
+        try
+        {
+            var s = Handles.Resolve<BulkSession>(session);
+            long rows = s?.Complete(abort != 0) ?? 0;
+            Handles.Free(session);
+            if (affected is not null)
+            {
+                *affected = rows;
+            }
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            // Free the handle even on failure (the background task has been observed).
+            Handles.Free(session);
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static int BeginTransaction(nint handle, byte** err) => RunTransactionOp(handle, c => c.BeginTransaction(), err);
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -454,7 +538,34 @@ public static unsafe class Bootstrap
     {
         if (err is not null)
         {
-            *err = (byte*)Marshal.StringToCoTaskMemUTF8(ex.Message);
+            *err = (byte*)Marshal.StringToCoTaskMemUTF8(FormatError(ex));
         }
+    }
+
+    /// <summary>
+    /// Surfaces a provider error code (e.g. SqlException.Number = 2627 for a PK
+    /// violation) ahead of the message, so error-code assertions match the way the
+    /// native mssql extension reports TDS errors. The bridge stays provider-agnostic,
+    /// so we duck-type a public <c>int Number</c> property (SqlException has one)
+    /// rather than reference Microsoft.Data.SqlClient.
+    /// </summary>
+    private static string FormatError(Exception ex)
+    {
+        try
+        {
+            for (Exception? e = ex; e is not null; e = e.InnerException)
+            {
+                var prop = e.GetType().GetProperty("Number");
+                if (prop?.PropertyType == typeof(int) && prop.GetValue(e) is int number && number != 0)
+                {
+                    return $"{number}: {ex.Message}";
+                }
+            }
+        }
+        catch
+        {
+            // Reflection failed — fall back to the plain message.
+        }
+        return ex.Message;
     }
 }

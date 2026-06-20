@@ -16,18 +16,18 @@ set(EXTENSION_SOURCES
     src/mssql_net_extension.cpp
     src/mssql_net_secret.cpp
     src/mssql_net_storage.cpp
-    src/mssql_net_optimizer.cpp
+    src/arrownet_optimizer.cpp
     src/arrownet/clr_host.cpp
     src/arrownet/arrow_ingest.cpp
     src/arrownet/arrow_produce.cpp
-    src/catalog/mssql_net_metadata.cpp
-    src/catalog/mssql_net_catalog.cpp
-    src/catalog/mssql_net_schema_entry.cpp
-    src/catalog/mssql_net_table_entry.cpp
-    src/catalog/mssql_net_transaction.cpp
-    src/dml/mssql_net_insert.cpp
-    src/dml/mssql_net_modify.cpp
-    src/dml/mssql_net_ctas.cpp
+    src/catalog/arrownet_metadata.cpp
+    src/catalog/arrownet_catalog.cpp
+    src/catalog/arrownet_schema_entry.cpp
+    src/catalog/arrownet_table_entry.cpp
+    src/catalog/arrownet_transaction.cpp
+    src/dml/arrownet_insert.cpp
+    src/dml/arrownet_modify.cpp
+    src/dml/arrownet_ctas.cpp
     src/copy/mssql_net_copy.cpp
 )
 

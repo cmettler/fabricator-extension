@@ -5,8 +5,8 @@
 #include "mssql_net_storage.hpp"
 
 #include "arrownet/clr_host.hpp"
-#include "catalog/mssql_net_catalog.hpp"
-#include "catalog/mssql_net_transaction.hpp"
+#include "catalog/arrownet_catalog.hpp"
+#include "catalog/arrownet_transaction.hpp"
 #include "mssql_net_secret.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -115,7 +115,7 @@ static unique_ptr<Catalog> MssqlNetAttach(optional_ptr<StorageExtensionInfo> sto
 
 	// Validate the filter regexes up front so a bad pattern reports a clean "Invalid
 	// regex" error rather than being wrapped as a connection failure below.
-	MssqlNetCatalog::ValidateCatalogFilters(schema_filter, table_filter);
+	ArrowNetCatalog::ValidateCatalogFilters(schema_filter, table_filter);
 
 	ValidateConnectionPort(connection_string);
 
@@ -124,7 +124,7 @@ static unique_ptr<Catalog> MssqlNetAttach(optional_ptr<StorageExtensionInfo> sto
 	// catalog query is never the first place a bad connection surfaces).
 	try {
 		auto handle = arrownet::OpenCatalog(connection_string);
-		auto catalog = make_uniq<MssqlNetCatalog>(db, name, handle, RedactConnectionString(connection_string));
+		auto catalog = make_uniq<ArrowNetCatalog>(db, name, handle, RedactConnectionString(connection_string));
 		catalog->SetCatalogFilters(schema_filter, table_filter);
 		catalog->LoadCatalog(context); // discover schemas + tables (also validates the connection)
 		return std::move(catalog);
@@ -136,8 +136,8 @@ static unique_ptr<Catalog> MssqlNetAttach(optional_ptr<StorageExtensionInfo> sto
 static unique_ptr<TransactionManager>
 MssqlNetCreateTransactionManager(optional_ptr<StorageExtensionInfo> storage_info, AttachedDatabase &db,
                                  Catalog &catalog) {
-	auto handle = catalog.Cast<MssqlNetCatalog>().GetHandle();
-	return make_uniq<MssqlNetTransactionManager>(db, handle);
+	auto handle = catalog.Cast<ArrowNetCatalog>().GetHandle();
+	return make_uniq<ArrowNetTransactionManager>(db, handle);
 }
 
 void RegisterMssqlNetStorageExtension(ExtensionLoader &loader) {

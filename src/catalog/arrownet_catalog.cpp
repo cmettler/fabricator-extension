@@ -1,16 +1,16 @@
 //===----------------------------------------------------------------------===//
-//                         mssql_net — catalog (impl)
+//                         arrownet — catalog (impl)
 //===----------------------------------------------------------------------===//
 
-#include "catalog/mssql_net_catalog.hpp"
+#include "catalog/arrownet_catalog.hpp"
 
 #include "arrownet/clr_host.hpp"
-#include "catalog/mssql_net_metadata.hpp"
-#include "catalog/mssql_net_schema_entry.hpp"
-#include "catalog/mssql_net_table_entry.hpp"
-#include "dml/mssql_net_ctas.hpp"
-#include "dml/mssql_net_insert.hpp"
-#include "dml/mssql_net_modify.hpp"
+#include "catalog/arrownet_metadata.hpp"
+#include "catalog/arrownet_schema_entry.hpp"
+#include "catalog/arrownet_table_entry.hpp"
+#include "dml/arrownet_ctas.hpp"
+#include "dml/arrownet_insert.hpp"
+#include "dml/arrownet_modify.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/exception.hpp"
@@ -59,7 +59,7 @@ struct CatalogFilters {
 
 } // namespace
 
-void MssqlNetCatalog::ValidateCatalogFilters(const string &schema_filter, const string &table_filter) {
+void ArrowNetCatalog::ValidateCatalogFilters(const string &schema_filter, const string &table_filter) {
 	auto check = [](const string &pattern) {
 		if (pattern.empty()) {
 			return;
@@ -74,31 +74,31 @@ void MssqlNetCatalog::ValidateCatalogFilters(const string &schema_filter, const 
 	check(table_filter);
 }
 
-void MssqlNetCatalog::SetCatalogFilters(const string &schema_filter, const string &table_filter) {
+void ArrowNetCatalog::SetCatalogFilters(const string &schema_filter, const string &table_filter) {
 	ValidateCatalogFilters(schema_filter, table_filter);
 	schema_filter_ = schema_filter;
 	table_filter_ = table_filter;
 }
 
-MssqlNetCatalog::MssqlNetCatalog(AttachedDatabase &db, string internal_name, ArrowNetHandle handle, string db_path)
+ArrowNetCatalog::ArrowNetCatalog(AttachedDatabase &db, string internal_name, ArrowNetHandle handle, string db_path)
     : Catalog(db), handle_(handle), db_path_(std::move(db_path)) {
 }
 
-MssqlNetCatalog::~MssqlNetCatalog() {
+ArrowNetCatalog::~ArrowNetCatalog() {
 	arrownet::CloseCatalog(handle_);
 }
 
-void MssqlNetCatalog::LoadCatalog(ClientContext &context) {
+void ArrowNetCatalog::LoadCatalog(ClientContext &context) {
 	lock_guard<mutex> lock(schema_lock_);
 
-	auto ensure_schema = [&](const string &schema_name) -> MssqlNetSchemaEntry & {
+	auto ensure_schema = [&](const string &schema_name) -> ArrowNetSchemaEntry & {
 		auto it = schemas_.find(schema_name);
 		if (it != schemas_.end()) {
 			return *it->second;
 		}
 		CreateSchemaInfo info;
 		info.schema = schema_name;
-		auto entry = make_uniq<MssqlNetSchemaEntry>(*this, info, handle_);
+		auto entry = make_uniq<ArrowNetSchemaEntry>(*this, info, handle_);
 		auto &ref = *entry;
 		schemas_[schema_name] = std::move(entry);
 		return ref;
@@ -117,17 +117,17 @@ void MssqlNetCatalog::LoadCatalog(ClientContext &context) {
 	}
 }
 
-void MssqlNetCatalog::RefreshCache(ClientContext &context) {
+void ArrowNetCatalog::RefreshCache(ClientContext &context) {
 	lock_guard<mutex> lock(schema_lock_);
 
-	auto ensure_schema = [&](const string &schema_name) -> MssqlNetSchemaEntry & {
+	auto ensure_schema = [&](const string &schema_name) -> ArrowNetSchemaEntry & {
 		auto it = schemas_.find(schema_name);
 		if (it != schemas_.end()) {
 			return *it->second;
 		}
 		CreateSchemaInfo info;
 		info.schema = schema_name;
-		auto entry = make_uniq<MssqlNetSchemaEntry>(*this, info, handle_);
+		auto entry = make_uniq<ArrowNetSchemaEntry>(*this, info, handle_);
 		auto &ref = *entry;
 		schemas_[schema_name] = std::move(entry);
 		return ref;
@@ -151,15 +151,15 @@ void MssqlNetCatalog::RefreshCache(ClientContext &context) {
 	}
 }
 
-void MssqlNetCatalog::Initialize(bool load_builtin) {
+void ArrowNetCatalog::Initialize(bool load_builtin) {
 	// Discovery happens in LoadCatalog (called from attach, where a context exists).
 }
 
-string MssqlNetCatalog::GetCatalogType() {
+string ArrowNetCatalog::GetCatalogType() {
 	return "mssql_net";
 }
 
-optional_ptr<SchemaCatalogEntry> MssqlNetCatalog::LookupSchema(CatalogTransaction transaction,
+optional_ptr<SchemaCatalogEntry> ArrowNetCatalog::LookupSchema(CatalogTransaction transaction,
                                                               const EntryLookupInfo &schema_lookup,
                                                               OnEntryNotFound if_not_found) {
 	lock_guard<mutex> lock(schema_lock_);
@@ -173,26 +173,26 @@ optional_ptr<SchemaCatalogEntry> MssqlNetCatalog::LookupSchema(CatalogTransactio
 	return nullptr;
 }
 
-void MssqlNetCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) {
+void ArrowNetCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) {
 	lock_guard<mutex> lock(schema_lock_);
 	for (auto &entry : schemas_) {
 		callback(*entry.second);
 	}
 }
 
-DatabaseSize MssqlNetCatalog::GetDatabaseSize(ClientContext &context) {
+DatabaseSize ArrowNetCatalog::GetDatabaseSize(ClientContext &context) {
 	return DatabaseSize();
 }
 
-bool MssqlNetCatalog::InMemory() {
+bool ArrowNetCatalog::InMemory() {
 	return false;
 }
 
-string MssqlNetCatalog::GetDBPath() {
+string ArrowNetCatalog::GetDBPath() {
 	return db_path_;
 }
 
-optional_ptr<CatalogEntry> MssqlNetCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
+optional_ptr<CatalogEntry> ArrowNetCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
 	if (info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
 		arrownet::DropSchema(handle_, info.schema, /*if_exists=*/true);
 	}
@@ -207,22 +207,22 @@ optional_ptr<CatalogEntry> MssqlNetCatalog::CreateSchema(CatalogTransaction tran
 		}
 		schemas_.erase(it);
 	}
-	auto entry = make_uniq<MssqlNetSchemaEntry>(*this, info, handle_);
+	auto entry = make_uniq<ArrowNetSchemaEntry>(*this, info, handle_);
 	auto &ref = *entry;
 	schemas_[info.schema] = std::move(entry);
 	return &ref;
 }
-void MssqlNetCatalog::DropSchema(ClientContext &context, DropInfo &info) {
+void ArrowNetCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 	bool if_exists = info.if_not_found == OnEntryNotFound::RETURN_NULL;
 	arrownet::DropSchema(handle_, info.name, if_exists);
 	lock_guard<mutex> lock(schema_lock_);
 	schemas_.erase(info.name);
 }
-PhysicalOperator &MssqlNetCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
+PhysicalOperator &ArrowNetCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
                                                      LogicalCreateTable &op, PhysicalOperator &plan) {
 	auto &create_info = op.info->base->Cast<CreateTableInfo>();
 
-	MssqlNetCtasInfo info;
+	ArrowNetCtasInfo info;
 	info.schema_name = create_info.schema;
 	info.table_name = create_info.table;
 	for (auto &col : create_info.columns.Logical()) {
@@ -231,17 +231,17 @@ PhysicalOperator &MssqlNetCatalog::PlanCreateTableAs(ClientContext &context, Phy
 	}
 	info.replace = op.info->base->on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT;
 	info.handle = handle_;
-	info.schema_entry = &op.schema.Cast<MssqlNetSchemaEntry>();
+	info.schema_entry = &op.schema.Cast<ArrowNetSchemaEntry>();
 
 	vector<LogicalType> result_types {LogicalType::BIGINT};
-	auto &ctas = planner.Make<MssqlNetPhysicalCreateTableAs>(std::move(result_types), op.estimated_cardinality,
+	auto &ctas = planner.Make<ArrowNetPhysicalCreateTableAs>(std::move(result_types), op.estimated_cardinality,
 	                                                         std::move(info));
 	ctas.children.push_back(plan);
 	return ctas;
 }
-PhysicalOperator &MssqlNetCatalog::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner,
+PhysicalOperator &ArrowNetCatalog::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner,
                                               LogicalInsert &op, optional_ptr<PhysicalOperator> plan) {
-	MssqlNetInsertTarget target;
+	ArrowNetInsertTarget target;
 	target.returning = op.return_chunk;
 	target.schema_name = op.table.schema.name;
 	target.table_name = op.table.name;
@@ -277,22 +277,22 @@ PhysicalOperator &MssqlNetCatalog::PlanInsert(ClientContext &context, PhysicalPl
 	// For RETURNING, the operator emits all table columns (op.types); otherwise a
 	// single rows-affected BIGINT.
 	vector<LogicalType> result_types = op.return_chunk ? op.types : vector<LogicalType> {LogicalType::BIGINT};
-	auto &insert = planner.Make<MssqlNetPhysicalInsert>(std::move(result_types), op.estimated_cardinality,
+	auto &insert = planner.Make<ArrowNetPhysicalInsert>(std::move(result_types), op.estimated_cardinality,
 	                                                    std::move(target), handle_);
 	if (plan) {
 		insert.children.push_back(*plan);
 	}
 	return insert;
 }
-static MssqlNetModifyTarget BuildModifyTarget(LogicalOperator &, TableCatalogEntry &table) {
-	auto &entry = table.Cast<MssqlNetTableEntry>();
+static ArrowNetModifyTarget BuildModifyTarget(LogicalOperator &, TableCatalogEntry &table) {
+	auto &entry = table.Cast<ArrowNetTableEntry>();
 	if (!entry.HasRowId()) {
 		throw BinderException(
 		    "mssql_net: UPDATE/DELETE requires a table with a primary key or unique index for row identity. "
 		    "Table '%s' has neither (use mssql_net_exec for set-based UPDATE/DELETE)",
 		    entry.name);
 	}
-	MssqlNetModifyTarget target;
+	ArrowNetModifyTarget target;
 	target.schema_name = entry.schema.name;
 	target.table_name = entry.name;
 	auto names = entry.GetColumns().GetColumnNames();
@@ -307,20 +307,20 @@ static MssqlNetModifyTarget BuildModifyTarget(LogicalOperator &, TableCatalogEnt
 	return target;
 }
 
-PhysicalOperator &MssqlNetCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner,
+PhysicalOperator &ArrowNetCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner,
                                               LogicalDelete &op, PhysicalOperator &plan) {
 	if (op.return_chunk) {
 		throw NotImplementedException("mssql_net: DELETE ... RETURNING is not supported yet");
 	}
 	auto target = BuildModifyTarget(op, op.table);
 	vector<LogicalType> result_types {LogicalType::BIGINT};
-	auto &del = planner.Make<MssqlNetPhysicalDelete>(std::move(result_types), op.estimated_cardinality,
+	auto &del = planner.Make<ArrowNetPhysicalDelete>(std::move(result_types), op.estimated_cardinality,
 	                                                 std::move(target), handle_);
 	del.children.push_back(plan);
 	return del;
 }
 
-PhysicalOperator &MssqlNetCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner,
+PhysicalOperator &ArrowNetCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner,
                                               LogicalUpdate &op, PhysicalOperator &plan) {
 	if (op.return_chunk) {
 		throw NotImplementedException("mssql_net: UPDATE ... RETURNING is not supported yet");
@@ -336,7 +336,7 @@ PhysicalOperator &MssqlNetCatalog::PlanUpdate(ClientContext &context, PhysicalPl
 		target.set_types.push_back(types[physical_index.index]);
 	}
 	vector<LogicalType> result_types {LogicalType::BIGINT};
-	auto &upd = planner.Make<MssqlNetPhysicalUpdate>(std::move(result_types), op.estimated_cardinality,
+	auto &upd = planner.Make<ArrowNetPhysicalUpdate>(std::move(result_types), op.estimated_cardinality,
 	                                                 std::move(target), handle_);
 	upd.children.push_back(plan);
 	return upd;

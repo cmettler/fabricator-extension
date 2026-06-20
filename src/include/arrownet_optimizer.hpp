@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-//                         mssql_net — optimizer extension
+//                         arrownet — optimizer extension
 //
 // Pushes a bare LIMIT (no ORDER BY) on an mssql_net catalog scan down to SQL
 // Server as `SELECT TOP (n)`. Safe because an unordered LIMIT may return any n
@@ -14,6 +14,6 @@ namespace duckdb {
 
 class DBConfig;
 
-void RegisterMssqlNetOptimizer(DBConfig &config);
+void RegisterArrowNetOptimizer(DBConfig &config);
 
 } // namespace duckdb

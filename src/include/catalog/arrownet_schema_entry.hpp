@@ -1,20 +1,20 @@
 //===----------------------------------------------------------------------===//
-//                         mssql_net — schema catalog entry
+//                         arrownet — schema catalog entry
 //===----------------------------------------------------------------------===//
 
 #pragma once
 
 #include "arrownet/abi.h"
-#include "catalog/mssql_net_table_entry.hpp"
+#include "catalog/arrownet_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/mutex.hpp"
 
 namespace duckdb {
 
-class MssqlNetSchemaEntry : public SchemaCatalogEntry {
+class ArrowNetSchemaEntry : public SchemaCatalogEntry {
 public:
-	MssqlNetSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, ArrowNetHandle handle);
+	ArrowNetSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, ArrowNetHandle handle);
 
 	//! Registers a discovered table/view name (called at attach time).
 	void AddTable(const string &table_name, const string &table_type);
@@ -51,7 +51,7 @@ private:
 	ArrowNetHandle handle_;
 	case_insensitive_map_t<string> table_types_; // table name -> "BASE TABLE" | "VIEW"
 	mutex entry_lock_;
-	case_insensitive_map_t<unique_ptr<MssqlNetTableEntry>> entries_;
+	case_insensitive_map_t<unique_ptr<ArrowNetTableEntry>> entries_;
 };
 
 } // namespace duckdb

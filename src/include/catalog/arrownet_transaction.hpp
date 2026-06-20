@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-//                         mssql_net — transactions (minimal, read-only)
+//                         arrownet — transactions (minimal, read-only)
 //===----------------------------------------------------------------------===//
 
 #pragma once
@@ -14,14 +14,14 @@ namespace duckdb {
 
 // A DuckDB transaction over the attached SQL Server catalog. The actual provider
 // transaction is pinned lazily in the managed backend on the first write.
-class MssqlNetTransaction : public Transaction {
+class ArrowNetTransaction : public Transaction {
 public:
-	MssqlNetTransaction(TransactionManager &manager, ClientContext &context);
+	ArrowNetTransaction(TransactionManager &manager, ClientContext &context);
 };
 
-class MssqlNetTransactionManager : public TransactionManager {
+class ArrowNetTransactionManager : public TransactionManager {
 public:
-	MssqlNetTransactionManager(AttachedDatabase &db, ArrowNetHandle handle);
+	ArrowNetTransactionManager(AttachedDatabase &db, ArrowNetHandle handle);
 
 	Transaction &StartTransaction(ClientContext &context) override;
 	ErrorData CommitTransaction(ClientContext &context, Transaction &transaction) override;
@@ -31,7 +31,7 @@ public:
 private:
 	ArrowNetHandle handle_;
 	mutex transaction_lock;
-	reference_map_t<Transaction, unique_ptr<MssqlNetTransaction>> transactions;
+	reference_map_t<Transaction, unique_ptr<ArrowNetTransaction>> transactions;
 };
 
 } // namespace duckdb

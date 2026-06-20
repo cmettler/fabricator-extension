@@ -70,6 +70,16 @@ public unsafe struct ArrowNetVTable
 
     // int32 insert_returning(void* handle, const char* schema, const char* table, ArrowArrayStream* in, ArrowArrayStream* out, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, CArrowArrayStream*, byte**, int> InsertReturning;
+
+    // int32 begin_bulk(void* handle, const char* schema, const char* table, int32 create_table, int32 replace,
+    //                  ArrowSchema* schema_in, void** out_session, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, int, int, CArrowSchema*, nint*, byte**, int> BeginBulk;
+
+    // int32 push_batch(void* session, ArrowArray* batch, char** err)
+    public delegate* unmanaged[Cdecl]<nint, CArrowArray*, byte**, int> PushBatch;
+
+    // int32 complete_bulk(void* session, int32 abort, int64* affected, char** err)
+    public delegate* unmanaged[Cdecl]<nint, int, long*, byte**, int> CompleteBulk;
 }
 
 /// <summary>Mirrors <c>ArrowNetAlterKind</c> in abi.h.</summary>

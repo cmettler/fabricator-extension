@@ -1,12 +1,12 @@
 //===----------------------------------------------------------------------===//
-//                  mssql_net — DELETE / UPDATE physical operators (impl)
+//                  arrownet — DELETE / UPDATE physical operators (impl)
 //
 // Provider-agnostic: the operators serialize the key columns (DELETE) or the
 // SET values + key columns (UPDATE) to Arrow and hand them to the bridge. The
 // C# provider generates the parameterized DELETE/UPDATE. No T-SQL here.
 //===----------------------------------------------------------------------===//
 
-#include "dml/mssql_net_modify.hpp"
+#include "dml/arrownet_modify.hpp"
 
 #include "arrownet/arrow_produce.hpp"
 #include "arrownet/clr_host.hpp"
@@ -19,9 +19,9 @@ namespace duckdb {
 
 // Shared sink state: an Arrow producer over the columns we send to the bridge —
 // [set columns...] (UPDATE only) followed by [key columns...].
-class MssqlNetModifyGlobalState : public GlobalSinkState {
+class ArrowNetModifyGlobalState : public GlobalSinkState {
 public:
-	MssqlNetModifyGlobalState(ClientContext &context, const MssqlNetModifyTarget &target, bool is_update) {
+	ArrowNetModifyGlobalState(ClientContext &context, const ArrowNetModifyTarget &target, bool is_update) {
 		if (is_update) {
 			for (idx_t i = 0; i < target.set_columns.size(); i++) {
 				names.push_back(target.set_columns[i]);
@@ -51,7 +51,7 @@ public:
 	mutable mutex lock;
 };
 
-class MssqlNetModifyLocalState : public LocalSinkState {};
+class ArrowNetModifyLocalState : public LocalSinkState {};
 
 // References the rowid column's key vector(s) into `out` starting at out_offset.
 static void ReferenceKeyColumns(DataChunk &out, idx_t out_offset, DataChunk &src, idx_t rowid_col, idx_t key_count) {
@@ -67,7 +67,7 @@ static void ReferenceKeyColumns(DataChunk &out, idx_t out_offset, DataChunk &src
 
 // Builds an ArrowArray from a column layout that references the source chunk,
 // and enqueues it on the producer.
-static void AppendModifyBatch(MssqlNetModifyGlobalState &gstate, DataChunk &chunk, bool is_update) {
+static void AppendModifyBatch(ArrowNetModifyGlobalState &gstate, DataChunk &chunk, bool is_update) {
 	idx_t rowid_col = chunk.ColumnCount() - 1; // rowid is the last child column
 	DataChunk produce;
 	produce.InitializeEmpty(gstate.types);
@@ -88,7 +88,7 @@ static void AppendModifyBatch(MssqlNetModifyGlobalState &gstate, DataChunk &chun
 }
 
 static SourceResultType EmitCount(GlobalSinkState &sink_state, DataChunk &chunk) {
-	auto &gstate = sink_state.Cast<MssqlNetModifyGlobalState>();
+	auto &gstate = sink_state.Cast<ArrowNetModifyGlobalState>();
 	lock_guard<mutex> guard(gstate.lock);
 	if (gstate.returned) {
 		return SourceResultType::FINISHED;
@@ -102,40 +102,40 @@ static SourceResultType EmitCount(GlobalSinkState &sink_state, DataChunk &chunk)
 //===----------------------------------------------------------------------===//
 // DELETE
 //===----------------------------------------------------------------------===//
-MssqlNetPhysicalDelete::MssqlNetPhysicalDelete(PhysicalPlan &plan, vector<LogicalType> types,
-                                               idx_t estimated_cardinality, MssqlNetModifyTarget target,
+ArrowNetPhysicalDelete::ArrowNetPhysicalDelete(PhysicalPlan &plan, vector<LogicalType> types,
+                                               idx_t estimated_cardinality, ArrowNetModifyTarget target,
                                                ArrowNetHandle handle)
     : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality),
       target_(std::move(target)), handle_(handle) {
 }
 
-unique_ptr<GlobalSinkState> MssqlNetPhysicalDelete::GetGlobalSinkState(ClientContext &context) const {
-	return make_uniq<MssqlNetModifyGlobalState>(context, target_, /*is_update=*/false);
+unique_ptr<GlobalSinkState> ArrowNetPhysicalDelete::GetGlobalSinkState(ClientContext &context) const {
+	return make_uniq<ArrowNetModifyGlobalState>(context, target_, /*is_update=*/false);
 }
-unique_ptr<LocalSinkState> MssqlNetPhysicalDelete::GetLocalSinkState(ExecutionContext &context) const {
-	return make_uniq<MssqlNetModifyLocalState>();
+unique_ptr<LocalSinkState> ArrowNetPhysicalDelete::GetLocalSinkState(ExecutionContext &context) const {
+	return make_uniq<ArrowNetModifyLocalState>();
 }
-SinkResultType MssqlNetPhysicalDelete::Sink(ExecutionContext &context, DataChunk &chunk,
+SinkResultType ArrowNetPhysicalDelete::Sink(ExecutionContext &context, DataChunk &chunk,
                                             OperatorSinkInput &input) const {
 	if (chunk.size() > 0) {
-		AppendModifyBatch(input.global_state.Cast<MssqlNetModifyGlobalState>(), chunk, /*is_update=*/false);
+		AppendModifyBatch(input.global_state.Cast<ArrowNetModifyGlobalState>(), chunk, /*is_update=*/false);
 	}
 	return SinkResultType::NEED_MORE_INPUT;
 }
-SinkCombineResultType MssqlNetPhysicalDelete::Combine(ExecutionContext &context,
+SinkCombineResultType ArrowNetPhysicalDelete::Combine(ExecutionContext &context,
                                                       OperatorSinkCombineInput &input) const {
 	return SinkCombineResultType::FINISHED;
 }
-SinkFinalizeType MssqlNetPhysicalDelete::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
+SinkFinalizeType ArrowNetPhysicalDelete::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
                                                   OperatorSinkFinalizeInput &input) const {
-	auto &gstate = input.global_state.Cast<MssqlNetModifyGlobalState>();
+	auto &gstate = input.global_state.Cast<ArrowNetModifyGlobalState>();
 	lock_guard<mutex> guard(gstate.lock);
 	gstate.producer->Finish();
 	gstate.total = (idx_t)arrownet::ExecuteDelete(handle_, target_.schema_name, target_.table_name,
 	                                              *gstate.producer->Stream());
 	return SinkFinalizeType::READY;
 }
-SourceResultType MssqlNetPhysicalDelete::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+SourceResultType ArrowNetPhysicalDelete::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
                                                          OperatorSourceInput &input) const {
 	return EmitCount(*sink_state, chunk);
 }
@@ -143,40 +143,40 @@ SourceResultType MssqlNetPhysicalDelete::GetDataInternal(ExecutionContext &conte
 //===----------------------------------------------------------------------===//
 // UPDATE
 //===----------------------------------------------------------------------===//
-MssqlNetPhysicalUpdate::MssqlNetPhysicalUpdate(PhysicalPlan &plan, vector<LogicalType> types,
-                                               idx_t estimated_cardinality, MssqlNetModifyTarget target,
+ArrowNetPhysicalUpdate::ArrowNetPhysicalUpdate(PhysicalPlan &plan, vector<LogicalType> types,
+                                               idx_t estimated_cardinality, ArrowNetModifyTarget target,
                                                ArrowNetHandle handle)
     : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality),
       target_(std::move(target)), handle_(handle) {
 }
 
-unique_ptr<GlobalSinkState> MssqlNetPhysicalUpdate::GetGlobalSinkState(ClientContext &context) const {
-	return make_uniq<MssqlNetModifyGlobalState>(context, target_, /*is_update=*/true);
+unique_ptr<GlobalSinkState> ArrowNetPhysicalUpdate::GetGlobalSinkState(ClientContext &context) const {
+	return make_uniq<ArrowNetModifyGlobalState>(context, target_, /*is_update=*/true);
 }
-unique_ptr<LocalSinkState> MssqlNetPhysicalUpdate::GetLocalSinkState(ExecutionContext &context) const {
-	return make_uniq<MssqlNetModifyLocalState>();
+unique_ptr<LocalSinkState> ArrowNetPhysicalUpdate::GetLocalSinkState(ExecutionContext &context) const {
+	return make_uniq<ArrowNetModifyLocalState>();
 }
-SinkResultType MssqlNetPhysicalUpdate::Sink(ExecutionContext &context, DataChunk &chunk,
+SinkResultType ArrowNetPhysicalUpdate::Sink(ExecutionContext &context, DataChunk &chunk,
                                             OperatorSinkInput &input) const {
 	if (chunk.size() > 0) {
-		AppendModifyBatch(input.global_state.Cast<MssqlNetModifyGlobalState>(), chunk, /*is_update=*/true);
+		AppendModifyBatch(input.global_state.Cast<ArrowNetModifyGlobalState>(), chunk, /*is_update=*/true);
 	}
 	return SinkResultType::NEED_MORE_INPUT;
 }
-SinkCombineResultType MssqlNetPhysicalUpdate::Combine(ExecutionContext &context,
+SinkCombineResultType ArrowNetPhysicalUpdate::Combine(ExecutionContext &context,
                                                       OperatorSinkCombineInput &input) const {
 	return SinkCombineResultType::FINISHED;
 }
-SinkFinalizeType MssqlNetPhysicalUpdate::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
+SinkFinalizeType ArrowNetPhysicalUpdate::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
                                                   OperatorSinkFinalizeInput &input) const {
-	auto &gstate = input.global_state.Cast<MssqlNetModifyGlobalState>();
+	auto &gstate = input.global_state.Cast<ArrowNetModifyGlobalState>();
 	lock_guard<mutex> guard(gstate.lock);
 	gstate.producer->Finish();
 	gstate.total = (idx_t)arrownet::ExecuteUpdate(handle_, target_.schema_name, target_.table_name,
 	                                              (int32_t)gstate.set_count, *gstate.producer->Stream());
 	return SinkFinalizeType::READY;
 }
-SourceResultType MssqlNetPhysicalUpdate::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+SourceResultType ArrowNetPhysicalUpdate::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
                                                          OperatorSourceInput &input) const {
 	return EmitCount(*sink_state, chunk);
 }

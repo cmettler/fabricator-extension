@@ -1,12 +1,12 @@
 //===----------------------------------------------------------------------===//
-//                         mssql_net — schema catalog entry (impl)
+//                         arrownet — schema catalog entry (impl)
 //===----------------------------------------------------------------------===//
 
-#include "catalog/mssql_net_schema_entry.hpp"
+#include "catalog/arrownet_schema_entry.hpp"
 
 #include "arrownet/arrow_produce.hpp"
 #include "arrownet/clr_host.hpp"
-#include "catalog/mssql_net_metadata.hpp"
+#include "catalog/arrownet_metadata.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/blob.hpp"
@@ -22,24 +22,24 @@
 
 namespace duckdb {
 
-MssqlNetSchemaEntry::MssqlNetSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, ArrowNetHandle handle)
+ArrowNetSchemaEntry::ArrowNetSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, ArrowNetHandle handle)
     : SchemaCatalogEntry(catalog, info), handle_(handle) {
 }
 
-void MssqlNetSchemaEntry::AddTable(const string &table_name, const string &table_type) {
+void ArrowNetSchemaEntry::AddTable(const string &table_name, const string &table_type) {
 	lock_guard<mutex> lock(entry_lock_);
 	table_types_[table_name] = table_type;
 	// Drop any cached entry so the schema is re-fetched (e.g. after CREATE OR REPLACE).
 	entries_.erase(table_name);
 }
 
-void MssqlNetSchemaEntry::ClearTables() {
+void ArrowNetSchemaEntry::ClearTables() {
 	lock_guard<mutex> lock(entry_lock_);
 	table_types_.clear();
 	entries_.clear();
 }
 
-optional_ptr<CatalogEntry> MssqlNetSchemaEntry::GetOrCreateEntry(ClientContext &context, const string &table_name) {
+optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateEntry(ClientContext &context, const string &table_name) {
 	lock_guard<mutex> lock(entry_lock_);
 	auto cached = entries_.find(table_name);
 	if (cached != entries_.end()) {
@@ -94,14 +94,14 @@ optional_ptr<CatalogEntry> MssqlNetSchemaEntry::GetOrCreateEntry(ClientContext &
 		rowid_type = LogicalType::STRUCT(std::move(children));
 	}
 
-	auto entry = make_uniq<MssqlNetTableEntry>(catalog, *this, info, handle_, std::move(rowid_indices),
+	auto entry = make_uniq<ArrowNetTableEntry>(catalog, *this, info, handle_, std::move(rowid_indices),
 	                                           std::move(rowid_type));
 	auto &ref = *entry;
 	entries_[table_name] = std::move(entry);
 	return &ref;
 }
 
-optional_ptr<CatalogEntry> MssqlNetSchemaEntry::LookupEntry(CatalogTransaction transaction,
+optional_ptr<CatalogEntry> ArrowNetSchemaEntry::LookupEntry(CatalogTransaction transaction,
                                                             const EntryLookupInfo &lookup_info) {
 	if (lookup_info.GetCatalogType() != CatalogType::TABLE_ENTRY) {
 		return nullptr;
@@ -112,7 +112,7 @@ optional_ptr<CatalogEntry> MssqlNetSchemaEntry::LookupEntry(CatalogTransaction t
 	return GetOrCreateEntry(*transaction.context, lookup_info.GetEntryName());
 }
 
-void MssqlNetSchemaEntry::Scan(ClientContext &context, CatalogType type,
+void ArrowNetSchemaEntry::Scan(ClientContext &context, CatalogType type,
                                const std::function<void(CatalogEntry &)> &callback) {
 	if (type != CatalogType::TABLE_ENTRY) {
 		return;
@@ -125,7 +125,7 @@ void MssqlNetSchemaEntry::Scan(ClientContext &context, CatalogType type,
 	}
 }
 
-void MssqlNetSchemaEntry::Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) {
+void ArrowNetSchemaEntry::Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) {
 	if (type != CatalogType::TABLE_ENTRY) {
 		return;
 	}
@@ -140,7 +140,7 @@ void MssqlNetSchemaEntry::Scan(CatalogType type, const std::function<void(Catalo
 	throw NotImplementedException("mssql_net: %s is not supported (read-only catalog in Phase 1)", op);
 }
 
-optional_ptr<CatalogEntry> MssqlNetSchemaEntry::CreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info) {
+optional_ptr<CatalogEntry> ArrowNetSchemaEntry::CreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info) {
 	if (!transaction.context) {
 		throw InternalException("mssql_net: CREATE TABLE requires a client context");
 	}
@@ -263,35 +263,35 @@ optional_ptr<CatalogEntry> MssqlNetSchemaEntry::CreateTable(CatalogTransaction t
 	AddTable(base.table, "BASE TABLE");
 	return GetOrCreateEntry(context, base.table);
 }
-optional_ptr<CatalogEntry> MssqlNetSchemaEntry::CreateFunction(CatalogTransaction, CreateFunctionInfo &) {
+optional_ptr<CatalogEntry> ArrowNetSchemaEntry::CreateFunction(CatalogTransaction, CreateFunctionInfo &) {
 	ReadOnly("CREATE FUNCTION");
 }
-optional_ptr<CatalogEntry> MssqlNetSchemaEntry::CreateIndex(CatalogTransaction, CreateIndexInfo &,
+optional_ptr<CatalogEntry> ArrowNetSchemaEntry::CreateIndex(CatalogTransaction, CreateIndexInfo &,
                                                             TableCatalogEntry &) {
 	ReadOnly("CREATE INDEX");
 }
-optional_ptr<CatalogEntry> MssqlNetSchemaEntry::CreateView(CatalogTransaction, CreateViewInfo &) {
+optional_ptr<CatalogEntry> ArrowNetSchemaEntry::CreateView(CatalogTransaction, CreateViewInfo &) {
 	ReadOnly("CREATE VIEW");
 }
-optional_ptr<CatalogEntry> MssqlNetSchemaEntry::CreateSequence(CatalogTransaction, CreateSequenceInfo &) {
+optional_ptr<CatalogEntry> ArrowNetSchemaEntry::CreateSequence(CatalogTransaction, CreateSequenceInfo &) {
 	ReadOnly("CREATE SEQUENCE");
 }
-optional_ptr<CatalogEntry> MssqlNetSchemaEntry::CreateTableFunction(CatalogTransaction, CreateTableFunctionInfo &) {
+optional_ptr<CatalogEntry> ArrowNetSchemaEntry::CreateTableFunction(CatalogTransaction, CreateTableFunctionInfo &) {
 	ReadOnly("CREATE TABLE FUNCTION");
 }
-optional_ptr<CatalogEntry> MssqlNetSchemaEntry::CreateCopyFunction(CatalogTransaction, CreateCopyFunctionInfo &) {
+optional_ptr<CatalogEntry> ArrowNetSchemaEntry::CreateCopyFunction(CatalogTransaction, CreateCopyFunctionInfo &) {
 	ReadOnly("CREATE COPY FUNCTION");
 }
-optional_ptr<CatalogEntry> MssqlNetSchemaEntry::CreatePragmaFunction(CatalogTransaction, CreatePragmaFunctionInfo &) {
+optional_ptr<CatalogEntry> ArrowNetSchemaEntry::CreatePragmaFunction(CatalogTransaction, CreatePragmaFunctionInfo &) {
 	ReadOnly("CREATE PRAGMA FUNCTION");
 }
-optional_ptr<CatalogEntry> MssqlNetSchemaEntry::CreateCollation(CatalogTransaction, CreateCollationInfo &) {
+optional_ptr<CatalogEntry> ArrowNetSchemaEntry::CreateCollation(CatalogTransaction, CreateCollationInfo &) {
 	ReadOnly("CREATE COLLATION");
 }
-optional_ptr<CatalogEntry> MssqlNetSchemaEntry::CreateType(CatalogTransaction, CreateTypeInfo &) {
+optional_ptr<CatalogEntry> ArrowNetSchemaEntry::CreateType(CatalogTransaction, CreateTypeInfo &) {
 	ReadOnly("CREATE TYPE");
 }
-void MssqlNetSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
+void ArrowNetSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 	if (info.type != CatalogType::TABLE_ENTRY) {
 		throw NotImplementedException("mssql_net: only DROP TABLE is supported yet (not %s)",
 		                              CatalogTypeToString(info.type));
@@ -303,7 +303,7 @@ void MssqlNetSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 	table_types_.erase(info.name);
 	entries_.erase(info.name);
 }
-void MssqlNetSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
+void ArrowNetSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 	if (info.type != AlterType::ALTER_TABLE) {
 		throw NotImplementedException("mssql_net: only ALTER TABLE is supported");
 	}

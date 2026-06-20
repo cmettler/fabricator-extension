@@ -1,8 +1,8 @@
 //===----------------------------------------------------------------------===//
-//                         mssql_net — catalog metadata helpers (impl)
+//                         arrownet — catalog metadata helpers (impl)
 //===----------------------------------------------------------------------===//
 
-#include "catalog/mssql_net_metadata.hpp"
+#include "catalog/arrownet_metadata.hpp"
 
 #include "arrownet/clr_host.hpp"
 #include "duckdb/common/exception.hpp"
@@ -81,13 +81,13 @@ vector<string> DiscoverSchemas(ArrowNetHandle handle) {
 	return rows[0];
 }
 
-vector<MssqlNetTableInfo> DiscoverTables(ArrowNetHandle handle) {
+vector<ArrowNetTableInfo> DiscoverTables(ArrowNetHandle handle) {
 	ArrowArrayStream stream;
 	std::memset(&stream, 0, sizeof(stream));
 	arrownet::GetMetadata(handle, ARROWNET_META_TABLES, "", "", stream);
 	auto rows = ReadStringTable(stream, 3);
 
-	vector<MssqlNetTableInfo> tables;
+	vector<ArrowNetTableInfo> tables;
 	for (idx_t i = 0; i < rows[0].size(); i++) {
 		tables.push_back({rows[0][i], rows[1][i], rows[2][i]});
 	}

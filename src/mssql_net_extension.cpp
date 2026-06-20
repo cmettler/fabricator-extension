@@ -9,9 +9,9 @@
 #include "arrownet/arrow_ingest.hpp"
 
 #include "arrownet/clr_host.hpp"
-#include "catalog/mssql_net_catalog.hpp"
+#include "catalog/arrownet_catalog.hpp"
 #include "copy/mssql_net_copy.hpp"
-#include "mssql_net_optimizer.hpp"
+#include "arrownet_optimizer.hpp"
 #include "mssql_net_secret.hpp"
 #include "mssql_net_storage.hpp"
 #include "duckdb/function/function_set.hpp"
@@ -39,7 +39,7 @@ static ArrowNetHandle ResolveConnection(ClientContext &context, const string &co
 			// (mssql_net_exec grabs the handle directly, bypassing the binder).
 			catalog.GetCatalogTransaction(context);
 			owns = false;
-			return catalog.Cast<MssqlNetCatalog>().GetHandle();
+			return catalog.Cast<ArrowNetCatalog>().GetHandle();
 		}
 	}
 	owns = true;
@@ -225,7 +225,7 @@ static void MssqlNetExecFunction(DataChunk &args, ExpressionState &state, Vector
 		if (invalidate_on_ddl && schema_may_change && !owns) {
 			auto db = DatabaseManager::Get(context).GetDatabase(context, conn_name);
 			if (db && db->GetCatalog().GetCatalogType() == "mssql_net") {
-				db->GetCatalog().Cast<MssqlNetCatalog>().RefreshCache(context);
+				db->GetCatalog().Cast<ArrowNetCatalog>().RefreshCache(context);
 			}
 		}
 	}
@@ -250,7 +250,7 @@ static void MssqlRefreshCacheFunction(DataChunk &args, ExpressionState &state, V
 			throw BinderException("mssql_refresh_cache: catalog '%s' is not an mssql_net catalog (type: %s)", name,
 			                      catalog.GetCatalogType());
 		}
-		catalog.Cast<MssqlNetCatalog>().RefreshCache(context);
+		catalog.Cast<ArrowNetCatalog>().RefreshCache(context);
 		result_data[i] = true;
 	}
 }
@@ -270,7 +270,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    ScalarFunction("arrownet_managed_dir", {}, LogicalType::VARCHAR, ArrowNetManagedDirFunction));
 
 	RegisterCompatSettings(DBConfig::GetConfig(loader.GetDatabaseInstance()));
-	RegisterMssqlNetOptimizer(DBConfig::GetConfig(loader.GetDatabaseInstance()));
+	RegisterArrowNetOptimizer(DBConfig::GetConfig(loader.GetDatabaseInstance()));
 
 	TableFunction test_scan("arrownet_test_scan", {LogicalType::VARCHAR}, arrownet::ArrowStreamScan, TestScanBind,
 	                        arrownet::ArrowStreamInitGlobal, arrownet::ArrowStreamInitLocal);

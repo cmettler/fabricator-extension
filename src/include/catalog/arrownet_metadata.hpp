@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-//                         mssql_net — catalog metadata helpers
+//                         arrownet — catalog metadata helpers
 //===----------------------------------------------------------------------===//
 
 #pragma once
@@ -15,7 +15,7 @@
 namespace duckdb {
 
 //! A discovered SQL Server table (or view).
-struct MssqlNetTableInfo {
+struct ArrowNetTableInfo {
 	string schema_name;
 	string table_name;
 	string table_type; // "BASE TABLE" | "VIEW"
@@ -29,7 +29,7 @@ vector<vector<string>> ReadStringTable(ArrowArrayStream &stream, idx_t expected_
 vector<string> DiscoverSchemas(ArrowNetHandle handle);
 
 //! Discovers user tables + views across all schemas.
-vector<MssqlNetTableInfo> DiscoverTables(ArrowNetHandle handle);
+vector<ArrowNetTableInfo> DiscoverTables(ArrowNetHandle handle);
 
 //! Resolves a table's column names + DuckDB types from the Arrow schema of the
 //! COLUMNS metadata stream (a zero-row result; reuses the C# type mapping, no

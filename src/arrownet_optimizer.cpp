@@ -1,8 +1,8 @@
 //===----------------------------------------------------------------------===//
-//                         mssql_net — optimizer extension (impl)
+//                         arrownet — optimizer extension (impl)
 //===----------------------------------------------------------------------===//
 
-#include "mssql_net_optimizer.hpp"
+#include "arrownet_optimizer.hpp"
 
 #include "arrownet/arrow_ingest.hpp"
 #include "duckdb/common/enums/order_type.hpp"
@@ -38,13 +38,13 @@ ScanMatch FindScan(LogicalOperator &node) {
 	auto *child = node.children[0].get();
 	if (child->type == LogicalOperatorType::LOGICAL_GET) {
 		auto &g = child->Cast<LogicalGet>();
-		if (g.function.name == "mssql_net_scan") {
+		if (g.function.name == "arrownet_scan") {
 			m.get = &g;
 		}
 	} else if (child->type == LogicalOperatorType::LOGICAL_PROJECTION && child->children.size() == 1 &&
 	           child->children[0]->type == LogicalOperatorType::LOGICAL_GET) {
 		auto &g = child->children[0]->Cast<LogicalGet>();
-		if (g.function.name == "mssql_net_scan") {
+		if (g.function.name == "arrownet_scan") {
 			m.get = &g;
 			m.proj = &child->Cast<LogicalProjection>();
 		}
@@ -212,15 +212,15 @@ void OptimizeNode(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &p
 	}
 }
 
-void MssqlNetOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+void ArrowNetOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
 	OptimizeNode(input, plan);
 }
 
 } // namespace
 
-void RegisterMssqlNetOptimizer(DBConfig &config) {
+void RegisterArrowNetOptimizer(DBConfig &config) {
 	OptimizerExtension extension;
-	extension.optimize_function = MssqlNetOptimize;
+	extension.optimize_function = ArrowNetOptimize;
 	OptimizerExtension::Register(config, std::move(extension));
 }
 

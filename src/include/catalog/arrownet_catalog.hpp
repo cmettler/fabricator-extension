@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-//                         mssql_net — catalog
+//                         arrownet — catalog
 //===----------------------------------------------------------------------===//
 
 #pragma once
@@ -11,14 +11,14 @@
 
 namespace duckdb {
 
-class MssqlNetSchemaEntry;
+class ArrowNetSchemaEntry;
 
 //! Read-only catalog backed by a SQL Server connection (via the C# bridge).
 //! Owns the bridge catalog handle for its lifetime.
-class MssqlNetCatalog : public Catalog {
+class ArrowNetCatalog : public Catalog {
 public:
-	MssqlNetCatalog(AttachedDatabase &db, string internal_name, ArrowNetHandle handle, string db_path);
-	~MssqlNetCatalog() override;
+	ArrowNetCatalog(AttachedDatabase &db, string internal_name, ArrowNetHandle handle, string db_path);
+	~ArrowNetCatalog() override;
 
 	//! Restricts catalog discovery to schemas/tables matching these (icase regex,
 	//! substring) patterns. Empty => no filter. Validates the patterns (throws on a
@@ -71,7 +71,7 @@ private:
 	string schema_filter_;
 	string table_filter_;
 	mutex schema_lock_;
-	case_insensitive_map_t<unique_ptr<MssqlNetSchemaEntry>> schemas_;
+	case_insensitive_map_t<unique_ptr<ArrowNetSchemaEntry>> schemas_;
 };
 
 } // namespace duckdb

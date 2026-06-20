@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-//                         mssql_net — table catalog entry
+//                         arrownet — table catalog entry
 //===----------------------------------------------------------------------===//
 
 #pragma once
@@ -12,9 +12,9 @@
 
 namespace duckdb {
 
-class MssqlNetTableEntry : public TableCatalogEntry {
+class ArrowNetTableEntry : public TableCatalogEntry {
 public:
-	MssqlNetTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info, ArrowNetHandle handle,
+	ArrowNetTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info, ArrowNetHandle handle,
 	                   vector<idx_t> rowid_columns, LogicalType rowid_type);
 
 	//! Produces a table scan that streams `SELECT * FROM [schema].[table]` from

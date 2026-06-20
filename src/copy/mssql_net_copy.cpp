@@ -6,8 +6,8 @@
 
 #include "arrownet/arrow_produce.hpp"
 #include "arrownet/clr_host.hpp"
-#include "catalog/mssql_net_catalog.hpp"
-#include "catalog/mssql_net_schema_entry.hpp"
+#include "catalog/arrownet_catalog.hpp"
+#include "catalog/arrownet_schema_entry.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/value.hpp"
@@ -16,6 +16,8 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
+
+#include <cstring>
 
 namespace duckdb {
 
@@ -44,11 +46,24 @@ struct MssqlNetCopyGlobalState : public GlobalFunctionData {
 	MssqlNetCopyGlobalState(ClientContext &context, const MssqlNetCopyBindData &bind_data)
 	    : properties(context.GetClientProperties()),
 	      extension_types(ArrowTypeExtensionData::GetExtensionTypes(context, bind_data.column_types)) {
+		// The producer also builds the Arrow schema handed to begin_bulk.
 		producer = make_uniq<arrownet::ArrowProducer>(bind_data.column_types, bind_data.column_names, properties);
+	}
+	~MssqlNetCopyGlobalState() override {
+		// Cancel the background load if the query failed before Finalize (best-effort).
+		if (bulk_session && !bulk_completed) {
+			try {
+				arrownet::CompleteBulk(bulk_session, /*abort=*/true);
+			} catch (...) {
+			}
+		}
 	}
 	ClientProperties properties;
 	unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>> extension_types;
 	unique_ptr<arrownet::ArrowProducer> producer;
+	//! Streaming bulk-load session.
+	ArrowNetHandle bulk_session = nullptr;
+	bool bulk_completed = false;
 	mutex lock;
 };
 
@@ -102,7 +117,7 @@ static unique_ptr<FunctionData> CopyToBind(ClientContext &context, CopyFunctionB
 	if (catalog.GetCatalogType() != "mssql_net") {
 		throw BinderException("mssql_net COPY: catalog '%s' is not an mssql_net catalog", bind_data->catalog_name);
 	}
-	bind_data->handle = catalog.Cast<MssqlNetCatalog>().GetHandle();
+	bind_data->handle = catalog.Cast<ArrowNetCatalog>().GetHandle();
 	bind_data->column_names = names;
 	bind_data->column_types = sql_types;
 	bind_data->create_table = GetBoolOption(input.info.options, "CREATE_TABLE", true);
@@ -110,9 +125,19 @@ static unique_ptr<FunctionData> CopyToBind(ClientContext &context, CopyFunctionB
 	return std::move(bind_data);
 }
 
-static unique_ptr<GlobalFunctionData> CopyToInitGlobal(ClientContext &context, FunctionData &bind_data,
+static unique_ptr<GlobalFunctionData> CopyToInitGlobal(ClientContext &context, FunctionData &bind_data_p,
                                                        const string &file_path) {
-	return make_uniq<MssqlNetCopyGlobalState>(context, bind_data.Cast<MssqlNetCopyBindData>());
+	auto &bind_data = bind_data_p.Cast<MssqlNetCopyBindData>();
+	auto gstate = make_uniq<MssqlNetCopyGlobalState>(context, bind_data);
+	// Stream rows to the provider as they are sinked (bounded memory). The target is
+	// created at begin per CREATE_TABLE/REPLACE, then rows stream in.
+	ArrowSchema schema;
+	std::memset(&schema, 0, sizeof(schema));
+	auto *stream = gstate->producer->Stream();
+	stream->get_schema(stream, &schema);
+	gstate->bulk_session = arrownet::BeginBulk(bind_data.handle, bind_data.schema_name, bind_data.table_name,
+	                                           bind_data.create_table, bind_data.replace, schema);
+	return std::move(gstate);
 }
 
 static unique_ptr<LocalFunctionData> CopyToInitLocal(ExecutionContext &context, FunctionData &bind_data) {
@@ -129,8 +154,9 @@ static void CopyToSink(ExecutionContext &context, FunctionData &bind_data_p, Glo
 	ArrowAppender appender(bind_data.column_types, input.size(), gstate.properties, gstate.extension_types);
 	appender.Append(input, 0, input.size(), input.size());
 	ArrowArray array = appender.Finalize();
-	lock_guard<mutex> guard(gstate.lock);
-	gstate.producer->AddBatch(array);
+	// Stream the batch to the provider; PushBatch blocks for backpressure when the
+	// channel is full. COPY runs serially, so no lock is needed.
+	arrownet::PushBatch(gstate.bulk_session, array);
 }
 
 static void CopyToCombine(ExecutionContext &context, FunctionData &bind_data, GlobalFunctionData &gstate,
@@ -140,10 +166,10 @@ static void CopyToCombine(ExecutionContext &context, FunctionData &bind_data, Gl
 static void CopyToFinalize(ClientContext &context, FunctionData &bind_data_p, GlobalFunctionData &gstate_p) {
 	auto &bind_data = bind_data_p.Cast<MssqlNetCopyBindData>();
 	auto &gstate = gstate_p.Cast<MssqlNetCopyGlobalState>();
-	lock_guard<mutex> guard(gstate.lock);
-	gstate.producer->Finish();
-	arrownet::BulkInsert(bind_data.handle, bind_data.schema_name, bind_data.table_name, bind_data.create_table,
-	                     bind_data.replace, *gstate.producer->Stream());
+	// Signal end-of-stream and wait for the background load to drain.
+	arrownet::CompleteBulk(gstate.bulk_session, /*abort=*/false);
+	gstate.bulk_completed = true;
+	gstate.bulk_session = nullptr;
 
 	// Register the target in the attached catalog so it's queryable immediately
 	// (also invalidates any stale cached entry, e.g. for CREATE_TABLE/REPLACE).
@@ -151,7 +177,7 @@ static void CopyToFinalize(ClientContext &context, FunctionData &bind_data_p, Gl
 	if (catalog.GetCatalogType() == "mssql_net") {
 		auto schema = catalog.GetSchema(context, bind_data.schema_name, OnEntryNotFound::RETURN_NULL);
 		if (schema) {
-			schema->Cast<MssqlNetSchemaEntry>().AddTable(bind_data.table_name, "BASE TABLE");
+			schema->Cast<ArrowNetSchemaEntry>().AddTable(bind_data.table_name, "BASE TABLE");
 		}
 	}
 }

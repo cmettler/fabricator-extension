@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-//                         mssql_net — CREATE TABLE AS (CTAS) operator
+//                         arrownet — CREATE TABLE AS (CTAS) operator
 //===----------------------------------------------------------------------===//
 
 #pragma once
@@ -10,9 +10,9 @@
 
 namespace duckdb {
 
-class MssqlNetSchemaEntry;
+class ArrowNetSchemaEntry;
 
-struct MssqlNetCtasInfo {
+struct ArrowNetCtasInfo {
 	string schema_name;
 	string table_name;
 	vector<string> column_names;
@@ -20,18 +20,18 @@ struct MssqlNetCtasInfo {
 	bool replace = false;
 	ArrowNetHandle handle = nullptr;
 	//! Schema entry to register the new table in (so it appears in the catalog).
-	optional_ptr<MssqlNetSchemaEntry> schema_entry;
+	optional_ptr<ArrowNetSchemaEntry> schema_entry;
 };
 
 //! CREATE TABLE [schema].[table] AS SELECT ... — streams the SELECT result as
 //! Arrow to the bridge, which creates the table (mapping Arrow types) and bulk
 //! loads it. Returns the inserted row count.
-class MssqlNetPhysicalCreateTableAs : public PhysicalOperator {
+class ArrowNetPhysicalCreateTableAs : public PhysicalOperator {
 public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXTENSION;
 
-	MssqlNetPhysicalCreateTableAs(PhysicalPlan &plan, vector<LogicalType> types, idx_t estimated_cardinality,
-	                              MssqlNetCtasInfo info);
+	ArrowNetPhysicalCreateTableAs(PhysicalPlan &plan, vector<LogicalType> types, idx_t estimated_cardinality,
+	                              ArrowNetCtasInfo info);
 
 	string GetName() const override {
 		return "MSSQL_NET_CREATE_TABLE_AS";
@@ -53,7 +53,7 @@ public:
 	                                 OperatorSourceInput &input) const override;
 
 private:
-	MssqlNetCtasInfo info_;
+	ArrowNetCtasInfo info_;
 };
 
 } // namespace duckdb

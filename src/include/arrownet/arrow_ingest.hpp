@@ -1,0 +1,153 @@
+//===----------------------------------------------------------------------===//
+//                         ArrowNet — Arrow stream ingestion
+//
+// arrow_ingest.hpp
+//
+// Reusable bridge from an Arrow C Stream (produced by the managed bridge) into
+// DuckDB DataChunks. Mirrors DuckDB's own ArrowTableFunction scan loop
+// (see duckdb/src/function/table/arrow.cpp) but driven by a caller-supplied
+// stream factory instead of arrow_scan's pointer factory.
+//
+// A concrete table function provides a `factory` that (re)produces a fresh
+// ArrowArrayStream; this module owns schema discovery, global/local state, and
+// the per-chunk ArrowToDuckDB conversion.
+//===----------------------------------------------------------------------===//
+
+#pragma once
+
+// DuckDB arrow headers MUST precede any include that pulls in arrownet/abi.h, so
+// DuckDB's richer ArrowSchema definition (with Init()) wins the include guard.
+#include "duckdb/common/arrow/arrow_wrapper.hpp"
+#include "duckdb/common/types/value.hpp"
+#include "duckdb/function/table/arrow.hpp"
+#include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
+#include "duckdb/function/table_function.hpp"
+
+#include <functional>
+
+namespace duckdb {
+class TableCatalogEntry;
+}
+
+namespace arrownet {
+
+// A pushdown request for one scan: projection + filter, serialized as a small
+// JSON spec, plus the typed constant values the filter tree references. Empty
+// spec_json + null filter_values => a plain full scan.
+struct ArrowScanRequest {
+	duckdb::string spec_json;          // {"columns":[...],"filter":<tree>}; empty => SELECT *
+	ArrowArrayStream *filter_values = nullptr; // typed constants for the filter tree (nullable)
+};
+
+// Produces a fresh, owned ArrowArrayStream into `out` for the given request. Must
+// throw a duckdb::Exception on failure (it will propagate to the SQL caller).
+using StreamFactory = std::function<void(const ArrowScanRequest &request, ArrowArrayStream &out)>;
+
+// Bind data for any table function that streams Arrow from the bridge.
+struct ArrowStreamBindData : public duckdb::TableFunctionData {
+	//! Owned copy of the result schema (populated during bind).
+	duckdb::ArrowSchemaWrapper schema_root;
+	//! DuckDB's parsed view of the Arrow schema (column converters).
+	duckdb::ArrowTableSchema arrow_table;
+	//! Resolved DuckDB return types (column order matches the Arrow schema).
+	duckdb::vector<duckdb::LogicalType> return_types;
+	//! Column names (parallel to return_types) — used to map a projected/filtered
+	//! column index back to its provider name when pushing projection/filters.
+	duckdb::vector<duckdb::string> names;
+	//! Column nullability (parallel to return_types); used to decide whether NULL
+	//! ordering matters when pushing ORDER BY. Empty/true => assume nullable.
+	duckdb::vector<bool> column_nullable;
+	//! Per-column distinct-value estimate (NDV) for the optimizer's selectivity
+	//! (parallel to return_types); <= 0 => unknown (no DistinctStats reported). Only
+	//! used for cardinality estimation, never pruning, so approximate/stale is safe.
+	duckdb::vector<int64_t> column_ndv;
+	//! When true (catalog table scans), the projected column list (and later, the
+	//! filter) is pushed to the provider; the result is the projected subset and the
+	//! scan maps output columns by NAME. When false (raw queries), the full result is
+	//! fetched and projected positionally.
+	bool push_projection = false;
+	//! Re-creates the data stream for each scan.
+	StreamFactory factory;
+
+	//! Filter pushdown (Phase 2). Set by the catalog scan's pushdown_complex_filter
+	//! callback: `filter_json` is a predicate-tree (FilterNode) whose constants are
+	//! referenced by index into `filter_constants`; the scan ships them to the
+	//! provider (value batch) so C# builds a parameterized WHERE. Empty => no filter.
+	duckdb::string filter_json;
+	duckdb::vector<duckdb::Value> filter_constants;
+
+	//! LIMIT pushdown (Phase 3): a constant row limit to push as `SELECT TOP (n)`.
+	//! -1 => none. Only applied when there is no pushed filter (a best-effort filter
+	//! returns a superset, so TOP before exact filtering could drop rows). Set by the
+	//! optimizer extension; DuckDB keeps its own LIMIT, so this is purely a hint.
+	int64_t top_n = -1;
+	//! ORDER BY pushdown: a JSON array `[{"col":"c","desc":bool}]`. Set by the
+	//! optimizer only when ALL order keys are plain non-string columns with
+	//! SQL-Server-compatible NULL ordering and there is no pushed filter; paired with
+	//! top_n (TopN). Empty => none. DuckDB keeps its TopN, so this is a hint.
+	duckdb::string order_by_json;
+
+	//! Row-identity (rowid) support for catalog tables. When non-empty, these are
+	//! the indices (in the result column order) of the PK / unique-index columns,
+	//! and rowid_type is the rowid's DuckDB type (a scalar type for a single
+	//! column, a STRUCT for a compound key). Empty => no rowid (table functions).
+	duckdb::vector<duckdb::idx_t> rowid_source_columns;
+	duckdb::LogicalType rowid_type;
+
+	//! Approximate table row count for the optimizer's cardinality estimate; -1 =>
+	//! unknown (no NodeStatistics reported). Set for catalog table scans.
+	int64_t row_count = -1;
+
+	//! For catalog tables: the backing table entry, so LogicalGet::GetTable()
+	//! resolves (required for UPDATE/DELETE). Null for raw table functions.
+	duckdb::optional_ptr<duckdb::TableCatalogEntry> table;
+};
+
+// get_bind_info callback so DuckDB can recover the table entry from a scan
+// (LogicalGet::GetTable()); enables UPDATE/DELETE on catalog tables.
+duckdb::BindInfo ArrowStreamGetBindInfo(const duckdb::optional_ptr<duckdb::FunctionData> bind_data);
+
+// Discovers the result schema by producing a stream, reading its schema, and
+// releasing it. Fills `return_types`/`names` and bind_data.arrow_table.
+void PopulateReturnSchema(duckdb::ClientContext &context, ArrowStreamBindData &bind_data,
+                          duckdb::vector<duckdb::LogicalType> &return_types,
+                          duckdb::vector<duckdb::string> &names);
+
+// Table-function callbacks (wire these into a duckdb::TableFunction).
+duckdb::unique_ptr<duckdb::GlobalTableFunctionState>
+ArrowStreamInitGlobal(duckdb::ClientContext &context, duckdb::TableFunctionInitInput &input);
+
+duckdb::unique_ptr<duckdb::LocalTableFunctionState>
+ArrowStreamInitLocal(duckdb::ExecutionContext &context, duckdb::TableFunctionInitInput &input,
+                     duckdb::GlobalTableFunctionState *global_state);
+
+void ArrowStreamScan(duckdb::ClientContext &context, duckdb::TableFunctionInput &data, duckdb::DataChunk &output);
+
+// Ingests an owned ArrowArrayStream into DuckDB DataChunks (identity column map,
+// no projection/rowid). Used to drive an operator's source from a one-off Arrow
+// result, e.g. the OUTPUT rows of INSERT ... RETURNING. Owns + releases the stream.
+class ArrowStreamReader {
+public:
+	ArrowStreamReader(duckdb::ClientContext &context, ArrowArrayStream stream);
+	~ArrowStreamReader();
+
+	//! DuckDB types of the stream's columns (in Arrow schema order).
+	const duckdb::vector<duckdb::LogicalType> &Types() const {
+		return types_;
+	}
+
+	//! Reads the next batch into `output` (which must be initialized to Types());
+	//! sets cardinality 0 at end of stream.
+	void Read(duckdb::DataChunk &output);
+
+private:
+	duckdb::ClientContext &context_;
+	ArrowArrayStream stream_ {};
+	duckdb::ArrowSchemaWrapper schema_root_;
+	duckdb::ArrowTableSchema arrow_table_;
+	duckdb::vector<duckdb::LogicalType> types_;
+	duckdb::unique_ptr<duckdb::ArrowScanLocalState> lstate_;
+	bool done_ = false;
+};
+
+} // namespace arrownet

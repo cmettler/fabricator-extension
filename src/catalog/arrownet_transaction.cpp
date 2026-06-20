@@ -1,23 +1,23 @@
 //===----------------------------------------------------------------------===//
-//                         mssql_net — transactions (impl)
+//                         arrownet — transactions (impl)
 //===----------------------------------------------------------------------===//
 
-#include "catalog/mssql_net_transaction.hpp"
+#include "catalog/arrownet_transaction.hpp"
 
 #include "arrownet/clr_host.hpp"
 
 namespace duckdb {
 
-MssqlNetTransaction::MssqlNetTransaction(TransactionManager &manager, ClientContext &context)
+ArrowNetTransaction::ArrowNetTransaction(TransactionManager &manager, ClientContext &context)
     : Transaction(manager, context) {
 }
 
-MssqlNetTransactionManager::MssqlNetTransactionManager(AttachedDatabase &db, ArrowNetHandle handle)
+ArrowNetTransactionManager::ArrowNetTransactionManager(AttachedDatabase &db, ArrowNetHandle handle)
     : TransactionManager(db), handle_(handle) {
 }
 
-Transaction &MssqlNetTransactionManager::StartTransaction(ClientContext &context) {
-	auto transaction = make_uniq<MssqlNetTransaction>(*this, context);
+Transaction &ArrowNetTransactionManager::StartTransaction(ClientContext &context) {
+	auto transaction = make_uniq<ArrowNetTransaction>(*this, context);
 	auto &result = *transaction;
 	{
 		lock_guard<mutex> lock(transaction_lock);
@@ -33,7 +33,7 @@ Transaction &MssqlNetTransactionManager::StartTransaction(ClientContext &context
 	return result;
 }
 
-ErrorData MssqlNetTransactionManager::CommitTransaction(ClientContext &context, Transaction &transaction) {
+ErrorData ArrowNetTransactionManager::CommitTransaction(ClientContext &context, Transaction &transaction) {
 	{
 		lock_guard<mutex> lock(transaction_lock);
 		transactions.erase(transaction);
@@ -46,7 +46,7 @@ ErrorData MssqlNetTransactionManager::CommitTransaction(ClientContext &context, 
 	return ErrorData();
 }
 
-void MssqlNetTransactionManager::RollbackTransaction(Transaction &transaction) {
+void ArrowNetTransactionManager::RollbackTransaction(Transaction &transaction) {
 	{
 		lock_guard<mutex> lock(transaction_lock);
 		transactions.erase(transaction);
@@ -58,7 +58,7 @@ void MssqlNetTransactionManager::RollbackTransaction(Transaction &transaction) {
 	}
 }
 
-void MssqlNetTransactionManager::Checkpoint(ClientContext &context, bool force) {
+void ArrowNetTransactionManager::Checkpoint(ClientContext &context, bool force) {
 	// Nothing to checkpoint for a remote catalog.
 }
 

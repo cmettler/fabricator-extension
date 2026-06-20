@@ -1,12 +1,12 @@
 //===----------------------------------------------------------------------===//
-//                         mssql_net — table catalog entry (impl)
+//                         arrownet — table catalog entry (impl)
 //===----------------------------------------------------------------------===//
 
-#include "catalog/mssql_net_table_entry.hpp"
+#include "catalog/arrownet_table_entry.hpp"
 
 #include "arrownet/arrow_ingest.hpp"
 #include "arrownet/clr_host.hpp"
-#include "catalog/mssql_net_metadata.hpp"
+#include "catalog/arrownet_metadata.hpp"
 #include "duckdb/common/column_index.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -330,7 +330,7 @@ private:
 
 // pushdown_complex_filter: serialize the superset-safe predicates into bind_data and
 // LEAVE every expression in `filters` (best-effort) so DuckDB still applies them all.
-void MssqlNetComplexFilterPushdown(ClientContext &, LogicalGet &get, FunctionData *bind_data_p,
+void ArrowNetComplexFilterPushdown(ClientContext &, LogicalGet &get, FunctionData *bind_data_p,
                                    vector<unique_ptr<Expression>> &filters) {
 	auto &bind_data = bind_data_p->Cast<arrownet::ArrowStreamBindData>();
 	bind_data.filter_json.clear();
@@ -368,7 +368,7 @@ void MssqlNetComplexFilterPushdown(ClientContext &, LogicalGet &get, FunctionDat
 
 } // namespace
 
-MssqlNetTableEntry::MssqlNetTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
+ArrowNetTableEntry::ArrowNetTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
                                        ArrowNetHandle handle, vector<idx_t> rowid_columns, LogicalType rowid_type)
     : TableCatalogEntry(catalog, schema, info), handle_(handle), rowid_columns_(std::move(rowid_columns)),
       rowid_type_(std::move(rowid_type)) {
@@ -376,7 +376,7 @@ MssqlNetTableEntry::MssqlNetTableEntry(Catalog &catalog, SchemaCatalogEntry &sch
 
 // Cardinality callback: hands the optimizer the table's approximate row count so
 // join ordering has a real estimate. Unknown (-1) => no statistics reported.
-static unique_ptr<NodeStatistics> MssqlNetScanCardinality(ClientContext &context, const FunctionData *bind_data_p) {
+static unique_ptr<NodeStatistics> ArrowNetScanCardinality(ClientContext &context, const FunctionData *bind_data_p) {
 	auto &bind_data = bind_data_p->Cast<arrownet::ArrowStreamBindData>();
 	if (bind_data.row_count < 0) {
 		return nullptr;
@@ -389,7 +389,7 @@ static unique_ptr<NodeStatistics> MssqlNetScanCardinality(ClientContext &context
 // DuckDB prunes filters on min/max (FILTER_ALWAYS_FALSE), and SQL Server's sampled,
 // possibly-stale stats are not exact bounds on a live table — so reporting them could
 // drop rows. NDV only affects cardinality estimation, never correctness.
-static unique_ptr<BaseStatistics> MssqlNetScanStatistics(ClientContext &context, const FunctionData *bind_data_p,
+static unique_ptr<BaseStatistics> ArrowNetScanStatistics(ClientContext &context, const FunctionData *bind_data_p,
                                                          column_t column_index) {
 	auto &bind_data = bind_data_p->Cast<arrownet::ArrowStreamBindData>();
 	if (column_index >= bind_data.column_ndv.size() || bind_data.column_ndv[column_index] <= 0 ||
@@ -401,7 +401,7 @@ static unique_ptr<BaseStatistics> MssqlNetScanStatistics(ClientContext &context,
 	return make_uniq<BaseStatistics>(std::move(stats));
 }
 
-TableFunction MssqlNetTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) {
+TableFunction ArrowNetTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) {
 	auto data = make_uniq<arrownet::ArrowStreamBindData>();
 	auto handle = handle_;
 	// The managed side builds the provider SELECT for the whole table.
@@ -455,29 +455,29 @@ TableFunction MssqlNetTableEntry::GetScanFunction(ClientContext &context, unique
 
 	bind_data = std::move(data);
 
-	TableFunction function("mssql_net_scan", {}, arrownet::ArrowStreamScan, nullptr, arrownet::ArrowStreamInitGlobal,
+	TableFunction function("arrownet_scan", {}, arrownet::ArrowStreamScan, nullptr, arrownet::ArrowStreamInitGlobal,
 	                       arrownet::ArrowStreamInitLocal);
 	function.projection_pushdown = true;
 	// Best-effort filter pushdown: the callback serializes superset-safe predicates
 	// and leaves them in place, so DuckDB still applies every filter (correctness).
 	// filter_pushdown stays false (its TableFilterSet path removes filters from the
 	// plan, which would be unsafe for partial/approximate pushdown).
-	function.pushdown_complex_filter = MssqlNetComplexFilterPushdown;
-	function.cardinality = MssqlNetScanCardinality;
-	function.statistics = MssqlNetScanStatistics;
+	function.pushdown_complex_filter = ArrowNetComplexFilterPushdown;
+	function.cardinality = ArrowNetScanCardinality;
+	function.statistics = ArrowNetScanStatistics;
 	function.get_bind_info = arrownet::ArrowStreamGetBindInfo;
 	return function;
 }
 
-unique_ptr<BaseStatistics> MssqlNetTableEntry::GetStatistics(ClientContext &context, column_t column_id) {
+unique_ptr<BaseStatistics> ArrowNetTableEntry::GetStatistics(ClientContext &context, column_t column_id) {
 	return nullptr;
 }
 
-TableStorageInfo MssqlNetTableEntry::GetStorageInfo(ClientContext &context) {
+TableStorageInfo ArrowNetTableEntry::GetStorageInfo(ClientContext &context) {
 	return TableStorageInfo();
 }
 
-virtual_column_map_t MssqlNetTableEntry::GetVirtualColumns() const {
+virtual_column_map_t ArrowNetTableEntry::GetVirtualColumns() const {
 	virtual_column_map_t result;
 	if (!rowid_columns_.empty()) {
 		// Expose a rowid backed by the PK / unique-index columns.
@@ -488,7 +488,7 @@ virtual_column_map_t MssqlNetTableEntry::GetVirtualColumns() const {
 	return result;
 }
 
-vector<column_t> MssqlNetTableEntry::GetRowIdColumns() const {
+vector<column_t> ArrowNetTableEntry::GetRowIdColumns() const {
 	vector<column_t> result;
 	if (!rowid_columns_.empty()) {
 		result.push_back(COLUMN_IDENTIFIER_ROW_ID);
