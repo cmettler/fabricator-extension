@@ -33,7 +33,7 @@ static ArrowNetHandle ResolveConnection(ClientContext &context, const string &co
 	auto db = DatabaseManager::Get(context).GetDatabase(context, conn_or_name);
 	if (db) {
 		auto &catalog = db->GetCatalog();
-		if (catalog.GetCatalogType() == "mssql_net") {
+		if (ArrowNetCatalog::Is(catalog)) {
 			// Ensure our catalog's transaction is started for this context, so a
 			// write via mssql_net_exec/query joins the active DuckDB transaction
 			// (mssql_net_exec grabs the handle directly, bypassing the binder).
@@ -224,7 +224,7 @@ static void MssqlNetExecFunction(DataChunk &args, ExpressionState &state, Vector
 		// owns == false => the arg named an attached mssql_net catalog whose cache we own.
 		if (invalidate_on_ddl && schema_may_change && !owns) {
 			auto db = DatabaseManager::Get(context).GetDatabase(context, conn_name);
-			if (db && db->GetCatalog().GetCatalogType() == "mssql_net") {
+			if (db && ArrowNetCatalog::Is(db->GetCatalog())) {
 				db->GetCatalog().Cast<ArrowNetCatalog>().RefreshCache(context);
 			}
 		}
@@ -246,7 +246,7 @@ static void MssqlRefreshCacheFunction(DataChunk &args, ExpressionState &state, V
 		}
 		auto name = StringValue::Get(value);
 		auto &catalog = Catalog::GetCatalog(context, name);
-		if (catalog.GetCatalogType() != "mssql_net") {
+		if (!ArrowNetCatalog::Is(catalog)) {
 			throw BinderException("mssql_refresh_cache: catalog '%s' is not an mssql_net catalog (type: %s)", name,
 			                      catalog.GetCatalogType());
 		}

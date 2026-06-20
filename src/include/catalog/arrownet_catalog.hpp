@@ -41,6 +41,16 @@ public:
 		return handle_;
 	}
 
+	//! The catalog-type string identifying an attached catalog as ours (the provider
+	//! identity — becomes generic in the multi-provider rename). Centralized so the
+	//! "is this our catalog?" checks don't repeat the literal.
+	static constexpr const char *CATALOG_TYPE = "mssql_net";
+
+	//! True if `catalog` is one of our attached catalogs.
+	static bool Is(Catalog &catalog) {
+		return catalog.GetCatalogType() == CATALOG_TYPE;
+	}
+
 	void Initialize(bool load_builtin) override;
 	string GetCatalogType() override;
 

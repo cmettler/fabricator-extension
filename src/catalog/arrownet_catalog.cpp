@@ -156,7 +156,7 @@ void ArrowNetCatalog::Initialize(bool load_builtin) {
 }
 
 string ArrowNetCatalog::GetCatalogType() {
-	return "mssql_net";
+	return CATALOG_TYPE;
 }
 
 optional_ptr<SchemaCatalogEntry> ArrowNetCatalog::LookupSchema(CatalogTransaction transaction,
