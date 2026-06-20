@@ -481,6 +481,32 @@ void ExecuteScalar(ArrowNetHandle handle, const std::string &schema, const std::
 	}
 }
 
+void GetFunctionOutputSchema(ArrowNetHandle handle, const std::string &schema, const std::string &func,
+                             ArrowArrayStream &out) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.get_function_output_schema) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide get_function_output_schema");
+	}
+	char *err = nullptr;
+	int32_t rc = vt.get_function_output_schema(handle, schema.c_str(), func.c_str(), &out, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: get_function_output_schema failed");
+	}
+}
+
+void ExecuteTable(ArrowNetHandle handle, const std::string &schema, const std::string &func, ArrowArrayStream &args,
+                  ArrowArrayStream &out) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.execute_table) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide execute_table");
+	}
+	char *err = nullptr;
+	int32_t rc = vt.execute_table(handle, schema.c_str(), func.c_str(), &args, &out, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: execute_table failed");
+	}
+}
+
 void ScanTable(ArrowNetHandle handle, const std::string &schema, const std::string &table, const std::string &spec_json,
                ArrowArrayStream *filter_values, ArrowArrayStream &out) {
 	const ArrowNetVTable &vt = GetBridge();

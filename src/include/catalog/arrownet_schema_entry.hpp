@@ -8,6 +8,7 @@
 #include "catalog/arrownet_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/mutex.hpp"
 
@@ -24,6 +25,11 @@ public:
 	//! DuckDB scalar function so `db.schema.func(args)` resolves; arg/return types and
 	//! the body are resolved lazily on first lookup.
 	void AddScalarFunction(const string &func_name);
+
+	//! Registers a discovered table-valued function name (called at attach time). Exposed
+	//! as a DuckDB table function so `SELECT * FROM db.schema.tvf(args)` resolves; arg +
+	//! output schemas are resolved lazily on first lookup.
+	void AddTableFunction(const string &func_name);
 
 	//! Drops all cached table + function names and materialized entries (cache refresh).
 	void ClearTables();
@@ -54,13 +60,16 @@ public:
 private:
 	optional_ptr<CatalogEntry> GetOrCreateEntry(ClientContext &context, const string &table_name);
 	optional_ptr<CatalogEntry> GetOrCreateScalarFunction(ClientContext &context, const string &func_name);
+	optional_ptr<CatalogEntry> GetOrCreateTableFunction(ClientContext &context, const string &func_name);
 
 	ArrowNetHandle handle_;
 	case_insensitive_map_t<string> table_types_; // table name -> "BASE TABLE" | "VIEW"
 	case_insensitive_set_t scalar_functions_;    // discovered scalar UDF names
+	case_insensitive_set_t table_functions_;     // discovered table-valued function names
 	mutex entry_lock_;
 	case_insensitive_map_t<unique_ptr<ArrowNetTableEntry>> entries_;
 	case_insensitive_map_t<unique_ptr<ScalarFunctionCatalogEntry>> function_entries_;
+	case_insensitive_map_t<unique_ptr<TableFunctionCatalogEntry>> table_function_entries_;
 };
 
 } // namespace duckdb

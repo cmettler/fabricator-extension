@@ -4,6 +4,7 @@
 
 #include "catalog/arrownet_schema_entry.hpp"
 
+#include "arrownet/arrow_ingest.hpp"
 #include "arrownet/arrow_produce.hpp"
 #include "arrownet/clr_host.hpp"
 #include "catalog/arrownet_metadata.hpp"
@@ -14,6 +15,7 @@
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/expression_executor_state.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
+#include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
@@ -21,6 +23,7 @@
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
@@ -45,12 +48,20 @@ void ArrowNetSchemaEntry::AddScalarFunction(const string &func_name) {
 	function_entries_.erase(func_name);
 }
 
+void ArrowNetSchemaEntry::AddTableFunction(const string &func_name) {
+	lock_guard<mutex> lock(entry_lock_);
+	table_functions_.insert(func_name);
+	table_function_entries_.erase(func_name);
+}
+
 void ArrowNetSchemaEntry::ClearTables() {
 	lock_guard<mutex> lock(entry_lock_);
 	table_types_.clear();
 	entries_.clear();
 	scalar_functions_.clear();
 	function_entries_.clear();
+	table_functions_.clear();
+	table_function_entries_.clear();
 }
 
 optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateEntry(ClientContext &context, const string &table_name) {
@@ -199,6 +210,106 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateScalarFunction(Client
 	return &ref;
 }
 
+namespace {
+
+// Carried on the registered TableFunction so its (static) bind can recover the catalog
+// identity + signature of a discovered TVF (table_function_bind_t is a raw fn pointer,
+// so it can't capture — unlike the scalar callback's std::function).
+struct ArrowNetTableFunctionInfo : public TableFunctionInfo {
+	ArrowNetHandle handle = nullptr;
+	string schema;
+	string func;
+	vector<LogicalType> arg_types;
+	vector<string> arg_names;
+};
+
+// Bind a catalog-bound TVF: resolve the (fixed) output schema for the return types, then
+// install a scan factory that marshals the constant call args into a 1-row Arrow batch
+// and runs execute_table (which streams the result rows).
+unique_ptr<FunctionData> ArrowNetTableFunctionBind(ClientContext &context, TableFunctionBindInput &input,
+                                                   vector<LogicalType> &return_types, vector<string> &names) {
+	auto &info = input.info->Cast<ArrowNetTableFunctionInfo>();
+	ArrowNetHandle handle = info.handle;
+	string schema_name = info.schema;
+	string func_name = info.func;
+	vector<LogicalType> arg_types = info.arg_types;
+	vector<string> arg_names = info.arg_names;
+	vector<Value> arg_values = input.inputs; // positional constant args
+
+	auto bind_data = make_uniq<arrownet::ArrowStreamBindData>();
+
+	// 1) Output schema (fixed, from metadata) -> return types/names + column converters.
+	bind_data->factory = [handle, schema_name, func_name](const arrownet::ArrowScanRequest &, ArrowArrayStream &out) {
+		arrownet::GetFunctionOutputSchema(handle, schema_name, func_name, out);
+	};
+	arrownet::PopulateReturnSchema(context, *bind_data, return_types, names);
+
+	// 2) Scan factory: constant args -> 1-row Arrow batch -> execute_table (streams rows).
+	auto properties = context.GetClientProperties();
+	auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(context, arg_types);
+	bind_data->factory = [handle, schema_name, func_name, arg_types, arg_names, arg_values, properties,
+	                      extension_types](const arrownet::ArrowScanRequest &, ArrowArrayStream &out) {
+		DataChunk chunk;
+		chunk.Initialize(Allocator::DefaultAllocator(), arg_types);
+		for (idx_t c = 0; c < arg_values.size(); c++) {
+			chunk.SetValue(c, 0, arg_values[c].DefaultCastAs(arg_types[c]));
+		}
+		chunk.SetCardinality(1);
+		ArrowAppender appender(arg_types, 1, properties, extension_types);
+		appender.Append(chunk, 0, 1, 1);
+		ArrowArray array = appender.Finalize();
+		arrownet::ArrowProducer producer(arg_types, arg_names, properties);
+		producer.AddBatch(array);
+		producer.Finish();
+		arrownet::ExecuteTable(handle, schema_name, func_name, *producer.Stream(), out);
+	};
+	return std::move(bind_data);
+}
+
+} // namespace
+
+optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateTableFunction(ClientContext &context,
+                                                                         const string &func_name) {
+	lock_guard<mutex> lock(entry_lock_);
+	auto cached = table_function_entries_.find(func_name);
+	if (cached != table_function_entries_.end()) {
+		return cached->second.get();
+	}
+	if (table_functions_.find(func_name) == table_functions_.end()) {
+		return nullptr;
+	}
+
+	vector<string> arg_names;
+	vector<LogicalType> arg_types;
+	try {
+		FetchFunctionParamSchema(context, handle_, name, func_name, arg_names, arg_types);
+	} catch (std::exception &) {
+		// Stale discovery (dropped out-of-band) — treat as not-found.
+		table_functions_.erase(func_name);
+		table_function_entries_.erase(func_name);
+		return nullptr;
+	}
+
+	TableFunction tf(func_name, arg_types, arrownet::ArrowStreamScan, ArrowNetTableFunctionBind,
+	                 arrownet::ArrowStreamInitGlobal, arrownet::ArrowStreamInitLocal);
+	tf.projection_pushdown = true; // arrow_ingest maps requested columns (local projection)
+	auto fn_info = make_shared_ptr<ArrowNetTableFunctionInfo>();
+	fn_info->handle = handle_;
+	fn_info->schema = name;
+	fn_info->func = func_name;
+	fn_info->arg_types = arg_types;
+	fn_info->arg_names = arg_names;
+	tf.function_info = std::move(fn_info);
+
+	CreateTableFunctionInfo info(std::move(tf));
+	info.catalog = catalog.GetName();
+	info.schema = name;
+	auto entry = make_uniq<TableFunctionCatalogEntry>(catalog, *this, info);
+	auto &ref = *entry;
+	table_function_entries_[func_name] = std::move(entry);
+	return &ref;
+}
+
 optional_ptr<CatalogEntry> ArrowNetSchemaEntry::LookupEntry(CatalogTransaction transaction,
                                                             const EntryLookupInfo &lookup_info) {
 	if (!transaction.context) {
@@ -210,6 +321,9 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::LookupEntry(CatalogTransaction t
 	}
 	if (type == CatalogType::SCALAR_FUNCTION_ENTRY) {
 		return GetOrCreateScalarFunction(*transaction.context, lookup_info.GetEntryName());
+	}
+	if (type == CatalogType::TABLE_FUNCTION_ENTRY) {
+		return GetOrCreateTableFunction(*transaction.context, lookup_info.GetEntryName());
 	}
 	return nullptr;
 }
@@ -241,6 +355,22 @@ void ArrowNetSchemaEntry::Scan(ClientContext &context, CatalogType type,
 				callback(*catalog_entry);
 			}
 		}
+		return;
+	}
+	if (type == CatalogType::TABLE_FUNCTION_ENTRY) {
+		vector<string> names;
+		{
+			lock_guard<mutex> lock(entry_lock_);
+			for (auto &fn : table_functions_) {
+				names.push_back(fn);
+			}
+		}
+		for (auto &fn : names) {
+			auto catalog_entry = GetOrCreateTableFunction(context, fn);
+			if (catalog_entry) {
+				callback(*catalog_entry);
+			}
+		}
 	}
 }
 
@@ -253,6 +383,10 @@ void ArrowNetSchemaEntry::Scan(CatalogType type, const std::function<void(Catalo
 		}
 	} else if (type == CatalogType::SCALAR_FUNCTION_ENTRY) {
 		for (auto &entry : function_entries_) {
+			callback(*entry.second);
+		}
+	} else if (type == CatalogType::TABLE_FUNCTION_ENTRY) {
+		for (auto &entry : table_function_entries_) {
 			callback(*entry.second);
 		}
 	}

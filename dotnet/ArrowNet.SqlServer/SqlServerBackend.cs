@@ -1122,6 +1122,89 @@ public sealed class SqlServerCatalog : IBackendCatalog
         return new InMemoryArrayStream(resultSchema!, batches);
     }
 
+    // A table-valued function's output columns from INFORMATION_SCHEMA.ROUTINE_COLUMNS
+    // (the result-set columns of inline + multi-statement TVFs), each with a
+    // reconstructed SQL type. Empty => not a TVF (e.g. a stored procedure).
+    private List<(string name, string sqlType)> FunctionOutputColumns(string schemaName, string functionName)
+    {
+        using var connection = OpenConnection();
+        connection.Open();
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText =
+            "SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE, " +
+            "DATETIME_PRECISION FROM INFORMATION_SCHEMA.ROUTINE_COLUMNS " +
+            "WHERE TABLE_SCHEMA = @s AND TABLE_NAME = @f ORDER BY ORDINAL_POSITION";
+        cmd.Parameters.AddWithValue("@s", schemaName);
+        cmd.Parameters.AddWithValue("@f", functionName);
+        var result = new List<(string, string)>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            var name = reader.IsDBNull(0) ? $"col{result.Count}" : reader.GetString(0);
+            int? charLen = reader.IsDBNull(2) ? null : Convert.ToInt32(reader.GetValue(2));
+            int? numPrec = reader.IsDBNull(3) ? null : Convert.ToInt32(reader.GetValue(3));
+            int numScale = reader.IsDBNull(4) ? 0 : Convert.ToInt32(reader.GetValue(4));
+            int? dtPrec = reader.IsDBNull(5) ? null : Convert.ToInt32(reader.GetValue(5));
+            result.Add((name, BuildSqlType(reader.GetString(1), charLen, numPrec, numScale, dtPrec)));
+        }
+        return result;
+    }
+
+    public IArrowArrayStream GetFunctionOutputSchema(string schemaName, string functionName)
+    {
+        var cols = FunctionOutputColumns(schemaName, functionName);
+        if (cols.Count == 0)
+        {
+            throw new ArgumentException(
+                $"mssql_net: '{schemaName}.{functionName}' has no table output columns (is it a table-valued function?)");
+        }
+        var sb = new StringBuilder("SELECT ");
+        for (int i = 0; i < cols.Count; i++)
+        {
+            if (i > 0)
+            {
+                sb.Append(", ");
+            }
+            sb.Append("CAST(NULL AS ").Append(cols[i].sqlType).Append(") AS ").Append(Quote(cols[i].name));
+        }
+        sb.Append(" WHERE 1 = 0");
+        return ExecuteQuery(sb.ToString());
+    }
+
+    // Executes a TVF over its constant arguments (row 0 of the args stream, in param
+    // order) as `SELECT * FROM [s].[f](@p0, ...)` — streams the result lazily.
+    public IArrowArrayStream ExecuteTable(string schemaName, string functionName, IArrowArrayStream args)
+    {
+        var qualified = Quote(schemaName) + "." + Quote(functionName);
+        object?[] argValues = System.Array.Empty<object?>();
+        using (var reader = new ArrowDataReader(args))
+        {
+            int paramCount = reader.FieldCount;
+            if (reader.Read())
+            {
+                argValues = new object?[paramCount];
+                for (int c = 0; c < paramCount; c++)
+                {
+                    argValues[c] = reader.IsDBNull(c) ? null : reader.GetValue(c);
+                }
+            }
+        }
+        var sb = new StringBuilder("SELECT * FROM ").Append(qualified).Append('(');
+        var sqlParams = new List<SqlParameter>();
+        for (int c = 0; c < argValues.Length; c++)
+        {
+            if (c > 0)
+            {
+                sb.Append(", ");
+            }
+            var pn = $"@p{c}";
+            sb.Append(pn);
+            sqlParams.Add(new SqlParameter(pn, argValues[c] ?? (object)DBNull.Value));
+        }
+        sb.Append(')');
+        return ExecuteQuery(sb.ToString(), sqlParams);
+    }
+
     // Drops any DEFAULT constraint bound to a column (no-op if none).
     private static void DropColumnDefault(SqlConnection connection, string schemaName, string tableName, string column)
     {

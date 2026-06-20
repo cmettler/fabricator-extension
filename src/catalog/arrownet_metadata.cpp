@@ -132,6 +132,15 @@ LogicalType FetchFunctionReturnType(ClientContext &context, ArrowNetHandle handl
 	return types[0];
 }
 
+void FetchFunctionOutputSchema(ClientContext &context, ArrowNetHandle handle, const string &schema_name,
+                               const string &func_name, vector<string> &names, vector<LogicalType> &types) {
+	arrownet::ArrowStreamBindData bind_data;
+	bind_data.factory = [handle, schema_name, func_name](const arrownet::ArrowScanRequest &, ArrowArrayStream &out) {
+		arrownet::GetFunctionOutputSchema(handle, schema_name, func_name, out);
+	};
+	arrownet::PopulateReturnSchema(context, bind_data, types, names);
+}
+
 vector<string> FetchRowIdColumns(ArrowNetHandle handle, const string &schema_name, const string &table_name) {
 	// The managed side picks the PK (else the smallest unique index) and returns
 	// its columns in key order.

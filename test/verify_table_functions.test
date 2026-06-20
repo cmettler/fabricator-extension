@@ -1,0 +1,72 @@
+# name: test/verify_table_functions.test
+# description: Discovered table-valued functions are callable as SELECT * FROM db.schema.tvf(args) over Arrow
+# group: [mssql]
+
+require mssql_net
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS tfdb (TYPE mssql_net);
+
+# Inline TVF, multi-column inline TVF, and a multi-statement TVF. Distinct tf_* names
+# so this can't clash with other function tests.
+statement ok
+SELECT mssql_net_exec('tfdb', 'CREATE OR ALTER FUNCTION dbo.tf_nums(@n INT) RETURNS TABLE AS RETURN (SELECT v.n FROM (VALUES(1),(2),(3),(4),(5)) v(n) WHERE v.n <= @n)');
+
+statement ok
+SELECT mssql_net_exec('tfdb', 'CREATE OR ALTER FUNCTION dbo.tf_pair(@a INT, @b VARCHAR(20)) RETURNS TABLE AS RETURN (SELECT @a AS id, @b AS label)');
+
+statement ok
+SELECT mssql_net_exec('tfdb', 'CREATE OR ALTER FUNCTION dbo.tf_ms(@n INT) RETURNS @t TABLE(n INT, sq INT) AS BEGIN INSERT @t SELECT v.n, v.n*v.n FROM (VALUES(1),(2),(3),(4)) v(n) WHERE v.n <= @n; RETURN; END');
+
+# New TVFs are picked up on a cache refresh (DDL via mssql_net_exec does not auto-invalidate).
+statement ok
+SELECT mssql_refresh_cache('tfdb');
+
+# Inline TVF, called positionally in a FROM clause.
+query I
+SELECT n FROM tfdb.dbo.tf_nums(3) ORDER BY n;
+----
+1
+2
+3
+
+# Multi-column inline TVF with a string argument.
+query IT
+SELECT id, label FROM tfdb.dbo.tf_pair(7, 'hi');
+----
+7	hi
+
+# Multi-statement TVF.
+query II
+SELECT n, sq FROM tfdb.dbo.tf_ms(3) ORDER BY n;
+----
+1	1
+2	4
+3	9
+
+# Projection (only sq) + a filter applied above the scan by DuckDB.
+query I
+SELECT sq FROM tfdb.dbo.tf_ms(4) WHERE sq > 4 ORDER BY sq;
+----
+9
+16
+
+# A TVF composes with normal query operators (aggregate over its rows).
+query II
+SELECT count(*), sum(n) FROM tfdb.dbo.tf_nums(5);
+----
+5	15
+
+statement ok
+SELECT mssql_net_exec('tfdb', 'DROP FUNCTION IF EXISTS dbo.tf_nums');
+
+statement ok
+SELECT mssql_net_exec('tfdb', 'DROP FUNCTION IF EXISTS dbo.tf_pair');
+
+statement ok
+SELECT mssql_net_exec('tfdb', 'DROP FUNCTION IF EXISTS dbo.tf_ms');
+
+statement ok
+DETACH tfdb;

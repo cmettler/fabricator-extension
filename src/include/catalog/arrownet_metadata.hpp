@@ -50,6 +50,11 @@ void FetchFunctionParamSchema(ClientContext &context, ArrowNetHandle handle, con
 LogicalType FetchFunctionReturnType(ClientContext &context, ArrowNetHandle handle, const string &schema_name,
                                     const string &func_name);
 
+//! Resolves a table-valued function's output column names + DuckDB types from the Arrow
+//! schema of its (zero-row) output-schema stream — reuses the C# type mapping.
+void FetchFunctionOutputSchema(ClientContext &context, ArrowNetHandle handle, const string &schema_name,
+                               const string &func_name, vector<string> &names, vector<LogicalType> &types);
+
 //! Resolves a table's column names + DuckDB types from the Arrow schema of the
 //! COLUMNS metadata stream (a zero-row result; reuses the C# type mapping, no
 //! duplicate type logic in C++).

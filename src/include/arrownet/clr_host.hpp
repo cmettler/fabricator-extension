@@ -170,4 +170,15 @@ void GetFunctionReturnSchema(ArrowNetHandle handle, const std::string &schema, c
 void ExecuteScalar(ArrowNetHandle handle, const std::string &schema, const std::string &func, ArrowArrayStream &args,
                    ArrowArrayStream &out);
 
+// Zero-row Arrow stream whose schema = a table-valued function's output columns. Used
+// to bind the catalog table function (resolve its DuckDB return types).
+void GetFunctionOutputSchema(ArrowNetHandle handle, const std::string &schema, const std::string &func,
+                             ArrowArrayStream &out);
+
+// Execute a table-valued function over its constant arguments: `args` is a 1-row stream
+// of the argument values (in param order; consumed by the managed side); fills `out`
+// with the function's result rows.
+void ExecuteTable(ArrowNetHandle handle, const std::string &schema, const std::string &func, ArrowArrayStream &args,
+                  ArrowArrayStream &out);
+
 } // namespace arrownet

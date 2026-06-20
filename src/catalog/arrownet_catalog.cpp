@@ -115,11 +115,16 @@ void ArrowNetCatalog::LoadCatalog(ClientContext &context) {
 			ensure_schema(table.schema_name).AddTable(table.table_name, table.table_type);
 		}
 	}
-	// Expose discovered scalar UDFs as callable catalog functions (db.schema.func(args)).
-	// Other routine kinds (table functions, procedures) are registered in later phases.
+	// Expose discovered scalar UDFs + table-valued functions as callable catalog functions
+	// (db.schema.func(args) / SELECT * FROM db.schema.tvf(args)). Procedures are a later phase.
 	for (auto &func : DiscoverFunctions(handle_)) {
-		if (func.kind == "scalar" && filters.MatchSchema(func.schema_name)) {
+		if (!filters.MatchSchema(func.schema_name)) {
+			continue;
+		}
+		if (func.kind == "scalar") {
 			ensure_schema(func.schema_name).AddScalarFunction(func.name);
+		} else if (func.kind == "table") {
+			ensure_schema(func.schema_name).AddTableFunction(func.name);
 		}
 	}
 }
@@ -156,11 +161,16 @@ void ArrowNetCatalog::RefreshCache(ClientContext &context) {
 			ensure_schema(table.schema_name).AddTable(table.table_name, table.table_type);
 		}
 	}
-	// Expose discovered scalar UDFs as callable catalog functions (db.schema.func(args)).
-	// Other routine kinds (table functions, procedures) are registered in later phases.
+	// Expose discovered scalar UDFs + table-valued functions as callable catalog functions
+	// (db.schema.func(args) / SELECT * FROM db.schema.tvf(args)). Procedures are a later phase.
 	for (auto &func : DiscoverFunctions(handle_)) {
-		if (func.kind == "scalar" && filters.MatchSchema(func.schema_name)) {
+		if (!filters.MatchSchema(func.schema_name)) {
+			continue;
+		}
+		if (func.kind == "scalar") {
 			ensure_schema(func.schema_name).AddScalarFunction(func.name);
+		} else if (func.kind == "table") {
+			ensure_schema(func.schema_name).AddTableFunction(func.name);
 		}
 	}
 }

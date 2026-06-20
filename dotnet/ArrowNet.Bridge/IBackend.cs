@@ -104,6 +104,15 @@ public interface IBackendCatalog : IDisposable
     /// </summary>
     IArrowArrayStream ExecuteScalar(string schemaName, string functionName, IArrowArrayStream args);
 
+    /// <summary>Zero-row Arrow stream whose schema describes a table-valued function's output columns.</summary>
+    IArrowArrayStream GetFunctionOutputSchema(string schemaName, string functionName);
+
+    /// <summary>
+    /// Executes a table-valued function over its constant arguments: <paramref name="args"/> is a 1-row
+    /// stream of the argument values (in parameter order); returns the function's result rows.
+    /// </summary>
+    IArrowArrayStream ExecuteTable(string schemaName, string functionName, IArrowArrayStream args);
+
     /// <summary>
     /// Creates a table whose columns are described by <paramref name="columns"/>
     /// (a non-nullable field maps to NOT NULL). The backend maps Arrow types to

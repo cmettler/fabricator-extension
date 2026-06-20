@@ -317,9 +317,20 @@ typedef struct ArrowNetVTable {
 	// The managed side consumes `args`.
 	int32_t (*execute_scalar)(ArrowNetHandle handle, const char *schema, const char *func,
 	                          struct ArrowArrayStream *args, struct ArrowArrayStream *out, char **err);
+
+	// Zero-row Arrow stream whose schema = a table-valued function's output columns
+	// (the result set, fixed/known from metadata). Used to bind the catalog table function.
+	int32_t (*get_function_output_schema)(ArrowNetHandle handle, const char *schema, const char *func,
+	                                      struct ArrowArrayStream *out, char **err);
+
+	// Execute a table-valued function over its constant arguments: `args` is a 1-row
+	// stream of the argument values (in param order; consumed by the managed side);
+	// *out receives the result rows. (Projection/filter pushdown TBD — full result.)
+	int32_t (*execute_table)(ArrowNetHandle handle, const char *schema, const char *func,
+	                         struct ArrowArrayStream *args, struct ArrowArrayStream *out, char **err);
 } ArrowNetVTable;
 
-#define ARROWNET_ABI_VERSION 19
+#define ARROWNET_ABI_VERSION 20
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen
