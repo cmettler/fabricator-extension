@@ -18,6 +18,104 @@ public sealed class SqlServerBackend : IBackend
     public IEnumerable<string> Aliases => new[] { "mssql" };
 
     public IBackendCatalog OpenCatalog(string connectionString) => new SqlServerCatalog(connectionString);
+
+    /// <summary>
+    /// Assembles a Microsoft.Data.SqlClient connection string from a secret's fields. All SqlClient
+    /// connstr / Azure-auth formatting lives here (the C++ host has none). For token auth the token rides
+    /// a trailing marker that <see cref="SqlServerCatalog"/> strips and applies via
+    /// <c>SqlConnection.AccessToken</c>.
+    /// </summary>
+    public string BuildConnectionString(IReadOnlyDictionary<string, string> fields)
+    {
+        string Field(string key) => fields.TryGetValue(key, out var v) ? v ?? "" : "";
+
+        var portStr = Field("port");
+        var port = string.IsNullOrEmpty(portStr) ? "1433" : portStr;
+        var encryptStr = Field("use_encrypt");
+        var encrypt = string.IsNullOrEmpty(encryptStr) || ParseBool(encryptStr); // default true
+
+        var cs = new StringBuilder();
+        cs.Append("Server=").Append(Field("host")).Append(',').Append(port)
+          .Append(";Database=").Append(QuoteConnValue(Field("database")))
+          .Append(";Encrypt=").Append(encrypt ? "True" : "False")
+          .Append(";TrustServerCertificate=True");
+
+        var accessToken = Field("access_token");
+        if (accessToken.Length > 0)
+        {
+            // Token auth: SqlServerCatalog strips this marker and sets SqlConnection.AccessToken.
+            return cs.Append(SqlServerCatalog.AccessTokenKeyword).Append(accessToken).ToString();
+        }
+
+        var authKw = MapAuthentication(Field("authentication"));
+        var user = Field("user");
+        var password = Field("password");
+        if (authKw.Length > 0)
+        {
+            cs.Append(";Authentication=").Append(authKw);
+            if (user.Length > 0) cs.Append(";User Id=").Append(QuoteConnValue(user));       // SP: client id; MI: client id
+            if (password.Length > 0) cs.Append(";Password=").Append(QuoteConnValue(password)); // SP: client secret
+        }
+        else
+        {
+            cs.Append(";User Id=").Append(QuoteConnValue(user)).Append(";Password=").Append(QuoteConnValue(password));
+        }
+        return cs.ToString();
+    }
+
+    private static bool ParseBool(string v)
+    {
+        var t = v.Trim().ToLowerInvariant();
+        return t is "true" or "1" or "yes";
+    }
+
+    // Quotes a connection-string value per Microsoft.Data.SqlClient rules (double quotes around
+    // ; = ', single quotes when the value itself contains a double quote).
+    private static string QuoteConnValue(string v)
+    {
+        var needs = v.Length == 0 || v.IndexOfAny(new[] { ';', '=', '"', '\'' }) >= 0 || v[0] == ' ' || v[^1] == ' ';
+        if (!needs)
+        {
+            return v;
+        }
+        return v.Contains('"') ? "'" + v.Replace("'", "''") + "'" : "\"" + v + "\"";
+    }
+
+    // Maps a friendly/explicit authentication value to the SqlClient `Authentication` keyword
+    // (Azure Entra). Returns "" for plain SQL auth; throws on an unknown value.
+    private static string MapAuthentication(string raw)
+    {
+        var k = NormalizeAuth(raw);
+        if (k.Length == 0 || k is "sql" or "sqlpassword")
+        {
+            return "";
+        }
+        return k switch
+        {
+            "serviceprincipal" or "spn" or "activedirectoryserviceprincipal" => "Active Directory Service Principal",
+            "password" or "entrapassword" or "activedirectorypassword" => "Active Directory Password",
+            "managedidentity" or "msi" or "activedirectorymanagedidentity" => "Active Directory Managed Identity",
+            "default" or "activedirectorydefault" => "Active Directory Default",
+            "interactive" or "activedirectoryinteractive" => "Active Directory Interactive",
+            "devicecode" or "devicecodeflow" or "activedirectorydevicecodeflow" => "Active Directory Device Code Flow",
+            "workloadidentity" or "activedirectoryworkloadidentity" => "Active Directory Workload Identity",
+            "integrated" or "activedirectoryintegrated" => "Active Directory Integrated",
+            _ => throw new ArgumentException($"mssql_net secret: unsupported authentication '{raw}'"),
+        };
+    }
+
+    private static string NormalizeAuth(string raw)
+    {
+        var sb = new StringBuilder();
+        foreach (var c in raw.ToLowerInvariant())
+        {
+            if (c != ' ' && c != '_' && c != '-')
+            {
+                sb.Append(c);
+            }
+        }
+        return sb.ToString();
+    }
 }
 
 /// <summary>
@@ -27,10 +125,10 @@ public sealed class SqlServerBackend : IBackend
 /// </summary>
 public sealed class SqlServerCatalog : IBackendCatalog
 {
-    // Non-standard trailing segment used by the secret builder to carry an Azure
-    // Entra access token (not a valid SqlClient connection-string keyword); it is
-    // stripped here and applied via SqlConnection.AccessToken.
-    private const string AccessTokenKeyword = ";ArrowNetAccessToken=";
+    // Non-standard trailing segment used by SqlServerBackend.BuildConnectionString to carry an Azure
+    // Entra access token (not a valid SqlClient connection-string keyword); it is stripped here and
+    // applied via SqlConnection.AccessToken.
+    internal const string AccessTokenKeyword = ";ArrowNetAccessToken=";
 
     private readonly string _connectionString;
     private readonly string? _accessToken;

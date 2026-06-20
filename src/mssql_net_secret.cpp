@@ -1,9 +1,14 @@
 //===----------------------------------------------------------------------===//
 //                         mssql_net — secret type (impl)
+//
+// Registration + basic validation live here (DuckDB API); the provider-specific
+// connection-string + auth formatting lives in the managed backend
+// (build_connection_string), so the C++ side has no SqlClient knowledge.
 //===----------------------------------------------------------------------===//
 
 #include "mssql_net_secret.hpp"
 
+#include "arrownet/clr_host.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -20,10 +25,10 @@ static constexpr const char *kDatabase = "database";
 static constexpr const char *kUser = "user";
 static constexpr const char *kPassword = "password";
 static constexpr const char *kUseEncrypt = "use_encrypt";
-static constexpr const char *kAccessToken = "access_token";       // BYO Azure Entra JWT
-static constexpr const char *kAzureTenantId = "azure_tenant_id";  // tenant hint
-// `authentication` is our addition: selects the Microsoft.Data.SqlClient Entra
-// method (the C++ extension infers it from azure_secret/access_token instead).
+static constexpr const char *kAccessToken = "access_token";      // BYO Azure Entra JWT
+static constexpr const char *kAzureTenantId = "azure_tenant_id"; // tenant hint
+// `authentication` selects the Microsoft.Data.SqlClient Entra method (mapped in the
+// managed backend); the C++ extension infers it from azure_secret/access_token instead.
 static constexpr const char *kAuthentication = "authentication";
 // Accepted for cross-compat (stored; not all are wired to the SqlClient path).
 static constexpr const char *kCatalog = "catalog";
@@ -33,68 +38,13 @@ static constexpr const char *kTableFilter = "table_filter";
 static constexpr const char *kAuthenticator = "authenticator";
 static constexpr const char *kApplicationName = "application_name";
 
-// Non-standard connection-string segment carrying an Azure access token. The
-// managed backend strips it and sets SqlConnection.AccessToken (the token is not
-// a valid SqlClient connection-string keyword). Mirrored in C# (SqlServerCatalog).
-static constexpr const char *kAccessTokenKeyword = "ArrowNetAccessToken";
-
-// -----------------------------------------------------------------------------
-// Authentication mapping
-// -----------------------------------------------------------------------------
-// Classifies how an `authentication` value relates to user/password requirements.
-enum class AuthClass { SqlAuth, EntraUserPass, EntraTokenless };
-
-static string NormalizeAuth(const string &raw) {
-	string k;
-	for (char c : StringUtil::Lower(raw)) {
-		if (c != ' ' && c != '_' && c != '-') {
-			k += c;
-		}
-	}
-	return k;
-}
-
-// Maps a friendly/explicit `authentication` value to the SqlClient `Authentication`
-// keyword. Returns "" for plain SQL auth. Throws on an unknown value.
-static string MapAuthentication(const string &raw, AuthClass &cls) {
-	auto k = NormalizeAuth(raw);
-	if (k.empty() || k == "sql" || k == "sqlpassword") {
-		cls = AuthClass::SqlAuth;
-		return "";
-	}
-	if (k == "serviceprincipal" || k == "spn" || k == "activedirectoryserviceprincipal") {
-		cls = AuthClass::EntraUserPass;
-		return "Active Directory Service Principal";
-	}
-	if (k == "password" || k == "entrapassword" || k == "activedirectorypassword") {
-		cls = AuthClass::EntraUserPass;
-		return "Active Directory Password";
-	}
-	cls = AuthClass::EntraTokenless;
-	if (k == "managedidentity" || k == "msi" || k == "activedirectorymanagedidentity") {
-		return "Active Directory Managed Identity";
-	}
-	if (k == "default" || k == "activedirectorydefault") {
-		return "Active Directory Default";
-	}
-	if (k == "interactive" || k == "activedirectoryinteractive") {
-		return "Active Directory Interactive";
-	}
-	if (k == "devicecode" || k == "devicecodeflow" || k == "activedirectorydevicecodeflow") {
-		return "Active Directory Device Code Flow";
-	}
-	if (k == "workloadidentity" || k == "activedirectoryworkloadidentity") {
-		return "Active Directory Workload Identity";
-	}
-	if (k == "integrated" || k == "activedirectoryintegrated") {
-		return "Active Directory Integrated";
-	}
-	throw BinderException("mssql_net secret: unsupported authentication '%s'", raw);
-}
-
 // -----------------------------------------------------------------------------
 // Creation + validation
 // -----------------------------------------------------------------------------
+// Basic, provider-agnostic validation. Connection-string assembly and auth-value
+// validation now live in the managed backend (build_connection_string), so a secret
+// missing user/password (SQL auth) or carrying an unknown `authentication` value
+// surfaces at connect time rather than here.
 static string ValidateFields(const CreateSecretInput &input) {
 	auto get = [&](const char *key) -> string {
 		auto it = input.options.find(key);
@@ -104,21 +54,6 @@ static string ValidateFields(const CreateSecretInput &input) {
 	for (auto field : {kHost, kDatabase}) {
 		if (get(field).empty()) {
 			return StringUtil::Format("Missing required field '%s'", field);
-		}
-	}
-
-	bool has_token = !get(kAccessToken).empty();
-	bool requires_user_pass = false;
-	if (!has_token) {
-		AuthClass cls;
-		MapAuthentication(get(kAuthentication), cls); // also validates the value
-		requires_user_pass = cls != AuthClass::EntraTokenless;
-	}
-	if (requires_user_pass) {
-		for (auto field : {kUser, kPassword}) {
-			if (get(field).empty()) {
-				return StringUtil::Format("Missing required field '%s'", field);
-			}
 		}
 	}
 
@@ -187,27 +122,8 @@ void RegisterMssqlNetSecretType(ExtensionLoader &loader) {
 }
 
 // -----------------------------------------------------------------------------
-// Connection-string assembly
+// Connection-string assembly (delegated to the managed backend)
 // -----------------------------------------------------------------------------
-// Quotes a connection-string value if it contains a delimiter/quote, per the
-// Microsoft.Data.SqlClient rules (double quotes around ; = ', single quotes when
-// the value itself contains a double quote).
-static string QuoteConnValue(const string &v) {
-	bool needs = v.empty() || v.find_first_of(";=\"'") != string::npos || v.front() == ' ' || v.back() == ' ';
-	if (!needs) {
-		return v;
-	}
-	if (v.find('"') != string::npos) {
-		string out = "'";
-		for (char c : v) {
-			out += (c == '\'') ? "''" : string(1, c);
-		}
-		out += "'";
-		return out;
-	}
-	return "\"" + v + "\"";
-}
-
 static unique_ptr<SecretEntry> GetSecretEntry(ClientContext &context, const string &secret_name) {
 	auto &secret_manager = SecretManager::Get(context);
 	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
@@ -220,6 +136,36 @@ bool IsMssqlNetSecret(ClientContext &context, const string &secret_name) {
 	}
 	auto entry = GetSecretEntry(context, secret_name);
 	return entry && entry->secret && entry->secret->GetType() == "mssql_net";
+}
+
+// Minimal JSON-string escaping for secret values. Handles the JSON-special chars;
+// non-ASCII UTF-8 passes through unchanged (valid JSON).
+static string EscapeJson(const string &s) {
+	string out;
+	out.reserve(s.size() + 8);
+	for (char c : s) {
+		switch (c) {
+		case '"':
+			out += "\\\"";
+			break;
+		case '\\':
+			out += "\\\\";
+			break;
+		case '\n':
+			out += "\\n";
+			break;
+		case '\r':
+			out += "\\r";
+			break;
+		case '\t':
+			out += "\\t";
+			break;
+		default:
+			out += c;
+			break;
+		}
+	}
+	return out;
 }
 
 string BuildConnectionStringFromSecret(ClientContext &context, const string &secret_name) {
@@ -235,43 +181,24 @@ string BuildConnectionStringFromSecret(ClientContext &context, const string &sec
 		                      secret.GetType());
 	}
 	auto &kv = static_cast<const KeyValueSecret &>(secret);
-	auto field = [&](const char *key) -> string {
-		auto value = kv.TryGetValue(key);
-		return value.IsNull() ? string() : value.ToString();
-	};
 
-	auto host = field(kHost);
-	auto port_val = kv.TryGetValue(kPort);
-	int64_t port = port_val.IsNull() ? 1433 : port_val.GetValue<int64_t>();
-	auto encrypt_val = kv.TryGetValue(kUseEncrypt);
-	bool encrypt = encrypt_val.IsNull() ? true : encrypt_val.GetValue<bool>();
-
-	string cs = "Server=" + host + "," + std::to_string(port) + ";Database=" + QuoteConnValue(field(kDatabase)) +
-	            ";Encrypt=" + (encrypt ? "True" : "False") + ";TrustServerCertificate=True";
-
-	auto access_token = field(kAccessToken);
-	if (!access_token.empty()) {
-		// Token auth: the backend strips this and sets SqlConnection.AccessToken.
-		// Must be the LAST segment so the managed side can read it verbatim.
-		return cs + ";" + kAccessTokenKeyword + "=" + access_token;
-	}
-
-	AuthClass cls;
-	string auth_kw = MapAuthentication(field(kAuthentication), cls);
-	auto user = field(kUser);
-	auto password = field(kPassword);
-	if (!auth_kw.empty()) {
-		cs += ";Authentication=" + auth_kw;
-		if (!user.empty()) {
-			cs += ";User Id=" + QuoteConnValue(user); // service principal: client id; MI: client id
+	// Hand all of the secret's fields to the managed backend, which owns the provider
+	// connection-string format (Server=/Database=/Encrypt=/auth/access-token, escaping).
+	string json = "{";
+	bool first = true;
+	for (auto &field : kv.secret_map) {
+		if (field.second.IsNull()) {
+			continue;
 		}
-		if (!password.empty()) {
-			cs += ";Password=" + QuoteConnValue(password); // service principal: client secret
+		if (!first) {
+			json += ",";
 		}
-	} else {
-		cs += ";User Id=" + QuoteConnValue(user) + ";Password=" + QuoteConnValue(password);
+		first = false;
+		json += "\"" + EscapeJson(field.first) + "\":\"" + EscapeJson(field.second.ToString()) + "\"";
 	}
-	return cs;
+	json += "}";
+
+	return arrownet::BuildConnectionString("", json);
 }
 
 } // namespace duckdb

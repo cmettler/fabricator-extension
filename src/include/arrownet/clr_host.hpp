@@ -41,6 +41,12 @@ const std::string &GetManagedDirectory();
 // default backend. Returns an opaque handle to close later.
 ArrowNetHandle OpenCatalog(const std::string &connection_string, const std::string &provider = "");
 
+// Build a provider connection string from a secret's fields (`fields_json` = a flat
+// JSON object of the secret's key/values). `provider` selects the backend whose
+// connstr format applies (empty => default). Keeps all provider connection-string /
+// auth formatting in the managed backend. Returns the assembled connection string.
+std::string BuildConnectionString(const std::string &provider, const std::string &fields_json);
+
 // Close a handle previously returned by OpenCatalog. Safe with nullptr.
 void CloseCatalog(ArrowNetHandle handle);
 

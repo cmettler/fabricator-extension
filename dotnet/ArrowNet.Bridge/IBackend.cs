@@ -23,6 +23,14 @@ public interface IBackend
     /// <summary>Additional names this backend also answers to (e.g. <c>"mssql"</c>). Empty by default.</summary>
     IEnumerable<string> Aliases => System.Array.Empty<string>();
 
+    /// <summary>
+    /// Builds a provider connection string from a secret's fields (the host reads the DuckDB secret and
+    /// passes its key/values here). Keeps all provider connection-string / auth formatting in the
+    /// backend — the C++ side has no knowledge of the provider's connstr dialect. The result is then
+    /// passed to <see cref="OpenCatalog"/>.
+    /// </summary>
+    string BuildConnectionString(IReadOnlyDictionary<string, string> fields);
+
     /// <summary>Open a catalog/connection for the given connection string.</summary>
     IBackendCatalog OpenCatalog(string connectionString);
 }

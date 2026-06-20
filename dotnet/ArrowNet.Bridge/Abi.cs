@@ -80,6 +80,9 @@ public unsafe struct ArrowNetVTable
 
     // int32 complete_bulk(void* session, int32 abort, int64* affected, char** err)
     public delegate* unmanaged[Cdecl]<nint, int, long*, byte**, int> CompleteBulk;
+
+    // int32 build_connection_string(const char* provider, const char* fields_json, char** out_connstr, char** err)
+    public delegate* unmanaged[Cdecl]<byte*, byte*, byte**, byte**, int> BuildConnectionString;
 }
 
 /// <summary>Mirrors <c>ArrowNetAlterKind</c> in abi.h.</summary>

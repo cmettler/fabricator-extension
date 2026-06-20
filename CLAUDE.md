@@ -70,10 +70,14 @@ current code still uses the single-provider `mssql_net` naming):
 - Suggested order: (1) **C# multi-backend registry — DONE** (`BackendRegistry` is provider-keyed:
   `IBackend.Name`/`Aliases`, `Resolve(provider)`, `Active`=default; multi-assembly discovery via
   `ARROWNET_BACKEND_ASSEMBLY` comma-list; SqlServer = `"sqlserver"`/alias `"mssql"`. Behavior-preserving —
-  `Active` still routes to SqlServer); (2) generic rename + provider selection (`open_catalog(provider,…)`,
-  ATTACH `PROVIDER` option, `arrownet_query`/`_exec`, catalog-type `"arrownet"`) + regenerate the compat
-  corpus; (3) connstr/auth logic → C#; (4) dynamic functions (attach-time catalog fns first, then
-  load-time global, then table-in-out).
+  `Active` still routes to SqlServer); (2) **provider selection — DONE** (`open_catalog(provider,…)` ABI
+  v17 → `BackendRegistry.Resolve`; ATTACH `PROVIDER` option + `scheme://` inference; clean unknown-provider
+  error). The **generic rename** (`arrownet_query`/`_exec`, catalog-type `"arrownet"`) + corpus regen is
+  **deferred** to when the 2nd provider lands (cosmetic; the functional capability is complete);
+  (3) **connstr/auth → C# — DONE** (`build_connection_string` ABI v18: `mssql_net_secret.cpp` reads the
+  secret + emits its fields as JSON, `SqlServerBackend.BuildConnectionString` assembles the SqlClient
+  connstr; `MapAuthentication`/`QuoteConnValue`/the access-token marker are now C#-only — C++ has no connstr
+  knowledge); (4) dynamic functions (attach-time catalog fns first, then load-time global, then table-in-out).
 
 ## Implementation status (current)
 

@@ -25,7 +25,7 @@ public static unsafe class Bootstrap
             return ArrowNetStatus.InvalidArgument;
         }
 
-        vtable->AbiVersion = 17;
+        vtable->AbiVersion = 18;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -48,6 +48,7 @@ public static unsafe class Bootstrap
         vtable->BeginBulk = &BeginBulk;
         vtable->PushBatch = &PushBatch;
         vtable->CompleteBulk = &CompleteBulk;
+        vtable->BuildConnectionString = &BuildConnectionString;
         return ArrowNetStatus.Ok;
     }
 
@@ -518,6 +519,30 @@ public static unsafe class Bootstrap
             var catalog = Handles.Resolve<IBackendCatalog>(handle)
                           ?? BackendRegistry.Active.OpenCatalog(string.Empty);
             op(catalog);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int BuildConnectionString(byte* provider, byte* fieldsJson, byte** outConnStr, byte** err)
+    {
+        try
+        {
+            if (outConnStr is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            var providerName = Marshal.PtrToStringUTF8((nint)provider); // null/empty => default backend
+            var json = Marshal.PtrToStringUTF8((nint)fieldsJson) ?? "{}";
+            var fields = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, string>>(json)
+                         ?? new Dictionary<string, string>();
+            var connStr = BackendRegistry.Resolve(providerName).BuildConnectionString(fields);
+            *outConnStr = (byte*)Marshal.StringToCoTaskMemUTF8(connStr);
             return ArrowNetStatus.Ok;
         }
         catch (Exception ex)

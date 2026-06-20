@@ -323,6 +323,25 @@ ArrowNetHandle OpenCatalog(const std::string &connection_string, const std::stri
 	return handle;
 }
 
+std::string BuildConnectionString(const std::string &provider, const std::string &fields_json) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.build_connection_string) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide build_connection_string");
+	}
+	char *out_connstr = nullptr;
+	char *err = nullptr;
+	int32_t rc = vt.build_connection_string(provider.empty() ? nullptr : provider.c_str(), fields_json.c_str(),
+	                                        &out_connstr, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: build_connection_string failed");
+	}
+	std::string result = out_connstr ? out_connstr : "";
+	if (out_connstr && vt.free_error) {
+		vt.free_error(out_connstr); // owned UTF-8, freed like an error string
+	}
+	return result;
+}
+
 void CloseCatalog(ArrowNetHandle handle) {
 	if (!handle) {
 		return;
