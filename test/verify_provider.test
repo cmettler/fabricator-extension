@@ -1,0 +1,58 @@
+# name: test/verify_provider.test
+# description: provider selection — default, explicit PROVIDER, alias, scheme inference, unknown-provider error
+# group: [mssql]
+
+require mssql_net
+
+require-env MSSQL_TESTDB_DSN
+
+require-env MSSQL_TESTDB_URI
+
+# Default provider (no PROVIDER option) — preserves single-provider behavior.
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS p_default (TYPE mssql_net);
+
+query I
+SELECT x FROM mssql_net_query('p_default', 'SELECT 1 AS x');
+----
+1
+
+statement ok
+DETACH p_default;
+
+# Explicit PROVIDER 'sqlserver'.
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS p_ss (TYPE mssql_net, PROVIDER 'sqlserver');
+
+query I
+SELECT x FROM mssql_net_query('p_ss', 'SELECT 1 AS x');
+----
+1
+
+statement ok
+DETACH p_ss;
+
+# Alias 'mssql' resolves to the same backend.
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS p_alias (TYPE mssql_net, PROVIDER 'mssql');
+
+statement ok
+DETACH p_alias;
+
+# Scheme inference: mssql:// URI -> provider "mssql" (alias) without an explicit option.
+statement ok
+ATTACH '${MSSQL_TESTDB_URI}' AS p_uri (TYPE mssql_net);
+
+query I
+SELECT x FROM mssql_net_query('p_uri', 'SELECT 1 AS x');
+----
+1
+
+statement ok
+DETACH p_uri;
+
+# Unknown provider -> clean error (not an opaque connection failure).
+statement error
+ATTACH '${MSSQL_TESTDB_DSN}' AS p_bad (TYPE mssql_net, PROVIDER 'bogus');
+----
+unknown provider

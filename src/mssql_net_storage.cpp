@@ -85,6 +85,7 @@ static unique_ptr<Catalog> MssqlNetAttach(optional_ptr<StorageExtensionInfo> sto
 	string secret_name;
 	string schema_filter;
 	string table_filter;
+	string provider; // which registered backend handles this catalog (empty => default)
 	for (auto it = options.options.begin(); it != options.options.end();) {
 		auto lower = StringUtil::Lower(it->first);
 		if (lower == "secret") {
@@ -95,6 +96,10 @@ static unique_ptr<Catalog> MssqlNetAttach(optional_ptr<StorageExtensionInfo> sto
 			continue;
 		} else if (lower == "table_filter") {
 			table_filter = it->second.ToString();
+			it = options.options.erase(it);
+			continue;
+		} else if (lower == "provider") {
+			provider = StringUtil::Lower(it->second.ToString());
 			it = options.options.erase(it);
 			continue;
 		}
@@ -119,11 +124,30 @@ static unique_ptr<Catalog> MssqlNetAttach(optional_ptr<StorageExtensionInfo> sto
 
 	ValidateConnectionPort(connection_string);
 
+	// No explicit PROVIDER option? Infer it from a "scheme://" connection string
+	// (e.g. mssql://… -> "mssql"); otherwise the default backend handles it.
+	if (provider.empty()) {
+		size_t scheme_end = connection_string.find("://");
+		if (scheme_end != string::npos && scheme_end > 0) {
+			bool all_alpha = true;
+			for (size_t i = 0; i < scheme_end; i++) {
+				char c = connection_string[i];
+				if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) {
+					all_alpha = false;
+					break;
+				}
+			}
+			if (all_alpha) {
+				provider = StringUtil::Lower(connection_string.substr(0, scheme_end));
+			}
+		}
+	}
+
 	// ATTACH must validate the connection up front and create NO catalog on failure;
 	// wrap the underlying driver/network error so the cause is clear (and so a later
 	// catalog query is never the first place a bad connection surfaces).
 	try {
-		auto handle = arrownet::OpenCatalog(connection_string);
+		auto handle = arrownet::OpenCatalog(connection_string, provider);
 		auto catalog = make_uniq<ArrowNetCatalog>(db, name, handle, RedactConnectionString(connection_string));
 		catalog->SetCatalogFilters(schema_filter, table_filter);
 		catalog->LoadCatalog(context); // discover schemas + tables (also validates the connection)

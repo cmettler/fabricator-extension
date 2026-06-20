@@ -25,7 +25,7 @@ public static unsafe class Bootstrap
             return ArrowNetStatus.InvalidArgument;
         }
 
-        vtable->AbiVersion = 16;
+        vtable->AbiVersion = 17;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -52,7 +52,7 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int OpenCatalog(byte* conn, nint* outHandle, byte** err)
+    private static int OpenCatalog(byte* provider, byte* conn, nint* outHandle, byte** err)
     {
         try
         {
@@ -60,8 +60,9 @@ public static unsafe class Bootstrap
             {
                 return ArrowNetStatus.InvalidArgument;
             }
+            var providerName = Marshal.PtrToStringUTF8((nint)provider); // null/empty => default backend
             var connStr = Marshal.PtrToStringUTF8((nint)conn) ?? string.Empty;
-            var catalog = BackendRegistry.Active.OpenCatalog(connStr);
+            var catalog = BackendRegistry.Resolve(providerName).OpenCatalog(connStr);
             *outHandle = Handles.Alloc(catalog);
             return ArrowNetStatus.Ok;
         }

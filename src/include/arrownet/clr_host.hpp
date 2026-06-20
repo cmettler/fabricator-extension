@@ -36,8 +36,10 @@ const std::string &GetManagedDirectory();
 // the managed error message (and releases it via free_error) on failure.
 // -----------------------------------------------------------------------------
 
-// Open a backend catalog/connection. Returns an opaque handle to close later.
-ArrowNetHandle OpenCatalog(const std::string &connection_string);
+// Open a backend catalog/connection. `provider` selects which registered backend
+// handles it (case-insensitive name/alias, e.g. "sqlserver"/"mssql"); empty => the
+// default backend. Returns an opaque handle to close later.
+ArrowNetHandle OpenCatalog(const std::string &connection_string, const std::string &provider = "");
 
 // Close a handle previously returned by OpenCatalog. Safe with nullptr.
 void CloseCatalog(ArrowNetHandle handle);

@@ -13,8 +13,8 @@ public unsafe struct ArrowNetVTable
 {
     public int AbiVersion;
 
-    // int32 open_catalog(const char* conn, void** out_handle, char** err)
-    public delegate* unmanaged[Cdecl]<byte*, nint*, byte**, int> OpenCatalog;
+    // int32 open_catalog(const char* provider, const char* conn, void** out_handle, char** err)
+    public delegate* unmanaged[Cdecl]<byte*, byte*, nint*, byte**, int> OpenCatalog;
 
     // void close_catalog(void* handle)
     public delegate* unmanaged[Cdecl]<nint, void> CloseCatalog;

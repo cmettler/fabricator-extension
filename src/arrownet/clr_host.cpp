@@ -308,14 +308,15 @@ namespace {
 
 } // namespace
 
-ArrowNetHandle OpenCatalog(const std::string &connection_string) {
+ArrowNetHandle OpenCatalog(const std::string &connection_string, const std::string &provider) {
 	const ArrowNetVTable &vt = GetBridge();
 	if (!vt.open_catalog) {
 		throw duckdb::IOException("ArrowNet: bridge does not provide open_catalog");
 	}
 	ArrowNetHandle handle = nullptr;
 	char *err = nullptr;
-	int32_t rc = vt.open_catalog(connection_string.c_str(), &handle, &err);
+	int32_t rc = vt.open_catalog(provider.empty() ? nullptr : provider.c_str(), connection_string.c_str(), &handle,
+	                             &err);
 	if (rc != ARROWNET_OK) {
 		ThrowManagedError(vt, err, "ArrowNet: open_catalog failed");
 	}

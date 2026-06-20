@@ -133,10 +133,13 @@ typedef struct ArrowNetVTable {
 	// ABI/struct version. Bumped when the layout changes.
 	int32_t abi_version;
 
-	// Open a backend catalog/connection for a connection string. On success
-	// *out_handle receives an opaque handle. On failure returns non-zero and
-	// *err points to an owned UTF-8 message.
-	int32_t (*open_catalog)(const char *conn, ArrowNetHandle *out_handle, char **err);
+	// Open a backend catalog/connection for a connection string. `provider`
+	// selects which registered backend handles it (case-insensitive name/alias,
+	// e.g. "sqlserver"/"mssql"); NULL/empty => the default backend (single-provider
+	// behaviour). On success *out_handle receives an opaque handle (thereafter every
+	// call on it dispatches to that backend). On failure returns non-zero and *err
+	// points to an owned UTF-8 message.
+	int32_t (*open_catalog)(const char *provider, const char *conn, ArrowNetHandle *out_handle, char **err);
 
 	// Close a handle previously returned by open_catalog. Safe with NULL.
 	void (*close_catalog)(ArrowNetHandle handle);
@@ -283,7 +286,7 @@ typedef struct ArrowNetVTable {
 	int32_t (*complete_bulk)(ArrowNetHandle session, int32_t abort, int64_t *affected, char **err);
 } ArrowNetVTable;
 
-#define ARROWNET_ABI_VERSION 16
+#define ARROWNET_ABI_VERSION 17
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen
