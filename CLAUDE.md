@@ -39,10 +39,37 @@ Layered so a future **Power BI / DAX** connector reuses the same C++ core + mana
   composition root; published self-contained next to the extension. Discovered via `BackendRegistry`
   reflection (env `ARROWNET_BACKEND_ASSEMBLY`, default `ArrowNet.SqlServer`).
 
-A future DAX/PBI connector = the `arrownet` core verbatim + a thin provider layer + an
-`ArrowNet.AnalysisServices` C# backend. **Deferred until a 2nd provider lands** (YAGNI): parameterizing
-the hardcoded `"mssql_net"` catalog-type string, a `RegisterProviderFunctions(prefix)` helper, and
-per-connection backend selection in the Bridge.
+### Target architecture: ONE binary, MULTIPLE providers (corrected goal, 2026-06-20)
+
+The end goal is a **single `arrownet` extension binary that hosts several providers** (SQL Server via
+SqlClient, Power BI/DAX via ADOMD, …) — NOT a separate binary per provider. Implications (planned;
+current code still uses the single-provider `mssql_net` naming):
+
+- **Generic user-facing names**: `arrownet_query` / `arrownet_exec` (not `mssql_net_query`). The user is
+  fine breaking `gen_mssqlcompat_tests.sh` and renaming the kept tests.
+- **Dispatch is handle/catalog-based** and already works: `Handles.Resolve<IBackendCatalog>(handle)`
+  returns a backend-specific catalog, so any ABI call already routes to the right provider. Multi-provider
+  mainly needs: C# `BackendRegistry` keyed by provider name (providers self-register, not `Active`=one) +
+  **provider selection at open time** (`ATTACH … (TYPE arrownet, PROVIDER 'sqlserver')`, or inferred from
+  the `mssql://`/`dax://` scheme, or the secret's provider). `open_catalog` ABI gains a `provider` arg; the
+  catalog-type string becomes the generic `"arrownet"` (provider stored on the catalog).
+- **Provider-specific logic lives in C#**: connection-string assembly + auth mapping (move out of
+  `mssql_net_secret.cpp`), type mapping, all SQL. The C++ `arrownet` core owns registration + dispatch +
+  the function machinery, reused verbatim by every provider.
+- **Custom scalar / table / table-in-out functions** (Airport-style, Phase 3) drive this. Two registration
+  phases through one ABI shape (`list_global_functions(provider)` / `list_catalog_functions(handle)` +
+  `execute_scalar`/`execute_table`/`execute_inout`, decls = Arrow-serialized name/kind/in-schema/out-schema/
+  decl_id): **(A) load-time global** via `loader.RegisterFunction` — DuckDB only allows global registration
+  during `Extension::Load()`, so this forces the **bridge to boot at extension load** (not lazily);
+  **(B) attach-time catalog-bound** — discovered SQL Server procs/UDFs become `ScalarFunctionCatalogEntry`/
+  `TableFunctionCatalogEntry` in `ArrowNetSchemaEntry` (resolved as `db.schema.proc(args)`, refreshable via
+  the existing cache invalidation). New core file `arrownet_functions.{hpp,cpp}` holds this. Table-in-out
+  (`in_out_function`) is the hard part → Phase 4. **Full design: [docs/custom-functions-design.md](docs/custom-functions-design.md)**
+  (ABI, the C# authoring API — lambda / attribute(SQLCLR-style, columnar) / derived — and
+  `sp_describe_first_result_set` late-binding for table procs).
+- Suggested order: (1) C# multi-backend registry; (2) generic rename + provider selection + regenerate the
+  compat corpus; (3) connstr/auth logic → C#; (4) dynamic functions (attach-time catalog fns first, then
+  load-time global, then table-in-out).
 
 ## Implementation status (current)
 
