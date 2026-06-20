@@ -83,9 +83,10 @@ current code still uses the single-provider `mssql_net` naming):
   executed over Arrow — ABI v19); **(4c) attach-time catalog-bound table-valued functions DONE** (discovered
   TVFs become `TableFunctionCatalogEntry`, resolved as `SELECT * FROM db.schema.tvf(args)`, with real
   SQL-level projection + best-effort filter pushdown reusing the table scan's machinery — ABI v21);
-  **(4d) attach-time catalog-bound stored procedures DONE** (procs with a determinable result set +
-  positional params resolved as table functions — `sp_describe` schema, `EXEC` execution, no pushdown —
-  ABI v22; named/optional params + `_OUTPUT_` deferred); next: load-time global, then table-in-out.
+  **(4d) attach-time catalog-bound stored procedures DONE** (procs with a determinable result set resolved
+  as table functions — `sp_describe` schema, `EXEC` execution, no pushdown — ABI v22; **named/optional
+  params DONE (4d-2)**; `_OUTPUT_` params + multi-result-set deferred); next: proc `_OUTPUT_`, then load-time
+  global, then table-in-out.
 
 ## Implementation status (current)
 
@@ -123,7 +124,7 @@ syntax, and catalog-after-rollback staleness.
 
 **Not yet / out of scope:** Airport-style **table-in-out** functions and **load-time global** functions
 (Phase 3 — scalar UDFs, TVFs + stored procs done, see "Callable scalar UDFs (4b)" / "table functions (4c)" /
-"stored procedures (4d)"; proc **named/optional params** + **`_OUTPUT_`** still deferred); connection
+"stored procedures (4d)"; proc **`_OUTPUT_`** params + multi-result-set still deferred); connection
 pooling knobs / `mssql_pool_stats` (ADO.NET pools by connstr already); COPY to temp tables
 (`mssql://cat//#t`, `cat..#t` — `ParseTarget` only accepts strict 3-part names); CHECK constraints +
 non-literal/expression DEFAULTs on CREATE; UPDATE/DELETE…RETURNING; length-aware VARCHAR mapping (so
@@ -219,10 +220,17 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
   list, not `*`; parameterized `WHERE`). Committed test: `test/verify_table_functions.test` (incl. a
   `dm_exec_query_stats` proof that `FROM [dbo].[tf_ms] … WHERE …` reached the server).
 ### Callable stored procedures (4d)
-- **Scope**: procs with a **determinable first result set** + **positional required params**, resolved as
-  table functions (`SELECT * FROM db.schema.proc(args)`). **Deferred**: named/optional params (the design's
-  preferred shape — `EXEC @name=val`), `OUTPUT` params → `_OUTPUT_` struct, multiple result sets.
-- **Unified with TVFs**: `table_functions_` is now a `name -> is_proc` map; discovery routes `kind=='proc'`
+- **Scope**: procs with a **determinable first result set**, resolved as table functions
+  (`SELECT * FROM db.schema.proc(name := val)`) with **named parameters** (4d-2). **Deferred**: `OUTPUT`
+  params → `_OUTPUT_` struct, multiple result sets.
+- **Named/optional params (4d-2)**: procs register their params as DuckDB **named parameters**
+  (`tf.named_parameters[name]=type`, empty positional `arguments`) — mirrors `EXEC @name=val`. The bind
+  gathers only the **supplied** `input.named_parameters` (each cast to its declared type) into the 1-row
+  args batch whose **field names = the parameter names**; C# `ExecuteProc` builds `EXEC [s].[p] @name=@p0,…`
+  from those field names. Omitting a param → it's absent from the EXEC → SQL Server uses the proc's own
+  `DEFAULT` (so **optional params work for free**, no `has_default_value` discovery needed); a required
+  param omitted → SQL Server errors. (TVFs stay **positional** — `input.inputs`.)
+- **Unified with TVFs**: `table_functions_` is a `name -> is_proc` map; discovery routes `kind=='proc'`
   → `AddTableFunction(name, true)`. Procs reuse the **same** `TableFunctionCatalogEntry` registration +
   static bind via an `is_proc` flag on `ArrowNetTableFunctionInfo`. Proc branch: factory calls
   `execute_proc` (not `execute_table`), `push_projection=false`, and **no** `pushdown_complex_filter` — a
@@ -230,9 +238,11 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
 - **Output schema** (`SqlServerCatalog.GetFunctionOutputSchema`): TVFs use `INFORMATION_SCHEMA.ROUTINE_COLUMNS`;
   empty ⇒ a proc ⇒ `sys.dm_exec_describe_first_result_set_for_object(OBJECT_ID(@obj),0)` (`system_type_name`
   is the full SQL type, used directly). Auto-routes by object kind. Empty ⇒ "no describable result set".
-- **Execution** (`ExecuteProc`): `EXEC [s].[p] @p0,…` over the 1-row positional args; streams the first
-  result set lazily. Input param types come from `INFORMATION_SCHEMA.PARAMETERS` (reused `get_function_param_schema`).
-- **Verified**: `SELECT * FROM db.dbo.usp_emp(200)` → rows; local projection+filter; aggregation. Committed
+- **Execution** (`ExecuteProc`): `EXEC [s].[p] @name=@p0,…` over the supplied named args (field name ⇒
+  parameter name); streams the first result set lazily. Param types come from `INFORMATION_SCHEMA.PARAMETERS`
+  (reused `get_function_param_schema`, whose field names are the de-@'d param names).
+- **Verified**: `usp_sc(minSalary := 200)` → rows; local projection+filter; aggregation; **optional param**
+  omitted → proc `DEFAULT` (`usp_opt(base:=10)`→60) and supplied → override (`…, bonus:=5`→15). Committed
   test: `test/verify_stored_procs.test`.
 
 - **Filtering**: discovered scalar UDFs + TVFs/procs are gated by the ATTACH `schema_filter` (icase

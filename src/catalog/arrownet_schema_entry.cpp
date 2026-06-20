@@ -233,10 +233,33 @@ unique_ptr<FunctionData> ArrowNetTableFunctionBind(ClientContext &context, Table
 	ArrowNetHandle handle = info.handle;
 	string schema_name = info.schema;
 	string func_name = info.func;
-	vector<LogicalType> arg_types = info.arg_types;
-	vector<string> arg_names = info.arg_names;
-	vector<Value> arg_values = input.inputs; // positional constant args
 	bool is_proc = info.is_proc;
+
+	// Resolve the values to marshal into the 1-row args batch (the field NAMES become the
+	// proc parameter names that C# uses to build `EXEC @name=@p`). TVFs: all params,
+	// positional, in order (`input.inputs`). Procs: only the SUPPLIED named parameters
+	// (`input.named_parameters`), each cast to its declared type — omitted params are absent.
+	vector<LogicalType> arg_types;
+	vector<string> arg_names;
+	vector<Value> arg_values;
+	if (is_proc) {
+		for (auto &kv : input.named_parameters) {
+			LogicalType declared = kv.second.type();
+			for (idx_t i = 0; i < info.arg_names.size(); i++) {
+				if (StringUtil::CIEquals(info.arg_names[i], kv.first)) {
+					declared = info.arg_types[i];
+					break;
+				}
+			}
+			arg_names.push_back(kv.first);
+			arg_types.push_back(declared);
+			arg_values.push_back(kv.second);
+		}
+	} else {
+		arg_types = info.arg_types;
+		arg_names = info.arg_names;
+		arg_values = input.inputs;
+	}
 
 	auto bind_data = make_uniq<arrownet::ArrowStreamBindData>();
 
@@ -305,10 +328,18 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateTableFunction(ClientC
 		return nullptr;
 	}
 
-	TableFunction tf(func_name, arg_types, arrownet::ArrowStreamScan, ArrowNetTableFunctionBind,
+	// TVFs take positional arguments (called positionally in a FROM clause); stored procs
+	// take DuckDB named parameters (EXEC @name=val), so the caller supplies a subset and
+	// omitted optional params fall back to the proc's own DEFAULT.
+	vector<LogicalType> positional = is_proc ? vector<LogicalType>() : arg_types;
+	TableFunction tf(func_name, positional, arrownet::ArrowStreamScan, ArrowNetTableFunctionBind,
 	                 arrownet::ArrowStreamInitGlobal, arrownet::ArrowStreamInitLocal);
 	tf.projection_pushdown = true;
-	if (!is_proc) {
+	if (is_proc) {
+		for (idx_t i = 0; i < arg_names.size(); i++) {
+			tf.named_parameters[arg_names[i]] = arg_types[i];
+		}
+	} else {
 		// Best-effort filter pushdown into the TVF (reuses the table scan's serializer; the
 		// predicates are left in the plan so DuckDB re-applies them — an over-approximation
 		// is safe). `SELECT <cols> FROM tvf(@args) WHERE <filter>` is emitted by C#. Procs

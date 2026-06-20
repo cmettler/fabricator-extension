@@ -1244,14 +1244,16 @@ public sealed class SqlServerCatalog : IBackendCatalog
         return ScanFromSource($"{qualified}({argList})", argParams, specJson, filterValues);
     }
 
-    // Executes a stored procedure over its constant arguments (row 0, positional) as
-    // `EXEC [s].[p] @p0, ...` — streams the first result set lazily. No pushdown (EXEC
-    // is not inline-wrappable); DuckDB applies projection + filters above the scan.
+    // Executes a stored procedure over its supplied named arguments as
+    // `EXEC [s].[p] @name1=@p0, ...` — the args stream's FIELD NAMES are the proc's
+    // parameter names (only the supplied ones are present; omitted optionals use the
+    // proc's DEFAULT). Streams the first result set lazily. No pushdown (EXEC is not
+    // inline-wrappable); DuckDB applies projection + filters above the scan.
     public IArrowArrayStream ExecuteProc(string schemaName, string functionName, IArrowArrayStream args)
     {
         var qualified = Quote(schemaName) + "." + Quote(functionName);
         var argParams = new List<SqlParameter>();
-        var argList = new StringBuilder();
+        var assignments = new List<string>();
         using (var reader = new ArrowDataReader(args))
         {
             int paramCount = reader.FieldCount;
@@ -1259,17 +1261,14 @@ public sealed class SqlServerCatalog : IBackendCatalog
             {
                 for (int c = 0; c < paramCount; c++)
                 {
-                    if (c > 0)
-                    {
-                        argList.Append(", ");
-                    }
                     var pn = $"@p{c}";
-                    argList.Append(pn);
                     argParams.Add(new SqlParameter(pn, (reader.IsDBNull(c) ? null : reader.GetValue(c)) ?? (object)DBNull.Value));
+                    // Named: @<paramName> = @p<c>. The field name is the proc's parameter name.
+                    assignments.Add($"@{reader.GetName(c)} = {pn}");
                 }
             }
         }
-        var sql = argList.Length > 0 ? $"EXEC {qualified} {argList}" : $"EXEC {qualified}";
+        var sql = assignments.Count > 0 ? $"EXEC {qualified} {string.Join(", ", assignments)}" : $"EXEC {qualified}";
         return ExecuteQuery(sql, argParams);
     }
 
