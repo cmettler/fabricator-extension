@@ -11,6 +11,8 @@ namespace ArrowNet.Bridge;
 /// </summary>
 public sealed class StubBackend : IBackend
 {
+    public string Name => "stub";
+
     public IBackendCatalog OpenCatalog(string connectionString) => new StubCatalog();
 
     private sealed class StubCatalog : IBackendCatalog

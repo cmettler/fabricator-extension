@@ -14,6 +14,9 @@ namespace ArrowNet.SqlServer;
 /// </summary>
 public sealed class SqlServerBackend : IBackend
 {
+    public string Name => "sqlserver";
+    public IEnumerable<string> Aliases => new[] { "mssql" };
+
     public IBackendCatalog OpenCatalog(string connectionString) => new SqlServerCatalog(connectionString);
 }
 

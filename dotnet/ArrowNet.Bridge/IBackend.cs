@@ -12,6 +12,17 @@ namespace ArrowNet.Bridge;
 /// </summary>
 public interface IBackend
 {
+    /// <summary>
+    /// Canonical provider name this backend registers under (case-insensitive), e.g.
+    /// <c>"sqlserver"</c>. One binary can host several providers; <see cref="BackendRegistry"/>
+    /// keys backends by this name (and <see cref="Aliases"/>) so a connection can be routed to the
+    /// right provider.
+    /// </summary>
+    string Name { get; }
+
+    /// <summary>Additional names this backend also answers to (e.g. <c>"mssql"</c>). Empty by default.</summary>
+    IEnumerable<string> Aliases => System.Array.Empty<string>();
+
     /// <summary>Open a catalog/connection for the given connection string.</summary>
     IBackendCatalog OpenCatalog(string connectionString);
 }
@@ -129,43 +140,129 @@ public interface IBackendCatalog : IDisposable
 }
 
 /// <summary>
-/// Process-wide registry of the active backend. The bridge stays decoupled from
-/// any concrete backend: on first use it loads the backend assembly named by
-/// <c>ARROWNET_BACKEND_ASSEMBLY</c> (default <c>ArrowNet.SqlServer</c>), finds an
-/// <see cref="IBackend"/> implementation, and instantiates it. If that fails it
-/// falls back to <see cref="StubBackend"/> so the bridge still works standalone.
+/// Process-wide registry of backends, **keyed by provider name** so one binary can host several
+/// providers (SQL Server, later Power BI/DAX, …). On first use it loads the provider assemblies named
+/// by <c>ARROWNET_BACKEND_ASSEMBLY</c> (comma-separated; default <c>ArrowNet.SqlServer</c>), finds every
+/// <see cref="IBackend"/> implementation, and registers each under its <see cref="IBackend.Name"/> +
+/// <see cref="IBackend.Aliases"/> (case-insensitive). If none are found it falls back to
+/// <see cref="StubBackend"/> so the bridge still works standalone.
+/// <para>
+/// <see cref="Resolve"/> picks a backend by provider name; <see cref="Active"/> returns the default
+/// (the sole backend, or the one named by <c>ARROWNET_DEFAULT_PROVIDER</c>) for call sites that don't
+/// yet carry a provider — preserving single-provider behaviour until provider selection is wired through
+/// the ABI.
+/// </para>
 /// </summary>
 public static class BackendRegistry
 {
-    private static IBackend? _active;
+    private static readonly object Gate = new();
+    private static Dictionary<string, IBackend>? _byName; // name/alias (case-insensitive) -> backend
+    private static string? _defaultProvider;              // canonical name of the default backend
 
-    public static void Register(IBackend backend) => _active = backend;
-
-    public static IBackend Active => _active ??= LoadDefault();
-
-    private static IBackend LoadDefault()
+    /// <summary>
+    /// Explicitly registers a backend (e.g. from a host or test) under its name + aliases. The first
+    /// registered backend becomes the default unless <c>ARROWNET_DEFAULT_PROVIDER</c> overrides it.
+    /// </summary>
+    public static void Register(IBackend backend)
     {
-        var assemblyName = Environment.GetEnvironmentVariable("ARROWNET_BACKEND_ASSEMBLY");
-        if (string.IsNullOrEmpty(assemblyName))
+        lock (Gate)
         {
-            assemblyName = "ArrowNet.SqlServer";
+            _byName ??= NewMap();
+            Add(_byName, backend);
+            _defaultProvider ??= Environment.GetEnvironmentVariable("ARROWNET_DEFAULT_PROVIDER") ?? backend.Name;
         }
-        try
+    }
+
+    /// <summary>
+    /// Resolves a backend by provider name or alias (case-insensitive). A null/empty provider yields the
+    /// default (see <see cref="Active"/>). Throws when the provider is unknown.
+    /// </summary>
+    public static IBackend Resolve(string? provider)
+    {
+        var map = Map();
+        if (string.IsNullOrWhiteSpace(provider))
         {
-            var assembly = System.Reflection.Assembly.Load(assemblyName);
-            foreach (var type in assembly.GetTypes())
+            return Default(map);
+        }
+        if (map.TryGetValue(provider.Trim(), out var backend))
+        {
+            return backend;
+        }
+        var known = string.Join(", ", map.Values.Select(b => b.Name).Distinct(StringComparer.OrdinalIgnoreCase));
+        throw new ArgumentException($"mssql_net: unknown provider '{provider}'. Registered providers: {known}.");
+    }
+
+    /// <summary>
+    /// The default backend, for call sites that don't yet carry a provider (the sole registered backend,
+    /// or the one named by <c>ARROWNET_DEFAULT_PROVIDER</c> / the first registered).
+    /// </summary>
+    public static IBackend Active => Default(Map());
+
+    private static IBackend Default(Dictionary<string, IBackend> map)
+    {
+        if (_defaultProvider != null && map.TryGetValue(_defaultProvider, out var named))
+        {
+            return named;
+        }
+        // Exactly one backend (the common single-provider case) => it. Otherwise the first by name.
+        return map.Values.Distinct().First();
+    }
+
+    private static Dictionary<string, IBackend> Map()
+    {
+        lock (Gate)
+        {
+            return _byName ??= Discover();
+        }
+    }
+
+    private static Dictionary<string, IBackend> NewMap() => new(StringComparer.OrdinalIgnoreCase);
+
+    private static void Add(Dictionary<string, IBackend> map, IBackend backend)
+    {
+        map[backend.Name] = backend;
+        foreach (var alias in backend.Aliases)
+        {
+            if (!string.IsNullOrWhiteSpace(alias))
             {
-                if (!type.IsAbstract && typeof(IBackend).IsAssignableFrom(type) &&
-                    type.GetConstructor(Type.EmptyTypes) != null)
-                {
-                    return (IBackend)Activator.CreateInstance(type)!;
-                }
+                map[alias] = backend;
             }
         }
-        catch
+    }
+
+    private static Dictionary<string, IBackend> Discover()
+    {
+        var map = NewMap();
+        var names = Environment.GetEnvironmentVariable("ARROWNET_BACKEND_ASSEMBLY");
+        if (string.IsNullOrWhiteSpace(names))
         {
-            // No backend assembly available — fall back to the stub.
+            names = "ArrowNet.SqlServer";
         }
-        return new StubBackend();
+        foreach (var assemblyName in names.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            try
+            {
+                var assembly = System.Reflection.Assembly.Load(assemblyName);
+                foreach (var type in assembly.GetTypes())
+                {
+                    if (!type.IsAbstract && typeof(IBackend).IsAssignableFrom(type) &&
+                        type.GetConstructor(Type.EmptyTypes) != null)
+                    {
+                        var backend = (IBackend)Activator.CreateInstance(type)!;
+                        Add(map, backend);
+                        _defaultProvider ??= Environment.GetEnvironmentVariable("ARROWNET_DEFAULT_PROVIDER") ?? backend.Name;
+                    }
+                }
+            }
+            catch
+            {
+                // Assembly missing/unloadable — skip it; fall back to the stub below if nothing registered.
+            }
+        }
+        if (map.Count == 0)
+        {
+            Add(map, new StubBackend());
+        }
+        return map;
     }
 }

@@ -67,8 +67,12 @@ current code still uses the single-provider `mssql_net` naming):
   (`in_out_function`) is the hard part → Phase 4. **Full design: [docs/custom-functions-design.md](docs/custom-functions-design.md)**
   (ABI, the C# authoring API — lambda / attribute(SQLCLR-style, columnar) / derived — and
   `sp_describe_first_result_set` late-binding for table procs).
-- Suggested order: (1) C# multi-backend registry; (2) generic rename + provider selection + regenerate the
-  compat corpus; (3) connstr/auth logic → C#; (4) dynamic functions (attach-time catalog fns first, then
+- Suggested order: (1) **C# multi-backend registry — DONE** (`BackendRegistry` is provider-keyed:
+  `IBackend.Name`/`Aliases`, `Resolve(provider)`, `Active`=default; multi-assembly discovery via
+  `ARROWNET_BACKEND_ASSEMBLY` comma-list; SqlServer = `"sqlserver"`/alias `"mssql"`. Behavior-preserving —
+  `Active` still routes to SqlServer); (2) generic rename + provider selection (`open_catalog(provider,…)`,
+  ATTACH `PROVIDER` option, `arrownet_query`/`_exec`, catalog-type `"arrownet"`) + regenerate the compat
+  corpus; (3) connstr/auth logic → C#; (4) dynamic functions (attach-time catalog fns first, then
   load-time global, then table-in-out).
 
 ## Implementation status (current)
