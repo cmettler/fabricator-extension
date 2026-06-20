@@ -178,8 +178,17 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
     to gate which UDFs register when a catalog has many. Today functions are schema-filtered only.
   - **Targeted/scoped refresh.** `mssql_refresh_cache` is arity-1 (whole catalog); `mssql_invalidate_cache
     (catalog[,schema[,table]])` accepts the schema/table args for native-extension compat but **ignores
-    them** (always a full refresh — a valid superset). Idea: rename the `table` arg to a generic **object
-    name** and implement scoped re-discovery for whichever kind it is (table/view/function/proc).
+    them** (always a full refresh — a valid superset). The `mssql_net_exec` auto-refresh (gated by
+    `mssql_exec_invalidate_cache`) is likewise a **full** `RefreshCache`: the C# DDL detector returns only a
+    bool `schema_may_change` (no object/schema name crosses the ABI), so there's nothing to scope to — and
+    it deliberately doesn't parse the statement. Idea: rename the `table` arg to a generic **object name** +
+    implement scoped re-discovery for whichever kind it is (table/view/function/proc); the exec path would
+    additionally need C# to surface the touched object (not just the bool flag). **Native parity:** the C++
+    mssql extension's `mssql_exec` does the same — full `catalog.InvalidateMetadataCache()` gated by its own
+    bool `ExecSqlMayChangeSchema`, no scoping; it only scopes (`InvalidateSchema`/table-set) in
+    catalog-driven DDL where the name is known (as we do via per-entry eviction). It invalidates *lazily*
+    (mark stale + evict, reload on next access) vs our *eager* `RefreshCache` re-discovery — so scoping the
+    exec path would exceed native parity, and a lazy mark-stale would be cheaper here too.
 
 ## C ABI contract (`src/include/arrownet/abi.h`)
 
