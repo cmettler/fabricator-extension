@@ -1,5 +1,5 @@
 # name: test/verify_custom_functions.test
-# description: Provider-authored custom C# scalar functions are callable as db.schema.fn(args) at attach time
+# description: Provider-authored custom C# scalar + table functions are callable as db.schema.fn(args) at attach time
 # group: [mssql]
 
 require mssql_net
@@ -41,6 +41,35 @@ query I
 SELECT cnt FROM mssql_net_query('cdb', 'SELECT COUNT(*) AS cnt FROM sys.objects WHERE name = ''cf_add''');
 ----
 0
+
+# A custom C# TABLE function (IArrowTableFunction): dbo.cf_range(n) generates (value, squared) rows in C#.
+query II
+SELECT value, squared FROM cdb.dbo.cf_range(3) ORDER BY value;
+----
+1	1
+2	4
+3	9
+
+# Projection (squared only) + filter (value > 1) are applied by DuckDB above the scan (custom functions
+# get no SQL-level pushdown); arrow_ingest selects the projected column by name from the full result.
+query I
+SELECT squared FROM cdb.dbo.cf_range(4) WHERE value > 1 ORDER BY squared;
+----
+4
+9
+16
+
+# Aggregation over the custom table function.
+query II
+SELECT count(*), sum(value) FROM cdb.dbo.cf_range(5);
+----
+5	15
+
+# Discovered as a table function — again with no backing SQL Server object.
+query TT
+SELECT name, kind FROM mssql_net_functions('cdb') WHERE name = 'cf_range';
+----
+cf_range	table
 
 statement ok
 DETACH cdb;

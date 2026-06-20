@@ -16,6 +16,44 @@ internal static class CustomFunctions
     {
         new CfAddFunction(),
     };
+
+    public static readonly IReadOnlyList<IArrowTableFunction> Table = new IArrowTableFunction[]
+    {
+        new CfRangeFunction(),
+    };
+}
+
+// Demo: dbo.cf_range(n) -> rows (value, squared) for value = 1..n, generated in C#
+// (no such object exists in SQL Server). Multi-column to exercise projection.
+internal sealed class CfRangeFunction : IArrowTableFunction
+{
+    public string SchemaName => "dbo";
+    public string Name => "cf_range";
+
+    public Schema Parameters => new(new[]
+    {
+        new Field("n", Int32Type.Default, nullable: true),
+    }, metadata: null);
+
+    public Schema OutputSchema => new(new[]
+    {
+        new Field("value", Int32Type.Default, nullable: false),
+        new Field("squared", Int32Type.Default, nullable: false),
+    }, metadata: null);
+
+    public IEnumerable<RecordBatch> Invoke(RecordBatch args)
+    {
+        var arg = (Int32Array)args.Column(0);
+        int n = args.Length > 0 && !arg.IsNull(0) ? arg.Values[0] : 0;
+        var value = new Int32Array.Builder().Reserve(n);
+        var squared = new Int32Array.Builder().Reserve(n);
+        for (int i = 1; i <= n; i++)
+        {
+            value.Append(i);
+            squared.Append(i * i);
+        }
+        yield return new RecordBatch(OutputSchema, new IArrowArray[] { value.Build(), squared.Build() }, n);
+    }
 }
 
 // Demo: dbo.cf_add(a, b) -> a + b, computed in C# (no such object exists in SQL Server).

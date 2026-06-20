@@ -136,6 +136,11 @@ public sealed class SqlServerCatalog : IBackendCatalog
     private static readonly IReadOnlyDictionary<string, IArrowScalarFunction> CustomScalar =
         CustomFunctions.Scalar.ToDictionary(f => $"{f.SchemaName}.{f.Name}", StringComparer.OrdinalIgnoreCase);
 
+    // Provider-authored custom table functions, keyed "schema.name" (case-insensitive). Surfaced like
+    // discovered TVFs but dispatched to C# (see ExecuteTable / GetFunctionParamSchema / GetFunctionOutputSchema).
+    private static readonly IReadOnlyDictionary<string, IArrowTableFunction> CustomTable =
+        CustomFunctions.Table.ToDictionary(f => $"{f.SchemaName}.{f.Name}", StringComparer.OrdinalIgnoreCase);
+
     private readonly string _connectionString;
     private readonly string? _accessToken;
 
@@ -714,24 +719,29 @@ public sealed class SqlServerCatalog : IBackendCatalog
         _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "mssql_net: unknown metadata kind"),
     };
 
-    // Discovered SQL Server routines + the provider's custom scalar functions, appended via UNION ALL so
-    // the C++ catalog discovers + registers them uniformly (then dispatches custom ones to C#).
+    // Discovered SQL Server routines + the provider's custom scalar/table functions, appended via
+    // UNION ALL so the C++ catalog discovers + registers them uniformly (then dispatches custom ones to C#).
     private static string FunctionsMetadataSql()
     {
-        if (CustomScalar.Count == 0)
+        if (CustomScalar.Count == 0 && CustomTable.Count == 0)
         {
             return FunctionsSql;
         }
+        static string Esc(string s) => s.Replace("'", "''");
         // FunctionsSql ends with ORDER BY; strip it so the UNION ALL is valid (the diagnostic /
         // discovery callers sort themselves, so dropping the ordering here is harmless).
         int orderIdx = FunctionsSql.LastIndexOf(" ORDER BY ", StringComparison.Ordinal);
-        var sb = new StringBuilder(orderIdx >= 0 ? FunctionsSql.Substring(0, orderIdx) : FunctionsSql);
+        var sb = new StringBuilder(orderIdx >= 0 ? FunctionsSql[..orderIdx] : FunctionsSql);
         foreach (var f in CustomScalar.Values)
         {
-            string esc(string s) => s.Replace("'", "''");
-            sb.Append(" UNION ALL SELECT '").Append(esc(f.SchemaName)).Append("', '").Append(esc(f.Name))
+            sb.Append(" UNION ALL SELECT '").Append(Esc(f.SchemaName)).Append("', '").Append(Esc(f.Name))
               .Append("', 'scalar', ").Append(f.Parameters.FieldsList.Count).Append(", '")
-              .Append(esc(f.Result.DataType.Name)).Append('\'');
+              .Append(Esc(f.Result.DataType.Name)).Append('\'');
+        }
+        foreach (var f in CustomTable.Values)
+        {
+            sb.Append(" UNION ALL SELECT '").Append(Esc(f.SchemaName)).Append("', '").Append(Esc(f.Name))
+              .Append("', 'table', ").Append(f.Parameters.FieldsList.Count).Append(", ''");
         }
         return sb.ToString();
     }
@@ -1074,9 +1084,14 @@ public sealed class SqlServerCatalog : IBackendCatalog
 
     public IArrowArrayStream GetFunctionParamSchema(string schemaName, string functionName)
     {
-        if (CustomScalar.TryGetValue($"{schemaName}.{functionName}", out var custom))
+        var key = $"{schemaName}.{functionName}";
+        if (CustomScalar.TryGetValue(key, out var customScalar))
         {
-            return new InMemoryArrayStream(custom.Parameters, System.Array.Empty<RecordBatch>());
+            return new InMemoryArrayStream(customScalar.Parameters, System.Array.Empty<RecordBatch>());
+        }
+        if (CustomTable.TryGetValue(key, out var customTable))
+        {
+            return new InMemoryArrayStream(customTable.Parameters, System.Array.Empty<RecordBatch>());
         }
         var parms = FunctionParameters(schemaName, functionName, wantReturn: false);
         if (parms.Count == 0)
@@ -1275,6 +1290,10 @@ public sealed class SqlServerCatalog : IBackendCatalog
 
     public IArrowArrayStream GetFunctionOutputSchema(string schemaName, string functionName)
     {
+        if (CustomTable.TryGetValue($"{schemaName}.{functionName}", out var customTable))
+        {
+            return new InMemoryArrayStream(customTable.OutputSchema, System.Array.Empty<RecordBatch>());
+        }
         // TVFs expose their result columns in ROUTINE_COLUMNS; stored procs don't.
         var cols = FunctionOutputColumns(schemaName, functionName);
         if (cols.Count == 0)
@@ -1317,6 +1336,20 @@ public sealed class SqlServerCatalog : IBackendCatalog
     public IArrowArrayStream ExecuteTable(string schemaName, string functionName, IArrowArrayStream args,
                                           string? specJson, IArrowArrayStream? filterValues)
     {
+        // Provider-authored custom table function: run the C# delegate. There is no SQL to push into,
+        // so projection/filter (specJson/filterValues) are ignored here — the function returns its full
+        // result and DuckDB projects (by column name) + filters above the scan.
+        if (CustomTable.TryGetValue($"{schemaName}.{functionName}", out var custom))
+        {
+            filterValues?.Dispose();
+            using var input = args; // the 1-row args batch; result batches must be independent
+            var argBatch = input.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+            var batches = argBatch is null
+                ? System.Array.Empty<RecordBatch>()
+                : custom.Invoke(argBatch).ToArray();
+            return new InMemoryArrayStream(custom.OutputSchema, batches);
+        }
+
         var qualified = Quote(schemaName) + "." + Quote(functionName);
         var argParams = new List<SqlParameter>();
         var argList = new StringBuilder();
