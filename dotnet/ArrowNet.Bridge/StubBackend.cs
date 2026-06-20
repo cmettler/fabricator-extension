@@ -52,6 +52,15 @@ public sealed class StubBackend : IBackend
                                            IArrowArrayStream? filterValues) =>
             ExecuteQuery($"SELECT * FROM {schemaName}.{tableName}");
 
+        public IArrowArrayStream GetFunctionParamSchema(string schemaName, string functionName) =>
+            new InMemoryArrayStream(new Schema(System.Array.Empty<Field>(), null), System.Array.Empty<RecordBatch>());
+
+        public IArrowArrayStream GetFunctionReturnSchema(string schemaName, string functionName) =>
+            EmptyStringTable("result");
+
+        public IArrowArrayStream ExecuteScalar(string schemaName, string functionName, IArrowArrayStream args) =>
+            EmptyStringTable("result");
+
         public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists,
                                 string? primaryKey, string? uniques, string? defaults, string? textType)
         {

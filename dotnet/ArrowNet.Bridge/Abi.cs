@@ -83,6 +83,15 @@ public unsafe struct ArrowNetVTable
 
     // int32 build_connection_string(const char* provider, const char* fields_json, char** out_connstr, char** err)
     public delegate* unmanaged[Cdecl]<byte*, byte*, byte**, byte**, int> BuildConnectionString;
+
+    // int32 get_function_param_schema(void* handle, const char* schema, const char* func, ArrowArrayStream* out, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, byte**, int> GetFunctionParamSchema;
+
+    // int32 get_function_return_schema(void* handle, const char* schema, const char* func, ArrowArrayStream* out, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, byte**, int> GetFunctionReturnSchema;
+
+    // int32 execute_scalar(void* handle, const char* schema, const char* func, ArrowArrayStream* args, ArrowArrayStream* out, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, CArrowArrayStream*, byte**, int> ExecuteScalar;
 }
 
 /// <summary>Mirrors <c>ArrowNetAlterKind</c> in abi.h.</summary>

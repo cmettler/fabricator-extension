@@ -90,6 +90,21 @@ public interface IBackendCatalog : IDisposable
     IArrowArrayStream ScanTable(string schemaName, string tableName, string? specJson, IArrowArrayStream? filterValues);
 
     /// <summary>
+    /// Zero-row Arrow stream whose schema describes a scalar function's input parameters (one field per
+    /// parameter, in order). Used to register the DuckDB function's argument types.
+    /// </summary>
+    IArrowArrayStream GetFunctionParamSchema(string schemaName, string functionName);
+
+    /// <summary>Zero-row Arrow stream whose single field is the scalar function's return type.</summary>
+    IArrowArrayStream GetFunctionReturnSchema(string schemaName, string functionName);
+
+    /// <summary>
+    /// Applies a scalar function over an input batch: <paramref name="args"/> columns are the argument
+    /// values (in parameter order); returns one column of per-row results, typed as the return type.
+    /// </summary>
+    IArrowArrayStream ExecuteScalar(string schemaName, string functionName, IArrowArrayStream args);
+
+    /// <summary>
     /// Creates a table whose columns are described by <paramref name="columns"/>
     /// (a non-nullable field maps to NOT NULL). The backend maps Arrow types to
     /// provider types and runs the provider CREATE TABLE. When

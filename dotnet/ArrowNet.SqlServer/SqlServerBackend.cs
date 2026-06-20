@@ -978,7 +978,13 @@ public sealed class SqlServerCatalog : IBackendCatalog
         int numScale = reader.IsDBNull(3) ? 0 : Convert.ToInt32(reader.GetValue(3));
         int? dtPrec = reader.IsDBNull(4) ? null : Convert.ToInt32(reader.GetValue(4));
 
-        string full = dataType.ToLowerInvariant() switch
+        return (BuildSqlType(dataType, charLen, numPrec, numScale, dtPrec), dataType);
+    }
+
+    // Reconstructs a SQL Server type string (e.g. "varchar(50)", "decimal(10,2)") from
+    // INFORMATION_SCHEMA size/precision columns. Shared by column + parameter type queries.
+    private static string BuildSqlType(string dataType, int? charLen, int? numPrec, int numScale, int? dtPrec) =>
+        dataType.ToLowerInvariant() switch
         {
             "char" or "varchar" or "nchar" or "nvarchar" or "binary" or "varbinary" =>
                 $"{dataType}({(charLen == -1 ? "max" : charLen?.ToString())})",
@@ -986,7 +992,134 @@ public sealed class SqlServerCatalog : IBackendCatalog
             "datetime2" or "time" or "datetimeoffset" => dtPrec is null ? dataType : $"{dataType}({dtPrec})",
             _ => dataType,
         };
-        return (full, dataType);
+
+    // A scalar function's parameters from INFORMATION_SCHEMA.PARAMETERS: input params
+    // (ORDINAL_POSITION > 0) or, when wantReturn, the return value (ORDINAL_POSITION = 0).
+    // Each carries a reconstructed SQL type; names are de-@'d (blank => positional fallback).
+    private List<(string name, string sqlType)> FunctionParameters(string schemaName, string functionName,
+                                                                   bool wantReturn)
+    {
+        using var connection = OpenConnection();
+        connection.Open();
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText =
+            "SELECT PARAMETER_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE, " +
+            "DATETIME_PRECISION FROM INFORMATION_SCHEMA.PARAMETERS " +
+            "WHERE SPECIFIC_SCHEMA = @s AND SPECIFIC_NAME = @f AND ORDINAL_POSITION " +
+            (wantReturn ? "= 0" : "> 0 ORDER BY ORDINAL_POSITION");
+        cmd.Parameters.AddWithValue("@s", schemaName);
+        cmd.Parameters.AddWithValue("@f", functionName);
+        var result = new List<(string, string)>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            var name = (reader.IsDBNull(0) ? "" : reader.GetString(0)).TrimStart('@');
+            if (string.IsNullOrEmpty(name))
+            {
+                name = wantReturn ? "result" : $"arg{result.Count}";
+            }
+            int? charLen = reader.IsDBNull(2) ? null : Convert.ToInt32(reader.GetValue(2));
+            int? numPrec = reader.IsDBNull(3) ? null : Convert.ToInt32(reader.GetValue(3));
+            int numScale = reader.IsDBNull(4) ? 0 : Convert.ToInt32(reader.GetValue(4));
+            int? dtPrec = reader.IsDBNull(5) ? null : Convert.ToInt32(reader.GetValue(5));
+            result.Add((name, BuildSqlType(reader.GetString(1), charLen, numPrec, numScale, dtPrec)));
+        }
+        return result;
+    }
+
+    public IArrowArrayStream GetFunctionParamSchema(string schemaName, string functionName)
+    {
+        var parms = FunctionParameters(schemaName, functionName, wantReturn: false);
+        if (parms.Count == 0)
+        {
+            return new InMemoryArrayStream(new Schema(System.Array.Empty<Field>(), null),
+                                           System.Array.Empty<RecordBatch>());
+        }
+        var sb = new StringBuilder("SELECT ");
+        for (int i = 0; i < parms.Count; i++)
+        {
+            if (i > 0)
+            {
+                sb.Append(", ");
+            }
+            sb.Append("CAST(NULL AS ").Append(parms[i].sqlType).Append(") AS ").Append(Quote(parms[i].name));
+        }
+        sb.Append(" WHERE 1 = 0");
+        return ExecuteQuery(sb.ToString());
+    }
+
+    public IArrowArrayStream GetFunctionReturnSchema(string schemaName, string functionName)
+    {
+        var ret = FunctionParameters(schemaName, functionName, wantReturn: true);
+        if (ret.Count == 0)
+        {
+            throw new ArgumentException($"mssql_net: '{schemaName}.{functionName}' is not a scalar function");
+        }
+        return ExecuteQuery($"SELECT CAST(NULL AS {ret[0].sqlType}) AS result WHERE 1 = 0");
+    }
+
+    // Applies a scalar UDF over the input batch via chunked, parameterized
+    // `SELECT f(@..) AS result UNION ALL ...` queries — the result column inherits the
+    // function's return type. Chunked to stay under SQL Server's ~2100-parameter limit.
+    public IArrowArrayStream ExecuteScalar(string schemaName, string functionName, IArrowArrayStream args)
+    {
+        var qualified = Quote(schemaName) + "." + Quote(functionName);
+        var rows = new List<object?[]>();
+        int paramCount;
+        using (var reader = new ArrowDataReader(args))
+        {
+            paramCount = reader.FieldCount;
+            while (reader.Read())
+            {
+                var vals = new object?[paramCount];
+                for (int c = 0; c < paramCount; c++)
+                {
+                    vals[c] = reader.IsDBNull(c) ? null : reader.GetValue(c);
+                }
+                rows.Add(vals);
+            }
+        }
+        if (rows.Count == 0)
+        {
+            return GetFunctionReturnSchema(schemaName, functionName); // correctly typed, zero rows
+        }
+
+        int maxRows = Math.Max(1, 2000 / Math.Max(1, paramCount));
+        var batches = new List<RecordBatch>();
+        Schema? resultSchema = null;
+        for (int start = 0; start < rows.Count; start += maxRows)
+        {
+            int end = Math.Min(start + maxRows, rows.Count);
+            var sb = new StringBuilder();
+            var sqlParams = new List<SqlParameter>();
+            for (int r = start; r < end; r++)
+            {
+                if (r > start)
+                {
+                    sb.Append(" UNION ALL ");
+                }
+                sb.Append("SELECT ").Append(qualified).Append('(');
+                for (int c = 0; c < paramCount; c++)
+                {
+                    if (c > 0)
+                    {
+                        sb.Append(", ");
+                    }
+                    var pn = $"@p{r}_{c}";
+                    sb.Append(pn);
+                    sqlParams.Add(new SqlParameter(pn, rows[r][c] ?? (object)DBNull.Value));
+                }
+                sb.Append(") AS result");
+            }
+            using var sub = ExecuteQuery(sb.ToString(), sqlParams);
+            resultSchema ??= sub.Schema;
+            RecordBatch? b;
+            while ((b = sub.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult()) is not null)
+            {
+                batches.Add(b);
+            }
+        }
+        return new InMemoryArrayStream(resultSchema!, batches);
     }
 
     // Drops any DEFAULT constraint bound to a column (no-op if none).

@@ -7,15 +7,20 @@
 #include "arrownet/arrow_produce.hpp"
 #include "arrownet/clr_host.hpp"
 #include "catalog/arrownet_metadata.hpp"
+#include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/blob.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
+#include "duckdb/execution/expression_executor_state.hpp"
+#include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/parsed_data/alter_table_info.hpp"
+#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
@@ -33,10 +38,19 @@ void ArrowNetSchemaEntry::AddTable(const string &table_name, const string &table
 	entries_.erase(table_name);
 }
 
+void ArrowNetSchemaEntry::AddScalarFunction(const string &func_name) {
+	lock_guard<mutex> lock(entry_lock_);
+	scalar_functions_.insert(func_name);
+	// Drop any cached entry so the signature is re-fetched (e.g. after CREATE OR ALTER).
+	function_entries_.erase(func_name);
+}
+
 void ArrowNetSchemaEntry::ClearTables() {
 	lock_guard<mutex> lock(entry_lock_);
 	table_types_.clear();
 	entries_.clear();
+	scalar_functions_.clear();
+	function_entries_.clear();
 }
 
 optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateEntry(ClientContext &context, const string &table_name) {
@@ -101,38 +115,146 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateEntry(ClientContext &
 	return &ref;
 }
 
-optional_ptr<CatalogEntry> ArrowNetSchemaEntry::LookupEntry(CatalogTransaction transaction,
-                                                            const EntryLookupInfo &lookup_info) {
-	if (lookup_info.GetCatalogType() != CatalogType::TABLE_ENTRY) {
+optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateScalarFunction(ClientContext &context,
+                                                                          const string &func_name) {
+	lock_guard<mutex> lock(entry_lock_);
+	auto cached = function_entries_.find(func_name);
+	if (cached != function_entries_.end()) {
+		return cached->second.get();
+	}
+	if (scalar_functions_.find(func_name) == scalar_functions_.end()) {
 		return nullptr;
 	}
+
+	vector<string> arg_names;
+	vector<LogicalType> arg_types;
+	LogicalType return_type;
+	try {
+		FetchFunctionParamSchema(context, handle_, name, func_name, arg_names, arg_types);
+		return_type = FetchFunctionReturnType(context, handle_, name, func_name);
+	} catch (std::exception &) {
+		// The discovered name is stale — the function no longer exists on the server
+		// (e.g. dropped out-of-band). Treat it as not-found rather than erroring.
+		scalar_functions_.erase(func_name);
+		function_entries_.erase(func_name);
+		return nullptr;
+	}
+
+	// Capture the identity for the per-call execution. The callback marshals the
+	// argument chunk to Arrow, runs the UDF on the backend, and ingests the result.
+	ArrowNetHandle handle = handle_;
+	string schema_name = name;
+	string fn_name = func_name;
+	scalar_function_t exec = [handle, schema_name, fn_name, arg_types, arg_names](
+	                             DataChunk &args, ExpressionState &state, Vector &result) {
+		auto &ctx = state.GetContext();
+		idx_t row_count = args.size();
+
+		// Argument chunk -> a one-batch Arrow stream (in parameter order).
+		auto properties = ctx.GetClientProperties();
+		auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(ctx, arg_types);
+		ArrowAppender appender(arg_types, row_count, properties, extension_types);
+		appender.Append(args, 0, row_count, row_count);
+		ArrowArray array = appender.Finalize();
+
+		arrownet::ArrowProducer producer(arg_types, arg_names, properties);
+		producer.AddBatch(array);
+		producer.Finish();
+
+		ArrowArrayStream out;
+		std::memset(&out, 0, sizeof(out));
+		arrownet::ExecuteScalar(handle, schema_name, fn_name, *producer.Stream(), out);
+
+		// Single-column, row_count-row result -> the output vector (matching offsets).
+		arrownet::ArrowStreamReader reader(ctx, out);
+		DataChunk chunk;
+		chunk.Initialize(Allocator::Get(ctx), reader.Types());
+		idx_t offset = 0;
+		while (offset < row_count) {
+			chunk.Reset();
+			reader.Read(chunk);
+			idx_t got = chunk.size();
+			if (got == 0) {
+				break; // defensive: backend returned fewer rows than requested
+			}
+			VectorOperations::Copy(chunk.data[0], result, got, 0, offset);
+			offset += got;
+		}
+	};
+
+	ScalarFunction fn(arg_types, return_type, exec);
+	fn.name = func_name;
+	// A remote UDF may be non-deterministic / side-effecting (VOLATILE => never folded),
+	// and may return non-NULL for NULL inputs, so it must see NULL args (SPECIAL_HANDLING)
+	// rather than DuckDB short-circuiting the row to NULL.
+	fn.SetStability(FunctionStability::VOLATILE);
+	fn.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+
+	CreateScalarFunctionInfo info(std::move(fn));
+	info.catalog = catalog.GetName();
+	info.schema = name;
+	auto entry = make_uniq<ScalarFunctionCatalogEntry>(catalog, *this, info);
+	auto &ref = *entry;
+	function_entries_[func_name] = std::move(entry);
+	return &ref;
+}
+
+optional_ptr<CatalogEntry> ArrowNetSchemaEntry::LookupEntry(CatalogTransaction transaction,
+                                                            const EntryLookupInfo &lookup_info) {
 	if (!transaction.context) {
 		return nullptr;
 	}
-	return GetOrCreateEntry(*transaction.context, lookup_info.GetEntryName());
+	auto type = lookup_info.GetCatalogType();
+	if (type == CatalogType::TABLE_ENTRY) {
+		return GetOrCreateEntry(*transaction.context, lookup_info.GetEntryName());
+	}
+	if (type == CatalogType::SCALAR_FUNCTION_ENTRY) {
+		return GetOrCreateScalarFunction(*transaction.context, lookup_info.GetEntryName());
+	}
+	return nullptr;
 }
 
 void ArrowNetSchemaEntry::Scan(ClientContext &context, CatalogType type,
                                const std::function<void(CatalogEntry &)> &callback) {
-	if (type != CatalogType::TABLE_ENTRY) {
+	if (type == CatalogType::TABLE_ENTRY) {
+		for (auto &entry : table_types_) {
+			auto catalog_entry = GetOrCreateEntry(context, entry.first);
+			if (catalog_entry) {
+				callback(*catalog_entry);
+			}
+		}
 		return;
 	}
-	for (auto &entry : table_types_) {
-		auto catalog_entry = GetOrCreateEntry(context, entry.first);
-		if (catalog_entry) {
-			callback(*catalog_entry);
+	if (type == CatalogType::SCALAR_FUNCTION_ENTRY) {
+		// Snapshot the names: GetOrCreateScalarFunction locks entry_lock_ and may evict
+		// a stale entry, which would invalidate an iterator over scalar_functions_.
+		vector<string> names;
+		{
+			lock_guard<mutex> lock(entry_lock_);
+			for (auto &fn : scalar_functions_) {
+				names.push_back(fn);
+			}
+		}
+		for (auto &fn : names) {
+			auto catalog_entry = GetOrCreateScalarFunction(context, fn);
+			if (catalog_entry) {
+				callback(*catalog_entry);
+			}
 		}
 	}
 }
 
 void ArrowNetSchemaEntry::Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) {
-	if (type != CatalogType::TABLE_ENTRY) {
-		return;
-	}
 	// No context available: only report already-materialized entries.
 	lock_guard<mutex> lock(entry_lock_);
-	for (auto &entry : entries_) {
-		callback(*entry.second);
+	if (type == CatalogType::TABLE_ENTRY) {
+		for (auto &entry : entries_) {
+			callback(*entry.second);
+		}
+	} else if (type == CatalogType::SCALAR_FUNCTION_ENTRY) {
+		for (auto &entry : function_entries_) {
+			callback(*entry.second);
+		}
 	}
 }
 

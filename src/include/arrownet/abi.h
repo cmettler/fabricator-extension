@@ -295,9 +295,31 @@ typedef struct ArrowNetVTable {
 	// SqlClient knowledge); the result is then handed to open_catalog as usual.
 	int32_t (*build_connection_string)(const char *provider, const char *fields_json, char **out_connstr,
 	                                   char **err);
+
+	// -------------------------------------------------------------------------
+	// Custom scalar functions (Phase 3). Discovered SQL Server scalar UDFs are
+	// registered as DuckDB catalog scalar functions; these resolve their argument
+	// + return types and execute them, all over Arrow.
+	// -------------------------------------------------------------------------
+
+	// Zero-row Arrow stream whose schema = the function's input parameters (one
+	// field per param, in order); used to register the DuckDB function's arg types.
+	int32_t (*get_function_param_schema)(ArrowNetHandle handle, const char *schema, const char *func,
+	                                     struct ArrowArrayStream *out, char **err);
+
+	// Zero-row Arrow stream whose single field = the scalar function's return type.
+	int32_t (*get_function_return_schema)(ArrowNetHandle handle, const char *schema, const char *func,
+	                                      struct ArrowArrayStream *out, char **err);
+
+	// Execute a scalar function over an input batch: `args` is an N-row stream whose
+	// columns are the argument values (in param order); *out receives an N-row stream
+	// with a single column = the per-row results (typed as the function's return).
+	// The managed side consumes `args`.
+	int32_t (*execute_scalar)(ArrowNetHandle handle, const char *schema, const char *func,
+	                          struct ArrowArrayStream *args, struct ArrowArrayStream *out, char **err);
 } ArrowNetVTable;
 
-#define ARROWNET_ABI_VERSION 18
+#define ARROWNET_ABI_VERSION 19
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

@@ -372,8 +372,12 @@ make                                 # builds DuckDB + the extension (POSIX/CI)
 pwsh scripts/publish-managed.ps1     # publish the bridge beside the extension
 ```
 
-On Windows, build with CMake + Ninja inside a VS dev environment (`vcvars64.bat` — a plain shell fails
-with `Cannot open include file: 'stdint.h'`):
+On Windows, build with CMake + Ninja inside a **VS 18** dev environment — run
+`"C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvars64.bat"` first (a plain
+shell fails to compile with `Cannot open include file: 'stdint.h'`; an older toolset such as VS 2022
+fails at *link* with `unresolved external symbol __std_rotate` / `__std_unique_1`). The `shell` target
+produces `duckdb.exe`; because the extension is statically embedded, rebuild `shell`/`unittest` (not just
+the loadable target) after changing extension code:
 
 ```powershell
 cmake -G Ninja -DEXTENSION_STATIC_BUILD=1 `
@@ -385,9 +389,16 @@ cmake -G Ninja -DEXTENSION_STATIC_BUILD=1 `
 cmake --build build/release --target mssql_net_loadable_extension duckdb shell
 ```
 
-Produces `build/release/extension/mssql_net/mssql_net.duckdb_extension` and a matching `duckdb.exe`.
-Run: `duckdb -unsigned -c "LOAD 'path/to/mssql_net.duckdb_extension'; SELECT ..."`. The bridge is
-located via `ARROWNET_MANAGED_DIR`, else an `arrownet/` folder next to the extension binary.
+Produces `build/release/extension/mssql_net/mssql_net.duckdb_extension` and a `build/release/duckdb.exe`
+that already embeds the extension (no `LOAD` needed). The bridge is located via `ARROWNET_MANAGED_DIR`,
+else an `arrownet/` folder next to the loaded module — `publish-managed.ps1` writes it to
+`build/release/extension/mssql_net/arrownet`, so when running `duckdb.exe` directly set
+`ARROWNET_MANAGED_DIR` to that folder:
+
+```powershell
+$env:ARROWNET_MANAGED_DIR = "$PWD/build/release/extension/mssql_net/arrownet"
+build/release/duckdb.exe -unsigned -c "ATTACH 'mssql://…' AS db (TYPE mssql_net); SELECT …"
+```
 
 ## Layout
 

@@ -115,6 +115,13 @@ void ArrowNetCatalog::LoadCatalog(ClientContext &context) {
 			ensure_schema(table.schema_name).AddTable(table.table_name, table.table_type);
 		}
 	}
+	// Expose discovered scalar UDFs as callable catalog functions (db.schema.func(args)).
+	// Other routine kinds (table functions, procedures) are registered in later phases.
+	for (auto &func : DiscoverFunctions(handle_)) {
+		if (func.kind == "scalar" && filters.MatchSchema(func.schema_name)) {
+			ensure_schema(func.schema_name).AddScalarFunction(func.name);
+		}
+	}
 }
 
 void ArrowNetCatalog::RefreshCache(ClientContext &context) {
@@ -147,6 +154,13 @@ void ArrowNetCatalog::RefreshCache(ClientContext &context) {
 	for (auto &table : DiscoverTables(handle_)) {
 		if (filters.MatchSchema(table.schema_name) && filters.MatchTable(table.table_name)) {
 			ensure_schema(table.schema_name).AddTable(table.table_name, table.table_type);
+		}
+	}
+	// Expose discovered scalar UDFs as callable catalog functions (db.schema.func(args)).
+	// Other routine kinds (table functions, procedures) are registered in later phases.
+	for (auto &func : DiscoverFunctions(handle_)) {
+		if (func.kind == "scalar" && filters.MatchSchema(func.schema_name)) {
+			ensure_schema(func.schema_name).AddScalarFunction(func.name);
 		}
 	}
 }

@@ -77,7 +77,10 @@ current code still uses the single-provider `mssql_net` naming):
   (3) **connstr/auth → C# — DONE** (`build_connection_string` ABI v18: `mssql_net_secret.cpp` reads the
   secret + emits its fields as JSON, `SqlServerBackend.BuildConnectionString` assembles the SqlClient
   connstr; `MapAuthentication`/`QuoteConnValue`/the access-token marker are now C#-only — C++ has no connstr
-  knowledge); (4) dynamic functions (attach-time catalog fns first, then load-time global, then table-in-out).
+  knowledge); (4) dynamic functions — **(4a) function discovery DONE** (`mssql_net_functions(catalog)` table
+  fn + `ARROWNET_META_FUNCTIONS`); **(4b) attach-time catalog-bound scalar UDFs DONE** (discovered scalar
+  UDFs become `ScalarFunctionCatalogEntry` in `ArrowNetSchemaEntry`, resolved as `db.schema.fn(args)` and
+  executed over Arrow — ABI v19); next: table functions, then load-time global, then table-in-out.
 
 ## Implementation status (current)
 
@@ -113,7 +116,8 @@ non-data: error-WORDING/number assertions (corpus expects native-extension text)
 (`mssql_pool_stats`/`mssql_open` diagnostics, krb5 connstr parser), COPY-to-temp-table empty-schema
 syntax, and catalog-after-rollback staleness.
 
-**Not yet / out of scope:** Airport-style custom scalar/table/in-out functions (Phase 3); connection
+**Not yet / out of scope:** Airport-style custom **table** + **table-in-out** functions and **load-time
+global** functions (Phase 3 — scalar UDFs done, see "Callable scalar UDFs (4b)"); connection
 pooling knobs / `mssql_pool_stats` (ADO.NET pools by connstr already); COPY to temp tables
 (`mssql://cat//#t`, `cat..#t` — `ParseTarget` only accepts strict 3-part names); CHECK constraints +
 non-literal/expression DEFAULTs on CREATE; UPDATE/DELETE…RETURNING; length-aware VARCHAR mapping (so
@@ -139,6 +143,33 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
   constraint-violating INSERT fails like a classic INSERT — SqlBulkCopy skips CHECK/FK by default).
   CTAS/COPY pass **false** (bulk-load speed). NOT NULL is still caught client-side by SqlBulkCopy.
 - The legacy `bulk_insert` ABI entry + its `clr_host` wrapper are now unused by C++ (left in place).
+- **ABI v17–v19** entries: `open_catalog(provider, conn, …)` (v17); `build_connection_string(provider,
+  fields_json, …)` (v18); and the **scalar-function trio** (v19): `get_function_param_schema(handle,
+  schema, func, out)` + `get_function_return_schema(…)` (each a zero-row Arrow stream whose schema gives
+  the arg/return `LogicalType`s, via `PopulateReturnSchema`) + `execute_scalar(handle, schema, func, args,
+  out)` (runs the UDF over an N-row arg batch; the managed side consumes `args`).
+
+### Callable scalar UDFs (4b)
+- **Discovery**: `ArrowNetCatalog::LoadCatalog`/`RefreshCache` call `DiscoverFunctions` (reads
+  `ARROWNET_META_FUNCTIONS`, first 3 string cols) and `AddScalarFunction(name)` for every `kind=='scalar'`
+  in a matched schema. Names cached in `ArrowNetSchemaEntry::scalar_functions_`; entries materialized lazily.
+- **Registration**: `ArrowNetSchemaEntry::LookupEntry`/`Scan` now handle `CatalogType::SCALAR_FUNCTION_ENTRY`
+  → `GetOrCreateScalarFunction` fetches the param + return schemas (`FetchFunctionParamSchema` /
+  `FetchFunctionReturnType`), builds a `ScalarFunction` with a **capturing-lambda** callback (no bind/
+  function_info dance — `scalar_function_t` is `std::function`), and caches a `ScalarFunctionCatalogEntry`.
+  Stale-on-fetch self-heals (evict → not-found), like the table path.
+- **Callback**: marshals the arg `DataChunk` → Arrow (`ArrowAppender`+`ArrowProducer`), calls
+  `execute_scalar`, ingests the single-column result via `ArrowStreamReader` + `VectorOperations::Copy`
+  into the result `Vector`. Registered **VOLATILE** (never folded) + **SPECIAL_HANDLING** (sees NULL args —
+  SQL Server semantics).
+- **C# execution** (`SqlServerCatalog.ExecuteScalar`, option **B**): runs chunked, parameterized
+  `SELECT [s].[f](@..) AS result UNION ALL …` — the result column inherits the UDF's return type (correctly
+  typed Arrow, no hand-built array). Chunked to ≤ ~`2000/param_count` rows/query to stay under SQL Server's
+  ~2100-parameter cap. Param/return schemas via typed-NULL `SELECT CAST(NULL AS <type>) …` reconstructed
+  from `INFORMATION_SCHEMA.PARAMETERS` (shared `BuildSqlType` with `ColumnTypeInfo`).
+- **Verified**: `db.dbo.vf_add(1,2)=3`, string returns, NULL handling (`vf_inc(NULL)=0`), and a 5000-row
+  batch summing exactly (exercises 2048-row vectors × the C# param-limit chunking). Strict typing: a
+  BIGINT arg to an `INTEGER` UDF errors (no implicit narrowing) — cast required.
 
 ## C ABI contract (`src/include/arrownet/abi.h`)
 
@@ -146,7 +177,7 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v16.** **Bump rule:** when you add a vtable entry OR change a signature, bump
+- **Current version: ABI v19.** **Bump rule:** when you add a vtable entry OR change a signature, bump
   **BOTH** `ARROWNET_ABI_VERSION` in `abi.h` AND `vtable->AbiVersion = N` in `Bootstrap.Initialize`,
   else the host throws "ABI version mismatch". Adding an *enum value* (e.g. a new metadata/alter kind)
   is additive and needs NO bump.
@@ -160,10 +191,25 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
   to `duckdb@08e34c4` (v1.5.4) + `extension-ci-tools@v1.5.3` (no 1.5.4 branch exists; v1.5.3 is the
   latest tooling for the 1.5.x line). `duckdb` is a **shallow** clone — bump via
   `git -C duckdb fetch --depth 1 origin <sha> && git -C duckdb checkout <sha>`.
-- **Windows build needs the VS dev env** — a plain shell fails with `Cannot open include file: 'stdint.h'`.
-  Use vcvars (`C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvars64.bat`).
-  Incremental rebuild of the test binary:
-  `cmd /c '"…\vcvars64.bat" && cmake --build build/release --target unittest'`.
+- **Windows build needs the VS dev env** — a plain shell fails at *compile* with `Cannot open include
+  file: 'stdint.h'`. **Use the VS 18 vcvars, NOT VS 2022:**
+  `C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvars64.bat`. The build is
+  configured against the VS 18 toolset (`…/VC/Tools/MSVC/14.50.35717`, see `CMAKE_CXX_COMPILER` in
+  `build/release/CMakeCache.txt`); linking with an older toolset (VS 2022 = `14.44.x`) **fails at link**
+  with `unresolved external symbol __std_find_first_not_of_trivial_pos_1` / `__std_rotate` /
+  `__std_unique_1` — newer STL vectorized-algorithm intrinsics that `duckdb_static.lib` references but the
+  older vcruntime lacks. Run every cmake/ninja command inside that vcvars shell, e.g.
+  `cmd /c '"…\18\…\vcvars64.bat" && cmake --build build/release --target <target>'`.
+- **Targets → binaries** (`EXTENSION_STATIC_BUILD=1` ⇒ the extension is statically embedded in BOTH exes
+  *and* built loadable):
+  - `shell` → `build/release/duckdb.exe` (interactive shell; **embeds** the extension).
+  - `unittest` → `build/release/test/unittest.exe` (runs the `.test` suites; **embeds** the extension).
+  - `mssql_net_loadable_extension` → `build/release/extension/mssql_net/mssql_net.duckdb_extension`
+    (the loadable; only matters when `LOAD`-ing into a duckdb that does NOT embed it — rarely, here).
+  - `cmake --build build/release` (no `--target`) builds all of them.
+  - **After changing C++ extension code, rebuild the target whose binary you'll run.** Building only
+    `mssql_net_loadable_extension` then running `duckdb.exe`/`unittest.exe` runs the STALE embedded copy
+    (a `LOAD '<path>'` is then a no-op). This is the #1 "my change didn't take" trap.
 - Full configure (first time), run inside vcvars64:
   `cmake -G Ninja -DEXTENSION_STATIC_BUILD=1 -DDUCKDB_EXTENSION_CONFIGS=<repo>/extension_config.cmake
   -DDUCKDB_EXPLICIT_PLATFORM=windows_amd64 -DENABLE_EXTENSION_AUTOLOADING=1
@@ -173,9 +219,13 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
 - **Managed publish:** `pwsh scripts/publish-managed.ps1` → publishes `ArrowNet.SqlServer` (+ Bridge +
   self-contained .NET 10 runtime) into `build/release/extension/mssql_net/arrownet/`. A C#-only change
   needs only a republish (no C++ rebuild) unless an ABI signature changed.
-- **`EXTENSION_STATIC_BUILD=1` caveat:** the extension is statically linked into `duckdb.exe`/
-  `unittest.exe` AND built loadable; after changing extension code rebuild the **`unittest`**/`shell`
-  target (relinks the binary) — `LOAD '<path>'` is a no-op when the binary already embeds it.
+- **Managed-dir resolution gotcha:** `clr_host` looks for the bridge in `ARROWNET_MANAGED_DIR`, else an
+  `arrownet/` folder *next to the loaded module*. For the static `duckdb.exe`/`unittest.exe` the module IS
+  the exe, so the default lookup is `build/release/arrownet` (next to `duckdb.exe`) — but
+  `publish-managed.ps1` lands the bridge in `build/release/extension/mssql_net/arrownet`. So when running
+  an exe **directly** you MUST set `ARROWNET_MANAGED_DIR` to that publish dir (symptom otherwise:
+  `ArrowNet: failed to load hostfxr from …\build\release\arrownet\hostfxr.dll`). Manual smoke, e.g.:
+  `ARROWNET_MANAGED_DIR=…/extension/mssql_net/arrownet build/release/duckdb.exe -unsigned -batch < q.sql`.
 - **CoreCLR hosting:** init via `hostfxr_initialize_for_dotnet_command_line` (argv[0] =
   `ArrowNet.Bridge.dll`) then `hdt_load_assembly_and_get_function_pointer`.
   `hostfxr_initialize_for_runtime_config` FAILS for self-contained deployments. The bridge finds its

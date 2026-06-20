@@ -150,4 +150,24 @@ void PushBatch(ArrowNetHandle session, ArrowArray &batch);
 // query. Frees the session; the handle is invalid afterwards.
 int64_t CompleteBulk(ArrowNetHandle session, bool abort);
 
+// -----------------------------------------------------------------------------
+// Custom scalar functions. Discovered SQL Server scalar UDFs are exposed as DuckDB
+// catalog scalar functions; these resolve their arg/return types and run them.
+// -----------------------------------------------------------------------------
+
+// Zero-row Arrow stream whose schema = the function's input parameters (one field
+// per param, in order). Used to register the DuckDB function's argument types.
+void GetFunctionParamSchema(ArrowNetHandle handle, const std::string &schema, const std::string &func,
+                            ArrowArrayStream &out);
+
+// Zero-row Arrow stream whose single field = the scalar function's return type.
+void GetFunctionReturnSchema(ArrowNetHandle handle, const std::string &schema, const std::string &func,
+                             ArrowArrayStream &out);
+
+// Execute a scalar function over an input batch: `args` is an N-row stream of the
+// argument columns (in param order; consumed by the managed side); fills `out` with
+// an N-row, single-column stream of the per-row results.
+void ExecuteScalar(ArrowNetHandle handle, const std::string &schema, const std::string &func, ArrowArrayStream &args,
+                   ArrowArrayStream &out);
+
 } // namespace arrownet

@@ -31,6 +31,25 @@ vector<string> DiscoverSchemas(ArrowNetHandle handle);
 //! Discovers user tables + views across all schemas.
 vector<ArrowNetTableInfo> DiscoverTables(ArrowNetHandle handle);
 
+//! A discovered SQL Server routine (function or procedure).
+struct ArrowNetFunctionInfo {
+	string schema_name;
+	string name;
+	string kind; // "scalar" | "table" | "proc" | "other"
+};
+
+//! Discovers user functions/procedures across all schemas (kind per ArrowNetFunctionInfo).
+vector<ArrowNetFunctionInfo> DiscoverFunctions(ArrowNetHandle handle);
+
+//! Resolves a scalar function's parameter names + DuckDB types from the Arrow schema of
+//! its (zero-row) param-schema stream — reuses the C# type mapping, no duplicate logic.
+void FetchFunctionParamSchema(ClientContext &context, ArrowNetHandle handle, const string &schema_name,
+                              const string &func_name, vector<string> &names, vector<LogicalType> &types);
+
+//! Resolves a scalar function's return type from its (single-field) return-schema stream.
+LogicalType FetchFunctionReturnType(ClientContext &context, ArrowNetHandle handle, const string &schema_name,
+                                    const string &func_name);
+
 //! Resolves a table's column names + DuckDB types from the Arrow schema of the
 //! COLUMNS metadata stream (a zero-row result; reuses the C# type mapping, no
 //! duplicate type logic in C++).

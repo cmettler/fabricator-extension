@@ -94,6 +94,44 @@ vector<ArrowNetTableInfo> DiscoverTables(ArrowNetHandle handle) {
 	return tables;
 }
 
+vector<ArrowNetFunctionInfo> DiscoverFunctions(ArrowNetHandle handle) {
+	ArrowArrayStream stream;
+	std::memset(&stream, 0, sizeof(stream));
+	arrownet::GetMetadata(handle, ARROWNET_META_FUNCTIONS, "", "", stream);
+	// Columns: schema_name, name, kind, [param_count (int), return_type]. We read only
+	// the first three string columns here; the trailing columns are ignored.
+	auto rows = ReadStringTable(stream, 3);
+	vector<ArrowNetFunctionInfo> funcs;
+	for (idx_t i = 0; i < rows[0].size(); i++) {
+		funcs.push_back({rows[0][i], rows[1][i], rows[2][i]});
+	}
+	return funcs;
+}
+
+void FetchFunctionParamSchema(ClientContext &context, ArrowNetHandle handle, const string &schema_name,
+                              const string &func_name, vector<string> &names, vector<LogicalType> &types) {
+	arrownet::ArrowStreamBindData bind_data;
+	bind_data.factory = [handle, schema_name, func_name](const arrownet::ArrowScanRequest &, ArrowArrayStream &out) {
+		arrownet::GetFunctionParamSchema(handle, schema_name, func_name, out);
+	};
+	arrownet::PopulateReturnSchema(context, bind_data, types, names);
+}
+
+LogicalType FetchFunctionReturnType(ClientContext &context, ArrowNetHandle handle, const string &schema_name,
+                                    const string &func_name) {
+	arrownet::ArrowStreamBindData bind_data;
+	bind_data.factory = [handle, schema_name, func_name](const arrownet::ArrowScanRequest &, ArrowArrayStream &out) {
+		arrownet::GetFunctionReturnSchema(handle, schema_name, func_name, out);
+	};
+	vector<string> names;
+	vector<LogicalType> types;
+	arrownet::PopulateReturnSchema(context, bind_data, types, names);
+	if (types.empty()) {
+		throw InvalidInputException("mssql_net: function '%s.%s' has no scalar return type", schema_name, func_name);
+	}
+	return types[0];
+}
+
 vector<string> FetchRowIdColumns(ArrowNetHandle handle, const string &schema_name, const string &table_name) {
 	// The managed side picks the PK (else the smallest unique index) and returns
 	// its columns in key order.

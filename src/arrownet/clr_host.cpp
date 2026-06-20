@@ -442,6 +442,45 @@ void GetMetadata(ArrowNetHandle handle, int32_t kind, const std::string &arg1, c
 	}
 }
 
+void GetFunctionParamSchema(ArrowNetHandle handle, const std::string &schema, const std::string &func,
+                            ArrowArrayStream &out) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.get_function_param_schema) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide get_function_param_schema");
+	}
+	char *err = nullptr;
+	int32_t rc = vt.get_function_param_schema(handle, schema.c_str(), func.c_str(), &out, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: get_function_param_schema failed");
+	}
+}
+
+void GetFunctionReturnSchema(ArrowNetHandle handle, const std::string &schema, const std::string &func,
+                             ArrowArrayStream &out) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.get_function_return_schema) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide get_function_return_schema");
+	}
+	char *err = nullptr;
+	int32_t rc = vt.get_function_return_schema(handle, schema.c_str(), func.c_str(), &out, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: get_function_return_schema failed");
+	}
+}
+
+void ExecuteScalar(ArrowNetHandle handle, const std::string &schema, const std::string &func, ArrowArrayStream &args,
+                   ArrowArrayStream &out) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.execute_scalar) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide execute_scalar");
+	}
+	char *err = nullptr;
+	int32_t rc = vt.execute_scalar(handle, schema.c_str(), func.c_str(), &args, &out, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: execute_scalar failed");
+	}
+}
+
 void ScanTable(ArrowNetHandle handle, const std::string &schema, const std::string &table, const std::string &spec_json,
                ArrowArrayStream *filter_values, ArrowArrayStream &out) {
 	const ArrowNetVTable &vt = GetBridge();
