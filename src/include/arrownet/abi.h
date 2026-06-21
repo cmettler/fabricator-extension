@@ -351,9 +351,13 @@ typedef struct ArrowNetVTable {
 
 	// Open a session. `input_schema` = the Arrow schema of the input table (its columns
 	// are the function's positional parameters; the managed side consumes/releases it).
-	// Returns an opaque session handle in *out_session.
+	// `isolation` (nullable/empty => provider default) names the SQL transaction isolation
+	// level for the session's pinned connection ("read committed"/"snapshot"/"repeatable
+	// read"/"serializable"/"read uncommitted") — gives a consistent view across the per-chunk
+	// queries of one in-out call. Returns an opaque session handle in *out_session.
 	int32_t (*inout_open)(ArrowNetHandle handle, const char *schema, const char *func,
-	                      struct ArrowSchema *input_schema, ArrowNetHandle *out_session, char **err);
+	                      struct ArrowSchema *input_schema, const char *isolation, ArrowNetHandle *out_session,
+	                      char **err);
 
 	// Push one input chunk (consumed/released by the managed side); fill *out with the
 	// output rows available so far (may be empty). Backpressured.
@@ -367,7 +371,7 @@ typedef struct ArrowNetVTable {
 	int32_t (*inout_abort)(ArrowNetHandle session, char **err);
 } ArrowNetVTable;
 
-#define ARROWNET_ABI_VERSION 23
+#define ARROWNET_ABI_VERSION 24
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

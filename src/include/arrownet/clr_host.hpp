@@ -195,9 +195,10 @@ void ExecuteProc(ArrowNetHandle handle, const std::string &schema, const std::st
 
 // Open a session for `schema.func` over an input table described by `input_schema`
 // (its columns are the function's positional params; consumed by the managed side).
-// Returns an opaque session handle to push into / finish / abort.
+// `isolation` (empty => provider default) sets the SQL transaction isolation level for the
+// session's pinned connection. Returns an opaque session handle to push into / finish / abort.
 ArrowNetHandle InOutOpen(ArrowNetHandle handle, const std::string &schema, const std::string &func,
-                         ArrowSchema &input_schema);
+                         ArrowSchema &input_schema, const std::string &isolation);
 
 // Push one input chunk (the managed side imports + releases it); fills `out` with the
 // output rows available so far (may be empty). Blocks for backpressure.

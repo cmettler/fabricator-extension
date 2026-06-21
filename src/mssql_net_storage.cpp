@@ -85,6 +85,7 @@ static unique_ptr<Catalog> MssqlNetAttach(optional_ptr<StorageExtensionInfo> sto
 	string secret_name;
 	string schema_filter;
 	string table_filter;
+	string isolation_level; // default SQL transaction isolation level for table-in-out sessions
 	string provider; // which registered backend handles this catalog (empty => default)
 	for (auto it = options.options.begin(); it != options.options.end();) {
 		auto lower = StringUtil::Lower(it->first);
@@ -96,6 +97,10 @@ static unique_ptr<Catalog> MssqlNetAttach(optional_ptr<StorageExtensionInfo> sto
 			continue;
 		} else if (lower == "table_filter") {
 			table_filter = it->second.ToString();
+			it = options.options.erase(it);
+			continue;
+		} else if (lower == "isolation_level") {
+			isolation_level = it->second.ToString();
 			it = options.options.erase(it);
 			continue;
 		} else if (lower == "provider") {
@@ -150,6 +155,7 @@ static unique_ptr<Catalog> MssqlNetAttach(optional_ptr<StorageExtensionInfo> sto
 		auto handle = arrownet::OpenCatalog(connection_string, provider);
 		auto catalog = make_uniq<ArrowNetCatalog>(db, name, handle, RedactConnectionString(connection_string));
 		catalog->SetCatalogFilters(schema_filter, table_filter);
+		catalog->SetIsolationLevel(isolation_level);
 		catalog->LoadCatalog(context); // discover schemas + tables (also validates the connection)
 		return std::move(catalog);
 	} catch (const std::exception &ex) {

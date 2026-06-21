@@ -97,6 +97,13 @@ static void RegisterCompatSettings(DBConfig &config) {
 	}
 	add("mssql_ctas_text_type", LogicalType::VARCHAR);
 
+	// SQL transaction isolation level for table-in-out sessions (e.g. "snapshot",
+	// "repeatable read", "serializable"), giving a consistent view across one in-out
+	// call. Overrides the ATTACH isolation_level option per-session. Empty => provider default.
+	config.AddExtensionOption("mssql_isolation_level",
+	                          "mssql_net: SQL transaction isolation level for table-in-out sessions",
+	                          LogicalType::VARCHAR);
+
 	// The INSERT knobs carry real defaults (so current_setting() reads them) and the
 	// numeric ones validate `>= 1` on SET — parity with the C++ mssql extension.
 	config.AddExtensionOption("mssql_insert_batch_size", "mssql_net: max rows per INSERT statement",

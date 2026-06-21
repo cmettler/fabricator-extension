@@ -7,6 +7,7 @@
 #include "arrownet/arrow_ingest.hpp"
 #include "arrownet/arrow_produce.hpp"
 #include "arrownet/clr_host.hpp"
+#include "catalog/arrownet_catalog.hpp"
 #include "catalog/arrownet_metadata.hpp"
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
@@ -241,7 +242,8 @@ struct ArrowNetTableFunctionInfo : public TableFunctionInfo {
 	string func;
 	vector<LogicalType> arg_types;
 	vector<string> arg_names;
-	bool is_proc = false; // stored procedure (EXEC, no pushdown) vs TVF (FROM, pushdown)
+	bool is_proc = false;    // stored procedure (EXEC, no pushdown) vs TVF (FROM, pushdown)
+	string attach_isolation; // ATTACH isolation_level default for this catalog (in-out only; empty => none)
 };
 
 // Bind a catalog-bound TVF: resolve the (fixed) output schema for the return types, then
@@ -376,11 +378,28 @@ struct ArrowNetInOutBindData : public TableFunctionData {
 	string func;
 	vector<LogicalType> input_types; // input parameter-table columns (= the TVF's positional params)
 	vector<string> input_names;
+	//! Effective SQL transaction isolation level for the session (SET mssql_isolation_level ?? the ATTACH
+	//! isolation_level default ?? empty). Resolved at bind; passed to inout_open. Gives a consistent view
+	//! across the per-chunk queries of one in-out call.
+	string isolation;
 	//! Per-execution managed session, opened in init_global, pushed by in_out_function, finished by the
 	//! injected OperatorFinalize / released by the holder destructor. shared_ptr so the injected operator
 	//! can hold the same session.
 	shared_ptr<InOutSessionHolder> session_holder;
 };
+
+// Resolves the effective isolation level for an in-out session: the `mssql_isolation_level` session
+// setting if set, else the catalog's ATTACH `isolation_level` default, else empty (provider default).
+string ResolveInOutIsolation(ClientContext &context, const string &attach_isolation) {
+	Value setting;
+	if (context.TryGetCurrentSetting("mssql_isolation_level", setting) && !setting.IsNull()) {
+		string s = setting.ToString();
+		if (!s.empty()) {
+			return s;
+		}
+	}
+	return attach_isolation;
+}
 
 struct ArrowNetInOutGlobalState : public GlobalTableFunctionState {
 	idx_t MaxThreads() const override {
@@ -436,6 +455,7 @@ unique_ptr<FunctionData> ArrowNetInOutBind(ClientContext &context, TableFunction
 	bind_data->handle = info.handle;
 	bind_data->schema = info.schema;
 	bind_data->func = info.func;
+	bind_data->isolation = ResolveInOutIsolation(context, info.attach_isolation);
 	bind_data->session_holder = make_shared_ptr<InOutSessionHolder>();
 
 	// 1) The input parameter columns lead the output (p.* in the CROSS APPLY). C# casts the
@@ -464,6 +484,7 @@ unique_ptr<FunctionData> ArrowNetCustomInOutBind(ClientContext &context, TableFu
 	bind_data->handle = info.handle;
 	bind_data->schema = info.schema;
 	bind_data->func = info.func;
+	bind_data->isolation = ResolveInOutIsolation(context, info.attach_isolation);
 	bind_data->session_holder = make_shared_ptr<InOutSessionHolder>();
 	for (idx_t i = 0; i < input.input_table_types.size(); i++) {
 		bind_data->input_types.push_back(input.input_table_types[i]);
@@ -489,7 +510,7 @@ unique_ptr<GlobalTableFunctionState> ArrowNetInOutInitGlobal(ClientContext &cont
 		holder.session = nullptr;
 	}
 	holder.finished = false;
-	holder.session = arrownet::InOutOpen(bind.handle, bind.schema, bind.func, input_schema);
+	holder.session = arrownet::InOutOpen(bind.handle, bind.schema, bind.func, input_schema, bind.isolation);
 	return make_uniq<ArrowNetInOutGlobalState>();
 }
 
@@ -644,6 +665,7 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateInOutFunction(ClientC
 	fn_info->arg_types = arg_types;
 	fn_info->arg_names = arg_names;
 	fn_info->is_proc = false;
+	fn_info->attach_isolation = catalog.Cast<ArrowNetCatalog>().GetIsolationLevel();
 	inout.function_info = std::move(fn_info);
 
 	CreateTableFunctionInfo info(std::move(inout));
@@ -669,6 +691,7 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateCustomInOutFunction(C
 	fn_info->schema = name;
 	fn_info->func = func_name;
 	fn_info->is_proc = false;
+	fn_info->attach_isolation = catalog.Cast<ArrowNetCatalog>().GetIsolationLevel();
 	inout.function_info = std::move(fn_info);
 
 	CreateTableFunctionInfo info(std::move(inout));

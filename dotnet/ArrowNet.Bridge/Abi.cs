@@ -103,8 +103,8 @@ public unsafe struct ArrowNetVTable
     // int32 execute_proc(void* handle, const char* schema, const char* func, ArrowArrayStream* args, ArrowArrayStream* out, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, CArrowArrayStream*, byte**, int> ExecuteProc;
 
-    // int32 inout_open(void* handle, const char* schema, const char* func, ArrowSchema* input_schema, void** out_session, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowSchema*, nint*, byte**, int> InOutOpen;
+    // int32 inout_open(void* handle, const char* schema, const char* func, ArrowSchema* input_schema, const char* isolation, void** out_session, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowSchema*, byte*, nint*, byte**, int> InOutOpen;
 
     // int32 inout_push(void* session, ArrowArray* in_chunk, ArrowArrayStream* out, char** err)
     public delegate* unmanaged[Cdecl]<nint, CArrowArray*, CArrowArrayStream*, byte**, int> InOutPush;

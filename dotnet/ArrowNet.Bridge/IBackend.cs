@@ -127,9 +127,11 @@ public interface IBackendCatalog : IDisposable
     /// Opens a table-in-out session for <c>schema.func</c> over an input table of the given
     /// <paramref name="inputSchema"/> (its columns are the function's positional parameters). The session
     /// applies the function once per input row (e.g. CROSS APPLY a TVF over the parameter table) and
-    /// streams output back. See <see cref="IInOutSession"/>.
+    /// streams output back. <paramref name="isolationLevel"/> (empty => provider default) names the SQL
+    /// transaction isolation level for the session's pinned connection, for a consistent view across the
+    /// in-out call. See <see cref="IInOutSession"/>.
     /// </summary>
-    IInOutSession InOutOpen(string schemaName, string functionName, Schema inputSchema);
+    IInOutSession InOutOpen(string schemaName, string functionName, Schema inputSchema, string isolationLevel);
 
     /// <summary>
     /// Creates a table whose columns are described by <paramref name="columns"/>

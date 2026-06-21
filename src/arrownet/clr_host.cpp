@@ -522,14 +522,14 @@ void ExecuteProc(ArrowNetHandle handle, const std::string &schema, const std::st
 }
 
 ArrowNetHandle InOutOpen(ArrowNetHandle handle, const std::string &schema, const std::string &func,
-                         ArrowSchema &input_schema) {
+                         ArrowSchema &input_schema, const std::string &isolation) {
 	const ArrowNetVTable &vt = GetBridge();
 	if (!vt.inout_open) {
 		throw duckdb::IOException("ArrowNet: bridge does not provide inout_open");
 	}
 	ArrowNetHandle session = nullptr;
 	char *err = nullptr;
-	int32_t rc = vt.inout_open(handle, schema.c_str(), func.c_str(), &input_schema, &session, &err);
+	int32_t rc = vt.inout_open(handle, schema.c_str(), func.c_str(), &input_schema, isolation.c_str(), &session, &err);
 	if (rc != ARROWNET_OK) {
 		ThrowManagedError(vt, err, "ArrowNet: inout_open failed");
 	}

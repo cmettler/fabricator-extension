@@ -25,7 +25,7 @@ public static unsafe class Bootstrap
             return ArrowNetStatus.InvalidArgument;
         }
 
-        vtable->AbiVersion = 23;
+        vtable->AbiVersion = 24;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -707,8 +707,8 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int InOutOpen(nint handle, byte* schema, byte* func, CArrowSchema* inputSchema, nint* outSession,
-                                 byte** err)
+    private static int InOutOpen(nint handle, byte* schema, byte* func, CArrowSchema* inputSchema, byte* isolation,
+                                 nint* outSession, byte** err)
     {
         try
         {
@@ -720,7 +720,8 @@ public static unsafe class Bootstrap
             var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty);
             var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
-            *outSession = Handles.Alloc(catalog.InOutOpen(s, f, arrowSchema));
+            var iso = Marshal.PtrToStringUTF8((nint)isolation) ?? string.Empty;
+            *outSession = Handles.Alloc(catalog.InOutOpen(s, f, arrowSchema, iso));
             return ArrowNetStatus.Ok;
         }
         catch (Exception ex)

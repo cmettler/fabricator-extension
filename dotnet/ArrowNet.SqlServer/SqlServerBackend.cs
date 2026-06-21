@@ -1402,16 +1402,57 @@ public sealed class SqlServerCatalog : IBackendCatalog
     // input columns are the function's positional params). The C++ in_out_function operator pushes each
     // input chunk; that chunk's CROSS APPLY runs synchronously and its full output is returned (no lagging
     // tail), so output emission never depends on detecting the last parallel input branch.
-    public IInOutSession InOutOpen(string schemaName, string functionName, Schema inputSchema)
+    public IInOutSession InOutOpen(string schemaName, string functionName, Schema inputSchema, string isolationLevel)
     {
         // A provider-authored custom in-out (4g, pure C#) shadows a same-named SQL object — run it through
         // the operator's session contract instead of generating CROSS APPLY. A fresh instance per session
-        // (the function may be stateful across its input stream).
+        // (the function may be stateful across its input stream). Custom functions run in C#, so the SQL
+        // isolation level does not apply to them.
         if (CustomInOut.TryGetValue($"{schemaName}.{functionName}", out var customFactory))
         {
             return new CustomInOutSessionImpl(customFactory(), inputSchema);
         }
-        return new InOutSessionImpl(this, schemaName, functionName, inputSchema);
+        return new InOutSessionImpl(this, schemaName, functionName, inputSchema, isolationLevel);
+    }
+
+    // Maps an isolation_level string (ATTACH option / SET mssql_isolation_level) to ADO.NET. Empty =>
+    // Unspecified (connection/provider default); a genuinely unknown name throws.
+    private static IsolationLevel ParseIsolationLevel(string? level)
+    {
+        switch ((level ?? string.Empty).Trim().ToLowerInvariant().Replace(" ", string.Empty))
+        {
+            case "":
+                return IsolationLevel.Unspecified;
+            case "readuncommitted":
+                return IsolationLevel.ReadUncommitted;
+            case "readcommitted":
+                return IsolationLevel.ReadCommitted;
+            case "repeatableread":
+                return IsolationLevel.RepeatableRead;
+            case "serializable":
+                return IsolationLevel.Serializable;
+            case "snapshot":
+                return IsolationLevel.Snapshot;
+            default:
+                throw new ArgumentException(
+                    $"mssql_net: unknown isolation level '{level}' (expected read uncommitted / read committed / " +
+                    "repeatable read / serializable / snapshot)");
+        }
+    }
+
+    // Begin the transaction scope for a table-in-out call: open a dedicated connection and begin one
+    // transaction at the requested isolation so all per-chunk queries share one consistent view, committed
+    // at the in-out's finish / rolled back on abort. Uses an ADO.NET SqlTransaction (MARS-compatible — a
+    // raw BEGIN TRANSACTION can't span batches under the forced MARS). NOTE: independent of any surrounding
+    // DuckDB transaction — a per-row stored proc that must participate in DuckDB's BEGIN/COMMIT (write
+    // atomicity) will instead reuse the catalog's pinned transaction; that path is added with proc support.
+    internal (SqlConnection connection, SqlTransaction transaction) BeginInOutScope(string isolation)
+    {
+        var connection = OpenConnection();
+        connection.Open();
+        var level = ParseIsolationLevel(isolation);
+        var txn = level == IsolationLevel.Unspecified ? connection.BeginTransaction() : connection.BeginTransaction(level);
+        return (connection, txn);
     }
 
     // Session for a custom C#-authored table-in-out (IArrowTableInOutFunction). The C++ operator pushes
@@ -1493,10 +1534,17 @@ public sealed class SqlServerCatalog : IBackendCatalog
         private readonly ConcurrentQueue<RecordBatch> _ready = new();
         private readonly object _lock = new();
         private bool _aborted;
+        // One pinned connection + transaction for the whole in-out call, so all per-chunk CROSS APPLY queries
+        // share one consistent view (the configured isolation). Committed at finish / rolled back on abort;
+        // the connection + transaction are disposed on abort (the final teardown).
+        private readonly SqlConnection _conn;
+        private readonly SqlTransaction _txn;
+        private bool _scopeClosed;
 
         public Schema InputSchema => _inputSchema;
 
-        public InOutSessionImpl(SqlServerCatalog owner, string schemaName, string functionName, Schema inputSchema)
+        public InOutSessionImpl(SqlServerCatalog owner, string schemaName, string functionName, Schema inputSchema,
+                                string isolation)
         {
             _owner = owner;
             _qualified = Quote(schemaName) + "." + Quote(functionName);
@@ -1528,6 +1576,8 @@ public sealed class SqlServerCatalog : IBackendCatalog
             {
                 _outputSchema = new Schema(pFields.Concat(os.Schema.FieldsList), metadata: null);
             }
+            // Open the pinned connection + transaction last: if anything above throws, no connection leaks.
+            (_conn, _txn) = owner.BeginInOutScope(isolation);
         }
 
         // Run this chunk's CROSS APPLY to completion and stash its full output (synchronous: no lagging
@@ -1561,20 +1611,45 @@ public sealed class SqlServerCatalog : IBackendCatalog
             return new InMemoryArrayStream(_outputSchema, list);
         }
 
-        // No tail (output is fully produced per Push), so finishing just drains anything not yet pulled.
-        // The clean-finish / commit signal is the operator's job (OperatorFinalize); for a read-only TVF
-        // CROSS APPLY there is nothing to commit.
-        public IArrowArrayStream Finish() => DrainReady();
+        // Clean finish: commit the in-out's transaction. For a read-only TVF a commit just releases the
+        // (snapshot) view; the connection + transaction are disposed on abort (the final teardown). Then
+        // drain any leftover.
+        public IArrowArrayStream Finish()
+        {
+            lock (_lock)
+            {
+                if (!_scopeClosed)
+                {
+                    _scopeClosed = true;
+                    _txn.Commit();
+                }
+            }
+            return DrainReady();
+        }
 
         public void Abort()
         {
             lock (_lock)
             {
                 _aborted = true;
+                if (!_scopeClosed)
+                {
+                    _scopeClosed = true;
+                    try
+                    {
+                        _txn.Rollback();
+                    }
+                    catch
+                    {
+                        // best-effort: the transaction may already be doomed (e.g. a row EXEC failed)
+                    }
+                }
                 while (_ready.TryDequeue(out var b))
                 {
                     b.Dispose();
                 }
+                _txn.Dispose();
+                _conn.Dispose();
             }
         }
 
@@ -1626,7 +1701,14 @@ public sealed class SqlServerCatalog : IBackendCatalog
                 }
                 sb.Append(") AS f");
 
-                using var res = _owner.ExecuteQuery(sb.ToString(), sqlParams);
+                // Run on the session's pinned connection + transaction (consistent view across all chunks).
+                var command = _conn.CreateCommand();
+                command.CommandText = sb.ToString();
+                command.CommandType = CommandType.Text;
+                command.Transaction = _txn;
+                AddParameters(command, sqlParams);
+                var reader = command.ExecuteReader();
+                using var res = new DbDataReaderArrowStream(_conn, command, reader, ownsConnection: false);
                 while (true)
                 {
                     var b = res.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();

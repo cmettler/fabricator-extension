@@ -202,12 +202,14 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
   @p0,…` over the 1-row positional args, `out` = the proc's first result set. No `spec_json` (a proc's EXEC
   isn't inline-wrappable → no pushdown). Procs reuse `get_function_param_schema` (input params) +
   `get_function_output_schema` (which auto-detects proc vs TVF — `sp_describe` vs `ROUTINE_COLUMNS`).
-- **ABI v23** entries (table-in-out, 4g): `inout_open(handle, schema, func, input_schema, *out_session)`
-  (input table columns = the TVF's positional params; managed side consumes the schema) + `inout_push(session,
-  in_chunk, out)` (out = output ready so far) + `inout_finish(session, out)` (out = the entire remaining tail)
-  + `inout_abort(session)` (frees the session handle; idempotent). The managed `InOutSessionImpl` is a
-  bounded-channel CROSS APPLY consumer; `inout_abort` (not `inout_finish`) frees the GCHandle, so the C++
-  global-state destructor always calls it. See "Callable table-in-out (4g)" below + design §11.1.
+- **ABI v23/v24** entries (table-in-out, 4g): `inout_open(handle, schema, func, input_schema, isolation,
+  *out_session)` (input table columns = the TVF's positional params; managed side consumes the schema;
+  `isolation` added at v24 — the session opens ONE transaction at that SQL isolation level so all its
+  per-chunk queries share a consistent view; from `SET mssql_isolation_level` ?? the ATTACH `isolation_level`
+  option) + `inout_push(session, in_chunk, out)` (runs that chunk's CROSS APPLY synchronously; `out` = its
+  full output) + `inout_finish(session, out)` (commit; `out` empty in the synchronous model) +
+  `inout_abort(session)` (rollback + frees the GCHandle; idempotent). `inout_abort` (not `inout_finish`)
+  frees the handle, so the C++ holder destructor always calls it. See "Callable table-in-out (4g)" below.
 
 ### Callable scalar UDFs (4b)
 - **Discovery**: `ArrowNetCatalog::LoadCatalog`/`RefreshCache` call `DiscoverFunctions` (reads
@@ -353,6 +355,16 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
   drains leftovers (no tail), `Abort` releases. `RunCrossApply` builds
   `SELECT p.*, f.* FROM (VALUES (CAST(@.. AS <paramtype>),…)) p(cols) CROSS APPLY [s].[tf](p.cols) f`,
   sub-chunked under the ~2100-param cap. A CROSS APPLY error throws out of `Push`/`inout_push` → fails the query.
+- **Isolation / consistent view**: the in-out session opens ONE SQL transaction (ADO.NET `SqlTransaction`,
+  MARS-compatible) wrapping all its per-chunk CROSS APPLY queries, at a configurable isolation level — so a
+  call sees one consistent snapshot even if another process modifies the data between chunks. Level from the
+  ATTACH `isolation_level` option (per-catalog default, `ArrowNetCatalog::isolation_level_`) overridable by
+  `SET mssql_isolation_level` (resolved in C++ `ResolveInOutIsolation`, passed via `inout_open`'s v24
+  `isolation` arg). `SqlServerCatalog.BeginInOutScope` maps it (`read uncommitted`/`read committed`/
+  `repeatable read`/`serializable`/`snapshot`; snapshot needs `ALLOW_SNAPSHOT_ISOLATION ON`); `Finish`
+  commits, `Abort`/destructor rolls back. (Custom C# in-out functions run in C#, so isolation doesn't apply.)
+  Verified: `test/verify_inout_isolation.test` (a TVF reporting `transaction_isolation_level`, run via
+  `_each`, shows the configured level; ATTACH default + SET override + unknown-name error).
 - **Verified**: `test/verify_table_inout.test` (63 assertions) — scalar-arg regression, single-chunk,
   parallel `UNION ALL` (coherent), `WHERE`, `ORDER BY`+`LIMIT`, aggregate, empty, multi-column, large
   50-row `BIGINT`→`INT` (sub-chunking + type round-trip), error mid-stream + recovery.
@@ -395,7 +407,9 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v23.** **Bump rule:** when you add a vtable entry OR change a signature, bump
+- **Current version: ABI v24** (`inout_open` gained an `isolation` arg at v24 — the in-out session runs
+  its per-chunk CROSS APPLY in one transaction at that SQL isolation level for a consistent view).
+  **Bump rule:** when you add a vtable entry OR change a signature, bump
   **BOTH** `ARROWNET_ABI_VERSION` in `abi.h` AND `vtable->AbiVersion = N` in `Bootstrap.Initialize`,
   else the host throws "ABI version mismatch". Adding an *enum value* (e.g. a new metadata/alter kind)
   is additive and needs NO bump.

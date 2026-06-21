@@ -41,6 +41,16 @@ public:
 		return handle_;
 	}
 
+	//! Sets the default SQL transaction isolation level for sessions opened against this catalog
+	//! (the ATTACH `isolation_level` option; e.g. "snapshot"). Empty => provider default. A
+	//! `SET mssql_isolation_level` overrides it per-session. Used by table-in-out sessions.
+	void SetIsolationLevel(string isolation_level) {
+		isolation_level_ = std::move(isolation_level);
+	}
+	const string &GetIsolationLevel() const {
+		return isolation_level_;
+	}
+
 	//! The catalog-type string identifying an attached catalog as ours (the provider
 	//! identity — becomes generic in the multi-provider rename). Centralized so the
 	//! "is this our catalog?" checks don't repeat the literal.
@@ -80,6 +90,8 @@ private:
 	//! Catalog visibility filters (icase regex, substring match); empty => match all.
 	string schema_filter_;
 	string table_filter_;
+	//! Default SQL transaction isolation level (ATTACH isolation_level option); empty => provider default.
+	string isolation_level_;
 	mutex schema_lock_;
 	case_insensitive_map_t<unique_ptr<ArrowNetSchemaEntry>> schemas_;
 };

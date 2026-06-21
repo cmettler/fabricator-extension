@@ -1,0 +1,81 @@
+# name: test/verify_inout_isolation.test
+# description: Table-in-out (4g) pins one connection + transaction per call at a configurable isolation
+#              level (ATTACH isolation_level option + SET mssql_isolation_level override), so all per-chunk
+#              CROSS APPLY queries share one consistent view.
+# group: [mssql]
+
+require mssql_net
+
+require-env MSSQL_TESTDB_DSN
+
+# Setup: create a TVF that reports its session's current transaction isolation level
+# (1=ReadUncommitted, 2=ReadCommitted, 3=RepeatableRead, 4=Serializable, 5=Snapshot). @d is ignored
+# — it only gives the TVF a parameter so it gets an `_each` in-out alias. (The 'snapshot' case below
+# needs `ALTER DATABASE TestDB SET ALLOW_SNAPSHOT_ISOLATION ON`, which can't run via mssql_net_exec —
+# the test DB has it enabled out-of-band.)
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS setupdb (TYPE mssql_net);
+
+statement ok
+SELECT mssql_net_exec('setupdb', 'CREATE OR ALTER FUNCTION dbo.tf_iso(@d INT) RETURNS TABLE AS RETURN (SELECT CAST(transaction_isolation_level AS INT) AS iso FROM sys.dm_exec_sessions WHERE session_id = @@SPID)');
+
+statement ok
+DETACH setupdb;
+
+# Per-catalog default isolation via the ATTACH option: serializable (4).
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS isodb (TYPE mssql_net, isolation_level 'serializable');
+
+statement ok
+SELECT mssql_refresh_cache('isodb');
+
+# Every per-chunk CROSS APPLY of the in-out call runs on the one pinned connection at the ATTACH default.
+query I
+SELECT DISTINCT iso FROM isodb.dbo.tf_iso_each((SELECT v.n FROM (VALUES(1),(2),(3)) v(n)));
+----
+4
+
+# SET mssql_isolation_level overrides the ATTACH default for the session (repeatable read = 3).
+statement ok
+SET mssql_isolation_level = 'repeatable read';
+
+query I
+SELECT DISTINCT iso FROM isodb.dbo.tf_iso_each((SELECT v.n FROM (VALUES(1),(2)) v(n)));
+----
+3
+
+# Snapshot (5) — the consistent-view use case.
+statement ok
+SET mssql_isolation_level = 'snapshot';
+
+query I
+SELECT DISTINCT iso FROM isodb.dbo.tf_iso_each((SELECT v.n FROM (VALUES(1),(2)) v(n)));
+----
+5
+
+# An empty SET falls back to the ATTACH default (serializable = 4).
+statement ok
+SET mssql_isolation_level = '';
+
+query I
+SELECT DISTINCT iso FROM isodb.dbo.tf_iso_each((SELECT v.n FROM (VALUES(1)) v(n)));
+----
+4
+
+# An unknown isolation name is a clean error.
+statement ok
+SET mssql_isolation_level = 'bogus';
+
+statement error
+SELECT iso FROM isodb.dbo.tf_iso_each((SELECT v.n FROM (VALUES(1)) v(n)));
+----
+unknown isolation level
+
+statement ok
+SET mssql_isolation_level = '';
+
+statement ok
+SELECT mssql_net_exec('isodb', 'DROP FUNCTION IF EXISTS dbo.tf_iso');
+
+statement ok
+DETACH isodb;
