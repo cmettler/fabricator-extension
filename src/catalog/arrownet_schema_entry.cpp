@@ -18,10 +18,16 @@
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/execution/expression_executor_state.hpp"
+#include "duckdb/execution/physical_operator.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/function/function_set.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/config.hpp"
+#include "duckdb/optimizer/optimizer_extension.hpp"
+#include "duckdb/planner/operator/logical_extension_operator.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
@@ -557,7 +563,110 @@ OperatorResultType ArrowNetInOutFunction(ExecutionContext &context, TableFunctio
 	return OperatorResultType::HAVE_MORE_OUTPUT;
 }
 
+// -----------------------------------------------------------------------------
+// Table-in-out OperatorFinalize (4g): a reliable single "all input consumed" signal to the managed
+// session, for resource cleanup (and a clean commit of a read-only TVF's snapshot transaction — NOT the
+// per-row-proc commit, which DuckDB's transaction manager drives). DuckDB exposes no row-less finalize on
+// the in-out TableFunction itself, so an OptimizerExtension wraps the in-out's LogicalGet in this
+// pass-through LogicalExtensionOperator; its PhysicalOperator forwards rows unchanged and calls
+// holder->Finish() in OperatorFinalize, which fires once (sink-level) after every input branch is drained.
+class ArrowNetInOutFinalizePhysical : public PhysicalOperator {
+public:
+	ArrowNetInOutFinalizePhysical(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
+	                              shared_ptr<InOutSessionHolder> holder)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality),
+	      holder(std::move(holder)) {
+	}
+
+	shared_ptr<InOutSessionHolder> holder;
+
+	string GetName() const override {
+		return "ARROWNET_INOUT_FINALIZE";
+	}
+
+	// Pass-through: forward the child's chunk unchanged.
+	OperatorResultType Execute(ExecutionContext &, DataChunk &input, DataChunk &chunk, GlobalOperatorState &,
+	                           OperatorState &) const override {
+		chunk.Reference(input);
+		return OperatorResultType::NEED_MORE_INPUT;
+	}
+
+	bool ParallelOperator() const override {
+		return true;
+	}
+
+	bool RequiresOperatorFinalize() const override {
+		return true;
+	}
+
+	OperatorFinalResultType OperatorFinalize(Pipeline &, Event &, ClientContext &,
+	                                         OperatorFinalizeInput &) const override {
+		holder->Finish(); // single all-input-done signal (idempotent); resource cleanup / read-only commit
+		return OperatorFinalResultType::FINISHED;
+	}
+};
+
+struct ArrowNetInOutFinalizeOperator : public LogicalExtensionOperator {
+	explicit ArrowNetInOutFinalizeOperator(unique_ptr<LogicalOperator> child, shared_ptr<InOutSessionHolder> holder)
+	    : holder(std::move(holder)) {
+		children.push_back(std::move(child));
+	}
+
+	shared_ptr<InOutSessionHolder> holder;
+
+	PhysicalOperator &CreatePlan(ClientContext &, PhysicalPlanGenerator &planner) override {
+		auto &child_plan = planner.CreatePlan(*children[0]);
+		auto &op = planner.Make<ArrowNetInOutFinalizePhysical>(children[0]->types, children[0]->estimated_cardinality,
+		                                                       holder);
+		op.children.push_back(child_plan);
+		return op;
+	}
+
+	vector<ColumnBinding> GetColumnBindings() override {
+		return children[0]->GetColumnBindings(); // pass-through
+	}
+
+	void ResolveTypes() override {
+		types = children[0]->types;
+	}
+
+	string GetExtensionName() const override {
+		return "arrownet_inout_finalize";
+	}
+};
+
+// Recursively wrap every ArrowNet table-in-out LogicalGet in a finalize operator.
+void WrapArrowNetInOutNodes(unique_ptr<LogicalOperator> &op) {
+	for (auto &child : op->children) {
+		WrapArrowNetInOutNodes(child);
+	}
+	if (op->type != LogicalOperatorType::LOGICAL_GET) {
+		return;
+	}
+	auto &get = op->Cast<LogicalGet>();
+	// A table-in-out is a LogicalGet with input children + our in_out_function; identify it by the
+	// function pointer (no RTTI), then recover the session holder from its bind data.
+	if (get.children.empty() || get.function.in_out_function != ArrowNetInOutFunction || !get.bind_data) {
+		return;
+	}
+	auto holder = get.bind_data->Cast<ArrowNetInOutBindData>().session_holder;
+	if (!holder) {
+		return;
+	}
+	op = make_uniq<ArrowNetInOutFinalizeOperator>(std::move(op), std::move(holder));
+}
+
+void ArrowNetInOutOptimize(OptimizerExtensionInput &, unique_ptr<LogicalOperator> &plan) {
+	WrapArrowNetInOutNodes(plan);
+}
+
 } // namespace
+
+void RegisterArrowNetInOutFinalizer(DBConfig &config) {
+	OptimizerExtension extension;
+	extension.optimize_function = ArrowNetInOutOptimize;
+	OptimizerExtension::Register(config, std::move(extension));
+}
 
 optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateTableFunction(ClientContext &context,
                                                                          const string &func_name) {

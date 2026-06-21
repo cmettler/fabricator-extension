@@ -14,6 +14,15 @@
 
 namespace duckdb {
 
+class DBConfig;
+
+//! Registers the table-in-out OperatorFinalize optimizer extension (4g): an OptimizerExtension that wraps
+//! each discovered table-in-out LogicalGet in a pass-through LogicalExtensionOperator whose OperatorFinalize
+//! signals the managed session that all input is consumed ("in-out finished" — a reliable resource-cleanup
+//! hook, and a clean commit of a read-only TVF's snapshot transaction). NOT the proc commit (DuckDB's
+//! transaction drives that). Call once at extension load.
+void RegisterArrowNetInOutFinalizer(DBConfig &config);
+
 class ArrowNetSchemaEntry : public SchemaCatalogEntry {
 public:
 	ArrowNetSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, ArrowNetHandle handle);

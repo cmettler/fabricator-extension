@@ -10,6 +10,7 @@
 
 #include "arrownet/clr_host.hpp"
 #include "catalog/arrownet_catalog.hpp"
+#include "catalog/arrownet_schema_entry.hpp"
 #include "copy/mssql_net_copy.hpp"
 #include "arrownet_optimizer.hpp"
 #include "mssql_net_secret.hpp"
@@ -307,6 +308,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	RegisterCompatSettings(DBConfig::GetConfig(loader.GetDatabaseInstance()));
 	RegisterArrowNetOptimizer(DBConfig::GetConfig(loader.GetDatabaseInstance()));
+	RegisterArrowNetInOutFinalizer(DBConfig::GetConfig(loader.GetDatabaseInstance()));
 
 	TableFunction test_scan("arrownet_test_scan", {LogicalType::VARCHAR}, arrownet::ArrowStreamScan, TestScanBind,
 	                        arrownet::ArrowStreamInitGlobal, arrownet::ArrowStreamInitLocal);
