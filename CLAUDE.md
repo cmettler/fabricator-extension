@@ -298,6 +298,26 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
   `INFORMATION_SCHEMA.ROUTINE_COLUMNS` (shared `BuildSqlType`); `ExecuteTable` binds the constant args as
   `@a0…` (disjoint from the filter's `@p0…`) and delegates to the shared **`ScanFromSource`** helper (also
   used by `ScanTable`), which builds the projected/filtered `SELECT … FROM <source> WHERE …` — streamed lazily.
+
+### Function-abstraction refactor (Phase 5 — in progress)
+A DuckDB-faithful `Bind`/`Binding` model + expressing SQL-Server functions as the authoring interfaces.
+- **Scalar — DONE** (`refactor(scalar)`, commit `60ea6f0`): discovered SQL UDFs are a `SqlServerScalarFunction
+  : IArrowScalarFunction` (in `SqlServerScalarFunction.cs`) — `ResolveScalar` returns a custom registry entry
+  or the wrapper, so `ExecuteScalar`/param/return-schema dispatch through ONE `IArrowScalarFunction` path. The
+  chunked `SELECT [s].[f](@..) UNION ALL` (≤2100-param cap) moved into the wrapper's single-batch `Invoke`; the
+  per-cap sub-queries merge into one column via a typed builder (no `ArrowArrayConcatenator`). C#-only, no ABI.
+- **Table `Bind` — DONE** (`feat(table)`, commit `85de4df`, **ABI v27**): `IArrowTableFunction.Bind(RecordBatch
+  args) → IArrowTableFunctionBinding { OutputSchema; SupportsPushdown; Execute(TableFunctionScan) }` — a custom
+  TVF's **output schema may depend on its constant args** (the gap before: a static `OutputSchema` property).
+  `get_function_output_schema` gained a nullable `args` 1-row stream (the C++ table bind marshals the args once
+  for both the output-schema resolution and the scan; the in-out `_each` base lookup passes null). A
+  `StaticTableFunction` base keeps fixed-schema functions trivial (`cf_range`). Demo `dbo.cf_columns(n)` returns
+  `n` columns `c1..cn` — schema resolved from the arg at bind (`verify_custom_functions.test`).
+- **Deferred follow-ups** (organizational; capability already delivered): the **session-handle** model
+  (`table_bind`/`output_schema`/`execute`/`close`, for a binding holding state across bind↔execute); **retiring
+  `execute_table`/`execute_proc`** (fold into the table session); the **`SqlServerTableValuedFunction` /
+  `SqlServerProcedure : IArrowTableFunction`** wrapper extraction (shrink the 2654-line `SqlServerBackend`); the
+  **in-out session-class file-move** + an `IArrowInOutFunction` registry. Full design: the plan file's "Phase 5".
 - **Verified**: inline TVF (`tf_nums(3)`→1,2,3), multi-column (`tf_pair(7,'hi')`), multi-statement
   (`tf_ms`→squares), and aggregation over a TVF. **Pushdown proven via the plan cache**: the statement that
   reached SQL Server was `SELECT [id],[name],[salary] FROM [dbo].[tf_emp](@a0) WHERE [id] <> @p0` (column
@@ -536,7 +556,9 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v26** (v26 appended the three spillable-aggregate entries `agg_update_spill`/
+- **Current version: ABI v27** (v27 added a nullable `args` 1-row stream to `get_function_output_schema` so a
+  custom table function's output schema can depend on its constant arguments — the **table `Bind`** capability;
+  see "Callable table functions (4c)". v26 appended the three spillable-aggregate entries `agg_update_spill`/
   `agg_combine_spill`/`agg_finalize_spill` + the `ARROWNET_AGG_SPILL_CAP` constant — 4h opt-in spill; v25
   appended the six custom-aggregate entries `agg_open`/`agg_update`/`agg_combine`/`agg_finalize`/`agg_destroy`/
   `agg_close` — 4h; v24 added `inout_open`'s `isolation` arg so the in-out session runs its per-chunk CROSS
