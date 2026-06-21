@@ -339,9 +339,35 @@ typedef struct ArrowNetVTable {
 	// proc's EXEC is not inline-wrappable, so DuckDB applies projection + filters locally.
 	int32_t (*execute_proc)(ArrowNetHandle handle, const char *schema, const char *func,
 	                        struct ArrowArrayStream *args, struct ArrowArrayStream *out, char **err);
+
+	// -------------------------------------------------------------------------
+	// Table-in-out (Phase 4). A session streams a TABLE in + a TABLE out, used to
+	// apply a function once per input row (e.g. CROSS APPLY a TVF over a parameter
+	// table). Parallel input branches feed ONE session; the host's injected
+	// OperatorFinalize calls inout_finish once after all input is exhausted
+	// (in_out_function_final fires per-branch, so it can't be the single signal);
+	// the operator-state destructor calls inout_abort (error/cancel/LIMIT backstop).
+	// -------------------------------------------------------------------------
+
+	// Open a session. `input_schema` = the Arrow schema of the input table (its columns
+	// are the function's positional parameters; the managed side consumes/releases it).
+	// Returns an opaque session handle in *out_session.
+	int32_t (*inout_open)(ArrowNetHandle handle, const char *schema, const char *func,
+	                      struct ArrowSchema *input_schema, ArrowNetHandle *out_session, char **err);
+
+	// Push one input chunk (consumed/released by the managed side); fill *out with the
+	// output rows available so far (may be empty). Backpressured.
+	int32_t (*inout_push)(ArrowNetHandle session, struct ArrowArray *in_chunk, struct ArrowArrayStream *out,
+	                      char **err);
+
+	// Signal input exhausted: drain + return all remaining output in *out. Idempotent.
+	int32_t (*inout_finish)(ArrowNetHandle session, struct ArrowArrayStream *out, char **err);
+
+	// Release the session (error/cancel/LIMIT backstop). Idempotent. Safe with nullptr.
+	int32_t (*inout_abort)(ArrowNetHandle session, char **err);
 } ArrowNetVTable;
 
-#define ARROWNET_ABI_VERSION 22
+#define ARROWNET_ABI_VERSION 23
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

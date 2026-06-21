@@ -25,7 +25,7 @@ public static unsafe class Bootstrap
             return ArrowNetStatus.InvalidArgument;
         }
 
-        vtable->AbiVersion = 22;
+        vtable->AbiVersion = 23;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -55,6 +55,10 @@ public static unsafe class Bootstrap
         vtable->GetFunctionOutputSchema = &GetFunctionOutputSchema;
         vtable->ExecuteTable = &ExecuteTable;
         vtable->ExecuteProc = &ExecuteProc;
+        vtable->InOutOpen = &InOutOpen;
+        vtable->InOutPush = &InOutPush;
+        vtable->InOutFinish = &InOutFinish;
+        vtable->InOutAbort = &InOutAbort;
         return ArrowNetStatus.Ok;
     }
 
@@ -693,6 +697,96 @@ public static unsafe class Bootstrap
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
             var argStream = CArrowArrayStreamImporter.ImportArrayStream(args); // we own it
             CArrowArrayStreamExporter.ExportArrayStream(catalog.ExecuteProc(s, f, argStream), outStream);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int InOutOpen(nint handle, byte* schema, byte* func, CArrowSchema* inputSchema, nint* outSession,
+                                 byte** err)
+    {
+        try
+        {
+            if (inputSchema is null || outSession is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            var arrowSchema = CArrowSchemaImporter.ImportSchema(inputSchema); // takes ownership of the C schema
+            var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+            var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
+            *outSession = Handles.Alloc(catalog.InOutOpen(s, f, arrowSchema));
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int InOutPush(nint session, CArrowArray* inChunk, CArrowArrayStream* outStream, byte** err)
+    {
+        try
+        {
+            if (inChunk is null || outStream is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            var s = Handles.Resolve<IInOutSession>(session);
+            if (s is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            var batch = CArrowArrayImporter.ImportRecordBatch(inChunk, s.InputSchema); // takes ownership
+            s.Push(batch);
+            CArrowArrayStreamExporter.ExportArrayStream(s.DrainReady(), outStream);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int InOutFinish(nint session, CArrowArrayStream* outStream, byte** err)
+    {
+        try
+        {
+            if (outStream is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            var s = Handles.Resolve<IInOutSession>(session);
+            if (s is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            CArrowArrayStreamExporter.ExportArrayStream(s.Finish(), outStream);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int InOutAbort(nint session, byte** err)
+    {
+        try
+        {
+            Handles.Resolve<IInOutSession>(session)?.Abort(); // idempotent
+            Handles.Free(session);
             return ArrowNetStatus.Ok;
         }
         catch (Exception ex)

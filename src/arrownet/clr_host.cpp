@@ -521,6 +521,63 @@ void ExecuteProc(ArrowNetHandle handle, const std::string &schema, const std::st
 	}
 }
 
+ArrowNetHandle InOutOpen(ArrowNetHandle handle, const std::string &schema, const std::string &func,
+                         ArrowSchema &input_schema) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.inout_open) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide inout_open");
+	}
+	ArrowNetHandle session = nullptr;
+	char *err = nullptr;
+	int32_t rc = vt.inout_open(handle, schema.c_str(), func.c_str(), &input_schema, &session, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: inout_open failed");
+	}
+	return session;
+}
+
+void InOutPush(ArrowNetHandle session, ArrowArray &in_chunk, ArrowArrayStream &out) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.inout_push) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide inout_push");
+	}
+	char *err = nullptr;
+	int32_t rc = vt.inout_push(session, &in_chunk, &out, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: inout_push failed");
+	}
+}
+
+void InOutFinish(ArrowNetHandle session, ArrowArrayStream &out) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.inout_finish) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide inout_finish");
+	}
+	char *err = nullptr;
+	int32_t rc = vt.inout_finish(session, &out, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: inout_finish failed");
+	}
+}
+
+void InOutAbort(ArrowNetHandle session) {
+	if (!session) {
+		return;
+	}
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.inout_abort) {
+		return;
+	}
+	char *err = nullptr;
+	int32_t rc = vt.inout_abort(session, &err);
+	if (rc != ARROWNET_OK) {
+		// Abort is best-effort cleanup; swallow + free the managed error message.
+		if (err && vt.free_error) {
+			vt.free_error(err);
+		}
+	}
+}
+
 void ScanTable(ArrowNetHandle handle, const std::string &schema, const std::string &table, const std::string &spec_json,
                ArrowArrayStream *filter_values, ArrowArrayStream &out) {
 	const ArrowNetVTable &vt = GetBridge();

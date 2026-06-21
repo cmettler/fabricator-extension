@@ -74,6 +74,9 @@ public sealed class StubBackend : IBackend
         public IArrowArrayStream ExecuteProc(string schemaName, string functionName, IArrowArrayStream args) =>
             EmptyStringTable("result");
 
+        public IInOutSession InOutOpen(string schemaName, string functionName, Schema inputSchema) =>
+            throw new NotSupportedException("stub backend has no table-in-out functions");
+
         public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists,
                                 string? primaryKey, string? uniques, string? defaults, string? textType)
         {

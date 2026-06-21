@@ -1378,6 +1378,12 @@ public sealed class SqlServerCatalog : IBackendCatalog
     // parameter names (only the supplied ones are present; omitted optionals use the
     // proc's DEFAULT). Streams the first result set lazily. No pushdown (EXEC is not
     // inline-wrappable); DuckDB applies projection + filters above the scan.
+    // 4g table-in-out (build in progress): the real SqlServerInOutSession (bounded channel + per-input-batch
+    // `VALUES … CROSS APPLY [s].[func](…)` generation) and the C++ in_out_function operator + injected
+    // OperatorFinalize are the next increment. See docs/custom-functions-design.md §11.1.
+    public IInOutSession InOutOpen(string schemaName, string functionName, Schema inputSchema) =>
+        throw new NotImplementedException("mssql_net: table-in-out (4g) is not implemented yet");
+
     public IArrowArrayStream ExecuteProc(string schemaName, string functionName, IArrowArrayStream args)
     {
         var qualified = Quote(schemaName) + "." + Quote(functionName);

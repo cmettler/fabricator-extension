@@ -124,6 +124,14 @@ public interface IBackendCatalog : IDisposable
     IArrowArrayStream ExecuteProc(string schemaName, string functionName, IArrowArrayStream args);
 
     /// <summary>
+    /// Opens a table-in-out session for <c>schema.func</c> over an input table of the given
+    /// <paramref name="inputSchema"/> (its columns are the function's positional parameters). The session
+    /// applies the function once per input row (e.g. CROSS APPLY a TVF over the parameter table) and
+    /// streams output back. See <see cref="IInOutSession"/>.
+    /// </summary>
+    IInOutSession InOutOpen(string schemaName, string functionName, Schema inputSchema);
+
+    /// <summary>
     /// Creates a table whose columns are described by <paramref name="columns"/>
     /// (a non-nullable field maps to NOT NULL). The backend maps Arrow types to
     /// provider types and runs the provider CREATE TABLE. When
