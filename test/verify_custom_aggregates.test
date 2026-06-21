@@ -203,3 +203,49 @@ SELECT bool_and(cf_w = duck_w) FROM (
 );
 ----
 true
+
+# ---- Non-additive (holistic) aggregate: dbo.cf_median. Its state IS the full collection of values — Update
+# collects, Combine MERGES the collections (concatenation, not arithmetic), Finalize sorts + picks the median.
+# Order-independent, so it stays correct under parallel partial-state merging. Runs in the fast (default) mode. ----
+
+# Holistic => fast mode: discovered as 'aggregate' (not 'aggregate_spill' — an unbounded collection can't spill).
+query TTT
+SELECT schema_name, name, kind FROM mssql_net_functions('adb') WHERE name = 'cf_median';
+----
+dbo	cf_median	aggregate
+
+# Odd count: median of 1..5 = 3 (exact middle).
+query I
+SELECT adb.dbo.cf_median(x)::INTEGER FROM range(1, 6) t(x);
+----
+3
+
+# Even count: median of 1..4 = 2.5 (average of the two middles).
+query I
+SELECT adb.dbo.cf_median(x) = 2.5 FROM range(1, 5) t(x);
+----
+true
+
+# NULLs skipped: median of {1,3,5} = 3.
+query I
+SELECT adb.dbo.cf_median(x)::INTEGER FROM (VALUES (1.0::DOUBLE), (NULL::DOUBLE), (3.0::DOUBLE), (5.0::DOUBLE)) t(x);
+----
+3
+
+# Empty input => NULL.
+query I
+SELECT adb.dbo.cf_median(x) FROM range(1, 6) t(x) WHERE x > 100;
+----
+NULL
+
+# GROUP BY + parallel (threads=4, set above): 5000 rows over 50 groups — Combine merges many partial
+# collections per group; cross-checked against DuckDB's built-in median() (tolerance for the last-ULP of the
+# interpolation formula). This is the proof that combine-as-merge is correct under parallel aggregation.
+query I
+SELECT bool_and(abs(cf - duck) < 1e-9) FROM (
+    SELECT g, adb.dbo.cf_median(x) AS cf, median(x) AS duck
+    FROM (SELECT x % 50 AS g, ((x * 7) % 101)::DOUBLE AS x FROM range(0, 5000) t(x)) s
+    GROUP BY g
+);
+----
+true

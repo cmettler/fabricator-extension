@@ -37,7 +37,55 @@ internal static class CustomFunctions
         new CfProductFunction(),
         new CfBitOrFunction(),
         new CfSumSpillFunction(),
+        new CfMedianFunction(),
     };
+}
+
+// Demo (aggregate, NON-ADDITIVE / holistic): dbo.cf_median(x DOUBLE) -> DOUBLE. A holistic aggregate can't be
+// reduced to a small running value — the state IS the full collection of values: Update collects, Combine
+// MERGES the two collections (the answer to "what about combine?": it's concatenation, not arithmetic), and
+// Finalize sorts + picks the median. Order-independent, so it's correct under parallel partial-state merging.
+// SupportsSpill stays false (the default): an unbounded collection can't fit the fixed spill blob, so holistic
+// aggregates run in the fast in-memory mode (bounded by the group's cardinality), like DuckDB's own median.
+internal sealed class CfMedianFunction : IArrowAggregateFunction
+{
+    public string SchemaName => "dbo";
+    public string Name => "cf_median";
+    public Schema Parameters => new(new[] { new Field("x", DoubleType.Default, nullable: true) }, metadata: null);
+    public Field Result => new("median", DoubleType.Default, nullable: true);
+    public IArrowAggregateState CreateState() => new State();
+
+    private sealed class State : IArrowAggregateState
+    {
+        private readonly List<double> _values = new();
+
+        public void Update(RecordBatch args)
+        {
+            var x = (DoubleArray)args.Column(0);
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (!x.IsNull(i))
+                {
+                    _values.Add(x.Values[i]); // copy the value out — the batch's buffers are freed after this returns
+                }
+            }
+        }
+
+        // Combine for a holistic aggregate = merge the collections (NOT an arithmetic fold).
+        public void Combine(IArrowAggregateState source) => _values.AddRange(((State)source)._values);
+
+        public object? Finalize()
+        {
+            if (_values.Count == 0)
+            {
+                return null;
+            }
+            _values.Sort();
+            int n = _values.Count;
+            // Matches DuckDB's median (quantile_cont(0.5)): average the two middles for an even count.
+            return n % 2 == 1 ? _values[n / 2] : (_values[n / 2 - 1] + _values[n / 2]) / 2.0;
+        }
+    }
 }
 
 // Demo (aggregate): dbo.cf_product(x BIGINT) -> BIGINT, the product of all non-NULL inputs (SQL Server has

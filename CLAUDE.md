@@ -495,13 +495,21 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
   windowed-spill test); (2) serialized state must fit the 1 KB cap (enforced on write-back) → spill suits
   fixed/small state (sum/product/bitwise/avg/moments), not unbounded state (string concat). Demo
   `dbo.cf_sum_spill`.
-- **Verified**: `test/verify_custom_aggregates.test` (50 assertions) — discovery (`kind='aggregate'` +
+- **Non-additive (holistic) aggregates** work in the fast mode with **no special support**: the accumulator's
+  state IS the collected values (`Update` collects, **`Combine` merges the two collections** — concatenation,
+  not arithmetic, the same way DuckDB's own `median`/`list`/`mode` combine — and `Finalize` computes over the
+  union). Correct under parallel partial-state merging for order-independent aggregates. `SupportsSpill` stays
+  false (an unbounded collection can't fit the blob cap). Demo `dbo.cf_median` (collect → sort → middle). The
+  author must **copy values out in `Update`** (the batch's Arrow buffers are freed after it returns; don't
+  retain the `RecordBatch`).
+- **Verified**: `test/verify_custom_aggregates.test` (58 assertions) — discovery (`kind='aggregate'` +
   `'aggregate_spill'`) + no SQL object, ungrouped (`simple_update`), implicit INTEGER→BIGINT, NULL-skip,
   empty/all-NULL → NULL, `GROUP BY` (incl. a NULL-only group), parallel `bit_or` cross-checked vs DuckDB's
   built-in (threads=4), grouped+parallel `product` cross-checked vs DuckDB's `product()`, running-frame `OVER`,
-  windowed `OVER`/`PARTITION BY` cross-checked vs the built-in, AND the spillable `cf_sum_spill` across all of
-  ungrouped / `GROUP BY` / high-cardinality (50k rows × 1000 groups) / low-`memory_limit` (80k × 4000) /
-  window — each cross-checked vs the built-in `sum()`.
+  windowed `OVER`/`PARTITION BY` cross-checked vs the built-in; the spillable `cf_sum_spill` across ungrouped /
+  `GROUP BY` / high-cardinality (50k rows × 1000 groups) / low-`memory_limit` (80k × 4000) / window — each
+  cross-checked vs `sum()`; AND the holistic `cf_median` (odd/even/NULL/empty + a 5000-row × 50-group parallel
+  cross-check vs DuckDB's `median()`, proving combine-as-merge under parallel aggregation).
 
 - **Filtering**: discovered scalar UDFs + TVFs/procs are gated by the ATTACH `schema_filter` (icase
   `std::regex`, applied in `LoadCatalog`/`RefreshCache`); `table_filter` is table-only and does NOT apply to functions.
