@@ -22,12 +22,12 @@ internal static class CustomFunctions
         new CfRangeFunction(),
     };
 
-    // Factories, not instances: a table-in-out may be STATEFUL across its input stream (e.g.
-    // cf_summarize), so each session gets a fresh instance (see SqlServerCatalog.InOutOpen).
+    // Factories, not instances: a table-in-out may keep mutable state across its input stream (a running
+    // aggregate), so each session gets a fresh instance (see SqlServerCatalog.InOutOpen).
     public static readonly IReadOnlyList<Func<IArrowTableInOutFunction>> InOut = new Func<IArrowTableInOutFunction>[]
     {
         () => new CfTagFunction(),
-        () => new CfSummarizeFunction(),
+        () => new CfRunningSumFunction(),
     };
 }
 
@@ -67,47 +67,48 @@ internal sealed class CfTagFunction : IArrowTableInOutFunction
         }
         yield return new RecordBatch(OutputSchema, new IArrowArray[] { nb.Build(), sq.Build() }, rows);
     }
-
-    public IEnumerable<RecordBatch> Finish() => System.Array.Empty<RecordBatch>();
 }
 
-// Demo (table-in-out, stateful/finish-only): dbo.cf_summarize(<table of n>) consumes the WHOLE input and
-// emits ONE row (cnt, total) at Finish — impossible as a scalar/table function. Order-independent. Pure C#.
-internal sealed class CfSummarizeFunction : IArrowTableInOutFunction
+// Demo (table-in-out, STATEFUL streaming): dbo.cf_running_sum(<table of n>) -> (n, running) where running is
+// the cumulative sum across the input stream (state kept across Process calls). Emitted per row in Process,
+// so it fits the per-chunk streaming model (no emit-at-end). Pure C#, no SQL object. The cumulative VALUE is
+// order-dependent, but max(running) == total is order-independent (the last row processed always holds the
+// full sum), which is what the test asserts.
+internal sealed class CfRunningSumFunction : IArrowTableInOutFunction
 {
-    private long _cnt;
-    private long _total;
+    private long _running;
 
     public string SchemaName => "dbo";
-    public string Name => "cf_summarize";
+    public string Name => "cf_running_sum";
 
     public Schema InputSchema => new(new[] { new Field("n", Int32Type.Default, nullable: true) }, metadata: null);
 
     public Schema OutputSchema => new(new[]
     {
-        new Field("cnt", Int64Type.Default, nullable: false),
-        new Field("total", Int64Type.Default, nullable: false),
+        new Field("n", Int32Type.Default, nullable: true),
+        new Field("running", Int64Type.Default, nullable: false),
     }, metadata: null);
 
     public IEnumerable<RecordBatch> Process(RecordBatch inputChunk)
     {
         var n = (Int32Array)inputChunk.Column(0);
-        for (int i = 0; i < inputChunk.Length; i++)
+        int rows = inputChunk.Length;
+        var nb = new Int32Array.Builder().Reserve(rows);
+        var rb = new Int64Array.Builder().Reserve(rows);
+        for (int i = 0; i < rows; i++)
         {
-            if (!n.IsNull(i))
+            if (n.IsNull(i))
             {
-                _cnt++;
-                _total += n.Values[i];
+                nb.AppendNull();
             }
+            else
+            {
+                _running += n.Values[i];
+                nb.Append(n.Values[i]);
+            }
+            rb.Append(_running);
         }
-        return System.Array.Empty<RecordBatch>(); // accumulate only; emit at Finish
-    }
-
-    public IEnumerable<RecordBatch> Finish()
-    {
-        var cnt = new Int64Array.Builder().Append(_cnt).Build();
-        var total = new Int64Array.Builder().Append(_total).Build();
-        yield return new RecordBatch(OutputSchema, new IArrowArray[] { cnt, total }, 1);
+        yield return new RecordBatch(OutputSchema, new IArrowArray[] { nb.Build(), rb.Build() }, rows);
     }
 }
 

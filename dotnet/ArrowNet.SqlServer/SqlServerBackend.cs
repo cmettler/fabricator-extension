@@ -1399,9 +1399,9 @@ public sealed class SqlServerCatalog : IBackendCatalog
     // proc's DEFAULT). Streams the first result set lazily. No pushdown (EXEC is not
     // inline-wrappable); DuckDB applies projection + filters above the scan.
     // 4g table-in-out: stream an input parameter table through SQL Server CROSS APPLY of the TVF (the
-    // input columns are the function's positional params). The C++ in_out_function operator pushes input
-    // chunks (one session per call, parallel branches into one bounded channel) and a single
-    // OperatorFinalize drives Finish.
+    // input columns are the function's positional params). The C++ in_out_function operator pushes each
+    // input chunk; that chunk's CROSS APPLY runs synchronously and its full output is returned (no lagging
+    // tail), so output emission never depends on detecting the last parallel input branch.
     public IInOutSession InOutOpen(string schemaName, string functionName, Schema inputSchema)
     {
         // A provider-authored custom in-out (4g, pure C#) shadows a same-named SQL object — run it through
@@ -1415,8 +1415,9 @@ public sealed class SqlServerCatalog : IBackendCatalog
     }
 
     // Session for a custom C#-authored table-in-out (IArrowTableInOutFunction). The C++ operator pushes
-    // input chunks (Process) and, after all input, drains the tail (Finish) — exactly the IInOutSession
-    // contract. Process/Finish run serially (under a lock), so the function may keep mutable state.
+    // input chunks; each Process runs synchronously and its output is emitted immediately (per-chunk
+    // streaming — no emit-at-end). Push runs serially (under a lock), so the function may keep mutable
+    // state across calls.
     private sealed class CustomInOutSessionImpl : IInOutSession
     {
         private readonly IArrowTableInOutFunction _fn;
@@ -1424,7 +1425,6 @@ public sealed class SqlServerCatalog : IBackendCatalog
         private readonly ConcurrentQueue<RecordBatch> _ready = new();
         private readonly object _lock = new();
         private bool _aborted;
-        private bool _finished;
 
         public CustomInOutSessionImpl(IArrowTableInOutFunction fn, Schema inputSchema)
         {
@@ -1462,26 +1462,8 @@ public sealed class SqlServerCatalog : IBackendCatalog
             return new InMemoryArrayStream(_fn.OutputSchema, list);
         }
 
-        public IArrowArrayStream Finish()
-        {
-            lock (_lock)
-            {
-                if (!_aborted && !_finished)
-                {
-                    _finished = true; // Finish() is the single all-input-done call, but stay idempotent
-                    foreach (var b in _fn.Finish())
-                    {
-                        _ready.Enqueue(b);
-                    }
-                }
-            }
-            var list = new List<RecordBatch>();
-            while (_ready.TryDequeue(out var b))
-            {
-                list.Add(b);
-            }
-            return new InMemoryArrayStream(_fn.OutputSchema, list);
-        }
+        // No emit-at-end: finishing just drains anything not yet pulled (normally empty).
+        public IArrowArrayStream Finish() => DrainReady();
 
         public void Abort()
         {
@@ -1504,13 +1486,13 @@ public sealed class SqlServerCatalog : IBackendCatalog
         private readonly string[] _colSqlTypes;    // SQL types for the VALUES CAST (positional TVF params)
         private readonly Schema _inputSchema;
         private readonly Schema _outputSchema;
-        // One single-reader input channel fed by all parallel branches; one output channel.
-        private readonly Channel<RecordBatch> _in =
-            Channel.CreateBounded<RecordBatch>(new BoundedChannelOptions(4) { SingleReader = true });
-        private readonly Channel<RecordBatch> _out = Channel.CreateBounded<RecordBatch>(4);
-        private readonly ConcurrentQueue<RecordBatch> _stash = new(); // output drained during a blocked Push
-        private readonly Task _consumer;
-        private volatile bool _aborted;
+        // Output is produced SYNCHRONOUSLY per input chunk (each Push runs that chunk's CROSS APPLY to
+        // completion), so there is no lagging tail to drain after all input — which is what lets the
+        // injected OperatorFinalize be a pure no-rows cleanup signal and removes any reliance on detecting
+        // the "last" parallel input branch. Parallel branches feed the one session; the lock serializes them.
+        private readonly ConcurrentQueue<RecordBatch> _ready = new();
+        private readonly object _lock = new();
+        private bool _aborted;
 
         public Schema InputSchema => _inputSchema;
 
@@ -1546,33 +1528,25 @@ public sealed class SqlServerCatalog : IBackendCatalog
             {
                 _outputSchema = new Schema(pFields.Concat(os.Schema.FieldsList), metadata: null);
             }
-            _consumer = Task.Run(ConsumeAsync);
         }
 
+        // Run this chunk's CROSS APPLY to completion and stash its full output (synchronous: no lagging
+        // tail). The lock serializes parallel input branches feeding the one session; a CROSS APPLY error
+        // throws here and propagates out through inout_push, failing the query.
         public void Push(RecordBatch chunk)
         {
-            if (_aborted)
+            using (chunk)
             {
-                chunk.Dispose();
-                return;
-            }
-            // Backpressure without deadlock: if the input channel is full, drain ready output into the
-            // stash so the consumer (possibly blocked writing output) can progress + free input space.
-            while (!_in.Writer.TryWrite(chunk))
-            {
-                if (_out.Reader.TryRead(out var ready))
+                lock (_lock)
                 {
-                    _stash.Enqueue(ready);
-                }
-                else if (_consumer.IsCompleted)
-                {
-                    chunk.Dispose();
-                    _consumer.GetAwaiter().GetResult(); // surface a consumer fault
-                    return;
-                }
-                else
-                {
-                    Thread.Sleep(1);
+                    if (_aborted)
+                    {
+                        return;
+                    }
+                    foreach (var b in RunCrossApply(chunk)) // enumerated before the chunk is disposed
+                    {
+                        _ready.Enqueue(b);
+                    }
                 }
             }
         }
@@ -1580,80 +1554,27 @@ public sealed class SqlServerCatalog : IBackendCatalog
         public IArrowArrayStream DrainReady()
         {
             var list = new List<RecordBatch>();
-            while (_stash.TryDequeue(out var b))
+            while (_ready.TryDequeue(out var b))
             {
                 list.Add(b);
-            }
-            while (_out.Reader.TryRead(out var b))
-            {
-                list.Add(b);
-            }
-            // Surface a consumer fault (a CROSS APPLY error) promptly on the next push, rather
-            // than only at Finish — TryRead doesn't throw on a faulted channel.
-            if (_out.Reader.Completion.IsFaulted)
-            {
-                _out.Reader.Completion.GetAwaiter().GetResult();
             }
             return new InMemoryArrayStream(_outputSchema, list);
         }
 
-        public IArrowArrayStream Finish()
-        {
-            _in.Writer.TryComplete(); // no more input — the single all-branches-done signal
-            var list = new List<RecordBatch>();
-            while (_stash.TryDequeue(out var b))
-            {
-                list.Add(b);
-            }
-            // Block until the consumer has produced all output (throws if the consumer faulted).
-            var reader = _out.Reader;
-            while (reader.WaitToReadAsync().AsTask().GetAwaiter().GetResult())
-            {
-                while (reader.TryRead(out var b))
-                {
-                    list.Add(b);
-                }
-            }
-            return new InMemoryArrayStream(_outputSchema, list);
-        }
+        // No tail (output is fully produced per Push), so finishing just drains anything not yet pulled.
+        // The clean-finish / commit signal is the operator's job (OperatorFinalize); for a read-only TVF
+        // CROSS APPLY there is nothing to commit.
+        public IArrowArrayStream Finish() => DrainReady();
 
         public void Abort()
         {
-            _aborted = true;
-            _in.Writer.TryComplete();
-            while (_stash.TryDequeue(out var b))
+            lock (_lock)
             {
-                b.Dispose();
-            }
-            while (_out.Reader.TryRead(out var b))
-            {
-                b.Dispose();
-            }
-        }
-
-        private async Task ConsumeAsync()
-        {
-            try
-            {
-                await foreach (var batch in _in.Reader.ReadAllAsync())
+                _aborted = true;
+                while (_ready.TryDequeue(out var b))
                 {
-                    using (batch)
-                    {
-                        if (_aborted)
-                        {
-                            continue;
-                        }
-                        foreach (var outBatch in RunCrossApply(batch))
-                        {
-                            await _out.Writer.WriteAsync(outBatch);
-                        }
-                    }
+                    b.Dispose();
                 }
-                _out.Writer.TryComplete();
-            }
-            catch (Exception ex)
-            {
-                _out.Writer.TryComplete(ex);
             }
         }
 

@@ -3,21 +3,24 @@ using Apache.Arrow;
 namespace ArrowNet.Bridge;
 
 /// <summary>
-/// A provider-authored custom <em>table-in-out</em> function, implemented in C# over Arrow — the in-out
-/// analog of <see cref="IArrowScalarFunction"/> (4e) / <see cref="IArrowTableFunction"/> (4f). It consumes
-/// a TABLE and produces a TABLE, so it can be <b>stateful across the whole input stream</b> (a running
-/// aggregate, a windowed transform, a whole-table summary) — something a per-call scalar/table function
-/// cannot express. It is surfaced into every attached catalog and resolves as
-/// <c>SELECT * FROM db.SchemaName.Name(&lt;input table&gt;)</c>, running through the very same in-out operator
-/// path as a discovered TVF's <c>_each</c> alias — but the session dispatches to this object (see
-/// <c>SqlServerCatalog.InOutOpen</c>) instead of generating a CROSS APPLY. No extra ABI (reuses
-/// <c>inout_open</c>/<c>inout_push</c>/<c>inout_finish</c>/<c>inout_abort</c>, ABI v23).
+/// A provider-authored custom table-in-out function, implemented in C# over Arrow - the in-out analog of
+/// <see cref="IArrowScalarFunction"/> (4e) / <see cref="IArrowTableFunction"/> (4f). It consumes a TABLE
+/// and produces a TABLE (e.g. a streaming transform or a running aggregate). It is surfaced into every
+/// attached catalog and resolves as <c>SELECT * FROM db.SchemaName.Name(&lt;input table&gt;)</c>, running
+/// through the very same in-out operator path as a discovered TVF's <c>_each</c> alias - but the session
+/// dispatches to this object (see <c>SqlServerCatalog.InOutOpen</c>) instead of generating a CROSS APPLY.
+/// No extra ABI (reuses <c>inout_open</c>/<c>inout_push</c>/<c>inout_abort</c>, ABI v23).
 ///
 /// Unlike a discovered TVF's <c>_each</c> (whose output echoes the input columns ++ the TVF output), a
-/// custom in-out declares its <see cref="OutputSchema"/> in full — it need not echo its input.
+/// custom in-out declares its <see cref="OutputSchema"/> in full - it need not echo its input.
 ///
-/// Threading: <see cref="Process"/>/<see cref="Finish"/> are invoked serially by the session (one input
-/// chunk at a time, then one Finish), so an implementation may keep mutable state without locking.
+/// Per-chunk streaming only. Output is emitted synchronously per input chunk: each <see cref="Process"/>
+/// call returns that chunk's complete output, emitted immediately. There is deliberately no "emit at end"
+/// hook - a function that must consume the whole table before emitting (a non-running aggregate /
+/// whole-table summary) is a pipeline breaker, not a streaming in-out, and cannot reliably emit its final
+/// rows across parallel input branches (the row-emitting operator finalize fires per branch). A running
+/// aggregate that emits per row works (emit during <see cref="Process"/>), and may keep mutable state
+/// across calls since <see cref="Process"/> is invoked serially by the session.
 /// </summary>
 public interface IArrowTableInOutFunction
 {
@@ -34,15 +37,10 @@ public interface IArrowTableInOutFunction
     Schema OutputSchema { get; }
 
     /// <summary>
-    /// Process one input chunk and return zero or more output batches (streamed). Called once per input
-    /// chunk, in arrival order. Each returned batch must conform to <see cref="OutputSchema"/>. The chunk
-    /// is disposed after this returns, so do not retain views into it (copy what you keep).
+    /// Process one input chunk and return zero or more output batches (emitted immediately). Called once
+    /// per input chunk, in arrival order (serially). Each returned batch must conform to
+    /// <see cref="OutputSchema"/>. The chunk is disposed after this returns, so do not retain views into
+    /// it (copy what you keep).
     /// </summary>
     IEnumerable<RecordBatch> Process(RecordBatch inputChunk);
-
-    /// <summary>
-    /// Input exhausted — return any final output (e.g. a running aggregate's result, a whole-table
-    /// summary). May be empty. Each returned batch must conform to <see cref="OutputSchema"/>.
-    /// </summary>
-    IEnumerable<RecordBatch> Finish();
 }

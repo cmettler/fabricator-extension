@@ -80,29 +80,30 @@ SELECT n, sq FROM cdb.dbo.cf_tag((SELECT v.n FROM (VALUES(2),(3),(4)) v(n))) ORD
 3	9
 4	16
 
-# A STATEFUL table-in-out: cf_summarize consumes the whole input table and emits ONE (cnt, total) row at
-# Finish — impossible as a scalar/table function. Multi-chunk input (4999 rows, INT) exercises state
-# accumulated across Process calls + the single Finish tail. cnt=4999, total=sum(1..4999)=12497500.
+# A STATEFUL table-in-out: cf_running_sum keeps a cumulative sum across the input stream (state held
+# across Process calls). Multi-chunk input (4999 rows, INT) exercises state accumulated across many
+# Process calls. The cumulative value is order-dependent, but max(running) == total is order-independent
+# (the last row processed always holds the full sum): count=4999, max(running)=sum(1..4999)=12497500.
 query II
-SELECT cnt, total FROM cdb.dbo.cf_summarize((SELECT t.n::INTEGER FROM range(1, 5000) t(n)));
+SELECT count(*), max(running) FROM cdb.dbo.cf_running_sum((SELECT t.n::INTEGER FROM range(1, 5000) t(n)));
 ----
 4999	12497500
 
-# State is per-session (fresh instance each open): a second cf_summarize sees only its own input.
+# State is per-session (fresh instance each open): a second call starts its running sum from zero.
 query II
-SELECT cnt, total FROM cdb.dbo.cf_summarize((SELECT v.n FROM (VALUES(10),(20),(30)) v(n)));
+SELECT count(*), max(running) FROM cdb.dbo.cf_running_sum((SELECT v.n FROM (VALUES(10),(20),(30)) v(n)));
 ----
 3	60
 
 # Discovered with kind 'inout', and (like the others) no backing SQL Server object.
 query TT
-SELECT name, kind FROM mssql_net_functions('cdb') WHERE name IN ('cf_tag', 'cf_summarize') ORDER BY name;
+SELECT name, kind FROM mssql_net_functions('cdb') WHERE name IN ('cf_tag', 'cf_running_sum') ORDER BY name;
 ----
-cf_summarize	inout
+cf_running_sum	inout
 cf_tag	inout
 
 query I
-SELECT cnt FROM mssql_net_query('cdb', 'SELECT COUNT(*) AS cnt FROM sys.objects WHERE name IN (''cf_tag'', ''cf_summarize'')');
+SELECT cnt FROM mssql_net_query('cdb', 'SELECT COUNT(*) AS cnt FROM sys.objects WHERE name IN (''cf_tag'', ''cf_running_sum'')');
 ----
 0
 

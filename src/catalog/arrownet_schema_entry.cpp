@@ -32,8 +32,6 @@
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 
-#include <atomic>
-
 namespace duckdb {
 
 ArrowNetSchemaEntry::ArrowNetSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, ArrowNetHandle handle)
@@ -330,53 +328,69 @@ unique_ptr<FunctionData> ArrowNetTableFunctionBind(ClientContext &context, Table
 // executed in C#; see SqlServerCatalog.InOutSessionImpl). Output = the input parameter
 // columns ++ the TVF's output columns. Read-only (a SQL Server TVF can't modify data).
 //
-// Parallel input (e.g. a UNION ALL parameter table) arrives as multiple per-branch
-// local states feeding ONE managed session over one bounded channel (thread-safe). The
-// session's output lags the input (the consumer runs CROSS APPLY on a background task),
-// so each push drains whatever output is ready; the *tail* (output not yet drained when
-// the last branch finishes) is flushed by inout_finish.
+// OUTPUT IS SYNCHRONOUS PER CHUNK: each in_out_function call pushes one input chunk and the
+// managed side runs THAT chunk's CROSS APPLY to completion, returning its full output — so
+// there is no lagging "tail" produced after the last input. This is what makes the design
+// robust: emitting rows never depends on detecting which parallel input branch finishes
+// last (`in_out_function_final` fires per branch, and the union branch pipelines may even run
+// sequentially — see PhysicalUnion::BuildPipelines — so a per-branch "last" detector is
+// unreliable). With no tail there is nothing to emit at the end, so there is no
+// `in_out_function_final` at all.
 //
-// `in_out_function_final` fires once PER branch — so it can't be the single "all input
-// done" signal (completing the channel on the first one would lose later branches' rows).
-// Instead an atomic active-branch counter (incremented per init_local, decremented once
-// per branch's first final) lets exactly the LAST branch call inout_finish and emit the
-// whole tail. The global-state destructor calls inout_abort on every teardown path
-// (frees the session handle + releases; idempotent after a clean finish) — the backstop
-// for LIMIT/error/cancel where finals may be skipped.
-//
-// NOTE: OperatorFinalize (the design's original plan) is a *global single-shot* hook that
-// returns no DataChunk, so it cannot emit the tail rows; FinalExecute (per branch) is the
-// only row-emitting post-input hook, hence the last-branch counter approach. OperatorFinalize
-// remains the right place for the future per-row-stored-proc COMMIT (which emits no rows).
+// Session lifecycle lives in a refcounted InOutSessionHolder carried on the bind data, so the
+// injected OperatorFinalize (Phase: per-row procs) can reach the same session to signal a clean
+// finish/COMMIT. The holder's destructor calls inout_abort on every teardown path (frees the
+// managed handle + rolls back/releases) — the reliable RAII backstop for normal/LIMIT/error/cancel.
+struct InOutSessionHolder {
+	ArrowNetHandle session = nullptr;
+	bool finished = false; // a clean finish (OperatorFinalize) was signalled
+	mutex lock;
+
+	// Clean finish / commit signal (no rows in the synchronous model). Idempotent. Used by the
+	// injected OperatorFinalize (built with per-row stored procs); unused for read-only TVFs.
+	void Finish() {
+		lock_guard<mutex> guard(lock);
+		if (!session || finished) {
+			return;
+		}
+		finished = true;
+		ArrowArrayStream out;
+		std::memset(&out, 0, sizeof(out));
+		arrownet::InOutFinish(session, out);
+		if (out.release) {
+			out.release(&out); // synchronous model: finish carries no tail rows
+		}
+	}
+
+	~InOutSessionHolder() {
+		// inout_abort releases the managed session AND frees the GCHandle (inout_finish does NOT
+		// free it), so call it on every path. Idempotent + best-effort (swallows errors): after a
+		// clean Finish it is a no-op release that just frees the handle.
+		arrownet::InOutAbort(session);
+	}
+};
+
 struct ArrowNetInOutBindData : public TableFunctionData {
 	ArrowNetHandle handle = nullptr;
 	string schema;
 	string func;
 	vector<LogicalType> input_types; // input parameter-table columns (= the TVF's positional params)
 	vector<string> input_names;
+	//! Per-execution managed session, opened in init_global, pushed by in_out_function, finished by the
+	//! injected OperatorFinalize / released by the holder destructor. shared_ptr so the injected operator
+	//! can hold the same session.
+	shared_ptr<InOutSessionHolder> session_holder;
 };
 
 struct ArrowNetInOutGlobalState : public GlobalTableFunctionState {
-	ArrowNetHandle session = nullptr;
-	std::atomic<idx_t> active_branches {0}; // # of parallel input branches still feeding the session
-
 	idx_t MaxThreads() const override {
-		return 1; // a single Arrow C output stream is consumed serially per finish
-	}
-
-	~ArrowNetInOutGlobalState() override {
-		// Frees the managed session handle + releases (idempotent after inout_finish). The
-		// sole cleanup on LIMIT/error/cancel, where the per-branch finals may not all fire.
-		arrownet::InOutAbort(session);
+		return 1; // the operator consumes one Arrow C output stream at a time
 	}
 };
 
 struct ArrowNetInOutLocalState : public LocalTableFunctionState {
-	bool pushed_current = false;                          // pushed the current input chunk yet?
-	unique_ptr<arrownet::ArrowStreamReader> reader;       // ready-output reader for the current input chunk
-	bool counted_down = false;                            // already decremented the active-branch counter?
-	bool is_last = false;                                 // this branch was the last → it drains the tail
-	unique_ptr<arrownet::ArrowStreamReader> tail_reader;  // final tail drain (last branch only)
+	bool pushed_current = false;                    // pushed the current input chunk yet?
+	unique_ptr<arrownet::ArrowStreamReader> reader; // output reader for the current input chunk
 };
 
 // Append the function's output columns (read from a zero-row get_function_output_schema stream) to
@@ -422,6 +436,7 @@ unique_ptr<FunctionData> ArrowNetInOutBind(ClientContext &context, TableFunction
 	bind_data->handle = info.handle;
 	bind_data->schema = info.schema;
 	bind_data->func = info.func;
+	bind_data->session_holder = make_shared_ptr<InOutSessionHolder>();
 
 	// 1) The input parameter columns lead the output (p.* in the CROSS APPLY). C# casts the
 	//    VALUES to the TVF's parameter types, so the echoed columns come back typed as the
@@ -449,6 +464,7 @@ unique_ptr<FunctionData> ArrowNetCustomInOutBind(ClientContext &context, TableFu
 	bind_data->handle = info.handle;
 	bind_data->schema = info.schema;
 	bind_data->func = info.func;
+	bind_data->session_holder = make_shared_ptr<InOutSessionHolder>();
 	for (idx_t i = 0; i < input.input_table_types.size(); i++) {
 		bind_data->input_types.push_back(input.input_table_types[i]);
 		bind_data->input_names.push_back(input.input_table_names[i]);
@@ -459,32 +475,36 @@ unique_ptr<FunctionData> ArrowNetCustomInOutBind(ClientContext &context, TableFu
 
 unique_ptr<GlobalTableFunctionState> ArrowNetInOutInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->Cast<ArrowNetInOutBindData>();
-	auto gstate = make_uniq<ArrowNetInOutGlobalState>();
-	// Build the input table's Arrow schema (its columns are the TVF's positional params) and
-	// open the managed session. C# consumes/releases the schema struct.
+	auto &holder = *bind.session_holder;
+	// Build the input table's Arrow schema (its columns are the TVF's positional params) and open the
+	// managed session into the holder (one per execution). C# consumes/releases the schema struct.
 	ArrowSchema input_schema;
 	std::memset(&input_schema, 0, sizeof(input_schema));
 	auto props = context.GetClientProperties();
 	ArrowConverter::ToArrowSchema(&input_schema, bind.input_types, bind.input_names, props);
-	gstate->session = arrownet::InOutOpen(bind.handle, bind.schema, bind.func, input_schema);
-	return std::move(gstate);
+	lock_guard<mutex> guard(holder.lock);
+	if (holder.session) {
+		// Re-execution of a cached plan: release the previous session before opening a new one.
+		arrownet::InOutAbort(holder.session);
+		holder.session = nullptr;
+	}
+	holder.finished = false;
+	holder.session = arrownet::InOutOpen(bind.handle, bind.schema, bind.func, input_schema);
+	return make_uniq<ArrowNetInOutGlobalState>();
 }
 
-unique_ptr<LocalTableFunctionState> ArrowNetInOutInitLocal(ExecutionContext &, TableFunctionInitInput &input,
-                                                           GlobalTableFunctionState *global_state) {
-	auto &g = global_state->Cast<ArrowNetInOutGlobalState>();
-	g.active_branches.fetch_add(1);
+unique_ptr<LocalTableFunctionState> ArrowNetInOutInitLocal(ExecutionContext &, TableFunctionInitInput &,
+                                                           GlobalTableFunctionState *) {
 	return make_uniq<ArrowNetInOutLocalState>();
 }
 
-// Per input chunk: push it to the session (CROSS APPLY runs in C#), then stream out whatever
-// output is ready. HAVE_MORE_OUTPUT drains the current ready batch across re-calls (same input);
-// NEED_MORE_INPUT advances to the next chunk. Output that the consumer hasn't produced yet is
-// flushed later by the final drain.
+// Per input chunk: push it to the session — the managed side runs THAT chunk's CROSS APPLY to
+// completion and returns its full output (synchronous, no lagging tail). HAVE_MORE_OUTPUT drains the
+// chunk's output across re-calls (same input); NEED_MORE_INPUT advances to the next chunk. Parallel
+// branches push into the one session concurrently; the managed Push serializes them.
 OperatorResultType ArrowNetInOutFunction(ExecutionContext &context, TableFunctionInput &data, DataChunk &input,
                                          DataChunk &output) {
 	auto &bind = data.bind_data->Cast<ArrowNetInOutBindData>();
-	auto &g = data.global_state->Cast<ArrowNetInOutGlobalState>();
 	auto &l = data.local_state->Cast<ArrowNetInOutLocalState>();
 
 	if (!l.pushed_current) {
@@ -502,51 +522,19 @@ OperatorResultType ArrowNetInOutFunction(ExecutionContext &context, TableFunctio
 
 		ArrowArrayStream ready;
 		std::memset(&ready, 0, sizeof(ready));
-		arrownet::InOutPush(g.session, array, ready);
+		arrownet::InOutPush(bind.session_holder->session, array, ready);
 		l.reader = make_uniq<arrownet::ArrowStreamReader>(context.client, ready);
 		l.pushed_current = true;
 	}
 
 	l.reader->Read(output);
 	if (output.size() == 0) {
-		// Current chunk's ready output is exhausted — fetch the next input chunk.
+		// This chunk's output is exhausted — fetch the next input chunk.
 		l.reader.reset();
 		l.pushed_current = false;
 		return OperatorResultType::NEED_MORE_INPUT;
 	}
 	return OperatorResultType::HAVE_MORE_OUTPUT;
-}
-
-// Per-branch final. Decrement the active-branch counter once; the branch that drives it to
-// zero is the last one feeding the session — it calls inout_finish (completes the channel,
-// waits for the consumer, drains the entire remaining output) and emits that tail. Every
-// other branch's final is a no-op (the channel must NOT be completed before all branches
-// are done — that was the original parallel-UNION-ALL pain).
-OperatorFinalizeResultType ArrowNetInOutFinal(ExecutionContext &context, TableFunctionInput &data, DataChunk &output) {
-	auto &g = data.global_state->Cast<ArrowNetInOutGlobalState>();
-	auto &l = data.local_state->Cast<ArrowNetInOutLocalState>();
-
-	if (!l.counted_down) {
-		l.counted_down = true;
-		if (g.active_branches.fetch_sub(1) == 1) { // was 1 -> now 0: this is the last branch
-			l.is_last = true;
-			ArrowArrayStream tail;
-			std::memset(&tail, 0, sizeof(tail));
-			arrownet::InOutFinish(g.session, tail);
-			l.tail_reader = make_uniq<arrownet::ArrowStreamReader>(context.client, tail);
-		}
-	}
-
-	if (l.is_last && l.tail_reader) {
-		l.tail_reader->Read(output);
-		if (output.size() == 0) {
-			l.tail_reader.reset();
-			return OperatorFinalizeResultType::FINISHED;
-		}
-		return OperatorFinalizeResultType::HAVE_MORE_OUTPUT;
-	}
-	output.SetCardinality(0);
-	return OperatorFinalizeResultType::FINISHED;
 }
 
 } // namespace
@@ -649,7 +637,6 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateInOutFunction(ClientC
 	TableFunction inout(each_name, {LogicalType::TABLE}, nullptr, ArrowNetInOutBind, ArrowNetInOutInitGlobal,
 	                    ArrowNetInOutInitLocal);
 	inout.in_out_function = ArrowNetInOutFunction;
-	inout.in_out_function_final = ArrowNetInOutFinal;
 	auto fn_info = make_shared_ptr<ArrowNetTableFunctionInfo>();
 	fn_info->handle = handle_;
 	fn_info->schema = name;
@@ -677,7 +664,6 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateCustomInOutFunction(C
 	TableFunction inout(func_name, {LogicalType::TABLE}, nullptr, ArrowNetCustomInOutBind, ArrowNetInOutInitGlobal,
 	                    ArrowNetInOutInitLocal);
 	inout.in_out_function = ArrowNetInOutFunction;
-	inout.in_out_function_final = ArrowNetInOutFinal;
 	auto fn_info = make_shared_ptr<ArrowNetTableFunctionInfo>();
 	fn_info->handle = handle_;
 	fn_info->schema = name;
