@@ -533,10 +533,10 @@ they don't apply to in-out declarations.
 
 (Refined with the user; this is what we build first. Supersedes any conflicting sketch above.)
 
-**Feature.** A discovered SQL Server **TVF** gains a *second overload* that takes an **input parameter
-table** and applies the function **once per input row**, combined via SQL Server **`CROSS APPLY`**. So
-`SELECT * FROM db.dbo.tf_nums( (SELECT n FROM params) )` runs `tf_nums(n)` for each row of `params`.
-Per input chunk the C# session generates and runs, **on SQL Server**:
+**Feature.** A discovered SQL Server **TVF** gains a sibling **`<name>_each`** entry that takes an
+**input parameter table** and applies the function **once per input row**, combined via SQL Server
+**`CROSS APPLY`**. So `SELECT * FROM db.dbo.tf_nums_each( (SELECT n FROM params) )` runs `tf_nums(n)`
+for each row of `params`. Per input chunk the C# session generates and runs, **on SQL Server**:
 ```sql
 SELECT p.*, f.* FROM (VALUES (@r0c0,…),(@r1c0,…),…) AS p(col0,…) CROSS APPLY [dbo].[tf_nums](p.col0,…) AS f;
 ```
@@ -553,40 +553,68 @@ parallel `UNION ALL` input arrives as multiple local states/threads that must fe
 **The crux — verified empirically.** `in_out_function_final` is called **once per parallel input branch**
 (observed: **twice** for a 2-way `UNION ALL`), so it is **NOT** a usable single "all input done" signal —
 completing the channel / closing the session on the first one loses the second branch's rows (the real pain).
-A producer-count over per-branch finals is fragile (skipped on `LIMIT`/error → never balances → hang). So:
 
-- **The injected `OperatorFinalize` operator IS required even for read-only** — its purpose here is the
-  **single reliable "all parallel input exhausted" signal**, NOT commit (an earlier note wrongly said
-  "only for write/commit"; that was wrong). Build it via `LogicalExtensionOperator` + an `OptimizerExtension`
-  that wraps the in-out's logical node; `CreatePlan` emits a thin pass-through `PhysicalOperator`
-  (`RequiresOperatorFinalize()=true`) whose `OperatorFinalize` → `inout_finish` (complete channel + drain
-  tail). This **replaces** the producer-count.
-- **Operator-state destructor → `inout_abort`** is the backstop for `LIMIT`/error/cancel (where even
-  `OperatorFinalize` may not fire); idempotent with `inout_finish`.
+**CORRECTION (verified during the build — supersedes the earlier "OperatorFinalize is the signal" plan):**
+`PhysicalOperator::OperatorFinalize` is a **global single-shot** hook that returns `OperatorFinalResultType`
+and is handed **no `DataChunk`** (`OperatorFinalizeInput {GlobalOperatorState&, InterruptState&}`) — it runs
+in the `PipelineFinishEvent` alongside the sink's `Finalize`, **after** the pipeline has stopped pulling
+rows. So it **cannot emit the tail** downstream. The only **row-emitting** post-input hook is
+`FinalExecute` (`in_out_function_final`), which fires **per branch**. Therefore the tail must be emitted by
+exactly the **last** branch's final, selected by an **atomic active-branch counter** (NOT an injected
+`OperatorFinalize`):
+
+- **init_local increments** a `std::atomic<idx_t> active_branches`; **`in_out_function_final` decrements it
+  once per branch.** The branch that drives it to **0** is the last one still feeding → it calls
+  `inout_finish` (complete the channel, wait for the consumer, drain the **entire** remaining output) and
+  emits that tail across `HAVE_MORE_OUTPUT` finals. Every other branch's final is a **no-op** (it must NOT
+  complete the channel — that was the UNION-ALL pain). The counter is reached **only on the normal path**;
+  on `LIMIT`/error the finals are skipped, the counter never hits 0, and `inout_finish` is simply not called
+  (we don't need the tail then) — nothing blocks on the counter, so there is **no hang** (the earlier
+  "producer-count → hang" worry assumed something *waits* on it; nothing does).
+- **Operator-state (global) destructor → `inout_abort`** runs on **every** teardown path (normal, `LIMIT`,
+  error, cancel): it frees the managed session handle + releases, and is the sole cleanup when the finals are
+  skipped. Idempotent after a clean `inout_finish`. This is the real backstop.
 - `in_out_function` (any branch) → `inout_push` (feed the bounded channel, thread-safe + backpressure; pull
-  available output). `in_out_function_final` is **not** used for completion.
+  available output). `in_out_function_final` is used only to elect the last branch + emit the tail.
 
-**APIs verified present in v1.5.4** (the §11 design is feasible, not just theoretical): `in_out_function` /
-`in_out_function_final` + `OperatorResultType {NEED_MORE_INPUT, HAVE_MORE_OUTPUT, FINISHED, BLOCKED}`;
-`PhysicalOperator::OperatorFinalize` + `RequiresOperatorFinalize()`; `LogicalExtensionOperator::CreatePlan`;
-`OptimizerExtension`; the `{LogicalType::TABLE}`-arg registration pattern (ref: built-in `summary` =
+`OperatorFinalize` / the injected `LogicalExtensionOperator` is therefore **not built for the read-only TVF
+case**. It remains the right mechanism for the **future per-row stored-proc COMMIT** (a single post-all-input
+action that emits no rows), so revisit it then.
+
+**APIs used in v1.5.4** (verified in the build): `in_out_function` / `in_out_function_final` +
+`OperatorResultType {NEED_MORE_INPUT, HAVE_MORE_OUTPUT, FINISHED, BLOCKED}`; the
+`{LogicalType::TABLE}`-arg registration pattern (ref: built-in `summary` =
 `TableFunction("summary",{LogicalType::TABLE},nullptr,Bind)` + `in_out_function` + `init_global`/`init_local`,
-where init returns *our* state so the RAII destructor is real).
+where init returns *our* state so the RAII destructor is real — `PhysicalTableInOutFunction::GetGlobalOperatorState`
+wraps it, so the global-state destructor is the abort backstop, and `RequiresFinalExecute()` is `true` iff
+`in_out_function_final` is set). `OperatorFinalize`/`LogicalExtensionOperator`/`OptimizerExtension` exist but
+are **not used** for this read-only case (see the CORRECTION above) — reserved for the per-row-proc COMMIT.
 
-**ABI (session-based):** `inout_open(handle, schema, func, scalar_args, input_schema) → session`;
-`inout_push(session, in_chunk, out)`; `inout_finish(session, out)`; `inout_abort(session)` — all idempotent.
+**ABI (session-based, implemented at v23):** `inout_open(handle, schema, func, input_schema) → session` (the
+input table's columns ARE the TVF's positional params — no separate scalar args); `inout_push(session,
+in_chunk, out)` (out = output ready so far); `inout_finish(session, out)` (out = the entire remaining tail);
+`inout_abort(session)` (frees the handle) — all idempotent.
 
-**Registration:** the discovered TVF becomes a `TableFunctionSet` — the scalar-arg form (4c, `tf_nums(5)`)
-**+** a new `{LogicalType::TABLE}` in-out form (`tf_nums(<table>)`); DuckDB picks by call shape. Discovery via
-the existing `UNION ALL` functions-metadata with a new `kind` for the in-out form (or by adding the overload
-when registering a discovered `kind='table'`).
+**Registration (CORRECTED — shape-dispatch is infeasible).** The original plan was a single
+`TableFunctionSet` with the scalar-arg form (4c, `tf_nums(5)`) **+** a `{LogicalType::TABLE}` overload, with
+DuckDB picking by call shape. **DuckDB v1.5.4 forbids this:** `bind_table_function.cpp` throws *"Function …
+has a TABLE parameter, and multiple function overloads — this is not supported"* (`functions.Size() != 1`).
+So the in-out form is a **separate catalog entry under its own name** — the convention is the discovered TVF
+name **+ `_each`** suffix (e.g. `tf_nums_each`), a `TableFunctionCatalogEntry` with a **single**
+`{LogicalType::TABLE}` function; the scan form (4c) keeps the bare name `tf_nums`. The synthetic alias is
+tracked in `ArrowNetSchemaEntry::inout_functions_` (`<name>_each` → base TVF), registered for every
+discovered `kind='table'` (procs excluded — per-row procs are a later layer), and listed by `Scan` so it's
+discoverable. A *real* SQL Server function literally named `…_each` shadows the alias (the real name is
+matched first). The in-out bind's `function_info.func` is the **base** TVF name (the CROSS APPLY target).
 
 **Also wanted later: a custom C#-authored table in/out function** — `IArrowTableInOutFunction` (the in-out
 analog of 4e `IArrowScalarFunction` / 4f `IArrowTableFunction`): a pure-C# in-out (e.g. a streaming transform
 / running aggregate) authored in the provider, dispatched through the *same* session+channel+`OperatorFinalize`
 machinery. Build after the TVF CROSS APPLY case proves the operator/channel plumbing.
 
-**Build order:** session ABI + C# `InOutSession` (bounded channel consumer + CROSS APPLY SQL gen) → C++
-`in_out_function` operator + `init_global`/`init_local` + the injected `LogicalExtensionOperator`/
-`OperatorFinalize` + destructor-abort → the §11 test matrix (`UNION ALL`, `ORDER BY`, `LIMIT`, `WHERE`,
-aggregate/join, error/cancel, empty/large). Then: per-row stored procs (with rollback) + custom C# in-out.
+**Build order:** session ABI + C# `InOutSession` (bounded channel consumer + CROSS APPLY SQL gen) **[DONE]**
+→ C++ `in_out_function` operator + `init_global`/`init_local` + last-branch-counter tail-emit +
+destructor-abort **[DONE]** → the §11 test matrix (`UNION ALL`, `ORDER BY`, `LIMIT`, `WHERE`, aggregate,
+error/recover, empty/large) **[DONE — `test/verify_table_inout.test`, 63 assertions]**. Next: per-row stored
+procs (with rollback, where the injected `OperatorFinalize` COMMIT becomes relevant) + a custom C#-authored
+`IArrowTableInOutFunction` (in-out analog of 4e/4f), reusing the same session+channel machinery.
