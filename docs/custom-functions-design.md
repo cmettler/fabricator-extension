@@ -579,20 +579,26 @@ So:
   every teardown path (normal/`LIMIT`/error/cancel) — the reliable release/rollback backstop (frees the
   managed GCHandle too; `inout_finish` does not). The holder is `shared_ptr` so the **injected
   OperatorFinalize** (next bullet) can reach the same session.
-- **`OperatorFinalize` is reserved for the per-row stored-proc COMMIT** — a single, reliable, post-all-input,
-  **no-rows** action, which is exactly what it can do. Verified it fires **once** even above a UNION: a UNION
-  branch pipeline shares the base pipeline's single `PipelineFinishEvent` (`MetaPipeline::CreateUnionPipeline`
-  doesn't `AddFinishEvent`; executor `else` branch), unlike per-branch `FinalExecute`. The plan: an
-  `OptimizerExtension` wraps the in-out's `LogicalGet` in a `LogicalExtensionOperator` whose pass-through
-  `PhysicalOperator::OperatorFinalize` calls `holder->Finish()` (→ `inout_finish` = COMMIT). Built with procs
-  (it's a no-op for read-only TVFs / custom in-out, so there's nothing to test until a proc can commit/roll back).
+- **`OperatorFinalize` is BUILT — as a reliable "in-out finished" signal for C# resource cleanup**, NOT for
+  the proc commit. (Originally planned for the proc COMMIT; that turned out wrong — committing the in-out's
+  own txn at operator-finish would commit before a user's explicit `ROLLBACK` could undo it, so the per-row
+  proc instead runs on DuckDB's pinned transaction and the **transaction manager** drives commit/rollback.)
+  It fires **once** even above a UNION (a UNION branch pipeline shares the base pipeline's single
+  `PipelineFinishEvent` — `MetaPipeline::CreateUnionPipeline` doesn't `AddFinishEvent`, executor `else`
+  branch — unlike per-branch `FinalExecute`; verified empirically). An `OptimizerExtension`
+  (`RegisterArrowNetInOutFinalizer`) wraps the in-out's `LogicalGet` (identified by `function.in_out_function
+  == ArrowNetInOutFunction`, RTTI-free) in a pass-through `LogicalExtensionOperator` whose `PhysicalOperator`
+  (`PhysicalOperatorType::EXTENSION`) forwards rows 1:1 and calls `holder->Finish()` → C# `inout_finish` in
+  `OperatorFinalize`. For a read-only TVF that's the clean commit of its snapshot transaction; for procs/custom
+  it's resource cleanup; the holder destructor's `inout_abort` stays the LIMIT/error backstop.
 
 **APIs used in v1.5.4** (verified in the build): `in_out_function` +
 `OperatorResultType {NEED_MORE_INPUT, HAVE_MORE_OUTPUT, FINISHED, BLOCKED}`; the
 `{LogicalType::TABLE}`-arg registration pattern (ref: built-in `summary` =
 `TableFunction("summary",{LogicalType::TABLE},nullptr,Bind)` + `in_out_function` + `init_global`/`init_local`).
 `OperatorFinalize` (fires once, sink-level, even above a UNION) / `LogicalExtensionOperator` /
-`OptimizerExtension` exist and are reserved for the per-row-proc COMMIT (see above).
+`OptimizerExtension` / `PhysicalOperatorType::EXTENSION` — used to inject the "in-out finished" cleanup
+signal (see above).
 
 **ABI (session-based, implemented at v23):** `inout_open(handle, schema, func, input_schema) → session` (the
 input table's columns ARE the TVF's positional params — no separate scalar args); `inout_push(session,
@@ -621,9 +627,12 @@ C++ `AddInOutFunction` registers a bare-name `{TABLE}` entry reusing the 4g oper
 Demos `dbo.cf_tag` (per-row) + `dbo.cf_summarize` (stateful, emits at Finish); see
 `test/verify_custom_functions.test`.
 
-**Build order:** session ABI + C# `InOutSession` (bounded channel consumer + CROSS APPLY SQL gen) **[DONE]**
-→ C++ `in_out_function` operator + `init_global`/`init_local` + last-branch-counter tail-emit +
-destructor-abort **[DONE]** → the §11 test matrix (`UNION ALL`, `ORDER BY`, `LIMIT`, `WHERE`, aggregate,
-error/recover, empty/large) **[DONE — `test/verify_table_inout.test`, 63 assertions]** → custom C#-authored
-`IArrowTableInOutFunction` **[DONE — `test/verify_custom_functions.test`]**. Next: per-row stored procs
-(with rollback, where the injected `OperatorFinalize` COMMIT finally becomes relevant).
+**Build order (all DONE — 4g complete):** session ABI + C# `InOutSession` → C++ `in_out_function` operator
+(synchronous per-chunk output, no counter; RAII `InOutSessionHolder`) → §11 test matrix
+(`test/verify_table_inout.test`, 63) → configurable isolation (ATTACH `isolation_level` + `SET
+mssql_isolation_level`, one `SqlTransaction` per call, ABI v24; `test/verify_inout_isolation.test`, 17) →
+custom C#-authored `IArrowTableInOutFunction` (`test/verify_custom_functions.test`) → per-row stored procs
+(`usp_x_each`, on DuckDB's pinned transaction; `test/verify_proc_inout.test`, 31) → the injected
+`OperatorFinalize` "in-out finished" cleanup signal (`OptimizerExtension` + `LogicalExtensionOperator` +
+pass-through `PhysicalOperator`, fires once even above a UNION). Possible future: OUTPUT-param-only proc
+`_each`, multi-result-set procs, an `OperatorExtension` so in-out plans can be serialized/deserialized.

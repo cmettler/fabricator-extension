@@ -117,28 +117,25 @@ current code still uses the single-provider `mssql_net` naming):
   full declared schema, no input echo), dispatched in C# (`CustomInOut` factory registry → fresh instance per
   session; `CustomInOutSessionImpl` runs `Process(chunk)`). Reuses the 4g operator path — no new ABI/C++
   operator. Verified: `test/verify_custom_functions.test` (cf_tag per-row, cf_running_sum stateful 4999-row
-  multi-chunk, per-session state, no SQL object).
-- **Per-row stored procs (4g-proc)**: a discovered proc also gets `_each` (C++ `AddTableFunction` registers
-  the alias for procs too; the in-out bind/operator are reused). C# `InOutOpen` routes a proc (`sys.objects`
-  P/PC) to `ProcInOutSessionImpl`: per input row it runs `DECLARE @t TABLE(<proc result>); INSERT @t EXEC
-  [s].[p] @param=@p,…; SELECT <echoed input>, t.* FROM @t;` on **DuckDB's pinned connection/`_txn`**
-  (`BeginWrite`) — echo is server-side (output = input cols ++ proc result cols), result-set procs only. The
-  proc's writes commit/roll back with **DuckDB's** transaction (autocommit + explicit `BEGIN`), so
-  `Finish`/`Abort` are cleanup-only. Verified: `test/verify_proc_inout.test`. **(4g-proc) per-row stored-proc in-out DONE**: a discovered
+  multi-chunk, per-session state, no SQL object). **(4g-proc) per-row stored-proc in-out DONE**: a discovered
   proc also gets `_each` (`db.s.usp_x_each(<table>)` EXECs the proc once per input row — a proc can't be
   inline-CROSS-APPLY'd). The per-row EXECs run on **DuckDB's pinned transaction** (`BeginWrite`), so the
   proc's writes commit/roll back with **DuckDB's** COMMIT/ROLLBACK — atomic in autocommit AND inside an
   explicit DuckDB `BEGIN`, no per-row commits. **`OperatorFinalize` is NOT used for the commit** (committing
   the in-out's own txn at operator-finish would commit before a user's explicit `ROLLBACK` could undo it; the
   transaction manager is the correct signal). C# `InOutOpen` routes a proc (`sys.objects` type P/PC) to
-  `ProcInOutSessionImpl`, which per row runs `DECLARE @t TABLE(<proc result>); INSERT @t EXEC [s].[p]
-  @param=@p,…; SELECT <echoed input>, t.* FROM @t;` on the pinned conn/`_txn` (echo done server-side →
-  output = input columns ++ proc result columns; result-set procs only). Verified: `test/verify_proc_inout.test`
-  (echo output, autocommit commit, row-failure rolls back the whole statement, explicit-`BEGIN`
-  read-your-writes + `ROLLBACK` undoes — 31 assertions). **Next: the `OperatorFinalize` cleanup signal**
-  (injected operator → C# `inout_finish` as a reliable "in-out finished, release resources" hook — NOT for
-  commit; for the read-only TVF it cleanly commits the own snapshot txn, and is a C# cleanup hook for other
-  uses; `OperatorFinalize` fires once even above a UNION, verified via `MetaPipeline`/executor scheduling).
+  `ProcInOutSessionImpl`, per row running `DECLARE @t TABLE(<proc result>); INSERT @t EXEC [s].[p] @param=@p,…;
+  SELECT <echoed input>, t.* FROM @t;` on the pinned conn/`_txn` (echo server-side → output = input columns ++
+  proc result columns; result-set procs only). Verified: `test/verify_proc_inout.test` (echo output, autocommit
+  commit, row-failure rolls back the whole statement, explicit-`BEGIN` read-your-writes + `ROLLBACK` undoes —
+  31 assertions). **(4g-finalize) the injected `OperatorFinalize` DONE**: an `OptimizerExtension`
+  (`RegisterArrowNetInOutFinalizer`) wraps each in-out `LogicalGet` (identified by `function.in_out_function
+  == ArrowNetInOutFunction`) in a pass-through `LogicalExtensionOperator` whose `PhysicalOperator`
+  (`PhysicalOperatorType::EXTENSION`) forwards rows 1:1 and, in `OperatorFinalize`, calls `holder->Finish()`
+  → C# `inout_finish`. This is the reliable single "in-out finished" signal (fires **once**, sink-level, even
+  above a parallel UNION — verified empirically + via `MetaPipeline`/executor finish-event scheduling),
+  intended as a C# resource-cleanup hook + a clean commit of the read-only TVF's snapshot transaction
+  (NOT the proc commit). **4g (table-in-out) is fully complete.**
 
 ## Implementation status (current)
 
@@ -174,13 +171,13 @@ non-data: error-WORDING/number assertions (corpus expects native-extension text)
 (`mssql_pool_stats`/`mssql_open` diagnostics, krb5 connstr parser), COPY-to-temp-table empty-schema
 syntax, and catalog-after-rollback staleness.
 
-**Not yet / out of scope:** the **`OperatorFinalize` cleanup signal** (a reliable injected "in-out finished →
-release resources" C# hook — NOT for commit; see the 4g sequencing note) and
+**Not yet / out of scope:**
 **load-time global** functions
 (Phase 3 — scalar UDFs, TVFs, stored procs + custom C#-authored scalar, table & table-in-out functions +
-discovered-TVF & per-row-proc table-in-out done, see "Callable scalar UDFs (4b)" / "table functions (4c)" /
-"stored procedures (4d)" / "custom functions (4e scalar, 4f table)" / "table-in-out (4g — incl. custom C#
-in-out + per-row procs)"; proc multi-result-set + INPUT/OUTPUT + OUTPUT-param-only `_each` still deferred;
+discovered-TVF & per-row-proc table-in-out + the OperatorFinalize cleanup signal all done, see "Callable
+scalar UDFs (4b)" / "table functions (4c)" / "stored procedures (4d)" / "custom functions (4e scalar, 4f
+table)" / "table-in-out (4g — incl. custom C# in-out, per-row procs, OperatorFinalize)"; proc
+multi-result-set + INPUT/OUTPUT + OUTPUT-param-only `_each` still deferred;
 load-time global deferred in
 favor of attach-time custom functions); connection
 pooling knobs / `mssql_pool_stats` (ADO.NET pools by connstr already); COPY to temp tables
@@ -401,6 +398,23 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
   (runs `Process` per push) ahead of the CROSS APPLY path. Demos `CustomFunctions.InOut`: `dbo.cf_tag`
   (per-row `(n, n*n)`) + `dbo.cf_running_sum` (stateful cumulative sum, emitted per row). Verified in
   `test/verify_custom_functions.test`.
+- **Per-row stored procs (4g-proc)**: a discovered proc also gets `_each` (C++ `AddTableFunction` registers
+  the alias for procs too; the in-out bind/operator are reused — a proc can't be inline-CROSS-APPLY'd, so
+  it's EXEC'd per row). C# `InOutOpen` routes a proc (`sys.objects` P/PC) to `ProcInOutSessionImpl`: per
+  input row it runs `DECLARE @t TABLE(<proc result>); INSERT @t EXEC [s].[p] @param=@p,…; SELECT
+  <echoed input>, t.* FROM @t;` on **DuckDB's pinned connection/`_txn`** (`BeginWrite`) — echo is server-side
+  (output = input cols ++ proc result cols), result-set procs only. The proc's writes commit/roll back with
+  **DuckDB's** transaction (autocommit + explicit `BEGIN`), so `Finish`/`Abort` are cleanup-only. Verified:
+  `test/verify_proc_inout.test`.
+- **OperatorFinalize cleanup signal (4g-finalize)**: an `OptimizerExtension` (`RegisterArrowNetInOutFinalizer`,
+  registered at load) wraps each in-out `LogicalGet` (identified by `function.in_out_function ==
+  ArrowNetInOutFunction`, RTTI-free) in a pass-through `LogicalExtensionOperator`; its `PhysicalOperator`
+  (`PhysicalOperatorType::EXTENSION`) forwards rows 1:1 (`Execute = chunk.Reference(input)`) and, in
+  `OperatorFinalize`, calls `holder->Finish()` → C# `inout_finish`. Fires **once**, sink-level, even above a
+  parallel UNION (unlike per-branch `in_out_function_final`) — a reliable C# resource-cleanup hook + the clean
+  commit of a read-only TVF's snapshot transaction (NOT the proc commit — DuckDB drives that). Transparent to
+  data flow (`GetColumnBindings`/`ResolveTypes` delegate to the child); the holder destructor's `inout_abort`
+  stays the LIMIT/error backstop (idempotent via `_scopeClosed`).
 
 - **Filtering**: discovered scalar UDFs + TVFs/procs are gated by the ATTACH `schema_filter` (icase
   `std::regex`, applied in `LoadCatalog`/`RefreshCache`); `table_filter` is table-only and does NOT apply to functions.
