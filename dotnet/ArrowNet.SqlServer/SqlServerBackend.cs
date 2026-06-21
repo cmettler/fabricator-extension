@@ -1,5 +1,7 @@
+using System.Collections.Concurrent;
 using System.Data;
 using System.Text;
+using System.Threading.Channels;
 using ArrowNet.Bridge;
 using Apache.Arrow;
 using Apache.Arrow.Ipc;
@@ -1378,11 +1380,216 @@ public sealed class SqlServerCatalog : IBackendCatalog
     // parameter names (only the supplied ones are present; omitted optionals use the
     // proc's DEFAULT). Streams the first result set lazily. No pushdown (EXEC is not
     // inline-wrappable); DuckDB applies projection + filters above the scan.
-    // 4g table-in-out (build in progress): the real SqlServerInOutSession (bounded channel + per-input-batch
-    // `VALUES … CROSS APPLY [s].[func](…)` generation) and the C++ in_out_function operator + injected
-    // OperatorFinalize are the next increment. See docs/custom-functions-design.md §11.1.
+    // 4g table-in-out: stream an input parameter table through SQL Server CROSS APPLY of the TVF (the
+    // input columns are the function's positional params). The C++ in_out_function operator pushes input
+    // chunks (one session per call, parallel branches into one bounded channel) and a single
+    // OperatorFinalize drives Finish.
     public IInOutSession InOutOpen(string schemaName, string functionName, Schema inputSchema) =>
-        throw new NotImplementedException("mssql_net: table-in-out (4g) is not implemented yet");
+        new InOutSessionImpl(this, schemaName, functionName, inputSchema);
+
+    private sealed class InOutSessionImpl : IInOutSession
+    {
+        private readonly SqlServerCatalog _owner;
+        private readonly string _qualified;       // [schema].[func]
+        private readonly string[] _colNames;       // input column names (VALUES aliases + CROSS APPLY args)
+        private readonly string[] _colSqlTypes;    // SQL types for the VALUES CAST (positional TVF params)
+        private readonly Schema _inputSchema;
+        private readonly Schema _outputSchema;
+        // One single-reader input channel fed by all parallel branches; one output channel.
+        private readonly Channel<RecordBatch> _in =
+            Channel.CreateBounded<RecordBatch>(new BoundedChannelOptions(4) { SingleReader = true });
+        private readonly Channel<RecordBatch> _out = Channel.CreateBounded<RecordBatch>(4);
+        private readonly ConcurrentQueue<RecordBatch> _stash = new(); // output drained during a blocked Push
+        private readonly Task _consumer;
+        private volatile bool _aborted;
+
+        public Schema InputSchema => _inputSchema;
+
+        public InOutSessionImpl(SqlServerCatalog owner, string schemaName, string functionName, Schema inputSchema)
+        {
+            _owner = owner;
+            _qualified = Quote(schemaName) + "." + Quote(functionName);
+            _inputSchema = inputSchema;
+            _colNames = inputSchema.FieldsList.Select(f => f.Name).ToArray();
+            // Input columns map positionally to the TVF's parameters; CAST the VALUES columns to those
+            // SQL types so CROSS APPLY binds (and an all-NULL chunk still type-checks).
+            var pars = owner.FunctionParameters(schemaName, functionName, wantReturn: false);
+            _colSqlTypes = new string[_colNames.Length];
+            for (int i = 0; i < _colNames.Length; i++)
+            {
+                _colSqlTypes[i] = i < pars.Count ? pars[i].sqlType : "sql_variant";
+            }
+            // Output = the input parameter columns (p.*) + the TVF's output columns (f.*).
+            using (var os = owner.GetFunctionOutputSchema(schemaName, functionName))
+            {
+                _outputSchema = new Schema(_inputSchema.FieldsList.Concat(os.Schema.FieldsList), metadata: null);
+            }
+            _consumer = Task.Run(ConsumeAsync);
+        }
+
+        public void Push(RecordBatch chunk)
+        {
+            if (_aborted)
+            {
+                chunk.Dispose();
+                return;
+            }
+            // Backpressure without deadlock: if the input channel is full, drain ready output into the
+            // stash so the consumer (possibly blocked writing output) can progress + free input space.
+            while (!_in.Writer.TryWrite(chunk))
+            {
+                if (_out.Reader.TryRead(out var ready))
+                {
+                    _stash.Enqueue(ready);
+                }
+                else if (_consumer.IsCompleted)
+                {
+                    chunk.Dispose();
+                    _consumer.GetAwaiter().GetResult(); // surface a consumer fault
+                    return;
+                }
+                else
+                {
+                    Thread.Sleep(1);
+                }
+            }
+        }
+
+        public IArrowArrayStream DrainReady()
+        {
+            var list = new List<RecordBatch>();
+            while (_stash.TryDequeue(out var b))
+            {
+                list.Add(b);
+            }
+            while (_out.Reader.TryRead(out var b))
+            {
+                list.Add(b);
+            }
+            return new InMemoryArrayStream(_outputSchema, list);
+        }
+
+        public IArrowArrayStream Finish()
+        {
+            _in.Writer.TryComplete(); // no more input — the single all-branches-done signal
+            var list = new List<RecordBatch>();
+            while (_stash.TryDequeue(out var b))
+            {
+                list.Add(b);
+            }
+            // Block until the consumer has produced all output (throws if the consumer faulted).
+            var reader = _out.Reader;
+            while (reader.WaitToReadAsync().AsTask().GetAwaiter().GetResult())
+            {
+                while (reader.TryRead(out var b))
+                {
+                    list.Add(b);
+                }
+            }
+            return new InMemoryArrayStream(_outputSchema, list);
+        }
+
+        public void Abort()
+        {
+            _aborted = true;
+            _in.Writer.TryComplete();
+            while (_stash.TryDequeue(out var b))
+            {
+                b.Dispose();
+            }
+            while (_out.Reader.TryRead(out var b))
+            {
+                b.Dispose();
+            }
+        }
+
+        private async Task ConsumeAsync()
+        {
+            try
+            {
+                await foreach (var batch in _in.Reader.ReadAllAsync())
+                {
+                    using (batch)
+                    {
+                        if (_aborted)
+                        {
+                            continue;
+                        }
+                        foreach (var outBatch in RunCrossApply(batch))
+                        {
+                            await _out.Writer.WriteAsync(outBatch);
+                        }
+                    }
+                }
+                _out.Writer.TryComplete();
+            }
+            catch (Exception ex)
+            {
+                _out.Writer.TryComplete(ex);
+            }
+        }
+
+        // One input batch -> `SELECT p.*, f.* FROM (VALUES …) p(cols) CROSS APPLY [s].[func](p.cols) f`,
+        // sub-chunked to stay under SQL Server's ~2100-parameter cap; yields the per-query result batches.
+        private IEnumerable<RecordBatch> RunCrossApply(RecordBatch batch)
+        {
+            int rows = batch.Length;
+            int cols = _colNames.Length;
+            if (rows == 0 || cols == 0)
+            {
+                yield break;
+            }
+            int maxRows = Math.Max(1, 2000 / cols);
+            for (int start = 0; start < rows; start += maxRows)
+            {
+                int end = Math.Min(start + maxRows, rows);
+                var sb = new StringBuilder("SELECT p.*, f.* FROM (VALUES ");
+                var sqlParams = new List<SqlParameter>();
+                for (int r = start; r < end; r++)
+                {
+                    if (r > start)
+                    {
+                        sb.Append(", ");
+                    }
+                    sb.Append('(');
+                    for (int c = 0; c < cols; c++)
+                    {
+                        if (c > 0)
+                        {
+                            sb.Append(", ");
+                        }
+                        var pn = $"@p{r}_{c}";
+                        sb.Append("CAST(").Append(pn).Append(" AS ").Append(_colSqlTypes[c]).Append(')');
+                        sqlParams.Add(new SqlParameter(pn,
+                            ArrowValueReader.ReadScalar(batch.Column(c), r) ?? (object)DBNull.Value));
+                    }
+                    sb.Append(')');
+                }
+                sb.Append(") AS p(");
+                for (int c = 0; c < cols; c++)
+                {
+                    sb.Append(c > 0 ? ", " : "").Append(Quote(_colNames[c]));
+                }
+                sb.Append(") CROSS APPLY ").Append(_qualified).Append('(');
+                for (int c = 0; c < cols; c++)
+                {
+                    sb.Append(c > 0 ? ", " : "").Append("p.").Append(Quote(_colNames[c]));
+                }
+                sb.Append(") AS f");
+
+                using var res = _owner.ExecuteQuery(sb.ToString(), sqlParams);
+                while (true)
+                {
+                    var b = res.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+                    if (b is null)
+                    {
+                        break;
+                    }
+                    yield return b;
+                }
+            }
+        }
+    }
 
     public IArrowArrayStream ExecuteProc(string schemaName, string functionName, IArrowArrayStream args)
     {
