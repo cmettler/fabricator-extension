@@ -1419,10 +1419,23 @@ public sealed class SqlServerCatalog : IBackendCatalog
             {
                 _colSqlTypes[i] = i < pars.Count ? pars[i].sqlType : "sql_variant";
             }
-            // Output = the input parameter columns (p.*) + the TVF's output columns (f.*).
+            // Output = the echoed input columns (p.*) + the TVF's output columns (f.*). The p.* columns
+            // come back typed as the TVF PARAMETERS (the VALUES are CAST to the param types above), not
+            // as the pushed input schema — so build them from the param schema, named by the input
+            // columns, to match what SQL Server actually returns (and the C++ bind's declared types).
+            var pFields = new List<Field>(_colNames.Length);
+            using (var ps = owner.GetFunctionParamSchema(schemaName, functionName))
+            {
+                var paramFields = ps.Schema.FieldsList;
+                for (int i = 0; i < _colNames.Length; i++)
+                {
+                    var dataType = i < paramFields.Count ? paramFields[i].DataType : _inputSchema.FieldsList[i].DataType;
+                    pFields.Add(new Field(_colNames[i], dataType, nullable: true));
+                }
+            }
             using (var os = owner.GetFunctionOutputSchema(schemaName, functionName))
             {
-                _outputSchema = new Schema(_inputSchema.FieldsList.Concat(os.Schema.FieldsList), metadata: null);
+                _outputSchema = new Schema(pFields.Concat(os.Schema.FieldsList), metadata: null);
             }
             _consumer = Task.Run(ConsumeAsync);
         }
@@ -1465,6 +1478,12 @@ public sealed class SqlServerCatalog : IBackendCatalog
             while (_out.Reader.TryRead(out var b))
             {
                 list.Add(b);
+            }
+            // Surface a consumer fault (a CROSS APPLY error) promptly on the next push, rather
+            // than only at Finish — TryRead doesn't throw on a faulted channel.
+            if (_out.Reader.Completion.IsFaulted)
+            {
+                _out.Reader.Completion.GetAwaiter().GetResult();
             }
             return new InMemoryArrayStream(_outputSchema, list);
         }

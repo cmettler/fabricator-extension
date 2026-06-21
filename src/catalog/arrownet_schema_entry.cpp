@@ -9,11 +9,15 @@
 #include "arrownet/clr_host.hpp"
 #include "catalog/arrownet_metadata.hpp"
 #include "duckdb/common/arrow/arrow_appender.hpp"
+#include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/common/enums/operator_result_type.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/blob.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
+#include "duckdb/execution/execution_context.hpp"
 #include "duckdb/execution/expression_executor_state.hpp"
+#include "duckdb/function/function_set.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -27,6 +31,8 @@
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
+
+#include <atomic>
 
 namespace duckdb {
 
@@ -52,6 +58,14 @@ void ArrowNetSchemaEntry::AddTableFunction(const string &func_name, bool is_proc
 	lock_guard<mutex> lock(entry_lock_);
 	table_functions_[func_name] = is_proc;
 	table_function_entries_.erase(func_name);
+	// A discovered TVF also gets a synthetic table-in-out alias `<name>_each` that applies it once
+	// per input row via CROSS APPLY (4g). Procs are EXEC-based (not inline-CROSS-APPLY-able) — per-row
+	// procs are a later layer, so no alias for them.
+	if (!is_proc) {
+		string each = func_name + "_each";
+		inout_functions_[each] = func_name;
+		table_function_entries_.erase(each);
+	}
 }
 
 void ArrowNetSchemaEntry::ClearTables() {
@@ -61,6 +75,7 @@ void ArrowNetSchemaEntry::ClearTables() {
 	scalar_functions_.clear();
 	function_entries_.clear();
 	table_functions_.clear();
+	inout_functions_.clear();
 	table_function_entries_.clear();
 }
 
@@ -302,6 +317,206 @@ unique_ptr<FunctionData> ArrowNetTableFunctionBind(ClientContext &context, Table
 	return std::move(bind_data);
 }
 
+// -----------------------------------------------------------------------------
+// Table-in-out (4g): a discovered TVF's `{LogicalType::TABLE}` overload — applies the
+// function once per input row via SQL-Server CROSS APPLY (the T-SQL is generated +
+// executed in C#; see SqlServerCatalog.InOutSessionImpl). Output = the input parameter
+// columns ++ the TVF's output columns. Read-only (a SQL Server TVF can't modify data).
+//
+// Parallel input (e.g. a UNION ALL parameter table) arrives as multiple per-branch
+// local states feeding ONE managed session over one bounded channel (thread-safe). The
+// session's output lags the input (the consumer runs CROSS APPLY on a background task),
+// so each push drains whatever output is ready; the *tail* (output not yet drained when
+// the last branch finishes) is flushed by inout_finish.
+//
+// `in_out_function_final` fires once PER branch — so it can't be the single "all input
+// done" signal (completing the channel on the first one would lose later branches' rows).
+// Instead an atomic active-branch counter (incremented per init_local, decremented once
+// per branch's first final) lets exactly the LAST branch call inout_finish and emit the
+// whole tail. The global-state destructor calls inout_abort on every teardown path
+// (frees the session handle + releases; idempotent after a clean finish) — the backstop
+// for LIMIT/error/cancel where finals may be skipped.
+//
+// NOTE: OperatorFinalize (the design's original plan) is a *global single-shot* hook that
+// returns no DataChunk, so it cannot emit the tail rows; FinalExecute (per branch) is the
+// only row-emitting post-input hook, hence the last-branch counter approach. OperatorFinalize
+// remains the right place for the future per-row-stored-proc COMMIT (which emits no rows).
+struct ArrowNetInOutBindData : public TableFunctionData {
+	ArrowNetHandle handle = nullptr;
+	string schema;
+	string func;
+	vector<LogicalType> input_types; // input parameter-table columns (= the TVF's positional params)
+	vector<string> input_names;
+};
+
+struct ArrowNetInOutGlobalState : public GlobalTableFunctionState {
+	ArrowNetHandle session = nullptr;
+	std::atomic<idx_t> active_branches {0}; // # of parallel input branches still feeding the session
+
+	idx_t MaxThreads() const override {
+		return 1; // a single Arrow C output stream is consumed serially per finish
+	}
+
+	~ArrowNetInOutGlobalState() override {
+		// Frees the managed session handle + releases (idempotent after inout_finish). The
+		// sole cleanup on LIMIT/error/cancel, where the per-branch finals may not all fire.
+		arrownet::InOutAbort(session);
+	}
+};
+
+struct ArrowNetInOutLocalState : public LocalTableFunctionState {
+	bool pushed_current = false;                          // pushed the current input chunk yet?
+	unique_ptr<arrownet::ArrowStreamReader> reader;       // ready-output reader for the current input chunk
+	bool counted_down = false;                            // already decremented the active-branch counter?
+	bool is_last = false;                                 // this branch was the last → it drains the tail
+	unique_ptr<arrownet::ArrowStreamReader> tail_reader;  // final tail drain (last branch only)
+};
+
+// Bind the in-out overload: output schema = input parameter-table columns ++ the TVF's
+// output columns (resolved from metadata, without executing the function).
+unique_ptr<FunctionData> ArrowNetInOutBind(ClientContext &context, TableFunctionBindInput &input,
+                                           vector<LogicalType> &return_types, vector<string> &names) {
+	auto &info = input.info->Cast<ArrowNetTableFunctionInfo>();
+	if (input.input_table_types.size() != info.arg_types.size()) {
+		throw BinderException(
+		    "mssql_net: table-in-out function \"%s\" takes %llu parameter(s) but the input table has %llu column(s)",
+		    info.func, (idx_t)info.arg_types.size(), (idx_t)input.input_table_types.size());
+	}
+
+	auto bind_data = make_uniq<ArrowNetInOutBindData>();
+	bind_data->handle = info.handle;
+	bind_data->schema = info.schema;
+	bind_data->func = info.func;
+
+	// 1) The input parameter columns lead the output (p.* in the CROSS APPLY). C# casts the
+	//    VALUES to the TVF's parameter types, so the echoed columns come back typed as the
+	//    PARAMETERS (info.arg_types) — not necessarily the input-table types. bind_data->input_*
+	//    keep the actual input-table types: that's what we marshal/push (and pass to inout_open).
+	for (idx_t i = 0; i < input.input_table_types.size(); i++) {
+		return_types.push_back(info.arg_types[i]);
+		names.push_back(input.input_table_names[i]);
+		bind_data->input_types.push_back(input.input_table_types[i]);
+		bind_data->input_names.push_back(input.input_table_names[i]);
+	}
+
+	// 2) Then the TVF's own output columns (f.*), read from a zero-row schema stream.
+	ArrowArrayStream out_schema;
+	std::memset(&out_schema, 0, sizeof(out_schema));
+	arrownet::GetFunctionOutputSchema(info.handle, info.schema, info.func, out_schema);
+	ArrowSchemaWrapper schema_root;
+	if (out_schema.get_schema(&out_schema, &schema_root.arrow_schema) != 0) {
+		const char *msg = out_schema.get_last_error ? out_schema.get_last_error(&out_schema) : nullptr;
+		if (out_schema.release) {
+			out_schema.release(&out_schema);
+		}
+		throw IOException(string("mssql_net: failed to read table-in-out output schema") +
+		                  (msg ? string(": ") + msg : string()));
+	}
+	if (out_schema.release) {
+		out_schema.release(&out_schema);
+	}
+	ArrowTableSchema arrow_table;
+	ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table, schema_root.arrow_schema);
+	for (int64_t i = 0; i < schema_root.arrow_schema.n_children; i++) {
+		auto &child = *schema_root.arrow_schema.children[i];
+		names.push_back(child.name ? string(child.name) : "column" + to_string(i));
+		return_types.push_back(arrow_table.GetColumns().at((idx_t)i)->GetDuckType());
+	}
+	return std::move(bind_data);
+}
+
+unique_ptr<GlobalTableFunctionState> ArrowNetInOutInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
+	auto &bind = input.bind_data->Cast<ArrowNetInOutBindData>();
+	auto gstate = make_uniq<ArrowNetInOutGlobalState>();
+	// Build the input table's Arrow schema (its columns are the TVF's positional params) and
+	// open the managed session. C# consumes/releases the schema struct.
+	ArrowSchema input_schema;
+	std::memset(&input_schema, 0, sizeof(input_schema));
+	auto props = context.GetClientProperties();
+	ArrowConverter::ToArrowSchema(&input_schema, bind.input_types, bind.input_names, props);
+	gstate->session = arrownet::InOutOpen(bind.handle, bind.schema, bind.func, input_schema);
+	return std::move(gstate);
+}
+
+unique_ptr<LocalTableFunctionState> ArrowNetInOutInitLocal(ExecutionContext &, TableFunctionInitInput &input,
+                                                           GlobalTableFunctionState *global_state) {
+	auto &g = global_state->Cast<ArrowNetInOutGlobalState>();
+	g.active_branches.fetch_add(1);
+	return make_uniq<ArrowNetInOutLocalState>();
+}
+
+// Per input chunk: push it to the session (CROSS APPLY runs in C#), then stream out whatever
+// output is ready. HAVE_MORE_OUTPUT drains the current ready batch across re-calls (same input);
+// NEED_MORE_INPUT advances to the next chunk. Output that the consumer hasn't produced yet is
+// flushed later by the final drain.
+OperatorResultType ArrowNetInOutFunction(ExecutionContext &context, TableFunctionInput &data, DataChunk &input,
+                                         DataChunk &output) {
+	auto &bind = data.bind_data->Cast<ArrowNetInOutBindData>();
+	auto &g = data.global_state->Cast<ArrowNetInOutGlobalState>();
+	auto &l = data.local_state->Cast<ArrowNetInOutLocalState>();
+
+	if (!l.pushed_current) {
+		if (input.size() == 0) {
+			output.SetCardinality(0);
+			return OperatorResultType::NEED_MORE_INPUT;
+		}
+		// Marshal the input chunk -> a one-batch Arrow array (columns in param order); the
+		// managed side imports + releases it, so we never release `array` ourselves.
+		auto props = context.client.GetClientProperties();
+		auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(context.client, bind.input_types);
+		ArrowAppender appender(bind.input_types, input.size(), props, extension_types);
+		appender.Append(input, 0, input.size(), input.size());
+		ArrowArray array = appender.Finalize();
+
+		ArrowArrayStream ready;
+		std::memset(&ready, 0, sizeof(ready));
+		arrownet::InOutPush(g.session, array, ready);
+		l.reader = make_uniq<arrownet::ArrowStreamReader>(context.client, ready);
+		l.pushed_current = true;
+	}
+
+	l.reader->Read(output);
+	if (output.size() == 0) {
+		// Current chunk's ready output is exhausted — fetch the next input chunk.
+		l.reader.reset();
+		l.pushed_current = false;
+		return OperatorResultType::NEED_MORE_INPUT;
+	}
+	return OperatorResultType::HAVE_MORE_OUTPUT;
+}
+
+// Per-branch final. Decrement the active-branch counter once; the branch that drives it to
+// zero is the last one feeding the session — it calls inout_finish (completes the channel,
+// waits for the consumer, drains the entire remaining output) and emits that tail. Every
+// other branch's final is a no-op (the channel must NOT be completed before all branches
+// are done — that was the original parallel-UNION-ALL pain).
+OperatorFinalizeResultType ArrowNetInOutFinal(ExecutionContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &g = data.global_state->Cast<ArrowNetInOutGlobalState>();
+	auto &l = data.local_state->Cast<ArrowNetInOutLocalState>();
+
+	if (!l.counted_down) {
+		l.counted_down = true;
+		if (g.active_branches.fetch_sub(1) == 1) { // was 1 -> now 0: this is the last branch
+			l.is_last = true;
+			ArrowArrayStream tail;
+			std::memset(&tail, 0, sizeof(tail));
+			arrownet::InOutFinish(g.session, tail);
+			l.tail_reader = make_uniq<arrownet::ArrowStreamReader>(context.client, tail);
+		}
+	}
+
+	if (l.is_last && l.tail_reader) {
+		l.tail_reader->Read(output);
+		if (output.size() == 0) {
+			l.tail_reader.reset();
+			return OperatorFinalizeResultType::FINISHED;
+		}
+		return OperatorFinalizeResultType::HAVE_MORE_OUTPUT;
+	}
+	output.SetCardinality(0);
+	return OperatorFinalizeResultType::FINISHED;
+}
+
 } // namespace
 
 optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateTableFunction(ClientContext &context,
@@ -313,6 +528,12 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateTableFunction(ClientC
 	}
 	auto kind_it = table_functions_.find(func_name);
 	if (kind_it == table_functions_.end()) {
+		// Not a discovered scan TVF/proc — it may be the synthetic in-out alias `<base>_each`
+		// (a real same-named function would have matched above, so it wins over the alias).
+		auto each_it = inout_functions_.find(func_name);
+		if (each_it != inout_functions_.end()) {
+			return GetOrCreateInOutFunction(context, func_name, each_it->second);
+		}
 		return nullptr;
 	}
 	bool is_proc = kind_it->second;
@@ -361,6 +582,53 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateTableFunction(ClientC
 	auto entry = make_uniq<TableFunctionCatalogEntry>(catalog, *this, info);
 	auto &ref = *entry;
 	table_function_entries_[func_name] = std::move(entry);
+	return &ref;
+}
+
+// Build the in-out catalog entry for the synthetic alias `<base>_each` — a `{LogicalType::TABLE}`
+// table function that applies the discovered TVF `base_func` once per input row (4g). DuckDB
+// forbids a TABLE-parameter overload from coexisting with the scalar-arg scan form under one name
+// (bind_table_function.cpp), so the in-out form is exposed as a sibling entry under its own name;
+// the scan form keeps the bare TVF name. Caller holds entry_lock_.
+optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateInOutFunction(ClientContext &context,
+                                                                         const string &each_name,
+                                                                         const string &base_func) {
+	vector<string> arg_names;
+	vector<LogicalType> arg_types;
+	try {
+		FetchFunctionParamSchema(context, handle_, name, base_func, arg_names, arg_types);
+	} catch (std::exception &) {
+		// Stale discovery (base TVF dropped out-of-band) — treat as not-found, evicting both
+		// the alias and the base so the next lookup re-discovers.
+		inout_functions_.erase(each_name);
+		table_function_entries_.erase(each_name);
+		table_functions_.erase(base_func);
+		table_function_entries_.erase(base_func);
+		return nullptr;
+	}
+	if (arg_types.empty()) {
+		return nullptr; // a no-arg TVF has nothing to apply per input row
+	}
+
+	TableFunction inout(each_name, {LogicalType::TABLE}, nullptr, ArrowNetInOutBind, ArrowNetInOutInitGlobal,
+	                    ArrowNetInOutInitLocal);
+	inout.in_out_function = ArrowNetInOutFunction;
+	inout.in_out_function_final = ArrowNetInOutFinal;
+	auto fn_info = make_shared_ptr<ArrowNetTableFunctionInfo>();
+	fn_info->handle = handle_;
+	fn_info->schema = name;
+	fn_info->func = base_func; // the CROSS APPLY target is the real SQL Server TVF, not the alias
+	fn_info->arg_types = arg_types;
+	fn_info->arg_names = arg_names;
+	fn_info->is_proc = false;
+	inout.function_info = std::move(fn_info);
+
+	CreateTableFunctionInfo info(std::move(inout));
+	info.catalog = catalog.GetName();
+	info.schema = name;
+	auto entry = make_uniq<TableFunctionCatalogEntry>(catalog, *this, info);
+	auto &ref = *entry;
+	table_function_entries_[each_name] = std::move(entry);
 	return &ref;
 }
 
@@ -416,6 +684,10 @@ void ArrowNetSchemaEntry::Scan(ClientContext &context, CatalogType type,
 		{
 			lock_guard<mutex> lock(entry_lock_);
 			for (auto &fn : table_functions_) {
+				names.push_back(fn.first);
+			}
+			// The synthetic `<name>_each` table-in-out aliases are catalog functions too.
+			for (auto &fn : inout_functions_) {
 				names.push_back(fn.first);
 			}
 		}

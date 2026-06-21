@@ -62,11 +62,16 @@ private:
 	optional_ptr<CatalogEntry> GetOrCreateEntry(ClientContext &context, const string &table_name);
 	optional_ptr<CatalogEntry> GetOrCreateScalarFunction(ClientContext &context, const string &func_name);
 	optional_ptr<CatalogEntry> GetOrCreateTableFunction(ClientContext &context, const string &func_name);
+	//! Materializes the synthetic `<base>_each` table-in-out alias (4g): a TABLE-parameter table
+	//! function applying the discovered TVF `base_func` once per input row via CROSS APPLY.
+	optional_ptr<CatalogEntry> GetOrCreateInOutFunction(ClientContext &context, const string &each_name,
+	                                                    const string &base_func);
 
 	ArrowNetHandle handle_;
 	case_insensitive_map_t<string> table_types_; // table name -> "BASE TABLE" | "VIEW"
 	case_insensitive_set_t scalar_functions_;    // discovered scalar UDF names
 	case_insensitive_map_t<bool> table_functions_; // table-returning routine name -> is_proc (TVF=false)
+	case_insensitive_map_t<string> inout_functions_; // synthetic `<base>_each` alias -> base TVF name (4g)
 	mutex entry_lock_;
 	case_insensitive_map_t<unique_ptr<ArrowNetTableEntry>> entries_;
 	case_insensitive_map_t<unique_ptr<ScalarFunctionCatalogEntry>> function_entries_;

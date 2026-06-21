@@ -1,0 +1,123 @@
+# name: test/verify_table_inout.test
+# description: Table-in-out (4g) — a discovered TVF's `<name>_each(<input table>)` alias applies it
+#              once per input row via SQL-Server CROSS APPLY (parallel input coordinated in C#).
+# group: [mssql]
+
+require mssql_net
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS iodb (TYPE mssql_net);
+
+# A 1-arg inline TVF returning rows 1..n; a 2-arg TVF (multi-column input); a TVF that errors for n=0.
+statement ok
+SELECT mssql_net_exec('iodb', 'CREATE OR ALTER FUNCTION dbo.tf_io(@n INT) RETURNS TABLE AS RETURN (SELECT TOP (@n) CAST(ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS INT) AS m FROM sys.all_objects)');
+
+statement ok
+SELECT mssql_net_exec('iodb', 'CREATE OR ALTER FUNCTION dbo.tf_kv(@id INT, @label VARCHAR(20)) RETURNS TABLE AS RETURN (SELECT @id*10 AS v, @label AS lbl)');
+
+statement ok
+SELECT mssql_net_exec('iodb', 'CREATE OR ALTER FUNCTION dbo.tf_div(@n INT) RETURNS TABLE AS RETURN (SELECT 100/@n AS q)');
+
+statement ok
+SELECT mssql_refresh_cache('iodb');
+
+# The scalar-arg scan form (4c) is unchanged and coexists with the `_each` in-out alias.
+query I
+SELECT m FROM iodb.dbo.tf_io(2) ORDER BY m;
+----
+1
+2
+
+# Basic table-in-out: apply tf_io once per input row. Output = the echoed input column (n) + tf output (m).
+query II
+SELECT n, m FROM iodb.dbo.tf_io_each((SELECT v.n FROM (VALUES(1),(2),(3)) v(n))) ORDER BY n, m;
+----
+1	1
+2	1
+2	2
+3	1
+3	2
+3	3
+
+# Parallel UNION ALL input — both branches feed ONE session; one coherent result (the case that
+# historically broke: in_out_function_final fires once per branch, so the single all-input-done
+# finish is driven by the last-branch counter, not per-branch).
+query II
+SELECT n, m FROM iodb.dbo.tf_io_each((SELECT 2 AS n UNION ALL SELECT 3)) ORDER BY n, m;
+----
+2	1
+2	2
+3	1
+3	2
+3	3
+
+# WHERE on the output (applied by DuckDB above the operator — no pushdown into an in-out).
+query II
+SELECT n, m FROM iodb.dbo.tf_io_each((SELECT v.n FROM (VALUES(2),(3)) v(n))) WHERE m > 1 ORDER BY n, m;
+----
+2	2
+3	2
+3	3
+
+# ORDER BY + LIMIT on the output (a TopN pipeline-breaker above the operator; LIMIT short-circuits
+# — the operator-state destructor's inout_abort is the cleanup backstop).
+query II
+SELECT n, m FROM iodb.dbo.tf_io_each((SELECT v.n FROM (VALUES(1),(2),(3)) v(n))) ORDER BY n, m LIMIT 3;
+----
+1	1
+2	1
+2	2
+
+# Aggregate over the in-out output.
+query II
+SELECT count(*), sum(m) FROM iodb.dbo.tf_io_each((SELECT v.n FROM (VALUES(1),(2),(3)) v(n)));
+----
+6	10
+
+# Empty input -> no output, no hang.
+query I
+SELECT count(*) FROM iodb.dbo.tf_io_each((SELECT v.n FROM (VALUES(1)) v(n) WHERE 1=0));
+----
+0
+
+# Multi-column input table (2 params) -> echoed input columns + TVF output columns.
+query ITIT
+SELECT id, label, v, lbl FROM iodb.dbo.tf_kv_each((SELECT v.id, v.label FROM (VALUES(1,'a'),(2,'b')) v(id,label))) ORDER BY id;
+----
+1	a	10	a
+2	b	20	b
+
+# Large input (50 rows; BIGINT input from range -> INT param echo exercises the type round-trip)
+# + sub-chunking under the ~2100-parameter cap + backpressure. count = sum(1..50)=1275; sum(m)=22100.
+query II
+SELECT count(*), sum(m) FROM iodb.dbo.tf_io_each((SELECT t.n FROM range(1, 51) t(n)));
+----
+1275	22100
+
+# Error mid-stream (divide by zero for n=0) surfaces as a query failure (the consumer faults the
+# output channel; it's raised on the next push/finish), and the session is released.
+statement error
+SELECT q FROM iodb.dbo.tf_div_each((SELECT v.n FROM (VALUES(1),(0)) v(n)));
+----
+Divide by zero
+
+# After the error the catalog/session is healthy — a normal in-out still works.
+query II
+SELECT n, m FROM iodb.dbo.tf_io_each((SELECT v.n FROM (VALUES(2)) v(n))) ORDER BY n, m;
+----
+2	1
+2	2
+
+statement ok
+SELECT mssql_net_exec('iodb', 'DROP FUNCTION IF EXISTS dbo.tf_io');
+
+statement ok
+SELECT mssql_net_exec('iodb', 'DROP FUNCTION IF EXISTS dbo.tf_kv');
+
+statement ok
+SELECT mssql_net_exec('iodb', 'DROP FUNCTION IF EXISTS dbo.tf_div');
+
+statement ok
+DETACH iodb;
