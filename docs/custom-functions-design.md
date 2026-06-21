@@ -607,14 +607,19 @@ discovered `kind='table'` (procs excluded — per-row procs are a later layer), 
 discoverable. A *real* SQL Server function literally named `…_each` shadows the alias (the real name is
 matched first). The in-out bind's `function_info.func` is the **base** TVF name (the CROSS APPLY target).
 
-**Also wanted later: a custom C#-authored table in/out function** — `IArrowTableInOutFunction` (the in-out
-analog of 4e `IArrowScalarFunction` / 4f `IArrowTableFunction`): a pure-C# in-out (e.g. a streaming transform
-/ running aggregate) authored in the provider, dispatched through the *same* session+channel+`OperatorFinalize`
-machinery. Build after the TVF CROSS APPLY case proves the operator/channel plumbing.
+**Custom C#-authored table-in-out — DONE** (`IArrowTableInOutFunction`, the in-out analog of 4e
+`IArrowScalarFunction` / 4f `IArrowTableFunction`): a pure-C# in-out (streaming transform / running aggregate
+/ whole-table summary) authored in the provider, dispatched through the *same* session machinery as the TVF
+CROSS APPLY. `Process(chunk)`/`Finish()` are invoked serially per session (no locking needed), and the
+function declares its **full** output schema (no input echo, unlike `_each`). Surfaced as `kind='inout'`;
+C# `CustomInOut` is a **factory** registry (fresh instance per session so state can't leak across queries);
+C++ `AddInOutFunction` registers a bare-name `{TABLE}` entry reusing the 4g operator callbacks (no new ABI).
+Demos `dbo.cf_tag` (per-row) + `dbo.cf_summarize` (stateful, emits at Finish); see
+`test/verify_custom_functions.test`.
 
 **Build order:** session ABI + C# `InOutSession` (bounded channel consumer + CROSS APPLY SQL gen) **[DONE]**
 → C++ `in_out_function` operator + `init_global`/`init_local` + last-branch-counter tail-emit +
 destructor-abort **[DONE]** → the §11 test matrix (`UNION ALL`, `ORDER BY`, `LIMIT`, `WHERE`, aggregate,
-error/recover, empty/large) **[DONE — `test/verify_table_inout.test`, 63 assertions]**. Next: per-row stored
-procs (with rollback, where the injected `OperatorFinalize` COMMIT becomes relevant) + a custom C#-authored
-`IArrowTableInOutFunction` (in-out analog of 4e/4f), reusing the same session+channel machinery.
+error/recover, empty/large) **[DONE — `test/verify_table_inout.test`, 63 assertions]** → custom C#-authored
+`IArrowTableInOutFunction` **[DONE — `test/verify_custom_functions.test`]**. Next: per-row stored procs
+(with rollback, where the injected `OperatorFinalize` COMMIT finally becomes relevant).

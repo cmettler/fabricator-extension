@@ -106,9 +106,16 @@ current code still uses the single-provider `mssql_net` naming):
   is the LIMIT/error/cancel backstop (frees the handle). So **no `OperatorFinalize`/`LogicalExtensionOperator`
   was built** (the earlier "REQUIRED even for read-only" note was wrong — it's reserved for the future per-row
   proc COMMIT). Verified: `test/verify_table_inout.test` (63 assertions — incl. parallel UNION ALL, ORDER
-  BY+LIMIT, WHERE, aggregate, empty, multi-column, large BIGINT→INT, error+recover). Next: per-row **stored
-  procs** (rollback-on-failure — where the `OperatorFinalize` COMMIT becomes relevant) + a **custom C#
-  `IArrowTableInOutFunction`** (in-out analog of 4e/4f), reusing the same session+channel machinery.
+  BY+LIMIT, WHERE, aggregate, empty, multi-column, large BIGINT→INT, error+recover). **(4g-custom) custom
+  C#-authored table-in-out DONE** (`IArrowTableInOutFunction` — in-out analog of 4e/4f): a pure-C# table-in-out
+  authored in the provider (no SQL object), STATEFUL across the input stream (running aggregate / whole-table
+  summary), surfaced as `kind='inout'` → C++ `AddInOutFunction` registers a bare-name `{TABLE}` entry
+  (`GetOrCreateCustomInOutFunction` + `ArrowNetCustomInOutBind`, output = the fn's full declared schema, no
+  input echo), dispatched in C# (`CustomInOut` factory registry → fresh instance per session;
+  `CustomInOutSessionImpl` runs `Process(chunk)`/`Finish()`). Reuses the 4g operator path — no new ABI/C++
+  operator. Verified: `test/verify_custom_functions.test` (cf_tag per-row, cf_summarize stateful 4999-row
+  multi-chunk + Finish-only, per-session state, no SQL object). **Next: per-row stored procs**
+  (rollback-on-failure — where the `OperatorFinalize` COMMIT finally becomes relevant).
 
 ## Implementation status (current)
 
@@ -144,12 +151,13 @@ non-data: error-WORDING/number assertions (corpus expects native-extension text)
 (`mssql_pool_stats`/`mssql_open` diagnostics, krb5 connstr parser), COPY-to-temp-table empty-schema
 syntax, and catalog-after-rollback staleness.
 
-**Not yet / out of scope:** **per-row stored procs** (table-in-out over a proc, with rollback-on-failure)
-and a **custom C# `IArrowTableInOutFunction`** (the in-out form of 4g — see the sequencing note above) and
+**Not yet / out of scope:** **per-row stored procs** (table-in-out over a proc, with rollback-on-failure —
+where the injected `OperatorFinalize` COMMIT finally gets built) and
 **load-time global** functions
-(Phase 3 — scalar UDFs, TVFs, stored procs + custom C#-authored scalar & table functions + table-in-out
-done, see "Callable scalar UDFs (4b)" / "table functions (4c)" / "stored procedures (4d)" / "custom functions
-(4e scalar, 4f table)" / "table-in-out (4g)"; proc multi-result-set + INPUT/OUTPUT still deferred; load-time global deferred in
+(Phase 3 — scalar UDFs, TVFs, stored procs + custom C#-authored scalar, table & table-in-out functions +
+discovered-TVF table-in-out done, see "Callable scalar UDFs (4b)" / "table functions (4c)" / "stored
+procedures (4d)" / "custom functions (4e scalar, 4f table)" / "table-in-out (4g, incl. custom C# in-out)";
+proc multi-result-set + INPUT/OUTPUT still deferred; load-time global deferred in
 favor of attach-time custom functions); connection
 pooling knobs / `mssql_pool_stats` (ADO.NET pools by connstr already); COPY to temp tables
 (`mssql://cat//#t`, `cat..#t` — `ParseTarget` only accepts strict 3-part names); CHECK constraints +
@@ -344,6 +352,18 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
 - **Verified**: `test/verify_table_inout.test` (63 assertions) — scalar-arg regression, single-chunk,
   parallel `UNION ALL` (coherent), `WHERE`, `ORDER BY`+`LIMIT`, aggregate, empty, multi-column, large
   50-row `BIGINT`→`INT` (sub-chunking + backpressure + type round-trip), error mid-stream + recovery.
+- **Custom C#-authored in-out (4g-custom)**: `IArrowTableInOutFunction` (Bridge) =
+  `SchemaName`/`Name`/`InputSchema`/`OutputSchema` + `IEnumerable<RecordBatch> Process(chunk)` + `Finish()`
+  (the in-out analog of 4e `IArrowScalarFunction` / 4f `IArrowTableFunction`). A pure-C# table-in-out (no
+  SQL object) that, unlike the `_each` CROSS APPLY, can be **stateful across the whole input stream**
+  (`Process`/`Finish` are invoked serially per session, so no locking needed) and declares its **full**
+  output (no input echo). Surfaced via `FunctionsMetadataSql` as `kind='inout'`; C++ `AddInOutFunction`
+  registers a bare-name `{TABLE}` entry (`GetOrCreateCustomInOutFunction` + `ArrowNetCustomInOutBind`,
+  reusing the 4g operator callbacks — no new ABI). C# `CustomInOut` is a **factory** registry (fresh
+  instance per session so state can't leak across queries); `InOutOpen` dispatches to `CustomInOutSessionImpl`
+  (Process per push, Finish drains the tail) ahead of the CROSS APPLY path. Demos `CustomFunctions.InOut`:
+  `dbo.cf_tag` (per-row `(n, n*n)`) + `dbo.cf_summarize` (whole-table `(cnt, total)` at Finish). Verified in
+  `test/verify_custom_functions.test`.
 
 - **Filtering**: discovered scalar UDFs + TVFs/procs are gated by the ATTACH `schema_filter` (icase
   `std::regex`, applied in `LoadCatalog`/`RefreshCache`); `table_filter` is table-only and does NOT apply to functions.
