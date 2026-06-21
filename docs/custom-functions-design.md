@@ -554,41 +554,45 @@ parallel `UNION ALL` input arrives as multiple local states/threads that must fe
 (observed: **twice** for a 2-way `UNION ALL`), so it is **NOT** a usable single "all input done" signal —
 completing the channel / closing the session on the first one loses the second branch's rows (the real pain).
 
-**CORRECTION (verified during the build — supersedes the earlier "OperatorFinalize is the signal" plan):**
-`PhysicalOperator::OperatorFinalize` is a **global single-shot** hook that returns `OperatorFinalResultType`
-and is handed **no `DataChunk`** (`OperatorFinalizeInput {GlobalOperatorState&, InterruptState&}`) — it runs
-in the `PipelineFinishEvent` alongside the sink's `Finalize`, **after** the pipeline has stopped pulling
-rows. So it **cannot emit the tail** downstream. The only **row-emitting** post-input hook is
-`FinalExecute` (`in_out_function_final`), which fires **per branch**. Therefore the tail must be emitted by
-exactly the **last** branch's final, selected by an **atomic active-branch counter** (NOT an injected
-`OperatorFinalize`):
+**RESOLUTION (built — supersedes both the "OperatorFinalize emits the tail" and the "last-branch counter"
+sketches):** make the output **synchronous per input chunk** so there is **no tail** — then emitting rows
+never depends on detecting which branch finishes last, and the problem dissolves.
 
-- **init_local increments** a `std::atomic<idx_t> active_branches`; **`in_out_function_final` decrements it
-  once per branch.** The branch that drives it to **0** is the last one still feeding → it calls
-  `inout_finish` (complete the channel, wait for the consumer, drain the **entire** remaining output) and
-  emits that tail across `HAVE_MORE_OUTPUT` finals. Every other branch's final is a **no-op** (it must NOT
-  complete the channel — that was the UNION-ALL pain). The counter is reached **only on the normal path**;
-  on `LIMIT`/error the finals are skipped, the counter never hits 0, and `inout_finish` is simply not called
-  (we don't need the tail then) — nothing blocks on the counter, so there is **no hang** (the earlier
-  "producer-count → hang" worry assumed something *waits* on it; nothing does).
-- **Operator-state (global) destructor → `inout_abort`** runs on **every** teardown path (normal, `LIMIT`,
-  error, cancel): it frees the managed session handle + releases, and is the sole cleanup when the finals are
-  skipped. Idempotent after a clean `inout_finish`. This is the real backstop.
-- `in_out_function` (any branch) → `inout_push` (feed the bounded channel, thread-safe + backpressure; pull
-  available output). `in_out_function_final` is used only to elect the last branch + emit the tail.
+Two facts forced this. (1) `PhysicalOperator::OperatorFinalize` is a **global single-shot** hook handed
+**no `DataChunk`** (`OperatorFinalizeInput {GlobalOperatorState&, InterruptState&}`), running in the
+`PipelineFinishEvent` *after* the pipeline stopped pulling rows — so it **cannot emit rows**. (2) The only
+row-emitting post-input hook, `FinalExecute` (`in_out_function_final`), fires **per branch**, and an atomic
+**last-branch counter is unsound**: `PhysicalUnion::BuildPipelines` adds dependencies so the UNION branch
+pipelines may run **sequentially**, and a branch's operator state is created when its pipeline runs — so
+branch 1 can finish (counter → 0, premature `inout_finish`) **before** branch 2 even starts, losing branch
+2's rows. (The first build used the counter and passed tests only because that query let the branches
+overlap — scheduling luck, not a contract. Caught in review.)
 
-`OperatorFinalize` / the injected `LogicalExtensionOperator` is therefore **not built for the read-only TVF
-case**. It remains the right mechanism for the **future per-row stored-proc COMMIT** (a single post-all-input
-action that emits no rows), so revisit it then.
+So:
+- **`inout_push` is synchronous**: it runs THAT chunk's CROSS APPLY (or custom `Process`) to completion and
+  returns the chunk's **full** output. `in_out_function` drains it across `HAVE_MORE_OUTPUT`, then
+  `NEED_MORE_INPUT`. No tail → **no `in_out_function_final`, no counter**. Parallel branches push into the
+  one session concurrently; the managed `Push` is lock-serialized. Correct under sequential *or* parallel
+  union, by construction.
+- **Session lifecycle = a refcounted `InOutSessionHolder` on the bind data.** `init_global` opens the
+  session into it; `in_out_function` pushes via it; the holder's **RAII destructor calls `inout_abort`** on
+  every teardown path (normal/`LIMIT`/error/cancel) — the reliable release/rollback backstop (frees the
+  managed GCHandle too; `inout_finish` does not). The holder is `shared_ptr` so the **injected
+  OperatorFinalize** (next bullet) can reach the same session.
+- **`OperatorFinalize` is reserved for the per-row stored-proc COMMIT** — a single, reliable, post-all-input,
+  **no-rows** action, which is exactly what it can do. Verified it fires **once** even above a UNION: a UNION
+  branch pipeline shares the base pipeline's single `PipelineFinishEvent` (`MetaPipeline::CreateUnionPipeline`
+  doesn't `AddFinishEvent`; executor `else` branch), unlike per-branch `FinalExecute`. The plan: an
+  `OptimizerExtension` wraps the in-out's `LogicalGet` in a `LogicalExtensionOperator` whose pass-through
+  `PhysicalOperator::OperatorFinalize` calls `holder->Finish()` (→ `inout_finish` = COMMIT). Built with procs
+  (it's a no-op for read-only TVFs / custom in-out, so there's nothing to test until a proc can commit/roll back).
 
-**APIs used in v1.5.4** (verified in the build): `in_out_function` / `in_out_function_final` +
+**APIs used in v1.5.4** (verified in the build): `in_out_function` +
 `OperatorResultType {NEED_MORE_INPUT, HAVE_MORE_OUTPUT, FINISHED, BLOCKED}`; the
 `{LogicalType::TABLE}`-arg registration pattern (ref: built-in `summary` =
-`TableFunction("summary",{LogicalType::TABLE},nullptr,Bind)` + `in_out_function` + `init_global`/`init_local`,
-where init returns *our* state so the RAII destructor is real — `PhysicalTableInOutFunction::GetGlobalOperatorState`
-wraps it, so the global-state destructor is the abort backstop, and `RequiresFinalExecute()` is `true` iff
-`in_out_function_final` is set). `OperatorFinalize`/`LogicalExtensionOperator`/`OptimizerExtension` exist but
-are **not used** for this read-only case (see the CORRECTION above) — reserved for the per-row-proc COMMIT.
+`TableFunction("summary",{LogicalType::TABLE},nullptr,Bind)` + `in_out_function` + `init_global`/`init_local`).
+`OperatorFinalize` (fires once, sink-level, even above a UNION) / `LogicalExtensionOperator` /
+`OptimizerExtension` exist and are reserved for the per-row-proc COMMIT (see above).
 
 **ABI (session-based, implemented at v23):** `inout_open(handle, schema, func, input_schema) → session` (the
 input table's columns ARE the TVF's positional params — no separate scalar args); `inout_push(session,

@@ -99,23 +99,27 @@ current code still uses the single-provider `mssql_net` naming):
   overload coexisting with the scalar-arg scan form under one name (`bind_table_function.cpp`: "TABLE
   parameter, and multiple function overloads — not supported") → the in-out form is a **separate `_each`
   catalog entry** (single TABLE overload), the scan form (4c) keeps the bare name; alias tracked in
-  `ArrowNetSchemaEntry::inout_functions_`. (2) `OperatorFinalize` is a **global single-shot hook handed no
-  DataChunk** → it **can't emit the tail**; `in_out_function_final` (the only row-emitting post-input hook)
-  fires once PER branch → the **last branch (atomic active-branch counter hits 0)** calls `inout_finish` and
-  drains the whole tail; other branches' finals are no-ops; the **global-state destructor → `inout_abort`**
-  is the LIMIT/error/cancel backstop (frees the handle). So **no `OperatorFinalize`/`LogicalExtensionOperator`
-  was built** (the earlier "REQUIRED even for read-only" note was wrong — it's reserved for the future per-row
-  proc COMMIT). Verified: `test/verify_table_inout.test` (63 assertions — incl. parallel UNION ALL, ORDER
-  BY+LIMIT, WHERE, aggregate, empty, multi-column, large BIGINT→INT, error+recover). **(4g-custom) custom
-  C#-authored table-in-out DONE** (`IArrowTableInOutFunction` — in-out analog of 4e/4f): a pure-C# table-in-out
-  authored in the provider (no SQL object), STATEFUL across the input stream (running aggregate / whole-table
-  summary), surfaced as `kind='inout'` → C++ `AddInOutFunction` registers a bare-name `{TABLE}` entry
-  (`GetOrCreateCustomInOutFunction` + `ArrowNetCustomInOutBind`, output = the fn's full declared schema, no
-  input echo), dispatched in C# (`CustomInOut` factory registry → fresh instance per session;
-  `CustomInOutSessionImpl` runs `Process(chunk)`/`Finish()`). Reuses the 4g operator path — no new ABI/C++
-  operator. Verified: `test/verify_custom_functions.test` (cf_tag per-row, cf_summarize stateful 4999-row
-  multi-chunk + Finish-only, per-session state, no SQL object). **Next: per-row stored procs**
-  (rollback-on-failure — where the `OperatorFinalize` COMMIT finally becomes relevant).
+  `ArrowNetSchemaEntry::inout_functions_`. (2) **Output is emitted SYNCHRONOUSLY per input chunk** (each
+  `inout_push` runs that chunk's CROSS APPLY to completion + returns its full output) → there is **no tail**,
+  so emitting rows never depends on detecting which parallel branch finishes last. This replaced an unsound
+  first attempt (an atomic last-branch counter in `in_out_function_final`): `PhysicalUnion::BuildPipelines`
+  can run UNION branch pipelines **sequentially**, so branch 1 could finish (counter→0, premature finish)
+  before branch 2 starts → lost rows; it passed tests only by scheduling luck (caught in review). Also
+  `OperatorFinalize` is a **global single-shot hook handed no `DataChunk`** so it **can't emit rows** — it's
+  reserved for the per-row-proc COMMIT (a no-rows action). Session lifecycle = a refcounted
+  `InOutSessionHolder` on the bind data; its **RAII destructor → `inout_abort`** is the release/rollback
+  backstop on every teardown path (also frees the GCHandle). Verified: `test/verify_table_inout.test` (63
+  assertions — incl. parallel UNION ALL, ORDER BY+LIMIT, WHERE, aggregate, empty, multi-column, large
+  BIGINT→INT, error+recover). **(4g-custom) custom C#-authored table-in-out DONE** (`IArrowTableInOutFunction`
+  — in-out analog of 4e/4f): a pure-C# **per-chunk streaming** table-in-out (no SQL object), may keep mutable
+  state across chunks (running aggregate); surfaced as `kind='inout'` → C++ `AddInOutFunction` registers a
+  bare-name `{TABLE}` entry (`GetOrCreateCustomInOutFunction` + `ArrowNetCustomInOutBind`, output = the fn's
+  full declared schema, no input echo), dispatched in C# (`CustomInOut` factory registry → fresh instance per
+  session; `CustomInOutSessionImpl` runs `Process(chunk)`). Reuses the 4g operator path — no new ABI/C++
+  operator. Verified: `test/verify_custom_functions.test` (cf_tag per-row, cf_running_sum stateful 4999-row
+  multi-chunk, per-session state, no SQL object). **Next: per-row stored procs** (one txn; the injected
+  `OperatorFinalize`→COMMIT + holder-destructor→ROLLBACK finally get built — `OperatorFinalize` fires once
+  even above a UNION, verified via `MetaPipeline`/executor finish-event scheduling).
 
 ## Implementation status (current)
 
@@ -334,35 +338,36 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
   to `tf`'s params.
 - **Registration** (`arrownet_schema_entry.cpp`): `AddTableFunction(name,false)` also registers
   `inout_functions_["<name>_each"] = name`; `GetOrCreateTableFunction` resolves the alias via
-  `GetOrCreateInOutFunction` → a single `{LogicalType::TABLE}` `TableFunction` (`in_out_function` +
-  `in_out_function_final`, `function_info.func` = the **base** TVF). A real same-named `_each` function
-  wins (matched first). `Scan` lists the aliases so they're discoverable.
+  `GetOrCreateInOutFunction` → a single `{LogicalType::TABLE}` `TableFunction` (`in_out_function` only,
+  `function_info.func` = the **base** TVF). A real same-named `_each` function wins (matched first). `Scan`
+  lists the aliases so they're discoverable.
 - **Operator** (all in the anon namespace of `arrownet_schema_entry.cpp`): `ArrowNetInOutBind` (output
-  schema, no execution) / `…InitGlobal` (`ToArrowSchema` + `inout_open`; atomic `active_branches`) /
-  `…InitLocal` (`active_branches++`) / `…Function` (`inout_push` + stream ready output across
-  `HAVE_MORE_OUTPUT`) / `…Final` (last branch — counter→0 — calls `inout_finish` + drains the whole tail;
-  other branches no-op). The **global-state destructor → `inout_abort`** is the LIMIT/error/cancel backstop
-  + frees the handle. `OperatorFinalize` was NOT used (it can't emit rows — corrected during the build;
-  reserved for the future per-row-proc COMMIT). See design §11.1.
-- **C#** (`SqlServerCatalog.InOutSessionImpl`): bounded `Channel` consumer; `Push` (deadlock-free,
-  drains output to a stash when input is full), `DrainReady` (ready output + surfaces a consumer fault),
-  `Finish` (completes input, drains the whole tail), `Abort` (idempotent release). `RunCrossApply` builds
+  schema, no execution) / `…InitGlobal` (`ToArrowSchema` + `inout_open` into the holder) / `…InitLocal`
+  (trivial) / `…Function` (`inout_push` → the chunk's **full** output, drained across `HAVE_MORE_OUTPUT`,
+  then `NEED_MORE_INPUT`). **Synchronous per chunk → no tail → no `in_out_function_final`, no counter.**
+  Session lives in `InOutSessionHolder` (refcounted, on the bind data); its **RAII destructor → `inout_abort`**
+  is the release/rollback backstop on every teardown path (also frees the GCHandle). `OperatorFinalize`
+  reserved for the per-row-proc COMMIT (it can't emit rows). See design §11.1.
+- **C#** (`SqlServerCatalog.InOutSessionImpl`): synchronous — `Push` runs `RunCrossApply` inline
+  (lock-serialized for parallel branches) + stashes the chunk's output, `DrainReady` returns it, `Finish`
+  drains leftovers (no tail), `Abort` releases. `RunCrossApply` builds
   `SELECT p.*, f.* FROM (VALUES (CAST(@.. AS <paramtype>),…)) p(cols) CROSS APPLY [s].[tf](p.cols) f`,
-  sub-chunked under the ~2100-param cap.
+  sub-chunked under the ~2100-param cap. A CROSS APPLY error throws out of `Push`/`inout_push` → fails the query.
 - **Verified**: `test/verify_table_inout.test` (63 assertions) — scalar-arg regression, single-chunk,
   parallel `UNION ALL` (coherent), `WHERE`, `ORDER BY`+`LIMIT`, aggregate, empty, multi-column, large
-  50-row `BIGINT`→`INT` (sub-chunking + backpressure + type round-trip), error mid-stream + recovery.
+  50-row `BIGINT`→`INT` (sub-chunking + type round-trip), error mid-stream + recovery.
 - **Custom C#-authored in-out (4g-custom)**: `IArrowTableInOutFunction` (Bridge) =
-  `SchemaName`/`Name`/`InputSchema`/`OutputSchema` + `IEnumerable<RecordBatch> Process(chunk)` + `Finish()`
-  (the in-out analog of 4e `IArrowScalarFunction` / 4f `IArrowTableFunction`). A pure-C# table-in-out (no
-  SQL object) that, unlike the `_each` CROSS APPLY, can be **stateful across the whole input stream**
-  (`Process`/`Finish` are invoked serially per session, so no locking needed) and declares its **full**
-  output (no input echo). Surfaced via `FunctionsMetadataSql` as `kind='inout'`; C++ `AddInOutFunction`
-  registers a bare-name `{TABLE}` entry (`GetOrCreateCustomInOutFunction` + `ArrowNetCustomInOutBind`,
-  reusing the 4g operator callbacks — no new ABI). C# `CustomInOut` is a **factory** registry (fresh
+  `SchemaName`/`Name`/`InputSchema`/`OutputSchema` + `IEnumerable<RecordBatch> Process(chunk)` (the in-out
+  analog of 4e `IArrowScalarFunction` / 4f `IArrowTableFunction`). A pure-C# **per-chunk streaming**
+  table-in-out (no SQL object) that may keep mutable state across chunks (running aggregate — `Process` is
+  invoked serially per session) and declares its **full** output (no input echo). There is no emit-at-end
+  hook (a whole-table aggregate is a pipeline breaker, not a streaming in-out). Surfaced via
+  `FunctionsMetadataSql` as `kind='inout'`; C++ `AddInOutFunction` registers a bare-name `{TABLE}` entry
+  (`GetOrCreateCustomInOutFunction` + `ArrowNetCustomInOutBind`, reusing the 4g operator callbacks — no new
+  ABI). C# `CustomInOut` is a **factory** registry (fresh
   instance per session so state can't leak across queries); `InOutOpen` dispatches to `CustomInOutSessionImpl`
-  (Process per push, Finish drains the tail) ahead of the CROSS APPLY path. Demos `CustomFunctions.InOut`:
-  `dbo.cf_tag` (per-row `(n, n*n)`) + `dbo.cf_summarize` (whole-table `(cnt, total)` at Finish). Verified in
+  (runs `Process` per push) ahead of the CROSS APPLY path. Demos `CustomFunctions.InOut`: `dbo.cf_tag`
+  (per-row `(n, n*n)`) + `dbo.cf_running_sum` (stateful cumulative sum, emitted per row). Verified in
   `test/verify_custom_functions.test`.
 
 - **Filtering**: discovered scalar UDFs + TVFs/procs are gated by the ATTACH `schema_filter` (icase
