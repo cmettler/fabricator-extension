@@ -26,7 +26,7 @@ public static unsafe class Bootstrap
             return ArrowNetStatus.InvalidArgument;
         }
 
-        vtable->AbiVersion = 26;
+        vtable->AbiVersion = 27;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -643,8 +643,8 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int GetFunctionOutputSchema(nint handle, byte* schema, byte* func, CArrowArrayStream* outStream,
-                                               byte** err)
+    private static int GetFunctionOutputSchema(nint handle, byte* schema, byte* func, CArrowArrayStream* args,
+                                               CArrowArrayStream* outStream, byte** err)
     {
         try
         {
@@ -655,7 +655,15 @@ public static unsafe class Bootstrap
             var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty);
             var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
-            CArrowArrayStreamExporter.ExportArrayStream(catalog.GetFunctionOutputSchema(s, f), outStream);
+            // `args` (nullable) is a 1-row stream of the constant call args — a custom table function's output
+            // schema may depend on them. Discovered SQL functions ignore it.
+            RecordBatch? argsBatch = null;
+            if (args is not null)
+            {
+                using var argStream = CArrowArrayStreamImporter.ImportArrayStream(args); // we own it
+                argsBatch = argStream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+            }
+            CArrowArrayStreamExporter.ExportArrayStream(catalog.GetFunctionOutputSchema(s, f, argsBatch), outStream);
             return ArrowNetStatus.Ok;
         }
         catch (Exception ex)

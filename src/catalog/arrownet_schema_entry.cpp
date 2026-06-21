@@ -828,19 +828,12 @@ unique_ptr<FunctionData> ArrowNetTableFunctionBind(ClientContext &context, Table
 
 	auto bind_data = make_uniq<arrownet::ArrowStreamBindData>();
 
-	// 1) Output schema (fixed, from metadata) -> return types/names + column converters.
-	bind_data->factory = [handle, schema_name, func_name](const arrownet::ArrowScanRequest &, ArrowArrayStream &out) {
-		arrownet::GetFunctionOutputSchema(handle, schema_name, func_name, out);
-	};
-	arrownet::PopulateReturnSchema(context, *bind_data, return_types, names);
-
-	// 2) Scan factory: constant args -> 1-row Arrow batch -> execute_table (streams rows).
-	// The request carries projection + best-effort filter pushdown (spec_json/filter_values),
-	// built by the scan machinery from the projected column ids + the pushed filter tree.
 	auto properties = context.GetClientProperties();
 	auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(context, arg_types);
-	bind_data->factory = [handle, schema_name, func_name, arg_types, arg_names, arg_values, properties, extension_types,
-	                      is_proc](const arrownet::ArrowScanRequest &req, ArrowArrayStream &out) {
+
+	// Marshal the constant call args into a 1-row Arrow array (shared by the output-schema resolution and the
+	// scan): a custom table function's output schema MAY depend on the args, so they cross at bind time too.
+	auto marshal_args = [arg_types, arg_values, properties, extension_types]() -> ArrowArray {
 		DataChunk chunk;
 		chunk.Initialize(Allocator::DefaultAllocator(), arg_types);
 		for (idx_t c = 0; c < arg_values.size(); c++) {
@@ -849,7 +842,26 @@ unique_ptr<FunctionData> ArrowNetTableFunctionBind(ClientContext &context, Table
 		chunk.SetCardinality(1);
 		ArrowAppender appender(arg_types, 1, properties, extension_types);
 		appender.Append(chunk, 0, 1, 1);
-		ArrowArray array = appender.Finalize();
+		return appender.Finalize();
+	};
+
+	// 1) Output schema (may depend on the constant args) -> return types/names + column converters. The args
+	//    cross as a 1-row Arrow stream; the managed side consumes it.
+	bind_data->factory = [handle, schema_name, func_name, arg_types, arg_names, properties, marshal_args](
+	                         const arrownet::ArrowScanRequest &, ArrowArrayStream &out) {
+		ArrowArray array = marshal_args();
+		arrownet::ArrowProducer producer(arg_types, arg_names, properties);
+		producer.AddBatch(array);
+		producer.Finish();
+		arrownet::GetFunctionOutputSchema(handle, schema_name, func_name, producer.Stream(), out);
+	};
+	arrownet::PopulateReturnSchema(context, *bind_data, return_types, names);
+
+	// 2) Scan factory: constant args -> 1-row Arrow batch -> execute_table/execute_proc (streams rows).
+	// The request carries projection + best-effort filter pushdown (spec_json/filter_values).
+	bind_data->factory = [handle, schema_name, func_name, arg_types, arg_names, properties, marshal_args,
+	                      is_proc](const arrownet::ArrowScanRequest &req, ArrowArrayStream &out) {
+		ArrowArray array = marshal_args();
 		arrownet::ArrowProducer producer(arg_types, arg_names, properties);
 		producer.AddBatch(array);
 		producer.Finish();
@@ -961,7 +973,7 @@ void AppendInOutOutputSchema(ClientContext &context, ArrowNetHandle handle, cons
                             vector<LogicalType> &return_types, vector<string> &names) {
 	ArrowArrayStream out_schema;
 	std::memset(&out_schema, 0, sizeof(out_schema));
-	arrownet::GetFunctionOutputSchema(handle, schema, func, out_schema);
+	arrownet::GetFunctionOutputSchema(handle, schema, func, nullptr, out_schema); // in-out base: no constant args
 	ArrowSchemaWrapper schema_root;
 	if (out_schema.get_schema(&out_schema, &schema_root.arrow_schema) != 0) {
 		const char *msg = out_schema.get_last_error ? out_schema.get_last_error(&out_schema) : nullptr;

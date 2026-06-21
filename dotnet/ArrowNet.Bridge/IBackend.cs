@@ -104,8 +104,13 @@ public interface IBackendCatalog : IDisposable
     /// </summary>
     IArrowArrayStream ExecuteScalar(string schemaName, string functionName, IArrowArrayStream args);
 
-    /// <summary>Zero-row Arrow stream whose schema describes a table-valued function's output columns.</summary>
-    IArrowArrayStream GetFunctionOutputSchema(string schemaName, string functionName);
+    /// <summary>
+    /// Zero-row Arrow stream whose schema describes a table-returning function's output columns.
+    /// <paramref name="args"/> (null =&gt; none) is a 1-row batch of the constant call arguments — a custom
+    /// table function's output schema may depend on them (bound via <see cref="IArrowTableFunction.Bind"/>);
+    /// discovered SQL TVFs/procs read their schema from metadata and ignore it.
+    /// </summary>
+    IArrowArrayStream GetFunctionOutputSchema(string schemaName, string functionName, RecordBatch? args = null);
 
     /// <summary>
     /// Executes a table-valued function over its constant arguments: <paramref name="args"/> is a 1-row

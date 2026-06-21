@@ -61,7 +61,7 @@ public sealed class StubBackend : IBackend
         public IArrowArrayStream ExecuteScalar(string schemaName, string functionName, IArrowArrayStream args) =>
             EmptyStringTable("result");
 
-        public IArrowArrayStream GetFunctionOutputSchema(string schemaName, string functionName) =>
+        public IArrowArrayStream GetFunctionOutputSchema(string schemaName, string functionName, RecordBatch? args = null) =>
             EmptyStringTable("result");
 
         public IArrowArrayStream ExecuteTable(string schemaName, string functionName, IArrowArrayStream args,

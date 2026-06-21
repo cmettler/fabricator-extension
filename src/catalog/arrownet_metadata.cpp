@@ -136,7 +136,7 @@ void FetchFunctionOutputSchema(ClientContext &context, ArrowNetHandle handle, co
                                const string &func_name, vector<string> &names, vector<LogicalType> &types) {
 	arrownet::ArrowStreamBindData bind_data;
 	bind_data.factory = [handle, schema_name, func_name](const arrownet::ArrowScanRequest &, ArrowArrayStream &out) {
-		arrownet::GetFunctionOutputSchema(handle, schema_name, func_name, out);
+		arrownet::GetFunctionOutputSchema(handle, schema_name, func_name, nullptr, out);
 	};
 	arrownet::PopulateReturnSchema(context, bind_data, types, names);
 }

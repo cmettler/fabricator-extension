@@ -1299,11 +1299,15 @@ public sealed class SqlServerCatalog : IBackendCatalog
         return result;
     }
 
-    public IArrowArrayStream GetFunctionOutputSchema(string schemaName, string functionName)
+    public IArrowArrayStream GetFunctionOutputSchema(string schemaName, string functionName, RecordBatch? args = null)
     {
         if (CustomTable.TryGetValue($"{schemaName}.{functionName}", out var customTable))
         {
-            return new InMemoryArrayStream(customTable.OutputSchema, System.Array.Empty<RecordBatch>());
+            // The output schema may depend on the constant args (bound per call). `args` is null only for the
+            // in-out `_each` base-schema probe (which doesn't apply to a pure-C# table function); a static
+            // function ignores it.
+            using var binding = customTable.Bind(args!);
+            return new InMemoryArrayStream(binding.OutputSchema, System.Array.Empty<RecordBatch>());
         }
         if (CustomInOut.TryGetValue($"{schemaName}.{functionName}", out var customInOutFactory))
         {
@@ -1356,13 +1360,14 @@ public sealed class SqlServerCatalog : IBackendCatalog
         // result and DuckDB projects (by column name) + filters above the scan.
         if (CustomTable.TryGetValue($"{schemaName}.{functionName}", out var custom))
         {
-            filterValues?.Dispose();
             using var input = args; // the 1-row args batch; result batches must be independent
-            var argBatch = input.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
-            var batches = argBatch is null
-                ? System.Array.Empty<RecordBatch>()
-                : custom.Invoke(argBatch).ToArray();
-            return new InMemoryArrayStream(custom.OutputSchema, batches);
+            var argBatch = input.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult()
+                           ?? throw new ArgumentException($"mssql_net: '{schemaName}.{functionName}' called with no arguments");
+            using var binding = custom.Bind(argBatch);
+            // The binding's Execute owns scan.FilterValues; pushdown is ignored for a pure-C# function
+            // (DuckDB re-applies projection by name + filters above the scan).
+            var batches = binding.Execute(new TableFunctionScan(specJson, filterValues)).ToArray();
+            return new InMemoryArrayStream(binding.OutputSchema, batches);
         }
 
         var qualified = Quote(schemaName) + "." + Quote(functionName);

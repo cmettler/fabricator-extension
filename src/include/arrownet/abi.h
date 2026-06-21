@@ -318,10 +318,13 @@ typedef struct ArrowNetVTable {
 	int32_t (*execute_scalar)(ArrowNetHandle handle, const char *schema, const char *func,
 	                          struct ArrowArrayStream *args, struct ArrowArrayStream *out, char **err);
 
-	// Zero-row Arrow stream whose schema = a table-valued function's output columns
-	// (the result set, fixed/known from metadata). Used to bind the catalog table function.
+	// Zero-row Arrow stream whose schema = a table-returning function's output columns. `args` (nullable) is
+	// a 1-row Arrow array of the constant call arguments (in param order; consumed by the managed side when
+	// present) — a custom table function's output schema MAY depend on them (the managed side binds the call
+	// and returns the bound output schema); discovered SQL TVFs/procs read it from metadata and ignore `args`.
+	// Pass NULL for `args` when there are none (e.g. the in-out `_each` base-schema lookup).
 	int32_t (*get_function_output_schema)(ArrowNetHandle handle, const char *schema, const char *func,
-	                                      struct ArrowArrayStream *out, char **err);
+	                                      struct ArrowArrayStream *args, struct ArrowArrayStream *out, char **err);
 
 	// Execute a table-valued function over its constant arguments: `args` is a 1-row
 	// stream of the argument values (in param order; consumed by the managed side).
@@ -450,7 +453,7 @@ typedef struct ArrowNetVTable {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 26
+#define ARROWNET_ABI_VERSION 27
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

@@ -107,5 +107,24 @@ SELECT cnt FROM mssql_net_query('cdb', 'SELECT COUNT(*) AS cnt FROM sys.objects 
 ----
 0
 
+# A custom table function whose OUTPUT SCHEMA depends on the constant argument — only expressible because
+# IArrowTableFunction.Bind sees the args. dbo.cf_columns(n) returns one row of n INT columns c1..cn.
+query III
+SELECT * FROM cdb.dbo.cf_columns(3);
+----
+1	2	3
+
+# A different argument yields a DIFFERENT schema (2 columns here vs 3 above): the binding resolved it from n.
+query II
+SELECT * FROM cdb.dbo.cf_columns(2);
+----
+1	2
+
+# The columns are named c1..cn (resolved at bind) — selecting a specific one works.
+query I
+SELECT c4 FROM cdb.dbo.cf_columns(5);
+----
+4
+
 statement ok
 DETACH cdb;

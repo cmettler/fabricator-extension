@@ -20,6 +20,7 @@ internal static class CustomFunctions
     public static readonly IReadOnlyList<IArrowTableFunction> Table = new IArrowTableFunction[]
     {
         new CfRangeFunction(),
+        new CfColumnsFunction(),
     };
 
     // Factories, not instances: a table-in-out may keep mutable state across its input stream (a running
@@ -317,25 +318,25 @@ internal sealed class CfRunningSumFunction : IArrowTableInOutFunction
     }
 }
 
-// Demo: dbo.cf_range(n) -> rows (value, squared) for value = 1..n, generated in C#
-// (no such object exists in SQL Server). Multi-column to exercise projection.
-internal sealed class CfRangeFunction : IArrowTableFunction
+// Demo: dbo.cf_range(n) -> rows (value, squared) for value = 1..n, generated in C# (no such object exists in
+// SQL Server). FIXED output schema → derives from StaticTableFunction (just OutputSchema + Invoke).
+internal sealed class CfRangeFunction : StaticTableFunction
 {
-    public string SchemaName => "dbo";
-    public string Name => "cf_range";
+    public override string SchemaName => "dbo";
+    public override string Name => "cf_range";
 
-    public Schema Parameters => new(new[]
+    public override Schema Parameters => new(new[]
     {
         new Field("n", Int32Type.Default, nullable: true),
     }, metadata: null);
 
-    public Schema OutputSchema => new(new[]
+    public override Schema OutputSchema => new(new[]
     {
         new Field("value", Int32Type.Default, nullable: false),
         new Field("squared", Int32Type.Default, nullable: false),
     }, metadata: null);
 
-    public IEnumerable<RecordBatch> Invoke(RecordBatch args)
+    public override IEnumerable<RecordBatch> Invoke(RecordBatch args)
     {
         var arg = (Int32Array)args.Column(0);
         int n = args.Length > 0 && !arg.IsNull(0) ? arg.Values[0] : 0;
@@ -347,6 +348,56 @@ internal sealed class CfRangeFunction : IArrowTableFunction
             squared.Append(i * i);
         }
         yield return new RecordBatch(OutputSchema, new IArrowArray[] { value.Build(), squared.Build() }, n);
+    }
+}
+
+// Demo: dbo.cf_columns(n) -> a single row with n INT columns c1..cn (c_i = i). The OUTPUT SCHEMA itself
+// depends on the constant argument n — only expressible because IArrowTableFunction.Bind sees the args. The
+// binding resolves the schema once at bind and reuses it for the row.
+internal sealed class CfColumnsFunction : IArrowTableFunction
+{
+    public string SchemaName => "dbo";
+    public string Name => "cf_columns";
+    public Schema Parameters => new(new[] { new Field("n", Int32Type.Default, nullable: true) }, metadata: null);
+
+    public IArrowTableFunctionBinding Bind(RecordBatch args)
+    {
+        var a = (Int32Array)args.Column(0);
+        int n = args.Length > 0 && !a.IsNull(0) ? a.Values[0] : 0;
+        return new Binding(n);
+    }
+
+    private sealed class Binding : IArrowTableFunctionBinding
+    {
+        private readonly int _n;
+        public Binding(int n)
+        {
+            _n = n;
+            var fields = new Field[_n];
+            for (int i = 1; i <= _n; i++)
+            {
+                fields[i - 1] = new Field($"c{i}", Int32Type.Default, nullable: false);
+            }
+            OutputSchema = new Schema(fields, metadata: null);
+        }
+
+        public Schema OutputSchema { get; }
+        public bool SupportsPushdown => false;
+
+        public IEnumerable<RecordBatch> Execute(TableFunctionScan scan)
+        {
+            scan.FilterValues?.Dispose();
+            var arrays = new IArrowArray[_n];
+            for (int i = 1; i <= _n; i++)
+            {
+                var b = new Int32Array.Builder();
+                b.Append(i);
+                arrays[i - 1] = b.Build();
+            }
+            return new[] { new RecordBatch(OutputSchema, arrays, 1) };
+        }
+
+        public void Dispose() { }
     }
 }
 
