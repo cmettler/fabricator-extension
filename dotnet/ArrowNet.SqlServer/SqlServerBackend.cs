@@ -151,6 +151,13 @@ public sealed class SqlServerCatalog : IBackendCatalog
         CustomFunctions.InOut.ToDictionary(factory => { var p = factory(); return $"{p.SchemaName}.{p.Name}"; },
                                            factory => factory, StringComparer.OrdinalIgnoreCase);
 
+    // Provider-authored custom aggregate functions (UDAF), keyed "schema.name" (case-insensitive). Surfaced
+    // as `kind='aggregate'` (see FunctionsMetadataSql) so the C++ catalog registers them as an
+    // AggregateFunctionCatalogEntry; dispatched to C# (see AggOpen / GetFunctionParamSchema /
+    // GetFunctionReturnSchema). The function object is a singleton (CreateState() mints the per-group state).
+    private static readonly IReadOnlyDictionary<string, IArrowAggregateFunction> CustomAgg =
+        CustomFunctions.Aggregate.ToDictionary(f => $"{f.SchemaName}.{f.Name}", StringComparer.OrdinalIgnoreCase);
+
     private readonly string _connectionString;
     private readonly string? _accessToken;
 
@@ -733,7 +740,7 @@ public sealed class SqlServerCatalog : IBackendCatalog
     // UNION ALL so the C++ catalog discovers + registers them uniformly (then dispatches custom ones to C#).
     private static string FunctionsMetadataSql()
     {
-        if (CustomScalar.Count == 0 && CustomTable.Count == 0 && CustomInOut.Count == 0)
+        if (CustomScalar.Count == 0 && CustomTable.Count == 0 && CustomInOut.Count == 0 && CustomAgg.Count == 0)
         {
             return FunctionsSql;
         }
@@ -758,6 +765,12 @@ public sealed class SqlServerCatalog : IBackendCatalog
             var f = factory();
             sb.Append(" UNION ALL SELECT '").Append(Esc(f.SchemaName)).Append("', '").Append(Esc(f.Name))
               .Append("', 'inout', ").Append(f.InputSchema.FieldsList.Count).Append(", ''");
+        }
+        foreach (var f in CustomAgg.Values)
+        {
+            sb.Append(" UNION ALL SELECT '").Append(Esc(f.SchemaName)).Append("', '").Append(Esc(f.Name))
+              .Append("', 'aggregate', ").Append(f.Parameters.FieldsList.Count).Append(", '")
+              .Append(Esc(f.Result.DataType.Name)).Append('\'');
         }
         return sb.ToString();
     }
@@ -1109,6 +1122,10 @@ public sealed class SqlServerCatalog : IBackendCatalog
         {
             return new InMemoryArrayStream(customTable.Parameters, System.Array.Empty<RecordBatch>());
         }
+        if (CustomAgg.TryGetValue(key, out var customAgg))
+        {
+            return new InMemoryArrayStream(customAgg.Parameters, System.Array.Empty<RecordBatch>());
+        }
         var parms = FunctionParameters(schemaName, functionName, wantReturn: false);
         if (parms.Count == 0)
         {
@@ -1133,6 +1150,11 @@ public sealed class SqlServerCatalog : IBackendCatalog
         if (CustomScalar.TryGetValue($"{schemaName}.{functionName}", out var custom))
         {
             return new InMemoryArrayStream(new Schema(new[] { custom.Result }, null),
+                                           System.Array.Empty<RecordBatch>());
+        }
+        if (CustomAgg.TryGetValue($"{schemaName}.{functionName}", out var customAgg))
+        {
+            return new InMemoryArrayStream(new Schema(new[] { customAgg.Result }, null),
                                            System.Array.Empty<RecordBatch>());
         }
         var ret = FunctionParameters(schemaName, functionName, wantReturn: true);
@@ -1419,6 +1441,276 @@ public sealed class SqlServerCatalog : IBackendCatalog
             return new ProcInOutSessionImpl(this, schemaName, functionName, inputSchema);
         }
         return new InOutSessionImpl(this, schemaName, functionName, inputSchema, isolationLevel);
+    }
+
+    // 4h custom aggregate (UDAF): open a session mapping DuckDB's per-group int64 state ids to live C#
+    // accumulators (IArrowAggregateFunction). Only provider-authored aggregates exist (SQL Server has no
+    // DuckDB-aggregate to discover), so this requires a registered CustomAgg entry.
+    public IAggregateSession AggOpen(string schemaName, string functionName)
+    {
+        if (CustomAgg.TryGetValue($"{schemaName}.{functionName}", out var fn))
+        {
+            return new AggSessionImpl(fn);
+        }
+        throw new ArgumentException($"mssql_net: '{schemaName}.{functionName}' is not a custom aggregate function");
+    }
+
+    // Session for a custom C#-authored aggregate. Maps DuckDB's per-group int64 state ids to live C#
+    // accumulators. The C++ aggregate callbacks marshal [id ++ args] (update), [target_id, source_id]
+    // (combine), and [id] (finalize/destroy) over the agg_* ABI; this routes them. A given id is touched by
+    // one thread at a time (DuckDB partitions per thread; combine is partition-disjoint), so a
+    // ConcurrentDictionary suffices with no per-accumulator lock. An absent id => a fresh accumulator => the
+    // empty-group value (a state DuckDB initialized but never updated).
+    private sealed class AggSessionImpl : IAggregateSession
+    {
+        private readonly IArrowAggregateFunction _fn;
+        private readonly Schema _updateSchema;
+        private readonly ConcurrentDictionary<long, IArrowAggregateState> _states = new();
+
+        public AggSessionImpl(IArrowAggregateFunction fn)
+        {
+            _fn = fn;
+            var fields = new List<Field>(fn.Parameters.FieldsList.Count + 1)
+            {
+                new Field("state_id", Int64Type.Default, nullable: false),
+            };
+            fields.AddRange(fn.Parameters.FieldsList);
+            _updateSchema = new Schema(fields, null);
+        }
+
+        public Schema UpdateSchema => _updateSchema;
+
+        private IArrowAggregateState StateFor(long id) => _states.GetOrAdd(id, _ => _fn.CreateState());
+
+        public void Update(RecordBatch idPlusArgs)
+        {
+            using (idPlusArgs)
+            {
+                int rows = idPlusArgs.Length;
+                if (rows == 0)
+                {
+                    return;
+                }
+                var ids = (Int64Array)idPlusArgs.Column(0);
+                var argCols = new IArrowArray[idPlusArgs.ColumnCount - 1];
+                for (int c = 0; c < argCols.Length; c++)
+                {
+                    argCols[c] = idPlusArgs.Column(c + 1);
+                }
+
+                // Fast path: the whole chunk is one group — always true for the ungrouped simple_update path,
+                // and for GROUP BY chunks holding a single group — so the arg columns pass through with no
+                // gather. (The wrapper batch is NOT disposed: its columns are owned by idPlusArgs.)
+                long first = ids.GetValue(0) ?? 0;
+                bool single = true;
+                for (int i = 1; i < rows; i++)
+                {
+                    if ((ids.GetValue(i) ?? 0) != first)
+                    {
+                        single = false;
+                        break;
+                    }
+                }
+                if (single)
+                {
+                    StateFor(first).Update(new RecordBatch(_fn.Parameters, argCols, rows));
+                    return;
+                }
+
+                // General path: group row indices by id, gather each group's arg rows, update once per group.
+                var groups = new Dictionary<long, List<int>>();
+                for (int i = 0; i < rows; i++)
+                {
+                    long id = ids.GetValue(i) ?? 0;
+                    if (!groups.TryGetValue(id, out var list))
+                    {
+                        groups[id] = list = new List<int>();
+                    }
+                    list.Add(i);
+                }
+                foreach (var kv in groups)
+                {
+                    var gathered = new IArrowArray[argCols.Length];
+                    for (int c = 0; c < argCols.Length; c++)
+                    {
+                        gathered[c] = GatherRows(argCols[c], kv.Value);
+                    }
+                    using var batch = new RecordBatch(_fn.Parameters, gathered, kv.Value.Count);
+                    StateFor(kv.Key).Update(batch);
+                }
+            }
+        }
+
+        public void Combine(RecordBatch targetSource)
+        {
+            using (targetSource)
+            {
+                var target = (Int64Array)targetSource.Column(0);
+                var source = (Int64Array)targetSource.Column(1);
+                for (int i = 0; i < targetSource.Length; i++)
+                {
+                    // A source state that was never updated is absent => empty, nothing to merge.
+                    if (_states.TryGetValue(source.GetValue(i) ?? 0, out var src))
+                    {
+                        StateFor(target.GetValue(i) ?? 0).Combine(src);
+                    }
+                }
+            }
+        }
+
+        public IArrowArrayStream Finalize(RecordBatch ids)
+        {
+            var resultSchema = new Schema(new[] { _fn.Result }, null);
+            using (ids)
+            {
+                var idCol = (Int64Array)ids.Column(0);
+                int rows = ids.Length;
+                var values = new object?[rows];
+                for (int i = 0; i < rows; i++)
+                {
+                    // Absent id => a fresh accumulator => the empty-group value. Do NOT insert it (finalize
+                    // must not grow the map), just finalize a throwaway.
+                    var state = _states.TryGetValue(idCol.GetValue(i) ?? 0, out var s) ? s : _fn.CreateState();
+                    values[i] = state.Finalize();
+                }
+                var col = BuildResultColumn(_fn.Result.DataType, values);
+                return new InMemoryArrayStream(resultSchema, new[] { new RecordBatch(resultSchema, new[] { col }, rows) });
+            }
+        }
+
+        public void Destroy(RecordBatch ids)
+        {
+            using (ids)
+            {
+                var idCol = (Int64Array)ids.Column(0);
+                for (int i = 0; i < ids.Length; i++)
+                {
+                    _states.TryRemove(idCol.GetValue(i) ?? 0, out _);
+                }
+            }
+        }
+
+        public void Close() => _states.Clear();
+
+        // Gathers the given row indices from one Arrow column into a fresh array (Apache.Arrow C# has no
+        // take/gather). Supports the common aggregate-argument types; an exotic type throws clearly.
+        private static IArrowArray GatherRows(IArrowArray src, List<int> rows)
+        {
+            switch (src)
+            {
+                case Int16Array a:
+                {
+                    var b = new Int16Array.Builder().Reserve(rows.Count);
+                    foreach (var r in rows) { if (a.IsNull(r)) b.AppendNull(); else b.Append(a.Values[r]); }
+                    return b.Build();
+                }
+                case Int32Array a:
+                {
+                    var b = new Int32Array.Builder().Reserve(rows.Count);
+                    foreach (var r in rows) { if (a.IsNull(r)) b.AppendNull(); else b.Append(a.Values[r]); }
+                    return b.Build();
+                }
+                case Int64Array a:
+                {
+                    var b = new Int64Array.Builder().Reserve(rows.Count);
+                    foreach (var r in rows) { if (a.IsNull(r)) b.AppendNull(); else b.Append(a.Values[r]); }
+                    return b.Build();
+                }
+                case FloatArray a:
+                {
+                    var b = new FloatArray.Builder().Reserve(rows.Count);
+                    foreach (var r in rows) { if (a.IsNull(r)) b.AppendNull(); else b.Append(a.Values[r]); }
+                    return b.Build();
+                }
+                case DoubleArray a:
+                {
+                    var b = new DoubleArray.Builder().Reserve(rows.Count);
+                    foreach (var r in rows) { if (a.IsNull(r)) b.AppendNull(); else b.Append(a.Values[r]); }
+                    return b.Build();
+                }
+                case BooleanArray a:
+                {
+                    var b = new BooleanArray.Builder();
+                    foreach (var r in rows) { var v = a.GetValue(r); if (v is null) b.AppendNull(); else b.Append(v.Value); }
+                    return b.Build();
+                }
+                case StringArray a:
+                {
+                    var b = new StringArray.Builder();
+                    foreach (var r in rows) { if (a.IsNull(r)) b.AppendNull(); else b.Append(a.GetString(r)); }
+                    return b.Build();
+                }
+                case Decimal128Array a:
+                {
+                    var b = new Decimal128Array.Builder((Decimal128Type)a.Data.DataType).Reserve(rows.Count);
+                    foreach (var r in rows) { var v = a.GetValue(r); if (v is null) b.AppendNull(); else b.Append(v.Value); }
+                    return b.Build();
+                }
+                default:
+                    throw new NotSupportedException(
+                        $"mssql_net: custom aggregate argument type {src.Data.DataType} is not supported");
+            }
+        }
+
+        // Builds the one-column result array (typed as the aggregate's Result) from per-group boxed values
+        // (null => SQL NULL). Convert.* tolerates the author returning any compatible boxed numeric type.
+        private static IArrowArray BuildResultColumn(IArrowType type, IReadOnlyList<object?> values)
+        {
+            int n = values.Count;
+            switch (type)
+            {
+                case Int16Type:
+                {
+                    var b = new Int16Array.Builder().Reserve(n);
+                    foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append(Convert.ToInt16(v)); }
+                    return b.Build();
+                }
+                case Int32Type:
+                {
+                    var b = new Int32Array.Builder().Reserve(n);
+                    foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append(Convert.ToInt32(v)); }
+                    return b.Build();
+                }
+                case Int64Type:
+                {
+                    var b = new Int64Array.Builder().Reserve(n);
+                    foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append(Convert.ToInt64(v)); }
+                    return b.Build();
+                }
+                case FloatType:
+                {
+                    var b = new FloatArray.Builder().Reserve(n);
+                    foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append(Convert.ToSingle(v)); }
+                    return b.Build();
+                }
+                case DoubleType:
+                {
+                    var b = new DoubleArray.Builder().Reserve(n);
+                    foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append(Convert.ToDouble(v)); }
+                    return b.Build();
+                }
+                case BooleanType:
+                {
+                    var b = new BooleanArray.Builder();
+                    foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append(Convert.ToBoolean(v)); }
+                    return b.Build();
+                }
+                case StringType:
+                {
+                    var b = new StringArray.Builder();
+                    foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append((string)v); }
+                    return b.Build();
+                }
+                case Decimal128Type dt:
+                {
+                    var b = new Decimal128Array.Builder(dt).Reserve(n);
+                    foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append(Convert.ToDecimal(v)); }
+                    return b.Build();
+                }
+                default:
+                    throw new NotSupportedException($"mssql_net: custom aggregate result type {type} is not supported");
+            }
+        }
     }
 
     // True if schema.name is a stored procedure (vs a table-valued function) — picks the in-out execution

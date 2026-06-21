@@ -29,6 +29,101 @@ internal static class CustomFunctions
         () => new CfTagFunction(),
         () => new CfRunningSumFunction(),
     };
+
+    // Aggregate functions (UDAF). The function object is a singleton; CreateState() mints the per-group
+    // accumulator. These reduce in C# (no SQL Server equivalent) and work in GROUP BY / parallel / OVER(...).
+    public static readonly IReadOnlyList<IArrowAggregateFunction> Aggregate = new IArrowAggregateFunction[]
+    {
+        new CfProductFunction(),
+        new CfBitOrFunction(),
+    };
+}
+
+// Demo (aggregate): dbo.cf_product(x BIGINT) -> BIGINT, the product of all non-NULL inputs (SQL Server has
+// no PRODUCT aggregate). Empty group / all-NULL => NULL (SUM-like). Order-independent => safe under parallel
+// combine and windowing.
+internal sealed class CfProductFunction : IArrowAggregateFunction
+{
+    public string SchemaName => "dbo";
+    public string Name => "cf_product";
+    public Schema Parameters => new(new[] { new Field("x", Int64Type.Default, nullable: true) }, metadata: null);
+    public Field Result => new("product", Int64Type.Default, nullable: true);
+    public IArrowAggregateState CreateState() => new State();
+
+    private sealed class State : IArrowAggregateState
+    {
+        private bool _any;
+        private long _product = 1;
+
+        public void Update(RecordBatch args)
+        {
+            var x = (Int64Array)args.Column(0);
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (x.IsNull(i))
+                {
+                    continue; // NULLs are skipped (standard aggregate semantics)
+                }
+                _product *= x.Values[i];
+                _any = true;
+            }
+        }
+
+        public void Combine(IArrowAggregateState source)
+        {
+            var s = (State)source;
+            if (s._any)
+            {
+                _product *= s._product;
+                _any = true;
+            }
+        }
+
+        public object? Finalize() => _any ? _product : null;
+    }
+}
+
+// Demo (aggregate): dbo.cf_bit_or(x BIGINT) -> BIGINT, the bitwise OR of all non-NULL inputs. Associative +
+// commutative => a clean parallel/combine test. Empty group / all-NULL => NULL.
+internal sealed class CfBitOrFunction : IArrowAggregateFunction
+{
+    public string SchemaName => "dbo";
+    public string Name => "cf_bit_or";
+    public Schema Parameters => new(new[] { new Field("x", Int64Type.Default, nullable: true) }, metadata: null);
+    public Field Result => new("bit_or", Int64Type.Default, nullable: true);
+    public IArrowAggregateState CreateState() => new State();
+
+    private sealed class State : IArrowAggregateState
+    {
+        private bool _any;
+        private long _acc;
+
+        public void Update(RecordBatch args)
+        {
+            var x = (Int64Array)args.Column(0);
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (x.IsNull(i))
+                {
+                    continue;
+                }
+                _acc |= x.Values[i];
+                _any = true;
+            }
+        }
+
+        public void Combine(IArrowAggregateState source)
+        {
+            var s = (State)source;
+            if (s._any)
+            {
+                _acc |= s._acc;
+                _any = true;
+            }
+        }
+
+        public object? Finalize() => _any ? _acc : null;
+    }
 }
 
 // Demo (table-in-out, per-row/streaming): dbo.cf_tag(<table of n>) -> (n, sq=n*n) per input row, emitted

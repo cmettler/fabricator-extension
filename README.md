@@ -48,7 +48,8 @@ intended for reuse by a future Power BI / DAX connector.
 | | Custom C#-authored scalar / table / table-in-out functions | ✅ |
 | | **Table-in-out**: `db.schema.fn_each(<input table>)` — apply a TVF (CROSS APPLY) or proc per input row | ✅ |
 | | — configurable isolation (consistent snapshot per call); per-row procs run in DuckDB's transaction | ✅ |
-| | Load-time *global* functions (connection-free); proc multi-result-set / `INOUT` params | ❌ deferred |
+| | **Custom C# aggregates** (UDAF) → `db.schema.agg(x)` in `GROUP BY` / parallel / `OVER(…)` | ✅ |
+| | Load-time *global* functions (connection-free); proc multi-result-set / `INOUT` params; aggregate disk-spill | ❌ deferred |
 | **Diag** | Connection-pool diagnostics (`mssql_pool_stats`, `mssql_open/close/ping`) | ❌ |
 | | COPY to temp tables (`#t` / empty-schema syntax) | ❌ |
 
@@ -406,6 +407,30 @@ SELECT * FROM mssql.dbo.usp_process_each((SELECT id FROM mssql.dbo.queue));
   (a row failure mid-stream rolls back the whole statement).
 - Custom C#-authored in-out functions (`IArrowTableInOutFunction`) use the same `fn_each` path.
 
+### Custom aggregates (UDAF)
+
+Provider-authored aggregate functions written in C# (`IArrowAggregateFunction`) are registered as DuckDB
+aggregates and usable wherever DuckDB allows one — `GROUP BY`, parallel aggregation, and window (`OVER`)
+contexts — over **any** data (local or remote). They reduce in C#; there need be no SQL Server object.
+
+```sql
+ATTACH 'mssql://…' AS mssql (TYPE mssql_net);
+
+-- dbo.cf_product is a C# UDAF (no PRODUCT aggregate exists in SQL Server):
+SELECT cf_product(x) FROM (VALUES (2),(3),(4)) t(x);         -- 24
+
+SELECT g, mssql.dbo.cf_product(x) FROM t GROUP BY g;          -- grouped + parallel
+SELECT cf_bit_or(x) OVER (ORDER BY id) FROM t;                -- window (running frame)
+```
+
+- **How it maps:** DuckDB owns a contiguous array of fixed-size state blobs; each blob holds only an
+  `int64` id and the real per-group accumulator lives in C# behind it (one session per bound aggregate).
+  The C# author implements `CreateState()` + `Update(batch)` / `Combine(other)` / `Finalize()`.
+- **Window** works with no custom window callback — DuckDB drives it through `Update`/`Combine`/`Finalize`
+  (segment-tree), which is cheaper for a marshaled bridge than one boundary crossing per output row.
+- State lives in C# (not serialized into DuckDB memory), so a huge-cardinality `GROUP BY` can't spill to
+  disk — bounded by managed memory. Demos: `dbo.cf_product`, `dbo.cf_bit_or`.
+
 ## Settings
 
 `SET mssql_*` settings are accepted for compatibility with the native extension. Two are **active**;
@@ -435,9 +460,10 @@ the native extension's batching/pooling/TDS knobs don't apply).
 - **`uniqueidentifier` → `VARCHAR`** on reads (the native extension maps it to DuckDB `UUID`).
 - **ORDER BY pushdown** is always attempted when safe (the native extension gates it behind
   `mssql_order_pushdown`, default off).
-- **Callable functions / table-in-out** (discovered UDFs, TVFs, procs + custom C#-authored functions,
-  including `fn_each` per-row apply) are implemented here over Arrow — see
-  [Callable Functions](#callable-functions). Load-time *global* (connection-free) functions are deferred.
+- **Callable functions / table-in-out / aggregates** (discovered UDFs, TVFs, procs + custom C#-authored
+  scalar / table / table-in-out / **aggregate** functions, including `fn_each` per-row apply) are implemented
+  here over Arrow — see [Callable Functions](#callable-functions). Load-time *global* (connection-free)
+  functions are deferred.
 - **Not implemented here:** connection-pool diagnostics (`mssql_pool_stats`, `mssql_open/close/ping`),
   COPY to temp tables, multi-statement batches.
 

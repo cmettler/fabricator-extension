@@ -173,11 +173,14 @@ syntax, and catalog-after-rollback staleness.
 
 **Not yet / out of scope:**
 **load-time global** functions
-(Phase 3 — scalar UDFs, TVFs, stored procs + custom C#-authored scalar, table & table-in-out functions +
-discovered-TVF & per-row-proc table-in-out + the OperatorFinalize cleanup signal all done, see "Callable
-scalar UDFs (4b)" / "table functions (4c)" / "stored procedures (4d)" / "custom functions (4e scalar, 4f
-table)" / "table-in-out (4g — incl. custom C# in-out, per-row procs, OperatorFinalize)"; proc
-multi-result-set + INPUT/OUTPUT + OUTPUT-param-only `_each` still deferred;
+(Phase 3 — scalar UDFs, TVFs, stored procs + custom C#-authored scalar, table, table-in-out & aggregate
+functions + discovered-TVF & per-row-proc table-in-out + the OperatorFinalize cleanup signal all done, see
+"Callable scalar UDFs (4b)" / "table functions (4c)" / "stored procedures (4d)" / "custom functions (4e scalar,
+4f table)" / "table-in-out (4g — incl. custom C# in-out, per-row procs, OperatorFinalize)" / "aggregate
+functions (4h — custom C# UDAF, GROUP BY + parallel + window)"; proc
+multi-result-set + INPUT/OUTPUT + OUTPUT-param-only `_each` still deferred; a custom aggregate `window`
+callback is deliberately NOT implemented (DuckDB's segment-tree path drives our combine/finalize — cheaper for
+a marshaled bridge); aggregates have no disk-spill (state in C#);
 load-time global deferred in
 favor of attach-time custom functions); connection
 pooling knobs / `mssql_pool_stats` (ADO.NET pools by connstr already); COPY to temp tables
@@ -227,6 +230,14 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
   full output) + `inout_finish(session, out)` (commit; `out` empty in the synchronous model) +
   `inout_abort(session)` (rollback + frees the GCHandle; idempotent). `inout_abort` (not `inout_finish`)
   frees the handle, so the C++ holder destructor always calls it. See "Callable table-in-out (4g)" below.
+- **ABI v25** entries (custom aggregates, 4h): `agg_open(handle, schema, func, *out_session)` (opens a managed
+  session = a `ConcurrentDictionary<id, accumulator>`; closed via `agg_close`) + `agg_update(session, batch)`
+  (`batch` = `[int64 state_id ++ params]`, N rows; C# groups by id + folds each group) + `agg_combine(session,
+  batch)` (`batch` = `[int64 target_id, int64 source_id]`; merges source→target per row) + `agg_finalize(session,
+  ids, out)` (`ids` = `[int64 state_id]`; `out` = one result column in id order) + `agg_destroy(session, ids)`
+  (drops those states — bounds memory for the window paths; best-effort) + `agg_close(session)` (frees the
+  session; best-effort). Arg/return schemas reuse `get_function_param_schema`/`get_function_return_schema`. See
+  "Callable aggregate functions (4h)" below.
 
 ### Callable scalar UDFs (4b)
 - **Discovery**: `ArrowNetCatalog::LoadCatalog`/`RefreshCache` call `DiscoverFunctions` (reads
@@ -416,6 +427,55 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
   data flow (`GetColumnBindings`/`ResolveTypes` delegate to the child); the holder destructor's `inout_abort`
   stays the LIMIT/error backstop (idempotent via `_scopeClosed`).
 
+### Callable aggregate functions (4h — custom C# UDAF)
+- **Scope**: provider-authored aggregates in C# (there are no SQL Server aggregates to discover), attach-time +
+  catalog-bound (`db.dbo.cf_agg(x)`), usable in `GROUP BY`, parallel aggregation, and window (`OVER`) contexts.
+  Authored via Bridge `IArrowAggregateFunction` (`SchemaName`/`Name`/`Parameters`/`Result`/`CreateState()`) +
+  `IArrowAggregateState` (`Update(RecordBatch)`/`Combine(other)`/`object? Finalize()`). Demos
+  `CustomFunctions.Aggregate`: `dbo.cf_product` (numeric product) + `dbo.cf_bit_or` (bitwise OR fold).
+- **State model (the crux)**: DuckDB's aggregate model is *state-vectorized* — it owns a contiguous array of
+  fixed-size state blobs and drives reduction through `state_size`/`initialize`/`update`/`simple_update`/
+  `combine`/`finalize`/`destructor` callbacks. We keep each **blob as a mere `int64` id** (`state_size=8`);
+  the real per-group accumulator lives in **C#** behind that id (a `ConcurrentDictionary<id, accumulator>` per
+  bound aggregate). `initialize` writes `id = counter.fetch_add(1)` from a `std::atomic<int64_t>` on the
+  function's `function_info` → **monotonic ids never collide** across threads or prepared-statement
+  re-executions, so correctness needs no destructor. (State-in-C# was the user's call: matches the existing
+  handle-based architecture, no per-call (de)serialization; the trade-off is that the managed map isn't visible
+  to DuckDB's memory manager → no disk-spill for billions of distinct keys.)
+- **Session**: opened in the aggregate `bind` (a `FunctionData` = `ArrowNetAggregateBindData` holding a
+  refcounted `AggSessionHolder`; its destructor calls `agg_close`). `bind` runs once per bound plan; update/
+  combine/finalize/destructor reach the session via `AggregateInputData.bind_data`. Identity (handle/schema/
+  func) + the counter ride on `ArrowNetAggregateFunctionInfo : AggregateFunctionInfo` (reachable from
+  `initialize` via `function.function_info`, which has no `bind_data`).
+- **Two correctness rules from the DuckDB source** (both verified): (1) **read state pointers via
+  `UnifiedVectorFormat`, never `FlatVector::GetData<data_ptr_t>`** — the ungrouped path passes a **CONSTANT**
+  state vector to `finalize`/`simple_update`; (2) implement **both** `update` (grouped, FLAT state vector) and
+  `simple_update` (ungrouped fast path, single `data_ptr_t` → one id, no C# grouping). Threading: each id is
+  touched by one thread at a time (DuckDB's per-thread local hash tables; combine is partition-disjoint), so a
+  `ConcurrentDictionary` suffices with **no** per-accumulator lock. Empty group: an init'd-but-never-updated id
+  is absent from the map → finalize makes a fresh accumulator → its `Finalize()` is the empty value (NULL).
+- **Window (OVER) needs no custom `window` callback**: DuckDB drives windowing through our update/combine/
+  finalize via `WindowSegmentTree` (chosen at `window_aggregate_function.cpp`), which batches updates + does
+  O(log n) combines per output row. A custom `window` callback would cost **one C++↔C# crossing per output
+  row** — strictly worse for a marshaled bridge — so we deliberately don't implement it. The window paths churn
+  many transient states, so the **destructor IS wired** (`agg_destroy`) to bound the C# map; `agg_close` is the
+  backstop.
+- **C++** (`arrownet_schema_entry.cpp`, anon ns): `ArrowNetAggregate{StateSize,Init,Bind,Update,SimpleUpdate,
+  Combine,Finalize,Destroy}` static callbacks marshal `[id ++ inputs]` / `[target_id, source_id]` / `[id]`
+  Arrow batches (`ArrowAppender` + `arrownet::Agg*`); finalize ingests the single result column via
+  `ArrowStreamReader` + `VectorOperations::Copy`. The aggregate callbacks get **no `ClientContext`** (unlike
+  scalar/table execution), so the connection context + client properties are captured at `bind`.
+  `GetOrCreateAggregateFunction` mirrors `GetOrCreateScalarFunction` → an `AggregateFunctionCatalogEntry`
+  (`AggregateFunctionSet` of one). **Resolution**: DuckDB stores scalar/aggregate/macro in one namespace and
+  the binder looks up `SCALAR_FUNCTION_ENTRY` then dispatches on the returned entry's actual type, so
+  `LookupEntry(SCALAR_FUNCTION_ENTRY)` **falls back to the aggregate** (plus an explicit `AGGREGATE_FUNCTION_ENTRY`
+  branch). Discovery routes `kind=='aggregate'` → `AddAggregateFunction`.
+- **Verified**: `test/verify_custom_aggregates.test` (35 assertions) — discovery (`kind='aggregate'`) + no SQL
+  object, ungrouped (`simple_update`), implicit INTEGER→BIGINT, NULL-skip, empty/all-NULL → NULL, `GROUP BY`
+  (incl. a NULL-only group), parallel `bit_or` cross-checked vs DuckDB's built-in (threads=4), grouped+parallel
+  `product` cross-checked vs DuckDB's `product()`, running-frame `OVER`, and windowed `OVER`/`PARTITION BY`
+  cross-checked vs the built-in.
+
 - **Filtering**: discovered scalar UDFs + TVFs/procs are gated by the ATTACH `schema_filter` (icase
   `std::regex`, applied in `LoadCatalog`/`RefreshCache`); `table_filter` is table-only and does NOT apply to functions.
 - **Open design items (filters + refresh)** — deliberated, not yet built:
@@ -441,9 +501,10 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v24** (`inout_open` gained an `isolation` arg at v24 — the in-out session runs
-  its per-chunk CROSS APPLY in one transaction at that SQL isolation level for a consistent view).
-  **Bump rule:** when you add a vtable entry OR change a signature, bump
+- **Current version: ABI v25** (v25 appended the six custom-aggregate entries `agg_open`/`agg_update`/
+  `agg_combine`/`agg_finalize`/`agg_destroy`/`agg_close` — 4h; v24 added `inout_open`'s `isolation` arg so
+  the in-out session runs its per-chunk CROSS APPLY in one transaction at that SQL isolation level for a
+  consistent view). **Bump rule:** when you add a vtable entry OR change a signature, bump
   **BOTH** `ARROWNET_ABI_VERSION` in `abi.h` AND `vtable->AbiVersion = N` in `Bootstrap.Initialize`,
   else the host throws "ABI version mismatch". Adding an *enum value* (e.g. a new metadata/alter kind)
   is additive and needs NO bump.

@@ -373,7 +373,12 @@ buffer signals. The hard part is **reliably detecting end-of-input** for cleanup
 5. **Param passing** — named vs positional; how DuckDB named params (`fn(region := 'US')`) map to the
    proc's `@params`.
 
-## 9. Aggregate functions (future — after table-in-out)
+## 9. Aggregate functions (4h — IMPLEMENTED)
+
+> **STATUS: built (4h).** Option **(b)** below — the DuckDB-side custom C# aggregate (SQLCLR-style, handle-based
+> state) — is implemented and verified (`test/verify_custom_aggregates.test`, 35 assertions). The as-built
+> design + the deviations from this original sketch are in **§9.1**. Option **(a)** aggregate *pushdown* (rewrite
+> `GROUP BY` to server-side SQL) remains a future optimizer feature, unbuilt.
 
 Aggregates are the heaviest function type and get a **separate, stateful contract** (not `IArrowFunction`).
 Two distinct features get conflated here — decide which is actually needed:
@@ -413,6 +418,51 @@ GROUP BY anyway, and it sidesteps the entire state-plumbing problem. Tackle **(b
 client-side / cross-source aggregate need appears; it's a separate `ArrowAggregateFunction` base + the
 state-handle ABI above, sequenced after table-in-out. (`FunctionKind` gains an `Aggregate` value, but
 aggregates do not use the `IArrowFunction` scalar/table contract.)
+
+### 9.1 As built (4h) — the DuckDB-side custom C# aggregate
+
+Implemented option (b). The sketch above was largely right (handle-in-blob, scattered grouped `update`); the
+concrete build settled these points:
+
+- **C# authoring** = `IArrowAggregateFunction` (`SchemaName`/`Name`/`Parameters`/`Result`/`CreateState()`) +
+  `IArrowAggregateState` (`Update(RecordBatch)` / `Combine(IArrowAggregateState source)` /
+  **`object? Finalize()`** — a boxed scalar, null = SQL NULL; the session builds the typed result column). Demos:
+  `dbo.cf_product`, `dbo.cf_bit_or`. Always provider-authored (no SQL Server aggregate to discover); surfaced via
+  the custom-function metadata `UNION ALL` as `kind='aggregate'` → C++ `AddAggregateFunction` → an
+  `AggregateFunctionCatalogEntry`. Catalog-bound + attach-time (`db.dbo.cf_agg(x)`), like 4e/4f/4g.
+
+- **State = id in the blob, accumulator in C#.** `state_size=8`; the blob holds an `int64` id assigned in
+  `initialize` from a `std::atomic<int64_t>` on `function_info` (reachable from `initialize`, which has no
+  bind_data). **Monotonic ids never collide** → correctness needs no destructor, even across prepared-statement
+  re-executions (which share bind_data). The C# session is a `ConcurrentDictionary<id, accumulator>` opened in
+  the aggregate `bind` (stored on `ArrowNetAggregateBindData`; the holder destructor calls `agg_close`).
+
+- **ABI v25, six entries** (not the single `agg_update(ctx, batch, handles[])` of the sketch): `agg_open` /
+  `agg_update` (`[int64 id ++ params]`) / `agg_combine` (`[target_id, source_id]`) / `agg_finalize`
+  (`[id]` → one result column in id order) / `agg_destroy` (`[id]`) / `agg_close`. Arg/return schemas reuse
+  `get_function_param_schema`/`get_function_return_schema`.
+
+- **Two corrections found against the DuckDB source** (both verified): (1) read state pointers via
+  `UnifiedVectorFormat`, **never** `FlatVector::GetData<data_ptr_t>` — the ungrouped path passes a **CONSTANT**
+  state vector to `finalize`/`simple_update`; (2) implement **both** `update` (grouped) and `simple_update`
+  (ungrouped) — DuckDB calls different ones. Threading: each id is touched by one thread at a time (per-thread
+  local hash tables; partition-disjoint combine) → `ConcurrentDictionary`, no per-accumulator lock. C# grouping
+  in `update`: a fast path when the chunk is one group (always for `simple_update`), else group row-indices by
+  id and gather per-group sub-batches (Apache.Arrow C# has no `take`).
+
+- **Window (OVER): no custom `window` callback.** With `window==nullptr`, DuckDB drives windowing through our
+  `update`/`combine`/`finalize` via `WindowSegmentTree` — batched updates + O(log n) combines per output row. A
+  custom per-output-row `window` callback would be **one C++↔C# crossing per output row**, strictly worse for a
+  marshaled bridge, so it's deliberately omitted. Because the window paths churn many transient states, the
+  **destructor IS wired** (`agg_destroy`) to bound the C# map (the GROUP-BY-only design could have skipped it).
+
+- **No disk-spill** (the managed map is invisible to DuckDB's memory manager) and **no `serialize`/`deserialize`**
+  — both deferred; acceptable for a first cut (a billion-distinct-key external aggregation isn't the target).
+
+- **Resolution detail**: DuckDB stores scalar/aggregate/macro in one `functions` namespace and the binder looks
+  up `SCALAR_FUNCTION_ENTRY` then dispatches on the returned entry's *actual* type — so
+  `ArrowNetSchemaEntry::LookupEntry(SCALAR_FUNCTION_ENTRY)` **falls back to the aggregate** (plus an explicit
+  `AGGREGATE_FUNCTION_ENTRY` branch).
 
 ## 10. Build-on points (already in the repo)
 

@@ -16,10 +16,13 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/blob.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
+#include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/execution/expression_executor_state.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/function/aggregate_function.hpp"
+#include "duckdb/function/aggregate_state.hpp"
 #include "duckdb/function/function_set.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -33,11 +36,14 @@
 #include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/parsed_data/alter_table_info.hpp"
+#include "duckdb/parser/parsed_data/create_aggregate_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
+
+#include <atomic>
 
 namespace duckdb {
 
@@ -78,6 +84,13 @@ void ArrowNetSchemaEntry::AddInOutFunction(const string &func_name) {
 	table_function_entries_.erase(func_name);
 }
 
+void ArrowNetSchemaEntry::AddAggregateFunction(const string &func_name) {
+	lock_guard<mutex> lock(entry_lock_);
+	aggregate_functions_.insert(func_name);
+	// Drop any cached entry so the signature is re-fetched (e.g. after a cache refresh).
+	aggregate_function_entries_.erase(func_name);
+}
+
 void ArrowNetSchemaEntry::ClearTables() {
 	lock_guard<mutex> lock(entry_lock_);
 	table_types_.clear();
@@ -87,7 +100,9 @@ void ArrowNetSchemaEntry::ClearTables() {
 	table_functions_.clear();
 	inout_functions_.clear();
 	custom_inout_functions_.clear();
+	aggregate_functions_.clear();
 	table_function_entries_.clear();
+	aggregate_function_entries_.clear();
 }
 
 optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateEntry(ClientContext &context, const string &table_name) {
@@ -233,6 +248,298 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateScalarFunction(Client
 	auto entry = make_uniq<ScalarFunctionCatalogEntry>(catalog, *this, info);
 	auto &ref = *entry;
 	function_entries_[func_name] = std::move(entry);
+	return &ref;
+}
+
+// -----------------------------------------------------------------------------
+// Custom aggregate functions (4h). DuckDB owns a contiguous array of fixed-size state blobs and drives the
+// reduction through initialize/update/simple_update/combine/finalize/destructor callbacks. We keep each blob
+// as just an int64 id; the real per-group accumulator lives in C# behind that id (a Dictionary keyed by id
+// on a per-bound-aggregate session). The callbacks below marshal the id(s) + argument columns over the
+// agg_* ABI. Window (OVER) needs no custom `window` callback — DuckDB drives windowing through these same
+// update/combine/finalize via WindowSegmentTree, which is far cheaper for a marshaled bridge than one
+// boundary crossing per output row; the destructor (wired) bounds the C# map for the window paths that
+// churn transient states.
+namespace {
+
+// Identity + a monotonic id counter, carried on the AggregateFunction's function_info (aggregate callbacks
+// are raw fn pointers — they can't capture). Reachable from initialize (function.function_info) and bind.
+// Monotonic ids are never reused, so they never collide across threads or prepared-statement re-executions.
+struct ArrowNetAggregateFunctionInfo : public AggregateFunctionInfo {
+	ArrowNetHandle handle = nullptr;
+	string schema;
+	string func;
+	vector<LogicalType> arg_types;
+	vector<string> arg_names;
+	std::atomic<int64_t> counter {0};
+};
+
+// Refcounted holder for the managed aggregate session, carried on the bind data. Its destructor calls
+// agg_close (frees the managed id->accumulator map + GCHandle) on plan teardown — best-effort, idempotent.
+struct AggSessionHolder {
+	ArrowNetHandle session = nullptr;
+	~AggSessionHolder() {
+		arrownet::AggClose(session);
+	}
+};
+
+// Per-bound-aggregate state (FunctionData). bind runs once per bound plan; update/combine/finalize/destructor
+// reach it via AggregateInputData.bind_data. Carries the managed session + the marshaling context (the
+// aggregate callbacks are not handed a ClientContext, unlike scalar/table execution — so we capture what we
+// need at bind: client properties, the update-batch extension types, and the connection's stable context).
+struct ArrowNetAggregateBindData : public FunctionData {
+	shared_ptr<AggSessionHolder> holder;
+	vector<LogicalType> arg_types;
+	vector<string> arg_names;
+	ClientProperties properties;
+	optional_ptr<ClientContext> context; // connection context (stable across the bound plan); Arrow marshaling
+
+	unique_ptr<FunctionData> Copy() const override {
+		auto c = make_uniq<ArrowNetAggregateBindData>();
+		c->holder = holder;
+		c->arg_types = arg_types;
+		c->arg_names = arg_names;
+		c->properties = properties;
+		c->context = context;
+		return std::move(c);
+	}
+	bool Equals(const FunctionData &other_p) const override {
+		return holder == other_p.Cast<ArrowNetAggregateBindData>().holder;
+	}
+};
+
+// Reads `count` state ids out of a state-pointer Vector via UnifiedVectorFormat — handles FLAT *and*
+// CONSTANT (the ungrouped path passes a CONSTANT state vector to finalize/simple_update). The callback
+// already receives a pointer to our {int64 id} blob, so Load<int64_t> reads the id directly.
+void ReadStateIds(Vector &state, idx_t count, int64_t *out) {
+	UnifiedVectorFormat sdata;
+	state.ToUnifiedFormat(count, sdata);
+	auto ptrs = UnifiedVectorFormat::GetData<data_ptr_t>(sdata);
+	for (idx_t i = 0; i < count; i++) {
+		out[i] = Load<int64_t>(ptrs[sdata.sel->get_index(i)]);
+	}
+}
+
+// Marshal a single-column int64 Arrow batch from `ids` (no extension types — BIGINT has none).
+ArrowArray BuildIdBatch(const ClientProperties &props, const int64_t *ids, idx_t count) {
+	Vector id_vec(LogicalType::BIGINT);
+	auto data = FlatVector::GetData<int64_t>(id_vec);
+	for (idx_t i = 0; i < count; i++) {
+		data[i] = ids[i];
+	}
+	vector<LogicalType> types {LogicalType::BIGINT};
+	DataChunk batch;
+	batch.InitializeEmpty(types);
+	batch.data[0].Reference(id_vec);
+	batch.SetCardinality(count);
+	ArrowAppender appender(types, count, props, {});
+	appender.Append(batch, 0, count, count);
+	return appender.Finalize();
+}
+
+// Marshal [id ++ inputs] (one BIGINT id column + the argument columns) and send to agg_update.
+void MarshalAggUpdate(ArrowNetAggregateBindData &bind, Vector &id_vec, Vector inputs[], idx_t input_count,
+                      idx_t count) {
+	vector<LogicalType> types;
+	types.reserve(input_count + 1);
+	types.push_back(LogicalType::BIGINT);
+	for (idx_t i = 0; i < input_count; i++) {
+		types.push_back(bind.arg_types[i]);
+	}
+	DataChunk batch;
+	batch.InitializeEmpty(types);
+	batch.data[0].Reference(id_vec);
+	for (idx_t i = 0; i < input_count; i++) {
+		batch.data[1 + i].Reference(inputs[i]);
+	}
+	batch.SetCardinality(count);
+	// Extension types are recomputed here (the aggregate callbacks get no ClientContext, so we use the
+	// connection context captured at bind) — mirrors the scalar path's GetExtensionTypes usage.
+	auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(*bind.context, types);
+	ArrowAppender appender(types, count, bind.properties, extension_types);
+	appender.Append(batch, 0, count, count);
+	ArrowArray array = appender.Finalize();
+	arrownet::AggUpdate(bind.holder->session, array);
+}
+
+idx_t ArrowNetAggregateStateSize(const AggregateFunction &) {
+	return sizeof(int64_t);
+}
+
+void ArrowNetAggregateInit(const AggregateFunction &function, data_ptr_t state) {
+	auto &info = function.function_info->Cast<ArrowNetAggregateFunctionInfo>();
+	Store<int64_t>(info.counter.fetch_add(1, std::memory_order_relaxed), state);
+}
+
+unique_ptr<FunctionData> ArrowNetAggregateBind(ClientContext &context, AggregateFunction &function,
+                                               vector<unique_ptr<Expression>> &) {
+	auto &info = function.function_info->Cast<ArrowNetAggregateFunctionInfo>();
+	auto bind_data = make_uniq<ArrowNetAggregateBindData>();
+	bind_data->holder = make_shared_ptr<AggSessionHolder>();
+	bind_data->holder->session = arrownet::AggOpen(info.handle, info.schema, info.func);
+	bind_data->arg_types = info.arg_types;
+	bind_data->arg_names = info.arg_names;
+	bind_data->properties = context.GetClientProperties();
+	bind_data->context = &context;
+	return std::move(bind_data);
+}
+
+// Grouped GROUP BY: a FLAT vector of one state pointer per row (rows belong to different groups).
+void ArrowNetAggregateUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count, Vector &state,
+                             idx_t count) {
+	if (count == 0) {
+		return;
+	}
+	auto &bind = aggr_input_data.bind_data->Cast<ArrowNetAggregateBindData>();
+	Vector id_vec(LogicalType::BIGINT);
+	ReadStateIds(state, count, FlatVector::GetData<int64_t>(id_vec));
+	MarshalAggUpdate(bind, id_vec, inputs, input_count, count);
+}
+
+// Ungrouped fast path: all `count` rows fold into one state (no per-row state vector).
+void ArrowNetAggregateSimpleUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count,
+                                   data_ptr_t state, idx_t count) {
+	if (count == 0) {
+		return;
+	}
+	auto &bind = aggr_input_data.bind_data->Cast<ArrowNetAggregateBindData>();
+	int64_t id = Load<int64_t>(state);
+	Vector id_vec(LogicalType::BIGINT);
+	auto data = FlatVector::GetData<int64_t>(id_vec);
+	for (idx_t i = 0; i < count; i++) {
+		data[i] = id;
+	}
+	MarshalAggUpdate(bind, id_vec, inputs, input_count, count);
+}
+
+// Merge partial states (parallel/windowed aggregation): source[i] merged into target[i].
+void ArrowNetAggregateCombine(Vector &source, Vector &target, AggregateInputData &aggr_input_data, idx_t count) {
+	if (count == 0) {
+		return;
+	}
+	auto &bind = aggr_input_data.bind_data->Cast<ArrowNetAggregateBindData>();
+	vector<int64_t> tgt(count), src(count);
+	ReadStateIds(target, count, tgt.data());
+	ReadStateIds(source, count, src.data());
+	Vector tgt_vec(LogicalType::BIGINT);
+	Vector src_vec(LogicalType::BIGINT);
+	auto tgt_data = FlatVector::GetData<int64_t>(tgt_vec);
+	auto src_data = FlatVector::GetData<int64_t>(src_vec);
+	for (idx_t i = 0; i < count; i++) {
+		tgt_data[i] = tgt[i];
+		src_data[i] = src[i];
+	}
+	vector<LogicalType> types {LogicalType::BIGINT, LogicalType::BIGINT};
+	DataChunk batch;
+	batch.InitializeEmpty(types);
+	batch.data[0].Reference(tgt_vec); // column 0 = target_id, column 1 = source_id (C# merges source -> target)
+	batch.data[1].Reference(src_vec);
+	batch.SetCardinality(count);
+	ArrowAppender appender(types, count, bind.properties, {});
+	appender.Append(batch, 0, count, count);
+	ArrowArray array = appender.Finalize();
+	arrownet::AggCombine(bind.holder->session, array);
+}
+
+// Produce each group's result. `state` may be CONSTANT (ungrouped) or FLAT (grouped). The managed side
+// returns one column of `count` results in id order (an absent id => a fresh accumulator => empty value).
+void ArrowNetAggregateFinalize(Vector &state, AggregateInputData &aggr_input_data, Vector &result, idx_t count,
+                               idx_t offset) {
+	if (count == 0) {
+		return;
+	}
+	auto &bind = aggr_input_data.bind_data->Cast<ArrowNetAggregateBindData>();
+	vector<int64_t> ids(count);
+	ReadStateIds(state, count, ids.data());
+	ArrowArray array = BuildIdBatch(bind.properties, ids.data(), count);
+	ArrowArrayStream out;
+	std::memset(&out, 0, sizeof(out));
+	arrownet::AggFinalize(bind.holder->session, array, out);
+	if (!bind.context) {
+		if (out.release) {
+			out.release(&out);
+		}
+		throw InternalException("mssql_net: aggregate finalize is missing its client context");
+	}
+	arrownet::ArrowStreamReader reader(*bind.context, out);
+	DataChunk chunk;
+	chunk.Initialize(Allocator::Get(*bind.context), reader.Types());
+	idx_t produced = 0;
+	while (produced < count) {
+		chunk.Reset();
+		reader.Read(chunk);
+		idx_t got = chunk.size();
+		if (got == 0) {
+			break; // defensive: backend returned fewer rows than requested
+		}
+		VectorOperations::Copy(chunk.data[0], result, got, 0, offset + produced);
+		produced += got;
+	}
+}
+
+// Free the managed accumulators for these states. Wired so the window paths (which churn many transient
+// states) don't accumulate unbounded; the bind-data destructor's agg_close is the backstop. Must not throw.
+void ArrowNetAggregateDestroy(Vector &state, AggregateInputData &aggr_input_data, idx_t count) {
+	if (count == 0) {
+		return;
+	}
+	try {
+		auto &bind = aggr_input_data.bind_data->Cast<ArrowNetAggregateBindData>();
+		vector<int64_t> ids(count);
+		ReadStateIds(state, count, ids.data());
+		ArrowArray array = BuildIdBatch(bind.properties, ids.data(), count);
+		arrownet::AggDestroy(bind.holder->session, array);
+	} catch (...) {
+		// A destructor must not throw — memory cleanup is best-effort (the session close frees the rest).
+	}
+}
+
+} // namespace
+
+optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateAggregateFunction(ClientContext &context,
+                                                                             const string &func_name) {
+	lock_guard<mutex> lock(entry_lock_);
+	auto cached = aggregate_function_entries_.find(func_name);
+	if (cached != aggregate_function_entries_.end()) {
+		return cached->second.get();
+	}
+	if (aggregate_functions_.find(func_name) == aggregate_functions_.end()) {
+		return nullptr;
+	}
+
+	vector<string> arg_names;
+	vector<LogicalType> arg_types;
+	LogicalType return_type;
+	try {
+		FetchFunctionParamSchema(context, handle_, name, func_name, arg_names, arg_types);
+		return_type = FetchFunctionReturnType(context, handle_, name, func_name);
+	} catch (std::exception &) {
+		// Stale discovery (the function no longer exists) — treat as not-found, like the scalar path.
+		aggregate_functions_.erase(func_name);
+		aggregate_function_entries_.erase(func_name);
+		return nullptr;
+	}
+
+	AggregateFunction fn(func_name, arg_types, return_type, ArrowNetAggregateStateSize, ArrowNetAggregateInit,
+	                     ArrowNetAggregateUpdate, ArrowNetAggregateCombine, ArrowNetAggregateFinalize,
+	                     FunctionNullHandling::DEFAULT_NULL_HANDLING, ArrowNetAggregateSimpleUpdate,
+	                     ArrowNetAggregateBind, ArrowNetAggregateDestroy);
+	auto fn_info = make_shared_ptr<ArrowNetAggregateFunctionInfo>();
+	fn_info->handle = handle_;
+	fn_info->schema = name;
+	fn_info->func = func_name;
+	fn_info->arg_types = arg_types;
+	fn_info->arg_names = arg_names;
+	fn.function_info = std::move(fn_info);
+
+	AggregateFunctionSet set(func_name);
+	set.AddFunction(fn);
+	CreateAggregateFunctionInfo info(std::move(set));
+	info.catalog = catalog.GetName();
+	info.schema = name;
+	auto entry = make_uniq<AggregateFunctionCatalogEntry>(catalog, *this, info);
+	auto &ref = *entry;
+	aggregate_function_entries_[func_name] = std::move(entry);
 	return &ref;
 }
 
@@ -821,7 +1128,17 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::LookupEntry(CatalogTransaction t
 		return GetOrCreateEntry(*transaction.context, lookup_info.GetEntryName());
 	}
 	if (type == CatalogType::SCALAR_FUNCTION_ENTRY) {
-		return GetOrCreateScalarFunction(*transaction.context, lookup_info.GetEntryName());
+		// DuckDB stores scalar/aggregate/macro functions in one namespace and resolves a function call by
+		// looking up SCALAR_FUNCTION_ENTRY, then dispatching on the returned entry's actual type (see
+		// bind_function_expression.cpp). So a scalar lookup must also surface our custom aggregates.
+		auto scalar = GetOrCreateScalarFunction(*transaction.context, lookup_info.GetEntryName());
+		if (scalar) {
+			return scalar;
+		}
+		return GetOrCreateAggregateFunction(*transaction.context, lookup_info.GetEntryName());
+	}
+	if (type == CatalogType::AGGREGATE_FUNCTION_ENTRY) {
+		return GetOrCreateAggregateFunction(*transaction.context, lookup_info.GetEntryName());
 	}
 	if (type == CatalogType::TABLE_FUNCTION_ENTRY) {
 		return GetOrCreateTableFunction(*transaction.context, lookup_info.GetEntryName());
@@ -852,6 +1169,22 @@ void ArrowNetSchemaEntry::Scan(ClientContext &context, CatalogType type,
 		}
 		for (auto &fn : names) {
 			auto catalog_entry = GetOrCreateScalarFunction(context, fn);
+			if (catalog_entry) {
+				callback(*catalog_entry);
+			}
+		}
+		return;
+	}
+	if (type == CatalogType::AGGREGATE_FUNCTION_ENTRY) {
+		vector<string> names;
+		{
+			lock_guard<mutex> lock(entry_lock_);
+			for (auto &fn : aggregate_functions_) {
+				names.push_back(fn);
+			}
+		}
+		for (auto &fn : names) {
+			auto catalog_entry = GetOrCreateAggregateFunction(context, fn);
 			if (catalog_entry) {
 				callback(*catalog_entry);
 			}
@@ -892,6 +1225,10 @@ void ArrowNetSchemaEntry::Scan(CatalogType type, const std::function<void(Catalo
 		}
 	} else if (type == CatalogType::SCALAR_FUNCTION_ENTRY) {
 		for (auto &entry : function_entries_) {
+			callback(*entry.second);
+		}
+	} else if (type == CatalogType::AGGREGATE_FUNCTION_ENTRY) {
+		for (auto &entry : aggregate_function_entries_) {
 			callback(*entry.second);
 		}
 	} else if (type == CatalogType::TABLE_FUNCTION_ENTRY) {

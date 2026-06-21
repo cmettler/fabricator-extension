@@ -134,6 +134,14 @@ public interface IBackendCatalog : IDisposable
     IInOutSession InOutOpen(string schemaName, string functionName, Schema inputSchema, string isolationLevel);
 
     /// <summary>
+    /// Opens a custom-aggregate session for <c>schema.func</c> (a provider-authored
+    /// <see cref="IArrowAggregateFunction"/>). The session maps DuckDB's per-group <c>int64</c> state ids
+    /// to live C# accumulators; the C++ aggregate callbacks marshal ids + argument columns through it. See
+    /// <see cref="IAggregateSession"/>.
+    /// </summary>
+    IAggregateSession AggOpen(string schemaName, string functionName);
+
+    /// <summary>
     /// Creates a table whose columns are described by <paramref name="columns"/>
     /// (a non-nullable field maps to NOT NULL). The backend maps Arrow types to
     /// provider types and runs the provider CREATE TABLE. When

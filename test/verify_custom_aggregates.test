@@ -1,0 +1,131 @@
+# name: test/verify_custom_aggregates.test
+# description: Provider-authored custom C# aggregate functions (UDAF) — db.schema.fn(args) in GROUP BY / parallel / OVER
+# group: [mssql]
+
+require mssql_net
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS adb (TYPE mssql_net);
+
+# dbo.cf_product / dbo.cf_bit_or are custom C# aggregates (IArrowAggregateFunction baked into the provider),
+# NOT SQL Server objects — surfaced into the attached catalog and registered as DuckDB aggregate functions.
+query TTT
+SELECT schema_name, name, kind FROM mssql_net_functions('adb') WHERE name IN ('cf_product', 'cf_bit_or') ORDER BY name;
+----
+dbo	cf_bit_or	aggregate
+dbo	cf_product	aggregate
+
+# ...yet there is NO such object in SQL Server — proving they are the C#-authored custom aggregates.
+query I
+SELECT cnt FROM mssql_net_query('adb', 'SELECT COUNT(*) AS cnt FROM sys.objects WHERE name IN (''cf_product'',''cf_bit_or'')');
+----
+0
+
+# Ungrouped reduction (the simple_update fast path): product of 1..5 = 120.
+query I
+SELECT adb.dbo.cf_product(x) FROM range(1, 6) t(x);
+----
+120
+
+# An INTEGER argument implicitly widens to the aggregate's BIGINT parameter.
+query I
+SELECT adb.dbo.cf_product(x::INTEGER) FROM range(1, 5) t(x);
+----
+24
+
+# NULL inputs are skipped (standard aggregate semantics): 2 * 5 = 10.
+query I
+SELECT adb.dbo.cf_product(x) FROM (VALUES (2::BIGINT), (NULL::BIGINT), (5::BIGINT)) t(x);
+----
+10
+
+# Empty input (no rows survive the filter) => the empty-group value, NULL.
+query I
+SELECT adb.dbo.cf_product(x) FROM range(1, 6) t(x) WHERE x > 100;
+----
+NULL
+
+# All-NULL input => NULL.
+query I
+SELECT adb.dbo.cf_product(x) FROM (VALUES (NULL::BIGINT), (NULL::BIGINT)) t(x);
+----
+NULL
+
+# GROUP BY (the grouped update + combine + finalize path): g=1 -> 2*3=6, g=2 -> 4*5*6=120.
+query II
+SELECT g, adb.dbo.cf_product(x) AS p
+FROM (VALUES (1, 2::BIGINT), (1, 3::BIGINT), (2, 4::BIGINT), (2, 5::BIGINT), (2, 6::BIGINT)) t(g, x)
+GROUP BY g ORDER BY g;
+----
+1	6
+2	120
+
+# GROUP BY with a NULL-only group: g=1 -> {2,NULL}=2 (NULL skipped); g=2 -> {NULL} => NULL.
+query II
+SELECT g, adb.dbo.cf_product(x) AS p
+FROM (VALUES (1, 2::BIGINT), (1, NULL::BIGINT), (2, NULL::BIGINT)) t(g, x)
+GROUP BY g ORDER BY g;
+----
+1	2
+2	NULL
+
+# bit_or fold (associative + commutative). OR of 0..999 sets bits 0..9 => 1023.
+query I
+SELECT adb.dbo.cf_bit_or(x) FROM range(0, 1000) t(x);
+----
+1023
+
+# ---- Parallel aggregation: force multiple threads so combine() merges thread-local partial states. ----
+statement ok
+SET threads = 4;
+
+# Cross-check the custom aggregate against DuckDB's built-in bit_or over 1000 rows (ungrouped, parallel):
+# equality proves the parallel combine path is coherent.
+query I
+SELECT adb.dbo.cf_bit_or(x) = bit_or(x) FROM range(0, 1000) t(x);
+----
+true
+
+# Grouped + parallel: cross-check cf_product against DuckDB's product() per group (200 rows, 7 groups).
+query I
+SELECT bool_and(cf_p = duck_p) FROM (
+    SELECT g, adb.dbo.cf_product(x) AS cf_p, product(x)::BIGINT AS duck_p
+    FROM (SELECT x % 7 AS g, ((x % 4) + 1)::BIGINT AS x FROM range(0, 200) t(x)) s
+    GROUP BY g
+);
+----
+true
+
+# ---- Window (OVER): no custom `window` callback — DuckDB drives windowing through update/combine/finalize. ----
+# Running product over an ordered frame.
+query II
+SELECT x, adb.dbo.cf_product(x) OVER (ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running
+FROM range(1, 5) t(x) ORDER BY x;
+----
+1	1
+2	2
+3	6
+4	24
+
+# Cross-check a windowed cf_bit_or against DuckDB's bit_or window (running frame) — proves the segment-tree
+# window path uses our callbacks correctly.
+query I
+SELECT bool_and(cf_w = duck_w) FROM (
+    SELECT adb.dbo.cf_bit_or(x) OVER (ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cf_w,
+           bit_or(x) OVER (ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS duck_w
+    FROM range(0, 50) t(x)
+);
+----
+true
+
+# Windowed with PARTITION BY (3 partitions) — cross-checked against the built-in.
+query I
+SELECT bool_and(cf_w = duck_w) FROM (
+    SELECT adb.dbo.cf_bit_or(x) OVER (PARTITION BY x % 3 ORDER BY x) AS cf_w,
+           bit_or(x) OVER (PARTITION BY x % 3 ORDER BY x) AS duck_w
+    FROM range(0, 60) t(x)
+);
+----
+true

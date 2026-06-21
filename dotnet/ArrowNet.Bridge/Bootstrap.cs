@@ -3,6 +3,7 @@ using System.Runtime.InteropServices;
 using Apache.Arrow;
 using Apache.Arrow.C;
 using Apache.Arrow.Ipc;
+using Apache.Arrow.Types;
 
 namespace ArrowNet.Bridge;
 
@@ -25,7 +26,7 @@ public static unsafe class Bootstrap
             return ArrowNetStatus.InvalidArgument;
         }
 
-        vtable->AbiVersion = 24;
+        vtable->AbiVersion = 25;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -59,6 +60,12 @@ public static unsafe class Bootstrap
         vtable->InOutPush = &InOutPush;
         vtable->InOutFinish = &InOutFinish;
         vtable->InOutAbort = &InOutAbort;
+        vtable->AggOpen = &AggOpen;
+        vtable->AggUpdate = &AggUpdate;
+        vtable->AggCombine = &AggCombine;
+        vtable->AggFinalize = &AggFinalize;
+        vtable->AggDestroy = &AggDestroy;
+        vtable->AggClose = &AggClose;
         return ArrowNetStatus.Ok;
     }
 
@@ -787,6 +794,155 @@ public static unsafe class Bootstrap
         try
         {
             Handles.Resolve<IInOutSession>(session)?.Abort(); // idempotent
+            Handles.Free(session);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    // Function-independent import schemas for the aggregate ABI batches: combine carries two int64 id
+    // columns, finalize/destroy a single int64 id column. (Update's schema is per-function — the session
+    // exposes it as IAggregateSession.UpdateSchema. Field names are cosmetic on import — the session reads
+    // columns by position.)
+    private static readonly Schema AggCombineSchema =
+        new(new[] { new Field("target_id", Int64Type.Default, false), new Field("source_id", Int64Type.Default, false) },
+            null);
+    private static readonly Schema AggIdsSchema =
+        new(new[] { new Field("state_id", Int64Type.Default, false) }, null);
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int AggOpen(nint handle, byte* schema, byte* func, nint* outSession, byte** err)
+    {
+        try
+        {
+            if (outSession is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+            var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
+            *outSession = Handles.Alloc(catalog.AggOpen(s, f));
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int AggUpdate(nint session, CArrowArray* batch, byte** err)
+    {
+        try
+        {
+            if (batch is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            var s = Handles.Resolve<IAggregateSession>(session);
+            if (s is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            var rb = CArrowArrayImporter.ImportRecordBatch(batch, s.UpdateSchema); // takes ownership
+            s.Update(rb);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int AggCombine(nint session, CArrowArray* batch, byte** err)
+    {
+        try
+        {
+            if (batch is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            var s = Handles.Resolve<IAggregateSession>(session);
+            if (s is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            var rb = CArrowArrayImporter.ImportRecordBatch(batch, AggCombineSchema); // takes ownership
+            s.Combine(rb);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int AggFinalize(nint session, CArrowArray* ids, CArrowArrayStream* outStream, byte** err)
+    {
+        try
+        {
+            if (ids is null || outStream is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            var s = Handles.Resolve<IAggregateSession>(session);
+            if (s is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            var rb = CArrowArrayImporter.ImportRecordBatch(ids, AggIdsSchema); // takes ownership
+            CArrowArrayStreamExporter.ExportArrayStream(s.Finalize(rb), outStream);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int AggDestroy(nint session, CArrowArray* ids, byte** err)
+    {
+        try
+        {
+            if (ids is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            var rb = CArrowArrayImporter.ImportRecordBatch(ids, AggIdsSchema); // takes ownership (must release)
+            var s = Handles.Resolve<IAggregateSession>(session);
+            if (s is null)
+            {
+                rb.Dispose();
+                return ArrowNetStatus.Ok; // session already closed — nothing to drop
+            }
+            s.Destroy(rb);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int AggClose(nint session, byte** err)
+    {
+        try
+        {
+            Handles.Resolve<IAggregateSession>(session)?.Close(); // idempotent
             Handles.Free(session);
             return ArrowNetStatus.Ok;
         }

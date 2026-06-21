@@ -210,4 +210,33 @@ void InOutFinish(ArrowNetHandle session, ArrowArrayStream &out);
 // Release the session (error/cancel/LIMIT backstop). Idempotent; safe with nullptr.
 void InOutAbort(ArrowNetHandle session);
 
+// -----------------------------------------------------------------------------
+// Custom aggregate functions (Phase 4h, C#-authored UDAF). The C++ aggregate
+// callbacks keep each DuckDB state blob as an int64 id; the real accumulator lives
+// in C# behind that id. One session per bound aggregate. See abi.h.
+// -----------------------------------------------------------------------------
+
+// Open a managed aggregate session for `schema.func`. Returns an opaque session handle.
+ArrowNetHandle AggOpen(ArrowNetHandle handle, const std::string &schema, const std::string &func);
+
+// Update: `batch` = [int64 state_id ++ argument columns], N rows (consumed/released by
+// the managed side, which groups by id and folds each group into its accumulator).
+void AggUpdate(ArrowNetHandle session, ArrowArray &batch);
+
+// Combine: `batch` = [int64 target_id, int64 source_id], N rows (consumed/released);
+// the managed side merges each source accumulator into its target.
+void AggCombine(ArrowNetHandle session, ArrowArray &batch);
+
+// Finalize: `ids` = a single int64 state_id column, N rows (consumed/released); fills
+// `out` with one column of N results, in the SAME ORDER as `ids`.
+void AggFinalize(ArrowNetHandle session, ArrowArray &ids, ArrowArrayStream &out);
+
+// Destroy: `ids` = a single int64 state_id column (consumed/released); the managed side
+// drops those accumulators. Best-effort (a destructor must not throw) — swallows errors.
+void AggDestroy(ArrowNetHandle session, ArrowArray &ids);
+
+// Release the session (frees the managed map). Idempotent; safe with nullptr.
+// Best-effort — swallows errors (teardown must not throw).
+void AggClose(ArrowNetHandle session);
+
 } // namespace arrownet

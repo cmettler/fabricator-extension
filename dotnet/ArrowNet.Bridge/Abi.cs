@@ -114,6 +114,24 @@ public unsafe struct ArrowNetVTable
 
     // int32 inout_abort(void* session, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte**, int> InOutAbort;
+
+    // int32 agg_open(void* handle, const char* schema, const char* func, void** out_session, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, nint*, byte**, int> AggOpen;
+
+    // int32 agg_update(void* session, ArrowArray* batch, char** err)  -- batch = [int64 id ++ params]
+    public delegate* unmanaged[Cdecl]<nint, CArrowArray*, byte**, int> AggUpdate;
+
+    // int32 agg_combine(void* session, ArrowArray* batch, char** err) -- batch = [int64 target, int64 source]
+    public delegate* unmanaged[Cdecl]<nint, CArrowArray*, byte**, int> AggCombine;
+
+    // int32 agg_finalize(void* session, ArrowArray* ids, ArrowArrayStream* out, char** err)
+    public delegate* unmanaged[Cdecl]<nint, CArrowArray*, CArrowArrayStream*, byte**, int> AggFinalize;
+
+    // int32 agg_destroy(void* session, ArrowArray* ids, char** err)
+    public delegate* unmanaged[Cdecl]<nint, CArrowArray*, byte**, int> AggDestroy;
+
+    // int32 agg_close(void* session, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte**, int> AggClose;
 }
 
 /// <summary>Mirrors <c>ArrowNetAlterKind</c> in abi.h.</summary>

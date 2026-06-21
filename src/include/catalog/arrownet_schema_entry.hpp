@@ -6,6 +6,7 @@
 
 #include "arrownet/abi.h"
 #include "catalog/arrownet_table_entry.hpp"
+#include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
@@ -47,6 +48,12 @@ public:
 	//! its output schema is the function's full declared schema (no input echo).
 	void AddInOutFunction(const string &func_name);
 
+	//! Registers a provider-authored custom aggregate function (4h, `kind='aggregate'`): a UDAF
+	//! exposed as a DuckDB AggregateFunctionCatalogEntry so `db.schema.fn(args)` resolves wherever
+	//! DuckDB allows an aggregate (GROUP BY / parallel / OVER). Arg + return types are resolved
+	//! lazily on first lookup; per-group state lives in C# behind an int64 id.
+	void AddAggregateFunction(const string &func_name);
+
 	//! Drops all cached table + function names and materialized entries (cache refresh).
 	void ClearTables();
 
@@ -84,6 +91,9 @@ private:
 	//! Materializes a provider-authored custom table-in-out function (4g): a TABLE-parameter table
 	//! function whose output schema is the function's full declared schema (dispatched in C#).
 	optional_ptr<CatalogEntry> GetOrCreateCustomInOutFunction(ClientContext &context, const string &func_name);
+	//! Materializes a custom aggregate (4h) as an AggregateFunctionCatalogEntry whose callbacks marshal
+	//! per-group int64 state ids + Arrow batches to the C# accumulator over the agg_* ABI.
+	optional_ptr<CatalogEntry> GetOrCreateAggregateFunction(ClientContext &context, const string &func_name);
 
 	ArrowNetHandle handle_;
 	case_insensitive_map_t<string> table_types_; // table name -> "BASE TABLE" | "VIEW"
@@ -91,10 +101,12 @@ private:
 	case_insensitive_map_t<bool> table_functions_; // table-returning routine name -> is_proc (TVF=false)
 	case_insensitive_map_t<string> inout_functions_; // synthetic `<base>_each` alias -> base TVF name (4g)
 	case_insensitive_set_t custom_inout_functions_;  // provider-authored custom table-in-out names (4g)
+	case_insensitive_set_t aggregate_functions_;     // custom aggregate (UDAF) names (4h)
 	mutex entry_lock_;
 	case_insensitive_map_t<unique_ptr<ArrowNetTableEntry>> entries_;
 	case_insensitive_map_t<unique_ptr<ScalarFunctionCatalogEntry>> function_entries_;
 	case_insensitive_map_t<unique_ptr<TableFunctionCatalogEntry>> table_function_entries_;
+	case_insensitive_map_t<unique_ptr<AggregateFunctionCatalogEntry>> aggregate_function_entries_;
 };
 
 } // namespace duckdb

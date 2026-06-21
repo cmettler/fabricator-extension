@@ -369,9 +369,54 @@ typedef struct ArrowNetVTable {
 
 	// Release the session (error/cancel/LIMIT backstop). Idempotent. Safe with nullptr.
 	int32_t (*inout_abort)(ArrowNetHandle session, char **err);
+
+	// -------------------------------------------------------------------------
+	// Custom aggregate functions (Phase 4h, C#-authored UDAF). DuckDB owns a
+	// contiguous array of fixed-size state blobs (each blob = an int64 id); the
+	// real per-group accumulator lives in C# behind that id. One managed session
+	// per bound aggregate (a Dictionary<id, accumulator>); the C++ aggregate
+	// callbacks (initialize/update/simple_update/combine/finalize/destructor)
+	// marshal the id(s) + input columns over these entries. Argument + return
+	// schemas reuse get_function_param_schema / get_function_return_schema (the
+	// custom registry routes them).
+	// -------------------------------------------------------------------------
+
+	// Open a managed aggregate session for (schema, func). On success *out_session
+	// receives an opaque handle (a fresh Dictionary<id, accumulator>). Closed via
+	// agg_close when the bound plan is torn down.
+	int32_t (*agg_open)(ArrowNetHandle handle, const char *schema, const char *func, ArrowNetHandle *out_session,
+	                    char **err);
+
+	// Update: `batch` is an N-row Arrow array whose column 0 is an int64 "state_id"
+	// and columns 1.. are the argument values (in param order). The managed side
+	// groups rows by id, get-or-creates each accumulator, and applies the per-group
+	// rows. Consumes/releases `batch`. (simple_update reuses this with a constant id.)
+	int32_t (*agg_update)(ArrowNetHandle session, struct ArrowArray *batch, char **err);
+
+	// Combine: `batch` is an N-row Arrow array of two int64 columns
+	// [target_id, source_id]; the managed side merges each source accumulator into
+	// its target (absent source => empty, skipped). Consumes/releases `batch`.
+	int32_t (*agg_combine)(ArrowNetHandle session, struct ArrowArray *batch, char **err);
+
+	// Finalize: `ids` is an N-row Arrow array of a single int64 "state_id" column;
+	// *out receives an N-row stream with one column = each group's result, in the
+	// SAME ORDER as `ids` (an absent id => a fresh accumulator => the empty-group
+	// value). Consumes/releases `ids`.
+	int32_t (*agg_finalize)(ArrowNetHandle session, struct ArrowArray *ids, struct ArrowArrayStream *out,
+	                        char **err);
+
+	// Destroy: `ids` is an N-row Arrow array of a single int64 "state_id" column;
+	// the managed side drops those accumulators (bounds memory for the window paths
+	// that churn transient states). Best-effort (a destructor must not throw).
+	// Consumes/releases `ids`.
+	int32_t (*agg_destroy)(ArrowNetHandle session, struct ArrowArray *ids, char **err);
+
+	// Release the session (frees the dictionary + GCHandle). Idempotent. Safe with
+	// nullptr. Best-effort (teardown must not throw).
+	int32_t (*agg_close)(ArrowNetHandle session, char **err);
 } ArrowNetVTable;
 
-#define ARROWNET_ABI_VERSION 24
+#define ARROWNET_ABI_VERSION 25
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

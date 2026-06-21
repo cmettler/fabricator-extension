@@ -132,6 +132,9 @@ void ArrowNetCatalog::LoadCatalog(ClientContext &context) {
 			// Provider-authored custom table-in-out (4g, pure C#): a {TABLE}-param table function under
 			// the bare name (no scalar-arg scan form, no `_each` alias — it is already in-out).
 			ensure_schema(func.schema_name).AddInOutFunction(func.name);
+		} else if (func.kind == "aggregate") {
+			// Provider-authored custom aggregate (4h, UDAF, pure C#): an AggregateFunctionCatalogEntry.
+			ensure_schema(func.schema_name).AddAggregateFunction(func.name);
 		}
 	}
 }
@@ -185,6 +188,9 @@ void ArrowNetCatalog::RefreshCache(ClientContext &context) {
 			// Provider-authored custom table-in-out (4g, pure C#): a {TABLE}-param table function under
 			// the bare name (no scalar-arg scan form, no `_each` alias — it is already in-out).
 			ensure_schema(func.schema_name).AddInOutFunction(func.name);
+		} else if (func.kind == "aggregate") {
+			// Provider-authored custom aggregate (4h, UDAF, pure C#): an AggregateFunctionCatalogEntry.
+			ensure_schema(func.schema_name).AddAggregateFunction(func.name);
 		}
 	}
 }

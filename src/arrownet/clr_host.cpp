@@ -578,6 +578,93 @@ void InOutAbort(ArrowNetHandle session) {
 	}
 }
 
+ArrowNetHandle AggOpen(ArrowNetHandle handle, const std::string &schema, const std::string &func) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.agg_open) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide agg_open");
+	}
+	ArrowNetHandle session = nullptr;
+	char *err = nullptr;
+	int32_t rc = vt.agg_open(handle, schema.c_str(), func.c_str(), &session, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: agg_open failed");
+	}
+	return session;
+}
+
+void AggUpdate(ArrowNetHandle session, ArrowArray &batch) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.agg_update) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide agg_update");
+	}
+	char *err = nullptr;
+	int32_t rc = vt.agg_update(session, &batch, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: agg_update failed");
+	}
+}
+
+void AggCombine(ArrowNetHandle session, ArrowArray &batch) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.agg_combine) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide agg_combine");
+	}
+	char *err = nullptr;
+	int32_t rc = vt.agg_combine(session, &batch, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: agg_combine failed");
+	}
+}
+
+void AggFinalize(ArrowNetHandle session, ArrowArray &ids, ArrowArrayStream &out) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.agg_finalize) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide agg_finalize");
+	}
+	char *err = nullptr;
+	int32_t rc = vt.agg_finalize(session, &ids, &out, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: agg_finalize failed");
+	}
+}
+
+void AggDestroy(ArrowNetHandle session, ArrowArray &ids) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.agg_destroy) {
+		// No destroy entry: release the array we were handed so it doesn't leak.
+		if (ids.release) {
+			ids.release(&ids);
+		}
+		return;
+	}
+	char *err = nullptr;
+	int32_t rc = vt.agg_destroy(session, &ids, &err);
+	if (rc != ARROWNET_OK) {
+		// Destroy is best-effort (an aggregate destructor must not throw); swallow + free the message.
+		if (err && vt.free_error) {
+			vt.free_error(err);
+		}
+	}
+}
+
+void AggClose(ArrowNetHandle session) {
+	if (!session) {
+		return;
+	}
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.agg_close) {
+		return;
+	}
+	char *err = nullptr;
+	int32_t rc = vt.agg_close(session, &err);
+	if (rc != ARROWNET_OK) {
+		// Close is best-effort cleanup; swallow + free the managed error message.
+		if (err && vt.free_error) {
+			vt.free_error(err);
+		}
+	}
+}
+
 void ScanTable(ArrowNetHandle handle, const std::string &schema, const std::string &table, const std::string &spec_json,
                ArrowArrayStream *filter_values, ArrowArrayStream &out) {
 	const ArrowNetVTable &vt = GetBridge();
