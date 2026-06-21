@@ -21,6 +21,94 @@ internal static class CustomFunctions
     {
         new CfRangeFunction(),
     };
+
+    // Factories, not instances: a table-in-out may be STATEFUL across its input stream (e.g.
+    // cf_summarize), so each session gets a fresh instance (see SqlServerCatalog.InOutOpen).
+    public static readonly IReadOnlyList<Func<IArrowTableInOutFunction>> InOut = new Func<IArrowTableInOutFunction>[]
+    {
+        () => new CfTagFunction(),
+        () => new CfSummarizeFunction(),
+    };
+}
+
+// Demo (table-in-out, per-row/streaming): dbo.cf_tag(<table of n>) -> (n, sq=n*n) per input row, emitted
+// in Process. Order-independent (one output row per input row). Pure C#, no SQL object.
+internal sealed class CfTagFunction : IArrowTableInOutFunction
+{
+    public string SchemaName => "dbo";
+    public string Name => "cf_tag";
+
+    public Schema InputSchema => new(new[] { new Field("n", Int32Type.Default, nullable: true) }, metadata: null);
+
+    public Schema OutputSchema => new(new[]
+    {
+        new Field("n", Int32Type.Default, nullable: true),
+        new Field("sq", Int32Type.Default, nullable: true),
+    }, metadata: null);
+
+    public IEnumerable<RecordBatch> Process(RecordBatch inputChunk)
+    {
+        var n = (Int32Array)inputChunk.Column(0);
+        int rows = inputChunk.Length;
+        var nb = new Int32Array.Builder().Reserve(rows);
+        var sq = new Int32Array.Builder().Reserve(rows);
+        for (int i = 0; i < rows; i++)
+        {
+            if (n.IsNull(i))
+            {
+                nb.AppendNull();
+                sq.AppendNull();
+            }
+            else
+            {
+                nb.Append(n.Values[i]);
+                sq.Append(n.Values[i] * n.Values[i]);
+            }
+        }
+        yield return new RecordBatch(OutputSchema, new IArrowArray[] { nb.Build(), sq.Build() }, rows);
+    }
+
+    public IEnumerable<RecordBatch> Finish() => System.Array.Empty<RecordBatch>();
+}
+
+// Demo (table-in-out, stateful/finish-only): dbo.cf_summarize(<table of n>) consumes the WHOLE input and
+// emits ONE row (cnt, total) at Finish — impossible as a scalar/table function. Order-independent. Pure C#.
+internal sealed class CfSummarizeFunction : IArrowTableInOutFunction
+{
+    private long _cnt;
+    private long _total;
+
+    public string SchemaName => "dbo";
+    public string Name => "cf_summarize";
+
+    public Schema InputSchema => new(new[] { new Field("n", Int32Type.Default, nullable: true) }, metadata: null);
+
+    public Schema OutputSchema => new(new[]
+    {
+        new Field("cnt", Int64Type.Default, nullable: false),
+        new Field("total", Int64Type.Default, nullable: false),
+    }, metadata: null);
+
+    public IEnumerable<RecordBatch> Process(RecordBatch inputChunk)
+    {
+        var n = (Int32Array)inputChunk.Column(0);
+        for (int i = 0; i < inputChunk.Length; i++)
+        {
+            if (!n.IsNull(i))
+            {
+                _cnt++;
+                _total += n.Values[i];
+            }
+        }
+        return System.Array.Empty<RecordBatch>(); // accumulate only; emit at Finish
+    }
+
+    public IEnumerable<RecordBatch> Finish()
+    {
+        var cnt = new Int64Array.Builder().Append(_cnt).Build();
+        var total = new Int64Array.Builder().Append(_total).Build();
+        yield return new RecordBatch(OutputSchema, new IArrowArray[] { cnt, total }, 1);
+    }
 }
 
 // Demo: dbo.cf_range(n) -> rows (value, squared) for value = 1..n, generated in C#

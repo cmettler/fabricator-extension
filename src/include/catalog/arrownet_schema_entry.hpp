@@ -32,6 +32,12 @@ public:
 	//! schemas are resolved lazily on first lookup (procs use sp_describe + EXEC).
 	void AddTableFunction(const string &func_name, bool is_proc);
 
+	//! Registers a provider-authored custom table-in-out function (4g, `kind='inout'`): a
+	//! `{LogicalType::TABLE}`-parameter table function under the bare name (no scalar-arg
+	//! scan form, no `_each` alias). Resolved as `SELECT * FROM db.schema.fn(<input table>)`;
+	//! its output schema is the function's full declared schema (no input echo).
+	void AddInOutFunction(const string &func_name);
+
 	//! Drops all cached table + function names and materialized entries (cache refresh).
 	void ClearTables();
 
@@ -66,12 +72,16 @@ private:
 	//! function applying the discovered TVF `base_func` once per input row via CROSS APPLY.
 	optional_ptr<CatalogEntry> GetOrCreateInOutFunction(ClientContext &context, const string &each_name,
 	                                                    const string &base_func);
+	//! Materializes a provider-authored custom table-in-out function (4g): a TABLE-parameter table
+	//! function whose output schema is the function's full declared schema (dispatched in C#).
+	optional_ptr<CatalogEntry> GetOrCreateCustomInOutFunction(ClientContext &context, const string &func_name);
 
 	ArrowNetHandle handle_;
 	case_insensitive_map_t<string> table_types_; // table name -> "BASE TABLE" | "VIEW"
 	case_insensitive_set_t scalar_functions_;    // discovered scalar UDF names
 	case_insensitive_map_t<bool> table_functions_; // table-returning routine name -> is_proc (TVF=false)
 	case_insensitive_map_t<string> inout_functions_; // synthetic `<base>_each` alias -> base TVF name (4g)
+	case_insensitive_set_t custom_inout_functions_;  // provider-authored custom table-in-out names (4g)
 	mutex entry_lock_;
 	case_insensitive_map_t<unique_ptr<ArrowNetTableEntry>> entries_;
 	case_insensitive_map_t<unique_ptr<ScalarFunctionCatalogEntry>> function_entries_;

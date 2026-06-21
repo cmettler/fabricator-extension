@@ -71,5 +71,40 @@ SELECT name, kind FROM mssql_net_functions('cdb') WHERE name = 'cf_range';
 ----
 cf_range	table
 
+# A custom C# TABLE-IN-OUT function (IArrowTableInOutFunction): cf_tag(<table of n>) -> (n, n*n) per input
+# row, emitted in Process. Pure C#, no SQL object. Output is the function's full declared schema (no echo).
+query II
+SELECT n, sq FROM cdb.dbo.cf_tag((SELECT v.n FROM (VALUES(2),(3),(4)) v(n))) ORDER BY n;
+----
+2	4
+3	9
+4	16
+
+# A STATEFUL table-in-out: cf_summarize consumes the whole input table and emits ONE (cnt, total) row at
+# Finish — impossible as a scalar/table function. Multi-chunk input (4999 rows, INT) exercises state
+# accumulated across Process calls + the single Finish tail. cnt=4999, total=sum(1..4999)=12497500.
+query II
+SELECT cnt, total FROM cdb.dbo.cf_summarize((SELECT t.n::INTEGER FROM range(1, 5000) t(n)));
+----
+4999	12497500
+
+# State is per-session (fresh instance each open): a second cf_summarize sees only its own input.
+query II
+SELECT cnt, total FROM cdb.dbo.cf_summarize((SELECT v.n FROM (VALUES(10),(20),(30)) v(n)));
+----
+3	60
+
+# Discovered with kind 'inout', and (like the others) no backing SQL Server object.
+query TT
+SELECT name, kind FROM mssql_net_functions('cdb') WHERE name IN ('cf_tag', 'cf_summarize') ORDER BY name;
+----
+cf_summarize	inout
+cf_tag	inout
+
+query I
+SELECT cnt FROM mssql_net_query('cdb', 'SELECT COUNT(*) AS cnt FROM sys.objects WHERE name IN (''cf_tag'', ''cf_summarize'')');
+----
+0
+
 statement ok
 DETACH cdb;

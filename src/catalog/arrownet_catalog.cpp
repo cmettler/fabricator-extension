@@ -128,6 +128,10 @@ void ArrowNetCatalog::LoadCatalog(ClientContext &context) {
 			ensure_schema(func.schema_name).AddTableFunction(func.name, /*is_proc=*/false);
 		} else if (func.kind == "proc") {
 			ensure_schema(func.schema_name).AddTableFunction(func.name, /*is_proc=*/true);
+		} else if (func.kind == "inout") {
+			// Provider-authored custom table-in-out (4g, pure C#): a {TABLE}-param table function under
+			// the bare name (no scalar-arg scan form, no `_each` alias — it is already in-out).
+			ensure_schema(func.schema_name).AddInOutFunction(func.name);
 		}
 	}
 }
@@ -177,6 +181,10 @@ void ArrowNetCatalog::RefreshCache(ClientContext &context) {
 			ensure_schema(func.schema_name).AddTableFunction(func.name, /*is_proc=*/false);
 		} else if (func.kind == "proc") {
 			ensure_schema(func.schema_name).AddTableFunction(func.name, /*is_proc=*/true);
+		} else if (func.kind == "inout") {
+			// Provider-authored custom table-in-out (4g, pure C#): a {TABLE}-param table function under
+			// the bare name (no scalar-arg scan form, no `_each` alias — it is already in-out).
+			ensure_schema(func.schema_name).AddInOutFunction(func.name);
 		}
 	}
 }

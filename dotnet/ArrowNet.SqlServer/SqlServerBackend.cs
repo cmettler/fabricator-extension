@@ -143,6 +143,14 @@ public sealed class SqlServerCatalog : IBackendCatalog
     private static readonly IReadOnlyDictionary<string, IArrowTableFunction> CustomTable =
         CustomFunctions.Table.ToDictionary(f => $"{f.SchemaName}.{f.Name}", StringComparer.OrdinalIgnoreCase);
 
+    // Provider-authored custom table-in-out functions, keyed "schema.name" (case-insensitive). Surfaced as
+    // `kind='inout'` (see FunctionsMetadataSql) so the C++ catalog registers them as a {TABLE}-param table
+    // function under the bare name; dispatched to C# (see InOutOpen / GetFunctionOutputSchema). Unlike a
+    // discovered TVF's `_each` alias, the output is the function's full declared schema (no input echo).
+    private static readonly IReadOnlyDictionary<string, Func<IArrowTableInOutFunction>> CustomInOut =
+        CustomFunctions.InOut.ToDictionary(factory => { var p = factory(); return $"{p.SchemaName}.{p.Name}"; },
+                                           factory => factory, StringComparer.OrdinalIgnoreCase);
+
     private readonly string _connectionString;
     private readonly string? _accessToken;
 
@@ -725,7 +733,7 @@ public sealed class SqlServerCatalog : IBackendCatalog
     // UNION ALL so the C++ catalog discovers + registers them uniformly (then dispatches custom ones to C#).
     private static string FunctionsMetadataSql()
     {
-        if (CustomScalar.Count == 0 && CustomTable.Count == 0)
+        if (CustomScalar.Count == 0 && CustomTable.Count == 0 && CustomInOut.Count == 0)
         {
             return FunctionsSql;
         }
@@ -744,6 +752,12 @@ public sealed class SqlServerCatalog : IBackendCatalog
         {
             sb.Append(" UNION ALL SELECT '").Append(Esc(f.SchemaName)).Append("', '").Append(Esc(f.Name))
               .Append("', 'table', ").Append(f.Parameters.FieldsList.Count).Append(", ''");
+        }
+        foreach (var factory in CustomInOut.Values)
+        {
+            var f = factory();
+            sb.Append(" UNION ALL SELECT '").Append(Esc(f.SchemaName)).Append("', '").Append(Esc(f.Name))
+              .Append("', 'inout', ").Append(f.InputSchema.FieldsList.Count).Append(", ''");
         }
         return sb.ToString();
     }
@@ -1296,6 +1310,10 @@ public sealed class SqlServerCatalog : IBackendCatalog
         {
             return new InMemoryArrayStream(customTable.OutputSchema, System.Array.Empty<RecordBatch>());
         }
+        if (CustomInOut.TryGetValue($"{schemaName}.{functionName}", out var customInOutFactory))
+        {
+            return new InMemoryArrayStream(customInOutFactory().OutputSchema, System.Array.Empty<RecordBatch>());
+        }
         // TVFs expose their result columns in ROUTINE_COLUMNS; stored procs don't.
         var cols = FunctionOutputColumns(schemaName, functionName);
         if (cols.Count == 0)
@@ -1384,8 +1402,99 @@ public sealed class SqlServerCatalog : IBackendCatalog
     // input columns are the function's positional params). The C++ in_out_function operator pushes input
     // chunks (one session per call, parallel branches into one bounded channel) and a single
     // OperatorFinalize drives Finish.
-    public IInOutSession InOutOpen(string schemaName, string functionName, Schema inputSchema) =>
-        new InOutSessionImpl(this, schemaName, functionName, inputSchema);
+    public IInOutSession InOutOpen(string schemaName, string functionName, Schema inputSchema)
+    {
+        // A provider-authored custom in-out (4g, pure C#) shadows a same-named SQL object — run it through
+        // the operator's session contract instead of generating CROSS APPLY. A fresh instance per session
+        // (the function may be stateful across its input stream).
+        if (CustomInOut.TryGetValue($"{schemaName}.{functionName}", out var customFactory))
+        {
+            return new CustomInOutSessionImpl(customFactory(), inputSchema);
+        }
+        return new InOutSessionImpl(this, schemaName, functionName, inputSchema);
+    }
+
+    // Session for a custom C#-authored table-in-out (IArrowTableInOutFunction). The C++ operator pushes
+    // input chunks (Process) and, after all input, drains the tail (Finish) — exactly the IInOutSession
+    // contract. Process/Finish run serially (under a lock), so the function may keep mutable state.
+    private sealed class CustomInOutSessionImpl : IInOutSession
+    {
+        private readonly IArrowTableInOutFunction _fn;
+        private readonly Schema _inputSchema;
+        private readonly ConcurrentQueue<RecordBatch> _ready = new();
+        private readonly object _lock = new();
+        private bool _aborted;
+        private bool _finished;
+
+        public CustomInOutSessionImpl(IArrowTableInOutFunction fn, Schema inputSchema)
+        {
+            _fn = fn;
+            _inputSchema = inputSchema;
+        }
+
+        public Schema InputSchema => _inputSchema;
+
+        public void Push(RecordBatch chunk)
+        {
+            using (chunk)
+            {
+                lock (_lock)
+                {
+                    if (_aborted)
+                    {
+                        return;
+                    }
+                    foreach (var b in _fn.Process(chunk)) // enumerated (materialized) before the chunk is disposed
+                    {
+                        _ready.Enqueue(b);
+                    }
+                }
+            }
+        }
+
+        public IArrowArrayStream DrainReady()
+        {
+            var list = new List<RecordBatch>();
+            while (_ready.TryDequeue(out var b))
+            {
+                list.Add(b);
+            }
+            return new InMemoryArrayStream(_fn.OutputSchema, list);
+        }
+
+        public IArrowArrayStream Finish()
+        {
+            lock (_lock)
+            {
+                if (!_aborted && !_finished)
+                {
+                    _finished = true; // Finish() is the single all-input-done call, but stay idempotent
+                    foreach (var b in _fn.Finish())
+                    {
+                        _ready.Enqueue(b);
+                    }
+                }
+            }
+            var list = new List<RecordBatch>();
+            while (_ready.TryDequeue(out var b))
+            {
+                list.Add(b);
+            }
+            return new InMemoryArrayStream(_fn.OutputSchema, list);
+        }
+
+        public void Abort()
+        {
+            lock (_lock)
+            {
+                _aborted = true;
+                while (_ready.TryDequeue(out var b))
+                {
+                    b.Dispose();
+                }
+            }
+        }
+    }
 
     private sealed class InOutSessionImpl : IInOutSession
     {

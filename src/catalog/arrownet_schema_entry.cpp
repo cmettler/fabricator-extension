@@ -68,6 +68,12 @@ void ArrowNetSchemaEntry::AddTableFunction(const string &func_name, bool is_proc
 	}
 }
 
+void ArrowNetSchemaEntry::AddInOutFunction(const string &func_name) {
+	lock_guard<mutex> lock(entry_lock_);
+	custom_inout_functions_.insert(func_name);
+	table_function_entries_.erase(func_name);
+}
+
 void ArrowNetSchemaEntry::ClearTables() {
 	lock_guard<mutex> lock(entry_lock_);
 	table_types_.clear();
@@ -76,6 +82,7 @@ void ArrowNetSchemaEntry::ClearTables() {
 	function_entries_.clear();
 	table_functions_.clear();
 	inout_functions_.clear();
+	custom_inout_functions_.clear();
 	table_function_entries_.clear();
 }
 
@@ -372,7 +379,35 @@ struct ArrowNetInOutLocalState : public LocalTableFunctionState {
 	unique_ptr<arrownet::ArrowStreamReader> tail_reader;  // final tail drain (last branch only)
 };
 
-// Bind the in-out overload: output schema = input parameter-table columns ++ the TVF's
+// Append the function's output columns (read from a zero-row get_function_output_schema stream) to
+// return_types/names — shared by the discovered-TVF `_each` bind and the custom-in-out bind.
+void AppendInOutOutputSchema(ClientContext &context, ArrowNetHandle handle, const string &schema, const string &func,
+                            vector<LogicalType> &return_types, vector<string> &names) {
+	ArrowArrayStream out_schema;
+	std::memset(&out_schema, 0, sizeof(out_schema));
+	arrownet::GetFunctionOutputSchema(handle, schema, func, out_schema);
+	ArrowSchemaWrapper schema_root;
+	if (out_schema.get_schema(&out_schema, &schema_root.arrow_schema) != 0) {
+		const char *msg = out_schema.get_last_error ? out_schema.get_last_error(&out_schema) : nullptr;
+		if (out_schema.release) {
+			out_schema.release(&out_schema);
+		}
+		throw IOException(string("mssql_net: failed to read table-in-out output schema") +
+		                  (msg ? string(": ") + msg : string()));
+	}
+	if (out_schema.release) {
+		out_schema.release(&out_schema);
+	}
+	ArrowTableSchema arrow_table;
+	ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table, schema_root.arrow_schema);
+	for (int64_t i = 0; i < schema_root.arrow_schema.n_children; i++) {
+		auto &child = *schema_root.arrow_schema.children[i];
+		names.push_back(child.name ? string(child.name) : "column" + to_string(i));
+		return_types.push_back(arrow_table.GetColumns().at((idx_t)i)->GetDuckType());
+	}
+}
+
+// Bind the discovered-TVF `_each` overload: output schema = input parameter-table columns ++ the TVF's
 // output columns (resolved from metadata, without executing the function).
 unique_ptr<FunctionData> ArrowNetInOutBind(ClientContext &context, TableFunctionBindInput &input,
                                            vector<LogicalType> &return_types, vector<string> &names) {
@@ -399,29 +434,26 @@ unique_ptr<FunctionData> ArrowNetInOutBind(ClientContext &context, TableFunction
 		bind_data->input_names.push_back(input.input_table_names[i]);
 	}
 
-	// 2) Then the TVF's own output columns (f.*), read from a zero-row schema stream.
-	ArrowArrayStream out_schema;
-	std::memset(&out_schema, 0, sizeof(out_schema));
-	arrownet::GetFunctionOutputSchema(info.handle, info.schema, info.func, out_schema);
-	ArrowSchemaWrapper schema_root;
-	if (out_schema.get_schema(&out_schema, &schema_root.arrow_schema) != 0) {
-		const char *msg = out_schema.get_last_error ? out_schema.get_last_error(&out_schema) : nullptr;
-		if (out_schema.release) {
-			out_schema.release(&out_schema);
-		}
-		throw IOException(string("mssql_net: failed to read table-in-out output schema") +
-		                  (msg ? string(": ") + msg : string()));
+	// 2) Then the TVF's own output columns (f.*).
+	AppendInOutOutputSchema(context, info.handle, info.schema, info.func, return_types, names);
+	return std::move(bind_data);
+}
+
+// Bind a custom (provider-authored) table-in-out: output schema = the function's FULL declared output
+// (no input echo, unlike the `_each` alias above). The input table's columns are marshalled as-is and
+// validated against the function's expected input in C#.
+unique_ptr<FunctionData> ArrowNetCustomInOutBind(ClientContext &context, TableFunctionBindInput &input,
+                                                 vector<LogicalType> &return_types, vector<string> &names) {
+	auto &info = input.info->Cast<ArrowNetTableFunctionInfo>();
+	auto bind_data = make_uniq<ArrowNetInOutBindData>();
+	bind_data->handle = info.handle;
+	bind_data->schema = info.schema;
+	bind_data->func = info.func;
+	for (idx_t i = 0; i < input.input_table_types.size(); i++) {
+		bind_data->input_types.push_back(input.input_table_types[i]);
+		bind_data->input_names.push_back(input.input_table_names[i]);
 	}
-	if (out_schema.release) {
-		out_schema.release(&out_schema);
-	}
-	ArrowTableSchema arrow_table;
-	ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table, schema_root.arrow_schema);
-	for (int64_t i = 0; i < schema_root.arrow_schema.n_children; i++) {
-		auto &child = *schema_root.arrow_schema.children[i];
-		names.push_back(child.name ? string(child.name) : "column" + to_string(i));
-		return_types.push_back(arrow_table.GetColumns().at((idx_t)i)->GetDuckType());
-	}
+	AppendInOutOutputSchema(context, info.handle, info.schema, info.func, return_types, names);
 	return std::move(bind_data);
 }
 
@@ -528,8 +560,12 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateTableFunction(ClientC
 	}
 	auto kind_it = table_functions_.find(func_name);
 	if (kind_it == table_functions_.end()) {
-		// Not a discovered scan TVF/proc — it may be the synthetic in-out alias `<base>_each`
-		// (a real same-named function would have matched above, so it wins over the alias).
+		// A provider-authored custom table-in-out (4g) is registered under the bare name.
+		if (custom_inout_functions_.find(func_name) != custom_inout_functions_.end()) {
+			return GetOrCreateCustomInOutFunction(context, func_name);
+		}
+		// Else maybe the synthetic in-out alias `<base>_each` (a real same-named function would
+		// have matched above, so it wins over the alias).
 		auto each_it = inout_functions_.find(func_name);
 		if (each_it != inout_functions_.end()) {
 			return GetOrCreateInOutFunction(context, func_name, each_it->second);
@@ -632,6 +668,32 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateInOutFunction(ClientC
 	return &ref;
 }
 
+// Build the catalog entry for a provider-authored custom table-in-out (4g) — a `{LogicalType::TABLE}`
+// table function under the bare name, dispatched to C# (no SQL object, no scalar-arg scan form). Reuses
+// the same operator callbacks as the `_each` path; only the bind differs (full output schema, no input
+// echo). Caller holds entry_lock_.
+optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateCustomInOutFunction(ClientContext &context,
+                                                                              const string &func_name) {
+	TableFunction inout(func_name, {LogicalType::TABLE}, nullptr, ArrowNetCustomInOutBind, ArrowNetInOutInitGlobal,
+	                    ArrowNetInOutInitLocal);
+	inout.in_out_function = ArrowNetInOutFunction;
+	inout.in_out_function_final = ArrowNetInOutFinal;
+	auto fn_info = make_shared_ptr<ArrowNetTableFunctionInfo>();
+	fn_info->handle = handle_;
+	fn_info->schema = name;
+	fn_info->func = func_name;
+	fn_info->is_proc = false;
+	inout.function_info = std::move(fn_info);
+
+	CreateTableFunctionInfo info(std::move(inout));
+	info.catalog = catalog.GetName();
+	info.schema = name;
+	auto entry = make_uniq<TableFunctionCatalogEntry>(catalog, *this, info);
+	auto &ref = *entry;
+	table_function_entries_[func_name] = std::move(entry);
+	return &ref;
+}
+
 optional_ptr<CatalogEntry> ArrowNetSchemaEntry::LookupEntry(CatalogTransaction transaction,
                                                             const EntryLookupInfo &lookup_info) {
 	if (!transaction.context) {
@@ -686,9 +748,13 @@ void ArrowNetSchemaEntry::Scan(ClientContext &context, CatalogType type,
 			for (auto &fn : table_functions_) {
 				names.push_back(fn.first);
 			}
-			// The synthetic `<name>_each` table-in-out aliases are catalog functions too.
+			// The synthetic `<name>_each` table-in-out aliases + custom in-out functions are catalog
+			// functions too.
 			for (auto &fn : inout_functions_) {
 				names.push_back(fn.first);
+			}
+			for (auto &fn : custom_inout_functions_) {
+				names.push_back(fn);
 			}
 		}
 		for (auto &fn : names) {
