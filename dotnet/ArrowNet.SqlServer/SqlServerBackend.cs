@@ -1129,6 +1129,14 @@ public sealed class SqlServerCatalog : IBackendCatalog
         {
             return new InMemoryArrayStream(customAgg.Parameters, System.Array.Empty<RecordBatch>());
         }
+        return RoutineParamSchemaQuery(schemaName, functionName);
+    }
+
+    // Zero-row Arrow stream of a routine's input parameters (typed-NULL SELECT reconstructed from
+    // INFORMATION_SCHEMA.PARAMETERS). General over scalar/table/proc; shared by GetFunctionParamSchema and
+    // SqlServerScalarFunction.Parameters.
+    internal IArrowArrayStream RoutineParamSchemaQuery(string schemaName, string functionName)
+    {
         var parms = FunctionParameters(schemaName, functionName, wantReturn: false);
         if (parms.Count == 0)
         {
@@ -1160,6 +1168,13 @@ public sealed class SqlServerCatalog : IBackendCatalog
             return new InMemoryArrayStream(new Schema(new[] { customAgg.Result }, null),
                                            System.Array.Empty<RecordBatch>());
         }
+        return RoutineReturnSchemaQuery(schemaName, functionName);
+    }
+
+    // Zero-row Arrow stream of a scalar function's single return field (typed-NULL SELECT). Throws if the
+    // routine has no return (e.g. a TVF/proc). Shared by GetFunctionReturnSchema and SqlServerScalarFunction.Result.
+    internal IArrowArrayStream RoutineReturnSchemaQuery(string schemaName, string functionName)
+    {
         var ret = FunctionParameters(schemaName, functionName, wantReturn: true);
         if (ret.Count == 0)
         {
@@ -1168,83 +1183,38 @@ public sealed class SqlServerCatalog : IBackendCatalog
         return ExecuteQuery($"SELECT CAST(NULL AS {ret[0].sqlType}) AS result WHERE 1 = 0");
     }
 
-    // Applies a scalar UDF over the input batch via chunked, parameterized
-    // `SELECT f(@..) AS result UNION ALL ...` queries — the result column inherits the
-    // function's return type. Chunked to stay under SQL Server's ~2100-parameter limit.
+    // Resolves a scalar function to its IArrowScalarFunction implementation: a provider-authored custom
+    // function if registered, else a SqlServerScalarFunction wrapping the discovered SQL UDF. One uniform
+    // dispatch for ExecuteScalar (created on demand — the wrapper just holds the catalog + name).
+    private IArrowScalarFunction ResolveScalar(string schemaName, string functionName) =>
+        CustomScalar.TryGetValue($"{schemaName}.{functionName}", out var custom)
+            ? custom
+            : new SqlServerScalarFunction(this, schemaName, functionName);
+
+    // Executes a scalar function over the input batches by dispatching to the resolved IArrowScalarFunction
+    // (a custom C# function, or a SqlServerScalarFunction wrapping the discovered SQL UDF). Each input batch's
+    // results become one output batch; the result column is typed by the function's result (the C++ side
+    // ingests by position). The SQL UDF's chunking under the ~2100-parameter cap lives in its Invoke.
     public IArrowArrayStream ExecuteScalar(string schemaName, string functionName, IArrowArrayStream args)
     {
-        // Provider-authored custom function: run the C# delegate over the input batch instead of SQL.
-        if (CustomScalar.TryGetValue($"{schemaName}.{functionName}", out var custom))
-        {
-            var customSchema = new Schema(new[] { custom.Result }, null);
-            using var input = args; // input stream disposed when done (result must be independent)
-            var inBatch = input.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
-            if (inBatch is null)
-            {
-                return new InMemoryArrayStream(customSchema, System.Array.Empty<RecordBatch>());
-            }
-            var resultArray = custom.Invoke(inBatch);
-            var outBatch = new RecordBatch(customSchema, new[] { resultArray }, resultArray.Length);
-            return new InMemoryArrayStream(customSchema, new[] { outBatch });
-        }
-
-        var qualified = Quote(schemaName) + "." + Quote(functionName);
-        var rows = new List<object?[]>();
-        int paramCount;
-        using (var reader = new ArrowDataReader(args))
-        {
-            paramCount = reader.FieldCount;
-            while (reader.Read())
-            {
-                var vals = new object?[paramCount];
-                for (int c = 0; c < paramCount; c++)
-                {
-                    vals[c] = reader.IsDBNull(c) ? null : reader.GetValue(c);
-                }
-                rows.Add(vals);
-            }
-        }
-        if (rows.Count == 0)
-        {
-            return GetFunctionReturnSchema(schemaName, functionName); // correctly typed, zero rows
-        }
-
-        int maxRows = Math.Max(1, 2000 / Math.Max(1, paramCount));
+        var fn = ResolveScalar(schemaName, functionName);
+        using var input = args;
         var batches = new List<RecordBatch>();
         Schema? resultSchema = null;
-        for (int start = 0; start < rows.Count; start += maxRows)
+        RecordBatch? inBatch;
+        while ((inBatch = input.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult()) is not null)
         {
-            int end = Math.Min(start + maxRows, rows.Count);
-            var sb = new StringBuilder();
-            var sqlParams = new List<SqlParameter>();
-            for (int r = start; r < end; r++)
+            if (inBatch.Length == 0)
             {
-                if (r > start)
-                {
-                    sb.Append(" UNION ALL ");
-                }
-                sb.Append("SELECT ").Append(qualified).Append('(');
-                for (int c = 0; c < paramCount; c++)
-                {
-                    if (c > 0)
-                    {
-                        sb.Append(", ");
-                    }
-                    var pn = $"@p{r}_{c}";
-                    sb.Append(pn);
-                    sqlParams.Add(new SqlParameter(pn, rows[r][c] ?? (object)DBNull.Value));
-                }
-                sb.Append(") AS result");
+                continue;
             }
-            using var sub = ExecuteQuery(sb.ToString(), sqlParams);
-            resultSchema ??= sub.Schema;
-            RecordBatch? b;
-            while ((b = sub.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult()) is not null)
-            {
-                batches.Add(b);
-            }
+            var resultArray = fn.Invoke(inBatch);
+            resultSchema ??= new Schema(new[] { new Field("result", resultArray.Data.DataType, nullable: true) }, null);
+            batches.Add(new RecordBatch(resultSchema, new[] { resultArray }, resultArray.Length));
         }
-        return new InMemoryArrayStream(resultSchema!, batches);
+        // No non-empty input → a correctly-typed zero-row stream.
+        resultSchema ??= new Schema(new[] { new Field("result", fn.Result.DataType, nullable: true) }, null);
+        return new InMemoryArrayStream(resultSchema, batches);
     }
 
     // A table-valued function's output columns from INFORMATION_SCHEMA.ROUTINE_COLUMNS
@@ -2494,7 +2464,7 @@ public sealed class SqlServerCatalog : IBackendCatalog
         return result;
     }
 
-    private static string Quote(string identifier) => "[" + identifier.Replace("]", "]]") + "]";
+    internal static string Quote(string identifier) => "[" + identifier.Replace("]", "]]") + "]";
 
     private static string BuildCreateTable(string qualified, Schema schema) =>
         BuildCreateTable(qualified, schema, null, null, null, null);
