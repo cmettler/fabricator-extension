@@ -48,11 +48,12 @@ public:
 	//! its output schema is the function's full declared schema (no input echo).
 	void AddInOutFunction(const string &func_name);
 
-	//! Registers a provider-authored custom aggregate function (4h, `kind='aggregate'`): a UDAF
-	//! exposed as a DuckDB AggregateFunctionCatalogEntry so `db.schema.fn(args)` resolves wherever
-	//! DuckDB allows an aggregate (GROUP BY / parallel / OVER). Arg + return types are resolved
-	//! lazily on first lookup; per-group state lives in C# behind an int64 id.
-	void AddAggregateFunction(const string &func_name);
+	//! Registers a provider-authored custom aggregate function (4h): a UDAF exposed as a DuckDB
+	//! AggregateFunctionCatalogEntry so `db.schema.fn(args)` resolves wherever DuckDB allows an aggregate
+	//! (GROUP BY / parallel / OVER). Arg + return types are resolved lazily on first lookup. `spillable`
+	//! (`kind='aggregate_spill'`) selects the bytes-in-blob mode (state serialized into DuckDB's blob so
+	//! external GROUP BY can spill it); otherwise the fast in-memory id-based mode (state lives in C#).
+	void AddAggregateFunction(const string &func_name, bool spillable);
 
 	//! Drops all cached table + function names and materialized entries (cache refresh).
 	void ClearTables();
@@ -101,7 +102,7 @@ private:
 	case_insensitive_map_t<bool> table_functions_; // table-returning routine name -> is_proc (TVF=false)
 	case_insensitive_map_t<string> inout_functions_; // synthetic `<base>_each` alias -> base TVF name (4g)
 	case_insensitive_set_t custom_inout_functions_;  // provider-authored custom table-in-out names (4g)
-	case_insensitive_set_t aggregate_functions_;     // custom aggregate (UDAF) names (4h)
+	case_insensitive_map_t<bool> aggregate_functions_; // custom aggregate (UDAF) name -> spillable (4h)
 	mutex entry_lock_;
 	case_insensitive_map_t<unique_ptr<ArrowNetTableEntry>> entries_;
 	case_insensitive_map_t<unique_ptr<ScalarFunctionCatalogEntry>> function_entries_;

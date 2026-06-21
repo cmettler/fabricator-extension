@@ -456,8 +456,19 @@ concrete build settled these points:
   marshaled bridge, so it's deliberately omitted. Because the window paths churn many transient states, the
   **destructor IS wired** (`agg_destroy`) to bound the C# map (the GROUP-BY-only design could have skipped it).
 
-- **No disk-spill** (the managed map is invisible to DuckDB's memory manager) and **no `serialize`/`deserialize`**
-  — both deferred; acceptable for a first cut (a billion-distinct-key external aggregation isn't the target).
+- **Disk-spill is opt-in per aggregate** (`IArrowAggregateFunction.SupportsSpill`, ABI v26). The default
+  (fast) mode keeps the live accumulator in C# behind an id — bounded by managed memory, no spill. Setting
+  `SupportsSpill=true` (+ `IArrowAggregateState.Serialize()`/`Load()`) switches to **bytes-in-blob mode**: the
+  per-group state is serialized into DuckDB's fixed, pointer-free state blob
+  (`[uint32 len][byte data[ARROWNET_AGG_SPILL_CAP = 1 KB]]`), so DuckDB's external GROUP BY spills it to disk
+  under memory pressure. The cost is (de)serialization on every update/combine/finalize, and a 1 KB cap on the
+  serialized state — so it suits fixed/small state (sum/product/bitwise/avg/moments), not unbounded state
+  (string concat). Surfaced as `kind='aggregate_spill'`; the C++ callbacks branch on the `spillable` flag and
+  marshal state as Arrow BLOB columns (the C# side is stateless per call). **Build note:** the spill update +
+  combine assign *dense group/target slots* so interleaved-group updates and the window segment-tree's
+  merge-many-nodes-into-one-frame-state combine accumulate correctly (a naive read-once/write-once per row
+  loses merges — caught by the windowed-spill test). `serialize`/`deserialize` for *variable/unbounded* state
+  and for distributed-plan serialization remain deferred.
 
 - **Resolution detail**: DuckDB stores scalar/aggregate/macro in one `functions` namespace and the binder looks
   up `SCALAR_FUNCTION_ENTRY` then dispatches on the returned entry's *actual* type — so

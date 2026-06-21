@@ -48,8 +48,8 @@ intended for reuse by a future Power BI / DAX connector.
 | | Custom C#-authored scalar / table / table-in-out functions | ✅ |
 | | **Table-in-out**: `db.schema.fn_each(<input table>)` — apply a TVF (CROSS APPLY) or proc per input row | ✅ |
 | | — configurable isolation (consistent snapshot per call); per-row procs run in DuckDB's transaction | ✅ |
-| | **Custom C# aggregates** (UDAF) → `db.schema.agg(x)` in `GROUP BY` / parallel / `OVER(…)` | ✅ |
-| | Load-time *global* functions (connection-free); proc multi-result-set / `INOUT` params; aggregate disk-spill | ❌ deferred |
+| | **Custom C# aggregates** (UDAF) → `db.schema.agg(x)` in `GROUP BY` / parallel / `OVER(…)`; opt-in disk-spill (`SupportsSpill`) | ✅ |
+| | Load-time *global* functions (connection-free); proc multi-result-set / `INOUT` params | ❌ deferred |
 | **Diag** | Connection-pool diagnostics (`mssql_pool_stats`, `mssql_open/close/ping`) | ❌ |
 | | COPY to temp tables (`#t` / empty-schema syntax) | ❌ |
 
@@ -428,8 +428,11 @@ SELECT cf_bit_or(x) OVER (ORDER BY id) FROM t;                -- window (running
   The C# author implements `CreateState()` + `Update(batch)` / `Combine(other)` / `Finalize()`.
 - **Window** works with no custom window callback — DuckDB drives it through `Update`/`Combine`/`Finalize`
   (segment-tree), which is cheaper for a marshaled bridge than one boundary crossing per output row.
-- State lives in C# (not serialized into DuckDB memory), so a huge-cardinality `GROUP BY` can't spill to
-  disk — bounded by managed memory. Demos: `dbo.cf_product`, `dbo.cf_bit_or`.
+- **Disk-spill is opt-in.** By default the state lives in C# (fast; bounded by managed memory, no spill). Set
+  `SupportsSpill = true` (and implement `Serialize()`/`Load()` on the state) to switch to *bytes-in-blob*
+  mode: the per-group state is serialized into DuckDB's fixed state blob (≤ 1 KB) so a huge-cardinality
+  `GROUP BY` spills to disk under memory pressure — at the cost of (de)serializing on every step. Demos:
+  `dbo.cf_product`, `dbo.cf_bit_or` (fast), `dbo.cf_sum_spill` (spillable).
 
 ## Settings
 

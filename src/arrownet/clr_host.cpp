@@ -665,6 +665,42 @@ void AggClose(ArrowNetHandle session) {
 	}
 }
 
+void AggUpdateSpill(ArrowNetHandle session, ArrowArray &group_states, ArrowArray &batch, ArrowArrayStream &out) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.agg_update_spill) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide agg_update_spill");
+	}
+	char *err = nullptr;
+	int32_t rc = vt.agg_update_spill(session, &group_states, &batch, &out, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: agg_update_spill failed");
+	}
+}
+
+void AggCombineSpill(ArrowNetHandle session, ArrowArray &target_states, ArrowArray &batch, ArrowArrayStream &out) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.agg_combine_spill) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide agg_combine_spill");
+	}
+	char *err = nullptr;
+	int32_t rc = vt.agg_combine_spill(session, &target_states, &batch, &out, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: agg_combine_spill failed");
+	}
+}
+
+void AggFinalizeSpill(ArrowNetHandle session, ArrowArray &states, ArrowArrayStream &out) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.agg_finalize_spill) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide agg_finalize_spill");
+	}
+	char *err = nullptr;
+	int32_t rc = vt.agg_finalize_spill(session, &states, &out, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: agg_finalize_spill failed");
+	}
+}
+
 void ScanTable(ArrowNetHandle handle, const std::string &schema, const std::string &table, const std::string &spec_json,
                ArrowArrayStream *filter_values, ArrowArrayStream &out) {
 	const ArrowNetVTable &vt = GetBridge();

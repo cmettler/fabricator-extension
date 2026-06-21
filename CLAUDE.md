@@ -180,7 +180,9 @@ functions + discovered-TVF & per-row-proc table-in-out + the OperatorFinalize cl
 functions (4h — custom C# UDAF, GROUP BY + parallel + window)"; proc
 multi-result-set + INPUT/OUTPUT + OUTPUT-param-only `_each` still deferred; a custom aggregate `window`
 callback is deliberately NOT implemented (DuckDB's segment-tree path drives our combine/finalize — cheaper for
-a marshaled bridge); aggregates have no disk-spill (state in C#);
+a marshaled bridge); aggregate disk-spill is **opt-in** per aggregate (`SupportsSpill` → bytes-in-blob, 1 KB
+state cap; default is fast in-C# state, no spill) — `serialize`/`deserialize` for variable/unbounded state and
+distributed-plan serialization stay deferred;
 load-time global deferred in
 favor of attach-time custom functions); connection
 pooling knobs / `mssql_pool_stats` (ADO.NET pools by connstr already); COPY to temp tables
@@ -238,6 +240,14 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
   (drops those states — bounds memory for the window paths; best-effort) + `agg_close(session)` (frees the
   session; best-effort). Arg/return schemas reuse `get_function_param_schema`/`get_function_return_schema`. See
   "Callable aggregate functions (4h)" below.
+- **ABI v26** entries (spillable aggregates, 4h opt-in): `agg_update_spill(session, group_states, batch, out)`
+  (`group_states` = BLOB[G] current state per distinct group, `batch` = `[int64 slot ++ params]`; `out` =
+  BLOB[G] new state) + `agg_combine_spill(session, target_states, batch, out)` (`target_states` = BLOB[G]
+  distinct targets, `batch` = `[int64 slot, BLOB source]` — a target may repeat, e.g. the window segment-tree
+  merges several nodes into one frame state; `out` = BLOB[G] merged) + `agg_finalize_spill(session, states,
+  out)` (`states` = BLOB[N]; `out` = one result column). For a spillable aggregate the per-group state is
+  serialized into a fixed, pointer-free state blob (`[uint32 len][byte data[ARROWNET_AGG_SPILL_CAP]]`, cap =
+  1 KB) so DuckDB's external GROUP BY spills it; state crosses as an Arrow BLOB column (NULL row = fresh).
 
 ### Callable scalar UDFs (4b)
 - **Discovery**: `ArrowNetCatalog::LoadCatalog`/`RefreshCache` call `DiscoverFunctions` (reads
@@ -470,11 +480,28 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
   the binder looks up `SCALAR_FUNCTION_ENTRY` then dispatches on the returned entry's actual type, so
   `LookupEntry(SCALAR_FUNCTION_ENTRY)` **falls back to the aggregate** (plus an explicit `AGGREGATE_FUNCTION_ENTRY`
   branch). Discovery routes `kind=='aggregate'` → `AddAggregateFunction`.
-- **Verified**: `test/verify_custom_aggregates.test` (35 assertions) — discovery (`kind='aggregate'`) + no SQL
-  object, ungrouped (`simple_update`), implicit INTEGER→BIGINT, NULL-skip, empty/all-NULL → NULL, `GROUP BY`
-  (incl. a NULL-only group), parallel `bit_or` cross-checked vs DuckDB's built-in (threads=4), grouped+parallel
-  `product` cross-checked vs DuckDB's `product()`, running-frame `OVER`, and windowed `OVER`/`PARTITION BY`
-  cross-checked vs the built-in.
+- **Opt-in disk-spill (`SupportsSpill`, ABI v26)**: by default the state lives in C# (fast, bounded by managed
+  memory, no spill). A provider can instead set `IArrowAggregateFunction.SupportsSpill=true` (+ implement
+  `IArrowAggregateState.Serialize()`/`Load()`) → **bytes-in-blob mode**: the per-group state is serialized into
+  DuckDB's fixed, pointer-free state blob (`[uint32 len][byte data[ARROWNET_AGG_SPILL_CAP=1 KB]]`) so DuckDB's
+  external GROUP BY spills it to disk under memory pressure. Surfaced as `kind='aggregate_spill'`; `state_size`/
+  `initialize` (sentinel len, no C# call) and update/combine/finalize/destroy all branch on the `spillable`
+  flag (on `function_info` for the first two, `bind_data` for the rest). The spill callbacks marshal state as
+  Arrow BLOB columns over the v26 `agg_*_spill` ABI; C# is **stateless per call** (rehydrate→apply→reserialize)
+  so the destructor is a no-op (the blob owns the state). **Two correctness points found in the build:** (1)
+  update + combine assign **dense group/target slots** so a group whose rows interleave (update) OR a target
+  combined with several sources in one batch (the **window** segment-tree merges many nodes into one frame
+  state) accumulates into one transient accumulator — a naive read-once/write-once loses merges (caught by the
+  windowed-spill test); (2) serialized state must fit the 1 KB cap (enforced on write-back) → spill suits
+  fixed/small state (sum/product/bitwise/avg/moments), not unbounded state (string concat). Demo
+  `dbo.cf_sum_spill`.
+- **Verified**: `test/verify_custom_aggregates.test` (50 assertions) — discovery (`kind='aggregate'` +
+  `'aggregate_spill'`) + no SQL object, ungrouped (`simple_update`), implicit INTEGER→BIGINT, NULL-skip,
+  empty/all-NULL → NULL, `GROUP BY` (incl. a NULL-only group), parallel `bit_or` cross-checked vs DuckDB's
+  built-in (threads=4), grouped+parallel `product` cross-checked vs DuckDB's `product()`, running-frame `OVER`,
+  windowed `OVER`/`PARTITION BY` cross-checked vs the built-in, AND the spillable `cf_sum_spill` across all of
+  ungrouped / `GROUP BY` / high-cardinality (50k rows × 1000 groups) / low-`memory_limit` (80k × 4000) /
+  window — each cross-checked vs the built-in `sum()`.
 
 - **Filtering**: discovered scalar UDFs + TVFs/procs are gated by the ATTACH `schema_filter` (icase
   `std::regex`, applied in `LoadCatalog`/`RefreshCache`); `table_filter` is table-only and does NOT apply to functions.
@@ -501,10 +528,12 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v25** (v25 appended the six custom-aggregate entries `agg_open`/`agg_update`/
-  `agg_combine`/`agg_finalize`/`agg_destroy`/`agg_close` — 4h; v24 added `inout_open`'s `isolation` arg so
-  the in-out session runs its per-chunk CROSS APPLY in one transaction at that SQL isolation level for a
-  consistent view). **Bump rule:** when you add a vtable entry OR change a signature, bump
+- **Current version: ABI v26** (v26 appended the three spillable-aggregate entries `agg_update_spill`/
+  `agg_combine_spill`/`agg_finalize_spill` + the `ARROWNET_AGG_SPILL_CAP` constant — 4h opt-in spill; v25
+  appended the six custom-aggregate entries `agg_open`/`agg_update`/`agg_combine`/`agg_finalize`/`agg_destroy`/
+  `agg_close` — 4h; v24 added `inout_open`'s `isolation` arg so the in-out session runs its per-chunk CROSS
+  APPLY in one transaction at that SQL isolation level for a consistent view). **Bump rule:** when you add a
+  vtable entry OR change a signature, bump
   **BOTH** `ARROWNET_ABI_VERSION` in `abi.h` AND `vtable->AbiVersion = N` in `Bootstrap.Initialize`,
   else the host throws "ABI version mismatch". Adding an *enum value* (e.g. a new metadata/alter kind)
   is additive and needs NO bump.

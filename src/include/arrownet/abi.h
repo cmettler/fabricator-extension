@@ -414,9 +414,43 @@ typedef struct ArrowNetVTable {
 	// Release the session (frees the dictionary + GCHandle). Idempotent. Safe with
 	// nullptr. Best-effort (teardown must not throw).
 	int32_t (*agg_close)(ArrowNetHandle session, char **err);
+
+	// -------------------------------------------------------------------------
+	// Spillable aggregates (Phase 4h opt-in, `IArrowAggregateFunction.SupportsSpill`).
+	// For these the per-group accumulator is serialized into the fixed-size,
+	// pointer-free state blob (`[uint32 len][byte data[ARROWNET_AGG_SPILL_CAP]]`),
+	// so DuckDB's external GROUP BY can spill it to disk. Each call round-trips the
+	// state bytes <-> the C# accumulator (no persistent C# state). State is carried
+	// as an Arrow BLOB column; a NULL row = a fresh/empty group. Serialized state
+	// must fit ARROWNET_AGG_SPILL_CAP bytes.
+	// -------------------------------------------------------------------------
+
+	// Update: `group_states` = a BLOB column, one row per distinct group in this chunk
+	// (its current serialized state; NULL = fresh); `batch` = `[int64 slot ++ params]`,
+	// N rows (slot indexes into group_states). *out = a BLOB column of the new serialized
+	// state per group, SAME ORDER as group_states. Consumes both input arrays.
+	int32_t (*agg_update_spill)(ArrowNetHandle session, struct ArrowArray *group_states, struct ArrowArray *batch,
+	                            struct ArrowArrayStream *out, char **err);
+
+	// Combine: `target_states` = a BLOB column, one row per distinct TARGET group (NULL = fresh); `batch` =
+	// `[int64 slot, BLOB source]`, N rows (slot indexes into target_states; source = the partial state to
+	// merge in — a target may repeat across rows, e.g. the window segment-tree merges several nodes into one
+	// frame state). *out = a BLOB column of the merged state per target, SAME ORDER as target_states.
+	// Consumes both input arrays.
+	int32_t (*agg_combine_spill)(ArrowNetHandle session, struct ArrowArray *target_states, struct ArrowArray *batch,
+	                             struct ArrowArrayStream *out, char **err);
+
+	// Finalize: `states` = a BLOB column, N rows (NULL = fresh/empty). *out = one result
+	// column, N rows, SAME ORDER. Consumes `states`.
+	int32_t (*agg_finalize_spill)(ArrowNetHandle session, struct ArrowArray *states, struct ArrowArrayStream *out,
+	                              char **err);
 } ArrowNetVTable;
 
-#define ARROWNET_ABI_VERSION 25
+// Max serialized size of a spillable aggregate's per-group state (the inline, pointer-free
+// state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
+#define ARROWNET_AGG_SPILL_CAP 1024
+
+#define ARROWNET_ABI_VERSION 26
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

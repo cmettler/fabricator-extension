@@ -44,6 +44,8 @@
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 
 #include <atomic>
+#include <cstring>
+#include <unordered_map>
 
 namespace duckdb {
 
@@ -84,9 +86,9 @@ void ArrowNetSchemaEntry::AddInOutFunction(const string &func_name) {
 	table_function_entries_.erase(func_name);
 }
 
-void ArrowNetSchemaEntry::AddAggregateFunction(const string &func_name) {
+void ArrowNetSchemaEntry::AddAggregateFunction(const string &func_name, bool spillable) {
 	lock_guard<mutex> lock(entry_lock_);
-	aggregate_functions_.insert(func_name);
+	aggregate_functions_[func_name] = spillable;
 	// Drop any cached entry so the signature is re-fetched (e.g. after a cache refresh).
 	aggregate_function_entries_.erase(func_name);
 }
@@ -272,7 +274,13 @@ struct ArrowNetAggregateFunctionInfo : public AggregateFunctionInfo {
 	vector<LogicalType> arg_types;
 	vector<string> arg_names;
 	std::atomic<int64_t> counter {0};
+	bool spillable = false; // bytes-in-blob mode (state serialized into DuckDB's blob → external spill)
 };
+
+// Spillable-mode state blob: [uint32 len][byte data[ARROWNET_AGG_SPILL_CAP]] — fixed-size + pointer-free so
+// DuckDB's external GROUP BY spills it as raw bytes. A len of this sentinel = fresh/uninitialized (so
+// `initialize` needs no C# call).
+static constexpr uint32_t AGG_SPILL_SENTINEL = 0xFFFFFFFFu;
 
 // Refcounted holder for the managed aggregate session, carried on the bind data. Its destructor calls
 // agg_close (frees the managed id->accumulator map + GCHandle) on plan teardown — best-effort, idempotent.
@@ -293,6 +301,7 @@ struct ArrowNetAggregateBindData : public FunctionData {
 	vector<string> arg_names;
 	ClientProperties properties;
 	optional_ptr<ClientContext> context; // connection context (stable across the bound plan); Arrow marshaling
+	bool spillable = false;              // bytes-in-blob mode (see ArrowNetAggregateFunctionInfo)
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto c = make_uniq<ArrowNetAggregateBindData>();
@@ -301,6 +310,7 @@ struct ArrowNetAggregateBindData : public FunctionData {
 		c->arg_names = arg_names;
 		c->properties = properties;
 		c->context = context;
+		c->spillable = spillable;
 		return std::move(c);
 	}
 	bool Equals(const FunctionData &other_p) const override {
@@ -337,9 +347,9 @@ ArrowArray BuildIdBatch(const ClientProperties &props, const int64_t *ids, idx_t
 	return appender.Finalize();
 }
 
-// Marshal [id ++ inputs] (one BIGINT id column + the argument columns) and send to agg_update.
-void MarshalAggUpdate(ArrowNetAggregateBindData &bind, Vector &id_vec, Vector inputs[], idx_t input_count,
-                      idx_t count) {
+// Marshal a `[BIGINT key ++ inputs]` batch (key = state id in fast mode, dense group slot in spill mode).
+ArrowArray BuildUpdateBatch(ArrowNetAggregateBindData &bind, Vector &key_vec, Vector inputs[], idx_t input_count,
+                            idx_t count) {
 	vector<LogicalType> types;
 	types.reserve(input_count + 1);
 	types.push_back(LogicalType::BIGINT);
@@ -348,7 +358,7 @@ void MarshalAggUpdate(ArrowNetAggregateBindData &bind, Vector &id_vec, Vector in
 	}
 	DataChunk batch;
 	batch.InitializeEmpty(types);
-	batch.data[0].Reference(id_vec);
+	batch.data[0].Reference(key_vec);
 	for (idx_t i = 0; i < input_count; i++) {
 		batch.data[1 + i].Reference(inputs[i]);
 	}
@@ -358,17 +368,206 @@ void MarshalAggUpdate(ArrowNetAggregateBindData &bind, Vector &id_vec, Vector in
 	auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(*bind.context, types);
 	ArrowAppender appender(types, count, bind.properties, extension_types);
 	appender.Append(batch, 0, count, count);
-	ArrowArray array = appender.Finalize();
+	return appender.Finalize();
+}
+
+// Fast mode: marshal [id ++ inputs] and send to agg_update.
+void MarshalAggUpdate(ArrowNetAggregateBindData &bind, Vector &id_vec, Vector inputs[], idx_t input_count,
+                      idx_t count) {
+	ArrowArray array = BuildUpdateBatch(bind, id_vec, inputs, input_count, count);
 	arrownet::AggUpdate(bind.holder->session, array);
 }
 
-idx_t ArrowNetAggregateStateSize(const AggregateFunction &) {
-	return sizeof(int64_t);
+// ---- Spillable mode (bytes-in-blob): state travels as an Arrow BLOB column, one row per group; a NULL row
+// = a fresh/empty group. The state blob is `[uint32 len][byte data]`. ----
+
+// Fill a BLOB Vector with the current serialized state of each group blob (sentinel => NULL).
+void FillBlobVector(Vector &vec, const data_ptr_t *blobs, idx_t count) {
+	auto data = FlatVector::GetData<string_t>(vec);
+	for (idx_t i = 0; i < count; i++) {
+		uint32_t len = Load<uint32_t>(blobs[i]);
+		if (len == AGG_SPILL_SENTINEL) {
+			FlatVector::SetNull(vec, i, true);
+		} else {
+			data[i] = StringVector::AddStringOrBlob(
+			    vec, string_t(reinterpret_cast<const char *>(blobs[i] + sizeof(uint32_t)), len));
+		}
+	}
+}
+
+// Build a single-column BLOB Arrow array holding the current serialized state of each group blob.
+ArrowArray BuildSpillStateColumn(const ClientProperties &props, const data_ptr_t *blobs, idx_t count) {
+	Vector vec(LogicalType::BLOB);
+	FillBlobVector(vec, blobs, count);
+	vector<LogicalType> types {LogicalType::BLOB};
+	DataChunk chunk;
+	chunk.InitializeEmpty(types);
+	chunk.data[0].Reference(vec);
+	chunk.SetCardinality(count);
+	ArrowAppender appender(types, count == 0 ? 1 : count, props, {});
+	appender.Append(chunk, 0, count, count);
+	return appender.Finalize();
+}
+
+// Read a BLOB stream of new per-group state back into the group blobs (len-prefixed, capped).
+void WriteBackSpillStates(ClientContext &context, ArrowArrayStream &out, const data_ptr_t *blobs, idx_t count) {
+	arrownet::ArrowStreamReader reader(context, out);
+	DataChunk chunk;
+	chunk.Initialize(Allocator::Get(context), reader.Types());
+	idx_t produced = 0;
+	while (produced < count) {
+		chunk.Reset();
+		reader.Read(chunk);
+		idx_t got = chunk.size();
+		if (got == 0) {
+			break;
+		}
+		UnifiedVectorFormat ovf;
+		chunk.data[0].ToUnifiedFormat(got, ovf);
+		auto strs = UnifiedVectorFormat::GetData<string_t>(ovf);
+		for (idx_t j = 0; j < got; j++) {
+			auto sv = strs[ovf.sel->get_index(j)];
+			idx_t len = sv.GetSize();
+			if (len > ARROWNET_AGG_SPILL_CAP) {
+				throw InvalidInputException(
+				    "mssql_net: spillable aggregate state is %llu bytes, exceeding the %d-byte cap", (idx_t)len,
+				    ARROWNET_AGG_SPILL_CAP);
+			}
+			data_ptr_t blob = blobs[produced + j];
+			Store<uint32_t>(static_cast<uint32_t>(len), blob);
+			std::memcpy(blob + sizeof(uint32_t), sv.GetData(), len);
+		}
+		produced += got;
+	}
+}
+
+// Spillable update: group rows by state-blob pointer (dense slots), read each group's current state, run the
+// chunk's rows for each group in C#, and write the new serialized state back into the blobs.
+void AggUpdateSpillImpl(ArrowNetAggregateBindData &bind, Vector inputs[], idx_t input_count, Vector &state,
+                        idx_t count) {
+	UnifiedVectorFormat sdata;
+	state.ToUnifiedFormat(count, sdata);
+	auto ptrs = UnifiedVectorFormat::GetData<data_ptr_t>(sdata);
+	std::unordered_map<data_ptr_t, idx_t> slot_of;
+	vector<data_ptr_t> group_blobs;
+	Vector slot_vec(LogicalType::BIGINT);
+	auto slot_data = FlatVector::GetData<int64_t>(slot_vec);
+	for (idx_t i = 0; i < count; i++) {
+		data_ptr_t blob = ptrs[sdata.sel->get_index(i)];
+		auto it = slot_of.find(blob);
+		idx_t slot;
+		if (it == slot_of.end()) {
+			slot = group_blobs.size();
+			slot_of.emplace(blob, slot);
+			group_blobs.push_back(blob);
+		} else {
+			slot = it->second;
+		}
+		slot_data[i] = static_cast<int64_t>(slot);
+	}
+	idx_t g = group_blobs.size();
+	ArrowArray group_states = BuildSpillStateColumn(bind.properties, group_blobs.data(), g);
+	ArrowArray batch = BuildUpdateBatch(bind, slot_vec, inputs, input_count, count);
+	ArrowArrayStream out;
+	std::memset(&out, 0, sizeof(out));
+	arrownet::AggUpdateSpill(bind.holder->session, group_states, batch, out);
+	WriteBackSpillStates(*bind.context, out, group_blobs.data(), g);
+}
+
+// Spillable combine: assign dense slots to the distinct TARGET blobs (a target may repeat in one combine
+// batch — the window segment-tree merges several source nodes into one frame target), build a `[slot, source]`
+// batch, merge in C#, and write each distinct target's merged state back.
+void AggCombineSpillImpl(ArrowNetAggregateBindData &bind, Vector &source, Vector &target, idx_t count) {
+	UnifiedVectorFormat sf, tf;
+	source.ToUnifiedFormat(count, sf);
+	target.ToUnifiedFormat(count, tf);
+	auto sptr = UnifiedVectorFormat::GetData<data_ptr_t>(sf);
+	auto tptr = UnifiedVectorFormat::GetData<data_ptr_t>(tf);
+
+	std::unordered_map<data_ptr_t, idx_t> slot_of;
+	vector<data_ptr_t> target_blobs;
+	vector<data_ptr_t> source_blobs(count);
+	Vector slot_vec(LogicalType::BIGINT);
+	auto slot_data = FlatVector::GetData<int64_t>(slot_vec);
+	for (idx_t i = 0; i < count; i++) {
+		data_ptr_t tgt = tptr[tf.sel->get_index(i)];
+		auto it = slot_of.find(tgt);
+		idx_t slot;
+		if (it == slot_of.end()) {
+			slot = target_blobs.size();
+			slot_of.emplace(tgt, slot);
+			target_blobs.push_back(tgt);
+		} else {
+			slot = it->second;
+		}
+		slot_data[i] = static_cast<int64_t>(slot);
+		source_blobs[i] = sptr[sf.sel->get_index(i)];
+	}
+	idx_t g = target_blobs.size();
+
+	ArrowArray target_states = BuildSpillStateColumn(bind.properties, target_blobs.data(), g);
+	// batch = [int64 slot, BLOB source]
+	Vector src_vec(LogicalType::BLOB);
+	FillBlobVector(src_vec, source_blobs.data(), count);
+	vector<LogicalType> types {LogicalType::BIGINT, LogicalType::BLOB};
+	DataChunk batch_chunk;
+	batch_chunk.InitializeEmpty(types);
+	batch_chunk.data[0].Reference(slot_vec);
+	batch_chunk.data[1].Reference(src_vec);
+	batch_chunk.SetCardinality(count);
+	ArrowAppender appender(types, count, bind.properties, {});
+	appender.Append(batch_chunk, 0, count, count);
+	ArrowArray batch = appender.Finalize();
+
+	ArrowArrayStream out;
+	std::memset(&out, 0, sizeof(out));
+	arrownet::AggCombineSpill(bind.holder->session, target_states, batch, out);
+	WriteBackSpillStates(*bind.context, out, target_blobs.data(), g);
+}
+
+// Spillable finalize: read each group's serialized state, finalize in C#, copy the result column out.
+void AggFinalizeSpillImpl(ArrowNetAggregateBindData &bind, Vector &state, Vector &result, idx_t count,
+                          idx_t offset) {
+	UnifiedVectorFormat sf;
+	state.ToUnifiedFormat(count, sf);
+	auto ptr = UnifiedVectorFormat::GetData<data_ptr_t>(sf);
+	vector<data_ptr_t> blobs(count);
+	for (idx_t i = 0; i < count; i++) {
+		blobs[i] = ptr[sf.sel->get_index(i)];
+	}
+	ArrowArray states = BuildSpillStateColumn(bind.properties, blobs.data(), count);
+	ArrowArrayStream out;
+	std::memset(&out, 0, sizeof(out));
+	arrownet::AggFinalizeSpill(bind.holder->session, states, out);
+	arrownet::ArrowStreamReader reader(*bind.context, out);
+	DataChunk chunk;
+	chunk.Initialize(Allocator::Get(*bind.context), reader.Types());
+	idx_t produced = 0;
+	while (produced < count) {
+		chunk.Reset();
+		reader.Read(chunk);
+		idx_t got = chunk.size();
+		if (got == 0) {
+			break;
+		}
+		VectorOperations::Copy(chunk.data[0], result, got, 0, offset + produced);
+		produced += got;
+	}
+}
+
+idx_t ArrowNetAggregateStateSize(const AggregateFunction &function) {
+	auto &info = function.function_info->Cast<ArrowNetAggregateFunctionInfo>();
+	// Spillable: a fixed, pointer-free serialized-state blob ([uint32 len][data]); else an int64 id.
+	return info.spillable ? (sizeof(uint32_t) + ARROWNET_AGG_SPILL_CAP) : sizeof(int64_t);
 }
 
 void ArrowNetAggregateInit(const AggregateFunction &function, data_ptr_t state) {
 	auto &info = function.function_info->Cast<ArrowNetAggregateFunctionInfo>();
-	Store<int64_t>(info.counter.fetch_add(1, std::memory_order_relaxed), state);
+	if (info.spillable) {
+		Store<uint32_t>(AGG_SPILL_SENTINEL, state); // fresh/uninitialized; no C# call needed at init
+	} else {
+		Store<int64_t>(info.counter.fetch_add(1, std::memory_order_relaxed), state);
+	}
 }
 
 unique_ptr<FunctionData> ArrowNetAggregateBind(ClientContext &context, AggregateFunction &function,
@@ -381,6 +580,7 @@ unique_ptr<FunctionData> ArrowNetAggregateBind(ClientContext &context, Aggregate
 	bind_data->arg_names = info.arg_names;
 	bind_data->properties = context.GetClientProperties();
 	bind_data->context = &context;
+	bind_data->spillable = info.spillable;
 	return std::move(bind_data);
 }
 
@@ -391,6 +591,10 @@ void ArrowNetAggregateUpdate(Vector inputs[], AggregateInputData &aggr_input_dat
 		return;
 	}
 	auto &bind = aggr_input_data.bind_data->Cast<ArrowNetAggregateBindData>();
+	if (bind.spillable) {
+		AggUpdateSpillImpl(bind, inputs, input_count, state, count);
+		return;
+	}
 	Vector id_vec(LogicalType::BIGINT);
 	ReadStateIds(state, count, FlatVector::GetData<int64_t>(id_vec));
 	MarshalAggUpdate(bind, id_vec, inputs, input_count, count);
@@ -403,13 +607,26 @@ void ArrowNetAggregateSimpleUpdate(Vector inputs[], AggregateInputData &aggr_inp
 		return;
 	}
 	auto &bind = aggr_input_data.bind_data->Cast<ArrowNetAggregateBindData>();
+	Vector key_vec(LogicalType::BIGINT);
+	auto data = FlatVector::GetData<int64_t>(key_vec);
+	if (bind.spillable) {
+		// All rows fold into the single state `state`: one group (slot 0).
+		for (idx_t i = 0; i < count; i++) {
+			data[i] = 0;
+		}
+		ArrowArray group_states = BuildSpillStateColumn(bind.properties, &state, 1);
+		ArrowArray batch = BuildUpdateBatch(bind, key_vec, inputs, input_count, count);
+		ArrowArrayStream out;
+		std::memset(&out, 0, sizeof(out));
+		arrownet::AggUpdateSpill(bind.holder->session, group_states, batch, out);
+		WriteBackSpillStates(*bind.context, out, &state, 1);
+		return;
+	}
 	int64_t id = Load<int64_t>(state);
-	Vector id_vec(LogicalType::BIGINT);
-	auto data = FlatVector::GetData<int64_t>(id_vec);
 	for (idx_t i = 0; i < count; i++) {
 		data[i] = id;
 	}
-	MarshalAggUpdate(bind, id_vec, inputs, input_count, count);
+	MarshalAggUpdate(bind, key_vec, inputs, input_count, count);
 }
 
 // Merge partial states (parallel/windowed aggregation): source[i] merged into target[i].
@@ -418,6 +635,10 @@ void ArrowNetAggregateCombine(Vector &source, Vector &target, AggregateInputData
 		return;
 	}
 	auto &bind = aggr_input_data.bind_data->Cast<ArrowNetAggregateBindData>();
+	if (bind.spillable) {
+		AggCombineSpillImpl(bind, source, target, count);
+		return;
+	}
 	vector<int64_t> tgt(count), src(count);
 	ReadStateIds(target, count, tgt.data());
 	ReadStateIds(source, count, src.data());
@@ -449,6 +670,10 @@ void ArrowNetAggregateFinalize(Vector &state, AggregateInputData &aggr_input_dat
 		return;
 	}
 	auto &bind = aggr_input_data.bind_data->Cast<ArrowNetAggregateBindData>();
+	if (bind.spillable) {
+		AggFinalizeSpillImpl(bind, state, result, count, offset);
+		return;
+	}
 	vector<int64_t> ids(count);
 	ReadStateIds(state, count, ids.data());
 	ArrowArray array = BuildIdBatch(bind.properties, ids.data(), count);
@@ -485,6 +710,9 @@ void ArrowNetAggregateDestroy(Vector &state, AggregateInputData &aggr_input_data
 	}
 	try {
 		auto &bind = aggr_input_data.bind_data->Cast<ArrowNetAggregateBindData>();
+		if (bind.spillable) {
+			return; // spillable state lives inline in the blob — nothing in C# to free
+		}
 		vector<int64_t> ids(count);
 		ReadStateIds(state, count, ids.data());
 		ArrowArray array = BuildIdBatch(bind.properties, ids.data(), count);
@@ -503,9 +731,11 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateAggregateFunction(Cli
 	if (cached != aggregate_function_entries_.end()) {
 		return cached->second.get();
 	}
-	if (aggregate_functions_.find(func_name) == aggregate_functions_.end()) {
+	auto spill_it = aggregate_functions_.find(func_name);
+	if (spill_it == aggregate_functions_.end()) {
 		return nullptr;
 	}
+	bool spillable = spill_it->second;
 
 	vector<string> arg_names;
 	vector<LogicalType> arg_types;
@@ -530,6 +760,7 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateAggregateFunction(Cli
 	fn_info->func = func_name;
 	fn_info->arg_types = arg_types;
 	fn_info->arg_names = arg_names;
+	fn_info->spillable = spillable;
 	fn.function_info = std::move(fn_info);
 
 	AggregateFunctionSet set(func_name);
@@ -1180,7 +1411,7 @@ void ArrowNetSchemaEntry::Scan(ClientContext &context, CatalogType type,
 		{
 			lock_guard<mutex> lock(entry_lock_);
 			for (auto &fn : aggregate_functions_) {
-				names.push_back(fn);
+				names.push_back(fn.first);
 			}
 		}
 		for (auto &fn : names) {

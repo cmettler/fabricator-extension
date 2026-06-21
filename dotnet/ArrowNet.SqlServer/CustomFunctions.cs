@@ -36,6 +36,7 @@ internal static class CustomFunctions
     {
         new CfProductFunction(),
         new CfBitOrFunction(),
+        new CfSumSpillFunction(),
     };
 }
 
@@ -123,6 +124,67 @@ internal sealed class CfBitOrFunction : IArrowAggregateFunction
         }
 
         public object? Finalize() => _any ? _acc : null;
+    }
+}
+
+// Demo (aggregate, SPILLABLE): dbo.cf_sum_spill(x BIGINT) -> BIGINT, sum of non-NULL inputs. Identical in
+// behaviour to SUM, but opts into spillable mode (SupportsSpill + Serialize/Load): its state is serialized
+// into DuckDB's fixed state blob so a huge-cardinality GROUP BY can spill to disk. State = {any:bool, sum:long}
+// => 9 bytes, well under the 1 KB cap. Empty group / all-NULL => NULL.
+internal sealed class CfSumSpillFunction : IArrowAggregateFunction
+{
+    public string SchemaName => "dbo";
+    public string Name => "cf_sum_spill";
+    public Schema Parameters => new(new[] { new Field("x", Int64Type.Default, nullable: true) }, metadata: null);
+    public Field Result => new("sum", Int64Type.Default, nullable: true);
+    public bool SupportsSpill => true;
+    public IArrowAggregateState CreateState() => new State();
+
+    private sealed class State : IArrowAggregateState
+    {
+        private bool _any;
+        private long _sum;
+
+        public void Update(RecordBatch args)
+        {
+            var x = (Int64Array)args.Column(0);
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (x.IsNull(i))
+                {
+                    continue;
+                }
+                _sum += x.Values[i];
+                _any = true;
+            }
+        }
+
+        public void Combine(IArrowAggregateState source)
+        {
+            var s = (State)source;
+            if (s._any)
+            {
+                _sum += s._sum;
+                _any = true;
+            }
+        }
+
+        public object? Finalize() => _any ? _sum : null;
+
+        // Spillable: 1 byte flag + 8 byte little-endian sum.
+        public byte[] Serialize()
+        {
+            var buf = new byte[9];
+            buf[0] = _any ? (byte)1 : (byte)0;
+            System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(buf.AsSpan(1), _sum);
+            return buf;
+        }
+
+        public void Load(ReadOnlySpan<byte> state)
+        {
+            _any = state[0] != 0;
+            _sum = System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(state.Slice(1));
+        }
     }
 }
 

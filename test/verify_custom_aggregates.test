@@ -129,3 +129,77 @@ SELECT bool_and(cf_w = duck_w) FROM (
 );
 ----
 true
+
+# ---- Spillable aggregate (opt-in SupportsSpill): dbo.cf_sum_spill serializes its state into DuckDB's blob
+# so external GROUP BY can spill it to disk. The bytes-in-blob round-trip runs on every update/combine/finalize
+# — these cases exercise that path and cross-check the result against the built-in SUM. ----
+
+# Discovered with kind='aggregate_spill' (vs 'aggregate' for the fast in-memory ones).
+query TTT
+SELECT schema_name, name, kind FROM mssql_net_functions('adb') WHERE name = 'cf_sum_spill';
+----
+dbo	cf_sum_spill	aggregate_spill
+
+# Ungrouped (simple_update spill path): sum of 1..5 = 15.
+query I
+SELECT adb.dbo.cf_sum_spill(x) FROM range(1, 6) t(x);
+----
+15
+
+# NULL-skip and empty/all-NULL => NULL.
+query I
+SELECT adb.dbo.cf_sum_spill(x) FROM (VALUES (10::BIGINT), (NULL::BIGINT), (5::BIGINT)) t(x);
+----
+15
+
+query I
+SELECT adb.dbo.cf_sum_spill(x) FROM range(1, 6) t(x) WHERE x > 100;
+----
+NULL
+
+# GROUP BY (spill update + combine + finalize): g=1 -> 2+3=5, g=2 -> 4+5+6=15.
+query II
+SELECT g, adb.dbo.cf_sum_spill(x) AS s
+FROM (VALUES (1, 2::BIGINT), (1, 3::BIGINT), (2, 4::BIGINT), (2, 5::BIGINT), (2, 6::BIGINT)) t(g, x)
+GROUP BY g ORDER BY g;
+----
+1	5
+2	15
+
+# High-cardinality grouped + parallel (threads=4, set above): 50k rows over 1000 groups heavily exercises the
+# bytes-in-blob update/combine/finalize round-trip; cross-checked against the built-in SUM per group.
+query I
+SELECT bool_and(cf = duck) FROM (
+    SELECT g, adb.dbo.cf_sum_spill(x) AS cf, sum(x)::BIGINT AS duck
+    FROM (SELECT x % 1000 AS g, x AS x FROM range(0, 50000) t(x)) s
+    GROUP BY g
+);
+----
+true
+
+# Under a tighter memory limit the same query must still be correct (the spillable state is what DuckDB
+# spills); cross-checked against the built-in.
+statement ok
+SET memory_limit = '120MB';
+
+query I
+SELECT bool_and(cf = duck) FROM (
+    SELECT g, adb.dbo.cf_sum_spill(x) AS cf, sum(x)::BIGINT AS duck
+    FROM (SELECT x % 4000 AS g, x AS x FROM range(0, 80000) t(x)) s
+    GROUP BY g
+);
+----
+true
+
+statement ok
+RESET memory_limit;
+
+# Window (segment-tree drives the spill update/combine/finalize): running sum cross-checked against built-in.
+query I
+SELECT bool_and(cf_w = duck_w) FROM (
+    SELECT adb.dbo.cf_sum_spill(x) OVER (ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cf_w,
+           sum(x) OVER (ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS duck_w
+    FROM range(0, 50) t(x)
+);
+----
+true

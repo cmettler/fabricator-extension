@@ -134,7 +134,10 @@ void ArrowNetCatalog::LoadCatalog(ClientContext &context) {
 			ensure_schema(func.schema_name).AddInOutFunction(func.name);
 		} else if (func.kind == "aggregate") {
 			// Provider-authored custom aggregate (4h, UDAF, pure C#): an AggregateFunctionCatalogEntry.
-			ensure_schema(func.schema_name).AddAggregateFunction(func.name);
+			ensure_schema(func.schema_name).AddAggregateFunction(func.name, /*spillable=*/false);
+		} else if (func.kind == "aggregate_spill") {
+			// Spillable variant: state serialized into DuckDB's blob so external GROUP BY can spill to disk.
+			ensure_schema(func.schema_name).AddAggregateFunction(func.name, /*spillable=*/true);
 		}
 	}
 }
@@ -190,7 +193,10 @@ void ArrowNetCatalog::RefreshCache(ClientContext &context) {
 			ensure_schema(func.schema_name).AddInOutFunction(func.name);
 		} else if (func.kind == "aggregate") {
 			// Provider-authored custom aggregate (4h, UDAF, pure C#): an AggregateFunctionCatalogEntry.
-			ensure_schema(func.schema_name).AddAggregateFunction(func.name);
+			ensure_schema(func.schema_name).AddAggregateFunction(func.name, /*spillable=*/false);
+		} else if (func.kind == "aggregate_spill") {
+			// Spillable variant: state serialized into DuckDB's blob so external GROUP BY can spill to disk.
+			ensure_schema(func.schema_name).AddAggregateFunction(func.name, /*spillable=*/true);
 		}
 	}
 }

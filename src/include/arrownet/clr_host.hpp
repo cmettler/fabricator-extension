@@ -239,4 +239,18 @@ void AggDestroy(ArrowNetHandle session, ArrowArray &ids);
 // Best-effort — swallows errors (teardown must not throw).
 void AggClose(ArrowNetHandle session);
 
+// Spillable-mode aggregate steps (IArrowAggregateFunction.SupportsSpill): state travels as Arrow BLOB
+// columns (one row per group; null = fresh). All input arrays are consumed/released by the managed side.
+
+// `group_states` = BLOB[G] (current state per group), `batch` = [int64 slot ++ params]; fills `out` with
+// BLOB[G] of the new state per group (same order as group_states).
+void AggUpdateSpill(ArrowNetHandle session, ArrowArray &group_states, ArrowArray &batch, ArrowArrayStream &out);
+
+// `target_states` = BLOB[G] (distinct targets), `batch` = [int64 slot, BLOB source]; fills `out` with
+// BLOB[G] of the merged target state per target.
+void AggCombineSpill(ArrowNetHandle session, ArrowArray &target_states, ArrowArray &batch, ArrowArrayStream &out);
+
+// `states` = BLOB[N]; fills `out` with one result column of N rows.
+void AggFinalizeSpill(ArrowNetHandle session, ArrowArray &states, ArrowArrayStream &out);
+
 } // namespace arrownet

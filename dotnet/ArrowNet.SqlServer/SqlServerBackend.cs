@@ -768,8 +768,11 @@ public sealed class SqlServerCatalog : IBackendCatalog
         }
         foreach (var f in CustomAgg.Values)
         {
+            // 'aggregate' (fast in-memory id-based) vs 'aggregate_spill' (state serialized into DuckDB's blob
+            // so external GROUP BY can spill it) — the C++ side picks the callback set from this kind.
             sb.Append(" UNION ALL SELECT '").Append(Esc(f.SchemaName)).Append("', '").Append(Esc(f.Name))
-              .Append("', 'aggregate', ").Append(f.Parameters.FieldsList.Count).Append(", '")
+              .Append(f.SupportsSpill ? "', 'aggregate_spill', " : "', 'aggregate', ")
+              .Append(f.Parameters.FieldsList.Count).Append(", '")
               .Append(Esc(f.Result.DataType.Name)).Append('\'');
         }
         return sb.ToString();
@@ -1486,58 +1489,66 @@ public sealed class SqlServerCatalog : IBackendCatalog
         {
             using (idPlusArgs)
             {
-                int rows = idPlusArgs.Length;
-                if (rows == 0)
+                GroupAndApply(idPlusArgs, StateFor);
+            }
+        }
+
+        // Groups the [key ++ args] batch by column 0 and folds each group's rows into stateFor(key).Update(...).
+        // Shared by the fast Update (key = state id) and UpdateSpill (key = group slot). Does NOT dispose the
+        // batch (the caller owns it).
+        private void GroupAndApply(RecordBatch keyPlusArgs, Func<long, IArrowAggregateState> stateFor)
+        {
+            int rows = keyPlusArgs.Length;
+            if (rows == 0)
+            {
+                return;
+            }
+            var keys = (Int64Array)keyPlusArgs.Column(0);
+            var argCols = new IArrowArray[keyPlusArgs.ColumnCount - 1];
+            for (int c = 0; c < argCols.Length; c++)
+            {
+                argCols[c] = keyPlusArgs.Column(c + 1);
+            }
+
+            // Fast path: the whole chunk is one group — always true for the ungrouped simple_update path, and
+            // for GROUP BY chunks holding a single group — so the arg columns pass through with no gather. (The
+            // wrapper batch is NOT disposed: its columns are owned by keyPlusArgs.)
+            long first = keys.GetValue(0) ?? 0;
+            bool single = true;
+            for (int i = 1; i < rows; i++)
+            {
+                if ((keys.GetValue(i) ?? 0) != first)
                 {
-                    return;
+                    single = false;
+                    break;
                 }
-                var ids = (Int64Array)idPlusArgs.Column(0);
-                var argCols = new IArrowArray[idPlusArgs.ColumnCount - 1];
+            }
+            if (single)
+            {
+                stateFor(first).Update(new RecordBatch(_fn.Parameters, argCols, rows));
+                return;
+            }
+
+            // General path: group row indices by key, gather each group's arg rows, update once per group.
+            var groups = new Dictionary<long, List<int>>();
+            for (int i = 0; i < rows; i++)
+            {
+                long key = keys.GetValue(i) ?? 0;
+                if (!groups.TryGetValue(key, out var list))
+                {
+                    groups[key] = list = new List<int>();
+                }
+                list.Add(i);
+            }
+            foreach (var kv in groups)
+            {
+                var gathered = new IArrowArray[argCols.Length];
                 for (int c = 0; c < argCols.Length; c++)
                 {
-                    argCols[c] = idPlusArgs.Column(c + 1);
+                    gathered[c] = GatherRows(argCols[c], kv.Value);
                 }
-
-                // Fast path: the whole chunk is one group — always true for the ungrouped simple_update path,
-                // and for GROUP BY chunks holding a single group — so the arg columns pass through with no
-                // gather. (The wrapper batch is NOT disposed: its columns are owned by idPlusArgs.)
-                long first = ids.GetValue(0) ?? 0;
-                bool single = true;
-                for (int i = 1; i < rows; i++)
-                {
-                    if ((ids.GetValue(i) ?? 0) != first)
-                    {
-                        single = false;
-                        break;
-                    }
-                }
-                if (single)
-                {
-                    StateFor(first).Update(new RecordBatch(_fn.Parameters, argCols, rows));
-                    return;
-                }
-
-                // General path: group row indices by id, gather each group's arg rows, update once per group.
-                var groups = new Dictionary<long, List<int>>();
-                for (int i = 0; i < rows; i++)
-                {
-                    long id = ids.GetValue(i) ?? 0;
-                    if (!groups.TryGetValue(id, out var list))
-                    {
-                        groups[id] = list = new List<int>();
-                    }
-                    list.Add(i);
-                }
-                foreach (var kv in groups)
-                {
-                    var gathered = new IArrowArray[argCols.Length];
-                    for (int c = 0; c < argCols.Length; c++)
-                    {
-                        gathered[c] = GatherRows(argCols[c], kv.Value);
-                    }
-                    using var batch = new RecordBatch(_fn.Parameters, gathered, kv.Value.Count);
-                    StateFor(kv.Key).Update(batch);
-                }
+                using var batch = new RecordBatch(_fn.Parameters, gathered, kv.Value.Count);
+                stateFor(kv.Key).Update(batch);
             }
         }
 
@@ -1591,6 +1602,94 @@ public sealed class SqlServerCatalog : IBackendCatalog
         }
 
         public void Close() => _states.Clear();
+
+        // ---- Spillable mode: state lives as bytes in DuckDB's blob (not in _states); each call rehydrates a
+        // transient accumulator, applies, and re-serializes. The serialized-state column is a single BLOB. ----
+        private static readonly Schema StateSchema =
+            new(new[] { new Field("state", BinaryType.Default, nullable: true) }, null);
+
+        private IArrowAggregateState LoadOrFresh(BinaryArray states, int i)
+        {
+            var s = _fn.CreateState();
+            if (!states.IsNull(i))
+            {
+                s.Load(states.GetBytes(i));
+            }
+            return s;
+        }
+
+        private static IArrowArrayStream StateStream(IReadOnlyList<IArrowAggregateState> states)
+        {
+            var b = new BinaryArray.Builder().Reserve(states.Count);
+            foreach (var s in states)
+            {
+                b.Append((ReadOnlySpan<byte>)s.Serialize());
+            }
+            return new InMemoryArrayStream(StateSchema,
+                                           new[] { new RecordBatch(StateSchema, new IArrowArray[] { b.Build() }, states.Count) });
+        }
+
+        public IArrowArrayStream UpdateSpill(RecordBatch groupStates, RecordBatch slotPlusArgs)
+        {
+            using (groupStates)
+            using (slotPlusArgs)
+            {
+                var statesArr = (BinaryArray)groupStates.Column(0);
+                int g = groupStates.Length;
+                var states = new IArrowAggregateState[g];
+                for (int i = 0; i < g; i++)
+                {
+                    states[i] = LoadOrFresh(statesArr, i);
+                }
+                // Reuse the fast-path grouping: column 0 is the dense group slot (0..g-1) instead of a state id.
+                GroupAndApply(slotPlusArgs, slot => states[(int)slot]);
+                return StateStream(states);
+            }
+        }
+
+        public IArrowArrayStream CombineSpill(RecordBatch targetStates, RecordBatch batch)
+        {
+            using (targetStates)
+            using (batch)
+            {
+                var tArr = (BinaryArray)targetStates.Column(0);
+                int g = targetStates.Length;
+                var targets = new IArrowAggregateState[g];
+                for (int i = 0; i < g; i++)
+                {
+                    targets[i] = LoadOrFresh(tArr, i);
+                }
+                // [int64 slot, BLOB source] — merge each source into targets[slot]; a target may repeat (the
+                // window segment-tree combines several nodes into one frame state), so we accumulate in place.
+                var slots = (Int64Array)batch.Column(0);
+                var srcArr = (BinaryArray)batch.Column(1);
+                for (int i = 0; i < batch.Length; i++)
+                {
+                    if (!srcArr.IsNull(i))
+                    {
+                        targets[(int)(slots.GetValue(i) ?? 0)].Combine(LoadOrFresh(srcArr, i));
+                    }
+                }
+                return StateStream(targets);
+            }
+        }
+
+        public IArrowArrayStream FinalizeSpill(RecordBatch states)
+        {
+            var resultSchema = new Schema(new[] { _fn.Result }, null);
+            using (states)
+            {
+                var arr = (BinaryArray)states.Column(0);
+                int n = states.Length;
+                var values = new object?[n];
+                for (int i = 0; i < n; i++)
+                {
+                    values[i] = LoadOrFresh(arr, i).Finalize(); // NULL row => fresh => empty-group value
+                }
+                var col = BuildResultColumn(_fn.Result.DataType, values);
+                return new InMemoryArrayStream(resultSchema, new[] { new RecordBatch(resultSchema, new[] { col }, n) });
+            }
+        }
 
         // Gathers the given row indices from one Arrow column into a fresh array (Apache.Arrow C# has no
         // take/gather). Supports the common aggregate-argument types; an exotic type throws clearly.

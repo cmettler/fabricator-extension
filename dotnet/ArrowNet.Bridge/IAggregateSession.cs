@@ -40,4 +40,29 @@ public interface IAggregateSession
 
     /// <summary>Releases the session (the id→accumulator map). Idempotent.</summary>
     void Close();
+
+    // ---- Spillable mode (IArrowAggregateFunction.SupportsSpill) — state lives as bytes in DuckDB's blob,
+    // not in this session; each call round-trips bytes <-> a transient accumulator. ----
+
+    /// <summary>
+    /// Spillable update: <paramref name="groupStates"/> is a single BLOB column (one row per distinct group
+    /// in this chunk, its current serialized state; NULL = fresh); <paramref name="slotPlusArgs"/> is
+    /// <c>[int64 slot ++ params]</c> (slot indexes into <paramref name="groupStates"/>). Returns a single BLOB
+    /// column of the new serialized state per group, in the same order as <paramref name="groupStates"/>.
+    /// </summary>
+    IArrowArrayStream UpdateSpill(RecordBatch groupStates, RecordBatch slotPlusArgs);
+
+    /// <summary>
+    /// Spillable combine: <paramref name="targetStates"/> is a BLOB column (one row per distinct target,
+    /// NULL = fresh); <paramref name="batch"/> is <c>[int64 slot, BLOB source]</c> — each row merges its
+    /// source into <c>targetStates[slot]</c> (a target may repeat, e.g. the window segment-tree merges
+    /// several nodes into one frame state). Returns a BLOB column of the merged target state per target.
+    /// </summary>
+    IArrowArrayStream CombineSpill(RecordBatch targetStates, RecordBatch batch);
+
+    /// <summary>
+    /// Spillable finalize: <paramref name="states"/> is a single BLOB column (NULL = fresh/empty); returns one
+    /// result column, same order.
+    /// </summary>
+    IArrowArrayStream FinalizeSpill(RecordBatch states);
 }

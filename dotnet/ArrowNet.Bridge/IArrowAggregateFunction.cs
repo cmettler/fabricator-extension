@@ -36,6 +36,16 @@ public interface IArrowAggregateFunction
     /// independent (no shared mutable state across groups).
     /// </summary>
     IArrowAggregateState CreateState();
+
+    /// <summary>
+    /// Opt-in: when <c>true</c>, the aggregate runs in <em>spillable</em> mode — the per-group state is
+    /// serialized into DuckDB's fixed-size, pointer-free state blob (via <see cref="IArrowAggregateState.Serialize"/>
+    /// / <see cref="IArrowAggregateState.Load"/>) so DuckDB's out-of-core <c>GROUP BY</c> can spill it to disk.
+    /// This trades per-call (de)serialization cost for bounded memory at high group cardinality, and requires
+    /// the serialized state to fit a fixed cap (1&nbsp;KB). Leave <c>false</c> (the default) for the fast
+    /// in-memory path, which keeps a live accumulator per group and cannot spill.
+    /// </summary>
+    bool SupportsSpill => false;
 }
 
 /// <summary>
@@ -60,4 +70,17 @@ public interface IArrowAggregateState
     /// <summary>This group's single result value (boxed; <c>null</c> = SQL NULL), typed per
     /// <see cref="IArrowAggregateFunction.Result"/>.</summary>
     object? Finalize();
+
+    /// <summary>
+    /// Spillable mode only (<see cref="IArrowAggregateFunction.SupportsSpill"/>): serialize this accumulator
+    /// to a compact, self-contained byte form. Must fit the fixed cap (1&nbsp;KB) — throw or keep state small
+    /// otherwise. The default throws (non-spillable aggregates need not implement it).
+    /// </summary>
+    byte[] Serialize() => throw new NotSupportedException("this aggregate does not support spilling");
+
+    /// <summary>
+    /// Spillable mode only: reset this accumulator's state from bytes previously produced by
+    /// <see cref="Serialize"/>. The default throws.
+    /// </summary>
+    void Load(ReadOnlySpan<byte> state) => throw new NotSupportedException("this aggregate does not support spilling");
 }
