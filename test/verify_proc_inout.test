@@ -1,0 +1,101 @@
+# name: test/verify_proc_inout.test
+# description: Table-in-out (4g) over a stored procedure — `<proc>_each(<input table>)` EXECs the proc once
+#              per input row on DuckDB's pinned transaction, so the proc's writes commit/roll back with
+#              DuckDB's COMMIT/ROLLBACK (atomic in autocommit AND inside an explicit BEGIN). Output = the
+#              echoed input columns + the proc's result-set columns.
+# group: [mssql]
+
+require mssql_net
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS pdb (TYPE mssql_net);
+
+# A target table the procs write to (so we can observe commit/rollback), plus two procs:
+# usp_log inserts its arg and returns it; usp_div inserts then divides (fails for n=0).
+statement ok
+SELECT mssql_net_exec('pdb', 'DROP TABLE IF EXISTS dbo.proc_log');
+
+statement ok
+SELECT mssql_net_exec('pdb', 'CREATE TABLE dbo.proc_log (id INT)');
+
+statement ok
+SELECT mssql_net_exec('pdb', 'CREATE OR ALTER PROCEDURE dbo.usp_log(@n INT) AS BEGIN SET NOCOUNT ON; INSERT INTO dbo.proc_log(id) VALUES(@n); SELECT @n AS logged; END');
+
+statement ok
+SELECT mssql_net_exec('pdb', 'CREATE OR ALTER PROCEDURE dbo.usp_div(@n INT) AS BEGIN SET NOCOUNT ON; INSERT INTO dbo.proc_log(id) VALUES(@n); SELECT 100/@n AS q; END');
+
+statement ok
+SELECT mssql_refresh_cache('pdb');
+
+statement ok
+SELECT mssql_net_exec('pdb', 'DELETE FROM dbo.proc_log');
+
+# Per-row EXEC: output = echoed input column (n) + the proc's result column (logged).
+query II
+SELECT n, logged FROM pdb.dbo.usp_log_each((SELECT v.n FROM (VALUES(1),(2),(3)) v(n))) ORDER BY n;
+----
+1	1
+2	2
+3	3
+
+# Autocommit: the proc's writes committed at statement end (DuckDB's CommitTransaction).
+query I
+SELECT id FROM pdb.dbo.proc_log ORDER BY id;
+----
+1
+2
+3
+
+statement ok
+SELECT mssql_net_exec('pdb', 'DELETE FROM dbo.proc_log');
+
+# Row failure mid-stream (divide by zero on n=0) fails the query AND rolls back the whole statement —
+# the insert of n=5 (which ran before the n=0 row) is undone too.
+statement error
+SELECT q FROM pdb.dbo.usp_div_each((SELECT v.n FROM (VALUES(5),(0)) v(n)));
+----
+Divide by zero
+
+query I
+SELECT count(*) AS c FROM pdb.dbo.proc_log;
+----
+0
+
+# Atomic inside an explicit DuckDB transaction: the proc's writes participate in DuckDB's BEGIN/ROLLBACK.
+statement ok
+BEGIN TRANSACTION;
+
+query II
+SELECT n, logged FROM pdb.dbo.usp_log_each((SELECT v.n FROM (VALUES(7),(8)) v(n))) ORDER BY n;
+----
+7	7
+8	8
+
+# Within the transaction the writes are visible (read-your-writes on the pinned connection).
+query I
+SELECT count(*) AS c FROM pdb.dbo.proc_log;
+----
+2
+
+statement ok
+ROLLBACK;
+
+# After ROLLBACK the proc's writes are gone — atomic with DuckDB's transaction.
+query I
+SELECT count(*) AS c FROM pdb.dbo.proc_log;
+----
+0
+
+statement ok
+SELECT mssql_net_exec('pdb', 'DROP PROCEDURE IF EXISTS dbo.usp_log');
+
+statement ok
+SELECT mssql_net_exec('pdb', 'DROP PROCEDURE IF EXISTS dbo.usp_div');
+
+statement ok
+SELECT mssql_net_exec('pdb', 'DROP TABLE IF EXISTS dbo.proc_log');
+
+statement ok
+DETACH pdb;

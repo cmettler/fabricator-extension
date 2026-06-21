@@ -57,14 +57,13 @@ void ArrowNetSchemaEntry::AddTableFunction(const string &func_name, bool is_proc
 	lock_guard<mutex> lock(entry_lock_);
 	table_functions_[func_name] = is_proc;
 	table_function_entries_.erase(func_name);
-	// A discovered TVF also gets a synthetic table-in-out alias `<name>_each` that applies it once
-	// per input row via CROSS APPLY (4g). Procs are EXEC-based (not inline-CROSS-APPLY-able) — per-row
-	// procs are a later layer, so no alias for them.
-	if (!is_proc) {
-		string each = func_name + "_each";
-		inout_functions_[each] = func_name;
-		table_function_entries_.erase(each);
-	}
+	// A discovered TVF or stored proc also gets a synthetic table-in-out alias `<name>_each` that applies
+	// it once per input row (4g): a TVF via SQL-Server CROSS APPLY, a proc via per-row EXEC (the managed
+	// side picks by object kind). Both echo the input columns + the function's output columns; a proc's
+	// per-row EXECs run in DuckDB's transaction (commit/rollback driven by DuckDB).
+	string each = func_name + "_each";
+	inout_functions_[each] = func_name;
+	table_function_entries_.erase(each);
 }
 
 void ArrowNetSchemaEntry::AddInOutFunction(const string &func_name) {
