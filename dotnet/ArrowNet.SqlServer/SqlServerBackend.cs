@@ -409,7 +409,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         }
     }
 
-    private static void AddParameters(SqlCommand command, IReadOnlyList<SqlParameter>? parameters)
+    internal static void AddParameters(SqlCommand command, IReadOnlyList<SqlParameter>? parameters)
     {
         if (parameters is null)
         {
@@ -1093,8 +1093,8 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // A scalar function's parameters from INFORMATION_SCHEMA.PARAMETERS: input params
     // (ORDINAL_POSITION > 0) or, when wantReturn, the return value (ORDINAL_POSITION = 0).
     // Each carries a reconstructed SQL type; names are de-@'d (blank => positional fallback).
-    private List<(string name, string sqlType)> FunctionParameters(string schemaName, string functionName,
-                                                                   bool wantReturn)
+    internal List<(string name, string sqlType)> FunctionParameters(string schemaName, string functionName,
+                                                                    bool wantReturn)
     {
         using var connection = OpenConnection();
         connection.Open();
