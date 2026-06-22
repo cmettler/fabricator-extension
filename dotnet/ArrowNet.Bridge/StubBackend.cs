@@ -77,6 +77,9 @@ public sealed class StubBackend : IBackend
         public IInOutSession InOutOpen(string schemaName, string functionName, Schema inputSchema, string isolationLevel) =>
             throw new NotSupportedException("stub backend has no table-in-out functions");
 
+        public IArrowInOutBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema) =>
+            throw new NotSupportedException("stub backend has no table-in-out functions");
+
         public IAggregateSession AggOpen(string schemaName, string functionName) =>
             throw new NotSupportedException("stub backend has no aggregate functions");
 

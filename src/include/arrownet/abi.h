@@ -447,13 +447,49 @@ typedef struct ArrowNetVTable {
 	// column, N rows, SAME ORDER. Consumes `states`.
 	int32_t (*agg_finalize_spill)(ArrowNetHandle session, struct ArrowArray *states, struct ArrowArrayStream *out,
 	                              char **err);
+
+	// -------------------------------------------------------------------------
+	// Streaming table-in-out exchange (Phase 6, read-only). The newer in-out path for
+	// discovered TVFs (CROSS APPLY) + custom C#-authored in-out functions: instead of the
+	// push/materialize model (inout_open/push/finish/abort, now proc-only), output streams
+	// via two pull-based Arrow streams coordinated by a C++ "gate" mutex — at most one input
+	// array + one output array in flight (no per-chunk materialization). One SQL connection +
+	// transaction for the whole call (consistent snapshot); the host's injected
+	// OperatorFinalize is the single EOF signal.
+	// -------------------------------------------------------------------------
+
+	// Bind one in-out call. `args` (nullable) is a 1-row Arrow stream of the constant "cost"
+	// arguments (consumed by the managed side); `input_schema` is the Arrow schema of the input
+	// table (consumed/released). *out_schema receives a zero-row Arrow stream whose schema = the
+	// binding's FULL output columns — the input-column echo (typed as the function's parameters)
+	// ++ the function's own output columns, computed in C# from the args + input schema — read it
+	// for the DuckDB return types, then release it. *out_binding receives an opaque binding handle
+	// (reused by inout_exchange_open across prepared re-executions; freed via inout_bind_close).
+	int32_t (*inout_bind)(ArrowNetHandle handle, const char *schema, const char *func,
+	                      struct ArrowArrayStream *args, struct ArrowSchema *input_schema,
+	                      struct ArrowArrayStream *out_schema, ArrowNetHandle *out_binding, char **err);
+
+	// Open one execution exchange on a bound binding. `input` is an Arrow stream the HOST has
+	// populated (host exports; its get_next yields one input chunk per gate tenure, a released/null
+	// array at end) — the managed side IMPORTS it (takes ownership, pulls, releases). `isolation`
+	// (nullable/empty => provider default) sets the SQL transaction isolation for the call's one
+	// connection. *output receives the managed OUTPUT stream (the managed side exports into it; the
+	// host pulls it — non-empty batch = HAVE_MORE_OUTPUT, length-0 batch = NEED_MORE_INPUT,
+	// released/null array = FINISHED — and releases it). The connection opens lazily on first input
+	// pull. One binding may open at most one exchange at a time.
+	int32_t (*inout_exchange_open)(ArrowNetHandle binding, struct ArrowArrayStream *input, const char *isolation,
+	                               struct ArrowArrayStream *output, char **err);
+
+	// Release a binding handle from inout_bind. Idempotent; safe with nullptr. Best-effort
+	// (bind-data teardown must not throw).
+	int32_t (*inout_bind_close)(ArrowNetHandle binding, char **err);
 } ArrowNetVTable;
 
 // Max serialized size of a spillable aggregate's per-group state (the inline, pointer-free
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 27
+#define ARROWNET_ABI_VERSION 28
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

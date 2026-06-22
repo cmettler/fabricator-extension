@@ -139,6 +139,16 @@ public interface IBackendCatalog : IDisposable
     IInOutSession InOutOpen(string schemaName, string functionName, Schema inputSchema, string isolationLevel);
 
     /// <summary>
+    /// Binds one streaming table-in-out call (Phase 6 exchange path). <paramref name="args"/> (nullable) is a
+    /// 1-row batch of the constant "cost" arguments; <paramref name="inputSchema"/> is the input table's schema.
+    /// Returns a binding whose <see cref="IArrowInOutBinding.OutputSchema"/> is the full output (input echo ++
+    /// the function's own columns) and whose <c>DoExchange</c> streams the transform. Used by the gate-based
+    /// exchange operator (custom C# in-out + discovered TVFs); stored procedures keep the push path
+    /// (<see cref="InOutOpen"/>).
+    /// </summary>
+    IArrowInOutBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema);
+
+    /// <summary>
     /// Opens a custom-aggregate session for <c>schema.func</c> (a provider-authored
     /// <see cref="IArrowAggregateFunction"/>). The session maps DuckDB's per-group <c>int64</c> state ids
     /// to live C# accumulators; the C++ aggregate callbacks marshal ids + argument columns through it. See

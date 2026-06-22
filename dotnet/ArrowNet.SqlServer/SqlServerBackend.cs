@@ -1421,6 +1421,20 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         return new InOutSessionImpl(this, schemaName, functionName, inputSchema, isolationLevel);
     }
 
+    // Phase 6 streaming-exchange bind. Custom C# in-out functions move onto the gate-based exchange (a
+    // CustomInOutBinding adapting their per-chunk Process); discovered TVFs follow in 6.2 (SqlServerTvfEach),
+    // and stored procs stay on the push path (InOutOpen / ProcInOutSessionImpl, on DuckDB's pinned txn).
+    public IArrowInOutBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema)
+    {
+        if (CustomInOut.TryGetValue($"{schemaName}.{functionName}", out var customFactory))
+        {
+            return new CustomInOutBinding(customFactory);
+        }
+        throw new NotSupportedException(
+            $"mssql_net: streaming in-out exchange is not yet wired for '{schemaName}.{functionName}' " +
+            "(Phase 6.1 supports custom C# in-out functions; discovered TVFs land in 6.2)");
+    }
+
     // 4h custom aggregate (UDAF): open a session mapping DuckDB's per-group int64 state ids to live C#
     // accumulators (IArrowAggregateFunction). Only provider-authored aggregates exist (SQL Server has no
     // DuckDB-aggregate to discover), so this requires a registered CustomAgg entry.

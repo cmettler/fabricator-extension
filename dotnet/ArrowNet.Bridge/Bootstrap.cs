@@ -26,7 +26,7 @@ public static unsafe class Bootstrap
             return ArrowNetStatus.InvalidArgument;
         }
 
-        vtable->AbiVersion = 27;
+        vtable->AbiVersion = 28;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -69,6 +69,9 @@ public static unsafe class Bootstrap
         vtable->AggUpdateSpill = &AggUpdateSpill;
         vtable->AggCombineSpill = &AggCombineSpill;
         vtable->AggFinalizeSpill = &AggFinalizeSpill;
+        vtable->InOutBind = &InOutBind;
+        vtable->InOutExchangeOpen = &InOutExchangeOpen;
+        vtable->InOutBindClose = &InOutBindClose;
         return ArrowNetStatus.Ok;
     }
 
@@ -806,6 +809,85 @@ public static unsafe class Bootstrap
         {
             Handles.Resolve<IInOutSession>(session)?.Abort(); // idempotent
             Handles.Free(session);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int InOutBind(nint handle, byte* schema, byte* func, CArrowArrayStream* args, CArrowSchema* inputSchema,
+                                 CArrowArrayStream* outSchema, nint* outBinding, byte** err)
+    {
+        try
+        {
+            if (inputSchema is null || outSchema is null || outBinding is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            var inSchema = CArrowSchemaImporter.ImportSchema(inputSchema); // takes ownership of the C schema
+            // `args` (nullable) is a 1-row stream of the constant cost args (read synchronously below).
+            RecordBatch? argsBatch = null;
+            if (args is not null)
+            {
+                using var argStream = CArrowArrayStreamImporter.ImportArrayStream(args); // we own it
+                argsBatch = argStream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+            }
+            var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+            var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
+            var binding = catalog.InOutBind(s, f, argsBatch, inSchema);
+            // Export the binding's full output schema as a zero-row stream so the host can read return types.
+            CArrowArrayStreamExporter.ExportArrayStream(
+                new InMemoryArrayStream(binding.OutputSchema, System.Array.Empty<RecordBatch>()), outSchema);
+            *outBinding = Handles.Alloc(binding);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int InOutExchangeOpen(nint binding, CArrowArrayStream* input, byte* isolation,
+                                         CArrowArrayStream* output, byte** err)
+    {
+        try
+        {
+            if (input is null || output is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            var b = Handles.Resolve<IArrowInOutBinding>(binding);
+            if (b is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            // Take ownership of the host's input stream; the pump pulls it (one chunk per gate tenure) + releases it.
+            var inputStream = CArrowArrayStreamImporter.ImportArrayStream(input);
+            var iso = Marshal.PtrToStringUTF8((nint)isolation) ?? string.Empty;
+            CArrowArrayStreamExporter.ExportArrayStream(new InOutExchangeStream(b, inputStream, iso), output);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int InOutBindClose(nint binding, byte** err)
+    {
+        try
+        {
+            Handles.Resolve<IArrowInOutBinding>(binding)?.Dispose(); // idempotent
+            Handles.Free(binding);
             return ArrowNetStatus.Ok;
         }
         catch (Exception ex)

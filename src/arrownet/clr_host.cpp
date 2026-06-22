@@ -578,6 +578,53 @@ void InOutAbort(ArrowNetHandle session) {
 	}
 }
 
+ArrowNetHandle InOutBind(ArrowNetHandle handle, const std::string &schema, const std::string &func,
+                         ArrowArrayStream *args, ArrowSchema &input_schema, ArrowArrayStream &out_schema) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.inout_bind) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide inout_bind");
+	}
+	ArrowNetHandle binding = nullptr;
+	char *err = nullptr;
+	int32_t rc =
+	    vt.inout_bind(handle, schema.c_str(), func.c_str(), args, &input_schema, &out_schema, &binding, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: inout_bind failed");
+	}
+	return binding;
+}
+
+void InOutExchangeOpen(ArrowNetHandle binding, ArrowArrayStream &input, const std::string &isolation,
+                       ArrowArrayStream &output) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.inout_exchange_open) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide inout_exchange_open");
+	}
+	char *err = nullptr;
+	int32_t rc = vt.inout_exchange_open(binding, &input, isolation.c_str(), &output, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: inout_exchange_open failed");
+	}
+}
+
+void InOutBindClose(ArrowNetHandle binding) {
+	if (!binding) {
+		return;
+	}
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.inout_bind_close) {
+		return;
+	}
+	char *err = nullptr;
+	int32_t rc = vt.inout_bind_close(binding, &err);
+	if (rc != ARROWNET_OK) {
+		// Best-effort cleanup; swallow + free the managed error message.
+		if (err && vt.free_error) {
+			vt.free_error(err);
+		}
+	}
+}
+
 ArrowNetHandle AggOpen(ArrowNetHandle handle, const std::string &schema, const std::string &func) {
 	const ArrowNetVTable &vt = GetBridge();
 	if (!vt.agg_open) {

@@ -254,4 +254,27 @@ void AggCombineSpill(ArrowNetHandle session, ArrowArray &target_states, ArrowArr
 // `states` = BLOB[N]; fills `out` with one result column of N rows.
 void AggFinalizeSpill(ArrowNetHandle session, ArrowArray &states, ArrowArrayStream &out);
 
+// -----------------------------------------------------------------------------
+// Streaming table-in-out exchange (Phase 6, read-only). Two pull-based Arrow
+// streams + a C++ gate replace the push/materialize model for discovered TVFs +
+// custom C# in-out functions. See abi.h.
+// -----------------------------------------------------------------------------
+
+// Bind one in-out call. `args` (nullable) = a 1-row stream of the constant cost args (consumed by
+// the managed side when present); `input_schema` = the input table's Arrow schema (consumed). Fills
+// `out_schema` with a zero-row stream whose schema = the binding's full output columns. Returns an
+// opaque binding handle (reused by InOutExchangeOpen; freed via InOutBindClose).
+ArrowNetHandle InOutBind(ArrowNetHandle handle, const std::string &schema, const std::string &func,
+                         ArrowArrayStream *args, ArrowSchema &input_schema, ArrowArrayStream &out_schema);
+
+// Open one execution exchange on a bound binding. `input` = a host-populated stream the managed side
+// imports + pulls (one input chunk per gate tenure; released/null array = end). `isolation` (empty =>
+// provider default) sets the SQL transaction isolation. Fills `output` with the managed output stream
+// (the host pulls it: non-empty = HAVE_MORE_OUTPUT, length-0 = NEED_MORE_INPUT, null = FINISHED).
+void InOutExchangeOpen(ArrowNetHandle binding, ArrowArrayStream &input, const std::string &isolation,
+                       ArrowArrayStream &output);
+
+// Release a binding handle from InOutBind. Idempotent; safe with nullptr. Best-effort (swallows errors).
+void InOutBindClose(ArrowNetHandle binding);
+
 } // namespace arrownet
