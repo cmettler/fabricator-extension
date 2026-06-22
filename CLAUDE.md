@@ -390,6 +390,12 @@ A DuckDB-faithful `Bind`/`Binding` model + expressing SQL-Server functions as th
   with **no SQL object** (`sys.objects` count 0). Committed test: `test/verify_custom_functions.test`.
 
 ### Callable table-in-out (4g)
+> **Superseded by the streaming exchange (Phase 6, ABI v28) for custom C# in-out + discovered TVFs.** The
+> per-chunk **materializing** model described in this section (a C# `_ready` buffer + a C# lock, over
+> `inout_open`/`push`/`finish`/`abort`) now serves **stored procs only**. Custom in-out + discovered TVF
+> `_each` run on the gate-based **streaming** exchange — see "Streaming table-in-out exchange (Phase 6)"
+> below. These 4g notes remain the reference for the per-row CROSS APPLY semantics, the echo output schema,
+> and the proc path (all unchanged); only the output transport + the lock location changed.
 - **Surface**: a discovered TVF `db.s.tf` ALSO gets a sibling `db.s.tf_each(<input table>)` (DuckDB
   forbids a TABLE-param overload sharing the bare name — see the §91 sequencing note). `tf_each(<table>)`
   applies `tf` **once per input row** via SQL-Server **`CROSS APPLY`** (T-SQL generated + run in C#),
@@ -456,6 +462,51 @@ A DuckDB-faithful `Bind`/`Binding` model + expressing SQL-Server functions as th
   commit of a read-only TVF's snapshot transaction (NOT the proc commit — DuckDB drives that). Transparent to
   data flow (`GetColumnBindings`/`ResolveTypes` delegate to the child); the holder destructor's `inout_abort`
   stays the LIMIT/error backstop (idempotent via `_scopeClosed`).
+
+### Streaming table-in-out exchange (Phase 6, ABI v28)
+The streaming successor to the 4g push/materialize in-out model, for **custom C# in-out + discovered TVFs**
+(stored procs stay on the 4g push path — they EXEC per row on DuckDB's pinned write transaction, which the
+read-only exchange can't host). No per-chunk materialization: output streams via two pull-based Arrow streams
+coordinated by a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` (operator +
+custom), `330d2c7` (discovered TVF). Design + the 6.0 spike: the plan file's "Phase 6".
+- **Author API** (`IArrowInOutBinding`, Bridge): `Schema OutputSchema` + `IAsyncEnumerable<RecordBatch>
+  DoExchange(IAsyncEnumerable<RecordBatch> input, ct)`. `input` yields one batch per DuckDB input chunk; the
+  returned enumerable maps to the operator contract — non-empty = HAVE_MORE_OUTPUT, **length-0 = the
+  per-input sentinel (NEED_MORE_INPUT)**, end-of-enumerable = FINISHED. **The author yields the sentinel** (the
+  decision after the 6.0 spike — a free-form `DoExchange` is incompatible with the single-slot gate unless the
+  author delimits per chunk; the framework can't inject it without deadlocking). `IArrowInOutIsolation` is the
+  optional SQL-isolation hook (the framework sets it before `DoExchange`; pure-C# bindings ignore it).
+- **ABI v28** (`abi.h`): `inout_bind(handle, schema, func, args, input_schema, out_schema, out_binding)` resolves
+  the FULL output schema (input echo ++ the function's own columns) in C# + returns a binding handle (reused
+  across prepared re-executions, freed via `inout_bind_close`); `inout_exchange_open(binding, input, isolation,
+  output)` runs one execution — the host exports the INPUT stream (its get_next hands the gate-holder's one
+  chunk to C#), C# exports the OUTPUT stream the host pulls. The 4g `inout_open`/`push`/`finish`/`abort` stay
+  (proc-only).
+- **C# pump** (`InOutExchange.cs`, Bridge): `InOutExchangeStream` exposes `DoExchange` as a pull-based
+  `IArrowArrayStream` — the Arrow C-stream exporter blocks on `ReadNextRecordBatchAsync` (sync-over-async; the
+  hostfxr CLR has no `SynchronizationContext`, so `GetResult` can't deadlock — proven by the 6.0 spike).
+  `CustomInOutBinding` adapts the existing per-chunk `IArrowTableInOutFunction.Process` (yielding the
+  sentinel); `SqlServerTvfEach` (`SqlServerInOutSessions.cs`) runs the per-row CROSS APPLY inside `DoExchange`
+  on one pinned connection + transaction (the streaming successor to the deleted `InOutSessionImpl`).
+  `InOutExchange.EmptyBatch` builds the length-0 sentinel matching the output schema.
+- **C++ operator** (`arrownet_schema_entry.cpp`, anon ns): `ArrowNetExchange{Bind,InitGlobal,InitLocal,Function}`
+  + `ArrowNetExchangeGlobalState` (the gate `std::mutex`, the single input `slot`, `input_eof`, the output
+  reader, `MaxThreads()=1`) + a host-side input stream whose get_next hands the gate-holder's slot to C#.
+  `Execute` holds the gate across the chunk's HAVE_MORE_OUTPUT cycle (ownership in the per-thread local state),
+  releases it on the sentinel/EOF **or on a thrown managed error** (RAII-style — never leaks). `ArrowStreamReader`
+  gained **sentinel-aware** `Pull()`/`HasPending()`/`Drain()` (its `Read()` skips empty batches, so the sentinel
+  needs explicit length inspection + <=STANDARD_VECTOR_SIZE slicing). **EOF is the injected `OperatorFinalize`**
+  (`ArrowNetExchangeFinalizePhysical`, parallel to the 4g one): once, sink-level, after all branches it sets
+  `input_eof` + drains the output to terminal-null so the managed `DoExchange` finishes + disposes — NOT a
+  producer counter (the rejected premature-finish design). `ExchangeHolder` (refcounted on the bind data) frees
+  the binding once. Registration: custom in-out (`GetOrCreateCustomInOutFunction`) + TVF `_each`
+  (`GetOrCreateInOutFunction`, branched by the base object's kind) use the exchange callbacks; proc `_each` keeps
+  the push callbacks (so proc-vs-TVF is decided at registration — the per-open `IsStoredProcedure` round-trip is
+  gone).
+- **Verified**: `verify_custom_functions` (73 — incl. parallel UNION ALL + a `threads=1` sequential-union case,
+  the schedule a premature-finish bug would drop rows on); `verify_table_inout` (63, TVF now on the exchange);
+  `verify_inout_isolation` (17, via `IArrowInOutIsolation`); `verify_proc_inout` (31, push, unregressed). Full
+  suite 20/20.
 
 ### Callable aggregate functions (4h — custom C# UDAF)
 - **Scope**: provider-authored aggregates in C# (there are no SQL Server aggregates to discover), attach-time +
@@ -556,7 +607,9 @@ A DuckDB-faithful `Bind`/`Binding` model + expressing SQL-Server functions as th
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v27** (v27 added a nullable `args` 1-row stream to `get_function_output_schema` so a
+- **Current version: ABI v28** (v28 appended the three streaming table-in-out **exchange** entries `inout_bind`/
+  `inout_exchange_open`/`inout_bind_close` — Phase 6, see "Streaming table-in-out exchange (Phase 6)" below.
+  v27 added a nullable `args` 1-row stream to `get_function_output_schema` so a
   custom table function's output schema can depend on its constant arguments — the **table `Bind`** capability;
   see "Callable table functions (4c)". v26 appended the three spillable-aggregate entries `agg_update_spill`/
   `agg_combine_spill`/`agg_finalize_spill` + the `ARROWNET_AGG_SPILL_CAP` constant — 4h opt-in spill; v25
