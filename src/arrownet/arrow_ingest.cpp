@@ -450,4 +450,39 @@ void ArrowStreamReader::Read(DataChunk &output) {
 	output.Verify();
 }
 
+ArrowStreamReader::PullResult ArrowStreamReader::Pull() {
+	auto chunk = make_uniq<ArrowArrayWrapper>();
+	int ret = stream_.get_next(&stream_, &chunk->arrow_array);
+	if (ret != 0) {
+		const char *msg = stream_.get_last_error ? stream_.get_last_error(&stream_) : nullptr;
+		throw IOException(string("ArrowNet: failed to read exchange batch") + (msg ? string(": ") + msg : string()));
+	}
+	if (!chunk->arrow_array.release) {
+		return PullResult::END; // released/null array == FINISHED
+	}
+	if (chunk->arrow_array.length == 0) {
+		chunk->arrow_array.release(&chunk->arrow_array); // length-0 == per-input sentinel (NEED_MORE_INPUT)
+		return PullResult::SENTINEL;
+	}
+	lstate_->chunk = shared_ptr<ArrowArrayWrapper>(chunk.release());
+	lstate_->chunk_offset = 0;
+	lstate_->Reset();
+	return PullResult::DATA;
+}
+
+bool ArrowStreamReader::HasPending() const {
+	return lstate_->chunk && lstate_->chunk->arrow_array.release &&
+	       lstate_->chunk_offset < (idx_t)lstate_->chunk->arrow_array.length;
+}
+
+void ArrowStreamReader::Drain(DataChunk &output) {
+	output.Reset();
+	idx_t output_size =
+	    MinValue<idx_t>(STANDARD_VECTOR_SIZE, (idx_t)lstate_->chunk->arrow_array.length - lstate_->chunk_offset);
+	output.SetCardinality(output_size);
+	ArrowTableFunction::ArrowToDuckDB(*lstate_, arrow_table_.GetColumns(), output);
+	lstate_->chunk_offset += output_size;
+	output.Verify();
+}
+
 } // namespace arrownet

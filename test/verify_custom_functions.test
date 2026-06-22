@@ -126,5 +126,53 @@ SELECT c4 FROM cdb.dbo.cf_columns(5);
 ----
 4
 
+# --- Phase 6 streaming exchange: the gate under parallel UNION ALL input ---
+# cf_tag runs on the gate-based exchange operator. A UNION ALL input is several branch pipelines feeding
+# ONE session; the C++ gate serializes them and the single injected OperatorFinalize is the EOF signal.
+# The FULL result must come back whether the branches run in parallel (threads=4) OR sequentially
+# (threads=1 — the schedule a premature-finish bug would silently drop the later branch's rows on).
+statement ok
+SET threads=4;
+
+query II
+SELECT n, sq FROM cdb.dbo.cf_tag((
+    SELECT v.n FROM (VALUES(1),(2)) v(n)
+    UNION ALL SELECT v.n FROM (VALUES(3),(4),(5)) v(n)
+)) ORDER BY n;
+----
+1	1
+2	4
+3	9
+4	16
+5	25
+
+statement ok
+SET threads=1;
+
+query II
+SELECT n, sq FROM cdb.dbo.cf_tag((
+    SELECT v.n FROM (VALUES(1),(2)) v(n)
+    UNION ALL SELECT v.n FROM (VALUES(3),(4),(5)) v(n)
+)) ORDER BY n;
+----
+1	1
+2	4
+3	9
+4	16
+5	25
+
+# Larger parallel union (two multi-chunk range branches): aggregate the tagged output. count = 200 rows,
+# sum(sq) = sum(n*n, n=1..200) = 200*201*401/6 = 2686700 — exercises the gate across many chunks + branches.
+statement ok
+SET threads=4;
+
+query II
+SELECT count(*), sum(sq) FROM cdb.dbo.cf_tag((
+    SELECT t.n::INTEGER FROM range(1, 101) t(n)
+    UNION ALL SELECT t.n::INTEGER FROM range(101, 201) t(n)
+));
+----
+200	2686700
+
 statement ok
 DETACH cdb;

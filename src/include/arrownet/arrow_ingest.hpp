@@ -140,6 +140,22 @@ public:
 	//! sets cardinality 0 at end of stream.
 	void Read(duckdb::DataChunk &output);
 
+	// ---- sentinel-aware streaming, for the table-in-out exchange (Phase 6) ----
+	// The exchange output stream interleaves real batches with length-0 SENTINEL batches
+	// (NEED_MORE_INPUT) and ends with a released array (FINISHED). Read() can't be used here — it
+	// skips empty batches. Instead Pull() one array at a time, then Drain() it in vector-sized slices.
+	enum class PullResult { DATA, SENTINEL, END };
+
+	//! Pull the next array. DATA => a (possibly multi-vector) batch is pending; drain it with Drain()
+	//! while HasPending(). SENTINEL => a length-0 batch (released here). END => stream exhausted.
+	PullResult Pull();
+
+	//! True while the pending DATA array has rows left to drain.
+	bool HasPending() const;
+
+	//! Import the next <=STANDARD_VECTOR_SIZE slice of the pending array into `output`.
+	void Drain(duckdb::DataChunk &output);
+
 private:
 	duckdb::ClientContext &context_;
 	ArrowArrayStream stream_ {};

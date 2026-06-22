@@ -1113,6 +1113,280 @@ OperatorResultType ArrowNetInOutFunction(ExecutionContext &context, TableFunctio
 	return OperatorResultType::HAVE_MORE_OUTPUT;
 }
 
+// =============================================================================
+// Phase 6 streaming table-in-out EXCHANGE operator (read-only). Replaces the push/materialize model
+// above for custom C# in-out (and, in 6.2, discovered TVFs): two pull-based Arrow streams coordinated by
+// a C++ "gate" mutex, no per-chunk materialization. The host exports the INPUT stream (its get_next hands
+// the current gate-holder's one input chunk to C#); C# exports the OUTPUT stream, which the host pulls —
+// a non-empty batch = HAVE_MORE_OUTPUT, a length-0 batch = NEED_MORE_INPUT (the per-input sentinel C#
+// yields), a released array = FINISHED. One binding (bound once) runs one exchange per execution. EOF is
+// the injected OperatorFinalize (sets input_eof + drains), not a producer counter. See abi.h / the plan.
+// =============================================================================
+
+struct ArrowNetExchangeGlobalState;
+
+// Refcounted, on the bind data (survives prepared re-executions). Owns the bound binding handle (freed
+// once via inout_bind_close) and points at the CURRENT execution's global state for the EOF signal.
+struct ExchangeHolder {
+	mutex lock;
+	ArrowNetHandle binding = nullptr;
+	ArrowNetExchangeGlobalState *active = nullptr; // set at init_global; cleared at its dtor
+	~ExchangeHolder();
+	void Finish(ClientContext &context); // forwards to active->FinishEof (single all-input-done signal)
+};
+
+struct ArrowNetExchangeGlobalState : public GlobalTableFunctionState {
+	mutex gate;                  // serializes one input chunk's full cycle across parallel branch pipelines
+	ArrowArray slot {};          // the single input handoff (set by the gate-holder, moved out by input get_next)
+	bool slot_full = false;
+	bool input_eof = false;
+	bool finished = false;
+	duckdb::unique_ptr<arrownet::ArrowStreamReader> reader; // the C# output stream (sentinel-aware pull)
+	// Captured for the host-side input stream's get_schema/get_next callbacks.
+	vector<LogicalType> input_types;
+	vector<string> input_names;
+	ClientProperties props;
+	string input_error;
+	ExchangeHolder *holder = nullptr;
+
+	idx_t MaxThreads() const override {
+		return 1; // intra-pipeline cap; parallel UNION branches are separate pipelines (serialized by the gate)
+	}
+
+	// Single "all input consumed" action (idempotent): mark EOF and drain the output to its terminal null so
+	// the managed DoExchange exits its loop and disposes (commit / connection close). Read-only => no tail rows.
+	void FinishEof(ClientContext &context) {
+		lock_guard<mutex> guard(gate);
+		if (finished) {
+			return;
+		}
+		finished = true;
+		input_eof = true;
+		if (!reader) {
+			return;
+		}
+		DataChunk scratch;
+		scratch.Initialize(Allocator::Get(context), reader->Types());
+		while (true) {
+			auto pr = reader->Pull();
+			if (pr == arrownet::ArrowStreamReader::PullResult::END) {
+				break;
+			}
+			if (pr == arrownet::ArrowStreamReader::PullResult::DATA) {
+				while (reader->HasPending()) {
+					reader->Drain(scratch);
+				}
+			}
+		}
+	}
+
+	~ArrowNetExchangeGlobalState() override {
+		// Release the output stream first (the managed dispose tears down the exchange + the imported input
+		// stream, so input get_next won't fire again), THEN free the slot.
+		reader.reset();
+		if (slot_full && slot.release) {
+			slot.release(&slot);
+		}
+		if (holder) {
+			lock_guard<mutex> guard(holder->lock);
+			if (holder->active == this) {
+				holder->active = nullptr;
+			}
+		}
+	}
+};
+
+ExchangeHolder::~ExchangeHolder() {
+	if (binding) {
+		arrownet::InOutBindClose(binding); // best-effort; swallows errors
+		binding = nullptr;
+	}
+}
+
+void ExchangeHolder::Finish(ClientContext &context) {
+	lock_guard<mutex> guard(lock);
+	if (active) {
+		active->FinishEof(context);
+	}
+}
+
+// Bind data (reused across prepared re-executions; the holder is shared, the binding bound once).
+struct ArrowNetExchangeBindData : public TableFunctionData {
+	ArrowNetHandle handle = nullptr;
+	string schema;
+	string func;
+	string isolation;
+	vector<LogicalType> input_types;
+	vector<string> input_names;
+	shared_ptr<ExchangeHolder> holder;
+};
+
+struct ArrowNetExchangeLocalState : public LocalTableFunctionState {
+	bool owns_gate = false; // this thread holds the gate for the current input chunk's cycle
+};
+
+// Host-side INPUT stream callbacks. private_data == the global state. Only the current gate-holder sets the
+// slot, and C# pulls exactly once per tenure (after the sentinel), so a "slot empty, not EOF" pull means the
+// transform read ahead of the gate (a missing sentinel) — surfaced as a stream error, never silent.
+int ExchangeInputGetSchema(ArrowArrayStream *stream, ArrowSchema *out) {
+	auto *g = reinterpret_cast<ArrowNetExchangeGlobalState *>(stream->private_data);
+	ArrowConverter::ToArrowSchema(out, g->input_types, g->input_names, g->props);
+	return 0;
+}
+int ExchangeInputGetNext(ArrowArrayStream *stream, ArrowArray *out) {
+	auto *g = reinterpret_cast<ArrowNetExchangeGlobalState *>(stream->private_data);
+	if (g->slot_full) {
+		*out = g->slot; // move the gate-holder's chunk to C#
+		g->slot = ArrowArray {};
+		g->slot_full = false;
+		return 0;
+	}
+	if (g->input_eof) {
+		out->release = nullptr; // EOF
+		return 0;
+	}
+	g->input_error = "ArrowNet: in-out transform requested input before yielding a sentinel (single-slot gate)";
+	return 1;
+}
+const char *ExchangeInputGetLastError(ArrowArrayStream *stream) {
+	auto *g = reinterpret_cast<ArrowNetExchangeGlobalState *>(stream->private_data);
+	return g->input_error.empty() ? nullptr : g->input_error.c_str();
+}
+void ExchangeInputRelease(ArrowArrayStream *stream) {
+	stream->release = nullptr; // the global state (private_data) is not owned by the stream
+}
+
+// Bind: resolve the binding + its full output schema via inout_bind (no cost args for custom in-out yet).
+unique_ptr<FunctionData> ArrowNetExchangeBind(ClientContext &context, TableFunctionBindInput &input,
+                                              vector<LogicalType> &return_types, vector<string> &names) {
+	auto &info = input.info->Cast<ArrowNetTableFunctionInfo>();
+	auto bind_data = make_uniq<ArrowNetExchangeBindData>();
+	bind_data->handle = info.handle;
+	bind_data->schema = info.schema;
+	bind_data->func = info.func;
+	bind_data->isolation = ResolveInOutIsolation(context, info.attach_isolation);
+	bind_data->holder = make_shared_ptr<ExchangeHolder>();
+	for (idx_t i = 0; i < input.input_table_types.size(); i++) {
+		bind_data->input_types.push_back(input.input_table_types[i]);
+		bind_data->input_names.push_back(input.input_table_names[i]);
+	}
+
+	auto props = context.GetClientProperties();
+	ArrowSchema input_schema;
+	std::memset(&input_schema, 0, sizeof(input_schema));
+	ArrowConverter::ToArrowSchema(&input_schema, bind_data->input_types, bind_data->input_names, props);
+	ArrowArrayStream out_schema;
+	std::memset(&out_schema, 0, sizeof(out_schema));
+	bind_data->holder->binding =
+	    arrownet::InOutBind(info.handle, info.schema, info.func, nullptr, input_schema, out_schema);
+
+	ArrowSchemaWrapper schema_root;
+	if (out_schema.get_schema(&out_schema, &schema_root.arrow_schema) != 0) {
+		const char *msg = out_schema.get_last_error ? out_schema.get_last_error(&out_schema) : nullptr;
+		if (out_schema.release) {
+			out_schema.release(&out_schema);
+		}
+		throw IOException(string("mssql_net: failed to read in-out exchange output schema") +
+		                  (msg ? string(": ") + msg : string()));
+	}
+	if (out_schema.release) {
+		out_schema.release(&out_schema);
+	}
+	ArrowTableSchema arrow_table;
+	ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table, schema_root.arrow_schema);
+	for (int64_t i = 0; i < schema_root.arrow_schema.n_children; i++) {
+		auto &child = *schema_root.arrow_schema.children[i];
+		names.push_back(child.name ? string(child.name) : "column" + to_string(i));
+		return_types.push_back(arrow_table.GetColumns().at((idx_t)i)->GetDuckType());
+	}
+	return std::move(bind_data);
+}
+
+unique_ptr<GlobalTableFunctionState> ArrowNetExchangeInitGlobal(ClientContext &context,
+                                                               TableFunctionInitInput &input) {
+	auto &bind = input.bind_data->Cast<ArrowNetExchangeBindData>();
+	auto gstate = make_uniq<ArrowNetExchangeGlobalState>();
+	gstate->holder = bind.holder.get();
+	gstate->input_types = bind.input_types;
+	gstate->input_names = bind.input_names;
+	gstate->props = context.GetClientProperties();
+
+	ArrowArrayStream input_stream;
+	std::memset(&input_stream, 0, sizeof(input_stream));
+	input_stream.private_data = gstate.get();
+	input_stream.get_schema = ExchangeInputGetSchema;
+	input_stream.get_next = ExchangeInputGetNext;
+	input_stream.get_last_error = ExchangeInputGetLastError;
+	input_stream.release = ExchangeInputRelease;
+
+	ArrowArrayStream output_stream;
+	std::memset(&output_stream, 0, sizeof(output_stream));
+	arrownet::InOutExchangeOpen(bind.holder->binding, input_stream, bind.isolation, output_stream);
+	gstate->reader = make_uniq<arrownet::ArrowStreamReader>(context, output_stream);
+
+	lock_guard<mutex> guard(bind.holder->lock);
+	bind.holder->active = gstate.get();
+	return std::move(gstate);
+}
+
+unique_ptr<LocalTableFunctionState> ArrowNetExchangeInitLocal(ExecutionContext &, TableFunctionInitInput &,
+                                                              GlobalTableFunctionState *) {
+	return make_uniq<ArrowNetExchangeLocalState>();
+}
+
+// The gate-based operator. The gate is held across the whole chunk cycle (multiple Execute calls during
+// HAVE_MORE_OUTPUT) — ownership in the per-thread local state — and released on the sentinel/EOF or on a
+// thrown managed error (so the gate never leaks).
+OperatorResultType ArrowNetExchangeFunction(ExecutionContext &context, TableFunctionInput &data, DataChunk &input,
+                                            DataChunk &output) {
+	auto &bind = data.bind_data->Cast<ArrowNetExchangeBindData>();
+	auto &g = data.global_state->Cast<ArrowNetExchangeGlobalState>();
+	auto &l = data.local_state->Cast<ArrowNetExchangeLocalState>();
+	try {
+		if (!l.owns_gate) {
+			if (input.size() == 0) {
+				output.SetCardinality(0);
+				return OperatorResultType::NEED_MORE_INPUT;
+			}
+			g.gate.lock();
+			l.owns_gate = true;
+			// Export this input chunk into the single slot for the C# input pull.
+			auto props = context.client.GetClientProperties();
+			auto ext = ArrowTypeExtensionData::GetExtensionTypes(context.client, bind.input_types);
+			ArrowAppender appender(bind.input_types, input.size(), props, ext);
+			appender.Append(input, 0, input.size(), input.size());
+			g.slot = appender.Finalize();
+			g.slot_full = true;
+		}
+		// Drain a pending output array (one C# batch may exceed STANDARD_VECTOR_SIZE).
+		if (g.reader->HasPending()) {
+			g.reader->Drain(output);
+			return OperatorResultType::HAVE_MORE_OUTPUT;
+		}
+		auto pr = g.reader->Pull();
+		if (pr == arrownet::ArrowStreamReader::PullResult::SENTINEL) {
+			l.owns_gate = false;
+			g.gate.unlock(); // hand the gate to the next branch
+			output.SetCardinality(0);
+			return OperatorResultType::NEED_MORE_INPUT;
+		}
+		if (pr == arrownet::ArrowStreamReader::PullResult::END) {
+			l.owns_gate = false;
+			g.gate.unlock();
+			output.SetCardinality(0);
+			return OperatorResultType::FINISHED;
+		}
+		g.reader->Drain(output);
+		return OperatorResultType::HAVE_MORE_OUTPUT;
+	} catch (...) {
+		if (l.owns_gate) {
+			l.owns_gate = false;
+			g.gate.unlock(); // never leak the gate on a managed error
+		}
+		throw;
+	}
+}
+
 // -----------------------------------------------------------------------------
 // Table-in-out OperatorFinalize (4g): a reliable single "all input consumed" signal to the managed
 // session, for resource cleanup (and a clean commit of a read-only TVF's snapshot transaction — NOT the
@@ -1185,6 +1459,72 @@ struct ArrowNetInOutFinalizeOperator : public LogicalExtensionOperator {
 	}
 };
 
+// The exchange analog: forwards rows 1:1 and drives the exchange EOF (set input_eof + drain the output to
+// terminal-null so the managed DoExchange finishes + disposes) once, sink-level, after all branches.
+class ArrowNetExchangeFinalizePhysical : public PhysicalOperator {
+public:
+	ArrowNetExchangeFinalizePhysical(PhysicalPlan &physical_plan, vector<LogicalType> types,
+	                                 idx_t estimated_cardinality, shared_ptr<ExchangeHolder> holder)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality),
+	      holder(std::move(holder)) {
+	}
+
+	shared_ptr<ExchangeHolder> holder;
+
+	string GetName() const override {
+		return "ARROWNET_INOUT_EXCHANGE_FINALIZE";
+	}
+
+	OperatorResultType Execute(ExecutionContext &, DataChunk &input, DataChunk &chunk, GlobalOperatorState &,
+	                           OperatorState &) const override {
+		chunk.Reference(input);
+		return OperatorResultType::NEED_MORE_INPUT;
+	}
+
+	bool ParallelOperator() const override {
+		return true;
+	}
+
+	bool RequiresOperatorFinalize() const override {
+		return true;
+	}
+
+	OperatorFinalResultType OperatorFinalize(Pipeline &, Event &, ClientContext &context,
+	                                         OperatorFinalizeInput &) const override {
+		holder->Finish(context); // single all-input-done signal (idempotent): EOF + drain
+		return OperatorFinalResultType::FINISHED;
+	}
+};
+
+struct ArrowNetExchangeFinalizeOperator : public LogicalExtensionOperator {
+	explicit ArrowNetExchangeFinalizeOperator(unique_ptr<LogicalOperator> child, shared_ptr<ExchangeHolder> holder)
+	    : holder(std::move(holder)) {
+		children.push_back(std::move(child));
+	}
+
+	shared_ptr<ExchangeHolder> holder;
+
+	PhysicalOperator &CreatePlan(ClientContext &, PhysicalPlanGenerator &planner) override {
+		auto &child_plan = planner.CreatePlan(*children[0]);
+		auto &op = planner.Make<ArrowNetExchangeFinalizePhysical>(children[0]->types,
+		                                                          children[0]->estimated_cardinality, holder);
+		op.children.push_back(child_plan);
+		return op;
+	}
+
+	vector<ColumnBinding> GetColumnBindings() override {
+		return children[0]->GetColumnBindings();
+	}
+
+	void ResolveTypes() override {
+		types = children[0]->types;
+	}
+
+	string GetExtensionName() const override {
+		return "arrownet_inout_exchange_finalize";
+	}
+};
+
 // Recursively wrap every ArrowNet table-in-out LogicalGet in a finalize operator.
 void WrapArrowNetInOutNodes(unique_ptr<LogicalOperator> &op) {
 	for (auto &child : op->children) {
@@ -1194,16 +1534,23 @@ void WrapArrowNetInOutNodes(unique_ptr<LogicalOperator> &op) {
 		return;
 	}
 	auto &get = op->Cast<LogicalGet>();
-	// A table-in-out is a LogicalGet with input children + our in_out_function; identify it by the
-	// function pointer (no RTTI), then recover the session holder from its bind data.
-	if (get.children.empty() || get.function.in_out_function != ArrowNetInOutFunction || !get.bind_data) {
+	// A table-in-out is a LogicalGet with input children + one of our in_out_functions; identify by the
+	// function pointer (no RTTI), then recover the holder from its bind data. The push model (proc + the
+	// legacy materializing path) and the Phase 6 streaming exchange use distinct functions + holders.
+	if (get.children.empty() || !get.bind_data) {
 		return;
 	}
-	auto holder = get.bind_data->Cast<ArrowNetInOutBindData>().session_holder;
-	if (!holder) {
-		return;
+	if (get.function.in_out_function == ArrowNetInOutFunction) {
+		auto holder = get.bind_data->Cast<ArrowNetInOutBindData>().session_holder;
+		if (holder) {
+			op = make_uniq<ArrowNetInOutFinalizeOperator>(std::move(op), std::move(holder));
+		}
+	} else if (get.function.in_out_function == ArrowNetExchangeFunction) {
+		auto holder = get.bind_data->Cast<ArrowNetExchangeBindData>().holder;
+		if (holder) {
+			op = make_uniq<ArrowNetExchangeFinalizeOperator>(std::move(op), std::move(holder));
+		}
 	}
-	op = make_uniq<ArrowNetInOutFinalizeOperator>(std::move(op), std::move(holder));
 }
 
 void ArrowNetInOutOptimize(OptimizerExtensionInput &, unique_ptr<LogicalOperator> &plan) {
@@ -1341,9 +1688,11 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateInOutFunction(ClientC
 // echo). Caller holds entry_lock_.
 optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateCustomInOutFunction(ClientContext &context,
                                                                               const string &func_name) {
-	TableFunction inout(func_name, {LogicalType::TABLE}, nullptr, ArrowNetCustomInOutBind, ArrowNetInOutInitGlobal,
-	                    ArrowNetInOutInitLocal);
-	inout.in_out_function = ArrowNetInOutFunction;
+	// Phase 6: custom C# in-out runs on the streaming exchange operator (gate + two pull streams, no
+	// per-chunk materialization). Discovered-TVF `_each` + procs stay on the push model for now.
+	TableFunction inout(func_name, {LogicalType::TABLE}, nullptr, ArrowNetExchangeBind, ArrowNetExchangeInitGlobal,
+	                    ArrowNetExchangeInitLocal);
+	inout.in_out_function = ArrowNetExchangeFunction;
 	auto fn_info = make_shared_ptr<ArrowNetTableFunctionInfo>();
 	fn_info->handle = handle_;
 	fn_info->schema = name;
