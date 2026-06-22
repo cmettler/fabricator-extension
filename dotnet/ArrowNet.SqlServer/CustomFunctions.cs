@@ -5,10 +5,12 @@ using ArrowNet.Bridge;
 namespace ArrowNet.SqlServer;
 
 /// <summary>
-/// Provider-authored custom scalar functions, surfaced into every attached catalog alongside the
-/// discovered SQL Server functions (resolved as <c>db.schema.name(args)</c>). To add one, implement
-/// <see cref="ArrowScalarFunction"/> and list it here. These run entirely in C# — there need be no
-/// corresponding SQL Server object.
+/// Provider-authored custom functions — scalar, table, table-in-out, and aggregate — surfaced into every
+/// attached catalog alongside the discovered SQL Server functions (resolved as <c>db.schema.name(args)</c>).
+/// To add one, implement the matching Bridge interface (<see cref="IArrowScalarFunction"/>,
+/// <see cref="IArrowTableFunction"/>, <see cref="IArrowTableInOutFunction"/>, <see cref="IArrowInOutFunction"/>,
+/// or <see cref="IArrowAggregateFunction"/>) and list it in the corresponding array below. These run entirely
+/// in C# — there need be no corresponding SQL Server object.
 /// </summary>
 internal static class CustomFunctions
 {
@@ -23,8 +25,9 @@ internal static class CustomFunctions
         new CfColumnsFunction(),
     };
 
-    // Factories, not instances: a table-in-out may keep mutable state across its input stream (a running
-    // aggregate), so each session gets a fresh instance (see SqlServerCatalog.InOutOpen).
+    // Factories, not instances: a per-chunk table-in-out may keep mutable state across its input stream (a
+    // running aggregate), so each call gets a fresh instance. Resolved via SqlServerCatalog.InOutBind ->
+    // CustomInOutBinding on the streaming exchange (InOutOpen is proc-only since Phase 6.2).
     public static readonly IReadOnlyList<Func<IArrowTableInOutFunction>> InOut = new Func<IArrowTableInOutFunction>[]
     {
         () => new CfTagFunction(),
