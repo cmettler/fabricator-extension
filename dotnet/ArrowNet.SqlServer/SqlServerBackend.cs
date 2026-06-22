@@ -1404,21 +1404,11 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // tail), so output emission never depends on detecting the last parallel input branch.
     public IInOutSession InOutOpen(string schemaName, string functionName, Schema inputSchema, string isolationLevel)
     {
-        // A provider-authored custom in-out (4g, pure C#) shadows a same-named SQL object — run it through
-        // the operator's session contract instead of generating CROSS APPLY. A fresh instance per session
-        // (the function may be stateful across its input stream). Custom functions run in C#, so the SQL
-        // isolation level does not apply to them.
-        if (CustomInOut.TryGetValue($"{schemaName}.{functionName}", out var customFactory))
-        {
-            return new CustomInOutSessionImpl(customFactory(), inputSchema);
-        }
-        // A stored proc can't be inline-CROSS-APPLY'd, so it's EXEC'd once per input row on DuckDB's pinned
-        // transaction (commit/rollback driven by DuckDB) — see ProcInOutSessionImpl. A TVF uses CROSS APPLY.
-        if (IsStoredProcedure(schemaName, functionName))
-        {
-            return new ProcInOutSessionImpl(this, schemaName, functionName, inputSchema);
-        }
-        return new InOutSessionImpl(this, schemaName, functionName, inputSchema, isolationLevel);
+        // The push path now serves stored procs ONLY: custom C# in-out + discovered TVFs run on the streaming
+        // exchange (see InOutBind), and the C++ side routes only proc `_each` here. A proc can't be inline
+        // CROSS-APPLY'd, so it is EXEC'd once per input row on DuckDB's pinned write transaction (commit/
+        // rollback driven by DuckDB — the SQL isolation level does not apply). See ProcInOutSessionImpl.
+        return new ProcInOutSessionImpl(this, schemaName, functionName, inputSchema);
     }
 
     // Phase 6 streaming-exchange bind. Custom C# in-out functions move onto the gate-based exchange (a
@@ -1430,9 +1420,9 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         {
             return new CustomInOutBinding(customFactory);
         }
-        throw new NotSupportedException(
-            $"mssql_net: streaming in-out exchange is not yet wired for '{schemaName}.{functionName}' " +
-            "(Phase 6.1 supports custom C# in-out functions; discovered TVFs land in 6.2)");
+        // A discovered TVF `_each`: stream the CROSS APPLY (6.2). Stored procs are routed to the push path
+        // by the C++ side (they need DuckDB's pinned write transaction), so they never reach here.
+        return new SqlServerTvfEach(this, schemaName, functionName, inputSchema);
     }
 
     // 4h custom aggregate (UDAF): open a session mapping DuckDB's per-group int64 state ids to live C#
@@ -1799,20 +1789,6 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                     throw new NotSupportedException($"mssql_net: custom aggregate result type {type} is not supported");
             }
         }
-    }
-
-    // True if schema.name is a stored procedure (vs a table-valued function) — picks the in-out execution
-    // strategy (per-row EXEC vs CROSS APPLY).
-    private bool IsStoredProcedure(string schemaName, string functionName)
-    {
-        using var connection = OpenConnection();
-        connection.Open();
-        using var cmd = connection.CreateCommand();
-        cmd.CommandText = "SELECT 1 FROM sys.objects o JOIN sys.schemas s ON o.schema_id = s.schema_id " +
-                          "WHERE s.name = @s AND o.name = @f AND o.type IN ('P','PC')";
-        cmd.Parameters.AddWithValue("@s", schemaName);
-        cmd.Parameters.AddWithValue("@f", functionName);
-        return cmd.ExecuteScalar() is not null;
     }
 
     // Maps an isolation_level string (ATTACH option / SET mssql_isolation_level) to ADO.NET. Empty =>

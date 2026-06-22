@@ -3,7 +3,10 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Data;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using Apache.Arrow;
 using Apache.Arrow.Ipc;
 using ArrowNet.Bridge;
@@ -16,207 +19,90 @@ namespace ArrowNet.SqlServer;
 // (BeginInOutScope / BeginWrite / FunctionParameters / GetFunction*Schema / Quote) without widening them.
 public sealed partial class SqlServerCatalog
 {
-    // Session for a custom C#-authored table-in-out (IArrowTableInOutFunction). The C++ operator pushes
-    // input chunks; each Process runs synchronously and its output is emitted immediately (per-chunk
-    // streaming — no emit-at-end). Push runs serially (under a lock), so the function may keep mutable
-    // state across calls.
-    private sealed class CustomInOutSessionImpl : IInOutSession
-    {
-        private readonly IArrowTableInOutFunction _fn;
-        private readonly Schema _inputSchema;
-        private readonly ConcurrentQueue<RecordBatch> _ready = new();
-        private readonly object _lock = new();
-        private bool _aborted;
-
-        public CustomInOutSessionImpl(IArrowTableInOutFunction fn, Schema inputSchema)
-        {
-            _fn = fn;
-            _inputSchema = inputSchema;
-        }
-
-        public Schema InputSchema => _inputSchema;
-
-        public void Push(RecordBatch chunk)
-        {
-            using (chunk)
-            {
-                lock (_lock)
-                {
-                    if (_aborted)
-                    {
-                        return;
-                    }
-                    foreach (var b in _fn.Process(chunk)) // enumerated (materialized) before the chunk is disposed
-                    {
-                        _ready.Enqueue(b);
-                    }
-                }
-            }
-        }
-
-        public IArrowArrayStream DrainReady()
-        {
-            var list = new List<RecordBatch>();
-            while (_ready.TryDequeue(out var b))
-            {
-                list.Add(b);
-            }
-            return new InMemoryArrayStream(_fn.OutputSchema, list);
-        }
-
-        // No emit-at-end: finishing just drains anything not yet pulled (normally empty).
-        public IArrowArrayStream Finish() => DrainReady();
-
-        public void Abort()
-        {
-            lock (_lock)
-            {
-                _aborted = true;
-                while (_ready.TryDequeue(out var b))
-                {
-                    b.Dispose();
-                }
-            }
-        }
-    }
-
-    private sealed class InOutSessionImpl : IInOutSession
+    // Phase 6.2 streaming-exchange binding for a discovered TVF `_each`: applies the TVF once per input row
+    // via SQL-Server CROSS APPLY, streamed through the gate-based exchange operator (no per-chunk
+    // materialization — the streaming successor to InOutSessionImpl). Output = the echoed input columns
+    // (typed as the TVF's PARAMETERS — C# CASTs the VALUES to them) ++ the TVF's output columns. One pinned
+    // connection + transaction (the configured isolation) wraps all chunks for a consistent snapshot, opened
+    // lazily on the first chunk and committed when the input stream ends.
+    private sealed class SqlServerTvfEach : IArrowInOutBinding, IArrowInOutIsolation
     {
         private readonly SqlServerCatalog _owner;
-        private readonly string _qualified;       // [schema].[func]
-        private readonly string[] _colNames;       // input column names (VALUES aliases + CROSS APPLY args)
-        private readonly string[] _colSqlTypes;    // SQL types for the VALUES CAST (positional TVF params)
-        private readonly Schema _inputSchema;
-        private readonly Schema _outputSchema;
-        // Output is produced SYNCHRONOUSLY per input chunk (each Push runs that chunk's CROSS APPLY to
-        // completion), so there is no lagging tail to drain after all input — which is what lets the
-        // injected OperatorFinalize be a pure no-rows cleanup signal and removes any reliance on detecting
-        // the "last" parallel input branch. Parallel branches feed the one session; the lock serializes them.
-        private readonly ConcurrentQueue<RecordBatch> _ready = new();
-        private readonly object _lock = new();
-        private bool _aborted;
-        // One pinned connection + transaction for the whole in-out call, so all per-chunk CROSS APPLY queries
-        // share one consistent view (the configured isolation). Committed at finish / rolled back on abort;
-        // the connection + transaction are disposed on abort (the final teardown).
-        private readonly SqlConnection _conn;
-        private readonly SqlTransaction _txn;
-        private bool _scopeClosed;
+        private readonly string _qualified;     // [schema].[func]
+        private readonly string[] _colNames;     // input column names (VALUES aliases + CROSS APPLY args)
+        private readonly string[] _colSqlTypes;  // SQL types for the VALUES CAST (the TVF's positional params)
+        private string _isolation = "";
 
-        public Schema InputSchema => _inputSchema;
-
-        public InOutSessionImpl(SqlServerCatalog owner, string schemaName, string functionName, Schema inputSchema,
-                                string isolation)
+        public SqlServerTvfEach(SqlServerCatalog owner, string schemaName, string functionName, Schema inputSchema)
         {
             _owner = owner;
             _qualified = Quote(schemaName) + "." + Quote(functionName);
-            _inputSchema = inputSchema;
             _colNames = inputSchema.FieldsList.Select(f => f.Name).ToArray();
-            // Input columns map positionally to the TVF's parameters; CAST the VALUES columns to those
-            // SQL types so CROSS APPLY binds (and an all-NULL chunk still type-checks).
+            // Input columns map positionally to the TVF's parameters; CAST the VALUES columns to those SQL
+            // types so CROSS APPLY binds (and an all-NULL chunk still type-checks).
             var pars = owner.FunctionParameters(schemaName, functionName, wantReturn: false);
             _colSqlTypes = new string[_colNames.Length];
             for (int i = 0; i < _colNames.Length; i++)
             {
                 _colSqlTypes[i] = i < pars.Count ? pars[i].sqlType : "sql_variant";
             }
-            // Output = the echoed input columns (p.*) + the TVF's output columns (f.*). The p.* columns
-            // come back typed as the TVF PARAMETERS (the VALUES are CAST to the param types above), not
-            // as the pushed input schema — so build them from the param schema, named by the input
-            // columns, to match what SQL Server actually returns (and the C++ bind's declared types).
+            // Output = the echoed input columns (p.*) ++ the TVF's output columns (f.*). The p.* columns come
+            // back typed as the TVF PARAMETERS (the VALUES are CAST to them), named by the input columns.
             var pFields = new List<Field>(_colNames.Length);
             using (var ps = owner.GetFunctionParamSchema(schemaName, functionName))
             {
                 var paramFields = ps.Schema.FieldsList;
                 for (int i = 0; i < _colNames.Length; i++)
                 {
-                    var dataType = i < paramFields.Count ? paramFields[i].DataType : _inputSchema.FieldsList[i].DataType;
+                    var dataType = i < paramFields.Count ? paramFields[i].DataType : inputSchema.FieldsList[i].DataType;
                     pFields.Add(new Field(_colNames[i], dataType, nullable: true));
                 }
             }
             using (var os = owner.GetFunctionOutputSchema(schemaName, functionName))
             {
-                _outputSchema = new Schema(pFields.Concat(os.Schema.FieldsList), metadata: null);
-            }
-            // Open the pinned connection + transaction last: if anything above throws, no connection leaks.
-            (_conn, _txn) = owner.BeginInOutScope(isolation);
-        }
-
-        // Run this chunk's CROSS APPLY to completion and stash its full output (synchronous: no lagging
-        // tail). The lock serializes parallel input branches feeding the one session; a CROSS APPLY error
-        // throws here and propagates out through inout_push, failing the query.
-        public void Push(RecordBatch chunk)
-        {
-            using (chunk)
-            {
-                lock (_lock)
-                {
-                    if (_aborted)
-                    {
-                        return;
-                    }
-                    foreach (var b in RunCrossApply(chunk)) // enumerated before the chunk is disposed
-                    {
-                        _ready.Enqueue(b);
-                    }
-                }
+                OutputSchema = new Schema(pFields.Concat(os.Schema.FieldsList), metadata: null);
             }
         }
 
-        public IArrowArrayStream DrainReady()
+        public Schema OutputSchema { get; }
+
+        public string IsolationLevel { set => _isolation = value ?? ""; }
+
+        // Stream the CROSS APPLY per input chunk on one pinned connection + transaction (consistent snapshot),
+        // opened lazily here and committed when the input ends. The per-input sentinel is yielded per chunk.
+        public async IAsyncEnumerable<RecordBatch> DoExchange(
+            IAsyncEnumerable<RecordBatch> input, [EnumeratorCancellation] CancellationToken ct = default)
         {
-            var list = new List<RecordBatch>();
-            while (_ready.TryDequeue(out var b))
+            var (conn, txn) = _owner.BeginInOutScope(_isolation);
+            try
             {
-                list.Add(b);
+                await foreach (var chunk in input.WithCancellation(ct))
+                {
+                    using (chunk)
+                    {
+                        foreach (var outBatch in RunCrossApply(conn, txn, chunk))
+                        {
+                            yield return outBatch;
+                        }
+                    }
+                    yield return InOutExchange.EmptyBatch(OutputSchema); // per-input sentinel (NEED_MORE_INPUT)
+                }
+                txn.Commit(); // read-only: releases the snapshot view
             }
-            return new InMemoryArrayStream(_outputSchema, list);
+            finally
+            {
+                txn.Dispose();
+                conn.Dispose();
+            }
         }
 
-        // Clean finish: commit the in-out's transaction. For a read-only TVF a commit just releases the
-        // (snapshot) view; the connection + transaction are disposed on abort (the final teardown). Then
-        // drain any leftover.
-        public IArrowArrayStream Finish()
+        public void Dispose()
         {
-            lock (_lock)
-            {
-                if (!_scopeClosed)
-                {
-                    _scopeClosed = true;
-                    _txn.Commit();
-                }
-            }
-            return DrainReady();
-        }
-
-        public void Abort()
-        {
-            lock (_lock)
-            {
-                _aborted = true;
-                if (!_scopeClosed)
-                {
-                    _scopeClosed = true;
-                    try
-                    {
-                        _txn.Rollback();
-                    }
-                    catch
-                    {
-                        // best-effort: the transaction may already be doomed (e.g. a row EXEC failed)
-                    }
-                }
-                while (_ready.TryDequeue(out var b))
-                {
-                    b.Dispose();
-                }
-                _txn.Dispose();
-                _conn.Dispose();
-            }
         }
 
         // One input batch -> `SELECT p.*, f.* FROM (VALUES …) p(cols) CROSS APPLY [s].[func](p.cols) f`,
-        // sub-chunked to stay under SQL Server's ~2100-parameter cap; yields the per-query result batches.
-        private IEnumerable<RecordBatch> RunCrossApply(RecordBatch batch)
+        // sub-chunked under the ~2100-parameter cap; yields the per-query result batches.
+        private IEnumerable<RecordBatch> RunCrossApply(SqlConnection conn, SqlTransaction txn, RecordBatch batch)
         {
             int rows = batch.Length;
             int cols = _colNames.Length;
@@ -262,14 +148,13 @@ public sealed partial class SqlServerCatalog
                 }
                 sb.Append(") AS f");
 
-                // Run on the session's pinned connection + transaction (consistent view across all chunks).
-                var command = _conn.CreateCommand();
+                var command = conn.CreateCommand();
                 command.CommandText = sb.ToString();
                 command.CommandType = CommandType.Text;
-                command.Transaction = _txn;
+                command.Transaction = txn;
                 AddParameters(command, sqlParams);
                 var reader = command.ExecuteReader();
-                using var res = new DbDataReaderArrowStream(_conn, command, reader, ownsConnection: false);
+                using var res = new DbDataReaderArrowStream(conn, command, reader, ownsConnection: false);
                 while (true)
                 {
                     var b = res.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();

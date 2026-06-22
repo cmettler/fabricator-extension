@@ -174,8 +174,11 @@ public static class InOutExchange
         ArrowTypeId.String => new StringArray.Builder().Build(),
         ArrowTypeId.Binary => new BinaryArray.Builder().Build(),
         ArrowTypeId.Decimal128 => new Decimal128Array.Builder((Decimal128Type)type).Build(),
-        // Temporal types (date/time/timestamp) are added in Phase 6.2 (discovered-TVF echo) with their
-        // exact builder ctors; the custom-function path (6.1) does not produce them.
+        ArrowTypeId.Date32 => new Date32Array.Builder().Build(),
+        ArrowTypeId.Date64 => new Date64Array.Builder().Build(),
+        ArrowTypeId.Timestamp => new TimestampArray.Builder((TimestampType)type).Build(),
+        ArrowTypeId.Time32 => new Time32Array.Builder((Time32Type)type).Build(),
+        ArrowTypeId.Time64 => new Time64Array.Builder((Time64Type)type).Build(),
         _ => throw new NotSupportedException(
             $"mssql_net: in-out exchange sentinel does not support output column type {type.Name}"),
     };

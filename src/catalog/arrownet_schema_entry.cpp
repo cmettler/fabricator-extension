@@ -1660,9 +1660,17 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateInOutFunction(ClientC
 		return nullptr; // a no-arg TVF has nothing to apply per input row
 	}
 
-	TableFunction inout(each_name, {LogicalType::TABLE}, nullptr, ArrowNetInOutBind, ArrowNetInOutInitGlobal,
-	                    ArrowNetInOutInitLocal);
-	inout.in_out_function = ArrowNetInOutFunction;
+	// A discovered TVF `_each` streams on the Phase 6 exchange operator (CROSS APPLY, no materialization); a
+	// stored proc keeps the push model (it is EXEC'd per row on DuckDB's pinned write transaction, which the
+	// read-only exchange can't host). Route by the base object's kind.
+	auto base_kind = table_functions_.find(base_func);
+	bool base_is_proc = base_kind != table_functions_.end() && base_kind->second;
+	TableFunction inout =
+	    base_is_proc ? TableFunction(each_name, {LogicalType::TABLE}, nullptr, ArrowNetInOutBind,
+	                                 ArrowNetInOutInitGlobal, ArrowNetInOutInitLocal)
+	                 : TableFunction(each_name, {LogicalType::TABLE}, nullptr, ArrowNetExchangeBind,
+	                                 ArrowNetExchangeInitGlobal, ArrowNetExchangeInitLocal);
+	inout.in_out_function = base_is_proc ? ArrowNetInOutFunction : ArrowNetExchangeFunction;
 	auto fn_info = make_shared_ptr<ArrowNetTableFunctionInfo>();
 	fn_info->handle = handle_;
 	fn_info->schema = name;
