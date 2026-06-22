@@ -485,8 +485,11 @@ custom), `330d2c7` (discovered TVF). Design + the 6.0 spike: the plan file's "Ph
 - **C# pump** (`InOutExchange.cs`, Bridge): `InOutExchangeStream` exposes `DoExchange` as a pull-based
   `IArrowArrayStream` — the Arrow C-stream exporter blocks on `ReadNextRecordBatchAsync` (sync-over-async; the
   hostfxr CLR has no `SynchronizationContext`, so `GetResult` can't deadlock — proven by the 6.0 spike).
-  `CustomInOutBinding` adapts the existing per-chunk `IArrowTableInOutFunction.Process` (yielding the
-  sentinel); `SqlServerTvfEach` (`SqlServerInOutSessions.cs`) runs the per-row CROSS APPLY inside `DoExchange`
+  Two custom-author shapes both land here: the **per-chunk** `IArrowTableInOutFunction.Process` (framework
+  owns the sentinel — `CustomInOutBinding` adapts it; demos `cf_tag`/`cf_running_sum`) and the **free-form**
+  `IArrowInOutFunction.Bind(args,inputSchema) → IArrowInOutBinding` (the author writes `DoExchange` + yields
+  the sentinel itself, e.g. cross-chunk state in a local; registry `CustomInOutExchange`, demo `cf_exchange`).
+  `SqlServerTvfEach` (`SqlServerInOutSessions.cs`) runs the per-row CROSS APPLY inside `DoExchange`
   on one pinned connection + transaction (the streaming successor to the deleted `InOutSessionImpl`).
   `InOutExchange.EmptyBatch` builds the length-0 sentinel matching the output schema.
 - **C++ operator** (`arrownet_schema_entry.cpp`, anon ns): `ArrowNetExchange{Bind,InitGlobal,InitLocal,Function}`

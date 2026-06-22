@@ -34,6 +34,32 @@ public interface IArrowInOutIsolation
 }
 
 /// <summary>
+/// A provider-authored custom table-in-out function that drives the streaming exchange directly (the
+/// free-form shape): <see cref="Bind"/> returns an <see cref="IArrowInOutBinding"/> whose <c>DoExchange</c>
+/// the author writes — reading the input stream and yielding output, INCLUDING the length-0 sentinel after
+/// each input chunk. Use this when you want full control of the streaming loop / cross-chunk state in locals;
+/// for the simpler per-chunk shape (the framework owns the sentinel) implement
+/// <see cref="IArrowTableInOutFunction"/> instead. Surfaced into the catalog as <c>kind='inout'</c> and
+/// resolved by <c>IBackendCatalog.InOutBind</c>.
+/// </summary>
+public interface IArrowInOutFunction
+{
+    /// <summary>Target catalog schema (e.g. "dbo").</summary>
+    string SchemaName { get; }
+
+    /// <summary>Function name, called as <c>SELECT * FROM db.SchemaName.Name(&lt;input table&gt;)</c>.</summary>
+    string Name { get; }
+
+    /// <summary>The declared input-table columns — used for discovery metadata; the actual input schema is
+    /// passed to <see cref="Bind"/>.</summary>
+    Schema InputSchema { get; }
+
+    /// <summary>Binds one call: <paramref name="args"/> (nullable) are the constant "cost" args (1-row batch);
+    /// <paramref name="inputSchema"/> is the actual input table's schema. Returns the per-call binding.</summary>
+    IArrowInOutBinding Bind(RecordBatch? args, Schema inputSchema);
+}
+
+/// <summary>
 /// The framework "pump": exposes an <see cref="IArrowInOutBinding"/>'s <c>DoExchange</c> as a pull-based Arrow
 /// output stream for the C++ exchange operator. The host pulls this stream synchronously (the Arrow C-stream
 /// exporter blocks on <see cref="ReadNextRecordBatchAsync"/>); each pull drives <c>DoExchange</c> one step. The

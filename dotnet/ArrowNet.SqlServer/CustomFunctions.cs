@@ -31,6 +31,14 @@ internal static class CustomFunctions
         () => new CfRunningSumFunction(),
     };
 
+    // Free-form (DoExchange-style) custom in-out functions: the author drives the streaming loop and yields
+    // the per-input sentinel themselves (vs the per-chunk Process shape above; the framework owns the sentinel
+    // there). Singletons — Bind() mints the per-call binding that holds the loop state.
+    public static readonly IReadOnlyList<IArrowInOutFunction> ExchangeInOut = new IArrowInOutFunction[]
+    {
+        new CfExchangeFunction(),
+    };
+
     // Aggregate functions (UDAF). The function object is a singleton; CreateState() mints the per-group
     // accumulator. These reduce in C# (no SQL Server equivalent) and work in GROUP BY / parallel / OVER(...).
     public static readonly IReadOnlyList<IArrowAggregateFunction> Aggregate = new IArrowAggregateFunction[]
@@ -315,6 +323,66 @@ internal sealed class CfRunningSumFunction : IArrowTableInOutFunction
             rb.Append(_running);
         }
         yield return new RecordBatch(OutputSchema, new IArrowArray[] { nb.Build(), rb.Build() }, rows);
+    }
+}
+
+// Demo: dbo.cf_exchange(<table of n>) -> rows (n, rownum) where rownum is a 1-based index across the WHOLE
+// input stream. Implemented as a free-form IArrowInOutFunction — the author drives the streaming loop in
+// DoExchange (holding the running index in a LOCAL across chunks, not instance state) and yields the per-input
+// sentinel. Dogfoods the author-facing exchange API; the per-chunk Process shape (cf_tag/cf_running_sum) is the
+// simpler alternative where the framework owns the sentinel. Pure C#, no SQL object.
+internal sealed class CfExchangeFunction : IArrowInOutFunction
+{
+    public string SchemaName => "dbo";
+    public string Name => "cf_exchange";
+
+    public Schema InputSchema => new(new[] { new Field("n", Int32Type.Default, nullable: true) }, metadata: null);
+
+    public IArrowInOutBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding();
+
+    private sealed class Binding : IArrowInOutBinding
+    {
+        public Schema OutputSchema { get; } = new(new[]
+        {
+            new Field("n", Int32Type.Default, nullable: true),
+            new Field("rownum", Int64Type.Default, nullable: false),
+        }, metadata: null);
+
+        public async IAsyncEnumerable<RecordBatch> DoExchange(
+            IAsyncEnumerable<RecordBatch> input,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] System.Threading.CancellationToken ct = default)
+        {
+            long rownum = 0; // running 1-based index across the whole stream, in a LOCAL (survives chunks)
+            await foreach (var chunk in input)
+            {
+                using (chunk)
+                {
+                    var n = (Int32Array)chunk.Column(0);
+                    int rows = chunk.Length;
+                    var nb = new Int32Array.Builder().Reserve(rows);
+                    var rb = new Int64Array.Builder().Reserve(rows);
+                    for (int i = 0; i < rows; i++)
+                    {
+                        rownum++;
+                        if (n.IsNull(i))
+                        {
+                            nb.AppendNull();
+                        }
+                        else
+                        {
+                            nb.Append(n.Values[i]);
+                        }
+                        rb.Append(rownum);
+                    }
+                    yield return new RecordBatch(OutputSchema, new IArrowArray[] { nb.Build(), rb.Build() }, rows);
+                }
+                yield return InOutExchange.EmptyBatch(OutputSchema); // AUTHOR yields the per-input sentinel
+            }
+        }
+
+        public void Dispose()
+        {
+        }
     }
 }
 

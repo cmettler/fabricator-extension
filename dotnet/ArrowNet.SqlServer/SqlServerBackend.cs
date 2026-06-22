@@ -151,6 +151,12 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         CustomFunctions.InOut.ToDictionary(factory => { var p = factory(); return $"{p.SchemaName}.{p.Name}"; },
                                            factory => factory, StringComparer.OrdinalIgnoreCase);
 
+    // Free-form (DoExchange-style) custom table-in-out functions, keyed "schema.name". Also surfaced as
+    // `kind='inout'` (same C++ exchange registration); InOutBind resolves them via Bind(args, inputSchema),
+    // so the author drives the streaming loop + sentinel directly (vs the per-chunk CustomInOut above).
+    private static readonly IReadOnlyDictionary<string, IArrowInOutFunction> CustomInOutExchange =
+        CustomFunctions.ExchangeInOut.ToDictionary(f => $"{f.SchemaName}.{f.Name}", StringComparer.OrdinalIgnoreCase);
+
     // Provider-authored custom aggregate functions (UDAF), keyed "schema.name" (case-insensitive). Surfaced
     // as `kind='aggregate'` (see FunctionsMetadataSql) so the C++ catalog registers them as an
     // AggregateFunctionCatalogEntry; dispatched to C# (see AggOpen / GetFunctionParamSchema /
@@ -740,7 +746,8 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // UNION ALL so the C++ catalog discovers + registers them uniformly (then dispatches custom ones to C#).
     private static string FunctionsMetadataSql()
     {
-        if (CustomScalar.Count == 0 && CustomTable.Count == 0 && CustomInOut.Count == 0 && CustomAgg.Count == 0)
+        if (CustomScalar.Count == 0 && CustomTable.Count == 0 && CustomInOut.Count == 0 &&
+            CustomInOutExchange.Count == 0 && CustomAgg.Count == 0)
         {
             return FunctionsSql;
         }
@@ -763,6 +770,11 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         foreach (var factory in CustomInOut.Values)
         {
             var f = factory();
+            sb.Append(" UNION ALL SELECT '").Append(Esc(f.SchemaName)).Append("', '").Append(Esc(f.Name))
+              .Append("', 'inout', ").Append(f.InputSchema.FieldsList.Count).Append(", ''");
+        }
+        foreach (var f in CustomInOutExchange.Values)
+        {
             sb.Append(" UNION ALL SELECT '").Append(Esc(f.SchemaName)).Append("', '").Append(Esc(f.Name))
               .Append("', 'inout', ").Append(f.InputSchema.FieldsList.Count).Append(", ''");
         }
@@ -1416,7 +1428,14 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // and stored procs stay on the push path (InOutOpen / ProcInOutSessionImpl, on DuckDB's pinned txn).
     public IArrowInOutBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema)
     {
-        if (CustomInOut.TryGetValue($"{schemaName}.{functionName}", out var customFactory))
+        var key = $"{schemaName}.{functionName}";
+        // Free-form (DoExchange-style) custom in-out: the author's binding drives the streaming loop + sentinel.
+        if (CustomInOutExchange.TryGetValue(key, out var exchangeFn))
+        {
+            return exchangeFn.Bind(args, inputSchema);
+        }
+        // Per-chunk custom in-out: adapt the author's Process onto the exchange (framework owns the sentinel).
+        if (CustomInOut.TryGetValue(key, out var customFactory))
         {
             return new CustomInOutBinding(customFactory);
         }

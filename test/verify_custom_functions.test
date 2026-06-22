@@ -174,5 +174,37 @@ SELECT count(*), sum(sq) FROM cdb.dbo.cf_tag((
 ----
 200	2686700
 
+# --- A FREE-FORM DoExchange custom in-out (IArrowInOutFunction) ---
+# cf_exchange tags each input row with a 1-based rownum maintained in a LOCAL across the whole input stream:
+# the author drives the streaming loop in DoExchange and yields the per-input sentinel itself (vs the per-chunk
+# Process shape of cf_tag/cf_running_sum). Single-chunk input arrives in order, so rownum follows n.
+statement ok
+SET threads=1;
+
+query II
+SELECT n, rownum FROM cdb.dbo.cf_exchange((SELECT v.n FROM (VALUES(10),(20),(30)) v(n))) ORDER BY n;
+----
+10	1
+20	2
+30	3
+
+# Multi-chunk input: rownum is a GLOBAL 1-based index held in the binding's local across chunks, so
+# max(rownum) == count over the whole 4999-row stream — proving the local survives chunk boundaries.
+query II
+SELECT count(*), max(rownum) FROM cdb.dbo.cf_exchange((SELECT t.n::INTEGER FROM range(1, 5000) t(n)));
+----
+4999	4999
+
+# Discovered as kind 'inout' (same as the per-chunk custom in-out), with no backing SQL Server object.
+query TT
+SELECT name, kind FROM mssql_net_functions('cdb') WHERE name = 'cf_exchange';
+----
+cf_exchange	inout
+
+query I
+SELECT cnt FROM mssql_net_query('cdb', 'SELECT COUNT(*) AS cnt FROM sys.objects WHERE name = ''cf_exchange''');
+----
+0
+
 statement ok
 DETACH cdb;
