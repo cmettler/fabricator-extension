@@ -76,7 +76,7 @@ internal sealed class SqlServerTvfEach : IArrowInOutBinding, IArrowInOutIsolatio
             {
                 using (chunk)
                 {
-                    foreach (var outBatch in RunCrossApply(conn, txn, chunk))
+                    await foreach (var outBatch in RunCrossApply(conn, txn, chunk))
                     {
                         yield return outBatch;
                     }
@@ -98,7 +98,7 @@ internal sealed class SqlServerTvfEach : IArrowInOutBinding, IArrowInOutIsolatio
 
     // One input batch -> `SELECT p.*, f.* FROM (VALUES …) p(cols) CROSS APPLY [s].[func](p.cols) f`,
     // sub-chunked under the ~2100-parameter cap; yields the per-query result batches.
-    private IEnumerable<RecordBatch> RunCrossApply(SqlConnection conn, SqlTransaction txn, RecordBatch batch)
+    private async IAsyncEnumerable<RecordBatch> RunCrossApply(SqlConnection conn, SqlTransaction txn, RecordBatch batch)
     {
         int rows = batch.Length;
         int cols = _colNames.Length;
@@ -149,15 +149,19 @@ internal sealed class SqlServerTvfEach : IArrowInOutBinding, IArrowInOutIsolatio
             command.CommandType = CommandType.Text;
             command.Transaction = txn;
             SqlServerCatalog.AddParameters(command, sqlParams);
-            var reader = command.ExecuteReader();
+            var reader = await command.ExecuteReaderAsync();
+
             using var res = new DbDataReaderArrowStream(conn, command, reader, ownsConnection: false);
+            
             while (true)
             {
-                var b = res.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+                var b = await res.ReadNextRecordBatchAsync();
+
                 if (b is null)
                 {
                     break;
                 }
+
                 yield return b;
             }
         }
