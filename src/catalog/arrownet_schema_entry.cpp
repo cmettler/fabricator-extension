@@ -789,6 +789,18 @@ struct ArrowNetTableFunctionInfo : public TableFunctionInfo {
 	string attach_isolation; // ATTACH isolation_level default for this catalog (in-out only; empty => none)
 };
 
+// Per-plan binding handle for the session-model table functions (table_bind / table_execute / table_close).
+// Held (refcounted) on the bind data's scan factory; its destructor frees the managed binding at plan
+// teardown. The per-execution provider connection lives in table_execute's result stream (released by the
+// arrow scan at teardown), so the binding itself holds no connection — table_close is metadata cleanup.
+struct TableBindState {
+	ArrowNetHandle binding = nullptr;
+	bool supports_pushdown = false;
+	~TableBindState() {
+		arrownet::TableClose(binding);
+	}
+};
+
 // Bind a catalog-bound TVF: resolve the (fixed) output schema for the return types, then
 // install a scan factory that marshals the constant call args into a 1-row Arrow batch
 // and runs execute_table (which streams the result rows).
@@ -845,37 +857,29 @@ unique_ptr<FunctionData> ArrowNetTableFunctionBind(ClientContext &context, Table
 		return appender.Finalize();
 	};
 
-	// 1) Output schema (may depend on the constant args) -> return types/names + column converters. The args
-	//    cross as a 1-row Arrow stream; the managed side consumes it.
-	bind_data->factory = [handle, schema_name, func_name, arg_types, arg_names, properties, marshal_args](
-	                         const arrownet::ArrowScanRequest &, ArrowArrayStream &out) {
+	// 1) Bind the call (Phase 5 session model): table_bind resolves the output schema (-> return types),
+	//    whether the host should push the projection, and an opaque binding handle reused by every execution.
+	//    The managed side classifies the function (TVF / proc / custom), so the host no longer branches on
+	//    is_proc here (is_proc above is only the named-vs-positional arg marshaling). The binding is freed at
+	//    plan teardown via the refcounted TableBindState captured on the scan factory.
+	auto bind_state = make_shared_ptr<TableBindState>();
+	bind_data->factory = [handle, schema_name, func_name, arg_types, arg_names, properties, marshal_args,
+	                      bind_state](const arrownet::ArrowScanRequest &, ArrowArrayStream &out) {
 		ArrowArray array = marshal_args();
 		arrownet::ArrowProducer producer(arg_types, arg_names, properties);
 		producer.AddBatch(array);
 		producer.Finish();
-		arrownet::GetFunctionOutputSchema(handle, schema_name, func_name, producer.Stream(), out);
+		bind_state->binding = arrownet::TableBind(handle, schema_name, func_name, producer.Stream(), out,
+		                                          bind_state->supports_pushdown);
 	};
 	arrownet::PopulateReturnSchema(context, *bind_data, return_types, names);
 
-	// 2) Scan factory: constant args -> 1-row Arrow batch -> execute_table/execute_proc (streams rows).
-	// The request carries projection + best-effort filter pushdown (spec_json/filter_values).
-	bind_data->factory = [handle, schema_name, func_name, arg_types, arg_names, properties, marshal_args,
-	                      is_proc](const arrownet::ArrowScanRequest &req, ArrowArrayStream &out) {
-		ArrowArray array = marshal_args();
-		arrownet::ArrowProducer producer(arg_types, arg_names, properties);
-		producer.AddBatch(array);
-		producer.Finish();
-		if (is_proc) {
-			// Procs run via EXEC (not inline-wrappable) → no projection/filter pushdown.
-			arrownet::ExecuteProc(handle, schema_name, func_name, *producer.Stream(), out);
-		} else {
-			arrownet::ExecuteTable(handle, schema_name, func_name, *producer.Stream(), req.spec_json,
-			                       req.filter_values, out);
-		}
+	// 2) Scan factory: table_execute over the bound binding (per execution). spec_json/filter_values push
+	//    projection + filter into the SELECT when the binding supports it (a discovered TVF); else ignored.
+	bind_data->factory = [bind_state](const arrownet::ArrowScanRequest &req, ArrowArrayStream &out) {
+		arrownet::TableExecute(bind_state->binding, req.spec_json, req.filter_values, out);
 	};
-	// TVFs push the projected column list (by name) + filters to SQL Server (inline TVFs
-	// get inlined → genuine pushdown). Procs can't, so DuckDB projects/filters locally.
-	bind_data->push_projection = !is_proc;
+	bind_data->push_projection = bind_state->supports_pushdown;
 	return std::move(bind_data);
 }
 

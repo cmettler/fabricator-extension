@@ -1330,15 +1330,18 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // The binding resolves the output schema once and is reused across (prepared) re-executions.
     public IBoundTable TableBind(string schemaName, string functionName, RecordBatch? args)
     {
+        // supportsPushdown = !is_proc (preserves the prior push_projection): a custom function maps its full
+        // result by NAME (true); a discovered TVF pushes the projection into SQL (true); a stored proc is
+        // projected positionally above the scan (false).
         if (CustomTable.TryGetValue($"{schemaName}.{functionName}", out var custom))
         {
-            return new BindingBoundTable(custom.Bind(args!));
+            return new BindingBoundTable(custom.Bind(args!), supportsPushdown: true);
         }
         if (FunctionOutputColumns(schemaName, functionName).Count > 0)
         {
             return new TvfBoundTable(new SqlServerTableValuedFunction(this, schemaName, functionName), args!);
         }
-        return new BindingBoundTable(new SqlServerProcedure(this, schemaName, functionName).Bind(args!));
+        return new BindingBoundTable(new SqlServerProcedure(this, schemaName, functionName).Bind(args!), supportsPushdown: false);
     }
 
     // Executes a TVF over its constant arguments (row 0 of the args stream, in param

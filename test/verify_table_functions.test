@@ -73,6 +73,29 @@ SELECT count(*), sum(n) FROM tfdb.dbo.tf_nums(5);
 ----
 5	15
 
+# Prepared-statement re-execution (Phase 5 session model): the table_bind binding is resolved once and
+# reused — each EXECUTE runs a fresh table_execute over the same binding (its constant args are read, not
+# consumed). Proves the per-execution lifecycle (running the prepared TVF twice yields the same rows).
+statement ok
+PREPARE tf_reuse AS SELECT n FROM tfdb.dbo.tf_nums(3) ORDER BY n;
+
+query I
+EXECUTE tf_reuse;
+----
+1
+2
+3
+
+query I
+EXECUTE tf_reuse;
+----
+1
+2
+3
+
+statement ok
+DEALLOCATE tf_reuse;
+
 statement ok
 SELECT mssql_net_exec('tfdb', 'DROP FUNCTION IF EXISTS dbo.tf_nums');
 

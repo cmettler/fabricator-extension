@@ -500,10 +500,12 @@ typedef struct ArrowNetVTable {
 	// constant call arguments (consumed by the managed side). *out_schema receives a
 	// zero-row Arrow stream whose schema = the function's output columns (a custom
 	// function's MAY depend on `args`) — read it for the DuckDB return types, then
-	// release it. *supports_pushdown receives 1 if the binding accepts projection /
-	// filter pushdown (a discovered TVF), 0 otherwise (proc / custom — DuckDB projects
-	// + filters above the scan). *out_binding receives an opaque binding handle, reused
-	// by table_execute across (prepared) re-executions and freed via table_close.
+	// release it. *supports_pushdown drives the host's projection mapping: 1 = map result
+	// columns by NAME — a discovered TVF (pushes the projection + filter into the SELECT)
+	// or a custom function (returns its full result, mapped by name); 0 = a stored proc
+	// (full result, projected positionally + filtered above the scan). *out_binding
+	// receives an opaque binding handle, reused by table_execute across (prepared)
+	// re-executions and freed via table_close.
 	int32_t (*table_bind)(ArrowNetHandle handle, const char *schema, const char *func,
 	                      struct ArrowArrayStream *args, struct ArrowArrayStream *out_schema,
 	                      int32_t *supports_pushdown, ArrowNetHandle *out_binding, char **err);

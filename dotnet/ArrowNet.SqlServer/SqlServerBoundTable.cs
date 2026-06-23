@@ -11,15 +11,23 @@ namespace ArrowNet.SqlServer;
 
 // A stored proc or a custom (pure-C#) table function — wraps an IArrowTableFunctionBinding. Its batches
 // carry the FULL output schema (no SQL projection), so the result streams via AsyncEnumerableArrowStream
-// over the binding's IAsyncEnumerable and DuckDB projects (by name) + filters above the scan.
+// over the binding's IAsyncEnumerable and DuckDB projects + filters above the scan. `supportsPushdown` here
+// drives the host's push_projection (by-name column mapping), NOT SQL pushdown: it is true for a custom
+// function (the full result is mapped by NAME, as before) and false for a stored proc (full result,
+// projected positionally above the scan) — preserving the prior `push_projection = !is_proc` behavior.
 internal sealed class BindingBoundTable : IBoundTable
 {
     private readonly IArrowTableFunctionBinding _binding;
+    private readonly bool _supportsPushdown;
 
-    public BindingBoundTable(IArrowTableFunctionBinding binding) => _binding = binding;
+    public BindingBoundTable(IArrowTableFunctionBinding binding, bool supportsPushdown)
+    {
+        _binding = binding;
+        _supportsPushdown = supportsPushdown;
+    }
 
     public Schema OutputSchema => _binding.OutputSchema;
-    public bool SupportsPushdown => _binding.SupportsPushdown;
+    public bool SupportsPushdown => _supportsPushdown;
 
     public IArrowArrayStream Execute(string? specJson, IArrowArrayStream? filterValues) =>
         new AsyncEnumerableArrowStream(
