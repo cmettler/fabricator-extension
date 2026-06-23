@@ -13,9 +13,11 @@ namespace ArrowNet.SqlServer;
 /// </summary>
 internal sealed class ServerProfile
 {
-    // SERVERPROPERTY('EngineEdition') values. NOTE: confirm Fabric's value empirically — the
-    // capability flags below derive from edition + version + collation TOGETHER, never a single
-    // brittle number, so refining one rule here is enough.
+    // SERVERPROPERTY('EngineEdition') values. The capability flags below derive from edition + version
+    // + collation TOGETHER, never a single brittle number, so refining one rule here is enough.
+    // CONFIRMED live against a Fabric Warehouse: EngineEdition 11, ProductMajorVersion 12 (ProductVersion
+    // 12.0.x), collation Latin1_General_100_BIN2_UTF8 -> supports_mars/has_nvarchar/has_datetimeoffset
+    // all false, max_datetime2_scale 6, UTF-8 + binary + case-sensitive.
     public const int EditionAzureSqlDatabase = 5;
     public const int EditionSynapseDedicated = 6;            // Azure Synapse Analytics — dedicated SQL pool
     public const int EditionFabricOrSynapseServerless = 11;  // Fabric Warehouse + Lakehouse SQL endpoint / Synapse serverless

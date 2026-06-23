@@ -5,7 +5,9 @@
 > endpoint**. These differ from box SQL Server in connection capabilities (no MARS, snapshot
 > isolation) **and** in their type systems and collation. The strategy: **detect a server
 > capability profile once at ATTACH and adapt** — be collation-*adaptive and always correct*,
-> never collation-*prescriptive*. Status: **slices 1–2 implemented** — `ServerProfile` detection
+> never collation-*prescriptive*. Status: **slices 1–2 implemented + validated end-to-end against a
+> real Fabric Warehouse** (edition 11, `Latin1_General_100_BIN2_UTF8`; ATTACH + catalog discovery work,
+> the connection succeeds MARS-free) — `ServerProfile` detection
 > (`dotnet/ArrowNet.SqlServer/ServerProfile.cs`) + the `mssql_server_info(catalog)` diagnostic that
 > surfaces it; profile-driven type mapping, connection mode, and settings are the remaining slices
 > (§6). File references are repo-root-relative. Connection/transaction behavior is in
@@ -36,8 +38,8 @@ SELECT SERVERPROPERTY('EngineEdition'),
        DATABASEPROPERTYEX(DB_NAME(), 'Collation');   -- the collation new columns inherit
 ```
 
-`EngineEdition` (well-known values; **confirm Fabric's empirically — do not hardcode brittle
-assumptions**, derive capabilities from edition + version + collation together):
+`EngineEdition` (capabilities derive from edition + version + collation together, never a single
+brittle number):
 
 | Value | Engine |
 |------:|--------|
@@ -45,10 +47,13 @@ assumptions**, derive capabilities from edition + version + collation together):
 | 5 | Azure SQL Database |
 | 6 | Azure Synapse Analytics — dedicated SQL pool |
 | 8 | Azure SQL Managed Instance |
-| 11 | Azure Synapse serverless / **Fabric Warehouse + Lakehouse SQL endpoint** (verify) |
+| 11 | Azure Synapse serverless / **Fabric Warehouse + Lakehouse SQL endpoint** — CONFIRMED against a Fabric Warehouse |
 
 `ProductMajorVersion`: SQL Server 2022 = 16, **2025 = 17**; Azure SQL DB returns a rolling high
-version.
+version. A **Fabric Warehouse reports 12** (and `ProductVersion` 12.0.x, collation
+`Latin1_General_100_BIN2_UTF8`) — so `has_native_json` keys off `IsWarehouse`, not the low version
+(verified live: edition 11 → `supports_mars`/`has_nvarchar`/`has_datetimeoffset` all false,
+`max_datetime2_scale` 6, collation UTF-8 + binary + case-sensitive).
 
 The profile stores **derived capabilities**, not raw numbers, so call sites read intent:
 
