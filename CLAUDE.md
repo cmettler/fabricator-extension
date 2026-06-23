@@ -137,6 +137,25 @@ current code still uses the single-provider `mssql_net` naming):
   intended as a C# resource-cleanup hook + a clean commit of the read-only TVF's snapshot transaction
   (NOT the proc commit). **4g (table-in-out) is fully complete.**
 
+## Next up (open threads for future sessions)
+
+In-flight / planned refactors (all C#-only unless noted; tests stay green per slice):
+- **Discovered TVF/proc → `IArrowTableFunction` wrappers (in progress).** Extract the inline SQL in
+  `SqlServerCatalog` (`ExecuteTable`/`ExecuteProc`/`GetFunctionOutputSchema` TVF+proc branches + the
+  `FunctionOutputColumns`/`ProcResultColumns`/`ProcOutputParams`/`ScanFromSource` helpers) into
+  `SqlServerTableValuedFunction` / `SqlServerProcedure : IArrowTableFunction` (top-level `internal`, like
+  `SqlServerScalarFunction`/`SqlServerTvfEach`), so the catalog dispatch is uniform (resolve →
+  `IArrowTableFunction.Bind(args).Execute(scan)`) and the 2600-line catalog shrinks. Now unblocked: the
+  TVF wrapper's `Execute` can stream lazily because `IArrowTableFunction.Execute` is `IAsyncEnumerable`
+  (it wraps `ScanFromSource` / the proc EXEC stream; the catalog wraps that in `AsyncEnumerableArrowStream`).
+  Keep `execute_table`/`execute_proc` (fold internally — no ABI change). The proc EXEC logic (named params,
+  OUTPUT params + `return_value`, no-result-set error) ports verbatim into `SqlServerProcedure`. Gate:
+  `verify_table_functions` (25), `verify_stored_procs` (24).
+- **Proc `RunProcRow` → async** (`SqlServerInOutSessions.cs`, the per-row in-out proc path) — consistency
+  with the now-async `RunCrossApply`; still sync-over-async inside a sync `IEnumerable`.
+- **DAX / ADOMD 2nd provider** (the "one binary, many providers" goal) + the then-due generic rename
+  (`arrownet_query`/`_exec`, catalog-type `"arrownet"`) + `BackendRegistry` multi-provider polish.
+
 ## Implementation status (current)
 
 **Phases 1–2 complete + streaming bulk write; verified against real SQL Server on DuckDB v1.5.4.**
