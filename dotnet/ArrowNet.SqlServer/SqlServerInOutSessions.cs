@@ -105,9 +105,21 @@ public sealed partial class SqlServerCatalog
                     }
                     for (int r = 0; r < chunk.Length; r++)
                     {
-                        foreach (var b in RunProcRow(chunk, r))
+                        // RunProcRow is async (it awaits the EXEC + the Arrow reads); the push model's Push is
+                        // synchronous and holds _lock (no `await` allowed inside a lock), so drain the async
+                        // enumerator sync-over-async here — safe in the hostfxr CLR (no SynchronizationContext),
+                        // and the lock already serializes parallel input branches onto the one pinned connection.
+                        var e = RunProcRow(chunk, r).GetAsyncEnumerator();
+                        try
                         {
-                            _ready.Enqueue(b);
+                            while (e.MoveNextAsync().AsTask().GetAwaiter().GetResult())
+                            {
+                                _ready.Enqueue(e.Current);
+                            }
+                        }
+                        finally
+                        {
+                            e.DisposeAsync().AsTask().GetAwaiter().GetResult();
                         }
                     }
                 }
@@ -146,7 +158,7 @@ public sealed partial class SqlServerCatalog
             }
         }
 
-        private IEnumerable<RecordBatch> RunProcRow(RecordBatch chunk, int row)
+        private async IAsyncEnumerable<RecordBatch> RunProcRow(RecordBatch chunk, int row)
         {
             int cols = _colNames.Length;
             var sb = new StringBuilder("DECLARE @t TABLE (");
@@ -175,11 +187,11 @@ public sealed partial class SqlServerCatalog
             command.CommandType = CommandType.Text;
             command.Transaction = _txn;
             AddParameters(command, sqlParams);
-            var reader = command.ExecuteReader();
+            var reader = await command.ExecuteReaderAsync();
             using var res = new DbDataReaderArrowStream(_conn, command, reader, ownsConnection: false);
             while (true)
             {
-                var b = res.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+                var b = await res.ReadNextRecordBatchAsync();
                 if (b is null)
                 {
                     break;
