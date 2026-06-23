@@ -140,17 +140,20 @@ current code still uses the single-provider `mssql_net` naming):
 ## Next up (open threads for future sessions)
 
 In-flight / planned refactors (all C#-only unless noted; tests stay green per slice):
-- **Discovered TVF/proc → `IArrowTableFunction` wrappers (in progress).** Extract the inline SQL in
-  `SqlServerCatalog` (`ExecuteTable`/`ExecuteProc`/`GetFunctionOutputSchema` TVF+proc branches + the
-  `FunctionOutputColumns`/`ProcResultColumns`/`ProcOutputParams`/`ScanFromSource` helpers) into
-  `SqlServerTableValuedFunction` / `SqlServerProcedure : IArrowTableFunction` (top-level `internal`, like
-  `SqlServerScalarFunction`/`SqlServerTvfEach`), so the catalog dispatch is uniform (resolve →
-  `IArrowTableFunction.Bind(args).Execute(scan)`) and the 2600-line catalog shrinks. Now unblocked: the
-  TVF wrapper's `Execute` can stream lazily because `IArrowTableFunction.Execute` is `IAsyncEnumerable`
-  (it wraps `ScanFromSource` / the proc EXEC stream; the catalog wraps that in `AsyncEnumerableArrowStream`).
-  Keep `execute_table`/`execute_proc` (fold internally — no ABI change). The proc EXEC logic (named params,
-  OUTPUT params + `return_value`, no-result-set error) ports verbatim into `SqlServerProcedure`. Gate:
-  `verify_table_functions` (25), `verify_stored_procs` (24).
+- **Discovered TVF/proc wrapper extraction — DONE** (`SqlServerProcedure.cs` `6da8033`,
+  `SqlServerTableValuedFunction.cs` `eb6c34e`). The inline TVF/proc SQL moved out of `SqlServerCatalog`
+  into top-level `internal` wrappers (like `SqlServerScalarFunction`/`SqlServerTvfEach`), so
+  `ExecuteTable` + `GetFunctionOutputSchema` are now **thin custom/TVF/proc dispatchers**. **Two
+  asymmetric shapes** (a real finding, not laziness): `SqlServerProcedure : IArrowTableFunction` (proc
+  EXEC has no pushdown → full batches match the bind-time `OutputSchema`, so the `IAsyncEnumerable` +
+  `AsyncEnumerableArrowStream` shape is correct); `SqlServerTableValuedFunction` is a **bespoke** wrapper
+  (`OutputSchema` property + `ExecuteScan` returning the stream **directly**) — a pushdown source is
+  stream-native: `ScanFromSource`'s stream schema already reflects the PROJECTED columns, so it matches
+  the projected batches and must NOT be re-wrapped with the full schema (doing so crashed `arrow_ingest`
+  with SIGSEGV on `SELECT sq FROM tf_ms(4)`). Folding the pushdown TVF fully into `IArrowTableFunction`
+  needs the stream-returning **session-handle ABI** (deferred Phase 5 Part 2). `execute_table`/
+  `execute_proc` ABI unchanged (C#-only). `ProcResultColumns`/`ProcOutputParams`/`FunctionOutputColumns`/
+  `ScanFromSource` widened to `internal`.
 - **Proc `RunProcRow` → async** (`SqlServerInOutSessions.cs`, the per-row in-out proc path) — consistency
   with the now-async `RunCrossApply`; still sync-over-async inside a sync `IEnumerable`.
 - **DAX / ADOMD 2nd provider** (the "one binary, many providers" goal) + the then-due generic rename
@@ -332,11 +335,23 @@ A DuckDB-faithful `Bind`/`Binding` model + expressing SQL-Server functions as th
   for both the output-schema resolution and the scan; the in-out `_each` base lookup passes null). A
   `StaticTableFunction` base keeps fixed-schema functions trivial (`cf_range`). Demo `dbo.cf_columns(n)` returns
   `n` columns `c1..cn` — schema resolved from the arg at bind (`verify_custom_functions.test`).
+- **Discovered TVF/proc wrapper extraction — DONE** (`SqlServerProcedure.cs` `6da8033`,
+  `SqlServerTableValuedFunction.cs` `eb6c34e`): the inline TVF/proc SQL (the `ExecuteTable`/`ExecuteProc`/
+  `GetFunctionOutputSchema` branches + `FunctionOutputColumns`/`ProcResultColumns`/`ProcOutputParams`/
+  `ScanFromSource`, the last four widened to `internal`) moved into top-level `internal` wrappers, leaving
+  `ExecuteTable` + `GetFunctionOutputSchema` as **thin custom/TVF/proc dispatchers**. `SqlServerProcedure :
+  IArrowTableFunction` (proc EXEC has no pushdown → full batches match the bind-time `OutputSchema`, so the
+  `IAsyncEnumerable`/`AsyncEnumerableArrowStream` shape is correct); but `SqlServerTableValuedFunction` is a
+  **bespoke** wrapper (`OutputSchema` property + `ExecuteScan` → the `ScanFromSource` stream **returned
+  directly**) — a pushdown source is stream-native, its stream schema IS the PROJECTED schema (matching the
+  projected batches; re-wrapping it with the full schema crashed `arrow_ingest` — SIGSEGV on a column-subset
+  projection `SELECT sq FROM tf_ms(4)`). C#-only (`execute_table`/`execute_proc` unchanged). Verified: full
+  function suite green.
 - **Deferred follow-ups** (organizational; capability already delivered): the **session-handle** model
-  (`table_bind`/`output_schema`/`execute`/`close`, for a binding holding state across bind↔execute); **retiring
-  `execute_table`/`execute_proc`** (fold into the table session); the **`SqlServerTableValuedFunction` /
-  `SqlServerProcedure : IArrowTableFunction`** wrapper extraction (shrink the 2654-line `SqlServerBackend`); the
-  **in-out session-class file-move** + an `IArrowInOutFunction` registry. Full design: the plan file's "Phase 5".
+  (`table_bind`/`output_schema`/`execute`/`close`, a binding holding state across bind↔execute) — which would
+  also let the **pushdown TVF fold into `IArrowTableFunction`** (a stream-returning `table_execute`); +
+  **retiring `execute_table`/`execute_proc`** (fold into the table session). Full design: the plan file's
+  "Phase 5".
 - **Verified**: inline TVF (`tf_nums(3)`→1,2,3), multi-column (`tf_pair(7,'hi')`), multi-statement
   (`tf_ms`→squares), and aggregation over a TVF. **Pushdown proven via the plan cache**: the statement that
   reached SQL Server was `SELECT [id],[name],[salary] FROM [dbo].[tf_emp](@a0) WHERE [id] <> @p0` (column
