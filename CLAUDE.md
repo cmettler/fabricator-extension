@@ -174,6 +174,16 @@ Implemented and verified:
   (leading-column histogram). **min/max deliberately NOT reported** (DuckDB prunes filters on min/max →
   stale SQL Server stats could drop rows; NDV is costing-only so stale is safe).
 - **rowid** from PK / smallest unique index (scalar + compound STRUCT) → enables UPDATE/DELETE.
+- **Time travel** (`FROM cat.t AT (TIMESTAMP => ts)`) → SQL Server temporal tables `FOR SYSTEM_TIME AS OF`
+  (`eeae2e2`). The AT clause is a **bind-time, per-table-reference constant** (not per-scan pushdown), so it
+  flows through the binding: `ArrowNetCatalog::SupportsTimeTravel()→true` (else the binder rejects it with
+  "Catalog type does not support time travel" before the scan), `ArrowNetTableEntry::GetScanFunction(EntryLookupInfo)`
+  reads `lookup_info.GetAtClause()` {unit,value} onto `ArrowStreamBindData` (the basic + lookup overloads share
+  `BuildScanFunction`), `BuildScanSpec` folds it into the existing `spec_json` (`"at":{unit,value}` — **no new
+  ABI**), and C# `ScanFromSource` emits `FOR SYSTEM_TIME AS OF @__at` (a datetime2 param). `AT (VERSION => …)`
+  (an Iceberg/Delta snapshot-id notion) has no SQL Server equivalent → a clean "not supported" error (no silent
+  current-data result). Verified: `test/verify_time_travel.test` (14 — current/future/past + a
+  `dm_exec_query_stats` `FOR SYSTEM_TIME AS OF` proof + the VERSION error).
 - **DML**: INSERT (+ INSERT…SELECT, + RETURNING via `OUTPUT INSERTED.*`), UPDATE, DELETE (rowid-based,
   parameterized). INSERT/CTAS/COPY use a **streaming bulk path** (see below).
 - **DDL**: CREATE/DROP TABLE, CREATE/DROP SCHEMA, ALTER TABLE (rename table/column, add/drop column,
