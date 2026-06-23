@@ -837,7 +837,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // @p*). Projection / TOP / ORDER BY / filter come from the scan spec; the filter is
     // best-effort — on any failure we fall back to no WHERE (DuckDB re-applies every
     // predicate, so correctness holds).
-    private IArrowArrayStream ScanFromSource(string source, IReadOnlyList<SqlParameter> sourceParams, string? specJson,
+    internal IArrowArrayStream ScanFromSource(string source, IReadOnlyList<SqlParameter> sourceParams, string? specJson,
                                              IArrowArrayStream? filterValues)
     {
         var spec = ScanSpec.Parse(specJson);
@@ -1220,7 +1220,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // A table-valued function's output columns from INFORMATION_SCHEMA.ROUTINE_COLUMNS
     // (the result-set columns of inline + multi-statement TVFs), each with a
     // reconstructed SQL type. Empty => not a TVF (e.g. a stored procedure).
-    private List<(string name, string sqlType)> FunctionOutputColumns(string schemaName, string functionName)
+    internal List<(string name, string sqlType)> FunctionOutputColumns(string schemaName, string functionName)
     {
         using var connection = OpenConnection();
         connection.Open();
@@ -1310,26 +1310,17 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             return new InMemoryArrayStream(binding.OutputSchema, System.Array.Empty<RecordBatch>());
         }
         // Custom in-out functions resolve their output schema through InOutBind (the exchange path), not here.
-        // A TVF exposes its result columns in ROUTINE_COLUMNS; a stored proc doesn't, so the SqlServerProcedure
-        // wrapper resolves the proc's schema (OUTPUT params + return_value, else sp_describe_first_result_set).
-        var cols = FunctionOutputColumns(schemaName, functionName);
-        if (cols.Count == 0)
+        // A discovered TVF (its result columns are in ROUTINE_COLUMNS) resolves its full output schema via
+        // SqlServerTableValuedFunction; else a stored proc (OUTPUT params + return_value, else
+        // sp_describe_first_result_set) via the SqlServerProcedure wrapper.
+        if (FunctionOutputColumns(schemaName, functionName).Count > 0)
         {
-            using var procBinding = new SqlServerProcedure(this, schemaName, functionName).Bind(args!);
-            return new InMemoryArrayStream(procBinding.OutputSchema, System.Array.Empty<RecordBatch>());
+            return new InMemoryArrayStream(
+                new SqlServerTableValuedFunction(this, schemaName, functionName).OutputSchema,
+                System.Array.Empty<RecordBatch>());
         }
-        // TVF: a zero-row stream typed by the ROUTINE_COLUMNS columns.
-        var sb = new StringBuilder("SELECT ");
-        for (int i = 0; i < cols.Count; i++)
-        {
-            if (i > 0)
-            {
-                sb.Append(", ");
-            }
-            sb.Append("CAST(NULL AS ").Append(cols[i].sqlType).Append(") AS ").Append(Quote(cols[i].name));
-        }
-        sb.Append(" WHERE 1 = 0");
-        return ExecuteQuery(sb.ToString());
+        using var procBinding = new SqlServerProcedure(this, schemaName, functionName).Bind(args!);
+        return new InMemoryArrayStream(procBinding.OutputSchema, System.Array.Empty<RecordBatch>());
     }
 
     // Executes a TVF over its constant arguments (row 0 of the args stream, in param
@@ -1338,47 +1329,26 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     public IArrowArrayStream ExecuteTable(string schemaName, string functionName, IArrowArrayStream args,
                                           string? specJson, IArrowArrayStream? filterValues)
     {
-        // Provider-authored custom table function: run the C# delegate. There is no SQL to push into,
-        // so projection/filter (specJson/filterValues) are ignored here — the function returns its full
-        // result and DuckDB projects (by column name) + filters above the scan.
+        RecordBatch argBatch;
+        using (var input = args) // 1-row args stream; argBatch is read out (independent) before disposal
+        {
+            argBatch = input.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult()
+                       ?? throw new ArgumentException($"mssql_net: '{schemaName}.{functionName}' called with no arguments");
+        }
+        // Provider-authored custom (pure-C#) table function: no SQL to push into, so it ignores projection/
+        // filter — dispose the filter constants and return the full result (DuckDB projects by column name +
+        // filters above the scan).
         if (CustomTable.TryGetValue($"{schemaName}.{functionName}", out var custom))
         {
-            RecordBatch argBatch;
-            using (var input = args) // 1-row args stream; argBatch is read out (independent) before disposal
-            {
-                argBatch = input.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult()
-                           ?? throw new ArgumentException($"mssql_net: '{schemaName}.{functionName}' called with no arguments");
-            }
-            // A pure-C# function ignores pushdown (no SQL to push into) — DuckDB re-applies projection (by
-            // name) + filters above the scan; dispose the filter constants now.
             filterValues?.Dispose();
-            var binding = custom.Bind(argBatch);
-            // Stream the binding's async output lazily; the stream disposes the binding (and its args) at close.
+            var customBinding = custom.Bind(argBatch);
             return new AsyncEnumerableArrowStream(
-                binding.OutputSchema, binding.Execute(new TableFunctionScan(specJson, null)), binding);
+                customBinding.OutputSchema, customBinding.Execute(new TableFunctionScan(specJson, null)), customBinding);
         }
-
-        var qualified = Quote(schemaName) + "." + Quote(functionName);
-        var argParams = new List<SqlParameter>();
-        var argList = new StringBuilder();
-        using (var reader = new ArrowDataReader(args))
-        {
-            int paramCount = reader.FieldCount;
-            if (reader.Read())
-            {
-                for (int c = 0; c < paramCount; c++)
-                {
-                    if (c > 0)
-                    {
-                        argList.Append(", ");
-                    }
-                    var pn = $"@a{c}";
-                    argList.Append(pn);
-                    argParams.Add(new SqlParameter(pn, (reader.IsDBNull(c) ? null : reader.GetValue(c)) ?? (object)DBNull.Value));
-                }
-            }
-        }
-        return ScanFromSource($"{qualified}({argList})", argParams, specJson, filterValues);
+        // Discovered SQL Server TVF: ScanFromSource's stream already reflects the pushed projection (its
+        // schema matches the projected batches), so return it directly — never re-wrap it with a fixed schema.
+        return new SqlServerTableValuedFunction(this, schemaName, functionName)
+            .ExecuteScan(argBatch, specJson, filterValues);
     }
 
     // Executes a stored procedure over its supplied named arguments as
