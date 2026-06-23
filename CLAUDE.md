@@ -190,7 +190,12 @@ Implemented and verified:
 - **DDL**: CREATE/DROP TABLE, CREATE/DROP SCHEMA, ALTER TABLE (rename table/column, add/drop column,
   change type, SET/DROP NOT NULL, SET/DROP literal DEFAULT); PRIMARY KEY/UNIQUE/literal DEFAULT on CREATE.
 - **Transactions**: BEGIN/COMMIT/ROLLBACK with a pinned connection (lazy on first write); reads inside
-  the txn use it too (read-your-writes); MARS forced so a scan reader + DML coexist.
+  the txn use it too (read-your-writes); MARS forced so a scan reader + DML coexist. **Full design:
+  [docs/transactions.md](docs/transactions.md)** (autocommit = implicit per-statement txn; the three
+  lazy levels — DuckDB `BeginTransaction` always / extension `StartTransaction` on catalog touch / C#
+  connection-pin on first write; MetaTransaction fan-out + one-writer rule; why MARS, and the exchange's
+  deliberately MARS-free serialized connection; the `INSERT…SELECT` pin-timing race; per-row proc `_each`
+  on DuckDB's pinned txn).
 - **Functions**: `mssql_net_query` (raw scan), `mssql_net_exec` (raw exec) — both accept a connstr, a
   secret name, OR an attached-catalog name; `mssql_refresh_cache`/`mssql_invalidate_cache` (+ `_net_`
   aliases, arities 1/2/3); `mssql_version()`; `arrownet_managed_dir()` / `arrownet_test_scan()` (diag).
