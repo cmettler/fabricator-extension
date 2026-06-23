@@ -244,11 +244,11 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
 - The legacy `bulk_insert` ABI entry + its `clr_host` wrapper are now unused by C++ (left in place).
 - **ABI v17–v19** entries: `open_catalog(provider, conn, …)` (v17); `build_connection_string(provider,
   fields_json, …)` (v18); and the **scalar-function trio** (v19): `get_function_param_schema(handle,
-  schema, func, out)` + `get_function_return_schema(…)` (each a zero-row Arrow stream whose schema gives
-  the arg/return `LogicalType`s, via `PopulateReturnSchema`) + `execute_scalar(handle, schema, func, args,
-  out)` (runs the UDF over an N-row arg batch; the managed side consumes `args`).
+  schema, func, out)` + `get_function_return_schema(…)` (each fills a bare `ArrowSchema *out` giving the
+  arg/return `LogicalType`s, read via `ReadArrowSchema` — was a zero-row stream until **v32**) +
+  `execute_scalar(handle, schema, func, args, out)` (runs the UDF over an N-row arg batch; consumes `args`).
 - **ABI v20/v21** entries (table functions): `get_function_output_schema(handle, schema, func, out)`
-  (zero-row Arrow stream = the TVF's output columns) + `execute_table(handle, schema, func, args, spec_json,
+  (a bare `ArrowSchema` = the TVF's output columns, **v32**) + `execute_table(handle, schema, func, args, spec_json,
   filter_values, out)` (`args` = 1-row batch of the constant call args; `spec_json`+`filter_values` carry
   projection + best-effort filter pushdown exactly like `scan_table`; `out` = the result rows). The
   `spec_json`/`filter_values` params were added at **v21**.
@@ -694,7 +694,11 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v31** (v31 **removed** the dead 4g push entries `inout_open`/`inout_push`/
+- **Current version: ABI v32** (v32 changed `get_function_param_schema`/`get_function_return_schema`/
+  `get_function_output_schema` to fill a bare `ArrowSchema *out` instead of an `ArrowArrayStream *out` — they
+  are schema-only, so the zero-row-stream-carrying-a-schema is gone; C# returns `Schema`, C++ reads it via
+  the new `ReadArrowSchema` (sharing a `ReadSchemaColumns` core with `PopulateReturnSchema`). A signature
+  change, not a slot change → no offset shift. v31 **removed** the dead 4g push entries `inout_open`/`inout_push`/
   `inout_finish`/`inout_abort` — every `_each` form runs on the streaming exchange since `9056eae`; the
   C++ push operator + `IInOutSession`/`InOutOpen` went with them. **Mid-struct** removal (they sat before the
   agg/exchange/table entries), so `abi.h` + `Abi.cs` field order stays in exact sync — the function/agg/in-out
