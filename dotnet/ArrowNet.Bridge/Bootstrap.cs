@@ -26,7 +26,7 @@ public static unsafe class Bootstrap
             return ArrowNetStatus.InvalidArgument;
         }
 
-        vtable->AbiVersion = 31;
+        vtable->AbiVersion = 32;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -573,19 +573,19 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int GetFunctionParamSchema(nint handle, byte* schema, byte* func, CArrowArrayStream* outStream,
+    private static int GetFunctionParamSchema(nint handle, byte* schema, byte* func, CArrowSchema* outSchema,
                                               byte** err)
     {
         try
         {
-            if (outStream is null)
+            if (outSchema is null)
             {
                 return ArrowNetStatus.InvalidArgument;
             }
             var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty);
             var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
-            CArrowArrayStreamExporter.ExportArrayStream(catalog.GetFunctionParamSchema(s, f), outStream);
+            CArrowSchemaExporter.ExportSchema(catalog.GetFunctionParamSchema(s, f), outSchema);
             return ArrowNetStatus.Ok;
         }
         catch (Exception ex)
@@ -596,19 +596,19 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int GetFunctionReturnSchema(nint handle, byte* schema, byte* func, CArrowArrayStream* outStream,
+    private static int GetFunctionReturnSchema(nint handle, byte* schema, byte* func, CArrowSchema* outSchema,
                                                byte** err)
     {
         try
         {
-            if (outStream is null)
+            if (outSchema is null)
             {
                 return ArrowNetStatus.InvalidArgument;
             }
             var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty);
             var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
-            CArrowArrayStreamExporter.ExportArrayStream(catalog.GetFunctionReturnSchema(s, f), outStream);
+            CArrowSchemaExporter.ExportSchema(catalog.GetFunctionReturnSchema(s, f), outSchema);
             return ArrowNetStatus.Ok;
         }
         catch (Exception ex)
@@ -644,11 +644,11 @@ public static unsafe class Bootstrap
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static int GetFunctionOutputSchema(nint handle, byte* schema, byte* func, CArrowArrayStream* args,
-                                               CArrowArrayStream* outStream, byte** err)
+                                               CArrowSchema* outSchema, byte** err)
     {
         try
         {
-            if (outStream is null)
+            if (outSchema is null)
             {
                 return ArrowNetStatus.InvalidArgument;
             }
@@ -663,7 +663,7 @@ public static unsafe class Bootstrap
                 using var argStream = CArrowArrayStreamImporter.ImportArrayStream(args); // we own it
                 argsBatch = argStream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
             }
-            CArrowArrayStreamExporter.ExportArrayStream(catalog.GetFunctionOutputSchema(s, f, argsBatch), outStream);
+            CArrowSchemaExporter.ExportSchema(catalog.GetFunctionOutputSchema(s, f, argsBatch), outSchema);
             return ArrowNetStatus.Ok;
         }
         catch (Exception ex)

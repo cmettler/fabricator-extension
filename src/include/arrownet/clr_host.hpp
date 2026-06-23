@@ -155,14 +155,15 @@ int64_t CompleteBulk(ArrowNetHandle session, bool abort);
 // catalog scalar functions; these resolve their arg/return types and run them.
 // -----------------------------------------------------------------------------
 
-// Zero-row Arrow stream whose schema = the function's input parameters (one field
-// per param, in order). Used to register the DuckDB function's argument types.
+// Fills `out` with the Arrow schema of the function's input parameters (one field per param, in order),
+// used to register the DuckDB function's argument types. A bare ArrowSchema (the caller reads it then
+// releases it via ArrowSchemaWrapper).
 void GetFunctionParamSchema(ArrowNetHandle handle, const std::string &schema, const std::string &func,
-                            ArrowArrayStream &out);
+                            ArrowSchema &out);
 
-// Zero-row Arrow stream whose single field = the scalar function's return type.
+// Fills `out` with the Arrow schema whose single field = the scalar function's return type.
 void GetFunctionReturnSchema(ArrowNetHandle handle, const std::string &schema, const std::string &func,
-                             ArrowArrayStream &out);
+                             ArrowSchema &out);
 
 // Execute a scalar function over an input batch: `args` is an N-row stream of the
 // argument columns (in param order; consumed by the managed side); fills `out` with
@@ -170,11 +171,11 @@ void GetFunctionReturnSchema(ArrowNetHandle handle, const std::string &schema, c
 void ExecuteScalar(ArrowNetHandle handle, const std::string &schema, const std::string &func, ArrowArrayStream &args,
                    ArrowArrayStream &out);
 
-// Zero-row Arrow stream whose schema = a table-returning function's output columns. `args` (nullable) is a
+// Fills `out` with the Arrow schema of a table-returning function's output columns. `args` (nullable) is a
 // 1-row Arrow stream of the constant call arguments; a custom table function's output schema may depend on it
 // (consumed by the managed side when non-null). Pass nullptr when there are no constant args (in-out base).
 void GetFunctionOutputSchema(ArrowNetHandle handle, const std::string &schema, const std::string &func,
-                             ArrowArrayStream *args, ArrowArrayStream &out);
+                             ArrowArrayStream *args, ArrowSchema &out);
 
 // (ExecuteTable / ExecuteProc were removed at ABI v30 — superseded by the table-function session
 //  TableBind / TableExecute / TableClose below.)

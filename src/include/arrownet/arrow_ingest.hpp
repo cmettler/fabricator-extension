@@ -120,6 +120,11 @@ void PopulateReturnSchema(duckdb::ClientContext &context, ArrowStreamBindData &b
                           duckdb::vector<duckdb::LogicalType> &return_types,
                           duckdb::vector<duckdb::string> &names);
 
+// Reads a bare Arrow schema (e.g. filled by get_function_*_schema) into DuckDB return types + names.
+// Consumes/releases `arrow_schema` (moves it into an ArrowSchemaWrapper). For schema-only metadata fetches.
+void ReadArrowSchema(duckdb::ClientContext &context, ArrowSchema &arrow_schema,
+                     duckdb::vector<duckdb::LogicalType> &return_types, duckdb::vector<duckdb::string> &names);
+
 // Table-function callbacks (wire these into a duckdb::TableFunction).
 duckdb::unique_ptr<duckdb::GlobalTableFunctionState>
 ArrowStreamInitGlobal(duckdb::ClientContext &context, duckdb::TableFunctionInitInput &input);

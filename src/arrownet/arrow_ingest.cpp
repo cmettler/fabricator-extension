@@ -93,6 +93,38 @@ bool GetNextBatch(ArrowStreamGlobalState &gstate, ArrowStreamLocalState &lstate)
 
 } // namespace
 
+// Reads an Arrow schema's columns into DuckDB return types + names (via the per-column converters), and
+// optionally per-column nullability (ARROW_FLAG_NULLABLE — a NOT NULL SQL column is exported non-nullable,
+// letting ORDER BY pushdown ignore NULL order for NOT NULL keys). Shared by PopulateReturnSchema (the scan
+// path, reading a stream's schema) and ReadArrowSchema (the schema-only function-metadata path).
+static void ReadSchemaColumns(ClientContext &context, ArrowSchema &arrow_schema, ArrowTableSchema &arrow_table,
+                              vector<LogicalType> &return_types, vector<string> &names,
+                              vector<bool> *column_nullable) {
+	ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table, arrow_schema);
+	if (column_nullable) {
+		column_nullable->clear();
+	}
+	for (int64_t i = 0; i < arrow_schema.n_children; i++) {
+		auto &child = *arrow_schema.children[i];
+		names.push_back(child.name ? string(child.name) : "column" + to_string(i));
+		return_types.push_back(arrow_table.GetColumns().at((idx_t)i)->GetDuckType());
+		if (column_nullable) {
+			column_nullable->push_back((child.flags & ARROW_FLAG_NULLABLE) != 0);
+		}
+	}
+}
+
+// Reads a bare Arrow schema (e.g. from get_function_*_schema) into DuckDB return types + names. Releases the
+// caller-owned ArrowSchema via an ArrowSchemaWrapper. Used by the function-metadata fetches (schema-only).
+void ReadArrowSchema(ClientContext &context, ArrowSchema &arrow_schema, vector<LogicalType> &return_types,
+                     vector<string> &names) {
+	ArrowSchemaWrapper schema_root;
+	schema_root.arrow_schema = arrow_schema;
+	arrow_schema.release = nullptr; // ownership moved into schema_root (auto-released)
+	ArrowTableSchema arrow_table;
+	ReadSchemaColumns(context, schema_root.arrow_schema, arrow_table, return_types, names, nullptr);
+}
+
 void PopulateReturnSchema(ClientContext &context, ArrowStreamBindData &bind_data,
                           vector<LogicalType> &return_types, vector<string> &names) {
 	// Produce a throwaway stream solely to read the schema, then release it. A bare
@@ -114,22 +146,9 @@ void PopulateReturnSchema(ClientContext &context, ArrowStreamBindData &bind_data
 		schema_stream.release(&schema_stream);
 	}
 
-	// Build DuckDB's per-column Arrow converters, then derive names + DuckDB types.
-	ArrowTableFunction::PopulateArrowTableSchema(context, bind_data.arrow_table,
-	                                             bind_data.schema_root.arrow_schema);
-
-	auto &arrow_schema = bind_data.schema_root.arrow_schema;
-	bind_data.column_nullable.clear();
-	for (int64_t i = 0; i < arrow_schema.n_children; i++) {
-		auto &child = *arrow_schema.children[i];
-		names.push_back(child.name ? string(child.name) : "column" + to_string(i));
-		auto arrow_type = bind_data.arrow_table.GetColumns().at((idx_t)i);
-		return_types.push_back(arrow_type->GetDuckType());
-		// ARROW_FLAG_NULLABLE (bit 1) — a NOT NULL SQL column is exported non-nullable
-		// (C# sets the flag from AllowDBNull). Lets ORDER BY pushdown ignore NULL order
-		// for NOT NULL keys.
-		bind_data.column_nullable.push_back((child.flags & ARROW_FLAG_NULLABLE) != 0);
-	}
+	// Build DuckDB's per-column Arrow converters, then derive names + DuckDB types + nullability.
+	ReadSchemaColumns(context, bind_data.schema_root.arrow_schema, bind_data.arrow_table, return_types, names,
+	                  &bind_data.column_nullable);
 	if (return_types.empty()) {
 		throw IOException("ArrowNet: result schema has no columns");
 	}

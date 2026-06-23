@@ -113,13 +113,13 @@ public interface IBackendCatalog : IDisposable
     IArrowArrayStream ScanTable(string schemaName, string tableName, string? specJson, IArrowArrayStream? filterValues);
 
     /// <summary>
-    /// Zero-row Arrow stream whose schema describes a scalar function's input parameters (one field per
-    /// parameter, in order). Used to register the DuckDB function's argument types.
+    /// The Arrow schema describing a function's input parameters (one field per parameter, in order). Used
+    /// to register the DuckDB function's argument types. Exported to the host as a bare <c>ArrowSchema</c>.
     /// </summary>
-    IArrowArrayStream GetFunctionParamSchema(string schemaName, string functionName);
+    Schema GetFunctionParamSchema(string schemaName, string functionName);
 
-    /// <summary>Zero-row Arrow stream whose single field is the scalar function's return type.</summary>
-    IArrowArrayStream GetFunctionReturnSchema(string schemaName, string functionName);
+    /// <summary>The Arrow schema whose single field is the scalar function's return type.</summary>
+    Schema GetFunctionReturnSchema(string schemaName, string functionName);
 
     /// <summary>
     /// Applies a scalar function over an input batch: <paramref name="args"/> columns are the argument
@@ -128,12 +128,12 @@ public interface IBackendCatalog : IDisposable
     IArrowArrayStream ExecuteScalar(string schemaName, string functionName, IArrowArrayStream args);
 
     /// <summary>
-    /// Zero-row Arrow stream whose schema describes a table-returning function's output columns.
+    /// The Arrow schema describing a table-returning function's output columns.
     /// <paramref name="args"/> (null =&gt; none) is a 1-row batch of the constant call arguments — a custom
     /// table function's output schema may depend on them (bound via <see cref="IArrowTableFunction.Bind"/>);
     /// discovered SQL TVFs/procs read their schema from metadata and ignore it.
     /// </summary>
-    IArrowArrayStream GetFunctionOutputSchema(string schemaName, string functionName, RecordBatch? args = null);
+    Schema GetFunctionOutputSchema(string schemaName, string functionName, RecordBatch? args = null);
 
     /// <summary>
     /// Binds one table-function call (Phase 5 session model — the successor to the removed

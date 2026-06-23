@@ -52,17 +52,17 @@ public sealed class StubBackend : IBackend
                                            IArrowArrayStream? filterValues) =>
             ExecuteQuery($"SELECT * FROM {schemaName}.{tableName}");
 
-        public IArrowArrayStream GetFunctionParamSchema(string schemaName, string functionName) =>
-            new InMemoryArrayStream(new Schema(System.Array.Empty<Field>(), null), System.Array.Empty<RecordBatch>());
+        public Schema GetFunctionParamSchema(string schemaName, string functionName) =>
+            new Schema(System.Array.Empty<Field>(), null);
 
-        public IArrowArrayStream GetFunctionReturnSchema(string schemaName, string functionName) =>
-            EmptyStringTable("result");
+        public Schema GetFunctionReturnSchema(string schemaName, string functionName) =>
+            new Schema(new[] { new Field("result", StringType.Default, nullable: true) }, null);
 
         public IArrowArrayStream ExecuteScalar(string schemaName, string functionName, IArrowArrayStream args) =>
             EmptyStringTable("result");
 
-        public IArrowArrayStream GetFunctionOutputSchema(string schemaName, string functionName, RecordBatch? args = null) =>
-            EmptyStringTable("result");
+        public Schema GetFunctionOutputSchema(string schemaName, string functionName, RecordBatch? args = null) =>
+            new Schema(new[] { new Field("result", StringType.Default, nullable: true) }, null);
 
         public IBoundTable TableBind(string schemaName, string functionName, RecordBatch? args) =>
             throw new NotSupportedException("stub backend has no table functions");

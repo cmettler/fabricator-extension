@@ -110,22 +110,18 @@ vector<ArrowNetFunctionInfo> DiscoverFunctions(ArrowNetHandle handle) {
 
 void FetchFunctionParamSchema(ClientContext &context, ArrowNetHandle handle, const string &schema_name,
                               const string &func_name, vector<string> &names, vector<LogicalType> &types) {
-	arrownet::ArrowStreamBindData bind_data;
-	bind_data.factory = [handle, schema_name, func_name](const arrownet::ArrowScanRequest &, ArrowArrayStream &out) {
-		arrownet::GetFunctionParamSchema(handle, schema_name, func_name, out);
-	};
-	arrownet::PopulateReturnSchema(context, bind_data, types, names);
+	ArrowSchema schema {};
+	arrownet::GetFunctionParamSchema(handle, schema_name, func_name, schema);
+	arrownet::ReadArrowSchema(context, schema, types, names);
 }
 
 LogicalType FetchFunctionReturnType(ClientContext &context, ArrowNetHandle handle, const string &schema_name,
                                     const string &func_name) {
-	arrownet::ArrowStreamBindData bind_data;
-	bind_data.factory = [handle, schema_name, func_name](const arrownet::ArrowScanRequest &, ArrowArrayStream &out) {
-		arrownet::GetFunctionReturnSchema(handle, schema_name, func_name, out);
-	};
+	ArrowSchema schema {};
+	arrownet::GetFunctionReturnSchema(handle, schema_name, func_name, schema);
 	vector<string> names;
 	vector<LogicalType> types;
-	arrownet::PopulateReturnSchema(context, bind_data, types, names);
+	arrownet::ReadArrowSchema(context, schema, types, names);
 	if (types.empty()) {
 		throw InvalidInputException("mssql_net: function '%s.%s' has no scalar return type", schema_name, func_name);
 	}
@@ -134,11 +130,9 @@ LogicalType FetchFunctionReturnType(ClientContext &context, ArrowNetHandle handl
 
 void FetchFunctionOutputSchema(ClientContext &context, ArrowNetHandle handle, const string &schema_name,
                                const string &func_name, vector<string> &names, vector<LogicalType> &types) {
-	arrownet::ArrowStreamBindData bind_data;
-	bind_data.factory = [handle, schema_name, func_name](const arrownet::ArrowScanRequest &, ArrowArrayStream &out) {
-		arrownet::GetFunctionOutputSchema(handle, schema_name, func_name, nullptr, out);
-	};
-	arrownet::PopulateReturnSchema(context, bind_data, types, names);
+	ArrowSchema schema {};
+	arrownet::GetFunctionOutputSchema(handle, schema_name, func_name, nullptr, schema);
+	arrownet::ReadArrowSchema(context, schema, types, names);
 }
 
 vector<string> FetchRowIdColumns(ArrowNetHandle handle, const string &schema_name, const string &table_name) {

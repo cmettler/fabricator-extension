@@ -443,7 +443,7 @@ void GetMetadata(ArrowNetHandle handle, int32_t kind, const std::string &arg1, c
 }
 
 void GetFunctionParamSchema(ArrowNetHandle handle, const std::string &schema, const std::string &func,
-                            ArrowArrayStream &out) {
+                            ArrowSchema &out) {
 	const ArrowNetVTable &vt = GetBridge();
 	if (!vt.get_function_param_schema) {
 		throw duckdb::IOException("ArrowNet: bridge does not provide get_function_param_schema");
@@ -456,7 +456,7 @@ void GetFunctionParamSchema(ArrowNetHandle handle, const std::string &schema, co
 }
 
 void GetFunctionReturnSchema(ArrowNetHandle handle, const std::string &schema, const std::string &func,
-                             ArrowArrayStream &out) {
+                             ArrowSchema &out) {
 	const ArrowNetVTable &vt = GetBridge();
 	if (!vt.get_function_return_schema) {
 		throw duckdb::IOException("ArrowNet: bridge does not provide get_function_return_schema");
@@ -482,7 +482,7 @@ void ExecuteScalar(ArrowNetHandle handle, const std::string &schema, const std::
 }
 
 void GetFunctionOutputSchema(ArrowNetHandle handle, const std::string &schema, const std::string &func,
-                             ArrowArrayStream *args, ArrowArrayStream &out) {
+                             ArrowArrayStream *args, ArrowSchema &out) {
 	const ArrowNetVTable &vt = GetBridge();
 	if (!vt.get_function_output_schema) {
 		throw duckdb::IOException("ArrowNet: bridge does not provide get_function_output_schema");

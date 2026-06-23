@@ -302,14 +302,15 @@ typedef struct ArrowNetVTable {
 	// + return types and execute them, all over Arrow.
 	// -------------------------------------------------------------------------
 
-	// Zero-row Arrow stream whose schema = the function's input parameters (one
-	// field per param, in order); used to register the DuckDB function's arg types.
+	// *out receives the Arrow schema of the function's input parameters (one field per param, in order),
+	// used to register the DuckDB function's arg types. A bare ArrowSchema (the managed side exports it; the
+	// caller reads it then calls its release callback).
 	int32_t (*get_function_param_schema)(ArrowNetHandle handle, const char *schema, const char *func,
-	                                     struct ArrowArrayStream *out, char **err);
+	                                     struct ArrowSchema *out, char **err);
 
-	// Zero-row Arrow stream whose single field = the scalar function's return type.
+	// *out receives the Arrow schema whose single field = the scalar function's return type (a bare ArrowSchema).
 	int32_t (*get_function_return_schema)(ArrowNetHandle handle, const char *schema, const char *func,
-	                                      struct ArrowArrayStream *out, char **err);
+	                                      struct ArrowSchema *out, char **err);
 
 	// Execute a scalar function over an input batch: `args` is an N-row stream whose
 	// columns are the argument values (in param order); *out receives an N-row stream
@@ -318,13 +319,13 @@ typedef struct ArrowNetVTable {
 	int32_t (*execute_scalar)(ArrowNetHandle handle, const char *schema, const char *func,
 	                          struct ArrowArrayStream *args, struct ArrowArrayStream *out, char **err);
 
-	// Zero-row Arrow stream whose schema = a table-returning function's output columns. `args` (nullable) is
-	// a 1-row Arrow array of the constant call arguments (in param order; consumed by the managed side when
-	// present) — a custom table function's output schema MAY depend on them (the managed side binds the call
-	// and returns the bound output schema); discovered SQL TVFs/procs read it from metadata and ignore `args`.
-	// Pass NULL for `args` when there are none (e.g. the in-out `_each` base-schema lookup).
+	// *out receives the Arrow schema of a table-returning function's output columns (a bare ArrowSchema).
+	// `args` (nullable) is a 1-row Arrow STREAM of the constant call arguments (in param order; consumed by
+	// the managed side when present) — a custom table function's output schema MAY depend on them (the managed
+	// side binds the call and returns the bound output schema); discovered SQL TVFs/procs read it from metadata
+	// and ignore `args`. Pass NULL for `args` when there are none (e.g. the in-out `_each` base-schema lookup).
 	int32_t (*get_function_output_schema)(ArrowNetHandle handle, const char *schema, const char *func,
-	                                      struct ArrowArrayStream *args, struct ArrowArrayStream *out, char **err);
+	                                      struct ArrowArrayStream *args, struct ArrowSchema *out, char **err);
 
 	// (execute_table / execute_proc were removed at ABI v30 — superseded by the table-function session
 	//  table_bind / table_execute / table_close at the end of this struct.)
@@ -489,7 +490,7 @@ typedef struct ArrowNetVTable {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 31
+#define ARROWNET_ABI_VERSION 32
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

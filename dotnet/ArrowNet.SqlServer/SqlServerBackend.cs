@@ -1135,22 +1135,23 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         return result;
     }
 
-    public IArrowArrayStream GetFunctionParamSchema(string schemaName, string functionName)
+    public Schema GetFunctionParamSchema(string schemaName, string functionName)
     {
         var key = $"{schemaName}.{functionName}";
         if (CustomScalar.TryGetValue(key, out var customScalar))
         {
-            return new InMemoryArrayStream(customScalar.Parameters, System.Array.Empty<RecordBatch>());
+            return customScalar.Parameters;
         }
         if (CustomTable.TryGetValue(key, out var customTable))
         {
-            return new InMemoryArrayStream(customTable.Parameters, System.Array.Empty<RecordBatch>());
+            return customTable.Parameters;
         }
         if (CustomAgg.TryGetValue(key, out var customAgg))
         {
-            return new InMemoryArrayStream(customAgg.Parameters, System.Array.Empty<RecordBatch>());
+            return customAgg.Parameters;
         }
-        return RoutineParamSchemaQuery(schemaName, functionName);
+        using var s = RoutineParamSchemaQuery(schemaName, functionName);
+        return s.Schema;
     }
 
     // Zero-row Arrow stream of a routine's input parameters (typed-NULL SELECT reconstructed from
@@ -1177,19 +1178,18 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         return ExecuteQuery(sb.ToString());
     }
 
-    public IArrowArrayStream GetFunctionReturnSchema(string schemaName, string functionName)
+    public Schema GetFunctionReturnSchema(string schemaName, string functionName)
     {
         if (CustomScalar.TryGetValue($"{schemaName}.{functionName}", out var custom))
         {
-            return new InMemoryArrayStream(new Schema(new[] { custom.Result }, null),
-                                           System.Array.Empty<RecordBatch>());
+            return new Schema(new[] { custom.Result }, null);
         }
         if (CustomAgg.TryGetValue($"{schemaName}.{functionName}", out var customAgg))
         {
-            return new InMemoryArrayStream(new Schema(new[] { customAgg.Result }, null),
-                                           System.Array.Empty<RecordBatch>());
+            return new Schema(new[] { customAgg.Result }, null);
         }
-        return RoutineReturnSchemaQuery(schemaName, functionName);
+        using var s = RoutineReturnSchemaQuery(schemaName, functionName);
+        return s.Schema;
     }
 
     // Zero-row Arrow stream of a scalar function's single return field (typed-NULL SELECT). Throws if the
@@ -1320,7 +1320,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         return result;
     }
 
-    public IArrowArrayStream GetFunctionOutputSchema(string schemaName, string functionName, RecordBatch? args = null)
+    public Schema GetFunctionOutputSchema(string schemaName, string functionName, RecordBatch? args = null)
     {
         if (CustomTable.TryGetValue($"{schemaName}.{functionName}", out var customTable))
         {
@@ -1328,7 +1328,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             // in-out `_each` base-schema probe (which doesn't apply to a pure-C# table function); a static
             // function ignores it.
             using var binding = customTable.Bind(args!);
-            return new InMemoryArrayStream(binding.OutputSchema, System.Array.Empty<RecordBatch>());
+            return binding.OutputSchema;
         }
         // Custom in-out functions resolve their output schema through InOutBind (the exchange path), not here.
         // A discovered TVF (its result columns are in ROUTINE_COLUMNS) resolves its full output schema via
@@ -1336,12 +1336,10 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         // sp_describe_first_result_set) via the SqlServerProcedure wrapper.
         if (FunctionOutputColumns(schemaName, functionName).Count > 0)
         {
-            return new InMemoryArrayStream(
-                new SqlServerTableValuedFunction(this, schemaName, functionName).OutputSchema,
-                System.Array.Empty<RecordBatch>());
+            return new SqlServerTableValuedFunction(this, schemaName, functionName).OutputSchema;
         }
         using var procBinding = new SqlServerProcedure(this, schemaName, functionName).Bind(args!);
-        return new InMemoryArrayStream(procBinding.OutputSchema, System.Array.Empty<RecordBatch>());
+        return procBinding.OutputSchema;
     }
 
     // Phase 5 session model: bind a table-function call into an IBoundTable (the host then runs it via

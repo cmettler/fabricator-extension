@@ -84,17 +84,17 @@ public unsafe struct ArrowNetVTable
     // int32 build_connection_string(const char* provider, const char* fields_json, char** out_connstr, char** err)
     public delegate* unmanaged[Cdecl]<byte*, byte*, byte**, byte**, int> BuildConnectionString;
 
-    // int32 get_function_param_schema(void* handle, const char* schema, const char* func, ArrowArrayStream* out, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, byte**, int> GetFunctionParamSchema;
+    // int32 get_function_param_schema(void* handle, const char* schema, const char* func, ArrowSchema* out, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowSchema*, byte**, int> GetFunctionParamSchema;
 
-    // int32 get_function_return_schema(void* handle, const char* schema, const char* func, ArrowArrayStream* out, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, byte**, int> GetFunctionReturnSchema;
+    // int32 get_function_return_schema(void* handle, const char* schema, const char* func, ArrowSchema* out, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowSchema*, byte**, int> GetFunctionReturnSchema;
 
     // int32 execute_scalar(void* handle, const char* schema, const char* func, ArrowArrayStream* args, ArrowArrayStream* out, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, CArrowArrayStream*, byte**, int> ExecuteScalar;
 
-    // int32 get_function_output_schema(void* handle, const char* schema, const char* func, ArrowArrayStream* args, ArrowArrayStream* out, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, CArrowArrayStream*, byte**, int> GetFunctionOutputSchema;
+    // int32 get_function_output_schema(void* handle, const char* schema, const char* func, ArrowArrayStream* args, ArrowSchema* out, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, CArrowSchema*, byte**, int> GetFunctionOutputSchema;
 
     // (execute_table / execute_proc were removed at ABI v30 — superseded by the table-function session
     //  table_bind / table_execute / table_close below.)

@@ -58,19 +58,14 @@ internal sealed class SqlServerProcEach : IArrowInOutBinding
         // Output = echoed input columns (param-typed, named by the input columns) ++ the proc's result columns
         // — matching the C++ exchange bind (input echo ++ the function's own output columns).
         var pFields = new List<Field>(_colNames.Length);
-        using (var ps = owner.GetFunctionParamSchema(schemaName, functionName))
+        var paramFields = owner.GetFunctionParamSchema(schemaName, functionName).FieldsList;
+        for (int i = 0; i < _colNames.Length; i++)
         {
-            var paramFields = ps.Schema.FieldsList;
-            for (int i = 0; i < _colNames.Length; i++)
-            {
-                var dataType = i < paramFields.Count ? paramFields[i].DataType : inputSchema.FieldsList[i].DataType;
-                pFields.Add(new Field(_colNames[i], dataType, nullable: true));
-            }
+            var dataType = i < paramFields.Count ? paramFields[i].DataType : inputSchema.FieldsList[i].DataType;
+            pFields.Add(new Field(_colNames[i], dataType, nullable: true));
         }
-        using (var os = owner.GetFunctionOutputSchema(schemaName, functionName))
-        {
-            OutputSchema = new Schema(pFields.Concat(os.Schema.FieldsList), metadata: null);
-        }
+        OutputSchema = new Schema(pFields.Concat(owner.GetFunctionOutputSchema(schemaName, functionName).FieldsList),
+                                  metadata: null);
     }
 
     public Schema OutputSchema { get; }

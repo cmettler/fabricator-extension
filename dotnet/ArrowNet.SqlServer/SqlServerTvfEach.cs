@@ -45,19 +45,14 @@ internal sealed class SqlServerTvfEach : IArrowInOutBinding, IArrowInOutIsolatio
         // Output = the echoed input columns (p.*) ++ the TVF's output columns (f.*). The p.* columns come
         // back typed as the TVF PARAMETERS (the VALUES are CAST to them), named by the input columns.
         var pFields = new List<Field>(_colNames.Length);
-        using (var ps = owner.GetFunctionParamSchema(schemaName, functionName))
+        var paramFields = owner.GetFunctionParamSchema(schemaName, functionName).FieldsList;
+        for (int i = 0; i < _colNames.Length; i++)
         {
-            var paramFields = ps.Schema.FieldsList;
-            for (int i = 0; i < _colNames.Length; i++)
-            {
-                var dataType = i < paramFields.Count ? paramFields[i].DataType : inputSchema.FieldsList[i].DataType;
-                pFields.Add(new Field(_colNames[i], dataType, nullable: true));
-            }
+            var dataType = i < paramFields.Count ? paramFields[i].DataType : inputSchema.FieldsList[i].DataType;
+            pFields.Add(new Field(_colNames[i], dataType, nullable: true));
         }
-        using (var os = owner.GetFunctionOutputSchema(schemaName, functionName))
-        {
-            OutputSchema = new Schema(pFields.Concat(os.Schema.FieldsList), metadata: null);
-        }
+        OutputSchema = new Schema(pFields.Concat(owner.GetFunctionOutputSchema(schemaName, functionName).FieldsList),
+                                  metadata: null);
     }
 
     public Schema OutputSchema { get; }
