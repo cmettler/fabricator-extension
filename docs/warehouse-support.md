@@ -219,12 +219,18 @@ point, not something we can fix by picking a default:
 1. **`ServerProfile` detection** at OpenCatalog (the foundation everything keys off). **DONE** — slice 1
    (`ServerProfile.cs`, lazy detection via a non-MARS probe, MARS gated on `SupportsMars`); slice 2 added
    the `mssql_server_info(catalog)` diagnostic + `test/verify_server_profile.test`.
-2. **Profile-driven `MapArrowToSqlType`** (`VARCHAR`/`NVARCHAR` by collation, `datetime2(6)`, UTC
-   `datetime2` for tz, `time(6)`) + the matching value-reader branch.
+2. **Profile-driven `MapArrowToSqlType`** (`VARCHAR`/`NVARCHAR` by `HasNVarchar`, `datetime2`/`time` scale
+   by `MaxDateTime2Scale`, tz → `datetimeoffset`-or-UTC-`datetime2` by `HasDatetimeOffset`). **DONE** — slice 3,
+   box-preserving (edition 3 → identical output); **validated live on Fabric**: a CTAS of a
+   `VARCHAR`/`TIMESTAMP`/`DATE`/`INT` table produced `varchar(MAX)` / `datetime2(6)` / `date` / `int` and
+   round-tripped with µs fidelity. **Fabric accepts `varchar(MAX)`** (`CHARACTER_MAXIMUM_LENGTH = -1`), so the
+   length setting (step 4) is NOT required for CTAS — only for string keys. *Remaining (3b):* the
+   tz-value-reader branch — `TIMESTAMPTZ` → UTC `datetime2` value conversion when there's no `datetimeoffset`
+   (needs ICU + a non-UTC session-tz test to validate; naive timestamps already round-trip correctly).
 3. **Connection mode** (`mars` tri-state, pooled reads, snapshot default) — see
    [transactions.md](transactions.md).
-4. **`mssql_default_varchar_length`** + length-aware `VARCHAR` (also unblocks string PK/UNIQUE keys
-   generally, not just Fabric).
+4. **`mssql_default_varchar_length`** + length-aware `VARCHAR` (unblocks string PK/UNIQUE keys; NOT needed
+   for plain CTAS since Fabric takes `varchar(MAX)`).
 5. **JSON type gate** (smallest, independent).
 6. **Collation-aware pushdown relaxation** (string `ORDER BY` on binary collations) — optimization.
 

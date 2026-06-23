@@ -508,7 +508,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 using var create = connection.CreateCommand();
                 create.Transaction = transaction;
                 create.CommandText = $"IF OBJECT_ID({objectLiteral}, 'U') IS NULL " +
-                                     BuildCreateTable(qualified, data.Schema);
+                                     BuildCreateTable(qualified, data.Schema, Profile);
                 create.ExecuteNonQuery();
             }
 
@@ -1012,7 +1012,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         try
         {
             string qualified = Quote(schemaName) + "." + Quote(tableName);
-            string create = BuildCreateTable(qualified, columns, primaryKey, uniques, defaults, textType);
+            string create = BuildCreateTable(qualified, columns, Profile, primaryKey, uniques, defaults, textType);
             using var cmd = connection.CreateCommand();
             cmd.Transaction = transaction;
             cmd.CommandText = ifNotExists
@@ -1070,7 +1070,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             case AlterKind.AddColumn:
             {
                 var field = RequireField(column, "added column");
-                string colDef = Quote(RequireArg(arg1, "column name")) + " " + MapArrowToSqlType(field.DataType) +
+                string colDef = Quote(RequireArg(arg1, "column name")) + " " + MapArrowToSqlType(field.DataType, Profile) +
                                 (field.IsNullable ? " NULL" : " NOT NULL");
                 string add = $"ALTER TABLE {qualified} ADD {colDef}";
                 ExecuteNonQuery(ifFlag
@@ -1090,7 +1090,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 string col = RequireArg(arg1, "column name");
                 bool nullable = ColumnIsNullable(schemaName, tableName, col);
                 ExecuteNonQuery($"ALTER TABLE {qualified} ALTER COLUMN {Quote(col)} " +
-                                MapArrowToSqlType(RequireField(column, "column type").DataType) +
+                                MapArrowToSqlType(RequireField(column, "column type").DataType, Profile) +
                                 (nullable ? " NULL" : " NOT NULL"));
                 break;
             }
@@ -2010,11 +2010,11 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     internal static string Quote(string identifier) => "[" + identifier.Replace("]", "]]") + "]";
 
-    private static string BuildCreateTable(string qualified, Schema schema) =>
-        BuildCreateTable(qualified, schema, null, null, null, null);
+    private static string BuildCreateTable(string qualified, Schema schema, ServerProfile profile) =>
+        BuildCreateTable(qualified, schema, profile, null, null, null, null);
 
-    private static string BuildCreateTable(string qualified, Schema schema, string? primaryKey, string? uniques,
-                                           string? defaults, string? textType)
+    private static string BuildCreateTable(string qualified, Schema schema, ServerProfile profile, string? primaryKey,
+                                           string? uniques, string? defaults, string? textType)
     {
         var defaultMap = ParseDefaults(defaults);
         var sb = new StringBuilder();
@@ -2026,7 +2026,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             {
                 sb.Append(", ");
             }
-            sb.Append(Quote(field.Name)).Append(' ').Append(MapArrowToSqlType(field.DataType, textType))
+            sb.Append(Quote(field.Name)).Append(' ').Append(MapArrowToSqlType(field.DataType, profile, textType))
               .Append(field.IsNullable ? " NULL" : " NOT NULL");
             if (defaultMap.TryGetValue(i, out var defaultValue))
             {
@@ -2113,9 +2113,15 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         }
     }
 
-    // Arrow type -> SQL Server column type (provider-specific).
-    private static string MapArrowToSqlType(IArrowType type, string? textType = null)
+    // Arrow type -> SQL Server column type, adapted to the connected engine's ServerProfile:
+    //  - text: NVARCHAR (box/Azure SQL) vs VARCHAR (Fabric Warehouse, which has no NVARCHAR); an explicit
+    //    mssql_ctas_text_type override (textType) still wins.
+    //  - datetime2/time fractional scale: 7 (box) vs 6 (Fabric).
+    //  - timestamptz: DATETIMEOFFSET where it exists, else UTC DATETIME2 (Fabric has no DATETIMEOFFSET).
+    // Box SQL Server (HasNVarchar, HasDatetimeOffset, scale 7) reproduces the previous fixed mapping exactly.
+    private static string MapArrowToSqlType(IArrowType type, ServerProfile profile, string? textType = null)
     {
+        int scale = profile.MaxDateTime2Scale;
         switch (type.TypeId)
         {
             case ArrowTypeId.Boolean: return "BIT";
@@ -2139,14 +2145,20 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 return "DATE";
             case ArrowTypeId.Time32:
             case ArrowTypeId.Time64:
-                return "TIME(7)";
+                return $"TIME({scale})";
             case ArrowTypeId.Timestamp:
-                return ((TimestampType)type).Timezone != null ? "DATETIMEOFFSET(7)" : "DATETIME2(7)";
+                return ((TimestampType)type).Timezone != null && profile.HasDatetimeOffset
+                    ? $"DATETIMEOFFSET({scale})"
+                    : $"DATETIME2({scale})";
             case ArrowTypeId.Binary:
                 return "VARBINARY(MAX)";
             case ArrowTypeId.String:
             default:
-                return string.IsNullOrWhiteSpace(textType) ? "NVARCHAR(MAX)" : textType!;
+                if (!string.IsNullOrWhiteSpace(textType))
+                {
+                    return textType!;
+                }
+                return profile.HasNVarchar ? "NVARCHAR(MAX)" : "VARCHAR(MAX)";
         }
     }
 
