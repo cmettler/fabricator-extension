@@ -1365,13 +1365,6 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         return new BindingBoundTable(new SqlServerProcedure(this, schemaName, functionName).Bind(args!), supportsPushdown: false);
     }
 
-    // The 4g table-in-out PUSH path (inout_open/push/finish/abort) is retired: every `_each` form — discovered
-    // TVFs, stored procs, and custom C# in-out — now runs on the Phase 6 streaming exchange (see InOutBind).
-    // This remains only to satisfy IBackendCatalog; the C++ side never routes here anymore.
-    public IInOutSession InOutOpen(string schemaName, string functionName, Schema inputSchema, string isolationLevel) =>
-        throw new NotSupportedException(
-            "mssql_net: the table-in-out push path is retired; all _each functions run on the streaming exchange (InOutBind)");
-
     // Phase 6 streaming-exchange bind for every `_each` form. A custom C# in-out (IArrowInOutFunction —
     // directly or via the StaticInOutFunction base) binds itself; a discovered TVF `_each` CROSS APPLYs on a
     // read-only connection (SqlServerTvfEach); a stored-proc `_each` EXECs once per input row on DuckDB's

@@ -497,62 +497,8 @@ void GetFunctionOutputSchema(ArrowNetHandle handle, const std::string &schema, c
 // (ExecuteTable / ExecuteProc were removed at ABI v30 — superseded by the table-function session
 //  TableBind / TableExecute / TableClose below.)
 
-ArrowNetHandle InOutOpen(ArrowNetHandle handle, const std::string &schema, const std::string &func,
-                         ArrowSchema &input_schema, const std::string &isolation) {
-	const ArrowNetVTable &vt = GetBridge();
-	if (!vt.inout_open) {
-		throw duckdb::IOException("ArrowNet: bridge does not provide inout_open");
-	}
-	ArrowNetHandle session = nullptr;
-	char *err = nullptr;
-	int32_t rc = vt.inout_open(handle, schema.c_str(), func.c_str(), &input_schema, isolation.c_str(), &session, &err);
-	if (rc != ARROWNET_OK) {
-		ThrowManagedError(vt, err, "ArrowNet: inout_open failed");
-	}
-	return session;
-}
-
-void InOutPush(ArrowNetHandle session, ArrowArray &in_chunk, ArrowArrayStream &out) {
-	const ArrowNetVTable &vt = GetBridge();
-	if (!vt.inout_push) {
-		throw duckdb::IOException("ArrowNet: bridge does not provide inout_push");
-	}
-	char *err = nullptr;
-	int32_t rc = vt.inout_push(session, &in_chunk, &out, &err);
-	if (rc != ARROWNET_OK) {
-		ThrowManagedError(vt, err, "ArrowNet: inout_push failed");
-	}
-}
-
-void InOutFinish(ArrowNetHandle session, ArrowArrayStream &out) {
-	const ArrowNetVTable &vt = GetBridge();
-	if (!vt.inout_finish) {
-		throw duckdb::IOException("ArrowNet: bridge does not provide inout_finish");
-	}
-	char *err = nullptr;
-	int32_t rc = vt.inout_finish(session, &out, &err);
-	if (rc != ARROWNET_OK) {
-		ThrowManagedError(vt, err, "ArrowNet: inout_finish failed");
-	}
-}
-
-void InOutAbort(ArrowNetHandle session) {
-	if (!session) {
-		return;
-	}
-	const ArrowNetVTable &vt = GetBridge();
-	if (!vt.inout_abort) {
-		return;
-	}
-	char *err = nullptr;
-	int32_t rc = vt.inout_abort(session, &err);
-	if (rc != ARROWNET_OK) {
-		// Abort is best-effort cleanup; swallow + free the managed error message.
-		if (err && vt.free_error) {
-			vt.free_error(err);
-		}
-	}
-}
+// (The 4g table-in-out push wrappers InOutOpen/InOutPush/InOutFinish/InOutAbort were removed at ABI v31 —
+//  every `_each` form now runs on the streaming exchange: InOutBind/InOutExchangeOpen/InOutBindClose below.)
 
 ArrowNetHandle InOutBind(ArrowNetHandle handle, const std::string &schema, const std::string &func,
                          ArrowArrayStream *args, ArrowSchema &input_schema, ArrowArrayStream &out_schema) {

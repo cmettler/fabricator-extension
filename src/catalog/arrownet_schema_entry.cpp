@@ -883,69 +883,6 @@ unique_ptr<FunctionData> ArrowNetTableFunctionBind(ClientContext &context, Table
 	return std::move(bind_data);
 }
 
-// -----------------------------------------------------------------------------
-// Table-in-out (4g): a discovered TVF's `{LogicalType::TABLE}` overload — applies the
-// function once per input row via SQL-Server CROSS APPLY (the T-SQL is generated +
-// executed in C#; see SqlServerCatalog.InOutSessionImpl). Output = the input parameter
-// columns ++ the TVF's output columns. Read-only (a SQL Server TVF can't modify data).
-//
-// OUTPUT IS SYNCHRONOUS PER CHUNK: each in_out_function call pushes one input chunk and the
-// managed side runs THAT chunk's CROSS APPLY to completion, returning its full output — so
-// there is no lagging "tail" produced after the last input. This is what makes the design
-// robust: emitting rows never depends on detecting which parallel input branch finishes
-// last (`in_out_function_final` fires per branch, and the union branch pipelines may even run
-// sequentially — see PhysicalUnion::BuildPipelines — so a per-branch "last" detector is
-// unreliable). With no tail there is nothing to emit at the end, so there is no
-// `in_out_function_final` at all.
-//
-// Session lifecycle lives in a refcounted InOutSessionHolder carried on the bind data, so the
-// injected OperatorFinalize (Phase: per-row procs) can reach the same session to signal a clean
-// finish/COMMIT. The holder's destructor calls inout_abort on every teardown path (frees the
-// managed handle + rolls back/releases) — the reliable RAII backstop for normal/LIMIT/error/cancel.
-struct InOutSessionHolder {
-	ArrowNetHandle session = nullptr;
-	bool finished = false; // a clean finish (OperatorFinalize) was signalled
-	mutex lock;
-
-	// Clean finish / commit signal (no rows in the synchronous model). Idempotent. Used by the
-	// injected OperatorFinalize (built with per-row stored procs); unused for read-only TVFs.
-	void Finish() {
-		lock_guard<mutex> guard(lock);
-		if (!session || finished) {
-			return;
-		}
-		finished = true;
-		ArrowArrayStream out;
-		std::memset(&out, 0, sizeof(out));
-		arrownet::InOutFinish(session, out);
-		if (out.release) {
-			out.release(&out); // synchronous model: finish carries no tail rows
-		}
-	}
-
-	~InOutSessionHolder() {
-		// inout_abort releases the managed session AND frees the GCHandle (inout_finish does NOT
-		// free it), so call it on every path. Idempotent + best-effort (swallows errors): after a
-		// clean Finish it is a no-op release that just frees the handle.
-		arrownet::InOutAbort(session);
-	}
-};
-
-struct ArrowNetInOutBindData : public TableFunctionData {
-	ArrowNetHandle handle = nullptr;
-	string schema;
-	string func;
-	vector<LogicalType> input_types; // input parameter-table columns (= the TVF's positional params)
-	vector<string> input_names;
-	//! Effective SQL transaction isolation level for the session (SET mssql_isolation_level ?? the ATTACH
-	//! isolation_level default ?? empty). Resolved at bind; passed to inout_open. Gives a consistent view
-	//! across the per-chunk queries of one in-out call.
-	string isolation;
-	//! Per-execution managed session, opened in init_global, pushed by in_out_function, finished by the
-	//! injected OperatorFinalize / released by the holder destructor. shared_ptr so the injected operator
-	//! can hold the same session.
-	shared_ptr<InOutSessionHolder> session_holder;
-};
 
 // Resolves the effective isolation level for an in-out session: the `mssql_isolation_level` session
 // setting if set, else the catalog's ATTACH `isolation_level` default, else empty (provider default).
@@ -960,162 +897,6 @@ string ResolveInOutIsolation(ClientContext &context, const string &attach_isolat
 	return attach_isolation;
 }
 
-struct ArrowNetInOutGlobalState : public GlobalTableFunctionState {
-	idx_t MaxThreads() const override {
-		return 1; // the operator consumes one Arrow C output stream at a time
-	}
-};
-
-struct ArrowNetInOutLocalState : public LocalTableFunctionState {
-	bool pushed_current = false;                    // pushed the current input chunk yet?
-	unique_ptr<arrownet::ArrowStreamReader> reader; // output reader for the current input chunk
-};
-
-// Append the function's output columns (read from a zero-row get_function_output_schema stream) to
-// return_types/names — shared by the discovered-TVF `_each` bind and the custom-in-out bind.
-void AppendInOutOutputSchema(ClientContext &context, ArrowNetHandle handle, const string &schema, const string &func,
-                            vector<LogicalType> &return_types, vector<string> &names) {
-	ArrowArrayStream out_schema;
-	std::memset(&out_schema, 0, sizeof(out_schema));
-	arrownet::GetFunctionOutputSchema(handle, schema, func, nullptr, out_schema); // in-out base: no constant args
-	ArrowSchemaWrapper schema_root;
-	if (out_schema.get_schema(&out_schema, &schema_root.arrow_schema) != 0) {
-		const char *msg = out_schema.get_last_error ? out_schema.get_last_error(&out_schema) : nullptr;
-		if (out_schema.release) {
-			out_schema.release(&out_schema);
-		}
-		throw IOException(string("mssql_net: failed to read table-in-out output schema") +
-		                  (msg ? string(": ") + msg : string()));
-	}
-	if (out_schema.release) {
-		out_schema.release(&out_schema);
-	}
-	ArrowTableSchema arrow_table;
-	ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table, schema_root.arrow_schema);
-	for (int64_t i = 0; i < schema_root.arrow_schema.n_children; i++) {
-		auto &child = *schema_root.arrow_schema.children[i];
-		names.push_back(child.name ? string(child.name) : "column" + to_string(i));
-		return_types.push_back(arrow_table.GetColumns().at((idx_t)i)->GetDuckType());
-	}
-}
-
-// Bind the discovered-TVF `_each` overload: output schema = input parameter-table columns ++ the TVF's
-// output columns (resolved from metadata, without executing the function).
-unique_ptr<FunctionData> ArrowNetInOutBind(ClientContext &context, TableFunctionBindInput &input,
-                                           vector<LogicalType> &return_types, vector<string> &names) {
-	auto &info = input.info->Cast<ArrowNetTableFunctionInfo>();
-	if (input.input_table_types.size() != info.arg_types.size()) {
-		throw BinderException(
-		    "mssql_net: table-in-out function \"%s\" takes %llu parameter(s) but the input table has %llu column(s)",
-		    info.func, (idx_t)info.arg_types.size(), (idx_t)input.input_table_types.size());
-	}
-
-	auto bind_data = make_uniq<ArrowNetInOutBindData>();
-	bind_data->handle = info.handle;
-	bind_data->schema = info.schema;
-	bind_data->func = info.func;
-	bind_data->isolation = ResolveInOutIsolation(context, info.attach_isolation);
-	bind_data->session_holder = make_shared_ptr<InOutSessionHolder>();
-
-	// 1) The input parameter columns lead the output (p.* in the CROSS APPLY). C# casts the
-	//    VALUES to the TVF's parameter types, so the echoed columns come back typed as the
-	//    PARAMETERS (info.arg_types) — not necessarily the input-table types. bind_data->input_*
-	//    keep the actual input-table types: that's what we marshal/push (and pass to inout_open).
-	for (idx_t i = 0; i < input.input_table_types.size(); i++) {
-		return_types.push_back(info.arg_types[i]);
-		names.push_back(input.input_table_names[i]);
-		bind_data->input_types.push_back(input.input_table_types[i]);
-		bind_data->input_names.push_back(input.input_table_names[i]);
-	}
-
-	// 2) Then the TVF's own output columns (f.*).
-	AppendInOutOutputSchema(context, info.handle, info.schema, info.func, return_types, names);
-	return std::move(bind_data);
-}
-
-// Bind a custom (provider-authored) table-in-out: output schema = the function's FULL declared output
-// (no input echo, unlike the `_each` alias above). The input table's columns are marshalled as-is and
-// validated against the function's expected input in C#.
-unique_ptr<FunctionData> ArrowNetCustomInOutBind(ClientContext &context, TableFunctionBindInput &input,
-                                                 vector<LogicalType> &return_types, vector<string> &names) {
-	auto &info = input.info->Cast<ArrowNetTableFunctionInfo>();
-	auto bind_data = make_uniq<ArrowNetInOutBindData>();
-	bind_data->handle = info.handle;
-	bind_data->schema = info.schema;
-	bind_data->func = info.func;
-	bind_data->isolation = ResolveInOutIsolation(context, info.attach_isolation);
-	bind_data->session_holder = make_shared_ptr<InOutSessionHolder>();
-	for (idx_t i = 0; i < input.input_table_types.size(); i++) {
-		bind_data->input_types.push_back(input.input_table_types[i]);
-		bind_data->input_names.push_back(input.input_table_names[i]);
-	}
-	AppendInOutOutputSchema(context, info.handle, info.schema, info.func, return_types, names);
-	return std::move(bind_data);
-}
-
-unique_ptr<GlobalTableFunctionState> ArrowNetInOutInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
-	auto &bind = input.bind_data->Cast<ArrowNetInOutBindData>();
-	auto &holder = *bind.session_holder;
-	// Build the input table's Arrow schema (its columns are the TVF's positional params) and open the
-	// managed session into the holder (one per execution). C# consumes/releases the schema struct.
-	ArrowSchema input_schema;
-	std::memset(&input_schema, 0, sizeof(input_schema));
-	auto props = context.GetClientProperties();
-	ArrowConverter::ToArrowSchema(&input_schema, bind.input_types, bind.input_names, props);
-	lock_guard<mutex> guard(holder.lock);
-	if (holder.session) {
-		// Re-execution of a cached plan: release the previous session before opening a new one.
-		arrownet::InOutAbort(holder.session);
-		holder.session = nullptr;
-	}
-	holder.finished = false;
-	holder.session = arrownet::InOutOpen(bind.handle, bind.schema, bind.func, input_schema, bind.isolation);
-	return make_uniq<ArrowNetInOutGlobalState>();
-}
-
-unique_ptr<LocalTableFunctionState> ArrowNetInOutInitLocal(ExecutionContext &, TableFunctionInitInput &,
-                                                           GlobalTableFunctionState *) {
-	return make_uniq<ArrowNetInOutLocalState>();
-}
-
-// Per input chunk: push it to the session — the managed side runs THAT chunk's CROSS APPLY to
-// completion and returns its full output (synchronous, no lagging tail). HAVE_MORE_OUTPUT drains the
-// chunk's output across re-calls (same input); NEED_MORE_INPUT advances to the next chunk. Parallel
-// branches push into the one session concurrently; the managed Push serializes them.
-OperatorResultType ArrowNetInOutFunction(ExecutionContext &context, TableFunctionInput &data, DataChunk &input,
-                                         DataChunk &output) {
-	auto &bind = data.bind_data->Cast<ArrowNetInOutBindData>();
-	auto &l = data.local_state->Cast<ArrowNetInOutLocalState>();
-
-	if (!l.pushed_current) {
-		if (input.size() == 0) {
-			output.SetCardinality(0);
-			return OperatorResultType::NEED_MORE_INPUT;
-		}
-		// Marshal the input chunk -> a one-batch Arrow array (columns in param order); the
-		// managed side imports + releases it, so we never release `array` ourselves.
-		auto props = context.client.GetClientProperties();
-		auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(context.client, bind.input_types);
-		ArrowAppender appender(bind.input_types, input.size(), props, extension_types);
-		appender.Append(input, 0, input.size(), input.size());
-		ArrowArray array = appender.Finalize();
-
-		ArrowArrayStream ready;
-		std::memset(&ready, 0, sizeof(ready));
-		arrownet::InOutPush(bind.session_holder->session, array, ready);
-		l.reader = make_uniq<arrownet::ArrowStreamReader>(context.client, ready);
-		l.pushed_current = true;
-	}
-
-	l.reader->Read(output);
-	if (output.size() == 0) {
-		// This chunk's output is exhausted — fetch the next input chunk.
-		l.reader.reset();
-		l.pushed_current = false;
-		return OperatorResultType::NEED_MORE_INPUT;
-	}
-	return OperatorResultType::HAVE_MORE_OUTPUT;
-}
 
 // =============================================================================
 // Phase 6 streaming table-in-out EXCHANGE operator (read-only). Replaces the push/materialize model
@@ -1392,76 +1173,6 @@ OperatorResultType ArrowNetExchangeFunction(ExecutionContext &context, TableFunc
 }
 
 // -----------------------------------------------------------------------------
-// Table-in-out OperatorFinalize (4g): a reliable single "all input consumed" signal to the managed
-// session, for resource cleanup (and a clean commit of a read-only TVF's snapshot transaction — NOT the
-// per-row-proc commit, which DuckDB's transaction manager drives). DuckDB exposes no row-less finalize on
-// the in-out TableFunction itself, so an OptimizerExtension wraps the in-out's LogicalGet in this
-// pass-through LogicalExtensionOperator; its PhysicalOperator forwards rows unchanged and calls
-// holder->Finish() in OperatorFinalize, which fires once (sink-level) after every input branch is drained.
-class ArrowNetInOutFinalizePhysical : public PhysicalOperator {
-public:
-	ArrowNetInOutFinalizePhysical(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
-	                              shared_ptr<InOutSessionHolder> holder)
-	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality),
-	      holder(std::move(holder)) {
-	}
-
-	shared_ptr<InOutSessionHolder> holder;
-
-	string GetName() const override {
-		return "ARROWNET_INOUT_FINALIZE";
-	}
-
-	// Pass-through: forward the child's chunk unchanged.
-	OperatorResultType Execute(ExecutionContext &, DataChunk &input, DataChunk &chunk, GlobalOperatorState &,
-	                           OperatorState &) const override {
-		chunk.Reference(input);
-		return OperatorResultType::NEED_MORE_INPUT;
-	}
-
-	bool ParallelOperator() const override {
-		return true;
-	}
-
-	bool RequiresOperatorFinalize() const override {
-		return true;
-	}
-
-	OperatorFinalResultType OperatorFinalize(Pipeline &, Event &, ClientContext &,
-	                                         OperatorFinalizeInput &) const override {
-		holder->Finish(); // single all-input-done signal (idempotent); resource cleanup / read-only commit
-		return OperatorFinalResultType::FINISHED;
-	}
-};
-
-struct ArrowNetInOutFinalizeOperator : public LogicalExtensionOperator {
-	explicit ArrowNetInOutFinalizeOperator(unique_ptr<LogicalOperator> child, shared_ptr<InOutSessionHolder> holder)
-	    : holder(std::move(holder)) {
-		children.push_back(std::move(child));
-	}
-
-	shared_ptr<InOutSessionHolder> holder;
-
-	PhysicalOperator &CreatePlan(ClientContext &, PhysicalPlanGenerator &planner) override {
-		auto &child_plan = planner.CreatePlan(*children[0]);
-		auto &op = planner.Make<ArrowNetInOutFinalizePhysical>(children[0]->types, children[0]->estimated_cardinality,
-		                                                       holder);
-		op.children.push_back(child_plan);
-		return op;
-	}
-
-	vector<ColumnBinding> GetColumnBindings() override {
-		return children[0]->GetColumnBindings(); // pass-through
-	}
-
-	void ResolveTypes() override {
-		types = children[0]->types;
-	}
-
-	string GetExtensionName() const override {
-		return "arrownet_inout_finalize";
-	}
-};
 
 // The exchange analog: forwards rows 1:1 and drives the exchange EOF (set input_eof + drain the output to
 // terminal-null so the managed DoExchange finishes + disposes) once, sink-level, after all branches.
@@ -1538,18 +1249,12 @@ void WrapArrowNetInOutNodes(unique_ptr<LogicalOperator> &op) {
 		return;
 	}
 	auto &get = op->Cast<LogicalGet>();
-	// A table-in-out is a LogicalGet with input children + one of our in_out_functions; identify by the
-	// function pointer (no RTTI), then recover the holder from its bind data. The push model (proc + the
-	// legacy materializing path) and the Phase 6 streaming exchange use distinct functions + holders.
+	// A table-in-out is a LogicalGet with input children + the exchange in_out_function; identify by the
+	// function pointer (no RTTI), then recover the holder from its bind data to inject the EOF/finalize.
 	if (get.children.empty() || !get.bind_data) {
 		return;
 	}
-	if (get.function.in_out_function == ArrowNetInOutFunction) {
-		auto holder = get.bind_data->Cast<ArrowNetInOutBindData>().session_holder;
-		if (holder) {
-			op = make_uniq<ArrowNetInOutFinalizeOperator>(std::move(op), std::move(holder));
-		}
-	} else if (get.function.in_out_function == ArrowNetExchangeFunction) {
+	if (get.function.in_out_function == ArrowNetExchangeFunction) {
 		auto holder = get.bind_data->Cast<ArrowNetExchangeBindData>().holder;
 		if (holder) {
 			op = make_uniq<ArrowNetExchangeFinalizeOperator>(std::move(op), std::move(holder));

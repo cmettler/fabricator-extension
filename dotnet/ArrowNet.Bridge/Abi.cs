@@ -99,17 +99,8 @@ public unsafe struct ArrowNetVTable
     // (execute_table / execute_proc were removed at ABI v30 — superseded by the table-function session
     //  table_bind / table_execute / table_close below.)
 
-    // int32 inout_open(void* handle, const char* schema, const char* func, ArrowSchema* input_schema, const char* isolation, void** out_session, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowSchema*, byte*, nint*, byte**, int> InOutOpen;
-
-    // int32 inout_push(void* session, ArrowArray* in_chunk, ArrowArrayStream* out, char** err)
-    public delegate* unmanaged[Cdecl]<nint, CArrowArray*, CArrowArrayStream*, byte**, int> InOutPush;
-
-    // int32 inout_finish(void* session, ArrowArrayStream* out, char** err)
-    public delegate* unmanaged[Cdecl]<nint, CArrowArrayStream*, byte**, int> InOutFinish;
-
-    // int32 inout_abort(void* session, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte**, int> InOutAbort;
+    // (inout_open / inout_push / inout_finish / inout_abort were removed at ABI v31 — every `_each` form now
+    //  runs on the streaming exchange: inout_bind / inout_exchange_open / inout_bind_close below.)
 
     // int32 agg_open(void* handle, const char* schema, const char* func, void** out_session, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte*, byte*, nint*, byte**, int> AggOpen;

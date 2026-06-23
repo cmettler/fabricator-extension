@@ -26,7 +26,7 @@ public static unsafe class Bootstrap
             return ArrowNetStatus.InvalidArgument;
         }
 
-        vtable->AbiVersion = 30;
+        vtable->AbiVersion = 31;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -54,10 +54,6 @@ public static unsafe class Bootstrap
         vtable->GetFunctionReturnSchema = &GetFunctionReturnSchema;
         vtable->ExecuteScalar = &ExecuteScalar;
         vtable->GetFunctionOutputSchema = &GetFunctionOutputSchema;
-        vtable->InOutOpen = &InOutOpen;
-        vtable->InOutPush = &InOutPush;
-        vtable->InOutFinish = &InOutFinish;
-        vtable->InOutAbort = &InOutAbort;
         vtable->AggOpen = &AggOpen;
         vtable->AggUpdate = &AggUpdate;
         vtable->AggCombine = &AggCombine;
@@ -680,96 +676,8 @@ public static unsafe class Bootstrap
     // (ExecuteTable / ExecuteProc handlers were removed at ABI v30 — superseded by the table-function
     //  session TableBind / TableExecute / TableClose.)
 
-    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int InOutOpen(nint handle, byte* schema, byte* func, CArrowSchema* inputSchema, byte* isolation,
-                                 nint* outSession, byte** err)
-    {
-        try
-        {
-            if (inputSchema is null || outSession is null)
-            {
-                return ArrowNetStatus.InvalidArgument;
-            }
-            var arrowSchema = CArrowSchemaImporter.ImportSchema(inputSchema); // takes ownership of the C schema
-            var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty);
-            var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
-            var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
-            var iso = Marshal.PtrToStringUTF8((nint)isolation) ?? string.Empty;
-            *outSession = Handles.Alloc(catalog.InOutOpen(s, f, arrowSchema, iso));
-            return ArrowNetStatus.Ok;
-        }
-        catch (Exception ex)
-        {
-            SetError(err, ex);
-            return ArrowNetStatus.Error;
-        }
-    }
-
-    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int InOutPush(nint session, CArrowArray* inChunk, CArrowArrayStream* outStream, byte** err)
-    {
-        try
-        {
-            if (inChunk is null || outStream is null)
-            {
-                return ArrowNetStatus.InvalidArgument;
-            }
-            var s = Handles.Resolve<IInOutSession>(session);
-            if (s is null)
-            {
-                return ArrowNetStatus.InvalidArgument;
-            }
-            var batch = CArrowArrayImporter.ImportRecordBatch(inChunk, s.InputSchema); // takes ownership
-            s.Push(batch);
-            CArrowArrayStreamExporter.ExportArrayStream(s.DrainReady(), outStream);
-            return ArrowNetStatus.Ok;
-        }
-        catch (Exception ex)
-        {
-            SetError(err, ex);
-            return ArrowNetStatus.Error;
-        }
-    }
-
-    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int InOutFinish(nint session, CArrowArrayStream* outStream, byte** err)
-    {
-        try
-        {
-            if (outStream is null)
-            {
-                return ArrowNetStatus.InvalidArgument;
-            }
-            var s = Handles.Resolve<IInOutSession>(session);
-            if (s is null)
-            {
-                return ArrowNetStatus.InvalidArgument;
-            }
-            CArrowArrayStreamExporter.ExportArrayStream(s.Finish(), outStream);
-            return ArrowNetStatus.Ok;
-        }
-        catch (Exception ex)
-        {
-            SetError(err, ex);
-            return ArrowNetStatus.Error;
-        }
-    }
-
-    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int InOutAbort(nint session, byte** err)
-    {
-        try
-        {
-            Handles.Resolve<IInOutSession>(session)?.Abort(); // idempotent
-            Handles.Free(session);
-            return ArrowNetStatus.Ok;
-        }
-        catch (Exception ex)
-        {
-            SetError(err, ex);
-            return ArrowNetStatus.Error;
-        }
-    }
+    // (The 4g table-in-out push handlers InOutOpen/InOutPush/InOutFinish/InOutAbort were removed at ABI v31 —
+    //  every `_each` form now runs on the streaming exchange: InOutBind / InOutExchangeOpen / InOutBindClose.)
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static int InOutBind(nint handle, byte* schema, byte* func, CArrowArrayStream* args, CArrowSchema* inputSchema,

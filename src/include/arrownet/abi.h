@@ -329,35 +329,9 @@ typedef struct ArrowNetVTable {
 	// (execute_table / execute_proc were removed at ABI v30 — superseded by the table-function session
 	//  table_bind / table_execute / table_close at the end of this struct.)
 
-	// -------------------------------------------------------------------------
-	// Table-in-out (Phase 4). A session streams a TABLE in + a TABLE out, used to
-	// apply a function once per input row (e.g. CROSS APPLY a TVF over a parameter
-	// table). Parallel input branches feed ONE session; the host's injected
-	// OperatorFinalize calls inout_finish once after all input is exhausted
-	// (in_out_function_final fires per-branch, so it can't be the single signal);
-	// the operator-state destructor calls inout_abort (error/cancel/LIMIT backstop).
-	// -------------------------------------------------------------------------
-
-	// Open a session. `input_schema` = the Arrow schema of the input table (its columns
-	// are the function's positional parameters; the managed side consumes/releases it).
-	// `isolation` (nullable/empty => provider default) names the SQL transaction isolation
-	// level for the session's pinned connection ("read committed"/"snapshot"/"repeatable
-	// read"/"serializable"/"read uncommitted") — gives a consistent view across the per-chunk
-	// queries of one in-out call. Returns an opaque session handle in *out_session.
-	int32_t (*inout_open)(ArrowNetHandle handle, const char *schema, const char *func,
-	                      struct ArrowSchema *input_schema, const char *isolation, ArrowNetHandle *out_session,
-	                      char **err);
-
-	// Push one input chunk (consumed/released by the managed side); fill *out with the
-	// output rows available so far (may be empty). Backpressured.
-	int32_t (*inout_push)(ArrowNetHandle session, struct ArrowArray *in_chunk, struct ArrowArrayStream *out,
-	                      char **err);
-
-	// Signal input exhausted: drain + return all remaining output in *out. Idempotent.
-	int32_t (*inout_finish)(ArrowNetHandle session, struct ArrowArrayStream *out, char **err);
-
-	// Release the session (error/cancel/LIMIT backstop). Idempotent. Safe with nullptr.
-	int32_t (*inout_abort)(ArrowNetHandle session, char **err);
+	// (The 4g table-in-out PUSH entries inout_open/inout_push/inout_finish/inout_abort were removed at ABI
+	//  v31 — every `_each` form now runs on the streaming exchange below: inout_bind/inout_exchange_open/
+	//  inout_bind_close.)
 
 	// -------------------------------------------------------------------------
 	// Custom aggregate functions (Phase 4h, C#-authored UDAF). DuckDB owns a
@@ -435,10 +409,11 @@ typedef struct ArrowNetVTable {
 	                              char **err);
 
 	// -------------------------------------------------------------------------
-	// Streaming table-in-out exchange (Phase 6, read-only). The newer in-out path for
-	// discovered TVFs (CROSS APPLY) + custom C#-authored in-out functions: instead of the
-	// push/materialize model (inout_open/push/finish/abort, now proc-only), output streams
-	// via two pull-based Arrow streams coordinated by a C++ "gate" mutex — at most one input
+	// Streaming table-in-out exchange (Phase 6). The in-out path for EVERY `_each` form —
+	// discovered TVFs (CROSS APPLY), stored procs (per-row EXEC on DuckDB's pinned write txn),
+	// and custom C#-authored in-out functions (the 4g push entries it replaced were removed at
+	// v31). Output streams via two pull-based Arrow streams coordinated by a C++ "gate" mutex —
+	// at most one input
 	// array + one output array in flight (no per-chunk materialization). One SQL connection +
 	// transaction for the whole call (consistent snapshot); the host's injected
 	// OperatorFinalize is the single EOF signal.
@@ -514,7 +489,7 @@ typedef struct ArrowNetVTable {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 30
+#define ARROWNET_ABI_VERSION 31
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

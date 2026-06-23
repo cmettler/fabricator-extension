@@ -146,22 +146,13 @@ public interface IBackendCatalog : IDisposable
     IBoundTable TableBind(string schemaName, string functionName, RecordBatch? args);
 
     /// <summary>
-    /// Opens a table-in-out session for <c>schema.func</c> over an input table of the given
-    /// <paramref name="inputSchema"/> (its columns are the function's positional parameters). The session
-    /// applies the function once per input row (e.g. CROSS APPLY a TVF over the parameter table) and
-    /// streams output back. <paramref name="isolationLevel"/> (empty => provider default) names the SQL
-    /// transaction isolation level for the session's pinned connection, for a consistent view across the
-    /// in-out call. See <see cref="IInOutSession"/>.
-    /// </summary>
-    IInOutSession InOutOpen(string schemaName, string functionName, Schema inputSchema, string isolationLevel);
-
-    /// <summary>
-    /// Binds one streaming table-in-out call (Phase 6 exchange path). <paramref name="args"/> (nullable) is a
-    /// 1-row batch of the constant "cost" arguments; <paramref name="inputSchema"/> is the input table's schema.
-    /// Returns a binding whose <see cref="IArrowInOutBinding.OutputSchema"/> is the full output (input echo ++
-    /// the function's own columns) and whose <c>DoExchange</c> streams the transform. Used by the gate-based
-    /// exchange operator (custom C# in-out + discovered TVFs); stored procedures keep the push path
-    /// (<see cref="InOutOpen"/>).
+    /// Binds one streaming table-in-out call (Phase 6 exchange path) for every <c>_each</c> form.
+    /// <paramref name="args"/> (nullable) is a 1-row batch of the constant "cost" arguments;
+    /// <paramref name="inputSchema"/> is the input table's schema. Returns a binding whose
+    /// <see cref="IArrowInOutBinding.OutputSchema"/> is the full output (input echo ++ the function's own
+    /// columns) and whose <c>DoExchange</c> streams the transform — a discovered TVF (CROSS APPLY on a
+    /// read-only connection), a stored proc (per-row EXEC on DuckDB's pinned write transaction), or a custom
+    /// C# in-out. The gate-based exchange operator drives it.
     /// </summary>
     IArrowInOutBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema);
 

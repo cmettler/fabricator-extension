@@ -179,27 +179,8 @@ void GetFunctionOutputSchema(ArrowNetHandle handle, const std::string &schema, c
 // (ExecuteTable / ExecuteProc were removed at ABI v30 — superseded by the table-function session
 //  TableBind / TableExecute / TableClose below.)
 
-// -----------------------------------------------------------------------------
-// Table-in-out (Phase 4). A session streams a TABLE in + a TABLE out (apply a
-// function once per input row). See abi.h / docs §11.1.
-// -----------------------------------------------------------------------------
-
-// Open a session for `schema.func` over an input table described by `input_schema`
-// (its columns are the function's positional params; consumed by the managed side).
-// `isolation` (empty => provider default) sets the SQL transaction isolation level for the
-// session's pinned connection. Returns an opaque session handle to push into / finish / abort.
-ArrowNetHandle InOutOpen(ArrowNetHandle handle, const std::string &schema, const std::string &func,
-                         ArrowSchema &input_schema, const std::string &isolation);
-
-// Push one input chunk (the managed side imports + releases it); fills `out` with the
-// output rows available so far (may be empty). Blocks for backpressure.
-void InOutPush(ArrowNetHandle session, ArrowArray &in_chunk, ArrowArrayStream &out);
-
-// Signal input exhausted: drain + fill `out` with all remaining output. Idempotent.
-void InOutFinish(ArrowNetHandle session, ArrowArrayStream &out);
-
-// Release the session (error/cancel/LIMIT backstop). Idempotent; safe with nullptr.
-void InOutAbort(ArrowNetHandle session);
+// (The 4g table-in-out push wrappers InOutOpen/InOutPush/InOutFinish/InOutAbort were removed at ABI v31 —
+//  every `_each` form now runs on the streaming exchange: InOutBind/InOutExchangeOpen/InOutBindClose below.)
 
 // -----------------------------------------------------------------------------
 // Custom aggregate functions (Phase 4h, C#-authored UDAF). The C++ aggregate

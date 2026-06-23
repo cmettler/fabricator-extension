@@ -67,9 +67,6 @@ public sealed class StubBackend : IBackend
         public IBoundTable TableBind(string schemaName, string functionName, RecordBatch? args) =>
             throw new NotSupportedException("stub backend has no table functions");
 
-        public IInOutSession InOutOpen(string schemaName, string functionName, Schema inputSchema, string isolationLevel) =>
-            throw new NotSupportedException("stub backend has no table-in-out functions");
-
         public IArrowInOutBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema) =>
             throw new NotSupportedException("stub backend has no table-in-out functions");
 
