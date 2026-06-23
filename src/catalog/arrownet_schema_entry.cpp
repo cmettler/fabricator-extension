@@ -1664,17 +1664,13 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateInOutFunction(ClientC
 		return nullptr; // a no-arg TVF has nothing to apply per input row
 	}
 
-	// A discovered TVF `_each` streams on the Phase 6 exchange operator (CROSS APPLY, no materialization); a
-	// stored proc keeps the push model (it is EXEC'd per row on DuckDB's pinned write transaction, which the
-	// read-only exchange can't host). Route by the base object's kind.
-	auto base_kind = table_functions_.find(base_func);
-	bool base_is_proc = base_kind != table_functions_.end() && base_kind->second;
-	TableFunction inout =
-	    base_is_proc ? TableFunction(each_name, {LogicalType::TABLE}, nullptr, ArrowNetInOutBind,
-	                                 ArrowNetInOutInitGlobal, ArrowNetInOutInitLocal)
-	                 : TableFunction(each_name, {LogicalType::TABLE}, nullptr, ArrowNetExchangeBind,
-	                                 ArrowNetExchangeInitGlobal, ArrowNetExchangeInitLocal);
-	inout.in_out_function = base_is_proc ? ArrowNetInOutFunction : ArrowNetExchangeFunction;
+	// Every `_each` form (discovered TVF AND stored proc) streams on the Phase 6 exchange operator (gate + two
+	// pull streams, no per-chunk materialization). The managed InOutBind classifies the base object: a TVF
+	// CROSS APPLYs on a read-only connection (SqlServerTvfEach); a proc EXECs per input row on DuckDB's pinned
+	// write transaction (SqlServerProcEach). The retired 4g push operator (ArrowNetInOut*) is now unused.
+	TableFunction inout(each_name, {LogicalType::TABLE}, nullptr, ArrowNetExchangeBind, ArrowNetExchangeInitGlobal,
+	                    ArrowNetExchangeInitLocal);
+	inout.in_out_function = ArrowNetExchangeFunction;
 	auto fn_info = make_shared_ptr<ArrowNetTableFunctionInfo>();
 	fn_info->handle = handle_;
 	fn_info->schema = name;

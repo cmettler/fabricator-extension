@@ -337,8 +337,9 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // Returns a connection for a write. In transaction mode it is the pinned
     // connection (opened + provider-transaction started on first use), owns=false
     // so the caller must NOT dispose it; otherwise a fresh autocommit connection
-    // (owns=true). The connection is already open.
-    private (SqlConnection connection, SqlTransaction? transaction, bool owns) BeginWrite()
+    // (owns=true). The connection is already open. Internal so the top-level
+    // SqlServerProcEach (the proc `_each` exchange binding) can run its per-row EXEC on it.
+    internal (SqlConnection connection, SqlTransaction? transaction, bool owns) BeginWrite()
     {
         lock (_txnLock)
         {
@@ -1364,30 +1365,29 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         return new BindingBoundTable(new SqlServerProcedure(this, schemaName, functionName).Bind(args!), supportsPushdown: false);
     }
 
-    // 4g table-in-out: stream an input parameter table through SQL Server CROSS APPLY of the TVF (the
-    // input columns are the function's positional params). The C++ in_out_function operator pushes each
-    // input chunk; that chunk's CROSS APPLY runs synchronously and its full output is returned (no lagging
-    // tail), so output emission never depends on detecting the last parallel input branch.
-    public IInOutSession InOutOpen(string schemaName, string functionName, Schema inputSchema, string isolationLevel)
-    {
-        // The push path now serves stored procs ONLY: custom C# in-out + discovered TVFs run on the streaming
-        // exchange (see InOutBind), and the C++ side routes only proc `_each` here. A proc can't be inline
-        // CROSS-APPLY'd, so it is EXEC'd once per input row on DuckDB's pinned write transaction (commit/
-        // rollback driven by DuckDB — the SQL isolation level does not apply). See ProcInOutSessionImpl.
-        return new ProcInOutSessionImpl(this, schemaName, functionName, inputSchema);
-    }
+    // The 4g table-in-out PUSH path (inout_open/push/finish/abort) is retired: every `_each` form — discovered
+    // TVFs, stored procs, and custom C# in-out — now runs on the Phase 6 streaming exchange (see InOutBind).
+    // This remains only to satisfy IBackendCatalog; the C++ side never routes here anymore.
+    public IInOutSession InOutOpen(string schemaName, string functionName, Schema inputSchema, string isolationLevel) =>
+        throw new NotSupportedException(
+            "mssql_net: the table-in-out push path is retired; all _each functions run on the streaming exchange (InOutBind)");
 
-    // Phase 6 streaming-exchange bind. A custom C# in-out (IArrowInOutFunction — directly or via the
-    // StaticInOutFunction base) binds itself; a discovered TVF `_each` streams the CROSS APPLY
-    // (SqlServerTvfEach). Stored procs stay on the push path (InOutOpen / ProcInOutSessionImpl, on DuckDB's
-    // pinned write transaction), routed there by the C++ side, so they never reach here.
+    // Phase 6 streaming-exchange bind for every `_each` form. A custom C# in-out (IArrowInOutFunction —
+    // directly or via the StaticInOutFunction base) binds itself; a discovered TVF `_each` CROSS APPLYs on a
+    // read-only connection (SqlServerTvfEach); a stored-proc `_each` EXECs once per input row on DuckDB's
+    // pinned write transaction (SqlServerProcEach). Proc vs TVF is classified the same way as elsewhere — a
+    // TVF has result columns in ROUTINE_COLUMNS, a proc doesn't.
     public IArrowInOutBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema)
     {
         if (CustomInOut.TryGetValue($"{schemaName}.{functionName}", out var custom))
         {
             return custom.Bind(args, inputSchema);
         }
-        return new SqlServerTvfEach(this, schemaName, functionName, inputSchema);
+        if (FunctionOutputColumns(schemaName, functionName).Count > 0)
+        {
+            return new SqlServerTvfEach(this, schemaName, functionName, inputSchema);
+        }
+        return new SqlServerProcEach(this, schemaName, functionName, inputSchema);
     }
 
     // 4h custom aggregate (UDAF): open a session mapping DuckDB's per-group int64 state ids to live C#
