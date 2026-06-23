@@ -147,8 +147,8 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // (case-insensitive). Surfaced as `kind='inout'` (see FunctionsMetadataSql) so the C++ catalog registers
     // them as a {TABLE}-param table function under the bare name, resolved by InOutBind on the streaming
     // exchange (Bind(args, inputSchema) -> the per-call binding). The output is the binding's full declared
-    // schema (no input echo, unlike a discovered TVF's `_each`). Authors use the per-chunk PerChunkInOutFunction
-    // base or implement IArrowInOutFunction directly (free-form DoExchange).
+    // schema (no input echo, unlike a discovered TVF's `_each`). Authors implement IArrowInOutFunction (or its
+    // fixed-schema convenience base StaticInOutFunction) and write DoExchange.
     private static readonly IReadOnlyDictionary<string, IArrowInOutFunction> CustomInOut =
         CustomFunctions.InOut.ToDictionary(f => $"{f.SchemaName}.{f.Name}", StringComparer.OrdinalIgnoreCase);
 
@@ -1408,10 +1408,10 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         return new ProcInOutSessionImpl(this, schemaName, functionName, inputSchema);
     }
 
-    // Phase 6 streaming-exchange bind. A custom C# in-out (IArrowInOutFunction — per-chunk via the
-    // PerChunkInOutFunction base, or free-form DoExchange) binds itself; a discovered TVF `_each` streams the
-    // CROSS APPLY (SqlServerTvfEach). Stored procs stay on the push path (InOutOpen / ProcInOutSessionImpl, on
-    // DuckDB's pinned write transaction), routed there by the C++ side, so they never reach here.
+    // Phase 6 streaming-exchange bind. A custom C# in-out (IArrowInOutFunction — directly or via the
+    // StaticInOutFunction base) binds itself; a discovered TVF `_each` streams the CROSS APPLY
+    // (SqlServerTvfEach). Stored procs stay on the push path (InOutOpen / ProcInOutSessionImpl, on DuckDB's
+    // pinned write transaction), routed there by the C++ side, so they never reach here.
     public IArrowInOutBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema)
     {
         if (CustomInOut.TryGetValue($"{schemaName}.{functionName}", out var custom))

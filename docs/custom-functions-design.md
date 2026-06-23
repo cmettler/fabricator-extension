@@ -678,7 +678,11 @@ discovered `kind='table'` (procs excluded — per-row procs are a later layer), 
 discoverable. A *real* SQL Server function literally named `…_each` shadows the alias (the real name is
 matched first). The in-out bind's `function_info.func` is the **base** TVF name (the CROSS APPLY target).
 
-**Custom C#-authored table-in-out — DONE** (`IArrowTableInOutFunction`, the in-out analog of 4e
+**Custom C#-authored table-in-out — DONE.** *(Reworked in Phase 6 → now `IArrowInOutFunction`, or the
+`StaticInOutFunction` convenience base, on the gate-based streaming exchange; the author writes `DoExchange`
+(yielding a per-input sentinel), not `Process`/`Finish`, and there is one `IArrowInOutFunction` registry. See
+CLAUDE.md "Streaming table-in-out exchange (Phase 6)". The original 4g push design is recorded below.)*
+Original (push) design (`IArrowTableInOutFunction`, the in-out analog of 4e
 `IArrowScalarFunction` / 4f `IArrowTableFunction`): a pure-C# in-out (streaming transform / running aggregate
 / whole-table summary) authored in the provider, dispatched through the *same* session machinery as the TVF
 CROSS APPLY. `Process(chunk)`/`Finish()` are invoked serially per session (no locking needed), and the
@@ -692,7 +696,7 @@ Demos `dbo.cf_tag` (per-row) + `dbo.cf_summarize` (stateful, emits at Finish); s
 (synchronous per-chunk output, no counter; RAII `InOutSessionHolder`) → §11 test matrix
 (`test/verify_table_inout.test`, 63) → configurable isolation (ATTACH `isolation_level` + `SET
 mssql_isolation_level`, one `SqlTransaction` per call, ABI v24; `test/verify_inout_isolation.test`, 17) →
-custom C#-authored `IArrowTableInOutFunction` (`test/verify_custom_functions.test`) → per-row stored procs
+custom C#-authored in-out (`test/verify_custom_functions.test`) → per-row stored procs
 (`usp_x_each`, on DuckDB's pinned transaction; `test/verify_proc_inout.test`, 31) → the injected
 `OperatorFinalize` "in-out finished" cleanup signal (`OptimizerExtension` + `LogicalExtensionOperator` +
 pass-through `PhysicalOperator`, fires once even above a UNION). Possible future: OUTPUT-param-only proc

@@ -71,8 +71,8 @@ SELECT name, kind FROM mssql_net_functions('cdb') WHERE name = 'cf_range';
 ----
 cf_range	table
 
-# A custom C# TABLE-IN-OUT function (IArrowTableInOutFunction): cf_tag(<table of n>) -> (n, n*n) per input
-# row, emitted in Process. Pure C#, no SQL object. Output is the function's full declared schema (no echo).
+# A custom C# TABLE-IN-OUT function (IArrowInOutFunction, via the StaticInOutFunction base): cf_tag(<table of
+# n>) -> (n, n*n) per input row, yielded in DoExchange. Pure C#, no SQL object. Output = the declared schema.
 query II
 SELECT n, sq FROM cdb.dbo.cf_tag((SELECT v.n FROM (VALUES(2),(3),(4)) v(n))) ORDER BY n;
 ----

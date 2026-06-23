@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using Apache.Arrow;
 using Apache.Arrow.Types;
 using ArrowNet.Bridge;
@@ -8,8 +9,8 @@ namespace ArrowNet.SqlServer;
 /// Provider-authored custom functions — scalar, table, table-in-out, and aggregate — surfaced into every
 /// attached catalog alongside the discovered SQL Server functions (resolved as <c>db.schema.name(args)</c>).
 /// To add one, implement the matching Bridge interface (<see cref="IArrowScalarFunction"/>,
-/// <see cref="IArrowTableFunction"/>, <see cref="IArrowInOutFunction"/> — or its per-chunk convenience base
-/// <see cref="PerChunkInOutFunction"/> — or <see cref="IArrowAggregateFunction"/>) and list it in the
+/// <see cref="IArrowTableFunction"/>, <see cref="IArrowInOutFunction"/> — or its fixed-schema convenience base
+/// <see cref="StaticInOutFunction"/> — or <see cref="IArrowAggregateFunction"/>) and list it in the
 /// corresponding array below. These run entirely in C# — there need be no corresponding SQL Server object.
 /// </summary>
 internal static class CustomFunctions
@@ -26,9 +27,10 @@ internal static class CustomFunctions
     };
 
     // Custom table-in-out functions (IArrowInOutFunction), singletons — surfaced as `kind='inout'` and
-    // resolved by SqlServerCatalog.InOutBind on the streaming exchange; Bind() mints the per-call binding.
-    // cf_tag/cf_running_sum use the per-chunk convenience base (PerChunkInOutFunction — the framework owns the
-    // loop + sentinel, per-exchange state via a closure); cf_exchange drives the free-form DoExchange itself.
+    // resolved by SqlServerCatalog.InOutBind on the streaming exchange; Bind() mints the per-call binding. All
+    // three use the fixed-schema convenience base StaticInOutFunction (override OutputSchema + DoExchange; the
+    // author owns the loop + sentinel, cross-chunk state in DoExchange locals — stateless cf_tag, cumulative
+    // cf_running_sum, row-index cf_exchange).
     public static readonly IReadOnlyList<IArrowInOutFunction> InOut = new IArrowInOutFunction[]
     {
         new CfTagFunction(),
@@ -242,10 +244,10 @@ internal sealed class CfSumSpillFunction : IArrowAggregateFunction
     }
 }
 
-// Demo (table-in-out, per-row): dbo.cf_tag(<table of n>) -> (n, sq=n*n) per input row. STATELESS, so the
-// per-chunk convenience base (PerChunkInOutFunction) just exposes the chunk transform as the processor — the
-// framework owns the streaming loop + the per-input sentinel. Pure C#, no SQL object.
-internal sealed class CfTagFunction : PerChunkInOutFunction
+// Demo (table-in-out): dbo.cf_tag(<table of n>) -> (n, sq=n*n) per input row. STATELESS. Uses the
+// StaticInOutFunction base (fixed schema + Bind wiring); the author writes DoExchange — one output batch per
+// input chunk + a sentinel. Pure C#, no SQL object.
+internal sealed class CfTagFunction : StaticInOutFunction
 {
     public override string SchemaName => "dbo";
     public override string Name => "cf_tag";
@@ -259,38 +261,42 @@ internal sealed class CfTagFunction : PerChunkInOutFunction
         new Field("sq", Int32Type.Default, nullable: true),
     }, metadata: null);
 
-    // Stateless => the processor is just the chunk transform (a method group).
-    protected override Func<RecordBatch, IEnumerable<RecordBatch>> CreateProcessor() => ProcessChunk;
-
-    private IEnumerable<RecordBatch> ProcessChunk(RecordBatch inputChunk)
+    public override async IAsyncEnumerable<RecordBatch> DoExchange(
+        IAsyncEnumerable<RecordBatch> input, [EnumeratorCancellation] CancellationToken ct = default)
     {
-        var n = (Int32Array)inputChunk.Column(0);
-        int rows = inputChunk.Length;
-        var nb = new Int32Array.Builder().Reserve(rows);
-        var sq = new Int32Array.Builder().Reserve(rows);
-        for (int i = 0; i < rows; i++)
+        await foreach (var chunk in input.WithCancellation(ct))
         {
-            if (n.IsNull(i))
+            using (chunk)
             {
-                nb.AppendNull();
-                sq.AppendNull();
+                var n = (Int32Array)chunk.Column(0);
+                int rows = chunk.Length;
+                var nb = new Int32Array.Builder().Reserve(rows);
+                var sq = new Int32Array.Builder().Reserve(rows);
+                for (int i = 0; i < rows; i++)
+                {
+                    if (n.IsNull(i))
+                    {
+                        nb.AppendNull();
+                        sq.AppendNull();
+                    }
+                    else
+                    {
+                        nb.Append(n.Values[i]);
+                        sq.Append(n.Values[i] * n.Values[i]);
+                    }
+                }
+                yield return new RecordBatch(OutputSchema, new IArrowArray[] { nb.Build(), sq.Build() }, rows);
             }
-            else
-            {
-                nb.Append(n.Values[i]);
-                sq.Append(n.Values[i] * n.Values[i]);
-            }
+            yield return InOutExchange.EmptyBatch(OutputSchema); // per-input sentinel (NEED_MORE_INPUT)
         }
-        yield return new RecordBatch(OutputSchema, new IArrowArray[] { nb.Build(), sq.Build() }, rows);
     }
 }
 
-// Demo (table-in-out, STATEFUL): dbo.cf_running_sum(<table of n>) -> (n, running) where running is the
-// cumulative sum across the input stream. The per-exchange state lives in a LOCAL (`running`) captured by the
-// processor CreateProcessor mints — a fresh one per exchange, so re-executions never share state (no instance
-// field). The cumulative VALUE is order-dependent, but max(running) == total is order-independent (the last
-// row processed always holds the full sum), which is what the test asserts. Pure C#, no SQL object.
-internal sealed class CfRunningSumFunction : PerChunkInOutFunction
+// Demo (table-in-out, STATEFUL): dbo.cf_running_sum(<table of n>) -> (n, running) — cumulative sum across the
+// input stream, held in a DoExchange LOCAL (`running`, fresh per exchange, so re-executions never share state).
+// The cumulative VALUE is order-dependent, but max(running) == total is order-independent (the last row holds
+// the full sum), which is what the test asserts. Pure C#, no SQL object.
+internal sealed class CfRunningSumFunction : StaticInOutFunction
 {
     public override string SchemaName => "dbo";
     public override string Name => "cf_running_sum";
@@ -304,90 +310,83 @@ internal sealed class CfRunningSumFunction : PerChunkInOutFunction
         new Field("running", Int64Type.Default, nullable: false),
     }, metadata: null);
 
-    protected override Func<RecordBatch, IEnumerable<RecordBatch>> CreateProcessor()
+    public override async IAsyncEnumerable<RecordBatch> DoExchange(
+        IAsyncEnumerable<RecordBatch> input, [EnumeratorCancellation] CancellationToken ct = default)
     {
-        long running = 0; // per-exchange cumulative sum, captured by the local processor below (fresh per exchange)
-        IEnumerable<RecordBatch> Process(RecordBatch inputChunk)
+        long running = 0; // cumulative sum across the whole input stream, in a local (fresh per exchange)
+        await foreach (var chunk in input.WithCancellation(ct))
         {
-            var n = (Int32Array)inputChunk.Column(0);
-            int rows = inputChunk.Length;
-            var nb = new Int32Array.Builder().Reserve(rows);
-            var rb = new Int64Array.Builder().Reserve(rows);
-            for (int i = 0; i < rows; i++)
+            using (chunk)
             {
-                if (n.IsNull(i))
+                var n = (Int32Array)chunk.Column(0);
+                int rows = chunk.Length;
+                var nb = new Int32Array.Builder().Reserve(rows);
+                var rb = new Int64Array.Builder().Reserve(rows);
+                for (int i = 0; i < rows; i++)
                 {
-                    nb.AppendNull();
+                    if (n.IsNull(i))
+                    {
+                        nb.AppendNull();
+                    }
+                    else
+                    {
+                        running += n.Values[i];
+                        nb.Append(n.Values[i]);
+                    }
+                    rb.Append(running);
                 }
-                else
-                {
-                    running += n.Values[i];
-                    nb.Append(n.Values[i]);
-                }
-                rb.Append(running);
+                yield return new RecordBatch(OutputSchema, new IArrowArray[] { nb.Build(), rb.Build() }, rows);
             }
-            yield return new RecordBatch(OutputSchema, new IArrowArray[] { nb.Build(), rb.Build() }, rows);
+            yield return InOutExchange.EmptyBatch(OutputSchema); // per-input sentinel (NEED_MORE_INPUT)
         }
-        return Process;
     }
 }
 
-// Demo: dbo.cf_exchange(<table of n>) -> rows (n, rownum) where rownum is a 1-based index across the WHOLE
-// input stream. Implemented as a free-form IArrowInOutFunction — the author drives the streaming loop in
-// DoExchange (holding the running index in a LOCAL across chunks, not instance state) and yields the per-input
-// sentinel. Dogfoods the author-facing exchange API; the per-chunk Process shape (cf_tag/cf_running_sum) is the
-// simpler alternative where the framework owns the sentinel. Pure C#, no SQL object.
-internal sealed class CfExchangeFunction : IArrowInOutFunction
+// Demo (table-in-out, STATEFUL): dbo.cf_exchange(<table of n>) -> (n, rownum) — rownum is a 1-based index
+// across the WHOLE input stream, held in a DoExchange LOCAL. Same StaticInOutFunction shape as
+// cf_tag/cf_running_sum (the author owns the streaming loop + sentinel). Pure C#, no SQL object.
+internal sealed class CfExchangeFunction : StaticInOutFunction
 {
-    public string SchemaName => "dbo";
-    public string Name => "cf_exchange";
+    public override string SchemaName => "dbo";
+    public override string Name => "cf_exchange";
 
-    public Schema InputSchema => new(new[] { new Field("n", Int32Type.Default, nullable: true) }, metadata: null);
+    public override Schema InputSchema =>
+        new(new[] { new Field("n", Int32Type.Default, nullable: true) }, metadata: null);
 
-    public IArrowInOutBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding();
-
-    private sealed class Binding : IArrowInOutBinding
+    public override Schema OutputSchema => new(new[]
     {
-        public Schema OutputSchema { get; } = new(new[]
-        {
-            new Field("n", Int32Type.Default, nullable: true),
-            new Field("rownum", Int64Type.Default, nullable: false),
-        }, metadata: null);
+        new Field("n", Int32Type.Default, nullable: true),
+        new Field("rownum", Int64Type.Default, nullable: false),
+    }, metadata: null);
 
-        public async IAsyncEnumerable<RecordBatch> DoExchange(
-            IAsyncEnumerable<RecordBatch> input,
-            [System.Runtime.CompilerServices.EnumeratorCancellation] System.Threading.CancellationToken ct = default)
+    public override async IAsyncEnumerable<RecordBatch> DoExchange(
+        IAsyncEnumerable<RecordBatch> input, [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        long rownum = 0; // 1-based index across the whole input stream, in a local (fresh per exchange)
+        await foreach (var chunk in input.WithCancellation(ct))
         {
-            long rownum = 0; // running 1-based index across the whole stream, in a LOCAL (survives chunks)
-            await foreach (var chunk in input)
+            using (chunk)
             {
-                using (chunk)
+                var n = (Int32Array)chunk.Column(0);
+                int rows = chunk.Length;
+                var nb = new Int32Array.Builder().Reserve(rows);
+                var rb = new Int64Array.Builder().Reserve(rows);
+                for (int i = 0; i < rows; i++)
                 {
-                    var n = (Int32Array)chunk.Column(0);
-                    int rows = chunk.Length;
-                    var nb = new Int32Array.Builder().Reserve(rows);
-                    var rb = new Int64Array.Builder().Reserve(rows);
-                    for (int i = 0; i < rows; i++)
+                    rownum++;
+                    if (n.IsNull(i))
                     {
-                        rownum++;
-                        if (n.IsNull(i))
-                        {
-                            nb.AppendNull();
-                        }
-                        else
-                        {
-                            nb.Append(n.Values[i]);
-                        }
-                        rb.Append(rownum);
+                        nb.AppendNull();
                     }
-                    yield return new RecordBatch(OutputSchema, new IArrowArray[] { nb.Build(), rb.Build() }, rows);
+                    else
+                    {
+                        nb.Append(n.Values[i]);
+                    }
+                    rb.Append(rownum);
                 }
-                yield return InOutExchange.EmptyBatch(OutputSchema); // AUTHOR yields the per-input sentinel
+                yield return new RecordBatch(OutputSchema, new IArrowArray[] { nb.Build(), rb.Build() }, rows);
             }
-        }
-
-        public void Dispose()
-        {
+            yield return InOutExchange.EmptyBatch(OutputSchema); // per-input sentinel (NEED_MORE_INPUT)
         }
     }
 }
