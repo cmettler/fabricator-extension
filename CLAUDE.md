@@ -123,8 +123,9 @@ current code still uses the single-provider `mssql_net` naming):
   proc's writes commit/roll back with **DuckDB's** COMMIT/ROLLBACK — atomic in autocommit AND inside an
   explicit DuckDB `BEGIN`, no per-row commits. **`OperatorFinalize` is NOT used for the commit** (committing
   the in-out's own txn at operator-finish would commit before a user's explicit `ROLLBACK` could undo it; the
-  transaction manager is the correct signal). C# `InOutOpen` routes a proc (`sys.objects` type P/PC) to
-  `ProcInOutSessionImpl`, per row running `DECLARE @t TABLE(<proc result>); INSERT @t EXEC [s].[p] @param=@p,…;
+  transaction manager is the correct signal). Now on the Phase 6 streaming exchange (`SqlServerProcEach :
+  IArrowInOutBinding`, resolved by `InOutBind`; was the 4g push `ProcInOutSessionImpl`, retired in `9056eae`):
+  `DoExchange` per row runs `DECLARE @t TABLE(<proc result>); INSERT @t EXEC [s].[p] @param=@p,…;
   SELECT <echoed input>, t.* FROM @t;` on the pinned conn/`_txn` (echo server-side → output = input columns ++
   proc result columns; result-set procs only). Verified: `test/verify_proc_inout.test` (echo output, autocommit
   commit, row-failure rolls back the whole statement, explicit-`BEGIN` read-your-writes + `ROLLBACK` undoes —
@@ -453,12 +454,13 @@ v29 table-function session, and the v30 removal of the dead `execute_table`/`exe
   with **no SQL object** (`sys.objects` count 0). Committed test: `test/verify_custom_functions.test`.
 
 ### Callable table-in-out (4g)
-> **Superseded by the streaming exchange (Phase 6, ABI v28) for custom C# in-out + discovered TVFs.** The
-> per-chunk **materializing** model described in this section (a C# `_ready` buffer + a C# lock, over
-> `inout_open`/`push`/`finish`/`abort`) now serves **stored procs only**. Custom in-out + discovered TVF
-> `_each` run on the gate-based **streaming** exchange — see "Streaming table-in-out exchange (Phase 6)"
-> below. These 4g notes remain the reference for the per-row CROSS APPLY semantics, the echo output schema,
-> and the proc path (all unchanged); only the output transport + the lock location changed.
+> **Fully superseded by the streaming exchange (Phase 6) — this push/materialize model is RETIRED.** The
+> per-chunk materializing model described here (a C# `_ready` buffer + a C# lock, over
+> `inout_open`/`push`/`finish`/`abort`) served custom in-out + discovered TVFs (moved to the exchange in
+> Phase 6) and finally stored procs (`SqlServerProcEach`, moved in `9056eae`). The C# push sessions are gone;
+> the C++ push operator + ABI are dead-in-place. These 4g notes remain the reference for the per-row CROSS
+> APPLY / proc-EXEC **semantics** + the echo output schema (unchanged on the exchange); only the transport
+> changed (push/materialize → gate + two pull streams). See "Streaming table-in-out exchange (Phase 6)".
 - **Surface**: a discovered TVF `db.s.tf` ALSO gets a sibling `db.s.tf_each(<input table>)` (DuckDB
   forbids a TABLE-param overload sharing the bare name — see the §91 sequencing note). `tf_each(<table>)`
   applies `tf` **once per input row** via SQL-Server **`CROSS APPLY`** (T-SQL generated + run in C#),
@@ -512,13 +514,15 @@ v29 table-function session, and the v30 removal of the dead `execute_table`/`exe
   (runs `Process` per push) ahead of the CROSS APPLY path. Demos `CustomFunctions.InOut`: `dbo.cf_tag`
   (per-row `(n, n*n)`) + `dbo.cf_running_sum` (stateful cumulative sum, emitted per row). Verified in
   `test/verify_custom_functions.test`.
-- **Per-row stored procs (4g-proc)**: a discovered proc also gets `_each` (C++ `AddTableFunction` registers
-  the alias for procs too; the in-out bind/operator are reused — a proc can't be inline-CROSS-APPLY'd, so
-  it's EXEC'd per row). C# `InOutOpen` routes a proc (`sys.objects` P/PC) to `ProcInOutSessionImpl`: per
-  input row it runs `DECLARE @t TABLE(<proc result>); INSERT @t EXEC [s].[p] @param=@p,…; SELECT
-  <echoed input>, t.* FROM @t;` on **DuckDB's pinned connection/`_txn`** (`BeginWrite`) — echo is server-side
-  (output = input cols ++ proc result cols), result-set procs only. The proc's writes commit/roll back with
-  **DuckDB's** transaction (autocommit + explicit `BEGIN`), so `Finish`/`Abort` are cleanup-only. Verified:
+- **Per-row stored procs (4g-proc → now on the exchange, `9056eae`)**: a discovered proc also gets `_each`
+  (C++ `AddTableFunction` registers the alias for procs too; a proc can't be inline-CROSS-APPLY'd, so it's
+  EXEC'd per input row). **Now on the streaming exchange** (`SqlServerProcEach : IArrowInOutBinding`, resolved
+  by `InOutBind` — proc vs TVF classified by ROUTINE_COLUMNS): `DoExchange` runs, per input row, `DECLARE @t
+  TABLE(<proc result>); INSERT @t EXEC [s].[p] @param=@p,…; SELECT <echoed input>, t.* FROM @t;` on **DuckDB's
+  pinned connection/`_txn`** (`BeginWrite`) — echo is server-side (output = input cols ++ proc result cols),
+  result-set procs only. It does **not** commit/dispose the pinned scope, so the proc's writes commit/roll
+  back with **DuckDB's** transaction (autocommit + explicit `BEGIN`); the gate (`MaxThreads=1`) serializes the
+  EXECs on the pinned connection. (Was the 4g push `ProcInOutSessionImpl`, retired in `9056eae`.) Verified:
   `test/verify_proc_inout.test`.
 - **OperatorFinalize cleanup signal (4g-finalize)**: an `OptimizerExtension` (`RegisterArrowNetInOutFinalizer`,
   registered at load) wraps each in-out `LogicalGet` (identified by `function.in_out_function ==
@@ -531,11 +535,19 @@ v29 table-function session, and the v30 removal of the dead `execute_table`/`exe
   stays the LIMIT/error backstop (idempotent via `_scopeClosed`).
 
 ### Streaming table-in-out exchange (Phase 6, ABI v28)
-The streaming successor to the 4g push/materialize in-out model, for **custom C# in-out + discovered TVFs**
-(stored procs stay on the 4g push path — they EXEC per row on DuckDB's pinned write transaction, which the
-read-only exchange can't host). No per-chunk materialization: output streams via two pull-based Arrow streams
-coordinated by a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` (operator +
-custom), `330d2c7` (discovered TVF). Design + the 6.0 spike: the plan file's "Phase 6".
+The streaming successor to the 4g push/materialize in-out model, for **ALL `_each` forms — custom C# in-out,
+discovered TVFs, AND stored procs** (procs unified onto the exchange in `9056eae`; the 4g push path is now
+fully retired). No per-chunk materialization: output streams via two pull-based Arrow streams coordinated by
+a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` (operator + custom), `330d2c7`
+(discovered TVF), `9056eae` (proc). Design + the 6.0 spike: the plan file's "Phase 6".
+- **Three bindings, one `DoExchange` shape** (resolved by `InOutBind`, which classifies custom / TVF / proc):
+  a custom C# in-out (`IArrowInOutFunction`); a discovered TVF `_each` (`SqlServerTvfEach` — per-row CROSS
+  APPLY on its **own read-only** connection at the configured isolation); a stored-proc `_each`
+  (`SqlServerProcEach` — per-row `EXEC` on **DuckDB's pinned write** connection (`BeginWrite`), no commit/
+  dispose, so the proc's writes commit/roll back with DuckDB's COMMIT/ROLLBACK). The gate (`MaxThreads=1`)
+  serializes the proc EXECs on the pinned connection; the transactional contract (autocommit / explicit-BEGIN
+  read-your-writes + ROLLBACK) holds — verified by `verify_proc_inout`. The 4g push operator (`ArrowNetInOut*`)
+  + the `inout_open`/`push`/`finish`/`abort` ABI are now unused (dead-in-place; removal is a follow-up).
 - **Author API** (`IArrowInOutBinding`, Bridge): `Schema OutputSchema` + `IAsyncEnumerable<RecordBatch>
   DoExchange(IAsyncEnumerable<RecordBatch> input, ct)`. `input` yields one batch per DuckDB input chunk; the
   returned enumerable maps to the operator contract — non-empty = HAVE_MORE_OUTPUT, **length-0 = the
@@ -573,10 +585,10 @@ custom), `330d2c7` (discovered TVF). Design + the 6.0 spike: the plan file's "Ph
   (`ArrowNetExchangeFinalizePhysical`, parallel to the 4g one): once, sink-level, after all branches it sets
   `input_eof` + drains the output to terminal-null so the managed `DoExchange` finishes + disposes — NOT a
   producer counter (the rejected premature-finish design). `ExchangeHolder` (refcounted on the bind data) frees
-  the binding once. Registration: custom in-out (`GetOrCreateCustomInOutFunction`) + TVF `_each`
-  (`GetOrCreateInOutFunction`, branched by the base object's kind) use the exchange callbacks; proc `_each` keeps
-  the push callbacks (so proc-vs-TVF is decided at registration — the per-open `IsStoredProcedure` round-trip is
-  gone).
+  the binding once. Registration: custom in-out (`GetOrCreateCustomInOutFunction`) + **every** `_each`
+  (`GetOrCreateInOutFunction`) use the exchange callbacks (proc `_each` moved here in `9056eae` — no
+  base-is-proc branch); the managed `InOutBind` classifies custom / TVF / proc and returns the matching
+  binding (`SqlServerTvfEach` read-only conn / `SqlServerProcEach` DuckDB's pinned write conn).
 - **Verified**: `verify_custom_functions` (73 — incl. parallel UNION ALL + a `threads=1` sequential-union case,
   the schedule a premature-finish bug would drop rows on); `verify_table_inout` (63, TVF now on the exchange);
   `verify_inout_isolation` (17, via `IArrowInOutIsolation`); `verify_proc_inout` (31, push, unregressed). Full
