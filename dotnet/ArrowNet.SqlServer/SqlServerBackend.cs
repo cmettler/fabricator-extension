@@ -1248,7 +1248,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // A stored procedure's first result-set columns via sp_describe_first_result_set
     // (late-binding). system_type_name is the full SQL type, used directly. Empty =>
     // no determinable result set (e.g. a proc that only does work / has OUTPUT params).
-    private List<(string name, string sqlType)> ProcResultColumns(string schemaName, string functionName)
+    internal List<(string name, string sqlType)> ProcResultColumns(string schemaName, string functionName)
     {
         using var connection = OpenConnection();
         connection.Open();
@@ -1270,7 +1270,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     // A stored procedure's OUTPUT parameters (PARAMETER_MODE 'INOUT'), each with a
     // reconstructed SQL type, in ordinal order. De-@'d names. Empty => none.
-    private List<(string name, string sqlType)> ProcOutputParams(string schemaName, string functionName)
+    internal List<(string name, string sqlType)> ProcOutputParams(string schemaName, string functionName)
     {
         using var connection = OpenConnection();
         connection.Open();
@@ -1310,29 +1310,15 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             return new InMemoryArrayStream(binding.OutputSchema, System.Array.Empty<RecordBatch>());
         }
         // Custom in-out functions resolve their output schema through InOutBind (the exchange path), not here.
-        // TVFs expose their result columns in ROUTINE_COLUMNS; stored procs don't.
+        // A TVF exposes its result columns in ROUTINE_COLUMNS; a stored proc doesn't, so the SqlServerProcedure
+        // wrapper resolves the proc's schema (OUTPUT params + return_value, else sp_describe_first_result_set).
         var cols = FunctionOutputColumns(schemaName, functionName);
         if (cols.Count == 0)
         {
-            // A proc with OUTPUT params returns the outputs (+ the integer RETURN value) as
-            // flat columns — its own result set, if any, is ignored; otherwise (no outputs)
-            // its first result set via sp_describe_first_result_set (late-binding).
-            var outs = ProcOutputParams(schemaName, functionName);
-            if (outs.Count > 0)
-            {
-                outs.Add(("return_value", "int"));
-                cols = outs;
-            }
-            else
-            {
-                cols = ProcResultColumns(schemaName, functionName);
-            }
+            using var procBinding = new SqlServerProcedure(this, schemaName, functionName).Bind(args!);
+            return new InMemoryArrayStream(procBinding.OutputSchema, System.Array.Empty<RecordBatch>());
         }
-        if (cols.Count == 0)
-        {
-            throw new ArgumentException(
-                $"mssql_net: '{schemaName}.{functionName}' has no describable result set");
-        }
+        // TVF: a zero-row stream typed by the ROUTINE_COLUMNS columns.
         var sb = new StringBuilder("SELECT ");
         for (int i = 0; i < cols.Count; i++)
         {
@@ -1835,48 +1821,19 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     public IArrowArrayStream ExecuteProc(string schemaName, string functionName, IArrowArrayStream args)
     {
-        var qualified = Quote(schemaName) + "." + Quote(functionName);
-        var argParams = new List<SqlParameter>();
-        var assignments = new List<string>(); // @<inputParamName> = @p<c>, from the supplied named args
-        using (var reader = new ArrowDataReader(args))
+        // The proc EXEC logic lives in the SqlServerProcedure wrapper (IArrowTableFunction). Read the 1-row
+        // named-args batch out of the stream (field names = supplied parameter names), bind, and stream the
+        // result lazily; the returned stream owns the binding (and the args batch), disposing both at close.
+        RecordBatch argBatch;
+        using (args)
         {
-            int paramCount = reader.FieldCount;
-            if (reader.Read())
-            {
-                for (int c = 0; c < paramCount; c++)
-                {
-                    var pn = $"@p{c}";
-                    argParams.Add(new SqlParameter(pn, (reader.IsDBNull(c) ? null : reader.GetValue(c)) ?? (object)DBNull.Value));
-                    assignments.Add($"@{reader.GetName(c)} = {pn}");
-                }
-            }
+            argBatch = args.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult()
+                       ?? throw new ArgumentException(
+                           $"mssql_net: '{schemaName}.{functionName}' called with no argument batch");
         }
-
-        var outs = ProcOutputParams(schemaName, functionName);
-        if (outs.Count == 0)
-        {
-            // No OUTPUT params: return the proc's first result set.
-            var exec = assignments.Count > 0 ? $"EXEC {qualified} {string.Join(", ", assignments)}" : $"EXEC {qualified}";
-            return ExecuteQuery(exec, argParams);
-        }
-
-        // OUTPUT params: capture them (+ the integer RETURN value) via T-SQL locals and
-        // SELECT them as a flat 1-row result set (the proc's own result set is ignored).
-        // Avoids the SqlParameter Direction=Output timing caveat (no buffering needed).
-        var decls = new List<string>();
-        foreach (var (name, sqlType) in outs)
-        {
-            decls.Add($"@{name} {sqlType}");
-            assignments.Add($"@{name} = @{name} OUTPUT");
-        }
-        decls.Add("@_rv int");
-        var selects = outs.Select(o => $"@{o.name} AS {Quote(o.name)}").ToList();
-        selects.Add("@_rv AS [return_value]");
-        var batch =
-            $"DECLARE {string.Join(", ", decls)}; " +
-            $"EXEC @_rv = {qualified} {string.Join(", ", assignments)}; " +
-            $"SELECT {string.Join(", ", selects)};";
-        return ExecuteQuery(batch, argParams);
+        var binding = new SqlServerProcedure(this, schemaName, functionName).Bind(argBatch);
+        return new AsyncEnumerableArrowStream(
+            binding.OutputSchema, binding.Execute(new TableFunctionScan(null, null)), binding);
     }
 
     // Drops any DEFAULT constraint bound to a column (no-op if none).
