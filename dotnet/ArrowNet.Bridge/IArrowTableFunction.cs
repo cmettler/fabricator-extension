@@ -77,4 +77,8 @@ public sealed class TableFunctionScan
 
     public string? SpecJson { get; }
     public IArrowArrayStream? FilterValues { get; }
+
+    /// <summary>The parsed <see cref="SpecJson"/> (projection + filter + time travel), or null when there is
+    /// none — a convenience for custom table functions that want to honor the pushdown spec.</summary>
+    public ScanSpec? Spec => ScanSpec.Parse(SpecJson);
 }

@@ -1,18 +1,23 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
-namespace ArrowNet.SqlServer;
+namespace ArrowNet.Bridge;
 
 /// <summary>
-/// Pushdown specification the C++ host sends with a table scan, as a small JSON
-/// document: <c>{ "columns": ["a","b"], "filter": &lt;predicate-tree&gt; }</c>.
+/// The projection + filter (+ time-travel) pushdown specification the C++ host sends with a table or
+/// table-function scan, as a small JSON document:
+/// <c>{ "columns": ["a","b"], "filter": &lt;predicate-tree&gt;, "top": n, "order_by": [...], "at": {...} }</c>.
 ///
-/// <para><c>columns</c> is the projection (absent/empty =&gt; <c>SELECT *</c>).</para>
-/// <para><c>filter</c> is an optional predicate tree (see <see cref="FilterNode"/>);
-/// its constants are referenced by index into the separate Arrow value batch, so
-/// the final WHERE can be built with parameters rather than inlined literals.</para>
+/// <para>This is the provider-agnostic mirror of the host's <c>spec_json</c> contract (defined by the C++
+/// arrownet core), so it lives in the Bridge: every backend (SQL Server, future DAX) and any custom C#
+/// table function (which receives the raw <see cref="TableFunctionScan.SpecJson"/>) can parse it. Rendering
+/// a parsed spec into provider SQL (e.g. a T-SQL WHERE) is provider-specific and stays in the backend.</para>
+///
+/// <para><c>columns</c> is the projection (absent/empty =&gt; <c>SELECT *</c>). <c>filter</c> is an optional
+/// predicate tree (see <see cref="FilterNode"/>) whose constants are referenced by index into the separate
+/// Arrow value batch, so the final predicate can be built with parameters rather than inlined literals.</para>
 /// </summary>
-internal sealed class ScanSpec
+public sealed class ScanSpec
 {
     [JsonPropertyName("columns")]
     public List<string>? Columns { get; set; }
@@ -43,7 +48,7 @@ internal sealed class ScanSpec
 }
 
 /// <summary>One ORDER BY key: a column name + direction.</summary>
-internal sealed class OrderKey
+public sealed class OrderKey
 {
     [JsonPropertyName("col")]
     public string Col { get; set; } = "";
@@ -53,9 +58,9 @@ internal sealed class OrderKey
 }
 
 /// <summary>A DuckDB <c>AT (...)</c> time-travel clause: a unit ("timestamp" / "version") + the constant
-/// value (rendered as a string). The SQL Server provider maps "timestamp" to <c>FOR SYSTEM_TIME AS OF</c>;
-/// "version" has no equivalent and is rejected.</summary>
-internal sealed class AtSpec
+/// value (rendered as a string). A backend maps it to its own time-travel facility (SQL Server maps
+/// "timestamp" to <c>FOR SYSTEM_TIME AS OF</c>; "version" has no equivalent and is rejected).</summary>
+public sealed class AtSpec
 {
     [JsonPropertyName("unit")]
     public string Unit { get; set; } = "";

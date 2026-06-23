@@ -1,4 +1,5 @@
 using System.Text;
+using ArrowNet.Bridge;
 using Microsoft.Data.SqlClient;
 
 namespace ArrowNet.SqlServer;
