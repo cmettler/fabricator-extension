@@ -326,22 +326,8 @@ typedef struct ArrowNetVTable {
 	int32_t (*get_function_output_schema)(ArrowNetHandle handle, const char *schema, const char *func,
 	                                      struct ArrowArrayStream *args, struct ArrowArrayStream *out, char **err);
 
-	// Execute a table-valued function over its constant arguments: `args` is a 1-row
-	// stream of the argument values (in param order; consumed by the managed side).
-	// `spec_json` (nullable/empty => SELECT *) + `filter_values` (nullable) carry
-	// projection + best-effort filter pushdown into the TVF, exactly like scan_table:
-	// the managed side emits `SELECT <cols> FROM schema.func(@args) WHERE <filter>`.
-	// *out receives the result rows.
-	int32_t (*execute_table)(ArrowNetHandle handle, const char *schema, const char *func,
-	                         struct ArrowArrayStream *args, const char *spec_json,
-	                         struct ArrowArrayStream *filter_values, struct ArrowArrayStream *out, char **err);
-
-	// Execute a stored procedure over its constant arguments: `args` is a 1-row stream
-	// of the argument values (positional, in param order; consumed by the managed side);
-	// *out receives the procedure's first result set. No projection/filter pushdown — a
-	// proc's EXEC is not inline-wrappable, so DuckDB applies projection + filters locally.
-	int32_t (*execute_proc)(ArrowNetHandle handle, const char *schema, const char *func,
-	                        struct ArrowArrayStream *args, struct ArrowArrayStream *out, char **err);
+	// (execute_table / execute_proc were removed at ABI v30 — superseded by the table-function session
+	//  table_bind / table_execute / table_close at the end of this struct.)
 
 	// -------------------------------------------------------------------------
 	// Table-in-out (Phase 4). A session streams a TABLE in + a TABLE out, used to
@@ -486,14 +472,14 @@ typedef struct ArrowNetVTable {
 
 	// -------------------------------------------------------------------------
 	// Table-function session (Phase 5). The session-handle successor to the
-	// stateless execute_table / execute_proc (left in place but unused once the
-	// host adopts this): table_bind resolves a per-PLAN binding (output schema +
-	// whether it accepts pushdown) once; that binding is reused by table_execute
-	// for each execution (the result stream owns its own provider connection,
-	// released by the host's arrow scan at teardown — no separate close). Unifies
-	// discovered TVFs (pushdown), stored procs (no pushdown) and custom C# table
-	// functions behind one path; the managed side classifies the function (so the
-	// host no longer needs the is_proc distinction at bind).
+	// stateless execute_table / execute_proc (removed at v30): table_bind resolves
+	// a per-PLAN binding (output schema + whether it accepts pushdown) once; that
+	// binding is reused by table_execute for each execution (the result stream owns
+	// its own provider connection, released by the host's arrow scan at teardown —
+	// no separate close). Unifies discovered TVFs (pushdown), stored procs (no
+	// pushdown) and custom C# table functions behind one path; the managed side
+	// classifies the function (so the host no longer needs the is_proc distinction
+	// at bind).
 	// -------------------------------------------------------------------------
 
 	// Bind one table-function call. `args` (nullable) is a 1-row Arrow stream of the
@@ -528,7 +514,7 @@ typedef struct ArrowNetVTable {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 29
+#define ARROWNET_ABI_VERSION 30
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

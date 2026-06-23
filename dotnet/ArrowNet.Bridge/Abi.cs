@@ -96,12 +96,8 @@ public unsafe struct ArrowNetVTable
     // int32 get_function_output_schema(void* handle, const char* schema, const char* func, ArrowArrayStream* args, ArrowArrayStream* out, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, CArrowArrayStream*, byte**, int> GetFunctionOutputSchema;
 
-    // int32 execute_table(void* handle, const char* schema, const char* func, ArrowArrayStream* args,
-    //                     const char* spec_json, ArrowArrayStream* filter_values, ArrowArrayStream* out, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, byte*, CArrowArrayStream*, CArrowArrayStream*, byte**, int> ExecuteTable;
-
-    // int32 execute_proc(void* handle, const char* schema, const char* func, ArrowArrayStream* args, ArrowArrayStream* out, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, CArrowArrayStream*, byte**, int> ExecuteProc;
+    // (execute_table / execute_proc were removed at ABI v30 — superseded by the table-function session
+    //  table_bind / table_execute / table_close below.)
 
     // int32 inout_open(void* handle, const char* schema, const char* func, ArrowSchema* input_schema, const char* isolation, void** out_session, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowSchema*, byte*, nint*, byte**, int> InOutOpen;

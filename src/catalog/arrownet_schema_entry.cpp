@@ -801,9 +801,9 @@ struct TableBindState {
 	}
 };
 
-// Bind a catalog-bound TVF: resolve the (fixed) output schema for the return types, then
-// install a scan factory that marshals the constant call args into a 1-row Arrow batch
-// and runs execute_table (which streams the result rows).
+// Bind a catalog-bound TVF / proc / custom table function (Phase 5 session model): table_bind resolves the
+// output schema (return types) + pushdown + an opaque binding, then a scan factory runs table_execute over
+// that binding per execution (which streams the result rows). See TableBindState + abi.h.
 unique_ptr<FunctionData> ArrowNetTableFunctionBind(ClientContext &context, TableFunctionBindInput &input,
                                                    vector<LogicalType> &return_types, vector<string> &names) {
 	auto &info = input.info->Cast<ArrowNetTableFunctionInfo>();

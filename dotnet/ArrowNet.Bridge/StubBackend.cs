@@ -64,16 +64,6 @@ public sealed class StubBackend : IBackend
         public IArrowArrayStream GetFunctionOutputSchema(string schemaName, string functionName, RecordBatch? args = null) =>
             EmptyStringTable("result");
 
-        public IArrowArrayStream ExecuteTable(string schemaName, string functionName, IArrowArrayStream args,
-                                              string? specJson, IArrowArrayStream? filterValues)
-        {
-            filterValues?.Dispose();
-            return EmptyStringTable("result");
-        }
-
-        public IArrowArrayStream ExecuteProc(string schemaName, string functionName, IArrowArrayStream args) =>
-            EmptyStringTable("result");
-
         public IBoundTable TableBind(string schemaName, string functionName, RecordBatch? args) =>
             throw new NotSupportedException("stub backend has no table functions");
 

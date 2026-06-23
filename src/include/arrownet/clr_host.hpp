@@ -176,18 +176,8 @@ void ExecuteScalar(ArrowNetHandle handle, const std::string &schema, const std::
 void GetFunctionOutputSchema(ArrowNetHandle handle, const std::string &schema, const std::string &func,
                              ArrowArrayStream *args, ArrowArrayStream &out);
 
-// Execute a table-valued function over its constant arguments: `args` is a 1-row stream
-// of the argument values (in param order; consumed by the managed side). `spec_json`
-// (empty => none) + `filter_values` (nullable) carry projection + best-effort filter
-// pushdown into the TVF (like ScanTable). Fills `out` with the function's result rows.
-void ExecuteTable(ArrowNetHandle handle, const std::string &schema, const std::string &func, ArrowArrayStream &args,
-                  const std::string &spec_json, ArrowArrayStream *filter_values, ArrowArrayStream &out);
-
-// Execute a stored procedure over its constant arguments: `args` is a 1-row stream of
-// the positional argument values (consumed by the managed side); fills `out` with the
-// procedure's first result set. No pushdown (EXEC is not inline-wrappable).
-void ExecuteProc(ArrowNetHandle handle, const std::string &schema, const std::string &func, ArrowArrayStream &args,
-                 ArrowArrayStream &out);
+// (ExecuteTable / ExecuteProc were removed at ABI v30 — superseded by the table-function session
+//  TableBind / TableExecute / TableClose below.)
 
 // -----------------------------------------------------------------------------
 // Table-in-out (Phase 4). A session streams a TABLE in + a TABLE out (apply a

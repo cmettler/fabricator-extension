@@ -136,27 +136,11 @@ public interface IBackendCatalog : IDisposable
     IArrowArrayStream GetFunctionOutputSchema(string schemaName, string functionName, RecordBatch? args = null);
 
     /// <summary>
-    /// Executes a table-valued function over its constant arguments: <paramref name="args"/> is a 1-row
-    /// stream of the argument values (in parameter order). <paramref name="specJson"/> (null => SELECT *)
-    /// + <paramref name="filterValues"/> (null => no filter) carry projection + best-effort filter
-    /// pushdown, exactly like <see cref="ScanTable"/>. Returns the function's result rows.
-    /// </summary>
-    IArrowArrayStream ExecuteTable(string schemaName, string functionName, IArrowArrayStream args, string? specJson,
-                                   IArrowArrayStream? filterValues);
-
-    /// <summary>
-    /// Executes a stored procedure over its constant arguments (<paramref name="args"/> = a 1-row stream of
-    /// the positional argument values); returns the procedure's first result set. No pushdown — a proc's
-    /// EXEC is not inline-wrappable, so DuckDB applies projection + filters above the scan.
-    /// </summary>
-    IArrowArrayStream ExecuteProc(string schemaName, string functionName, IArrowArrayStream args);
-
-    /// <summary>
-    /// Binds one table-function call (Phase 5 session model — the successor to <see cref="ExecuteTable"/> /
-    /// <see cref="ExecuteProc"/>). <paramref name="args"/> (nullable) is a 1-row batch of the constant call
-    /// arguments. Returns an <see cref="IBoundTable"/> whose <see cref="IBoundTable.OutputSchema"/> is the
-    /// function's output columns (a custom function's may depend on the args) and which executes the scan
-    /// (possibly many times); the managed side classifies the function (discovered TVF / stored proc /
+    /// Binds one table-function call (Phase 5 session model — the successor to the removed
+    /// <c>execute_table</c>/<c>execute_proc</c>). <paramref name="args"/> (nullable) is a 1-row batch of the
+    /// constant call arguments. Returns an <see cref="IBoundTable"/> whose <see cref="IBoundTable.OutputSchema"/>
+    /// is the function's output columns (a custom function's may depend on the args) and which executes the
+    /// scan (possibly many times); the managed side classifies the function (discovered TVF / stored proc /
     /// custom). The binding is reused across (prepared) re-executions and disposed via the host's table_close.
     /// </summary>
     IBoundTable TableBind(string schemaName, string functionName, RecordBatch? args);

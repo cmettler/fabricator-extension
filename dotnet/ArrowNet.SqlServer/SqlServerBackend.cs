@@ -139,7 +139,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         CustomFunctions.Scalar.ToDictionary(f => $"{f.SchemaName}.{f.Name}", StringComparer.OrdinalIgnoreCase);
 
     // Provider-authored custom table functions, keyed "schema.name" (case-insensitive). Surfaced like
-    // discovered TVFs but dispatched to C# (see ExecuteTable / GetFunctionParamSchema / GetFunctionOutputSchema).
+    // discovered TVFs but dispatched to C# (see TableBind / GetFunctionParamSchema / GetFunctionOutputSchema).
     private static readonly IReadOnlyDictionary<string, IArrowTableFunction> CustomTable =
         CustomFunctions.Table.ToDictionary(f => $"{f.SchemaName}.{f.Name}", StringComparer.OrdinalIgnoreCase);
 
@@ -1324,10 +1324,10 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     }
 
     // Phase 5 session model: bind a table-function call into an IBoundTable (the host then runs it via
-    // table_execute and frees it via table_close). Classifies the function exactly like
-    // GetFunctionOutputSchema / ExecuteTable / ExecuteProc — a custom (pure-C#) table function, else a
-    // discovered TVF (its result columns are in ROUTINE_COLUMNS; pushdown), else a stored proc (no pushdown).
-    // The binding resolves the output schema once and is reused across (prepared) re-executions.
+    // table_execute and frees it via table_close). Classifies the function the same way
+    // GetFunctionOutputSchema does — a custom (pure-C#) table function, else a discovered TVF (its result
+    // columns are in ROUTINE_COLUMNS; pushdown), else a stored proc (no pushdown). The binding resolves the
+    // output schema once and is reused across (prepared) re-executions.
     public IBoundTable TableBind(string schemaName, string functionName, RecordBatch? args)
     {
         // supportsPushdown = !is_proc (preserves the prior push_projection): a custom function maps its full
@@ -1344,43 +1344,6 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         return new BindingBoundTable(new SqlServerProcedure(this, schemaName, functionName).Bind(args!), supportsPushdown: false);
     }
 
-    // Executes a TVF over its constant arguments (row 0 of the args stream, in param
-    // order) as `SELECT <cols> FROM [s].[f](@a0, ...) WHERE <filter>` — args bound as
-    // @a* (disjoint from the filter's @p*); projection + filter pushed via the spec.
-    public IArrowArrayStream ExecuteTable(string schemaName, string functionName, IArrowArrayStream args,
-                                          string? specJson, IArrowArrayStream? filterValues)
-    {
-        RecordBatch argBatch;
-        using (var input = args) // 1-row args stream; argBatch is read out (independent) before disposal
-        {
-            argBatch = input.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult()
-                       ?? throw new ArgumentException($"mssql_net: '{schemaName}.{functionName}' called with no arguments");
-        }
-        // Provider-authored custom (pure-C#) table function: no SQL to push into, so it ignores projection/
-        // filter — dispose the filter constants and return the full result (DuckDB projects by column name +
-        // filters above the scan).
-        if (CustomTable.TryGetValue($"{schemaName}.{functionName}", out var custom))
-        {
-            filterValues?.Dispose();
-            var customBinding = custom.Bind(argBatch);
-            return new AsyncEnumerableArrowStream(
-                customBinding.OutputSchema, customBinding.Execute(new TableFunctionScan(specJson, null)), customBinding);
-        }
-        // Discovered SQL Server TVF: ScanFromSource's stream already reflects the pushed projection (its
-        // schema matches the projected batches), so return it directly — never re-wrap it with a fixed schema.
-        // ExecuteScan reads `argBatch` synchronously (does not own it), so dispose it once the stream is built.
-        using (argBatch)
-        {
-            return new SqlServerTableValuedFunction(this, schemaName, functionName)
-                .ExecuteScan(argBatch, specJson, filterValues);
-        }
-    }
-
-    // Executes a stored procedure over its supplied named arguments as
-    // `EXEC [s].[p] @name1=@p0, ...` — the args stream's FIELD NAMES are the proc's
-    // parameter names (only the supplied ones are present; omitted optionals use the
-    // proc's DEFAULT). Streams the first result set lazily. No pushdown (EXEC is not
-    // inline-wrappable); DuckDB applies projection + filters above the scan.
     // 4g table-in-out: stream an input parameter table through SQL Server CROSS APPLY of the TVF (the
     // input columns are the function's positional params). The C++ in_out_function operator pushes each
     // input chunk; that chunk's CROSS APPLY runs synchronously and its full output is returned (no lagging
@@ -1811,24 +1774,6 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         var level = ParseIsolationLevel(isolation);
         var txn = level == IsolationLevel.Unspecified ? connection.BeginTransaction() : connection.BeginTransaction(level);
         return (connection, txn);
-    }
-
-
-    public IArrowArrayStream ExecuteProc(string schemaName, string functionName, IArrowArrayStream args)
-    {
-        // The proc EXEC logic lives in the SqlServerProcedure wrapper (IArrowTableFunction). Read the 1-row
-        // named-args batch out of the stream (field names = supplied parameter names), bind, and stream the
-        // result lazily; the returned stream owns the binding (and the args batch), disposing both at close.
-        RecordBatch argBatch;
-        using (args)
-        {
-            argBatch = args.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult()
-                       ?? throw new ArgumentException(
-                           $"mssql_net: '{schemaName}.{functionName}' called with no argument batch");
-        }
-        var binding = new SqlServerProcedure(this, schemaName, functionName).Bind(argBatch);
-        return new AsyncEnumerableArrowStream(
-            binding.OutputSchema, binding.Execute(new TableFunctionScan(null, null)), binding);
     }
 
     // Drops any DEFAULT constraint bound to a column (no-op if none).
