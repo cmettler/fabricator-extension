@@ -26,6 +26,12 @@ internal sealed class ScanSpec
     [JsonPropertyName("order_by")]
     public List<OrderKey>? OrderBy { get; set; }
 
+    /// <summary>Time travel (DuckDB <c>AT (...)</c>): a base-table snapshot context. Only set for catalog
+    /// table scans (the AT clause is a base-table feature). <see cref="AtSpec.Unit"/> is "timestamp" or
+    /// "version".</summary>
+    [JsonPropertyName("at")]
+    public AtSpec? At { get; set; }
+
     private static readonly JsonSerializerOptions Options = new()
     {
         PropertyNameCaseInsensitive = true,
@@ -44,4 +50,16 @@ internal sealed class OrderKey
 
     [JsonPropertyName("desc")]
     public bool Desc { get; set; }
+}
+
+/// <summary>A DuckDB <c>AT (...)</c> time-travel clause: a unit ("timestamp" / "version") + the constant
+/// value (rendered as a string). The SQL Server provider maps "timestamp" to <c>FOR SYSTEM_TIME AS OF</c>;
+/// "version" has no equivalent and is rejected.</summary>
+internal sealed class AtSpec
+{
+    [JsonPropertyName("unit")]
+    public string Unit { get; set; } = "";
+
+    [JsonPropertyName("value")]
+    public string Value { get; set; } = "";
 }

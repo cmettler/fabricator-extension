@@ -223,6 +223,15 @@ static string BuildScanSpec(const ArrowStreamBindData &bind_data, const vector<c
 	if (!bind_data.order_by_json.empty() && bind_data.filter_json.empty()) {
 		json += ",\"order_by\":" + bind_data.order_by_json; // already a JSON array
 	}
+	// Time travel (AT clause): orthogonal to projection/filter/order — always emitted when set so the
+	// provider applies it as a table-level temporal qualifier (SQL Server: FOR SYSTEM_TIME AS OF).
+	if (!bind_data.at_unit.empty()) {
+		json += ",\"at\":{\"unit\":";
+		JsonEscape(bind_data.at_unit, json);
+		json += ",\"value\":";
+		JsonEscape(bind_data.at_value, json);
+		json += "}";
+	}
 	json += "}";
 	return json;
 }

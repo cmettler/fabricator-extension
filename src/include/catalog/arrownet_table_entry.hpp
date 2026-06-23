@@ -14,6 +14,7 @@ namespace duckdb {
 
 class LogicalGet;
 class Expression;
+class BoundAtClause;
 
 //! pushdown_complex_filter callback shared by the catalog table scan AND the table-
 //! function (TVF) scan: serializes the superset-safe predicates into the scan's
@@ -30,6 +31,10 @@ public:
 	//! Produces a table scan that streams `SELECT * FROM [schema].[table]` from
 	//! SQL Server as Arrow into DuckDB.
 	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override;
+	//! Time-travel overload: DuckDB binds `FROM t AT (...)` and passes the bound clause via the lookup info.
+	//! TIMESTAMP maps to `FOR SYSTEM_TIME AS OF` (system-versioned tables); VERSION is rejected managed-side.
+	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data,
+	                              const EntryLookupInfo &lookup_info) override;
 
 	unique_ptr<BaseStatistics> GetStatistics(ClientContext &context, column_t column_id) override;
 	TableStorageInfo GetStorageInfo(ClientContext &context) override;
@@ -48,6 +53,10 @@ public:
 	}
 
 private:
+	//! Shared body of both GetScanFunction overloads; `at_clause` (nullable) is the time-travel snapshot.
+	TableFunction BuildScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data,
+	                                optional_ptr<BoundAtClause> at_clause);
+
 	ArrowNetHandle handle_;
 	//! Indices (in table column order) of the rowid/PK columns; empty => no rowid.
 	vector<idx_t> rowid_columns_;

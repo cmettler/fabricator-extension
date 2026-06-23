@@ -842,6 +842,26 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     {
         var spec = ScanSpec.Parse(specJson);
 
+        // Time travel (DuckDB AT clause) -> SQL Server temporal tables. Only a catalog table scan carries it
+        // (AT is a base-table feature; a TVF source never sets it). "timestamp" maps to FOR SYSTEM_TIME AS OF;
+        // "version" (and any other unit) has no SQL Server equivalent -> a clean error.
+        if (spec?.At is { } at)
+        {
+            if (!string.Equals(at.Unit, "timestamp", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new NotSupportedException(
+                    $"mssql_net: AT ({at.Unit} => ...) time travel is not supported by the SQL Server provider; " +
+                    "use AT (TIMESTAMP => ...) on a system-versioned (temporal) table");
+            }
+            // FOR SYSTEM_TIME AS OF @__at — a datetime2 parameter (name disjoint from the @a*/@p* used elsewhere).
+            var asOf = new SqlParameter("@__at", SqlDbType.DateTime2)
+            {
+                Value = DateTime.Parse(at.Value, System.Globalization.CultureInfo.InvariantCulture)
+            };
+            source = $"{source} FOR SYSTEM_TIME AS OF @__at";
+            sourceParams = new List<SqlParameter>(sourceParams) { asOf };
+        }
+
         // Projection: SELECT only the requested columns (absent/empty => SELECT *).
         var columns = spec?.Columns is { Count: > 0 } cols
             ? string.Join(", ", cols.Select(Quote))

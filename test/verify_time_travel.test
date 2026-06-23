@@ -1,0 +1,69 @@
+# name: test/verify_time_travel.test
+# description: Time travel (DuckDB AT clause) maps to SQL Server temporal tables (FOR SYSTEM_TIME AS OF)
+# group: [mssql]
+
+require mssql_net
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS ttcat (TYPE mssql_net);
+
+# Fresh system-versioned (temporal) table; drop any prior one (versioning must be disabled before DROP).
+statement ok
+SELECT mssql_net_exec('ttcat', 'IF OBJECT_ID(''dbo.tt_demo'',''U'') IS NOT NULL BEGIN ALTER TABLE dbo.tt_demo SET (SYSTEM_VERSIONING = OFF); DROP TABLE dbo.tt_demo; END; DROP TABLE IF EXISTS dbo.tt_demo_hist;');
+
+statement ok
+SELECT mssql_net_exec('ttcat', 'CREATE TABLE dbo.tt_demo (id INT NOT NULL PRIMARY KEY, val INT NOT NULL, sys_start DATETIME2 GENERATED ALWAYS AS ROW START HIDDEN NOT NULL, sys_end DATETIME2 GENERATED ALWAYS AS ROW END HIDDEN NOT NULL, PERIOD FOR SYSTEM_TIME (sys_start, sys_end)) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.tt_demo_hist))');
+
+# Two versions: insert (val=10) then update (val=20) -> the old version moves to history.
+statement ok
+SELECT mssql_net_exec('ttcat', 'INSERT INTO dbo.tt_demo (id, val) VALUES (1, 10)');
+
+statement ok
+SELECT mssql_net_exec('ttcat', 'UPDATE dbo.tt_demo SET val = 20 WHERE id = 1');
+
+statement ok
+SELECT mssql_refresh_cache('ttcat');
+
+# Current scan (no AT): the latest version.
+query II
+SELECT id, val FROM ttcat.dbo.tt_demo;
+----
+1	20
+
+# AT (TIMESTAMP => far future): FOR SYSTEM_TIME AS OF resolves to the current row (its period runs to 9999).
+query II
+SELECT id, val FROM ttcat.dbo.tt_demo AT (TIMESTAMP => TIMESTAMP '2999-01-01 00:00:00');
+----
+1	20
+
+# AT (TIMESTAMP => far past, before the table existed): no version is valid -> empty.
+query II
+SELECT id, val FROM ttcat.dbo.tt_demo AT (TIMESTAMP => TIMESTAMP '2000-01-01 00:00:00');
+----
+
+# Proof FOR SYSTEM_TIME AS OF reached SQL Server (not applied locally by DuckDB).
+query I
+SELECT hit FROM mssql_net_query('ttcat',
+  'SELECT CAST(CASE WHEN EXISTS (
+     SELECT 1 FROM sys.dm_exec_query_stats qs
+     CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
+     WHERE CHARINDEX(''FOR SYSTEM_TIME AS OF'', st.text) > 0
+       AND CHARINDEX(''tt_demo'', st.text) > 0
+       AND CHARINDEX(''dm_exec'', st.text) = 0
+   ) THEN 1 ELSE 0 END AS INT) AS hit');
+----
+1
+
+# AT (VERSION => ...): no SQL Server equivalent -> a clean error (no silent wrong result).
+statement error
+SELECT id, val FROM ttcat.dbo.tt_demo AT (VERSION => 1);
+----
+time travel is not supported
+
+statement ok
+SELECT mssql_net_exec('ttcat', 'ALTER TABLE dbo.tt_demo SET (SYSTEM_VERSIONING = OFF); DROP TABLE dbo.tt_demo; DROP TABLE dbo.tt_demo_hist;');
+
+statement ok
+DETACH ttcat;

@@ -64,6 +64,13 @@ public:
 	void Initialize(bool load_builtin) override;
 	string GetCatalogType() override;
 
+	//! Time travel: SQL Server temporal (system-versioned) tables support FOR SYSTEM_TIME AS OF, which the
+	//! table scan maps the DuckDB `AT (...)` clause to. Without this the binder rejects `FROM t AT (...)`
+	//! with "Catalog type does not support time travel" before reaching ArrowNetTableEntry::GetScanFunction.
+	bool SupportsTimeTravel() const override {
+		return true;
+	}
+
 	optional_ptr<CatalogEntry> CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) override;
 	optional_ptr<SchemaCatalogEntry> LookupSchema(CatalogTransaction transaction,
 	                                              const EntryLookupInfo &schema_lookup,

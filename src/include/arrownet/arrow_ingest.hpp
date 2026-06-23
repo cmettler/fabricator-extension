@@ -87,6 +87,13 @@ struct ArrowStreamBindData : public duckdb::TableFunctionData {
 	//! top_n (TopN). Empty => none. DuckDB keeps its TopN, so this is a hint.
 	duckdb::string order_by_json;
 
+	//! Time travel (DuckDB `FROM t AT (...)`), set at bind for a catalog table reference. `at_unit` is the
+	//! unit ("timestamp"/"version"); `at_value` is the constant rendered as a string. Empty `at_unit` => no
+	//! AT clause. Carried into the scan spec so the provider applies it (SQL Server: FOR SYSTEM_TIME AS OF
+	//! for "timestamp"; "version" is rejected). A bind-time constant — the same for every scan of this plan.
+	duckdb::string at_unit;
+	duckdb::string at_value;
+
 	//! Row-identity (rowid) support for catalog tables. When non-empty, these are
 	//! the indices (in the result column order) of the PK / unique-index columns,
 	//! and rowid_type is the rowid's DuckDB type (a scalar type for a single

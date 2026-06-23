@@ -7,7 +7,9 @@
 #include "arrownet/arrow_ingest.hpp"
 #include "arrownet/clr_host.hpp"
 #include "catalog/arrownet_metadata.hpp"
+#include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/common/column_index.hpp"
+#include "duckdb/planner/tableref/bound_at_clause.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
@@ -404,6 +406,17 @@ static unique_ptr<BaseStatistics> ArrowNetScanStatistics(ClientContext &context,
 }
 
 TableFunction ArrowNetTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) {
+	return BuildScanFunction(context, bind_data, nullptr);
+}
+
+// Time-travel overload: DuckDB binds `FROM t AT (...)` and hands us the bound clause via the lookup info.
+TableFunction ArrowNetTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data,
+                                                  const EntryLookupInfo &lookup_info) {
+	return BuildScanFunction(context, bind_data, lookup_info.GetAtClause());
+}
+
+TableFunction ArrowNetTableEntry::BuildScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data,
+                                                    optional_ptr<BoundAtClause> at_clause) {
 	auto data = make_uniq<arrownet::ArrowStreamBindData>();
 	auto handle = handle_;
 	// The managed side builds the provider SELECT for the whole table.
@@ -454,6 +467,13 @@ TableFunction ArrowNetTableEntry::GetScanFunction(ClientContext &context, unique
 	data->rowid_source_columns = rowid_columns_;
 	data->rowid_type = rowid_type_;
 	data->table = this; // lets LogicalGet::GetTable() resolve (UPDATE/DELETE)
+
+	// Time travel: record `FROM t AT (...)` (a bind-time constant) so the scan spec carries it to the
+	// provider (SQL Server: FOR SYSTEM_TIME AS OF for "timestamp"; "version" is rejected managed-side).
+	if (at_clause) {
+		data->at_unit = at_clause->Unit();
+		data->at_value = at_clause->GetValue().ToString();
+	}
 
 	bind_data = std::move(data);
 
