@@ -19,6 +19,8 @@ public abstract class StaticTableFunction : IArrowTableFunction
     /// <summary>The fixed result columns (names + Arrow types).</summary>
     public abstract Schema OutputSchema { get; }
 
+    public virtual bool SupportsPushdown => false; // pure C#: no SQL to push into; DuckDB re-applies above the scan
+
     /// <summary>Produces the result rows for one call (<paramref name="args"/> = the 1-row constant args).</summary>
     public abstract IEnumerable<RecordBatch> Invoke(RecordBatch args);
 
@@ -36,7 +38,7 @@ public abstract class StaticTableFunction : IArrowTableFunction
         }
 
         public Schema OutputSchema => _fn.OutputSchema;
-        public bool SupportsPushdown => false; // pure C#: no SQL to push into; DuckDB re-applies above the scan
+        public bool SupportsPushdown => _fn.SupportsPushdown;
 
         public IEnumerable<RecordBatch> Execute(TableFunctionScan scan)
         {
