@@ -547,7 +547,8 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   dispose, so the proc's writes commit/roll back with DuckDB's COMMIT/ROLLBACK). The gate (`MaxThreads=1`)
   serializes the proc EXECs on the pinned connection; the transactional contract (autocommit / explicit-BEGIN
   read-your-writes + ROLLBACK) holds — verified by `verify_proc_inout`. The 4g push operator (`ArrowNetInOut*`)
-  + the `inout_open`/`push`/`finish`/`abort` ABI are now unused (dead-in-place; removal is a follow-up).
+  + the `inout_open`/`push`/`finish`/`abort` ABI + `IInOutSession`/`InOutOpen` were **removed at ABI v31**
+  (`49e6d94`); the exchange is the only in-out path.
 - **Author API** (`IArrowInOutBinding`, Bridge): `Schema OutputSchema` + `IAsyncEnumerable<RecordBatch>
   DoExchange(IAsyncEnumerable<RecordBatch> input, ct)`. `input` yields one batch per DuckDB input chunk; the
   returned enumerable maps to the operator contract — non-empty = HAVE_MORE_OUTPUT, **length-0 = the
@@ -559,8 +560,8 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   the FULL output schema (input echo ++ the function's own columns) in C# + returns a binding handle (reused
   across prepared re-executions, freed via `inout_bind_close`); `inout_exchange_open(binding, input, isolation,
   output)` runs one execution — the host exports the INPUT stream (its get_next hands the gate-holder's one
-  chunk to C#), C# exports the OUTPUT stream the host pulls. The 4g `inout_open`/`push`/`finish`/`abort` stay
-  (proc-only).
+  chunk to C#), C# exports the OUTPUT stream the host pulls. (The 4g `inout_open`/`push`/`finish`/`abort`
+  were removed at ABI v31 once procs joined the exchange.)
 - **C# pump** (`InOutExchange.cs`, Bridge): `InOutExchangeStream` exposes `DoExchange` as a pull-based
   `IArrowArrayStream` — the Arrow C-stream exporter blocks on `ReadNextRecordBatchAsync` (sync-over-async; the
   hostfxr CLR has no `SynchronizationContext`, so `GetResult` can't deadlock — proven by the 6.0 spike).
@@ -693,9 +694,13 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v30** (v30 **removed** `execute_table`/`execute_proc` — superseded by the v29
-  table-function session; they had been unused in C++ since v29, so this is the cleanup. NOTE: this was a
-  **mid-struct** removal (between `get_function_output_schema` and `inout_open`), so it shifted every later
+- **Current version: ABI v31** (v31 **removed** the dead 4g push entries `inout_open`/`inout_push`/
+  `inout_finish`/`inout_abort` — every `_each` form runs on the streaming exchange since `9056eae`; the
+  C++ push operator + `IInOutSession`/`InOutOpen` went with them. **Mid-struct** removal (they sat before the
+  agg/exchange/table entries), so `abi.h` + `Abi.cs` field order stays in exact sync — the function/agg/in-out
+  suites are the alignment gate. v30 **removed** `execute_table`/`execute_proc` — superseded by the v29
+  table-function session; they had been unused in C++ since v29, so this is the cleanup. NOTE: that too was a
+  **mid-struct** removal (between `get_function_output_schema` and the inout entries), so it shifted every later
   entry's offset — `abi.h` + `Abi.cs` field order must stay in exact sync. v29 appended the three
   **table-function session** entries `table_bind`/`table_execute`/`table_close` — the session-handle
   successor to `execute_table`/`execute_proc`; see the "Table-function session — DONE" bullet under
