@@ -158,6 +158,16 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   needn't — the dispatch is already unified.
 - **DAX / ADOMD 2nd provider** (the "one binary, many providers" goal) + the then-due generic rename
   (`arrownet_query`/`_exec`, catalog-type `"arrownet"`) + `BackendRegistry` multi-provider polish.
+- **Multi-edition support** (Synapse / Fabric Warehouse / Lakehouse SQL endpoint) — **design:
+  [docs/warehouse-support.md](docs/warehouse-support.md)** (not yet implemented). A `ServerProfile`
+  (EngineEdition + product version + DB collation) detected at OpenCatalog drives connection behavior
+  (no MARS → pooled reads + snapshot, see [docs/transactions.md](docs/transactions.md)) AND type mapping
+  (no `NVARCHAR` → `VARCHAR`; no `DATETIMEOFFSET` → UTC `datetime2(6)`; `datetime2` scale ≤ 6; native
+  `json` on 2025+). Collation is the principled `VARCHAR`/`NVARCHAR` driver (`_UTF8`) + gates string
+  `ORDER BY` pushdown (`_BIN2`); the doc records the **no-universal-collation** cross-stack reality
+  (DuckDB/SQL-endpoint = CS binary vs DAX/Vertipaq = CI). New `mssql_default_varchar_length` setting
+  (length policy, separate from the varchar/nvarchar choice; existing `mssql_ctas_text_type` is the
+  blunt whole-string escape hatch). Open: the naive-`datetime2` reinterpret-as-session-local semantic.
 
 ## Implementation status (current)
 
