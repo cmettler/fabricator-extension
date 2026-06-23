@@ -783,8 +783,32 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         MetadataKind.RowCount => ExecuteQuery(RowCountSql(Require(schema, table).schema, Require(schema, table).table)),
         MetadataKind.ColumnNdv => ExecuteQuery(ColumnNdvSql(Require(schema, table).schema, Require(schema, table).table)),
         MetadataKind.Functions => ExecuteQuery(FunctionsMetadataSql()),
+        // The detected capability profile as (property, value) rows — the mssql_server_info() diagnostic.
+        // Built from the in-memory profile (not a re-query), so it surfaces the derived flags.
+        MetadataKind.ServerInfo => ServerInfoStream(),
         _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "mssql_net: unknown metadata kind"),
     };
+
+    // Builds a two-column (property, value) stream from the detected ServerProfile. Accessing Profile
+    // detects it (via the non-MARS probe) on first use; for an attached catalog it is already cached.
+    private IArrowArrayStream ServerInfoStream()
+    {
+        var rows = Profile.Properties();
+        var schema = new Schema(new[]
+        {
+            new Field("property", StringType.Default, nullable: false),
+            new Field("value", StringType.Default, nullable: true),
+        }, metadata: null);
+        var properties = new StringArray.Builder();
+        var values = new StringArray.Builder();
+        foreach (var (property, value) in rows)
+        {
+            properties.Append(property);
+            values.Append(value);
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { properties.Build(), values.Build() }, rows.Count);
+        return new InMemoryArrayStream(schema, new[] { batch });
+    }
 
     // Discovered SQL Server routines + the provider's custom scalar/table functions, appended via
     // UNION ALL so the C++ catalog discovers + registers them uniformly (then dispatches custom ones to C#).

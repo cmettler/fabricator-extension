@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using Microsoft.Data.SqlClient;
 
 namespace ArrowNet.SqlServer;
@@ -74,6 +75,29 @@ internal sealed class ServerProfile
     public static ServerProfile FromValues(int engineEdition, int productMajorVersion, string? productVersion,
                                             string? collation)
         => new(engineEdition, productMajorVersion, productVersion, collation);
+
+    /// <summary>
+    /// The profile as ordered (property, value) text rows — surfaced by the <c>mssql_server_info(catalog)</c>
+    /// diagnostic. Booleans render as "true"/"false".
+    /// </summary>
+    public IReadOnlyList<(string Property, string Value)> Properties() => new[]
+    {
+        ("engine_edition", EngineEdition.ToString()),
+        ("product_major_version", ProductMajorVersion.ToString()),
+        ("product_version", ProductVersion),
+        ("collation", Collation),
+        ("is_warehouse", Bool(IsWarehouse)),
+        ("supports_mars", Bool(SupportsMars)),
+        ("has_nvarchar", Bool(HasNVarchar)),
+        ("has_datetimeoffset", Bool(HasDatetimeOffset)),
+        ("max_datetime2_scale", MaxDateTime2Scale.ToString()),
+        ("has_native_json", Bool(HasNativeJson)),
+        ("is_utf8_collation", Bool(IsUtf8Collation)),
+        ("is_binary_collation", Bool(IsBinaryCollation)),
+        ("is_case_sensitive", Bool(IsCaseSensitive)),
+    };
+
+    private static string Bool(bool value) => value ? "true" : "false";
 
     /// <summary>
     /// Detect the profile over an already-open connection (one round-trip). SERVERPROPERTY values are

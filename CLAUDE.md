@@ -159,7 +159,12 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
 - **DAX / ADOMD 2nd provider** (the "one binary, many providers" goal) + the then-due generic rename
   (`arrownet_query`/`_exec`, catalog-type `"arrownet"`) + `BackendRegistry` multi-provider polish.
 - **Multi-edition support** (Synapse / Fabric Warehouse / Lakehouse SQL endpoint) — **design:
-  [docs/warehouse-support.md](docs/warehouse-support.md)** (not yet implemented). A `ServerProfile`
+  [docs/warehouse-support.md](docs/warehouse-support.md)**. **Slices 1–2 DONE**: `ServerProfile`
+  (`ServerProfile.cs`) detected lazily on first connection via a **non-MARS probe** (so Fabric/Synapse,
+  which reject a MARS connection, are classified before the MARS decision); **MARS now gated on
+  `profile.SupportsMars`** (behavior-preserving on box SQL Server); surfaced by the `mssql_server_info(catalog)`
+  diagnostic (`test/verify_server_profile.test`). **Remaining**: profile-driven type mapping, connection
+  mode (`mars` tri-state + pooled reads + snapshot), the varchar-length setting, JSON gate. A `ServerProfile`
   (EngineEdition + product version + DB collation) detected at OpenCatalog drives connection behavior
   (no MARS → pooled reads + snapshot, see [docs/transactions.md](docs/transactions.md)) AND type mapping
   (no `NVARCHAR` → `VARCHAR`; no `DATETIMEOFFSET` → UTC `datetime2(6)`; `datetime2` scale ≤ 6; native
@@ -208,7 +213,8 @@ Implemented and verified:
   on DuckDB's pinned txn).
 - **Functions**: `mssql_net_query` (raw scan), `mssql_net_exec` (raw exec) — both accept a connstr, a
   secret name, OR an attached-catalog name; `mssql_refresh_cache`/`mssql_invalidate_cache` (+ `_net_`
-  aliases, arities 1/2/3); `mssql_version()`; `arrownet_managed_dir()` / `arrownet_test_scan()` (diag).
+  aliases, arities 1/2/3); `mssql_version()`; `arrownet_managed_dir()` / `arrownet_test_scan()` /
+  `mssql_server_info(catalog)` (diag — the latter surfaces the detected `ServerProfile`).
 - **Cache invalidation after DDL via `mssql_net_exec`**: DDL detection in C# (`SqlDdl.MayChangeSchema`),
   gated by `SET mssql_exec_invalidate_cache` (default false, Postgres-scanner parity).
 

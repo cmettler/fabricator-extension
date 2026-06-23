@@ -216,6 +216,25 @@ static unique_ptr<FunctionData> FunctionsBind(ClientContext &context, TableFunct
 	return std::move(bind_data);
 }
 
+// --- mssql_server_info(connection VARCHAR) -----------------------------------
+// Surfaces the detected server capability profile (engine edition, product version,
+// collation + the derived flags driving connection mode + type mapping) as
+// (property, value) rows. Diagnostic; the profile is detected in the C# backend.
+static unique_ptr<FunctionData> ServerInfoBind(ClientContext &context, TableFunctionBindInput &input,
+                                               vector<LogicalType> &return_types, vector<string> &names) {
+	auto connection = input.inputs[0].GetValue<string>();
+
+	auto bind_data = make_uniq<MssqlNetFunctionsBindData>();
+	bind_data->handle = ResolveConnection(context, connection, bind_data->owns_handle);
+	auto handle = bind_data->handle;
+	bind_data->factory = [handle](const arrownet::ArrowScanRequest &, ArrowArrayStream &out) {
+		arrownet::GetMetadata(handle, ARROWNET_META_SERVER_INFO, "", "", out);
+	};
+
+	arrownet::PopulateReturnSchema(context, *bind_data, return_types, names);
+	return std::move(bind_data);
+}
+
 // --- mssql_net_exec(connection_string VARCHAR, sql VARCHAR) -> BIGINT --------
 // Executes arbitrary T-SQL (DDL/DML/EXEC) against SQL Server and returns the
 // number of rows affected. Volatile (always executed, never constant-folded).
@@ -326,6 +345,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                           FunctionsBind, arrownet::ArrowStreamInitGlobal, arrownet::ArrowStreamInitLocal);
 	functions_fn.projection_pushdown = true; // arrow_ingest maps requested columns; required (see mssql_net_query)
 	loader.RegisterFunction(functions_fn);
+
+	// mssql_server_info(catalog|connstr) — the detected server capability profile (diagnostic).
+	TableFunction server_info_fn("mssql_server_info", {LogicalType::VARCHAR}, arrownet::ArrowStreamScan,
+	                             ServerInfoBind, arrownet::ArrowStreamInitGlobal, arrownet::ArrowStreamInitLocal);
+	server_info_fn.projection_pushdown = true;
+	loader.RegisterFunction(server_info_fn);
 
 	ScalarFunction exec_fn("mssql_net_exec", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BIGINT,
 	                       MssqlNetExecFunction);

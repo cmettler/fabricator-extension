@@ -5,8 +5,11 @@
 > endpoint**. These differ from box SQL Server in connection capabilities (no MARS, snapshot
 > isolation) **and** in their type systems and collation. The strategy: **detect a server
 > capability profile once at ATTACH and adapt** — be collation-*adaptive and always correct*,
-> never collation-*prescriptive*. Status: **design / not yet implemented.** File references are
-> repo-root-relative. Connection/transaction behavior is in [transactions.md](transactions.md).
+> never collation-*prescriptive*. Status: **slices 1–2 implemented** — `ServerProfile` detection
+> (`dotnet/ArrowNet.SqlServer/ServerProfile.cs`) + the `mssql_server_info(catalog)` diagnostic that
+> surfaces it; profile-driven type mapping, connection mode, and settings are the remaining slices
+> (§6). File references are repo-root-relative. Connection/transaction behavior is in
+> [transactions.md](transactions.md).
 
 ## TL;DR
 
@@ -208,7 +211,9 @@ point, not something we can fix by picking a default:
 
 ## 6. Sequencing
 
-1. **`ServerProfile` detection** at OpenCatalog (the foundation everything keys off).
+1. **`ServerProfile` detection** at OpenCatalog (the foundation everything keys off). **DONE** — slice 1
+   (`ServerProfile.cs`, lazy detection via a non-MARS probe, MARS gated on `SupportsMars`); slice 2 added
+   the `mssql_server_info(catalog)` diagnostic + `test/verify_server_profile.test`.
 2. **Profile-driven `MapArrowToSqlType`** (`VARCHAR`/`NVARCHAR` by collation, `datetime2(6)`, UTC
    `datetime2` for tz, `time(6)`) + the matching value-reader branch.
 3. **Connection mode** (`mars` tri-state, pooled reads, snapshot default) — see
