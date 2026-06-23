@@ -26,7 +26,7 @@ public static unsafe class Bootstrap
             return ArrowNetStatus.InvalidArgument;
         }
 
-        vtable->AbiVersion = 28;
+        vtable->AbiVersion = 29;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -72,6 +72,9 @@ public static unsafe class Bootstrap
         vtable->InOutBind = &InOutBind;
         vtable->InOutExchangeOpen = &InOutExchangeOpen;
         vtable->InOutBindClose = &InOutBindClose;
+        vtable->TableBind = &TableBind;
+        vtable->TableExecute = &TableExecute;
+        vtable->TableClose = &TableClose;
         return ArrowNetStatus.Ok;
     }
 
@@ -887,6 +890,85 @@ public static unsafe class Bootstrap
         try
         {
             Handles.Resolve<IArrowInOutBinding>(binding)?.Dispose(); // idempotent
+            Handles.Free(binding);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int TableBind(nint handle, byte* schema, byte* func, CArrowArrayStream* args,
+                                 CArrowArrayStream* outSchema, int* supportsPushdown, nint* outBinding, byte** err)
+    {
+        try
+        {
+            if (outSchema is null || supportsPushdown is null || outBinding is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            // `args` (nullable) is a 1-row stream of the constant call args (read synchronously below).
+            RecordBatch? argsBatch = null;
+            if (args is not null)
+            {
+                using var argStream = CArrowArrayStreamImporter.ImportArrayStream(args); // we own it
+                argsBatch = argStream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+            }
+            var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+            var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
+            var bound = catalog.TableBind(s, f, argsBatch);
+            // Export the binding's output schema as a zero-row stream so the host can read return types.
+            CArrowArrayStreamExporter.ExportArrayStream(
+                new InMemoryArrayStream(bound.OutputSchema, System.Array.Empty<RecordBatch>()), outSchema);
+            *supportsPushdown = bound.SupportsPushdown ? 1 : 0;
+            *outBinding = Handles.Alloc(bound);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int TableExecute(nint binding, byte* specJson, CArrowArrayStream* filterValues,
+                                    CArrowArrayStream* outStream, byte** err)
+    {
+        try
+        {
+            if (outStream is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            var bound = Handles.Resolve<IBoundTable>(binding);
+            if (bound is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            var spec = Marshal.PtrToStringUTF8((nint)specJson); // null => SELECT *
+            IArrowArrayStream? filters =
+                filterValues is null ? null : CArrowArrayStreamImporter.ImportArrayStream(filterValues);
+            CArrowArrayStreamExporter.ExportArrayStream(bound.Execute(spec, filters), outStream);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int TableClose(nint binding, byte** err)
+    {
+        try
+        {
+            Handles.Resolve<IBoundTable>(binding)?.Dispose(); // idempotent
             Handles.Free(binding);
             return ArrowNetStatus.Ok;
         }

@@ -151,6 +151,16 @@ public unsafe struct ArrowNetVTable
 
     // int32 inout_bind_close(void* binding, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte**, int> InOutBindClose;
+
+    // int32 table_bind(void* handle, const char* schema, const char* func, ArrowArrayStream* args /*nullable*/,
+    //                  ArrowArrayStream* out_schema, int* supports_pushdown, void** out_binding, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, CArrowArrayStream*, int*, nint*, byte**, int> TableBind;
+
+    // int32 table_execute(void* binding, const char* spec_json, ArrowArrayStream* filter_values, ArrowArrayStream* out, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte*, CArrowArrayStream*, CArrowArrayStream*, byte**, int> TableExecute;
+
+    // int32 table_close(void* binding, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte**, int> TableClose;
 }
 
 /// <summary>Mirrors <c>ArrowNetAlterKind</c> in abi.h.</summary>

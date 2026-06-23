@@ -277,4 +277,27 @@ void InOutExchangeOpen(ArrowNetHandle binding, ArrowArrayStream &input, const st
 // Release a binding handle from InOutBind. Idempotent; safe with nullptr. Best-effort (swallows errors).
 void InOutBindClose(ArrowNetHandle binding);
 
+// -----------------------------------------------------------------------------
+// Table-function session (Phase 5). The session-handle successor to ExecuteTable /
+// ExecuteProc: TableBind resolves a per-plan binding (output schema + whether it
+// accepts pushdown); TableExecute runs it (per execution); TableClose frees it. The
+// managed side classifies the function (TVF / proc / custom). See abi.h.
+// -----------------------------------------------------------------------------
+
+// Bind one table-function call. `args` (nullable) = a 1-row stream of the constant call args (consumed
+// by the managed side). Fills `out_schema` with a zero-row stream = the function's output columns; sets
+// `supports_pushdown` (true = the binding accepts projection/filter pushdown — a discovered TVF).
+// Returns an opaque binding handle (reused by TableExecute across executions; freed via TableClose).
+ArrowNetHandle TableBind(ArrowNetHandle handle, const std::string &schema, const std::string &func,
+                         ArrowArrayStream *args, ArrowArrayStream &out_schema, bool &supports_pushdown);
+
+// Execute a bound table function. `spec_json` (empty => SELECT *) + `filter_values` (nullable) carry
+// projection + best-effort filter pushdown (honored only when the binding supports it). Fills `out`
+// with the result rows (its stream owns the provider connection, released by the host at scan teardown).
+void TableExecute(ArrowNetHandle binding, const std::string &spec_json, ArrowArrayStream *filter_values,
+                  ArrowArrayStream &out);
+
+// Release a binding handle from TableBind. Idempotent; safe with nullptr. Best-effort (swallows errors).
+void TableClose(ArrowNetHandle binding);
+
 } // namespace arrownet

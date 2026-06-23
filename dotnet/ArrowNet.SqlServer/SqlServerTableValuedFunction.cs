@@ -66,21 +66,20 @@ internal sealed class SqlServerTableValuedFunction
     // full OutputSchema). ScanFromSource consumes the filter constants synchronously while building the SELECT.
     public IArrowArrayStream ExecuteScan(RecordBatch args, string? specJson, IArrowArrayStream? filterValues)
     {
+        // The caller owns `args` (a session binding reuses it across executions); read the values
+        // synchronously here (copied into the SqlParameters) without disposing the batch.
         var argParams = new List<SqlParameter>();
         var argList = new StringBuilder();
-        using (args) // values are copied into argParams below; the batch is not needed after that
+        var fields = args.Schema.FieldsList;
+        for (int c = 0; c < fields.Count; c++)
         {
-            var fields = args.Schema.FieldsList;
-            for (int c = 0; c < fields.Count; c++)
+            if (c > 0)
             {
-                if (c > 0)
-                {
-                    argList.Append(", ");
-                }
-                var pn = $"@a{c}";
-                argList.Append(pn);
-                argParams.Add(new SqlParameter(pn, ArrowValueReader.ReadScalar(args.Column(c), 0) ?? (object)DBNull.Value));
+                argList.Append(", ");
             }
+            var pn = $"@a{c}";
+            argList.Append(pn);
+            argParams.Add(new SqlParameter(pn, ArrowValueReader.ReadScalar(args.Column(c), 0) ?? (object)DBNull.Value));
         }
         return _owner.ScanFromSource($"{_qualified}({argList})", argParams, specJson, filterValues);
     }

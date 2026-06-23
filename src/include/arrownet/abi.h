@@ -483,13 +483,50 @@ typedef struct ArrowNetVTable {
 	// Release a binding handle from inout_bind. Idempotent; safe with nullptr. Best-effort
 	// (bind-data teardown must not throw).
 	int32_t (*inout_bind_close)(ArrowNetHandle binding, char **err);
+
+	// -------------------------------------------------------------------------
+	// Table-function session (Phase 5). The session-handle successor to the
+	// stateless execute_table / execute_proc (left in place but unused once the
+	// host adopts this): table_bind resolves a per-PLAN binding (output schema +
+	// whether it accepts pushdown) once; that binding is reused by table_execute
+	// for each execution (the result stream owns its own provider connection,
+	// released by the host's arrow scan at teardown — no separate close). Unifies
+	// discovered TVFs (pushdown), stored procs (no pushdown) and custom C# table
+	// functions behind one path; the managed side classifies the function (so the
+	// host no longer needs the is_proc distinction at bind).
+	// -------------------------------------------------------------------------
+
+	// Bind one table-function call. `args` (nullable) is a 1-row Arrow stream of the
+	// constant call arguments (consumed by the managed side). *out_schema receives a
+	// zero-row Arrow stream whose schema = the function's output columns (a custom
+	// function's MAY depend on `args`) — read it for the DuckDB return types, then
+	// release it. *supports_pushdown receives 1 if the binding accepts projection /
+	// filter pushdown (a discovered TVF), 0 otherwise (proc / custom — DuckDB projects
+	// + filters above the scan). *out_binding receives an opaque binding handle, reused
+	// by table_execute across (prepared) re-executions and freed via table_close.
+	int32_t (*table_bind)(ArrowNetHandle handle, const char *schema, const char *func,
+	                      struct ArrowArrayStream *args, struct ArrowArrayStream *out_schema,
+	                      int32_t *supports_pushdown, ArrowNetHandle *out_binding, char **err);
+
+	// Execute a bound table function. `spec_json` (nullable/empty => SELECT *) +
+	// `filter_values` (nullable) carry projection + best-effort filter pushdown,
+	// honored only when the binding reported supports_pushdown (else ignored — DuckDB
+	// re-applies above the scan). *out receives the result rows (its stream owns the
+	// provider connection, released by the host at scan teardown). Called once per
+	// execution; the binding may be executed repeatedly.
+	int32_t (*table_execute)(ArrowNetHandle binding, const char *spec_json,
+	                         struct ArrowArrayStream *filter_values, struct ArrowArrayStream *out, char **err);
+
+	// Release a binding handle from table_bind. Idempotent; safe with nullptr.
+	// Best-effort (bind-data teardown must not throw).
+	int32_t (*table_close)(ArrowNetHandle binding, char **err);
 } ArrowNetVTable;
 
 // Max serialized size of a spillable aggregate's per-group state (the inline, pointer-free
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 28
+#define ARROWNET_ABI_VERSION 29
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

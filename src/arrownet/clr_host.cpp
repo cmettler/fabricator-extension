@@ -625,6 +625,55 @@ void InOutBindClose(ArrowNetHandle binding) {
 	}
 }
 
+ArrowNetHandle TableBind(ArrowNetHandle handle, const std::string &schema, const std::string &func,
+                         ArrowArrayStream *args, ArrowArrayStream &out_schema, bool &supports_pushdown) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.table_bind) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide table_bind");
+	}
+	ArrowNetHandle binding = nullptr;
+	int32_t pushdown = 0;
+	char *err = nullptr;
+	int32_t rc = vt.table_bind(handle, schema.c_str(), func.c_str(), args, &out_schema, &pushdown, &binding, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: table_bind failed");
+	}
+	supports_pushdown = pushdown != 0;
+	return binding;
+}
+
+void TableExecute(ArrowNetHandle binding, const std::string &spec_json, ArrowArrayStream *filter_values,
+                  ArrowArrayStream &out) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.table_execute) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide table_execute");
+	}
+	char *err = nullptr;
+	const char *spec = spec_json.empty() ? nullptr : spec_json.c_str();
+	int32_t rc = vt.table_execute(binding, spec, filter_values, &out, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: table_execute failed");
+	}
+}
+
+void TableClose(ArrowNetHandle binding) {
+	if (!binding) {
+		return;
+	}
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.table_close) {
+		return;
+	}
+	char *err = nullptr;
+	int32_t rc = vt.table_close(binding, &err);
+	if (rc != ARROWNET_OK) {
+		// Best-effort cleanup; swallow + free the managed error message.
+		if (err && vt.free_error) {
+			vt.free_error(err);
+		}
+	}
+}
+
 ArrowNetHandle AggOpen(ArrowNetHandle handle, const std::string &schema, const std::string &func) {
 	const ArrowNetVTable &vt = GetBridge();
 	if (!vt.agg_open) {

@@ -1323,6 +1323,24 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         return new InMemoryArrayStream(procBinding.OutputSchema, System.Array.Empty<RecordBatch>());
     }
 
+    // Phase 5 session model: bind a table-function call into an IBoundTable (the host then runs it via
+    // table_execute and frees it via table_close). Classifies the function exactly like
+    // GetFunctionOutputSchema / ExecuteTable / ExecuteProc — a custom (pure-C#) table function, else a
+    // discovered TVF (its result columns are in ROUTINE_COLUMNS; pushdown), else a stored proc (no pushdown).
+    // The binding resolves the output schema once and is reused across (prepared) re-executions.
+    public IBoundTable TableBind(string schemaName, string functionName, RecordBatch? args)
+    {
+        if (CustomTable.TryGetValue($"{schemaName}.{functionName}", out var custom))
+        {
+            return new BindingBoundTable(custom.Bind(args!));
+        }
+        if (FunctionOutputColumns(schemaName, functionName).Count > 0)
+        {
+            return new TvfBoundTable(new SqlServerTableValuedFunction(this, schemaName, functionName), args!);
+        }
+        return new BindingBoundTable(new SqlServerProcedure(this, schemaName, functionName).Bind(args!));
+    }
+
     // Executes a TVF over its constant arguments (row 0 of the args stream, in param
     // order) as `SELECT <cols> FROM [s].[f](@a0, ...) WHERE <filter>` — args bound as
     // @a* (disjoint from the filter's @p*); projection + filter pushed via the spec.
@@ -1347,8 +1365,12 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         }
         // Discovered SQL Server TVF: ScanFromSource's stream already reflects the pushed projection (its
         // schema matches the projected batches), so return it directly — never re-wrap it with a fixed schema.
-        return new SqlServerTableValuedFunction(this, schemaName, functionName)
-            .ExecuteScan(argBatch, specJson, filterValues);
+        // ExecuteScan reads `argBatch` synchronously (does not own it), so dispose it once the stream is built.
+        using (argBatch)
+        {
+            return new SqlServerTableValuedFunction(this, schemaName, functionName)
+                .ExecuteScan(argBatch, specJson, filterValues);
+        }
     }
 
     // Executes a stored procedure over its supplied named arguments as
