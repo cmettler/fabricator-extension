@@ -143,19 +143,14 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     private static readonly IReadOnlyDictionary<string, IArrowTableFunction> CustomTable =
         CustomFunctions.Table.ToDictionary(f => $"{f.SchemaName}.{f.Name}", StringComparer.OrdinalIgnoreCase);
 
-    // Provider-authored custom table-in-out functions, keyed "schema.name" (case-insensitive). Surfaced as
-    // `kind='inout'` (see FunctionsMetadataSql) so the C++ catalog registers them as a {TABLE}-param table
-    // function under the bare name; dispatched to C# (see InOutOpen / GetFunctionOutputSchema). Unlike a
-    // discovered TVF's `_each` alias, the output is the function's full declared schema (no input echo).
-    private static readonly IReadOnlyDictionary<string, Func<IArrowTableInOutFunction>> CustomInOut =
-        CustomFunctions.InOut.ToDictionary(factory => { var p = factory(); return $"{p.SchemaName}.{p.Name}"; },
-                                           factory => factory, StringComparer.OrdinalIgnoreCase);
-
-    // Free-form (DoExchange-style) custom table-in-out functions, keyed "schema.name". Also surfaced as
-    // `kind='inout'` (same C++ exchange registration); InOutBind resolves them via Bind(args, inputSchema),
-    // so the author drives the streaming loop + sentinel directly (vs the per-chunk CustomInOut above).
-    private static readonly IReadOnlyDictionary<string, IArrowInOutFunction> CustomInOutExchange =
-        CustomFunctions.ExchangeInOut.ToDictionary(f => $"{f.SchemaName}.{f.Name}", StringComparer.OrdinalIgnoreCase);
+    // Provider-authored custom table-in-out functions (IArrowInOutFunction), keyed "schema.name"
+    // (case-insensitive). Surfaced as `kind='inout'` (see FunctionsMetadataSql) so the C++ catalog registers
+    // them as a {TABLE}-param table function under the bare name, resolved by InOutBind on the streaming
+    // exchange (Bind(args, inputSchema) -> the per-call binding). The output is the binding's full declared
+    // schema (no input echo, unlike a discovered TVF's `_each`). Authors use the per-chunk PerChunkInOutFunction
+    // base or implement IArrowInOutFunction directly (free-form DoExchange).
+    private static readonly IReadOnlyDictionary<string, IArrowInOutFunction> CustomInOut =
+        CustomFunctions.InOut.ToDictionary(f => $"{f.SchemaName}.{f.Name}", StringComparer.OrdinalIgnoreCase);
 
     // Provider-authored custom aggregate functions (UDAF), keyed "schema.name" (case-insensitive). Surfaced
     // as `kind='aggregate'` (see FunctionsMetadataSql) so the C++ catalog registers them as an
@@ -746,8 +741,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // UNION ALL so the C++ catalog discovers + registers them uniformly (then dispatches custom ones to C#).
     private static string FunctionsMetadataSql()
     {
-        if (CustomScalar.Count == 0 && CustomTable.Count == 0 && CustomInOut.Count == 0 &&
-            CustomInOutExchange.Count == 0 && CustomAgg.Count == 0)
+        if (CustomScalar.Count == 0 && CustomTable.Count == 0 && CustomInOut.Count == 0 && CustomAgg.Count == 0)
         {
             return FunctionsSql;
         }
@@ -767,13 +761,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             sb.Append(" UNION ALL SELECT '").Append(Esc(f.SchemaName)).Append("', '").Append(Esc(f.Name))
               .Append("', 'table', ").Append(f.Parameters.FieldsList.Count).Append(", ''");
         }
-        foreach (var factory in CustomInOut.Values)
-        {
-            var f = factory();
-            sb.Append(" UNION ALL SELECT '").Append(Esc(f.SchemaName)).Append("', '").Append(Esc(f.Name))
-              .Append("', 'inout', ").Append(f.InputSchema.FieldsList.Count).Append(", ''");
-        }
-        foreach (var f in CustomInOutExchange.Values)
+        foreach (var f in CustomInOut.Values)
         {
             sb.Append(" UNION ALL SELECT '").Append(Esc(f.SchemaName)).Append("', '").Append(Esc(f.Name))
               .Append("', 'inout', ").Append(f.InputSchema.FieldsList.Count).Append(", ''");
@@ -1321,10 +1309,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             using var binding = customTable.Bind(args!);
             return new InMemoryArrayStream(binding.OutputSchema, System.Array.Empty<RecordBatch>());
         }
-        if (CustomInOut.TryGetValue($"{schemaName}.{functionName}", out var customInOutFactory))
-        {
-            return new InMemoryArrayStream(customInOutFactory().OutputSchema, System.Array.Empty<RecordBatch>());
-        }
+        // Custom in-out functions resolve their output schema through InOutBind (the exchange path), not here.
         // TVFs expose their result columns in ROUTINE_COLUMNS; stored procs don't.
         var cols = FunctionOutputColumns(schemaName, functionName);
         if (cols.Count == 0)
@@ -1423,24 +1408,16 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         return new ProcInOutSessionImpl(this, schemaName, functionName, inputSchema);
     }
 
-    // Phase 6 streaming-exchange bind. Custom C# in-out functions move onto the gate-based exchange (a
-    // CustomInOutBinding adapting their per-chunk Process); discovered TVFs follow in 6.2 (SqlServerTvfEach),
-    // and stored procs stay on the push path (InOutOpen / ProcInOutSessionImpl, on DuckDB's pinned txn).
+    // Phase 6 streaming-exchange bind. A custom C# in-out (IArrowInOutFunction — per-chunk via the
+    // PerChunkInOutFunction base, or free-form DoExchange) binds itself; a discovered TVF `_each` streams the
+    // CROSS APPLY (SqlServerTvfEach). Stored procs stay on the push path (InOutOpen / ProcInOutSessionImpl, on
+    // DuckDB's pinned write transaction), routed there by the C++ side, so they never reach here.
     public IArrowInOutBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema)
     {
-        var key = $"{schemaName}.{functionName}";
-        // Free-form (DoExchange-style) custom in-out: the author's binding drives the streaming loop + sentinel.
-        if (CustomInOutExchange.TryGetValue(key, out var exchangeFn))
+        if (CustomInOut.TryGetValue($"{schemaName}.{functionName}", out var custom))
         {
-            return exchangeFn.Bind(args, inputSchema);
+            return custom.Bind(args, inputSchema);
         }
-        // Per-chunk custom in-out: adapt the author's Process onto the exchange (framework owns the sentinel).
-        if (CustomInOut.TryGetValue(key, out var customFactory))
-        {
-            return new CustomInOutBinding(customFactory);
-        }
-        // A discovered TVF `_each`: stream the CROSS APPLY (6.2). Stored procs are routed to the push path
-        // by the C++ side (they need DuckDB's pinned write transaction), so they never reach here.
         return new SqlServerTvfEach(this, schemaName, functionName, inputSchema);
     }
 

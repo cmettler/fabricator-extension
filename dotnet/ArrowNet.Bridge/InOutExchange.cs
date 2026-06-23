@@ -38,8 +38,8 @@ public interface IArrowInOutIsolation
 /// free-form shape): <see cref="Bind"/> returns an <see cref="IArrowInOutBinding"/> whose <c>DoExchange</c>
 /// the author writes — reading the input stream and yielding output, INCLUDING the length-0 sentinel after
 /// each input chunk. Use this when you want full control of the streaming loop / cross-chunk state in locals;
-/// for the simpler per-chunk shape (the framework owns the sentinel) implement
-/// <see cref="IArrowTableInOutFunction"/> instead. Surfaced into the catalog as <c>kind='inout'</c> and
+/// for the simpler per-chunk shape (the framework owns the loop + sentinel) derive from
+/// <see cref="PerChunkInOutFunction"/> instead. Surfaced into the catalog as <c>kind='inout'</c> and
 /// resolved by <c>IBackendCatalog.InOutBind</c>.
 /// </summary>
 public interface IArrowInOutFunction
@@ -130,42 +130,64 @@ internal sealed class InOutExchangeStream : IArrowArrayStream
 }
 
 /// <summary>
-/// Adapts a custom (provider-authored, pure-C#) <see cref="IArrowTableInOutFunction"/> — whose contract is a
-/// per-chunk <c>Process</c> — onto the streaming <see cref="IArrowInOutBinding"/>. A fresh function instance is
-/// created per exchange (it may keep state across its input stream); the binding yields the per-chunk sentinel.
-/// Custom functions run entirely in C#, so there is no connection and no isolation.
+/// Convenience base for a custom table-in-out whose author writes a simple PER-CHUNK transform: override
+/// <see cref="OutputSchema"/> + <see cref="CreateProcessor"/> (which mints a fresh per-exchange chunk processor,
+/// closing over any cross-chunk state in a local), and the framework owns the streaming loop + the per-input
+/// sentinel. This is to <see cref="IArrowInOutFunction"/> what <c>StaticTableFunction</c> is to
+/// <c>IArrowTableFunction</c> — for full control of the loop/sentinel, implement <see cref="IArrowInOutFunction"/>
+/// directly. The function object is a singleton (it carries the static schema); CreateProcessor mints the
+/// per-exchange state, so re-executions never share state — no throwaway instance, no Process redirection.
 /// </summary>
-public sealed class CustomInOutBinding : IArrowInOutBinding
+public abstract class PerChunkInOutFunction : IArrowInOutFunction
 {
-    private readonly Func<IArrowTableInOutFunction> _factory;
+    /// <summary>Target catalog schema (e.g. "dbo").</summary>
+    public abstract string SchemaName { get; }
 
-    public CustomInOutBinding(Func<IArrowTableInOutFunction> factory)
+    /// <summary>Function name.</summary>
+    public abstract string Name { get; }
+
+    /// <summary>The declared input-table columns.</summary>
+    public abstract Schema InputSchema { get; }
+
+    /// <summary>The output columns (fixed for the function).</summary>
+    public abstract Schema OutputSchema { get; }
+
+    /// <summary>Mint a fresh per-exchange chunk processor: transforms one input chunk into 0..n output batches,
+    /// invoked sequentially per chunk. Close over a local for cross-chunk state (e.g. a running aggregate) — a
+    /// fresh processor is created per exchange, so state never leaks across re-executions.</summary>
+    protected abstract Func<RecordBatch, IEnumerable<RecordBatch>> CreateProcessor();
+
+    public IArrowInOutBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding(this);
+
+    // The framework binding: owns the DoExchange loop + the per-input sentinel, dispatching each chunk to a
+    // fresh processor minted per exchange (per DoExchange, since the binding is reused across re-executions).
+    private sealed class Binding : IArrowInOutBinding
     {
-        _factory = factory;
-        OutputSchema = factory().OutputSchema; // declared output schema (static); a throwaway instance reads it
-    }
+        private readonly PerChunkInOutFunction _fn;
+        public Binding(PerChunkInOutFunction fn) => _fn = fn;
 
-    public Schema OutputSchema { get; }
+        public Schema OutputSchema => _fn.OutputSchema;
 
-    public async IAsyncEnumerable<RecordBatch> DoExchange(IAsyncEnumerable<RecordBatch> input,
-                                                          [EnumeratorCancellation] CancellationToken ct = default)
-    {
-        var fn = _factory(); // fresh instance per exchange (Process may accumulate state across chunks)
-        await foreach (var chunk in input.WithCancellation(ct))
+        public async IAsyncEnumerable<RecordBatch> DoExchange(IAsyncEnumerable<RecordBatch> input,
+                                                              [EnumeratorCancellation] CancellationToken ct = default)
         {
-            using (chunk)
+            var process = _fn.CreateProcessor(); // fresh per exchange (may close over cross-chunk state)
+            await foreach (var chunk in input.WithCancellation(ct))
             {
-                foreach (var outBatch in fn.Process(chunk))
+                using (chunk)
                 {
-                    yield return outBatch;
+                    foreach (var outBatch in process(chunk))
+                    {
+                        yield return outBatch;
+                    }
                 }
+                yield return InOutExchange.EmptyBatch(_fn.OutputSchema); // per-input sentinel (NEED_MORE_INPUT)
             }
-            yield return InOutExchange.EmptyBatch(OutputSchema); // per-chunk sentinel (NEED_MORE_INPUT)
         }
-    }
 
-    public void Dispose()
-    {
+        public void Dispose()
+        {
+        }
     }
 }
 

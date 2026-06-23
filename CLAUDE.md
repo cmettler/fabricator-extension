@@ -110,8 +110,8 @@ current code still uses the single-provider `mssql_net` naming):
   `InOutSessionHolder` on the bind data; its **RAII destructor → `inout_abort`** is the release/rollback
   backstop on every teardown path (also frees the GCHandle). Verified: `test/verify_table_inout.test` (63
   assertions — incl. parallel UNION ALL, ORDER BY+LIMIT, WHERE, aggregate, empty, multi-column, large
-  BIGINT→INT, error+recover). **(4g-custom) custom C#-authored table-in-out DONE** (`IArrowTableInOutFunction`
-  — in-out analog of 4e/4f): a pure-C# **per-chunk streaming** table-in-out (no SQL object), may keep mutable
+  BIGINT→INT, error+recover). **(4g-custom) custom C#-authored table-in-out DONE** (now `IArrowInOutFunction` /
+  the `PerChunkInOutFunction` base — in-out analog of 4e/4f): a pure-C# **per-chunk streaming** table-in-out (no SQL object), may keep mutable
   state across chunks (running aggregate); surfaced as `kind='inout'` → C++ `AddInOutFunction` registers a
   bare-name `{TABLE}` entry (`GetOrCreateCustomInOutFunction` + `ArrowNetCustomInOutBind`, output = the fn's
   full declared schema, no input echo), dispatched in C# (`CustomInOut` factory registry → fresh instance per
@@ -432,7 +432,11 @@ A DuckDB-faithful `Bind`/`Binding` model + expressing SQL-Server functions as th
 - **Verified**: `test/verify_table_inout.test` (63 assertions) — scalar-arg regression, single-chunk,
   parallel `UNION ALL` (coherent), `WHERE`, `ORDER BY`+`LIMIT`, aggregate, empty, multi-column, large
   50-row `BIGINT`→`INT` (sub-chunking + type round-trip), error mid-stream + recovery.
-- **Custom C#-authored in-out (4g-custom)**: `IArrowTableInOutFunction` (Bridge) =
+- **Custom C#-authored in-out (4g-custom)** — *unified in Phase 6: the per-chunk `Process` shape below is now
+  the `PerChunkInOutFunction` base under the single `IArrowInOutFunction`, and runs on the streaming exchange
+  (`InOutBind`), not the push `CustomInOutSessionImpl`/`InOutOpen` described here. See "Streaming table-in-out
+  exchange (Phase 6)". The per-chunk semantics are unchanged; the original push wiring below is historical.*
+  Original (push) design: `IArrowTableInOutFunction` (Bridge) =
   `SchemaName`/`Name`/`InputSchema`/`OutputSchema` + `IEnumerable<RecordBatch> Process(chunk)` (the in-out
   analog of 4e `IArrowScalarFunction` / 4f `IArrowTableFunction`). A pure-C# **per-chunk streaming**
   table-in-out (no SQL object) that may keep mutable state across chunks (running aggregate — `Process` is
@@ -485,13 +489,16 @@ custom), `330d2c7` (discovered TVF). Design + the 6.0 spike: the plan file's "Ph
 - **C# pump** (`InOutExchange.cs`, Bridge): `InOutExchangeStream` exposes `DoExchange` as a pull-based
   `IArrowArrayStream` — the Arrow C-stream exporter blocks on `ReadNextRecordBatchAsync` (sync-over-async; the
   hostfxr CLR has no `SynchronizationContext`, so `GetResult` can't deadlock — proven by the 6.0 spike).
-  Two custom-author shapes both land here: the **per-chunk** `IArrowTableInOutFunction.Process` (framework
-  owns the sentinel — `CustomInOutBinding` adapts it; demos `cf_tag`/`cf_running_sum`) and the **free-form**
-  `IArrowInOutFunction.Bind(args,inputSchema) → IArrowInOutBinding` (the author writes `DoExchange` + yields
-  the sentinel itself, e.g. cross-chunk state in a local; registry `CustomInOutExchange`, demo `cf_exchange`).
-  `SqlServerTvfEach` (`SqlServerInOutSessions.cs`) runs the per-row CROSS APPLY inside `DoExchange`
-  on one pinned connection + transaction (the streaming successor to the deleted `InOutSessionImpl`).
-  `InOutExchange.EmptyBatch` builds the length-0 sentinel matching the output schema.
+  Custom authors implement **one** interface, `IArrowInOutFunction.Bind(args,inputSchema) →
+  IArrowInOutBinding` (registry `CustomInOut`, resolved by `InOutBind`), in two styles: the **free-form**
+  shape (the author writes `DoExchange` + yields the per-input sentinel itself, e.g. cross-chunk state in a
+  local — demo `cf_exchange`), or the **per-chunk** convenience base **`PerChunkInOutFunction`** (override
+  `OutputSchema` + `CreateProcessor()`, which mints a fresh per-exchange chunk processor closing over any
+  state; the base owns the loop + sentinel — demos `cf_tag`/`cf_running_sum`). `PerChunkInOutFunction` is to
+  `IArrowInOutFunction` what `StaticTableFunction` is to `IArrowTableFunction`. `SqlServerTvfEach`
+  (`SqlServerTvfEach.cs`) runs the per-row CROSS APPLY inside `DoExchange` on one pinned connection +
+  transaction (the streaming successor to the deleted `InOutSessionImpl`). `InOutExchange.EmptyBatch` builds
+  the length-0 sentinel matching the output schema.
 - **C++ operator** (`arrownet_schema_entry.cpp`, anon ns): `ArrowNetExchange{Bind,InitGlobal,InitLocal,Function}`
   + `ArrowNetExchangeGlobalState` (the gate `std::mutex`, the single input `slot`, `input_eof`, the output
   reader, `MaxThreads()=1`) + a host-side input stream whose get_next hands the gate-holder's slot to C#.

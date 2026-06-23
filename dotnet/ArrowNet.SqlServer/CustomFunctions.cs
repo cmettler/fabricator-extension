@@ -8,9 +8,9 @@ namespace ArrowNet.SqlServer;
 /// Provider-authored custom functions — scalar, table, table-in-out, and aggregate — surfaced into every
 /// attached catalog alongside the discovered SQL Server functions (resolved as <c>db.schema.name(args)</c>).
 /// To add one, implement the matching Bridge interface (<see cref="IArrowScalarFunction"/>,
-/// <see cref="IArrowTableFunction"/>, <see cref="IArrowTableInOutFunction"/>, <see cref="IArrowInOutFunction"/>,
-/// or <see cref="IArrowAggregateFunction"/>) and list it in the corresponding array below. These run entirely
-/// in C# — there need be no corresponding SQL Server object.
+/// <see cref="IArrowTableFunction"/>, <see cref="IArrowInOutFunction"/> — or its per-chunk convenience base
+/// <see cref="PerChunkInOutFunction"/> — or <see cref="IArrowAggregateFunction"/>) and list it in the
+/// corresponding array below. These run entirely in C# — there need be no corresponding SQL Server object.
 /// </summary>
 internal static class CustomFunctions
 {
@@ -25,20 +25,14 @@ internal static class CustomFunctions
         new CfColumnsFunction(),
     };
 
-    // Factories, not instances: a per-chunk table-in-out may keep mutable state across its input stream (a
-    // running aggregate), so each call gets a fresh instance. Resolved via SqlServerCatalog.InOutBind ->
-    // CustomInOutBinding on the streaming exchange (InOutOpen is proc-only since Phase 6.2).
-    public static readonly IReadOnlyList<Func<IArrowTableInOutFunction>> InOut = new Func<IArrowTableInOutFunction>[]
+    // Custom table-in-out functions (IArrowInOutFunction), singletons — surfaced as `kind='inout'` and
+    // resolved by SqlServerCatalog.InOutBind on the streaming exchange; Bind() mints the per-call binding.
+    // cf_tag/cf_running_sum use the per-chunk convenience base (PerChunkInOutFunction — the framework owns the
+    // loop + sentinel, per-exchange state via a closure); cf_exchange drives the free-form DoExchange itself.
+    public static readonly IReadOnlyList<IArrowInOutFunction> InOut = new IArrowInOutFunction[]
     {
-        () => new CfTagFunction(),
-        () => new CfRunningSumFunction(),
-    };
-
-    // Free-form (DoExchange-style) custom in-out functions: the author drives the streaming loop and yields
-    // the per-input sentinel themselves (vs the per-chunk Process shape above; the framework owns the sentinel
-    // there). Singletons — Bind() mints the per-call binding that holds the loop state.
-    public static readonly IReadOnlyList<IArrowInOutFunction> ExchangeInOut = new IArrowInOutFunction[]
-    {
+        new CfTagFunction(),
+        new CfRunningSumFunction(),
         new CfExchangeFunction(),
     };
 
@@ -248,22 +242,27 @@ internal sealed class CfSumSpillFunction : IArrowAggregateFunction
     }
 }
 
-// Demo (table-in-out, per-row/streaming): dbo.cf_tag(<table of n>) -> (n, sq=n*n) per input row, emitted
-// in Process. Order-independent (one output row per input row). Pure C#, no SQL object.
-internal sealed class CfTagFunction : IArrowTableInOutFunction
+// Demo (table-in-out, per-row): dbo.cf_tag(<table of n>) -> (n, sq=n*n) per input row. STATELESS, so the
+// per-chunk convenience base (PerChunkInOutFunction) just exposes the chunk transform as the processor — the
+// framework owns the streaming loop + the per-input sentinel. Pure C#, no SQL object.
+internal sealed class CfTagFunction : PerChunkInOutFunction
 {
-    public string SchemaName => "dbo";
-    public string Name => "cf_tag";
+    public override string SchemaName => "dbo";
+    public override string Name => "cf_tag";
 
-    public Schema InputSchema => new(new[] { new Field("n", Int32Type.Default, nullable: true) }, metadata: null);
+    public override Schema InputSchema =>
+        new(new[] { new Field("n", Int32Type.Default, nullable: true) }, metadata: null);
 
-    public Schema OutputSchema => new(new[]
+    public override Schema OutputSchema => new(new[]
     {
         new Field("n", Int32Type.Default, nullable: true),
         new Field("sq", Int32Type.Default, nullable: true),
     }, metadata: null);
 
-    public IEnumerable<RecordBatch> Process(RecordBatch inputChunk)
+    // Stateless => the processor is just the chunk transform (a method group).
+    protected override Func<RecordBatch, IEnumerable<RecordBatch>> CreateProcessor() => ProcessChunk;
+
+    private IEnumerable<RecordBatch> ProcessChunk(RecordBatch inputChunk)
     {
         var n = (Int32Array)inputChunk.Column(0);
         int rows = inputChunk.Length;
@@ -286,46 +285,50 @@ internal sealed class CfTagFunction : IArrowTableInOutFunction
     }
 }
 
-// Demo (table-in-out, STATEFUL streaming): dbo.cf_running_sum(<table of n>) -> (n, running) where running is
-// the cumulative sum across the input stream (state kept across Process calls). Emitted per row in Process,
-// so it fits the per-chunk streaming model (no emit-at-end). Pure C#, no SQL object. The cumulative VALUE is
-// order-dependent, but max(running) == total is order-independent (the last row processed always holds the
-// full sum), which is what the test asserts.
-internal sealed class CfRunningSumFunction : IArrowTableInOutFunction
+// Demo (table-in-out, STATEFUL): dbo.cf_running_sum(<table of n>) -> (n, running) where running is the
+// cumulative sum across the input stream. The per-exchange state lives in a LOCAL (`running`) captured by the
+// processor CreateProcessor mints — a fresh one per exchange, so re-executions never share state (no instance
+// field). The cumulative VALUE is order-dependent, but max(running) == total is order-independent (the last
+// row processed always holds the full sum), which is what the test asserts. Pure C#, no SQL object.
+internal sealed class CfRunningSumFunction : PerChunkInOutFunction
 {
-    private long _running;
+    public override string SchemaName => "dbo";
+    public override string Name => "cf_running_sum";
 
-    public string SchemaName => "dbo";
-    public string Name => "cf_running_sum";
+    public override Schema InputSchema =>
+        new(new[] { new Field("n", Int32Type.Default, nullable: true) }, metadata: null);
 
-    public Schema InputSchema => new(new[] { new Field("n", Int32Type.Default, nullable: true) }, metadata: null);
-
-    public Schema OutputSchema => new(new[]
+    public override Schema OutputSchema => new(new[]
     {
         new Field("n", Int32Type.Default, nullable: true),
         new Field("running", Int64Type.Default, nullable: false),
     }, metadata: null);
 
-    public IEnumerable<RecordBatch> Process(RecordBatch inputChunk)
+    protected override Func<RecordBatch, IEnumerable<RecordBatch>> CreateProcessor()
     {
-        var n = (Int32Array)inputChunk.Column(0);
-        int rows = inputChunk.Length;
-        var nb = new Int32Array.Builder().Reserve(rows);
-        var rb = new Int64Array.Builder().Reserve(rows);
-        for (int i = 0; i < rows; i++)
+        long running = 0; // per-exchange cumulative sum, captured by the local processor below (fresh per exchange)
+        IEnumerable<RecordBatch> Process(RecordBatch inputChunk)
         {
-            if (n.IsNull(i))
+            var n = (Int32Array)inputChunk.Column(0);
+            int rows = inputChunk.Length;
+            var nb = new Int32Array.Builder().Reserve(rows);
+            var rb = new Int64Array.Builder().Reserve(rows);
+            for (int i = 0; i < rows; i++)
             {
-                nb.AppendNull();
+                if (n.IsNull(i))
+                {
+                    nb.AppendNull();
+                }
+                else
+                {
+                    running += n.Values[i];
+                    nb.Append(n.Values[i]);
+                }
+                rb.Append(running);
             }
-            else
-            {
-                _running += n.Values[i];
-                nb.Append(n.Values[i]);
-            }
-            rb.Append(_running);
+            yield return new RecordBatch(OutputSchema, new IArrowArray[] { nb.Build(), rb.Build() }, rows);
         }
-        yield return new RecordBatch(OutputSchema, new IArrowArray[] { nb.Build(), rb.Build() }, rows);
+        return Process;
     }
 }
 
