@@ -159,8 +159,14 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     private static readonly IReadOnlyDictionary<string, IArrowAggregateFunction> CustomAgg =
         CustomFunctions.Aggregate.ToDictionary(f => $"{f.SchemaName}.{f.Name}", StringComparer.OrdinalIgnoreCase);
 
-    private readonly string _connectionString;
+    private readonly string _baseConnectionString;   // user connstr (no MARS); basis for the finalized string
     private readonly string? _accessToken;
+    // Server capability profile, detected lazily on the first connection (see docs/warehouse-support.md).
+    // Probed on a NON-MARS connection (Synapse/Fabric reject a MARS connection outright), after which the
+    // working connection string re-enables MARS only when the engine supports it.
+    private volatile ServerProfile? _profile;
+    private string? _connectionString;               // finalized in EnsureProfile (MARS iff profile.SupportsMars)
+    private readonly object _profileLock = new();
 
     public SqlServerCatalog(string connectionString)
     {
@@ -188,9 +194,11 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         {
             connStr = connectionString;
         }
-        // Enable MARS so a scan reader and the transaction's DML commands can be
-        // active on the one pinned connection (read-your-writes within a transaction).
-        _connectionString = new SqlConnectionStringBuilder(connStr) { MultipleActiveResultSets = true }.ConnectionString;
+        // Defer the MARS decision to first-connection profile detection: MARS is forced only when the
+        // engine supports it (box SQL Server / Azure SQL DB), since Synapse/Fabric reject a MARS
+        // connection outright. See EnsureProfile + docs/transactions.md (read-your-writes on the pinned
+        // connection requires MARS so a scan reader and DML coexist).
+        _baseConnectionString = connStr;
     }
 
     // Translates a mssql://[user[:password]@]host[:port]/database[?params] URI into
@@ -272,16 +280,56 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         return builder.ConnectionString;
     }
 
-    // Creates a connection, applying an Azure access token when one was supplied
-    // via the secret (Entra "bring-your-own-token" auth).
-    private SqlConnection OpenConnection()
+    // The connected engine's capability profile (detected once, on first connection).
+    internal ServerProfile Profile
     {
-        var connection = new SqlConnection(_connectionString);
+        get { EnsureProfile(); return _profile!; }
+    }
+
+    // Detect the server profile on first use and finalize the working connection string. Probed on a
+    // NON-MARS connection so Synapse/Fabric (which reject a MARS connection) can be classified; MARS is
+    // then re-enabled in _connectionString only when the engine supports it. One-time per catalog.
+    private void EnsureProfile()
+    {
+        if (_profile is not null)
+        {
+            return;
+        }
+        lock (_profileLock)
+        {
+            if (_profile is not null)
+            {
+                return;
+            }
+            using var probe = OpenRaw(_baseConnectionString);
+            probe.Open();
+            var profile = ServerProfile.Detect(probe);
+            _connectionString = profile.SupportsMars
+                ? new SqlConnectionStringBuilder(_baseConnectionString) { MultipleActiveResultSets = true }.ConnectionString
+                : _baseConnectionString;
+            _profile = profile; // volatile write last → publishes _connectionString to fast-path readers
+        }
+    }
+
+    // Builds a connection on a specific connection string, applying an Azure access token when one was
+    // supplied via the secret (Entra "bring-your-own-token" auth). Does NOT trigger profile detection
+    // (used by the detection probe itself).
+    private SqlConnection OpenRaw(string connectionString)
+    {
+        var connection = new SqlConnection(connectionString);
         if (_accessToken is not null)
         {
             connection.AccessToken = _accessToken;
         }
         return connection;
+    }
+
+    // Creates a connection on the finalized (profile-aware) connection string, detecting the server
+    // profile on first use.
+    private SqlConnection OpenConnection()
+    {
+        EnsureProfile();
+        return OpenRaw(_connectionString!);
     }
 
     // ---- Transaction state ----------------------------------------------------
