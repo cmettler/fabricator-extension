@@ -150,10 +150,14 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   (`OutputSchema` property + `ExecuteScan` returning the stream **directly**) — a pushdown source is
   stream-native: `ScanFromSource`'s stream schema already reflects the PROJECTED columns, so it matches
   the projected batches and must NOT be re-wrapped with the full schema (doing so crashed `arrow_ingest`
-  with SIGSEGV on `SELECT sq FROM tf_ms(4)`). Folding the pushdown TVF fully into `IArrowTableFunction`
-  needs the stream-returning **session-handle ABI** (deferred Phase 5 Part 2). `execute_table`/
-  `execute_proc` ABI unchanged (C#-only). `ProcResultColumns`/`ProcOutputParams`/`FunctionOutputColumns`/
-  `ScanFromSource` widened to `internal`.
+  with SIGSEGV on `SELECT sq FROM tf_ms(4)`). `ProcResultColumns`/`ProcOutputParams`/`FunctionOutputColumns`/
+  `ScanFromSource` widened to `internal`. The **table-function session ABI v29** (`c2e452f`+`1f9fe96`) then
+  unified the dispatch under `IBoundTable` (`table_bind`/`table_execute`/`table_close`); see the Phase 5
+  section. The bespoke TVF could now fold into `IArrowTableFunction` (`table_execute` returns a stream) but
+  needn't — the dispatch is already unified.
+- **Remove the dead `execute_table`/`execute_proc`** (ABI cleanup) — unused in C++ since v29 (the table scan
+  uses `table_bind`/`table_execute`), left in place like the legacy `bulk_insert` entry; the actual removal is
+  a later ABI bump (drop the 2 vtable entries + their `clr_host` wrappers + the C# handlers/methods).
 - **Proc `RunProcRow` → async** (`SqlServerInOutSessions.cs`, the per-row in-out proc path) — consistency
   with the now-async `RunCrossApply`; still sync-over-async inside a sync `IEnumerable`.
 - **DAX / ADOMD 2nd provider** (the "one binary, many providers" goal) + the then-due generic rename
@@ -321,8 +325,10 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
   `@a0…` (disjoint from the filter's `@p0…`) and delegates to the shared **`ScanFromSource`** helper (also
   used by `ScanTable`), which builds the projected/filtered `SELECT … FROM <source> WHERE …` — streamed lazily.
 
-### Function-abstraction refactor (Phase 5 — in progress)
+### Function-abstraction refactor (Phase 5 — core done)
 A DuckDB-faithful `Bind`/`Binding` model + expressing SQL-Server functions as the authoring interfaces.
+Capability complete (scalar wrappers, arg-dependent table output schema, in-out, the TVF/proc wrapper
+extraction, and the v29 table-function session); only the dead-`execute_table`/`execute_proc` removal remains.
 - **Scalar — DONE** (`refactor(scalar)`, commit `60ea6f0`): discovered SQL UDFs are a `SqlServerScalarFunction
   : IArrowScalarFunction` (in `SqlServerScalarFunction.cs`) — `ResolveScalar` returns a custom registry entry
   or the wrapper, so `ExecuteScalar`/param/return-schema dispatch through ONE `IArrowScalarFunction` path. The
@@ -347,11 +353,22 @@ A DuckDB-faithful `Bind`/`Binding` model + expressing SQL-Server functions as th
   projected batches; re-wrapping it with the full schema crashed `arrow_ingest` — SIGSEGV on a column-subset
   projection `SELECT sq FROM tf_ms(4)`). C#-only (`execute_table`/`execute_proc` unchanged). Verified: full
   function suite green.
-- **Deferred follow-ups** (organizational; capability already delivered): the **session-handle** model
-  (`table_bind`/`output_schema`/`execute`/`close`, a binding holding state across bind↔execute) — which would
-  also let the **pushdown TVF fold into `IArrowTableFunction`** (a stream-returning `table_execute`); +
-  **retiring `execute_table`/`execute_proc`** (fold into the table session). Full design: the plan file's
-  "Phase 5".
+- **Table-function session — DONE** (ABI v29: `c2e452f` surface + `1f9fe96` C++ rewire): `table_bind`
+  (resolve a per-plan binding → output schema/return types + `supports_pushdown` + an opaque handle) /
+  `table_execute` (run the scan, per execution) / `table_close` (free the binding at plan teardown), the
+  session-handle successor to `get_function_output_schema`+`execute_table`/`execute_proc` in the table scan.
+  C++ `ArrowNetTableFunctionBind` uses them; the `is_proc` **execute** branch is gone (`table_execute`
+  unifies TVF/proc/custom — C# `SqlServerCatalog.TableBind` classifies + returns an `IBoundTable`:
+  `TvfBoundTable` (SQL pushdown) or `BindingBoundTable` (proc positional / custom by-name)). `push_projection`
+  = the binding's `supports_pushdown` (= `!is_proc`, behavior-preserving; `is_proc` survives only for the
+  named-vs-positional arg marshaling). The binding is **reused across (prepared) re-executions** — proven by
+  a `PREPARE`/`EXECUTE`-twice test (R2); `SqlServerTableValuedFunction.ExecuteScan` no longer consumes its
+  args, and the per-execution connection lives in `table_execute`'s stream (released by the arrow scan), so
+  the refcounted `TableBindState` only frees binding metadata at teardown (no `arrow_ingest` hook needed).
+- **Deferred follow-ups**: **remove the dead `execute_table`/`execute_proc`** (now unused in C++, left in
+  place like `bulk_insert`; removal is a later ABI bump); optionally fold the bespoke
+  `SqlServerTableValuedFunction` into `IArrowTableFunction` (organizational — the dispatch is already
+  unified under `IBoundTable`). Full design: the plan file's "Phase 5".
 - **Verified**: inline TVF (`tf_nums(3)`→1,2,3), multi-column (`tf_pair(7,'hi')`), multi-statement
   (`tf_ms`→squares), and aggregation over a TVF. **Pushdown proven via the plan cache**: the statement that
   reached SQL Server was `SELECT [id],[name],[salary] FROM [dbo].[tf_emp](@a0) WHERE [id] <> @p0` (column
@@ -656,7 +673,11 @@ custom), `330d2c7` (discovered TVF). Design + the 6.0 spike: the plan file's "Ph
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v28** (v28 appended the three streaming table-in-out **exchange** entries `inout_bind`/
+- **Current version: ABI v29** (v29 appended the three **table-function session** entries `table_bind`/
+  `table_execute`/`table_close` — the session-handle successor to `execute_table`/`execute_proc` (now
+  unused-but-left-in-place, like `bulk_insert`); see the "Table-function session — DONE" bullet under
+  "Function-abstraction refactor (Phase 5)".
+  v28 appended the three streaming table-in-out **exchange** entries `inout_bind`/
   `inout_exchange_open`/`inout_bind_close` — Phase 6, see "Streaming table-in-out exchange (Phase 6)" below.
   v27 added a nullable `args` 1-row stream to `get_function_output_schema` so a
   custom table function's output schema can depend on its constant arguments — the **table `Bind`** capability;
