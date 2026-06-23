@@ -409,8 +409,10 @@ internal sealed class CfRangeFunction : StaticTableFunction
         new Field("squared", Int32Type.Default, nullable: false),
     }, metadata: null);
 
-    public override IEnumerable<RecordBatch> Invoke(RecordBatch args)
+    public override async IAsyncEnumerable<RecordBatch> Invoke(
+        RecordBatch args, [EnumeratorCancellation] CancellationToken ct = default)
     {
+        await Task.CompletedTask; // synchronous generation; satisfies the async-iterator signature
         var arg = (Int32Array)args.Column(0);
         int n = args.Length > 0 && !arg.IsNull(0) ? arg.Values[0] : 0;
         var value = new Int32Array.Builder().Reserve(n);
@@ -457,9 +459,11 @@ internal sealed class CfColumnsFunction : IArrowTableFunction
         public Schema OutputSchema { get; }
         public bool SupportsPushdown => false;
 
-        public IEnumerable<RecordBatch> Execute(TableFunctionScan scan)
+        public async IAsyncEnumerable<RecordBatch> Execute(
+            TableFunctionScan scan, [EnumeratorCancellation] CancellationToken ct = default)
         {
             scan.FilterValues?.Dispose();
+            await Task.CompletedTask; // synchronous generation; satisfies the async-iterator signature
             var arrays = new IArrowArray[_n];
             for (int i = 1; i <= _n; i++)
             {
@@ -467,7 +471,7 @@ internal sealed class CfColumnsFunction : IArrowTableFunction
                 b.Append(i);
                 arrays[i - 1] = b.Build();
             }
-            return new[] { new RecordBatch(OutputSchema, arrays, 1) };
+            yield return new RecordBatch(OutputSchema, arrays, 1);
         }
 
         public void Dispose() { }

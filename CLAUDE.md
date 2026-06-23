@@ -365,9 +365,13 @@ A DuckDB-faithful `Bind`/`Binding` model + expressing SQL-Server functions as th
 - Beyond functions *discovered* from SQL Server, a provider can **author custom functions in C#**:
   - **4e scalar** — `IArrowScalarFunction` (Bridge) = `SchemaName`/`Name`/`Parameters`(arg fields)/
     `Result`(field)/`Invoke(RecordBatch)→IArrowArray`. Demo `CustomFunctions.Scalar`: `dbo.cf_add(a,b)=a+b`.
-  - **4f table** — `IArrowTableFunction` (Bridge) = `SchemaName`/`Name`/`Parameters`/`OutputSchema`/
-    `Invoke(RecordBatch args)→IEnumerable<RecordBatch>` (args = the 1-row positional call args; yields result
-    batches). Demo `CustomFunctions.Table`: `dbo.cf_range(n)` → `(value, squared)` rows generated in C#.
+  - **4f table** — `IArrowTableFunction` (Bridge) = `SchemaName`/`Name`/`Parameters` + `Bind(args) →
+    IArrowTableFunctionBinding` (`OutputSchema` + `IAsyncEnumerable<RecordBatch> Execute(scan, ct)` — args = the
+    1-row positional call args; yields result batches **async/lazily**, streamed to the host via
+    `AsyncEnumerableArrowStream`). Fixed-schema functions derive from `StaticTableFunction` (override
+    `OutputSchema` + `IAsyncEnumerable<RecordBatch> Invoke(args, ct)`). Demos `CustomFunctions.Table`:
+    `dbo.cf_range(n)` → `(value, squared)` (StaticTableFunction) + `dbo.cf_columns(n)` (output schema from the
+    arg, via Bind).
 - **Reuses the entire catalog scalar/TVF path — C#-only, no ABI/C++ change** (the lean alternative to
   load-time global functions): `GetMetadata(Functions)` appends the custom functions to `FunctionsSql` via
   `UNION ALL` (`kind='scalar'`/`'table'`), so the existing C++ discovery registers them as a

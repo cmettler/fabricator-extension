@@ -53,11 +53,12 @@ public interface IArrowTableFunctionBinding : System.IDisposable
     bool SupportsPushdown { get; }
 
     /// <summary>
-    /// Produces the result rows. <paramref name="scan"/> carries the projection + filter pushdown request;
-    /// a binding that returns <see cref="SupportsPushdown"/> == false ignores it (DuckDB re-applies). Yield
-    /// lazily to stream large results.
+    /// Produces the result rows, streamed asynchronously. <paramref name="scan"/> carries the projection +
+    /// filter pushdown request; a binding that returns <see cref="SupportsPushdown"/> == false ignores it
+    /// (DuckDB re-applies). Yield lazily (an async iterator) to stream large results without buffering — the
+    /// host pulls one batch at a time.
     /// </summary>
-    System.Collections.Generic.IEnumerable<RecordBatch> Execute(TableFunctionScan scan);
+    IAsyncEnumerable<RecordBatch> Execute(TableFunctionScan scan, CancellationToken ct = default);
 }
 
 /// <summary>

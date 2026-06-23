@@ -21,8 +21,9 @@ public abstract class StaticTableFunction : IArrowTableFunction
 
     public virtual bool SupportsPushdown => false; // pure C#: no SQL to push into; DuckDB re-applies above the scan
 
-    /// <summary>Produces the result rows for one call (<paramref name="args"/> = the 1-row constant args).</summary>
-    public abstract IEnumerable<RecordBatch> Invoke(RecordBatch args);
+    /// <summary>Produces the result rows for one call (<paramref name="args"/> = the 1-row constant args),
+    /// streamed asynchronously — implement as an async iterator (a synchronous generator just yields).</summary>
+    public abstract IAsyncEnumerable<RecordBatch> Invoke(RecordBatch args, CancellationToken ct = default);
 
     public IArrowTableFunctionBinding Bind(RecordBatch args) => new Binding(this, args);
 
@@ -40,10 +41,10 @@ public abstract class StaticTableFunction : IArrowTableFunction
         public Schema OutputSchema => _fn.OutputSchema;
         public bool SupportsPushdown => _fn.SupportsPushdown;
 
-        public IEnumerable<RecordBatch> Execute(TableFunctionScan scan)
+        public IAsyncEnumerable<RecordBatch> Execute(TableFunctionScan scan, CancellationToken ct = default)
         {
             scan.FilterValues?.Dispose();
-            return _fn.Invoke(_args);
+            return _fn.Invoke(_args, ct);
         }
 
         public void Dispose() => _args.Dispose();

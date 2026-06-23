@@ -1357,14 +1357,19 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         // result and DuckDB projects (by column name) + filters above the scan.
         if (CustomTable.TryGetValue($"{schemaName}.{functionName}", out var custom))
         {
-            using var input = args; // the 1-row args batch; result batches must be independent
-            var argBatch = input.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult()
+            RecordBatch argBatch;
+            using (var input = args) // 1-row args stream; argBatch is read out (independent) before disposal
+            {
+                argBatch = input.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult()
                            ?? throw new ArgumentException($"mssql_net: '{schemaName}.{functionName}' called with no arguments");
-            using var binding = custom.Bind(argBatch);
-            // The binding's Execute owns scan.FilterValues; pushdown is ignored for a pure-C# function
-            // (DuckDB re-applies projection by name + filters above the scan).
-            var batches = binding.Execute(new TableFunctionScan(specJson, filterValues)).ToArray();
-            return new InMemoryArrayStream(binding.OutputSchema, batches);
+            }
+            // A pure-C# function ignores pushdown (no SQL to push into) — DuckDB re-applies projection (by
+            // name) + filters above the scan; dispose the filter constants now.
+            filterValues?.Dispose();
+            var binding = custom.Bind(argBatch);
+            // Stream the binding's async output lazily; the stream disposes the binding (and its args) at close.
+            return new AsyncEnumerableArrowStream(
+                binding.OutputSchema, binding.Execute(new TableFunctionScan(specJson, null)), binding);
         }
 
         var qualified = Quote(schemaName) + "." + Quote(functionName);
