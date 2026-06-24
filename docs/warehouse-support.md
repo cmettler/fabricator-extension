@@ -10,10 +10,11 @@
 > the connection succeeds MARS-free) — `ServerProfile` detection
 > (`dotnet/ArrowNet.SqlServer/ServerProfile.cs`) + the `mssql_server_info(catalog)` diagnostic + profile-
 > driven type mapping (§3) + connection mode (`mssql_mars` tri-state, pooled reads, SNAPSHOT writes — §2,
-> [transactions.md](transactions.md) §5.1) + collation-aware string `ORDER BY` pushdown (§4/§6.6). Remaining:
-> the JSON gate (§3.3 — blocked on the boundary type-erasure + a 2025/Azure server) and the tz value-reader
-> (§3.1, needs ICU). File references are repo-root-relative. Connection/transaction behavior is in
-> [transactions.md](transactions.md).
+> [transactions.md](transactions.md) §5.1) + collation-aware string `ORDER BY` pushdown (§4/§6.6) + the
+> JSON read-side gate (§3.3: SQL `json` → DuckDB `JSON`; box test DB now on SQL Server 2025). Remaining: the
+> JSON **write-side** (§3.3/§3.4 — DuckDB `JSON` → SQL `json`, blocked on the lossless-boundary decision) and
+> the tz value-reader (§3.1, needs ICU). File references are repo-root-relative. Connection/transaction
+> behavior is in [transactions.md](transactions.md).
 
 ## TL;DR
 
@@ -151,10 +152,24 @@ Three *separable* concerns — today they're conflated into one blunt knob:
 ### 3.3 JSON (SQL Server 2025)
 
 `HasNativeJson` = `ProductMajorVersion >= 17` or Azure SQL DB (Fabric: none yet — assume false until
-confirmed). When true, map the Arrow JSON canonical extension type (and DuckDB's `JSON` logical type)
-→ SQL `json`, and read a `json` column back as the Arrow JSON extension type so it lands as DuckDB
-`JSON`. Otherwise fall back to `nvarchar(max)` / `varchar(max)`. One profile-gated branch, symmetric
-both directions.
+confirmed).
+
+- **Read-side — DONE.** A SQL Server `json` column is tagged with the canonical **`arrow.json`** Arrow
+  extension in `SqlArrowMapping.ToArrowField` (storage type stays `Utf8`); DuckDB's Arrow **import** reads
+  the extension and lands it as the **`JSON`** logical type. Independent of the boundary's produce-direction
+  flags (import reads extension metadata regardless), and graceful: an engine/build without the json
+  extension registered falls back to the `Utf8` storage type = `VARCHAR` (DuckDB
+  `GetArrowExtensionInternal` falls back to the format type — no throw), so the value round-trips either
+  way. The core `json` extension is **statically embedded** in our build (`extension_config.cmake`) so the
+  `JSON` type + functions exist in the test binaries (this build reports v0.0.1, so json can't be autoloaded
+  from the repo). Verified: `test/verify_json.test`.
+- **Write-side — DEFERRED to §3.4.** A DuckDB `JSON` column still maps to `nvarchar`/`varchar`, NOT native
+  `json`. Reason (confirmed in the DuckDB source, `arrow_converter.cpp:120`): DuckDB exports `JSON` as the
+  `arrow.json` extension **only when `arrow_lossless_conversion = true`**, which our C++↔C# boundary
+  deliberately forces **off** (the BOOLEAN→Int8 fix — see CLAUDE.md "boundary uses STANDARD encoding"). So a
+  DuckDB `JSON` column arrives at C# as plain `Utf8`, indistinguishable from `VARCHAR`. Mapping it to SQL
+  `json` requires the §3.4 granular-types work (lossless boundary + honor `arrow.json`/`arrow.bool8`/… on
+  the produce side), the same prerequisite as UUID and lossless ALTER/CTAS.
 
 ### 3.4 Granular type conversions (future refinement) — reuse the SqlServerFlights pattern
 
@@ -269,7 +284,9 @@ point, not something we can fix by picking a default:
    ATTACH-options→C# refactor).
 4. **`mssql_default_varchar_length`** + length-aware `VARCHAR` (unblocks string PK/UNIQUE keys; NOT needed
    for plain CTAS since Fabric takes `varchar(MAX)`).
-5. **JSON type gate** (smallest, independent).
+5. **JSON type gate** (smallest, independent). **Read-side DONE** (§3.3: SQL `json` → DuckDB `JSON` via
+   `arrow.json`; json statically embedded; `test/verify_json.test`). **Write-side deferred** to §3.4 (the
+   boundary forces `arrow_lossless_conversion` off, so DuckDB `JSON` reaches C# as plain `Utf8`).
 6. **Collation-aware pushdown relaxation** (string `ORDER BY` on binary collations) — optimization.
    **DONE** — no ABI: `FetchBinaryCollation` (reuses `ARROWNET_META_SERVER_INFO`) caches the flag on the
    catalog at `LoadCatalog`; scan bind → `ArrowStreamBindData::string_order_pushable`; optimizer gate

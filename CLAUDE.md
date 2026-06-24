@@ -176,8 +176,20 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   ATTACH-options→C# refactor. **Caveat:** `RESET` of an extension option does NOT fire its set-callback
   (`config.cpp ResetOption`), so it never clears the process-global `ProviderSettingsStore` — restore a setting
   with `SET name='<default>'`, not `RESET` (matters for `.test` hygiene across files). Verified:
-  `test/verify_connection_mode.test` (20). **Remaining**: JSON gate, the tz-value-reader branch (3b).
-  (`mssql_default_varchar_length` — done via the settings refactor; applies to all created text columns.) A `ServerProfile`
+  `test/verify_connection_mode.test` (20). (5) **collation-aware string `ORDER BY` pushdown** (no ABI):
+  `FetchBinaryCollation` (reads the `SERVER_INFO` profile) caches a flag on the catalog at `LoadCatalog` →
+  scan `bind_data.string_order_pushable` → `arrownet_optimizer` gate `is_string && !string_order_pushable`;
+  string keys push only on a binary (`_BIN`/`_BIN2`) collation (byte-order sort == DuckDB).
+  `test/verify_collation_pushdown.test` + `test/verify_orderby_pushdown.test`. (6) **JSON read-side gate**
+  (C#-only): a SQL `json` column is tagged `arrow.json` in `SqlArrowMapping.ToArrowField` → DuckDB imports it
+  as the `JSON` logical type (unregistered-extension fallback = `VARCHAR`, so it's safe + round-trips); the
+  core `json` extension is **statically embedded** (`extension_config.cmake`) so the test binaries have the
+  `JSON` type + functions (this build is v0.0.1 → json can't be autoloaded). `test/verify_json.test` (`require
+  json`). **The box test DB is now SQL Server 2025** (major 17, native `json`). **Remaining**: JSON
+  **write-side** (DuckDB `JSON` → SQL `json` — blocked: `arrow_converter.cpp:120` only emits `arrow.json` under
+  `arrow_lossless_conversion`, which our boundary forces off; needs the §3.4 granular-types work, same as
+  UUID), the tz-value-reader branch (3b). (`mssql_default_varchar_length` — done via the settings refactor;
+  applies to all created text columns.) A `ServerProfile`
   (EngineEdition + product version + DB collation) detected at OpenCatalog drives connection behavior
   (no MARS → pooled reads + snapshot, see [docs/transactions.md](docs/transactions.md)) AND type mapping
   (no `NVARCHAR` → `VARCHAR`; no `DATETIMEOFFSET` → UTC `datetime2(6)`; `datetime2` scale ≤ 6; native

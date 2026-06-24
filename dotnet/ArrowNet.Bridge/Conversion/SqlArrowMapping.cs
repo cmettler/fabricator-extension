@@ -16,7 +16,16 @@ public static class SqlArrowMapping
     {
         var name = col.ColumnName ?? $"column{col.ColumnOrdinal ?? 0}";
         var nullable = col.AllowDBNull ?? true;
-        return new Field(name, MapType(col), nullable);
+        // A SQL Server 2025+ native `json` column is tagged with the canonical Arrow `arrow.json`
+        // extension so DuckDB's import lands it as the JSON logical type (when the json extension is
+        // available; an unregistered extension falls back to the Utf8 storage type = VARCHAR, so the
+        // value round-trips either way). Storage type is Utf8 in both cases.
+        IReadOnlyDictionary<string, string>? metadata = null;
+        if ((col.DataTypeName ?? string.Empty).Equals("json", StringComparison.OrdinalIgnoreCase))
+        {
+            metadata = new Dictionary<string, string> { ["ARROW:extension:name"] = "arrow.json" };
+        }
+        return new Field(name, MapType(col), nullable, metadata);
     }
 
     public static IArrowType MapType(DbColumn col)
@@ -72,6 +81,7 @@ public static class SqlArrowMapping
             case "ntext":
             case "xml":
             case "sysname":
+            case "json": // SQL Server 2025 native json; ToArrowField tags it arrow.json (Utf8 storage)
                 return StringType.Default;
             default:
                 // Fall back on the CLR type for anything unmapped.

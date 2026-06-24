@@ -6,3 +6,8 @@ duckdb_extension_load(mssql_net
     EXTENSION_VERSION "0.0.1"
     LOAD_TESTS
 )
+
+# Statically build + link the core `json` extension into the test binaries so the DuckDB `JSON` type is
+# available. This build reports version v0.0.1, so `json` can't be autoloaded from the extension repo
+# (404); static linkage compiles it from the pinned duckdb submodule, matching the engine exactly.
+duckdb_extension_load(json)
