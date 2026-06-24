@@ -11,10 +11,11 @@
 > (`dotnet/ArrowNet.SqlServer/ServerProfile.cs`) + the `mssql_server_info(catalog)` diagnostic + profile-
 > driven type mapping (§3) + connection mode (`mssql_mars` tri-state, pooled reads, SNAPSHOT writes — §2,
 > [transactions.md](transactions.md) §5.1) + collation-aware string `ORDER BY` pushdown (§4/§6.6) + the
-> JSON read-side gate (§3.3: SQL `json` → DuckDB `JSON`; box test DB now on SQL Server 2025). Remaining: the
-> JSON **write-side** (§3.3/§3.4 — DuckDB `JSON` → SQL `json`, blocked on the lossless-boundary decision) and
-> the tz value-reader (§3.1, needs ICU). File references are repo-root-relative. Connection/transaction
-> behavior is in [transactions.md](transactions.md).
+> JSON read-side gate (§3.3) + granular read-side types (§3.4: `time(7)`/`datetime2(7)`→ns,
+> `uniqueidentifier`→`UUID`, decimal `(p,s)`) + tz validated naive↔naive under a non-UTC zone (§3.1, ICU
+> embedded); box test DB now on SQL Server 2025. Remaining: the **write-side** rich types (DuckDB
+> `JSON`/`UUID` → native, blocked on the lossless-boundary decision, §3.4.1). File references are
+> repo-root-relative. Connection/transaction behavior is in [transactions.md](transactions.md).
 
 ## TL;DR
 
@@ -121,12 +122,16 @@ hardcodes the box answers. It becomes profile-parameterized:
 - **Fabric ambiguity (document loudly):** without `datetimeoffset`, a stored `datetime2` can't record
   "this is an instant." A `TIMESTAMPTZ` written to Fabric reads back as a naive `TIMESTAMP` holding
   the UTC value — instant preserved, tz-aware marker lost. Default to naive on read.
-- **Open decision — the only timezone choice to pin:** keep naive↔naive (recommended; no session-tz
-  dependency), or adopt the SqlServerFlights semantic "treat a stored naive `datetime2` as wall-clock
-  in the session zone and convert to UTC." The latter needs the DuckDB `TimeZone` setting plumbed
-  from the C++ `ClientContext` (`TryGetCurrentSetting("TimeZone", …)`) across to C#, and is only
-  meaningful with the ICU extension loaded. It ripples through both the value reader and the
-  read-back path, so decide before building.
+- **Decision — naive↔naive (validated, DONE).** We keep the naive↔naive semantic (no session-tz
+  dependency); we do NOT reinterpret a stored naive `datetime2` as session-local. Validated end-to-end
+  under a non-UTC session zone (`America/New_York`) with the ICU extension now statically embedded
+  (`extension_config.cmake`): a `TIMESTAMPTZ` preserves its instant (stored UTC `datetimeoffset` /
+  re-displayed in the session zone), and a naive `TIMESTAMP` round-trips its wall-clock **unshifted** by
+  the session zone. No code change was needed — the value path was already correct (a `TIMESTAMPTZ` Arrow
+  value is a UTC instant, so storing `.UtcDateTime` needs no session zone). Verified:
+  `test/verify_timezone.test`. The alternative SqlServerFlights "reinterpret stored naive as session-local"
+  semantic is deliberately NOT adopted (it would surprise; it would need `TimeZone` plumbed C++→C# and
+  ripple through the value + read-back paths).
 
 ### 3.2 VARCHAR length & the text-type settings
 
@@ -335,9 +340,11 @@ point, not something we can fix by picking a default:
    box-preserving (edition 3 → identical output); **validated live on Fabric**: a CTAS of a
    `VARCHAR`/`TIMESTAMP`/`DATE`/`INT` table produced `varchar(MAX)` / `datetime2(6)` / `date` / `int` and
    round-tripped with µs fidelity. **Fabric accepts `varchar(MAX)`** (`CHARACTER_MAXIMUM_LENGTH = -1`), so the
-   length setting (step 4) is NOT required for CTAS — only for string keys. *Remaining (3b):* the
-   tz-value-reader branch — `TIMESTAMPTZ` → UTC `datetime2` value conversion when there's no `datetimeoffset`
-   (needs ICU + a non-UTC session-tz test to validate; naive timestamps already round-trip correctly).
+   length setting (step 4) is NOT required for CTAS — only for string keys. **3b (tz) DONE:** validated under
+   a non-UTC session zone with ICU embedded — `TIMESTAMPTZ` preserves its instant, naive `TIMESTAMP` is
+   unshifted (naive↔naive); no code change needed (the value path was already correct). Granular read-side
+   refinements (§3.4) also done: `time(7)`/`datetime2(7)`→ns, `uniqueidentifier`→`UUID`.
+   `test/verify_timezone.test`, `test/verify_granular_types.test`.
 3. **Connection mode** (`mssql_mars` tri-state, pooled reads, snapshot default) — see
    [transactions.md](transactions.md) §5.1. **DONE** — slice 3, C#-only (no ABI): `mssql_mars` provider
    setting resolved at first connection; MARS-off reads take a fresh pooled connection (no read-your-writes
@@ -357,8 +364,8 @@ point, not something we can fix by picking a default:
 
 ## 7. Open decisions
 
-- **Naive-`datetime2` semantic:** keep naive↔naive (recommended) vs reinterpret stored naive as
-  session-local (needs `TimeZone` + ICU). §3.1.
+- **Naive-`datetime2` semantic:** RESOLVED — keep naive↔naive (validated under a non-UTC session zone, §3.1;
+  the reinterpret-as-session-local alternative is deliberately not adopted).
 - **Auto-detect vs explicit-only** for the connection mode: recommend auto from the profile with an
   explicit override.
 - **Collation guidance** to publish in the README for OneLake users (the §4 trade-off).

@@ -196,7 +196,12 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   `varchar(MAX)` is already correct + the only option there; native-`json` write only helps box-2025/Azure where
   `nvarchar(max)` already holds the JSON). Recommendation: keep the STANDARD boundary; revisit via field-metadata
   injection or a json-column-indices ABI arg only if a box-2025/Azure target needs it (or with the DAX provider).
-  (6) the tz-value-reader branch (3b). (`mssql_default_varchar_length` — done via the settings refactor;
+  (6) **tz validated (3b) — naive↔naive**: with `icu` statically embedded (`extension_config.cmake`), validated
+  under a non-UTC session zone (`America/New_York`) that a `TIMESTAMPTZ` preserves its instant (stored UTC
+  `datetimeoffset`, re-displayed in the session zone) and a naive `TIMESTAMP` is unshifted; no code change
+  needed. The reinterpret-as-session-local semantic is deliberately NOT adopted. `test/verify_timezone.test`.
+  **Warehouse read-side is now complete**; the only remaining warehouse item is write-side rich types (lossless
+  flip). (`mssql_default_varchar_length` — done via the settings refactor;
   applies to all created text columns.) A `ServerProfile`
   (EngineEdition + product version + DB collation) detected at OpenCatalog drives connection behavior
   (no MARS → pooled reads + snapshot, see [docs/transactions.md](docs/transactions.md)) AND type mapping
