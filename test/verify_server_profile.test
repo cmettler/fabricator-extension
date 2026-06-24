@@ -15,7 +15,7 @@ SELECT count(*) FROM mssql_server_info('db');
 ----
 14
 
-# Detected raw values for the test SQL Server 2022 (box, Developer edition).
+# Detected raw values for the test SQL Server 2025 (box, Developer edition).
 query I
 SELECT CAST(value AS INTEGER) FROM mssql_server_info('db') WHERE property = 'engine_edition';
 ----
@@ -24,7 +24,7 @@ SELECT CAST(value AS INTEGER) FROM mssql_server_info('db') WHERE property = 'eng
 query I
 SELECT CAST(value AS INTEGER) FROM mssql_server_info('db') WHERE property = 'product_major_version';
 ----
-16
+17
 
 # Box SQL Server: MARS present, not a warehouse.
 query T
@@ -53,11 +53,11 @@ SELECT CAST(value AS INTEGER) FROM mssql_server_info('db') WHERE property = 'max
 ----
 7
 
-# SQL Server 2022 (major 16 < 17) has no native json type.
+# SQL Server 2025 (major 17) has the native json type.
 query T
 SELECT value FROM mssql_server_info('db') WHERE property = 'has_native_json';
 ----
-false
+true
 
 # Collation SQL_Latin1_General_CP1_CI_AS -> not UTF-8, not binary, case-insensitive.
 query T
