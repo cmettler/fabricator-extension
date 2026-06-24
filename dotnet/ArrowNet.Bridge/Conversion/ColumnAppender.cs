@@ -79,8 +79,12 @@ public sealed class ColumnAppender
             }
             case ArrowTypeId.Time64:
             {
-                var b = new Time64Array.Builder((Time64Type)type);
-                return new ColumnAppender(o => b.Append(((TimeSpan)o).Ticks / 10L), // 100ns ticks -> microseconds
+                var t = (Time64Type)type;
+                var b = new Time64Array.Builder(t);
+                // TimeSpan.Ticks are 100ns units: -> microseconds = Ticks/10; -> nanoseconds = Ticks*100
+                // (time(7) maps to TIME_NS, so the 7th fractional digit survives).
+                bool ns = t.Unit == TimeUnit.Nanosecond;
+                return new ColumnAppender(o => b.Append(ns ? ((TimeSpan)o).Ticks * 100L : ((TimeSpan)o).Ticks / 10L),
                                           () => b.AppendNull(), () => b.Build());
             }
             case ArrowTypeId.Timestamp:

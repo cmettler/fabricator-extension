@@ -233,6 +233,20 @@ and `JSON` (alias)→`arrow.json`. Everything else is unaffected.
 optional) is the principled, low-risk half. Revisit write-side native `json`/UUID via option (b)/(c) only if a
 box-2025/Azure target makes it worthwhile, or fold it into the DAX provider's type-mapping work.
 
+### 3.4.2 Scale-aware temporal precision — DONE (read-side)
+
+`MapArrowToSqlType`'s read counterpart (`SqlArrowMapping`) used to map every `time`/`datetime2` to
+**microsecond**, silently truncating the 7th fractional digit of `time(7)`/`datetime2(7)` (and `datetime2(7)`
+is the *default*). Now scale-aware via `DbColumn.NumericScale`: **scale 7 → nanosecond** (DuckDB
+`TIME_NS`/`TIMESTAMP_NS`, the 100ns digit preserved), **scale ≤6 → microsecond** (DuckDB `TIME`/`TIMESTAMP`,
+the common types, full date range). The `Time64` value appender branches on the unit (`Ticks*100` for ns vs
+`Ticks/10` for µs). `decimal`/`numeric` were already granular (`Decimal128(precision, scale)` from
+`NumericPrecision`/`NumericScale`). **`datetimeoffset` stays microsecond `TIMESTAMPTZ`** — DuckDB has no ns+tz
+type, so the tz instant keeps the correct type (the 7th digit is dropped, the prior behavior). Caveat: DuckDB
+`TIMESTAMP_NS` spans only ~1677..2262, so a `datetime2(7)` value outside that errors **loudly** on read (a
+Conversion Error, never silent corruption — an extreme edge for 100ns-precision timestamps). Verified:
+`test/verify_granular_types.test`.
+
 ## 4. Collation — the cross-stack problem
 
 **Collation is chosen at warehouse/lakehouse creation time** (Fabric defaults to

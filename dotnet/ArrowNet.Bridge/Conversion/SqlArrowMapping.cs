@@ -57,12 +57,15 @@ public static class SqlArrowMapping
             case "date":
                 return Date32Type.Default;
             case "time":
-                return new Time64Type(TimeUnit.Microsecond);
+                return new Time64Type(FractionalUnit(col));
             case "datetime":
             case "datetime2":
             case "smalldatetime":
-                return new TimestampType(TimeUnit.Microsecond, (string?)null);
+                return new TimestampType(FractionalUnit(col), (string?)null);
             case "datetimeoffset":
+                // Keep microsecond: DuckDB TIMESTAMPTZ is microsecond-only (no ns+tz type), so a tz instant
+                // stays TIMESTAMPTZ (the 7th digit is dropped — the same minor tradeoff as before, but the
+                // type is correct). Only naive datetime2/time go scale-aware ns above.
                 return new TimestampType(TimeUnit.Microsecond, "UTC");
             case "binary":
             case "varbinary":
@@ -88,6 +91,18 @@ public static class SqlArrowMapping
                 return MapClrType(col.DataType) ?? StringType.Default;
         }
     }
+
+    // SQL Server fractional-seconds scale -> Arrow time unit, for naive time/datetime2 (datetimeoffset
+    // stays microsecond TIMESTAMPTZ — see above). Scale 7 (time(7)/datetime2(7) — incl. the datetime2/time
+    // DEFAULT of 7) carries 100ns resolution, so map it to Nanosecond (DuckDB TIME_NS / TIMESTAMP_NS) to
+    // preserve the 7th fractional digit; scale <= 6 fits Microsecond (DuckDB TIME / TIMESTAMP — the common
+    // types, full date range). NumericScale is the fractional scale for these types (datetime/smalldatetime
+    // report <= 3 -> Microsecond); a null (older driver) falls back to Microsecond.
+    //   CAVEAT: DuckDB TIMESTAMP_NS spans only ~1677..2262, so a datetime2(7) value outside that range
+    //   errors LOUDLY on read (a Conversion Error, never silent corruption) — an extreme edge for
+    //   100ns-precision timestamps. time(7) (time-of-day) has no range concern.
+    private static TimeUnit FractionalUnit(DbColumn col) =>
+        (col.NumericScale ?? 0) >= 7 ? TimeUnit.Nanosecond : TimeUnit.Microsecond;
 
     private static IArrowType MakeDecimal(DbColumn col)
     {

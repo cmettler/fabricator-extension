@@ -1,0 +1,38 @@
+# name: test/verify_granular_types.test
+# description: scale-aware temporal mapping — time(7)/datetime2(7) preserve the 7th digit (ns); scale<=6 stays µs; decimal granular (warehouse-support §3.4)
+# group: [mssql_net]
+
+require mssql_net
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql_net);
+
+statement ok
+SELECT mssql_net_exec('db', 'IF OBJECT_ID(''dbo.gt'',''U'') IS NOT NULL DROP TABLE dbo.gt; CREATE TABLE dbo.gt (id INT PRIMARY KEY, dt2_7 datetime2(7), dt2_3 datetime2(3), t7 time(7), t0 time(0), dec1 decimal(18,4), dto datetimeoffset(7))');
+
+statement ok
+SELECT mssql_net_exec('db', 'INSERT INTO dbo.gt VALUES (1, ''2024-01-02 12:34:56.1234567'', ''2024-01-02 12:34:56.123'', ''12:34:56.1234567'', ''12:34:56'', 12345.6789, ''2024-01-02 12:34:56.1234567 +00:00'')');
+
+statement ok
+SELECT mssql_refresh_cache('db');
+
+# Scale 7 -> nanosecond DuckDB types (the 100ns digit is preserved); scale <=6 -> microsecond (the common
+# types, full date range); decimal carries (precision, scale); datetimeoffset stays TIMESTAMPTZ (µs).
+query TTTTTT
+SELECT typeof(dt2_7), typeof(dt2_3), typeof(t7), typeof(t0), typeof(dec1), typeof(dto) FROM db.dbo.gt;
+----
+TIMESTAMP_NS	TIMESTAMP	TIME_NS	TIME	DECIMAL(18,4)	TIMESTAMP WITH TIME ZONE
+
+# Values: the 7th fractional digit round-trips for scale-7; the microsecond ones are exact; decimal exact.
+query TTTT
+SELECT dt2_7::VARCHAR, dt2_3::VARCHAR, t7::VARCHAR, dec1::VARCHAR FROM db.dbo.gt;
+----
+2024-01-02 12:34:56.1234567	2024-01-02 12:34:56.123	12:34:56.1234567	12345.6789
+
+statement ok
+SELECT mssql_net_exec('db', 'DROP TABLE dbo.gt');
+
+statement ok
+DETACH db;
