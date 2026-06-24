@@ -20,11 +20,14 @@ public static class SqlArrowMapping
         // extension so DuckDB's import lands it as the JSON logical type (when the json extension is
         // available; an unregistered extension falls back to the Utf8 storage type = VARCHAR, so the
         // value round-trips either way). Storage type is Utf8 in both cases.
-        IReadOnlyDictionary<string, string>? metadata = null;
-        if ((col.DataTypeName ?? string.Empty).Equals("json", StringComparison.OrdinalIgnoreCase))
+        IReadOnlyDictionary<string, string>? metadata = (col.DataTypeName ?? string.Empty).ToLowerInvariant() switch
         {
-            metadata = new Dictionary<string, string> { ["ARROW:extension:name"] = "arrow.json" };
-        }
+            // Canonical Arrow extensions DuckDB's import recognizes: json (Utf8 storage) -> JSON,
+            // uuid (FixedSizeBinary(16) storage) -> UUID. Unregistered => graceful fallback to storage type.
+            "json" => new Dictionary<string, string> { ["ARROW:extension:name"] = "arrow.json" },
+            "uniqueidentifier" => new Dictionary<string, string> { ["ARROW:extension:name"] = "arrow.uuid" },
+            _ => null,
+        };
         return new Field(name, MapType(col), nullable, metadata);
     }
 
@@ -74,8 +77,9 @@ public static class SqlArrowMapping
             case "rowversion":
                 return BinaryType.Default;
             case "uniqueidentifier":
-                // Surface as text for Phase 1 (readable, lossless round-trip of the value).
-                return StringType.Default;
+                // FixedSizeBinary(16) + the arrow.uuid extension (set in ToArrowField) -> DuckDB UUID.
+                // The value appender writes the 16 bytes in canonical RFC-4122 (big-endian) order.
+                return new FixedSizeBinaryType(16);
             case "char":
             case "varchar":
             case "nchar":

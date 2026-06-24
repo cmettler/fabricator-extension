@@ -188,8 +188,9 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   json`). **The box test DB is now SQL Server 2025** (major 17, native `json`). **§3.4 granular-types investigated
   (2026-06-24) → write-side DEFERRED** (`docs/warehouse-support.md` §3.4.1): `arrow_lossless_conversion` toggles
   an Arrow extension rep for 6 types (`BOOLEAN`→`arrow.bool8`/Int8, `HUGEINT`, `UUID`, `TIME_TZ`, `BIT`, `JSON`).
-  The **read path** (C#-authored Arrow) is the principled, low-risk half — JSON read-side is done, UUID read-side
-  is feasible but changes today's correct text behavior + has byte-order/builder uncertainty (optional). The
+  The **read path** (C#-authored Arrow) is the principled, low-risk half — JSON read-side + UUID read-side done
+  (`uniqueidentifier`→`FixedSizeBinary(16)`+`arrow.uuid`→DuckDB `UUID`, big-endian RFC-4122 bytes; scale-aware
+  `time(7)`/`datetime2(7)`→ns; decimal already `(p,s)` — `verify_granular_types.test`). The
   **write path** flip is high blast radius (`ColumnAppender` has no `Int8` case → would corrupt every BOOLEAN
   write; also filter/UPDATE/DELETE value readers) AND **low warehouse value** (Fabric has no native `json`, so
   `varchar(MAX)` is already correct + the only option there; native-`json` write only helps box-2025/Azure where

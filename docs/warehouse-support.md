@@ -206,11 +206,16 @@ and `JSON` (alias)→`arrow.json`. Everything else is unaffected.
 - **Read path (C#→Arrow→DuckDB) — the principled half, low-risk, no boundary change.** C# *authors* the Arrow,
   so it can emit any extension type directly; DuckDB's import honors registered extensions
   (`arrow.uuid`/`arrow.json` are registered → `UUID`/`JSON`; unregistered → graceful fallback to the storage
-  type). This is how **JSON read-side** already works (§3.3). **UUID read-side** is feasible the same way
-  (`uniqueidentifier` → `FixedSizeBinary(16)`+`arrow.uuid` → DuckDB `UUID`) but: (a) it **changes a currently
-  correct behavior** (we surface `uniqueidentifier` as readable text today), (b) needs a `FixedSizeBinary`
-  appender (Apache.Arrow C# builder support to confirm) and (c) needs the SQL-Server↔canonical UUID byte order
-  verified (`Guid.ToByteArray(bigEndian:true)` on .NET 10). Marginal value → optional.
+  type). This is how **JSON read-side** and now **UUID read-side** work. **UUID read-side — DONE:**
+  `uniqueidentifier` → `FixedSizeBinary(16)`+`arrow.uuid` → DuckDB `UUID`, replacing the prior surface-as-text
+  behavior. The appender writes `Guid.ToByteArray(bigEndian:true)` (canonical RFC-4122 order — verified against a
+  distinct-per-group GUID that a wrong byte order would scramble); the builder is a
+  `FixedSizeBinaryArray.BuilderBase` subclass (Apache.Arrow 23.0.0 ships only the abstract base; the array type
+  lives in the `Apache.Arrow.Arrays` namespace and the enum value is `ArrowTypeId.FixedSizedBinary`). Verified:
+  `test/verify_granular_types.test`. **Write-side UUID stays deferred** (DuckDB `UUID` → `uniqueidentifier`):
+  unlike JSON, the standard-boundary storage (string) differs from `arrow.uuid` (FixedSizeBinary(16)), so
+  metadata-injection can't bridge it — it needs the lossless flip. Writing a DuckDB UUID into an *existing*
+  `uniqueidentifier` column still works (the GUID string coerces); only the CTAS type choice would be `varchar`.
 
 - **Write path (DuckDB→Arrow→C#) — high cost, low warehouse value → DEFERRED.** Detecting a DuckDB `JSON`/`UUID`
   on write needs the extension name on the produced schema, which only appears under `arrow_lossless_conversion =

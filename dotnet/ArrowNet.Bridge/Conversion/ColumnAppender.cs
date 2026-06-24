@@ -1,4 +1,5 @@
 using Apache.Arrow;
+using Apache.Arrow.Arrays;
 using Apache.Arrow.Types;
 
 namespace ArrowNet.Bridge.Conversion;
@@ -102,6 +103,13 @@ public sealed class ColumnAppender
                 var b = new BinaryArray.Builder();
                 return new ColumnAppender(o => b.Append(((byte[])o).AsSpan()), () => b.AppendNull(), () => b.Build());
             }
+            case ArrowTypeId.FixedSizedBinary:
+            {
+                // Only produced for uniqueidentifier (arrow.uuid, 16 bytes). A Guid is written in canonical
+                // RFC-4122 (big-endian) byte order, which is what DuckDB's arrow.uuid import expects.
+                var b = new FixedSizeBinaryArrayBuilder((FixedSizeBinaryType)type);
+                return new ColumnAppender(o => b.Append(UuidBytes(o)), () => b.AppendNull(), () => b.Build());
+            }
             default:
                 throw new NotSupportedException($"ArrowNet: no column appender for Arrow type {type.TypeId} ({type.Name})");
         }
@@ -121,4 +129,27 @@ public sealed class ColumnAppender
         Guid g => g.ToString("D"),
         _ => o.ToString() ?? string.Empty,
     };
+
+    // 16 canonical (RFC-4122, big-endian) bytes for a uniqueidentifier value -> arrow.uuid -> DuckDB UUID.
+    private static byte[] UuidBytes(object o) => o switch
+    {
+        Guid g => g.ToByteArray(bigEndian: true),
+        byte[] b => b,
+        string s => Guid.Parse(s).ToByteArray(bigEndian: true),
+        _ => throw new NotSupportedException($"ArrowNet: cannot convert {o.GetType().Name} to a UUID"),
+    };
+}
+
+/// <summary>
+/// Concrete <see cref="FixedSizeBinaryArray"/> builder (Apache.Arrow only ships the abstract
+/// <c>BuilderBase</c>). Used for the 16-byte <c>arrow.uuid</c> column.
+/// </summary>
+internal sealed class FixedSizeBinaryArrayBuilder
+    : FixedSizeBinaryArray.BuilderBase<FixedSizeBinaryArray, FixedSizeBinaryArrayBuilder>
+{
+    public FixedSizeBinaryArrayBuilder(FixedSizeBinaryType type) : base(type, type.ByteWidth)
+    {
+    }
+
+    protected override FixedSizeBinaryArray Build(ArrayData data) => new(data);
 }
