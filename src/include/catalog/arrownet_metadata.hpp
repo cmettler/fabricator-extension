@@ -28,6 +28,11 @@ vector<vector<string>> ReadStringTable(ArrowArrayStream &stream, idx_t expected_
 //! Discovers user schemas in the attached SQL Server database.
 vector<string> DiscoverSchemas(ArrowNetHandle handle);
 
+//! Whether the connected database's collation is binary (_BIN/_BIN2), read from the detected server
+//! profile (ARROWNET_META_SERVER_INFO). A binary collation sorts strings by byte value, matching DuckDB,
+//! so string-keyed ORDER BY+LIMIT can be pushed down safely. Best-effort: false on any failure.
+bool FetchBinaryCollation(ArrowNetHandle handle);
+
 //! Discovers user tables + views across all schemas.
 vector<ArrowNetTableInfo> DiscoverTables(ArrowNetHandle handle);
 

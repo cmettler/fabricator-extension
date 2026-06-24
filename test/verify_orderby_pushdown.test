@@ -29,11 +29,27 @@ SELECT pushed FROM mssql_net_query('db',
 ----
 1
 
-# ORDER BY a string column + LIMIT must NOT push order (collation) yet stay correct.
+# ORDER BY a string column + LIMIT must NOT push order on this CI_AS (non-binary) collation, yet stay
+# correct (DuckDB sorts/limits itself). String ORDER BY pushdown is gated on a binary database collation
+# (see test/verify_collation_pushdown.test for the binary-collation positive path).
 query I
 SELECT count(*) FROM (SELECT name FROM db.dbo.TestSimplePK ORDER BY name LIMIT 3);
 ----
 3
+
+# Proof: TOP + ORDER BY [name] (a string key) did NOT reach SQL Server under the non-binary collation.
+query I
+SELECT pushed FROM mssql_net_query('db',
+  'SELECT CAST(CASE WHEN EXISTS (
+     SELECT 1 FROM sys.dm_exec_query_stats qs
+     CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
+     WHERE CHARINDEX(''FROM [dbo].[TestSimplePK]'', st.text) > 0
+       AND CHARINDEX(''ORDER BY [name]'', st.text) > 0
+       AND CHARINDEX(''TOP ('', st.text) > 0
+       AND CHARINDEX(''dm_exec'', st.text) = 0
+   ) THEN 1 ELSE 0 END AS INT) AS pushed');
+----
+0
 
 statement ok
 DETACH db;

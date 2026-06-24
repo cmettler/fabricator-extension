@@ -184,8 +184,11 @@ void TryPushTopN(ClientContext &context, LogicalOperator &op) {
 		if (!ResolveOrderColumn(*o.expression, *match.get, match.proj, bind_data, name, nullable, is_string)) {
 			return;
 		}
-		if (is_string) {
-			return; // string ordering is collation-dependent -> SQL top-n may differ
+		if (is_string && !bind_data.string_order_pushable) {
+			// String ordering is collation-dependent: SQL Server's sort may differ from DuckDB's, so a
+			// pushed TOP+ORDER BY could trim the wrong rows. Push it only under a binary database
+			// collation (byte-order sort == DuckDB), detected at LoadCatalog. Otherwise keep it off.
+			return;
 		}
 		if (!NullOrderCompatible(context, o.type, o.null_order, nullable)) {
 			return;

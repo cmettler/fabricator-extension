@@ -1,0 +1,48 @@
+# name: test/verify_collation_pushdown.test
+# description: string-keyed ORDER BY+LIMIT pushes as TOP+ORDER BY under a BINARY database collation (warehouse-support §4/§6.6)
+# group: [mssql_net]
+#
+# Fixture (a binary-collation database — byte-order string sort, matching DuckDB):
+#   CREATE DATABASE BinCollTest COLLATE Latin1_General_100_BIN2;
+#   CREATE TABLE dbo.names (id INT NOT NULL PRIMARY KEY, name VARCHAR(50) NOT NULL);
+#   INSERT INTO dbo.names VALUES (1,'banana'),(2,'Apple'),(3,'cherry'),(4,'apple'),(5,'Banana');
+# Point MSSQL_BINCOLL_DSN at it (Database=BinCollTest). Env-gated, like the Fabric checks.
+
+require mssql_net
+
+require-env MSSQL_BINCOLL_DSN
+
+statement ok
+ATTACH '${MSSQL_BINCOLL_DSN}' AS bdb (TYPE mssql_net);
+
+# The profile detected a binary collation -> string ORDER BY pushdown is enabled for this catalog.
+query T
+SELECT value FROM mssql_server_info('bdb') WHERE property = 'is_binary_collation';
+----
+true
+
+# A binary collation sorts by byte value (uppercase before lowercase), identical to DuckDB's bytewise
+# string comparison, so the pushed SQL TOP+ORDER BY produces the same top-n DuckDB would.
+query T
+SELECT name FROM bdb.dbo.names ORDER BY name LIMIT 2;
+----
+Apple
+Banana
+
+# Proof: TOP (n) + ORDER BY [name] (a STRING key) reached SQL Server — the relaxation a non-binary
+# collation would suppress.
+query I
+SELECT pushed FROM mssql_net_query('bdb',
+  'SELECT CAST(CASE WHEN EXISTS (
+     SELECT 1 FROM sys.dm_exec_query_stats qs
+     CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
+     WHERE CHARINDEX(''FROM [dbo].[names]'', st.text) > 0
+       AND CHARINDEX(''ORDER BY [name]'', st.text) > 0
+       AND CHARINDEX(''TOP ('', st.text) > 0
+       AND CHARINDEX(''dm_exec'', st.text) = 0
+   ) THEN 1 ELSE 0 END AS INT) AS pushed');
+----
+1
+
+statement ok
+DETACH bdb;

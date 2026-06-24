@@ -91,6 +91,14 @@ ArrowNetCatalog::~ArrowNetCatalog() {
 void ArrowNetCatalog::LoadCatalog(ClientContext &context) {
 	lock_guard<mutex> lock(schema_lock_);
 
+	// Detect the database collation's sort semantics once (binary => SQL Server's byte-order string sort
+	// matches DuckDB, so string-keyed ORDER BY+LIMIT can be pushed). Best-effort: a failure leaves it off.
+	try {
+		string_order_pushable_ = FetchBinaryCollation(handle_);
+	} catch (...) {
+		string_order_pushable_ = false;
+	}
+
 	auto ensure_schema = [&](const string &schema_name) -> ArrowNetSchemaEntry & {
 		auto it = schemas_.find(schema_name);
 		if (it != schemas_.end()) {

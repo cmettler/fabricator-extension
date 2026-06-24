@@ -51,6 +51,13 @@ public:
 		return isolation_level_;
 	}
 
+	//! Whether string-keyed ORDER BY+LIMIT can be pushed to SQL Server: true only when the database
+	//! collation is binary (_BIN/_BIN2), so the server's byte-order string sort matches DuckDB. Detected
+	//! once at LoadCatalog from the server profile; read at scan bind onto the scan's bind_data.
+	bool StringOrderPushable() const {
+		return string_order_pushable_;
+	}
+
 	//! The catalog-type string identifying an attached catalog as ours (the provider
 	//! identity — becomes generic in the multi-provider rename). Centralized so the
 	//! "is this our catalog?" checks don't repeat the literal.
@@ -99,6 +106,8 @@ private:
 	string table_filter_;
 	//! Default SQL transaction isolation level (ATTACH isolation_level option); empty => provider default.
 	string isolation_level_;
+	//! Whether the database collation is binary (detected at LoadCatalog) => string ORDER BY is pushable.
+	bool string_order_pushable_ = false;
 	mutex schema_lock_;
 	case_insensitive_map_t<unique_ptr<ArrowNetSchemaEntry>> schemas_;
 };

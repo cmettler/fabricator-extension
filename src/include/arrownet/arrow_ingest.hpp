@@ -82,10 +82,16 @@ struct ArrowStreamBindData : public duckdb::TableFunctionData {
 	//! optimizer extension; DuckDB keeps its own LIMIT, so this is purely a hint.
 	int64_t top_n = -1;
 	//! ORDER BY pushdown: a JSON array `[{"col":"c","desc":bool}]`. Set by the
-	//! optimizer only when ALL order keys are plain non-string columns with
-	//! SQL-Server-compatible NULL ordering and there is no pushed filter; paired with
-	//! top_n (TopN). Empty => none. DuckDB keeps its TopN, so this is a hint.
+	//! optimizer only when ALL order keys have SQL-Server-compatible NULL ordering, there is no pushed
+	//! filter, and every key is either non-string OR string under a binary collation
+	//! (`string_order_pushable`); paired with top_n (TopN). Empty => none. DuckDB keeps its TopN, so this
+	//! is a hint.
 	duckdb::string order_by_json;
+
+	//! Whether string-keyed ORDER BY may be pushed: true only when the catalog's database collation is
+	//! binary (_BIN/_BIN2), so SQL Server's byte-order string sort matches DuckDB. Set at scan bind from
+	//! the catalog (ArrowNetCatalog::StringOrderPushable). Read by the optimizer's TopN pushdown.
+	bool string_order_pushable = false;
 
 	//! Time travel (DuckDB `FROM t AT (...)`), set at bind for a catalog table reference. `at_unit` is the
 	//! unit ("timestamp"/"version"); `at_value` is the constant rendered as a string. Empty `at_unit` => no

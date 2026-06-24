@@ -229,7 +229,11 @@ Implemented and verified:
 - **Read path** fully in C# behind `get_metadata`/`scan_table` ABI calls — **C++ has zero T-SQL**.
 - **Pushdown**: projection (by-name), filter (best-effort via `pushdown_complex_filter`, never erases →
   DuckDB always re-applies; superset-safe shapes only), bare `LIMIT` (`TOP n`), `ORDER BY`+`LIMIT`
-  (TopN, gated: non-string keys, NULL-order compatible, no pushed filter).
+  (TopN, gated: NULL-order compatible, no pushed filter, and **string keys only under a binary database
+  collation** — `ArrowStreamBindData::string_order_pushable`, set at scan bind from
+  `ArrowNetCatalog::StringOrderPushable()`, which `LoadCatalog` caches via `FetchBinaryCollation` reading
+  the `ARROWNET_META_SERVER_INFO` profile; binary `_BIN/_BIN2` collation sorts bytewise == DuckDB. No ABI.
+  `test/verify_collation_pushdown.test`).
 - **Statistics → optimizer**: cardinality (row count from `sys.dm_db_partition_stats`) + per-column NDV
   (leading-column histogram). **min/max deliberately NOT reported** (DuckDB prunes filters on min/max →
   stale SQL Server stats could drop rows; NDV is costing-only so stale is safe).

@@ -81,6 +81,23 @@ vector<string> DiscoverSchemas(ArrowNetHandle handle) {
 	return rows[0];
 }
 
+bool FetchBinaryCollation(ArrowNetHandle handle) {
+	// Read the detected server profile (property, value rows) and look for the binary-collation flag.
+	// A binary (_BIN/_BIN2) database collation sorts strings by byte value — identical to DuckDB — so a
+	// pushed SQL TOP+ORDER BY on a string column matches DuckDB's ordering. Best-effort: any failure or a
+	// missing row => false (string ORDER BY pushdown stays off, the safe default).
+	ArrowArrayStream stream;
+	std::memset(&stream, 0, sizeof(stream));
+	arrownet::GetMetadata(handle, ARROWNET_META_SERVER_INFO, "", "", stream);
+	auto rows = ReadStringTable(stream, 2); // property, value
+	for (idx_t i = 0; i < rows[0].size(); i++) {
+		if (rows[0][i] == "is_binary_collation") {
+			return rows[1][i] == "true";
+		}
+	}
+	return false;
+}
+
 vector<ArrowNetTableInfo> DiscoverTables(ArrowNetHandle handle) {
 	ArrowArrayStream stream;
 	std::memset(&stream, 0, sizeof(stream));

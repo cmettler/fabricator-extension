@@ -6,6 +6,7 @@
 
 #include "arrownet/arrow_ingest.hpp"
 #include "arrownet/clr_host.hpp"
+#include "catalog/arrownet_catalog.hpp"
 #include "catalog/arrownet_metadata.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/common/column_index.hpp"
@@ -448,6 +449,9 @@ TableFunction ArrowNetTableEntry::BuildScanFunction(ClientContext &context, uniq
 		arrownet::ScanTable(handle, schema_name, table_name, req.spec_json, req.filter_values, out);
 	};
 	data->push_projection = true; // push the projected column list (and later, filters) to SQL
+	// String-keyed ORDER BY may be pushed only under a binary database collation (byte-order sort ==
+	// DuckDB); the optimizer's TopN pushdown reads this. Detected once at LoadCatalog.
+	data->string_order_pushable = ParentCatalog().Cast<ArrowNetCatalog>().StringOrderPushable();
 
 	// Build the Arrow column converters + verify the result schema.
 	vector<LogicalType> return_types;

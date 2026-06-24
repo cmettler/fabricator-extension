@@ -10,9 +10,9 @@
 > the connection succeeds MARS-free) — `ServerProfile` detection
 > (`dotnet/ArrowNet.SqlServer/ServerProfile.cs`) + the `mssql_server_info(catalog)` diagnostic + profile-
 > driven type mapping (§3) + connection mode (`mssql_mars` tri-state, pooled reads, SNAPSHOT writes — §2,
-> [transactions.md](transactions.md) §5.1). Remaining: `mssql_default_varchar_length` for string keys
-> (§3.2 — done as a setting), the JSON gate (§3.3), the tz value-reader (§3.1), collation-aware pushdown
-> (§4). File references are repo-root-relative. Connection/transaction behavior is in
+> [transactions.md](transactions.md) §5.1) + collation-aware string `ORDER BY` pushdown (§4/§6.6). Remaining:
+> the JSON gate (§3.3 — blocked on the boundary type-erasure + a 2025/Azure server) and the tz value-reader
+> (§3.1, needs ICU). File references are repo-root-relative. Connection/transaction behavior is in
 > [transactions.md](transactions.md).
 
 ## TL;DR
@@ -195,10 +195,14 @@ support, and lossless round-trip for `ALTER`/CTAS — and would carry over to th
 - **Pushdown case-sensitivity.** A case-*insensitive* server collation makes a pushed equality/`LIKE`
   filter match a *superset* of what DuckDB would — **safe**, because our pushdown never erases (DuckDB
   re-applies every predicate). A `BIN2` collation matches DuckDB's case-sensitive bytewise semantics.
-- **String `ORDER BY` pushdown.** Today we never push `ORDER BY` on string keys (collation/sort-order
-  mismatch risk). A **binary** collation sorts by byte value — identical to DuckDB — so the profile
-  can *safely re-enable* string `ORDER BY`+`LIMIT` pushdown when `IsBinaryCollation`. A real
-  optimization the profile unlocks.
+- **String `ORDER BY` pushdown** — **DONE** (slice 6). We used to never push `ORDER BY` on string keys
+  (collation/sort-order mismatch risk). A **binary** collation sorts by byte value — identical to DuckDB —
+  so the profile now *safely re-enables* string `ORDER BY`+`LIMIT` (TopN) pushdown when `IsBinaryCollation`.
+  Wiring (no ABI): `ArrowNetCatalog` caches the flag at `LoadCatalog` via `FetchBinaryCollation` (reads the
+  existing `ARROWNET_META_SERVER_INFO` profile), the scan bind threads it onto
+  `ArrowStreamBindData::string_order_pushable`, and `arrownet_optimizer.cpp`'s `TryPushTopN` gate becomes
+  `is_string && !string_order_pushable`. Verified: `test/verify_collation_pushdown.test` (binary DB →
+  pushed) + `test/verify_orderby_pushdown.test` (CI_AS box → not pushed, both correct).
 
 ### The no-universal-winner reality
 
@@ -267,6 +271,10 @@ point, not something we can fix by picking a default:
    for plain CTAS since Fabric takes `varchar(MAX)`).
 5. **JSON type gate** (smallest, independent).
 6. **Collation-aware pushdown relaxation** (string `ORDER BY` on binary collations) — optimization.
+   **DONE** — no ABI: `FetchBinaryCollation` (reuses `ARROWNET_META_SERVER_INFO`) caches the flag on the
+   catalog at `LoadCatalog`; scan bind → `ArrowStreamBindData::string_order_pushable`; optimizer gate
+   relaxed to `is_string && !string_order_pushable`. `test/verify_collation_pushdown.test` (binary) +
+   `test/verify_orderby_pushdown.test` (non-binary, explicit not-pushed proof).
 
 ## 7. Open decisions
 
