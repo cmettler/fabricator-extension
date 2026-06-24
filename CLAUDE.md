@@ -185,10 +185,17 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   as the `JSON` logical type (unregistered-extension fallback = `VARCHAR`, so it's safe + round-trips); the
   core `json` extension is **statically embedded** (`extension_config.cmake`) so the test binaries have the
   `JSON` type + functions (this build is v0.0.1 → json can't be autoloaded). `test/verify_json.test` (`require
-  json`). **The box test DB is now SQL Server 2025** (major 17, native `json`). **Remaining**: JSON
-  **write-side** (DuckDB `JSON` → SQL `json` — blocked: `arrow_converter.cpp:120` only emits `arrow.json` under
-  `arrow_lossless_conversion`, which our boundary forces off; needs the §3.4 granular-types work, same as
-  UUID), the tz-value-reader branch (3b). (`mssql_default_varchar_length` — done via the settings refactor;
+  json`). **The box test DB is now SQL Server 2025** (major 17, native `json`). **§3.4 granular-types investigated
+  (2026-06-24) → write-side DEFERRED** (`docs/warehouse-support.md` §3.4.1): `arrow_lossless_conversion` toggles
+  an Arrow extension rep for 6 types (`BOOLEAN`→`arrow.bool8`/Int8, `HUGEINT`, `UUID`, `TIME_TZ`, `BIT`, `JSON`).
+  The **read path** (C#-authored Arrow) is the principled, low-risk half — JSON read-side is done, UUID read-side
+  is feasible but changes today's correct text behavior + has byte-order/builder uncertainty (optional). The
+  **write path** flip is high blast radius (`ColumnAppender` has no `Int8` case → would corrupt every BOOLEAN
+  write; also filter/UPDATE/DELETE value readers) AND **low warehouse value** (Fabric has no native `json`, so
+  `varchar(MAX)` is already correct + the only option there; native-`json` write only helps box-2025/Azure where
+  `nvarchar(max)` already holds the JSON). Recommendation: keep the STANDARD boundary; revisit via field-metadata
+  injection or a json-column-indices ABI arg only if a box-2025/Azure target needs it (or with the DAX provider).
+  (6) the tz-value-reader branch (3b). (`mssql_default_varchar_length` — done via the settings refactor;
   applies to all created text columns.) A `ServerProfile`
   (EngineEdition + product version + DB collation) detected at OpenCatalog drives connection behavior
   (no MARS → pooled reads + snapshot, see [docs/transactions.md](docs/transactions.md)) AND type mapping

@@ -194,6 +194,45 @@ thorough — adapt the idea, not the code). Two techniques worth lifting:
 Relevance: this refines the warehouse type mapping (precise types), the §3.3 JSON gate (`arrow.json`), UUID
 support, and lossless round-trip for `ALTER`/CTAS — and would carry over to the DAX provider's own mapping.
 
+### 3.4.1 Findings (investigated 2026-06-24) — write-side deferred, read-side is the principled half
+
+Ground truth from `duckdb/src/common/arrow/arrow_converter.cpp` `SetArrowFormat`: `arrow_lossless_conversion`
+toggles an Arrow **extension** representation for exactly six types — `BOOLEAN`→`arrow.bool8` (Int8 storage),
+`HUGEINT`/`UHUGEINT`→`arrow.hugeint`, `UUID`→`arrow.uuid` (`w:16`), `TIME_TZ`→`arrow.time_tz`, `BIT`→`arrow.bit`,
+and `JSON` (alias)→`arrow.json`. Everything else is unaffected.
+
+**The two directions are NOT symmetric in cost:**
+
+- **Read path (C#→Arrow→DuckDB) — the principled half, low-risk, no boundary change.** C# *authors* the Arrow,
+  so it can emit any extension type directly; DuckDB's import honors registered extensions
+  (`arrow.uuid`/`arrow.json` are registered → `UUID`/`JSON`; unregistered → graceful fallback to the storage
+  type). This is how **JSON read-side** already works (§3.3). **UUID read-side** is feasible the same way
+  (`uniqueidentifier` → `FixedSizeBinary(16)`+`arrow.uuid` → DuckDB `UUID`) but: (a) it **changes a currently
+  correct behavior** (we surface `uniqueidentifier` as readable text today), (b) needs a `FixedSizeBinary`
+  appender (Apache.Arrow C# builder support to confirm) and (c) needs the SQL-Server↔canonical UUID byte order
+  verified (`Guid.ToByteArray(bigEndian:true)` on .NET 10). Marginal value → optional.
+
+- **Write path (DuckDB→Arrow→C#) — high cost, low warehouse value → DEFERRED.** Detecting a DuckDB `JSON`/`UUID`
+  on write needs the extension name on the produced schema, which only appears under `arrow_lossless_conversion =
+  true`. Options: **(a)** flip the global boundary to lossless — but that also changes the *data* encoding of
+  `BOOLEAN`→Int8, `HUGEINT`, `UUID`, `BIT`, `TIME_TZ` across **every** produce path (CTAS schema, `SqlBulkCopy`
+  values via `ColumnAppender` — which has **no `Int8` case** today, filter constants, UPDATE/DELETE values), so
+  every value reader must learn the extension storage; `BOOLEAN` is the common hazard. High blast radius,
+  reverses the documented "boundary uses STANDARD encoding" decision. **(b)** inject `arrow.json` field metadata
+  into just the JSON columns of the begin_bulk/create schema (C-ABI metadata-buffer encoding in `ArrowProducer`)
+  — surgical but fiddly, data encoding untouched (JSON data is `Utf8` either way, so only the schema name
+  changes). **(c)** pass JSON column indices to `begin_bulk`/`create_table` as an ABI arg — clean-ish but an ABI
+  bump for incremental value.
+  - **Why low value for the warehouse:** **Fabric has no native `json` type** (`has_native_json=false`, edition
+    11), so DuckDB `JSON` → `varchar(MAX)` is already correct **and the only option** on the warehouse target.
+    Native-`json` write only helps box SQL Server 2025 / Azure SQL DB, where `nvarchar(max)` already stores the
+    JSON text fine (it just isn't the validated/indexable native type). So the write-side flip's payoff is
+    incremental and does **not** apply to Fabric.
+
+**Recommendation:** keep the STANDARD-encoding boundary (don't pursue option (a)). The read-side (JSON done; UUID
+optional) is the principled, low-risk half. Revisit write-side native `json`/UUID via option (b)/(c) only if a
+box-2025/Azure target makes it worthwhile, or fold it into the DAX provider's type-mapping work.
+
 ## 4. Collation — the cross-stack problem
 
 **Collation is chosen at warehouse/lakehouse creation time** (Fabric defaults to
