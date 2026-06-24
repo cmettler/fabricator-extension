@@ -13,7 +13,7 @@ ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql_net);
 query I
 SELECT count(*) FROM mssql_server_info('db');
 ----
-13
+14
 
 # Detected raw values for the test SQL Server 2022 (box, Developer edition).
 query I
@@ -74,6 +74,12 @@ query T
 SELECT value FROM mssql_server_info('db') WHERE property = 'is_case_sensitive';
 ----
 false
+
+# Box SQL Server: the pinned write transaction uses the connection/server default isolation.
+query T
+SELECT value FROM mssql_server_info('db') WHERE property = 'default_write_isolation';
+----
+(default)
 
 statement ok
 DETACH db;

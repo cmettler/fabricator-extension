@@ -1,0 +1,92 @@
+# name: test/verify_connection_mode.test
+# description: mssql_mars tri-state (auto|true|false) + the MARS-off pooled-read path (warehouse connection mode, slice 3 of warehouse-support §6)
+# group: [mssql_net]
+
+require mssql_net
+
+require-env MSSQL_TESTDB_DSN
+
+# mssql_mars is resolved ONCE at first connection (ATTACH validates -> detects the profile ->
+# finalizes the connection string), so it must be SET *before* ATTACH. Force MARS off — selectable
+# on box SQL Server too, not just on the non-MARS warehouse engines (Fabric/Synapse) where it is the
+# automatic default. NOTE: end this file with `SET mssql_mars='auto'` (not RESET): RESET of an
+# extension option does not fire the set-callback, so it would NOT clear the process-global provider
+# settings store and would leak MARS-off into later .test files.
+statement ok
+SET mssql_mars='false';
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql_net);
+
+statement ok
+DROP TABLE IF EXISTS db.dbo.cm_a;
+
+statement ok
+DROP TABLE IF EXISTS db.dbo.cm_b;
+
+# CTAS (the pattern every other test uses — registers the catalog entry for the next statement).
+# cm_a starts empty (WHERE 1=0); cm_b carries two committed rows.
+statement ok
+CREATE TABLE db.dbo.cm_a AS SELECT * FROM (VALUES (1)) v(id) WHERE 1=0;
+
+statement ok
+CREATE TABLE db.dbo.cm_b AS SELECT * FROM (VALUES (10), (20)) v(id);
+
+# Basic autocommit read works with MARS forced off (each statement gets its own pooled connection).
+query I
+SELECT count(*) FROM db.dbo.cm_b;
+----
+2
+
+# Inside a write transaction, a read of a DIFFERENT (unlocked) table takes a fresh pooled connection
+# (no read-your-writes, no MARS) and returns the committed data — the warehouse read path. We read a
+# different table on purpose: reading the table the txn is writing would block on a non-snapshot box
+# engine (on Fabric, snapshot isolation makes even that non-blocking).
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO db.dbo.cm_a VALUES (1);
+
+query I
+SELECT count(*) FROM db.dbo.cm_b;
+----
+2
+
+statement ok
+COMMIT;
+
+# The write committed on the pinned connection.
+query I
+SELECT count(*) FROM db.dbo.cm_a;
+----
+1
+
+statement ok
+DROP TABLE db.dbo.cm_a;
+
+statement ok
+DROP TABLE db.dbo.cm_b;
+
+statement ok
+DETACH db;
+
+# An explicit MARS value is honored; an unknown one is rejected when the mode is resolved (at ATTACH).
+statement ok
+SET mssql_mars='bogus';
+
+statement error
+ATTACH '${MSSQL_TESTDB_DSN}' AS db2 (TYPE mssql_net);
+----
+invalid mssql_mars
+
+# Restore the default (auto) via SET so the process-global store does not leak into later test files.
+statement ok
+SET mssql_mars='auto';
+
+# auto re-attaches normally (MARS on for box SQL Server -> read-your-writes restored).
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db3 (TYPE mssql_net);
+
+statement ok
+DETACH db3;

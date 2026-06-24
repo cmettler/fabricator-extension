@@ -49,6 +49,14 @@ internal sealed class ServerProfile
     /// <summary>True for Synapse (dedicated/serverless) + Fabric — the "warehouse" family.</summary>
     public bool IsWarehouse => EngineEdition is EditionSynapseDedicated or EditionFabricOrSynapseServerless;
 
+    /// <summary>
+    /// Isolation level for the pinned WRITE transaction (BeginWrite). Fabric Warehouse / Lakehouse SQL
+    /// endpoint only support SNAPSHOT, so we set it explicitly there; box SQL Server / Azure SQL DB /
+    /// Synapse dedicated keep the connection/server default (empty => Unspecified). Synapse dedicated is
+    /// intentionally NOT snapshot here — its default is READ UNCOMMITTED and snapshot may be disabled.
+    /// </summary>
+    public string DefaultWriteIsolation => EngineEdition == EditionFabricOrSynapseServerless ? "snapshot" : string.Empty;
+
     private ServerProfile(int engineEdition, int productMajorVersion, string? productVersion, string? collation)
     {
         EngineEdition = engineEdition;
@@ -97,6 +105,7 @@ internal sealed class ServerProfile
         ("is_utf8_collation", Bool(IsUtf8Collation)),
         ("is_binary_collation", Bool(IsBinaryCollation)),
         ("is_case_sensitive", Bool(IsCaseSensitive)),
+        ("default_write_isolation", DefaultWriteIsolation.Length == 0 ? "(default)" : DefaultWriteIsolation),
     };
 
     private static string Bool(bool value) => value ? "true" : "false";

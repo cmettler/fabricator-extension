@@ -107,12 +107,13 @@ Callers that pin (the write paths): `ExecuteNonQuery`, `BulkInsert`, `ExecuteDel
 `InsertReturning`, `CreateTable` (and other DDL routed through `BeginWrite`), and `SqlServerProcEach`
 (per-row proc `_each`).
 
-**Reads never pin.** `ScanFromSource` does `pinned = _inTransaction ? _txnConnection : null` — it *reads*
-the field, never assigns it. Consequences:
+**Reads never pin.** `ExecuteQuery` does `pinned = (_inTransaction && _marsEnabled) ? _txnConnection : null`
+— it *reads* the field, never assigns it. Consequences:
 
 | Sequence (within a transaction) | Read connection |
 |---|---|
-| Write, then read | The **pinned** connection + its `SqlTransaction` → **read-your-writes**. |
+| Write, then read (**MARS on**) | The **pinned** connection + its `SqlTransaction` → **read-your-writes**. |
+| Write, then read (**MARS off**) | A **fresh pooled** connection → **no read-your-writes** (see §5.1). |
 | Read before any write | `_txnConnection` is null → a **fresh pooled** connection. |
 | Read-only transaction | Nothing pinned; every scan is pooled; commit/rollback are no-ops. |
 
@@ -154,6 +155,42 @@ CROSS APPLY path) serializes access to its own connection via the C++ gate (`Max
 relying on MARS — a conscious choice for Fabric / Azure endpoints where MARS may be unavailable. So: the
 **pinned transaction connection** depends on MARS; the **exchange connection** sidesteps it with
 serialization.
+
+### 5.1 Connection mode — `mssql_mars` + the warehouse (no-MARS) path
+
+MARS is **not** unconditionally forced. It is resolved once, at the first connection (ATTACH validates →
+`ServerProfile.Detect` runs on a deliberately MARS-free probe → the working connection string is finalized),
+from the `mssql_mars` provider setting:
+
+| `mssql_mars` | Effect |
+|---|---|
+| `auto` (default) / unset | MARS = `profile.SupportsMars` — on for box SQL Server / Azure SQL DB, **off** for Synapse / Fabric (which reject a MARS connection outright). |
+| `true` | Force MARS on. On a non-MARS engine this fails loudly at connect — the user's choice. |
+| `false` | Force MARS off, even on box SQL Server (pooled reads, no read-your-writes — see below). |
+
+`mssql_mars` is a **global** provider setting (`SET mssql_mars=…`), resolved at first connection, so **set it
+before `ATTACH`** — a later `SET` does not re-finalize an already-connected catalog (same lifetime as the
+detected profile). A per-catalog `mars` ATTACH option is deferred to the ATTACH-options→C# refactor (see
+`docs/provider-extensibility.md`); the global `SET` is the override available today, symmetric to
+`SET mssql_isolation_level` alongside its own deferred per-catalog cutover. *(Implementation note for tests:
+`RESET mssql_mars` does **not** clear the value — DuckDB does not fire an extension option's set-callback on
+RESET — so restore the default with `SET mssql_mars='auto'`, which does.)*
+
+**With MARS off, reads never reuse the pinned write connection.** An open scan reader and the transaction's
+DML can only coexist on one connection under MARS, so when MARS is off `ExecuteQuery` routes every read
+through a **fresh pooled connection**, even inside a write transaction. The trade-off: **no read-your-writes
+within the write transaction** — a read sees the last committed state, not the transaction's uncommitted
+writes. This is the documented warehouse behavior ("pin only for writes, pooled connections for reads"). On a
+**snapshot**-isolation engine (Fabric) the pooled read sees a consistent committed snapshot and never blocks;
+on a non-snapshot box engine with `mssql_mars=false`, a pooled read of a row the same transaction is **writing**
+would block on the writer's locks — so don't read rows the open transaction is modifying when you force MARS
+off on box.
+
+**Warehouse write transactions run at SNAPSHOT.** Fabric Warehouse / Lakehouse SQL endpoint support only
+snapshot isolation, so `BeginWrite` opens the pinned `SqlTransaction` at `IsolationLevel.Snapshot` for those
+engines (`ServerProfile.DefaultWriteIsolation`); box SQL Server / Azure SQL DB / Synapse dedicated keep the
+connection/server default (Synapse dedicated is intentionally **not** forced to snapshot — its default is READ
+UNCOMMITTED and snapshot may be disabled).
 
 ### Contrast: the native `mssql-extension` (TDS sibling) does NOT use MARS
 

@@ -159,7 +159,7 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
 - **DAX / ADOMD 2nd provider** (the "one binary, many providers" goal) + the then-due generic rename
   (`arrownet_query`/`_exec`, catalog-type `"arrownet"`) + `BackendRegistry` multi-provider polish.
 - **Multi-edition support** (Synapse / Fabric Warehouse / Lakehouse SQL endpoint) — **design:
-  [docs/warehouse-support.md](docs/warehouse-support.md)**. **Slices 1–3 DONE + validated end-to-end against
+  [docs/warehouse-support.md](docs/warehouse-support.md)**. **Slices 1–4 DONE + validated end-to-end against
   a real Fabric Warehouse** (edition 11, `BIN2_UTF8`): (1) `ServerProfile` (`ServerProfile.cs`) detected
   lazily on first connection via a **non-MARS probe** (so Fabric/Synapse, which reject a MARS connection, are
   classified before the MARS decision); **MARS gated on `profile.SupportsMars`** (the connection only works on
@@ -167,8 +167,16 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   (3) **profile-driven `MapArrowToSqlType`** — `NVARCHAR`→`VARCHAR` by `HasNVarchar`, `datetime2`/`time` scale
   by `MaxDateTime2Scale`, tz→`datetimeoffset`|UTC-`datetime2` by `HasDatetimeOffset`; box-preserving; CTAS to
   Fabric verified (`varchar(MAX)`+`datetime2(6)`, µs round-trip; **Fabric accepts `varchar(MAX)`**). Read +
-  write paths (incl. `SqlBulkCopy`) both confirmed working on Fabric. **Remaining**: connection mode (`mars`
-  tri-state + pooled reads + snapshot), JSON gate, the tz-value-reader branch (3b).
+  write paths (incl. `SqlBulkCopy`) both confirmed working on Fabric. (4) **connection mode** (C#-only, no ABI):
+  `mssql_mars` tri-state provider setting (`auto`=`profile.SupportsMars` | `true` | `false`) resolved
+  once at first connection; **MARS-off reads take a fresh pooled connection** (no read-your-writes in a write
+  txn — `ExecuteQuery` gates the pinned-read branch on `_marsEnabled`); **Fabric write transactions run at
+  SNAPSHOT** (`ServerProfile.DefaultWriteIsolation`, edition-11-only — box/Synapse keep the server default).
+  `mssql_mars` is **global** (`SET` before ATTACH); a per-catalog `mars` ATTACH option waits for the
+  ATTACH-options→C# refactor. **Caveat:** `RESET` of an extension option does NOT fire its set-callback
+  (`config.cpp ResetOption`), so it never clears the process-global `ProviderSettingsStore` — restore a setting
+  with `SET name='<default>'`, not `RESET` (matters for `.test` hygiene across files). Verified:
+  `test/verify_connection_mode.test` (20). **Remaining**: JSON gate, the tz-value-reader branch (3b).
   (`mssql_default_varchar_length` — done via the settings refactor; applies to all created text columns.) A `ServerProfile`
   (EngineEdition + product version + DB collation) detected at OpenCatalog drives connection behavior
   (no MARS → pooled reads + snapshot, see [docs/transactions.md](docs/transactions.md)) AND type mapping

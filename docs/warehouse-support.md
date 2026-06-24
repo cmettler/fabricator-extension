@@ -5,12 +5,14 @@
 > endpoint**. These differ from box SQL Server in connection capabilities (no MARS, snapshot
 > isolation) **and** in their type systems and collation. The strategy: **detect a server
 > capability profile once at ATTACH and adapt** — be collation-*adaptive and always correct*,
-> never collation-*prescriptive*. Status: **slices 1–2 implemented + validated end-to-end against a
+> never collation-*prescriptive*. Status: **slices 1–3 implemented + validated end-to-end against a
 > real Fabric Warehouse** (edition 11, `Latin1_General_100_BIN2_UTF8`; ATTACH + catalog discovery work,
 > the connection succeeds MARS-free) — `ServerProfile` detection
-> (`dotnet/ArrowNet.SqlServer/ServerProfile.cs`) + the `mssql_server_info(catalog)` diagnostic that
-> surfaces it; profile-driven type mapping, connection mode, and settings are the remaining slices
-> (§6). File references are repo-root-relative. Connection/transaction behavior is in
+> (`dotnet/ArrowNet.SqlServer/ServerProfile.cs`) + the `mssql_server_info(catalog)` diagnostic + profile-
+> driven type mapping (§3) + connection mode (`mssql_mars` tri-state, pooled reads, SNAPSHOT writes — §2,
+> [transactions.md](transactions.md) §5.1). Remaining: `mssql_default_varchar_length` for string keys
+> (§3.2 — done as a setting), the JSON gate (§3.3), the tz value-reader (§3.1), collation-aware pushdown
+> (§4). File references are repo-root-relative. Connection/transaction behavior is in
 > [transactions.md](transactions.md).
 
 ## TL;DR
@@ -77,13 +79,18 @@ lifetime (edition/collation don't change). Explicit ATTACH options override the 
 
 ## 2. Connection behavior
 
-Covered in [transactions.md](transactions.md) — summarized here because the profile drives it:
+Covered in [transactions.md](transactions.md) §5.1 — summarized here because the profile drives it.
+**DONE** (slice 3):
 
-- `mars` ATTACH option is tri-state (`auto` | `true` | `false`); `auto` = `profile.SupportsMars`.
-  `false` (pooled reads, no read-your-writes) is selectable on box SQL Server too, intentionally.
-- Warehouse mode → **pin only for writes, pooled connections for reads**, write transaction at
-  **snapshot** isolation. Reads in a write-transaction don't see uncommitted writes — acceptable for
-  warehouse workloads, documented. The in-out exchange is already MARS-free (gate-serialized).
+- `mssql_mars` is tri-state (`auto` | `true` | `false`); `auto` = `profile.SupportsMars`. `false`
+  (pooled reads, no read-your-writes) is selectable on box SQL Server too, intentionally. Resolved once
+  at first connection (a **global** setting today — `SET mssql_mars=…` **before** ATTACH; a per-catalog
+  ATTACH option waits for the ATTACH-options→C# refactor).
+- Warehouse mode → **pin only for writes, pooled connections for reads** (`ExecuteQuery` routes reads to a
+  fresh pooled connection whenever MARS is off), write transaction at **snapshot** isolation
+  (`ServerProfile.DefaultWriteIsolation`, Fabric only). Reads in a write-transaction don't see uncommitted
+  writes — acceptable for warehouse workloads, documented. The in-out exchange is already MARS-free
+  (gate-serialized). Verified: `test/verify_connection_mode.test`.
 
 ## 3. Type mapping (profile-driven `MapArrowToSqlType`)
 
@@ -250,8 +257,12 @@ point, not something we can fix by picking a default:
    length setting (step 4) is NOT required for CTAS — only for string keys. *Remaining (3b):* the
    tz-value-reader branch — `TIMESTAMPTZ` → UTC `datetime2` value conversion when there's no `datetimeoffset`
    (needs ICU + a non-UTC session-tz test to validate; naive timestamps already round-trip correctly).
-3. **Connection mode** (`mars` tri-state, pooled reads, snapshot default) — see
-   [transactions.md](transactions.md).
+3. **Connection mode** (`mssql_mars` tri-state, pooled reads, snapshot default) — see
+   [transactions.md](transactions.md) §5.1. **DONE** — slice 3, C#-only (no ABI): `mssql_mars` provider
+   setting resolved at first connection; MARS-off reads take a fresh pooled connection (no read-your-writes
+   in a write txn); Fabric write transactions run at SNAPSHOT (`ServerProfile.DefaultWriteIsolation`).
+   `test/verify_connection_mode.test`. *Remaining:* a per-catalog `mars` ATTACH option (with the
+   ATTACH-options→C# refactor).
 4. **`mssql_default_varchar_length`** + length-aware `VARCHAR` (unblocks string PK/UNIQUE keys; NOT needed
    for plain CTAS since Fabric takes `varchar(MAX)`).
 5. **JSON type gate** (smallest, independent).

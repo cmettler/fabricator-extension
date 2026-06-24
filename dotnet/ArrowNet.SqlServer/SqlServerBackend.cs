@@ -42,6 +42,7 @@ public sealed class SqlServerBackend : IBackend
                 Long("mssql_idle_timeout"), Long("mssql_min_connections"),
                 Str("mssql_ctas_text_type"),
                 Str("mssql_isolation_level", "mssql_net: SQL transaction isolation level for table-in-out sessions"),
+                Str("mssql_mars", "mssql_net: MARS mode — auto (default, per engine) | true | false"),
                 Long("mssql_insert_batch_size", "mssql_net: max rows per INSERT statement", 2000L, 1),
                 Long("mssql_insert_max_rows_per_statement", "mssql_net: hard cap on rows per statement", 2000L, 1),
                 Long("mssql_insert_max_sql_bytes", "mssql_net: max SQL statement size in bytes", 8388608L, 1),
@@ -200,7 +201,8 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // Probed on a NON-MARS connection (Synapse/Fabric reject a MARS connection outright), after which the
     // working connection string re-enables MARS only when the engine supports it.
     private volatile ServerProfile? _profile;
-    private string? _connectionString;               // finalized in EnsureProfile (MARS iff profile.SupportsMars)
+    private string? _connectionString;               // finalized in EnsureProfile (MARS per the resolved mode)
+    private bool _marsEnabled;                        // resolved in EnsureProfile (mssql_mars ?? profile.SupportsMars)
     private readonly object _profileLock = new();
 
     public SqlServerCatalog(string connectionString)
@@ -336,13 +338,48 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             {
                 return;
             }
-            using var probe = OpenRaw(_baseConnectionString);
+            // Probe MARS-free regardless of what the user put in the connection string: Synapse/Fabric
+            // reject a MARS connection outright, so detection must not ride one.
+            using var probe = OpenRaw(
+                new SqlConnectionStringBuilder(_baseConnectionString) { MultipleActiveResultSets = false }.ConnectionString);
             probe.Open();
             var profile = ServerProfile.Detect(probe);
-            _connectionString = profile.SupportsMars
-                ? new SqlConnectionStringBuilder(_baseConnectionString) { MultipleActiveResultSets = true }.ConnectionString
-                : _baseConnectionString;
-            _profile = profile; // volatile write last → publishes _connectionString to fast-path readers
+            // mssql_mars (provider setting) is tri-state: auto (default) => the engine's capability
+            // (profile.SupportsMars); true/false force it. Forcing MARS on an engine that rejects it
+            // (Fabric/Synapse) is the user's choice — it fails loudly at connect.
+            bool mars = ResolveMarsMode(profile);
+            _connectionString =
+                new SqlConnectionStringBuilder(_baseConnectionString) { MultipleActiveResultSets = mars }.ConnectionString;
+            _marsEnabled = mars;
+            _profile = profile; // volatile write last → publishes _connectionString + _marsEnabled to fast-path readers
+        }
+    }
+
+    // mssql_mars: "auto"/empty => the engine default (profile.SupportsMars); "true"/"false" force it.
+    // A genuinely unknown value throws. When MARS is off, reads never reuse the pinned write connection
+    // (no read-your-writes) — they take a fresh pooled connection (see ExecuteQuery), which is what makes
+    // a non-MARS warehouse (Fabric/Synapse) work: an open scan reader and DML can't coexist on one
+    // non-MARS connection. See docs/transactions.md + docs/warehouse-support.md.
+    private static bool ResolveMarsMode(ServerProfile profile)
+    {
+        var v = ProviderSettingsStore.Instance.GetString(SqlServerBackend.ProviderName, "mssql_mars");
+        switch ((v ?? string.Empty).Trim().ToLowerInvariant())
+        {
+            case "":
+            case "auto":
+                return profile.SupportsMars;
+            case "true":
+            case "on":
+            case "1":
+            case "yes":
+                return true;
+            case "false":
+            case "off":
+            case "0":
+            case "no":
+                return false;
+            default:
+                throw new ArgumentException($"mssql_net: invalid mssql_mars '{v}' (expected auto | true | false)");
         }
     }
 
@@ -432,7 +469,13 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 {
                     _txnConnection = OpenConnection();
                     _txnConnection.Open();
-                    _txn = _txnConnection.BeginTransaction();
+                    // Warehouse engines run the write transaction at SNAPSHOT (Fabric's only isolation
+                    // level); box SQL Server keeps the connection/server default (Unspecified). Profile is
+                    // already detected (OpenConnection ran EnsureProfile).
+                    var level = ParseIsolationLevel(_profile!.DefaultWriteIsolation);
+                    _txn = level == IsolationLevel.Unspecified
+                        ? _txnConnection.BeginTransaction()
+                        : _txnConnection.BeginTransaction(level);
                 }
                 return (_txnConnection, _txn, false);
             }
@@ -449,12 +492,20 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         // Inside a transaction that has a pinned connection (a write has happened),
         // read on that connection so the query sees uncommitted changes
         // (read-your-writes). Borrowed: the stream must not dispose the connection.
-        SqlConnection? pinned;
-        SqlTransaction? pinnedTransaction;
+        // Only when MARS is enabled, though — an open scan reader and the transaction's
+        // DML can only coexist on one connection under MARS. With MARS off (Fabric/Synapse,
+        // or an explicit mssql_mars=false), reads take a fresh pooled connection instead,
+        // giving up read-your-writes within the write transaction (documented warehouse
+        // trade-off — see docs/transactions.md §4/§5).
+        SqlConnection? pinned = null;
+        SqlTransaction? pinnedTransaction = null;
         lock (_txnLock)
         {
-            pinned = _inTransaction ? _txnConnection : null;
-            pinnedTransaction = _txn;
+            if (_inTransaction && _marsEnabled)
+            {
+                pinned = _txnConnection;
+                pinnedTransaction = _txn;
+            }
         }
         if (pinned is not null)
         {
