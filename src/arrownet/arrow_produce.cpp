@@ -5,12 +5,22 @@
 #include "arrownet/arrow_produce.hpp"
 
 #include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/main/client_context.hpp"
 
 #include <cstring>
 
 namespace arrownet {
 
 using namespace duckdb;
+
+ClientProperties BoundaryClientProperties(ClientContext &context) {
+	auto p = context.GetClientProperties();
+	// Keep time zone + Arrow output version; force the encoding-robustness settings to standard so the
+	// managed side always sees plain Arrow (see the header for why — the lossless BOOLEAN->Int8 trap).
+	return ClientProperties(p.time_zone, ArrowOffsetSize::REGULAR, /*arrow_use_list_view=*/false,
+	                        /*produce_arrow_string_view=*/false, /*lossless_conversion=*/false,
+	                        p.arrow_output_version, p.client_context);
+}
 
 ArrowProducer::ArrowProducer(vector<LogicalType> types, vector<string> names, ClientProperties properties)
     : types_(std::move(types)), names_(std::move(names)), properties_(std::move(properties)) {

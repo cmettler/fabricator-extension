@@ -861,6 +861,13 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
 - **C++ is provider-agnostic** — the operators only produce Arrow + table/column identity; every SQL
   Server specific (SqlBulkCopy, parameterized UPDATE/DELETE, type mapping, DDL generation, all `sys.*`)
   lives in `ArrowNet.SqlServer`. Keep it that way.
+- **The C++↔C# Arrow boundary always uses STANDARD encoding** (`arrownet::BoundaryClientProperties`, used at
+  every DuckDB→Arrow site instead of `context.GetClientProperties()`): it keeps the session time zone +
+  Arrow output version but forces `arrow_lossless_conversion`/`arrow_offset_size`/`produce_arrow_string_view`/
+  `arrow_use_list_view` to their standard form. Our bridge maps Arrow→provider types itself, so a user's
+  **global** `SET arrow_lossless_conversion = true` must not change our boundary encoding — otherwise DuckDB
+  exports `BOOLEAN` as Arrow `Int8` and our mapper turns it into SQL `SMALLINT` (1/0) instead of `BIT`
+  (true/false), and `HUGEINT` into `nvarchar`. Verified: `test/verify_arrow_lossless.test`.
 - **Self-healing catalog cache:** `GetOrCreateEntry` evicts on a `FetchTableColumns` failure (a table
   dropped out-of-band leaves no stale entry). Do NOT remove this to match
   `exec_invalidate_cache_setting.test`'s setting-OFF stale-cache footgun — it's a deliberate robustness

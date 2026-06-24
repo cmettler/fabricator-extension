@@ -16,7 +16,19 @@
 #include <mutex>
 #include <queue>
 
+namespace duckdb {
+class ClientContext;
+}
+
 namespace arrownet {
+
+// ClientProperties for the C++<->C# Arrow boundary: keeps the user's time zone and Arrow output version, but
+// forces the type-encoding-robustness settings to their standard form (lossless conversion OFF, regular
+// offsets, no string-view, no list-view). Our bridge maps Arrow to provider types itself, so it must always
+// receive plain, standard Arrow regardless of the user's GLOBAL Arrow settings — e.g. a global
+// `SET arrow_lossless_conversion = true` otherwise exports BOOLEAN as Arrow Int8, which our type mapping then
+// turns into SQL SMALLINT (1/0) instead of BIT (true/false). Use this wherever an ArrowProducer is built.
+duckdb::ClientProperties BoundaryClientProperties(duckdb::ClientContext &context);
 
 class ArrowProducer {
 public:

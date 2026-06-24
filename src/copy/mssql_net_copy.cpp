@@ -44,7 +44,7 @@ struct ArrowNetCopyBindData : public FunctionData {
 
 struct ArrowNetCopyGlobalState : public GlobalFunctionData {
 	ArrowNetCopyGlobalState(ClientContext &context, const ArrowNetCopyBindData &bind_data)
-	    : properties(context.GetClientProperties()),
+	    : properties(arrownet::BoundaryClientProperties(context)),
 	      extension_types(ArrowTypeExtensionData::GetExtensionTypes(context, bind_data.column_types)) {
 		// The producer also builds the Arrow schema handed to begin_bulk.
 		producer = make_uniq<arrownet::ArrowProducer>(bind_data.column_types, bind_data.column_names, properties);

@@ -22,7 +22,7 @@ namespace duckdb {
 class ArrowNetInsertGlobalSinkState : public GlobalSinkState {
 public:
 	ArrowNetInsertGlobalSinkState(ClientContext &context, const ArrowNetInsertTarget &target)
-	    : properties(context.GetClientProperties()),
+	    : properties(arrownet::BoundaryClientProperties(context)),
 	      extension_types(ArrowTypeExtensionData::GetExtensionTypes(context, target.column_types)) {
 		// The Arrow schema field names = the insert column names, so the provider
 		// can map columns by name (SqlBulkCopy column mappings). The producer also

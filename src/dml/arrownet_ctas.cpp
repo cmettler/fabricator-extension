@@ -18,7 +18,7 @@ namespace duckdb {
 class ArrowNetCtasGlobalState : public GlobalSinkState {
 public:
 	ArrowNetCtasGlobalState(ClientContext &context, const ArrowNetCtasInfo &info)
-	    : properties(context.GetClientProperties()),
+	    : properties(arrownet::BoundaryClientProperties(context)),
 	      extension_types(ArrowTypeExtensionData::GetExtensionTypes(context, info.column_types)) {
 		// The producer also builds the Arrow schema handed to begin_bulk.
 		producer = make_uniq<arrownet::ArrowProducer>(info.column_types, info.column_names, properties);

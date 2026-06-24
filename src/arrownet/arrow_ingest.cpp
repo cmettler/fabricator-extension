@@ -265,7 +265,7 @@ static unique_ptr<arrownet::ArrowProducer> BuildFilterValues(ClientContext &cont
 		types.push_back(consts[i].type());
 		names.push_back("v" + to_string(i));
 	}
-	auto props = context.GetClientProperties();
+	auto props = arrownet::BoundaryClientProperties(context);
 	auto producer = make_uniq<arrownet::ArrowProducer>(types, names, props);
 
 	auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(context, types);

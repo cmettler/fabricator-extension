@@ -1,0 +1,44 @@
+# name: test/verify_arrow_lossless.test
+# description: a global arrow_lossless_conversion=true must not pollute our write type mapping (the C++<->C# boundary forces standard Arrow)
+# group: [mssql_net]
+
+require mssql_net
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql_net);
+
+statement ok
+DROP TABLE IF EXISTS db.dbo.lossless_bool;
+
+# Without the boundary override, lossless exports DuckDB BOOLEAN as Arrow Int8 -> our mapper picks SMALLINT.
+statement ok
+SET arrow_lossless_conversion = true;
+
+statement ok
+CREATE TABLE db.dbo.lossless_bool AS SELECT true AS b, 7 AS i;
+
+# BOOLEAN must still land as BIT (not SMALLINT), and the int as INT.
+query T
+SELECT DATA_TYPE FROM mssql_net_query('db',
+  'SELECT CAST(DATA_TYPE AS VARCHAR(16)) AS DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS
+   WHERE TABLE_NAME = ''lossless_bool'' ORDER BY ORDINAL_POSITION');
+----
+bit
+int
+
+# Round-trips as a real boolean (read back boolean true -> 1; 1 + 7 = 8).
+query I
+SELECT b::INTEGER + i FROM db.dbo.lossless_bool;
+----
+8
+
+statement ok
+DROP TABLE db.dbo.lossless_bool;
+
+statement ok
+RESET arrow_lossless_conversion;
+
+statement ok
+DETACH db;

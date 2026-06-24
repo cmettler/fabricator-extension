@@ -34,7 +34,7 @@ public:
 			types.push_back(target.rowid_types[i]);
 		}
 		key_count = target.rowid_columns.size();
-		properties = context.GetClientProperties();
+		properties = arrownet::BoundaryClientProperties(context);
 		extension_types = ArrowTypeExtensionData::GetExtensionTypes(context, types);
 		producer = make_uniq<arrownet::ArrowProducer>(types, names, properties);
 	}

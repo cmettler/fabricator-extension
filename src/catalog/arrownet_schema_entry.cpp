@@ -205,7 +205,7 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateScalarFunction(Client
 		idx_t row_count = args.size();
 
 		// Argument chunk -> a one-batch Arrow stream (in parameter order).
-		auto properties = ctx.GetClientProperties();
+		auto properties = arrownet::BoundaryClientProperties(ctx);
 		auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(ctx, arg_types);
 		ArrowAppender appender(arg_types, row_count, properties, extension_types);
 		appender.Append(args, 0, row_count, row_count);
@@ -578,7 +578,7 @@ unique_ptr<FunctionData> ArrowNetAggregateBind(ClientContext &context, Aggregate
 	bind_data->holder->session = arrownet::AggOpen(info.handle, info.schema, info.func);
 	bind_data->arg_types = info.arg_types;
 	bind_data->arg_names = info.arg_names;
-	bind_data->properties = context.GetClientProperties();
+	bind_data->properties = arrownet::BoundaryClientProperties(context);
 	bind_data->context = &context;
 	bind_data->spillable = info.spillable;
 	return std::move(bind_data);
@@ -840,7 +840,7 @@ unique_ptr<FunctionData> ArrowNetTableFunctionBind(ClientContext &context, Table
 
 	auto bind_data = make_uniq<arrownet::ArrowStreamBindData>();
 
-	auto properties = context.GetClientProperties();
+	auto properties = arrownet::BoundaryClientProperties(context);
 	auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(context, arg_types);
 
 	// Marshal the constant call args into a 1-row Arrow array (shared by the output-schema resolution and the
@@ -1056,7 +1056,7 @@ unique_ptr<FunctionData> ArrowNetExchangeBind(ClientContext &context, TableFunct
 		bind_data->input_names.push_back(input.input_table_names[i]);
 	}
 
-	auto props = context.GetClientProperties();
+	auto props = arrownet::BoundaryClientProperties(context);
 	ArrowSchema input_schema;
 	std::memset(&input_schema, 0, sizeof(input_schema));
 	ArrowConverter::ToArrowSchema(&input_schema, bind_data->input_types, bind_data->input_names, props);
@@ -1094,7 +1094,7 @@ unique_ptr<GlobalTableFunctionState> ArrowNetExchangeInitGlobal(ClientContext &c
 	gstate->holder = bind.holder.get();
 	gstate->input_types = bind.input_types;
 	gstate->input_names = bind.input_names;
-	gstate->props = context.GetClientProperties();
+	gstate->props = arrownet::BoundaryClientProperties(context);
 
 	ArrowArrayStream input_stream;
 	std::memset(&input_stream, 0, sizeof(input_stream));
@@ -1136,7 +1136,7 @@ OperatorResultType ArrowNetExchangeFunction(ExecutionContext &context, TableFunc
 			g.gate.lock();
 			l.owns_gate = true;
 			// Export this input chunk into the single slot for the C# input pull.
-			auto props = context.client.GetClientProperties();
+			auto props = arrownet::BoundaryClientProperties(context.client);
 			auto ext = ArrowTypeExtensionData::GetExtensionTypes(context.client, bind.input_types);
 			ArrowAppender appender(bind.input_types, input.size(), props, ext);
 			appender.Append(input, 0, input.size(), input.size());
@@ -1654,7 +1654,7 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::CreateTable(CatalogTransaction t
 	// A schema-only Arrow stream carries the column definitions to the backend. The text-column SQL type
 	// (mssql_ctas_text_type / mssql_default_varchar_length) is read C#-side from the provider settings store
 	// (see docs/settings-architecture.md), not passed here.
-	arrownet::ArrowProducer producer(types, names, context.GetClientProperties());
+	arrownet::ArrowProducer producer(types, names, arrownet::BoundaryClientProperties(context));
 	producer.SetNullability(nullable);
 	producer.Finish();
 	arrownet::CreateTable(handle_, name, base.table, *producer.Stream(), if_not_exists, pk_arg, unique_arg,
@@ -1746,7 +1746,7 @@ void ArrowNetSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info)
 		// Carry the new column's type as a single-field zero-row Arrow stream.
 		vector<LogicalType> types {ac.new_column.Type()};
 		vector<string> names {ac.new_column.Name()};
-		arrownet::ArrowProducer producer(types, names, context.GetClientProperties());
+		arrownet::ArrowProducer producer(types, names, arrownet::BoundaryClientProperties(context));
 		producer.Finish();
 		arrownet::AlterTable(handle_, name, table, ARROWNET_ALTER_ADD_COLUMN, ac.new_column.Name(), "",
 		                     producer.Stream(), flags);
@@ -1764,7 +1764,7 @@ void ArrowNetSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info)
 		auto &ct = table_info.Cast<ChangeColumnTypeInfo>();
 		vector<LogicalType> types {ct.target_type};
 		vector<string> names {ct.column_name};
-		arrownet::ArrowProducer producer(types, names, context.GetClientProperties());
+		arrownet::ArrowProducer producer(types, names, arrownet::BoundaryClientProperties(context));
 		producer.Finish();
 		arrownet::AlterTable(handle_, name, table, ARROWNET_ALTER_COLUMN_TYPE, ct.column_name, "", producer.Stream(),
 		                     0);
