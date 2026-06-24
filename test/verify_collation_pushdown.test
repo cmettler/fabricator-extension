@@ -1,9 +1,10 @@
 # name: test/verify_collation_pushdown.test
-# description: string-keyed ORDER BY+LIMIT pushes as TOP+ORDER BY under a BINARY database collation (warehouse-support §4/§6.6)
+# description: under Fabric's BIN2_UTF8 collation, text maps to VARCHAR (UTF-8) and string ORDER BY+LIMIT pushes (warehouse-support §3/§4/§6.6)
 # group: [mssql_net]
 #
-# Fixture (a binary-collation database — byte-order string sort, matching DuckDB):
-#   CREATE DATABASE BinCollTest COLLATE Latin1_General_100_BIN2;
+# Fixture (Fabric Warehouse's actual default collation — binary + UTF-8: byte-order string sort matching
+# DuckDB, and VARCHAR holds full Unicode):
+#   CREATE DATABASE BinCollTest COLLATE Latin1_General_100_BIN2_UTF8;
 #   CREATE TABLE dbo.names (id INT NOT NULL PRIMARY KEY, name VARCHAR(50) NOT NULL);
 #   INSERT INTO dbo.names VALUES (1,'banana'),(2,'Apple'),(3,'cherry'),(4,'apple'),(5,'Banana');
 # Point MSSQL_BINCOLL_DSN at it (Database=BinCollTest). Env-gated, like the Fabric checks.
@@ -15,11 +16,33 @@ require-env MSSQL_BINCOLL_DSN
 statement ok
 ATTACH '${MSSQL_BINCOLL_DSN}' AS bdb (TYPE mssql_net);
 
-# The profile detected a binary collation -> string ORDER BY pushdown is enabled for this catalog.
+# Binary collation -> string ORDER BY pushdown enabled; UTF-8 collation -> text maps to VARCHAR.
 query T
 SELECT value FROM mssql_server_info('bdb') WHERE property = 'is_binary_collation';
 ----
 true
+
+query T
+SELECT value FROM mssql_server_info('bdb') WHERE property = 'is_utf8_collation';
+----
+true
+
+# A UTF-8 collation makes VARCHAR hold full Unicode, so a created text column maps to VARCHAR (not
+# NVARCHAR) — driven by the collation, not the edition (this box engine HAS nvarchar). §4 principled rule.
+statement ok
+DROP TABLE IF EXISTS bdb.dbo.coll_ctas;
+
+statement ok
+CREATE TABLE bdb.dbo.coll_ctas AS SELECT 'x' AS s;
+
+query T
+SELECT DATA_TYPE FROM mssql_net_query('bdb',
+  'SELECT CAST(DATA_TYPE AS VARCHAR(32)) AS DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = ''coll_ctas'' AND COLUMN_NAME = ''s''');
+----
+varchar
+
+statement ok
+DROP TABLE bdb.dbo.coll_ctas;
 
 # A binary collation sorts by byte value (uppercase before lowercase), identical to DuckDB's bytewise
 # string comparison, so the pushed SQL TOP+ORDER BY produces the same top-n DuckDB would.

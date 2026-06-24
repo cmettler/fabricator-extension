@@ -2200,8 +2200,8 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     }
 
     // Arrow type -> SQL Server column type, adapted to the connected engine's ServerProfile:
-    //  - text: NVARCHAR (box/Azure SQL) vs VARCHAR (Fabric Warehouse, which has no NVARCHAR); an explicit
-    //    mssql_ctas_text_type override (textType) still wins.
+    //  - text: VARCHAR under a UTF-8 collation (holds full Unicode, lossless; the only option on Fabric),
+    //    else NVARCHAR where it exists, else VARCHAR; an explicit mssql_ctas_text_type override still wins.
     //  - datetime2/time fractional scale: 7 (box) vs 6 (Fabric).
     //  - timestamptz: DATETIMEOFFSET where it exists, else UTC DATETIME2 (Fabric has no DATETIMEOFFSET).
     // Box SQL Server (HasNVarchar, HasDatetimeOffset, scale 7) reproduces the previous fixed mapping exactly.
@@ -2248,7 +2248,15 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 {
                     return textType!;
                 }
-                string baseType = profile.HasNVarchar ? "NVARCHAR" : "VARCHAR";
+                // VARCHAR-vs-NVARCHAR is driven by the COLLATION, not the edition (the §4 principled rule):
+                // a UTF-8 collation makes VARCHAR hold full Unicode, so DuckDB's UTF-8 strings round-trip
+                // losslessly as VARCHAR (and it's the only option on Fabric). A non-UTF-8 collation makes
+                // VARCHAR a legacy single-byte codepage, so Unicode strings MUST go to NVARCHAR where it
+                // exists; if NVARCHAR is also unavailable, VARCHAR is the only choice. This also correctly
+                // handles a box SQL Server DB that opted into a UTF-8 collation (VARCHAR, not NVARCHAR).
+                string baseType = profile.IsUtf8Collation ? "VARCHAR"
+                                : profile.HasNVarchar ? "NVARCHAR"
+                                : "VARCHAR";
                 // mssql_default_varchar_length bounds every text column (unset => MAX). Read straight from
                 // the provider settings store (see docs/settings-architecture.md) — no per-method ABI param.
                 long? len = ProviderSettingsStore.Instance.GetLong(SqlServerBackend.ProviderName, "mssql_default_varchar_length");

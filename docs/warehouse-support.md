@@ -202,11 +202,15 @@ support, and lossless round-trip for `ALTER`/CTAS — and would carry over to th
 
 ### Why it matters to us
 
-- **`VARCHAR` vs `NVARCHAR` (principled driver).** A `_UTF8` collation means `VARCHAR` stores UTF-8 →
-  it holds full Unicode → DuckDB `VARCHAR` → SQL `VARCHAR` is lossless (and on Fabric it's the only
-  option). A non-UTF-8 collation makes `VARCHAR` a legacy single-byte codepage → DuckDB's UTF-8
-  strings **must** go to `NVARCHAR`. So the rule is `IsUtf8Collation ? VARCHAR(n) : NVARCHAR(n)` —
-  which also correctly handles a *box* 2019+ database that opted into a UTF-8 collation.
+- **`VARCHAR` vs `NVARCHAR` (principled driver) — DONE.** A `_UTF8` collation means `VARCHAR` stores
+  UTF-8 → it holds full Unicode → DuckDB `VARCHAR` → SQL `VARCHAR` is lossless (and on Fabric it's the
+  only option). A non-UTF-8 collation makes `VARCHAR` a legacy single-byte codepage → DuckDB's UTF-8
+  strings **must** go to `NVARCHAR`. `MapArrowToSqlType` now keys off the **collation**, not the edition:
+  `IsUtf8Collation ? VARCHAR : (HasNVarchar ? NVARCHAR : VARCHAR)` — so a *box* SQL Server DB that opted
+  into a UTF-8 collation correctly gets `VARCHAR` (previously it wrongly got `NVARCHAR` because the choice
+  was edition-driven via `HasNVarchar`). Fabric (edition 11, always UTF-8) and box non-UTF-8 DBs are
+  unchanged. Verified: `test/verify_collation_pushdown.test` (a `BIN2_UTF8` box DB → a created text column
+  is `varchar`).
 - **Pushdown case-sensitivity.** A case-*insensitive* server collation makes a pushed equality/`LIKE`
   filter match a *superset* of what DuckDB would — **safe**, because our pushdown never erases (DuckDB
   re-applies every predicate). A `BIN2` collation matches DuckDB's case-sensitive bytewise semantics.
