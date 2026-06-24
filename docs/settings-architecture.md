@@ -148,9 +148,13 @@ session-local is ever needed, key the `SettingsStore` by a session token pushed 
 2. **Cut over the readers**: `SqlServerCatalog` reads `mssql_ctas_text_type` / `mssql_isolation_level` from
    `Settings`; remove the `text_type` / `isolation` ABI params. Gate: full `verify_*` suite green +
    `verify_inout_isolation` / `verify_ctas_text_type` unchanged.
-3. **Unblock `mssql_default_varchar_length`** (the original motivator): declare it, read it in
-   `MapArrowToSqlType` from `Settings` (applies to **all** varchars, CTAS/COPY included — no
-   `begin_bulk`/`create_table` signature changes). See [warehouse-support.md](warehouse-support.md) §3.2.
+3. **Unblock `mssql_default_varchar_length`** (the original motivator) — **DONE**: declared in C#, read in
+   `MapArrowToSqlType` from `ProviderSettingsStore` (applies to **all** created text columns incl. CTAS/COPY,
+   no `begin_bulk`/`create_table` signature changes; `mssql_ctas_text_type` whole-type override still wins).
+   `test/verify_default_varchar_length.test`. See [warehouse-support.md](warehouse-support.md) §3.2.
+
+**Status:** steps 1–3 (mechanism) + step 5 (`mssql_default_varchar_length`) DONE at ABI v33. Step 4 (cut the
+`ctas_text_type`/`isolation` readers over to `ProviderSettingsStore` and drop those ABI params) remains.
 4. Each slice rebuilds C++ + republishes managed (the ABI changes are lockstep — exact-match version check).
 
 ## 8. Open decisions

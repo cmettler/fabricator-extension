@@ -168,8 +168,8 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   by `MaxDateTime2Scale`, tz→`datetimeoffset`|UTC-`datetime2` by `HasDatetimeOffset`; box-preserving; CTAS to
   Fabric verified (`varchar(MAX)`+`datetime2(6)`, µs round-trip; **Fabric accepts `varchar(MAX)`**). Read +
   write paths (incl. `SqlBulkCopy`) both confirmed working on Fabric. **Remaining**: connection mode (`mars`
-  tri-state + pooled reads + snapshot), `mssql_default_varchar_length` (string keys only — not needed for
-  CTAS), JSON gate, the tz-value-reader branch (3b). A `ServerProfile`
+  tri-state + pooled reads + snapshot), JSON gate, the tz-value-reader branch (3b).
+  (`mssql_default_varchar_length` — done via the settings refactor; applies to all created text columns.) A `ServerProfile`
   (EngineEdition + product version + DB collation) detected at OpenCatalog drives connection behavior
   (no MARS → pooled reads + snapshot, see [docs/transactions.md](docs/transactions.md)) AND type mapping
   (no `NVARCHAR` → `VARCHAR`; no `DATETIMEOFFSET` → UTC `datetime2(6)`; `datetime2` scale ≤ 6; native
@@ -186,9 +186,12 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   via `set_setting` from a **per-slot trampoline** set-callback (`SetTrampoline<I>` — DuckDB's set-callback
   carries no setting name + fires before the store, so one generic callback can't work). The provider-agnostic
   core no longer names a setting; `RegisterCompatSettings` + the hardcoded `mssql_*` list are gone. Min-validation
-  preserved (now names the setting). **Remaining**: step 4 cutover (`SqlServerCatalog` reads
-  `ProviderSettingsStore` instead of the `text_type`/`isolation` ABI params → drop those params) + step 5
-  `mssql_default_varchar_length`. Replaces the old "hardcode `mssql_*` in C++ / read in C++ / pass each value
+  preserved (now names the setting). **`mssql_default_varchar_length` DONE** (the original motivator): declared
+  in C#, read from `ProviderSettingsStore` inside `MapArrowToSqlType` (no ABI param), bounds **all** created
+  text columns incl. CTAS/COPY (`NVARCHAR(n)`/`VARCHAR(n)` vs `(MAX)`); `mssql_ctas_text_type` whole-type
+  override still wins (`test/verify_default_varchar_length.test`, 19). **Remaining**: step 4 cutover
+  (`SqlServerCatalog` reads `ProviderSettingsStore` for `ctas_text_type`/`isolation` too → drop those ABI
+  params). Replaces the old "hardcode `mssql_*` in C++ / read in C++ / pass each value
   through an ABI method param" model (O(settings × providers) churn): **net ABI reduction** — two generic
   entries replace the per-setting params. Trade-offs: boot the CLR at extension
   load (needed for `SET` before first ATTACH; aligns with Phase-3 load-time functions) + catalog/provider

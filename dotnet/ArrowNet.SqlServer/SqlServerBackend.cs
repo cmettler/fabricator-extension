@@ -16,7 +16,8 @@ namespace ArrowNet.SqlServer;
 /// </summary>
 public sealed class SqlServerBackend : IBackend
 {
-    public string Name => "sqlserver";
+    public const string ProviderName = "sqlserver";
+    public string Name => ProviderName;
     public IEnumerable<string> Aliases => new[] { "mssql" };
 
     // Provider-declared settings (registered by the host as DuckDB extension options at load; values pushed
@@ -44,6 +45,8 @@ public sealed class SqlServerBackend : IBackend
                 Long("mssql_insert_batch_size", "mssql_net: max rows per INSERT statement", 2000L, 1),
                 Long("mssql_insert_max_rows_per_statement", "mssql_net: hard cap on rows per statement", 2000L, 1),
                 Long("mssql_insert_max_sql_bytes", "mssql_net: max SQL statement size in bytes", 8388608L, 1),
+                Long("mssql_default_varchar_length",
+                     "mssql_net: default VARCHAR/NVARCHAR length for created text columns (unset => MAX)", null, 1),
                 Bool("mssql_insert_use_returning_output", "mssql_net: use OUTPUT INSERTED for RETURNING", true),
                 Bool("mssql_exec_invalidate_cache",
                      "mssql_net: invalidate the catalog cache after DDL run via mssql_net_exec()", false),
@@ -2188,9 +2191,13 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             default:
                 if (!string.IsNullOrWhiteSpace(textType))
                 {
-                    return textType!;
+                    return textType!; // mssql_ctas_text_type: explicit whole-type override wins
                 }
-                return profile.HasNVarchar ? "NVARCHAR(MAX)" : "VARCHAR(MAX)";
+                string baseType = profile.HasNVarchar ? "NVARCHAR" : "VARCHAR";
+                // mssql_default_varchar_length bounds every text column (unset => MAX). Read straight from
+                // the provider settings store (see docs/settings-architecture.md) — no per-method ABI param.
+                long? len = ProviderSettingsStore.Instance.GetLong(SqlServerBackend.ProviderName, "mssql_default_varchar_length");
+                return len is long n && n > 0 ? $"{baseType}({n})" : $"{baseType}(MAX)";
         }
     }
 

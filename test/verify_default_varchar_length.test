@@ -1,0 +1,70 @@
+# name: test/verify_default_varchar_length.test
+# description: mssql_default_varchar_length bounds all created text columns (read from the provider settings store)
+# group: [mssql_net]
+
+require mssql_net
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql_net);
+
+statement ok
+DROP TABLE IF EXISTS db.dbo.dvl_test;
+
+# Unset => NVARCHAR(MAX) (box SQL Server has NVARCHAR; CHARACTER_MAXIMUM_LENGTH -1 = MAX).
+statement ok
+CREATE TABLE db.dbo.dvl_test (id INTEGER, label VARCHAR);
+
+query TI
+SELECT * FROM mssql_net_query('db',
+  'SELECT CAST(DATA_TYPE AS VARCHAR(32)), CHARACTER_MAXIMUM_LENGTH FROM INFORMATION_SCHEMA.COLUMNS
+   WHERE TABLE_NAME = ''dvl_test'' AND COLUMN_NAME = ''label''');
+----
+nvarchar	-1
+
+statement ok
+DROP TABLE db.dbo.dvl_test;
+
+# Set the length => every text column is bounded (NVARCHAR(200) on box SQL Server).
+statement ok
+SET mssql_default_varchar_length = 200;
+
+statement ok
+CREATE TABLE db.dbo.dvl_test (id INTEGER, label VARCHAR);
+
+query TI
+SELECT * FROM mssql_net_query('db',
+  'SELECT CAST(DATA_TYPE AS VARCHAR(32)), CHARACTER_MAXIMUM_LENGTH FROM INFORMATION_SCHEMA.COLUMNS
+   WHERE TABLE_NAME = ''dvl_test'' AND COLUMN_NAME = ''label''');
+----
+nvarchar	200
+
+statement ok
+DROP TABLE db.dbo.dvl_test;
+
+# mssql_ctas_text_type (explicit whole-type override) still wins over the length.
+statement ok
+SET mssql_ctas_text_type = 'VARCHAR(50)';
+
+statement ok
+CREATE TABLE db.dbo.dvl_test (id INTEGER, label VARCHAR);
+
+query TI
+SELECT * FROM mssql_net_query('db',
+  'SELECT CAST(DATA_TYPE AS VARCHAR(32)), CHARACTER_MAXIMUM_LENGTH FROM INFORMATION_SCHEMA.COLUMNS
+   WHERE TABLE_NAME = ''dvl_test'' AND COLUMN_NAME = ''label''');
+----
+varchar	50
+
+statement ok
+DROP TABLE db.dbo.dvl_test;
+
+statement ok
+RESET mssql_ctas_text_type;
+
+statement ok
+RESET mssql_default_varchar_length;
+
+statement ok
+DETACH db;
