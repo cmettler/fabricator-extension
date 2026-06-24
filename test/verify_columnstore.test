@@ -1,0 +1,66 @@
+# name: test/verify_columnstore.test
+# description: mssql_default_table_type='clustered columnstore' creates a CCI table (box); PK/UNIQUE become NONCLUSTERED (warehouse-support §3.6)
+# group: [mssql_net]
+#
+# Box SQL Server only (Fabric/Synapse tables are columnstore implicitly and reject an inline INDEX -> the
+# setting is a no-op there). End with SET ...='' (NOT RESET): RESET does not clear the provider settings store.
+
+require mssql_net
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+SET mssql_default_table_type='clustered columnstore';
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql_net);
+
+statement ok
+DROP TABLE IF EXISTS db.dbo.cci_t;
+
+statement ok
+CREATE TABLE db.dbo.cci_t (id INTEGER PRIMARY KEY, name VARCHAR);
+
+statement ok
+INSERT INTO db.dbo.cci_t VALUES (1,'a'),(2,'b');
+
+# The table's clustered index is the columnstore, so the PK is NONCLUSTERED (type order: NONCLUSTERED=2 < CCI=5).
+query TI
+SELECT CAST(type_desc AS VARCHAR(24)), CAST(is_primary_key AS INTEGER) FROM mssql_net_query('db',
+  'SELECT type_desc, is_primary_key FROM sys.indexes WHERE object_id = OBJECT_ID(''dbo.cci_t'') AND type > 0 ORDER BY type');
+----
+NONCLUSTERED	1
+CLUSTERED COLUMNSTORE	0
+
+# Data round-trips; UPDATE works (the NONCLUSTERED PK still seeds rowid discovery).
+statement ok
+UPDATE db.dbo.cci_t SET name='B' WHERE id = 2;
+
+query IT
+SELECT id, name FROM db.dbo.cci_t ORDER BY id;
+----
+1	a
+2	B
+
+statement ok
+DROP TABLE db.dbo.cci_t;
+
+# CTAS honors the setting too (a created analytics table is columnstore).
+statement ok
+CREATE TABLE db.dbo.cci_ctas AS SELECT 1 AS a, 'x' AS b;
+
+query T
+SELECT CAST(type_desc AS VARCHAR(24)) FROM mssql_net_query('db',
+  'SELECT type_desc FROM sys.indexes WHERE object_id = OBJECT_ID(''dbo.cci_ctas'') AND type > 0');
+----
+CLUSTERED COLUMNSTORE
+
+statement ok
+DROP TABLE db.dbo.cci_ctas;
+
+statement ok
+DETACH db;
+
+# Restore the default via SET (RESET would not clear the process-global store -> would leak CCI to later files).
+statement ok
+SET mssql_default_table_type='';

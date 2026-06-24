@@ -290,6 +290,19 @@ as any unenforced constraint. (Same-session `CREATE TABLE` then DML now works on
 see the metadata read-your-writes note in [transactions.md](transactions.md) §5.1; the catalog re-fetches the
 new table's columns on the pinned write connection so it's visible despite MARS-off pooled scans.)
 
+### 3.6 Clustered columnstore tables (`mssql_default_table_type`)
+
+DuckDB's `CREATE TABLE` can't express SQL Server's clustered-columnstore storage, so the provider setting
+`mssql_default_table_type` selects it: `''` (rowstore, default) | `clustered columnstore` (also `columnstore`
+/ `cci`). When set, on **box SQL Server / Azure SQL** `CreateTable` and CTAS/COPY emit an inline
+`INDEX [cc_<schema>_<table>] CLUSTERED COLUMNSTORE` so the table is a clustered columnstore — and because the
+columnstore **is** the table's clustered index, the PK/UNIQUE are emitted `NONCLUSTERED` (a clustered PK would
+conflict). The index name is schema-qualified for database-wide uniqueness. The `NONCLUSTERED` PK still seeds
+rowid discovery → UPDATE/DELETE work. On **Fabric / Synapse** it is a **no-op**: their tables are columnstore
+implicitly and reject an inline `INDEX`, and their PK/UNIQUE are already `NONCLUSTERED NOT ENFORCED` via ALTER
+(§3.5). Restore the default with `SET mssql_default_table_type=''` (RESET does not clear the provider settings
+store). Verified: `test/verify_columnstore.test`.
+
 ## 4. Collation — the cross-stack problem
 
 **Collation is chosen at warehouse/lakehouse creation time** (Fabric defaults to

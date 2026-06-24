@@ -43,6 +43,9 @@ public sealed class SqlServerBackend : IBackend
                 Str("mssql_ctas_text_type"),
                 Str("mssql_isolation_level", "mssql_net: SQL transaction isolation level for table-in-out sessions"),
                 Str("mssql_mars", "mssql_net: MARS mode — auto (default, per engine) | true | false"),
+                Str("mssql_default_table_type",
+                    "mssql_net: created-table storage — '' (rowstore, default) | 'clustered columnstore' " +
+                    "(CCI, box/Azure SQL; Fabric/Synapse tables are columnstore already so it is a no-op there)"),
                 Long("mssql_insert_batch_size", "mssql_net: max rows per INSERT statement", 2000L, 1),
                 Long("mssql_insert_max_rows_per_statement", "mssql_net: hard cap on rows per statement", 2000L, 1),
                 Long("mssql_insert_max_sql_bytes", "mssql_net: max SQL statement size in bytes", 8388608L, 1),
@@ -2203,17 +2206,61 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 sb.Append(" DEFAULT ").Append(RenderDefault(field.DataType, defaultValue));
             }
         }
+        // Clustered columnstore (mssql_default_table_type='clustered columnstore'). Box / Azure SQL only:
+        // emit an inline INDEX … CLUSTERED COLUMNSTORE so the table is columnstore. Fabric/Synapse tables
+        // are columnstore implicitly and reject an inline INDEX, so it is a no-op there (IsWarehouse gate).
+        // When the clustered index IS the columnstore, PK/UNIQUE must be NONCLUSTERED.
+        bool cci = !profile.IsWarehouse &&
+                   IsClusteredColumnstore(ProviderSettingsStore.Instance.GetString(SqlServerBackend.ProviderName,
+                                                                                   "mssql_default_table_type"));
+        if (cci)
+        {
+            sb.Append(", INDEX ").Append(Quote(ColumnstoreIndexName(qualified))).Append(" CLUSTERED COLUMNSTORE");
+        }
+        string keyKind = cci ? " NONCLUSTERED" : "";
         var pk = ParseIndexGroup(primaryKey);
         if (pk.Count > 0)
         {
-            sb.Append(", PRIMARY KEY (").Append(ColumnList(schema, pk)).Append(')');
+            sb.Append(", PRIMARY KEY").Append(keyKind).Append(" (").Append(ColumnList(schema, pk)).Append(')');
         }
         foreach (var group in ParseIndexGroups(uniques))
         {
-            sb.Append(", UNIQUE (").Append(ColumnList(schema, group)).Append(')');
+            sb.Append(", UNIQUE").Append(keyKind).Append(" (").Append(ColumnList(schema, group)).Append(')');
         }
         sb.Append(')');
         return sb.ToString();
+    }
+
+    // mssql_default_table_type values that select a clustered columnstore table (case/underscore tolerant).
+    private static bool IsClusteredColumnstore(string? tableType)
+    {
+        var t = (tableType ?? string.Empty).Trim().ToLowerInvariant().Replace("_", " ");
+        return t is "clustered columnstore" or "columnstore" or "cci";
+    }
+
+    // The table identifier out of a quoted "[schema].[table]" (last bracketed segment).
+    private static string TableNameFromQualified(string qualified)
+    {
+        int close = qualified.LastIndexOf(']');
+        int open = qualified.LastIndexOf('[', close < 0 ? qualified.Length - 1 : close);
+        return (open >= 0 && close > open) ? qualified.Substring(open + 1, close - open - 1) : qualified;
+    }
+
+    // Clustered-columnstore index name, schema-qualified for database-wide uniqueness: cc_<schema>_<table>
+    // (from the quoted "[schema].[table]"). Falls back to cc_<table> if the schema can't be parsed.
+    private static string ColumnstoreIndexName(string qualified)
+    {
+        int e1 = qualified.IndexOf(']');
+        int s1 = qualified.IndexOf('[');
+        int s2 = e1 >= 0 ? qualified.IndexOf('[', e1 + 1) : -1;
+        int e2 = qualified.LastIndexOf(']');
+        if (s1 >= 0 && e1 > s1 && s2 > e1 && e2 > s2)
+        {
+            string schema = qualified.Substring(s1 + 1, e1 - s1 - 1);
+            string table = qualified.Substring(s2 + 1, e2 - s2 - 1);
+            return $"cc_{schema}_{table}";
+        }
+        return "cc_" + TableNameFromQualified(qualified);
     }
 
     private static string ColumnList(Schema schema, List<int> indices) =>

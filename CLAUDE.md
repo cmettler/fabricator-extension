@@ -285,6 +285,10 @@ Implemented and verified:
   separate `ALTER TABLE ADD CONSTRAINT`** (inline-in-CREATE is rejected, error 24584); they're hints (not
   enforced) but appear in `sys.indexes`, so they seed rowid discovery → **UPDATE/DELETE work on Fabric**
   (validated 2026-06-24). Box keeps the inline form. See [docs/warehouse-support.md](docs/warehouse-support.md) §3.5.
+  **`mssql_default_table_type`** (`''` rowstore | `clustered columnstore`/`cci`): on box/Azure SQL, CREATE/CTAS
+  emit an inline `INDEX [cc_<schema>_<table>] CLUSTERED COLUMNSTORE` (PK/UNIQUE forced `NONCLUSTERED` — the
+  columnstore is the clustered index); no-op on Fabric/Synapse (columnstore implicit). §3.6,
+  `test/verify_columnstore.test`.
 - **Transactions**: BEGIN/COMMIT/ROLLBACK with a pinned connection (lazy on first write); reads inside
   the txn use it too (read-your-writes); MARS forced so a scan reader + DML coexist. **Full design:
   [docs/transactions.md](docs/transactions.md)** (autocommit = implicit per-statement txn; the three
