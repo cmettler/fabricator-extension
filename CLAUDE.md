@@ -504,9 +504,12 @@ v29 table-function session, and the v30 removal of the dead `execute_table`/`exe
   `execute_proc` (not `execute_table`), `push_projection=false`, and **no** `pushdown_complex_filter` — a
   proc's `EXEC` isn't inline-wrappable, so DuckDB projects + filters locally.
 - **Output schema** (`SqlServerCatalog.GetFunctionOutputSchema`): TVFs use `INFORMATION_SCHEMA.ROUTINE_COLUMNS`;
-  a proc ⇒ OUTPUT params (`ProcOutputParams`) + `return_value` if any, else
-  `sys.dm_exec_describe_first_result_set_for_object(OBJECT_ID(@obj),0)` (`system_type_name` used directly).
-  Auto-routes by object kind. Empty ⇒ "no describable result set".
+  a proc ⇒ OUTPUT params (`ProcOutputParams`) + `return_value` if any, else its first result set via
+  **`sys.sp_describe_first_result_set`** (over `EXEC [s].[p] @a=@a,…` with the input params declared NULL;
+  `system_type_name` used directly). **Uses the sp, NOT the `dm_exec_describe_first_result_set_for_object`
+  DMV** — Fabric Warehouse doesn't support that DMV (error 15871) but supports the sp; the sp works on box
+  too, so one path serves both (Fabric-validated 2026-06-24). Auto-routes by object kind. Empty ⇒ "no
+  describable result set".
 - **Execution** (`ExecuteProc`): no-output proc ⇒ `EXEC [s].[p] @name=@p0,…` (streams the first result set);
   output proc ⇒ the `DECLARE/EXEC OUTPUT/SELECT` batch above. Input param types come from
   `INFORMATION_SCHEMA.PARAMETERS` (reused `get_function_param_schema`, whose field names are the de-@'d names).

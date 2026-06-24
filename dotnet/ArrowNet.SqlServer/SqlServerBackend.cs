@@ -1424,24 +1424,45 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         return result;
     }
 
-    // A stored procedure's first result-set columns via sp_describe_first_result_set
-    // (late-binding). system_type_name is the full SQL type, used directly. Empty =>
-    // no determinable result set (e.g. a proc that only does work / has OUTPUT params).
+    // A stored procedure's first result-set columns via sp_describe_first_result_set (late-binding).
+    // We use the sp (over `EXEC [s].[p] @a=@a, …` with the proc's input params declared NULL — sp_describe
+    // analyzes statically, no execution) rather than the dm_exec_describe_first_result_set_for_object DMV
+    // because Fabric Warehouse does NOT support that DMV (error 15871) but does support the sp; the sp works
+    // on box SQL Server too, so one path serves both. system_type_name is the full SQL type, used directly.
+    // Empty => no determinable result set (e.g. a proc that only does work). Only called for procs WITHOUT
+    // OUTPUT params (those take the ProcOutputParams path), so an IN-params-only EXEC is correct.
     internal List<(string name, string sqlType)> ProcResultColumns(string schemaName, string functionName)
     {
+        var inputs = FunctionParameters(schemaName, functionName, wantReturn: false);
+        string exec = $"EXEC {Quote(schemaName)}.{Quote(functionName)}";
+        if (inputs.Count > 0)
+        {
+            exec += " " + string.Join(", ", inputs.Select(p => $"@{p.name}=@{p.name}"));
+        }
+        string? paramDecls = inputs.Count > 0
+            ? string.Join(", ", inputs.Select(p => $"@{p.name} {p.sqlType}"))
+            : null;
+
         using var connection = OpenConnection();
         connection.Open();
         using var cmd = connection.CreateCommand();
         cmd.CommandText =
-            "SELECT name, system_type_name FROM sys.dm_exec_describe_first_result_set_for_object(OBJECT_ID(@obj), 0) " +
-            "WHERE is_hidden = 0 ORDER BY column_ordinal";
-        cmd.Parameters.AddWithValue("@obj", $"{schemaName}.{functionName}");
+            "EXEC sys.sp_describe_first_result_set @tsql = @__tsql, @params = @__params, @browse_information_mode = 0";
+        cmd.Parameters.AddWithValue("@__tsql", exec);
+        cmd.Parameters.AddWithValue("@__params", (object?)paramDecls ?? DBNull.Value);
         var result = new List<(string, string)>();
         using var reader = cmd.ExecuteReader();
+        int iHidden = reader.GetOrdinal("is_hidden");
+        int iName = reader.GetOrdinal("name");
+        int iType = reader.GetOrdinal("system_type_name");
         while (reader.Read())
         {
-            var name = reader.IsDBNull(0) ? $"col{result.Count}" : reader.GetString(0);
-            var sqlType = reader.IsDBNull(1) ? "sql_variant" : reader.GetString(1);
+            if (!reader.IsDBNull(iHidden) && Convert.ToBoolean(reader.GetValue(iHidden)))
+            {
+                continue; // skip hidden (browse-key) columns
+            }
+            var name = reader.IsDBNull(iName) ? $"col{result.Count}" : reader.GetString(iName);
+            var sqlType = reader.IsDBNull(iType) ? "sql_variant" : reader.GetString(iType);
             result.Add((name, sqlType));
         }
         return result;

@@ -23,6 +23,14 @@
 > `datetime2(6)`→`TIMESTAMP` (µs, correctly NOT ns since Fabric caps scale at 6), tz instant preserved
 > (`12:00-04`→`16:00`Z, read naive); and string `ORDER BY`+`LIMIT` correct under the binary collation. No
 > regressions.
+>
+> **Function stack on Fabric (also 2026-06-24):** discovered **scalar UDFs**, inline **TVFs** (projection +
+> filter pushdown), **stored procs** as table functions, **custom C#** scalar/table functions, and the
+> **in-out exchange `_each`** (per-row `CROSS APPLY`, MARS-free / gate-serialized) all work. **Fix applied:**
+> proc result-set detection used `sys.dm_exec_describe_first_result_set_for_object`, which Fabric does not
+> support (error 15871); switched `ProcResultColumns` to `sys.sp_describe_first_result_set` (over `EXEC [s].[p]
+> @a=@a,…` with the input params declared) — supported on Fabric AND box, one path for both. (Fabric does
+> support scalar UDFs / TVFs / procs / `datetime2(6)`; only `datetime2(7)` and native `json` are absent.)
 
 ## TL;DR
 
