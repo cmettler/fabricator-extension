@@ -286,9 +286,9 @@ in `sys.indexes`** (`is_primary_key` / `is_unique`), which is exactly what our r
 KEY` via the extension produced a `NONCLUSTERED NOT ENFORCED` PK, and rowid-based UPDATE/DELETE worked.
 **Caveat:** because the key is NOT ENFORCED, Fabric permits duplicate "key" values; a rowid-based UPDATE/DELETE
 then trusts the declared key and could touch more than one row — the user's data-integrity responsibility, same
-as any unenforced constraint. (A pre-existing, unrelated quirk: a plain `CREATE TABLE` followed by DML in the
-**same** session needs a `mssql_refresh_cache` / re-ATTACH for the new table to be visible — applies on box
-too; CTAS does not have this.)
+as any unenforced constraint. (Same-session `CREATE TABLE` then DML now works on Fabric without a refresh —
+see the metadata read-your-writes note in [transactions.md](transactions.md) §5.1; the catalog re-fetches the
+new table's columns on the pinned write connection so it's visible despite MARS-off pooled scans.)
 
 ## 4. Collation — the cross-stack problem
 

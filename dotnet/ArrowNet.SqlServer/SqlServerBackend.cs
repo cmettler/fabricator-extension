@@ -487,21 +487,32 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     public IArrowArrayStream ExecuteQuery(string sql) => ExecuteQuery(sql, null);
 
-    public IArrowArrayStream ExecuteQuery(string sql, IReadOnlyList<SqlParameter>? parameters)
+    public IArrowArrayStream ExecuteQuery(string sql, IReadOnlyList<SqlParameter>? parameters) =>
+        ExecuteQuery(sql, parameters, readYourWrites: false);
+
+    // A short metadata read (e.g. FetchTableColumns / FetchRowIdColumns) that must see the transaction's
+    // own uncommitted writes — e.g. CREATE TABLE then immediately re-fetch the new table's columns to build
+    // the catalog entry. Unlike a data SCAN, it holds no long-lived reader, so it is safe on the pinned
+    // connection even without MARS (see ExecuteQuery's readYourWrites note). Routes through the pinned
+    // write connection whenever one exists, regardless of MARS.
+    internal IArrowArrayStream ExecuteMetadataQuery(string sql) => ExecuteQuery(sql, null, readYourWrites: true);
+
+    public IArrowArrayStream ExecuteQuery(string sql, IReadOnlyList<SqlParameter>? parameters, bool readYourWrites)
     {
-        // Inside a transaction that has a pinned connection (a write has happened),
-        // read on that connection so the query sees uncommitted changes
-        // (read-your-writes). Borrowed: the stream must not dispose the connection.
-        // Only when MARS is enabled, though — an open scan reader and the transaction's
-        // DML can only coexist on one connection under MARS. With MARS off (Fabric/Synapse,
-        // or an explicit mssql_mars=false), reads take a fresh pooled connection instead,
-        // giving up read-your-writes within the write transaction (documented warehouse
-        // trade-off — see docs/transactions.md §4/§5).
+        // Inside a transaction that has a pinned connection (a write has happened), read on that connection
+        // so the query sees uncommitted changes (read-your-writes). Borrowed: the stream must not dispose the
+        // connection. For a data SCAN this is gated on MARS — an open scan reader and the transaction's DML
+        // can only coexist on one connection under MARS, so with MARS off (Fabric/Synapse, or mssql_mars=false)
+        // scans take a fresh pooled connection (documented warehouse trade-off — docs/transactions.md §5.1).
+        // A METADATA read (readYourWrites) is exempt from the MARS gate: it fully drains immediately (no held
+        // reader), and on MARS-off the pinned connection never carries a concurrent scan reader, so reusing it
+        // is safe — and REQUIRED so a just-created table's metadata is visible (else the self-healing cache
+        // would evict the table the CREATE just made; see ArrowNetSchemaEntry::CreateTable).
         SqlConnection? pinned = null;
         SqlTransaction? pinnedTransaction = null;
         lock (_txnLock)
         {
-            if (_inTransaction && _marsEnabled)
+            if (_inTransaction && _txnConnection is not null && (_marsEnabled || readYourWrites))
             {
                 pinned = _txnConnection;
                 pinnedTransaction = _txn;
@@ -857,18 +868,21 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         return stream.Schema;
     }
 
+    // Metadata reads use ExecuteMetadataQuery (read-your-writes: routed through the pinned write connection
+    // when one exists, regardless of MARS) so a table/columns just created in this transaction are visible —
+    // otherwise the self-healing cache would evict a freshly CREATEd table on a non-MARS engine (Fabric).
     public IArrowArrayStream GetMetadata(int kind, string? schema, string? table) => kind switch
     {
-        MetadataKind.Schemas => ExecuteQuery(SchemasSql),
-        MetadataKind.Tables => ExecuteQuery(TablesSql),
+        MetadataKind.Schemas => ExecuteMetadataQuery(SchemasSql),
+        MetadataKind.Tables => ExecuteMetadataQuery(TablesSql),
         // Zero-row result whose Arrow schema describes the table's columns; the
         // C++ host reads that schema to learn the DuckDB column types.
-        MetadataKind.Columns => ExecuteQuery($"SELECT * FROM {Quote(Require(schema, table).schema)}." +
+        MetadataKind.Columns => ExecuteMetadataQuery($"SELECT * FROM {Quote(Require(schema, table).schema)}." +
                                              $"{Quote(Require(schema, table).table)} WHERE 1 = 0"),
-        MetadataKind.RowId => ExecuteQuery(RowIdSql(Require(schema, table).schema, Require(schema, table).table)),
-        MetadataKind.RowCount => ExecuteQuery(RowCountSql(Require(schema, table).schema, Require(schema, table).table)),
-        MetadataKind.ColumnNdv => ExecuteQuery(ColumnNdvSql(Require(schema, table).schema, Require(schema, table).table)),
-        MetadataKind.Functions => ExecuteQuery(FunctionsMetadataSql()),
+        MetadataKind.RowId => ExecuteMetadataQuery(RowIdSql(Require(schema, table).schema, Require(schema, table).table)),
+        MetadataKind.RowCount => ExecuteMetadataQuery(RowCountSql(Require(schema, table).schema, Require(schema, table).table)),
+        MetadataKind.ColumnNdv => ExecuteMetadataQuery(ColumnNdvSql(Require(schema, table).schema, Require(schema, table).table)),
+        MetadataKind.Functions => ExecuteMetadataQuery(FunctionsMetadataSql()),
         // The detected capability profile as (property, value) rows — the mssql_server_info() diagnostic.
         // Built from the in-memory profile (not a re-query), so it surfaces the derived flags.
         MetadataKind.ServerInfo => ServerInfoStream(),

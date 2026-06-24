@@ -176,15 +176,25 @@ detected profile). A per-catalog `mars` ATTACH option is deferred to the ATTACH-
 `RESET mssql_mars` does **not** clear the value — DuckDB does not fire an extension option's set-callback on
 RESET — so restore the default with `SET mssql_mars='auto'`, which does.)*
 
-**With MARS off, reads never reuse the pinned write connection.** An open scan reader and the transaction's
-DML can only coexist on one connection under MARS, so when MARS is off `ExecuteQuery` routes every read
-through a **fresh pooled connection**, even inside a write transaction. The trade-off: **no read-your-writes
-within the write transaction** — a read sees the last committed state, not the transaction's uncommitted
-writes. This is the documented warehouse behavior ("pin only for writes, pooled connections for reads"). On a
-**snapshot**-isolation engine (Fabric) the pooled read sees a consistent committed snapshot and never blocks;
-on a non-snapshot box engine with `mssql_mars=false`, a pooled read of a row the same transaction is **writing**
-would block on the writer's locks — so don't read rows the open transaction is modifying when you force MARS
-off on box.
+**With MARS off, data SCANS never reuse the pinned write connection.** An open scan reader and the
+transaction's DML can only coexist on one connection under MARS, so when MARS is off `ExecuteQuery` routes
+every **scan** through a **fresh pooled connection**, even inside a write transaction. The trade-off: **no
+read-your-writes for scans within the write transaction** — a scan sees the last committed state, not the
+transaction's uncommitted writes. This is the documented warehouse behavior ("pin only for writes, pooled
+connections for reads"). On a **snapshot**-isolation engine (Fabric) the pooled read sees a consistent
+committed snapshot and never blocks; on a non-snapshot box engine with `mssql_mars=false`, a pooled read of a
+row the same transaction is **writing** would block on the writer's locks — so don't read rows the open
+transaction is modifying when you force MARS off on box.
+
+**Metadata reads are the exception — they keep read-your-writes even with MARS off.** A short metadata read
+(`ExecuteMetadataQuery`: `FetchTableColumns` / `FetchRowIdColumns` / the catalog discovery queries) reuses the
+pinned write connection whenever one exists, **regardless of MARS**. It holds no long-lived reader (it drains
+immediately), and on a MARS-off engine the pinned connection never carries a concurrent scan reader, so reusing
+it is safe. This is **required**: `CREATE TABLE` runs on the pinned connection inside the lazy write
+transaction, then the catalog immediately re-fetches the new table's columns to build its entry — on Fabric a
+pooled read couldn't see the still-uncommitted `CREATE`, so the self-healing cache would evict the table the
+`CREATE` just made (symptom: "table … does not exist" right after a same-session `CREATE`). The metadata read
+on the pinned connection sees the uncommitted `CREATE` and the entry materializes correctly.
 
 **Warehouse write transactions run at SNAPSHOT.** Fabric Warehouse / Lakehouse SQL endpoint support only
 snapshot isolation, so `BeginWrite` opens the pinned `SqlTransaction` at `IsolationLevel.Snapshot` for those

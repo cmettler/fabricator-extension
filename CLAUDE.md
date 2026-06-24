@@ -169,8 +169,12 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   Fabric verified (`varchar(MAX)`+`datetime2(6)`, µs round-trip; **Fabric accepts `varchar(MAX)`**). Read +
   write paths (incl. `SqlBulkCopy`) both confirmed working on Fabric. (4) **connection mode** (C#-only, no ABI):
   `mssql_mars` tri-state provider setting (`auto`=`profile.SupportsMars` | `true` | `false`) resolved
-  once at first connection; **MARS-off reads take a fresh pooled connection** (no read-your-writes in a write
-  txn — `ExecuteQuery` gates the pinned-read branch on `_marsEnabled`); **Fabric write transactions run at
+  once at first connection; **MARS-off data SCANS take a fresh pooled connection** (no read-your-writes for
+  scans in a write txn — `ExecuteQuery` gates the pinned-read branch on `_marsEnabled`). **Metadata reads are
+  exempt** (`ExecuteMetadataQuery`, read-your-writes regardless of MARS): they're short (no held reader) and
+  the pinned conn carries no concurrent scan on MARS-off, so a just-CREATEd table's column/rowid re-fetch sees
+  the uncommitted `CREATE` on the pinned connection — without this the self-healing cache evicts the new table
+  on Fabric (same-session `CREATE`+DML failed). **Fabric write transactions run at
   SNAPSHOT** (`ServerProfile.DefaultWriteIsolation`, edition-11-only — box/Synapse keep the server default).
   `mssql_mars` is **global** (`SET` before ATTACH); a per-catalog `mars` ATTACH option waits for the
   ATTACH-options→C# refactor. **Caveat:** `RESET` of an extension option does NOT fire its set-callback
