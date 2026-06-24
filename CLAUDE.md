@@ -178,6 +178,17 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   (DuckDB/SQL-endpoint = CS binary vs DAX/Vertipaq = CI). New `mssql_default_varchar_length` setting
   (length policy, separate from the varchar/nvarchar choice; existing `mssql_ctas_text_type` is the
   blunt whole-string escape hatch). Open: the naive-`datetime2` reinterpret-as-session-local semantic.
+- **Settings refactor** (provider-declared, C#-accessible settings) — **design:
+  [docs/settings-architecture.md](docs/settings-architecture.md)** (not yet implemented). Replaces the
+  current "hardcode `mssql_*` in C++ / read in C++ / pass each value through an ABI method param" model
+  (which is O(settings × providers) churn and forces the provider-agnostic core to know `mssql_*` names): a
+  provider **declares** its settings in C# (`IBackend.Settings`), C++ **registers** them at load via a generic
+  `list_settings(provider)` ABI, values **push** to C# via a generic `set_setting(provider,name,value)`, and
+  C# reads `catalog.Settings.Get<T>(name)`. **Net ABI reduction** — two generic entries replace the
+  `text_type`/`isolation`/proposed-`text_length` per-setting params. Trade-offs: boot the CLR at extension
+  load (needed for `SET` before first ATTACH; aligns with Phase-3 load-time functions) + catalog/provider
+  scope (not session-local). **Directly unblocks `mssql_default_varchar_length`** (C# reads the length from
+  `Settings`, no `begin_bulk`/`create_table` signature changes). Prerequisite for the 2nd provider.
 
 ## Implementation status (current)
 
