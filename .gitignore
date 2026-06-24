@@ -39,3 +39,6 @@ wheels/
 
 # Local credentials / connection recipes — contain live secrets, never commit.
 /fabric.md
+
+# dbt-duckdb concurrency/integration test harness — profiles.yml holds live connstrs/secrets.
+/dbt_mssql_test/

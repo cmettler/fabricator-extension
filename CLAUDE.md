@@ -855,7 +855,13 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   - `shell` → `build/release/duckdb.exe` (interactive shell; **embeds** the extension).
   - `unittest` → `build/release/test/unittest.exe` (runs the `.test` suites; **embeds** the extension).
   - `mssql_net_loadable_extension` → `build/release/extension/mssql_net/mssql_net.duckdb_extension`
-    (the loadable; only matters when `LOAD`-ing into a duckdb that does NOT embed it — rarely, here).
+    (the loadable; needed to `LOAD` into a duckdb that does NOT embed it — e.g. the **official `duckdb==1.5.4`
+    Python wheel** for the dbt-duckdb concurrency tests). **To load into the official wheel, reconfigure with
+    `-DOVERRIDE_GIT_DESCRIBE=v1.5.4`** so the extension footer declares `duckdb_version=v1.5.4` — the shallow
+    submodule has no git tag, so it otherwise defaults to `v0.0.1` and the official engine rejects it on the
+    version check (NOT bypassed by `allow_unsigned_extensions`). Then `LOAD` with `allow_unsigned_extensions`
+    + set `ARROWNET_MANAGED_DIR` (the bridge isn't next to the python `.pyd`). Verified loads + ATTACH +
+    query against the official wheel. (This also fixes `json`/`icu` autoload, though we embed those.)
   - `cmake --build build/release` (no `--target`) builds all of them.
   - **After changing C++ extension code, rebuild the target whose binary you'll run.** Building only
     `mssql_net_loadable_extension` then running `duckdb.exe`/`unittest.exe` runs the STALE embedded copy
