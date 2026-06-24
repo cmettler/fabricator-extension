@@ -370,6 +370,14 @@ Execute arbitrary T-SQL (DDL/DML/EXEC); returns rows affected (0 for DDL / no-ro
 SELECT mssql_net_exec('mssql', 'UPDATE dbo.people SET salary = salary + 1 WHERE id <= 2');
 ```
 
+Multiple statements separated by `;` (including multiline) run as **one batch** in a single call (return
+value = aggregate rows affected). `GO` is **not** supported — it's a sqlcmd/SSMS client directive, not T-SQL
+(use `;`, or separate calls). For cross-statement atomicity, wrap in `BEGIN…COMMIT` or a DuckDB `BEGIN`.
+
+```sql
+SELECT mssql_net_exec('mssql', 'CREATE TABLE dbo.t (id int); INSERT INTO dbo.t VALUES (1),(2)');
+```
+
 ### `mssql_refresh_cache(catalog)` / `mssql_invalidate_cache(catalog [, schema [, table]])`
 
 Refresh cached catalog metadata after creating/dropping tables out-of-band (e.g. via
