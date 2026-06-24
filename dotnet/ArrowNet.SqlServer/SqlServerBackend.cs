@@ -19,6 +19,38 @@ public sealed class SqlServerBackend : IBackend
     public string Name => "sqlserver";
     public IEnumerable<string> Aliases => new[] { "mssql" };
 
+    // Provider-declared settings (registered by the host as DuckDB extension options at load; values pushed
+    // back into ProviderSettingsStore). Parity with the former C++ RegisterCompatSettings: most are accepted
+    // no-ops for native-extension SET compatibility; mssql_ctas_text_type / mssql_isolation_level /
+    // mssql_exec_invalidate_cache are honored. See docs/settings-architecture.md.
+    public IEnumerable<ProviderSetting> Settings
+    {
+        get
+        {
+            const string compat = "mssql_net compatibility setting";
+            ProviderSetting Bool(string n, string d = compat, object? def = null) => new(n, ProviderSettingType.Bool, def, d);
+            ProviderSetting Long(string n, string d = compat, object? def = null, long? min = null) =>
+                new(n, ProviderSettingType.Long, def, d, min);
+            ProviderSetting Str(string n, string d = compat) => new(n, ProviderSettingType.Varchar, null, d);
+            return new[]
+            {
+                Bool("mssql_connection_cache"), Bool("mssql_order_pushdown"), Bool("mssql_copy_tablock"),
+                Bool("mssql_ctas_use_bcp"), Bool("mssql_convert_varchar_max"),
+                Long("mssql_connection_limit"), Long("mssql_connection_timeout"), Long("mssql_acquire_timeout"),
+                Long("mssql_attach_validation_timeout"), Long("mssql_catalog_cache_ttl"), Long("mssql_copy_flush_rows"),
+                Long("mssql_idle_timeout"), Long("mssql_min_connections"),
+                Str("mssql_ctas_text_type"),
+                Str("mssql_isolation_level", "mssql_net: SQL transaction isolation level for table-in-out sessions"),
+                Long("mssql_insert_batch_size", "mssql_net: max rows per INSERT statement", 2000L, 1),
+                Long("mssql_insert_max_rows_per_statement", "mssql_net: hard cap on rows per statement", 2000L, 1),
+                Long("mssql_insert_max_sql_bytes", "mssql_net: max SQL statement size in bytes", 8388608L, 1),
+                Bool("mssql_insert_use_returning_output", "mssql_net: use OUTPUT INSERTED for RETURNING", true),
+                Bool("mssql_exec_invalidate_cache",
+                     "mssql_net: invalidate the catalog cache after DDL run via mssql_net_exec()", false),
+            };
+        }
+    }
+
     public IBackendCatalog OpenCatalog(string connectionString) => new SqlServerCatalog(connectionString);
 
     /// <summary>

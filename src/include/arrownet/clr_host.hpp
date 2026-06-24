@@ -79,6 +79,13 @@ int64_t ExecuteUpdate(ArrowNetHandle handle, const std::string &schema, const st
 void GetMetadata(ArrowNetHandle handle, int32_t kind, const std::string &arg1, const std::string &arg2,
                  ArrowArrayStream &out);
 
+// Provider-declared settings (see docs/settings-architecture.md). ListSettings fills `out` with ALL
+// registered providers' declared settings (six string columns: provider, name, type, default, description,
+// min); the host registers each as a DuckDB extension option at load. SetSetting pushes a setting's value
+// (nullptr => unset) into the managed ProviderSettingsStore.
+void ListSettings(ArrowArrayStream &out);
+void SetSetting(const std::string &provider, const std::string &name, const char *value);
+
 // Scan a table; fills `out` with the rows as an Arrow stream. `spec_json` (empty
 // => none) carries projection + filter pushdown; `filter_values` (nullable) is a
 // one-batch Arrow stream of the typed constants the filter tree references.

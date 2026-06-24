@@ -485,13 +485,28 @@ typedef struct ArrowNetVTable {
 	// Release a binding handle from table_bind. Idempotent; safe with nullptr.
 	// Best-effort (bind-data teardown must not throw).
 	int32_t (*table_close)(ArrowNetHandle binding, char **err);
+
+	// -------------------------------------------------------------------------
+	// Provider-declared settings (Phase: settings refactor; see docs/settings-architecture.md).
+	// Appended at the vtable end so no earlier slot shifts.
+	// -------------------------------------------------------------------------
+	// list_settings: the managed side returns ALL registered providers' declared settings as an Arrow
+	// stream with six UTF-8 columns: provider, name, type ("bool"|"long"|"varchar"), default (rendered;
+	// empty => unset), description, min (rendered int64 for long settings; empty => none). The host
+	// registers each as a DuckDB extension option at extension load.
+	int32_t (*list_settings)(struct ArrowArrayStream *out, char **err);
+
+	// set_setting: push a setting's new value (rendered UTF-8; NULL/empty => unset/reset) into the managed
+	// ProviderSettingsStore. Called from each option's set-callback when the value is SET, and once per
+	// setting at registration for its default.
+	int32_t (*set_setting)(const char *provider, const char *name, const char *value, char **err);
 } ArrowNetVTable;
 
 // Max serialized size of a spillable aggregate's per-group state (the inline, pointer-free
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 32
+#define ARROWNET_ABI_VERSION 33
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

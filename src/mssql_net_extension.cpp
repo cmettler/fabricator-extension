@@ -10,6 +10,7 @@
 
 #include "arrownet/clr_host.hpp"
 #include "catalog/arrownet_catalog.hpp"
+#include "catalog/arrownet_metadata.hpp"
 #include "catalog/arrownet_schema_entry.hpp"
 #include "copy/mssql_net_copy.hpp"
 #include "arrownet_optimizer.hpp"
@@ -22,6 +23,10 @@
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+
+#include <array>
+#include <cstring>
+#include <utility>
 
 namespace duckdb {
 
@@ -72,57 +77,108 @@ static void ArrowNetVersionFunction(DataChunk &args, ExpressionState &state, Vec
 	ConstantVector::GetData<string_t>(result)[0] = StringVector::AddString(result, GetExtensionVersion());
 }
 
-// SET callback that rejects values < 1 (matches the C++ mssql extension's
-// "must be >= 1" validation on batch-size / SQL-byte knobs).
-static void RequireAtLeastOne(ClientContext &, SetScope, Value &parameter) {
-	if (!parameter.IsNull() && parameter.GetValue<int64_t>() < 1) {
-		throw InvalidInputException("mssql_net: value must be >= 1");
+// -----------------------------------------------------------------------------
+// Provider-declared settings (see docs/settings-architecture.md). Each provider declares its settings in C#
+// (IBackend.Settings); we register them here as DuckDB extension options and push value changes back into
+// the managed ProviderSettingsStore. DuckDB's set-callback carries no setting name, so we bind one callback
+// per slot (a compile-time trampoline array). The provider-agnostic core thus knows no setting names.
+// -----------------------------------------------------------------------------
+
+// Max settings registrable across all providers (trampoline array size; generous).
+static constexpr size_t ARROWNET_MAX_SETTINGS = 128;
+
+struct SettingSlot {
+	string provider;
+	string name;
+	bool has_min = false;
+	int64_t min_value = 0;
+};
+static SettingSlot g_setting_slots[ARROWNET_MAX_SETTINGS];
+static size_t g_setting_count = 0;
+
+// One set-callback per slot: validates an optional minimum (parity with the former RequireAtLeastOne), then
+// best-effort pushes the new value to the managed store. DuckDB has already cast `value` to the option type.
+template <size_t I>
+static void SettingTrampoline(ClientContext &, SetScope, Value &value) {
+	const SettingSlot &slot = g_setting_slots[I];
+	if (slot.has_min && !value.IsNull() && value.GetValue<int64_t>() < slot.min_value) {
+		throw InvalidInputException("mssql_net: %s must be >= %lld", slot.name, (long long)slot.min_value);
+	}
+	try {
+		if (value.IsNull()) {
+			arrownet::SetSetting(slot.provider, slot.name, nullptr);
+		} else {
+			string rendered = value.ToString();
+			arrownet::SetSetting(slot.provider, slot.name, rendered.c_str());
+		}
+	} catch (...) {
+		// Best-effort: a managed-store hiccup must not fail the user's SET.
 	}
 }
 
-// Registers the SET mssql_* knobs the C++ mssql extension exposes so that
-// `SET mssql_... = ...` is accepted (no error). Behavioral knobs we actually
-// honor are read where relevant; the rest are accepted no-ops for compatibility.
-static void RegisterCompatSettings(DBConfig &config) {
-	auto add = [&](const char *name, const LogicalType &type) {
-		config.AddExtensionOption(name, "mssql_net compatibility setting", type);
-	};
-	for (const char *b : {"mssql_connection_cache", "mssql_order_pushdown", "mssql_copy_tablock",
-	                      "mssql_ctas_use_bcp", "mssql_convert_varchar_max"}) {
-		add(b, LogicalType::BOOLEAN);
-	}
-	for (const char *i : {"mssql_connection_limit", "mssql_connection_timeout", "mssql_acquire_timeout",
-	                      "mssql_attach_validation_timeout", "mssql_catalog_cache_ttl", "mssql_copy_flush_rows",
-	                      "mssql_idle_timeout", "mssql_min_connections"}) {
-		add(i, LogicalType::BIGINT);
-	}
-	add("mssql_ctas_text_type", LogicalType::VARCHAR);
-
-	// SQL transaction isolation level for table-in-out sessions (e.g. "snapshot",
-	// "repeatable read", "serializable"), giving a consistent view across one in-out
-	// call. Overrides the ATTACH isolation_level option per-session. Empty => provider default.
-	config.AddExtensionOption("mssql_isolation_level",
-	                          "mssql_net: SQL transaction isolation level for table-in-out sessions",
-	                          LogicalType::VARCHAR);
-
-	// The INSERT knobs carry real defaults (so current_setting() reads them) and the
-	// numeric ones validate `>= 1` on SET — parity with the C++ mssql extension.
-	config.AddExtensionOption("mssql_insert_batch_size", "mssql_net: max rows per INSERT statement",
-	                          LogicalType::BIGINT, Value::BIGINT(2000), RequireAtLeastOne);
-	config.AddExtensionOption("mssql_insert_max_rows_per_statement", "mssql_net: hard cap on rows per statement",
-	                          LogicalType::BIGINT, Value::BIGINT(2000), RequireAtLeastOne);
-	config.AddExtensionOption("mssql_insert_max_sql_bytes", "mssql_net: max SQL statement size in bytes",
-	                          LogicalType::BIGINT, Value::BIGINT(8388608), RequireAtLeastOne);
-	config.AddExtensionOption("mssql_insert_use_returning_output", "mssql_net: use OUTPUT INSERTED for RETURNING",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
-
-	// Auto-invalidate the catalog cache after DDL run via mssql_net_exec(). Defaults
-	// to FALSE (Postgres-scanner parity): by default invalidate manually with
-	// mssql_invalidate_cache()/mssql_refresh_cache(); set true to auto-invalidate.
-	config.AddExtensionOption("mssql_exec_invalidate_cache",
-	                          "mssql_net: invalidate the catalog cache after DDL run via mssql_net_exec()",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+template <size_t... I>
+static std::array<set_option_callback_t, sizeof...(I)> MakeSettingTrampolines(std::index_sequence<I...>) {
+	return {{&SettingTrampoline<I>...}};
 }
+static const std::array<set_option_callback_t, ARROWNET_MAX_SETTINGS> g_setting_trampolines =
+    MakeSettingTrampolines(std::make_index_sequence<ARROWNET_MAX_SETTINGS>());
+
+// Registers every provider's declared settings (queried from the managed bridge) as DuckDB extension
+// options. Best-effort: if the bridge can't boot at load (e.g. the managed dir is missing), registration is
+// skipped and the extension still loads (SET of provider settings would then error as "unknown setting";
+// the bridge boots lazily on first use as before).
+static void RegisterProviderSettings(ExtensionLoader &loader) {
+	DBConfig &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
+	try {
+		ArrowArrayStream stream;
+		std::memset(&stream, 0, sizeof(stream));
+		arrownet::ListSettings(stream);
+		// Columns: provider, name, type, default, description, min (empty string => null/none).
+		auto rows = ReadStringTable(stream, 6);
+		size_t n = rows[0].size();
+		for (size_t i = 0; i < n && g_setting_count < ARROWNET_MAX_SETTINGS; i++) {
+			const string &provider = rows[0][i];
+			const string &name = rows[1][i];
+			const string &type = rows[2][i];
+			const string &def = rows[3][i];
+			const string &desc = rows[4][i];
+			const string &min = rows[5][i];
+
+			LogicalType lt = type == "bool" ? LogicalType::BOOLEAN
+			               : type == "long" ? LogicalType::BIGINT
+			                                : LogicalType::VARCHAR;
+			Value default_value; // NULL => unset
+			if (!def.empty()) {
+				if (type == "bool") {
+					default_value = Value::BOOLEAN(def == "true" || def == "1");
+				} else if (type == "long") {
+					default_value = Value::BIGINT(std::stoll(def));
+				} else {
+					default_value = Value(def);
+				}
+			}
+
+			size_t slot = g_setting_count++;
+			g_setting_slots[slot].provider = provider;
+			g_setting_slots[slot].name = name;
+			g_setting_slots[slot].has_min = !min.empty();
+			g_setting_slots[slot].min_value = min.empty() ? 0 : std::stoll(min);
+
+			config.AddExtensionOption(name, desc, lt, default_value, g_setting_trampolines[slot]);
+
+			// Seed the managed store with the default so reads see it before any SET.
+			if (!def.empty()) {
+				try {
+					arrownet::SetSetting(provider, name, def.c_str());
+				} catch (...) {
+				}
+			}
+		}
+	} catch (std::exception &) {
+		// Bridge unavailable at load — skip provider-setting registration (graceful degradation).
+	}
+}
+
 
 // --- arrownet_managed_dir() --------------------------------------------------
 // Diagnostic: forces the bridge to load and reports the resolved managed dir.
@@ -325,7 +381,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(
 	    ScalarFunction("arrownet_managed_dir", {}, LogicalType::VARCHAR, ArrowNetManagedDirFunction));
 
-	RegisterCompatSettings(DBConfig::GetConfig(loader.GetDatabaseInstance()));
+	RegisterProviderSettings(loader);
 	RegisterArrowNetOptimizer(DBConfig::GetConfig(loader.GetDatabaseInstance()));
 	RegisterArrowNetInOutFinalizer(DBConfig::GetConfig(loader.GetDatabaseInstance()));
 

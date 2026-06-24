@@ -179,13 +179,18 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   (length policy, separate from the varchar/nvarchar choice; existing `mssql_ctas_text_type` is the
   blunt whole-string escape hatch). Open: the naive-`datetime2` reinterpret-as-session-local semantic.
 - **Settings refactor** (provider-declared, C#-accessible settings) — **design:
-  [docs/settings-architecture.md](docs/settings-architecture.md)** (not yet implemented). Replaces the
-  current "hardcode `mssql_*` in C++ / read in C++ / pass each value through an ABI method param" model
-  (which is O(settings × providers) churn and forces the provider-agnostic core to know `mssql_*` names): a
-  provider **declares** its settings in C# (`IBackend.Settings`), C++ **registers** them at load via a generic
-  `list_settings(provider)` ABI, values **push** to C# via a generic `set_setting(provider,name,value)`, and
-  C# reads `catalog.Settings.Get<T>(name)`. **Net ABI reduction** — two generic entries replace the
-  `text_type`/`isolation`/proposed-`text_length` per-setting params. Trade-offs: boot the CLR at extension
+  [docs/settings-architecture.md](docs/settings-architecture.md)**. **Mechanism DONE (ABI v33, steps 1–3,
+  behavior-preserving)**: a provider declares its settings in C# (`IBackend.Settings` → `ProviderSetting`),
+  the host registers them as DuckDB extension options **at extension load** via the generic `list_settings`
+  ABI (booting the bridge best-effort at load), and value changes **push** to C#'s `ProviderSettingsStore`
+  via `set_setting` from a **per-slot trampoline** set-callback (`SetTrampoline<I>` — DuckDB's set-callback
+  carries no setting name + fires before the store, so one generic callback can't work). The provider-agnostic
+  core no longer names a setting; `RegisterCompatSettings` + the hardcoded `mssql_*` list are gone. Min-validation
+  preserved (now names the setting). **Remaining**: step 4 cutover (`SqlServerCatalog` reads
+  `ProviderSettingsStore` instead of the `text_type`/`isolation` ABI params → drop those params) + step 5
+  `mssql_default_varchar_length`. Replaces the old "hardcode `mssql_*` in C++ / read in C++ / pass each value
+  through an ABI method param" model (O(settings × providers) churn): **net ABI reduction** — two generic
+  entries replace the per-setting params. Trade-offs: boot the CLR at extension
   load (needed for `SET` before first ATTACH; aligns with Phase-3 load-time functions) + catalog/provider
   scope (not session-local). **Directly unblocks `mssql_default_varchar_length`** (C# reads the length from
   `Settings`, no `begin_bulk`/`create_table` signature changes). Prerequisite for the 2nd provider.

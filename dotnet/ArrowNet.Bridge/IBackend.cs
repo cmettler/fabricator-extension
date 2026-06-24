@@ -24,6 +24,14 @@ public interface IBackend
     IEnumerable<string> Aliases => System.Array.Empty<string>();
 
     /// <summary>
+    /// The settings this provider declares (default none). The host registers each as a DuckDB extension
+    /// option at load (so <c>SET</c> / <c>duckdb_settings()</c> work) and pushes value changes into
+    /// <see cref="ProviderSettingsStore"/>, which the provider reads in C# — keeping setting names out of the
+    /// provider-agnostic C++ core and off the per-method ABI. See docs/settings-architecture.md.
+    /// </summary>
+    IEnumerable<ProviderSetting> Settings => System.Array.Empty<ProviderSetting>();
+
+    /// <summary>
     /// Builds a provider connection string from a secret's fields (the host reads the DuckDB secret and
     /// passes its key/values here). Keeps all provider connection-string / auth formatting in the
     /// backend — the C++ side has no knowledge of the provider's connstr dialect. The result is then
@@ -280,6 +288,10 @@ public static class BackendRegistry
     /// or the one named by <c>ARROWNET_DEFAULT_PROVIDER</c> / the first registered).
     /// </summary>
     public static IBackend Active => Default(Map());
+
+    /// <summary>All distinct registered backends — for host-side enumeration (e.g. listing every provider's
+    /// declared settings at load).</summary>
+    public static IEnumerable<IBackend> All() => Map().Values.Distinct();
 
     private static IBackend Default(Dictionary<string, IBackend> map)
     {

@@ -26,7 +26,7 @@ public static unsafe class Bootstrap
             return ArrowNetStatus.InvalidArgument;
         }
 
-        vtable->AbiVersion = 32;
+        vtable->AbiVersion = 33;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -69,6 +69,8 @@ public static unsafe class Bootstrap
         vtable->TableBind = &TableBind;
         vtable->TableExecute = &TableExecute;
         vtable->TableClose = &TableClose;
+        vtable->ListSettings = &ListSettings;
+        vtable->SetSetting = &SetSetting;
         return ArrowNetStatus.Ok;
     }
 
@@ -828,6 +830,98 @@ public static unsafe class Bootstrap
         {
             Handles.Resolve<IBoundTable>(binding)?.Dispose(); // idempotent
             Handles.Free(binding);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Provider-declared settings (see docs/settings-architecture.md). list_settings returns ALL registered
+    // providers' declared settings (not catalog-scoped); set_setting pushes a value into the process-wide
+    // ProviderSettingsStore. Six string columns: provider, name, type, default, description, min.
+    // -------------------------------------------------------------------------
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int ListSettings(CArrowArrayStream* outStream, byte** err)
+    {
+        try
+        {
+            if (outStream is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            var provider = new StringArray.Builder();
+            var name = new StringArray.Builder();
+            var type = new StringArray.Builder();
+            var def = new StringArray.Builder();
+            var desc = new StringArray.Builder();
+            var min = new StringArray.Builder();
+            int rows = 0;
+            foreach (var backend in BackendRegistry.All())
+            {
+                foreach (var s in backend.Settings)
+                {
+                    provider.Append(backend.Name);
+                    name.Append(s.Name);
+                    type.Append(s.Type switch
+                    {
+                        ProviderSettingType.Bool => "bool",
+                        ProviderSettingType.Long => "long",
+                        _ => "varchar",
+                    });
+                    var rendered = RenderSettingValue(s.Default);
+                    if (rendered is null) { def.AppendNull(); } else { def.Append(rendered); }
+                    desc.Append(s.Description ?? string.Empty);
+                    if (s.Min is long m) { min.Append(m.ToString()); } else { min.AppendNull(); }
+                    rows++;
+                }
+            }
+            var schema = new Schema(new[]
+            {
+                new Field("provider", StringType.Default, nullable: false),
+                new Field("name", StringType.Default, nullable: false),
+                new Field("type", StringType.Default, nullable: false),
+                new Field("default", StringType.Default, nullable: true),
+                new Field("description", StringType.Default, nullable: true),
+                new Field("min", StringType.Default, nullable: true),
+            }, metadata: null);
+            var batch = new RecordBatch(schema, new IArrowArray[]
+            {
+                provider.Build(), name.Build(), type.Build(), def.Build(), desc.Build(), min.Build(),
+            }, rows);
+            CArrowArrayStreamExporter.ExportArrayStream(new InMemoryArrayStream(schema, new[] { batch }), outStream);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    // Renders a setting default/value to the string transport form (bool -> true/false, long/int -> digits,
+    // anything else -> ToString); null => unset (the caller appends a null).
+    private static string? RenderSettingValue(object? value) => value switch
+    {
+        null => null,
+        bool b => b ? "true" : "false",
+        long l => l.ToString(),
+        int i => i.ToString(),
+        _ => value.ToString(),
+    };
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int SetSetting(byte* provider, byte* name, byte* value, byte** err)
+    {
+        try
+        {
+            var p = Marshal.PtrToStringUTF8((nint)provider) ?? string.Empty;
+            var n = Marshal.PtrToStringUTF8((nint)name) ?? string.Empty;
+            var v = Marshal.PtrToStringUTF8((nint)value); // null => unset / reset
+            ProviderSettingsStore.Instance.Set(p, n, v);
             return ArrowNetStatus.Ok;
         }
         catch (Exception ex)

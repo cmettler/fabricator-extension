@@ -442,6 +442,32 @@ void GetMetadata(ArrowNetHandle handle, int32_t kind, const std::string &arg1, c
 	}
 }
 
+void ListSettings(ArrowArrayStream &out) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.list_settings) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide list_settings");
+	}
+	char *err = nullptr;
+	int32_t rc = vt.list_settings(&out, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: list_settings failed");
+	}
+}
+
+// `value` is the rendered setting value (nullptr => unset/reset). Pushes into the managed
+// ProviderSettingsStore so providers read it in C#.
+void SetSetting(const std::string &provider, const std::string &name, const char *value) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.set_setting) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide set_setting");
+	}
+	char *err = nullptr;
+	int32_t rc = vt.set_setting(provider.c_str(), name.c_str(), value, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: set_setting failed");
+	}
+}
+
 void GetFunctionParamSchema(ArrowNetHandle handle, const std::string &schema, const std::string &func,
                             ArrowSchema &out) {
 	const ArrowNetVTable &vt = GetBridge();

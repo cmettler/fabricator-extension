@@ -57,7 +57,7 @@ instance. The options and their costs:
 | Approach | How C# gets values | Problem |
 |---|---|---|
 | **Pull via host callback** (`host_get_setting(name)`) | C# calls back into C++ on demand | needs the *operation's* context; an ambient/thread-local context breaks on the async bulk-consumer thread (`BulkSession`'s `Task.Run`) |
-| **Push at change** (DuckDB `set_callback` → `set_setting` ABI) | C++ pushes on every `SET`; C# caches | session-local `SET` cannot map cleanly onto the shared catalog |
+| **Push at change** (a `set_callback` → `set_setting` ABI) | C++ pushes on every `SET`; C# caches | the callback gets **no setting name** and fires **before** the value is stored ([physical_set.cpp:23-30](../duckdb/src/execution/operator/helper/physical_set.cpp#L23)), so a *single* generic callback can neither identify the setting nor re-read it — needs a per-slot trampoline (§4.3). Session-local `SET` still resolves onto the shared catalog (§5.2). |
 | **Per-operation snapshot** | C++ reads context, passes a settings blob | still a per-method param — the thing we are removing |
 
 No option is simultaneously zero-param, fully session-local-correct, and async-safe. The
@@ -89,14 +89,20 @@ core never names a setting.
 
 A generic `RegisterProviderSettings(loader)` enumerates providers and calls a new ABI
 `list_settings(provider) → Arrow[(name, type, default, description)]`, then `AddExtensionOption(...)` for
-each with **one generic `set_callback`**. Replaces the hardcoded `mssql_*` list. (Requires the bridge booted
-at load — see §5.1.)
+each, assigning it a **slot index** and a per-slot trampoline `set_callback` (see §4.3). Replaces the
+hardcoded `mssql_*` list. (Requires the bridge booted at load — see §5.1.)
 
-### 4.3 Value flow (push)
+### 4.3 Value flow (push) — per-slot trampolines
 
-The generic `set_callback` fires on `SET` and calls a new generic ABI `set_setting(provider, name, value)`
-into C#; C# stores it in a provider-keyed `SettingsStore`. An initial snapshot of current values is pushed
-at first bridge boot. ATTACH options layer on top per-catalog.
+DuckDB's `set_option_callback_t` is `(ClientContext&, SetScope, Value&)` — **no setting name** — and the SET
+operator invokes it *before* storing the value ([physical_set.cpp:23-30](../duckdb/src/execution/operator/helper/physical_set.cpp#L23)),
+so a single shared callback can neither tell which setting fired nor re-read it from the context. Resolve
+this with a **compile-time array of trampolines** `SetTrampoline<0..N>` (N = a fixed cap, e.g. 64). At
+registration, setting *i* is bound to `SetTrampoline<i>`; the trampoline knows its `(provider, name)` from a
+global table at index *i* and pushes the `Value` it was handed via a generic ABI
+`set_setting(provider, name, value)` into C#'s provider-keyed `SettingsStore`. An initial snapshot of
+defaults/current values is pushed at registration. ATTACH options layer on top per-catalog. (`SetScope` is
+available to the trampoline but, per §5.2, all scopes resolve onto the provider-global store.)
 
 ### 4.4 C# access
 
