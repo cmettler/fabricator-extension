@@ -36,3 +36,6 @@ wheels/
 .serena/
 .DS_Store
 *.swp
+
+# Local credentials / connection recipes — contain live secrets, never commit.
+/fabric.md
