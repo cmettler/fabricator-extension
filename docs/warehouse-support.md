@@ -16,6 +16,13 @@
 > embedded); box test DB now on SQL Server 2025. Remaining: the **write-side** rich types (DuckDB
 > `JSON`/`UUID` → native, blocked on the lossless-boundary decision, §3.4.1). File references are
 > repo-root-relative. Connection/transaction behavior is in [transactions.md](transactions.md).
+>
+> **Re-validated end-to-end on a real Fabric Warehouse (2026-06-24, edition 11, `BIN2_UTF8`, via a service
+> principal):** profile flags; CTAS write mapping → `varchar(max)` (no NVARCHAR), `BOOLEAN`→`bit` (the
+> lossless-boundary fix), `datetime2(6)`, `TIMESTAMPTZ`→UTC `datetime2(6)` (no DATETIMEOFFSET); read-back →
+> `datetime2(6)`→`TIMESTAMP` (µs, correctly NOT ns since Fabric caps scale at 6), tz instant preserved
+> (`12:00-04`→`16:00`Z, read naive); and string `ORDER BY`+`LIMIT` correct under the binary collation. No
+> regressions.
 
 ## TL;DR
 
