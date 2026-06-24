@@ -11,3 +11,8 @@ duckdb_extension_load(mssql_net
 # available. This build reports version v0.0.1, so `json` can't be autoloaded from the extension repo
 # (404); static linkage compiles it from the pinned duckdb submodule, matching the engine exactly.
 duckdb_extension_load(json)
+
+# Likewise `icu` — provides the `TimeZone` setting + timezone-aware timestamp ops needed to validate the
+# TIMESTAMPTZ <-> SQL Server datetime/datetimeoffset value conversions (warehouse-support §3.1) under a
+# non-UTC session zone. Same v0.0.1 autoload problem -> link it statically.
+duckdb_extension_load(icu)
