@@ -1098,13 +1098,43 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         try
         {
             string qualified = Quote(schemaName) + "." + Quote(tableName);
+            var pk = ParseIndexGroup(primaryKey);
+            var uniqueGroups = ParseIndexGroups(uniques);
+
+            // Fabric Warehouse / Synapse reject PRIMARY KEY/UNIQUE declared INLINE in CREATE TABLE (error
+            // 24584) and only support them as NONCLUSTERED NOT ENFORCED metadata hints added via ALTER TABLE.
+            // So on a warehouse engine emit a plain CREATE then ALTER ADD CONSTRAINT per key. The hints are
+            // NOT enforced (Fabric never checks uniqueness) but DO appear in sys.indexes, which seeds our
+            // rowid discovery -> UPDATE/DELETE. Box SQL Server keeps the inline form (single statement).
+            if (Profile.IsWarehouse && (pk.Count > 0 || uniqueGroups.Count > 0))
+            {
+                using var cmd = connection.CreateCommand();
+                cmd.Transaction = transaction;
+                if (ifNotExists)
+                {
+                    cmd.CommandText = $"SELECT CASE WHEN OBJECT_ID({ObjectLiteral(schemaName, tableName)}, 'U') IS NULL THEN 0 ELSE 1 END";
+                    if (Convert.ToInt32(cmd.ExecuteScalar()) == 1)
+                    {
+                        return; // table already exists
+                    }
+                }
+                cmd.CommandText = BuildCreateTable(qualified, columns, Profile, null, null, defaults);
+                cmd.ExecuteNonQuery();
+                foreach (var alter in WarehouseConstraintAlters(qualified, tableName, columns, pk, uniqueGroups))
+                {
+                    cmd.CommandText = alter;
+                    cmd.ExecuteNonQuery();
+                }
+                return;
+            }
+
             string create = BuildCreateTable(qualified, columns, Profile, primaryKey, uniques, defaults);
-            using var cmd = connection.CreateCommand();
-            cmd.Transaction = transaction;
-            cmd.CommandText = ifNotExists
+            using var cmd0 = connection.CreateCommand();
+            cmd0.Transaction = transaction;
+            cmd0.CommandText = ifNotExists
                 ? $"IF OBJECT_ID({ObjectLiteral(schemaName, tableName)}, 'U') IS NULL {create}"
                 : create;
-            cmd.ExecuteNonQuery();
+            cmd0.ExecuteNonQuery();
         }
         finally
         {
@@ -1112,6 +1142,25 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             {
                 connection.Dispose();
             }
+        }
+    }
+
+    // The ALTER TABLE ADD CONSTRAINT statements for a warehouse table's PK/UNIQUE hints (NONCLUSTERED NOT
+    // ENFORCED — the only form Fabric/Synapse accept, and only via ALTER, not inline). Names are derived
+    // from the table so they're unique within the schema.
+    private static IEnumerable<string> WarehouseConstraintAlters(string qualified, string tableName, Schema schema,
+                                                                 List<int> pk, List<List<int>> uniqueGroups)
+    {
+        if (pk.Count > 0)
+        {
+            yield return $"ALTER TABLE {qualified} ADD CONSTRAINT {Quote("PK_" + tableName)} " +
+                         $"PRIMARY KEY NONCLUSTERED ({ColumnList(schema, pk)}) NOT ENFORCED";
+        }
+        int u = 0;
+        foreach (var group in uniqueGroups)
+        {
+            yield return $"ALTER TABLE {qualified} ADD CONSTRAINT {Quote($"UQ_{tableName}_{u++}")} " +
+                         $"UNIQUE NONCLUSTERED ({ColumnList(schema, group)}) NOT ENFORCED";
         }
     }
 

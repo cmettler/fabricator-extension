@@ -272,6 +272,24 @@ type, so the tz instant keeps the correct type (the 7th digit is dropped, the pr
 Conversion Error, never silent corruption — an extreme edge for 100ns-precision timestamps). Verified:
 `test/verify_granular_types.test`.
 
+### 3.5 Constraints (PK / UNIQUE) + UPDATE/DELETE on warehouse
+
+Fabric Warehouse / Synapse support `PRIMARY KEY` / `UNIQUE` / `FOREIGN KEY` **only** as `NONCLUSTERED NOT
+ENFORCED` metadata hints, and **only added via `ALTER TABLE ADD CONSTRAINT`** — declaring a key **inline in
+`CREATE TABLE` is rejected** (error 24584). So on a warehouse profile, `CreateTable` emits a plain column-only
+`CREATE TABLE` followed by one `ALTER TABLE … ADD CONSTRAINT … PRIMARY KEY|UNIQUE NONCLUSTERED (…) NOT
+ENFORCED` per key (named `PK_<table>` / `UQ_<table>_<n>`), run as separate statements; box SQL Server keeps the
+inline single-statement form. The hints are **not enforced** (Fabric never checks uniqueness) but **do appear
+in `sys.indexes`** (`is_primary_key` / `is_unique`), which is exactly what our rowid discovery
+([`RowIdSql`](../dotnet/ArrowNet.SqlServer/SqlServerBackend.cs)) reads — so a keyed warehouse table gets a
+**rowid**, enabling **UPDATE / DELETE**. Validated end-to-end on Fabric (2026-06-24): `CREATE TABLE … PRIMARY
+KEY` via the extension produced a `NONCLUSTERED NOT ENFORCED` PK, and rowid-based UPDATE/DELETE worked.
+**Caveat:** because the key is NOT ENFORCED, Fabric permits duplicate "key" values; a rowid-based UPDATE/DELETE
+then trusts the declared key and could touch more than one row — the user's data-integrity responsibility, same
+as any unenforced constraint. (A pre-existing, unrelated quirk: a plain `CREATE TABLE` followed by DML in the
+**same** session needs a `mssql_refresh_cache` / re-ATTACH for the new table to be visible — applies on box
+too; CTAS does not have this.)
+
 ## 4. Collation — the cross-stack problem
 
 **Collation is chosen at warehouse/lakehouse creation time** (Fabric defaults to
