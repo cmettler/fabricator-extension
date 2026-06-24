@@ -153,8 +153,13 @@ session-local is ever needed, key the `SettingsStore` by a session token pushed 
    no `begin_bulk`/`create_table` signature changes; `mssql_ctas_text_type` whole-type override still wins).
    `test/verify_default_varchar_length.test`. See [warehouse-support.md](warehouse-support.md) §3.2.
 
-**Status:** steps 1–3 (mechanism) + step 5 (`mssql_default_varchar_length`) DONE at ABI v33. Step 4 (cut the
-`ctas_text_type`/`isolation` readers over to `ProviderSettingsStore` and drop those ABI params) remains.
+**Status:** steps 1–3 (mechanism) + step 5 (`mssql_default_varchar_length`) DONE at ABI v33. Step 4
+**partly done** at ABI v34: `ctas_text_type` cut over (C# reads it from the store in `MapArrowToSqlType`; the
+`text_type` param dropped from `create_table` end-to-end — proving a per-setting param can be removed — and
+it now applies to CTAS/COPY too). The C++11 trampoline array was hardened (hand-rolled `IndexSeq`). The
+**`isolation` cutover is deferred**: it's entangled with the per-catalog `isolation_level` ATTACH option (a
+provider-global store can't hold a per-catalog value), so it lands with the ATTACH-options refactor
+([provider-extensibility.md](provider-extensibility.md) §3).
 4. Each slice rebuilds C++ + republishes managed (the ABI changes are lockstep — exact-match version check).
 
 ## 8. Open decisions

@@ -26,7 +26,7 @@ public static unsafe class Bootstrap
             return ArrowNetStatus.InvalidArgument;
         }
 
-        vtable->AbiVersion = 33;
+        vtable->AbiVersion = 34;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -301,7 +301,7 @@ public static unsafe class Bootstrap
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static int CreateTable(nint handle, byte* schema, byte* table, CArrowArrayStream* columns, int ifNotExists,
-                                   byte* pkColumns, byte* uniqueColumns, byte* defaults, byte* textType, byte** err)
+                                   byte* pkColumns, byte* uniqueColumns, byte* defaults, byte** err)
     {
         try
         {
@@ -316,12 +316,11 @@ public static unsafe class Bootstrap
             var pk = Marshal.PtrToStringUTF8((nint)pkColumns);
             var uniques = Marshal.PtrToStringUTF8((nint)uniqueColumns);
             var defaultSpec = Marshal.PtrToStringUTF8((nint)defaults);
-            var textTypeName = Marshal.PtrToStringUTF8((nint)textType);
 
-            // We own the C stream; read its schema (the column layout) and release it.
+            // We own the C stream; read its schema (the column layout) and release it. The text-column SQL
+            // type (mssql_ctas_text_type / mssql_default_varchar_length) is read from the settings store in C#.
             using var stream = CArrowArrayStreamImporter.ImportArrayStream(columns);
-            catalog.CreateTable(schemaName, tableName, stream.Schema, ifNotExists != 0, pk, uniques, defaultSpec,
-                                textTypeName);
+            catalog.CreateTable(schemaName, tableName, stream.Schema, ifNotExists != 0, pk, uniques, defaultSpec);
             return ArrowNetStatus.Ok;
         }
         catch (Exception ex)

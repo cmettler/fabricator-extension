@@ -116,12 +116,23 @@ static void SettingTrampoline(ClientContext &, SetScope, Value &value) {
 	}
 }
 
+// Hand-rolled compile-time index sequence: the build is -std=c++11 (std::make_index_sequence is C++14;
+// MSVC's STL provides it even in C++11 mode, but a strict libstdc++ -std=c++11 build does not).
+template <size_t...>
+struct IndexSeq {};
+template <size_t N, size_t... Is>
+struct BuildIndexSeq : BuildIndexSeq<N - 1, N - 1, Is...> {};
+template <size_t... Is>
+struct BuildIndexSeq<0, Is...> {
+	using type = IndexSeq<Is...>;
+};
+
 template <size_t... I>
-static std::array<set_option_callback_t, sizeof...(I)> MakeSettingTrampolines(std::index_sequence<I...>) {
+static std::array<set_option_callback_t, sizeof...(I)> MakeSettingTrampolines(IndexSeq<I...>) {
 	return {{&SettingTrampoline<I>...}};
 }
 static const std::array<set_option_callback_t, ARROWNET_MAX_SETTINGS> g_setting_trampolines =
-    MakeSettingTrampolines(std::make_index_sequence<ARROWNET_MAX_SETTINGS>());
+    MakeSettingTrampolines(BuildIndexSeq<ARROWNET_MAX_SETTINGS>::type {});
 
 // Registers every provider's declared settings (queried from the managed bridge) as DuckDB extension
 // options. Best-effort: if the bridge can't boot at load (e.g. the managed dir is missing), registration is

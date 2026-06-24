@@ -74,7 +74,7 @@ public sealed class StubBackend : IBackend
             throw new NotSupportedException("stub backend has no aggregate functions");
 
         public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists,
-                                string? primaryKey, string? uniques, string? defaults, string? textType)
+                                string? primaryKey, string? uniques, string? defaults)
         {
         }
 

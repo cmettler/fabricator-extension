@@ -211,11 +211,11 @@ typedef struct ArrowNetVTable {
 	// pairs, where payload is base64(value-text) or "-" for DEFAULT NULL (NULL/
 	// empty if none). The managed side maps Arrow->provider types, quotes the
 	// default by column type, and runs the provider CREATE TABLE. Consumes `columns`.
-	// `text_type` (nullable/empty => NVARCHAR(MAX)) overrides the SQL type used for
-	// text (VARCHAR) columns — the `mssql_ctas_text_type` compatibility setting.
+	// The text-column SQL type (mssql_ctas_text_type override / mssql_default_varchar_length) is read from
+	// the managed provider settings store (see docs/settings-architecture.md), not passed here.
 	int32_t (*create_table)(ArrowNetHandle handle, const char *schema, const char *table,
 	                        struct ArrowArrayStream *columns, int32_t if_not_exists, const char *pk_columns,
-	                        const char *unique_columns, const char *defaults, const char *text_type, char **err);
+	                        const char *unique_columns, const char *defaults, char **err);
 
 	// DDL: drop a table. `if_exists` suppresses the error when it is absent.
 	int32_t (*drop_table)(ArrowNetHandle handle, const char *schema, const char *table, int32_t if_exists, char **err);
@@ -506,7 +506,7 @@ typedef struct ArrowNetVTable {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 33
+#define ARROWNET_ABI_VERSION 34
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

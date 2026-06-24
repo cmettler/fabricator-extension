@@ -1038,7 +1038,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     }
 
     public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists, string? primaryKey,
-                            string? uniques, string? defaults, string? textType)
+                            string? uniques, string? defaults)
     {
         // Route through BeginWrite so this participates in the pinned transaction
         // when one is active — without it, CREATE OR REPLACE (DROP pinned + CREATE
@@ -1047,7 +1047,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         try
         {
             string qualified = Quote(schemaName) + "." + Quote(tableName);
-            string create = BuildCreateTable(qualified, columns, Profile, primaryKey, uniques, defaults, textType);
+            string create = BuildCreateTable(qualified, columns, Profile, primaryKey, uniques, defaults);
             using var cmd = connection.CreateCommand();
             cmd.Transaction = transaction;
             cmd.CommandText = ifNotExists
@@ -2046,10 +2046,10 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     internal static string Quote(string identifier) => "[" + identifier.Replace("]", "]]") + "]";
 
     private static string BuildCreateTable(string qualified, Schema schema, ServerProfile profile) =>
-        BuildCreateTable(qualified, schema, profile, null, null, null, null);
+        BuildCreateTable(qualified, schema, profile, null, null, null);
 
     private static string BuildCreateTable(string qualified, Schema schema, ServerProfile profile, string? primaryKey,
-                                           string? uniques, string? defaults, string? textType)
+                                           string? uniques, string? defaults)
     {
         var defaultMap = ParseDefaults(defaults);
         var sb = new StringBuilder();
@@ -2061,7 +2061,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             {
                 sb.Append(", ");
             }
-            sb.Append(Quote(field.Name)).Append(' ').Append(MapArrowToSqlType(field.DataType, profile, textType))
+            sb.Append(Quote(field.Name)).Append(' ').Append(MapArrowToSqlType(field.DataType, profile))
               .Append(field.IsNullable ? " NULL" : " NOT NULL");
             if (defaultMap.TryGetValue(i, out var defaultValue))
             {
@@ -2154,7 +2154,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     //  - datetime2/time fractional scale: 7 (box) vs 6 (Fabric).
     //  - timestamptz: DATETIMEOFFSET where it exists, else UTC DATETIME2 (Fabric has no DATETIMEOFFSET).
     // Box SQL Server (HasNVarchar, HasDatetimeOffset, scale 7) reproduces the previous fixed mapping exactly.
-    private static string MapArrowToSqlType(IArrowType type, ServerProfile profile, string? textType = null)
+    private static string MapArrowToSqlType(IArrowType type, ServerProfile profile)
     {
         int scale = profile.MaxDateTime2Scale;
         switch (type.TypeId)
@@ -2189,9 +2189,13 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 return "VARBINARY(MAX)";
             case ArrowTypeId.String:
             default:
+                // mssql_ctas_text_type: explicit whole-type override wins. Read from the provider settings
+                // store (see docs/settings-architecture.md) — no per-method ABI param. Now also applies to
+                // CTAS/COPY (the bulk-create path shares this mapper), not just explicit CREATE TABLE.
+                var textType = ProviderSettingsStore.Instance.GetString(SqlServerBackend.ProviderName, "mssql_ctas_text_type");
                 if (!string.IsNullOrWhiteSpace(textType))
                 {
-                    return textType!; // mssql_ctas_text_type: explicit whole-type override wins
+                    return textType!;
                 }
                 string baseType = profile.HasNVarchar ? "NVARCHAR" : "VARCHAR";
                 // mssql_default_varchar_length bounds every text column (unset => MAX). Read straight from

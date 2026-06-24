@@ -189,9 +189,15 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   preserved (now names the setting). **`mssql_default_varchar_length` DONE** (the original motivator): declared
   in C#, read from `ProviderSettingsStore` inside `MapArrowToSqlType` (no ABI param), bounds **all** created
   text columns incl. CTAS/COPY (`NVARCHAR(n)`/`VARCHAR(n)` vs `(MAX)`); `mssql_ctas_text_type` whole-type
-  override still wins (`test/verify_default_varchar_length.test`, 19). **Remaining**: step 4 cutover
-  (`SqlServerCatalog` reads `ProviderSettingsStore` for `ctas_text_type`/`isolation` too → drop those ABI
-  params). Replaces the old "hardcode `mssql_*` in C++ / read in C++ / pass each value
+  override still wins (`test/verify_default_varchar_length.test`, 19). **Step 4 cutover — `ctas_text_type`
+  DONE (ABI v34)**: `MapArrowToSqlType` reads `mssql_ctas_text_type` from the store; the `text_type` param is
+  dropped from `create_table` across C#/ABI/C++ (proving a per-setting param can be removed); it now applies
+  to CTAS/COPY too, not just explicit CREATE (closing the old gap). The C++11 trampoline array was also
+  hardened (hand-rolled `IndexSeq` replacing `std::make_index_sequence`). **Remaining**: `isolation` cutover
+  is deferred — it's entangled with the per-catalog `isolation_level` **ATTACH option** (a global store can't
+  hold a per-catalog value), so it lands with the ATTACH-options refactor (see
+  [docs/provider-extensibility.md](docs/provider-extensibility.md)). Replaces the old "hardcode `mssql_*` in
+  C++ / read in C++ / pass each value
   through an ABI method param" model (O(settings × providers) churn): **net ABI reduction** — two generic
   entries replace the per-setting params. Trade-offs: boot the CLR at extension
   load (needed for `SET` before first ATTACH; aligns with Phase-3 load-time functions) + catalog/provider

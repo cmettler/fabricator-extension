@@ -182,12 +182,12 @@ public interface IBackendCatalog : IDisposable
     /// <paramref name="uniques"/> is ';'-separated groups of comma-separated
     /// indices, one UNIQUE constraint per group. <paramref name="defaults"/>
     /// carries literal column DEFAULTs as space-separated "<index> <payload>"
-    /// pairs, payload = base64(value-text) or "-" for DEFAULT NULL.
-    /// <paramref name="textType"/> (null/empty => NVARCHAR(MAX)) overrides the SQL
-    /// type for text (VARCHAR) columns — the mssql_ctas_text_type setting.
+    /// pairs, payload = base64(value-text) or "-" for DEFAULT NULL. The text-column
+    /// SQL type (mssql_ctas_text_type override / mssql_default_varchar_length) is read
+    /// from the provider settings store, not passed here (see docs/settings-architecture.md).
     /// </summary>
     void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists, string? primaryKey,
-                     string? uniques, string? defaults, string? textType);
+                     string? uniques, string? defaults);
 
     /// <summary>Drops a table; <paramref name="ifExists"/> suppresses the missing-table error.</summary>
     void DropTable(string schemaName, string tableName, bool ifExists);
