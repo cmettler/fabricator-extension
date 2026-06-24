@@ -13,7 +13,14 @@ ingests the Arrow streams the bridge produces. Connection strings are therefore 
 natively. The C++ core (`arrownet`) and managed `ArrowNet.Bridge` are transport- and backend-agnostic,
 intended for reuse by a future Power BI / DAX connector.
 
-> Project knowledge & build notes for contributors live in [`CLAUDE.md`](CLAUDE.md).
+**Works against box SQL Server, Azure SQL Database, and the Microsoft Fabric / Synapse warehouse family.**
+The extension detects a server **capability profile** at ATTACH and adapts connection behavior (MARS,
+isolation) and type mapping (collation-driven `VARCHAR`/`NVARCHAR`, `datetime2` scale, …) to the engine —
+including Fabric Warehouse over an Entra service principal. See
+[Microsoft Fabric & Synapse](#microsoft-fabric--synapse-warehouse).
+
+> Project knowledge & build notes for contributors live in [`CLAUDE.md`](CLAUDE.md), and the full
+> warehouse design in [`docs/warehouse-support.md`](docs/warehouse-support.md).
 
 ## Feature Status
 
@@ -50,6 +57,11 @@ intended for reuse by a future Power BI / DAX connector.
 | | — configurable isolation (consistent snapshot per call); per-row procs run in DuckDB's transaction | ✅ |
 | | **Custom C# aggregates** (UDAF) → `db.schema.agg(x)` in `GROUP BY` / parallel / `OVER(…)`; opt-in disk-spill (`SupportsSpill`) | ✅ |
 | | Load-time *global* functions (connection-free); proc multi-result-set / `INOUT` params | ❌ deferred |
+| **Warehouse** | Auto-detected server profile (edition / version / collation) + `mssql_server_info()` | ✅ Fabric Warehouse validated |
+| | Connection mode: `mssql_mars` (auto per engine), pooled reads + SNAPSHOT writes when MARS off | ✅ |
+| | Collation-adaptive `VARCHAR`/`NVARCHAR`; binary-collation string `ORDER BY` pushdown | ✅ |
+| | PK/UNIQUE as `NONCLUSTERED NOT ENFORCED` (via ALTER) → rowid → UPDATE/DELETE on Fabric | ✅ |
+| | Clustered columnstore tables (`mssql_default_table_type`) | ✅ (box; implicit on Fabric) |
 | **Diag** | Connection-pool diagnostics (`mssql_pool_stats`, `mssql_open/close/ping`) | ❌ |
 | | COPY to temp tables (`#t` / empty-schema syntax) | ❌ |
 
@@ -138,6 +150,47 @@ never leaked):
 ATTACH 'Server=nonexistent.host,1433;Database=db;User Id=sa;Password=pass' AS db (TYPE mssql_net);
 -- Error: MSSQL connection validation failed: <cause>
 ```
+
+## Microsoft Fabric & Synapse (warehouse)
+
+Beyond box SQL Server, the extension connects to **Fabric Warehouse**, the **Lakehouse SQL analytics
+endpoint**, and **Synapse** pools. At ATTACH it detects a **server capability profile** (engine edition +
+product version + database collation) once and adapts automatically — no configuration needed. Inspect it
+with `mssql_server_info(catalog)`:
+
+```sql
+-- Fabric Warehouse via an Entra service principal:
+CREATE SECRET fab (TYPE mssql_net,
+  host 'xxxxx.datawarehouse.fabric.microsoft.com', database 'My Warehouse',
+  authentication 'service_principal', user '<app-client-id>', password '<client-secret>');
+ATTACH '' AS wh (TYPE mssql_net, SECRET fab);
+
+SELECT property, value FROM mssql_server_info('wh');
+-- engine_edition=11, supports_mars=false, has_nvarchar=false, has_datetimeoffset=false,
+-- max_datetime2_scale=6, is_utf8_collation=true, is_binary_collation=true, default_write_isolation=snapshot
+```
+
+What the profile drives automatically:
+
+- **Connection mode.** Fabric/Synapse reject MARS, so it's auto-disabled (`mssql_mars=auto`); with MARS off,
+  data scans use **pooled** connections and the write transaction runs at **SNAPSHOT** isolation. Override
+  with `SET mssql_mars='true'|'false'|'auto'` **before** ATTACH. (Read-your-writes for *scans* is given up on
+  MARS-off engines — a documented trade-off — but *metadata* reads still see your own uncommitted DDL, so
+  `CREATE TABLE` then immediate use works.)
+- **Type mapping** is collation/edition-driven: `VARCHAR` (UTF-8, not `NVARCHAR`), `DATETIME2(6)`, and UTC
+  `DATETIME2` for tz instants (Fabric has no `datetimeoffset`). See the type table below.
+- **Constraints.** Fabric accepts `PRIMARY KEY`/`UNIQUE` only as `NONCLUSTERED NOT ENFORCED` hints added via
+  `ALTER`, so `CREATE TABLE … PRIMARY KEY` is automatically split into `CREATE` + `ALTER TABLE ADD CONSTRAINT
+  … NONCLUSTERED NOT ENFORCED`. They aren't enforced by Fabric, but they seed rowid discovery so
+  **UPDATE/DELETE work**.
+- **String `ORDER BY` pushdown** turns on under Fabric's binary (`BIN2_UTF8`) collation (byte-order sort
+  matches DuckDB); it stays local under case-insensitive collations (still correct).
+- **Functions.** Discovered scalar UDFs, TVFs, and stored procedures work on Fabric (proc result sets resolved
+  via `sp_describe_first_result_set`), as do custom C# functions and the `fn_each` table-in-out exchange.
+
+> **Collation reality:** no single collation is ideal across the whole OneLake stack (DuckDB + the SQL endpoint
+> are case-sensitive/binary; the DAX/Vertipaq engine is case-insensitive). The extension is *adaptive* —
+> correct under any collation — but does not prescribe one. Full design: [`docs/warehouse-support.md`](docs/warehouse-support.md).
 
 ## Catalog Integration
 
@@ -242,24 +295,32 @@ false). The target is registered in the catalog (queryable immediately).
 
 ### Type mapping (DuckDB → SQL Server, for CREATE / CTAS / COPY)
 
-| DuckDB | SQL Server |
-|--------|------------|
-| `BOOLEAN` | `BIT` |
-| `TINYINT`/`SMALLINT`/`INTEGER`/`BIGINT` | `TINYINT`/`SMALLINT`/`INT`/`BIGINT` |
-| `FLOAT` / `DOUBLE` | `REAL` / `FLOAT` |
-| `DECIMAL(p,s)` | `DECIMAL(p,s)` |
-| `VARCHAR` | `NVARCHAR(MAX)` (override with `mssql_ctas_text_type` on `CREATE TABLE`) |
-| `BLOB` | `VARBINARY(MAX)` |
-| `DATE` / `TIME` / `TIMESTAMP` | `DATE` / `TIME` / `DATETIME2` |
-| `TIMESTAMP WITH TIME ZONE` | `DATETIMEOFFSET` |
-| `UUID` | `UNIQUEIDENTIFIER` |
+The write mapping is **profile-adaptive** — it follows the connected engine's collation, version, and edition:
 
-> A `VARCHAR` maps to `NVARCHAR(MAX)`, which SQL Server cannot use as a `PRIMARY KEY`/`UNIQUE` key
-> column — use a fixed-width/indexable type for keys.
+| DuckDB | Box SQL Server / Azure SQL | Fabric Warehouse / Lakehouse |
+|--------|----------------------------|------------------------------|
+| `BOOLEAN` | `BIT` | `BIT` |
+| `TINYINT`/`SMALLINT`/`INTEGER`/`BIGINT` | `TINYINT`/`SMALLINT`/`INT`/`BIGINT` | same |
+| `FLOAT` / `DOUBLE` | `REAL` / `FLOAT` | same |
+| `DECIMAL(p,s)` | `DECIMAL(p,s)` | same |
+| `VARCHAR` | `NVARCHAR(n)` (non-UTF-8 collation) / `VARCHAR(n)` (UTF-8 collation) | `VARCHAR(n)` (UTF-8) |
+| `BLOB` | `VARBINARY(MAX)` | same |
+| `DATE` | `DATE` | `DATE` |
+| `TIME` / `TIMESTAMP` | `TIME(7)` / `DATETIME2(7)` | `TIME(6)` / `DATETIME2(6)` |
+| `TIMESTAMP WITH TIME ZONE` | `DATETIMEOFFSET(7)` | UTC `DATETIME2(6)` (no `datetimeoffset`) |
+| `UUID` | `UNIQUEIDENTIFIER` | `UNIQUEIDENTIFIER` |
 
-On reads, SQL Server types are mapped to DuckDB via SqlClient + Arrow (int/tinyint→uint8/decimal/
-money→`DECIMAL(19,4)`/bit→`BOOLEAN`/date/time/datetime2→`TIMESTAMP`/datetimeoffset→`TIMESTAMP_TZ`/
-**uniqueidentifier→`VARCHAR`**/varbinary→`BLOB`/…).
+- **Text type** is driven by the **collation** (a `_UTF8` collation → `VARCHAR`, else `NVARCHAR`), not the
+  edition. Length `n` comes from `mssql_default_varchar_length` (unset ⇒ `MAX`); `mssql_ctas_text_type` is a
+  whole-type override (e.g. `'VARCHAR(64)'`). `MAX` columns can't be a `PRIMARY KEY`/`UNIQUE` key, so set a
+  length for indexable string keys.
+- **`datetime2`/`time` scale** is the engine max (7 on box, 6 on Fabric).
+
+On **reads**, SQL Server types map to DuckDB via SqlClient + Arrow:
+`int`/`tinyint`→`UINTEGER`/`UTINYINT`, `decimal(p,s)`/`money`→`DECIMAL`, `bit`→`BOOLEAN`,
+`date`→`DATE`, `time(≤6)`/`datetime2(≤6)`→`TIME`/`TIMESTAMP` (µs), **`time(7)`/`datetime2(7)`→`TIME_NS`/`TIMESTAMP_NS`**
+(the 100 ns digit is preserved), `datetimeoffset`→`TIMESTAMPTZ`, **`uniqueidentifier`→`UUID`**,
+**`json`→`JSON`** (SQL Server 2025; via the `arrow.uuid`/`arrow.json` Arrow extensions), `varbinary`→`BLOB`.
 
 ## DDL
 
@@ -324,6 +385,13 @@ SET mssql_exec_invalidate_cache = true;
 SELECT mssql_net_exec('mssql', 'CREATE TABLE dbo.t2 (id INT)');
 SELECT * FROM mssql.dbo.t2;   -- visible immediately
 ```
+
+### `mssql_server_info(catalog) -> TABLE(property, value)`
+
+The detected server capability profile for an attached catalog (edition, version, collation, and the
+derived flags: `supports_mars`, `has_nvarchar`, `has_datetimeoffset`, `max_datetime2_scale`,
+`has_native_json`, `is_utf8_collation`, `is_binary_collation`, `default_write_isolation`, …). See
+[Microsoft Fabric & Synapse](#microsoft-fabric--synapse-warehouse).
 
 ### `mssql_version() -> VARCHAR`
 
@@ -448,7 +516,10 @@ the native extension's batching/pooling/TDS knobs don't apply).
 
 | Setting | Status | Description |
 |---------|--------|-------------|
-| `mssql_ctas_text_type` | **Active** | SQL type for text columns on `CREATE TABLE` (default `NVARCHAR(MAX)`); e.g. `'VARCHAR(64)'` for indexable string keys |
+| `mssql_mars` | **Active** | MARS mode: `auto` (default, per engine — off for Fabric/Synapse) \| `true` \| `false`. Resolved once at first connection — set **before** ATTACH |
+| `mssql_default_varchar_length` | **Active** | Length `n` for created text columns (`NVARCHAR(n)`/`VARCHAR(n)`); unset ⇒ `MAX`. Needed for indexable string keys |
+| `mssql_default_table_type` | **Active** | Created-table storage: `''` (rowstore) \| `clustered columnstore` (CCI, box/Azure; no-op on Fabric — columnstore already) |
+| `mssql_ctas_text_type` | **Active** | Whole-type override for text columns on CREATE/CTAS/COPY (e.g. `'VARCHAR(64)'`); wins over the collation choice + length |
 | `mssql_exec_invalidate_cache` | **Active** | Auto-invalidate the catalog cache after DDL run via `mssql_net_exec` (default `false`) |
 | `mssql_isolation_level` | **Active** | SQL transaction isolation level for table-in-out (`fn_each`) calls; overrides the ATTACH `isolation_level` per session (empty ⇒ provider default) |
 | `mssql_insert_batch_size`, `mssql_insert_max_rows_per_statement`, `mssql_insert_max_sql_bytes`, `mssql_insert_use_returning_output` | Accepted | Registered with defaults + `>= 1` validation; no-op (INSERT streams via SqlBulkCopy) |
@@ -466,9 +537,11 @@ the native extension's batching/pooling/TDS knobs don't apply).
 - **Bulk write:** INSERT/CTAS/COPY use `SqlBulkCopy` streamed over a bounded channel; INSERT enables
   `CheckConstraints` (CTAS/COPY do not). The native extension uses classic batched INSERT statements +
   TDS BCP.
-- **`uniqueidentifier` → `VARCHAR`** on reads (the native extension maps it to DuckDB `UUID`).
+- **Warehouse-aware:** detects a server profile and adapts (Fabric/Synapse connection mode, collation-driven
+  types, `NONCLUSTERED NOT ENFORCED` keys, clustered columnstore) — see
+  [Microsoft Fabric & Synapse](#microsoft-fabric--synapse-warehouse).
 - **ORDER BY pushdown** is always attempted when safe (the native extension gates it behind
-  `mssql_order_pushdown`, default off).
+  `mssql_order_pushdown`, default off); string keys push only under a binary collation.
 - **Callable functions / table-in-out / aggregates** (discovered UDFs, TVFs, procs + custom C#-authored
   scalar / table / table-in-out / **aggregate** functions, including `fn_each` per-row apply) are implemented
   here over Arrow — see [Callable Functions](#callable-functions). Load-time *global* (connection-free)
