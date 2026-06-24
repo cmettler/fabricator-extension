@@ -350,6 +350,17 @@ DROP SCHEMA mssql.staging;
 For SQL Server-specific features (IDENTITY, CHECK, indexes, FKs, non-literal DEFAULTs), use
 `mssql_net_exec`.
 
+### Temporary tables
+
+`CREATE TEMPORARY TABLE` is **not** mapped to SQL Server `#temp` tables — DuckDB routes every temp table to
+its own in-memory/spillable `temp` catalog and forbids qualifying one with an attached catalog (`TEMPORARY
+table names can only use the "temp" catalog`), so it never reaches the provider. Just use DuckDB's native temp
+tables for transient data (faster — no round-trip, no connection affinity). If you specifically need a
+*server-side* `#temp` (e.g. staging for a complex `EXEC`), create and use it via `mssql_net_exec` **inside a
+DuckDB `BEGIN`** so all calls share the one pinned connection — and only on a **MARS engine (box SQL Server)**:
+`#temp` tables are connection-scoped, so they don't survive across autocommit calls, and on Fabric/Synapse
+(MARS off → pooled reads) they aren't visible to subsequent statements.
+
 ## Function Reference
 
 ### `mssql_net_query(context, sql) -> TABLE`
