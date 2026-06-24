@@ -196,7 +196,13 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   entries replace the per-setting params. Trade-offs: boot the CLR at extension
   load (needed for `SET` before first ATTACH; aligns with Phase-3 load-time functions) + catalog/provider
   scope (not session-local). **Directly unblocks `mssql_default_varchar_length`** (C# reads the length from
-  `Settings`, no `begin_bulk`/`create_table` signature changes). Prerequisite for the 2nd provider.
+  `Settings`, no `begin_bulk`/`create_table` signature changes). Prerequisite for the 2nd provider. The same
+  provider-declared pattern extends to **secret fields** (declaration C++-hardcoded in `mssql_net_secret.cpp`,
+  but values already flow via `build_connection_string`) and **ATTACH options** (C++-hardcoded in
+  `mssql_net_storage.cpp`; pass the options map to `open_catalog`, move `schema_filter`/`table_filter`
+  filtering to C#, keep `PROVIDER`/`SECRET` as C++ meta-options) — **design:
+  [docs/provider-extensibility.md](docs/provider-extensibility.md)** (the unified "provider declares; core
+  stays name-agnostic" model; settings built, secrets + ATTACH to build with the DAX provider).
 
 ## Implementation status (current)
 
