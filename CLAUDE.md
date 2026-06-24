@@ -881,5 +881,9 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
 
 `mssql-extension` (C++ TDS — compat target; adapting permitted, it's the user's repo),
 `adbc_scanner` (Arrow→DuckDB ingestion pattern), `airport` (function-declaration pattern),
-`SqlServerFlights` (reusable C# SqlClient/DAX→Arrow), `ArrowSerializer` (POCO↔Arrow for Phase 3),
+`SqlServerFlights` (reusable C# SqlClient/DAX→Arrow; its `Airport/Data` `ArrowTypeConverter.cs`/`FlightField.cs`
+are the granular type-conversion reference — original SQL type + precision/scale/length carried on Arrow
+field metadata for precise + lossless round-trip, and Arrow extension names `arrow.bool8`/`arrow.uuid`/
+`arrow.json` to disambiguate same-storage types; see [docs/warehouse-support.md](docs/warehouse-support.md)
+§3.4 for the future type-mapping refinement), `ArrowSerializer` (POCO↔Arrow for Phase 3),
 `vgi` (source-available — never copy code, design patterns only).

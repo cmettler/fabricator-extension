@@ -149,6 +149,29 @@ confirmed). When true, map the Arrow JSON canonical extension type (and DuckDB's
 `JSON`. Otherwise fall back to `nvarchar(max)` / `varchar(max)`. One profile-gated branch, symmetric
 both directions.
 
+### 3.4 Granular type conversions (future refinement) — reuse the SqlServerFlights pattern
+
+Today `MapArrowToSqlType` switches on the Arrow `TypeId` alone — coarse (e.g. every string → `*(MAX)`,
+no UUID, no precise round-trip). The sibling repo's `D:\repos\SqlServerFlights\SqlServerFlights\Airport\Data`
+(`ArrowTypeConverter.cs`, `FlightField.cs`) is the granular reference (the user notes it's "ugly" but
+thorough — adapt the idea, not the code). Two techniques worth lifting:
+
+1. **Carry the original SQL type + precision/scale/length on the Arrow field METADATA** (`OrigDataType`,
+   `NumericPrecision`, `NumericScale`, `CharacterMaximumLength`, `DateTimePrecision`, `OrdinalPosition`).
+   On the read path the DuckDB type is then precise (e.g. `datetime2(p)` → the right `Timestamp` unit,
+   `decimal(p,s)`), and on write-back the exact SQL type can be regenerated **losslessly** (`OrigDataTypeSql`
+   rebuilds `decimal(p,s)` / `char(n)` / …). This is "put the original source datatype on the field metadata
+   in case it's needed later."
+2. **Use Arrow extension-type names to disambiguate same-storage types.** `FlightField.ToSql` matches on
+   `(ArrowType, extensionName)`: `arrow.bool8` (an `Int8` that is really a BIT) → `BIT` vs a plain `Int8` →
+   `TINYINT`; `arrow.uuid` (`FixedSizeBinary(16)`) → `UNIQUEIDENTIFIER`; `arrow.json` → the JSON path (§3.3).
+   Notably **`arrow.bool8` is exactly how you'd distinguish a bool-as-`Int8` from a real `TINYINT`** — the
+   ambiguity the lossless-boundary fix sidesteps by forcing standard Arrow (see CLAUDE.md "boundary uses
+   STANDARD encoding"); a marker is the alternative if rich types are ever wanted at the boundary.
+
+Relevance: this refines the warehouse type mapping (precise types), the §3.3 JSON gate (`arrow.json`), UUID
+support, and lossless round-trip for `ALTER`/CTAS — and would carry over to the DAX provider's own mapping.
+
 ## 4. Collation — the cross-stack problem
 
 **Collation is chosen at warehouse/lakehouse creation time** (Fabric defaults to
