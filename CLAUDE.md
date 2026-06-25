@@ -156,6 +156,31 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   unified the dispatch under `IBoundTable` (`table_bind`/`table_execute`/`table_close`); see the Phase 5
   section. The bespoke TVF could now fold into `IArrowTableFunction` (`table_execute` returns a stream) but
   needn't — the dispatch is already unified.
+- **Load-time global functions = the 4th provider-self-description capability** (design only; not built).
+  Today provider functions are **attach-time catalog-bound** (4e/4f/4g — resolved as `db.schema.fn`, dispatched
+  via the catalog `handle`). The deferred **Phase 3-A** alternative is **load-time global** functions
+  (connection-free, bare `fn(...)`, registered at `Extension::Load`). **This does NOT break the catalog-only
+  concept — the two are orthogonal scopes that coexist**: catalog-bound = needs an ATTACH'd catalog + its
+  connection (discovered SQL UDFs/procs/TVFs, custom fns using the catalog's SQL conn); global = connection-free
+  (`arrownet_delta_scan(path)`, future `arrownet_iceberg_scan`, lakehouse readers — they belong to no SQL Server
+  catalog). **The original objection has dissolved:** Phase 3 deferred global functions to avoid booting the CLR
+  at `Extension::Load()`, but the settings refactor (v33) + the fs/delta spike already boot the bridge
+  best-effort at load. So global functions are now the natural **4th member of the "provider declares; core
+  stays name-agnostic" family** (after settings v33 / ATTACH options v37 / secret fields v38): a
+  `list_global_functions(provider)` ABI at load → C++ registers each declared scalar/table function
+  **generically** (dispatch to C# by name/`decl_id`), the provider authoring them in C# with **zero per-function
+  C++**. `arrownet_delta_scan` is **already a global function** (bespoke `RegisterDeltaScan` in
+  `arrownet_delta.cpp`) — proof the scope exists. **Two wrinkles found while scoping the generic build (why it's
+  deferred until a 2nd lakehouse format/provider lands, not justified by one function):** (1) **arg-dependent
+  output schema** — a global table fn's columns depend on its args (delta's schema comes from the `path`), so the
+  generic registration must use the v27/v29 `table_bind`(args→schema+binding) shape, not the no-arg
+  `get_function_output_schema`; (2) **the opener vs SQL-connection split** — `table_bind`/`table_execute` pass the
+  **catalog handle** to C# (SQL fns use the catalog's `SqlConnection`), but `arrownet_delta_scan` needs the
+  **host-FS opener (ClientContext)** for IO, which that path doesn't thread through. So **"build the generic
+  global path" and "migrate delta onto it" are separable**: the generic path is cleanest for connection/
+  connstr-style global functions; **delta is better kept bespoke** (its host-FS-opener need is special) unless the
+  global table-fn bind/execute ABI gains an opener arg (SQL fns ignore it). Build it when the 2nd lakehouse
+  format/provider arrives; until then delta stays the hand-written ~60-line `arrownet_delta.cpp`.
 - **DAX / ADOMD 2nd provider** (the "one binary, many providers" goal) + the then-due generic rename
   (`arrownet_query`/`_exec`, catalog-type `"arrownet"`) + `BackendRegistry` multi-provider polish.
 - **Multi-edition support** (Synapse / Fabric Warehouse / Lakehouse SQL endpoint) — **design:
