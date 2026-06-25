@@ -35,18 +35,6 @@ internal sealed class DaxCatalog : IBackendCatalog
         _modelName = DiscoverModelNames()[0];
     }
 
-    /// <summary>Opens a fresh pooled ADOMD connection bound to this catalog's database (for scans, so a
-    /// long-running reader doesn't block metadata on the shared connection).</summary>
-    private AdomdConnection OpenScanConnection()
-    {
-        var conn = new AdomdConnection(_connectionString);
-        conn.Open();
-        if (_catalog != null)
-        {
-            conn.ChangeDatabase(_catalog);
-        }
-        return conn;
-    }
 
     // ---- metadata --------------------------------------------------------------------------------------
 
@@ -179,21 +167,23 @@ internal sealed class DaxCatalog : IBackendCatalog
     }
 
     /// <summary>
-    /// Materializes a DAX result and returns it as an in-memory Arrow stream. Uses
-    /// <see cref="AdomdDataAdapter"/>.Fill (a buffered read of the whole XMLA response) rather than the
-    /// streaming <see cref="AdomdDataReader"/>: under the in-process CoreCLR host the streaming reader fails
-    /// to parse the second rowset chunk of a multi-chunk response (AdomdUnknownResponseException in
-    /// XmlaClient.ReadEndElementS, once a result exceeds the first ~2048-row chunk). The schema (with exact
-    /// numeric precision/scale) is probed separately via a zero-row reader (a single-chunk response, which
-    /// the reader handles). DAX results are typically aggregated/modest, so full materialization is fine;
-    /// bounded-memory streaming is a future improvement (see docs/dax-provider.md).
+    /// Streams a DAX result lazily as Arrow (at most one batch buffered). The schema (with exact numeric
+    /// precision/scale) is resolved from a separate zero-row probe (<c>EVALUATE TOPN(0, …)</c>); the data
+    /// reader is then streamed via <see cref="DaxArrowStream"/> without ever calling <c>GetSchemaTable</c> on
+    /// it. The host pulls batches on demand and disposes the stream (and its connection) at scan teardown.
     /// </summary>
     private IArrowArrayStream ScanTableCore(string innerExpr)
     {
-        var conn = OpenScanConnection();
+        var conn = new AdomdConnection(_connectionString);
         try
         {
-            // 1) Schema (exact types incl. decimal precision/scale) from a zero-row probe — one chunk, safe.
+            conn.Open();
+            if (_catalog != null)
+            {
+                conn.ChangeDatabase(_catalog);
+            }
+
+            // Schema (exact types incl. decimal precision/scale) from a zero-row probe.
             Schema schema;
             using (var probe = conn.CreateCommand())
             {
@@ -202,7 +192,16 @@ internal sealed class DaxCatalog : IBackendCatalog
                 schema = ArrowSchemaFromReader(pr);
             }
 
-            // 2) Data via a buffered Fill into a DataTable (avoids the streaming-reader chunk bug).
+            // Data via AdomdDataAdapter.Fill — a single NON-CHUNKED fetch of the whole rowset, materialized
+            // into a DataTable. We deliberately do NOT use the streaming AdomdDataReader: its chunked-rowset
+            // protocol (the response is split into ~2048-row chunks the client reads on demand) is unreliable
+            // under the in-process CoreCLR host — reading the 2nd chunk raises AdomdUnknownResponseException
+            // ("the server sent an unrecognizable response"). Extensive investigation (docs/dax-provider.md)
+            // ruled out thread affinity, GC, pause-between-chunks, and query count individually, with
+            // contradictory results — i.e. the chunked reader is fragile here, while Fill (one whole-rowset
+            // response, no chunk continuations) is reliable. Trade-off: full materialization per scan (fine
+            // for typically-aggregated DAX results; true incremental streaming needs an out-of-process
+            // reader — the Airport model).
             var table = new System.Data.DataTable();
             using (var cmd = conn.CreateCommand())
             {
@@ -210,8 +209,6 @@ internal sealed class DaxCatalog : IBackendCatalog
                 using var adapter = new AdomdDataAdapter((AdomdCommand)cmd);
                 adapter.Fill(table);
             }
-
-            // 3) Build Arrow batches from the materialized DataTable (no ADOMD reads here — safe to chunk).
             return new InMemoryArrayStream(schema, BuildBatches(table, schema, batchSize: 2048));
         }
         finally
@@ -241,14 +238,7 @@ internal sealed class DaxCatalog : IBackendCatalog
                 for (int c = 0; c < ncols; c++)
                 {
                     var v = row[c];
-                    if (v is null or DBNull)
-                    {
-                        appenders[c].AppendNull();
-                    }
-                    else
-                    {
-                        appenders[c].Append(v);
-                    }
+                    if (v is null or DBNull) { appenders[c].AppendNull(); } else { appenders[c].Append(v); }
                 }
             }
             var arrays = new IArrowArray[ncols];

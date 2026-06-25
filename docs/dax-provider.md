@@ -99,19 +99,28 @@ which caps at 19.84.1) loads in net10 (win-x64), connects to local PBI Desktop, 
    (DAX has no general WHERE here) — the pushed filter is ignored and DuckDB re-applies it (never-erase: a
    superset is safe). Validated: full scan, projection, `WHERE`+`ORDER BY`+`LIMIT`, aggregation, exact
    `DECIMAL(38,2)` sums, `TIMESTAMP_MS` min, and `DESCRIBE` — all green against the live model.
-   - **CRITICAL FINDING — use `AdomdDataAdapter.Fill`, not the streaming `AdomdDataReader`.** Under the
-     in-process CoreCLR host, ADOMD's streaming reader **fails to parse the second rowset chunk** of a
-     multi-chunk response: `AdomdUnknownResponseException: "The server sent an unrecognizable response"` at
-     `XmlaClient.ReadEndElementS` → `EndRowsetResponseS`, once a result exceeds the first ~2048-row chunk
-     (small results / metadata work; `SELECT … LIMIT` that needs only the first chunk works). It is **not**
-     the batch boundary, the calling thread (a clean pool thread fails too), transport compression/format, or
-     globalization — a standalone console with the same package + data reads all chunks fine, so it's specific
-     to the hostfxr-hosted CLR. The fix: read the whole response **buffered** via `AdomdDataAdapter.Fill(DataTable)`
-     (materialize), then build Arrow from the `DataTable`. The exact schema (incl. decimal precision/scale) is
-     probed separately via a **zero-row reader** (`EVALUATE TOPN(0, <expr>)` — a single-chunk response the
-     reader handles). DAX results are typically aggregated/modest, so full materialization is acceptable;
-     bounded-memory streaming (e.g. server-side paging) is a future improvement. `DaxArrowStream` (the
-     interface-typed streaming reader) was removed once Fill replaced it.
+   - **CRITICAL FINDING — in-process, the DAX result must be read to completion before the host consumes any
+     of it (use `AdomdDataAdapter.Fill`, not the streaming reader).** Under the in-process CoreCLR host,
+     incremental streaming via `AdomdDataReader` **fails to parse the second rowset chunk** of a multi-chunk
+     (> ~2048-row) response: `AdomdUnknownResponseException: "The server sent an unrecognizable response"` at
+     `XmlaClient.ReadEndElementS` → `EndRowsetResponseS`. **Root cause (established by exhaustive testing):**
+     it is the **in-process interleaving of the host's Arrow C-Data-Interface consumption with the ADOMD
+     read** — every failure has the C++ side importing/releasing an Arrow batch while (or between) ADOMD chunk
+     reads; every success has the ADOMD read running **alone** to completion. Ruled out individually (with
+     contradictory pass/fail, i.e. it's the interleaving, not these): batch boundary, thread affinity (a
+     dedicated single-thread reader fails), GC mode, the pause between chunks (an unbounded continuous
+     producer fails), query-count-per-connection, and a second (metadata) connection (disposing it and
+     streaming on one connection still fails). A **standalone process** (a console with the same package +
+     data, AND the old Airport Flight server) streams all chunks fine — because there the Arrow **consumer is
+     a different process** (the Flight client / DuckDB), so the Arrow import never interleaves with the ADOMD
+     read in the reader's process. **In our in-process design the bridge exports the stream and DuckDB imports
+     it in the same process → interleaving → failure.** So it's a hosting-topology constraint, not a code
+     pattern. The reliable in-process path: `AdomdDataAdapter.Fill(DataTable)` — a single **non-chunked**
+     whole-rowset fetch (no chunk continuations to fail) — then build Arrow from the DataTable; the schema
+     (incl. decimal precision/scale) comes from a zero-row `EVALUATE TOPN(0, <expr>)` probe. **True incremental
+     streaming requires an out-of-process DAX reader** (the Airport model: a sidecar that reads ADOMD and
+     streams Arrow over IPC, keeping the Arrow consumption in the bridge/DuckDB process separate). Trade-off
+     of Fill: full materialization per scan — fine for typically-aggregated DAX, not ideal for huge raw scans.
 4. **`daxeval(expr, params)`** — `IArrowTableFunction.Bind` executes + reads `GetSchemaTable()` for the output
    schema (stashing the reader), streams rows in `Execute`.
 5. **`daxevaltable` / `daxapply` in-out** — `IArrowInOutFunction.DoExchange` (DATATABLE injection / per-row

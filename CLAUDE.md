@@ -203,12 +203,18 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   guessing; `DaxTypeMap` CLR→Arrow incl. `Decimal`→`Decimal128(p,s)`; `'T'[Col]`→`Col`); slice 3 = table
   scan via `EVALUATE SELECTCOLUMNS` projection (no filter pushdown — DuckDB re-filters), validated for
   full/projected scans, `WHERE`/`ORDER BY`/`LIMIT`, aggregation, exact decimals, `DESCRIBE`. **CRITICAL
-  ADOMD finding:** under the in-process CoreCLR host the streaming `AdomdDataReader` fails parsing the
-  **2nd rowset chunk** of a multi-chunk (>~2048-row) response (`AdomdUnknownResponseException` at
-  `XmlaClient.ReadEndElementS`; small/metadata/`LIMIT`-one-chunk reads work; NOT thread/transport/
-  globalization — a standalone console with the same package works). **Fix: read buffered via
-  `AdomdDataAdapter.Fill(DataTable)` + materialize**, schema probed via a zero-row `TOPN(0)` reader
-  (single chunk). Remaining slices (4 `daxeval`, 5 `daxevaltable`/
+  ADOMD finding (root-caused):** under the in-process CoreCLR host, incremental streaming via
+  `AdomdDataReader` fails parsing the **2nd rowset chunk** of a multi-chunk (>~2048-row) response
+  (`AdomdUnknownResponseException` at `XmlaClient.ReadEndElementS`). Cause = **in-process interleaving of the
+  host's Arrow C-Data-Interface consumption with the ADOMD read** (the bridge exports the stream + DuckDB
+  imports it in the SAME process). Ruled out (contradictory pass/fail): thread affinity (dedicated single
+  thread fails), GC, pause-between-chunks (unbounded continuous producer fails), query-count, 2nd connection
+  (disposing the metadata conn + one connection still fails). A **standalone process** (console + the same
+  package, AND the old Airport Flight server) streams fine — there the Arrow consumer is a DIFFERENT process,
+  so no interleaving. So it's hosting topology, not a code pattern. **Reliable in-process path:
+  `AdomdDataAdapter.Fill(DataTable)` (one NON-chunked whole-rowset fetch) + materialize**, schema from a
+  zero-row `TOPN(0)` probe. **True incremental streaming needs an out-of-process DAX sidecar** (Airport
+  model). Fill trade-off: full materialization per scan (fine for aggregated DAX, not huge raw scans). Remaining slices (4 `daxeval`, 5 `daxevaltable`/
   `daxapply` in-out, 6 Fabric token auth) in the doc. Then the **generic rename**
   (`arrownet_query`/`_exec`, catalog-type `"arrownet"`) + `BackendRegistry` multi-provider polish are due.
 - **Multi-edition support** (Synapse / Fabric Warehouse / Lakehouse SQL endpoint) — **design:
