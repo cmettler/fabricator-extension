@@ -1,0 +1,39 @@
+# name: test/verify_delta.test
+# description: arrownet_delta_scan reads a Delta Lake table via engineered-wood, IO through DuckDB's FileSystem
+#              reverse-callbacks (SPIKE — docs/filesystem-bridge.md). Fixture: test/fixtures/delta_simple
+#              (a delta-rs-written table, 10 rows id/name/amount). Set ARROWNET_DELTA_DIR to its absolute path.
+# group: [mssql_net]
+
+require mssql_net
+
+require-env ARROWNET_DELTA_DIR
+
+# Full scan: 10 rows, correct types resolved at bind via delta_schema.
+query III
+SELECT id, name, amount FROM arrownet_delta_scan('${ARROWNET_DELTA_DIR}') ORDER BY id;
+----
+1	row_1	1.5
+2	row_2	3.0
+3	row_3	4.5
+4	row_4	6.0
+5	row_5	7.5
+6	row_6	9.0
+7	row_7	10.5
+8	row_8	12.0
+9	row_9	13.5
+10	row_10	15.0
+
+# DuckDB applies projection / filter / aggregation above the materialized Arrow result.
+query IRT
+SELECT count(*), sum(amount), max(name)
+FROM arrownet_delta_scan('${ARROWNET_DELTA_DIR}') WHERE id > 7;
+----
+3	40.5	row_9
+
+# Bind resolves the schema (column names + types) without reading data.
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM arrownet_delta_scan('${ARROWNET_DELTA_DIR}')) ORDER BY column_name;
+----
+amount	DOUBLE
+id	BIGINT
+name	VARCHAR

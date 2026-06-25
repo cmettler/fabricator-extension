@@ -81,6 +81,51 @@ void HostFreeStr(char *str) {
 	free(str);
 }
 
+// Escape a path for a JSON string value (backslash + quote; control chars are not expected in paths).
+std::string JsonEscape(const std::string &s) {
+	std::string out;
+	out.reserve(s.size() + 8);
+	for (char c : s) {
+		if (c == '\\' || c == '"') {
+			out.push_back('\\');
+		}
+		out.push_back(c);
+	}
+	return out;
+}
+
+int32_t HostFsGlob(ArrowNetHandle opener, const char *pattern, char **out_json, char **err) {
+	try {
+		// Opener auto-pushed (OpenerFileSystem) — secrets resolve as a native read would.
+		auto *ctx = reinterpret_cast<ClientContext *>(opener);
+		auto &fs = FileSystem::GetFileSystem(*ctx);
+		auto files = fs.Glob(pattern);
+		std::string json = "[";
+		for (idx_t i = 0; i < files.size(); i++) {
+			const std::string &p = files[i].path;
+			int64_t size = -1;
+			try {
+				auto h = fs.OpenFile(p, FileOpenFlags::FILE_FLAGS_READ);
+				size = static_cast<int64_t>(h->GetFileSize());
+			} catch (...) {
+				size = -1; // best-effort; the managed side falls back to a size query if it needs one
+			}
+			if (i) {
+				json += ",";
+			}
+			json += "{\"path\":\"" + JsonEscape(p) + "\",\"size\":" + std::to_string(size) + "}";
+		}
+		json += "]";
+		*out_json = DupErr(json);
+		return ARROWNET_OK;
+	} catch (std::exception &e) {
+		if (err) {
+			*err = DupErr(e.what());
+		}
+		return 1;
+	}
+}
+
 void InstallHostFsServices() {
 	ArrowNetHostServices services {};
 	services.abi_version = ARROWNET_ABI_VERSION;
@@ -89,6 +134,7 @@ void InstallHostFsServices() {
 	services.fs_read = HostFsRead;
 	services.fs_close = HostFsClose;
 	services.free_str = HostFreeStr;
+	services.fs_glob = HostFsGlob;
 	arrownet::SetHostServices(services);
 }
 

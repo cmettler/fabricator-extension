@@ -165,6 +165,11 @@ public unsafe struct ArrowNetVTable
 
     // SPIKE: int32 fs_spike(void* opener, const char* path, char** out, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte*, byte**, byte**, int> FsSpike;
+
+    // int32 delta_schema(void* opener, const char* path, ArrowSchema* out, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte*, CArrowSchema*, byte**, int> DeltaSchema;
+    // int32 delta_scan(void* opener, const char* path, ArrowArrayStream* out, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte*, CArrowArrayStream*, byte**, int> DeltaScan;
 }
 
 /// <summary>
@@ -186,6 +191,8 @@ public unsafe struct ArrowNetHostServices
     public delegate* unmanaged[Cdecl]<nint, void> FsClose;
     // void free_str(char* str)
     public delegate* unmanaged[Cdecl]<byte*, void> FreeStr;
+    // int32 fs_glob(void* opener, const char* pattern, char** out_json, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte*, byte**, byte**, int> FsGlob;
 }
 
 /// <summary>Mirrors <c>ArrowNetAlterKind</c> in abi.h.</summary>

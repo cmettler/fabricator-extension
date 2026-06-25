@@ -20,4 +20,11 @@
     <PackageReference Include="Apache.Arrow" Version="23.0.0" />
   </ItemGroup>
 
+  <!-- Lakehouse (Delta) reader: Curt Hagenlocher's engineered-wood (pure C#), IO delegated to DuckDB's
+       FileSystem via the host reverse-callbacks. Sibling repo at D:\repos\engineered-wood (Apache.Arrow 23.0.0
+       aligned, net10.0). SPIKE — see docs/filesystem-bridge.md. -->
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\engineered-wood\src\EngineeredWood.DeltaLake.Table\EngineeredWood.DeltaLake.Table.csproj" />
+  </ItemGroup>
+
 </Project>

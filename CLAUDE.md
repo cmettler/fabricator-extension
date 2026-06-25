@@ -847,7 +847,22 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v40** (v40 = filesystem reverse-callback SPIKE/foundation: a new `ArrowNetHostServices`
+- **Current version: ABI v41** (v41 = the **Delta lakehouse reader on the filesystem bridge** SPIKE: appended
+  `delta_schema`/`delta_scan` to the vtable + `fs_glob` to `ArrowNetHostServices`. `arrownet_delta_scan(path)`
+  reads a Delta Lake table via **engineered-wood** (Curt Hagenlocher's pure-C# Delta), with ALL IO through
+  DuckDB's `FileSystem` over the host callbacks — so local/`az://`/`s3://`/`https://` + DuckDB secrets all work.
+  C# `DuckDbTableFileSystem : ITableFileSystem` (root-relative paths, read-only) + `DuckDbRandomAccessFile` over
+  the callbacks; `DeltaReader` = `delta_schema` (bind, `OpenAsync().ArrowSchema`, no data) + `delta_scan`
+  (execute, `ReadAllAsync()` **materialized** into an `InMemoryArrayStream` while the opener is valid); C++
+  `arrownet_delta.cpp` binds via `DeltaSchema`+`ReadArrowSchema`, scans via `DeltaScan`+`ArrowStreamReader`.
+  DuckDB applies projection/filter/aggregation above the scan. engineered-wood is referenced from
+  `ArrowNet.Bridge` (sibling repo `D:\repos\engineered-wood`, **Apache.Arrow 23.0.0 aligned**, net10.0) +
+  published transitively. **One local engineered-wood patch:** `ActionSerializer` read optional `add`/`remove`
+  numeric fields (`baseRowId`/`defaultRowCommitVersion`/remove `size`/`deletionTimestamp` — the **Delta
+  row-tracking** fields) with a bare `GetInt64()` that throws on delta-rs's explicit `"field":null`; guarded with
+  `TokenType==Null?null:GetInt64()`. Validated: `test/verify_delta.test` (39 — fixture `test/fixtures/delta_simple`,
+  a delta-rs 10-row table; full scan + filter/aggregate + DESCRIBE + join). SPIKE, not a user feature. See
+  [docs/filesystem-bridge.md](docs/filesystem-bridge.md). v40 = filesystem reverse-callback SPIKE/foundation: a new `ArrowNetHostServices`
   struct (host→managed function pointers: `fs_open_read`/`fs_size`/`fs_read`/`fs_close`/`free_str`) is passed
   to `Bootstrap.Initialize(vtable, size, host)` so the managed side can call back into DuckDB's `FileSystem`
   (secret-backed remote IO via DuckDB), plus an `fs_spike` vtable entry + `arrownet_fs_spike(path)` table fn

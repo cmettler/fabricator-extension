@@ -978,4 +978,28 @@ std::string FsSpike(ArrowNetHandle opener, const std::string &path) {
 	return result;
 }
 
+void DeltaSchema(ArrowNetHandle opener, const std::string &path, ArrowSchema &out) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.delta_schema) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide delta_schema");
+	}
+	char *err = nullptr;
+	int32_t rc = vt.delta_schema(opener, path.c_str(), &out, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: delta_schema failed");
+	}
+}
+
+void DeltaScan(ArrowNetHandle opener, const std::string &path, ArrowArrayStream &out) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.delta_scan) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide delta_scan");
+	}
+	char *err = nullptr;
+	int32_t rc = vt.delta_scan(opener, path.c_str(), &out, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: delta_scan failed");
+	}
+}
+
 } // namespace arrownet

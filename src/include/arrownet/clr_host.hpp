@@ -40,6 +40,12 @@ void SetHostServices(const ArrowNetHostServices &services);
 // resolution) and return a short human-readable result (head/tail bytes + size). Proves C#->host FS reads.
 std::string FsSpike(ArrowNetHandle opener, const std::string &path);
 
+// Delta lakehouse reads (engineered-wood, IO via the host FileSystem callbacks). `opener` = the calling
+// operator's ClientContext (secret resolution + FileSystem). DeltaSchema fills `out` with the table's Arrow
+// schema only; DeltaScan reads the whole table into `out` (materialized during the call). Both throw on error.
+void DeltaSchema(ArrowNetHandle opener, const std::string &path, ArrowSchema &out);
+void DeltaScan(ArrowNetHandle opener, const std::string &path, ArrowArrayStream &out);
+
 // -----------------------------------------------------------------------------
 // Convenience wrappers over the vtable. Each throws duckdb::IOException carrying
 // the managed error message (and releases it via free_error) on failure.

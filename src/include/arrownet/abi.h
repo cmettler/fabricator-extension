@@ -556,6 +556,18 @@ typedef struct ArrowNetVTable {
 	// freed via free_error). Proves C#->host FileSystem reads + opener/secret threading work end-to-end.
 	// -------------------------------------------------------------------------
 	int32_t (*fs_spike)(ArrowNetHandle opener, const char *path, char **out, char **err);
+
+	// -------------------------------------------------------------------------
+	// Lakehouse (Delta) — managed reader over the host FileSystem callbacks (engineered-wood). `opener` is
+	// the calling operator's ClientContext (carries secret resolution + the FileSystem the managed
+	// DuckDbTableFileSystem reads through). `path` is the Delta table root (any DuckDB-resolvable path:
+	// local, az://, s3://, https://).
+	// -------------------------------------------------------------------------
+	// delta_schema: open the Delta table at `path` and fill *out with its Arrow schema only (no data read).
+	int32_t (*delta_schema)(ArrowNetHandle opener, const char *path, struct ArrowSchema *out, char **err);
+	// delta_scan: open + read the Delta table at `path`, returning all record batches as *out (materialized
+	// in managed memory during this synchronous call — the opener need only stay valid until it returns).
+	int32_t (*delta_scan)(ArrowNetHandle opener, const char *path, struct ArrowArrayStream *out, char **err);
 } ArrowNetVTable;
 
 // -----------------------------------------------------------------------------
@@ -581,13 +593,17 @@ typedef struct ArrowNetHostServices {
 	void (*fs_close)(ArrowNetHandle file);
 	// Free an error string returned by the fs_* callbacks above.
 	void (*free_str)(char *str);
+	// Glob `pattern` (DuckDB glob, e.g. "<root>/_delta_log/*") via DuckDB's FileSystem (opener resolves
+	// secrets). *out_json receives an owned UTF-8 JSON array of {"path":<string>,"size":<int64>} (freed via
+	// free_str). Used by the managed lakehouse filesystem's directory listing.
+	int32_t (*fs_glob)(ArrowNetHandle opener, const char *pattern, char **out_json, char **err);
 } ArrowNetHostServices;
 
 // Max serialized size of a spillable aggregate's per-group state (the inline, pointer-free
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 40
+#define ARROWNET_ABI_VERSION 41
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

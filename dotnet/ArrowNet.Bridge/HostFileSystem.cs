@@ -74,6 +74,36 @@ internal static unsafe class HostFs
         }
     }
 
+    /// <summary>True once the host registered the glob callback (needed for directory listing).</summary>
+    public static bool CanGlob => _set && _h.FsGlob != null;
+
+    /// <summary>Globs <paramref name="pattern"/> (DuckDB glob) via DuckDB's FileSystem; returns the raw JSON
+    /// array of <c>{"path":..,"size":..}</c> the host produced (caller parses).</summary>
+    public static string Glob(nint opener, string pattern)
+    {
+        var patPtr = Marshal.StringToCoTaskMemUTF8(pattern);
+        try
+        {
+            byte* err = null;
+            byte* outJson = null;
+            int rc = _h.FsGlob(opener, (byte*)patPtr, &outJson, &err);
+            if (rc != 0)
+            {
+                throw HostError("fs_glob", err);
+            }
+            var json = Marshal.PtrToStringUTF8((nint)outJson) ?? "[]";
+            if (outJson != null && _h.FreeStr != null)
+            {
+                _h.FreeStr(outJson);
+            }
+            return json;
+        }
+        finally
+        {
+            Marshal.FreeCoTaskMem(patPtr);
+        }
+    }
+
     private static Exception HostError(string op, byte* err)
     {
         var msg = Marshal.PtrToStringUTF8((nint)err) ?? string.Empty;

@@ -15,6 +15,7 @@
 #include "copy/mssql_net_copy.hpp"
 #include "arrownet_optimizer.hpp"
 #include "arrownet_fs_spike.hpp"
+#include "arrownet_delta.hpp"
 #include "mssql_net_secret.hpp"
 #include "mssql_net_storage.hpp"
 #include "duckdb/function/function_set.hpp"
@@ -394,6 +395,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// SPIKE: install the host FileSystem callbacks FIRST (before any bridge boot) + register
 	// arrownet_fs_spike(path). Foundation for a managed lakehouse reader doing secret-backed remote IO.
 	RegisterFsSpike(loader);
+	// arrownet_delta_scan(path) — a managed (engineered-wood) Delta reader, IO via the host FileSystem.
+	RegisterDeltaScan(loader);
 	// CREATE SECRET ... (TYPE mssql_net, host '...', ...) — secret type(s) + fields declared in C#
 	RegisterProviderSecrets(loader);
 	// ATTACH '<connstr>' AS db (TYPE mssql_net) — or ATTACH '' (TYPE mssql_net, SECRET name)

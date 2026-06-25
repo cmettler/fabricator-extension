@@ -33,7 +33,7 @@ public static unsafe class Bootstrap
             HostFs.Set(*host);
         }
 
-        vtable->AbiVersion = 40;
+        vtable->AbiVersion = 41;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -81,6 +81,8 @@ public static unsafe class Bootstrap
         vtable->SetActiveTxn = &SetActiveTxn;
         vtable->ListSecretFields = &ListSecretFields;
         vtable->FsSpike = &FsSpike;
+        vtable->DeltaSchema = &DeltaSchema;
+        vtable->DeltaScan = &DeltaScan;
         return ArrowNetStatus.Ok;
     }
 
@@ -479,6 +481,48 @@ public static unsafe class Bootstrap
             var p = Marshal.PtrToStringUTF8((nint)path) ?? string.Empty;
             var result = HostFileSystemSpike.Run(opener, p);
             *outResult = (byte*)Marshal.StringToCoTaskMemUTF8(result); // host frees via free_error
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int DeltaSchema(nint opener, byte* path, CArrowSchema* outSchema, byte** err)
+    {
+        try
+        {
+            if (outSchema is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            var p = Marshal.PtrToStringUTF8((nint)path) ?? string.Empty;
+            CArrowSchemaExporter.ExportSchema(DeltaReader.GetSchema(opener, p), outSchema);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int DeltaScan(nint opener, byte* path, CArrowArrayStream* outStream, byte** err)
+    {
+        try
+        {
+            if (outStream is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            var p = Marshal.PtrToStringUTF8((nint)path) ?? string.Empty;
+            // Materialize the whole table while the opener is valid (synchronous call).
+            var stream = DeltaReader.Scan(opener, p);
+            CArrowArrayStreamExporter.ExportArrayStream(stream, outStream);
             return ArrowNetStatus.Ok;
         }
         catch (Exception ex)

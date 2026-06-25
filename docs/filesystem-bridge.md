@@ -1,9 +1,10 @@
-# Host FileSystem bridge — reverse callbacks (SPIKE / foundation)
+# Host FileSystem bridge — reverse callbacks + Delta reader (SPIKE / foundation)
 
-> Status: **spike, validated** (ABI v40). Proves a managed component can do **secret-backed remote IO via
-> DuckDB's `FileSystem`** — the foundation for a future C# lakehouse-format provider (e.g. Curt Hagenlocher's
-> *engineered-wood*: Delta/Iceberg/Lance/ORC/Avro readers in pure C#) that reuses DuckDB's filesystem +
-> secrets instead of shipping its own cloud SDK filesystems. Not a user feature yet.
+> Status: **spike, validated** (ABI v41). Proves a managed component can do **secret-backed remote IO via
+> DuckDB's `FileSystem`** AND, on top of it, that **Curt Hagenlocher's *engineered-wood* (pure-C# Delta Lake)
+> reads a real Delta table through that bridge**, surfaced as Arrow → DuckDB. The foundation for a C#
+> lakehouse-format provider (Delta/Iceberg/Lance/ORC/Avro) that reuses DuckDB's filesystem + secrets instead
+> of shipping its own cloud SDK filesystems. Not a user feature yet.
 
 ## Why
 
@@ -54,17 +55,52 @@ opener — and azure-secret resolution itself is already validated, see provider
 only piece not directly smoke-tested is a live `az://` blob (no blob store + file handy), but it shares the
 proven code path.
 
+## Delta reader on the bridge — `arrownet_delta_scan(path)` (BUILT, validated)
+
+`arrownet_delta_scan('<delta table root>')` reads a Delta Lake table via engineered-wood, with **all IO going
+through DuckDB's FileSystem** over the host callbacks — so local, `az://`, `s3://`, `https://` paths and DuckDB
+secrets all work, one auth config shared with native reads.
+
+- **`HostFs.fs_glob`** added to `ArrowNetHostServices` (DuckDB `FileSystem::Glob` → JSON `[{path,size}]`) — the
+  directory listing engineered-wood needs to enumerate `_delta_log/`.
+- **C# `DuckDbTableFileSystem : ITableFileSystem`** + `DuckDbRandomAccessFile : IRandomAccessFile`
+  (`DuckDbTableFileSystem.cs`) — read-only, over the host callbacks. Paths are root-relative (matching
+  `LocalTableFileSystem`): `ListAsync` returns paths relative to the table root, re-resolved by
+  `OpenReadAsync`/`ReadAllBytesAsync`. Write methods throw. Reads are synchronous host calls in completed
+  `ValueTask`s (the hostfxr CLR has no `SynchronizationContext`, so engineered-wood's `await` upstream can't
+  deadlock).
+- **`DeltaReader`** (`DeltaReader.cs`): `delta_schema` (bind) = `DeltaTable.OpenAsync(fs).ArrowSchema` (no data
+  read); `delta_scan` (execute) = `OpenAsync` + `ReadAllAsync()` **materialized** into an `InMemoryArrayStream`
+  (all host IO happens while the opener/ClientContext is valid — the opener need not outlive the call).
+- **C++ `arrownet_delta_scan`** (`arrownet_delta.cpp`): bind → `DeltaSchema` → `ReadArrowSchema` → return
+  types; init_global → `DeltaScan` → `ArrowStreamReader`; scan → `Read()` per chunk. DuckDB applies
+  projection/filter/aggregation above the scan.
+- **engineered-wood patch (local clone):** `ActionSerializer` read optional `add`/`remove` numeric fields
+  (`baseRowId`, `defaultRowCommitVersion`, remove `size`/`deletionTimestamp`) with a bare `GetInt64()`, which
+  throws on delta-rs's explicit `"field":null` (engineered-wood's own writer omits them). Guarded with
+  `TokenType == Null ? null : GetInt64()` — an upstream-worthy robustness fix for reading delta-rs tables.
+
+**Validated** (`test/verify_delta.test`, 39 assertions; fixture `test/fixtures/delta_simple`, a delta-rs table
+of 10 rows id/name/amount): full scan with correct bind-time types, filter+aggregate pushed by DuckDB above
+the scan, `DESCRIBE` schema, and joins against a values table — all green. The Apache.Arrow version is aligned
+(engineered-wood + the bridge both **23.0.0**, both net10.0).
+
 ## Next (a real lakehouse provider — not built)
 
-- Promote the spike surface to a stable `IArrowFileSystem` host-callback set (open/read/size/glob/exists/
-  delete/move) — Glob → `ITableFileSystem.ListAsync`, etc. (the 1:1 mapping in the discussion).
-- A C# `DuckDbTableFileSystem : ITableFileSystem` delegating to those callbacks.
-- An `arrownet` lakehouse provider: a table function that reads Delta/Iceberg/Lance/… via engineered-wood,
-  IO through DuckDB's FileSystem, results as Arrow → DuckDB. Start with **Delta** as the first format.
+- **Streaming** (not materialized): `delta_scan` currently buffers the whole table; wrap `ReadAllAsync` as a
+  lazy `IArrowArrayStream` whose `get_next` pulls a batch at a time. The opener must then stay valid across
+  the scan (it does — the ClientContext lives for the whole table-function execution).
+- **Predicate / projection pushdown into Delta** (file skipping): engineered-wood's `ReadAllAsync(columns,
+  Predicate)` prunes files by partition values + column stats. Forward the scan's `spec_json`/`filter_values`
+  (as the TVF path already does) into a Delta `Predicate` + column list.
+- **More formats / a provider surface**: Iceberg/Lance/… via engineered-wood; promote `arrownet_delta_scan` to
+  a provider-style `ATTACH`-able lakehouse catalog. The reverse-callback set is already general (open/read/
+  size/close/glob).
 - Watch: don't double-coalesce (httpfs vs engineered-wood's `CoalescingFileReader`); buffer-copy at the
   boundary is network-dominated but measure for many-small-metadata-read patterns.
 
 ## ABI
 
 v40 appended `fs_spike` to the vtable + introduced `ArrowNetHostServices` (passed to `Bootstrap.Initialize`,
-which gained the `host` param). Both are spike surface; the host-services struct is the reusable foundation.
+which gained the `host` param). **v41** appended `delta_schema`/`delta_scan` to the vtable and `fs_glob` to
+`ArrowNetHostServices`. All spike surface; the host-services struct is the reusable foundation.
