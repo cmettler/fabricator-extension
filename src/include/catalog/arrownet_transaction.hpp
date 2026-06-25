@@ -17,6 +17,11 @@ namespace duckdb {
 class ArrowNetTransaction : public Transaction {
 public:
 	ArrowNetTransaction(TransactionManager &manager, ClientContext &context);
+
+	// The DuckDB transaction id (global_transaction_id), captured at StartTransaction. Used to key the
+	// managed backend's per-transaction provider connection, and to tell the backend which transaction to
+	// commit/roll back (RollbackTransaction has no ClientContext to re-derive it from).
+	int64_t txn_id_ = 0;
 };
 
 class ArrowNetTransactionManager : public TransactionManager {

@@ -14,6 +14,7 @@
 #include "duckdb/function/copy_function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 
@@ -136,8 +137,8 @@ static unique_ptr<GlobalFunctionData> CopyToInitGlobal(ClientContext &context, F
 	auto *stream = gstate->producer->Stream();
 	stream->get_schema(stream, &schema);
 	gstate->bulk_session = arrownet::BeginBulk(bind_data.handle, bind_data.schema_name, bind_data.table_name,
-	                                           bind_data.create_table, bind_data.replace,
-	                                           /*check_constraints=*/false, schema);
+	                                           bind_data.create_table, bind_data.replace, /*check_constraints=*/false,
+	                                           (int64_t)context.ActiveTransaction().global_transaction_id, schema);
 	return std::move(gstate);
 }
 

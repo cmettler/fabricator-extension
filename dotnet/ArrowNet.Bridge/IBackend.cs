@@ -85,7 +85,7 @@ public interface IBackendCatalog : IDisposable
     /// rows written. This is the provider-specific bulk path (e.g. SqlBulkCopy).
     /// </summary>
     long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable, bool replace,
-                    bool checkConstraints);
+                    bool checkConstraints, long txnId);
 
     /// <summary>
     /// rowid-based DELETE. <paramref name="keys"/> columns (named by Arrow field)

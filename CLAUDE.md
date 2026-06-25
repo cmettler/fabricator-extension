@@ -296,6 +296,22 @@ Implemented and verified:
   connection-pin on first write; MetaTransaction fan-out + one-writer rule; why MARS, and the exchange's
   deliberately MARS-free serialized connection; the `INSERT…SELECT` pin-timing race; per-row proc `_each`
   on DuckDB's pinned txn).
+  - **Per-DuckDB-transaction connections (write concurrency, ABI v35) — DONE + validated.** The pinned
+    connection is now **per `global_transaction_id`**, not a single shared one: C# keys connection state by a
+    `ConcurrentDictionary<long, TxnState>`, and the active id rides a per-thread `AmbientTransaction` set by a
+    new `set_active_txn(handle, txn_id)` ABI entry that the host calls immediately before each
+    connection-using call (same thread, synchronous); `begin_bulk`'s old `autocommit` arg became `txn_id`
+    (the bulk runs on a background thread so the id is captured + re-established by the consumer). C++ sources
+    `MetaTransaction::Get(context).global_transaction_id` (`ArrowNetTransaction::txn_id_` for lifecycle;
+    `arrow_ingest` `ArrowStreamInitGlobal` centrally for all scans/read-your-writes; the DDL/DML/exchange/
+    `FetchTableColumns`/`mssql_net_exec` callsites via `catalog/arrownet_txn_util.hpp`'s `ArrowNetSetActiveTxn`).
+    So concurrent DuckDB transactions (e.g. **dbt `--threads N`** building several models at once) each get
+    their OWN provider connection instead of colliding on one non-thread-safe `SqlConnection` (was error
+    **595**). Matches the native `mssql-extension`'s per-`MSSQLTransaction` connection. **Validated: `dbt run
+    --threads 4` PASS=4/4 on box (4×200k concurrent CTAS) AND Fabric (no MARS); `verify_*` 30/30.** Design +
+    the abandoned Option A (dbt uses explicit txns, not autocommit — so an autocommit-detection fix never
+    fired): [docs/transaction-concurrency.md](docs/transaction-concurrency.md). Harness:
+    `dbt_mssql_test/` (gitignored).
 - **Functions**: `mssql_net_query` (raw scan), `mssql_net_exec` (raw exec) — both accept a connstr, a
   secret name, OR an attached-catalog name; `mssql_refresh_cache`/`mssql_invalidate_cache` (+ `_net_`
   aliases, arities 1/2/3); `mssql_version()`; `arrownet_managed_dir()` / `arrownet_test_scan()` /
@@ -803,7 +819,12 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v32** (v32 changed `get_function_param_schema`/`get_function_return_schema`/
+- **Current version: ABI v35** (v35 = the write-concurrency fix: `begin_bulk`'s `autocommit` int32 arg became
+  `int64 txn_id`, and one new entry `set_active_txn(handle, txn_id)` was appended — the host sets the active
+  DuckDB `global_transaction_id` so the managed side keys a per-transaction provider connection; see the
+  "Per-DuckDB-transaction connections" bullet under Transactions + [docs/transaction-concurrency.md](docs/transaction-concurrency.md).
+  v33/v34 = the settings refactor: v33 added `list_settings` + `set_setting`; v34 dropped `create_table`'s
+  `text_type` param. v32 changed `get_function_param_schema`/`get_function_return_schema`/
   `get_function_output_schema` to fill a bare `ArrowSchema *out` instead of an `ArrowArrayStream *out` — they
   are schema-only, so the zero-row-stream-carrying-a-schema is gone; C# returns `Schema`, C++ reads it via
   the new `ReadArrowSchema` (sharing a `ReadSchemaColumns` core with `PopulateReturnSchema`). A signature

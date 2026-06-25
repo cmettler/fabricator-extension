@@ -20,6 +20,7 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -333,6 +334,12 @@ static void MssqlNetExecFunction(DataChunk &args, ExpressionState &state, Vector
 		auto handle = ResolveConnection(context, conn_name, owns);
 		bool schema_may_change = false;
 		try {
+			// mssql_net_exec is a raw passthrough that autocommits (txn 0 => its own connection), matching the
+			// native mssql_exec. It takes the target as a STRING arg, so DuckDB never registers that catalog as
+			// touched by this statement => its transaction manager's StartTransaction/CommitTransaction don't
+			// fire; keying the write to the active txn id would open a per-transaction connection that nothing
+			// ever commits (it would roll back at teardown). So force autocommit regardless of target.
+			arrownet::SetActiveTxn(handle, 0);
 			result_data[i] = arrownet::ExecuteDml(handle, StringValue::Get(sql_value), &schema_may_change);
 		} catch (...) {
 			if (owns) {

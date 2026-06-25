@@ -9,6 +9,7 @@
 #include "arrownet/clr_host.hpp"
 #include "catalog/arrownet_catalog.hpp"
 #include "catalog/arrownet_metadata.hpp"
+#include "catalog/arrownet_txn_util.hpp"
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/enums/operator_result_type.hpp"
@@ -1106,6 +1107,11 @@ unique_ptr<GlobalTableFunctionState> ArrowNetExchangeInitGlobal(ClientContext &c
 
 	ArrowArrayStream output_stream;
 	std::memset(&output_stream, 0, sizeof(output_stream));
+	// A proc `_each` runs its per-row EXEC on DuckDB's pinned write connection (BeginWrite), so the binding
+	// must see this transaction's id when it opens that connection (read-your-writes + commit/rollback with
+	// DuckDB's transaction). The id rides the per-thread ambient; also re-set in the Execute function (the
+	// connection is opened lazily on the first output pull there). See docs/transaction-concurrency.md.
+	ArrowNetSetActiveTxn(nullptr, context);
 	arrownet::InOutExchangeOpen(bind.holder->binding, input_stream, bind.isolation, output_stream);
 	gstate->reader = make_uniq<arrownet::ArrowStreamReader>(context, output_stream);
 
@@ -1127,6 +1133,10 @@ OperatorResultType ArrowNetExchangeFunction(ExecutionContext &context, TableFunc
 	auto &bind = data.bind_data->Cast<ArrowNetExchangeBindData>();
 	auto &g = data.global_state->Cast<ArrowNetExchangeGlobalState>();
 	auto &l = data.local_state->Cast<ArrowNetExchangeLocalState>();
+	// A proc `_each` opens its pinned write connection (BeginWrite) lazily on the first output pull below,
+	// which runs on THIS thread — so set the active transaction id here so it joins DuckDB's transaction
+	// (read-your-writes + commit/rollback with DuckDB). Harmless for a TVF `_each` (its own read connection).
+	ArrowNetSetActiveTxn(nullptr, context.client);
 	try {
 		if (!l.owns_gate) {
 			if (input.size() == 0) {
@@ -1553,6 +1563,7 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::CreateTable(CatalogTransaction t
 	}
 	auto &context = *transaction.context;
 	auto &base = info.Base();
+	ArrowNetSetActiveTxn(handle_, context); // CREATE (+ optional DROP for REPLACE) joins this txn's connection
 
 	// Column names + types, and per-column nullability (NOT NULL constraints).
 	vector<string> names;
@@ -1698,6 +1709,7 @@ void ArrowNetSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 		                              CatalogTypeToString(info.type));
 	}
 	bool if_exists = info.if_not_found == OnEntryNotFound::RETURN_NULL;
+	ArrowNetSetActiveTxn(handle_, context);
 	arrownet::DropTable(handle_, name, info.name, if_exists);
 
 	lock_guard<mutex> lock(entry_lock_);
@@ -1712,6 +1724,7 @@ void ArrowNetSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info)
 		throw InternalException("mssql_net: ALTER TABLE requires a client context");
 	}
 	auto &context = *transaction.context;
+	ArrowNetSetActiveTxn(handle_, context); // every ALTER below joins this txn's connection
 	auto &table_info = info.Cast<AlterTableInfo>();
 	const string &table = table_info.name;
 

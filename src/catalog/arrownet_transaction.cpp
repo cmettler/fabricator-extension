@@ -5,6 +5,7 @@
 #include "catalog/arrownet_transaction.hpp"
 
 #include "arrownet/clr_host.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 
 namespace duckdb {
 
@@ -19,14 +20,18 @@ ArrowNetTransactionManager::ArrowNetTransactionManager(AttachedDatabase &db, Arr
 Transaction &ArrowNetTransactionManager::StartTransaction(ClientContext &context) {
 	auto transaction = make_uniq<ArrowNetTransaction>(*this, context);
 	auto &result = *transaction;
+	// Capture the DuckDB transaction id so all of this transaction's writes/reads on the backend key the
+	// SAME per-transaction provider connection (and so commit/rollback target it). Distinct concurrent
+	// transactions (e.g. dbt --threads N) get distinct ids => distinct connections.
+	result.txn_id_ = (int64_t)MetaTransaction::Get(context).global_transaction_id;
 	{
 		lock_guard<mutex> lock(transaction_lock);
 		transactions[result] = std::move(transaction);
 	}
-	// Enter transaction mode on the backend; the provider transaction is pinned
-	// lazily on the first write. Best-effort: a failure here must not abort the
-	// statement (writes would then fail loudly on their own).
+	// Enter transaction mode on the backend; the provider connection is pinned lazily on the first write,
+	// keyed by the active transaction id. Best-effort: a failure here must not abort the statement.
 	try {
+		arrownet::SetActiveTxn(handle_, result.txn_id_);
 		arrownet::BeginTransaction(handle_);
 	} catch (...) {
 	}
@@ -34,11 +39,13 @@ Transaction &ArrowNetTransactionManager::StartTransaction(ClientContext &context
 }
 
 ErrorData ArrowNetTransactionManager::CommitTransaction(ClientContext &context, Transaction &transaction) {
+	auto txn_id = transaction.Cast<ArrowNetTransaction>().txn_id_;
 	{
 		lock_guard<mutex> lock(transaction_lock);
 		transactions.erase(transaction);
 	}
 	try {
+		arrownet::SetActiveTxn(handle_, txn_id);
 		arrownet::CommitTransaction(handle_);
 	} catch (std::exception &ex) {
 		return ErrorData(ex);
@@ -47,11 +54,13 @@ ErrorData ArrowNetTransactionManager::CommitTransaction(ClientContext &context, 
 }
 
 void ArrowNetTransactionManager::RollbackTransaction(Transaction &transaction) {
+	auto txn_id = transaction.Cast<ArrowNetTransaction>().txn_id_;
 	{
 		lock_guard<mutex> lock(transaction_lock);
 		transactions.erase(transaction);
 	}
 	try {
+		arrownet::SetActiveTxn(handle_, txn_id);
 		arrownet::RollbackTransaction(handle_);
 	} catch (...) {
 		// best-effort: never throw out of rollback

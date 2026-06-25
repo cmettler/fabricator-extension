@@ -5,11 +5,13 @@
 #include "arrownet/arrow_ingest.hpp"
 
 #include "arrownet/arrow_produce.hpp"
+#include "arrownet/clr_host.hpp"
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 
 #include <algorithm>
 #include <mutex>
@@ -332,6 +334,12 @@ unique_ptr<GlobalTableFunctionState> ArrowStreamInitGlobal(ClientContext &contex
 			request.filter_values = value_producer->Stream();
 		}
 	}
+	// Key this scan's connection to the active DuckDB transaction so a read inside an explicit transaction
+	// sees the transaction's own uncommitted writes (read-your-writes); the factory's scan_table/execute_query
+	// runs synchronously on this thread, so the managed per-thread ambient set here governs which connection
+	// it borrows. (handle is unused by set_active_txn — the ambient is global per-thread.) See
+	// docs/transaction-concurrency.md.
+	SetActiveTxn(nullptr, (int64_t)MetaTransaction::Get(context).global_transaction_id);
 	bind_data.factory(request, gstate->stream);
 	gstate->stream_initialized = true;
 

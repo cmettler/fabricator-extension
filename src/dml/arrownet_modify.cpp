@@ -10,6 +10,7 @@
 
 #include "arrownet/arrow_produce.hpp"
 #include "arrownet/clr_host.hpp"
+#include "catalog/arrownet_txn_util.hpp"
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
@@ -131,6 +132,7 @@ SinkFinalizeType ArrowNetPhysicalDelete::Finalize(Pipeline &pipeline, Event &eve
 	auto &gstate = input.global_state.Cast<ArrowNetModifyGlobalState>();
 	lock_guard<mutex> guard(gstate.lock);
 	gstate.producer->Finish();
+	ArrowNetSetActiveTxn(handle_, context);
 	gstate.total = (idx_t)arrownet::ExecuteDelete(handle_, target_.schema_name, target_.table_name,
 	                                              *gstate.producer->Stream());
 	return SinkFinalizeType::READY;
@@ -172,6 +174,7 @@ SinkFinalizeType ArrowNetPhysicalUpdate::Finalize(Pipeline &pipeline, Event &eve
 	auto &gstate = input.global_state.Cast<ArrowNetModifyGlobalState>();
 	lock_guard<mutex> guard(gstate.lock);
 	gstate.producer->Finish();
+	ArrowNetSetActiveTxn(handle_, context);
 	gstate.total = (idx_t)arrownet::ExecuteUpdate(handle_, target_.schema_name, target_.table_name,
 	                                              (int32_t)gstate.set_count, *gstate.producer->Stream());
 	return SinkFinalizeType::READY;

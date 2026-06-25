@@ -28,7 +28,7 @@ internal sealed class BulkSession
     public Schema Schema { get; }
 
     public BulkSession(IBackendCatalog catalog, string schemaName, string tableName, Schema schema, bool createTable,
-                       bool replace, bool checkConstraints)
+                       bool replace, bool checkConstraints, long txnId)
     {
         Schema = schema;
         _channel = Channel.CreateBounded<RecordBatch>(new BoundedChannelOptions(ChannelCapacity)
@@ -43,7 +43,7 @@ internal sealed class BulkSession
             try
             {
                 return catalog.BulkInsert(schemaName, tableName, new ChannelArrowStream(schema, reader), createTable,
-                                          replace, checkConstraints);
+                                          replace, checkConstraints, txnId);
             }
             finally
             {

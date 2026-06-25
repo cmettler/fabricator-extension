@@ -270,8 +270,15 @@ typedef struct ArrowNetVTable {
 	// `check_constraints` (1/0): when set, the bulk-copy validates CHECK / FOREIGN
 	// KEY constraints during load (INSERT semantics); when 0 they are skipped for
 	// bulk-load speed (COPY/CTAS). SqlBulkCopy skips constraints by default.
+	// `txn_id` is the DuckDB transaction id (global_transaction_id) the load belongs to, sourced at the sink
+	// from `context.ActiveTransaction().global_transaction_id`. The bulk-copy runs on a background task (its
+	// own thread), so unlike other calls the id can't ride the per-thread ambient (set_active_txn) — the host
+	// passes it here and the managed consumer re-establishes it on its thread. It keys the per-transaction
+	// provider connection, so concurrent writes (e.g. dbt --threads N building several models at once) each
+	// use their OWN connection instead of colliding on one non-thread-safe SqlConnection (0 => no specific
+	// transaction => a fresh connection). See docs/transaction-concurrency.md.
 	int32_t (*begin_bulk)(ArrowNetHandle handle, const char *schema, const char *table, int32_t create_table,
-	                      int32_t replace, int32_t check_constraints, struct ArrowSchema *schema_in,
+	                      int32_t replace, int32_t check_constraints, int64_t txn_id, struct ArrowSchema *schema_in,
 	                      ArrowNetHandle *out_session, char **err);
 
 	// push_batch enqueues one record batch into the session. The managed side
@@ -500,13 +507,26 @@ typedef struct ArrowNetVTable {
 	// ProviderSettingsStore. Called from each option's set-callback when the value is SET, and once per
 	// setting at registration for its default.
 	int32_t (*set_setting)(const char *provider, const char *name, const char *value, char **err);
+
+	// -------------------------------------------------------------------------
+	// Per-transaction connection routing (write-concurrency fix; see
+	// docs/transaction-concurrency.md). Appended at the vtable end.
+	// -------------------------------------------------------------------------
+	// set_active_txn: record the DuckDB transaction id (`global_transaction_id`) currently in effect, so the
+	// NEXT connection-using call keys its per-transaction provider connection by it. The managed side stores
+	// it in a per-thread ambient; the host calls this IMMEDIATELY before each connection-using call, on the
+	// SAME thread (the calls are synchronous). `txn_id` 0 => no specific transaction (a fresh/pooled
+	// connection). This makes concurrent DuckDB transactions (e.g. dbt --threads N) each use their OWN
+	// provider connection instead of colliding on one shared, non-thread-safe connection. `handle` is unused
+	// (the ambient is per-thread + global; each catalog keys its own connection-state map by the id).
+	int32_t (*set_active_txn)(ArrowNetHandle handle, int64_t txn_id, char **err);
 } ArrowNetVTable;
 
 // Max serialized size of a spillable aggregate's per-group state (the inline, pointer-free
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 34
+#define ARROWNET_ABI_VERSION 35
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

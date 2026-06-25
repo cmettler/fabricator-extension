@@ -26,7 +26,7 @@ public static unsafe class Bootstrap
             return ArrowNetStatus.InvalidArgument;
         }
 
-        vtable->AbiVersion = 34;
+        vtable->AbiVersion = 35;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -71,6 +71,7 @@ public static unsafe class Bootstrap
         vtable->TableClose = &TableClose;
         vtable->ListSettings = &ListSettings;
         vtable->SetSetting = &SetSetting;
+        vtable->SetActiveTxn = &SetActiveTxn;
         return ArrowNetStatus.Ok;
     }
 
@@ -169,7 +170,7 @@ public static unsafe class Bootstrap
             // We take ownership of the C stream (consume + release on dispose).
             var stream = CArrowArrayStreamImporter.ImportArrayStream(input);
             long rows = catalog.BulkInsert(schemaName, tableName, stream, createTable != 0, replace != 0,
-                                           checkConstraints: false);
+                                           checkConstraints: false, txnId: AmbientTransaction.Current);
             if (affected is not null)
             {
                 *affected = rows;
@@ -442,9 +443,21 @@ public static unsafe class Bootstrap
         }
     }
 
+    // Set the DuckDB transaction id (global_transaction_id) in effect on THIS thread, so the subsequent
+    // connection-using call on the same thread keys its per-transaction provider connection by it. The host
+    // calls this immediately before each such call. 0 => no specific transaction (fresh/pooled connection).
+    // handle is unused (the ambient is per-thread + global; each catalog keys its own state dictionary by it).
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int SetActiveTxn(nint handle, long txnId, byte** err)
+    {
+        AmbientTransaction.Current = txnId;
+        return ArrowNetStatus.Ok;
+    }
+
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static int BeginBulk(nint handle, byte* schema, byte* table, int createTable, int replace,
-                                 int checkConstraints, CArrowSchema* schemaIn, nint* outSession, byte** err)
+                                 int checkConstraints, long txnId, CArrowSchema* schemaIn, nint* outSession,
+                                 byte** err)
     {
         try
         {
@@ -461,7 +474,7 @@ public static unsafe class Bootstrap
             var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
 
             var session = new BulkSession(catalog, schemaName, tableName, arrowSchema, createTable != 0, replace != 0,
-                                          checkConstraints != 0);
+                                          checkConstraints != 0, txnId);
             *outSession = Handles.Alloc(session);
             return ArrowNetStatus.Ok;
         }

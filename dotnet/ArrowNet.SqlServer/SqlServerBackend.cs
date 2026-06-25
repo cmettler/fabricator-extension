@@ -407,80 +407,89 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         return OpenRaw(_connectionString!);
     }
 
-    // ---- Transaction state ----------------------------------------------------
-    // While in transaction mode, all DML runs on a single pinned connection +
-    // SqlTransaction (opened lazily on the first write) so COMMIT/ROLLBACK are
-    // atomic. Reads keep using fresh connections. Single-session by design.
-    private readonly object _txnLock = new();
-    private bool _inTransaction;
-    private SqlConnection? _txnConnection;
-    private SqlTransaction? _txn;
+    // ---- Transaction state (per DuckDB transaction) ---------------------------
+    // Each concurrent DuckDB transaction (keyed by its global_transaction_id, carried per-thread via
+    // AmbientTransaction) gets its OWN pinned provider connection + SqlTransaction, opened lazily on the
+    // first write. This is what makes concurrent writes — e.g. dbt --threads N building several models at
+    // once, each in its own explicit BEGIN/COMMIT — correct: they no longer collapse onto one shared,
+    // non-thread-safe SqlConnection (which produced error 595). Reads in a transaction reuse that
+    // transaction's connection (read-your-writes); reads with no active transaction take a fresh pooled
+    // connection. Matches the native mssql-extension's per-MSSQLTransaction connection model. See
+    // docs/transaction-concurrency.md.
+    private sealed class TxnState
+    {
+        public SqlConnection? Connection;
+        public SqlTransaction? Transaction;
+    }
 
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<long, TxnState> _txns = new();
+
+    // begin is a no-op: the connection + provider transaction are pinned lazily on the first write
+    // (BeginWrite), keyed by the ambient transaction id. A read-only transaction never creates state.
     public void BeginTransaction()
     {
-        lock (_txnLock)
-        {
-            _inTransaction = true; // pin lazily on the first write
-        }
     }
 
-    public void CommitTransaction() => EndTransaction(commit: true);
+    public void CommitTransaction() => EndTransaction(AmbientTransaction.Current, commit: true);
 
-    public void RollbackTransaction() => EndTransaction(commit: false);
+    public void RollbackTransaction() => EndTransaction(AmbientTransaction.Current, commit: false);
 
-    private void EndTransaction(bool commit)
+    private void EndTransaction(long txnId, bool commit)
     {
-        lock (_txnLock)
+        if (!_txns.TryRemove(txnId, out var state))
         {
-            try
+            return; // no write happened in this transaction (or already finished)
+        }
+        try
+        {
+            if (state.Transaction is not null)
             {
-                if (_txn is not null)
+                if (commit)
                 {
-                    if (commit)
-                    {
-                        _txn.Commit();
-                    }
-                    else
-                    {
-                        _txn.Rollback();
-                    }
+                    state.Transaction.Commit();
+                }
+                else
+                {
+                    state.Transaction.Rollback();
                 }
             }
-            finally
-            {
-                _txn?.Dispose();
-                _txnConnection?.Dispose();
-                _txn = null;
-                _txnConnection = null;
-                _inTransaction = false;
-            }
+        }
+        finally
+        {
+            state.Transaction?.Dispose();
+            state.Connection?.Dispose();
         }
     }
 
-    // Returns a connection for a write. In transaction mode it is the pinned
-    // connection (opened + provider-transaction started on first use), owns=false
-    // so the caller must NOT dispose it; otherwise a fresh autocommit connection
-    // (owns=true). The connection is already open. Internal so the top-level
+    // Returns a connection for a write. When a DuckDB transaction is active (ambient id != 0) it is that
+    // transaction's pinned connection (opened + provider-transaction started on first use), owns=false so
+    // the caller must NOT dispose it (COMMIT/ROLLBACK disposes it). With no active transaction (id 0) it is
+    // a fresh connection (owns=true). The connection is already open. Internal so the top-level
     // SqlServerProcEach (the proc `_each` exchange binding) can run its per-row EXEC on it.
     internal (SqlConnection connection, SqlTransaction? transaction, bool owns) BeginWrite()
     {
-        lock (_txnLock)
+        long txnId = AmbientTransaction.Current;
+        if (txnId != 0)
         {
-            if (_inTransaction)
+            var state = _txns.GetOrAdd(txnId, _ => new TxnState());
+            // One thread at a time touches a given transaction (DuckDB serializes a transaction's
+            // statements), so locking the single state is enough; distinct transactions use distinct states.
+            lock (state)
             {
-                if (_txnConnection is null)
+                if (state.Connection is null)
                 {
-                    _txnConnection = OpenConnection();
-                    _txnConnection.Open();
+                    var conn = OpenConnection();
+                    conn.Open();
                     // Warehouse engines run the write transaction at SNAPSHOT (Fabric's only isolation
                     // level); box SQL Server keeps the connection/server default (Unspecified). Profile is
                     // already detected (OpenConnection ran EnsureProfile).
                     var level = ParseIsolationLevel(_profile!.DefaultWriteIsolation);
-                    _txn = level == IsolationLevel.Unspecified
-                        ? _txnConnection.BeginTransaction()
-                        : _txnConnection.BeginTransaction(level);
+                    state.Connection = conn;
+                    state.Transaction = level == IsolationLevel.Unspecified
+                        ? conn.BeginTransaction()
+                        : conn.BeginTransaction(level);
                 }
-                return (_txnConnection, _txn, false);
+                return (state.Connection, state.Transaction, false);
             }
         }
         var connection = OpenConnection();
@@ -513,12 +522,16 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         // would evict the table the CREATE just made; see ArrowNetSchemaEntry::CreateTable).
         SqlConnection? pinned = null;
         SqlTransaction? pinnedTransaction = null;
-        lock (_txnLock)
+        long txnId = AmbientTransaction.Current;
+        if (txnId != 0 && _txns.TryGetValue(txnId, out var state))
         {
-            if (_inTransaction && _txnConnection is not null && (_marsEnabled || readYourWrites))
+            lock (state)
             {
-                pinned = _txnConnection;
-                pinnedTransaction = _txn;
+                if (state.Connection is not null && (_marsEnabled || readYourWrites))
+                {
+                    pinned = state.Connection;
+                    pinnedTransaction = state.Transaction;
+                }
             }
         }
         if (pinned is not null)
@@ -588,8 +601,13 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     }
 
     public long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable, bool replace,
-                           bool checkConstraints)
+                           bool checkConstraints, long txnId)
     {
+        // The bulk-copy runs on a background task (its own pool thread), so the host can't carry the active
+        // transaction id to us via the per-thread ambient — it captured it at begin_bulk and hands it here;
+        // we re-establish it on THIS thread so BeginWrite + read-your-writes use the right per-transaction
+        // connection (joining an explicit BEGIN's pinned connection; a fresh one in autocommit).
+        AmbientTransaction.Current = txnId;
         var (connection, transaction, owns) = BeginWrite();
         try
         {
@@ -2397,12 +2415,13 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     public void Dispose()
     {
-        // Roll back and release a still-open transaction (e.g. on DETACH mid-txn).
-        if (_inTransaction || _txn is not null)
+        // Roll back and release any still-open transactions (e.g. on DETACH mid-txn).
+        // ConcurrentDictionary enumeration tolerates the concurrent removals EndTransaction does.
+        foreach (var kvp in _txns)
         {
             try
             {
-                RollbackTransaction();
+                EndTransaction(kvp.Key, commit: false);
             }
             catch
             {

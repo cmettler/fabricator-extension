@@ -7,6 +7,7 @@
 #include "arrownet/clr_host.hpp"
 #include "catalog/arrownet_metadata.hpp"
 #include "catalog/arrownet_schema_entry.hpp"
+#include "catalog/arrownet_txn_util.hpp"
 #include "catalog/arrownet_table_entry.hpp"
 #include "dml/arrownet_ctas.hpp"
 #include "dml/arrownet_insert.hpp"
@@ -251,6 +252,9 @@ string ArrowNetCatalog::GetDBPath() {
 }
 
 optional_ptr<CatalogEntry> ArrowNetCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
+	if (transaction.context) {
+		ArrowNetSetActiveTxn(handle_, *transaction.context);
+	}
 	if (info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
 		arrownet::DropSchema(handle_, info.schema, /*if_exists=*/true);
 	}
@@ -272,6 +276,7 @@ optional_ptr<CatalogEntry> ArrowNetCatalog::CreateSchema(CatalogTransaction tran
 }
 void ArrowNetCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 	bool if_exists = info.if_not_found == OnEntryNotFound::RETURN_NULL;
+	ArrowNetSetActiveTxn(handle_, context);
 	arrownet::DropSchema(handle_, info.name, if_exists);
 	lock_guard<mutex> lock(schema_lock_);
 	schemas_.erase(info.name);

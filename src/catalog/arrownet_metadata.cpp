@@ -5,6 +5,7 @@
 #include "catalog/arrownet_metadata.hpp"
 
 #include "arrownet/clr_host.hpp"
+#include "catalog/arrownet_txn_util.hpp"
 #include "duckdb/common/exception.hpp"
 
 #include <cstdint>
@@ -209,6 +210,9 @@ void FetchTableColumns(ClientContext &context, ArrowNetHandle handle, const stri
 	bind_data.factory = [handle, schema_name, table_name](const arrownet::ArrowScanRequest &, ArrowArrayStream &out) {
 		arrownet::GetMetadata(handle, ARROWNET_META_COLUMNS, schema_name, table_name, out);
 	};
+	// Read-your-writes: re-fetching a just-created table's columns (to build its catalog entry) inside an
+	// explicit transaction must see the uncommitted CREATE, so key the metadata read to the active txn.
+	ArrowNetSetActiveTxn(handle, context);
 	arrownet::PopulateReturnSchema(context, bind_data, types, names);
 }
 

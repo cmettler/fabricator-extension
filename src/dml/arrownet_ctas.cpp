@@ -10,6 +10,7 @@
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 
 #include <cstring>
 
@@ -63,8 +64,8 @@ unique_ptr<GlobalSinkState> ArrowNetPhysicalCreateTableAs::GetGlobalSinkState(Cl
 	auto *stream = gstate->producer->Stream();
 	stream->get_schema(stream, &schema);
 	gstate->bulk_session = arrownet::BeginBulk(info_.handle, info_.schema_name, info_.table_name,
-	                                           /*create_table=*/true, info_.replace,
-	                                           /*check_constraints=*/false, schema);
+	                                           /*create_table=*/true, info_.replace, /*check_constraints=*/false,
+	                                           (int64_t)context.ActiveTransaction().global_transaction_id, schema);
 	return std::move(gstate);
 }
 

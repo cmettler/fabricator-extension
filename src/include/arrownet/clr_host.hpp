@@ -146,7 +146,12 @@ void InsertReturning(ArrowNetHandle handle, const std::string &schema, const std
 // semantics; SqlBulkCopy skips them by default — pass false for COPY/CTAS bulk speed).
 // Returns an opaque session handle to push batches into and complete later.
 ArrowNetHandle BeginBulk(ArrowNetHandle handle, const std::string &schema, const std::string &table, bool create_table,
-                         bool replace, bool check_constraints, ArrowSchema &schema_in);
+                         bool replace, bool check_constraints, int64_t txn_id, ArrowSchema &schema_in);
+
+// Record the DuckDB transaction id in effect on this thread (global_transaction_id), so the next
+// connection-using bridge call keys its per-transaction provider connection by it. Call immediately before
+// each such call, on the same thread. txn_id 0 => no specific transaction. Best-effort (never throws).
+void SetActiveTxn(ArrowNetHandle handle, int64_t txn_id);
 
 // Push one record batch into the session; the managed side imports + releases it
 // (the caller never releases it). Blocks while the channel is full (backpressure).

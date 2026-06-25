@@ -874,7 +874,7 @@ void InsertReturning(ArrowNetHandle handle, const std::string &schema, const std
 }
 
 ArrowNetHandle BeginBulk(ArrowNetHandle handle, const std::string &schema, const std::string &table, bool create_table,
-                         bool replace, bool check_constraints, ArrowSchema &schema_in) {
+                         bool replace, bool check_constraints, int64_t txn_id, ArrowSchema &schema_in) {
 	const ArrowNetVTable &vt = GetBridge();
 	if (!vt.begin_bulk) {
 		throw duckdb::IOException("ArrowNet: bridge does not provide begin_bulk");
@@ -882,11 +882,26 @@ ArrowNetHandle BeginBulk(ArrowNetHandle handle, const std::string &schema, const
 	ArrowNetHandle session = nullptr;
 	char *err = nullptr;
 	int32_t rc = vt.begin_bulk(handle, schema.c_str(), table.c_str(), create_table ? 1 : 0, replace ? 1 : 0,
-	                           check_constraints ? 1 : 0, &schema_in, &session, &err);
+	                           check_constraints ? 1 : 0, txn_id, &schema_in, &session, &err);
 	if (rc != ARROWNET_OK) {
 		ThrowManagedError(vt, err, "ArrowNet: begin_bulk failed");
 	}
 	return session;
+}
+
+void SetActiveTxn(ArrowNetHandle handle, int64_t txn_id) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.set_active_txn) {
+		return; // older/partial bridge: per-transaction routing simply not active
+	}
+	char *err = nullptr;
+	int32_t rc = vt.set_active_txn(handle, txn_id, &err);
+	if (rc != ARROWNET_OK && err) {
+		// Best-effort: a failure to set the ambient must not abort the statement; free the message.
+		if (vt.free_error) {
+			vt.free_error(err);
+		}
+	}
 }
 
 void PushBatch(ArrowNetHandle session, ArrowArray &batch) {

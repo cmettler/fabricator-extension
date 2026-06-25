@@ -14,6 +14,8 @@
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
+#include "catalog/arrownet_txn_util.hpp"
 
 #include <cstring>
 
@@ -76,7 +78,8 @@ unique_ptr<GlobalSinkState> ArrowNetPhysicalInsert::GetGlobalSinkState(ClientCon
 		stream->get_schema(stream, &schema);
 		gstate->bulk_session = arrownet::BeginBulk(handle_, target_.schema_name, target_.table_name,
 		                                           /*create_table=*/false, /*replace=*/false,
-		                                           /*check_constraints=*/true, schema);
+		                                           /*check_constraints=*/true,
+		                                           (int64_t)context.ActiveTransaction().global_transaction_id, schema);
 	}
 	return std::move(gstate);
 }
@@ -121,6 +124,7 @@ SinkFinalizeType ArrowNetPhysicalInsert::Finalize(Pipeline &pipeline, Event &eve
 		gstate.producer->Finish();
 		ArrowArrayStream out;
 		std::memset(&out, 0, sizeof(out));
+		ArrowNetSetActiveTxn(handle_, context);
 		arrownet::InsertReturning(handle_, target_.schema_name, target_.table_name, *gstate.producer->Stream(), out);
 		gstate.returning_reader = make_uniq<arrownet::ArrowStreamReader>(context, out);
 	} else {

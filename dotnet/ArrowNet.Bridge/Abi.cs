@@ -72,8 +72,8 @@ public unsafe struct ArrowNetVTable
     public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, CArrowArrayStream*, byte**, int> InsertReturning;
 
     // int32 begin_bulk(void* handle, const char* schema, const char* table, int32 create_table, int32 replace,
-    //                  int32 check_constraints, ArrowSchema* schema_in, void** out_session, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, int, int, int, CArrowSchema*, nint*, byte**, int> BeginBulk;
+    //                  int32 check_constraints, int64 txn_id, ArrowSchema* schema_in, void** out_session, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, int, int, int, long, CArrowSchema*, nint*, byte**, int> BeginBulk;
 
     // int32 push_batch(void* session, ArrowArray* batch, char** err)
     public delegate* unmanaged[Cdecl]<nint, CArrowArray*, byte**, int> PushBatch;
@@ -154,6 +154,9 @@ public unsafe struct ArrowNetVTable
 
     // int32 set_setting(const char* provider, const char* name, const char* value, char** err)
     public delegate* unmanaged[Cdecl]<byte*, byte*, byte*, byte**, int> SetSetting;
+
+    // int32 set_active_txn(void* handle, int64 txn_id, char** err)
+    public delegate* unmanaged[Cdecl]<nint, long, byte**, int> SetActiveTxn;
 }
 
 /// <summary>Mirrors <c>ArrowNetAlterKind</c> in abi.h.</summary>
