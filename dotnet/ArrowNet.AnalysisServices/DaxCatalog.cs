@@ -17,6 +17,7 @@ internal sealed class DaxCatalog : IBackendCatalog
 {
     private readonly AdomdConnection _conn;
     private readonly string? _catalog; // the ADOMD database (model db) this connection is bound to
+    private readonly string _modelName; // the single Tabular model in this database = the DuckDB schema name
 
     public DaxCatalog(string connectionString)
     {
@@ -27,6 +28,7 @@ internal sealed class DaxCatalog : IBackendCatalog
         {
             _conn.ChangeDatabase(_catalog);
         }
+        _modelName = DiscoverModelNames()[0];
     }
 
     // ---- metadata --------------------------------------------------------------------------------------
@@ -34,15 +36,71 @@ internal sealed class DaxCatalog : IBackendCatalog
     public IArrowArrayStream GetMetadata(int kind, string? schema, string? table) => kind switch
     {
         // Schemas = the model name(s) in this database (usually one for Power BI Desktop).
-        MetadataKind.Schemas => SingleColumn("schema_name", DiscoverModelNames()),
-        // Tables / columns / functions / server-info: empty (valid) for slice 1 — discovery is slice 2+.
-        MetadataKind.Tables => EmptyStringTable("schema_name", "table_name", "table_type"),
+        MetadataKind.Schemas => SingleColumn("schema_name", new[] { _modelName }),
+        // Tables = the model's tables (TMSCHEMA_TABLES), all under the single model = schema.
+        MetadataKind.Tables => DiscoverTables(),
+        // Columns = a zero-row stream whose SCHEMA describes the table's columns, resolved by running a
+        // zero-row DAX query and reading its schema table (the no-describe approach; real engine types).
+        MetadataKind.Columns => DiscoverColumns(table!),
+        // Functions / server-info: empty (valid); functions are slice 4.
         MetadataKind.Functions => EmptyStringTable("schema_name", "name", "kind"),
         MetadataKind.ServerInfo => EmptyStringTable("property", "value"),
-        MetadataKind.Columns => new InMemoryArrayStream(
-            new Schema(System.Array.Empty<Field>(), null), System.Array.Empty<RecordBatch>()),
         _ => EmptyStringTable("name"),
     };
+
+    private IArrowArrayStream DiscoverTables()
+    {
+        var schemaCol = new List<string>();
+        var nameCol = new List<string>();
+        var typeCol = new List<string>();
+        using (var cmd = _conn.CreateCommand())
+        {
+            cmd.CommandText = "SELECT [Name] FROM $SYSTEM.TMSCHEMA_TABLES";
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+            {
+                var name = r.IsDBNull(0) ? null : r.GetValue(0)?.ToString();
+                if (string.IsNullOrEmpty(name) || IsSystemDateTable(name!))
+                {
+                    continue; // skip Power BI's auto-generated date tables (noise)
+                }
+                schemaCol.Add(_modelName);
+                nameCol.Add(name!);
+                typeCol.Add("BASE TABLE");
+            }
+        }
+        return ThreeColumn("schema_name", schemaCol, "table_name", nameCol, "table_type", typeCol);
+    }
+
+    private static bool IsSystemDateTable(string name)
+        => name.StartsWith("LocalDateTable_", StringComparison.OrdinalIgnoreCase)
+        || name.StartsWith("DateTableTemplate_", StringComparison.OrdinalIgnoreCase);
+
+    private IArrowArrayStream DiscoverColumns(string table)
+    {
+        // EVALUATE TOPN(0, 'Table') returns the table's data columns (no internal RowNumber) with the
+        // engine's result-column types; GetSchemaTable gives name + CLR type + nullability.
+        var fields = new List<Field>();
+        using (var cmd = _conn.CreateCommand())
+        {
+            cmd.CommandText = $"EVALUATE TOPN(0, {QuoteDaxTable(table)})";
+            using var r = cmd.ExecuteReader();
+            var st = r.GetSchemaTable();
+            foreach (System.Data.DataRow row in st!.Rows)
+            {
+                var rawName = (string)row["ColumnName"];
+                var clr = (Type)row["DataType"];
+                bool nullable = row["AllowDBNull"] is not bool b || b;
+                int? precision = row.Table.Columns.Contains("NumericPrecision") && row["NumericPrecision"] is int p ? p : null;
+                int? scale = row.Table.Columns.Contains("NumericScale") && row["NumericScale"] is int s ? s : null;
+                fields.Add(new Field(DaxTypeMap.DebracketColumn(rawName), DaxTypeMap.MapClr(clr, precision, scale), nullable));
+            }
+        }
+        return new InMemoryArrayStream(new Schema(fields, null), System.Array.Empty<RecordBatch>());
+    }
+
+    /// <summary>Quotes a table name for DAX (single quotes; embedded quotes doubled).</summary>
+    internal static string QuoteDaxTable(string table) => "'" + table.Replace("'", "''") + "'";
 
     private List<string> DiscoverModelNames()
     {
@@ -143,6 +201,25 @@ internal sealed class DaxCatalog : IBackendCatalog
             builder.Append(v);
         }
         var batch = new RecordBatch(schema, new IArrowArray[] { builder.Build() }, values.Count);
+        return new InMemoryArrayStream(schema, new[] { batch });
+    }
+
+    private static IArrowArrayStream ThreeColumn(string n0, IReadOnlyList<string> c0, string n1,
+                                                 IReadOnlyList<string> c1, string n2, IReadOnlyList<string> c2)
+    {
+        var schema = new Schema(new[]
+        {
+            new Field(n0, StringType.Default, nullable: true),
+            new Field(n1, StringType.Default, nullable: true),
+            new Field(n2, StringType.Default, nullable: true),
+        }, null);
+        IArrowArray Build(IReadOnlyList<string> vals)
+        {
+            var b = new StringArray.Builder();
+            foreach (var v in vals) b.Append(v);
+            return b.Build();
+        }
+        var batch = new RecordBatch(schema, new[] { Build(c0), Build(c1), Build(c2) }, c0.Count);
         return new InMemoryArrayStream(schema, new[] { batch });
     }
 

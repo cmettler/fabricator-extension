@@ -86,10 +86,17 @@ which caps at 19.84.1) loads in net10 (win-x64), connects to local PBI Desktop, 
    model name(s) from `TMSCHEMA_MODEL`, so the model shows as a DuckDB schema. SqlServer unregressed; unknown
    provider errors cleanly listing `sqlserver, dax`. (TYPE is still `mssql_net` — the generic `arrownet`
    rename is deferred to when this provider matures.)
-2. **DMV metadata → catalog** — `GetMetadata` Tables (`TMSCHEMA_TABLES`) + Columns (`TMSCHEMA_COLUMNS` + the
-   DAX→Arrow type map). Multi-database SSAS = multiple catalogs/schemas; PBI Desktop = one model.
+2. **DMV metadata → catalog** — **DONE + validated.** `GetMetadata(Tables)` = `$SYSTEM.TMSCHEMA_TABLES`
+   (under the single model = schema; Power BI's auto `LocalDateTable_*`/`DateTableTemplate_*` filtered out).
+   `GetMetadata(Columns)` resolves each table's columns by running `EVALUATE TOPN(0, '<table>')` and reading
+   `GetSchemaTable()` — the **no-describe** approach (real engine types, no internal RowNumber column, no TOM
+   enum guessing). `DaxTypeMap` maps the CLR result types → Arrow (incl. `Decimal`→`Decimal128(p,s)` from the
+   schema table's precision/scale, `DateTime`→`Timestamp(ms)`); `DebracketColumn` strips `'T'[Col]`→`Col`.
+   Validated against the live model: `SHOW ALL TABLES` lists all 6 tables with correct types
+   (`DECIMAL(19,4)` currency, `TIMESTAMP_MS`, `BIGINT`, `BOOLEAN`, `VARCHAR`).
 3. **Table scan** — `ScanTable` → `EVALUATE SELECTCOLUMNS('T', "Col", 'T'[Col], …)` projection; column-name
-   de-bracketing; `AdomdDataReader`→Arrow. No filter pushdown initially (DuckDB re-filters).
+   de-bracketing; `AdomdDataReader`→Arrow. No filter pushdown initially (DuckDB re-filters). (Also makes
+   `DESCRIBE`/`SELECT` work — DuckDB binds the scan for both.)
 4. **`daxeval(expr, params)`** — `IArrowTableFunction.Bind` executes + reads `GetSchemaTable()` for the output
    schema (stashing the reader), streams rows in `Execute`.
 5. **`daxevaltable` / `daxapply` in-out** — `IArrowInOutFunction.DoExchange` (DATATABLE injection / per-row
