@@ -847,7 +847,15 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v39** (v39 = foreign-secret consumption: `build_connection_string` gained
+- **Current version: ABI v40** (v40 = filesystem reverse-callback SPIKE/foundation: a new `ArrowNetHostServices`
+  struct (host→managed function pointers: `fs_open_read`/`fs_size`/`fs_read`/`fs_close`/`free_str`) is passed
+  to `Bootstrap.Initialize(vtable, size, host)` so the managed side can call back into DuckDB's `FileSystem`
+  (secret-backed remote IO via DuckDB), plus an `fs_spike` vtable entry + `arrownet_fs_spike(path)` table fn
+  that proves it. Key finding: `FileSystem::GetFileSystem(context)` is an `OpenerFileSystem` that AUTO-pushes
+  the context's `FileOpener` (secrets) — open with NO explicit opener. Validated: local parquet (PAR1 footer)
+  + remote https via httpfs (range GET). Foundation for a future C# lakehouse-format provider (engineered-wood
+  Delta/Iceberg/Lance/… reusing DuckDB IO + secrets). See [docs/filesystem-bridge.md](docs/filesystem-bridge.md).
+  v39 = foreign-secret consumption: `build_connection_string` gained
   `secret_type` + `base_connstr` args so a provider can reuse a secret of ANOTHER extension's type. C++
   `BuildConnectionStringFromSecret` resolves ANY secret (`IsMssqlNetSecret`→`IsKnownSecret`) and passes the
   type + fields + the ATTACH target to C#; `SqlServerBackend` maps an `azure` service_principal/managed_identity

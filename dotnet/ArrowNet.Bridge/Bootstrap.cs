@@ -18,7 +18,7 @@ namespace ArrowNet.Bridge;
 public static unsafe class Bootstrap
 {
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    public static int Initialize(ArrowNetVTable* vtable, int size)
+    public static int Initialize(ArrowNetVTable* vtable, int size, ArrowNetHostServices* host)
     {
         // Guard against a host built against a newer/larger struct than we know.
         if (vtable is null || size < sizeof(ArrowNetVTable))
@@ -26,7 +26,14 @@ public static unsafe class Bootstrap
             return ArrowNetStatus.InvalidArgument;
         }
 
-        vtable->AbiVersion = 39;
+        // Cache the host-services callbacks (reverse direction) so managed components can reach DuckDB's
+        // FileSystem (secret-backed remote IO). May be a zeroed block if the host registered none. SPIKE.
+        if (host is not null)
+        {
+            HostFs.Set(*host);
+        }
+
+        vtable->AbiVersion = 40;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -73,6 +80,7 @@ public static unsafe class Bootstrap
         vtable->SetSetting = &SetSetting;
         vtable->SetActiveTxn = &SetActiveTxn;
         vtable->ListSecretFields = &ListSecretFields;
+        vtable->FsSpike = &FsSpike;
         return ArrowNetStatus.Ok;
     }
 
@@ -455,6 +463,29 @@ public static unsafe class Bootstrap
         AmbientTransaction.Current = txnId;
         AmbientTransaction.JoinOnly = joinOnly != 0;
         return ArrowNetStatus.Ok;
+    }
+
+    // SPIKE: open `path` via the host FileSystem callbacks (using `opener` for secret resolution) and return
+    // head/tail bytes + size. Proves a managed component can do secret-backed remote IO through DuckDB.
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int FsSpike(nint opener, byte* path, byte** outResult, byte** err)
+    {
+        try
+        {
+            if (outResult is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            var p = Marshal.PtrToStringUTF8((nint)path) ?? string.Empty;
+            var result = HostFileSystemSpike.Run(opener, p);
+            *outResult = (byte*)Marshal.StringToCoTaskMemUTF8(result); // host frees via free_error
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]

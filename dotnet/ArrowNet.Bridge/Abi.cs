@@ -162,6 +162,30 @@ public unsafe struct ArrowNetVTable
 
     // int32 list_secret_fields(ArrowArrayStream* out, char** err)
     public delegate* unmanaged[Cdecl]<CArrowArrayStream*, byte**, int> ListSecretFields;
+
+    // SPIKE: int32 fs_spike(void* opener, const char* path, char** out, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte*, byte**, byte**, int> FsSpike;
+}
+
+/// <summary>
+/// Host services — function pointers the C++ host provides TO the managed side (reverse of the vtable), so a
+/// managed component can reach DuckDB's FileSystem (secret-backed remote IO via DuckDB). Mirrors
+/// <c>ArrowNetHostServices</c> in abi.h; the host fills it and passes it to <c>Bootstrap.Initialize</c>.
+/// SPIKE surface (the foundation for a future C# lakehouse reader).
+/// </summary>
+public unsafe struct ArrowNetHostServices
+{
+    public int AbiVersion;
+    // int32 fs_open_read(void* opener, const char* path, void** out_file, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte*, nint*, byte**, int> FsOpenRead;
+    // int32 fs_size(void* file, int64* out_size, char** err)
+    public delegate* unmanaged[Cdecl]<nint, long*, byte**, int> FsSize;
+    // int32 fs_read(void* file, void* buffer, int64 nr_bytes, int64 location, char** err)
+    public delegate* unmanaged[Cdecl]<nint, void*, long, long, byte**, int> FsRead;
+    // void fs_close(void* file)
+    public delegate* unmanaged[Cdecl]<nint, void> FsClose;
+    // void free_str(char* str)
+    public delegate* unmanaged[Cdecl]<byte*, void> FreeStr;
 }
 
 /// <summary>Mirrors <c>ArrowNetAlterKind</c> in abi.h.</summary>

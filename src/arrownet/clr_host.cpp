@@ -46,8 +46,9 @@ typedef int(ANET_STDCALL *load_assembly_and_get_function_pointer_fn)(const host_
                                                                      const host_char_t *delegate_type_name,
                                                                      void *reserved, void **out_fn);
 
-// The managed Bootstrap.Initialize, exported [UnmanagedCallersOnly(Cdecl)].
-typedef int32_t(ANET_CDECL *bootstrap_fn)(ArrowNetVTable *vtable, int32_t size);
+// The managed Bootstrap.Initialize, exported [UnmanagedCallersOnly(Cdecl)]. `host` carries the host-services
+// callbacks (reverse direction) the managed side caches; may be a zeroed block if none were registered.
+typedef int32_t(ANET_CDECL *bootstrap_fn)(ArrowNetVTable *vtable, int32_t size, const ArrowNetHostServices *host);
 
 static constexpr int kHdtLoadAssemblyAndGetFunctionPointer = 5;
 static const host_char_t *const kUnmanagedCallersOnly = reinterpret_cast<const host_char_t *>(-1);
@@ -169,6 +170,10 @@ const char *HostFxrLeaf() {
 // ---- loaded state ----
 std::once_flag g_once;
 ArrowNetVTable g_vtable {};
+// Host-services callbacks the managed side calls (reverse direction). Populated by SetHostServices BEFORE the
+// bridge boots; passed to Bootstrap.Initialize. Zeroed if no host registered any (the managed side then
+// treats host services as unavailable).
+ArrowNetHostServices g_host_services {};
 std::string g_managed_dir;
 std::string g_load_error;
 
@@ -257,7 +262,7 @@ void LoadOnce() {
 	}
 
 	auto bootstrap = reinterpret_cast<bootstrap_fn>(bootstrap_ptr);
-	int32_t brc = bootstrap(&g_vtable, (int32_t)sizeof(ArrowNetVTable));
+	int32_t brc = bootstrap(&g_vtable, (int32_t)sizeof(ArrowNetVTable), &g_host_services);
 	if (brc != 0) {
 		close_fn(ctx);
 		g_load_error = "ArrowNet: Bootstrap.Initialize returned " + std::to_string(brc);
@@ -286,6 +291,10 @@ const ArrowNetVTable &GetBridge() {
 
 const std::string &GetManagedDirectory() {
 	return g_managed_dir;
+}
+
+void SetHostServices(const ArrowNetHostServices &services) {
+	g_host_services = services; // must be called before the first GetBridge() (bridge boot)
 }
 
 // -----------------------------------------------------------------------------
@@ -949,6 +958,24 @@ int64_t CompleteBulk(ArrowNetHandle session, bool abort) {
 		ThrowManagedError(vt, err, "ArrowNet: complete_bulk failed");
 	}
 	return affected;
+}
+
+std::string FsSpike(ArrowNetHandle opener, const std::string &path) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.fs_spike) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide fs_spike");
+	}
+	char *out = nullptr;
+	char *err = nullptr;
+	int32_t rc = vt.fs_spike(opener, path.c_str(), &out, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: fs_spike failed");
+	}
+	std::string result = out ? out : "";
+	if (out && vt.free_error) {
+		vt.free_error(out); // owned UTF-8, freed like an error string
+	}
+	return result;
 }
 
 } // namespace arrownet

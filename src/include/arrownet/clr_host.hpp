@@ -31,6 +31,15 @@ const ArrowNetVTable &GetBridge();
 // Returns the resolved managed directory (for diagnostics).
 const std::string &GetManagedDirectory();
 
+// Registers the host-services callbacks (the reverse direction: functions the managed side calls to reach
+// DuckDB's FileSystem). MUST be called before the bridge first boots (GetBridge) so the services are passed
+// to Bootstrap.Initialize. See ArrowNetHostServices in abi.h. (Filesystem reverse-callback foundation.)
+void SetHostServices(const ArrowNetHostServices &services);
+
+// SPIKE: ask the managed side to open `path` via the host FileSystem callbacks (using `opener` for secret
+// resolution) and return a short human-readable result (head/tail bytes + size). Proves C#->host FS reads.
+std::string FsSpike(ArrowNetHandle opener, const std::string &path);
+
 // -----------------------------------------------------------------------------
 // Convenience wrappers over the vtable. Each throws duckdb::IOException carrying
 // the managed error message (and releases it via free_error) on failure.

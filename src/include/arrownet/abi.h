@@ -547,13 +547,47 @@ typedef struct ArrowNetVTable {
 	// with the listed fields as the CREATE SECRET named parameters (redacting the marked ones) — so the
 	// provider-agnostic core names no secret type or field. A provider with no secret type contributes no rows.
 	int32_t (*list_secret_fields)(struct ArrowArrayStream *out, char **err);
+
+	// -------------------------------------------------------------------------
+	// SPIKE — filesystem reverse-callback foundation (a managed lakehouse reader doing secret-backed remote
+	// IO via DuckDB's FileSystem). `opener` is the opaque host FileOpener handle for the calling operator's
+	// ClientContext (carries secret resolution); the managed side opens `path` via the ArrowNetHostServices
+	// callbacks, reads its head + tail bytes, and returns a short human-readable result in *out (owned UTF-8,
+	// freed via free_error). Proves C#->host FileSystem reads + opener/secret threading work end-to-end.
+	// -------------------------------------------------------------------------
+	int32_t (*fs_spike)(ArrowNetHandle opener, const char *path, char **out, char **err);
 } ArrowNetVTable;
+
+// -----------------------------------------------------------------------------
+// Host services — function pointers the HOST provides TO the managed side (the reverse direction of the
+// vtable). They let a managed component reach DuckDB's FileSystem so it can do secret-backed remote IO via
+// DuckDB (one auth config — DuckDB secrets — shared with native reads). The host fills this struct and passes
+// it to Bootstrap.Initialize; the managed side caches the pointers. SPIKE surface (open/size/read/close) —
+// the foundation for a future C# lakehouse provider. A failing call returns non-zero and, when `err` is
+// provided, sets *err to an owned UTF-8 message the managed side frees via `free_str`.
+// -----------------------------------------------------------------------------
+typedef struct ArrowNetHostServices {
+	// Mirrors ARROWNET_ABI_VERSION so the managed side can reject a mismatched host services block.
+	int32_t abi_version;
+	// Open `path` for reading via DuckDB's FileSystem. `opener` is the opaque host FileOpener handle (its
+	// ClientContext resolves secrets for az://, s3://, … ); valid only for the duration of the managed call
+	// that received it. *out_file receives an opaque file handle (close via fs_close).
+	int32_t (*fs_open_read)(ArrowNetHandle opener, const char *path, ArrowNetHandle *out_file, char **err);
+	// File size in bytes.
+	int32_t (*fs_size)(ArrowNetHandle file, int64_t *out_size, char **err);
+	// Read `nr_bytes` at byte offset `location` into `buffer` (caller-allocated, in managed memory).
+	int32_t (*fs_read)(ArrowNetHandle file, void *buffer, int64_t nr_bytes, int64_t location, char **err);
+	// Close a file handle from fs_open_read. Safe with NULL.
+	void (*fs_close)(ArrowNetHandle file);
+	// Free an error string returned by the fs_* callbacks above.
+	void (*free_str)(char *str);
+} ArrowNetHostServices;
 
 // Max serialized size of a spillable aggregate's per-group state (the inline, pointer-free
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 39
+#define ARROWNET_ABI_VERSION 40
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen
