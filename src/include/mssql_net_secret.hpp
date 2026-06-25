@@ -19,11 +19,16 @@ namespace duckdb {
 //! provider-agnostic core names no secret type or field. See docs/provider-extensibility.md §2.
 void RegisterProviderSecrets(ExtensionLoader &loader);
 
-//! Looks up a stored provider secret by name and assembles a connection string from its fields (the owning
-//! backend validates + formats it). Throws if the secret is missing or is not a provider secret type.
-string BuildConnectionStringFromSecret(ClientContext &context, const string &secret_name);
+//! Looks up a stored secret by name (our own type OR a foreign one reused for auth, e.g. azure) and assembles
+//! a connection string from its fields — the owning backend validates + formats it, interpreting the fields
+//! per the secret's type. `base_connstr` is the ATTACH target (Server=…;Database=… / mssql:// URI), used when
+//! a foreign secret carries only auth (empty otherwise). `provider` selects the consuming backend for a
+//! foreign secret (empty => default; our own secret type routes to its declared backend). Throws if the
+//! secret is missing. See docs/provider-extensibility.md §2.
+string BuildConnectionStringFromSecret(ClientContext &context, const string &secret_name,
+                                       const string &base_connstr = "", const string &provider = "");
 
-//! True if a secret with this name exists and is one of the registered provider secret types.
-bool IsProviderSecret(ClientContext &context, const string &secret_name);
+//! True if a secret with this name exists (any type — our own or a foreign one reused for auth).
+bool IsKnownSecret(ClientContext &context, const string &secret_name);
 
 } // namespace duckdb

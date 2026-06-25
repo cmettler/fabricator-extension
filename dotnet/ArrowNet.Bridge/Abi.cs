@@ -82,7 +82,9 @@ public unsafe struct ArrowNetVTable
     public delegate* unmanaged[Cdecl]<nint, int, long*, byte**, int> CompleteBulk;
 
     // int32 build_connection_string(const char* provider, const char* fields_json, char** out_connstr, char** err)
-    public delegate* unmanaged[Cdecl]<byte*, byte*, byte**, byte**, int> BuildConnectionString;
+    // int32 build_connection_string(const char* provider, const char* secret_type, const char* fields_json,
+    //                               const char* base_connstr, char** out_connstr, char** err)
+    public delegate* unmanaged[Cdecl]<byte*, byte*, byte*, byte*, byte**, byte**, int> BuildConnectionString;
 
     // int32 get_function_param_schema(void* handle, const char* schema, const char* func, ArrowSchema* out, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowSchema*, byte**, int> GetFunctionParamSchema;

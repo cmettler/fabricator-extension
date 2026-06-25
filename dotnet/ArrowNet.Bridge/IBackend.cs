@@ -48,11 +48,23 @@ public interface IBackend
 
     /// <summary>
     /// Builds a provider connection string from a secret's fields (the host reads the DuckDB secret and
-    /// passes its key/values here). Keeps all provider connection-string / auth formatting in the
-    /// backend — the C++ side has no knowledge of the provider's connstr dialect. The result is then
-    /// passed to <see cref="OpenCatalog"/>.
+    /// passes its key/values here). Keeps all provider connection-string / auth formatting in the backend —
+    /// the C++ side has no knowledge of the provider's connstr dialect. The result is passed to
+    /// <see cref="OpenCatalog"/>.
     /// </summary>
-    string BuildConnectionString(IReadOnlyDictionary<string, string> fields);
+    /// <param name="secretType">
+    /// The DuckDB secret type the fields came from (e.g. <c>"mssql_net"</c> = this provider's own secret;
+    /// <c>"azure"</c> = a foreign secret reused for auth). Lets the backend interpret the fields per type —
+    /// e.g. map an azure service-principal/managed-identity secret to Entra auth. See
+    /// docs/provider-extensibility.md §2.
+    /// </param>
+    /// <param name="fields">The secret's key/values (case-insensitive lookups recommended).</param>
+    /// <param name="baseConnString">
+    /// The ATTACH connection target (e.g. <c>Server=…;Database=…</c> or a <c>mssql://</c> URI), empty when
+    /// none. Used when a foreign secret carries only AUTH (e.g. azure) and the server/database must come from
+    /// the ATTACH target; ignored for this provider's own full secret.
+    /// </param>
+    string BuildConnectionString(string secretType, IReadOnlyDictionary<string, string> fields, string baseConnString);
 
     /// <summary>
     /// Open a catalog/connection for the given connection string. <paramref name="optionsJson"/> is the

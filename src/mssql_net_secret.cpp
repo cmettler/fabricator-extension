@@ -39,7 +39,7 @@ struct SecretTypeDecl {
 	vector<SecretFieldDecl> fields;
 };
 // secret_type -> declaration. Populated once at extension load (RegisterProviderSecrets), read by the generic
-// creation function + IsProviderSecret + BuildConnectionStringFromSecret. Registration is single-threaded at
+// creation function + IsKnownSecret + BuildConnectionStringFromSecret. Registration is single-threaded at
 // load; reads thereafter never mutate it.
 case_insensitive_map_t<SecretTypeDecl> g_secret_types;
 
@@ -121,12 +121,14 @@ static unique_ptr<SecretEntry> GetSecretEntry(ClientContext &context, const stri
 	return secret_manager.GetSecretByName(transaction, secret_name);
 }
 
-bool IsProviderSecret(ClientContext &context, const string &secret_name) {
+bool IsKnownSecret(ClientContext &context, const string &secret_name) {
 	if (secret_name.empty()) {
 		return false;
 	}
+	// ANY existing secret (our own mssql_net type OR a foreign one reused for auth, e.g. azure). A foreign
+	// secret that turns out to be unusable surfaces a clear error when BuildConnectionStringFromSecret runs.
 	auto entry = GetSecretEntry(context, secret_name);
-	return entry && entry->secret && g_secret_types.find(entry->secret->GetType()) != g_secret_types.end();
+	return entry && entry->secret != nullptr;
 }
 
 // Minimal JSON-string escaping for secret values. Handles the JSON-special chars;
@@ -159,23 +161,22 @@ static string EscapeJson(const string &s) {
 	return out;
 }
 
-string BuildConnectionStringFromSecret(ClientContext &context, const string &secret_name) {
+string BuildConnectionStringFromSecret(ClientContext &context, const string &secret_name,
+                                       const string &base_connstr, const string &provider) {
 	auto entry = GetSecretEntry(context, secret_name); // owns the secret; keep alive for the reads below
-	if (!entry) {
+	if (!entry || !entry->secret) {
 		throw BinderException("mssql_net: secret '%s' not found. Create it with: CREATE SECRET %s "
 		                      "(TYPE mssql_net, host '...', database '...', user '...', password '...')",
 		                      secret_name, secret_name);
 	}
 	auto &secret = *entry->secret;
-	auto type_it = g_secret_types.find(secret.GetType());
-	if (type_it == g_secret_types.end()) {
-		throw BinderException("mssql_net: secret '%s' is not a provider secret type (got '%s')", secret_name,
-		                      secret.GetType());
-	}
+	const string secret_type = secret.GetType();
 	auto &kv = static_cast<const KeyValueSecret &>(secret);
 
-	// Hand all of the secret's fields to the owning backend, which owns the provider connection-string format
-	// (Server=/Database=/Encrypt=/auth/access-token, escaping) AND validates them (build_connection_string).
+	// Hand all of the secret's fields to the owning backend, which owns the connection-string format AND
+	// validates them (build_connection_string), interpreting them per `secret_type` (our own mssql_net secret
+	// => full connstr; a foreign secret, e.g. azure, => auth merged onto base_connstr). See
+	// docs/provider-extensibility.md §2.
 	string json = "{";
 	bool first = true;
 	for (auto &field : kv.secret_map) {
@@ -190,7 +191,11 @@ string BuildConnectionStringFromSecret(ClientContext &context, const string &sec
 	}
 	json += "}";
 
-	return arrownet::BuildConnectionString(type_it->second.provider, json);
+	// Our own secret type routes to its declared backend; a foreign secret routes to the ATTACHing provider
+	// (the one consuming it), default backend when unspecified.
+	auto our = g_secret_types.find(secret_type);
+	const string backend_provider = our != g_secret_types.end() ? our->second.provider : provider;
+	return arrownet::BuildConnectionString(backend_provider, secret_type, json, base_connstr);
 }
 
 } // namespace duckdb

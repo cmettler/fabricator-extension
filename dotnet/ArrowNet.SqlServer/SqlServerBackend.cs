@@ -94,7 +94,91 @@ public sealed class SqlServerBackend : IBackend
     /// a trailing marker that <see cref="SqlServerCatalog"/> strips and applies via
     /// <c>SqlConnection.AccessToken</c>.
     /// </summary>
-    public string BuildConnectionString(IReadOnlyDictionary<string, string> fields)
+    public string BuildConnectionString(string secretType, IReadOnlyDictionary<string, string> fields,
+                                        string baseConnString)
+    {
+        // Dispatch by the DuckDB secret type the fields came from. Our own secret is a full connstr; a foreign
+        // azure secret supplies only Entra auth, merged onto the ATTACH target. See docs/provider-extensibility.md §2.
+        if (string.IsNullOrEmpty(secretType) || secretType.Equals("mssql_net", StringComparison.OrdinalIgnoreCase))
+        {
+            return BuildMssqlConnectionString(fields);
+        }
+        if (secretType.Equals("azure", StringComparison.OrdinalIgnoreCase))
+        {
+            return BuildAzureEntraConnectionString(fields, baseConnString);
+        }
+        throw new ArgumentException(
+            $"mssql_net: a '{secretType}' secret can't be used by the mssql_net provider — use an mssql_net secret, " +
+            "an azure service-principal/managed-identity secret, or authentication='Active Directory Default'");
+    }
+
+    // Reuses an azure secret for Entra auth: the secret supplies the credential (service_principal =
+    // client_id + client_secret, or managed_identity = client_id/none), the ATTACH target supplies
+    // Server/Database. credential_chain has no token usable for SQL (storage-scoped + fetched lazily) — a
+    // clear error points to authentication='Active Directory Default', which makes SqlClient run the same
+    // chain scoped for SQL. See docs/provider-extensibility.md §2.
+    private string BuildAzureEntraConnectionString(IReadOnlyDictionary<string, string> fields, string baseConnString)
+    {
+        string F(string key) => fields.TryGetValue(key, out var v) ? v ?? "" : "";
+        if (string.IsNullOrWhiteSpace(baseConnString))
+        {
+            throw new ArgumentException(
+                "mssql_net: an azure secret supplies only auth — give the server/database in the ATTACH target, " +
+                "e.g. ATTACH 'Server=...;Database=...' AS d (TYPE mssql_net, SECRET <azure_secret>)");
+        }
+        // Normalize a mssql:// URI base to a SqlClient connstr so the auth can be attached onto it.
+        var baseCs = baseConnString.StartsWith("mssql://", StringComparison.OrdinalIgnoreCase)
+            ? SqlServerCatalog.ParseMssqlUri(baseConnString)
+            : baseConnString;
+        SqlConnectionStringBuilder builder;
+        try
+        {
+            builder = new SqlConnectionStringBuilder(baseCs);
+        }
+        catch (Exception ex)
+        {
+            throw new ArgumentException($"mssql_net: invalid ATTACH target for an azure secret: {ex.Message}");
+        }
+        if (string.IsNullOrEmpty(builder.DataSource))
+        {
+            throw new ArgumentException("mssql_net: the ATTACH target for an azure secret must include a Server");
+        }
+
+        var azProvider = F("provider").ToLowerInvariant();
+        var clientId = F("client_id");
+        var clientSecret = F("client_secret");
+        if (azProvider == "credential_chain" ||
+            (clientId.Length == 0 && clientSecret.Length == 0))
+        {
+            throw new ArgumentException(
+                "mssql_net: this azure secret has no reusable SQL credential (credential_chain tokens are " +
+                "storage-scoped and fetched lazily). Use authentication='Active Directory Default' on an " +
+                "mssql_net secret/connstr instead — SqlClient runs the same credential chain, scoped for SQL.");
+        }
+        if (clientSecret.Length > 0)
+        {
+            builder.Authentication = SqlAuthenticationMethod.ActiveDirectoryServicePrincipal;
+            builder.UserID = clientId; // the SP application (client) id
+            builder.Password = clientSecret;
+        }
+        else
+        {
+            // managed identity: user-assigned when a client id is present, else system-assigned.
+            builder.Authentication = SqlAuthenticationMethod.ActiveDirectoryManagedIdentity;
+            if (clientId.Length > 0)
+            {
+                builder.UserID = clientId;
+            }
+        }
+        if (!builder.ContainsKey("Encrypt"))
+        {
+            builder["Encrypt"] = true; // TLS on by default, like the mssql_net path
+        }
+        builder["TrustServerCertificate"] = true;
+        return builder.ConnectionString;
+    }
+
+    private string BuildMssqlConnectionString(IReadOnlyDictionary<string, string> fields)
     {
         string Field(string key) => fields.TryGetValue(key, out var v) ? v ?? "" : "";
 
@@ -340,7 +424,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // user/password before the LAST '@' (passwords may contain unencoded '@'), all
     // components percent-decoded; encrypt/trustservercertificate query params honored
     // (TLS on by default for compatibility).
-    private static string ParseMssqlUri(string uri)
+    internal static string ParseMssqlUri(string uri)
     {
         string rest = uri.Substring("mssql://".Length);
         string query = "";

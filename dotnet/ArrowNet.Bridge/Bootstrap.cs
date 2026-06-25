@@ -26,7 +26,7 @@ public static unsafe class Bootstrap
             return ArrowNetStatus.InvalidArgument;
         }
 
-        vtable->AbiVersion = 38;
+        vtable->AbiVersion = 39;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -566,7 +566,8 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int BuildConnectionString(byte* provider, byte* fieldsJson, byte** outConnStr, byte** err)
+    private static int BuildConnectionString(byte* provider, byte* secretType, byte* fieldsJson, byte* baseConnStr,
+                                             byte** outConnStr, byte** err)
     {
         try
         {
@@ -575,10 +576,14 @@ public static unsafe class Bootstrap
                 return ArrowNetStatus.InvalidArgument;
             }
             var providerName = Marshal.PtrToStringUTF8((nint)provider); // null/empty => default backend
+            var type = Marshal.PtrToStringUTF8((nint)secretType) ?? string.Empty; // the DuckDB secret type
+            var baseConn = Marshal.PtrToStringUTF8((nint)baseConnStr) ?? string.Empty; // ATTACH target (may be empty)
             var json = Marshal.PtrToStringUTF8((nint)fieldsJson) ?? "{}";
-            var fields = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, string>>(json)
+            var parsed = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, string>>(json)
                          ?? new Dictionary<string, string>();
-            var connStr = BackendRegistry.Resolve(providerName).BuildConnectionString(fields);
+            // Case-insensitive: secret field names may be stored lower-cased (ours) or differ by provider (azure).
+            var fields = new Dictionary<string, string>(parsed, StringComparer.OrdinalIgnoreCase);
+            var connStr = BackendRegistry.Resolve(providerName).BuildConnectionString(type, fields, baseConn);
             *outConnStr = (byte*)Marshal.StringToCoTaskMemUTF8(connStr);
             return ArrowNetStatus.Ok;
         }

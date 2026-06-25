@@ -139,7 +139,10 @@ static unique_ptr<Catalog> MssqlNetAttach(optional_ptr<StorageExtensionInfo> sto
 
 	string connection_string;
 	if (!secret_name.empty()) {
-		connection_string = BuildConnectionStringFromSecret(context, secret_name);
+		// info.path is the ATTACH target (Server=…;Database=… / mssql:// URI). For our own mssql_net secret it
+		// is ignored (the secret is a full connstr); for a foreign secret (e.g. azure) reused for auth, the
+		// server/database come from it. provider is the resolved PROVIDER option (which backend interprets it).
+		connection_string = BuildConnectionStringFromSecret(context, secret_name, info.path, provider);
 	} else {
 		connection_string = info.path;
 	}

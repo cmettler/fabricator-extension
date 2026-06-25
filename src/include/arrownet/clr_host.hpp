@@ -44,11 +44,13 @@ const std::string &GetManagedDirectory();
 ArrowNetHandle OpenCatalog(const std::string &connection_string, const std::string &provider = "",
                            const std::string &options_json = "");
 
-// Build a provider connection string from a secret's fields (`fields_json` = a flat
-// JSON object of the secret's key/values). `provider` selects the backend whose
-// connstr format applies (empty => default). Keeps all provider connection-string /
-// auth formatting in the managed backend. Returns the assembled connection string.
-std::string BuildConnectionString(const std::string &provider, const std::string &fields_json);
+// Build a provider connection string from a secret's fields (`fields_json` = a flat JSON object of the
+// secret's key/values). `provider` selects the backend (empty => default). `secret_type` is the DuckDB
+// secret type the fields came from (so the backend interprets them per type, e.g. an azure secret mapped to
+// Entra auth). `base_connstr` (empty => none) is the ATTACH target, used when a foreign secret carries only
+// auth. Keeps all provider connstr/auth formatting in the managed backend. Returns the assembled connstr.
+std::string BuildConnectionString(const std::string &provider, const std::string &secret_type,
+                                  const std::string &fields_json, const std::string &base_connstr = "");
 
 // Close a handle previously returned by OpenCatalog. Safe with nullptr.
 void CloseCatalog(ArrowNetHandle handle);

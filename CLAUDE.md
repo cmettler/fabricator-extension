@@ -847,7 +847,15 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v38** (v38 = the secret-field declaration refactor: a `list_secret_fields` entry was
+- **Current version: ABI v39** (v39 = foreign-secret consumption: `build_connection_string` gained
+  `secret_type` + `base_connstr` args so a provider can reuse a secret of ANOTHER extension's type. C++
+  `BuildConnectionStringFromSecret` resolves ANY secret (`IsMssqlNetSecret`→`IsKnownSecret`) and passes the
+  type + fields + the ATTACH target to C#; `SqlServerBackend` maps an `azure` service_principal/managed_identity
+  secret to Entra auth merged onto the ATTACH target (`ATTACH 'Server=…;Database=…' (TYPE mssql_net, SECRET
+  <azure_sp>)`), and rejects `credential_chain` (storage-scoped/lazy token) pointing to
+  authentication='Active Directory Default'. Validated end-to-end against a live Fabric Warehouse (manual);
+  error paths in `verify_azure_secret.test` (`require azure`). See [docs/provider-extensibility.md](docs/provider-extensibility.md) §2.1.
+  v38 = the secret-field declaration refactor: a `list_secret_fields` entry was
   appended; the provider declares its secret type + fields in C# (`IBackend.SecretType`/`SecretFields`), and
   `RegisterProviderSecrets` registers one DuckDB secret type per declared type generically (fields = the
   `CREATE SECRET` named params; one shared `CreateProviderSecret` keyed by `input.type`). The C++ core names

@@ -302,15 +302,17 @@ typedef struct ArrowNetVTable {
 	// after this call.
 	int32_t (*complete_bulk)(ArrowNetHandle session, int32_t abort, int64_t *affected, char **err);
 
-	// Build a provider connection string from a secret's fields. The host reads the
-	// secret's key/values (DuckDB SecretManager) and passes them as a flat JSON
-	// object {"key":"value",...}; `provider` selects the backend whose connstr
-	// format applies (empty => default). On success *out_connstr receives an owned
-	// UTF-8 connection string (free it via free_error). This keeps all provider
-	// connection-string/auth formatting in the managed backend (the C++ side has no
-	// SqlClient knowledge); the result is then handed to open_catalog as usual.
-	int32_t (*build_connection_string)(const char *provider, const char *fields_json, char **out_connstr,
-	                                   char **err);
+	// Build a provider connection string from a secret's fields. The host reads the secret's key/values
+	// (DuckDB SecretManager) and passes them as a flat JSON object {"key":"value",...}; `provider` selects the
+	// backend whose connstr format applies (empty => default). `secret_type` is the DuckDB type of the secret
+	// the fields came from (e.g. "mssql_net" = this provider's own full secret; "azure" = a FOREIGN secret
+	// reused for auth) so the backend interprets the fields per type. `base_connstr` (nullable/empty) is the
+	// ATTACH connection target (Server=…;Database=… or a mssql:// URI) — used when a foreign secret carries
+	// only auth and the server/database must come from the ATTACH target; ignored for the provider's own full
+	// secret. On success *out_connstr receives an owned UTF-8 connection string (free it via free_error). This
+	// keeps all provider connstr/auth formatting in the managed backend; the result is handed to open_catalog.
+	int32_t (*build_connection_string)(const char *provider, const char *secret_type, const char *fields_json,
+	                                   const char *base_connstr, char **out_connstr, char **err);
 
 	// -------------------------------------------------------------------------
 	// Custom scalar functions (Phase 3). Discovered SQL Server scalar UDFs are
@@ -551,7 +553,7 @@ typedef struct ArrowNetVTable {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 38
+#define ARROWNET_ABI_VERSION 39
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

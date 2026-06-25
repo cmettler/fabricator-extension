@@ -51,6 +51,29 @@ moved — net a *deletion* of the C++ field list + `ValidateFields`, replaced by
 driven by `list_secret_fields`. Validated: `verify_secret` (incl. redaction + connect-time validation) +
 full suite 30/30.
 
+### 2.1 Consuming a FOREIGN secret type (ABI v39)
+
+A provider can also **reuse a secret of another extension's type** (e.g. DuckDB's `azure` secret) — useful
+both for SQL Entra auth and, later, for a storage-capable provider reading `azure`/`s3`/`http` creds. The
+mechanism: `BuildConnectionStringFromSecret` resolves a secret of **any** type (`IsMssqlNetSecret` →
+`IsKnownSecret` = "any secret exists"; the type-restricted check is gone) and passes `(secret_type,
+fields_json, base_connstr)` to `build_connection_string` (ABI v39 added `secret_type` + `base_connstr`). C#
+interprets the fields **per type** — so each provider handles the foreign types it understands; the core just
+forwards. Resolution stays at the points where C++ holds a `ClientContext` (ATTACH, raw-query functions) —
+secrets are context-scoped, so there is no "fetch any secret from arbitrary C#" path.
+
+**SQL Server's azure mapping** (`SqlServerBackend.BuildAzureEntraConnectionString`): an `azure`
+`service_principal` secret → `Active Directory Service Principal` (`User Id`=`CLIENT_ID`,
+`Password`=`CLIENT_SECRET`); `managed_identity` → `Active Directory Managed Identity` (+ `CLIENT_ID` for
+user-assigned). The azure secret carries **auth only** (its `ACCOUNT_NAME` is a storage account), so the
+server/database come from the **ATTACH target** (`base_connstr`), merged via `SqlConnectionStringBuilder`:
+`ATTACH 'Server=…;Database=…' AS d (TYPE mssql_net, SECRET <azure_sp>)`. `credential_chain` is rejected with a
+clear error (its token is storage-scoped + fetched lazily — no SQL-usable credential) pointing to
+`authentication='Active Directory Default'`, which makes SqlClient run the same chain scoped for SQL — also
+the answer for "DuckDB running inside Fabric/Azure with an ambient managed identity." Validated end-to-end:
+an azure SP secret → Entra → a live **Fabric Warehouse** query (manual smoke; the azure extension +
+credentials aren't in CI). Error paths: `verify_azure_secret.test` (`require azure`).
+
 ## 3. ATTACH options — DONE (ABI v37)
 
 **Implemented.** `open_catalog` gained an `options_json` arg: `MssqlNetAttach` now extracts only the two

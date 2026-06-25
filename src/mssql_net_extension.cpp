@@ -51,7 +51,9 @@ static ArrowNetHandle ResolveConnection(ClientContext &context, const string &co
 	}
 	owns = true;
 	// A bare name may also be a provider secret — build a connection string from it.
-	if (IsProviderSecret(context, conn_or_name)) {
+	if (IsKnownSecret(context, conn_or_name)) {
+		// No ATTACH target here (a raw query function), so a foreign auth-only secret (e.g. azure) errors
+		// clearly inside BuildConnectionStringFromSecret; our own mssql_net secret is a full connstr.
 		return arrownet::OpenCatalog(BuildConnectionStringFromSecret(context, conn_or_name));
 	}
 	// A value with no connection-string markers ('=' key/value pairs or a 'scheme://'
