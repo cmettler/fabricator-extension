@@ -198,7 +198,17 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   resolution = execute-at-bind + `GetSchemaTable` + stash the reader (NO `TOPN(0)`); params = ADOMD named
   binding ++ DATATABLE injection; **filter pushdown was never implemented** (projection-only); metadata = DMV
   `SELECT`s (NOT the UNION-ALL trick). Cross-platform AdomdClient (Linux/Fabric XMLA) is **Windows-first,
-  Linux-TBD**. Remaining slices (2 metadata→tables/columns, 3 table scan, 4 `daxeval`, 5 `daxevaltable`/
+  Linux-TBD**. **Slices 2–3 DONE + validated** (live local model): slice 2 = DMV table/column discovery
+  (`TMSCHEMA_TABLES`; columns via `EVALUATE TOPN(0,'T')`+`GetSchemaTable` = real engine types, no TOM-enum
+  guessing; `DaxTypeMap` CLR→Arrow incl. `Decimal`→`Decimal128(p,s)`; `'T'[Col]`→`Col`); slice 3 = table
+  scan via `EVALUATE SELECTCOLUMNS` projection (no filter pushdown — DuckDB re-filters), validated for
+  full/projected scans, `WHERE`/`ORDER BY`/`LIMIT`, aggregation, exact decimals, `DESCRIBE`. **CRITICAL
+  ADOMD finding:** under the in-process CoreCLR host the streaming `AdomdDataReader` fails parsing the
+  **2nd rowset chunk** of a multi-chunk (>~2048-row) response (`AdomdUnknownResponseException` at
+  `XmlaClient.ReadEndElementS`; small/metadata/`LIMIT`-one-chunk reads work; NOT thread/transport/
+  globalization — a standalone console with the same package works). **Fix: read buffered via
+  `AdomdDataAdapter.Fill(DataTable)` + materialize**, schema probed via a zero-row `TOPN(0)` reader
+  (single chunk). Remaining slices (4 `daxeval`, 5 `daxevaltable`/
   `daxapply` in-out, 6 Fabric token auth) in the doc. Then the **generic rename**
   (`arrownet_query`/`_exec`, catalog-type `"arrownet"`) + `BackendRegistry` multi-provider polish are due.
 - **Multi-edition support** (Synapse / Fabric Warehouse / Lakehouse SQL endpoint) — **design:

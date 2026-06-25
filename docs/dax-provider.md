@@ -94,9 +94,24 @@ which caps at 19.84.1) loads in net10 (win-x64), connects to local PBI Desktop, 
    schema table's precision/scale, `DateTime`→`Timestamp(ms)`); `DebracketColumn` strips `'T'[Col]`→`Col`.
    Validated against the live model: `SHOW ALL TABLES` lists all 6 tables with correct types
    (`DECIMAL(19,4)` currency, `TIMESTAMP_MS`, `BIGINT`, `BOOLEAN`, `VARCHAR`).
-3. **Table scan** — `ScanTable` → `EVALUATE SELECTCOLUMNS('T', "Col", 'T'[Col], …)` projection; column-name
-   de-bracketing; `AdomdDataReader`→Arrow. No filter pushdown initially (DuckDB re-filters). (Also makes
-   `DESCRIBE`/`SELECT` work — DuckDB binds the scan for both.)
+3. **Table scan** — **DONE + validated.** `ScanTable` → `EVALUATE SELECTCOLUMNS('T', "Col", 'T'[Col], …)`
+   projection (no projection → `EVALUATE 'T'`); de-bracketed column names match discovery. No filter pushdown
+   (DAX has no general WHERE here) — the pushed filter is ignored and DuckDB re-applies it (never-erase: a
+   superset is safe). Validated: full scan, projection, `WHERE`+`ORDER BY`+`LIMIT`, aggregation, exact
+   `DECIMAL(38,2)` sums, `TIMESTAMP_MS` min, and `DESCRIBE` — all green against the live model.
+   - **CRITICAL FINDING — use `AdomdDataAdapter.Fill`, not the streaming `AdomdDataReader`.** Under the
+     in-process CoreCLR host, ADOMD's streaming reader **fails to parse the second rowset chunk** of a
+     multi-chunk response: `AdomdUnknownResponseException: "The server sent an unrecognizable response"` at
+     `XmlaClient.ReadEndElementS` → `EndRowsetResponseS`, once a result exceeds the first ~2048-row chunk
+     (small results / metadata work; `SELECT … LIMIT` that needs only the first chunk works). It is **not**
+     the batch boundary, the calling thread (a clean pool thread fails too), transport compression/format, or
+     globalization — a standalone console with the same package + data reads all chunks fine, so it's specific
+     to the hostfxr-hosted CLR. The fix: read the whole response **buffered** via `AdomdDataAdapter.Fill(DataTable)`
+     (materialize), then build Arrow from the `DataTable`. The exact schema (incl. decimal precision/scale) is
+     probed separately via a **zero-row reader** (`EVALUATE TOPN(0, <expr>)` — a single-chunk response the
+     reader handles). DAX results are typically aggregated/modest, so full materialization is acceptable;
+     bounded-memory streaming (e.g. server-side paging) is a future improvement. `DaxArrowStream` (the
+     interface-typed streaming reader) was removed once Fill replaced it.
 4. **`daxeval(expr, params)`** — `IArrowTableFunction.Bind` executes + reads `GetSchemaTable()` for the output
    schema (stashing the reader), streams rows in `Execute`.
 5. **`daxevaltable` / `daxapply` in-out** — `IArrowInOutFunction.DoExchange` (DATATABLE injection / per-row

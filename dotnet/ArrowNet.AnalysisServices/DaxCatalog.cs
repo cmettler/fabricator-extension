@@ -1,7 +1,9 @@
+using System.Data;
 using Apache.Arrow;
 using Apache.Arrow.Ipc;
 using Apache.Arrow.Types;
 using ArrowNet.Bridge;
+using ArrowNet.Bridge.Conversion;
 using Microsoft.AnalysisServices.AdomdClient;
 
 namespace ArrowNet.AnalysisServices;
@@ -15,13 +17,15 @@ namespace ArrowNet.AnalysisServices;
 /// </summary>
 internal sealed class DaxCatalog : IBackendCatalog
 {
+    private readonly string _connectionString;
     private readonly AdomdConnection _conn;
     private readonly string? _catalog; // the ADOMD database (model db) this connection is bound to
     private readonly string _modelName; // the single Tabular model in this database = the DuckDB schema name
 
     public DaxCatalog(string connectionString)
     {
-        _conn = new AdomdConnection(connectionString);
+        _connectionString = connectionString;
+        _conn = new AdomdConnection(_connectionString);
         _conn.Open();
         _catalog = DiscoverDefaultCatalog(_conn);
         if (_catalog != null)
@@ -29,6 +33,19 @@ internal sealed class DaxCatalog : IBackendCatalog
             _conn.ChangeDatabase(_catalog);
         }
         _modelName = DiscoverModelNames()[0];
+    }
+
+    /// <summary>Opens a fresh pooled ADOMD connection bound to this catalog's database (for scans, so a
+    /// long-running reader doesn't block metadata on the shared connection).</summary>
+    private AdomdConnection OpenScanConnection()
+    {
+        var conn = new AdomdConnection(_connectionString);
+        conn.Open();
+        if (_catalog != null)
+        {
+            conn.ChangeDatabase(_catalog);
+        }
+        return conn;
     }
 
     // ---- metadata --------------------------------------------------------------------------------------
@@ -79,24 +96,33 @@ internal sealed class DaxCatalog : IBackendCatalog
     private IArrowArrayStream DiscoverColumns(string table)
     {
         // EVALUATE TOPN(0, 'Table') returns the table's data columns (no internal RowNumber) with the
-        // engine's result-column types; GetSchemaTable gives name + CLR type + nullability.
+        // engine's result-column types; the schema table gives name + CLR type + nullability.
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = $"EVALUATE TOPN(0, {QuoteDaxTable(table)})";
+        using var r = cmd.ExecuteReader();
+        var schema = ArrowSchemaFromReader(r);
+        return new InMemoryArrayStream(schema, System.Array.Empty<RecordBatch>());
+    }
+
+    /// <summary>Builds the Arrow schema for a DAX result set from the reader's schema table — de-bracketed
+    /// column names + <see cref="DaxTypeMap"/> types. Shared by column discovery and table scans so a scan's
+    /// column names/types match what was discovered.</summary>
+    private static Schema ArrowSchemaFromReader(IDataReader reader)
+    {
         var fields = new List<Field>();
-        using (var cmd = _conn.CreateCommand())
+        var st = reader.GetSchemaTable();
+        bool hasPrecision = st!.Columns.Contains("NumericPrecision");
+        bool hasScale = st.Columns.Contains("NumericScale");
+        foreach (System.Data.DataRow row in st.Rows)
         {
-            cmd.CommandText = $"EVALUATE TOPN(0, {QuoteDaxTable(table)})";
-            using var r = cmd.ExecuteReader();
-            var st = r.GetSchemaTable();
-            foreach (System.Data.DataRow row in st!.Rows)
-            {
-                var rawName = (string)row["ColumnName"];
-                var clr = (Type)row["DataType"];
-                bool nullable = row["AllowDBNull"] is not bool b || b;
-                int? precision = row.Table.Columns.Contains("NumericPrecision") && row["NumericPrecision"] is int p ? p : null;
-                int? scale = row.Table.Columns.Contains("NumericScale") && row["NumericScale"] is int s ? s : null;
-                fields.Add(new Field(DaxTypeMap.DebracketColumn(rawName), DaxTypeMap.MapClr(clr, precision, scale), nullable));
-            }
+            var rawName = (string)row["ColumnName"];
+            var clr = (Type)row["DataType"];
+            bool nullable = row["AllowDBNull"] is not bool b || b;
+            int? precision = hasPrecision && row["NumericPrecision"] is int p ? p : null;
+            int? scale = hasScale && row["NumericScale"] is int s ? s : null;
+            fields.Add(new Field(DaxTypeMap.DebracketColumn(rawName), DaxTypeMap.MapClr(clr, precision, scale), nullable));
         }
-        return new InMemoryArrayStream(new Schema(fields, null), System.Array.Empty<RecordBatch>());
+        return new Schema(fields, null);
     }
 
     /// <summary>Quotes a table name for DAX (single quotes; embedded quotes doubled).</summary>
@@ -133,9 +159,133 @@ internal sealed class DaxCatalog : IBackendCatalog
     public IArrowArrayStream ExecuteQuery(string sql)
         => throw new NotSupportedException("dax provider: raw query not supported yet (slice 1).");
 
+    /// <summary>
+    /// Scans a model table: projects the requested columns via <c>EVALUATE SELECTCOLUMNS('T', "Col",
+    /// 'T'[Col], …)</c> (no projection => <c>EVALUATE 'T'</c>), runs it on a fresh connection, and streams
+    /// the <see cref="AdomdDataReader"/> as Arrow. Filter pushdown is not done — DAX has no general SQL WHERE
+    /// here — so any pushed filter is ignored and DuckDB re-applies it (never-erase: a superset is safe).
+    /// </summary>
     public IArrowArrayStream ScanTable(string schemaName, string tableName, string? specJson,
                                        IArrowArrayStream? filterValues)
-        => throw new NotSupportedException("dax provider: table scan lands in slice 3.");
+    {
+        var projection = ParseProjection(specJson);
+        // Inner table expression (no leading EVALUATE) so we can both probe its schema and fetch its data.
+        string innerExpr = projection is { Count: > 0 }
+            ? $"SELECTCOLUMNS({QuoteDaxTable(tableName)}, " +
+              string.Join(", ", projection.Select(c =>
+                  $"\"{c.Replace("\"", "\"\"")}\", {QuoteDaxTable(tableName)}[{c}]")) + ")"
+            : QuoteDaxTable(tableName);
+        return ScanTableCore(innerExpr);
+    }
+
+    /// <summary>
+    /// Materializes a DAX result and returns it as an in-memory Arrow stream. Uses
+    /// <see cref="AdomdDataAdapter"/>.Fill (a buffered read of the whole XMLA response) rather than the
+    /// streaming <see cref="AdomdDataReader"/>: under the in-process CoreCLR host the streaming reader fails
+    /// to parse the second rowset chunk of a multi-chunk response (AdomdUnknownResponseException in
+    /// XmlaClient.ReadEndElementS, once a result exceeds the first ~2048-row chunk). The schema (with exact
+    /// numeric precision/scale) is probed separately via a zero-row reader (a single-chunk response, which
+    /// the reader handles). DAX results are typically aggregated/modest, so full materialization is fine;
+    /// bounded-memory streaming is a future improvement (see docs/dax-provider.md).
+    /// </summary>
+    private IArrowArrayStream ScanTableCore(string innerExpr)
+    {
+        var conn = OpenScanConnection();
+        try
+        {
+            // 1) Schema (exact types incl. decimal precision/scale) from a zero-row probe — one chunk, safe.
+            Schema schema;
+            using (var probe = conn.CreateCommand())
+            {
+                probe.CommandText = $"EVALUATE TOPN(0, {innerExpr})";
+                using var pr = probe.ExecuteReader();
+                schema = ArrowSchemaFromReader(pr);
+            }
+
+            // 2) Data via a buffered Fill into a DataTable (avoids the streaming-reader chunk bug).
+            var table = new System.Data.DataTable();
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = $"EVALUATE {innerExpr}";
+                using var adapter = new AdomdDataAdapter((AdomdCommand)cmd);
+                adapter.Fill(table);
+            }
+
+            // 3) Build Arrow batches from the materialized DataTable (no ADOMD reads here — safe to chunk).
+            return new InMemoryArrayStream(schema, BuildBatches(table, schema, batchSize: 2048));
+        }
+        finally
+        {
+            conn.Dispose();
+        }
+    }
+
+    /// <summary>Builds Arrow record batches from a fully-materialized <see cref="System.Data.DataTable"/>
+    /// using the probed <paramref name="schema"/> (column order matches the DataTable).</summary>
+    private static List<RecordBatch> BuildBatches(System.Data.DataTable table, Schema schema, int batchSize)
+    {
+        var batches = new List<RecordBatch>();
+        int ncols = schema.FieldsList.Count;
+        int total = table.Rows.Count;
+        for (int start = 0; start < total; start += batchSize)
+        {
+            int count = Math.Min(batchSize, total - start);
+            var appenders = new ColumnAppender[ncols];
+            for (int c = 0; c < ncols; c++)
+            {
+                appenders[c] = ColumnAppender.Create(schema.FieldsList[c].DataType);
+            }
+            for (int r = 0; r < count; r++)
+            {
+                var row = table.Rows[start + r];
+                for (int c = 0; c < ncols; c++)
+                {
+                    var v = row[c];
+                    if (v is null or DBNull)
+                    {
+                        appenders[c].AppendNull();
+                    }
+                    else
+                    {
+                        appenders[c].Append(v);
+                    }
+                }
+            }
+            var arrays = new IArrowArray[ncols];
+            for (int c = 0; c < ncols; c++)
+            {
+                arrays[c] = appenders[c].Build();
+            }
+            batches.Add(new RecordBatch(schema, arrays, count));
+        }
+        return batches;
+    }
+
+    /// <summary>Extracts the projected DuckDB column names from the scan spec (<c>{"columns":[...]}</c>);
+    /// null/absent => full table.</summary>
+    private static List<string>? ParseProjection(string? specJson)
+    {
+        if (string.IsNullOrWhiteSpace(specJson))
+        {
+            return null;
+        }
+        using var doc = System.Text.Json.JsonDocument.Parse(specJson);
+        if (!doc.RootElement.TryGetProperty("columns", out var cols) ||
+            cols.ValueKind != System.Text.Json.JsonValueKind.Array)
+        {
+            return null;
+        }
+        var result = new List<string>();
+        foreach (var c in cols.EnumerateArray())
+        {
+            var name = c.ValueKind == System.Text.Json.JsonValueKind.String ? c.GetString() : null;
+            if (!string.IsNullOrEmpty(name))
+            {
+                result.Add(name!);
+            }
+        }
+        return result.Count > 0 ? result : null;
+    }
 
     // ---- functions (later slices) ---------------------------------------------------------------------
 
