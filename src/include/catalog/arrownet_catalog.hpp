@@ -37,6 +37,12 @@ public:
 	//! via mssql_net_exec becomes visible). Backs mssql_refresh_cache().
 	void RefreshCache(ClientContext &context);
 
+	//! Drops every schema's MATERIALIZED entries (keeping the discovered name lists), so they lazily
+	//! re-fetch from the committed server state. Context-free (callable from RollbackTransaction, which has
+	//! none). Used on transaction ROLLBACK to discard entries an ALTER's eager re-fetch cached from the
+	//! now-undone uncommitted schema. See ArrowNetSchemaEntry::Alter / arrownet_transaction.cpp.
+	void InvalidateAllEntries();
+
 	ArrowNetHandle GetHandle() const {
 		return handle_;
 	}

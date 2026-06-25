@@ -151,6 +151,13 @@ void ArrowNetCatalog::LoadCatalog(ClientContext &context) {
 	}
 }
 
+void ArrowNetCatalog::InvalidateAllEntries() {
+	lock_guard<mutex> lock(schema_lock_);
+	for (auto &entry : schemas_) {
+		entry.second->InvalidateEntryCache();
+	}
+}
+
 void ArrowNetCatalog::RefreshCache(ClientContext &context) {
 	lock_guard<mutex> lock(schema_lock_);
 

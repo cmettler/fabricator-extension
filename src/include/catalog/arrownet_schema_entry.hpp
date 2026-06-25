@@ -58,6 +58,12 @@ public:
 	//! Drops all cached table + function names and materialized entries (cache refresh).
 	void ClearTables();
 
+	//! Drops only the MATERIALIZED entries (table columns/rowid + function entries), keeping the discovered
+	//! NAME lists — so they lazily re-fetch their details on next access without a full re-discovery (no
+	//! ClientContext needed). Used on transaction ROLLBACK to discard any entry that an ALTER's eager
+	//! re-fetch cached from the now-undone (uncommitted) schema. See Alter() / arrownet_transaction.cpp.
+	void InvalidateEntryCache();
+
 	void Scan(ClientContext &context, CatalogType type, const std::function<void(CatalogEntry &)> &callback) override;
 	void Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) override;
 	optional_ptr<CatalogEntry> LookupEntry(CatalogTransaction transaction,

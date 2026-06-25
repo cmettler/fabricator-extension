@@ -321,16 +321,20 @@ Implemented and verified:
     false` still works (model commits first; non-atomic post-processing). Fabric **`CREATE INDEX` is
     unsupported** (`22424`) — a provider limitation no hook can avoid (the in-txn form then rolls the model
     back with it).
-  - **dbt incremental models — [docs/dbt-incremental.md](docs/dbt-incremental.md)** (validated box).
-    Concurrent **incremental append** (`incremental_strategy='append'`) works at `--threads 4`; **schema
-    evolution** (`on_schema_change='append_new_columns'` → `ALTER ADD COLUMN`) works at `--threads 1`. BUT
-    **concurrent schema evolution at `--threads > 1` deadlocks** (a not-fully-solvable limitation): dbt
-    re-introspects the table schema on a separate autocommit connection while the model's transaction holds
-    the uncommitted `ALTER`'s Sch-M lock → 30s timeout → catalog eviction → "Table does not exist" (captured
-    via `sys.dm_os_waiting_tasks`: a `SELECT * FROM <model> WHERE 1=0` blocked `LCK_M_IS` by the ALTER's
-    session). Unlike the post-hook self-block (solvable via join-only routing), the introspection is a
-    separate txn so there's nothing to join. **Workaround: run schema-evolution migrations at `--threads 1`,
-    steady-state loads at `--threads N`** (a normal migration pattern).
+  - **dbt incremental models — [docs/dbt-incremental.md](docs/dbt-incremental.md)** (validated box + Fabric).
+    Concurrent **incremental append** (`incremental_strategy='append'`) works at `--threads 4`, and
+    **concurrent schema evolution** (`on_schema_change='append_new_columns'` → `ALTER ADD COLUMN`) now works
+    at `--threads 4` too (~0.5s/model). It **used to deadlock** at `--threads > 1`: our `ALTER` evicted the
+    cached entry, so the next bind (in a different transaction, no pinned connection) re-fetched columns
+    (`SELECT * FROM <model> WHERE 1=0`) on a **pooled** connection that blocked `LCK_M_IS` on the ALTER's
+    still-uncommitted Sch-M lock → 30s timeout → re-eviction → "Table does not exist" (captured via
+    `sys.dm_os_waiting_tasks`). **Fix (C++-only): `ArrowNetSchemaEntry::Alter` re-fetches the columns
+    EAGERLY on the model's OWN connection** (which owns the Sch-M lock → read-your-writes, no block) and
+    caches them, so the later bind finds the entry cached and never issues the blocking pooled re-fetch.
+    Since that cached entry reflects the uncommitted schema, **`RollbackTransaction` calls
+    `ArrowNetCatalog::InvalidateAllEntries()`** (drops materialized entries, keeps name lists for lazy
+    re-fetch) so a rolled-back ALTER leaves no stale schema (verified). Same family as the post-hook
+    join-only fix — keep in-transaction work on the transaction's own connection.
 - **Functions**: `mssql_net_query` (raw scan), `mssql_net_exec` (raw exec) — both accept a connstr, a
   secret name, OR an attached-catalog name; `mssql_refresh_cache`/`mssql_invalidate_cache` (+ `_net_`
   aliases, arities 1/2/3); `mssql_version()`; `arrownet_managed_dir()` / `arrownet_test_scan()` /

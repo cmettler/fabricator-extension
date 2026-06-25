@@ -108,6 +108,16 @@ void ArrowNetSchemaEntry::ClearTables() {
 	aggregate_function_entries_.clear();
 }
 
+void ArrowNetSchemaEntry::InvalidateEntryCache() {
+	// Keep the discovered NAME lists (table_types_, scalar_functions_, …); drop only the materialized
+	// entries so the next access re-fetches columns/rowid/return types from the (now committed) server state.
+	lock_guard<mutex> lock(entry_lock_);
+	entries_.clear();
+	function_entries_.clear();
+	table_function_entries_.clear();
+	aggregate_function_entries_.clear();
+}
+
 optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateEntry(ClientContext &context, const string &table_name) {
 	lock_guard<mutex> lock(entry_lock_);
 	auto cached = entries_.find(table_name);
@@ -1728,10 +1738,27 @@ void ArrowNetSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info)
 	auto &table_info = info.Cast<AlterTableInfo>();
 	const string &table = table_info.name;
 
-	// Drops the cached entry so the next lookup re-fetches columns/rowid.
-	auto invalidate = [&](const string &t) {
-		lock_guard<mutex> lock(entry_lock_);
-		entries_.erase(t);
+	// Refresh the cached entry AFTER an ALTER. We don't just evict-and-wait-for-lazy-refetch: the lazy
+	// re-fetch would be triggered by whatever binds the table next — and under dbt that is a SEPARATE
+	// (introspection) transaction with no pinned connection, so its `SELECT * FROM t WHERE 1=0` runs on a
+	// POOLED connection and BLOCKS on this ALTER's still-uncommitted Sch-M lock (held on THIS transaction's
+	// connection) until the command timeout → catalog eviction → "table does not exist" (the concurrent
+	// schema-evolution deadlock, docs/dbt-incremental.md). Instead we re-fetch EAGERLY here, on THIS
+	// transaction's connection (the ambient txn was set at the top of Alter): that connection owns the Sch-M
+	// lock, so a read-your-writes probe on the same session sees the new schema with NO lock wait, and the
+	// fresh entry is cached — so the next bind (even in a different transaction) finds it and never issues the
+	// blocking pooled re-fetch. A transaction that later ROLLS BACK leaves this entry stale (it reflects the
+	// uncommitted ALTER) → RollbackTransaction invalidates the cache (arrownet_transaction.cpp).
+	auto refresh = [&](const string &t) {
+		{
+			lock_guard<mutex> lock(entry_lock_);
+			entries_.erase(t);
+		}
+		try {
+			GetOrCreateEntry(context, t); // eager re-fetch on this txn's connection (no Sch-M self-block)
+		} catch (...) {
+			// Best-effort: on any failure leave the entry evicted (falls back to lazy re-fetch).
+		}
 	};
 
 	switch (table_info.alter_table_type) {
@@ -1750,7 +1777,7 @@ void ArrowNetSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info)
 	case AlterTableType::RENAME_COLUMN: {
 		auto &rc = table_info.Cast<RenameColumnInfo>();
 		arrownet::AlterTable(handle_, name, table, ARROWNET_ALTER_RENAME_COLUMN, rc.old_name, rc.new_name, nullptr, 0);
-		invalidate(table);
+		refresh(table);
 		break;
 	}
 	case AlterTableType::ADD_COLUMN: {
@@ -1763,14 +1790,14 @@ void ArrowNetSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info)
 		producer.Finish();
 		arrownet::AlterTable(handle_, name, table, ARROWNET_ALTER_ADD_COLUMN, ac.new_column.Name(), "",
 		                     producer.Stream(), flags);
-		invalidate(table);
+		refresh(table);
 		break;
 	}
 	case AlterTableType::REMOVE_COLUMN: {
 		auto &rc = table_info.Cast<RemoveColumnInfo>();
 		int32_t flags = rc.if_column_exists ? ARROWNET_ALTER_FLAG_IF_EXISTS : 0;
 		arrownet::AlterTable(handle_, name, table, ARROWNET_ALTER_DROP_COLUMN, rc.removed_column, "", nullptr, flags);
-		invalidate(table);
+		refresh(table);
 		break;
 	}
 	case AlterTableType::ALTER_COLUMN_TYPE: {
@@ -1781,19 +1808,19 @@ void ArrowNetSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info)
 		producer.Finish();
 		arrownet::AlterTable(handle_, name, table, ARROWNET_ALTER_COLUMN_TYPE, ct.column_name, "", producer.Stream(),
 		                     0);
-		invalidate(table);
+		refresh(table);
 		break;
 	}
 	case AlterTableType::SET_NOT_NULL: {
 		auto &sn = table_info.Cast<SetNotNullInfo>();
 		arrownet::AlterTable(handle_, name, table, ARROWNET_ALTER_SET_NOT_NULL, sn.column_name, "", nullptr, 0);
-		invalidate(table);
+		refresh(table);
 		break;
 	}
 	case AlterTableType::DROP_NOT_NULL: {
 		auto &dn = table_info.Cast<DropNotNullInfo>();
 		arrownet::AlterTable(handle_, name, table, ARROWNET_ALTER_DROP_NOT_NULL, dn.column_name, "", nullptr, 0);
-		invalidate(table);
+		refresh(table);
 		break;
 	}
 	case AlterTableType::SET_DEFAULT: {
@@ -1801,7 +1828,7 @@ void ArrowNetSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info)
 		if (!sd.expression) {
 			// DROP DEFAULT (no expression).
 			arrownet::AlterTable(handle_, name, table, ARROWNET_ALTER_DROP_DEFAULT, sd.column_name, "", nullptr, 0);
-			invalidate(table);
+			refresh(table);
 			break;
 		}
 		// Only literal defaults: unwrap one CAST (booleans parse as CAST(... AS BOOLEAN)).
@@ -1823,7 +1850,7 @@ void ArrowNetSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info)
 			arg2 = "b" + Blob::ToBase64(string_t(text.c_str(), (uint32_t)text.size()));
 		}
 		arrownet::AlterTable(handle_, name, table, ARROWNET_ALTER_SET_DEFAULT, sd.column_name, arg2, nullptr, 0);
-		invalidate(table);
+		refresh(table);
 		break;
 	}
 	default:

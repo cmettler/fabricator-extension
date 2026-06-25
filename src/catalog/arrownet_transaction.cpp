@@ -5,6 +5,7 @@
 #include "catalog/arrownet_transaction.hpp"
 
 #include "arrownet/clr_host.hpp"
+#include "catalog/arrownet_catalog.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 
 namespace duckdb {
@@ -64,6 +65,12 @@ void ArrowNetTransactionManager::RollbackTransaction(Transaction &transaction) {
 		arrownet::RollbackTransaction(handle_);
 	} catch (...) {
 		// best-effort: never throw out of rollback
+	}
+	// Discard any catalog entry that an ALTER's eager re-fetch cached from this now-undone (uncommitted)
+	// schema, so the next access re-fetches the committed state. Best-effort; never throw out of rollback.
+	try {
+		db.GetCatalog().Cast<ArrowNetCatalog>().InvalidateAllEntries();
+	} catch (...) {
 	}
 }
 

@@ -6,9 +6,7 @@
 > `incremental_strategy='append'`, `on_schema_change='append_new_columns'`, run at `--threads 4`.
 >
 > **Box and Fabric behave identically** here: concurrent incremental append works at `--threads 4` and schema
-> evolution works at `--threads 1` on both; the concurrent-schema-evolution deadlock (below) is
-> provider-agnostic (it's a dbt-introspection-vs-transactional-DDL interaction, reproduced on box; the same
-> applies to Fabric).
+> evolution works at any thread count on both.
 
 ## Results
 
@@ -17,7 +15,7 @@
 | Run 1 — create (CTAS), `--threads 4` | ✓ 4 models created concurrently |
 | Run 2 — incremental **append** (more rows), `--threads 4` | ✓ appends only new ids (`is_incremental()` filter), 4 concurrent, no contention |
 | Run 3 — **schema evolution** (model SELECT gains a column → `ALTER ADD COLUMN`), `--threads 1` | ✓ all models gain the column |
-| Run 3 — **schema evolution**, `--threads 4` | ✗ **deadlock → 30s timeout per model → "Table does not exist"** |
+| Run 3 — **schema evolution**, `--threads 4` | ✓ all models gain the column (~0.5 s each) — **fixed** (was a ~90 s deadlock; see below) |
 
 ## What works
 
@@ -25,14 +23,14 @@
   provider connection (per the concurrency fix), the `is_incremental()` `WHERE id > (select max(id) from
   {{ this }})` reads the model on the same connection, and the append `INSERT` streams via the bulk path.
   No cross-model contention at `--threads 4`.
-- **Schema evolution itself works** (`on_schema_change='append_new_columns'` → DuckDB `ALTER TABLE … ADD
-  COLUMN` → our catalog `ALTER` path) — at `--threads 1`, all models gain the new column.
+- **Concurrent schema evolution** (`on_schema_change='append_new_columns'` → DuckDB `ALTER TABLE … ADD
+  COLUMN` → our catalog `ALTER` path) now works at `--threads 4` (see the fix below).
 
-## LIMITATION — concurrent schema evolution (`on_schema_change` ALTER) at `--threads > 1` deadlocks
+## Concurrent schema evolution at `--threads > 1` — was a deadlock, now FIXED
 
-Running a dbt run that **introduces a column change** to **multiple incremental models concurrently**
-fails: each model errors after a ~30 s command timeout with a DuckDB `Catalog Error: Table with name
-<model> does not exist!` (with 4 models the failures serialize to ~90 s — see below).
+Before the fix, a dbt run that introduced a column change to **multiple incremental models concurrently**
+failed: each model errored after a ~30 s command timeout (~90 s across 4 models) with a DuckDB `Catalog
+Error: Table with name <model> does not exist!`.
 
 ### Root cause (captured via `sys.dm_os_waiting_tasks`)
 
@@ -41,50 +39,35 @@ session 60  SUSPENDED  wait_type=LCK_M_IS  blocked_by=57   SELECT * FROM [dbo].[
 session 57  (holds an incompatible lock on inc_a — the uncommitted ALTER … ADD COLUMN's Sch-M lock)
 ```
 
-- dbt's incremental + `on_schema_change` path **re-introspects the table's schema** (`SELECT * FROM <model>
-  WHERE 1=0`) as part of materializing it. That introspection runs on a **different connection** (a separate,
-  autocommit query) than the model's transaction.
-- The model's transaction is mid-materialization and holds the **uncommitted `ALTER … ADD COLUMN`'s Sch-M
-  (schema-modification) lock** on the table — which blocks *all* other access, including the `IS` lock the
-  introspection needs.
-- dbt won't `COMMIT` the model (release the Sch-M lock) until the materialization — including the blocked
-  introspection — finishes → a **client-mediated distributed deadlock** invisible to SQL Server's deadlock
-  monitor, resolved only by the `SqlCommand` 30 s timeout. The timed-out metadata read then makes our
-  self-healing catalog **evict** the entry → the next bind reports "table does not exist".
-- With 4 models the catalog's entry-lock serializes the timeouts (~90 s total).
+- Our `ALTER … ADD COLUMN` runs on the model's per-transaction connection (session 57) and **evicts the
+  table's cached catalog entry**. The Sch-M (schema-modification) lock it takes is held until the model's
+  transaction commits, and blocks *all* other access to the table — including the schema-stability lock a
+  `SELECT * FROM inc_a WHERE 1=0` needs.
+- Because the entry was evicted, the **next bind of the table re-fetches its columns** via our
+  `get_metadata(COLUMNS)` query `SELECT * FROM inc_a WHERE 1=0`. Under dbt, that next bind happens in a
+  **different (introspection) transaction** with no pinned connection, so the re-fetch runs on a **pooled**
+  connection (session 60) → it **blocks** on session 57's uncommitted Sch-M lock → ~30 s `SqlCommand`
+  timeout → our self-healing catalog **re-evicts** the entry → the next bind reports "table does not exist".
+- It was threads-specific only incidentally: at `--threads 1` the model commits (releasing the lock) before
+  another transaction binds the table; the plain incremental **append** is fine at any thread count because
+  it takes no Sch-M lock.
 
-This is **threads-specific**: at `--threads 1` the same schema change succeeds (the model commits before the
-next introspection needs the lock). The plain incremental **append** (no `ALTER`) is fine at `--threads 4`
-because it takes no Sch-M lock.
+### The fix — eager same-connection re-fetch on ALTER
 
-### Solvable?
+`ArrowNetSchemaEntry::Alter` no longer evicts-and-waits-for-a-lazy-refetch. After the `ALTER` it **re-fetches
+the columns eagerly, on the model's own connection** (the ambient transaction is set at the top of `Alter`,
+so the metadata read routes to session 57 — which *owns* the Sch-M lock, so a read-your-writes probe on the
+same session sees the new schema with **no lock wait**) and caches that fresh entry. The later bind (even in
+a different transaction) then finds the entry **cached** and never issues the blocking pooled re-fetch.
+Result: concurrent schema evolution succeeds (~0.5 s/model).
 
-**Not in the extension** for the concurrent case. The conflict is between dbt holding a model's transaction
-open across a DDL `ALTER` (Sch-M lock) and dbt re-introspecting that table's schema on a separate
-autocommit connection. The two are different DuckDB transactions, so the per-transaction-connection routing
-can't unify them onto one connection; and a Sch-M lock blocks even snapshot / `READ UNCOMMITTED` reads, so
-the introspection can't be made non-blocking. This is the same family as the dbt **post-hook** self-block
-([dbt-hooks.md](dbt-hooks.md) §3) — there it was solvable because the hook's exec **is** in the model's
-transaction (join-only routing); here the introspection is a separate autocommit query, so there is nothing
-to join.
+Because the eager re-fetch reflects the *uncommitted* schema, a transaction that later **rolls back** would
+leave a stale entry — so `ArrowNetTransactionManager::RollbackTransaction` calls
+`ArrowNetCatalog::InvalidateAllEntries()` (drops materialized entries, keeps the discovered name lists for a
+lazy re-fetch) on rollback. Verified: `ALTER … ADD COLUMN` inside a transaction that `ROLLBACK`s leaves the
+table at its original schema (no stale column). The commit path needs nothing — the cached entry already
+matches the committed schema.
 
-### Workaround (validated)
-
-Run **schema-evolution migrations at `--threads 1`**, then steady-state incremental loads at `--threads N`:
-
-```bash
-dbt run --threads 1 --select state:modified   # the run that changes columns
-dbt run --threads 4                            # normal concurrent incremental loads
-```
-
-This matches the common operational pattern of applying schema migrations as a separate, serialized step.
-Alternatives: `on_schema_change='ignore'` (or `'fail'`) + manage the `ALTER` out-of-band (e.g. a
-`--threads 1` pre-hook / a separate migration), or split schema-changing models into their own selector.
-
-### Possible extension-side mitigation (not implemented)
-
-Lower blast radius without fixing the deadlock: don't hold the catalog entry-lock across the metadata SQL
-(so one blocked introspection doesn't serialize other models' catalog operations — turns the ~90 s
-cascade into independent ~30 s failures), and/or set a short `lock_timeout` on metadata reads so they fail
-fast instead of waiting the full command timeout. Neither makes concurrent schema evolution *work* — the
-`--threads 1` migration step remains the supported path.
+This is the same family of fix as the dbt **post-hook** join-only routing ([dbt-hooks.md](dbt-hooks.md) §3):
+keep the in-transaction work on the transaction's own connection so it never blocks on its own uncommitted
+locks. C++-only (no ABI change).
