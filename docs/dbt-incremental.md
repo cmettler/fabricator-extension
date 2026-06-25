@@ -1,9 +1,14 @@
 # dbt incremental models + schema evolution with `mssql_net`
 
-> Findings from the `dbt_mssql_test/` harness (gitignored), validated against **box SQL Server 2025** with
-> the per-transaction connection model ([transaction-concurrency.md](transaction-concurrency.md)). Models:
-> `materialized='incremental'`, `incremental_strategy='append'`, `on_schema_change='append_new_columns'`,
-> run at `--threads 4`.
+> Findings from the `dbt_mssql_test/` harness (gitignored), validated against **box SQL Server 2025** and a
+> **Fabric Warehouse** with the per-transaction connection model
+> ([transaction-concurrency.md](transaction-concurrency.md)). Models: `materialized='incremental'`,
+> `incremental_strategy='append'`, `on_schema_change='append_new_columns'`, run at `--threads 4`.
+>
+> **Box and Fabric behave identically** here: concurrent incremental append works at `--threads 4` and schema
+> evolution works at `--threads 1` on both; the concurrent-schema-evolution deadlock (below) is
+> provider-agnostic (it's a dbt-introspection-vs-transactional-DDL interaction, reproduced on box; the same
+> applies to Fabric).
 
 ## Results
 
