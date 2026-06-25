@@ -181,8 +181,26 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   connstr-style global functions; **delta is better kept bespoke** (its host-FS-opener need is special) unless the
   global table-fn bind/execute ABI gains an opener arg (SQL fns ignore it). Build it when the 2nd lakehouse
   format/provider arrives; until then delta stays the hand-written ~60-line `arrownet_delta.cpp`.
-- **DAX / ADOMD 2nd provider** (the "one binary, many providers" goal) + the then-due generic rename
-  (`arrownet_query`/`_exec`, catalog-type `"arrownet"`) + `BackendRegistry` multi-provider polish.
+- **DAX / ADOMD 2nd provider** (the "one binary, many providers" goal) — **design + slices:
+  [docs/dax-provider.md](docs/dax-provider.md)**. **Slice 1 DONE + validated against a live local Power BI
+  Desktop instance**: new project `ArrowNet.AnalysisServices` (`DaxBackend : IBackend` provider `"dax"`,
+  aliases `adomd`/`powerbi`/`ssas`/`fabric`; `DaxCatalog : IBackendCatalog`; `PowerBiDesktop` port detection).
+  `ATTACH 'pbidesktop://' AS pbi (TYPE mssql_net, PROVIDER 'dax')` auto-detects the local msmdsrv port
+  (Windows-only, newest workspace's `msmdsrv.port.txt`) → AdomdConnection; `GetMetadata(Schemas)` = model
+  name(s) from `$SYSTEM.TMSCHEMA_MODEL` so the model shows as a DuckDB schema. Other targets pass through as
+  an ADOMD connstr (SSAS/Fabric/AAS). **No ABI/C++ change — pure C# provider** reusing the catalog/scan/
+  function machinery. `BackendRegistry` default is now `ArrowNet.SqlServer,ArrowNet.AnalysisServices` (missing
+  assembly skipped; SqlServer stays default → existing ATTACHes unchanged); `publish-managed.ps1` publishes
+  both into one `arrownet/` dir (Bridge + SqlClient + `Microsoft.AnalysisServices.AdomdClient` 19.96.1 — the
+  plain managed package, **not** `.retail.amd64`). Connection round-trip de-risked via `scratchpad/dax-spike`
+  (AdomdClient loads in net10, DMV + `EVALUATE` + `GetSchemaTable` all work). DAX is **read-only** (writes
+  throw; BEGIN/COMMIT/ROLLBACK no-op). **Key analysis findings** (from `D:\repos\SqlServerFlights`): schema
+  resolution = execute-at-bind + `GetSchemaTable` + stash the reader (NO `TOPN(0)`); params = ADOMD named
+  binding ++ DATATABLE injection; **filter pushdown was never implemented** (projection-only); metadata = DMV
+  `SELECT`s (NOT the UNION-ALL trick). Cross-platform AdomdClient (Linux/Fabric XMLA) is **Windows-first,
+  Linux-TBD**. Remaining slices (2 metadata→tables/columns, 3 table scan, 4 `daxeval`, 5 `daxevaltable`/
+  `daxapply` in-out, 6 Fabric token auth) in the doc. Then the **generic rename**
+  (`arrownet_query`/`_exec`, catalog-type `"arrownet"`) + `BackendRegistry` multi-provider polish are due.
 - **Multi-edition support** (Synapse / Fabric Warehouse / Lakehouse SQL endpoint) — **design:
   [docs/warehouse-support.md](docs/warehouse-support.md)**. **Slices 1–4 DONE + validated end-to-end against
   a real Fabric Warehouse** (edition 11, `BIN2_UTF8`): (1) `ServerProfile` (`ServerProfile.cs`) detected

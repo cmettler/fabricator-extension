@@ -364,7 +364,9 @@ public static class BackendRegistry
         var names = Environment.GetEnvironmentVariable("ARROWNET_BACKEND_ASSEMBLY");
         if (string.IsNullOrWhiteSpace(names))
         {
-            names = "ArrowNet.SqlServer";
+            // Default to every shipped provider; a missing/unloadable assembly is skipped below, so listing
+            // ArrowNet.AnalysisServices here is harmless when only the SqlServer provider is published.
+            names = "ArrowNet.SqlServer,ArrowNet.AnalysisServices";
         }
         foreach (var assemblyName in names.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {

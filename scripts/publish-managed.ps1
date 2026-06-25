@@ -50,4 +50,16 @@ dotnet publish $appProj `
     -o $managedOut
 if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed ($LASTEXITCODE)" }
 
+# Second provider: ArrowNet.AnalysisServices (DAX/ADOMD) — published into the SAME arrownet/ dir so the
+# bridge discovers it by assembly name (ARROWNET_BACKEND_ASSEMBLY defaults to both). Adds its own dll +
+# Microsoft.AnalysisServices.AdomdClient (+ deps) alongside the shared Bridge/runtime files.
+$daxProj = Join-Path $PSScriptRoot "../dotnet/ArrowNet.AnalysisServices/ArrowNet.AnalysisServices.csproj" | Resolve-Path
+Write-Host "Publishing ArrowNet.AnalysisServices ($Rid, $Configuration) -> $managedOut"
+dotnet publish $daxProj `
+    -c $Configuration `
+    -r $Rid `
+    --self-contained true `
+    -o $managedOut
+if ($LASTEXITCODE -ne 0) { throw "dotnet publish (AnalysisServices) failed ($LASTEXITCODE)" }
+
 Write-Host "Managed bridge published to $managedOut"

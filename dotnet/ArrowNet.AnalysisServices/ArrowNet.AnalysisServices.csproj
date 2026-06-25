@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <RootNamespace>ArrowNet.AnalysisServices</RootNamespace>
+    <AssemblyName>ArrowNet.AnalysisServices</AssemblyName>
+    <Description>
+      Analysis Services / DAX backend for the ArrowNet bridge: connects to a Power BI / SSAS / Fabric
+      semantic model via Microsoft.AnalysisServices.AdomdClient, discovers metadata via $SYSTEM DMVs, and
+      evaluates DAX, streaming results to DuckDB as Apache Arrow. The second provider behind the one
+      arrownet binary (provider name "dax"). See docs/dax-provider.md.
+    </Description>
+    <!-- Published beside ArrowNet.SqlServer + Bridge into the extension's arrownet/ dir; the CoreCLR host
+         initializes against ArrowNet.Bridge's runtimeconfig and discovers this backend by assembly name. -->
+    <GenerateRuntimeConfigurationFiles>true</GenerateRuntimeConfigurationFiles>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\ArrowNet.Bridge\ArrowNet.Bridge.csproj" />
+    <PackageReference Include="Microsoft.AnalysisServices.AdomdClient" Version="19.96.1" />
+  </ItemGroup>
+
+</Project>
