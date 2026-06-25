@@ -312,6 +312,16 @@ Implemented and verified:
     the abandoned Option A (dbt uses explicit txns, not autocommit — so an autocommit-detection fix never
     fired): [docs/transaction-concurrency.md](docs/transaction-concurrency.md). Harness:
     `dbt_mssql_test/` (gitignored).
+  - **dbt pre/post hooks — behavior + limitations: [docs/dbt-hooks.md](docs/dbt-hooks.md)** (validated box +
+    Fabric). Highlights: an **in-transaction post-hook error rolls back the model's CREATE on BOTH box AND
+    Fabric** (Fabric Warehouse supports transactional DDL rollback — unlike Snowflake). SQL-Server-specific
+    DDL in a hook (index/PK/UNIQUE) must call `mssql_net_exec` and use **`transaction: false`** (the model
+    commits first so the exec's separate autocommit connection can see it — but then it's NOT atomic). A
+    **default in-txn** post-hook that touches the model via `mssql_net_exec` **self-blocks to a 30s command
+    timeout** (the exec's separate autocommit connection blocks on the model's uncommitted schema lock while
+    dbt won't commit until the hook returns — a client-mediated distributed deadlock); workaround is
+    `transaction: false`, possible future fix is routing `mssql_net_exec` onto the active txn connection when
+    one exists. Fabric **`CREATE INDEX` is unsupported** (`22424`) — a provider limitation no hook can avoid.
 - **Functions**: `mssql_net_query` (raw scan), `mssql_net_exec` (raw exec) — both accept a connstr, a
   secret name, OR an attached-catalog name; `mssql_refresh_cache`/`mssql_invalidate_cache` (+ `_net_`
   aliases, arities 1/2/3); `mssql_version()`; `arrownet_managed_dir()` / `arrownet_test_scan()` /
