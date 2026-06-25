@@ -321,6 +321,16 @@ Implemented and verified:
     false` still works (model commits first; non-atomic post-processing). Fabric **`CREATE INDEX` is
     unsupported** (`22424`) — a provider limitation no hook can avoid (the in-txn form then rolls the model
     back with it).
+  - **dbt incremental models — [docs/dbt-incremental.md](docs/dbt-incremental.md)** (validated box).
+    Concurrent **incremental append** (`incremental_strategy='append'`) works at `--threads 4`; **schema
+    evolution** (`on_schema_change='append_new_columns'` → `ALTER ADD COLUMN`) works at `--threads 1`. BUT
+    **concurrent schema evolution at `--threads > 1` deadlocks** (a not-fully-solvable limitation): dbt
+    re-introspects the table schema on a separate autocommit connection while the model's transaction holds
+    the uncommitted `ALTER`'s Sch-M lock → 30s timeout → catalog eviction → "Table does not exist" (captured
+    via `sys.dm_os_waiting_tasks`: a `SELECT * FROM <model> WHERE 1=0` blocked `LCK_M_IS` by the ALTER's
+    session). Unlike the post-hook self-block (solvable via join-only routing), the introspection is a
+    separate txn so there's nothing to join. **Workaround: run schema-evolution migrations at `--threads 1`,
+    steady-state loads at `--threads N`** (a normal migration pattern).
 - **Functions**: `mssql_net_query` (raw scan), `mssql_net_exec` (raw exec) — both accept a connstr, a
   secret name, OR an attached-catalog name; `mssql_refresh_cache`/`mssql_invalidate_cache` (+ `_net_`
   aliases, arities 1/2/3); `mssql_version()`; `arrownet_managed_dir()` / `arrownet_test_scan()` /
