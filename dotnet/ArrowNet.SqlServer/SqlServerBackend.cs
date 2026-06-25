@@ -60,6 +60,31 @@ public sealed class SqlServerBackend : IBackend
         }
     }
 
+    // The DuckDB secret type + its CREATE SECRET fields, declared here so the host registers them generically
+    // (the C++ core names no field). Names mirror the C++ mssql secret for cross-compat. password / access_token
+    // are redacted. port is INTEGER, use_encrypt / catalog are BOOLEAN, the rest VARCHAR. Connection-string
+    // assembly + validation live in BuildConnectionString. See docs/provider-extensibility.md §2.
+    public string SecretType => "mssql_net";
+
+    public IEnumerable<SecretField> SecretFields => new[]
+    {
+        new SecretField("host"),
+        new SecretField("port", SecretFieldType.Integer),
+        new SecretField("database"),
+        new SecretField("user"),
+        new SecretField("password", Redact: true),
+        new SecretField("use_encrypt", SecretFieldType.Boolean),
+        new SecretField("authentication"),
+        new SecretField("access_token", Redact: true),
+        new SecretField("azure_tenant_id"),
+        new SecretField("catalog", SecretFieldType.Boolean),
+        new SecretField("azure_secret"),
+        new SecretField("schema_filter"),
+        new SecretField("table_filter"),
+        new SecretField("authenticator"),
+        new SecretField("application_name"),
+    };
+
     public IBackendCatalog OpenCatalog(string connectionString, string optionsJson) =>
         new SqlServerCatalog(connectionString, optionsJson);
 
@@ -73,7 +98,29 @@ public sealed class SqlServerBackend : IBackend
     {
         string Field(string key) => fields.TryGetValue(key, out var v) ? v ?? "" : "";
 
+        // Field validation lives here (provider-specific; moved from the former C++ ValidateFields when secret
+        // fields became provider-declared — docs/provider-extensibility.md §2). host + database are required;
+        // an out-of-range/non-numeric port is rejected. Surfaces at connect/ATTACH time.
+        if (string.IsNullOrEmpty(Field("host")))
+        {
+            throw new ArgumentException("mssql_net secret: missing required field 'host'");
+        }
+        if (string.IsNullOrEmpty(Field("database")))
+        {
+            throw new ArgumentException("mssql_net secret: missing required field 'database'");
+        }
         var portStr = Field("port");
+        if (!string.IsNullOrEmpty(portStr))
+        {
+            if (!long.TryParse(portStr, out var p))
+            {
+                throw new ArgumentException($"mssql_net secret: port must be a valid integer. Got: {portStr}");
+            }
+            if (p < 1 || p > 65535)
+            {
+                throw new ArgumentException($"mssql_net secret: port must be between 1 and 65535. Got: {p}");
+            }
+        }
         var port = string.IsNullOrEmpty(portStr) ? "1433" : portStr;
         var encryptStr = Field("use_encrypt");
         var encrypt = string.IsNullOrEmpty(encryptStr) || ParseBool(encryptStr); // default true

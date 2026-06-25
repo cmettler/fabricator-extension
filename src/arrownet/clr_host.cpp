@@ -455,6 +455,18 @@ void ListSettings(ArrowArrayStream &out) {
 	}
 }
 
+void ListSecretFields(ArrowArrayStream &out) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.list_secret_fields) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide list_secret_fields");
+	}
+	char *err = nullptr;
+	int32_t rc = vt.list_secret_fields(&out, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: list_secret_fields failed");
+	}
+}
+
 // `value` is the rendered setting value (nullptr => unset/reset). Pushes into the managed
 // ProviderSettingsStore so providers read it in C#.
 void SetSetting(const std::string &provider, const std::string &name, const char *value) {

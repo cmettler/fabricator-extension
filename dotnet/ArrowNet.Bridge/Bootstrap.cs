@@ -26,7 +26,7 @@ public static unsafe class Bootstrap
             return ArrowNetStatus.InvalidArgument;
         }
 
-        vtable->AbiVersion = 37;
+        vtable->AbiVersion = 38;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -72,6 +72,7 @@ public static unsafe class Bootstrap
         vtable->ListSettings = &ListSettings;
         vtable->SetSetting = &SetSetting;
         vtable->SetActiveTxn = &SetActiveTxn;
+        vtable->ListSecretFields = &ListSecretFields;
         return ArrowNetStatus.Ok;
     }
 
@@ -905,6 +906,68 @@ public static unsafe class Bootstrap
             var batch = new RecordBatch(schema, new IArrowArray[]
             {
                 provider.Build(), name.Build(), type.Build(), def.Build(), desc.Build(), min.Build(),
+            }, rows);
+            CArrowArrayStreamExporter.ExportArrayStream(new InMemoryArrayStream(schema, new[] { batch }), outStream);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    // Provider-declared secret fields (see docs/provider-extensibility.md §2). Returns ALL registered
+    // providers' secret types + fields so the host registers each secret type + its CREATE SECRET named
+    // parameters generically. Five columns: provider, secret_type, name, type ("varchar"|"integer"|
+    // "boolean"), redact ("1"|"0"). A provider with an empty SecretType contributes no rows.
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int ListSecretFields(CArrowArrayStream* outStream, byte** err)
+    {
+        try
+        {
+            if (outStream is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            var provider = new StringArray.Builder();
+            var secretType = new StringArray.Builder();
+            var name = new StringArray.Builder();
+            var type = new StringArray.Builder();
+            var redact = new StringArray.Builder();
+            int rows = 0;
+            foreach (var backend in BackendRegistry.All())
+            {
+                if (string.IsNullOrEmpty(backend.SecretType))
+                {
+                    continue;
+                }
+                foreach (var f in backend.SecretFields)
+                {
+                    provider.Append(backend.Name);
+                    secretType.Append(backend.SecretType);
+                    name.Append(f.Name);
+                    type.Append(f.Type switch
+                    {
+                        SecretFieldType.Integer => "integer",
+                        SecretFieldType.Boolean => "boolean",
+                        _ => "varchar",
+                    });
+                    redact.Append(f.Redact ? "1" : "0");
+                    rows++;
+                }
+            }
+            var schema = new Schema(new[]
+            {
+                new Field("provider", StringType.Default, nullable: false),
+                new Field("secret_type", StringType.Default, nullable: false),
+                new Field("name", StringType.Default, nullable: false),
+                new Field("type", StringType.Default, nullable: false),
+                new Field("redact", StringType.Default, nullable: false),
+            }, metadata: null);
+            var batch = new RecordBatch(schema, new IArrowArray[]
+            {
+                provider.Build(), secretType.Build(), name.Build(), type.Build(), redact.Build(),
             }, rows);
             CArrowArrayStreamExporter.ExportArrayStream(new InMemoryArrayStream(schema, new[] { batch }), outStream);
             return ArrowNetStatus.Ok;

@@ -157,6 +157,9 @@ public unsafe struct ArrowNetVTable
 
     // int32 set_active_txn(void* handle, int64 txn_id, int32 join_only, char** err)
     public delegate* unmanaged[Cdecl]<nint, long, int, byte**, int> SetActiveTxn;
+
+    // int32 list_secret_fields(ArrowArrayStream* out, char** err)
+    public delegate* unmanaged[Cdecl]<CArrowArrayStream*, byte**, int> ListSecretFields;
 }
 
 /// <summary>Mirrors <c>ArrowNetAlterKind</c> in abi.h.</summary>

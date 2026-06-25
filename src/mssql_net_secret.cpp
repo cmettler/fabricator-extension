@@ -9,116 +9,107 @@
 #include "mssql_net_secret.hpp"
 
 #include "arrownet/clr_host.hpp"
+#include "catalog/arrownet_metadata.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
+#include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/secret/secret.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 
+#include <cstring>
+
 namespace duckdb {
 
-// Field names — kept in lock-step with the C++ `mssql` extension's secret so a
-// `CREATE SECRET (TYPE mssql_net, ...)` accepts the same parameters (cross-compat).
-static constexpr const char *kHost = "host";
-static constexpr const char *kPort = "port";
-static constexpr const char *kDatabase = "database";
-static constexpr const char *kUser = "user";
-static constexpr const char *kPassword = "password";
-static constexpr const char *kUseEncrypt = "use_encrypt";
-static constexpr const char *kAccessToken = "access_token";      // BYO Azure Entra JWT
-static constexpr const char *kAzureTenantId = "azure_tenant_id"; // tenant hint
-// `authentication` selects the Microsoft.Data.SqlClient Entra method (mapped in the
-// managed backend); the C++ extension infers it from azure_secret/access_token instead.
-static constexpr const char *kAuthentication = "authentication";
-// Accepted for cross-compat (stored; not all are wired to the SqlClient path).
-static constexpr const char *kCatalog = "catalog";
-static constexpr const char *kAzureSecret = "azure_secret";
-static constexpr const char *kSchemaFilter = "schema_filter";
-static constexpr const char *kTableFilter = "table_filter";
-static constexpr const char *kAuthenticator = "authenticator";
-static constexpr const char *kApplicationName = "application_name";
-
 // -----------------------------------------------------------------------------
-// Creation + validation
+// Provider-declared secret types (see docs/provider-extensibility.md §2). Each provider declares its secret
+// type + fields in C# (IBackend.SecretType / SecretFields); we register them here generically from the
+// list_secret_fields ABI, so the provider-agnostic core names no secret type or field. Field validation +
+// connection-string assembly live in the managed backend (build_connection_string).
 // -----------------------------------------------------------------------------
-// Basic, provider-agnostic validation. Connection-string assembly and auth-value
-// validation now live in the managed backend (build_connection_string), so a secret
-// missing user/password (SQL auth) or carrying an unknown `authentication` value
-// surfaces at connect time rather than here.
-static string ValidateFields(const CreateSecretInput &input) {
-	auto get = [&](const char *key) -> string {
-		auto it = input.options.find(key);
-		return it == input.options.end() ? string() : it->second.ToString();
-	};
+namespace {
 
-	for (auto field : {kHost, kDatabase}) {
-		if (get(field).empty()) {
-			return StringUtil::Format("Missing required field '%s'", field);
-		}
-	}
+struct SecretFieldDecl {
+	string name;
+	bool redact = false;
+	LogicalType type = LogicalType::VARCHAR;
+};
+struct SecretTypeDecl {
+	string provider; // the backend that owns this secret type (passed to build_connection_string)
+	vector<SecretFieldDecl> fields;
+};
+// secret_type -> declaration. Populated once at extension load (RegisterProviderSecrets), read by the generic
+// creation function + IsProviderSecret + BuildConnectionStringFromSecret. Registration is single-threaded at
+// load; reads thereafter never mutate it.
+case_insensitive_map_t<SecretTypeDecl> g_secret_types;
 
-	auto port_it = input.options.find(kPort);
-	if (port_it != input.options.end() && !port_it->second.IsNull()) {
-		int64_t port_value;
-		try {
-			port_value = port_it->second.GetValue<int64_t>();
-		} catch (...) {
-			return StringUtil::Format("Port must be a valid integer. Got: %s", port_it->second.ToString());
-		}
-		if (port_value < 1 || port_value > 65535) {
-			return StringUtil::Format("Port must be between 1 and 65535. Got: %lld", (long long)port_value);
-		}
-	}
-	return "";
-}
+} // namespace
 
-static unique_ptr<BaseSecret> CreateMssqlNetSecret(ClientContext &context, CreateSecretInput &input) {
-	auto error = ValidateFields(input);
-	if (!error.empty()) {
-		throw InvalidInputException("mssql_net secret: %s", error);
+// Generic secret-creation function shared by every registered provider secret type (keyed by input.type):
+// stores the declared fields' supplied values (redacting the marked ones). Validation is deferred to the
+// managed build_connection_string (provider-specific), so a missing/invalid field surfaces at connect time.
+static unique_ptr<BaseSecret> CreateProviderSecret(ClientContext &context, CreateSecretInput &input) {
+	auto it = g_secret_types.find(input.type);
+	if (it == g_secret_types.end()) {
+		throw InvalidInputException("mssql_net: unknown secret type '%s'", input.type);
 	}
 	auto result = make_uniq<KeyValueSecret>(input.scope, input.type, input.provider, input.name);
-	// TrySetValue is a no-op when the key was not supplied.
-	for (auto field : {kHost, kPort, kDatabase, kUser, kPassword, kUseEncrypt, kAccessToken, kAzureTenantId,
-	                   kAuthentication, kCatalog, kAzureSecret, kSchemaFilter, kTableFilter, kAuthenticator,
-	                   kApplicationName}) {
-		result->TrySetValue(field, input);
+	for (auto &field : it->second.fields) {
+		result->TrySetValue(field.name, input); // no-op when the key was not supplied
+		if (field.redact) {
+			result->redact_keys.insert(field.name);
+		}
 	}
-	if (input.options.find(kUseEncrypt) == input.options.end()) {
-		result->secret_map[kUseEncrypt] = Value::BOOLEAN(true); // TLS on by default
-	}
-	result->redact_keys.insert(kPassword);
-	result->redact_keys.insert(kAccessToken);
 	return std::move(result);
 }
 
-void RegisterMssqlNetSecretType(ExtensionLoader &loader) {
-	SecretType type;
-	type.name = "mssql_net";
-	type.deserializer = KeyValueSecret::Deserialize<KeyValueSecret>;
-	type.default_provider = "config";
-	loader.RegisterSecretType(type);
+void RegisterProviderSecrets(ExtensionLoader &loader) {
+	try {
+		ArrowArrayStream stream;
+		std::memset(&stream, 0, sizeof(stream));
+		arrownet::ListSecretFields(stream);
+		// Columns: provider, secret_type, name, type ("varchar"|"integer"|"boolean"), redact ("1"|"0").
+		auto rows = ReadStringTable(stream, 5);
+		size_t n = rows[0].size();
+		for (size_t i = 0; i < n; i++) {
+			const string &provider = rows[0][i];
+			const string &secret_type = rows[1][i];
+			const string &name = rows[2][i];
+			const string &type = rows[3][i];
+			const string &redact = rows[4][i];
+			LogicalType lt = type == "integer" ? LogicalType::INTEGER
+			               : type == "boolean" ? LogicalType::BOOLEAN
+			                                    : LogicalType::VARCHAR;
+			auto &decl = g_secret_types[secret_type];
+			decl.provider = provider;
+			SecretFieldDecl field;
+			field.name = name;
+			field.redact = (redact == "1");
+			field.type = lt;
+			decl.fields.push_back(std::move(field));
+		}
+		// Register one DuckDB secret type (+ its config creation function) per distinct declared secret_type.
+		for (auto &entry : g_secret_types) {
+			SecretType type;
+			type.name = entry.first;
+			type.deserializer = KeyValueSecret::Deserialize<KeyValueSecret>;
+			type.default_provider = "config";
+			loader.RegisterSecretType(type);
 
-	CreateSecretFunction create_func;
-	create_func.secret_type = "mssql_net";
-	create_func.provider = "config";
-	create_func.function = CreateMssqlNetSecret;
-	create_func.named_parameters[kHost] = LogicalType::VARCHAR;
-	create_func.named_parameters[kPort] = LogicalType::INTEGER;
-	create_func.named_parameters[kDatabase] = LogicalType::VARCHAR;
-	create_func.named_parameters[kUser] = LogicalType::VARCHAR;
-	create_func.named_parameters[kPassword] = LogicalType::VARCHAR;
-	create_func.named_parameters[kUseEncrypt] = LogicalType::BOOLEAN;
-	create_func.named_parameters[kAuthentication] = LogicalType::VARCHAR;
-	create_func.named_parameters[kAccessToken] = LogicalType::VARCHAR;
-	create_func.named_parameters[kAzureTenantId] = LogicalType::VARCHAR;
-	create_func.named_parameters[kCatalog] = LogicalType::BOOLEAN;
-	create_func.named_parameters[kAzureSecret] = LogicalType::VARCHAR;
-	create_func.named_parameters[kSchemaFilter] = LogicalType::VARCHAR;
-	create_func.named_parameters[kTableFilter] = LogicalType::VARCHAR;
-	create_func.named_parameters[kAuthenticator] = LogicalType::VARCHAR;
-	create_func.named_parameters[kApplicationName] = LogicalType::VARCHAR;
-	loader.RegisterFunction(std::move(create_func));
+			CreateSecretFunction create_func;
+			create_func.secret_type = entry.first;
+			create_func.provider = "config";
+			create_func.function = CreateProviderSecret;
+			for (auto &field : entry.second.fields) {
+				create_func.named_parameters[field.name] = field.type;
+			}
+			loader.RegisterFunction(std::move(create_func));
+		}
+	} catch (std::exception &) {
+		// Best-effort: if the bridge can't boot at load (e.g. the managed dir is missing), no secret type is
+		// registered (CREATE SECRET would then error "unknown secret type"); the extension still loads.
+		// Mirrors RegisterProviderSettings.
+	}
 }
 
 // -----------------------------------------------------------------------------
@@ -130,12 +121,12 @@ static unique_ptr<SecretEntry> GetSecretEntry(ClientContext &context, const stri
 	return secret_manager.GetSecretByName(transaction, secret_name);
 }
 
-bool IsMssqlNetSecret(ClientContext &context, const string &secret_name) {
+bool IsProviderSecret(ClientContext &context, const string &secret_name) {
 	if (secret_name.empty()) {
 		return false;
 	}
 	auto entry = GetSecretEntry(context, secret_name);
-	return entry && entry->secret && entry->secret->GetType() == "mssql_net";
+	return entry && entry->secret && g_secret_types.find(entry->secret->GetType()) != g_secret_types.end();
 }
 
 // Minimal JSON-string escaping for secret values. Handles the JSON-special chars;
@@ -176,14 +167,15 @@ string BuildConnectionStringFromSecret(ClientContext &context, const string &sec
 		                      secret_name, secret_name);
 	}
 	auto &secret = *entry->secret;
-	if (secret.GetType() != "mssql_net") {
-		throw BinderException("mssql_net: secret '%s' is not TYPE mssql_net (got '%s')", secret_name,
+	auto type_it = g_secret_types.find(secret.GetType());
+	if (type_it == g_secret_types.end()) {
+		throw BinderException("mssql_net: secret '%s' is not a provider secret type (got '%s')", secret_name,
 		                      secret.GetType());
 	}
 	auto &kv = static_cast<const KeyValueSecret &>(secret);
 
-	// Hand all of the secret's fields to the managed backend, which owns the provider
-	// connection-string format (Server=/Database=/Encrypt=/auth/access-token, escaping).
+	// Hand all of the secret's fields to the owning backend, which owns the provider connection-string format
+	// (Server=/Database=/Encrypt=/auth/access-token, escaping) AND validates them (build_connection_string).
 	string json = "{";
 	bool first = true;
 	for (auto &field : kv.secret_map) {
@@ -198,7 +190,7 @@ string BuildConnectionStringFromSecret(ClientContext &context, const string &sec
 	}
 	json += "}";
 
-	return arrownet::BuildConnectionString("", json);
+	return arrownet::BuildConnectionString(type_it->second.provider, json);
 }
 
 } // namespace duckdb

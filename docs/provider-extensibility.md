@@ -18,8 +18,10 @@ The three flavors:
 | Flavor | DuckDB surface | Status |
 |---|---|---|
 | **Settings** (`SET x = …`) | extension options | **DONE** (ABI v33) |
-| **Secret fields** (`CREATE SECRET (TYPE …, field …)`) | secret type + params | designed (§2) — the last one left |
+| **Secret fields** (`CREATE SECRET (TYPE …, field …)`) | secret type + params | **DONE** (ABI v38, §2) |
 | **ATTACH options** (`ATTACH … (TYPE …, opt …)`) | storage-extension attach map | **DONE** (ABI v37, §3) |
+
+All three flavors now follow the one principle: **the provider declares; the core stays name-agnostic.**
 
 ## 1. Settings — DONE (ABI v33)
 
@@ -28,26 +30,26 @@ Full design: [settings-architecture.md](settings-architecture.md). Recap: `IBack
 values via `set_setting` into `ProviderSettingsStore` → the provider reads them in C#
 (`MapArrowToSqlType` already reads `mssql_default_varchar_length` this way). The core names no setting.
 
-## 2. Secret fields — the cleanest remaining (values already flow to C#)
+## 2. Secret fields — DONE (ABI v38)
 
-**Today (C++-hardcoded):** [mssql_net_secret.cpp](../src/mssql_net_secret.cpp) registers the `mssql_net`
-secret type and a `CreateSecretFunction` whose `named_parameters[kHost] = …` etc. are all `mssql`-specific,
-plus a C++ `ValidateFields` (port-range check).
+**Implemented.** The provider declares its secret type + fields in C#: `IBackend.SecretType` (e.g.
+`"mssql_net"`) + `IBackend.SecretFields` (a `SecretField` list — name / type (`varchar`/`integer`/`boolean`)
+/ `redact`). A new `list_secret_fields` ABI (the `list_settings` twin) is queried at extension load;
+`RegisterProviderSecrets` registers **one DuckDB secret type per declared `secret_type`** generically — the
+listed fields become the `CREATE SECRET` named parameters (redacting the marked ones) via one shared
+`CreateProviderSecret` (keyed by `input.type`). The C++ core names **no** secret type or field: the field
+constants (`kHost` …), `ValidateFields`, and `CreateMssqlNetSecret` are gone; `IsMssqlNetSecret` →
+`IsProviderSecret` and `BuildConnectionStringFromSecret` now check the registered-types map and pass the
+owning provider to `build_connection_string`.
 
-**Already C#:** the secret *values* cross via `build_connection_string(provider, fields_json)` (ABI v18) —
-C# reads the secret's fields as JSON and assembles the provider connstr. So only the **declaration** and
-**validation** are stuck in C++.
+**Validation moved to C#** (`SqlServerBackend.BuildConnectionString`): host/database required + port range —
+it surfaces at **connect/ATTACH time** rather than at `CREATE SECRET` (the design intent; `use_encrypt`/`port`
+defaults were already applied there). `verify_secret.test` updated to assert the connect-time error.
 
-**Refactor:**
-- `IBackend.SecretType` (the secret type name, e.g. `sqlserver`/`mssql`, `dax`) + `IBackend.SecretFields`
-  (name/type, like `ProviderSetting`).
-- A new `list_secret_fields` ABI (the `list_settings` twin) called at load; C++ registers **one secret type
-  per provider** generically from the result. The core stops naming secret fields.
-- `ValidateFields` moves to C# — it's provider-specific, and C# already owns connstr assembly
-  (`BuildConnectionString`), so validation belongs right next to it.
-
-**Why cleanest:** only declaration + validation move; the value path (`build_connection_string`) already
-exists. Mostly *deleting* the C++ field list + `ValidateFields` and declaring them in C#.
+**The value path** (`build_connection_string`, ABI v18) was already C#, so only declaration + validation
+moved — net a *deletion* of the C++ field list + `ValidateFields`, replaced by one generic registration
+driven by `list_secret_fields`. Validated: `verify_secret` (incl. redaction + connect-time validation) +
+full suite 30/30.
 
 ## 3. ATTACH options — DONE (ABI v37)
 
@@ -106,12 +108,13 @@ Both are **net reductions** in provider-specific C++, mirroring the settings out
 
 ## Sequencing
 
-- **Settings** — done.
-- **Secret fields + ATTACH options** — build **with the DAX provider**: that's when a *second* secret type
-  and a *second* ATTACH-option set first exist to validate the genericity against (building them now would be
-  speculative with only one provider). The **secret-field declaration** is close enough to done (values
-  already flow) to be a tidy standalone follow-up if the `mssql` provider should be fully self-describing
-  before DAX.
+- **Settings** — done (ABI v33).
+- **ATTACH options** — done (ABI v37).
+- **Secret fields** — done (ABI v38).
+
+All three flavors are built and the `mssql` provider is fully self-describing. The DAX provider can now
+declare its settings / ATTACH options / secret type the same way, with no provider-specific names in the
+core — the genericity is in place to validate against a second provider when it lands.
 
 The architecture converges on: **a provider declares its settings, secret fields, and ATTACH options; the
 C++ core stays name-agnostic** — three instances of one pattern.

@@ -89,6 +89,11 @@ void GetMetadata(ArrowNetHandle handle, int32_t kind, const std::string &arg1, c
 void ListSettings(ArrowArrayStream &out);
 void SetSetting(const std::string &provider, const std::string &name, const char *value);
 
+// Provider-declared secret fields (see docs/provider-extensibility.md §2). Fills `out` with ALL registered
+// providers' secret types + fields (five string columns: provider, secret_type, name, type, redact); the
+// host registers one DuckDB secret type per distinct secret_type at load.
+void ListSecretFields(ArrowArrayStream &out);
+
 // Scan a table; fills `out` with the rows as an Arrow stream. `spec_json` (empty
 // => none) carries projection + filter pushdown; `filter_values` (nullable) is a
 // one-batch Arrow stream of the typed constants the filter tree references.

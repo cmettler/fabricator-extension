@@ -535,13 +535,23 @@ typedef struct ArrowNetVTable {
 	// never triggers DuckDB's transaction lifecycle, so nothing would ever commit a pinned connection). Normal
 	// DuckDB-managed writes pass 0 (they create + own the per-transaction connection). See docs/dbt-hooks.md.
 	int32_t (*set_active_txn)(ArrowNetHandle handle, int64_t txn_id, int32_t join_only, char **err);
+
+	// -------------------------------------------------------------------------
+	// Provider-declared secret fields (see docs/provider-extensibility.md §2). Appended at the vtable end.
+	// -------------------------------------------------------------------------
+	// list_secret_fields: the managed side returns ALL registered providers' secret types + fields as an Arrow
+	// stream with five UTF-8 columns: provider, secret_type, name, type ("varchar"|"integer"|"boolean"),
+	// redact ("1"|"0"). The host registers one DuckDB secret type per distinct secret_type at extension load,
+	// with the listed fields as the CREATE SECRET named parameters (redacting the marked ones) — so the
+	// provider-agnostic core names no secret type or field. A provider with no secret type contributes no rows.
+	int32_t (*list_secret_fields)(struct ArrowArrayStream *out, char **err);
 } ArrowNetVTable;
 
 // Max serialized size of a spillable aggregate's per-group state (the inline, pointer-free
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 37
+#define ARROWNET_ABI_VERSION 38
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

@@ -245,9 +245,10 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   `Settings`, no `begin_bulk`/`create_table` signature changes). Prerequisite for the 2nd provider. The same
   provider-declared pattern also covers **ATTACH options** (DONE, ABI v37 — `open_catalog(options_json)`;
   C# parses `schema_filter`/`table_filter`/`isolation_level`, filtering applied in `get_metadata`,
-  `PROVIDER`/`SECRET` stay C++ meta-options) and **secret fields** (still C++-hardcoded in
-  `mssql_net_secret.cpp`, though values already flow via `build_connection_string` — the last flavor left,
-  to build with the DAX provider) — **design:
+  `PROVIDER`/`SECRET` stay C++ meta-options) and **secret fields** (DONE, ABI v38 — `list_secret_fields`;
+  C# declares `SecretType`/`SecretFields`, C++ `RegisterProviderSecrets` registers the type + params
+  generically, validation in `BuildConnectionString`). **All three flavors are built; the `mssql` provider is
+  fully self-describing** — **design:
   [docs/provider-extensibility.md](docs/provider-extensibility.md)** (the unified "provider declares; core
   stays name-agnostic" model).
 
@@ -846,7 +847,14 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v37** (v37 = the ATTACH-options→C# refactor: `open_catalog` gained an `options_json`
+- **Current version: ABI v38** (v38 = the secret-field declaration refactor: a `list_secret_fields` entry was
+  appended; the provider declares its secret type + fields in C# (`IBackend.SecretType`/`SecretFields`), and
+  `RegisterProviderSecrets` registers one DuckDB secret type per declared type generically (fields = the
+  `CREATE SECRET` named params; one shared `CreateProviderSecret` keyed by `input.type`). The C++ core names
+  no secret type/field — the `kHost…` constants, `ValidateFields`, and `CreateMssqlNetSecret` are gone;
+  validation moved to C# `BuildConnectionString` (surfaces at connect time). `IsMssqlNetSecret`→
+  `IsProviderSecret`. See [docs/provider-extensibility.md](docs/provider-extensibility.md) §2.
+  v37 = the ATTACH-options→C# refactor: `open_catalog` gained an `options_json`
   arg carrying the provider-owned ATTACH options as a flat JSON object, and `inout_exchange_open` dropped its
   `isolation` arg. `MssqlNetAttach` now extracts only PROVIDER/SECRET (meta) and forwards every other option
   as JSON; C# `SqlServerCatalog` parses `schema_filter`/`table_filter` (applied in `get_metadata`, with the

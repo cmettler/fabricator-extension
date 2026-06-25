@@ -32,6 +32,21 @@ public interface IBackend
     IEnumerable<ProviderSetting> Settings => System.Array.Empty<ProviderSetting>();
 
     /// <summary>
+    /// The DuckDB secret type this provider registers (used in <c>CREATE SECRET (TYPE …)</c>), e.g.
+    /// <c>"mssql_net"</c>. Empty (default) =&gt; the provider has no secret type. Declared here so the host
+    /// registers the secret type + its <see cref="SecretFields"/> generically — the C++ core names no secret
+    /// type or field. See docs/provider-extensibility.md §2.
+    /// </summary>
+    string SecretType => string.Empty;
+
+    /// <summary>
+    /// The fields of <see cref="SecretType"/> (the <c>CREATE SECRET</c> named parameters). Empty when the
+    /// provider has no secret type. The host registers these generically (via <c>list_secret_fields</c>) and
+    /// stores supplied values; this provider reads them in <see cref="BuildConnectionString"/>.
+    /// </summary>
+    IEnumerable<SecretField> SecretFields => System.Array.Empty<SecretField>();
+
+    /// <summary>
     /// Builds a provider connection string from a secret's fields (the host reads the DuckDB secret and
     /// passes its key/values here). Keeps all provider connection-string / auth formatting in the
     /// backend — the C++ side has no knowledge of the provider's connstr dialect. The result is then

@@ -50,8 +50,8 @@ static ArrowNetHandle ResolveConnection(ClientContext &context, const string &co
 		}
 	}
 	owns = true;
-	// A bare name may also be an mssql_net secret — build a connection string from it.
-	if (IsMssqlNetSecret(context, conn_or_name)) {
+	// A bare name may also be a provider secret — build a connection string from it.
+	if (IsProviderSecret(context, conn_or_name)) {
 		return arrownet::OpenCatalog(BuildConnectionStringFromSecret(context, conn_or_name));
 	}
 	// A value with no connection-string markers ('=' key/value pairs or a 'scheme://'
@@ -388,8 +388,8 @@ static void MssqlRefreshCacheFunction(DataChunk &args, ExpressionState &state, V
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
-	// CREATE SECRET ... (TYPE mssql_net, host '...', ...)
-	RegisterMssqlNetSecretType(loader);
+	// CREATE SECRET ... (TYPE mssql_net, host '...', ...) — secret type(s) + fields declared in C#
+	RegisterProviderSecrets(loader);
 	// ATTACH '<connstr>' AS db (TYPE mssql_net) — or ATTACH '' (TYPE mssql_net, SECRET name)
 	RegisterMssqlNetStorageExtension(loader);
 	// COPY ... TO 'mssql://...' (FORMAT mssql_net)

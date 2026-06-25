@@ -14,15 +14,16 @@
 
 namespace duckdb {
 
-//! Registers the `mssql_net` secret type + its `config` creation function.
-void RegisterMssqlNetSecretType(ExtensionLoader &loader);
+//! Registers every provider's secret type(s) + their `config` creation functions, declared in C#
+//! (IBackend.SecretType / SecretFields) and queried via the list_secret_fields ABI at load — so the
+//! provider-agnostic core names no secret type or field. See docs/provider-extensibility.md §2.
+void RegisterProviderSecrets(ExtensionLoader &loader);
 
-//! Looks up a stored `mssql_net` secret by name and assembles a SqlClient
-//! connection string from its fields. Throws if the secret is missing or is not
-//! an mssql_net secret.
+//! Looks up a stored provider secret by name and assembles a connection string from its fields (the owning
+//! backend validates + formats it). Throws if the secret is missing or is not a provider secret type.
 string BuildConnectionStringFromSecret(ClientContext &context, const string &secret_name);
 
-//! True if a secret with this name exists and is of type `mssql_net`.
-bool IsMssqlNetSecret(ClientContext &context, const string &secret_name);
+//! True if a secret with this name exists and is one of the registered provider secret types.
+bool IsProviderSecret(ClientContext &context, const string &secret_name);
 
 } // namespace duckdb
