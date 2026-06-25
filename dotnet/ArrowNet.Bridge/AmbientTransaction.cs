@@ -19,11 +19,28 @@ namespace ArrowNet.Bridge;
 public static class AmbientTransaction
 {
     [ThreadStatic] private static long _current;
+    [ThreadStatic] private static bool _joinOnly;
 
     /// <summary>The active DuckDB transaction id on this thread (0 = none / autocommit).</summary>
     public static long Current
     {
         get => _current;
         set => _current = value;
+    }
+
+    /// <summary>
+    /// "Join-only" mode for the next write: used by the raw `mssql_net_exec` passthrough. When set, a write
+    /// JOINS the active transaction's pinned connection **only if one already exists** (a DuckDB-managed write
+    /// — INSERT/CTAS/DDL — is already in flight in this transaction), so the exec runs on that same connection
+    /// (atomic with the transaction, sees its uncommitted writes). If no pinned connection exists it takes a
+    /// fresh autocommit connection and does NOT create persistent transaction state — because a raw exec's
+    /// target catalog never triggers DuckDB's transaction lifecycle, so nothing would ever commit a pinned
+    /// connection (it would roll back at teardown). Normal DuckDB-managed writes leave this false (they create
+    /// + own the per-transaction connection, committed by the transaction manager).
+    /// </summary>
+    public static bool JoinOnly
+    {
+        get => _joinOnly;
+        set => _joinOnly = value;
     }
 }

@@ -315,13 +315,12 @@ Implemented and verified:
   - **dbt pre/post hooks — behavior + limitations: [docs/dbt-hooks.md](docs/dbt-hooks.md)** (validated box +
     Fabric). Highlights: an **in-transaction post-hook error rolls back the model's CREATE on BOTH box AND
     Fabric** (Fabric Warehouse supports transactional DDL rollback — unlike Snowflake). SQL-Server-specific
-    DDL in a hook (index/PK/UNIQUE) must call `mssql_net_exec` and use **`transaction: false`** (the model
-    commits first so the exec's separate autocommit connection can see it — but then it's NOT atomic). A
-    **default in-txn** post-hook that touches the model via `mssql_net_exec` **self-blocks to a 30s command
-    timeout** (the exec's separate autocommit connection blocks on the model's uncommitted schema lock while
-    dbt won't commit until the hook returns — a client-mediated distributed deadlock); workaround is
-    `transaction: false`, possible future fix is routing `mssql_net_exec` onto the active txn connection when
-    one exists. Fabric **`CREATE INDEX` is unsupported** (`22424`) — a provider limitation no hook can avoid.
+    DDL in a hook (index/PK/UNIQUE) must call `mssql_net_exec`. A **default in-txn** post-hook touching the
+    model via `mssql_net_exec` now runs **atomically with the model** (ABI v36 join-only: the exec runs on the
+    model's own pinned connection — box: model + index in ~0.3s; previously a 30s self-block). `transaction:
+    false` still works (model commits first; non-atomic post-processing). Fabric **`CREATE INDEX` is
+    unsupported** (`22424`) — a provider limitation no hook can avoid (the in-txn form then rolls the model
+    back with it).
 - **Functions**: `mssql_net_query` (raw scan), `mssql_net_exec` (raw exec) — both accept a connstr, a
   secret name, OR an attached-catalog name; `mssql_refresh_cache`/`mssql_invalidate_cache` (+ `_net_`
   aliases, arities 1/2/3); `mssql_version()`; `arrownet_managed_dir()` / `arrownet_test_scan()` /
@@ -829,8 +828,12 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v35** (v35 = the write-concurrency fix: `begin_bulk`'s `autocommit` int32 arg became
-  `int64 txn_id`, and one new entry `set_active_txn(handle, txn_id)` was appended — the host sets the active
+- **Current version: ABI v36** (v36 = the `mssql_net_exec` join-only refinement: `set_active_txn` gained an
+  `int32 join_only` arg — a raw exec joins the active transaction's pinned connection iff one already exists
+  (atomic with an in-flight DuckDB-managed write, e.g. a dbt post-hook adding an index to the model), else
+  autocommits without pinning; fixes the in-transaction-hook self-block, see [docs/dbt-hooks.md](docs/dbt-hooks.md) §3.
+  v35 = the write-concurrency fix: `begin_bulk`'s `autocommit` int32 arg became
+  `int64 txn_id`, and one new entry `set_active_txn(handle, txn_id, …)` was appended — the host sets the active
   DuckDB `global_transaction_id` so the managed side keys a per-transaction provider connection; see the
   "Per-DuckDB-transaction connections" bullet under Transactions + [docs/transaction-concurrency.md](docs/transaction-concurrency.md).
   v33/v34 = the settings refactor: v33 added `list_settings` + `set_setting`; v34 dropped `create_table`'s

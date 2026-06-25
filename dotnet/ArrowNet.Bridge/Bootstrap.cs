@@ -26,7 +26,7 @@ public static unsafe class Bootstrap
             return ArrowNetStatus.InvalidArgument;
         }
 
-        vtable->AbiVersion = 35;
+        vtable->AbiVersion = 36;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -448,9 +448,10 @@ public static unsafe class Bootstrap
     // calls this immediately before each such call. 0 => no specific transaction (fresh/pooled connection).
     // handle is unused (the ambient is per-thread + global; each catalog keys its own state dictionary by it).
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int SetActiveTxn(nint handle, long txnId, byte** err)
+    private static int SetActiveTxn(nint handle, long txnId, int joinOnly, byte** err)
     {
         AmbientTransaction.Current = txnId;
+        AmbientTransaction.JoinOnly = joinOnly != 0;
         return ArrowNetStatus.Ok;
     }
 

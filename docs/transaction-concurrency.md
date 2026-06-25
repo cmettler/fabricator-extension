@@ -58,7 +58,7 @@ but is **incorrect**: concurrent DuckDB transactions would share one `SqlConnect
 so their commits/rollbacks would mix. Locking only makes a *per-transaction-connection* model safe (native's
 intra-transaction mutex), it does not substitute for it.
 
-## Implementation (Option C, ABI v35)
+## Implementation (Option C, ABI v35; join-only refinement at v36)
 
 Per-DuckDB-transaction provider connections, keyed by `global_transaction_id`:
 
@@ -81,10 +81,17 @@ Per-DuckDB-transaction provider connections, keyed by `global_transaction_id`:
   `mssql_net_query` — read-your-writes), DDL in `ArrowNetSchemaEntry::CreateTable/DropEntry/Alter` +
   `ArrowNetCatalog::CreateSchema/DropSchema`, DML in `arrownet_modify`/`arrownet_insert`, the proc `_each`
   exchange in `ArrowNetExchange{InitGlobal,Function}` (so its `BeginWrite` joins DuckDB's pinned write txn),
-  the catalog-visibility re-fetch in `FetchTableColumns`, and `mssql_net_exec` (attached-catalog target only;
-  an ephemeral connstr handle stays autocommit since nothing commits its connection). `begin_bulk` carries
-  the id explicitly (background thread). Helper: `ArrowNetSetActiveTxn(handle, context)` in
+  the catalog-visibility re-fetch in `FetchTableColumns`, and `mssql_net_exec`. `begin_bulk` carries the id
+  explicitly (background thread). Helper: `ArrowNetSetActiveTxn(handle, context)` in
   `catalog/arrownet_txn_util.hpp`.
+- **`mssql_net_exec` join-only mode (ABI v36).** A raw exec can't blindly key to the active transaction: its
+  string-arg target never triggers DuckDB's transaction lifecycle, so a pinned connection it created would
+  never be committed (rolled back at teardown). `set_active_txn` gained a `join_only` flag the exec sets:
+  `BeginWrite` then runs on the active transaction's pinned connection **iff one already exists** (a
+  DuckDB-managed write — e.g. a dbt model's CTAS — is in flight), making the exec **atomic** with that
+  transaction and able to see its uncommitted writes (the fix for the in-transaction-hook self-block — see
+  [dbt-hooks.md](dbt-hooks.md) §3); otherwise it autocommits on its own connection without pinning. Normal
+  DuckDB-managed writes pass `join_only=0` (create + own the per-transaction connection).
 
 ## Validation
 

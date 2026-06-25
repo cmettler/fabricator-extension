@@ -31,7 +31,7 @@ COMMIT                              -- our CommitTransaction(T) commits the prov
 |---|---|---|
 | In-txn post-hook **errors** (bad T-SQL) | model **rolled back** — table absent ✓ | model **rolled back** — table absent ✓ |
 | `transaction:false` post-hook adds an index via `mssql_net_exec` | model committed **+ index created** ✓ | model committed; index **fails** (`22424 CREATE INDEX is not supported`) → table persists **without** index |
-| In-txn post-hook modifies the model via `mssql_net_exec` | **30s Execution Timeout** (self-block) ✗ | same (provider-agnostic) ✗ |
+| In-txn post-hook adds an index via `mssql_net_exec` | model **+ index created atomically** ✓ (was a 30s self-block before the join-only fix) | index **fails** (`22424`) → model rolled back with it |
 
 ## Findings
 
@@ -67,28 +67,29 @@ index. This is exactly dbt's own caveat about out-of-transaction hooks.
 > `UNIQUE` has no such requirement. On Fabric, both must be `NONCLUSTERED … NOT ENFORCED` (the model's own
 > PK/UNIQUE-on-CREATE path already emits that form — see warehouse-support.md §3.5).
 
-### 3. LIMITATION — an in-transaction hook must NOT modify the just-created model via `mssql_net_exec`
+### 3. In-transaction hook modifying the model via `mssql_net_exec` — FIXED (join-only routing)
 
-A **default** (`transaction:true`) post-hook calling `mssql_net_exec` to touch the model **self-blocks to a
-30-second command timeout** (`-2: Execution Timeout Expired`):
+A **default** (`transaction:true`) post-hook calling `mssql_net_exec` to touch the just-created model now
+**runs atomically with the model** (box: model + index created in one transaction, ~0.3s). It used to
+**self-block to a 30-second command timeout** (`-2: Execution Timeout Expired`):
 
 - The model's `CREATE` is **uncommitted**, holding schema locks on **dbt's transaction connection** `C_T`.
-- `mssql_net_exec` **autocommits on a separate connection** `C_X` (by design — it's a raw passthrough; see
-  transaction-concurrency.md), which **blocks** on `C_T`'s locks.
-- dbt won't `COMMIT` (release `C_T`) until the hook returns, and the hook (`C_X`) can't return until `C_T`
-  commits → a **client-mediated distributed deadlock** that SQL Server's deadlock monitor can't see (the two
-  sessions wait through the dbt client), so it resolves only by the `SqlCommand` timeout.
+- `mssql_net_exec` *used to* autocommit on a **separate** connection `C_X`, which **blocked** on `C_T`'s
+  locks; dbt wouldn't `COMMIT` (release `C_T`) until the hook returned, and the hook (`C_X`) couldn't return
+  until `C_T` committed → a **client-mediated distributed deadlock** invisible to SQL Server's deadlock
+  monitor → resolved only by the `SqlCommand` timeout.
 
-**Workaround (idiomatic):** use `transaction: false` / `after_commit()` (finding #2). This is the standard
-dbt pattern for DDL-ish hooks anyway.
-
-**Possible future fix (not implemented):** route `mssql_net_exec` onto the **active transaction's** connection
-when the catalog already has one for this DuckDB transaction (i.e. a model write is in progress) — it would
-then run the DDL on `C_T` itself, see the uncommitted model, and commit/roll back **atomically** with the
-model. Today `mssql_net_exec` always autocommits because, standalone, its string-arg target doesn't trigger
-the catalog's transaction lifecycle (nothing would ever commit a pinned connection). A "join the active
-transaction connection iff one already exists, else autocommit" rule would make the in-txn hook atomic
-without regressing the standalone case. Tracked as an enhancement.
+**Fix (ABI v36 `set_active_txn` `join_only`):** `mssql_net_exec` runs in **join-only** mode — it executes on
+the **active transaction's pinned connection iff one already exists** (a DuckDB-managed write — the model's
+CTAS — is in flight in this transaction). So the `CREATE INDEX` runs on `C_T` itself: it sees the uncommitted
+model (same connection), takes no conflicting lock, and **commits/rolls back atomically** with the model. When
+there is **no** active pinned connection (standalone `mssql_net_exec`), it autocommits on its own connection
+as before — a raw exec's string-arg target never triggers DuckDB's transaction lifecycle, so nothing would
+ever commit a pinned connection (it would roll back at teardown). This also makes `mssql_net_exec` inside an
+explicit DuckDB `BEGIN` that already wrote rows atomic + read-your-writes. See
+[transaction-concurrency.md](transaction-concurrency.md). `transaction: false` (finding #2) remains the right
+choice when you specifically want the hook to run **after** the model commits (e.g. a non-atomic
+post-processing step).
 
 ### 4. LIMITATION (provider, unsolvable in the extension) — Fabric DDL gaps
 
@@ -103,8 +104,7 @@ without regressing the standalone case. Tracked as an enhancement.
 
 | Limitation | Solvable? | How |
 |---|---|---|
-| In-txn hook modifying the model via `mssql_net_exec` self-blocks | Yes (workaround) | use `transaction: false` / `after_commit()` |
-| …same, made atomic | Yes (code, future) | route `mssql_net_exec` onto the active txn connection if present |
-| `transaction:false`/`after_commit` hooks aren't atomic with the model | No (inherent) | dbt design + provider; accept or move logic into the model |
+| In-txn hook modifying the model via `mssql_net_exec` (was a 30s self-block) | **FIXED** (ABI v36) | `mssql_net_exec` runs join-only — on the active txn connection if one exists → atomic with the model |
+| `transaction:false`/`after_commit` hooks aren't atomic with the model | No (inherent) | dbt design + provider; accept, or use an in-txn hook (now atomic) for the SQL-Server side |
 | Fabric `CREATE INDEX` in a hook | No (provider) | Fabric has no nonclustered indexes |
 | Rollback-of-resource on hook error | Works ✓ | in-transaction (default) hooks; box AND Fabric |

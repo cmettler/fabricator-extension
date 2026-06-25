@@ -519,14 +519,21 @@ typedef struct ArrowNetVTable {
 	// connection). This makes concurrent DuckDB transactions (e.g. dbt --threads N) each use their OWN
 	// provider connection instead of colliding on one shared, non-thread-safe connection. `handle` is unused
 	// (the ambient is per-thread + global; each catalog keys its own connection-state map by the id).
-	int32_t (*set_active_txn)(ArrowNetHandle handle, int64_t txn_id, char **err);
+	//
+	// `join_only` (1/0): set ONLY by the raw `mssql_net_exec` passthrough. When 1, the following write JOINS
+	// the active transaction's pinned connection if one already exists (a DuckDB-managed write is in flight in
+	// this transaction) — so the exec is atomic with the transaction and sees its uncommitted writes — else it
+	// autocommits on a fresh connection WITHOUT creating persistent transaction state (a raw exec's target
+	// never triggers DuckDB's transaction lifecycle, so nothing would ever commit a pinned connection). Normal
+	// DuckDB-managed writes pass 0 (they create + own the per-transaction connection). See docs/dbt-hooks.md.
+	int32_t (*set_active_txn)(ArrowNetHandle handle, int64_t txn_id, int32_t join_only, char **err);
 } ArrowNetVTable;
 
 // Max serialized size of a spillable aggregate's per-group state (the inline, pointer-free
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 35
+#define ARROWNET_ABI_VERSION 36
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

@@ -150,8 +150,10 @@ ArrowNetHandle BeginBulk(ArrowNetHandle handle, const std::string &schema, const
 
 // Record the DuckDB transaction id in effect on this thread (global_transaction_id), so the next
 // connection-using bridge call keys its per-transaction provider connection by it. Call immediately before
-// each such call, on the same thread. txn_id 0 => no specific transaction. Best-effort (never throws).
-void SetActiveTxn(ArrowNetHandle handle, int64_t txn_id);
+// each such call, on the same thread. txn_id 0 => no specific transaction. `join_only` (raw mssql_net_exec
+// only) joins the active transaction's connection iff one exists, else autocommits without pinning a
+// connection — see abi.h / docs/dbt-hooks.md. Best-effort (never throws).
+void SetActiveTxn(ArrowNetHandle handle, int64_t txn_id, bool join_only = false);
 
 // Push one record batch into the session; the managed side imports + releases it
 // (the caller never releases it). Blocks while the channel is full (backpressure).

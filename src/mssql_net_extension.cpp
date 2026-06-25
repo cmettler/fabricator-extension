@@ -334,12 +334,14 @@ static void MssqlNetExecFunction(DataChunk &args, ExpressionState &state, Vector
 		auto handle = ResolveConnection(context, conn_name, owns);
 		bool schema_may_change = false;
 		try {
-			// mssql_net_exec is a raw passthrough that autocommits (txn 0 => its own connection), matching the
-			// native mssql_exec. It takes the target as a STRING arg, so DuckDB never registers that catalog as
-			// touched by this statement => its transaction manager's StartTransaction/CommitTransaction don't
-			// fire; keying the write to the active txn id would open a per-transaction connection that nothing
-			// ever commits (it would roll back at teardown). So force autocommit regardless of target.
-			arrownet::SetActiveTxn(handle, 0);
+			// mssql_net_exec is a raw passthrough. In JOIN-ONLY mode it runs on the active transaction's pinned
+			// connection IFF a DuckDB-managed write is already in flight in this transaction (e.g. a dbt model's
+			// CTAS, with the exec in a post-hook) — then it is atomic with the transaction and sees its
+			// uncommitted writes. Otherwise it autocommits on its own connection (a raw exec's string-arg target
+			// never triggers the catalog's transaction lifecycle, so nothing would ever commit a pinned
+			// connection). See docs/dbt-hooks.md. handle is unused by set_active_txn (the ambient is per-thread).
+			arrownet::SetActiveTxn(handle, (int64_t)MetaTransaction::Get(context).global_transaction_id,
+			                       /*join_only=*/true);
 			result_data[i] = arrownet::ExecuteDml(handle, StringValue::Get(sql_value), &schema_may_change);
 		} catch (...) {
 			if (owns) {

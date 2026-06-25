@@ -469,6 +469,26 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     internal (SqlConnection connection, SqlTransaction? transaction, bool owns) BeginWrite()
     {
         long txnId = AmbientTransaction.Current;
+        if (txnId != 0 && AmbientTransaction.JoinOnly)
+        {
+            // Raw mssql_net_exec: join the active transaction's connection ONLY if one already exists (a
+            // DuckDB-managed write is in flight) — then the exec is atomic with the transaction and sees its
+            // uncommitted writes. Otherwise autocommit on a fresh connection without creating persistent
+            // state (nothing would ever commit it — see AmbientTransaction.JoinOnly).
+            if (_txns.TryGetValue(txnId, out var existing))
+            {
+                lock (existing)
+                {
+                    if (existing.Connection is not null)
+                    {
+                        return (existing.Connection, existing.Transaction, false);
+                    }
+                }
+            }
+            var own = OpenConnection();
+            own.Open();
+            return (own, null, true);
+        }
         if (txnId != 0)
         {
             var state = _txns.GetOrAdd(txnId, _ => new TxnState());
@@ -606,8 +626,10 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         // The bulk-copy runs on a background task (its own pool thread), so the host can't carry the active
         // transaction id to us via the per-thread ambient — it captured it at begin_bulk and hands it here;
         // we re-establish it on THIS thread so BeginWrite + read-your-writes use the right per-transaction
-        // connection (joining an explicit BEGIN's pinned connection; a fresh one in autocommit).
+        // connection (joining an explicit BEGIN's pinned connection; a fresh one in autocommit). This is a
+        // DuckDB-managed write that creates + owns the per-transaction connection, so normal mode (not join-only).
         AmbientTransaction.Current = txnId;
+        AmbientTransaction.JoinOnly = false;
         var (connection, transaction, owns) = BeginWrite();
         try
         {

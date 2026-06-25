@@ -889,13 +889,13 @@ ArrowNetHandle BeginBulk(ArrowNetHandle handle, const std::string &schema, const
 	return session;
 }
 
-void SetActiveTxn(ArrowNetHandle handle, int64_t txn_id) {
+void SetActiveTxn(ArrowNetHandle handle, int64_t txn_id, bool join_only) {
 	const ArrowNetVTable &vt = GetBridge();
 	if (!vt.set_active_txn) {
 		return; // older/partial bridge: per-transaction routing simply not active
 	}
 	char *err = nullptr;
-	int32_t rc = vt.set_active_txn(handle, txn_id, &err);
+	int32_t rc = vt.set_active_txn(handle, txn_id, join_only ? 1 : 0, &err);
 	if (rc != ARROWNET_OK && err) {
 		// Best-effort: a failure to set the ambient must not abort the statement; free the message.
 		if (vt.free_error) {
