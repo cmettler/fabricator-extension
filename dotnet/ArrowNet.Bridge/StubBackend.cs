@@ -16,7 +16,7 @@ public sealed class StubBackend : IBackend
     // The stub ignores the connection string; return any non-empty marker.
     public string BuildConnectionString(IReadOnlyDictionary<string, string> fields) => "stub";
 
-    public IBackendCatalog OpenCatalog(string connectionString) => new StubCatalog();
+    public IBackendCatalog OpenCatalog(string connectionString, string optionsJson) => new StubCatalog();
 
     private sealed class StubCatalog : IBackendCatalog
     {

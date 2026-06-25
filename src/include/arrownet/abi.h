@@ -141,7 +141,15 @@ typedef struct ArrowNetVTable {
 	// behaviour). On success *out_handle receives an opaque handle (thereafter every
 	// call on it dispatches to that backend). On failure returns non-zero and *err
 	// points to an owned UTF-8 message.
-	int32_t (*open_catalog)(const char *provider, const char *conn, ArrowNetHandle *out_handle, char **err);
+	// `options_json` carries the ATTACH options the provider owns, as a flat JSON object of strings
+	// {"schema_filter":"…","table_filter":"…","isolation_level":"…", …} (NULL/empty => none). The host
+	// passes every ATTACH option EXCEPT the two it must handle itself before the provider is resolved —
+	// PROVIDER (selects the backend) and SECRET (resolved to a connstr) — so the provider-agnostic core
+	// names no provider-specific option. The managed side parses the keys it knows (e.g. SQL Server applies
+	// schema_filter/table_filter in get_metadata and stores isolation_level for table-in-out sessions). See
+	// docs/provider-extensibility.md §3.
+	int32_t (*open_catalog)(const char *provider, const char *conn, const char *options_json,
+	                        ArrowNetHandle *out_handle, char **err);
 
 	// Close a handle previously returned by open_catalog. Safe with NULL.
 	void (*close_catalog)(ArrowNetHandle handle);
@@ -441,13 +449,13 @@ typedef struct ArrowNetVTable {
 
 	// Open one execution exchange on a bound binding. `input` is an Arrow stream the HOST has
 	// populated (host exports; its get_next yields one input chunk per gate tenure, a released/null
-	// array at end) — the managed side IMPORTS it (takes ownership, pulls, releases). `isolation`
-	// (nullable/empty => provider default) sets the SQL transaction isolation for the call's one
-	// connection. *output receives the managed OUTPUT stream (the managed side exports into it; the
-	// host pulls it — non-empty batch = HAVE_MORE_OUTPUT, length-0 batch = NEED_MORE_INPUT,
-	// released/null array = FINISHED — and releases it). The connection opens lazily on first input
-	// pull. One binding may open at most one exchange at a time.
-	int32_t (*inout_exchange_open)(ArrowNetHandle binding, struct ArrowArrayStream *input, const char *isolation,
+	// array at end) — the managed side IMPORTS it (takes ownership, pulls, releases). *output receives the
+	// managed OUTPUT stream (the managed side exports into it; the host pulls it — non-empty batch =
+	// HAVE_MORE_OUTPUT, length-0 batch = NEED_MORE_INPUT, released/null array = FINISHED — and releases it).
+	// The connection opens lazily on first input pull. One binding may open at most one exchange at a time.
+	// The SQL isolation for the read transaction is resolved + set on the binding in C# at inout_bind (SET
+	// mssql_isolation_level ?? the catalog's ATTACH isolation_level — both C#-owned), so it is not passed here.
+	int32_t (*inout_exchange_open)(ArrowNetHandle binding, struct ArrowArrayStream *input,
 	                               struct ArrowArrayStream *output, char **err);
 
 	// Release a binding handle from inout_bind. Idempotent; safe with nullptr. Best-effort
@@ -533,7 +541,7 @@ typedef struct ArrowNetVTable {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 36
+#define ARROWNET_ABI_VERSION 37
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

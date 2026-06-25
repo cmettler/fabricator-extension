@@ -176,8 +176,10 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   the uncommitted `CREATE` on the pinned connection — without this the self-healing cache evicts the new table
   on Fabric (same-session `CREATE`+DML failed). **Fabric write transactions run at
   SNAPSHOT** (`ServerProfile.DefaultWriteIsolation`, edition-11-only — box/Synapse keep the server default).
-  `mssql_mars` is **global** (`SET` before ATTACH); a per-catalog `mars` ATTACH option waits for the
-  ATTACH-options→C# refactor. **Caveat:** `RESET` of an extension option does NOT fire its set-callback
+  `mssql_mars` is **global** (`SET` before ATTACH); a per-catalog `mars` ATTACH option is now straightforward
+  to add (the ATTACH-options→C# refactor landed, ABI v37 — `SqlServerCatalog` parses the options JSON; just
+  add a `mars` key alongside `schema_filter`/`table_filter`/`isolation_level`). **Caveat:** `RESET` of an
+  extension option does NOT fire its set-callback
   (`config.cpp ResetOption`), so it never clears the process-global `ProviderSettingsStore` — restore a setting
   with `SET name='<default>'`, not `RESET` (matters for `.test` hygiene across files). Verified:
   `test/verify_connection_mode.test` (20). (5) **collation-aware string `ORDER BY` pushdown** (no ABI):
@@ -230,22 +232,24 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   DONE (ABI v34)**: `MapArrowToSqlType` reads `mssql_ctas_text_type` from the store; the `text_type` param is
   dropped from `create_table` across C#/ABI/C++ (proving a per-setting param can be removed); it now applies
   to CTAS/COPY too, not just explicit CREATE (closing the old gap). The C++11 trampoline array was also
-  hardened (hand-rolled `IndexSeq` replacing `std::make_index_sequence`). **Remaining**: `isolation` cutover
-  is deferred — it's entangled with the per-catalog `isolation_level` **ATTACH option** (a global store can't
-  hold a per-catalog value), so it lands with the ATTACH-options refactor (see
-  [docs/provider-extensibility.md](docs/provider-extensibility.md)). Replaces the old "hardcode `mssql_*` in
+  hardened (hand-rolled `IndexSeq` replacing `std::make_index_sequence`). The `isolation` entanglement is now
+  resolved: the **ATTACH-options→C# refactor (ABI v37) landed** — the per-catalog `isolation_level` ATTACH
+  option lives on the C# `SqlServerCatalog`, and in-out isolation resolves in C# (`mssql_isolation_level`
+  setting ?? the catalog's `isolation_level`), so no global store holds a per-catalog value (see
+  [docs/provider-extensibility.md](docs/provider-extensibility.md) §3). Replaces the old "hardcode `mssql_*` in
   C++ / read in C++ / pass each value
   through an ABI method param" model (O(settings × providers) churn): **net ABI reduction** — two generic
   entries replace the per-setting params. Trade-offs: boot the CLR at extension
   load (needed for `SET` before first ATTACH; aligns with Phase-3 load-time functions) + catalog/provider
   scope (not session-local). **Directly unblocks `mssql_default_varchar_length`** (C# reads the length from
   `Settings`, no `begin_bulk`/`create_table` signature changes). Prerequisite for the 2nd provider. The same
-  provider-declared pattern extends to **secret fields** (declaration C++-hardcoded in `mssql_net_secret.cpp`,
-  but values already flow via `build_connection_string`) and **ATTACH options** (C++-hardcoded in
-  `mssql_net_storage.cpp`; pass the options map to `open_catalog`, move `schema_filter`/`table_filter`
-  filtering to C#, keep `PROVIDER`/`SECRET` as C++ meta-options) — **design:
+  provider-declared pattern also covers **ATTACH options** (DONE, ABI v37 — `open_catalog(options_json)`;
+  C# parses `schema_filter`/`table_filter`/`isolation_level`, filtering applied in `get_metadata`,
+  `PROVIDER`/`SECRET` stay C++ meta-options) and **secret fields** (still C++-hardcoded in
+  `mssql_net_secret.cpp`, though values already flow via `build_connection_string` — the last flavor left,
+  to build with the DAX provider) — **design:
   [docs/provider-extensibility.md](docs/provider-extensibility.md)** (the unified "provider declares; core
-  stays name-agnostic" model; settings built, secrets + ATTACH to build with the DAX provider).
+  stays name-agnostic" model).
 
 ## Implementation status (current)
 
@@ -842,7 +846,15 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v36** (v36 = the `mssql_net_exec` join-only refinement: `set_active_txn` gained an
+- **Current version: ABI v37** (v37 = the ATTACH-options→C# refactor: `open_catalog` gained an `options_json`
+  arg carrying the provider-owned ATTACH options as a flat JSON object, and `inout_exchange_open` dropped its
+  `isolation` arg. `MssqlNetAttach` now extracts only PROVIDER/SECRET (meta) and forwards every other option
+  as JSON; C# `SqlServerCatalog` parses `schema_filter`/`table_filter` (applied in `get_metadata`, with the
+  regex validated C#-side) + `isolation_level` (resolved with `mssql_isolation_level` in `InOutBind`). The
+  C++ `CatalogFilters`/`ValidateCatalogFilters`/`ResolveInOutIsolation` + the catalog's filter/isolation
+  members are gone; function discovery is schema-filtered by only registering functions whose schema is
+  already registered. See [docs/provider-extensibility.md](docs/provider-extensibility.md) §3.
+  v36 = the `mssql_net_exec` join-only refinement: `set_active_txn` gained an
   `int32 join_only` arg — a raw exec joins the active transaction's pinned connection iff one already exists
   (atomic with an in-flight DuckDB-managed write, e.g. a dbt post-hook adding an index to the model), else
   autocommits without pinning; fixes the in-transaction-hook self-block, see [docs/dbt-hooks.md](docs/dbt-hooks.md) §3.

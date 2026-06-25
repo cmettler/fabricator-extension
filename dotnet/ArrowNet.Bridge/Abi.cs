@@ -13,8 +13,8 @@ public unsafe struct ArrowNetVTable
 {
     public int AbiVersion;
 
-    // int32 open_catalog(const char* provider, const char* conn, void** out_handle, char** err)
-    public delegate* unmanaged[Cdecl]<byte*, byte*, nint*, byte**, int> OpenCatalog;
+    // int32 open_catalog(const char* provider, const char* conn, const char* options_json, void** out_handle, char** err)
+    public delegate* unmanaged[Cdecl]<byte*, byte*, byte*, nint*, byte**, int> OpenCatalog;
 
     // void close_catalog(void* handle)
     public delegate* unmanaged[Cdecl]<nint, void> CloseCatalog;
@@ -133,8 +133,8 @@ public unsafe struct ArrowNetVTable
     //                  ArrowSchema* input_schema, ArrowArrayStream* out_schema, void** out_binding, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, CArrowSchema*, CArrowArrayStream*, nint*, byte**, int> InOutBind;
 
-    // int32 inout_exchange_open(void* binding, ArrowArrayStream* input, const char* isolation, ArrowArrayStream* output, char** err)
-    public delegate* unmanaged[Cdecl]<nint, CArrowArrayStream*, byte*, CArrowArrayStream*, byte**, int> InOutExchangeOpen;
+    // int32 inout_exchange_open(void* binding, ArrowArrayStream* input, ArrowArrayStream* output, char** err)
+    public delegate* unmanaged[Cdecl]<nint, CArrowArrayStream*, CArrowArrayStream*, byte**, int> InOutExchangeOpen;
 
     // int32 inout_bind_close(void* binding, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte**, int> InOutBindClose;

@@ -20,17 +20,9 @@ public:
 	ArrowNetCatalog(AttachedDatabase &db, string internal_name, ArrowNetHandle handle, string db_path);
 	~ArrowNetCatalog() override;
 
-	//! Restricts catalog discovery to schemas/tables matching these (icase regex,
-	//! substring) patterns. Empty => no filter. Validates the patterns (throws on a
-	//! bad regex). Must be called before LoadCatalog. Mirrors the C++ mssql extension's
-	//! schema_filter / table_filter ATTACH options.
-	void SetCatalogFilters(const string &schema_filter, const string &table_filter);
-
-	//! Validates the filter regex patterns (throws "Invalid regex …" on a bad one).
-	//! Static so ATTACH can validate before opening the connection.
-	static void ValidateCatalogFilters(const string &schema_filter, const string &table_filter);
-
 	//! Discovers schemas + tables from SQL Server (called once at attach time).
+	//! schema_filter / table_filter (ATTACH options) are applied provider-side now (get_metadata returns
+	//! only matches — docs/provider-extensibility.md §3), so this registers everything it discovers.
 	void LoadCatalog(ClientContext &context);
 
 	//! Re-discovers schemas + tables and drops cached entries (so out-of-band DDL
@@ -45,16 +37,6 @@ public:
 
 	ArrowNetHandle GetHandle() const {
 		return handle_;
-	}
-
-	//! Sets the default SQL transaction isolation level for sessions opened against this catalog
-	//! (the ATTACH `isolation_level` option; e.g. "snapshot"). Empty => provider default. A
-	//! `SET mssql_isolation_level` overrides it per-session. Used by table-in-out sessions.
-	void SetIsolationLevel(string isolation_level) {
-		isolation_level_ = std::move(isolation_level);
-	}
-	const string &GetIsolationLevel() const {
-		return isolation_level_;
 	}
 
 	//! Whether string-keyed ORDER BY+LIMIT can be pushed to SQL Server: true only when the database
@@ -107,11 +89,6 @@ public:
 private:
 	ArrowNetHandle handle_;
 	string db_path_;
-	//! Catalog visibility filters (icase regex, substring match); empty => match all.
-	string schema_filter_;
-	string table_filter_;
-	//! Default SQL transaction isolation level (ATTACH isolation_level option); empty => provider default.
-	string isolation_level_;
 	//! Whether the database collation is binary (detected at LoadCatalog) => string ORDER BY is pushable.
 	bool string_order_pushable_ = false;
 	mutex schema_lock_;

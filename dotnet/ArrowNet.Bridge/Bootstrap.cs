@@ -26,7 +26,7 @@ public static unsafe class Bootstrap
             return ArrowNetStatus.InvalidArgument;
         }
 
-        vtable->AbiVersion = 36;
+        vtable->AbiVersion = 37;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -76,7 +76,7 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int OpenCatalog(byte* provider, byte* conn, nint* outHandle, byte** err)
+    private static int OpenCatalog(byte* provider, byte* conn, byte* optionsJson, nint* outHandle, byte** err)
     {
         try
         {
@@ -86,7 +86,8 @@ public static unsafe class Bootstrap
             }
             var providerName = Marshal.PtrToStringUTF8((nint)provider); // null/empty => default backend
             var connStr = Marshal.PtrToStringUTF8((nint)conn) ?? string.Empty;
-            var catalog = BackendRegistry.Resolve(providerName).OpenCatalog(connStr);
+            var options = Marshal.PtrToStringUTF8((nint)optionsJson) ?? string.Empty; // ATTACH options (JSON), provider-owned
+            var catalog = BackendRegistry.Resolve(providerName).OpenCatalog(connStr, options);
             *outHandle = Handles.Alloc(catalog);
             return ArrowNetStatus.Ok;
         }
@@ -110,7 +111,7 @@ public static unsafe class Bootstrap
                 return ArrowNetStatus.InvalidArgument;
             }
             var catalog = Handles.Resolve<IBackendCatalog>(handle)
-                          ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var query = Marshal.PtrToStringUTF8((nint)sql) ?? string.Empty;
 
             IArrowArrayStream stream = catalog.ExecuteQuery(query);
@@ -130,7 +131,7 @@ public static unsafe class Bootstrap
         try
         {
             var catalog = Handles.Resolve<IBackendCatalog>(handle)
-                          ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var statement = Marshal.PtrToStringUTF8((nint)sql) ?? string.Empty;
             // DDL detection lives here (C#); the host invalidates its catalog cache
             // when this is set (and the mssql_exec_invalidate_cache setting is on).
@@ -163,7 +164,7 @@ public static unsafe class Bootstrap
                 return ArrowNetStatus.InvalidArgument;
             }
             var catalog = Handles.Resolve<IBackendCatalog>(handle)
-                          ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
 
@@ -195,7 +196,7 @@ public static unsafe class Bootstrap
                 return ArrowNetStatus.InvalidArgument;
             }
             var catalog = Handles.Resolve<IBackendCatalog>(handle)
-                          ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
             var stream = CArrowArrayStreamImporter.ImportArrayStream(keys);
@@ -224,7 +225,7 @@ public static unsafe class Bootstrap
                 return ArrowNetStatus.InvalidArgument;
             }
             var catalog = Handles.Resolve<IBackendCatalog>(handle)
-                          ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
             var stream = CArrowArrayStreamImporter.ImportArrayStream(data);
@@ -253,7 +254,7 @@ public static unsafe class Bootstrap
                 return ArrowNetStatus.InvalidArgument;
             }
             var catalog = Handles.Resolve<IBackendCatalog>(handle)
-                          ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var a1 = Marshal.PtrToStringUTF8((nint)arg1);
             var a2 = Marshal.PtrToStringUTF8((nint)arg2);
 
@@ -279,7 +280,7 @@ public static unsafe class Bootstrap
                 return ArrowNetStatus.InvalidArgument;
             }
             var catalog = Handles.Resolve<IBackendCatalog>(handle)
-                          ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
             var spec = Marshal.PtrToStringUTF8((nint)specJson); // null => full SELECT *
@@ -311,7 +312,7 @@ public static unsafe class Bootstrap
                 return ArrowNetStatus.InvalidArgument;
             }
             var catalog = Handles.Resolve<IBackendCatalog>(handle)
-                          ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
             var pk = Marshal.PtrToStringUTF8((nint)pkColumns);
@@ -337,7 +338,7 @@ public static unsafe class Bootstrap
         try
         {
             var catalog = Handles.Resolve<IBackendCatalog>(handle)
-                          ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
             catalog.DropTable(schemaName, tableName, ifExists != 0);
@@ -356,7 +357,7 @@ public static unsafe class Bootstrap
         try
         {
             var catalog = Handles.Resolve<IBackendCatalog>(handle)
-                          ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             catalog.CreateSchema(schemaName, ifNotExists != 0);
             return ArrowNetStatus.Ok;
@@ -374,7 +375,7 @@ public static unsafe class Bootstrap
         try
         {
             var catalog = Handles.Resolve<IBackendCatalog>(handle)
-                          ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             catalog.DropSchema(schemaName, ifExists != 0);
             return ArrowNetStatus.Ok;
@@ -393,7 +394,7 @@ public static unsafe class Bootstrap
         try
         {
             var catalog = Handles.Resolve<IBackendCatalog>(handle)
-                          ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
             var a1 = Marshal.PtrToStringUTF8((nint)arg1);
@@ -427,7 +428,7 @@ public static unsafe class Bootstrap
                 return ArrowNetStatus.InvalidArgument;
             }
             var catalog = Handles.Resolve<IBackendCatalog>(handle)
-                          ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
 
@@ -470,7 +471,7 @@ public static unsafe class Bootstrap
             // C struct is released by the importer).
             var arrowSchema = CArrowSchemaImporter.ImportSchema(schemaIn);
             var catalog = Handles.Resolve<IBackendCatalog>(handle)
-                          ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
 
@@ -552,7 +553,7 @@ public static unsafe class Bootstrap
         try
         {
             var catalog = Handles.Resolve<IBackendCatalog>(handle)
-                          ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             op(catalog);
             return ArrowNetStatus.Ok;
         }
@@ -597,7 +598,7 @@ public static unsafe class Bootstrap
             {
                 return ArrowNetStatus.InvalidArgument;
             }
-            var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+            var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
             CArrowSchemaExporter.ExportSchema(catalog.GetFunctionParamSchema(s, f), outSchema);
@@ -620,7 +621,7 @@ public static unsafe class Bootstrap
             {
                 return ArrowNetStatus.InvalidArgument;
             }
-            var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+            var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
             CArrowSchemaExporter.ExportSchema(catalog.GetFunctionReturnSchema(s, f), outSchema);
@@ -643,7 +644,7 @@ public static unsafe class Bootstrap
             {
                 return ArrowNetStatus.InvalidArgument;
             }
-            var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+            var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
             var argStream = CArrowArrayStreamImporter.ImportArrayStream(args); // we own it
@@ -667,7 +668,7 @@ public static unsafe class Bootstrap
             {
                 return ArrowNetStatus.InvalidArgument;
             }
-            var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+            var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
             // `args` (nullable) is a 1-row stream of the constant call args — a custom table function's output
@@ -712,7 +713,7 @@ public static unsafe class Bootstrap
                 using var argStream = CArrowArrayStreamImporter.ImportArrayStream(args); // we own it
                 argsBatch = argStream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
             }
-            var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+            var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
             var binding = catalog.InOutBind(s, f, argsBatch, inSchema);
@@ -730,7 +731,7 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int InOutExchangeOpen(nint binding, CArrowArrayStream* input, byte* isolation,
+    private static int InOutExchangeOpen(nint binding, CArrowArrayStream* input,
                                          CArrowArrayStream* output, byte** err)
     {
         try
@@ -745,9 +746,9 @@ public static unsafe class Bootstrap
                 return ArrowNetStatus.InvalidArgument;
             }
             // Take ownership of the host's input stream; the pump pulls it (one chunk per gate tenure) + releases it.
+            // The SQL isolation was resolved + set on the binding at inout_bind (C#), so it is not passed here.
             var inputStream = CArrowArrayStreamImporter.ImportArrayStream(input);
-            var iso = Marshal.PtrToStringUTF8((nint)isolation) ?? string.Empty;
-            CArrowArrayStreamExporter.ExportArrayStream(new InOutExchangeStream(b, inputStream, iso), output);
+            CArrowArrayStreamExporter.ExportArrayStream(new InOutExchangeStream(b, inputStream), output);
             return ArrowNetStatus.Ok;
         }
         catch (Exception ex)
@@ -790,7 +791,7 @@ public static unsafe class Bootstrap
                 using var argStream = CArrowArrayStreamImporter.ImportArrayStream(args); // we own it
                 argsBatch = argStream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
             }
-            var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+            var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
             var bound = catalog.TableBind(s, f, argsBatch);
@@ -969,7 +970,7 @@ public static unsafe class Bootstrap
             {
                 return ArrowNetStatus.InvalidArgument;
             }
-            var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty);
+            var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
             *outSession = Handles.Alloc(catalog.AggOpen(s, f));

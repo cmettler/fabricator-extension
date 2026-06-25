@@ -38,8 +38,11 @@ const std::string &GetManagedDirectory();
 
 // Open a backend catalog/connection. `provider` selects which registered backend
 // handles it (case-insensitive name/alias, e.g. "sqlserver"/"mssql"); empty => the
-// default backend. Returns an opaque handle to close later.
-ArrowNetHandle OpenCatalog(const std::string &connection_string, const std::string &provider = "");
+// default backend. `options_json` carries the provider-owned ATTACH options as a flat
+// JSON object of strings (empty => none); the managed side parses the keys it knows.
+// Returns an opaque handle to close later.
+ArrowNetHandle OpenCatalog(const std::string &connection_string, const std::string &provider = "",
+                           const std::string &options_json = "");
 
 // Build a provider connection string from a secret's fields (`fields_json` = a flat
 // JSON object of the secret's key/values). `provider` selects the backend whose
@@ -254,11 +257,10 @@ ArrowNetHandle InOutBind(ArrowNetHandle handle, const std::string &schema, const
                          ArrowArrayStream *args, ArrowSchema &input_schema, ArrowArrayStream &out_schema);
 
 // Open one execution exchange on a bound binding. `input` = a host-populated stream the managed side
-// imports + pulls (one input chunk per gate tenure; released/null array = end). `isolation` (empty =>
-// provider default) sets the SQL transaction isolation. Fills `output` with the managed output stream
-// (the host pulls it: non-empty = HAVE_MORE_OUTPUT, length-0 = NEED_MORE_INPUT, null = FINISHED).
-void InOutExchangeOpen(ArrowNetHandle binding, ArrowArrayStream &input, const std::string &isolation,
-                       ArrowArrayStream &output);
+// imports + pulls (one input chunk per gate tenure; released/null array = end). Fills `output` with the
+// managed output stream (the host pulls it: non-empty = HAVE_MORE_OUTPUT, length-0 = NEED_MORE_INPUT,
+// null = FINISHED). The SQL isolation is resolved + set on the binding in C# at inout_bind, not passed here.
+void InOutExchangeOpen(ArrowNetHandle binding, ArrowArrayStream &input, ArrowArrayStream &output);
 
 // Release a binding handle from InOutBind. Idempotent; safe with nullptr. Best-effort (swallows errors).
 void InOutBindClose(ArrowNetHandle binding);

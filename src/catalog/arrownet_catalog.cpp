@@ -26,60 +26,11 @@
 #include "duckdb/storage/database_size.hpp"
 
 #include <algorithm>
-#include <regex>
 
 namespace duckdb {
 
-namespace {
-
-// Compiles the (optional) icase catalog filters once and matches names by substring
-// regex search — mirrors the C++ mssql extension's schema_filter / table_filter.
-struct CatalogFilters {
-	bool has_schema = false;
-	bool has_table = false;
-	std::regex schema_re;
-	std::regex table_re;
-
-	CatalogFilters(const string &schema_filter, const string &table_filter) {
-		if (!schema_filter.empty()) {
-			schema_re = std::regex(schema_filter, std::regex::icase);
-			has_schema = true;
-		}
-		if (!table_filter.empty()) {
-			table_re = std::regex(table_filter, std::regex::icase);
-			has_table = true;
-		}
-	}
-	bool MatchSchema(const string &n) const {
-		return !has_schema || std::regex_search(n, schema_re);
-	}
-	bool MatchTable(const string &n) const {
-		return !has_table || std::regex_search(n, table_re);
-	}
-};
-
-} // namespace
-
-void ArrowNetCatalog::ValidateCatalogFilters(const string &schema_filter, const string &table_filter) {
-	auto check = [](const string &pattern) {
-		if (pattern.empty()) {
-			return;
-		}
-		try {
-			std::regex(pattern, std::regex::icase);
-		} catch (const std::regex_error &e) {
-			throw InvalidInputException("mssql_net: Invalid regex in catalog filter '%s': %s", pattern, e.what());
-		}
-	};
-	check(schema_filter);
-	check(table_filter);
-}
-
-void ArrowNetCatalog::SetCatalogFilters(const string &schema_filter, const string &table_filter) {
-	ValidateCatalogFilters(schema_filter, table_filter);
-	schema_filter_ = schema_filter;
-	table_filter_ = table_filter;
-}
+// schema_filter / table_filter are now applied provider-side (the managed get_metadata returns only matching
+// schemas/tables — see docs/provider-extensibility.md §3), so the catalog registers everything it discovers.
 
 ArrowNetCatalog::ArrowNetCatalog(AttachedDatabase &db, string internal_name, ArrowNetHandle handle, string db_path)
     : Catalog(db), handle_(handle), db_path_(std::move(db_path)) {
@@ -113,40 +64,40 @@ void ArrowNetCatalog::LoadCatalog(ClientContext &context) {
 		return ref;
 	};
 
-	CatalogFilters filters(schema_filter_, table_filter_);
+	// schema_filter / table_filter are applied provider-side now (DiscoverSchemas/DiscoverTables already
+	// return only matches), so register everything discovered.
 	for (auto &schema_name : DiscoverSchemas(handle_)) {
-		if (filters.MatchSchema(schema_name)) {
-			ensure_schema(schema_name);
-		}
+		ensure_schema(schema_name);
 	}
 	for (auto &table : DiscoverTables(handle_)) {
-		if (filters.MatchSchema(table.schema_name) && filters.MatchTable(table.table_name)) {
-			ensure_schema(table.schema_name).AddTable(table.table_name, table.table_type);
-		}
+		ensure_schema(table.schema_name).AddTable(table.table_name, table.table_type);
 	}
-	// Expose discovered routines as callable catalog functions: scalar UDFs
-	// (db.schema.fn(args)), table-valued functions and stored procedures
-	// (SELECT * FROM db.schema.fn(args) — procs run via EXEC, see AddTableFunction).
+	// Discovered routines (scalar UDFs / TVFs / procs / custom in-out & aggregates) register onto their
+	// schema — but ONLY a schema already registered above. The managed schema_filter keeps non-matching
+	// schemas out of DiscoverSchemas, so skipping a function whose schema is absent applies the filter to
+	// functions too (the core never re-creates a filtered-out schema). See docs/provider-extensibility.md §3.
 	for (auto &func : DiscoverFunctions(handle_)) {
-		if (!filters.MatchSchema(func.schema_name)) {
+		auto sit = schemas_.find(func.schema_name);
+		if (sit == schemas_.end()) {
 			continue;
 		}
+		auto &schema = *sit->second;
 		if (func.kind == "scalar") {
-			ensure_schema(func.schema_name).AddScalarFunction(func.name);
+			schema.AddScalarFunction(func.name);
 		} else if (func.kind == "table") {
-			ensure_schema(func.schema_name).AddTableFunction(func.name, /*is_proc=*/false);
+			schema.AddTableFunction(func.name, /*is_proc=*/false);
 		} else if (func.kind == "proc") {
-			ensure_schema(func.schema_name).AddTableFunction(func.name, /*is_proc=*/true);
+			schema.AddTableFunction(func.name, /*is_proc=*/true);
 		} else if (func.kind == "inout") {
 			// Provider-authored custom table-in-out (4g, pure C#): a {TABLE}-param table function under
 			// the bare name (no scalar-arg scan form, no `_each` alias — it is already in-out).
-			ensure_schema(func.schema_name).AddInOutFunction(func.name);
+			schema.AddInOutFunction(func.name);
 		} else if (func.kind == "aggregate") {
 			// Provider-authored custom aggregate (4h, UDAF, pure C#): an AggregateFunctionCatalogEntry.
-			ensure_schema(func.schema_name).AddAggregateFunction(func.name, /*spillable=*/false);
+			schema.AddAggregateFunction(func.name, /*spillable=*/false);
 		} else if (func.kind == "aggregate_spill") {
 			// Spillable variant: state serialized into DuckDB's blob so external GROUP BY can spill to disk.
-			ensure_schema(func.schema_name).AddAggregateFunction(func.name, /*spillable=*/true);
+			schema.AddAggregateFunction(func.name, /*spillable=*/true);
 		}
 	}
 }
@@ -179,40 +130,40 @@ void ArrowNetCatalog::RefreshCache(ClientContext &context) {
 	for (auto &entry : schemas_) {
 		entry.second->ClearTables();
 	}
-	CatalogFilters filters(schema_filter_, table_filter_);
+	// schema_filter / table_filter are applied provider-side now (DiscoverSchemas/DiscoverTables already
+	// return only matches), so register everything discovered.
 	for (auto &schema_name : DiscoverSchemas(handle_)) {
-		if (filters.MatchSchema(schema_name)) {
-			ensure_schema(schema_name);
-		}
+		ensure_schema(schema_name);
 	}
 	for (auto &table : DiscoverTables(handle_)) {
-		if (filters.MatchSchema(table.schema_name) && filters.MatchTable(table.table_name)) {
-			ensure_schema(table.schema_name).AddTable(table.table_name, table.table_type);
-		}
+		ensure_schema(table.schema_name).AddTable(table.table_name, table.table_type);
 	}
-	// Expose discovered routines as callable catalog functions: scalar UDFs
-	// (db.schema.fn(args)), table-valued functions and stored procedures
-	// (SELECT * FROM db.schema.fn(args) — procs run via EXEC, see AddTableFunction).
+	// Discovered routines (scalar UDFs / TVFs / procs / custom in-out & aggregates) register onto their
+	// schema — but ONLY a schema already registered above. The managed schema_filter keeps non-matching
+	// schemas out of DiscoverSchemas, so skipping a function whose schema is absent applies the filter to
+	// functions too (the core never re-creates a filtered-out schema). See docs/provider-extensibility.md §3.
 	for (auto &func : DiscoverFunctions(handle_)) {
-		if (!filters.MatchSchema(func.schema_name)) {
+		auto sit = schemas_.find(func.schema_name);
+		if (sit == schemas_.end()) {
 			continue;
 		}
+		auto &schema = *sit->second;
 		if (func.kind == "scalar") {
-			ensure_schema(func.schema_name).AddScalarFunction(func.name);
+			schema.AddScalarFunction(func.name);
 		} else if (func.kind == "table") {
-			ensure_schema(func.schema_name).AddTableFunction(func.name, /*is_proc=*/false);
+			schema.AddTableFunction(func.name, /*is_proc=*/false);
 		} else if (func.kind == "proc") {
-			ensure_schema(func.schema_name).AddTableFunction(func.name, /*is_proc=*/true);
+			schema.AddTableFunction(func.name, /*is_proc=*/true);
 		} else if (func.kind == "inout") {
 			// Provider-authored custom table-in-out (4g, pure C#): a {TABLE}-param table function under
 			// the bare name (no scalar-arg scan form, no `_each` alias — it is already in-out).
-			ensure_schema(func.schema_name).AddInOutFunction(func.name);
+			schema.AddInOutFunction(func.name);
 		} else if (func.kind == "aggregate") {
 			// Provider-authored custom aggregate (4h, UDAF, pure C#): an AggregateFunctionCatalogEntry.
-			ensure_schema(func.schema_name).AddAggregateFunction(func.name, /*spillable=*/false);
+			schema.AddAggregateFunction(func.name, /*spillable=*/false);
 		} else if (func.kind == "aggregate_spill") {
 			// Spillable variant: state serialized into DuckDB's blob so external GROUP BY can spill to disk.
-			ensure_schema(func.schema_name).AddAggregateFunction(func.name, /*spillable=*/true);
+			schema.AddAggregateFunction(func.name, /*spillable=*/true);
 		}
 	}
 }

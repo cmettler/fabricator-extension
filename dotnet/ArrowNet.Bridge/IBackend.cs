@@ -39,8 +39,14 @@ public interface IBackend
     /// </summary>
     string BuildConnectionString(IReadOnlyDictionary<string, string> fields);
 
-    /// <summary>Open a catalog/connection for the given connection string.</summary>
-    IBackendCatalog OpenCatalog(string connectionString);
+    /// <summary>
+    /// Open a catalog/connection for the given connection string. <paramref name="optionsJson"/> is the
+    /// provider-owned ATTACH options as a flat JSON object of strings (e.g.
+    /// <c>{"schema_filter":"…","table_filter":"…","isolation_level":"…"}</c>; empty/null => none). The C++
+    /// core forwards every ATTACH option except the two it handles itself (PROVIDER / SECRET), so the
+    /// provider parses the keys it knows. See docs/provider-extensibility.md §3.
+    /// </summary>
+    IBackendCatalog OpenCatalog(string connectionString, string optionsJson);
 }
 
 /// <summary>

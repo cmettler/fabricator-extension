@@ -308,15 +308,16 @@ namespace {
 
 } // namespace
 
-ArrowNetHandle OpenCatalog(const std::string &connection_string, const std::string &provider) {
+ArrowNetHandle OpenCatalog(const std::string &connection_string, const std::string &provider,
+                           const std::string &options_json) {
 	const ArrowNetVTable &vt = GetBridge();
 	if (!vt.open_catalog) {
 		throw duckdb::IOException("ArrowNet: bridge does not provide open_catalog");
 	}
 	ArrowNetHandle handle = nullptr;
 	char *err = nullptr;
-	int32_t rc = vt.open_catalog(provider.empty() ? nullptr : provider.c_str(), connection_string.c_str(), &handle,
-	                             &err);
+	int32_t rc = vt.open_catalog(provider.empty() ? nullptr : provider.c_str(), connection_string.c_str(),
+	                             options_json.empty() ? nullptr : options_json.c_str(), &handle, &err);
 	if (rc != ARROWNET_OK) {
 		ThrowManagedError(vt, err, "ArrowNet: open_catalog failed");
 	}
@@ -542,14 +543,13 @@ ArrowNetHandle InOutBind(ArrowNetHandle handle, const std::string &schema, const
 	return binding;
 }
 
-void InOutExchangeOpen(ArrowNetHandle binding, ArrowArrayStream &input, const std::string &isolation,
-                       ArrowArrayStream &output) {
+void InOutExchangeOpen(ArrowNetHandle binding, ArrowArrayStream &input, ArrowArrayStream &output) {
 	const ArrowNetVTable &vt = GetBridge();
 	if (!vt.inout_exchange_open) {
 		throw duckdb::IOException("ArrowNet: bridge does not provide inout_exchange_open");
 	}
 	char *err = nullptr;
-	int32_t rc = vt.inout_exchange_open(binding, &input, isolation.c_str(), &output, &err);
+	int32_t rc = vt.inout_exchange_open(binding, &input, &output, &err);
 	if (rc != ARROWNET_OK) {
 		ThrowManagedError(vt, err, "ArrowNet: inout_exchange_open failed");
 	}

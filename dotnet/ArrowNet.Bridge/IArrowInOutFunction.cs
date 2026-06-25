@@ -72,14 +72,12 @@ internal sealed class InOutExchangeStream : IArrowArrayStream
     private readonly IAsyncEnumerator<RecordBatch> _out;
     private bool _disposed;
 
-    public InOutExchangeStream(IArrowInOutBinding binding, IArrowArrayStream input, string isolation)
+    public InOutExchangeStream(IArrowInOutBinding binding, IArrowArrayStream input)
     {
+        // The SQL isolation (if any) was already resolved + set on the binding at bind time (InOutBind), so
+        // there is nothing isolation-related to do here. See docs/provider-extensibility.md §3.
         _binding = binding;
         _input = input;
-        if (!string.IsNullOrEmpty(isolation) && binding is IArrowInOutIsolation iso)
-        {
-            iso.IsolationLevel = isolation;
-        }
         _out = binding.DoExchange(ReadInput(), CancellationToken.None).GetAsyncEnumerator();
     }
 

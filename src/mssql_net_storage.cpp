@@ -75,41 +75,67 @@ static string RedactConnectionString(const string &conn) {
 	return result;
 }
 
+// Minimal JSON-string escaping for ATTACH option keys/values (mirrors mssql_net_secret.cpp's EscapeJson).
+static string EscapeJsonOption(const string &s) {
+	string out;
+	out.reserve(s.size() + 8);
+	for (char c : s) {
+		switch (c) {
+		case '"':
+			out += "\\\"";
+			break;
+		case '\\':
+			out += "\\\\";
+			break;
+		case '\n':
+			out += "\\n";
+			break;
+		case '\r':
+			out += "\\r";
+			break;
+		case '\t':
+			out += "\\t";
+			break;
+		default:
+			out += c;
+			break;
+		}
+	}
+	return out;
+}
+
 static unique_ptr<Catalog> MssqlNetAttach(optional_ptr<StorageExtensionInfo> storage_info, ClientContext &context,
                                           AttachedDatabase &db, const string &name, AttachInfo &info,
                                           AttachOptions &options) {
-	// A SECRET option supplies the connection from a stored mssql_net secret;
-	// otherwise the first ATTACH argument is the connection string. schema_filter /
-	// table_filter restrict catalog discovery. Recognized options are erased so
-	// DuckDB's StorageOptions doesn't reject them as unrecognized.
+	// Only the two META options the core must handle itself are parsed here: SECRET (resolved to a connstr
+	// before the provider opens) and PROVIDER (selects which backend handles this ATTACH). EVERY other option
+	// is provider-owned — collected into a flat JSON object and forwarded to the managed side via open_catalog
+	// (e.g. SQL Server reads schema_filter / table_filter / isolation_level). The provider-agnostic core thus
+	// names no provider-specific option. Forwarded options are erased so DuckDB's StorageOptions doesn't
+	// reject them as unrecognized. See docs/provider-extensibility.md §3.
 	string secret_name;
-	string schema_filter;
-	string table_filter;
-	string isolation_level; // default SQL transaction isolation level for table-in-out sessions
 	string provider; // which registered backend handles this catalog (empty => default)
+	string options_body;
 	for (auto it = options.options.begin(); it != options.options.end();) {
 		auto lower = StringUtil::Lower(it->first);
 		if (lower == "secret") {
 			secret_name = it->second.ToString();
-		} else if (lower == "schema_filter") {
-			schema_filter = it->second.ToString();
-			it = options.options.erase(it);
+			++it; // left in the options map (handled by DuckDB's ATTACH machinery), as before
 			continue;
-		} else if (lower == "table_filter") {
-			table_filter = it->second.ToString();
-			it = options.options.erase(it);
-			continue;
-		} else if (lower == "isolation_level") {
-			isolation_level = it->second.ToString();
-			it = options.options.erase(it);
-			continue;
-		} else if (lower == "provider") {
+		}
+		if (lower == "provider") {
 			provider = StringUtil::Lower(it->second.ToString());
 			it = options.options.erase(it);
 			continue;
 		}
-		++it;
+		// Provider-owned option: forward to C# as a JSON string field (lowercased key for a stable contract).
+		if (!options_body.empty()) {
+			options_body += ",";
+		}
+		options_body += "\"" + EscapeJsonOption(lower) + "\":\"" + EscapeJsonOption(it->second.ToString()) + "\"";
+		it = options.options.erase(it);
 	}
+	string options_json = "{" + options_body + "}";
 
 	string connection_string;
 	if (!secret_name.empty()) {
@@ -122,10 +148,6 @@ static unique_ptr<Catalog> MssqlNetAttach(optional_ptr<StorageExtensionInfo> sto
 		                      "ATTACH 'Server=...;Database=...;User Id=...;Password=...' AS db (TYPE mssql_net) "
 		                      "or ATTACH '' AS db (TYPE mssql_net, SECRET my_secret)");
 	}
-
-	// Validate the filter regexes up front so a bad pattern reports a clean "Invalid
-	// regex" error rather than being wrapped as a connection failure below.
-	ArrowNetCatalog::ValidateCatalogFilters(schema_filter, table_filter);
 
 	ValidateConnectionPort(connection_string);
 
@@ -152,10 +174,10 @@ static unique_ptr<Catalog> MssqlNetAttach(optional_ptr<StorageExtensionInfo> sto
 	// wrap the underlying driver/network error so the cause is clear (and so a later
 	// catalog query is never the first place a bad connection surfaces).
 	try {
-		auto handle = arrownet::OpenCatalog(connection_string, provider);
+		// The provider-owned options (schema_filter / table_filter / isolation_level / …) ride options_json
+		// into the managed side; a bad filter regex now surfaces here as the managed open error.
+		auto handle = arrownet::OpenCatalog(connection_string, provider, options_json);
 		auto catalog = make_uniq<ArrowNetCatalog>(db, name, handle, RedactConnectionString(connection_string));
-		catalog->SetCatalogFilters(schema_filter, table_filter);
-		catalog->SetIsolationLevel(isolation_level);
 		catalog->LoadCatalog(context); // discover schemas + tables (also validates the connection)
 		return std::move(catalog);
 	} catch (const std::exception &ex) {

@@ -18,8 +18,8 @@ The three flavors:
 | Flavor | DuckDB surface | Status |
 |---|---|---|
 | **Settings** (`SET x = …`) | extension options | **DONE** (ABI v33) |
-| **Secret fields** (`CREATE SECRET (TYPE …, field …)`) | secret type + params | designed (§2) |
-| **ATTACH options** (`ATTACH … (TYPE …, opt …)`) | storage-extension attach map | designed (§3) |
+| **Secret fields** (`CREATE SECRET (TYPE …, field …)`) | secret type + params | designed (§2) — the last one left |
+| **ATTACH options** (`ATTACH … (TYPE …, opt …)`) | storage-extension attach map | **DONE** (ABI v37, §3) |
 
 ## 1. Settings — DONE (ABI v33)
 
@@ -49,11 +49,25 @@ C# reads the secret's fields as JSON and assembles the provider connstr. So only
 **Why cleanest:** only declaration + validation move; the value path (`build_connection_string`) already
 exists. Mostly *deleting* the C++ field list + `ValidateFields` and declaring them in C#.
 
-## 3. ATTACH options — designed, with one structural nuance
+## 3. ATTACH options — DONE (ABI v37)
 
-**Today (C++-hardcoded):** [mssql_net_storage.cpp:90-110](../src/mssql_net_storage.cpp#L90) parses options
-with a hardcoded `if (lower == "schema_filter") …` chain (`schema_filter`/`table_filter`/`isolation_level`/
-`provider`/`secret`), all `mssql`-specific.
+**Implemented.** `open_catalog` gained an `options_json` arg: `MssqlNetAttach` now extracts only the two
+META options it must handle before the provider is resolved (**PROVIDER** — selects the backend, incl.
+`scheme://` inference; **SECRET** — resolved to a connstr), serializes **every other** ATTACH option into a
+flat JSON object, and forwards it. The provider-agnostic core names no provider-specific option. C#
+(`SqlServerCatalog`) parses the keys it knows — `schema_filter`/`table_filter` (applied in `get_metadata`)
+and `isolation_level` (per-catalog default for table-in-out, resolved with `mssql_isolation_level` in
+`InOutBind`). Consequences carried out: the C++ `CatalogFilters` + `ValidateCatalogFilters` (regex validation
+moved to C#, clean ATTACH error preserved) + the catalog's `schema_filter_`/`table_filter_`/`isolation_level_`
++ `ResolveInOutIsolation` are gone, and `inout_exchange_open` dropped its `isolation` arg (C# resolves it).
+Function discovery is schema-filtered for free: the C++ catalog only registers a discovered function if its
+schema is already registered (and the managed `schema_filter` kept non-matching schemas out of
+`DiscoverSchemas`). Validated: `verify_catalog_filter` + `verify_inout_isolation` + full suite 30/30; dbt
+`--threads 4` green. Below is the original design (retained for context).
+
+**Was (C++-hardcoded):** [mssql_net_storage.cpp](../src/mssql_net_storage.cpp) parsed options with a hardcoded
+`if (lower == "schema_filter") …` chain (`schema_filter`/`table_filter`/`isolation_level`/`provider`/`secret`),
+all `mssql`-specific.
 
 **Key difference from settings/secrets:** ATTACH options are **not pre-registered** in DuckDB — the storage
 extension just reads them from the attach options map at attach time. So the refactor is "**pass the map to
@@ -104,8 +118,10 @@ C++ core stays name-agnostic** — three instances of one pattern.
 
 ## Open decisions
 
-- **Secret type naming per provider** (`sqlserver`/`mssql` vs a generic `arrownet` type with a provider field?).
-- **ATTACH filter-location change** — confirm the C#-side filtering matches the current C++ semantics
-  (`verify_catalog_filter`).
-- **Declare ATTACH options (for validation) vs just read the map** — declaration adds a clean unknown-option
-  error + docs at the cost of a second declaration surface.
+- **Secret type naming per provider** (`sqlserver`/`mssql` vs a generic `arrownet` type with a provider field?)
+  — still open; decide with the DAX provider (§2).
+- **ATTACH filter-location change** — RESOLVED: C#-side filtering matches the C++ semantics
+  (`verify_catalog_filter` green; icase unanchored substring regex).
+- **Declare ATTACH options (for validation) vs just read the map** — RESOLVED for now: **just read the map**
+  (the provider reads keys it knows; unknown keys are ignored — no per-provider declaration surface). A
+  declared-options validation pass (clean "unknown option" error + docs) can be added later if wanted.

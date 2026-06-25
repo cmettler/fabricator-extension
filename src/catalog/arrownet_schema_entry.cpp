@@ -797,7 +797,6 @@ struct ArrowNetTableFunctionInfo : public TableFunctionInfo {
 	vector<LogicalType> arg_types;
 	vector<string> arg_names;
 	bool is_proc = false;    // stored procedure (EXEC, no pushdown) vs TVF (FROM, pushdown)
-	string attach_isolation; // ATTACH isolation_level default for this catalog (in-out only; empty => none)
 };
 
 // Per-plan binding handle for the session-model table functions (table_bind / table_execute / table_close).
@@ -892,20 +891,6 @@ unique_ptr<FunctionData> ArrowNetTableFunctionBind(ClientContext &context, Table
 	};
 	bind_data->push_projection = bind_state->supports_pushdown;
 	return std::move(bind_data);
-}
-
-
-// Resolves the effective isolation level for an in-out session: the `mssql_isolation_level` session
-// setting if set, else the catalog's ATTACH `isolation_level` default, else empty (provider default).
-string ResolveInOutIsolation(ClientContext &context, const string &attach_isolation) {
-	Value setting;
-	if (context.TryGetCurrentSetting("mssql_isolation_level", setting) && !setting.IsNull()) {
-		string s = setting.ToString();
-		if (!s.empty()) {
-			return s;
-		}
-	}
-	return attach_isolation;
 }
 
 
@@ -1011,7 +996,6 @@ struct ArrowNetExchangeBindData : public TableFunctionData {
 	ArrowNetHandle handle = nullptr;
 	string schema;
 	string func;
-	string isolation;
 	vector<LogicalType> input_types;
 	vector<string> input_names;
 	shared_ptr<ExchangeHolder> holder;
@@ -1060,7 +1044,6 @@ unique_ptr<FunctionData> ArrowNetExchangeBind(ClientContext &context, TableFunct
 	bind_data->handle = info.handle;
 	bind_data->schema = info.schema;
 	bind_data->func = info.func;
-	bind_data->isolation = ResolveInOutIsolation(context, info.attach_isolation);
 	bind_data->holder = make_shared_ptr<ExchangeHolder>();
 	for (idx_t i = 0; i < input.input_table_types.size(); i++) {
 		bind_data->input_types.push_back(input.input_table_types[i]);
@@ -1122,7 +1105,7 @@ unique_ptr<GlobalTableFunctionState> ArrowNetExchangeInitGlobal(ClientContext &c
 	// DuckDB's transaction). The id rides the per-thread ambient; also re-set in the Execute function (the
 	// connection is opened lazily on the first output pull there). See docs/transaction-concurrency.md.
 	ArrowNetSetActiveTxn(nullptr, context);
-	arrownet::InOutExchangeOpen(bind.holder->binding, input_stream, bind.isolation, output_stream);
+	arrownet::InOutExchangeOpen(bind.holder->binding, input_stream, output_stream);
 	gstate->reader = make_uniq<arrownet::ArrowStreamReader>(context, output_stream);
 
 	lock_guard<mutex> guard(bind.holder->lock);
@@ -1403,7 +1386,6 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateInOutFunction(ClientC
 	fn_info->arg_types = arg_types;
 	fn_info->arg_names = arg_names;
 	fn_info->is_proc = false;
-	fn_info->attach_isolation = catalog.Cast<ArrowNetCatalog>().GetIsolationLevel();
 	inout.function_info = std::move(fn_info);
 
 	CreateTableFunctionInfo info(std::move(inout));
@@ -1431,7 +1413,6 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateCustomInOutFunction(C
 	fn_info->schema = name;
 	fn_info->func = func_name;
 	fn_info->is_proc = false;
-	fn_info->attach_isolation = catalog.Cast<ArrowNetCatalog>().GetIsolationLevel();
 	inout.function_info = std::move(fn_info);
 
 	CreateTableFunctionInfo info(std::move(inout));

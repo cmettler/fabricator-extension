@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
 using System.Data;
 using System.Text;
+using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Threading.Channels;
 using ArrowNet.Bridge;
 using Apache.Arrow;
@@ -58,7 +60,8 @@ public sealed class SqlServerBackend : IBackend
         }
     }
 
-    public IBackendCatalog OpenCatalog(string connectionString) => new SqlServerCatalog(connectionString);
+    public IBackendCatalog OpenCatalog(string connectionString, string optionsJson) =>
+        new SqlServerCatalog(connectionString, optionsJson);
 
     /// <summary>
     /// Assembles a Microsoft.Data.SqlClient connection string from a secret's fields. All SqlClient
@@ -208,7 +211,15 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     private bool _marsEnabled;                        // resolved in EnsureProfile (mssql_mars ?? profile.SupportsMars)
     private readonly object _profileLock = new();
 
-    public SqlServerCatalog(string connectionString)
+    // Provider-owned ATTACH options (parsed from open_catalog's options_json; docs/provider-extensibility.md §3).
+    // schema_filter/table_filter (icase regex, substring match) are applied in GetMetadata so discovery returns
+    // only matches; _isolationLevel is this catalog's default SQL isolation for table-in-out sessions (a SET
+    // mssql_isolation_level overrides it, resolved in InOutBind).
+    private readonly Regex? _schemaFilter;
+    private readonly Regex? _tableFilter;
+    private readonly string _isolationLevel = "";
+
+    public SqlServerCatalog(string connectionString, string optionsJson)
     {
         // Empty connection string is rejected early with a clear message.
         if (string.IsNullOrWhiteSpace(connectionString))
@@ -239,6 +250,42 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         // connection outright. See EnsureProfile + docs/transactions.md (read-your-writes on the pinned
         // connection requires MARS so a scan reader and DML coexist).
         _baseConnectionString = connStr;
+
+        // Parse the provider-owned ATTACH options (a flat JSON object of strings). Keys are matched
+        // case-insensitively; unknown keys are ignored (forward-compat). A bad filter regex fails ATTACH
+        // here with a clean message (the former C++ ValidateCatalogFilters).
+        if (!string.IsNullOrEmpty(optionsJson))
+        {
+            using var doc = JsonDocument.Parse(optionsJson);
+            foreach (var prop in doc.RootElement.EnumerateObject())
+            {
+                string val = prop.Value.ValueKind == JsonValueKind.String ? (prop.Value.GetString() ?? "") : "";
+                switch (prop.Name.ToLowerInvariant())
+                {
+                    case "schema_filter": _schemaFilter = CompileFilter("schema_filter", val); break;
+                    case "table_filter": _tableFilter = CompileFilter("table_filter", val); break;
+                    case "isolation_level": _isolationLevel = val; break;
+                }
+            }
+        }
+    }
+
+    // Compiles an ATTACH filter pattern (icase regex, unanchored substring match — parity with the former
+    // C++ CatalogFilters std::regex_search). Empty => no filter. A bad pattern => a clean ATTACH error.
+    private static Regex? CompileFilter(string key, string pattern)
+    {
+        if (string.IsNullOrEmpty(pattern))
+        {
+            return null;
+        }
+        try
+        {
+            return new Regex(pattern, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        }
+        catch (ArgumentException ex)
+        {
+            throw new ArgumentException($"mssql_net: invalid {key} regex '{pattern}': {ex.Message}");
+        }
     }
 
     // Translates a mssql://[user[:password]@]host[:port]/database[?params] URI into
@@ -916,8 +963,13 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // otherwise the self-healing cache would evict a freshly CREATEd table on a non-MARS engine (Fabric).
     public IArrowArrayStream GetMetadata(int kind, string? schema, string? table) => kind switch
     {
-        MetadataKind.Schemas => ExecuteMetadataQuery(SchemasSql),
-        MetadataKind.Tables => ExecuteMetadataQuery(TablesSql),
+        // schema_filter/table_filter (ATTACH options) are applied here so discovery sees only matches —
+        // the provider owns its filtering (the C++ core no longer knows these option names). No filter set =>
+        // stream the query directly (no materialization).
+        MetadataKind.Schemas => _schemaFilter is null ? ExecuteMetadataQuery(SchemasSql) : FilteredSchemas(),
+        MetadataKind.Tables => _schemaFilter is null && _tableFilter is null
+                                   ? ExecuteMetadataQuery(TablesSql)
+                                   : FilteredTables(),
         // Zero-row result whose Arrow schema describes the table's columns; the
         // C++ host reads that schema to learn the DuckDB column types.
         MetadataKind.Columns => ExecuteMetadataQuery($"SELECT * FROM {Quote(Require(schema, table).schema)}." +
@@ -950,6 +1002,91 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             values.Append(value);
         }
         var batch = new RecordBatch(schema, new IArrowArray[] { properties.Build(), values.Build() }, rows.Count);
+        return new InMemoryArrayStream(schema, new[] { batch });
+    }
+
+    // Reads a metadata query's result rows as strings (small result sets: schema/table discovery). Uses the
+    // metadata connection (read-your-writes when in a write transaction), mirroring GetMetadata.
+    private List<string?[]> ReadMetadataRows(string sql, int columnCount)
+    {
+        var rows = new List<string?[]>();
+        using var src = ExecuteMetadataQuery(sql);
+        while (true)
+        {
+            var batch = src.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+            if (batch is null)
+            {
+                break;
+            }
+            using (batch)
+            {
+                var cols = new StringArray[columnCount];
+                for (int c = 0; c < columnCount; c++)
+                {
+                    cols[c] = (StringArray)batch.Column(c);
+                }
+                for (int i = 0; i < batch.Length; i++)
+                {
+                    var row = new string?[columnCount];
+                    for (int c = 0; c < columnCount; c++)
+                    {
+                        row[c] = cols[c].GetString(i);
+                    }
+                    rows.Add(row);
+                }
+            }
+        }
+        return rows;
+    }
+
+    // schema_filter applied: only schema names matching the icase regex (substring) are returned.
+    private IArrowArrayStream FilteredSchemas()
+    {
+        var schema = new Schema(new[] { new Field("name", StringType.Default, nullable: false) }, metadata: null);
+        var names = new StringArray.Builder();
+        int n = 0;
+        foreach (var row in ReadMetadataRows(SchemasSql, 1))
+        {
+            if (row[0] is { } name && _schemaFilter!.IsMatch(name))
+            {
+                names.Append(name);
+                n++;
+            }
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { names.Build() }, n);
+        return new InMemoryArrayStream(schema, new[] { batch });
+    }
+
+    // schema_filter + table_filter applied: a table is kept only if its schema matches schema_filter (or none
+    // set) AND its name matches table_filter (or none set) — parity with the former C++ CatalogFilters.
+    private IArrowArrayStream FilteredTables()
+    {
+        var schema = new Schema(new[]
+        {
+            new Field("schema_name", StringType.Default, nullable: false),
+            new Field("table_name", StringType.Default, nullable: false),
+            new Field("table_type", StringType.Default, nullable: false),
+        }, metadata: null);
+        var schemas = new StringArray.Builder();
+        var tables = new StringArray.Builder();
+        var types = new StringArray.Builder();
+        int n = 0;
+        foreach (var row in ReadMetadataRows(TablesSql, 3))
+        {
+            if (row[0] is not { } sn || row[1] is not { } tn)
+            {
+                continue;
+            }
+            if ((_schemaFilter is null || _schemaFilter.IsMatch(sn)) &&
+                (_tableFilter is null || _tableFilter.IsMatch(tn)))
+            {
+                schemas.Append(sn);
+                tables.Append(tn);
+                types.Append(row[2]);
+                n++;
+            }
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { schemas.Build(), tables.Build(), types.Build() }, n);
         return new InMemoryArrayStream(schema, new[] { batch });
     }
 
@@ -1655,15 +1792,29 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // TVF has result columns in ROUTINE_COLUMNS, a proc doesn't.
     public IArrowInOutBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema)
     {
+        IArrowInOutBinding binding;
         if (CustomInOut.TryGetValue($"{schemaName}.{functionName}", out var custom))
         {
-            return custom.Bind(args, inputSchema);
+            binding = custom.Bind(args, inputSchema);
         }
-        if (FunctionOutputColumns(schemaName, functionName).Count > 0)
+        else if (FunctionOutputColumns(schemaName, functionName).Count > 0)
         {
-            return new SqlServerTvfEach(this, schemaName, functionName, inputSchema);
+            binding = new SqlServerTvfEach(this, schemaName, functionName, inputSchema);
         }
-        return new SqlServerProcEach(this, schemaName, functionName, inputSchema);
+        else
+        {
+            binding = new SqlServerProcEach(this, schemaName, functionName, inputSchema);
+        }
+        // Resolve the SQL isolation for this in-out call and set it on the binding (if it honors isolation):
+        // a SET mssql_isolation_level (pushed to the provider settings store) overrides this catalog's ATTACH
+        // isolation_level default; pure-C# / proc bindings ignore it. Replaces the former C++
+        // ResolveInOutIsolation + inout_exchange_open's isolation arg (docs/provider-extensibility.md §3).
+        if (binding is IArrowInOutIsolation iso)
+        {
+            var setLevel = ProviderSettingsStore.Instance.GetString(SqlServerBackend.ProviderName, "mssql_isolation_level");
+            iso.IsolationLevel = string.IsNullOrEmpty(setLevel) ? _isolationLevel : setLevel;
+        }
+        return binding;
     }
 
     // 4h custom aggregate (UDAF): open a session mapping DuckDB's per-group int64 state ids to live C#
