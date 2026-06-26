@@ -102,7 +102,13 @@ which caps at 19.84.1) loads in net10 (win-x64), connects to local PBI Desktop, 
 3. **Table scan** — **DONE + validated.** `ScanTable` → `EVALUATE SELECTCOLUMNS('T', "Col", 'T'[Col], …)`
    projection (no projection → `EVALUATE 'T'`); de-bracketed column names match discovery. **Filter pushdown
    DONE** (see below). Validated: full scan, projection, `WHERE`+`ORDER BY`+`LIMIT`, aggregation, exact
-   `DECIMAL(38,2)` sums, `TIMESTAMP_MS` min, and `DESCRIBE` — all green against the live model.
+   `DECIMAL(38,2)` sums, `TIMESTAMP_MS` min, and `DESCRIBE` — all green against the live model. **Committed
+   test: `test/verify_dax.test`** — gated by `require-env` (a live model isn't a portable fixture) and
+   asserting **model-agnostic invariants** (non-empty scan; projection preserves row count; `IS NULL` +
+   `IS NOT NULL` pushdown partitions all rows = superset-safe/complete; `IS NOT NULL` == `count(col)`;
+   contradiction → 0). Set `ARROWNET_DAX_DSN` (e.g. `pbidesktop://`), `ARROWNET_DAX_TABLE` (a quoted table
+   ref), `ARROWNET_DAX_COL` (a column with some NULLs); it runs against any tabular model and skips
+   otherwise.
    - **Filter pushdown** (`DaxFilterBuilder`): the C++ catalog scan already passes the pushed predicate
      (`spec.Filter` + `filterValues`) to `ScanTable`; we render it into a DAX boolean and wrap the table in
      `FILTER('T', <pred>)` (VertiPaq pushes storage-engine-friendly parts down, iterates the rest in the

@@ -1,0 +1,62 @@
+# name: test/verify_dax.test
+# description: DAX / Analysis Services provider (slices 1-3) — ATTACH a live semantic model, scan +
+#              projection + filter pushdown. A live model is not a portable fixture (it's a running
+#              Power BI Desktop / SSAS / Fabric instance), so this is gated by require-env and asserts
+#              MODEL-AGNOSTIC invariants (no hardcoded counts) — it passes against ANY tabular model you
+#              point it at. Set:
+#                ARROWNET_DAX_DSN   e.g. 'pbidesktop://' (local PBI Desktop autodetect) or
+#                                   'Data Source=localhost:<port>' / a Fabric/SSAS XMLA connstr
+#                ARROWNET_DAX_TABLE a fully-qualified, quoted table reference, e.g. pbi."Model"."Customer"
+#                ARROWNET_DAX_COL   a quoted column of that table that has some NULLs, e.g. "Country"
+# group: [mssql_net]
+
+require mssql_net
+
+require-env ARROWNET_DAX_DSN
+
+require-env ARROWNET_DAX_TABLE
+
+require-env ARROWNET_DAX_COL
+
+statement ok
+ATTACH '${ARROWNET_DAX_DSN}' AS pbi (TYPE mssql_net, PROVIDER 'dax');
+
+# A model table is reachable and non-empty (EVALUATE scan streams rows).
+query I
+SELECT count(*) > 0 FROM ${ARROWNET_DAX_TABLE};
+----
+true
+
+# Projection preserves the row count (the SELECTCOLUMNS scan path).
+query I
+SELECT (SELECT count(*) FROM ${ARROWNET_DAX_TABLE})
+     = (SELECT count(*) FROM (SELECT ${ARROWNET_DAX_COL} FROM ${ARROWNET_DAX_TABLE}) s);
+----
+true
+
+# Filter pushdown is superset-safe / complete: IS NULL + IS NOT NULL partition all rows. This pushes
+# FILTER('T', ISBLANK(c)) and FILTER('T', NOT(ISBLANK(c))); DuckDB re-applies, so the only way the two
+# parts sum to the total is if the pushed FILTER drops/duplicates nothing.
+query I
+SELECT (SELECT count(*) FROM ${ARROWNET_DAX_TABLE})
+     = (SELECT count(*) FROM ${ARROWNET_DAX_TABLE} WHERE ${ARROWNET_DAX_COL} IS NULL)
+     + (SELECT count(*) FROM ${ARROWNET_DAX_TABLE} WHERE ${ARROWNET_DAX_COL} IS NOT NULL);
+----
+true
+
+# IS NOT NULL pushdown returns exactly the non-null rows (must equal count(col), which ignores NULLs).
+query I
+SELECT (SELECT count(*) FROM ${ARROWNET_DAX_TABLE} WHERE ${ARROWNET_DAX_COL} IS NOT NULL)
+     = (SELECT count(${ARROWNET_DAX_COL}) FROM ${ARROWNET_DAX_TABLE});
+----
+true
+
+# A contradictory predicate returns no rows.
+query I
+SELECT count(*) FROM ${ARROWNET_DAX_TABLE}
+WHERE ${ARROWNET_DAX_COL} IS NULL AND ${ARROWNET_DAX_COL} IS NOT NULL;
+----
+0
+
+statement ok
+DETACH pbi;
