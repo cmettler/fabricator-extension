@@ -100,10 +100,24 @@ which caps at 19.84.1) loads in net10 (win-x64), connects to local PBI Desktop, 
    Validated against the live model: `SHOW ALL TABLES` lists all 6 tables with correct types
    (`DECIMAL(19,4)` currency, `TIMESTAMP_MS`, `BIGINT`, `BOOLEAN`, `VARCHAR`).
 3. **Table scan** — **DONE + validated.** `ScanTable` → `EVALUATE SELECTCOLUMNS('T', "Col", 'T'[Col], …)`
-   projection (no projection → `EVALUATE 'T'`); de-bracketed column names match discovery. No filter pushdown
-   (DAX has no general WHERE here) — the pushed filter is ignored and DuckDB re-applies it (never-erase: a
-   superset is safe). Validated: full scan, projection, `WHERE`+`ORDER BY`+`LIMIT`, aggregation, exact
+   projection (no projection → `EVALUATE 'T'`); de-bracketed column names match discovery. **Filter pushdown
+   DONE** (see below). Validated: full scan, projection, `WHERE`+`ORDER BY`+`LIMIT`, aggregation, exact
    `DECIMAL(38,2)` sums, `TIMESTAMP_MS` min, and `DESCRIBE` — all green against the live model.
+   - **Filter pushdown** (`DaxFilterBuilder`): the C++ catalog scan already passes the pushed predicate
+     (`spec.Filter` + `filterValues`) to `ScanTable`; we render it into a DAX boolean and wrap the table in
+     `FILTER('T', <pred>)` (VertiPaq pushes storage-engine-friendly parts down, iterates the rest in the
+     formula engine). Best-effort + **superset-safe** (DuckDB re-applies, so a superset is fine but a subset
+     would drop rows). DAX has no parameters → constants are inlined as DAX literals (`"…"`, `TRUE()`,
+     `DATE()+TIME()`, invariant numerics); `ArrowValueReader` (promoted to Bridge, shared with the SQL
+     provider) turns the `filterValues` batch into CLR values. **Safety gating** (DAX semantics differ from
+     SQL): string comparison is case-insensitive, so `=` / `IN` on strings yield a *superset* (safe) but `<>`
+     on strings yields a *subset* (also excludes case-variants DuckDB keeps) → NOT pushed; string ordering
+     (`<`/`>`) can differ by collation → NOT pushed; so `<>`/`<`/`<=`/`>`/`>=` push only for **non-string**
+     values, while `=`/`IN`/`IS NULL`(→`ISBLANK`)/`IS NOT NULL` push for any type. `and` drops unpushable
+     children (still a superset); `or` is all-or-nothing (dropping a branch would narrow). Validated against
+     the live model: `= 'N/A'` → 9117 (= ground-truth group count), `IS NULL` → 21019, `IN ('N/A')` → 9117,
+     a **case-insensitive superset proof** (`= 'n/a'` → 0, DuckDB re-narrows DAX's case-insensitive match),
+     and a date range (`>= 1900` → all 13949 non-null, `>= 2999` → 0).
    - **It is TRUE incremental streaming** (`DaxArrowStream`, ≤1 batch buffered) — validated to **10.5M rows**.
      The earlier belief that streaming was impossible in-process (and that `AdomdDataAdapter.Fill` /
      materialization was required) was **WRONG** — see the correction below.

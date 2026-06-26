@@ -1,15 +1,15 @@
 using Apache.Arrow;
 using Apache.Arrow.Types;
 
-namespace ArrowNet.SqlServer;
+namespace ArrowNet.Bridge;
 
 /// <summary>
-/// Reads a single scalar (row 0) out of an Arrow array — used to turn the filter
-/// value batch into CLR values for SQL parameters. Unhandled types throw; the
-/// caller treats that as "don't push this predicate" (DuckDB re-applies it), so
-/// coverage gaps cost performance, never correctness.
+/// Reads a single scalar (row <paramref name="index"/>) out of an Arrow array as a CLR value — used to turn
+/// a pushed-down filter value batch into CLR values (SQL parameters, DAX literals, …). Provider-agnostic, so
+/// it lives in the Bridge. Unhandled types throw; callers treat that as "don't push this predicate" (DuckDB
+/// re-applies it), so coverage gaps cost performance, never correctness.
 /// </summary>
-internal static class ArrowValueReader
+public static class ArrowValueReader
 {
     public static object? ReadScalar(IArrowArray array, int index)
     {
@@ -38,7 +38,7 @@ internal static class ArrowValueReader
             Date32Array a => a.GetDateTime(index),
             Date64Array a => a.GetDateTime(index),
             TimestampArray a => ReadTimestamp(a, index),
-            _ => throw new NotSupportedException($"mssql_net: unsupported filter value type {array.Data.DataType.TypeId}"),
+            _ => throw new NotSupportedException($"arrownet: unsupported filter value type {array.Data.DataType.TypeId}"),
         };
     }
 
@@ -46,8 +46,8 @@ internal static class ArrowValueReader
     {
         var ts = a.GetTimestamp(index)!.Value; // DateTimeOffset (stored as UTC when no tz)
         var type = (TimestampType)a.Data.DataType;
-        // No timezone => a wall-clock value (SQL datetime2): hand SQL a DateTime.
-        // With timezone (SQL datetimeoffset): hand it the DateTimeOffset.
+        // No timezone => a wall-clock value (SQL datetime2): hand back a DateTime.
+        // With timezone (SQL datetimeoffset): hand back the DateTimeOffset.
         return string.IsNullOrEmpty(type.Timezone) ? ts.UtcDateTime : ts;
     }
 }

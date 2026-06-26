@@ -155,14 +155,62 @@ internal sealed class DaxCatalog : IBackendCatalog
     public IArrowArrayStream ScanTable(string schemaName, string tableName, string? specJson,
                                        IArrowArrayStream? filterValues)
     {
-        var projection = ParseProjection(specJson);
-        // Inner table expression (no leading EVALUATE) so we can both probe its schema and fetch its data.
-        string innerExpr = projection is { Count: > 0 }
-            ? $"SELECTCOLUMNS({QuoteDaxTable(tableName)}, " +
-              string.Join(", ", projection.Select(c =>
-                  $"\"{c.Replace("\"", "\"\"")}\", {QuoteDaxTable(tableName)}[{c}]")) + ")"
-            : QuoteDaxTable(tableName);
+        var spec = ScanSpec.Parse(specJson);
+        string tableRef = QuoteDaxTable(tableName);
+
+        // Filter pushdown (best-effort, superset-safe — DuckDB re-applies every predicate). Wrap the table in
+        // FILTER('T', <pred>); VertiPaq pushes the storage-engine-friendly parts down and iterates the rest.
+        // If nothing safe is pushable (or anything fails), scan unfiltered and let DuckDB filter.
+        string tableExpr = tableRef;
+        if (spec?.Filter is not null && filterValues is not null)
+        {
+            try
+            {
+                var values = ReadFilterValues(filterValues);
+                filterValues = null; // consumed + disposed by ReadFilterValues
+                var pred = new DaxFilterBuilder(values, tableRef).Render(spec.Filter);
+                if (!string.IsNullOrEmpty(pred))
+                {
+                    tableExpr = $"FILTER({tableRef}, {pred})";
+                }
+            }
+            catch
+            {
+                // Fall through to an unfiltered scan; correctness preserved by DuckDB.
+            }
+        }
+        filterValues?.Dispose(); // dispose if not consumed above (host hands us ownership)
+
+        // Projection (absent/empty => whole table). Column refs stay qualified by the base table so they
+        // resolve in FILTER's row context.
+        string innerExpr = spec?.Columns is { Count: > 0 } cols
+            ? $"SELECTCOLUMNS({tableExpr}, " +
+              string.Join(", ", cols.Select(c =>
+                  $"\"{c.Replace("\"", "\"\"")}\", {tableRef}[{c}]")) + ")"
+            : tableExpr;
         return ScanTableCore(innerExpr);
+    }
+
+    // Reads the one-row filter value batch (column i == value i) into CLR values; disposes the stream.
+    private static List<object?> ReadFilterValues(IArrowArrayStream stream)
+    {
+        using (stream)
+        {
+            var batch = stream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+            if (batch is null)
+            {
+                return new List<object?>();
+            }
+            using (batch)
+            {
+                var values = new List<object?>(batch.ColumnCount);
+                for (int i = 0; i < batch.ColumnCount; i++)
+                {
+                    values.Add(ArrowValueReader.ReadScalar(batch.Column(i), 0));
+                }
+                return values;
+            }
+        }
     }
 
     /// <summary>
@@ -194,32 +242,6 @@ internal sealed class DaxCatalog : IBackendCatalog
             conn.Dispose();
             throw;
         }
-    }
-
-    /// <summary>Extracts the projected DuckDB column names from the scan spec (<c>{"columns":[...]}</c>);
-    /// null/absent => full table.</summary>
-    private static List<string>? ParseProjection(string? specJson)
-    {
-        if (string.IsNullOrWhiteSpace(specJson))
-        {
-            return null;
-        }
-        using var doc = System.Text.Json.JsonDocument.Parse(specJson);
-        if (!doc.RootElement.TryGetProperty("columns", out var cols) ||
-            cols.ValueKind != System.Text.Json.JsonValueKind.Array)
-        {
-            return null;
-        }
-        var result = new List<string>();
-        foreach (var c in cols.EnumerateArray())
-        {
-            var name = c.ValueKind == System.Text.Json.JsonValueKind.String ? c.GetString() : null;
-            if (!string.IsNullOrEmpty(name))
-            {
-                result.Add(name!);
-            }
-        }
-        return result.Count > 0 ? result : null;
     }
 
     // ---- functions (later slices) ---------------------------------------------------------------------

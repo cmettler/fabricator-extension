@@ -201,7 +201,11 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   Linux-TBD**. **Slices 2–3 DONE + validated** (live local model): slice 2 = DMV table/column discovery
   (`TMSCHEMA_TABLES`; columns via `EVALUATE TOPN(0,'T')`+`GetSchemaTable` = real engine types, no TOM-enum
   guessing; `DaxTypeMap` CLR→Arrow incl. `Decimal`→`Decimal128(p,s)`; `'T'[Col]`→`Col`); slice 3 = table
-  scan via `EVALUATE SELECTCOLUMNS` projection (no filter pushdown — DuckDB re-filters), **TRUE incremental
+  scan via `EVALUATE SELECTCOLUMNS` projection + **filter pushdown** (`DaxFilterBuilder` wraps the table in
+  `FILTER('T', <pred>)`; superset-safe — DuckDB re-applies; string `=`/`IN`/`ISBLANK` push for any type,
+  `<>`/range push only for non-string since DAX strings are case-insensitive/collation-dependent; `and`
+  drops unpushable children, `or` is all-or-nothing; constants inlined as DAX literals via the Bridge-shared
+  `ArrowValueReader`), **TRUE incremental
   streaming** (`DaxArrowStream`, ≤1 batch buffered — validated to **10.5M rows**), `WHERE`/`ORDER BY`/`LIMIT`,
   aggregation, exact decimals, `DESCRIBE`. **CRITICAL ADOMD GOTCHA (the real root cause):** `AdomdDataReader.Read()`
   called AFTER it already returned `false` (past end-of-data) does NOT return `false` again — it **throws**
