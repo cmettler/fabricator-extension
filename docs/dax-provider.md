@@ -317,15 +317,30 @@ lateral-capable apply is `apply_tmdl_each(<rows>)`; no new "lateral table functi
   `(path, content)`. `tmdl_of('Table','Sales')` scalar = one object (pure read → scalar is fine here).
 - **`<model>.apply_tmdl(text)` — table function (effect, status row):** apply one; arg is a bind-constant, so
   it composes with `render_tmdl(…)` over literals: `FROM apply_tmdl(render_tmdl('tmpl', {…}))`.
-- **`<model>.apply_tmdl_each(<rows>)` — table-in-out:** the lateral apply — dynamic per-row TMDL from the
-  input relation (the templating runs upstream: `apply_tmdl_each(SELECT render_tmdl(…) AS tmdl FROM driving)`),
-  serialized commits.
+- **`<model>.apply_tmdl_each(<rows>)` — table-in-out:** per-row apply — dynamic per-row TMDL from the input
+  relation (templating upstream: `apply_tmdl_each(SELECT render_tmdl(…) AS tmdl FROM driving)`), **N commits**,
+  serialized (gate `MaxThreads=1`). Use when you want independent/streaming per-row applies.
+- **`<model>.apply_tmdl_agg(fragment)` — custom aggregate (4h machinery):** collect many fragments and apply
+  them in **ONE atomic commit** at finalize — the best fit for assembling a model edit from many fragments
+  (`SELECT apply_tmdl_agg(render_tmdl(…)) FROM edits`; `GROUP BY scope` → one atomic apply per scope). Reuses
+  the holistic/collect aggregate pattern (Update collects the fragment string, Combine merges the collections,
+  Finalize opens one TOM model + applies all + a single `SaveChanges`). **Side-effect-safe by construction:**
+  the collection (Update/Combine) is parallel + pure; the effect is isolated in **Finalize, which DuckDB runs
+  exactly once per group, single-threaded** on the merged state — the "runs once, serialized" property a
+  commit needs, achieved structurally (vs an unsafe scalar). Vs `_each`: one transaction + one reframe instead
+  of N. Caveats: Combine order isn't guaranteed (fine for independent fragments; one `SaveChanges` lets TOM
+  resolve the object graph at once); **don't use it windowed** (`OVER` drives finalize per frame → repeated
+  apply) — plain / `GROUP BY` only; empty input → no-op. (Note: `apply_tmdl((SELECT string_agg(frag) …))`
+  does NOT work — a TVF arg must be a bind-constant, not a runtime aggregate subquery — and a `string_agg`
+  + `_each` variant assumes the fragments textually concatenate into one valid TMDL document; the aggregate
+  batches at the OBJECT level instead, so they needn't.)
 - **`<model>.apply_tmsl(json)` / `<model>.refresh([table])` — table functions:** the raw-TMSL escape hatch +
   the DirectLake reframe companion.
 
 **Build order if pursued:** (1) `tmdl()` reader — low risk, immediately useful (version/diff/CI a model's
-definition); (2) `render_tmdl` + `apply_tmdl`/`apply_tmdl_each` + `refresh` — real editing, scoped, prefer
-per-object alter over whole-model `createOrReplace`; (3) whole-model replace + DDL→model auto-sync — deferred
+definition); (2) `render_tmdl` + `apply_tmdl`/`apply_tmdl_each`/`apply_tmdl_agg` + `refresh` — real editing,
+scoped, prefer per-object alter over whole-model `createOrReplace` (and `apply_tmdl_agg` for one atomic
+multi-fragment commit); (3) whole-model replace + DDL→model auto-sync — deferred
 (high blast radius). Non-atomic with warehouse writes throughout (two systems).
 
 ## Open questions / deferred
