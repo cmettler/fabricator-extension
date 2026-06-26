@@ -206,7 +206,10 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   `<>`/range push only for non-string since DAX strings are case-insensitive/collation-dependent; `and`
   drops unpushable children, `or` is all-or-nothing; constants inlined as DAX literals via the Bridge-shared
   `ArrowValueReader`), **TRUE incremental
-  streaming** (`DaxArrowStream`, ≤1 batch buffered — validated to **10.5M rows**), `WHERE`/`ORDER BY`/`LIMIT`,
+  streaming** (`DaxArrowStream`, ≤1 batch buffered — validated to **10.5M rows**), a **`system` schema**
+  exposing a curated set of VertiPaq/`$SYSTEM` DMVs as tables (`db.system."TMSCHEMA_TABLES"` etc. —
+  `DaxCatalog.SystemTables`; bare `SELECT * FROM $SYSTEM.<dmv>`, no pushdown; metadata/scan branch on the
+  `system` schema; 14 DMVs validated live), `WHERE`/`ORDER BY`/`LIMIT`,
   aggregation, exact decimals, `DESCRIBE`. **CRITICAL ADOMD GOTCHA (the real root cause):** `AdomdDataReader.Read()`
   called AFTER it already returned `false` (past end-of-data) does NOT return `false` again — it **throws**
   `AdomdUnknownResponseException` ("the server sent an unrecognizable response", `XmlaClient.ReadEndElementS`).

@@ -58,5 +58,18 @@ WHERE ${ARROWNET_DAX_COL} IS NULL AND ${ARROWNET_DAX_COL} IS NOT NULL;
 ----
 0
 
+# The "system" schema exposes curated $SYSTEM DMVs as tables (bare SELECT * FROM $SYSTEM.<dmv>; no pushdown).
+# These DMV names exist in every tabular model, so these assertions are model-agnostic.
+query I
+SELECT count(*) > 0 FROM pbi.system."TMSCHEMA_TABLES";
+----
+true
+
+# A wider DMV scans without error (exercises the multi-batch DMV streaming path).
+query I
+SELECT count(*) >= 0 FROM pbi.system."DBSCHEMA_COLUMNS";
+----
+true
+
 statement ok
 DETACH pbi;

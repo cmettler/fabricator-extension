@@ -91,6 +91,18 @@ which caps at 19.84.1) loads in net10 (win-x64), connects to local PBI Desktop, 
    model name(s) from `TMSCHEMA_MODEL`, so the model shows as a DuckDB schema. SqlServer unregressed; unknown
    provider errors cleanly listing `sqlserver, dax`. (TYPE is still `mssql_net` — the generic `arrownet`
    rename is deferred to when this provider matures.)
+- **System ($SYSTEM DMV) tables** — **DONE + validated.** A curated set of VertiPaq/`$SYSTEM` DMVs is
+  exposed as tables under a **`system` schema** in the same catalog (`db.system."TMSCHEMA_TABLES"`, etc.).
+  `DaxCatalog.SystemTables` lists them (extend freely): `TMSCHEMA_MODEL/TABLES/COLUMNS/MEASURES/
+  RELATIONSHIPS/PARTITIONS/HIERARCHIES`, `DBSCHEMA_TABLES/COLUMNS`, `DISCOVER_STORAGE_TABLES/
+  STORAGE_TABLE_COLUMNS/STORAGE_TABLE_COLUMN_SEGMENTS/CALC_DEPENDENCY/OBJECT_MEMORY_USAGE`. The DMV query
+  language is very limited, so the scan is a **bare `SELECT * FROM $SYSTEM.<dmv>`** (no `EVALUATE`, no
+  projection/filter pushdown — DuckDB applies those above the scan); column discovery uses the same query +
+  `GetSchemaTable` (reads no rows). Metadata/scan reuse the model path: `GetMetadata(Schemas)` adds `system`,
+  `GetMetadata(Tables)` appends the DMVs (`table_type='SYSTEM TABLE'`), `GetMetadata(Columns)`/`ScanTable`
+  branch on the `system` schema. Only DMVs queryable without a restriction `WHERE` belong in the list (all 14
+  validated live: e.g. `TMSCHEMA_COLUMNS` 792 rows, `DISCOVER_STORAGE_TABLE_COLUMN_SEGMENTS` 4063 — the
+  latter >2048 rows, so it also exercises multi-batch DMV streaming).
 2. **DMV metadata → catalog** — **DONE + validated.** `GetMetadata(Tables)` = `$SYSTEM.TMSCHEMA_TABLES`
    (under the single model = schema; Power BI's auto `LocalDateTable_*`/`DateTableTemplate_*` filtered out).
    `GetMetadata(Columns)` resolves each table's columns by running `EVALUATE TOPN(0, '<table>')` and reading

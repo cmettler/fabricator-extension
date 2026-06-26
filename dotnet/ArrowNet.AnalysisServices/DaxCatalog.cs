@@ -37,15 +37,48 @@ internal sealed class DaxCatalog : IBackendCatalog
 
     // ---- metadata --------------------------------------------------------------------------------------
 
+    // The DuckDB schema that exposes the curated VertiPaq/$SYSTEM DMVs as tables, in the same catalog.
+    private const string SystemSchema = "system";
+
+    // Curated $SYSTEM DMVs surfaced under the "system" schema. Each is queryable with a bare
+    // `SELECT * FROM $SYSTEM.<name>` (the DMV SQL is very limited; DuckDB applies projection/filter above the
+    // scan — no pushdown). Only DMVs that work WITHOUT a restriction WHERE belong here; extend as needed.
+    private static readonly string[] SystemTables =
+    {
+        "TMSCHEMA_MODEL", "TMSCHEMA_TABLES", "TMSCHEMA_COLUMNS", "TMSCHEMA_MEASURES",
+        "TMSCHEMA_RELATIONSHIPS", "TMSCHEMA_PARTITIONS", "TMSCHEMA_HIERARCHIES",
+        "DBSCHEMA_TABLES", "DBSCHEMA_COLUMNS",
+        "DISCOVER_STORAGE_TABLES", "DISCOVER_STORAGE_TABLE_COLUMNS",
+        "DISCOVER_STORAGE_TABLE_COLUMN_SEGMENTS", "DISCOVER_CALC_DEPENDENCY",
+        "DISCOVER_OBJECT_MEMORY_USAGE",
+    };
+
+    private static bool IsSystem(string? schema) =>
+        string.Equals(schema, SystemSchema, StringComparison.OrdinalIgnoreCase);
+
+    // Resolves a system table name to its $SYSTEM DMV (validated against the curated list — DuckDB only scans
+    // tables we declared, but guard defensively so a stray name can't reach the DMV endpoint).
+    private static string SystemDmv(string table)
+    {
+        foreach (var t in SystemTables)
+        {
+            if (string.Equals(t, table, StringComparison.OrdinalIgnoreCase))
+            {
+                return t;
+            }
+        }
+        throw new NotSupportedException($"dax provider: unknown system table '{table}'");
+    }
+
     public IArrowArrayStream GetMetadata(int kind, string? schema, string? table) => kind switch
     {
-        // Schemas = the model name(s) in this database (usually one for Power BI Desktop).
-        MetadataKind.Schemas => SingleColumn("schema_name", new[] { _modelName }),
-        // Tables = the model's tables (TMSCHEMA_TABLES), all under the single model = schema.
+        // Schemas = the model name(s) + the "system" schema (curated $SYSTEM DMVs).
+        MetadataKind.Schemas => SingleColumn("schema_name", new[] { _modelName, SystemSchema }),
+        // Tables = the model's tables (TMSCHEMA_TABLES) + the curated system DMVs.
         MetadataKind.Tables => DiscoverTables(),
-        // Columns = a zero-row stream whose SCHEMA describes the table's columns, resolved by running a
-        // zero-row DAX query and reading its schema table (the no-describe approach; real engine types).
-        MetadataKind.Columns => DiscoverColumns(table!),
+        // Columns = a zero-row stream whose SCHEMA describes the table's columns (the no-describe approach;
+        // real engine types). Model: EVALUATE TOPN(0,'T'); system: bare SELECT * FROM $SYSTEM.<dmv>.
+        MetadataKind.Columns => DiscoverColumns(schema, table!),
         // Functions / server-info: empty (valid); functions are slice 4.
         MetadataKind.Functions => EmptyStringTable("schema_name", "name", "kind"),
         MetadataKind.ServerInfo => EmptyStringTable("property", "value"),
@@ -73,6 +106,13 @@ internal sealed class DaxCatalog : IBackendCatalog
                 typeCol.Add("BASE TABLE");
             }
         }
+        // Curated $SYSTEM DMVs under the "system" schema (same catalog).
+        foreach (var sysTable in SystemTables)
+        {
+            schemaCol.Add(SystemSchema);
+            nameCol.Add(sysTable);
+            typeCol.Add("SYSTEM TABLE");
+        }
         return ThreeColumn("schema_name", schemaCol, "table_name", nameCol, "table_type", typeCol);
     }
 
@@ -80,15 +120,19 @@ internal sealed class DaxCatalog : IBackendCatalog
         => name.StartsWith("LocalDateTable_", StringComparison.OrdinalIgnoreCase)
         || name.StartsWith("DateTableTemplate_", StringComparison.OrdinalIgnoreCase);
 
-    private IArrowArrayStream DiscoverColumns(string table)
+    private IArrowArrayStream DiscoverColumns(string? schema, string table)
     {
-        // EVALUATE TOPN(0, 'Table') returns the table's data columns (no internal RowNumber) with the
-        // engine's result-column types; the schema table gives name + CLR type + nullability.
+        // Model: EVALUATE TOPN(0,'T') returns the data columns (no internal RowNumber) with engine types.
+        // System: a bare SELECT * FROM $SYSTEM.<dmv> — GetSchemaTable reads NO rows, so it's cheap even
+        // without a TOPN-style cap (the DMV SQL has no TOPN/EVALUATE). The schema table gives name + CLR type.
+        string cmdText = IsSystem(schema)
+            ? $"SELECT * FROM $SYSTEM.{SystemDmv(table)}"
+            : $"EVALUATE TOPN(0, {QuoteDaxTable(table)})";
         using var cmd = _conn.CreateCommand();
-        cmd.CommandText = $"EVALUATE TOPN(0, {QuoteDaxTable(table)})";
+        cmd.CommandText = cmdText;
         using var r = cmd.ExecuteReader();
-        var schema = ArrowSchemaFromReader(r);
-        return new InMemoryArrayStream(schema, System.Array.Empty<RecordBatch>());
+        var arrowSchema = ArrowSchemaFromReader(r);
+        return new InMemoryArrayStream(arrowSchema, System.Array.Empty<RecordBatch>());
     }
 
     /// <summary>Builds the Arrow schema for a DAX result set from the reader's schema table — de-bracketed
@@ -155,6 +199,14 @@ internal sealed class DaxCatalog : IBackendCatalog
     public IArrowArrayStream ScanTable(string schemaName, string tableName, string? specJson,
                                        IArrowArrayStream? filterValues)
     {
+        // $SYSTEM DMVs: a bare SELECT (the DMV SQL is very limited; no pushdown — DuckDB projects/filters
+        // above the scan). Ignore + dispose any pushed filter values.
+        if (IsSystem(schemaName))
+        {
+            filterValues?.Dispose();
+            return ScanTableCore($"SELECT * FROM $SYSTEM.{SystemDmv(tableName)}");
+        }
+
         var spec = ScanSpec.Parse(specJson);
         string tableRef = QuoteDaxTable(tableName);
 
@@ -188,7 +240,7 @@ internal sealed class DaxCatalog : IBackendCatalog
               string.Join(", ", cols.Select(c =>
                   $"\"{c.Replace("\"", "\"\"")}\", {tableRef}[{c}]")) + ")"
             : tableExpr;
-        return ScanTableCore(innerExpr);
+        return ScanTableCore($"EVALUATE {innerExpr}");
     }
 
     // Reads the one-row filter value batch (column i == value i) into CLR values; disposes the stream.
@@ -220,7 +272,7 @@ internal sealed class DaxCatalog : IBackendCatalog
     /// (validated to 10.5M rows). See <see cref="DaxArrowStream"/> for the one subtlety that makes it work:
     /// never call <c>Read()</c> past end-of-data (ADOMD throws on it).
     /// </summary>
-    private IArrowArrayStream ScanTableCore(string innerExpr)
+    private IArrowArrayStream ScanTableCore(string commandText)
     {
         var conn = new AdomdConnection(_connectionString);
         try
@@ -231,7 +283,7 @@ internal sealed class DaxCatalog : IBackendCatalog
                 conn.ChangeDatabase(_catalog);
             }
             var cmd = conn.CreateCommand();
-            cmd.CommandText = $"EVALUATE {innerExpr}";
+            cmd.CommandText = commandText;
             var reader = cmd.ExecuteReader();
             var schema = ArrowSchemaFromReader(reader);
             // The stream owns conn/cmd/reader and disposes them at scan teardown.
