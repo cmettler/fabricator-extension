@@ -85,7 +85,9 @@ internal sealed class DaxCatalog : IBackendCatalog
         MetadataKind.Functions => ThreeColumn(
             "schema_name", new[] { _modelName, _modelName, _modelName },
             "name", new[] { DaxEvalName, DaxEvalTableName, DaxEachName },
-            "kind", new[] { "table", "inout", "inout" }),
+            // daxeval is a 'proc' (not 'table') so its args register as NAMED parameters — it takes an
+            // optional `params` JSON arg alongside `expression`, which a positional table fn can't express.
+            "kind", new[] { "proc", "inout", "inout" }),
         MetadataKind.ServerInfo => EmptyStringTable("property", "value"),
         _ => EmptyStringTable("name"),
     };
@@ -294,13 +296,15 @@ internal sealed class DaxCatalog : IBackendCatalog
     /// <summary>Runs <paramref name="commandText"/> (DAX or a $SYSTEM DMV SELECT) on a fresh connection and
     /// returns its rows as a lazy Arrow stream (the stream owns conn/cmd/reader). The output schema is taken
     /// from <paramref name="knownSchema"/> when given (e.g. resolved at bind), else from the data reader.</summary>
-    internal IArrowArrayStream StreamCommand(string commandText, Schema? knownSchema)
+    internal IArrowArrayStream StreamCommand(string commandText, Schema? knownSchema,
+                                             IReadOnlyList<KeyValuePair<string, object?>>? daxParams = null)
     {
         var conn = OpenConnection();
         try
         {
             var cmd = conn.CreateCommand();
             cmd.CommandText = commandText;
+            BindDaxParams(cmd, daxParams);
             var reader = cmd.ExecuteReader();
             var schema = knownSchema ?? ArrowSchemaFromReader(reader);
             return new DaxArrowStream(conn, cmd, reader, schema, batchSize: 2048);
@@ -314,11 +318,13 @@ internal sealed class DaxCatalog : IBackendCatalog
 
     /// <summary>Resolves a command's output schema without fetching rows (ExecuteReader + GetSchemaTable) —
     /// the no-describe approach used to bind a daxeval call's output columns.</summary>
-    internal Schema ProbeSchema(string commandText)
+    internal Schema ProbeSchema(string commandText,
+                                IReadOnlyList<KeyValuePair<string, object?>>? daxParams = null)
     {
         using var conn = OpenConnection();
         using var cmd = conn.CreateCommand();
         cmd.CommandText = commandText;
+        BindDaxParams(cmd, daxParams);
         using var reader = cmd.ExecuteReader();
         return ArrowSchemaFromReader(reader);
     }
@@ -342,22 +348,98 @@ internal sealed class DaxCatalog : IBackendCatalog
     private static bool IsDaxEach(string functionName) =>
         string.Equals(functionName, DaxEachName, StringComparison.OrdinalIgnoreCase);
 
+    // Reads the named arg <paramref name="name"/> (case-insensitive) from the 1-row args batch, or null if
+    // absent. Args arrive as a batch whose columns are the SUPPLIED named parameters (order not guaranteed),
+    // so read by field name rather than position.
+    private static object? ReadArgByName(RecordBatch? args, string name)
+    {
+        if (args is null)
+        {
+            return null;
+        }
+        var fields = args.Schema.FieldsList;
+        for (int i = 0; i < fields.Count; i++)
+        {
+            if (string.Equals(fields[i].Name, name, StringComparison.OrdinalIgnoreCase))
+            {
+                return ArrowValueReader.ReadScalar(args.Column(i), 0);
+            }
+        }
+        return null;
+    }
+
     private static string DaxEvalExpression(RecordBatch? args)
     {
-        var expr = args is { ColumnCount: > 0 } ? ArrowValueReader.ReadScalar(args.Column(0), 0)?.ToString() : null;
+        var expr = ReadArgByName(args, "expression")?.ToString();
         if (string.IsNullOrWhiteSpace(expr))
         {
-            throw new ArgumentException("dax provider: daxeval(expression) requires a non-empty DAX expression");
+            throw new ArgumentException(
+                "dax provider: a non-empty 'expression' is required, e.g. daxeval(expression := 'EVALUATE …')");
         }
         return expr!;
     }
 
+    // daxeval's optional `params` arg = a JSON object of DAX parameter values; each becomes an ADOMD
+    // parameter the expression references as @<name> (e.g. params := '{"p": 5, "q": "x"}' -> @p, @q).
+    private static IReadOnlyList<KeyValuePair<string, object?>> DaxParams(RecordBatch? args)
+        => ParseDaxParams(ReadArgByName(args, "params")?.ToString());
+
+    private static IReadOnlyList<KeyValuePair<string, object?>> ParseDaxParams(string? json)
+    {
+        var result = new List<KeyValuePair<string, object?>>();
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return result;
+        }
+        using var doc = System.Text.Json.JsonDocument.Parse(json);
+        if (doc.RootElement.ValueKind != System.Text.Json.JsonValueKind.Object)
+        {
+            throw new ArgumentException("dax provider: daxeval 'params' must be a JSON object, e.g. '{\"p\": 5}'");
+        }
+        foreach (var p in doc.RootElement.EnumerateObject())
+        {
+            result.Add(new KeyValuePair<string, object?>(p.Name, JsonScalar(p.Value)));
+        }
+        return result;
+    }
+
+    private static object? JsonScalar(System.Text.Json.JsonElement e) => e.ValueKind switch
+    {
+        System.Text.Json.JsonValueKind.Number => e.TryGetInt64(out var l) ? l : e.GetDouble(),
+        System.Text.Json.JsonValueKind.String => e.GetString(),
+        System.Text.Json.JsonValueKind.True => true,
+        System.Text.Json.JsonValueKind.False => false,
+        System.Text.Json.JsonValueKind.Null => null,
+        _ => e.GetRawText(), // array/object — pass the raw JSON text (unusual for a DAX scalar param)
+    };
+
+    private static void BindDaxParams(AdomdCommand cmd, IReadOnlyList<KeyValuePair<string, object?>>? daxParams)
+    {
+        if (daxParams is null)
+        {
+            return;
+        }
+        foreach (var kv in daxParams)
+        {
+            cmd.Parameters.Add(new AdomdParameter(kv.Key, kv.Value ?? DBNull.Value));
+        }
+    }
+
     public Schema GetFunctionParamSchema(string schemaName, string functionName)
     {
-        // Both daxeval (table fn) and daxevaltable (in-out) take a single DAX-expression arg. For the in-out
-        // it is declared as a NAMED parameter (coexists with the {TABLE} input): daxevaltable(<input>,
-        // expression := '…').
-        if (IsDaxEval(functionName) || IsDaxEvalTable(functionName) || IsDaxEach(functionName))
+        // daxeval takes `expression` (required) + an optional `params` JSON arg — both NAMED parameters
+        // (daxeval registers as a 'proc'). daxevaltable / daxeach take only `expression` (a named param
+        // that coexists with their {TABLE} input): daxevaltable(<input>, expression := '…').
+        if (IsDaxEval(functionName))
+        {
+            return new Schema(
+                new[]
+                {
+                    new Field("expression", StringType.Default, nullable: false),
+                    new Field("params", StringType.Default, nullable: true),
+                }, null);
+        }
+        if (IsDaxEvalTable(functionName) || IsDaxEach(functionName))
         {
             return new Schema(new[] { new Field("expression", StringType.Default, nullable: false) }, null);
         }
@@ -368,7 +450,8 @@ internal sealed class DaxCatalog : IBackendCatalog
     {
         if (IsDaxEval(functionName))
         {
-            return ProbeSchema(DaxEvalExpression(args)); // arg-dependent: the DAX result's columns
+            // arg-dependent: the DAX result's columns (resolved with any params bound).
+            return ProbeSchema(DaxEvalExpression(args), DaxParams(args));
         }
         throw new NotSupportedException($"dax provider: unknown function '{functionName}'");
     }
@@ -377,7 +460,7 @@ internal sealed class DaxCatalog : IBackendCatalog
     {
         if (IsDaxEval(functionName))
         {
-            return new DaxEvalBoundTable(this, DaxEvalExpression(args));
+            return new DaxEvalBoundTable(this, DaxEvalExpression(args), DaxParams(args));
         }
         throw new NotSupportedException($"dax provider: unknown table function '{functionName}'");
     }
@@ -409,12 +492,15 @@ internal sealed class DaxCatalog : IBackendCatalog
     {
         private readonly DaxCatalog _catalog;
         private readonly string _dax;
+        private readonly IReadOnlyList<KeyValuePair<string, object?>> _params;
 
-        public DaxEvalBoundTable(DaxCatalog catalog, string dax)
+        public DaxEvalBoundTable(DaxCatalog catalog, string dax,
+                                 IReadOnlyList<KeyValuePair<string, object?>> daxParams)
         {
             _catalog = catalog;
             _dax = dax;
-            OutputSchema = catalog.ProbeSchema(dax);
+            _params = daxParams;
+            OutputSchema = catalog.ProbeSchema(dax, daxParams);
         }
 
         public Schema OutputSchema { get; }
@@ -423,7 +509,7 @@ internal sealed class DaxCatalog : IBackendCatalog
         public IArrowArrayStream Execute(string? specJson, IArrowArrayStream? filterValues)
         {
             filterValues?.Dispose(); // no pushdown — DuckDB re-applies; just release the (usually null) batch
-            return _catalog.StreamCommand(_dax, OutputSchema);
+            return _catalog.StreamCommand(_dax, OutputSchema, _params);
         }
 
         public void Dispose() { }

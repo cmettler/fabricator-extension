@@ -157,19 +157,27 @@ which caps at 19.84.1) loads in net10 (win-x64), connects to local PBI Desktop, 
      batched/lazy/materialize/worker attempt failed because it called `Read()` one time too many. It was
      never concurrency, threads, GC, transport, PBI/`msmdsrv` version, AdomdClient version, or process
      topology.
-4. **`daxeval(expression)`** — **DONE + validated.** A table function (under the model schema) that evaluates
-   an arbitrary DAX query — a complete `EVALUATE` / `DEFINE…EVALUATE` statement — and returns its result
-   table: `SELECT * FROM db."<model>".daxeval('EVALUATE …')`. Registered via `GetMetadata(Functions)`
-   (`kind='table'`) + `GetFunctionParamSchema` (one `expression VARCHAR` arg). The C++ `kind='table'` path
-   calls `TableBind(schema, func, args)` → `DaxEvalBoundTable`: **bind** resolves the output schema by
-   executing the query + `GetSchemaTable` (no rows fetched — the no-describe approach; arg-dependent, the
-   columns follow the DAX); **`Execute`** re-runs the query and streams via `DaxArrowStream`. `SupportsPushdown
-   = false` (an arbitrary DAX query can't be wrapped — DuckDB projects/filters/aggregates above the scan).
-   Trade-off: the query runs at bind (schema, no rows) + once per execution. Validated live: `EVALUATE ROW(…)`
-   (schema from arbitrary DAX), `COUNTROWS`/`SUMMARIZECOLUMNS` aggregations, `EVALUATE {1,2,3}`, and a
-   full-table `EVALUATE 'T'` (30136 rows, multi-batch streaming). `verify_dax.test` covers it (model-agnostic
-   `ROW`/table-constructor cases; needs `ARROWNET_DAX_SCHEMA`). **Deferred:** parameter binding (the old
-   `DaxEvalFlight`'s named-parameter / ADOMD `Command.Parameters` path) — a later refinement.
+4. **`daxeval(expression := …, params := …)`** — **DONE + validated (incl. parameter binding).** A function
+   (under the model schema) that evaluates an arbitrary DAX query — a complete `EVALUATE` / `DEFINE…EVALUATE`
+   statement — and returns its result table: `SELECT * FROM db."<model>".daxeval(expression := 'EVALUATE …')`.
+   Registered via `GetMetadata(Functions)` with **`kind='proc'`** (not `'table'`) so its args register as
+   **named parameters** — that's what lets it take an *optional* second arg without breaking the no-arg call.
+   `GetFunctionParamSchema` returns `expression VARCHAR` (required) + `params VARCHAR` (optional). The C++
+   table-session path calls `TableBind(schema, func, args)` → `DaxEvalBoundTable`: **bind** resolves the
+   output schema by executing the query + `GetSchemaTable` (no rows fetched — the no-describe approach;
+   arg-dependent, the columns follow the DAX); **`Execute`** re-runs the query and streams via `DaxArrowStream`.
+   `SupportsPushdown = false` (an arbitrary DAX query can't be wrapped — DuckDB projects/filters/aggregates
+   above the scan). Trade-off: the query runs at bind (schema, no rows) + once per execution.
+   - **Parameter binding** (the old `DaxEvalFlight` mechanism): `params` is a JSON object — each entry is
+     bound as an ADOMD `AdomdParameter` the expression references as `@<name>` (e.g. `params := '{"a": 40,
+     "b": 2}'` → `@a`, `@b`). `ParseDaxParams` maps JSON number→int64/double, string→string, bool→bool,
+     null→`BLANK`; `BindDaxParams` adds them to the command for **both** the bind-time schema probe and each
+     execution. Args are read **by field name** (`ReadArgByName`) since named params arrive in arbitrary
+     column order. No ABI change (reuses the existing proc named-param marshaling + the v29 table session).
+   - Validated live: no-param `EVALUATE ROW(…)` (schema from arbitrary DAX), `COUNTROWS`/`SUMMARIZECOLUMNS`,
+     `EVALUATE {1,2,3}`, full-table `EVALUATE 'T'` (multi-batch streaming), **and** parameter binding —
+     numeric `@a + @b`, a string `@who`, and a param in a table filter (`FILTER(…, [Value] > @t)`).
+     `verify_dax.test` covers it (model-agnostic `ROW`/table-constructor/param cases; needs `ARROWNET_DAX_SCHEMA`).
 5. **`daxevaltable` in-out** — **DONE + validated.** `daxevaltable(<input>, expression := 'EVALUATE …')`
    injects the input table into the DAX as a table named `_input` (`DEFINE TABLE _input = DATATABLE(…)`
    prepended; the expression is a single `EVALUATE` referencing `_input`), evaluates ONCE, returns the
@@ -193,8 +201,8 @@ which caps at 19.84.1) loads in net10 (win-x64), connects to local PBI Desktop, 
    reuses one connection + command across rows (only the param values change), reads each row's result via
    the shared end-of-data-guarded `ReadBatches`, and emits per chunk — so unlike `daxevaltable` there is **no
    input-size limit** (per-row emit fits the streaming exchange). Validated live (`ROW("sq", @n*@n)` per row;
-   a row yielding 3 results → 2 inputs × 3 = 6 rows) + `verify_dax.test` (23). **This completes the DAX
-   eval/apply function family.** Deferred: `daxeval` parameter binding (a `daxeval(expr, params)` form).
+   a row yielding 3 results → 2 inputs × 3 = 6 rows) + `verify_dax.test`. **The DAX eval/apply function
+   family (daxeval + params, daxevaltable, daxeach) is complete.** `verify_dax.test` is at 25 assertions.
 6. *(later/optional)* limited filter pushdown into DAX `FILTER`/`CALCULATETABLE`; Fabric/AAS token auth via a
    secret + XMLA endpoint connection mode (cross-platform validation).
 

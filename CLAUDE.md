@@ -209,10 +209,15 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   streaming** (`DaxArrowStream`, ≤1 batch buffered — validated to **10.5M rows**), a **`system` schema**
   exposing a curated set of VertiPaq/`$SYSTEM` DMVs as tables (`db.system."TMSCHEMA_TABLES"` etc. —
   `DaxCatalog.SystemTables`; bare `SELECT * FROM $SYSTEM.<dmv>`, no pushdown; metadata/scan branch on the
-  `system` schema; 14 DMVs validated live), **`daxeval(expression)` table function** (slice 4 — under the
-  model schema; evaluates an arbitrary DAX `EVALUATE`/`DEFINE…EVALUATE` query, output schema resolved at
-  bind via `GetSchemaTable` no-describe, `DaxEvalBoundTable`, `SupportsPushdown=false`, streams; validated
-  ROW/COUNTROWS/SUMMARIZECOLUMNS/full-table; param binding deferred), **`daxevaltable(<input>, expression
+  `system` schema; 14 DMVs validated live), **`daxeval(expression := …, params := …)` function** (slice 4 +
+  param binding — under the model schema; evaluates an arbitrary DAX `EVALUATE`/`DEFINE…EVALUATE` query,
+  output schema resolved at bind via `GetSchemaTable` no-describe, `DaxEvalBoundTable`, `SupportsPushdown=false`,
+  streams; validated ROW/COUNTROWS/SUMMARIZECOLUMNS/full-table. **Registered `kind='proc'`** (not `'table'`)
+  so args are NAMED params — that's what allows the optional `params` arg without breaking the no-arg call.
+  **`params` = a JSON object** → each entry bound as an ADOMD `@<name>` parameter the DAX references
+  (`ParseDaxParams`/`BindDaxParams`, for both the bind probe + each execution; args read by field name via
+  `ReadArgByName`). Validated numeric/string/filter params. No ABI change — reuses the proc named-param
+  marshaling + v29 table session), **`daxevaltable(<input>, expression
   := …)` in-out** (slice 5 — injects the input table as a DAX `DATATABLE` named `_input`, evaluates once,
   `DaxEvalTableBinding`/`DaxDataTable`; this required wiring **cost args (named params) through the shared
   exchange** — `GetOrCreateCustomInOutFunction` declares named params via a tolerant `FetchFunctionParamSchema`
@@ -223,7 +228,7 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   proc_inout 31 / isolation 17) + **`daxeach(<input>, expression := …)` in-out** (slice 5b — per-input-row
   ADOMD `@<col>` param binding, output = the DAX result per row, no echo; `DaxEachBinding` reuses one
   conn+command across rows, emits per chunk so NO input-size limit; the "each" analog of the SQL `_each`,
-  renamed from the old `daxapply`). `verify_dax.test` 23/23. `WHERE`/`ORDER BY`/`LIMIT`,
+  renamed from the old `daxapply`). `verify_dax.test` 25/25. `WHERE`/`ORDER BY`/`LIMIT`,
   aggregation, exact decimals, `DESCRIBE`. **CRITICAL ADOMD GOTCHA (the real root cause):** `AdomdDataReader.Read()`
   called AFTER it already returned `false` (past end-of-data) does NOT return `false` again — it **throws**
   `AdomdUnknownResponseException` ("the server sent an unrecognizable response", `XmlaClient.ReadEndElementS`).

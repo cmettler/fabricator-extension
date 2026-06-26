@@ -75,18 +75,34 @@ SELECT count(*) >= 0 FROM pbi.system."DBSCHEMA_COLUMNS";
 ----
 true
 
-# daxeval(expression): evaluate an arbitrary DAX query as a table function. Output schema is resolved at
-# bind (the DAX result's columns). These DAX expressions reference no model data, so they're model-agnostic.
+# daxeval(expression := …): evaluate an arbitrary DAX query as a table function. Output schema is resolved
+# at bind (the DAX result's columns). Args are NAMED (daxeval registers as a 'proc'), so `expression :=`.
+# These DAX expressions reference no model data, so they're model-agnostic.
 query I
-SELECT n FROM ${ARROWNET_DAX_SCHEMA}.daxeval('EVALUATE ROW("n", 42)');
+SELECT n FROM ${ARROWNET_DAX_SCHEMA}.daxeval(expression := 'EVALUATE ROW("n", 42)');
 ----
 42
 
 # Multi-row result via a DAX table constructor (3 rows).
 query I
-SELECT count(*) FROM ${ARROWNET_DAX_SCHEMA}.daxeval('EVALUATE {1, 2, 3}');
+SELECT count(*) FROM ${ARROWNET_DAX_SCHEMA}.daxeval(expression := 'EVALUATE {1, 2, 3}');
 ----
 3
+
+# Parameter binding: daxeval(expression, params := '{json}') binds each JSON entry as an ADOMD @parameter
+# the DAX references as @<name> (40 + 2 = 42). Mixed-type params + the no-param call both stay model-agnostic.
+query I
+SELECT result::BIGINT FROM ${ARROWNET_DAX_SCHEMA}.daxeval(
+  expression := 'EVALUATE ROW("result", @a + @b)', params := '{"a": 40, "b": 2}');
+----
+42
+
+# A string parameter flows through (DAX string concat).
+query I
+SELECT greeting FROM ${ARROWNET_DAX_SCHEMA}.daxeval(
+  expression := 'EVALUATE ROW("greeting", @who)', params := '{"who": "world"}');
+----
+world
 
 # daxevaltable(<input>, expression := …): inject a DuckDB-side table into DAX as _input and evaluate once.
 # Model-agnostic (the injected table is a VALUES list; the DAX references only _input).
