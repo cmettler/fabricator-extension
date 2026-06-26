@@ -1,9 +1,12 @@
+using System.Data;
 using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Text;
 using Apache.Arrow;
 using Apache.Arrow.Types;
 using ArrowNet.Bridge;
+using ArrowNet.Bridge.Conversion;
+using Microsoft.AnalysisServices.AdomdClient;
 
 namespace ArrowNet.AnalysisServices;
 
@@ -85,6 +88,125 @@ internal sealed class DaxEvalTableBinding : IArrowInOutBinding
                 }
             }
             yield return InOutExchange.EmptyBatch(OutputSchema); // sentinel: this (sole) input chunk consumed
+        }
+    }
+
+    public void Dispose() { }
+}
+
+/// <summary>
+/// <c>daxeach(&lt;input&gt;, expression := 'EVALUATE …')</c> — runs the DAX query ONCE PER INPUT ROW, binding
+/// the row's columns as ADOMD parameters the expression references as <c>@&lt;column&gt;</c>, and streams each
+/// row's result. The "each" analog of the SQL provider's <c>_each</c> (the old Airport <c>DaxApplyFlight</c>).
+/// Output = the DAX result's columns (no input echo — reference <c>@col</c> in the expression to carry input
+/// values through). Per-row + per-chunk emit fits the streaming exchange with no input-size limit.
+/// </summary>
+internal sealed class DaxEachBinding : IArrowInOutBinding
+{
+    private readonly DaxCatalog _catalog;
+    private readonly string _expression;
+    private readonly Schema _inputSchema;
+
+    public DaxEachBinding(DaxCatalog catalog, string expression, Schema inputSchema)
+    {
+        _catalog = catalog;
+        _expression = expression;
+        _inputSchema = inputSchema;
+        // Output schema = the DAX result columns, resolved by executing once with BLANK (DBNull) parameters
+        // (structure-determined; GetSchemaTable fetches no rows). Each input column is an @<name> parameter.
+        using var conn = catalog.OpenConnection();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = expression;
+        foreach (var f in inputSchema.FieldsList)
+        {
+            ((AdomdCommand)cmd).Parameters.Add(new AdomdParameter(f.Name, DBNull.Value));
+        }
+        using var reader = cmd.ExecuteReader();
+        OutputSchema = DaxCatalog.ArrowSchemaFromReader(reader);
+    }
+
+    public Schema OutputSchema { get; }
+
+    public async IAsyncEnumerable<RecordBatch> DoExchange(
+        IAsyncEnumerable<RecordBatch> input, [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        // One connection + command reused across all rows; only the parameter values change per row.
+        using var conn = _catalog.OpenConnection();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = _expression;
+        int ncols = _inputSchema.FieldsList.Count;
+        var adomd = (AdomdCommand)cmd;
+        for (int c = 0; c < ncols; c++)
+        {
+            adomd.Parameters.Add(new AdomdParameter(_inputSchema.FieldsList[c].Name, DBNull.Value));
+        }
+
+        await foreach (var chunk in input.WithCancellation(ct))
+        {
+            for (int r = 0; r < chunk.Length; r++)
+            {
+                for (int c = 0; c < ncols; c++)
+                {
+                    adomd.Parameters[c].Value = ToParam(ArrowValueReader.ReadScalar(chunk.Column(c), r));
+                }
+                using var reader = adomd.ExecuteReader();
+                foreach (var batch in ReadBatches(reader, OutputSchema))
+                {
+                    yield return batch;
+                }
+            }
+            yield return InOutExchange.EmptyBatch(OutputSchema); // sentinel: this input chunk consumed
+        }
+    }
+
+    private static object ToParam(object? value) => value switch
+    {
+        null => DBNull.Value,
+        DateTimeOffset dto => dto.DateTime, // DAX datetime is naive (no tz)
+        _ => value,
+    };
+
+    // Reads an ADOMD result fully into Arrow batches (<= batchSize), with the end-of-data guard
+    // (AdomdDataReader.Read() past EOF throws — see DaxArrowStream). One column appender set per batch.
+    private static IEnumerable<RecordBatch> ReadBatches(IDataReader reader, Schema schema, int batchSize = 2048)
+    {
+        int ncols = schema.FieldsList.Count;
+        while (true)
+        {
+            var appenders = new ColumnAppender[ncols];
+            for (int i = 0; i < ncols; i++)
+            {
+                appenders[i] = ColumnAppender.Create(schema.FieldsList[i].DataType);
+            }
+            int rows = 0;
+            bool end = false;
+            while (rows < batchSize)
+            {
+                if (!reader.Read())
+                {
+                    end = true;
+                    break;
+                }
+                for (int i = 0; i < ncols; i++)
+                {
+                    var v = reader.GetValue(i);
+                    if (v is null or DBNull) { appenders[i].AppendNull(); } else { appenders[i].Append(v); }
+                }
+                rows++;
+            }
+            if (rows > 0)
+            {
+                var arrays = new IArrowArray[ncols];
+                for (int i = 0; i < ncols; i++)
+                {
+                    arrays[i] = appenders[i].Build();
+                }
+                yield return new RecordBatch(schema, arrays, rows);
+            }
+            if (end)
+            {
+                yield break;
+            }
         }
     }
 

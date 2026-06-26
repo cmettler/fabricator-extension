@@ -83,9 +83,9 @@ internal sealed class DaxCatalog : IBackendCatalog
         // DAX query; daxevaltable(<input>, expression := …) — in-out, injects the input table as a DAX
         // DATATABLE the expression references (slice 5).
         MetadataKind.Functions => ThreeColumn(
-            "schema_name", new[] { _modelName, _modelName },
-            "name", new[] { DaxEvalName, DaxEvalTableName },
-            "kind", new[] { "table", "inout" }),
+            "schema_name", new[] { _modelName, _modelName, _modelName },
+            "name", new[] { DaxEvalName, DaxEvalTableName, DaxEachName },
+            "kind", new[] { "table", "inout", "inout" }),
         MetadataKind.ServerInfo => EmptyStringTable("property", "value"),
         _ => EmptyStringTable("name"),
     };
@@ -143,7 +143,7 @@ internal sealed class DaxCatalog : IBackendCatalog
     /// <summary>Builds the Arrow schema for a DAX result set from the reader's schema table — de-bracketed
     /// column names + <see cref="DaxTypeMap"/> types. Shared by column discovery and table scans so a scan's
     /// column names/types match what was discovered.</summary>
-    private static Schema ArrowSchemaFromReader(IDataReader reader)
+    internal static Schema ArrowSchemaFromReader(IDataReader reader)
     {
         var fields = new List<Field>();
         var st = reader.GetSchemaTable();
@@ -280,7 +280,7 @@ internal sealed class DaxCatalog : IBackendCatalog
     private IArrowArrayStream ScanTableCore(string commandText) => StreamCommand(commandText, null);
 
     /// <summary>Opens a fresh ADOMD connection bound to this catalog's model database.</summary>
-    private AdomdConnection OpenConnection()
+    internal AdomdConnection OpenConnection()
     {
         var conn = new AdomdConnection(_connectionString);
         conn.Open();
@@ -331,12 +331,16 @@ internal sealed class DaxCatalog : IBackendCatalog
 
     private const string DaxEvalName = "daxeval";
     private const string DaxEvalTableName = "daxevaltable";
+    private const string DaxEachName = "daxeach";
 
     private static bool IsDaxEval(string functionName) =>
         string.Equals(functionName, DaxEvalName, StringComparison.OrdinalIgnoreCase);
 
     private static bool IsDaxEvalTable(string functionName) =>
         string.Equals(functionName, DaxEvalTableName, StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsDaxEach(string functionName) =>
+        string.Equals(functionName, DaxEachName, StringComparison.OrdinalIgnoreCase);
 
     private static string DaxEvalExpression(RecordBatch? args)
     {
@@ -353,7 +357,7 @@ internal sealed class DaxCatalog : IBackendCatalog
         // Both daxeval (table fn) and daxevaltable (in-out) take a single DAX-expression arg. For the in-out
         // it is declared as a NAMED parameter (coexists with the {TABLE} input): daxevaltable(<input>,
         // expression := '…').
-        if (IsDaxEval(functionName) || IsDaxEvalTable(functionName))
+        if (IsDaxEval(functionName) || IsDaxEvalTable(functionName) || IsDaxEach(functionName))
         {
             return new Schema(new[] { new Field("expression", StringType.Default, nullable: false) }, null);
         }
@@ -386,10 +390,14 @@ internal sealed class DaxCatalog : IBackendCatalog
 
     public IArrowInOutBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema)
     {
+        // args carries the named "expression" param (1-row, column 0); inputSchema = the input table.
         if (IsDaxEvalTable(functionName))
         {
-            // args carries the named "expression" param (1-row, column 0); inputSchema = the input table.
             return new DaxEvalTableBinding(this, DaxEvalExpression(args), inputSchema);
+        }
+        if (IsDaxEach(functionName))
+        {
+            return new DaxEachBinding(this, DaxEvalExpression(args), inputSchema);
         }
         throw new NotSupportedException($"dax provider: unknown table-in-out function '{functionName}'");
     }

@@ -185,8 +185,16 @@ which caps at 19.84.1) loads in net10 (win-x64), connects to local PBI Desktop, 
    tenure — the input must arrive in a **single chunk (≤ 2048 rows)**; a larger input errors clearly (the
    intended use is a small parameter/lookup table). Validated live (`EVALUATE _input` echo; `SUMX` over the
    injected table) + `verify_dax.test`; existing in-out suites unregressed (`verify_custom_functions` 85,
-   `verify_table_inout` 63, `verify_proc_inout` 31, `verify_inout_isolation` 17). **`daxeach`** (per-row
-   param binding — the renamed `daxapply`) is next; it fits the per-chunk exchange with no row limit.
+   `verify_table_inout` 63, `verify_proc_inout` 31, `verify_inout_isolation` 17).
+6. **`daxeach` in-out** — **DONE + validated.** `daxeach(<input>, expression := 'EVALUATE …')` runs the DAX
+   once PER INPUT ROW, binding each input column as an ADOMD `@<column>` parameter the expression references;
+   output = the DAX result per row (no input echo — reference `@col` to carry input values through). The
+   "each" analog of the SQL provider's `_each` (renamed from the old Airport `daxapply`). `DaxEachBinding`
+   reuses one connection + command across rows (only the param values change), reads each row's result via
+   the shared end-of-data-guarded `ReadBatches`, and emits per chunk — so unlike `daxevaltable` there is **no
+   input-size limit** (per-row emit fits the streaming exchange). Validated live (`ROW("sq", @n*@n)` per row;
+   a row yielding 3 results → 2 inputs × 3 = 6 rows) + `verify_dax.test` (23). **This completes the DAX
+   eval/apply function family.** Deferred: `daxeval` parameter binding (a `daxeval(expr, params)` form).
 6. *(later/optional)* limited filter pushdown into DAX `FILTER`/`CALCULATETABLE`; Fabric/AAS token auth via a
    secret + XMLA endpoint connection mode (cross-platform validation).
 

@@ -220,7 +220,10 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   args, else nullptr (`_each` unchanged); no ABI bump. Whole-table op, but the exchange has no emit-at-end
   hook [finalize drain discards trailing output], so input must be a **single chunk ≤2048 rows** — for a
   small parameter/lookup table; larger errors. In-out regression green: custom 85 / table_inout 63 /
-  proc_inout 31 / isolation 17), `WHERE`/`ORDER BY`/`LIMIT`,
+  proc_inout 31 / isolation 17) + **`daxeach(<input>, expression := …)` in-out** (slice 5b — per-input-row
+  ADOMD `@<col>` param binding, output = the DAX result per row, no echo; `DaxEachBinding` reuses one
+  conn+command across rows, emits per chunk so NO input-size limit; the "each" analog of the SQL `_each`,
+  renamed from the old `daxapply`). `verify_dax.test` 23/23. `WHERE`/`ORDER BY`/`LIMIT`,
   aggregation, exact decimals, `DESCRIBE`. **CRITICAL ADOMD GOTCHA (the real root cause):** `AdomdDataReader.Read()`
   called AFTER it already returned `false` (past end-of-data) does NOT return `false` again — it **throws**
   `AdomdUnknownResponseException` ("the server sent an unrecognizable response", `XmlaClient.ReadEndElementS`).

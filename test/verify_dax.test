@@ -104,5 +104,22 @@ SELECT total FROM ${ARROWNET_DAX_SCHEMA}.daxevaltable(
 ----
 60
 
+# daxeach(<input>, expression := …): run the DAX once per input row, binding each input column as @<col>.
+# Output = the DAX result per row. Model-agnostic (VALUES + @params; no model data).
+query II
+SELECT n, sq FROM ${ARROWNET_DAX_SCHEMA}.daxeach(
+  (SELECT * FROM (VALUES (3), (4), (5)) v(n)), expression := 'EVALUATE ROW("n", @n, "sq", @n * @n)') ORDER BY n;
+----
+3	9
+4	16
+5	25
+
+# A row may yield multiple result rows (2 input rows x 3 = 6) — per-row, unbounded-input streaming.
+query I
+SELECT count(*) FROM ${ARROWNET_DAX_SCHEMA}.daxeach(
+  (SELECT * FROM (VALUES (1), (2)) v(k)), expression := 'EVALUATE { @k, @k + 10, @k + 20 }');
+----
+6
+
 statement ok
 DETACH pbi;
