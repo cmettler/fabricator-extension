@@ -72,10 +72,15 @@ which caps at 19.84.1) loads in net10 (win-x64), connects to local PBI Desktop, 
 - **Publish:** `publish-managed.ps1` publishes both providers into the same `arrownet/` dir (Bridge +
   SqlClient + AdomdClient + both backend dlls); the CoreCLR host initializes against Bridge's runtimeconfig.
 - **Connection modes** (`DaxBackend.ResolveConnectionString`): empty target or a `pbidesktop[://]` /
-  `localhost` marker → auto-detect the local PBI port (Windows-only, newest workspace's `msmdsrv.port.txt`) →
-  `Data Source=localhost:<port>`; any other target is passed through verbatim as an ADOMD connection string
-  (SSAS / Fabric / AAS). Token/Entra auth via a secret is a later slice (`BuildConnectionString` returns the
-  base target for now).
+  `localhost` marker → auto-detect the local PBI port → `Data Source=localhost:<port>`; any other target is
+  passed through verbatim as an ADOMD connection string (SSAS / Fabric / AAS). Token/Entra auth via a secret
+  is a later slice (`BuildConnectionString` returns the base target for now).
+- **Local-instance autodetect** (`PowerBiDesktop`, Windows-only): scans the `msmdsrv.port.txt` workspace
+  files across **all editions** — classic (`…\Power BI Desktop\…`), Report Server (`…\Power BI Desktop
+  SSRS\…`), and Store/MSIX (`%LOCALAPPDATA%\Packages\Microsoft.MicrosoftPowerBIDesktop*`) — and prefers the
+  **newest port that is actually listening** (a 250 ms loopback TCP connect), so a stale port file from a
+  closed instance is skipped. Falls back to the newest port file if none verifies. (Replaces the old
+  classic-path-only scan that missed the SSRS/Store editions.)
 - **DAX is read-only:** all write paths throw; `BEGIN/COMMIT/ROLLBACK` are no-ops so a wrapping DuckDB
   read-only transaction doesn't fail.
 
@@ -132,7 +137,7 @@ which caps at 19.84.1) loads in net10 (win-x64), connects to local PBI Desktop, 
 - **Cross-platform AdomdClient** (Linux) for the Fabric XMLA path — validate when a Fabric target is wired.
 - **Fabric/AAS auth** — access-token / Entra via a provider secret (reuse the azure-secret work, §2.1 of
   provider-extensibility.md). Slice 6.
-- **Multi-instance local PBI** — slice 1 picks the newest workspace's port; a way to target a specific open
-  file (by window title / workspace) is a later nicety.
+- **Multi-instance local PBI** — autodetect picks the newest *listening* workspace port (across all
+  editions); a way to target a specific open file (by window title / workspace) is a later nicety.
 - **The generic rename** (`TYPE arrownet`, `arrownet_query`/`_exec`) — do it once the DAX provider is real,
   per the "Next up" thread in CLAUDE.md.
