@@ -282,12 +282,22 @@ with the same token** `DaxTokenAuth` already mints — so auth is free, but it n
 endpoint + model-write permission (premium/Fabric), and TOM is a sizable new dependency. TMSL (a single JSON
 `alter`/`createOrReplace`/`refresh` command sent over XMLA) is the lower-level escape hatch under TMDL.
 
-**The design crux — generate is pure, apply is effectful → they take different shapes.** A scalar function is
-treated as **pure** by the optimizer (folded, deduped, pruned if the column is unused, or called per-row in
-arbitrary order/parallelism). That is fine for *generating* text but wrong for *applying* a change — a
-side-effecting scalar `apply_tmdl(...)` could run zero times, or many times in parallel, racing on a model
-commit (TOM `SaveChanges`/TMSL must be serialized). So, mirroring `mssql_net_exec` (a table function used for
-effect), **apply is a table function, never a scalar.**
+**The design crux — generate is pure, apply is effectful → they take different shapes.** That is fine for
+*generating* text but wrong for *applying* a change. Marking the scalar `VOLATILE` (our scalar-UDF path
+already does) removes only the value-caching hazards — no **constant-folding**, no **CSE/dedup** — but it does
+**not** give the properties a model commit needs, and DuckDB has **no scalar flag** that does:
+- **Not exactly-once.** A scalar in `SELECT apply(x) FROM t` runs once per row, and if its result column is
+  projected away upstream the optimizer can still **prune** it — `VOLATILE` governs value caching, not
+  side-effect *preservation* (SQL assumes scalars are side-effect-free, so even `random()` in an unused column
+  is elided).
+- **Not serialized.** `VOLATILE` says nothing about concurrency/order — the vectorized executor still runs the
+  projection across **multiple threads / morsels in parallel**, so a side-effecting `apply_tmdl(...)` races on
+  the model commit (TOM `SaveChanges`/TMSL must be serialized).
+
+The needed properties — *runs, exactly once per intended unit, in order* — aren't expressible on a scalar at
+all. They ARE what a source operator gives: a table function is materialized + evaluated once as written, and
+the `_each` in-out additionally pins `MaxThreads=1`, serializing commits by construction. So, mirroring
+`mssql_net_exec` (a table function used for effect), **apply is a table function, never a scalar.**
 
 **Bind-constant vs. table-argument (how to take DYNAMIC input).** A plain table function resolves its
 arguments at **bind time**, so an arg must be a bind-constant (a literal, or a scalar folded over literals) —
