@@ -271,6 +271,53 @@ the model table**. So the DMVs hand us everything to route a DAX model's table s
 have (SQL provider + the azure-SP token path). Direct Delta writes are a Lakehouse-only specialization, and
 automatic model/DDL sync is the speculative, high-blast-radius 20% — document it, don't build it yet.
 
+### TMDL model management — retrieve / apply a model definition (design idea, DEFERRED)
+
+The "sync the semantic model" piece above, fleshed out. The goal: read a model's **TMDL** (Tabular Model
+Definition Language — the human-readable text format) and apply edits, through the provider.
+
+**Mechanics.** TMDL is a **TOM** feature (`Microsoft.AnalysisServices.Tabular`): `TmdlSerializer` does TMDL↔
+model, `Model.SaveChanges()` applies (TOM emits TMSL under the hood). TOM connects to the **same XMLA endpoint
+with the same token** `DaxTokenAuth` already mints — so auth is free, but it needs the **read-write** XMLA
+endpoint + model-write permission (premium/Fabric), and TOM is a sizable new dependency. TMSL (a single JSON
+`alter`/`createOrReplace`/`refresh` command sent over XMLA) is the lower-level escape hatch under TMDL.
+
+**The design crux — generate is pure, apply is effectful → they take different shapes.** A scalar function is
+treated as **pure** by the optimizer (folded, deduped, pruned if the column is unused, or called per-row in
+arbitrary order/parallelism). That is fine for *generating* text but wrong for *applying* a change — a
+side-effecting scalar `apply_tmdl(...)` could run zero times, or many times in parallel, racing on a model
+commit (TOM `SaveChanges`/TMSL must be serialized). So, mirroring `mssql_net_exec` (a table function used for
+effect), **apply is a table function, never a scalar.**
+
+**Bind-constant vs. table-argument (how to take DYNAMIC input).** A plain table function resolves its
+arguments at **bind time**, so an arg must be a bind-constant (a literal, or a scalar folded over literals) —
+it cannot reference another relation's column (no "current row" at bind), so `FROM driving d, apply_tmdl(d.x)`
+is impossible. DuckDB's general mechanism for *per-row dynamic* table input is the **`in_out_function` with a
+`{LogicalType::TABLE}` argument** — i.e. exactly our Phase 6 exchange / `_each`: the dynamic value rides in the
+**input table**, not in a scalar argument, and the operator emits output per input row. The enabling
+constraint (a relation has ONE schema) is naturally satisfied: an in-out's **output schema is fixed and
+resolved at bind** — for `apply` it's a constant `(status, …)` shape regardless of the TMDL coming in. So the
+lateral-capable apply is `apply_tmdl_each(<rows>)`; no new "lateral table function" capability is needed — the
+`_each` operator IS it, and it serializes the applies (gate `MaxThreads=1` → no racing commits).
+
+**The function family (each in its natural shape; TOM-backed):**
+- **`render_tmdl(template, args…)` — scalar (pure):** the templating engine — composes/chains anywhere, runs
+  per row. Authored as a custom `IArrowScalarFunction` (the 4e machinery), or just DuckDB `format`/`concat`.
+- **`<model>.tmdl()` — table function (pure read):** scripts the model to TMDL, one row per object/document
+  `(path, content)`. `tmdl_of('Table','Sales')` scalar = one object (pure read → scalar is fine here).
+- **`<model>.apply_tmdl(text)` — table function (effect, status row):** apply one; arg is a bind-constant, so
+  it composes with `render_tmdl(…)` over literals: `FROM apply_tmdl(render_tmdl('tmpl', {…}))`.
+- **`<model>.apply_tmdl_each(<rows>)` — table-in-out:** the lateral apply — dynamic per-row TMDL from the
+  input relation (the templating runs upstream: `apply_tmdl_each(SELECT render_tmdl(…) AS tmdl FROM driving)`),
+  serialized commits.
+- **`<model>.apply_tmsl(json)` / `<model>.refresh([table])` — table functions:** the raw-TMSL escape hatch +
+  the DirectLake reframe companion.
+
+**Build order if pursued:** (1) `tmdl()` reader — low risk, immediately useful (version/diff/CI a model's
+definition); (2) `render_tmdl` + `apply_tmdl`/`apply_tmdl_each` + `refresh` — real editing, scoped, prefer
+per-object alter over whole-model `createOrReplace`; (3) whole-model replace + DDL→model auto-sync — deferred
+(high blast radius). Non-atomic with warehouse writes throughout (two systems).
+
 ## Open questions / deferred
 
 - **Cross-platform AdomdClient** (Linux) for the Fabric XMLA path — validate when a Linux Fabric target is

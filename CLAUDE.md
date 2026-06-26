@@ -265,8 +265,11 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   warehouse SQL endpoint = the DAX model scan, 2,838,927 rows) → a documented (NOT built) **DirectLake
   passthrough** idea: route base-table reads to the cheap SQL endpoint (measures/calc stay DAX), write
   warehouses via SQL / lakehouses via Delta + reframe, optional far-future TMSL model sync — design + honest
-  good/bad triage in [docs/dax-provider.md](docs/dax-provider.md) ("DirectLake passthrough"). Then the
-  **generic rename**
+  good/bad triage in [docs/dax-provider.md](docs/dax-provider.md) ("DirectLake passthrough"). A follow-on
+  **TMDL model-management** note (same doc) covers retrieve/apply a model definition via TOM: the
+  generate-vs-apply split (pure scalar `render_tmdl` vs effectful table-function `apply_tmdl` — never a
+  side-effecting scalar, optimizer purity) + bind-constant-vs-table-argument (dynamic per-row apply = the
+  in-out `_each` form, fixed bind-time output schema). Then the **generic rename**
   (`arrownet_query`/`_exec`, catalog-type `"arrownet"`) + `BackendRegistry` multi-provider polish are due.
 - **Multi-edition support** (Synapse / Fabric Warehouse / Lakehouse SQL endpoint) — **design:
   [docs/warehouse-support.md](docs/warehouse-support.md)**. **Slices 1–4 DONE + validated end-to-end against
