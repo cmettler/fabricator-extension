@@ -379,10 +379,48 @@ internal sealed class DaxCatalog : IBackendCatalog
         return expr!;
     }
 
-    // daxeval's optional `params` arg = a JSON object of DAX parameter values; each becomes an ADOMD
-    // parameter the expression references as @<name> (e.g. params := '{"p": 5, "q": "x"}' -> @p, @q).
+    // daxeval's optional `params` arg = a bag of DAX parameter values; each becomes an ADOMD parameter the
+    // expression references as @<name>. Two accepted shapes (the param is declared ANY — see the NullType
+    // sentinel above): a DuckDB STRUCT (params := {'p': 5, 'q': 'x'}) read field-by-field, OR a JSON string
+    // (params := '{"p": 5}') parsed below. STRUCT is type-safe + needs no quoting; JSON suits programmatic callers.
     private static IReadOnlyList<KeyValuePair<string, object?>> DaxParams(RecordBatch? args)
-        => ParseDaxParams(ReadArgByName(args, "params")?.ToString());
+    {
+        if (args is null)
+        {
+            return System.Array.Empty<KeyValuePair<string, object?>>();
+        }
+        var fields = args.Schema.FieldsList;
+        for (int i = 0; i < fields.Count; i++)
+        {
+            if (!string.Equals(fields[i].Name, "params", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+            if (args.Column(i) is StructArray sa)
+            {
+                return ReadStructParams(sa);
+            }
+            // scalar: a JSON string, or a NULL literal (-> empty).
+            return ParseDaxParams(ArrowValueReader.ReadScalar(args.Column(i), 0)?.ToString());
+        }
+        return System.Array.Empty<KeyValuePair<string, object?>>();
+    }
+
+    private static IReadOnlyList<KeyValuePair<string, object?>> ReadStructParams(StructArray sa)
+    {
+        var result = new List<KeyValuePair<string, object?>>();
+        if (sa.Length == 0 || sa.IsNull(0))
+        {
+            return result;
+        }
+        var st = (StructType)sa.Data.DataType;
+        for (int f = 0; f < st.Fields.Count; f++)
+        {
+            // row 0 of each child = that field's value (the args batch is always 1 row).
+            result.Add(new KeyValuePair<string, object?>(st.Fields[f].Name, ArrowValueReader.ReadScalar(sa.Fields[f], 0)));
+        }
+        return result;
+    }
 
     private static IReadOnlyList<KeyValuePair<string, object?>> ParseDaxParams(string? json)
     {
@@ -432,11 +470,15 @@ internal sealed class DaxCatalog : IBackendCatalog
         // that coexists with their {TABLE} input): daxevaltable(<input>, expression := '…').
         if (IsDaxEval(functionName))
         {
+            // `params` is declared with the NullType sentinel = "accept any value" (the host registers it
+            // as DuckDB ANY), so a caller may pass EITHER a STRUCT bag (params := {'a': 40, 'b': 2}) OR a
+            // JSON string (params := '{"a": 40}'); both are read below (DaxParams). A fixed VARCHAR here
+            // would force DuckDB to stringify a struct before we ever saw it.
             return new Schema(
                 new[]
                 {
                     new Field("expression", StringType.Default, nullable: false),
-                    new Field("params", StringType.Default, nullable: true),
+                    new Field("params", NullType.Default, nullable: true),
                 }, null);
         }
         if (IsDaxEvalTable(functionName) || IsDaxEach(functionName))

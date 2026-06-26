@@ -214,10 +214,17 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   output schema resolved at bind via `GetSchemaTable` no-describe, `DaxEvalBoundTable`, `SupportsPushdown=false`,
   streams; validated ROW/COUNTROWS/SUMMARIZECOLUMNS/full-table. **Registered `kind='proc'`** (not `'table'`)
   so args are NAMED params — that's what allows the optional `params` arg without breaking the no-arg call.
-  **`params` = a JSON object** → each entry bound as an ADOMD `@<name>` parameter the DAX references
-  (`ParseDaxParams`/`BindDaxParams`, for both the bind probe + each execution; args read by field name via
-  `ReadArgByName`). Validated numeric/string/filter params. No ABI change — reuses the proc named-param
-  marshaling + v29 table session), **`daxevaltable(<input>, expression
+  **`params` accepts EITHER a DuckDB `STRUCT` (`{'a':40,'b':2}`, preferred — type-safe, no quoting) OR a
+  JSON string (`'{"a":40}'`, for programmatic callers)** — each field/key bound as an ADOMD `@<name>` param
+  the DAX references (`ReadStructParams`/`ParseDaxParams` → `BindDaxParams`, for both the bind probe + each
+  execution; args read by field name). **The struct crosses with NO ABI change** via a generic marker: a
+  provider declares an "accept any value" named param as the **`NullType` sentinel** → C++ registers a
+  `SQLNULL`-typed named param as `LogicalType::ANY` (`GetOrCreateTableFunction`) so DuckDB passes the literal
+  UNCAST, and the shared table-bind marshaling keeps the value's **runtime** type for a `SQLNULL`-declared
+  param (`ArrowNetTableFunctionBind`) so a `STRUCT` marshals as a real Arrow struct. The guard is
+  `SQLNULL`-only → every concrete-typed function is unaffected (full SQL fn suite green). Validated
+  numeric/string/filter params, struct + JSON. No ABI change — reuses the proc named-param marshaling + v29
+  table session), **`daxevaltable(<input>, expression
   := …)` in-out** (slice 5 — injects the input table as a DAX `DATATABLE` named `_input`, evaluates once,
   `DaxEvalTableBinding`/`DaxDataTable`; this required wiring **cost args (named params) through the shared
   exchange** — `GetOrCreateCustomInOutFunction` declares named params via a tolerant `FetchFunctionParamSchema`

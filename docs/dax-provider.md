@@ -168,12 +168,20 @@ which caps at 19.84.1) loads in net10 (win-x64), connects to local PBI Desktop, 
    arg-dependent, the columns follow the DAX); **`Execute`** re-runs the query and streams via `DaxArrowStream`.
    `SupportsPushdown = false` (an arbitrary DAX query can't be wrapped — DuckDB projects/filters/aggregates
    above the scan). Trade-off: the query runs at bind (schema, no rows) + once per execution.
-   - **Parameter binding** (the old `DaxEvalFlight` mechanism): `params` is a JSON object — each entry is
-     bound as an ADOMD `AdomdParameter` the expression references as `@<name>` (e.g. `params := '{"a": 40,
-     "b": 2}'` → `@a`, `@b`). `ParseDaxParams` maps JSON number→int64/double, string→string, bool→bool,
-     null→`BLANK`; `BindDaxParams` adds them to the command for **both** the bind-time schema probe and each
-     execution. Args are read **by field name** (`ReadArgByName`) since named params arrive in arbitrary
-     column order. No ABI change (reuses the existing proc named-param marshaling + the v29 table session).
+   - **Parameter binding** (the old `DaxEvalFlight` mechanism): `params` is a bag of values, each bound as an
+     ADOMD `AdomdParameter` the expression references as `@<name>`. **Two accepted shapes (dual-accept):**
+     a DuckDB **`STRUCT`** — `params := {'a': 40, 'b': 2}` (type-safe, no quoting — the preferred shape), read
+     field-by-field (`ReadStructParams`); or a **JSON string** — `params := '{"a": 40}'` (handy for
+     programmatic callers), parsed by `ParseDaxParams` (number→int64/double, string, bool, null→`BLANK`).
+     `BindDaxParams` adds them for **both** the bind-time schema probe and each execution; args are read **by
+     field name** (named params arrive in arbitrary order).
+   - **How the struct crosses with no ABI change**: `params` is declared in `GetFunctionParamSchema` as the
+     **`NullType` sentinel** = "accept any value". There's no Arrow type for DuckDB `ANY`, so the host treats a
+     `SQLNULL`-typed named parameter as `ANY` (`GetOrCreateTableFunction`), and the shared table-bind
+     marshaling keeps the supplied value's **runtime** type for such a param (`ArrowNetTableFunctionBind`) —
+     so a `STRUCT` literal marshals across as a real Arrow struct instead of being coerced to the declared
+     type. The guard is `LogicalTypeId::SQLNULL`-only, so every other function (concrete-typed params) is
+     unaffected — full SQL function suite green (procs 24, TVFs 33, scalar 26, custom 85, in-out 63/31/17).
    - Validated live: no-param `EVALUATE ROW(…)` (schema from arbitrary DAX), `COUNTROWS`/`SUMMARIZECOLUMNS`,
      `EVALUATE {1,2,3}`, full-table `EVALUATE 'T'` (multi-batch streaming), **and** parameter binding —
      numeric `@a + @b`, a string `@who`, and a param in a table filter (`FILTER(…, [Value] > @t)`).

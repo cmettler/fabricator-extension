@@ -104,6 +104,20 @@ SELECT greeting FROM ${ARROWNET_DAX_SCHEMA}.daxeval(
 ----
 world
 
+# params also accepts a DuckDB STRUCT (type-safe, no JSON quoting): {'a': 40, 'b': 2} -> @a, @b.
+query I
+SELECT result::BIGINT FROM ${ARROWNET_DAX_SCHEMA}.daxeval(
+  expression := 'EVALUATE ROW("result", @a + @b)', params := {'a': 40, 'b': 2});
+----
+42
+
+# A STRUCT string field.
+query I
+SELECT greeting FROM ${ARROWNET_DAX_SCHEMA}.daxeval(
+  expression := 'EVALUATE ROW("greeting", @who)', params := {'who': 'world'});
+----
+world
+
 # daxevaltable(<input>, expression := …): inject a DuckDB-side table into DAX as _input and evaluate once.
 # Model-agnostic (the injected table is a VALUES list; the DAX references only _input).
 query II

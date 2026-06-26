@@ -834,7 +834,12 @@ unique_ptr<FunctionData> ArrowNetTableFunctionBind(ClientContext &context, Table
 			LogicalType declared = kv.second.type();
 			for (idx_t i = 0; i < info.arg_names.size(); i++) {
 				if (StringUtil::CIEquals(info.arg_names[i], kv.first)) {
-					declared = info.arg_types[i];
+					// A SQLNULL-declared param is the "accept any value" marker (registered as ANY):
+					// keep the supplied value's RUNTIME type so a STRUCT bag (or a VARCHAR, …) marshals
+					// across as its real Arrow type, not coerced to the declared type.
+					if (info.arg_types[i].id() != LogicalTypeId::SQLNULL) {
+						declared = info.arg_types[i];
+					}
 					break;
 				}
 			}
@@ -1357,7 +1362,11 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateTableFunction(ClientC
 	tf.projection_pushdown = true;
 	if (is_proc) {
 		for (idx_t i = 0; i < arg_names.size(); i++) {
-			tf.named_parameters[arg_names[i]] = arg_types[i];
+			// A provider declares an "accept any value" named parameter (e.g. a struct/JSON parameter bag)
+			// as a SQLNULL-typed field — there is no Arrow type for ANY, so SQLNULL is the agreed marker.
+			// Register it as ANY so DuckDB passes any literal (a STRUCT, a VARCHAR, …) through UNCAST.
+			auto t = arg_types[i].id() == LogicalTypeId::SQLNULL ? LogicalType::ANY : arg_types[i];
+			tf.named_parameters[arg_names[i]] = t;
 		}
 	} else {
 		// Best-effort filter pushdown into the TVF (reuses the table scan's serializer; the
