@@ -1054,10 +1054,47 @@ unique_ptr<FunctionData> ArrowNetExchangeBind(ClientContext &context, TableFunct
 	ArrowSchema input_schema;
 	std::memset(&input_schema, 0, sizeof(input_schema));
 	ArrowConverter::ToArrowSchema(&input_schema, bind_data->input_types, bind_data->input_names, props);
+
+	// Marshal the SUPPLIED constant args (named parameters) into a 1-row Arrow stream for inout_bind — e.g.
+	// daxevaltable(<input>, expression := 'EVALUATE …'). A custom in-out with no declared args, and every
+	// discovered `_each` (which declares no named parameters — its per-row arg values come from input
+	// columns), supplies none => args stays null (unchanged behavior). Mirrors the table-function bind.
+	vector<LogicalType> arg_types;
+	vector<string> arg_names;
+	vector<Value> arg_values;
+	for (auto &kv : input.named_parameters) {
+		LogicalType declared = kv.second.type();
+		for (idx_t i = 0; i < info.arg_names.size(); i++) {
+			if (StringUtil::CIEquals(info.arg_names[i], kv.first)) {
+				declared = info.arg_types[i];
+				break;
+			}
+		}
+		arg_names.push_back(kv.first);
+		arg_types.push_back(declared);
+		arg_values.push_back(kv.second);
+	}
+	arrownet::ArrowProducer arg_producer(arg_types, arg_names, props);
+	ArrowArrayStream *args_ptr = nullptr;
+	if (!arg_values.empty()) {
+		DataChunk chunk;
+		chunk.Initialize(Allocator::DefaultAllocator(), arg_types);
+		for (idx_t c = 0; c < arg_values.size(); c++) {
+			chunk.SetValue(c, 0, arg_values[c].DefaultCastAs(arg_types[c]));
+		}
+		chunk.SetCardinality(1);
+		auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(context, arg_types);
+		ArrowAppender appender(arg_types, 1, props, extension_types);
+		appender.Append(chunk, 0, 1, 1);
+		arg_producer.AddBatch(appender.Finalize());
+		arg_producer.Finish();
+		args_ptr = arg_producer.Stream();
+	}
+
 	ArrowArrayStream out_schema;
 	std::memset(&out_schema, 0, sizeof(out_schema));
 	bind_data->holder->binding =
-	    arrownet::InOutBind(info.handle, info.schema, info.func, nullptr, input_schema, out_schema);
+	    arrownet::InOutBind(info.handle, info.schema, info.func, args_ptr, input_schema, out_schema);
 
 	ArrowSchemaWrapper schema_root;
 	if (out_schema.get_schema(&out_schema, &schema_root.arrow_schema) != 0) {
@@ -1413,6 +1450,22 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateCustomInOutFunction(C
 	fn_info->schema = name;
 	fn_info->func = func_name;
 	fn_info->is_proc = false;
+	// Constant "cost" args (e.g. the DAX expression for daxevaltable / daxeach) are declared as NAMED
+	// parameters so they can coexist with the single {LogicalType::TABLE} overload (a scalar arg can't —
+	// bind_table_function.cpp). Best-effort: a custom in-out with no args (a pure-C# in-out like cf_tag, or
+	// any provider returning an empty param schema) declares none, preserving existing behavior.
+	try {
+		vector<string> arg_names;
+		vector<LogicalType> arg_types;
+		FetchFunctionParamSchema(context, handle_, name, func_name, arg_names, arg_types);
+		for (idx_t i = 0; i < arg_names.size(); i++) {
+			inout.named_parameters[arg_names[i]] = arg_types[i];
+		}
+		fn_info->arg_names = std::move(arg_names);
+		fn_info->arg_types = std::move(arg_types);
+	} catch (std::exception &) {
+		// no cost args for this in-out function
+	}
 	inout.function_info = std::move(fn_info);
 
 	CreateTableFunctionInfo info(std::move(inout));

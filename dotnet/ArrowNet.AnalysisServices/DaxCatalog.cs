@@ -79,10 +79,13 @@ internal sealed class DaxCatalog : IBackendCatalog
         // Columns = a zero-row stream whose SCHEMA describes the table's columns (the no-describe approach;
         // real engine types). Model: EVALUATE TOPN(0,'T'); system: bare SELECT * FROM $SYSTEM.<dmv>.
         MetadataKind.Columns => DiscoverColumns(schema, table!),
-        // Functions: daxeval(expression) — a table function evaluating an arbitrary DAX query, under the
-        // model schema (db."<model>".daxeval('EVALUATE …')).
+        // Functions (under the model schema): daxeval(expression) — table function evaluating an arbitrary
+        // DAX query; daxevaltable(<input>, expression := …) — in-out, injects the input table as a DAX
+        // DATATABLE the expression references (slice 5).
         MetadataKind.Functions => ThreeColumn(
-            "schema_name", new[] { _modelName }, "name", new[] { DaxEvalName }, "kind", new[] { "table" }),
+            "schema_name", new[] { _modelName, _modelName },
+            "name", new[] { DaxEvalName, DaxEvalTableName },
+            "kind", new[] { "table", "inout" }),
         MetadataKind.ServerInfo => EmptyStringTable("property", "value"),
         _ => EmptyStringTable("name"),
     };
@@ -291,7 +294,7 @@ internal sealed class DaxCatalog : IBackendCatalog
     /// <summary>Runs <paramref name="commandText"/> (DAX or a $SYSTEM DMV SELECT) on a fresh connection and
     /// returns its rows as a lazy Arrow stream (the stream owns conn/cmd/reader). The output schema is taken
     /// from <paramref name="knownSchema"/> when given (e.g. resolved at bind), else from the data reader.</summary>
-    private IArrowArrayStream StreamCommand(string commandText, Schema? knownSchema)
+    internal IArrowArrayStream StreamCommand(string commandText, Schema? knownSchema)
     {
         var conn = OpenConnection();
         try
@@ -311,7 +314,7 @@ internal sealed class DaxCatalog : IBackendCatalog
 
     /// <summary>Resolves a command's output schema without fetching rows (ExecuteReader + GetSchemaTable) —
     /// the no-describe approach used to bind a daxeval call's output columns.</summary>
-    private Schema ProbeSchema(string commandText)
+    internal Schema ProbeSchema(string commandText)
     {
         using var conn = OpenConnection();
         using var cmd = conn.CreateCommand();
@@ -327,9 +330,13 @@ internal sealed class DaxCatalog : IBackendCatalog
     // rows fetched); the scan re-executes + streams. Registered under the model schema.
 
     private const string DaxEvalName = "daxeval";
+    private const string DaxEvalTableName = "daxevaltable";
 
     private static bool IsDaxEval(string functionName) =>
         string.Equals(functionName, DaxEvalName, StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsDaxEvalTable(string functionName) =>
+        string.Equals(functionName, DaxEvalTableName, StringComparison.OrdinalIgnoreCase);
 
     private static string DaxEvalExpression(RecordBatch? args)
     {
@@ -343,7 +350,10 @@ internal sealed class DaxCatalog : IBackendCatalog
 
     public Schema GetFunctionParamSchema(string schemaName, string functionName)
     {
-        if (IsDaxEval(functionName))
+        // Both daxeval (table fn) and daxevaltable (in-out) take a single DAX-expression arg. For the in-out
+        // it is declared as a NAMED parameter (coexists with the {TABLE} input): daxevaltable(<input>,
+        // expression := '…').
+        if (IsDaxEval(functionName) || IsDaxEvalTable(functionName))
         {
             return new Schema(new[] { new Field("expression", StringType.Default, nullable: false) }, null);
         }
@@ -375,7 +385,14 @@ internal sealed class DaxCatalog : IBackendCatalog
         => throw new NotSupportedException("dax provider: no scalar functions.");
 
     public IArrowInOutBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema)
-        => throw new NotSupportedException("dax provider: table-in-out functions land in slice 5.");
+    {
+        if (IsDaxEvalTable(functionName))
+        {
+            // args carries the named "expression" param (1-row, column 0); inputSchema = the input table.
+            return new DaxEvalTableBinding(this, DaxEvalExpression(args), inputSchema);
+        }
+        throw new NotSupportedException($"dax provider: unknown table-in-out function '{functionName}'");
+    }
 
     /// <summary>A bound <c>daxeval(expression)</c> call: the output schema is resolved once (at bind, via a
     /// row-less GetSchemaTable probe), and each <see cref="Execute"/> re-runs the DAX and streams the result.

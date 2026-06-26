@@ -212,7 +212,15 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   `system` schema; 14 DMVs validated live), **`daxeval(expression)` table function** (slice 4 — under the
   model schema; evaluates an arbitrary DAX `EVALUATE`/`DEFINE…EVALUATE` query, output schema resolved at
   bind via `GetSchemaTable` no-describe, `DaxEvalBoundTable`, `SupportsPushdown=false`, streams; validated
-  ROW/COUNTROWS/SUMMARIZECOLUMNS/full-table; param binding deferred), `WHERE`/`ORDER BY`/`LIMIT`,
+  ROW/COUNTROWS/SUMMARIZECOLUMNS/full-table; param binding deferred), **`daxevaltable(<input>, expression
+  := …)` in-out** (slice 5 — injects the input table as a DAX `DATATABLE` named `_input`, evaluates once,
+  `DaxEvalTableBinding`/`DaxDataTable`; this required wiring **cost args (named params) through the shared
+  exchange** — `GetOrCreateCustomInOutFunction` declares named params via a tolerant `FetchFunctionParamSchema`
+  (empty for cf_tag → unchanged) + `ArrowNetExchangeBind` marshals supplied named params into `inout_bind`
+  args, else nullptr (`_each` unchanged); no ABI bump. Whole-table op, but the exchange has no emit-at-end
+  hook [finalize drain discards trailing output], so input must be a **single chunk ≤2048 rows** — for a
+  small parameter/lookup table; larger errors. In-out regression green: custom 85 / table_inout 63 /
+  proc_inout 31 / isolation 17), `WHERE`/`ORDER BY`/`LIMIT`,
   aggregation, exact decimals, `DESCRIBE`. **CRITICAL ADOMD GOTCHA (the real root cause):** `AdomdDataReader.Read()`
   called AFTER it already returned `false` (past end-of-data) does NOT return `false` again — it **throws**
   `AdomdUnknownResponseException` ("the server sent an unrecognizable response", `XmlaClient.ReadEndElementS`).

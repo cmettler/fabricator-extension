@@ -88,5 +88,21 @@ SELECT count(*) FROM ${ARROWNET_DAX_SCHEMA}.daxeval('EVALUATE {1, 2, 3}');
 ----
 3
 
+# daxevaltable(<input>, expression := …): inject a DuckDB-side table into DAX as _input and evaluate once.
+# Model-agnostic (the injected table is a VALUES list; the DAX references only _input).
+query II
+SELECT id, name FROM ${ARROWNET_DAX_SCHEMA}.daxevaltable(
+  (SELECT * FROM (VALUES (1, 'a'), (2, 'b')) v(id, name)), expression := 'EVALUATE _input') ORDER BY id;
+----
+1	a
+2	b
+
+# A whole-table DAX computation over the injected table (10+20+30 = 60).
+query I
+SELECT total FROM ${ARROWNET_DAX_SCHEMA}.daxevaltable(
+  (SELECT * FROM (VALUES (10), (20), (30)) v(x)), expression := 'EVALUATE ROW("total", SUMX(_input, _input[x]))');
+----
+60
+
 statement ok
 DETACH pbi;

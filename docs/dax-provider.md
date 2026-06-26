@@ -170,8 +170,23 @@ which caps at 19.84.1) loads in net10 (win-x64), connects to local PBI Desktop, 
    full-table `EVALUATE 'T'` (30136 rows, multi-batch streaming). `verify_dax.test` covers it (model-agnostic
    `ROW`/table-constructor cases; needs `ARROWNET_DAX_SCHEMA`). **Deferred:** parameter binding (the old
    `DaxEvalFlight`'s named-parameter / ADOMD `Command.Parameters` path) — a later refinement.
-5. **`daxevaltable` / `daxapply` in-out** — `IArrowInOutFunction.DoExchange` (DATATABLE injection / per-row
-   param binding).
+5. **`daxevaltable` in-out** — **DONE + validated.** `daxevaltable(<input>, expression := 'EVALUATE …')`
+   injects the input table into the DAX as a table named `_input` (`DEFINE TABLE _input = DATATABLE(…)`
+   prepended; the expression is a single `EVALUATE` referencing `_input`), evaluates ONCE, returns the
+   result. Registered `kind='inout'`; resolved by `InOutBind` → `DaxEvalTableBinding`; the DATATABLE literal
+   (`DaxDataTable`: Arrow→DATATABLE type map + value formatting) is built from the input rows, output schema
+   probed at bind via a 1-row dummy DATATABLE. **Required wiring the long-deferred cost args through the
+   shared exchange** (C++ `arrownet_schema_entry.cpp`): `GetOrCreateCustomInOutFunction` now declares the
+   function's constant args as **named parameters** (tolerant `FetchFunctionParamSchema` — empty for a
+   no-arg custom in-out like `cf_tag`, so unchanged), and `ArrowNetExchangeBind` marshals the supplied named
+   params into the `inout_bind` args (else `nullptr` — `_each` declares none, so unchanged). No ABI change.
+   **Whole-table limit:** the exchange has no emit-at-end hook (a whole-table op is a pipeline breaker; the
+   operator's finalize drain *discards* trailing output), so the result is emitted during the input chunk's
+   tenure — the input must arrive in a **single chunk (≤ 2048 rows)**; a larger input errors clearly (the
+   intended use is a small parameter/lookup table). Validated live (`EVALUATE _input` echo; `SUMX` over the
+   injected table) + `verify_dax.test`; existing in-out suites unregressed (`verify_custom_functions` 85,
+   `verify_table_inout` 63, `verify_proc_inout` 31, `verify_inout_isolation` 17). **`daxeach`** (per-row
+   param binding — the renamed `daxapply`) is next; it fits the per-chunk exchange with no row limit.
 6. *(later/optional)* limited filter pushdown into DAX `FILTER`/`CALCULATETABLE`; Fabric/AAS token auth via a
    secret + XMLA endpoint connection mode (cross-platform validation).
 
