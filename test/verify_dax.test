@@ -6,8 +6,10 @@
 #              point it at. Set:
 #                ARROWNET_DAX_DSN   e.g. 'pbidesktop://' (local PBI Desktop autodetect) or
 #                                   'Data Source=localhost:<port>' / a Fabric/SSAS XMLA connstr
-#                ARROWNET_DAX_TABLE a fully-qualified, quoted table reference, e.g. pbi."Model"."Customer"
-#                ARROWNET_DAX_COL   a quoted column of that table that has some NULLs, e.g. "Country"
+#                ARROWNET_DAX_TABLE  a fully-qualified, quoted table reference, e.g. pbi."Model"."Customer"
+#                ARROWNET_DAX_COL    a quoted column of that table that has some NULLs, e.g. "Country"
+#                ARROWNET_DAX_SCHEMA the catalog.schema prefix the model lives under, e.g. pbi."Model"
+#                                    (daxeval registers under the model schema, whose name varies)
 # group: [mssql_net]
 
 require mssql_net
@@ -17,6 +19,8 @@ require-env ARROWNET_DAX_DSN
 require-env ARROWNET_DAX_TABLE
 
 require-env ARROWNET_DAX_COL
+
+require-env ARROWNET_DAX_SCHEMA
 
 statement ok
 ATTACH '${ARROWNET_DAX_DSN}' AS pbi (TYPE mssql_net, PROVIDER 'dax');
@@ -70,6 +74,19 @@ query I
 SELECT count(*) >= 0 FROM pbi.system."DBSCHEMA_COLUMNS";
 ----
 true
+
+# daxeval(expression): evaluate an arbitrary DAX query as a table function. Output schema is resolved at
+# bind (the DAX result's columns). These DAX expressions reference no model data, so they're model-agnostic.
+query I
+SELECT n FROM ${ARROWNET_DAX_SCHEMA}.daxeval('EVALUATE ROW("n", 42)');
+----
+42
+
+# Multi-row result via a DAX table constructor (3 rows).
+query I
+SELECT count(*) FROM ${ARROWNET_DAX_SCHEMA}.daxeval('EVALUATE {1, 2, 3}');
+----
+3
 
 statement ok
 DETACH pbi;

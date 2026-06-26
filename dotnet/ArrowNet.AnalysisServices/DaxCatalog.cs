@@ -79,8 +79,10 @@ internal sealed class DaxCatalog : IBackendCatalog
         // Columns = a zero-row stream whose SCHEMA describes the table's columns (the no-describe approach;
         // real engine types). Model: EVALUATE TOPN(0,'T'); system: bare SELECT * FROM $SYSTEM.<dmv>.
         MetadataKind.Columns => DiscoverColumns(schema, table!),
-        // Functions / server-info: empty (valid); functions are slice 4.
-        MetadataKind.Functions => EmptyStringTable("schema_name", "name", "kind"),
+        // Functions: daxeval(expression) — a table function evaluating an arbitrary DAX query, under the
+        // model schema (db."<model>".daxeval('EVALUATE …')).
+        MetadataKind.Functions => ThreeColumn(
+            "schema_name", new[] { _modelName }, "name", new[] { DaxEvalName }, "kind", new[] { "table" }),
         MetadataKind.ServerInfo => EmptyStringTable("property", "value"),
         _ => EmptyStringTable("name"),
     };
@@ -272,21 +274,32 @@ internal sealed class DaxCatalog : IBackendCatalog
     /// (validated to 10.5M rows). See <see cref="DaxArrowStream"/> for the one subtlety that makes it work:
     /// never call <c>Read()</c> past end-of-data (ADOMD throws on it).
     /// </summary>
-    private IArrowArrayStream ScanTableCore(string commandText)
+    private IArrowArrayStream ScanTableCore(string commandText) => StreamCommand(commandText, null);
+
+    /// <summary>Opens a fresh ADOMD connection bound to this catalog's model database.</summary>
+    private AdomdConnection OpenConnection()
     {
         var conn = new AdomdConnection(_connectionString);
+        conn.Open();
+        if (_catalog != null)
+        {
+            conn.ChangeDatabase(_catalog);
+        }
+        return conn;
+    }
+
+    /// <summary>Runs <paramref name="commandText"/> (DAX or a $SYSTEM DMV SELECT) on a fresh connection and
+    /// returns its rows as a lazy Arrow stream (the stream owns conn/cmd/reader). The output schema is taken
+    /// from <paramref name="knownSchema"/> when given (e.g. resolved at bind), else from the data reader.</summary>
+    private IArrowArrayStream StreamCommand(string commandText, Schema? knownSchema)
+    {
+        var conn = OpenConnection();
         try
         {
-            conn.Open();
-            if (_catalog != null)
-            {
-                conn.ChangeDatabase(_catalog);
-            }
             var cmd = conn.CreateCommand();
             cmd.CommandText = commandText;
             var reader = cmd.ExecuteReader();
-            var schema = ArrowSchemaFromReader(reader);
-            // The stream owns conn/cmd/reader and disposes them at scan teardown.
+            var schema = knownSchema ?? ArrowSchemaFromReader(reader);
             return new DaxArrowStream(conn, cmd, reader, schema, batchSize: 2048);
         }
         catch
@@ -296,25 +309,100 @@ internal sealed class DaxCatalog : IBackendCatalog
         }
     }
 
-    // ---- functions (later slices) ---------------------------------------------------------------------
+    /// <summary>Resolves a command's output schema without fetching rows (ExecuteReader + GetSchemaTable) —
+    /// the no-describe approach used to bind a daxeval call's output columns.</summary>
+    private Schema ProbeSchema(string commandText)
+    {
+        using var conn = OpenConnection();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = commandText;
+        using var reader = cmd.ExecuteReader();
+        return ArrowSchemaFromReader(reader);
+    }
+
+    // ---- functions -----------------------------------------------------------------------------------
+    // daxeval(expression) — a table function that evaluates an arbitrary DAX query (a complete EVALUATE /
+    // DEFINE…EVALUATE statement) against the model and returns its result table. ADOMD has no result-set
+    // describe, so the output schema is resolved at bind by executing the query + reading GetSchemaTable (no
+    // rows fetched); the scan re-executes + streams. Registered under the model schema.
+
+    private const string DaxEvalName = "daxeval";
+
+    private static bool IsDaxEval(string functionName) =>
+        string.Equals(functionName, DaxEvalName, StringComparison.OrdinalIgnoreCase);
+
+    private static string DaxEvalExpression(RecordBatch? args)
+    {
+        var expr = args is { ColumnCount: > 0 } ? ArrowValueReader.ReadScalar(args.Column(0), 0)?.ToString() : null;
+        if (string.IsNullOrWhiteSpace(expr))
+        {
+            throw new ArgumentException("dax provider: daxeval(expression) requires a non-empty DAX expression");
+        }
+        return expr!;
+    }
 
     public Schema GetFunctionParamSchema(string schemaName, string functionName)
-        => throw new NotSupportedException("dax provider: functions land in slice 4.");
-
-    public Schema GetFunctionReturnSchema(string schemaName, string functionName)
-        => throw new NotSupportedException("dax provider: functions land in slice 4.");
-
-    public IArrowArrayStream ExecuteScalar(string schemaName, string functionName, IArrowArrayStream args)
-        => throw new NotSupportedException("dax provider: functions land in slice 4.");
+    {
+        if (IsDaxEval(functionName))
+        {
+            return new Schema(new[] { new Field("expression", StringType.Default, nullable: false) }, null);
+        }
+        throw new NotSupportedException($"dax provider: unknown function '{functionName}'");
+    }
 
     public Schema GetFunctionOutputSchema(string schemaName, string functionName, RecordBatch? args = null)
-        => throw new NotSupportedException("dax provider: functions land in slice 4.");
+    {
+        if (IsDaxEval(functionName))
+        {
+            return ProbeSchema(DaxEvalExpression(args)); // arg-dependent: the DAX result's columns
+        }
+        throw new NotSupportedException($"dax provider: unknown function '{functionName}'");
+    }
 
     public IBoundTable TableBind(string schemaName, string functionName, RecordBatch? args)
-        => throw new NotSupportedException("dax provider: table functions land in slice 4.");
+    {
+        if (IsDaxEval(functionName))
+        {
+            return new DaxEvalBoundTable(this, DaxEvalExpression(args));
+        }
+        throw new NotSupportedException($"dax provider: unknown table function '{functionName}'");
+    }
+
+    public Schema GetFunctionReturnSchema(string schemaName, string functionName)
+        => throw new NotSupportedException("dax provider: no scalar functions.");
+
+    public IArrowArrayStream ExecuteScalar(string schemaName, string functionName, IArrowArrayStream args)
+        => throw new NotSupportedException("dax provider: no scalar functions.");
 
     public IArrowInOutBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema)
         => throw new NotSupportedException("dax provider: table-in-out functions land in slice 5.");
+
+    /// <summary>A bound <c>daxeval(expression)</c> call: the output schema is resolved once (at bind, via a
+    /// row-less GetSchemaTable probe), and each <see cref="Execute"/> re-runs the DAX and streams the result.
+    /// No pushdown (an arbitrary DAX query can't be wrapped) — DuckDB projects/filters above the scan.</summary>
+    private sealed class DaxEvalBoundTable : IBoundTable
+    {
+        private readonly DaxCatalog _catalog;
+        private readonly string _dax;
+
+        public DaxEvalBoundTable(DaxCatalog catalog, string dax)
+        {
+            _catalog = catalog;
+            _dax = dax;
+            OutputSchema = catalog.ProbeSchema(dax);
+        }
+
+        public Schema OutputSchema { get; }
+        public bool SupportsPushdown => false;
+
+        public IArrowArrayStream Execute(string? specJson, IArrowArrayStream? filterValues)
+        {
+            filterValues?.Dispose(); // no pushdown — DuckDB re-applies; just release the (usually null) batch
+            return _catalog.StreamCommand(_dax, OutputSchema);
+        }
+
+        public void Dispose() { }
+    }
 
     public IAggregateSession AggOpen(string schemaName, string functionName)
         => throw new NotSupportedException("dax provider: no aggregate functions.");

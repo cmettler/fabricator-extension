@@ -157,8 +157,19 @@ which caps at 19.84.1) loads in net10 (win-x64), connects to local PBI Desktop, 
      batched/lazy/materialize/worker attempt failed because it called `Read()` one time too many. It was
      never concurrency, threads, GC, transport, PBI/`msmdsrv` version, AdomdClient version, or process
      topology.
-4. **`daxeval(expr, params)`** — `IArrowTableFunction.Bind` executes + reads `GetSchemaTable()` for the output
-   schema (stashing the reader), streams rows in `Execute`.
+4. **`daxeval(expression)`** — **DONE + validated.** A table function (under the model schema) that evaluates
+   an arbitrary DAX query — a complete `EVALUATE` / `DEFINE…EVALUATE` statement — and returns its result
+   table: `SELECT * FROM db."<model>".daxeval('EVALUATE …')`. Registered via `GetMetadata(Functions)`
+   (`kind='table'`) + `GetFunctionParamSchema` (one `expression VARCHAR` arg). The C++ `kind='table'` path
+   calls `TableBind(schema, func, args)` → `DaxEvalBoundTable`: **bind** resolves the output schema by
+   executing the query + `GetSchemaTable` (no rows fetched — the no-describe approach; arg-dependent, the
+   columns follow the DAX); **`Execute`** re-runs the query and streams via `DaxArrowStream`. `SupportsPushdown
+   = false` (an arbitrary DAX query can't be wrapped — DuckDB projects/filters/aggregates above the scan).
+   Trade-off: the query runs at bind (schema, no rows) + once per execution. Validated live: `EVALUATE ROW(…)`
+   (schema from arbitrary DAX), `COUNTROWS`/`SUMMARIZECOLUMNS` aggregations, `EVALUATE {1,2,3}`, and a
+   full-table `EVALUATE 'T'` (30136 rows, multi-batch streaming). `verify_dax.test` covers it (model-agnostic
+   `ROW`/table-constructor cases; needs `ARROWNET_DAX_SCHEMA`). **Deferred:** parameter binding (the old
+   `DaxEvalFlight`'s named-parameter / ADOMD `Command.Parameters` path) — a later refinement.
 5. **`daxevaltable` / `daxapply` in-out** — `IArrowInOutFunction.DoExchange` (DATATABLE injection / per-row
    param binding).
 6. *(later/optional)* limited filter pushdown into DAX `FILTER`/`CALCULATETABLE`; Fabric/AAS token auth via a

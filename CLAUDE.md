@@ -209,7 +209,10 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   streaming** (`DaxArrowStream`, ≤1 batch buffered — validated to **10.5M rows**), a **`system` schema**
   exposing a curated set of VertiPaq/`$SYSTEM` DMVs as tables (`db.system."TMSCHEMA_TABLES"` etc. —
   `DaxCatalog.SystemTables`; bare `SELECT * FROM $SYSTEM.<dmv>`, no pushdown; metadata/scan branch on the
-  `system` schema; 14 DMVs validated live), `WHERE`/`ORDER BY`/`LIMIT`,
+  `system` schema; 14 DMVs validated live), **`daxeval(expression)` table function** (slice 4 — under the
+  model schema; evaluates an arbitrary DAX `EVALUATE`/`DEFINE…EVALUATE` query, output schema resolved at
+  bind via `GetSchemaTable` no-describe, `DaxEvalBoundTable`, `SupportsPushdown=false`, streams; validated
+  ROW/COUNTROWS/SUMMARIZECOLUMNS/full-table; param binding deferred), `WHERE`/`ORDER BY`/`LIMIT`,
   aggregation, exact decimals, `DESCRIBE`. **CRITICAL ADOMD GOTCHA (the real root cause):** `AdomdDataReader.Read()`
   called AFTER it already returned `false` (past end-of-data) does NOT return `false` again — it **throws**
   `AdomdUnknownResponseException` ("the server sent an unrecognizable response", `XmlaClient.ReadEndElementS`).
