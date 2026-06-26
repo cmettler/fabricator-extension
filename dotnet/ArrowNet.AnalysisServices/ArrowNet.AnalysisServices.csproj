@@ -19,6 +19,10 @@
   <ItemGroup>
     <ProjectReference Include="..\ArrowNet.Bridge\ArrowNet.Bridge.csproj" />
     <PackageReference Include="Microsoft.AnalysisServices.AdomdClient" Version="19.114.0" />
+    <!-- Entra token acquisition for Fabric/AAS XMLA: mint a Power BI-scoped token from the same Azure
+         principal the SqlServer warehouse uses (service principal / managed identity / default chain),
+         set as AdomdConnection.AccessToken (ADOMD has no interactive flow in the CLR host). -->
+    <PackageReference Include="Azure.Identity" Version="1.13.2" />
   </ItemGroup>
 
 </Project>

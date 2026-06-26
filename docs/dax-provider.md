@@ -211,14 +211,73 @@ which caps at 19.84.1) loads in net10 (win-x64), connects to local PBI Desktop, 
    input-size limit** (per-row emit fits the streaming exchange). Validated live (`ROW("sq", @n*@n)` per row;
    a row yielding 3 results → 2 inputs × 3 = 6 rows) + `verify_dax.test`. **The DAX eval/apply function
    family (daxeval + params, daxevaltable, daxeach) is complete.** `verify_dax.test` is at 25 assertions.
-6. *(later/optional)* limited filter pushdown into DAX `FILTER`/`CALCULATETABLE`; Fabric/AAS token auth via a
-   secret + XMLA endpoint connection mode (cross-platform validation).
+7. **Fabric / AAS token auth (Entra)** — **DONE + validated live against two Fabric semantic models.** ADOMD
+   has no interactive auth in the CoreCLR host ("interactive authentication is not supported … an external
+   access-token is required"), so we mint a Power BI-scoped token (`https://analysis.windows.net/powerbi/api/.default`)
+   from an Azure principal and set `AdomdConnection.AccessToken` (with an `OnAccessTokenExpired` refresh
+   callback — mirrors how `SqlServerCatalog` sets `SqlConnection.AccessToken`). The principal is the **same
+   azure service-principal secret the Fabric Warehouse uses** (reused via the v39 foreign-secret path):
+   `ATTACH 'Data Source=powerbi://…;Initial Catalog=<model>' AS m (TYPE mssql_net, PROVIDER 'dax', SECRET
+   <azure_sp>)` → `DaxBackend.BuildConnectionString` carries the secret fields to the catalog (a connstr
+   marker), which builds a `ClientSecretCredential` / `ManagedIdentityCredential` (`DaxTokenAuth`). A
+   secretless remote XMLA endpoint falls back to `DefaultAzureCredential` (the "Active Directory Default"
+   analog — env / MI / VS / az CLI). New dep: `Azure.Identity`. **Also fixed: honor the explicit `Initial
+   Catalog`** — a workspace XMLA endpoint lists MANY models in `DBSCHEMA_CATALOGS`, and we were binding to
+   the *first* one (e.g. a lakehouse default model) instead of the requested model, so every metadata/DMV
+   query came back empty; now the connection's current catalog wins, auto-discovery only when none is given.
+8. *(later/optional)* limited filter pushdown into DAX `FILTER`/`CALCULATETABLE`.
+
+## DirectLake passthrough — read (and maybe write) the underlying store directly (design idea, DEFERRED)
+
+**Validated facts (2026-06-26, live).** Both Fabric models `Test Warehouse Model1/2` are 100% **DirectLake**
+(every partition `Mode=5`/`Type=5` = Entity), and every table maps 1:1 to a `dbo.<entity>` object in **one
+shared warehouse item** `486cd767-9ea3-4e40-be6c-49824d91d841`. The discriminator is the single source
+expression (`TMSCHEMA_EXPRESSIONS`):
+- **Model1 = DirectLake on OneLake** — `AzureStorage.DataLake("https://onelake.dfs.fabric.microsoft.com/<workspaceId>/486cd767…")`
+- **Model2 = DirectLake on SQL** — `Sql.Database("…datawarehouse.fabric.microsoft.com", "486cd767…")`
+
+The OneLake *item id* equals the SQL *database* — the same warehouse, two source modes. **The bypass is
+proven:** `ATTACH 'Server=…datawarehouse.fabric.microsoft.com;Database=486cd767…' (TYPE mssql_net, SECRET
+<azure_sp>)` and `SELECT count(*) FROM wh.dbo.Trip` returns **2,838,927 rows — identical to the DAX scan of
+the model table**. So the DMVs hand us everything to route a DAX model's table scans to the SQL endpoint.
+
+**The idea (and an honest good/bad triage). Build only on demand.**
+
+- **READ passthrough — clearly good, low risk.** At ATTACH of a DAX model, read these DMVs, detect DirectLake
+  tables, resolve `(SQL endpoint, database, dbo.entity)`, and route base-table scans to the SQL provider
+  (the cheap path) instead of DAX/Vertipaq compute. Identical data (DirectLake reads the same Delta). **Hard
+  boundary:** SQL only returns the **base tables** — DAX **measures / calculated columns / calculated tables /
+  relationships / RLS** live only in the semantic layer, so those still require DAX. The passthrough is for raw
+  table/column extraction, not model-computed results.
+- **WRITE to a Warehouse via the SQL provider — good, mostly free.** Our SQL provider already does
+  INSERT/UPDATE/DELETE/CTAS/bulk against a Fabric Warehouse (validated). A DirectLake model serves a pinned
+  Delta snapshot, so after a write the model must **reframe** to see new rows — Fabric reframes automatically
+  (default), or an explicit refresh (XMLA/TMSL `Refresh`, TOM, or the Fabric REST API) forces it. Note: the
+  write (warehouse) and the reframe (model) are **two systems → eventually consistent, not atomic**.
+- **WRITE Delta directly (engineered-wood / delta-rs) — Lakehouse only, you own correctness.** For a
+  *Lakehouse* OneLake item, writing Delta with delta-rs (or an engineered-wood write path — today it's
+  read-only in this repo) is legitimate, but you take on the Delta commit protocol: optimistic concurrency,
+  schema enforcement, stats/checkpoints, deletion vectors, column mapping. **Do NOT write Delta directly into
+  a Warehouse-managed item** (e.g. `486cd767…`) — the Warehouse SQL engine owns those files and external
+  writes can corrupt its metadata; write a Warehouse via SQL, write a Lakehouse via Delta. Either way, reframe
+  after.
+- **ALTER passthrough + sync the semantic model — powerful, high risk, far-future.** ALTER on the warehouse
+  table is already a SQL-provider DDL passthrough; but to surface a new/changed column the **model metadata**
+  must be edited too (TMSL/TOM over the XMLA *read-write* endpoint). That crosses from "data connector" into
+  "model management" — needs model write permission + premium/Fabric XMLA read-write, and a wrong TMSL edit can
+  break the model. Treat as opt-in, carefully scoped, only if a clear need appears.
+
+**Net take:** the read bypass and warehouse writes are the safe, high-value 80% and reuse machinery we already
+have (SQL provider + the azure-SP token path). Direct Delta writes are a Lakehouse-only specialization, and
+automatic model/DDL sync is the speculative, high-blast-radius 20% — document it, don't build it yet.
 
 ## Open questions / deferred
 
-- **Cross-platform AdomdClient** (Linux) for the Fabric XMLA path — validate when a Fabric target is wired.
-- **Fabric/AAS auth** — access-token / Entra via a provider secret (reuse the azure-secret work, §2.1 of
-  provider-extensibility.md). Slice 6.
+- **Cross-platform AdomdClient** (Linux) for the Fabric XMLA path — validate when a Linux Fabric target is
+  wired (Windows + the token path is validated).
+- **Friendly model schema name on Fabric** — `TMSCHEMA_MODEL.Name` is often empty for a Fabric model, so the
+  DuckDB schema falls back to the literal `Model` (the GUID/empty isn't user-friendly). Cosmetic; the catalog
+  (`Initial Catalog`) is the real model selector.
 - **Multi-instance local PBI** — autodetect picks the newest *listening* workspace port (across all
   editions); a way to target a specific open file (by window title / workspace) is a later nicety.
 - **The generic rename** (`TYPE arrownet`, `arrownet_query`/`_exec`) — do it once the DAX provider is real,

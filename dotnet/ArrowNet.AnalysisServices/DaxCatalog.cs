@@ -17,21 +17,63 @@ namespace ArrowNet.AnalysisServices;
 internal sealed class DaxCatalog : IBackendCatalog
 {
     private readonly string _connectionString;
+    private readonly Azure.Core.TokenCredential? _credential; // Entra cred for Fabric/AAS XMLA (null = no token auth)
     private readonly AdomdConnection _conn;
     private readonly string? _catalog; // the ADOMD database (model db) this connection is bound to
     private readonly string _modelName; // the single Tabular model in this database = the DuckDB schema name
 
-    public DaxCatalog(string connectionString)
+    public DaxCatalog(string connectionString, Azure.Core.TokenCredential? credential = null)
     {
         _connectionString = connectionString;
+        _credential = credential;
         _conn = new AdomdConnection(_connectionString);
+        ApplyAuth(_conn);
         _conn.Open();
-        _catalog = DiscoverDefaultCatalog(_conn);
-        if (_catalog != null)
+        // Honor an explicit Initial Catalog (the model the user asked for). A workspace XMLA endpoint hosts
+        // MANY models, so DBSCHEMA_CATALOGS lists several and its first row may be the wrong one — only
+        // auto-discover a default when the connection carries no current catalog.
+        _catalog = string.IsNullOrEmpty(_conn.Database) ? DiscoverDefaultCatalog(_conn) : _conn.Database;
+        if (!string.IsNullOrEmpty(_catalog) && !string.Equals(_catalog, _conn.Database, StringComparison.Ordinal))
         {
-            _conn.ChangeDatabase(_catalog);
+            _conn.ChangeDatabase(_catalog!);
         }
         _modelName = DiscoverModelNames()[0];
+    }
+
+    // Sets a freshly-acquired Power BI access token on the connection before Open (Fabric/AAS). Azure.Identity
+    // caches + refreshes the token internally, so calling this per connection is cheap and always yields a
+    // valid token. No-op when no credential (local Power BI Desktop / an explicit connstr with its own auth).
+    private void ApplyAuth(AdomdConnection conn)
+    {
+        if (_credential is null)
+        {
+            return;
+        }
+        conn.AccessToken = AcquireToken();
+        // Refresh callback for a connection that outlives the token (~1 h for an SP): ADOMD calls this when
+        // the token expires; Azure.Identity returns a cached-or-refreshed token, so it's cheap.
+        conn.OnAccessTokenExpired = _ => AcquireToken();
+    }
+
+    private Microsoft.AnalysisServices.AccessToken AcquireToken()
+    {
+        try
+        {
+            var t = DaxTokenAuth.GetToken(_credential!);
+            return new Microsoft.AnalysisServices.AccessToken(t.Token, t.ExpiresOn, null);
+        }
+        catch (Exception ex)
+        {
+            // Azure.Identity nests the real AADSTS reason in inner exceptions — flatten them so the cause
+            // (invalid secret / app not in tenant / no consent / XMLA disabled) reaches the user.
+            var detail = "";
+            for (var e = ex; e != null; e = e.InnerException)
+            {
+                detail += (detail.Length > 0 ? " <- " : "") + e.GetType().Name + ": " + e.Message;
+            }
+            throw new InvalidOperationException(
+                $"dax: Entra token acquisition failed for scope {DaxTokenAuth.PowerBiScope}: {detail}");
+        }
     }
 
 
@@ -47,7 +89,11 @@ internal sealed class DaxCatalog : IBackendCatalog
     {
         "TMSCHEMA_MODEL", "TMSCHEMA_TABLES", "TMSCHEMA_COLUMNS", "TMSCHEMA_MEASURES",
         "TMSCHEMA_RELATIONSHIPS", "TMSCHEMA_PARTITIONS", "TMSCHEMA_HIERARCHIES",
-        "DBSCHEMA_TABLES", "DBSCHEMA_COLUMNS",
+        // Storage/source provenance — what a table's data is actually connected to (DirectLake on OneLake
+        // vs on SQL): partitions carry Mode/SourceType + an ExpressionSource, expressions hold the M source,
+        // data sources hold structured-source connection details.
+        "TMSCHEMA_EXPRESSIONS", "TMSCHEMA_DATA_SOURCES", "TMSCHEMA_PARTITION_SOURCES",
+        "DBSCHEMA_CATALOGS", "DBSCHEMA_TABLES", "DBSCHEMA_COLUMNS",
         "DISCOVER_STORAGE_TABLES", "DISCOVER_STORAGE_TABLE_COLUMNS",
         "DISCOVER_STORAGE_TABLE_COLUMN_SEGMENTS", "DISCOVER_CALC_DEPENDENCY",
         "DISCOVER_OBJECT_MEMORY_USAGE",
@@ -285,6 +331,7 @@ internal sealed class DaxCatalog : IBackendCatalog
     internal AdomdConnection OpenConnection()
     {
         var conn = new AdomdConnection(_connectionString);
+        ApplyAuth(conn);
         conn.Open();
         if (_catalog != null)
         {

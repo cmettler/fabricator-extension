@@ -246,9 +246,27 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   conclusion** — it was misdiagnosed as "fails on the 2nd chunk." Instrumentation (max-in-flight + per-call
   thread + rows-read) proved `maxInFlight=1` (no parallel access; `MaxThreads()==1` + `get_next` under mutex),
   single thread (no hopping), and the throw on the pull AFTER the last row (read-past-EOF), not the 2nd chunk.
-  `Fill` and any tight `while(Read())` loop only "worked" because they stop at the first `false`. Remaining
-  slices (4 `daxeval`, 5 `daxevaltable`/
-  `daxapply` in-out, 6 Fabric token auth) in the doc. Then the **generic rename**
+  `Fill` and any tight `while(Read())` loop only "worked" because they stop at the first `false`. **Slice 6
+  (Fabric/AAS Entra token auth) DONE + validated live against two Fabric semantic models on one warehouse.**
+  ADOMD has no interactive auth in the CLR host, so `DaxTokenAuth` mints a Power BI-scoped token
+  (`…/powerbi/api/.default`) and sets `AdomdConnection.AccessToken` (+ `OnAccessTokenExpired` refresh) — the
+  principal is the **same azure SP secret the warehouse uses** (reused via the v39 foreign-secret path:
+  `ATTACH 'Data Source=powerbi://…;Initial Catalog=<model>' (…, PROVIDER 'dax', SECRET <azure_sp>)` →
+  `DaxBackend.BuildConnectionString` carries the secret fields to the catalog via a connstr marker → a
+  `ClientSecretCredential`); a secretless remote XMLA endpoint falls back to `DefaultAzureCredential` (the
+  "Active Directory Default" analog). New dep `Azure.Identity`. **Also fixed: honor the explicit `Initial
+  Catalog`** — a workspace XMLA endpoint lists many models in `DBSCHEMA_CATALOGS` and we were binding to the
+  FIRST (e.g. a lakehouse default model), so every DMV/metadata query came back empty; the connection's
+  current catalog now wins (auto-discover only when none given). **Storage provenance via system tables
+  validated:** `TMSCHEMA_PARTITIONS` (Mode/Type=5 = DirectLake Entity) → `ExpressionSourceID` →
+  `TMSCHEMA_EXPRESSIONS.Expression` is the discriminator — `AzureStorage.DataLake(onelake…)` = DirectLake on
+  OneLake vs `Sql.Database(…datawarehouse.fabric.microsoft.com)` = DirectLake on SQL (two models on one
+  warehouse item). **DAX→SQL bypass PROVEN** (`SELECT count(*) FROM wh.dbo.Trip` via the SQL provider on the
+  warehouse SQL endpoint = the DAX model scan, 2,838,927 rows) → a documented (NOT built) **DirectLake
+  passthrough** idea: route base-table reads to the cheap SQL endpoint (measures/calc stay DAX), write
+  warehouses via SQL / lakehouses via Delta + reframe, optional far-future TMSL model sync — design + honest
+  good/bad triage in [docs/dax-provider.md](docs/dax-provider.md) ("DirectLake passthrough"). Then the
+  **generic rename**
   (`arrownet_query`/`_exec`, catalog-type `"arrownet"`) + `BackendRegistry` multi-provider polish are due.
 - **Multi-edition support** (Synapse / Fabric Warehouse / Lakehouse SQL endpoint) — **design:
   [docs/warehouse-support.md](docs/warehouse-support.md)**. **Slices 1–4 DONE + validated end-to-end against
