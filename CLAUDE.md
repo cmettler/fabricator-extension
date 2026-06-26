@@ -201,20 +201,20 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   Linux-TBD**. **Slices 2–3 DONE + validated** (live local model): slice 2 = DMV table/column discovery
   (`TMSCHEMA_TABLES`; columns via `EVALUATE TOPN(0,'T')`+`GetSchemaTable` = real engine types, no TOM-enum
   guessing; `DaxTypeMap` CLR→Arrow incl. `Decimal`→`Decimal128(p,s)`; `'T'[Col]`→`Col`); slice 3 = table
-  scan via `EVALUATE SELECTCOLUMNS` projection (no filter pushdown — DuckDB re-filters), validated for
-  full/projected scans, `WHERE`/`ORDER BY`/`LIMIT`, aggregation, exact decimals, `DESCRIBE`. **CRITICAL
-  ADOMD finding (root-caused):** under the in-process CoreCLR host, incremental streaming via
-  `AdomdDataReader` fails parsing the **2nd rowset chunk** of a multi-chunk (>~2048-row) response
-  (`AdomdUnknownResponseException` at `XmlaClient.ReadEndElementS`). Cause = **in-process interleaving of the
-  host's Arrow C-Data-Interface consumption with the ADOMD read** (the bridge exports the stream + DuckDB
-  imports it in the SAME process). Ruled out (contradictory pass/fail): thread affinity (dedicated single
-  thread fails), GC, pause-between-chunks (unbounded continuous producer fails), query-count, 2nd connection
-  (disposing the metadata conn + one connection still fails). A **standalone process** (console + the same
-  package, AND the old Airport Flight server) streams fine — there the Arrow consumer is a DIFFERENT process,
-  so no interleaving. So it's hosting topology, not a code pattern. **Reliable in-process path:
-  `AdomdDataAdapter.Fill(DataTable)` (one NON-chunked whole-rowset fetch) + materialize**, schema from a
-  zero-row `TOPN(0)` probe. **True incremental streaming needs an out-of-process DAX sidecar** (Airport
-  model). Fill trade-off: full materialization per scan (fine for aggregated DAX, not huge raw scans). Remaining slices (4 `daxeval`, 5 `daxevaltable`/
+  scan via `EVALUATE SELECTCOLUMNS` projection (no filter pushdown — DuckDB re-filters), **TRUE incremental
+  streaming** (`DaxArrowStream`, ≤1 batch buffered — validated to **10.5M rows**), `WHERE`/`ORDER BY`/`LIMIT`,
+  aggregation, exact decimals, `DESCRIBE`. **CRITICAL ADOMD GOTCHA (the real root cause):** `AdomdDataReader.Read()`
+  called AFTER it already returned `false` (past end-of-data) does NOT return `false` again — it **throws**
+  `AdomdUnknownResponseException` ("the server sent an unrecognizable response", `XmlaClient.ReadEndElementS`).
+  Unlike `SqlDataReader` it is not idempotent at EOF. DuckDB pulls one batch AFTER the final (partial) one, so
+  a batched reader must remember EOF (set `_done` when `Read()` first returns false) and never call `Read()`
+  again — one-line fix in `DaxArrowStream`. **This invalidates the earlier (WRONG) "in-process Arrow-import
+  interleaving / hosting-topology, must use `AdomdDataAdapter.Fill`/materialize/out-of-process sidecar"
+  conclusion** — it was misdiagnosed as "fails on the 2nd chunk." Instrumentation (max-in-flight + per-call
+  thread + rows-read) proved `maxInFlight=1` (no parallel access; `MaxThreads()==1` + `get_next` under mutex),
+  single thread (no hopping), and the throw on the pull AFTER the last row (read-past-EOF), not the 2nd chunk.
+  `Fill` and any tight `while(Read())` loop only "worked" because they stop at the first `false`. Remaining
+  slices (4 `daxeval`, 5 `daxevaltable`/
   `daxapply` in-out, 6 Fabric token auth) in the doc. Then the **generic rename**
   (`arrownet_query`/`_exec`, catalog-type `"arrownet"`) + `BackendRegistry` multi-provider polish are due.
 - **Multi-edition support** (Synapse / Fabric Warehouse / Lakehouse SQL endpoint) — **design:

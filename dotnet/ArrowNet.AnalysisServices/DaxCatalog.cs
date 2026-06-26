@@ -3,7 +3,6 @@ using Apache.Arrow;
 using Apache.Arrow.Ipc;
 using Apache.Arrow.Types;
 using ArrowNet.Bridge;
-using ArrowNet.Bridge.Conversion;
 using Microsoft.AnalysisServices.AdomdClient;
 
 namespace ArrowNet.AnalysisServices;
@@ -167,10 +166,11 @@ internal sealed class DaxCatalog : IBackendCatalog
     }
 
     /// <summary>
-    /// Streams a DAX result lazily as Arrow (at most one batch buffered). The schema (with exact numeric
-    /// precision/scale) is resolved from a separate zero-row probe (<c>EVALUATE TOPN(0, …)</c>); the data
-    /// reader is then streamed via <see cref="DaxArrowStream"/> without ever calling <c>GetSchemaTable</c> on
-    /// it. The host pulls batches on demand and disposes the stream (and its connection) at scan teardown.
+    /// Lazy, true-streaming scan (one batch per host pull, ≤1 batch buffered) — open one connection, one
+    /// ExecuteReader, hand the open <see cref="AdomdDataReader"/> to <see cref="DaxArrowStream"/>. The schema
+    /// comes from the data reader itself (one query per connection). Streams arbitrarily large results
+    /// (validated to 10.5M rows). See <see cref="DaxArrowStream"/> for the one subtlety that makes it work:
+    /// never call <c>Read()</c> past end-of-data (ADOMD throws on it).
     /// </summary>
     private IArrowArrayStream ScanTableCore(string innerExpr)
     {
@@ -182,73 +182,18 @@ internal sealed class DaxCatalog : IBackendCatalog
             {
                 conn.ChangeDatabase(_catalog);
             }
-
-            // Schema (exact types incl. decimal precision/scale) from a zero-row probe.
-            Schema schema;
-            using (var probe = conn.CreateCommand())
-            {
-                probe.CommandText = $"EVALUATE TOPN(0, {innerExpr})";
-                using var pr = probe.ExecuteReader();
-                schema = ArrowSchemaFromReader(pr);
-            }
-
-            // Data via AdomdDataAdapter.Fill — a single NON-CHUNKED fetch of the whole rowset, materialized
-            // into a DataTable. We deliberately do NOT use the streaming AdomdDataReader: its chunked-rowset
-            // protocol (the response is split into ~2048-row chunks the client reads on demand) is unreliable
-            // under the in-process CoreCLR host — reading the 2nd chunk raises AdomdUnknownResponseException
-            // ("the server sent an unrecognizable response"). Extensive investigation (docs/dax-provider.md)
-            // ruled out thread affinity, GC, pause-between-chunks, and query count individually, with
-            // contradictory results — i.e. the chunked reader is fragile here, while Fill (one whole-rowset
-            // response, no chunk continuations) is reliable. Trade-off: full materialization per scan (fine
-            // for typically-aggregated DAX results; true incremental streaming needs an out-of-process
-            // reader — the Airport model).
-            var table = new System.Data.DataTable();
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText = $"EVALUATE {innerExpr}";
-                using var adapter = new AdomdDataAdapter((AdomdCommand)cmd);
-                adapter.Fill(table);
-            }
-            return new InMemoryArrayStream(schema, BuildBatches(table, schema, batchSize: 2048));
+            var cmd = conn.CreateCommand();
+            cmd.CommandText = $"EVALUATE {innerExpr}";
+            var reader = cmd.ExecuteReader();
+            var schema = ArrowSchemaFromReader(reader);
+            // The stream owns conn/cmd/reader and disposes them at scan teardown.
+            return new DaxArrowStream(conn, cmd, reader, schema, batchSize: 2048);
         }
-        finally
+        catch
         {
             conn.Dispose();
+            throw;
         }
-    }
-
-    /// <summary>Builds Arrow record batches from a fully-materialized <see cref="System.Data.DataTable"/>
-    /// using the probed <paramref name="schema"/> (column order matches the DataTable).</summary>
-    private static List<RecordBatch> BuildBatches(System.Data.DataTable table, Schema schema, int batchSize)
-    {
-        var batches = new List<RecordBatch>();
-        int ncols = schema.FieldsList.Count;
-        int total = table.Rows.Count;
-        for (int start = 0; start < total; start += batchSize)
-        {
-            int count = Math.Min(batchSize, total - start);
-            var appenders = new ColumnAppender[ncols];
-            for (int c = 0; c < ncols; c++)
-            {
-                appenders[c] = ColumnAppender.Create(schema.FieldsList[c].DataType);
-            }
-            for (int r = 0; r < count; r++)
-            {
-                var row = table.Rows[start + r];
-                for (int c = 0; c < ncols; c++)
-                {
-                    var v = row[c];
-                    if (v is null or DBNull) { appenders[c].AppendNull(); } else { appenders[c].Append(v); }
-                }
-            }
-            var arrays = new IArrowArray[ncols];
-            for (int c = 0; c < ncols; c++)
-            {
-                arrays[c] = appenders[c].Build();
-            }
-            batches.Add(new RecordBatch(schema, arrays, count));
-        }
-        return batches;
     }
 
     /// <summary>Extracts the projected DuckDB column names from the scan spec (<c>{"columns":[...]}</c>);

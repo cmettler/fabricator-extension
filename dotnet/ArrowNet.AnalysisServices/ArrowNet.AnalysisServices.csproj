@@ -18,7 +18,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\ArrowNet.Bridge\ArrowNet.Bridge.csproj" />
-    <PackageReference Include="Microsoft.AnalysisServices.AdomdClient" Version="19.96.1" />
+    <PackageReference Include="Microsoft.AnalysisServices.AdomdClient" Version="19.114.0" />
   </ItemGroup>
 
 </Project>
