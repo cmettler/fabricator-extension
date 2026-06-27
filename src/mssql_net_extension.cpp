@@ -15,6 +15,7 @@
 #include "copy/mssql_net_copy.hpp"
 #include "arrownet_optimizer.hpp"
 #include "arrownet_fs_spike.hpp"
+#include "arrownet_host_query.hpp"
 #include "arrownet_delta.hpp"
 #include "mssql_net_secret.hpp"
 #include "mssql_net_storage.hpp"
@@ -397,6 +398,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	RegisterFsSpike(loader);
 	// arrownet_delta_scan(path) — a managed (engineered-wood) Delta reader, IO via the host FileSystem.
 	RegisterDeltaScan(loader);
+	// arrownet_host_query(sql) — run a query on a fresh host connection, result as Arrow (reuse DuckDB).
+	RegisterHostQuery(loader);
 	// CREATE SECRET ... (TYPE mssql_net, host '...', ...) — secret type(s) + fields declared in C#
 	RegisterProviderSecrets(loader);
 	// ATTACH '<connstr>' AS db (TYPE mssql_net) — or ATTACH '' (TYPE mssql_net, SECRET name)

@@ -1,0 +1,106 @@
+//===----------------------------------------------------------------------===//
+//                         arrownet — host query (impl)
+//===----------------------------------------------------------------------===//
+
+#include "arrownet_host_query.hpp"
+
+#include "arrownet/arrow_ingest.hpp"
+#include "arrownet/arrow_produce.hpp"
+#include "duckdb/common/arrow/arrow_appender.hpp"
+#include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/main/connection.hpp"
+
+#include <cstring>
+
+namespace duckdb {
+
+namespace {
+
+// A self-owning ArrowArrayStream over a fresh-connection query result. Unlike arrownet::ArrowProducer (which
+// is for synchronous hand-off within a call), this is drained ASYNCHRONOUSLY by the consuming scan, so it
+// owns its Connection + result and frees them on release. The fresh Connection has its own ClientContext /
+// transaction — the in-flight context is non-reentrant, so reusing it would corrupt the outer query.
+struct HostQueryStream {
+	unique_ptr<Connection> conn;
+	unique_ptr<QueryResult> result;
+	vector<LogicalType> types;
+	vector<string> names;
+	ArrowArrayStream stream {};
+};
+
+int HostQueryGetSchema(ArrowArrayStream *stream, ArrowSchema *out) {
+	auto *st = static_cast<HostQueryStream *>(stream->private_data);
+	auto props = arrownet::BoundaryClientProperties(*st->conn->context);
+	ArrowConverter::ToArrowSchema(out, st->types, st->names, props);
+	return 0;
+}
+
+int HostQueryGetNext(ArrowArrayStream *stream, ArrowArray *out) {
+	auto *st = static_cast<HostQueryStream *>(stream->private_data);
+	std::memset(out, 0, sizeof(*out));
+	auto chunk = st->result->Fetch(); // next DataChunk, or null at end-of-result
+	if (!chunk || chunk->size() == 0) {
+		return 0; // EOF — a zeroed (released) ArrowArray is the end marker
+	}
+	auto props = arrownet::BoundaryClientProperties(*st->conn->context);
+	auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(*st->conn->context, st->types);
+	ArrowAppender appender(st->types, chunk->size(), props, extension_types);
+	appender.Append(*chunk, 0, chunk->size(), chunk->size());
+	*out = appender.Finalize();
+	return 0;
+}
+
+const char *HostQueryGetLastError(ArrowArrayStream *) {
+	return nullptr;
+}
+
+void HostQueryRelease(ArrowArrayStream *stream) {
+	delete static_cast<HostQueryStream *>(stream->private_data);
+	stream->release = nullptr;
+}
+
+// Table function bind: stash a factory that (re)runs the query on a fresh connection + produces the result
+// stream, then read the output schema from it (PopulateReturnSchema runs the factory once for the schema;
+// the scan runs it again for the data — like the other arrownet table functions).
+unique_ptr<FunctionData> HostQueryBind(ClientContext &context, TableFunctionBindInput &input,
+                                       vector<LogicalType> &return_types, vector<string> &names) {
+	auto sql = input.inputs[0].GetValue<string>();
+	auto db = context.db; // shared_ptr<DatabaseInstance>; the fresh connection is opened on it per run
+	auto bind_data = make_uniq<arrownet::ArrowStreamBindData>();
+	bind_data->factory = [db, sql](const arrownet::ArrowScanRequest &, ArrowArrayStream &out) {
+		MakeHostQueryStream(*db, sql, out);
+	};
+	arrownet::PopulateReturnSchema(context, *bind_data, return_types, names);
+	return std::move(bind_data);
+}
+
+} // namespace
+
+void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStream &out) {
+	auto conn = make_uniq<Connection>(db); // FRESH connection: own context/transaction (see header)
+	auto result = conn->Query(sql);
+	if (result->HasError()) {
+		throw IOException("arrownet_host_query: " + result->GetError());
+	}
+	auto *st = new HostQueryStream();
+	st->conn = std::move(conn);
+	st->types = result->types;
+	st->names = result->names;
+	st->result = std::move(result);
+	st->stream.get_schema = HostQueryGetSchema;
+	st->stream.get_next = HostQueryGetNext;
+	st->stream.get_last_error = HostQueryGetLastError;
+	st->stream.release = HostQueryRelease;
+	st->stream.private_data = st;
+	out = st->stream; // copy the stream struct; ownership of `st` rides private_data (freed in HostQueryRelease)
+}
+
+void RegisterHostQuery(ExtensionLoader &loader) {
+	TableFunction fn("arrownet_host_query", {LogicalType::VARCHAR}, arrownet::ArrowStreamScan, HostQueryBind,
+	                 arrownet::ArrowStreamInitGlobal, arrownet::ArrowStreamInitLocal);
+	loader.RegisterFunction(fn);
+}
+
+} // namespace duckdb

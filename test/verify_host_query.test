@@ -1,0 +1,36 @@
+# name: test/verify_host_query.test
+# description: arrownet_host_query(sql) — run a query on a FRESH host DuckDB connection (own context/txn)
+#              and stream the result back as Arrow through the ingest path. Pure C++ (no SQL Server / no
+#              live backend), so it runs anywhere the extension loads. See docs/host-query.md.
+# group: [mssql_net]
+
+require mssql_net
+
+# Basic round-trip: a literal projection run on a fresh host connection.
+query II
+SELECT x, y FROM arrownet_host_query('SELECT 42 AS x, ''hi'' AS y');
+----
+42	hi
+
+# Multi-chunk streaming (1000 rows > a vector) materialized + streamed back.
+query II
+SELECT count(*), sum(i) FROM arrownet_host_query('SELECT * FROM range(1000) t(i)');
+----
+1000	499500
+
+# Projection + filter are applied ABOVE the host-query scan (DuckDB owns them).
+query I
+SELECT y FROM arrownet_host_query('SELECT 1 x, ''a'' y UNION ALL SELECT 2, ''b''') WHERE x = 2;
+----
+b
+
+# Reuse a DuckDB feature (the catalog) through the fresh host connection.
+query I
+SELECT c > 0 FROM arrownet_host_query('SELECT count(*) c FROM duckdb_functions()');
+----
+true
+
+# A query error surfaces as an error (not silent empty).
+statement error
+SELECT * FROM arrownet_host_query('SELECT * FROM a_table_that_does_not_exist_xyz');
+----

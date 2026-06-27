@@ -1,0 +1,112 @@
+# Host query — reuse the host's DuckDB engine from C#, over Arrow
+
+> Status: **design + implementation in progress.** Lets a managed component (a provider backend, a custom
+> function) run a DuckDB query/statement **on the host's own engine** and exchange data as Apache Arrow —
+> reusing DuckDB features (functions, readers, extensions, the catalog) without re-implementing them, and
+> without going out-of-process. This is the C#→host reverse-callback companion to the v40 filesystem bridge
+> (`ArrowNetHostServices`); see [docs/filesystem-bridge.md](filesystem-bridge.md).
+
+## Why not ADBC / a second DuckDB
+
+We are **already inside DuckDB** — the extension holds a first-class C++ `Connection`/`DatabaseInstance`.
+Loading DuckDB's native ADBC driver in C# would open a *separate* database/connection (its own transaction,
+its own locks) and binding our connection into it requires poking the driver's internal connection wrapper +
+disabling its release — fragile and version-coupled (analysed and rejected). A reverse callback that runs on
+the host's engine is simpler, has zero coupling to ADBC internals, and lets **C++ own the connection/transaction
+binding**.
+
+## The non-negotiable: a FRESH connection per call
+
+`host_query` runs on a **new `Connection` over the host `DatabaseInstance`**, never the in-flight
+`ClientContext`. A `ClientContext` is **not reentrant** — it owns one active transaction, one in-flight
+query/result (executor pipeline, arena allocators, bound expression context) and a context lock held during
+execution. A `host_query` is almost always invoked *from inside* an executing query (a C# scalar/table/in-out
+callback), so reusing that context would **deadlock on the context lock or corrupt the outer query's state**.
+A fresh `Connection` gets its own `ClientContext` (own transaction, own executor state), sharing only the
+`DatabaseInstance` at the storage/catalog layer — which is built for concurrent connections (MVCC).
+
+Consequences (accepted): the query runs in a **separate transaction** → it sees *committed* data, not the
+extension's own uncommitted writes. (Same-transaction read-your-writes would mean reusing the live context =
+the corruption path; explicitly out of scope.) Each call is naturally **thread-safe** (own connection, no
+shared mutable state); a small connection pool is a later optimization (create-per-call first).
+
+## ABI — additions to `ArrowNetHostServices` (the reverse-direction struct)
+
+`ArrowNetHostServices` already carries host→managed function pointers the managed side calls (the v40
+`fs_*` callbacks). We append one primitive:
+
+```c
+// Run `sql` on a FRESH host connection (own transaction). `params` (nullable) is a 1-row Arrow batch whose
+// columns bind to the statement's parameters (by name when the batch field is named, else positionally).
+// `inputs` (nullable) registers named Arrow sources as connection-scoped views BEFORE the query runs (via
+// duckdb_arrow_scan), so the SQL can reference them by name (`SELECT * FROM <input_name> …`). `out` receives
+// the result as an ArrowArrayStream. The connection + result outlive `out` (released when `out` is released).
+int32_t (*host_query)(const char *sql,
+                      struct ArrowArray *params /*nullable, 1-row*/,
+                      ArrowNetHostInputs *inputs /*nullable*/,
+                      struct ArrowArrayStream *out, char **err);
+```
+
+`ArrowNetHostInputs` = `{ int32_t count; const char **names; struct ArrowArrayStream **streams; }` — the
+managed caller hands over N named Arrow streams (it owns producing them; the host consumes/releases them when
+the query's connection is torn down). Bump `ARROWNET_ABI_VERSION` **and** the host-services `abi_version`.
+
+**`exec_nonquery` is NOT a separate entry.** A DDL/DML statement returns a result in DuckDB too (DML → a
+1-row `BIGINT` count; DDL → empty), so `host_query` subsumes it. "Exec, return affected rows" is a thin **C#
+helper over `host_query`** (run, read the single count column if present, discard the stream) — keeping the
+ABI minimal. Both get parameter binding for free.
+
+## C++ side (`arrownet_host_query.cpp`, host service + the test/utility table function)
+
+- **`HostQuery(...)`** (the `host_query` callback): `Connection conn(*g_database)` (the `DatabaseInstance`
+  captured at extension load, like the fs services); for each input `duckdb_arrow_scan(conn, name, stream)`
+  to register it as a connection view; `conn.Prepare(sql)` + bind the `params` row (read via a 1-row
+  `ArrowAppender`→`DataChunk`, each value `→ Value` bound positionally/by name); execute; **export the result
+  as an `ArrowArrayStream`** by fetching each `DataChunk` and `ArrowAppender`→`ArrowArray`→`ArrowProducer`,
+  whose `Stream()` is returned. The `Connection` + materialized batches live in the producer's lifetime
+  (released with `out`). Errors → `DupErr` (freed via `free_str`), like the fs callbacks.
+- **Capture the `DatabaseInstance` at load** (`InstallHostServices(loader.GetDatabaseInstance())`) into a
+  global the callback reads — `host_query` has no per-call opener (unlike the fs callbacks), it just needs the
+  database to open a connection on.
+
+## C# side (`ArrowNet.Bridge`)
+
+- **`Abi.cs`**: add the `HostQuery` function-pointer field to `ArrowNetHostServices` (+ the `ArrowNetHostInputs`
+  struct).
+- **`Host` API** (mirrors `HostFs`): `Host.Query(string sql, RecordBatch? params = null, IReadOnlyDictionary<
+  string, IArrowArrayStream>? inputs = null) → IArrowArrayStream` — marshals params to a 1-row Arrow array,
+  exports each input stream + the names into an `ArrowNetHostInputs`, calls the pointer, imports the result
+  stream. `Host.ExecuteNonQuery(sql, params) → long` = the helper (run, read the count, discard).
+- This is the surface a provider backend / custom function uses to reuse the host engine.
+
+## Data-in — two layers
+
+1. **Scoped inputs (built in `host_query`):** the caller passes named Arrow streams with the query; the host
+   registers them as connection-scoped views (`duckdb_arrow_scan`) for that query only and tears them down with
+   the connection. No global state, no name collisions, no lifetime ambiguity. **This is the primary data-in
+   path** — the query references the input names directly.
+2. **Replacement-scan layer (optional, ambient registry):** for "register a C# source by name once, then any
+   query referencing that bare name resolves to it" (pandas-df style). A C# registry maps `name → Func<
+   IArrowArrayStream>`; a C++ replacement scan registered on the `DBConfig` rewrites an unknown table name to a
+   `arrownet_scan('name')` `TableFunctionRef` when the name is registered (a `named_input_exists(name)` +
+   `open_named_input(name, out)` managed lookup). `arrownet_scan(name)` is a global table function that opens
+   the registered stream and scans it via the existing `arrow_ingest` path. Single-use streams → the registry
+   holds a **factory** so each scan gets a fresh stream. This layer is additive over (1) and is only needed for
+   the ambient/by-bare-name ergonomics.
+
+## Verification
+
+- A test table function `arrownet_host_query(sql)` (C++) that calls `HostQuery` directly proves the
+  fresh-connection run + param-free Arrow export (`SELECT * FROM arrownet_host_query('SELECT 42 AS x')`).
+- A C# round-trip test — a custom C# table function whose `Execute` calls `Host.Query(...)` — proves
+  SQL → our C# function → `host_query` → fresh host connection → Arrow → back, including the reentrancy safety
+  (the nested run is on a fresh connection, so the outer query's context is untouched).
+- Data-in: a `host_query` with an input stream that the SQL joins/filters; and (layer 2) a replacement-scan
+  test resolving a bare registered name.
+
+## Open / deferred
+
+- **Streaming result** (vs the current materialize-into-`ArrowProducer`): lazy fetch as the consumer pulls —
+  later, if large host-query results matter.
+- **Connection pool** for hot `host_query` callers (create-per-call first).
+- **Same-transaction** reads — intentionally not supported (would require the live context = corruption).
