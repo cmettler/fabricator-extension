@@ -128,12 +128,17 @@ ABI minimal. Both get parameter binding for free.
   registered (so `FROM <name>` works), declining unknown names so a genuine "table does not exist" is left to
   DuckDB (`NamedInputExists` is non-throwing + bridge-tolerant). DONE; verified (`verify_host_query.test`, 15
   — `arrownet_scan` + bare-name + unknown-name passthrough; built-in demo source `arrownet_demo_numbers`).
-- **Deferred:** parameter binding for the ambient `arrownet_scan` (the scoped `host_query` path already binds
-  params); streaming (vs materialized) host-query results.
+- **Slice 6 — streaming results**: `host_query` now uses `SendQuery` (and a streaming prepared `Execute`) so
+  the result is fetched lazily (`StreamQueryResult.Fetch()` per `get_next`) — bounded memory for large
+  results (validated to 1M rows). The holder keeps the connection (+ the prepared statement for params)
+  alive; runtime errors that surface during `Fetch` (vs bind errors at `SendQuery`) are caught in `get_next`
+  and reported via `get_last_error`. DONE.
+- **Deferred:** parameter binding for the ambient `arrownet_scan` (it resolves a registered source by NAME —
+  parameters belong on the scoped `host_query` path, which already binds them; a parameterized named source
+  would be a separate, larger design); and the **full breaking rename** (removing the `mssql_net_*` names;
+  the generic `arrownet_*`/`TYPE arrownet` names already exist as additive aliases — `verify_generic_names.test`).
 
 ## Open / deferred
 
-- **Streaming result** (vs the current materialize-into-`ArrowProducer`): lazy fetch as the consumer pulls —
-  later, if large host-query results matter.
 - **Connection pool** for hot `host_query` callers (create-per-call first).
 - **Same-transaction** reads — intentionally not supported (would require the live context = corruption).

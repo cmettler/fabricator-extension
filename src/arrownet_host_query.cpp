@@ -32,9 +32,11 @@ namespace {
 // transaction — the in-flight context is non-reentrant, so reusing it would corrupt the outer query.
 struct HostQueryStream {
 	unique_ptr<Connection> conn;
-	unique_ptr<QueryResult> result;
+	unique_ptr<PreparedStatement> prepared; // kept alive for the param path (the streaming result references it)
+	unique_ptr<QueryResult> result;         // a StreamQueryResult — fetched lazily (bounded memory)
 	vector<LogicalType> types;
 	vector<string> names;
+	string last_error;
 	ArrowArrayStream stream {};
 };
 
@@ -48,20 +50,27 @@ int HostQueryGetSchema(ArrowArrayStream *stream, ArrowSchema *out) {
 int HostQueryGetNext(ArrowArrayStream *stream, ArrowArray *out) {
 	auto *st = static_cast<HostQueryStream *>(stream->private_data);
 	std::memset(out, 0, sizeof(*out));
-	auto chunk = st->result->Fetch(); // next DataChunk, or null at end-of-result
-	if (!chunk || chunk->size() == 0) {
-		return 0; // EOF — a zeroed (released) ArrowArray is the end marker
+	try {
+		auto chunk = st->result->Fetch(); // next DataChunk, lazily; null at end. A streaming result can
+		                                   // surface a RUNTIME error here (vs at SendQuery) — caught below.
+		if (!chunk || chunk->size() == 0) {
+			return 0; // EOF — a zeroed (released) ArrowArray is the end marker
+		}
+		auto props = arrownet::BoundaryClientProperties(*st->conn->context);
+		auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(*st->conn->context, st->types);
+		ArrowAppender appender(st->types, chunk->size(), props, extension_types);
+		appender.Append(*chunk, 0, chunk->size(), chunk->size());
+		*out = appender.Finalize();
+		return 0;
+	} catch (std::exception &e) {
+		st->last_error = string("arrownet_host_query: ") + e.what();
+		return 1; // the consumer reads get_last_error
 	}
-	auto props = arrownet::BoundaryClientProperties(*st->conn->context);
-	auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(*st->conn->context, st->types);
-	ArrowAppender appender(st->types, chunk->size(), props, extension_types);
-	appender.Append(*chunk, 0, chunk->size(), chunk->size());
-	*out = appender.Finalize();
-	return 0;
 }
 
-const char *HostQueryGetLastError(ArrowArrayStream *) {
-	return nullptr;
+const char *HostQueryGetLastError(ArrowArrayStream *stream) {
+	auto *st = static_cast<HostQueryStream *>(stream->private_data);
+	return st->last_error.empty() ? nullptr : st->last_error.c_str();
 }
 
 void HostQueryRelease(ArrowArrayStream *stream) {
@@ -100,6 +109,7 @@ void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStre
 		}
 	}
 	unique_ptr<QueryResult> result;
+	unique_ptr<PreparedStatement> prepared;
 	if (params) {
 		// Read the 1-row Arrow params batch into values, bind positionally via a prepared statement.
 		arrownet::ArrowStreamReader reader(*conn->context, *params); // consumes + releases the params stream
@@ -110,21 +120,21 @@ void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStre
 		for (idx_t c = 0; c < chunk.ColumnCount(); c++) {
 			values.push_back(chunk.size() > 0 ? chunk.GetValue(c, 0) : Value());
 		}
-		auto prepared = conn->Prepare(sql);
+		prepared = conn->Prepare(sql);
 		if (prepared->HasError()) {
 			throw IOException("arrownet_host_query: " + prepared->GetError());
 		}
-		// Materialize (allow_stream_result=false): the result must NOT reference the prepared statement, which
-		// is destroyed when this function returns (the result stream outlives it). Matches the conn.Query path.
-		result = prepared->Execute(values, false);
+		// Streaming result: it references the prepared statement, so the holder keeps `prepared` alive.
+		result = prepared->Execute(values, /*allow_stream_result=*/true);
 	} else {
-		result = conn->Query(sql);
+		result = conn->SendQuery(sql); // streaming (lazy Fetch) — bounded memory for large results
 	}
-	if (result->HasError()) {
+	if (result->HasError()) { // bind/plan errors surface here; runtime errors surface during Fetch (get_next)
 		throw IOException("arrownet_host_query: " + result->GetError());
 	}
 	auto *st = new HostQueryStream();
 	st->conn = std::move(conn);
+	st->prepared = std::move(prepared);
 	st->types = result->types;
 	st->names = result->names;
 	st->result = std::move(result);
