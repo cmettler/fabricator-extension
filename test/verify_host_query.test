@@ -53,3 +53,22 @@ SELECT sum(value)::BIGINT FROM arrownet_scan('arrownet_demo_numbers');
 statement error
 SELECT * FROM arrownet_scan('no_such_source_xyz');
 ----
+
+# Replacement scan: a BARE table name matching a registered source resolves to arrownet_scan automatically,
+# so it's usable like any table (here in an aggregate + a filter).
+query I
+SELECT sum(value)::BIGINT FROM arrownet_demo_numbers;
+----
+60
+
+query I
+SELECT count(*) FROM arrownet_demo_numbers WHERE value > 15;
+----
+2
+
+# A genuinely-unknown name still gives DuckDB's normal "does not exist" error — the replacement scan declines
+# names it doesn't recognize (NamedInputExists is non-throwing + bridge-tolerant), never hijacking a typo.
+statement error
+SELECT * FROM truly_unknown_table_xyz;
+----
+does not exist

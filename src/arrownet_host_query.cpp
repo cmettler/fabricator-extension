@@ -11,8 +11,13 @@
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb.h" // C API: duckdb_arrow_scan + duckdb_connection (data-in via connection-scoped views)
+#include "duckdb/function/replacement_scan.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
 
 #include <cstdlib>
 #include <cstring>
@@ -181,9 +186,26 @@ static unique_ptr<FunctionData> NamedScanBind(ClientContext &context, TableFunct
 	return std::move(bind_data);
 }
 
+// Replacement scan: an unresolved bare table name that matches a registered ambient source is rewritten to
+// `arrownet_scan('<name>')`. Fires only for names DuckDB couldn't resolve; NamedInputExists is non-throwing
+// + tolerates an unavailable bridge, so a genuine "table does not exist" is left to DuckDB.
+static unique_ptr<TableRef> NamedSourceReplacement(ClientContext &, ReplacementScanInput &input,
+                                                   optional_ptr<ReplacementScanData>) {
+	if (!arrownet::NamedInputExists(input.table_name)) {
+		return nullptr;
+	}
+	auto table_function = make_uniq<TableFunctionRef>();
+	vector<unique_ptr<ParsedExpression>> children;
+	children.push_back(make_uniq<ConstantExpression>(Value(input.table_name)));
+	table_function->function = make_uniq<FunctionExpression>("arrownet_scan", std::move(children));
+	table_function->alias = input.table_name;
+	return std::move(table_function);
+}
+
 void RegisterHostQuery(ExtensionLoader &loader) {
 	g_host_db = &loader.GetDatabaseInstance();
 	arrownet::SetHostQueryService(HostQueryService); // make host_query callable from C# (added to the host block)
+	DBConfig::GetConfig(loader.GetDatabaseInstance()).replacement_scans.emplace_back(NamedSourceReplacement);
 	TableFunction fn("arrownet_host_query", {LogicalType::VARCHAR}, arrownet::ArrowStreamScan, HostQueryBind,
 	                 arrownet::ArrowStreamInitGlobal, arrownet::ArrowStreamInitLocal);
 	loader.RegisterFunction(fn);

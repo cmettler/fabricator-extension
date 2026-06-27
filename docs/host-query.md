@@ -121,9 +121,15 @@ ABI minimal. Both get parameter binding for free.
   `verify_custom_functions.test`). **Ownership note:** the host's `ArrowStreamReader` releases its *copy* of
   the params stream, so the managed caller frees only its allocation (`Marshal.FreeHGlobal`), never
   re-releasing (which would double-free the exporter → NRE).
-- **Deferred:** the **ambient replacement-scan layer** (a C# `name → Func<stream>` registry + a `DBConfig`
-  replacement scan resolving bare names to `arrownet_scan('name')`) — the scoped per-call inputs above cover
-  the primary data-in need.
+- **Slice 5 — ambient named-source registry + replacement scan (ABI v45)**: `Host.RegisterSource(name,
+  Func<IArrowArrayStream>)` registers a stream factory; two handle-less vtable entries (`open_named_input`,
+  `named_input_exists`) let the host resolve a name to a fresh stream. `arrownet_scan('name')` scans it; a
+  `DBConfig` **replacement scan** rewrites a bare unresolved name to `arrownet_scan('name')` when it's
+  registered (so `FROM <name>` works), declining unknown names so a genuine "table does not exist" is left to
+  DuckDB (`NamedInputExists` is non-throwing + bridge-tolerant). DONE; verified (`verify_host_query.test`, 15
+  — `arrownet_scan` + bare-name + unknown-name passthrough; built-in demo source `arrownet_demo_numbers`).
+- **Deferred:** parameter binding for the ambient `arrownet_scan` (the scoped `host_query` path already binds
+  params); streaming (vs materialized) host-query results.
 
 ## Open / deferred
 

@@ -485,17 +485,26 @@ void OpenNamedInput(const std::string &name, ArrowArrayStream &out) {
 }
 
 bool NamedInputExists(const std::string &name) {
-	const ArrowNetVTable &vt = GetBridge();
-	if (!vt.named_input_exists) {
+	// Called from the replacement scan for EVERY unresolved table name, so it must NEVER throw (else a normal
+	// "table does not exist" would become an error) and must tolerate an unavailable/unbootable bridge.
+	try {
+		const ArrowNetVTable &vt = GetBridge();
+		if (!vt.named_input_exists) {
+			return false;
+		}
+		char *err = nullptr;
+		int32_t exists = 0;
+		int32_t rc = vt.named_input_exists(name.c_str(), &exists, &err);
+		if (rc != ARROWNET_OK) {
+			if (err && vt.free_error) {
+				vt.free_error(err);
+			}
+			return false;
+		}
+		return exists != 0;
+	} catch (...) {
 		return false;
 	}
-	char *err = nullptr;
-	int32_t exists = 0;
-	int32_t rc = vt.named_input_exists(name.c_str(), &exists, &err);
-	if (rc != ARROWNET_OK) {
-		ThrowManagedError(vt, err, "ArrowNet: named_input_exists failed");
-	}
-	return exists != 0;
 }
 
 void ListSecretFields(ArrowArrayStream &out) {
