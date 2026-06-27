@@ -72,8 +72,11 @@ current code still uses the single-provider `mssql_net` naming):
   `ARROWNET_BACKEND_ASSEMBLY` comma-list; SqlServer = `"sqlserver"`/alias `"mssql"`. Behavior-preserving —
   `Active` still routes to SqlServer); (2) **provider selection — DONE** (`open_catalog(provider,…)` ABI
   v17 → `BackendRegistry.Resolve`; ATTACH `PROVIDER` option + `scheme://` inference; clean unknown-provider
-  error). The **generic rename** (`arrownet_query`/`_exec`, catalog-type `"arrownet"`) + corpus regen is
-  **deferred** to when the 2nd provider lands (cosmetic; the functional capability is complete);
+  error). The **generic names are now live as ADDITIVE ALIASES** (no breakage): `arrownet_query`/`arrownet_exec`/
+  `arrownet_functions`/`arrownet_server_info` (+ the existing `arrownet_version`) and `ATTACH … (TYPE arrownet)`
+  (the storage extension is registered under both `mssql_net` and `arrownet`) — `test/verify_generic_names.test`.
+  The **breaking removal** of the `mssql_net_*` names (+ catalog-type string `"arrownet"`, settings/secret/URI
+  scheme rename, compat-corpus regen) remains the separate full-rename pass;
   (3) **connstr/auth → C# — DONE** (`build_connection_string` ABI v18: `mssql_net_secret.cpp` reads the
   secret + emits its fields as JSON, `SqlServerBackend.BuildConnectionString` assembles the SqlClient
   connstr; `MapAuthentication`/`QuoteConnValue`/the access-token marker are now C#-only — C++ has no connstr

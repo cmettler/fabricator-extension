@@ -422,10 +422,15 @@ static void LoadInternal(ExtensionLoader &loader) {
 	test_scan.projection_pushdown = true;
 	loader.RegisterFunction(test_scan);
 
+	// Provider-agnostic names are the going-forward surface (the binary hosts several providers). They are
+	// registered as ALIASES of the mssql_net_* names — additive, so existing usage + the compat corpus keep
+	// working; the eventual removal of the mssql_net_* names is the separate breaking rename.
 	TableFunction query_fn("mssql_net_query", {LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                       arrownet::ArrowStreamScan, QueryBind, arrownet::ArrowStreamInitGlobal,
 	                       arrownet::ArrowStreamInitLocal);
 	query_fn.projection_pushdown = true;
+	loader.RegisterFunction(query_fn);
+	query_fn.name = "arrownet_query";
 	loader.RegisterFunction(query_fn);
 
 	// mssql_net_functions(catalog|connstr) — lists discovered routines (diagnostic).
@@ -433,16 +438,22 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                           FunctionsBind, arrownet::ArrowStreamInitGlobal, arrownet::ArrowStreamInitLocal);
 	functions_fn.projection_pushdown = true; // arrow_ingest maps requested columns; required (see mssql_net_query)
 	loader.RegisterFunction(functions_fn);
+	functions_fn.name = "arrownet_functions";
+	loader.RegisterFunction(functions_fn);
 
 	// mssql_server_info(catalog|connstr) — the detected server capability profile (diagnostic).
 	TableFunction server_info_fn("mssql_server_info", {LogicalType::VARCHAR}, arrownet::ArrowStreamScan,
 	                             ServerInfoBind, arrownet::ArrowStreamInitGlobal, arrownet::ArrowStreamInitLocal);
 	server_info_fn.projection_pushdown = true;
 	loader.RegisterFunction(server_info_fn);
+	server_info_fn.name = "arrownet_server_info";
+	loader.RegisterFunction(server_info_fn);
 
 	ScalarFunction exec_fn("mssql_net_exec", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BIGINT,
 	                       MssqlNetExecFunction);
 	exec_fn.stability = FunctionStability::VOLATILE;
+	loader.RegisterFunction(exec_fn);
+	exec_fn.name = "arrownet_exec";
 	loader.RegisterFunction(exec_fn);
 
 	// mssql_refresh_cache(catalog) re-discovers the attached catalog's metadata.

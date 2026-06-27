@@ -200,7 +200,10 @@ void RegisterMssqlNetStorageExtension(ExtensionLoader &loader) {
 	auto storage_extension = make_shared_ptr<StorageExtension>();
 	storage_extension->attach = MssqlNetAttach;
 	storage_extension->create_transaction_manager = MssqlNetCreateTransactionManager;
-	StorageExtension::Register(config, "mssql_net", std::move(storage_extension));
+	// Register under both the legacy `mssql_net` and the provider-agnostic `arrownet` TYPE keyword (same
+	// stateless handler) — additive; ATTACH '…' (TYPE arrownet) now works alongside TYPE mssql_net.
+	StorageExtension::Register(config, "mssql_net", storage_extension);
+	StorageExtension::Register(config, "arrownet", std::move(storage_extension));
 }
 
 } // namespace duckdb
