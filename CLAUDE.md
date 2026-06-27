@@ -233,19 +233,20 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   exchange** — `GetOrCreateCustomInOutFunction` declares named params via a tolerant `FetchFunctionParamSchema`
   (empty for cf_tag → unchanged) + `ArrowNetExchangeBind` marshals supplied named params into `inout_bind`
   args, else nullptr (`_each` unchanged); no ABI bump. Whole-table op, but the exchange has no emit-at-end
-  hook [finalize drain discards trailing output], so input must be a **single chunk ≤2048 rows** — for a
-  small parameter/lookup table; larger errors. **The clean lift for this cap is the
-  [collector table-in-out](docs/inout-collector-mode.md) — now BUILT** (custom C# collectors): a second in-out
-  execution shape (a Sink+Source **pipeline breaker**: collect all input, emit at input-EOF) that coexists with
-  the streaming exchange, picked by a new additive `kind='collector'`; reuses the v28
+  hook [finalize drain discards trailing output] — **this single-chunk cap is now LIFTED: `daxevaltable` is a
+  [collector](docs/inout-collector-mode.md)** (see below), so an arbitrarily large injected table works
+  (validated live to 5000 rows). **The collector table-in-out (pipeline breaker) is BUILT + verified**: a
+  second in-out execution shape (a Sink+Source: collect all input, emit at input-EOF) that coexists with the
+  streaming exchange, picked by a new additive `kind='collector'`; reuses the v28
   `inout_bind`/`inout_exchange_open` ABI as-is (no bump). C# `IArrowCollectorTableFunction`/
   `IArrowCollectorBinding` (+ `StaticCollectorFunction` base, the `CollectorInOutBinding` adapter); C++
   `ArrowNetCollector*` (in-out `Execute` buffers input into an `ArrowProducer`; the injected
   `ArrowNetCollectorPhysical` Sink+Source materializes the C# output into a `ColumnDataCollection` at Finalize +
-  scans it). Demo `dbo.cf_collect`; verified `test/verify_collector.test` (40 — whole-table total, 5000-row
-  multi-chunk, sequential-UNION threads=1, empty, NULLs, prepared re-exec). **`daxevaltable` migration onto the
-  collector (to lift its single-chunk cap) is the remaining step — deferred, needs a live model to verify.**
-  In-out regression green: custom 89 / table_inout 63 /
+  scans it). SqlServer demo `dbo.cf_collect` (`test/verify_collector.test`, 40 — whole-table total, 5000-row
+  multi-chunk, sequential-UNION threads=1, empty, NULLs, prepared re-exec). **`daxevaltable` migrated onto it**
+  (`DaxEvalTableBinding : IArrowCollectorBinding`, `kind='collector'`; reads the whole input into one DATATABLE
+  → no 2048 cap; `daxeach` stays streaming `inout`) — validated live against Power BI Desktop
+  (`test/verify_dax.test`, 29). In-out regression green: custom 89 / table_inout 63 /
   proc_inout 31 / isolation 17) + **`daxeach(<input>, expression := …)` in-out** (slice 5b — per-input-row
   ADOMD `@<col>` param binding, output = the DAX result per row, no echo; `DaxEachBinding` reuses one
   conn+command across rows, emits per chunk so NO input-size limit; the "each" analog of the SQL `_each`,

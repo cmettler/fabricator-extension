@@ -134,6 +134,21 @@ SELECT total FROM ${ARROWNET_DAX_SCHEMA}.daxevaltable(
 ----
 60
 
+# daxevaltable is a COLLECTOR (pipeline breaker), so the injected input may span MANY chunks — the earlier
+# streaming form capped it at a single 2048-row batch. 5000 rows: sum(0..4999) = 12497500 (whole-table SUMX).
+query I
+SELECT total FROM ${ARROWNET_DAX_SCHEMA}.daxevaltable(
+  (SELECT i::INTEGER AS x FROM range(5000) t(i)), expression := 'EVALUATE ROW("total", SUMX(_input, _input[x]))');
+----
+12497500
+
+# The whole 5000-row input is echoed back (every row collected before evaluation).
+query I
+SELECT count(*) FROM ${ARROWNET_DAX_SCHEMA}.daxevaltable(
+  (SELECT i::INTEGER AS x FROM range(5000) t(i)), expression := 'EVALUATE _input');
+----
+5000
+
 # daxeach(<input>, expression := …): run the DAX once per input row, binding each input column as @<col>.
 # Output = the DAX result per row. Model-agnostic (VALUES + @params; no model data).
 query II

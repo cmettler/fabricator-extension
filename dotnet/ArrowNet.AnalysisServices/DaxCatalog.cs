@@ -126,14 +126,16 @@ internal sealed class DaxCatalog : IBackendCatalog
         // real engine types). Model: EVALUATE TOPN(0,'T'); system: bare SELECT * FROM $SYSTEM.<dmv>.
         MetadataKind.Columns => DiscoverColumns(schema, table!),
         // Functions (under the model schema): daxeval(expression) — table function evaluating an arbitrary
-        // DAX query; daxevaltable(<input>, expression := …) — in-out, injects the input table as a DAX
-        // DATATABLE the expression references (slice 5).
+        // DAX query; daxevaltable(<input>, expression := …) — a COLLECTOR (pipeline breaker): it buffers the
+        // WHOLE input and injects it as a DAX DATATABLE the expression references, so it needs all input
+        // before emitting (no single-chunk cap); daxeach(<input>, expression := …) — streaming per-row in-out.
         MetadataKind.Functions => ThreeColumn(
             "schema_name", new[] { _modelName, _modelName, _modelName },
             "name", new[] { DaxEvalName, DaxEvalTableName, DaxEachName },
             // daxeval is a 'proc' (not 'table') so its args register as NAMED parameters — it takes an
             // optional `params` JSON arg alongside `expression`, which a positional table fn can't express.
-            "kind", new[] { "proc", "inout", "inout" }),
+            // daxevaltable is a 'collector' (whole-table); daxeach is a streaming 'inout' (per-row).
+            "kind", new[] { "proc", "collector", "inout" }),
         MetadataKind.ServerInfo => EmptyStringTable("property", "value"),
         _ => EmptyStringTable("name"),
     };
@@ -565,7 +567,11 @@ internal sealed class DaxCatalog : IBackendCatalog
         // args carries the named "expression" param (1-row, column 0); inputSchema = the input table.
         if (IsDaxEvalTable(functionName))
         {
-            return new DaxEvalTableBinding(this, DaxEvalExpression(args), inputSchema);
+            // daxevaltable is a COLLECTOR (registered kind='collector'): the C++ Sink+Source operator buffers
+            // ALL input then calls inout_exchange_open once. Wrap the collector binding as an IArrowInOutBinding
+            // (CollectorInOutBinding adapter) so it flows through the shared exchange marshaling. No single-chunk
+            // cap — DaxEvalTableBinding now reads the whole input into one DATATABLE.
+            return new CollectorInOutBinding(new DaxEvalTableBinding(this, DaxEvalExpression(args), inputSchema));
         }
         if (IsDaxEach(functionName))
         {

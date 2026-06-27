@@ -17,14 +17,14 @@ namespace ArrowNet.AnalysisServices;
 /// result. The expression must be a single <c>EVALUATE …</c> (no <c>DEFINE</c> of its own) and reference
 /// <c>_input</c>. The old Airport <c>DaxEvalTableFlight</c> equivalent.
 ///
-/// <para>Whole-table semantics (the DAX sees the entire injected table at once), which a streaming exchange
-/// can't express — the operator has no emit-at-end hook (a whole-table operation is a pipeline breaker). So
-/// the result is emitted DURING the input chunk's tenure, which requires the whole input to arrive in a
-/// SINGLE chunk (≤ DuckDB's vector size, 2048 rows). That matches the intended use (inject a small
-/// parameter / lookup / filter table into DAX); a larger input raises a clear error. For row-by-row work
-/// over a large input, use <c>daxeach</c> instead.</para>
+/// <para>Whole-table semantics (the DAX sees the entire injected table at once) make this a <b>COLLECTOR</b>
+/// (<see cref="IArrowCollectorBinding"/>, registered <c>kind='collector'</c>): the C++ Sink+Source operator
+/// buffers ALL input, then <see cref="Collect"/> reads every row into one <c>DATATABLE</c>, evaluates once,
+/// and streams the result — so there is <b>no single-chunk cap</b> (unlike the earlier streaming-exchange
+/// form). Bounded only by what ADOMD accepts as a query string, so still aimed at a parameter / lookup /
+/// filter table; for row-by-row work over a large input use <c>daxeach</c> instead.</para>
 /// </summary>
-internal sealed class DaxEvalTableBinding : IArrowInOutBinding
+internal sealed class DaxEvalTableBinding : IArrowCollectorBinding
 {
     private readonly DaxCatalog _catalog;
     private readonly string _expression;
@@ -42,52 +42,47 @@ internal sealed class DaxEvalTableBinding : IArrowInOutBinding
 
     public Schema OutputSchema { get; }
 
-    public async IAsyncEnumerable<RecordBatch> DoExchange(
-        IAsyncEnumerable<RecordBatch> input, [EnumeratorCancellation] CancellationToken ct = default)
+    public async IAsyncEnumerable<RecordBatch> Collect(
+        IAsyncEnumerable<RecordBatch> allInput, [EnumeratorCancellation] CancellationToken ct = default)
     {
-        bool consumed = false;
-        await foreach (var chunk in input.WithCancellation(ct))
+        // Buffer the WHOLE input (across all chunks) into one DEFINE TABLE _input = DATATABLE(...) literal.
+        var sb = new StringBuilder();
+        sb.Append(DaxDataTable.DefineHeader(_inputSchema));
+        bool any = false;
+        await foreach (var chunk in allInput.WithCancellation(ct))
         {
-            if (consumed)
+            using (chunk)
             {
-                // The result depends on the WHOLE injected table, but it was already emitted for the first
-                // chunk and the exchange can't emit at end. So a multi-chunk input can't be supported here.
-                throw new NotSupportedException(
-                    "daxevaltable: the injected input table must fit in a single batch (<= 2048 rows). " +
-                    "Reduce/pre-aggregate the input, or use daxeach for row-by-row evaluation.");
-            }
-            consumed = true;
-
-            if (chunk.Length > 0)
-            {
-                // Build DEFINE TABLE _input = DATATABLE(...) from THIS (sole) chunk + the expression, run once,
-                // and stream the result NOW — during this chunk's tenure (before the sentinel), since output
-                // emitted after input EOF is discarded by the operator's finalize drain.
-                var sb = new StringBuilder();
-                sb.Append(DaxDataTable.DefineHeader(_inputSchema));
                 for (int r = 0; r < chunk.Length; r++)
                 {
-                    if (r > 0)
+                    if (any)
                     {
                         sb.Append(',');
                     }
+                    any = true;
                     DaxDataTable.AppendRow(sb, _inputSchema, chunk, r);
                 }
-                sb.Append(" }) ");
-                sb.Append(_expression);
-
-                using var stream = _catalog.StreamCommand(sb.ToString(), OutputSchema);
-                while (true)
-                {
-                    var batch = await stream.ReadNextRecordBatchAsync(ct).ConfigureAwait(false);
-                    if (batch is null)
-                    {
-                        break;
-                    }
-                    yield return batch;
-                }
             }
-            yield return InOutExchange.EmptyBatch(OutputSchema); // sentinel: this (sole) input chunk consumed
+        }
+        if (!any)
+        {
+            // Empty input: a DATATABLE with no rows is invalid DAX, so emit no output (matches "empty in =>
+            // empty out"). A caller wanting an all-data evaluation should use daxeval (no input table).
+            yield break;
+        }
+        sb.Append(" }) ");
+        sb.Append(_expression);
+
+        // Evaluate once over the full injected table and stream the result.
+        using var stream = _catalog.StreamCommand(sb.ToString(), OutputSchema);
+        while (true)
+        {
+            var batch = await stream.ReadNextRecordBatchAsync(ct).ConfigureAwait(false);
+            if (batch is null)
+            {
+                break;
+            }
+            yield return batch;
         }
     }
 

@@ -1,11 +1,12 @@
 # Collector table-in-out (pipeline-breaker mode)
 
-> Status: **BUILT (custom C# collectors) + verified** (`test/verify_collector.test`, 40 assertions). A *second*
-> table-in-out execution shape alongside the Phase 6 streaming exchange: a binding that **collects all input,
-> emits nothing until input EOF, then emits its full output**. The streaming exchange ([the Phase 6
-> work](../CLAUDE.md)) is **untouched** — the two modes coexist, picked by a discovery `kind`. Reuses the v28
-> exchange ABI verbatim (no bump). **Remaining (deferred, needs a live model):** migrate `daxevaltable` onto the
-> collector to lift its single-chunk cap (see "What this fixes / enables").
+> Status: **BUILT + verified.** Custom C# collectors: `test/verify_collector.test` (40 assertions). DAX:
+> `daxevaltable` migrated onto the collector — `test/verify_dax.test` (29 assertions, validated live against a
+> Power BI Desktop model), **lifting its old single-chunk ≤2048-row cap** (a 5000-row injected table now
+> evaluates fine). A *second* table-in-out execution shape alongside the Phase 6 streaming exchange: a binding
+> that **collects all input, emits nothing until input EOF, then emits its full output**. The streaming
+> exchange ([the Phase 6 work](../CLAUDE.md)) is **untouched** — the two modes coexist, picked by a discovery
+> `kind`. Reuses the v28 exchange ABI verbatim (no bump).
 >
 > **As-built notes** (where the build refined the sketch below):
 > - **C# author API** (`ArrowNet.Bridge`): `IArrowCollectorTableFunction` (`SchemaName`/`Name`/`InputSchema`/
@@ -156,20 +157,23 @@ DuckDB's external-sort/aggregate spill applies to its *own* operators, not to a 
 collector that must bound memory would have to spill in C# (out of scope; the streaming exchange is the
 bounded-memory path by design).
 
-## Build sketch (when motivated)
+## Build (done)
 
-1. C# `IArrowCollectorTableFunction`/`IArrowCollectorBinding` + `StaticCollectorFunction`; classify in
-   `InOutBind`; register a demo (`cf_collect` — e.g. emit input row count + a fold) with no SQL object.
-2. C++ Sink+Source operator; route `kind='collector'` registration to it (additive `kind`, no ABI bump).
-3. Reuse `inout_bind`/`inout_exchange_open`/`inout_bind_close` verbatim.
-4. **Migrate `daxevaltable` to the collector** (drops its single-chunk cap) — the proof-of-value.
-5. Tests: a multi-chunk collector (proves >2048-row input), a **sequential-UNION** input case (the schedule
-   that catches premature-finish — must see *all* branches before emit), a cost-arg-dependent output schema,
-   and a re-run of `verify_dax` for `daxevaltable`.
+1. C# `IArrowCollectorTableFunction`/`IArrowCollectorBinding` + `StaticCollectorFunction`; classified in
+   `InOutBind`; demo `cf_collect` (no SQL object). **DONE.**
+2. C++ Sink+Source operator; `kind='collector'` registration routed to it (additive `kind`, no ABI bump). **DONE.**
+3. Reuse `inout_bind`/`inout_exchange_open`/`inout_bind_close` verbatim. **DONE.**
+4. **Migrated `daxevaltable` to the collector** (dropped its single-chunk cap). **DONE** — `daxevaltable` is now
+   `kind='collector'`, `DaxEvalTableBinding : IArrowCollectorBinding` reads the whole input into one DATATABLE
+   and evaluates once; validated live against Power BI Desktop with a 5000-row injected table (was capped at
+   2048). `daxeach` stays a streaming `kind='inout'` (per-row).
+5. Tests: `verify_collector.test` (40 — whole-table total, 5000-row multi-chunk, **sequential-UNION at
+   threads=1** catching premature-finish, empty, NULLs, prepared re-exec) + `verify_dax.test` (29, incl. the
+   5000-row daxevaltable). **DONE.**
 
-## Recommendation
+## Remaining (future, on demand)
 
-Build **on demand** — when a real whole-table need lands (lifting the `daxevaltable` cap, a sort/dedup-the-input
-function, or the `apply_tmdl_agg`-style table-valued collector). It's a contained addition (1 C# interface + 1
-C++ operator + 1 additive `kind`, no ABI bump, streaming exchange untouched), and it slots cleanly beside the
-streaming exchange as the second of the two table-in-out execution shapes.
+The collector scaffold is now reusable for other whole-table needs as they arise: a sort/dedup-the-input
+function, or the **`apply_tmdl_agg`-style** table-valued collector (collect TMDL fragments → one atomic apply at
+Finalize, the effect-once safety this shape gives). Build those when motivated — each is a new
+`IArrowCollectorTableFunction` (or DAX/SqlServer binding), no C++/ABI change.
