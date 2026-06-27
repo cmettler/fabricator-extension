@@ -72,6 +72,56 @@ This alone makes a Delta lakehouse a read+append target via the SQL surface — 
 DirectLake-write idea in [docs/dax-provider.md](dax-provider.md): write the warehouse via SQL, the lakehouse
 via this Delta catalog).
 
+## Scan, data-skipping, and dynamic filters
+
+engineered-wood does stats-driven skipping, but at different levels — and there's one plumbing gap + one
+runtime-filter opportunity worth recording.
+
+**File-level skipping — works (wired into the read scan).** `DeltaTable.ReadAllAsync(columns, filter)` builds a
+`DeltaFilePruner` and drops each `add` file whose stats prove no match —
+`StatisticsEvaluator.Evaluate(filter, stats, accessor) != AlwaysFalse` (`DeltaFilePruner.cs:37-44`) over the
+Delta `add`-action **per-file column stats** (`MinValues`/`MaxValues`/`NullCount`/`NumRecords`) **+ partition
+values**. So if we pass our predicate (`FilterNode → engineered-wood Predicate`) to `ReadAllAsync`, whole files
+are pruned before any page is read — the big lever on partitioned/clustered tables.
+
+**Row-group + bloom skipping — capability exists, NOT engaged for the Delta query filter (a plumbing gap).**
+`ParquetFileReader.ReadAllAsync` can skip row groups when `_options.Filter` is set —
+`StatisticsEvaluator.Evaluate(filter, RowGroups[i], accessor)` → skip `AlwaysFalse`, with an optional bloom
+check on `Unknown` (`ParquetFileReader.cs:187-205`). **But** the Delta layer's `ReadFileAsync` opens the reader
+with the *table-level* `_options.ParquetReadOptions` (`DeltaTable.cs:1086-1087`) and uses the per-query `filter`
+only for the file-level pruner — so within an included file **every row group is read**. Closing this is a
+small engineered-wood change: thread the per-query filter into the parquet reader's options inside
+`ReadFileAsync` (the evaluator + bloom code is already there). Worth it for big files / selective predicates.
+Correctness is unaffected either way — our pushdown never erases and DuckDB re-applies every predicate above the
+scan; this is purely I/O+decode avoidance.
+
+**Dynamic filters (join / TopN) — applicable via the live `TableFilterSet`.** The high-value case for a Delta
+fact table is a *join* with no static predicate on the fact (`SELECT … FROM delta_fact f JOIN small_dim d ON
+f.k = d.k`): at runtime DuckDB's **join-filter-pushdown** (`join_filter_pushdown.hpp`) has the hash-join build
+side (the small dim) compute a min/max (and sometimes an IN set) over the key and attach it to the probe-side
+scan as a **dynamic `TableFilter`** (TopN does the same with a threshold). These reach a table-function scan via
+`TableFunctionInitInput.filters` (`optional_ptr<TableFilterSet>`, `table_function.hpp:144`) — the *live* set,
+which for a hash-join probe is **resolved by the time the probe-side scan executes** (build completes first).
+
+The hook: our static pushdown runs at bind (`pushdown_complex_filter` → `FilterNode`), *before* dynamic filters
+exist. To use them, the Delta scan reads `init.filters` at **execute time** (`init_global` / the per-execution
+stream factory), translates the resolved dynamic `ConstantFilter`/min-max (and IN) for the relevant columns
+into our `FilterNode`/`Predicate`, **merges it with the static predicate**, and hands the combined predicate to
+`ReadAllAsync` for file pruning (and, once the gap above is closed, row-group pruning). A min/max dynamic filter
+maps exactly onto what `DeltaFilePruner` already evaluates against `MinValues`/`MaxValues`, so star-schema
+queries skip files whose key-range doesn't overlap the dim — a big win with no static WHERE.
+
+A nice property of the Delta scan specifically: it **iterates files in a C# loop**, so it can **re-read the
+(updating) dynamic filter set before opening each file** — catching late-resolving filters and giving per-file
+late-binding skipping, rather than snapshotting once at init. Dynamic filters are always safe
+over-approximations (min/max), so this never drops rows, and DuckDB re-applies above the scan regardless.
+
+**Caveat / to verify:** whether DuckDB's join-filter-pushdown optimizer actually *targets* our catalog scan
+(it's designed for base-table scans that support filter pushdown + report stats — which our catalog tables do;
+the Delta catalog would need to present the same way). Confirm the dynamic filter reaches
+`TableFunctionInitInput.filters` for a Delta catalog scan before relying on it. This is additive on top of the
+static file-pruning slice — build static first, add dynamic when the join-skipping win is wanted.
+
 ## The one real design decision — DELETE / UPDATE: rowid vs predicate
 
 Our existing DML is **rowid-driven**: DuckDB scans with the filter, collects the **rowids** of matching rows,

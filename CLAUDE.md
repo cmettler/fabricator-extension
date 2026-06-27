@@ -1015,7 +1015,12 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   real decision is DELETE/UPDATE = rowid→deletion-vector (fits our rowid DML, needs an engineered-wood
   position-delete) vs predicate (`FilterNode`→engineered-wood `Predicate` via its Arrow row evaluator — clean,
   gap-free in that direction); UPDATE-SET evaluation + Delta's per-commit (non-cross-table-ACID) semantics are
-  the caveats. v40 = filesystem reverse-callback SPIKE/foundation: a new `ArrowNetHostServices`
+  the caveats. The note also records **scan data-skipping**: engineered-wood file-pruning (Delta `add` stats +
+  partition values) works once we pass the predicate; row-group/bloom skipping exists in its parquet reader but
+  isn't plumbed through the Delta filter path (small engineered-wood fix); and **dynamic (join/TopN) filters**
+  can be applied by reading the live `TableFilterSet` (`TableFunctionInitInput.filters`) at execute time +
+  merging into the predicate — the Delta scan's per-file C# loop even lets it re-check before each file. v40 =
+  filesystem reverse-callback SPIKE/foundation: a new `ArrowNetHostServices`
   struct (host→managed function pointers: `fs_open_read`/`fs_size`/`fs_read`/`fs_close`/`free_str`) is passed
   to `Bootstrap.Initialize(vtable, size, host)` so the managed side can call back into DuckDB's `FileSystem`
   (secret-backed remote IO via DuckDB), plus an `fs_spike` vtable entry + `arrownet_fs_spike(path)` table fn
