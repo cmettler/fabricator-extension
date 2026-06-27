@@ -234,7 +234,11 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   (empty for cf_tag → unchanged) + `ArrowNetExchangeBind` marshals supplied named params into `inout_bind`
   args, else nullptr (`_each` unchanged); no ABI bump. Whole-table op, but the exchange has no emit-at-end
   hook [finalize drain discards trailing output], so input must be a **single chunk ≤2048 rows** — for a
-  small parameter/lookup table; larger errors. In-out regression green: custom 85 / table_inout 63 /
+  small parameter/lookup table; larger errors. **The clean lift for this cap is the deferred
+  [collector table-in-out](docs/inout-collector-mode.md)** — a second in-out execution shape (a Sink+Source
+  **pipeline breaker**: collect all input, emit at input-EOF) that coexists with the streaming exchange, picked
+  by a new additive `kind='collector'`; reuses the v28 `inout_bind`/`inout_exchange_open` ABI as-is (no bump),
+  adds a C# `IArrowCollectorTableFunction` + one C++ operator. In-out regression green: custom 85 / table_inout 63 /
   proc_inout 31 / isolation 17) + **`daxeach(<input>, expression := …)` in-out** (slice 5b — per-input-row
   ADOMD `@<col>` param binding, output = the DAX result per row, no echo; `DaxEachBinding` reuses one
   conn+command across rows, emits per chunk so NO input-size limit; the "each" analog of the SQL `_each`,
