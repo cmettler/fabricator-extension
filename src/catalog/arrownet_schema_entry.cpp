@@ -16,8 +16,6 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/blob.hpp"
-#include "duckdb/common/types/column/column_data_collection.hpp"
-#include "duckdb/common/types/column/column_data_scan_states.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/execution/execution_context.hpp"
@@ -1296,49 +1294,39 @@ struct ArrowNetExchangeFinalizeOperator : public LogicalExtensionOperator {
 
 // =============================================================================
 // COLLECTOR table-in-out (pipeline breaker). The second in-out execution shape (alongside the streaming
-// exchange above): a Sink+Source operator that buffers ALL input, then (once, after all branches) hands the
-// complete input to C# in ONE inout_exchange_open call and materializes the output, which the Source emits.
-// Right for whole-table transforms (output depends on all input). Reuses the inout_bind / inout_exchange_open
-// ABI verbatim — only the OPERATOR differs (no gate, no per-chunk sentinel; the C# input stream is a plain
-// buffered producer, so the binding reads all input before yielding). See docs/inout-collector-mode.md.
+// exchange above): a Sink+Source operator that buffers ALL input, then (once, after all branches) opens the
+// exchange and STREAMS the output (the Source pulls the C# output one vector-slice at a time — no output
+// materialization). Right for whole-table transforms (output depends on all input). Reuses the inout_bind /
+// inout_exchange_open ABI verbatim — only the OPERATOR differs (no gate, no per-chunk sentinel; the C# input
+// stream is a plain buffered producer, so the binding reads all input before yielding). Input is fully
+// buffered (inherent); output is streamed. See docs/inout-collector-mode.md.
 // =============================================================================
 
-struct ArrowNetCollectorGlobalState;
-
-// Refcounted, on the bind data (survives prepared re-executions). Owns the bound binding handle (freed once via
-// inout_bind_close), the per-execution input source (via `active`), and the materialized output (survives the
-// sink->source boundary, so the Source reads it here, NOT from the in-out's global state).
+// Refcounted, on the bind data. Survives prepared re-executions AND the sink->source boundary, so it owns
+// everything the Source needs: the bound binding handle (freed via inout_bind_close), the per-execution input
+// buffer (ALL input, as Arrow — the in-out Execute appends to it during the sink phase), and the C# output
+// stream reader (opened at Finalize, pulled LAZILY by the Source). The input producer lives HERE (not in the
+// in-out global state) because C# reads it only on the first Source pull — by which point the in-out's global
+// state may already be gone; the holder outlives both phases.
 struct CollectorHolder {
 	mutex lock;
 	ArrowNetHandle binding = nullptr;
-	vector<LogicalType> output_types;              // the collector's full output columns (resolved at bind)
-	ArrowNetCollectorGlobalState *active = nullptr; // current execution's buffered input (set at init_global)
-	bool finalized = false;                        // per execution; reset at init_global
-	duckdb::unique_ptr<ColumnDataCollection> output; // materialized at Finalize, scanned by the Source
+	vector<LogicalType> input_types; // input table columns (set at bind; for the producer + Execute appender)
+	vector<string> input_names;
+	ClientProperties props;          // boundary props for the input producer (set at init_global)
+	// per-execution (reset at init_global):
+	duckdb::unique_ptr<arrownet::ArrowProducer> input_producer; // ALL input buffered here; drained by C# lazily
+	bool opened = false;                                        // exchange opened (Finalize ran)
+	duckdb::unique_ptr<arrownet::ArrowStreamReader> reader;     // C# output stream; Source pulls vector-slices
+	bool source_done = false;
 	~CollectorHolder();
-	void Finalize(ClientContext &context); // single all-input-done: run the exchange + materialize the output
+	void OpenExchange(ClientContext &context); // single all-input-done: Finish input + open exchange (keep reader)
 };
 
-// Per-execution input buffer for the collector. The in-out Execute appends each input chunk (as Arrow) to
-// `input_producer`; Finalize streams it to C#. holder->active points here for the duration of the sink phase.
+// Trivial per-execution state. Its init (ArrowNetCollectorInitGlobal) resets the holder's per-execution buffer.
 struct ArrowNetCollectorGlobalState : public GlobalTableFunctionState {
-	duckdb::unique_ptr<arrownet::ArrowProducer> input_producer;
-	vector<LogicalType> input_types;
-	vector<string> input_names;
-	ClientProperties props;
-	CollectorHolder *holder = nullptr;
-
 	idx_t MaxThreads() const override {
 		return 1;
-	}
-
-	~ArrowNetCollectorGlobalState() override {
-		if (holder) {
-			lock_guard<mutex> guard(holder->lock);
-			if (holder->active == this) {
-				holder->active = nullptr;
-			}
-		}
 	}
 };
 
@@ -1347,51 +1335,43 @@ struct ArrowNetCollectorBindData : public TableFunctionData {
 	ArrowNetHandle handle = nullptr;
 	string schema;
 	string func;
-	vector<LogicalType> input_types;
-	vector<string> input_names;
 	shared_ptr<CollectorHolder> holder;
 };
 
 struct ArrowNetCollectorLocalState : public LocalTableFunctionState {};
 
 CollectorHolder::~CollectorHolder() {
+	// Release the output reader FIRST (its C# dispose releases the imported input stream, which points at the
+	// producer), THEN the producer, THEN the binding.
+	reader.reset();
+	input_producer.reset();
 	if (binding) {
 		arrownet::InOutBindClose(binding); // best-effort; swallows errors
 		binding = nullptr;
 	}
 }
 
-void CollectorHolder::Finalize(ClientContext &context) {
+void CollectorHolder::OpenExchange(ClientContext &context) {
 	lock_guard<mutex> guard(lock);
-	if (finalized) {
+	if (opened) {
 		return;
 	}
-	finalized = true;
+	opened = true;
 	// Read-only / custom collectors don't touch DuckDB's write transaction; set a null active txn for
-	// consistency (a future SQL-backed collector opening a connection in DoExchange would pick it up).
+	// consistency (a future SQL-backed collector opening a connection in Collect would pick it up).
 	ArrowNetSetActiveTxn(nullptr, context);
-	if (!active) {
-		// The input pipeline never ran (e.g. an empty plan) — emit no rows.
-		output = make_uniq<ColumnDataCollection>(Allocator::Get(context), output_types);
-		return;
+	if (!input_producer) {
+		return; // input pipeline never ran (empty plan) — the Source sees no reader => FINISHED (no rows)
 	}
-	active->input_producer->Finish(); // no more input batches
+	input_producer->Finish(); // no more input batches
 	ArrowArrayStream out_stream;
 	std::memset(&out_stream, 0, sizeof(out_stream));
-	// Hand the COMPLETE buffered input to C# in one call; C# Collect reads it all, then yields the output.
-	arrownet::InOutExchangeOpen(binding, *active->input_producer->Stream(), out_stream);
-	arrownet::ArrowStreamReader reader(context, out_stream);
-	output = make_uniq<ColumnDataCollection>(Allocator::Get(context), reader.Types());
-	DataChunk chunk;
-	chunk.Initialize(Allocator::Get(context), reader.Types());
-	while (true) {
-		chunk.Reset();
-		reader.Read(chunk); // a collector yields no sentinels; Read returns size 0 at end
-		if (chunk.size() == 0) {
-			break;
-		}
-		output->Append(chunk);
-	}
+	// Open the exchange: C# Collect is wired up but LAZY — it doesn't read the (now fully buffered) input until
+	// the Source pulls the first output batch. The Source then drains `reader` one vector-slice at a time, so
+	// the output is STREAMED (never materialized). The reader holds `context` by reference (the query context,
+	// valid through the source phase).
+	arrownet::InOutExchangeOpen(binding, *input_producer->Stream(), out_stream);
+	reader = make_uniq<arrownet::ArrowStreamReader>(context, out_stream);
 }
 
 // Bind: resolve the binding + its full output schema via inout_bind (identical to the streaming exchange bind,
@@ -1405,15 +1385,16 @@ unique_ptr<FunctionData> ArrowNetCollectorBind(ClientContext &context, TableFunc
 	bind_data->schema = info.schema;
 	bind_data->func = info.func;
 	bind_data->holder = make_shared_ptr<CollectorHolder>();
+	auto &holder = *bind_data->holder;
 	for (idx_t i = 0; i < input.input_table_types.size(); i++) {
-		bind_data->input_types.push_back(input.input_table_types[i]);
-		bind_data->input_names.push_back(input.input_table_names[i]);
+		holder.input_types.push_back(input.input_table_types[i]);
+		holder.input_names.push_back(input.input_table_names[i]);
 	}
 
 	auto props = arrownet::BoundaryClientProperties(context);
 	ArrowSchema input_schema;
 	std::memset(&input_schema, 0, sizeof(input_schema));
-	ArrowConverter::ToArrowSchema(&input_schema, bind_data->input_types, bind_data->input_names, props);
+	ArrowConverter::ToArrowSchema(&input_schema, holder.input_types, holder.input_names, props);
 
 	// Marshal supplied constant args (named parameters) into a 1-row Arrow stream (else null). Same as the
 	// streaming exchange bind.
@@ -1473,26 +1454,23 @@ unique_ptr<FunctionData> ArrowNetCollectorBind(ClientContext &context, TableFunc
 		names.push_back(child.name ? string(child.name) : "column" + to_string(i));
 		return_types.push_back(arrow_table.GetColumns().at((idx_t)i)->GetDuckType());
 	}
-	bind_data->holder->output_types = return_types;
 	return std::move(bind_data);
 }
 
 unique_ptr<GlobalTableFunctionState> ArrowNetCollectorInitGlobal(ClientContext &context,
                                                                 TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->Cast<ArrowNetCollectorBindData>();
-	auto gstate = make_uniq<ArrowNetCollectorGlobalState>();
-	gstate->props = arrownet::BoundaryClientProperties(context);
-	gstate->input_types = bind.input_types;
-	gstate->input_names = bind.input_names;
-	gstate->holder = bind.holder.get();
-	gstate->input_producer =
-	    make_uniq<arrownet::ArrowProducer>(gstate->input_types, gstate->input_names, gstate->props);
-	// Reset per-execution holder state (a prepared statement may re-execute on the shared holder).
-	lock_guard<mutex> guard(bind.holder->lock);
-	bind.holder->finalized = false;
-	bind.holder->output.reset();
-	bind.holder->active = gstate.get();
-	return std::move(gstate);
+	auto &holder = *bind.holder;
+	// Reset per-execution holder state (a prepared statement may re-execute on the shared holder). Release the
+	// prior reader FIRST (its C# dispose releases the prior producer's exported stream) before replacing the
+	// producer with a fresh one for this execution.
+	lock_guard<mutex> guard(holder.lock);
+	holder.reader.reset();
+	holder.opened = false;
+	holder.source_done = false;
+	holder.props = arrownet::BoundaryClientProperties(context);
+	holder.input_producer = make_uniq<arrownet::ArrowProducer>(holder.input_types, holder.input_names, holder.props);
+	return make_uniq<ArrowNetCollectorGlobalState>();
 }
 
 unique_ptr<LocalTableFunctionState> ArrowNetCollectorInitLocal(ExecutionContext &, TableFunctionInitInput &,
@@ -1504,27 +1482,28 @@ unique_ptr<LocalTableFunctionState> ArrowNetCollectorInitLocal(ExecutionContext 
 // by the injected Sink+Source wrapper after ALL input is collected.
 OperatorResultType ArrowNetCollectorFunction(ExecutionContext &context, TableFunctionInput &data, DataChunk &input,
                                              DataChunk &output) {
-	auto &g = data.global_state->Cast<ArrowNetCollectorGlobalState>();
+	auto &holder = *data.bind_data->Cast<ArrowNetCollectorBindData>().holder;
 	if (input.size() > 0) {
-		auto ext = ArrowTypeExtensionData::GetExtensionTypes(context.client, g.input_types);
-		ArrowAppender appender(g.input_types, input.size(), g.props, ext);
+		// holder.input_producer + holder.props are set at init_global (before any Execute) and are stable for
+		// the execution; AddBatch is internally mutex-guarded, so parallel-branch appends are safe lock-free.
+		auto ext = ArrowTypeExtensionData::GetExtensionTypes(context.client, holder.input_types);
+		ArrowAppender appender(holder.input_types, input.size(), holder.props, ext);
 		appender.Append(input, 0, input.size(), input.size());
-		g.input_producer->AddBatch(appender.Finalize()); // ArrowProducer::AddBatch is internally mutex-guarded
+		holder.input_producer->AddBatch(appender.Finalize());
 	}
 	output.SetCardinality(0);
 	return OperatorResultType::NEED_MORE_INPUT;
 }
 
-// Source scan state over the materialized output collection (single-threaded — base MaxThreads()==1).
+// Source state — single-threaded (base MaxThreads()==1); the lock guards the lazy reader pull.
 class ArrowNetCollectorSourceState : public GlobalSourceState {
 public:
 	mutex lock;
-	ColumnDataScanState scan;
-	bool initialized = false;
 };
 
 // The pipeline-breaker operator: Sink consumes the (empty) in-out output (just to get the single
-// all-branches-done Finalize), Finalize runs the exchange + materializes the collected output, Source emits it.
+// all-branches-done Finalize); Finalize opens the exchange; the Source STREAMS the C# output (pulls the reader
+// one vector-slice at a time — no materialization).
 class ArrowNetCollectorPhysical : public PhysicalOperator {
 public:
 	ArrowNetCollectorPhysical(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
@@ -1549,11 +1528,11 @@ public:
 		return SinkResultType::NEED_MORE_INPUT;
 	}
 	SinkFinalizeType Finalize(Pipeline &, Event &, ClientContext &context, OperatorSinkFinalizeInput &) const override {
-		holder->Finalize(context); // single, all-branches-done: run the exchange + materialize the output
+		holder->OpenExchange(context); // single, all-branches-done: open the exchange (the Source streams it)
 		return SinkFinalizeType::READY;
 	}
 
-	// ---- Source (emit the materialized output) ----
+	// ---- Source (STREAM the C# output — pull the reader one vector-slice at a time) ----
 	bool IsSource() const override {
 		return true;
 	}
@@ -1562,16 +1541,27 @@ public:
 	}
 	SourceResultType GetDataInternal(ExecutionContext &, DataChunk &chunk, OperatorSourceInput &input) const override {
 		auto &gstate = input.global_state.Cast<ArrowNetCollectorSourceState>();
-		if (!holder->output) {
+		lock_guard<mutex> guard(gstate.lock); // single-stream reader; MaxThreads()==1 but guard anyway
+		if (!holder->reader || holder->source_done) {
 			return SourceResultType::FINISHED;
 		}
-		lock_guard<mutex> guard(gstate.lock);
-		if (!gstate.initialized) {
-			holder->output->InitializeScan(gstate.scan);
-			gstate.initialized = true;
+		// Drain a pending array first (one C# output batch may exceed STANDARD_VECTOR_SIZE).
+		if (holder->reader->HasPending()) {
+			holder->reader->Drain(chunk);
+			return SourceResultType::HAVE_MORE_OUTPUT;
 		}
-		holder->output->Scan(gstate.scan, chunk);
-		return chunk.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
+		while (true) {
+			auto pr = holder->reader->Pull();
+			if (pr == arrownet::ArrowStreamReader::PullResult::END) {
+				holder->source_done = true;
+				return SourceResultType::FINISHED;
+			}
+			if (pr == arrownet::ArrowStreamReader::PullResult::SENTINEL) {
+				continue; // a collector yields no sentinels, but tolerate (skip empty) for robustness
+			}
+			holder->reader->Drain(chunk);
+			return SourceResultType::HAVE_MORE_OUTPUT;
+		}
 	}
 };
 

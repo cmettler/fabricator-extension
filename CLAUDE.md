@@ -240,10 +240,12 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   streaming exchange, picked by a new additive `kind='collector'`; reuses the v28
   `inout_bind`/`inout_exchange_open` ABI as-is (no bump). C# `IArrowCollectorTableFunction`/
   `IArrowCollectorBinding` (+ `StaticCollectorFunction` base, the `CollectorInOutBinding` adapter); C++
-  `ArrowNetCollector*` (in-out `Execute` buffers input into an `ArrowProducer`; the injected
-  `ArrowNetCollectorPhysical` Sink+Source materializes the C# output into a `ColumnDataCollection` at Finalize +
-  scans it). SqlServer demo `dbo.cf_collect` (`test/verify_collector.test`, 40 — whole-table total, 5000-row
-  multi-chunk, sequential-UNION threads=1, empty, NULLs, prepared re-exec). **`daxevaltable` migrated onto it**
+  `ArrowNetCollector*` (in-out `Execute` buffers input into an `ArrowProducer` on the refcounted holder; the
+  injected `ArrowNetCollectorPhysical` Sink+Source opens the exchange at Finalize and **streams** the C# output
+  — the Source pulls the `ArrowStreamReader` a vector-slice at a time, so **input is fully buffered (inherent)
+  but output is never materialized**). SqlServer demo `dbo.cf_collect` (`test/verify_collector.test`, 40 —
+  whole-table total, 5000-row multi-chunk, sequential-UNION threads=1, empty, NULLs, prepared re-exec; +50k-row
+  streamed-output smoke). **`daxevaltable` migrated onto it**
   (`DaxEvalTableBinding : IArrowCollectorBinding`, `kind='collector'`; reads the whole input into one DATATABLE
   → no 2048 cap; `daxeach` stays streaming `inout`) — validated live against Power BI Desktop
   (`test/verify_dax.test`, 29). In-out regression green: custom 89 / table_inout 63 /

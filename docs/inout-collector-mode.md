@@ -16,14 +16,21 @@
 >   `inout_bind`/`inout_exchange_open` marshaling + `InOutExchangeStream` pump **with no ABI change**. Registry
 >   `CustomCollector`; `InOutBind` checks it first; `FunctionsMetadataSql` emits `kind='collector'`.
 > - **C++** (`arrownet_schema_entry.cpp`): a dedicated `ArrowNetCollector*` operator — the in-out `Execute`
->   buffers each input chunk into an `arrownet::ArrowProducer` (held in the per-execution global state, pointed
->   at by a refcounted `CollectorHolder`) and emits 0 rows; the injected `ArrowNetCollectorPhysical` is a real
->   **Sink+Source** (`IsSink`+`IsSource`) whose `Finalize` (once, all-branches-done) calls `inout_exchange_open`
->   over the complete buffered input + materializes the C# output into a `ColumnDataCollection`, and whose
->   `GetDataInternal` scans it. `WrapArrowNetInOutNodes` routes a collector `LogicalGet` (identified by
->   `in_out_function == ArrowNetCollectorFunction`) to this wrapper; the streaming exchange path is unchanged.
->   `kind='collector'` is additive (no ABI bump). Registration: `AddCollectorFunction` /
->   `custom_collector_functions_` / `GetOrCreateCustomCollectorFunction`.
+>   buffers each input chunk into an `arrownet::ArrowProducer` (held on the refcounted `CollectorHolder`, which
+>   outlives both phases) and emits 0 rows; the injected `ArrowNetCollectorPhysical` is a real **Sink+Source**
+>   (`IsSink`+`IsSource`) whose `Finalize` (once, all-branches-done) calls `inout_exchange_open` over the
+>   complete buffered input, and whose `GetDataInternal` **streams** the C# output — pulling the
+>   `ArrowStreamReader` one vector-slice at a time (`Pull`/`HasPending`/`Drain`), so the output is **never
+>   materialized**. `WrapArrowNetInOutNodes` routes a collector `LogicalGet` (identified by `in_out_function ==
+>   ArrowNetCollectorFunction`) to this wrapper; the streaming exchange path is unchanged. `kind='collector'` is
+>   additive (no ABI bump). Registration: `AddCollectorFunction` / `custom_collector_functions_` /
+>   `GetOrCreateCustomCollectorFunction`.
+> - **Input buffered, output streamed.** Input is fully buffered before `Collect` runs (inherent — a collector
+>   must see all input; `Collect` reads the already-complete `ArrowProducer` queue, popping each batch as it
+>   goes). Output is pulled lazily by the Source, so only ~1 output batch is in flight — matters for collectors
+>   whose result is large (e.g. a `daxevaltable` whose `EVALUATE` returns many rows). The C# `Collect`
+>   enumerator + any SQL/DAX result reader stay alive across the source phase (held via the holder); the holder
+>   destructor releases the reader before the producer so the C# input-stream dispose never dangles.
 
 ## Motivation
 
@@ -49,7 +56,7 @@ scaffold built for exactly that (Sink + Source), not on the streaming operator.
 |---|---|---|
 | Output timing | interleaved with input, per chunk | nothing until input EOF, then all of it |
 | DuckDB shape | `in_out_function` **Operator** + gate + per-chunk length-0 sentinel | **Sink + Source** pipeline breaker |
-| Memory | bounded (≤1 batch in flight) | **unbounded** (buffers input/output — inherent) |
+| Memory | bounded (≤1 batch in flight) | **input fully buffered** (inherent); output streamed (≤1 batch) |
 | Author API | `DoExchange(input)→output`, author yields sentinels | `Collect(allInput)→output`, **no sentinel** |
 | Fits | high-fan-out `_each` (CROSS APPLY / per-row EXEC) | whole-table: DATATABLE inject, lookup, sort/dedup, fragment-collect |
 
@@ -150,12 +157,13 @@ exchange's, not more complex.
 
 ## Cost / trade-off (inherent, not incidental)
 
-It is a **pipeline breaker** — it buffers all input (or all output) with **no streaming memory bound**. That is
-the definition of "see all input before any output," not a flaw to engineer away. Right for parameter/lookup
-tables, model fragments, whole-table transforms; **wrong** for high-fan-out streaming (use the exchange there).
-DuckDB's external-sort/aggregate spill applies to its *own* operators, not to a C#-buffered collector — so a
-collector that must bound memory would have to spill in C# (out of scope; the streaming exchange is the
-bounded-memory path by design).
+It is a **pipeline breaker** on the INPUT — it buffers all input with **no streaming bound on the input side**.
+That is the definition of "see all input before any output," not a flaw to engineer away. (The **output** *is*
+streamed — the Source pulls the C# result one vector-slice at a time, so output peak is ~1 batch regardless of
+result size.) Right for parameter/lookup tables, model fragments, whole-table transforms; **wrong** for
+high-fan-out streaming (use the exchange there). The input buffer holds the full input as Arrow in C++
+(`ArrowProducer`), drained as C# consumes it; a collector that must also bound *input* memory would have to
+spill in C# (out of scope; the streaming exchange is the input-bounded path by design).
 
 ## Build (done)
 
