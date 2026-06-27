@@ -53,6 +53,12 @@ std::string FsSpike(ArrowNetHandle opener, const std::string &path);
 void DeltaSchema(ArrowNetHandle opener, const std::string &path, ArrowSchema &out);
 void DeltaScan(ArrowNetHandle opener, const std::string &path, ArrowArrayStream &out);
 
+// Ambient named-source registry (data-in by name). OpenNamedInput fills `out` with a fresh Arrow stream for
+// the registered source `name` (throws if none); NamedInputExists reports whether a source is registered
+// (used by the replacement scan; false if the bridge predates the entry). See arrownet_host_query.cpp.
+void OpenNamedInput(const std::string &name, ArrowArrayStream &out);
+bool NamedInputExists(const std::string &name);
+
 // -----------------------------------------------------------------------------
 // Convenience wrappers over the vtable. Each throws duckdb::IOException carrying
 // the managed error message (and releases it via free_error) on failure.

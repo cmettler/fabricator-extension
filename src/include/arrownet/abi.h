@@ -568,6 +568,18 @@ typedef struct ArrowNetVTable {
 	// delta_scan: open + read the Delta table at `path`, returning all record batches as *out (materialized
 	// in managed memory during this synchronous call — the opener need only stay valid until it returns).
 	int32_t (*delta_scan)(ArrowNetHandle opener, const char *path, struct ArrowArrayStream *out, char **err);
+
+	// -------------------------------------------------------------------------
+	// Ambient named-source registry (data-in by name). A managed component registers `name -> a fresh Arrow
+	// stream factory`; arrownet_scan(name) + the replacement scan resolve a referenced name to that stream.
+	// -------------------------------------------------------------------------
+	// open_named_input: fill *out with a FRESH Arrow stream for the registered source `name`. Errors (non-zero
+	// + *err) if no source is registered under that name. Each call produces a fresh stream (the registry
+	// holds a factory), so bind + execute can each open one.
+	int32_t (*open_named_input)(const char *name, struct ArrowArrayStream *out, char **err);
+	// named_input_exists: set *out_exists to 1 if a source is registered under `name`, else 0 (no stream
+	// produced). Used by the replacement scan to decide whether to rewrite a bare table name.
+	int32_t (*named_input_exists)(const char *name, int32_t *out_exists, char **err);
 } ArrowNetVTable;
 
 // -----------------------------------------------------------------------------
@@ -623,7 +635,7 @@ typedef struct ArrowNetHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 44
+#define ARROWNET_ABI_VERSION 45
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using Apache.Arrow;
 using Apache.Arrow.Ipc;
@@ -56,4 +57,23 @@ public static class Host
         }
         return batch.Column(0) is Int64Array c && c.GetValue(0) is long v ? v : 0;
     }
+
+    // ---- ambient named-source registry (data-in by name) -------------------------------------------------
+    // A managed component registers `name -> a factory producing a FRESH Arrow stream`; any host query (and,
+    // with the replacement-scan layer, any query) referencing that name resolves to it via arrownet_scan.
+    // The factory must yield a fresh stream per call (a stream is read once). Names are case-insensitive.
+    private static readonly ConcurrentDictionary<string, Func<IArrowArrayStream>> Sources =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Registers (or replaces) a named Arrow source. <paramref name="factory"/> is invoked per scan to
+    /// produce a fresh stream. Reference it as <c>arrownet_scan('name')</c> (or bare, with the replacement scan).</summary>
+    public static void RegisterSource(string name, Func<IArrowArrayStream> factory) => Sources[name] = factory;
+
+    /// <summary>Removes a named source. Returns true if it was registered.</summary>
+    public static bool UnregisterSource(string name) => Sources.TryRemove(name, out _);
+
+    internal static bool SourceExists(string name) => Sources.ContainsKey(name);
+
+    internal static IArrowArrayStream? OpenSource(string name) =>
+        Sources.TryGetValue(name, out var factory) ? factory() : null;
 }

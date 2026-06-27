@@ -34,3 +34,22 @@ true
 statement error
 SELECT * FROM arrownet_host_query('SELECT * FROM a_table_that_does_not_exist_xyz');
 ----
+
+# Ambient named-source registry: arrownet_scan(name) scans a source registered in C# (Host.RegisterSource).
+# `arrownet_demo_numbers` is a built-in demo source ([10,20,30]); no catalog/ATTACH needed.
+query I
+SELECT value FROM arrownet_scan('arrownet_demo_numbers') ORDER BY value;
+----
+10
+20
+30
+
+query I
+SELECT sum(value)::BIGINT FROM arrownet_scan('arrownet_demo_numbers');
+----
+60
+
+# An unregistered name errors clearly (not a silent empty result).
+statement error
+SELECT * FROM arrownet_scan('no_such_source_xyz');
+----

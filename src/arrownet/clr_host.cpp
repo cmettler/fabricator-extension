@@ -472,6 +472,32 @@ void ListSettings(ArrowArrayStream &out) {
 	}
 }
 
+void OpenNamedInput(const std::string &name, ArrowArrayStream &out) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.open_named_input) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide open_named_input");
+	}
+	char *err = nullptr;
+	int32_t rc = vt.open_named_input(name.c_str(), &out, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: open_named_input failed");
+	}
+}
+
+bool NamedInputExists(const std::string &name) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.named_input_exists) {
+		return false;
+	}
+	char *err = nullptr;
+	int32_t exists = 0;
+	int32_t rc = vt.named_input_exists(name.c_str(), &exists, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: named_input_exists failed");
+	}
+	return exists != 0;
+}
+
 void ListSecretFields(ArrowArrayStream &out) {
 	const ArrowNetVTable &vt = GetBridge();
 	if (!vt.list_secret_fields) {

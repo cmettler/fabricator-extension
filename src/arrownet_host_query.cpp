@@ -168,12 +168,29 @@ int32_t HostQueryService(const char *sql, ArrowArrayStream *params, ArrowNetHost
 	}
 }
 
+// arrownet_scan(name) — scan an ambient named source (registered in C# via Host.RegisterSource). The factory
+// asks the managed registry for a fresh stream by name (OpenNamedInput); reuses the arrow_ingest scan path.
+static unique_ptr<FunctionData> NamedScanBind(ClientContext &context, TableFunctionBindInput &input,
+                                              vector<LogicalType> &return_types, vector<string> &names) {
+	auto name = input.inputs[0].GetValue<string>();
+	auto bind_data = make_uniq<arrownet::ArrowStreamBindData>();
+	bind_data->factory = [name](const arrownet::ArrowScanRequest &, ArrowArrayStream &out) {
+		arrownet::OpenNamedInput(name, out);
+	};
+	arrownet::PopulateReturnSchema(context, *bind_data, return_types, names);
+	return std::move(bind_data);
+}
+
 void RegisterHostQuery(ExtensionLoader &loader) {
 	g_host_db = &loader.GetDatabaseInstance();
 	arrownet::SetHostQueryService(HostQueryService); // make host_query callable from C# (added to the host block)
 	TableFunction fn("arrownet_host_query", {LogicalType::VARCHAR}, arrownet::ArrowStreamScan, HostQueryBind,
 	                 arrownet::ArrowStreamInitGlobal, arrownet::ArrowStreamInitLocal);
 	loader.RegisterFunction(fn);
+
+	TableFunction scan("arrownet_scan", {LogicalType::VARCHAR}, arrownet::ArrowStreamScan, NamedScanBind,
+	                   arrownet::ArrowStreamInitGlobal, arrownet::ArrowStreamInitLocal);
+	loader.RegisterFunction(scan);
 }
 
 } // namespace duckdb

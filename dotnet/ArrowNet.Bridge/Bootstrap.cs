@@ -33,7 +33,18 @@ public static unsafe class Bootstrap
             HostFs.Set(*host);
         }
 
-        vtable->AbiVersion = 44;
+        // A built-in demo named source (data-in by name): query it as `arrownet_scan('arrownet_demo_numbers')`
+        // or, with the replacement scan, bare `FROM arrownet_demo_numbers`. Harmless; proves the registry.
+        Host.RegisterSource("arrownet_demo_numbers", () =>
+        {
+            var schema = new Apache.Arrow.Schema(
+                new[] { new Apache.Arrow.Field("value", Apache.Arrow.Types.Int64Type.Default, nullable: false) }, null);
+            var col = new Apache.Arrow.Int64Array.Builder().Append(10).Append(20).Append(30).Build();
+            var batch = new Apache.Arrow.RecordBatch(schema, new Apache.Arrow.IArrowArray[] { col }, 3);
+            return new InMemoryArrayStream(schema, new[] { batch });
+        });
+
+        vtable->AbiVersion = 45;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -83,6 +94,8 @@ public static unsafe class Bootstrap
         vtable->FsSpike = &FsSpike;
         vtable->DeltaSchema = &DeltaSchema;
         vtable->DeltaScan = &DeltaScan;
+        vtable->OpenNamedInput = &OpenNamedInput;
+        vtable->NamedInputExists = &NamedInputExists;
         return ArrowNetStatus.Ok;
     }
 
@@ -523,6 +536,49 @@ public static unsafe class Bootstrap
             // Materialize the whole table while the opener is valid (synchronous call).
             var stream = DeltaReader.Scan(opener, p);
             CArrowArrayStreamExporter.ExportArrayStream(stream, outStream);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    // Ambient named-source registry (data-in by name) — see Host.RegisterSource. open_named_input exports a
+    // fresh stream for the registered source (errors if none); named_input_exists reports registration.
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int OpenNamedInput(byte* name, CArrowArrayStream* outStream, byte** err)
+    {
+        try
+        {
+            if (outStream is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            var n = Marshal.PtrToStringUTF8((nint)name) ?? string.Empty;
+            var stream = Host.OpenSource(n)
+                         ?? throw new InvalidOperationException($"arrownet: no named source registered as '{n}'");
+            CArrowArrayStreamExporter.ExportArrayStream(stream, outStream);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int NamedInputExists(byte* name, int* outExists, byte** err)
+    {
+        try
+        {
+            var n = Marshal.PtrToStringUTF8((nint)name) ?? string.Empty;
+            if (outExists != null)
+            {
+                *outExists = Host.SourceExists(n) ? 1 : 0;
+            }
             return ArrowNetStatus.Ok;
         }
         catch (Exception ex)

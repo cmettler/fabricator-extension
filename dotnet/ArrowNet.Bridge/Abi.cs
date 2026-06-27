@@ -170,6 +170,11 @@ public unsafe struct ArrowNetVTable
     public delegate* unmanaged[Cdecl]<nint, byte*, CArrowSchema*, byte**, int> DeltaSchema;
     // int32 delta_scan(void* opener, const char* path, ArrowArrayStream* out, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte*, CArrowArrayStream*, byte**, int> DeltaScan;
+
+    // int32 open_named_input(const char* name, ArrowArrayStream* out, char** err) — fresh stream for a
+    // registered ambient source; int32 named_input_exists(const char* name, int32* out_exists, char** err).
+    public delegate* unmanaged[Cdecl]<byte*, CArrowArrayStream*, byte**, int> OpenNamedInput;
+    public delegate* unmanaged[Cdecl]<byte*, int*, byte**, int> NamedInputExists;
 }
 
 /// <summary>
