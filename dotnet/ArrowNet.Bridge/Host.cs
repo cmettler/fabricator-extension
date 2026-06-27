@@ -21,13 +21,25 @@ public static class Host
     public static IArrowArrayStream Query(string sql) => HostFs.Query(sql);
 
     /// <summary>
+    /// Runs <paramref name="sql"/> binding a 1-row <paramref name="parameters"/> batch positionally to the
+    /// statement's parameters (?, $1, …) via a prepared statement on a fresh host connection.
+    /// </summary>
+    public static IArrowArrayStream Query(string sql, RecordBatch parameters) => HostFs.Query(sql, parameters);
+
+    /// <summary>
     /// Runs <paramref name="sql"/> on a fresh host connection with C#-provided named Arrow <paramref name="inputs"/>
     /// registered as connection-scoped views first (data-in) — the SQL references them by name. The host
     /// consumes the input streams during the query. Lets a managed component push data into the host engine
     /// (join/filter/aggregate it with DuckDB) over Arrow. See docs/host-query.md.
     /// </summary>
     public static IArrowArrayStream Query(string sql, IReadOnlyList<(string Name, IArrowArrayStream Stream)> inputs)
-        => HostFs.Query(sql, inputs);
+        => HostFs.Query(sql, inputs: inputs);
+
+    /// <summary>Runs <paramref name="sql"/> with both positional <paramref name="parameters"/> and named Arrow
+    /// <paramref name="inputs"/> on a fresh host connection.</summary>
+    public static IArrowArrayStream Query(string sql, RecordBatch? parameters,
+                                          IReadOnlyList<(string Name, IArrowArrayStream Stream)>? inputs)
+        => HostFs.Query(sql, parameters, inputs);
 
     /// <summary>
     /// Runs a non-query statement (DDL / DML) on a fresh host connection and returns the affected-row count

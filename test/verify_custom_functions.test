@@ -53,6 +53,13 @@ SELECT cdb.dbo.cf_host_sum(0);
 ----
 10
 
+# dbo.cf_host_param binds a 1-row Arrow params batch [40, 2] POSITIONALLY into a host query
+# (SELECT (?::BIGINT)+(?::BIGINT)) via a prepared statement on a fresh host connection -> 42. host-query.md.
+query I
+SELECT cdb.dbo.cf_host_param(0);
+----
+42
+
 # It is discovered like any catalog function...
 query TTT
 SELECT schema_name, name, kind FROM mssql_net_functions('cdb') WHERE name = 'cf_add';

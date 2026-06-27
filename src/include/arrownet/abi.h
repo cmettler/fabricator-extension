@@ -612,18 +612,18 @@ typedef struct ArrowNetHostServices {
 	// in-flight one, which is non-reentrant) and return the result as an ArrowArrayStream in *out. Lets a
 	// managed component reuse the host engine (functions, readers, the catalog) over Arrow. Separate
 	// transaction => committed-reads semantics. The result stream (and its connection) is owned by the
-	// managed caller, which releases it when done. `inputs` (nullable) registers named Arrow sources as
-	// connection-scoped views before the query (data-in). See docs/host-query.md. (Parameter binding is a
-	// later addition.)
-	int32_t (*host_query)(const char *sql, struct ArrowNetHostInputs *inputs, struct ArrowArrayStream *out,
-	                      char **err);
+	// managed caller, which releases it when done. `params` (nullable) is a 1-row Arrow stream whose columns
+	// bind POSITIONALLY to the statement's parameters (?, $1, …) via a prepared statement. `inputs` (nullable)
+	// registers named Arrow sources as connection-scoped views before the query (data-in). See docs/host-query.md.
+	int32_t (*host_query)(const char *sql, struct ArrowArrayStream *params, struct ArrowNetHostInputs *inputs,
+	                      struct ArrowArrayStream *out, char **err);
 } ArrowNetHostServices;
 
 // Max serialized size of a spillable aggregate's per-group state (the inline, pointer-free
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 43
+#define ARROWNET_ABI_VERSION 44
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

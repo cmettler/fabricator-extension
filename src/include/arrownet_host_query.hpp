@@ -24,10 +24,12 @@ struct HostQueryInput {
 };
 
 // Runs `sql` on a fresh Connection over `db` and fills `out` with a self-owning ArrowArrayStream over the
-// result (the Connection + result live until `out` is released). Each `inputs` entry is registered as a
-// connection-scoped view (so the SQL can reference it by name) before the query. Throws on a query error.
-void MakeHostQueryStream(DatabaseInstance &db, const string &sql, const vector<HostQueryInput> &inputs,
-                         ArrowArrayStream &out);
+// result (the Connection + result live until `out` is released). When `params` is non-null it is a 1-row
+// Arrow stream whose columns bind positionally to the statement's parameters (via a prepared statement;
+// ownership is consumed here). Each `inputs` entry is registered as a connection-scoped view (so the SQL can
+// reference it by name) before the query. Throws on a query error.
+void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStream *params,
+                         const vector<HostQueryInput> &inputs, ArrowArrayStream &out);
 
 // Registers the `arrownet_host_query(VARCHAR)` table function.
 void RegisterHostQuery(ExtensionLoader &loader);

@@ -21,6 +21,7 @@ internal static class CustomFunctions
         new CfAddFunction(),
         new CfHostAnswerFunction(),
         new CfHostSumFunction(),
+        new CfHostParamFunction(),
     };
 
     public static readonly IReadOnlyList<IArrowTableFunction> Table = new IArrowTableFunction[]
@@ -539,6 +540,43 @@ internal sealed class CfHostSumFunction : IArrowScalarFunction
         for (int i = 0; i < args.Length; i++)
         {
             outb.Append(sum);
+        }
+        return outb.Build();
+    }
+}
+
+// Demo: dbo.cf_host_param(x) binds a 1-row Arrow params batch [40, 2] POSITIONALLY into a host query
+// (SELECT (?::BIGINT)+(?::BIGINT)) via a prepared statement on a fresh host connection -> 42. Proves
+// host_query parameter binding. host-query.md.
+internal sealed class CfHostParamFunction : IArrowScalarFunction
+{
+    public string SchemaName => "dbo";
+    public string Name => "cf_host_param";
+    public Schema Parameters => new(new[] { new Field("x", Int64Type.Default, nullable: true) }, metadata: null);
+    public Field Result => new("host_param", Int64Type.Default, nullable: false);
+
+    public IArrowArray Invoke(RecordBatch args)
+    {
+        var pschema = new Schema(new[]
+        {
+            new Field("p0", Int64Type.Default, nullable: false),
+            new Field("p1", Int64Type.Default, nullable: false),
+        }, metadata: null);
+        var p0 = new Int64Array.Builder().Append(40).Build();
+        var p1 = new Int64Array.Builder().Append(2).Build();
+        var paramBatch = new RecordBatch(pschema, new IArrowArray[] { p0, p1 }, 1);
+
+        long answer;
+        using (var result = Host.Query("SELECT (?::BIGINT) + (?::BIGINT) AS s", paramBatch))
+        {
+            var b = result.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult()
+                    ?? throw new InvalidOperationException("host_query returned no result");
+            answer = ((Int64Array)b.Column(0)).GetValue(0)!.Value; // 40 + 2 = 42
+        }
+        var outb = new Int64Array.Builder().Reserve(args.Length);
+        for (int i = 0; i < args.Length; i++)
+        {
+            outb.Append(answer);
         }
         return outb.Build();
     }

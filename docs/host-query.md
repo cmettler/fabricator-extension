@@ -114,9 +114,16 @@ ABI minimal. Both get parameter binding for free.
   registers each C#-provided stream as a connection-scoped view via `duckdb_arrow_scan` before the query.
   `Host.Query(sql, inputs)`. DONE; verified (`cf_host_sum` pushes a C# Arrow table into a host query and sums
   it on the host engine — `verify_custom_functions.test`).
-- **Deferred:** parameter binding (a 1-row Arrow param batch → prepared-statement bind) and the **ambient
-  replacement-scan layer** (a C# `name → Func<stream>` registry + a `DBConfig` replacement scan resolving bare
-  names to `arrownet_scan('name')`) — the scoped per-call inputs above cover the primary data-in need.
+- **Slice 4 — parameter binding (ABI v44)**: `host_query` gained a nullable `params` 1-row Arrow stream; the
+  host reads it via `ArrowStreamReader` and binds the columns POSITIONALLY (`?`, `$1`, …) to a prepared
+  statement (materialized result so it doesn't outlive the prepared stmt). `Host.Query(sql, parameters)`.
+  DONE; verified (`cf_host_param` binds `[40, 2]` into `SELECT (?::BIGINT)+(?::BIGINT)` → 42 —
+  `verify_custom_functions.test`). **Ownership note:** the host's `ArrowStreamReader` releases its *copy* of
+  the params stream, so the managed caller frees only its allocation (`Marshal.FreeHGlobal`), never
+  re-releasing (which would double-free the exporter → NRE).
+- **Deferred:** the **ambient replacement-scan layer** (a C# `name → Func<stream>` registry + a `DBConfig`
+  replacement scan resolving bare names to `arrownet_scan('name')`) — the scoped per-call inputs above cover
+  the primary data-in need.
 
 ## Open / deferred
 
