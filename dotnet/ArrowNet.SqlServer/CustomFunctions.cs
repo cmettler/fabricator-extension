@@ -51,6 +51,84 @@ internal static class CustomFunctions
         new CfSumSpillFunction(),
         new CfMedianFunction(),
     };
+
+    // Collector table-in-out functions (IArrowCollectorTableFunction), singletons — surfaced as
+    // `kind='collector'` and resolved by SqlServerCatalog.InOutBind on the Sink+Source pipeline-breaker
+    // operator (NOT the streaming exchange). A collector sees ALL input before emitting any output (whole-table
+    // semantics), so it can take arbitrarily many input chunks — unlike the streaming in-out. Pure C#.
+    public static readonly IReadOnlyList<IArrowCollectorTableFunction> Collector = new IArrowCollectorTableFunction[]
+    {
+        new CfCollectFunction(),
+    };
+}
+
+// Demo (COLLECTOR table-in-out): dbo.cf_collect(<table of n>) -> (n, total) — emits every input row paired
+// with the GLOBAL sum across ALL input rows. The total is only knowable after the whole input is seen, so this
+// proves the pipeline-breaker contract: Collect reads all input to EOF, THEN emits. It also emits one output
+// row per input row across as many chunks as needed (no single-chunk cap — the operator buffers all input).
+// FIXED output schema → derives from StaticCollectorFunction (just OutputSchema + Collect). Pure C#, no SQL.
+internal sealed class CfCollectFunction : StaticCollectorFunction
+{
+    public override string SchemaName => "dbo";
+    public override string Name => "cf_collect";
+
+    public override Schema InputSchema =>
+        new(new[] { new Field("n", Int32Type.Default, nullable: true) }, metadata: null);
+
+    public override Schema OutputSchema => new(new[]
+    {
+        new Field("n", Int32Type.Default, nullable: true),
+        new Field("total", Int64Type.Default, nullable: false),
+    }, metadata: null);
+
+    public override async IAsyncEnumerable<RecordBatch> Collect(
+        IAsyncEnumerable<RecordBatch> allInput, [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        // Phase 1 — collect EVERY input row (copy values out; the batch buffers are freed after we consume it).
+        var values = new List<int?>();
+        long total = 0;
+        await foreach (var chunk in allInput.WithCancellation(ct))
+        {
+            using (chunk)
+            {
+                var n = (Int32Array)chunk.Column(0);
+                for (int i = 0; i < chunk.Length; i++)
+                {
+                    if (n.IsNull(i))
+                    {
+                        values.Add(null);
+                    }
+                    else
+                    {
+                        values.Add(n.Values[i]);
+                        total += n.Values[i];
+                    }
+                }
+            }
+        }
+
+        // Phase 2 — only now (all input seen) emit each input n with the global total, in output-sized batches.
+        const int batchRows = 2048;
+        for (int off = 0; off < values.Count; off += batchRows)
+        {
+            int rows = Math.Min(batchRows, values.Count - off);
+            var nb = new Int32Array.Builder().Reserve(rows);
+            var tb = new Int64Array.Builder().Reserve(rows);
+            for (int i = 0; i < rows; i++)
+            {
+                if (values[off + i].HasValue)
+                {
+                    nb.Append(values[off + i]!.Value);
+                }
+                else
+                {
+                    nb.AppendNull();
+                }
+                tb.Append(total);
+            }
+            yield return new RecordBatch(OutputSchema, new IArrowArray[] { nb.Build(), tb.Build() }, rows);
+        }
+    }
 }
 
 // Demo (aggregate, NON-ADDITIVE / holistic): dbo.cf_median(x DOUBLE) -> DOUBLE. A holistic aggregate can't be

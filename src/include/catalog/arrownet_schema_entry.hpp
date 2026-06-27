@@ -48,6 +48,13 @@ public:
 	//! its output schema is the function's full declared schema (no input echo).
 	void AddInOutFunction(const string &func_name);
 
+	//! Registers a provider-authored custom COLLECTOR table-in-out function (`kind='collector'`): like
+	//! AddInOutFunction, a `{LogicalType::TABLE}`-parameter table function under the bare name, but routed
+	//! to the Sink+Source pipeline-breaker operator (buffers all input, then emits) instead of the streaming
+	//! exchange. For whole-table transforms whose output depends on the entire input. See
+	//! docs/inout-collector-mode.md.
+	void AddCollectorFunction(const string &func_name);
+
 	//! Registers a provider-authored custom aggregate function (4h): a UDAF exposed as a DuckDB
 	//! AggregateFunctionCatalogEntry so `db.schema.fn(args)` resolves wherever DuckDB allows an aggregate
 	//! (GROUP BY / parallel / OVER). Arg + return types are resolved lazily on first lookup. `spillable`
@@ -98,6 +105,9 @@ private:
 	//! Materializes a provider-authored custom table-in-out function (4g): a TABLE-parameter table
 	//! function whose output schema is the function's full declared schema (dispatched in C#).
 	optional_ptr<CatalogEntry> GetOrCreateCustomInOutFunction(ClientContext &context, const string &func_name);
+	//! Materializes a provider-authored custom COLLECTOR table-in-out function: a TABLE-parameter table
+	//! function routed to the Sink+Source pipeline-breaker operator (buffers all input, then emits).
+	optional_ptr<CatalogEntry> GetOrCreateCustomCollectorFunction(ClientContext &context, const string &func_name);
 	//! Materializes a custom aggregate (4h) as an AggregateFunctionCatalogEntry whose callbacks marshal
 	//! per-group int64 state ids + Arrow batches to the C# accumulator over the agg_* ABI.
 	optional_ptr<CatalogEntry> GetOrCreateAggregateFunction(ClientContext &context, const string &func_name);
@@ -108,6 +118,7 @@ private:
 	case_insensitive_map_t<bool> table_functions_; // table-returning routine name -> is_proc (TVF=false)
 	case_insensitive_map_t<string> inout_functions_; // synthetic `<base>_each` alias -> base TVF name (4g)
 	case_insensitive_set_t custom_inout_functions_;  // provider-authored custom table-in-out names (4g)
+	case_insensitive_set_t custom_collector_functions_; // provider-authored custom collector (pipeline-breaker) names
 	case_insensitive_map_t<bool> aggregate_functions_; // custom aggregate (UDAF) name -> spillable (4h)
 	mutex entry_lock_;
 	case_insensitive_map_t<unique_ptr<ArrowNetTableEntry>> entries_;

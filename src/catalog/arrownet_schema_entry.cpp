@@ -16,6 +16,8 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/blob.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
+#include "duckdb/common/types/column/column_data_scan_states.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/execution/execution_context.hpp"
@@ -87,6 +89,12 @@ void ArrowNetSchemaEntry::AddInOutFunction(const string &func_name) {
 	table_function_entries_.erase(func_name);
 }
 
+void ArrowNetSchemaEntry::AddCollectorFunction(const string &func_name) {
+	lock_guard<mutex> lock(entry_lock_);
+	custom_collector_functions_.insert(func_name);
+	table_function_entries_.erase(func_name);
+}
+
 void ArrowNetSchemaEntry::AddAggregateFunction(const string &func_name, bool spillable) {
 	lock_guard<mutex> lock(entry_lock_);
 	aggregate_functions_[func_name] = spillable;
@@ -103,6 +111,7 @@ void ArrowNetSchemaEntry::ClearTables() {
 	table_functions_.clear();
 	inout_functions_.clear();
 	custom_inout_functions_.clear();
+	custom_collector_functions_.clear();
 	aggregate_functions_.clear();
 	table_function_entries_.clear();
 	aggregate_function_entries_.clear();
@@ -1285,6 +1294,318 @@ struct ArrowNetExchangeFinalizeOperator : public LogicalExtensionOperator {
 	}
 };
 
+// =============================================================================
+// COLLECTOR table-in-out (pipeline breaker). The second in-out execution shape (alongside the streaming
+// exchange above): a Sink+Source operator that buffers ALL input, then (once, after all branches) hands the
+// complete input to C# in ONE inout_exchange_open call and materializes the output, which the Source emits.
+// Right for whole-table transforms (output depends on all input). Reuses the inout_bind / inout_exchange_open
+// ABI verbatim — only the OPERATOR differs (no gate, no per-chunk sentinel; the C# input stream is a plain
+// buffered producer, so the binding reads all input before yielding). See docs/inout-collector-mode.md.
+// =============================================================================
+
+struct ArrowNetCollectorGlobalState;
+
+// Refcounted, on the bind data (survives prepared re-executions). Owns the bound binding handle (freed once via
+// inout_bind_close), the per-execution input source (via `active`), and the materialized output (survives the
+// sink->source boundary, so the Source reads it here, NOT from the in-out's global state).
+struct CollectorHolder {
+	mutex lock;
+	ArrowNetHandle binding = nullptr;
+	vector<LogicalType> output_types;              // the collector's full output columns (resolved at bind)
+	ArrowNetCollectorGlobalState *active = nullptr; // current execution's buffered input (set at init_global)
+	bool finalized = false;                        // per execution; reset at init_global
+	duckdb::unique_ptr<ColumnDataCollection> output; // materialized at Finalize, scanned by the Source
+	~CollectorHolder();
+	void Finalize(ClientContext &context); // single all-input-done: run the exchange + materialize the output
+};
+
+// Per-execution input buffer for the collector. The in-out Execute appends each input chunk (as Arrow) to
+// `input_producer`; Finalize streams it to C#. holder->active points here for the duration of the sink phase.
+struct ArrowNetCollectorGlobalState : public GlobalTableFunctionState {
+	duckdb::unique_ptr<arrownet::ArrowProducer> input_producer;
+	vector<LogicalType> input_types;
+	vector<string> input_names;
+	ClientProperties props;
+	CollectorHolder *holder = nullptr;
+
+	idx_t MaxThreads() const override {
+		return 1;
+	}
+
+	~ArrowNetCollectorGlobalState() override {
+		if (holder) {
+			lock_guard<mutex> guard(holder->lock);
+			if (holder->active == this) {
+				holder->active = nullptr;
+			}
+		}
+	}
+};
+
+// Bind data (reused across prepared re-executions; the holder is shared, the binding bound once).
+struct ArrowNetCollectorBindData : public TableFunctionData {
+	ArrowNetHandle handle = nullptr;
+	string schema;
+	string func;
+	vector<LogicalType> input_types;
+	vector<string> input_names;
+	shared_ptr<CollectorHolder> holder;
+};
+
+struct ArrowNetCollectorLocalState : public LocalTableFunctionState {};
+
+CollectorHolder::~CollectorHolder() {
+	if (binding) {
+		arrownet::InOutBindClose(binding); // best-effort; swallows errors
+		binding = nullptr;
+	}
+}
+
+void CollectorHolder::Finalize(ClientContext &context) {
+	lock_guard<mutex> guard(lock);
+	if (finalized) {
+		return;
+	}
+	finalized = true;
+	// Read-only / custom collectors don't touch DuckDB's write transaction; set a null active txn for
+	// consistency (a future SQL-backed collector opening a connection in DoExchange would pick it up).
+	ArrowNetSetActiveTxn(nullptr, context);
+	if (!active) {
+		// The input pipeline never ran (e.g. an empty plan) — emit no rows.
+		output = make_uniq<ColumnDataCollection>(Allocator::Get(context), output_types);
+		return;
+	}
+	active->input_producer->Finish(); // no more input batches
+	ArrowArrayStream out_stream;
+	std::memset(&out_stream, 0, sizeof(out_stream));
+	// Hand the COMPLETE buffered input to C# in one call; C# Collect reads it all, then yields the output.
+	arrownet::InOutExchangeOpen(binding, *active->input_producer->Stream(), out_stream);
+	arrownet::ArrowStreamReader reader(context, out_stream);
+	output = make_uniq<ColumnDataCollection>(Allocator::Get(context), reader.Types());
+	DataChunk chunk;
+	chunk.Initialize(Allocator::Get(context), reader.Types());
+	while (true) {
+		chunk.Reset();
+		reader.Read(chunk); // a collector yields no sentinels; Read returns size 0 at end
+		if (chunk.size() == 0) {
+			break;
+		}
+		output->Append(chunk);
+	}
+}
+
+// Bind: resolve the binding + its full output schema via inout_bind (identical to the streaming exchange bind,
+// but stores a CollectorHolder + the output types for the Source). Cost args (named parameters) marshaled the
+// same way so a collector can take constant args (e.g. a future daxevaltable).
+unique_ptr<FunctionData> ArrowNetCollectorBind(ClientContext &context, TableFunctionBindInput &input,
+                                               vector<LogicalType> &return_types, vector<string> &names) {
+	auto &info = input.info->Cast<ArrowNetTableFunctionInfo>();
+	auto bind_data = make_uniq<ArrowNetCollectorBindData>();
+	bind_data->handle = info.handle;
+	bind_data->schema = info.schema;
+	bind_data->func = info.func;
+	bind_data->holder = make_shared_ptr<CollectorHolder>();
+	for (idx_t i = 0; i < input.input_table_types.size(); i++) {
+		bind_data->input_types.push_back(input.input_table_types[i]);
+		bind_data->input_names.push_back(input.input_table_names[i]);
+	}
+
+	auto props = arrownet::BoundaryClientProperties(context);
+	ArrowSchema input_schema;
+	std::memset(&input_schema, 0, sizeof(input_schema));
+	ArrowConverter::ToArrowSchema(&input_schema, bind_data->input_types, bind_data->input_names, props);
+
+	// Marshal supplied constant args (named parameters) into a 1-row Arrow stream (else null). Same as the
+	// streaming exchange bind.
+	vector<LogicalType> arg_types;
+	vector<string> arg_names;
+	vector<Value> arg_values;
+	for (auto &kv : input.named_parameters) {
+		LogicalType declared = kv.second.type();
+		for (idx_t i = 0; i < info.arg_names.size(); i++) {
+			if (StringUtil::CIEquals(info.arg_names[i], kv.first)) {
+				declared = info.arg_types[i];
+				break;
+			}
+		}
+		arg_names.push_back(kv.first);
+		arg_types.push_back(declared);
+		arg_values.push_back(kv.second);
+	}
+	arrownet::ArrowProducer arg_producer(arg_types, arg_names, props);
+	ArrowArrayStream *args_ptr = nullptr;
+	if (!arg_values.empty()) {
+		DataChunk chunk;
+		chunk.Initialize(Allocator::DefaultAllocator(), arg_types);
+		for (idx_t c = 0; c < arg_values.size(); c++) {
+			chunk.SetValue(c, 0, arg_values[c].DefaultCastAs(arg_types[c]));
+		}
+		chunk.SetCardinality(1);
+		auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(context, arg_types);
+		ArrowAppender appender(arg_types, 1, props, extension_types);
+		appender.Append(chunk, 0, 1, 1);
+		arg_producer.AddBatch(appender.Finalize());
+		arg_producer.Finish();
+		args_ptr = arg_producer.Stream();
+	}
+
+	ArrowArrayStream out_schema;
+	std::memset(&out_schema, 0, sizeof(out_schema));
+	bind_data->holder->binding =
+	    arrownet::InOutBind(info.handle, info.schema, info.func, args_ptr, input_schema, out_schema);
+
+	ArrowSchemaWrapper schema_root;
+	if (out_schema.get_schema(&out_schema, &schema_root.arrow_schema) != 0) {
+		const char *msg = out_schema.get_last_error ? out_schema.get_last_error(&out_schema) : nullptr;
+		if (out_schema.release) {
+			out_schema.release(&out_schema);
+		}
+		throw IOException(string("mssql_net: failed to read collector output schema") +
+		                  (msg ? string(": ") + msg : string()));
+	}
+	if (out_schema.release) {
+		out_schema.release(&out_schema);
+	}
+	ArrowTableSchema arrow_table;
+	ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table, schema_root.arrow_schema);
+	for (int64_t i = 0; i < schema_root.arrow_schema.n_children; i++) {
+		auto &child = *schema_root.arrow_schema.children[i];
+		names.push_back(child.name ? string(child.name) : "column" + to_string(i));
+		return_types.push_back(arrow_table.GetColumns().at((idx_t)i)->GetDuckType());
+	}
+	bind_data->holder->output_types = return_types;
+	return std::move(bind_data);
+}
+
+unique_ptr<GlobalTableFunctionState> ArrowNetCollectorInitGlobal(ClientContext &context,
+                                                                TableFunctionInitInput &input) {
+	auto &bind = input.bind_data->Cast<ArrowNetCollectorBindData>();
+	auto gstate = make_uniq<ArrowNetCollectorGlobalState>();
+	gstate->props = arrownet::BoundaryClientProperties(context);
+	gstate->input_types = bind.input_types;
+	gstate->input_names = bind.input_names;
+	gstate->holder = bind.holder.get();
+	gstate->input_producer =
+	    make_uniq<arrownet::ArrowProducer>(gstate->input_types, gstate->input_names, gstate->props);
+	// Reset per-execution holder state (a prepared statement may re-execute on the shared holder).
+	lock_guard<mutex> guard(bind.holder->lock);
+	bind.holder->finalized = false;
+	bind.holder->output.reset();
+	bind.holder->active = gstate.get();
+	return std::move(gstate);
+}
+
+unique_ptr<LocalTableFunctionState> ArrowNetCollectorInitLocal(ExecutionContext &, TableFunctionInitInput &,
+                                                               GlobalTableFunctionState *) {
+	return make_uniq<ArrowNetCollectorLocalState>();
+}
+
+// The in-out operator function: buffer each input chunk (as Arrow), emit NO rows. The actual output is emitted
+// by the injected Sink+Source wrapper after ALL input is collected.
+OperatorResultType ArrowNetCollectorFunction(ExecutionContext &context, TableFunctionInput &data, DataChunk &input,
+                                             DataChunk &output) {
+	auto &g = data.global_state->Cast<ArrowNetCollectorGlobalState>();
+	if (input.size() > 0) {
+		auto ext = ArrowTypeExtensionData::GetExtensionTypes(context.client, g.input_types);
+		ArrowAppender appender(g.input_types, input.size(), g.props, ext);
+		appender.Append(input, 0, input.size(), input.size());
+		g.input_producer->AddBatch(appender.Finalize()); // ArrowProducer::AddBatch is internally mutex-guarded
+	}
+	output.SetCardinality(0);
+	return OperatorResultType::NEED_MORE_INPUT;
+}
+
+// Source scan state over the materialized output collection (single-threaded — base MaxThreads()==1).
+class ArrowNetCollectorSourceState : public GlobalSourceState {
+public:
+	mutex lock;
+	ColumnDataScanState scan;
+	bool initialized = false;
+};
+
+// The pipeline-breaker operator: Sink consumes the (empty) in-out output (just to get the single
+// all-branches-done Finalize), Finalize runs the exchange + materializes the collected output, Source emits it.
+class ArrowNetCollectorPhysical : public PhysicalOperator {
+public:
+	ArrowNetCollectorPhysical(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
+	                          shared_ptr<CollectorHolder> holder)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality),
+	      holder(std::move(holder)) {
+	}
+
+	shared_ptr<CollectorHolder> holder;
+
+	string GetName() const override {
+		return "ARROWNET_COLLECTOR";
+	}
+
+	// ---- Sink (collect all input) ----
+	bool IsSink() const override {
+		return true;
+	}
+	SinkResultType Sink(ExecutionContext &, DataChunk &, OperatorSinkInput &) const override {
+		// The child in-out emits 0 rows; the actual input buffering happens in its Execute. Nothing to do here
+		// except participate in the pipeline so Finalize fires once after all branches.
+		return SinkResultType::NEED_MORE_INPUT;
+	}
+	SinkFinalizeType Finalize(Pipeline &, Event &, ClientContext &context, OperatorSinkFinalizeInput &) const override {
+		holder->Finalize(context); // single, all-branches-done: run the exchange + materialize the output
+		return SinkFinalizeType::READY;
+	}
+
+	// ---- Source (emit the materialized output) ----
+	bool IsSource() const override {
+		return true;
+	}
+	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &) const override {
+		return make_uniq<ArrowNetCollectorSourceState>();
+	}
+	SourceResultType GetDataInternal(ExecutionContext &, DataChunk &chunk, OperatorSourceInput &input) const override {
+		auto &gstate = input.global_state.Cast<ArrowNetCollectorSourceState>();
+		if (!holder->output) {
+			return SourceResultType::FINISHED;
+		}
+		lock_guard<mutex> guard(gstate.lock);
+		if (!gstate.initialized) {
+			holder->output->InitializeScan(gstate.scan);
+			gstate.initialized = true;
+		}
+		holder->output->Scan(gstate.scan, chunk);
+		return chunk.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
+	}
+};
+
+struct ArrowNetCollectorFinalizeOperator : public LogicalExtensionOperator {
+	explicit ArrowNetCollectorFinalizeOperator(unique_ptr<LogicalOperator> child, shared_ptr<CollectorHolder> holder)
+	    : holder(std::move(holder)) {
+		children.push_back(std::move(child));
+	}
+
+	shared_ptr<CollectorHolder> holder;
+
+	PhysicalOperator &CreatePlan(ClientContext &, PhysicalPlanGenerator &planner) override {
+		auto &child_plan = planner.CreatePlan(*children[0]);
+		auto &op = planner.Make<ArrowNetCollectorPhysical>(children[0]->types, children[0]->estimated_cardinality,
+		                                                   holder);
+		op.children.push_back(child_plan);
+		return op;
+	}
+
+	vector<ColumnBinding> GetColumnBindings() override {
+		return children[0]->GetColumnBindings();
+	}
+
+	void ResolveTypes() override {
+		types = children[0]->types;
+	}
+
+	string GetExtensionName() const override {
+		return "arrownet_collector";
+	}
+};
+
+// -----------------------------------------------------------------------------
+
 // Recursively wrap every ArrowNet table-in-out LogicalGet in a finalize operator.
 void WrapArrowNetInOutNodes(unique_ptr<LogicalOperator> &op) {
 	for (auto &child : op->children) {
@@ -1303,6 +1624,15 @@ void WrapArrowNetInOutNodes(unique_ptr<LogicalOperator> &op) {
 		auto holder = get.bind_data->Cast<ArrowNetExchangeBindData>().holder;
 		if (holder) {
 			op = make_uniq<ArrowNetExchangeFinalizeOperator>(std::move(op), std::move(holder));
+		}
+		return;
+	}
+	// A COLLECTOR (pipeline breaker) in-out is wrapped in its Sink+Source finalize operator instead — it
+	// alone emits the output (the in-out itself emits 0 rows; it only buffers input).
+	if (get.function.in_out_function == ArrowNetCollectorFunction) {
+		auto holder = get.bind_data->Cast<ArrowNetCollectorBindData>().holder;
+		if (holder) {
+			op = make_uniq<ArrowNetCollectorFinalizeOperator>(std::move(op), std::move(holder));
 		}
 	}
 }
@@ -1331,6 +1661,10 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateTableFunction(ClientC
 		// A provider-authored custom table-in-out (4g) is registered under the bare name.
 		if (custom_inout_functions_.find(func_name) != custom_inout_functions_.end()) {
 			return GetOrCreateCustomInOutFunction(context, func_name);
+		}
+		// A provider-authored custom COLLECTOR (pipeline breaker) is also registered under the bare name.
+		if (custom_collector_functions_.find(func_name) != custom_collector_functions_.end()) {
+			return GetOrCreateCustomCollectorFunction(context, func_name);
 		}
 		// Else maybe the synthetic in-out alias `<base>_each` (a real same-named function would
 		// have matched above, so it wins over the alias).
@@ -1486,6 +1820,47 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateCustomInOutFunction(C
 	return &ref;
 }
 
+// Build the catalog entry for a provider-authored custom COLLECTOR (pipeline breaker) — a
+// `{LogicalType::TABLE}`-parameter table function under the bare name, routed to the Sink+Source collector
+// operator (ArrowNetCollectorFunction): it buffers ALL input, then emits the C# output once. Mirrors
+// GetOrCreateCustomInOutFunction (same cost-arg named-parameter handling); only the operator callbacks differ.
+// Caller holds entry_lock_.
+optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateCustomCollectorFunction(ClientContext &context,
+                                                                                  const string &func_name) {
+	TableFunction collector(func_name, {LogicalType::TABLE}, nullptr, ArrowNetCollectorBind,
+	                        ArrowNetCollectorInitGlobal, ArrowNetCollectorInitLocal);
+	collector.in_out_function = ArrowNetCollectorFunction;
+	auto fn_info = make_shared_ptr<ArrowNetTableFunctionInfo>();
+	fn_info->handle = handle_;
+	fn_info->schema = name;
+	fn_info->func = func_name;
+	fn_info->is_proc = false;
+	// Constant "cost" args declared as NAMED parameters (coexist with the single {TABLE} overload). A collector
+	// with no args (the cf_collect demo) declares none.
+	try {
+		vector<string> arg_names;
+		vector<LogicalType> arg_types;
+		FetchFunctionParamSchema(context, handle_, name, func_name, arg_names, arg_types);
+		for (idx_t i = 0; i < arg_names.size(); i++) {
+			auto t = arg_types[i].id() == LogicalTypeId::SQLNULL ? LogicalType::ANY : arg_types[i];
+			collector.named_parameters[arg_names[i]] = t;
+		}
+		fn_info->arg_names = std::move(arg_names);
+		fn_info->arg_types = std::move(arg_types);
+	} catch (std::exception &) {
+		// no cost args for this collector
+	}
+	collector.function_info = std::move(fn_info);
+
+	CreateTableFunctionInfo info(std::move(collector));
+	info.catalog = catalog.GetName();
+	info.schema = name;
+	auto entry = make_uniq<TableFunctionCatalogEntry>(catalog, *this, info);
+	auto &ref = *entry;
+	table_function_entries_[func_name] = std::move(entry);
+	return &ref;
+}
+
 optional_ptr<CatalogEntry> ArrowNetSchemaEntry::LookupEntry(CatalogTransaction transaction,
                                                             const EntryLookupInfo &lookup_info) {
 	if (!transaction.context) {
@@ -1572,6 +1947,9 @@ void ArrowNetSchemaEntry::Scan(ClientContext &context, CatalogType type,
 				names.push_back(fn.first);
 			}
 			for (auto &fn : custom_inout_functions_) {
+				names.push_back(fn);
+			}
+			for (auto &fn : custom_collector_functions_) {
 				names.push_back(fn);
 			}
 		}

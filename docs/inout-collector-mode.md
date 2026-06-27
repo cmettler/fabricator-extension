@@ -1,9 +1,28 @@
-# Collector table-in-out (pipeline-breaker mode) — design idea, DEFERRED
+# Collector table-in-out (pipeline-breaker mode)
 
-> Status: **design note only — nothing built.** A *second* table-in-out execution shape alongside the Phase 6
-> streaming exchange: a binding that **collects all input, emits nothing until input EOF, then emits its full
-> output**. The streaming exchange ([the Phase 6 work](../CLAUDE.md)) is **untouched** — the two modes coexist,
-> picked by a discovery `kind`. Builds on the v28 exchange ABI (reused as-is) + the injected-finalize machinery.
+> Status: **BUILT (custom C# collectors) + verified** (`test/verify_collector.test`, 40 assertions). A *second*
+> table-in-out execution shape alongside the Phase 6 streaming exchange: a binding that **collects all input,
+> emits nothing until input EOF, then emits its full output**. The streaming exchange ([the Phase 6
+> work](../CLAUDE.md)) is **untouched** — the two modes coexist, picked by a discovery `kind`. Reuses the v28
+> exchange ABI verbatim (no bump). **Remaining (deferred, needs a live model):** migrate `daxevaltable` onto the
+> collector to lift its single-chunk cap (see "What this fixes / enables").
+>
+> **As-built notes** (where the build refined the sketch below):
+> - **C# author API** (`ArrowNet.Bridge`): `IArrowCollectorTableFunction` (`SchemaName`/`Name`/`InputSchema`/
+>   `Bind(args, inputSchema)`) + `IArrowCollectorBinding` (`OutputSchema` + `Collect(allInput, ct)`), plus a
+>   `StaticCollectorFunction` fixed-schema base. A public `CollectorInOutBinding` adapter wraps an
+>   `IArrowCollectorBinding` as an `IArrowInOutBinding` (`DoExchange = Collect`) so it flows through the existing
+>   `inout_bind`/`inout_exchange_open` marshaling + `InOutExchangeStream` pump **with no ABI change**. Registry
+>   `CustomCollector`; `InOutBind` checks it first; `FunctionsMetadataSql` emits `kind='collector'`.
+> - **C++** (`arrownet_schema_entry.cpp`): a dedicated `ArrowNetCollector*` operator — the in-out `Execute`
+>   buffers each input chunk into an `arrownet::ArrowProducer` (held in the per-execution global state, pointed
+>   at by a refcounted `CollectorHolder`) and emits 0 rows; the injected `ArrowNetCollectorPhysical` is a real
+>   **Sink+Source** (`IsSink`+`IsSource`) whose `Finalize` (once, all-branches-done) calls `inout_exchange_open`
+>   over the complete buffered input + materializes the C# output into a `ColumnDataCollection`, and whose
+>   `GetDataInternal` scans it. `WrapArrowNetInOutNodes` routes a collector `LogicalGet` (identified by
+>   `in_out_function == ArrowNetCollectorFunction`) to this wrapper; the streaming exchange path is unchanged.
+>   `kind='collector'` is additive (no ABI bump). Registration: `AddCollectorFunction` /
+>   `custom_collector_functions_` / `GetOrCreateCustomCollectorFunction`.
 
 ## Motivation
 

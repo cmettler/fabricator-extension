@@ -1,0 +1,115 @@
+# name: test/verify_collector.test
+# description: Custom COLLECTOR table-in-out (pipeline breaker) — buffers ALL input, then emits. Proves the
+#              whole-table contract (every output row carries the global total, knowable only after all input),
+#              multi-chunk input (no single-chunk cap), sequential UNION (all branches seen before emit), and
+#              discovery as kind='collector'. See docs/inout-collector-mode.md.
+# group: [mssql]
+
+require mssql_net
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS cdb (TYPE mssql_net);
+
+# dbo.cf_collect is a custom C# COLLECTOR (no SQL Server object): it reads the WHOLE input table, then emits
+# every input row n paired with the GLOBAL sum across all rows. The total is only knowable after all input is
+# seen — so a correct total per row proves the pipeline-breaker contract (collect-then-emit).
+query II
+SELECT n, total FROM cdb.dbo.cf_collect((SELECT 10 AS n UNION ALL SELECT 20 UNION ALL SELECT 30)) ORDER BY n;
+----
+10	60
+20	60
+30	60
+
+# One output row per input row (output cardinality == input cardinality).
+query I
+SELECT count(*) FROM cdb.dbo.cf_collect((SELECT 10 AS n UNION ALL SELECT 20 UNION ALL SELECT 30));
+----
+3
+
+# Multi-chunk input: 5000 rows (well past STANDARD_VECTOR_SIZE) — the collector buffers ALL of them (no
+# single-chunk cap, unlike the streaming daxevaltable). total = sum(0..4999) = 12497500 on every row.
+query III
+SELECT count(*), min(total), max(total)
+FROM cdb.dbo.cf_collect((SELECT i::INTEGER AS n FROM range(5000) t(i)));
+----
+5000	12497500	12497500
+
+# The collected n round-trips exactly (sum of the echoed input column == the global total).
+query I
+SELECT sum(n)::BIGINT FROM cdb.dbo.cf_collect((SELECT i::INTEGER AS n FROM range(5000) t(i)));
+----
+12497500
+
+# Sequential UNION input under threads=1: the collector must see ALL branches before emitting (a per-branch
+# finalize would emit branch 1's partial total — this is the schedule that catches a premature-finish bug).
+statement ok
+SET threads=1;
+
+query II
+SELECT n, total FROM cdb.dbo.cf_collect(
+    (SELECT i::INTEGER AS n FROM range(3) t(i)
+     UNION ALL
+     SELECT i::INTEGER AS n FROM range(100, 103) u(i))
+) ORDER BY n;
+----
+0	306
+1	306
+2	306
+100	306
+101	306
+102	306
+
+statement ok
+RESET threads;
+
+# Aggregation over the collector output works (it is a normal source above the breaker).
+query I
+SELECT max(total) FROM cdb.dbo.cf_collect((SELECT i::INTEGER AS n FROM range(100) t(i)));
+----
+4950
+
+# Empty input -> no output rows (the collector sees zero input, emits nothing).
+query I
+SELECT count(*) FROM cdb.dbo.cf_collect((SELECT 1 AS n WHERE 1=0));
+----
+0
+
+# NULLs in the input are echoed (and skipped from the sum): total = 5 + 7 = 12.
+query II
+SELECT n, total FROM cdb.dbo.cf_collect(
+    (SELECT 5 AS n UNION ALL SELECT NULL UNION ALL SELECT 7)) ORDER BY n NULLS LAST;
+----
+5	12
+7	12
+NULL	12
+
+# Discovered as kind='collector'.
+query T
+SELECT kind FROM mssql_net_functions('cdb') WHERE name = 'cf_collect';
+----
+collector
+
+# NO backing SQL Server object (it is pure C#).
+query I
+SELECT cnt FROM mssql_net_query('cdb', 'SELECT COUNT(*) AS cnt FROM sys.objects WHERE name = ''cf_collect''');
+----
+0
+
+# Re-execution (prepared) reuses the binding + resets the per-execution buffer — run twice, same answer.
+statement ok
+PREPARE pc AS SELECT max(total) FROM cdb.dbo.cf_collect((SELECT i::INTEGER AS n FROM range(10) t(i)));
+
+query I
+EXECUTE pc;
+----
+45
+
+query I
+EXECUTE pc;
+----
+45
+
+statement ok
+DETACH cdb;

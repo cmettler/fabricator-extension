@@ -325,6 +325,15 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     private static readonly IReadOnlyDictionary<string, IArrowInOutFunction> CustomInOut =
         CustomFunctions.InOut.ToDictionary(f => $"{f.SchemaName}.{f.Name}", StringComparer.OrdinalIgnoreCase);
 
+    // Provider-authored custom COLLECTOR table-in-out functions (IArrowCollectorTableFunction), keyed
+    // "schema.name" (case-insensitive). Surfaced as `kind='collector'` (see FunctionsMetadataSql) so the C++
+    // catalog registers them as a {TABLE}-param table function routed to the Sink+Source pipeline-breaker
+    // operator (NOT the streaming exchange). Resolved by InOutBind (which wraps the IArrowCollectorBinding in a
+    // CollectorInOutBinding so it flows through the shared inout_bind/inout_exchange_open marshaling). A
+    // collector sees ALL input before emitting (whole-table semantics) — no single-chunk cap.
+    private static readonly IReadOnlyDictionary<string, IArrowCollectorTableFunction> CustomCollector =
+        CustomFunctions.Collector.ToDictionary(f => $"{f.SchemaName}.{f.Name}", StringComparer.OrdinalIgnoreCase);
+
     // Provider-authored custom aggregate functions (UDAF), keyed "schema.name" (case-insensitive). Surfaced
     // as `kind='aggregate'` (see FunctionsMetadataSql) so the C++ catalog registers them as an
     // AggregateFunctionCatalogEntry; dispatched to C# (see AggOpen / GetFunctionParamSchema /
@@ -1225,7 +1234,8 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // UNION ALL so the C++ catalog discovers + registers them uniformly (then dispatches custom ones to C#).
     private static string FunctionsMetadataSql()
     {
-        if (CustomScalar.Count == 0 && CustomTable.Count == 0 && CustomInOut.Count == 0 && CustomAgg.Count == 0)
+        if (CustomScalar.Count == 0 && CustomTable.Count == 0 && CustomInOut.Count == 0 && CustomAgg.Count == 0 &&
+            CustomCollector.Count == 0)
         {
             return FunctionsSql;
         }
@@ -1249,6 +1259,11 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         {
             sb.Append(" UNION ALL SELECT '").Append(Esc(f.SchemaName)).Append("', '").Append(Esc(f.Name))
               .Append("', 'inout', ").Append(f.InputSchema.FieldsList.Count).Append(", ''");
+        }
+        foreach (var f in CustomCollector.Values)
+        {
+            sb.Append(" UNION ALL SELECT '").Append(Esc(f.SchemaName)).Append("', '").Append(Esc(f.Name))
+              .Append("', 'collector', ").Append(f.InputSchema.FieldsList.Count).Append(", ''");
         }
         foreach (var f in CustomAgg.Values)
         {
@@ -1924,7 +1939,15 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     public IArrowInOutBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema)
     {
         IArrowInOutBinding binding;
-        if (CustomInOut.TryGetValue($"{schemaName}.{functionName}", out var custom))
+        if (CustomCollector.TryGetValue($"{schemaName}.{functionName}", out var collector))
+        {
+            // A custom collector (pipeline breaker): wrap its IArrowCollectorBinding as an IArrowInOutBinding so
+            // it flows through the shared exchange marshaling. The C++ side registered it on the Sink+Source
+            // collector operator (kind='collector'), which feeds a NON-gated buffered input stream — so Collect
+            // reading all input before yielding (no sentinels) is safe.
+            binding = new CollectorInOutBinding(collector.Bind(args, inputSchema));
+        }
+        else if (CustomInOut.TryGetValue($"{schemaName}.{functionName}", out var custom))
         {
             binding = custom.Bind(args, inputSchema);
         }

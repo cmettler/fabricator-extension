@@ -92,6 +92,10 @@ void ArrowNetCatalog::LoadCatalog(ClientContext &context) {
 			// Provider-authored custom table-in-out (4g, pure C#): a {TABLE}-param table function under
 			// the bare name (no scalar-arg scan form, no `_each` alias — it is already in-out).
 			schema.AddInOutFunction(func.name);
+		} else if (func.kind == "collector") {
+			// Provider-authored custom collector (pipeline breaker, pure C#): a {TABLE}-param table function
+			// routed to the Sink+Source operator — buffers all input, then emits. See docs/inout-collector-mode.md.
+			schema.AddCollectorFunction(func.name);
 		} else if (func.kind == "aggregate") {
 			// Provider-authored custom aggregate (4h, UDAF, pure C#): an AggregateFunctionCatalogEntry.
 			schema.AddAggregateFunction(func.name, /*spillable=*/false);
@@ -158,6 +162,10 @@ void ArrowNetCatalog::RefreshCache(ClientContext &context) {
 			// Provider-authored custom table-in-out (4g, pure C#): a {TABLE}-param table function under
 			// the bare name (no scalar-arg scan form, no `_each` alias — it is already in-out).
 			schema.AddInOutFunction(func.name);
+		} else if (func.kind == "collector") {
+			// Provider-authored custom collector (pipeline breaker, pure C#): a {TABLE}-param table function
+			// routed to the Sink+Source operator — buffers all input, then emits. See docs/inout-collector-mode.md.
+			schema.AddCollectorFunction(func.name);
 		} else if (func.kind == "aggregate") {
 			// Provider-authored custom aggregate (4h, UDAF, pure C#): an AggregateFunctionCatalogEntry.
 			schema.AddAggregateFunction(func.name, /*spillable=*/false);
