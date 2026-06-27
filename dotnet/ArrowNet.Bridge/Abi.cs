@@ -193,6 +193,9 @@ public unsafe struct ArrowNetHostServices
     public delegate* unmanaged[Cdecl]<byte*, void> FreeStr;
     // int32 fs_glob(void* opener, const char* pattern, char** out_json, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte*, byte**, byte**, int> FsGlob;
+    // int32 host_query(const char* sql, ArrowArrayStream* out, char** err) — run sql on a fresh host
+    // connection, result as Arrow (the managed caller imports + releases the stream). See docs/host-query.md.
+    public delegate* unmanaged[Cdecl]<byte*, CArrowArrayStream*, byte**, int> HostQuery;
 }
 
 /// <summary>Mirrors <c>ArrowNetAlterKind</c> in abi.h.</summary>

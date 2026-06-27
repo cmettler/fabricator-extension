@@ -597,13 +597,21 @@ typedef struct ArrowNetHostServices {
 	// secrets). *out_json receives an owned UTF-8 JSON array of {"path":<string>,"size":<int64>} (freed via
 	// free_str). Used by the managed lakehouse filesystem's directory listing.
 	int32_t (*fs_glob)(ArrowNetHandle opener, const char *pattern, char **out_json, char **err);
+
+	// Host query — run `sql` on a FRESH host DuckDB connection (its own ClientContext/transaction; never the
+	// in-flight one, which is non-reentrant) and return the result as an ArrowArrayStream in *out. Lets a
+	// managed component reuse the host engine (functions, readers, the catalog) over Arrow. Separate
+	// transaction => committed-reads semantics. The result stream (and its connection) is owned by the
+	// managed caller, which releases it when done. See docs/host-query.md. (params + named Arrow inputs are
+	// the next slice — this entry is sql-only for now.)
+	int32_t (*host_query)(const char *sql, struct ArrowArrayStream *out, char **err);
 } ArrowNetHostServices;
 
 // Max serialized size of a spillable aggregate's per-group state (the inline, pointer-free
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 41
+#define ARROWNET_ABI_VERSION 42
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

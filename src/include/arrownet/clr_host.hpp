@@ -36,6 +36,12 @@ const std::string &GetManagedDirectory();
 // to Bootstrap.Initialize. See ArrowNetHostServices in abi.h. (Filesystem reverse-callback foundation.)
 void SetHostServices(const ArrowNetHostServices &services);
 
+// Installs the host_query host-service callback onto the shared host-services block (called at extension
+// load by the host-query module, after SetHostServices set the rest; both run before the bridge boots, so
+// order-independent). See ArrowNetHostServices::host_query in abi.h.
+using HostQueryFn = int32_t (*)(const char *sql, struct ArrowArrayStream *out, char **err);
+void SetHostQueryService(HostQueryFn fn);
+
 // SPIKE: ask the managed side to open `path` via the host FileSystem callbacks (using `opener` for secret
 // resolution) and return a short human-readable result (head/tail bytes + size). Proves C#->host FS reads.
 std::string FsSpike(ArrowNetHandle opener, const std::string &path);

@@ -33,7 +33,7 @@ public static unsafe class Bootstrap
             HostFs.Set(*host);
         }
 
-        vtable->AbiVersion = 41;
+        vtable->AbiVersion = 42;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;

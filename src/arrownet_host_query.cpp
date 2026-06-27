@@ -6,12 +6,14 @@
 
 #include "arrownet/arrow_ingest.hpp"
 #include "arrownet/arrow_produce.hpp"
+#include "arrownet/clr_host.hpp"
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
 
+#include <cstdlib>
 #include <cstring>
 
 namespace duckdb {
@@ -97,7 +99,39 @@ void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStre
 	out = st->stream; // copy the stream struct; ownership of `st` rides private_data (freed in HostQueryRelease)
 }
 
+// The host DatabaseInstance the C#-callable `host_query` opens a fresh connection on (captured at load —
+// the host service has no per-call context, unlike the fs callbacks). Valid for the extension's lifetime.
+static DatabaseInstance *g_host_db = nullptr;
+
+// Duplicate a message into a malloc'd C string for the managed side (freed via the host-services free_str).
+static char *DupErr(const string &msg) {
+	char *out = static_cast<char *>(malloc(msg.size() + 1));
+	if (out) {
+		memcpy(out, msg.c_str(), msg.size() + 1);
+	}
+	return out;
+}
+
+// The `host_query` host-service callback (C# -> host). Runs `sql` on a fresh connection + hands C# the
+// result as a self-owning ArrowArrayStream (C# imports + releases it). See abi.h / docs/host-query.md.
+int32_t HostQueryService(const char *sql, ArrowArrayStream *out, char **err) {
+	try {
+		if (!g_host_db) {
+			throw IOException("arrownet host_query: host database not available");
+		}
+		MakeHostQueryStream(*g_host_db, sql ? string(sql) : string(), *out);
+		return ARROWNET_OK;
+	} catch (std::exception &e) {
+		if (err) {
+			*err = DupErr(e.what());
+		}
+		return 1;
+	}
+}
+
 void RegisterHostQuery(ExtensionLoader &loader) {
+	g_host_db = &loader.GetDatabaseInstance();
+	arrownet::SetHostQueryService(HostQueryService); // make host_query callable from C# (added to the host block)
 	TableFunction fn("arrownet_host_query", {LogicalType::VARCHAR}, arrownet::ArrowStreamScan, HostQueryBind,
 	                 arrownet::ArrowStreamInitGlobal, arrownet::ArrowStreamInitLocal);
 	loader.RegisterFunction(fn);

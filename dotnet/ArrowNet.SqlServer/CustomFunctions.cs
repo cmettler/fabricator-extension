@@ -18,6 +18,7 @@ internal static class CustomFunctions
     public static readonly IReadOnlyList<IArrowScalarFunction> Scalar = new IArrowScalarFunction[]
     {
         new CfAddFunction(),
+        new CfHostAnswerFunction(),
     };
 
     public static readonly IReadOnlyList<IArrowTableFunction> Table = new IArrowTableFunction[]
@@ -475,6 +476,35 @@ internal sealed class CfColumnsFunction : IArrowTableFunction
         }
 
         public void Dispose() { }
+    }
+}
+
+// Demo: dbo.cf_host_answer(x) -> runs a query on the HOST DuckDB engine (a fresh connection) via
+// Host.Query and returns its scalar result for every input row. Proves the C#->host_query round-trip:
+// DuckDB -> this C# scalar -> host_query -> a fresh host connection -> Arrow -> back. The nested run is on a
+// FRESH connection, so the outer query's context is untouched (reentrancy-safe). See docs/host-query.md.
+internal sealed class CfHostAnswerFunction : IArrowScalarFunction
+{
+    public string SchemaName => "dbo";
+    public string Name => "cf_host_answer";
+    public Schema Parameters => new(new[] { new Field("x", Int64Type.Default, nullable: true) }, metadata: null);
+    public Field Result => new("answer", Int64Type.Default, nullable: false);
+
+    public IArrowArray Invoke(RecordBatch args)
+    {
+        long answer;
+        using (var stream = Host.Query("SELECT 40::BIGINT + 2 AS answer"))
+        {
+            var batch = stream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult()
+                        ?? throw new InvalidOperationException("host_query returned no result");
+            answer = ((Int64Array)batch.Column(0)).GetValue(0)!.Value;
+        }
+        var builder = new Int64Array.Builder().Reserve(args.Length);
+        for (int i = 0; i < args.Length; i++)
+        {
+            builder.Append(answer);
+        }
+        return builder.Build();
     }
 }
 

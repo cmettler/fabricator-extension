@@ -297,6 +297,12 @@ void SetHostServices(const ArrowNetHostServices &services) {
 	g_host_services = services; // must be called before the first GetBridge() (bridge boot)
 }
 
+void SetHostQueryService(HostQueryFn fn) {
+	// Patches just the host_query field on the shared host-services block (the fs services set the rest).
+	// Both happen at extension load, before the bridge boots — order-independent.
+	g_host_services.host_query = fn;
+}
+
 // -----------------------------------------------------------------------------
 // vtable convenience wrappers
 // -----------------------------------------------------------------------------

@@ -1,5 +1,7 @@
 using System;
 using System.Runtime.InteropServices;
+using Apache.Arrow.C;
+using Apache.Arrow.Ipc;
 
 namespace ArrowNet.Bridge;
 
@@ -101,6 +103,44 @@ internal static unsafe class HostFs
         finally
         {
             Marshal.FreeCoTaskMem(patPtr);
+        }
+    }
+
+    /// <summary>True once the host registered the host_query callback.</summary>
+    public static bool CanQuery => _set && _h.HostQuery != null;
+
+    /// <summary>
+    /// Runs <paramref name="sql"/> on a FRESH host DuckDB connection (its own transaction) and returns the
+    /// result as an Arrow stream the caller owns (dispose to release the connection + result). Lets a managed
+    /// component reuse the host engine — functions, readers, the catalog — over Arrow. See docs/host-query.md.
+    /// </summary>
+    public static IArrowArrayStream Query(string sql)
+    {
+        if (!CanQuery)
+        {
+            throw new InvalidOperationException("host_query is unavailable (the host did not register it)");
+        }
+        var sqlPtr = Marshal.StringToCoTaskMemUTF8(sql);
+        var cstream = CArrowArrayStream.Create();
+        try
+        {
+            byte* err = null;
+            int rc = _h.HostQuery((byte*)sqlPtr, cstream, &err);
+            if (rc != 0)
+            {
+                throw HostError("host_query", err);
+            }
+            var imported = CArrowArrayStreamImporter.ImportArrayStream(cstream);
+            cstream = null; // ownership transferred to the imported stream (it frees the alloc on dispose)
+            return imported;
+        }
+        finally
+        {
+            if (cstream != null)
+            {
+                CArrowArrayStream.Free(cstream);
+            }
+            Marshal.FreeCoTaskMem(sqlPtr);
         }
     }
 
