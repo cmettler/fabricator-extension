@@ -943,6 +943,13 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
 
 - **Filtering**: discovered scalar UDFs + TVFs/procs are gated by the ATTACH `schema_filter` (icase
   `std::regex`, applied in `LoadCatalog`/`RefreshCache`); `table_filter` is table-only and does NOT apply to functions.
+- **Parallel partitioned reads** (ConnectorX-style `partition_on`/`partition_num`) — **design note, deferred,
+  nothing built**: [docs/parallel-partitioned-read.md](docs/parallel-partitioned-read.md). Two wins to keep
+  distinct — parallel *fetch* (form A: C# runs N range queries concurrently + `ParallelMerge` → the existing
+  single-stream scan, no ABI) vs parallel DuckDB *pipeline/core usage* (form B: N streams → N scan threads via
+  a parallel multi-stream scan = the native form of the proven `UNION ALL` core-saturation trick; bigger). On
+  `arrownet_query` the two surface as optional NAMED params (the `daxeval` pattern); a custom
+  `IArrowTableFunction` could return `IAsyncEnumerable<IAsyncEnumerable<RecordBatch>>` (outer = partitions).
 - **Open design items (filters + refresh)** — deliberated, not yet built:
   - A **`function_filter`** ATTACH option (icase regex on the function name), symmetric with `table_filter`,
     to gate which UDFs/TVFs register when a catalog has many. Today functions are schema-filtered only.
