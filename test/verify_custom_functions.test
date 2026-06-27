@@ -30,6 +30,21 @@ SELECT cdb.dbo.cf_add(NULL::INTEGER, 5);
 ----
 NULL
 
+# dbo.cf_host_answer reuses the HOST DuckDB engine from inside a C# function: it calls Host.Query (the
+# host_query reverse callback), which runs 'SELECT 40+2' on a FRESH host connection and returns Arrow.
+# This is the full round-trip DuckDB -> C# scalar -> host_query -> fresh host connection -> Arrow -> back,
+# and it is reentrancy-safe (the nested run is a fresh connection, never the in-flight context). host-query.md.
+query I
+SELECT cdb.dbo.cf_host_answer(0);
+----
+42
+
+# Vectorized: the host query runs once per Invoke; the answer is returned for every input row.
+query I
+SELECT count(*) FILTER (WHERE a = 42) FROM (SELECT cdb.dbo.cf_host_answer(i) AS a FROM range(3) t(i));
+----
+3
+
 # It is discovered like any catalog function...
 query TTT
 SELECT schema_name, name, kind FROM mssql_net_functions('cdb') WHERE name = 'cf_add';
