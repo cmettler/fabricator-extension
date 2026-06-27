@@ -981,7 +981,11 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   row-tracking** fields) with a bare `GetInt64()` that throws on delta-rs's explicit `"field":null`; guarded with
   `TokenType==Null?null:GetInt64()`. Validated: `test/verify_delta.test` (39 — fixture `test/fixtures/delta_simple`,
   a delta-rs 10-row table; full scan + filter/aggregate + DESCRIBE + join). SPIKE, not a user feature. See
-  [docs/filesystem-bridge.md](docs/filesystem-bridge.md). v40 = filesystem reverse-callback SPIKE/foundation: a new `ArrowNetHostServices`
+  [docs/filesystem-bridge.md](docs/filesystem-bridge.md). A faster future path — engineered-wood as a Delta
+  **snapshot/file-list provider** feeding DuckDB's C++ **`MultiFileReader`** + native parquet reader (the
+  architecture of DuckDB's own `delta` ext, swapping delta-kernel-rs for the C# log layer), with a cheaper
+  `host_query`+`read_parquet` middle-ground first — is captured as a design note (deferred, nothing built):
+  [docs/multifile-delta.md](docs/multifile-delta.md). v40 = filesystem reverse-callback SPIKE/foundation: a new `ArrowNetHostServices`
   struct (host→managed function pointers: `fs_open_read`/`fs_size`/`fs_read`/`fs_close`/`free_str`) is passed
   to `Bootstrap.Initialize(vtable, size, host)` so the managed side can call back into DuckDB's `FileSystem`
   (secret-backed remote IO via DuckDB), plus an `fs_spike` vtable entry + `arrownet_fs_spike(path)` table fn
