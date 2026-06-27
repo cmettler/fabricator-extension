@@ -1006,7 +1006,16 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   **snapshot/file-list provider** feeding DuckDB's C++ **`MultiFileReader`** + native parquet reader (the
   architecture of DuckDB's own `delta` ext, swapping delta-kernel-rs for the C# log layer), with a cheaper
   `host_query`+`read_parquet` middle-ground first — is captured as a design note (deferred, nothing built):
-  [docs/multifile-delta.md](docs/multifile-delta.md). v40 = filesystem reverse-callback SPIKE/foundation: a new `ArrowNetHostServices`
+  [docs/multifile-delta.md](docs/multifile-delta.md). A separate deferred note,
+  [docs/delta-catalog.md](docs/delta-catalog.md), covers a **Delta WRITE-BACK** path: expose a Delta **folder
+  as an ATTACH catalog root** (`ATTACH '/lake/root' (TYPE arrownet, PROVIDER 'delta')`; each `_delta_log` subdir
+  = a table, discovered via `fs_glob`) as the 3rd `IBackend` reusing the provider-agnostic C++ catalog/scan/DML
+  wholesale. engineered-wood is full read-write (INSERT/DELETE/UPDATE via `WriteAsync`/`DeleteAsync`/`UpdateAsync`
+  + deletion vectors + commit writing; NO merge). Clean first slice = read + INSERT + CREATE (no rowid); the one
+  real decision is DELETE/UPDATE = rowid→deletion-vector (fits our rowid DML, needs an engineered-wood
+  position-delete) vs predicate (`FilterNode`→engineered-wood `Predicate` via its Arrow row evaluator — clean,
+  gap-free in that direction); UPDATE-SET evaluation + Delta's per-commit (non-cross-table-ACID) semantics are
+  the caveats. v40 = filesystem reverse-callback SPIKE/foundation: a new `ArrowNetHostServices`
   struct (host→managed function pointers: `fs_open_read`/`fs_size`/`fs_read`/`fs_close`/`free_str`) is passed
   to `Bootstrap.Initialize(vtable, size, host)` so the managed side can call back into DuckDB's `FileSystem`
   (secret-backed remote IO via DuckDB), plus an `fs_spike` vtable entry + `arrownet_fs_spike(path)` table fn

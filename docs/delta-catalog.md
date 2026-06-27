@@ -1,0 +1,138 @@
+# Delta Lake catalog (folder-as-root) + write-back — design idea, DEFERRED
+
+> Status: **design note only — nothing built.** Captures exposing a Delta Lake **folder** as an ATTACH-able
+> catalog (each `_delta_log` subdir = a table), reusing the existing multi-provider architecture so a Delta
+> table is read/written like any other catalog table. Write-back (INSERT / DELETE / UPDATE) is backed by
+> **engineered-wood**'s read-write Delta implementation. Builds on the validated filesystem bridge
+> ([docs/filesystem-bridge.md](filesystem-bridge.md)), the existing read-only `arrownet_delta_scan`
+> ([docs/multifile-delta.md](multifile-delta.md)), and the provider model
+> ([docs/provider-extensibility.md](provider-extensibility.md)).
+
+## Why
+
+Today Delta is a single **read-only global table function**, `arrownet_delta_scan(path)` (bespoke
+`arrownet_delta.cpp`, materialized C# read). There is **no write target** — a SQL `DELETE FROM <delta>` /
+`INSERT` has nothing to bind to. engineered-wood, however, is **full read-write** (see the capability survey
+below), so the missing piece is a *catalog* that turns a Delta location into addressable, writable table
+entries.
+
+A Delta "database" has no server and no namespace — it's just a **directory tree of tables**. So the natural
+catalog root is a **folder path**: `ATTACH '/lake/root' AS lake (TYPE arrownet, PROVIDER 'delta')`. Subdirs
+containing a `_delta_log/` are the tables.
+
+## It drops into the existing provider architecture (almost no new C++)
+
+A Delta catalog is the **3rd `IBackend`** (after SqlServer and DAX) — `DeltaBackend` / `DeltaCatalog`,
+registered in `BackendRegistry`, connstr = the folder path. The C++ core is already provider-agnostic: ATTACH,
+the catalog/schema/table entries, the scan operator, and the INSERT/CTAS/DML operators all dispatch to the
+handle's C# catalog. So a Delta catalog is **a C# `IBackendCatalog` + engineered-wood calls, with ~zero new
+C++**.
+
+- **Open** — `open_catalog(provider='delta', conn='/lake/root', options_json)` → a `DeltaCatalog` rooted at the
+  folder. (Provider selection + ATTACH options already exist, ABI v17/v37.)
+- **Discovery** — `get_metadata(Tables)`: list subdirs of the root containing `_delta_log/` via the FS bridge
+  **`fs_glob`** (ABI v41), so it works for local + `az://` / `s3://` / `https://` + DuckDB secrets, exactly
+  like the scan. `get_metadata(Columns)`: engineered-wood's snapshot schema (no data read), same path the
+  current scan binds with.
+- **Namespace** — Delta has none. Simplest: **flat** — every `_delta_log` dir under the root is a table in a
+  single `main` schema. Alternative: one subdir level = schema, next = table (a 2-level namespace). The folder
+  root gives a 1-/2-level namespace for free; start flat.
+- **Scan** — reuse the engineered-wood `DeltaReader` already wired for `arrownet_delta_scan`, now per
+  table-entry (projection/filter applied by DuckDB above the scan, as today; pushdown into the snapshot is a
+  later optimization — see [docs/multifile-delta.md](multifile-delta.md)).
+
+## engineered-wood write capability (surveyed)
+
+`src/EngineeredWood.DeltaLake` is genuinely read-write, not a reader:
+
+| Op | engineered-wood API | Notes |
+|---|---|---|
+| INSERT / APPEND | `DeltaTable.WriteAsync(batches, DeltaWriteMode.Append)` | clean — no rowid needed |
+| OVERWRITE | `WriteAsync(batches, DeltaWriteMode.Overwrite)` | replace all data |
+| CREATE | `DeltaTable.CreateAsync(...)` | writes protocol + metadata |
+| DELETE | `DeltaTable.DeleteAsync(Func<RecordBatch,BooleanArray> predicate)` | **predicate-driven** (deletion vectors) |
+| UPDATE | `DeltaTable.UpdateAsync(predicate, Func<RecordBatch,RecordBatch> updater)` | file rewrite; **updater is a batch transform**, not SET-expressions |
+| MERGE / UPSERT | — | **not implemented** |
+
+Plus: transaction-log commit writing (`TransactionLog.WriteCommitAsync(version, actions)`, atomic
+temp-then-rename + version-conflict detection — no `OptimisticTransaction` type, the atomic version check is
+the concurrency control), `ActionSerializer` (add/remove/metaData/protocol/commitInfo/txn/cdc/domainMetadata),
+deletion-vector **read and write** (`DeletionVectorReader` / `DeletionVectorWriter`), CDC, Vacuum, Compaction.
+All IO routes through the host `FileSystem` over the bridge callbacks (so secrets/remote work).
+
+## The clean first slice — read + INSERT + CREATE (no rowid)
+
+These map directly onto the existing DML operators and need no row identity:
+- **INSERT / INSERT…SELECT / COPY** → `WriteAsync(Append)` (reuse the streaming bulk path's batches).
+- **CTAS** → `CreateAsync` + `WriteAsync`.
+- **CREATE TABLE** → `CreateAsync` with the column schema.
+- (OVERWRITE / replace → `WriteAsync(Overwrite)`.)
+
+This alone makes a Delta lakehouse a read+append target via the SQL surface — useful on its own (e.g. the
+DirectLake-write idea in [docs/dax-provider.md](dax-provider.md): write the warehouse via SQL, the lakehouse
+via this Delta catalog).
+
+## The one real design decision — DELETE / UPDATE: rowid vs predicate
+
+Our existing DML is **rowid-driven**: DuckDB scans with the filter, collects the **rowids** of matching rows,
+and hands them to the catalog's delete (for SQL Server: `DELETE WHERE rowid IN (...)`). engineered-wood is
+**predicate-/rewrite-driven**. Two ways to bridge, pulling the design differently:
+
+1. **rowid = (file, row-index)** — the natural Delta address. Reuses our **entire** rowid-based DML path:
+   DuckDB gives a rowid set → group by file → write **deletion vectors** for those positions → add/remove
+   actions. Best fit for the existing machinery, but engineered-wood's public delete is predicate-only (the
+   `DeletionVectorWriter` is internal to `DeleteAsync`), so this needs a **small engineered-wood addition**: a
+   position-based delete ("apply a DV to these (file, rowindex) sets"). A scan must also surface a stable
+   (file, rowindex) rowid (engineered-wood already addresses rows this way for DVs).
+
+2. **predicate-based** — map the DELETE **filter** (`FilterNode → engineered-wood Predicate`, see below) and
+   call `DeleteAsync` directly; engineered-wood owns the file rewrite / DV. No rowid, but it means **bypassing
+   DuckDB's default rowid-driven delete** for this catalog (a more divergent DML path than SQL/DAX use).
+
+**`FilterNode → Predicate` is clean and gap-free in the direction we need.** engineered-wood
+(`EngineeredWood.Expressions`) has a real predicate model + an Arrow row evaluator
+(`IRowEvaluator.EvaluatePredicate(Predicate, RecordBatch) → BooleanArray`), so a `Predicate` adapts to
+`DeleteAsync`'s lambda in one line: `batch => evaluator.EvaluatePredicate(pred, batch)`. The map:
+
+| our `FilterNode` | engineered-wood |
+|---|---|
+| `and` / `or` | `AndPredicate` / `OrPredicate` (both N-ary) |
+| `compare` `=,<>,<,<=,>,>=` | `ComparisonPredicate` |
+| `is_null` / `is_not_null` | `UnaryPredicate(IsNull/IsNotNull)` |
+| `in` | `SetPredicate(In)` |
+| `is_distinct` / `is_not_distinct` | `NullSafeEqual` (± a `NotPredicate` for polarity) |
+
+The gaps a naive comparison surfaces (`StartsWith`, `IsNaN`, `True/False`, field-id binding) all live in the
+*other* direction (engineered-wood features SQL can't represent) and don't bite us — `FilterNode` is the
+subset. Our constants are indices into a separate Arrow value batch → resolve via `ArrowValueReader.ReadScalar`
+→ `LiteralValue.Of(...)`. So the predicate path is a ~60-line tree walk regardless of which delete strategy
+wins (it's also reusable for the UPDATE WHERE).
+
+**UPDATE's SET clause** is the genuinely open part: engineered-wood's updater is `Func<RecordBatch,RecordBatch>`
+(not per-column SET expressions). The WHERE reuses the predicate map; the SET needs either a **value**-expression
+evaluator (confirm engineered-wood exposes `Expression → column`, not just `Predicate → bool`) or a
+batch-transform we build from the bound SET assignments. DELETE is the cleaner target first.
+
+## Transaction semantics caveat
+
+engineered-wood commits **per write** (atomic version-N + conflict detection). A DuckDB multi-statement
+`BEGIN…COMMIT` spanning several Delta writes is therefore **not** one atomic Delta transaction — Delta is
+per-commit, no cross-table ACID. State this up front; it's a provider property, not a bug. (A single
+INSERT/DELETE = one Delta commit = atomic, which covers the common case.)
+
+## Recommendation (sequenced; build on demand)
+
+1. **Folder-root `DeltaCatalog` + read** — `DeltaBackend`/`DeltaCatalog` (3rd `IBackend`), `fs_glob` table
+   discovery, flat `main` schema, scan via the existing `DeltaReader`. ~All C#, no new C++. Proves ATTACH +
+   `SELECT FROM lake.t`.
+2. **INSERT / CREATE / CTAS / COPY** — `WriteAsync(Append)` / `CreateAsync`. No rowid; reuses the bulk path.
+3. **DELETE** — pick the rowid-vs-predicate strategy (lean: predicate via `FilterNode → Predicate`, since it's
+   contained and doesn't need an engineered-wood position-delete addition); deletion vectors handled by
+   engineered-wood.
+4. **UPDATE** — WHERE via the predicate map; resolve the SET-evaluation question.
+5. MERGE/UPSERT — out of scope (engineered-wood doesn't implement it; could be composed delete+append,
+   non-atomic).
+
+**Net:** the folder-as-catalog-root + read + INSERT + CREATE is a small, well-fitting slice that reuses the
+provider architecture wholesale; DELETE/UPDATE is where the one real choice (rowid→DV vs predicate, + UPDATE
+SET) lives. Build when a Delta write-back need is concrete (the DirectLake-write path is the likely driver).
