@@ -61,26 +61,60 @@ across cores — the actual fix for the idle-cores case. Cost: a new parallel sc
 `ArrowStreamScan` is single-stream/sequential) + per-partition stream marshaling across the ABI (the host asks
 C# for partition i's stream per thread, or C# hands over N streams up front). This is the meaningful build.
 
+## Partition strategies (the planner is pluggable; the executor is shared)
+
+Range-on-a-numeric-column (ConnectorX) is only one way to slice. The real abstraction: a **planner emits a
+list of disjoint, covering `WHERE` predicates**; the parallel executor (form A merge / form B N-thread scan)
+is identical regardless of how they were produced. Three planners, pick by the column(s):
+
+- **range** (ConnectorX) — an ordered/numeric `partition_on`, `partition_num` equal-width ranges
+  (`col >= lo AND col < hi`). Needs a `min/max` probe; **NULLs excluded**; skew-prone on non-uniform keys.
+- **hash bucket** — *any* column(s), `WHERE ABS(CHECKSUM(col1, col2)) % partition_num = i` pushed to SQL
+  Server. **No probe**, exactly `partition_num` partitions, balanced (the hash distributes), and it **covers
+  every row including NULLs** (the buckets are a total partition of the hash space). Often the best general
+  default — works for strings/dates/composites and gives controllable, balanced N. (CHECKSUM is light but can
+  skew; HASHBYTES is heavier but more uniform.)
+- **distinct values** — *(this idea)* one or more columns, one partition per distinct combination:
+  `SELECT DISTINCT col1, col2 FROM (<sql>)` → per combo `WHERE col1 IS NOT DISTINCT FROM v1 AND …` (NULL-safe).
+  Best when the data has **logical partitions** (region / year / tenant) or the key is non-numeric/composite.
+  Trade-off: **N = the distinct cardinality, not chosen** — low cardinality → under-parallel; high → thousands
+  of tiny single-combo queries (overhead). Bridge to a controllable N by **bucketing the distinct combos**
+  into ≤ `partition_num` groups (`WHERE (col1,col2) IN (…combos for bucket i…)`), which is really the hash
+  strategy applied to the distinct set.
+
+All three feed the same machinery: planner → predicate list → A (`ParallelMerge`) or B (N-thread scan). So a
+`partition_strategy` selector (`range` | `hash` | `values`, default `hash` for arbitrary columns / `range`
+for the ConnectorX-compatible numeric case) generalizes cleanly.
+
 ## Fitting it into `arrownet_query`
 
 `arrownet_query` is the raw-query path (C++ `QueryBind` → C# scan), not an `IArrowTableFunction`. Add two
 **optional NAMED parameters** (the `daxeval` pattern — named ⇒ optional, doesn't break the 2-arg call):
 
 ```sql
+-- range (ConnectorX-compatible)
 SELECT * FROM arrownet_query('db', 'SELECT * FROM lineitem',
                              partition_on := 'l_orderkey', partition_num := 10);
+-- hash bucket (any column, balanced, no probe)
+SELECT * FROM arrownet_query('db', 'SELECT * FROM orders',
+                             partition_on := 'o_custkey', partition_num := 10, partition_strategy := 'hash');
+-- distinct values (multi-column, logical partitions)
+SELECT * FROM arrownet_query('db', 'SELECT * FROM sales',
+                             partition_on := 'region, year', partition_strategy := 'values');
 ```
 
-No new ABI for the planning — `QueryBind` forwards the two params; the **SqlServer backend** does the
-ConnectorX-style range planning when they're set:
+Optional NAMED params: `partition_on` (column, or comma-list for `values`/`hash`), `partition_num`,
+`partition_strategy` (`range` | `hash` | `values`; default `hash` for non-numeric, `range` for numeric). No
+new ABI for the planning — `QueryBind` forwards the params; the **SqlServer backend** runs the selected
+planner:
 
-1. **Bounds**: `SELECT min(partition_on), max(partition_on) FROM (<sql>) x` (one round-trip; only when `partition_num > 1`).
-2. **Split** `[min,max]` into `partition_num` equal-width ranges.
-3. **Per partition**: `SELECT * FROM (<sql>) x WHERE partition_on >= lo AND partition_on < hi` (last inclusive),
-   run concurrently.
-4. **Consume**: form A → `ParallelMerge` to the existing single-stream scan (no ABI). Form B → the N range
-   queries become the N partition streams a parallel scan drains on N threads.
-5. Output schema probed once from `(<sql>)`, as the scan already does.
+1. **Plan** the predicate list (per strategy): `range` → `min/max` probe + equal-width ranges; `hash` →
+   `ABS(CHECKSUM(<cols>)) % N = i` (no probe); `values` → `SELECT DISTINCT <cols>` → per-combo NULL-safe
+   equality (optionally bucketed to ≤ `partition_num`).
+2. **Per partition**: `SELECT * FROM (<sql>) x WHERE <predicate_i>`, run concurrently.
+3. **Consume**: form A → `ParallelMerge` to the existing single-stream scan (no ABI); form B → the N queries
+   become the N partition streams a parallel scan drains on N threads.
+4. Output schema probed once from `(<sql>)`, as the scan already does.
 
 Absent the params → today's single query.
 
