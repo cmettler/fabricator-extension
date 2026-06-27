@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using Apache.Arrow;
 using Apache.Arrow.Ipc;
 
@@ -18,6 +19,15 @@ public static class Host
 
     /// <summary>Runs <paramref name="sql"/> on a fresh host connection; the caller owns + disposes the stream.</summary>
     public static IArrowArrayStream Query(string sql) => HostFs.Query(sql);
+
+    /// <summary>
+    /// Runs <paramref name="sql"/> on a fresh host connection with C#-provided named Arrow <paramref name="inputs"/>
+    /// registered as connection-scoped views first (data-in) — the SQL references them by name. The host
+    /// consumes the input streams during the query. Lets a managed component push data into the host engine
+    /// (join/filter/aggregate it with DuckDB) over Arrow. See docs/host-query.md.
+    /// </summary>
+    public static IArrowArrayStream Query(string sql, IReadOnlyList<(string Name, IArrowArrayStream Stream)> inputs)
+        => HostFs.Query(sql, inputs);
 
     /// <summary>
     /// Runs a non-query statement (DDL / DML) on a fresh host connection and returns the affected-row count

@@ -17,9 +17,17 @@ struct ArrowArrayStream;
 
 namespace duckdb {
 
+// One named Arrow input to register as a connection-scoped view before the query runs (data-in).
+struct HostQueryInput {
+	string name;
+	ArrowArrayStream *stream; // not owned here — consumed (+ released) by DuckDB's arrow_scan during the query
+};
+
 // Runs `sql` on a fresh Connection over `db` and fills `out` with a self-owning ArrowArrayStream over the
-// result (the Connection + result live until `out` is released). Throws on a query error.
-void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStream &out);
+// result (the Connection + result live until `out` is released). Each `inputs` entry is registered as a
+// connection-scoped view (so the SQL can reference it by name) before the query. Throws on a query error.
+void MakeHostQueryStream(DatabaseInstance &db, const string &sql, const vector<HostQueryInput> &inputs,
+                         ArrowArrayStream &out);
 
 // Registers the `arrownet_host_query(VARCHAR)` table function.
 void RegisterHostQuery(ExtensionLoader &loader);

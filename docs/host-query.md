@@ -104,6 +104,20 @@ ABI minimal. Both get parameter binding for free.
 - Data-in: a `host_query` with an input stream that the SQL joins/filters; and (layer 2) a replacement-scan
   test resolving a bare registered name.
 
+## Implementation status
+
+- **Slice 1 — `arrownet_host_query(sql)`** (the C++ engine: fresh connection + self-owning Arrow result via
+  the ingest path). DONE, `verify_host_query.test`.
+- **Slice 2 — C#-callable `host_query` host service (ABI v42→v43)** + public `Host.Query`/`Host.ExecuteNonQuery`.
+  DONE; round-trip verified (`cf_host_answer` in `verify_custom_functions.test`).
+- **Slice 3 — named Arrow inputs (data-in)**: `host_query` gained `ArrowNetHostInputs` (ABI v43); the host
+  registers each C#-provided stream as a connection-scoped view via `duckdb_arrow_scan` before the query.
+  `Host.Query(sql, inputs)`. DONE; verified (`cf_host_sum` pushes a C# Arrow table into a host query and sums
+  it on the host engine — `verify_custom_functions.test`).
+- **Deferred:** parameter binding (a 1-row Arrow param batch → prepared-statement bind) and the **ambient
+  replacement-scan layer** (a C# `name → Func<stream>` registry + a `DBConfig` replacement scan resolving bare
+  names to `arrownet_scan('name')`) — the scoped per-call inputs above cover the primary data-in need.
+
 ## Open / deferred
 
 - **Streaming result** (vs the current materialize-into-`ArrowProducer`): lazy fetch as the consumer pulls —

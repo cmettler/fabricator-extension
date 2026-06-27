@@ -45,6 +45,14 @@ SELECT count(*) FILTER (WHERE a = 42) FROM (SELECT cdb.dbo.cf_host_answer(i) AS 
 ----
 3
 
+# dbo.cf_host_sum pushes a C#-built Arrow table [1,2,3,4] INTO a host query (data-in): Host.Query registers
+# it as the connection-scoped view `in0` (duckdb_arrow_scan) and runs SELECT sum(v) FROM in0 on the host
+# engine. Proves C#-provided Arrow streaming into the host. 1+2+3+4 = 10. host-query.md.
+query I
+SELECT cdb.dbo.cf_host_sum(0);
+----
+10
+
 # It is discovered like any catalog function...
 query TTT
 SELECT schema_name, name, kind FROM mssql_net_functions('cdb') WHERE name = 'cf_add';

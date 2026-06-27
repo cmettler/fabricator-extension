@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using Apache.Arrow.C;
 using Apache.Arrow.Ipc;
@@ -114,18 +115,40 @@ internal static unsafe class HostFs
     /// result as an Arrow stream the caller owns (dispose to release the connection + result). Lets a managed
     /// component reuse the host engine — functions, readers, the catalog — over Arrow. See docs/host-query.md.
     /// </summary>
-    public static IArrowArrayStream Query(string sql)
+    public static IArrowArrayStream Query(string sql, IReadOnlyList<(string Name, IArrowArrayStream Stream)>? inputs = null)
     {
         if (!CanQuery)
         {
             throw new InvalidOperationException("host_query is unavailable (the host did not register it)");
         }
+        int n = inputs?.Count ?? 0;
         var sqlPtr = Marshal.StringToCoTaskMemUTF8(sql);
         var cstream = CArrowArrayStream.Create();
+        byte** namePtrs = null;
+        CArrowArrayStream** streamPtrs = null;
         try
         {
+            ArrowNetHostInputs hi = default;
+            ArrowNetHostInputs* hiPtr = null;
+            if (n > 0)
+            {
+                namePtrs = (byte**)Marshal.AllocHGlobal(sizeof(nint) * n);
+                streamPtrs = (CArrowArrayStream**)Marshal.AllocHGlobal(sizeof(nint) * n);
+                for (int i = 0; i < n; i++)
+                {
+                    namePtrs[i] = (byte*)Marshal.StringToCoTaskMemUTF8(inputs![i].Name);
+                    var s = CArrowArrayStream.Create();
+                    CArrowArrayStreamExporter.ExportArrayStream(inputs[i].Stream, s); // host consumes + releases it
+                    streamPtrs[i] = s;
+                }
+                hi.Count = n;
+                hi.Names = namePtrs;
+                hi.Streams = streamPtrs;
+                hiPtr = &hi;
+            }
+
             byte* err = null;
-            int rc = _h.HostQuery((byte*)sqlPtr, cstream, &err);
+            int rc = _h.HostQuery((byte*)sqlPtr, hiPtr, cstream, &err);
             if (rc != 0)
             {
                 throw HostError("host_query", err);
@@ -139,6 +162,24 @@ internal static unsafe class HostFs
             if (cstream != null)
             {
                 CArrowArrayStream.Free(cstream);
+            }
+            // Free the marshaling arrays + the input-stream allocations. The stream CONTENT was consumed +
+            // released by DuckDB during the (materializing) query; we free only our allocations.
+            if (namePtrs != null)
+            {
+                for (int i = 0; i < n; i++)
+                {
+                    Marshal.FreeCoTaskMem((nint)namePtrs[i]);
+                }
+                Marshal.FreeHGlobal((nint)namePtrs);
+            }
+            if (streamPtrs != null)
+            {
+                for (int i = 0; i < n; i++)
+                {
+                    CArrowArrayStream.Free(streamPtrs[i]);
+                }
+                Marshal.FreeHGlobal((nint)streamPtrs);
             }
             Marshal.FreeCoTaskMem(sqlPtr);
         }

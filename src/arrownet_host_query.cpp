@@ -10,6 +10,7 @@
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
+#include "duckdb.h" // C API: duckdb_arrow_scan + duckdb_connection (data-in via connection-scoped views)
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
 
@@ -72,7 +73,7 @@ unique_ptr<FunctionData> HostQueryBind(ClientContext &context, TableFunctionBind
 	auto db = context.db; // shared_ptr<DatabaseInstance>; the fresh connection is opened on it per run
 	auto bind_data = make_uniq<arrownet::ArrowStreamBindData>();
 	bind_data->factory = [db, sql](const arrownet::ArrowScanRequest &, ArrowArrayStream &out) {
-		MakeHostQueryStream(*db, sql, out);
+		MakeHostQueryStream(*db, sql, {}, out); // the table-function form takes no inputs
 	};
 	arrownet::PopulateReturnSchema(context, *bind_data, return_types, names);
 	return std::move(bind_data);
@@ -80,8 +81,19 @@ unique_ptr<FunctionData> HostQueryBind(ClientContext &context, TableFunctionBind
 
 } // namespace
 
-void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStream &out) {
+void MakeHostQueryStream(DatabaseInstance &db, const string &sql, const vector<HostQueryInput> &inputs,
+                         ArrowArrayStream &out) {
 	auto conn = make_uniq<Connection>(db); // FRESH connection: own context/transaction (see header)
+	// Register each named Arrow input as a connection-scoped view (data-in). duckdb_arrow_scan reinterprets
+	// the opaque handle back to ArrowArrayStream* and creates a temp view; the stream is consumed + released
+	// by DuckDB during the (materializing) query below.
+	for (auto &in : inputs) {
+		auto rc = duckdb_arrow_scan(reinterpret_cast<duckdb_connection>(conn.get()), in.name.c_str(),
+		                            reinterpret_cast<duckdb_arrow_stream>(in.stream));
+		if (rc != DuckDBSuccess) {
+			throw IOException("arrownet_host_query: failed to register input view '" + in.name + "'");
+		}
+	}
 	auto result = conn->Query(sql);
 	if (result->HasError()) {
 		throw IOException("arrownet_host_query: " + result->GetError());
@@ -114,12 +126,18 @@ static char *DupErr(const string &msg) {
 
 // The `host_query` host-service callback (C# -> host). Runs `sql` on a fresh connection + hands C# the
 // result as a self-owning ArrowArrayStream (C# imports + releases it). See abi.h / docs/host-query.md.
-int32_t HostQueryService(const char *sql, ArrowArrayStream *out, char **err) {
+int32_t HostQueryService(const char *sql, ArrowNetHostInputs *inputs, ArrowArrayStream *out, char **err) {
 	try {
 		if (!g_host_db) {
 			throw IOException("arrownet host_query: host database not available");
 		}
-		MakeHostQueryStream(*g_host_db, sql ? string(sql) : string(), *out);
+		vector<HostQueryInput> in;
+		if (inputs && inputs->count > 0) {
+			for (int32_t i = 0; i < inputs->count; i++) {
+				in.push_back({string(inputs->names[i]), inputs->streams[i]});
+			}
+		}
+		MakeHostQueryStream(*g_host_db, sql ? string(sql) : string(), in, *out);
 		return ARROWNET_OK;
 	} catch (std::exception &e) {
 		if (err) {

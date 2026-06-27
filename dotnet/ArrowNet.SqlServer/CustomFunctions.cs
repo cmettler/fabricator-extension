@@ -1,5 +1,6 @@
 using System.Runtime.CompilerServices;
 using Apache.Arrow;
+using Apache.Arrow.Ipc;
 using Apache.Arrow.Types;
 using ArrowNet.Bridge;
 
@@ -19,6 +20,7 @@ internal static class CustomFunctions
     {
         new CfAddFunction(),
         new CfHostAnswerFunction(),
+        new CfHostSumFunction(),
     };
 
     public static readonly IReadOnlyList<IArrowTableFunction> Table = new IArrowTableFunction[]
@@ -505,6 +507,40 @@ internal sealed class CfHostAnswerFunction : IArrowScalarFunction
             builder.Append(answer);
         }
         return builder.Build();
+    }
+}
+
+// Demo: dbo.cf_host_sum(x) pushes a C#-built Arrow table INTO a host query (data-in) and sums it on the
+// host DuckDB engine: Host.Query registers the input as a connection-scoped view `in0` (via duckdb_arrow_scan)
+// and runs `SELECT sum(v) FROM in0`. Proves C#-provided Arrow streaming into the host. See docs/host-query.md.
+internal sealed class CfHostSumFunction : IArrowScalarFunction
+{
+    public string SchemaName => "dbo";
+    public string Name => "cf_host_sum";
+    public Schema Parameters => new(new[] { new Field("x", Int64Type.Default, nullable: true) }, metadata: null);
+    public Field Result => new("host_sum", Int64Type.Default, nullable: false);
+
+    public IArrowArray Invoke(RecordBatch args)
+    {
+        var schema = new Schema(new[] { new Field("v", Int64Type.Default, nullable: false) }, metadata: null);
+        var col = new Int64Array.Builder().Append(1).Append(2).Append(3).Append(4).Build();
+        var inputBatch = new RecordBatch(schema, new IArrowArray[] { col }, 4);
+        var inputStream = new InMemoryArrayStream(schema, new[] { inputBatch }); // host consumes + disposes it
+
+        long sum;
+        using (var result = Host.Query("SELECT sum(v)::BIGINT AS s FROM in0",
+                                       new[] { ("in0", (IArrowArrayStream)inputStream) }))
+        {
+            var b = result.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult()
+                    ?? throw new InvalidOperationException("host_query returned no result");
+            sum = ((Int64Array)b.Column(0)).GetValue(0)!.Value; // 1+2+3+4 = 10
+        }
+        var outb = new Int64Array.Builder().Reserve(args.Length);
+        for (int i = 0; i < args.Length; i++)
+        {
+            outb.Append(sum);
+        }
+        return outb.Build();
     }
 }
 

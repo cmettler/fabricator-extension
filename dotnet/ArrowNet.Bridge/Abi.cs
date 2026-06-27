@@ -193,9 +193,19 @@ public unsafe struct ArrowNetHostServices
     public delegate* unmanaged[Cdecl]<byte*, void> FreeStr;
     // int32 fs_glob(void* opener, const char* pattern, char** out_json, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte*, byte**, byte**, int> FsGlob;
-    // int32 host_query(const char* sql, ArrowArrayStream* out, char** err) — run sql on a fresh host
-    // connection, result as Arrow (the managed caller imports + releases the stream). See docs/host-query.md.
-    public delegate* unmanaged[Cdecl]<byte*, CArrowArrayStream*, byte**, int> HostQuery;
+    // int32 host_query(const char* sql, ArrowNetHostInputs* inputs, ArrowArrayStream* out, char** err) — run
+    // sql on a fresh host connection (optionally registering named Arrow inputs as views first); result as
+    // Arrow (the managed caller imports + releases the stream). See docs/host-query.md.
+    public delegate* unmanaged[Cdecl]<byte*, ArrowNetHostInputs*, CArrowArrayStream*, byte**, int> HostQuery;
+}
+
+/// <summary>Mirrors <c>ArrowNetHostInputs</c> in abi.h — named Arrow streams handed to host_query as data-in
+/// (registered as connection-scoped views the SQL references by name).</summary>
+public unsafe struct ArrowNetHostInputs
+{
+    public int Count;
+    public byte** Names;                // Count UTF-8 view names
+    public CArrowArrayStream** Streams; // Count Arrow streams (parallel to Names)
 }
 
 /// <summary>Mirrors <c>ArrowNetAlterKind</c> in abi.h.</summary>
