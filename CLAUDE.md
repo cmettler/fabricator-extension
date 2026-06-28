@@ -422,6 +422,17 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   fully self-describing** — **design:
   [docs/provider-extensibility.md](docs/provider-extensibility.md)** (the unified "provider declares; core
   stays name-agnostic" model).
+- **Plugin system (ALC isolation)** — **design only, deferred: [docs/plugin-system.md](docs/plugin-system.md)**.
+  A plugin SPI where each plugin folder contributes `IBackend`(s) + global functions, optionally isolated in its
+  own `AssemblyLoadContext` so plugins with conflicting managed deps coexist. Works on our CoreCLR host. **Crux:
+  `Apache.Arrow`(+`.C`) MUST be SHARED (default context), never isolated** — every cross-boundary call traffics
+  Arrow types, and cross-ALC types aren't assignable, so all plugins pin the bridge's Arrow version (isolation
+  frees their OTHER deps only). The one fix over the textbook sketch: the `PluginLoadContext.Load` must return
+  null for an explicit **shared-name allowlist** (`ArrowNet.Abstractions` + `Apache.Arrow`/`.C`) BEFORE the
+  resolver, else `AssemblyDependencyResolver` loads an isolated Arrow copy and breaks everything. Clean shape:
+  extract a thin shared **`ArrowNet.Abstractions`** (interfaces + Arrow-typed contracts) + non-collectible
+  per-plugin ALCs, additive beside the default-context first-party providers (which gain nothing from isolation).
+  Adopt isolation only when a real dependency conflict / third-party plugin lands.
 
 ## Implementation status (current)
 
