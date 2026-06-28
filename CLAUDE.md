@@ -160,6 +160,13 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   section. The bespoke TVF could now fold into `IArrowTableFunction` (`table_execute` returns a stream) but
   needn't — the dispatch is already unified.
 - **Load-time global functions = the 4th provider-self-description capability** (design only; not built).
+  **Full plan: [docs/global-functions.md](docs/global-functions.md)** — splits into global **scalar** (build-now:
+  connection-free, fixed return type, motivated by a **template engine** `arrownet_render(template, params)`;
+  +1 ABI entry `list_global_functions` + a `handle==0` branch reusing `get_function_*_schema`/`execute_scalar`;
+  C# `IArrowGlobalScalarFunction` + `IBackend.GlobalScalarFunctions`, registered at load via
+  `RegisterArrowNetGlobalFunctions`→`loader.RegisterFunction`; composes with TMDL = render-via-scalar then
+  apply-via-table-fn/collector) vs global **table** (still deferred — the two wrinkles below). The rest of this
+  bullet is the table-case detail.
   Today provider functions are **attach-time catalog-bound** (4e/4f/4g — resolved as `db.schema.fn`, dispatched
   via the catalog `handle`). The deferred **Phase 3-A** alternative is **load-time global** functions
   (connection-free, bare `fn(...)`, registered at `Extension::Load`). **This does NOT break the catalog-only
