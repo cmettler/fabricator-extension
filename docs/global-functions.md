@@ -1,13 +1,14 @@
 # Load-time global functions (connection-free) — plan
 
-> Status: **Slices 1–3 BUILT + verified** — global **scalar** (ABI v46 `list_global_functions` + handle-0
-> dispatch; `arrownet_render`, Fluid/Liquid), **in-out + collector** (`arrownet_tag` streaming +
-> `arrownet_collect_sum` collector, handle-0 `inout_bind`), AND **table** (`arrownet_seq` fixed schema +
-> `arrownet_columns` ARG-DEPENDENT schema, handle-0 `table_bind` reusing the v29 session). All resolve as a bare
-> `fn(...)` with NO ATTACH — `test/verify_global_functions.test` (42). **Zero new ABI beyond the v46 scalar
-> entry** (in-out/collector reuse the v28 exchange ABI, table the v29 session, all with handle 0). Only **slice
-> 4** (host-FS table — secret-backed lakehouse readers like delta, needs an opener arg) remains deferred. The
-> **Phase 3-A**: connection-free functions registered
+> Status: **BUILT + verified for ALL FIVE kinds** — global **scalar** (ABI v46 `list_global_functions` +
+> handle-0 dispatch; `arrownet_render`, Fluid/Liquid), **in-out + collector** (`arrownet_tag` +
+> `arrownet_collect_sum`, handle-0 `inout_bind`), **table** (`arrownet_seq` fixed + `arrownet_columns`
+> ARG-DEPENDENT schema, handle-0 `table_bind` / v29 session), AND **aggregate** (`arrownet_product`, handle-0
+> `agg_open`; GROUP BY / parallel / OVER all work). All resolve as a bare `fn(...)` with NO ATTACH —
+> `test/verify_global_functions.test` (59). **Zero new ABI beyond the v46 scalar entry** (in-out/collector reuse
+> the v28 exchange ABI, table the v29 session, aggregate the v25/v26 `agg_*` ABI — all with handle 0). Only the
+> **host-FS table** sub-case (secret-backed lakehouse readers like delta, needs an opener arg) remains deferred.
+> The **Phase 3-A**: connection-free functions registered
 > at `Extension::Load` so a bare `fn(...)` works with **no ATTACH** (e.g. a template engine). The 4th member of
 > the "provider declares; core stays name-agnostic" family (after settings v33 / ATTACH options v37 / secret
 > fields v38). Today provider functions are all **attach-time catalog-bound** (`db.schema.fn`, dispatched via a
@@ -268,11 +269,19 @@ built once in slice 1; each later slice just extends the handle-0 branch to one 
    best-effort filter pushdown). The handle-0 `get_function_param_schema` became kind-agnostic
    (`GlobalFunctions.ParamSchema`). Demos `arrownet_seq` (fixed schema) + `arrownet_columns` (ARG-DEPENDENT
    schema). No opener. `test/verify_global_functions.test`.
-4. **Global table (host-FS reader)** — deferred; needs the **opener arg** on `table_bind`/`table_execute`. Keep
+4. **Global aggregate (UDAF) — DONE**: the `IAggregateFunction` base rename (`IArrowAggregateFunction` →
+   `ICatalogAggregateFunction`); `AggSessionImpl` moved to the Bridge as the public `AggregateSession` (shared by
+   catalog + global); `agg_open` handle-0 → `GlobalFunctions.ResolveAggregate`; the handle-0
+   `get_function_param_schema`/`get_function_return_schema` cover the aggregate kind (`ParamSchema`/`ReturnField`);
+   `RegisterArrowNetGlobalFunctions` registers `kind='aggregate'`/`'aggregate_spill'` via a shared
+   `BuildArrowNetAggregateFunction` at load. Reuses the v25/v26 `agg_*` ABI (no bump). Demo `arrownet_product`;
+   GROUP BY / parallel / OVER verified. `test/verify_global_functions.test`.
+5. **Global table (host-FS reader)** — deferred; needs the **opener arg** on `table_bind`/`table_execute`. Keep
    `arrownet_delta_scan` bespoke until a 2nd secret-backed FS reader justifies the generic opener path. See
    [docs/delta-catalog.md](delta-catalog.md) + the CLAUDE Phase-3-A note.
 
-**Net:** all four global kinds register through one mechanism (`list_global_functions` + the handle-0 `*_bind`
-marker), reusing the scalar/table-session/exchange-collector machinery wholesale — **global table + in-out cost
-zero ABI beyond the scalar slice**. The only genuinely deferred piece is the *host-FS-opener* sub-case of global
-table (secret-backed lakehouse readers like delta), which gets an opener arg when a 2nd such reader lands.
+**Net:** all FIVE global kinds (scalar / in-out / collector / table / aggregate) register through one mechanism
+(`list_global_functions` + the handle-0 `*_bind`/`*_open` marker), reusing the scalar / v29 table-session /
+v28 exchange-collector / v25-v26 aggregate machinery wholesale — **zero ABI beyond the v46 scalar entry**. The
+only genuinely deferred piece is the *host-FS-opener* sub-case of global table (secret-backed lakehouse readers
+like delta), which gets an opener arg when a 2nd such reader lands.

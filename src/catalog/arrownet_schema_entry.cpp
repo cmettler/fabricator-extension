@@ -750,6 +750,29 @@ void ArrowNetAggregateDestroy(Vector &state, AggregateInputData &aggr_input_data
 
 } // namespace
 
+// Builds an AggregateFunction whose state-vectorized callbacks marshal per-group int64 ids + Arrow batches to
+// the C# session over the agg_* ABI (ExecuteScalar's aggregate analog). `handle` = 0 for a connection-free
+// GLOBAL aggregate (C# resolves by name); `spillable` selects the bytes-in-blob mode (the callbacks branch on
+// the flag). Shared by catalog-bound aggregates (GetOrCreateAggregateFunction) + load-time global aggregates.
+static AggregateFunction BuildArrowNetAggregateFunction(ArrowNetHandle handle, const string &schema_name,
+                                                        const string &func_name, vector<LogicalType> arg_types,
+                                                        vector<string> arg_names, LogicalType return_type,
+                                                        bool spillable) {
+	AggregateFunction fn(func_name, arg_types, return_type, ArrowNetAggregateStateSize, ArrowNetAggregateInit,
+	                     ArrowNetAggregateUpdate, ArrowNetAggregateCombine, ArrowNetAggregateFinalize,
+	                     FunctionNullHandling::DEFAULT_NULL_HANDLING, ArrowNetAggregateSimpleUpdate,
+	                     ArrowNetAggregateBind, ArrowNetAggregateDestroy);
+	auto fn_info = make_shared_ptr<ArrowNetAggregateFunctionInfo>();
+	fn_info->handle = handle;
+	fn_info->schema = schema_name;
+	fn_info->func = func_name;
+	fn_info->arg_types = arg_types;
+	fn_info->arg_names = arg_names;
+	fn_info->spillable = spillable;
+	fn.function_info = std::move(fn_info);
+	return fn;
+}
+
 optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateAggregateFunction(ClientContext &context,
                                                                              const string &func_name) {
 	lock_guard<mutex> lock(entry_lock_);
@@ -776,18 +799,8 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateAggregateFunction(Cli
 		return nullptr;
 	}
 
-	AggregateFunction fn(func_name, arg_types, return_type, ArrowNetAggregateStateSize, ArrowNetAggregateInit,
-	                     ArrowNetAggregateUpdate, ArrowNetAggregateCombine, ArrowNetAggregateFinalize,
-	                     FunctionNullHandling::DEFAULT_NULL_HANDLING, ArrowNetAggregateSimpleUpdate,
-	                     ArrowNetAggregateBind, ArrowNetAggregateDestroy);
-	auto fn_info = make_shared_ptr<ArrowNetAggregateFunctionInfo>();
-	fn_info->handle = handle_;
-	fn_info->schema = name;
-	fn_info->func = func_name;
-	fn_info->arg_types = arg_types;
-	fn_info->arg_names = arg_names;
-	fn_info->spillable = spillable;
-	fn.function_info = std::move(fn_info);
+	AggregateFunction fn =
+	    BuildArrowNetAggregateFunction(handle_, name, func_name, arg_types, arg_names, return_type, spillable);
 
 	AggregateFunctionSet set(func_name);
 	set.AddFunction(fn);
@@ -1716,6 +1729,22 @@ void RegisterArrowNetGlobalFunctions(ExtensionLoader &loader) {
 				}
 				tf.function_info = std::move(fn_info);
 				loader.RegisterFunction(tf);
+			} else if (kind == "aggregate" || kind == "aggregate_spill") {
+				// A connection-free aggregate (UDAF): same state-vectorized callbacks as a catalog aggregate,
+				// handle = 0 so agg_open resolves the session against the C# global registry by name. Usable in
+				// GROUP BY / OVER / parallel. Mirrors GetOrCreateAggregateFunction.
+				vector<string> arg_names;
+				vector<LogicalType> arg_types;
+				LogicalType return_type;
+				try {
+					FetchFunctionParamSchema(context, nullptr, "", fn_name, arg_names, arg_types);
+					return_type = FetchFunctionReturnType(context, nullptr, "", fn_name);
+				} catch (std::exception &) {
+					continue;
+				}
+				AggregateFunction fn = BuildArrowNetAggregateFunction(nullptr, "", fn_name, arg_types, arg_names,
+				                                                      return_type, kind == "aggregate_spill");
+				loader.RegisterFunction(fn);
 			} else if (kind == "table") {
 				// A connection-free table function: positional args + the v29 table-session bind/scan, with
 				// handle = 0 so table_bind resolves the binding against the C# global registry by name. Output

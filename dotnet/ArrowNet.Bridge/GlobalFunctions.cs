@@ -28,6 +28,10 @@ public static class GlobalFunctions
         new(() => Build<ITableFunction>(b => b.GlobalTableFunctions, f => f.Name, "table"),
             LazyThreadSafetyMode.ExecutionAndPublication);
 
+    private static readonly Lazy<IReadOnlyDictionary<string, IAggregateFunction>> AggregateMap =
+        new(() => Build<IAggregateFunction>(b => b.GlobalAggregateFunctions, f => f.Name, "aggregate"),
+            LazyThreadSafetyMode.ExecutionAndPublication);
+
     /// <summary>All declared global scalar functions (the provider union), for <c>list_global_functions</c>.</summary>
     public static IReadOnlyCollection<IScalarFunction> AllScalars() => (IReadOnlyCollection<IScalarFunction>)ScalarMap.Value.Values;
 
@@ -48,18 +52,37 @@ public static class GlobalFunctions
             ? new BindingBoundTable(t.Bind(args!), supportsPushdown: true)
             : throw new ArgumentException($"arrownet: no global table function '{name}'");
 
+    /// <summary>All declared global aggregate functions, for <c>list_global_functions</c>.</summary>
+    public static IReadOnlyCollection<IAggregateFunction> AllAggregates() => (IReadOnlyCollection<IAggregateFunction>)AggregateMap.Value.Values;
+
+    /// <summary>Open a session for a global aggregate by name (the handle-0 agg_open path). Throws if none.</summary>
+    public static IAggregateSession ResolveAggregate(string name) =>
+        AggregateMap.Value.TryGetValue(name, out var a)
+            ? new AggregateSession(a)
+            : throw new ArgumentException($"arrownet: no global aggregate function '{name}'");
+
     /// <summary>The positional/cost parameter schema for ANY global function by name (the handle-0
-    /// get_function_param_schema path): a scalar's or table's <c>Parameters</c>; an in-out/collector declares
-    /// no cost args here (the input table is the <c>{TABLE}</c> param), so it returns an empty schema.</summary>
+    /// get_function_param_schema path): a scalar's, table's, or aggregate's <c>Parameters</c>; an in-out/collector
+    /// declares no cost args here (the input table is the <c>{TABLE}</c> param), so it returns an empty schema.</summary>
     public static Schema ParamSchema(string name)
     {
         if (ScalarMap.Value.TryGetValue(name, out var s)) { return s.Parameters; }
         if (TableMap.Value.TryGetValue(name, out var t)) { return t.Parameters; }
+        if (AggregateMap.Value.TryGetValue(name, out var a)) { return a.Parameters; }
         if (InOutMap.Value.ContainsKey(name) || CollectorMap.Value.ContainsKey(name))
         {
             return new Schema(System.Array.Empty<Field>(), metadata: null);
         }
         throw new ArgumentException($"arrownet: no global function '{name}'");
+    }
+
+    /// <summary>The single return field for a global scalar OR aggregate by name (the handle-0
+    /// get_function_return_schema path). Throws for kinds without a scalar return (table/in-out/collector).</summary>
+    public static Field ReturnField(string name)
+    {
+        if (ScalarMap.Value.TryGetValue(name, out var s)) { return s.Result; }
+        if (AggregateMap.Value.TryGetValue(name, out var a)) { return a.Result; }
+        throw new ArgumentException($"arrownet: global function '{name}' has no scalar return type");
     }
 
     /// <summary>Resolve a global scalar by name (case-insensitive); throws if none is registered.</summary>

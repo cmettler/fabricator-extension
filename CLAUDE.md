@@ -159,8 +159,9 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   unified the dispatch under `IBoundTable` (`table_bind`/`table_execute`/`table_close`); see the Phase 5
   section. The bespoke TVF could now fold into `IArrowTableFunction` (`table_execute` returns a stream) but
   needn't — the dispatch is already unified.
-- **Load-time global functions = the 4th provider-self-description capability** (**global SCALAR + IN-OUT +
-  COLLECTOR + TABLE DONE, ABI v46**; only the host-FS table sub-case deferred). Connection-free, ATTACH-free functions registered at `Extension::Load`
+- **Load-time global functions = the 4th provider-self-description capability** (**ALL FIVE kinds DONE — global
+  SCALAR + IN-OUT + COLLECTOR + TABLE + AGGREGATE, ABI v46**; only the host-FS table sub-case deferred).
+  Connection-free, ATTACH-free functions registered at `Extension::Load`
   via `loader.RegisterFunction`. **Slice 1 built + verified**: `list_global_functions` enumerates the
   provider-union at load + a **`handle==0`** branch on `get_function_*_schema`/`execute_scalar` resolves a
   function by name against the C# `GlobalFunctions` registry; `IBackend.GlobalScalarFunctions` declares them;
@@ -186,7 +187,11 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   (3) compute/connstr table **DONE** (`table_bind` handle-0 → `GlobalFunctions.ResolveTable` over the v29
   session; the handle-0 `get_function_param_schema` is kind-agnostic via `GlobalFunctions.ParamSchema`;
   `BindingBoundTable` moved to the Bridge; demos `arrownet_seq` fixed-schema + `arrownet_columns` arg-dependent
-  schema); (4) **deferred** host-FS table (secret-backed readers like delta) — needs an **opener arg** on
+  schema); (4) aggregate **DONE** (`IAggregateFunction` base + `ICatalogAggregateFunction`; `AggSessionImpl` →
+  the Bridge as public `AggregateSession` shared by catalog+global; `agg_open` handle-0 →
+  `GlobalFunctions.ResolveAggregate`; `ParamSchema`/`ReturnField` kind-agnostic; shared
+  `BuildArrowNetAggregateFunction`; reuses the v25/v26 `agg_*` ABI; demo `arrownet_product` — GROUP BY/parallel/
+  OVER); (5) **deferred** host-FS table (secret-backed readers like delta) — needs an **opener arg** on
   `table_bind`, delta stays bespoke until a 2nd such reader.
   Composes with TMDL = render-via-(global)scalar then apply-via-(global)table/collector. The rest of this bullet
   is the original table-case detail.

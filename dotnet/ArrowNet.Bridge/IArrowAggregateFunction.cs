@@ -16,12 +16,9 @@ namespace ArrowNet.Bridge;
 /// <see cref="CreateState"/>; partial states from parallel threads are merged via
 /// <see cref="IArrowAggregateState.Combine"/>.
 /// </summary>
-public interface IArrowAggregateFunction
+public interface IAggregateFunction
 {
-    /// <summary>Target catalog schema (e.g. "dbo"); created on attach if it isn't already present.</summary>
-    string SchemaName { get; }
-
-    /// <summary>Function name, as called: <c>db.SchemaName.Name(args)</c>.</summary>
+    /// <summary>Function name. Catalog: <c>db.schema.Name(args)</c>; global: the bare registered name.</summary>
     string Name { get; }
 
     /// <summary>The argument fields, in positional order (names + Arrow types) — the call signature.</summary>
@@ -48,8 +45,17 @@ public interface IArrowAggregateFunction
     bool SupportsSpill => false;
 }
 
+/// <summary>A catalog-bound custom aggregate (attach-time scope) — <see cref="IAggregateFunction"/> plus the
+/// <see cref="SchemaName"/>. For a connection-free, ATTACH-free aggregate, implement the base
+/// <see cref="IAggregateFunction"/> and declare it as a global instead.</summary>
+public interface ICatalogAggregateFunction : IAggregateFunction
+{
+    /// <summary>Target catalog schema (e.g. "dbo"); created on attach if it isn't already present.</summary>
+    string SchemaName { get; }
+}
+
 /// <summary>
-/// A single per-group accumulator created by <see cref="IArrowAggregateFunction.CreateState"/>. A given
+/// A single per-group accumulator created by <see cref="IAggregateFunction.CreateState"/>. A given
 /// instance is only ever touched by one thread at a time (DuckDB partitions work per thread), so it needs
 /// no internal locking. A brand-new instance must finalize to the "empty group" value (e.g. NULL or 0) —
 /// DuckDB may finalize a state that was never updated.
@@ -58,7 +64,7 @@ public interface IArrowAggregateState
 {
     /// <summary>
     /// Folds one batch of argument rows into this accumulator. <paramref name="args"/> carries the columns
-    /// described by <see cref="IArrowAggregateFunction.Parameters"/> (positional, same order); every row
+    /// described by <see cref="IAggregateFunction.Parameters"/> (positional, same order); every row
     /// belongs to this group. The accumulator sees NULL argument rows and decides how to treat them
     /// (standard SQL aggregates skip NULLs).
     /// </summary>
@@ -68,11 +74,11 @@ public interface IArrowAggregateState
     void Combine(IArrowAggregateState source);
 
     /// <summary>This group's single result value (boxed; <c>null</c> = SQL NULL), typed per
-    /// <see cref="IArrowAggregateFunction.Result"/>.</summary>
+    /// <see cref="IAggregateFunction.Result"/>.</summary>
     object? Finalize();
 
     /// <summary>
-    /// Spillable mode only (<see cref="IArrowAggregateFunction.SupportsSpill"/>): serialize this accumulator
+    /// Spillable mode only (<see cref="IAggregateFunction.SupportsSpill"/>): serialize this accumulator
     /// to a compact, self-contained byte form. Must fit the fixed cap (1&nbsp;KB) — throw or keep state small
     /// otherwise. The default throws (non-spillable aggregates need not implement it).
     /// </summary>

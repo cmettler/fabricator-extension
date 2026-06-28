@@ -6,7 +6,7 @@ namespace ArrowNet.Bridge;
 /// <summary>
 /// A custom-aggregate execution session (Phase 4h). One session per bound aggregate holds the map from
 /// DuckDB's per-group <c>int64</c> state ids to the live C# accumulators (see
-/// <see cref="IArrowAggregateFunction"/>). The C++ aggregate callbacks marshal the state id(s) + argument
+/// <see cref="IAggregateFunction"/>). The C++ aggregate callbacks marshal the state id(s) + argument
 /// columns over the <c>agg_*</c> ABI; this session routes them to the right accumulator. Opened at
 /// <c>bind</c> (<c>agg_open</c>), released when the bound plan is torn down (<c>agg_close</c>).
 ///
@@ -18,7 +18,7 @@ public interface IAggregateSession
 {
     /// <summary>
     /// Arrow schema of an <see cref="Update"/> batch: an <c>int64</c> "state_id" column followed by the
-    /// function's <see cref="IArrowAggregateFunction.Parameters"/> (used to import the batch).
+    /// function's <see cref="IAggregateFunction.Parameters"/> (used to import the batch).
     /// </summary>
     Schema UpdateSchema { get; }
 
@@ -41,7 +41,7 @@ public interface IAggregateSession
     /// <summary>Releases the session (the id→accumulator map). Idempotent.</summary>
     void Close();
 
-    // ---- Spillable mode (IArrowAggregateFunction.SupportsSpill) — state lives as bytes in DuckDB's blob,
+    // ---- Spillable mode (IAggregateFunction.SupportsSpill) — state lives as bytes in DuckDB's blob,
     // not in this session; each call round-trips bytes <-> a transient accumulator. ----
 
     /// <summary>

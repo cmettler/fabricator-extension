@@ -66,6 +66,10 @@ public interface IBackend
     /// docs/global-functions.md.</summary>
     IEnumerable<ITableFunction> GlobalTableFunctions => System.Array.Empty<ITableFunction>();
 
+    /// <summary>Connection-free GLOBAL aggregate functions (UDAF), registered at load as a bare <c>fn(args)</c>
+    /// usable in <c>GROUP BY</c> / <c>OVER</c> / parallel. Empty by default. See docs/global-functions.md.</summary>
+    IEnumerable<IAggregateFunction> GlobalAggregateFunctions => System.Array.Empty<IAggregateFunction>();
+
     /// <summary>
     /// Builds a provider connection string from a secret's fields (the host reads the DuckDB secret and
     /// passes its key/values here). Keeps all provider connection-string / auth formatting in the backend —
@@ -219,7 +223,7 @@ public interface IBackendCatalog : IDisposable
 
     /// <summary>
     /// Opens a custom-aggregate session for <c>schema.func</c> (a provider-authored
-    /// <see cref="IArrowAggregateFunction"/>). The session maps DuckDB's per-group <c>int64</c> state ids
+    /// <see cref="IAggregateFunction"/>). The session maps DuckDB's per-group <c>int64</c> state ids
     /// to live C# accumulators; the C++ aggregate callbacks marshal ids + argument columns through it. See
     /// <see cref="IAggregateSession"/>.
     /// </summary>

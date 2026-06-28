@@ -15,7 +15,7 @@ namespace ArrowNet.SqlServer;
 /// attached catalog alongside the discovered SQL Server functions (resolved as <c>db.schema.name(args)</c>).
 /// To add one, implement the matching Bridge interface (<see cref="ICatalogScalarFunction"/>,
 /// <see cref="ICatalogTableFunction"/>, <see cref="ICatalogInOutFunction"/> — or its fixed-schema convenience base
-/// <see cref="StaticInOutFunction"/> — or <see cref="IArrowAggregateFunction"/>) and list it in the
+/// <see cref="StaticInOutFunction"/> — or <see cref="ICatalogAggregateFunction"/>) and list it in the
 /// corresponding array below. These run entirely in C# — there need be no corresponding SQL Server object.
 /// </summary>
 internal static class CustomFunctions
@@ -50,6 +50,13 @@ internal static class CustomFunctions
         new GfColumnsFunction(),
     };
 
+    // Connection-free GLOBAL aggregate functions (UDAF) — bare fn(args), no ATTACH, usable in GROUP BY / OVER /
+    // parallel. Implement the base IAggregateFunction (no SchemaName).
+    public static readonly IReadOnlyList<IAggregateFunction> GlobalAggregate = new IAggregateFunction[]
+    {
+        new GfProductFunction(),
+    };
+
     public static readonly IReadOnlyList<ICatalogScalarFunction> Scalar = new ICatalogScalarFunction[]
     {
         new CfAddFunction(),
@@ -78,7 +85,7 @@ internal static class CustomFunctions
 
     // Aggregate functions (UDAF). The function object is a singleton; CreateState() mints the per-group
     // accumulator. These reduce in C# (no SQL Server equivalent) and work in GROUP BY / parallel / OVER(...).
-    public static readonly IReadOnlyList<IArrowAggregateFunction> Aggregate = new IArrowAggregateFunction[]
+    public static readonly IReadOnlyList<ICatalogAggregateFunction> Aggregate = new ICatalogAggregateFunction[]
     {
         new CfProductFunction(),
         new CfBitOrFunction(),
@@ -171,7 +178,7 @@ internal sealed class CfCollectFunction : StaticCollectorFunction
 // Finalize sorts + picks the median. Order-independent, so it's correct under parallel partial-state merging.
 // SupportsSpill stays false (the default): an unbounded collection can't fit the fixed spill blob, so holistic
 // aggregates run in the fast in-memory mode (bounded by the group's cardinality), like DuckDB's own median.
-internal sealed class CfMedianFunction : IArrowAggregateFunction
+internal sealed class CfMedianFunction : ICatalogAggregateFunction
 {
     public string SchemaName => "dbo";
     public string Name => "cf_median";
@@ -215,7 +222,7 @@ internal sealed class CfMedianFunction : IArrowAggregateFunction
 // Demo (aggregate): dbo.cf_product(x BIGINT) -> BIGINT, the product of all non-NULL inputs (SQL Server has
 // no PRODUCT aggregate). Empty group / all-NULL => NULL (SUM-like). Order-independent => safe under parallel
 // combine and windowing.
-internal sealed class CfProductFunction : IArrowAggregateFunction
+internal sealed class CfProductFunction : ICatalogAggregateFunction
 {
     public string SchemaName => "dbo";
     public string Name => "cf_product";
@@ -258,7 +265,7 @@ internal sealed class CfProductFunction : IArrowAggregateFunction
 
 // Demo (aggregate): dbo.cf_bit_or(x BIGINT) -> BIGINT, the bitwise OR of all non-NULL inputs. Associative +
 // commutative => a clean parallel/combine test. Empty group / all-NULL => NULL.
-internal sealed class CfBitOrFunction : IArrowAggregateFunction
+internal sealed class CfBitOrFunction : ICatalogAggregateFunction
 {
     public string SchemaName => "dbo";
     public string Name => "cf_bit_or";
@@ -303,7 +310,7 @@ internal sealed class CfBitOrFunction : IArrowAggregateFunction
 // behaviour to SUM, but opts into spillable mode (SupportsSpill + Serialize/Load): its state is serialized
 // into DuckDB's fixed state blob so a huge-cardinality GROUP BY can spill to disk. State = {any:bool, sum:long}
 // => 9 bytes, well under the 1 KB cap. Empty group / all-NULL => NULL.
-internal sealed class CfSumSpillFunction : IArrowAggregateFunction
+internal sealed class CfSumSpillFunction : ICatalogAggregateFunction
 {
     public string SchemaName => "dbo";
     public string Name => "cf_sum_spill";
@@ -947,6 +954,43 @@ internal sealed class GfColumnsFunction : ITableFunction
         }
 
         public void Dispose() { }
+    }
+}
+
+// GLOBAL aggregate (UDAF, connection-free): arrownet_product(x BIGINT) -> BIGINT, the product of all non-NULL
+// inputs, no ATTACH. The global analog of cf_product; implements the base IAggregateFunction (no SchemaName),
+// registered at load. Works in GROUP BY / OVER / parallel via the shared state-vectorized session. Empty group
+// / all-NULL => NULL. See docs/global-functions.md.
+internal sealed class GfProductFunction : IAggregateFunction
+{
+    public string Name => "arrownet_product";
+    public Schema Parameters => new(new[] { new Field("x", Int64Type.Default, nullable: true) }, metadata: null);
+    public Field Result => new("product", Int64Type.Default, nullable: true);
+    public IArrowAggregateState CreateState() => new State();
+
+    private sealed class State : IArrowAggregateState
+    {
+        private bool _any;
+        private long _product = 1;
+
+        public void Update(RecordBatch args)
+        {
+            var x = (Int64Array)args.Column(0);
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (x.IsNull(i)) { continue; } // NULLs skipped (standard aggregate semantics)
+                _product *= x.Values[i];
+                _any = true;
+            }
+        }
+
+        public void Combine(IArrowAggregateState source)
+        {
+            var s = (State)source;
+            if (s._any) { _product *= s._product; _any = true; }
+        }
+
+        public object? Finalize() => _any ? _product : null;
     }
 }
 

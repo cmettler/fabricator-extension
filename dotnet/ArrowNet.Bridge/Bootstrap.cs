@@ -765,10 +765,9 @@ public static unsafe class Bootstrap
                 return ArrowNetStatus.InvalidArgument;
             }
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
-            if (handle == 0) // global (connection-free) function
+            if (handle == 0) // global (connection-free) function — scalar or aggregate return type
             {
-                var rf = GlobalFunctions.ResolveScalar(f).Result;
-                CArrowSchemaExporter.ExportSchema(new Schema(new[] { rf }, null), outSchema);
+                CArrowSchemaExporter.ExportSchema(new Schema(new[] { GlobalFunctions.ReturnField(f) }, null), outSchema);
                 return ArrowNetStatus.Ok;
             }
             var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
@@ -1126,6 +1125,14 @@ public static unsafe class Bootstrap
                 returnType.Append(string.Empty);
                 rows++;
             }
+            foreach (var fn in GlobalFunctions.AllAggregates())
+            {
+                name.Append(fn.Name);
+                kind.Append(fn.SupportsSpill ? "aggregate_spill" : "aggregate");
+                paramCount.Append(fn.Parameters.FieldsList.Count);
+                returnType.Append(fn.Result.DataType.Name);
+                rows++;
+            }
             var schema = new Schema(new[]
             {
                 new Field("name", StringType.Default, nullable: false),
@@ -1263,10 +1270,13 @@ public static unsafe class Bootstrap
             {
                 return ArrowNetStatus.InvalidArgument;
             }
-            var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
-            var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
-            *outSession = Handles.Alloc(catalog.AggOpen(s, f));
+            // handle == 0 => a connection-free GLOBAL aggregate: open a session from the global registry by name.
+            var session = handle == 0
+                ? GlobalFunctions.ResolveAggregate(f)
+                : (Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty))
+                    .AggOpen(Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty, f);
+            *outSession = Handles.Alloc(session);
             return ArrowNetStatus.Ok;
         }
         catch (Exception ex)

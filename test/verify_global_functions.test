@@ -110,3 +110,45 @@ query I
 SELECT c5 FROM arrownet_columns(5);
 ----
 5
+
+# ---- global AGGREGATE (UDAF) — bare fn(args), no ATTACH (GROUP BY / parallel / OVER) ----
+# Ungrouped product: 2 * 3 * 4 = 24.
+query I
+SELECT arrownet_product(x) FROM (VALUES (2),(3),(4)) v(x);
+----
+24
+
+# GROUP BY: per-group product.
+query II
+SELECT g, arrownet_product(x) FROM (VALUES (1,2),(1,5),(2,3),(2,7)) v(g,x) GROUP BY g ORDER BY g;
+----
+1	10
+2	21
+
+# Parallel (threads=4) cross-checked against the built-in product() — exercises multi-thread combine.
+statement ok
+SET threads=4;
+
+query I
+SELECT arrownet_product(i + 1) = product(i + 1)::BIGINT FROM range(12) t(i);
+----
+true
+
+statement ok
+RESET threads;
+
+# Window OVER — running product 1,2,6,24 (proves the segment-tree path drives our callbacks).
+query II
+SELECT i, arrownet_product(i + 1) OVER (ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+FROM range(4) t(i) ORDER BY i;
+----
+0	1
+1	2
+2	6
+3	24
+
+# Empty / all-NULL group => NULL (SUM-like empty value).
+query I
+SELECT arrownet_product(x::BIGINT) FROM (VALUES (NULL),(NULL)) v(x);
+----
+NULL
