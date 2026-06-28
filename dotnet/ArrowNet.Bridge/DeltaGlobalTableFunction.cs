@@ -26,6 +26,11 @@ public sealed class DeltaGlobalTableFunction : ITableFunction
     public Schema Parameters { get; } =
         new Schema(new[] { new Field("path", StringType.Default, nullable: false) }, metadata: null);
 
+    // Delta/Parquet statistics are byte-ordered (UTF-8 binary), matching DuckDB's default binary string
+    // comparison — so string ordering comparisons + BETWEEN are superset-safe to push into file/row-group
+    // skipping (the C++ FilterSerializer honors this; DuckDB re-applies regardless).
+    public bool StringOrderPushable => true;
+
     public IArrowTableFunctionBinding Bind(RecordBatch args)
     {
         var path = ((StringArray)args.Column(0)).GetString(0)

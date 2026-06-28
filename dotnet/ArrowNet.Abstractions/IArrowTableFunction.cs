@@ -24,6 +24,16 @@ public interface ITableFunction
     Schema Parameters { get; }
 
     /// <summary>
+    /// Whether this function's source orders strings the same way DuckDB does (byte/binary) — so string
+    /// ordering comparisons (<c>&lt;</c> <c>&gt;</c> …) and <c>BETWEEN</c> are superset-safe to push into it.
+    /// Default <c>false</c> (conservative: a function whose filter is rendered to a collation-dependent engine
+    /// only gets string EQUALITY pushed). A byte-ordered reader — e.g. a Delta/Parquet lakehouse scan, whose
+    /// statistics are byte-ordered like DuckDB's default — sets it <c>true</c>. (Only the host-FS / pushdown
+    /// global table path consults this; a pure-compute function that ignores the pushed filter is unaffected.)
+    /// </summary>
+    bool StringOrderPushable => false;
+
+    /// <summary>
     /// Binds one call: <paramref name="args"/> is a single (1-row) batch whose columns are the constant
     /// argument values (positional, matching <see cref="Parameters"/>). Returns a per-call binding carrying
     /// the resolved output schema + any state. Mirrors DuckDB's bind.

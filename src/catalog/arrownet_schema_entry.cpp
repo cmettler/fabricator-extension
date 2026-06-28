@@ -838,6 +838,12 @@ struct ArrowNetTableFunctionInfo : public TableFunctionInfo {
 	vector<LogicalType> arg_types;
 	vector<string> arg_names;
 	bool is_proc = false;    // stored procedure (EXEC, no pushdown) vs TVF (FROM, pushdown)
+	// The function's source orders strings the way DuckDB does (byte/binary), so string ordering comparisons +
+	// BETWEEN are superset-safe to push (e.g. a Delta/Parquet reader — byte-ordered stats). Default false:
+	// discovered SQL TVFs run on SQL Server under its (possibly case-insensitive) collation, so only string
+	// equality is pushed for them. Set true for a byte-ordered global host-FS reader (declared in C#). Copied
+	// onto the scan bind data so ArrowNetComplexFilterPushdown's FilterSerializer honors it.
+	bool string_order_pushable = false;
 };
 
 // Per-plan binding handle for the session-model table functions (table_bind / table_execute / table_close).
@@ -895,6 +901,9 @@ unique_ptr<FunctionData> ArrowNetTableFunctionBind(ClientContext &context, Table
 	}
 
 	auto bind_data = make_uniq<arrownet::ArrowStreamBindData>();
+	// A byte-ordered source (e.g. a Delta/Parquet global reader) can safely push string ordering + BETWEEN;
+	// discovered SQL TVFs leave this false (collation-dependent). Read by the shared FilterSerializer.
+	bind_data->string_order_pushable = info.string_order_pushable;
 
 	auto properties = arrownet::BoundaryClientProperties(context);
 	auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(context, arg_types);
@@ -1681,11 +1690,13 @@ void RegisterArrowNetGlobalFunctions(ExtensionLoader &loader) {
 		ArrowArrayStream stream;
 		std::memset(&stream, 0, sizeof(stream));
 		arrownet::ListGlobalFunctions(stream);
-		// Columns: name, kind, param_count(int), return_type. We read the two leading string columns (name,
-		// kind); the precise arg/return types come from the per-function fetch below (handle = 0 = global).
-		auto rows = ReadStringTable(stream, 2);
+		// Columns: name, kind, string_order, param_count(int), return_type. We read the three leading string
+		// columns (name, kind, string_order); the precise arg/return types come from the per-function fetch
+		// below (handle = 0 = global). string_order ("1"/"0") marks a byte-ordered-string table reader.
+		auto rows = ReadStringTable(stream, 3);
 		const auto &names = rows[0];
 		const auto &kinds = rows[1];
+		const auto &string_order = rows[2];
 		if (names.empty()) {
 			return; // no global functions declared
 		}
@@ -1781,6 +1792,8 @@ void RegisterArrowNetGlobalFunctions(ExtensionLoader &loader) {
 				fn_info->arg_types = arg_types;
 				fn_info->arg_names = arg_names;
 				fn_info->is_proc = false;
+				// A byte-ordered-string reader (e.g. Delta/Parquet) can safely push string ordering + BETWEEN.
+				fn_info->string_order_pushable = string_order[i] == "1";
 				tf.function_info = std::move(fn_info);
 				loader.RegisterFunction(tf);
 			}

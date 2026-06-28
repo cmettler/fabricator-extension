@@ -33,7 +33,12 @@ namespace {
 // so over-approximation is correct, under-approximation is not.
 class FilterSerializer {
 public:
-	FilterSerializer(LogicalGet &get, vector<Value> &constants) : get_(get), constants_(constants) {
+	// `string_order_pushable` = the source orders strings the same way DuckDB does for these scans (a binary
+	// `_BIN/_BIN2` SQL collation, or a byte-ordered source like Parquet/Delta statistics). When true, string
+	// ordering comparisons (`<` `<=` `>` `>=` `<>` `is_distinct`) and string BETWEEN are superset-safe to push;
+	// otherwise only string equality (`=`/`is_not_distinct`, superset-safe under any collation) is pushed.
+	FilterSerializer(LogicalGet &get, vector<Value> &constants, bool string_order_pushable)
+	    : get_(get), constants_(constants), string_order_pushable_(string_order_pushable) {
 	}
 
 	// Returns true and fills `out` (a JSON object) iff `e` was fully serialized.
@@ -145,11 +150,17 @@ private:
 	// column collation, which for `=`/IN is typically LOOSER (=> superset, safe) but
 	// for ordering / `<>` / IS DISTINCT can be a strict subset (=> drops rows). So for
 	// VARCHAR push only the positive-equality shapes.
-	static bool SafeForType(const char *cmp, const LogicalType &type) {
+	bool SafeForType(const char *cmp, const LogicalType &type) const {
 		if (type.id() != LogicalTypeId::VARCHAR) {
 			return true; // numeric / temporal / bool / blob / uuid: exact
 		}
-		return string(cmp) == "=" || string(cmp) == "is_not_distinct";
+		// Equality is superset-safe under ANY string collation (a case-insensitive source returns a superset;
+		// DuckDB re-applies). Ordering / not-equal match DuckDB only when the source is byte/binary-ordered.
+		string c(cmp);
+		if (c == "=" || c == "is_not_distinct") {
+			return true;
+		}
+		return string_order_pushable_;
 	}
 
 	idx_t AddConstant(const Value &v) {
@@ -299,8 +310,8 @@ private:
 		if (!ColumnName(*b.input, name, coltype)) {
 			return false;
 		}
-		if (coltype.id() == LogicalTypeId::VARCHAR) {
-			return false; // string range: collation-dependent ordering, not superset-safe
+		if (coltype.id() == LogicalTypeId::VARCHAR && !string_order_pushable_) {
+			return false; // string range: collation-dependent ordering, not superset-safe (unless byte-ordered)
 		}
 		if (b.lower->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT ||
 		    b.upper->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
@@ -329,6 +340,7 @@ private:
 
 	LogicalGet &get_;
 	vector<Value> &constants_;
+	bool string_order_pushable_;
 };
 
 } // namespace
@@ -345,7 +357,7 @@ void ArrowNetComplexFilterPushdown(ClientContext &, LogicalGet &get, FunctionDat
 	if (filters.empty()) {
 		return;
 	}
-	FilterSerializer ser(get, bind_data.filter_constants);
+	FilterSerializer ser(get, bind_data.filter_constants, bind_data.string_order_pushable);
 	vector<string> parts;
 	for (auto &f : filters) { // do NOT erase — DuckDB re-applies them
 		string js;

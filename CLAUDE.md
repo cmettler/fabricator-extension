@@ -175,10 +175,16 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   SQL function suite unregressed. See [docs/global-functions.md](docs/global-functions.md) §"Host-FS global
   table functions". **The reader STREAMS lazily** (captures the opener — valid for the whole execution — and
   pulls one batch at a time, no materialization) **and pushes the FILTER into engineered-wood file + row-group
-  skipping** (`DeltaFilterBuilder` maps the `FilterNode` → `EngineeredWood.Expressions.Predicate` — all
-  comparisons `=`/`<>`/`<`/`<=`/`>`/`>=` + `IN` for any type incl. strings, since Parquet min/max stats are
-  byte-ordered like DuckDB's default binary string comparison; superset-safe;
-  the predicate drives the Delta file pruner `ReadAllAsync(columns, filter)` AND per-file Parquet row-group
+  skipping** (`DeltaFilterBuilder` maps the `FilterNode` → `EngineeredWood.Expressions.Predicate`; the
+  superset-safe policy lives in the shared C++ `FilterSerializer` gated on `string_order_pushable` — string
+  ordering + `BETWEEN` push only for a byte-ordered source. `DeltaGlobalTableFunction.StringOrderPushable=>true`
+  (Parquet stats byte-ordered like DuckDB's default), so all comparisons `=`/`<>`/`<`/`<=`/`>`/`>=` + `IN` +
+  `BETWEEN` push incl. strings. The SQL catalog scan shares the encoder + flag, so it ALSO pushes string
+  ordering/`BETWEEN` under a binary `_BIN2` collation (latent win, `dm_exec`-proven in
+  `verify_collation_pushdown`); discovered SQL TVFs stay equality-only (collation-dependent). The C# signal
+  rides the `list_global_functions` metadata (a `string_order` column) → `ArrowNetTableFunctionInfo` →
+  `bind_data.string_order_pushable`; no ABI bump.
+  The predicate drives the Delta file pruner `ReadAllAsync(columns, filter)` AND per-file Parquet row-group
   pruning via `ParquetReadOptions.Filter` on a per-scan `DeltaTableOptions` — no engineered-wood change). Column
   PROJECTION into the Parquet read stays deferred: the shared `BindingBoundTable` wraps the result stream with
   the binding's FULL `OutputSchema`, so a projected subset mismatches it (arrow_ingest SIGSEGV) — DuckDB projects

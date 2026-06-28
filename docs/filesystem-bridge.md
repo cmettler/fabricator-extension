@@ -91,7 +91,7 @@ secrets all work, one auth config shared with native reads.
   throws on delta-rs's explicit `"field":null` (engineered-wood's own writer omits them). Guarded with
   `TokenType == Null ? null : GetInt64()` — an upstream-worthy robustness fix for reading delta-rs tables.
 
-**Validated** (`test/verify_delta.test`, 52 assertions; fixture `test/fixtures/delta_simple`, a delta-rs table
+**Validated** (`test/verify_delta.test`, 60 assertions; fixture `test/fixtures/delta_simple`, a delta-rs table
 of 10 rows id/name/amount): full scan with correct bind-time types, filter+aggregate, `DESCRIBE` schema, and
 the pushed-filter cases (`=`/`IN`/`AND`-range, and string `=`/`>`/`<>` — all pushed into engineered-wood
 skipping, byte-order-sound) — all green. The Apache.Arrow version is aligned (engineered-wood + the bridge both
@@ -105,13 +105,18 @@ skipping, byte-order-sound) — all green. The Apache.Arrow version is aligned (
   old materialize-into-`InMemoryArrayStream`.
 - **Filter pushdown into file + row-group skipping — DONE**: `DeltaFilterBuilder` maps the scan's `FilterNode`
   tree (constants read from `filter_values` via `ArrowValueReader`) into an engineered-wood
-  `EngineeredWood.Expressions.Predicate`, superset-safe (all comparisons `=`/`<>`/`<`/`<=`/`>`/`>=` + `IN` push
-  for any type incl. strings — Parquet byte-order stats match DuckDB's default binary string comparison; `and`
-  keeps pushable children, `or` is all-or-nothing; temporal/GUID/binary literals not pushed yet). The predicate
+  `EngineeredWood.Expressions.Predicate`. The superset-safety policy lives UPSTREAM in the shared C++
+  `FilterSerializer`, gated on `string_order_pushable`: numeric/temporal/bool comparisons + string `=`/`IN`
+  always push; string ordering (`<`/`>`/…) + string `BETWEEN` push only when the source is byte-ordered.
+  `DeltaGlobalTableFunction.StringOrderPushable => true` (Parquet stats are byte-ordered, matching DuckDB's
+  default binary string comparison), so ALL string comparisons push for Delta. (The SQL catalog scan shares
+  the encoder and gets the same relaxation under a binary `_BIN2` collation — proven by `dm_exec` in
+  `verify_collation_pushdown`.) `and` keeps pushable children, `or` is all-or-nothing; temporal/GUID/binary
+  literals aren't pushed yet. The predicate
   drives BOTH the Delta file pruner (`ReadAllAsync(columns, filter)`) AND per-file Parquet row-group/stats
   pruning (set via `ParquetReadOptions.Filter` on the per-scan `DeltaTableOptions` — no engineered-wood change
   needed). engineered-wood never re-applies per row, and DuckDB re-applies above the scan, so the result is a
-  correct superset. `test/verify_delta.test` (52 — incl. `=`/`IN`/`AND`-range pushed, and a string `<>`
+  correct superset. `test/verify_delta.test` (60 — incl. `=`/`IN`/`AND`-range pushed, and string `=`/`>`/`<>`
   correctly NOT pushed but still filtered by DuckDB).
 - **Column projection into the Parquet read — still deferred**: engineered-wood's `ReadAllAsync(columns, …)`
   can read only the requested columns, but the shared `BindingBoundTable` wraps the result stream with the

@@ -67,5 +67,32 @@ SELECT pushed FROM mssql_net_query('bdb',
 ----
 1
 
+# String-FILTER ordering also pushes under a binary collation (the relaxation gated on string_order_pushable):
+# byte-order '>' matches DuckDB exactly. Fixture: banana, Apple, cherry, apple, Banana (uppercase < lowercase).
+query IT
+SELECT id, name FROM bdb.dbo.names WHERE name > 'banana' ORDER BY id;
+----
+3	cherry
+
+# String BETWEEN pushes too (-> [name] >= @ AND [name] <= @): byte order excludes the lowercase variants.
+query I
+SELECT id FROM bdb.dbo.names WHERE name BETWEEN 'Apple' AND 'Banana' ORDER BY id;
+----
+2
+5
+
+# Proof a string ordering comparison reached SQL Server (WHERE [name] > @p) — suppressed under a non-binary collation.
+query I
+SELECT pushed FROM mssql_net_query('bdb',
+  'SELECT CAST(CASE WHEN EXISTS (
+     SELECT 1 FROM sys.dm_exec_query_stats qs
+     CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
+     WHERE CHARINDEX(''FROM [dbo].[names]'', st.text) > 0
+       AND CHARINDEX(''[name] >'', st.text) > 0
+       AND CHARINDEX(''dm_exec'', st.text) = 0
+   ) THEN 1 ELSE 0 END AS INT) AS pushed');
+----
+1
+
 statement ok
 DETACH bdb;

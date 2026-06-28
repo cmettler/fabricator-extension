@@ -12,18 +12,18 @@ namespace ArrowNet.Bridge;
 /// row — and DuckDB re-applies every predicate above the scan anyway — so this must be <b>superset-safe</b>:
 /// only skip when CERTAIN nothing matches.
 ///
-/// <para>Soundness rules (Parquet min/max stats are byte-ordered / binary, matching DuckDB's default binary
-/// string comparison):</para>
+/// <para>This builder maps faithfully whatever the C++ encoder emits — the superset-safety policy lives
+/// UPSTREAM in the C++ <c>FilterSerializer</c> (arrownet_table_entry.cpp). For a Delta reader the encoder is
+/// told the source is byte-ordered (<c>string_order_pushable=true</c>, since Parquet min/max stats are
+/// byte-ordered like DuckDB's default binary string comparison), so it emits ALL comparisons + <c>IN</c> for
+/// every type including strings; DuckDB re-applies regardless, so any mismatch only forfeits pruning.</para>
 /// <list type="bullet">
-/// <item>All comparisons (<c>=</c> <c>&lt;&gt;</c> <c>&lt;</c> <c>&lt;=</c> <c>&gt;</c> <c>&gt;=</c>) and
-/// <c>IN</c> push for any type, including strings — byte-order stats match DuckDB's default binary string
-/// comparison. (A non-binary string collation could differ, but that risk applies equally to every operator
-/// and DuckDB re-applies regardless, so a mismatch only forfeits pruning, never correctness.)</item>
-/// <item><c>is_null</c> / <c>is_not_null</c> push.</item>
+/// <item>All comparisons (<c>=</c> <c>&lt;&gt;</c> <c>&lt;</c> <c>&lt;=</c> <c>&gt;</c> <c>&gt;=</c>) + <c>IN</c>
+/// map to the matching predicate; <c>is_null</c> / <c>is_not_null</c> map.</item>
 /// <item><c>and</c> keeps its pushable children (dropping one still yields a superset); <c>or</c> is
 /// all-or-nothing (dropping a branch would narrow the result).</item>
 /// </list>
-/// A node (or value type) that can't be safely mapped renders to <c>null</c> = "don't push it". Temporal /
+/// A node (or value type) that can't be mapped renders to <c>null</c> = "don't push it". Temporal /
 /// GUID / binary literals are not pushed in this iteration (a future extension — the literal-vs-stat type
 /// pairing needs the column's physical type to stay sound).
 /// </summary>
