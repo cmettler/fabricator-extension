@@ -186,7 +186,7 @@ public interface IBackendCatalog : IDisposable
     /// <summary>
     /// The Arrow schema describing a table-returning function's output columns.
     /// <paramref name="args"/> (null =&gt; none) is a 1-row batch of the constant call arguments — a custom
-    /// table function's output schema may depend on them (bound via <see cref="IArrowTableFunction.Bind"/>);
+    /// table function's output schema may depend on them (bound via <see cref="ICatalogTableFunction.Bind"/>);
     /// discovered SQL TVFs/procs read their schema from metadata and ignore it.
     /// </summary>
     Schema GetFunctionOutputSchema(string schemaName, string functionName, RecordBatch? args = null);

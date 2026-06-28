@@ -4,7 +4,7 @@ namespace ArrowNet.Bridge;
 
 /// <summary>
 /// A provider-authored custom aggregate function (UDAF), implemented in C# over Arrow — the aggregate
-/// analog of <see cref="ICatalogScalarFunction"/> (4e) / <see cref="IArrowTableFunction"/> (4f) /
+/// analog of <see cref="ICatalogScalarFunction"/> (4e) / <see cref="ICatalogTableFunction"/> (4f) /
 /// <see cref="ICatalogInOutFunction"/> (4g). Surfaced into every attached catalog and usable wherever
 /// DuckDB allows an aggregate: <c>SELECT db.SchemaName.Name(args) FROM t</c>, with <c>GROUP BY</c>,
 /// parallel aggregation, and window (<c>OVER(...)</c>) contexts.

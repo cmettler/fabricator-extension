@@ -9,32 +9,8 @@ namespace ArrowNet.SqlServer;
 // table_close). A bound table resolves its output schema once and runs the scan possibly many times (once
 // per execution); the host frees it via table_close. Two shapes, matching the two execution models:
 
-// A stored proc or a custom (pure-C#) table function — wraps an IArrowTableFunctionBinding. Its batches
-// carry the FULL output schema (no SQL projection), so the result streams via AsyncEnumerableArrowStream
-// over the binding's IAsyncEnumerable and DuckDB projects + filters above the scan. `supportsPushdown` here
-// drives the host's push_projection (by-name column mapping), NOT SQL pushdown: it is true for a custom
-// function (the full result is mapped by NAME, as before) and false for a stored proc (full result,
-// projected positionally above the scan) — preserving the prior `push_projection = !is_proc` behavior.
-internal sealed class BindingBoundTable : IBoundTable
-{
-    private readonly IArrowTableFunctionBinding _binding;
-    private readonly bool _supportsPushdown;
-
-    public BindingBoundTable(IArrowTableFunctionBinding binding, bool supportsPushdown)
-    {
-        _binding = binding;
-        _supportsPushdown = supportsPushdown;
-    }
-
-    public Schema OutputSchema => _binding.OutputSchema;
-    public bool SupportsPushdown => _supportsPushdown;
-
-    public IArrowArrayStream Execute(string? specJson, IArrowArrayStream? filterValues) =>
-        new AsyncEnumerableArrowStream(
-            _binding.OutputSchema, _binding.Execute(new TableFunctionScan(specJson, filterValues)));
-
-    public void Dispose() => _binding.Dispose();
-}
+// (BindingBoundTable — the IArrowTableFunctionBinding wrapper used by stored procs, custom, and global table
+// functions — now lives in ArrowNet.Bridge so the connection-free global path can reuse it.)
 
 // A discovered SQL Server TVF — wraps a SqlServerTableValuedFunction + the constant args. The scan pushes
 // projection + filter into the SELECT (ScanFromSource), so its stream is returned directly (its schema is

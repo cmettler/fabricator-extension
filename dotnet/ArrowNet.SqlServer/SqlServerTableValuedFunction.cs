@@ -15,11 +15,11 @@ namespace ArrowNet.SqlServer;
 // tables) via the shared ScanFromSource. The constant call args are POSITIONAL (input columns map to the
 // TVF's parameters in order).
 //
-// Deliberately NOT an IArrowTableFunction (unlike SqlServerProcedure / the custom C# functions): a pushdown
+// Deliberately NOT an ICatalogTableFunction (unlike SqlServerProcedure / the custom C# functions): a pushdown
 // source is stream-native — ScanFromSource returns a stream whose schema already reflects the PROJECTED
-// columns (so it matches the projected batches). The IArrowTableFunction shape (IAsyncEnumerable output +
+// columns (so it matches the projected batches). The ICatalogTableFunction shape (IAsyncEnumerable output +
 // a bind-time OutputSchema fixed before the scan's projection is known) would force the full schema onto
-// projected batches and crash arrow_ingest. Folding the TVF fully into IArrowTableFunction needs the
+// projected batches and crash arrow_ingest. Folding the TVF fully into ICatalogTableFunction needs the
 // stream-returning session-handle ABI (deferred Phase 5). A top-level internal class (like
 // SqlServerProcedure / SqlServerScalarFunction) holding a SqlServerCatalog and reaching its internal helpers.
 internal sealed class SqlServerTableValuedFunction

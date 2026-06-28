@@ -319,7 +319,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     // Provider-authored custom table functions, keyed "schema.name" (case-insensitive). Surfaced like
     // discovered TVFs but dispatched to C# (see TableBind / GetFunctionParamSchema / GetFunctionOutputSchema).
-    private static readonly IReadOnlyDictionary<string, IArrowTableFunction> CustomTable =
+    private static readonly IReadOnlyDictionary<string, ICatalogTableFunction> CustomTable =
         CustomFunctions.Table.ToDictionary(f => $"{f.SchemaName}.{f.Name}", StringComparer.OrdinalIgnoreCase);
 
     // Provider-authored custom table-in-out functions (ICatalogInOutFunction), keyed "schema.name"

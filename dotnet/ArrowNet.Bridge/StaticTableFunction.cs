@@ -6,11 +6,11 @@ namespace ArrowNet.Bridge;
 /// <summary>
 /// Base class for a custom table function whose output schema is FIXED (independent of the call arguments) —
 /// the common case. Implementers provide <see cref="OutputSchema"/> + <see cref="Invoke"/> (one batch of
-/// constant args in, result rows out), and this adapter supplies the <see cref="IArrowTableFunction.Bind"/>
-/// machinery. Functions whose output columns depend on the arguments implement <see cref="IArrowTableFunction"/>
+/// constant args in, result rows out), and this adapter supplies the <see cref="ICatalogTableFunction.Bind"/>
+/// machinery. Functions whose output columns depend on the arguments implement <see cref="ICatalogTableFunction"/>
 /// directly instead.
 /// </summary>
-public abstract class StaticTableFunction : IArrowTableFunction
+public abstract class StaticTableFunction : ICatalogTableFunction
 {
     public abstract string SchemaName { get; }
     public abstract string Name { get; }

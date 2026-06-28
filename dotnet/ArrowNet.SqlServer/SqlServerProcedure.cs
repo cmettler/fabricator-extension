@@ -12,14 +12,14 @@ using Microsoft.Data.SqlClient;
 
 namespace ArrowNet.SqlServer;
 
-// A discovered stored procedure exposed as a custom table function (IArrowTableFunction): resolved as
+// A discovered stored procedure exposed as a custom table function (ICatalogTableFunction): resolved as
 // `SELECT * FROM db.schema.proc(name := val, ...)`. Bind resolves the output schema (OUTPUT params + the
 // integer RETURN value as flat columns, else the first result set via sp_describe_first_result_set) and
 // Execute runs the EXEC over the supplied NAMED parameters (the args batch's field names are the proc's
 // parameter names; omitted optionals fall back to the proc's own DEFAULT). No pushdown — a proc's EXEC isn't
 // inline-wrappable, so DuckDB projects + filters above the scan. A top-level internal class (like
 // SqlServerScalarFunction / SqlServerTvfEach) holding a SqlServerCatalog and reaching its internal helpers.
-internal sealed class SqlServerProcedure : IArrowTableFunction
+internal sealed class SqlServerProcedure : ICatalogTableFunction
 {
     private readonly SqlServerCatalog _owner;
     private readonly string _schema;

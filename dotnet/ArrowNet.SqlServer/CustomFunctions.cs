@@ -14,7 +14,7 @@ namespace ArrowNet.SqlServer;
 /// Provider-authored custom functions — scalar, table, table-in-out, and aggregate — surfaced into every
 /// attached catalog alongside the discovered SQL Server functions (resolved as <c>db.schema.name(args)</c>).
 /// To add one, implement the matching Bridge interface (<see cref="ICatalogScalarFunction"/>,
-/// <see cref="IArrowTableFunction"/>, <see cref="ICatalogInOutFunction"/> — or its fixed-schema convenience base
+/// <see cref="ICatalogTableFunction"/>, <see cref="ICatalogInOutFunction"/> — or its fixed-schema convenience base
 /// <see cref="StaticInOutFunction"/> — or <see cref="IArrowAggregateFunction"/>) and list it in the
 /// corresponding array below. These run entirely in C# — there need be no corresponding SQL Server object.
 /// </summary>
@@ -50,7 +50,7 @@ internal static class CustomFunctions
         new CfHostParamFunction(),
     };
 
-    public static readonly IReadOnlyList<IArrowTableFunction> Table = new IArrowTableFunction[]
+    public static readonly IReadOnlyList<ICatalogTableFunction> Table = new ICatalogTableFunction[]
     {
         new CfRangeFunction(),
         new CfColumnsFunction(),
@@ -535,9 +535,9 @@ internal sealed class CfRangeFunction : StaticTableFunction
 }
 
 // Demo: dbo.cf_columns(n) -> a single row with n INT columns c1..cn (c_i = i). The OUTPUT SCHEMA itself
-// depends on the constant argument n — only expressible because IArrowTableFunction.Bind sees the args. The
+// depends on the constant argument n — only expressible because ICatalogTableFunction.Bind sees the args. The
 // binding resolves the schema once at bind and reuses it for the row.
-internal sealed class CfColumnsFunction : IArrowTableFunction
+internal sealed class CfColumnsFunction : ICatalogTableFunction
 {
     public string SchemaName => "dbo";
     public string Name => "cf_columns";

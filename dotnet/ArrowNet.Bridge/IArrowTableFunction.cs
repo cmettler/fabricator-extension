@@ -15,12 +15,9 @@ namespace ArrowNet.Bridge;
 /// For a fixed (arg-independent) output schema, derive from <see cref="StaticTableFunction"/> to keep the
 /// implementation a few lines.
 /// </summary>
-public interface IArrowTableFunction
+public interface ITableFunction
 {
-    /// <summary>Target catalog schema (e.g. "dbo"); created on attach if it isn't already present.</summary>
-    string SchemaName { get; }
-
-    /// <summary>Function name, as called: <c>SELECT * FROM db.SchemaName.Name(args)</c>.</summary>
+    /// <summary>Function name. Catalog: <c>SELECT * FROM db.schema.Name(args)</c>; global: the bare name.</summary>
     string Name { get; }
 
     /// <summary>The argument fields, in positional order (names + Arrow types) — the call signature.</summary>
@@ -32,6 +29,15 @@ public interface IArrowTableFunction
     /// the resolved output schema + any state. Mirrors DuckDB's bind.
     /// </summary>
     IArrowTableFunctionBinding Bind(RecordBatch args);
+}
+
+/// <summary>A catalog-bound custom table function (attach-time scope) — <see cref="ITableFunction"/> plus the
+/// <see cref="SchemaName"/>. For a connection-free, ATTACH-free table function, implement the base
+/// <see cref="ITableFunction"/> and declare it as a global instead.</summary>
+public interface ICatalogTableFunction : ITableFunction
+{
+    /// <summary>Target catalog schema (e.g. "dbo"); created on attach if it isn't already present.</summary>
+    string SchemaName { get; }
 }
 
 /// <summary>

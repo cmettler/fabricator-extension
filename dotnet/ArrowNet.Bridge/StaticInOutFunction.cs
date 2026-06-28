@@ -6,7 +6,7 @@ namespace ArrowNet.Bridge;
 /// Convenience base for a custom table-in-out with a FIXED output schema: override <see cref="OutputSchema"/>
 /// and <see cref="DoExchange"/>, and the base supplies the <see cref="ICatalogInOutFunction.Bind"/> → binding
 /// wiring (no separate binding class to write). This is to <see cref="ICatalogInOutFunction"/> what
-/// <c>StaticTableFunction</c> is to <c>IArrowTableFunction</c>.
+/// <c>StaticTableFunction</c> is to <c>ICatalogTableFunction</c>.
 ///
 /// The author owns the streaming loop in <see cref="DoExchange"/>: read <c>input</c> (one batch per input
 /// chunk, ends at EOF), yield output batches, and yield a length-0 sentinel (<c>InOutExchange.EmptyBatch</c>)
