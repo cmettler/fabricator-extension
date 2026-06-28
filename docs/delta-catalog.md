@@ -170,6 +170,42 @@ engineered-wood commits **per write** (atomic version-N + conflict detection). A
 per-commit, no cross-table ACID. State this up front; it's a provider property, not a bug. (A single
 INSERT/DELETE = one Delta commit = atomic, which covers the common case.)
 
+## Host-FS write capability — probe findings (the commit-primitive blocker)
+
+Before building any Delta write-back, `arrownet_fs_write_probe(base_path)` (a C++ spike in `arrownet_fs_spike.cpp`,
+no ABI) exercises DuckDB's `FileSystem` write surface directly — the managed reverse-callbacks would forward to
+these same calls, and the opener/secret path is identical, so it faithfully answers "is DuckDB's FileSystem
+capable?" for local AND (when pointed at an `az://`/`s3://` prefix with a secret) object stores.
+
+**Result on Windows local (`build/release/duckdb.exe`):** write / read-back / `FileExists` / `MoveFile`-to-new /
+`RemoveFile` / `TryRemoveFile` / `CreateDirectory` all **work**. The blocker is the **commit primitive**:
+
+- **`EXCLUSIVE_CREATE` is IGNORED on Windows local.** `WRITE|FILE_CREATE|EXCLUSIVE_CREATE` on an *existing* file
+  **succeeded** (it should fail = put-if-absent). Root cause (`local_file_system.cpp`, Windows `OpenFile`):
+  `FILE_CREATE → OPEN_ALWAYS`, `FILE_CREATE_NEW → CREATE_ALWAYS` (overwrite), and `flags.ExclusiveCreate()` is
+  **not consulted** — there is no `CREATE_NEW` disposition. (The POSIX branch *does* map `FILE_CREATE | EXCLUSIVE_CREATE`
+  → `O_CREAT | O_EXCL` = a real put-if-absent, so this is a Windows-local gap, not universal.)
+- **`MoveFile` OVERWRITES the target** on every platform (POSIX `rename()` — with a source `//! FIXME: rename does
+  not guarantee atomicity or overwriting target`; Windows `MoveFileExW`). So it is **not** a fail-if-exists commit
+  primitive either.
+
+**Implication.** engineered-wood's commit is `write temp → RenameAsync(temp, N.json)` and keys conflict detection
+off the rename/target-exists check. On DuckDB's FileSystem that check **does not hold** (rename overwrites;
+EXCLUSIVE_CREATE unreliable), so a Delta write-back through the host-FS bridge is **last-writer-wins on the version
+file → silent lost commits** under concurrency. **So "fully implement the host filesystem" is necessary for the
+data-file I/O but NOT sufficient for safe *concurrent* commits** — DuckDB's `FileSystem` abstraction does not expose
+a portable put-if-absent / atomic-no-overwrite.
+
+**Consequences for sequencing:**
+- **Single-writer Delta write-back is fine** on this foundation (one committer, no race) — the realistic first target.
+- **Safe concurrent commits need a primitive DuckDB FS doesn't give.** Options: (a) an external commit lock /
+  coordinator (Delta-on-S3's historical DynamoDB pattern); (b) a dedicated put-if-absent **host callback that
+  bypasses `FileSystem`** and uses the store's native conditional create (Azure `If-None-Match: *`, S3 conditional
+  PUT, POSIX `O_CREAT|O_EXCL`) — i.e. don't route the commit through DuckDB's `MoveFile`; (c) accept single-writer.
+- **Next probe (decisive for the cloud target):** run `arrownet_fs_write_probe('abfss://…onelake…')` with a DuckDB
+  azure secret — object-store FS semantics (does azfs honor `EXCLUSIVE_CREATE`?) differ from local and determine
+  which option above is needed. Not yet run (no live OneLake path wired in this environment).
+
 ## Recommendation (sequenced; build on demand)
 
 1. **Folder-root `DeltaCatalog` + read** — `DeltaBackend`/`DeltaCatalog` (3rd `IBackend`), `fs_glob` table
