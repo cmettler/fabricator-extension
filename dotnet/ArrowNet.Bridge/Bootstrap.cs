@@ -737,9 +737,9 @@ public static unsafe class Bootstrap
                 return ArrowNetStatus.InvalidArgument;
             }
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
-            if (handle == 0) // global (connection-free) function — resolve by name, no catalog
+            if (handle == 0) // global (connection-free) function — resolve by name (any kind), no catalog
             {
-                CArrowSchemaExporter.ExportSchema(GlobalFunctions.ResolveScalar(f).Parameters, outSchema);
+                CArrowSchemaExporter.ExportSchema(GlobalFunctions.ParamSchema(f), outSchema);
                 return ArrowNetStatus.Ok;
             }
             var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
@@ -949,10 +949,12 @@ public static unsafe class Bootstrap
                 using var argStream = CArrowArrayStreamImporter.ImportArrayStream(args); // we own it
                 argsBatch = argStream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
             }
-            var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
-            var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
-            var bound = catalog.TableBind(s, f, argsBatch);
+            // handle == 0 => a connection-free GLOBAL table function: resolve from the global registry by name.
+            var bound = handle == 0
+                ? GlobalFunctions.ResolveTable(f, argsBatch)
+                : (Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty))
+                    .TableBind(Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty, f, argsBatch);
             // Export the binding's output schema as a zero-row stream so the host can read return types.
             CArrowArrayStreamExporter.ExportArrayStream(
                 new InMemoryArrayStream(bound.OutputSchema, System.Array.Empty<RecordBatch>()), outSchema);
@@ -1113,6 +1115,14 @@ public static unsafe class Bootstrap
                 name.Append(fn.Name);
                 kind.Append("collector");
                 paramCount.Append(fn.InputSchema.FieldsList.Count);
+                returnType.Append(string.Empty);
+                rows++;
+            }
+            foreach (var fn in GlobalFunctions.AllTables())
+            {
+                name.Append(fn.Name);
+                kind.Append("table");
+                paramCount.Append(fn.Parameters.FieldsList.Count);
                 returnType.Append(string.Empty);
                 rows++;
             }

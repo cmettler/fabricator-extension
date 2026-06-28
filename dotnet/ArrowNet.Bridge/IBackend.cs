@@ -61,6 +61,11 @@ public interface IBackend
     /// <c>fn(&lt;input&gt;)</c>. Empty by default. See docs/global-functions.md.</summary>
     IEnumerable<ICollectorTableFunction> GlobalCollectorFunctions => System.Array.Empty<ICollectorTableFunction>();
 
+    /// <summary>Connection-free GLOBAL table functions, registered at load as a bare <c>fn(args)</c> (output
+    /// schema resolved per-call from the args via the v29 table session). Empty by default. See
+    /// docs/global-functions.md.</summary>
+    IEnumerable<ITableFunction> GlobalTableFunctions => System.Array.Empty<ITableFunction>();
+
     /// <summary>
     /// Builds a provider connection string from a secret's fields (the host reads the DuckDB secret and
     /// passes its key/values here). Keeps all provider connection-string / auth formatting in the backend —

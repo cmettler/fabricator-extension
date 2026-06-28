@@ -1716,6 +1716,31 @@ void RegisterArrowNetGlobalFunctions(ExtensionLoader &loader) {
 				}
 				tf.function_info = std::move(fn_info);
 				loader.RegisterFunction(tf);
+			} else if (kind == "table") {
+				// A connection-free table function: positional args + the v29 table-session bind/scan, with
+				// handle = 0 so table_bind resolves the binding against the C# global registry by name. Output
+				// schema is arg-dependent (resolved per-call at table_bind). Mirrors GetOrCreateTableFunction's
+				// non-proc branch (projection + best-effort filter pushdown; the binding decides honoring).
+				vector<string> arg_names;
+				vector<LogicalType> arg_types;
+				try {
+					FetchFunctionParamSchema(context, nullptr, "", fn_name, arg_names, arg_types);
+				} catch (std::exception &) {
+					continue;
+				}
+				TableFunction tf(fn_name, arg_types, arrownet::ArrowStreamScan, ArrowNetTableFunctionBind,
+				                 arrownet::ArrowStreamInitGlobal, arrownet::ArrowStreamInitLocal);
+				tf.projection_pushdown = true;
+				tf.pushdown_complex_filter = ArrowNetComplexFilterPushdown;
+				auto fn_info = make_shared_ptr<ArrowNetTableFunctionInfo>();
+				fn_info->handle = nullptr; // global marker
+				fn_info->schema = "";
+				fn_info->func = fn_name;
+				fn_info->arg_types = arg_types;
+				fn_info->arg_names = arg_names;
+				fn_info->is_proc = false;
+				tf.function_info = std::move(fn_info);
+				loader.RegisterFunction(tf);
 			}
 		}
 	} catch (std::exception &) {

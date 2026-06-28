@@ -24,6 +24,10 @@ public static class GlobalFunctions
         new(() => Build<ICollectorTableFunction>(b => b.GlobalCollectorFunctions, f => f.Name, "collector"),
             LazyThreadSafetyMode.ExecutionAndPublication);
 
+    private static readonly Lazy<IReadOnlyDictionary<string, ITableFunction>> TableMap =
+        new(() => Build<ITableFunction>(b => b.GlobalTableFunctions, f => f.Name, "table"),
+            LazyThreadSafetyMode.ExecutionAndPublication);
+
     /// <summary>All declared global scalar functions (the provider union), for <c>list_global_functions</c>.</summary>
     public static IReadOnlyCollection<IScalarFunction> AllScalars() => (IReadOnlyCollection<IScalarFunction>)ScalarMap.Value.Values;
 
@@ -32,6 +36,31 @@ public static class GlobalFunctions
 
     /// <summary>All declared global collector functions, for <c>list_global_functions</c>.</summary>
     public static IReadOnlyCollection<ICollectorTableFunction> AllCollectors() => (IReadOnlyCollection<ICollectorTableFunction>)CollectorMap.Value.Values;
+
+    /// <summary>All declared global table functions, for <c>list_global_functions</c>.</summary>
+    public static IReadOnlyCollection<ITableFunction> AllTables() => (IReadOnlyCollection<ITableFunction>)TableMap.Value.Values;
+
+    /// <summary>Bind a global table function by name (the handle-0 table_bind path) → an IBoundTable. Wraps the
+    /// arg-dependent binding in a <see cref="BindingBoundTable"/> (by-name projection mapping, like a custom
+    /// table function); DuckDB re-applies filters above the scan.</summary>
+    public static IBoundTable ResolveTable(string name, RecordBatch? args) =>
+        TableMap.Value.TryGetValue(name, out var t)
+            ? new BindingBoundTable(t.Bind(args!), supportsPushdown: true)
+            : throw new ArgumentException($"arrownet: no global table function '{name}'");
+
+    /// <summary>The positional/cost parameter schema for ANY global function by name (the handle-0
+    /// get_function_param_schema path): a scalar's or table's <c>Parameters</c>; an in-out/collector declares
+    /// no cost args here (the input table is the <c>{TABLE}</c> param), so it returns an empty schema.</summary>
+    public static Schema ParamSchema(string name)
+    {
+        if (ScalarMap.Value.TryGetValue(name, out var s)) { return s.Parameters; }
+        if (TableMap.Value.TryGetValue(name, out var t)) { return t.Parameters; }
+        if (InOutMap.Value.ContainsKey(name) || CollectorMap.Value.ContainsKey(name))
+        {
+            return new Schema(System.Array.Empty<Field>(), metadata: null);
+        }
+        throw new ArgumentException($"arrownet: no global function '{name}'");
+    }
 
     /// <summary>Resolve a global scalar by name (case-insensitive); throws if none is registered.</summary>
     public static IScalarFunction ResolveScalar(string name) =>

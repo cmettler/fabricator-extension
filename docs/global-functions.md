@@ -1,12 +1,13 @@
 # Load-time global functions (connection-free) — plan
 
-> Status: **Slices 1–2 BUILT + verified** — global **scalar** (ABI v46 `list_global_functions` + handle-0
-> dispatch; `arrownet_render`, Fluid/Liquid) AND global **in-out + collector** (the in-out/collector base
-> interface split; handle-0 `inout_bind` → the C# global registry; C++ registers the exchange/collector
-> operators at load by `kind`; demos `arrownet_tag` (streaming) + `arrownet_collect_sum` (collector)). All
-> resolve as a bare `fn(...)` with NO ATTACH — `test/verify_global_functions.test` (28). **Zero ABI beyond the
-> v46 scalar entry** (in-out/collector reuse the v28 exchange ABI with handle 0). Slices 3–4 (compute/connstr
-> table, host-FS table) remain planned below. The **Phase 3-A**: connection-free functions registered
+> Status: **Slices 1–3 BUILT + verified** — global **scalar** (ABI v46 `list_global_functions` + handle-0
+> dispatch; `arrownet_render`, Fluid/Liquid), **in-out + collector** (`arrownet_tag` streaming +
+> `arrownet_collect_sum` collector, handle-0 `inout_bind`), AND **table** (`arrownet_seq` fixed schema +
+> `arrownet_columns` ARG-DEPENDENT schema, handle-0 `table_bind` reusing the v29 session). All resolve as a bare
+> `fn(...)` with NO ATTACH — `test/verify_global_functions.test` (42). **Zero new ABI beyond the v46 scalar
+> entry** (in-out/collector reuse the v28 exchange ABI, table the v29 session, all with handle 0). Only **slice
+> 4** (host-FS table — secret-backed lakehouse readers like delta, needs an opener arg) remains deferred. The
+> **Phase 3-A**: connection-free functions registered
 > at `Extension::Load` so a bare `fn(...)` works with **no ATTACH** (e.g. a template engine). The 4th member of
 > the "provider declares; core stays name-agnostic" family (after settings v33 / ATTACH options v37 / secret
 > fields v38). Today provider functions are all **attach-time catalog-bound** (`db.schema.fn`, dispatched via a
@@ -261,8 +262,12 @@ built once in slice 1; each later slice just extends the handle-0 branch to one 
    exchange/collector operators by `kind` at load (handle 0). **No opener** (they transform their input). Demos
    `arrownet_tag` (streaming) + `arrownet_collect_sum` (collector); `test/verify_global_functions.test`. Enables
    the effectful global *apply* half (e.g. an `arrownet_apply_tmdl` collector).
-3. **Global table (compute / connstr)** — the `ITableFunction` base rename; extend the handle-0 branch to
-   `table_bind`; register `kind='table'` with the v29 session. No opener (args carry any target).
+3. **Global table (compute / connstr) — DONE**: the `ITableFunction` base rename; `table_bind` handle-0 →
+   `GlobalFunctions.ResolveTable` (wraps the arg-dependent binding in the now-Bridge `BindingBoundTable`);
+   `RegisterArrowNetGlobalFunctions` registers `kind='table'` on the v29 session at load (handle 0, projection +
+   best-effort filter pushdown). The handle-0 `get_function_param_schema` became kind-agnostic
+   (`GlobalFunctions.ParamSchema`). Demos `arrownet_seq` (fixed schema) + `arrownet_columns` (ARG-DEPENDENT
+   schema). No opener. `test/verify_global_functions.test`.
 4. **Global table (host-FS reader)** — deferred; needs the **opener arg** on `table_bind`/`table_execute`. Keep
    `arrownet_delta_scan` bespoke until a 2nd secret-backed FS reader justifies the generic opener path. See
    [docs/delta-catalog.md](delta-catalog.md) + the CLAUDE Phase-3-A note.

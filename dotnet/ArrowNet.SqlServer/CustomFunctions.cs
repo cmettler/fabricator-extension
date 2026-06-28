@@ -42,6 +42,14 @@ internal static class CustomFunctions
         new GfCollectSumFunction(),
     };
 
+    // Connection-free GLOBAL table functions — bare fn(args), no ATTACH. Implement the base ITableFunction
+    // (no SchemaName); output schema resolved per-call from the args via the v29 table session.
+    public static readonly IReadOnlyList<ITableFunction> GlobalTable = new ITableFunction[]
+    {
+        new GfSeqFunction(),
+        new GfColumnsFunction(),
+    };
+
     public static readonly IReadOnlyList<ICatalogScalarFunction> Scalar = new ICatalogScalarFunction[]
     {
         new CfAddFunction(),
@@ -849,6 +857,93 @@ internal sealed class GfCollectSumFunction : ICollectorTableFunction
                 }
                 yield return new RecordBatch(OutputSchema, new IArrowArray[] { nb.Build(), tb.Build() }, rows);
             }
+        }
+
+        public void Dispose() { }
+    }
+}
+
+// GLOBAL table (connection-free): arrownet_seq(n) -> rows (value, squared) for value = 1..n, no ATTACH.
+// Fixed output schema. Implements the base ITableFunction (no SchemaName); registered at load on the v29
+// table-session path (handle-0 table_bind). See docs/global-functions.md.
+internal sealed class GfSeqFunction : ITableFunction
+{
+    public string Name => "arrownet_seq";
+    public Schema Parameters => new(new[] { new Field("n", Int32Type.Default, nullable: true) }, metadata: null);
+
+    public IArrowTableFunctionBinding Bind(RecordBatch args)
+    {
+        var a = (Int32Array)args.Column(0);
+        int n = args.Length > 0 && !a.IsNull(0) ? a.Values[0] : 0;
+        return new Binding(n);
+    }
+
+    private sealed class Binding : IArrowTableFunctionBinding
+    {
+        private readonly int _n;
+        public Binding(int n) => _n = n;
+
+        public Schema OutputSchema => new(new[]
+        {
+            new Field("value", Int32Type.Default, nullable: false),
+            new Field("squared", Int32Type.Default, nullable: false),
+        }, metadata: null);
+
+        public bool SupportsPushdown => false;
+
+        public async IAsyncEnumerable<RecordBatch> Execute(
+            TableFunctionScan scan, [EnumeratorCancellation] CancellationToken ct = default)
+        {
+            scan.FilterValues?.Dispose();
+            await Task.CompletedTask;
+            var value = new Int32Array.Builder().Reserve(_n);
+            var squared = new Int32Array.Builder().Reserve(_n);
+            for (int i = 1; i <= _n; i++) { value.Append(i); squared.Append(i * i); }
+            yield return new RecordBatch(OutputSchema, new IArrowArray[] { value.Build(), squared.Build() }, _n);
+        }
+
+        public void Dispose() { }
+    }
+}
+
+// GLOBAL table with ARG-DEPENDENT output schema (connection-free): arrownet_columns(n) -> a single row with n
+// INT columns c1..cn (c_i = i). The output COLUMN SET depends on the constant arg n — resolved at bind via the
+// handle-0 table_bind (the v29 session), proving arg-dependent global table schemas. No ATTACH. The global
+// analog of cf_columns.
+internal sealed class GfColumnsFunction : ITableFunction
+{
+    public string Name => "arrownet_columns";
+    public Schema Parameters => new(new[] { new Field("n", Int32Type.Default, nullable: true) }, metadata: null);
+
+    public IArrowTableFunctionBinding Bind(RecordBatch args)
+    {
+        var a = (Int32Array)args.Column(0);
+        int n = args.Length > 0 && !a.IsNull(0) ? a.Values[0] : 0;
+        return new Binding(n);
+    }
+
+    private sealed class Binding : IArrowTableFunctionBinding
+    {
+        private readonly int _n;
+        public Binding(int n)
+        {
+            _n = n;
+            var fields = new Field[_n];
+            for (int i = 1; i <= _n; i++) { fields[i - 1] = new Field($"c{i}", Int32Type.Default, nullable: false); }
+            OutputSchema = new Schema(fields, metadata: null);
+        }
+
+        public Schema OutputSchema { get; }
+        public bool SupportsPushdown => false;
+
+        public async IAsyncEnumerable<RecordBatch> Execute(
+            TableFunctionScan scan, [EnumeratorCancellation] CancellationToken ct = default)
+        {
+            scan.FilterValues?.Dispose();
+            await Task.CompletedTask;
+            var arrays = new IArrowArray[_n];
+            for (int i = 1; i <= _n; i++) { var b = new Int32Array.Builder(); b.Append(i); arrays[i - 1] = b.Build(); }
+            yield return new RecordBatch(OutputSchema, arrays, 1);
         }
 
         public void Dispose() { }

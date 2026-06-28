@@ -81,3 +81,32 @@ SELECT count(*), max(total)
 FROM arrownet_collect_sum((SELECT i::INTEGER AS n FROM range(5000) t(i)));
 ----
 5000	12497500
+
+# ---- global TABLE functions — bare fn(args), no ATTACH (the v29 table session at handle 0) ----
+# Fixed output schema: arrownet_seq(n) -> (value, squared) for value = 1..n.
+query II
+SELECT value, squared FROM arrownet_seq(4) ORDER BY value;
+----
+1	1
+2	4
+3	9
+4	16
+
+# DuckDB projects + filters above the scan (the binding reports no pushdown).
+query I
+SELECT squared FROM arrownet_seq(5) WHERE value > 3 ORDER BY squared;
+----
+16
+25
+
+# ARG-DEPENDENT output schema: arrownet_columns(n) returns n columns c1..cn, resolved at bind from the arg.
+query III
+SELECT c1, c2, c3 FROM arrownet_columns(3);
+----
+1	2	3
+
+# A different arg => a different column set (proves the schema is bound per-call, not fixed).
+query I
+SELECT c5 FROM arrownet_columns(5);
+----
+5

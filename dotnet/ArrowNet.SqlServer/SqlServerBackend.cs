@@ -90,6 +90,7 @@ public sealed class SqlServerBackend : IBackend
     public IEnumerable<IScalarFunction> GlobalScalarFunctions => CustomFunctions.GlobalScalar;
     public IEnumerable<IInOutFunction> GlobalInOutFunctions => CustomFunctions.GlobalInOut;
     public IEnumerable<ICollectorTableFunction> GlobalCollectorFunctions => CustomFunctions.GlobalCollector;
+    public IEnumerable<ITableFunction> GlobalTableFunctions => CustomFunctions.GlobalTable;
 
     public IBackendCatalog OpenCatalog(string connectionString, string optionsJson) =>
         new SqlServerCatalog(connectionString, optionsJson);
