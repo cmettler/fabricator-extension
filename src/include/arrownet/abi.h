@@ -580,6 +580,17 @@ typedef struct ArrowNetVTable {
 	// named_input_exists: set *out_exists to 1 if a source is registered under `name`, else 0 (no stream
 	// produced). Used by the replacement scan to decide whether to rewrite a bare table name.
 	int32_t (*named_input_exists)(const char *name, int32_t *out_exists, char **err);
+
+	// -------------------------------------------------------------------------
+	// Load-time GLOBAL functions (connection-free; no ATTACH). The host calls this ONCE at extension load to
+	// enumerate the provider-union of global functions, then registers each as a bare `fn(...)` via
+	// loader.RegisterFunction. Metadata rows: {name VARCHAR, kind VARCHAR, param_count INT, return_type VARCHAR}
+	// (same shape as the catalog functions metadata; return_type is meaningful for kind='scalar', empty
+	// otherwise). For each, the host fetches the precise Arrow param/return schema via the existing
+	// get_function_param_schema / get_function_return_schema entries with HANDLE = 0 (the global marker; C#
+	// routes a 0 handle to the global registry by name), and dispatches execution via execute_scalar with
+	// handle = 0. So global SCALAR functions add NO execution/schema ABI — only this enumeration entry.
+	int32_t (*list_global_functions)(struct ArrowArrayStream *out, char **err);
 } ArrowNetVTable;
 
 // -----------------------------------------------------------------------------
@@ -635,7 +646,7 @@ typedef struct ArrowNetHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 45
+#define ARROWNET_ABI_VERSION 46
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

@@ -44,7 +44,7 @@ public static unsafe class Bootstrap
             return new InMemoryArrayStream(schema, new[] { batch });
         });
 
-        vtable->AbiVersion = 45;
+        vtable->AbiVersion = 46;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -96,6 +96,7 @@ public static unsafe class Bootstrap
         vtable->DeltaScan = &DeltaScan;
         vtable->OpenNamedInput = &OpenNamedInput;
         vtable->NamedInputExists = &NamedInputExists;
+        vtable->ListGlobalFunctions = &ListGlobalFunctions;
         return ArrowNetStatus.Ok;
     }
 
@@ -735,9 +736,14 @@ public static unsafe class Bootstrap
             {
                 return ArrowNetStatus.InvalidArgument;
             }
+            var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
+            if (handle == 0) // global (connection-free) function — resolve by name, no catalog
+            {
+                CArrowSchemaExporter.ExportSchema(GlobalFunctions.ResolveScalar(f).Parameters, outSchema);
+                return ArrowNetStatus.Ok;
+            }
             var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
-            var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
             CArrowSchemaExporter.ExportSchema(catalog.GetFunctionParamSchema(s, f), outSchema);
             return ArrowNetStatus.Ok;
         }
@@ -758,9 +764,15 @@ public static unsafe class Bootstrap
             {
                 return ArrowNetStatus.InvalidArgument;
             }
+            var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
+            if (handle == 0) // global (connection-free) function
+            {
+                var rf = GlobalFunctions.ResolveScalar(f).Result;
+                CArrowSchemaExporter.ExportSchema(new Schema(new[] { rf }, null), outSchema);
+                return ArrowNetStatus.Ok;
+            }
             var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
-            var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
             CArrowSchemaExporter.ExportSchema(catalog.GetFunctionReturnSchema(s, f), outSchema);
             return ArrowNetStatus.Ok;
         }
@@ -781,10 +793,16 @@ public static unsafe class Bootstrap
             {
                 return ArrowNetStatus.InvalidArgument;
             }
-            var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
-            var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
             var argStream = CArrowArrayStreamImporter.ImportArrayStream(args); // we own it
+            if (handle == 0) // global (connection-free) function
+            {
+                CArrowArrayStreamExporter.ExportArrayStream(
+                    GlobalFunctions.ExecuteScalar(GlobalFunctions.ResolveScalar(f), argStream), outStream);
+                return ArrowNetStatus.Ok;
+            }
+            var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             CArrowArrayStreamExporter.ExportArrayStream(catalog.ExecuteScalar(s, f, argStream), outStream);
             return ArrowNetStatus.Ok;
         }
@@ -1042,6 +1060,53 @@ public static unsafe class Bootstrap
             var batch = new RecordBatch(schema, new IArrowArray[]
             {
                 provider.Build(), name.Build(), type.Build(), def.Build(), desc.Build(), min.Build(),
+            }, rows);
+            CArrowArrayStreamExporter.ExportArrayStream(new InMemoryArrayStream(schema, new[] { batch }), outStream);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    // Load-time GLOBAL functions (see docs/global-functions.md). Returns the provider-union of connection-free
+    // global functions so the host registers each as a bare fn(...) at extension load. Columns: name, kind,
+    // param_count, return_type (return_type meaningful for kind='scalar'). Per-function schemas + execution
+    // reuse the scalar entries with handle=0. Currently scalar only; table/in-out kinds slot in here later.
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int ListGlobalFunctions(CArrowArrayStream* outStream, byte** err)
+    {
+        try
+        {
+            if (outStream is null)
+            {
+                return ArrowNetStatus.InvalidArgument;
+            }
+            var name = new StringArray.Builder();
+            var kind = new StringArray.Builder();
+            var paramCount = new Int32Array.Builder();
+            var returnType = new StringArray.Builder();
+            int rows = 0;
+            foreach (var fn in GlobalFunctions.AllScalars())
+            {
+                name.Append(fn.Name);
+                kind.Append("scalar");
+                paramCount.Append(fn.Parameters.FieldsList.Count);
+                returnType.Append(fn.Result.DataType.Name);
+                rows++;
+            }
+            var schema = new Schema(new[]
+            {
+                new Field("name", StringType.Default, nullable: false),
+                new Field("kind", StringType.Default, nullable: false),
+                new Field("param_count", Int32Type.Default, nullable: false),
+                new Field("return_type", StringType.Default, nullable: true),
+            }, metadata: null);
+            var batch = new RecordBatch(schema, new IArrowArray[]
+            {
+                name.Build(), kind.Build(), paramCount.Build(), returnType.Build(),
             }, rows);
             CArrowArrayStreamExporter.ExportArrayStream(new InMemoryArrayStream(schema, new[] { batch }), outStream);
             return ArrowNetStatus.Ok;

@@ -175,6 +175,10 @@ public unsafe struct ArrowNetVTable
     // registered ambient source; int32 named_input_exists(const char* name, int32* out_exists, char** err).
     public delegate* unmanaged[Cdecl]<byte*, CArrowArrayStream*, byte**, int> OpenNamedInput;
     public delegate* unmanaged[Cdecl]<byte*, int*, byte**, int> NamedInputExists;
+
+    // int32 list_global_functions(ArrowArrayStream* out, char** err) — the provider-union of connection-free
+    // global functions (metadata: name/kind/param_count/return_type), enumerated once at extension load.
+    public delegate* unmanaged[Cdecl]<CArrowArrayStream*, byte**, int> ListGlobalFunctions;
 }
 
 /// <summary>

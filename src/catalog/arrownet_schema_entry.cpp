@@ -29,6 +29,8 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -187,36 +189,13 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateEntry(ClientContext &
 	return &ref;
 }
 
-optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateScalarFunction(ClientContext &context,
-                                                                          const string &func_name) {
-	lock_guard<mutex> lock(entry_lock_);
-	auto cached = function_entries_.find(func_name);
-	if (cached != function_entries_.end()) {
-		return cached->second.get();
-	}
-	if (scalar_functions_.find(func_name) == scalar_functions_.end()) {
-		return nullptr;
-	}
-
-	vector<string> arg_names;
-	vector<LogicalType> arg_types;
-	LogicalType return_type;
-	try {
-		FetchFunctionParamSchema(context, handle_, name, func_name, arg_names, arg_types);
-		return_type = FetchFunctionReturnType(context, handle_, name, func_name);
-	} catch (std::exception &) {
-		// The discovered name is stale — the function no longer exists on the server
-		// (e.g. dropped out-of-band). Treat it as not-found rather than erroring.
-		scalar_functions_.erase(func_name);
-		function_entries_.erase(func_name);
-		return nullptr;
-	}
-
-	// Capture the identity for the per-call execution. The callback marshals the
-	// argument chunk to Arrow, runs the UDF on the backend, and ingests the result.
-	ArrowNetHandle handle = handle_;
-	string schema_name = name;
-	string fn_name = func_name;
+// Builds a ScalarFunction whose callback marshals the arg chunk to Arrow, runs the UDF over the bridge
+// (ExecuteScalar with `handle` — 0 for a connection-free GLOBAL scalar, where the C# side resolves by name
+// against the global registry), and ingests the single-column result. Shared by catalog-bound scalar UDFs
+// (GetOrCreateScalarFunction) and load-time global scalars (RegisterArrowNetGlobalFunctions).
+static ScalarFunction BuildArrowNetScalarFunction(ArrowNetHandle handle, const string &schema_name,
+                                                  const string &fn_name, vector<LogicalType> arg_types,
+                                                  vector<string> arg_names, LogicalType return_type) {
 	scalar_function_t exec = [handle, schema_name, fn_name, arg_types, arg_names](
 	                             DataChunk &args, ExpressionState &state, Vector &result) {
 		auto &ctx = state.GetContext();
@@ -255,12 +234,41 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateScalarFunction(Client
 	};
 
 	ScalarFunction fn(arg_types, return_type, exec);
-	fn.name = func_name;
-	// A remote UDF may be non-deterministic / side-effecting (VOLATILE => never folded),
-	// and may return non-NULL for NULL inputs, so it must see NULL args (SPECIAL_HANDLING)
-	// rather than DuckDB short-circuiting the row to NULL.
+	fn.name = fn_name;
+	// A remote UDF may be non-deterministic / side-effecting (VOLATILE => never folded), and may return
+	// non-NULL for NULL inputs, so it must see NULL args (SPECIAL_HANDLING) rather than being short-circuited.
 	fn.SetStability(FunctionStability::VOLATILE);
 	fn.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	return fn;
+}
+
+optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateScalarFunction(ClientContext &context,
+                                                                          const string &func_name) {
+	lock_guard<mutex> lock(entry_lock_);
+	auto cached = function_entries_.find(func_name);
+	if (cached != function_entries_.end()) {
+		return cached->second.get();
+	}
+	if (scalar_functions_.find(func_name) == scalar_functions_.end()) {
+		return nullptr;
+	}
+
+	vector<string> arg_names;
+	vector<LogicalType> arg_types;
+	LogicalType return_type;
+	try {
+		FetchFunctionParamSchema(context, handle_, name, func_name, arg_names, arg_types);
+		return_type = FetchFunctionReturnType(context, handle_, name, func_name);
+	} catch (std::exception &) {
+		// The discovered name is stale — the function no longer exists on the server
+		// (e.g. dropped out-of-band). Treat it as not-found rather than erroring.
+		scalar_functions_.erase(func_name);
+		function_entries_.erase(func_name);
+		return nullptr;
+	}
+
+	// The per-call execution callback (shared with load-time global scalars).
+	ScalarFunction fn = BuildArrowNetScalarFunction(handle_, name, func_name, arg_types, arg_names, return_type);
 
 	CreateScalarFunctionInfo info(std::move(fn));
 	info.catalog = catalog.GetName();
@@ -1637,6 +1645,49 @@ void RegisterArrowNetInOutFinalizer(DBConfig &config) {
 	OptimizerExtension extension;
 	extension.optimize_function = ArrowNetInOutOptimize;
 	OptimizerExtension::Register(config, std::move(extension));
+}
+
+void RegisterArrowNetGlobalFunctions(ExtensionLoader &loader) {
+	// Load-time global (connection-free) functions: enumerate the provider-union via the bridge, then register
+	// each as a bare fn(...). Best-effort — if the bridge can't boot (no managed dir) this is skipped, exactly
+	// like provider settings/secrets. See docs/global-functions.md.
+	try {
+		ArrowArrayStream stream;
+		std::memset(&stream, 0, sizeof(stream));
+		arrownet::ListGlobalFunctions(stream);
+		// Columns: name, kind, param_count(int), return_type. We read the two leading string columns (name,
+		// kind); the precise arg/return types come from the per-function fetch below (handle = 0 = global).
+		auto rows = ReadStringTable(stream, 2);
+		const auto &names = rows[0];
+		const auto &kinds = rows[1];
+		if (names.empty()) {
+			return; // no global functions declared
+		}
+		// FetchFunctionParamSchema/ReturnType need a ClientContext to turn the Arrow schema into DuckDB types;
+		// a fresh connection on the loading database provides one. (The DB instance exists by Extension::Load.)
+		Connection conn(loader.GetDatabaseInstance());
+		auto &context = *conn.context;
+		for (idx_t i = 0; i < names.size(); i++) {
+			if (kinds[i] != "scalar") {
+				continue; // table / in-out / collector globals are a later slice (docs/global-functions.md)
+			}
+			const string &fn_name = names[i];
+			vector<string> arg_names;
+			vector<LogicalType> arg_types;
+			LogicalType return_type;
+			try {
+				// handle = 0 + empty schema = the global marker; C# resolves the function by name.
+				FetchFunctionParamSchema(context, nullptr, "", fn_name, arg_names, arg_types);
+				return_type = FetchFunctionReturnType(context, nullptr, "", fn_name);
+			} catch (std::exception &) {
+				continue; // skip a global whose schema can't be resolved
+			}
+			ScalarFunction fn = BuildArrowNetScalarFunction(nullptr, "", fn_name, arg_types, arg_names, return_type);
+			loader.RegisterFunction(fn);
+		}
+	} catch (std::exception &) {
+		// Bridge unavailable at load — skip global-function registration (graceful degradation).
+	}
 }
 
 optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateTableFunction(ClientContext &context,

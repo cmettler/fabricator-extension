@@ -119,6 +119,12 @@ void GetMetadata(ArrowNetHandle handle, int32_t kind, const std::string &arg1, c
 void ListSettings(ArrowArrayStream &out);
 void SetSetting(const std::string &provider, const std::string &name, const char *value);
 
+// Load-time global (connection-free) functions (see docs/global-functions.md). Fills `out` with the
+// provider-union of global functions (metadata columns: name, kind, param_count, return_type); the host
+// registers each as a bare `fn(...)` at extension load. Per-function param/return schemas + execution reuse
+// the scalar entries with handle = 0 (the global marker).
+void ListGlobalFunctions(ArrowArrayStream &out);
+
 // Provider-declared secret fields (see docs/provider-extensibility.md §2). Fills `out` with ALL registered
 // providers' secret types + fields (five string columns: provider, secret_type, name, type, redact); the
 // host registers one DuckDB secret type per distinct secret_type at load.

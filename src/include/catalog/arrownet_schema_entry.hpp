@@ -16,6 +16,7 @@
 namespace duckdb {
 
 class DBConfig;
+class ExtensionLoader;
 
 //! Registers the table-in-out OperatorFinalize optimizer extension (4g): an OptimizerExtension that wraps
 //! each discovered table-in-out LogicalGet in a pass-through LogicalExtensionOperator whose OperatorFinalize
@@ -23,6 +24,11 @@ class DBConfig;
 //! hook, and a clean commit of a read-only TVF's snapshot transaction). NOT the proc commit (DuckDB's
 //! transaction drives that). Call once at extension load.
 void RegisterArrowNetInOutFinalizer(DBConfig &config);
+
+//! Registers load-time GLOBAL (connection-free) functions: enumerates the provider-union via the bridge and
+//! registers each as a bare `fn(...)` (no ATTACH). Best-effort — skipped if the bridge can't boot at load.
+//! Currently scalar only (table/in-out kinds are a later slice). See docs/global-functions.md.
+void RegisterArrowNetGlobalFunctions(ExtensionLoader &loader);
 
 class ArrowNetSchemaEntry : public SchemaCatalogEntry {
 public:

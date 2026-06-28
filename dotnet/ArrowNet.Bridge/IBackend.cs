@@ -47,6 +47,13 @@ public interface IBackend
     IEnumerable<SecretField> SecretFields => System.Array.Empty<SecretField>();
 
     /// <summary>
+    /// Connection-free GLOBAL scalar functions the provider contributes — registered at extension load as bare
+    /// <c>fn(...)</c> (no ATTACH), unioned across providers by <see cref="GlobalFunctions"/>. Empty by default;
+    /// a provider opts in (e.g. a template engine). See docs/global-functions.md.
+    /// </summary>
+    IEnumerable<IScalarFunction> GlobalScalarFunctions => System.Array.Empty<IScalarFunction>();
+
+    /// <summary>
     /// Builds a provider connection string from a secret's fields (the host reads the DuckDB secret and
     /// passes its key/values here). Keeps all provider connection-string / auth formatting in the backend —
     /// the C++ side has no knowledge of the provider's connstr dialect. The result is passed to

@@ -414,6 +414,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    ScalarFunction("arrownet_managed_dir", {}, LogicalType::VARCHAR, ArrowNetManagedDirFunction));
 
 	RegisterProviderSettings(loader);
+	RegisterArrowNetGlobalFunctions(loader); // connection-free global functions (docs/global-functions.md)
 	RegisterArrowNetOptimizer(DBConfig::GetConfig(loader.GetDatabaseInstance()));
 	RegisterArrowNetInOutFinalizer(DBConfig::GetConfig(loader.GetDatabaseInstance()));
 

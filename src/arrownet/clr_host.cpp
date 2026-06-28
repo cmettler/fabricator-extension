@@ -472,6 +472,18 @@ void ListSettings(ArrowArrayStream &out) {
 	}
 }
 
+void ListGlobalFunctions(ArrowArrayStream &out) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.list_global_functions) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide list_global_functions");
+	}
+	char *err = nullptr;
+	int32_t rc = vt.list_global_functions(&out, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: list_global_functions failed");
+	}
+}
+
 void OpenNamedInput(const std::string &name, ArrowArrayStream &out) {
 	const ArrowNetVTable &vt = GetBridge();
 	if (!vt.open_named_input) {
