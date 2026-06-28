@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.IO;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -181,7 +182,6 @@ public sealed class DeltaWriteDemoFunction : ITableFunction
 
     private static (long Version, long Rows) WriteDemoTable(nint opener, string path, CancellationToken ct)
     {
-        var fs = new DuckDbTableFileSystem(opener, path);
         var schema = new Schema(new[]
         {
             new Field("id", Int64Type.Default, nullable: false),
@@ -197,11 +197,23 @@ public sealed class DeltaWriteDemoFunction : ITableFunction
             names.Append($"row_{i}");
         }
         var batch = new RecordBatch(schema, new IArrowArray[] { ids.Build(), names.Build() }, rows);
+        long version = DeltaWriter.WriteOverwrite(opener, path, schema, new[] { batch }, ct);
+        return (version, rows);
+    }
+}
 
-        // engineered-wood defaults OmitPathInSchema=true, which drops the `path_in_schema` field from each
-        // column chunk's parquet footer. That field is REQUIRED in the shipping Parquet Thrift definitions used
-        // by DuckDB (Apache Thrift C++), arrow-rs/delta-kernel, and Fabric — omitting it makes them reject the
-        // file ("TProtocolException: Invalid data" = required-field-missing). Force it on for portable output.
+/// <summary>
+/// Writes a Delta Lake table via engineered-wood through the host FileSystem (the <see cref="DuckDbTableFileSystem"/>
+/// write side + the put-if-absent EXCLUSIVE_CREATE commit). Forces <c>OmitPathInSchema=false</c> so the parquet
+/// footer carries the REQUIRED <c>path_in_schema</c> field — otherwise standard readers (DuckDB/arrow-rs/Fabric)
+/// reject the file. The opener is the calling operator's ClientContext (valid for the write call).
+/// </summary>
+internal static class DeltaWriter
+{
+    public static long WriteOverwrite(
+        nint opener, string path, Schema schema, IReadOnlyList<RecordBatch> batches, CancellationToken ct)
+    {
+        var fs = new DuckDbTableFileSystem(opener, path);
         var options = DeltaTableOptions.Default with
         {
             ParquetWriteOptions = new ParquetWriteOptions { OmitPathInSchema = false },
@@ -210,14 +222,120 @@ public sealed class DeltaWriteDemoFunction : ITableFunction
             .AsTask().GetAwaiter().GetResult();
         try
         {
-            // Overwrite so the demo is idempotent (the table is always exactly these 5 rows, re-run-safe).
-            long version = table.WriteAsync(new[] { batch }, DeltaWriteMode.Overwrite, ct)
-                .AsTask().GetAwaiter().GetResult();
-            return (version, rows);
+            // Overwrite: the table becomes exactly these batches (CTAS-like, idempotent on re-run).
+            return table.WriteAsync(batches, DeltaWriteMode.Overwrite, ct).AsTask().GetAwaiter().GetResult();
         }
         finally
         {
             table.DisposeAsync().AsTask().GetAwaiter().GetResult();
         }
+    }
+}
+
+/// <summary>
+/// <c>arrownet_delta_write(&lt;input&gt;, path := '…')</c> — a connection-free GLOBAL host-FS <b>collector</b>
+/// that writes ANY input table (a DuckDB query result) to a Delta Lake table at <c>path</c> on OneLake/ADLS/
+/// local (Overwrite), returning one row <c>(version, rows_written)</c>. The collector buffers all input, copies
+/// it (via an Arrow IPC round-trip — the input batches are freed after consumption), and commits one Delta
+/// version through <see cref="DeltaWriter"/>. The opener is threaded via <see cref="AmbientOpener"/> (set by the
+/// host before the collector runs). Single-writer; the commit is put-if-absent (EXCLUSIVE_CREATE). The written
+/// table is standard-/Fabric-readable.
+/// </summary>
+public sealed class DeltaWriteCollectorFunction : ICollectorTableFunction
+{
+    public string Name => "arrownet_delta_write";
+
+    // The actual input schema is supplied to Bind; this declared schema is only discovery metadata (the operator
+    // registers a {TABLE} param that accepts any input).
+    public Schema InputSchema { get; } = new Schema(System.Array.Empty<Field>(), metadata: null);
+
+    public Schema Parameters { get; } =
+        new Schema(new[] { new Field("path", StringType.Default, nullable: false) }, metadata: null);
+
+    public IArrowCollectorBinding Bind(RecordBatch? args, Schema inputSchema)
+    {
+        var path = ReadPath(args);
+        return new WriteCollectorBinding(path, inputSchema);
+    }
+
+    private static string ReadPath(RecordBatch? args)
+    {
+        if (args is not null)
+        {
+            for (int i = 0; i < args.ColumnCount; i++)
+            {
+                if (string.Equals(args.Schema.FieldsList[i].Name, "path", System.StringComparison.OrdinalIgnoreCase)
+                    && args.Column(i) is StringArray s && s.Length > 0 && s.GetString(0) is { } p)
+                {
+                    return p;
+                }
+            }
+        }
+        throw new System.ArgumentException("arrownet_delta_write: the 'path' argument is required");
+    }
+
+    private sealed class WriteCollectorBinding : IArrowCollectorBinding
+    {
+        private readonly string _path;
+        private readonly Schema _inputSchema;
+        private readonly Schema _outputSchema;
+
+        public WriteCollectorBinding(string path, Schema inputSchema)
+        {
+            _path = path;
+            _inputSchema = inputSchema;
+            _outputSchema = new Schema(new[]
+            {
+                new Field("version", Int64Type.Default, nullable: false),
+                new Field("rows_written", Int64Type.Default, nullable: false),
+            }, metadata: null);
+        }
+
+        public Schema OutputSchema => _outputSchema;
+
+        public async IAsyncEnumerable<RecordBatch> Collect(
+            IAsyncEnumerable<RecordBatch> allInput, [EnumeratorCancellation] CancellationToken ct = default)
+        {
+            // Capture the opener at entry (the operator set it before pulling); valid for the whole write.
+            var opener = AmbientOpener.Current;
+
+            // Copy the input out of its (transient) Arrow buffers via an IPC round-trip, since the operator frees
+            // each batch after it's consumed and we must retain ALL rows to write one Delta commit.
+            var ms = new MemoryStream();
+            long rows = 0;
+            using (var w = new ArrowStreamWriter(ms, _inputSchema, leaveOpen: true))
+            {
+                await foreach (var b in allInput.WithCancellation(ct).ConfigureAwait(false))
+                {
+                    if (b.Length == 0)
+                    {
+                        continue;
+                    }
+                    await w.WriteRecordBatchAsync(b, ct).ConfigureAwait(false);
+                    rows += b.Length;
+                }
+                await w.WriteEndAsync(ct).ConfigureAwait(false);
+            }
+
+            var batches = new List<RecordBatch>();
+            ms.Position = 0;
+            using (var r = new ArrowStreamReader(ms))
+            {
+                RecordBatch? b;
+                while ((b = await r.ReadNextRecordBatchAsync(ct).ConfigureAwait(false)) is not null)
+                {
+                    batches.Add(b);
+                }
+            }
+
+            long version = DeltaWriter.WriteOverwrite(opener, _path, _inputSchema, batches, ct);
+            yield return new RecordBatch(_outputSchema, new IArrowArray[]
+            {
+                new Int64Array.Builder().Append(version).Build(),
+                new Int64Array.Builder().Append(rows).Build(),
+            }, length: 1);
+        }
+
+        public void Dispose() { }
     }
 }

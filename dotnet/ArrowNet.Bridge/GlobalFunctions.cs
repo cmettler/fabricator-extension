@@ -69,10 +69,9 @@ public static class GlobalFunctions
         if (ScalarMap.Value.TryGetValue(name, out var s)) { return s.Parameters; }
         if (TableMap.Value.TryGetValue(name, out var t)) { return t.Parameters; }
         if (AggregateMap.Value.TryGetValue(name, out var a)) { return a.Parameters; }
-        if (InOutMap.Value.ContainsKey(name) || CollectorMap.Value.ContainsKey(name))
-        {
-            return new Schema(System.Array.Empty<Field>(), metadata: null);
-        }
+        // In-out / collector cost args are declared as NAMED parameters (e.g. path := '…'); default empty.
+        if (InOutMap.Value.TryGetValue(name, out var io)) { return io.Parameters; }
+        if (CollectorMap.Value.TryGetValue(name, out var co)) { return co.Parameters; }
         throw new ArgumentException($"arrownet: no global function '{name}'");
     }
 

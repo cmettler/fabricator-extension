@@ -41,6 +41,11 @@ public interface ICollectorTableFunction
     /// passed to <see cref="Bind"/>.</summary>
     Schema InputSchema { get; }
 
+    /// <summary>Constant "cost" args declared as NAMED parameters (e.g. <c>path := '…'</c>), default none.
+    /// Supplied values arrive in <see cref="Bind"/>'s <c>args</c> (a 1-row batch whose field names are the
+    /// parameter names). A global collector with no cost args returns an empty schema.</summary>
+    Schema Parameters => new Schema(System.Array.Empty<Field>(), metadata: null);
+
     /// <summary>Binds one call: <paramref name="args"/> (nullable) are the constant "cost" args (1-row batch);
     /// <paramref name="inputSchema"/> is the actual input table's schema. Returns the per-call binding.</summary>
     IArrowCollectorBinding Bind(RecordBatch? args, Schema inputSchema);

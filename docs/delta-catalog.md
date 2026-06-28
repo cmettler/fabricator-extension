@@ -258,11 +258,19 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
 1. **Folder-root `DeltaCatalog` + read** — `DeltaBackend`/`DeltaCatalog` (3rd `IBackend`), `fs_glob` table
    discovery, flat `main` schema, scan via the existing `DeltaReader`. ~All C#, no new C++. Proves ATTACH +
    `SELECT FROM lake.t`.
-2. **INSERT / CREATE / CTAS / COPY** — `WriteAsync(Append)` / `CreateAsync` (the write surface from step 0 is
-   built + validated; `arrownet_delta_write_demo` already exercises `OpenOrCreateAsync` + `WriteAsync`). No
-   rowid; reuses the bulk path. Remaining: bind the catalog's INSERT/CTAS operators to engineered-wood writes
-   (vs the fixed-data demo) + the OCC retry loop (catch `DeltaConflictException` → reopen → retry) for
-   concurrent writers.
+2. **Write arbitrary data — DONE (function form), via the collector.** `arrownet_delta_write(<input>, path := '…')`
+   is a connection-free GLOBAL host-FS **collector** (`DeltaWriteCollectorFunction`) that writes ANY input table
+   (a DuckDB query result) to a Delta table at `path` (Overwrite), returning `(version, rows_written)`. It
+   buffers the input (copying it out via an Arrow IPC round-trip — the operator frees each batch after
+   consumption), then commits one Delta version through the shared `DeltaWriter` (OmitPathInSchema=false →
+   Fabric-readable). The opener is threaded through the collector operator's Source `GetDataInternal` (where the
+   C# `Collect` actually runs, sync-over-async on the pull thread — setting it only in Finalize was racy). Cost
+   args ride as NAMED params (`Parameters` added to `IInOutFunction`/`ICollectorTableFunction`, surfaced via the
+   handle-0 `GlobalFunctions.ParamSchema`). Validated local (`test/verify_delta_write.test`, official
+   delta-kernel read-back) + a live OneLake managed table (`Tables/dbo/arrownet_query`, 20-row query result).
+   **Remaining for the CATALOG form** (`ATTACH … INSERT INTO lake.t`): bind the catalog INSERT/CTAS/COPY
+   operators to engineered-wood writes (needs the opener threaded into the catalog `get_metadata`/bulk path too)
+   + the OCC retry loop (catch `DeltaConflictException` → reopen → retry) for concurrent writers + Append mode.
 3. **DELETE** — pick the rowid-vs-predicate strategy (lean: predicate via `FilterNode → Predicate`, since it's
    contained and doesn't need an engineered-wood position-delete addition); deletion vectors handled by
    engineered-wood.

@@ -1104,7 +1104,15 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   written to OneLake for Fabric. (#1/#2 are engineered-wood-repo patches; #3 is a write option. DuckDB's official
   `delta_scan` can't LIST a OneLake `_delta_log` — a delta-kernel azure/secret quirk, "No files in log segment" —
   so OneLake validation is via our reader + the local delta-kernel read. A table written BEFORE the fixes stays
-  broken on its version-0 metaData → write a fresh one.) See docs/delta-catalog.md + docs/filesystem-bridge.md. v47 =
+  broken on its version-0 metaData → write a fresh one.) **`arrownet_delta_write(<input>, path := '…')`** — a
+  global host-FS **collector** that writes ANY input table (a DuckDB query result) to a Delta table (Overwrite),
+  returning `(version, rows_written)`; buffers input (Arrow-IPC round-trip copy), commits one version via the
+  shared `DeltaWriter`. Cost args ride as NAMED params (`Parameters` added to `IInOutFunction`/
+  `ICollectorTableFunction` + handle-0 `GlobalFunctions.ParamSchema`); the opener is threaded into the collector
+  Source `GetDataInternal` (where C# `Collect` runs — Finalize-only was racy) AND into the shared
+  `ArrowNetSetActiveTxn` helper (so any connection-using callsite sets it). Validated local + a live OneLake
+  managed table (`Tables/dbo/arrownet_query`). `test/verify_delta_write.test` (18). The full ATTACH-catalog
+  INSERT/CTAS form (+ OCC retry, Append) is the remaining Delta write-back work. See docs/delta-catalog.md + docs/filesystem-bridge.md. v47 =
   **host-FS global table functions**: appended one vtable entry `set_active_opener(opener)` — a per-thread ambient (`AmbientOpener`, mirroring `set_active_txn`) recording the
   calling operator's `ClientContext` so a connection-free GLOBAL host-FS table reader (a lakehouse format)
   resolves DuckDB secrets while reading through the host `fs_*` callbacks; set in the shared `PopulateReturnSchema`

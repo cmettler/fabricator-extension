@@ -1582,12 +1582,17 @@ public:
 	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &) const override {
 		return make_uniq<ArrowNetCollectorSourceState>();
 	}
-	SourceResultType GetDataInternal(ExecutionContext &, DataChunk &chunk, OperatorSourceInput &input) const override {
+	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const override {
 		auto &gstate = input.global_state.Cast<ArrowNetCollectorSourceState>();
 		lock_guard<mutex> guard(gstate.lock); // single-stream reader; MaxThreads()==1 but guard anyway
 		if (!holder->reader || holder->source_done) {
 			return SourceResultType::FINISHED;
 		}
+		// C# Collect runs lazily on THIS pull (sync-over-async on this thread), so (re)set the active txn +
+		// host-FS opener here — not just in Finalize/OpenExchange, which may run on a different thread (the
+		// per-thread ambient would otherwise be unset here → a host-FS collector like arrownet_delta_write
+		// would see a null opener).
+		ArrowNetSetActiveTxn(nullptr, context.client);
 		// Drain a pending array first (one C# output batch may exceed STANDARD_VECTOR_SIZE).
 		if (holder->reader->HasPending()) {
 			holder->reader->Drain(chunk);

@@ -38,3 +38,19 @@ query I
 SELECT count(*) FROM arrownet_delta_scan('${ARROWNET_DELTA_WRITE_DIR}/arrownet_delta_write_test');
 ----
 5
+
+# Collector form: arrownet_delta_write(<input>, path := '…') writes ANY input table (a query result) to a
+# Delta table (Overwrite). Returns (version, rows_written); the written table round-trips via the scan.
+query I
+SELECT rows_written FROM arrownet_delta_write(
+  (SELECT i AS id, 'r' || i AS name FROM range(1, 11) t(i)),
+  path := '${ARROWNET_DELTA_WRITE_DIR}/arrownet_delta_query_test');
+----
+10
+
+query IT
+SELECT id, name FROM arrownet_delta_scan('${ARROWNET_DELTA_WRITE_DIR}/arrownet_delta_query_test')
+WHERE id > 8 ORDER BY id;
+----
+9	r9
+10	r10

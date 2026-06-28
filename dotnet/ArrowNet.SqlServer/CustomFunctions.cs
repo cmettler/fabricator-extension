@@ -41,6 +41,9 @@ internal static class CustomFunctions
     public static readonly IReadOnlyList<ICollectorTableFunction> GlobalCollector = new ICollectorTableFunction[]
     {
         new GfCollectSumFunction(),
+        // HOST-FS WRITE: arrownet_delta_write(<input>, path := '…') writes any input table to a Delta table
+        // (Overwrite) on OneLake/ADLS/local, returning (version, rows_written). Buffers + writes one commit.
+        new ArrowNet.Bridge.DeltaWriteCollectorFunction(),
     };
 
     // Connection-free GLOBAL table functions — bare fn(args), no ATTACH. Implement the base ITableFunction
