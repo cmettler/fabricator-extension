@@ -49,6 +49,10 @@ internal static class CustomFunctions
     {
         new GfSeqFunction(),
         new GfColumnsFunction(),
+        // Reference HOST-FS reader: arrownet_delta_scan(path) reads a Delta Lake table via engineered-wood,
+        // IO through DuckDB's FileSystem + secrets. A provider-agnostic core reader (lives in the Bridge);
+        // declared here because SqlServer is the always-present default backend (same as arrownet_render).
+        new ArrowNet.Bridge.DeltaGlobalTableFunction(),
     };
 
     // Connection-free GLOBAL aggregate functions (UDAF) — bare fn(args), no ATTACH, usable in GROUP BY / OVER /

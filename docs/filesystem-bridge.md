@@ -55,7 +55,18 @@ opener — and azure-secret resolution itself is already validated, see provider
 only piece not directly smoke-tested is a live `az://` blob (no blob store + file handy), but it shares the
 proven code path.
 
-## Delta reader on the bridge — `arrownet_delta_scan(path)` (BUILT, validated)
+> **Update (ABI v47): `arrownet_delta_scan` is now a connection-free GLOBAL host-FS table function, not a
+> bespoke C++ table function.** The bespoke `arrownet_delta.cpp` + the `delta_schema`/`delta_scan` vtable entries
+> were removed; delta is a pure-C# global `ITableFunction` (`DeltaGlobalTableFunction`, declared in
+> `CustomFunctions.GlobalTable`) dispatched through the v29 table session (`table_bind`/`table_execute`). The
+> only new plumbing is the opener: a global host-FS reader needs the calling operator's `ClientContext` (for
+> DuckDB secret resolution) at bind + execute, threaded via a per-thread ambient (`AmbientOpener`, mirroring
+> `set_active_txn`) the host sets with the appended `set_active_opener` ABI entry. So a NEW lakehouse format
+> (Iceberg/Lance/…) is now added with **zero C++** — see docs/global-functions.md §"Host-FS global table
+> functions". The DeltaReader / DuckDbTableFileSystem C# below are unchanged; only the dispatch moved. The
+> sections below describe the original (now-superseded) bespoke wiring.
+
+## Delta reader on the bridge — `arrownet_delta_scan(path)` (BUILT, validated; now a global host-FS fn)
 
 `arrownet_delta_scan('<delta table root>')` reads a Delta Lake table via engineered-wood, with **all IO going
 through DuckDB's FileSystem** over the host callbacks — so local, `az://`, `s3://`, `https://` paths and DuckDB
@@ -103,4 +114,9 @@ the scan, `DESCRIBE` schema, and joins against a values table — all green. The
 
 v40 appended `fs_spike` to the vtable + introduced `ArrowNetHostServices` (passed to `Bootstrap.Initialize`,
 which gained the `host` param). **v41** appended `delta_schema`/`delta_scan` to the vtable and `fs_glob` to
-`ArrowNetHostServices`. All spike surface; the host-services struct is the reusable foundation.
+`ArrowNetHostServices`. **v47** REMOVED `delta_schema`/`delta_scan` (delta became a connection-free global
+host-FS `ITableFunction` on the v29 table session) and appended `set_active_opener` — a per-thread ambient
+opener (mirroring `set_active_txn`) so a global host-FS reader resolves DuckDB secrets through the `fs_*`
+callbacks. So `ArrowNetHostServices` (fs_open_read/size/read/close/glob + host_query) is the reusable C#
+host-IO foundation, and a new lakehouse format is now pure-C# (declare a global `ITableFunction`). See
+docs/global-functions.md §"Host-FS global table functions".

@@ -131,6 +131,9 @@ void PopulateReturnSchema(ClientContext &context, ArrowStreamBindData &bind_data
                           vector<LogicalType> &return_types, vector<string> &names) {
 	// Produce a throwaway stream solely to read the schema, then release it. A bare
 	// request (no projection/filter) => the provider reports the full column set.
+	// Set the active host-FS opener (this context) so a global host-FS table function (a lakehouse reader)
+	// can resolve DuckDB secrets while reading its schema; SQL/compute factories ignore it.
+	SetActiveOpener(reinterpret_cast<ArrowNetHandle>(&context));
 	ArrowArrayStream schema_stream {};
 	bind_data.factory(ArrowScanRequest {}, schema_stream);
 
@@ -340,6 +343,10 @@ unique_ptr<GlobalTableFunctionState> ArrowStreamInitGlobal(ClientContext &contex
 	// it borrows. (handle is unused by set_active_txn — the ambient is global per-thread.) See
 	// docs/transaction-concurrency.md.
 	SetActiveTxn(nullptr, (int64_t)MetaTransaction::Get(context).global_transaction_id);
+	// Set the active host-FS opener (this execution's context) so a global host-FS table function (a
+	// lakehouse reader) resolves DuckDB secrets while reading its data through the host FileSystem; SQL
+	// scans ignore it. The factory runs synchronously on this thread, so the per-thread ambient governs it.
+	SetActiveOpener(reinterpret_cast<ArrowNetHandle>(&context));
 	bind_data.factory(request, gstate->stream);
 	gstate->stream_initialized = true;
 

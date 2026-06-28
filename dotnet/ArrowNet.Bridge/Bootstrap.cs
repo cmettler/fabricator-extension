@@ -44,7 +44,7 @@ public static unsafe class Bootstrap
             return new InMemoryArrayStream(schema, new[] { batch });
         });
 
-        vtable->AbiVersion = 46;
+        vtable->AbiVersion = 47;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -92,11 +92,10 @@ public static unsafe class Bootstrap
         vtable->SetActiveTxn = &SetActiveTxn;
         vtable->ListSecretFields = &ListSecretFields;
         vtable->FsSpike = &FsSpike;
-        vtable->DeltaSchema = &DeltaSchema;
-        vtable->DeltaScan = &DeltaScan;
         vtable->OpenNamedInput = &OpenNamedInput;
         vtable->NamedInputExists = &NamedInputExists;
         vtable->ListGlobalFunctions = &ListGlobalFunctions;
+        vtable->SetActiveOpener = &SetActiveOpener;
         return ArrowNetStatus.Ok;
     }
 
@@ -504,46 +503,15 @@ public static unsafe class Bootstrap
         }
     }
 
+    // Record the calling operator's ClientContext as the active host-FS opener (per-thread ambient), so a
+    // connection-free GLOBAL host-FS table function (a lakehouse reader like arrownet_delta_scan) can resolve
+    // DuckDB secrets while reading through the host FileSystem callbacks. The host calls this immediately
+    // before each table-function bind + execution, on the same thread. 0 clears it. Mirrors SetActiveTxn.
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int DeltaSchema(nint opener, byte* path, CArrowSchema* outSchema, byte** err)
+    private static int SetActiveOpener(nint opener, byte** err)
     {
-        try
-        {
-            if (outSchema is null)
-            {
-                return ArrowNetStatus.InvalidArgument;
-            }
-            var p = Marshal.PtrToStringUTF8((nint)path) ?? string.Empty;
-            CArrowSchemaExporter.ExportSchema(DeltaReader.GetSchema(opener, p), outSchema);
-            return ArrowNetStatus.Ok;
-        }
-        catch (Exception ex)
-        {
-            SetError(err, ex);
-            return ArrowNetStatus.Error;
-        }
-    }
-
-    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int DeltaScan(nint opener, byte* path, CArrowArrayStream* outStream, byte** err)
-    {
-        try
-        {
-            if (outStream is null)
-            {
-                return ArrowNetStatus.InvalidArgument;
-            }
-            var p = Marshal.PtrToStringUTF8((nint)path) ?? string.Empty;
-            // Materialize the whole table while the opener is valid (synchronous call).
-            var stream = DeltaReader.Scan(opener, p);
-            CArrowArrayStreamExporter.ExportArrayStream(stream, outStream);
-            return ArrowNetStatus.Ok;
-        }
-        catch (Exception ex)
-        {
-            SetError(err, ex);
-            return ArrowNetStatus.Error;
-        }
+        AmbientOpener.Current = opener;
+        return ArrowNetStatus.Ok;
     }
 
     // Ambient named-source registry (data-in by name) — see Host.RegisterSource. open_named_input exports a

@@ -5,9 +5,14 @@
 > `arrownet_collect_sum`, handle-0 `inout_bind`), **table** (`arrownet_seq` fixed + `arrownet_columns`
 > ARG-DEPENDENT schema, handle-0 `table_bind` / v29 session), AND **aggregate** (`arrownet_product`, handle-0
 > `agg_open`; GROUP BY / parallel / OVER all work). All resolve as a bare `fn(...)` with NO ATTACH —
-> `test/verify_global_functions.test` (59). **Zero new ABI beyond the v46 scalar entry** (in-out/collector reuse
-> the v28 exchange ABI, table the v29 session, aggregate the v25/v26 `agg_*` ABI — all with handle 0). Only the
-> **host-FS table** sub-case (secret-backed lakehouse readers like delta, needs an opener arg) remains deferred.
+> `test/verify_global_functions.test` (63). **The host-FS table sub-case is now DONE too (ABI v47)** — a global
+> table reader that does secret-backed IO through DuckDB's FileSystem (lakehouse readers like Delta). It needed
+> the calling operator's opener (ClientContext) threaded to the C# binding, solved by **one appended ABI entry
+> `set_active_opener`** (a per-thread ambient mirroring `set_active_txn`) set in the shared table bind/init hooks
+> and read by the binding — reusing the v29 table session verbatim, no new operator. **`arrownet_delta_scan` is
+> now a pure-C# global host-FS `ITableFunction`** (the bespoke `arrownet_delta.cpp` + the `delta_schema`/
+> `delta_scan` ABI entries were removed) — proof a new lakehouse format (Iceberg/Lance/…) is added with **zero
+> C++**. `test/verify_delta.test` (39). See §"Host-FS global table functions (DONE)" below.
 > The **Phase 3-A**: connection-free functions registered
 > at `Extension::Load` so a bare `fn(...)` works with **no ATTACH** (e.g. a template engine). The 4th member of
 > the "provider declares; core stays name-agnostic" family (after settings v33 / ATTACH options v37 / secret
@@ -184,7 +189,32 @@ the binding handle it returns is a real, resolvable handle, so `table_execute`/`
 — just extend the handle-0 branch (added for scalar) to `table_bind` and `inout_bind`, and have C++
 `RegisterArrowNetGlobalFunctions` branch on `kind` to register the right operator.
 
-### The opener wrinkle — where it bites, where it doesn't
+### Host-FS global table functions (DONE, ABI v47)
+
+A global table reader doing secret-backed IO through DuckDB's FileSystem (lakehouse readers — Delta today,
+Iceberg/Lance next). The mechanism, built on the existing `kind='table'` global path:
+
+- **The opener** (the calling operator's `ClientContext`, which resolves DuckDB secrets for `az://`/`s3://`/…)
+  is not an argument of the generic `table_bind`/`table_execute`. So — exactly like `set_active_txn` for the
+  transaction id — the host records it in a **per-thread ambient** via one appended ABI entry
+  `set_active_opener(opener)`, set in the two shared arrow-scan hooks (`PopulateReturnSchema` at bind,
+  `ArrowStreamInitGlobal` at execute) right next to the existing `set_active_txn` call. The managed
+  `AmbientOpener.Current` (ThreadStatic) holds it; a SQL/compute binding never reads it.
+- **Authoring = a plain global `ITableFunction`.** No new interface: the host-FS reader's `Bind(args)` reads
+  `AmbientOpener.Current` to resolve its schema (e.g. open the Delta log) and `Execute(scan)` reads it to read
+  the data through `DuckDbTableFileSystem` (the host `fs_*` callbacks). Because the opener is valid only for the
+  synchronous call, `Execute` **materializes** the result while it's valid (then streams the in-memory batches)
+  — exactly what the bespoke delta reader did at init_global. Declared in `IBackend.GlobalTableFunctions`.
+- **Delta is the reference impl**: `DeltaGlobalTableFunction` (Bridge, over engineered-wood + `DuckDbTableFileSystem`)
+  registered via `CustomFunctions.GlobalTable`. The bespoke `arrownet_delta.cpp` + the `delta_schema`/`delta_scan`
+  ABI entries were removed; `arrownet_delta_scan(path)` now resolves as a global, enumerated by
+  `list_global_functions` (`kind='table'`) and dispatched through the v29 table session. `test/verify_delta.test`.
+- **A future streaming refinement** (not done): the opener (ClientContext) actually lives for the whole
+  table-function execution, so a host-FS reader *could* stream (capture the opener, pull lazily) instead of
+  materializing — and forward the scan's filter/projection spec into engineered-wood's file/row-group skipping.
+  See docs/filesystem-bridge.md "Next".
+
+### The opener wrinkle — where it bit, and how it was resolved (historical)
 
 `table_bind`/`table_execute` (and `inout_bind`) pass a **handle** to C#; a catalog fn uses that handle's
 `SqlConnection`. A global fn has handle 0 — fine for:
@@ -196,11 +226,13 @@ It bites exactly one sub-case: a **host-FS reader** (delta/iceberg/parquet over 
 secrets**), which needs the host `FileSystem` opened against a `ClientContext` for secret resolution — and the
 v29 `table_bind`/`table_execute` path doesn't thread a `ClientContext`/opener to C#. The filesystem bridge
 (`ArrowNetHostServices` fs callbacks, v40/v41) gives C# host IO, but secret-backed opens need the right context.
-Two outs (already the documented decision): **(a)** keep such readers **bespoke** — `arrownet_delta_scan` stays
-the hand-written global fn it is today (its host-FS-opener need is special); **(b)** when a *second* secret-backed
-FS reader wants the generic path, add an **optional opener handle to `table_bind`/`table_execute`** (a host-FS/
-ClientContext handle that FS fns use and SQL fns ignore) and migrate delta onto it. Build (b) only when the 2nd
-format lands; until then the generic global table path serves compute/connstr fns and delta stays bespoke.
+**Resolved (ABI v47):** rather than an opener *param* on `table_bind`/`table_execute` (which would touch every
+catalog/proc/custom callsite + churn `IArrowTableFunctionBinding.Execute`), the opener is threaded as a
+**per-thread ambient** — one appended entry `set_active_opener(opener)` set in the shared `PopulateReturnSchema`
++ `ArrowStreamInitGlobal` hooks (beside `set_active_txn`), read by the host-FS binding from
+`AmbientOpener.Current`. SQL fns ignore it; the v29 session is otherwise untouched. Delta migrated onto it
+(bespoke `arrownet_delta.cpp` + `delta_schema`/`delta_scan` removed). See the "Host-FS global table functions
+(DONE)" section above for the built shape.
 
 ### Effectful global table/in-out (the apply half)
 
@@ -279,9 +311,17 @@ built once in slice 1; each later slice just extends the handle-0 branch to one 
    `RegisterArrowNetGlobalFunctions` registers `kind='aggregate'`/`'aggregate_spill'` via a shared
    `BuildArrowNetAggregateFunction` at load. Reuses the v25/v26 `agg_*` ABI (no bump). Demo `arrownet_product`;
    GROUP BY / parallel / OVER verified. `test/verify_global_functions.test`.
-5. **Global table (host-FS reader)** — deferred; needs the **opener arg** on `table_bind`/`table_execute`. Keep
-   `arrownet_delta_scan` bespoke until a 2nd secret-backed FS reader justifies the generic opener path. See
-   [docs/delta-catalog.md](delta-catalog.md) + the CLAUDE Phase-3-A note.
+5. **Global table (host-FS reader) — DONE (ABI v47)**: a global table reader that does secret-backed IO through
+   DuckDB's FileSystem. The opener (the operator's `ClientContext`, carrying secret resolution) is threaded to
+   the C# binding via **one appended ABI entry `set_active_opener`** — a per-thread ambient (`AmbientOpener`,
+   mirroring `set_active_txn`) the host sets in the shared table bind/init hooks (`PopulateReturnSchema` +
+   `ArrowStreamInitGlobal`), read by the host-FS binding in `Bind` (schema) + `Execute` (data; materialized
+   while the opener is valid). NO opener *param* on `table_bind`/`table_execute` and NO new operator — the v29
+   table session is reused verbatim. `arrownet_delta_scan` migrated to a pure-C# global host-FS `ITableFunction`
+   (`DeltaGlobalTableFunction`, declared in `CustomFunctions.GlobalTable`); the bespoke `arrownet_delta.cpp` +
+   the `delta_schema`/`delta_scan` ABI were removed. So a new lakehouse format (Iceberg/Lance/…) = a pure-C#
+   `ITableFunction` whose `Bind`/`Execute` read `AmbientOpener.Current` + read files via `DuckDbTableFileSystem`,
+   declared as a global — **zero C++**. `test/verify_delta.test` (39). See the §below + docs/filesystem-bridge.md.
 
 **Net:** all FIVE global kinds (scalar / in-out / collector / table / aggregate) register through one mechanism
 (`list_global_functions` + the handle-0 `*_bind`/`*_open` marker), reusing the scalar / v29 table-session /

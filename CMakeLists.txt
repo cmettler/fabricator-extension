@@ -18,7 +18,6 @@ set(EXTENSION_SOURCES
     src/mssql_net_storage.cpp
     src/arrownet_fs_spike.cpp
     src/arrownet_host_query.cpp
-    src/arrownet_delta.cpp
     src/arrownet_optimizer.cpp
     src/arrownet/clr_host.cpp
     src/arrownet/arrow_ingest.cpp

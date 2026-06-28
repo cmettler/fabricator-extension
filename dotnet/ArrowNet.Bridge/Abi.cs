@@ -166,10 +166,8 @@ public unsafe struct ArrowNetVTable
     // SPIKE: int32 fs_spike(void* opener, const char* path, char** out, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte*, byte**, byte**, int> FsSpike;
 
-    // int32 delta_schema(void* opener, const char* path, ArrowSchema* out, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, CArrowSchema*, byte**, int> DeltaSchema;
-    // int32 delta_scan(void* opener, const char* path, ArrowArrayStream* out, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, CArrowArrayStream*, byte**, int> DeltaScan;
+    // (delta_schema / delta_scan removed at ABI v47 — the Delta reader is a connection-free GLOBAL host-FS
+    //  table function dispatched through the table-session path; see SetActiveOpener below.)
 
     // int32 open_named_input(const char* name, ArrowArrayStream* out, char** err) — fresh stream for a
     // registered ambient source; int32 named_input_exists(const char* name, int32* out_exists, char** err).
@@ -179,6 +177,11 @@ public unsafe struct ArrowNetVTable
     // int32 list_global_functions(ArrowArrayStream* out, char** err) — the provider-union of connection-free
     // global functions (metadata: name/kind/param_count/return_type), enumerated once at extension load.
     public delegate* unmanaged[Cdecl]<CArrowArrayStream*, byte**, int> ListGlobalFunctions;
+
+    // int32 set_active_opener(void* opener, char** err) — record the calling operator's ClientContext as the
+    // active host-FS opener (per-thread ambient) so a global host-FS table function (a lakehouse reader)
+    // resolves DuckDB secrets when reading through the host FileSystem. NULL clears it. Mirrors SetActiveTxn.
+    public delegate* unmanaged[Cdecl]<nint, byte**, int> SetActiveOpener;
 }
 
 /// <summary>

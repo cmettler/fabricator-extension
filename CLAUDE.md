@@ -160,7 +160,21 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   section. The bespoke TVF could now fold into `IArrowTableFunction` (`table_execute` returns a stream) but
   needn't — the dispatch is already unified.
 - **Load-time global functions = the 4th provider-self-description capability** (**ALL FIVE kinds DONE — global
-  SCALAR + IN-OUT + COLLECTOR + TABLE + AGGREGATE, ABI v46**; only the host-FS table sub-case deferred).
+  SCALAR + IN-OUT + COLLECTOR + TABLE + AGGREGATE, ABI v46; + the host-FS table sub-case DONE, ABI v47**). The
+  **host-FS global table** sub-case (secret-backed lakehouse readers) is now built: a global table reader that
+  does IO through DuckDB's FileSystem needs the calling operator's opener (`ClientContext`, for secret
+  resolution), threaded to the C# binding via **one appended ABI entry `set_active_opener`** — a per-thread
+  ambient (`AmbientOpener`, mirroring `set_active_txn`) the host sets in the shared table bind/init hooks
+  (`PopulateReturnSchema` + `ArrowStreamInitGlobal`), read by the host-FS binding in `Bind`/`Execute`. NO opener
+  param + NO new operator (the v29 table session is reused verbatim). **`arrownet_delta_scan` migrated to a
+  pure-C# global host-FS `ITableFunction`** (`DeltaGlobalTableFunction`, Bridge, over engineered-wood +
+  `DuckDbTableFileSystem`, declared in `CustomFunctions.GlobalTable`); the bespoke `arrownet_delta.cpp` + the
+  `delta_schema`/`delta_scan` ABI entries were **removed** — so a NEW lakehouse format (Iceberg/Lance/…) is added
+  with **zero C++** (a pure-C# `ITableFunction` reading `AmbientOpener.Current` + files via the host `fs_*`
+  callbacks, declared as a global). `test/verify_delta.test` (39), `test/verify_global_functions.test` (63), full
+  SQL function suite unregressed. See [docs/global-functions.md](docs/global-functions.md) §"Host-FS global
+  table functions". (A future refinement: stream instead of materialize + push the filter/projection into
+  engineered-wood file/row-group skipping — docs/filesystem-bridge.md "Next".)
   Connection-free, ATTACH-free functions registered at `Extension::Load`
   via `loader.RegisterFunction`. **Slice 1 built + verified**: `list_global_functions` enumerates the
   provider-union at load + a **`handle==0`** branch on `get_function_*_schema`/`execute_scalar` resolves a
@@ -1050,12 +1064,22 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v46** (v46 = **load-time global functions**: appended one vtable entry
+- **Current version: ABI v47** (v47 = **host-FS global table functions**: appended one vtable entry
+  `set_active_opener(opener)` — a per-thread ambient (`AmbientOpener`, mirroring `set_active_txn`) recording the
+  calling operator's `ClientContext` so a connection-free GLOBAL host-FS table reader (a lakehouse format)
+  resolves DuckDB secrets while reading through the host `fs_*` callbacks; set in the shared `PopulateReturnSchema`
+  + `ArrowStreamInitGlobal` arrow-scan hooks, read by the host-FS binding in `Bind`/`Execute`. **REMOVED**
+  `delta_schema`/`delta_scan` (a mid-struct removal → offsets of later entries shift; `abi.h` ↔ `Abi.cs` kept in
+  lockstep, function/delta suites the gate): `arrownet_delta_scan` is now a pure-C# global `ITableFunction`
+  (`DeltaGlobalTableFunction`) on the v29 table session — a new lakehouse format costs zero C++. See the
+  load-time-global-functions bullet + [docs/global-functions.md](docs/global-functions.md) §"Host-FS global table
+  functions". v46 = **load-time global functions**: appended one vtable entry
   `list_global_functions` (enumerate the provider-union of connection-free global functions at extension load);
   the scalar entries `get_function_param_schema`/`get_function_return_schema`/`execute_scalar` gained a
-  **`handle==0`** branch that resolves a function by name against the C# global registry instead of a catalog.
-  Global scalar only so far; see the load-time-global-functions bullet + [docs/global-functions.md](docs/global-functions.md).
-  v42–v45 = the **host-query** feature, prior session. v41 = the **Delta lakehouse reader on the filesystem bridge** SPIKE: appended
+  **`handle==0`** branch that resolves a function by name against the C# global registry instead of a catalog
+  (all five global kinds — scalar/in-out/collector/table/aggregate — reuse it).
+  v42–v45 = the **host-query** feature, prior session. v41 (its `delta_schema`/`delta_scan`, removed at v47) was
+  the **Delta lakehouse reader on the filesystem bridge** SPIKE: appended
   `delta_schema`/`delta_scan` to the vtable + `fs_glob` to `ArrowNetHostServices`. `arrownet_delta_scan(path)`
   reads a Delta Lake table via **engineered-wood** (Curt Hagenlocher's pure-C# Delta), with ALL IO through
   DuckDB's `FileSystem` over the host callbacks — so local/`az://`/`s3://`/`https://` + DuckDB secrets all work.

@@ -8,7 +8,8 @@ namespace ArrowNet.Bridge;
 /// Reads a Delta Lake table (Curt Hagenlocher's engineered-wood, pure C#) whose IO is delegated to DuckDB's
 /// <c>FileSystem</c> via <see cref="DuckDbTableFileSystem"/> — so Delta tables on local/az://-s3://-https://
 /// paths read with DuckDB's secrets + backends. Surfaced to DuckDB as the <c>arrownet_delta_scan(path)</c>
-/// table function (see the <c>delta_schema</c>/<c>delta_scan</c> ABI handlers in <c>Bootstrap</c>).
+/// connection-free GLOBAL host-FS table function (see <see cref="DeltaGlobalTableFunction"/>); the opener is
+/// the calling operator's ClientContext, threaded via <see cref="AmbientOpener"/>.
 /// </summary>
 internal static class DeltaReader
 {

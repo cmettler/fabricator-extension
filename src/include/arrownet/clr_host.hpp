@@ -47,11 +47,12 @@ void SetHostQueryService(HostQueryFn fn);
 // resolution) and return a short human-readable result (head/tail bytes + size). Proves C#->host FS reads.
 std::string FsSpike(ArrowNetHandle opener, const std::string &path);
 
-// Delta lakehouse reads (engineered-wood, IO via the host FileSystem callbacks). `opener` = the calling
-// operator's ClientContext (secret resolution + FileSystem). DeltaSchema fills `out` with the table's Arrow
-// schema only; DeltaScan reads the whole table into `out` (materialized during the call). Both throw on error.
-void DeltaSchema(ArrowNetHandle opener, const std::string &path, ArrowSchema &out);
-void DeltaScan(ArrowNetHandle opener, const std::string &path, ArrowArrayStream &out);
+// Record the calling operator's ClientContext as the active host-FS opener (a per-thread ambient on the
+// managed side), so a connection-free GLOBAL host-FS table function (a lakehouse reader: Delta/Iceberg/…)
+// can resolve DuckDB secrets when reading through the host FileSystem callbacks. The host calls this
+// IMMEDIATELY before each table-function bind + execution (same thread, synchronous); `opener` is valid only
+// for the call it precedes. Best-effort (mirrors SetActiveTxn). See docs/global-functions.md §host-FS.
+void SetActiveOpener(ArrowNetHandle opener);
 
 // Ambient named-source registry (data-in by name). OpenNamedInput fills `out` with a fresh Arrow stream for
 // the registered source `name` (throws if none); NamedInputExists reports whether a source is registered

@@ -557,17 +557,10 @@ typedef struct ArrowNetVTable {
 	// -------------------------------------------------------------------------
 	int32_t (*fs_spike)(ArrowNetHandle opener, const char *path, char **out, char **err);
 
-	// -------------------------------------------------------------------------
-	// Lakehouse (Delta) — managed reader over the host FileSystem callbacks (engineered-wood). `opener` is
-	// the calling operator's ClientContext (carries secret resolution + the FileSystem the managed
-	// DuckDbTableFileSystem reads through). `path` is the Delta table root (any DuckDB-resolvable path:
-	// local, az://, s3://, https://).
-	// -------------------------------------------------------------------------
-	// delta_schema: open the Delta table at `path` and fill *out with its Arrow schema only (no data read).
-	int32_t (*delta_schema)(ArrowNetHandle opener, const char *path, struct ArrowSchema *out, char **err);
-	// delta_scan: open + read the Delta table at `path`, returning all record batches as *out (materialized
-	// in managed memory during this synchronous call — the opener need only stay valid until it returns).
-	int32_t (*delta_scan)(ArrowNetHandle opener, const char *path, struct ArrowArrayStream *out, char **err);
+	// (delta_schema / delta_scan were removed at ABI v47 — the Delta reader is now a connection-free GLOBAL
+	//  host-FS table function (kind='table' enumerated by list_global_functions), dispatched through the v29
+	//  table-session path (table_bind / table_execute) with the active host-FS opener set via set_active_opener
+	//  below. So a managed lakehouse reader needs NO bespoke C++/ABI — see docs/global-functions.md §host-FS.)
 
 	// -------------------------------------------------------------------------
 	// Ambient named-source registry (data-in by name). A managed component registers `name -> a fresh Arrow
@@ -591,6 +584,18 @@ typedef struct ArrowNetVTable {
 	// routes a 0 handle to the global registry by name), and dispatches execution via execute_scalar with
 	// handle = 0. So global SCALAR functions add NO execution/schema ABI — only this enumeration entry.
 	int32_t (*list_global_functions)(struct ArrowArrayStream *out, char **err);
+
+	// -------------------------------------------------------------------------
+	// Active host-FS opener (for connection-free GLOBAL host-FS table functions — lakehouse readers like
+	// Delta/Iceberg). A global host-FS table reader does its IO through DuckDB's FileSystem (the
+	// ArrowNetHostServices fs_* callbacks), which needs the calling operator's FileOpener/ClientContext to
+	// resolve DuckDB secrets (az://, s3://, …). That context isn't an argument of the generic table_bind /
+	// table_execute path, so — mirroring set_active_txn — the host records it in a per-thread ambient
+	// IMMEDIATELY before each table-function bind + execution (same thread, synchronous), and the managed
+	// host-FS binding reads it. `opener` is the operator's ClientContext (reinterpret_cast to a handle), valid
+	// only for the duration of the call it precedes; NULL clears it. SQL/compute table functions ignore it.
+	// Best-effort (a failure to set the ambient must not abort the statement). See docs/global-functions.md.
+	int32_t (*set_active_opener)(ArrowNetHandle opener, char **err);
 } ArrowNetVTable;
 
 // -----------------------------------------------------------------------------
@@ -646,7 +651,7 @@ typedef struct ArrowNetHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 46
+#define ARROWNET_ABI_VERSION 47
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen
