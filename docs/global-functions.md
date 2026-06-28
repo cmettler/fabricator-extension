@@ -98,13 +98,21 @@ managed bridge unless the ABI bumped).
 ## The template-engine demo (the motivator)
 
 A provider-agnostic core global, e.g. `arrownet_render(template VARCHAR, params <any>) → VARCHAR`:
-- **Engine**: a pure-managed templating library — **Scriban** (netstandard, no native deps, Liquid/Handlebars-ish)
-  is the natural pick; published transitively like `Azure.Identity` / engineered-wood.
+- **Engine**: **Fluid** (`github.com/sebastienros/fluid`) — a pure-managed (.NET, MIT, on Parlot) **Liquid**
+  template engine; published transitively like `Azure.Identity` / engineered-wood. Chosen over Scriban for this
+  use because (a) **secure-by-default** — Liquid + opt-in `MemberAccessStrategy`, no arbitrary .NET eval, so a
+  *user-supplied* template (a SQL literal/column) can't reach arbitrary object graphs; (b) **Liquid** is a
+  widely-known syntax; (c) **fast + low-alloc** with a clean **parse-once / render-many** split
+  (`FluidParser.TryParse` → a thread-safe `IFluidTemplate`), ideal for vectorized rendering; (d) native
+  dictionary / `System.Text.Json` model binding, which is exactly how we hand it `params`. (Scriban stays a fine
+  alternative if a richer scripting language is later wanted for heavy TMDL generation.)
 - **params**: accept EITHER a DuckDB `STRUCT` (`{'name':'world','n':3}`, preferred — type-safe) OR a JSON string,
   via the **`NullType` sentinel → `LogicalType::ANY`** marker already used by `daxeval` (so `params` crosses
-  uncast and `Invoke` reads its runtime type). Each row: bind the struct/JSON fields as template variables,
-  render, emit the text.
-- Vectorized: render per row (compile-per-row, or cache by template string if it's constant across the batch).
+  uncast and `Invoke` reads its runtime type). Materialize each row's bag into a `Dictionary<string,object>` /
+  `JsonElement` and drop it into the `TemplateContext` (dictionaries/JSON need no member allow-listing), render,
+  emit the text.
+- Vectorized: parse the template ONCE and **cache the `IFluidTemplate` keyed by the template string** (usually
+  constant across a batch — a literal), render per row off the cached, thread-safe template.
 
 **Composition with TMDL** (the original driver, [docs/dax-provider.md](dax-provider.md) "TMDL"): the global
 scalar is the **"dynamically create a TMDL"** step — `arrownet_render(tmdl_template, params)` → a TMDL string —
