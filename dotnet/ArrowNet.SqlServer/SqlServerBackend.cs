@@ -320,22 +320,22 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     private static readonly IReadOnlyDictionary<string, IArrowTableFunction> CustomTable =
         CustomFunctions.Table.ToDictionary(f => $"{f.SchemaName}.{f.Name}", StringComparer.OrdinalIgnoreCase);
 
-    // Provider-authored custom table-in-out functions (IArrowInOutFunction), keyed "schema.name"
+    // Provider-authored custom table-in-out functions (ICatalogInOutFunction), keyed "schema.name"
     // (case-insensitive). Surfaced as `kind='inout'` (see FunctionsMetadataSql) so the C++ catalog registers
     // them as a {TABLE}-param table function under the bare name, resolved by InOutBind on the streaming
     // exchange (Bind(args, inputSchema) -> the per-call binding). The output is the binding's full declared
-    // schema (no input echo, unlike a discovered TVF's `_each`). Authors implement IArrowInOutFunction (or its
+    // schema (no input echo, unlike a discovered TVF's `_each`). Authors implement ICatalogInOutFunction (or its
     // fixed-schema convenience base StaticInOutFunction) and write DoExchange.
-    private static readonly IReadOnlyDictionary<string, IArrowInOutFunction> CustomInOut =
+    private static readonly IReadOnlyDictionary<string, ICatalogInOutFunction> CustomInOut =
         CustomFunctions.InOut.ToDictionary(f => $"{f.SchemaName}.{f.Name}", StringComparer.OrdinalIgnoreCase);
 
-    // Provider-authored custom COLLECTOR table-in-out functions (IArrowCollectorTableFunction), keyed
+    // Provider-authored custom COLLECTOR table-in-out functions (ICatalogCollectorTableFunction), keyed
     // "schema.name" (case-insensitive). Surfaced as `kind='collector'` (see FunctionsMetadataSql) so the C++
     // catalog registers them as a {TABLE}-param table function routed to the Sink+Source pipeline-breaker
     // operator (NOT the streaming exchange). Resolved by InOutBind (which wraps the IArrowCollectorBinding in a
     // CollectorInOutBinding so it flows through the shared inout_bind/inout_exchange_open marshaling). A
     // collector sees ALL input before emitting (whole-table semantics) — no single-chunk cap.
-    private static readonly IReadOnlyDictionary<string, IArrowCollectorTableFunction> CustomCollector =
+    private static readonly IReadOnlyDictionary<string, ICatalogCollectorTableFunction> CustomCollector =
         CustomFunctions.Collector.ToDictionary(f => $"{f.SchemaName}.{f.Name}", StringComparer.OrdinalIgnoreCase);
 
     // Provider-authored custom aggregate functions (UDAF), keyed "schema.name" (case-insensitive). Surfaced
@@ -1936,7 +1936,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         return new BindingBoundTable(new SqlServerProcedure(this, schemaName, functionName).Bind(args!), supportsPushdown: false);
     }
 
-    // Phase 6 streaming-exchange bind for every `_each` form. A custom C# in-out (IArrowInOutFunction —
+    // Phase 6 streaming-exchange bind for every `_each` form. A custom C# in-out (ICatalogInOutFunction —
     // directly or via the StaticInOutFunction base) binds itself; a discovered TVF `_each` CROSS APPLYs on a
     // read-only connection (SqlServerTvfEach); a stored-proc `_each` EXECs once per input row on DuckDB's
     // pinned write transaction (SqlServerProcEach). Proc vs TVF is classified the same way as elsewhere — a

@@ -4,17 +4,17 @@ namespace ArrowNet.Bridge;
 
 /// <summary>
 /// Convenience base for a custom table-in-out with a FIXED output schema: override <see cref="OutputSchema"/>
-/// and <see cref="DoExchange"/>, and the base supplies the <see cref="IArrowInOutFunction.Bind"/> → binding
-/// wiring (no separate binding class to write). This is to <see cref="IArrowInOutFunction"/> what
+/// and <see cref="DoExchange"/>, and the base supplies the <see cref="ICatalogInOutFunction.Bind"/> → binding
+/// wiring (no separate binding class to write). This is to <see cref="ICatalogInOutFunction"/> what
 /// <c>StaticTableFunction</c> is to <c>IArrowTableFunction</c>.
 ///
 /// The author owns the streaming loop in <see cref="DoExchange"/>: read <c>input</c> (one batch per input
 /// chunk, ends at EOF), yield output batches, and yield a length-0 sentinel (<c>InOutExchange.EmptyBatch</c>)
 /// after each input chunk. Keep any cross-chunk state in DoExchange LOCALS — a fresh enumerator runs per
 /// exchange, so state never leaks across prepared re-executions. For an output schema that depends on the
-/// call's args, implement <see cref="IArrowInOutFunction"/> directly instead.
+/// call's args, implement <see cref="ICatalogInOutFunction"/> directly instead.
 /// </summary>
-public abstract class StaticInOutFunction : IArrowInOutFunction
+public abstract class StaticInOutFunction : ICatalogInOutFunction
 {
     /// <summary>Target catalog schema (e.g. "dbo").</summary>
     public abstract string SchemaName { get; }

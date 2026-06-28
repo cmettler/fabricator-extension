@@ -14,7 +14,7 @@ namespace ArrowNet.SqlServer;
 /// Provider-authored custom functions — scalar, table, table-in-out, and aggregate — surfaced into every
 /// attached catalog alongside the discovered SQL Server functions (resolved as <c>db.schema.name(args)</c>).
 /// To add one, implement the matching Bridge interface (<see cref="ICatalogScalarFunction"/>,
-/// <see cref="IArrowTableFunction"/>, <see cref="IArrowInOutFunction"/> — or its fixed-schema convenience base
+/// <see cref="IArrowTableFunction"/>, <see cref="ICatalogInOutFunction"/> — or its fixed-schema convenience base
 /// <see cref="StaticInOutFunction"/> — or <see cref="IArrowAggregateFunction"/>) and list it in the
 /// corresponding array below. These run entirely in C# — there need be no corresponding SQL Server object.
 /// </summary>
@@ -42,12 +42,12 @@ internal static class CustomFunctions
         new CfColumnsFunction(),
     };
 
-    // Custom table-in-out functions (IArrowInOutFunction), singletons — surfaced as `kind='inout'` and
+    // Custom table-in-out functions (ICatalogInOutFunction), singletons — surfaced as `kind='inout'` and
     // resolved by SqlServerCatalog.InOutBind on the streaming exchange; Bind() mints the per-call binding. All
     // three use the fixed-schema convenience base StaticInOutFunction (override OutputSchema + DoExchange; the
     // author owns the loop + sentinel, cross-chunk state in DoExchange locals — stateless cf_tag, cumulative
     // cf_running_sum, row-index cf_exchange).
-    public static readonly IReadOnlyList<IArrowInOutFunction> InOut = new IArrowInOutFunction[]
+    public static readonly IReadOnlyList<ICatalogInOutFunction> InOut = new ICatalogInOutFunction[]
     {
         new CfTagFunction(),
         new CfRunningSumFunction(),
@@ -64,11 +64,11 @@ internal static class CustomFunctions
         new CfMedianFunction(),
     };
 
-    // Collector table-in-out functions (IArrowCollectorTableFunction), singletons — surfaced as
+    // Collector table-in-out functions (ICatalogCollectorTableFunction), singletons — surfaced as
     // `kind='collector'` and resolved by SqlServerCatalog.InOutBind on the Sink+Source pipeline-breaker
     // operator (NOT the streaming exchange). A collector sees ALL input before emitting any output (whole-table
     // semantics), so it can take arbitrarily many input chunks — unlike the streaming in-out. Pure C#.
-    public static readonly IReadOnlyList<IArrowCollectorTableFunction> Collector = new IArrowCollectorTableFunction[]
+    public static readonly IReadOnlyList<ICatalogCollectorTableFunction> Collector = new ICatalogCollectorTableFunction[]
     {
         new CfCollectFunction(),
     };

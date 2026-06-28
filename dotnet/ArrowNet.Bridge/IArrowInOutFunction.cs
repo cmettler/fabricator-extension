@@ -41,12 +41,9 @@ public interface IArrowInOutIsolation
 /// (it supplies the <see cref="Bind"/> wiring — you still write DoExchange). Surfaced into the catalog as
 /// <c>kind='inout'</c> and resolved by <c>IBackendCatalog.InOutBind</c>.
 /// </summary>
-public interface IArrowInOutFunction
+public interface IInOutFunction
 {
-    /// <summary>Target catalog schema (e.g. "dbo").</summary>
-    string SchemaName { get; }
-
-    /// <summary>Function name, called as <c>SELECT * FROM db.SchemaName.Name(&lt;input table&gt;)</c>.</summary>
+    /// <summary>Function name. Catalog: <c>SELECT * FROM db.schema.Name(&lt;input&gt;)</c>; global: the bare name.</summary>
     string Name { get; }
 
     /// <summary>The declared input-table columns — used for discovery metadata; the actual input schema is
@@ -56,6 +53,15 @@ public interface IArrowInOutFunction
     /// <summary>Binds one call: <paramref name="args"/> (nullable) are the constant "cost" args (1-row batch);
     /// <paramref name="inputSchema"/> is the actual input table's schema. Returns the per-call binding.</summary>
     IArrowInOutBinding Bind(RecordBatch? args, Schema inputSchema);
+}
+
+/// <summary>A catalog-bound table-in-out function (attach-time scope) — <see cref="IInOutFunction"/> plus the
+/// <see cref="SchemaName"/>. For a connection-free, ATTACH-free in-out, implement the base
+/// <see cref="IInOutFunction"/> and declare it as a global instead.</summary>
+public interface ICatalogInOutFunction : IInOutFunction
+{
+    /// <summary>Target catalog schema (e.g. "dbo").</summary>
+    string SchemaName { get; }
 }
 
 /// <summary>

@@ -5,16 +5,16 @@ namespace ArrowNet.Bridge;
 /// <summary>
 /// Convenience base for a custom COLLECTOR table-in-out with a FIXED output schema: override
 /// <see cref="OutputSchema"/> and <see cref="Collect"/>, and the base supplies the
-/// <see cref="IArrowCollectorTableFunction.Bind"/> → binding wiring. This is to
-/// <see cref="IArrowCollectorTableFunction"/> what <c>StaticInOutFunction</c> is to
-/// <see cref="IArrowInOutFunction"/>.
+/// <see cref="ICatalogCollectorTableFunction.Bind"/> → binding wiring. This is to
+/// <see cref="ICatalogCollectorTableFunction"/> what <c>StaticInOutFunction</c> is to
+/// <see cref="ICatalogInOutFunction"/>.
 ///
 /// The author writes the whole-table transform in <see cref="Collect"/>: read <c>allInput</c> to EOF
 /// (every input batch — copy values out, don't retain the batch), then yield the full output. No sentinels —
 /// the operator buffers all input before <c>Collect</c> runs. Cross-input state lives in <c>Collect</c> LOCALS
 /// (a fresh enumerator runs per call, so state never leaks across prepared re-executions).
 /// </summary>
-public abstract class StaticCollectorFunction : IArrowCollectorTableFunction
+public abstract class StaticCollectorFunction : ICatalogCollectorTableFunction
 {
     /// <summary>Target catalog schema (e.g. "dbo").</summary>
     public abstract string SchemaName { get; }
