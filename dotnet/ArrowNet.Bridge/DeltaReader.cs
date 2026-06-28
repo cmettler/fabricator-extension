@@ -1,6 +1,10 @@
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
+using System.Threading;
 using Apache.Arrow;
 using EngineeredWood.DeltaLake.Table;
+using EngineeredWood.Expressions;
+using EngineeredWood.Parquet;
 
 namespace ArrowNet.Bridge;
 
@@ -19,31 +23,50 @@ internal static class DeltaReader
     {
         var fs = new DuckDbTableFileSystem(opener, path);
         var table = DeltaTable.OpenAsync(fs).GetAwaiter().GetResult();
-        return table.ArrowSchema;
-    }
-
-    /// <summary>Opens + reads the whole Delta table at <paramref name="path"/>, materializing every
-    /// <see cref="RecordBatch"/> in managed memory (so the result is independent of the opener's lifetime —
-    /// all host IO happens before this returns).</summary>
-    public static InMemoryArrayStream Scan(nint opener, string path)
-    {
-        var fs = new DuckDbTableFileSystem(opener, path);
-        var table = DeltaTable.OpenAsync(fs).GetAwaiter().GetResult();
-        var schema = table.ArrowSchema;
-
-        var batches = new List<RecordBatch>();
-        var e = table.ReadAllAsync().GetAsyncEnumerator();
         try
         {
-            while (e.MoveNextAsync().GetAwaiter().GetResult())
+            return table.ArrowSchema;
+        }
+        finally
+        {
+            table.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Streams the Delta table at <paramref name="path"/> lazily (one <see cref="RecordBatch"/> at a time, no
+    /// materialization). <paramref name="columns"/> (null =&gt; all) is the projection — engineered-wood reads
+    /// only those columns. <paramref name="filter"/> (null =&gt; none) is pushed for <b>file + row-group
+    /// skipping</b>: it drives both the Delta file pruner (<c>ReadAllAsync(columns, filter)</c>) and the
+    /// per-file Parquet row-group/stats pruner (via <c>ParquetReadOptions.Filter</c>). engineered-wood does not
+    /// re-apply the predicate per row, so the result is a superset — DuckDB re-applies above the scan.
+    /// <paramref name="opener"/> (the operator's ClientContext) must stay valid for the whole scan; it does —
+    /// the ClientContext lives for the whole table-function execution.
+    /// </summary>
+    public static IAsyncEnumerable<RecordBatch> Stream(
+        nint opener, string path, IReadOnlyList<string>? columns, Predicate? filter, CancellationToken ct)
+    {
+        var fs = new DuckDbTableFileSystem(opener, path);
+        var parquet = filter is null ? ParquetReadOptions.Default : new ParquetReadOptions { Filter = filter };
+        var options = DeltaTableOptions.Default with { ParquetReadOptions = parquet };
+        return StreamImpl(fs, options, columns, filter, ct);
+    }
+
+    private static async IAsyncEnumerable<RecordBatch> StreamImpl(
+        DuckDbTableFileSystem fs, DeltaTableOptions options, IReadOnlyList<string>? columns,
+        Predicate? filter, [EnumeratorCancellation] CancellationToken ct)
+    {
+        var table = await DeltaTable.OpenAsync(fs, options, ct).ConfigureAwait(false);
+        try
+        {
+            await foreach (var batch in table.ReadAllAsync(columns, filter, ct).ConfigureAwait(false))
             {
-                batches.Add(e.Current);
+                yield return batch;
             }
         }
         finally
         {
-            e.DisposeAsync().GetAwaiter().GetResult();
+            await table.DisposeAsync().ConfigureAwait(false);
         }
-        return new InMemoryArrayStream(schema, batches);
     }
 }

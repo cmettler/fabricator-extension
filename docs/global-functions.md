@@ -203,16 +203,19 @@ Iceberg/Lance next). The mechanism, built on the existing `kind='table'` global 
 - **Authoring = a plain global `ITableFunction`.** No new interface: the host-FS reader's `Bind(args)` reads
   `AmbientOpener.Current` to resolve its schema (e.g. open the Delta log) and `Execute(scan)` reads it to read
   the data through `DuckDbTableFileSystem` (the host `fs_*` callbacks). Because the opener is valid only for the
-  synchronous call, `Execute` **materializes** the result while it's valid (then streams the in-memory batches)
-  — exactly what the bespoke delta reader did at init_global. Declared in `IBackend.GlobalTableFunctions`.
+  synchronous call, `Execute` **streams lazily** — it captures the opener (which stays valid for the whole
+  table-function execution) and reads batches on demand as the host pulls (no materialization). Declared in
+  `IBackend.GlobalTableFunctions`.
 - **Delta is the reference impl**: `DeltaGlobalTableFunction` (Bridge, over engineered-wood + `DuckDbTableFileSystem`)
   registered via `CustomFunctions.GlobalTable`. The bespoke `arrownet_delta.cpp` + the `delta_schema`/`delta_scan`
   ABI entries were removed; `arrownet_delta_scan(path)` now resolves as a global, enumerated by
   `list_global_functions` (`kind='table'`) and dispatched through the v29 table session. `test/verify_delta.test`.
-- **A future streaming refinement** (not done): the opener (ClientContext) actually lives for the whole
-  table-function execution, so a host-FS reader *could* stream (capture the opener, pull lazily) instead of
-  materializing — and forward the scan's filter/projection spec into engineered-wood's file/row-group skipping.
-  See docs/filesystem-bridge.md "Next".
+- **Streaming + filter pushdown** (DONE): the reader streams lazily (captures the opener, pulls one batch at a
+  time — no materialization) and pushes the scan's `FilterNode` into engineered-wood's **file + row-group
+  skipping** (`DeltaFilterBuilder` → `EngineeredWood.Expressions.Predicate`, superset-safe; DuckDB re-applies).
+  Column projection into the Parquet read stays deferred (the shared `BindingBoundTable` wraps the stream with
+  the full output schema, so a projected subset would mismatch it — DuckDB projects above the scan instead).
+  See docs/filesystem-bridge.md §"Streaming + filter pushdown".
 
 ### The opener wrinkle — where it bit, and how it was resolved (historical)
 

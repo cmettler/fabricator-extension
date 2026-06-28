@@ -1,5 +1,4 @@
 using System.Collections.Generic;
-using System.Runtime.CompilerServices;
 using System.Threading;
 using Apache.Arrow;
 using Apache.Arrow.Ipc;
@@ -50,30 +49,58 @@ public sealed class DeltaGlobalTableFunction : ITableFunction
 
         public Schema OutputSchema => _schema;
 
-        // The Delta read returns the full set of columns; DuckDB re-applies projection (by name) + filters
-        // above the scan. (engineered-wood file/row-group skipping via the scan's filter spec is a future
-        // streaming refinement — see docs/filesystem-bridge.md "Next".)
+        // engineered-wood honors the projection (reads only the requested columns) and pushes the filter into
+        // file + row-group skipping; it does NOT re-apply the predicate per row, so the result is a SUPERSET —
+        // DuckDB re-applies the projection (by name) + every filter above the scan. (The host already maps the
+        // result columns by name regardless of this flag for a global table function.)
         public bool SupportsPushdown => false;
 
         public IAsyncEnumerable<RecordBatch> Execute(TableFunctionScan scan, CancellationToken ct = default)
         {
-            // Materialize the whole table NOW, while the opener is valid (this Execute body runs synchronously
-            // — the actual host IO happens here, not lazily). The returned iterator only walks the in-memory
-            // result, so it's safe to drain after the opener is gone.
-            var stream = DeltaReader.Scan(AmbientOpener.Current, _path);
-            return Drain(stream, ct);
+            // Capture the opener (this operator's ClientContext) NOW — it stays valid for the whole execution,
+            // so the lazy stream below can read files through it as the host pulls batches (no materialization).
+            var opener = AmbientOpener.Current;
+            var spec = scan.Spec;
+            // Push the FILTER for file + row-group skipping (doesn't change the result schema). Read the filter
+            // constants + map the predicate eagerly (the constants batch is in-memory; this consumes + disposes
+            // scan.FilterValues). A node we can't safely push is dropped (superset-safe); DuckDB re-applies.
+            var filter = spec?.Filter is { } node
+                ? new DeltaFilterBuilder(ReadValues(scan.FilterValues)).Build(node)
+                : null;
+            // Column PROJECTION is intentionally NOT pushed into engineered-wood here: the shared
+            // BindingBoundTable wraps this stream with the binding's FULL OutputSchema, so returning a
+            // projected column subset would mismatch the declared schema (arrow_ingest SIGSEGV). DuckDB still
+            // projects columns above the scan (by name). True column-pruning into the Parquet read would need
+            // a pushdown-native bound table that declares the projected schema — see docs/filesystem-bridge.md.
+            return DeltaReader.Stream(opener, _path, columns: null, filter, ct);
         }
 
-        private static async IAsyncEnumerable<RecordBatch> Drain(
-            IArrowArrayStream stream, [EnumeratorCancellation] CancellationToken ct)
+        private static IReadOnlyList<object?> ReadValues(IArrowArrayStream? filterValues)
         {
-            using (stream)
+            if (filterValues is null)
             {
-                RecordBatch? batch;
-                while ((batch = await stream.ReadNextRecordBatchAsync(ct).ConfigureAwait(false)) is not null)
+                return System.Array.Empty<object?>();
+            }
+            using (filterValues)
+            {
+                var batch = filterValues.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+                if (batch is null)
                 {
-                    yield return batch;
+                    return System.Array.Empty<object?>();
                 }
+                var values = new object?[batch.ColumnCount];
+                for (int i = 0; i < batch.ColumnCount; i++)
+                {
+                    try
+                    {
+                        values[i] = ArrowValueReader.ReadScalar(batch.Column(i), 0);
+                    }
+                    catch (System.NotSupportedException)
+                    {
+                        values[i] = null; // unmappable Arrow type → that predicate node won't push (DuckDB re-applies)
+                    }
+                }
+                return values;
             }
         }
 

@@ -91,19 +91,36 @@ secrets all work, one auth config shared with native reads.
   throws on delta-rs's explicit `"field":null` (engineered-wood's own writer omits them). Guarded with
   `TokenType == Null ? null : GetInt64()` — an upstream-worthy robustness fix for reading delta-rs tables.
 
-**Validated** (`test/verify_delta.test`, 39 assertions; fixture `test/fixtures/delta_simple`, a delta-rs table
-of 10 rows id/name/amount): full scan with correct bind-time types, filter+aggregate pushed by DuckDB above
-the scan, `DESCRIBE` schema, and joins against a values table — all green. The Apache.Arrow version is aligned
-(engineered-wood + the bridge both **23.0.0**, both net10.0).
+**Validated** (`test/verify_delta.test`, 52 assertions; fixture `test/fixtures/delta_simple`, a delta-rs table
+of 10 rows id/name/amount): full scan with correct bind-time types, filter+aggregate, `DESCRIBE` schema, and
+the pushed-filter cases (`=`/`IN`/`AND`-range into engineered-wood skipping; string `<>` not pushed but still
+filtered by DuckDB) — all green. The Apache.Arrow version is aligned (engineered-wood + the bridge both
+**23.0.0**, both net10.0). Now streams lazily (no materialization) with filter pushdown — see the section below.
+
+## Streaming + filter pushdown (DONE, ABI v47)
+
+- **Streaming (not materialized) — DONE**: `DeltaReader.Stream` is a lazy `IAsyncEnumerable<RecordBatch>` over
+  engineered-wood's `ReadAllAsync` (one batch per host pull, ≤1 buffered). The opener (captured at `Execute`)
+  stays valid across the scan — the ClientContext lives for the whole table-function execution. Replaced the
+  old materialize-into-`InMemoryArrayStream`.
+- **Filter pushdown into file + row-group skipping — DONE**: `DeltaFilterBuilder` maps the scan's `FilterNode`
+  tree (constants read from `filter_values` via `ArrowValueReader`) into an engineered-wood
+  `EngineeredWood.Expressions.Predicate`, superset-safe (`=`/`IN` any type; ordering for non-string; `and`
+  keeps pushable children, `or` is all-or-nothing; temporal/GUID/binary literals not pushed yet). The predicate
+  drives BOTH the Delta file pruner (`ReadAllAsync(columns, filter)`) AND per-file Parquet row-group/stats
+  pruning (set via `ParquetReadOptions.Filter` on the per-scan `DeltaTableOptions` — no engineered-wood change
+  needed). engineered-wood never re-applies per row, and DuckDB re-applies above the scan, so the result is a
+  correct superset. `test/verify_delta.test` (52 — incl. `=`/`IN`/`AND`-range pushed, and a string `<>`
+  correctly NOT pushed but still filtered by DuckDB).
+- **Column projection into the Parquet read — still deferred**: engineered-wood's `ReadAllAsync(columns, …)`
+  can read only the requested columns, but the shared `BindingBoundTable` wraps the result stream with the
+  binding's FULL `OutputSchema`, so returning a projected column SUBSET mismatches the declared schema
+  (arrow_ingest SIGSEGV). DuckDB still projects columns above the scan (by name), so this only forfeits the
+  Parquet column-read I/O savings, never correctness. Doing it needs a pushdown-native `IBoundTable` that
+  declares the projected schema (like the bespoke `SqlServerTableValuedFunction`) — a small follow-up.
 
 ## Next (a real lakehouse provider — not built)
 
-- **Streaming** (not materialized): `delta_scan` currently buffers the whole table; wrap `ReadAllAsync` as a
-  lazy `IArrowArrayStream` whose `get_next` pulls a batch at a time. The opener must then stay valid across
-  the scan (it does — the ClientContext lives for the whole table-function execution).
-- **Predicate / projection pushdown into Delta** (file skipping): engineered-wood's `ReadAllAsync(columns,
-  Predicate)` prunes files by partition values + column stats. Forward the scan's `spec_json`/`filter_values`
-  (as the TVF path already does) into a Delta `Predicate` + column list.
 - **More formats / a provider surface**: Iceberg/Lance/… via engineered-wood; promote `arrownet_delta_scan` to
   a provider-style `ATTACH`-able lakehouse catalog. The reverse-callback set is already general (open/read/
   size/close/glob).

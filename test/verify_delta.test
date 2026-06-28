@@ -37,3 +37,34 @@ SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM arrownet_delta_scan
 amount	DOUBLE
 id	BIGINT
 name	VARCHAR
+
+# Filter pushdown into engineered-wood file/row-group skipping (DeltaFilterBuilder maps the FilterNode to an
+# engineered-wood Predicate). It is superset-safe — DuckDB re-applies every predicate — so these assert that no
+# matching row is ever dropped by the pruning. String equality ('=') pushes (byte-exact).
+query IRT
+SELECT id, amount, name FROM arrownet_delta_scan('${ARROWNET_DELTA_DIR}') WHERE name = 'row_3';
+----
+3	4.5	row_3
+
+# IN list pushes (any type).
+query I
+SELECT id FROM arrownet_delta_scan('${ARROWNET_DELTA_DIR}') WHERE id IN (1, 2, 10) ORDER BY id;
+----
+1
+2
+10
+
+# AND of numeric range comparisons (both children push; AND keeps pushable children).
+query II
+SELECT id, amount FROM arrownet_delta_scan('${ARROWNET_DELTA_DIR}') WHERE id >= 5 AND amount < 12.0 ORDER BY id;
+----
+5	7.5
+6	9.0
+7	10.5
+
+# String '<>' is NOT pushed (collation-sensitive — could differ from byte order), but DuckDB re-applies it, so
+# the result is still exactly correct (9 rows).
+query I
+SELECT count(*) FROM arrownet_delta_scan('${ARROWNET_DELTA_DIR}') WHERE name <> 'row_1';
+----
+9
