@@ -5,7 +5,11 @@
 > the "provider declares; core stays name-agnostic" family (after settings v33 / ATTACH options v37 / secret
 > fields v38). Today provider functions are all **attach-time catalog-bound** (`db.schema.fn`, dispatched via a
 > catalog handle — 4e/4f/4g/4h). Global functions are the **orthogonal scope that coexists** with that.
-> Motivating case: a **template engine scalar**. See the existing summary in [CLAUDE.md] and the related
+> Motivating case: a **template engine scalar**. This plan covers **all four kinds** — scalar, table, in-out,
+> collector — through **one mechanism** (`list_global_functions` + a handle-0 `*_bind` marker reusing the
+> existing scalar / v29 table-session / v28 exchange-collector ABIs). Only **one sub-case is deferred**: a global
+> *table* fn that needs the **host-FS opener** (secret-backed lakehouse readers like delta) — it wants an opener
+> arg on `table_bind`; delta stays bespoke until a 2nd such reader lands. See the summary in CLAUDE.md +
 > [docs/provider-extensibility.md](provider-extensibility.md), [docs/delta-catalog.md](delta-catalog.md).
 
 ## Why / the defining property
@@ -23,15 +27,23 @@ spike already boot the bridge **best-effort at extension load**. So load-time re
 
 ## Scope split — scalar NOW, table LATER
 
-| | Global SCALAR (build now) | Global TABLE (deferred) |
-|---|---|---|
-| Return shape | **fixed** return type (from the decl) | **arg-dependent** output schema (delta's columns come from `path`) |
-| IO / opener | none (pure compute) | may need the **host-FS opener (ClientContext)** for IO |
-| ABI reuse | reuses `get_function_*_schema` + `execute_scalar` (handle-less) | needs `table_bind`(args→schema) + an **opener arg** the SQL path lacks |
-| Verdict | clean — the template engine motivates it | keep delta **bespoke**; build the generic table-global path when a 2nd lakehouse format/provider lands |
+All four kinds are *registrable* at load by the **same mechanism** (`list_global_functions` enumerates them; the
+per-call `*_bind` ABIs resolve schema/binding with a **handle-0 marker**). What differs is only whether a kind
+needs the **host-FS opener** for IO — which is the single axis that splits "build now" from "needs an opener arg":
 
-So this plan builds **global scalar functions**; global table functions stay the documented deferral (see
-[docs/delta-catalog.md](delta-catalog.md) + the CLAUDE Phase-3-A note — the two wrinkles live there).
+| Kind | Output schema | Host IO / opener | ABI reuse (all handle-0) | When |
+|---|---|---|---|---|
+| **scalar** | fixed (decl) | none | `get_function_*_schema` + `execute_scalar` | **slice 1** — template engine |
+| **in-out / collector** (pure-C#) | from cost args + input schema, via `inout_bind` | none (transforms its input) | `inout_bind` + `inout_exchange_open` + `inout_bind_close` (v28) | **slice 2** — clean, no opener |
+| **table** (compute / connstr) | arg-dependent, via `table_bind` | none | `table_bind` + `table_execute` + `table_close` (v29) | **slice 3** — clean |
+| **table** (host-FS reader, e.g. delta) | arg-dependent, via `table_bind` | **needs the host-FS opener (ClientContext + secrets)** | as above **+ an opener arg on `table_bind`** | **deferred** — delta stays bespoke until then |
+
+**Key point: global table + in-out add ZERO new ABI entries beyond the scalar plan.** The arg-dependent output
+schema (wrinkle 1) is *already solved* by the v27/v29 `table_bind`(args→schema) and v28 `inout_bind`(args+input
+schema→schema) sessions — we just call them with the handle-0 marker. Only the *host-FS-opener* split (wrinkle
+2) remains, and it bites **one** sub-case (secret-backed FS readers like delta), not the others.
+
+Sections below cover scalar in full, then the table + in-out specifics.
 
 ## ABI — one new entry + a handle-less branch (minimal)
 
@@ -107,6 +119,90 @@ If the bridge can't boot (no managed dir), global functions simply aren't regist
 settings. **Zero per-function C++** — adding a global scalar is a pure-C# change (declare it; rebuild only the
 managed bridge unless the ABI bumped).
 
+## Global table + in-out functions (the other kinds)
+
+Same registration spine, same base/derived interface split, same handle-0 reuse — only the per-kind ABI and the
+opener question differ.
+
+### Interface hierarchy (mirror the scalar split)
+
+Extract a schema-free base per kind; the existing `IArrow*` interface becomes the catalog-bound derived type:
+
+```csharp
+public interface ITableFunction {                               // global table fn
+    string Name { get; } Schema Parameters { get; }
+    IArrowTableFunctionBinding Bind(RecordBatch args);          // arg-dependent OutputSchema + Execute
+}
+public interface ICatalogTableFunction : ITableFunction { string SchemaName { get; } }   // was IArrowTableFunction
+
+public interface IInOutFunction {                               // global in-out (streaming exchange)
+    string Name { get; } Schema InputSchema { get; }
+    IArrowInOutBinding Bind(RecordBatch? args, Schema inputSchema);
+}
+public interface ICatalogInOutFunction : IInOutFunction { string SchemaName { get; } }   // was IArrowInOutFunction
+
+public interface ICollectorTableFunction {                      // global collector (pipeline breaker)
+    string Name { get; } Schema InputSchema { get; }
+    IArrowCollectorBinding Bind(RecordBatch? args, Schema inputSchema);
+}
+public interface ICatalogCollectorTableFunction : ICollectorTableFunction { string SchemaName { get; } }  // was IArrowCollectorTableFunction
+```
+
+Globals declare `IBackend.GlobalTableFunctions` / `GlobalInOutFunctions` / `GlobalCollectorFunctions`
+(`IReadOnlyList<ITableFunction>` etc., default empty), unioned by `BackendRegistry` into per-kind global
+registries keyed by name. The `Binding` types (`IArrowTableFunctionBinding`, `IArrowInOutBinding`,
+`IArrowCollectorBinding`) are **unchanged** — they already carry no schema-name. Behavior-preserving renames,
+same gate (the function `verify_*` suites green).
+
+### Registration at load + handle-0 reuse (no new ABI)
+
+`list_global_functions` already emits a `kind` per row; C++ at load branches on it (exactly as the catalog
+discovery does), all dispatching with the **handle-0 marker** at *bind* time:
+
+- **table** → build a `TableFunction(name, arg_types, ArrowStreamScan, GlobalTableBind, …)` where `arg_types` =
+  `get_function_param_schema(0,"",name)` (positional) and `GlobalTableBind` marshals `input.inputs` →
+  `table_bind(0,"",name,args,&binding)` → output schema + a **concrete binding handle**; the scan factory calls
+  `table_execute(binding,spec,filter,out)`; teardown `table_close(binding)`. Reuses the v29 session + the
+  existing `arrow_ingest` scan verbatim.
+- **in-out** → register the `{LogicalType::TABLE}` **exchange** operator (the same `ArrowNetExchange*` used by
+  `_each`/custom in-out) under the bare name; its bind marshals the input schema + cost named-params →
+  `inout_bind(0,"",name,args,input_schema,&out_schema,&binding)`; `inout_exchange_open(binding,…)` runs it.
+- **collector** → register the `{TABLE}` **collector** (Sink+Source) operator under the bare name; bind →
+  `inout_bind(0,…)` (collectors reuse the inout_bind/exchange ABI); the operator streams the output as built.
+
+In every case only the **bind** entry takes the handle-0 marker (→ C# routes to the global registry by name);
+the binding handle it returns is a real, resolvable handle, so `table_execute`/`table_close` /
+`inout_exchange_open`/`inout_bind_close` are unchanged. **So global table + in-out cost zero new vtable entries**
+— just extend the handle-0 branch (added for scalar) to `table_bind` and `inout_bind`, and have C++
+`RegisterArrowNetGlobalFunctions` branch on `kind` to register the right operator.
+
+### The opener wrinkle — where it bites, where it doesn't
+
+`table_bind`/`table_execute` (and `inout_bind`) pass a **handle** to C#; a catalog fn uses that handle's
+`SqlConnection`. A global fn has handle 0 — fine for:
+- **pure-compute** table fns (generators, transforms) and **all pure-C# in-out/collector** globals (they
+  transform their *input table*, no external IO) — **no opener needed**;
+- **connstr-style** table fns that take the connection target as an *argument* (handle-0 + args is enough).
+
+It bites exactly one sub-case: a **host-FS reader** (delta/iceberg/parquet over `az://`/`s3://` with **DuckDB
+secrets**), which needs the host `FileSystem` opened against a `ClientContext` for secret resolution — and the
+v29 `table_bind`/`table_execute` path doesn't thread a `ClientContext`/opener to C#. The filesystem bridge
+(`ArrowNetHostServices` fs callbacks, v40/v41) gives C# host IO, but secret-backed opens need the right context.
+Two outs (already the documented decision): **(a)** keep such readers **bespoke** — `arrownet_delta_scan` stays
+the hand-written global fn it is today (its host-FS-opener need is special); **(b)** when a *second* secret-backed
+FS reader wants the generic path, add an **optional opener handle to `table_bind`/`table_execute`** (a host-FS/
+ClientContext handle that FS fns use and SQL fns ignore) and migrate delta onto it. Build (b) only when the 2nd
+format lands; until then the generic global table path serves compute/connstr fns and delta stays bespoke.
+
+### Effectful global table/in-out (the apply half)
+
+Side effects belong in **table / in-out / collector / aggregate-finalize**, never scalars (optimizer purity).
+So the effectful "apply" steps can be **global** too — e.g. a global `arrownet_apply_tmdl(<fragments>)`
+**collector** (collect fragments → one atomic apply at Finalize, run once single-threaded) whose target is
+addressed by its args (a connstr/endpoint), composing with the global `arrownet_render` scalar: render (pure
+global scalar) → apply (effectful global collector), **both connection-free / no ATTACH**. A target that's
+inherently a live model/connection is more naturally catalog-bound; a target addressable by an arg works global.
+
 ## The template-engine demo (the motivator)
 
 A provider-agnostic core global, e.g. `arrownet_render(template VARCHAR, params <any>) → VARCHAR`:
@@ -134,22 +230,36 @@ effectful halves, exactly as deliberated.
 
 ## Verification
 
-- `test/verify_global_functions.test`: **no ATTACH** — `SELECT arrownet_render('Hi {{name}}', {'name':'x'})` →
-  `Hi x`; vectorized over a `range()`; NULL handling; the JSON-string param form; and that it resolves on a bare
-  loaded extension (no catalog). Plus a collision test if two providers declare the same global name.
+- `test/verify_global_functions.test`: **no ATTACH** throughout. Scalar: `SELECT arrownet_render('Hi {{name}}',
+  {'name':'x'})` → `Hi x`; vectorized over `range()`; NULL handling; the JSON-string param form; resolves on a
+  bare loaded extension (no catalog); a collision test if two providers declare the same global name. Later
+  slices add: a global **table** fn (`SELECT * FROM arrownet_gen(3)`) proving arg-dependent output schema via
+  `table_bind` with no catalog; a global **in-out** (`SELECT * FROM arrownet_xform((SELECT …))`) and **collector**
+  proving the exchange/Sink+Source operators run handle-0 with no ATTACH.
 - Build: VS18 vcvars `--target unittest shell`; `publish-managed.ps1`. ABI bumped → rebuild **both** from one
   commit (exact-match ABI).
 
 ## Recommendation (sequenced)
 
-1. **Global scalar functions** (this plan) — the `IScalarFunction`/`ICatalogScalarFunction` rename, then
-   `list_global_functions` ABI + handle-0 reuse + `IBackend.GlobalScalarFunctions` +
-   `RegisterArrowNetGlobalFunctions` at load + the `arrownet_render` demo.
-   Small, motivated, and unblocks the TMDL render step.
-2. **Global table functions** — deferred; the arg-dependent-schema + host-FS-opener wrinkles (keep delta bespoke
-   until a 2nd lakehouse format lands; then give the global table-fn bind/execute path an opener arg). See
+The **single new ABI entry (`list_global_functions`) + the `RegisterArrowNetGlobalFunctions` load hook** are
+built once in slice 1; each later slice just extends the handle-0 branch to one more `*_bind` and adds the
+`kind` case in the load registrar — no further ABI.
+
+1. **Global scalar** — the `IScalarFunction`/`ICatalogScalarFunction` rename, `list_global_functions` ABI +
+   handle-0 reuse of `get_function_*_schema`/`execute_scalar`, `IBackend.GlobalScalarFunctions`,
+   `RegisterArrowNetGlobalFunctions` at load, the `arrownet_render` (Fluid) demo. Motivated, unblocks the TMDL
+   render step.
+2. **Global in-out + collector (pure-C#)** — the `IInOutFunction`/`ICollectorTableFunction` base renames; extend
+   the handle-0 branch to `inout_bind`; register the exchange/collector operators by `kind` in the load
+   registrar. **No opener needed** (they transform their input) → the clean next step; enables the effectful
+   global *apply* half (e.g. `arrownet_apply_tmdl` collector).
+3. **Global table (compute / connstr)** — the `ITableFunction` base rename; extend the handle-0 branch to
+   `table_bind`; register `kind='table'` with the v29 session. No opener (args carry any target).
+4. **Global table (host-FS reader)** — deferred; needs the **opener arg** on `table_bind`/`table_execute`. Keep
+   `arrownet_delta_scan` bespoke until a 2nd secret-backed FS reader justifies the generic opener path. See
    [docs/delta-catalog.md](delta-catalog.md) + the CLAUDE Phase-3-A note.
 
-**Net:** global scalar functions are a contained, ~1-ABI-entry addition that reuses the existing scalar
-authoring/execution wholesale, gives connection-free functions (template engine first), and composes cleanly
-with the deferred TMDL apply path — while leaving the genuinely harder global *table* case documented for later.
+**Net:** all four global kinds register through one mechanism (`list_global_functions` + the handle-0 `*_bind`
+marker), reusing the scalar/table-session/exchange-collector machinery wholesale — **global table + in-out cost
+zero ABI beyond the scalar slice**. The only genuinely deferred piece is the *host-FS-opener* sub-case of global
+table (secret-backed lakehouse readers like delta), which gets an opener arg when a 2nd such reader lands.
