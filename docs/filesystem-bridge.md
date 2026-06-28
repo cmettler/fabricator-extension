@@ -93,8 +93,8 @@ secrets all work, one auth config shared with native reads.
 
 **Validated** (`test/verify_delta.test`, 52 assertions; fixture `test/fixtures/delta_simple`, a delta-rs table
 of 10 rows id/name/amount): full scan with correct bind-time types, filter+aggregate, `DESCRIBE` schema, and
-the pushed-filter cases (`=`/`IN`/`AND`-range into engineered-wood skipping; string `<>` not pushed but still
-filtered by DuckDB) — all green. The Apache.Arrow version is aligned (engineered-wood + the bridge both
+the pushed-filter cases (`=`/`IN`/`AND`-range, and string `=`/`>`/`<>` — all pushed into engineered-wood
+skipping, byte-order-sound) — all green. The Apache.Arrow version is aligned (engineered-wood + the bridge both
 **23.0.0**, both net10.0). Now streams lazily (no materialization) with filter pushdown — see the section below.
 
 ## Streaming + filter pushdown (DONE, ABI v47)
@@ -105,7 +105,8 @@ filtered by DuckDB) — all green. The Apache.Arrow version is aligned (engineer
   old materialize-into-`InMemoryArrayStream`.
 - **Filter pushdown into file + row-group skipping — DONE**: `DeltaFilterBuilder` maps the scan's `FilterNode`
   tree (constants read from `filter_values` via `ArrowValueReader`) into an engineered-wood
-  `EngineeredWood.Expressions.Predicate`, superset-safe (`=`/`IN` any type; ordering for non-string; `and`
+  `EngineeredWood.Expressions.Predicate`, superset-safe (all comparisons `=`/`<>`/`<`/`<=`/`>`/`>=` + `IN` push
+  for any type incl. strings — Parquet byte-order stats match DuckDB's default binary string comparison; `and`
   keeps pushable children, `or` is all-or-nothing; temporal/GUID/binary literals not pushed yet). The predicate
   drives BOTH the Delta file pruner (`ReadAllAsync(columns, filter)`) AND per-file Parquet row-group/stats
   pruning (set via `ParquetReadOptions.Filter` on the per-scan `DeltaTableOptions` — no engineered-wood change

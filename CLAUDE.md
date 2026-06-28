@@ -171,11 +171,13 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   `DuckDbTableFileSystem`, declared in `CustomFunctions.GlobalTable`); the bespoke `arrownet_delta.cpp` + the
   `delta_schema`/`delta_scan` ABI entries were **removed** — so a NEW lakehouse format (Iceberg/Lance/…) is added
   with **zero C++** (a pure-C# `ITableFunction` reading `AmbientOpener.Current` + files via the host `fs_*`
-  callbacks, declared as a global). `test/verify_delta.test` (52), `test/verify_global_functions.test` (63), full
+  callbacks, declared as a global). `test/verify_delta.test` (60), `test/verify_global_functions.test` (63), full
   SQL function suite unregressed. See [docs/global-functions.md](docs/global-functions.md) §"Host-FS global
   table functions". **The reader STREAMS lazily** (captures the opener — valid for the whole execution — and
   pulls one batch at a time, no materialization) **and pushes the FILTER into engineered-wood file + row-group
-  skipping** (`DeltaFilterBuilder` maps the `FilterNode` → `EngineeredWood.Expressions.Predicate`, superset-safe;
+  skipping** (`DeltaFilterBuilder` maps the `FilterNode` → `EngineeredWood.Expressions.Predicate` — all
+  comparisons `=`/`<>`/`<`/`<=`/`>`/`>=` + `IN` for any type incl. strings, since Parquet min/max stats are
+  byte-ordered like DuckDB's default binary string comparison; superset-safe;
   the predicate drives the Delta file pruner `ReadAllAsync(columns, filter)` AND per-file Parquet row-group
   pruning via `ParquetReadOptions.Filter` on a per-scan `DeltaTableOptions` — no engineered-wood change). Column
   PROJECTION into the Parquet read stays deferred: the shared `BindingBoundTable` wraps the result stream with

@@ -212,7 +212,8 @@ Iceberg/Lance next). The mechanism, built on the existing `kind='table'` global 
   `list_global_functions` (`kind='table'`) and dispatched through the v29 table session. `test/verify_delta.test`.
 - **Streaming + filter pushdown** (DONE): the reader streams lazily (captures the opener, pulls one batch at a
   time — no materialization) and pushes the scan's `FilterNode` into engineered-wood's **file + row-group
-  skipping** (`DeltaFilterBuilder` → `EngineeredWood.Expressions.Predicate`, superset-safe; DuckDB re-applies).
+  skipping** (`DeltaFilterBuilder` → `EngineeredWood.Expressions.Predicate`, all comparisons + `IN` for any
+  type incl. strings since Parquet stats are byte-ordered like DuckDB's default; superset-safe; DuckDB re-applies).
   Column projection into the Parquet read stays deferred (the shared `BindingBoundTable` wraps the stream with
   the full output schema, so a projected subset would mismatch it — DuckDB projects above the scan instead).
   See docs/filesystem-bridge.md §"Streaming + filter pushdown".

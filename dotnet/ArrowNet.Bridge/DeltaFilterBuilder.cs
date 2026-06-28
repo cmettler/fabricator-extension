@@ -15,10 +15,10 @@ namespace ArrowNet.Bridge;
 /// <para>Soundness rules (Parquet min/max stats are byte-ordered / binary, matching DuckDB's default binary
 /// string comparison):</para>
 /// <list type="bullet">
-/// <item><c>=</c> and <c>IN</c> push for any type (byte-exact equality).</item>
-/// <item><c>&lt;&gt;</c> / <c>&lt;</c> / <c>&lt;=</c> / <c>&gt;</c> / <c>&gt;=</c> push for NON-string values
-/// only (a non-binary string collation could differ from byte order → could prune a matching file; DuckDB
-/// keeps the predicate regardless, so skipping the push only forfeits pruning, never correctness).</item>
+/// <item>All comparisons (<c>=</c> <c>&lt;&gt;</c> <c>&lt;</c> <c>&lt;=</c> <c>&gt;</c> <c>&gt;=</c>) and
+/// <c>IN</c> push for any type, including strings — byte-order stats match DuckDB's default binary string
+/// comparison. (A non-binary string collation could differ, but that risk applies equally to every operator
+/// and DuckDB re-applies regardless, so a mismatch only forfeits pruning, never correctness.)</item>
 /// <item><c>is_null</c> / <c>is_not_null</c> push.</item>
 /// <item><c>and</c> keeps its pushable children (dropping one still yields a superset); <c>or</c> is
 /// all-or-nothing (dropping a branch would narrow the result).</item>
@@ -85,15 +85,19 @@ internal sealed class DeltaFilterBuilder
         {
             return null; // null constant (host emits is_null separately) or unmappable type
         }
-        bool isString = value is string;
+        // All comparisons push for any type, INCLUDING strings: Parquet min/max statistics are byte-ordered
+        // (UTF-8 binary), which matches DuckDB's default binary string comparison — so byte-order pruning is a
+        // correct superset. (Only a non-binary string collation could differ, and that risk applies equally to
+        // '=' / IN; DuckDB re-applies every predicate above the scan, so any mismatch only forfeits pruning,
+        // never correctness.)
         return node.Cmp switch
         {
-            "=" => Expressions.Equal(col, lit),                                      // byte-exact, any type
-            "<>" => isString ? null : Expressions.NotEqual(col, lit),
-            "<" => isString ? null : Expressions.LessThan(col, lit),
-            "<=" => isString ? null : Expressions.LessThanOrEqual(col, lit),
-            ">" => isString ? null : Expressions.GreaterThan(col, lit),
-            ">=" => isString ? null : Expressions.GreaterThanOrEqual(col, lit),
+            "=" => Expressions.Equal(col, lit),
+            "<>" => Expressions.NotEqual(col, lit),
+            "<" => Expressions.LessThan(col, lit),
+            "<=" => Expressions.LessThanOrEqual(col, lit),
+            ">" => Expressions.GreaterThan(col, lit),
+            ">=" => Expressions.GreaterThanOrEqual(col, lit),
             _ => null,                                                               // is_distinct / is_not_distinct
         };
     }

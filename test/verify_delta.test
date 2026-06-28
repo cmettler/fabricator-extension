@@ -62,8 +62,18 @@ SELECT id, amount FROM arrownet_delta_scan('${ARROWNET_DELTA_DIR}') WHERE id >= 
 6	9.0
 7	10.5
 
-# String '<>' is NOT pushed (collation-sensitive — could differ from byte order), but DuckDB re-applies it, so
-# the result is still exactly correct (9 rows).
+# String ordering pushes too (Parquet byte-order stats match DuckDB's default binary string comparison): the
+# result must be exactly correct regardless. 'row_7','row_8','row_9' sort after 'row_5' bytewise.
+query IT
+SELECT id, name FROM arrownet_delta_scan('${ARROWNET_DELTA_DIR}') WHERE name > 'row_5' ORDER BY id;
+----
+6	row_6
+7	row_7
+8	row_8
+9	row_9
+
+# String '<>' (also pushed): a file/row-group is pruned only when all its values equal the literal; DuckDB
+# re-applies, so the result is exactly correct (9 rows).
 query I
 SELECT count(*) FROM arrownet_delta_scan('${ARROWNET_DELTA_DIR}') WHERE name <> 'row_1';
 ----
