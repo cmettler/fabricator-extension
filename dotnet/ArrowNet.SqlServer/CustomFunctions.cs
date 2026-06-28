@@ -53,6 +53,9 @@ internal static class CustomFunctions
         // IO through DuckDB's FileSystem + secrets. A provider-agnostic core reader (lives in the Bridge);
         // declared here because SqlServer is the always-present default backend (same as arrownet_render).
         new ArrowNet.Bridge.DeltaGlobalTableFunction(),
+        // HOST-FS WRITE spike: arrownet_delta_write_demo(path) writes a fixed 5-row Delta table via the host-FS
+        // write callbacks (put-if-absent commit), returning (version, rows_written). Proves the write bridge.
+        new ArrowNet.Bridge.DeltaWriteDemoFunction(),
     };
 
     // Connection-free GLOBAL aggregate functions (UDAF) — bare fn(args), no ATTACH, usable in GROUP BY / OVER /

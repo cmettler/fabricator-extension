@@ -1079,8 +1079,23 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v47** (v47 = **host-FS global table functions**: appended one vtable entry
-  `set_active_opener(opener)` — a per-thread ambient (`AmbientOpener`, mirroring `set_active_txn`) recording the
+- **Current version: ABI v48** (v48 = **host-FS WRITE surface** — the Delta write-back foundation: appended five
+  WRITE callbacks to `ArrowNetHostServices` (the reverse host→managed struct, not the vtable) —
+  `fs_open_write(opener,path,exclusive,…)` / `fs_write` / `fs_close_write` / `fs_remove` / `fs_create_dir` — plus
+  the `ARROWNET_ALREADY_EXISTS=4` status. `exclusive=1` opens with `EXCLUSIVE_CREATE` (the put-if-absent commit
+  primitive — honored on OneLake/ADLS + POSIX; returns `ALREADY_EXISTS` if the target exists). `fs_create_dir`
+  is recursive (mkdir -p; DuckDB's is single-level). The C# `DuckDbTableFileSystem` write methods
+  (`CreateAsync`/`WriteAllBytesAsync`/`RenameAsync`/`DeleteAsync` + `DuckDbSequentialFile`) sit on these;
+  **`RenameAsync` is emulated as exclusive-create-copy + delete-source** because DuckDB's `MoveFile` overwrites
+  on local and is *unimplemented* on Azure DFS — so the commit's put-if-absent guard rides `EXCLUSIVE_CREATE`,
+  and engineered-wood's temp+rename commit works unchanged (a conflicting target → `RenameAsync` returns false
+  → `DeltaConflictException`). `HostFsGlob` now normalizes a not-found glob (object-store 404) to empty so a
+  brand-new table's missing `_delta_log/` reads as "create". Demo `arrownet_delta_write_demo(path)` — a global
+  host-FS table fn writing a fixed 5-row Delta table via engineered-wood (`DeltaWriteMode.Overwrite`,
+  idempotent), validated end-to-end (write+read round-trip) on **local AND a live OneLake lakehouse** (SP
+  azure secret). `test/verify_delta_write.test`. Single-writer; concurrent commits work where `EXCLUSIVE_CREATE`
+  is honored (OneLake/POSIX — not Windows local). See docs/delta-catalog.md + docs/filesystem-bridge.md. v47 =
+  **host-FS global table functions**: appended one vtable entry `set_active_opener(opener)` — a per-thread ambient (`AmbientOpener`, mirroring `set_active_txn`) recording the
   calling operator's `ClientContext` so a connection-free GLOBAL host-FS table reader (a lakehouse format)
   resolves DuckDB secrets while reading through the host `fs_*` callbacks; set in the shared `PopulateReturnSchema`
   + `ArrowStreamInitGlobal` arrow-scan hooks, read by the host-FS binding in `Bind`/`Execute`. **REMOVED**

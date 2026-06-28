@@ -143,3 +143,12 @@ opener (mirroring `set_active_txn`) so a global host-FS reader resolves DuckDB s
 callbacks. So `ArrowNetHostServices` (fs_open_read/size/read/close/glob + host_query) is the reusable C#
 host-IO foundation, and a new lakehouse format is now pure-C# (declare a global `ITableFunction`). See
 docs/global-functions.md §"Host-FS global table functions".
+
+**v48** added the **WRITE** surface to `ArrowNetHostServices` — `fs_open_write`(exclusive)/`fs_write`/
+`fs_close_write`/`fs_remove`/`fs_create_dir`(recursive) + the `ARROWNET_ALREADY_EXISTS` status. The C#
+`DuckDbTableFileSystem` write methods sit on these; the Delta commit's put-if-absent rides `EXCLUSIVE_CREATE`
+(DuckDB `MoveFile` overwrites on local + is unimplemented on Azure DFS, so `RenameAsync` is emulated as
+exclusive-create-copy → false on an existing target → `DeltaConflictException`). `HostFsGlob` normalizes an
+object-store 404 (glob of a missing prefix) to empty. Validated end-to-end (write+read round-trip) on local +
+a live OneLake lakehouse via `arrownet_delta_write_demo(path)` (`test/verify_delta_write.test`). The Delta
+write-back foundation — see docs/delta-catalog.md (recommendation step 0).

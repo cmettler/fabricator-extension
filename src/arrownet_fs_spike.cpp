@@ -121,6 +121,133 @@ int32_t HostFsGlob(ArrowNetHandle opener, const char *pattern, char **out_json, 
 		*out_json = DupErr(json);
 		return ARROWNET_OK;
 	} catch (std::exception &e) {
+		// A glob over a non-existent prefix returns empty on a local FS but THROWS 404 on object stores
+		// (Azure/S3). Normalize "path does not exist" to an empty result — a glob of a missing dir = no files
+		// (so a brand-new Delta table, whose `_delta_log/` doesn't exist yet, is treated as version -1 = create,
+		// not an error). Genuine failures (auth 401/403, etc.) still propagate.
+		std::string msg = e.what();
+		auto contains = [&](const char *needle) { return msg.find(needle) != std::string::npos; };
+		if (contains("does not exist") || contains("404") || contains("NoSuchKey") || contains("BlobNotFound") ||
+		    contains("PathNotFound")) {
+			*out_json = DupErr("[]");
+			return ARROWNET_OK;
+		}
+		if (err) {
+			*err = DupErr(msg);
+		}
+		return 1;
+	}
+}
+
+// ---- WRITE surface (Delta write-back foundation) ----
+
+int32_t HostFsOpenWrite(ArrowNetHandle opener, const char *path, int32_t exclusive, ArrowNetHandle *out_file,
+                        char **err) {
+	try {
+		auto *ctx = reinterpret_cast<ClientContext *>(opener);
+		auto &fs = FileSystem::GetFileSystem(*ctx);
+		// exclusive => put-if-absent (O_CREAT|O_EXCL on POSIX / honored on ADLS); else create-or-truncate.
+		idx_t flags = exclusive ? (FileOpenFlags::FILE_FLAGS_WRITE | FileOpenFlags::FILE_FLAGS_FILE_CREATE |
+		                           FileOpenFlags::FILE_FLAGS_EXCLUSIVE_CREATE)
+		                        : (FileOpenFlags::FILE_FLAGS_WRITE | FileOpenFlags::FILE_FLAGS_FILE_CREATE_NEW);
+		auto handle = fs.OpenFile(path, FileOpenFlags(flags));
+		*out_file = reinterpret_cast<ArrowNetHandle>(handle.release()); // closed via HostFsCloseWrite
+		return ARROWNET_OK;
+	} catch (std::exception &e) {
+		// For an exclusive (put-if-absent) open, distinguish "already exists" (a commit conflict) from a real
+		// error by probing existence — robust across backends (no fragile message matching).
+		if (exclusive) {
+			try {
+				auto *ctx = reinterpret_cast<ClientContext *>(opener);
+				auto &fs = FileSystem::GetFileSystem(*ctx);
+				if (fs.FileExists(path)) {
+					return ARROWNET_ALREADY_EXISTS; // no *err — the caller treats this as a conflict, not a failure
+				}
+			} catch (...) {
+				// fall through to the generic error below
+			}
+		}
+		if (err) {
+			*err = DupErr(e.what());
+		}
+		return 1;
+	}
+}
+
+int32_t HostFsWrite(ArrowNetHandle file, const void *buffer, int64_t nr_bytes, char **err) {
+	try {
+		auto *h = reinterpret_cast<FileHandle *>(file);
+		// Sequential append (no location) — the only mode Azure DFS supports beyond location 0.
+		h->Write(const_cast<void *>(buffer), nr_bytes);
+		return ARROWNET_OK;
+	} catch (std::exception &e) {
+		if (err) {
+			*err = DupErr(e.what());
+		}
+		return 1;
+	}
+}
+
+int32_t HostFsCloseWrite(ArrowNetHandle file, char **err) {
+	auto *h = reinterpret_cast<FileHandle *>(file);
+	try {
+		h->Close(); // flush — surfaces write/commit errors that the dtor would swallow
+		delete h;
+		return ARROWNET_OK;
+	} catch (std::exception &e) {
+		delete h; // still free the handle on a flush error
+		if (err) {
+			*err = DupErr(e.what());
+		}
+		return 1;
+	}
+}
+
+int32_t HostFsRemove(ArrowNetHandle opener, const char *path, char **err) {
+	try {
+		auto *ctx = reinterpret_cast<ClientContext *>(opener);
+		auto &fs = FileSystem::GetFileSystem(*ctx);
+		fs.TryRemoveFile(path); // no error if missing
+		return ARROWNET_OK;
+	} catch (std::exception &e) {
+		if (err) {
+			*err = DupErr(e.what());
+		}
+		return 1;
+	}
+}
+
+// Recursive mkdir -p: DuckDB's CreateDirectory is single-level, so create the parent chain. Recurses up until
+// an existing ancestor (drive root / scheme authority), then creates downward. Idempotent; object stores treat
+// directories as implicit (CreateDirectory is a no-op/marker), so the recursion is harmless there.
+void CreateDirRecursive(FileSystem &fs, const std::string &path) {
+	if (path.empty() || fs.DirectoryExists(path)) {
+		return;
+	}
+	auto slash = path.find_last_of('/');
+	if (slash != std::string::npos && slash > 0) {
+		std::string parent = path.substr(0, slash);
+		// Stop at a scheme authority ("abfss://c@host") — has no '/' after "://".
+		if (!parent.empty() && parent.find("://") != parent.size() - 3 && !fs.DirectoryExists(parent)) {
+			CreateDirRecursive(fs, parent);
+		}
+	}
+	try {
+		fs.CreateDirectory(path);
+	} catch (...) {
+		if (!fs.DirectoryExists(path)) {
+			throw; // a real failure (not a lost create/exists race)
+		}
+	}
+}
+
+int32_t HostFsCreateDir(ArrowNetHandle opener, const char *path, char **err) {
+	try {
+		auto *ctx = reinterpret_cast<ClientContext *>(opener);
+		auto &fs = FileSystem::GetFileSystem(*ctx);
+		CreateDirRecursive(fs, path);
+		return ARROWNET_OK;
+	} catch (std::exception &e) {
 		if (err) {
 			*err = DupErr(e.what());
 		}
@@ -137,6 +264,11 @@ void InstallHostFsServices() {
 	services.fs_close = HostFsClose;
 	services.free_str = HostFreeStr;
 	services.fs_glob = HostFsGlob;
+	services.fs_open_write = HostFsOpenWrite;
+	services.fs_write = HostFsWrite;
+	services.fs_close_write = HostFsCloseWrite;
+	services.fs_remove = HostFsRemove;
+	services.fs_create_dir = HostFsCreateDir;
 	arrownet::SetHostServices(services);
 }
 

@@ -108,6 +108,121 @@ internal static unsafe class HostFs
         }
     }
 
+    /// <summary>True once the host registered the write callbacks (the Delta write-back foundation).</summary>
+    public static bool CanWrite => _set && _h.FsOpenWrite != null;
+
+    /// <summary>Opens <paramref name="path"/> for sequential writing (create-or-truncate). Throws on error.</summary>
+    public static nint OpenWrite(nint opener, string path)
+    {
+        var pathPtr = Marshal.StringToCoTaskMemUTF8(path);
+        try
+        {
+            byte* err = null;
+            nint file;
+            int rc = _h.FsOpenWrite(opener, (byte*)pathPtr, 0, &file, &err);
+            if (rc != ArrowNetStatus.Ok)
+            {
+                throw HostError("fs_open_write", err);
+            }
+            return file;
+        }
+        finally
+        {
+            Marshal.FreeCoTaskMem(pathPtr);
+        }
+    }
+
+    /// <summary>
+    /// Opens <paramref name="path"/> for writing with EXCLUSIVE_CREATE (put-if-absent). Returns true + a write
+    /// handle if it created the file; false (no handle) if the file already existed — the commit-conflict signal;
+    /// throws on any other error.
+    /// </summary>
+    public static bool TryOpenWriteExclusive(nint opener, string path, out nint file)
+    {
+        file = 0;
+        var pathPtr = Marshal.StringToCoTaskMemUTF8(path);
+        try
+        {
+            byte* err = null;
+            nint f;
+            int rc = _h.FsOpenWrite(opener, (byte*)pathPtr, 1, &f, &err);
+            if (rc == ArrowNetStatus.AlreadyExists)
+            {
+                return false;
+            }
+            if (rc != ArrowNetStatus.Ok)
+            {
+                throw HostError("fs_open_write(exclusive)", err);
+            }
+            file = f;
+            return true;
+        }
+        finally
+        {
+            Marshal.FreeCoTaskMem(pathPtr);
+        }
+    }
+
+    /// <summary>Appends <paramref name="nrBytes"/> from <paramref name="buffer"/> to a write handle (sequential).</summary>
+    public static void WriteBytes(nint file, void* buffer, long nrBytes)
+    {
+        byte* err = null;
+        int rc = _h.FsWrite(file, buffer, nrBytes, &err);
+        if (rc != ArrowNetStatus.Ok)
+        {
+            throw HostError("fs_write", err);
+        }
+    }
+
+    /// <summary>Flushes + closes a write handle (surfaces flush errors). Frees the handle.</summary>
+    public static void CloseWrite(nint file)
+    {
+        byte* err = null;
+        int rc = _h.FsCloseWrite(file, &err);
+        if (rc != ArrowNetStatus.Ok)
+        {
+            throw HostError("fs_close_write", err);
+        }
+    }
+
+    /// <summary>Removes <paramref name="path"/> (no error if missing).</summary>
+    public static void Remove(nint opener, string path)
+    {
+        var pathPtr = Marshal.StringToCoTaskMemUTF8(path);
+        try
+        {
+            byte* err = null;
+            int rc = _h.FsRemove(opener, (byte*)pathPtr, &err);
+            if (rc != ArrowNetStatus.Ok)
+            {
+                throw HostError("fs_remove", err);
+            }
+        }
+        finally
+        {
+            Marshal.FreeCoTaskMem(pathPtr);
+        }
+    }
+
+    /// <summary>Creates directory <paramref name="path"/> (idempotent; implicit on object stores).</summary>
+    public static void CreateDir(nint opener, string path)
+    {
+        var pathPtr = Marshal.StringToCoTaskMemUTF8(path);
+        try
+        {
+            byte* err = null;
+            int rc = _h.FsCreateDir(opener, (byte*)pathPtr, &err);
+            if (rc != ArrowNetStatus.Ok)
+            {
+                throw HostError("fs_create_dir", err);
+            }
+        }
+        finally
+        {
+            Marshal.FreeCoTaskMem(pathPtr);
+        }
+    }
+
     /// <summary>True once the host registered the host_query callback.</summary>
     public static bool CanQuery => _set && _h.HostQuery != null;
 

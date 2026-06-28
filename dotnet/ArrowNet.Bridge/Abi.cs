@@ -210,6 +210,19 @@ public unsafe struct ArrowNetHostServices
     // params batch positionally + registering named Arrow inputs as views first); result as Arrow (the managed
     // caller imports + releases the stream). See docs/host-query.md.
     public delegate* unmanaged[Cdecl]<byte*, CArrowArrayStream*, ArrowNetHostInputs*, CArrowArrayStream*, byte**, int> HostQuery;
+
+    // ---- WRITE surface (Delta write-back foundation; see docs/delta-catalog.md) ----
+    // int32 fs_open_write(void* opener, const char* path, int32 exclusive, void** out_file, char** err)
+    // exclusive=1 => EXCLUSIVE_CREATE (put-if-absent: fails if the file exists); 0 => create-or-truncate.
+    public delegate* unmanaged[Cdecl]<nint, byte*, int, nint*, byte**, int> FsOpenWrite;
+    // int32 fs_write(void* file, const void* buffer, int64 nr_bytes, char** err) — sequential append.
+    public delegate* unmanaged[Cdecl]<nint, void*, long, byte**, int> FsWrite;
+    // int32 fs_close_write(void* file, char** err) — flush + close + free the write handle.
+    public delegate* unmanaged[Cdecl]<nint, byte**, int> FsCloseWrite;
+    // int32 fs_remove(void* opener, const char* path, char** err) — delete (no error if missing).
+    public delegate* unmanaged[Cdecl]<nint, byte*, byte**, int> FsRemove;
+    // int32 fs_create_dir(void* opener, const char* path, char** err) — idempotent mkdir.
+    public delegate* unmanaged[Cdecl]<nint, byte*, byte**, int> FsCreateDir;
 }
 
 /// <summary>Mirrors <c>ArrowNetHostInputs</c> in abi.h — named Arrow streams handed to host_query as data-in
@@ -260,4 +273,5 @@ internal static class ArrowNetStatus
     public const int Error = 1;
     public const int InvalidArgument = 2;
     public const int NotFound = 3;
+    public const int AlreadyExists = 4; // fs_open_write(exclusive): target already exists (commit conflict)
 }

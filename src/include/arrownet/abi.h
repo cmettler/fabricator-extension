@@ -84,6 +84,7 @@ typedef enum {
 	ARROWNET_ERROR = 1,           // generic failure; see *err
 	ARROWNET_INVALID_ARGUMENT = 2,
 	ARROWNET_NOT_FOUND = 3,
+	ARROWNET_ALREADY_EXISTS = 4,  // fs_open_write(exclusive): the target already exists (a commit conflict)
 } ArrowNetStatus;
 
 // Opaque handle to a managed catalog/connection (a GCHandle id on the C# side).
@@ -645,13 +646,34 @@ typedef struct ArrowNetHostServices {
 	// registers named Arrow sources as connection-scoped views before the query (data-in). See docs/host-query.md.
 	int32_t (*host_query)(const char *sql, struct ArrowArrayStream *params, struct ArrowNetHostInputs *inputs,
 	                      struct ArrowArrayStream *out, char **err);
+
+	// -------------------------------------------------------------------------
+	// WRITE surface (foundation for a Delta WRITE-back through the host FileSystem; see docs/delta-catalog.md).
+	// `opener` is the calling operator's ClientContext (secret resolution), valid for the duration of the call.
+	// -------------------------------------------------------------------------
+	// Open `path` for sequential writing. `exclusive` (1/0): when 1, opens with EXCLUSIVE_CREATE
+	// (WRITE|FILE_CREATE|EXCLUSIVE_CREATE) — the put-if-absent primitive: FAILS (non-zero + *err) if the file
+	// already exists, which is honored on OneLake/ADLS and POSIX (and is how a Delta commit detects a conflict).
+	// When 0, opens create-or-truncate (WRITE|FILE_CREATE_NEW). *out_file receives a write handle (close via
+	// fs_close_write). NOTE: Azure DFS allows only sequential writes (or location 0).
+	int32_t (*fs_open_write)(ArrowNetHandle opener, const char *path, int32_t exclusive, ArrowNetHandle *out_file,
+	                         char **err);
+	// Append `nr_bytes` from `buffer` to a write handle (sequential; the position advances).
+	int32_t (*fs_write)(ArrowNetHandle file, const void *buffer, int64_t nr_bytes, char **err);
+	// Flush + close a write handle from fs_open_write (surfaces flush errors, unlike fs_close). Frees the handle.
+	int32_t (*fs_close_write)(ArrowNetHandle file, char **err);
+	// Remove `path`. Does NOT error if it does not exist (TryRemoveFile semantics).
+	int32_t (*fs_remove)(ArrowNetHandle opener, const char *path, char **err);
+	// Create directory `path` (idempotent — ok if it already exists). On object stores directories are implicit;
+	// on a local filesystem this materializes the parent (e.g. `_delta_log/`) before a write.
+	int32_t (*fs_create_dir)(ArrowNetHandle opener, const char *path, char **err);
 } ArrowNetHostServices;
 
 // Max serialized size of a spillable aggregate's per-group state (the inline, pointer-free
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 47
+#define ARROWNET_ABI_VERSION 48
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

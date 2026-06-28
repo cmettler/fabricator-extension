@@ -102,15 +102,128 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
         }
     }
 
-    // ---- write surface: not supported (read-only bridge) ----
-    public ValueTask<ISequentialFile> CreateAsync(string path, bool overwrite = false, CancellationToken cancellationToken = default)
-        => throw new NotSupportedException("DuckDbTableFileSystem is read-only.");
-    public ValueTask<bool> RenameAsync(string sourcePath, string targetPath, CancellationToken cancellationToken = default)
-        => throw new NotSupportedException("DuckDbTableFileSystem is read-only.");
+    // ---- write surface: over the host fs_* write callbacks (Delta write-back) ----
+
+    /// <summary>The parent directory of a resolved path (for materializing e.g. <c>_delta_log/</c> on a local FS;
+    /// a no-op marker on object stores). Empty if there is no parent.</summary>
+    private string ParentDir(string resolved)
+    {
+        int slash = resolved.LastIndexOf('/');
+        return slash <= 0 ? string.Empty : resolved.Substring(0, slash);
+    }
+
+    private void EnsureParentDir(string resolved)
+    {
+        // On object stores directories are implicit (the write creates the path); on a local FS they are not.
+        // fs_create_dir is recursive (mkdir -p) on the host side, so one call on the immediate parent
+        // materializes the whole chain (the table root + `_delta_log/`). Idempotent.
+        var parent = ParentDir(resolved);
+        if (parent.Length > 0)
+        {
+            HostFs.CreateDir(_opener, parent);
+        }
+    }
+
+    public ValueTask<ISequentialFile> CreateAsync(
+        string path, bool overwrite = false, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var resolved = Resolve(path);
+        EnsureParentDir(resolved);
+        nint file;
+        if (overwrite)
+        {
+            file = HostFs.OpenWrite(_opener, resolved);
+        }
+        else if (!HostFs.TryOpenWriteExclusive(_opener, resolved, out file))
+        {
+            // Contract: CreateAsync fails when the file exists and overwrite is false.
+            throw new System.IO.IOException($"DuckDbTableFileSystem: file already exists: {path}");
+        }
+        return new ValueTask<ISequentialFile>(new DuckDbSequentialFile(file));
+    }
+
+    public ValueTask<bool> RenameAsync(
+        string sourcePath, string targetPath, CancellationToken cancellationToken = default)
+    {
+        // DuckDB's FileSystem has no atomic-no-overwrite MoveFile (it overwrites on local, and is NOT
+        // implemented on Azure DFS). So emulate the put-if-absent rename that Delta's commit relies on:
+        // create the TARGET with EXCLUSIVE_CREATE (the put-if-absent primitive, honored on OneLake/ADLS + POSIX)
+        // and copy the source bytes in; if the target already exists, return false (the commit-conflict signal
+        // engineered-wood maps to DeltaConflictException) WITHOUT touching the source (the caller deletes it).
+        cancellationToken.ThrowIfCancellationRequested();
+        var src = Resolve(sourcePath);
+        var dst = Resolve(targetPath);
+        nint bytesFile = HostFs.OpenRead(_opener, src);
+        byte[] bytes;
+        try
+        {
+            long size = HostFs.Size(bytesFile);
+            bytes = new byte[size];
+            if (size > 0)
+            {
+                fixed (byte* bp = bytes)
+                {
+                    HostFs.Read(bytesFile, bp, size, 0);
+                }
+            }
+        }
+        finally
+        {
+            HostFs.Close(bytesFile);
+        }
+
+        EnsureParentDir(dst);
+        if (!HostFs.TryOpenWriteExclusive(_opener, dst, out nint target))
+        {
+            return new ValueTask<bool>(false); // target exists => conflict; leave source for the caller to delete
+        }
+        try
+        {
+            if (bytes.Length > 0)
+            {
+                fixed (byte* bp = bytes)
+                {
+                    HostFs.WriteBytes(target, bp, bytes.Length);
+                }
+            }
+        }
+        finally
+        {
+            HostFs.CloseWrite(target);
+        }
+        HostFs.Remove(_opener, src); // the source temp is consumed by the (emulated) rename
+        return new ValueTask<bool>(true);
+    }
+
     public ValueTask DeleteAsync(string path, CancellationToken cancellationToken = default)
-        => throw new NotSupportedException("DuckDbTableFileSystem is read-only.");
-    public ValueTask WriteAllBytesAsync(string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
-        => throw new NotSupportedException("DuckDbTableFileSystem is read-only.");
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        HostFs.Remove(_opener, Resolve(path));
+        return ValueTask.CompletedTask;
+    }
+
+    public ValueTask WriteAllBytesAsync(
+        string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var resolved = Resolve(path);
+        EnsureParentDir(resolved);
+        nint file = HostFs.OpenWrite(_opener, resolved);
+        try
+        {
+            if (data.Length > 0)
+            {
+                using var pin = data.Pin();
+                HostFs.WriteBytes(file, pin.Pointer, data.Length);
+            }
+        }
+        finally
+        {
+            HostFs.CloseWrite(file);
+        }
+        return ValueTask.CompletedTask;
+    }
 
     private readonly record struct GlobEntry(string Path, long Size);
 
@@ -184,6 +297,52 @@ internal sealed unsafe class DuckDbRandomAccessFile : IRandomAccessFile
         {
             _closed = true;
             HostFs.Close(_file);
+        }
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        Dispose();
+        return ValueTask.CompletedTask;
+    }
+}
+
+/// <summary>
+/// Sequential (append-only) write handle over a host <c>FileSystem</c> file (opened via fs_open_write). Writes
+/// are synchronous host calls in completed <see cref="ValueTask"/>s; the handle is flushed + closed on dispose.
+/// Azure DFS only accepts sequential writes, which is exactly this contract.
+/// </summary>
+internal sealed unsafe class DuckDbSequentialFile : ISequentialFile
+{
+    private readonly nint _file;
+    private long _position;
+    private bool _closed;
+
+    public DuckDbSequentialFile(nint file) => _file = file;
+
+    public long Position => _position;
+
+    public ValueTask WriteAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+    {
+        if (data.Length > 0)
+        {
+            using var pin = data.Pin();
+            HostFs.WriteBytes(_file, pin.Pointer, data.Length);
+            _position += data.Length;
+        }
+        return ValueTask.CompletedTask;
+    }
+
+    // The host flushes on close (fs_close_write); there is no separate flush callback. Sequential writes are
+    // already handed straight to the FileHandle, so this is a no-op until Dispose.
+    public ValueTask FlushAsync(CancellationToken cancellationToken = default) => ValueTask.CompletedTask;
+
+    public void Dispose()
+    {
+        if (!_closed)
+        {
+            _closed = true;
+            HostFs.CloseWrite(_file);
         }
     }
 

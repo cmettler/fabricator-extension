@@ -228,10 +228,24 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
 
 ## Recommendation (sequenced; build on demand)
 
+0. **Host-FS WRITE surface — DONE (ABI v48).** `ArrowNetHostServices` gained `fs_open_write`(exclusive) /
+   `fs_write` / `fs_close_write` / `fs_remove` / `fs_create_dir`(recursive); `DuckDbTableFileSystem` implements
+   the write side (`CreateAsync`/`WriteAllBytesAsync`/`RenameAsync`/`DeleteAsync` + `DuckDbSequentialFile`). The
+   commit's put-if-absent rides `EXCLUSIVE_CREATE` (since DuckDB `MoveFile` overwrites on local + is unimplemented
+   on Azure DFS, `RenameAsync` is emulated as exclusive-create-copy → returns false on an existing target →
+   engineered-wood maps to `DeltaConflictException`). `HostFsGlob` normalizes object-store 404 to empty.
+   **Validated end-to-end on local AND a live OneLake lakehouse** by the `arrownet_delta_write_demo(path)` global
+   host-FS table fn (writes a 5-row Delta table via engineered-wood, idempotent Overwrite, round-trips with
+   `arrownet_delta_scan`) — `test/verify_delta_write.test`. Single-writer; concurrent commits are safe where
+   `EXCLUSIVE_CREATE` is honored (OneLake/POSIX).
 1. **Folder-root `DeltaCatalog` + read** — `DeltaBackend`/`DeltaCatalog` (3rd `IBackend`), `fs_glob` table
    discovery, flat `main` schema, scan via the existing `DeltaReader`. ~All C#, no new C++. Proves ATTACH +
    `SELECT FROM lake.t`.
-2. **INSERT / CREATE / CTAS / COPY** — `WriteAsync(Append)` / `CreateAsync`. No rowid; reuses the bulk path.
+2. **INSERT / CREATE / CTAS / COPY** — `WriteAsync(Append)` / `CreateAsync` (the write surface from step 0 is
+   built + validated; `arrownet_delta_write_demo` already exercises `OpenOrCreateAsync` + `WriteAsync`). No
+   rowid; reuses the bulk path. Remaining: bind the catalog's INSERT/CTAS operators to engineered-wood writes
+   (vs the fixed-data demo) + the OCC retry loop (catch `DeltaConflictException` → reopen → retry) for
+   concurrent writers.
 3. **DELETE** — pick the rowid-vs-predicate strategy (lean: predicate via `FilterNode → Predicate`, since it's
    contained and doesn't need an engineered-wood position-delete addition); deletion vectors handled by
    engineered-wood.
