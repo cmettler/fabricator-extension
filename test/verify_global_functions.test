@@ -54,3 +54,30 @@ SELECT arrownet_render('id={{ id }}', '{"id":' || i::VARCHAR || '}') AS r FROM r
 ----
 id=0
 id=1
+
+# ---- global TABLE-IN-OUT (streaming exchange) — bare fn(<input>), no ATTACH ----
+# arrownet_tag applies n -> (n, n*n) per input row on the streaming-exchange operator (handle-0 binding).
+query II
+SELECT n, sq FROM arrownet_tag((SELECT * FROM (VALUES (2),(3),(4)) v(n))) ORDER BY n;
+----
+2	4
+3	9
+4	16
+
+# ---- global COLLECTOR (pipeline breaker) — bare fn(<input>), no ATTACH ----
+# arrownet_collect_sum emits every input row with the GLOBAL sum (only knowable after all input is seen).
+query II
+SELECT n, total FROM arrownet_collect_sum((SELECT i::INTEGER AS n FROM range(5) t(i))) ORDER BY n;
+----
+0	10
+1	10
+2	10
+3	10
+4	10
+
+# The collector buffers ALL input (no single-chunk cap): 5000 rows, sum(0..4999) = 12497500.
+query II
+SELECT count(*), max(total)
+FROM arrownet_collect_sum((SELECT i::INTEGER AS n FROM range(5000) t(i)));
+----
+5000	12497500

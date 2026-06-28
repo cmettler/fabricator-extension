@@ -88,6 +88,8 @@ public sealed class SqlServerBackend : IBackend
     // Connection-free GLOBAL functions registered at extension load (no ATTACH). Provider-agnostic utilities
     // (e.g. the arrownet_render template engine) ride along on the always-present default provider.
     public IEnumerable<IScalarFunction> GlobalScalarFunctions => CustomFunctions.GlobalScalar;
+    public IEnumerable<IInOutFunction> GlobalInOutFunctions => CustomFunctions.GlobalInOut;
+    public IEnumerable<ICollectorTableFunction> GlobalCollectorFunctions => CustomFunctions.GlobalCollector;
 
     public IBackendCatalog OpenCatalog(string connectionString, string optionsJson) =>
         new SqlServerCatalog(connectionString, optionsJson);

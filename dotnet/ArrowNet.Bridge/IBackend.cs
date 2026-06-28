@@ -53,6 +53,14 @@ public interface IBackend
     /// </summary>
     IEnumerable<IScalarFunction> GlobalScalarFunctions => System.Array.Empty<IScalarFunction>();
 
+    /// <summary>Connection-free GLOBAL table-in-out functions (streaming exchange), registered at load as bare
+    /// <c>fn(&lt;input&gt;)</c>. Empty by default. See docs/global-functions.md.</summary>
+    IEnumerable<IInOutFunction> GlobalInOutFunctions => System.Array.Empty<IInOutFunction>();
+
+    /// <summary>Connection-free GLOBAL collector (pipeline-breaker) functions, registered at load as bare
+    /// <c>fn(&lt;input&gt;)</c>. Empty by default. See docs/global-functions.md.</summary>
+    IEnumerable<ICollectorTableFunction> GlobalCollectorFunctions => System.Array.Empty<ICollectorTableFunction>();
+
     /// <summary>
     /// Builds a provider connection string from a secret's fields (the host reads the DuckDB secret and
     /// passes its key/values here). Keeps all provider connection-string / auth formatting in the backend —

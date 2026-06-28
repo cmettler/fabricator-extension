@@ -1668,22 +1668,55 @@ void RegisterArrowNetGlobalFunctions(ExtensionLoader &loader) {
 		Connection conn(loader.GetDatabaseInstance());
 		auto &context = *conn.context;
 		for (idx_t i = 0; i < names.size(); i++) {
-			if (kinds[i] != "scalar") {
-				continue; // table / in-out / collector globals are a later slice (docs/global-functions.md)
-			}
 			const string &fn_name = names[i];
-			vector<string> arg_names;
-			vector<LogicalType> arg_types;
-			LogicalType return_type;
-			try {
-				// handle = 0 + empty schema = the global marker; C# resolves the function by name.
-				FetchFunctionParamSchema(context, nullptr, "", fn_name, arg_names, arg_types);
-				return_type = FetchFunctionReturnType(context, nullptr, "", fn_name);
-			} catch (std::exception &) {
-				continue; // skip a global whose schema can't be resolved
+			const string &kind = kinds[i];
+			if (kind == "scalar") {
+				vector<string> arg_names;
+				vector<LogicalType> arg_types;
+				LogicalType return_type;
+				try {
+					// handle = 0 + empty schema = the global marker; C# resolves the function by name.
+					FetchFunctionParamSchema(context, nullptr, "", fn_name, arg_names, arg_types);
+					return_type = FetchFunctionReturnType(context, nullptr, "", fn_name);
+				} catch (std::exception &) {
+					continue; // skip a global whose schema can't be resolved
+				}
+				ScalarFunction fn =
+				    BuildArrowNetScalarFunction(nullptr, "", fn_name, arg_types, arg_names, return_type);
+				loader.RegisterFunction(fn);
+			} else if (kind == "inout" || kind == "collector") {
+				// A connection-free in-out / collector: a {TABLE}-param table function on the streaming-exchange
+				// (in-out) or Sink+Source (collector) operator, with handle = 0 so the bind resolves the binding
+				// against the C# global registry by name (mirrors GetOrCreateCustomInOut/CollectorFunction).
+				bool is_collector = kind == "collector";
+				TableFunction tf(fn_name, {LogicalType::TABLE}, nullptr,
+				                  is_collector ? ArrowNetCollectorBind : ArrowNetExchangeBind,
+				                  is_collector ? ArrowNetCollectorInitGlobal : ArrowNetExchangeInitGlobal,
+				                  is_collector ? ArrowNetCollectorInitLocal : ArrowNetExchangeInitLocal);
+				tf.in_out_function = is_collector ? ArrowNetCollectorFunction : ArrowNetExchangeFunction;
+				auto fn_info = make_shared_ptr<ArrowNetTableFunctionInfo>();
+				fn_info->handle = nullptr; // global marker
+				fn_info->schema = "";
+				fn_info->func = fn_name;
+				fn_info->is_proc = false;
+				try {
+					// Constant "cost" args as NAMED parameters (coexist with the single {TABLE} overload); none
+					// for a no-arg in-out/collector. SQLNULL sentinel => ANY (an "accept any value" param bag).
+					vector<string> arg_names;
+					vector<LogicalType> arg_types;
+					FetchFunctionParamSchema(context, nullptr, "", fn_name, arg_names, arg_types);
+					for (idx_t k = 0; k < arg_names.size(); k++) {
+						auto t = arg_types[k].id() == LogicalTypeId::SQLNULL ? LogicalType::ANY : arg_types[k];
+						tf.named_parameters[arg_names[k]] = t;
+					}
+					fn_info->arg_names = std::move(arg_names);
+					fn_info->arg_types = std::move(arg_types);
+				} catch (std::exception &) {
+					// no cost args
+				}
+				tf.function_info = std::move(fn_info);
+				loader.RegisterFunction(tf);
 			}
-			ScalarFunction fn = BuildArrowNetScalarFunction(nullptr, "", fn_name, arg_types, arg_names, return_type);
-			loader.RegisterFunction(fn);
 		}
 	} catch (std::exception &) {
 		// Bridge unavailable at load — skip global-function registration (graceful degradation).

@@ -868,10 +868,13 @@ public static unsafe class Bootstrap
                 using var argStream = CArrowArrayStreamImporter.ImportArrayStream(args); // we own it
                 argsBatch = argStream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
             }
-            var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
-            var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
-            var binding = catalog.InOutBind(s, f, argsBatch, inSchema);
+            // handle == 0 => a connection-free GLOBAL in-out / collector: resolve from the global registry by
+            // name (a collector is wrapped as an IArrowInOutBinding). Else the catalog path.
+            var binding = handle == 0
+                ? GlobalFunctions.ResolveInOut(f, argsBatch, inSchema)
+                : (Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty))
+                    .InOutBind(Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty, f, argsBatch, inSchema);
             // Export the binding's full output schema as a zero-row stream so the host can read return types.
             CArrowArrayStreamExporter.ExportArrayStream(
                 new InMemoryArrayStream(binding.OutputSchema, System.Array.Empty<RecordBatch>()), outSchema);
@@ -1095,6 +1098,22 @@ public static unsafe class Bootstrap
                 kind.Append("scalar");
                 paramCount.Append(fn.Parameters.FieldsList.Count);
                 returnType.Append(fn.Result.DataType.Name);
+                rows++;
+            }
+            foreach (var fn in GlobalFunctions.AllInOut())
+            {
+                name.Append(fn.Name);
+                kind.Append("inout");
+                paramCount.Append(fn.InputSchema.FieldsList.Count);
+                returnType.Append(string.Empty);
+                rows++;
+            }
+            foreach (var fn in GlobalFunctions.AllCollectors())
+            {
+                name.Append(fn.Name);
+                kind.Append("collector");
+                paramCount.Append(fn.InputSchema.FieldsList.Count);
+                returnType.Append(string.Empty);
                 rows++;
             }
             var schema = new Schema(new[]

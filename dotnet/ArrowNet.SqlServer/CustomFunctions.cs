@@ -28,6 +28,20 @@ internal static class CustomFunctions
         new CfRenderFunction(),
     };
 
+    // Connection-free GLOBAL table-in-out (streaming exchange) functions — bare fn(<input>), no ATTACH.
+    // Implement the base IInOutFunction (no SchemaName).
+    public static readonly IReadOnlyList<IInOutFunction> GlobalInOut = new IInOutFunction[]
+    {
+        new GfTagFunction(),
+    };
+
+    // Connection-free GLOBAL collector (pipeline-breaker) functions — bare fn(<input>), no ATTACH.
+    // Implement the base ICollectorTableFunction (no SchemaName).
+    public static readonly IReadOnlyList<ICollectorTableFunction> GlobalCollector = new ICollectorTableFunction[]
+    {
+        new GfCollectSumFunction(),
+    };
+
     public static readonly IReadOnlyList<ICatalogScalarFunction> Scalar = new ICatalogScalarFunction[]
     {
         new CfAddFunction(),
@@ -741,6 +755,104 @@ internal sealed class CfRenderFunction : IScalarFunction
         JsonValueKind.Object => e.EnumerateObject().ToDictionary(p => p.Name, p => JsonToClr(p.Value)),
         _ => e.ToString(),
     };
+}
+
+// GLOBAL in-out (streaming, connection-free): arrownet_tag(<table of n>) -> (n, sq=n*n) per input row, no
+// ATTACH. The global analog of cf_tag — implements the base IInOutFunction (no SchemaName); registered at load
+// on the streaming-exchange operator. The author writes DoExchange (one output batch per input chunk + a
+// length-0 sentinel). See docs/global-functions.md.
+internal sealed class GfTagFunction : IInOutFunction
+{
+    public string Name => "arrownet_tag";
+    public Schema InputSchema => new(new[] { new Field("n", Int32Type.Default, nullable: true) }, metadata: null);
+    public IArrowInOutBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding();
+
+    private sealed class Binding : IArrowInOutBinding
+    {
+        public Schema OutputSchema => new(new[]
+        {
+            new Field("n", Int32Type.Default, nullable: true),
+            new Field("sq", Int32Type.Default, nullable: true),
+        }, metadata: null);
+
+        public async IAsyncEnumerable<RecordBatch> DoExchange(
+            IAsyncEnumerable<RecordBatch> input, [EnumeratorCancellation] CancellationToken ct = default)
+        {
+            await foreach (var chunk in input.WithCancellation(ct))
+            {
+                using (chunk)
+                {
+                    var n = (Int32Array)chunk.Column(0);
+                    int rows = chunk.Length;
+                    var nb = new Int32Array.Builder().Reserve(rows);
+                    var sq = new Int32Array.Builder().Reserve(rows);
+                    for (int i = 0; i < rows; i++)
+                    {
+                        if (n.IsNull(i)) { nb.AppendNull(); sq.AppendNull(); }
+                        else { nb.Append(n.Values[i]); sq.Append(n.Values[i] * n.Values[i]); }
+                    }
+                    yield return new RecordBatch(OutputSchema, new IArrowArray[] { nb.Build(), sq.Build() }, rows);
+                }
+                yield return InOutExchange.EmptyBatch(OutputSchema); // per-input sentinel (NEED_MORE_INPUT)
+            }
+        }
+
+        public void Dispose() { }
+    }
+}
+
+// GLOBAL collector (pipeline-breaker, connection-free): arrownet_collect_sum(<table of n>) -> (n, total),
+// emitting every input row paired with the GLOBAL sum across ALL input — only knowable after the whole input
+// is seen. The global analog of cf_collect; implements the base ICollectorTableFunction, registered at load on
+// the Sink+Source collector operator. No ATTACH. See docs/global-functions.md.
+internal sealed class GfCollectSumFunction : ICollectorTableFunction
+{
+    public string Name => "arrownet_collect_sum";
+    public Schema InputSchema => new(new[] { new Field("n", Int32Type.Default, nullable: true) }, metadata: null);
+    public IArrowCollectorBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding();
+
+    private sealed class Binding : IArrowCollectorBinding
+    {
+        public Schema OutputSchema => new(new[]
+        {
+            new Field("n", Int32Type.Default, nullable: true),
+            new Field("total", Int64Type.Default, nullable: false),
+        }, metadata: null);
+
+        public async IAsyncEnumerable<RecordBatch> Collect(
+            IAsyncEnumerable<RecordBatch> allInput, [EnumeratorCancellation] CancellationToken ct = default)
+        {
+            var values = new List<int?>();
+            long total = 0;
+            await foreach (var chunk in allInput.WithCancellation(ct))
+            {
+                using (chunk)
+                {
+                    var n = (Int32Array)chunk.Column(0);
+                    for (int i = 0; i < chunk.Length; i++)
+                    {
+                        if (n.IsNull(i)) { values.Add(null); }
+                        else { values.Add(n.Values[i]); total += n.Values[i]; }
+                    }
+                }
+            }
+            const int batchRows = 2048;
+            for (int off = 0; off < values.Count; off += batchRows)
+            {
+                int rows = Math.Min(batchRows, values.Count - off);
+                var nb = new Int32Array.Builder().Reserve(rows);
+                var tb = new Int64Array.Builder().Reserve(rows);
+                for (int i = 0; i < rows; i++)
+                {
+                    if (values[off + i].HasValue) { nb.Append(values[off + i]!.Value); } else { nb.AppendNull(); }
+                    tb.Append(total);
+                }
+                yield return new RecordBatch(OutputSchema, new IArrowArray[] { nb.Build(), tb.Build() }, rows);
+            }
+        }
+
+        public void Dispose() { }
+    }
 }
 
 // Demo: dbo.cf_add(a, b) -> a + b, computed in C# (no such object exists in SQL Server).
