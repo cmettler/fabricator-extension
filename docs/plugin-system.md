@@ -5,7 +5,8 @@
 > registered, and its **global functions** surfaced as a bare `fn(...)` with NO ATTACH — verified end-to-end
 > (`ArrowNet.SamplePlugin`'s `plug_greet`, `test/verify_plugin.test`). Loaded into the **default (non-isolated)**
 > context for now; per-plugin `AssemblyLoadContext` **isolation** (for conflicting transitive deps) is the
-> deferred upgrade — a loader-internal swap, no contract change. Builds on `BackendRegistry` +
+> deferred upgrade — a loader-internal swap, no contract change. The contract assembly **`ArrowNet.Abstractions`
+> is extracted** (a plugin references it + Apache.Arrow only — see recommendation #2). Builds on `BackendRegistry` +
 > [docs/global-functions.md](global-functions.md) + [docs/provider-extensibility.md](provider-extensibility.md).
 > The load-bearing constraint regardless of ALC: **Apache.Arrow must be shared, never isolated**.
 >
@@ -153,8 +154,15 @@ discipline (and the restrictions collectible ALCs impose). We never unload a plu
    discovery. Plugins reference `ArrowNet.Bridge` directly (no `Abstractions` needed without ALC — everything is
    one context). Sample plugin + `verify_plugin.test`. **Plugins must align their full dependency closure with
    the host** (Apache.Arrow always; every other shared dep too — there is no version isolation without ALC).
-2. **Extract `ArrowNet.Abstractions`** (deferred) — the contract surface (interfaces + Arrow-typed POCOs), so
-   plugins bind to a minimal stable SPI instead of the whole bridge. Pure refactor; the prerequisite for ALC.
+2. **Extract `ArrowNet.Abstractions` — DONE** — the contract surface (the `I*Function`/`IBackend`/`IBoundTable`/
+   `IAggregateSession` interfaces + `ProviderSetting`/`SecretField`/`TableFunctionScan`/`ScanSpec`/`FilterNode`)
+   is now a separate assembly, **kept in the `ArrowNet.Bridge` namespace** (assembly split only — zero source
+   churn). `ArrowNet.Bridge` references it (the ABI/marshaling/`Bootstrap`/`BackendRegistry`/Static-bases/
+   adapters stay in Bridge); the `BackendRegistry`, `InOutExchangeStream`/`InOutExchange`, and
+   `CollectorInOutBinding` impls split back out of their old interface files into Bridge. `ArrowNet.SamplePlugin`
+   now references **`ArrowNet.Abstractions` ONLY** (+ Apache.Arrow, host-provided) — a lean, Bridge-independent
+   plugin surface (its plugin folder is just `ArrowNet.Abstractions.dll` + the plugin dll). Behavior-preserving;
+   full `verify_*` suite + `verify_plugin` green.
 3. **ALC isolation** (deferred) — a loader-internal swap (`host.LoadFromAssemblyPath` → a per-plugin
    `PluginLoadContext`) with the shared-name allowlist `Load` above (non-collectible). **Adopt only when a real
    dependency conflict / a third-party plugin with conflicting managed deps lands** — version-aligned plugins

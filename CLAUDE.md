@@ -432,9 +432,13 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   bridge into a non-default context, so loading into Default bound the plugin to a separate `ArrowNet.Bridge`
   copy (different, non-assignable `IBackend` → 0 backends). The loader skips host-context-loaded assemblies (the
   shared set) + a `Resolving` hook probes plugin dirs for private deps. **Plugins must align their full
-  dependency closure with the host (Apache.Arrow always)** — no version isolation without ALC. Per-plugin
-  `AssemblyLoadContext` isolation (for conflicting deps) is a deferred, non-breaking loader-internal upgrade
-  (+ a thin `ArrowNet.Abstractions` extraction). **Crux for that day:
+  dependency closure with the host (Apache.Arrow always)** — no version isolation without ALC. **The contract
+  assembly `ArrowNet.Abstractions` is extracted** (the `I*Function`/`IBackend`/`IBoundTable`/`IAggregateSession`
+  interfaces + `ProviderSetting`/`SecretField`/`TableFunctionScan`/`ScanSpec`/`FilterNode`, kept in the
+  `ArrowNet.Bridge` namespace — assembly split only, zero source churn; Bridge references it, the
+  ABI/marshaling/`BackendRegistry`/Static-bases/adapters stay in Bridge). `ArrowNet.SamplePlugin` references
+  **Abstractions only** (+ Apache.Arrow) — Bridge-independent. Per-plugin `AssemblyLoadContext` isolation (for
+  conflicting deps) is a deferred, non-breaking loader-internal upgrade. **Crux for that day:
   `Apache.Arrow`(+`.C`) MUST be SHARED (default context), never isolated** — every cross-boundary call traffics
   Arrow types, and cross-ALC types aren't assignable, so all plugins pin the bridge's Arrow version (isolation
   frees their OTHER deps only). The one fix over the textbook sketch: the `PluginLoadContext.Load` must return

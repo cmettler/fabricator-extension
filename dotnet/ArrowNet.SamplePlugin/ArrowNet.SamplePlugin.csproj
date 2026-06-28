@@ -13,9 +13,10 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- Host-provided: referenced for the contracts (and Apache.Arrow transitively), but NOT copied — the
-         loaded bridge supplies them in the default context. -->
-    <ProjectReference Include="..\ArrowNet.Bridge\ArrowNet.Bridge.csproj" Private="false" />
+    <!-- A plugin references ONLY the contract assembly (+ Apache.Arrow transitively), not the bridge internals
+         — host-provided, NOT copied (the loaded bridge supplies them). This is the minimal, stable plugin
+         surface the Abstractions split enables. -->
+    <ProjectReference Include="..\ArrowNet.Abstractions\ArrowNet.Abstractions.csproj" Private="false" />
   </ItemGroup>
 
 </Project>

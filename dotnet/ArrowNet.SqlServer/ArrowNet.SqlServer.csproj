@@ -16,6 +16,7 @@
 
   <ItemGroup>
     <PackageReference Include="Fluid.Core" Version="2.31.0" />
+    <ProjectReference Include="..\ArrowNet.Abstractions\ArrowNet.Abstractions.csproj" />
     <ProjectReference Include="..\ArrowNet.Bridge\ArrowNet.Bridge.csproj" />
     <PackageReference Include="Microsoft.Data.SqlClient" Version="6.0.2" />
   </ItemGroup>

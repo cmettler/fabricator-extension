@@ -17,6 +17,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\ArrowNet.Abstractions\ArrowNet.Abstractions.csproj" />
     <ProjectReference Include="..\ArrowNet.Bridge\ArrowNet.Bridge.csproj" />
     <PackageReference Include="Microsoft.AnalysisServices.AdomdClient" Version="19.114.0" />
     <!-- Entra token acquisition for Fabric/AAS XMLA: mint a Power BI-scoped token from the same Azure

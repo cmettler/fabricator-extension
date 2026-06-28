@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <RootNamespace>ArrowNet.Bridge</RootNamespace>
+    <AssemblyName>ArrowNet.Abstractions</AssemblyName>
+    <Description>
+      The stable, minimal contract surface for the arrownet bridge: the provider/function interfaces and the
+      Arrow-typed POCOs that cross the host&lt;-&gt;provider/plugin boundary. Kept in the ArrowNet.Bridge namespace
+      (assembly split only — no source churn). Plugins reference THIS + Apache.Arrow (host-provided); it carries
+      no ABI/marshaling internals. Shared (default-context) assembly — the prerequisite for AssemblyLoadContext
+      plugin isolation. See docs/plugin-system.md.
+    </Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Apache.Arrow" Version="23.0.0" />
+  </ItemGroup>
+
+</Project>
