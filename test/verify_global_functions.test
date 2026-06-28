@@ -1,0 +1,56 @@
+# name: test/verify_global_functions.test
+# description: Load-time GLOBAL (connection-free) functions — a bare fn(...) registered at extension load,
+#              usable with NO ATTACH and no SQL Server / DAX connection. Demo: arrownet_render (the Fluid /
+#              Liquid template engine). Proves the global-function path end-to-end (list_global_functions +
+#              the handle-0 scalar dispatch). See docs/global-functions.md.
+# group: [mssql_net]
+
+require mssql_net
+
+# NOTE: no ATTACH, no require-env — a global function resolves on a bare loaded extension.
+
+# Basic render: Liquid substitution from a JSON params bag.
+query I
+SELECT arrownet_render('Hello {{ name }}, you have {{ n }} messages', '{"name":"world","n":3}');
+----
+Hello world, you have 3 messages
+
+# Vectorized over a batch (the template is a per-row column; params empty object).
+query I
+SELECT arrownet_render('row ' || i::VARCHAR, '{}') AS r FROM range(3) t(i) ORDER BY i;
+----
+row 0
+row 1
+row 2
+
+# Liquid control flow (if/else) — proves it's a real template engine, not just substitution.
+query I
+SELECT arrownet_render('{% if x > 1 %}big{% else %}small{% endif %}', '{"x":5}');
+----
+big
+
+# Liquid loop over a JSON array param.
+query I
+SELECT arrownet_render('{% for i in items %}{{ i }};{% endfor %}', '{"items":[1,2,3]}');
+----
+1;2;3;
+
+# A NULL template yields NULL (SPECIAL_HANDLING — the function sees NULL args).
+query I
+SELECT arrownet_render(NULL, '{"a":1}');
+----
+NULL
+
+# An unreferenced/empty params object renders the literal text.
+query I
+SELECT arrownet_render('static text', '{}');
+----
+static text
+
+# Still resolves AFTER an ATTACH is in play elsewhere is not needed — but confirm it composes with a normal
+# query (no catalog dependency): used inside a CTE over generated rows.
+query I
+SELECT arrownet_render('id={{ id }}', '{"id":' || i::VARCHAR || '}') AS r FROM range(2) t(i) ORDER BY i;
+----
+id=0
+id=1

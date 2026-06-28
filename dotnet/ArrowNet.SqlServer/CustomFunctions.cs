@@ -1,8 +1,12 @@
+using System.Collections.Concurrent;
+using System.Linq;
 using System.Runtime.CompilerServices;
+using System.Text.Json;
 using Apache.Arrow;
 using Apache.Arrow.Ipc;
 using Apache.Arrow.Types;
 using ArrowNet.Bridge;
+using Fluid;
 
 namespace ArrowNet.SqlServer;
 
@@ -16,6 +20,14 @@ namespace ArrowNet.SqlServer;
 /// </summary>
 internal static class CustomFunctions
 {
+    // Connection-free GLOBAL scalar functions — registered at extension load as bare fn(...), no ATTACH
+    // (see docs/global-functions.md). Provider-agnostic utilities; surfaced via SqlServerBackend (the always
+    // -present default provider). Implement the base IScalarFunction (no SchemaName).
+    public static readonly IReadOnlyList<IScalarFunction> GlobalScalar = new IScalarFunction[]
+    {
+        new CfRenderFunction(),
+    };
+
     public static readonly IReadOnlyList<ICatalogScalarFunction> Scalar = new ICatalogScalarFunction[]
     {
         new CfAddFunction(),
@@ -658,6 +670,77 @@ internal sealed class CfHostParamFunction : ICatalogScalarFunction
         }
         return outb.Build();
     }
+}
+
+// GLOBAL scalar (connection-free, no ATTACH): arrownet_render(template, params_json) -> the Liquid template
+// rendered with the JSON params bag. A template engine (Fluid / Liquid — secure-by-default, parse-once cached).
+// Registered at extension load via SqlServerBackend.GlobalScalarFunctions; resolved as a bare fn(...) with no
+// catalog. Implements the base IScalarFunction (no SchemaName). See docs/global-functions.md.
+internal sealed class CfRenderFunction : IScalarFunction
+{
+    private static readonly FluidParser Parser = new();
+    // Parse-once / render-many: templates are usually a constant literal across a batch, so cache the parsed,
+    // thread-safe IFluidTemplate keyed by the template string.
+    private static readonly ConcurrentDictionary<string, IFluidTemplate> Cache = new();
+
+    public string Name => "arrownet_render";
+
+    public Schema Parameters => new(new[]
+    {
+        new Field("template", StringType.Default, nullable: true),
+        new Field("params", StringType.Default, nullable: true), // a JSON object of template variables
+    }, metadata: null);
+
+    public Field Result => new("result", StringType.Default, nullable: true);
+
+    public IArrowArray Invoke(RecordBatch args)
+    {
+        var templates = (StringArray)args.Column(0);
+        var paramsCol = (StringArray)args.Column(1);
+        var b = new StringArray.Builder().Reserve(args.Length);
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (templates.IsNull(i))
+            {
+                b.AppendNull();
+                continue;
+            }
+            var template = Cache.GetOrAdd(templates.GetString(i), src =>
+            {
+                if (!Parser.TryParse(src, out var parsed, out var error))
+                {
+                    throw new ArgumentException($"arrownet_render: template parse error: {error}");
+                }
+                return parsed;
+            });
+            var ctx = new TemplateContext();
+            if (!paramsCol.IsNull(i))
+            {
+                using var doc = JsonDocument.Parse(paramsCol.GetString(i));
+                if (doc.RootElement.ValueKind == JsonValueKind.Object)
+                {
+                    foreach (var p in doc.RootElement.EnumerateObject())
+                    {
+                        ctx.SetValue(p.Name, JsonToClr(p.Value));
+                    }
+                }
+            }
+            b.Append(template.Render(ctx));
+        }
+        return b.Build();
+    }
+
+    private static object? JsonToClr(JsonElement e) => e.ValueKind switch
+    {
+        JsonValueKind.String => e.GetString(),
+        JsonValueKind.Number => e.TryGetInt64(out var l) ? l : e.GetDouble(),
+        JsonValueKind.True => true,
+        JsonValueKind.False => false,
+        JsonValueKind.Null => null,
+        JsonValueKind.Array => e.EnumerateArray().Select(JsonToClr).ToList(),
+        JsonValueKind.Object => e.EnumerateObject().ToDictionary(p => p.Name, p => JsonToClr(p.Value)),
+        _ => e.ToString(),
+    };
 }
 
 // Demo: dbo.cf_add(a, b) -> a + b, computed in C# (no such object exists in SQL Server).

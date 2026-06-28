@@ -1,6 +1,9 @@
 # Load-time global functions (connection-free) — plan
 
-> Status: **design / plan — nothing built.** The deferred **Phase 3-A**: connection-free functions registered
+> Status: **Slice 1 (global SCALAR) BUILT + verified** — ABI v46 `list_global_functions` + the handle-0 scalar
+> dispatch; demo **`arrownet_render`** (Fluid/Liquid template engine) resolves as a bare `fn(...)` with NO
+> ATTACH (`test/verify_global_functions.test`, 10). Slices 2–4 (in-out/collector, compute/connstr table,
+> host-FS table) remain planned below. The **Phase 3-A**: connection-free functions registered
 > at `Extension::Load` so a bare `fn(...)` works with **no ATTACH** (e.g. a template engine). The 4th member of
 > the "provider declares; core stays name-agnostic" family (after settings v33 / ATTACH options v37 / secret
 > fields v38). Today provider functions are all **attach-time catalog-bound** (`db.schema.fn`, dispatched via a
@@ -245,10 +248,10 @@ The **single new ABI entry (`list_global_functions`) + the `RegisterArrowNetGlob
 built once in slice 1; each later slice just extends the handle-0 branch to one more `*_bind` and adds the
 `kind` case in the load registrar — no further ABI.
 
-1. **Global scalar** — the `IScalarFunction`/`ICatalogScalarFunction` rename, `list_global_functions` ABI +
-   handle-0 reuse of `get_function_*_schema`/`execute_scalar`, `IBackend.GlobalScalarFunctions`,
-   `RegisterArrowNetGlobalFunctions` at load, the `arrownet_render` (Fluid) demo. Motivated, unblocks the TMDL
-   render step.
+1. **Global scalar — DONE** (ABI v46): the `IScalarFunction`/`ICatalogScalarFunction` rename, `list_global_functions`
+   + handle-0 reuse of `get_function_*_schema`/`execute_scalar`, `IBackend.GlobalScalarFunctions` (unioned by
+   `GlobalFunctions`), `RegisterArrowNetGlobalFunctions` at load (shared `BuildArrowNetScalarFunction`), the
+   `arrownet_render` (Fluid/Liquid) demo. `test/verify_global_functions.test`. Unblocks the TMDL render step.
 2. **Global in-out + collector (pure-C#)** — the `IInOutFunction`/`ICollectorTableFunction` base renames; extend
    the handle-0 branch to `inout_bind`; register the exchange/collector operators by `kind` in the load
    registrar. **No opener needed** (they transform their input) → the clean next step; enables the effectful

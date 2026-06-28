@@ -159,8 +159,17 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   unified the dispatch under `IBoundTable` (`table_bind`/`table_execute`/`table_close`); see the Phase 5
   section. The bespoke TVF could now fold into `IArrowTableFunction` (`table_execute` returns a stream) but
   needn't — the dispatch is already unified.
-- **Load-time global functions = the 4th provider-self-description capability** (design only; not built).
-  **Full plan: [docs/global-functions.md](docs/global-functions.md)** — covers **all four kinds** (scalar / table
+- **Load-time global functions = the 4th provider-self-description capability** (**global SCALAR DONE, ABI v46**;
+  table/in-out/collector kinds planned). Connection-free, ATTACH-free functions registered at `Extension::Load`
+  via `loader.RegisterFunction`. **Slice 1 built + verified**: `list_global_functions` enumerates the
+  provider-union at load + a **`handle==0`** branch on `get_function_*_schema`/`execute_scalar` resolves a
+  function by name against the C# `GlobalFunctions` registry; `IBackend.GlobalScalarFunctions` declares them;
+  C++ `RegisterArrowNetGlobalFunctions` builds a `ScalarFunction` per scalar decl (shared
+  `BuildArrowNetScalarFunction`, handle=0) at load (best-effort — skipped if the bridge can't boot). Demo
+  **`arrownet_render(template, params_json)`** — the **Fluid/Liquid** template engine (secure-by-default,
+  parse-once cached), resolves as a bare `fn(...)` with NO ATTACH (`test/verify_global_functions.test`, 10;
+  validated live via the shell). Unblocks the TMDL render step (render = pure global scalar; apply = table/
+  collector). **Full plan: [docs/global-functions.md](docs/global-functions.md)** — covers **all four kinds** (scalar / table
   / in-out / collector) through **one mechanism**: +1 ABI entry `list_global_functions` (enumerate the
   provider-union at load) + a **`handle==0` marker** on the existing *bind* entries (`get_function_*_schema` +
   `execute_scalar`; `table_bind`; `inout_bind`) so the per-call binding resolves against a global registry — the
@@ -1003,7 +1012,12 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v41** (v41 = the **Delta lakehouse reader on the filesystem bridge** SPIKE: appended
+- **Current version: ABI v46** (v46 = **load-time global functions**: appended one vtable entry
+  `list_global_functions` (enumerate the provider-union of connection-free global functions at extension load);
+  the scalar entries `get_function_param_schema`/`get_function_return_schema`/`execute_scalar` gained a
+  **`handle==0`** branch that resolves a function by name against the C# global registry instead of a catalog.
+  Global scalar only so far; see the load-time-global-functions bullet + [docs/global-functions.md](docs/global-functions.md).
+  v42–v45 = the **host-query** feature, prior session. v41 = the **Delta lakehouse reader on the filesystem bridge** SPIKE: appended
   `delta_schema`/`delta_scan` to the vtable + `fs_glob` to `ArrowNetHostServices`. `arrownet_delta_scan(path)`
   reads a Delta Lake table via **engineered-wood** (Curt Hagenlocher's pure-C# Delta), with ALL IO through
   DuckDB's `FileSystem` over the host callbacks — so local/`az://`/`s3://`/`https://` + DuckDB secrets all work.
