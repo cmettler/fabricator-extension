@@ -167,8 +167,11 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   function by name against the C# `GlobalFunctions` registry; `IBackend.GlobalScalarFunctions` declares them;
   C++ `RegisterArrowNetGlobalFunctions` builds a `ScalarFunction` per scalar decl (shared
   `BuildArrowNetScalarFunction`, handle=0) at load (best-effort — skipped if the bridge can't boot). Demo
-  **`arrownet_render(template, params_json)`** — the **Fluid/Liquid** template engine (secure-by-default,
-  parse-once cached), resolves as a bare `fn(...)` with NO ATTACH (`test/verify_global_functions.test`, 10;
+  **`arrownet_render(template, params)`** — the **Fluid/Liquid** template engine (secure-by-default,
+  parse-once cached); `params` accepts a **DuckDB STRUCT** (`{'name':'x'}`, type-safe) OR a JSON string via the
+  **`SQLNULL→ANY` sentinel now wired for scalars** (the scalar builder maps SQLNULL→ANY + marshals the exec chunk
+  by its runtime `DataChunk::GetTypes()`, not the declared signature; `Invoke` reads a StructArray or StringArray).
+  Resolves as a bare `fn(...)` with NO ATTACH (`test/verify_global_functions.test`;
   validated live via the shell). Unblocks the TMDL render step (render = pure global scalar; apply = table/
   collector). **Full plan: [docs/global-functions.md](docs/global-functions.md)** — covers **all four kinds** (scalar / table
   / in-out / collector) through **one mechanism**: +1 ABI entry `list_global_functions` (enumerate the

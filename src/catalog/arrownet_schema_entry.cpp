@@ -196,19 +196,23 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateEntry(ClientContext &
 static ScalarFunction BuildArrowNetScalarFunction(ArrowNetHandle handle, const string &schema_name,
                                                   const string &fn_name, vector<LogicalType> arg_types,
                                                   vector<string> arg_names, LogicalType return_type) {
-	scalar_function_t exec = [handle, schema_name, fn_name, arg_types, arg_names](
+	scalar_function_t exec = [handle, schema_name, fn_name, arg_names](
 	                             DataChunk &args, ExpressionState &state, Vector &result) {
 		auto &ctx = state.GetContext();
 		idx_t row_count = args.size();
 
-		// Argument chunk -> a one-batch Arrow stream (in parameter order).
+		// Marshal the arg chunk -> a one-batch Arrow stream using the chunk's ACTUAL column types (not the
+		// declared signature): for a SQLNULL-sentinel ("accept any value") param declared as ANY, DuckDB passes
+		// the value UNCAST, so the runtime type (a STRUCT, a VARCHAR, …) is what must be appended. For a
+		// concrete-typed param DuckDB has already cast to the declared type, so this equals the signature.
+		auto actual_types = args.GetTypes();
 		auto properties = arrownet::BoundaryClientProperties(ctx);
-		auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(ctx, arg_types);
-		ArrowAppender appender(arg_types, row_count, properties, extension_types);
+		auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(ctx, actual_types);
+		ArrowAppender appender(actual_types, row_count, properties, extension_types);
 		appender.Append(args, 0, row_count, row_count);
 		ArrowArray array = appender.Finalize();
 
-		arrownet::ArrowProducer producer(arg_types, arg_names, properties);
+		arrownet::ArrowProducer producer(actual_types, arg_names, properties);
 		producer.AddBatch(array);
 		producer.Finish();
 
@@ -233,7 +237,16 @@ static ScalarFunction BuildArrowNetScalarFunction(ArrowNetHandle handle, const s
 		}
 	};
 
-	ScalarFunction fn(arg_types, return_type, exec);
+	// Signature: a SQLNULL-typed param is the "accept any value" sentinel (no Arrow type for ANY) → register it
+	// as LogicalType::ANY so DuckDB passes any literal (a STRUCT, a VARCHAR, …) UNCAST; the exec marshals the
+	// runtime type. Same marker the table/proc named-param path uses (e.g. daxeval's params bag).
+	vector<LogicalType> sig_types = arg_types;
+	for (auto &t : sig_types) {
+		if (t.id() == LogicalTypeId::SQLNULL) {
+			t = LogicalType::ANY;
+		}
+	}
+	ScalarFunction fn(sig_types, return_type, exec);
 	fn.name = fn_name;
 	// A remote UDF may be non-deterministic / side-effecting (VOLATILE => never folded), and may return
 	// non-NULL for NULL inputs, so it must see NULL args (SPECIAL_HANDLING) rather than being short-circuited.

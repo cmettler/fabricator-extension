@@ -222,11 +222,14 @@ A provider-agnostic core global, e.g. `arrownet_render(template VARCHAR, params 
   (`FluidParser.TryParse` → a thread-safe `IFluidTemplate`), ideal for vectorized rendering; (d) native
   dictionary / `System.Text.Json` model binding, which is exactly how we hand it `params`. (Scriban stays a fine
   alternative if a richer scripting language is later wanted for heavy TMDL generation.)
-- **params**: accept EITHER a DuckDB `STRUCT` (`{'name':'world','n':3}`, preferred — type-safe) OR a JSON string,
-  via the **`NullType` sentinel → `LogicalType::ANY`** marker already used by `daxeval` (so `params` crosses
-  uncast and `Invoke` reads its runtime type). Materialize each row's bag into a `Dictionary<string,object>` /
-  `JsonElement` and drop it into the `TemplateContext` (dictionaries/JSON need no member allow-listing), render,
-  emit the text.
+- **params (DONE — STRUCT or JSON)**: accepts EITHER a DuckDB `STRUCT` (`{'name':'world','n':3}`, preferred —
+  type-safe, no quoting) OR a JSON string, via the **`NullType` sentinel → `LogicalType::ANY`** marker (now
+  wired for SCALARS, not just the daxeval table/proc path). `CfRenderFunction.Parameters` declares `params` as
+  `NullType`; the C++ scalar builder maps `SQLNULL → ANY` for the signature AND marshals the exec chunk using
+  its **runtime** column types (`DataChunk::GetTypes()`, not the declared signature) so a STRUCT/VARCHAR passed
+  for an ANY param appends correctly; `Invoke` reads column 1's runtime type — a `StructArray` (each field → a
+  template var via `ArrowValueReader.ReadScalar`) or a `StringArray` (JSON). `test/verify_global_functions.test`
+  covers both forms incl. per-row struct extraction.
 - Vectorized: parse the template ONCE and **cache the `IFluidTemplate` keyed by the template string** (usually
   constant across a batch — a literal), render per row off the cached, thread-safe template.
 

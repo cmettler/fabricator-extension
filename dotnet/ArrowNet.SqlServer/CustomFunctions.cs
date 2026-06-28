@@ -6,6 +6,7 @@ using Apache.Arrow;
 using Apache.Arrow.Ipc;
 using Apache.Arrow.Types;
 using ArrowNet.Bridge;
+using ArrowNet.Bridge.Conversion;
 using Fluid;
 
 namespace ArrowNet.SqlServer;
@@ -701,8 +702,9 @@ internal sealed class CfHostParamFunction : ICatalogScalarFunction
     }
 }
 
-// GLOBAL scalar (connection-free, no ATTACH): arrownet_render(template, params_json) -> the Liquid template
-// rendered with the JSON params bag. A template engine (Fluid / Liquid — secure-by-default, parse-once cached).
+// GLOBAL scalar (connection-free, no ATTACH): arrownet_render(template, params) -> the Liquid template rendered
+// with the params bag, where `params` is EITHER a DuckDB STRUCT ({'name':'x','n':3}, type-safe, no quoting) OR a
+// JSON string ('{"name":"x"}'). A template engine (Fluid / Liquid — secure-by-default, parse-once cached).
 // Registered at extension load via SqlServerBackend.GlobalScalarFunctions; resolved as a bare fn(...) with no
 // catalog. Implements the base IScalarFunction (no SchemaName). See docs/global-functions.md.
 internal sealed class CfRenderFunction : IScalarFunction
@@ -717,7 +719,9 @@ internal sealed class CfRenderFunction : IScalarFunction
     public Schema Parameters => new(new[]
     {
         new Field("template", StringType.Default, nullable: true),
-        new Field("params", StringType.Default, nullable: true), // a JSON object of template variables
+        // The SQLNULL sentinel => the host registers this param as LogicalType::ANY, so a caller may pass a
+        // STRUCT (preferred) OR a JSON string; Invoke reads the column's runtime type.
+        new Field("params", NullType.Default, nullable: true),
     }, metadata: null);
 
     public Field Result => new("result", StringType.Default, nullable: true);
@@ -725,7 +729,8 @@ internal sealed class CfRenderFunction : IScalarFunction
     public IArrowArray Invoke(RecordBatch args)
     {
         var templates = (StringArray)args.Column(0);
-        var paramsCol = (StringArray)args.Column(1);
+        var paramsCol = args.Column(1); // a StructArray (preferred), a StringArray (JSON), or a NullArray
+        var structType = (paramsCol as StructArray)?.Data.DataType as StructType;
         var b = new StringArray.Builder().Reserve(args.Length);
         for (int i = 0; i < args.Length; i++)
         {
@@ -743,9 +748,18 @@ internal sealed class CfRenderFunction : IScalarFunction
                 return parsed;
             });
             var ctx = new TemplateContext();
-            if (!paramsCol.IsNull(i))
+            if (paramsCol is StructArray sa && structType is not null)
             {
-                using var doc = JsonDocument.Parse(paramsCol.GetString(i));
+                // STRUCT params: each field becomes a template variable (the field's value at this row).
+                for (int k = 0; k < structType.Fields.Count; k++)
+                {
+                    ctx.SetValue(structType.Fields[k].Name, ArrowValueReader.ReadScalar(sa.Fields[k], i));
+                }
+            }
+            else if (paramsCol is StringArray jsonStrs && !jsonStrs.IsNull(i))
+            {
+                // JSON-string params (programmatic callers).
+                using var doc = JsonDocument.Parse(jsonStrs.GetString(i));
                 if (doc.RootElement.ValueKind == JsonValueKind.Object)
                 {
                     foreach (var p in doc.RootElement.EnumerateObject())

@@ -15,6 +15,20 @@ SELECT arrownet_render('Hello {{ name }}, you have {{ n }} messages', '{"name":"
 ----
 Hello world, you have 3 messages
 
+# params as a DuckDB STRUCT (type-safe, no quoting) — the SQLNULL->ANY sentinel lets the same fn accept it.
+query I
+SELECT arrownet_render('Hello {{ name }}, you have {{ n }} messages', {'name':'world','n':3});
+----
+Hello world, you have 3 messages
+
+# STRUCT params vectorized over rows (each row's struct supplies that row's variables).
+query I
+SELECT arrownet_render('id={{ id }}', {'id': i}) AS r FROM range(3) t(i) ORDER BY r;
+----
+id=0
+id=1
+id=2
+
 # Vectorized over a batch (the template is a per-row column; params empty object).
 query I
 SELECT arrownet_render('row ' || i::VARCHAR, '{}') AS r FROM range(3) t(i) ORDER BY i;
