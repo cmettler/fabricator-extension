@@ -58,17 +58,29 @@ already anticipated it — "the existing `execute_scalar` with a handle-less mar
 
 ## C# authoring (provider declares; Bridge unions)
 
-- **Interface** (`ArrowNet.Bridge`): a minimal `IArrowGlobalScalarFunction`:
+- **Interface (extract a shared base, don't duplicate)** (`ArrowNet.Bridge`): `SchemaName` is the *only*
+  catalog-specific member, so factor it out — a global scalar is just a scalar without a catalog binding:
   ```csharp
-  public interface IArrowGlobalScalarFunction {
-      string Name { get; }            // BARE function name (registered as-is; arrownet_-prefixed by convention)
-      Schema Parameters { get; }      // arg fields (NullType sentinel = "any", reused from daxeval for STRUCT|JSON bags)
+  public interface IScalarFunction {                   // scope-independent: pure compute
+      string Name { get; }            // BARE name (registered as-is; arrownet_-prefixed by convention)
+      Schema Parameters { get; }      // arg fields (NullType sentinel = "any", reused from daxeval for STRUCT|JSON)
       Field Result { get; }           // fixed return type
-      IArrowArray Invoke(RecordBatch args);   // vectorized over the arg batch (same shape as IArrowScalarFunction)
+      IArrowArray Invoke(RecordBatch args);            // vectorized over the arg batch
+  }
+  public interface ICatalogScalarFunction : IScalarFunction {  // RENAME of IArrowScalarFunction
+      string SchemaName { get; }      // the only catalog-specific bit (db.schema.fn resolution)
   }
   ```
-  It is `IArrowScalarFunction` minus `SchemaName` (no catalog schema for a global). The execution body is
-  identical, so a tiny adapter lets the same code back both scopes if desired.
+  Globals declare `IBackend.GlobalScalarFunctions : IReadOnlyList<IScalarFunction>` directly — **no separate
+  global marker interface**, the base *is* the global contract. The `Invoke` body + the schema/execute dispatch
+  (`GetFunctionParamSchema`/`GetFunctionReturnSchema`/`ExecuteScalar`) all operate on `IScalarFunction`, so they
+  don't care whether resolution was catalog (by `schema.name` via the handle) or global (by `name` via the
+  registry). This **rename is behavior-preserving** (Liskov-clean: every catalog scalar *is* a scalar) and is
+  done as the first slice-1 step — it touches `IArrowScalarFunction.cs` + its implementors (the `Cf*` scalar
+  demos, `SqlServerScalarFunction`, `SqlServerBackend`'s `CustomScalar`/`ResolveScalar`/the three scalar
+  handlers); DAX has no scalar functions so it's untouched. Gate: `verify_scalar_functions` /
+  `verify_custom_functions` stay green. (The same base/derived split would extend to `IArrowTableFunction`/
+  in-out when global *table* functions eventually land — YAGNI until then.)
 - **Declaration**: `IBackend.GlobalScalarFunctions` (new property, default empty) — like `IBackend.Settings` /
   `SecretFields`. Each provider contributes its globals; the **Bridge `BackendRegistry` unions them** (plus an
   optional provider-agnostic *core* set) into a `GlobalScalarRegistry` keyed by name (case-insensitive).
@@ -130,8 +142,9 @@ effectful halves, exactly as deliberated.
 
 ## Recommendation (sequenced)
 
-1. **Global scalar functions** (this plan) — `list_global_functions` ABI + handle-0 reuse + `IArrowGlobalScalarFunction`
-   / `IBackend.GlobalScalarFunctions` + `RegisterArrowNetGlobalFunctions` at load + the `arrownet_render` demo.
+1. **Global scalar functions** (this plan) — the `IScalarFunction`/`ICatalogScalarFunction` rename, then
+   `list_global_functions` ABI + handle-0 reuse + `IBackend.GlobalScalarFunctions` +
+   `RegisterArrowNetGlobalFunctions` at load + the `arrownet_render` demo.
    Small, motivated, and unblocks the TMDL render step.
 2. **Global table functions** — deferred; the arg-dependent-schema + host-FS-opener wrinkles (keep delta bespoke
    until a 2nd lakehouse format lands; then give the global table-fn bind/execute path an opener arg). See
