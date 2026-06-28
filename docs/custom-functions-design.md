@@ -683,7 +683,7 @@ matched first). The in-out bind's `function_info.func` is the **base** TVF name 
 (yielding a per-input sentinel), not `Process`/`Finish`, and there is one `IArrowInOutFunction` registry. See
 CLAUDE.md "Streaming table-in-out exchange (Phase 6)". The original 4g push design is recorded below.)*
 Original (push) design (`IArrowTableInOutFunction`, the in-out analog of 4e
-`IArrowScalarFunction` / 4f `IArrowTableFunction`): a pure-C# in-out (streaming transform / running aggregate
+`ICatalogScalarFunction` / 4f `IArrowTableFunction`): a pure-C# in-out (streaming transform / running aggregate
 / whole-table summary) authored in the provider, dispatched through the *same* session machinery as the TVF
 CROSS APPLY. `Process(chunk)`/`Finish()` are invoked serially per session (no locking needed), and the
 function declares its **full** output schema (no input echo, unlike `_each`). Surfaced as `kind='inout'`;

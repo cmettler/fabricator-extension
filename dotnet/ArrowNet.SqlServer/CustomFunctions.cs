@@ -9,14 +9,14 @@ namespace ArrowNet.SqlServer;
 /// <summary>
 /// Provider-authored custom functions — scalar, table, table-in-out, and aggregate — surfaced into every
 /// attached catalog alongside the discovered SQL Server functions (resolved as <c>db.schema.name(args)</c>).
-/// To add one, implement the matching Bridge interface (<see cref="IArrowScalarFunction"/>,
+/// To add one, implement the matching Bridge interface (<see cref="ICatalogScalarFunction"/>,
 /// <see cref="IArrowTableFunction"/>, <see cref="IArrowInOutFunction"/> — or its fixed-schema convenience base
 /// <see cref="StaticInOutFunction"/> — or <see cref="IArrowAggregateFunction"/>) and list it in the
 /// corresponding array below. These run entirely in C# — there need be no corresponding SQL Server object.
 /// </summary>
 internal static class CustomFunctions
 {
-    public static readonly IReadOnlyList<IArrowScalarFunction> Scalar = new IArrowScalarFunction[]
+    public static readonly IReadOnlyList<ICatalogScalarFunction> Scalar = new ICatalogScalarFunction[]
     {
         new CfAddFunction(),
         new CfHostAnswerFunction(),
@@ -564,7 +564,7 @@ internal sealed class CfColumnsFunction : IArrowTableFunction
 // Host.Query and returns its scalar result for every input row. Proves the C#->host_query round-trip:
 // DuckDB -> this C# scalar -> host_query -> a fresh host connection -> Arrow -> back. The nested run is on a
 // FRESH connection, so the outer query's context is untouched (reentrancy-safe). See docs/host-query.md.
-internal sealed class CfHostAnswerFunction : IArrowScalarFunction
+internal sealed class CfHostAnswerFunction : ICatalogScalarFunction
 {
     public string SchemaName => "dbo";
     public string Name => "cf_host_answer";
@@ -592,7 +592,7 @@ internal sealed class CfHostAnswerFunction : IArrowScalarFunction
 // Demo: dbo.cf_host_sum(x) pushes a C#-built Arrow table INTO a host query (data-in) and sums it on the
 // host DuckDB engine: Host.Query registers the input as a connection-scoped view `in0` (via duckdb_arrow_scan)
 // and runs `SELECT sum(v) FROM in0`. Proves C#-provided Arrow streaming into the host. See docs/host-query.md.
-internal sealed class CfHostSumFunction : IArrowScalarFunction
+internal sealed class CfHostSumFunction : ICatalogScalarFunction
 {
     public string SchemaName => "dbo";
     public string Name => "cf_host_sum";
@@ -626,7 +626,7 @@ internal sealed class CfHostSumFunction : IArrowScalarFunction
 // Demo: dbo.cf_host_param(x) binds a 1-row Arrow params batch [40, 2] POSITIONALLY into a host query
 // (SELECT (?::BIGINT)+(?::BIGINT)) via a prepared statement on a fresh host connection -> 42. Proves
 // host_query parameter binding. host-query.md.
-internal sealed class CfHostParamFunction : IArrowScalarFunction
+internal sealed class CfHostParamFunction : ICatalogScalarFunction
 {
     public string SchemaName => "dbo";
     public string Name => "cf_host_param";
@@ -661,7 +661,7 @@ internal sealed class CfHostParamFunction : IArrowScalarFunction
 }
 
 // Demo: dbo.cf_add(a, b) -> a + b, computed in C# (no such object exists in SQL Server).
-internal sealed class CfAddFunction : IArrowScalarFunction
+internal sealed class CfAddFunction : ICatalogScalarFunction
 {
     public string SchemaName => "dbo";
     public string Name => "cf_add";

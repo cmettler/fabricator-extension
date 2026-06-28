@@ -9,14 +9,14 @@ using Microsoft.Data.SqlClient;
 namespace ArrowNet.SqlServer;
 
 /// <summary>
-/// A discovered SQL Server scalar UDF, expressed as an <see cref="IArrowScalarFunction"/> so the catalog
+/// A discovered SQL Server scalar UDF, expressed as an <see cref="ICatalogScalarFunction"/> so the catalog
 /// dispatches every scalar function — provider-authored C# and discovered SQL — through one uniform path.
 /// Parameter/return schemas come from <c>INFORMATION_SCHEMA</c> (via the catalog's shared schema queries);
 /// <see cref="Invoke"/> applies the UDF over the input batch with chunked, parameterized
 /// <c>SELECT [s].[f](@..) UNION ALL …</c> queries (≤ ~2100 params/query) and merges the per-chunk results
 /// into one result column. Created on demand per call (cheap — it holds only the catalog + name).
 /// </summary>
-internal sealed class SqlServerScalarFunction : IArrowScalarFunction
+internal sealed class SqlServerScalarFunction : ICatalogScalarFunction
 {
     private readonly SqlServerCatalog _catalog;
 

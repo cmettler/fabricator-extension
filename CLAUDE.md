@@ -89,7 +89,7 @@ current code still uses the single-provider `mssql_net` naming):
   **(4d) attach-time catalog-bound stored procedures DONE** (procs with a determinable result set resolved
   as table functions — `sp_describe` schema, `EXEC` execution, no pushdown — ABI v22; **named/optional
   params DONE (4d-2)**; **OUTPUT params + RETURN value as flat columns DONE (4d-3)**; multi-result-set +
-  INPUT/OUTPUT deferred); **(4e) attach-time custom C#-authored scalar functions DONE** (`IArrowScalarFunction`)
+  INPUT/OUTPUT deferred); **(4e) attach-time custom C#-authored scalar functions DONE** (`ICatalogScalarFunction`)
   **+ (4f) custom table functions DONE** (`IArrowTableFunction`) — both reuse the catalog scalar/TVF path,
   C#-only, no ABI; chosen over load-time global (deferred). **(4g) table-in-out DONE** (ABI v23 —
   `inout_open`/`push`/`finish`/`abort`; full plan + corrections:
@@ -635,8 +635,8 @@ A DuckDB-faithful `Bind`/`Binding` model + expressing SQL-Server functions as th
 Complete: scalar wrappers, arg-dependent table output schema, in-out, the TVF/proc wrapper extraction, the
 v29 table-function session, and the v30 removal of the dead `execute_table`/`execute_proc`.
 - **Scalar — DONE** (`refactor(scalar)`, commit `60ea6f0`): discovered SQL UDFs are a `SqlServerScalarFunction
-  : IArrowScalarFunction` (in `SqlServerScalarFunction.cs`) — `ResolveScalar` returns a custom registry entry
-  or the wrapper, so `ExecuteScalar`/param/return-schema dispatch through ONE `IArrowScalarFunction` path. The
+  : ICatalogScalarFunction` (in `SqlServerScalarFunction.cs`) — `ResolveScalar` returns a custom registry entry
+  or the wrapper as the base `IScalarFunction`, so `ExecuteScalar`/param/return-schema dispatch through ONE path. The
   chunked `SELECT [s].[f](@..) UNION ALL` (≤2100-param cap) moved into the wrapper's single-batch `Invoke`; the
   per-cap sub-queries merge into one column via a typed builder (no `ArrowArrayConcatenator`). C#-only, no ABI.
 - **Table `Bind` — DONE** (`feat(table)`, commit `85de4df`, **ABI v27**): `IArrowTableFunction.Bind(RecordBatch
@@ -725,7 +725,7 @@ v29 table-function session, and the v30 removal of the dead `execute_table`/`exe
 
 ### Custom (provider-authored) functions (4e scalar, 4f table)
 - Beyond functions *discovered* from SQL Server, a provider can **author custom functions in C#**:
-  - **4e scalar** — `IArrowScalarFunction` (Bridge) = `SchemaName`/`Name`/`Parameters`(arg fields)/
+  - **4e scalar** — `ICatalogScalarFunction` (Bridge, derives the base `IScalarFunction`) = `SchemaName`/`Name`/`Parameters`(arg fields)/
     `Result`(field)/`Invoke(RecordBatch)→IArrowArray`. Demo `CustomFunctions.Scalar`: `dbo.cf_add(a,b)=a+b`.
   - **4f table** — `IArrowTableFunction` (Bridge) = `SchemaName`/`Name`/`Parameters` + `Bind(args) →
     IArrowTableFunctionBinding` (`OutputSchema` + `IAsyncEnumerable<RecordBatch> Execute(scan, ct)` — args = the
@@ -749,7 +749,7 @@ v29 table-function session, and the v30 removal of the dead `execute_table`/`exe
 - **Attach-time + catalog-bound** (`db.schema.fn`), not connection-free globals — chosen over load-time
   global functions because it avoids booting the CLR at `Extension::Load()` and needs no new ABI. (Load-time
   global via `loader.RegisterFunction` remains an option if connection-free functions are ever needed; the
-  same `IArrowScalarFunction` authoring + the existing `execute_scalar` with a handle-less marker would reuse
+  same `IScalarFunction` authoring + the existing `execute_scalar` with a handle-less marker would reuse
   this path.)
 - **Verified**: scalar `db.dbo.cf_add(2,3)=5`, vectorized, NULL→NULL; table `cf_range(3)`→`(1,1),(2,4),(3,9)`
   with projection (`squared` only) + filter (`value>1`) + aggregation; both discovered (`scalar`/`table`)
@@ -805,7 +805,7 @@ v29 table-function session, and the v30 removal of the dead `execute_table`/`exe
   exchange (Phase 6)". The per-chunk semantics are unchanged; the original push wiring below is historical.*
   Original (push) design: `IArrowTableInOutFunction` (Bridge) =
   `SchemaName`/`Name`/`InputSchema`/`OutputSchema` + `IEnumerable<RecordBatch> Process(chunk)` (the in-out
-  analog of 4e `IArrowScalarFunction` / 4f `IArrowTableFunction`). A pure-C# **per-chunk streaming**
+  analog of 4e `ICatalogScalarFunction` / 4f `IArrowTableFunction`). A pure-C# **per-chunk streaming**
   table-in-out (no SQL object) that may keep mutable state across chunks (running aggregate — `Process` is
   invoked serially per session) and declares its **full** output (no input echo). There is no emit-at-end
   hook (a whole-table aggregate is a pipeline breaker, not a streaming in-out). Surfaced via

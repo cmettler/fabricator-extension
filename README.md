@@ -461,7 +461,7 @@ SELECT sum, diff, return_value FROM mssql.dbo.usp_addsub(a := 10, b := 3);   -- 
 ### Custom (provider-authored) functions
 
 You can author functions in **C#** (no SQL Server object needed) and they surface into every attached
-catalog like discovered ones. Implement `IArrowScalarFunction`, `IArrowTableFunction`,
+catalog like discovered ones. Implement `ICatalogScalarFunction`, `IArrowTableFunction`,
 `IArrowInOutFunction`, or `IArrowAggregateFunction` (in `ArrowNet.Bridge`) and register them in
 `CustomFunctions` — each receives an Arrow `RecordBatch` and returns Arrow, fully vectorized.
 

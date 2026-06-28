@@ -308,7 +308,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // Provider-authored custom scalar functions, keyed "schema.name" (case-insensitive). Surfaced into
     // the catalog like discovered functions (see GetMetadata) but dispatched to C# (see ExecuteScalar /
     // GetFunctionParamSchema / GetFunctionReturnSchema) instead of generating SQL.
-    private static readonly IReadOnlyDictionary<string, IArrowScalarFunction> CustomScalar =
+    private static readonly IReadOnlyDictionary<string, ICatalogScalarFunction> CustomScalar =
         CustomFunctions.Scalar.ToDictionary(f => $"{f.SchemaName}.{f.Name}", StringComparer.OrdinalIgnoreCase);
 
     // Provider-authored custom table functions, keyed "schema.name" (case-insensitive). Surfaced like
@@ -1751,15 +1751,16 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         return ExecuteQuery($"SELECT CAST(NULL AS {ret[0].sqlType}) AS result WHERE 1 = 0");
     }
 
-    // Resolves a scalar function to its IArrowScalarFunction implementation: a provider-authored custom
+    // Resolves a scalar function to its IScalarFunction implementation: a provider-authored custom
     // function if registered, else a SqlServerScalarFunction wrapping the discovered SQL UDF. One uniform
-    // dispatch for ExecuteScalar (created on demand — the wrapper just holds the catalog + name).
-    private IArrowScalarFunction ResolveScalar(string schemaName, string functionName) =>
+    // dispatch for ExecuteScalar (created on demand — the wrapper just holds the catalog + name). Returns the
+    // base IScalarFunction — execution needs only Invoke/Parameters/Result, not the catalog SchemaName.
+    private IScalarFunction ResolveScalar(string schemaName, string functionName) =>
         CustomScalar.TryGetValue($"{schemaName}.{functionName}", out var custom)
             ? custom
             : new SqlServerScalarFunction(this, schemaName, functionName);
 
-    // Executes a scalar function over the input batches by dispatching to the resolved IArrowScalarFunction
+    // Executes a scalar function over the input batches by dispatching to the resolved IScalarFunction
     // (a custom C# function, or a SqlServerScalarFunction wrapping the discovered SQL UDF). Each input batch's
     // results become one output batch; the result column is typed by the function's result (the C++ side
     // ingests by position). The SQL UDF's chunking under the ~2100-parameter cap lives in its Invoke.
