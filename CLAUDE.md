@@ -1094,7 +1094,17 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   host-FS table fn writing a fixed 5-row Delta table via engineered-wood (`DeltaWriteMode.Overwrite`,
   idempotent), validated end-to-end (write+read round-trip) on **local AND a live OneLake lakehouse** (SP
   azure secret). `test/verify_delta_write.test`. Single-writer; concurrent commits work where `EXCLUSIVE_CREATE`
-  is honored (OneLake/POSIX — not Windows local). See docs/delta-catalog.md + docs/filesystem-bridge.md. v47 =
+  is honored (OneLake/POSIX — not Windows local). **Portability (validated with delta-kernel-rs, the reference
+  reader, via DuckDB's official `delta` extension): engineered-wood's defaults are NOT standard-readable (incl.
+  Fabric) — three fixes:** (1) `metaData.format.options` + (2) `metaData.configuration` always emitted
+  (engineered-wood `ActionSerializer` — were omitted when empty/null, non-nullable for strict readers); (3)
+  parquet `path_in_schema` (engineered-wood `OmitPathInSchema` defaults TRUE → drops this REQUIRED field →
+  `TProtocolException: Invalid data`) — fixed our side via `ParquetWriteOptions { OmitPathInSchema = false }` in
+  `DeltaWriteDemoFunction`. With all three, delta-kernel-rs reads it locally; a fresh `Tables/dbo/arrownet` table
+  written to OneLake for Fabric. (#1/#2 are engineered-wood-repo patches; #3 is a write option. DuckDB's official
+  `delta_scan` can't LIST a OneLake `_delta_log` — a delta-kernel azure/secret quirk, "No files in log segment" —
+  so OneLake validation is via our reader + the local delta-kernel read. A table written BEFORE the fixes stays
+  broken on its version-0 metaData → write a fresh one.) See docs/delta-catalog.md + docs/filesystem-bridge.md. v47 =
   **host-FS global table functions**: appended one vtable entry `set_active_opener(opener)` — a per-thread ambient (`AmbientOpener`, mirroring `set_active_txn`) recording the
   calling operator's `ClientContext` so a connection-free GLOBAL host-FS table reader (a lakehouse format)
   resolves DuckDB secrets while reading through the host `fs_*` callbacks; set in the shared `PopulateReturnSchema`

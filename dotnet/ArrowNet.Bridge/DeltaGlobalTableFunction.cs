@@ -6,6 +6,7 @@ using Apache.Arrow;
 using Apache.Arrow.Ipc;
 using Apache.Arrow.Types;
 using EngineeredWood.DeltaLake.Table;
+using EngineeredWood.Parquet;
 
 namespace ArrowNet.Bridge;
 
@@ -197,7 +198,16 @@ public sealed class DeltaWriteDemoFunction : ITableFunction
         }
         var batch = new RecordBatch(schema, new IArrowArray[] { ids.Build(), names.Build() }, rows);
 
-        var table = DeltaTable.OpenOrCreateAsync(fs, schema, cancellationToken: ct).AsTask().GetAwaiter().GetResult();
+        // engineered-wood defaults OmitPathInSchema=true, which drops the `path_in_schema` field from each
+        // column chunk's parquet footer. That field is REQUIRED in the shipping Parquet Thrift definitions used
+        // by DuckDB (Apache Thrift C++), arrow-rs/delta-kernel, and Fabric — omitting it makes them reject the
+        // file ("TProtocolException: Invalid data" = required-field-missing). Force it on for portable output.
+        var options = DeltaTableOptions.Default with
+        {
+            ParquetWriteOptions = new ParquetWriteOptions { OmitPathInSchema = false },
+        };
+        var table = DeltaTable.OpenOrCreateAsync(fs, schema, options, cancellationToken: ct)
+            .AsTask().GetAwaiter().GetResult();
         try
         {
             // Overwrite so the demo is idempotent (the table is always exactly these 5 rows, re-run-safe).

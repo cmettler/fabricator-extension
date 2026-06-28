@@ -238,6 +238,23 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
    host-FS table fn (writes a 5-row Delta table via engineered-wood, idempotent Overwrite, round-trips with
    `arrownet_delta_scan`) — `test/verify_delta_write.test`. Single-writer; concurrent commits are safe where
    `EXCLUSIVE_CREATE` is honored (OneLake/POSIX).
+   - **Portability of engineered-wood output (validated with the REFERENCE reader, delta-kernel-rs via DuckDB's
+     official `delta` extension).** engineered-wood's defaults are NOT readable by standard Delta/parquet tooling
+     (incl. Microsoft Fabric); three fixes were required so a written table reads in delta-kernel-rs / DuckDB
+     native / Fabric:
+     1. **`metaData.format.options`** — engineered-wood omitted it when empty; it's non-nullable for strict
+        readers. Fixed in engineered-wood `ActionSerializer` (always emit `"options":{}`).
+     2. **`metaData.configuration`** — same (omitted when null). Fixed (always emit `{}`).
+     3. **parquet `path_in_schema`** — engineered-wood's `ParquetWriteOptions.OmitPathInSchema` defaults `true`,
+        dropping this REQUIRED column-chunk field → standard parquet readers throw `TProtocolException: Invalid
+        data` (Apache-Thrift "required field missing"). Fixed on our side: write with
+        `ParquetWriteOptions { OmitPathInSchema = false }`.
+     With all three, delta-kernel-rs reads the table locally. (#1/#2 are engineered-wood-repo patches alongside
+     the existing `ActionSerializer` fix; #3 is our write option.) NOTE: DuckDB's official `delta_scan` can't
+     LIST a OneLake `_delta_log` (delta-kernel azure object_store + DuckDB-secret quirk: "No files in log
+     segment") so it can't validate on OneLake — but our own reader does, and the local delta-kernel read proves
+     the format. A table written before these fixes stays broken on its version-0 `metaData`; write a FRESH
+     table.
 1. **Folder-root `DeltaCatalog` + read** — `DeltaBackend`/`DeltaCatalog` (3rd `IBackend`), `fs_glob` table
    discovery, flat `main` schema, scan via the existing `DeltaReader`. ~All C#, no new C++. Proves ATTACH +
    `SELECT FROM lake.t`.
