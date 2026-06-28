@@ -422,9 +422,19 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   fully self-describing** — **design:
   [docs/provider-extensibility.md](docs/provider-extensibility.md)** (the unified "provider declares; core
   stays name-agnostic" model).
-- **Plugin system (ALC isolation)** — **design only, deferred: [docs/plugin-system.md](docs/plugin-system.md)**.
-  A plugin SPI where each plugin folder contributes `IBackend`(s) + global functions, optionally isolated in its
-  own `AssemblyLoadContext` so plugins with conflicting managed deps coexist. Works on our CoreCLR host. **Crux:
+- **Plugin system (third-party backends + global functions)** — **default-context SPI BUILT + verified; ALC
+  isolation deferred: [docs/plugin-system.md](docs/plugin-system.md)**. A plugin dropped into an
+  **`ARROWNET_PLUGIN_DIR`** folder is discovered at load (`BackendRegistry.ScanPluginDirectories`), its
+  `IBackend`(s) registered + global functions surfaced as bare `fn(...)` with NO ATTACH — no ABI/C++ change (the
+  scan runs in `Discover()` before the `list_global_functions` union). Demo `ArrowNet.SamplePlugin`'s
+  `plug_greet` (`test/verify_plugin.test`). **Key finding: plugins load into the BRIDGE's ALC**
+  (`AssemblyLoadContext.GetLoadContext(typeof(BackendRegistry).Assembly)`), NOT `Default` — hostfxr loads the
+  bridge into a non-default context, so loading into Default bound the plugin to a separate `ArrowNet.Bridge`
+  copy (different, non-assignable `IBackend` → 0 backends). The loader skips host-context-loaded assemblies (the
+  shared set) + a `Resolving` hook probes plugin dirs for private deps. **Plugins must align their full
+  dependency closure with the host (Apache.Arrow always)** — no version isolation without ALC. Per-plugin
+  `AssemblyLoadContext` isolation (for conflicting deps) is a deferred, non-breaking loader-internal upgrade
+  (+ a thin `ArrowNet.Abstractions` extraction). **Crux for that day:
   `Apache.Arrow`(+`.C`) MUST be SHARED (default context), never isolated** — every cross-boundary call traffics
   Arrow types, and cross-ALC types aren't assignable, so all plugins pin the bridge's Arrow version (isolation
   frees their OTHER deps only). The one fix over the textbook sketch: the `PluginLoadContext.Load` must return

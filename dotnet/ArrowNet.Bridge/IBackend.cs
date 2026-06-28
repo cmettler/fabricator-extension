@@ -397,26 +397,119 @@ public static class BackendRegistry
             try
             {
                 var assembly = System.Reflection.Assembly.Load(assemblyName);
-                foreach (var type in assembly.GetTypes())
-                {
-                    if (!type.IsAbstract && typeof(IBackend).IsAssignableFrom(type) &&
-                        type.GetConstructor(Type.EmptyTypes) != null)
-                    {
-                        var backend = (IBackend)Activator.CreateInstance(type)!;
-                        Add(map, backend);
-                        _defaultProvider ??= Environment.GetEnvironmentVariable("ARROWNET_DEFAULT_PROVIDER") ?? backend.Name;
-                    }
-                }
+                RegisterBackendsFrom(assembly, map);
             }
             catch
             {
                 // Assembly missing/unloadable — skip it; fall back to the stub below if nothing registered.
             }
         }
+        ScanPluginDirectories(map);
         if (map.Count == 0)
         {
             Add(map, new StubBackend());
         }
         return map;
+    }
+
+    private static void RegisterBackendsFrom(System.Reflection.Assembly assembly, Dictionary<string, IBackend> map)
+    {
+        foreach (var type in assembly.GetTypes())
+        {
+            if (!type.IsAbstract && typeof(IBackend).IsAssignableFrom(type) &&
+                type.GetConstructor(Type.EmptyTypes) != null)
+            {
+                var backend = (IBackend)Activator.CreateInstance(type)!;
+                Add(map, backend);
+                _defaultProvider ??= Environment.GetEnvironmentVariable("ARROWNET_DEFAULT_PROVIDER") ?? backend.Name;
+            }
+        }
+    }
+
+    // Third-party plugin discovery (docs/plugin-system.md). ARROWNET_PLUGIN_DIR is a comma-separated list of
+    // folders; every assembly in each is loaded into the DEFAULT context (no AssemblyLoadContext isolation —
+    // deferred until a real dep conflict lands) and reflected for IBackend, whose backends + global functions
+    // register like the built-in providers. A plugin references ArrowNet.Bridge + Apache.Arrow (host-provided,
+    // not copied), so its IBackend resolves to the default-context one and IsAssignableFrom works. Plugins must
+    // align their full dependency closure with the host (Apache.Arrow especially) — there is no version
+    // isolation without ALC.
+    private static void ScanPluginDirectories(Dictionary<string, IBackend> map)
+    {
+        var dirsEnv = Environment.GetEnvironmentVariable("ARROWNET_PLUGIN_DIR");
+        if (string.IsNullOrWhiteSpace(dirsEnv))
+        {
+            return;
+        }
+        var dirs = dirsEnv.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                          .Where(System.IO.Directory.Exists)
+                          .Select(System.IO.Path.GetFullPath)
+                          .ToArray();
+        // Load plugins into the BRIDGE's own ALC, not Default: hostfxr loads the bridge into a non-default
+        // context, so a plugin must be loaded into that same context for its ArrowNet.Bridge / Apache.Arrow
+        // references to resolve to the RUNNING bridge (else it binds to a separate copy and its IBackend is a
+        // different, non-assignable type). The same ALC's loaded assemblies are the shared set to skip.
+        var host = System.Runtime.Loader.AssemblyLoadContext.GetLoadContext(typeof(BackendRegistry).Assembly)
+                   ?? System.Runtime.Loader.AssemblyLoadContext.Default;
+        InstallPluginResolver(host, dirs); // so a plugin's private transitive deps resolve from its own folder
+        // Skip assemblies already loaded in the host context (the shared set — ArrowNet.Bridge, Apache.Arrow,
+        // the built-in providers): reflecting a plugin-dir copy of ArrowNet.Bridge would otherwise re-register
+        // its StubBackend. So only genuinely-new assemblies (the plugin entry + its private deps) are loaded.
+        var loaded = new HashSet<string>(
+            host.Assemblies.Select(a => a.GetName().Name).Where(n => n != null)!,
+            StringComparer.OrdinalIgnoreCase);
+        foreach (var dir in dirs)
+        {
+            foreach (var dll in System.IO.Directory.GetFiles(dir, "*.dll"))
+            {
+                if (loaded.Contains(System.IO.Path.GetFileNameWithoutExtension(dll)))
+                {
+                    continue; // shared/already-loaded — host provides it
+                }
+                try
+                {
+                    var assembly = host.LoadFromAssemblyPath(System.IO.Path.GetFullPath(dll));
+                    RegisterBackendsFrom(assembly, map);
+                }
+                catch
+                {
+                    // Not a plugin entry, or a native/unloadable dll — skip.
+                }
+            }
+        }
+    }
+
+    private static bool _pluginResolverInstalled;
+
+    // Resolve a plugin's transitive deps from the plugin folders (probing the bridge's own context — no
+    // isolation, so first-found wins across plugins; that's the documented trade vs. an ALC per plugin).
+    private static void InstallPluginResolver(System.Runtime.Loader.AssemblyLoadContext host, string[] dirs)
+    {
+        lock (Gate)
+        {
+            if (_pluginResolverInstalled || dirs.Length == 0)
+            {
+                return;
+            }
+            _pluginResolverInstalled = true;
+            host.Resolving += (ctx, name) =>
+            {
+                foreach (var dir in dirs)
+                {
+                    var candidate = System.IO.Path.Combine(dir, name.Name + ".dll");
+                    if (System.IO.File.Exists(candidate))
+                    {
+                        try
+                        {
+                            return ctx.LoadFromAssemblyPath(candidate);
+                        }
+                        catch
+                        {
+                            // keep probing other dirs
+                        }
+                    }
+                }
+                return null;
+            };
+        }
     }
 }

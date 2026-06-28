@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <RootNamespace>ArrowNet.SamplePlugin</RootNamespace>
+    <AssemblyName>ArrowNet.SamplePlugin</AssemblyName>
+    <Description>
+      A sample THIRD-PARTY plugin for the arrownet bridge: a connection-free IBackend that contributes a
+      global scalar function (plug_greet). Built to a folder and discovered via ARROWNET_PLUGIN_DIR; it
+      references ArrowNet.Bridge + Apache.Arrow as HOST-PROVIDED (Private=false, not copied), so at runtime
+      they resolve to the bridge's default-context copies. See docs/plugin-system.md.
+    </Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Host-provided: referenced for the contracts (and Apache.Arrow transitively), but NOT copied — the
+         loaded bridge supplies them in the default context. -->
+    <ProjectReference Include="..\ArrowNet.Bridge\ArrowNet.Bridge.csproj" Private="false" />
+  </ItemGroup>
+
+</Project>

@@ -1,11 +1,27 @@
-# Plugin system (AssemblyLoadContext isolation) — design idea, DEFERRED
+# Plugin system (third-party backends + global functions)
 
-> Status: **design note only — nothing built.** A plugin SPI where each plugin (a folder of managed assemblies
-> + its `deps.json`) contributes one or more **backends** (`IBackend`) and **global functions**, optionally
-> isolated in its own `AssemblyLoadContext` (ALC) so plugins with conflicting transitive dependencies can
-> coexist (the diamond-dependency problem). Builds on `BackendRegistry` (the current provider discovery) +
+> Status: **default-context SPI BUILT + verified; ALC isolation DEFERRED.** A plugin (a folder of managed
+> assemblies) dropped into an **`ARROWNET_PLUGIN_DIR`** folder is discovered at load, its `IBackend`(s)
+> registered, and its **global functions** surfaced as a bare `fn(...)` with NO ATTACH — verified end-to-end
+> (`ArrowNet.SamplePlugin`'s `plug_greet`, `test/verify_plugin.test`). Loaded into the **default (non-isolated)**
+> context for now; per-plugin `AssemblyLoadContext` **isolation** (for conflicting transitive deps) is the
+> deferred upgrade — a loader-internal swap, no contract change. Builds on `BackendRegistry` +
 > [docs/global-functions.md](global-functions.md) + [docs/provider-extensibility.md](provider-extensibility.md).
-> Works on our CoreCLR host; the load-bearing constraint is that **Apache.Arrow must be shared, never isolated**.
+> The load-bearing constraint regardless of ALC: **Apache.Arrow must be shared, never isolated**.
+>
+> **As-built (no-ALC SPI)** — the one non-obvious real-world finding: hostfxr loads the bridge into a
+> **non-default ALC**, so the loader must load plugins into the **bridge's own context**
+> (`AssemblyLoadContext.GetLoadContext(typeof(BackendRegistry).Assembly)`), NOT `AssemblyLoadContext.Default`.
+> Loading into Default made the plugin bind to a *separate* copy of `ArrowNet.Bridge` (from the plugin dir) → its
+> `IBackend` was a different, non-assignable type → 0 backends registered. The loader (`BackendRegistry`):
+> splits `ARROWNET_PLUGIN_DIR` (comma list of dirs), installs a `Resolving` hook on the host context (probes the
+> plugin dirs for a plugin's private transitive deps), skips assemblies already loaded in the host context (the
+> shared set — `ArrowNet.Bridge`, `Apache.Arrow`, built-in providers — so a plugin-dir copy of the bridge isn't
+> reflected + its `StubBackend` re-registered), and `LoadFromAssemblyPath`s the rest into the host context,
+> reflecting for `IBackend`. The scan runs inside `Discover()` (first `BackendRegistry.All()`, at load — before
+> the `list_global_functions` union), so a plugin's global functions register with **no ABI/C++ change**. No-op
+> when `ARROWNET_PLUGIN_DIR` is unset. Sample: `dotnet/ArrowNet.SamplePlugin` (a catalog-less `IBackend` whose
+> only job is to contribute the global scalar `plug_greet`), built to a folder and pointed at via the env var.
 
 ## Why / when
 
@@ -130,20 +146,23 @@ discipline (and the restrictions collectible ALCs impose). We never unload a plu
 - **Reflection across ALCs** works only through the shared contracts — a plugin type is matched via the
   default-context `IBackend`; never reflect over a plugin's private types from the host.
 
-## Recommendation (sequenced; build on demand)
+## Recommendation (sequenced)
 
-1. **Extract `ArrowNet.Abstractions`** (the contract surface) and have `ArrowNet.Bridge` reference it. Pure
-   refactor, no behavior change — the natural prerequisite, and useful on its own (a stable, minimal SPI surface
-   that decouples providers from the ABI internals).
-2. **A plugin-dir loader** with the shared-name allowlist `Load` above (non-collectible), additive beside the
-   default-context `BackendRegistry` reflection. First-party providers stay in the default context; external
-   plugins go in per-plugin ALCs.
-3. **Adopt ALC isolation only when a real conflict or a third-party plugin lands** — two version-aligned
-   first-party providers gain nothing from it and pay the cost (per-plugin `deps.json`, the allowlist, the
-   "don't copy the shared set" build config, the native-dep caveat).
+1. **Default-context plugin-dir loader — DONE** (this build): `ARROWNET_PLUGIN_DIR` scan in `BackendRegistry`,
+   plugins loaded into the **bridge's** ALC (not Default — see As-built), additive beside the env-assembly
+   discovery. Plugins reference `ArrowNet.Bridge` directly (no `Abstractions` needed without ALC — everything is
+   one context). Sample plugin + `verify_plugin.test`. **Plugins must align their full dependency closure with
+   the host** (Apache.Arrow always; every other shared dep too — there is no version isolation without ALC).
+2. **Extract `ArrowNet.Abstractions`** (deferred) — the contract surface (interfaces + Arrow-typed POCOs), so
+   plugins bind to a minimal stable SPI instead of the whole bridge. Pure refactor; the prerequisite for ALC.
+3. **ALC isolation** (deferred) — a loader-internal swap (`host.LoadFromAssemblyPath` → a per-plugin
+   `PluginLoadContext`) with the shared-name allowlist `Load` above (non-collectible). **Adopt only when a real
+   dependency conflict / a third-party plugin with conflicting managed deps lands** — version-aligned plugins
+   gain nothing and pay the cost (per-plugin `deps.json`, the allowlist, the "don't copy the shared set" build
+   config, the native-dep caveat). The contract + the plugin packaging do NOT change when isolation is turned on.
 
-**Net:** the sketch is sound for our CoreCLR host; the single must-fix is the explicit shared-name allowlist in
-`Load` (the resolver would otherwise isolate Apache.Arrow and break every Arrow-typed call); the clean shape is
-a thin shared `ArrowNet.Abstractions` + `Apache.Arrow` + non-collectible per-plugin ALCs, kept as an opt-in path
-beside the default-context first-party providers. Worth designing the SPI now; worth turning on isolation only
-when a dependency conflict actually appears.
+**Net:** the SPI is built and works on our CoreCLR host without ALC — third-party plugins contribute backends +
+global functions today, provided they align their dependency closure with the host (Apache.Arrow always). ALC
+isolation is a non-breaking later upgrade to the loader, worth turning on only when a genuine dep conflict
+appears; the must-fix for that day is the explicit shared-name allowlist in `Load` (the resolver would otherwise
+isolate Apache.Arrow and break every Arrow-typed call).
