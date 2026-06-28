@@ -202,9 +202,29 @@ a portable put-if-absent / atomic-no-overwrite.
   coordinator (Delta-on-S3's historical DynamoDB pattern); (b) a dedicated put-if-absent **host callback that
   bypasses `FileSystem`** and uses the store's native conditional create (Azure `If-None-Match: *`, S3 conditional
   PUT, POSIX `O_CREAT|O_EXCL`) — i.e. don't route the commit through DuckDB's `MoveFile`; (c) accept single-writer.
-- **Next probe (decisive for the cloud target):** run `arrownet_fs_write_probe('abfss://…onelake…')` with a DuckDB
-  azure secret — object-store FS semantics (does azfs honor `EXCLUSIVE_CREATE`?) differ from local and determine
-  which option above is needed. Not yet run (no live OneLake path wired in this environment).
+**OneLake (`abfss://Test@onelake.dfs.fabric.microsoft.com/LH.Lakehouse/Files/test`) — full probe, validated
+live (`azure`+`httpfs` autoloaded; service-principal azure secret):**
+- write / read-back / `FileExists` / `RemoveFile` / `TryRemoveFile` / `CreateDirectory` all **work**.
+- **`EXCLUSIVE_CREATE` IS HONORED on OneLake/ADLS DFS** — exclusive create on an existing file threw
+  *"AzureDfsStorageFileSystem will not open file: … ExclusiveCreate specified while file already exists."*, and
+  on a new path it succeeded. So the **put-if-absent commit primitive EXISTS on the real cloud target** (unlike
+  Windows local, which ignores the flag). This is the key positive result.
+- **`MoveFile` is NOT IMPLEMENTED on Azure DFS** — *"AzureDfsStorageFileSystem: MoveFile is not implemented!"*.
+- Azure DFS writes are **sequential or at location=0 only** (no random mid-file writes) — fine for Parquet/JSON
+  which are written sequentially.
+
+**Conclusion (flips positive): safe concurrent Delta commits ARE achievable on OneLake through DuckDB's
+FileSystem — but the commit must write `N.json` DIRECTLY with `EXCLUSIVE_CREATE`, never via temp+rename**
+(MoveFile throws there). engineered-wood's `TransactionLog.WriteCommitAsync` hardcodes temp+rename, so a
+write-back needs the commit routed through a direct exclusive-create instead — either a small engineered-wood
+addition (a put-if-absent commit-write) or our own commit step that calls a put-if-absent host-FS write
+(`WRITE|FILE_CREATE|EXCLUSIVE_CREATE`) and maps the throw to `DeltaConflictException` → reopen → retry.
+- Caveat — the matrix is FS-specific: Windows local ignores `EXCLUSIVE_CREATE` (no guard) and `MoveFile`
+  overwrites; POSIX local has `O_CREAT|O_EXCL` but `MoveFile` overwrites (FIXME); OneLake/ADLS honors
+  `EXCLUSIVE_CREATE` but has no `MoveFile`. So the **commit path must be exclusive-create everywhere** (the one
+  primitive that's safe on the cloud target), with local-Windows treated as single-writer/dev-only.
+- The SP used was the Fabric-Warehouse service principal; it has OneLake Files read+write here, so one secret
+  serves SQL endpoint + OneLake (matches the v39 foreign-secret reuse).
 
 ## Recommendation (sequenced; build on demand)
 
