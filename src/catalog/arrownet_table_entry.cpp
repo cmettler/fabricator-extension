@@ -386,9 +386,10 @@ void ArrowNetComplexFilterPushdown(ClientContext &, LogicalGet &get, FunctionDat
 }
 
 ArrowNetTableEntry::ArrowNetTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
-                                       ArrowNetHandle handle, vector<idx_t> rowid_columns, LogicalType rowid_type)
+                                       ArrowNetHandle handle, vector<idx_t> rowid_columns, LogicalType rowid_type,
+                                       vector<string> virtual_rowid_columns)
     : TableCatalogEntry(catalog, schema, info), handle_(handle), rowid_columns_(std::move(rowid_columns)),
-      rowid_type_(std::move(rowid_type)) {
+      virtual_rowid_columns_(std::move(virtual_rowid_columns)), rowid_type_(std::move(rowid_type)) {
 }
 
 // Cardinality callback: hands the optimizer the table's approximate row count so
@@ -481,6 +482,7 @@ TableFunction ArrowNetTableEntry::BuildScanFunction(ClientContext &context, uniq
 
 	// Propagate rowid info so the scan can synthesize the rowid column.
 	data->rowid_source_columns = rowid_columns_;
+	data->virtual_rowid_columns = virtual_rowid_columns_; // Delta `_metadata.row_id` (not a user column)
 	data->rowid_type = rowid_type_;
 	data->table = this; // lets LogicalGet::GetTable() resolve (UPDATE/DELETE)
 
@@ -517,8 +519,9 @@ TableStorageInfo ArrowNetTableEntry::GetStorageInfo(ClientContext &context) {
 
 virtual_column_map_t ArrowNetTableEntry::GetVirtualColumns() const {
 	virtual_column_map_t result;
-	if (!rowid_columns_.empty()) {
-		// Expose a rowid backed by the PK / unique-index columns.
+	if (HasRowId()) {
+		// Expose a rowid backed by the PK / unique-index columns (SQL Server) or a virtual
+		// provider column (Delta `_metadata.row_id`).
 		result.insert(make_pair(COLUMN_IDENTIFIER_ROW_ID, TableColumn("rowid", rowid_type_)));
 	}
 	// Otherwise no virtual columns (no DuckDB rowid) — scans then don't require
@@ -528,7 +531,7 @@ virtual_column_map_t ArrowNetTableEntry::GetVirtualColumns() const {
 
 vector<column_t> ArrowNetTableEntry::GetRowIdColumns() const {
 	vector<column_t> result;
-	if (!rowid_columns_.empty()) {
+	if (HasRowId()) {
 		result.push_back(COLUMN_IDENTIFIER_ROW_ID);
 	}
 	return result;

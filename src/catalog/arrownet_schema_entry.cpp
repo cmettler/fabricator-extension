@@ -167,8 +167,15 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateEntry(ClientContext &
 			}
 		}
 	}
-	if (rowid_indices.size() != rowid_names.size()) {
-		rowid_indices.clear(); // unresolved column — disable rowid rather than risk a bad key
+
+	// A rowid name that resolves to no user column is a VIRTUAL rowid: a provider-supplied row identity that
+	// is not part of the visible schema (the Delta catalog's stable `_metadata.row_id`). SQL Server's rowid is
+	// always real PK/unique columns, so they all resolve and this branch never triggers there.
+	vector<string> virtual_rowid_columns;
+	if (!rowid_names.empty() && rowid_indices.empty()) {
+		virtual_rowid_columns = rowid_names; // none resolved as a user column => treat all as virtual
+	} else if (rowid_indices.size() != rowid_names.size()) {
+		rowid_indices.clear(); // a partial/mixed resolution is a bad key — disable rowid rather than risk it
 	}
 
 	LogicalType rowid_type = LogicalType::BIGINT;
@@ -180,10 +187,18 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateEntry(ClientContext &
 			children.push_back(make_pair(names[idx], types[idx]));
 		}
 		rowid_type = LogicalType::STRUCT(std::move(children));
+	} else if (virtual_rowid_columns.size() > 1) {
+		// Compound virtual key (not used by the Delta provider, which has a single BIGINT row id) — STRUCT
+		// of BIGINTs keyed by the virtual names.
+		child_list_t<LogicalType> children;
+		for (auto &vn : virtual_rowid_columns) {
+			children.push_back(make_pair(vn, LogicalType::BIGINT));
+		}
+		rowid_type = LogicalType::STRUCT(std::move(children));
 	}
 
 	auto entry = make_uniq<ArrowNetTableEntry>(catalog, *this, info, handle_, std::move(rowid_indices),
-	                                           std::move(rowid_type));
+	                                           std::move(rowid_type), std::move(virtual_rowid_columns));
 	auto &ref = *entry;
 	entries_[table_name] = std::move(entry);
 	return &ref;

@@ -69,4 +69,67 @@ internal static class DeltaReader
             await table.DisposeAsync().ConfigureAwait(false);
         }
     }
+
+    /// <summary>Like <see cref="Stream"/> but each batch carries a trailing non-null Int64
+    /// <c>_metadata.row_id</c> column (the stable row-tracking id) — used to surface the DuckDB rowid for
+    /// UPDATE/DELETE. Requires the table to have row tracking enabled (see <see cref="IsRowTrackingEnabled"/>).</summary>
+    public static IAsyncEnumerable<RecordBatch> StreamWithRowIds(
+        nint opener, string path, IReadOnlyList<string>? columns, Predicate? filter, CancellationToken ct)
+    {
+        var fs = new DuckDbTableFileSystem(opener, path);
+        var parquet = filter is null ? ParquetReadOptions.Default : new ParquetReadOptions { Filter = filter };
+        var options = DeltaTableOptions.Default with { ParquetReadOptions = parquet };
+        return StreamWithRowIdsImpl(fs, options, columns, filter, ct);
+    }
+
+    private static async IAsyncEnumerable<RecordBatch> StreamWithRowIdsImpl(
+        DuckDbTableFileSystem fs, DeltaTableOptions options, IReadOnlyList<string>? columns,
+        Predicate? filter, [EnumeratorCancellation] CancellationToken ct)
+    {
+        var table = await DeltaTable.OpenAsync(fs, options, ct).ConfigureAwait(false);
+        try
+        {
+            await foreach (var batch in table.ReadAllWithRowIdsAsync(columns, filter, ct).ConfigureAwait(false))
+            {
+                yield return batch;
+            }
+        }
+        finally
+        {
+            await table.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>True when the Delta table at <paramref name="path"/> has row tracking enabled
+    /// (<c>delta.enableRowTracking=true</c>) — the prerequisite for surfacing a stable rowid for UPDATE/DELETE.</summary>
+    public static bool IsRowTrackingEnabled(nint opener, string path)
+    {
+        var fs = new DuckDbTableFileSystem(opener, path);
+        var table = DeltaTable.OpenAsync(fs).GetAwaiter().GetResult();
+        try
+        {
+            return EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
+                table.CurrentSnapshot.Metadata.Configuration);
+        }
+        finally
+        {
+            table.Dispose();
+        }
+    }
+
+    /// <summary>Deletes the rows whose stable <c>_metadata.row_id</c> is in <paramref name="rowIds"/>
+    /// (deletion vectors). Returns the number of rows deleted.</summary>
+    public static long DeleteByRowIds(nint opener, string path, IReadOnlyCollection<long> rowIds, CancellationToken ct)
+    {
+        var fs = new DuckDbTableFileSystem(opener, path);
+        var table = DeltaTable.OpenAsync(fs, DeltaTableOptions.Default, ct).AsTask().GetAwaiter().GetResult();
+        try
+        {
+            return table.DeleteByRowIdsAsync(rowIds, ct).AsTask().GetAwaiter().GetResult().RowsDeleted;
+        }
+        finally
+        {
+            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+    }
 }

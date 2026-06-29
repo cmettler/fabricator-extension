@@ -219,14 +219,24 @@ internal static class DeltaWriter
         },
     };
 
+    // Enable Delta row tracking on tables we create, so each row gets a stable _metadata.row_id — the row
+    // identity the catalog surfaces as the DuckDB rowid for UPDATE/DELETE (a writer-v7 table feature).
+    private static readonly Dictionary<string, string> RowTrackingConfig = new()
+    {
+        ["delta.enableRowTracking"] = "true",
+    };
+
     /// <summary>Opens-or-creates the Delta table at <paramref name="path"/> and writes <paramref name="batches"/>
-    /// in <paramref name="mode"/> (Overwrite for CTAS/REPLACE, Append for INSERT). Returns the committed version.</summary>
+    /// in <paramref name="mode"/> (Overwrite for CTAS/REPLACE, Append for INSERT). Returns the committed version.
+    /// <paramref name="rowTracking"/> enables <c>delta.enableRowTracking</c> on a NEW table (the catalog path,
+    /// so UPDATE/DELETE get a stable rowid); the global write functions leave it off (no DML, max compatibility).</summary>
     public static long Write(nint opener, string path, Schema schema, IReadOnlyList<RecordBatch> batches,
-                             DeltaWriteMode mode, CancellationToken ct)
+                             DeltaWriteMode mode, CancellationToken ct, bool rowTracking = false)
     {
         var fs = new DuckDbTableFileSystem(opener, path);
-        var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(), cancellationToken: ct)
-            .AsTask().GetAwaiter().GetResult();
+        var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(),
+                                                 configuration: rowTracking ? RowTrackingConfig : null,
+                                                 cancellationToken: ct).AsTask().GetAwaiter().GetResult();
         try
         {
             return table.WriteAsync(batches, mode, ct).AsTask().GetAwaiter().GetResult();
@@ -241,12 +251,14 @@ internal static class DeltaWriter
                                       CancellationToken ct) =>
         Write(opener, path, schema, batches, DeltaWriteMode.Overwrite, ct);
 
-    /// <summary>Creates an empty Delta table (commit 0 with the schema, no data) at <paramref name="path"/>.</summary>
-    public static void Create(nint opener, string path, Schema schema, CancellationToken ct)
+    /// <summary>Creates an empty Delta table (commit 0 with the schema, no data) at <paramref name="path"/>.
+    /// <paramref name="rowTracking"/> enables row tracking (the catalog path — UPDATE/DELETE rowid).</summary>
+    public static void Create(nint opener, string path, Schema schema, CancellationToken ct, bool rowTracking = false)
     {
         var fs = new DuckDbTableFileSystem(opener, path);
-        var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(), cancellationToken: ct)
-            .AsTask().GetAwaiter().GetResult();
+        var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(),
+                                                 configuration: rowTracking ? RowTrackingConfig : null,
+                                                 cancellationToken: ct).AsTask().GetAwaiter().GetResult();
         table.DisposeAsync().AsTask().GetAwaiter().GetResult();
     }
 

@@ -26,7 +26,8 @@ void ArrowNetComplexFilterPushdown(ClientContext &context, LogicalGet &get, Func
 class ArrowNetTableEntry : public TableCatalogEntry {
 public:
 	ArrowNetTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info, ArrowNetHandle handle,
-	                   vector<idx_t> rowid_columns, LogicalType rowid_type);
+	                   vector<idx_t> rowid_columns, LogicalType rowid_type,
+	                   vector<string> virtual_rowid_columns = {});
 
 	//! Produces a table scan that streams `SELECT * FROM [schema].[table]` from
 	//! SQL Server as Arrow into DuckDB.
@@ -45,11 +46,23 @@ public:
 	vector<column_t> GetRowIdColumns() const override;
 
 	bool HasRowId() const {
-		return !rowid_columns_.empty();
+		return !rowid_columns_.empty() || !virtual_rowid_columns_.empty();
 	}
 	//! Indices (in table column order) of the rowid/PK columns.
 	const vector<idx_t> &RowIdColumnIndices() const {
 		return rowid_columns_;
+	}
+	//! True when the rowid is a virtual (non-user-column) provider column, e.g. Delta's `_metadata.row_id`.
+	bool HasVirtualRowId() const {
+		return !virtual_rowid_columns_.empty();
+	}
+	//! The virtual rowid source column names (empty unless HasVirtualRowId()).
+	const vector<string> &VirtualRowIdColumns() const {
+		return virtual_rowid_columns_;
+	}
+	//! The rowid's DuckDB type (scalar for a single column, STRUCT for a compound key).
+	const LogicalType &RowIdType() const {
+		return rowid_type_;
 	}
 
 private:
@@ -60,6 +73,8 @@ private:
 	ArrowNetHandle handle_;
 	//! Indices (in table column order) of the rowid/PK columns; empty => no rowid.
 	vector<idx_t> rowid_columns_;
+	//! Virtual rowid source column names (provider-supplied, not in the user schema); empty => none.
+	vector<string> virtual_rowid_columns_;
 	//! rowid type: scalar (single column) or STRUCT (compound key).
 	LogicalType rowid_type_;
 	//! Lazily-fetched approximate row count for the optimizer (-2 = not yet fetched,

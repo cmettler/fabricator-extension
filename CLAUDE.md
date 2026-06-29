@@ -1133,16 +1133,36 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   valid until `complete_bulk`, which blocks on the consumer). `createTable`/`replace` ⇒ `DeltaWriteMode.Overwrite`,
   plain INSERT ⇒ `Append`; one commit per statement; `CreateTable` writes empty commit-0 (PK/UNIQUE/DEFAULT
   ignored — Delta has none); `DeltaWriter.Materialize` IPC-round-trips the streamed batches for the commit. NO
-  ABI change (reuses bulk + the v47 `set_active_opener`). `test/verify_delta_catalog_write.test` (29 — CREATE/
+  ABI change (reuses bulk + the v47 `set_active_opener`). `test/verify_delta_catalog_write.test` (31 — CREATE/
   INSERT/append/CTAS/aggregate + DROP TABLE + detach/re-attach durability, LOCAL). **DROP TABLE DONE** (ABI v49
   — appended `fs_remove_dir` to `ArrowNetHostServices`: recursive directory delete via DuckDB's
   `FileSystem::RemoveDirectory`, idempotent; `DeltaCatalog.DropTable` deletes the table's whole `<root>/<table>/`
   folder via `HostFs.RemoveDir(AmbientOpener.Current, …)`, opener threaded by `DropEntry`'s `ArrowNetSetActiveTxn`).
-  **Still unsupported** (clean error): DELETE, UPDATE, raw exec. **OneLake/ADLS auto-discovery is
+  **DELETE DONE — rowid pattern via Delta row tracking** (mirrors the SQL Server backend; reuses the existing
+  rowid DML operators wholesale — NO OptimizerExtension / custom operator, NO ABI change). **Key finding:** DuckDB
+  does NOT expose the WHERE at `PlanDelete` (`LogicalDelete` keeps only the table + a rowid-producing child), so a
+  predicate-capture delete is unsafe (pushdown is a superset → would over-delete) and would need a custom operator
+  → the rowid path is correct + idiomatic. **engineered-wood additions** (local working changes; its row-tracking
+  was write-only): `DeltaTable.ReadAllWithRowIdsAsync` (surfaces the stable `_metadata.row_id`),
+  `DeleteByRowIdsAsync` (delete-by-id via deletion vectors), and `CreateAsync`/`OpenOrCreateAsync` gained a
+  `configuration` arg (sets `delta.enableRowTracking=true` + writer-v7 `rowTracking` feature). **Virtual rowid
+  threading** (the crux — `_metadata.row_id` is NOT a user column; surfacing it as one would break INSERT):
+  `FetchRowIdColumns` returning a name absent from the schema is treated as a VIRTUAL rowid — `ArrowNetTableEntry`/
+  `ArrowStreamBindData` carry the NAMES (not indices) in `virtual_rowid_columns`, `HasRowId`/`GetVirtualColumns`/
+  `GetRowIdColumns` honor them, `BuildScanSpec` adds them to the fetch list when rowid is requested, `arrow_ingest`
+  resolves their result positions BY NAME for `BuildRowId`, and `BuildModifyTarget` uses the virtual names +
+  BIGINT. SQL Server is unaffected (its rowid names always resolve to real columns; the virtual branch never
+  fires — verified `verify_proc_inout`/`verify_time_travel`/`verify_columnstore` green). `DeltaCatalog`:
+  `CreateTable`/`BulkInsert` enable row tracking; `GetMetadata(RowId)` returns `_metadata.row_id` IFF row tracking
+  is on (external/legacy tables report no rowid → DML cleanly disabled); `ScanTable` streams WITH the row-id column
+  when requested; `ExecuteDelete` collects the ids → `DeleteByRowIdsAsync`. The global `arrownet_delta_write`
+  collector/demo leave row tracking OFF (no DML, max delta-kernel compatibility). `test/verify_delta_catalog_delete.test`
+  (28 — equality/range/name predicates + durable across re-attach + DELETE-all). **Still unsupported** (clean
+  error): UPDATE (next — needs `UpdateByRowIdsAsync`), raw exec. **OneLake/ADLS auto-discovery is
   BLOCKED by a DuckDB azure-extension glob bug** (mid-path-wildcard recursion throws `type must be string, but is
   null`; reproduced with DuckDB's own `glob()`) — single-table scan works, only the multi-table enumeration under
   a OneLake root doesn't; workaround = an explicit `tables` ATTACH option or lazy per-table resolution (future).
-  Remaining Delta write-back work: DELETE/UPDATE (rowid-vs-predicate), OCC retry for concurrent writers, the
+  Remaining Delta write-back work: UPDATE (rowid via row tracking), OCC retry for concurrent writers, the
   `engineeredwooddelta` rename, and a `delta-rs` production provider. See docs/delta-catalog.md + docs/filesystem-bridge.md. v47 =
   **host-FS global table functions**: appended one vtable entry `set_active_opener(opener)` — a per-thread ambient (`AmbientOpener`, mirroring `set_active_txn`) recording the
   calling operator's `ClientContext` so a connection-free GLOBAL host-FS table reader (a lakehouse format)

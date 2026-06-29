@@ -1,0 +1,80 @@
+# name: test/verify_delta_catalog_delete.test
+# description: Delta folder-as-catalog DELETE — rowid-based via Delta row tracking (mirrors the SQL Server
+#              backend). Tables created by the catalog enable delta.enableRowTracking, so each row gets a
+#              stable _metadata.row_id surfaced as the DuckDB rowid (a VIRTUAL column, not in the user schema);
+#              DELETE FROM lake.t WHERE ... plans rowid-based, DuckDB applies the WHERE during its scan, and the
+#              rows are removed via deletion vectors. Set ARROWNET_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
+# group: [mssql_net]
+
+require mssql_net
+
+require-env ARROWNET_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogdel' AS lake (TYPE arrownet, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE lake.main.t (id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO lake.main.t SELECT i, 'a' || i FROM range(1, 6) AS r(i);
+
+query I
+SELECT count(*) FROM lake.main.t;
+----
+5
+
+# DELETE a single row by equality predicate (DuckDB scans -> rowid -> deletion vector).
+statement ok
+DELETE FROM lake.main.t WHERE id = 2;
+
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
+----
+1	a1
+3	a3
+4	a4
+5	a5
+
+# DELETE a range — removes 4 and 5.
+statement ok
+DELETE FROM lake.main.t WHERE id >= 4;
+
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
+----
+1	a1
+3	a3
+
+# The surviving rows keep their identity across deletes (a second DELETE targets the right rows).
+statement ok
+DELETE FROM lake.main.t WHERE name = 'a1';
+
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
+----
+3	a3
+
+# Durability: detach + re-attach re-reads the _delta_log (deletion vectors applied).
+statement ok
+DETACH lake;
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogdel' AS lake2 (TYPE arrownet, PROVIDER 'delta');
+
+query IT
+SELECT id, name FROM lake2.main.t ORDER BY id;
+----
+3	a3
+
+# DELETE all remaining (no WHERE) empties the table.
+statement ok
+DELETE FROM lake2.main.t;
+
+query I
+SELECT count(*) FROM lake2.main.t;
+----
+0
+
+statement ok
+DETACH lake2;

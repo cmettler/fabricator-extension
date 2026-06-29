@@ -222,6 +222,13 @@ static string BuildScanSpec(const ArrowStreamBindData &bind_data, const vector<c
 		for (auto src : bind_data.rowid_source_columns) {
 			add(src);
 		}
+		// Virtual rowid columns are names not present in the user schema (e.g. Delta's `_metadata.row_id`);
+		// add them to the fetch list directly so the provider supplies them on this scan.
+		for (auto &vname : bind_data.virtual_rowid_columns) {
+			if (std::find(cols.begin(), cols.end(), vname) == cols.end()) {
+				cols.push_back(vname);
+			}
+		}
 	}
 	if (cols.empty() && !bind_data.names.empty()) {
 		cols.push_back(bind_data.names[0]);
@@ -317,6 +324,12 @@ static void BuildProjectionMapping(const ArrowStreamBindData &bind_data, const v
 	gstate.rowid_source_pos.clear();
 	for (auto src : bind_data.rowid_source_columns) {
 		gstate.rowid_source_pos.push_back(resolve(src));
+	}
+	// Virtual rowid columns (e.g. Delta `_metadata.row_id`): resolved BY NAME in the result (they have no
+	// table index). The provider always returns them in the result when requested, so they're in scan_names.
+	for (auto &vname : bind_data.virtual_rowid_columns) {
+		auto it = pos_by_name.find(vname);
+		gstate.rowid_source_pos.push_back(it != pos_by_name.end() ? it->second : 0);
 	}
 }
 

@@ -39,6 +39,9 @@ public sealed class DeltaBackend : IBackend
 public sealed class DeltaCatalog : IBackendCatalog
 {
     private const string MainSchema = "main";
+    // The stable row-tracking id surfaced as the DuckDB rowid for UPDATE/DELETE (a VIRTUAL column — not part
+    // of the user schema). Matches EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.VirtualRowIdColumn.
+    private const string RowIdColumn = "_metadata.row_id";
     private readonly string _root; // normalized (forward slashes), no trailing slash
 
     public DeltaCatalog(string root) => _root = Normalize(root).TrimEnd('/');
@@ -54,7 +57,13 @@ public sealed class DeltaCatalog : IBackendCatalog
         // Columns = a zero-row stream whose SCHEMA describes the table's columns (engineered-wood's Delta schema).
         MetadataKind.Columns => new InMemoryArrayStream(
             DeltaReader.GetSchema(AmbientOpener.Current, TablePath(table!)), System.Array.Empty<RecordBatch>()),
-        // No rowid (no UPDATE/DELETE yet), no row-count/NDV stats surfaced, no functions.
+        // RowId: the stable _metadata.row_id virtual column IFF the table has row tracking enabled — that
+        // surfaces a DuckDB rowid so UPDATE/DELETE work (rowid-based, mirrors the SQL Server backend). A table
+        // without row tracking (external Delta, or pre-row-tracking) reports no rowid => UPDATE/DELETE disabled.
+        MetadataKind.RowId => DeltaReader.IsRowTrackingEnabled(AmbientOpener.Current, TablePath(table!))
+            ? SingleColumn("name", new[] { RowIdColumn })
+            : EmptyStringTable("name"),
+        // No row-count/NDV stats surfaced, no functions.
         _ => EmptyStringTable("name"),
     };
 
@@ -106,8 +115,23 @@ public sealed class DeltaCatalog : IBackendCatalog
         EngineeredWood.Expressions.Predicate? filter = spec?.Filter is { } node
             ? new DeltaFilterBuilder(ReadFilterValues(filterValues)).Build(node)
             : null;
-        var schema = DeltaReader.GetSchema(opener, path);
-        return new AsyncEnumerableArrowStream(schema, DeltaReader.Stream(opener, path, columns: null, filter, default));
+        var userSchema = DeltaReader.GetSchema(opener, path);
+
+        // When the scan requests the virtual rowid (UPDATE/DELETE plans), stream WITH the trailing
+        // _metadata.row_id column and advertise it in the schema; DuckDB maps the requested output by name.
+        bool wantRowId = spec?.Columns is { } cols && cols.Contains(RowIdColumn);
+        if (wantRowId)
+        {
+            var fields = new List<Field>(userSchema.FieldsList)
+            {
+                new Field(RowIdColumn, Int64Type.Default, nullable: false),
+            };
+            var schemaWithRowId = new Schema(fields, userSchema.Metadata);
+            return new AsyncEnumerableArrowStream(
+                schemaWithRowId, DeltaReader.StreamWithRowIds(opener, path, columns: null, filter, default));
+        }
+
+        return new AsyncEnumerableArrowStream(userSchema, DeltaReader.Stream(opener, path, columns: null, filter, default));
     }
 
     private static IReadOnlyList<object?> ReadFilterValues(IArrowArrayStream? filterValues)
@@ -144,7 +168,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         var opener = AmbientOpener.Current;
         var (schema, batches, rows) = DeltaWriter.Materialize(data, default);
         var mode = createTable || replace ? DeltaWriteMode.Overwrite : DeltaWriteMode.Append;
-        DeltaWriter.Write(opener, TablePath(tableName), schema, batches, mode, default);
+        DeltaWriter.Write(opener, TablePath(tableName), schema, batches, mode, default, rowTracking: true);
         return rows;
     }
 
@@ -152,7 +176,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// <paramref name="ifNotExists"/> is satisfied; PK/UNIQUE/DEFAULT are ignored (Delta has no such constraints).</summary>
     public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists,
                             string? primaryKey, string? uniques, string? defaults)
-        => DeltaWriter.Create(AmbientOpener.Current, TablePath(tableName), columns, default);
+        => DeltaWriter.Create(AmbientOpener.Current, TablePath(tableName), columns, default, rowTracking: true);
 
     public void CreateSchema(string s, bool ie) { } // a Delta folder catalog has only the flat `main` schema
     public void BeginTransaction() { }              // Delta is per-commit (no cross-statement transaction)
@@ -175,9 +199,47 @@ public sealed class DeltaCatalog : IBackendCatalog
         HostFs.RemoveDir(AmbientOpener.Current, TablePath(tableName));
     }
 
+    /// <summary>DELETE = rowid-based via Delta row tracking: <paramref name="keys"/> is a stream whose single
+    /// <c>_metadata.row_id</c> Int64 column holds the stable ids of the rows to delete (DuckDB's scan produced
+    /// them, applying the WHERE). Collected and applied via deletion vectors (<see cref="DeltaReader.DeleteByRowIds"/>).</summary>
+    public long ExecuteDelete(string schemaName, string tableName, IArrowArrayStream keys)
+    {
+        var opener = AmbientOpener.Current;
+        var ids = new List<long>();
+        using (keys)
+        {
+            while (keys.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult() is { } batch)
+            {
+                using (batch)
+                {
+                    if (batch.Length == 0)
+                    {
+                        continue;
+                    }
+                    // The keys batch has exactly the rowid column(s); a virtual rowid is the single Int64
+                    // _metadata.row_id (column 0).
+                    if (batch.Column(0) is Int64Array idArray)
+                    {
+                        for (int i = 0; i < idArray.Length; i++)
+                        {
+                            if (idArray.GetValue(i) is { } id)
+                            {
+                                ids.Add(id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (ids.Count == 0)
+        {
+            return 0;
+        }
+        return DeltaReader.DeleteByRowIds(opener, TablePath(tableName), ids, default);
+    }
+
     public IArrowArrayStream ExecuteQuery(string sql) => throw Unsupported("raw query");
     public long ExecuteNonQuery(string sql) => throw Unsupported("exec");
-    public long ExecuteDelete(string s, string t, IArrowArrayStream k) => throw Unsupported("DELETE");
     public long ExecuteUpdate(string s, string t, int n, IArrowArrayStream d) => throw Unsupported("UPDATE");
     public IArrowArrayStream InsertReturning(string s, string t, IArrowArrayStream r) => throw Unsupported("INSERT ... RETURNING");
     public void DropSchema(string s, bool ie) => throw Unsupported("DROP SCHEMA");

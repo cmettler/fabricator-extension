@@ -344,22 +344,24 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      `__delta_row_id` physical column); (b) `DeltaTable.DeleteByRowIdsAsync(IReadOnlyCollection<long> rowIds)` —
      deletes by stable id via deletion vectors (reads each file's `__delta_row_id`, maps ids→positions, writes a
      DV + RemoveFile/add). Both require `delta.enableRowTracking=true`. Builds clean.
-   - **ArrowNet wiring — REMAINING** (the next slice): (1) `DeltaCatalog.CreateTable` enables
-     `delta.enableRowTracking=true` (config on the empty commit-0); (2) `DeltaCatalog.GetMetadata(RowId)` returns
-     `_metadata.row_id` as the rowid column; (3) **virtual-rowid threading in C++** — the rowid machinery currently
-     resolves rowid names to INDICES into the user column list (`arrownet_schema_entry.cpp:160-186`), but
-     `_metadata.row_id` is NOT a user column (surfacing it as one would break INSERT). So: when `FetchRowIdColumns`
-     returns names not present in the schema, treat them as a **virtual rowid** — carry the NAMES (not indices) on
-     `ArrowNetTableEntry` + `ArrowStreamBindData` (`virtual_rowid_columns`), `HasRowId()`/`GetVirtualColumns()`/
-     `GetRowIdColumns()` honor them, `BuildScanSpec` adds the virtual names to the fetch list when rowid is
-     requested, and `arrow_ingest` resolves their result positions BY NAME for `BuildRowId` (rowid_type=BIGINT for
-     a single virtual col). `PlanDelete`/`BuildModifyTarget` use the virtual names + BIGINT type. SQL Server is
-     unaffected (its rowid names always resolve to real columns; the virtual path only triggers on
-     otherwise-unresolved names — today a disabled-rowid fallback); (4) `DeltaCatalog.ScanTable` calls
-     `ReadAllWithRowIdsAsync` when the spec requests `_metadata.row_id`; (5) `DeltaCatalog.ExecuteDelete` collects
-     the `_metadata.row_id` keys → `DeleteByRowIdsAsync`. DELETE first; **UPDATE** next (needs `ExecuteUpdate` →
-     an engineered-wood `UpdateByRowIdsAsync(ids, newValuesByRowId)` that rewrites affected files substituting the
-     SET columns — the `updater` analog keyed by row id).
+   - **ArrowNet wiring — DELETE DONE** (`test/verify_delta_catalog_delete.test`, 28): (1) `DeltaCatalog.CreateTable`/
+     `BulkInsert` enable `delta.enableRowTracking=true` (catalog-created tables only; the global write
+     collector/demo leave it OFF for max delta-kernel compatibility); (2) `DeltaCatalog.GetMetadata(RowId)` returns
+     `_metadata.row_id` IFF the table has row tracking (external/legacy tables → no rowid → DML cleanly disabled);
+     (3) **virtual-rowid threading in C++** — the rowid machinery resolved rowid names to INDICES into the user
+     column list (`arrownet_schema_entry.cpp`), but `_metadata.row_id` is NOT a user column (surfacing it as one
+     would break INSERT). So when `FetchRowIdColumns` returns names absent from the schema, they're a **virtual
+     rowid**: `ArrowNetTableEntry` + `ArrowStreamBindData` carry the NAMES (not indices) in `virtual_rowid_columns`,
+     `HasRowId()`/`GetVirtualColumns()`/`GetRowIdColumns()` honor them, `BuildScanSpec` adds them to the fetch list
+     when rowid is requested, `arrow_ingest` resolves their result positions BY NAME for `BuildRowId`
+     (rowid_type=BIGINT for a single virtual col), and `BuildModifyTarget` uses the virtual names + BIGINT. SQL
+     Server is unaffected (its rowid names always resolve to real columns; the virtual branch never fires —
+     `verify_proc_inout`/`verify_time_travel`/`verify_columnstore` green); (4) `DeltaCatalog.ScanTable` streams via
+     `StreamWithRowIds`/`ReadAllWithRowIdsAsync` (advertising `_metadata.row_id`) when the spec requests it;
+     (5) `DeltaCatalog.ExecuteDelete` collects the `_metadata.row_id` keys → `DeleteByRowIdsAsync`. NO ABI change.
+   - **UPDATE — REMAINING** (next): `DeltaCatalog.ExecuteUpdate` → an engineered-wood `UpdateByRowIdsAsync(ids,
+     newValuesByRowId)` that rewrites affected files substituting the SET columns (the `updater` analog keyed by
+     row id; the SET values arrive via the existing rowid-UPDATE operator as the leading `set_count` columns).
 4. MERGE/UPSERT — out of scope (engineered-wood doesn't implement it; could be composed delete+append,
    non-atomic).
 

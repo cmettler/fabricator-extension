@@ -107,6 +107,13 @@ struct ArrowStreamBindData : public duckdb::TableFunctionData {
 	duckdb::vector<duckdb::idx_t> rowid_source_columns;
 	duckdb::LogicalType rowid_type;
 
+	//! Virtual rowid source columns: rowid columns the provider supplies on request but that are NOT part of
+	//! the user-visible schema (so they have no index into `names`) — e.g. the Delta catalog's stable
+	//! `_metadata.row_id`. When non-empty (rowid_source_columns is then empty), these names are added to the
+	//! scan's fetch list when a rowid is requested, and `arrow_ingest` resolves their result positions BY NAME
+	//! for BuildRowId. SQL Server uses real columns (rowid_source_columns); this is the lakehouse path.
+	duckdb::vector<duckdb::string> virtual_rowid_columns;
+
 	//! Approximate table row count for the optimizer's cardinality estimate; -1 =>
 	//! unknown (no NodeStatistics reported). Set for catalog table scans.
 	int64_t row_count = -1;

@@ -332,6 +332,18 @@ static ArrowNetModifyTarget BuildModifyTarget(LogicalOperator &, TableCatalogEnt
 	ArrowNetModifyTarget target;
 	target.schema_name = entry.schema.name;
 	target.table_name = entry.name;
+	if (entry.HasVirtualRowId()) {
+		// Virtual rowid (Delta `_metadata.row_id`): the key columns are provider-supplied, not in the schema.
+		const auto &rowid_type = entry.RowIdType();
+		const auto &vnames = entry.VirtualRowIdColumns();
+		for (idx_t i = 0; i < vnames.size(); i++) {
+			target.rowid_columns.push_back(vnames[i]);
+			target.rowid_types.push_back(rowid_type.id() == LogicalTypeId::STRUCT
+			                                 ? StructType::GetChildType(rowid_type, i)
+			                                 : rowid_type);
+		}
+		return target;
+	}
 	auto names = entry.GetColumns().GetColumnNames();
 	vector<LogicalType> types;
 	for (auto &col : entry.GetColumns().Logical()) {
