@@ -1225,11 +1225,25 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `DELTA_FEATURES_PROTOCOL_METADATA_MISMATCH`; DVs written without the `deletionVectors` reader-v3 feature →
   OneLake conversion `INTERNAL_ERROR`); declaring all features fixed the protocol, but Fabric/Spark STILL could
   not read it — engineered-wood's inline DV byte format isn't Spark-decodable (Fabric DOES support DVs, so it's
-  our format). **Resolution = abandon row tracking + DVs for plain Delta + copy-on-write + transient rowid**
-  (see the DELETE paragraph above) — validated live. Remaining Delta write-back work (all OPTIONAL now that
-  CREATE/INSERT/CTAS/COPY/DROP/DELETE/UPDATE work, DELETE+UPDATE both PER-FILE copy-on-write):
-  the deletion-vector + row-tracking fast-delete opt-in (needs the upstream engineered-wood inline-DV
-  serialization fix — verifiable against `delta_scan`), OCC retry for concurrent writers, the
+  our format). At that point we shipped plain Delta + copy-on-write + transient rowid (see the DELETE paragraph
+  above) as the default — validated live. **DV FORMAT BUG NOW FIXED (upstream engineered-wood, verified against
+  delta-kernel via DuckDB's official `delta_scan`).** Two bugs in engineered-wood's `RoaringBitmapWriter`/`Reader`:
+  (1) it omitted the 64-bit **`RoaringBitmapArray` wrapper** — wrote `[magic][32-bit bitmap]` instead of
+  `[magic][int64 sub-bitmap-count][int32 high-key + 32-bit bitmap]…`; (2) the inner 32-bit bitmap used a
+  non-standard no-run cookie `((count-1)<<16)|12346` instead of the CRoaring portable form
+  `[12346 full u32][int32 size][descriptive][offset-header-ALWAYS]`. Fixed both + made
+  `RoaringBitmap.DeserializePortable` return bytes-consumed (to walk multi-sub-bitmap arrays); the reader now
+  parses the array wrapper with the legacy bare-bitmap fallback. `delta_scan` reads an engineered-wood DV table
+  with the deleted row correctly removed (`scratchpad/dvtest` harness). This also fixes engineered-wood's own
+  `DeleteAsync` — report upstream. **Finding:** the Delta `rowTracking` FEATURE is NOT actually needed for DV
+  deletes — an ABSOLUTE-position transient `(file, position)` rowid composes correctly across repeated DV deletes
+  (the parquet file is never rewritten, so absolute positions are stable); rowTracking only adds stable-ids-across-
+  compaction, which our DML doesn't use. **Remaining for the opt-in DV-delete MODE (decisions: enable DV +
+  rowTracking features; activate by the table's `delta.enableDeletionVectors` config):** (a) make the shared
+  `ReadFileAsync`/`ReadAllWithRowIdsAsync` emit ABSOLUTE file positions (currently post-DV-filter index; SAFE for
+  copy-on-write since no-DV tables have absolute==sequential), (b) engineered-wood DV-union delete (mark positions
+  in the file's DV, no rewrite) chosen when the table has DVs enabled, (c) UPDATE on a DV table reads via the
+  rowid column (absolute) + rewrites clean. Other remaining (OPTIONAL): OCC retry for concurrent writers, the
   `engineeredwooddelta` rename, and a `delta-rs` production provider. See docs/delta-catalog.md + docs/filesystem-bridge.md. v47 =
   **host-FS global table functions**: appended one vtable entry `set_active_opener(opener)` — a per-thread ambient (`AmbientOpener`, mirroring `set_active_txn`) recording the
   calling operator's `ClientContext` so a connection-free GLOBAL host-FS table reader (a lakehouse format)
