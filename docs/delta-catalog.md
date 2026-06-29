@@ -29,8 +29,11 @@ be listed by `ListTables` (400) nor glob, so they're discovered via the lakehous
 (`SqlEndpointProperties.ConnectionString` + INFORMATION_SCHEMA, an Entra SQL token from the same SP —
 `Microsoft.Data.SqlClient`); `DeltaCatalog` is multi-schema (schema-aware `TablePath`). The Fabric API / SQL
 endpoint are used ONLY to list tables; data files go through DuckDB's FileSystem (the opener + a DuckDB azure
-secret). **VALIDATED LIVE (2026-06-29)** on a schema-enabled lakehouse: ATTACH → CTAS `lake.dbo.t` (row tracking)
-→ `DELETE WHERE` (deletion vector) → correct read-back. **`READ_ONLY false` is required** — DuckDB force-bumps
+secret). **VALIDATED LIVE (2026-06-29)** on a schema-enabled lakehouse: ATTACH → CTAS `lake.dbo.t` → `DELETE
+WHERE` → correct read-back. Catalog tables are written as **PLAIN Delta (no table features)** with **copy-on-write
+DELETE** + a **transient `(file,position)` rowid** — NOT row tracking / deletion vectors, which Fabric/Spark
+could not read (engineered-wood's DV byte format isn't Spark-decodable; see §3 below for the full trail).
+**`READ_ONLY false` is required** — DuckDB force-bumps
 remote (`abfss://`) attaches to read-only unless the access mode is explicit (`database_manager.cpp:105`); Delta
 supports remote writes. **Caveat:** `duckdb_tables()` over OneLake is slow (materializes every table's columns);
 use targeted `lake.<schema>.<t>`. The Unity Catalog API is an alternative but read-only.
@@ -343,7 +346,19 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      via a new host-FS callback `fs_remove_dir` (ABI v49 — DuckDB's `FileSystem::RemoveDirectory`, idempotent).
      **Still unsupported** (throw a clean error): DELETE, UPDATE, raw exec. **Remaining for production write
      concurrency:** the OCC retry loop (catch `DeltaConflictException` → reopen → retry) for concurrent writers.
-3. **DELETE / UPDATE — chosen strategy: the rowid pattern via Delta row tracking** (mirrors the SQL Server
+3. **DELETE — FINAL: copy-on-write + transient `(file,position)` rowid, PLAIN Delta (no features).** The
+   detailed design below (row tracking + deletion vectors) is the SUPERSEDED first attempt — kept as the trail.
+   Why it changed: Fabric's OneLake converter / Spark could not read our row-tracking + DV commits (first from
+   missing protocol feature declarations — `domainMetadata` dep, `deletionVectors` reader-v3 — and then, even
+   with a compliant protocol, because engineered-wood's inline DV byte format isn't Spark-decodable). Final
+   design: write **plain Delta** (minReader 1 / minWriter 2, no features); the DuckDB rowid is a TRANSIENT
+   `(fileOrdinal << 40) | rowPosition` (file ordinal in the path-sorted active set) computed at scan
+   (`ReadAllWithRowIdsAsync`), and `DeleteByRowIdsAsync` decodes it → **copy-on-write** rewrite of each affected
+   file (plain `remove`+`add`, no DV). Validated live on the schema-enabled `LH` lakehouse (`arrownet_deltest4`:
+   v0 protocol minReader 1/minWriter 2/no features, DELETE = plain remove+add). The virtual-rowid C++ threading +
+   `DeltaCatalog.ExecuteDelete` wiring are unchanged from the SUPERSEDED notes — only the rowid *meaning*
+   (transient, not stable) and the delete *mechanism* (rewrite, not DV) changed. **(SUPERSEDED below:)** the rowid
+   pattern via Delta row tracking (mirrors the SQL Server
    backend — reuses ArrowNet's existing rowid DML operators wholesale, no OptimizerExtension / custom operator).
    **Key finding that drove this:** DuckDB does NOT expose the WHERE predicate at the catalog's `PlanDelete`/
    `PlanUpdate` hook (`LogicalDelete` retains only the table + a rowid-producing child plan), so a "capture the

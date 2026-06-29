@@ -95,12 +95,10 @@ public sealed class DeltaCatalog : IBackendCatalog
         // Columns = a zero-row stream whose SCHEMA describes the table's columns (engineered-wood's Delta schema).
         MetadataKind.Columns => new InMemoryArrayStream(
             DeltaReader.GetSchema(AmbientOpener.Current, TablePath(schema!, table!)), System.Array.Empty<RecordBatch>()),
-        // RowId: the stable _metadata.row_id virtual column IFF the table has row tracking enabled — that
-        // surfaces a DuckDB rowid so UPDATE/DELETE work (rowid-based, mirrors the SQL Server backend). A table
-        // without row tracking (external Delta, or pre-row-tracking) reports no rowid => UPDATE/DELETE disabled.
-        MetadataKind.RowId => DeltaReader.IsRowTrackingEnabled(AmbientOpener.Current, TablePath(schema!, table!))
-            ? SingleColumn("name", new[] { RowIdColumn })
-            : EmptyStringTable("name"),
+        // RowId: always surface the virtual _metadata.row_id — a TRANSIENT (file, position) rowid computed at
+        // scan time (no row-tracking feature needed; works on ANY Delta table). Enables UPDATE/DELETE
+        // (rowid-based, mirrors the SQL Server backend); DELETE is copy-on-write (plain add/remove).
+        MetadataKind.RowId => SingleColumn("name", new[] { RowIdColumn }),
         // No row-count/NDV stats surfaced, no functions.
         _ => EmptyStringTable("name"),
     };
@@ -246,7 +244,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         var opener = AmbientOpener.Current;
         var (schema, batches, rows) = DeltaWriter.Materialize(data, default);
         var mode = createTable || replace ? DeltaWriteMode.Overwrite : DeltaWriteMode.Append;
-        DeltaWriter.Write(opener, TablePath(schemaName, tableName), schema, batches, mode, default, rowTracking: true);
+        DeltaWriter.Write(opener, TablePath(schemaName, tableName), schema, batches, mode, default);
         return rows;
     }
 
@@ -254,7 +252,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// <paramref name="ifNotExists"/> is satisfied; PK/UNIQUE/DEFAULT are ignored (Delta has no such constraints).</summary>
     public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists,
                             string? primaryKey, string? uniques, string? defaults)
-        => DeltaWriter.Create(AmbientOpener.Current, TablePath(schemaName, tableName), columns, default, rowTracking: true);
+        => DeltaWriter.Create(AmbientOpener.Current, TablePath(schemaName, tableName), columns, default);
 
     public void CreateSchema(string s, bool ie) { } // schemas mirror the lakehouse; CREATE SCHEMA is a no-op
     public void BeginTransaction() { }              // Delta is per-commit (no cross-statement transaction)

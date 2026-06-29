@@ -219,27 +219,20 @@ internal static class DeltaWriter
         },
     };
 
-    // Table features enabled on catalog-created tables: row tracking (stable _metadata.row_id → the DuckDB
-    // rowid for UPDATE/DELETE) AND deletion vectors (DELETE writes a DV). Both are declared in the protocol at
-    // create (rowTracking+domainMetadata writer features; deletionVectors reader+writer, reader v3) so the
-    // commits are protocol-compliant for strict readers — Fabric's OneLake converter, delta-kernel.
-    private static readonly Dictionary<string, string> RowTrackingConfig = new()
-    {
-        ["delta.enableRowTracking"] = "true",
-        ["delta.enableDeletionVectors"] = "true",
-    };
+    // Catalog tables are written as PLAIN Delta — NO table features (no row tracking, no deletion vectors).
+    // The DuckDB rowid for UPDATE/DELETE is a TRANSIENT (file, position) rowid computed at scan time
+    // (engineered-wood ReadAllWithRowIdsAsync), and DELETE is copy-on-write (rewrite the file, plain add/remove).
+    // Plain Delta (minReader 1 / minWriter 2) is maximally reader-compatible — Fabric OneLake conversion + Spark
+    // can't read our row-tracking/deletion-vector commits (engineered-wood's DV format isn't Spark-compatible).
 
     /// <summary>Opens-or-creates the Delta table at <paramref name="path"/> and writes <paramref name="batches"/>
-    /// in <paramref name="mode"/> (Overwrite for CTAS/REPLACE, Append for INSERT). Returns the committed version.
-    /// <paramref name="rowTracking"/> enables <c>delta.enableRowTracking</c> on a NEW table (the catalog path,
-    /// so UPDATE/DELETE get a stable rowid); the global write functions leave it off (no DML, max compatibility).</summary>
+    /// in <paramref name="mode"/> (Overwrite for CTAS/REPLACE, Append for INSERT). Returns the committed version.</summary>
     public static long Write(nint opener, string path, Schema schema, IReadOnlyList<RecordBatch> batches,
-                             DeltaWriteMode mode, CancellationToken ct, bool rowTracking = false)
+                             DeltaWriteMode mode, CancellationToken ct)
     {
         var fs = new DuckDbTableFileSystem(opener, path);
-        var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(),
-                                                 configuration: rowTracking ? RowTrackingConfig : null,
-                                                 cancellationToken: ct).AsTask().GetAwaiter().GetResult();
+        var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(), cancellationToken: ct)
+                             .AsTask().GetAwaiter().GetResult();
         try
         {
             return table.WriteAsync(batches, mode, ct).AsTask().GetAwaiter().GetResult();
@@ -254,14 +247,12 @@ internal static class DeltaWriter
                                       CancellationToken ct) =>
         Write(opener, path, schema, batches, DeltaWriteMode.Overwrite, ct);
 
-    /// <summary>Creates an empty Delta table (commit 0 with the schema, no data) at <paramref name="path"/>.
-    /// <paramref name="rowTracking"/> enables row tracking (the catalog path — UPDATE/DELETE rowid).</summary>
-    public static void Create(nint opener, string path, Schema schema, CancellationToken ct, bool rowTracking = false)
+    /// <summary>Creates an empty Delta table (commit 0 with the schema, no data) at <paramref name="path"/>.</summary>
+    public static void Create(nint opener, string path, Schema schema, CancellationToken ct)
     {
         var fs = new DuckDbTableFileSystem(opener, path);
-        var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(),
-                                                 configuration: rowTracking ? RowTrackingConfig : null,
-                                                 cancellationToken: ct).AsTask().GetAwaiter().GetResult();
+        var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(), cancellationToken: ct)
+                             .AsTask().GetAwaiter().GetResult();
         table.DisposeAsync().AsTask().GetAwaiter().GetResult();
     }
 

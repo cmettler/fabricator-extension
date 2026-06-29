@@ -100,24 +100,7 @@ internal static class DeltaReader
         }
     }
 
-    /// <summary>True when the Delta table at <paramref name="path"/> has row tracking enabled
-    /// (<c>delta.enableRowTracking=true</c>) — the prerequisite for surfacing a stable rowid for UPDATE/DELETE.</summary>
-    public static bool IsRowTrackingEnabled(nint opener, string path)
-    {
-        var fs = new DuckDbTableFileSystem(opener, path);
-        var table = DeltaTable.OpenAsync(fs).GetAwaiter().GetResult();
-        try
-        {
-            return EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
-                table.CurrentSnapshot.Metadata.Configuration);
-        }
-        finally
-        {
-            table.Dispose();
-        }
-    }
-
-    /// <summary>Deletes the rows whose stable <c>_metadata.row_id</c> is in <paramref name="rowIds"/>
+    /// <summary>Deletes the rows whose transient <c>_metadata.row_id</c> is in <paramref name="rowIds"/>
     /// (deletion vectors). Returns the number of rows deleted.</summary>
     public static long DeleteByRowIds(nint opener, string path, IReadOnlyCollection<long> rowIds, CancellationToken ct)
     {

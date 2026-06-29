@@ -1138,14 +1138,22 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   — appended `fs_remove_dir` to `ArrowNetHostServices`: recursive directory delete via DuckDB's
   `FileSystem::RemoveDirectory`, idempotent; `DeltaCatalog.DropTable` deletes the table's whole `<root>/<table>/`
   folder via `HostFs.RemoveDir(AmbientOpener.Current, …)`, opener threaded by `DropEntry`'s `ArrowNetSetActiveTxn`).
-  **DELETE DONE — rowid pattern via Delta row tracking** (mirrors the SQL Server backend; reuses the existing
-  rowid DML operators wholesale — NO OptimizerExtension / custom operator, NO ABI change). **Key finding:** DuckDB
-  does NOT expose the WHERE at `PlanDelete` (`LogicalDelete` keeps only the table + a rowid-producing child), so a
-  predicate-capture delete is unsafe (pushdown is a superset → would over-delete) and would need a custom operator
-  → the rowid path is correct + idiomatic. **engineered-wood additions** (local working changes; its row-tracking
-  was write-only): `DeltaTable.ReadAllWithRowIdsAsync` (surfaces the stable `_metadata.row_id`),
-  `DeleteByRowIdsAsync` (delete-by-id via deletion vectors), and `CreateAsync`/`OpenOrCreateAsync` gained a
-  `configuration` arg (sets `delta.enableRowTracking=true` + writer-v7 `rowTracking` feature). **Virtual rowid
+  **DELETE DONE — copy-on-write via a TRANSIENT (file,position) rowid; tables are PLAIN Delta (no features)**
+  (mirrors the SQL Server backend's rowid DML — reuses the existing rowid operators wholesale, NO OptimizerExtension/
+  custom operator, NO ABI change). **Why this shape (3 live-Fabric iterations):** DuckDB doesn't expose the WHERE
+  at `PlanDelete` (`LogicalDelete` keeps only the table + a rowid-producing child) → predicate-capture is unsafe
+  (pushdown is a superset → over-delete) → the rowid path is correct. The FIRST attempt used **Delta row tracking**
+  (stable `_metadata.row_id`) + **deletion vectors**, but Fabric's OneLake converter / Spark could NOT read those
+  commits: engineered-wood's protocol omitted feature dependencies (rowTracking needs `domainMetadata`; DVs need
+  reader-v3 + `deletionVectors`) AND — even with a fully spec-compliant protocol — engineered-wood's inline DV
+  byte format isn't what Spark/Fabric decode. **Final design = plain Delta, no table features:** the rowid is a
+  TRANSIENT `(fileOrdinal << 40) | rowPositionInFile` (file ordinal in the path-sorted active set), computed at
+  scan time, NOT persisted; DELETE is **copy-on-write** — rewrite each affected file without the deleted rows,
+  committing plain `remove`+`add` (no DV). minReaderVersion 1 / minWriterVersion 2, zero features → every reader
+  (Fabric OneLake conversion, Spark, delta-kernel) reads it. **engineered-wood** (local working changes):
+  `ReadAllWithRowIdsAsync` appends the transient rowid (`OrderedActiveFiles` path-sort + per-file position);
+  `DeleteByRowIdsAsync` decodes rowids → positions-per-file → copy-on-write rewrite; `CreateAsync` writes plain
+  Delta (the feature-declaration logic stays but is unused — `DeltaWriter` passes no config). **Virtual rowid
   threading** (the crux — `_metadata.row_id` is NOT a user column; surfacing it as one would break INSERT):
   `FetchRowIdColumns` returning a name absent from the schema is treated as a VIRTUAL rowid — `ArrowNetTableEntry`/
   `ArrowStreamBindData` carry the NAMES (not indices) in `virtual_rowid_columns`, `HasRowId`/`GetVirtualColumns`/
@@ -1153,11 +1161,15 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   resolves their result positions BY NAME for `BuildRowId`, and `BuildModifyTarget` uses the virtual names +
   BIGINT. SQL Server is unaffected (its rowid names always resolve to real columns; the virtual branch never
   fires — verified `verify_proc_inout`/`verify_time_travel`/`verify_columnstore` green). `DeltaCatalog`:
-  `CreateTable`/`BulkInsert` enable row tracking; `GetMetadata(RowId)` returns `_metadata.row_id` IFF row tracking
-  is on (external/legacy tables report no rowid → DML cleanly disabled); `ScanTable` streams WITH the row-id column
-  when requested; `ExecuteDelete` collects the ids → `DeleteByRowIdsAsync`. The global `arrownet_delta_write`
-  collector/demo leave row tracking OFF (no DML, max delta-kernel compatibility). `test/verify_delta_catalog_delete.test`
-  (28 — equality/range/name predicates + durable across re-attach + DELETE-all). **Still unsupported** (clean
+  `GetMetadata(RowId)` ALWAYS returns `_metadata.row_id` (the transient rowid works on ANY Delta table);
+  `ScanTable` streams WITH the row-id column when requested; `ExecuteDelete` collects the ids → `DeleteByRowIdsAsync`.
+  `test/verify_delta_catalog_delete.test` (28 — equality/range/name predicates + durable across re-attach +
+  DELETE-all). **Live Fabric: plain-Delta CTAS+DELETE validated end-to-end** on the schema-enabled `LH` lakehouse
+  (`arrownet_deltest4`: v0 protocol = minReader 1/minWriter 2/no features, DELETE = plain remove+add, our read
+  correct); the OneLake table-format conversion is expected to succeed on plain Delta (pending user confirm — the
+  earlier row-tracking/DV tables failed conversion). **A transient rowid is valid only within one snapshot** (a
+  scan's rowids must be consumed by the DELETE before another write changes the file set — true for a single
+  DML statement). **Still unsupported** (clean
   error): UPDATE (next — needs `UpdateByRowIdsAsync`), raw exec. **OneLake table discovery — via the Fabric REST
   API** (`FabricLakehouse`, Bridge): DuckDB's azure glob can't recurse a OneLake `_delta_log` tree (mid-path
   wildcard → `type must be string, but is null`, duckdb-azure PR #174), so a OneLake root
@@ -1189,20 +1201,14 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   it explicitly. **Caveat:** `duckdb_tables()` over a OneLake catalog is slow (materializes every table's columns
   = N OneLake reads) — use targeted `lake.<schema>.<t>` access. **Sync lag:** the SQL endpoint may not list a
   just-created table immediately, but same-session ops use the C++ entry cache so CREATE→INSERT→DELETE works.
-  **Protocol-compliance fix (2026-06-29, after a Fabric OneLake conversion failure):** our row-tracking + DV
-  commits were NON-compliant — the protocol declared `["rowTracking"]` but (a) `rowTracking` DEPENDS on the
-  `domainMetadata` feature (Fabric: `DELTA_FEATURES_PROTOCOL_METADATA_MISMATCH … domainMetadata`) and (b) the
-  DELETE wrote a `deletionVector` while the protocol never declared `deletionVectors` (Fabric OneLake
-  table-format conversion failed at the DELETE commit, `INTERNAL_ERROR`). Fix: engineered-wood `CreateAsync`
-  now declares table features from the config — `delta.enableRowTracking` → writerFeatures `rowTracking` +
-  `domainMetadata`; `delta.enableDeletionVectors` → reader v3 + reader/writer feature `deletionVectors`.
-  `DeltaWriter` enables BOTH on catalog-created tables. Verified the v0 protocol now =
-  `minReader 3 / minWriter 7 / readerFeatures[deletionVectors] / writerFeatures[rowTracking,domainMetadata,
-  deletionVectors]` and our read is unaffected (local regressions green). **A table created BEFORE this fix has
-  an immutable bad v0 protocol → must be recreated.** If Fabric's converter still rejects deletion vectors
-  (a Fabric DV-support limitation, not a protocol bug), the fallback is a copy-on-write DELETE (rewrite the file
-  without the deleted rows, no DV — plain add/remove, universally readable). Remaining Delta write-back work: UPDATE
-  (rowid via row tracking), OCC retry for concurrent writers, the
+  **Fabric-compat history (2026-06-29, SUPERSEDED — kept as the trail):** the first DELETE used row tracking +
+  deletion vectors. Two protocol bugs surfaced first (rowTracking missing its `domainMetadata` dependency →
+  `DELTA_FEATURES_PROTOCOL_METADATA_MISMATCH`; DVs written without the `deletionVectors` reader-v3 feature →
+  OneLake conversion `INTERNAL_ERROR`); declaring all features fixed the protocol, but Fabric/Spark STILL could
+  not read it — engineered-wood's inline DV byte format isn't Spark-decodable (Fabric DOES support DVs, so it's
+  our format). **Resolution = abandon row tracking + DVs for plain Delta + copy-on-write + transient rowid**
+  (see the DELETE paragraph above) — validated live. Remaining Delta write-back work: UPDATE
+  (copy-on-write rewrite of the SET columns, same transient rowid), OCC retry for concurrent writers, the
   `engineeredwooddelta` rename, and a `delta-rs` production provider. See docs/delta-catalog.md + docs/filesystem-bridge.md. v47 =
   **host-FS global table functions**: appended one vtable entry `set_active_opener(opener)` — a per-thread ambient (`AmbientOpener`, mirroring `set_active_txn`) recording the
   calling operator's `ClientContext` so a connection-free GLOBAL host-FS table reader (a lakehouse format)
