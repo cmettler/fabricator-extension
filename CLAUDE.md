@@ -1189,7 +1189,19 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   it explicitly. **Caveat:** `duckdb_tables()` over a OneLake catalog is slow (materializes every table's columns
   = N OneLake reads) — use targeted `lake.<schema>.<t>` access. **Sync lag:** the SQL endpoint may not list a
   just-created table immediately, but same-session ops use the C++ entry cache so CREATE→INSERT→DELETE works.
-  Remaining Delta write-back work: UPDATE
+  **Protocol-compliance fix (2026-06-29, after a Fabric OneLake conversion failure):** our row-tracking + DV
+  commits were NON-compliant — the protocol declared `["rowTracking"]` but (a) `rowTracking` DEPENDS on the
+  `domainMetadata` feature (Fabric: `DELTA_FEATURES_PROTOCOL_METADATA_MISMATCH … domainMetadata`) and (b) the
+  DELETE wrote a `deletionVector` while the protocol never declared `deletionVectors` (Fabric OneLake
+  table-format conversion failed at the DELETE commit, `INTERNAL_ERROR`). Fix: engineered-wood `CreateAsync`
+  now declares table features from the config — `delta.enableRowTracking` → writerFeatures `rowTracking` +
+  `domainMetadata`; `delta.enableDeletionVectors` → reader v3 + reader/writer feature `deletionVectors`.
+  `DeltaWriter` enables BOTH on catalog-created tables. Verified the v0 protocol now =
+  `minReader 3 / minWriter 7 / readerFeatures[deletionVectors] / writerFeatures[rowTracking,domainMetadata,
+  deletionVectors]` and our read is unaffected (local regressions green). **A table created BEFORE this fix has
+  an immutable bad v0 protocol → must be recreated.** If Fabric's converter still rejects deletion vectors
+  (a Fabric DV-support limitation, not a protocol bug), the fallback is a copy-on-write DELETE (rewrite the file
+  without the deleted rows, no DV — plain add/remove, universally readable). Remaining Delta write-back work: UPDATE
   (rowid via row tracking), OCC retry for concurrent writers, the
   `engineeredwooddelta` rename, and a `delta-rs` production provider. See docs/delta-catalog.md + docs/filesystem-bridge.md. v47 =
   **host-FS global table functions**: appended one vtable entry `set_active_opener(opener)` — a per-thread ambient (`AmbientOpener`, mirroring `set_active_txn`) recording the

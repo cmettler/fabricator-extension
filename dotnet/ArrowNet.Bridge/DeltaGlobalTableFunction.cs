@@ -219,11 +219,14 @@ internal static class DeltaWriter
         },
     };
 
-    // Enable Delta row tracking on tables we create, so each row gets a stable _metadata.row_id — the row
-    // identity the catalog surfaces as the DuckDB rowid for UPDATE/DELETE (a writer-v7 table feature).
+    // Table features enabled on catalog-created tables: row tracking (stable _metadata.row_id → the DuckDB
+    // rowid for UPDATE/DELETE) AND deletion vectors (DELETE writes a DV). Both are declared in the protocol at
+    // create (rowTracking+domainMetadata writer features; deletionVectors reader+writer, reader v3) so the
+    // commits are protocol-compliant for strict readers — Fabric's OneLake converter, delta-kernel.
     private static readonly Dictionary<string, string> RowTrackingConfig = new()
     {
         ["delta.enableRowTracking"] = "true",
+        ["delta.enableDeletionVectors"] = "true",
     };
 
     /// <summary>Opens-or-creates the Delta table at <paramref name="path"/> and writes <paramref name="batches"/>
