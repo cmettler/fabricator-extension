@@ -163,12 +163,23 @@ public sealed class DeltaCatalog : IBackendCatalog
     private static NotSupportedException Unsupported(string what) =>
         new($"delta provider: {what} not supported yet.");
 
+    /// <summary>DROP TABLE = recursively delete the table's <c>&lt;root&gt;/&lt;table&gt;/</c> folder (its _delta_log
+    /// + all data files) via the host's recursive directory-delete callback. Idempotent (no error if missing);
+    /// <paramref name="ifExists"/> is therefore satisfied either way.</summary>
+    public void DropTable(string schemaName, string tableName, bool ifExists)
+    {
+        if (!HostFs.CanRemoveDir)
+        {
+            throw Unsupported("DROP TABLE (host does not provide a recursive directory-delete callback)");
+        }
+        HostFs.RemoveDir(AmbientOpener.Current, TablePath(tableName));
+    }
+
     public IArrowArrayStream ExecuteQuery(string sql) => throw Unsupported("raw query");
     public long ExecuteNonQuery(string sql) => throw Unsupported("exec");
     public long ExecuteDelete(string s, string t, IArrowArrayStream k) => throw Unsupported("DELETE");
     public long ExecuteUpdate(string s, string t, int n, IArrowArrayStream d) => throw Unsupported("UPDATE");
     public IArrowArrayStream InsertReturning(string s, string t, IArrowArrayStream r) => throw Unsupported("INSERT ... RETURNING");
-    public void DropTable(string s, string t, bool ie) => throw Unsupported("DROP TABLE (no recursive delete callback)");
     public void DropSchema(string s, bool ie) => throw Unsupported("DROP SCHEMA");
     public void AlterTable(int k, string s, string t, string? a1, string? a2, Field? c, int f) => throw Unsupported("ALTER TABLE");
 

@@ -1079,7 +1079,12 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v48** (v48 = **host-FS WRITE surface** — the Delta write-back foundation: appended five
+- **Current version: ABI v49** (v49 = **recursive directory delete** — appended `fs_remove_dir(opener,path,…)` to
+  `ArrowNetHostServices` (the reverse host→managed struct, not the vtable): deletes a directory RECURSIVELY via
+  DuckDB's `FileSystem::RemoveDirectory` (idempotent — no error if absent). Powers **Delta catalog DROP TABLE**
+  (`DeltaCatalog.DropTable` → `HostFs.RemoveDir` removes the table's whole `<root>/<table>/` folder; opener
+  threaded by `DropEntry`'s `ArrowNetSetActiveTxn`). `test/verify_delta_catalog_write.test` (31). v48 =
+  **host-FS WRITE surface** — the Delta write-back foundation: appended five
   WRITE callbacks to `ArrowNetHostServices` (the reverse host→managed struct, not the vtable) —
   `fs_open_write(opener,path,exclusive,…)` / `fs_write` / `fs_close_write` / `fs_remove` / `fs_create_dir` — plus
   the `ARROWNET_ALREADY_EXISTS=4` status. `exclusive=1` opens with `EXCLUSIVE_CREATE` (the put-if-absent commit
@@ -1129,8 +1134,11 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   plain INSERT ⇒ `Append`; one commit per statement; `CreateTable` writes empty commit-0 (PK/UNIQUE/DEFAULT
   ignored — Delta has none); `DeltaWriter.Materialize` IPC-round-trips the streamed batches for the commit. NO
   ABI change (reuses bulk + the v47 `set_active_opener`). `test/verify_delta_catalog_write.test` (29 — CREATE/
-  INSERT/append/CTAS/aggregate + detach/re-attach durability, LOCAL). **Still unsupported** (clean error):
-  DROP TABLE (no recursive-delete host callback), DELETE, UPDATE, raw exec. **OneLake/ADLS auto-discovery is
+  INSERT/append/CTAS/aggregate + DROP TABLE + detach/re-attach durability, LOCAL). **DROP TABLE DONE** (ABI v49
+  — appended `fs_remove_dir` to `ArrowNetHostServices`: recursive directory delete via DuckDB's
+  `FileSystem::RemoveDirectory`, idempotent; `DeltaCatalog.DropTable` deletes the table's whole `<root>/<table>/`
+  folder via `HostFs.RemoveDir(AmbientOpener.Current, …)`, opener threaded by `DropEntry`'s `ArrowNetSetActiveTxn`).
+  **Still unsupported** (clean error): DELETE, UPDATE, raw exec. **OneLake/ADLS auto-discovery is
   BLOCKED by a DuckDB azure-extension glob bug** (mid-path-wildcard recursion throws `type must be string, but is
   null`; reproduced with DuckDB's own `glob()`) — single-table scan works, only the multi-table enumeration under
   a OneLake root doesn't; workaround = an explicit `tables` ATTACH option or lazy per-table resolution (future).

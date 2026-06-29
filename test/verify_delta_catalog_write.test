@@ -67,17 +67,31 @@ SELECT sum(sq) FROM lake.main.squares WHERE n >= 3;
 ----
 25
 
+# DROP TABLE recursively deletes the table's folder (its _delta_log + data files).
+statement ok
+DROP TABLE lake.main.squares;
+
+query T
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'lake' ORDER BY table_name;
+----
+t
+
+# The dropped table is gone — re-discovery no longer finds it.
+statement error
+SELECT * FROM lake.main.squares;
+----
+
 statement ok
 DETACH lake;
 
 # Re-ATTACH proves the commits are durable + standard Delta (re-discovered from _delta_log).
+# `squares` was dropped, so only `t` remains.
 statement ok
 ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogw' AS lake2 (TYPE arrownet, PROVIDER 'delta');
 
 query T
 SELECT table_name FROM duckdb_tables() WHERE database_name = 'lake2' ORDER BY table_name;
 ----
-squares
 t
 
 query I

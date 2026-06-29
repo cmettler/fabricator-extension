@@ -223,6 +223,28 @@ internal static unsafe class HostFs
         }
     }
 
+    /// <summary>True once the host registered the recursive directory-delete callback (ABI v49+).</summary>
+    public static bool CanRemoveDir => _set && _h.FsRemoveDir != null;
+
+    /// <summary>Removes directory <paramref name="path"/> RECURSIVELY (all files + subdirs; no error if missing).</summary>
+    public static void RemoveDir(nint opener, string path)
+    {
+        var pathPtr = Marshal.StringToCoTaskMemUTF8(path);
+        try
+        {
+            byte* err = null;
+            int rc = _h.FsRemoveDir(opener, (byte*)pathPtr, &err);
+            if (rc != ArrowNetStatus.Ok)
+            {
+                throw HostError("fs_remove_dir", err);
+            }
+        }
+        finally
+        {
+            Marshal.FreeCoTaskMem(pathPtr);
+        }
+    }
+
     /// <summary>True once the host registered the host_query callback.</summary>
     public static bool CanQuery => _set && _h.HostQuery != null;
 

@@ -667,13 +667,17 @@ typedef struct ArrowNetHostServices {
 	// Create directory `path` (idempotent — ok if it already exists). On object stores directories are implicit;
 	// on a local filesystem this materializes the parent (e.g. `_delta_log/`) before a write.
 	int32_t (*fs_create_dir)(ArrowNetHandle opener, const char *path, char **err);
+	// Remove directory `path` RECURSIVELY (all files + subdirectories). Idempotent — no error if it does not
+	// exist. Maps to DuckDB's FileSystem::RemoveDirectory (recursive on local; on object stores it deletes every
+	// object under the prefix). Used to DROP a Delta catalog table (its whole `<table>/` folder).
+	int32_t (*fs_remove_dir)(ArrowNetHandle opener, const char *path, char **err);
 } ArrowNetHostServices;
 
 // Max serialized size of a spillable aggregate's per-group state (the inline, pointer-free
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 48
+#define ARROWNET_ABI_VERSION 49
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

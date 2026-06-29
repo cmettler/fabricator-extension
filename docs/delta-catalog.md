@@ -326,10 +326,11 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      result), plain INSERT ⇒ `Append`; one Delta commit per statement. `CreateTable` writes an empty commit-0
      (schema only; PK/UNIQUE/DEFAULT ignored — Delta has no such constraints). `DeltaWriter.Materialize` does the
      Arrow IPC round-trip from the streamed `ChannelArrowStream` into retained batches for the single commit.
-     Validated local: `test/verify_delta_catalog_write.test` (29 — CREATE/INSERT/append/CTAS/aggregate +
-     detach/re-attach durability). **Still unsupported** (throw a clean error): DROP TABLE (no recursive-delete
-     host callback yet), DELETE, UPDATE, raw exec. **Remaining for production write concurrency:** the OCC retry
-     loop (catch `DeltaConflictException` → reopen → retry) for concurrent writers.
+     Validated local: `test/verify_delta_catalog_write.test` (31 — CREATE/INSERT/append/CTAS/aggregate + DROP
+     TABLE + detach/re-attach durability). **DROP TABLE** recursively deletes the table's `<root>/<table>/` folder
+     via a new host-FS callback `fs_remove_dir` (ABI v49 — DuckDB's `FileSystem::RemoveDirectory`, idempotent).
+     **Still unsupported** (throw a clean error): DELETE, UPDATE, raw exec. **Remaining for production write
+     concurrency:** the OCC retry loop (catch `DeltaConflictException` → reopen → retry) for concurrent writers.
 3. **DELETE** — pick the rowid-vs-predicate strategy (lean: predicate via `FilterNode → Predicate`, since it's
    contained and doesn't need an engineered-wood position-delete addition); deletion vectors handled by
    engineered-wood.

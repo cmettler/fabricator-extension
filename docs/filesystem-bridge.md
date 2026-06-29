@@ -152,3 +152,7 @@ exclusive-create-copy → false on an existing target → `DeltaConflictExceptio
 object-store 404 (glob of a missing prefix) to empty. Validated end-to-end (write+read round-trip) on local +
 a live OneLake lakehouse via `arrownet_delta_write_demo(path)` (`test/verify_delta_write.test`). The Delta
 write-back foundation — see docs/delta-catalog.md (recommendation step 0).
+
+**v49** appended `fs_remove_dir`(opener,path) — a RECURSIVE directory delete (DuckDB's
+`FileSystem::RemoveDirectory`, idempotent). Powers Delta catalog **DROP TABLE** (`DeltaCatalog.DropTable` →
+`HostFs.RemoveDir` deletes the table's whole `<root>/<table>/` folder). See docs/delta-catalog.md.

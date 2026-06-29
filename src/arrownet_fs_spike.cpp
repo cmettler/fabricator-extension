@@ -255,6 +255,22 @@ int32_t HostFsCreateDir(ArrowNetHandle opener, const char *path, char **err) {
 	}
 }
 
+int32_t HostFsRemoveDir(ArrowNetHandle opener, const char *path, char **err) {
+	try {
+		auto *ctx = reinterpret_cast<ClientContext *>(opener);
+		auto &fs = FileSystem::GetFileSystem(*ctx);
+		if (fs.DirectoryExists(path)) {
+			fs.RemoveDirectory(path); // recursive; idempotent (skip if absent)
+		}
+		return ARROWNET_OK;
+	} catch (std::exception &e) {
+		if (err) {
+			*err = DupErr(e.what());
+		}
+		return 1;
+	}
+}
+
 void InstallHostFsServices() {
 	ArrowNetHostServices services {};
 	services.abi_version = ARROWNET_ABI_VERSION;
@@ -269,6 +285,7 @@ void InstallHostFsServices() {
 	services.fs_close_write = HostFsCloseWrite;
 	services.fs_remove = HostFsRemove;
 	services.fs_create_dir = HostFsCreateDir;
+	services.fs_remove_dir = HostFsRemoveDir;
 	arrownet::SetHostServices(services);
 }
 
