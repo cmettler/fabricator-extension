@@ -105,7 +105,9 @@ internal static class DeltaReader
     public static long DeleteByRowIds(nint opener, string path, IReadOnlyCollection<long> rowIds, CancellationToken ct)
     {
         var fs = new DuckDbTableFileSystem(opener, path);
-        var table = DeltaTable.OpenAsync(fs, DeltaTableOptions.Default, ct).AsTask().GetAwaiter().GetResult();
+        // Open with the standard WRITE options (OmitPathInSchema=false) so the copy-on-write rewrite emits
+        // standard-readable parquet — DeltaTableOptions.Default would drop path_in_schema (TProtocolException).
+        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).AsTask().GetAwaiter().GetResult();
         try
         {
             return table.DeleteByRowIdsAsync(rowIds, ct).AsTask().GetAwaiter().GetResult().RowsDeleted;

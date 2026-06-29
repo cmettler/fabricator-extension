@@ -1153,7 +1153,14 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   (Fabric OneLake conversion, Spark, delta-kernel) reads it. **engineered-wood** (local working changes):
   `ReadAllWithRowIdsAsync` appends the transient rowid (`OrderedActiveFiles` path-sort + per-file position);
   `DeleteByRowIdsAsync` decodes rowids → positions-per-file → copy-on-write rewrite; `CreateAsync` writes plain
-  Delta (the feature-declaration logic stays but is unused — `DeltaWriter` passes no config). **Virtual rowid
+  Delta (the feature-declaration logic stays but is unused — `DeltaWriter` passes no config). **Two parquet
+  footer gotchas the rewrite hit** (both made the rewritten file unreadable by delta-kernel/Spark/Fabric with
+  `TProtocolException: Invalid data`, while OUR reader tolerated it): (1) the rewrite must open with
+  `DeltaWriter.Options()` (`OmitPathInSchema=false`) — `DeltaTableOptions.Default` drops the REQUIRED parquet
+  `path_in_schema`; (2) the rewrite must REBUILD each kept batch with a CLEAN schema (drop the parquet reader's
+  field metadata, e.g. an existing `PARQUET:field_id`) before re-writing — else `SetParquetFieldIds` collides
+  and the footer is malformed. With both, delta-kernel reads our copy-on-write output (verified locally via
+  DuckDB's official `delta_scan` — the reference reader Spark/Fabric use). **Virtual rowid
   threading** (the crux — `_metadata.row_id` is NOT a user column; surfacing it as one would break INSERT):
   `FetchRowIdColumns` returning a name absent from the schema is treated as a VIRTUAL rowid — `ArrowNetTableEntry`/
   `ArrowStreamBindData` carry the NAMES (not indices) in `virtual_rowid_columns`, `HasRowId`/`GetVirtualColumns`/

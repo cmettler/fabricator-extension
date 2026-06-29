@@ -210,7 +210,10 @@ public sealed class DeltaWriteDemoFunction : ITableFunction
 /// </summary>
 internal static class DeltaWriter
 {
-    private static DeltaTableOptions Options() => DeltaTableOptions.Default with
+    /// <summary>Delta table options for ALL engineered-wood writes (initial write AND the copy-on-write DELETE
+    /// rewrite): the parquet writer MUST emit <c>path_in_schema</c> (OmitPathInSchema=false) or standard readers
+    /// (delta-kernel / Spark / Fabric) reject the footer with <c>TProtocolException: Invalid data</c>.</summary>
+    internal static DeltaTableOptions Options() => DeltaTableOptions.Default with
     {
         ParquetWriteOptions = new ParquetWriteOptions
         {
