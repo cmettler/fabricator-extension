@@ -13,14 +13,21 @@ Two Delta providers are emerging — keep them distinct:
   Arrow source, dynamic filters applied in our scan loop. Native build is Rust (Linux-oriented README; Windows
   via WSL or a native toolchain — feasibility TBD).
 
-**OneLake/ADLS table discovery — the glob bug is upstream (DuckDB `duckdb-azure` #174), not ours.** A
-mid-path-wildcard glob (`<root>/*/_delta_log/…`) throws `type must be string, but is null` recursing a OneLake
-listing. **Workaround for Fabric: the Fabric REST API** (`Microsoft.Fabric.Api` NuGet) —
-`TablesClient.ListTables(workspaceId, lakehouseId)` returns each `Table { Name, Location, Format }` (Location =
-the exact abfss path, Format = "Delta"), so discovery needs NO glob and even hands us the table location
-directly. Auth = a `TokenCredential` (the same Fabric SP, Fabric scope) against `https://api.fabric.microsoft.com/v1`;
-the connstr would carry / resolve workspace + lakehouse (names → GUIDs via the Workspaces/Items API, or GUIDs
-given). The Unity Catalog API is an alternative but read-only.
+**OneLake table discovery — via the Fabric REST API (DONE; the upstream glob bug is duckdb-azure #174, not ours).**
+A mid-path-wildcard glob (`<root>/*/_delta_log/…`) throws `type must be string, but is null` recursing a OneLake
+listing, so a OneLake root discovers its tables via the **Fabric REST API** instead of `HostFs.Glob`
+(`FabricLakehouse`, Bridge): `TablesClient.ListTables(workspaceId, lakehouseId)` (`Microsoft.Fabric.Api` 2.14.0)
+returns each `Table { Name, Location, Format }`. **Local / S3 / plain-ADLS roots keep the glob** —
+`DeltaCatalog.DiscoverTables` branches on `FabricLakehouse.IsOneLake(_root)` (host contains `onelake.`).
+Workspace + lakehouse are parsed from `abfss://<ws>@onelake…/<lh>[.Lakehouse]/Tables`: GUID segments are used
+directly, display names are resolved via `WorkspacesClient`/`ItemsClient`. Auth = a `TokenCredential` against
+`https://api.fabric.microsoft.com/v1` (scope `…/.default`), minted from the **ATTACH'd azure SP secret** —
+`ATTACH '…OneLake…/Tables' (TYPE arrownet, PROVIDER 'delta', SECRET <azure_sp>)` flows the secret through the v39
+foreign-secret path → `DeltaBackend.BuildConnectionString` appends a base64 cred marker on the root →
+`DeltaCatalog` extracts it into a `ClientSecretCredential` (mirrors the DAX provider). The Fabric API is used
+ONLY to list table names; the data files are still read/written through DuckDB's FileSystem (the opener + a
+DuckDB azure secret). **Live Fabric CREATE→INSERT→DELETE validation is pending** (needs Fabric creds + a
+lakehouse). The Unity Catalog API is an alternative but read-only.
 
 **Write quality:** the engineered-wood write path emits one parquet file per input `RecordBatch` (TargetFileSize
 is compaction-only). Row-group size IS controllable (`ParquetWriteOptions.RowGroupMaxRows` — now set to DuckDB's
@@ -296,13 +303,12 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
    is threaded into the catalog metadata path: `LoadCatalog`/`RefreshCache` now call `ArrowNetSetActiveTxn`
    (which also sets the opener) before discovery, and `FetchTableColumns` already did. Validated on a LOCAL
    Delta root: `test/verify_delta_catalog.test` (17 — discovery, filter pushdown, aggregate, cross-table join).
-   **OneLake/ADLS auto-discovery is BLOCKED by a DuckDB azure-extension glob bug**: a mid-path-wildcard glob
-   (`<root>/*/_delta_log/…`, needed to enumerate the table subdirs) throws
-   `[json.exception.type_error.302] type must be string, but is null` when it recurses the root listing — and
-   `<root>/*` returns no directories — so tables under a OneLake root can't be enumerated (a single table's
-   `<root>/<table>/_delta_log/*` glob DOES work, which is why `arrownet_delta_scan`/the global write are fine).
-   Reproduced with DuckDB's own `glob()` (not our code). Workarounds (future): an explicit `tables := 'a,b'`
-   ATTACH option, or lazy per-table resolution (resolve a referenced table by globbing just its own log).
+   **OneLake table discovery uses the Fabric REST API** (the DuckDB azure glob can't recurse a OneLake
+   `_delta_log` tree — duckdb-azure #174 — `<root>/*/_delta_log/…` throws `type must be string, but is null`).
+   `DeltaCatalog.DiscoverTables` branches on `FabricLakehouse.IsOneLake(_root)`: OneLake →
+   `TablesClient.ListTables`; **local / S3 / plain ADLS keep the glob**. See the "OneLake table discovery" note
+   near the top of this doc for auth (the ATTACH'd azure SP secret) + workspace/lakehouse resolution. Live Fabric
+   validation pending.
 2. **Write arbitrary data — DONE, both the function form AND the catalog (streaming) form.**
    - **Function form** (`arrownet_delta_write(<input>, path := '…')`): a connection-free GLOBAL host-FS
      **collector** (`DeltaWriteCollectorFunction`) that writes ANY input table (a DuckDB query result) to a Delta

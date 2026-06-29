@@ -1158,11 +1158,20 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   when requested; `ExecuteDelete` collects the ids → `DeleteByRowIdsAsync`. The global `arrownet_delta_write`
   collector/demo leave row tracking OFF (no DML, max delta-kernel compatibility). `test/verify_delta_catalog_delete.test`
   (28 — equality/range/name predicates + durable across re-attach + DELETE-all). **Still unsupported** (clean
-  error): UPDATE (next — needs `UpdateByRowIdsAsync`), raw exec. **OneLake/ADLS auto-discovery is
-  BLOCKED by a DuckDB azure-extension glob bug** (mid-path-wildcard recursion throws `type must be string, but is
-  null`; reproduced with DuckDB's own `glob()`) — single-table scan works, only the multi-table enumeration under
-  a OneLake root doesn't; workaround = an explicit `tables` ATTACH option or lazy per-table resolution (future).
-  Remaining Delta write-back work: UPDATE (rowid via row tracking), OCC retry for concurrent writers, the
+  error): UPDATE (next — needs `UpdateByRowIdsAsync`), raw exec. **OneLake table discovery — via the Fabric REST
+  API** (`FabricLakehouse`, Bridge): DuckDB's azure glob can't recurse a OneLake `_delta_log` tree (mid-path
+  wildcard → `type must be string, but is null`, duckdb-azure PR #174), so a OneLake root
+  (`abfss://<ws>@onelake…/<lh>.Lakehouse/Tables`) lists its tables via `TablesClient.ListTables`
+  (`Microsoft.Fabric.Api` 2.14.0) instead of `HostFs.Glob`; **local/S3/plain-ADLS roots keep the glob**
+  (`DeltaCatalog.DiscoverTables` branches on `FabricLakehouse.IsOneLake`). Workspace/lakehouse are GUIDs (used
+  directly) or display names (resolved via `WorkspacesClient`/`ItemsClient`). Auth = the **ATTACH'd azure SP
+  secret** (`ATTACH '…OneLake…' (TYPE arrownet, PROVIDER 'delta', SECRET <azure_sp>)` → v39 foreign-secret path →
+  `DeltaBackend.BuildConnectionString` appends a cred marker on the root → `DeltaCatalog` mints a
+  `ClientSecretCredential`, mirroring DAX); the data files are still read/written through DuckDB's FileSystem (the
+  opener + a DuckDB azure secret) — the Fabric API is used ONLY to list table names. **Live Fabric CREATE→INSERT→
+  DELETE validation is pending** (needs Fabric creds + a lakehouse; the writer-v7 `rowTracking` + materialized
+  `__delta_row_id` cross-reader readability is what a live test confirms). Remaining Delta write-back work: UPDATE
+  (rowid via row tracking), OCC retry for concurrent writers, the
   `engineeredwooddelta` rename, and a `delta-rs` production provider. See docs/delta-catalog.md + docs/filesystem-bridge.md. v47 =
   **host-FS global table functions**: appended one vtable entry `set_active_opener(opener)` — a per-thread ambient (`AmbientOpener`, mirroring `set_active_txn`) recording the
   calling operator's `ClientContext` so a connection-free GLOBAL host-FS table reader (a lakehouse format)

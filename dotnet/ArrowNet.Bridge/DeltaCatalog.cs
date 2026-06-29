@@ -25,9 +25,19 @@ public sealed class DeltaBackend : IBackend
 
     public IEnumerable<string> Aliases => new[] { "deltalake" };
 
-    // Delta has no provider secret (cloud auth is via DuckDB FS secrets); the connstr IS the folder root.
+    // The connstr IS the folder root. Data-file IO is via DuckDB FS secrets (the opener). An azure SP secret on
+    // a OneLake ATTACH additionally authenticates the Fabric REST API used to list tables (the glob bug
+    // workaround) — carry its fields to the catalog as a credential marker on the root (mirrors the DAX provider).
     public string BuildConnectionString(
-        string secretType, IReadOnlyDictionary<string, string> fields, string baseConnString) => baseConnString;
+        string secretType, IReadOnlyDictionary<string, string> fields, string baseConnString)
+    {
+        if (secretType.Equals("azure", System.StringComparison.OrdinalIgnoreCase)
+            && FabricLakehouse.IsOneLake(baseConnString))
+        {
+            return FabricLakehouse.AppendCredMarker(baseConnString, fields);
+        }
+        return baseConnString;
+    }
 
     public IBackendCatalog OpenCatalog(string connectionString, string optionsJson) =>
         new DeltaCatalog(connectionString);
@@ -43,8 +53,16 @@ public sealed class DeltaCatalog : IBackendCatalog
     // of the user schema). Matches EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.VirtualRowIdColumn.
     private const string RowIdColumn = "_metadata.row_id";
     private readonly string _root; // normalized (forward slashes), no trailing slash
+    // For a OneLake root: the Fabric REST API credential (from the ATTACH'd azure SP secret) used to list
+    // tables. Null for local/S3/ADLS (which discover tables by glob) or when no secret was supplied.
+    private readonly Azure.Core.TokenCredential? _fabricCredential;
 
-    public DeltaCatalog(string root) => _root = Normalize(root).TrimEnd('/');
+    public DeltaCatalog(string root)
+    {
+        var (clean, credential) = FabricLakehouse.Extract(root);
+        _root = Normalize(clean).TrimEnd('/');
+        _fabricCredential = credential;
+    }
 
     private static string Normalize(string p) => p.Replace('\\', '/');
 
@@ -73,22 +91,35 @@ public sealed class DeltaCatalog : IBackendCatalog
     private IArrowArrayStream DiscoverTables()
     {
         var names = new SortedSet<string>(System.StringComparer.Ordinal);
-        var json = HostFs.Glob(AmbientOpener.Current, _root + "/*/_delta_log/*.json");
-        using var doc = JsonDocument.Parse(json);
-        foreach (var el in doc.RootElement.EnumerateArray())
+        if (FabricLakehouse.IsOneLake(_root))
         {
-            var path = Normalize(el.GetProperty("path").GetString() ?? string.Empty);
-            // …/<table>/_delta_log/<file>.json  →  the segment before "/_delta_log/".
-            int marker = path.IndexOf("/_delta_log/", System.StringComparison.Ordinal);
-            if (marker < 0)
+            // OneLake: DuckDB's azure glob can't recurse a _delta_log tree (PR #174), so list via the Fabric
+            // REST API (table data is still read/written through DuckDB's FileSystem on _root/<name>).
+            foreach (var n in FabricLakehouse.ListTableNames(_root, _fabricCredential))
             {
-                continue;
+                names.Add(n);
             }
-            int slash = path.LastIndexOf('/', marker - 1);
-            var name = slash < 0 ? path.Substring(0, marker) : path.Substring(slash + 1, marker - slash - 1);
-            if (name.Length > 0)
+        }
+        else
+        {
+            // Local / S3 / plain ADLS: discover by globbing the commit files <root>/*/_delta_log/*.json.
+            var json = HostFs.Glob(AmbientOpener.Current, _root + "/*/_delta_log/*.json");
+            using var doc = JsonDocument.Parse(json);
+            foreach (var el in doc.RootElement.EnumerateArray())
             {
-                names.Add(name);
+                var path = Normalize(el.GetProperty("path").GetString() ?? string.Empty);
+                // …/<table>/_delta_log/<file>.json  →  the segment before "/_delta_log/".
+                int marker = path.IndexOf("/_delta_log/", System.StringComparison.Ordinal);
+                if (marker < 0)
+                {
+                    continue;
+                }
+                int slash = path.LastIndexOf('/', marker - 1);
+                var name = slash < 0 ? path.Substring(0, marker) : path.Substring(slash + 1, marker - slash - 1);
+                if (name.Length > 0)
+                {
+                    names.Add(name);
+                }
             }
         }
         var schemaCol = new List<string>();
