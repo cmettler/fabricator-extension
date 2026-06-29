@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using Apache.Arrow;
+using EngineeredWood.DeltaLake;
 using EngineeredWood.DeltaLake.Table;
 using EngineeredWood.Expressions;
 using EngineeredWood.Parquet;
@@ -112,11 +113,22 @@ internal static class DeltaReader
         {
             return table.DeleteByRowIdsAsync(rowIds, ct).AsTask().GetAwaiter().GetResult().RowsDeleted;
         }
+        catch (DeltaConflictException)
+        {
+            throw ConcurrentModification("DELETE");
+        }
         finally
         {
             table.DisposeAsync().AsTask().GetAwaiter().GetResult();
         }
     }
+
+    // A rowid DELETE/UPDATE cannot be safely retried on a commit conflict: its absolute positions were computed
+    // against the scanned snapshot, which a concurrent writer has changed. Surface a clear, retryable-by-the-user
+    // error instead (re-running re-scans and recomputes the rowids).
+    private static System.InvalidOperationException ConcurrentModification(string op) =>
+        new($"delta: concurrent modification during {op} — another writer committed; the row positions are no "
+            + "longer valid. Retry the statement.");
 
     /// <summary>True if the Delta table at <paramref name="path"/> has <c>delta.enableDeletionVectors=true</c>
     /// — DELETE then uses deletion vectors (no file rewrite) instead of copy-on-write.</summary>
@@ -148,6 +160,10 @@ internal static class DeltaReader
         {
             return table.DeleteByRowIdsViaVectorsAsync(rowIds, ct).AsTask().GetAwaiter().GetResult().RowsDeleted;
         }
+        catch (DeltaConflictException)
+        {
+            throw ConcurrentModification("DELETE");
+        }
         finally
         {
             table.DisposeAsync().AsTask().GetAwaiter().GetResult();
@@ -166,6 +182,10 @@ internal static class DeltaReader
         try
         {
             table.UpdateByRowIdsAsync(rowIds, rewriteFile, ct).AsTask().GetAwaiter().GetResult();
+        }
+        catch (DeltaConflictException)
+        {
+            throw ConcurrentModification("UPDATE");
         }
         finally
         {

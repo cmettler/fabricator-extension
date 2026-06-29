@@ -238,23 +238,38 @@ internal static class DeltaWriter
         ["delta.enableRowTracking"] = "true",
     };
 
+    // Optimistic-concurrency retry bound for commits. A concurrent writer that commits our target version
+    // first makes engineered-wood throw DeltaConflictException; we reopen (picking up the new latest version)
+    // and retry. Safe for append/overwrite/create — the data doesn't depend on the conflicting commit. Rowid
+    // DELETE/UPDATE do NOT retry (their absolute positions are tied to the scanned snapshot — a concurrent
+    // change invalidates them; DeltaReader surfaces a clear conflict error instead).
+    internal const int MaxCommitAttempts = 16;
+
     /// <summary>Opens-or-creates the Delta table at <paramref name="path"/> and writes <paramref name="batches"/>
     /// in <paramref name="mode"/> (Overwrite for CTAS/REPLACE, Append for INSERT). Returns the committed version.
-    /// <paramref name="deletionVectors"/> enables the DV+rowTracking features on a NEW table (opt-in fast-delete).</summary>
+    /// <paramref name="deletionVectors"/> enables the DV+rowTracking features on a NEW table (opt-in fast-delete).
+    /// Retries on a commit conflict (concurrent writer) by reopening at the new latest version (OCC).</summary>
     public static long Write(nint opener, string path, Schema schema, IReadOnlyList<RecordBatch> batches,
                              DeltaWriteMode mode, CancellationToken ct, bool deletionVectors = false)
     {
-        var fs = new DuckDbTableFileSystem(opener, path);
-        var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(),
-                                                 configuration: deletionVectors ? DeletionVectorConfig : null,
-                                                 cancellationToken: ct).AsTask().GetAwaiter().GetResult();
-        try
+        for (int attempt = 1; ; attempt++)
         {
-            return table.WriteAsync(batches, mode, ct).AsTask().GetAwaiter().GetResult();
-        }
-        finally
-        {
-            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            var fs = new DuckDbTableFileSystem(opener, path);
+            var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(),
+                                                     configuration: deletionVectors ? DeletionVectorConfig : null,
+                                                     cancellationToken: ct).AsTask().GetAwaiter().GetResult();
+            try
+            {
+                return table.WriteAsync(batches, mode, ct).AsTask().GetAwaiter().GetResult();
+            }
+            catch (EngineeredWood.DeltaLake.DeltaConflictException) when (attempt < MaxCommitAttempts)
+            {
+                // Concurrent writer took our version — reopen + retry (append/overwrite is snapshot-independent).
+            }
+            finally
+            {
+                table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            }
         }
     }
 
@@ -267,11 +282,23 @@ internal static class DeltaWriter
     public static void Create(nint opener, string path, Schema schema, CancellationToken ct,
                               bool deletionVectors = false)
     {
-        var fs = new DuckDbTableFileSystem(opener, path);
-        var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(),
-                                                 configuration: deletionVectors ? DeletionVectorConfig : null,
-                                                 cancellationToken: ct).AsTask().GetAwaiter().GetResult();
-        table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        for (int attempt = 1; ; attempt++)
+        {
+            var fs = new DuckDbTableFileSystem(opener, path);
+            try
+            {
+                // OpenOrCreate writes commit-0 for a new table (or opens an existing one — no commit, no conflict).
+                var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(),
+                                                         configuration: deletionVectors ? DeletionVectorConfig : null,
+                                                         cancellationToken: ct).AsTask().GetAwaiter().GetResult();
+                table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                return;
+            }
+            catch (EngineeredWood.DeltaLake.DeltaConflictException) when (attempt < MaxCommitAttempts)
+            {
+                // A concurrent creator won commit-0 — retry (the next OpenOrCreate will just open it).
+            }
+        }
     }
 
     /// <summary>Materializes a (possibly streamed) Arrow stream into independent in-memory batches via an Arrow

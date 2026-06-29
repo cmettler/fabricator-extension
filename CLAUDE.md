@@ -1250,7 +1250,14 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `RemoveFile` carries the file's DV so it matches the active `(path, DV)` entry (without that the old file stayed
   active → duplicated rows — the bug found in testing). Verified local (`test/verify_delta_catalog_dv.test`, 48 —
   DV delete + composition + UPDATE-on-DV + post-UPDATE DV delete + re-attach) + delta-kernel `delta_scan` read-back;
-  copy-on-write delete (28)/update (63)/write (31) unregressed. Other remaining (OPTIONAL): OCC retry for concurrent writers, the
+  copy-on-write delete (28)/update (63)/write (31) unregressed. **OCC RETRY DONE (concurrent writers):**
+  engineered-wood `WriteCommitAsync` throws `DeltaConflictException` when a concurrent writer takes the target
+  version; `DeltaWriter.Write`/`Create` (append/CTAS/create) catch it and retry by reopening at the new latest
+  version (bounded `MaxCommitAttempts=16`) — the data is snapshot-independent so re-commit is safe. Rowid
+  DELETE/UPDATE do NOT retry (their absolute positions are tied to the scanned snapshot; a concurrent change
+  invalidates them) — `DeltaReader` surfaces a clear "concurrent modification — retry the statement" error.
+  Verified: 4 parallel processes appending 200 rows each to ONE local Delta table → 800/800 distinct, no lost
+  commits, no surfaced conflicts. Other remaining (OPTIONAL): the
   `engineeredwooddelta` rename, and a `delta-rs` production provider. See docs/delta-catalog.md + docs/filesystem-bridge.md. v47 =
   **host-FS global table functions**: appended one vtable entry `set_active_opener(opener)` — a per-thread ambient (`AmbientOpener`, mirroring `set_active_txn`) recording the
   calling operator's `ClientContext` so a connection-free GLOBAL host-FS table reader (a lakehouse format)
