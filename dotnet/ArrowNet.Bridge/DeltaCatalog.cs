@@ -316,7 +316,164 @@ public sealed class DeltaCatalog : IBackendCatalog
 
     public IArrowArrayStream ExecuteQuery(string sql) => throw Unsupported("raw query");
     public long ExecuteNonQuery(string sql) => throw Unsupported("exec");
-    public long ExecuteUpdate(string s, string t, int n, IArrowArrayStream d) => throw Unsupported("UPDATE");
+
+    /// <summary>UPDATE = rowid-based copy-on-write: <paramref name="data"/> carries the new SET-column values
+    /// (columns 0..<paramref name="setColumnCount"/>-1, named by the target column) + the transient
+    /// <c>_metadata.row_id</c> (last column). We re-scan the table with rowids, replace the SET columns on the
+    /// matched rows (rebuilt as clean Apache.Arrow batches), and OVERWRITE via the proven write path — so the
+    /// output is plain Delta + standard-readable (delta-kernel/Spark/Fabric). Returns rows updated.</summary>
+    public long ExecuteUpdate(string schemaName, string tableName, int setColumnCount, IArrowArrayStream data)
+    {
+        var opener = AmbientOpener.Current;
+        var path = TablePath(schemaName, tableName);
+
+        // 1. Parse the update stream: rowid -> new SET values (aligned to the SET column order).
+        var setColNames = new List<string>();
+        var updates = new Dictionary<long, object?[]>();
+        using (data)
+        {
+            while (data.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult() is { } b)
+            {
+                using (b)
+                {
+                    if (b.Length == 0)
+                    {
+                        continue;
+                    }
+                    if (setColNames.Count == 0)
+                    {
+                        for (int j = 0; j < setColumnCount; j++)
+                        {
+                            setColNames.Add(b.Schema.FieldsList[j].Name);
+                        }
+                    }
+                    var ridArr = (Int64Array)b.Column(setColumnCount);
+                    for (int i = 0; i < b.Length; i++)
+                    {
+                        if (ridArr.GetValue(i) is not { } rid)
+                        {
+                            continue;
+                        }
+                        var vals = new object?[setColumnCount];
+                        for (int j = 0; j < setColumnCount; j++)
+                        {
+                            vals[j] = ArrowValueReader.ReadScalar(b.Column(j), i);
+                        }
+                        updates[rid] = vals;
+                    }
+                }
+            }
+        }
+        if (updates.Count == 0)
+        {
+            return 0;
+        }
+
+        // 2. Map SET column names -> user-schema column indices (case-insensitive).
+        var userSchema = DeltaReader.GetSchema(opener, path);
+        var fields = userSchema.FieldsList;
+        var setSlotByColumn = new int[fields.Count];
+        for (int c = 0; c < fields.Count; c++)
+        {
+            setSlotByColumn[c] = -1;
+            for (int j = 0; j < setColNames.Count; j++)
+            {
+                if (string.Equals(fields[c].Name, setColNames[j], System.StringComparison.OrdinalIgnoreCase))
+                {
+                    setSlotByColumn[c] = j;
+                    break;
+                }
+            }
+        }
+
+        // 3. Re-scan (with rowids), rebuild SET columns on matched rows, overwrite. Source batches are kept
+        //    alive until the write completes (the rebuilt batches reference their unchanged columns).
+        var sources = new List<RecordBatch>();
+        var rebuilt = new List<RecordBatch>();
+        long affected = 0;
+        try
+        {
+            var e = DeltaReader.StreamWithRowIds(opener, path, columns: null, filter: null, default)
+                               .GetAsyncEnumerator();
+            try
+            {
+                while (e.MoveNextAsync().AsTask().GetAwaiter().GetResult())
+                {
+                    var batch = e.Current;
+                    sources.Add(batch);
+                    var rids = (Int64Array)batch.Column(batch.ColumnCount - 1); // _metadata.row_id is appended last
+                    var newCols = new IArrowArray[fields.Count];
+                    for (int c = 0; c < fields.Count; c++)
+                    {
+                        int slot = setSlotByColumn[c];
+                        if (slot < 0)
+                        {
+                            newCols[c] = batch.Column(c); // unchanged column (referenced from the live source)
+                            continue;
+                        }
+                        var values = new List<object?>(batch.Length);
+                        for (int i = 0; i < batch.Length; i++)
+                        {
+                            long rid = rids.GetValue(i) ?? -1;
+                            values.Add(updates.TryGetValue(rid, out var nv)
+                                ? nv[slot]
+                                : ArrowValueReader.ReadScalar(batch.Column(c), i));
+                        }
+                        newCols[c] = BuildArray(fields[c].DataType, values);
+                    }
+                    for (int i = 0; i < batch.Length; i++)
+                    {
+                        if (updates.ContainsKey(rids.GetValue(i) ?? -1))
+                        {
+                            affected++;
+                        }
+                    }
+                    rebuilt.Add(new RecordBatch(userSchema, newCols, batch.Length));
+                }
+            }
+            finally
+            {
+                e.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            }
+
+            DeltaWriter.Write(opener, path, userSchema, rebuilt, DeltaWriteMode.Overwrite, default);
+        }
+        finally
+        {
+            foreach (var b in sources)
+            {
+                b.Dispose();
+            }
+        }
+        return affected;
+    }
+
+    /// <summary>Builds an Arrow array of <paramref name="type"/> from boxed CLR values (the inverse of
+    /// <see cref="ArrowValueReader.ReadScalar"/>) — used to rebuild a SET column during UPDATE. Covers the types
+    /// DuckDB↔Delta exchanges; an unsupported SET-column type throws (the UPDATE fails cleanly).</summary>
+    private static IArrowArray BuildArray(Apache.Arrow.Types.IArrowType type, List<object?> values)
+    {
+        switch (type)
+        {
+            case BooleanType: { var b = new BooleanArray.Builder(); foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append((bool)v); } return b.Build(); }
+            case Int8Type: { var b = new Int8Array.Builder(); foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append((sbyte)v); } return b.Build(); }
+            case Int16Type: { var b = new Int16Array.Builder(); foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append((short)v); } return b.Build(); }
+            case Int32Type: { var b = new Int32Array.Builder(); foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append((int)v); } return b.Build(); }
+            case Int64Type: { var b = new Int64Array.Builder(); foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append((long)v); } return b.Build(); }
+            case UInt8Type: { var b = new UInt8Array.Builder(); foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append((byte)v); } return b.Build(); }
+            case UInt16Type: { var b = new UInt16Array.Builder(); foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append((ushort)v); } return b.Build(); }
+            case UInt32Type: { var b = new UInt32Array.Builder(); foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append((uint)v); } return b.Build(); }
+            case UInt64Type: { var b = new UInt64Array.Builder(); foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append((ulong)v); } return b.Build(); }
+            case FloatType: { var b = new FloatArray.Builder(); foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append((float)v); } return b.Build(); }
+            case DoubleType: { var b = new DoubleArray.Builder(); foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append((double)v); } return b.Build(); }
+            case Decimal128Type d: { var b = new Decimal128Array.Builder(d); foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append((decimal)v); } return b.Build(); }
+            case StringType: { var b = new StringArray.Builder(); foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append((string)v); } return b.Build(); }
+            case Date32Type: { var b = new Date32Array.Builder(); foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append(System.DateOnly.FromDateTime((System.DateTime)v)); } return b.Build(); }
+            case TimestampType ts: { var b = new TimestampArray.Builder(ts); foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append(v is System.DateTimeOffset dto ? dto : new System.DateTimeOffset(System.DateTime.SpecifyKind((System.DateTime)v, System.DateTimeKind.Utc))); } return b.Build(); }
+            default: throw new NotSupportedException($"delta UPDATE: unsupported SET column type {type.TypeId}");
+        }
+    }
+
     public IArrowArrayStream InsertReturning(string s, string t, IArrowArrayStream r) => throw Unsupported("INSERT ... RETURNING");
     public void DropSchema(string s, bool ie) => throw Unsupported("DROP SCHEMA");
     public void AlterTable(int k, string s, string t, string? a1, string? a2, Field? c, int f) => throw Unsupported("ALTER TABLE");
