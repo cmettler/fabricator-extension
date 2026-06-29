@@ -52,6 +52,9 @@ public sealed class DeltaCatalog : IBackendCatalog
     // The stable row-tracking id surfaced as the DuckDB rowid for UPDATE/DELETE (a VIRTUAL column — not part
     // of the user schema). Matches EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.VirtualRowIdColumn.
     private const string RowIdColumn = "_metadata.row_id";
+    // Transient rowid packing — MUST match engineered-wood's DeltaTable.RowIdPositionBits: (fileOrdinal << 40) |
+    // rowPositionInFile. Used to recompute a row's rowid during the per-file UPDATE rewrite.
+    private const int RowIdPositionBits = 40;
     private readonly string _root; // normalized (forward slashes), no trailing slash
     // For a OneLake root: the Fabric REST API credential (from the ATTACH'd azure SP secret) used to list
     // tables (and, for a schema-enabled lakehouse, an Entra SQL token). Null for local/S3/ADLS (glob discovery)
@@ -386,66 +389,42 @@ public sealed class DeltaCatalog : IBackendCatalog
             }
         }
 
-        // 3. Re-scan (with rowids), rebuild SET columns on matched rows, overwrite. Source batches are kept
-        //    alive until the write completes (the rebuilt batches reference their unchanged columns).
-        var sources = new List<RecordBatch>();
-        var rebuilt = new List<RecordBatch>();
-        long affected = 0;
-        try
+        // 3. Per-file copy-on-write: engineered-wood rewrites ONLY the files containing a matched row. For each
+        //    such file it hands us (fileOrdinal, the file's batches in read order); we rebuild the SET columns
+        //    on the matched positions (rowid = (ordinal << RowIdPositionBits) | positionInFile — same encoding
+        //    the scan emitted) and return the modified batches. Unaffected files are left untouched.
+        DeltaReader.UpdateByRowIds(opener, path, updates.Keys, (ordinal, batches) =>
         {
-            var e = DeltaReader.StreamWithRowIds(opener, path, columns: null, filter: null, default)
-                               .GetAsyncEnumerator();
-            try
+            var outBatches = new List<RecordBatch>(batches.Count);
+            long pos = 0;
+            foreach (var batch in batches)
             {
-                while (e.MoveNextAsync().AsTask().GetAwaiter().GetResult())
+                var newCols = new IArrowArray[fields.Count];
+                for (int c = 0; c < fields.Count; c++)
                 {
-                    var batch = e.Current;
-                    sources.Add(batch);
-                    var rids = (Int64Array)batch.Column(batch.ColumnCount - 1); // _metadata.row_id is appended last
-                    var newCols = new IArrowArray[fields.Count];
-                    for (int c = 0; c < fields.Count; c++)
+                    int slot = setSlotByColumn[c];
+                    if (slot < 0)
                     {
-                        int slot = setSlotByColumn[c];
-                        if (slot < 0)
-                        {
-                            newCols[c] = batch.Column(c); // unchanged column (referenced from the live source)
-                            continue;
-                        }
-                        var values = new List<object?>(batch.Length);
-                        for (int i = 0; i < batch.Length; i++)
-                        {
-                            long rid = rids.GetValue(i) ?? -1;
-                            values.Add(updates.TryGetValue(rid, out var nv)
-                                ? nv[slot]
-                                : ArrowValueReader.ReadScalar(batch.Column(c), i));
-                        }
-                        newCols[c] = BuildArray(fields[c].DataType, values);
+                        newCols[c] = batch.Column(c); // unchanged column
+                        continue;
                     }
+                    var values = new List<object?>(batch.Length);
                     for (int i = 0; i < batch.Length; i++)
                     {
-                        if (updates.ContainsKey(rids.GetValue(i) ?? -1))
-                        {
-                            affected++;
-                        }
+                        long rid = (ordinal << RowIdPositionBits) | (pos + i);
+                        values.Add(updates.TryGetValue(rid, out var nv)
+                            ? nv[slot]
+                            : ArrowValueReader.ReadScalar(batch.Column(c), i));
                     }
-                    rebuilt.Add(new RecordBatch(userSchema, newCols, batch.Length));
+                    newCols[c] = BuildArray(fields[c].DataType, values);
                 }
+                outBatches.Add(new RecordBatch(userSchema, newCols, batch.Length));
+                pos += batch.Length;
             }
-            finally
-            {
-                e.DisposeAsync().AsTask().GetAwaiter().GetResult();
-            }
+            return outBatches;
+        }, default);
 
-            DeltaWriter.Write(opener, path, userSchema, rebuilt, DeltaWriteMode.Overwrite, default);
-        }
-        finally
-        {
-            foreach (var b in sources)
-            {
-                b.Dispose();
-            }
-        }
-        return affected;
+        return updates.Count; // each distinct rowid is one updated row
     }
 
     /// <summary>Builds an Arrow array of <paramref name="type"/> from boxed CLR values (the inverse of

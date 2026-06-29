@@ -1176,16 +1176,19 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   correct); the OneLake table-format conversion is expected to succeed on plain Delta (pending user confirm — the
   earlier row-tracking/DV tables failed conversion). **A transient rowid is valid only within one snapshot** (a
   scan's rowids must be consumed by the DELETE before another write changes the file set — true for a single
-  DML statement). **UPDATE DONE — rowid-based copy-on-write (full-table overwrite).** `ExecuteUpdate` receives
-  the new SET-column values (named) + the transient `_metadata.row_id` per row; it re-scans the table with
-  rowids, rebuilds the SET columns on the matched rows as CLEAN Apache.Arrow batches (a `BuildArray` typed
-  inverse of `ArrowValueReader.ReadScalar` — bool/ints/uints/float/double/decimal128/string/date32/timestamp),
-  and OVERWRITES via `DeltaWriter.Write` (the proven plain-Delta write path → standard-readable). Source batches
-  are kept alive until the write (the rebuilt batches reference their unchanged columns). NO new engineered-wood
-  method, NO C++ change (reuses the DELETE virtual-rowid planning + the `ExecuteUpdate` ABI). Full-table
-  overwrite is simpler than per-file rewrite + guarantees readability; per-file is a future optimization.
-  Verified single-row / multi-row / expression (`amt=amt+1`) updates, UPDATE∘DELETE composition, re-attach
-  durability, AND a delta-kernel `delta_scan` read-back. `test/verify_delta_catalog_update.test` (63). **Still
+  DML statement). **UPDATE DONE — rowid-based PER-FILE copy-on-write** (matches DELETE). `ExecuteUpdate` receives
+  the new SET-column values (named) + the transient `_metadata.row_id` per row; it builds a `rowid → new values`
+  map and calls engineered-wood `UpdateByRowIdsAsync(rowIds, rewriteFile)`, which rewrites ONLY the files
+  containing a matched row (decoded from `rowid >> 40`) — each affected file's batches are handed back via the
+  `rewriteFile` callback, where ArrowNet rebuilds the SET columns on the matched positions as CLEAN Apache.Arrow
+  batches (`BuildArray`, a typed inverse of `ArrowValueReader.ReadScalar` — bool/ints/uints/float/double/
+  decimal128/string/date32/timestamp; rowid recomputed as `(ordinal << 40) | positionInFile` to match the scan),
+  and engineered-wood re-writes them as plain `remove`+`add` with a CLEAN schema (the parquet-footer fix). The
+  typed substitution stays in ArrowNet (reuses `BuildArray`/`ReadScalar`); engineered-wood stays generic (file
+  selection + read + clean write). Unaffected files are untouched. NO C++ change (reuses the DELETE virtual-rowid
+  planning + the `ExecuteUpdate` ABI). Verified single-row / multi-row / expression (`amt=amt+1`) updates,
+  UPDATE∘DELETE composition, re-attach durability, a delta-kernel `delta_scan` read-back, AND live on Fabric
+  (`arrownet_updtest` on the schema-enabled `LH` lakehouse). `test/verify_delta_catalog_update.test` (63). **Still
   unsupported** (clean error): raw exec, DROP SCHEMA, ALTER. **OneLake table discovery — via the Fabric REST
   API** (`FabricLakehouse`, Bridge): DuckDB's azure glob can't recurse a OneLake `_delta_log` tree (mid-path
   wildcard → `type must be string, but is null`, duckdb-azure PR #174), so a OneLake root
@@ -1224,8 +1227,8 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   not read it — engineered-wood's inline DV byte format isn't Spark-decodable (Fabric DOES support DVs, so it's
   our format). **Resolution = abandon row tracking + DVs for plain Delta + copy-on-write + transient rowid**
   (see the DELETE paragraph above) — validated live. Remaining Delta write-back work (all OPTIONAL now that
-  CREATE/INSERT/CTAS/COPY/DROP/DELETE/UPDATE work): per-file copy-on-write (vs the current full-table overwrite
-  for UPDATE), the deletion-vector + row-tracking fast-delete opt-in (needs the upstream engineered-wood inline-DV
+  CREATE/INSERT/CTAS/COPY/DROP/DELETE/UPDATE work, DELETE+UPDATE both PER-FILE copy-on-write):
+  the deletion-vector + row-tracking fast-delete opt-in (needs the upstream engineered-wood inline-DV
   serialization fix — verifiable against `delta_scan`), OCC retry for concurrent writers, the
   `engineeredwooddelta` rename, and a `delta-rs` production provider. See docs/delta-catalog.md + docs/filesystem-bridge.md. v47 =
   **host-FS global table functions**: appended one vtable entry `set_active_opener(opener)` — a per-thread ambient (`AmbientOpener`, mirroring `set_active_txn`) recording the

@@ -117,4 +117,23 @@ internal static class DeltaReader
             table.DisposeAsync().AsTask().GetAwaiter().GetResult();
         }
     }
+
+    /// <summary>Per-file copy-on-write UPDATE: only files containing a target <paramref name="rowIds"/> are
+    /// rewritten. <paramref name="rewriteFile"/> (ordinal, the file's batches) returns the same rows with the SET
+    /// columns modified on matched positions (the caller owns the typed substitution); engineered-wood re-writes
+    /// them as plain remove+add with a clean schema. Opens with the standard write options (path_in_schema).</summary>
+    public static void UpdateByRowIds(nint opener, string path, IReadOnlyCollection<long> rowIds,
+        System.Func<long, IReadOnlyList<RecordBatch>, IReadOnlyList<RecordBatch>> rewriteFile, CancellationToken ct)
+    {
+        var fs = new DuckDbTableFileSystem(opener, path);
+        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).AsTask().GetAwaiter().GetResult();
+        try
+        {
+            table.UpdateByRowIdsAsync(rowIds, rewriteFile, ct).AsTask().GetAwaiter().GetResult();
+        }
+        finally
+        {
+            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+    }
 }
