@@ -1168,9 +1168,19 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   secret** (`ATTACH '…OneLake…' (TYPE arrownet, PROVIDER 'delta', SECRET <azure_sp>)` → v39 foreign-secret path →
   `DeltaBackend.BuildConnectionString` appends a cred marker on the root → `DeltaCatalog` mints a
   `ClientSecretCredential`, mirroring DAX); the data files are still read/written through DuckDB's FileSystem (the
-  opener + a DuckDB azure secret) — the Fabric API is used ONLY to list table names. **Live Fabric CREATE→INSERT→
-  DELETE validation is pending** (needs Fabric creds + a lakehouse; the writer-v7 `rowTracking` + materialized
-  `__delta_row_id` cross-reader readability is what a live test confirms). Remaining Delta write-back work: UPDATE
+  opener + a DuckDB azure secret) — the Fabric API is used ONLY to list table names. **Live Fabric tests use the
+  gitignored `dax_secret.sql`** at the repo root (`CREATE OR REPLACE SECRET fabric_sp (TYPE azure, PROVIDER
+  service_principal, TENANT_ID/CLIENT_ID/CLIENT_SECRET …)` — the Fabric-Warehouse SP; ATTACH `… (PROVIDER 'delta',
+  SECRET fabric_sp)`; one secret serves DuckDB OneLake IO + the Fabric REST API). **Live finding (2026-06-29):
+  the validated workspace `Test`/lakehouse `LH` is a SCHEMA-ENABLED lakehouse**, which breaks OneLake discovery
+  two ways: (1) Fabric `ListTables` (2.14.0) returns **400 `UnsupportedOperationForSchemasEnabledLakehouse`** (the
+  basic `/tables` endpoint has no schema support), and (2) DuckDB's azure `glob()` returns **0 rows at every level**
+  on OneLake (`Tables/*`, `Tables/dbo/*`; the deep pattern throws `type must be string, but is null`) — so glob is
+  not a fallback. AND our `DeltaCatalog` assumes a FLAT `Tables/<table>` + a single `main` schema, whereas a
+  schema-enabled lakehouse stores tables at `Tables/<schema>/<table>`. **Auth + workspace/lakehouse resolution +
+  the Fabric API call all WORK (proven live); schema-enabled-lakehouse support is the gap.** Unblock options: an
+  explicit `tables 'dbo.t,…'` ATTACH option + multi-schema paths; discover via the lakehouse SQL endpoint's
+  INFORMATION_SCHEMA; or validate on a NON-schema-enabled lakehouse first. Remaining Delta write-back work: UPDATE
   (rowid via row tracking), OCC retry for concurrent writers, the
   `engineeredwooddelta` rename, and a `delta-rs` production provider. See docs/delta-catalog.md + docs/filesystem-bridge.md. v47 =
   **host-FS global table functions**: appended one vtable entry `set_active_opener(opener)` — a per-thread ambient (`AmbientOpener`, mirroring `set_active_txn`) recording the
