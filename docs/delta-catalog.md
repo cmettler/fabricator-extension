@@ -331,11 +331,36 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      via a new host-FS callback `fs_remove_dir` (ABI v49 — DuckDB's `FileSystem::RemoveDirectory`, idempotent).
      **Still unsupported** (throw a clean error): DELETE, UPDATE, raw exec. **Remaining for production write
      concurrency:** the OCC retry loop (catch `DeltaConflictException` → reopen → retry) for concurrent writers.
-3. **DELETE** — pick the rowid-vs-predicate strategy (lean: predicate via `FilterNode → Predicate`, since it's
-   contained and doesn't need an engineered-wood position-delete addition); deletion vectors handled by
-   engineered-wood.
-4. **UPDATE** — WHERE via the predicate map; resolve the SET-evaluation question.
-5. MERGE/UPSERT — out of scope (engineered-wood doesn't implement it; could be composed delete+append,
+3. **DELETE / UPDATE — chosen strategy: the rowid pattern via Delta row tracking** (mirrors the SQL Server
+   backend — reuses ArrowNet's existing rowid DML operators wholesale, no OptimizerExtension / custom operator).
+   **Key finding that drove this:** DuckDB does NOT expose the WHERE predicate at the catalog's `PlanDelete`/
+   `PlanUpdate` hook (`LogicalDelete` retains only the table + a rowid-producing child plan), so a "capture the
+   FilterNode" predicate-delete is unsafe (the pushdown filter is a superset; a residual filter would over-delete)
+   AND would need a custom operator. The rowid pattern sidesteps all of that.
+   - **engineered-wood additions — DONE** (`D:\repos\engineered-wood`, local working changes; the repo's
+     row-tracking was write-only): (a) `DeltaTable.ReadAllWithRowIdsAsync(columns, filter)` — appends a trailing
+     non-null Int64 `_metadata.row_id` column (the stable row-tracking id, captured after DV filtering,
+     re-appended after transforms; `ReadFileAsync` gained an `includeRowId` flag that reads the materialized
+     `__delta_row_id` physical column); (b) `DeltaTable.DeleteByRowIdsAsync(IReadOnlyCollection<long> rowIds)` —
+     deletes by stable id via deletion vectors (reads each file's `__delta_row_id`, maps ids→positions, writes a
+     DV + RemoveFile/add). Both require `delta.enableRowTracking=true`. Builds clean.
+   - **ArrowNet wiring — REMAINING** (the next slice): (1) `DeltaCatalog.CreateTable` enables
+     `delta.enableRowTracking=true` (config on the empty commit-0); (2) `DeltaCatalog.GetMetadata(RowId)` returns
+     `_metadata.row_id` as the rowid column; (3) **virtual-rowid threading in C++** — the rowid machinery currently
+     resolves rowid names to INDICES into the user column list (`arrownet_schema_entry.cpp:160-186`), but
+     `_metadata.row_id` is NOT a user column (surfacing it as one would break INSERT). So: when `FetchRowIdColumns`
+     returns names not present in the schema, treat them as a **virtual rowid** — carry the NAMES (not indices) on
+     `ArrowNetTableEntry` + `ArrowStreamBindData` (`virtual_rowid_columns`), `HasRowId()`/`GetVirtualColumns()`/
+     `GetRowIdColumns()` honor them, `BuildScanSpec` adds the virtual names to the fetch list when rowid is
+     requested, and `arrow_ingest` resolves their result positions BY NAME for `BuildRowId` (rowid_type=BIGINT for
+     a single virtual col). `PlanDelete`/`BuildModifyTarget` use the virtual names + BIGINT type. SQL Server is
+     unaffected (its rowid names always resolve to real columns; the virtual path only triggers on
+     otherwise-unresolved names — today a disabled-rowid fallback); (4) `DeltaCatalog.ScanTable` calls
+     `ReadAllWithRowIdsAsync` when the spec requests `_metadata.row_id`; (5) `DeltaCatalog.ExecuteDelete` collects
+     the `_metadata.row_id` keys → `DeleteByRowIdsAsync`. DELETE first; **UPDATE** next (needs `ExecuteUpdate` →
+     an engineered-wood `UpdateByRowIdsAsync(ids, newValuesByRowId)` that rewrites affected files substituting the
+     SET columns — the `updater` analog keyed by row id).
+4. MERGE/UPSERT — out of scope (engineered-wood doesn't implement it; could be composed delete+append,
    non-atomic).
 
 **Net:** the folder-as-catalog-root + read + INSERT + CREATE is a small, well-fitting slice that reuses the
