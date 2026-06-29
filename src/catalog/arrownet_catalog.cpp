@@ -43,6 +43,11 @@ ArrowNetCatalog::~ArrowNetCatalog() {
 void ArrowNetCatalog::LoadCatalog(ClientContext &context) {
 	lock_guard<mutex> lock(schema_lock_);
 
+	// Set the active txn + host-FS opener for the metadata discovery below: a host-FS provider (the Delta
+	// folder catalog) globs the root + opens tables through DuckDB's FileSystem, which needs this context's
+	// opener (secret resolution). Harmless for SQL/DAX (they ignore the opener ambient).
+	ArrowNetSetActiveTxn(handle_, context);
+
 	// Detect the database collation's sort semantics once (binary => SQL Server's byte-order string sort
 	// matches DuckDB, so string-keyed ORDER BY+LIMIT can be pushed). Best-effort: a failure leaves it off.
 	try {
@@ -115,6 +120,9 @@ void ArrowNetCatalog::InvalidateAllEntries() {
 
 void ArrowNetCatalog::RefreshCache(ClientContext &context) {
 	lock_guard<mutex> lock(schema_lock_);
+
+	// Set the active host-FS opener for re-discovery (see LoadCatalog).
+	ArrowNetSetActiveTxn(handle_, context);
 
 	auto ensure_schema = [&](const string &schema_name) -> ArrowNetSchemaEntry & {
 		auto it = schemas_.find(schema_name);

@@ -255,9 +255,22 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      segment") so it can't validate on OneLake — but our own reader does, and the local delta-kernel read proves
      the format. A table written before these fixes stays broken on its version-0 `metaData`; write a FRESH
      table.
-1. **Folder-root `DeltaCatalog` + read** — `DeltaBackend`/`DeltaCatalog` (3rd `IBackend`), `fs_glob` table
-   discovery, flat `main` schema, scan via the existing `DeltaReader`. ~All C#, no new C++. Proves ATTACH +
-   `SELECT FROM lake.t`.
+1. **Folder-root `DeltaCatalog` + read — DONE (local; OneLake discovery caveat below).** `DeltaBackend` (3rd
+   `IBackend`, name `"delta"`/`"deltalake"`, registered explicitly in `BackendRegistry.Discover` since it lives
+   in the Bridge alongside `DeltaReader`) + `DeltaCatalog : IBackendCatalog` (read-only this slice; writes
+   throw). `ATTACH '/lake' AS lake (TYPE arrownet, PROVIDER 'delta')` → tables = immediate subdirs with a
+   `_delta_log/` (globbed `<root>/*/_delta_log/*.json`), flat `main` schema; columns via `DeltaReader.GetSchema`;
+   scan via `DeltaReader.Stream` with filter pushdown (projection left to DuckDB above). The host-FS **opener**
+   is threaded into the catalog metadata path: `LoadCatalog`/`RefreshCache` now call `ArrowNetSetActiveTxn`
+   (which also sets the opener) before discovery, and `FetchTableColumns` already did. Validated on a LOCAL
+   Delta root: `test/verify_delta_catalog.test` (17 — discovery, filter pushdown, aggregate, cross-table join).
+   **OneLake/ADLS auto-discovery is BLOCKED by a DuckDB azure-extension glob bug**: a mid-path-wildcard glob
+   (`<root>/*/_delta_log/…`, needed to enumerate the table subdirs) throws
+   `[json.exception.type_error.302] type must be string, but is null` when it recurses the root listing — and
+   `<root>/*` returns no directories — so tables under a OneLake root can't be enumerated (a single table's
+   `<root>/<table>/_delta_log/*` glob DOES work, which is why `arrownet_delta_scan`/the global write are fine).
+   Reproduced with DuckDB's own `glob()` (not our code). Workarounds (future): an explicit `tables := 'a,b'`
+   ATTACH option, or lazy per-table resolution (resolve a referenced table by globbing just its own log).
 2. **Write arbitrary data — DONE (function form), via the collector.** `arrownet_delta_write(<input>, path := '…')`
    is a connection-free GLOBAL host-FS **collector** (`DeltaWriteCollectorFunction`) that writes ANY input table
    (a DuckDB query result) to a Delta table at `path` (Overwrite), returning `(version, rows_written)`. It

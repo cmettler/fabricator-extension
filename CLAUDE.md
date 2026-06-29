@@ -1111,8 +1111,18 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `ICollectorTableFunction` + handle-0 `GlobalFunctions.ParamSchema`); the opener is threaded into the collector
   Source `GetDataInternal` (where C# `Collect` runs — Finalize-only was racy) AND into the shared
   `ArrowNetSetActiveTxn` helper (so any connection-using callsite sets it). Validated local + a live OneLake
-  managed table (`Tables/dbo/arrownet_query`). `test/verify_delta_write.test` (18). The full ATTACH-catalog
-  INSERT/CTAS form (+ OCC retry, Append) is the remaining Delta write-back work. See docs/delta-catalog.md + docs/filesystem-bridge.md. v47 =
+  managed table (`Tables/dbo/arrownet_query`). `test/verify_delta_write.test` (18). **Delta folder-as-catalog
+  (READ) DONE**: `DeltaBackend` (3rd `IBackend`, `"delta"`/`"deltalake"`, registered explicitly in
+  `BackendRegistry.Discover` — Bridge-resident) + `DeltaCatalog` (read-only; writes throw). `ATTACH '/lake'
+  (TYPE arrownet, PROVIDER 'delta')` discovers subdirs-with-`_delta_log/` as tables under a flat `main` schema
+  (glob `<root>/*/_delta_log/*.json`), columns via `DeltaReader.GetSchema`, scan via `DeltaReader.Stream` with
+  filter pushdown. The opener is threaded into the catalog metadata path (`LoadCatalog`/`RefreshCache` call
+  `ArrowNetSetActiveTxn` before discovery; `FetchTableColumns` already did). `test/verify_delta_catalog.test`
+  (17 — discovery + filter + join, LOCAL). **OneLake/ADLS auto-discovery is BLOCKED by a DuckDB azure-extension
+  glob bug** (mid-path-wildcard recursion throws `type must be string, but is null`; reproduced with DuckDB's own
+  `glob()`) — single-table scan works, only the multi-table enumeration under a OneLake root doesn't; workaround
+  = an explicit `tables` ATTACH option or lazy per-table resolution (future). The full ATTACH-catalog
+  INSERT/CTAS write form (+ OCC retry, Append) is the remaining Delta write-back work. See docs/delta-catalog.md + docs/filesystem-bridge.md. v47 =
   **host-FS global table functions**: appended one vtable entry `set_active_opener(opener)` — a per-thread ambient (`AmbientOpener`, mirroring `set_active_txn`) recording the
   calling operator's `ClientContext` so a connection-free GLOBAL host-FS table reader (a lakehouse format)
   resolves DuckDB secrets while reading through the host `fs_*` callbacks; set in the shared `PopulateReturnSchema`

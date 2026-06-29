@@ -118,6 +118,10 @@ public static class BackendRegistry
             }
         }
         ScanPluginDirectories(map);
+        // The built-in Delta provider lives in the Bridge (alongside DeltaReader / engineered-wood), so it isn't
+        // found by the assembly scan above — register it explicitly. Added AFTER the scan so a scanned provider
+        // (SqlServer) stays the default; it's just another provider keyed by name "delta".
+        Add(map, new DeltaBackend());
         if (map.Count == 0)
         {
             Add(map, new StubBackend());
