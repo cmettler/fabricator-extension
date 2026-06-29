@@ -216,7 +216,13 @@ internal static class DeltaWriter
         var fs = new DuckDbTableFileSystem(opener, path);
         var options = DeltaTableOptions.Default with
         {
-            ParquetWriteOptions = new ParquetWriteOptions { OmitPathInSchema = false },
+            ParquetWriteOptions = new ParquetWriteOptions
+            {
+                OmitPathInSchema = false,
+                // Match DuckDB's default row-group size (122880 rows) so a large input batch is split into
+                // sensibly-sized row groups within the file (ParquetFileWriter.WriteRowGroupAsync honors this).
+                RowGroupMaxRows = 122880,
+            },
         };
         var table = DeltaTable.OpenOrCreateAsync(fs, schema, options, cancellationToken: ct)
             .AsTask().GetAwaiter().GetResult();

@@ -1,5 +1,36 @@
 # Delta Lake catalog (folder-as-root) + write-back — design idea, DEFERRED
 
+## Provider strategy + findings (2026-06-29)
+
+Two Delta providers are emerging — keep them distinct:
+- **`engineeredwooddelta`** (rename of the current Bridge-resident `DeltaBackend`/`DeltaCatalog`, built on
+  Curt Hagenlocher's engineered-wood + the host-FS bridge). Read DONE (local); write via engineered-wood.
+- **`delta-rs`** (future, production) — a wrapper over **delta-dotnet** (`D:\repos\delta-dotnet`: a C# wrapper
+  around delta-rs `rust-v0.17.0` + delta-kernel-rs via a Rust FFI bridge, with DataFusion → a SQL layer for
+  read/merge). It has its OWN object store, so we'd grab the DuckDB azure/etc. secrets and pass them through.
+  It can't use DuckDB dynamic (join/TopN) filters directly; the alternative is a **C# MultiFileReader** like
+  DuckDB's own delta extension (which manages dynamic filters) — i.e. delta-dotnet as a snapshot/file-list +
+  Arrow source, dynamic filters applied in our scan loop. Native build is Rust (Linux-oriented README; Windows
+  via WSL or a native toolchain — feasibility TBD).
+
+**OneLake/ADLS table discovery — the glob bug is upstream (DuckDB `duckdb-azure` #174), not ours.** A
+mid-path-wildcard glob (`<root>/*/_delta_log/…`) throws `type must be string, but is null` recursing a OneLake
+listing. **Workaround for Fabric: the Fabric REST API** (`Microsoft.Fabric.Api` NuGet) —
+`TablesClient.ListTables(workspaceId, lakehouseId)` returns each `Table { Name, Location, Format }` (Location =
+the exact abfss path, Format = "Delta"), so discovery needs NO glob and even hands us the table location
+directly. Auth = a `TokenCredential` (the same Fabric SP, Fabric scope) against `https://api.fabric.microsoft.com/v1`;
+the connstr would carry / resolve workspace + lakehouse (names → GUIDs via the Workspaces/Items API, or GUIDs
+given). The Unity Catalog API is an alternative but read-only.
+
+**Write quality:** the engineered-wood write path emits one parquet file per input `RecordBatch` (TargetFileSize
+is compaction-only). Row-group size IS controllable (`ParquetWriteOptions.RowGroupMaxRows` — now set to DuckDB's
+default **122880** in `DeltaWriter`). To avoid the small-files problem on real writes, coalesce input batches
+(or stream to the catalog write — once the catalog does streaming INSERT/CTAS, the global `arrownet_delta_write`
+collector is no longer needed; stream straight to the provider like the SQL/DAX backends).
+
+---
+# (original) Delta Lake catalog (folder-as-root) + write-back — design idea
+
 > Status: **design note only — nothing built.** Captures exposing a Delta Lake **folder** as an ATTACH-able
 > catalog (each `_delta_log` subdir = a table), reusing the existing multi-provider architecture so a Delta
 > table is read/written like any other catalog table. Write-back (INSERT / DELETE / UPDATE) is backed by
