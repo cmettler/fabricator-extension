@@ -42,3 +42,5 @@ wheels/
 
 # dbt-duckdb concurrency/integration test harness — profiles.yml holds live connstrs/secrets.
 /dbt_mssql_test/
+fabric-test.local.env
+dax_secret.sql
