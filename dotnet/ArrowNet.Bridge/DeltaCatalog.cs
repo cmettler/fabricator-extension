@@ -10,20 +10,24 @@ using EngineeredWood.DeltaLake.Table;
 namespace ArrowNet.Bridge;
 
 /// <summary>
-/// The Delta Lake provider (the 3rd <see cref="IBackend"/>, after SQL Server and DAX): a Delta <b>folder</b>
-/// is an ATTACH-able catalog root — <c>ATTACH '/lake' AS lake (TYPE arrownet, PROVIDER 'delta')</c> (or an
-/// <c>abfss://…</c> OneLake/ADLS prefix). Each immediate subdirectory containing a <c>_delta_log/</c> is a
-/// table under a single flat <c>main</c> schema. Connection-free: all IO goes through DuckDB's FileSystem via
-/// the host callbacks (so local / az:// / s3:// + DuckDB secrets all work), reusing <see cref="DeltaReader"/>.
-/// Read + CREATE TABLE / INSERT / CTAS / COPY (write) reuse the provider-agnostic C++ catalog machinery, streaming
-/// to engineered-wood via the standard bulk path (one Delta commit per statement). DELETE/UPDATE/DROP not yet
-/// supported. See docs/delta-catalog.md.
+/// The Delta Lake provider backed by <b>engineered-wood</b> (the 3rd <see cref="IBackend"/>, after SQL Server
+/// and DAX): a Delta <b>folder</b> is an ATTACH-able catalog root —
+/// <c>ATTACH '/lake' AS lake (TYPE arrownet, PROVIDER 'engineeredwooddelta')</c> (or an <c>abfss://…</c>
+/// OneLake/ADLS prefix). The provider name is <c>engineeredwooddelta</c> to distinguish it from a future
+/// delta-rs/delta-kernel-backed provider; <c>delta</c> and <c>deltalake</c> remain aliases. Tables = subdirs
+/// with a <c>_delta_log/</c> (flat <c>main</c> schema, or per-lakehouse schemas on a schema-enabled OneLake
+/// lakehouse). Connection-free: all IO goes through DuckDB's FileSystem via the host callbacks (local / az:// /
+/// s3:// + DuckDB secrets), reusing <see cref="DeltaReader"/>. Full read + write DML — CREATE/INSERT/CTAS/COPY/
+/// DROP, DELETE (copy-on-write or opt-in deletion vectors), UPDATE (copy-on-write), OCC retry for concurrent
+/// writers — all reuse the provider-agnostic C++ catalog machinery. See docs/delta-catalog.md.
 /// </summary>
 public sealed class DeltaBackend : IBackend
 {
-    public string Name => "delta";
+    public string Name => "engineeredwooddelta";
 
-    public IEnumerable<string> Aliases => new[] { "deltalake" };
+    // `delta`/`deltalake` stay as aliases so existing ATTACHes keep working; the primary name distinguishes
+    // this engineered-wood-backed provider from a future delta-rs production provider.
+    public IEnumerable<string> Aliases => new[] { "delta", "deltalake" };
 
     // The connstr IS the folder root. Data-file IO is via DuckDB FS secrets (the opener). An azure SP secret on
     // a OneLake ATTACH additionally authenticates the Fabric REST API used to list tables (the glob bug

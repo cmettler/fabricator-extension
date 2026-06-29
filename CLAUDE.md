@@ -1257,8 +1257,11 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   DELETE/UPDATE do NOT retry (their absolute positions are tied to the scanned snapshot; a concurrent change
   invalidates them) — `DeltaReader` surfaces a clear "concurrent modification — retry the statement" error.
   Verified: 4 parallel processes appending 200 rows each to ONE local Delta table → 800/800 distinct, no lost
-  commits, no surfaced conflicts. Other remaining (OPTIONAL): the
-  `engineeredwooddelta` rename, and a `delta-rs` production provider. See docs/delta-catalog.md + docs/filesystem-bridge.md. v47 =
+  commits, no surfaced conflicts. **PROVIDER RENAMED to `engineeredwooddelta`** (the engineered-wood-backed Delta
+  provider), with **`delta` + `deltalake` kept as aliases** (non-breaking — `BackendRegistry` resolves Name +
+  Aliases case-insensitively; all `verify_delta_*` tests still ATTACH with `PROVIDER 'delta'`). The distinct
+  primary name reserves space for a future delta-rs/delta-kernel production provider. `test/verify_delta_rename.test`
+  (12 — new name + both aliases). Other remaining (OPTIONAL): a `delta-rs` production provider. See docs/delta-catalog.md + docs/filesystem-bridge.md. v47 =
   **host-FS global table functions**: appended one vtable entry `set_active_opener(opener)` — a per-thread ambient (`AmbientOpener`, mirroring `set_active_txn`) recording the
   calling operator's `ClientContext` so a connection-free GLOBAL host-FS table reader (a lakehouse format)
   resolves DuckDB secrets while reading through the host `fs_*` callbacks; set in the shared `PopulateReturnSchema`
