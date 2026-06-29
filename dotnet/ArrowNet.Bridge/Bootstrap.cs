@@ -576,8 +576,13 @@ public static unsafe class Bootstrap
             var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
 
+            // Capture the host-FS opener now (set by the C++ sink before begin_bulk, on this thread) so the
+            // background bulk consumer can re-establish it — a host-FS provider (the Delta catalog) writes
+            // through DuckDB's FileSystem on the consumer thread. The ClientContext stays valid for the
+            // statement (complete_bulk blocks until the consumer finishes), so the opener is live at write time.
+            var opener = AmbientOpener.Current;
             var session = new BulkSession(catalog, schemaName, tableName, arrowSchema, createTable != 0, replace != 0,
-                                          checkConstraints != 0, txnId);
+                                          checkConstraints != 0, txnId, opener);
             *outSession = Handles.Alloc(session);
             return ArrowNetStatus.Ok;
         }

@@ -24,9 +24,10 @@ given). The Unity Catalog API is an alternative but read-only.
 
 **Write quality:** the engineered-wood write path emits one parquet file per input `RecordBatch` (TargetFileSize
 is compaction-only). Row-group size IS controllable (`ParquetWriteOptions.RowGroupMaxRows` — now set to DuckDB's
-default **122880** in `DeltaWriter`). To avoid the small-files problem on real writes, coalesce input batches
-(or stream to the catalog write — once the catalog does streaming INSERT/CTAS, the global `arrownet_delta_write`
-collector is no longer needed; stream straight to the provider like the SQL/DAX backends).
+default **122880** in `DeltaWriter`). To avoid the small-files problem on real writes, coalesce input batches.
+The **catalog streaming write is now implemented** (`CREATE TABLE`/`INSERT`/CTAS/COPY stream straight to
+engineered-wood via the standard bulk path, like the SQL/DAX backends) — so for the catalog case the global
+`arrownet_delta_write` collector is no longer needed (it remains as the connection-free, no-ATTACH function form).
 
 ---
 # (original) Delta Lake catalog (folder-as-root) + write-back — design idea
@@ -302,19 +303,33 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
    `<root>/<table>/_delta_log/*` glob DOES work, which is why `arrownet_delta_scan`/the global write are fine).
    Reproduced with DuckDB's own `glob()` (not our code). Workarounds (future): an explicit `tables := 'a,b'`
    ATTACH option, or lazy per-table resolution (resolve a referenced table by globbing just its own log).
-2. **Write arbitrary data — DONE (function form), via the collector.** `arrownet_delta_write(<input>, path := '…')`
-   is a connection-free GLOBAL host-FS **collector** (`DeltaWriteCollectorFunction`) that writes ANY input table
-   (a DuckDB query result) to a Delta table at `path` (Overwrite), returning `(version, rows_written)`. It
-   buffers the input (copying it out via an Arrow IPC round-trip — the operator frees each batch after
-   consumption), then commits one Delta version through the shared `DeltaWriter` (OmitPathInSchema=false →
-   Fabric-readable). The opener is threaded through the collector operator's Source `GetDataInternal` (where the
-   C# `Collect` actually runs, sync-over-async on the pull thread — setting it only in Finalize was racy). Cost
-   args ride as NAMED params (`Parameters` added to `IInOutFunction`/`ICollectorTableFunction`, surfaced via the
-   handle-0 `GlobalFunctions.ParamSchema`). Validated local (`test/verify_delta_write.test`, official
-   delta-kernel read-back) + a live OneLake managed table (`Tables/dbo/arrownet_query`, 20-row query result).
-   **Remaining for the CATALOG form** (`ATTACH … INSERT INTO lake.t`): bind the catalog INSERT/CTAS/COPY
-   operators to engineered-wood writes (needs the opener threaded into the catalog `get_metadata`/bulk path too)
-   + the OCC retry loop (catch `DeltaConflictException` → reopen → retry) for concurrent writers + Append mode.
+2. **Write arbitrary data — DONE, both the function form AND the catalog (streaming) form.**
+   - **Function form** (`arrownet_delta_write(<input>, path := '…')`): a connection-free GLOBAL host-FS
+     **collector** (`DeltaWriteCollectorFunction`) that writes ANY input table (a DuckDB query result) to a Delta
+     table at `path` (Overwrite), returning `(version, rows_written)`. It buffers the input (copying it out via an
+     Arrow IPC round-trip — the operator frees each batch after consumption), then commits one Delta version
+     through the shared `DeltaWriter` (OmitPathInSchema=false → Fabric-readable). The opener is threaded through
+     the collector operator's Source `GetDataInternal` (where the C# `Collect` actually runs, sync-over-async on
+     the pull thread — setting it only in Finalize was racy). Cost args ride as NAMED params (`Parameters` added
+     to `IInOutFunction`/`ICollectorTableFunction`, surfaced via the handle-0 `GlobalFunctions.ParamSchema`).
+     Validated local (`test/verify_delta_write.test`, official delta-kernel read-back) + a live OneLake managed
+     table (`Tables/dbo/arrownet_query`, 20-row query result).
+   - **Catalog (streaming) form — DONE** (`ATTACH … (TYPE arrownet, PROVIDER 'delta')`; `CREATE TABLE` / `INSERT
+     INTO lake.t` / CTAS / COPY): the catalog INSERT/CTAS/COPY operators now stream straight to engineered-wood
+     via the **existing streaming bulk path** (`begin_bulk`/`push_batch`/`complete_bulk` → `BulkSession` →
+     `DeltaCatalog.BulkInsert`), exactly like the SQL Server / DAX backends — no separate global collector needed
+     for the catalog case. **Opener threading:** the host-FS opener (`ClientContext*`) is set via
+     `SetActiveOpener` immediately before `BeginBulk` in the insert/CTAS/COPY operators; `BulkSession` captures it
+     at `begin_bulk` and **re-establishes `AmbientOpener.Current` on its background consumer thread** (alongside
+     the txn id) — the opener stays valid until `complete_bulk`, which blocks on the consumer. `DeltaCatalog`:
+     `createTable`/`replace` ⇒ `DeltaWriteMode.Overwrite` (CTAS/REPLACE: the table becomes exactly the query
+     result), plain INSERT ⇒ `Append`; one Delta commit per statement. `CreateTable` writes an empty commit-0
+     (schema only; PK/UNIQUE/DEFAULT ignored — Delta has no such constraints). `DeltaWriter.Materialize` does the
+     Arrow IPC round-trip from the streamed `ChannelArrowStream` into retained batches for the single commit.
+     Validated local: `test/verify_delta_catalog_write.test` (29 — CREATE/INSERT/append/CTAS/aggregate +
+     detach/re-attach durability). **Still unsupported** (throw a clean error): DROP TABLE (no recursive-delete
+     host callback yet), DELETE, UPDATE, raw exec. **Remaining for production write concurrency:** the OCC retry
+     loop (catch `DeltaConflictException` → reopen → retry) for concurrent writers.
 3. **DELETE** — pick the rowid-vs-predicate strategy (lean: predicate via `FilterNode → Predicate`, since it's
    contained and doesn't need an engineered-wood position-delete addition); deletion vectors handled by
    engineered-wood.

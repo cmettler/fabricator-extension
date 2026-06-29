@@ -76,6 +76,9 @@ unique_ptr<GlobalSinkState> ArrowNetPhysicalInsert::GetGlobalSinkState(ClientCon
 		std::memset(&schema, 0, sizeof(schema));
 		auto *stream = gstate->producer->Stream();
 		stream->get_schema(stream, &schema);
+		// Set the host-FS opener so a host-FS provider (the Delta catalog) can write through DuckDB's
+		// FileSystem; the managed begin_bulk captures it + re-establishes it on the bulk consumer thread.
+		arrownet::SetActiveOpener(reinterpret_cast<ArrowNetHandle>(&context));
 		gstate->bulk_session = arrownet::BeginBulk(handle_, target_.schema_name, target_.table_name,
 		                                           /*create_table=*/false, /*replace=*/false,
 		                                           /*check_constraints=*/true,

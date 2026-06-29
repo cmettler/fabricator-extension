@@ -5,6 +5,7 @@ using System.Threading;
 using Apache.Arrow;
 using Apache.Arrow.Ipc;
 using Apache.Arrow.Types;
+using EngineeredWood.DeltaLake.Table;
 
 namespace ArrowNet.Bridge;
 
@@ -14,8 +15,9 @@ namespace ArrowNet.Bridge;
 /// <c>abfss://…</c> OneLake/ADLS prefix). Each immediate subdirectory containing a <c>_delta_log/</c> is a
 /// table under a single flat <c>main</c> schema. Connection-free: all IO goes through DuckDB's FileSystem via
 /// the host callbacks (so local / az:// / s3:// + DuckDB secrets all work), reusing <see cref="DeltaReader"/>.
-/// Read + INSERT/CTAS (write) reuse the provider-agnostic C++ catalog machinery; this slice is READ-only
-/// (writes throw). See docs/delta-catalog.md.
+/// Read + CREATE TABLE / INSERT / CTAS / COPY (write) reuse the provider-agnostic C++ catalog machinery, streaming
+/// to engineered-wood via the standard bulk path (one Delta commit per statement). DELETE/UPDATE/DROP not yet
+/// supported. See docs/delta-catalog.md.
 /// </summary>
 public sealed class DeltaBackend : IBackend
 {
@@ -33,7 +35,7 @@ public sealed class DeltaBackend : IBackend
 
 /// <summary>An ATTACH'd Delta folder catalog. Lazy: holds the root path; all FS access happens during metadata
 /// discovery / scan, using the active host-FS opener (<see cref="AmbientOpener"/>, set by the host before each
-/// catalog metadata + scan call). Read-only in this slice.</summary>
+/// catalog metadata + scan + bulk-write call).</summary>
 public sealed class DeltaCatalog : IBackendCatalog
 {
     private const string MainSchema = "main";
@@ -131,24 +133,44 @@ public sealed class DeltaCatalog : IBackendCatalog
         }
     }
 
-    // ---- read-only / unsupported surface (this slice) ----
-    private static NotSupportedException ReadOnly() =>
-        new("delta provider is read-only in this slice (INSERT/CTAS/DELETE not yet wired).");
+    // ---- write surface (INSERT / CTAS / COPY via the streaming bulk path) ----
 
-    public IArrowArrayStream ExecuteQuery(string sql) => throw new NotSupportedException("delta provider: no raw query.");
-    public long ExecuteNonQuery(string sql) => throw ReadOnly();
-    public long BulkInsert(string s, string t, IArrowArrayStream d, bool c, bool r, bool cc, long txn) => throw ReadOnly();
-    public long ExecuteDelete(string s, string t, IArrowArrayStream k) => throw ReadOnly();
-    public long ExecuteUpdate(string s, string t, int n, IArrowArrayStream d) => throw ReadOnly();
-    public IArrowArrayStream InsertReturning(string s, string t, IArrowArrayStream r) => throw ReadOnly();
-    public void CreateTable(string s, string t, Schema c, bool ie, string? pk, string? u, string? d) => throw ReadOnly();
-    public void DropTable(string s, string t, bool ie) => throw ReadOnly();
-    public void CreateSchema(string s, bool ie) => throw ReadOnly();
-    public void DropSchema(string s, bool ie) => throw ReadOnly();
-    public void AlterTable(int k, string s, string t, string? a1, string? a2, Field? c, int f) => throw ReadOnly();
-    public void BeginTransaction() { }
+    /// <summary>Streaming bulk write (INSERT / CTAS / COPY). Runs on the bulk consumer thread; the host-FS
+    /// opener was re-established on it by BulkSession. createTable/replace => Overwrite (CTAS/REPLACE: the table
+    /// becomes exactly these rows); otherwise Append (INSERT). One Delta commit. Returns rows written.</summary>
+    public long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable,
+                           bool replace, bool checkConstraints, long txnId)
+    {
+        var opener = AmbientOpener.Current;
+        var (schema, batches, rows) = DeltaWriter.Materialize(data, default);
+        var mode = createTable || replace ? DeltaWriteMode.Overwrite : DeltaWriteMode.Append;
+        DeltaWriter.Write(opener, TablePath(tableName), schema, batches, mode, default);
+        return rows;
+    }
+
+    /// <summary>Creates an empty Delta table (commit 0 with the schema). Idempotent (OpenOrCreate), so
+    /// <paramref name="ifNotExists"/> is satisfied; PK/UNIQUE/DEFAULT are ignored (Delta has no such constraints).</summary>
+    public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists,
+                            string? primaryKey, string? uniques, string? defaults)
+        => DeltaWriter.Create(AmbientOpener.Current, TablePath(tableName), columns, default);
+
+    public void CreateSchema(string s, bool ie) { } // a Delta folder catalog has only the flat `main` schema
+    public void BeginTransaction() { }              // Delta is per-commit (no cross-statement transaction)
     public void CommitTransaction() { }
     public void RollbackTransaction() { }
+
+    // ---- still unsupported in this slice ----
+    private static NotSupportedException Unsupported(string what) =>
+        new($"delta provider: {what} not supported yet.");
+
+    public IArrowArrayStream ExecuteQuery(string sql) => throw Unsupported("raw query");
+    public long ExecuteNonQuery(string sql) => throw Unsupported("exec");
+    public long ExecuteDelete(string s, string t, IArrowArrayStream k) => throw Unsupported("DELETE");
+    public long ExecuteUpdate(string s, string t, int n, IArrowArrayStream d) => throw Unsupported("UPDATE");
+    public IArrowArrayStream InsertReturning(string s, string t, IArrowArrayStream r) => throw Unsupported("INSERT ... RETURNING");
+    public void DropTable(string s, string t, bool ie) => throw Unsupported("DROP TABLE (no recursive delete callback)");
+    public void DropSchema(string s, bool ie) => throw Unsupported("DROP SCHEMA");
+    public void AlterTable(int k, string s, string t, string? a1, string? a2, Field? c, int f) => throw Unsupported("ALTER TABLE");
 
     public Schema GetFunctionParamSchema(string s, string f) => throw NoFunctions();
     public Schema GetFunctionReturnSchema(string s, string f) => throw NoFunctions();

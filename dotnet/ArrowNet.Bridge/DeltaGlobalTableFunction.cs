@@ -210,31 +210,80 @@ public sealed class DeltaWriteDemoFunction : ITableFunction
 /// </summary>
 internal static class DeltaWriter
 {
-    public static long WriteOverwrite(
-        nint opener, string path, Schema schema, IReadOnlyList<RecordBatch> batches, CancellationToken ct)
+    private static DeltaTableOptions Options() => DeltaTableOptions.Default with
+    {
+        ParquetWriteOptions = new ParquetWriteOptions
+        {
+            OmitPathInSchema = false, // REQUIRED field — standard readers (DuckDB/arrow-rs/Fabric) reject without it
+            RowGroupMaxRows = 122880, // DuckDB's default row-group size
+        },
+    };
+
+    /// <summary>Opens-or-creates the Delta table at <paramref name="path"/> and writes <paramref name="batches"/>
+    /// in <paramref name="mode"/> (Overwrite for CTAS/REPLACE, Append for INSERT). Returns the committed version.</summary>
+    public static long Write(nint opener, string path, Schema schema, IReadOnlyList<RecordBatch> batches,
+                             DeltaWriteMode mode, CancellationToken ct)
     {
         var fs = new DuckDbTableFileSystem(opener, path);
-        var options = DeltaTableOptions.Default with
-        {
-            ParquetWriteOptions = new ParquetWriteOptions
-            {
-                OmitPathInSchema = false,
-                // Match DuckDB's default row-group size (122880 rows) so a large input batch is split into
-                // sensibly-sized row groups within the file (ParquetFileWriter.WriteRowGroupAsync honors this).
-                RowGroupMaxRows = 122880,
-            },
-        };
-        var table = DeltaTable.OpenOrCreateAsync(fs, schema, options, cancellationToken: ct)
+        var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(), cancellationToken: ct)
             .AsTask().GetAwaiter().GetResult();
         try
         {
-            // Overwrite: the table becomes exactly these batches (CTAS-like, idempotent on re-run).
-            return table.WriteAsync(batches, DeltaWriteMode.Overwrite, ct).AsTask().GetAwaiter().GetResult();
+            return table.WriteAsync(batches, mode, ct).AsTask().GetAwaiter().GetResult();
         }
         finally
         {
             table.DisposeAsync().AsTask().GetAwaiter().GetResult();
         }
+    }
+
+    public static long WriteOverwrite(nint opener, string path, Schema schema, IReadOnlyList<RecordBatch> batches,
+                                      CancellationToken ct) =>
+        Write(opener, path, schema, batches, DeltaWriteMode.Overwrite, ct);
+
+    /// <summary>Creates an empty Delta table (commit 0 with the schema, no data) at <paramref name="path"/>.</summary>
+    public static void Create(nint opener, string path, Schema schema, CancellationToken ct)
+    {
+        var fs = new DuckDbTableFileSystem(opener, path);
+        var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(), cancellationToken: ct)
+            .AsTask().GetAwaiter().GetResult();
+        table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+    }
+
+    /// <summary>Materializes a (possibly streamed) Arrow stream into independent in-memory batches via an Arrow
+    /// IPC round-trip — the source batches may be freed after consumption, and engineered-wood's WriteAsync
+    /// needs them retained for one commit. Returns the schema, batches, and total row count.</summary>
+    public static (Schema Schema, List<RecordBatch> Batches, long Rows) Materialize(
+        IArrowArrayStream stream, CancellationToken ct)
+    {
+        var schema = stream.Schema;
+        var ms = new MemoryStream();
+        long rows = 0;
+        using (var w = new ArrowStreamWriter(ms, schema, leaveOpen: true))
+        {
+            RecordBatch? b;
+            while ((b = stream.ReadNextRecordBatchAsync(ct).AsTask().GetAwaiter().GetResult()) is not null)
+            {
+                if (b.Length == 0)
+                {
+                    continue;
+                }
+                w.WriteRecordBatchAsync(b, ct).GetAwaiter().GetResult();
+                rows += b.Length;
+            }
+            w.WriteEndAsync(ct).GetAwaiter().GetResult();
+        }
+        var batches = new List<RecordBatch>();
+        ms.Position = 0;
+        using (var r = new ArrowStreamReader(ms))
+        {
+            RecordBatch? b;
+            while ((b = r.ReadNextRecordBatchAsync(ct).AsTask().GetAwaiter().GetResult()) is not null)
+            {
+                batches.Add(b);
+            }
+        }
+        return (schema, batches, rows);
     }
 }
 

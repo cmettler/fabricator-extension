@@ -1112,17 +1112,30 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   Source `GetDataInternal` (where C# `Collect` runs — Finalize-only was racy) AND into the shared
   `ArrowNetSetActiveTxn` helper (so any connection-using callsite sets it). Validated local + a live OneLake
   managed table (`Tables/dbo/arrownet_query`). `test/verify_delta_write.test` (18). **Delta folder-as-catalog
-  (READ) DONE**: `DeltaBackend` (3rd `IBackend`, `"delta"`/`"deltalake"`, registered explicitly in
-  `BackendRegistry.Discover` — Bridge-resident) + `DeltaCatalog` (read-only; writes throw). `ATTACH '/lake'
+  (READ + WRITE) DONE**: `DeltaBackend` (3rd `IBackend`, `"delta"`/`"deltalake"`, registered explicitly in
+  `BackendRegistry.Discover` — Bridge-resident) + `DeltaCatalog`. `ATTACH '/lake'
   (TYPE arrownet, PROVIDER 'delta')` discovers subdirs-with-`_delta_log/` as tables under a flat `main` schema
   (glob `<root>/*/_delta_log/*.json`), columns via `DeltaReader.GetSchema`, scan via `DeltaReader.Stream` with
   filter pushdown. The opener is threaded into the catalog metadata path (`LoadCatalog`/`RefreshCache` call
   `ArrowNetSetActiveTxn` before discovery; `FetchTableColumns` already did). `test/verify_delta_catalog.test`
-  (17 — discovery + filter + join, LOCAL). **OneLake/ADLS auto-discovery is BLOCKED by a DuckDB azure-extension
-  glob bug** (mid-path-wildcard recursion throws `type must be string, but is null`; reproduced with DuckDB's own
-  `glob()`) — single-table scan works, only the multi-table enumeration under a OneLake root doesn't; workaround
-  = an explicit `tables` ATTACH option or lazy per-table resolution (future). The full ATTACH-catalog
-  INSERT/CTAS write form (+ OCC retry, Append) is the remaining Delta write-back work. See docs/delta-catalog.md + docs/filesystem-bridge.md. v47 =
+  (17 — discovery + filter + join, LOCAL). **CATALOG STREAMING WRITE DONE** (the chosen slice): `CREATE TABLE`/
+  `INSERT`/CTAS/COPY stream straight to engineered-wood via the **standard bulk path** (`begin_bulk`/`push_batch`/
+  `complete_bulk` → `BulkSession` → `DeltaCatalog.BulkInsert`), exactly like the SQL/DAX backends — the global
+  `arrownet_delta_write` collector is no longer needed for the catalog case (it stays as the no-ATTACH function
+  form). **Opener threading into the bulk path:** `SetActiveOpener(&context)` is set immediately before
+  `BeginBulk` in the insert/CTAS/COPY operators; `BulkSession` captures it at `begin_bulk` and **re-establishes
+  `AmbientOpener.Current` (+ the txn id) on its background consumer thread** (the opener's `ClientContext` stays
+  valid until `complete_bulk`, which blocks on the consumer). `createTable`/`replace` ⇒ `DeltaWriteMode.Overwrite`,
+  plain INSERT ⇒ `Append`; one commit per statement; `CreateTable` writes empty commit-0 (PK/UNIQUE/DEFAULT
+  ignored — Delta has none); `DeltaWriter.Materialize` IPC-round-trips the streamed batches for the commit. NO
+  ABI change (reuses bulk + the v47 `set_active_opener`). `test/verify_delta_catalog_write.test` (29 — CREATE/
+  INSERT/append/CTAS/aggregate + detach/re-attach durability, LOCAL). **Still unsupported** (clean error):
+  DROP TABLE (no recursive-delete host callback), DELETE, UPDATE, raw exec. **OneLake/ADLS auto-discovery is
+  BLOCKED by a DuckDB azure-extension glob bug** (mid-path-wildcard recursion throws `type must be string, but is
+  null`; reproduced with DuckDB's own `glob()`) — single-table scan works, only the multi-table enumeration under
+  a OneLake root doesn't; workaround = an explicit `tables` ATTACH option or lazy per-table resolution (future).
+  Remaining Delta write-back work: DELETE/UPDATE (rowid-vs-predicate), OCC retry for concurrent writers, the
+  `engineeredwooddelta` rename, and a `delta-rs` production provider. See docs/delta-catalog.md + docs/filesystem-bridge.md. v47 =
   **host-FS global table functions**: appended one vtable entry `set_active_opener(opener)` — a per-thread ambient (`AmbientOpener`, mirroring `set_active_txn`) recording the
   calling operator's `ClientContext` so a connection-free GLOBAL host-FS table reader (a lakehouse format)
   resolves DuckDB secrets while reading through the host `fs_*` callbacks; set in the shared `PopulateReturnSchema`

@@ -1,0 +1,89 @@
+# name: test/verify_delta_catalog_write.test
+# description: The Delta folder-as-catalog provider WRITE path — CREATE TABLE / INSERT / CTAS / COPY stream
+#              straight to engineered-wood through the host FileSystem (the streaming bulk path, like the
+#              SQL/DAX backends), superseding the global arrownet_delta_write collector. createTable/replace =>
+#              Overwrite, plain INSERT => Append; one Delta commit per statement. Set ARROWNET_DELTA_WRITE_DIR
+#              to a WRITABLE base path. Local FS (OneLake auto-discovery is blocked by a DuckDB-azure glob bug).
+# group: [mssql_net]
+
+require mssql_net
+
+require-env ARROWNET_DELTA_WRITE_DIR
+
+# ATTACH a fresh (empty) Delta catalog root — no tables discovered yet.
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogw' AS lake (TYPE arrownet, PROVIDER 'delta');
+
+# CREATE TABLE — writes an empty Delta table (commit 0, schema only).
+statement ok
+CREATE TABLE lake.main.t (id INTEGER, name VARCHAR);
+
+query T
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'lake' ORDER BY table_name;
+----
+t
+
+# A freshly created table is empty.
+query I
+SELECT count(*) FROM lake.main.t;
+----
+0
+
+# INSERT streams an Append commit.
+statement ok
+INSERT INTO lake.main.t SELECT i, 'a' || i FROM range(1, 4) AS r(i);
+
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
+----
+1	a1
+2	a2
+3	a3
+
+# A second INSERT appends (two commits, rows accumulate).
+statement ok
+INSERT INTO lake.main.t VALUES (4, 'a4');
+
+query I
+SELECT count(*) FROM lake.main.t;
+----
+4
+
+# CTAS — create_table => Overwrite (the table becomes exactly the query result).
+statement ok
+CREATE TABLE lake.main.squares AS SELECT i AS n, i * i AS sq FROM range(1, 5) AS r(i);
+
+query II
+SELECT n, sq FROM lake.main.squares ORDER BY n;
+----
+1	1
+2	4
+3	9
+4	16
+
+# Filter pushdown + aggregate over the written table.
+query I
+SELECT sum(sq) FROM lake.main.squares WHERE n >= 3;
+----
+25
+
+statement ok
+DETACH lake;
+
+# Re-ATTACH proves the commits are durable + standard Delta (re-discovered from _delta_log).
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogw' AS lake2 (TYPE arrownet, PROVIDER 'delta');
+
+query T
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'lake2' ORDER BY table_name;
+----
+squares
+t
+
+query I
+SELECT count(*) FROM lake2.main.t;
+----
+4
+
+statement ok
+DETACH lake2;

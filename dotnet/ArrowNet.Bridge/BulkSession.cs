@@ -28,7 +28,7 @@ internal sealed class BulkSession
     public Schema Schema { get; }
 
     public BulkSession(IBackendCatalog catalog, string schemaName, string tableName, Schema schema, bool createTable,
-                       bool replace, bool checkConstraints, long txnId)
+                       bool replace, bool checkConstraints, long txnId, nint opener = 0)
     {
         Schema = schema;
         _channel = Channel.CreateBounded<RecordBatch>(new BoundedChannelOptions(ChannelCapacity)
@@ -40,6 +40,12 @@ internal sealed class BulkSession
         var reader = _channel.Reader;
         _consumer = Task.Run(() =>
         {
+            // Re-establish the per-thread ambients on the consumer thread (it's a different thread than
+            // begin_bulk): the transaction id (so a SQL provider keys its per-transaction connection) and the
+            // host-FS opener (so a host-FS provider — the Delta catalog — resolves DuckDB secrets while writing
+            // through DuckDB's FileSystem). The opener's ClientContext stays valid until complete_bulk returns.
+            AmbientTransaction.Current = txnId;
+            AmbientOpener.Current = opener;
             try
             {
                 return catalog.BulkInsert(schemaName, tableName, new ChannelArrowStream(schema, reader), createTable,

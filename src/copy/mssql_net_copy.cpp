@@ -136,6 +136,7 @@ static unique_ptr<GlobalFunctionData> CopyToInitGlobal(ClientContext &context, F
 	std::memset(&schema, 0, sizeof(schema));
 	auto *stream = gstate->producer->Stream();
 	stream->get_schema(stream, &schema);
+	arrownet::SetActiveOpener(reinterpret_cast<ArrowNetHandle>(&context)); // host-FS opener for a Delta-catalog COPY
 	gstate->bulk_session = arrownet::BeginBulk(bind_data.handle, bind_data.schema_name, bind_data.table_name,
 	                                           bind_data.create_table, bind_data.replace, /*check_constraints=*/false,
 	                                           (int64_t)context.ActiveTransaction().global_transaction_id, schema);
