@@ -48,14 +48,18 @@ public sealed class DeltaBackend : IBackend
 /// catalog metadata + scan + bulk-write call).</summary>
 public sealed class DeltaCatalog : IBackendCatalog
 {
-    private const string MainSchema = "main";
+    internal const string MainSchema = "main";
     // The stable row-tracking id surfaced as the DuckDB rowid for UPDATE/DELETE (a VIRTUAL column — not part
     // of the user schema). Matches EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.VirtualRowIdColumn.
     private const string RowIdColumn = "_metadata.row_id";
     private readonly string _root; // normalized (forward slashes), no trailing slash
     // For a OneLake root: the Fabric REST API credential (from the ATTACH'd azure SP secret) used to list
-    // tables. Null for local/S3/ADLS (which discover tables by glob) or when no secret was supplied.
+    // tables (and, for a schema-enabled lakehouse, an Entra SQL token). Null for local/S3/ADLS (glob discovery)
+    // or when no secret was supplied.
     private readonly Azure.Core.TokenCredential? _fabricCredential;
+    // Lazily-resolved OneLake shape (schema-enabled flag + discovered tables); null for non-OneLake roots.
+    private FabricLakehouse.OneLakeInfo? _oneLake;
+    private bool _oneLakeResolved;
 
     public DeltaCatalog(string root)
     {
@@ -66,38 +70,81 @@ public sealed class DeltaCatalog : IBackendCatalog
 
     private static string Normalize(string p) => p.Replace('\\', '/');
 
-    private string TablePath(string table) => _root + "/" + table;
+    /// <summary>Resolves (once) the OneLake lakehouse shape via the Fabric API + (schema-enabled) SQL endpoint.
+    /// Null for non-OneLake roots. Network calls; cached for the catalog's lifetime (refreshed on re-ATTACH).</summary>
+    private FabricLakehouse.OneLakeInfo? OneLake()
+    {
+        if (!_oneLakeResolved)
+        {
+            _oneLake = FabricLakehouse.IsOneLake(_root) ? FabricLakehouse.Resolve(_root, _fabricCredential) : null;
+            _oneLakeResolved = true;
+        }
+        return _oneLake;
+    }
+
+    /// <summary>The Delta table folder for a (schema, table). A schema-enabled OneLake lakehouse stores tables at
+    /// <c>&lt;root&gt;/&lt;schema&gt;/&lt;table&gt;</c>; everything else is flat <c>&lt;root&gt;/&lt;table&gt;</c>
+    /// (the DuckDB schema is then the single "main", ignored).</summary>
+    private string TablePath(string schema, string table) =>
+        OneLake()?.SchemaEnabled == true ? _root + "/" + schema + "/" + table : _root + "/" + table;
 
     public IArrowArrayStream GetMetadata(int kind, string? schema, string? table) => kind switch
     {
-        MetadataKind.Schemas => SingleColumn("schema_name", new[] { MainSchema }),
+        MetadataKind.Schemas => SingleColumn("schema_name", SchemaNames()),
         MetadataKind.Tables => DiscoverTables(),
         // Columns = a zero-row stream whose SCHEMA describes the table's columns (engineered-wood's Delta schema).
         MetadataKind.Columns => new InMemoryArrayStream(
-            DeltaReader.GetSchema(AmbientOpener.Current, TablePath(table!)), System.Array.Empty<RecordBatch>()),
+            DeltaReader.GetSchema(AmbientOpener.Current, TablePath(schema!, table!)), System.Array.Empty<RecordBatch>()),
         // RowId: the stable _metadata.row_id virtual column IFF the table has row tracking enabled — that
         // surfaces a DuckDB rowid so UPDATE/DELETE work (rowid-based, mirrors the SQL Server backend). A table
         // without row tracking (external Delta, or pre-row-tracking) reports no rowid => UPDATE/DELETE disabled.
-        MetadataKind.RowId => DeltaReader.IsRowTrackingEnabled(AmbientOpener.Current, TablePath(table!))
+        MetadataKind.RowId => DeltaReader.IsRowTrackingEnabled(AmbientOpener.Current, TablePath(schema!, table!))
             ? SingleColumn("name", new[] { RowIdColumn })
             : EmptyStringTable("name"),
         // No row-count/NDV stats surfaced, no functions.
         _ => EmptyStringTable("name"),
     };
 
+    /// <summary>The catalog's schemas: the lakehouse schemas for a schema-enabled OneLake lakehouse, else the
+    /// single flat "main".</summary>
+    private IReadOnlyList<string> SchemaNames()
+    {
+        var ol = OneLake();
+        if (ol?.SchemaEnabled == true)
+        {
+            var schemas = new SortedSet<string>(System.StringComparer.Ordinal);
+            if (!string.IsNullOrEmpty(ol.DefaultSchema))
+            {
+                schemas.Add(ol.DefaultSchema!); // always expose the default schema (so CREATE works when empty)
+            }
+            foreach (var (s, _) in ol.Tables)
+            {
+                schemas.Add(s);
+            }
+            if (schemas.Count == 0)
+            {
+                schemas.Add(MainSchema);
+            }
+            return new List<string>(schemas);
+        }
+        return new[] { MainSchema };
+    }
+
     /// <summary>Discovers tables = immediate subdirs of the root containing a <c>_delta_log/</c>. Globs the
     /// commit files (<c>&lt;root&gt;/*/_delta_log/*.json</c>) and takes the distinct parent-of-_delta_log
     /// directory name as the table.</summary>
     private IArrowArrayStream DiscoverTables()
     {
-        var names = new SortedSet<string>(System.StringComparer.Ordinal);
-        if (FabricLakehouse.IsOneLake(_root))
+        var pairs = new SortedSet<(string Schema, string Table)>();
+        var ol = OneLake();
+        if (ol is not null)
         {
-            // OneLake: DuckDB's azure glob can't recurse a _delta_log tree (PR #174), so list via the Fabric
-            // REST API (table data is still read/written through DuckDB's FileSystem on _root/<name>).
-            foreach (var n in FabricLakehouse.ListTableNames(_root, _fabricCredential))
+            // OneLake: DuckDB's azure glob can't recurse a _delta_log tree (PR #174). A non-schema lakehouse
+            // lists via the Fabric ListTables API (schema "main"); a schema-enabled one via its SQL endpoint
+            // (Tables/<schema>/<table>). Resolved in OneLake().
+            foreach (var (s, t) in ol.Tables)
             {
-                names.Add(n);
+                pairs.Add((s, t));
             }
         }
         else
@@ -118,17 +165,17 @@ public sealed class DeltaCatalog : IBackendCatalog
                 var name = slash < 0 ? path.Substring(0, marker) : path.Substring(slash + 1, marker - slash - 1);
                 if (name.Length > 0)
                 {
-                    names.Add(name);
+                    pairs.Add((MainSchema, name));
                 }
             }
         }
         var schemaCol = new List<string>();
         var nameCol = new List<string>();
         var typeCol = new List<string>();
-        foreach (var n in names)
+        foreach (var (s, t) in pairs)
         {
-            schemaCol.Add(MainSchema);
-            nameCol.Add(n);
+            schemaCol.Add(s);
+            nameCol.Add(t);
             typeCol.Add("BASE TABLE");
         }
         return ThreeColumn("schema_name", schemaCol, "table_name", nameCol, "table_type", typeCol);
@@ -138,7 +185,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                                        IArrowArrayStream? filterValues)
     {
         var opener = AmbientOpener.Current;
-        var path = TablePath(tableName);
+        var path = TablePath(schemaName, tableName);
         // Push the FILTER into engineered-wood file/row-group skipping (superset-safe; DuckDB re-applies).
         // Projection is left to DuckDB above the scan (the full schema is returned, mapped by name) — same as
         // the global arrownet_delta_scan; column-pruning into parquet would need a projected-schema stream.
@@ -199,7 +246,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         var opener = AmbientOpener.Current;
         var (schema, batches, rows) = DeltaWriter.Materialize(data, default);
         var mode = createTable || replace ? DeltaWriteMode.Overwrite : DeltaWriteMode.Append;
-        DeltaWriter.Write(opener, TablePath(tableName), schema, batches, mode, default, rowTracking: true);
+        DeltaWriter.Write(opener, TablePath(schemaName, tableName), schema, batches, mode, default, rowTracking: true);
         return rows;
     }
 
@@ -207,9 +254,9 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// <paramref name="ifNotExists"/> is satisfied; PK/UNIQUE/DEFAULT are ignored (Delta has no such constraints).</summary>
     public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists,
                             string? primaryKey, string? uniques, string? defaults)
-        => DeltaWriter.Create(AmbientOpener.Current, TablePath(tableName), columns, default, rowTracking: true);
+        => DeltaWriter.Create(AmbientOpener.Current, TablePath(schemaName, tableName), columns, default, rowTracking: true);
 
-    public void CreateSchema(string s, bool ie) { } // a Delta folder catalog has only the flat `main` schema
+    public void CreateSchema(string s, bool ie) { } // schemas mirror the lakehouse; CREATE SCHEMA is a no-op
     public void BeginTransaction() { }              // Delta is per-commit (no cross-statement transaction)
     public void CommitTransaction() { }
     public void RollbackTransaction() { }
@@ -227,7 +274,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         {
             throw Unsupported("DROP TABLE (host does not provide a recursive directory-delete callback)");
         }
-        HostFs.RemoveDir(AmbientOpener.Current, TablePath(tableName));
+        HostFs.RemoveDir(AmbientOpener.Current, TablePath(schemaName, tableName));
     }
 
     /// <summary>DELETE = rowid-based via Delta row tracking: <paramref name="keys"/> is a stream whose single
@@ -266,7 +313,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         {
             return 0;
         }
-        return DeltaReader.DeleteByRowIds(opener, TablePath(tableName), ids, default);
+        return DeltaReader.DeleteByRowIds(opener, TablePath(schemaName, tableName), ids, default);
     }
 
     public IArrowArrayStream ExecuteQuery(string sql) => throw Unsupported("raw query");

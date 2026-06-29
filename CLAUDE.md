@@ -1171,16 +1171,25 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   opener + a DuckDB azure secret) — the Fabric API is used ONLY to list table names. **Live Fabric tests use the
   gitignored `dax_secret.sql`** at the repo root (`CREATE OR REPLACE SECRET fabric_sp (TYPE azure, PROVIDER
   service_principal, TENANT_ID/CLIENT_ID/CLIENT_SECRET …)` — the Fabric-Warehouse SP; ATTACH `… (PROVIDER 'delta',
-  SECRET fabric_sp)`; one secret serves DuckDB OneLake IO + the Fabric REST API). **Live finding (2026-06-29):
-  the validated workspace `Test`/lakehouse `LH` is a SCHEMA-ENABLED lakehouse**, which breaks OneLake discovery
-  two ways: (1) Fabric `ListTables` (2.14.0) returns **400 `UnsupportedOperationForSchemasEnabledLakehouse`** (the
-  basic `/tables` endpoint has no schema support), and (2) DuckDB's azure `glob()` returns **0 rows at every level**
-  on OneLake (`Tables/*`, `Tables/dbo/*`; the deep pattern throws `type must be string, but is null`) — so glob is
-  not a fallback. AND our `DeltaCatalog` assumes a FLAT `Tables/<table>` + a single `main` schema, whereas a
-  schema-enabled lakehouse stores tables at `Tables/<schema>/<table>`. **Auth + workspace/lakehouse resolution +
-  the Fabric API call all WORK (proven live); schema-enabled-lakehouse support is the gap.** Unblock options: an
-  explicit `tables 'dbo.t,…'` ATTACH option + multi-schema paths; discover via the lakehouse SQL endpoint's
-  INFORMATION_SCHEMA; or validate on a NON-schema-enabled lakehouse first. Remaining Delta write-back work: UPDATE
+  SECRET fabric_sp, READ_ONLY false)`; one secret serves DuckDB OneLake IO + the Fabric REST API + the SQL
+  endpoint). **Schema-enabled lakehouse support — DONE + VALIDATED LIVE (2026-06-29) on workspace `Test`/lakehouse
+  `LH`.** The validated lakehouse is SCHEMA-ENABLED (tables at `Tables/<schema>/<table>`), which neither the Fabric
+  `ListTables` API (2.14.0 → 400 `UnsupportedOperationForSchemasEnabledLakehouse`) nor DuckDB's azure `glob()`
+  (0 rows at every OneLake level) can enumerate. So discovery branches: `FabricLakehouse.Resolve` calls
+  `GetLakehouse` → if `DefaultSchema` is set (schema-enabled) it lists `(schema, table)` via the lakehouse's **SQL
+  analytics endpoint** (`SqlEndpointProperties.ConnectionString` + INFORMATION_SCHEMA, an Entra SQL token from the
+  same SP — `Microsoft.Data.SqlClient` in the Bridge); else the non-schema `TablesClient.ListTables` (flat `main`).
+  `DeltaCatalog` is now **multi-schema**: `GetMetadata(Schemas)` returns the lakehouse schemas (+ always the
+  `DefaultSchema`), and `TablePath` is schema-aware (`<root>/<schema>/<table>` when schema-enabled, else flat
+  `<root>/<table>` for local/S3/non-schema). **Validated live end-to-end:** `ATTACH 'abfss://Test@onelake…/LH.Lakehouse/Tables'
+  (TYPE arrownet, PROVIDER 'delta', SECRET fabric_sp, READ_ONLY false)` → CTAS into `lake.dbo.arrownet_deltest`
+  (3 rows, writer-v7 rowTracking) → `DELETE WHERE id=2` (deletion-vector commit) → `SELECT` returns 1,a/3,c.
+  **`READ_ONLY false` is REQUIRED** for OneLake writes: DuckDB force-bumps any remote (`abfss://`) ATTACH to
+  read-only when the access mode is AUTOMATIC (`database_manager.cpp:105`); Delta supports remote writes, so set
+  it explicitly. **Caveat:** `duckdb_tables()` over a OneLake catalog is slow (materializes every table's columns
+  = N OneLake reads) — use targeted `lake.<schema>.<t>` access. **Sync lag:** the SQL endpoint may not list a
+  just-created table immediately, but same-session ops use the C++ entry cache so CREATE→INSERT→DELETE works.
+  Remaining Delta write-back work: UPDATE
   (rowid via row tracking), OCC retry for concurrent writers, the
   `engineeredwooddelta` rename, and a `delta-rs` production provider. See docs/delta-catalog.md + docs/filesystem-bridge.md. v47 =
   **host-FS global table functions**: appended one vtable entry `set_active_opener(opener)` — a per-thread ambient (`AmbientOpener`, mirroring `set_active_txn`) recording the

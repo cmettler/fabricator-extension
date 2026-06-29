@@ -20,14 +20,20 @@ listing, so a OneLake root discovers its tables via the **Fabric REST API** inst
 returns each `Table { Name, Location, Format }`. **Local / S3 / plain-ADLS roots keep the glob** —
 `DeltaCatalog.DiscoverTables` branches on `FabricLakehouse.IsOneLake(_root)` (host contains `onelake.`).
 Workspace + lakehouse are parsed from `abfss://<ws>@onelake…/<lh>[.Lakehouse]/Tables`: GUID segments are used
-directly, display names are resolved via `WorkspacesClient`/`ItemsClient`. Auth = a `TokenCredential` against
-`https://api.fabric.microsoft.com/v1` (scope `…/.default`), minted from the **ATTACH'd azure SP secret** —
-`ATTACH '…OneLake…/Tables' (TYPE arrownet, PROVIDER 'delta', SECRET <azure_sp>)` flows the secret through the v39
-foreign-secret path → `DeltaBackend.BuildConnectionString` appends a base64 cred marker on the root →
-`DeltaCatalog` extracts it into a `ClientSecretCredential` (mirrors the DAX provider). The Fabric API is used
-ONLY to list table names; the data files are still read/written through DuckDB's FileSystem (the opener + a
-DuckDB azure secret). **Live Fabric CREATE→INSERT→DELETE validation is pending** (needs Fabric creds + a
-lakehouse). The Unity Catalog API is an alternative but read-only.
+directly, display names are resolved via `WorkspacesClient`/`ItemsClient`. Auth = a `TokenCredential` minted from
+the **ATTACH'd azure SP secret** — `ATTACH '…OneLake…/Tables' (TYPE arrownet, PROVIDER 'delta', SECRET <azure_sp>,
+READ_ONLY false)` flows the secret through the v39 foreign-secret path → `DeltaBackend.BuildConnectionString`
+appends a base64 cred marker on the root → `DeltaCatalog` extracts it into a `ClientSecretCredential` (mirrors
+DAX). **Schema-enabled lakehouses** (`GetLakehouse.DefaultSchema` set; tables at `Tables/<schema>/<table>`) can't
+be listed by `ListTables` (400) nor glob, so they're discovered via the lakehouse **SQL analytics endpoint**
+(`SqlEndpointProperties.ConnectionString` + INFORMATION_SCHEMA, an Entra SQL token from the same SP —
+`Microsoft.Data.SqlClient`); `DeltaCatalog` is multi-schema (schema-aware `TablePath`). The Fabric API / SQL
+endpoint are used ONLY to list tables; data files go through DuckDB's FileSystem (the opener + a DuckDB azure
+secret). **VALIDATED LIVE (2026-06-29)** on a schema-enabled lakehouse: ATTACH → CTAS `lake.dbo.t` (row tracking)
+→ `DELETE WHERE` (deletion vector) → correct read-back. **`READ_ONLY false` is required** — DuckDB force-bumps
+remote (`abfss://`) attaches to read-only unless the access mode is explicit (`database_manager.cpp:105`); Delta
+supports remote writes. **Caveat:** `duckdb_tables()` over OneLake is slow (materializes every table's columns);
+use targeted `lake.<schema>.<t>`. The Unity Catalog API is an alternative but read-only.
 
 **Write quality:** the engineered-wood write path emits one parquet file per input `RecordBatch` (TargetFileSize
 is compaction-only). Row-group size IS controllable (`ParquetWriteOptions.RowGroupMaxRows` — now set to DuckDB's

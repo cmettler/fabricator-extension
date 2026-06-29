@@ -77,28 +77,101 @@ internal static class FabricLakehouse
 
     // ---- table discovery ----
 
-    /// <summary>Lists the table names of the OneLake lakehouse addressed by <paramref name="root"/>
-    /// (<c>abfss://&lt;workspace&gt;@onelake.dfs.fabric.microsoft.com/&lt;lakehouse&gt;[.Lakehouse]/Tables…</c>),
-    /// via the Fabric REST API. <paramref name="credential"/> authenticates to the API (the ATTACH'd SP secret,
-    /// else the ambient chain). Workspace/lakehouse may be GUIDs (used directly) or display names (resolved).</summary>
-    public static IReadOnlyList<string> ListTableNames(string root, TokenCredential? credential)
+    /// <summary>The resolved shape of a OneLake lakehouse: whether schemas are enabled, the OneLake Tables path,
+    /// and the discovered (schema, table) pairs. For a non-schema lakehouse the schema is always
+    /// <see cref="DeltaCatalog.MainSchema"/> ("main").</summary>
+    internal sealed class OneLakeInfo
+    {
+        public bool SchemaEnabled { get; init; }
+        public string TablesPath { get; init; } = string.Empty; // abfss …/Tables, no trailing slash
+        public List<(string Schema, string Table)> Tables { get; init; } = new();
+        // The lakehouse's default schema (schema-enabled only) — always surfaced so CREATE works on an
+        // otherwise-empty schema. Null/empty for non-schema lakehouses.
+        public string? DefaultSchema { get; init; }
+    }
+
+    /// <summary>Resolves the OneLake lakehouse at <paramref name="root"/> and discovers its tables. A
+    /// <b>schema-enabled</b> lakehouse (Fabric `GetLakehouse.DefaultSchema` set) is enumerated via its SQL
+    /// analytics endpoint's INFORMATION_SCHEMA (the Fabric ListTables API returns 400 for it, and OneLake glob
+    /// returns nothing) → tables at <c>Tables/&lt;schema&gt;/&lt;table&gt;</c>; a <b>non-schema</b> lakehouse uses
+    /// the Fabric `TablesClient.ListTables` API → flat <c>Tables/&lt;table&gt;</c> under DuckDB schema "main".
+    /// <paramref name="credential"/> authenticates both the Fabric API and (token) the SQL endpoint.</summary>
+    public static OneLakeInfo Resolve(string root, TokenCredential? credential)
     {
         var cred = credential ?? new DefaultAzureCredential();
         var (workspaceSeg, lakehouseSeg) = ParseOneLake(root);
-
         Guid workspaceId = ResolveWorkspaceId(workspaceSeg, cred);
         Guid lakehouseId = ResolveLakehouseId(workspaceId, lakehouseSeg, cred);
 
-        var tables = new TablesClient(cred);
-        var names = new List<string>();
-        foreach (var t in tables.ListTables(workspaceId, lakehouseId))
+        var lakehouse = new Microsoft.Fabric.Api.Lakehouse.ItemsClient(cred)
+                            .GetLakehouse(workspaceId, lakehouseId).Value;
+        var props = lakehouse.Properties;
+        string tablesPath = (props?.OneLakeTablesPath ?? root).Replace('\\', '/').TrimEnd('/');
+        bool schemaEnabled = !string.IsNullOrEmpty(props?.DefaultSchema);
+
+        var tables = new List<(string, string)>();
+        if (schemaEnabled)
         {
-            if (!string.IsNullOrEmpty(t.Name))
+            // SQL-endpoint discovery: the lakehouse SQL endpoint's database is the lakehouse name.
+            var server = props!.SqlEndpointProperties?.ConnectionString;
+            if (string.IsNullOrEmpty(server))
             {
-                names.Add(t.Name);
+                throw new InvalidOperationException(
+                    $"delta(onelake): schema-enabled lakehouse '{lakehouse.DisplayName}' has no SQL endpoint yet " +
+                    "(still provisioning?) — cannot discover tables.");
+            }
+            foreach (var (schema, table) in ListSchemaTablesViaSql(server!, lakehouse.DisplayName, cred))
+            {
+                tables.Add((schema, table));
             }
         }
-        return names;
+        else
+        {
+            foreach (var t in new TablesClient(cred).ListTables(workspaceId, lakehouseId))
+            {
+                if (!string.IsNullOrEmpty(t.Name))
+                {
+                    tables.Add((DeltaCatalog.MainSchema, t.Name));
+                }
+            }
+        }
+        return new OneLakeInfo
+        {
+            SchemaEnabled = schemaEnabled,
+            TablesPath = tablesPath,
+            Tables = tables,
+            DefaultSchema = schemaEnabled ? props!.DefaultSchema : null,
+        };
+    }
+
+    private const string SqlScope = "https://database.windows.net/.default";
+
+    /// <summary>Lists (schema, table) for BASE TABLEs of a Fabric lakehouse/warehouse SQL endpoint via
+    /// INFORMATION_SCHEMA, authenticating with an Entra token minted from <paramref name="cred"/>.</summary>
+    private static IEnumerable<(string Schema, string Table)> ListSchemaTablesViaSql(
+        string server, string database, TokenCredential cred)
+    {
+        var token = cred.GetToken(new TokenRequestContext(new[] { SqlScope }), default).Token;
+        var connString = new Microsoft.Data.SqlClient.SqlConnectionStringBuilder
+        {
+            DataSource = server,
+            InitialCatalog = database,
+            Encrypt = true,
+            ConnectTimeout = 60,
+        }.ConnectionString;
+
+        var result = new List<(string, string)>();
+        using var conn = new Microsoft.Data.SqlClient.SqlConnection(connString) { AccessToken = token };
+        conn.Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText =
+            "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'";
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            result.Add((reader.GetString(0), reader.GetString(1)));
+        }
+        return result;
     }
 
     /// <summary>Parses <c>abfss://&lt;workspace&gt;@onelake.dfs.fabric.microsoft.com/&lt;lakehouse&gt;/…</c> into the
