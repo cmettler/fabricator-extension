@@ -40,7 +40,7 @@ public sealed class DeltaBackend : IBackend
     }
 
     public IBackendCatalog OpenCatalog(string connectionString, string optionsJson) =>
-        new DeltaCatalog(connectionString);
+        new DeltaCatalog(connectionString, optionsJson);
 }
 
 /// <summary>An ATTACH'd Delta folder catalog. Lazy: holds the root path; all FS access happens during metadata
@@ -63,12 +63,41 @@ public sealed class DeltaCatalog : IBackendCatalog
     // Lazily-resolved OneLake shape (schema-enabled flag + discovered tables); null for non-OneLake roots.
     private FabricLakehouse.OneLakeInfo? _oneLake;
     private bool _oneLakeResolved;
+    // ATTACH option `deletion_vectors true`: tables CREATED in this catalog enable DV + row tracking (so their
+    // DELETEs use deletion vectors). DELETE on ANY table still follows that table's own delta.enableDeletionVectors
+    // config, so external DV tables are honored regardless of this flag.
+    private readonly bool _deletionVectorsOnCreate;
 
-    public DeltaCatalog(string root)
+    public DeltaCatalog(string root) : this(root, "{}") { }
+
+    public DeltaCatalog(string root, string? optionsJson)
     {
         var (clean, credential) = FabricLakehouse.Extract(root);
         _root = Normalize(clean).TrimEnd('/');
         _fabricCredential = credential;
+        _deletionVectorsOnCreate = ParseBoolOption(optionsJson, "deletion_vectors");
+    }
+
+    private static bool ParseBoolOption(string? optionsJson, string key)
+    {
+        if (string.IsNullOrEmpty(optionsJson))
+        {
+            return false;
+        }
+        try
+        {
+            using var doc = JsonDocument.Parse(optionsJson);
+            if (doc.RootElement.ValueKind == JsonValueKind.Object
+                && doc.RootElement.TryGetProperty(key, out var el))
+            {
+                var s = el.ValueKind == JsonValueKind.String ? el.GetString() : el.ToString();
+                return string.Equals(s, "true", System.StringComparison.OrdinalIgnoreCase) || s == "1";
+            }
+        }
+        catch (JsonException)
+        {
+        }
+        return false;
     }
 
     private static string Normalize(string p) => p.Replace('\\', '/');
@@ -247,7 +276,8 @@ public sealed class DeltaCatalog : IBackendCatalog
         var opener = AmbientOpener.Current;
         var (schema, batches, rows) = DeltaWriter.Materialize(data, default);
         var mode = createTable || replace ? DeltaWriteMode.Overwrite : DeltaWriteMode.Append;
-        DeltaWriter.Write(opener, TablePath(schemaName, tableName), schema, batches, mode, default);
+        DeltaWriter.Write(opener, TablePath(schemaName, tableName), schema, batches, mode, default,
+                          deletionVectors: _deletionVectorsOnCreate);
         return rows;
     }
 
@@ -255,7 +285,8 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// <paramref name="ifNotExists"/> is satisfied; PK/UNIQUE/DEFAULT are ignored (Delta has no such constraints).</summary>
     public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists,
                             string? primaryKey, string? uniques, string? defaults)
-        => DeltaWriter.Create(AmbientOpener.Current, TablePath(schemaName, tableName), columns, default);
+        => DeltaWriter.Create(AmbientOpener.Current, TablePath(schemaName, tableName), columns, default,
+                              deletionVectors: _deletionVectorsOnCreate);
 
     public void CreateSchema(string s, bool ie) { } // schemas mirror the lakehouse; CREATE SCHEMA is a no-op
     public void BeginTransaction() { }              // Delta is per-commit (no cross-statement transaction)
@@ -314,7 +345,12 @@ public sealed class DeltaCatalog : IBackendCatalog
         {
             return 0;
         }
-        return DeltaReader.DeleteByRowIds(opener, TablePath(schemaName, tableName), ids, default);
+        var path = TablePath(schemaName, tableName);
+        // Follow the TABLE's config: deletion-vector tables get the no-rewrite DV delete; everything else is
+        // copy-on-write. (Honors external DV tables regardless of this catalog's create-time flag.)
+        return DeltaReader.IsDeletionVectorsEnabled(opener, path)
+            ? DeltaReader.DeleteByRowIdsViaVectors(opener, path, ids, default)
+            : DeltaReader.DeleteByRowIds(opener, path, ids, default);
     }
 
     public IArrowArrayStream ExecuteQuery(string sql) => throw Unsupported("raw query");
@@ -395,10 +431,12 @@ public sealed class DeltaCatalog : IBackendCatalog
         //    the scan emitted) and return the modified batches. Unaffected files are left untouched.
         DeltaReader.UpdateByRowIds(opener, path, updates.Keys, (ordinal, batches) =>
         {
+            // Each batch is the file's USER columns (0..fields.Count-1) + a trailing _metadata.row_id (last) =
+            // the ABSOLUTE rowid. Match each row by its rowid (robust even when the file has a deletion vector).
             var outBatches = new List<RecordBatch>(batches.Count);
-            long pos = 0;
             foreach (var batch in batches)
             {
+                var rids = (Int64Array)batch.Column(batch.ColumnCount - 1);
                 var newCols = new IArrowArray[fields.Count];
                 for (int c = 0; c < fields.Count; c++)
                 {
@@ -411,7 +449,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                     var values = new List<object?>(batch.Length);
                     for (int i = 0; i < batch.Length; i++)
                     {
-                        long rid = (ordinal << RowIdPositionBits) | (pos + i);
+                        long rid = rids.GetValue(i) ?? -1;
                         values.Add(updates.TryGetValue(rid, out var nv)
                             ? nv[slot]
                             : ArrowValueReader.ReadScalar(batch.Column(c), i));
@@ -419,7 +457,6 @@ public sealed class DeltaCatalog : IBackendCatalog
                     newCols[c] = BuildArray(fields[c].DataType, values);
                 }
                 outBatches.Add(new RecordBatch(userSchema, newCols, batch.Length));
-                pos += batch.Length;
             }
             return outBatches;
         }, default);

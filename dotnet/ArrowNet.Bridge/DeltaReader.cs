@@ -118,6 +118,42 @@ internal static class DeltaReader
         }
     }
 
+    /// <summary>True if the Delta table at <paramref name="path"/> has <c>delta.enableDeletionVectors=true</c>
+    /// — DELETE then uses deletion vectors (no file rewrite) instead of copy-on-write.</summary>
+    public static bool IsDeletionVectorsEnabled(nint opener, string path)
+    {
+        var fs = new DuckDbTableFileSystem(opener, path);
+        var table = DeltaTable.OpenAsync(fs).GetAwaiter().GetResult();
+        try
+        {
+            var cfg = table.CurrentSnapshot.Metadata.Configuration;
+            return cfg is not null
+                && cfg.TryGetValue("delta.enableDeletionVectors", out var v)
+                && string.Equals(v, "true", System.StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            table.Dispose();
+        }
+    }
+
+    /// <summary>DELETE via deletion vectors (no file rewrite) — for tables with deletion vectors enabled.
+    /// <paramref name="rowIds"/> are ABSOLUTE transient rowids. Returns rows deleted.</summary>
+    public static long DeleteByRowIdsViaVectors(nint opener, string path, IReadOnlyCollection<long> rowIds,
+                                                CancellationToken ct)
+    {
+        var fs = new DuckDbTableFileSystem(opener, path);
+        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).AsTask().GetAwaiter().GetResult();
+        try
+        {
+            return table.DeleteByRowIdsViaVectorsAsync(rowIds, ct).AsTask().GetAwaiter().GetResult().RowsDeleted;
+        }
+        finally
+        {
+            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+    }
+
     /// <summary>Per-file copy-on-write UPDATE: only files containing a target <paramref name="rowIds"/> are
     /// rewritten. <paramref name="rewriteFile"/> (ordinal, the file's batches) returns the same rows with the SET
     /// columns modified on matched positions (the caller owns the typed substitution); engineered-wood re-writes

@@ -1,0 +1,86 @@
+# name: test/verify_delta_catalog_dv.test
+# description: Delta folder-as-catalog DELETION-VECTOR mode (opt-in fast delete). ATTACH with `deletion_vectors
+#              true` => tables created here enable the deletionVectors + rowTracking table features; DELETE then
+#              marks rows in a deletion vector (no file rewrite) instead of copy-on-write. Repeat deletes compose
+#              (absolute-position rowids), and UPDATE on a DV table is copy-on-write (rewrites the file, dropping
+#              its DV). The DV bytes are standard (RoaringBitmapArray) — delta-kernel/Spark/Fabric read them. Set
+#              ARROWNET_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
+# group: [mssql_net]
+
+require mssql_net
+
+require-env ARROWNET_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogdv' AS lake (TYPE arrownet, PROVIDER 'delta', deletion_vectors true);
+
+statement ok
+CREATE TABLE lake.main.t (id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO lake.main.t SELECT i, 'a' || i FROM range(1, 7) AS r(i);
+
+# DELETE via deletion vector (no file rewrite).
+statement ok
+DELETE FROM lake.main.t WHERE id = 2;
+
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
+----
+1	a1
+3	a3
+4	a4
+5	a5
+6	a6
+
+# Second DELETE — composes with the first DV (absolute positions, no rewrite).
+statement ok
+DELETE FROM lake.main.t WHERE id = 5;
+
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
+----
+1	a1
+3	a3
+4	a4
+6	a6
+
+# UPDATE on a DV table (copy-on-write rewrite — drops the file's DV, keeps the survivors).
+statement ok
+UPDATE lake.main.t SET name = 'X' WHERE id = 4;
+
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
+----
+1	a1
+3	a3
+4	X
+6	a6
+
+# A DV delete after the UPDATE (the rewritten file has no DV; this starts a fresh DV on it).
+statement ok
+DELETE FROM lake.main.t WHERE id = 1;
+
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
+----
+3	a3
+4	X
+6	a6
+
+# Durability: detach + re-attach re-reads the deletion vectors.
+statement ok
+DETACH lake;
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogdv' AS lake2 (TYPE arrownet, PROVIDER 'delta', deletion_vectors true);
+
+query IT
+SELECT id, name FROM lake2.main.t ORDER BY id;
+----
+3	a3
+4	X
+6	a6
+
+statement ok
+DETACH lake2;

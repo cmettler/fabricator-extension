@@ -228,14 +228,26 @@ internal static class DeltaWriter
     // Plain Delta (minReader 1 / minWriter 2) is maximally reader-compatible — Fabric OneLake conversion + Spark
     // can't read our row-tracking/deletion-vector commits (engineered-wood's DV format isn't Spark-compatible).
 
+    // Opt-in table features for the deletion-vector fast-delete mode (DELETE marks rows in a DV instead of
+    // rewriting the file). Row tracking is enabled alongside (per the chosen design); both are declared in the
+    // protocol by CreateAsync (reader v3 + deletionVectors/rowTracking/domainMetadata). A table created with
+    // this config is recognized by DeltaReader.IsDeletionVectorsEnabled so DELETE picks the DV path.
+    private static readonly Dictionary<string, string> DeletionVectorConfig = new()
+    {
+        ["delta.enableDeletionVectors"] = "true",
+        ["delta.enableRowTracking"] = "true",
+    };
+
     /// <summary>Opens-or-creates the Delta table at <paramref name="path"/> and writes <paramref name="batches"/>
-    /// in <paramref name="mode"/> (Overwrite for CTAS/REPLACE, Append for INSERT). Returns the committed version.</summary>
+    /// in <paramref name="mode"/> (Overwrite for CTAS/REPLACE, Append for INSERT). Returns the committed version.
+    /// <paramref name="deletionVectors"/> enables the DV+rowTracking features on a NEW table (opt-in fast-delete).</summary>
     public static long Write(nint opener, string path, Schema schema, IReadOnlyList<RecordBatch> batches,
-                             DeltaWriteMode mode, CancellationToken ct)
+                             DeltaWriteMode mode, CancellationToken ct, bool deletionVectors = false)
     {
         var fs = new DuckDbTableFileSystem(opener, path);
-        var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(), cancellationToken: ct)
-                             .AsTask().GetAwaiter().GetResult();
+        var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(),
+                                                 configuration: deletionVectors ? DeletionVectorConfig : null,
+                                                 cancellationToken: ct).AsTask().GetAwaiter().GetResult();
         try
         {
             return table.WriteAsync(batches, mode, ct).AsTask().GetAwaiter().GetResult();
@@ -250,12 +262,15 @@ internal static class DeltaWriter
                                       CancellationToken ct) =>
         Write(opener, path, schema, batches, DeltaWriteMode.Overwrite, ct);
 
-    /// <summary>Creates an empty Delta table (commit 0 with the schema, no data) at <paramref name="path"/>.</summary>
-    public static void Create(nint opener, string path, Schema schema, CancellationToken ct)
+    /// <summary>Creates an empty Delta table (commit 0 with the schema, no data) at <paramref name="path"/>.
+    /// <paramref name="deletionVectors"/> enables the DV+rowTracking features (opt-in fast-delete).</summary>
+    public static void Create(nint opener, string path, Schema schema, CancellationToken ct,
+                              bool deletionVectors = false)
     {
         var fs = new DuckDbTableFileSystem(opener, path);
-        var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(), cancellationToken: ct)
-                             .AsTask().GetAwaiter().GetResult();
+        var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(),
+                                                 configuration: deletionVectors ? DeletionVectorConfig : null,
+                                                 cancellationToken: ct).AsTask().GetAwaiter().GetResult();
         table.DisposeAsync().AsTask().GetAwaiter().GetResult();
     }
 
