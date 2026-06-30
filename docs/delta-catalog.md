@@ -385,9 +385,13 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      view). Catalog NAME (not a path; resolved to its handle, reusing the catalog's `TablePath`) + schema-qualified
      table (schema mandatory on schema-enabled, defaults to `main` flat). Returns `(version, timestamp, operation,
      operation_parameters)` from the `_delta_log` (engineered-wood `GetHistoryAsync`). New `MetadataKind.Snapshots`
-     (additive, no ABI bump); C++ `SnapshotsBind` mirrors `ServerInfoBind`. timestamp/operation are non-null only
-     on tables that record commitInfo (`in_commit_timestamps`); plain tables show the version list with NULL
-     metadata. Validated local + live Fabric (`LH2`). `verify_delta_catalog_snapshots.test` (20).
+     (additive, no ABI bump); C++ `SnapshotsBind` mirrors `ServerInfoBind`. **commitInfo is written on every
+     commit by default** (engineered-wood `EnsureCommitInfo` always prepends operation + timestamp — standard,
+     no protocol bump), so plain tables show a full operation/timestamp history (CREATE TABLE/WRITE per version),
+     not just versions. The opt-in `inCommitTimestamp` field (on `in_commit_timestamps` tables) is what drives
+     `AT (TIMESTAMP)` travel; the snapshots `timestamp` is shown on plain tables too but you travel by VERSION
+     (the DuckLake workflow). Validated local + live Fabric (`LH2` ICT + a plain table on `LH_no_schema`).
+     `verify_delta_catalog_snapshots.test` (28).
      **Not built:** a `snapshots()`/history function (feasible via `TransactionLog.ListVersionsAsync` +
      `ReadCommitAsync`) and a per-row commit-version virtual column (needs Delta row tracking).
 3. **DELETE — FINAL: copy-on-write + transient `(file,position)` rowid, PLAIN Delta (no features).** The

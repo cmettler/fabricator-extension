@@ -1315,11 +1315,17 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   (catalog→handle, factory = `GetMetadata(handle, ARROWNET_META_SNAPSHOTS=8, schema, table)`, reuses
   `ArrowStreamScan`); C# `DeltaCatalog.GetMetadata(Snapshots)` → `DeltaReader.GetSnapshots` → engineered-wood
   `DeltaTable.GetHistoryAsync` (new — `ListVersionsAsync` + `ReadCommitAsync` → `CommitInfo`). **Additive enum →
-  NO ABI bump.** `timestamp`/`operation` are populated only when the table records `commitInfo` — i.e.
-  `in_commit_timestamps` tables (engineered-wood writes no commitInfo on plain tables, so those show the version
-  list with NULL metadata; the create commit v0 is null even on ICT tables since `CreateAsync` skips
-  EnsureCommitInfo). Validated local + **live Fabric** (`LH2.dbo.arrownet_ict2`: v0 null, v1–v3 WRITE +
-  timestamps). `test/verify_delta_catalog_snapshots.test` (20). Pairs with VERSION time travel: read the
+  NO ABI bump.** **`commitInfo` is now written on EVERY commit by default** (engineered-wood
+  `InCommitTimestamp.EnsureCommitInfo` always prepends a `commitInfo` with `operation` + a `timestamp` — standard
+  feature-free fields, no protocol bump, writer v2; `CreateAsync`'s v0 also gets one, operation `CREATE TABLE`).
+  So **plain tables now show a full operation + timestamp history** (`CREATE TABLE`/`WRITE` per version), not just
+  the version list. The opt-in `inCommitTimestamp` field is added on top ONLY for `in_commit_timestamps` tables —
+  and **only it (not the generic `commitInfo.timestamp`) drives `AT (TIMESTAMP)` time travel** (the snapshots
+  `timestamp` reads `inCommitTimestamp ?? commitInfo.timestamp`, but `GetSnapshotAtTimestampAsync` reads
+  `inCommitTimestamp` only — so the snapshots VIEW is timestamped on plain tables, but you time-travel by VERSION,
+  the DuckLake workflow). Validated local + **live Fabric**: `LH2.dbo.arrownet_ict2` (ICT) AND a PLAIN table on
+  `LH_no_schema` both show v0 `CREATE TABLE` + `WRITE`s with timestamps. `test/verify_delta_catalog_snapshots.test`
+  (28). Pairs with VERSION time travel: read the
   snapshots to pick a version. **Per-row commit version as a virtual column (DuckLake
   `snapshot_id` analog) — NOT built**: needs the Delta **row-tracking** feature (`_metadata.row_commit_version`),
   which our plain tables don't enable (only the opt-in `deletion_vectors true` path enables row tracking) + a

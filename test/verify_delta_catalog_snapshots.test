@@ -48,11 +48,20 @@ SELECT count(*) FROM arrownet_delta_snapshots('lake', 't');
 ----
 4
 
-# Plain tables record no commitInfo, so timestamp/operation are NULL (the version list is the usable part).
+# commitInfo is written on EVERY commit (default), so plain tables get operation + timestamp on all versions.
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('lake', 't') WHERE timestamp IS NULL;
+SELECT count(*) FROM arrownet_delta_snapshots('lake', 't') WHERE timestamp IS NOT NULL AND operation IS NOT NULL;
 ----
 4
+
+# v0 is the CREATE TABLE commit; the rest are WRITEs.
+query IT
+SELECT version, operation FROM arrownet_delta_snapshots('lake', 't') ORDER BY version;
+----
+0	CREATE TABLE
+1	WRITE
+2	WRITE
+3	WRITE
 
 statement ok
 DETACH lake;
@@ -67,13 +76,13 @@ CREATE TABLE ict.main.t AS SELECT 1 AS id;
 statement ok
 INSERT INTO ict.main.t VALUES (2);
 
-# Data commits (the CTAS data write + the INSERT) have a non-null timestamp.
+# All commits have a timestamp (v0 CREATE TABLE + the CTAS data write + the INSERT).
 query I
 SELECT count(*) FROM arrownet_delta_snapshots('ict', 'main.t') WHERE timestamp IS NOT NULL;
 ----
-2
+3
 
-# ...and operation = 'WRITE'.
+# The two data commits are WRITEs (v0 is CREATE TABLE).
 query I
 SELECT count(*) FROM arrownet_delta_snapshots('ict', 'main.t') WHERE operation = 'WRITE';
 ----
