@@ -374,8 +374,13 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      `in_commit_timestamps true` ATTACH option** — engineered-wood resolves timestamps via the Delta
      inCommitTimestamps writer feature (not commit-file mtime, which is unreliable on object stores), so tables
      created with the option carry a per-commit timestamp and TIMESTAMP travel resolves; plain tables give a
-     clean error and VERSION travel always works. It's a writer-only feature (reader-safe) — validated that
-     delta-rs/delta-kernel (`delta_scan`) AND live OneLake/Fabric read such a table. `verify_delta_catalog_time_travel.test` (47).
+     clean error and VERSION travel always works. delta-rs/delta-kernel (`delta_scan`) reads it. **BUT it BREAKS
+     Fabric's OneLake table conversion** (validated live: the table shows as "Unable to identify these objects as
+     tables or views") — Fabric's converter only registers plain Delta (writer v2, zero features); ANY writer-v7
+     feature table is rejected, even a writer-only one like inCommitTimestamp (same limitation as
+     `deletion_vectors`/row-tracking). **So `in_commit_timestamps` is local/S3 + delta-rs/Spark only — not for a
+     Fabric lakehouse queried via the SQL endpoint.** Fabric timestamp travel would need the commit-file mtime
+     path (keeps the table plain), not built. VERSION travel is universal. `verify_delta_catalog_time_travel.test` (47).
      **Not built:** a `snapshots()`/history function (feasible via `TransactionLog.ListVersionsAsync` +
      `ReadCommitAsync`) and a per-row commit-version virtual column (needs Delta row tracking).
 3. **DELETE — FINAL: copy-on-write + transient `(file,position)` rowid, PLAIN Delta (no features).** The

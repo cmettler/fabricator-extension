@@ -1287,12 +1287,22 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   in the create config; engineered-wood `CreateAsync` declares the `inCommitTimestamp` **writer** feature
   [writer v7, NOT a reader feature — readers read normally] + `EnsureCommitInfo` writes the per-commit timestamp)
   makes TIMESTAMP travel resolve. Enabled at creation (v0), so no
-  `inCommitTimestampEnablementVersion/Timestamp` props needed. **Validated both readers:** delta-rs/delta-kernel
-  (DuckDB's official `delta_scan`) reads an ICT table, AND live OneLake (`LH_no_schema`) write + read-back +
-  `AT (TIMESTAMP => future)` resolve — the writer-only feature is Fabric-reader-safe (unlike DV/row-tracking).
-  NO ABI/C++ change. Verified: `test/verify_delta_catalog_time_travel.test` (47 — version 0/1/2/3, filter
-  pushdown, multi-version count/JOIN/UNION, re-attach durability, plain-table timestamp error, and
-  `in_commit_timestamps` timestamp travel).
+  `inCommitTimestampEnablementVersion/Timestamp` props needed. **delta-rs/delta-kernel reads it** (DuckDB's
+  official `delta_scan`), and our provider write+read+timestamp-travel works on OneLake. **BUT it BREAKS Fabric's
+  OneLake table conversion (validated live 2026-06-30): the table shows as "Unable to identify these objects as
+  tables or views" in the lakehouse / SQL endpoint.** Fabric's OneLake CONVERTER only registers **plain Delta
+  (writer v2, zero table features)** — ANY writer-v7/table-features table is rejected, even a *writer-only*
+  feature like inCommitTimestamp (my "writer-only ⇒ Fabric-safe" reasoning was WRONG: it's reader-safe for a raw
+  delta-kernel read, but Fabric's converter is stricter than a reader). This is the SAME limitation that made
+  `deletion_vectors`/row-tracking tables Fabric-unconvertible — which is why plain Delta is our default.
+  **⇒ `in_commit_timestamps` is for local/S3 + delta-rs/Spark consumers ONLY; do NOT use it on a Fabric lakehouse
+  you need to query via the SQL endpoint.** For **Fabric timestamp travel** the only protocol-preserving option is
+  the **commit-file mtime** path (keeps the table plain → Fabric converts it; needs a host-FS mtime callback +
+  an engineered-wood mtime fallback; mtime reliability on object stores is the caveat) — NOT built. **VERSION
+  travel works everywhere (plain Delta) and is the universal form.** NO ABI/C++ change. Verified:
+  `test/verify_delta_catalog_time_travel.test` (47 — version 0/1/2/3, filter pushdown, multi-version
+  count/JOIN/UNION, re-attach durability, plain-table timestamp error, and `in_commit_timestamps` timestamp
+  travel [local]).
   **Snapshots/history function (DuckLake-style `snapshots()`) — NOT built** (feasible via engineered-wood
   `TransactionLog.ListVersionsAsync` + `ReadCommitAsync` → `CommitInfo.Values`; would be a global
   `arrownet_delta_snapshots(path)` table fn). **Per-row commit version as a virtual column (DuckLake
