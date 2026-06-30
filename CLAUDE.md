@@ -1324,7 +1324,9 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `timestamp` reads `inCommitTimestamp ?? commitInfo.timestamp`, but `GetSnapshotAtTimestampAsync` reads
   `inCommitTimestamp` only — so the snapshots VIEW is timestamped on plain tables, but you time-travel by VERSION,
   the DuckLake workflow). Validated local + **live Fabric**: `LH2.dbo.arrownet_ict2` (ICT) AND a PLAIN table on
-  `LH_no_schema` both show v0 `CREATE TABLE` + `WRITE`s with timestamps. `test/verify_delta_catalog_snapshots.test`
+  `LH_no_schema` both show v0 `CREATE TABLE` + `WRITE`s with timestamps — and the plain `commitInfo` table on
+  `LH_no_schema` (no time-travel setting) **registers + is SQL-endpoint-queryable** in Fabric (confirmed), i.e.
+  always-on `commitInfo` is Fabric-safe on plain writer-v2 tables. `test/verify_delta_catalog_snapshots.test`
   (28). Pairs with VERSION time travel: read the
   snapshots to pick a version. **Per-row commit version as a virtual column (DuckLake
   `snapshot_id` analog) — NOT built**: needs the Delta **row-tracking** feature (`_metadata.row_commit_version`),
