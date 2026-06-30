@@ -1264,7 +1264,32 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `test/verify_delta_catalog_schemas.test` (23 — subfolder layout, same-name tables in two schemas don't collide,
   re-attach rediscovers schemas, CREATE/DROP SCHEMA, RENAME-unsupported-locally). **Empty created schemas don't
   survive re-attach** (no `_delta_log` to glob) — a documented limitation. **Gotcha found:** unqualified
-  `staging.t` resolves to DuckDB's DEFAULT (memory) catalog, not the attached one — always use `db.schema.table`. **OneLake table discovery + DROP
+  `staging.t` resolves to DuckDB's DEFAULT (memory) catalog, not the attached one — always use `db.schema.table`.
+  **TIME TRAVEL — `FROM t AT (VERSION => n)` DONE** (C#-only; the plumbing already existed —
+  `ArrowNetCatalog::SupportsTimeTravel()` is `true` for all providers and the `AT` clause already flows to the
+  scan's `spec_json` as `"at":{unit,value}` → `ScanSpec.At`, which the SQL backend uses for `FOR SYSTEM_TIME AS
+  OF`). `DeltaCatalog.ScanTable` now honors `spec.At`: `DeltaReader.StreamAt` / `GetSchemaAt` resolve the
+  snapshot (engineered-wood `ReadAtVersionAsync` + `GetSnapshotAtVersionAsync`) and stream as of that version,
+  advertising the schema AS OF that version. **Filter pushdown applies under time travel** (`ReadAtVersionAsync`
+  takes the predicate → file/row-group pruning). Unlike the SQL provider (timestamp-only, `FOR SYSTEM_TIME`),
+  Delta accepts **VERSION** (the natural Delta form) — and works under JOIN/UNION version comparison. **Rowid
+  under time travel:** DuckDB's `count(*)`-via-rowid optimization can request the virtual `_metadata.row_id` on a
+  time-travel scan; the branch routes that to a version-aware rowid stream
+  (`DeltaReader.StreamWithRowIdsAt` → engineered-wood `ReadAtVersionWithRowIdsAsync`, the version analog of
+  `ReadAllWithRowIdsAsync`) — without it, the rowid (BIGINT) collided with the first user column (`INTERNAL
+  Error: Vector::Reference … BIGINT referenced INTEGER`) when the same table was scanned at multiple versions in
+  one statement. **`AT (TIMESTAMP => ts)` is NOT supported on plain tables** — engineered-wood's
+  `GetSnapshotAtTimestampAsync` resolves a timestamp via the Delta **in-commit-timestamps** feature (not the
+  commit-file mtime), which we don't enable → a clean "Ensure the table has in-commit timestamps enabled" error;
+  VERSION is the supported form. NO ABI/C++ change. Verified: `test/verify_delta_catalog_time_travel.test` (40 —
+  version 0/1/2/3, filter pushdown, multi-version count/JOIN/UNION, re-attach durability, timestamp error).
+  **Snapshots/history function (DuckLake-style `snapshots()`) — NOT built** (feasible via engineered-wood
+  `TransactionLog.ListVersionsAsync` + `ReadCommitAsync` → `CommitInfo.Values`; would be a global
+  `arrownet_delta_snapshots(path)` table fn). **Per-row commit version as a virtual column (DuckLake
+  `snapshot_id` analog) — NOT built**: needs the Delta **row-tracking** feature (`_metadata.row_commit_version`),
+  which our plain tables don't enable (only the opt-in `deletion_vectors true` path enables row tracking) + a
+  second-virtual-column plumbing beyond `_metadata.row_id` + uncertain Fabric read-compat of row-tracking
+  commits. **OneLake table discovery + DROP
   — via the ADLS Gen2 / OneLake DFS endpoint directly** (`FabricLakehouse`, Bridge; `Azure.Storage.Files.DataLake`
   12.21.0): DuckDB's azure glob can't recurse a OneLake `_delta_log` tree (mid-path wildcard → `type must be
   string, but is null`, duckdb-azure PR #174), so a OneLake root (`abfss://<ws>@onelake…/<lh>.Lakehouse/Tables`)

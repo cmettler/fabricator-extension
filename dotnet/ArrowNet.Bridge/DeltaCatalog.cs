@@ -270,6 +270,32 @@ public sealed class DeltaCatalog : IBackendCatalog
         EngineeredWood.Expressions.Predicate? filter = spec?.Filter is { } node
             ? new DeltaFilterBuilder(ReadFilterValues(filterValues)).Build(node)
             : null;
+        // Time travel: `FROM t AT (VERSION => n)` / `AT (TIMESTAMP => ts)` — a read-only snapshot, so it uses
+        // the plain stream (no rowid) and advertises the schema AS OF that version (which can differ from the
+        // latest, e.g. before an ADD COLUMN). Delta supports BOTH version and timestamp (unlike the SQL provider,
+        // which only does timestamp via FOR SYSTEM_TIME AS OF).
+        if (spec?.At is { } at)
+        {
+            var atSchema = DeltaReader.GetSchemaAt(opener, path, at.Unit, at.Value);
+            // DuckDB may still request the virtual rowid for a time-travel scan (its count(*)-via-rowid
+            // optimization). Produce it (version-aware transient rowid) so the stream matches what DuckDB asked
+            // for; otherwise the rowid (BIGINT) it expects collides with the first user column (the
+            // "BIGINT referenced INTEGER" internal error). No DML against a past snapshot, so it's read-only.
+            bool wantRowIdAt = spec.Columns is { } atCols && atCols.Contains(RowIdColumn);
+            if (wantRowIdAt)
+            {
+                var atFields = new List<Field>(atSchema.FieldsList)
+                {
+                    new Field(RowIdColumn, Int64Type.Default, nullable: false),
+                };
+                return new AsyncEnumerableArrowStream(
+                    new Schema(atFields, atSchema.Metadata),
+                    DeltaReader.StreamWithRowIdsAt(opener, path, columns: null, filter, at.Unit, at.Value, default));
+            }
+            return new AsyncEnumerableArrowStream(
+                atSchema, DeltaReader.StreamAt(opener, path, columns: null, filter, at.Unit, at.Value, default));
+        }
+
         var userSchema = DeltaReader.GetSchema(opener, path);
 
         // When the scan requests the virtual rowid (UPDATE/DELETE plans), stream WITH the trailing

@@ -1,0 +1,111 @@
+# name: test/verify_delta_catalog_time_travel.test
+# description: Delta folder-as-catalog TIME TRAVEL. `FROM t AT (VERSION => n)` reads the table as of commit n;
+#              `AT (TIMESTAMP => ts)` reads as of that instant (resolved to a version). Filter pushdown still
+#              applies under time travel. Read-only (a past snapshot is never written). Set ARROWNET_DELTA_WRITE_DIR
+#              to a WRITABLE base path. Local FS.
+# group: [mssql_net]
+
+require mssql_net
+
+require-env ARROWNET_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogtt' AS lake (TYPE arrownet, PROVIDER 'delta');
+
+# Build a version history: v0 = empty (CREATE), v1/v2/v3 = one INSERT each.
+statement ok
+CREATE TABLE lake.main.t (id INTEGER, val VARCHAR);
+
+statement ok
+INSERT INTO lake.main.t VALUES (1, 'a');
+
+statement ok
+INSERT INTO lake.main.t VALUES (2, 'b');
+
+statement ok
+INSERT INTO lake.main.t VALUES (3, 'c');
+
+# Latest = all three rows.
+query IT
+SELECT id, val FROM lake.main.t ORDER BY id;
+----
+1	a
+2	b
+3	c
+
+# AT (VERSION => 1) — only the first insert.
+query IT
+SELECT id, val FROM lake.main.t AT (VERSION => 1) ORDER BY id;
+----
+1	a
+
+# AT (VERSION => 2) — first two.
+query IT
+SELECT id, val FROM lake.main.t AT (VERSION => 2) ORDER BY id;
+----
+1	a
+2	b
+
+# AT (VERSION => 0) — the empty CREATE commit.
+query I
+SELECT count(*) FROM lake.main.t AT (VERSION => 0);
+----
+0
+
+# Filter pushdown still applies under time travel (superset-safe; DuckDB re-applies).
+query IT
+SELECT id, val FROM lake.main.t AT (VERSION => 3) WHERE id >= 2 ORDER BY id;
+----
+2	b
+3	c
+
+# Time travel coexists with the live (latest) scan in one query (the count(*)-via-rowid optimization on the
+# same table at several versions — exercises the version-aware rowid stream).
+query III
+SELECT (SELECT count(*) FROM lake.main.t),
+       (SELECT count(*) FROM lake.main.t AT (VERSION => 1)),
+       (SELECT count(*) FROM lake.main.t AT (VERSION => 0));
+----
+3	1	0
+
+# Version comparison in one query — a FULL JOIN of two versions (v1 has id 1; v3 adds 2,3).
+query II
+SELECT v1.id, v3.id
+FROM (SELECT id FROM lake.main.t AT (VERSION => 1)) v1
+FULL JOIN (SELECT id FROM lake.main.t AT (VERSION => 3)) v3 USING (id)
+ORDER BY v3.id;
+----
+1	1
+NULL	2
+NULL	3
+
+# Versions also compose under UNION ALL (1 row + 2 rows).
+query I
+SELECT count(*) FROM (SELECT id FROM lake.main.t AT (VERSION => 1)
+                      UNION ALL SELECT id FROM lake.main.t AT (VERSION => 2));
+----
+3
+
+# AT (TIMESTAMP => ...) needs the Delta in-commit-timestamps feature (engineered-wood resolves a timestamp via
+# inCommitTimestamp, not the commit-file mtime); our plain tables don't enable it → a clean error. VERSION travel
+# is the supported form.
+statement error
+SELECT count(*) FROM lake.main.t AT (TIMESTAMP => '2999-01-01 00:00:00');
+----
+in-commit timestamps
+
+# Time travel survives detach/re-attach (reads the log, not in-memory state).
+statement ok
+DETACH lake;
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogtt' AS lake (TYPE arrownet, PROVIDER 'delta');
+
+query IT
+SELECT id, val FROM lake.main.t AT (VERSION => 2) ORDER BY id;
+----
+1	a
+2	b
+
+statement ok
+DETACH lake;

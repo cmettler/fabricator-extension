@@ -366,6 +366,15 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      `DropSchema`; globs `<root>/*/*/_delta_log/*.json`). OneLake ignores it (layout from the lakehouse flag). No
      ABI change (rides the v37 options-JSON forwarding). `verify_delta_catalog_schemas.test` (23). **Still
      unsupported** (clean error): raw exec; DROP SCHEMA outside `schemas` mode.
+     **TIME TRAVEL — `FROM t AT (VERSION => n)` DONE** (C#-only; `SupportsTimeTravel` + the `AT`-clause→`spec.At`
+     plumbing already existed for the SQL backend). `DeltaCatalog.ScanTable` honors `spec.At` →
+     `DeltaReader.StreamAt`/`GetSchemaAt` (engineered-wood `ReadAtVersionAsync`), advertising the schema as of
+     that version, with filter pushdown. DuckDB's `count(*)`-via-rowid on a time-travel scan routes to a
+     version-aware rowid stream (`ReadAtVersionWithRowIdsAsync`). `AT (TIMESTAMP => ts)` needs the Delta
+     in-commit-timestamps feature (engineered-wood resolves timestamps via inCommitTimestamp, not commit-file
+     mtime) → clean error; VERSION is the supported form. `verify_delta_catalog_time_travel.test` (40).
+     **Not built:** a `snapshots()`/history function (feasible via `TransactionLog.ListVersionsAsync` +
+     `ReadCommitAsync`) and a per-row commit-version virtual column (needs Delta row tracking).
 3. **DELETE — FINAL: copy-on-write + transient `(file,position)` rowid, PLAIN Delta (no features).** The
    detailed design below (row tracking + deletion vectors) is the SUPERSEDED first attempt — kept as the trail.
    Why it changed: Fabric's OneLake converter / Spark could not read our row-tracking + DV commits (first from

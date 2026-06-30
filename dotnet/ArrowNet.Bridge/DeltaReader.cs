@@ -170,6 +170,109 @@ internal static class DeltaReader
         }
     }
 
+    /// <summary>Time travel — the Arrow schema of the table AS OF a version/timestamp (the schema can differ from
+    /// the latest, e.g. before an ADD COLUMN). <paramref name="unit"/> is "version" or "timestamp" (the DuckDB
+    /// <c>AT</c> clause unit); <paramref name="value"/> is the BIGINT version or a parseable timestamp.</summary>
+    public static Schema GetSchemaAt(nint opener, string path, string unit, string value)
+    {
+        var fs = new DuckDbTableFileSystem(opener, path);
+        var table = DeltaTable.OpenAsync(fs).GetAwaiter().GetResult();
+        try
+        {
+            var snap = ResolveSnapshotAsync(table, unit, value, default).AsTask().GetAwaiter().GetResult();
+            return snap.ArrowSchema;
+        }
+        finally
+        {
+            table.Dispose();
+        }
+    }
+
+    /// <summary>Time travel — streams the table AS OF a version/timestamp. A timestamp is resolved to its version
+    /// first, so the version read path (with file/row-group filter pushdown) serves both. Read-only (a past
+    /// snapshot is never written), so there is no rowid variant.</summary>
+    public static IAsyncEnumerable<RecordBatch> StreamAt(
+        nint opener, string path, IReadOnlyList<string>? columns, Predicate? filter, string unit, string value,
+        CancellationToken ct)
+    {
+        var fs = new DuckDbTableFileSystem(opener, path);
+        var parquet = filter is null ? ParquetReadOptions.Default : new ParquetReadOptions { Filter = filter };
+        var options = DeltaTableOptions.Default with { ParquetReadOptions = parquet };
+        return StreamAtImpl(fs, options, columns, filter, unit, value, ct);
+    }
+
+    private static async IAsyncEnumerable<RecordBatch> StreamAtImpl(
+        DuckDbTableFileSystem fs, DeltaTableOptions options, IReadOnlyList<string>? columns, Predicate? filter,
+        string unit, string value, [EnumeratorCancellation] CancellationToken ct)
+    {
+        var table = await DeltaTable.OpenAsync(fs, options, ct).ConfigureAwait(false);
+        try
+        {
+            var snap = await ResolveSnapshotAsync(table, unit, value, ct).ConfigureAwait(false);
+            await foreach (var batch in table.ReadAtVersionAsync(snap.Version, columns, filter, ct)
+                               .ConfigureAwait(false))
+            {
+                yield return batch;
+            }
+        }
+        finally
+        {
+            await table.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>Time travel WITH the trailing <c>_metadata.row_id</c> column — used when a time-travel scan
+    /// requests the rowid (e.g. DuckDB's <c>count(*)</c>-via-rowid optimization). The version analog of
+    /// <see cref="StreamWithRowIds"/>; a timestamp is resolved to its version first.</summary>
+    public static IAsyncEnumerable<RecordBatch> StreamWithRowIdsAt(
+        nint opener, string path, IReadOnlyList<string>? columns, Predicate? filter, string unit, string value,
+        CancellationToken ct)
+    {
+        var fs = new DuckDbTableFileSystem(opener, path);
+        var parquet = filter is null ? ParquetReadOptions.Default : new ParquetReadOptions { Filter = filter };
+        var options = DeltaTableOptions.Default with { ParquetReadOptions = parquet };
+        return StreamWithRowIdsAtImpl(fs, options, columns, filter, unit, value, ct);
+    }
+
+    private static async IAsyncEnumerable<RecordBatch> StreamWithRowIdsAtImpl(
+        DuckDbTableFileSystem fs, DeltaTableOptions options, IReadOnlyList<string>? columns, Predicate? filter,
+        string unit, string value, [EnumeratorCancellation] CancellationToken ct)
+    {
+        var table = await DeltaTable.OpenAsync(fs, options, ct).ConfigureAwait(false);
+        try
+        {
+            var snap = await ResolveSnapshotAsync(table, unit, value, ct).ConfigureAwait(false);
+            await foreach (var batch in table.ReadAtVersionWithRowIdsAsync(snap.Version, columns, filter, ct)
+                               .ConfigureAwait(false))
+            {
+                yield return batch;
+            }
+        }
+        finally
+        {
+            await table.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>Resolves the DuckDB <c>AT (unit =&gt; value)</c> clause to a Delta snapshot. "version" =&gt; that
+    /// commit version; "timestamp" =&gt; the latest version at/just-before that instant. Any other unit errors.</summary>
+    private static async System.Threading.Tasks.ValueTask<EngineeredWood.DeltaLake.Snapshot.Snapshot>
+        ResolveSnapshotAsync(DeltaTable table, string unit, string value, CancellationToken ct)
+    {
+        if (string.Equals(unit, "version", System.StringComparison.OrdinalIgnoreCase))
+        {
+            long version = long.Parse(value, System.Globalization.CultureInfo.InvariantCulture);
+            return await table.GetSnapshotAtVersionAsync(version, ct).ConfigureAwait(false);
+        }
+        if (string.Equals(unit, "timestamp", System.StringComparison.OrdinalIgnoreCase))
+        {
+            var ts = System.DateTimeOffset.Parse(value, System.Globalization.CultureInfo.InvariantCulture);
+            return await table.GetSnapshotAtTimestampAsync(ts, ct).ConfigureAwait(false);
+        }
+        throw new System.NotSupportedException(
+            $"delta: AT ({unit} => …) time travel is not supported — use AT (VERSION => n) or AT (TIMESTAMP => ts).");
+    }
+
     /// <summary>Schema evolution — appends a nullable <paramref name="column"/> to the Delta table at
     /// <paramref name="path"/> as a metadata-only commit (no file rewrite); old files' missing values read back
     /// as NULL (engineered-wood backfills them). Opens with the standard write options (path_in_schema).</summary>
