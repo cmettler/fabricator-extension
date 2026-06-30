@@ -541,7 +541,21 @@ Implemented and verified:
     --threads 4` PASS=4/4 on box (4×200k concurrent CTAS) AND Fabric (no MARS); `verify_*` 30/30.** Design +
     the abandoned Option A (dbt uses explicit txns, not autocommit — so an autocommit-detection fix never
     fired): [docs/transaction-concurrency.md](docs/transaction-concurrency.md). Harness:
-    `dbt_mssql_test/` (gitignored).
+    `dbt_mssql_test/` (gitignored — holds live SP creds, never commit). It has THREE targets: `box` (local SQL
+    Server), `fabric` (Fabric **Warehouse** via the SQL endpoint), and `lakehouse` (Fabric **Lakehouse** via the
+    **Delta** provider on OneLake — the `mssql` catalog is a Delta folder-catalog, not a SQL endpoint). The
+    lakehouse target can't use dbt-duckdb's profile `attach:` (its renderer can't emit `READ_ONLY false`, which
+    OneLake REQUIRES — DuckDB bumps a remote `abfss://` ATTACH to read-only under AUTOMATIC); instead a tiny
+    dbt-duckdb **plugin** (`dbt_mssql_test/plugins/onelake_attach.py`) ATTACHes `mssql` writable in
+    `configure_connection` (runs per connection, AFTER the profile `secrets:` create `fabric_sp` and BEFORE dbt's
+    per-connection schema creation — so all of dbt's cursors see the catalog). Uses `TYPE mssql_net` (the loadable
+    registers that storage-extension name; `arrownet` is a shell-only alias) + `PROVIDER 'delta'`. **Caveat:** a
+    dbt run over a OneLake catalog is SLOW — dbt lists every existing table in `mssql.dbo` before building (the
+    documented OneLake catalog-introspection cost: per-table `_delta_log` reads + a per-connection Fabric-API +
+    DFS resolution), so point it at a lakehouse with few tables. **The loadable extension must be rebuilt on an
+    ABI bump** (`cmake --build … --target mssql_net_loadable_extension`) — dbt loads the loadable, not the
+    static `unittest`/`duckdb.exe`, so a stale loadable vs a freshly-published bridge throws
+    `Bootstrap.Initialize returned 2` (ABI mismatch).
   - **dbt pre/post hooks — behavior + limitations: [docs/dbt-hooks.md](docs/dbt-hooks.md)** (validated box +
     Fabric). Highlights: an **in-transaction post-hook error rolls back the model's CREATE on BOTH box AND
     Fabric** (Fabric Warehouse supports transactional DDL rollback — unlike Snowflake). SQL-Server-specific
