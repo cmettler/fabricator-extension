@@ -338,6 +338,32 @@ static unique_ptr<FunctionData> SnapshotsBind(ClientContext &context, TableFunct
 	return std::move(bind_data);
 }
 
+// --- arrownet_delta_changes(catalog, 'schema.table', from_version[, to_version]) ----------------------------
+// The Change Data Feed of a Delta table between two versions: the table's columns plus _change_type,
+// _commit_version, _commit_timestamp. Catalog NAME (resolved to its handle) + schema-qualified table; the
+// version range is packed into arg2 as "from:to" (to omitted => latest). Requires the table to have
+// delta.enableChangeDataFeed (else the managed side errors). Delta only.
+static unique_ptr<FunctionData> ChangesBind(ClientContext &context, TableFunctionBindInput &input,
+                                            vector<LogicalType> &return_types, vector<string> &names) {
+	auto catalog_name = input.inputs[0].GetValue<string>();
+	auto table_ref = input.inputs[1].GetValue<string>();
+	int64_t from_version = input.inputs[2].GetValue<int64_t>();
+	int64_t to_version = (input.inputs.size() > 3 && !input.inputs[3].IsNull())
+	                         ? input.inputs[3].GetValue<int64_t>()
+	                         : -1; // -1 => latest
+	string range = std::to_string(from_version) + ":" + (to_version < 0 ? string() : std::to_string(to_version));
+
+	auto bind_data = make_uniq<MssqlNetFunctionsBindData>();
+	bind_data->handle = ResolveConnection(context, catalog_name, bind_data->owns_handle);
+	auto handle = bind_data->handle;
+	bind_data->factory = [handle, table_ref, range](const arrownet::ArrowScanRequest &, ArrowArrayStream &out) {
+		arrownet::GetMetadata(handle, ARROWNET_META_CHANGES, table_ref, range, out);
+	};
+
+	arrownet::PopulateReturnSchema(context, *bind_data, return_types, names);
+	return std::move(bind_data);
+}
+
 // --- mssql_net_exec(connection_string VARCHAR, sql VARCHAR) -> BIGINT --------
 // Executes arbitrary T-SQL (DDL/DML/EXEC) against SQL Server and returns the
 // number of rows affected. Volatile (always executed, never constant-folded).
@@ -487,6 +513,17 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                           arrownet::ArrowStreamInitLocal);
 	snapshots_fn.projection_pushdown = true;
 	loader.RegisterFunction(snapshots_fn);
+
+	// arrownet_delta_changes(catalog, 'schema.table', from_version[, to_version]) — the Change Data Feed.
+	// Two overloads: with an explicit end version, or without (=> latest).
+	TableFunction changes_fn("arrownet_delta_changes",
+	                         {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT},
+	                         arrownet::ArrowStreamScan, ChangesBind, arrownet::ArrowStreamInitGlobal,
+	                         arrownet::ArrowStreamInitLocal);
+	changes_fn.projection_pushdown = true;
+	loader.RegisterFunction(changes_fn);
+	changes_fn.arguments = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT};
+	loader.RegisterFunction(changes_fn);
 
 	ScalarFunction exec_fn("mssql_net_exec", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BIGINT,
 	                       MssqlNetExecFunction);

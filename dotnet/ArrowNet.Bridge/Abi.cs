@@ -273,6 +273,9 @@ public static class MetadataKind
     // Delta only: a table's commit history (version, timestamp, operation, operation_parameters). arg1=schema,
     // arg2=table. Surfaced by the arrownet_delta_snapshots(catalog, 'schema.table') table function.
     public const int Snapshots = 8;
+    // Delta only: the Change Data Feed (table cols ++ _change_type/_commit_version/_commit_timestamp). arg1 =
+    // 'schema.table' ref, arg2 = "from:to" (to empty => latest). Surfaced by arrownet_delta_changes(...).
+    public const int Changes = 9;
 }
 
 internal static class ArrowNetStatus

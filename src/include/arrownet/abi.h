@@ -108,6 +108,8 @@ typedef enum {
 	ARROWNET_META_SERVER_INFO = 7, // two columns: property, value — the detected server capability profile
 	ARROWNET_META_SNAPSHOTS = 8,   // Delta only: a table's commit history (version, timestamp, operation,
 	                               // operation_parameters); arg1 = schema, arg2 = table
+	ARROWNET_META_CHANGES = 9,     // Delta only: the Change Data Feed; arg1 = 'schema.table' ref,
+	                               // arg2 = "from:to" version range (to empty => latest)
 } ArrowNetMetadataKind;
 
 // -----------------------------------------------------------------------------

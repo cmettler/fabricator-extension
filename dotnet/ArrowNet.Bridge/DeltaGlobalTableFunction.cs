@@ -236,9 +236,10 @@ internal static class DeltaWriter
     /// <paramref name="deletionVectors"/> => DV + row-tracking fast-delete; <paramref name="inCommitTimestamps"/>
     /// => <c>delta.enableInCommitTimestamps</c> (a WRITER-only feature) so AT (TIMESTAMP =&gt; ...) time travel
     /// can resolve a timestamp to a version.</summary>
-    private static Dictionary<string, string>? CreateConfig(bool deletionVectors, bool inCommitTimestamps)
+    private static Dictionary<string, string>? CreateConfig(
+        bool deletionVectors, bool inCommitTimestamps, bool changeDataFeed)
     {
-        if (!deletionVectors && !inCommitTimestamps)
+        if (!deletionVectors && !inCommitTimestamps && !changeDataFeed)
         {
             return null;
         }
@@ -251,6 +252,10 @@ internal static class DeltaWriter
         if (inCommitTimestamps)
         {
             config["delta.enableInCommitTimestamps"] = "true";
+        }
+        if (changeDataFeed)
+        {
+            config["delta.enableChangeDataFeed"] = "true";
         }
         return config;
     }
@@ -268,13 +273,13 @@ internal static class DeltaWriter
     /// Retries on a commit conflict (concurrent writer) by reopening at the new latest version (OCC).</summary>
     public static long Write(nint opener, string path, Schema schema, IReadOnlyList<RecordBatch> batches,
                              DeltaWriteMode mode, CancellationToken ct, bool deletionVectors = false,
-                             bool inCommitTimestamps = false)
+                             bool inCommitTimestamps = false, bool changeDataFeed = false)
     {
         for (int attempt = 1; ; attempt++)
         {
             var fs = new DuckDbTableFileSystem(opener, path);
             var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(),
-                                                     configuration: CreateConfig(deletionVectors, inCommitTimestamps),
+                                                     configuration: CreateConfig(deletionVectors, inCommitTimestamps, changeDataFeed),
                                                      cancellationToken: ct).AsTask().GetAwaiter().GetResult();
             try
             {
@@ -298,7 +303,8 @@ internal static class DeltaWriter
     /// <summary>Creates an empty Delta table (commit 0 with the schema, no data) at <paramref name="path"/>.
     /// <paramref name="deletionVectors"/> enables the DV+rowTracking features (opt-in fast-delete).</summary>
     public static void Create(nint opener, string path, Schema schema, CancellationToken ct,
-                              bool deletionVectors = false, bool inCommitTimestamps = false)
+                              bool deletionVectors = false, bool inCommitTimestamps = false,
+                              bool changeDataFeed = false)
     {
         for (int attempt = 1; ; attempt++)
         {
@@ -307,7 +313,7 @@ internal static class DeltaWriter
             {
                 // OpenOrCreate writes commit-0 for a new table (or opens an existing one — no commit, no conflict).
                 var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(),
-                                                         configuration: CreateConfig(deletionVectors, inCommitTimestamps),
+                                                         configuration: CreateConfig(deletionVectors, inCommitTimestamps, changeDataFeed),
                                                          cancellationToken: ct).AsTask().GetAwaiter().GetResult();
                 table.DisposeAsync().AsTask().GetAwaiter().GetResult();
                 return;

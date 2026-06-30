@@ -75,6 +75,9 @@ public sealed class DeltaCatalog : IBackendCatalog
     // delta.enableInCommitTimestamps WRITER feature, so AT (TIMESTAMP => ts) time travel can resolve a timestamp
     // to a version (engineered-wood reads inCommitTimestamp, not commit-file mtime). VERSION travel works without it.
     private readonly bool _inCommitTimestampsOnCreate;
+    // ATTACH option `change_data_feed true`: tables CREATED here enable delta.enableChangeDataFeed, so DELETE/UPDATE
+    // write _change_data files and arrownet_delta_changes(...) returns a correct row-level change feed.
+    private readonly bool _changeDataFeedOnCreate;
     // ATTACH option `schemas true`: a NON-OneLake root (local/S3/plain-ADLS) uses a two-level
     // <root>/<schema>/<table> layout so DuckDB schemas other than "main" map to subfolders (discovery, CREATE,
     // DROP all schema-aware). Default false = the flat <root>/<table>, "main"-only layout. Ignored for OneLake
@@ -90,6 +93,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         _fabricCredential = credential;
         _deletionVectorsOnCreate = ParseBoolOption(optionsJson, "deletion_vectors");
         _inCommitTimestampsOnCreate = ParseBoolOption(optionsJson, "in_commit_timestamps");
+        _changeDataFeedOnCreate = ParseBoolOption(optionsJson, "change_data_feed");
         _schemas = ParseBoolOption(optionsJson, "schemas");
     }
 
@@ -154,6 +158,8 @@ public sealed class DeltaCatalog : IBackendCatalog
         // Snapshots/history (arrownet_delta_snapshots): arg1=schema, arg2=table. Schema is required on a
         // schema-enabled lakehouse; defaults to "main" on a flat catalog.
         MetadataKind.Snapshots => SnapshotsStream(schema, table),
+        // Change Data Feed (arrownet_delta_changes): arg1 = 'schema.table' ref, arg2 = "from:to" (to empty => latest).
+        MetadataKind.Changes => ChangesStream(schema, table),
         // No row-count/NDV stats surfaced, no functions.
         _ => EmptyStringTable("name"),
     };
@@ -182,6 +188,50 @@ public sealed class DeltaCatalog : IBackendCatalog
             resolvedSchema = MainSchema;
         }
         return DeltaReader.GetSnapshots(AmbientOpener.Current, TablePath(resolvedSchema, table!));
+    }
+
+    /// <summary>Change Data Feed of a table. <paramref name="tableRef"/> = '&lt;schema.&gt;table' (schema required
+    /// on a schema-enabled lakehouse, default "main" on a flat catalog); <paramref name="range"/> = "from:to"
+    /// (empty "to" =&gt; latest). Returns the row-level change feed for [from, to].</summary>
+    private IArrowArrayStream ChangesStream(string? tableRef, string? range)
+    {
+        if (string.IsNullOrEmpty(tableRef))
+        {
+            throw new System.ArgumentException("delta changes: a table is required (catalog, 'schema.table', from, to).");
+        }
+        // Split '<schema>.<table>' (first dot). A bare name => no schema (resolved below).
+        string? schema = null;
+        string table = tableRef!;
+        int dot = tableRef!.IndexOf('.');
+        if (dot >= 0)
+        {
+            schema = tableRef.Substring(0, dot);
+            table = tableRef.Substring(dot + 1);
+        }
+        string resolvedSchema;
+        if (!string.IsNullOrEmpty(schema))
+        {
+            resolvedSchema = schema!;
+        }
+        else if (SchemaLayout)
+        {
+            throw new System.InvalidOperationException(
+                "delta changes: a schema is required on a schema-enabled lakehouse — use 'schema.table'.");
+        }
+        else
+        {
+            resolvedSchema = MainSchema;
+        }
+
+        // Parse "from:to" — to empty/absent => latest (-1).
+        long from = 0, to = -1;
+        if (!string.IsNullOrEmpty(range))
+        {
+            var parts = range!.Split(':');
+            if (parts.Length > 0 && long.TryParse(parts[0], out var f)) { from = f; }
+            if (parts.Length > 1 && long.TryParse(parts[1], out var t)) { to = t; }
+        }
+        return DeltaReader.GetChanges(AmbientOpener.Current, TablePath(resolvedSchema, table), from, to);
     }
 
     /// <summary>The catalog's schemas: the lakehouse schemas for a schema-enabled OneLake lakehouse; for a
@@ -385,7 +435,8 @@ public sealed class DeltaCatalog : IBackendCatalog
         var mode = createTable || replace ? DeltaWriteMode.Overwrite : DeltaWriteMode.Append;
         DeltaWriter.Write(opener, TablePath(schemaName, tableName), schema, batches, mode, default,
                           deletionVectors: _deletionVectorsOnCreate,
-                          inCommitTimestamps: _inCommitTimestampsOnCreate);
+                          inCommitTimestamps: _inCommitTimestampsOnCreate,
+                          changeDataFeed: _changeDataFeedOnCreate);
         return rows;
     }
 
@@ -395,7 +446,8 @@ public sealed class DeltaCatalog : IBackendCatalog
                             string? primaryKey, string? uniques, string? defaults)
         => DeltaWriter.Create(AmbientOpener.Current, TablePath(schemaName, tableName), columns, default,
                               deletionVectors: _deletionVectorsOnCreate,
-                              inCommitTimestamps: _inCommitTimestampsOnCreate);
+                              inCommitTimestamps: _inCommitTimestampsOnCreate,
+                              changeDataFeed: _changeDataFeedOnCreate);
 
     /// <summary>CREATE SCHEMA. In <c>schemas</c> mode (non-OneLake) it materializes the <c>&lt;root&gt;/&lt;schema&gt;/</c>
     /// subfolder so a subsequent CREATE TABLE lands there (and the schema is rediscovered once it holds a table).

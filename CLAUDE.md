@@ -1319,11 +1319,13 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `InCommitTimestamp.EnsureCommitInfo` always prepends a `commitInfo` with `operation` + a `timestamp` — standard
   feature-free fields, no protocol bump, writer v2; `CreateAsync`'s v0 also gets one, operation `CREATE TABLE`).
   So **plain tables now show a full operation + timestamp history** (`CREATE TABLE`/`WRITE` per version), not just
-  the version list. The opt-in `inCommitTimestamp` field is added on top ONLY for `in_commit_timestamps` tables —
-  and **only it (not the generic `commitInfo.timestamp`) drives `AT (TIMESTAMP)` time travel** (the snapshots
-  `timestamp` reads `inCommitTimestamp ?? commitInfo.timestamp`, but `GetSnapshotAtTimestampAsync` reads
-  `inCommitTimestamp` only — so the snapshots VIEW is timestamped on plain tables, but you time-travel by VERSION,
-  the DuckLake workflow). Validated local + **live Fabric**: `LH2.dbo.arrownet_ict2` (ICT) AND a PLAIN table on
+  the version list. The opt-in `inCommitTimestamp` field is added on top ONLY for `in_commit_timestamps` tables.
+  **`AT (TIMESTAMP)` time travel now works on PLAIN tables too** (`GetTimestamp(CommitInfo)` reads
+  `inCommitTimestamp ?? commitInfo.timestamp`, and `GetSnapshotAtTimestampAsync` uses it) — the always-on
+  `commitInfo.timestamp` is enough to resolve a snapshot, so the `in_commit_timestamps` feature is now only needed
+  for the **in-protocol monotonic** guarantee (Spark/Fabric interop), NOT for local timestamp travel. A far-future
+  instant → latest version; an instant before commit-0 → clean "No commit found" error
+  (`test/verify_delta_catalog_time_travel.test`, 48). Validated local + **live Fabric**: `LH2.dbo.arrownet_ict2` (ICT) AND a PLAIN table on
   `LH_no_schema` both show v0 `CREATE TABLE` + `WRITE`s with timestamps — and the plain `commitInfo` table on
   `LH_no_schema` (no time-travel setting) **registers + is SQL-endpoint-queryable** in Fabric (confirmed), i.e.
   always-on `commitInfo` is Fabric-safe on plain writer-v2 tables. `test/verify_delta_catalog_snapshots.test`
@@ -1332,7 +1334,32 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `snapshot_id` analog) — NOT built**: needs the Delta **row-tracking** feature (`_metadata.row_commit_version`),
   which our plain tables don't enable (only the opt-in `deletion_vectors true` path enables row tracking) + a
   second-virtual-column plumbing beyond `_metadata.row_id` + uncertain Fabric read-compat of row-tracking
-  commits. **OneLake table discovery + DROP
+  commits. **Change Data Feed (CDF) — DONE + VALIDATED LIVE on Fabric (2026-06-30).** Enabled per-catalog via the
+  ATTACH option **`change_data_feed true`** (`DeltaCatalog._changeDataFeedOnCreate`): tables CREATEd in that
+  catalog declare the Delta **`changeDataFeed` writer feature** (writer-v7; `DeltaWriter.CreateConfig` →
+  engineered-wood `CreateAsync` adds `delta.enableChangeDataFeed=true` + the feature). Then INSERT/DELETE/UPDATE
+  **capture CDC change files**: blind appends infer naturally, and the rowid copy-on-write DELETE/UPDATE +
+  DV-delete paths emit `_change_data/*.parquet` (`CdfConfig.Delete`/`UpdatePreimage`/`UpdatePostimage`) — they
+  already read the changed rows for the rewrite, so capture is "for free" there. **Read** via
+  **`arrownet_delta_changes('<catalog>', '<schema.>table', from [, to])`** (2 overloads — `to` omitted/-1 ⇒
+  latest): the row-level feed between two versions with `_change_type` (insert/delete/update_preimage/
+  update_postimage) ++ `_commit_version BIGINT` ++ `_commit_timestamp BIGINT` (epoch ms, from the always-on
+  commitInfo). C++ `ChangesBind` mirrors `SnapshotsBind` (catalog→handle, arg2 = `"from:to"`, factory =
+  `GetMetadata(handle, ARROWNET_META_CHANGES=9, schema.table, range)`); C# `DeltaCatalog.GetMetadata(Changes)` →
+  `DeltaReader.GetChanges` → engineered-wood `DeltaTable.ReadChangesAsync`. **Additive enum → NO ABI bump.** **Two
+  fixes that made the read work:** (1) the rowid-DML CDC capture must drop the **virtual** `_metadata.row_id`
+  trailing column (`DropVirtualRowId` — NOT `RowTrackingWriter.StripRowIdColumn`, which strips the *physical*
+  `__delta_row_id`) before writing the change file, else the update_preimage batch has 6 cols vs 5 elsewhere → a
+  schema mismatch across change batches → **arrow_ingest SIGSEGV**; (2) `DeltaReader.GetChanges` **streams lazily**
+  (peek-the-first-batch for the schema, table stays open for the whole enumeration — materializing then disposing
+  the table frees the batches' Arrow buffers = use-after-free, "Out of Range string size"). **CDF-enabled guard:**
+  engineered-wood's `CdfReader` silently INFERS changes from add/remove on a non-CDF table (misleading for
+  copy-on-write — survivors look like inserts), so `GetChanges` requires `CdfConfig.IsEnabled(config)` and throws
+  "Change Data Feed is not enabled" otherwise (Spark `DELTA_CHANGE_DATA_FEED_NOT_ENABLED` parity). Validated local
+  (`test/verify_delta_catalog_changes.test`, 45 — full feed + change-type breakdown + pre/post images + bounded
+  ranges + 3-arg-latest + CDF-off error) AND **live Fabric** (`Test`/`LH` schema-enabled: CTAS → DELETE → UPDATE
+  on `lake.dbo.arrownet_cdftest` → correct feed [3 ins/v1, del/v2, upd pre+post/v3] + snapshots v0 CREATE/v1
+  WRITE/v2 DELETE/v3 UPDATE). **OneLake table discovery + DROP
   — via the ADLS Gen2 / OneLake DFS endpoint directly** (`FabricLakehouse`, Bridge; `Azure.Storage.Files.DataLake`
   12.21.0): DuckDB's azure glob can't recurse a OneLake `_delta_log` tree (mid-path wildcard → `type must be
   string, but is null`, duckdb-azure PR #174), so a OneLake root (`abfss://<ws>@onelake…/<lh>.Lakehouse/Tables`)

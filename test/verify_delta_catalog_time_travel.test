@@ -86,13 +86,19 @@ SELECT count(*) FROM (SELECT id FROM lake.main.t AT (VERSION => 1)
 ----
 3
 
-# AT (TIMESTAMP => ...) needs the Delta in-commit-timestamps feature (engineered-wood resolves a timestamp via
-# inCommitTimestamp, not the commit-file mtime); our plain tables don't enable it → a clean error. VERSION travel
-# is the supported form.
-statement error
+# AT (TIMESTAMP => ...) resolves via the commit timestamp. Every commit carries a timestamp from the always-on
+# commitInfo (the in_commit_timestamps feature adds the in-protocol monotonic inCommitTimestamp for Spark/Fabric
+# interop, but is NOT required for local timestamp travel). A far-future instant resolves to the latest version.
+query I
 SELECT count(*) FROM lake.main.t AT (TIMESTAMP => '2999-01-01 00:00:00');
 ----
-in-commit timestamps
+3
+
+# An instant BEFORE the first commit has no version at/before it → a clean error.
+statement error
+SELECT count(*) FROM lake.main.t AT (TIMESTAMP => '1999-01-01 00:00:00');
+----
+No commit found
 
 # Time travel survives detach/re-attach (reads the log, not in-memory state).
 statement ok

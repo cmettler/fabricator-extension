@@ -251,6 +251,83 @@ internal static class DeltaReader
         return new InMemoryArrayStream(schema, new[] { batch });
     }
 
+    /// <summary>The Change Data Feed of the table between <paramref name="fromVersion"/> and
+    /// <paramref name="toVersion"/> (inclusive; -1 =&gt; latest) as an Arrow stream — the table's columns plus
+    /// <c>_change_type</c> ("insert"/"delete"/"update_preimage"/"update_postimage"), <c>_commit_version</c>,
+    /// <c>_commit_timestamp</c>. Requires the table to have <c>delta.enableChangeDataFeed</c> (else
+    /// engineered-wood errors). Streams lazily.</summary>
+    public static IArrowArrayStream GetChanges(nint opener, string path, long fromVersion, long toVersion)
+    {
+        // Stream lazily (the table stays open for the whole enumeration — materializing then disposing frees the
+        // batches' Arrow buffers = use-after-free), and advertise the ACTUAL schema by peeking the first batch
+        // (hand-building it risks a column/type mismatch that SIGSEGVs arrow_ingest).
+        var enumerator = StreamChanges(opener, path, fromVersion, toVersion, default).GetAsyncEnumerator(default);
+        bool hasFirst = enumerator.MoveNextAsync().AsTask().GetAwaiter().GetResult();
+        var schema = hasFirst ? enumerator.Current.Schema : EmptyChangeSchema(opener, path);
+        return new AsyncEnumerableArrowStream(schema, ReplayThenRest(hasFirst, enumerator));
+    }
+
+    private static async IAsyncEnumerable<RecordBatch> ReplayThenRest(
+        bool hasFirst, IAsyncEnumerator<RecordBatch> enumerator)
+    {
+        try
+        {
+            if (hasFirst)
+            {
+                yield return enumerator.Current;
+            }
+            while (await enumerator.MoveNextAsync().ConfigureAwait(false))
+            {
+                yield return enumerator.Current;
+            }
+        }
+        finally
+        {
+            await enumerator.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    private static async IAsyncEnumerable<RecordBatch> StreamChanges(
+        nint opener, string path, long fromVersion, long toVersion, [EnumeratorCancellation] CancellationToken ct)
+    {
+        var fs = new DuckDbTableFileSystem(opener, path);
+        var table = await DeltaTable.OpenAsync(fs, DeltaTableOptions.Default, ct).ConfigureAwait(false);
+        try
+        {
+            // engineered-wood's CdfReader silently INFERS changes from add/remove when a version has no cdc
+            // files — misleading for copy-on-write DELETE/UPDATE (the rewritten file's survivors look like
+            // inserts, the removed file like deletes). So require the table to actually have CDF enabled,
+            // matching Spark/Delta (DELTA_CHANGE_DATA_FEED_NOT_ENABLED) rather than returning a bogus feed.
+            if (!EngineeredWood.DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(table.CurrentSnapshot.Metadata.Configuration))
+                throw new InvalidOperationException(
+                    "Change Data Feed is not enabled on this Delta table (delta.enableChangeDataFeed). " +
+                    "ATTACH with 'change_data_feed true' and create the table so future commits capture changes.");
+
+            long end = toVersion < 0 ? table.CurrentSnapshot.Version : toVersion;
+            await foreach (var batch in table.ReadChangesAsync(fromVersion, end, ct).ConfigureAwait(false))
+            {
+                yield return batch;
+            }
+        }
+        finally
+        {
+            await table.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>Schema for an empty change feed (no changes in range): the table columns ++ the 3 CDF columns.</summary>
+    private static Schema EmptyChangeSchema(nint opener, string path)
+    {
+        var us = GetSchema(opener, path);
+        var fields = new List<Field>(us.FieldsList)
+        {
+            new Field("_change_type", StringType.Default, nullable: false),
+            new Field("_commit_version", Int64Type.Default, nullable: false),
+            new Field("_commit_timestamp", Int64Type.Default, nullable: true),
+        };
+        return new Schema(fields, us.Metadata);
+    }
+
     private static async System.Threading.Tasks.Task<int> CollectHistory(
         nint opener, string path, Int64Array.Builder versions, TimestampArray.Builder timestamps,
         StringArray.Builder operations, StringArray.Builder operationParams)

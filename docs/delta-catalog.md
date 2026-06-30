@@ -388,12 +388,32 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      (additive, no ABI bump); C++ `SnapshotsBind` mirrors `ServerInfoBind`. **commitInfo is written on every
      commit by default** (engineered-wood `EnsureCommitInfo` always prepends operation + timestamp — standard,
      no protocol bump), so plain tables show a full operation/timestamp history (CREATE TABLE/WRITE per version),
-     not just versions. The opt-in `inCommitTimestamp` field (on `in_commit_timestamps` tables) is what drives
-     `AT (TIMESTAMP)` travel; the snapshots `timestamp` is shown on plain tables too but you travel by VERSION
-     (the DuckLake workflow). Validated local + live Fabric (`LH2` ICT + a plain table on `LH_no_schema`).
-     `verify_delta_catalog_snapshots.test` (28).
-     **Not built:** a `snapshots()`/history function (feasible via `TransactionLog.ListVersionsAsync` +
-     `ReadCommitAsync`) and a per-row commit-version virtual column (needs Delta row tracking).
+     not just versions. **`AT (TIMESTAMP)` travel now works on plain tables too** — `GetTimestamp(CommitInfo)`
+     reads `inCommitTimestamp ?? commitInfo.timestamp`, so the always-on commitInfo timestamp resolves a snapshot;
+     the `in_commit_timestamps` feature is now only for the in-protocol monotonic guarantee (Spark/Fabric interop).
+     Validated local + live Fabric (`LH2` ICT + a plain table on `LH_no_schema`).
+     `verify_delta_catalog_snapshots.test` (28), `verify_delta_catalog_time_travel.test` (48).
+     **Not built:** a per-row commit-version virtual column (needs Delta row tracking).
+
+     **CHANGE DATA FEED (CDF) — DONE + VALIDATED LIVE ON FABRIC (2026-06-30).** ATTACH option
+     **`change_data_feed true`** → tables CREATEd in the catalog declare the Delta `changeDataFeed` writer feature
+     (writer-v7). INSERT/DELETE/UPDATE capture CDC change files: blind appends infer naturally; the rowid
+     copy-on-write DELETE/UPDATE + DV-delete paths emit `_change_data/*.parquet` (Delete / UpdatePreimage /
+     UpdatePostimage) — they already read the changed rows for the rewrite, so capture is essentially free.
+     **Read** via **`arrownet_delta_changes('<catalog>', '<schema.>table', from [, to])`** (2 overloads; `to`
+     omitted/-1 ⇒ latest): the row-level feed with `_change_type` ++ `_commit_version BIGINT` ++
+     `_commit_timestamp BIGINT` (epoch ms). New `MetadataKind.Changes=9` (additive, **no ABI bump**); C++
+     `ChangesBind` mirrors `SnapshotsBind` (arg2 = `"from:to"`). **Two read-path fixes:** (1) the rowid-DML CDC
+     capture must drop the VIRTUAL `_metadata.row_id` trailing column (`DeltaTable.DropVirtualRowId`, NOT
+     `RowTrackingWriter.StripRowIdColumn` which targets the *physical* `__delta_row_id`) before writing the change
+     file — otherwise the update_preimage batch carries 6 cols vs 5 elsewhere → schema mismatch across change
+     batches → `arrow_ingest` SIGSEGV; (2) `DeltaReader.GetChanges` streams lazily (peek-first-batch for the
+     schema; the table stays open for the whole enumeration — materializing then disposing it frees the batches'
+     Arrow buffers, a use-after-free). **CDF-enabled guard:** engineered-wood's `CdfReader` silently INFERS
+     changes from add/remove on a non-CDF table (misleading for copy-on-write), so `GetChanges` requires
+     `CdfConfig.IsEnabled(config)` and throws "Change Data Feed is not enabled" otherwise (Spark
+     `DELTA_CHANGE_DATA_FEED_NOT_ENABLED` parity). `verify_delta_catalog_changes.test` (45); live Fabric on
+     `Test`/`LH` (`lake.dbo.arrownet_cdftest`: CTAS → DELETE → UPDATE → correct feed + snapshot operations).
 3. **DELETE — FINAL: copy-on-write + transient `(file,position)` rowid, PLAIN Delta (no features).** The
    detailed design below (row tracking + deletion vectors) is the SUPERSEDED first attempt — kept as the trail.
    Why it changed: Fabric's OneLake converter / Spark could not read our row-tracking + DV commits (first from

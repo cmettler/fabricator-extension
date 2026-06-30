@@ -1,0 +1,132 @@
+# name: test/verify_delta_catalog_changes.test
+# description: Delta folder-as-catalog Change Data Feed (CDF). ATTACH option `change_data_feed true` enables the
+#              changeDataFeed feature on tables CREATEd in that catalog; INSERT/DELETE/UPDATE capture CDC change
+#              files; arrownet_delta_changes('<catalog>', '<schema.>table', from[, to]) reads the row-level change
+#              feed between two versions (insert / delete / update_preimage / update_postimage), with the
+#              _change_type / _commit_version / _commit_timestamp metadata columns. `to` omitted/-1 => latest.
+#              Capture for the rowid copy-on-write DELETE/UPDATE strips the transient virtual rowid so every change
+#              batch shares the user-column schema. Set ARROWNET_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
+# group: [mssql_net]
+
+require mssql_net
+
+require-env ARROWNET_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogcdf' AS lake (TYPE arrownet, PROVIDER 'delta', change_data_feed true);
+
+statement ok
+CREATE TABLE lake.main.t (id INTEGER, val VARCHAR);
+
+statement ok
+INSERT INTO lake.main.t VALUES (1,'a'),(2,'b'),(3,'c');
+
+statement ok
+DELETE FROM lake.main.t WHERE id=2;
+
+statement ok
+UPDATE lake.main.t SET val='B' WHERE id=3;
+
+# Final table state: id=2 deleted, id=3 updated.
+query IT
+SELECT * FROM lake.main.t ORDER BY id;
+----
+1	a
+3	B
+
+# The full change feed across all versions: 3 inserts (v1), 1 delete (v2), update pre+post (v3).
+query I
+SELECT count(*) FROM arrownet_delta_changes('lake', 'main.t', 0, 99);
+----
+6
+
+# Change-type breakdown.
+query TI
+SELECT _change_type, count(*) FROM arrownet_delta_changes('lake', 'main.t', 0, 99)
+GROUP BY _change_type ORDER BY _change_type;
+----
+delete	1
+insert	3
+update_postimage	1
+update_preimage	1
+
+# The 3 inserts are at commit version 1, with the inserted values.
+query IT
+SELECT id, val FROM arrownet_delta_changes('lake', 'main.t', 0, 99)
+WHERE _change_type='insert' ORDER BY id;
+----
+1	a
+2	b
+3	c
+
+# The delete change carries the deleted row's pre-delete values.
+query IT
+SELECT id, val FROM arrownet_delta_changes('lake', 'main.t', 0, 99) WHERE _change_type='delete';
+----
+2	b
+
+# Update pre/post images carry the old and new values for the same key.
+query IT
+SELECT _change_type, val FROM arrownet_delta_changes('lake', 'main.t', 0, 99)
+WHERE id=3 AND _change_type LIKE 'update_%' ORDER BY _change_type;
+----
+update_postimage	B
+update_preimage	c
+
+# _commit_timestamp is populated (epoch ms) on every change from the always-on commitInfo timestamp.
+query I
+SELECT count(*) FROM arrownet_delta_changes('lake', 'main.t', 0, 99) WHERE _commit_timestamp IS NOT NULL;
+----
+6
+
+# Commit versions: inserts at v1, delete at v2, update images at v3.
+query TI
+SELECT _change_type, _commit_version FROM arrownet_delta_changes('lake', 'main.t', 0, 99)
+WHERE _change_type IN ('delete','update_preimage') ORDER BY _change_type;
+----
+delete	2
+update_preimage	3
+
+# A bounded range: only the inserts (version 1).
+query I
+SELECT count(*) FROM arrownet_delta_changes('lake', 'main.t', 1, 1);
+----
+3
+
+# Range starting after the inserts: delete + update images (versions 2..3).
+query I
+SELECT count(*) FROM arrownet_delta_changes('lake', 'main.t', 2, 99);
+----
+3
+
+# The 3-arg overload (no `to`) reads through to the latest version.
+query I
+SELECT count(*) FROM arrownet_delta_changes('lake', 'main.t', 0);
+----
+6
+
+# A bare table name resolves to "main" on a flat catalog.
+query I
+SELECT count(*) FROM arrownet_delta_changes('lake', 't', 0, 99);
+----
+6
+
+statement ok
+DETACH lake;
+
+# A table created WITHOUT change_data_feed has no change feed (CDF not enabled).
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogcdf_off' AS plain (TYPE arrownet, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE plain.main.t (id INTEGER);
+
+statement ok
+INSERT INTO plain.main.t VALUES (1),(2);
+
+statement error
+SELECT * FROM arrownet_delta_changes('plain', 'main.t', 0, 99);
+----
+
+statement ok
+DETACH plain;
