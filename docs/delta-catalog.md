@@ -344,8 +344,20 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      Validated local: `test/verify_delta_catalog_write.test` (31 — CREATE/INSERT/append/CTAS/aggregate + DROP
      TABLE + detach/re-attach durability). **DROP TABLE** recursively deletes the table's `<root>/<table>/` folder
      via a new host-FS callback `fs_remove_dir` (ABI v49 — DuckDB's `FileSystem::RemoveDirectory`, idempotent).
-     **Still unsupported** (throw a clean error): DELETE, UPDATE, raw exec. **Remaining for production write
-     concurrency:** the OCC retry loop (catch `DeltaConflictException` → reopen → retry) for concurrent writers.
+     **DROP TABLE LIMITATION — works on local/S3, FAILS on OneLake/Azure-DFS** (validated live 2026-06-30):
+     `FileSystem::RemoveDirectory` throws `AzureDfsStorageFileSystem: RemoveDirectory is not implemented!`
+     (duckdb-azure has no recursive delete on the DFS endpoint). **No host-FS fallback exists:** deleting the
+     files individually (glob the `<root>/<table>/` tree + `fs_remove` each) is blocked by the SAME duckdb-azure
+     mid-path-wildcard glob bug (PR #174, `type must be string, but is null`) that forced Fabric-REST table
+     discovery — azure `glob()` returns 0 rows at every OneLake level, so the file set can't be enumerated through
+     DuckDB's FileSystem. A real OneLake DROP would have to go **out-of-band via the Fabric REST API** (as
+     `FabricLakehouse` discovery already does), or wait for an upstream duckdb-azure `RemoveDirectory`/glob fix.
+     Until then a OneLake DROP TABLE raises the azure error and leaves the table's files in place; local/S3 DROP is
+     fine. **ADD COLUMN — DONE** (the only ALTER kind on Delta): a metadata-only commit
+     (`DeltaTable.AddColumnAsync`) + read-side NULL backfill of old files (`BackfillMissingColumns`); validated
+     local (`verify_delta_catalog_alter.test`, 81) + live on `LH`. RENAME/DROP COLUMN, ALTER COLUMN TYPE, RENAME
+     TABLE stay unsupported (column mapping / rewrite / folder move). **Still unsupported** (throw a clean error):
+     raw exec, DROP SCHEMA.
 3. **DELETE — FINAL: copy-on-write + transient `(file,position)` rowid, PLAIN Delta (no features).** The
    detailed design below (row tracking + deletion vectors) is the SUPERSEDED first attempt — kept as the trail.
    Why it changed: Fabric's OneLake converter / Spark could not read our row-tracking + DV commits (first from

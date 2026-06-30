@@ -156,3 +156,14 @@ write-back foundation — see docs/delta-catalog.md (recommendation step 0).
 **v49** appended `fs_remove_dir`(opener,path) — a RECURSIVE directory delete (DuckDB's
 `FileSystem::RemoveDirectory`, idempotent). Powers Delta catalog **DROP TABLE** (`DeltaCatalog.DropTable` →
 `HostFs.RemoveDir` deletes the table's whole `<root>/<table>/` folder). See docs/delta-catalog.md.
+
+> **Azure-DFS gap — `fs_remove_dir` does NOT work on OneLake/ADLS** (validated live 2026-06-30):
+> `FileSystem::RemoveDirectory` throws `AzureDfsStorageFileSystem: RemoveDirectory is not implemented!` —
+> duckdb-azure has no recursive delete on the DFS endpoint. So Delta-catalog DROP TABLE works on local/S3 but
+> fails on OneLake. **There is no host-FS workaround:** the obvious fallback (glob the folder + `fs_remove` each
+> file) is dead because `fs_glob` hits the **same duckdb-azure mid-path-wildcard bug** (PR #174,
+> `type must be string, but is null`) that already forced Fabric-REST table discovery — azure `glob()` returns 0
+> rows at every OneLake level, so the file set is not enumerable through the host FileSystem. A working OneLake
+> delete must go **out-of-band via the Fabric REST API** (like `FabricLakehouse` discovery) or await an upstream
+> duckdb-azure `RemoveDirectory`/glob fix. Note `fs_remove` (single file) DOES work on Azure DFS — only the
+> recursive directory delete and recursive glob are missing.
