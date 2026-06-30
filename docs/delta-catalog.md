@@ -350,10 +350,14 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      files individually (glob the `<root>/<table>/` tree + `fs_remove` each) is blocked by the SAME duckdb-azure
      mid-path-wildcard glob bug (PR #174, `type must be string, but is null`) that forced Fabric-REST table
      discovery — azure `glob()` returns 0 rows at every OneLake level, so the file set can't be enumerated through
-     DuckDB's FileSystem. A real OneLake DROP would have to go **out-of-band via the Fabric REST API** (as
-     `FabricLakehouse` discovery already does), or wait for an upstream duckdb-azure `RemoveDirectory`/glob fix.
-     Until then a OneLake DROP TABLE raises the azure error and leaves the table's files in place; local/S3 DROP is
-     fine. **ADD COLUMN — DONE** (the only ALTER kind on Delta): a metadata-only commit
+     DuckDB's FileSystem. **Neither discovery mechanism gives a delete primitive:** schema-enabled discovery uses
+     the **SQL analytics endpoint** (`INFORMATION_SCHEMA`, read-only metadata) and the Fabric `ListTables` REST API
+     **400s on schema-enabled lakehouses** (flat-only) — so "delete via the Fabric REST API like discovery" does
+     NOT apply. A real OneLake DROP must either (a) bypass duckdb-azure with a **direct ADLS Gen2 / OneLake DFS
+     recursive delete** — `Azure.Storage.Files.DataLake` `DataLakeDirectoryClient.DeleteRecursiveAsync` (or the raw
+     DFS REST `DELETE <path>?recursive=true`) under the same SP `ClientSecretCredential` the catalog already mints —
+     or (b) wait for an upstream duckdb-azure `RemoveDirectory`/glob fix. Until then a OneLake DROP TABLE raises the
+     azure error and leaves the table's files in place; local/S3 DROP is fine. **ADD COLUMN — DONE** (the only ALTER kind on Delta): a metadata-only commit
      (`DeltaTable.AddColumnAsync`) + read-side NULL backfill of old files (`BackfillMissingColumns`); validated
      local (`verify_delta_catalog_alter.test`, 81) + live on `LH`. RENAME/DROP COLUMN, ALTER COLUMN TYPE, RENAME
      TABLE stay unsupported (column mapping / rewrite / folder move). **Still unsupported** (throw a clean error):

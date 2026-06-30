@@ -1090,10 +1090,15 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   the obvious fallback — glob the table's files + `fs_remove` each — is blocked by the SAME duckdb-azure
   mid-path-wildcard glob bug (`type must be string, but is null`, PR #174) that already forced Fabric-REST table
   discovery (`FabricLakehouse`); azure `glob()` returns 0 rows at every OneLake level, so the file list can't be
-  enumerated through DuckDB's FileSystem at all. A real fix needs either an upstream duckdb-azure
-  `RemoveDirectory`/glob fix, or deleting via the **Fabric REST API** (out-of-band from the host FS, like
-  discovery). Until then DROP TABLE on a OneLake catalog raises the azure error (the `_delta_log` + data files
-  are left in place); local/S3 DROP TABLE is unaffected. v48 =
+  enumerated through DuckDB's FileSystem at all. **Note neither discovery mechanism provides a delete:** the
+  schema-enabled path uses the **SQL analytics endpoint** (`INFORMATION_SCHEMA` — read-only metadata), and the
+  Fabric `TablesClient.ListTables` REST API **400s on schema-enabled lakehouses** (used only for flat ones), so
+  "delete via the Fabric REST API like discovery" is a dead end. A real fix needs either an upstream duckdb-azure
+  `RemoveDirectory`/glob fix, OR a **direct ADLS Gen2 / OneLake DFS recursive delete** that bypasses duckdb-azure
+  — `Azure.Storage.Files.DataLake` `DataLakeDirectoryClient.DeleteRecursiveAsync` (or the raw DFS REST
+  `DELETE <path>?recursive=true`) authenticated with the same SP `ClientSecretCredential` the catalog already
+  mints. Until then DROP TABLE on a OneLake catalog raises the azure error (the `_delta_log` + data files are
+  left in place); local/S3 DROP TABLE is unaffected. v48 =
   **host-FS WRITE surface** — the Delta write-back foundation: appended five
   WRITE callbacks to `ArrowNetHostServices` (the reverse host→managed struct, not the vtable) —
   `fs_open_write(opener,path,exclusive,…)` / `fs_write` / `fs_close_write` / `fs_remove` / `fs_create_dir` — plus
