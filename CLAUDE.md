@@ -549,10 +549,18 @@ Implemented and verified:
     dbt-duckdb **plugin** (`dbt_mssql_test/plugins/onelake_attach.py`) ATTACHes `mssql` writable in
     `configure_connection` (runs per connection, AFTER the profile `secrets:` create `fabric_sp` and BEFORE dbt's
     per-connection schema creation — so all of dbt's cursors see the catalog). Uses `TYPE mssql_net` (the loadable
-    registers that storage-extension name; `arrownet` is a shell-only alias) + `PROVIDER 'delta'`. **Caveat:** a
-    dbt run over a OneLake catalog is SLOW — dbt lists every existing table in `mssql.dbo` before building (the
-    documented OneLake catalog-introspection cost: per-table `_delta_log` reads + a per-connection Fabric-API +
-    DFS resolution), so point it at a lakehouse with few tables. **The loadable extension must be rebuilt on an
+    registers that storage-extension name; `arrownet` is a shell-only alias) + `PROVIDER 'delta'`. **CRITICAL —
+    point it at an EMPTY lakehouse** (validated against the flat `LH_no_schema`, schema `main`): dbt runs
+    `information_schema.tables` before building, which scans the **WHOLE `mssql` catalog** (the
+    `WHERE table_schema=…` filters AFTER), and our catalog **materializes every table during enumeration**
+    (`FetchTableColumns` → a `_delta_log` read per table over OneLake). Against the populated `LH` (10 tables incl.
+    a 10M-row one) that effectively HANGS — even when the target schema is empty, because the scan still touches
+    every other table. Against the empty `LH_no_schema` a single-model build is ~11s and **`dbt run --threads 4`
+    is PASS=4/4** (4 concurrent CTAS → 4 separate `Tables/<model>` Delta tables, ~19s — validates the parallel
+    OneLake bulk-write path, same as box/fabric). (A lazy table-enumeration that doesn't fetch columns until
+    needed would fix the populated-catalog slowness generally — deferred.) Per-target
+    schema via `+schema: "{{ target.schema }}"` (box/fabric `dbo`, lakehouse `main`). **The loadable extension
+    must be rebuilt on an
     ABI bump** (`cmake --build … --target mssql_net_loadable_extension`) — dbt loads the loadable, not the
     static `unittest`/`duckdb.exe`, so a stale loadable vs a freshly-published bridge throws
     `Bootstrap.Initialize returned 2` (ABI mismatch).
