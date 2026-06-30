@@ -245,6 +245,31 @@ internal static unsafe class HostFs
         }
     }
 
+    /// <summary>True once the host registered the directory move/rename callback (ABI v50+).</summary>
+    public static bool CanMoveDir => _set && _h.FsMoveDir != null;
+
+    /// <summary>Renames/moves directory <paramref name="src"/> to <paramref name="dest"/>
+    /// (FileSystem::MoveFile — atomic on a local filesystem; object stores throw "not implemented").</summary>
+    public static void MoveDir(nint opener, string src, string dest)
+    {
+        var srcPtr = Marshal.StringToCoTaskMemUTF8(src);
+        var destPtr = Marshal.StringToCoTaskMemUTF8(dest);
+        try
+        {
+            byte* err = null;
+            int rc = _h.FsMoveDir(opener, (byte*)srcPtr, (byte*)destPtr, &err);
+            if (rc != ArrowNetStatus.Ok)
+            {
+                throw HostError("fs_move_dir", err);
+            }
+        }
+        finally
+        {
+            Marshal.FreeCoTaskMem(srcPtr);
+            Marshal.FreeCoTaskMem(destPtr);
+        }
+    }
+
     /// <summary>True once the host registered the host_query callback.</summary>
     public static bool CanQuery => _set && _h.HostQuery != null;
 

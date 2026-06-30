@@ -73,11 +73,30 @@ SELECT schema_name FROM information_schema.schemata WHERE catalog_name = 'lake' 
 main
 staging
 
-# RENAME TABLE is unsupported on a local/S3 Delta catalog (no recursive move primitive) — clean error.
-statement error
+# RENAME TABLE on a local Delta catalog moves the table folder (FileSystem::MoveFile).
+statement ok
 ALTER TABLE lake.staging.t1 RENAME TO t1b;
+
+query IT
+SELECT id, name FROM lake.staging.t1b;
 ----
-OneLake only
+1	a
+
+statement error
+SELECT id FROM lake.staging.t1;
+----
+
+# The rename survives re-attach (the folder really moved on disk).
+statement ok
+DETACH lake;
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogschemas' AS lake (TYPE arrownet, PROVIDER 'delta', schemas true);
+
+query I
+SELECT id FROM lake.staging.t1b;
+----
+1
 
 # DROP SCHEMA on a populated schema removes its whole subfolder (recursive).
 statement ok

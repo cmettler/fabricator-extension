@@ -1079,7 +1079,12 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v49** (v49 = **recursive directory delete** — appended `fs_remove_dir(opener,path,…)` to
+- **Current version: ABI v50** (v50 = **directory move/rename** — appended `fs_move_dir(opener,src,dest,…)` to
+  `ArrowNetHostServices` (the reverse host→managed struct): maps to DuckDB's `FileSystem::MoveFile` — an atomic
+  directory rename on a local filesystem; object stores (S3/Azure DFS) throw "not implemented". Powers **local/S3
+  Delta catalog RENAME TABLE** (`DeltaCatalog.AlterTable` RenameTable → `HostFs.MoveDir`; OneLake still renames via
+  the DFS SDK since Azure `MoveFile` is unimplemented). `test/verify_delta_catalog_schemas.test`. v49 =
+  **recursive directory delete** — appended `fs_remove_dir(opener,path,…)` to
   `ArrowNetHostServices` (the reverse host→managed struct, not the vtable): deletes a directory RECURSIVELY via
   DuckDB's `FileSystem::RemoveDirectory` (idempotent — no error if absent). Powers **Delta catalog DROP TABLE**
   (`DeltaCatalog.DropTable` → `HostFs.RemoveDir` removes the table's whole `<root>/<table>/` folder; opener
@@ -1215,10 +1220,14 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   rename** (`FabricLakehouse.RenameDirectory` → `DataLakeDirectoryClient.RenameAsync`; the destination path is
   filesystem-relative WITHOUT the workspace prefix — OneLake requires the leading segment to be the
   `<item>.Lakehouse`, else 400 "item type extension is missing"). C++ `Alter`'s RENAME_TABLE branch already updates
-  the entry cache; no ABI change. Validated live on `LH` (create → rename → new name reads → drop). **local/S3 RENAME
-  is unsupported** (no recursive-move primitive in the host FS — clean error), same gap class as a local recursive
-  delete. **Still unsupported** (clean error): raw exec, RENAME/DROP COLUMN + ALTER COLUMN TYPE (need column mapping /
-  rewrite). **DROP SCHEMA** is supported in `schemas` mode (see below), else unsupported.
+  the entry cache. Validated live on `LH` (create → rename → new name reads → drop). **local/S3 RENAME — DONE (ABI
+  v50)** via the new host `fs_move_dir` → `FileSystem::MoveFile` (`DeltaCatalog.AlterTable` → `HostFs.MoveDir`):
+  an atomic directory rename on local; an object store whose FileSystem doesn't implement `MoveFile` throws a clean
+  error. Verified local (`verify_delta_catalog_schemas.test` — rename + reattach durability). So RENAME works on
+  local + OneLake (S3 iff DuckDB's S3 FileSystem implements `MoveFile`). **Still unsupported** (clean error): raw
+  exec, RENAME/DROP COLUMN + ALTER COLUMN TYPE (need column mapping / rewrite). **DROP SCHEMA** is supported in
+  `schemas` mode (see below), else unsupported. (Recursive DROP TABLE already works on local/S3 via `fs_remove_dir`,
+  ABI v49.)
   **Multi-schema for local/S3 — the `schemas true` ATTACH option (DONE)**: by default a non-OneLake Delta catalog is
   FLAT (single `main` schema; the schema component is ignored, so `db.staging.t` and `db.main.t` would both map to
   `<root>/t` — a silent collision footgun). `ATTACH '…' (TYPE arrownet, PROVIDER 'delta', schemas true)` switches it

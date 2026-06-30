@@ -357,8 +357,9 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      validated local (`verify_delta_catalog_alter.test`, 81) + live on `LH`. **RENAME TABLE — DONE (OneLake only)**:
      the table is its folder + Delta logs are table-relative, so rename = move the folder; OneLake uses the DFS
      atomic native rename (`FabricLakehouse.RenameDirectory` → `DataLakeDirectoryClient.RenameAsync`, destination
-     filesystem-relative without the workspace prefix). local/S3 RENAME is unsupported (no recursive-move
-     primitive). Validated live on `LH`. DROP/RENAME COLUMN + ALTER COLUMN TYPE stay unsupported (column mapping /
+     filesystem-relative without the workspace prefix). **local/S3 RENAME — DONE (ABI v50)** via a new host
+     `fs_move_dir` → `FileSystem::MoveFile` (atomic dir rename on local; object stores throw cleanly if MoveFile
+     is unimplemented). Validated live on `LH` + local (`verify_delta_catalog_schemas.test`). DROP/RENAME COLUMN + ALTER COLUMN TYPE stay unsupported (column mapping /
      rewrite). **Multi-schema for local/S3 — `schemas true` ATTACH option (DONE)**: default is a FLAT main-only
      catalog (schema ignored → `db.staging.t` and `db.main.t` would collide at `<root>/t`); `schemas true` switches
      to the two-level `<root>/<schema>/<table>` layout (`SchemaLayout` drives `TablePath`/discovery/`CreateSchema`/

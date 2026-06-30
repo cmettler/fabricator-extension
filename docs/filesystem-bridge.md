@@ -157,6 +157,12 @@ write-back foundation — see docs/delta-catalog.md (recommendation step 0).
 `FileSystem::RemoveDirectory`, idempotent). Powers Delta catalog **DROP TABLE** (`DeltaCatalog.DropTable` →
 `HostFs.RemoveDir` deletes the table's whole `<root>/<table>/` folder). See docs/delta-catalog.md.
 
+**v50** appended `fs_move_dir`(opener,src,dest) — a directory rename/move (DuckDB's `FileSystem::MoveFile`:
+atomic on a local filesystem; object stores throw "not implemented"). Powers **local/S3 Delta catalog RENAME
+TABLE** (`DeltaCatalog.AlterTable` RenameTable → `HostFs.MoveDir` moves the `<root>/<table>/` folder). OneLake
+RENAME does NOT use this (Azure `MoveFile` is unimplemented) — it renames via the DFS SDK
+(`DataLakeDirectoryClient.RenameAsync`) directly, like the OneLake DROP. See docs/delta-catalog.md.
+
 > **Azure-DFS gap — `fs_remove_dir` does NOT work on OneLake/ADLS** (so OneLake Delta DROP bypasses the host FS):
 > `FileSystem::RemoveDirectory` throws `AzureDfsStorageFileSystem: RemoveDirectory is not implemented!` (duckdb-azure
 > has no recursive delete on the DFS endpoint), and the glob-files-then-`fs_remove` fallback is dead — `fs_glob`

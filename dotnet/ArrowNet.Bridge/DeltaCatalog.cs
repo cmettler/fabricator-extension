@@ -597,10 +597,16 @@ public sealed class DeltaCatalog : IBackendCatalog
                 string newName = a1 ?? throw new System.InvalidOperationException(
                     "delta RENAME TABLE requires a new table name.");
                 // The table folder (incl. _delta_log) is moved; the schema is unchanged (RENAME TABLE renames
-                // within the same schema). OneLake → DFS atomic rename; local/S3 lack a recursive move primitive.
-                if (!FabricLakehouse.IsOneLake(_root))
-                    throw Unsupported("ALTER TABLE RENAME (OneLake only — local/S3 has no recursive move yet)");
-                FabricLakehouse.RenameDirectory(TablePath(s, t), TablePath(s, newName), _fabricCredential);
+                // within the same schema). OneLake → DFS atomic rename (Azure MoveFile is unimplemented); local/S3
+                // → the host FS move (FileSystem::MoveFile — atomic on local; an object store throws cleanly).
+                if (FabricLakehouse.IsOneLake(_root))
+                {
+                    FabricLakehouse.RenameDirectory(TablePath(s, t), TablePath(s, newName), _fabricCredential);
+                }
+                else
+                {
+                    HostFs.MoveDir(AmbientOpener.Current, TablePath(s, t), TablePath(s, newName));
+                }
                 return;
             }
             default:

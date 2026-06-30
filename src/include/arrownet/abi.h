@@ -671,13 +671,18 @@ typedef struct ArrowNetHostServices {
 	// exist. Maps to DuckDB's FileSystem::RemoveDirectory (recursive on local; on object stores it deletes every
 	// object under the prefix). Used to DROP a Delta catalog table (its whole `<table>/` folder).
 	int32_t (*fs_remove_dir)(ArrowNetHandle opener, const char *path, char **err);
+	// Rename/move directory `src` to `dest`. Maps to DuckDB's FileSystem::MoveFile — atomic on a local
+	// filesystem (a directory rename); object stores (S3/Azure DFS) generally do NOT implement it and throw.
+	// Used to RENAME a Delta catalog table (move its whole `<table>/` folder; OneLake renames via the DFS SDK
+	// directly instead, since Azure MoveFile is unimplemented).
+	int32_t (*fs_move_dir)(ArrowNetHandle opener, const char *src, const char *dest, char **err);
 } ArrowNetHostServices;
 
 // Max serialized size of a spillable aggregate's per-group state (the inline, pointer-free
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 49
+#define ARROWNET_ABI_VERSION 50
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

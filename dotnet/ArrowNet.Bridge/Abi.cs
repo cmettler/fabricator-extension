@@ -225,6 +225,9 @@ public unsafe struct ArrowNetHostServices
     public delegate* unmanaged[Cdecl]<nint, byte*, byte**, int> FsCreateDir;
     // int32 fs_remove_dir(void* opener, const char* path, char** err) — recursive directory delete (idempotent).
     public delegate* unmanaged[Cdecl]<nint, byte*, byte**, int> FsRemoveDir;
+    // int32 fs_move_dir(void* opener, const char* src, const char* dest, char** err) — directory rename/move
+    // (FileSystem::MoveFile; atomic on local, unimplemented on object stores).
+    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, byte**, int> FsMoveDir;
 }
 
 /// <summary>Mirrors <c>ArrowNetHostInputs</c> in abi.h — named Arrow streams handed to host_query as data-in

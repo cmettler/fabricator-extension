@@ -271,6 +271,20 @@ int32_t HostFsRemoveDir(ArrowNetHandle opener, const char *path, char **err) {
 	}
 }
 
+int32_t HostFsMoveDir(ArrowNetHandle opener, const char *src, const char *dest, char **err) {
+	try {
+		auto *ctx = reinterpret_cast<ClientContext *>(opener);
+		auto &fs = FileSystem::GetFileSystem(*ctx);
+		fs.MoveFile(src, dest); // atomic directory rename on local; object stores throw "not implemented"
+		return ARROWNET_OK;
+	} catch (std::exception &e) {
+		if (err) {
+			*err = DupErr(e.what());
+		}
+		return 1;
+	}
+}
+
 void InstallHostFsServices() {
 	ArrowNetHostServices services {};
 	services.abi_version = ARROWNET_ABI_VERSION;
@@ -286,6 +300,7 @@ void InstallHostFsServices() {
 	services.fs_remove = HostFsRemove;
 	services.fs_create_dir = HostFsCreateDir;
 	services.fs_remove_dir = HostFsRemoveDir;
+	services.fs_move_dir = HostFsMoveDir;
 	arrownet::SetHostServices(services);
 }
 
