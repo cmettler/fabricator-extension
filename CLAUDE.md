@@ -1292,7 +1292,8 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   conversion — GATED ON A FABRIC TIME-TRAVEL SETTING (validated live 2026-06-30):** on a lakehouse WITHOUT it
   (`LH_no_schema`) the converter rejects the writer-v7 table — it shows "Unable to identify these objects as
   tables or views"; on a lakehouse WHERE the Fabric time-travel setting is ENABLED (`LH2`) the converter
-  **accepts** it (the table shows + registers). So it's NOT a blanket rejection — Fabric's converter accepts the
+  **accepts** it — the table registers AND is **queryable via the Fabric SQL endpoint** (confirmed live, not just
+  visible in the Tables list). So it's NOT a blanket rejection — Fabric's converter accepts the
   inCommitTimestamp (writer-only) feature once the workspace/lakehouse time-travel setting is on. (The setting is
   documented for the Warehouse but also affects the Lakehouse converter — confirmed.) Earlier
   `deletion_vectors`/row-tracking failures were a different cause (reader-v3 / domainMetadata / DV byte format),
