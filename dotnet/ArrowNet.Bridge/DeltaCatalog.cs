@@ -71,6 +71,11 @@ public sealed class DeltaCatalog : IBackendCatalog
     // DELETEs use deletion vectors). DELETE on ANY table still follows that table's own delta.enableDeletionVectors
     // config, so external DV tables are honored regardless of this flag.
     private readonly bool _deletionVectorsOnCreate;
+    // ATTACH option `schemas true`: a NON-OneLake root (local/S3/plain-ADLS) uses a two-level
+    // <root>/<schema>/<table> layout so DuckDB schemas other than "main" map to subfolders (discovery, CREATE,
+    // DROP all schema-aware). Default false = the flat <root>/<table>, "main"-only layout. Ignored for OneLake
+    // (its layout is driven by the lakehouse's schema-enabled flag, not this option).
+    private readonly bool _schemas;
 
     public DeltaCatalog(string root) : this(root, "{}") { }
 
@@ -80,7 +85,13 @@ public sealed class DeltaCatalog : IBackendCatalog
         _root = Normalize(clean).TrimEnd('/');
         _fabricCredential = credential;
         _deletionVectorsOnCreate = ParseBoolOption(optionsJson, "deletion_vectors");
+        _schemas = ParseBoolOption(optionsJson, "schemas");
     }
+
+    /// <summary>True when this catalog uses the two-level <c>&lt;root&gt;/&lt;schema&gt;/&lt;table&gt;</c> layout:
+    /// a schema-enabled OneLake lakehouse, OR a non-OneLake root with the <c>schemas true</c> ATTACH option.
+    /// (<see cref="OneLake"/> is null for non-OneLake roots, so the two arms are mutually exclusive.)</summary>
+    private bool SchemaLayout => OneLake()?.SchemaEnabled == true || (OneLake() is null && _schemas);
 
     private static bool ParseBoolOption(string? optionsJson, string key)
     {
@@ -122,7 +133,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// <c>&lt;root&gt;/&lt;schema&gt;/&lt;table&gt;</c>; everything else is flat <c>&lt;root&gt;/&lt;table&gt;</c>
     /// (the DuckDB schema is then the single "main", ignored).</summary>
     private string TablePath(string schema, string table) =>
-        OneLake()?.SchemaEnabled == true ? _root + "/" + schema + "/" + table : _root + "/" + table;
+        SchemaLayout ? _root + "/" + schema + "/" + table : _root + "/" + table;
 
     public IArrowArrayStream GetMetadata(int kind, string? schema, string? table) => kind switch
     {
@@ -139,8 +150,9 @@ public sealed class DeltaCatalog : IBackendCatalog
         _ => EmptyStringTable("name"),
     };
 
-    /// <summary>The catalog's schemas: the lakehouse schemas for a schema-enabled OneLake lakehouse, else the
-    /// single flat "main".</summary>
+    /// <summary>The catalog's schemas: the lakehouse schemas for a schema-enabled OneLake lakehouse; for a
+    /// non-OneLake <c>schemas true</c> catalog the distinct subfolders discovered as schemas (+ always "main", the
+    /// default); else the single flat "main".</summary>
     private IReadOnlyList<string> SchemaNames()
     {
         var ol = OneLake();
@@ -161,13 +173,26 @@ public sealed class DeltaCatalog : IBackendCatalog
             }
             return new List<string>(schemas);
         }
+        if (ol is null && _schemas)
+        {
+            // schemas-mode local/S3: schemas = the <root>/<schema>/ subfolders that contain a table, plus "main"
+            // (the default, so the catalog always has a schema). An EMPTY created schema with no tables yet does
+            // not survive a re-attach (it has no _delta_log to glob) — a documented limitation.
+            var schemas = new SortedSet<string>(System.StringComparer.Ordinal) { MainSchema };
+            foreach (var (s, _) in DiscoverTablePairs())
+            {
+                schemas.Add(s);
+            }
+            return new List<string>(schemas);
+        }
         return new[] { MainSchema };
     }
 
-    /// <summary>Discovers tables = immediate subdirs of the root containing a <c>_delta_log/</c>. Globs the
-    /// commit files (<c>&lt;root&gt;/*/_delta_log/*.json</c>) and takes the distinct parent-of-_delta_log
-    /// directory name as the table.</summary>
-    private IArrowArrayStream DiscoverTables()
+    /// <summary>Discovers (schema, table) pairs. OneLake → the DFS-resolved list. Non-OneLake → globs the Delta
+    /// commit files: flat <c>&lt;root&gt;/*/_delta_log/*.json</c> (schema "main") or, in <c>schemas</c> mode, the
+    /// two-level <c>&lt;root&gt;/*/*/_delta_log/*.json</c> (the segment before <c>_delta_log</c> = table, the one
+    /// before that = schema).</summary>
+    private SortedSet<(string Schema, string Table)> DiscoverTablePairs()
     {
         var pairs = new SortedSet<(string Schema, string Table)>();
         var ol = OneLake();
@@ -180,29 +205,47 @@ public sealed class DeltaCatalog : IBackendCatalog
             {
                 pairs.Add((s, t));
             }
+            return pairs;
         }
-        else
+
+        // Local / S3 / plain ADLS: glob the commit files. schemas mode = two levels deep, else one.
+        var glob = _schemas ? _root + "/*/*/_delta_log/*.json" : _root + "/*/_delta_log/*.json";
+        var json = HostFs.Glob(AmbientOpener.Current, glob);
+        using var doc = JsonDocument.Parse(json);
+        foreach (var el in doc.RootElement.EnumerateArray())
         {
-            // Local / S3 / plain ADLS: discover by globbing the commit files <root>/*/_delta_log/*.json.
-            var json = HostFs.Glob(AmbientOpener.Current, _root + "/*/_delta_log/*.json");
-            using var doc = JsonDocument.Parse(json);
-            foreach (var el in doc.RootElement.EnumerateArray())
+            var path = Normalize(el.GetProperty("path").GetString() ?? string.Empty);
+            int marker = path.IndexOf("/_delta_log/", System.StringComparison.Ordinal);
+            if (marker < 0)
             {
-                var path = Normalize(el.GetProperty("path").GetString() ?? string.Empty);
-                // …/<table>/_delta_log/<file>.json  →  the segment before "/_delta_log/".
-                int marker = path.IndexOf("/_delta_log/", System.StringComparison.Ordinal);
-                if (marker < 0)
+                continue;
+            }
+            // …/<table>/_delta_log/…  → the segment before "/_delta_log/" is the table.
+            int tblSlash = path.LastIndexOf('/', marker - 1);
+            var table = tblSlash < 0 ? path.Substring(0, marker) : path.Substring(tblSlash + 1, marker - tblSlash - 1);
+            if (table.Length == 0)
+            {
+                continue;
+            }
+            string schema = MainSchema;
+            if (_schemas && tblSlash > 0)
+            {
+                // …/<schema>/<table>/_delta_log/…  → the segment before <table> is the schema.
+                int schSlash = path.LastIndexOf('/', tblSlash - 1);
+                if (schSlash >= 0)
                 {
-                    continue;
-                }
-                int slash = path.LastIndexOf('/', marker - 1);
-                var name = slash < 0 ? path.Substring(0, marker) : path.Substring(slash + 1, marker - slash - 1);
-                if (name.Length > 0)
-                {
-                    pairs.Add((MainSchema, name));
+                    schema = path.Substring(schSlash + 1, tblSlash - schSlash - 1);
                 }
             }
+            pairs.Add((schema, table));
         }
+        return pairs;
+    }
+
+    /// <summary>Discovers tables as an Arrow metadata stream (schema_name, table_name, table_type).</summary>
+    private IArrowArrayStream DiscoverTables()
+    {
+        var pairs = DiscoverTablePairs();
         var schemaCol = new List<string>();
         var nameCol = new List<string>();
         var typeCol = new List<string>();
@@ -292,7 +335,16 @@ public sealed class DeltaCatalog : IBackendCatalog
         => DeltaWriter.Create(AmbientOpener.Current, TablePath(schemaName, tableName), columns, default,
                               deletionVectors: _deletionVectorsOnCreate);
 
-    public void CreateSchema(string s, bool ie) { } // schemas mirror the lakehouse; CREATE SCHEMA is a no-op
+    /// <summary>CREATE SCHEMA. In <c>schemas</c> mode (non-OneLake) it materializes the <c>&lt;root&gt;/&lt;schema&gt;/</c>
+    /// subfolder so a subsequent CREATE TABLE lands there (and the schema is rediscovered once it holds a table).
+    /// Otherwise a no-op: OneLake schemas mirror the lakehouse, and the flat layout has only "main".</summary>
+    public void CreateSchema(string s, bool ie)
+    {
+        if (_schemas && OneLake() is null && !string.Equals(s, MainSchema, System.StringComparison.Ordinal))
+        {
+            HostFs.CreateDir(AmbientOpener.Current, _root + "/" + s); // recursive mkdir; idempotent
+        }
+    }
     public void BeginTransaction() { }              // Delta is per-commit (no cross-statement transaction)
     public void CommitTransaction() { }
     public void RollbackTransaction() { }
@@ -502,22 +554,58 @@ public sealed class DeltaCatalog : IBackendCatalog
     }
 
     public IArrowArrayStream InsertReturning(string s, string t, IArrowArrayStream r) => throw Unsupported("INSERT ... RETURNING");
-    public void DropSchema(string s, bool ie) => throw Unsupported("DROP SCHEMA");
-    /// <summary>Schema evolution. Only <c>ADD COLUMN</c> is supported on Delta — a metadata-only commit appending
-    /// a nullable column (no file rewrite; old rows read back NULL). RENAME/DROP/TYPE need column mapping or a
-    /// full rewrite (clean error). <paramref name="a1"/> = the new column's name, <paramref name="c"/> carries its
-    /// Arrow type + nullability.</summary>
+    /// <summary>DROP SCHEMA. In <c>schemas</c> mode (non-OneLake) it recursively removes the
+    /// <c>&lt;root&gt;/&lt;schema&gt;/</c> subfolder (and every table under it). Unsupported otherwise (OneLake
+    /// schemas mirror the lakehouse; the flat layout has only "main").</summary>
+    public void DropSchema(string s, bool ie)
+    {
+        if (_schemas && OneLake() is null)
+        {
+            if (string.Equals(s, MainSchema, System.StringComparison.Ordinal))
+            {
+                throw Unsupported("DROP SCHEMA main (the default schema)");
+            }
+            HostFs.RemoveDir(AmbientOpener.Current, _root + "/" + s); // recursive; idempotent
+            return;
+        }
+        throw Unsupported("DROP SCHEMA");
+    }
+    /// <summary>Schema evolution. Supported on Delta: <c>ADD COLUMN</c> (a metadata-only commit appending a
+    /// nullable column — no file rewrite; old rows read back NULL) and <c>RENAME TABLE</c> (a folder move — the
+    /// <c>_delta_log</c> uses table-relative paths, so moving the whole folder preserves the table; OneLake uses
+    /// the DFS endpoint's atomic native rename). RENAME/DROP COLUMN + ALTER COLUMN TYPE need column mapping or a
+    /// full rewrite (clean error). For ADD COLUMN <paramref name="a1"/> = the new column's name and
+    /// <paramref name="c"/> carries its Arrow type + nullability; for RENAME TABLE <paramref name="a1"/> = the new
+    /// table name.</summary>
     public void AlterTable(int k, string s, string t, string? a1, string? a2, Field? c, int f)
     {
-        if (k != AlterKind.AddColumn)
-            throw Unsupported("ALTER TABLE (only ADD COLUMN is supported on Delta)");
-
-        var col = c ?? throw new System.InvalidOperationException("delta ADD COLUMN requires a column definition.");
-        string name = a1 ?? col.Name;
-        var field = string.Equals(name, col.Name, System.StringComparison.Ordinal)
-            ? col
-            : new Field(name, col.DataType, col.IsNullable);
-        DeltaReader.AddColumn(AmbientOpener.Current, TablePath(s, t), field, default);
+        switch (k)
+        {
+            case AlterKind.AddColumn:
+            {
+                var col = c ?? throw new System.InvalidOperationException(
+                    "delta ADD COLUMN requires a column definition.");
+                string name = a1 ?? col.Name;
+                var field = string.Equals(name, col.Name, System.StringComparison.Ordinal)
+                    ? col
+                    : new Field(name, col.DataType, col.IsNullable);
+                DeltaReader.AddColumn(AmbientOpener.Current, TablePath(s, t), field, default);
+                return;
+            }
+            case AlterKind.RenameTable:
+            {
+                string newName = a1 ?? throw new System.InvalidOperationException(
+                    "delta RENAME TABLE requires a new table name.");
+                // The table folder (incl. _delta_log) is moved; the schema is unchanged (RENAME TABLE renames
+                // within the same schema). OneLake → DFS atomic rename; local/S3 lack a recursive move primitive.
+                if (!FabricLakehouse.IsOneLake(_root))
+                    throw Unsupported("ALTER TABLE RENAME (OneLake only — local/S3 has no recursive move yet)");
+                FabricLakehouse.RenameDirectory(TablePath(s, t), TablePath(s, newName), _fabricCredential);
+                return;
+            }
+            default:
+                throw Unsupported("ALTER TABLE (only ADD COLUMN and RENAME TABLE are supported on Delta)");
+        }
     }
 
     public Schema GetFunctionParamSchema(string s, string f) => throw NoFunctions();

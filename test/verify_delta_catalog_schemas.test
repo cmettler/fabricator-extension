@@ -1,0 +1,103 @@
+# name: test/verify_delta_catalog_schemas.test
+# description: Delta folder-as-catalog with the `schemas true` ATTACH option — a non-OneLake (local/S3) root uses
+#              a two-level <root>/<schema>/<table> layout so DuckDB schemas other than "main" map to subfolders.
+#              CREATE SCHEMA materializes the subfolder; tables of the same name in different schemas don't
+#              collide; discovery + DROP SCHEMA are schema-aware; the layout survives re-attach. Without the
+#              option the catalog stays flat (main-only). Set ARROWNET_DELTA_WRITE_DIR to a WRITABLE base. Local FS.
+# group: [mssql_net]
+
+require mssql_net
+
+require-env ARROWNET_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogschemas' AS lake (TYPE arrownet, PROVIDER 'delta', schemas true);
+
+statement ok
+CREATE SCHEMA lake.staging;
+
+statement ok
+CREATE TABLE lake.staging.t1 AS SELECT 1 AS id, 'a' AS name;
+
+statement ok
+CREATE TABLE lake.main.t2 AS SELECT 2 AS id, 'b' AS name;
+
+# Same table name in two schemas — must NOT collide (distinct subfolders).
+statement ok
+CREATE TABLE lake.staging.dup AS SELECT 100 AS v;
+
+statement ok
+CREATE TABLE lake.main.dup AS SELECT 200 AS v;
+
+query I
+SELECT id FROM lake.staging.t1;
+----
+1
+
+query I
+SELECT id FROM lake.main.t2;
+----
+2
+
+query I
+SELECT v FROM lake.staging.dup;
+----
+100
+
+query I
+SELECT v FROM lake.main.dup;
+----
+200
+
+# Re-attach: the two-level layout is rediscovered with the right schemas (proves on-disk subfolders).
+statement ok
+DETACH lake;
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogschemas' AS lake (TYPE arrownet, PROVIDER 'delta', schemas true);
+
+query I
+SELECT v FROM lake.staging.dup;
+----
+100
+
+query I
+SELECT v FROM lake.main.dup;
+----
+200
+
+# The discovered schemas include both (+ main).
+query T
+SELECT schema_name FROM information_schema.schemata WHERE catalog_name = 'lake' AND schema_name IN ('main','staging') ORDER BY schema_name;
+----
+main
+staging
+
+# RENAME TABLE is unsupported on a local/S3 Delta catalog (no recursive move primitive) — clean error.
+statement error
+ALTER TABLE lake.staging.t1 RENAME TO t1b;
+----
+OneLake only
+
+# DROP SCHEMA on a populated schema removes its whole subfolder (recursive).
+statement ok
+DROP SCHEMA lake.staging CASCADE;
+
+statement ok
+DETACH lake;
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogschemas' AS lake (TYPE arrownet, PROVIDER 'delta', schemas true);
+
+# staging is gone; main.dup survives.
+query I
+SELECT v FROM lake.main.dup;
+----
+200
+
+statement error
+SELECT v FROM lake.staging.dup;
+----
+
+statement ok
+DETACH lake;

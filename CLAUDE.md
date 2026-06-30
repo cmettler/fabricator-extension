@@ -1204,14 +1204,36 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `MakeNullArray`, in `ReadFileAsync` before the rowid append): a column added after a data file was written is
   absent from that file's parquet, so each batch is reconciled to the current schema — present columns by name, the
   missing one as an all-NULL typed array (no-op fast path when the file already has every column). `DeltaReader.AddColumn`
-  → `DeltaCatalog.AlterTable` (only `AlterKind.AddColumn`; `a1`=name, the `Field` carries type+nullability; all other
-  kinds throw a clean "not supported"). C++ `ArrowNetSchemaEntry::Alter` now **`SetActiveOpener` before the alter**
-  (host-FS opener for the Delta metadata write; no-op for SQL) + the existing eager column re-fetch surfaces the new
-  column in-session. NO ABI change (reuses the v2 `alter_table` entry). Standard-compliant by construction (a textbook
-  metaData commit on already-standard data files → delta-kernel/Spark/Fabric backfill old-file NULLs natively).
-  Verified: `test/verify_delta_catalog_alter.test` (81 — old rows NULL, new rows valued, 2nd-column add, predicate on
-  the new column, re-attach durability, RENAME/DROP/TYPE error). **Still unsupported** (clean error): raw exec, DROP
-  SCHEMA, RENAME/DROP COLUMN + ALTER COLUMN TYPE (need column mapping / rewrite). **OneLake table discovery + DROP
+  → `DeltaCatalog.AlterTable`; `a1`=name, the `Field` carries type+nullability. C++ `ArrowNetSchemaEntry::Alter` now
+  **`SetActiveOpener` before the alter** (host-FS opener for the Delta metadata write; no-op for SQL) + the existing
+  eager column re-fetch surfaces the new column in-session. NO ABI change (reuses the v2 `alter_table` entry).
+  Standard-compliant by construction (a textbook metaData commit on already-standard data files →
+  delta-kernel/Spark/Fabric backfill old-file NULLs natively). Verified: `test/verify_delta_catalog_alter.test` (81 —
+  old rows NULL, new rows valued, 2nd-column add, predicate on the new column, re-attach durability,
+  RENAME/DROP/TYPE error). **`RENAME TABLE` DONE (OneLake only)** — the table IS its folder and Delta's `_delta_log`
+  uses table-relative paths, so renaming = moving the whole folder. OneLake uses the DFS endpoint's **atomic native
+  rename** (`FabricLakehouse.RenameDirectory` → `DataLakeDirectoryClient.RenameAsync`; the destination path is
+  filesystem-relative WITHOUT the workspace prefix — OneLake requires the leading segment to be the
+  `<item>.Lakehouse`, else 400 "item type extension is missing"). C++ `Alter`'s RENAME_TABLE branch already updates
+  the entry cache; no ABI change. Validated live on `LH` (create → rename → new name reads → drop). **local/S3 RENAME
+  is unsupported** (no recursive-move primitive in the host FS — clean error), same gap class as a local recursive
+  delete. **Still unsupported** (clean error): raw exec, RENAME/DROP COLUMN + ALTER COLUMN TYPE (need column mapping /
+  rewrite). **DROP SCHEMA** is supported in `schemas` mode (see below), else unsupported.
+  **Multi-schema for local/S3 — the `schemas true` ATTACH option (DONE)**: by default a non-OneLake Delta catalog is
+  FLAT (single `main` schema; the schema component is ignored, so `db.staging.t` and `db.main.t` would both map to
+  `<root>/t` — a silent collision footgun). `ATTACH '…' (TYPE arrownet, PROVIDER 'delta', schemas true)` switches it
+  to the two-level `<root>/<schema>/<table>` layout (the same layout a schema-enabled OneLake lakehouse uses):
+  `DeltaCatalog._schemas` (parsed from the forwarded ATTACH options JSON, like `deletion_vectors`) drives
+  `SchemaLayout` → `TablePath` nests by schema; `DiscoverTablePairs` globs the two-level
+  `<root>/*/*/_delta_log/*.json` (the segment before `_delta_log` = table, the one before that = schema);
+  `SchemaNames` enumerates the discovered schemas + always `main`; `CreateSchema` materializes the
+  `<root>/<schema>/` subfolder (`HostFs.CreateDir`, recursive) so a fresh schema works; `DropSchema` removes it
+  recursively (`HostFs.RemoveDir`; `main` is protected). OneLake ignores the option (its layout is driven by the
+  lakehouse schema-enabled flag). NO ABI change (the option rides the v37 ATTACH-options→JSON forwarding). Verified:
+  `test/verify_delta_catalog_schemas.test` (23 — subfolder layout, same-name tables in two schemas don't collide,
+  re-attach rediscovers schemas, CREATE/DROP SCHEMA, RENAME-unsupported-locally). **Empty created schemas don't
+  survive re-attach** (no `_delta_log` to glob) — a documented limitation. **Gotcha found:** unqualified
+  `staging.t` resolves to DuckDB's DEFAULT (memory) catalog, not the attached one — always use `db.schema.table`. **OneLake table discovery + DROP
   — via the ADLS Gen2 / OneLake DFS endpoint directly** (`FabricLakehouse`, Bridge; `Azure.Storage.Files.DataLake`
   12.21.0): DuckDB's azure glob can't recurse a OneLake `_delta_log` tree (mid-path wildcard → `type must be
   string, but is null`, duckdb-azure PR #174), so a OneLake root (`abfss://<ws>@onelake…/<lh>.Lakehouse/Tables`)

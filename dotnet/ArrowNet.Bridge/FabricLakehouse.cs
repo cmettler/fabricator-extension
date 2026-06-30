@@ -193,6 +193,25 @@ internal static class FabricLakehouse
         dirClient.DeleteIfExistsAsync().GetAwaiter().GetResult(); // directory delete on DFS is recursive
     }
 
+    /// <summary>Renames (moves) the OneLake directory at abfss <paramref name="abfssSrc"/> to
+    /// <paramref name="abfssDest"/> via the DFS endpoint's <b>atomic native rename</b>
+    /// (<see cref="DataLakeDirectoryClient.RenameAsync(string, string, Azure.Storage.Files.DataLake.Models.DataLakeRequestConditions, Azure.Storage.Files.DataLake.Models.DataLakeRequestConditions, CancellationToken)"/>).
+    /// A Delta table's <c>_delta_log</c> uses table-relative paths, so moving the whole folder preserves the
+    /// table. Src and dest are in the same filesystem (workspace). Async API (sync hangs under the CLR — see
+    /// <see cref="ListChildDirectories"/>).</summary>
+    public static void RenameDirectory(string abfssSrc, string abfssDest, TokenCredential? credential)
+    {
+        var cred = credential ?? new DefaultAzureCredential();
+        var (host, fileSystem, srcPath) = ParseAbfss(abfssSrc.Replace('\\', '/').TrimEnd('/'));
+        var (_, _, destPath) = ParseAbfss(abfssDest.Replace('\\', '/').TrimEnd('/'));
+        var dirClient = new DataLakeDirectoryClient(
+            new Uri($"https://{host}/{fileSystem}/{srcPath}"), cred);
+        // destinationPath = the new path WITHIN the same filesystem, WITHOUT the filesystem prefix. OneLake
+        // validates that the leading segment is the item ("<name>.Lakehouse"); prefixing the workspace
+        // (filesystem) makes it the leading segment and OneLake rejects it ("item type extension is missing").
+        dirClient.RenameAsync(destPath).GetAwaiter().GetResult();
+    }
+
     /// <summary>Parses <c>abfss://&lt;filesystem&gt;@&lt;host&gt;/&lt;path&gt;</c> into (host, filesystem, path).
     /// For OneLake the filesystem is the workspace and the path is <c>&lt;lakehouse&gt;.Lakehouse/Tables/…</c>.</summary>
     private static (string Host, string FileSystem, string Path) ParseAbfss(string abfss)

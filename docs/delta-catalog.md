@@ -352,11 +352,19 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      PR #174, returns 0 rows at every OneLake level). The DFS delete uses the same SP `ClientSecretCredential` the
      catalog mints (the data files are still read/written through DuckDB's FileSystem; the DFS endpoint is used for
      listing + delete only). Validated live 2026-06-30 on `LH` (schema-enabled) and `LH_no_schema` (flat) — DROP
-     succeeds and the table directory is confirmed gone via a DFS re-list. **ADD COLUMN — DONE** (the only ALTER kind on Delta): a metadata-only commit
-     (`DeltaTable.AddColumnAsync`) + read-side NULL backfill of old files (`BackfillMissingColumns`); validated
-     local (`verify_delta_catalog_alter.test`, 81) + live on `LH`. RENAME/DROP COLUMN, ALTER COLUMN TYPE, RENAME
-     TABLE stay unsupported (column mapping / rewrite / folder move). **Still unsupported** (throw a clean error):
-     raw exec, DROP SCHEMA.
+     succeeds and the table directory is confirmed gone via a DFS re-list. **ADD COLUMN — DONE**: a metadata-only
+     commit (`DeltaTable.AddColumnAsync`) + read-side NULL backfill of old files (`BackfillMissingColumns`);
+     validated local (`verify_delta_catalog_alter.test`, 81) + live on `LH`. **RENAME TABLE — DONE (OneLake only)**:
+     the table is its folder + Delta logs are table-relative, so rename = move the folder; OneLake uses the DFS
+     atomic native rename (`FabricLakehouse.RenameDirectory` → `DataLakeDirectoryClient.RenameAsync`, destination
+     filesystem-relative without the workspace prefix). local/S3 RENAME is unsupported (no recursive-move
+     primitive). Validated live on `LH`. DROP/RENAME COLUMN + ALTER COLUMN TYPE stay unsupported (column mapping /
+     rewrite). **Multi-schema for local/S3 — `schemas true` ATTACH option (DONE)**: default is a FLAT main-only
+     catalog (schema ignored → `db.staging.t` and `db.main.t` would collide at `<root>/t`); `schemas true` switches
+     to the two-level `<root>/<schema>/<table>` layout (`SchemaLayout` drives `TablePath`/discovery/`CreateSchema`/
+     `DropSchema`; globs `<root>/*/*/_delta_log/*.json`). OneLake ignores it (layout from the lakehouse flag). No
+     ABI change (rides the v37 options-JSON forwarding). `verify_delta_catalog_schemas.test` (23). **Still
+     unsupported** (clean error): raw exec; DROP SCHEMA outside `schemas` mode.
 3. **DELETE — FINAL: copy-on-write + transient `(file,position)` rowid, PLAIN Delta (no features).** The
    detailed design below (row tracking + deletion vectors) is the SUPERSEDED first attempt — kept as the trail.
    Why it changed: Fabric's OneLake converter / Spark could not read our row-tracking + DV commits (first from
