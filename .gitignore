@@ -44,3 +44,6 @@ wheels/
 /dbt_mssql_test/
 fabric-test.local.env
 dax_secret.sql
+
+# Scratch/temporary working files (spikes, ad-hoc SQL, throwaway test dirs).
+/scratchpad/
