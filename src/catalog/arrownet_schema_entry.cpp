@@ -2330,6 +2330,7 @@ void ArrowNetSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info)
 	}
 	auto &context = *transaction.context;
 	ArrowNetSetActiveTxn(handle_, context); // every ALTER below joins this txn's connection
+	arrownet::SetActiveOpener(reinterpret_cast<ArrowNetHandle>(&context)); // host-FS opener for a Delta-catalog ALTER
 	auto &table_info = info.Cast<AlterTableInfo>();
 	const string &table = table_info.name;
 

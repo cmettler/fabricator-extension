@@ -496,7 +496,22 @@ public sealed class DeltaCatalog : IBackendCatalog
 
     public IArrowArrayStream InsertReturning(string s, string t, IArrowArrayStream r) => throw Unsupported("INSERT ... RETURNING");
     public void DropSchema(string s, bool ie) => throw Unsupported("DROP SCHEMA");
-    public void AlterTable(int k, string s, string t, string? a1, string? a2, Field? c, int f) => throw Unsupported("ALTER TABLE");
+    /// <summary>Schema evolution. Only <c>ADD COLUMN</c> is supported on Delta — a metadata-only commit appending
+    /// a nullable column (no file rewrite; old rows read back NULL). RENAME/DROP/TYPE need column mapping or a
+    /// full rewrite (clean error). <paramref name="a1"/> = the new column's name, <paramref name="c"/> carries its
+    /// Arrow type + nullability.</summary>
+    public void AlterTable(int k, string s, string t, string? a1, string? a2, Field? c, int f)
+    {
+        if (k != AlterKind.AddColumn)
+            throw Unsupported("ALTER TABLE (only ADD COLUMN is supported on Delta)");
+
+        var col = c ?? throw new System.InvalidOperationException("delta ADD COLUMN requires a column definition.");
+        string name = a1 ?? col.Name;
+        var field = string.Equals(name, col.Name, System.StringComparison.Ordinal)
+            ? col
+            : new Field(name, col.DataType, col.IsNullable);
+        DeltaReader.AddColumn(AmbientOpener.Current, TablePath(s, t), field, default);
+    }
 
     public Schema GetFunctionParamSchema(string s, string f) => throw NoFunctions();
     public Schema GetFunctionReturnSchema(string s, string f) => throw NoFunctions();

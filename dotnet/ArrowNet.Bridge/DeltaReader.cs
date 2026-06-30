@@ -170,6 +170,27 @@ internal static class DeltaReader
         }
     }
 
+    /// <summary>Schema evolution — appends a nullable <paramref name="column"/> to the Delta table at
+    /// <paramref name="path"/> as a metadata-only commit (no file rewrite); old files' missing values read back
+    /// as NULL (engineered-wood backfills them). Opens with the standard write options (path_in_schema).</summary>
+    public static void AddColumn(nint opener, string path, Field column, CancellationToken ct)
+    {
+        var fs = new DuckDbTableFileSystem(opener, path);
+        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).AsTask().GetAwaiter().GetResult();
+        try
+        {
+            table.AddColumnAsync(column, ct).AsTask().GetAwaiter().GetResult();
+        }
+        catch (DeltaConflictException)
+        {
+            throw ConcurrentModification("ADD COLUMN");
+        }
+        finally
+        {
+            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+    }
+
     /// <summary>Per-file copy-on-write UPDATE: only files containing a target <paramref name="rowIds"/> are
     /// rewritten. <paramref name="rewriteFile"/> (ordinal, the file's batches) returns the same rows with the SET
     /// columns modified on matched positions (the caller owns the typed substitution); engineered-wood re-writes

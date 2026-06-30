@@ -1,0 +1,107 @@
+# name: test/verify_delta_catalog_alter.test
+# description: Delta folder-as-catalog SCHEMA EVOLUTION. Only ALTER TABLE ... ADD COLUMN is supported — a
+#              metadata-only commit appending a nullable column (no file rewrite). Rows written BEFORE the ADD
+#              read back NULL for the new column (engineered-wood backfills the missing column); rows written
+#              AFTER carry the value. RENAME/DROP/ALTER COLUMN TYPE raise a clean "not supported" error. Set
+#              ARROWNET_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
+# group: [mssql_net]
+
+require mssql_net
+
+require-env ARROWNET_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogalter' AS lake (TYPE arrownet, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE lake.main.t (id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO lake.main.t SELECT i, 'a' || i FROM range(1, 4) AS r(i);
+
+# ADD COLUMN — metadata-only; existing rows read back NULL for the new column.
+statement ok
+ALTER TABLE lake.main.t ADD COLUMN score INTEGER;
+
+query ITI
+SELECT id, name, score FROM lake.main.t ORDER BY id;
+----
+1	a1	NULL
+2	a2	NULL
+3	a3	NULL
+
+# A row written AFTER the ADD carries the new column's value; old rows still NULL.
+statement ok
+INSERT INTO lake.main.t VALUES (4, 'a4', 40);
+
+query ITI
+SELECT id, name, score FROM lake.main.t ORDER BY id;
+----
+1	a1	NULL
+2	a2	NULL
+3	a3	NULL
+4	a4	40
+
+# A predicate / projection on the new column works (DuckDB applies it above the scan).
+query IT
+SELECT id, name FROM lake.main.t WHERE score IS NULL ORDER BY id;
+----
+1	a1
+2	a2
+3	a3
+
+query I
+SELECT score FROM lake.main.t WHERE score = 40;
+----
+40
+
+# Add a second column of a different type (VARCHAR) — backfills NULL on all prior rows.
+statement ok
+ALTER TABLE lake.main.t ADD COLUMN tag VARCHAR;
+
+statement ok
+INSERT INTO lake.main.t VALUES (5, 'a5', 50, 'hot');
+
+query ITIT
+SELECT id, name, score, tag FROM lake.main.t ORDER BY id;
+----
+1	a1	NULL	NULL
+2	a2	NULL	NULL
+3	a3	NULL	NULL
+4	a4	40	NULL
+5	a5	50	hot
+
+# Durability: detach + re-attach re-reads the evolved schema.
+statement ok
+DETACH lake;
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogalter' AS lake2 (TYPE arrownet, PROVIDER 'delta');
+
+query ITIT
+SELECT id, name, score, tag FROM lake2.main.t ORDER BY id;
+----
+1	a1	NULL	NULL
+2	a2	NULL	NULL
+3	a3	NULL	NULL
+4	a4	40	NULL
+5	a5	50	hot
+
+# Other ALTER kinds are cleanly unsupported on Delta.
+statement error
+ALTER TABLE lake2.main.t RENAME COLUMN name TO label;
+----
+not supported
+
+statement error
+ALTER TABLE lake2.main.t DROP COLUMN tag;
+----
+not supported
+
+statement error
+ALTER TABLE lake2.main.t ALTER COLUMN score TYPE BIGINT;
+----
+not supported
+
+statement ok
+DETACH lake2;

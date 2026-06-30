@@ -1188,8 +1188,23 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   selection + read + clean write). Unaffected files are untouched. NO C++ change (reuses the DELETE virtual-rowid
   planning + the `ExecuteUpdate` ABI). Verified single-row / multi-row / expression (`amt=amt+1`) updates,
   UPDATE∘DELETE composition, re-attach durability, a delta-kernel `delta_scan` read-back, AND live on Fabric
-  (`arrownet_updtest` on the schema-enabled `LH` lakehouse). `test/verify_delta_catalog_update.test` (63). **Still
-  unsupported** (clean error): raw exec, DROP SCHEMA, ALTER. **OneLake table discovery — via the Fabric REST
+  (`arrownet_updtest` on the schema-enabled `LH` lakehouse). `test/verify_delta_catalog_update.test` (63).
+  **SCHEMA EVOLUTION — `ALTER TABLE … ADD COLUMN` DONE** (the only supported ALTER kind on Delta): a
+  **metadata-only commit** appending a nullable column (NO file rewrite) — engineered-wood `DeltaTable.AddColumnAsync`
+  writes a new `MetadataAction` (current Arrow schema ++ the new field → `SchemaConverter.FromArrowSchema` →
+  `DeltaSchemaSerializer` → `metaData` at version+1; rejects column-mapping tables [no field-id assignment] +
+  non-nullable + duplicate names). The crux is the **read-side NULL backfill** (`DeltaTable.BackfillMissingColumns` +
+  `MakeNullArray`, in `ReadFileAsync` before the rowid append): a column added after a data file was written is
+  absent from that file's parquet, so each batch is reconciled to the current schema — present columns by name, the
+  missing one as an all-NULL typed array (no-op fast path when the file already has every column). `DeltaReader.AddColumn`
+  → `DeltaCatalog.AlterTable` (only `AlterKind.AddColumn`; `a1`=name, the `Field` carries type+nullability; all other
+  kinds throw a clean "not supported"). C++ `ArrowNetSchemaEntry::Alter` now **`SetActiveOpener` before the alter**
+  (host-FS opener for the Delta metadata write; no-op for SQL) + the existing eager column re-fetch surfaces the new
+  column in-session. NO ABI change (reuses the v2 `alter_table` entry). Standard-compliant by construction (a textbook
+  metaData commit on already-standard data files → delta-kernel/Spark/Fabric backfill old-file NULLs natively).
+  Verified: `test/verify_delta_catalog_alter.test` (81 — old rows NULL, new rows valued, 2nd-column add, predicate on
+  the new column, re-attach durability, RENAME/DROP/TYPE error). **Still unsupported** (clean error): raw exec, DROP
+  SCHEMA, RENAME/DROP COLUMN + ALTER COLUMN TYPE (need column mapping / rewrite). **OneLake table discovery — via the Fabric REST
   API** (`FabricLakehouse`, Bridge): DuckDB's azure glob can't recurse a OneLake `_delta_log` tree (mid-path
   wildcard → `type must be string, but is null`, duckdb-azure PR #174), so a OneLake root
   (`abfss://<ws>@onelake…/<lh>.Lakehouse/Tables`) lists its tables via `TablesClient.ListTables`
