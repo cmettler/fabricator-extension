@@ -109,3 +109,34 @@ SELECT id, val FROM lake.main.t AT (VERSION => 2) ORDER BY id;
 
 statement ok
 DETACH lake;
+
+# With the `in_commit_timestamps true` ATTACH option, tables created here enable the Delta inCommitTimestamps
+# WRITER feature (the writer records a per-commit timestamp), so AT (TIMESTAMP => ...) RESOLVES (vs the error
+# above). Validated: delta-rs/delta-kernel (DuckDB's official delta_scan) reads such a table, and OneLake/Fabric
+# accepts it (it's a writer-only feature — readers read normally).
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogtt_ict' AS ict (TYPE arrownet, PROVIDER 'delta', in_commit_timestamps true);
+
+statement ok
+CREATE TABLE ict.main.t (id INTEGER);
+
+statement ok
+INSERT INTO ict.main.t VALUES (1);
+
+statement ok
+INSERT INTO ict.main.t VALUES (2);
+
+# A far-future timestamp resolves to the latest version (the inCommitTimestamp on each commit is honored).
+query I
+SELECT count(*) FROM ict.main.t AT (TIMESTAMP => '2999-01-01 00:00:00');
+----
+2
+
+# VERSION travel still works alongside.
+query I
+SELECT count(*) FROM ict.main.t AT (VERSION => 1);
+----
+1
+
+statement ok
+DETACH ict;

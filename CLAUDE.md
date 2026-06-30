@@ -1278,11 +1278,21 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   (`DeltaReader.StreamWithRowIdsAt` → engineered-wood `ReadAtVersionWithRowIdsAsync`, the version analog of
   `ReadAllWithRowIdsAsync`) — without it, the rowid (BIGINT) collided with the first user column (`INTERNAL
   Error: Vector::Reference … BIGINT referenced INTEGER`) when the same table was scanned at multiple versions in
-  one statement. **`AT (TIMESTAMP => ts)` is NOT supported on plain tables** — engineered-wood's
-  `GetSnapshotAtTimestampAsync` resolves a timestamp via the Delta **in-commit-timestamps** feature (not the
-  commit-file mtime), which we don't enable → a clean "Ensure the table has in-commit timestamps enabled" error;
-  VERSION is the supported form. NO ABI/C++ change. Verified: `test/verify_delta_catalog_time_travel.test` (40 —
-  version 0/1/2/3, filter pushdown, multi-version count/JOIN/UNION, re-attach durability, timestamp error).
+  one statement. **`AT (TIMESTAMP => ts)`: opt-in via `in_commit_timestamps true`.** engineered-wood's
+  `GetSnapshotAtTimestampAsync` resolves a timestamp via the Delta **in-commit-timestamps** feature (NOT the
+  commit-file mtime — mtime is mutable/non-monotonic on object stores, the very problem inCommitTimestamps
+  solves). On a plain table (default) it has no timestamp to read → a clean "Ensure the table has in-commit
+  timestamps enabled" error; **VERSION travel always works**. The **`in_commit_timestamps true` ATTACH option**
+  (mirrors `deletion_vectors`; `DeltaCatalog._inCommitTimestampsOnCreate` → `delta.enableInCommitTimestamps=true`
+  in the create config; engineered-wood `CreateAsync` declares the `inCommitTimestamp` **writer** feature
+  [writer v7, NOT a reader feature — readers read normally] + `EnsureCommitInfo` writes the per-commit timestamp)
+  makes TIMESTAMP travel resolve. Enabled at creation (v0), so no
+  `inCommitTimestampEnablementVersion/Timestamp` props needed. **Validated both readers:** delta-rs/delta-kernel
+  (DuckDB's official `delta_scan`) reads an ICT table, AND live OneLake (`LH_no_schema`) write + read-back +
+  `AT (TIMESTAMP => future)` resolve — the writer-only feature is Fabric-reader-safe (unlike DV/row-tracking).
+  NO ABI/C++ change. Verified: `test/verify_delta_catalog_time_travel.test` (47 — version 0/1/2/3, filter
+  pushdown, multi-version count/JOIN/UNION, re-attach durability, plain-table timestamp error, and
+  `in_commit_timestamps` timestamp travel).
   **Snapshots/history function (DuckLake-style `snapshots()`) — NOT built** (feasible via engineered-wood
   `TransactionLog.ListVersionsAsync` + `ReadCommitAsync` → `CommitInfo.Values`; would be a global
   `arrownet_delta_snapshots(path)` table fn). **Per-row commit version as a virtual column (DuckLake

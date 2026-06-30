@@ -71,6 +71,10 @@ public sealed class DeltaCatalog : IBackendCatalog
     // DELETEs use deletion vectors). DELETE on ANY table still follows that table's own delta.enableDeletionVectors
     // config, so external DV tables are honored regardless of this flag.
     private readonly bool _deletionVectorsOnCreate;
+    // ATTACH option `in_commit_timestamps true`: tables CREATED in this catalog enable the Delta
+    // delta.enableInCommitTimestamps WRITER feature, so AT (TIMESTAMP => ts) time travel can resolve a timestamp
+    // to a version (engineered-wood reads inCommitTimestamp, not commit-file mtime). VERSION travel works without it.
+    private readonly bool _inCommitTimestampsOnCreate;
     // ATTACH option `schemas true`: a NON-OneLake root (local/S3/plain-ADLS) uses a two-level
     // <root>/<schema>/<table> layout so DuckDB schemas other than "main" map to subfolders (discovery, CREATE,
     // DROP all schema-aware). Default false = the flat <root>/<table>, "main"-only layout. Ignored for OneLake
@@ -85,6 +89,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         _root = Normalize(clean).TrimEnd('/');
         _fabricCredential = credential;
         _deletionVectorsOnCreate = ParseBoolOption(optionsJson, "deletion_vectors");
+        _inCommitTimestampsOnCreate = ParseBoolOption(optionsJson, "in_commit_timestamps");
         _schemas = ParseBoolOption(optionsJson, "schemas");
     }
 
@@ -350,7 +355,8 @@ public sealed class DeltaCatalog : IBackendCatalog
         var (schema, batches, rows) = DeltaWriter.Materialize(data, default);
         var mode = createTable || replace ? DeltaWriteMode.Overwrite : DeltaWriteMode.Append;
         DeltaWriter.Write(opener, TablePath(schemaName, tableName), schema, batches, mode, default,
-                          deletionVectors: _deletionVectorsOnCreate);
+                          deletionVectors: _deletionVectorsOnCreate,
+                          inCommitTimestamps: _inCommitTimestampsOnCreate);
         return rows;
     }
 
@@ -359,7 +365,8 @@ public sealed class DeltaCatalog : IBackendCatalog
     public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists,
                             string? primaryKey, string? uniques, string? defaults)
         => DeltaWriter.Create(AmbientOpener.Current, TablePath(schemaName, tableName), columns, default,
-                              deletionVectors: _deletionVectorsOnCreate);
+                              deletionVectors: _deletionVectorsOnCreate,
+                              inCommitTimestamps: _inCommitTimestampsOnCreate);
 
     /// <summary>CREATE SCHEMA. In <c>schemas</c> mode (non-OneLake) it materializes the <c>&lt;root&gt;/&lt;schema&gt;/</c>
     /// subfolder so a subsequent CREATE TABLE lands there (and the schema is rediscovered once it holds a table).

@@ -370,9 +370,12 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      plumbing already existed for the SQL backend). `DeltaCatalog.ScanTable` honors `spec.At` →
      `DeltaReader.StreamAt`/`GetSchemaAt` (engineered-wood `ReadAtVersionAsync`), advertising the schema as of
      that version, with filter pushdown. DuckDB's `count(*)`-via-rowid on a time-travel scan routes to a
-     version-aware rowid stream (`ReadAtVersionWithRowIdsAsync`). `AT (TIMESTAMP => ts)` needs the Delta
-     in-commit-timestamps feature (engineered-wood resolves timestamps via inCommitTimestamp, not commit-file
-     mtime) → clean error; VERSION is the supported form. `verify_delta_catalog_time_travel.test` (40).
+     version-aware rowid stream (`ReadAtVersionWithRowIdsAsync`). `AT (TIMESTAMP => ts)` is **opt-in via the
+     `in_commit_timestamps true` ATTACH option** — engineered-wood resolves timestamps via the Delta
+     inCommitTimestamps writer feature (not commit-file mtime, which is unreliable on object stores), so tables
+     created with the option carry a per-commit timestamp and TIMESTAMP travel resolves; plain tables give a
+     clean error and VERSION travel always works. It's a writer-only feature (reader-safe) — validated that
+     delta-rs/delta-kernel (`delta_scan`) AND live OneLake/Fabric read such a table. `verify_delta_catalog_time_travel.test` (47).
      **Not built:** a `snapshots()`/history function (feasible via `TransactionLog.ListVersionsAsync` +
      `ReadCommitAsync`) and a per-row commit-version virtual column (needs Delta row tracking).
 3. **DELETE — FINAL: copy-on-write + transient `(file,position)` rowid, PLAIN Delta (no features).** The

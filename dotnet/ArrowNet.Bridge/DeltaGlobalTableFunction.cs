@@ -232,11 +232,28 @@ internal static class DeltaWriter
     // rewriting the file). Row tracking is enabled alongside (per the chosen design); both are declared in the
     // protocol by CreateAsync (reader v3 + deletionVectors/rowTracking/domainMetadata). A table created with
     // this config is recognized by DeltaReader.IsDeletionVectorsEnabled so DELETE picks the DV path.
-    private static readonly Dictionary<string, string> DeletionVectorConfig = new()
+    /// <summary>Builds the create-time table config for the opt-in features, or null when none are enabled.
+    /// <paramref name="deletionVectors"/> => DV + row-tracking fast-delete; <paramref name="inCommitTimestamps"/>
+    /// => <c>delta.enableInCommitTimestamps</c> (a WRITER-only feature) so AT (TIMESTAMP =&gt; ...) time travel
+    /// can resolve a timestamp to a version.</summary>
+    private static Dictionary<string, string>? CreateConfig(bool deletionVectors, bool inCommitTimestamps)
     {
-        ["delta.enableDeletionVectors"] = "true",
-        ["delta.enableRowTracking"] = "true",
-    };
+        if (!deletionVectors && !inCommitTimestamps)
+        {
+            return null;
+        }
+        var config = new Dictionary<string, string>(System.StringComparer.Ordinal);
+        if (deletionVectors)
+        {
+            config["delta.enableDeletionVectors"] = "true";
+            config["delta.enableRowTracking"] = "true";
+        }
+        if (inCommitTimestamps)
+        {
+            config["delta.enableInCommitTimestamps"] = "true";
+        }
+        return config;
+    }
 
     // Optimistic-concurrency retry bound for commits. A concurrent writer that commits our target version
     // first makes engineered-wood throw DeltaConflictException; we reopen (picking up the new latest version)
@@ -250,13 +267,14 @@ internal static class DeltaWriter
     /// <paramref name="deletionVectors"/> enables the DV+rowTracking features on a NEW table (opt-in fast-delete).
     /// Retries on a commit conflict (concurrent writer) by reopening at the new latest version (OCC).</summary>
     public static long Write(nint opener, string path, Schema schema, IReadOnlyList<RecordBatch> batches,
-                             DeltaWriteMode mode, CancellationToken ct, bool deletionVectors = false)
+                             DeltaWriteMode mode, CancellationToken ct, bool deletionVectors = false,
+                             bool inCommitTimestamps = false)
     {
         for (int attempt = 1; ; attempt++)
         {
             var fs = new DuckDbTableFileSystem(opener, path);
             var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(),
-                                                     configuration: deletionVectors ? DeletionVectorConfig : null,
+                                                     configuration: CreateConfig(deletionVectors, inCommitTimestamps),
                                                      cancellationToken: ct).AsTask().GetAwaiter().GetResult();
             try
             {
@@ -280,7 +298,7 @@ internal static class DeltaWriter
     /// <summary>Creates an empty Delta table (commit 0 with the schema, no data) at <paramref name="path"/>.
     /// <paramref name="deletionVectors"/> enables the DV+rowTracking features (opt-in fast-delete).</summary>
     public static void Create(nint opener, string path, Schema schema, CancellationToken ct,
-                              bool deletionVectors = false)
+                              bool deletionVectors = false, bool inCommitTimestamps = false)
     {
         for (int attempt = 1; ; attempt++)
         {
@@ -289,7 +307,7 @@ internal static class DeltaWriter
             {
                 // OpenOrCreate writes commit-0 for a new table (or opens an existing one — no commit, no conflict).
                 var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(),
-                                                         configuration: deletionVectors ? DeletionVectorConfig : null,
+                                                         configuration: CreateConfig(deletionVectors, inCommitTimestamps),
                                                          cancellationToken: ct).AsTask().GetAwaiter().GetResult();
                 table.DisposeAsync().AsTask().GetAwaiter().GetResult();
                 return;
