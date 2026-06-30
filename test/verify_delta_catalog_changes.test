@@ -114,6 +114,54 @@ SELECT count(*) FROM arrownet_delta_changes('lake', 't', 0, 99);
 statement ok
 DETACH lake;
 
+# CDF + deletion vectors: a rowTracking table's data files carry the physical __delta_row_id, which the inferred
+# insert path (blind append, no cdc file) must strip so every change batch shares the user-column schema (a 6-vs-5
+# mismatch otherwise SIGSEGVs the Arrow C-stream boundary). DELETE is a DV commit; UPDATE is copy-on-write.
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogcdfdv' AS dv (TYPE arrownet, PROVIDER 'delta', change_data_feed true, deletion_vectors true);
+
+statement ok
+CREATE TABLE dv.main.t (id INTEGER, val VARCHAR);
+
+statement ok
+INSERT INTO dv.main.t VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d');
+
+statement ok
+DELETE FROM dv.main.t WHERE id=2;
+
+statement ok
+UPDATE dv.main.t SET val='C' WHERE id=3;
+
+# Final state.
+query IT
+SELECT * FROM dv.main.t ORDER BY id;
+----
+1	a
+3	C
+4	d
+
+# Full feed: 4 inserts (v1), 1 delete (v2), update pre+post (v3) — the inferred inserts carry no row-id column.
+query TI
+SELECT _change_type, count(*) FROM arrownet_delta_changes('dv', 'main.t', 0, 99)
+GROUP BY _change_type ORDER BY _change_type;
+----
+delete	1
+insert	4
+update_postimage	1
+update_preimage	1
+
+# The inferred inserts are exactly the four original rows (no extra rowid column leaking through).
+query IT
+SELECT id, val FROM arrownet_delta_changes('dv', 'main.t', 0, 99) WHERE _change_type='insert' ORDER BY id;
+----
+1	a
+2	b
+3	c
+4	d
+
+statement ok
+DETACH dv;
+
 # A table created WITHOUT change_data_feed has no change feed (CDF not enabled).
 statement ok
 ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogcdf_off' AS plain (TYPE arrownet, PROVIDER 'delta');
