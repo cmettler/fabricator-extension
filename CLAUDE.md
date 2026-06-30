@@ -1083,22 +1083,14 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `ArrowNetHostServices` (the reverse host→managed struct, not the vtable): deletes a directory RECURSIVELY via
   DuckDB's `FileSystem::RemoveDirectory` (idempotent — no error if absent). Powers **Delta catalog DROP TABLE**
   (`DeltaCatalog.DropTable` → `HostFs.RemoveDir` removes the table's whole `<root>/<table>/` folder; opener
-  threaded by `DropEntry`'s `ArrowNetSetActiveTxn`). `test/verify_delta_catalog_write.test` (31).
-  **LIMITATION — DROP TABLE works on local/S3 but FAILS on OneLake/Azure-DFS** (validated live 2026-06-30):
-  `fs_remove_dir` → `FileSystem::RemoveDirectory` throws `AzureDfsStorageFileSystem: RemoveDirectory is not
-  implemented!` (duckdb-azure has no recursive-delete on the DFS endpoint). **There is no host-FS workaround:**
-  the obvious fallback — glob the table's files + `fs_remove` each — is blocked by the SAME duckdb-azure
-  mid-path-wildcard glob bug (`type must be string, but is null`, PR #174) that already forced Fabric-REST table
-  discovery (`FabricLakehouse`); azure `glob()` returns 0 rows at every OneLake level, so the file list can't be
-  enumerated through DuckDB's FileSystem at all. **Note neither discovery mechanism provides a delete:** the
-  schema-enabled path uses the **SQL analytics endpoint** (`INFORMATION_SCHEMA` — read-only metadata), and the
-  Fabric `TablesClient.ListTables` REST API **400s on schema-enabled lakehouses** (used only for flat ones), so
-  "delete via the Fabric REST API like discovery" is a dead end. A real fix needs either an upstream duckdb-azure
-  `RemoveDirectory`/glob fix, OR a **direct ADLS Gen2 / OneLake DFS recursive delete** that bypasses duckdb-azure
-  — `Azure.Storage.Files.DataLake` `DataLakeDirectoryClient.DeleteRecursiveAsync` (or the raw DFS REST
-  `DELETE <path>?recursive=true`) authenticated with the same SP `ClientSecretCredential` the catalog already
-  mints. Until then DROP TABLE on a OneLake catalog raises the azure error (the `_delta_log` + data files are
-  left in place); local/S3 DROP TABLE is unaffected. v48 =
+  threaded by `DropEntry`'s `ArrowNetSetActiveTxn`). `test/verify_delta_catalog_write.test` (31). **OneLake DROP
+  goes a different route** (`fs_remove_dir` → `FileSystem::RemoveDirectory` throws `AzureDfsStorageFileSystem:
+  RemoveDirectory is not implemented!` — duckdb-azure has no recursive-delete on the DFS endpoint): `DropTable`
+  branches on `FabricLakehouse.IsOneLake(root)` → a **direct ADLS Gen2 / OneLake DFS recursive delete**
+  (`FabricLakehouse.DeleteDirectory` → `DataLakeDirectoryClient.DeleteIfExistsAsync`, idempotent) using the SP
+  `ClientSecretCredential` the catalog mints — bypassing duckdb-azure entirely; local/S3 keep `fs_remove_dir`.
+  Validated live 2026-06-30 on both `LH` (schema-enabled) and `LH_no_schema` (flat). See the OneLake-discovery
+  paragraph below — discovery + DROP now share the DFS endpoint. v48 =
   **host-FS WRITE surface** — the Delta write-back foundation: appended five
   WRITE callbacks to `ArrowNetHostServices` (the reverse host→managed struct, not the vtable) —
   `fs_open_write(opener,path,exclusive,…)` / `fs_write` / `fs_close_write` / `fs_remove` / `fs_create_dir` — plus
@@ -1219,37 +1211,41 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   metaData commit on already-standard data files → delta-kernel/Spark/Fabric backfill old-file NULLs natively).
   Verified: `test/verify_delta_catalog_alter.test` (81 — old rows NULL, new rows valued, 2nd-column add, predicate on
   the new column, re-attach durability, RENAME/DROP/TYPE error). **Still unsupported** (clean error): raw exec, DROP
-  SCHEMA, RENAME/DROP COLUMN + ALTER COLUMN TYPE (need column mapping / rewrite). **OneLake table discovery — via the Fabric REST
-  API** (`FabricLakehouse`, Bridge): DuckDB's azure glob can't recurse a OneLake `_delta_log` tree (mid-path
-  wildcard → `type must be string, but is null`, duckdb-azure PR #174), so a OneLake root
-  (`abfss://<ws>@onelake…/<lh>.Lakehouse/Tables`) lists its tables via `TablesClient.ListTables`
-  (`Microsoft.Fabric.Api` 2.14.0) instead of `HostFs.Glob`; **local/S3/plain-ADLS roots keep the glob**
-  (`DeltaCatalog.DiscoverTables` branches on `FabricLakehouse.IsOneLake`). Workspace/lakehouse are GUIDs (used
-  directly) or display names (resolved via `WorkspacesClient`/`ItemsClient`). Auth = the **ATTACH'd azure SP
-  secret** (`ATTACH '…OneLake…' (TYPE arrownet, PROVIDER 'delta', SECRET <azure_sp>)` → v39 foreign-secret path →
-  `DeltaBackend.BuildConnectionString` appends a cred marker on the root → `DeltaCatalog` mints a
-  `ClientSecretCredential`, mirroring DAX); the data files are still read/written through DuckDB's FileSystem (the
-  opener + a DuckDB azure secret) — the Fabric API is used ONLY to list table names. **Live Fabric tests use the
-  gitignored `dax_secret.sql`** at the repo root (`CREATE OR REPLACE SECRET fabric_sp (TYPE azure, PROVIDER
-  service_principal, TENANT_ID/CLIENT_ID/CLIENT_SECRET …)` — the Fabric-Warehouse SP; ATTACH `… (PROVIDER 'delta',
-  SECRET fabric_sp, READ_ONLY false)`; one secret serves DuckDB OneLake IO + the Fabric REST API + the SQL
-  endpoint). **Schema-enabled lakehouse support — DONE + VALIDATED LIVE (2026-06-29) on workspace `Test`/lakehouse
-  `LH`.** The validated lakehouse is SCHEMA-ENABLED (tables at `Tables/<schema>/<table>`), which neither the Fabric
-  `ListTables` API (2.14.0 → 400 `UnsupportedOperationForSchemasEnabledLakehouse`) nor DuckDB's azure `glob()`
-  (0 rows at every OneLake level) can enumerate. So discovery branches: `FabricLakehouse.Resolve` calls
-  `GetLakehouse` → if `DefaultSchema` is set (schema-enabled) it lists `(schema, table)` via the lakehouse's **SQL
-  analytics endpoint** (`SqlEndpointProperties.ConnectionString` + INFORMATION_SCHEMA, an Entra SQL token from the
-  same SP — `Microsoft.Data.SqlClient` in the Bridge); else the non-schema `TablesClient.ListTables` (flat `main`).
-  `DeltaCatalog` is now **multi-schema**: `GetMetadata(Schemas)` returns the lakehouse schemas (+ always the
-  `DefaultSchema`), and `TablePath` is schema-aware (`<root>/<schema>/<table>` when schema-enabled, else flat
-  `<root>/<table>` for local/S3/non-schema). **Validated live end-to-end:** `ATTACH 'abfss://Test@onelake…/LH.Lakehouse/Tables'
-  (TYPE arrownet, PROVIDER 'delta', SECRET fabric_sp, READ_ONLY false)` → CTAS into `lake.dbo.arrownet_deltest`
-  (3 rows, writer-v7 rowTracking) → `DELETE WHERE id=2` (deletion-vector commit) → `SELECT` returns 1,a/3,c.
-  **`READ_ONLY false` is REQUIRED** for OneLake writes: DuckDB force-bumps any remote (`abfss://`) ATTACH to
-  read-only when the access mode is AUTOMATIC (`database_manager.cpp:105`); Delta supports remote writes, so set
-  it explicitly. **Caveat:** `duckdb_tables()` over a OneLake catalog is slow (materializes every table's columns
-  = N OneLake reads) — use targeted `lake.<schema>.<t>` access. **Sync lag:** the SQL endpoint may not list a
-  just-created table immediately, but same-session ops use the C++ entry cache so CREATE→INSERT→DELETE works.
+  SCHEMA, RENAME/DROP COLUMN + ALTER COLUMN TYPE (need column mapping / rewrite). **OneLake table discovery + DROP
+  — via the ADLS Gen2 / OneLake DFS endpoint directly** (`FabricLakehouse`, Bridge; `Azure.Storage.Files.DataLake`
+  12.21.0): DuckDB's azure glob can't recurse a OneLake `_delta_log` tree (mid-path wildcard → `type must be
+  string, but is null`, duckdb-azure PR #174), so a OneLake root (`abfss://<ws>@onelake…/<lh>.Lakehouse/Tables`)
+  lists its tables via the **Azure SDK `DataLakeFileSystemClient.GetPaths`** (NOT DuckDB's azure ext, NOT the
+  Fabric `ListTables` REST API, NOT the SQL endpoint) — flat lakehouse → table dirs under `Tables/` (schema
+  `main`), schema-enabled → schema dirs under `Tables/` then table dirs under each (`Tables/<schema>/<table>`);
+  **local/S3/plain-ADLS roots keep the host-FS glob** (`DeltaCatalog.DiscoverTables` branches on
+  `FabricLakehouse.IsOneLake`). This is immune to the glob bug AND the `ListTables` 400 on schema-enabled
+  lakehouses, AND free of the SQL-endpoint sync lag (DFS reflects committed files immediately). **The Fabric REST
+  API is kept ONLY for the schema-enabled flag** (`GetLakehouse.DefaultSchema` — authoritative even for an empty
+  lakehouse, where the DFS structure alone is ambiguous) **+ workspace/lakehouse name→GUID resolution**
+  (`WorkspacesClient`/`ItemsClient`; GUIDs in the path skip it). **CRITICAL — use the ASYNC DataLake APIs**
+  (`GetPathsAsync`/`DeleteIfExistsAsync` + `GetAwaiter().GetResult()` at the boundary): the SYNC `GetPaths` uses
+  `HttpClient.Send`, whose sync transport HANGS under the hostfxr-hosted CLR (a single discovery never returns —
+  isolated to the sync path; the same call is ~1s in a normal console host) — same reason every other Bridge IO
+  path is async. Auth = the **ATTACH'd azure SP secret** (`ATTACH '…OneLake…' (TYPE arrownet, PROVIDER 'delta',
+  SECRET <azure_sp>)` → v39 foreign-secret path → `DeltaBackend.BuildConnectionString` appends a cred marker on
+  the root → `DeltaCatalog` mints a `ClientSecretCredential`, mirroring DAX); the data files are still
+  read/written through DuckDB's FileSystem (the opener + a DuckDB azure secret) — the DFS endpoint is used for
+  table LISTING + DROP only. **Live Fabric tests use the gitignored `dax_secret.sql`** at the repo root (`CREATE
+  OR REPLACE SECRET fabric_sp (TYPE azure, PROVIDER service_principal, TENANT_ID/CLIENT_ID/CLIENT_SECRET …)` — the
+  Fabric-Warehouse SP; ATTACH `… (PROVIDER 'delta', SECRET fabric_sp, READ_ONLY false)`; one secret serves DuckDB
+  OneLake IO + the Fabric REST API + the DFS endpoint). **Schema-enabled AND flat lakehouse support — DONE +
+  VALIDATED LIVE (2026-06-30) on workspace `Test`, lakehouses `LH` (schema-enabled, tables at
+  `Tables/<schema>/<table>`) and `LH_no_schema` (flat, `Tables/<table>`).** `DeltaCatalog` is **multi-schema**:
+  `GetMetadata(Schemas)` returns the lakehouse schemas (+ always the `DefaultSchema`), and `TablePath` is
+  schema-aware (`<root>/<schema>/<table>` when schema-enabled, else flat `<root>/<table>`). **Validated live
+  end-to-end:** on both lakehouses, DFS discovery + CTAS + scan + DROP (DFS recursive delete, confirmed the table
+  dir is gone); plus on `LH` CTAS into `lake.dbo.arrownet_deltest` → `DELETE WHERE id=2` (deletion-vector commit)
+  → `SELECT` returns 1,a/3,c. **`READ_ONLY false` is REQUIRED** for OneLake writes: DuckDB force-bumps any remote
+  (`abfss://`) ATTACH to read-only when the access mode is AUTOMATIC (`database_manager.cpp:105`); Delta supports
+  remote writes, so set it explicitly. **Caveat:** `SHOW TABLES` / `duckdb_tables()` over a OneLake catalog is
+  slow (it materializes every table's COLUMNS = N OneLake `_delta_log` reads — DFS table LISTING itself is fast,
+  ~1–7s; it's the per-table column fetch that's slow) — use targeted `lake.<schema>.<t>` access.
   **Fabric-compat history (2026-06-29, SUPERSEDED — kept as the trail):** the first DELETE used row tracking +
   deletion vectors. Two protocol bugs surfaced first (rowTracking missing its `domainMetadata` dependency →
   `DELTA_FEATURES_PROTOCOL_METADATA_MISMATCH`; DVs written without the `deletionVectors` reader-v3 feature →

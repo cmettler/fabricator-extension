@@ -173,9 +173,9 @@ public sealed class DeltaCatalog : IBackendCatalog
         var ol = OneLake();
         if (ol is not null)
         {
-            // OneLake: DuckDB's azure glob can't recurse a _delta_log tree (PR #174). A non-schema lakehouse
-            // lists via the Fabric ListTables API (schema "main"); a schema-enabled one via its SQL endpoint
-            // (Tables/<schema>/<table>). Resolved in OneLake().
+            // OneLake: DuckDB's azure glob can't recurse a _delta_log tree (PR #174), so tables are listed via the
+            // OneLake DFS endpoint directly (GetPaths) — flat (Tables/<table>, schema "main") or schema-enabled
+            // (Tables/<schema>/<table>); the schema-enabled flag is from the Fabric API. Resolved in OneLake().
             foreach (var (s, t) in ol.Tables)
             {
                 pairs.Add((s, t));
@@ -302,10 +302,17 @@ public sealed class DeltaCatalog : IBackendCatalog
         new($"delta provider: {what} not supported yet.");
 
     /// <summary>DROP TABLE = recursively delete the table's <c>&lt;root&gt;/&lt;table&gt;/</c> folder (its _delta_log
-    /// + all data files) via the host's recursive directory-delete callback. Idempotent (no error if missing);
-    /// <paramref name="ifExists"/> is therefore satisfied either way.</summary>
+    /// + all data files). OneLake goes through the <b>DFS endpoint directly</b>
+    /// (<see cref="FabricLakehouse.DeleteDirectory"/>) — DuckDB's azure FileSystem has no RemoveDirectory; local/S3
+    /// use the host's recursive directory-delete callback. Idempotent (no error if missing), so
+    /// <paramref name="ifExists"/> is satisfied either way.</summary>
     public void DropTable(string schemaName, string tableName, bool ifExists)
     {
+        if (FabricLakehouse.IsOneLake(_root))
+        {
+            FabricLakehouse.DeleteDirectory(TablePath(schemaName, tableName), _fabricCredential);
+            return;
+        }
         if (!HostFs.CanRemoveDir)
         {
             throw Unsupported("DROP TABLE (host does not provide a recursive directory-delete callback)");

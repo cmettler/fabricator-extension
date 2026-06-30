@@ -27,9 +27,15 @@
          ATTACH'd azure SP secret (ClientSecretCredential, Azure.Identity). -->
     <PackageReference Include="Microsoft.Fabric.Api" Version="2.14.0" />
     <PackageReference Include="Azure.Identity" Version="1.13.2" />
-    <!-- A schema-enabled OneLake lakehouse can't be enumerated by the Fabric ListTables API (400) nor by glob;
-         its tables (Tables/<schema>/<table>) are discovered via the lakehouse SQL analytics endpoint's
-         INFORMATION_SCHEMA (SqlConnection + an Entra token from the same SP). Same version as ArrowNet.SqlServer. -->
+    <!-- OneLake table discovery + DROP go through the ADLS Gen2 / OneLake DFS endpoint directly (the Azure SDK,
+         NOT DuckDB's azure extension): GetPaths enumerates Tables/<table> (flat) or Tables/<schema>/<table>
+         (schema-enabled) — immune to the duckdb-azure mid-path glob bug (PR #174) and the Fabric ListTables 400
+         on schema-enabled lakehouses, and free of SQL-endpoint sync lag — and DeleteDirectory(recursive) powers
+         DROP TABLE (DuckDB's azure FileSystem has no RemoveDirectory). The Fabric API is kept only for the
+         schema-enabled flag (GetLakehouse.DefaultSchema) + name->GUID resolution. Same SP credential throughout. -->
+    <PackageReference Include="Azure.Storage.Files.DataLake" Version="12.21.0" />
+    <!-- Microsoft.Data.SqlClient: the SQL Server backend (ArrowNet.SqlServer) + the DAX SQL-endpoint path. The
+         Delta provider no longer uses it (OneLake discovery moved to the DFS endpoint above). -->
     <PackageReference Include="Microsoft.Data.SqlClient" Version="6.0.2" />
   </ItemGroup>
 

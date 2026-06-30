@@ -5,6 +5,7 @@ using System.Text;
 using System.Text.Json;
 using Azure.Core;
 using Azure.Identity;
+using Azure.Storage.Files.DataLake;
 using Microsoft.Fabric.Api.Core;
 using Microsoft.Fabric.Api.Lakehouse;
 
@@ -13,12 +14,18 @@ namespace ArrowNet.Bridge;
 /// <summary>
 /// OneLake (Microsoft Fabric) lakehouse support for the Delta folder-as-catalog provider. DuckDB's azure
 /// extension cannot enumerate a OneLake <c>_delta_log</c> tree with a mid-path wildcard glob (the
-/// <c>type must be string, but is null</c> bug, duckdb-azure PR #174), so OneLake roots discover their tables
-/// via the <b>Fabric REST API</b> (<see cref="TablesClient.ListTables"/>) instead of <see cref="HostFs.Glob"/>.
-/// Local / S3 / plain ADLS roots keep the glob (see <c>DeltaCatalog.DiscoverTables</c>). The data files are
-/// still read/written through DuckDB's FileSystem (the opener + a DuckDB azure secret); the Fabric API is used
-/// ONLY to list table names. Auth = the azure service-principal secret passed to the ATTACH (carried to the
-/// catalog as a credential marker on the connection string, mirroring the DAX provider).
+/// <c>type must be string, but is null</c> bug, duckdb-azure PR #174), so OneLake roots discover their tables —
+/// and DROP them — through the <b>ADLS Gen2 / OneLake DFS endpoint directly</b> (the Azure SDK
+/// <see cref="DataLakeFileSystemClient"/>, NOT DuckDB's azure extension): <c>GetPaths</c> lists
+/// <c>Tables/&lt;table&gt;</c> (flat) or <c>Tables/&lt;schema&gt;/&lt;table&gt;</c> (schema-enabled), and
+/// <see cref="DeleteDirectory"/> recursively deletes a table folder (DuckDB's azure FileSystem has no
+/// <c>RemoveDirectory</c>). This is immune to the glob bug AND the Fabric <c>ListTables</c> 400 on
+/// schema-enabled lakehouses, and free of the SQL-endpoint sync lag. The <b>Fabric REST API</b> is kept only for
+/// the schema-enabled flag (<c>GetLakehouse.DefaultSchema</c>) + workspace/lakehouse name→GUID resolution.
+/// Local / S3 / plain ADLS roots keep the host-FS glob (see <c>DeltaCatalog.DiscoverTables</c>). Table data is
+/// still read/written through DuckDB's FileSystem (the opener + a DuckDB azure secret). Auth = the azure
+/// service-principal secret passed to the ATTACH (carried to the catalog as a credential marker on the
+/// connection string, mirroring the DAX provider) — the SAME credential serves the Fabric API + the DFS endpoint.
 /// </summary>
 internal static class FabricLakehouse
 {
@@ -90,12 +97,12 @@ internal static class FabricLakehouse
         public string? DefaultSchema { get; init; }
     }
 
-    /// <summary>Resolves the OneLake lakehouse at <paramref name="root"/> and discovers its tables. A
-    /// <b>schema-enabled</b> lakehouse (Fabric `GetLakehouse.DefaultSchema` set) is enumerated via its SQL
-    /// analytics endpoint's INFORMATION_SCHEMA (the Fabric ListTables API returns 400 for it, and OneLake glob
-    /// returns nothing) → tables at <c>Tables/&lt;schema&gt;/&lt;table&gt;</c>; a <b>non-schema</b> lakehouse uses
-    /// the Fabric `TablesClient.ListTables` API → flat <c>Tables/&lt;table&gt;</c> under DuckDB schema "main".
-    /// <paramref name="credential"/> authenticates both the Fabric API and (token) the SQL endpoint.</summary>
+    /// <summary>Resolves the OneLake lakehouse at <paramref name="root"/> and discovers its tables via the DFS
+    /// endpoint. The <b>schema-enabled</b> flag comes from Fabric `GetLakehouse.DefaultSchema`; the table list
+    /// comes from <c>GetPaths</c> on the OneLake DFS endpoint — schema-enabled → list schema dirs under
+    /// <c>Tables/</c> then table dirs under each (<c>Tables/&lt;schema&gt;/&lt;table&gt;</c>), flat → table dirs
+    /// under <c>Tables/</c> (<c>Tables/&lt;table&gt;</c>) under DuckDB schema "main". <paramref name="credential"/>
+    /// authenticates both the Fabric API and the DFS endpoint.</summary>
     public static OneLakeInfo Resolve(string root, TokenCredential? credential)
     {
         var cred = credential ?? new DefaultAzureCredential();
@@ -103,36 +110,33 @@ internal static class FabricLakehouse
         Guid workspaceId = ResolveWorkspaceId(workspaceSeg, cred);
         Guid lakehouseId = ResolveLakehouseId(workspaceId, lakehouseSeg, cred);
 
+        // The schema-enabled flag is authoritative from the lakehouse definition (handles an EMPTY lakehouse,
+        // where the DFS structure alone is ambiguous). Table enumeration is then pure-DFS.
         var lakehouse = new Microsoft.Fabric.Api.Lakehouse.ItemsClient(cred)
                             .GetLakehouse(workspaceId, lakehouseId).Value;
         var props = lakehouse.Properties;
-        string tablesPath = (props?.OneLakeTablesPath ?? root).Replace('\\', '/').TrimEnd('/');
+        string tablesPath = root.Replace('\\', '/').TrimEnd('/');
         bool schemaEnabled = !string.IsNullOrEmpty(props?.DefaultSchema);
+
+        var (host, fileSystem, tablesUnderFs) = ParseAbfss(tablesPath);
+        var fsClient = new DataLakeFileSystemClient(new Uri($"https://{host}/{fileSystem}"), cred);
 
         var tables = new List<(string, string)>();
         if (schemaEnabled)
         {
-            // SQL-endpoint discovery: the lakehouse SQL endpoint's database is the lakehouse name.
-            var server = props!.SqlEndpointProperties?.ConnectionString;
-            if (string.IsNullOrEmpty(server))
+            foreach (var schema in ListChildDirectories(fsClient, tablesUnderFs))
             {
-                throw new InvalidOperationException(
-                    $"delta(onelake): schema-enabled lakehouse '{lakehouse.DisplayName}' has no SQL endpoint yet " +
-                    "(still provisioning?) — cannot discover tables.");
-            }
-            foreach (var (schema, table) in ListSchemaTablesViaSql(server!, lakehouse.DisplayName, cred))
-            {
-                tables.Add((schema, table));
+                foreach (var table in ListChildDirectories(fsClient, tablesUnderFs + "/" + schema))
+                {
+                    tables.Add((schema, table));
+                }
             }
         }
         else
         {
-            foreach (var t in new TablesClient(cred).ListTables(workspaceId, lakehouseId))
+            foreach (var table in ListChildDirectories(fsClient, tablesUnderFs))
             {
-                if (!string.IsNullOrEmpty(t.Name))
-                {
-                    tables.Add((DeltaCatalog.MainSchema, t.Name));
-                }
+                tables.Add((DeltaCatalog.MainSchema, table));
             }
         }
         return new OneLakeInfo
@@ -144,34 +148,71 @@ internal static class FabricLakehouse
         };
     }
 
-    private const string SqlScope = "https://database.windows.net/.default";
+    /// <summary>Lists the immediate child <b>directory</b> leaf-names of <paramref name="pathUnderFs"/> (a path
+    /// relative to the filesystem root) via the OneLake DFS endpoint (non-recursive). Returns empty when the
+    /// directory does not exist yet (a brand-new lakehouse / empty schema). Uses the <b>async</b> Azure API
+    /// bridged once with <c>GetAwaiter().GetResult()</c>: the Azure SDK's SYNC <c>GetPaths</c> uses
+    /// <c>HttpClient.Send</c>, whose sync transport hangs under the hostfxr-hosted CLR (every other Bridge IO
+    /// path is async for the same reason); the async path uses <c>SendAsync</c> and works.</summary>
+    private static IEnumerable<string> ListChildDirectories(DataLakeFileSystemClient fsClient, string pathUnderFs) =>
+        ListChildDirectoriesAsync(fsClient, pathUnderFs).GetAwaiter().GetResult();
 
-    /// <summary>Lists (schema, table) for BASE TABLEs of a Fabric lakehouse/warehouse SQL endpoint via
-    /// INFORMATION_SCHEMA, authenticating with an Entra token minted from <paramref name="cred"/>.</summary>
-    private static IEnumerable<(string Schema, string Table)> ListSchemaTablesViaSql(
-        string server, string database, TokenCredential cred)
+    private static async System.Threading.Tasks.Task<List<string>> ListChildDirectoriesAsync(
+        DataLakeFileSystemClient fsClient, string pathUnderFs)
     {
-        var token = cred.GetToken(new TokenRequestContext(new[] { SqlScope }), default).Token;
-        var connString = new Microsoft.Data.SqlClient.SqlConnectionStringBuilder
+        var names = new List<string>();
+        try
         {
-            DataSource = server,
-            InitialCatalog = database,
-            Encrypt = true,
-            ConnectTimeout = 60,
-        }.ConnectionString;
-
-        var result = new List<(string, string)>();
-        using var conn = new Microsoft.Data.SqlClient.SqlConnection(connString) { AccessToken = token };
-        conn.Open();
-        using var cmd = conn.CreateCommand();
-        cmd.CommandText =
-            "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'";
-        using var reader = cmd.ExecuteReader();
-        while (reader.Read())
-        {
-            result.Add((reader.GetString(0), reader.GetString(1)));
+            await foreach (var item in fsClient.GetPathsAsync(path: pathUnderFs, recursive: false)
+                               .ConfigureAwait(false))
+            {
+                if (item.IsDirectory == true && !string.IsNullOrEmpty(item.Name))
+                {
+                    int slash = item.Name.LastIndexOf('/');
+                    names.Add(slash < 0 ? item.Name : item.Name.Substring(slash + 1));
+                }
+            }
         }
-        return result;
+        catch (Azure.RequestFailedException ex) when (ex.Status == 404)
+        {
+            // The directory doesn't exist yet (no tables / schema not materialized) — treat as empty.
+        }
+        return names;
+    }
+
+    /// <summary>Recursively deletes the OneLake directory at the abfss <paramref name="abfssDir"/> (a table
+    /// folder) via the DFS endpoint — DuckDB's azure FileSystem has no RemoveDirectory. Idempotent (no error if
+    /// the directory is already gone), so it satisfies DROP TABLE IF EXISTS. Async API (see
+    /// <see cref="ListChildDirectories"/> for why sync hangs under the CLR).</summary>
+    public static void DeleteDirectory(string abfssDir, TokenCredential? credential)
+    {
+        var cred = credential ?? new DefaultAzureCredential();
+        var (host, fileSystem, pathUnderFs) = ParseAbfss(abfssDir.Replace('\\', '/').TrimEnd('/'));
+        var dirClient = new DataLakeDirectoryClient(
+            new Uri($"https://{host}/{fileSystem}/{pathUnderFs}"), cred);
+        dirClient.DeleteIfExistsAsync().GetAwaiter().GetResult(); // directory delete on DFS is recursive
+    }
+
+    /// <summary>Parses <c>abfss://&lt;filesystem&gt;@&lt;host&gt;/&lt;path&gt;</c> into (host, filesystem, path).
+    /// For OneLake the filesystem is the workspace and the path is <c>&lt;lakehouse&gt;.Lakehouse/Tables/…</c>.</summary>
+    private static (string Host, string FileSystem, string Path) ParseAbfss(string abfss)
+    {
+        int scheme = abfss.IndexOf("://", StringComparison.Ordinal);
+        if (scheme < 0)
+        {
+            throw new ArgumentException($"delta(onelake): not an abfss URL: '{abfss}'");
+        }
+        var authorityAndPath = abfss.Substring(scheme + 3);
+        int at = authorityAndPath.IndexOf('@');
+        int firstSlash = authorityAndPath.IndexOf('/');
+        if (at < 0 || firstSlash < 0 || at > firstSlash)
+        {
+            throw new ArgumentException($"delta(onelake): expected abfss://<fs>@<host>/<path>, got '{abfss}'");
+        }
+        var fileSystem = authorityAndPath.Substring(0, at);
+        var host = authorityAndPath.Substring(at + 1, firstSlash - at - 1);
+        var path = authorityAndPath.Substring(firstSlash + 1);
+        return (host, fileSystem, path);
     }
 
     /// <summary>Parses <c>abfss://&lt;workspace&gt;@onelake.dfs.fabric.microsoft.com/&lt;lakehouse&gt;/…</c> into the
