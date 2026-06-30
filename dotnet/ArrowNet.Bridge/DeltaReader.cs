@@ -2,6 +2,8 @@ using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using Apache.Arrow;
+using Apache.Arrow.Ipc;
+using Apache.Arrow.Types;
 using EngineeredWood.DeltaLake;
 using EngineeredWood.DeltaLake.Table;
 using EngineeredWood.Expressions;
@@ -219,6 +221,66 @@ internal static class DeltaReader
         {
             await table.DisposeAsync().ConfigureAwait(false);
         }
+    }
+
+    /// <summary>The table's commit history (the snapshots/versions view) as an Arrow stream:
+    /// <c>(version BIGINT, timestamp TIMESTAMP, operation VARCHAR, operation_parameters VARCHAR)</c>, oldest
+    /// first. <c>timestamp</c> is non-null only on tables that record it (inCommitTimestamps or a commitInfo
+    /// timestamp). Reads the Delta log only (no data files).</summary>
+    public static IArrowArrayStream GetSnapshots(nint opener, string path)
+    {
+        var tsType = new TimestampType(TimeUnit.Microsecond, (string?)null);
+        var versions = new Int64Array.Builder();
+        var timestamps = new TimestampArray.Builder(tsType);
+        var operations = new StringArray.Builder();
+        var operationParams = new StringArray.Builder();
+        int rows = CollectHistory(opener, path, versions, timestamps, operations, operationParams)
+            .GetAwaiter().GetResult();
+
+        var schema = new Schema(new[]
+        {
+            new Field("version", Int64Type.Default, nullable: false),
+            new Field("timestamp", tsType, nullable: true),
+            new Field("operation", StringType.Default, nullable: true),
+            new Field("operation_parameters", StringType.Default, nullable: true),
+        }, metadata: null);
+        var batch = new RecordBatch(schema, new IArrowArray[]
+        {
+            versions.Build(), timestamps.Build(), operations.Build(), operationParams.Build(),
+        }, rows);
+        return new InMemoryArrayStream(schema, new[] { batch });
+    }
+
+    private static async System.Threading.Tasks.Task<int> CollectHistory(
+        nint opener, string path, Int64Array.Builder versions, TimestampArray.Builder timestamps,
+        StringArray.Builder operations, StringArray.Builder operationParams)
+    {
+        var fs = new DuckDbTableFileSystem(opener, path);
+        var table = await DeltaTable.OpenAsync(fs).ConfigureAwait(false);
+        int rows = 0;
+        try
+        {
+            await foreach (var h in table.GetHistoryAsync().ConfigureAwait(false))
+            {
+                versions.Append(h.Version);
+                if (h.TimestampMs is { } ms)
+                {
+                    timestamps.Append(System.DateTimeOffset.FromUnixTimeMilliseconds(ms));
+                }
+                else
+                {
+                    timestamps.AppendNull();
+                }
+                if (h.Operation is { } op) { operations.Append(op); } else { operations.AppendNull(); }
+                if (h.OperationParameters is { } p) { operationParams.Append(p); } else { operationParams.AppendNull(); }
+                rows++;
+            }
+        }
+        finally
+        {
+            await table.DisposeAsync().ConfigureAwait(false);
+        }
+        return rows;
     }
 
     /// <summary>Time travel WITH the trailing <c>_metadata.row_id</c> column — used when a time-travel scan

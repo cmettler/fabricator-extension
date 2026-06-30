@@ -151,9 +151,38 @@ public sealed class DeltaCatalog : IBackendCatalog
         // scan time (no row-tracking feature needed; works on ANY Delta table). Enables UPDATE/DELETE
         // (rowid-based, mirrors the SQL Server backend); DELETE is copy-on-write (plain add/remove).
         MetadataKind.RowId => SingleColumn("name", new[] { RowIdColumn }),
+        // Snapshots/history (arrownet_delta_snapshots): arg1=schema, arg2=table. Schema is required on a
+        // schema-enabled lakehouse; defaults to "main" on a flat catalog.
+        MetadataKind.Snapshots => SnapshotsStream(schema, table),
         // No row-count/NDV stats surfaced, no functions.
         _ => EmptyStringTable("name"),
     };
+
+    /// <summary>The commit history of <paramref name="schema"/>.<paramref name="table"/> as an Arrow stream
+    /// (version, timestamp, operation, operation_parameters). <paramref name="schema"/> is required on a
+    /// schema-enabled lakehouse (the table path needs it); on a flat catalog an empty schema defaults to "main".</summary>
+    private IArrowArrayStream SnapshotsStream(string? schema, string? table)
+    {
+        if (string.IsNullOrEmpty(table))
+        {
+            throw new System.ArgumentException("delta snapshots: a table name is required (catalog, 'schema.table').");
+        }
+        string resolvedSchema;
+        if (!string.IsNullOrEmpty(schema))
+        {
+            resolvedSchema = schema!;
+        }
+        else if (SchemaLayout)
+        {
+            throw new System.InvalidOperationException(
+                "delta snapshots: a schema is required on a schema-enabled lakehouse — use 'schema.table'.");
+        }
+        else
+        {
+            resolvedSchema = MainSchema;
+        }
+        return DeltaReader.GetSnapshots(AmbientOpener.Current, TablePath(resolvedSchema, table!));
+    }
 
     /// <summary>The catalog's schemas: the lakehouse schemas for a schema-enabled OneLake lakehouse; for a
     /// non-OneLake <c>schemas true</c> catalog the distinct subfolders discovered as schemas (+ always "main", the

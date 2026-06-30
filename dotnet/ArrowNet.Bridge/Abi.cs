@@ -270,6 +270,9 @@ public static class MetadataKind
     public const int ColumnNdv = 5;
     public const int Functions = 6;
     public const int ServerInfo = 7;
+    // Delta only: a table's commit history (version, timestamp, operation, operation_parameters). arg1=schema,
+    // arg2=table. Surfaced by the arrownet_delta_snapshots(catalog, 'schema.table') table function.
+    public const int Snapshots = 8;
 }
 
 internal static class ArrowNetStatus

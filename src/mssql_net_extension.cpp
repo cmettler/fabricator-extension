@@ -307,6 +307,37 @@ static unique_ptr<FunctionData> ServerInfoBind(ClientContext &context, TableFunc
 	return std::move(bind_data);
 }
 
+// --- arrownet_delta_snapshots(catalog VARCHAR, 'schema.table' VARCHAR) --------
+// The commit history (snapshots/versions view) of a Delta table in an ATTACH'd Delta-provider catalog:
+// (version, timestamp, operation, operation_parameters). First arg = the attached catalog NAME (resolved to its
+// handle — no abfss path needed); second = the table, schema-qualified ('schema.table'). Schema is mandatory on
+// a schema-enabled lakehouse, defaults to "main" on a flat catalog (resolved managed-side). Delta only; a
+// non-Delta catalog yields no snapshot rows.
+static unique_ptr<FunctionData> SnapshotsBind(ClientContext &context, TableFunctionBindInput &input,
+                                              vector<LogicalType> &return_types, vector<string> &names) {
+	auto catalog_name = input.inputs[0].GetValue<string>();
+	auto table_ref = input.inputs[1].GetValue<string>();
+	// Split 'schema.table' on the first dot → (schema, table); a bare name → ("", table) (managed side defaults
+	// it to "main" on a flat catalog, or errors on a schema-enabled one).
+	string schema;
+	string table = table_ref;
+	auto dot = table_ref.find('.');
+	if (dot != string::npos) {
+		schema = table_ref.substr(0, dot);
+		table = table_ref.substr(dot + 1);
+	}
+
+	auto bind_data = make_uniq<MssqlNetFunctionsBindData>();
+	bind_data->handle = ResolveConnection(context, catalog_name, bind_data->owns_handle);
+	auto handle = bind_data->handle;
+	bind_data->factory = [handle, schema, table](const arrownet::ArrowScanRequest &, ArrowArrayStream &out) {
+		arrownet::GetMetadata(handle, ARROWNET_META_SNAPSHOTS, schema, table, out);
+	};
+
+	arrownet::PopulateReturnSchema(context, *bind_data, return_types, names);
+	return std::move(bind_data);
+}
+
 // --- mssql_net_exec(connection_string VARCHAR, sql VARCHAR) -> BIGINT --------
 // Executes arbitrary T-SQL (DDL/DML/EXEC) against SQL Server and returns the
 // number of rows affected. Volatile (always executed, never constant-folded).
@@ -449,6 +480,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(server_info_fn);
 	server_info_fn.name = "arrownet_server_info";
 	loader.RegisterFunction(server_info_fn);
+
+	// arrownet_delta_snapshots(catalog, 'schema.table') — a Delta table's commit-history / snapshots view.
+	TableFunction snapshots_fn("arrownet_delta_snapshots", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                           arrownet::ArrowStreamScan, SnapshotsBind, arrownet::ArrowStreamInitGlobal,
+	                           arrownet::ArrowStreamInitLocal);
+	snapshots_fn.projection_pushdown = true;
+	loader.RegisterFunction(snapshots_fn);
 
 	ScalarFunction exec_fn("mssql_net_exec", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BIGINT,
 	                       MssqlNetExecFunction);

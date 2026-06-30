@@ -1306,9 +1306,21 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `test/verify_delta_catalog_time_travel.test` (47 — version 0/1/2/3, filter pushdown, multi-version
   count/JOIN/UNION, re-attach durability, plain-table timestamp error, and `in_commit_timestamps` timestamp
   travel [local]).
-  **Snapshots/history function (DuckLake-style `snapshots()`) — NOT built** (feasible via engineered-wood
-  `TransactionLog.ListVersionsAsync` + `ReadCommitAsync` → `CommitInfo.Values`; would be a global
-  `arrownet_delta_snapshots(path)` table fn). **Per-row commit version as a virtual column (DuckLake
+  **Snapshots/history function — DONE: `arrownet_delta_snapshots('<catalog>', '<schema.>table')`** (DuckLake-style
+  snapshots view). First arg = the ATTACH'd catalog NAME (resolved to its handle via `ResolveConnection` — no
+  abfss path needed, the catalog's own `TablePath` builds the location); second = the table, schema-qualified
+  (schema **mandatory on a schema-enabled lakehouse**, defaults to `main` on a flat catalog; C++ splits on the
+  first `.`, C# resolves the default/required schema). Returns `(version BIGINT, timestamp TIMESTAMP, operation
+  VARCHAR, operation_parameters VARCHAR)` from the `_delta_log`. C++ `SnapshotsBind` mirrors `ServerInfoBind`
+  (catalog→handle, factory = `GetMetadata(handle, ARROWNET_META_SNAPSHOTS=8, schema, table)`, reuses
+  `ArrowStreamScan`); C# `DeltaCatalog.GetMetadata(Snapshots)` → `DeltaReader.GetSnapshots` → engineered-wood
+  `DeltaTable.GetHistoryAsync` (new — `ListVersionsAsync` + `ReadCommitAsync` → `CommitInfo`). **Additive enum →
+  NO ABI bump.** `timestamp`/`operation` are populated only when the table records `commitInfo` — i.e.
+  `in_commit_timestamps` tables (engineered-wood writes no commitInfo on plain tables, so those show the version
+  list with NULL metadata; the create commit v0 is null even on ICT tables since `CreateAsync` skips
+  EnsureCommitInfo). Validated local + **live Fabric** (`LH2.dbo.arrownet_ict2`: v0 null, v1–v3 WRITE +
+  timestamps). `test/verify_delta_catalog_snapshots.test` (20). Pairs with VERSION time travel: read the
+  snapshots to pick a version. **Per-row commit version as a virtual column (DuckLake
   `snapshot_id` analog) — NOT built**: needs the Delta **row-tracking** feature (`_metadata.row_commit_version`),
   which our plain tables don't enable (only the opt-in `deletion_vectors true` path enables row tracking) + a
   second-virtual-column plumbing beyond `_metadata.row_id` + uncertain Fabric read-compat of row-tracking
