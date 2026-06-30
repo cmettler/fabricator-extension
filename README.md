@@ -19,8 +19,19 @@ isolation) and type mapping (collation-driven `VARCHAR`/`NVARCHAR`, `datetime2` 
 including Fabric Warehouse over an Entra service principal. See
 [Microsoft Fabric & Synapse](#microsoft-fabric--synapse-warehouse).
 
-> Project knowledge & build notes for contributors live in [`CLAUDE.md`](CLAUDE.md), and the full
-> warehouse design in [`docs/warehouse-support.md`](docs/warehouse-support.md).
+**One binary, multiple providers.** The C++ core (`arrownet`) and managed `ArrowNet.Bridge` are
+provider-agnostic, and the same extension hosts several backends selected at ATTACH via `PROVIDER` (or
+inferred from the connection scheme):
+
+- **`sqlserver`** (default) — Microsoft SQL Server / Azure SQL / Fabric & Synapse warehouse (this document).
+- **`delta`** — a **Delta Lake** folder/lakehouse as a read-write catalog (local, S3, ADLS, and **Fabric
+  OneLake**), with DML, time travel, snapshots, and Change Data Feed. See [Delta Lake provider](#delta-lake-provider).
+- **`dax`** — **Power BI / Analysis Services** semantic models over ADOMD (read-only DAX). See
+  [`docs/dax-provider.md`](docs/dax-provider.md).
+
+> Project knowledge & build notes for contributors live in [`CLAUDE.md`](CLAUDE.md), the full
+> warehouse design in [`docs/warehouse-support.md`](docs/warehouse-support.md), and the Delta catalog
+> design in [`docs/delta-catalog.md`](docs/delta-catalog.md).
 
 ## Feature Status
 
@@ -568,6 +579,61 @@ the native extension's batching/pooling/TDS knobs don't apply).
 - **Not implemented here:** connection-pool diagnostics (`mssql_pool_stats`, `mssql_open/close/ping`),
   COPY to temp tables, multi-statement batches.
 
+## Delta Lake provider
+
+`PROVIDER 'delta'` attaches a **Delta Lake** root as a read-write DuckDB catalog. Each subdirectory with a
+`_delta_log/` is a table; data I/O goes through DuckDB's `FileSystem` (so `azure`/`httpfs` + DuckDB secrets
+work), and the Delta log layer is the pure-C# [engineered-wood](https://github.com/curthagenlocher/engineered-wood)
+library. Works on **local**, **S3**, **ADLS**, and **Fabric OneLake**. (Aliases: `deltalake`; the primary
+name is `engineeredwooddelta`.)
+
+```sql
+-- Local / S3 / ADLS folder catalog
+ATTACH '/lake/root' AS lake (TYPE mssql_net, PROVIDER 'delta');
+
+-- Fabric OneLake (READ_ONLY false is REQUIRED — DuckDB forces remote ATTACH read-only otherwise;
+-- one azure service-principal secret serves DuckDB IO + the OneLake DFS endpoint)
+ATTACH 'abfss://Workspace@onelake.dfs.fabric.microsoft.com/LH.Lakehouse/Tables'
+  AS lake (TYPE mssql_net, PROVIDER 'delta', SECRET fabric_sp, READ_ONLY false);
+
+SELECT * FROM lake.main.t WHERE id > 10;          -- streaming scan + file/row-group filter pushdown
+```
+
+| Feature | Status |
+|---------|--------|
+| Discover tables (local/S3/ADLS host-FS glob; OneLake via the ADLS Gen2 DFS endpoint) | ✅ |
+| Streaming scan + filter pushdown (Delta file pruning + Parquet row-group skipping) | ✅ |
+| `CREATE TABLE` / `INSERT` / CTAS / COPY (streaming bulk via the standard write path) | ✅ |
+| `DELETE` / `UPDATE` — rowid copy-on-write (plain Delta) or deletion vectors (opt-in) | ✅ |
+| `DROP TABLE`, `ALTER TABLE … ADD COLUMN`, `RENAME TABLE` (local + OneLake) | ✅ |
+| Multi-schema: `schemas true` (local/S3 `<root>/<schema>/<table>`); schema-enabled OneLake lakehouses | ✅ |
+| Time travel: `FROM t AT (VERSION => n)` and `AT (TIMESTAMP => ts)` | ✅ |
+| Snapshots/history: `arrownet_delta_snapshots('<catalog>', '<schema.>table')` | ✅ |
+| **Change Data Feed**: `change_data_feed true` + `arrownet_delta_changes('<catalog>', '<schema.>table', from[, to])` | ✅ |
+| Concurrent writers (OCC retry on append/CTAS; rowid DML is snapshot-bound) | ✅ |
+
+```sql
+-- Time travel + history
+SELECT * FROM lake.main.t AT (VERSION => 3);
+SELECT version, operation, timestamp FROM arrownet_delta_snapshots('lake', 'main.t') ORDER BY version;
+
+-- Change Data Feed (enable per catalog at ATTACH, then read the row-level feed)
+ATTACH '/lake/root' AS cdf (TYPE mssql_net, PROVIDER 'delta', change_data_feed true);
+CREATE TABLE cdf.main.t AS SELECT * FROM (VALUES (1,'a'),(2,'b')) v(id,val);
+DELETE FROM cdf.main.t WHERE id = 2;
+SELECT _change_type, id, val, _commit_version, _commit_timestamp
+  FROM arrownet_delta_changes('cdf', 'main.t', 0);     -- to omitted => latest
+-- insert/insert (v1), delete (v2): each row tagged with its commit version + timestamp (epoch ms)
+```
+
+Delta ATTACH options: `PROVIDER 'delta'`, `SECRET <azure_sp>` (OneLake/ADLS auth), `READ_ONLY false`
+(required for OneLake writes), `schemas true` (two-level layout on local/S3), `deletion_vectors true`
+(DV-based DELETE/UPDATE), `change_data_feed true` (CDF capture), `in_commit_timestamps true` (in-protocol
+monotonic timestamps for Spark/Fabric interop — `AT (TIMESTAMP)` also resolves on plain tables via the
+always-on commit timestamp). Tables are written as **plain Delta** (minReader 1 / minWriter 2, no features)
+by default, so Spark / delta-kernel / Fabric OneLake conversion read them; features are added only when the
+corresponding option is set. Full design: [`docs/delta-catalog.md`](docs/delta-catalog.md).
+
 ## Build
 
 ### Managed bridge
@@ -628,7 +694,9 @@ src/                         C++ DuckDB extension
   mssql_net_extension.cpp    extension entry + mssql_net_query / _exec / cache / version functions
   mssql_net_storage.cpp      ATTACH (TYPE mssql_net); mssql_net_secret.cpp  secret type
 dotnet/ArrowNet.Bridge/      backend-agnostic managed bridge (ABI, Arrow, IBackend, streaming bulk)
+                             also hosts the Delta provider (DeltaCatalog/DeltaReader over engineered-wood)
 dotnet/ArrowNet.SqlServer/   Microsoft.Data.SqlClient backend + composition root
+dotnet/ArrowNet.AnalysisServices/  Power BI / DAX (ADOMD) backend — PROVIDER 'dax'
 scripts/publish-managed.ps1  self-contained publish of the bridge + .NET runtime
 test/                        verify_*.test + mssqlcompat/ (regenerated from the native extension)
 CMakeLists.txt, Makefile, extension_config.cmake, vcpkg.json, CLAUDE.md
