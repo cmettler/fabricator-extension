@@ -28,7 +28,8 @@ internal static class DeltaReader
         var table = DeltaTable.OpenAsync(fs).GetAwaiter().GetResult();
         try
         {
-            return table.ArrowSchema;
+            // Widen narrow decimals (Decimal32/64) to Decimal128 so the C-interface handoff to DuckDB is correct.
+            return DecimalWidening.WidenSchema(table.ArrowSchema);
         }
         finally
         {
@@ -52,7 +53,7 @@ internal static class DeltaReader
         var fs = new DuckDbTableFileSystem(opener, path);
         var parquet = filter is null ? ParquetReadOptions.Default : new ParquetReadOptions { Filter = filter };
         var options = DeltaTableOptions.Default with { ParquetReadOptions = parquet };
-        return StreamImpl(fs, options, columns, filter, ct);
+        return DecimalWidening.WidenBatches(StreamImpl(fs, options, columns, filter, ct), ct);
     }
 
     private static async IAsyncEnumerable<RecordBatch> StreamImpl(
@@ -82,7 +83,7 @@ internal static class DeltaReader
         var fs = new DuckDbTableFileSystem(opener, path);
         var parquet = filter is null ? ParquetReadOptions.Default : new ParquetReadOptions { Filter = filter };
         var options = DeltaTableOptions.Default with { ParquetReadOptions = parquet };
-        return StreamWithRowIdsImpl(fs, options, columns, filter, ct);
+        return DecimalWidening.WidenBatches(StreamWithRowIdsImpl(fs, options, columns, filter, ct), ct);
     }
 
     private static async IAsyncEnumerable<RecordBatch> StreamWithRowIdsImpl(
@@ -182,7 +183,7 @@ internal static class DeltaReader
         try
         {
             var snap = ResolveSnapshotAsync(table, unit, value, default).AsTask().GetAwaiter().GetResult();
-            return snap.ArrowSchema;
+            return DecimalWidening.WidenSchema(snap.ArrowSchema);
         }
         finally
         {
@@ -200,7 +201,7 @@ internal static class DeltaReader
         var fs = new DuckDbTableFileSystem(opener, path);
         var parquet = filter is null ? ParquetReadOptions.Default : new ParquetReadOptions { Filter = filter };
         var options = DeltaTableOptions.Default with { ParquetReadOptions = parquet };
-        return StreamAtImpl(fs, options, columns, filter, unit, value, ct);
+        return DecimalWidening.WidenBatches(StreamAtImpl(fs, options, columns, filter, unit, value, ct), ct);
     }
 
     private static async IAsyncEnumerable<RecordBatch> StreamAtImpl(
@@ -263,8 +264,9 @@ internal static class DeltaReader
         // (hand-building it risks a column/type mismatch that SIGSEGVs arrow_ingest).
         var enumerator = StreamChanges(opener, path, fromVersion, toVersion, default).GetAsyncEnumerator(default);
         bool hasFirst = enumerator.MoveNextAsync().AsTask().GetAwaiter().GetResult();
-        var schema = hasFirst ? enumerator.Current.Schema : EmptyChangeSchema(opener, path);
-        return new AsyncEnumerableArrowStream(schema, ReplayThenRest(hasFirst, enumerator));
+        // Widen narrow decimals (Decimal32/64 -> Decimal128) so the change feed crosses the C boundary correctly.
+        var schema = hasFirst ? DecimalWidening.WidenSchema(enumerator.Current.Schema) : EmptyChangeSchema(opener, path);
+        return new AsyncEnumerableArrowStream(schema, DecimalWidening.WidenBatches(ReplayThenRest(hasFirst, enumerator)));
     }
 
     private static async IAsyncEnumerable<RecordBatch> ReplayThenRest(
@@ -370,7 +372,7 @@ internal static class DeltaReader
         var fs = new DuckDbTableFileSystem(opener, path);
         var parquet = filter is null ? ParquetReadOptions.Default : new ParquetReadOptions { Filter = filter };
         var options = DeltaTableOptions.Default with { ParquetReadOptions = parquet };
-        return StreamWithRowIdsAtImpl(fs, options, columns, filter, unit, value, ct);
+        return DecimalWidening.WidenBatches(StreamWithRowIdsAtImpl(fs, options, columns, filter, unit, value, ct), ct);
     }
 
     private static async IAsyncEnumerable<RecordBatch> StreamWithRowIdsAtImpl(

@@ -463,9 +463,19 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      resolved by `ResolveWriteSpec` (COPY `SCHEMA_MODE` > `delta_write_options` `schema_mode`/`merge_schema` > the
      `merge_schema` ATTACH option → Merge for append). Append-time evolution via INSERT stays `ALTER TABLE ADD
      COLUMN` (what dbt's `on_schema_change` uses). Validated: `verify_delta_catalog_overwrite_merge.test` (47); full
-     Delta + SqlServer suites unregressed. **Separate pre-existing bug found (NOT this change): Delta DECIMAL
-     round-trip is corrupt** (CTAS `CAST(1.5 AS DECIMAL(2,1))` → `10.4`; `DECIMAL(10,2)` → `0.00`) — the decimal128
-     write/read encoding is wrong; needs its own fix.
+     Delta + SqlServer suites unregressed.
+
+     **DECIMAL read corruption — FIXED (`DecimalWidening`, C#-only).** engineered-wood's parquet reader returns a
+     decimal at its physical width (INT32 → Arrow `Decimal32`, INT64 → `Decimal64`); those VALUES are correct in
+     C#, but the narrow Arrow decimal types are mishandled crossing the C-data-interface to DuckDB (read as 128-bit
+     over the 4/8-byte buffer → e.g. `CAST(1.5 AS DECIMAL(2,1))` → `10.4`). DuckDB's native `read_parquet` reads the
+     same files correctly, so only the read handoff was wrong. `DecimalWidening` (Bridge) widens `Decimal32/64` →
+     the classic `Decimal128` (schema + batches) on the Delta read boundary, applied in `DeltaReader` to every read
+     (scan / rowid / time-travel / CDF) + `GetSchema*`. No ABI or engineered-wood change.
+     `verify_delta_catalog_decimal.test` (19). **Still-open separate bug (engineered-wood parquet decoder):
+     `DELETE`/`UPDATE` on a decimal-column table crashes on the post-rewrite read — the copy-on-write rewrite emits
+     a `DELTA_BINARY_PACKED` page whose value count overruns the read buffer (`DecodeDeltaBinaryPackedValues` →
+     `ColumnBuildState.ReserveValues`); needs an engineered-wood decoder fix (independent of the widening).
 3. **DELETE — FINAL: copy-on-write + transient `(file,position)` rowid, PLAIN Delta (no features).** The
    detailed design below (row tracking + deletion vectors) is the SUPERSEDED first attempt — kept as the trail.
    Why it changed: Fabric's OneLake converter / Spark could not read our row-tracking + DV commits (first from

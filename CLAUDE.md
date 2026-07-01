@@ -1194,9 +1194,21 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   time-travel; old versions still show the old schema). Verified:
   `test/verify_delta_catalog_overwrite_merge.test` (47 — atomic partition overwrite, true CREATE OR REPLACE
   narrower-drops/wider-adds, COPY SCHEMA_MODE merge + overwrite); full Delta + SqlServer (columnstore/identity)
-  suites unregressed. **Known separate bug (pre-existing, NOT this change): Delta DECIMAL round-trip is corrupt**
-  (`CTAS SELECT CAST(1.5 AS DECIMAL(2,1))` reads back `10.4`; `DECIMAL(10,2)` → `0.00`) — the decimal128
-  encoding across the write/read path is wrong; needs a separate fix. v50 = **directory move/rename** — appended `fs_move_dir(opener,src,dest,…)` to
+  suites unregressed. **Delta DECIMAL read corruption — FIXED (C#-only, `DecimalWidening`).** Root cause: engineered-wood's
+  parquet reader represents a decimal by its parquet PHYSICAL width — INT32 → Arrow `Decimal32`, INT64 →
+  `Decimal64` (the newer narrow Arrow decimal types). The VALUES are correct in C# (verified via a spike), but the
+  Arrow C-data-interface handoff of `Decimal32/64` is mishandled crossing to DuckDB (DuckDB reads them as 128-bit
+  over the 4/8-byte buffer → garbage; e.g. `CAST(1.5 AS DECIMAL(2,1))` → `10.4`, `DECIMAL(10,2) 123.45` → `0.00`).
+  DuckDB's native `read_parquet` reads the SAME files correctly → the WRITE is fine, only the read handoff was
+  wrong. Fix: `DecimalWidening` (Bridge) widens `Decimal32/64` → the classic, universally-handled `Decimal128`
+  (schema + batches) on the Delta read boundary — applied in `DeltaReader` to EVERY read (scan, rowid, time-travel,
+  CDF) + `GetSchema*`. No ABI/engineered-wood change. Verified: `test/verify_delta_catalog_decimal.test` (19 —
+  Decimal32/64/128, negatives, filter/aggregate, INSERT, time-travel). **Still-open SEPARATE bug (deeper,
+  engineered-wood parquet decoder): `DELETE`/`UPDATE` on a table with a decimal column crashes on the post-rewrite
+  read** — the copy-on-write rewrite writes a `DELTA_BINARY_PACKED` page whose value count overruns the read
+  buffer (`ColumnChunkReader.DecodeDeltaBinaryPackedValues` → `ColumnBuildState.ReserveValues` `ArgumentOutOfRange`);
+  independent of the widening (the rewrite-read crashes regardless), needs an engineered-wood decoder fix.
+  v50 = **directory move/rename** — appended `fs_move_dir(opener,src,dest,…)` to
   `ArrowNetHostServices` (the reverse host→managed struct): maps to DuckDB's `FileSystem::MoveFile` — an atomic
   directory rename on a local filesystem; object stores (S3/Azure DFS) throw "not implemented". Powers **local/S3
   Delta catalog RENAME TABLE** (`DeltaCatalog.AlterTable` RenameTable → `HostFs.MoveDir`; OneLake still renames via
