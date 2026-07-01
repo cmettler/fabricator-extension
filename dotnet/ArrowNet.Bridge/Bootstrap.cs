@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Apache.Arrow;
@@ -44,7 +45,7 @@ public static unsafe class Bootstrap
             return new InMemoryArrayStream(schema, new[] { batch });
         });
 
-        vtable->AbiVersion = 50;
+        vtable->AbiVersion = 51;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -195,7 +196,8 @@ public static unsafe class Bootstrap
             // We take ownership of the C stream (consume + release on dispose).
             var stream = CArrowArrayStreamImporter.ImportArrayStream(input);
             long rows = catalog.BulkInsert(schemaName, tableName, stream, createTable != 0, replace != 0,
-                                           checkConstraints: false, txnId: AmbientTransaction.Current);
+                                           checkConstraints: false, txnId: AmbientTransaction.Current,
+                                           partitionColumns: null);
             if (affected is not null)
             {
                 *affected = rows;
@@ -327,7 +329,7 @@ public static unsafe class Bootstrap
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static int CreateTable(nint handle, byte* schema, byte* table, CArrowArrayStream* columns, int ifNotExists,
-                                   byte* pkColumns, byte* uniqueColumns, byte* defaults, byte** err)
+                                   byte* pkColumns, byte* uniqueColumns, byte* defaults, byte* partitionColumns, byte** err)
     {
         try
         {
@@ -342,11 +344,12 @@ public static unsafe class Bootstrap
             var pk = Marshal.PtrToStringUTF8((nint)pkColumns);
             var uniques = Marshal.PtrToStringUTF8((nint)uniqueColumns);
             var defaultSpec = Marshal.PtrToStringUTF8((nint)defaults);
+            var partition = SplitColumnList(Marshal.PtrToStringUTF8((nint)partitionColumns));
 
             // We own the C stream; read its schema (the column layout) and release it. The text-column SQL
             // type (mssql_ctas_text_type / mssql_default_varchar_length) is read from the settings store in C#.
             using var stream = CArrowArrayStreamImporter.ImportArrayStream(columns);
-            catalog.CreateTable(schemaName, tableName, stream.Schema, ifNotExists != 0, pk, uniques, defaultSpec);
+            catalog.CreateTable(schemaName, tableName, stream.Schema, ifNotExists != 0, pk, uniques, defaultSpec, partition);
             return ArrowNetStatus.Ok;
         }
         catch (Exception ex)
@@ -559,8 +562,8 @@ public static unsafe class Bootstrap
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static int BeginBulk(nint handle, byte* schema, byte* table, int createTable, int replace,
-                                 int checkConstraints, long txnId, CArrowSchema* schemaIn, nint* outSession,
-                                 byte** err)
+                                 int checkConstraints, long txnId, CArrowSchema* schemaIn, byte* partitionColumns,
+                                 nint* outSession, byte** err)
     {
         try
         {
@@ -575,6 +578,7 @@ public static unsafe class Bootstrap
                           ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
+            var partition = SplitColumnList(Marshal.PtrToStringUTF8((nint)partitionColumns));
 
             // Capture the host-FS opener now (set by the C++ sink before begin_bulk, on this thread) so the
             // background bulk consumer can re-establish it — a host-FS provider (the Delta catalog) writes
@@ -582,7 +586,7 @@ public static unsafe class Bootstrap
             // statement (complete_bulk blocks until the consumer finishes), so the opener is live at write time.
             var opener = AmbientOpener.Current;
             var session = new BulkSession(catalog, schemaName, tableName, arrowSchema, createTable != 0, replace != 0,
-                                          checkConstraints != 0, txnId, opener);
+                                          checkConstraints != 0, txnId, opener, partition);
             *outSession = Handles.Alloc(session);
             return ArrowNetStatus.Ok;
         }
@@ -1480,6 +1484,25 @@ public static unsafe class Bootstrap
         {
             *err = (byte*)Marshal.StringToCoTaskMemUTF8(FormatError(ex));
         }
+    }
+
+    /// <summary>Splits a comma-separated column list (from a native PARTITIONED BY clause, marshaled by C++) into a
+    /// trimmed non-empty list, or null when absent/empty. Providers that don't partition ignore the argument.</summary>
+    private static IReadOnlyList<string>? SplitColumnList(string? csv)
+    {
+        if (string.IsNullOrWhiteSpace(csv))
+        {
+            return null;
+        }
+        var list = new List<string>();
+        foreach (var part in csv.Split(','))
+        {
+            if (!string.IsNullOrWhiteSpace(part))
+            {
+                list.Add(part.Trim());
+            }
+        }
+        return list.Count > 0 ? list : null;
     }
 
     /// <summary>

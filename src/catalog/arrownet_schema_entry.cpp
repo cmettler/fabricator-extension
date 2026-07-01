@@ -37,6 +37,8 @@
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
+#include "catalog/arrownet_partition_util.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/parser/parsed_data/create_aggregate_function_info.hpp"
@@ -2267,6 +2269,10 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::CreateTable(CatalogTransaction t
 		arrownet::DropTable(handle_, name, base.table, /*if_exists=*/true);
 	}
 
+	// Native CREATE TABLE ... PARTITIONED BY (cols): the column names (comma-separated) go to the provider
+	// (the Delta provider records them as partition columns; SQL Server / DAX ignore the arg).
+	string partition_arg = arrownet::PartitionColumnsArg(base.partition_keys);
+
 	// A schema-only Arrow stream carries the column definitions to the backend. The text-column SQL type
 	// (mssql_ctas_text_type / mssql_default_varchar_length) is read C#-side from the provider settings store
 	// (see docs/settings-architecture.md), not passed here.
@@ -2274,7 +2280,7 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::CreateTable(CatalogTransaction t
 	producer.SetNullability(nullable);
 	producer.Finish();
 	arrownet::CreateTable(handle_, name, base.table, *producer.Stream(), if_not_exists, pk_arg, unique_arg,
-	                      defaults_arg);
+	                      defaults_arg, partition_arg);
 
 	// Register the new table (also invalidates any cached entry) and return it.
 	AddTable(base.table, "BASE TABLE");

@@ -202,6 +202,17 @@ public sealed class DeltaWriteDemoFunction : ITableFunction
     }
 }
 
+/// <summary>Resolved per-write tuning for a Delta write, assembled by <see cref="DeltaCatalog"/> from the ATTACH
+/// options (catalog defaults) overlaid with the session <c>delta_write_options</c> JSON setting, plus the
+/// partition columns (native <c>PARTITIONED BY</c> clause, else the setting's <c>partition_by</c>). Any null
+/// member keeps engineered-wood's default. Applied at CREATE/INSERT/CTAS/COPY (partition columns take effect at
+/// table creation and are thereafter preserved from the table metadata for all writes, incl. UPDATE/DELETE).</summary>
+internal sealed record DeltaWriteSpec(
+    EngineeredWood.Compression.CompressionCodec? Compression,
+    int? RowGroupSize,
+    IReadOnlyList<string>? BloomFilterColumns,
+    IReadOnlyList<string>? PartitionColumns);
+
 /// <summary>
 /// Writes a Delta Lake table via engineered-wood through the host FileSystem (the <see cref="DuckDbTableFileSystem"/>
 /// write side + the put-if-absent EXCLUSIVE_CREATE commit). Forces <c>OmitPathInSchema=false</c> so the parquet
@@ -212,13 +223,19 @@ internal static class DeltaWriter
 {
     /// <summary>Delta table options for ALL engineered-wood writes (initial write AND the copy-on-write DELETE
     /// rewrite): the parquet writer MUST emit <c>path_in_schema</c> (OmitPathInSchema=false) or standard readers
-    /// (delta-kernel / Spark / Fabric) reject the footer with <c>TProtocolException: Invalid data</c>.</summary>
-    internal static DeltaTableOptions Options() => DeltaTableOptions.Default with
+    /// (delta-kernel / Spark / Fabric) reject the footer with <c>TProtocolException: Invalid data</c>.
+    /// <paramref name="spec"/> (null =&gt; defaults) carries the resolved per-write tuning (compression /
+    /// row-group size / bloom-filter columns) from the ATTACH options + the <c>delta_write_options</c> setting.</summary>
+    internal static DeltaTableOptions Options(DeltaWriteSpec? spec = null) => DeltaTableOptions.Default with
     {
         ParquetWriteOptions = new ParquetWriteOptions
         {
             OmitPathInSchema = false, // REQUIRED field — standard readers (DuckDB/arrow-rs/Fabric) reject without it
-            RowGroupMaxRows = 122880, // DuckDB's default row-group size
+            RowGroupMaxRows = spec?.RowGroupSize ?? 122880, // default = DuckDB's row-group size
+            Compression = spec?.Compression ?? EngineeredWood.Compression.CompressionCodec.Snappy,
+            BloomFilterColumns = spec?.BloomFilterColumns is { Count: > 0 } bloom
+                ? new HashSet<string>(bloom, System.StringComparer.Ordinal)
+                : null,
         },
     };
 
@@ -273,12 +290,14 @@ internal static class DeltaWriter
     /// Retries on a commit conflict (concurrent writer) by reopening at the new latest version (OCC).</summary>
     public static long Write(nint opener, string path, Schema schema, IReadOnlyList<RecordBatch> batches,
                              DeltaWriteMode mode, CancellationToken ct, bool deletionVectors = false,
-                             bool inCommitTimestamps = false, bool changeDataFeed = false)
+                             bool inCommitTimestamps = false, bool changeDataFeed = false,
+                             DeltaWriteSpec? spec = null)
     {
         for (int attempt = 1; ; attempt++)
         {
             var fs = new DuckDbTableFileSystem(opener, path);
-            var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(),
+            var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(spec),
+                                                     partitionColumns: spec?.PartitionColumns,
                                                      configuration: CreateConfig(deletionVectors, inCommitTimestamps, changeDataFeed),
                                                      cancellationToken: ct).AsTask().GetAwaiter().GetResult();
             try
@@ -304,7 +323,7 @@ internal static class DeltaWriter
     /// <paramref name="deletionVectors"/> enables the DV+rowTracking features (opt-in fast-delete).</summary>
     public static void Create(nint opener, string path, Schema schema, CancellationToken ct,
                               bool deletionVectors = false, bool inCommitTimestamps = false,
-                              bool changeDataFeed = false)
+                              bool changeDataFeed = false, DeltaWriteSpec? spec = null)
     {
         for (int attempt = 1; ; attempt++)
         {
@@ -312,7 +331,8 @@ internal static class DeltaWriter
             try
             {
                 // OpenOrCreate writes commit-0 for a new table (or opens an existing one — no commit, no conflict).
-                var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(),
+                var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(spec),
+                                                         partitionColumns: spec?.PartitionColumns,
                                                          configuration: CreateConfig(deletionVectors, inCommitTimestamps, changeDataFeed),
                                                          cancellationToken: ct).AsTask().GetAwaiter().GetResult();
                 table.DisposeAsync().AsTask().GetAwaiter().GetResult();

@@ -29,6 +29,20 @@ public sealed class DeltaBackend : IBackend
     // this engineered-wood-backed provider from a future delta-rs production provider.
     public IEnumerable<string> Aliases => new[] { "delta", "deltalake" };
 
+    // Session-level write tuning applied just before each CREATE/INSERT/CTAS/COPY, modeled as a JSON object so a
+    // single setting carries several knobs (and is easy to extend). Keys: "compression" (snappy|zstd|gzip|brotli|
+    // lz4|uncompressed|…), "row_group_size" (int rows), "bloom_filter_columns" (string[] dotted paths),
+    // "partition_by" (string[] — applied at CREATE/CTAS; a native PARTITIONED BY clause overrides it). Overlays the
+    // per-catalog ATTACH defaults (compression / row_group_size / bloom_filter_columns). Read by DeltaCatalog from
+    // ProviderSettingsStore at write time — see docs/delta-catalog.md "Write tuning".
+    public const string WriteOptionsSetting = "delta_write_options";
+
+    public IEnumerable<ProviderSetting> Settings => new[]
+    {
+        new ProviderSetting(WriteOptionsSetting, ProviderSettingType.Varchar, Default: null,
+            Description: "Delta write tuning as a JSON object (compression, row_group_size, bloom_filter_columns, partition_by), applied to CREATE/INSERT/CTAS."),
+    };
+
     // The connstr IS the folder root. Data-file IO is via DuckDB FS secrets (the opener). An azure SP secret on
     // a OneLake ATTACH additionally authenticates the Fabric REST API used to list tables (the glob bug
     // workaround) — carry its fields to the catalog as a credential marker on the root (mirrors the DAX provider).
@@ -83,6 +97,11 @@ public sealed class DeltaCatalog : IBackendCatalog
     // DROP all schema-aware). Default false = the flat <root>/<table>, "main"-only layout. Ignored for OneLake
     // (its layout is driven by the lakehouse's schema-enabled flag, not this option).
     private readonly bool _schemas;
+    // Per-catalog write-tuning DEFAULTS from the ATTACH options (overlaid by the session delta_write_options
+    // setting at write time). Null => engineered-wood's default. See ResolveWriteSpec.
+    private readonly string? _defaultCompression;
+    private readonly int? _defaultRowGroupSize;
+    private readonly IReadOnlyList<string>? _defaultBloomColumns;
 
     public DeltaCatalog(string root) : this(root, "{}") { }
 
@@ -95,6 +114,9 @@ public sealed class DeltaCatalog : IBackendCatalog
         _inCommitTimestampsOnCreate = ParseBoolOption(optionsJson, "in_commit_timestamps");
         _changeDataFeedOnCreate = ParseBoolOption(optionsJson, "change_data_feed");
         _schemas = ParseBoolOption(optionsJson, "schemas");
+        _defaultCompression = ParseStringOption(optionsJson, "compression");
+        _defaultRowGroupSize = ParseIntOption(optionsJson, "row_group_size");
+        _defaultBloomColumns = ParseListOption(optionsJson, "bloom_filter_columns");
     }
 
     /// <summary>True when this catalog uses the two-level <c>&lt;root&gt;/&lt;schema&gt;/&lt;table&gt;</c> layout:
@@ -123,6 +145,125 @@ public sealed class DeltaCatalog : IBackendCatalog
         }
         return false;
     }
+
+    /// <summary>Reads a string ATTACH option (null if absent/blank/unparseable).</summary>
+    private static string? ParseStringOption(string? optionsJson, string key)
+    {
+        if (string.IsNullOrEmpty(optionsJson)) { return null; }
+        try
+        {
+            using var doc = JsonDocument.Parse(optionsJson);
+            if (doc.RootElement.ValueKind == JsonValueKind.Object
+                && doc.RootElement.TryGetProperty(key, out var el))
+            {
+                var s = el.ValueKind == JsonValueKind.String ? el.GetString() : el.ToString();
+                return string.IsNullOrWhiteSpace(s) ? null : s;
+            }
+        }
+        catch (JsonException) { }
+        return null;
+    }
+
+    /// <summary>Reads an int ATTACH option (accepts a JSON number or numeric string; null if absent/unparseable).</summary>
+    private static int? ParseIntOption(string? optionsJson, string key)
+    {
+        var s = ParseStringOption(optionsJson, key);
+        return int.TryParse(s, out var v) ? v : (int?)null;
+    }
+
+    /// <summary>Reads a list ATTACH option — a JSON array OR a comma-separated string (null if absent/empty).</summary>
+    private static IReadOnlyList<string>? ParseListOption(string? optionsJson, string key)
+    {
+        if (string.IsNullOrEmpty(optionsJson)) { return null; }
+        try
+        {
+            using var doc = JsonDocument.Parse(optionsJson);
+            if (doc.RootElement.ValueKind == JsonValueKind.Object
+                && doc.RootElement.TryGetProperty(key, out var el))
+            {
+                return ReadStringList(el);
+            }
+        }
+        catch (JsonException) { }
+        return null;
+    }
+
+    /// <summary>A JSON array of strings, or a single comma-separated string, → a trimmed non-empty list (null if none).</summary>
+    private static IReadOnlyList<string>? ReadStringList(JsonElement el)
+    {
+        var list = new List<string>();
+        if (el.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in el.EnumerateArray())
+            {
+                var s = item.ValueKind == JsonValueKind.String ? item.GetString() : item.ToString();
+                if (!string.IsNullOrWhiteSpace(s)) { list.Add(s!.Trim()); }
+            }
+        }
+        else
+        {
+            var raw = el.ValueKind == JsonValueKind.String ? el.GetString() : el.ToString();
+            foreach (var part in (raw ?? string.Empty).Split(','))
+            {
+                if (!string.IsNullOrWhiteSpace(part)) { list.Add(part.Trim()); }
+            }
+        }
+        return list.Count > 0 ? list : null;
+    }
+
+    /// <summary>Maps a compression name (case-insensitive) to engineered-wood's codec; null if unset/unknown
+    /// (=> engineered-wood's Snappy default).</summary>
+    private static EngineeredWood.Compression.CompressionCodec? ParseCompression(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name)) { return null; }
+        return name.Trim().ToLowerInvariant() switch
+        {
+            "snappy" => EngineeredWood.Compression.CompressionCodec.Snappy,
+            "zstd" => EngineeredWood.Compression.CompressionCodec.Zstd,
+            "gzip" => EngineeredWood.Compression.CompressionCodec.Gzip,
+            "brotli" => EngineeredWood.Compression.CompressionCodec.Brotli,
+            "lz4" => EngineeredWood.Compression.CompressionCodec.Lz4,
+            "lz4_hadoop" or "lz4hadoop" => EngineeredWood.Compression.CompressionCodec.Lz4Hadoop,
+            "deflate" => EngineeredWood.Compression.CompressionCodec.Deflate,
+            "lzo" => EngineeredWood.Compression.CompressionCodec.Lzo,
+            "none" or "uncompressed" => EngineeredWood.Compression.CompressionCodec.Uncompressed,
+            _ => null,
+        };
+    }
+
+    /// <summary>Resolves the effective write tuning for one write: the per-catalog ATTACH defaults overlaid with the
+    /// session <c>delta_write_options</c> JSON setting (setting wins per key). Partition columns come from
+    /// <paramref name="nativePartitionColumns"/> (a native <c>PARTITIONED BY</c> clause) when present, else the
+    /// setting's <c>partition_by</c>. Returns null only when nothing is specified (=> engineered-wood defaults).</summary>
+    private DeltaWriteSpec? ResolveWriteSpec(IReadOnlyList<string>? nativePartitionColumns)
+    {
+        var sessionJson = ProviderSettingsStore.Instance.GetString(
+            DeltaBackendName, DeltaBackend.WriteOptionsSetting);
+
+        string? compression = _defaultCompression;
+        int? rowGroup = _defaultRowGroupSize;
+        IReadOnlyList<string>? bloom = _defaultBloomColumns;
+        IReadOnlyList<string>? settingPartition = null;
+
+        if (!string.IsNullOrWhiteSpace(sessionJson))
+        {
+            compression = ParseStringOption(sessionJson, "compression") ?? compression;
+            rowGroup = ParseIntOption(sessionJson, "row_group_size") ?? rowGroup;
+            bloom = ParseListOption(sessionJson, "bloom_filter_columns") ?? bloom;
+            settingPartition = ParseListOption(sessionJson, "partition_by");
+        }
+
+        var partition = nativePartitionColumns is { Count: > 0 } ? nativePartitionColumns : settingPartition;
+        var codec = ParseCompression(compression);
+
+        if (codec is null && rowGroup is null && bloom is null && (partition is null || partition.Count == 0))
+        {
+            return null;
+        }
+        return new DeltaWriteSpec(codec, rowGroup, bloom, partition);
+    }
+
+    private const string DeltaBackendName = "engineeredwooddelta";
 
     private static string Normalize(string p) => p.Replace('\\', '/');
 
@@ -428,26 +569,32 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// opener was re-established on it by BulkSession. createTable/replace => Overwrite (CTAS/REPLACE: the table
     /// becomes exactly these rows); otherwise Append (INSERT). One Delta commit. Returns rows written.</summary>
     public long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable,
-                           bool replace, bool checkConstraints, long txnId)
+                           bool replace, bool checkConstraints, long txnId, IReadOnlyList<string>? partitionColumns)
     {
         var opener = AmbientOpener.Current;
         var (schema, batches, rows) = DeltaWriter.Materialize(data, default);
         var mode = createTable || replace ? DeltaWriteMode.Overwrite : DeltaWriteMode.Append;
+        // Partition columns take effect only at table creation; an INSERT (Append) into an existing table
+        // preserves the table's declared partitioning (engineered-wood reads it from the metadata).
+        var native = createTable || replace ? partitionColumns : null;
         DeltaWriter.Write(opener, TablePath(schemaName, tableName), schema, batches, mode, default,
                           deletionVectors: _deletionVectorsOnCreate,
                           inCommitTimestamps: _inCommitTimestampsOnCreate,
-                          changeDataFeed: _changeDataFeedOnCreate);
+                          changeDataFeed: _changeDataFeedOnCreate,
+                          spec: ResolveWriteSpec(native));
         return rows;
     }
 
     /// <summary>Creates an empty Delta table (commit 0 with the schema). Idempotent (OpenOrCreate), so
     /// <paramref name="ifNotExists"/> is satisfied; PK/UNIQUE/DEFAULT are ignored (Delta has no such constraints).</summary>
     public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists,
-                            string? primaryKey, string? uniques, string? defaults)
+                            string? primaryKey, string? uniques, string? defaults,
+                            IReadOnlyList<string>? partitionColumns)
         => DeltaWriter.Create(AmbientOpener.Current, TablePath(schemaName, tableName), columns, default,
                               deletionVectors: _deletionVectorsOnCreate,
                               inCommitTimestamps: _inCommitTimestampsOnCreate,
-                              changeDataFeed: _changeDataFeedOnCreate);
+                              changeDataFeed: _changeDataFeedOnCreate,
+                              spec: ResolveWriteSpec(partitionColumns));
 
     /// <summary>CREATE SCHEMA. In <c>schemas</c> mode (non-OneLake) it materializes the <c>&lt;root&gt;/&lt;schema&gt;/</c>
     /// subfolder so a subsequent CREATE TABLE lands there (and the schema is rediscovered once it holds a table).

@@ -66,7 +66,8 @@ unique_ptr<GlobalSinkState> ArrowNetPhysicalCreateTableAs::GetGlobalSinkState(Cl
 	arrownet::SetActiveOpener(reinterpret_cast<ArrowNetHandle>(&context)); // host-FS opener for a Delta-catalog CTAS
 	gstate->bulk_session = arrownet::BeginBulk(info_.handle, info_.schema_name, info_.table_name,
 	                                           /*create_table=*/true, info_.replace, /*check_constraints=*/false,
-	                                           (int64_t)context.ActiveTransaction().global_transaction_id, schema);
+	                                           (int64_t)context.ActiveTransaction().global_transaction_id, schema,
+	                                           info_.partition_columns);
 	return std::move(gstate);
 }
 

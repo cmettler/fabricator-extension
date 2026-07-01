@@ -414,6 +414,26 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      `CdfConfig.IsEnabled(config)` and throws "Change Data Feed is not enabled" otherwise (Spark
      `DELTA_CHANGE_DATA_FEED_NOT_ENABLED` parity). `verify_delta_catalog_changes.test` (45); live Fabric on
      `Test`/`LH` (`lake.dbo.arrownet_cdftest`: CTAS → DELETE → UPDATE → correct feed + snapshot operations).
+
+     **PARTITIONING + WRITE TUNING — DONE + VALIDATED LIVE ON FABRIC (ABI v51).** Two ways to declare partition
+     columns: (1) the **native `CREATE TABLE [t] PARTITIONED BY (cols) [AS …]`** clause (DuckDB v1.5.4 parses it
+     into `CreateTableInfo::partition_keys`; the clause precedes `AS` for CTAS) — the base
+     `Catalog::SupportsCreateTable` rejects any partition_keys, so `ArrowNetCatalog::SupportsCreateTable` is
+     overridden to permit them (SORTED BY + WITH-options stay unsupported); C++ extracts the names
+     (`arrownet::PartitionColumnsArg`, column-refs only) in the DDL `CreateTable` + CTAS (`ArrowNetCtasInfo`) and
+     passes a comma-separated `partition_columns` arg through **`create_table` + `begin_bulk`** (the ABI v51 bump —
+     a signature change on both, provider-agnostic: SQL Server / DAX ignore it); (2) the session
+     **`delta_write_options`** JSON setting's `partition_by` (used when there's no native clause). engineered-wood's
+     `WriteAsync` lays out `<table>/<col>=<value>/*.parquet` + records `add.partitionValues`, and reads
+     `Metadata.PartitionColumns` so a later INSERT/Append preserves the layout (partition columns take effect only
+     at CREATE/CTAS). **Write tuning** (compression / row_group_size / bloom_filter_columns) is a per-catalog ATTACH
+     default overlaid by the same `delta_write_options` JSON setting (setting wins per key); resolved by
+     `DeltaCatalog.ResolveWriteSpec` → `DeltaWriteSpec` → `DeltaWriter.Options` → `ParquetWriteOptions`.
+     engineered-wood's `ParquetWriteOptions` is delta-rs-class (per-column codec/encoding overrides, bloom filters,
+     page version/size, float column order, KV metadata); our defaults auto-enable dictionary encoding + always
+     collect min/max stats (driving file + row-group pruning), Snappy compression, bloom filters off — good
+     defaults, nothing required. Validated: `verify_delta_catalog_partition.test` (54); native partitioning live on
+     Fabric OneLake (`LH.dbo.arrownet_parttest`, `region=US/EU/APAC`).
 3. **DELETE — FINAL: copy-on-write + transient `(file,position)` rowid, PLAIN Delta (no features).** The
    detailed design below (row tracking + deletion vectors) is the SUPERSEDED first attempt — kept as the trail.
    Why it changed: Fabric's OneLake converter / Spark could not read our row-tracking + DV commits (first from

@@ -837,7 +837,7 @@ void ScanTable(ArrowNetHandle handle, const std::string &schema, const std::stri
 
 void CreateTable(ArrowNetHandle handle, const std::string &schema, const std::string &table, ArrowArrayStream &columns,
                  bool if_not_exists, const std::string &pk_columns, const std::string &unique_columns,
-                 const std::string &defaults) {
+                 const std::string &defaults, const std::string &partition_columns) {
 	const ArrowNetVTable &vt = GetBridge();
 	if (!vt.create_table) {
 		throw duckdb::IOException("ArrowNet: bridge does not provide create_table");
@@ -846,7 +846,8 @@ void CreateTable(ArrowNetHandle handle, const std::string &schema, const std::st
 	int32_t rc = vt.create_table(handle, schema.c_str(), table.c_str(), &columns, if_not_exists ? 1 : 0,
 	                             pk_columns.empty() ? nullptr : pk_columns.c_str(),
 	                             unique_columns.empty() ? nullptr : unique_columns.c_str(),
-	                             defaults.empty() ? nullptr : defaults.c_str(), &err);
+	                             defaults.empty() ? nullptr : defaults.c_str(),
+	                             partition_columns.empty() ? nullptr : partition_columns.c_str(), &err);
 	if (rc != ARROWNET_OK) {
 		ThrowManagedError(vt, err, "ArrowNet: create_table failed");
 	}
@@ -950,7 +951,8 @@ void InsertReturning(ArrowNetHandle handle, const std::string &schema, const std
 }
 
 ArrowNetHandle BeginBulk(ArrowNetHandle handle, const std::string &schema, const std::string &table, bool create_table,
-                         bool replace, bool check_constraints, int64_t txn_id, ArrowSchema &schema_in) {
+                         bool replace, bool check_constraints, int64_t txn_id, ArrowSchema &schema_in,
+                         const std::string &partition_columns) {
 	const ArrowNetVTable &vt = GetBridge();
 	if (!vt.begin_bulk) {
 		throw duckdb::IOException("ArrowNet: bridge does not provide begin_bulk");
@@ -958,7 +960,8 @@ ArrowNetHandle BeginBulk(ArrowNetHandle handle, const std::string &schema, const
 	ArrowNetHandle session = nullptr;
 	char *err = nullptr;
 	int32_t rc = vt.begin_bulk(handle, schema.c_str(), table.c_str(), create_table ? 1 : 0, replace ? 1 : 0,
-	                           check_constraints ? 1 : 0, txn_id, &schema_in, &session, &err);
+	                           check_constraints ? 1 : 0, txn_id, &schema_in,
+	                           partition_columns.empty() ? nullptr : partition_columns.c_str(), &session, &err);
 	if (rc != ARROWNET_OK) {
 		ThrowManagedError(vt, err, "ArrowNet: begin_bulk failed");
 	}

@@ -75,7 +75,8 @@ public sealed class StubBackend : IBackend
             throw new NotSupportedException("stub backend has no aggregate functions");
 
         public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists,
-                                string? primaryKey, string? uniques, string? defaults)
+                                string? primaryKey, string? uniques, string? defaults,
+                                IReadOnlyList<string>? partitionColumns)
         {
         }
 
@@ -122,7 +123,8 @@ public sealed class StubBackend : IBackend
         }
 
         public long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable,
-                               bool replace, bool checkConstraints, long txnId) => CountRows(data);
+                               bool replace, bool checkConstraints, long txnId,
+                               IReadOnlyList<string>? partitionColumns) => CountRows(data);
 
         public long ExecuteDelete(string schemaName, string tableName, IArrowArrayStream keys) => CountRows(keys);
 

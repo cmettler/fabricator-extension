@@ -816,8 +816,9 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     }
 
     public long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable, bool replace,
-                           bool checkConstraints, long txnId)
+                           bool checkConstraints, long txnId, IReadOnlyList<string>? partitionColumns)
     {
+        // partitionColumns is a Delta/lakehouse concept; SQL Server table partitioning is out of scope here — ignored.
         // The bulk-copy runs on a background task (its own pool thread), so the host can't carry the active
         // transaction id to us via the per-thread ambient — it captured it at begin_bulk and hands it here;
         // we re-establish it on THIS thread so BeginWrite + read-your-writes use the right per-transaction
@@ -1437,8 +1438,9 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     }
 
     public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists, string? primaryKey,
-                            string? uniques, string? defaults)
+                            string? uniques, string? defaults, IReadOnlyList<string>? partitionColumns)
     {
+        // partitionColumns is a Delta/lakehouse concept; not applied to SQL Server DDL here (ignored).
         // Route through BeginWrite so this participates in the pinned transaction
         // when one is active — without it, CREATE OR REPLACE (DROP pinned + CREATE
         // fresh) would self-deadlock on the dropped table's schema lock.

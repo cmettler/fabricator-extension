@@ -1,0 +1,126 @@
+# name: test/verify_delta_catalog_partition.test
+# description: Delta folder-as-catalog PARTITIONING. Two ways to declare partition columns: (1) the native
+#              CREATE TABLE [t] PARTITIONED BY (cols) [AS ...] clause (DuckDB v1.5.4 parses partition_keys;
+#              ArrowNetCatalog::SupportsCreateTable permits them, extracted in C++ and passed to create_table/
+#              begin_bulk); (2) the session `delta_write_options` JSON setting's "partition_by" (applied at
+#              CREATE/CTAS; a native clause overrides it). engineered-wood lays out data as <root>/<table>/
+#              <col>=<value>/*.parquet and records partitionValues; DuckDB reads them transparently. The JSON
+#              setting also carries write tuning (compression / row_group_size / bloom_filter_columns).
+#              Set ARROWNET_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
+# group: [mssql_net]
+
+require mssql_net
+
+require-env ARROWNET_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogpart' AS lake (TYPE arrownet, PROVIDER 'delta');
+
+# --- Native PARTITIONED BY on CTAS (clause precedes AS) ---
+statement ok
+CREATE TABLE lake.main.sales PARTITIONED BY (region) AS
+  SELECT * FROM (VALUES (1,'US',10),(2,'US',20),(3,'EU',30),(4,'EU',40)) AS t(id,region,amt);
+
+# All rows present and correct after the partitioned write.
+query TII
+SELECT region, count(*), sum(amt) FROM lake.main.sales GROUP BY region ORDER BY region;
+----
+EU	2	70
+US	2	30
+
+# A predicate on the partition column returns exactly its rows (DuckDB reads partitioned data transparently).
+query II
+SELECT id, amt FROM lake.main.sales WHERE region='EU' ORDER BY id;
+----
+3	30
+4	40
+
+# Non-partition predicate still works.
+query T
+SELECT region FROM lake.main.sales WHERE id=1;
+----
+US
+
+# --- Native PARTITIONED BY on empty CREATE + INSERT (partitioning preserved from metadata on append) ---
+statement ok
+CREATE TABLE lake.main.evt (id INTEGER, y INTEGER, v VARCHAR) PARTITIONED BY (y);
+
+statement ok
+INSERT INTO lake.main.evt VALUES (1,2023,'a'),(2,2024,'b'),(3,2024,'c');
+
+statement ok
+INSERT INTO lake.main.evt VALUES (4,2023,'d');
+
+query II
+SELECT y, count(*) FROM lake.main.evt GROUP BY y ORDER BY y;
+----
+2023	2
+2024	2
+
+query T
+SELECT v FROM lake.main.evt WHERE y=2024 AND id=3;
+----
+c
+
+# --- Multi-column partitioning ---
+statement ok
+CREATE TABLE lake.main.multi PARTITIONED BY (a, b) AS
+  SELECT * FROM (VALUES (1,'x',10),(2,'x',20),(3,'y',10)) AS t(id,a,b);
+
+query TII
+SELECT a, b, count(*) FROM lake.main.multi GROUP BY a, b ORDER BY a, b;
+----
+x	10	1
+x	20	1
+y	10	1
+
+# --- Partitioning via the session delta_write_options JSON setting (no native clause) ---
+statement ok
+SET delta_write_options='{"partition_by":["g"],"compression":"zstd"}';
+
+statement ok
+CREATE TABLE lake.main.viasetting AS SELECT * FROM (VALUES (1,'p'),(2,'q'),(3,'p')) AS t(id,g);
+
+query TI
+SELECT g, count(*) FROM lake.main.viasetting GROUP BY g ORDER BY g;
+----
+p	2
+q	1
+
+# Reset the setting so it doesn't leak into later statements/files.
+statement ok
+SET delta_write_options='';
+
+# A native clause overrides the setting's partition_by. Set an (unused) setting, then partition natively by a
+# different column; the query is a smoke check that the native write succeeds and reads back.
+statement ok
+SET delta_write_options='{"partition_by":["id"]}';
+
+statement ok
+CREATE TABLE lake.main.override PARTITIONED BY (region) AS
+  SELECT * FROM (VALUES (1,'US'),(2,'EU')) AS t(id,region);
+
+query TI
+SELECT region, count(*) FROM lake.main.override GROUP BY region ORDER BY region;
+----
+EU	1
+US	1
+
+statement ok
+SET delta_write_options='';
+
+# Partitioned tables survive detach/re-attach (partitionColumns are in the table metadata).
+statement ok
+DETACH lake;
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogpart' AS lake (TYPE arrownet, PROVIDER 'delta');
+
+query TII
+SELECT region, count(*), sum(amt) FROM lake.main.sales GROUP BY region ORDER BY region;
+----
+EU	2	70
+US	2	30
+
+statement ok
+DETACH lake;

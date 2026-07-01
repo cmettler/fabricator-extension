@@ -1101,7 +1101,25 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v50** (v50 = **directory move/rename** — appended `fs_move_dir(opener,src,dest,…)` to
+- **Current version: ABI v51** (v51 = **native `PARTITIONED BY`** — appended a `partition_columns` param (nullable,
+  comma-separated column names) to **both** `create_table` and `begin_bulk` (a signature change, not a slot add).
+  DuckDB v1.5.4 parses `CREATE TABLE [t] PARTITIONED BY (cols) [AS …]` into `CreateTableInfo::partition_keys`
+  (clause precedes `AS` for CTAS); the base `Catalog::SupportsCreateTable` REJECTS any partition_keys, so
+  `ArrowNetCatalog::SupportsCreateTable` is overridden to **permit** them (SORTED BY + WITH-options stay
+  unsupported). C++ extracts the column names (`arrownet::PartitionColumnsArg`, `catalog/arrownet_partition_util.hpp`
+  — column-refs only) in the DDL create (`ArrowNetSchemaEntry::CreateTable`) and CTAS (`ArrowNetCtasInfo`), passes
+  them to `create_table`/`begin_bulk`; C# `SplitColumnList` → `IReadOnlyList<string>` → `DeltaCatalog` →
+  engineered-wood `CreateAsync(partitionColumns:)` (Hive `<table>/<col>=<value>/*.parquet`, reads
+  `Metadata.PartitionColumns` so INSERT/Append preserve the layout). **Provider-agnostic**: SQL Server / DAX
+  ignore the arg (only Delta partitions). Also (C#-only, NO ABI): a **`delta_write_options` DuckDB session
+  setting** (JSON — `compression`/`row_group_size`/`bloom_filter_columns`/`partition_by`) overlaying per-catalog
+  ATTACH write-tuning defaults (`compression`/`row_group_size`/`bloom_filter_columns`), resolved by
+  `DeltaCatalog.ResolveWriteSpec` → `DeltaWriteSpec` → `DeltaWriter.Options`; a native `PARTITIONED BY` clause
+  overrides the setting's `partition_by`. engineered-wood's `ParquetWriteOptions` is delta-rs-class (auto
+  dictionary + always-on min/max stats; bloom off by default). Validated: `test/verify_delta_catalog_partition.test`
+  (54 — native CTAS/empty-CREATE+INSERT/multi-column/setting/override/re-attach), full Delta suite + SqlServer
+  columnstore (CREATE+CTAS) unregressed, native partitioning **live on Fabric OneLake** (`LH.dbo.arrownet_parttest`,
+  `region=US/EU/APAC`). v50 = **directory move/rename** — appended `fs_move_dir(opener,src,dest,…)` to
   `ArrowNetHostServices` (the reverse host→managed struct): maps to DuckDB's `FileSystem::MoveFile` — an atomic
   directory rename on a local filesystem; object stores (S3/Azure DFS) throw "not implemented". Powers **local/S3
   Delta catalog RENAME TABLE** (`DeltaCatalog.AlterTable` RenameTable → `HostFs.MoveDir`; OneLake still renames via

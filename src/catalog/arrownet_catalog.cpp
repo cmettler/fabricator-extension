@@ -3,6 +3,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "catalog/arrownet_catalog.hpp"
+#include "catalog/arrownet_partition_util.hpp"
 
 #include "arrownet/clr_host.hpp"
 #include "catalog/arrownet_metadata.hpp"
@@ -19,7 +20,9 @@
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
+#include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
@@ -255,6 +258,20 @@ void ArrowNetCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 	lock_guard<mutex> lock(schema_lock_);
 	schemas_.erase(info.name);
 }
+ErrorData ArrowNetCatalog::SupportsCreateTable(BoundCreateTableInfo &info) {
+	// Permit PARTITIONED BY (the base Catalog rejects it). SORTED BY and the WITH-options clause remain
+	// unsupported — a provider that can't honor them shouldn't silently drop them.
+	auto &base = info.Base().Cast<CreateTableInfo>();
+	if (!base.sort_keys.empty()) {
+		return ErrorData(ExceptionType::CATALOG,
+		                 StringUtil::Format("SORTED BY is not supported for tables in a %s catalog", GetCatalogType()));
+	}
+	if (!base.options.empty()) {
+		return ErrorData(ExceptionType::CATALOG,
+		                 StringUtil::Format("WITH clause is not supported for tables in a %s catalog", GetCatalogType()));
+	}
+	return ErrorData();
+}
 PhysicalOperator &ArrowNetCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
                                                      LogicalCreateTable &op, PhysicalOperator &plan) {
 	auto &create_info = op.info->base->Cast<CreateTableInfo>();
@@ -267,6 +284,7 @@ PhysicalOperator &ArrowNetCatalog::PlanCreateTableAs(ClientContext &context, Phy
 		info.column_types.push_back(col.Type());
 	}
 	info.replace = op.info->base->on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT;
+	info.partition_columns = arrownet::PartitionColumnsArg(create_info.partition_keys); // native PARTITIONED BY
 	info.handle = handle_;
 	info.schema_entry = &op.schema.Cast<ArrowNetSchemaEntry>();
 

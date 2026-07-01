@@ -610,6 +610,8 @@ SELECT * FROM lake.main.t WHERE id > 10;          -- streaming scan + file/row-g
 | Time travel: `FROM t AT (VERSION => n)` and `AT (TIMESTAMP => ts)` | ✅ |
 | Snapshots/history: `arrownet_delta_snapshots('<catalog>', '<schema.>table')` | ✅ |
 | **Change Data Feed**: `change_data_feed true` + `arrownet_delta_changes('<catalog>', '<schema.>table', from[, to])` | ✅ |
+| **Partitioning**: native `CREATE TABLE … PARTITIONED BY (cols)` (or the `delta_write_options` setting) → Hive `col=value/` layout | ✅ |
+| **Write tuning**: compression / row-group size / bloom filters via ATTACH options or the `delta_write_options` JSON setting | ✅ |
 | Concurrent writers (OCC retry on append/CTAS; rowid DML is snapshot-bound) | ✅ |
 
 ```sql
@@ -626,8 +628,37 @@ SELECT _change_type, id, val, _commit_version, _commit_timestamp
 -- insert/insert (v1), delete (v2): each row tagged with its commit version + timestamp (epoch ms)
 ```
 
+### Partitioning & write tuning
+
+Tables can be **partitioned** with the native DuckDB `PARTITIONED BY` clause (the column list comes before
+`AS`), producing a Hive-style `<table>/<col>=<value>/*.parquet` layout that DuckDB reads transparently.
+Partition columns are recorded in the table metadata, so a later `INSERT` preserves the layout.
+
+```sql
+CREATE TABLE lake.main.sales PARTITIONED BY (region) AS SELECT * FROM src;   -- CTAS
+CREATE TABLE lake.main.evt (id INT, y INT, v VARCHAR) PARTITIONED BY (y);     -- empty + INSERT
+```
+
+Parquet write tuning is set either as **per-catalog ATTACH defaults** or a **session `delta_write_options`
+JSON setting** (the setting overlays the ATTACH defaults per key; its `partition_by` is used when there's no
+native clause). Applies to CREATE / INSERT / CTAS / COPY.
+
+```sql
+ATTACH '/lake' AS lake (TYPE mssql_net, PROVIDER 'delta',
+  compression 'zstd', row_group_size 1000000, bloom_filter_columns 'id,email');
+
+SET delta_write_options = '{"compression":"zstd","row_group_size":1000000,
+                            "bloom_filter_columns":["id"],"partition_by":["region","year"]}';
+```
+
+Compression: `snappy` (default) / `zstd` / `gzip` / `brotli` / `lz4` / `uncompressed` / …. Dictionary
+encoding is auto-enabled per column and min/max statistics are always collected (driving file + row-group
+pruning); bloom filters are off unless requested. (Partitioning is honored by the Delta provider; the
+SQL Server / DAX providers ignore `PARTITIONED BY`.)
+
 Delta ATTACH options: `PROVIDER 'delta'`, `SECRET <azure_sp>` (OneLake/ADLS auth), `READ_ONLY false`
-(required for OneLake writes), `schemas true` (two-level layout on local/S3), `deletion_vectors true`
+(required for OneLake writes), `schemas true` (two-level layout on local/S3), `compression` / `row_group_size`
+/ `bloom_filter_columns` (write-tuning defaults), `deletion_vectors true`
 (DV-based DELETE/UPDATE), `change_data_feed true` (CDF capture), `in_commit_timestamps true` (in-protocol
 monotonic timestamps for Spark/Fabric interop — `AT (TIMESTAMP)` also resolves on plain tables via the
 always-on commit timestamp). Tables are written as **plain Delta** (minReader 1 / minWriter 2, no features)

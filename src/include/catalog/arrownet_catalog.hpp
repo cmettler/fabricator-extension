@@ -66,6 +66,11 @@ public:
 		return true;
 	}
 
+	//! Allow CREATE TABLE [AS] ... PARTITIONED BY (cols): the base Catalog rejects any partition_keys, so we
+	//! override to permit them (a partitioning provider — Delta — lays out the data by partition; SQL Server /
+	//! DAX ignore the columns). SORTED BY and the WITH-options clause stay unsupported.
+	ErrorData SupportsCreateTable(BoundCreateTableInfo &info) override;
+
 	optional_ptr<CatalogEntry> CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) override;
 	optional_ptr<SchemaCatalogEntry> LookupSchema(CatalogTransaction transaction,
 	                                              const EntryLookupInfo &schema_lookup,

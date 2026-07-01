@@ -147,7 +147,7 @@ void ScanTable(ArrowNetHandle handle, const std::string &schema, const std::stri
 // = base64(value-text) or "-" for DEFAULT NULL). Consumes `columns`.
 void CreateTable(ArrowNetHandle handle, const std::string &schema, const std::string &table, ArrowArrayStream &columns,
                  bool if_not_exists, const std::string &pk_columns, const std::string &unique_columns,
-                 const std::string &defaults);
+                 const std::string &defaults, const std::string &partition_columns = "");
 
 // DDL: drop a table (`if_exists` suppresses the missing-table error).
 void DropTable(ArrowNetHandle handle, const std::string &schema, const std::string &table, bool if_exists);
@@ -191,7 +191,8 @@ void InsertReturning(ArrowNetHandle handle, const std::string &schema, const std
 // semantics; SqlBulkCopy skips them by default — pass false for COPY/CTAS bulk speed).
 // Returns an opaque session handle to push batches into and complete later.
 ArrowNetHandle BeginBulk(ArrowNetHandle handle, const std::string &schema, const std::string &table, bool create_table,
-                         bool replace, bool check_constraints, int64_t txn_id, ArrowSchema &schema_in);
+                         bool replace, bool check_constraints, int64_t txn_id, ArrowSchema &schema_in,
+                         const std::string &partition_columns = "");
 
 // Record the DuckDB transaction id in effect on this thread (global_transaction_id), so the next
 // connection-using bridge call keys its per-transaction provider connection by it. Call immediately before
