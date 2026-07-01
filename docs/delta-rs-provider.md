@@ -59,9 +59,30 @@ end on Windows via `test/verify_delta_rs.test` (25 assertions) and a live shell 
   - **`ReadAsArrowTableAsync` at a version** — delta-dotnet's *kernel* read is latest-only (a versioned load
     sets `isKernelSupported=false`). Sidestepped: time travel reads via QueryAsync (DataFusion), which reads
     the loaded snapshot without the kernel. So time travel works; only the kernel read path is latest-only.
-- **Not yet wired** (design is below): cloud discovery (v1 lists local roots only; `storage_options` mapping
-  is coded in `StorageOptionsCodec` but unproven), a first-class MERGE surface (delta-rs MERGE is used
-  internally for DELETE/UPDATE), TIMESTAMP time travel (wired, unverified).
+- **Not yet wired**: cloud discovery, a first-class MERGE surface (delta-rs MERGE is used internally for
+  DELETE/UPDATE), TIMESTAMP time travel (wired via `LoadDateTimeAsync`, unverified).
+
+### Cloud discovery — the approach (live-gated, deliberately not shipped untested)
+
+Local FS works fully; cloud (OneLake / abfss / s3) is the remaining frontier. The **auth half is coded**
+(`StorageOptionsCodec` maps an ATTACH'd `azure`/`s3`/`gcs` secret → object_store keys), but two pieces remain,
+and both can only be validated against live cloud — so they are **not implemented blind**:
+
+1. **Table discovery** — `DiscoverPairs` lists local `_delta_log` subdirs; delta-dotnet exposes no directory
+   listing, so a cloud root needs an external lister. For **OneLake** that is the Bridge's `FabricLakehouse`
+   (Azure `DataLakeFileSystemClient.GetPaths` over the DFS endpoint) — but it is `internal` to the Bridge and
+   its credential path is coupled to engineered-wood's DuckDB-azure IO. Reusing it means: make it
+   `public`/`InternalsVisibleTo("ArrowNet.DeltaRs")`, and have `DeltaRsCatalog` mint a `ClientSecretCredential`
+   from the SP fields (like `DaxCatalog`) for the DFS listing.
+2. **Reads** go through delta-rs's own `object_store` (the `azure_storage_*` keys), a **separate credential
+   path** from the DFS listing — and delta-rs's OneLake object_store path is **unproven** (OneLake auth
+   specifics). This is the real risk: a live test could fail for auth/object_store reasons unrelated to our
+   code, so it needs a focused live session (the Fabric SP in the gitignored `dax_secret.sql`), not a blind
+   commit.
+
+Recommended: do cloud as a dedicated live-validation pass — (a) expose `FabricLakehouse`, (b) OneLake discovery
+via a minted credential, (c) prove a delta-rs object_store OneLake read round-trips, then (d) S3/plain-ADLS via
+the host-FS glob. Until then the provider is **local-FS only**.
 - **Scan schema note**: the scan uses `ReadAsArrowTableAsync` (schema == the bound `table.Schema()`), NOT
   DataFusion `QueryAsync` "SELECT *" — the latter's output schema diverged from the bound schema and
   **SIGSEGV'd `arrow_ingest`**. Materialize-and-serve is correct-first; streaming + pushdown is the follow-up.
