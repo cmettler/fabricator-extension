@@ -126,7 +126,7 @@ public sealed class StubBackend : IBackend
         public long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable,
                                bool replace, bool checkConstraints, long txnId,
                                IReadOnlyList<string>? partitionColumns,
-                               IReadOnlyList<string>? sortColumns) => CountRows(data);
+                               IReadOnlyList<string>? sortColumns, string? schemaMode) => CountRows(data);
 
         public long ExecuteDelete(string schemaName, string tableName, IArrowArrayStream keys) => CountRows(keys);
 

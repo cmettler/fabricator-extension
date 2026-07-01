@@ -306,10 +306,12 @@ typedef struct ArrowNetVTable {
 	// `sort_columns` (nullable): comma-separated column names from a native CREATE TABLE AS ... SORTED BY clause,
 	// honored only when `create_table`/`replace`. The SQL Server provider maps them to a Fabric Warehouse / Synapse
 	// WITH (CLUSTER BY (cols)) layout (ignored on box SQL Server and by Delta / DAX).
+	// `schema_mode` (nullable): a COPY SCHEMA_MODE option — "merge" (append + union new source columns) or
+	// "overwrite" (replace data + adopt the incoming source schema). Delta-provider concept; ignored elsewhere.
 	int32_t (*begin_bulk)(ArrowNetHandle handle, const char *schema, const char *table, int32_t create_table,
 	                      int32_t replace, int32_t check_constraints, int64_t txn_id, struct ArrowSchema *schema_in,
-	                      const char *partition_columns, const char *sort_columns, ArrowNetHandle *out_session,
-	                      char **err);
+	                      const char *partition_columns, const char *sort_columns, const char *schema_mode,
+	                      ArrowNetHandle *out_session, char **err);
 
 	// push_batch enqueues one record batch into the session. The managed side
 	// imports `batch` (taking ownership and releasing it); the caller never
@@ -703,7 +705,7 @@ typedef struct ArrowNetHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 53
+#define ARROWNET_ABI_VERSION 54
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

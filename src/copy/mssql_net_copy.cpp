@@ -31,6 +31,7 @@ struct ArrowNetCopyBindData : public FunctionData {
 	vector<LogicalType> column_types;
 	bool create_table = true;
 	bool replace = false;
+	string schema_mode; // SCHEMA_MODE COPY option: "" | "merge" | "overwrite" (Delta provider)
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto result = make_uniq<ArrowNetCopyBindData>();
@@ -83,6 +84,15 @@ static bool GetBoolOption(const case_insensitive_map_t<vector<Value>> &options, 
 	return text == "true" || text == "1" || text == "yes";
 }
 
+// A string COPY option (e.g. SCHEMA_MODE 'merge'|'overwrite'); empty when absent.
+static string GetStringOption(const case_insensitive_map_t<vector<Value>> &options, const string &key) {
+	auto it = options.find(key);
+	if (it == options.end() || it->second.empty() || it->second[0].IsNull()) {
+		return string();
+	}
+	return it->second[0].ToString();
+}
+
 // Parses 'mssql://catalog/schema/table' or 'catalog.schema.table'.
 static void ParseTarget(const string &path, string &catalog, string &schema, string &table) {
 	string body = path;
@@ -123,6 +133,7 @@ static unique_ptr<FunctionData> CopyToBind(ClientContext &context, CopyFunctionB
 	bind_data->column_types = sql_types;
 	bind_data->create_table = GetBoolOption(input.info.options, "CREATE_TABLE", true);
 	bind_data->replace = GetBoolOption(input.info.options, "REPLACE", false);
+	bind_data->schema_mode = GetStringOption(input.info.options, "SCHEMA_MODE");
 	return std::move(bind_data);
 }
 
@@ -139,7 +150,8 @@ static unique_ptr<GlobalFunctionData> CopyToInitGlobal(ClientContext &context, F
 	arrownet::SetActiveOpener(reinterpret_cast<ArrowNetHandle>(&context)); // host-FS opener for a Delta-catalog COPY
 	gstate->bulk_session = arrownet::BeginBulk(bind_data.handle, bind_data.schema_name, bind_data.table_name,
 	                                           bind_data.create_table, bind_data.replace, /*check_constraints=*/false,
-	                                           (int64_t)context.ActiveTransaction().global_transaction_id, schema);
+	                                           (int64_t)context.ActiveTransaction().global_transaction_id, schema,
+	                                           /*partition_columns=*/"", /*sort_columns=*/"", bind_data.schema_mode);
 	return std::move(gstate);
 }
 

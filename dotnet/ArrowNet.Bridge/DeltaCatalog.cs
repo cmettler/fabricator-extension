@@ -34,7 +34,8 @@ public sealed class DeltaBackend : IBackend
     // lz4|uncompressed|…), "row_group_size" (int rows), "bloom_filter_columns" (string[] dotted paths),
     // "partition_by" (string[] — applied at CREATE/CTAS; a native PARTITIONED BY clause overrides it),
     // "replace_where" ({partcol:val,…} — an INSERT becomes an ATOMIC partition-overwrite of the matching
-    // partition(s)), "merge_schema" (bool — a CREATE OR REPLACE / CTAS with a wider schema adopts the new columns).
+    // partition(s)), "schema_mode" ("merge"|"overwrite" — append+union / replace+adopt-schema; also the COPY
+    // SCHEMA_MODE option) / "merge_schema" (bool, legacy alias for schema_mode=merge on append).
     // Overlays the per-catalog ATTACH defaults (compression / row_group_size / bloom_filter_columns / merge_schema).
     // Read by DeltaCatalog from ProviderSettingsStore at write time — see docs/delta-catalog.md "Write tuning".
     public const string WriteOptionsSetting = "delta_write_options";
@@ -242,7 +243,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// session <c>delta_write_options</c> JSON setting (setting wins per key). Partition columns come from
     /// <paramref name="nativePartitionColumns"/> (a native <c>PARTITIONED BY</c> clause) when present, else the
     /// setting's <c>partition_by</c>. Returns null only when nothing is specified (=> engineered-wood defaults).</summary>
-    private DeltaWriteSpec? ResolveWriteSpec(IReadOnlyList<string>? nativePartitionColumns)
+    private DeltaWriteSpec? ResolveWriteSpec(IReadOnlyList<string>? nativePartitionColumns, string? schemaModeArg)
     {
         var sessionJson = ProviderSettingsStore.Instance.GetString(
             DeltaBackendName, DeltaBackend.WriteOptionsSetting);
@@ -252,7 +253,9 @@ public sealed class DeltaCatalog : IBackendCatalog
         IReadOnlyList<string>? bloom = _defaultBloomColumns;
         IReadOnlyList<string>? settingPartition = null;
         IReadOnlyDictionary<string, string>? replaceWhere = null;
-        bool mergeSchema = _mergeSchemaOnWrite;
+        // schema_mode precedence: per-catalog merge_schema default < delta_write_options (merge_schema / schema_mode)
+        // < the per-statement COPY SCHEMA_MODE arg.
+        var schemaMode = _mergeSchemaOnWrite ? DeltaSchemaMode.Merge : DeltaSchemaMode.None;
 
         if (!string.IsNullOrWhiteSpace(sessionJson))
         {
@@ -261,19 +264,29 @@ public sealed class DeltaCatalog : IBackendCatalog
             bloom = ParseListOption(sessionJson, "bloom_filter_columns") ?? bloom;
             settingPartition = ParseListOption(sessionJson, "partition_by");
             replaceWhere = ParseMapOption(sessionJson, "replace_where"); // partition col -> value (per-statement)
-            mergeSchema = ParseBoolOption(sessionJson, "merge_schema") || mergeSchema;
+            if (ParseStringOption(sessionJson, "schema_mode") is { } sm) { schemaMode = ParseSchemaMode(sm); }
+            else if (ParseBoolOption(sessionJson, "merge_schema")) { schemaMode = DeltaSchemaMode.Merge; }
         }
+        if (!string.IsNullOrWhiteSpace(schemaModeArg)) { schemaMode = ParseSchemaMode(schemaModeArg); }
 
         var partition = nativePartitionColumns is { Count: > 0 } ? nativePartitionColumns : settingPartition;
         var codec = ParseCompression(compression);
 
         if (codec is null && rowGroup is null && bloom is null && (partition is null || partition.Count == 0)
-            && (replaceWhere is null || replaceWhere.Count == 0) && !mergeSchema)
+            && (replaceWhere is null || replaceWhere.Count == 0) && schemaMode == DeltaSchemaMode.None)
         {
             return null;
         }
-        return new DeltaWriteSpec(codec, rowGroup, bloom, partition, replaceWhere, mergeSchema);
+        return new DeltaWriteSpec(codec, rowGroup, bloom, partition, replaceWhere, schemaMode);
     }
+
+    /// <summary>Maps a SCHEMA_MODE string (case-insensitive) to <see cref="DeltaSchemaMode"/>; unknown => None.</summary>
+    private static DeltaSchemaMode ParseSchemaMode(string? s) => (s ?? string.Empty).Trim().ToLowerInvariant() switch
+    {
+        "merge" => DeltaSchemaMode.Merge,
+        "overwrite" => DeltaSchemaMode.Overwrite,
+        _ => DeltaSchemaMode.None,
+    };
 
     /// <summary>Reads a JSON OBJECT option (e.g. <c>replace_where</c>) as a string→string map — a partition
     /// column→value equality set. A JSON string value is stringified. Null when absent/empty/not an object.</summary>
@@ -606,19 +619,20 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// becomes exactly these rows); otherwise Append (INSERT). One Delta commit. Returns rows written.</summary>
     public long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable,
                            bool replace, bool checkConstraints, long txnId, IReadOnlyList<string>? partitionColumns,
-                           IReadOnlyList<string>? sortColumns)
+                           IReadOnlyList<string>? sortColumns, string? schemaMode)
     {
         // sortColumns (native SORTED BY) is a SQL-Server-warehouse CLUSTER BY concept; Delta doesn't cluster — ignored.
         var opener = AmbientOpener.Current;
         var (schema, batches, rows) = DeltaWriter.Materialize(data, default);
-        var mode = createTable || replace ? DeltaWriteMode.Overwrite : DeltaWriteMode.Append;
         // Partition columns take effect only at table creation; an INSERT (Append) into an existing table
         // preserves the table's declared partitioning (engineered-wood reads it from the metadata).
-        var native = createTable || replace ? partitionColumns : null;
-        var spec = ResolveWriteSpec(native);
-        // replace_where (atomic partition-overwrite) is an APPEND-time concept — for CREATE/CTAS/REPLACE the whole
-        // table is (re)written, so drop it there to avoid a spurious partition-filter validation.
-        if ((createTable || replace) && spec?.ReplaceWhere is not null)
+        var spec = ResolveWriteSpec(createTable || replace ? partitionColumns : null, schemaMode);
+        // Data mode: schema_mode=overwrite forces a full replace (adopt the source schema); CREATE/CTAS/REPLACE
+        // also overwrite; otherwise it's an append (INSERT / COPY create_table=false / schema_mode=merge).
+        bool overwrite = createTable || replace || spec?.SchemaMode == DeltaSchemaMode.Overwrite;
+        var mode = overwrite ? DeltaWriteMode.Overwrite : DeltaWriteMode.Append;
+        // replace_where (atomic partition-overwrite) is an APPEND-time concept — for a full (re)write, drop it.
+        if (overwrite && spec?.ReplaceWhere is not null)
         {
             spec = spec with { ReplaceWhere = null };
         }
@@ -641,7 +655,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                               deletionVectors: _deletionVectorsOnCreate,
                               inCommitTimestamps: _inCommitTimestampsOnCreate,
                               changeDataFeed: _changeDataFeedOnCreate,
-                              spec: ResolveWriteSpec(partitionColumns));
+                              spec: ResolveWriteSpec(partitionColumns, schemaModeArg: null));
 
     /// <summary>CREATE SCHEMA. In <c>schemas</c> mode (non-OneLake) it materializes the <c>&lt;root&gt;/&lt;schema&gt;/</c>
     /// subfolder so a subsequent CREATE TABLE lands there (and the schema is rediscovered once it holds a table).

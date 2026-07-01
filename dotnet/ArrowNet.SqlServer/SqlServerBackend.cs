@@ -830,10 +830,12 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     public long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable, bool replace,
                            bool checkConstraints, long txnId, IReadOnlyList<string>? partitionColumns,
-                           IReadOnlyList<string>? sortColumns)
+                           IReadOnlyList<string>? sortColumns, string? schemaMode)
     {
         // partitionColumns is a Delta/lakehouse concept; SQL Server table partitioning is out of scope here — ignored.
         // sortColumns (native SORTED BY) becomes a Fabric Warehouse WITH (CLUSTER BY (cols)) on the created table.
+        // schemaMode (COPY SCHEMA_MODE merge/overwrite) is a Delta concept — ignored here (SQL Server REPLACE already
+        // drops+recreates = adopts the source schema; append is strict — evolve with ALTER ADD COLUMN).
         // The bulk-copy runs on a background task (its own pool thread), so the host can't carry the active
         // transaction id to us via the per-thread ambient — it captured it at begin_bulk and hands it here;
         // we re-establish it on THIS thread so BeginWrite + read-your-writes use the right per-transaction

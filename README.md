@@ -696,10 +696,17 @@ Two more write options (also via `delta_write_options`):
   INSERT INTO lake.main.sales SELECT * FROM new_eu_rows;   -- EU replaced atomically, other partitions untouched
   SET delta_write_options='';
   ```
-- **`merge_schema`** — additive schema evolution. On `CREATE OR REPLACE` / CTAS, a wider incoming schema
-  **adds the new columns** (nullable) instead of silently dropping them. Also a per-catalog `ATTACH` option
-  (`merge_schema true`). Note: a plain `INSERT` of wider data is rejected by DuckDB's binder before it reaches
-  the provider — use `ALTER TABLE ADD COLUMN` (supported) for append-time evolution, or `CREATE OR REPLACE`.
+- **Schema evolution** — on **COPY** (COPY-TO isn't schema-checked, so wider/different source schemas reach the
+  provider; a plain `INSERT` of wider data is rejected by DuckDB's binder first). A `SCHEMA_MODE` COPY option:
+  `merge` = append + **union** the new source columns (old rows read NULL); `overwrite` = replace data + **adopt**
+  the incoming source schema (drop/add columns). And **`CREATE OR REPLACE` is a true replace** — the table adopts
+  exactly the new SELECT's schema (a dropped column is gone, a new one appears), like DuckDB's drop+create.
+  ```sql
+  COPY (SELECT id, val, new_col FROM …) TO 'lake.main.t'
+    (FORMAT mssql_net, CREATE_TABLE false, SCHEMA_MODE 'merge');       -- append + add new_col (old rows NULL)
+  COPY (SELECT … FROM …) TO 'lake.main.t' (FORMAT mssql_net, SCHEMA_MODE 'overwrite');  -- replace data + schema
+  ```
+  For append-time evolution via `INSERT`, use `ALTER TABLE ADD COLUMN` (supported) then `INSERT`.
 
 Delta ATTACH options: `PROVIDER 'delta'`, `SECRET <azure_sp>` (OneLake/ADLS auth), `READ_ONLY false`
 (required for OneLake writes), `schemas true` (two-level layout on local/S3), `compression` / `row_group_size`

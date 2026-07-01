@@ -147,9 +147,12 @@ public interface IBackendCatalog : IDisposable
     /// <paramref name="sortColumns"/> (null/empty if none) are the columns from a native
     /// <c>SORTED BY</c> clause; the SQL Server provider maps them to a Fabric Warehouse
     /// <c>WITH (CLUSTER BY (cols))</c> layout (ignored on box SQL Server and by Delta / DAX).
+    /// <paramref name="schemaMode"/> (null if unset) is a COPY <c>SCHEMA_MODE</c> option —
+    /// "merge" (append + union new source columns) or "overwrite" (replace data + adopt the
+    /// incoming source schema). A Delta-provider concept; other providers ignore it.
     long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable, bool replace,
                     bool checkConstraints, long txnId, IReadOnlyList<string>? partitionColumns,
-                    IReadOnlyList<string>? sortColumns);
+                    IReadOnlyList<string>? sortColumns, string? schemaMode);
 
     /// <summary>
     /// rowid-based DELETE. <paramref name="keys"/> columns (named by Arrow field)

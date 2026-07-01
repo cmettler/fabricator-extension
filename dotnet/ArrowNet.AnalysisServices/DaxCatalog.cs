@@ -618,7 +618,7 @@ internal sealed class DaxCatalog : IBackendCatalog
     public long ExecuteNonQuery(string sql) => throw ReadOnly();
     public long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable,
                            bool replace, bool checkConstraints, long txnId, IReadOnlyList<string>? partitionColumns,
-                           IReadOnlyList<string>? sortColumns) => throw ReadOnly();
+                           IReadOnlyList<string>? sortColumns, string? schemaMode) => throw ReadOnly();
     public long ExecuteDelete(string schemaName, string tableName, IArrowArrayStream keys) => throw ReadOnly();
     public long ExecuteUpdate(string schemaName, string tableName, int setColumnCount, IArrowArrayStream data) => throw ReadOnly();
     public IArrowArrayStream InsertReturning(string schemaName, string tableName, IArrowArrayStream rows) => throw ReadOnly();

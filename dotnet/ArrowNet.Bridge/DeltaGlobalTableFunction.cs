@@ -207,6 +207,20 @@ public sealed class DeltaWriteDemoFunction : ITableFunction
 /// partition columns (native <c>PARTITIONED BY</c> clause, else the setting's <c>partition_by</c>). Any null
 /// member keeps engineered-wood's default. Applied at CREATE/INSERT/CTAS/COPY (partition columns take effect at
 /// table creation and are thereafter preserved from the table metadata for all writes, incl. UPDATE/DELETE).</summary>
+/// <summary>How a Delta write reconciles the incoming source schema with the table schema.</summary>
+internal enum DeltaSchemaMode
+{
+    /// <summary>Default: honor the write mode's normal schema handling (Overwrite adopts the incoming schema —
+    /// a true replace; Append is strict — extra source columns are dropped, missing ones read NULL).</summary>
+    None,
+    /// <summary>Append + UNION: add any incoming column not in the table (nullable) before appending. The
+    /// delta-rs <c>schema_mode="merge"</c>. Reaches the provider via COPY (INSERT is binder-checked).</summary>
+    Merge,
+    /// <summary>Replace data AND schema: the table adopts exactly the incoming source schema (add/drop/retype).
+    /// The delta-rs <c>schema_mode="overwrite"</c>.</summary>
+    Overwrite,
+}
+
 internal sealed record DeltaWriteSpec(
     EngineeredWood.Compression.CompressionCodec? Compression,
     int? RowGroupSize,
@@ -216,9 +230,9 @@ internal sealed record DeltaWriteSpec(
     // partition-overwrite (remove the matching partition's files + add the new data, one commit) instead of an
     // append. Keys must be partition columns of the table (engineered-wood enforces this).
     IReadOnlyDictionary<string, string>? ReplaceWhere = null,
-    // merge_schema: auto-evolve the table schema before an append — any column present in the incoming data but
-    // not in the table is added as a nullable column (metadata-only AddColumnAsync) prior to the write.
-    bool MergeSchema = false);
+    // schema_mode (SCHEMA_MODE COPY option / delta_write_options): Merge = append+union new columns;
+    // Overwrite = replace data + adopt the incoming schema. None = write-mode default.
+    DeltaSchemaMode SchemaMode = DeltaSchemaMode.None);
 
 /// <summary>
 /// Writes a Delta Lake table via engineered-wood through the host FileSystem (the <see cref="DuckDbTableFileSystem"/>
@@ -309,10 +323,16 @@ internal static class DeltaWriter
                                                      cancellationToken: ct).AsTask().GetAwaiter().GetResult();
             try
             {
-                // merge_schema: add any incoming column absent from the table as a nullable column (a metadata-only
-                // commit each) before the append, so a wider INSERT evolves the table instead of failing/ignoring.
-                if (spec?.MergeSchema == true)
+                if (mode == DeltaWriteMode.Overwrite)
                 {
+                    // A true replace (CREATE OR REPLACE / CTAS-replace / COPY REPLACE / schema_mode=overwrite):
+                    // the table adopts EXACTLY the incoming schema (add/drop/retype) — a metadata-only commit,
+                    // no-op if identical or a freshly-created table — then the Overwrite removes the old files.
+                    table.SetSchemaAsync(schema, ct).AsTask().GetAwaiter().GetResult();
+                }
+                else if (spec?.SchemaMode == DeltaSchemaMode.Merge)
+                {
+                    // Append + UNION: add any incoming column absent from the table (nullable) before appending.
                     MergeSchema(table, schema, ct);
                 }
                 // replace_where => atomic partition-overwrite (one commit); otherwise the requested append/overwrite.

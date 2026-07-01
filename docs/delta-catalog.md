@@ -446,14 +446,26 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      predicates, never a data-column predicate that could partially match a file), and the input must fall within
      the target partitions (else it errors rather than silently appending to an uncleared partition).
      `DeltaCatalog` applies it only to a plain INSERT (dropped for CREATE/CTAS/REPLACE, which rewrite the whole
-     table). **`merge_schema`** (bool; the setting OR a per-catalog `ATTACH` option `merge_schema true`): on
-     CREATE OR REPLACE / CTAS a WIDER incoming schema evolves the table — `DeltaWriter.MergeSchema` diffs the
-     incoming vs table schema and calls engineered-wood `AddColumnAsync` (nullable, metadata-only) for each new
-     column before the overwrite, instead of silently dropping it. **A plain INSERT of wider data cannot
-     auto-merge**: DuckDB's INSERT binder rejects extra columns *before* the provider is reached (a front-end
-     constraint, not fixable in the provider) — append-time evolution is via `ALTER TABLE ADD COLUMN` (already
-     supported, what dbt's `on_schema_change` uses) or CREATE OR REPLACE with `merge_schema`. Validated:
-     `verify_delta_catalog_overwrite_merge.test` (46); full Delta suite unregressed (the `WriteCoreAsync` refactor).
+     table).
+
+     **SCHEMA EVOLUTION (`SCHEMA_MODE` COPY option) + true CREATE OR REPLACE — ABI v54.** DuckDB's INSERT binder
+     rejects wider-than-table data *before* the provider (a front-end constraint), so schema evolution lives on
+     **COPY** — COPY-TO isn't schema-checked, so arbitrary source schemas reach the provider. A `SCHEMA_MODE` COPY
+     option threads through `begin_bulk` (the v54 `schema_mode` arg; SQL Server / DAX ignore it): **`merge`** =
+     append + UNION (engineered-wood `AddColumnAsync` per incoming-new column, then Append; old rows NULL);
+     **`overwrite`** = replace data + adopt the incoming source schema (drop/add/retype) via the new
+     `DeltaTable.SetSchemaAsync` (a metadata-only `metaData` commit adopting the Arrow schema; no-op if identical;
+     rejects column-mapping tables) then an Overwrite. **CREATE OR REPLACE / CTAS-replace is now a TRUE replace** —
+     the Overwrite path always `SetSchemaAsync(incoming)`, so the table adopts EXACTLY the new schema (a dropped
+     column is GONE, not a lingering NULL; a new column appears), matching DuckDB's drop+create + the SQL Server
+     provider. This replaced the earlier confusing `merge_schema`-on-CREATE-OR-REPLACE band-aid. History-preserving
+     (old versions keep their schema for time-travel). `DeltaSchemaMode` (None/Merge/Overwrite) on `DeltaWriteSpec`,
+     resolved by `ResolveWriteSpec` (COPY `SCHEMA_MODE` > `delta_write_options` `schema_mode`/`merge_schema` > the
+     `merge_schema` ATTACH option → Merge for append). Append-time evolution via INSERT stays `ALTER TABLE ADD
+     COLUMN` (what dbt's `on_schema_change` uses). Validated: `verify_delta_catalog_overwrite_merge.test` (47); full
+     Delta + SqlServer suites unregressed. **Separate pre-existing bug found (NOT this change): Delta DECIMAL
+     round-trip is corrupt** (CTAS `CAST(1.5 AS DECIMAL(2,1))` → `10.4`; `DECIMAL(10,2)` → `0.00`) — the decimal128
+     write/read encoding is wrong; needs its own fix.
 3. **DELETE — FINAL: copy-on-write + transient `(file,position)` rowid, PLAIN Delta (no features).** The
    detailed design below (row tracking + deletion vectors) is the SUPERSEDED first attempt — kept as the trail.
    Why it changed: Fabric's OneLake converter / Spark could not read our row-tracking + DV commits (first from

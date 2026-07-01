@@ -30,7 +30,8 @@ internal sealed class BulkSession
 
     public BulkSession(IBackendCatalog catalog, string schemaName, string tableName, Schema schema, bool createTable,
                        bool replace, bool checkConstraints, long txnId, nint opener = 0,
-                       IReadOnlyList<string>? partitionColumns = null, IReadOnlyList<string>? sortColumns = null)
+                       IReadOnlyList<string>? partitionColumns = null, IReadOnlyList<string>? sortColumns = null,
+                       string? schemaMode = null)
     {
         Schema = schema;
         _channel = Channel.CreateBounded<RecordBatch>(new BoundedChannelOptions(ChannelCapacity)
@@ -51,7 +52,7 @@ internal sealed class BulkSession
             try
             {
                 return catalog.BulkInsert(schemaName, tableName, new ChannelArrowStream(schema, reader), createTable,
-                                          replace, checkConstraints, txnId, partitionColumns, sortColumns);
+                                          replace, checkConstraints, txnId, partitionColumns, sortColumns, schemaMode);
             }
             finally
             {

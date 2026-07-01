@@ -1118,7 +1118,10 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v53** (v53 = **IDENTITY columns** — appended an `identity_columns` param (nullable,
+- **Current version: ABI v54** (v54 = **`SCHEMA_MODE` COPY option** — appended a `schema_mode` param to
+  `begin_bulk` (nullable: "merge" | "overwrite"); the Delta provider does append+union / replace+adopt-schema,
+  and `CREATE OR REPLACE` is now a true schema replace via engineered-wood `SetSchemaAsync`. Provider-agnostic —
+  SQL Server / DAX ignore it. See the Delta partitioning/write bullet ("SCHEMA EVOLUTION on write"). v53 = **IDENTITY columns** — appended an `identity_columns` param (nullable,
   comma-separated) to `create_table` (begin_bulk NOT changed — CTAS has no generated columns; the auto-identity
   is a C#-side setting). DuckDB has no IDENTITY concept, so TWO mechanisms: **(1) a DuckDB GENERATED column**
   (`col BIGINT AS (0)`) is (mis)used as an IDENTITY MARKER — the C++ DDL `CreateTable` detects `col.Generated()`
@@ -1165,21 +1168,35 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   dictionary + always-on min/max stats; bloom off by default). Validated: `test/verify_delta_catalog_partition.test`
   (54 — native CTAS/empty-CREATE+INSERT/multi-column/setting/override/re-attach), full Delta suite + SqlServer
   columnstore (CREATE+CTAS) unregressed, native partitioning **live on Fabric OneLake** (`LH.dbo.arrownet_parttest`,
-  `region=US/EU/APAC`). **`delta_write_options` also carries `replace_where` + `merge_schema`** (C#-only, no ABI):
-  **`replace_where` = `{partcol:val,…}`** turns an INSERT into an ATOMIC partition-overwrite — engineered-wood
+  `region=US/EU/APAC`). **`delta_write_options` also carries `replace_where`** (C#-only, no ABI): **`replace_where`
+  = `{partcol:val,…}`** turns an INSERT into an ATOMIC partition-overwrite — engineered-wood
   `DeltaTable.OverwritePartitionsAsync` (new; `WriteAsync`→ private `WriteCoreAsync` core with an
   `overwritePartitions` filter) removes exactly the matching-partition files + adds the new data in ONE commit
   (delta-rs static partition overwrite); keys MUST be partition columns (else `DeltaFormatException` — file-level
   removal is only exact for partition predicates) and the input must fall within them (else it errors, no
-  silent append). `DeltaCatalog` gates it to plain INSERT (dropped for CREATE/CTAS/REPLACE). **`merge_schema`**
-  (bool; ATTACH option `merge_schema true` + the setting) = additive evolution: on CREATE OR REPLACE / CTAS a
-  WIDER incoming schema adds the new columns nullable (`DeltaWriter.MergeSchema` → engineered-wood
-  `AddColumnAsync` per new column) instead of silently dropping them. **A plain INSERT of wider data can't
-  auto-merge** — DuckDB's INSERT binder rejects extra columns before the provider is reached (a front-end
-  limit); append-time evolution is via `ALTER TABLE ADD COLUMN` (already supported) or CREATE OR REPLACE.
-  Verified: `test/verify_delta_catalog_overwrite_merge.test` (46 — atomic EU-partition overwrite [US untouched,
-  one commit], non-partition-column + out-of-partition errors, merge_schema on CREATE OR REPLACE via setting +
-  ATTACH option); full Delta suite unregressed (the `WriteCoreAsync` refactor). v50 = **directory move/rename** — appended `fs_move_dir(opener,src,dest,…)` to
+  silent append). `DeltaCatalog` gates it to plain INSERT (dropped for CREATE/CTAS/REPLACE).
+
+  **SCHEMA EVOLUTION on write — `SCHEMA_MODE` COPY option + true CREATE OR REPLACE (ABI v54).** Because DuckDB's
+  INSERT binder rejects wider-than-table data BEFORE the provider, schema evolution lives on **COPY** (COPY-TO
+  isn't schema-checked, so arbitrary source schemas reach the provider) — surfaced as a `SCHEMA_MODE` COPY option
+  threaded through **`begin_bulk`** (the ABI v54 arg `schema_mode`, next to partition/sort columns; provider-
+  agnostic — SQL Server / DAX ignore it). **`SCHEMA_MODE 'merge'`** = append + UNION (engineered-wood
+  `AddColumnAsync` per incoming-new column, then Append; old rows read NULL). **`SCHEMA_MODE 'overwrite'`** =
+  replace data + adopt the incoming source schema (drop/add/retype) via new engineered-wood
+  `DeltaTable.SetSchemaAsync` (a metadata-only `metaData` commit adopting the Arrow schema; no-op if identical;
+  rejects column-mapping tables) then an Overwrite. **`CREATE OR REPLACE` / CTAS-replace is now a TRUE replace**:
+  the Overwrite path always calls `SetSchemaAsync(incoming)` so the table adopts EXACTLY the new schema — a
+  dropped column is GONE (not a lingering NULL), a new column appears — matching DuckDB's drop+create semantics
+  and the SQL Server provider (which drops+recreates on replace). This **replaced the earlier confusing
+  `merge_schema`-on-CREATE-OR-REPLACE band-aid**. `DeltaSchemaMode` (None/Merge/Overwrite) on `DeltaWriteSpec`,
+  resolved by `ResolveWriteSpec` (COPY `SCHEMA_MODE` arg > `delta_write_options` `schema_mode`/`merge_schema` >
+  the `merge_schema` ATTACH option, → Merge for append). Also fixed: history-preserving (the metaData commit keeps
+  time-travel; old versions still show the old schema). Verified:
+  `test/verify_delta_catalog_overwrite_merge.test` (47 — atomic partition overwrite, true CREATE OR REPLACE
+  narrower-drops/wider-adds, COPY SCHEMA_MODE merge + overwrite); full Delta + SqlServer (columnstore/identity)
+  suites unregressed. **Known separate bug (pre-existing, NOT this change): Delta DECIMAL round-trip is corrupt**
+  (`CTAS SELECT CAST(1.5 AS DECIMAL(2,1))` reads back `10.4`; `DECIMAL(10,2)` → `0.00`) — the decimal128
+  encoding across the write/read path is wrong; needs a separate fix. v50 = **directory move/rename** — appended `fs_move_dir(opener,src,dest,…)` to
   `ArrowNetHostServices` (the reverse host→managed struct): maps to DuckDB's `FileSystem::MoveFile` — an atomic
   directory rename on a local filesystem; object stores (S3/Azure DFS) throw "not implemented". Powers **local/S3
   Delta catalog RENAME TABLE** (`DeltaCatalog.AlterTable` RenameTable → `HostFs.MoveDir`; OneLake still renames via
