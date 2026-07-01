@@ -1212,7 +1212,19 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   the source now emits `Decimal128` directly. Verified: `test/verify_delta_catalog_decimal.test` (47 —
   Decimal32/64/128 physical widths, negatives, filter/aggregate, INSERT, time-travel AT VERSION, **DELETE**,
   **UPDATE**, re-attach durability); full Delta catalog suite (write/delete/update/changes/snapshots/
-  time_travel/dv/alter/schemas) unregressed.
+  time_travel/dv/alter/schemas) unregressed. **The decimal bug was one instance of a broader pattern — swept +
+  fixed the rest (engineered-wood).** Both per-column "take rows" filters ended in `default: return source`,
+  silently passing ANY unenumerated type through UNFILTERED (wrong-length column → the same corruption + overrun):
+  `DeletionVectorFilter.TakeRows` (copy-on-write DELETE/UPDATE survivor filter) had **no Date/Timestamp/decimal
+  case** — Date and Timestamp are ordinary columns, so this corrupted plain DELETE/UPDATEs, not just decimals;
+  `PartitionUtils.TakeRows` (partition-split on partitioned writes) had no decimal case. Both now route every
+  fixed-width Arrow type through a generic offset-aware value-buffer slicer and **THROW** on a genuinely
+  unsupported (nested) type instead of returning it unfiltered. Also fixed: `ArrowSchemaConverter` mapped a
+  parquet `TIME(micros/nanos)` to a malformed `Time32Type` (4-byte type, 8-byte semantics + a `<int>` value
+  decode over an INT64 physical) → now `Time64` for micro/nano (general parquet-correctness fix; Delta itself has
+  no TIME/unsigned type so it's not Delta-reachable). Verified: `test/verify_delta_catalog_temporal.test` (63 —
+  DATE/TIMESTAMP/DECIMAL through DELETE, UPDATE, native partitioned write, re-attach durability); full Delta
+  catalog suite unregressed.
   v50 = **directory move/rename** — appended `fs_move_dir(opener,src,dest,…)` to
   `ArrowNetHostServices` (the reverse host→managed struct): maps to DuckDB's `FileSystem::MoveFile` — an atomic
   directory rename on a local filesystem; object stores (S3/Azure DFS) throw "not implemented". Powers **local/S3

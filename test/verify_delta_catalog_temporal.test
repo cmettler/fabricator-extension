@@ -1,0 +1,102 @@
+# name: test/verify_delta_catalog_temporal.test
+# description: Delta rowid DML + partitioned write across DATE / TIMESTAMP / DECIMAL columns. Regression for the
+#              copy-on-write survivor filter (DeletionVectorFilter.TakeRows) and the partition-split filter
+#              (PartitionUtils.TakeRows), which used to `default: return source` for any type they didn't
+#              enumerate — passing such a column through UNFILTERED (wrong length => corruption + a read-buffer
+#              overrun). DeletionVectorFilter had NO Date/Timestamp/decimal case (very common columns!);
+#              PartitionUtils had no decimal case. Both now filter every fixed-width type generically and THROW
+#              on a truly unsupported type. (Delta has no TIME / unsigned type, so those aren't exercised here —
+#              the parallel Time32->Time64 read fix is a general parquet-correctness fix, not Delta-reachable.)
+#              Set ARROWNET_DELTA_WRITE_DIR. Local FS.
+# group: [mssql_net]
+
+require mssql_net
+
+require-env ARROWNET_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/temporal' AS lake (TYPE arrownet, PROVIDER 'delta');
+
+# DATE (Date32), TIMESTAMP (Timestamp us), DECIMAL — the three Delta-valid fixed-width types the survivor
+# filter did not handle (Date/Timestamp had NO case at all; decimal was the earlier fix).
+statement ok
+CREATE TABLE lake.main.t AS SELECT * FROM (VALUES
+  (1, DATE '2021-01-01', TIMESTAMP '2021-01-01 08:30:00', CAST(1.25 AS DECIMAL(10,2))),
+  (2, DATE '2022-02-02', TIMESTAMP '2022-02-02 09:45:15', CAST(2.50 AS DECIMAL(10,2))),
+  (3, DATE '2023-03-03', TIMESTAMP '2023-03-03 23:59:59', CAST(3.75 AS DECIMAL(10,2)))
+) AS v(id, d, ts, dec);
+
+# Round-trip (read path — date/timestamp/decimal correct + correctly paired).
+query ITTR
+SELECT id, d, ts, dec FROM lake.main.t ORDER BY id;
+----
+1	2021-01-01	2021-01-01 08:30:00	1.25
+2	2022-02-02	2022-02-02 09:45:15	2.50
+3	2023-03-03	2023-03-03 23:59:59	3.75
+
+# DELETE (rowid copy-on-write): every surviving column — date/timestamp/decimal — must be filtered to the
+# survivors and stay paired with id. Before the fix these columns passed through UNFILTERED (row-count mismatch).
+statement ok
+DELETE FROM lake.main.t WHERE id = 2;
+
+query ITTR
+SELECT id, d, ts, dec FROM lake.main.t ORDER BY id;
+----
+1	2021-01-01	2021-01-01 08:30:00	1.25
+3	2023-03-03	2023-03-03 23:59:59	3.75
+
+# UPDATE (rewrite): SET the decimal column; the temporal columns are read + rewritten intact.
+statement ok
+UPDATE lake.main.t SET dec = dec + 1 WHERE id = 3;
+
+query ITTR
+SELECT id, d, ts, dec FROM lake.main.t ORDER BY id;
+----
+1	2021-01-01	2021-01-01 08:30:00	1.25
+3	2023-03-03	2023-03-03 23:59:59	4.75
+
+# Partitioned write (native PARTITIONED BY): the partition-split filter (PartitionUtils.TakeRows) runs over the
+# non-partition data columns per partition group — exercise it with date/timestamp/decimal (decimal was the gap).
+statement ok
+CREATE TABLE lake.main.p PARTITIONED BY (region) AS SELECT * FROM (VALUES
+  ('US', DATE '2021-01-01', TIMESTAMP '2021-01-01 08:30:00', CAST(1.25 AS DECIMAL(10,2))),
+  ('US', DATE '2021-06-01', TIMESTAMP '2021-06-01 12:00:00', CAST(1.50 AS DECIMAL(10,2))),
+  ('EU', DATE '2022-02-02', TIMESTAMP '2022-02-02 09:45:15', CAST(2.50 AS DECIMAL(10,2))),
+  ('APAC', DATE '2023-03-03', TIMESTAMP '2023-03-03 23:59:59', CAST(3.75 AS DECIMAL(10,2)))
+) AS v(region, d, ts, dec);
+
+query TTTR
+SELECT region, d, ts, dec FROM lake.main.p ORDER BY region, d;
+----
+APAC	2023-03-03	2023-03-03 23:59:59	3.75
+EU	2022-02-02	2022-02-02 09:45:15	2.50
+US	2021-01-01	2021-01-01 08:30:00	1.25
+US	2021-06-01	2021-06-01 12:00:00	1.50
+
+# Filter on a partition value (correct per-partition decimals).
+query R
+SELECT dec FROM lake.main.p WHERE region = 'US' ORDER BY dec;
+----
+1.25
+1.50
+
+statement ok
+DETACH lake;
+
+# Durability: re-attach and re-read the DELETE'd + partitioned tables.
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/temporal' AS lake (TYPE arrownet, PROVIDER 'delta');
+
+query ITTR
+SELECT id, d, ts, dec FROM lake.main.t ORDER BY id;
+----
+1	2021-01-01	2021-01-01 08:30:00	1.25
+3	2023-03-03	2023-03-03 23:59:59	4.75
+
+query I
+SELECT count(*) FROM lake.main.p;
+----
+4
+
+statement ok
+DETACH lake;
