@@ -179,6 +179,32 @@ public sealed class DeltaRsCatalog : IBackendCatalog
             throw Unsupported("time travel (delta-dotnet reads only the latest snapshot in v1)");
         }
 
+        // Filter pushdown: translate the (superset-safe) FilterNode to a DataFusion WHERE and run it via
+        // QueryAsync so delta-rs does file/stats/row-group skipping. Unpushable predicates render as TRUE
+        // (dropped — DuckDB re-applies every predicate above the scan, so a superset is correct). Only taken
+        // when something is actually pushable; else the full-read path below. Projection stays above the scan.
+        if (spec?.Filter is { } filter)
+        {
+            var values = ReadFilterValues(filterValues);
+            string where = BuildWhere(filter, values);
+            if (where != "TRUE")
+            {
+                using var t = Open(schemaName, tableName);
+                var query = new SelectQuery($"SELECT * FROM src WHERE {where}") { TableAlias = "src" };
+                var batches = new List<RecordBatch>();
+                Schema? filteredSchema = null;
+                foreach (var b in t.QueryAsync(query, default).ToBlockingEnumerable())
+                {
+                    // delta-rs/DataFusion emits Utf8View for strings; advertise the ACTUAL batch schema (a
+                    // fixed table.Schema() would mismatch and SIGSEGV arrow_ingest). DuckDB maps by name.
+                    filteredSchema ??= b.Schema;
+                    batches.Add(b);
+                }
+                filteredSchema ??= t.Schema();
+                return new InMemoryArrayStream(filteredSchema, batches);
+            }
+        }
+
         OwnedArrowTable owned;
         using (var table = Open(schemaName, tableName))
         {
@@ -190,6 +216,99 @@ public sealed class DeltaRsCatalog : IBackendCatalog
         }
         return new AsyncEnumerableArrowStream(owned.Table.Schema, TableBatches(owned.Table), owner: owned);
     }
+
+    // Reads the one-row filter-constants batch into scalars (indexed by FilterNode.val/vals). Consumes the stream.
+    private static IReadOnlyList<object?> ReadFilterValues(IArrowArrayStream? filterValues)
+    {
+        if (filterValues is null)
+        {
+            return System.Array.Empty<object?>();
+        }
+        using (filterValues)
+        {
+            var batch = filterValues.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+            if (batch is null)
+            {
+                return System.Array.Empty<object?>();
+            }
+            var values = new object?[batch.ColumnCount];
+            for (int i = 0; i < batch.ColumnCount; i++)
+            {
+                try { values[i] = ArrowValueReader.ReadScalar(batch.Column(i), 0); }
+                catch (System.NotSupportedException) { values[i] = null; }
+            }
+            return values;
+        }
+    }
+
+    // Renders a superset-safe FilterNode as a DataFusion WHERE fragment. Anything not safely renderable
+    // becomes "TRUE" (dropped) — correct because DuckDB re-applies every predicate above the scan.
+    private static string BuildWhere(FilterNode node, IReadOnlyList<object?> values)
+    {
+        switch (node.Op)
+        {
+            case "and":
+            {
+                if (node.Children is not { Count: > 0 })
+                {
+                    return "TRUE";
+                }
+                var parts = node.Children.Select(c => BuildWhere(c, values)).Where(p => p != "TRUE").ToList();
+                return parts.Count == 0 ? "TRUE" : "(" + string.Join(" AND ", parts) + ")";
+            }
+            case "or":
+            {
+                if (node.Children is not { Count: > 0 })
+                {
+                    return "TRUE";
+                }
+                var parts = node.Children.Select(c => BuildWhere(c, values)).ToList();
+                // A dropped OR branch widens the whole OR to everything → the entire OR must become TRUE.
+                return parts.Any(p => p == "TRUE") ? "TRUE" : "(" + string.Join(" OR ", parts) + ")";
+            }
+            case "compare":
+            {
+                var op = SqlCmp(node.Cmp);
+                var lit = node.Val is int vi && vi >= 0 && vi < values.Count ? Literal(values[vi]) : null;
+                return (op != null && lit != null && node.Col != null) ? $"{Q(node.Col)} {op} {lit}" : "TRUE";
+            }
+            case "is_null":
+                return node.Col != null ? $"{Q(node.Col)} IS NULL" : "TRUE";
+            case "is_not_null":
+                return node.Col != null ? $"{Q(node.Col)} IS NOT NULL" : "TRUE";
+            case "in":
+            {
+                if (node.Col is null || node.Vals is not { Count: > 0 })
+                {
+                    return "TRUE";
+                }
+                var lits = node.Vals.Select(i => i >= 0 && i < values.Count ? Literal(values[i]) : null).ToList();
+                return lits.Any(l => l is null) ? "TRUE" : $"{Q(node.Col)} IN ({string.Join(", ", lits)})";
+            }
+            default:
+                return "TRUE";
+        }
+    }
+
+    private static string? SqlCmp(string? cmp) => cmp switch
+    {
+        "=" => "=", "<>" => "<>", "<" => "<", "<=" => "<=", ">" => ">", ">=" => ">=",
+        "is_distinct" => "IS DISTINCT FROM", "is_not_distinct" => "IS NOT DISTINCT FROM",
+        _ => null,
+    };
+
+    // A safe SQL literal for a filter constant, or null if not renderable (→ predicate dropped to TRUE).
+    private static string? Literal(object? value) => value switch
+    {
+        null => null,
+        string s => "'" + s.Replace("'", "''") + "'",
+        bool b => b ? "TRUE" : "FALSE",
+        sbyte or byte or short or ushort or int or uint or long or ulong => System.Convert.ToString(
+            value, System.Globalization.CultureInfo.InvariantCulture),
+        float or double or decimal => ((System.IFormattable)value).ToString(null,
+            System.Globalization.CultureInfo.InvariantCulture),
+        _ => null,
+    };
 
     // Yields an Apache.Arrow.Table as record batches, one per chunk. A Table built from a single read has all
     // columns chunked identically (one chunk per source batch), so chunk i of every column shares a length. The

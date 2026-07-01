@@ -1,0 +1,80 @@
+# name: test/verify_delta_rs_pushdown.test
+# description: delta-rs provider filter pushdown. The (superset-safe) FilterNode is translated to a DataFusion
+#              WHERE and run via QueryAsync so delta-rs does file/stats/row-group skipping; DuckDB re-applies
+#              every predicate above the scan, so an over-approximation stays correct. Unpushable predicates
+#              render as TRUE. Requires the delta-rs native libs published (publish-managed.ps1 -IncludeDeltaRs).
+#              Local FS.
+# group: [mssql_net]
+
+require mssql_net
+
+require-env ARROWNET_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/drp' AS lake (TYPE arrownet, PROVIDER 'deltars');
+
+statement ok
+CREATE TABLE lake.main.t AS SELECT * FROM (VALUES
+  (1,'alpha'),(2,'beta'),(3,'gamma'),(4,'delta'),(5,'eps'),(6,CAST(NULL AS VARCHAR))
+) v(id,name);
+
+# Range comparison (pushed).
+query IT
+SELECT id, name FROM lake.main.t WHERE id > 3 ORDER BY id;
+----
+4	delta
+5	eps
+6	NULL
+
+# String equality (pushed).
+query IT
+SELECT id, name FROM lake.main.t WHERE name = 'beta';
+----
+2	beta
+
+# IN list (pushed).
+query IT
+SELECT id, name FROM lake.main.t WHERE id IN (1, 4) ORDER BY id;
+----
+1	alpha
+4	delta
+
+# Compound AND with a <> (pushed): excludes gamma.
+query IT
+SELECT id, name FROM lake.main.t WHERE id >= 2 AND id <= 4 AND name <> 'gamma' ORDER BY id;
+----
+2	beta
+4	delta
+
+# IS NULL / IS NOT NULL (pushed).
+query I
+SELECT id FROM lake.main.t WHERE name IS NULL;
+----
+6
+
+query I
+SELECT count(*) FROM lake.main.t WHERE name IS NOT NULL;
+----
+5
+
+# OR (pushed).
+query IT
+SELECT id, name FROM lake.main.t WHERE id = 1 OR name = 'eps' ORDER BY id;
+----
+1	alpha
+5	eps
+
+# Aggregate over a filtered scan.
+query I
+SELECT sum(id) FROM lake.main.t WHERE id >= 4;
+----
+15
+
+# Unfiltered scan unaffected (full-read path).
+query I
+SELECT count(*) FROM lake.main.t;
+----
+6
+
+statement ok
+DETACH lake;
