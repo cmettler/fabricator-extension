@@ -503,10 +503,19 @@ Implemented and verified:
   "Catalog type does not support time travel" before the scan), `ArrowNetTableEntry::GetScanFunction(EntryLookupInfo)`
   reads `lookup_info.GetAtClause()` {unit,value} onto `ArrowStreamBindData` (the basic + lookup overloads share
   `BuildScanFunction`), `BuildScanSpec` folds it into the existing `spec_json` (`"at":{unit,value}` — **no new
-  ABI**), and C# `ScanFromSource` emits `FOR SYSTEM_TIME AS OF @__at` (a datetime2 param). `AT (VERSION => …)`
-  (an Iceberg/Delta snapshot-id notion) has no SQL Server equivalent → a clean "not supported" error (no silent
-  current-data result). Verified: `test/verify_time_travel.test` (14 — current/future/past + a
-  `dm_exec_query_stats` `FOR SYSTEM_TIME AS OF` proof + the VERSION error).
+  ABI**), and C# `ScanFromSource` emits the timestamp travel per engine profile: **box / Azure SQL** →
+  `FOR SYSTEM_TIME AS OF @__at` (a datetime2 param; requires a system-versioned temporal table); **Fabric
+  Warehouse / Synapse** (`profile.IsWarehouse`) → the statement-level hint `OPTION (FOR TIMESTAMP AS OF
+  '<literal>')` appended after WHERE/ORDER BY, which works on ANY table (no temporal setup). The Fabric literal
+  is a fixed-format `yyyy-MM-ddTHH:mm:ss.fff` (OPTION takes no parameter, so it's inlined — no injection, it's a
+  reformatted datetime) **truncated to milliseconds** (Fabric rejects ≥4 fractional digits, error 22440; UTC
+  only). Each catalog table scan is its own server query, so the query-level OPTION hint is per-table-correct
+  even across a join/union of different `AT` timestamps. `AT (VERSION => …)` (an Iceberg/Delta snapshot-id
+  notion) has no SQL Server equivalent → a clean "not supported" error (no silent current-data result).
+  Verified: `test/verify_time_travel.test` (14 — box temporal, current/future/past + a `dm_exec_query_stats`
+  `FOR SYSTEM_TIME AS OF` proof + the VERSION error); Fabric Warehouse `OPTION (FOR TIMESTAMP AS OF)` validated
+  **live** (point-in-time correct — a post-timestamp INSERT is invisible AS OF the earlier instant — and the
+  ≥4-digit truncation confirmed, no 22440).
 - **DML**: INSERT (+ INSERT…SELECT, + RETURNING via `OUTPUT INSERTED.*`), UPDATE, DELETE (rowid-based,
   parameterized). INSERT/CTAS/COPY use a **streaming bulk path** (see below).
 - **DDL**: CREATE/DROP TABLE, CREATE/DROP SCHEMA, ALTER TABLE (rename table/column, add/drop column,

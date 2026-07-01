@@ -204,6 +204,13 @@ What the profile drives automatically:
   CREATE TABLE wh.dbo.Sales (SaleID INT, CustomerID INT, SaleDate DATE, Amount DECIMAL(10,2))
     SORTED BY (CustomerID, SaleDate);   -- → CREATE TABLE … WITH (CLUSTER BY (CustomerID, SaleDate))
   ```
+- **Time travel.** `FROM t AT (TIMESTAMP => ts)` maps to the statement-level `OPTION (FOR TIMESTAMP AS OF
+  '<ts>')` hint on a warehouse (works on any table; UTC, truncated to milliseconds), and to `FOR SYSTEM_TIME
+  AS OF` on box SQL Server (which needs a system-versioned/temporal table). `AT (VERSION => n)` is not supported
+  (no SQL Server equivalent).
+  ```sql
+  SELECT * FROM wh.dbo.dimension_customer AT (TIMESTAMP => '2024-05-02 20:44:13.700');
+  ```
 - **Functions.** Discovered scalar UDFs, TVFs, and stored procedures work on Fabric (proc result sets resolved
   via `sp_describe_first_result_set`), as do custom C# functions and the `fn_each` table-in-out exchange.
 

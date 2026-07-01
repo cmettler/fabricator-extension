@@ -1355,24 +1355,36 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     {
         var spec = ScanSpec.Parse(specJson);
 
-        // Time travel (DuckDB AT clause) -> SQL Server temporal tables. Only a catalog table scan carries it
-        // (AT is a base-table feature; a TVF source never sets it). "timestamp" maps to FOR SYSTEM_TIME AS OF;
-        // "version" (and any other unit) has no SQL Server equivalent -> a clean error.
+        // Time travel (DuckDB AT clause). Only a catalog table scan carries it (AT is a base-table feature; a
+        // TVF source never sets it). "version" (and any other unit) has no SQL Server equivalent -> a clean error.
+        // TWO timestamp mechanisms by engine:
+        //  - box / Azure SQL: FOR SYSTEM_TIME AS OF @__at — a per-table clause, requires a system-versioned
+        //    (temporal) table.
+        //  - Fabric Warehouse / Synapse: OPTION (FOR TIMESTAMP AS OF '<literal>') — a statement-level hint that
+        //    works on ANY table (no temporal setup). UTC only; at most 3 fractional-second digits (Fabric errors
+        //    on more). The literal is a fixed-format datetime (no injection) since OPTION takes no parameter.
+        string optionClause = "";
         if (spec?.At is { } at)
         {
             if (!string.Equals(at.Unit, "timestamp", StringComparison.OrdinalIgnoreCase))
             {
                 throw new NotSupportedException(
                     $"mssql_net: AT ({at.Unit} => ...) time travel is not supported by the SQL Server provider; " +
-                    "use AT (TIMESTAMP => ...) on a system-versioned (temporal) table");
+                    "use AT (TIMESTAMP => ...) (a temporal table on box, or any table on Fabric Warehouse)");
             }
-            // FOR SYSTEM_TIME AS OF @__at — a datetime2 parameter (name disjoint from the @a*/@p* used elsewhere).
-            var asOf = new SqlParameter("@__at", SqlDbType.DateTime2)
+            var ts = DateTime.Parse(at.Value, System.Globalization.CultureInfo.InvariantCulture);
+            if (Profile.IsWarehouse)
             {
-                Value = DateTime.Parse(at.Value, System.Globalization.CultureInfo.InvariantCulture)
-            };
-            source = $"{source} FOR SYSTEM_TIME AS OF @__at";
-            sourceParams = new List<SqlParameter>(sourceParams) { asOf };
+                // Truncate to milliseconds (>= 4 fractional digits is rejected by Fabric, error 22440).
+                var literal = ts.ToString("yyyy-MM-ddTHH:mm:ss.fff", System.Globalization.CultureInfo.InvariantCulture);
+                optionClause = $" OPTION (FOR TIMESTAMP AS OF '{literal}')";
+            }
+            else
+            {
+                var asOf = new SqlParameter("@__at", SqlDbType.DateTime2) { Value = ts };
+                source = $"{source} FOR SYSTEM_TIME AS OF @__at";
+                sourceParams = new List<SqlParameter>(sourceParams) { asOf };
+            }
         }
 
         // Projection: SELECT only the requested columns (absent/empty => SELECT *).
@@ -1403,7 +1415,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 var where = builder.Build(spec.Filter);
                 var allParams = new List<SqlParameter>(sourceParams);
                 allParams.AddRange(builder.Parameters); // source @a* + filter @p* are disjoint
-                return ExecuteQuery($"SELECT {top}{columns} FROM {source} WHERE {where}{orderBy}", allParams);
+                return ExecuteQuery($"SELECT {top}{columns} FROM {source} WHERE {where}{orderBy}{optionClause}", allParams);
             }
             catch
             {
@@ -1412,7 +1424,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         }
 
         filterValues?.Dispose();
-        return ExecuteQuery($"SELECT {top}{columns} FROM {source}{orderBy}",
+        return ExecuteQuery($"SELECT {top}{columns} FROM {source}{orderBy}{optionClause}",
                             sourceParams.Count > 0 ? sourceParams : null);
     }
 
