@@ -2211,19 +2211,21 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                "  ORDER BY i2.is_primary_key DESC, COUNT(*) ASC, i2.index_id ASC) " +
                "ORDER BY ic.key_ordinal";
 
-        // Fabric Warehouse / Synapse: PK/UNIQUE are NON-ENFORCED hints (so not a reliable uniqueness guarantee),
-        // whereas an IDENTITY column is engine-generated-unique — an ideal single-column rowid. So prefer the
-        // IDENTITY column when present; otherwise fall back to the PK/unique-index logic. Box / Azure SQL keep the
-        // PK-first behavior (their PKs are enforced, and an identity key is usually the PK anyway).
-        if (!profile.IsWarehouse)
-        {
-            return keyIndexQuery;
-        }
-        return "IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(" + objectLiteral +
-               ") AND is_identity = 1) " +
-               "  SELECT c.name FROM sys.columns c WHERE c.object_id = OBJECT_ID(" + objectLiteral +
-               ") AND c.is_identity = 1 " +
-               "ELSE " + keyIndexQuery;
+        // An IDENTITY column is a fine single-column rowid too (engine-generated, effectively unique), so it lets
+        // UPDATE/DELETE work on a table with no PK/UNIQUE at all. Precedence differs by engine:
+        //  - Fabric Warehouse / Synapse: PK/UNIQUE are NON-ENFORCED hints (weak uniqueness), so the IDENTITY column
+        //    is the BETTER rowid — prefer it, fall back to the PK/unique index.
+        //  - Box / Azure SQL: enforced PKs are the intended key — prefer PK/unique, fall back to an IDENTITY column
+        //    only when the table has no key constraint.
+        string identityQuery = "SELECT c.name FROM sys.columns c WHERE c.object_id = OBJECT_ID(" + objectLiteral +
+                               ") AND c.is_identity = 1";
+        string identityExists = "EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(" + objectLiteral +
+                                ") AND is_identity = 1)";
+        string keyExists = "EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(" + objectLiteral +
+                           ") AND (is_primary_key = 1 OR is_unique = 1))";
+        return profile.IsWarehouse
+            ? "IF " + identityExists + " " + identityQuery + " ELSE " + keyIndexQuery
+            : "IF " + keyExists + " " + keyIndexQuery + " ELSE " + identityQuery;
     }
 
     // IDENTITY column names of an existing table (case-insensitive set).

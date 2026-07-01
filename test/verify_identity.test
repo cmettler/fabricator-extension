@@ -96,6 +96,48 @@ SELECT arrownet_idt4_id, x FROM db.dbo.arrownet_idt4;
 statement ok
 SET mssql_add_identity=false;
 
+# --- an IDENTITY column is usable as the rowid when the table has NO PK/UNIQUE (enables UPDATE/DELETE) ---
+statement ok
+DROP TABLE IF EXISTS db.dbo.arrownet_idrid;
+
+statement ok
+CREATE TABLE db.dbo.arrownet_idrid (OrderID BIGINT AS (0), val VARCHAR, qty INTEGER);
+
+statement ok
+INSERT INTO db.dbo.arrownet_idrid (val, qty) VALUES ('a',1),('b',2),('c',3);
+
+# rowid resolves to the identity column (box IDENTITY(1,1) → 1,2,3).
+query I
+SELECT rowid FROM db.dbo.arrownet_idrid ORDER BY qty;
+----
+1
+2
+3
+
+# UPDATE via the identity rowid.
+statement ok
+UPDATE db.dbo.arrownet_idrid SET qty = qty + 100 WHERE val = 'b';
+
+query TI
+SELECT val, qty FROM db.dbo.arrownet_idrid ORDER BY val;
+----
+a	1
+b	102
+c	3
+
+# DELETE via the identity rowid.
+statement ok
+DELETE FROM db.dbo.arrownet_idrid WHERE val = 'a';
+
+query TI
+SELECT val, qty FROM db.dbo.arrownet_idrid ORDER BY val;
+----
+b	102
+c	3
+
+statement ok
+DROP TABLE db.dbo.arrownet_idrid;
+
 # --- with add_identity OFF, no auto column is added (a plain table) ---
 statement ok
 DROP TABLE IF EXISTS db.dbo.arrownet_idt5;

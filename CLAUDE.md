@@ -496,13 +496,15 @@ Implemented and verified:
 - **Statistics → optimizer**: cardinality (row count from `sys.dm_db_partition_stats`) + per-column NDV
   (leading-column histogram). **min/max deliberately NOT reported** (DuckDB prunes filters on min/max →
   stale SQL Server stats could drop rows; NDV is costing-only so stale is safe).
-- **rowid** from PK / smallest unique index (scalar + compound STRUCT) → enables UPDATE/DELETE. **On a warehouse
-  profile (Fabric/Synapse), an IDENTITY column is preferred as the rowid when present** (`RowIdSql` gated on
-  `profile.IsWarehouse`: `IF EXISTS(is_identity) → that column ELSE the PK/unique-index query`) — Fabric PK/UNIQUE
-  are NON-ENFORCED hints (weak uniqueness guarantee) whereas an IDENTITY column is engine-generated-unique, an
-  ideal single-column rowid; so UPDATE/DELETE work on a warehouse table that has only an IDENTITY column and no
-  PK (validated live). Box / Azure SQL keep PK-first (enforced PKs; the identity is usually the PK). Falls back
-  to the existing logic when no identity column exists.
+- **rowid** from PK / smallest unique index (scalar + compound STRUCT) → enables UPDATE/DELETE. **An IDENTITY
+  column is also usable as the rowid** (engine-generated, effectively unique) so UPDATE/DELETE work on a table
+  with NO PK/UNIQUE at all — `RowIdSql` composes an `IF EXISTS(...) <a> ELSE <b>` with the precedence flipped by
+  engine: **Fabric/Synapse warehouse prefers the IDENTITY column** (their PK/UNIQUE are NON-ENFORCED hints =
+  weak uniqueness) — `IF is_identity → identity ELSE PK/unique-index`; **box / Azure SQL prefer PK/unique** (their
+  PKs are enforced/intended) and fall back to the IDENTITY column only when the table has no key constraint —
+  `IF has_pk_or_unique → PK/unique-index ELSE identity`. Both validated live (identity-only table, no PK →
+  UPDATE + DELETE via the identity rowid, on box AND Fabric Warehouse). Falls back to no rowid when neither
+  exists (as before).
 - **Time travel** (`FROM cat.t AT (TIMESTAMP => ts)`) → SQL Server temporal tables `FOR SYSTEM_TIME AS OF`
   (`eeae2e2`). The AT clause is a **bind-time, per-table-reference constant** (not per-scan pushdown), so it
   flows through the binding: `ArrowNetCatalog::SupportsTimeTravel()→true` (else the binder rejects it with
