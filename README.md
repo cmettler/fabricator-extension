@@ -220,6 +220,9 @@ What the profile drives automatically:
   CREATE TABLE wh.dbo.Orders (OrderID BIGINT AS (0), CustomerID INT, Amount DECIMAL(10,2));  -- OrderID → IDENTITY
   ATTACH '...' AS wh (TYPE mssql_net, add_identity true);   -- every created table gets <table>_id
   ```
+  On a warehouse, an IDENTITY column is also **preferred as the `rowid`** (Fabric PK/UNIQUE are non-enforced
+  hints, but IDENTITY is engine-unique) — so `UPDATE`/`DELETE` work on a warehouse table whose only key is its
+  identity column, with no primary key.
 - **Functions.** Discovered scalar UDFs, TVFs, and stored procedures work on Fabric (proc result sets resolved
   via `sp_describe_first_result_set`), as do custom C# functions and the `fn_each` table-in-out exchange.
 

@@ -1141,7 +1141,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         // C++ host reads that schema to learn the DuckDB column types.
         MetadataKind.Columns => ExecuteMetadataQuery($"SELECT * FROM {Quote(Require(schema, table).schema)}." +
                                              $"{Quote(Require(schema, table).table)} WHERE 1 = 0"),
-        MetadataKind.RowId => ExecuteMetadataQuery(RowIdSql(Require(schema, table).schema, Require(schema, table).table)),
+        MetadataKind.RowId => ExecuteMetadataQuery(RowIdSql(Require(schema, table).schema, Require(schema, table).table, Profile)),
         MetadataKind.RowCount => ExecuteMetadataQuery(RowCountSql(Require(schema, table).schema, Require(schema, table).table)),
         MetadataKind.ColumnNdv => ExecuteMetadataQuery(ColumnNdvSql(Require(schema, table).schema, Require(schema, table).table)),
         MetadataKind.Functions => ExecuteMetadataQuery(FunctionsMetadataSql()),
@@ -2195,10 +2195,12 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     // Row-identity columns in key order: the primary key if present, else the
     // unique index with the fewest columns (tie-break by index_id).
-    private static string RowIdSql(string schema, string table)
+    private static string RowIdSql(string schema, string table, ServerProfile profile)
     {
         string objectLiteral = "N'" + (schema + "." + table).Replace("'", "''") + "'";
-        return "SELECT c.name FROM sys.indexes i " +
+        // The rowid = the PK, else the smallest unique index (fewest columns), by key ordinal.
+        string keyIndexQuery =
+               "SELECT c.name FROM sys.indexes i " +
                "JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id " +
                "JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id " +
                "WHERE i.object_id = OBJECT_ID(" + objectLiteral + ") AND i.index_id = (" +
@@ -2208,6 +2210,20 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                "  GROUP BY i2.index_id, i2.is_primary_key " +
                "  ORDER BY i2.is_primary_key DESC, COUNT(*) ASC, i2.index_id ASC) " +
                "ORDER BY ic.key_ordinal";
+
+        // Fabric Warehouse / Synapse: PK/UNIQUE are NON-ENFORCED hints (so not a reliable uniqueness guarantee),
+        // whereas an IDENTITY column is engine-generated-unique — an ideal single-column rowid. So prefer the
+        // IDENTITY column when present; otherwise fall back to the PK/unique-index logic. Box / Azure SQL keep the
+        // PK-first behavior (their PKs are enforced, and an identity key is usually the PK anyway).
+        if (!profile.IsWarehouse)
+        {
+            return keyIndexQuery;
+        }
+        return "IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(" + objectLiteral +
+               ") AND is_identity = 1) " +
+               "  SELECT c.name FROM sys.columns c WHERE c.object_id = OBJECT_ID(" + objectLiteral +
+               ") AND c.is_identity = 1 " +
+               "ELSE " + keyIndexQuery;
     }
 
     // IDENTITY column names of an existing table (case-insensitive set).
