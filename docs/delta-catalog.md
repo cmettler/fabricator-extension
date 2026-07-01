@@ -465,17 +465,21 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      COLUMN` (what dbt's `on_schema_change` uses). Validated: `verify_delta_catalog_overwrite_merge.test` (47); full
      Delta + SqlServer suites unregressed.
 
-     **DECIMAL read corruption — FIXED (`DecimalWidening`, C#-only).** engineered-wood's parquet reader returns a
-     decimal at its physical width (INT32 → Arrow `Decimal32`, INT64 → `Decimal64`); those VALUES are correct in
-     C#, but the narrow Arrow decimal types are mishandled crossing the C-data-interface to DuckDB (read as 128-bit
-     over the 4/8-byte buffer → e.g. `CAST(1.5 AS DECIMAL(2,1))` → `10.4`). DuckDB's native `read_parquet` reads the
-     same files correctly, so only the read handoff was wrong. `DecimalWidening` (Bridge) widens `Decimal32/64` →
-     the classic `Decimal128` (schema + batches) on the Delta read boundary, applied in `DeltaReader` to every read
-     (scan / rowid / time-travel / CDF) + `GetSchema*`. No ABI or engineered-wood change.
-     `verify_delta_catalog_decimal.test` (19). **Still-open separate bug (engineered-wood parquet decoder):
-     `DELETE`/`UPDATE` on a decimal-column table crashes on the post-rewrite read — the copy-on-write rewrite emits
-     a `DELTA_BINARY_PACKED` page whose value count overruns the read buffer (`DecodeDeltaBinaryPackedValues` →
-     `ColumnBuildState.ReserveValues`); needs an engineered-wood decoder fix (independent of the widening).
+     **DECIMAL read + rowid-DML corruption — FIXED at the source (engineered-wood, no Bridge widening).** Two
+     bugs, both in engineered-wood: (1) the parquet reader mapped a decimal to its physical width (INT32 → narrow
+     Arrow `Decimal32`, INT64 → `Decimal64`); the VALUES are correct in C#, but the narrow Arrow decimal types are
+     mishandled crossing the C-data-interface to DuckDB (read as 128-bit over the 4/8-byte buffer → e.g.
+     `CAST(1.5 AS DECIMAL(2,1))` → `10.4`). DuckDB's native `read_parquet` reads the same files correctly, so only
+     the read handoff was wrong → **`ArrowSchemaConverter.MakeDecimalType` now always emits the classic
+     `Decimal128` (≤38) / `Decimal256` (>38)** regardless of physical width (the int32/int64 builders already
+     sign-extend to any byteWidth, so it's lossless). (2) the copy-on-write survivor filter
+     `DeletionVectorFilter.TakeRows` had no decimal case → `default: return source` passed the decimal column
+     through UNFILTERED (all rows) → a row-count mismatch in the rewritten file (mispaired reads + a
+     `ReserveValues` buffer overrun) → **`DELETE`/`UPDATE` on a decimal-column table corrupted/crashed**. Fixed by
+     handling `Decimal128Array`/`Decimal256Array` in `TakeRows` via a byte-slice copy of the fixed-width value
+     buffer (avoids `System.Decimal`'s 28-digit cap). With (1) the Bridge-side `DecimalWidening` is redundant and
+     **removed**. Verified: `verify_delta_catalog_decimal.test` (47 — scan, filter/aggregate, INSERT, time-travel,
+     DELETE, UPDATE, re-attach durability).
 3. **DELETE — FINAL: copy-on-write + transient `(file,position)` rowid, PLAIN Delta (no features).** The
    detailed design below (row tracking + deletion vectors) is the SUPERSEDED first attempt — kept as the trail.
    Why it changed: Fabric's OneLake converter / Spark could not read our row-tracking + DV commits (first from

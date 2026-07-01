@@ -1194,20 +1194,25 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   time-travel; old versions still show the old schema). Verified:
   `test/verify_delta_catalog_overwrite_merge.test` (47 — atomic partition overwrite, true CREATE OR REPLACE
   narrower-drops/wider-adds, COPY SCHEMA_MODE merge + overwrite); full Delta + SqlServer (columnstore/identity)
-  suites unregressed. **Delta DECIMAL read corruption — FIXED (C#-only, `DecimalWidening`).** Root cause: engineered-wood's
-  parquet reader represents a decimal by its parquet PHYSICAL width — INT32 → Arrow `Decimal32`, INT64 →
-  `Decimal64` (the newer narrow Arrow decimal types). The VALUES are correct in C# (verified via a spike), but the
-  Arrow C-data-interface handoff of `Decimal32/64` is mishandled crossing to DuckDB (DuckDB reads them as 128-bit
-  over the 4/8-byte buffer → garbage; e.g. `CAST(1.5 AS DECIMAL(2,1))` → `10.4`, `DECIMAL(10,2) 123.45` → `0.00`).
-  DuckDB's native `read_parquet` reads the SAME files correctly → the WRITE is fine, only the read handoff was
-  wrong. Fix: `DecimalWidening` (Bridge) widens `Decimal32/64` → the classic, universally-handled `Decimal128`
-  (schema + batches) on the Delta read boundary — applied in `DeltaReader` to EVERY read (scan, rowid, time-travel,
-  CDF) + `GetSchema*`. No ABI/engineered-wood change. Verified: `test/verify_delta_catalog_decimal.test` (19 —
-  Decimal32/64/128, negatives, filter/aggregate, INSERT, time-travel). **Still-open SEPARATE bug (deeper,
-  engineered-wood parquet decoder): `DELETE`/`UPDATE` on a table with a decimal column crashes on the post-rewrite
-  read** — the copy-on-write rewrite writes a `DELTA_BINARY_PACKED` page whose value count overruns the read
-  buffer (`ColumnChunkReader.DecodeDeltaBinaryPackedValues` → `ColumnBuildState.ReserveValues` `ArgumentOutOfRange`);
-  independent of the widening (the rewrite-read crashes regardless), needs an engineered-wood decoder fix.
+  suites unregressed. **Delta DECIMAL read + rowid-DML corruption — FIXED at the source (engineered-wood, no
+  Bridge widening).** TWO root causes, both in engineered-wood, both fixed there: (1) **read corruption** — the
+  parquet reader mapped a decimal to its parquet PHYSICAL width (INT32 → narrow Arrow `Decimal32`, INT64 →
+  `Decimal64`), and the newer narrow decimal types are mishandled crossing the Arrow C-data-interface to DuckDB
+  (read as 128-bit over the 4/8-byte buffer → garbage; e.g. `CAST(1.5 AS DECIMAL(2,1))` → `10.4`,
+  `DECIMAL(10,2) 123.45` → `0.00`). DuckDB's native `read_parquet` reads the SAME files correctly → the WRITE was
+  fine, only the read handoff was wrong. **Fix:** `ArrowSchemaConverter.MakeDecimalType` now always emits the
+  classic `Decimal128` (≤38) / `Decimal256` (>38) regardless of physical width (`BuildDecimalFromInt32/Int64`
+  already sign-extend to any byteWidth, so it's lossless). (2) **rowid `DELETE`/`UPDATE` corruption + crash** —
+  the copy-on-write survivor filter `DeletionVectorFilter.TakeRows` had no decimal case → its `default: return
+  source` passed the decimal column through UNFILTERED (all original rows), so the rewritten file had a
+  row-count mismatch (e.g. `id` filtered to 2 values, `b` still 3) → mispaired reads + a `ReserveValues` buffer
+  overrun. **Fix:** `TakeRows` now handles `Decimal128Array`/`Decimal256Array` via a byte-slice copy of the
+  fixed-width value buffer (avoids `System.Decimal`'s 28-digit cap so precision 29–38 survives). With (1) the
+  Bridge-side `DecimalWidening` (schema+batch widen on the Delta read boundary) is redundant and **removed** —
+  the source now emits `Decimal128` directly. Verified: `test/verify_delta_catalog_decimal.test` (47 —
+  Decimal32/64/128 physical widths, negatives, filter/aggregate, INSERT, time-travel AT VERSION, **DELETE**,
+  **UPDATE**, re-attach durability); full Delta catalog suite (write/delete/update/changes/snapshots/
+  time_travel/dv/alter/schemas) unregressed.
   v50 = **directory move/rename** — appended `fs_move_dir(opener,src,dest,…)` to
   `ArrowNetHostServices` (the reverse host→managed struct): maps to DuckDB's `FileSystem::MoveFile` — an atomic
   directory rename on a local filesystem; object stores (S3/Azure DFS) throw "not implemented". Powers **local/S3

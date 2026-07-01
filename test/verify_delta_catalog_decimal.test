@@ -1,10 +1,12 @@
 # name: test/verify_delta_catalog_decimal.test
-# description: Delta DECIMAL round-trip. engineered-wood's parquet reader represents a decimal by its parquet
-#              physical width (INT32 => Arrow Decimal32, INT64 => Decimal64) — whose VALUES are correct, but the
-#              newer narrow Arrow decimal types are mishandled crossing the C-data-interface to DuckDB (the format
-#              string is read as 128-bit over the 4/8-byte buffer => corruption). The Delta read path widens
-#              Decimal32/64 -> the classic Decimal128 (schema + batches) before export (DecimalWidening), applied
-#              to every read (scan, rowid DELETE/UPDATE, time travel, CDF). Set ARROWNET_DELTA_WRITE_DIR. Local FS.
+# description: Delta DECIMAL round-trip + rowid DML. engineered-wood's parquet reader maps a decimal to a
+#              classic Arrow Decimal128/256 (ArrowSchemaConverter.MakeDecimalType) regardless of the parquet
+#              physical width (INT32/INT64/FBA) — the narrow Decimal32/64 types are mishandled crossing the
+#              C-data-interface to DuckDB (the format string is read as 128-bit over the 4/8-byte buffer =>
+#              corruption), so emitting Decimal128 at the source is the fix (no Bridge-side widening). The
+#              copy-on-write DELETE/UPDATE survivor filter (DeletionVectorFilter.TakeRows) also handles decimals
+#              (byte-slice copy) — without it a decimal column passed through UNFILTERED (row-count mismatch =>
+#              corruption + crash). Set ARROWNET_DELTA_WRITE_DIR. Local FS.
 # group: [mssql_net]
 
 require mssql_net
@@ -21,7 +23,7 @@ CREATE TABLE lake.main.d AS SELECT * FROM (VALUES
   (2, CAST(-7.2 AS DECIMAL(2,1)), CAST(-0.01 AS DECIMAL(10,2)), CAST(0.001 AS DECIMAL(20,3)))
 ) AS t(id, a, b, c);
 
-# Round-trip (the scan read path, widened).
+# Round-trip (the scan read path).
 query IRRR
 SELECT id, a, b, c FROM lake.main.d ORDER BY id;
 ----
@@ -34,7 +36,7 @@ SELECT sum(b) FROM lake.main.d WHERE a > 0;
 ----
 123.45
 
-# Append more decimals (INSERT — an appended file, widened on read).
+# Append more decimals (INSERT — an appended file).
 statement ok
 INSERT INTO lake.main.d VALUES (3, CAST(2.5 AS DECIMAL(2,1)), CAST(500.00 AS DECIMAL(10,2)), CAST(1.5 AS DECIMAL(20,3)));
 
@@ -48,17 +50,45 @@ SELECT count(*) FROM lake.main.d;
 ----
 3
 
-# Time travel (the AT-version read path, widened): v0 = empty CREATE, v1 = the 2 CTAS rows, v2 = the INSERT.
+# Time travel (the AT-version read path): v0 = empty CREATE, v1 = the 2 CTAS rows, v2 = the INSERT.
 query IR
 SELECT id, b FROM lake.main.d AT (VERSION => 1) ORDER BY id;
 ----
 1	123.45
 2	-0.01
 
-# NOTE: DELETE/UPDATE on a table with a decimal column is blocked by a SEPARATE engineered-wood parquet bug
-# (the copy-on-write rewrite writes a DELTA_BINARY_PACKED page whose value count overruns the read buffer —
-# DecodeDeltaBinaryPackedValues / ColumnBuildState.ReserveValues). Independent of this decimal-widening fix;
-# tracked separately. Not exercised here.
+# DELETE (rowid copy-on-write): the survivor filter must keep the decimal columns correctly paired with id.
+statement ok
+DELETE FROM lake.main.d WHERE id = 2;
+
+query IRRR
+SELECT id, a, b, c FROM lake.main.d ORDER BY id;
+----
+1	1.5	123.45	9876543210.123
+3	2.5	500.00	1.5
+
+# UPDATE (rowid per-file copy-on-write): a SET on a decimal column; other decimals untouched.
+statement ok
+UPDATE lake.main.d SET b = b + 1 WHERE id = 3;
+
+query IRRR
+SELECT id, a, b, c FROM lake.main.d ORDER BY id;
+----
+1	1.5	123.45	9876543210.123
+3	2.5	501.00	1.5
+
+# The DELETE'd table is still readable and correct after re-attach (durability).
+statement ok
+DETACH lake;
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/dec' AS lake (TYPE arrownet, PROVIDER 'delta');
+
+query IRRR
+SELECT id, a, b, c FROM lake.main.d ORDER BY id;
+----
+1	1.5	123.45	9876543210.123
+3	2.5	501.00	1.5
 
 statement ok
 DETACH lake;
