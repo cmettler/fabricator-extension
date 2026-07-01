@@ -1165,7 +1165,21 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   dictionary + always-on min/max stats; bloom off by default). Validated: `test/verify_delta_catalog_partition.test`
   (54 — native CTAS/empty-CREATE+INSERT/multi-column/setting/override/re-attach), full Delta suite + SqlServer
   columnstore (CREATE+CTAS) unregressed, native partitioning **live on Fabric OneLake** (`LH.dbo.arrownet_parttest`,
-  `region=US/EU/APAC`). v50 = **directory move/rename** — appended `fs_move_dir(opener,src,dest,…)` to
+  `region=US/EU/APAC`). **`delta_write_options` also carries `replace_where` + `merge_schema`** (C#-only, no ABI):
+  **`replace_where` = `{partcol:val,…}`** turns an INSERT into an ATOMIC partition-overwrite — engineered-wood
+  `DeltaTable.OverwritePartitionsAsync` (new; `WriteAsync`→ private `WriteCoreAsync` core with an
+  `overwritePartitions` filter) removes exactly the matching-partition files + adds the new data in ONE commit
+  (delta-rs static partition overwrite); keys MUST be partition columns (else `DeltaFormatException` — file-level
+  removal is only exact for partition predicates) and the input must fall within them (else it errors, no
+  silent append). `DeltaCatalog` gates it to plain INSERT (dropped for CREATE/CTAS/REPLACE). **`merge_schema`**
+  (bool; ATTACH option `merge_schema true` + the setting) = additive evolution: on CREATE OR REPLACE / CTAS a
+  WIDER incoming schema adds the new columns nullable (`DeltaWriter.MergeSchema` → engineered-wood
+  `AddColumnAsync` per new column) instead of silently dropping them. **A plain INSERT of wider data can't
+  auto-merge** — DuckDB's INSERT binder rejects extra columns before the provider is reached (a front-end
+  limit); append-time evolution is via `ALTER TABLE ADD COLUMN` (already supported) or CREATE OR REPLACE.
+  Verified: `test/verify_delta_catalog_overwrite_merge.test` (46 — atomic EU-partition overwrite [US untouched,
+  one commit], non-partition-column + out-of-partition errors, merge_schema on CREATE OR REPLACE via setting +
+  ATTACH option); full Delta suite unregressed (the `WriteCoreAsync` refactor). v50 = **directory move/rename** — appended `fs_move_dir(opener,src,dest,…)` to
   `ArrowNetHostServices` (the reverse host→managed struct): maps to DuckDB's `FileSystem::MoveFile` — an atomic
   directory rename on a local filesystem; object stores (S3/Azure DFS) throw "not implemented". Powers **local/S3
   Delta catalog RENAME TABLE** (`DeltaCatalog.AlterTable` RenameTable → `HostFs.MoveDir`; OneLake still renames via

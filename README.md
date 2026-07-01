@@ -686,6 +686,21 @@ encoding is auto-enabled per column and min/max statistics are always collected 
 pruning); bloom filters are off unless requested. (Partitioning is honored by the Delta provider; the
 SQL Server / DAX providers ignore `PARTITIONED BY`.)
 
+Two more write options (also via `delta_write_options`):
+
+- **`replace_where`** — an atomic **partition overwrite**. On an `INSERT`, `{"replace_where":{"region":"EU"}}`
+  removes exactly the matching partition's files and adds the new rows in **one Delta commit** (delta-rs's
+  static partition overwrite). Keys must be partition columns; the inserted data must fall within them.
+  ```sql
+  SET delta_write_options='{"replace_where":{"region":"EU"}}';
+  INSERT INTO lake.main.sales SELECT * FROM new_eu_rows;   -- EU replaced atomically, other partitions untouched
+  SET delta_write_options='';
+  ```
+- **`merge_schema`** — additive schema evolution. On `CREATE OR REPLACE` / CTAS, a wider incoming schema
+  **adds the new columns** (nullable) instead of silently dropping them. Also a per-catalog `ATTACH` option
+  (`merge_schema true`). Note: a plain `INSERT` of wider data is rejected by DuckDB's binder before it reaches
+  the provider — use `ALTER TABLE ADD COLUMN` (supported) for append-time evolution, or `CREATE OR REPLACE`.
+
 Delta ATTACH options: `PROVIDER 'delta'`, `SECRET <azure_sp>` (OneLake/ADLS auth), `READ_ONLY false`
 (required for OneLake writes), `schemas true` (two-level layout on local/S3), `compression` / `row_group_size`
 / `bloom_filter_columns` (write-tuning defaults), `deletion_vectors true`

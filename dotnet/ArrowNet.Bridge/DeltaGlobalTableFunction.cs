@@ -211,7 +211,14 @@ internal sealed record DeltaWriteSpec(
     EngineeredWood.Compression.CompressionCodec? Compression,
     int? RowGroupSize,
     IReadOnlyList<string>? BloomFilterColumns,
-    IReadOnlyList<string>? PartitionColumns);
+    IReadOnlyList<string>? PartitionColumns,
+    // replace_where: a partition column→value map. When set on an INSERT, the write becomes an ATOMIC
+    // partition-overwrite (remove the matching partition's files + add the new data, one commit) instead of an
+    // append. Keys must be partition columns of the table (engineered-wood enforces this).
+    IReadOnlyDictionary<string, string>? ReplaceWhere = null,
+    // merge_schema: auto-evolve the table schema before an append — any column present in the incoming data but
+    // not in the table is added as a nullable column (metadata-only AddColumnAsync) prior to the write.
+    bool MergeSchema = false);
 
 /// <summary>
 /// Writes a Delta Lake table via engineered-wood through the host FileSystem (the <see cref="DuckDbTableFileSystem"/>
@@ -302,7 +309,16 @@ internal static class DeltaWriter
                                                      cancellationToken: ct).AsTask().GetAwaiter().GetResult();
             try
             {
-                return table.WriteAsync(batches, mode, ct).AsTask().GetAwaiter().GetResult();
+                // merge_schema: add any incoming column absent from the table as a nullable column (a metadata-only
+                // commit each) before the append, so a wider INSERT evolves the table instead of failing/ignoring.
+                if (spec?.MergeSchema == true)
+                {
+                    MergeSchema(table, schema, ct);
+                }
+                // replace_where => atomic partition-overwrite (one commit); otherwise the requested append/overwrite.
+                return spec?.ReplaceWhere is { Count: > 0 } parts
+                    ? table.OverwritePartitionsAsync(batches, parts, ct).AsTask().GetAwaiter().GetResult()
+                    : table.WriteAsync(batches, mode, ct).AsTask().GetAwaiter().GetResult();
             }
             catch (EngineeredWood.DeltaLake.DeltaConflictException) when (attempt < MaxCommitAttempts)
             {
@@ -312,6 +328,28 @@ internal static class DeltaWriter
             {
                 table.DisposeAsync().AsTask().GetAwaiter().GetResult();
             }
+        }
+    }
+
+    /// <summary>Evolves the table schema for merge_schema: for each field in <paramref name="incoming"/> whose
+    /// name is absent from the table's current schema, adds it as a NULLABLE column (engineered-wood
+    /// <c>AddColumnAsync</c> — a metadata-only commit; old files read the new column back as NULL). Case-insensitive
+    /// name match. Columns the incoming data lacks are left as-is (they read/append as NULL).</summary>
+    private static void MergeSchema(DeltaTable table, Schema incoming, CancellationToken ct)
+    {
+        var existing = new HashSet<string>(
+            table.ArrowSchema.FieldsList.Select(f => f.Name), System.StringComparer.OrdinalIgnoreCase);
+        foreach (var field in incoming.FieldsList)
+        {
+            if (existing.Contains(field.Name))
+            {
+                continue;
+            }
+            // Add as nullable regardless of the incoming field's flag (a newly-added column must be nullable so
+            // pre-existing rows can back-fill NULL).
+            var nullableField = new Field(field.Name, field.DataType, nullable: true);
+            table.AddColumnAsync(nullableField, ct).AsTask().GetAwaiter().GetResult();
+            existing.Add(field.Name);
         }
     }
 

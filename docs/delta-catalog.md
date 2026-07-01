@@ -434,6 +434,26 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      collect min/max stats (driving file + row-group pruning), Snappy compression, bloom filters off — good
      defaults, nothing required. Validated: `verify_delta_catalog_partition.test` (54); native partitioning live on
      Fabric OneLake (`LH.dbo.arrownet_parttest`, `region=US/EU/APAC`).
+
+     **ATOMIC PARTITION-OVERWRITE (`replace_where`) + SCHEMA MERGE (`merge_schema`) — DONE.** Two more
+     `delta_write_options` keys (C#-only, no ABI). **`replace_where` = `{partcol:val,…}`**: an INSERT becomes an
+     ATOMIC partition overwrite — engineered-wood `OverwritePartitionsAsync` (a new public entry over the private
+     `WriteCoreAsync` core; `WriteAsync` is now a thin wrapper) removes exactly the files whose partition values
+     match every entry + adds the new data, in **one Delta commit** (delta-rs static partition overwrite; delivers
+     the atomic "truncate partition + insert" the two-statement `BEGIN; …; END` cannot — the Delta provider's
+     BEGIN/COMMIT are no-ops, so multi-statement isn't atomic, but a single overwrite commit is). Guards: keys MUST
+     be partition columns (`DeltaFormatException` otherwise — file-level removal is only exact for partition
+     predicates, never a data-column predicate that could partially match a file), and the input must fall within
+     the target partitions (else it errors rather than silently appending to an uncleared partition).
+     `DeltaCatalog` applies it only to a plain INSERT (dropped for CREATE/CTAS/REPLACE, which rewrite the whole
+     table). **`merge_schema`** (bool; the setting OR a per-catalog `ATTACH` option `merge_schema true`): on
+     CREATE OR REPLACE / CTAS a WIDER incoming schema evolves the table — `DeltaWriter.MergeSchema` diffs the
+     incoming vs table schema and calls engineered-wood `AddColumnAsync` (nullable, metadata-only) for each new
+     column before the overwrite, instead of silently dropping it. **A plain INSERT of wider data cannot
+     auto-merge**: DuckDB's INSERT binder rejects extra columns *before* the provider is reached (a front-end
+     constraint, not fixable in the provider) — append-time evolution is via `ALTER TABLE ADD COLUMN` (already
+     supported, what dbt's `on_schema_change` uses) or CREATE OR REPLACE with `merge_schema`. Validated:
+     `verify_delta_catalog_overwrite_merge.test` (46); full Delta suite unregressed (the `WriteCoreAsync` refactor).
 3. **DELETE — FINAL: copy-on-write + transient `(file,position)` rowid, PLAIN Delta (no features).** The
    detailed design below (row tracking + deletion vectors) is the SUPERSEDED first attempt — kept as the trail.
    Why it changed: Fabric's OneLake converter / Spark could not read our row-tracking + DV commits (first from

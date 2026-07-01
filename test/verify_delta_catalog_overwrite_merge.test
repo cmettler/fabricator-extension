@@ -1,0 +1,121 @@
+# name: test/verify_delta_catalog_overwrite_merge.test
+# description: Delta write options — atomic partition-overwrite (replace_where) + additive schema merge
+#              (merge_schema), both driven by the session `delta_write_options` JSON setting (replace_where also
+#              needs it; merge_schema also has an ATTACH option).
+#              * replace_where {partcol:val,...}: an INSERT becomes an ATOMIC partition-overwrite — engineered-wood
+#                removes exactly the matching-partition files + adds the new data in ONE Delta commit (delta-rs's
+#                static partition overwrite). Keys must be partition columns; input must fall in those partitions.
+#              * merge_schema: on CREATE OR REPLACE / CTAS, a wider incoming schema evolves the table (new columns
+#                added nullable) instead of being silently dropped. (Plain INSERT can't widen — DuckDB's binder
+#                rejects extra columns before the provider; use ALTER ADD COLUMN there.)
+#              Set ARROWNET_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
+# group: [mssql_net]
+
+require mssql_net
+
+require-env ARROWNET_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/owm' AS lake (TYPE arrownet, PROVIDER 'delta');
+
+# ================= replace_where: atomic partition overwrite =================
+statement ok
+CREATE TABLE lake.main.sales PARTITIONED BY (region) AS
+  SELECT * FROM (VALUES (1,'US',10),(2,'US',20),(3,'EU',30),(4,'EU',40)) AS t(id,region,amt);
+
+query TII
+SELECT region, count(*), sum(amt) FROM lake.main.sales GROUP BY region ORDER BY region;
+----
+EU	2	70
+US	2	30
+
+# Overwrite ONLY the EU partition (atomic) with new EU rows; US must be untouched.
+statement ok
+SET delta_write_options='{"replace_where":{"region":"EU"}}';
+
+statement ok
+INSERT INTO lake.main.sales SELECT * FROM (VALUES (5,'EU',500),(6,'EU',600),(7,'EU',700)) AS t(id,region,amt);
+
+statement ok
+SET delta_write_options='';
+
+query TII
+SELECT region, count(*), sum(amt) FROM lake.main.sales GROUP BY region ORDER BY region;
+----
+EU	3	1800
+US	2	30
+
+# The swap is ONE commit (v0 CREATE, v1 initial WRITE, v2 the partition overwrite).
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('lake', 'main.sales');
+----
+3
+
+# replace_where on a NON-partition column errors (file-level removal would be inexact).
+statement ok
+SET delta_write_options='{"replace_where":{"amt":"10"}}';
+
+statement error
+INSERT INTO lake.main.sales SELECT * FROM (VALUES (9,'US',10)) AS t(id,region,amt);
+----
+
+statement ok
+SET delta_write_options='';
+
+# Input outside the target partition errors (would append into an uncleared partition).
+statement ok
+SET delta_write_options='{"replace_where":{"region":"EU"}}';
+
+statement error
+INSERT INTO lake.main.sales SELECT * FROM (VALUES (8,'US',80)) AS t(id,region,amt);
+----
+
+statement ok
+SET delta_write_options='';
+
+# ================= merge_schema: additive evolution on CREATE OR REPLACE =================
+statement ok
+CREATE TABLE lake.main.evolve AS SELECT * FROM (VALUES (1,'a'),(2,'b')) AS t(id,val);
+
+query IT
+SELECT * FROM lake.main.evolve ORDER BY id;
+----
+1	a
+2	b
+
+# CREATE OR REPLACE with a WIDER schema + merge_schema adopts the new column (instead of dropping it).
+statement ok
+SET delta_write_options='{"merge_schema":true}';
+
+statement ok
+CREATE OR REPLACE TABLE lake.main.evolve AS SELECT * FROM (VALUES (10,'z',99),(11,'y',88)) AS t(id,val,extra);
+
+statement ok
+SET delta_write_options='';
+
+query ITI
+SELECT id, val, extra FROM lake.main.evolve ORDER BY id;
+----
+10	z	99
+11	y	88
+
+# merge_schema also works as a per-catalog ATTACH option.
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/owm2' AS lake2 (TYPE arrownet, PROVIDER 'delta', merge_schema true);
+
+statement ok
+CREATE TABLE lake2.main.t AS SELECT * FROM (VALUES (1,'a')) AS x(id,val);
+
+statement ok
+CREATE OR REPLACE TABLE lake2.main.t AS SELECT * FROM (VALUES (2,'b',7)) AS x(id,val,c);
+
+query ITI
+SELECT id, val, c FROM lake2.main.t ORDER BY id;
+----
+2	b	7
+
+statement ok
+DETACH lake2;
+
+statement ok
+DETACH lake;

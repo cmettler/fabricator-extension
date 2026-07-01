@@ -32,15 +32,17 @@ public sealed class DeltaBackend : IBackend
     // Session-level write tuning applied just before each CREATE/INSERT/CTAS/COPY, modeled as a JSON object so a
     // single setting carries several knobs (and is easy to extend). Keys: "compression" (snappy|zstd|gzip|brotli|
     // lz4|uncompressed|…), "row_group_size" (int rows), "bloom_filter_columns" (string[] dotted paths),
-    // "partition_by" (string[] — applied at CREATE/CTAS; a native PARTITIONED BY clause overrides it). Overlays the
-    // per-catalog ATTACH defaults (compression / row_group_size / bloom_filter_columns). Read by DeltaCatalog from
-    // ProviderSettingsStore at write time — see docs/delta-catalog.md "Write tuning".
+    // "partition_by" (string[] — applied at CREATE/CTAS; a native PARTITIONED BY clause overrides it),
+    // "replace_where" ({partcol:val,…} — an INSERT becomes an ATOMIC partition-overwrite of the matching
+    // partition(s)), "merge_schema" (bool — a CREATE OR REPLACE / CTAS with a wider schema adopts the new columns).
+    // Overlays the per-catalog ATTACH defaults (compression / row_group_size / bloom_filter_columns / merge_schema).
+    // Read by DeltaCatalog from ProviderSettingsStore at write time — see docs/delta-catalog.md "Write tuning".
     public const string WriteOptionsSetting = "delta_write_options";
 
     public IEnumerable<ProviderSetting> Settings => new[]
     {
         new ProviderSetting(WriteOptionsSetting, ProviderSettingType.Varchar, Default: null,
-            Description: "Delta write tuning as a JSON object (compression, row_group_size, bloom_filter_columns, partition_by), applied to CREATE/INSERT/CTAS."),
+            Description: "Delta write options as JSON (compression, row_group_size, bloom_filter_columns, partition_by, replace_where, merge_schema), applied to CREATE/INSERT/CTAS."),
     };
 
     // The connstr IS the folder root. Data-file IO is via DuckDB FS secrets (the opener). An azure SP secret on
@@ -102,6 +104,10 @@ public sealed class DeltaCatalog : IBackendCatalog
     private readonly string? _defaultCompression;
     private readonly int? _defaultRowGroupSize;
     private readonly IReadOnlyList<string>? _defaultBloomColumns;
+    // ATTACH option `merge_schema true`: an append whose incoming data has columns absent from the table
+    // auto-evolves the schema (nullable AddColumn) before writing. Overridable per statement via the
+    // delta_write_options setting's "merge_schema". (replace_where is per-statement only — the setting.)
+    private readonly bool _mergeSchemaOnWrite;
 
     public DeltaCatalog(string root) : this(root, "{}") { }
 
@@ -117,6 +123,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         _defaultCompression = ParseStringOption(optionsJson, "compression");
         _defaultRowGroupSize = ParseIntOption(optionsJson, "row_group_size");
         _defaultBloomColumns = ParseListOption(optionsJson, "bloom_filter_columns");
+        _mergeSchemaOnWrite = ParseBoolOption(optionsJson, "merge_schema");
     }
 
     /// <summary>True when this catalog uses the two-level <c>&lt;root&gt;/&lt;schema&gt;/&lt;table&gt;</c> layout:
@@ -244,6 +251,8 @@ public sealed class DeltaCatalog : IBackendCatalog
         int? rowGroup = _defaultRowGroupSize;
         IReadOnlyList<string>? bloom = _defaultBloomColumns;
         IReadOnlyList<string>? settingPartition = null;
+        IReadOnlyDictionary<string, string>? replaceWhere = null;
+        bool mergeSchema = _mergeSchemaOnWrite;
 
         if (!string.IsNullOrWhiteSpace(sessionJson))
         {
@@ -251,16 +260,43 @@ public sealed class DeltaCatalog : IBackendCatalog
             rowGroup = ParseIntOption(sessionJson, "row_group_size") ?? rowGroup;
             bloom = ParseListOption(sessionJson, "bloom_filter_columns") ?? bloom;
             settingPartition = ParseListOption(sessionJson, "partition_by");
+            replaceWhere = ParseMapOption(sessionJson, "replace_where"); // partition col -> value (per-statement)
+            mergeSchema = ParseBoolOption(sessionJson, "merge_schema") || mergeSchema;
         }
 
         var partition = nativePartitionColumns is { Count: > 0 } ? nativePartitionColumns : settingPartition;
         var codec = ParseCompression(compression);
 
-        if (codec is null && rowGroup is null && bloom is null && (partition is null || partition.Count == 0))
+        if (codec is null && rowGroup is null && bloom is null && (partition is null || partition.Count == 0)
+            && (replaceWhere is null || replaceWhere.Count == 0) && !mergeSchema)
         {
             return null;
         }
-        return new DeltaWriteSpec(codec, rowGroup, bloom, partition);
+        return new DeltaWriteSpec(codec, rowGroup, bloom, partition, replaceWhere, mergeSchema);
+    }
+
+    /// <summary>Reads a JSON OBJECT option (e.g. <c>replace_where</c>) as a string→string map — a partition
+    /// column→value equality set. A JSON string value is stringified. Null when absent/empty/not an object.</summary>
+    private static IReadOnlyDictionary<string, string>? ParseMapOption(string? optionsJson, string key)
+    {
+        if (string.IsNullOrEmpty(optionsJson)) { return null; }
+        try
+        {
+            using var doc = JsonDocument.Parse(optionsJson);
+            if (doc.RootElement.ValueKind == JsonValueKind.Object
+                && doc.RootElement.TryGetProperty(key, out var el)
+                && el.ValueKind == JsonValueKind.Object)
+            {
+                var map = new Dictionary<string, string>(System.StringComparer.Ordinal);
+                foreach (var p in el.EnumerateObject())
+                {
+                    map[p.Name] = p.Value.ValueKind == JsonValueKind.String ? (p.Value.GetString() ?? "") : p.Value.ToString();
+                }
+                return map.Count > 0 ? map : null;
+            }
+        }
+        catch (JsonException) { }
+        return null;
     }
 
     private const string DeltaBackendName = "engineeredwooddelta";
@@ -579,11 +615,18 @@ public sealed class DeltaCatalog : IBackendCatalog
         // Partition columns take effect only at table creation; an INSERT (Append) into an existing table
         // preserves the table's declared partitioning (engineered-wood reads it from the metadata).
         var native = createTable || replace ? partitionColumns : null;
+        var spec = ResolveWriteSpec(native);
+        // replace_where (atomic partition-overwrite) is an APPEND-time concept — for CREATE/CTAS/REPLACE the whole
+        // table is (re)written, so drop it there to avoid a spurious partition-filter validation.
+        if ((createTable || replace) && spec?.ReplaceWhere is not null)
+        {
+            spec = spec with { ReplaceWhere = null };
+        }
         DeltaWriter.Write(opener, TablePath(schemaName, tableName), schema, batches, mode, default,
                           deletionVectors: _deletionVectorsOnCreate,
                           inCommitTimestamps: _inCommitTimestampsOnCreate,
                           changeDataFeed: _changeDataFeedOnCreate,
-                          spec: ResolveWriteSpec(native));
+                          spec: spec);
         return rows;
     }
 
