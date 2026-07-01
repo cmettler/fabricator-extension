@@ -47,7 +47,7 @@ SELECT id, name FROM lake.main.t AT (VERSION => 1) ORDER BY id;
 ----
 time travel
 
-# Snapshots / commit history (arrownet_delta_snapshots), oldest first.
+# Snapshots / commit history (arrownet_delta_snapshots), oldest first (before the DML commits).
 query IT
 SELECT version, operation FROM arrownet_delta_snapshots('lake', 'main.t') ORDER BY version;
 ----
@@ -55,17 +55,54 @@ SELECT version, operation FROM arrownet_delta_snapshots('lake', 'main.t') ORDER 
 1	WRITE
 2	WRITE
 
-# Durability: re-attach and re-read.
+# DELETE — the rowid (all columns) is mapped to a record-batch MERGE matching the scanned rows on every
+# column (NULL-safe) WHEN MATCHED THEN DELETE. DuckDB never hands the provider the WHERE, so this is the
+# rowid route onto delta-rs's MERGE.
+statement ok
+DELETE FROM lake.main.t WHERE id = 2;
+
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
+----
+1	alpha
+3	gamma
+4	delta
+
+# UPDATE — MERGE matching the pre-image row (all columns) WHEN MATCHED THEN UPDATE SET the changed column.
+statement ok
+UPDATE lake.main.t SET name = 'GAMMA' WHERE id = 3;
+
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
+----
+1	alpha
+3	GAMMA
+4	delta
+
+# UPDATE an expression + DELETE composition.
+statement ok
+UPDATE lake.main.t SET id = id + 10 WHERE name = 'alpha';
+
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
+----
+3	GAMMA
+4	delta
+11	alpha
+
+# Durability: re-attach and re-read the post-DML state.
 statement ok
 DETACH lake;
 
 statement ok
 ATTACH '${ARROWNET_DELTA_WRITE_DIR}/dr' AS lake (TYPE arrownet, PROVIDER 'deltars');
 
-query I
-SELECT count(*) FROM lake.main.t;
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
 ----
-4
+3	GAMMA
+4	delta
+11	alpha
 
 # The alias 'delta-rs' resolves to the same provider.
 statement ok
@@ -77,7 +114,7 @@ ATTACH '${ARROWNET_DELTA_WRITE_DIR}/dr' AS lake2 (TYPE arrownet, PROVIDER 'delta
 query I
 SELECT count(*) FROM lake2.main.t;
 ----
-4
+3
 
 statement ok
 DETACH lake2;

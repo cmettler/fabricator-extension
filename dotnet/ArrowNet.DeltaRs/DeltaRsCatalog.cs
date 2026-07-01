@@ -82,9 +82,11 @@ public sealed class DeltaRsCatalog : IBackendCatalog
         MetadataKind.Schemas => SingleColumn("schema_name", SchemaNames()),
         MetadataKind.Tables => TablesStream(),
         MetadataKind.Columns => ColumnsStream(schema!, table!),
-        // No rowid: delta-rs has no low-level position/remove API, so UPDATE/DELETE are unsupported in v1
-        // (DuckDB sees no rowid and won't plan them). See docs/delta-rs-provider.md.
-        MetadataKind.RowId => SingleColumn("name", System.Array.Empty<string>()),
+        // Rowid = ALL columns (a full-row identity). delta-rs has no low-level position/remove API, so DELETE/
+        // UPDATE run as a record-batch MERGE matching the scanned rows on every column (NULL-safe). This is
+        // sound because a WHERE can't distinguish identical rows, so DuckDB's rowid set is always a complete
+        // equivalence class. See docs/delta-rs-provider.md "The DML crux".
+        MetadataKind.RowId => SingleColumn("name", RowIdColumns(schema!, table!)),
         MetadataKind.Snapshots => SnapshotsStream(schema, table),
         MetadataKind.Changes => ChangesStream(schema, table),
         _ => SingleColumn("name", System.Array.Empty<string>()),
@@ -420,17 +422,100 @@ public sealed class DeltaRsCatalog : IBackendCatalog
 
     // ---- unsupported in v1 ----
 
-    // UPDATE/DELETE: delta-rs DML is predicate/SQL-based with no low-level position/remove API, so it cannot
-    // satisfy DuckDB's rowid model (DuckDB never hands us the WHERE). Deferred — see docs/delta-rs-provider.md
-    // "The DML crux" (options: reconstruct a predicate from scanned keys, passthrough MERGE, or a remote-merge
-    // optimizer step). No rowid is advertised, so DuckDB won't plan these.
-    public long ExecuteDelete(string schemaName, string tableName, IArrowArrayStream keys) =>
-        throw Unsupported("UPDATE/DELETE (delta-rs predicate DML does not map to DuckDB's rowid model — use "
-            + "the engineeredwooddelta provider, or see docs/delta-rs-provider.md)");
+    // DELETE via a record-batch MERGE: the scanned rows (keys = all columns) are the source; delete every
+    // target row matching one of them on ALL columns (NULL-safe). DuckDB never hands us the WHERE, so this is
+    // the rowid route mapped onto delta-rs's MERGE — see docs/delta-rs-provider.md "The DML crux".
+    public long ExecuteDelete(string schemaName, string tableName, IArrowArrayStream keys)
+    {
+        var schema = keys.Schema;
+        var (batches, rows) = ReadAll(keys);
+        if (rows == 0)
+        {
+            foreach (var b in batches) { b.Dispose(); }
+            return 0;
+        }
+        var cols = schema.FieldsList.Select(f => f.Name).ToList();
+        string on = string.Join(" AND ", cols.Select(c => NullSafeEq($"target.{Q(c)}", $"source.{Q(c)}")));
+        string query = $"MERGE INTO target USING source ON {on} WHEN MATCHED THEN DELETE";
+        using var table = Open(schemaName, tableName);
+        try
+        {
+            Run(table.MergeAsync(query, batches, schema, default));
+            return rows;
+        }
+        finally
+        {
+            foreach (var b in batches) { b.Dispose(); }
+        }
+    }
 
-    public long ExecuteUpdate(string schemaName, string tableName, int setColumnCount, IArrowArrayStream data) =>
-        throw Unsupported("UPDATE/DELETE (delta-rs predicate DML does not map to DuckDB's rowid model — use "
-            + "the engineeredwooddelta provider, or see docs/delta-rs-provider.md)");
+    // UPDATE via a record-batch MERGE: data = [setCols ++ keyCols(all columns)]. Match target on the key
+    // columns (NULL-safe), UPDATE SET the set columns. Source columns are renamed (s__/k__) to avoid the
+    // set/key name overlap. NOTE: if the pre-image row is duplicated, delta-rs may reject the ambiguous
+    // multi-match — acceptable v1 (identical rows can't be selectively updated by a WHERE anyway).
+    public long ExecuteUpdate(string schemaName, string tableName, int setColumnCount, IArrowArrayStream data)
+    {
+        var fields = data.Schema.FieldsList;
+        var (batches, rows) = ReadAll(data);
+        if (rows == 0)
+        {
+            foreach (var b in batches) { b.Dispose(); }
+            return 0;
+        }
+        var setNames = fields.Take(setColumnCount).Select(f => f.Name).ToList();
+        var keyNames = fields.Skip(setColumnCount).Select(f => f.Name).ToList();
+        var renamedSchema = RenameSchema(data.Schema, setColumnCount);
+        var renamed = batches.Select(b => RenameBatch(b, setColumnCount)).ToList();
+
+        string on = string.Join(" AND ",
+            keyNames.Select(c => NullSafeEq($"target.{Q(c)}", $"source.{Q("k__" + c)}")));
+        string set = string.Join(", ", setNames.Select(c => $"{Q(c)} = source.{Q("s__" + c)}"));
+        string query = $"MERGE INTO target USING source ON {on} WHEN MATCHED THEN UPDATE SET {set}";
+        using var table = Open(schemaName, tableName);
+        try
+        {
+            Run(table.MergeAsync(query, renamed, renamedSchema, default));
+            return rows;
+        }
+        finally
+        {
+            // renamed batches share the originals' arrays — dispose only the originals (single ownership).
+            foreach (var b in batches) { b.Dispose(); }
+        }
+    }
+
+    private static string NullSafeEq(string a, string b) => $"(({a} = {b}) OR ({a} IS NULL AND {b} IS NULL))";
+
+    // Quote a DataFusion identifier.
+    private static string Q(string name) => "\"" + name.Replace("\"", "\"\"") + "\"";
+
+    private static Schema RenameSchema(Schema schema, int setColumnCount)
+    {
+        var fields = schema.FieldsList;
+        var renamed = new List<Field>(fields.Count);
+        for (int i = 0; i < fields.Count; i++)
+        {
+            var prefix = i < setColumnCount ? "s__" : "k__";
+            renamed.Add(new Field(prefix + fields[i].Name, fields[i].DataType, fields[i].IsNullable));
+        }
+        return new Schema(renamed, schema.Metadata);
+    }
+
+    private static RecordBatch RenameBatch(RecordBatch batch, int setColumnCount)
+    {
+        var arrays = new IArrowArray[batch.ColumnCount];
+        for (int i = 0; i < batch.ColumnCount; i++)
+        {
+            arrays[i] = batch.Column(i);
+        }
+        return new RecordBatch(RenameSchema(batch.Schema, setColumnCount), arrays, batch.Length);
+    }
+
+    private IReadOnlyList<string> RowIdColumns(string schema, string table)
+    {
+        using var t = Open(schema, table);
+        return t.Schema().FieldsList.Select(f => f.Name).ToList();
+    }
 
     // ALTER: delta-dotnet exposes no add-column API (only InsertOptions.OverwriteSchema on a write).
     public void AlterTable(int alterKind, string schemaName, string tableName, string? arg1, string? arg2,

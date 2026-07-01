@@ -19,9 +19,22 @@ end on Windows via `test/verify_delta_rs.test` (25 assertions) and a live shell 
 - **Working**: `ATTACH … (TYPE arrownet, PROVIDER 'deltars')` (+ alias `'delta-rs'`); discovery (local FS);
   metadata (schemas/tables/columns); **scan** (read the whole table into an owned `Apache.Arrow.Table` via
   `ReadAsArrowTableAsync`, streamed as batches — DuckDB projects/filters above); **CREATE/CTAS/INSERT**
-  (append + overwrite via `CreateTableAsync`/`InsertAsync`); **snapshots** (`arrownet_delta_snapshots` →
-  `HistoryAsync`, real commit history: `CREATE TABLE`/`WRITE`/…); re-attach durability. No regression to the
-  engineered-wood provider (its full suite stays green).
+  (append + overwrite via `CreateTableAsync`/`InsertAsync`); **DELETE + UPDATE** (rowid → record-batch MERGE,
+  see below); **snapshots** (`arrownet_delta_snapshots` → `HistoryAsync`, real commit history:
+  `CREATE TABLE`/`WRITE`/`MERGE`/…); re-attach durability. `test/verify_delta_rs.test` (51). No regression to
+  the engineered-wood provider (its full suite stays green).
+- **DELETE / UPDATE now work — rowid mapped to a record-batch MERGE** (the crux, solved). The provider
+  advertises **all columns as the rowid** (a full-row identity), so DuckDB's rowid-based `PlanDelete`/
+  `PlanUpdate` hand `ExecuteDelete`/`ExecuteUpdate` the scanned rows; the catalog builds a delta-rs MERGE
+  matching those rows on **every column, NULL-safe** (`(t.c = s.c) OR (t.c IS NULL AND s.c IS NULL)`): DELETE
+  = `WHEN MATCHED THEN DELETE`; UPDATE = `WHEN MATCHED THEN UPDATE SET …` with the source columns renamed
+  (`s__`/`k__`) to separate the SET values from the match keys. **Sound because a WHERE cannot distinguish
+  identical rows**, so DuckDB's rowid set is always a complete equivalence class and a full-row match deletes/
+  updates exactly it. `target`/`source` are arbitrary MERGE aliases (delta-rs parses the SQL). Verified:
+  DELETE, UPDATE (incl. an expression `id = id + 10`), DELETE∘UPDATE composition, re-attach durability.
+  *Caveat*: a duplicated pre-image row could make delta-rs reject an UPDATE as an ambiguous multi-match
+  (identical rows can't be selectively updated by a WHERE anyway). This is the record-batch-MERGE mapping the
+  design anticipated; a future DuckDB "remote MERGE" optimizer step could push a MERGE statement directly.
 - **Deferred with a clean error** (delta-dotnet limitations found while building):
   - **Time travel** — delta-dotnet reads only the *latest* snapshot via the Delta Kernel; **any versioned
     load disables the kernel** (`Table.LoadVersionAsync` sets `isKernelSupported=false`) and there is no
@@ -29,7 +42,6 @@ end on Windows via `test/verify_delta_rs.test` (25 assertions) and a live shell 
     Delta Kernel."* `AT (VERSION/TIMESTAMP …)` therefore returns a clean "not supported (v1)" error, not
     silent latest-data. Needs the kernel wired to snapshot at a version (or a delta-rs read-at-version) — a
     delta-dotnet patch, like the ones we make to engineered-wood.
-  - **UPDATE/DELETE** — no rowid advertised (see "The DML crux"); DuckDB won't plan them.
   - **ALTER** — delta-dotnet has no schema-DDL API.
 - **Not yet wired** (design is below): cloud discovery (v1 lists local roots only; `storage_options` mapping
   is coded in `StorageOptionsCodec` but unproven), SQL/filter pushdown (scan is a full read), maintenance
