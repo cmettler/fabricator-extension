@@ -256,9 +256,12 @@ public interface IBackendCatalog : IDisposable
     /// them as the table's partition columns. <paramref name="sortColumns"/> come from a
     /// native <c>SORTED BY</c> clause; the SQL Server provider maps them to a Fabric
     /// Warehouse <c>WITH (CLUSTER BY (cols))</c> layout (ignored on box / Delta / DAX).
+    /// <paramref name="identityColumns"/> are columns the host detected as DuckDB GENERATED
+    /// columns (an IDENTITY marker); the SQL Server provider emits them as IDENTITY
+    /// (box <c>IDENTITY(1,1)</c> / Fabric bare <c>IDENTITY</c>, BIGINT). Delta / DAX ignore them.
     void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists, string? primaryKey,
                      string? uniques, string? defaults, IReadOnlyList<string>? partitionColumns,
-                     IReadOnlyList<string>? sortColumns);
+                     IReadOnlyList<string>? sortColumns, IReadOnlyList<string>? identityColumns);
 
     /// <summary>Drops a table; <paramref name="ifExists"/> suppresses the missing-table error.</summary>
     void DropTable(string schemaName, string tableName, bool ifExists);

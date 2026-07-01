@@ -211,6 +211,15 @@ What the profile drives automatically:
   ```sql
   SELECT * FROM wh.dbo.dimension_customer AT (TIMESTAMP => '2024-05-02 20:44:13.700');
   ```
+- **IDENTITY / surrogate keys.** DuckDB has no `IDENTITY`, so a **generated column** (`col BIGINT AS (0)`) is
+  used as a marker → the provider emits an `IDENTITY` column (box `IDENTITY(1,1)`; Fabric bare BIGINT `IDENTITY`).
+  Or set `add_identity` (ATTACH option / `SET mssql_add_identity`) to auto-add a `<table>_id BIGINT IDENTITY`
+  surrogate key to created tables (CREATE + CTAS; skipped if the name already exists). The engine assigns values
+  on INSERT (the identity column is absent from the source, so it's left for the engine).
+  ```sql
+  CREATE TABLE wh.dbo.Orders (OrderID BIGINT AS (0), CustomerID INT, Amount DECIMAL(10,2));  -- OrderID → IDENTITY
+  ATTACH '...' AS wh (TYPE mssql_net, add_identity true);   -- every created table gets <table>_id
+  ```
 - **Functions.** Discovered scalar UDFs, TVFs, and stored procedures work on Fabric (proc result sets resolved
   via `sp_describe_first_result_set`), as do custom C# functions and the `fn_each` table-in-out exchange.
 
@@ -565,6 +574,7 @@ the native extension's batching/pooling/TDS knobs don't apply).
 | `mssql_default_varchar_length` | **Active** | Length `n` for created text columns (`NVARCHAR(n)`/`VARCHAR(n)`); unset ⇒ `MAX`. Needed for indexable string keys |
 | `mssql_default_table_type` | **Active** | Created-table storage: `''` (rowstore) \| `clustered columnstore` (CCI, box/Azure; no-op on Fabric — columnstore already) |
 | `mssql_cluster_by` | **Active** | Comma-separated columns → Fabric Warehouse/Synapse `WITH (CLUSTER BY (cols))` on created tables (fallback for a native `SORTED BY` clause; no-op on box) |
+| `mssql_add_identity` | **Active** | Auto-add a `BIGINT IDENTITY` surrogate key (`<table>_id`) to created tables (CREATE + CTAS); overrides the per-catalog `add_identity` ATTACH option (`SET false` to skip for fact tables) |
 | `mssql_ctas_text_type` | **Active** | Whole-type override for text columns on CREATE/CTAS/COPY (e.g. `'VARCHAR(64)'`); wins over the collation choice + length |
 | `mssql_exec_invalidate_cache` | **Active** | Auto-invalidate the catalog cache after DDL run via `mssql_net_exec` (default `false`) |
 | `mssql_isolation_level` | **Active** | SQL transaction isolation level for table-in-out (`fn_each`) calls; overrides the ATTACH `isolation_level` per session (empty ⇒ provider default) |

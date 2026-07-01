@@ -76,7 +76,8 @@ public sealed class StubBackend : IBackend
 
         public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists,
                                 string? primaryKey, string? uniques, string? defaults,
-                                IReadOnlyList<string>? partitionColumns, IReadOnlyList<string>? sortColumns)
+                                IReadOnlyList<string>? partitionColumns, IReadOnlyList<string>? sortColumns,
+                                IReadOnlyList<string>? identityColumns)
         {
         }
 

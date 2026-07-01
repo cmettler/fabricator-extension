@@ -1110,7 +1110,23 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v52** (v52 = **native `SORTED BY` → Fabric Warehouse `CLUSTER BY`** — appended a
+- **Current version: ABI v53** (v53 = **IDENTITY columns** — appended an `identity_columns` param (nullable,
+  comma-separated) to `create_table` (begin_bulk NOT changed — CTAS has no generated columns; the auto-identity
+  is a C#-side setting). DuckDB has no IDENTITY concept, so TWO mechanisms: **(1) a DuckDB GENERATED column**
+  (`col BIGINT AS (0)`) is (mis)used as an IDENTITY MARKER — the C++ DDL `CreateTable` detects `col.Generated()`
+  (binder allows generated columns on an attached catalog; no capability gate) and passes the name(s); the
+  generated-ness exists only at create time (the table is re-fetched from SQL Server as a normal identity BIGINT
+  afterward). **(2) an `add_identity` ATTACH option + `mssql_add_identity` SET** (`ResolveAddIdentity`: SET wins)
+  auto-appends a `<table>_id BIGINT IDENTITY` surrogate key on CREATE + CTAS, skipped when a column is explicitly
+  marked OR the target name already exists. C# `BuildCreateTable` emits **box `IDENTITY(1,1)` / Fabric bare
+  `IDENTITY`** (Fabric supports only BIGINT IDENTITY, no seed/increment) via `IdentityClause(profile)`; identity
+  columns are always BIGINT, no NULL/DEFAULT. The engine assigns values on INSERT — the identity column is absent
+  from the source Arrow stream, so SqlBulkCopy's name-based `ColumnMappings` naturally skips it (works for
+  explicit CREATE + INSERT and CTAS). The **read + insert paths already handle IDENTITY** (discovery +
+  `KeepIdentity`), so only CREATE-side emission was new. Delta / DAX ignore `identity_columns`. Validated:
+  `test/verify_identity.test` (45 — marker→IDENTITY [IsIdentity=1], add_identity SET, CTAS, skip-if-present,
+  OFF=no column) + SqlServer/Delta suites unregressed; **live on Fabric Warehouse** (generated marker → real
+  IDENTITY, 3 distinct auto values; add_identity CTAS → `arrownet_idfab2_id`, 4 distinct). v52 = **native `SORTED BY` → Fabric Warehouse `CLUSTER BY`** — appended a
   `sort_columns` param (nullable, comma-separated) to **both** `create_table` and `begin_bulk`, mirroring the v51
   `partition_columns`. DuckDB v1.5.4 parses `CREATE TABLE [t] SORTED BY (cols) [AS …]` into
   `CreateTableInfo::sort_keys`; `ArrowNetCatalog::SupportsCreateTable` now permits BOTH partition_keys AND

@@ -2172,12 +2172,22 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::CreateTable(CatalogTransaction t
 	auto &base = info.Base();
 	ArrowNetSetActiveTxn(handle_, context); // CREATE (+ optional DROP for REPLACE) joins this txn's connection
 
-	// Column names + types, and per-column nullability (NOT NULL constraints).
+	// Column names + types, and per-column nullability (NOT NULL constraints). A DuckDB GENERATED column
+	// (`col type AS (expr)`) is (mis)used as an IDENTITY marker — DuckDB has no IDENTITY concept — so its name
+	// is collected for the identity arg; it is otherwise sent as a normal column (the C# SQL Server provider
+	// turns it into an IDENTITY column). The generated-ness exists only here at create time.
 	vector<string> names;
 	vector<LogicalType> types;
+	string identity_arg;
 	for (auto &col : base.columns.Logical()) {
 		names.push_back(col.Name());
 		types.push_back(col.Type());
+		if (col.Generated()) {
+			if (!identity_arg.empty()) {
+				identity_arg += ",";
+			}
+			identity_arg += col.Name();
+		}
 	}
 	vector<bool> nullable(names.size(), true);
 	for (auto &constraint : base.constraints) {
@@ -2283,7 +2293,7 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::CreateTable(CatalogTransaction t
 	producer.SetNullability(nullable);
 	producer.Finish();
 	arrownet::CreateTable(handle_, name, base.table, *producer.Stream(), if_not_exists, pk_arg, unique_arg,
-	                      defaults_arg, partition_arg, sort_arg);
+	                      defaults_arg, partition_arg, sort_arg, identity_arg);
 
 	// Register the new table (also invalidates any cached entry) and return it.
 	AddTable(base.table, "BASE TABLE");

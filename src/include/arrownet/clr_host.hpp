@@ -148,7 +148,7 @@ void ScanTable(ArrowNetHandle handle, const std::string &schema, const std::stri
 void CreateTable(ArrowNetHandle handle, const std::string &schema, const std::string &table, ArrowArrayStream &columns,
                  bool if_not_exists, const std::string &pk_columns, const std::string &unique_columns,
                  const std::string &defaults, const std::string &partition_columns = "",
-                 const std::string &sort_columns = "");
+                 const std::string &sort_columns = "", const std::string &identity_columns = "");
 
 // DDL: drop a table (`if_exists` suppresses the missing-table error).
 void DropTable(ArrowNetHandle handle, const std::string &schema, const std::string &table, bool if_exists);

@@ -624,7 +624,7 @@ internal sealed class DaxCatalog : IBackendCatalog
     public IArrowArrayStream InsertReturning(string schemaName, string tableName, IArrowArrayStream rows) => throw ReadOnly();
     public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists,
                             string? primaryKey, string? uniques, string? defaults, IReadOnlyList<string>? partitionColumns,
-                            IReadOnlyList<string>? sortColumns) => throw ReadOnly();
+                            IReadOnlyList<string>? sortColumns, IReadOnlyList<string>? identityColumns) => throw ReadOnly();
     public void DropTable(string schemaName, string tableName, bool ifExists) => throw ReadOnly();
     public void CreateSchema(string schemaName, bool ifNotExists) => throw ReadOnly();
     public void DropSchema(string schemaName, bool ifExists) => throw ReadOnly();

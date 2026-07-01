@@ -591,8 +591,9 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// <paramref name="ifNotExists"/> is satisfied; PK/UNIQUE/DEFAULT are ignored (Delta has no such constraints).</summary>
     public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists,
                             string? primaryKey, string? uniques, string? defaults,
-                            IReadOnlyList<string>? partitionColumns, IReadOnlyList<string>? sortColumns)
-        // sortColumns (native SORTED BY) is a SQL-Server-warehouse CLUSTER BY concept; Delta doesn't cluster — ignored.
+                            IReadOnlyList<string>? partitionColumns, IReadOnlyList<string>? sortColumns,
+                            IReadOnlyList<string>? identityColumns)
+        // sortColumns (CLUSTER BY) + identityColumns (SQL Server IDENTITY) are SQL-Server concepts — Delta ignores.
         => DeltaWriter.Create(AmbientOpener.Current, TablePath(schemaName, tableName), columns, default,
                               deletionVectors: _deletionVectorsOnCreate,
                               inCommitTimestamps: _inCommitTimestampsOnCreate,

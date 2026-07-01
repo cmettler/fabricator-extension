@@ -51,6 +51,9 @@ public sealed class SqlServerBackend : IBackend
                 Str("mssql_cluster_by",
                     "mssql_net: comma-separated columns for a Fabric Warehouse / Synapse WITH (CLUSTER BY (cols)) " +
                     "layout on created tables (fallback for a native SORTED BY clause; no-op on box SQL Server)"),
+                Bool("mssql_add_identity",
+                    "mssql_net: auto-add a BIGINT IDENTITY surrogate key (<table>_id) to created tables; overrides " +
+                    "the per-catalog add_identity ATTACH option (SET false to skip for fact tables)"),
                 Long("mssql_insert_batch_size", "mssql_net: max rows per INSERT statement", 2000L, 1),
                 Long("mssql_insert_max_rows_per_statement", "mssql_net: hard cap on rows per statement", 2000L, 1),
                 Long("mssql_insert_max_sql_bytes", "mssql_net: max SQL statement size in bytes", 8388608L, 1),
@@ -369,6 +372,10 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     private readonly Regex? _schemaFilter;
     private readonly Regex? _tableFilter;
     private readonly string _isolationLevel = "";
+    // ATTACH option `add_identity true`: created tables get an auto BIGINT IDENTITY surrogate key (<table>_id)
+    // when none is otherwise specified. The mssql_add_identity SET setting overrides this per session (turn OFF
+    // for fact tables that don't need a surrogate key). Resolved by ResolveAddIdentity().
+    private readonly bool _addIdentityOnCreate;
 
     public SqlServerCatalog(string connectionString, string optionsJson)
     {
@@ -416,6 +423,9 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                     case "schema_filter": _schemaFilter = CompileFilter("schema_filter", val); break;
                     case "table_filter": _tableFilter = CompileFilter("table_filter", val); break;
                     case "isolation_level": _isolationLevel = val; break;
+                    case "add_identity":
+                        _addIdentityOnCreate = string.Equals(val, "true", StringComparison.OrdinalIgnoreCase) || val == "1";
+                        break;
                 }
             }
         }
@@ -848,8 +858,11 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             {
                 using var create = connection.CreateCommand();
                 create.Transaction = transaction;
+                // CTAS has no GENERATED-column marker (identityColumns null), but add_identity still applies —
+                // the auto surrogate key is engine-generated and absent from the SELECT, so the bulk copy skips it.
                 create.CommandText = $"IF OBJECT_ID({objectLiteral}, 'U') IS NULL " +
-                                     BuildCreateTable(qualified, data.Schema, Profile, null, null, null, sortColumns);
+                                     BuildCreateTable(qualified, data.Schema, Profile, null, null, null, sortColumns,
+                                                      null, ResolveAddIdentity());
                 create.ExecuteNonQuery();
             }
 
@@ -1454,12 +1467,19 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         }
     }
 
+    // Whether a created table should get an auto BIGINT IDENTITY surrogate key: the mssql_add_identity SET
+    // setting wins when set (true/false), else the per-catalog add_identity ATTACH option.
+    private bool ResolveAddIdentity() =>
+        ProviderSettingsStore.Instance.GetBool(SqlServerBackend.ProviderName, "mssql_add_identity")
+        ?? _addIdentityOnCreate;
+
     public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists, string? primaryKey,
                             string? uniques, string? defaults, IReadOnlyList<string>? partitionColumns,
-                            IReadOnlyList<string>? sortColumns)
+                            IReadOnlyList<string>? sortColumns, IReadOnlyList<string>? identityColumns)
     {
         // partitionColumns is a Delta/lakehouse concept; not applied to SQL Server DDL here (ignored).
         // sortColumns (native SORTED BY) becomes a Fabric Warehouse WITH (CLUSTER BY (cols)) layout — see BuildCreateTable.
+        // identityColumns (DuckDB GENERATED-column marker) become IDENTITY columns — see BuildCreateTable.
         // Route through BeginWrite so this participates in the pinned transaction
         // when one is active — without it, CREATE OR REPLACE (DROP pinned + CREATE
         // fresh) would self-deadlock on the dropped table's schema lock.
@@ -1487,7 +1507,8 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                         return; // table already exists
                     }
                 }
-                cmd.CommandText = BuildCreateTable(qualified, columns, Profile, null, null, defaults, sortColumns);
+                cmd.CommandText = BuildCreateTable(qualified, columns, Profile, null, null, defaults, sortColumns,
+                                                   identityColumns, ResolveAddIdentity());
                 cmd.ExecuteNonQuery();
                 foreach (var alter in WarehouseConstraintAlters(qualified, tableName, columns, pk, uniqueGroups))
                 {
@@ -1497,7 +1518,8 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 return;
             }
 
-            string create = BuildCreateTable(qualified, columns, Profile, primaryKey, uniques, defaults, sortColumns);
+            string create = BuildCreateTable(qualified, columns, Profile, primaryKey, uniques, defaults, sortColumns,
+                                              identityColumns, ResolveAddIdentity());
             using var cmd0 = connection.CreateCommand();
             cmd0.Transaction = transaction;
             cmd0.CommandText = ifNotExists
@@ -2208,13 +2230,30 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     internal static string Quote(string identifier) => "[" + identifier.Replace("]", "]]") + "]";
 
     private static string BuildCreateTable(string qualified, Schema schema, ServerProfile profile) =>
-        BuildCreateTable(qualified, schema, profile, null, null, null, null);
+        BuildCreateTable(qualified, schema, profile, null, null, null, null, null, false);
+
+    // IDENTITY column clause. Fabric Warehouse supports only bare BIGINT IDENTITY (no seed/increment); box /
+    // Azure SQL take IDENTITY(1,1). Identity columns are always BIGINT here (Fabric requires it) and implicitly
+    // NOT NULL, and can carry no DEFAULT.
+    private static string IdentityClause(ServerProfile profile) =>
+        profile.IsWarehouse ? " BIGINT IDENTITY" : " BIGINT IDENTITY(1,1)";
 
     private static string BuildCreateTable(string qualified, Schema schema, ServerProfile profile, string? primaryKey,
                                            string? uniques, string? defaults,
-                                           IReadOnlyList<string>? clusterColumns = null)
+                                           IReadOnlyList<string>? clusterColumns = null,
+                                           IReadOnlyList<string>? identityColumns = null, bool addIdentity = false)
     {
         var defaultMap = ParseDefaults(defaults);
+        // Columns marked IDENTITY (a DuckDB GENERATED-column marker), matched by name (case-insensitive).
+        var identitySet = identityColumns is { Count: > 0 }
+            ? new HashSet<string>(identityColumns, StringComparer.OrdinalIgnoreCase)
+            : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var existingNames = new HashSet<string>(schema.FieldsList.Select(f => f.Name), StringComparer.OrdinalIgnoreCase);
+        // add_identity auto surrogate key: only when the option is on, no column was explicitly marked IDENTITY,
+        // and no column already carries the target name (<table>_id). Skipped otherwise ("ignored if present").
+        string autoIdentityName = TableNameFromQualified(qualified) + "_id";
+        bool autoIdentity = addIdentity && identitySet.Count == 0 && !existingNames.Contains(autoIdentityName);
+
         var sb = new StringBuilder();
         sb.Append("CREATE TABLE ").Append(qualified).Append(" (");
         for (int i = 0; i < schema.FieldsList.Count; i++)
@@ -2224,12 +2263,24 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             {
                 sb.Append(", ");
             }
+            if (identitySet.Contains(field.Name))
+            {
+                // A marked IDENTITY column: BIGINT IDENTITY (no NULL/DEFAULT — identity is NOT NULL, engine-assigned).
+                sb.Append(Quote(field.Name)).Append(IdentityClause(profile));
+                continue;
+            }
             sb.Append(Quote(field.Name)).Append(' ').Append(MapArrowToSqlType(field.DataType, profile))
               .Append(field.IsNullable ? " NULL" : " NOT NULL");
             if (defaultMap.TryGetValue(i, out var defaultValue))
             {
                 sb.Append(" DEFAULT ").Append(RenderDefault(field.DataType, defaultValue));
             }
+        }
+        // add_identity: append the auto surrogate-key column (engine-generated; absent from the source data, so
+        // SqlBulkCopy's name-based mapping simply skips it on INSERT/CTAS).
+        if (autoIdentity)
+        {
+            sb.Append(", ").Append(Quote(autoIdentityName)).Append(IdentityClause(profile));
         }
         // Clustered columnstore (mssql_default_table_type='clustered columnstore'). Box / Azure SQL only:
         // emit an inline INDEX … CLUSTERED COLUMNSTORE so the table is columnstore. Fabric/Synapse tables

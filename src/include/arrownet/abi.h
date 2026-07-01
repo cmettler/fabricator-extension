@@ -232,10 +232,13 @@ typedef struct ArrowNetVTable {
 	// `sort_columns` (nullable): comma-separated column names from a native CREATE TABLE ... SORTED BY clause. The
 	// SQL Server provider maps them to a Fabric Warehouse / Synapse WITH (CLUSTER BY (cols)) layout (ignored on box
 	// SQL Server and by the Delta / DAX providers).
+	// `identity_columns` (nullable): comma-separated column names the host detected as DuckDB GENERATED columns
+	// (used as an IDENTITY marker — DuckDB has no IDENTITY concept). The SQL Server provider emits them as
+	// IDENTITY (box: IDENTITY(1,1); Fabric Warehouse: bare IDENTITY, BIGINT only); Delta / DAX ignore them.
 	int32_t (*create_table)(ArrowNetHandle handle, const char *schema, const char *table,
 	                        struct ArrowArrayStream *columns, int32_t if_not_exists, const char *pk_columns,
 	                        const char *unique_columns, const char *defaults, const char *partition_columns,
-	                        const char *sort_columns, char **err);
+	                        const char *sort_columns, const char *identity_columns, char **err);
 
 	// DDL: drop a table. `if_exists` suppresses the error when it is absent.
 	int32_t (*drop_table)(ArrowNetHandle handle, const char *schema, const char *table, int32_t if_exists, char **err);
@@ -700,7 +703,7 @@ typedef struct ArrowNetHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 52
+#define ARROWNET_ABI_VERSION 53
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

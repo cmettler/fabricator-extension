@@ -837,7 +837,8 @@ void ScanTable(ArrowNetHandle handle, const std::string &schema, const std::stri
 
 void CreateTable(ArrowNetHandle handle, const std::string &schema, const std::string &table, ArrowArrayStream &columns,
                  bool if_not_exists, const std::string &pk_columns, const std::string &unique_columns,
-                 const std::string &defaults, const std::string &partition_columns, const std::string &sort_columns) {
+                 const std::string &defaults, const std::string &partition_columns, const std::string &sort_columns,
+                 const std::string &identity_columns) {
 	const ArrowNetVTable &vt = GetBridge();
 	if (!vt.create_table) {
 		throw duckdb::IOException("ArrowNet: bridge does not provide create_table");
@@ -848,7 +849,8 @@ void CreateTable(ArrowNetHandle handle, const std::string &schema, const std::st
 	                             unique_columns.empty() ? nullptr : unique_columns.c_str(),
 	                             defaults.empty() ? nullptr : defaults.c_str(),
 	                             partition_columns.empty() ? nullptr : partition_columns.c_str(),
-	                             sort_columns.empty() ? nullptr : sort_columns.c_str(), &err);
+	                             sort_columns.empty() ? nullptr : sort_columns.c_str(),
+	                             identity_columns.empty() ? nullptr : identity_columns.c_str(), &err);
 	if (rc != ARROWNET_OK) {
 		ThrowManagedError(vt, err, "ArrowNet: create_table failed");
 	}
