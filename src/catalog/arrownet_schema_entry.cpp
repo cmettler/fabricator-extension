@@ -2272,6 +2272,9 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::CreateTable(CatalogTransaction t
 	// Native CREATE TABLE ... PARTITIONED BY (cols): the column names (comma-separated) go to the provider
 	// (the Delta provider records them as partition columns; SQL Server / DAX ignore the arg).
 	string partition_arg = arrownet::PartitionColumnsArg(base.partition_keys);
+	// Native CREATE TABLE ... SORTED BY (cols): the SQL Server provider maps these to a Fabric Warehouse
+	// WITH (CLUSTER BY (cols)) layout (Delta / DAX ignore the arg).
+	string sort_arg = arrownet::PartitionColumnsArg(base.sort_keys);
 
 	// A schema-only Arrow stream carries the column definitions to the backend. The text-column SQL type
 	// (mssql_ctas_text_type / mssql_default_varchar_length) is read C#-side from the provider settings store
@@ -2280,7 +2283,7 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::CreateTable(CatalogTransaction t
 	producer.SetNullability(nullable);
 	producer.Finish();
 	arrownet::CreateTable(handle_, name, base.table, *producer.Stream(), if_not_exists, pk_arg, unique_arg,
-	                      defaults_arg, partition_arg);
+	                      defaults_arg, partition_arg, sort_arg);
 
 	// Register the new table (also invalidates any cached entry) and return it.
 	AddTable(base.table, "BASE TABLE");

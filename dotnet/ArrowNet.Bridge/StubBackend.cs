@@ -76,7 +76,7 @@ public sealed class StubBackend : IBackend
 
         public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists,
                                 string? primaryKey, string? uniques, string? defaults,
-                                IReadOnlyList<string>? partitionColumns)
+                                IReadOnlyList<string>? partitionColumns, IReadOnlyList<string>? sortColumns)
         {
         }
 
@@ -124,7 +124,8 @@ public sealed class StubBackend : IBackend
 
         public long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable,
                                bool replace, bool checkConstraints, long txnId,
-                               IReadOnlyList<string>? partitionColumns) => CountRows(data);
+                               IReadOnlyList<string>? partitionColumns,
+                               IReadOnlyList<string>? sortColumns) => CountRows(data);
 
         public long ExecuteDelete(string schemaName, string tableName, IArrowArrayStream keys) => CountRows(keys);
 

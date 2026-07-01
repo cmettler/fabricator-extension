@@ -144,8 +144,12 @@ public interface IBackendCatalog : IDisposable
     /// <paramref name="partitionColumns"/> (null/empty if none) are the partition
     /// columns from a native <c>CREATE TABLE AS ... PARTITIONED BY</c> clause, honored
     /// only when creating/replacing the table; ignored by non-partitioning providers.
+    /// <paramref name="sortColumns"/> (null/empty if none) are the columns from a native
+    /// <c>SORTED BY</c> clause; the SQL Server provider maps them to a Fabric Warehouse
+    /// <c>WITH (CLUSTER BY (cols))</c> layout (ignored on box SQL Server and by Delta / DAX).
     long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable, bool replace,
-                    bool checkConstraints, long txnId, IReadOnlyList<string>? partitionColumns);
+                    bool checkConstraints, long txnId, IReadOnlyList<string>? partitionColumns,
+                    IReadOnlyList<string>? sortColumns);
 
     /// <summary>
     /// rowid-based DELETE. <paramref name="keys"/> columns (named by Arrow field)
@@ -249,9 +253,12 @@ public interface IBackendCatalog : IDisposable
     /// <paramref name="partitionColumns"/> are the column names from a native
     /// <c>CREATE TABLE ... PARTITIONED BY</c> clause (null/empty if none). Providers
     /// that don't partition (SQL Server / DAX) ignore them; the Delta provider records
-    /// them as the table's partition columns.
+    /// them as the table's partition columns. <paramref name="sortColumns"/> come from a
+    /// native <c>SORTED BY</c> clause; the SQL Server provider maps them to a Fabric
+    /// Warehouse <c>WITH (CLUSTER BY (cols))</c> layout (ignored on box / Delta / DAX).
     void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists, string? primaryKey,
-                     string? uniques, string? defaults, IReadOnlyList<string>? partitionColumns);
+                     string? uniques, string? defaults, IReadOnlyList<string>? partitionColumns,
+                     IReadOnlyList<string>? sortColumns);
 
     /// <summary>Drops a table; <paramref name="ifExists"/> suppresses the missing-table error.</summary>
     void DropTable(string schemaName, string tableName, bool ifExists);

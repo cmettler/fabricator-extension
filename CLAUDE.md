@@ -1101,7 +1101,20 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v51** (v51 = **native `PARTITIONED BY`** — appended a `partition_columns` param (nullable,
+- **Current version: ABI v52** (v52 = **native `SORTED BY` → Fabric Warehouse `CLUSTER BY`** — appended a
+  `sort_columns` param (nullable, comma-separated) to **both** `create_table` and `begin_bulk`, mirroring the v51
+  `partition_columns`. DuckDB v1.5.4 parses `CREATE TABLE [t] SORTED BY (cols) [AS …]` into
+  `CreateTableInfo::sort_keys`; `ArrowNetCatalog::SupportsCreateTable` now permits BOTH partition_keys AND
+  sort_keys (only the WITH-options clause stays rejected). C++ extracts the sort columns (reusing
+  `arrownet::PartitionColumnsArg`) in the DDL create + CTAS and passes them; the **SQL Server provider maps them
+  to a Fabric Warehouse / Synapse `WITH (CLUSTER BY (cols))`** layout in `BuildCreateTable` — **only on a
+  warehouse profile** (`profile.IsWarehouse`; box SQL Server has no such syntax → the clause is a no-op there),
+  for both explicit CREATE and CTAS. A **`mssql_cluster_by` session setting** (comma-separated columns) is the
+  fallback when there's no native clause (`ResolveClusterColumns`: native SORTED BY wins). Delta / DAX ignore
+  `sort_columns`. Validated: `test/verify_cluster_by.test` (18 — box plumbing + graceful no-op), columnstore +
+  Delta suites unregressed, and **live on Fabric Warehouse**: `CREATE TABLE … SORTED BY (CustomerID, SaleDate)` +
+  CTAS both accepted (data correct), and a bad cluster column is **rejected by Fabric** (error 1911 — proving the
+  `WITH (CLUSTER BY …)` clause is emitted, not dropped). v51 = **native `PARTITIONED BY`** — appended a `partition_columns` param (nullable,
   comma-separated column names) to **both** `create_table` and `begin_bulk` (a signature change, not a slot add).
   DuckDB v1.5.4 parses `CREATE TABLE [t] PARTITIONED BY (cols) [AS …]` into `CreateTableInfo::partition_keys`
   (clause precedes `AS` for CTAS); the base `Catalog::SupportsCreateTable` REJECTS any partition_keys, so

@@ -229,10 +229,13 @@ typedef struct ArrowNetVTable {
 	// `partition_columns` (nullable): comma-separated column names from a native CREATE TABLE ... PARTITIONED BY
 	// clause (empty/NULL => none). Providers that don't partition (SQL Server / DAX) ignore it; the Delta provider
 	// records them as the table's partition columns (data files then laid out by partition on write).
+	// `sort_columns` (nullable): comma-separated column names from a native CREATE TABLE ... SORTED BY clause. The
+	// SQL Server provider maps them to a Fabric Warehouse / Synapse WITH (CLUSTER BY (cols)) layout (ignored on box
+	// SQL Server and by the Delta / DAX providers).
 	int32_t (*create_table)(ArrowNetHandle handle, const char *schema, const char *table,
 	                        struct ArrowArrayStream *columns, int32_t if_not_exists, const char *pk_columns,
 	                        const char *unique_columns, const char *defaults, const char *partition_columns,
-	                        char **err);
+	                        const char *sort_columns, char **err);
 
 	// DDL: drop a table. `if_exists` suppresses the error when it is absent.
 	int32_t (*drop_table)(ArrowNetHandle handle, const char *schema, const char *table, int32_t if_exists, char **err);
@@ -297,9 +300,13 @@ typedef struct ArrowNetVTable {
 	// `partition_columns` (nullable): comma-separated column names from a native CREATE TABLE AS ... PARTITIONED BY
 	// clause (empty/NULL => none), honored only when `create_table`/`replace` (an Append into an existing table keeps
 	// its declared partitioning). Providers that don't partition ignore it; the Delta provider partitions the data.
+	// `sort_columns` (nullable): comma-separated column names from a native CREATE TABLE AS ... SORTED BY clause,
+	// honored only when `create_table`/`replace`. The SQL Server provider maps them to a Fabric Warehouse / Synapse
+	// WITH (CLUSTER BY (cols)) layout (ignored on box SQL Server and by Delta / DAX).
 	int32_t (*begin_bulk)(ArrowNetHandle handle, const char *schema, const char *table, int32_t create_table,
 	                      int32_t replace, int32_t check_constraints, int64_t txn_id, struct ArrowSchema *schema_in,
-	                      const char *partition_columns, ArrowNetHandle *out_session, char **err);
+	                      const char *partition_columns, const char *sort_columns, ArrowNetHandle *out_session,
+	                      char **err);
 
 	// push_batch enqueues one record batch into the session. The managed side
 	// imports `batch` (taking ownership and releasing it); the caller never
@@ -693,7 +700,7 @@ typedef struct ArrowNetHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 51
+#define ARROWNET_ABI_VERSION 52
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

@@ -1,0 +1,70 @@
+# name: test/verify_cluster_by.test
+# description: Native CREATE TABLE ... SORTED BY (cols) → Fabric Warehouse / Synapse WITH (CLUSTER BY (cols)).
+#              DuckDB v1.5.4 parses SORTED BY into CreateTableInfo::sort_keys; ArrowNetCatalog::SupportsCreateTable
+#              permits it; C++ passes the columns via the ABI v52 sort_columns arg to create_table/begin_bulk; the
+#              SQL Server provider emits WITH (CLUSTER BY (cols)) ONLY on a warehouse profile (this test runs on
+#              box SQL Server, where the clause is a NO-OP — so it verifies the plumbing + graceful ignore, not the
+#              emitted clause; the emitted clause is validated live on Fabric Warehouse). mssql_cluster_by is the
+#              session-setting fallback. Needs a box SQL Server (MSSQL_TESTDB_DSN).
+# group: [mssql_net]
+
+require mssql_net
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql_net);
+
+# SORTED BY on an explicit CREATE is accepted (permitted by SupportsCreateTable; box ignores the CLUSTER BY).
+statement ok
+CREATE TABLE db.dbo.arrownet_cb1 (SaleID INTEGER, CustomerID INTEGER, Amount INTEGER) SORTED BY (CustomerID, SaleID);
+
+statement ok
+INSERT INTO db.dbo.arrownet_cb1 VALUES (1,100,10),(2,100,20),(3,200,30);
+
+query II
+SELECT CustomerID, sum(Amount) FROM db.dbo.arrownet_cb1 GROUP BY CustomerID ORDER BY CustomerID;
+----
+100	30
+200	30
+
+# SORTED BY on CTAS (the clause precedes AS) is accepted too.
+statement ok
+CREATE TABLE db.dbo.arrownet_cb2 SORTED BY (CustomerID) AS SELECT * FROM db.dbo.arrownet_cb1;
+
+query I
+SELECT count(*) FROM db.dbo.arrownet_cb2;
+----
+3
+
+# The mssql_cluster_by session setting is accepted (a comma-separated fallback for the native clause; a no-op
+# on box). Setting it and creating a table must not error.
+statement ok
+SET mssql_cluster_by='CustomerID';
+
+statement ok
+CREATE TABLE db.dbo.arrownet_cb3 (id INTEGER, CustomerID INTEGER);
+
+statement ok
+INSERT INTO db.dbo.arrownet_cb3 VALUES (1,100);
+
+query I
+SELECT count(*) FROM db.dbo.arrownet_cb3;
+----
+1
+
+statement ok
+SET mssql_cluster_by='';
+
+# Cleanup.
+statement ok
+DROP TABLE db.dbo.arrownet_cb1;
+
+statement ok
+DROP TABLE db.dbo.arrownet_cb2;
+
+statement ok
+DROP TABLE db.dbo.arrownet_cb3;
+
+statement ok
+DETACH db;

@@ -48,6 +48,9 @@ public sealed class SqlServerBackend : IBackend
                 Str("mssql_default_table_type",
                     "mssql_net: created-table storage — '' (rowstore, default) | 'clustered columnstore' " +
                     "(CCI, box/Azure SQL; Fabric/Synapse tables are columnstore already so it is a no-op there)"),
+                Str("mssql_cluster_by",
+                    "mssql_net: comma-separated columns for a Fabric Warehouse / Synapse WITH (CLUSTER BY (cols)) " +
+                    "layout on created tables (fallback for a native SORTED BY clause; no-op on box SQL Server)"),
                 Long("mssql_insert_batch_size", "mssql_net: max rows per INSERT statement", 2000L, 1),
                 Long("mssql_insert_max_rows_per_statement", "mssql_net: hard cap on rows per statement", 2000L, 1),
                 Long("mssql_insert_max_sql_bytes", "mssql_net: max SQL statement size in bytes", 8388608L, 1),
@@ -816,9 +819,11 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     }
 
     public long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable, bool replace,
-                           bool checkConstraints, long txnId, IReadOnlyList<string>? partitionColumns)
+                           bool checkConstraints, long txnId, IReadOnlyList<string>? partitionColumns,
+                           IReadOnlyList<string>? sortColumns)
     {
         // partitionColumns is a Delta/lakehouse concept; SQL Server table partitioning is out of scope here — ignored.
+        // sortColumns (native SORTED BY) becomes a Fabric Warehouse WITH (CLUSTER BY (cols)) on the created table.
         // The bulk-copy runs on a background task (its own pool thread), so the host can't carry the active
         // transaction id to us via the per-thread ambient — it captured it at begin_bulk and hands it here;
         // we re-establish it on THIS thread so BeginWrite + read-your-writes use the right per-transaction
@@ -844,7 +849,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 using var create = connection.CreateCommand();
                 create.Transaction = transaction;
                 create.CommandText = $"IF OBJECT_ID({objectLiteral}, 'U') IS NULL " +
-                                     BuildCreateTable(qualified, data.Schema, Profile);
+                                     BuildCreateTable(qualified, data.Schema, Profile, null, null, null, sortColumns);
                 create.ExecuteNonQuery();
             }
 
@@ -1438,9 +1443,11 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     }
 
     public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists, string? primaryKey,
-                            string? uniques, string? defaults, IReadOnlyList<string>? partitionColumns)
+                            string? uniques, string? defaults, IReadOnlyList<string>? partitionColumns,
+                            IReadOnlyList<string>? sortColumns)
     {
         // partitionColumns is a Delta/lakehouse concept; not applied to SQL Server DDL here (ignored).
+        // sortColumns (native SORTED BY) becomes a Fabric Warehouse WITH (CLUSTER BY (cols)) layout — see BuildCreateTable.
         // Route through BeginWrite so this participates in the pinned transaction
         // when one is active — without it, CREATE OR REPLACE (DROP pinned + CREATE
         // fresh) would self-deadlock on the dropped table's schema lock.
@@ -1468,7 +1475,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                         return; // table already exists
                     }
                 }
-                cmd.CommandText = BuildCreateTable(qualified, columns, Profile, null, null, defaults);
+                cmd.CommandText = BuildCreateTable(qualified, columns, Profile, null, null, defaults, sortColumns);
                 cmd.ExecuteNonQuery();
                 foreach (var alter in WarehouseConstraintAlters(qualified, tableName, columns, pk, uniqueGroups))
                 {
@@ -1478,7 +1485,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 return;
             }
 
-            string create = BuildCreateTable(qualified, columns, Profile, primaryKey, uniques, defaults);
+            string create = BuildCreateTable(qualified, columns, Profile, primaryKey, uniques, defaults, sortColumns);
             using var cmd0 = connection.CreateCommand();
             cmd0.Transaction = transaction;
             cmd0.CommandText = ifNotExists
@@ -2189,10 +2196,11 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     internal static string Quote(string identifier) => "[" + identifier.Replace("]", "]]") + "]";
 
     private static string BuildCreateTable(string qualified, Schema schema, ServerProfile profile) =>
-        BuildCreateTable(qualified, schema, profile, null, null, null);
+        BuildCreateTable(qualified, schema, profile, null, null, null, null);
 
     private static string BuildCreateTable(string qualified, Schema schema, ServerProfile profile, string? primaryKey,
-                                           string? uniques, string? defaults)
+                                           string? uniques, string? defaults,
+                                           IReadOnlyList<string>? clusterColumns = null)
     {
         var defaultMap = ParseDefaults(defaults);
         var sb = new StringBuilder();
@@ -2233,7 +2241,50 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             sb.Append(", UNIQUE").Append(keyKind).Append(" (").Append(ColumnList(schema, group)).Append(')');
         }
         sb.Append(')');
+
+        // Fabric Warehouse / Synapse data-layout clustering: CREATE TABLE x (...) WITH (CLUSTER BY (c1, c2)).
+        // Columns come from a native SORTED BY clause (clusterColumns), else the mssql_cluster_by setting.
+        // Box SQL Server has no such syntax, so it is emitted ONLY on a warehouse profile (ignored otherwise).
+        var cluster = ResolveClusterColumns(clusterColumns);
+        if (profile.IsWarehouse && cluster.Count > 0)
+        {
+            sb.Append(" WITH (CLUSTER BY (");
+            for (int i = 0; i < cluster.Count; i++)
+            {
+                if (i > 0)
+                {
+                    sb.Append(", ");
+                }
+                sb.Append(Quote(cluster[i]));
+            }
+            sb.Append("))");
+        }
         return sb.ToString();
+    }
+
+    // The effective CLUSTER BY columns: a native SORTED BY clause wins; otherwise the mssql_cluster_by session
+    // setting (comma-separated column names). Empty when neither is set.
+    private static IReadOnlyList<string> ResolveClusterColumns(IReadOnlyList<string>? sortColumns)
+    {
+        if (sortColumns is { Count: > 0 })
+        {
+            return sortColumns;
+        }
+        var setting = ProviderSettingsStore.Instance.GetString(SqlServerBackend.ProviderName, "mssql_cluster_by");
+        if (string.IsNullOrWhiteSpace(setting))
+        {
+            return System.Array.Empty<string>();
+        }
+        var list = new List<string>();
+        foreach (var part in setting.Split(','))
+        {
+            var t = part.Trim().Trim('[', ']', '(', ')');
+            if (t.Length > 0)
+            {
+                list.Add(t);
+            }
+        }
+        return list;
     }
 
     // mssql_default_table_type values that select a clustered columnstore table (case/underscore tolerant).

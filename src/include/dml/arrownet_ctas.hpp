@@ -21,6 +21,9 @@ struct ArrowNetCtasInfo {
 	//! Comma-separated column names from a native PARTITIONED BY clause (empty if none). Passed to begin_bulk so
 	//! a partitioning provider (Delta) lays out the CTAS result by partition; SQL Server / DAX ignore it.
 	string partition_columns;
+	//! Comma-separated column names from a native SORTED BY clause (empty if none). The SQL Server provider maps
+	//! them to a Fabric Warehouse WITH (CLUSTER BY (cols)) layout on the created table; Delta / DAX ignore it.
+	string sort_columns;
 	ArrowNetHandle handle = nullptr;
 	//! Schema entry to register the new table in (so it appears in the catalog).
 	optional_ptr<ArrowNetSchemaEntry> schema_entry;

@@ -569,8 +569,10 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// opener was re-established on it by BulkSession. createTable/replace => Overwrite (CTAS/REPLACE: the table
     /// becomes exactly these rows); otherwise Append (INSERT). One Delta commit. Returns rows written.</summary>
     public long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable,
-                           bool replace, bool checkConstraints, long txnId, IReadOnlyList<string>? partitionColumns)
+                           bool replace, bool checkConstraints, long txnId, IReadOnlyList<string>? partitionColumns,
+                           IReadOnlyList<string>? sortColumns)
     {
+        // sortColumns (native SORTED BY) is a SQL-Server-warehouse CLUSTER BY concept; Delta doesn't cluster — ignored.
         var opener = AmbientOpener.Current;
         var (schema, batches, rows) = DeltaWriter.Materialize(data, default);
         var mode = createTable || replace ? DeltaWriteMode.Overwrite : DeltaWriteMode.Append;
@@ -589,7 +591,8 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// <paramref name="ifNotExists"/> is satisfied; PK/UNIQUE/DEFAULT are ignored (Delta has no such constraints).</summary>
     public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists,
                             string? primaryKey, string? uniques, string? defaults,
-                            IReadOnlyList<string>? partitionColumns)
+                            IReadOnlyList<string>? partitionColumns, IReadOnlyList<string>? sortColumns)
+        // sortColumns (native SORTED BY) is a SQL-Server-warehouse CLUSTER BY concept; Delta doesn't cluster — ignored.
         => DeltaWriter.Create(AmbientOpener.Current, TablePath(schemaName, tableName), columns, default,
                               deletionVectors: _deletionVectorsOnCreate,
                               inCommitTimestamps: _inCommitTimestampsOnCreate,

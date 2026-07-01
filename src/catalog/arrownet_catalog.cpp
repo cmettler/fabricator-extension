@@ -259,13 +259,10 @@ void ArrowNetCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 	schemas_.erase(info.name);
 }
 ErrorData ArrowNetCatalog::SupportsCreateTable(BoundCreateTableInfo &info) {
-	// Permit PARTITIONED BY (the base Catalog rejects it). SORTED BY and the WITH-options clause remain
-	// unsupported — a provider that can't honor them shouldn't silently drop them.
+	// Permit PARTITIONED BY (Delta partitions the data) and SORTED BY (the SQL Server provider maps it to a
+	// Fabric Warehouse WITH (CLUSTER BY (cols)) layout) — the base Catalog rejects both. The WITH-options clause
+	// stays unsupported.
 	auto &base = info.Base().Cast<CreateTableInfo>();
-	if (!base.sort_keys.empty()) {
-		return ErrorData(ExceptionType::CATALOG,
-		                 StringUtil::Format("SORTED BY is not supported for tables in a %s catalog", GetCatalogType()));
-	}
 	if (!base.options.empty()) {
 		return ErrorData(ExceptionType::CATALOG,
 		                 StringUtil::Format("WITH clause is not supported for tables in a %s catalog", GetCatalogType()));
@@ -285,6 +282,7 @@ PhysicalOperator &ArrowNetCatalog::PlanCreateTableAs(ClientContext &context, Phy
 	}
 	info.replace = op.info->base->on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT;
 	info.partition_columns = arrownet::PartitionColumnsArg(create_info.partition_keys); // native PARTITIONED BY
+	info.sort_columns = arrownet::PartitionColumnsArg(create_info.sort_keys);           // native SORTED BY (→ CLUSTER BY)
 	info.handle = handle_;
 	info.schema_entry = &op.schema.Cast<ArrowNetSchemaEntry>();
 

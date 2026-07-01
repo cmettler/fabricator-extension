@@ -45,7 +45,7 @@ public static unsafe class Bootstrap
             return new InMemoryArrayStream(schema, new[] { batch });
         });
 
-        vtable->AbiVersion = 51;
+        vtable->AbiVersion = 52;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -197,7 +197,7 @@ public static unsafe class Bootstrap
             var stream = CArrowArrayStreamImporter.ImportArrayStream(input);
             long rows = catalog.BulkInsert(schemaName, tableName, stream, createTable != 0, replace != 0,
                                            checkConstraints: false, txnId: AmbientTransaction.Current,
-                                           partitionColumns: null);
+                                           partitionColumns: null, sortColumns: null);
             if (affected is not null)
             {
                 *affected = rows;
@@ -329,7 +329,8 @@ public static unsafe class Bootstrap
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static int CreateTable(nint handle, byte* schema, byte* table, CArrowArrayStream* columns, int ifNotExists,
-                                   byte* pkColumns, byte* uniqueColumns, byte* defaults, byte* partitionColumns, byte** err)
+                                   byte* pkColumns, byte* uniqueColumns, byte* defaults, byte* partitionColumns,
+                                   byte* sortColumns, byte** err)
     {
         try
         {
@@ -345,11 +346,13 @@ public static unsafe class Bootstrap
             var uniques = Marshal.PtrToStringUTF8((nint)uniqueColumns);
             var defaultSpec = Marshal.PtrToStringUTF8((nint)defaults);
             var partition = SplitColumnList(Marshal.PtrToStringUTF8((nint)partitionColumns));
+            var sort = SplitColumnList(Marshal.PtrToStringUTF8((nint)sortColumns));
 
             // We own the C stream; read its schema (the column layout) and release it. The text-column SQL
             // type (mssql_ctas_text_type / mssql_default_varchar_length) is read from the settings store in C#.
             using var stream = CArrowArrayStreamImporter.ImportArrayStream(columns);
-            catalog.CreateTable(schemaName, tableName, stream.Schema, ifNotExists != 0, pk, uniques, defaultSpec, partition);
+            catalog.CreateTable(schemaName, tableName, stream.Schema, ifNotExists != 0, pk, uniques, defaultSpec,
+                                partition, sort);
             return ArrowNetStatus.Ok;
         }
         catch (Exception ex)
@@ -563,7 +566,7 @@ public static unsafe class Bootstrap
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static int BeginBulk(nint handle, byte* schema, byte* table, int createTable, int replace,
                                  int checkConstraints, long txnId, CArrowSchema* schemaIn, byte* partitionColumns,
-                                 nint* outSession, byte** err)
+                                 byte* sortColumns, nint* outSession, byte** err)
     {
         try
         {
@@ -579,6 +582,7 @@ public static unsafe class Bootstrap
             var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
             var partition = SplitColumnList(Marshal.PtrToStringUTF8((nint)partitionColumns));
+            var sort = SplitColumnList(Marshal.PtrToStringUTF8((nint)sortColumns));
 
             // Capture the host-FS opener now (set by the C++ sink before begin_bulk, on this thread) so the
             // background bulk consumer can re-establish it — a host-FS provider (the Delta catalog) writes
@@ -586,7 +590,7 @@ public static unsafe class Bootstrap
             // statement (complete_bulk blocks until the consumer finishes), so the opener is live at write time.
             var opener = AmbientOpener.Current;
             var session = new BulkSession(catalog, schemaName, tableName, arrowSchema, createTable != 0, replace != 0,
-                                          checkConstraints != 0, txnId, opener, partition);
+                                          checkConstraints != 0, txnId, opener, partition, sort);
             *outSession = Handles.Alloc(session);
             return ArrowNetStatus.Ok;
         }

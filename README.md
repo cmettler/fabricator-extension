@@ -196,6 +196,14 @@ What the profile drives automatically:
   **UPDATE/DELETE work**.
 - **String `ORDER BY` pushdown** turns on under Fabric's binary (`BIN2_UTF8`) collation (byte-order sort
   matches DuckDB); it stays local under case-insensitive collations (still correct).
+- **Data-layout clustering.** A native `CREATE TABLE … SORTED BY (cols)` (the clause precedes `AS` for CTAS) is
+  mapped to Fabric Warehouse / Synapse `WITH (CLUSTER BY (cols))` — DuckDB has no `CLUSTER BY` syntax, so its
+  `SORTED BY` serves the same purpose. Emitted only on a warehouse profile (a no-op on box SQL Server). The
+  `mssql_cluster_by` setting is a session fallback. Example:
+  ```sql
+  CREATE TABLE wh.dbo.Sales (SaleID INT, CustomerID INT, SaleDate DATE, Amount DECIMAL(10,2))
+    SORTED BY (CustomerID, SaleDate);   -- → CREATE TABLE … WITH (CLUSTER BY (CustomerID, SaleDate))
+  ```
 - **Functions.** Discovered scalar UDFs, TVFs, and stored procedures work on Fabric (proc result sets resolved
   via `sp_describe_first_result_set`), as do custom C# functions and the `fn_each` table-in-out exchange.
 
@@ -549,6 +557,7 @@ the native extension's batching/pooling/TDS knobs don't apply).
 | `mssql_mars` | **Active** | MARS mode: `auto` (default, per engine — off for Fabric/Synapse) \| `true` \| `false`. Resolved once at first connection — set **before** ATTACH |
 | `mssql_default_varchar_length` | **Active** | Length `n` for created text columns (`NVARCHAR(n)`/`VARCHAR(n)`); unset ⇒ `MAX`. Needed for indexable string keys |
 | `mssql_default_table_type` | **Active** | Created-table storage: `''` (rowstore) \| `clustered columnstore` (CCI, box/Azure; no-op on Fabric — columnstore already) |
+| `mssql_cluster_by` | **Active** | Comma-separated columns → Fabric Warehouse/Synapse `WITH (CLUSTER BY (cols))` on created tables (fallback for a native `SORTED BY` clause; no-op on box) |
 | `mssql_ctas_text_type` | **Active** | Whole-type override for text columns on CREATE/CTAS/COPY (e.g. `'VARCHAR(64)'`); wins over the collation choice + length |
 | `mssql_exec_invalidate_cache` | **Active** | Auto-invalidate the catalog cache after DDL run via `mssql_net_exec` (default `false`) |
 | `mssql_isolation_level` | **Active** | SQL transaction isolation level for table-in-out (`fn_each`) calls; overrides the ATTACH `isolation_level` per session (empty ⇒ provider default) |

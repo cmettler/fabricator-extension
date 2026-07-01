@@ -617,12 +617,14 @@ internal sealed class DaxCatalog : IBackendCatalog
 
     public long ExecuteNonQuery(string sql) => throw ReadOnly();
     public long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable,
-                           bool replace, bool checkConstraints, long txnId, IReadOnlyList<string>? partitionColumns) => throw ReadOnly();
+                           bool replace, bool checkConstraints, long txnId, IReadOnlyList<string>? partitionColumns,
+                           IReadOnlyList<string>? sortColumns) => throw ReadOnly();
     public long ExecuteDelete(string schemaName, string tableName, IArrowArrayStream keys) => throw ReadOnly();
     public long ExecuteUpdate(string schemaName, string tableName, int setColumnCount, IArrowArrayStream data) => throw ReadOnly();
     public IArrowArrayStream InsertReturning(string schemaName, string tableName, IArrowArrayStream rows) => throw ReadOnly();
     public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists,
-                            string? primaryKey, string? uniques, string? defaults, IReadOnlyList<string>? partitionColumns) => throw ReadOnly();
+                            string? primaryKey, string? uniques, string? defaults, IReadOnlyList<string>? partitionColumns,
+                            IReadOnlyList<string>? sortColumns) => throw ReadOnly();
     public void DropTable(string schemaName, string tableName, bool ifExists) => throw ReadOnly();
     public void CreateSchema(string schemaName, bool ifNotExists) => throw ReadOnly();
     public void DropSchema(string schemaName, bool ifExists) => throw ReadOnly();
