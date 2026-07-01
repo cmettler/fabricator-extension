@@ -35,6 +35,7 @@ public sealed class DeltaRsCatalog : IBackendCatalog
     private readonly string _root;                              // ATTACH target (path or URI), forward slashes
     private readonly Dictionary<string, string> _storage;      // delta-rs object_store options (from a secret)
     private readonly bool _schemas;                             // two-level <root>/<schema>/<table> layout
+    private readonly bool _changeDataFeed;                      // enable delta.enableChangeDataFeed on CREATE
 
     public DeltaRsCatalog(string connectionString, string? optionsJson)
     {
@@ -42,7 +43,13 @@ public sealed class DeltaRsCatalog : IBackendCatalog
         _root = target.Replace('\\', '/').TrimEnd('/');
         _storage = storage;
         _schemas = ParseBoolOption(optionsJson, "schemas");
+        _changeDataFeed = ParseBoolOption(optionsJson, "change_data_feed");
     }
+
+    /// <summary>Table configuration applied at CREATE (null if none). Enables Change Data Feed when the
+    /// <c>change_data_feed</c> ATTACH option is set, so INSERT/DELETE/UPDATE capture change data.</summary>
+    private Dictionary<string, string>? CreateConfiguration() =>
+        _changeDataFeed ? new Dictionary<string, string> { ["delta.enableChangeDataFeed"] = "true" } : null;
 
     // ---- path / uri helpers ----
 
@@ -226,6 +233,7 @@ public sealed class DeltaRsCatalog : IBackendCatalog
                 StorageOptions = _storage,
                 PartitionBy = (partitionColumns ?? new List<string>()).ToList(),
                 SaveMode = replace ? SaveMode.Overwrite : SaveMode.ErrorIfExists,
+                Configuration = CreateConfiguration(),
             };
             table = Run(_engine.CreateTableAsync(create, default));
         }
@@ -267,6 +275,7 @@ public sealed class DeltaRsCatalog : IBackendCatalog
             StorageOptions = _storage,
             PartitionBy = (partitionColumns ?? new List<string>()).ToList(),
             SaveMode = ifNotExists ? SaveMode.Ignore : SaveMode.ErrorIfExists,
+            Configuration = CreateConfiguration(),
         };
         using var table = Run(_engine.CreateTableAsync(create, default));
     }
