@@ -169,52 +169,80 @@ public sealed class DeltaRsCatalog : IBackendCatalog
     public IArrowArrayStream ScanTable(string schemaName, string tableName, string? specJson,
                                        IArrowArrayStream? filterValues)
     {
-        // Time travel is DEFERRED in v1: delta-dotnet reads only the latest snapshot via the Delta Kernel, and
-        // any versioned load disables the kernel (isKernelSupported=false) with no non-kernel read path
-        // ("not supported without using the Delta Kernel"). VERSION/TIMESTAMP travel needs the kernel wired to
-        // snapshot at a version (or a delta-rs read-at-version) — see docs/delta-rs-provider.md.
         var spec = ScanSpec.Parse(specJson);
-        if (spec?.At is not null)
-        {
-            throw Unsupported("time travel (delta-dotnet reads only the latest snapshot in v1)");
-        }
 
-        // Filter pushdown: translate the (superset-safe) FilterNode to a DataFusion WHERE and run it via
-        // QueryAsync so delta-rs does file/stats/row-group skipping. Unpushable predicates render as TRUE
-        // (dropped — DuckDB re-applies every predicate above the scan, so a superset is correct). Only taken
-        // when something is actually pushable; else the full-read path below. Projection stays above the scan.
+        // Filter pushdown: translate the (superset-safe) FilterNode to a DataFusion WHERE (unpushable → TRUE,
+        // dropped, since DuckDB re-applies every predicate above the scan). Only pushed when something renders.
+        string? where = null;
         if (spec?.Filter is { } filter)
         {
-            var values = ReadFilterValues(filterValues);
-            string where = BuildWhere(filter, values);
-            if (where != "TRUE")
+            var built = BuildWhere(filter, ReadFilterValues(filterValues));
+            if (built != "TRUE")
             {
-                using var t = Open(schemaName, tableName);
-                var query = new SelectQuery($"SELECT * FROM src WHERE {where}") { TableAlias = "src" };
-                var batches = new List<RecordBatch>();
-                Schema? filteredSchema = null;
-                foreach (var b in t.QueryAsync(query, default).ToBlockingEnumerable())
-                {
-                    // delta-rs/DataFusion emits Utf8View for strings; advertise the ACTUAL batch schema (a
-                    // fixed table.Schema() would mismatch and SIGSEGV arrow_ingest). DuckDB maps by name.
-                    filteredSchema ??= b.Schema;
-                    batches.Add(b);
-                }
-                filteredSchema ??= t.Schema();
-                return new InMemoryArrayStream(filteredSchema, batches);
+                where = built;
             }
         }
 
+        // Time travel: FROM t AT (VERSION => n) / AT (TIMESTAMP => ts). Read via QueryAsync (DataFusion reads
+        // the LOADED snapshot) — NOT ReadAsArrowTableAsync, which needs the kernel and throws on a versioned
+        // load. delta-rs supports both version and timestamp.
+        if (spec?.At is { } at)
+        {
+            ulong? version = null;
+            DateTimeOffset? timestamp = null;
+            if (string.Equals(at.Unit, "version", StringComparison.OrdinalIgnoreCase))
+            {
+                version = ulong.Parse(at.Value, System.Globalization.CultureInfo.InvariantCulture);
+            }
+            else if (string.Equals(at.Unit, "timestamp", StringComparison.OrdinalIgnoreCase))
+            {
+                timestamp = DateTimeOffset.Parse(at.Value, System.Globalization.CultureInfo.InvariantCulture);
+            }
+            else
+            {
+                throw Unsupported($"time travel unit '{at.Unit}' (use VERSION or TIMESTAMP)");
+            }
+            return QueryScan(schemaName, tableName, version, timestamp, where);
+        }
+
+        // A pushed filter uses the QueryAsync path (file/stats skipping).
+        if (where is not null)
+        {
+            return QueryScan(schemaName, tableName, version: null, timestamp: null, where);
+        }
+
+        // No filter, no time travel: the sanitized kernel read (schema == the bound table.Schema()).
         OwnedArrowTable owned;
         using (var table = Open(schemaName, tableName))
         {
-            // v1: read the whole table into an owned Apache.Arrow.Table (materialized into managed memory,
-            // independent of the ITable handle). Its Schema is EXACTLY the bound table.Schema() — using
-            // DataFusion's SELECT * instead risks a schema divergence that SIGSEGVs arrow_ingest. DuckDB applies
-            // projection + filter above the scan (correct superset). Streaming + SQL pushdown is a follow-up.
             owned = Run(table.ReadAsArrowTableAsync(default));
         }
         return new AsyncEnumerableArrowStream(owned.Table.Schema, TableBatches(owned.Table), owner: owned);
+    }
+
+    // Reads via QueryAsync (DataFusion), optionally at a version/timestamp (time travel) and/or with a pushed
+    // WHERE. Materialized + advertises the actual batch schema (delta-rs emits Utf8View for strings; a fixed
+    // table.Schema() would mismatch arrow_ingest). Used for both time travel and filter pushdown — neither goes
+    // through the kernel read path (which can't read a non-latest snapshot).
+    private IArrowArrayStream QueryScan(string schemaName, string tableName, ulong? version,
+                                        DateTimeOffset? timestamp, string? where)
+    {
+        using var t = Open(schemaName, tableName, version);
+        if (timestamp is { } ts)
+        {
+            Run(t.LoadDateTimeAsync(ts, default));
+        }
+        var sql = where is null ? "SELECT * FROM src" : $"SELECT * FROM src WHERE {where}";
+        var query = new SelectQuery(sql) { TableAlias = "src" };
+        var batches = new List<RecordBatch>();
+        Schema? schema = null;
+        foreach (var b in t.QueryAsync(query, default).ToBlockingEnumerable())
+        {
+            schema ??= b.Schema;
+            batches.Add(b);
+        }
+        schema ??= t.Schema();
+        return new InMemoryArrayStream(schema, batches);
     }
 
     // Reads the one-row filter-constants batch into scalars (indexed by FilterNode.val/vals). Consumes the stream.

@@ -1581,11 +1581,14 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   reject an UPDATE as an ambiguous multi-match. **Maintenance** (OPTIMIZE / Z-ORDER / VACUUM / CHECKPOINT —
   ops engineered-wood lacks) via a command dialect on `mssql_net_exec('<catalog>', 'OPTIMIZE main.t ZORDER
   (id)' | 'VACUUM … [DRY RUN]' | 'CHECKPOINT main.t')` (C#-only `ExecuteNonQuery`, no ABI change;
-  `test/verify_delta_rs_maintenance.test`, 12). **Deferred (delta-dotnet limitations): time travel**
-  (delta-dotnet reads only the latest snapshot — a versioned load disables the kernel,
-  `isKernelSupported=false`, no non-kernel read path → clean "not supported" error), **ALTER** (no schema-DDL
-  API); cloud discovery / pushdown / CDF not yet wired. See docs/delta-catalog.md + docs/filesystem-bridge.md.
-  v47 =
+  `test/verify_delta_rs_maintenance.test`, 12). **Filter pushdown** (FilterNode→DataFusion WHERE via QueryAsync,
+  superset-safe/unpushable→TRUE; `_pushdown` 27), **time travel** (`AT (VERSION => n)` via QueryAsync — DataFusion
+  reads the loaded snapshot, sidestepping the kernel-only `ReadAsArrowTableAsync`; composes with pushdown;
+  `_time_travel` 36; VERSION 0 reads latest — delta-dotnet `Version=0` sentinel), and **Change Data Feed**
+  (`change_data_feed` ATTACH option + `arrownet_delta_changes`; `_cdf` 31) all work. **Deferred: ALTER** (no
+  delta-dotnet schema-DDL API); **not yet wired**: cloud discovery (local FS only in v1; `storage_options`
+  mapping coded but unproven), TIMESTAMP travel (wired, unverified), a first-class MERGE surface. See
+  docs/delta-rs-provider.md. v47 =
   **host-FS global table functions**: appended one vtable entry `set_active_opener(opener)` — a per-thread ambient (`AmbientOpener`, mirroring `set_active_txn`) recording the
   calling operator's `ClientContext` so a connection-free GLOBAL host-FS table reader (a lakehouse format)
   resolves DuckDB secrets while reading through the host `fs_*` callbacks; set in the shared `PopulateReturnSchema`

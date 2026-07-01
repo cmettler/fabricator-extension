@@ -40,12 +40,14 @@ SELECT count(*) FROM lake.main.t;
 ----
 4
 
-# Time travel is DEFERRED in v1 (delta-dotnet reads only the latest snapshot via the kernel; a versioned load
-# disables the kernel with no non-kernel read path) — a clean error, not silent latest-data.
-statement error
+# Time travel — AS OF v1 = the 3 CTAS rows (before the v2 insert). Read via QueryAsync (DataFusion reads the
+# loaded snapshot; the kernel-only ReadAsArrowTableAsync can't). delta-rs supports VERSION and TIMESTAMP.
+query IT
 SELECT id, name FROM lake.main.t AT (VERSION => 1) ORDER BY id;
 ----
-time travel
+1	alpha
+2	beta
+3	gamma
 
 # Snapshots / commit history (arrownet_delta_snapshots), oldest first (before the DML commits).
 query IT

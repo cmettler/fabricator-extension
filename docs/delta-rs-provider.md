@@ -17,13 +17,25 @@ assembly/native libs aren't published) and published opt-in via `publish-managed
 end on Windows via `test/verify_delta_rs.test` (25 assertions) and a live shell smoke:
 
 - **Working**: `ATTACH … (TYPE arrownet, PROVIDER 'deltars')` (+ alias `'delta-rs'`); discovery (local FS);
-  metadata (schemas/tables/columns); **scan** (read the whole table into an owned `Apache.Arrow.Table` via
-  `ReadAsArrowTableAsync`, streamed as batches — DuckDB projects/filters above); **CREATE/CTAS/INSERT**
-  (append + overwrite via `CreateTableAsync`/`InsertAsync`); **DELETE + UPDATE** (rowid → record-batch MERGE,
-  see below); **snapshots** (`arrownet_delta_snapshots` → `HistoryAsync`, real commit history:
-  `CREATE TABLE`/`WRITE`/`MERGE`/`OPTIMIZE`/…); **maintenance** (OPTIMIZE / Z-ORDER / VACUUM / CHECKPOINT — see
-  below); re-attach durability. `test/verify_delta_rs.test` (51) + `test/verify_delta_rs_maintenance.test`
-  (12). No regression to the engineered-wood provider (its full suite stays green).
+  metadata (schemas/tables/columns); **scan** (owned `Apache.Arrow.Table` via `ReadAsArrowTableAsync`, streamed
+  as batches); **filter pushdown** (FilterNode → DataFusion WHERE, see below); **CREATE/CTAS/INSERT** (append +
+  overwrite); **DELETE + UPDATE** (rowid → record-batch MERGE, see below); **time travel** (`AT (VERSION => n)`,
+  via QueryAsync, see below); **snapshots** (`arrownet_delta_snapshots` → `HistoryAsync`); **Change Data Feed**
+  (`change_data_feed` option + `arrownet_delta_changes`, see below); **maintenance** (OPTIMIZE / Z-ORDER /
+  VACUUM / CHECKPOINT, see below); re-attach durability. Tests: `verify_delta_rs.test` (56) +
+  `_maintenance` (12) + `_pushdown` (27) + `_cdf` (31) + `_time_travel` (36). No regression to the
+  engineered-wood provider.
+- **Filter pushdown**: a scan with a filter runs via QueryAsync with a DataFusion WHERE (file/stats/row-group
+  skipping); the superset-safe FilterNode renders compare / and·or / is_null / in, anything else → TRUE
+  (dropped, DuckDB re-applies above the scan). Filtered results materialize + advertise the actual batch schema
+  (delta-rs emits Utf8View for strings — a fixed `table.Schema()` would mismatch + SIGSEGV arrow_ingest).
+- **Time travel** (`AT (VERSION => n)`): reads via QueryAsync (DataFusion reads the *loaded* snapshot) — NOT
+  `ReadAsArrowTableAsync`, which needs the kernel and can't read a non-latest version. Composes with filter
+  pushdown. *Caveat*: `VERSION 0` reads as latest (delta-dotnet treats `Version=0` as a "latest" sentinel; v0
+  is our empty CREATE commit anyway). TIMESTAMP travel is wired (`LoadDateTimeAsync`) but not yet verified.
+- **Change Data Feed**: `ATTACH '(… change_data_feed true)'` enables `delta.enableChangeDataFeed` on tables
+  created in the catalog; read the row-level feed via `arrownet_delta_changes('<catalog>', '<schema.>table',
+  from [, to])` → `QueryTableChangesAsync` (`_change_type` / `_commit_version` / `_commit_timestamp`).
 - **Maintenance** (delta-rs ops engineered-wood lacks) via a small command dialect on
   `mssql_net_exec('<catalog>', '<cmd>')` (implemented in `ExecuteNonQuery`, C#-only, no ABI/C++ change):
   `OPTIMIZE <table> [ZORDER (c1, …)]` (bin-pack or Z-order clustering), `VACUUM <table> [RETAIN <h> HOURS]
@@ -42,18 +54,14 @@ end on Windows via `test/verify_delta_rs.test` (25 assertions) and a live shell 
   *Caveat*: a duplicated pre-image row could make delta-rs reject an UPDATE as an ambiguous multi-match
   (identical rows can't be selectively updated by a WHERE anyway). This is the record-batch-MERGE mapping the
   design anticipated; a future DuckDB "remote MERGE" optimizer step could push a MERGE statement directly.
-- **Deferred with a clean error** (delta-dotnet limitations found while building):
-  - **Time travel** — delta-dotnet reads only the *latest* snapshot via the Delta Kernel; **any versioned
-    load disables the kernel** (`Table.LoadVersionAsync` sets `isKernelSupported=false`) and there is no
-    non-kernel read path, so `ReadAsArrowTableAsync` at a version throws *"not supported without using the
-    Delta Kernel."* `AT (VERSION/TIMESTAMP …)` therefore returns a clean "not supported (v1)" error, not
-    silent latest-data. Needs the kernel wired to snapshot at a version (or a delta-rs read-at-version) — a
-    delta-dotnet patch, like the ones we make to engineered-wood.
+- **Deferred with a clean error**:
   - **ALTER** — delta-dotnet has no schema-DDL API.
+  - **`ReadAsArrowTableAsync` at a version** — delta-dotnet's *kernel* read is latest-only (a versioned load
+    sets `isKernelSupported=false`). Sidestepped: time travel reads via QueryAsync (DataFusion), which reads
+    the loaded snapshot without the kernel. So time travel works; only the kernel read path is latest-only.
 - **Not yet wired** (design is below): cloud discovery (v1 lists local roots only; `storage_options` mapping
-  is coded in `StorageOptionsCodec` but unproven), SQL/filter pushdown (scan is a full read), CDF read
-  (`QueryTableChangesAsync` is wired but untested), a first-class MERGE surface (DML MERGE is used internally
-  for DELETE/UPDATE).
+  is coded in `StorageOptionsCodec` but unproven), a first-class MERGE surface (delta-rs MERGE is used
+  internally for DELETE/UPDATE), TIMESTAMP time travel (wired, unverified).
 - **Scan schema note**: the scan uses `ReadAsArrowTableAsync` (schema == the bound `table.Schema()`), NOT
   DataFusion `QueryAsync` "SELECT *" — the latter's output schema diverged from the bound schema and
   **SIGSEGV'd `arrow_ingest`**. Materialize-and-serve is correct-first; streaming + pushdown is the follow-up.

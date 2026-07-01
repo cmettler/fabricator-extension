@@ -1,0 +1,79 @@
+# name: test/verify_delta_rs_time_travel.test
+# description: delta-rs provider time travel — FROM t AT (VERSION => n). Read via QueryAsync (DataFusion reads
+#              the loaded snapshot); the kernel-only ReadAsArrowTableAsync can't read a non-latest version.
+#              Composes with filter pushdown. NOTE: VERSION 0 reads as latest (delta-dotnet treats Version=0 as
+#              a "latest" sentinel; v0 is our empty CREATE commit), so tests use v1+. Requires the delta-rs
+#              native libs published (publish-managed.ps1 -IncludeDeltaRs). Local FS.
+# group: [mssql_net]
+
+require mssql_net
+
+require-env ARROWNET_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/drtt' AS lake (TYPE arrownet, PROVIDER 'deltars');
+
+# v1 = CTAS (3 rows).
+statement ok
+CREATE TABLE lake.main.t AS SELECT * FROM (VALUES (1,'a'),(2,'b'),(3,'c')) v(id,name);
+
+# v2 = insert (4 rows).
+statement ok
+INSERT INTO lake.main.t VALUES (4,'d');
+
+# v3 = delete id=2 (3 rows).
+statement ok
+DELETE FROM lake.main.t WHERE id = 2;
+
+# Per-version counts (v1=3, v2=4, latest=3).
+query TI
+SELECT 'v1' AS v, count(*) FROM lake.main.t AT (VERSION => 1)
+UNION ALL SELECT 'v2', count(*) FROM lake.main.t AT (VERSION => 2)
+UNION ALL SELECT 'latest', count(*) FROM lake.main.t
+ORDER BY v;
+----
+latest	3
+v1	3
+v2	4
+
+# v1 rows (the original CTAS data).
+query IT
+SELECT id, name FROM lake.main.t AT (VERSION => 1) ORDER BY id;
+----
+1	a
+2	b
+3	c
+
+# v2 rows (after the insert).
+query IT
+SELECT id, name FROM lake.main.t AT (VERSION => 2) ORDER BY id;
+----
+1	a
+2	b
+3	c
+4	d
+
+# Latest (after the delete).
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
+----
+1	a
+3	c
+4	d
+
+# Time travel composes with filter pushdown.
+query IT
+SELECT id, name FROM lake.main.t AT (VERSION => 2) WHERE id > 2 ORDER BY id;
+----
+3	c
+4	d
+
+# Multi-version comparison in one statement (each scan resolves its own AT).
+query I
+SELECT (SELECT count(*) FROM lake.main.t AT (VERSION => 2))
+     - (SELECT count(*) FROM lake.main.t AT (VERSION => 1));
+----
+1
+
+statement ok
+DETACH lake;
