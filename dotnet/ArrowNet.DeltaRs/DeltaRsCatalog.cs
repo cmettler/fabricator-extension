@@ -523,7 +523,95 @@ public sealed class DeltaRsCatalog : IBackendCatalog
         throw Unsupported("ALTER TABLE (delta-dotnet has no schema-DDL API)");
 
     public IArrowArrayStream ExecuteQuery(string sql) => throw Unsupported("raw query");
-    public long ExecuteNonQuery(string sql) => throw Unsupported("exec");
+
+    // Maintenance command dialect (delta-rs ops engineered-wood lacks), invoked via
+    // mssql_net_exec('<catalog>', '<cmd>'):
+    //   OPTIMIZE <table> [ZORDER (c1, c2, ...)]      -- bin-pack, or Z-order clustering
+    //   VACUUM   <table> [RETAIN <hours> HOURS] [DRY RUN]
+    //   CHECKPOINT <table>
+    // <table> is '<schema>.<table>' (schema defaults to 'main'). Returns 0 (these aren't row-affecting DML).
+    public long ExecuteNonQuery(string sql)
+    {
+        var text = (sql ?? string.Empty).Trim();
+        var tokens = text.Split(new[] { ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+        if (tokens.Length < 2)
+        {
+            throw Unsupported($"exec '{text}' — expected OPTIMIZE|VACUUM|CHECKPOINT <table> …");
+        }
+        var (schema, table) = SplitTableRef(tokens[1]);
+        using var t = Open(schema, table);
+        switch (tokens[0].ToUpperInvariant())
+        {
+            case "OPTIMIZE":
+            {
+                var options = new OptimizeOptions();
+                if (HasToken(tokens, "ZORDER") || HasToken(tokens, "Z-ORDER"))
+                {
+                    options.OptimizeType = OptimizeType.ZOrder;
+                    options.ZOrderColumns = ParseParenColumns(text);
+                }
+                Run(t.OptimizeAsync(options, default));
+                return 0;
+            }
+            case "VACUUM":
+            {
+                var options = new VacuumOptions { VacuumMode = VacuumMode.Full };
+                int r = TokenIndex(tokens, "RETAIN");
+                if (r >= 0 && r + 1 < tokens.Length &&
+                    ulong.TryParse(tokens[r + 1], out var hours))
+                {
+                    options.RetentionHours = hours;
+                }
+                if (HasToken(tokens, "DRY"))
+                {
+                    options.DryRun = true;
+                }
+                Run(t.VacuumAsync(options, default));
+                return 0;
+            }
+            case "CHECKPOINT":
+                Run(t.CheckpointAsync(default));
+                return 0;
+            default:
+                throw Unsupported($"exec verb '{tokens[0]}' — supported: OPTIMIZE, VACUUM, CHECKPOINT");
+        }
+    }
+
+    private static (string Schema, string Table) SplitTableRef(string reference)
+    {
+        int dot = reference.IndexOf('.');
+        return dot >= 0
+            ? (reference.Substring(0, dot), reference.Substring(dot + 1))
+            : (MainSchema, reference);
+    }
+
+    private static bool HasToken(string[] tokens, string token) => TokenIndex(tokens, token) >= 0;
+
+    private static int TokenIndex(string[] tokens, string token)
+    {
+        for (int i = 0; i < tokens.Length; i++)
+        {
+            if (string.Equals(tokens[i], token, StringComparison.OrdinalIgnoreCase))
+            {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private static IReadOnlyList<string> ParseParenColumns(string text)
+    {
+        int open = text.IndexOf('(');
+        int close = text.LastIndexOf(')');
+        if (open < 0 || close <= open)
+        {
+            return System.Array.Empty<string>();
+        }
+        return text.Substring(open + 1, close - open - 1)
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(c => c.Trim('"', '[', ']', '`'))
+            .ToList();
+    }
     public IArrowArrayStream InsertReturning(string s, string t, IArrowArrayStream r) =>
         throw Unsupported("INSERT ... RETURNING");
 

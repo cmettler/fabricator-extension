@@ -21,8 +21,15 @@ end on Windows via `test/verify_delta_rs.test` (25 assertions) and a live shell 
   `ReadAsArrowTableAsync`, streamed as batches — DuckDB projects/filters above); **CREATE/CTAS/INSERT**
   (append + overwrite via `CreateTableAsync`/`InsertAsync`); **DELETE + UPDATE** (rowid → record-batch MERGE,
   see below); **snapshots** (`arrownet_delta_snapshots` → `HistoryAsync`, real commit history:
-  `CREATE TABLE`/`WRITE`/`MERGE`/…); re-attach durability. `test/verify_delta_rs.test` (51). No regression to
-  the engineered-wood provider (its full suite stays green).
+  `CREATE TABLE`/`WRITE`/`MERGE`/`OPTIMIZE`/…); **maintenance** (OPTIMIZE / Z-ORDER / VACUUM / CHECKPOINT — see
+  below); re-attach durability. `test/verify_delta_rs.test` (51) + `test/verify_delta_rs_maintenance.test`
+  (12). No regression to the engineered-wood provider (its full suite stays green).
+- **Maintenance** (delta-rs ops engineered-wood lacks) via a small command dialect on
+  `mssql_net_exec('<catalog>', '<cmd>')` (implemented in `ExecuteNonQuery`, C#-only, no ABI/C++ change):
+  `OPTIMIZE <table> [ZORDER (c1, …)]` (bin-pack or Z-order clustering), `VACUUM <table> [RETAIN <h> HOURS]
+  [DRY RUN]`, `CHECKPOINT <table>` (`<table>` = `<schema>.<table>`, schema defaults to `main`). Verified:
+  OPTIMIZE commits an `OPTIMIZE` version, Z-ORDER, CHECKPOINT, VACUUM DRY RUN, data survives, unknown verb
+  errors cleanly.
 - **DELETE / UPDATE now work — rowid mapped to a record-batch MERGE** (the crux, solved). The provider
   advertises **all columns as the rowid** (a full-row identity), so DuckDB's rowid-based `PlanDelete`/
   `PlanUpdate` hand `ExecuteDelete`/`ExecuteUpdate` the scanned rows; the catalog builds a delta-rs MERGE
@@ -44,8 +51,9 @@ end on Windows via `test/verify_delta_rs.test` (25 assertions) and a live shell 
     delta-dotnet patch, like the ones we make to engineered-wood.
   - **ALTER** — delta-dotnet has no schema-DDL API.
 - **Not yet wired** (design is below): cloud discovery (v1 lists local roots only; `storage_options` mapping
-  is coded in `StorageOptionsCodec` but unproven), SQL/filter pushdown (scan is a full read), maintenance
-  functions (OPTIMIZE/VACUUM/CHECKPOINT), CDF read (`QueryTableChangesAsync` is wired but untested), MERGE.
+  is coded in `StorageOptionsCodec` but unproven), SQL/filter pushdown (scan is a full read), CDF read
+  (`QueryTableChangesAsync` is wired but untested), a first-class MERGE surface (DML MERGE is used internally
+  for DELETE/UPDATE).
 - **Scan schema note**: the scan uses `ReadAsArrowTableAsync` (schema == the bound `table.Schema()`), NOT
   DataFusion `QueryAsync` "SELECT *" — the latter's output schema diverged from the bound schema and
   **SIGSEGV'd `arrow_ingest`**. Materialize-and-serve is correct-first; streaming + pushdown is the follow-up.
