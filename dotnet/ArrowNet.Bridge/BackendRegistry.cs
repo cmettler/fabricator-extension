@@ -103,7 +103,7 @@ public static class BackendRegistry
         {
             // Default to every shipped provider; a missing/unloadable assembly is skipped below, so listing
             // ArrowNet.AnalysisServices here is harmless when only the SqlServer provider is published.
-            names = "ArrowNet.SqlServer,ArrowNet.AnalysisServices";
+            names = "ArrowNet.SqlServer,ArrowNet.AnalysisServices,ArrowNet.DeltaRs";
         }
         foreach (var assemblyName in names.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {

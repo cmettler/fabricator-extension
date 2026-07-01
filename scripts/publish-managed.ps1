@@ -24,7 +24,12 @@
 param(
     [string]$ExtensionDir = "$PSScriptRoot/../build/release/extension/mssql_net",
     [string]$Rid = "",
-    [string]$Configuration = "Release"
+    [string]$Configuration = "Release",
+    # Opt-in: also publish the delta-rs provider (ArrowNet.DeltaRs + delta-dotnet's ~240 MB native
+    # delta_rs_bridge.dll / delta_kernel_ffi.dll). Off by default so the normal publish stays lean and
+    # doesn't require the delta-dotnet sibling repo + its Rust build. Without it, BackendRegistry simply
+    # skips the (absent) ArrowNet.DeltaRs assembly.
+    [switch]$IncludeDeltaRs
 )
 
 $ErrorActionPreference = "Stop"
@@ -61,5 +66,34 @@ dotnet publish $daxProj `
     --self-contained true `
     -o $managedOut
 if ($LASTEXITCODE -ne 0) { throw "dotnet publish (AnalysisServices) failed ($LASTEXITCODE)" }
+
+# Optional third provider: ArrowNet.DeltaRs (delta-rs via delta-dotnet). Published into the SAME arrownet/
+# dir so the bridge discovers it by assembly name. Brings DeltaLake.dll + the two native Rust DLLs
+# (delta_rs_bridge.dll / delta_kernel_ffi.dll, ~240 MB) — hence opt-in via -IncludeDeltaRs.
+if ($IncludeDeltaRs) {
+    $deltaProj = Join-Path $PSScriptRoot "../dotnet/ArrowNet.DeltaRs/ArrowNet.DeltaRs.csproj"
+    if (Test-Path $deltaProj) {
+        $deltaProj = Resolve-Path $deltaProj
+        Write-Host "Publishing ArrowNet.DeltaRs ($Rid, $Configuration) -> $managedOut"
+        dotnet publish $deltaProj `
+            -c $Configuration `
+            -r $Rid `
+            --self-contained true `
+            -o $managedOut
+        if ($LASTEXITCODE -ne 0) { throw "dotnet publish (DeltaRs) failed ($LASTEXITCODE)" }
+        # Ensure the native Rust DLLs landed (they are Content in DeltaLake.csproj; publish copies them, but
+        # verify + copy from the DeltaLake build output as a backstop so p/invoke resolves them at runtime).
+        foreach ($dll in @("delta_rs_bridge.dll", "delta_kernel_ffi.dll")) {
+            if (-not (Test-Path (Join-Path $managedOut $dll))) {
+                $src = Get-ChildItem -Path (Join-Path $PSScriptRoot "../../delta-dotnet/src/DeltaLake") `
+                    -Recurse -Filter $dll -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($src) { Copy-Item $src.FullName (Join-Path $managedOut $dll) -Force }
+                else { Write-Warning "native $dll not found; ArrowNet.DeltaRs will fail to load at runtime" }
+            }
+        }
+    } else {
+        Write-Warning "ArrowNet.DeltaRs project not found; skipping (-IncludeDeltaRs)."
+    }
+}
 
 Write-Host "Managed bridge published to $managedOut"

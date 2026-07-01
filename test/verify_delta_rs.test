@@ -1,0 +1,83 @@
+# name: test/verify_delta_rs.test
+# description: The delta-rs provider (PROVIDER 'deltars') — Delta Lake via the delta-dotnet binding (delta-rs +
+#              delta-kernel-rs FFI), an opt-in alternative to the pure-C# engineered-wood provider. v1 scope:
+#              read (scan), CREATE/CTAS/INSERT (append), metadata (schemas/tables/columns), time travel
+#              (VERSION), snapshots (commit history), re-attach durability. UPDATE/DELETE/ALTER are deferred
+#              (delta-rs predicate DML doesn't map to DuckDB's rowid model — see docs/delta-rs-provider.md).
+#              Requires the delta-rs native libs published (publish-managed.ps1 -IncludeDeltaRs). Local FS.
+# group: [mssql_net]
+
+require mssql_net
+
+require-env ARROWNET_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/dr' AS lake (TYPE arrownet, PROVIDER 'deltars');
+
+# CTAS (v0 = empty CREATE, v1 = the 3 rows).
+statement ok
+CREATE TABLE lake.main.t AS SELECT * FROM (VALUES (1,'alpha'),(2,'beta'),(3,'gamma')) v(id,name);
+
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
+----
+1	alpha
+2	beta
+3	gamma
+
+# Filter + aggregate (DuckDB applies above the scan — superset-correct).
+query I
+SELECT count(*) FROM lake.main.t WHERE id > 1;
+----
+2
+
+# INSERT (append; v2).
+statement ok
+INSERT INTO lake.main.t VALUES (4,'delta');
+
+query I
+SELECT count(*) FROM lake.main.t;
+----
+4
+
+# Time travel is DEFERRED in v1 (delta-dotnet reads only the latest snapshot via the kernel; a versioned load
+# disables the kernel with no non-kernel read path) — a clean error, not silent latest-data.
+statement error
+SELECT id, name FROM lake.main.t AT (VERSION => 1) ORDER BY id;
+----
+time travel
+
+# Snapshots / commit history (arrownet_delta_snapshots), oldest first.
+query IT
+SELECT version, operation FROM arrownet_delta_snapshots('lake', 'main.t') ORDER BY version;
+----
+0	CREATE TABLE
+1	WRITE
+2	WRITE
+
+# Durability: re-attach and re-read.
+statement ok
+DETACH lake;
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/dr' AS lake (TYPE arrownet, PROVIDER 'deltars');
+
+query I
+SELECT count(*) FROM lake.main.t;
+----
+4
+
+# The alias 'delta-rs' resolves to the same provider.
+statement ok
+DETACH lake;
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/dr' AS lake2 (TYPE arrownet, PROVIDER 'delta-rs');
+
+query I
+SELECT count(*) FROM lake2.main.t;
+----
+4
+
+statement ok
+DETACH lake2;

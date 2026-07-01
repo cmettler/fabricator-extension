@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <RootNamespace>ArrowNet.DeltaRs</RootNamespace>
+    <AssemblyName>ArrowNet.DeltaRs</AssemblyName>
+    <Description>
+      Delta Lake provider (provider name "deltars") backed by delta-rs via the delta-dotnet binding
+      (DeltaLake.Net) — the reference Rust engine. An opt-in alternative to the pure-C# engineered-wood
+      provider ("engineeredwooddelta", the default): production-grade reads/writes/maintenance + MERGE,
+      standard-compliant writes, object_store cloud IO. delta-rs does its own IO (storage_options), so it
+      does NOT use the host-FS bridge. UPDATE/DELETE do not map to DuckDB's rowid model (deferred — see
+      docs/delta-rs-provider.md). Discovered by BackendRegistry only when this assembly + its native libs
+      (delta_rs_bridge.dll / delta_kernel_ffi.dll) are published; skipped otherwise.
+    </Description>
+    <GenerateRuntimeConfigurationFiles>true</GenerateRuntimeConfigurationFiles>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\ArrowNet.Abstractions\ArrowNet.Abstractions.csproj" />
+    <ProjectReference Include="..\ArrowNet.Bridge\ArrowNet.Bridge.csproj" />
+    <!-- delta-dotnet (delta-rs + delta-kernel-rs FFI), sibling repo at D:\repos\delta-dotnet. Multi-targets
+         net472;net8.0;net9.0; a net10 consumer resolves the net9.0 asset. Building this reference triggers
+         delta-dotnet's cargo build of the two native crates (delta_rs_bridge / delta_kernel_ffi). -->
+    <ProjectReference Include="..\..\..\delta-dotnet\src\DeltaLake\DeltaLake.csproj" />
+  </ItemGroup>
+
+</Project>

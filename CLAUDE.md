@@ -1559,7 +1559,24 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   provider), with **`delta` + `deltalake` kept as aliases** (non-breaking — `BackendRegistry` resolves Name +
   Aliases case-insensitively; all `verify_delta_*` tests still ATTACH with `PROVIDER 'delta'`). The distinct
   primary name reserves space for a future delta-rs/delta-kernel production provider. `test/verify_delta_rename.test`
-  (12 — new name + both aliases). Other remaining (OPTIONAL): a `delta-rs` production provider. See docs/delta-catalog.md + docs/filesystem-bridge.md. v47 =
+  (12 — new name + both aliases). Other remaining (OPTIONAL): a `delta-rs` production provider (`deltars`) via the
+  **delta-dotnet** binding — **design + build-feasibility (compiles on Windows, no WSL) in
+  [docs/delta-rs-provider.md](docs/delta-rs-provider.md)**: it's the better reader/writer/maintenance engine
+  (reference impl, standard-compliant writes, OPTIMIZE/Z-ORDER/VACUUM/CHECKPOINT/MERGE, DataFusion pushdown,
+  object_store cloud IO) but its **predicate/SQL DML does not map to DuckDB's rowid model** (no low-level
+  remove/position API → can't do our copy-on-write), so `engineeredwooddelta` stays the default for
+  UPDATE/DELETE/ALTER while `deltars` would coexist as an opt-in read/write/maintenance provider. **v1 BUILT +
+  verified (local FS)**: `dotnet/ArrowNet.DeltaRs` (`DeltaRsBackend`/`DeltaRsCatalog`/`StorageOptionsCodec`),
+  registered in `BackendRegistry` (skipped if not published), opt-in publish via `publish-managed.ps1
+  -IncludeDeltaRs` (adds `DeltaLake.dll` + the ~240 MB native `delta_rs_bridge.dll`/`delta_kernel_ffi.dll`);
+  NO ABI/C++ change. Working: `ATTACH … (PROVIDER 'deltars')` (+ alias `delta-rs`), scan (via
+  `ReadAsArrowTableAsync` — NOT DataFusion `QueryAsync`, whose schema diverged and SIGSEGV'd arrow_ingest),
+  CREATE/CTAS/INSERT (append+overwrite), metadata, snapshots (`HistoryAsync`), re-attach durability;
+  `test/verify_delta_rs.test` (25), engineered-wood suite unregressed. **Deferred (delta-dotnet limitations
+  found): time travel** (delta-dotnet reads only the latest snapshot — a versioned load disables the kernel,
+  `isKernelSupported=false`, no non-kernel read path → clean "not supported" error), **UPDATE/DELETE** (no
+  rowid advertised), **ALTER** (no schema-DDL API); cloud discovery / pushdown / OPTIMIZE-VACUUM-CHECKPOINT /
+  CDF / MERGE not yet wired. See docs/delta-catalog.md + docs/filesystem-bridge.md. v47 =
   **host-FS global table functions**: appended one vtable entry `set_active_opener(opener)` — a per-thread ambient (`AmbientOpener`, mirroring `set_active_txn`) recording the
   calling operator's `ClientContext` so a connection-free GLOBAL host-FS table reader (a lakehouse format)
   resolves DuckDB secrets while reading through the host `fs_*` callbacks; set in the shared `PopulateReturnSchema`
