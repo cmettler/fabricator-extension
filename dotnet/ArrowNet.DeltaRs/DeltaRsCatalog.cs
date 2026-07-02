@@ -37,6 +37,15 @@ public sealed class DeltaRsCatalog : IBackendCatalog
     private readonly bool _schemas;                             // two-level <root>/<schema>/<table> layout
     private readonly bool _changeDataFeed;                      // enable delta.enableChangeDataFeed on CREATE
 
+    // OneLake (Fabric) support: resolved lazily via the Unity Catalog REST API. delta-rs reads OneLake only
+    // with a GUID-based abfss path, so we cache the workspace/lakehouse GUIDs + the discovered tables.
+    private readonly bool _oneLake;
+    private bool _oneLakeResolved;
+    private bool _oneLakeSchemaEnabled;
+    private Guid _workspaceId;
+    private Guid _lakehouseId;
+    private List<(string Schema, string Table)> _oneLakePairs = new();
+
     public DeltaRsCatalog(string connectionString, string? optionsJson)
     {
         var (target, storage) = StorageOptionsCodec.Decode(connectionString);
@@ -44,6 +53,35 @@ public sealed class DeltaRsCatalog : IBackendCatalog
         _storage = storage;
         _schemas = ParseBoolOption(optionsJson, "schemas");
         _changeDataFeed = ParseBoolOption(optionsJson, "change_data_feed");
+        _oneLake = FabricLakehouse.IsOneLake(_root);
+        if (_oneLake)
+        {
+            // OneLake object_store needs these two beyond the SP creds StorageOptionsCodec already mapped
+            // (azure_storage_tenant_id/client_id/client_secret). account_name is always "onelake".
+            _storage["azure_storage_account_name"] = "onelake";
+            _storage["azure_storage_use_fabric_endpoint"] = "true";
+        }
+    }
+
+    /// <summary>Resolves the OneLake lakehouse (GUIDs + schema-enabled flag + table list) via the Unity
+    /// Catalog REST API, once. delta-rs reads require the GUID-based abfss path built from these.</summary>
+    private void EnsureOneLakeResolved()
+    {
+        if (!_oneLake || _oneLakeResolved)
+        {
+            return;
+        }
+        _storage.TryGetValue("azure_storage_tenant_id", out var tenant);
+        _storage.TryGetValue("azure_storage_client_id", out var clientId);
+        _storage.TryGetValue("azure_storage_client_secret", out var clientSecret);
+        var (schemaEnabled, ws, lh, tables) = FabricLakehouse.ResolveOneLakeTables(_root, tenant, clientId, clientSecret);
+        _oneLakeSchemaEnabled = schemaEnabled;
+        _workspaceId = ws;
+        _lakehouseId = lh;
+        // Map UC's schema to our display schema: schema-enabled → the UC schema; flat → "main" (the flat abfss
+        // path omits the schema segment, which the flat TableUri below reproduces).
+        _oneLakePairs = tables.Select(t => (schemaEnabled ? t.Schema : MainSchema, t.Table)).ToList();
+        _oneLakeResolved = true;
     }
 
     /// <summary>Table configuration applied at CREATE (null if none). Enables Change Data Feed when the
@@ -66,14 +104,24 @@ public sealed class DeltaRsCatalog : IBackendCatalog
         return Path.Combine(LocalRootDir, rel);
     }
 
-    /// <summary>The table location as a URI delta-dotnet accepts (file:// for a local root, else the cloud URI).</summary>
+    /// <summary>The table location as a URI delta-dotnet accepts: <c>file://</c> for a local root; a
+    /// GUID-based OneLake abfss path (the only form delta-rs's object_store reads); else the raw cloud URI.</summary>
     private string TableUri(string schema, string table)
     {
-        var rel = _schemas ? $"{schema}/{table}" : table;
+        if (_oneLake)
+        {
+            EnsureOneLakeResolved();
+            // abfss://<wsGuid>@onelake.dfs.fabric.microsoft.com/<lhGuid>/Tables/[<schema>/]<table>. The schema
+            // segment is present iff the lakehouse is schema-enabled (a flat lakehouse maps to "main" with no
+            // segment). Works for both discovered and newly-created tables.
+            string seg = _oneLakeSchemaEnabled ? $"{schema}/" : string.Empty;
+            return $"abfss://{_workspaceId}@onelake.dfs.fabric.microsoft.com/{_lakehouseId}/Tables/{seg}{table}";
+        }
         if (RootIsLocal)
         {
             return new Uri(Path.GetFullPath(LocalTableDir(schema, table))).AbsoluteUri;
         }
+        var rel = _schemas ? $"{schema}/{table}" : table;
         return _root + "/" + rel;
     }
 
@@ -130,10 +178,20 @@ public sealed class DeltaRsCatalog : IBackendCatalog
         return new InMemoryArrayStream(t.Schema(), System.Array.Empty<RecordBatch>());
     }
 
-    /// <summary>Local-FS table discovery: subdirs containing a <c>_delta_log</c>. Cloud discovery is deferred
-    /// (delta-dotnet exposes no directory listing; a cloud v2 would reuse the FabricLakehouse/DFS path).</summary>
+    /// <summary>Table discovery: OneLake → the Unity Catalog REST API (paginated); local FS → subdirs
+    /// containing a <c>_delta_log</c>. Other cloud roots (S3 / plain ADLS) are not yet enumerated (delta-dotnet
+    /// exposes no directory listing).</summary>
     private IEnumerable<(string Schema, string Table)> DiscoverPairs()
     {
+        if (_oneLake)
+        {
+            EnsureOneLakeResolved();
+            foreach (var pair in _oneLakePairs)
+            {
+                yield return pair;
+            }
+            yield break;
+        }
         if (!RootIsLocal || !Directory.Exists(LocalRootDir))
         {
             yield break;

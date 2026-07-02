@@ -1599,9 +1599,14 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `account_name=onelake` + `use_fabric_endpoint=true`) — both the kernel AND DataFusion reads succeed
   (`load_a`→2000 rows); the NAME-based path fails with delta-kernel's "No files in log segment" (that error,
   also from DuckDB's official `delta_scan` on OneLake, was purely name→GUID resolution, NOT a kernel limit).
-  The UC `storage_location` returns GUIDs — exactly the read form. Remaining: wire the OneLake path into
-  `DeltaRsCatalog` (detect root, resolve GUIDs + credential via `FabricLakehouse`, UC-discover, abfss-GUID
-  `TableLocation` + OneLake `storage_options`). See docs/delta-rs-provider.md. v47 =
+  The UC `storage_location` returns GUIDs — exactly the read form. **The delta-rs OneLake path is now WIRED +
+  live-validated**: `ATTACH 'abfss://<ws>@onelake…/<lh>.Lakehouse/Tables' (PROVIDER 'deltars', SECRET
+  <azure_sp>)` → `DeltaRsCatalog` detects the OneLake root, resolves GUIDs + schema-enabled + the UC table list
+  via `FabricLakehouse.ResolveOneLakeTables` (made `public`; `Resolve` → `internal`), builds the GUID-abfss
+  `TableUri`, and augments `storage_options` with `azure_storage_account_name=onelake` +
+  `_use_fabric_endpoint=true` over the SP client-creds (auto-refresh, no static bearer). Validated on
+  `LH_no_schema`: 4 tables discovered under `main`, `load_a`→2000 rows, filter pushdown works. S3/plain-ADLS
+  discovery still needs a lister. See docs/delta-rs-provider.md. v47 =
   **host-FS global table functions**: appended one vtable entry `set_active_opener(opener)` — a per-thread ambient (`AmbientOpener`, mirroring `set_active_txn`) recording the
   calling operator's `ClientContext` so a connection-free GLOBAL host-FS table reader (a lakehouse format)
   resolves DuckDB secrets while reading through the host `fs_*` callbacks; set in the shared `PopulateReturnSchema`

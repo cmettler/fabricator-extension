@@ -59,14 +59,34 @@ end on Windows via `test/verify_delta_rs.test` (25 assertions) and a live shell 
   - **`ReadAsArrowTableAsync` at a version** — delta-dotnet's *kernel* read is latest-only (a versioned load
     sets `isKernelSupported=false`). Sidestepped: time travel reads via QueryAsync (DataFusion), which reads
     the loaded snapshot without the kernel. So time travel works; only the kernel read path is latest-only.
-- **Not yet wired** (into `DeltaRsCatalog`, but both halves now PROVEN live — see below): OneLake cloud
-  discovery + read, a first-class MERGE surface (delta-rs MERGE is used internally for DELETE/UPDATE),
-  TIMESTAMP time travel (wired via `LoadDateTimeAsync`, unverified).
+- **OneLake cloud — WIRED + live-validated** (see below). **Not yet wired**: S3 / plain-ADLS discovery (no
+  lister), a first-class MERGE surface (delta-rs MERGE is used internally for DELETE/UPDATE), TIMESTAMP time
+  travel (wired via `LoadDateTimeAsync`, unverified).
 
-### Cloud (OneLake) — both discovery AND read PROVEN live (2026-07, ready to wire)
+### Cloud (OneLake) — DONE + live-validated (2026-07)
 
-The earlier "unproven / live-gated" conclusion is **superseded** — a live probe against workspace `Test`
-proved both halves work; only the `DeltaRsCatalog` wiring remains (a known implementation, no research left).
+`ATTACH 'abfss://<ws>@onelake.dfs.fabric.microsoft.com/<lh>.Lakehouse/Tables' (TYPE arrownet, PROVIDER
+'deltars', SECRET <azure_sp>)` discovers + reads OneLake tables. Validated live against `LH_no_schema`
+(flat): all 4 tables discovered under `main`, `load_a` → 2000 rows, filter pushdown works.
+
+How it's wired:
+- **Discovery** — `DeltaRsCatalog` detects a OneLake root (`FabricLakehouse.IsOneLake`) and resolves it once
+  via `FabricLakehouse.ResolveOneLakeTables` (workspace/lakehouse GUIDs + schema-enabled flag + the
+  Unity-Catalog-REST table list, paginated). UC reports a flat lakehouse's tables under `dbo`; they map to our
+  `main` (matching the flat abfss path, which omits the schema segment).
+- **Read** — `TableUri` builds the GUID-based abfss path
+  `abfss://<wsGuid>@onelake.dfs.fabric.microsoft.com/<lhGuid>/Tables/[<schema>/]<table>` (the only form
+  object_store reads), and the ctor augments `storage_options` with `azure_storage_account_name=onelake` +
+  `azure_storage_use_fabric_endpoint=true` on top of the SP client-creds from `StorageOptionsCodec` (so
+  object_store auto-refreshes the token — no static bearer). `FabricLakehouse` was made `public` for the
+  cross-assembly reuse (its `Resolve` returning the internal `OneLakeInfo` became `internal`).
+- **Scan / time-travel / snapshots / CDF / DML** all flow through `TableUri` + `storage_options`, so they work
+  on OneLake too (writes untested-live but wired). A OneLake ATTACH of a lakehouse with a very large table is
+  still slow on enumeration (the per-table column materialization, same as engineered-wood — a lazy-columns
+  follow-up).
+
+**Superseded**: the earlier "unproven / live-gated" conclusion — the "No files in log segment" failure was
+purely name→GUID resolution, and the UC `storage_location` returns GUIDs.
 
 1. **Discovery** — via the OneLake **Unity Catalog REST API** (`onelake.table.fabric.microsoft.com/delta/
    <wsGuid>/<lhGuid>/api/2.1/unity-catalog/schemas` + `/tables?schema_name=…`, **paginated** with

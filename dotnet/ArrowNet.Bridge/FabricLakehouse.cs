@@ -30,7 +30,7 @@ namespace ArrowNet.Bridge;
 /// service-principal secret passed to the ATTACH (carried to the catalog as a credential marker on the
 /// connection string, mirroring the DAX provider) — the SAME credential serves the Fabric API + the DFS endpoint.
 /// </summary>
-internal static class FabricLakehouse
+public static class FabricLakehouse
 {
     private const string OneLakeHost = "onelake."; // onelake.dfs.fabric.microsoft.com / onelake.blob...
     // A credential marker appended to the Delta connection string by DeltaBackend.BuildConnectionString when an
@@ -106,7 +106,7 @@ internal static class FabricLakehouse
     /// <c>Tables/</c> then table dirs under each (<c>Tables/&lt;schema&gt;/&lt;table&gt;</c>), flat → table dirs
     /// under <c>Tables/</c> (<c>Tables/&lt;table&gt;</c>) under DuckDB schema "main". <paramref name="credential"/>
     /// authenticates both the Fabric API and the DFS endpoint.</summary>
-    public static OneLakeInfo Resolve(string root, TokenCredential? credential)
+    internal static OneLakeInfo Resolve(string root, TokenCredential? credential)
     {
         var cred = credential ?? new DefaultAzureCredential();
         var (workspaceSeg, lakehouseSeg) = ParseOneLake(root);
@@ -141,6 +141,30 @@ internal static class FabricLakehouse
             Tables = tables,
             DefaultSchema = schemaEnabled ? props!.DefaultSchema : null,
         };
+    }
+
+    /// <summary>Resolves a OneLake lakehouse for the <b>delta-rs</b> provider: workspace + lakehouse GUIDs,
+    /// the schema-enabled flag, and the table list (via the Unity Catalog REST API). delta-rs's object_store
+    /// reads OneLake only with a <b>GUID-based</b> abfss path (<c>abfss://&lt;wsGuid&gt;@onelake.dfs.fabric.
+    /// microsoft.com/&lt;lhGuid&gt;/Tables/…</c>), so the caller builds table paths from these GUIDs. Builds a
+    /// <see cref="ClientSecretCredential"/> from the SP fields (else <see cref="DefaultAzureCredential"/>).</summary>
+    public static (bool SchemaEnabled, Guid WorkspaceId, Guid LakehouseId, List<(string Schema, string Table)> Tables)
+        ResolveOneLakeTables(string root, string? tenantId, string? clientId, string? clientSecret)
+    {
+        TokenCredential cred =
+            (!string.IsNullOrEmpty(tenantId) && !string.IsNullOrEmpty(clientId) && !string.IsNullOrEmpty(clientSecret))
+                ? new ClientSecretCredential(tenantId, clientId, clientSecret)
+                : new DefaultAzureCredential();
+        var (workspaceSeg, lakehouseSeg) = ParseOneLake(root);
+        Guid workspaceId = ResolveWorkspaceId(workspaceSeg, cred);
+        Guid lakehouseId = ResolveLakehouseId(workspaceId, lakehouseSeg, cred);
+        var lakehouse = new Microsoft.Fabric.Api.Lakehouse.ItemsClient(cred)
+                            .GetLakehouse(workspaceId, lakehouseId).Value;
+        bool schemaEnabled = !string.IsNullOrEmpty(lakehouse.Properties?.DefaultSchema);
+        string catalogName = (lakehouse.DisplayName ?? lakehouseSeg) + ".Lakehouse";
+        var uc = ListTablesViaUnityCatalog(workspaceId, lakehouseId, catalogName, cred);
+        var tables = uc.Select(t => (t.Schema, t.Table)).ToList();
+        return (schemaEnabled, workspaceId, lakehouseId, tables);
     }
 
     /// <summary>Lists a OneLake lakehouse's tables via the OneLake <b>Unity Catalog REST API</b>
