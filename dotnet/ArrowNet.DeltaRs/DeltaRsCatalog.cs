@@ -522,9 +522,18 @@ public sealed class DeltaRsCatalog : IBackendCatalog
 
     public void DropTable(string schemaName, string tableName, bool ifExists)
     {
+        if (_oneLake)
+        {
+            // Recursive DFS delete of the table folder (idempotent). The GUID-based abfss TableUri maps to the
+            // correct OneLake DFS URL, same as reads. Reuses the FabricLakehouse delete the engineered-wood
+            // provider uses live.
+            var (tenant, clientId, clientSecret) = OneLakeCreds();
+            FabricLakehouse.DeleteOneLakeDirectory(TableUri(schemaName, tableName), tenant, clientId, clientSecret);
+            return;
+        }
         if (!RootIsLocal)
         {
-            throw Unsupported("DROP TABLE on a non-local delta-rs catalog (cloud recursive delete deferred)");
+            throw Unsupported("DROP TABLE on a non-local delta-rs catalog (S3/plain-ADLS recursive delete deferred)");
         }
         var dir = LocalTableDir(schemaName, tableName);
         if (Directory.Exists(dir))
@@ -535,6 +544,16 @@ public sealed class DeltaRsCatalog : IBackendCatalog
         {
             throw new InvalidOperationException($"delta-rs: table {schemaName}.{tableName} does not exist.");
         }
+    }
+
+    /// <summary>The SP fields (tenant/client/secret) StorageOptionsCodec mapped into <see cref="_storage"/> —
+    /// used to mint a credential for the OneLake DFS management ops (DROP). Nulls fall back to a default chain.</summary>
+    private (string? Tenant, string? ClientId, string? ClientSecret) OneLakeCreds()
+    {
+        _storage.TryGetValue("azure_storage_tenant_id", out var tenant);
+        _storage.TryGetValue("azure_storage_client_id", out var clientId);
+        _storage.TryGetValue("azure_storage_client_secret", out var clientSecret);
+        return (tenant, clientId, clientSecret);
     }
 
     public void CreateSchema(string schemaName, bool ifNotExists)

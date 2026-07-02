@@ -148,13 +148,27 @@ public static class FabricLakehouse
     /// reads OneLake only with a <b>GUID-based</b> abfss path (<c>abfss://&lt;wsGuid&gt;@onelake.dfs.fabric.
     /// microsoft.com/&lt;lhGuid&gt;/Tables/…</c>), so the caller builds table paths from these GUIDs. Builds a
     /// <see cref="ClientSecretCredential"/> from the SP fields (else <see cref="DefaultAzureCredential"/>).</summary>
+    /// <summary>A service-principal credential from the SP fields, or <see cref="DefaultAzureCredential"/> when
+    /// they're absent (keeps Azure.Identity in the Bridge so the delta-rs provider passes plain strings).</summary>
+    public static TokenCredential MintCredential(string? tenantId, string? clientId, string? clientSecret) =>
+        (!string.IsNullOrEmpty(tenantId) && !string.IsNullOrEmpty(clientId) && !string.IsNullOrEmpty(clientSecret))
+            ? new ClientSecretCredential(tenantId, clientId, clientSecret)
+            : new DefaultAzureCredential();
+
+    /// <summary>DROP a OneLake table folder (recursive DFS delete) using SP fields — for the delta-rs provider,
+    /// which holds the SP creds as strings, not a <see cref="TokenCredential"/>.</summary>
+    public static void DeleteOneLakeDirectory(string abfssDir, string? tenantId, string? clientId, string? clientSecret) =>
+        DeleteDirectory(abfssDir, MintCredential(tenantId, clientId, clientSecret));
+
+    /// <summary>RENAME a OneLake table folder (atomic DFS rename) using SP fields.</summary>
+    public static void RenameOneLakeDirectory(string abfssSrc, string abfssDest,
+                                              string? tenantId, string? clientId, string? clientSecret) =>
+        RenameDirectory(abfssSrc, abfssDest, MintCredential(tenantId, clientId, clientSecret));
+
     public static (bool SchemaEnabled, Guid WorkspaceId, Guid LakehouseId, List<(string Schema, string Table)> Tables)
         ResolveOneLakeTables(string root, string? tenantId, string? clientId, string? clientSecret)
     {
-        TokenCredential cred =
-            (!string.IsNullOrEmpty(tenantId) && !string.IsNullOrEmpty(clientId) && !string.IsNullOrEmpty(clientSecret))
-                ? new ClientSecretCredential(tenantId, clientId, clientSecret)
-                : new DefaultAzureCredential();
+        TokenCredential cred = MintCredential(tenantId, clientId, clientSecret);
         var (workspaceSeg, lakehouseSeg) = ParseOneLake(root);
         Guid workspaceId = ResolveWorkspaceId(workspaceSeg, cred);
         Guid lakehouseId = ResolveLakehouseId(workspaceId, lakehouseSeg, cred);

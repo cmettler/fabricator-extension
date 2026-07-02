@@ -100,7 +100,9 @@ How it's wired:
   object_store auto-refreshes the token — no static bearer). `FabricLakehouse` was made `public` for the
   cross-assembly reuse (its `Resolve` returning the internal `OneLakeInfo` became `internal`).
 - **Scan / time-travel / snapshots / CDF / DML** all flow through `TableUri` + `storage_options`, so they work
-  on OneLake too (writes untested-live but wired). A OneLake ATTACH of a lakehouse with a very large table is
+  on OneLake too (writes untested-live but wired). **DROP TABLE** on OneLake does a recursive DFS delete
+  (`FabricLakehouse.DeleteOneLakeDirectory` on the GUID-abfss path — the same delete the engineered-wood
+  provider uses live); OneLake **RENAME** is deferred (a DFS-rename path-form nuance, untestable locally). A OneLake ATTACH of a lakehouse with a very large table is
   still slow on *full enumeration* (`information_schema.tables` etc.) — the per-table column materialization,
   same as engineered-wood. **This is NOT fixable by "lazy columns"** (investigated): DuckDB's
   `duckdb_tables`/`duckdb_columns` both enumerate via `SchemaEntry::Scan(TABLE_ENTRY)` and read the column list
