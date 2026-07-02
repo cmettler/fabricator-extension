@@ -56,6 +56,10 @@ internal static class CustomFunctions
         // IO through DuckDB's FileSystem + secrets. A provider-agnostic core reader (lives in the Bridge);
         // declared here because SqlServer is the always-present default backend (same as arrownet_render).
         new ArrowNet.Bridge.DeltaGlobalTableFunction(),
+        // NATIVE-READ pre-spike: arrownet_delta_native_scan(path) — engineered-wood lists the exact active files,
+        // DuckDB's native parquet reader reads them via read_parquet (cached, over onelake:// for OneLake).
+        // Plain tables only (no DV/partition/pushdown yet). See docs/multifile-delta.md Phase A.
+        new ArrowNet.Bridge.DeltaNativeScanFunction(),
         // HOST-FS WRITE spike: arrownet_delta_write_demo(path) writes a fixed 5-row Delta table via the host-FS
         // write callbacks (put-if-absent commit), returning (version, rows_written). Proves the write bridge.
         new ArrowNet.Bridge.DeltaWriteDemoFunction(),

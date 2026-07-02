@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -116,6 +117,94 @@ public sealed class DeltaGlobalTableFunction : ITableFunction
                     }
                 }
                 return values;
+            }
+        }
+
+        public void Dispose() { }
+    }
+}
+
+/// <summary>
+/// <c>arrownet_delta_native_scan(path)</c> — the native-read pre-spike (docs/multifile-delta.md Phase A):
+/// engineered-wood supplies the EXACT active data-file list + schema (the log/snapshot layer), and DuckDB's
+/// <b>native parquet reader</b> reads the files via <c>read_parquet([...])</c> run on the host engine
+/// (<see cref="Host.Query"/>) — so the read gets DuckDB's tuned reader + <c>ExternalFileCache</c> (over the
+/// <c>onelake://</c> subsystem for OneLake) instead of engineered-wood's C# parquet reader. Contrast
+/// <see cref="DeltaGlobalTableFunction"/> (<c>arrownet_delta_scan</c>), which reads the data in C#.
+///
+/// <para>First slice — plain tables: no deletion vectors, no partition columns, no pushdown (DuckDB projects +
+/// filters above the scan). DV/partition/pushdown + folding into the ATTACH catalog are follow-up slices.
+/// Credential-free where the log lives on a local/host-FS path; OneLake needs the ambient credential for the
+/// log read (works from the ATTACH catalog path — a later slice).</para>
+/// </summary>
+public sealed class DeltaNativeScanFunction : ITableFunction
+{
+    public string Name => "arrownet_delta_native_scan";
+    public Schema Parameters => new Schema(new[] { new Field("path", StringType.Default, nullable: false) }, null);
+
+    public IArrowTableFunctionBinding Bind(RecordBatch args)
+    {
+        var path = ((StringArray)args.Column(0)).GetString(0)
+                   ?? throw new System.ArgumentException("arrownet_delta_native_scan: path must not be NULL");
+        // Connection-free global reader → clear any stale Fabric credential (host-FS path for the log read).
+        AmbientOneLakeCredential.Current = null;
+        var opener = AmbientOpener.Current;
+        var schema = DeltaReader.GetSchema(opener, path);              // engineered-wood: the log → schema
+        var files = DeltaReader.GetActiveFileUris(opener, path);      // engineered-wood: the exact active file set
+        return new NativeBinding(schema, files);
+    }
+
+    private sealed class NativeBinding : IArrowTableFunctionBinding
+    {
+        private readonly Schema _schema;
+        private readonly IReadOnlyList<string> _files;
+
+        public NativeBinding(Schema schema, IReadOnlyList<string> files)
+        {
+            _schema = schema;
+            _files = files;
+        }
+
+        public Schema OutputSchema => _schema;
+        public bool SupportsPushdown => false; // DuckDB projects + filters above the read_parquet scan
+
+        public IAsyncEnumerable<RecordBatch> Execute(TableFunctionScan scan, CancellationToken ct = default)
+        {
+            if (_files.Count == 0)
+            {
+                return EmptyStream();
+            }
+            // Read the EXACT active files through the host's native parquet reader (cached; over onelake:// for
+            // OneLake). A fresh host connection runs this (Host.Query) — reentrancy-safe by design.
+            var list = string.Join(",", _files.Select(f => "'" + f.Replace("'", "''") + "'"));
+            var stream = Host.Query($"SELECT * FROM read_parquet([{list}])");
+            return Drain(stream, ct);
+        }
+
+        private static async IAsyncEnumerable<RecordBatch> EmptyStream()
+        {
+            await Task.CompletedTask.ConfigureAwait(false);
+            yield break;
+        }
+
+        private static async IAsyncEnumerable<RecordBatch> Drain(
+            IArrowArrayStream stream, [EnumeratorCancellation] CancellationToken ct)
+        {
+            try
+            {
+                while (true)
+                {
+                    var b = await stream.ReadNextRecordBatchAsync(ct).ConfigureAwait(false);
+                    if (b is null)
+                    {
+                        break;
+                    }
+                    yield return b;
+                }
+            }
+            finally
+            {
+                stream.Dispose();
             }
         }
 

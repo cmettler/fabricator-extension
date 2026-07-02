@@ -1,4 +1,6 @@
+using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using Apache.Arrow;
@@ -21,6 +23,45 @@ namespace ArrowNet.Bridge;
 /// </summary>
 internal static class DeltaReader
 {
+    /// <summary>The EXACT active data-file URIs of the current snapshot (the `add` set, NOT a glob — a glob would
+    /// include tombstoned files). Relative `add.path`s are resolved against the table root; an abfss-OneLake root
+    /// is rewritten to the <c>onelake://</c> scheme so DuckDB's native reader routes them to our FileSystem
+    /// subsystem (+ ExternalFileCache). Used by the native-read path (docs/multifile-delta.md Phase A pre-spike):
+    /// engineered-wood lists the files, DuckDB's native parquet reader reads them via read_parquet.</summary>
+    public static IReadOnlyList<string> GetActiveFileUris(nint opener, string path)
+    {
+        var fs = TableFileSystems.Create(opener, path);
+        var table = DeltaTable.OpenAsync(fs).GetAwaiter().GetResult();
+        try
+        {
+            var root = ToReadableRoot(path);
+            var uris = new List<string>();
+            foreach (var add in table.CurrentSnapshot.ActiveFiles.Values)
+            {
+                uris.Add(root + "/" + add.Path.Replace('\\', '/').TrimStart('/'));
+            }
+            return uris;
+        }
+        finally
+        {
+            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+    }
+
+    // The table root as a URI DuckDB's native reader can open: an abfss-OneLake root → onelake:// (our VFS
+    // subsystem, cached); everything else (local / s3 / already onelake://) passes through unchanged.
+    private static string ToReadableRoot(string path)
+    {
+        var p = path.Replace('\\', '/').TrimEnd('/');
+        if (p.StartsWith("abfss://", StringComparison.OrdinalIgnoreCase)
+            && p.Contains("onelake", StringComparison.OrdinalIgnoreCase))
+        {
+            var (_, fsName, under) = OneLakeDataLakeFileSystem.ParseAbfss(p);
+            return "onelake://" + fsName + "/" + under;
+        }
+        return p;
+    }
+
     /// <summary>Opens the Delta table at <paramref name="path"/> and returns its Arrow schema only (no data
     /// read). Used at table-function bind. <paramref name="opener"/> = the calling operator's ClientContext.</summary>
     public static Schema GetSchema(nint opener, string path)

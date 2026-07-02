@@ -1,6 +1,18 @@
-# MultiFileReader + engineered-wood — native-parquet Delta path (design, DEFERRED)
+# MultiFileReader + engineered-wood — native-parquet Delta path (design; Phase-A pre-spike BUILT)
 
-> Status: **design note — nothing built.** Source-grounded 2026-07-02 against `D:\repos\duckdb-delta`
+> **Phase-A pre-spike DONE (2026-07-03):** `arrownet_delta_native_scan(path)` — engineered-wood lists the EXACT
+> active data files + schema (`DeltaReader.GetActiveFileUris`, the `add` set, NOT a glob), and DuckDB's **native
+> parquet reader** reads them via `read_parquet([...])` run on the host engine (`Host.Query`/host_query). Matches
+> the C# reader (`arrownet_delta_scan`) row-for-row on the local fixture (`test/verify_delta_native_scan.test`,
+> 36 assertions); for OneLake the file URIs are rewritten to `onelake://` so the read is native **and cached**
+> (ExternalFileCache, confirmed). C#-only (no ABI — reuses the `onelake://` FS v56 + host_query); `parquet` is now
+> statically linked into the test binaries (`extension_config.cmake`). **First slice: plain tables** — no deletion
+> vectors, no partition columns, no pushdown (DuckDB projects/filters above the scan); OneLake needs the ambient
+> credential for the log read (works from the ATTACH catalog path — a later slice). This validates the whole
+> "engineered-wood lists → DuckDB reads natively" architecture cheaply, before the full `MultiFileList` C++ work.
+> Remaining below is the full design.
+
+> Status: design note. Source-grounded 2026-07-02 against `D:\repos\duckdb-delta`
 > (the official DuckDB Delta extension) and DuckDB v1.5.4's `MultiFileReader` API (submodule
 > `duckdb/src/include/duckdb/common/multi_file/`). Captures integrating DuckDB's native, tuned parquet
 > reader/writer with a **C# metadata layer** (engineered-wood), so DuckDB does all parquet I/O while

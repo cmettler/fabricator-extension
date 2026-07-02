@@ -16,3 +16,8 @@ duckdb_extension_load(json)
 # TIMESTAMPTZ <-> SQL Server datetime/datetimeoffset value conversions (warehouse-support §3.1) under a
 # non-UTC session zone. Same v0.0.1 autoload problem -> link it statically.
 duckdb_extension_load(icu)
+
+# And `parquet` — the native-read path (arrownet_delta_native_scan, docs/multifile-delta.md Phase A) runs
+# `read_parquet([...])` on the host engine to read Delta data files with DuckDB's native reader. The shell
+# ships parquet, but the test binaries need it linked (v0.0.1 can't autoload it).
+duckdb_extension_load(parquet)
