@@ -1557,7 +1557,14 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `RemoveFile` carries the file's DV so it matches the active `(path, DV)` entry (without that the old file stayed
   active → duplicated rows — the bug found in testing). Verified local (`test/verify_delta_catalog_dv.test`, 48 —
   DV delete + composition + UPDATE-on-DV + post-UPDATE DV delete + re-attach) + delta-kernel `delta_scan` read-back;
-  copy-on-write delete (28)/update (63)/write (31) unregressed. **OCC RETRY DONE (concurrent writers):**
+  copy-on-write delete (28)/update (63)/write (31) unregressed. **DV write now also live-validated on OneLake
+  (2026-07):** CTAS + `DELETE … WHERE id IN (2,4)` on `LH.dbo` with `deletion_vectors true` produced a v2 commit
+  that `remove`+`add`s the SAME file (numRecords 5 unchanged, no rewrite) with an **inline `deletionVector`**
+  (`storageType:"i"`, `cardinality:2` = the two deleted rows) + row-tracking `baseRowId`/`defaultRowCommitVersion`;
+  our read returned the correct survivors (1,3,5). Confirms the RoaringBitmap format fix writes correctly to
+  OneLake. (Still open: whether Fabric's OneLake CONVERTER / SQL endpoint reads a reader-v3+DV table — a separate
+  feature-gating question; contrast the delta-rs provider, which copy-on-writes DELETE and produces no DV.)
+  **OCC RETRY DONE (concurrent writers):**
   engineered-wood `WriteCommitAsync` throws `DeltaConflictException` when a concurrent writer takes the target
   version; `DeltaWriter.Write`/`Create` (append/CTAS/create) catch it and retry by reopening at the new latest
   version (bounded `MaxCommitAttempts=16`) — the data is snapshot-independent so re-commit is safe. Rowid
