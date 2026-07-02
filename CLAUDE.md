@@ -1571,8 +1571,10 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   -IncludeDeltaRs` (adds `DeltaLake.dll` + the ~240 MB native `delta_rs_bridge.dll`/`delta_kernel_ffi.dll`);
   NO ABI/C++ change. Working: `ATTACH … (PROVIDER 'deltars')` (+ alias `delta-rs`), scan (via
   `ReadAsArrowTableAsync` — NOT DataFusion `QueryAsync`, whose schema diverged and SIGSEGV'd arrow_ingest),
-  CREATE/CTAS/INSERT (append+overwrite), metadata, snapshots (`HistoryAsync`), **DELETE + UPDATE**, re-attach
-  durability; `test/verify_delta_rs.test` (51), engineered-wood suite unregressed. **DELETE/UPDATE = rowid →
+  CREATE/CTAS/INSERT/**COPY** (append+overwrite; `COPY … (FORMAT mssql_net)`: CREATE_TABLE false→append,
+  default→overwrite, new-table→create; `SCHEMA_MODE 'overwrite'` adopts schema, `'merge'` errors cleanly since
+  delta-dotnet's InsertOptions is overwrite-only), metadata, snapshots (`HistoryAsync`), **DELETE + UPDATE**,
+  re-attach durability; `test/verify_delta_rs*.test` (56/12/27/31/36/23), engineered-wood suite unregressed. **DELETE/UPDATE = rowid →
   record-batch MERGE** (the DML crux, solved): the provider advertises ALL columns as the rowid, so DuckDB's
   rowid `PlanDelete`/`PlanUpdate` give `ExecuteDelete`/`ExecuteUpdate` the scanned rows; the catalog builds a
   delta-rs MERGE matching them on every column NULL-safe (`WHEN MATCHED THEN DELETE` / `… UPDATE SET`, source

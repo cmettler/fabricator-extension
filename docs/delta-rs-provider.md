@@ -18,13 +18,15 @@ end on Windows via `test/verify_delta_rs.test` (25 assertions) and a live shell 
 
 - **Working**: `ATTACH … (TYPE arrownet, PROVIDER 'deltars')` (+ alias `'delta-rs'`); discovery (local FS);
   metadata (schemas/tables/columns); **scan** (owned `Apache.Arrow.Table` via `ReadAsArrowTableAsync`, streamed
-  as batches); **filter pushdown** (FilterNode → DataFusion WHERE, see below); **CREATE/CTAS/INSERT** (append +
-  overwrite); **DELETE + UPDATE** (rowid → record-batch MERGE, see below); **time travel** (`AT (VERSION => n)`,
+  as batches); **filter pushdown** (FilterNode → DataFusion WHERE, see below); **CREATE/CTAS/INSERT/COPY**
+  (append + overwrite; `COPY … (FORMAT mssql_net)` — `CREATE_TABLE false`→append, default→overwrite, new
+  table→create; `SCHEMA_MODE 'overwrite'` adopts the incoming schema; `'merge'` errors cleanly, delta-dotnet
+  being overwrite-only); **DELETE + UPDATE** (rowid → record-batch MERGE, see below); **time travel** (`AT (VERSION => n)`,
   via QueryAsync, see below); **snapshots** (`arrownet_delta_snapshots` → `HistoryAsync`); **Change Data Feed**
   (`change_data_feed` option + `arrownet_delta_changes`, see below); **maintenance** (OPTIMIZE / Z-ORDER /
   VACUUM / CHECKPOINT, see below); re-attach durability. Tests: `verify_delta_rs.test` (56) +
-  `_maintenance` (12) + `_pushdown` (27) + `_cdf` (31) + `_time_travel` (36). No regression to the
-  engineered-wood provider.
+  `_maintenance` (12) + `_pushdown` (27) + `_cdf` (31) + `_time_travel` (36) + `_copy` (23). No regression to
+  the engineered-wood provider.
 - **Filter pushdown**: a scan with a filter runs via QueryAsync with a DataFusion WHERE (file/stats/row-group
   skipping); the superset-safe FilterNode renders compare / and·or / is_null / in, anything else → TRUE
   (dropped, DuckDB re-applies above the scan). Filtered results materialize + advertise the actual batch schema

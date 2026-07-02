@@ -423,28 +423,46 @@ public sealed class DeltaRsCatalog : IBackendCatalog
 
     // ---- write (INSERT / CTAS / COPY) ----
 
+    // INSERT / CTAS / COPY. Semantics (matching the engineered-wood provider): createTable (CTAS + COPY's
+    // default) or replace (CREATE OR REPLACE) => the table becomes exactly these rows (Overwrite); a plain
+    // INSERT or COPY with CREATE_TABLE false => Append. A COPY SCHEMA_MODE 'overwrite' also adopts the incoming
+    // schema (OverwriteSchema); 'merge' (append + union new columns) is NOT expressible via delta-dotnet's
+    // InsertOptions (OverwriteSchema is overwrite-only and cannot combine with Append) → clean error.
     public long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable,
                            bool replace, bool checkConstraints, long txnId, IReadOnlyList<string>? partitionColumns,
                            IReadOnlyList<string>? sortColumns, string? schemaMode)
     {
         // sortColumns (SORTED BY) is a warehouse CLUSTER BY concept — Delta doesn't cluster; ignored.
+        if (string.Equals(schemaMode, "merge", StringComparison.OrdinalIgnoreCase))
+        {
+            throw Unsupported("COPY SCHEMA_MODE 'merge' — delta-dotnet's InsertOptions supports only schema "
+                + "OVERWRITE; use SCHEMA_MODE 'overwrite', or the engineeredwooddelta provider for merge");
+        }
         bool overwriteSchema = string.Equals(schemaMode, "overwrite", StringComparison.OrdinalIgnoreCase);
         var schema = data.Schema;
+
+        // Create the table only if it doesn't exist yet (empty, schema-only + CDF config/partitions), then
+        // write. An existing table with createTable=true (COPY default / CTAS-replace) is OVERWRITTEN, not an
+        // error — the previous ErrorIfExists broke COPY into an existing table.
+        ITable? existing = TryOpen(schemaName, tableName);
         ITable table;
-        if (createTable)
+        bool overwrite;
+        if (existing is null)
         {
             var create = new TableCreateOptions(TableUri(schemaName, tableName), schema)
             {
                 StorageOptions = _storage,
                 PartitionBy = (partitionColumns ?? new List<string>()).ToList(),
-                SaveMode = replace ? SaveMode.Overwrite : SaveMode.ErrorIfExists,
+                SaveMode = SaveMode.ErrorIfExists,
                 Configuration = CreateConfiguration(),
             };
             table = Run(_engine.CreateTableAsync(create, default));
+            overwrite = false; // fresh empty table created with this schema → Append == the rows
         }
         else
         {
-            table = Open(schemaName, tableName);
+            table = existing;
+            overwrite = createTable || replace || overwriteSchema;
         }
 
         using (table)
@@ -454,9 +472,14 @@ public sealed class DeltaRsCatalog : IBackendCatalog
             {
                 if (batches.Count > 0)
                 {
-                    var save = (!createTable && replace) || overwriteSchema ? SaveMode.Overwrite : SaveMode.Append;
-                    Run(table.InsertAsync(batches, schema,
-                        new InsertOptions { SaveMode = save, OverwriteSchema = overwriteSchema }, default));
+                    // OverwriteSchema only when replacing an existing table's schema (a fresh table already has
+                    // this schema; Append + OverwriteSchema is an invalid InsertOptions combination).
+                    bool adoptSchema = overwriteSchema && existing is not null;
+                    Run(table.InsertAsync(batches, schema, new InsertOptions
+                    {
+                        SaveMode = overwrite ? SaveMode.Overwrite : SaveMode.Append,
+                        OverwriteSchema = adoptSchema,
+                    }, default));
                 }
                 return rows;
             }
@@ -467,6 +490,19 @@ public sealed class DeltaRsCatalog : IBackendCatalog
                     b.Dispose();
                 }
             }
+        }
+    }
+
+    /// <summary>Opens the table if it exists, else null (a table-not-found error becomes "does not exist").</summary>
+    private ITable? TryOpen(string schemaName, string tableName)
+    {
+        try
+        {
+            return Open(schemaName, tableName);
+        }
+        catch
+        {
+            return null;
         }
     }
 
