@@ -62,11 +62,16 @@ SELECT count(*) FROM (DESCRIBE lake.main.ow);
 ----
 3
 
-# SCHEMA_MODE 'merge' is not supported by delta-dotnet (overwrite-only) — clean error.
-statement error
+# SCHEMA_MODE 'merge' — append + union the new source column (old rows read NULL). The bridge maps a plain
+# Append (OverwriteSchema=false) to delta-rs SchemaMode::Merge, so merge = force Append.
+statement ok
 COPY (SELECT 5 AS id, 'e' AS name, 42 AS extra) TO 'lake.main.t' (FORMAT mssql_net, SCHEMA_MODE 'merge');
+
+query ITI
+SELECT id, name, extra FROM lake.main.t ORDER BY id;
 ----
-merge
+5	e	42
+9	z	NULL
 
 statement ok
 DETACH lake;

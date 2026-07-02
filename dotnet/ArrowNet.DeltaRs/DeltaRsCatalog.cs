@@ -425,19 +425,16 @@ public sealed class DeltaRsCatalog : IBackendCatalog
 
     // INSERT / CTAS / COPY. Semantics (matching the engineered-wood provider): createTable (CTAS + COPY's
     // default) or replace (CREATE OR REPLACE) => the table becomes exactly these rows (Overwrite); a plain
-    // INSERT or COPY with CREATE_TABLE false => Append. A COPY SCHEMA_MODE 'overwrite' also adopts the incoming
-    // schema (OverwriteSchema); 'merge' (append + union new columns) is NOT expressible via delta-dotnet's
-    // InsertOptions (OverwriteSchema is overwrite-only and cannot combine with Append) → clean error.
+    // INSERT or COPY with CREATE_TABLE false => Append. COPY SCHEMA_MODE 'overwrite' replaces data + adopts the
+    // incoming schema (InsertOptions.OverwriteSchema → delta-rs SchemaMode::Overwrite). SCHEMA_MODE 'merge'
+    // appends + unions new source columns (old rows read NULL): a plain Append with OverwriteSchema=false
+    // already maps to delta-rs SchemaMode::Merge in the bridge, so merge = force Append.
     public long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable,
                            bool replace, bool checkConstraints, long txnId, IReadOnlyList<string>? partitionColumns,
                            IReadOnlyList<string>? sortColumns, string? schemaMode)
     {
         // sortColumns (SORTED BY) is a warehouse CLUSTER BY concept — Delta doesn't cluster; ignored.
-        if (string.Equals(schemaMode, "merge", StringComparison.OrdinalIgnoreCase))
-        {
-            throw Unsupported("COPY SCHEMA_MODE 'merge' — delta-dotnet's InsertOptions supports only schema "
-                + "OVERWRITE; use SCHEMA_MODE 'overwrite', or the engineeredwooddelta provider for merge");
-        }
+        bool merge = string.Equals(schemaMode, "merge", StringComparison.OrdinalIgnoreCase);
         bool overwriteSchema = string.Equals(schemaMode, "overwrite", StringComparison.OrdinalIgnoreCase);
         var schema = data.Schema;
 
@@ -462,7 +459,8 @@ public sealed class DeltaRsCatalog : IBackendCatalog
         else
         {
             table = existing;
-            overwrite = createTable || replace || overwriteSchema;
+            // merge is always an append (schema union); otherwise createTable/replace/overwrite => overwrite.
+            overwrite = !merge && (createTable || replace || overwriteSchema);
         }
 
         using (table)
@@ -473,7 +471,8 @@ public sealed class DeltaRsCatalog : IBackendCatalog
                 if (batches.Count > 0)
                 {
                     // OverwriteSchema only when replacing an existing table's schema (a fresh table already has
-                    // this schema; Append + OverwriteSchema is an invalid InsertOptions combination).
+                    // this schema; Append + OverwriteSchema is invalid). Append with OverwriteSchema=false is
+                    // SchemaMode::Merge in the bridge — that IS the 'merge' behavior (union new columns).
                     bool adoptSchema = overwriteSchema && existing is not null;
                     Run(table.InsertAsync(batches, schema, new InsertOptions
                     {
