@@ -1588,7 +1588,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   reads the loaded snapshot, sidestepping the kernel-only `ReadAsArrowTableAsync`; composes with pushdown;
   `_time_travel` 36; VERSION 0 reads latest — delta-dotnet `Version=0` sentinel), and **Change Data Feed**
   (`change_data_feed` ATTACH option + `arrownet_delta_changes`; `_cdf` 31) all work. **Deferred: ALTER** (no
-  delta-dotnet schema-DDL API); **not yet wired**: TIMESTAMP travel (wired, unverified), a first-class MERGE
+  delta-dotnet schema-DDL API); **not yet wired**: a first-class MERGE
   surface, and the `DeltaRsCatalog` OneLake wiring (both halves now PROVEN live — see next). **OneLake via the
   Unity Catalog REST API**: OneLake exposes a Unity-Catalog-compatible REST API
   (`onelake.table.fabric.microsoft.com/delta/<wsGuid>/<lhGuid>/api/2.1/unity-catalog/schemas` + `/tables`,

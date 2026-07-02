@@ -34,7 +34,8 @@ end on Windows via `test/verify_delta_rs.test` (25 assertions) and a live shell 
 - **Time travel** (`AT (VERSION => n)`): reads via QueryAsync (DataFusion reads the *loaded* snapshot) — NOT
   `ReadAsArrowTableAsync`, which needs the kernel and can't read a non-latest version. Composes with filter
   pushdown. *Caveat*: `VERSION 0` reads as latest (delta-dotnet treats `Version=0` as a "latest" sentinel; v0
-  is our empty CREATE commit anyway). TIMESTAMP travel is wired (`LoadDateTimeAsync`) but not yet verified.
+  is our empty CREATE commit anyway). **TIMESTAMP travel works too** (`LoadDateTimeAsync` resolves the version
+  as of the instant): `now()`/future → the latest snapshot, an instant before commit-0 → the empty v0.
 - **Change Data Feed**: `ATTACH '(… change_data_feed true)'` enables `delta.enableChangeDataFeed` on tables
   created in the catalog; read the row-level feed via `arrownet_delta_changes('<catalog>', '<schema.>table',
   from [, to])` → `QueryTableChangesAsync` (`_change_type` / `_commit_version` / `_commit_timestamp`).
@@ -62,8 +63,7 @@ end on Windows via `test/verify_delta_rs.test` (25 assertions) and a live shell 
     sets `isKernelSupported=false`). Sidestepped: time travel reads via QueryAsync (DataFusion), which reads
     the loaded snapshot without the kernel. So time travel works; only the kernel read path is latest-only.
 - **OneLake cloud — WIRED + live-validated** (see below). **Not yet wired**: S3 / plain-ADLS discovery (no
-  lister), a first-class MERGE surface (see note), TIMESTAMP time travel (wired via `LoadDateTimeAsync`,
-  unverified).
+  lister) and a first-class MERGE surface (see note).
 
   **A first-class MERGE surface (noted, not built).** We already call delta-dotnet's `MergeAsync` *internally*
   as the engine for rowid DELETE/UPDATE (match the scanned rows on all columns → `WHEN MATCHED THEN
