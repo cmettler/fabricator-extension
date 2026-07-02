@@ -1562,8 +1562,12 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   that `remove`+`add`s the SAME file (numRecords 5 unchanged, no rewrite) with an **inline `deletionVector`**
   (`storageType:"i"`, `cardinality:2` = the two deleted rows) + row-tracking `baseRowId`/`defaultRowCommitVersion`;
   our read returned the correct survivors (1,3,5). Confirms the RoaringBitmap format fix writes correctly to
-  OneLake. (Still open: whether Fabric's OneLake CONVERTER / SQL endpoint reads a reader-v3+DV table — a separate
-  feature-gating question; contrast the delta-rs provider, which copy-on-writes DELETE and produces no DV.)
+  OneLake. **FABRIC READS IT — confirmed (user-verified live, 2026-07):** the reader-v3 + inline-DV table
+  (`LH.dbo.arrownet_ewdv_live`) registers in Fabric AND is **SQL-endpoint-queryable** with the deleted rows
+  removed. So engineered-wood's DV mode is END-TO-END validated on OneLake: DV write → our read → Fabric SQL
+  endpoint. (This supersedes the earlier row-tracking/DV Fabric-conversion failures, which were the pre-fix
+  byte-format/protocol bugs; the current inline-DV format is Fabric-readable. Contrast the delta-rs provider,
+  which copy-on-writes DELETE and produces no DV.)
   **OCC RETRY DONE (concurrent writers):**
   engineered-wood `WriteCommitAsync` throws `DeltaConflictException` when a concurrent writer takes the target
   version; `DeltaWriter.Write`/`Create` (append/CTAS/create) catch it and retry by reopening at the new latest
