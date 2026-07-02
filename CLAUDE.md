@@ -1598,8 +1598,11 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   superset-safe/unpushable→TRUE; `_pushdown` 27), **time travel** (`AT (VERSION => n)` via QueryAsync — DataFusion
   reads the loaded snapshot, sidestepping the kernel-only `ReadAsArrowTableAsync`; composes with pushdown;
   `_time_travel` 36; VERSION 0 reads latest — delta-dotnet `Version=0` sentinel), and **Change Data Feed**
-  (`change_data_feed` ATTACH option + `arrownet_delta_changes`; `_cdf` 31) all work. **Deferred: ALTER** (no
-  delta-dotnet schema-DDL API); **not yet wired**: a first-class MERGE surface + S3/plain-ADLS discovery
+  (`change_data_feed` ATTACH option + `arrownet_delta_changes`; `_cdf` 31) all work. **ALTER ADD COLUMN**
+  works via a 0-row merge-append (Append+OverwriteSchema=false → `SchemaMode::Merge` unions the widened schema,
+  old rows NULL — pure delta-dotnet, all backends, no engineered-wood IO seam) + **RENAME TABLE** (local folder
+  move); `_alter` 47. **Deferred (clean error): RENAME/DROP COLUMN + ALTER TYPE** (need column mapping), cloud
+  RENAME. **Not yet wired**: a first-class MERGE surface + S3/plain-ADLS discovery
   (OneLake IS wired — see next). **OneLake via the
   Unity Catalog REST API**: OneLake exposes a Unity-Catalog-compatible REST API
   (`onelake.table.fabric.microsoft.com/delta/<wsGuid>/<lhGuid>/api/2.1/unity-catalog/schemas` + `/tables`,

@@ -766,10 +766,75 @@ public sealed class DeltaRsCatalog : IBackendCatalog
         return t.Schema().FieldsList.Select(f => f.Name).ToList();
     }
 
-    // ALTER: delta-dotnet exposes no add-column API (only InsertOptions.OverwriteSchema on a write).
+    // ALTER TABLE. ADD COLUMN is a metadata-only schema evolution done via a 0-row merge-append (a plain
+    // Append with OverwriteSchema=false maps to delta-rs SchemaMode::Merge, which unions the widened schema —
+    // old rows read NULL, no data written). Works on every backend (object_store), no engineered-wood IO seam
+    // and no delta-rs Rust amendment. RENAME TABLE moves the table folder (local only for now). Other kinds
+    // (RENAME/DROP COLUMN, ALTER TYPE) need column mapping / a rewrite → clean error.
     public void AlterTable(int alterKind, string schemaName, string tableName, string? arg1, string? arg2,
-                           Field? column, int flags) =>
-        throw Unsupported("ALTER TABLE (delta-dotnet has no schema-DDL API)");
+                           Field? column, int flags)
+    {
+        switch (alterKind)
+        {
+            case AlterKind.AddColumn:
+            {
+                var col = column ?? throw new InvalidOperationException(
+                    "delta-rs ADD COLUMN requires a column definition.");
+                string name = string.IsNullOrEmpty(arg1) ? col.Name : arg1!;
+                using var t = Open(schemaName, tableName);
+                var current = t.Schema();
+                var fields = new List<Field>(current.FieldsList) { new Field(name, col.DataType, nullable: true) };
+                var widened = new Schema(fields, current.Metadata);
+                var arrays = new IArrowArray[fields.Count];
+                for (int i = 0; i < fields.Count; i++)
+                {
+                    arrays[i] = EmptyArray(fields[i].DataType);
+                }
+                var empty = new RecordBatch(widened, arrays, 0);
+                // 0-row Append → SchemaMode::Merge (bridge) → the column is added, existing rows read NULL.
+                Run(t.InsertAsync(new[] { empty }, widened,
+                    new InsertOptions { SaveMode = SaveMode.Append, OverwriteSchema = false }, default));
+                return;
+            }
+            case AlterKind.RenameTable:
+            {
+                string newName = arg1 ?? throw new InvalidOperationException(
+                    "delta-rs RENAME TABLE requires a new table name.");
+                if (!RootIsLocal)
+                {
+                    throw Unsupported("RENAME TABLE on a non-local delta-rs catalog (cloud rename deferred)");
+                }
+                Directory.Move(LocalTableDir(schemaName, tableName), LocalTableDir(schemaName, newName));
+                return;
+            }
+            default:
+                throw Unsupported("ALTER TABLE (only ADD COLUMN and RENAME TABLE are supported on delta-rs; "
+                    + "RENAME/DROP COLUMN + ALTER TYPE need column mapping)");
+        }
+    }
+
+    /// <summary>An empty (0-length) Arrow array of the given type, for the widened schema of a 0-row
+    /// merge-append (ADD COLUMN). Covers the Delta-valid column types.</summary>
+    private static IArrowArray EmptyArray(IArrowType type) => type switch
+    {
+        BooleanType => new BooleanArray.Builder().Build(),
+        Int8Type => new Int8Array.Builder().Build(),
+        Int16Type => new Int16Array.Builder().Build(),
+        Int32Type => new Int32Array.Builder().Build(),
+        Int64Type => new Int64Array.Builder().Build(),
+        UInt8Type => new UInt8Array.Builder().Build(),
+        UInt16Type => new UInt16Array.Builder().Build(),
+        UInt32Type => new UInt32Array.Builder().Build(),
+        UInt64Type => new UInt64Array.Builder().Build(),
+        FloatType => new FloatArray.Builder().Build(),
+        DoubleType => new DoubleArray.Builder().Build(),
+        Decimal128Type d => new Decimal128Array.Builder(d).Build(),
+        StringType => new StringArray.Builder().Build(),
+        Date32Type => new Date32Array.Builder().Build(),
+        TimestampType ts => new TimestampArray.Builder(ts).Build(),
+        _ => throw new NotSupportedException(
+            $"delta-rs ADD COLUMN: table column type {type.TypeId} is not supported for the schema-merge write."),
+    };
 
     public IArrowArrayStream ExecuteQuery(string sql) => throw Unsupported("raw query");
 

@@ -1,0 +1,81 @@
+# name: test/verify_delta_rs_alter.test
+# description: delta-rs provider ALTER TABLE. ADD COLUMN is a metadata-only schema evolution via a 0-row
+#              merge-append (Append + OverwriteSchema=false → delta-rs SchemaMode::Merge unions the widened
+#              schema; old rows read NULL, no data written) — works on every backend, no engineered-wood IO
+#              seam. RENAME TABLE moves the table folder (local). RENAME/DROP COLUMN + ALTER TYPE need column
+#              mapping → clean error. Requires the delta-rs native libs (publish-managed.ps1 -IncludeDeltaRs).
+#              Local FS.
+# group: [mssql_net]
+
+require mssql_net
+
+require-env ARROWNET_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/dra' AS lake (TYPE arrownet, PROVIDER 'deltars');
+
+statement ok
+CREATE TABLE lake.main.t AS SELECT * FROM (VALUES (1,'a'),(2,'b')) v(id,name);
+
+# ADD COLUMN — existing rows read NULL for the new column.
+statement ok
+ALTER TABLE lake.main.t ADD COLUMN extra INTEGER;
+
+query ITI
+SELECT id, name, extra FROM lake.main.t ORDER BY id;
+----
+1	a	NULL
+2	b	NULL
+
+# New rows carry the added column.
+statement ok
+INSERT INTO lake.main.t VALUES (3, 'c', 99);
+
+query ITI
+SELECT id, name, extra FROM lake.main.t ORDER BY id;
+----
+1	a	NULL
+2	b	NULL
+3	c	99
+
+# A second ADD COLUMN (string).
+statement ok
+ALTER TABLE lake.main.t ADD COLUMN label VARCHAR;
+
+query ITIT
+SELECT id, name, extra, label FROM lake.main.t ORDER BY id;
+----
+1	a	NULL	NULL
+2	b	NULL	NULL
+3	c	99	NULL
+
+# RENAME TABLE moves the folder; data preserved.
+statement ok
+ALTER TABLE lake.main.t RENAME TO t2;
+
+query ITI
+SELECT id, name, extra FROM lake.main.t2 ORDER BY id;
+----
+1	a	NULL
+2	b	NULL
+3	c	99
+
+# Durability across re-attach.
+statement ok
+DETACH lake;
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/dra' AS lake (TYPE arrownet, PROVIDER 'deltars');
+
+query I
+SELECT count(*) FROM lake.main.t2;
+----
+3
+
+# DROP COLUMN needs column mapping — clean error.
+statement error
+ALTER TABLE lake.main.t2 DROP COLUMN extra;
+----
+
+statement ok
+DETACH lake;

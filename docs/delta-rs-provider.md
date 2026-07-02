@@ -26,7 +26,7 @@ end on Windows via `test/verify_delta_rs.test` (25 assertions) and a live shell 
   via QueryAsync, see below); **snapshots** (`arrownet_delta_snapshots` → `HistoryAsync`); **Change Data Feed**
   (`change_data_feed` option + `arrownet_delta_changes`, see below); **maintenance** (OPTIMIZE / Z-ORDER /
   VACUUM / CHECKPOINT, see below); re-attach durability. Tests: `verify_delta_rs.test` (56) +
-  `_maintenance` (12) + `_pushdown` (27) + `_cdf` (31) + `_time_travel` (39) + `_copy` (29). No regression to
+  `_maintenance` (12) + `_pushdown` (27) + `_cdf` (31) + `_time_travel` (39) + `_copy` (29) + `_alter` (47). No regression to
   the engineered-wood provider.
 - **Filter pushdown**: a scan with a filter runs via QueryAsync with a DataFusion WHERE (file/stats/row-group
   skipping); the superset-safe FilterNode renders compare / and·or / is_null / in, anything else → TRUE
@@ -58,8 +58,11 @@ end on Windows via `test/verify_delta_rs.test` (25 assertions) and a live shell 
   *Caveat*: a duplicated pre-image row could make delta-rs reject an UPDATE as an ambiguous multi-match
   (identical rows can't be selectively updated by a WHERE anyway). This is the record-batch-MERGE mapping the
   design anticipated; a future DuckDB "remote MERGE" optimizer step could push a MERGE statement directly.
-- **Deferred with a clean error**:
-  - **ALTER** — delta-dotnet has no schema-DDL API.
+- **ALTER TABLE** — **ADD COLUMN** works as a metadata-only schema evolution via a **0-row merge-append**
+  (Append + `OverwriteSchema=false` → delta-rs `SchemaMode::Merge` unions the widened schema; existing rows
+  read NULL, no data written) — pure delta-dotnet, every backend, no engineered-wood IO seam. **RENAME TABLE**
+  moves the table folder (local). Deferred with a clean error: **RENAME/DROP COLUMN + ALTER TYPE** (need column
+  mapping / a rewrite), and cloud RENAME TABLE.
   - **`ReadAsArrowTableAsync` at a version** — delta-dotnet's *kernel* read is latest-only (a versioned load
     sets `isKernelSupported=false`). Sidestepped: time travel reads via QueryAsync (DataFusion), which reads
     the loaded snapshot without the kernel. So time travel works; only the kernel read path is latest-only.
