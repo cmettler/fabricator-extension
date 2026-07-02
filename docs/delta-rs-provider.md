@@ -62,8 +62,21 @@ end on Windows via `test/verify_delta_rs.test` (25 assertions) and a live shell 
     sets `isKernelSupported=false`). Sidestepped: time travel reads via QueryAsync (DataFusion), which reads
     the loaded snapshot without the kernel. So time travel works; only the kernel read path is latest-only.
 - **OneLake cloud — WIRED + live-validated** (see below). **Not yet wired**: S3 / plain-ADLS discovery (no
-  lister), a first-class MERGE surface (delta-rs MERGE is used internally for DELETE/UPDATE), TIMESTAMP time
-  travel (wired via `LoadDateTimeAsync`, unverified).
+  lister), a first-class MERGE surface (see note), TIMESTAMP time travel (wired via `LoadDateTimeAsync`,
+  unverified).
+
+  **A first-class MERGE surface (noted, not built).** We already call delta-dotnet's `MergeAsync` *internally*
+  as the engine for rowid DELETE/UPDATE (match the scanned rows on all columns → `WHEN MATCHED THEN
+  DELETE`/`UPDATE SET`). "First-class" = a **user-facing upsert**: let a user run a real
+  `MERGE INTO … USING … ON … WHEN MATCHED THEN UPDATE/DELETE … WHEN NOT MATCHED THEN INSERT …
+  [WHEN NOT MATCHED BY SOURCE THEN DELETE]` as **one native delta-rs MERGE commit** (single-pass upsert, more
+  efficient + more expressive than the rowid DELETE+INSERT decomposition; the canonical Databricks/Spark
+  upsert). Not automatic because DuckDB's own `MERGE` decomposes into rowid DML for a custom catalog (never
+  handed to us as a MERGE), so it needs a **dedicated entry point** — most naturally an `mssql_net_exec`
+  MERGE dialect. **Design catch:** `MergeAsync(mergeSql, records, schema)` takes the source as materialized
+  `RecordBatch`es named by the `USING <alias>`, not a live subquery — so the surface must accept a source
+  query whose rows we materialize and feed in as that alias (e.g. `arrownet_delta_merge(catalog, mergeSql,
+  (SELECT …))`).
 
 ### Cloud (OneLake) — DONE + live-validated (2026-07)
 
