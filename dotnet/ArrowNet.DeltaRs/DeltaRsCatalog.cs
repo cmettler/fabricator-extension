@@ -36,6 +36,11 @@ public sealed class DeltaRsCatalog : IBackendCatalog
     private readonly Dictionary<string, string> _storage;      // delta-rs object_store options (from a secret)
     private readonly bool _schemas;                             // two-level <root>/<schema>/<table> layout
     private readonly bool _changeDataFeed;                      // enable delta.enableChangeDataFeed on CREATE
+    // NOTE: no deletion_vectors option — verified that delta-rs (0.32.1 via delta-dotnet) copy-on-writes for
+    // DELETE regardless of delta.enableDeletionVectors (BOTH the MERGE path and predicate DeleteAsync emit
+    // add+remove, never a deletionVector). Declaring the feature would only bump the table to reader-v3 (which
+    // can break Fabric's OneLake converter) for zero DV benefit. Use the engineeredwooddelta provider for real
+    // deletion vectors. See docs/delta-rs-provider.md.
 
     // OneLake (Fabric) support: resolved lazily via the Unity Catalog REST API. delta-rs reads OneLake only
     // with a GUID-based abfss path, so we cache the workspace/lakehouse GUIDs + the discovered tables.

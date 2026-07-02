@@ -1591,7 +1591,12 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   delta-rs MERGE matching them on every column NULL-safe (`WHEN MATCHED THEN DELETE` / `… UPDATE SET`, source
   cols renamed `s__`/`k__` to split SET vs key) — sound because a WHERE can't distinguish identical rows, so
   DuckDB's rowid set is a complete equivalence class. Caveat: a duplicated pre-image row may make delta-rs
-  reject an UPDATE as an ambiguous multi-match. **Maintenance** (OPTIMIZE / Z-ORDER / VACUUM / CHECKPOINT —
+  reject an UPDATE as an ambiguous multi-match. **DELETE/UPDATE are always copy-on-write — NO deletion vectors**
+  (verified 2026-07: with `delta.enableDeletionVectors=true`, BOTH our MERGE-delete AND delta-rs's predicate
+  `DeleteAsync` emit `add`+`remove`/rewritten file, never a `deletionVector`, in deltalake 0.32.1). So there is
+  **no `deletion_vectors` ATTACH option** for delta-rs (declaring the feature would only bump the table to
+  reader-v3, risking Fabric-converter breakage, for zero DV benefit) — use the `engineeredwooddelta` provider's
+  `deletion_vectors true` for real DVs. **Maintenance** (OPTIMIZE / Z-ORDER / VACUUM / CHECKPOINT —
   ops engineered-wood lacks) via a command dialect on `mssql_net_exec('<catalog>', 'OPTIMIZE main.t ZORDER
   (id)' | 'VACUUM … [DRY RUN]' | 'CHECKPOINT main.t')` (C#-only `ExecuteNonQuery`, no ABI change;
   `test/verify_delta_rs_maintenance.test`, 12). **Filter pushdown** (FilterNode→DataFusion WHERE via QueryAsync,

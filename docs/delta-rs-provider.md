@@ -58,6 +58,15 @@ end on Windows via `test/verify_delta_rs.test` (25 assertions) and a live shell 
   *Caveat*: a duplicated pre-image row could make delta-rs reject an UPDATE as an ambiguous multi-match
   (identical rows can't be selectively updated by a WHERE anyway). This is the record-batch-MERGE mapping the
   design anticipated; a future DuckDB "remote MERGE" optimizer step could push a MERGE statement directly.
+- **DELETE/UPDATE are always copy-on-write — deletion vectors are NOT produced.** Verified (2026-07): with
+  `delta.enableDeletionVectors=true` on the table, **both** delta-rs paths — our MERGE `WHEN MATCHED THEN
+  DELETE` *and* delta-rs's own predicate `DeleteAsync` — emit `add`+`remove` (a rewritten file), never a
+  `deletionVector`, in deltalake 0.32.1 (what delta-dotnet bundles). So there is deliberately **no
+  `deletion_vectors` ATTACH option** for this provider: declaring the feature would only bump the table to
+  reader-v3 (which can break Fabric's OneLake converter) for zero DV benefit. For real deletion vectors use the
+  **engineeredwooddelta** provider's `deletion_vectors true` (its DV writer is implemented + delta-kernel-verified).
+  Producing DVs from delta-rs would need upstream delta-rs/delta-dotnet support (the DELETE op honoring
+  `enableDeletionVectors`), not wireable on our side.
 - **ALTER TABLE** — **ADD COLUMN** works as a metadata-only schema evolution via a **0-row merge-append**
   (Append + `OverwriteSchema=false` → delta-rs `SchemaMode::Merge` unions the widened schema; existing rows
   read NULL, no data written) — pure delta-dotnet, every backend, no engineered-wood IO seam. **RENAME TABLE**
