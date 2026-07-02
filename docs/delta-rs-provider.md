@@ -66,8 +66,10 @@ end on Windows via `test/verify_delta_rs.test` (25 assertions) and a live shell 
   - **`ReadAsArrowTableAsync` at a version** — delta-dotnet's *kernel* read is latest-only (a versioned load
     sets `isKernelSupported=false`). Sidestepped: time travel reads via QueryAsync (DataFusion), which reads
     the loaded snapshot without the kernel. So time travel works; only the kernel read path is latest-only.
-- **OneLake cloud — WIRED + live-validated** (see below). **Not yet wired**: S3 / plain-ADLS discovery (no
-  lister) and a first-class MERGE surface (see note).
+- **OneLake cloud — WIRED + live-validated** (see below). **Not yet wired**: a first-class MERGE surface (see
+  note), S3 / plain-ADLS discovery (no lister), OneLake RENAME TABLE + CREATE/DROP SCHEMA (Fabric-managed
+  schemas; DFS-path nuances, untestable locally), and the UC-column-fetch enumeration speedup (type-risky —
+  UC `type_name` must match delta-rs's read schema across all types).
 
   **A first-class MERGE surface (noted, not built).** We already call delta-dotnet's `MergeAsync` *internally*
   as the engine for rowid DELETE/UPDATE (match the scanned rows on all columns → `WHEN MATCHED THEN
