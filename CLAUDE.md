@@ -574,8 +574,17 @@ Implemented and verified:
     a 10M-row one) that effectively HANGS — even when the target schema is empty, because the scan still touches
     every other table. Against the empty `LH_no_schema` a single-model build is ~11s and **`dbt run --threads 4`
     is PASS=4/4** (4 concurrent CTAS → 4 separate `Tables/<model>` Delta tables, ~19s — validates the parallel
-    OneLake bulk-write path, same as box/fabric). (A lazy table-enumeration that doesn't fetch columns until
-    needed would fix the populated-catalog slowness generally — deferred.) Per-target
+    OneLake bulk-write path, same as box/fabric). (**Lazy table-enumeration is INFEASIBLE** — investigated
+    2026-07: DuckDB's `duckdb_tables`/`information_schema.tables` reads `GetColumns().LogicalColumnCount()` +
+    the full `GetInfo()` CREATE SQL + `HasPrimaryKey()` from EVERY entry (`duckdb_tables.cpp:139/147/153`), and
+    `duckdb_columns`/`information_schema.columns` share the same `SchemaEntry::Scan(TABLE_ENTRY)` path — so a
+    full catalog scan inherently materializes every table's columns; there is no names-only enumeration API and
+    a `TableCatalogEntry` requires its columns. Targeted access (`db.schema.t`) is already lazy/fast per-table.
+    The realistic mitigation for the OneLake slowness is *cheaper* materialization: fetch a table's columns from
+    the **OneLake Unity Catalog single-table GET** (`…/unity-catalog/tables/<full_name>` returns
+    columns[name,type_name,nullable] — proven) instead of a heavy delta-rs `_delta_log` open, turning
+    enumeration from N log-replays into N light REST calls. Not built — the bind schema would have to match the
+    delta-rs read schema across all types.) Per-target
     schema via `+schema: "{{ target.schema }}"` (box/fabric `dbo`, lakehouse `main`). **The loadable extension
     must be rebuilt on an
     ABI bump** (`cmake --build … --target mssql_net_loadable_extension`) — dbt loads the loadable, not the
@@ -1588,8 +1597,8 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   reads the loaded snapshot, sidestepping the kernel-only `ReadAsArrowTableAsync`; composes with pushdown;
   `_time_travel` 36; VERSION 0 reads latest — delta-dotnet `Version=0` sentinel), and **Change Data Feed**
   (`change_data_feed` ATTACH option + `arrownet_delta_changes`; `_cdf` 31) all work. **Deferred: ALTER** (no
-  delta-dotnet schema-DDL API); **not yet wired**: a first-class MERGE
-  surface, and the `DeltaRsCatalog` OneLake wiring (both halves now PROVEN live — see next). **OneLake via the
+  delta-dotnet schema-DDL API); **not yet wired**: a first-class MERGE surface + S3/plain-ADLS discovery
+  (OneLake IS wired — see next). **OneLake via the
   Unity Catalog REST API**: OneLake exposes a Unity-Catalog-compatible REST API
   (`onelake.table.fabric.microsoft.com/delta/<wsGuid>/<lhGuid>/api/2.1/unity-catalog/schemas` + `/tables`,
   **paginated** via `next_page_token`, storage.azure.com-scope token) that lists schemas + tables + each

@@ -97,8 +97,16 @@ How it's wired:
   cross-assembly reuse (its `Resolve` returning the internal `OneLakeInfo` became `internal`).
 - **Scan / time-travel / snapshots / CDF / DML** all flow through `TableUri` + `storage_options`, so they work
   on OneLake too (writes untested-live but wired). A OneLake ATTACH of a lakehouse with a very large table is
-  still slow on enumeration (the per-table column materialization, same as engineered-wood — a lazy-columns
-  follow-up).
+  still slow on *full enumeration* (`information_schema.tables` etc.) — the per-table column materialization,
+  same as engineered-wood. **This is NOT fixable by "lazy columns"** (investigated): DuckDB's
+  `duckdb_tables`/`duckdb_columns` both enumerate via `SchemaEntry::Scan(TABLE_ENTRY)` and read the column list
+  (`column_count`, the `GetInfo()` CREATE SQL, `HasPrimaryKey`) from every entry, so a full scan inherently
+  materializes columns; a `TableCatalogEntry` requires its columns and there's no names-only API. Targeted
+  access (`lake.schema.t`) is already lazy/fast. **Realistic mitigation (not built):** fetch a table's columns
+  from the **OneLake Unity Catalog single-table GET** (`…/unity-catalog/tables/<full_name>` → `columns[name,
+  type_name,nullable]`, proven) instead of a heavy delta-rs `_delta_log` open — enumeration becomes N light
+  REST calls, not N log-replays. The catch is that the UC-derived bind schema must match the delta-rs read
+  schema across every type (decimal precision/scale, timestamp units, etc.), or bind/scan mismatch.
 
 **Superseded**: the earlier "unproven / live-gated" conclusion — the "No files in log segment" failure was
 purely name→GUID resolution, and the UC `storage_location` returns GUIDs.
