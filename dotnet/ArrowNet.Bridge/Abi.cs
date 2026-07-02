@@ -195,6 +195,13 @@ public unsafe struct ArrowNetVTable
     public delegate* unmanaged[Cdecl]<byte*, byte*, byte**, byte**, int> OneLakeGlob;
     // int32 onelake_exists(char* path, char* cred_json, int32* out_exists, char** err)
     public delegate* unmanaged[Cdecl]<byte*, byte*, int*, byte**, int> OneLakeExists;
+    // onelake:// WRITE (slice 2): create/overwrite a plain OneLake file (COPY … TO 'onelake://…').
+    // int32 onelake_open_write(char* path, char* cred_json, void** out_file, char** err)
+    public delegate* unmanaged[Cdecl]<byte*, byte*, nint*, byte**, int> OneLakeOpenWrite;
+    // int32 onelake_write(void* file, void* buffer, int64 nr_bytes, char** err)
+    public delegate* unmanaged[Cdecl]<nint, void*, long, byte**, int> OneLakeWrite;
+    // int32 onelake_close_write(void* file, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte**, int> OneLakeCloseWrite;
 }
 
 /// <summary>

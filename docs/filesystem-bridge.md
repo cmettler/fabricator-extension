@@ -157,6 +157,11 @@ write-back foundation — see docs/delta-catalog.md (recommendation step 0).
 `FileSystem::RemoveDirectory`, idempotent). Powers Delta catalog **DROP TABLE** (`DeltaCatalog.DropTable` →
 `HostFs.RemoveDir` deletes the table's whole `<root>/<table>/` folder). See docs/delta-catalog.md.
 
+**v56** appended 3 vtable entries `onelake_open_write`/`onelake_write`/`onelake_close_write` — the WRITE forward
+callbacks for the `onelake://` FileSystem (slice 2): sequential create→append→flush, so `COPY … TO 'onelake://…'`
+(and any DuckDB writer) writes to OneLake through the managed Azure DataLake SDK. Read-side caching via DuckDB's
+`ExternalFileCache` was confirmed already working on the native `read_parquet('onelake://…')` path (no wiring).
+
 **v55** appended 5 vtable entries `onelake_open`/`onelake_read`/`onelake_close`/`onelake_glob`/`onelake_exists`
 — the FORWARD callbacks (host C++ → managed) for the `onelake://` DuckDB FileSystem subsystem (Phase-3 step 3,
 read-only). The C++ `ArrowNetOneLakeFileSystem` (registered in the VFS at load) dispatches its reads to the
@@ -269,11 +274,19 @@ explicitly** to the filesystem instance (as we already do for DAX `DaxTokenAuth`
    the before-`*` prefix → pulled in `_delta_log/*.json` (read as parquet → "no magic bytes") — fixed to enforce
    the after-`*` suffix + a single-`*`-doesn't-cross-`/` rule; (c) the parquet reader calls
    `GetLastModifiedTime` → added (returns a constant, correct since Delta data files are immutable).
-   **Slice 2 (deferred):** wire engineered-wood's `fs_*` reverse callbacks to open through a `CachingFileHandle`
-   (so engineered-wood's log reads are cached too — the native reader already caches); route the Delta catalog
-   reads through `onelake://` to retire step 2's separate FS selection; `read_json`/`read_csv`/`excel`/
-   `COPY … TO 'onelake://…'` (write ops on the C++ FS still throw NotImplemented). Cost noted: per-range-read
-   C++↔C# marshaling (cache-mitigated).
+   **Caching CONFIRMED (the core motivation):** the native `read_parquet('onelake://…')` path already flows
+   through DuckDB's `ExternalFileCache` transparently — `duckdb_external_file_cache()` shows the `onelake://…`
+   parquet cached after a read, and a second read hits it. So step 3's caching win is delivered by slice 1 for the
+   native reader (no extra wiring). **Slice 2 — WRITE + general readers DONE + live-validated (2026-07-03, ABI
+   v56):** 3 more forward entries (`onelake_open_write`/`onelake_write`/`onelake_close_write`) + the C++ FS
+   `OpenFile(write)`/`Write` (sequential append; a non-sequential write throws — Azure DFS + COPY are sequential)
+   → `COPY (…) TO 'onelake://…/Files/x.parquet'` writes via DuckDB's native parquet writer + `OneLakeForwardFs`
+   (create → append → flush at the final length), read back correct (5/5 rows live on Fabric). `read_csv`/
+   `read_json` READ already worked via the slice-1 OpenFile/Read path (same VFS dispatch) — so **any DuckDB
+   reader/writer works on OneLake** now (the "Excel/JSON/CSV on the same path" charm). **Still deferred:** caching
+   engineered-wood's own reverse `fs_*` reads (route the Delta catalog through `onelake://` — low value since the
+   catalog's heavy reads are the native reader's and the log reads are small); non-sequential writes; directory
+   ops (CreateDirectory/RemoveFile throw). Cost noted: per-range C++↔C# marshaling (cache-mitigated).
 4. **(optional, UX) a dedicated `TYPE fabric` secret (small).** Via the provider-declared-secret machinery (ABI v38),
    modeling auth intent explicitly (`AUTH 'service_principal' | 'managed_identity' | 'workspace_identity' | 'cli' |
    'default'`). Functionally redundant over "azure secret + `DefaultAzureCredential` fallback" (which already covers

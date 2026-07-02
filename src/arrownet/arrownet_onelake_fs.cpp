@@ -138,16 +138,20 @@ int64_t ExtractJsonInt(const std::string &obj, const std::string &key) {
 
 class ArrowNetOneLakeFileHandle : public FileHandle {
 public:
-	ArrowNetOneLakeFileHandle(FileSystem &fs, const string &path, ArrowNetHandle handle, int64_t size)
-	    : FileHandle(fs, path, FileOpenFlags(FileOpenFlags::FILE_FLAGS_READ)), managed_handle(handle),
-	      file_size(size), position(0) {
+	ArrowNetOneLakeFileHandle(FileSystem &fs, const string &path, FileOpenFlags flags, ArrowNetHandle handle,
+	                          int64_t size, bool is_write)
+	    : FileHandle(fs, path, flags), managed_handle(handle), file_size(size), position(0), write_mode(is_write) {
 	}
 	~ArrowNetOneLakeFileHandle() override {
 		Close();
 	}
 	void Close() override {
 		if (managed_handle) {
-			OneLakeClose(managed_handle);
+			if (write_mode) {
+				OneLakeCloseWrite(managed_handle); // flush + commit at the final length
+			} else {
+				OneLakeClose(managed_handle);
+			}
 			managed_handle = nullptr;
 		}
 	}
@@ -155,20 +159,22 @@ public:
 	ArrowNetHandle managed_handle;
 	int64_t file_size;
 	idx_t position;
+	bool write_mode;
 };
 
 class ArrowNetOneLakeFileSystem : public FileSystem {
 public:
 	unique_ptr<FileHandle> OpenFile(const string &path, FileOpenFlags flags,
 	                                optional_ptr<FileOpener> opener) override {
-		if (flags.OpenForWriting()) {
-			throw NotImplementedException("onelake:// FileSystem is read-only (writes go through the Delta "
-			                              "catalog / OneLakeDataLakeFileSystem)");
-		}
 		auto cred = ResolveCredJson(path, opener);
+		if (flags.OpenForWriting()) {
+			// Plain sequential file write (COPY … TO 'onelake://…') — create/overwrite, appends follow.
+			auto handle = OneLakeOpenWrite(path, cred);
+			return make_uniq<ArrowNetOneLakeFileHandle>(*this, path, flags, handle, 0, /*is_write=*/true);
+		}
 		int64_t size = 0;
 		auto handle = OneLakeOpen(path, cred, size);
-		return make_uniq<ArrowNetOneLakeFileHandle>(*this, path, handle, size);
+		return make_uniq<ArrowNetOneLakeFileHandle>(*this, path, flags, handle, size, /*is_write=*/false);
 	}
 
 	void Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) override {
@@ -249,13 +255,27 @@ public:
 		return result;
 	}
 
-	// --- write / mutate ops: not supported on the read-only onelake:// FS ---
-	void Write(FileHandle &, void *, int64_t, idx_t) override {
-		throw NotImplementedException("onelake:// FileSystem is read-only");
+	// --- write: sequential append only (Azure DFS + COPY are sequential) ---
+	void Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) override {
+		auto &h = handle.Cast<ArrowNetOneLakeFileHandle>();
+		if (static_cast<int64_t>(location) != static_cast<int64_t>(h.position)) {
+			throw NotImplementedException("onelake:// FileSystem supports sequential writes only (got a write at "
+			                              "offset %lld, expected %lld)",
+			                              static_cast<long long>(location), static_cast<long long>(h.position));
+		}
+		OneLakeWrite(h.managed_handle, buffer, nr_bytes);
+		h.position += static_cast<idx_t>(nr_bytes);
 	}
-	int64_t Write(FileHandle &, void *, int64_t) override {
-		throw NotImplementedException("onelake:// FileSystem is read-only");
+	int64_t Write(FileHandle &handle, void *buffer, int64_t nr_bytes) override {
+		auto &h = handle.Cast<ArrowNetOneLakeFileHandle>();
+		OneLakeWrite(h.managed_handle, buffer, nr_bytes);
+		h.position += static_cast<idx_t>(nr_bytes);
+		return nr_bytes;
 	}
+	void FileSync(FileHandle &) override {
+		// The managed side flushes + commits on close (OneLakeCloseWrite); nothing to do mid-stream.
+	}
+	// --- other mutate ops: not supported ---
 	void RemoveFile(const string &, optional_ptr<FileOpener>) override {
 		throw NotImplementedException("onelake:// FileSystem is read-only");
 	}

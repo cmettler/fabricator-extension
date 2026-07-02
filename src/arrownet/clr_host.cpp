@@ -581,6 +581,41 @@ bool OneLakeExists(const std::string &path, const std::string &cred_json) {
 	return exists != 0;
 }
 
+ArrowNetHandle OneLakeOpenWrite(const std::string &path, const std::string &cred_json) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.onelake_open_write) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide onelake_open_write");
+	}
+	char *err = nullptr;
+	ArrowNetHandle file = nullptr;
+	int32_t rc = vt.onelake_open_write(path.c_str(), cred_json.c_str(), &file, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: onelake_open_write failed");
+	}
+	return file;
+}
+
+void OneLakeWrite(ArrowNetHandle file, const void *buffer, int64_t nr_bytes) {
+	const ArrowNetVTable &vt = GetBridge();
+	char *err = nullptr;
+	int32_t rc = vt.onelake_write(file, buffer, nr_bytes, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: onelake_write failed");
+	}
+}
+
+void OneLakeCloseWrite(ArrowNetHandle file) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.onelake_close_write || !file) {
+		return;
+	}
+	char *err = nullptr;
+	int32_t rc = vt.onelake_close_write(file, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: onelake_close_write failed");
+	}
+}
+
 void ListSecretFields(ArrowArrayStream &out) {
 	const ArrowNetVTable &vt = GetBridge();
 	if (!vt.list_secret_fields) {

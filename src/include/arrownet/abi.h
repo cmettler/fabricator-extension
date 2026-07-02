@@ -641,6 +641,14 @@ typedef struct ArrowNetVTable {
 	int32_t (*onelake_glob)(const char *pattern, const char *cred_json, char **out_json, char **err);
 	// FileExists(`path`). *out_exists = 0/1. cred_json as above.
 	int32_t (*onelake_exists)(const char *path, const char *cred_json, int32_t *out_exists, char **err);
+
+	// onelake:// WRITE (Phase-3 slice 2): a plain file write to OneLake through any DuckDB writer
+	// (COPY … TO 'onelake://…', etc.) — NOT a Delta commit. Sequential (append-only), which is what
+	// COPY and Azure DFS both do. onelake_open_write creates/overwrites the file; onelake_write appends;
+	// onelake_close_write flushes + commits at the final length. cred_json as above.
+	int32_t (*onelake_open_write)(const char *path, const char *cred_json, ArrowNetHandle *out_file, char **err);
+	int32_t (*onelake_write)(ArrowNetHandle file, const void *buffer, int64_t nr_bytes, char **err);
+	int32_t (*onelake_close_write)(ArrowNetHandle file, char **err);
 } ArrowNetVTable;
 
 // -----------------------------------------------------------------------------
@@ -726,7 +734,7 @@ typedef struct ArrowNetHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 55
+#define ARROWNET_ABI_VERSION 56
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

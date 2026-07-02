@@ -1127,7 +1127,14 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v55** (v55 = **`onelake://` FileSystem forward callbacks** — appended 5 vtable entries
+- **Current version: ABI v56** (v56 = **`onelake://` WRITE forward callbacks** — appended 3 vtable entries
+  `onelake_open_write`/`onelake_write`/`onelake_close_write`; the C++ `ArrowNetOneLakeFileSystem` `OpenFile(write)`/
+  `Write` (sequential append → managed `OneLakeForwardFs` create/append/flush) make **`COPY … TO 'onelake://…'` +
+  any DuckDB writer** write to OneLake (Phase-3 step-3 slice 2; live-validated: COPY a parquet, read back 5/5).
+  `read_csv`/`read_json` reads already worked via the slice-1 OpenFile/Read path, so any reader/writer now works on
+  OneLake. Read caching via DuckDB's `ExternalFileCache` was confirmed already transparent on the native
+  `read_parquet('onelake://…')` path (`duckdb_external_file_cache()` shows the file cached). Non-sequential writes +
+  directory ops throw; caching engineered-wood's reverse `fs_*` reads deferred (low value). v55 = **`onelake://` FileSystem forward callbacks** — appended 5 vtable entries
   `onelake_open`/`onelake_read`/`onelake_close`/`onelake_glob`/`onelake_exists` (host C++ → managed). A C++
   `ArrowNetOneLakeFileSystem : FileSystem` (`src/arrownet/arrownet_onelake_fs.{hpp,cpp}`) is registered in DuckDB's
   VFS at load (`RegisterOneLakeFileSystem`, `CanHandleFile` = the `onelake://` scheme) and forwards its **read** ops

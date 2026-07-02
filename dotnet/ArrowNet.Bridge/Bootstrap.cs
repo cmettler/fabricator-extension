@@ -45,7 +45,7 @@ public static unsafe class Bootstrap
             return new InMemoryArrayStream(schema, new[] { batch });
         });
 
-        vtable->AbiVersion = 55;
+        vtable->AbiVersion = 56;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -102,6 +102,9 @@ public static unsafe class Bootstrap
         vtable->OneLakeClose = &OneLakeClose;
         vtable->OneLakeGlob = &OneLakeGlob;
         vtable->OneLakeExists = &OneLakeExists;
+        vtable->OneLakeOpenWrite = &OneLakeOpenWrite;
+        vtable->OneLakeWrite = &OneLakeWrite;
+        vtable->OneLakeCloseWrite = &OneLakeCloseWrite;
         return ArrowNetStatus.Ok;
     }
 
@@ -601,6 +604,61 @@ public static unsafe class Bootstrap
             var p = Marshal.PtrToStringUTF8((nint)path) ?? string.Empty;
             var cj = Marshal.PtrToStringUTF8((nint)credJson);
             *outExists = OneLakeForwardFs.Exists(p, cj) ? 1 : 0;
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int OneLakeOpenWrite(byte* path, byte* credJson, nint* outFile, byte** err)
+    {
+        try
+        {
+            var p = Marshal.PtrToStringUTF8((nint)path) ?? string.Empty;
+            var cj = Marshal.PtrToStringUTF8((nint)credJson);
+            var handle = OneLakeForwardFs.OpenWrite(p, cj);
+            *outFile = Handles.Alloc(handle);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int OneLakeWrite(nint file, void* buffer, long nrBytes, byte** err)
+    {
+        try
+        {
+            var h = Handles.Resolve<OneLakeForwardFs.WriteHandle>(file)
+                    ?? throw new InvalidOperationException("onelake_write: invalid file handle");
+            OneLakeForwardFs.Write(h, new ReadOnlySpan<byte>(buffer, checked((int)nrBytes)));
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int OneLakeCloseWrite(nint file, byte** err)
+    {
+        try
+        {
+            var h = Handles.Resolve<OneLakeForwardFs.WriteHandle>(file);
+            if (h is not null)
+            {
+                OneLakeForwardFs.CloseWrite(h);
+                Handles.Free(file);
+            }
             return ArrowNetStatus.Ok;
         }
         catch (Exception ex)

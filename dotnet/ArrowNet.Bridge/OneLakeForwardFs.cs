@@ -171,4 +171,42 @@ internal static class OneLakeForwardFs
         var client = FsClient(fs, Cred(credJson)).GetFileClient(p);
         return client.ExistsAsync().GetAwaiter().GetResult().Value;
     }
+
+    // ---- WRITE (slice 2): a plain OneLake file write (COPY … TO 'onelake://…'), sequential append. ----
+
+    /// <summary>An open write handle: the file client + the running append position.</summary>
+    internal sealed class WriteHandle
+    {
+        public required DataLakeFileClient Client { get; init; }
+        public long Position { get; set; }
+    }
+
+    /// <summary>Create (overwrite) the target file and return a write handle.</summary>
+    public static WriteHandle OpenWrite(string path, string? credJson)
+    {
+        var (fs, p) = Parse(path);
+        var client = FsClient(fs, Cred(credJson)).GetFileClient(p);
+        client.CreateAsync().GetAwaiter().GetResult(); // create/overwrite (0-length); appends follow
+        return new WriteHandle { Client = client, Position = 0 };
+    }
+
+    /// <summary>Append `data` at the current position.</summary>
+    public static void Write(WriteHandle h, ReadOnlySpan<byte> data)
+    {
+        if (data.Length == 0)
+        {
+            return;
+        }
+        // AppendAsync needs a Stream; copy the span into a MemoryStream (the host buffer is not retained).
+        var bytes = data.ToArray();
+        using var ms = new MemoryStream(bytes, writable: false);
+        h.Client.AppendAsync(ms, h.Position).GetAwaiter().GetResult();
+        h.Position += bytes.Length;
+    }
+
+    /// <summary>Flush + commit at the final length.</summary>
+    public static void CloseWrite(WriteHandle h)
+    {
+        h.Client.FlushAsync(h.Position).GetAwaiter().GetResult();
+    }
 }

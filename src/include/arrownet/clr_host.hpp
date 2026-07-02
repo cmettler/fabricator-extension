@@ -70,6 +70,13 @@ void OneLakeClose(ArrowNetHandle file);
 std::string OneLakeGlob(const std::string &pattern, const std::string &cred_json);
 bool OneLakeExists(const std::string &path, const std::string &cred_json);
 
+// onelake:// WRITE (slice 2): a plain sequential file write (COPY … TO 'onelake://…'). OneLakeOpenWrite
+// creates/overwrites the file and returns a managed write handle; OneLakeWrite appends; OneLakeCloseWrite
+// flushes + frees the handle.
+ArrowNetHandle OneLakeOpenWrite(const std::string &path, const std::string &cred_json);
+void OneLakeWrite(ArrowNetHandle file, const void *buffer, int64_t nr_bytes);
+void OneLakeCloseWrite(ArrowNetHandle file);
+
 // -----------------------------------------------------------------------------
 // Convenience wrappers over the vtable. Each throws duckdb::IOException carrying
 // the managed error message (and releases it via free_error) on failure.
