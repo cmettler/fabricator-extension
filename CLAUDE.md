@@ -1586,9 +1586,22 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   reads the loaded snapshot, sidestepping the kernel-only `ReadAsArrowTableAsync`; composes with pushdown;
   `_time_travel` 36; VERSION 0 reads latest — delta-dotnet `Version=0` sentinel), and **Change Data Feed**
   (`change_data_feed` ATTACH option + `arrownet_delta_changes`; `_cdf` 31) all work. **Deferred: ALTER** (no
-  delta-dotnet schema-DDL API); **not yet wired**: cloud discovery (local FS only in v1; `storage_options`
-  mapping coded but unproven), TIMESTAMP travel (wired, unverified), a first-class MERGE surface. See
-  docs/delta-rs-provider.md. v47 =
+  delta-dotnet schema-DDL API); **not yet wired**: TIMESTAMP travel (wired, unverified), a first-class MERGE
+  surface, and the `DeltaRsCatalog` OneLake wiring (both halves now PROVEN live — see next). **OneLake via the
+  Unity Catalog REST API**: OneLake exposes a Unity-Catalog-compatible REST API
+  (`onelake.table.fabric.microsoft.com/delta/<wsGuid>/<lhGuid>/api/2.1/unity-catalog/schemas` + `/tables`,
+  **paginated** via `next_page_token`, storage.azure.com-scope token) that lists schemas + tables + each
+  table's `storage_location` — cleaner than the DFS `GetPaths` (no recursion, immune to the duckdb-azure
+  mid-path-glob bug). **The engineered-wood provider now discovers OneLake tables via this API**
+  (`FabricLakehouse.ListTablesViaUnityCatalog`, replacing GetPaths in `Resolve`; live-validated on
+  `LH_no_schema`). **delta-rs OneLake read is PROVEN**: `object_store` reads OneLake with a **GUID-based** abfss
+  path (`abfss://<wsGuid>@onelake.dfs.fabric.microsoft.com/<lhGuid>/Tables/[schema/]table` + `bearer_token` +
+  `account_name=onelake` + `use_fabric_endpoint=true`) — both the kernel AND DataFusion reads succeed
+  (`load_a`→2000 rows); the NAME-based path fails with delta-kernel's "No files in log segment" (that error,
+  also from DuckDB's official `delta_scan` on OneLake, was purely name→GUID resolution, NOT a kernel limit).
+  The UC `storage_location` returns GUIDs — exactly the read form. Remaining: wire the OneLake path into
+  `DeltaRsCatalog` (detect root, resolve GUIDs + credential via `FabricLakehouse`, UC-discover, abfss-GUID
+  `TableLocation` + OneLake `storage_options`). See docs/delta-rs-provider.md. v47 =
   **host-FS global table functions**: appended one vtable entry `set_active_opener(opener)` — a per-thread ambient (`AmbientOpener`, mirroring `set_active_txn`) recording the
   calling operator's `ClientContext` so a connection-free GLOBAL host-FS table reader (a lakehouse format)
   resolves DuckDB secrets while reading through the host `fs_*` callbacks; set in the shared `PopulateReturnSchema`
