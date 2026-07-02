@@ -1,8 +1,11 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using System.Threading.Tasks;
 using Azure.Core;
 using Azure.Identity;
 using Azure.Storage.Files.DataLake;
@@ -118,26 +121,18 @@ internal static class FabricLakehouse
         string tablesPath = root.Replace('\\', '/').TrimEnd('/');
         bool schemaEnabled = !string.IsNullOrEmpty(props?.DefaultSchema);
 
-        var (host, fileSystem, tablesUnderFs) = ParseAbfss(tablesPath);
-        var fsClient = new DataLakeFileSystemClient(new Uri($"https://{host}/{fileSystem}"), cred);
-
+        // Table enumeration via the OneLake Unity Catalog REST API (schemas + tables, paginated) — NOT DFS
+        // GetPaths. The UC endpoint lists tables directly (one call per schema, following next_page_token),
+        // immune to the duckdb-azure mid-path-glob bug and the DFS-recursion cost. A flat lakehouse's tables
+        // are reported by UC under schema "dbo" but map to our "main" (their storage_location has no schema
+        // segment, which the flat TablePath already produces). The schema-enabled flag stays authoritative
+        // from the lakehouse definition.
+        string catalogName = (lakehouse.DisplayName ?? lakehouseSeg) + ".Lakehouse";
+        var ucTables = ListTablesViaUnityCatalog(workspaceId, lakehouseId, catalogName, cred);
         var tables = new List<(string, string)>();
-        if (schemaEnabled)
+        foreach (var (schema, table, _) in ucTables)
         {
-            foreach (var schema in ListChildDirectories(fsClient, tablesUnderFs))
-            {
-                foreach (var table in ListChildDirectories(fsClient, tablesUnderFs + "/" + schema))
-                {
-                    tables.Add((schema, table));
-                }
-            }
-        }
-        else
-        {
-            foreach (var table in ListChildDirectories(fsClient, tablesUnderFs))
-            {
-                tables.Add((DeltaCatalog.MainSchema, table));
-            }
+            tables.Add((schemaEnabled ? schema : DeltaCatalog.MainSchema, table));
         }
         return new OneLakeInfo
         {
@@ -146,6 +141,77 @@ internal static class FabricLakehouse
             Tables = tables,
             DefaultSchema = schemaEnabled ? props!.DefaultSchema : null,
         };
+    }
+
+    /// <summary>Lists a OneLake lakehouse's tables via the OneLake <b>Unity Catalog REST API</b>
+    /// (<c>onelake.table.fabric.microsoft.com/delta/&lt;ws&gt;/&lt;lh&gt;/api/2.1/unity-catalog</c>) as
+    /// (schema, table, storage_location). Enumerates schemas then tables per schema, <b>following
+    /// <c>next_page_token</c></b> on both (Fabric pages internally — a lakehouse with more than a page of
+    /// tables would otherwise be silently truncated). Authenticated with the storage-scope token; async HTTP
+    /// (sync <c>HttpClient</c> hangs under the hostfxr CLR, like the DFS path). <paramref name="catalogName"/>
+    /// = <c>&lt;lakehouse-display-name&gt;.Lakehouse</c>.</summary>
+    public static List<(string Schema, string Table, string Location)> ListTablesViaUnityCatalog(
+        Guid workspaceId, Guid lakehouseId, string catalogName, TokenCredential credential) =>
+        ListTablesViaUnityCatalogAsync(workspaceId, lakehouseId, catalogName, credential).GetAwaiter().GetResult();
+
+    private const string UnityCatalogHost = "onelake.table.fabric.microsoft.com";
+
+    private static async Task<List<(string Schema, string Table, string Location)>> ListTablesViaUnityCatalogAsync(
+        Guid workspaceId, Guid lakehouseId, string catalogName, TokenCredential credential)
+    {
+        var token = await credential.GetTokenAsync(
+            new TokenRequestContext(new[] { "https://storage.azure.com/.default" }), default).ConfigureAwait(false);
+        using var http = new HttpClient();
+        http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token.Token);
+        string baseUrl = $"https://{UnityCatalogHost}/delta/{workspaceId}/{lakehouseId}/api/2.1/unity-catalog";
+        string catalogQuery = "catalog_name=" + Uri.EscapeDataString(catalogName);
+
+        var result = new List<(string, string, string)>();
+        var schemas = await UcPagedAsync(http, $"{baseUrl}/schemas?{catalogQuery}", "schemas",
+            el => el.GetProperty("name").GetString() ?? string.Empty).ConfigureAwait(false);
+        foreach (var schema in schemas)
+        {
+            string tablesUrl = $"{baseUrl}/tables?{catalogQuery}&schema_name={Uri.EscapeDataString(schema)}";
+            var tables = await UcPagedAsync(http, tablesUrl, "tables", el =>
+            {
+                string name = el.GetProperty("name").GetString() ?? string.Empty;
+                string loc = el.TryGetProperty("storage_location", out var l) ? l.GetString() ?? string.Empty : string.Empty;
+                return (Name: name, Loc: loc);
+            }).ConfigureAwait(false);
+            foreach (var (name, loc) in tables)
+            {
+                result.Add((schema, name, loc));
+            }
+        }
+        return result;
+    }
+
+    /// <summary>Reads a Unity Catalog list endpoint fully, following <c>next_page_token</c> (appended as
+    /// <c>&amp;page_token=</c>; the base URL already carries the <c>?catalog_name=</c> query).</summary>
+    private static async Task<List<T>> UcPagedAsync<T>(HttpClient http, string url, string arrayProperty,
+                                                       Func<JsonElement, T> map)
+    {
+        var items = new List<T>();
+        string? pageToken = null;
+        do
+        {
+            string pageUrl = pageToken is null ? url : url + "&page_token=" + Uri.EscapeDataString(pageToken);
+            string json = await http.GetStringAsync(pageUrl).ConfigureAwait(false);
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            if (root.TryGetProperty(arrayProperty, out var arr) && arr.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var el in arr.EnumerateArray())
+                {
+                    items.Add(map(el));
+                }
+            }
+            pageToken = root.TryGetProperty("next_page_token", out var t) && t.ValueKind == JsonValueKind.String
+                ? t.GetString()
+                : null;
+        }
+        while (!string.IsNullOrEmpty(pageToken));
+        return items;
     }
 
     /// <summary>Lists the immediate child <b>directory</b> leaf-names of <paramref name="pathUnderFs"/> (a path
