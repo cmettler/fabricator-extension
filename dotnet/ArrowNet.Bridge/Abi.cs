@@ -182,6 +182,19 @@ public unsafe struct ArrowNetVTable
     // active host-FS opener (per-thread ambient) so a global host-FS table function (a lakehouse reader)
     // resolves DuckDB secrets when reading through the host FileSystem. NULL clears it. Mirrors SetActiveTxn.
     public delegate* unmanaged[Cdecl]<nint, byte**, int> SetActiveOpener;
+
+    // onelake:// FileSystem forward callbacks (Phase-3): the C++ onelake FS subsystem forwards read ops here to
+    // the managed Azure DataLake SDK. cred_json = the azure secret fields the host resolved from the opener.
+    // int32 onelake_open(char* path, char* cred_json, void** out_file, int64* out_size, char** err)
+    public delegate* unmanaged[Cdecl]<byte*, byte*, nint*, long*, byte**, int> OneLakeOpen;
+    // int32 onelake_read(void* file, void* buffer, int64 nr_bytes, int64 location, char** err)
+    public delegate* unmanaged[Cdecl]<nint, void*, long, long, byte**, int> OneLakeRead;
+    // void onelake_close(void* file)
+    public delegate* unmanaged[Cdecl]<nint, void> OneLakeClose;
+    // int32 onelake_glob(char* pattern, char* cred_json, char** out_json, char** err)
+    public delegate* unmanaged[Cdecl]<byte*, byte*, byte**, byte**, int> OneLakeGlob;
+    // int32 onelake_exists(char* path, char* cred_json, int32* out_exists, char** err)
+    public delegate* unmanaged[Cdecl]<byte*, byte*, int*, byte**, int> OneLakeExists;
 }
 
 /// <summary>

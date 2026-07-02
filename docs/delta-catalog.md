@@ -45,6 +45,41 @@ The **catalog streaming write is now implemented** (`CREATE TABLE`/`INSERT`/CTAS
 engineered-wood via the standard bulk path, like the SQL/DAX backends) — so for the catalog case the global
 `arrownet_delta_write` collector is no longer needed (it remains as the connection-free, no-ATTACH function form).
 
+## engineered-wood interop caveats (Parquet + Delta on write) — reviewed 2026-07-02
+
+engineered-wood is a from-scratch C# Delta/Parquet stack (`D:\repos\engineered-wood`, doc
+`doc/known-issues.md`), so the write path diverges from Spark/parquet-mr in a few subtle, interop-relevant ways.
+None is a show-stopper (Fabric + DuckDB + arrow-rs read our output — validated live), but these are the ones
+that could make a stricter/legacy reader in the Spark ecosystem zicken:
+
+- **Writes DataPage V2 by default (NOT V1).** `ParquetWriteOptions.DataPageVersion` defaults to `V2`, and our
+  `DeltaWriter.Options()` doesn't override it → **every Delta write is DataPage V2**. Note this is *newer* than
+  Spark/parquet-mr, which default to DataPage **V1** for max compatibility; V2 is still marked "experimental" in
+  parts of the ecosystem. `FileMetaData.version` is `2`. **A V1 pin is a one-liner** if we want to match Spark's
+  default and maximize reader reach: `DeltaWriter.Options()` → `DataPageVersion = DataPageVersion.V1` (engineered-
+  wood has both `WriteDataPageV1`/`WriteDataPageV2` paths). Deferred — flip it only if a real reader rejects V2.
+- **Deprecated `min`/`max` always emitted with SIGNED byte ordering, and `column_orders` (field 7) never
+  written.** For UTF-8 and unsigned-int columns the deprecated stats have the wrong ordering; a *legacy* reader
+  that falls back to them (because `column_orders` is absent) can prune a string min/max range wrongly. Modern
+  readers use `min_value`/`max_value` (correct) → low risk for our stack, but it's exactly the kind of subtle
+  interop gap that surfaces under "does Spark read it cleanly".
+- **Nanosecond timestamp/time on write set `ConvertedType = micros`** (the spec has no ns converted-type). Tools
+  that trust `converted_type` read ns values as micros. Only bites if ns precision reaches the writer through the
+  SQL/DAX path (our mappings are µs-oriented, so normally N/A).
+- **Delta stats: no string min/max truncation** (unbounded min/max in the `_delta_log` → bloated commits for wide
+  text columns) and **stats only for top-level primitives** (no nested struct/list/map leaves → coarser file
+  skipping on nested schemas).
+- **Deletion vectors: inline (`i`) / UUID-relative (`u`) only, one DV file per delete** (no absolute-path `p`, no
+  DV packing). Known; the `deletion_vectors true` path is Fabric-read-validated regardless.
+- **No post-create protocol upgrades** — features (`deletionVectors`/`rowTracking`/`inCommitTimestamps`/
+  `changeDataFeed`) are only settable at `CreateAsync`. This matches our design (ATTACH options act at create), so
+  it's a confirmation, not a gap.
+
+Bottom line: for our workload (read + append/CTAS + moderate rowid DML + Fabric round-trip) these are acceptable.
+The two "Spark-ecosystem-friendliness" candidates worth a cheap defensive fix are the **DataPage V2 default**
+(pin V1) and the **signed deprecated min/max** (write `column_orders` / drop the deprecated fields) — both small,
+targeted engineered-wood/write-option changes, deferred until a concrete reader complains.
+
 ---
 # (original) Delta Lake catalog (folder-as-root) + write-back — design idea
 
@@ -414,6 +449,29 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      `CdfConfig.IsEnabled(config)` and throws "Change Data Feed is not enabled" otherwise (Spark
      `DELTA_CHANGE_DATA_FEED_NOT_ENABLED` parity). `verify_delta_catalog_changes.test` (45); live Fabric on
      `Test`/`LH` (`lake.dbo.arrownet_cdftest`: CTAS → DELETE → UPDATE → correct feed + snapshot operations).
+
+     **ROW TRACKING — DONE (STANDALONE ATTACH option).** ATTACH option **`row_tracking true`** → tables CREATEd
+     in the catalog declare the Delta **`delta.enableRowTracking`** WRITER feature (writer-v7 + `domainMetadata`),
+     **independent of `deletion_vectors`** and — unlike DV mode — WITHOUT a reader-v3 bump (`minReaderVersion`
+     stays 1). Materializes stable per-row ids: each `add` carries `baseRowId` + `defaultRowCommitVersion`, so
+     external consumers (Spark/Fabric) get stable ids + row-commit-versions. `DeltaCatalog._rowTrackingOnCreate`
+     (parsed from the ATTACH options JSON like `deletion_vectors`) → `DeltaWriter.Create`/`Write(rowTracking:)`
+     → `CreateConfig` adds a standalone `delta.enableRowTracking=true` branch (the existing DV→RT coupling is
+     unchanged). **Our own DELETE/UPDATE still use the transient `(file,position)` rowid**, NOT the stable
+     row-tracking id — see the note below — so DML behaves exactly as on a plain table (copy-on-write rewrite).
+     `verify_delta_catalog_row_tracking.test` (33 — create declares the feature, CTAS materializes baseRowId,
+     DELETE/UPDATE/INSERT unaffected). Regression: DV/write/delete/update suites unchanged.
+
+     **Can the stable row-tracking id be used as the DML rowid?** Technically yes, but it is counterproductive
+     and not done. Delta DELETE/UPDATE are ultimately **physical** — the copy-on-write rewrite (and the DV path)
+     both need the row's `(file, position)` to know which file to rewrite and which positions to drop. The
+     transient rowid IS that physical locator, computed at scan time for free. A stable row-tracking id would
+     have to be **resolved back** to `(file, position)` via the per-file `baseRowId` ranges (extra bookkeeping)
+     before any delete could act — buying nothing for DuckDB's model, where a single DML statement scans and
+     mutates one atomic snapshot (the transient rowid is valid for exactly that window). The stable id only pays
+     off for **cross-snapshot** identity (retry a delete after a concurrent writer changed the file set), which
+     DuckDB's single-statement atomic scan→delete never needs. Recommendation kept: transient rowid for DML;
+     `row_tracking true` is a **write-side interop feature** for external readers, not a DML mechanism.
 
      **PARTITIONING + WRITE TUNING — DONE + VALIDATED LIVE ON FABRIC (ABI v51).** Two ways to declare partition
      columns: (1) the **native `CREATE TABLE [t] PARTITIONED BY (cols) [AS …]`** clause (DuckDB v1.5.4 parses it

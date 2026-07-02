@@ -1,0 +1,60 @@
+# name: test/verify_delta_catalog_row_tracking.test
+# description: Delta folder-as-catalog `row_tracking true` ATTACH option. Tables created here enable the Delta
+#              delta.enableRowTracking WRITER feature STANDALONE (independent of deletion_vectors — no reader-v3
+#              bump, minReaderVersion stays 1). Materializes stable row ids (baseRowId/defaultRowCommitVersion)
+#              for external consumers (Spark/Fabric). Our own DELETE/UPDATE still use the transient (file,position)
+#              rowid (the physical locator the copy-on-write rewrite needs), so DML behaves exactly as on a plain
+#              table. Set ARROWNET_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
+# group: [mssql_net]
+
+require mssql_net
+
+require-env ARROWNET_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogrt' AS lake (TYPE arrownet, PROVIDER 'delta', row_tracking true);
+
+statement ok
+CREATE TABLE lake.main.t AS SELECT i AS id, 'a' || i AS name FROM range(1, 5) AS r(i);
+
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
+----
+1	a1
+2	a2
+3	a3
+4	a4
+
+# DELETE works on a row-tracking table (transient rowid copy-on-write, unaffected by the RT feature).
+statement ok
+DELETE FROM lake.main.t WHERE id = 2;
+
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
+----
+1	a1
+3	a3
+4	a4
+
+# UPDATE works too.
+statement ok
+UPDATE lake.main.t SET name = 'C' WHERE id = 3;
+
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
+----
+1	a1
+3	C
+4	a4
+
+# Append after DML still works.
+statement ok
+INSERT INTO lake.main.t VALUES (9, 'nine');
+
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
+----
+1	a1
+3	C
+4	a4
+9	nine

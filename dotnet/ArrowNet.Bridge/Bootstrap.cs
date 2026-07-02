@@ -45,7 +45,7 @@ public static unsafe class Bootstrap
             return new InMemoryArrayStream(schema, new[] { batch });
         });
 
-        vtable->AbiVersion = 54;
+        vtable->AbiVersion = 55;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -97,6 +97,11 @@ public static unsafe class Bootstrap
         vtable->NamedInputExists = &NamedInputExists;
         vtable->ListGlobalFunctions = &ListGlobalFunctions;
         vtable->SetActiveOpener = &SetActiveOpener;
+        vtable->OneLakeOpen = &OneLakeOpen;
+        vtable->OneLakeRead = &OneLakeRead;
+        vtable->OneLakeClose = &OneLakeClose;
+        vtable->OneLakeGlob = &OneLakeGlob;
+        vtable->OneLakeExists = &OneLakeExists;
         return ArrowNetStatus.Ok;
     }
 
@@ -519,6 +524,90 @@ public static unsafe class Bootstrap
     {
         AmbientOpener.Current = opener;
         return ArrowNetStatus.Ok;
+    }
+
+    // ---- onelake:// FileSystem forward callbacks (Phase-3): the C++ onelake FS forwards read ops here to the
+    //      managed Azure DataLake SDK (see OneLakeForwardFs). cred_json = the azure secret fields the host
+    //      resolved from the opener ("{}"/empty ⇒ DefaultAzureCredential).
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int OneLakeOpen(byte* path, byte* credJson, nint* outFile, long* outSize, byte** err)
+    {
+        try
+        {
+            var p = Marshal.PtrToStringUTF8((nint)path) ?? string.Empty;
+            var cj = Marshal.PtrToStringUTF8((nint)credJson);
+            var (handle, size) = OneLakeForwardFs.Open(p, cj);
+            *outFile = Handles.Alloc(handle);
+            *outSize = size;
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int OneLakeRead(nint file, void* buffer, long nrBytes, long location, byte** err)
+    {
+        try
+        {
+            var h = Handles.Resolve<OneLakeForwardFs.Handle>(file)
+                    ?? throw new InvalidOperationException("onelake_read: invalid file handle");
+            OneLakeForwardFs.Read(h, new Span<byte>(buffer, checked((int)nrBytes)), location);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static void OneLakeClose(nint file)
+    {
+        if (file != 0)
+        {
+            Handles.Free(file);
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int OneLakeGlob(byte* pattern, byte* credJson, byte** outJson, byte** err)
+    {
+        try
+        {
+            var pat = Marshal.PtrToStringUTF8((nint)pattern) ?? string.Empty;
+            var cj = Marshal.PtrToStringUTF8((nint)credJson);
+            var json = OneLakeForwardFs.Glob(pat, cj);
+            *outJson = (byte*)Marshal.StringToCoTaskMemUTF8(json); // host frees via free_error
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int OneLakeExists(byte* path, byte* credJson, int* outExists, byte** err)
+    {
+        try
+        {
+            var p = Marshal.PtrToStringUTF8((nint)path) ?? string.Empty;
+            var cj = Marshal.PtrToStringUTF8((nint)credJson);
+            *outExists = OneLakeForwardFs.Exists(p, cj) ? 1 : 0;
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
     }
 
     // Ambient named-source registry (data-in by name) — see Host.RegisterSource. open_named_input exports a

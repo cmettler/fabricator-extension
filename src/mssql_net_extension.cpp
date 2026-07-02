@@ -9,6 +9,7 @@
 #include "arrownet/arrow_ingest.hpp"
 
 #include "arrownet/clr_host.hpp"
+#include "arrownet/arrownet_onelake_fs.hpp"
 #include "catalog/arrownet_catalog.hpp"
 #include "catalog/arrownet_metadata.hpp"
 #include "catalog/arrownet_schema_entry.hpp"
@@ -471,6 +472,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    ScalarFunction("arrownet_managed_dir", {}, LogicalType::VARCHAR, ArrowNetManagedDirFunction));
 
 	RegisterProviderSettings(loader);
+	arrownet::RegisterOneLakeFileSystem(loader.GetDatabaseInstance()); // onelake:// VFS subsystem (docs/filesystem-bridge.md §3)
 	RegisterArrowNetGlobalFunctions(loader); // connection-free global functions (docs/global-functions.md)
 	RegisterArrowNetOptimizer(DBConfig::GetConfig(loader.GetDatabaseInstance()));
 	RegisterArrowNetInOutFinalizer(DBConfig::GetConfig(loader.GetDatabaseInstance()));

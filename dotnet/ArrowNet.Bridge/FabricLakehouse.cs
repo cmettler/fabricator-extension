@@ -71,19 +71,10 @@ public static class FabricLakehouse
         return (root, BuildCredential(fields));
     }
 
+    // Delegates to the shared resolver (SP / managed_identity / DefaultAzureCredential) — one credential model
+    // across DAX / OneLake. See FabricCredentialResolver.
     private static TokenCredential BuildCredential(IReadOnlyDictionary<string, string> fields)
-    {
-        string F(string k) => fields.TryGetValue(k, out var v) ? v ?? string.Empty : string.Empty;
-        var tenantId = F("tenant_id");
-        var clientId = F("client_id");
-        var clientSecret = F("client_secret");
-        if (clientSecret.Length > 0 && clientId.Length > 0 && tenantId.Length > 0)
-        {
-            return new ClientSecretCredential(tenantId, clientId, clientSecret);
-        }
-        // No SP fields → fall back to the ambient chain (az login / managed identity / env).
-        return new DefaultAzureCredential();
-    }
+        => FabricCredentialResolver.Resolve(fields);
 
     // ---- table discovery ----
 
@@ -150,10 +141,8 @@ public static class FabricLakehouse
     /// <see cref="ClientSecretCredential"/> from the SP fields (else <see cref="DefaultAzureCredential"/>).</summary>
     /// <summary>A service-principal credential from the SP fields, or <see cref="DefaultAzureCredential"/> when
     /// they're absent (keeps Azure.Identity in the Bridge so the delta-rs provider passes plain strings).</summary>
-    public static TokenCredential MintCredential(string? tenantId, string? clientId, string? clientSecret) =>
-        (!string.IsNullOrEmpty(tenantId) && !string.IsNullOrEmpty(clientId) && !string.IsNullOrEmpty(clientSecret))
-            ? new ClientSecretCredential(tenantId, clientId, clientSecret)
-            : new DefaultAzureCredential();
+    public static TokenCredential MintCredential(string? tenantId, string? clientId, string? clientSecret)
+        => FabricCredentialResolver.MintCredential(tenantId, clientId, clientSecret);
 
     /// <summary>DROP a OneLake table folder (recursive DFS delete) using SP fields — for the delta-rs provider,
     /// which holds the SP creds as strings, not a <see cref="TokenCredential"/>.</summary>
@@ -198,7 +187,7 @@ public static class FabricLakehouse
         Guid workspaceId, Guid lakehouseId, string catalogName, TokenCredential credential)
     {
         var token = await credential.GetTokenAsync(
-            new TokenRequestContext(new[] { "https://storage.azure.com/.default" }), default).ConfigureAwait(false);
+            new TokenRequestContext(new[] { FabricCredentialResolver.StorageScope }), default).ConfigureAwait(false);
         using var http = new HttpClient();
         http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token.Token);
         string baseUrl = $"https://{UnityCatalogHost}/delta/{workspaceId}/{lakehouseId}/api/2.1/unity-catalog";

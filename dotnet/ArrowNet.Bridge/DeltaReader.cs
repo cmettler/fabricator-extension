@@ -6,6 +6,7 @@ using Apache.Arrow.Ipc;
 using Apache.Arrow.Types;
 using EngineeredWood.DeltaLake;
 using EngineeredWood.DeltaLake.Table;
+using EngineeredWood.IO;
 using EngineeredWood.Expressions;
 using EngineeredWood.Parquet;
 
@@ -24,7 +25,7 @@ internal static class DeltaReader
     /// read). Used at table-function bind. <paramref name="opener"/> = the calling operator's ClientContext.</summary>
     public static Schema GetSchema(nint opener, string path)
     {
-        var fs = new DuckDbTableFileSystem(opener, path);
+        var fs = TableFileSystems.Create(opener, path);
         var table = DeltaTable.OpenAsync(fs).GetAwaiter().GetResult();
         try
         {
@@ -49,14 +50,14 @@ internal static class DeltaReader
     public static IAsyncEnumerable<RecordBatch> Stream(
         nint opener, string path, IReadOnlyList<string>? columns, Predicate? filter, CancellationToken ct)
     {
-        var fs = new DuckDbTableFileSystem(opener, path);
+        var fs = TableFileSystems.Create(opener, path);
         var parquet = filter is null ? ParquetReadOptions.Default : new ParquetReadOptions { Filter = filter };
         var options = DeltaTableOptions.Default with { ParquetReadOptions = parquet };
         return StreamImpl(fs, options, columns, filter, ct);
     }
 
     private static async IAsyncEnumerable<RecordBatch> StreamImpl(
-        DuckDbTableFileSystem fs, DeltaTableOptions options, IReadOnlyList<string>? columns,
+        ITableFileSystem fs, DeltaTableOptions options, IReadOnlyList<string>? columns,
         Predicate? filter, [EnumeratorCancellation] CancellationToken ct)
     {
         var table = await DeltaTable.OpenAsync(fs, options, ct).ConfigureAwait(false);
@@ -79,14 +80,14 @@ internal static class DeltaReader
     public static IAsyncEnumerable<RecordBatch> StreamWithRowIds(
         nint opener, string path, IReadOnlyList<string>? columns, Predicate? filter, CancellationToken ct)
     {
-        var fs = new DuckDbTableFileSystem(opener, path);
+        var fs = TableFileSystems.Create(opener, path);
         var parquet = filter is null ? ParquetReadOptions.Default : new ParquetReadOptions { Filter = filter };
         var options = DeltaTableOptions.Default with { ParquetReadOptions = parquet };
         return StreamWithRowIdsImpl(fs, options, columns, filter, ct);
     }
 
     private static async IAsyncEnumerable<RecordBatch> StreamWithRowIdsImpl(
-        DuckDbTableFileSystem fs, DeltaTableOptions options, IReadOnlyList<string>? columns,
+        ITableFileSystem fs, DeltaTableOptions options, IReadOnlyList<string>? columns,
         Predicate? filter, [EnumeratorCancellation] CancellationToken ct)
     {
         var table = await DeltaTable.OpenAsync(fs, options, ct).ConfigureAwait(false);
@@ -107,7 +108,7 @@ internal static class DeltaReader
     /// (deletion vectors). Returns the number of rows deleted.</summary>
     public static long DeleteByRowIds(nint opener, string path, IReadOnlyCollection<long> rowIds, CancellationToken ct)
     {
-        var fs = new DuckDbTableFileSystem(opener, path);
+        var fs = TableFileSystems.Create(opener, path);
         // Open with the standard WRITE options (OmitPathInSchema=false) so the copy-on-write rewrite emits
         // standard-readable parquet — DeltaTableOptions.Default would drop path_in_schema (TProtocolException).
         var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).AsTask().GetAwaiter().GetResult();
@@ -136,7 +137,7 @@ internal static class DeltaReader
     /// — DELETE then uses deletion vectors (no file rewrite) instead of copy-on-write.</summary>
     public static bool IsDeletionVectorsEnabled(nint opener, string path)
     {
-        var fs = new DuckDbTableFileSystem(opener, path);
+        var fs = TableFileSystems.Create(opener, path);
         var table = DeltaTable.OpenAsync(fs).GetAwaiter().GetResult();
         try
         {
@@ -156,7 +157,7 @@ internal static class DeltaReader
     public static long DeleteByRowIdsViaVectors(nint opener, string path, IReadOnlyCollection<long> rowIds,
                                                 CancellationToken ct)
     {
-        var fs = new DuckDbTableFileSystem(opener, path);
+        var fs = TableFileSystems.Create(opener, path);
         var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).AsTask().GetAwaiter().GetResult();
         try
         {
@@ -177,7 +178,7 @@ internal static class DeltaReader
     /// <c>AT</c> clause unit); <paramref name="value"/> is the BIGINT version or a parseable timestamp.</summary>
     public static Schema GetSchemaAt(nint opener, string path, string unit, string value)
     {
-        var fs = new DuckDbTableFileSystem(opener, path);
+        var fs = TableFileSystems.Create(opener, path);
         var table = DeltaTable.OpenAsync(fs).GetAwaiter().GetResult();
         try
         {
@@ -197,14 +198,14 @@ internal static class DeltaReader
         nint opener, string path, IReadOnlyList<string>? columns, Predicate? filter, string unit, string value,
         CancellationToken ct)
     {
-        var fs = new DuckDbTableFileSystem(opener, path);
+        var fs = TableFileSystems.Create(opener, path);
         var parquet = filter is null ? ParquetReadOptions.Default : new ParquetReadOptions { Filter = filter };
         var options = DeltaTableOptions.Default with { ParquetReadOptions = parquet };
         return StreamAtImpl(fs, options, columns, filter, unit, value, ct);
     }
 
     private static async IAsyncEnumerable<RecordBatch> StreamAtImpl(
-        DuckDbTableFileSystem fs, DeltaTableOptions options, IReadOnlyList<string>? columns, Predicate? filter,
+        ITableFileSystem fs, DeltaTableOptions options, IReadOnlyList<string>? columns, Predicate? filter,
         string unit, string value, [EnumeratorCancellation] CancellationToken ct)
     {
         var table = await DeltaTable.OpenAsync(fs, options, ct).ConfigureAwait(false);
@@ -290,7 +291,7 @@ internal static class DeltaReader
     private static async IAsyncEnumerable<RecordBatch> StreamChanges(
         nint opener, string path, long fromVersion, long toVersion, [EnumeratorCancellation] CancellationToken ct)
     {
-        var fs = new DuckDbTableFileSystem(opener, path);
+        var fs = TableFileSystems.Create(opener, path);
         var table = await DeltaTable.OpenAsync(fs, DeltaTableOptions.Default, ct).ConfigureAwait(false);
         try
         {
@@ -332,7 +333,7 @@ internal static class DeltaReader
         nint opener, string path, Int64Array.Builder versions, TimestampArray.Builder timestamps,
         StringArray.Builder operations, StringArray.Builder operationParams)
     {
-        var fs = new DuckDbTableFileSystem(opener, path);
+        var fs = TableFileSystems.Create(opener, path);
         var table = await DeltaTable.OpenAsync(fs).ConfigureAwait(false);
         int rows = 0;
         try
@@ -367,14 +368,14 @@ internal static class DeltaReader
         nint opener, string path, IReadOnlyList<string>? columns, Predicate? filter, string unit, string value,
         CancellationToken ct)
     {
-        var fs = new DuckDbTableFileSystem(opener, path);
+        var fs = TableFileSystems.Create(opener, path);
         var parquet = filter is null ? ParquetReadOptions.Default : new ParquetReadOptions { Filter = filter };
         var options = DeltaTableOptions.Default with { ParquetReadOptions = parquet };
         return StreamWithRowIdsAtImpl(fs, options, columns, filter, unit, value, ct);
     }
 
     private static async IAsyncEnumerable<RecordBatch> StreamWithRowIdsAtImpl(
-        DuckDbTableFileSystem fs, DeltaTableOptions options, IReadOnlyList<string>? columns, Predicate? filter,
+        ITableFileSystem fs, DeltaTableOptions options, IReadOnlyList<string>? columns, Predicate? filter,
         string unit, string value, [EnumeratorCancellation] CancellationToken ct)
     {
         var table = await DeltaTable.OpenAsync(fs, options, ct).ConfigureAwait(false);
@@ -417,7 +418,7 @@ internal static class DeltaReader
     /// as NULL (engineered-wood backfills them). Opens with the standard write options (path_in_schema).</summary>
     public static void AddColumn(nint opener, string path, Field column, CancellationToken ct)
     {
-        var fs = new DuckDbTableFileSystem(opener, path);
+        var fs = TableFileSystems.Create(opener, path);
         var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).AsTask().GetAwaiter().GetResult();
         try
         {
@@ -440,7 +441,7 @@ internal static class DeltaReader
     public static void UpdateByRowIds(nint opener, string path, IReadOnlyCollection<long> rowIds,
         System.Func<long, IReadOnlyList<RecordBatch>, IReadOnlyList<RecordBatch>> rewriteFile, CancellationToken ct)
     {
-        var fs = new DuckDbTableFileSystem(opener, path);
+        var fs = TableFileSystems.Create(opener, path);
         var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).AsTask().GetAwaiter().GetResult();
         try
         {

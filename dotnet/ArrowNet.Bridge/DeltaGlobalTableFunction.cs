@@ -41,7 +41,10 @@ public sealed class DeltaGlobalTableFunction : ITableFunction
         var path = ((StringArray)args.Column(0)).GetString(0)
                    ?? throw new System.ArgumentException("arrownet_delta_scan: path must not be NULL");
         // The opener (this operator's ClientContext) is valid for the duration of this synchronous bind —
-        // read the Delta table's schema now (no data read).
+        // read the Delta table's schema now (no data read). This is a connection-free global reader with no
+        // Fabric credential, so clear any left on this (reused) execution thread by a prior catalog op → the FS
+        // factory uses the host-FS (duckdb-azure) path, not the direct-SDK OneLake filesystem.
+        AmbientOneLakeCredential.Current = null;
         var schema = DeltaReader.GetSchema(AmbientOpener.Current, path);
         return new DeltaBinding(path, schema);
     }
@@ -69,6 +72,8 @@ public sealed class DeltaGlobalTableFunction : ITableFunction
         {
             // Capture the opener (this operator's ClientContext) NOW — it stays valid for the whole execution,
             // so the lazy stream below can read files through it as the host pulls batches (no materialization).
+            // Connection-free global reader → clear any stale Fabric credential (host-FS path, see Bind).
+            AmbientOneLakeCredential.Current = null;
             var opener = AmbientOpener.Current;
             var spec = scan.Spec;
             // Push the FILTER for file + row-group skipping (doesn't change the result schema). Read the filter
@@ -162,6 +167,7 @@ public sealed class DeltaWriteDemoFunction : ITableFunction
         public IAsyncEnumerable<RecordBatch> Execute(TableFunctionScan scan, CancellationToken ct = default)
         {
             // Write synchronously while the opener (captured now) is valid, then yield the result row.
+            AmbientOneLakeCredential.Current = null; // connection-free global writer → host-FS path
             var (version, rows) = WriteDemoTable(AmbientOpener.Current, _path, ct);
             var batch = new RecordBatch(_schema, new IArrowArray[]
             {
@@ -275,9 +281,9 @@ internal static class DeltaWriter
     /// => <c>delta.enableInCommitTimestamps</c> (a WRITER-only feature) so AT (TIMESTAMP =&gt; ...) time travel
     /// can resolve a timestamp to a version.</summary>
     private static Dictionary<string, string>? CreateConfig(
-        bool deletionVectors, bool inCommitTimestamps, bool changeDataFeed)
+        bool deletionVectors, bool rowTracking, bool inCommitTimestamps, bool changeDataFeed)
     {
-        if (!deletionVectors && !inCommitTimestamps && !changeDataFeed)
+        if (!deletionVectors && !rowTracking && !inCommitTimestamps && !changeDataFeed)
         {
             return null;
         }
@@ -285,6 +291,11 @@ internal static class DeltaWriter
         if (deletionVectors)
         {
             config["delta.enableDeletionVectors"] = "true";
+            config["delta.enableRowTracking"] = "true"; // DV mode keeps row tracking (unchanged behavior)
+        }
+        if (rowTracking)
+        {
+            // Standalone row tracking (writer feature), independent of deletion vectors.
             config["delta.enableRowTracking"] = "true";
         }
         if (inCommitTimestamps)
@@ -312,14 +323,14 @@ internal static class DeltaWriter
     public static long Write(nint opener, string path, Schema schema, IReadOnlyList<RecordBatch> batches,
                              DeltaWriteMode mode, CancellationToken ct, bool deletionVectors = false,
                              bool inCommitTimestamps = false, bool changeDataFeed = false,
-                             DeltaWriteSpec? spec = null)
+                             bool rowTracking = false, DeltaWriteSpec? spec = null)
     {
         for (int attempt = 1; ; attempt++)
         {
-            var fs = new DuckDbTableFileSystem(opener, path);
+            var fs = TableFileSystems.Create(opener, path);
             var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(spec),
                                                      partitionColumns: spec?.PartitionColumns,
-                                                     configuration: CreateConfig(deletionVectors, inCommitTimestamps, changeDataFeed),
+                                                     configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed),
                                                      cancellationToken: ct).AsTask().GetAwaiter().GetResult();
             try
             {
@@ -381,17 +392,17 @@ internal static class DeltaWriter
     /// <paramref name="deletionVectors"/> enables the DV+rowTracking features (opt-in fast-delete).</summary>
     public static void Create(nint opener, string path, Schema schema, CancellationToken ct,
                               bool deletionVectors = false, bool inCommitTimestamps = false,
-                              bool changeDataFeed = false, DeltaWriteSpec? spec = null)
+                              bool changeDataFeed = false, bool rowTracking = false, DeltaWriteSpec? spec = null)
     {
         for (int attempt = 1; ; attempt++)
         {
-            var fs = new DuckDbTableFileSystem(opener, path);
+            var fs = TableFileSystems.Create(opener, path);
             try
             {
                 // OpenOrCreate writes commit-0 for a new table (or opens an existing one — no commit, no conflict).
                 var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(spec),
                                                          partitionColumns: spec?.PartitionColumns,
-                                                         configuration: CreateConfig(deletionVectors, inCommitTimestamps, changeDataFeed),
+                                                         configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed),
                                                          cancellationToken: ct).AsTask().GetAwaiter().GetResult();
                 table.DisposeAsync().AsTask().GetAwaiter().GetResult();
                 return;
@@ -505,6 +516,7 @@ public sealed class DeltaWriteCollectorFunction : ICollectorTableFunction
             IAsyncEnumerable<RecordBatch> allInput, [EnumeratorCancellation] CancellationToken ct = default)
         {
             // Capture the opener at entry (the operator set it before pulling); valid for the whole write.
+            AmbientOneLakeCredential.Current = null; // connection-free global collector → host-FS path
             var opener = AmbientOpener.Current;
 
             // Copy the input out of its (transient) Arrow buffers via an IPC round-trip, since the operator frees

@@ -157,6 +157,14 @@ write-back foundation — see docs/delta-catalog.md (recommendation step 0).
 `FileSystem::RemoveDirectory`, idempotent). Powers Delta catalog **DROP TABLE** (`DeltaCatalog.DropTable` →
 `HostFs.RemoveDir` deletes the table's whole `<root>/<table>/` folder). See docs/delta-catalog.md.
 
+**v55** appended 5 vtable entries `onelake_open`/`onelake_read`/`onelake_close`/`onelake_glob`/`onelake_exists`
+— the FORWARD callbacks (host C++ → managed) for the `onelake://` DuckDB FileSystem subsystem (Phase-3 step 3,
+read-only). The C++ `ArrowNetOneLakeFileSystem` (registered in the VFS at load) dispatches its reads to the
+managed Azure DataLake SDK (`OneLakeForwardFs`), so DuckDB's native readers + `ExternalFileCache` use OneLake
+uniformly, bypassing duckdb-azure. Credential = the azure secret the host resolves from the opener (fields as
+JSON) → `FabricCredentialResolver`. See §3 above. (v51–v54 were the Delta partitioning / cluster-by / identity /
+schema-mode entries, prior sessions.)
+
 **v50** appended `fs_move_dir`(opener,src,dest) — a directory rename/move (DuckDB's `FileSystem::MoveFile`:
 atomic on a local filesystem; object stores throw "not implemented"). Powers **local/S3 Delta catalog RENAME
 TABLE** (`DeltaCatalog.AlterTable` RenameTable → `HostFs.MoveDir` moves the `<root>/<table>/` folder). OneLake
@@ -177,3 +185,106 @@ RENAME does NOT use this (Azure `MoveFile` is unimplemented) — it renames via 
 > single discovery never returns; ~1s in a console host) — the async path uses `SendAsync` and works, like every
 > other Bridge IO path. Note `fs_remove` (single file) DOES work on Azure DFS — only the recursive directory delete
 > and recursive glob through duckdb-azure are missing, which the direct DFS SDK sidesteps.
+
+## OneLake filesystem + unified Fabric credential (design, DEFERRED — nothing built)
+
+> Motivation (2026-07-02): the duckdb-azure `abfss://` gaps (recursive glob PR #174, `RemoveDirectory`/`MoveFile`
+> unimplemented on the DFS endpoint) are a recurring source of OneLake workarounds. Rather than keep working
+> *around* duckdb-azure per-operation, build a **C# OneLake filesystem** on the Azure SDK (the extension already
+> hosts C# and already uses `Azure.Storage.Files.DataLake` in `FabricLakehouse` for discovery + DROP) — bypassing
+> duckdb-azure for everything C# touches. Requirement: the extension + providers must run **both locally and inside
+> a Fabric Python notebook**, with **DAX + SQL + OneLake/Lakehouse** all authenticating seamlessly (SP locally;
+> managed/workspace identity in Fabric).
+
+**Blueprint checked, not copied — `D:\repos\duckdb_onelake`** (C++/Rust, uses delta-kernel-rs; appears unmaintained)
+**does NOT fix the filesystem** — it reads OneLake through DuckDB's `httpfs`/`delta` against the DFS endpoint (hence
+its fragile `set azure_transport_option_type='curl'` + `CURL_CA_PATH` requirement) with a bearer token. It leans on
+duckdb-azure exactly where we want to escape it. Its value is the **secret/auth layering**: a dedicated `TYPE ONELAKE`
+secret for the **Fabric REST API** (workspace/lakehouse resolution) alongside a `TYPE azure` secret for **storage**,
+with auth modes SP / workspace managed identity / `credential_chain` (`env`/`cli`). So: good model for secrets, no
+model for the filesystem.
+
+**Filesystem ↔ secret relationship (the key clarification).** DuckDB natively binds a FileSystem to secrets
+*implicitly* via the `FileOpener`/`SecretManager` (opening `abfss://…` scope-matches an `azure` secret). In our
+C# model there is **no implicit binding** — we resolve a credential **once at ATTACH/catalog-open and hand it
+explicitly** to the filesystem instance (as we already do for DAX `DaxTokenAuth`, SQL Entra tokens, and OneLake
+`FabricLakehouse`). The credential is a constructor argument, not a scope lookup. Simpler and fully under our control.
+
+### The four pieces (sequenced)
+
+1. **`FabricCredentialResolver` — DONE (2026-07-02).** One shared C# `TokenCredential` in the Bridge
+   (`dotnet/ArrowNet.Bridge/FabricCredentialResolver.cs`, `public static`): `azure` SP secret present ⇒
+   `ClientSecretCredential` (local / CI); `managed_identity` ⇒ `ManagedIdentityCredential`; else ⇒
+   `DefaultAzureCredential` (Fabric: managed / workspace identity via the MSI endpoint; local: az CLI / env / VS).
+   Scope constants `PowerBiScope` / `StorageScope` / `SqlScope` + `Resolve(fields)` / `MintCredential(strings)` /
+   `ResolveForRemoteTarget(connstr)` / `GetToken`(Async). The prior duplicates now delegate: `DaxTokenAuth`
+   (`Resolve` + `DefaultCredentialForTarget` + `GetToken`, PowerBiScope aliased), `FabricLakehouse.BuildCredential` +
+   `MintCredential` + the storage scope. SQL keeps SqlClient's native connstr-level Entra auth (consumes the same
+   secret *fields*, not a `TokenCredential`) — deliberately unchanged. Behavior-preserving for the SP + no-secret
+   cases; now also handles `managed_identity` consistently for OneLake (previously only DAX did). Builds across all
+   three assemblies; local Delta suite unregressed; DAX loads cleanly. **Caveat (unchanged):** the MSI/workspace-
+   identity path must still be **verified in a live Fabric notebook** — `DefaultAzureCredential` should pick up the
+   MSI endpoint, but that is assumption, not yet tested. This is the shared entry point step 2's OneLake FS consumes.
+2. **`OneLakeDataLakeFileSystem : ITableFileSystem` — DONE + LIVE-VALIDATED on Fabric (2026-07-02).** A full
+   read/write filesystem on `Azure.Storage.Files.DataLake` (`dotnet/ArrowNet.Bridge/OneLakeDataLakeFileSystem.cs`):
+   `ListAsync` (GetPaths, 404→empty), `OpenReadAsync`/`ReadAllBytesAsync` (range GET + OpenRead), `CreateAsync`
+   (put-if-absent via `DataLakePathCreateOptions.Conditions IfNoneMatch=*`), **`RenameAsync` = a TRUE atomic ADLS
+   rename** (`DataLakeFileClient.RenameAsync` with `IfNoneMatch=*` → 409/412 ⇒ false = the Delta commit-conflict
+   signal, replacing the host-FS copy+exclusive-create emulation), `DeleteAsync`/`ExistsAsync`/`WriteAllBytesAsync`,
+   + `OneLakeRandomAccessFile` / `OneLakeSequentialFile` (append+flush). All ASYNC (sync DataLake hangs under the
+   hostfxr CLR). Selected by `TableFileSystems.Create(opener, path)`: OneLake root AND a Fabric credential in scope
+   (`AmbientOneLakeCredential`, [ThreadStatic], mirroring `AmbientOpener`) ⇒ this FS; else `DuckDbTableFileSystem`.
+   `DeltaCatalog.Opener()` publishes `_fabricCredential` to the ambient wherever it fetches the opener (incl. the bulk
+   consumer thread — the FS is constructed synchronously there, capturing the credential before any async hop); the
+   connection-free global `arrownet_delta_*` functions clear the ambient (host-FS path). The 16
+   `new DuckDbTableFileSystem(...)` sites now route through the factory; `DeltaReader` helpers widened to
+   `ITableFileSystem`. **Local regression green** (9 Delta suites, 412 assertions — the local suites exercise the
+   credential-null fallback to `DuckDbTableFileSystem`). **Live-validated on Fabric** (workspace `Test`, flat
+   lakehouse `LH_no_schema`, `SECRET fabric_sp`): ATTACH → CTAS (count = 3) → `DELETE WHERE id=2` (→ 1,3, copy-on-write
+   + atomic-rename commit) → DROP, all through the direct DataLake SDK (no duckdb-azure). **Bug found + fixed during
+   validation:** `ListAsync("_delta_log/")` trimmed the trailing slash, treating the directory prefix as a file
+   prefix in the table root → listed the root non-recursively → returned only the `_delta_log` *directory* entry
+   (skipped) = empty log → the read-back saw no commits → `SnapshotBuilder` "Table has no metadata action". Fixed by
+   keeping the trailing slash when computing the listing directory. **Known OneLake characteristic (not a bug):** the
+   very first read immediately after the first write in a session can transiently miss the just-committed
+   `_delta_log/…json` (DFS `GetPaths` listing lag) → a stale/empty read that resolves within ~1-2s; observed once,
+   did not reproduce. A future mitigation could trust the writer's known committed version instead of re-listing.
+3. **Register the C# FS as a DuckDB `onelake://` subsystem (forward callbacks) — SLICE 1 (read-only) DONE +
+   LIVE-VALIDATED on Fabric (2026-07-03, ABI v55).** A C++ `ArrowNetOneLakeFileSystem : FileSystem`
+   (`src/arrownet/arrownet_onelake_fs.{hpp,cpp}`) is registered in DuckDB's VFS at extension load
+   (`RegisterOneLakeFileSystem`, `CanHandleFile` = the `onelake://` scheme). Its read ops forward C++→C# via 5 new
+   vtable entries (`onelake_open`/`onelake_read`/`onelake_close`/`onelake_glob`/`onelake_exists`) to
+   `OneLakeForwardFs` (the managed Azure DataLake SDK, reusing step 2's logic). **The credential** is resolved
+   C++-side from the calling opener: `SecretManager::LookupSecret(path,"azure")`, falling back to ANY registered
+   `azure` secret (OneLake `onelake://` paths don't match an azure secret's default scopes) → the fields as JSON →
+   C# `FabricCredentialResolver` (empty ⇒ `DefaultAzureCredential`). So this is exactly the C#→C++→C# path: the
+   OneLake IO logic is C#, registered as a C++ FileSystem, reached back in C#. **The charm (key upside): NOT
+   Delta-specific — `onelake://` lifts EVERY DuckDB reader onto OneLake**, and (unlike step 2's standalone FS) it
+   is behind the VFS so DuckDB's native parquet reader + `ExternalFileCache` use it. **Validated live:** CTAS a Delta
+   table via the catalog, then `SELECT count(*) FROM read_parquet('onelake://Test/LH_no_schema.Lakehouse/Tables/t/
+   *.parquet')` = 3, rows correct — read through DuckDB's NATIVE parquet reader over the subsystem, no duckdb-azure.
+   **Bugs found + fixed during validation:** (a) `OneLakeForwardFs.Glob` blocked the AsyncPageable enumerator
+   per-item (`MoveNextAsync().GetAwaiter().GetResult()`) → `NotSupportedException` under the hostfxr CLR — fixed to
+   `await foreach` in an async method blocked once at the top (the FabricLakehouse pattern); (b) glob matched only
+   the before-`*` prefix → pulled in `_delta_log/*.json` (read as parquet → "no magic bytes") — fixed to enforce
+   the after-`*` suffix + a single-`*`-doesn't-cross-`/` rule; (c) the parquet reader calls
+   `GetLastModifiedTime` → added (returns a constant, correct since Delta data files are immutable).
+   **Slice 2 (deferred):** wire engineered-wood's `fs_*` reverse callbacks to open through a `CachingFileHandle`
+   (so engineered-wood's log reads are cached too — the native reader already caches); route the Delta catalog
+   reads through `onelake://` to retire step 2's separate FS selection; `read_json`/`read_csv`/`excel`/
+   `COPY … TO 'onelake://…'` (write ops on the C++ FS still throw NotImplemented). Cost noted: per-range-read
+   C++↔C# marshaling (cache-mitigated).
+4. **(optional, UX) a dedicated `TYPE fabric` secret (small).** Via the provider-declared-secret machinery (ABI v38),
+   modeling auth intent explicitly (`AUTH 'service_principal' | 'managed_identity' | 'workspace_identity' | 'cli' |
+   'default'`). Functionally redundant over "azure secret + `DefaultAzureCredential` fallback" (which already covers
+   local SP + Fabric managed identity) — pure clarity. Reuse the `azure` secret now; add `fabric` only if the UX
+   warrants it.
+
+### Assessment / sequencing
+
+Steps **1 + 2** are clearly worthwhile and architecturally clean: they make us **independent of duckdb-azure's OneLake
+maturity for the entire C# path**, reusing what `FabricLakehouse` already proves (async DataLake SDK, SP credential
+minting). Step **3** is the strategic multiplier — a single `onelake://` DuckDB FileSystem serves *all* formats
+(Delta + Excel/JSON/CSV/parquet + `COPY`) and is what the native reader needs — but it is the largest lift and is
+gated on adopting the native Multifile-Delta model. Step **4** is optional polish. **Nothing built** — design note only;
+`FabricLakehouse` (direct DFS SDK for discovery + DROP) is the working precedent to generalize.

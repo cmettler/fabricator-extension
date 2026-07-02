@@ -519,6 +519,68 @@ bool NamedInputExists(const std::string &name) {
 	}
 }
 
+ArrowNetHandle OneLakeOpen(const std::string &path, const std::string &cred_json, int64_t &out_size) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.onelake_open) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide onelake_open");
+	}
+	char *err = nullptr;
+	ArrowNetHandle file = nullptr;
+	int32_t rc = vt.onelake_open(path.c_str(), cred_json.c_str(), &file, &out_size, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: onelake_open failed");
+	}
+	return file;
+}
+
+void OneLakeRead(ArrowNetHandle file, void *buffer, int64_t nr_bytes, int64_t location) {
+	const ArrowNetVTable &vt = GetBridge();
+	char *err = nullptr;
+	int32_t rc = vt.onelake_read(file, buffer, nr_bytes, location, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: onelake_read failed");
+	}
+}
+
+void OneLakeClose(ArrowNetHandle file) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (vt.onelake_close && file) {
+		vt.onelake_close(file);
+	}
+}
+
+std::string OneLakeGlob(const std::string &pattern, const std::string &cred_json) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.onelake_glob) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide onelake_glob");
+	}
+	char *err = nullptr;
+	char *out_json = nullptr;
+	int32_t rc = vt.onelake_glob(pattern.c_str(), cred_json.c_str(), &out_json, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: onelake_glob failed");
+	}
+	std::string result = out_json ? out_json : "[]";
+	if (out_json && vt.free_error) {
+		vt.free_error(out_json); // allocated by StringToCoTaskMemUTF8; freed like an error string
+	}
+	return result;
+}
+
+bool OneLakeExists(const std::string &path, const std::string &cred_json) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.onelake_exists) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide onelake_exists");
+	}
+	char *err = nullptr;
+	int32_t exists = 0;
+	int32_t rc = vt.onelake_exists(path.c_str(), cred_json.c_str(), &exists, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: onelake_exists failed");
+	}
+	return exists != 0;
+}
+
 void ListSecretFields(ArrowArrayStream &out) {
 	const ArrowNetVTable &vt = GetBridge();
 	if (!vt.list_secret_fields) {

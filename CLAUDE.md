@@ -1127,7 +1127,21 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v54** (v54 = **`SCHEMA_MODE` COPY option** — appended a `schema_mode` param to
+- **Current version: ABI v55** (v55 = **`onelake://` FileSystem forward callbacks** — appended 5 vtable entries
+  `onelake_open`/`onelake_read`/`onelake_close`/`onelake_glob`/`onelake_exists` (host C++ → managed). A C++
+  `ArrowNetOneLakeFileSystem : FileSystem` (`src/arrownet/arrownet_onelake_fs.{hpp,cpp}`) is registered in DuckDB's
+  VFS at load (`RegisterOneLakeFileSystem`, `CanHandleFile` = the `onelake://` scheme) and forwards its **read** ops
+  to the managed Azure DataLake SDK (`OneLakeForwardFs`, reusing the step-2 `OneLakeDataLakeFileSystem` logic) — so
+  DuckDB's **native parquet reader + ExternalFileCache** use OneLake uniformly, bypassing duckdb-azure. Credential =
+  C++ resolves the azure secret from the calling opener (`SecretManager::LookupSecret(path,"azure")`, fallback to any
+  `azure` secret since `onelake://` doesn't match azure's default scopes) → fields JSON → C# `FabricCredentialResolver`
+  (empty ⇒ `DefaultAzureCredential`). This is Phase-3 step 3 of the OneLake-filesystem design
+  ([docs/filesystem-bridge.md](docs/filesystem-bridge.md) §3): the C#→C++→C# path (OneLake IO logic in C#, registered
+  as a C++ FileSystem, reached back in C#). **Slice 1 (read-only) DONE + live-validated on Fabric**:
+  `SELECT count(*) FROM read_parquet('onelake://Test/LH_no_schema.Lakehouse/Tables/t/*.parquet')` reads OneLake Delta
+  data files through DuckDB's native reader over the subsystem (no duckdb-azure); local regression green. Write ops on
+  the C++ FS throw NotImplemented; slice 2 (caching the reverse `fs_*` reads, routing the Delta catalog through
+  `onelake://`, `read_json`/`csv`/`excel`/`COPY TO`) deferred. v54 = **`SCHEMA_MODE` COPY option** — appended a `schema_mode` param to
   `begin_bulk` (nullable: "merge" | "overwrite"); the Delta provider does append+union / replace+adopt-schema,
   and `CREATE OR REPLACE` is now a true schema replace via engineered-wood `SetSchemaAsync`. Provider-agnostic —
   SQL Server / DAX ignore it. See the Delta partitioning/write bullet ("SCHEMA EVOLUTION on write"). v53 = **IDENTITY columns** — appended an `identity_columns` param (nullable,
@@ -1501,7 +1515,18 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `main`), schema-enabled → schema dirs under `Tables/` then table dirs under each (`Tables/<schema>/<table>`);
   **local/S3/plain-ADLS roots keep the host-FS glob** (`DeltaCatalog.DiscoverTables` branches on
   `FabricLakehouse.IsOneLake`). This is immune to the glob bug AND the `ListTables` 400 on schema-enabled
-  lakehouses, AND free of the SQL-endpoint sync lag (DFS reflects committed files immediately). **The Fabric REST
+  lakehouses, AND free of the SQL-endpoint sync lag (DFS reflects committed files immediately). **DESIGN (deferred,
+  nothing built): generalize `FabricLakehouse` into a full C# OneLake filesystem to escape duckdb-azure entirely** —
+  [docs/filesystem-bridge.md](docs/filesystem-bridge.md) §"OneLake filesystem + unified Fabric credential": (1) a
+  shared `FabricCredentialResolver` (SP secret ⇒ `ClientSecretCredential`, else `DefaultAzureCredential` picking up
+  Fabric managed/workspace identity — one credential feeding DAX/SQL/OneLake with per-service scopes; the "seamless
+  local + Fabric-notebook" requirement); (2) `OneLakeDataLakeFileSystem : ITableFileSystem` on the Azure DataLake SDK,
+  swapped in for OneLake roots instead of the host `fs_*` callbacks (removes duckdb-azure from ALL C#-side IO); (3)
+  **with the native Multifile-Delta model, register it as a DuckDB `onelake://` FileSystem (forward callbacks)** — NOT
+  Delta-specific, it lifts EVERY DuckDB reader/writer (read_json/csv/parquet, excel, `COPY … TO 'onelake://…'`) onto
+  OneLake, so Excel/JSON round-trips ride the same transport for free; (4) optional `TYPE fabric` secret (v38 machinery)
+  for explicit auth UX (redundant over azure-secret + DefaultAzureCredential; pure clarity). `duckdb_onelake` is the
+  secret-layering blueprint only — it still leans on duckdb-azure/httpfs, doesn't fix the FS. **The Fabric REST
   API is kept ONLY for the schema-enabled flag** (`GetLakehouse.DefaultSchema` — authoritative even for an empty
   lakehouse, where the DFS structure alone is ambiguous) **+ workspace/lakehouse name→GUID resolution**
   (`WorkspacesClient`/`ItemsClient`; GUIDs in the path skip it). **CRITICAL — use the ASYNC DataLake APIs**
@@ -1568,6 +1593,33 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   endpoint. (This supersedes the earlier row-tracking/DV Fabric-conversion failures, which were the pre-fix
   byte-format/protocol bugs; the current inline-DV format is Fabric-readable. Contrast the delta-rs provider,
   which copy-on-writes DELETE and produces no DV.)
+  **STANDALONE ROW TRACKING DONE — ATTACH option `row_tracking true`.** Enables the Delta
+  `delta.enableRowTracking` WRITER feature (writer-v7 + `domainMetadata`) **independent of `deletion_vectors`**,
+  and — unlike DV mode — WITHOUT a reader-v3 bump (`minReaderVersion` stays 1). Verified: commit-0
+  `writerFeatures:["rowTracking","domainMetadata"]` + `delta.enableRowTracking=true`; the WRITE commit's `add`
+  carries `baseRowId`/`defaultRowCommitVersion` (stable ids for Spark/Fabric). `DeltaCatalog._rowTrackingOnCreate`
+  (parsed like `deletion_vectors`) → `DeltaWriter.Create`/`Write(rowTracking:)` → `CreateConfig`'s standalone
+  `delta.enableRowTracking` branch (the DV→RT coupling is unchanged). **Our DELETE/UPDATE still use the transient
+  `(file,position)` rowid, NOT the stable id** — Delta DML is physical (the copy-on-write rewrite / DV path need
+  `(file,position)`, which the transient rowid already IS, computed at scan time); a stable id would have to be
+  resolved back to `(file,position)` via per-file `baseRowId` ranges for no benefit under DuckDB's single-statement
+  atomic scan→mutate (the transient rowid is valid for exactly that snapshot window). Stable-id DML only pays off
+  for cross-snapshot retry, which DuckDB never needs → `row_tracking` is a **write-side interop feature for external
+  readers**, not a DML mechanism. `verify_delta_catalog_row_tracking.test` (33 — feature declared, baseRowId
+  materialized, DELETE/UPDATE/INSERT unaffected). See [docs/delta-catalog.md](docs/delta-catalog.md).
+  **engineered-wood WRITE interop caveats (reviewed 2026-07-02; from its `doc/known-issues.md`):** engineered-wood
+  is a from-scratch C# Parquet/Delta stack, so the write path diverges from Spark/parquet-mr in a few subtle ways —
+  none a show-stopper (Fabric/DuckDB/arrow-rs read our output, validated live), but the two "Spark-ecosystem
+  friendliness" candidates are: (1) **writes DataPage V2 by DEFAULT, not V1** (`ParquetWriteOptions.DataPageVersion`
+  defaults to V2; `DeltaWriter.Options()` doesn't override → all Delta writes are DataPage V2, *newer* than Spark's
+  V1 default and still "experimental" in parts of the ecosystem; a V1 pin is a one-liner — `DataPageVersion.V1` in
+  `DeltaWriter.Options()`); (2) **deprecated parquet `min`/`max` always emitted with SIGNED byte ordering + no
+  `column_orders`** → wrong ordering for UTF-8/unsigned columns *if* a legacy reader falls back to them (modern
+  readers use `min_value`/`max_value`, correct → low risk). Lesser: ns-timestamp write sets `ConvertedType=micros`;
+  Delta stats have no string-min/max truncation + only top-level primitives; DVs are inline/UUID-relative only,
+  one file per delete; features only settable at create (matches our design). Both cheap defensive fixes are
+  DEFERRED until a concrete reader complains. Full list: [docs/delta-catalog.md](docs/delta-catalog.md)
+  §"engineered-wood interop caveats".
   **OCC RETRY DONE (concurrent writers):**
   engineered-wood `WriteCommitAsync` throws `DeltaConflictException` when a concurrent writer takes the target
   version; `DeltaWriter.Write`/`Create` (append/CTAS/create) catch it and retry by reopening at the new latest
@@ -1672,7 +1724,30 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   **snapshot/file-list provider** feeding DuckDB's C++ **`MultiFileReader`** + native parquet reader (the
   architecture of DuckDB's own `delta` ext, swapping delta-kernel-rs for the C# log layer), with a cheaper
   `host_query`+`read_parquet` middle-ground first — is captured as a design note (deferred, nothing built):
-  [docs/multifile-delta.md](docs/multifile-delta.md). A separate deferred note,
+  [docs/multifile-delta.md](docs/multifile-delta.md). **Design fleshed out + source-grounded 2026-07-02**
+  (against `D:\repos\duckdb-delta` + DuckDB 1.5.4's `MultiFileReader` API): the **inversion** = C# becomes a
+  pure **metadata provider** (`ILakehouseSnapshot`: file list + DV + partition values + schema + baseRowId),
+  DuckDB's native parquet reader/writer does ALL parquet I/O → engineered-wood's weakest part (its parquet
+  reader/writer, source of the decimal/DV-format/DataPage-V2/signed-min-max issues) FALLS AWAY; its strongest
+  part (the `_delta_log` layer) stays. **The wiring trick** (from duckdb-delta): don't build `MultiFileFunction<>`
+  — **clone `parquet_scan` + inject `function.get_multi_file_reader`**, inheriting all encodings + multi-file
+  parallelism + dynamic (join/TopN) filter pushdown for free; custom = `ArrowNetMultiFileList : SimpleMultiFileList`
+  (file list) + `ArrowNetMultiFileReader : MultiFileReader` (~8 overrides), ~400–1700 LOC provider-agnostic C++
+  in `arrownet-core`, reuses `ParquetMultiFileInfo` verbatim. **DVs are ~free** (native `BaseFileReader::deletion_filter`
+  hook — attach a `DeleteFilter` from the C#-supplied DV). **Row tracking / commit version / CDF are all LOG-side
+  (C#), orthogonal to who writes parquet, and EASIER here**: `baseRowId` assigned on commit from the exact per-file
+  `WRITTEN_FILE_STATISTICS` row_count + the `delta.rowTracking` domainMetadata high-water mark (the one gap to
+  add in engineered-wood); the readable stable id = `baseRowId + file_row_number` (native parquet virtual column)
+  → **this is exactly the read-side stable id delta-rs couldn't expose**; `defaultRowCommitVersion` = the commit
+  version (per-file constant); CDF INSERT is inferred (free), DELETE/UPDATE need one extra tagged `_change_data/`
+  write (engineered-wood already has the CDF log machinery). **DELETE with `deletion_vectors true` is
+  rewrite-free** (pure log+DV write = engineered-wood's existing Fabric-validated capability, NO native parquet
+  writer — so DV-DELETE rides on Phase A/read alone); copy-on-write DELETE + UPDATE use the native writer;
+  merge-on-read DV-UPDATE (DV old + small postimage file) is an optional later refinement. Biggest cost =
+  coupling to DuckDB's churning
+  MultiFileReader internals (mitigated: provider-agnostic, in `arrownet-core`); no benefit for SQL Server / DAX
+  (Delta-only). Phased: A read-only (host_query+read_parquet pre-spike optional) → B native write → C DML+CDF.
+  A separate deferred note,
   [docs/delta-catalog.md](docs/delta-catalog.md), covers a **Delta WRITE-BACK** path: expose a Delta **folder
   as an ATTACH catalog root** (`ATTACH '/lake/root' (TYPE arrownet, PROVIDER 'delta')`; each `_delta_log` subdir
   = a table, discovered via `fs_glob`) as the 3rd `IBackend` reusing the provider-agnostic C++ catalog/scan/DML

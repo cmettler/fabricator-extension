@@ -620,6 +620,27 @@ typedef struct ArrowNetVTable {
 	// only for the duration of the call it precedes; NULL clears it. SQL/compute table functions ignore it.
 	// Best-effort (a failure to set the ambient must not abort the statement). See docs/global-functions.md.
 	int32_t (*set_active_opener)(ArrowNetHandle opener, char **err);
+
+	// -------------------------------------------------------------------------
+	// onelake:// FileSystem forward callbacks (Phase-3 filesystem subsystem). A C++ FileSystem registered in
+	// DuckDB's VFS for the `onelake://` scheme forwards its read ops HERE, to the managed Azure DataLake SDK
+	// (bypassing duckdb-azure's OneLake gaps). This is the FORWARD direction of the fs_* host services (which
+	// go managed→host); here the host's onelake FS goes host→managed. The credential rides as `cred_json` — the
+	// fields of the azure secret the host resolved from the calling opener (empty/"{}" ⇒ DefaultAzureCredential);
+	// the managed side builds a TokenCredential via FabricCredentialResolver. Because the onelake FS is behind
+	// the VFS, DuckDB's native readers + ExternalFileCache use it uniformly (see docs/filesystem-bridge.md §3).
+	// Read-only surface for now (write ops on the C++ FS throw NotImplemented). *out_file = an opaque managed
+	// file handle (close via onelake_close); *out_size = the file length (read at open, cached C++-side).
+	int32_t (*onelake_open)(const char *path, const char *cred_json, ArrowNetHandle *out_file, int64_t *out_size,
+	                        char **err);
+	// Read nr_bytes at absolute offset `location` into buffer (host-owned). The managed side does the range GET.
+	int32_t (*onelake_read)(ArrowNetHandle file, void *buffer, int64_t nr_bytes, int64_t location, char **err);
+	// Close a handle from onelake_open. Safe with NULL/0.
+	void (*onelake_close)(ArrowNetHandle file);
+	// Glob `pattern` (an onelake:// path, possibly with wildcards) → JSON array of {path,size}. cred_json as above.
+	int32_t (*onelake_glob)(const char *pattern, const char *cred_json, char **out_json, char **err);
+	// FileExists(`path`). *out_exists = 0/1. cred_json as above.
+	int32_t (*onelake_exists)(const char *path, const char *cred_json, int32_t *out_exists, char **err);
 } ArrowNetVTable;
 
 // -----------------------------------------------------------------------------
@@ -705,7 +726,7 @@ typedef struct ArrowNetHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 54
+#define ARROWNET_ABI_VERSION 55
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

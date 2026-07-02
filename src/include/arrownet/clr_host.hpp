@@ -60,6 +60,16 @@ void SetActiveOpener(ArrowNetHandle opener);
 void OpenNamedInput(const std::string &name, ArrowArrayStream &out);
 bool NamedInputExists(const std::string &name);
 
+// onelake:// FileSystem forward calls (Phase-3): the C++ onelake FS subsystem (registered in DuckDB's VFS)
+// forwards its read ops to the managed Azure DataLake SDK. `cred_json` = the azure secret fields the host
+// resolved from the calling opener (empty/"{}" => DefaultAzureCredential). Read-only for now. OneLakeOpen
+// returns an opaque managed handle (close via OneLakeClose) + the file length in `out_size`.
+ArrowNetHandle OneLakeOpen(const std::string &path, const std::string &cred_json, int64_t &out_size);
+void OneLakeRead(ArrowNetHandle file, void *buffer, int64_t nr_bytes, int64_t location);
+void OneLakeClose(ArrowNetHandle file);
+std::string OneLakeGlob(const std::string &pattern, const std::string &cred_json);
+bool OneLakeExists(const std::string &path, const std::string &cred_json);
+
 // -----------------------------------------------------------------------------
 // Convenience wrappers over the vtable. Each throws duckdb::IOException carrying
 // the managed error message (and releases it via free_error) on failure.

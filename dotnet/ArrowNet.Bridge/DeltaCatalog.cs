@@ -88,6 +88,11 @@ public sealed class DeltaCatalog : IBackendCatalog
     // DELETEs use deletion vectors). DELETE on ANY table still follows that table's own delta.enableDeletionVectors
     // config, so external DV tables are honored regardless of this flag.
     private readonly bool _deletionVectorsOnCreate;
+    // ATTACH option `row_tracking true`: tables CREATED here enable the Delta delta.enableRowTracking WRITER
+    // feature standalone (independent of deletion_vectors). Stable row ids + row_commit_version for external
+    // consumers (Spark/Fabric). NOTE: our own DELETE/UPDATE still use the transient (file,position) rowid — the
+    // physical locator the DV/copy-on-write delete needs — NOT the stable id (see docs/delta-catalog.md).
+    private readonly bool _rowTrackingOnCreate;
     // ATTACH option `in_commit_timestamps true`: tables CREATED in this catalog enable the Delta
     // delta.enableInCommitTimestamps WRITER feature, so AT (TIMESTAMP => ts) time travel can resolve a timestamp
     // to a version (engineered-wood reads inCommitTimestamp, not commit-file mtime). VERSION travel works without it.
@@ -118,6 +123,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         _root = Normalize(clean).TrimEnd('/');
         _fabricCredential = credential;
         _deletionVectorsOnCreate = ParseBoolOption(optionsJson, "deletion_vectors");
+        _rowTrackingOnCreate = ParseBoolOption(optionsJson, "row_tracking");
         _inCommitTimestampsOnCreate = ParseBoolOption(optionsJson, "in_commit_timestamps");
         _changeDataFeedOnCreate = ParseBoolOption(optionsJson, "change_data_feed");
         _schemas = ParseBoolOption(optionsJson, "schemas");
@@ -125,6 +131,19 @@ public sealed class DeltaCatalog : IBackendCatalog
         _defaultRowGroupSize = ParseIntOption(optionsJson, "row_group_size");
         _defaultBloomColumns = ParseListOption(optionsJson, "bloom_filter_columns");
         _mergeSchemaOnWrite = ParseBoolOption(optionsJson, "merge_schema");
+    }
+
+    /// <summary>Returns the host-FS opener for this thread and, in the same breath, publishes this catalog's
+    /// Fabric credential to <see cref="AmbientOneLakeCredential"/> so the filesystem factory
+    /// (<see cref="TableFileSystems.Create"/>) picks the direct-SDK <see cref="OneLakeDataLakeFileSystem"/> for
+    /// OneLake roots (bypassing duckdb-azure). For a non-OneLake catalog <c>_fabricCredential</c> is null → the
+    /// factory falls back to <see cref="DuckDbTableFileSystem"/> (unchanged behavior). Setting it every time also
+    /// clears any stale credential left on a reused execution thread by another catalog. The bulk write path runs
+    /// on a background thread, so <c>BulkSession</c> re-establishes both ambients there.</summary>
+    private nint Opener()
+    {
+        AmbientOneLakeCredential.Current = _fabricCredential;
+        return AmbientOpener.Current;
     }
 
     /// <summary>True when this catalog uses the two-level <c>&lt;root&gt;/&lt;schema&gt;/&lt;table&gt;</c> layout:
@@ -340,7 +359,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         MetadataKind.Tables => DiscoverTables(),
         // Columns = a zero-row stream whose SCHEMA describes the table's columns (engineered-wood's Delta schema).
         MetadataKind.Columns => new InMemoryArrayStream(
-            DeltaReader.GetSchema(AmbientOpener.Current, TablePath(schema!, table!)), System.Array.Empty<RecordBatch>()),
+            DeltaReader.GetSchema(Opener(), TablePath(schema!, table!)), System.Array.Empty<RecordBatch>()),
         // RowId: always surface the virtual _metadata.row_id — a TRANSIENT (file, position) rowid computed at
         // scan time (no row-tracking feature needed; works on ANY Delta table). Enables UPDATE/DELETE
         // (rowid-based, mirrors the SQL Server backend); DELETE is copy-on-write (plain add/remove).
@@ -377,7 +396,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         {
             resolvedSchema = MainSchema;
         }
-        return DeltaReader.GetSnapshots(AmbientOpener.Current, TablePath(resolvedSchema, table!));
+        return DeltaReader.GetSnapshots(Opener(), TablePath(resolvedSchema, table!));
     }
 
     /// <summary>Change Data Feed of a table. <paramref name="tableRef"/> = '&lt;schema.&gt;table' (schema required
@@ -421,7 +440,7 @@ public sealed class DeltaCatalog : IBackendCatalog
             if (parts.Length > 0 && long.TryParse(parts[0], out var f)) { from = f; }
             if (parts.Length > 1 && long.TryParse(parts[1], out var t)) { to = t; }
         }
-        return DeltaReader.GetChanges(AmbientOpener.Current, TablePath(resolvedSchema, table), from, to);
+        return DeltaReader.GetChanges(Opener(), TablePath(resolvedSchema, table), from, to);
     }
 
     /// <summary>The catalog's schemas: the lakehouse schemas for a schema-enabled OneLake lakehouse; for a
@@ -484,7 +503,7 @@ public sealed class DeltaCatalog : IBackendCatalog
 
         // Local / S3 / plain ADLS: glob the commit files. schemas mode = two levels deep, else one.
         var glob = _schemas ? _root + "/*/*/_delta_log/*.json" : _root + "/*/_delta_log/*.json";
-        var json = HostFs.Glob(AmbientOpener.Current, glob);
+        var json = HostFs.Glob(Opener(), glob);
         using var doc = JsonDocument.Parse(json);
         foreach (var el in doc.RootElement.EnumerateArray())
         {
@@ -535,7 +554,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     public IArrowArrayStream ScanTable(string schemaName, string tableName, string? specJson,
                                        IArrowArrayStream? filterValues)
     {
-        var opener = AmbientOpener.Current;
+        var opener = Opener();
         var path = TablePath(schemaName, tableName);
         // Push the FILTER into engineered-wood file/row-group skipping (superset-safe; DuckDB re-applies).
         // Projection is left to DuckDB above the scan (the full schema is returned, mapped by name) — same as
@@ -622,7 +641,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                            IReadOnlyList<string>? sortColumns, string? schemaMode)
     {
         // sortColumns (native SORTED BY) is a SQL-Server-warehouse CLUSTER BY concept; Delta doesn't cluster — ignored.
-        var opener = AmbientOpener.Current;
+        var opener = Opener();
         var (schema, batches, rows) = DeltaWriter.Materialize(data, default);
         // Partition columns take effect only at table creation; an INSERT (Append) into an existing table
         // preserves the table's declared partitioning (engineered-wood reads it from the metadata).
@@ -640,6 +659,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                           deletionVectors: _deletionVectorsOnCreate,
                           inCommitTimestamps: _inCommitTimestampsOnCreate,
                           changeDataFeed: _changeDataFeedOnCreate,
+                          rowTracking: _rowTrackingOnCreate,
                           spec: spec);
         return rows;
     }
@@ -651,10 +671,11 @@ public sealed class DeltaCatalog : IBackendCatalog
                             IReadOnlyList<string>? partitionColumns, IReadOnlyList<string>? sortColumns,
                             IReadOnlyList<string>? identityColumns)
         // sortColumns (CLUSTER BY) + identityColumns (SQL Server IDENTITY) are SQL-Server concepts — Delta ignores.
-        => DeltaWriter.Create(AmbientOpener.Current, TablePath(schemaName, tableName), columns, default,
+        => DeltaWriter.Create(Opener(), TablePath(schemaName, tableName), columns, default,
                               deletionVectors: _deletionVectorsOnCreate,
                               inCommitTimestamps: _inCommitTimestampsOnCreate,
                               changeDataFeed: _changeDataFeedOnCreate,
+                              rowTracking: _rowTrackingOnCreate,
                               spec: ResolveWriteSpec(partitionColumns, schemaModeArg: null));
 
     /// <summary>CREATE SCHEMA. In <c>schemas</c> mode (non-OneLake) it materializes the <c>&lt;root&gt;/&lt;schema&gt;/</c>
@@ -664,7 +685,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     {
         if (_schemas && OneLake() is null && !string.Equals(s, MainSchema, System.StringComparison.Ordinal))
         {
-            HostFs.CreateDir(AmbientOpener.Current, _root + "/" + s); // recursive mkdir; idempotent
+            HostFs.CreateDir(Opener(), _root + "/" + s); // recursive mkdir; idempotent
         }
     }
     public void BeginTransaction() { }              // Delta is per-commit (no cross-statement transaction)
@@ -691,7 +712,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         {
             throw Unsupported("DROP TABLE (host does not provide a recursive directory-delete callback)");
         }
-        HostFs.RemoveDir(AmbientOpener.Current, TablePath(schemaName, tableName));
+        HostFs.RemoveDir(Opener(), TablePath(schemaName, tableName));
     }
 
     /// <summary>DELETE = rowid-based via Delta row tracking: <paramref name="keys"/> is a stream whose single
@@ -699,7 +720,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// them, applying the WHERE). Collected and applied via deletion vectors (<see cref="DeltaReader.DeleteByRowIds"/>).</summary>
     public long ExecuteDelete(string schemaName, string tableName, IArrowArrayStream keys)
     {
-        var opener = AmbientOpener.Current;
+        var opener = Opener();
         var ids = new List<long>();
         using (keys)
         {
@@ -748,7 +769,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// output is plain Delta + standard-readable (delta-kernel/Spark/Fabric). Returns rows updated.</summary>
     public long ExecuteUpdate(string schemaName, string tableName, int setColumnCount, IArrowArrayStream data)
     {
-        var opener = AmbientOpener.Current;
+        var opener = Opener();
         var path = TablePath(schemaName, tableName);
 
         // 1. Parse the update stream: rowid -> new SET values (aligned to the SET column order).
@@ -887,7 +908,7 @@ public sealed class DeltaCatalog : IBackendCatalog
             {
                 throw Unsupported("DROP SCHEMA main (the default schema)");
             }
-            HostFs.RemoveDir(AmbientOpener.Current, _root + "/" + s); // recursive; idempotent
+            HostFs.RemoveDir(Opener(), _root + "/" + s); // recursive; idempotent
             return;
         }
         throw Unsupported("DROP SCHEMA");
@@ -911,7 +932,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 var field = string.Equals(name, col.Name, System.StringComparison.Ordinal)
                     ? col
                     : new Field(name, col.DataType, col.IsNullable);
-                DeltaReader.AddColumn(AmbientOpener.Current, TablePath(s, t), field, default);
+                DeltaReader.AddColumn(Opener(), TablePath(s, t), field, default);
                 return;
             }
             case AlterKind.RenameTable:
@@ -927,7 +948,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 }
                 else
                 {
-                    HostFs.MoveDir(AmbientOpener.Current, TablePath(s, t), TablePath(s, newName));
+                    HostFs.MoveDir(Opener(), TablePath(s, t), TablePath(s, newName));
                 }
                 return;
             }

@@ -1,7 +1,7 @@
 using System.Text;
 using System.Text.Json;
+using ArrowNet.Bridge;
 using Azure.Core;
-using Azure.Identity;
 
 namespace ArrowNet.AnalysisServices;
 
@@ -22,8 +22,8 @@ namespace ArrowNet.AnalysisServices;
 internal static class DaxTokenAuth
 {
     // The Power BI / AAS XMLA token audience. (Fabric + Power BI semantic models use the Power BI resource;
-    // AAS-only endpoints accept the same.) Acquired as an Entra v2 scope.
-    public const string PowerBiScope = "https://analysis.windows.net/powerbi/api/.default";
+    // AAS-only endpoints accept the same.) Aliases the shared resolver's constant.
+    public const string PowerBiScope = FabricCredentialResolver.PowerBiScope;
 
     // Trailing connstr marker carrying the base64(JSON) azure-secret fields from BuildConnectionString to the
     // catalog. ADOMD would reject an unknown keyword, so the catalog strips it before opening the connection.
@@ -50,53 +50,21 @@ internal static class DaxTokenAuth
         var b64 = connectionString.Substring(idx + CredMarker.Length);
         var json = Encoding.UTF8.GetString(Convert.FromBase64String(b64));
         var fields = JsonSerializer.Deserialize<Dictionary<string, string>>(json) ?? new();
-        return (clean, BuildCredential(fields));
-    }
-
-    private static TokenCredential BuildCredential(IReadOnlyDictionary<string, string> fields)
-    {
-        string F(string key) => fields.TryGetValue(key, out var v) ? v ?? "" : "";
-        var provider = F("provider").ToLowerInvariant();
-        var tenantId = F("tenant_id");
-        var clientId = F("client_id");
-        var clientSecret = F("client_secret");
-
-        // Service principal (client_id + client_secret + tenant_id) — the truest "same principal" as the
-        // warehouse's Active Directory Service Principal auth.
-        if (clientSecret.Length > 0 && clientId.Length > 0 && tenantId.Length > 0)
-        {
-            return new ClientSecretCredential(tenantId, clientId, clientSecret);
-        }
-        // Managed identity (user-assigned when a client id is present, else system-assigned).
-        if (provider == "managed_identity")
-        {
-            return clientId.Length > 0
-                ? new ManagedIdentityCredential(clientId)
-                : new ManagedIdentityCredential();
-        }
-        // credential_chain / default / anything else → the same ambient chain SqlClient's
-        // "Active Directory Default" runs (env → managed identity → VS → VS Code → Azure CLI → …).
-        return new DefaultAzureCredential();
+        return (clean, FabricCredentialResolver.Resolve(fields));
     }
 
     /// <summary>
     /// "Active Directory Default"-style fallback when no secret is supplied: a remote XMLA endpoint
     /// (a <c>scheme://</c> Data Source — Fabric / Power BI / AAS) with no inline credential gets a
-    /// <see cref="DefaultAzureCredential"/>, which runs the SAME ambient chain SqlClient's "Active Directory
-    /// Default" uses (env vars incl. AZURE_TENANT_ID/CLIENT_ID/CLIENT_SECRET → managed identity → Visual
-    /// Studio → VS Code → Azure CLI → interactive). Local Power BI Desktop (a <c>localhost</c> Data Source)
-    /// and an explicit connstr carrying its own <c>Password=</c>/<c>User ID=</c> get no token (null).
+    /// <see cref="Azure.Identity.DefaultAzureCredential"/>; local Power BI Desktop (a <c>localhost</c> Data
+    /// Source) and an explicit connstr carrying its own <c>Password=</c>/<c>User ID=</c> get no token (null).
+    /// Delegates to the shared <see cref="FabricCredentialResolver.ResolveForRemoteTarget"/>.
     /// </summary>
     public static TokenCredential? DefaultCredentialForTarget(string connectionString)
-    {
-        var lower = connectionString.ToLowerInvariant();
-        bool remote = lower.Contains("://"); // cloud XMLA uses a scheme:// Data Source; on-prem / localhost don't
-        bool hasInlineAuth = lower.Contains("password=") || lower.Contains("pwd=") || lower.Contains("user id=");
-        return remote && !hasInlineAuth ? new DefaultAzureCredential() : null;
-    }
+        => FabricCredentialResolver.ResolveForRemoteTarget(connectionString);
 
     /// <summary>Acquires a Power BI-scoped access token from the credential (Azure.Identity caches + refreshes
     /// internally, so per-connection calls are cheap and always valid).</summary>
     public static AccessToken GetToken(TokenCredential credential)
-        => credential.GetToken(new TokenRequestContext(new[] { PowerBiScope }), default);
+        => FabricCredentialResolver.GetToken(credential, FabricCredentialResolver.PowerBiScope);
 }
