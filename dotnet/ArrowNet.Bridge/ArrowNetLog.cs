@@ -45,6 +45,41 @@ public static class ArrowNetLog
         lock (Gate) { _factory.AddProvider(provider); }
     }
 
+    /// <summary>
+    /// Wires ILogger output to DuckDB's own internal logging: <paramref name="sink"/> is a
+    /// <c>(level, category, message)</c> delegate the host sets once (from <c>Bootstrap.Initialize</c>) over the
+    /// <c>host_log</c> reverse-callback, so events also land in DuckDB's <c>duckdb_logs</c>. The <b>C# seam is
+    /// ready now</b>; it stays inert until the host callback is added (a small additive ABI step — see
+    /// docs/multifile-delta.md §"Batch 2"). Idempotent; forwards regardless of the file-sink env config (the two
+    /// sinks are independent), so a caller can enable DuckDB forwarding even with logging otherwise "off".
+    /// </summary>
+    public static void EnableHostForwarding(Action<int, string, string> sink)
+    {
+        lock (Gate)
+        {
+            if (ReferenceEquals(_factory, NullLoggerFactory.Instance))
+            {
+                // Nothing routes through NullLoggerFactory — promote to a real (empty) factory so the forwarding
+                // provider actually receives events even when ARROWNET_LOG_LEVEL was unset.
+                _factory = LoggerFactory.Create(b => b.SetMinimumLevel(LogLevel.Debug));
+            }
+            _factory.AddProvider(new HostForwardingLoggerProvider(sink));
+        }
+    }
+
+    /// <summary>The integer log levels crossing to the host <c>host_log</c> callback (stable ABI contract):
+    /// 0 Trace, 1 Debug, 2 Information, 3 Warning, 4 Error, 5 Critical.</summary>
+    internal static int LevelCode(LogLevel l) => l switch
+    {
+        LogLevel.Trace => 0,
+        LogLevel.Debug => 1,
+        LogLevel.Information => 2,
+        LogLevel.Warning => 3,
+        LogLevel.Error => 4,
+        LogLevel.Critical => 5,
+        _ => 2,
+    };
+
     private static ILoggerFactory BuildDefault()
     {
         var levelText = Environment.GetEnvironmentVariable("ARROWNET_LOG_LEVEL");
@@ -150,5 +185,51 @@ internal sealed class FileLoggerProvider : ILoggerProvider
             LogLevel.Critical => "CRIT ",
             _ => "?????",
         };
+    }
+}
+
+/// <summary>Forwards ILogger events to DuckDB's internal logging via a host <c>(level, category, message)</c>
+/// delegate (the <c>host_log</c> reverse-callback, set by <see cref="ArrowNetLog.EnableHostForwarding"/>). The
+/// managed seam is complete; wiring the host callback is a small additive ABI step.</summary>
+internal sealed class HostForwardingLoggerProvider : ILoggerProvider
+{
+    private readonly Action<int, string, string> _sink;
+
+    public HostForwardingLoggerProvider(Action<int, string, string> sink) => _sink = sink;
+
+    public ILogger CreateLogger(string categoryName) => new Fwd(_sink, categoryName);
+
+    public void Dispose() { }
+
+    private sealed class Fwd : ILogger
+    {
+        private readonly Action<int, string, string> _sink;
+        private readonly string _category;
+
+        public Fwd(Action<int, string, string> sink, string category)
+        {
+            _sink = sink;
+            _category = category;
+        }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => logLevel != LogLevel.None;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+                                Func<TState, Exception?, string> formatter)
+        {
+            if (logLevel == LogLevel.None)
+            {
+                return;
+            }
+            var msg = formatter(state, exception);
+            if (exception is not null)
+            {
+                msg += " | " + exception.GetType().Name + ": " + exception.Message;
+            }
+            try { _sink(ArrowNetLog.LevelCode(logLevel), _category, msg); }
+            catch { /* forwarding must never fault the extension */ }
+        }
     }
 }

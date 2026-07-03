@@ -440,9 +440,30 @@ done as a standalone function) only if CPU-bound-local multi-lane Delta scans be
    the resolved snapshot version, the file list (active/scanned/pruned), and each per-file `read_parquet` SQL.
    One local engineered-wood change: `DeltaFilePruner` made `public` (was `internal`). **Deferred within slice 1:**
    very large DVs use a big `NOT IN` list (fine for typical DV cardinality; a bitmap/anti-join is a later opt).
-2. **Slice 2 (optional, small ABI):** a **live-filter host-callback** so the per-file loop reads the outer
+2. **Slice 2 (ABI, core-touching):** a **live-filter host-callback** so the per-file loop reads the outer
    scan's current (incl. dynamic/join) filters before each file → `read_parquet … WHERE` → dynamic file/
    row-group pruning at the per-file decision point (closes the mid-scan-filter gap).
+
+   **Batch 2 — exact remaining ABI work (for a fresh, well-budgeted session; NOT started — an unfinished ABI
+   bump breaks the extension):**
+   - **(2a) DuckDB log forwarding — the C# seam is DONE + committed** (`ArrowNetLog.EnableHostForwarding` +
+     `HostForwardingLoggerProvider`, inert until wired). Remaining = *additive* ABI: append a `host_log(level,
+     category, message)` fn-ptr to `ArrowNetHostServices` (host→managed struct, like `fs_*`), bump
+     `ARROWNET_ABI_VERSION`; C++ implements it by calling DuckDB's logger (investigate the 1.5.4 `Logger`/
+     `LogManager` API — needs a `DatabaseInstance`/`ClientContext`); `HostFs` exposes a `Log` wrapper;
+     `Bootstrap.Initialize` reads the new host field and calls `ArrowNetLog.EnableHostForwarding((lvl,cat,msg) =>
+     HostFs.Log(...))`. Level codes are the stable contract in `ArrowNetLog.LevelCode` (0 Trace…5 Critical).
+     Low risk (additive host-service entry); one C++ rebuild (unittest+shell+loadable).
+   - **(2b) live dynamic filters — the hard, shared-core part.** The native scan must (i) set
+     `filter_pushdown = true` on the `arrownet_scan` variant so DuckDB delivers `input.filters` (incl. the
+     hash-join `DynamicTableFilterSet`) — BUT `filter_pushdown = true` removes filters from the plan, so C# must
+     translate the **full** `TableFilterSet` faithfully (else keep it off); (ii) `arrow_ingest` exposes the live
+     filters to the C# scan factory via a **host callback that re-serializes the current `TableFilterSet`** into
+     the existing `filter_json`+`filter_values` shape on demand; (iii) `DeltaNativeReader` calls it before each
+     file open → `DeltaSqlFilter.ToWhere` → `read_parquet … WHERE`. This touches the **provider-shared
+     `arrow_ingest` scan path** (SQL/DAX also use it) → validate the full suite. Higher risk; do it deliberately.
+     Correctness is unaffected if deferred (DuckDB re-applies every filter above the scan — only join-driven
+     file/row-group *pruning* is missed, an optimization).
 3. **Slice 3 (later, additive):** downstream **multi-lane parallelism** — partition the file list across N
    per-thread Arrow streams (`MaxThreads = N`); no change to rowid/DV/filter.
 4. Snapshot consistency (the per-transaction UTC instant → implicit `AT`) applies to this reader exactly as to
