@@ -473,6 +473,25 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      DuckDB's single-statement atomic scan→delete never needs. Recommendation kept: transient rowid for DML;
      `row_tracking true` is a **write-side interop feature** for external readers, not a DML mechanism.
 
+     **NATIVE READ — DONE (opt-in `native_read true` ATTACH option, C#-only, NO ABI/C++; docs/multifile-delta.md
+     slice 1e).** A plain `SELECT … FROM lake.main.t` sources its bytes through **DuckDB's own parquet reader**
+     instead of engineered-wood's C# reader: `DeltaCatalog.ScanTable`'s plain-read branch runs
+     `Host.Query("SELECT * FROM read_parquet([<exact active files>])")` (files via
+     `DeltaReader.GetActiveFileUrisWithDv`; tuned decode + cross-file parallelism + `ExternalFileCache`, over
+     `onelake://` for OneLake — the `arrownet_delta_native_scan` mechanism reused from the catalog). It is a pure
+     **byte-source switch** — all catalog plumbing (three-part names, stats, DML, time travel) is untouched — and
+     deliberately NOT the C++ `MultiFileReader`-from-the-catalog fold (that would need a pre-bound parquet scan out
+     of `GetScanFunction`, and `TableFunctionBindInput` wants a live `Binder`+`TableFunctionRef` the catalog entry
+     doesn't have → fragile/DuckDB-coupled). **Opt-in (default off) + read-only fallbacks:** a scan needing the
+     transient rowid (UPDATE/DELETE), a time-travel scan (`AT`), or a table carrying **deletion vectors**
+     transparently falls back to the C# reader (the native path has no DeleteFilter / rowid / snapshot logic). The
+     pushed FILTER is not yet translated into the host SQL (no Delta-log/row-group pruning on this path — the C#
+     reader still prunes), projection is left to DuckDB above the scan, and the bind-time COLUMNS schema must match
+     `read_parquet` BY NAME (holds for engineered-wood/Spark plain tables; decimals align at `Decimal128`). The
+     **full MultiFileReader-in-catalog fold** (native DeleteFilter for DV, dynamic join/TopN filter pushdown into
+     row-groups, native rowid via `file_row_number`+path-sorted ordinal for DML, native time travel) is the heavier
+     follow-up. `test/verify_delta_catalog_native_read.test` (53).
+
      **PARTITIONING + WRITE TUNING — DONE + VALIDATED LIVE ON FABRIC (ABI v51).** Two ways to declare partition
      columns: (1) the **native `CREATE TABLE [t] PARTITIONED BY (cols) [AS …]`** clause (DuckDB v1.5.4 parses it
      into `CreateTableInfo::partition_keys`; the clause precedes `AS` for CTAS) — the base

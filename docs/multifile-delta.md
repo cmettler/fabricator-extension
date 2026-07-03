@@ -41,9 +41,32 @@
 > (1d-file) Delta-**log**-stats FILE-level pruning (skip whole files without opening — a pure optimization over the
 > row-group pruning; needs an engineered-wood "prune files by predicate" API, deferred); (1c-edge) log-authoritative
 > partition-value injection for edge cases hive inference misses (typed/NULL partitions — robustness follow-up);
-> and the bare-`count(*)`-on-DV fix. **1e — fold the native read into the ATTACH catalog** (make `SELECT … FROM
-> lake.main.t` use the MultiFileReader instead of the C# reader; credential available there for the OneLake log
-> read) is the remaining PRODUCTIVE step and the natural next slice.
+ and the bare-`count(*)`-on-DV fix.
+>
+> **1e slice 1 DONE (2026-07-03) — native read folded into the ATTACH catalog (opt-in, C#-only, NO ABI/C++):**
+> the Delta folder-catalog ATTACH option **`native_read true`** makes a plain `SELECT … FROM lake.main.t` source
+> its bytes through **DuckDB's own parquet reader** — `DeltaCatalog.ScanTable`'s plain-read branch runs
+> `Host.Query("SELECT * FROM read_parquet([<exact active files>])")` (the validated `arrownet_delta_native_scan`
+> mechanism: engineered-wood lists the exact `add` set via `GetActiveFileUrisWithDv`; DuckDB's native reader reads
+> them with tuned decode + cross-file parallelism + ExternalFileCache, over `onelake://` for OneLake) instead of
+> engineered-wood's C# parquet reader. **This deliberately does NOT drive the C++ MultiFileReader from the catalog
+> entry** — `GetScanFunction` would have to hand DuckDB a pre-bound parquet scan, and `TableFunctionBindInput`
+> needs a live `Binder` + `TableFunctionRef` the catalog entry doesn't cleanly have (fragile, DuckDB-internal-
+> coupled). Routing through the existing C# `ScanTable` seam keeps ALL catalog plumbing intact (three-part names,
+> stats, DML, time travel) and is a pure byte-source switch. **Opt-in + read-only fallbacks:** a scan needing the
+> transient rowid (UPDATE/DELETE), a time-travel scan (`AT`), or a table carrying **deletion vectors** transparently
+> falls back to the C# reader (the native path has no DeleteFilter / rowid / snapshot logic) — verified to stay
+> correct (`test/verify_delta_catalog_native_read.test`, 53: plain read/projection/filter/aggregate/multi-file
+> append, DELETE+UPDATE via the rowid C# reader, and a DV table falling back). **Caveats / follow-ups (native read):**
+> the pushed FILTER is NOT translated into the host SQL yet (DuckDB re-applies above the scan; native `read_parquet`
+> gets no WHERE → no Delta-log/row-group pruning on this path — the C# reader still does that), so a selective scan
+> may read more files; column PROJECTION is likewise left to DuckDB above the scan; the bind-time schema (from the
+> COLUMNS metadata = engineered-wood's `GetSchema`) must match `read_parquet`'s output BY NAME (holds for
+> engineered-wood- and Spark-written plain tables; decimals align since both now emit `Decimal128`). **The full
+> MultiFileReader-in-catalog fold** (below — native DeleteFilter for DV, dynamic join/TopN filter pushdown into
+> row-groups, native rowid via `file_row_number`+path-sorted ordinal for DML, native time travel) remains the
+> heavier follow-up; slice-1 delivers the headline native-read win (tuned decode + parallelism + caching) with
+> near-zero risk. Below is the full design.
 
 > **Phase-A pre-spike DONE (2026-07-03):** `arrownet_delta_native_scan(path)` — engineered-wood lists the EXACT
 > active data files + schema (`DeltaReader.GetActiveFileUris`, the `add` set, NOT a glob), and DuckDB's **native

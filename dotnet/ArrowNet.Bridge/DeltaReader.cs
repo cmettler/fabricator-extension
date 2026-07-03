@@ -49,6 +49,35 @@ internal static class DeltaReader
         }
     }
 
+    /// <summary>Like <see cref="GetActiveFileUris"/> but ALSO reports whether ANY active file carries a deletion
+    /// vector. The catalog's opt-in <c>native_read</c> path (docs/multifile-delta.md slice 1e) routes a plain scan
+    /// through DuckDB's native <c>read_parquet</c> over these files, which cannot honor a DV (there is no
+    /// DeleteFilter on that path) — so a DV table must fall back to the C# reader. One table-open serves both.</summary>
+    public static (IReadOnlyList<string> Files, bool HasDeletionVectors) GetActiveFileUrisWithDv(nint opener, string path)
+    {
+        var fs = TableFileSystems.Create(opener, path);
+        var table = DeltaTable.OpenAsync(fs).GetAwaiter().GetResult();
+        try
+        {
+            var root = ToReadableRoot(path);
+            var uris = new List<string>();
+            bool hasDv = false;
+            foreach (var add in table.CurrentSnapshot.ActiveFiles.Values)
+            {
+                uris.Add(root + "/" + add.Path.Replace('\\', '/').TrimStart('/'));
+                if (add.DeletionVector is not null)
+                {
+                    hasDv = true;
+                }
+            }
+            return (uris, hasDv);
+        }
+        finally
+        {
+            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+    }
+
     /// <summary>The active data files of the Delta table as a JSON array of objects <c>[{"path":"&lt;uri&gt;"}]</c>
     /// for the C++ MultiFileReader (docs/multifile-delta.md Phase A). Slice 1a: paths only (the exact `add` set,
     /// NOT a glob). Partition values + deletion vectors (later slices) become extra keys on each object; the

@@ -1148,8 +1148,25 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   PARTITIONED BY table). So 1a+1b + inherited features = a nearly complete native read (reader + projection +
   filter/row-group pushdown + hive partitions + parallelism + ExternalFileCache + DV). **Remaining:** 1d-file =
   Delta-log FILE-level pruning (optimization over row-group pruning; needs an engineered-wood prune-by-predicate
-  API), 1c-edge = log-authoritative partition injection for typed/NULL edge cases, the bare-count(*)-on-DV fix, and
-  **1e = fold the native read into the ATTACH catalog** (the productive step; credential available there). v56 = **`onelake://` WRITE forward callbacks** — appended 3 vtable entries
+  API), 1c-edge = log-authoritative partition injection for typed/NULL edge cases, the bare-count(*)-on-DV fix.
+  **1e slice 1 DONE (2026-07-03, C#-only, NO ABI/C++) — native read folded into the ATTACH catalog:** the Delta
+  folder-catalog ATTACH option **`native_read true`** routes a plain `SELECT … FROM lake.main.t` through DuckDB's
+  own parquet reader — `DeltaCatalog.ScanTable`'s plain-read branch runs `Host.Query("SELECT * FROM
+  read_parquet([<exact active files>])")` (files via `DeltaReader.GetActiveFileUrisWithDv`; tuned decode +
+  cross-file parallelism + ExternalFileCache, over `onelake://` for OneLake) instead of engineered-wood's C#
+  reader. **NOT the C++ MultiFileReader-from-the-catalog fold** (that needs a pre-bound parquet scan out of
+  `GetScanFunction` — `TableFunctionBindInput` wants a live `Binder`+`TableFunctionRef` the catalog entry lacks,
+  fragile/DuckDB-coupled); routing through the C# `ScanTable` seam keeps all catalog plumbing (three-part names,
+  stats, DML, time travel) intact and is a pure byte-source switch. **Opt-in (default off) + read-only:** a rowid
+  scan (UPDATE/DELETE), a time-travel scan (`AT`), or a DV table transparently falls back to the C# reader (no
+  DeleteFilter/rowid/snapshot on the native path) — `test/verify_delta_catalog_native_read.test` (53: read/
+  projection/filter/aggregate/multi-file append + DELETE/UPDATE via the rowid C# reader + DV fallback). **Caveats:**
+  the pushed FILTER is not yet translated into the host SQL (no Delta-log/row-group pruning on this path — the C#
+  reader still prunes), projection is left to DuckDB above the scan, and the bind-time COLUMNS schema must match
+  `read_parquet` BY NAME (holds for engineered-wood/Spark plain tables; decimals align at `Decimal128`). **Remaining
+  (heavier follow-up) = the full MultiFileReader-in-catalog fold** (native DeleteFilter for DV, dynamic join/TopN
+  filter pushdown into row-groups, native rowid via `file_row_number`+path-sorted ordinal for DML, native time
+  travel). v56 = **`onelake://` WRITE forward callbacks** — appended 3 vtable entries
   `onelake_open_write`/`onelake_write`/`onelake_close_write`; the C++ `ArrowNetOneLakeFileSystem` `OpenFile(write)`/
   `Write` (sequential append → managed `OneLakeForwardFs` create/append/flush) make **`COPY … TO 'onelake://…'` +
   any DuckDB writer** write to OneLake (Phase-3 step-3 slice 2; live-validated: COPY a parquet, read back 5/5).

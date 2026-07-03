@@ -114,6 +114,14 @@ public sealed class DeltaCatalog : IBackendCatalog
     // auto-evolves the schema (nullable AddColumn) before writing. Overridable per statement via the
     // delta_write_options setting's "merge_schema". (replace_where is per-statement only — the setting.)
     private readonly bool _mergeSchemaOnWrite;
+    // ATTACH option `native_read true` (docs/multifile-delta.md slice 1e): a plain SELECT reads the table's data
+    // files through DuckDB's NATIVE parquet reader (read_parquet over the exact active file set, run on the host
+    // engine via Host.Query — tuned decode + cross-file parallelism + ExternalFileCache, over onelake:// for
+    // OneLake) instead of engineered-wood's C# parquet reader. Opt-in (default off). Read-only: a scan that needs
+    // the transient rowid (UPDATE/DELETE), a time-travel scan, or a table carrying deletion vectors transparently
+    // falls back to the C# reader (the native path has no DeleteFilter / rowid / snapshot logic — those are
+    // follow-ups). Purely a byte-source switch inside ScanTable — no C++/ABI change.
+    private readonly bool _nativeRead;
 
     public DeltaCatalog(string root) : this(root, "{}") { }
 
@@ -131,6 +139,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         _defaultRowGroupSize = ParseIntOption(optionsJson, "row_group_size");
         _defaultBloomColumns = ParseListOption(optionsJson, "bloom_filter_columns");
         _mergeSchemaOnWrite = ParseBoolOption(optionsJson, "merge_schema");
+        _nativeRead = ParseBoolOption(optionsJson, "native_read");
     }
 
     /// <summary>Returns the host-FS opener for this thread and, in the same breath, publishes this catalog's
@@ -603,6 +612,27 @@ public sealed class DeltaCatalog : IBackendCatalog
             var schemaWithRowId = new Schema(fields, userSchema.Metadata);
             return new AsyncEnumerableArrowStream(
                 schemaWithRowId, DeltaReader.StreamWithRowIds(opener, path, columns: null, filter, default));
+        }
+
+        // Opt-in native read (native_read true): source the bytes through DuckDB's own parquet reader instead of
+        // engineered-wood's C#. Only for a plain, no-DV table (the rowid + time-travel branches above already
+        // returned; a DV table can't be honored without a DeleteFilter, so it falls back). read_parquet over the
+        // exact active file set gives tuned decode + cross-file parallelism + ExternalFileCache (over onelake://
+        // for OneLake). DuckDB still projects + filters above this scan (the pushed `filter` is only used by the
+        // C# fallback). The host query's own schema is authoritative; arrow_ingest maps to the bind schema by name.
+        if (_nativeRead)
+        {
+            var (files, hasDv) = DeltaReader.GetActiveFileUrisWithDv(opener, path);
+            if (!hasDv)
+            {
+                if (files.Count == 0)
+                {
+                    // No data files yet — the C# reader yields an empty stream matching the schema.
+                    return new AsyncEnumerableArrowStream(userSchema, DeltaReader.Stream(opener, path, columns: null, filter, default));
+                }
+                var list = string.Join(",", files.Select(f => "'" + f.Replace("'", "''") + "'"));
+                return Host.Query($"SELECT * FROM read_parquet([{list}])");
+            }
         }
 
         return new AsyncEnumerableArrowStream(userSchema, DeltaReader.Stream(opener, path, columns: null, filter, default));
