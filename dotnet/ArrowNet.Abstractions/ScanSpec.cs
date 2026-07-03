@@ -25,6 +25,13 @@ public sealed class ScanSpec
     [JsonPropertyName("filter")]
     public FilterNode? Filter { get; set; }
 
+    /// <summary>A 1:1 SQL rendering of the same predicates as <see cref="Filter"/>, with literals inlined —
+    /// emitted by the host only for a scan whose target is DuckDB itself (the native Delta <c>read_parquet</c>
+    /// path). A provider that renders its own dialect (SQL Server, DAX) ignores this and uses
+    /// <see cref="Filter"/> + the value batch. Null/absent =&gt; no filter (or the host didn't render one).</summary>
+    [JsonPropertyName("native_filter")]
+    public string? NativeFilter { get; set; }
+
     [JsonPropertyName("top")]
     public long? Top { get; set; }
 

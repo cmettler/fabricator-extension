@@ -463,16 +463,34 @@ done as a standalone function) only if CPU-bound-local multi-lane Delta scans be
      client flushes the log buffer at each query boundary, so no instance-vs-connection-logger issue exists. **No
      code change was needed** — the forwarding was correct; only the confirmation recipe. The file sink
      (`ARROWNET_LOG_LEVEL`+`ARROWNET_LOG_FILE`, Batch 1) remains the always-available independent trace.
-   - **(2b) live dynamic filters — the hard, shared-core part.** The native scan must (i) set
+   - **(2b-slice-1) host-rendered 1:1 native filter SQL — DONE (C++/C#, NO ABI).** The bind-time
+     `FilterSerializer` (`arrownet_table_entry.cpp`) now renders, alongside its superset-safe `filter_json`
+     tree, an **equivalent DuckDB SQL predicate** with literals inlined via `Value::ToSQLString()` — same nodes,
+     always produced together so they can't diverge (comparison/IN/IS [NOT] NULL/AND/OR/BETWEEN; column via a
+     `"…"`-quoted identifier; `is_[not_]distinct` → `IS [NOT] DISTINCT FROM`). It rides `bind_data.native_filter_sql`
+     → `BuildScanSpec` emits `spec_json.native_filter` → `ScanSpec.NativeFilter` → **`DeltaNativeReader` prefers it**
+     over `DeltaSqlFilter.ToWhere` for the `read_parquet … WHERE`. Because the native target IS DuckDB, the render is
+     exactly 1:1 (no dialect/collation risk) and **correctness-neutral** (DuckDB re-applies above the scan; only the
+     policy-approved superset-safe subset is pushed — a dropped branch, e.g. VARCHAR `<>` on a non-byte-ordered
+     source, just forfeits pruning). **Additive + SQL/DAX-neutral**: those providers read `Filter`+values and ignore
+     `native_filter`; the `filter_json`/`filter_constants` generation is byte-identical. Verified:
+     `verify_delta_catalog_native_read` (66) + delete (28) / update (63) / partition (54) green; live smoke shows
+     `read_parquet(…) WHERE "id" > 3` reaching the engine. This is the mechanism **slice 2 reuses**: it renders the
+     execute-time `TableFilterSet` into the same `native_filter` field via `TableFilter::ToString`.
+   - **(2b-slice-2) live dynamic filters — the hard, shared-core part (TODO).** The native scan must (i) set
      `filter_pushdown = true` on the `arrownet_scan` variant so DuckDB delivers `input.filters` (incl. the
-     hash-join `DynamicTableFilterSet`) — BUT `filter_pushdown = true` removes filters from the plan, so C# must
-     translate the **full** `TableFilterSet` faithfully (else keep it off); (ii) `arrow_ingest` exposes the live
-     filters to the C# scan factory via a **host callback that re-serializes the current `TableFilterSet`** into
-     the existing `filter_json`+`filter_values` shape on demand; (iii) `DeltaNativeReader` calls it before each
-     file open → `DeltaSqlFilter.ToWhere` → `read_parquet … WHERE`. This touches the **provider-shared
-     `arrow_ingest` scan path** (SQL/DAX also use it) → validate the full suite. Higher risk; do it deliberately.
-     Correctness is unaffected if deferred (DuckDB re-applies every filter above the scan — only join-driven
-     file/row-group *pruning* is missed, an optimization).
+     hash-join `DynamicTableFilter`, wrapped in `OptionalFilter`) at execute time; the **mandatory** `ConstantFilter`s
+     it then removes from the plan must be applied faithfully (1:1 via `TableFilter::ToString` on DuckDB — trivially
+     correct), while **`OptionalFilter`/`DynamicFilter` are pruning-only** (their `FilterSelection` is a no-op → the
+     join re-applies), so pushing them is pure best-effort and skipping any we can't render (or that isn't yet
+     `initialized`) is always correct — this **collapses most of the earlier "must be complete" risk**; (ii)
+     `arrow_ingest` exposes the live filters to the C# scan factory via a **host callback that re-renders the current
+     `TableFilterSet`** (unwrap `OptionalFilter` → child; resolve `DynamicFilter` via `filter_data` under its lock,
+     rendering the inner `ConstantFilter` when `initialized`, else skip — note `DynamicFilter::ToString` itself is a
+     debug string, NOT the bound) into `spec_json.native_filter` on demand; (iii) `DeltaNativeReader` calls it before
+     each file open → `read_parquet … WHERE`. This touches the **provider-shared `arrow_ingest` scan path** (SQL/DAX
+     also use it) → validate the full suite. Higher risk; do it deliberately. Correctness is unaffected if deferred
+     (DuckDB re-applies every filter above the scan — only join-driven file/row-group *pruning* is missed).
 3. **Slice 3 (later, additive):** downstream **multi-lane parallelism** — partition the file list across N
    per-thread Arrow streams (`MaxThreads = N`); no change to rowid/DV/filter.
 4. Snapshot consistency (the per-transaction UTC instant → implicit `AT`) applies to this reader exactly as to

@@ -49,7 +49,12 @@ internal static class DeltaNativeReader
 
         // Static filter → engineered-wood predicate (Delta-log FILE pruning) + SQL WHERE (read_parquet row-group pruning).
         Predicate? prune = spec?.Filter is { } node ? new DeltaFilterBuilder(filterValues).Build(node) : null;
-        string? where = spec?.Filter is { } node2 ? DeltaSqlFilter.ToWhere(node2, filterValues) : null;
+        // Prefer the host's 1:1 native SQL rendering (literals inlined, DuckDB self-render → exact). It carries the
+        // SAME superset-safe predicates as spec.Filter, so it's correctness-neutral (DuckDB re-applies above the
+        // scan). Fall back to translating the FilterNode ourselves when the host didn't emit one.
+        string? where = !string.IsNullOrEmpty(spec?.NativeFilter)
+            ? spec!.NativeFilter
+            : spec?.Filter is { } node2 ? DeltaSqlFilter.ToWhere(node2, filterValues) : null;
 
         var listing = DeltaReader.ListNativeScanFiles(opener, path, unit, value, prune, Log);
         var schema = ProbeSchema(listing, userSchema, dataCols, wantRowId);

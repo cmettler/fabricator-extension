@@ -246,6 +246,12 @@ static string BuildScanSpec(const ArrowStreamBindData &bind_data, const vector<c
 		json += ",\"filter\":";
 		json += bind_data.filter_json; // already a JSON object
 	}
+	// A 1:1 SQL rendering of the same predicates (literals inlined) — consumed only by a provider whose
+	// scan target is DuckDB itself (native Delta read_parquet); foreign-engine providers ignore it.
+	if (!bind_data.native_filter_sql.empty()) {
+		json += ",\"native_filter\":";
+		JsonEscape(bind_data.native_filter_sql, json);
+	}
 	// TOP (n) is only safe with no pushed filter: a best-effort filter returns a
 	// superset, so limiting before exact (DuckDB) filtering could drop valid rows.
 	if (bind_data.top_n >= 0 && bind_data.filter_json.empty()) {

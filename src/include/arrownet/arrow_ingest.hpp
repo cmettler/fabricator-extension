@@ -76,6 +76,14 @@ struct ArrowStreamBindData : public duckdb::TableFunctionData {
 	duckdb::string filter_json;
 	duckdb::vector<duckdb::Value> filter_constants;
 
+	//! A 1:1 SQL rendering of the SAME superset-safe predicates as `filter_json`, with literals INLINED
+	//! (via `Value::ToSQLString()`) so it is self-contained. Consumed ONLY by a provider whose scan target
+	//! is DuckDB itself (the native Delta `read_parquet` path), where DuckDB's own SQL semantics make the
+	//! push exactly 1:1 — no dialect/collation risk. Providers targeting a foreign engine (SQL Server, DAX)
+	//! ignore it and use `filter_json` + `filter_constants` instead. Empty => no filter. Emitted into
+	//! `spec_json` as `"native_filter"`; see BuildScanSpec.
+	duckdb::string native_filter_sql;
+
 	//! LIMIT pushdown (Phase 3): a constant row limit to push as `SELECT TOP (n)`.
 	//! -1 => none. Only applied when there is no pushed filter (a best-effort filter
 	//! returns a superset, so TOP before exact filtering could drop rows). Set by the

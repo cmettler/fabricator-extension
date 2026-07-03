@@ -41,17 +41,19 @@ public:
 	    : get_(get), constants_(constants), string_order_pushable_(string_order_pushable) {
 	}
 
-	// Returns true and fills `out` (a JSON object) iff `e` was fully serialized.
-	bool Serialize(const Expression &e, string &out) {
+	// Returns true and fills `out` (a JSON object) + `sql` (an equivalent DuckDB SQL predicate, literals
+	// inlined) iff `e` was fully serialized. `sql` is 1:1 with `out` and only consumed by the native
+	// (read_parquet-on-DuckDB) path; both are always produced together so they cannot diverge.
+	bool Serialize(const Expression &e, string &out, string &sql) {
 		switch (e.GetExpressionClass()) {
 		case ExpressionClass::BOUND_COMPARISON:
-			return Comparison(e.Cast<BoundComparisonExpression>(), out);
+			return Comparison(e.Cast<BoundComparisonExpression>(), out, sql);
 		case ExpressionClass::BOUND_OPERATOR:
-			return Operator(e.Cast<BoundOperatorExpression>(), out);
+			return Operator(e.Cast<BoundOperatorExpression>(), out, sql);
 		case ExpressionClass::BOUND_CONJUNCTION:
-			return Conjunction(e.Cast<BoundConjunctionExpression>(), out);
+			return Conjunction(e.Cast<BoundConjunctionExpression>(), out, sql);
 		case ExpressionClass::BOUND_BETWEEN:
-			return Between(e.Cast<BoundBetweenExpression>(), out);
+			return Between(e.Cast<BoundBetweenExpression>(), out, sql);
 		default:
 			return false;
 		}
@@ -82,6 +84,32 @@ private:
 			}
 		}
 		out += '"';
+	}
+
+	// A DuckDB double-quoted identifier ("col", with any embedded " doubled) for the native SQL WHERE.
+	static void SqlIdent(const string &s, string &out) {
+		out += '"';
+		for (char c : s) {
+			if (c == '"') {
+				out += "\"\"";
+			} else {
+				out += c;
+			}
+		}
+		out += '"';
+	}
+
+	// The comparison operator as it appears in the native SQL predicate (between column and literal).
+	// nullptr for a token we don't emit as SQL.
+	static const char *CmpSqlToken(const char *json_tok) {
+		string t(json_tok);
+		if (t == "is_distinct") {
+			return "IS DISTINCT FROM";
+		}
+		if (t == "is_not_distinct") {
+			return "IS NOT DISTINCT FROM";
+		}
+		return json_tok; // = <> < > <= >= are identical in DuckDB SQL
 	}
 
 	// Resolve a column-ref expression to its provider column name.
@@ -169,7 +197,7 @@ private:
 		return idx;
 	}
 
-	bool Comparison(const BoundComparisonExpression &cmp, string &out) {
+	bool Comparison(const BoundComparisonExpression &cmp, string &out, string &sql) {
 		auto type = cmp.GetExpressionType();
 		const Expression *col = nullptr;
 		const Expression *constant = nullptr;
@@ -208,10 +236,16 @@ private:
 		out += "\",\"col\":";
 		JsonStr(name, out);
 		out += ",\"val\":" + to_string(idx) + "}";
+		sql.clear();
+		SqlIdent(name, sql);
+		sql += ' ';
+		sql += CmpSqlToken(tok);
+		sql += ' ';
+		sql += value.ToSQLString();
 		return true;
 	}
 
-	bool Operator(const BoundOperatorExpression &op, string &out) {
+	bool Operator(const BoundOperatorExpression &op, string &out, string &sql) {
 		auto type = op.GetExpressionType();
 		if (type == ExpressionType::OPERATOR_IS_NULL || type == ExpressionType::OPERATOR_IS_NOT_NULL) {
 			if (op.children.size() != 1) {
@@ -227,6 +261,9 @@ private:
 			out += "\",\"col\":";
 			JsonStr(name, out);
 			out += "}";
+			sql.clear();
+			SqlIdent(name, sql);
+			sql += type == ExpressionType::OPERATOR_IS_NULL ? " IS NULL" : " IS NOT NULL";
 			return true;
 		}
 		if (type == ExpressionType::COMPARE_IN) {
@@ -255,19 +292,25 @@ private:
 			out = "{\"op\":\"in\",\"col\":";
 			JsonStr(name, out);
 			out += ",\"vals\":[";
+			sql.clear();
+			SqlIdent(name, sql);
+			sql += " IN (";
 			for (idx_t i = 0; i < values.size(); i++) {
 				if (i) {
 					out += ',';
+					sql += ", ";
 				}
 				out += to_string(AddConstant(values[i]));
+				sql += values[i].ToSQLString();
 			}
 			out += "]}";
+			sql += ')';
 			return true;
 		}
 		return false; // OPERATOR_NOT etc.: leave to DuckDB
 	}
 
-	bool Conjunction(const BoundConjunctionExpression &conj, string &out) {
+	bool Conjunction(const BoundConjunctionExpression &conj, string &out, string &sql) {
 		auto type = conj.GetExpressionType();
 		bool is_and = type == ExpressionType::CONJUNCTION_AND;
 		bool is_or = type == ExpressionType::CONJUNCTION_OR;
@@ -275,10 +318,12 @@ private:
 			return false;
 		}
 		vector<string> parts;
+		vector<string> sql_parts;
 		for (auto &child : conj.children) {
-			string js;
-			if (Serialize(*child, js)) {
+			string js, cs;
+			if (Serialize(*child, js, cs)) {
 				parts.push_back(std::move(js));
+				sql_parts.push_back(std::move(cs));
 			} else if (is_or) {
 				return false; // OR is all-or-nothing (dropping a branch would be a subset)
 			}
@@ -289,22 +334,28 @@ private:
 		}
 		if (parts.size() == 1) {
 			out = parts[0];
+			sql = sql_parts[0];
 			return true;
 		}
+		const char *joiner = is_and ? " AND " : " OR ";
 		out = "{\"op\":\"";
 		out += is_and ? "and" : "or";
 		out += "\",\"children\":[";
+		sql = "(";
 		for (idx_t i = 0; i < parts.size(); i++) {
 			if (i) {
 				out += ',';
+				sql += joiner;
 			}
 			out += parts[i];
+			sql += sql_parts[i];
 		}
 		out += "]}";
+		sql += ')';
 		return true;
 	}
 
-	bool Between(const BoundBetweenExpression &b, string &out) {
+	bool Between(const BoundBetweenExpression &b, string &out, string &sql) {
 		string name;
 		LogicalType coltype;
 		if (!ColumnName(*b.input, name, coltype)) {
@@ -335,6 +386,19 @@ private:
 		out += "\",\"col\":";
 		JsonStr(name, out);
 		out += ",\"val\":" + to_string(hi_idx) + "}]}";
+		sql = "(";
+		SqlIdent(name, sql);
+		sql += ' ';
+		sql += lo_op;
+		sql += ' ';
+		sql += lo.ToSQLString();
+		sql += " AND ";
+		SqlIdent(name, sql);
+		sql += ' ';
+		sql += hi_op;
+		sql += ' ';
+		sql += hi.ToSQLString();
+		sql += ')';
 		return true;
 	}
 
@@ -354,35 +418,43 @@ void ArrowNetComplexFilterPushdown(ClientContext &, LogicalGet &get, FunctionDat
 	auto &bind_data = bind_data_p->Cast<arrownet::ArrowStreamBindData>();
 	bind_data.filter_json.clear();
 	bind_data.filter_constants.clear();
+	bind_data.native_filter_sql.clear();
 	if (filters.empty()) {
 		return;
 	}
 	FilterSerializer ser(get, bind_data.filter_constants, bind_data.string_order_pushable);
 	vector<string> parts;
+	vector<string> sql_parts;
 	for (auto &f : filters) { // do NOT erase — DuckDB re-applies them
-		string js;
-		if (ser.Serialize(*f, js)) {
+		string js, cs;
+		if (ser.Serialize(*f, js, cs)) {
 			parts.push_back(std::move(js));
+			sql_parts.push_back(std::move(cs));
 		}
 	}
 	if (parts.empty()) {
 		bind_data.filter_constants.clear();
 		return;
 	}
-	// The filters vector is an implicit AND.
+	// The filters vector is an implicit AND (both the JSON tree and the native SQL WHERE).
 	if (parts.size() == 1) {
 		bind_data.filter_json = parts[0];
+		bind_data.native_filter_sql = sql_parts[0];
 		return;
 	}
 	string json = "{\"op\":\"and\",\"children\":[";
+	string sql;
 	for (idx_t i = 0; i < parts.size(); i++) {
 		if (i) {
 			json += ',';
+			sql += " AND ";
 		}
 		json += parts[i];
+		sql += sql_parts[i];
 	}
 	json += "]}";
 	bind_data.filter_json = std::move(json);
+	bind_data.native_filter_sql = std::move(sql);
 }
 
 ArrowNetTableEntry::ArrowNetTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
