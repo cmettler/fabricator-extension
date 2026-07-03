@@ -446,18 +446,23 @@ done as a standalone function) only if CPU-bound-local multi-lane Delta scans be
 
    **Batch 2 — exact remaining ABI work (for a fresh, well-budgeted session; NOT started — an unfinished ABI
    bump breaks the extension):**
-   - **(2a) DuckDB log forwarding — WIRED (ABI v58), lockstep-verified; duckdb_logs surfacing PENDING.** The
-     additive `host_log(level, log_type, message)` entry is appended to `ArrowNetHostServices`; C++
+   - **(2a) DuckDB log forwarding — WIRED (ABI v58), lockstep-verified, and `duckdb_logs` surfacing CONFIRMED
+     LIVE.** The additive `host_log(level, log_type, message)` entry is appended to `ArrowNetHostServices`; C++
      `HostLogService` (in `arrownet_host_query.cpp`, reusing the `g_host_db` `DatabaseInstance*`) maps the level
      and calls `Logger::Get(*g_host_db).WriteLog(...)`; `HostFs.Log` + `Bootstrap` wire
      `ArrowNetLog.EnableHostForwarding` when the host provides the callback (level codes stable in
-     `ArrowNetLog.LevelCode`, 0 Trace…5 Critical). **Verified:** ABI v58 boots (no mismatch) + `native_read` (66)
-     + Delta suites green — the bump is safe, the forwarding path is exercised (no-op-safe). **NOT yet confirmed:**
-     entries did NOT appear in `duckdb_logs` under `PRAGMA enable_logging` (0 rows). Likely root cause: logging
-     through `Logger::Get(DatabaseInstance&)` (instance scope) while `PRAGMA enable_logging` configures the
-     *connection*-level logger, so the instance logger's `ShouldLog` filters it. Follow-up (small): log through a
-     context that reflects the enabled config (or set the instance LogManager level), then confirm `duckdb_logs`.
-     **The file sink (Batch 1) is the working trace meanwhile.**
+     `ArrowNetLog.LevelCode`, 0 Trace…5 Critical). **Confirmed:** with `CALL enable_logging(storage='memory')`,
+     `SELECT * FROM duckdb_logs WHERE type LIKE 'ArrowNet%'` returns the forwarded events with the ILogger
+     **category as the `type`** (`ArrowNet.Delta`, `ArrowNet.Delta.Native`) and the mapped `log_level` — a live
+     native-read query surfaced all 6 events (snapshot pin, file list, per-file `read_parquet` SQL, etc.).
+     **Two prior red herrings** (why an earlier smoke showed 0 rows): (i) the enable form is `CALL
+     enable_logging(...)`, **not** `PRAGMA enable_logging` (which errors → config stays at default); (ii) the
+     DuckDB **shell** defaults log storage to a console-printing sink (so events print to stdout as `DEBUG:`/
+     `INFO:` but never reach the in-memory table `duckdb_logs` scans) — pass `storage='memory'` (the default in
+     the `unittest`/API host anyway). `WriteLog` on the global logger writes regardless of `ShouldLog`, and the
+     client flushes the log buffer at each query boundary, so no instance-vs-connection-logger issue exists. **No
+     code change was needed** — the forwarding was correct; only the confirmation recipe. The file sink
+     (`ARROWNET_LOG_LEVEL`+`ARROWNET_LOG_FILE`, Batch 1) remains the always-available independent trace.
    - **(2b) live dynamic filters — the hard, shared-core part.** The native scan must (i) set
      `filter_pushdown = true` on the `arrownet_scan` variant so DuckDB delivers `input.filters` (incl. the
      hash-join `DynamicTableFilterSet`) — BUT `filter_pushdown = true` removes filters from the plan, so C# must
