@@ -422,14 +422,24 @@ done as a standalone function) only if CPU-bound-local multi-lane Delta scans be
 
 ### Concrete plan — C# native catalog reader (supersedes the `native_read` Host.Query slice `9f5ec40`)
 
-1. **Slice 1 (C#-only, no ABI):** grow `DeltaCatalog.ScanTable`'s `native_read` branch from one
-   `read_parquet([list])` into a **per-file loop** (prefetch/bounded-channel ≈ threads) that per file emits
-   `SELECT <projected>, (ordinal<<40)|file_row_number AS "_metadata.row_id" FROM read_parquet(<file>,
-   file_row_number => true) [WHERE <static>]` via `Host.Query`, yields its batches, applies the file's **DV**
-   (drop deleted positions), and does **Delta-log file pruning** (skip a file whose `add` stats/partition
-   values can't match the static filter) — the per-file decision point + early-stop. rowid ⇒ **DML works
-   natively** (no C#-reader fallback for DELETE/UPDATE). File list is **relative-path-sorted** for ordinal
-   parity. Time-travel `AT` → list files as of the version.
+1. **Slice 1 (C#-only, no ABI) — DONE (2026-07-03).** `DeltaCatalog.ScanTable`'s `native_read` branch grew from
+   one `read_parquet([list])` into a **per-file loop** (`DeltaNativeReader`, prefetch/bounded-channel via
+   `ARROWNET_DELTA_PREFETCH`, default 1 = sequential, >1 = concurrent file fetch) that per file emits
+   `SELECT <projected>[, ((ordinal::BIGINT << 40) | file_row_number) AS "_metadata.row_id"] FROM
+   read_parquet(<file>, file_row_number => true) [WHERE <static> [AND file_row_number NOT IN (dv)]]` via
+   `Host.Query`, yields its batches, excludes the file's **DV** (`NOT IN`), and does **Delta-log FILE pruning**
+   (`DeltaFilePruner.ShouldInclude`, skip a file whose `add` stats/partitions can't match the static filter) —
+   the per-file decision point. rowid via `file_row_number` ⇒ **DML runs natively** (DELETE/UPDATE, no
+   C#-reader fallback). File list is **relative-path-sorted** so `file_list ordinal` == engineered-wood's
+   `OrderedActiveFiles` (rowid decode parity). Time-travel `AT (VERSION/TIMESTAMP)` → list files as of the
+   resolved snapshot. The output schema is probed (`read_parquet … LIMIT 0`) so it matches the batches by type.
+   Verified: `test/verify_delta_catalog_native_read.test` (66 — read/projection/filter/aggregate, multi-file
+   append, DELETE+UPDATE via native rowid, DV exclusion, AT VERSION 0/1/2, explicit-transaction pinning); Delta
+   catalog write/delete/update/decimal/time_travel/changes suites unregressed. **Logging (ILogger, C#-only):**
+   `ArrowNetLog` (off by default; `ARROWNET_LOG_LEVEL`+`ARROWNET_LOG_FILE` → a file sink; factory pluggable) traces
+   the resolved snapshot version, the file list (active/scanned/pruned), and each per-file `read_parquet` SQL.
+   One local engineered-wood change: `DeltaFilePruner` made `public` (was `internal`). **Deferred within slice 1:**
+   very large DVs use a big `NOT IN` list (fine for typical DV cardinality; a bitmap/anti-join is a later opt).
 2. **Slice 2 (optional, small ABI):** a **live-filter host-callback** so the per-file loop reads the outer
    scan's current (incl. dynamic/join) filters before each file → `read_parquet … WHERE` → dynamic file/
    row-group pruning at the per-file decision point (closes the mid-scan-filter gap).

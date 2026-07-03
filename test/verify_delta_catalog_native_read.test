@@ -111,3 +111,62 @@ query II
 SELECT count(id), sum(id) FROM dvlake.main.d;
 ----
 4	16
+
+# ---- Time travel via the native reader (AT VERSION resolves the snapshot; read_parquet reads those files) ----
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catnativett' AS ttlake (TYPE arrownet, PROVIDER 'delta', native_read true);
+
+# Empty CREATE = commit v0; each INSERT is its own commit (v1, v2, v3).
+statement ok
+CREATE TABLE ttlake.main.t (id INTEGER);
+
+statement ok
+INSERT INTO ttlake.main.t VALUES (1);
+
+statement ok
+INSERT INTO ttlake.main.t VALUES (2);
+
+statement ok
+INSERT INTO ttlake.main.t VALUES (3);
+
+# Latest = all three rows.
+query I
+SELECT count(*) FROM ttlake.main.t;
+----
+3
+
+# AT (VERSION => 0) = the empty CREATE commit (0 rows).
+query I
+SELECT count(*) FROM ttlake.main.t AT (VERSION => 0);
+----
+0
+
+# AT (VERSION => 1) = only the first insert.
+query I
+SELECT id FROM ttlake.main.t AT (VERSION => 1) ORDER BY id;
+----
+1
+
+# AT (VERSION => 2) = the first two inserts.
+query I
+SELECT count(*) FROM ttlake.main.t AT (VERSION => 2);
+----
+2
+
+# ---- Snapshot pinning: an explicit transaction reads a consistent, pinned version across statements ----
+statement ok
+BEGIN TRANSACTION;
+
+query I
+SELECT count(*) FROM ttlake.main.t;
+----
+3
+
+# A second scan in the SAME transaction reads the same pinned version.
+query I
+SELECT sum(id) FROM ttlake.main.t;
+----
+6
+
+statement ok
+COMMIT;

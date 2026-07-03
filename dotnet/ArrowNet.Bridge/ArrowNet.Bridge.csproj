@@ -18,6 +18,11 @@
 
   <ItemGroup>
     <PackageReference Include="Apache.Arrow" Version="23.0.0" />
+    <!-- .NET logging: trace the native Delta reader (per-file queries, applied static/dynamic filters, pruned
+         files, snapshot version). Off by default (NullLoggerFactory); env-driven file sink via ARROWNET_LOG_LEVEL
+         + ARROWNET_LOG_FILE. The ILoggerFactory is pluggable (ArrowNetLog.Factory), so a DuckDB-forwarding
+         provider can be attached later. -->
+    <PackageReference Include="Microsoft.Extensions.Logging" Version="9.0.0" />
     <!-- The stable contract surface (interfaces + Arrow-typed POCOs), split out so plugins can reference a
          minimal shared assembly. Same ArrowNet.Bridge namespace — assembly split only. -->
     <ProjectReference Include="..\ArrowNet.Abstractions\ArrowNet.Abstractions.csproj" />

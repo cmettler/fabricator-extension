@@ -1194,7 +1194,23 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   (prefetch/bounded-channel ≈ threads) with `file_row_number` rowid/DML + DV + projection + static filter + log
   file-pruning (slice 1, C#-only), optional live-filter host-callback for dynamic pruning (slice 2), multi-lane
   parallelism (slice 3). Build the C++ `arrownet_delta_mfr_scan` MFR (slices 1a/1b done, standalone) only if
-  CPU-bound-local multi-lane becomes a goal.
+  CPU-bound-local multi-lane becomes a goal. **Slice 1 DONE (2026-07-03, C#-only, no ABI):** `DeltaNativeReader`
+  is a **per-file loop** (`ARROWNET_DELTA_PREFETCH`, default 1 = sequential, >1 = concurrent file fetch) emitting
+  per file `SELECT <proj>[, ((ord::BIGINT<<40)|file_row_number) AS "_metadata.row_id"] FROM read_parquet(<file>,
+  file_row_number => true) [WHERE <static> [AND file_row_number NOT IN (dv)]]` via `Host.Query` — so plain SELECT,
+  **DELETE/UPDATE (native rowid via file_row_number, no C#-reader fallback)**, DV exclusion, projection, static
+  filter + **Delta-log FILE pruning** (`DeltaFilePruner`, now `public`), and time travel (`AT VERSION/TIMESTAMP`)
+  all run natively. File list **relative-path-sorted** for `OrderedActiveFiles` rowid-decode parity; output schema
+  **probed** (`read_parquet … LIMIT 0`) to match batches by type. **Snapshot consistency DONE:** `SnapshotPinning`
+  captures one UTC instant per DuckDB transaction (`AmbientTransaction`, keyed on the txn id — fires per statement
+  in autocommit, once per explicit `BEGIN`) → resolves+pins the version per (txn,table) via
+  `DeltaReader.ResolveVersionAsOf` (commitInfo.timestamp; falls back to latest), so a multi-table join reads a
+  consistent cut. **Logging DONE (ILogger, C#-only):** `ArrowNetLog` (off by default; `ARROWNET_LOG_LEVEL` +
+  `ARROWNET_LOG_FILE` → file sink; factory pluggable for a future DuckDB-forwarding provider) traces the resolved
+  snapshot version, file list (active/scanned/pruned), and each per-file `read_parquet` SQL. Verified:
+  `test/verify_delta_catalog_native_read.test` (66); Delta write/delete/update/decimal/time_travel/changes
+  unregressed. **Remaining: slice 2** (live-filter host-callback → dynamic/join filter pushdown per file, ABI) +
+  **slice 3** (multi-lane, deferred by user).
   v56 = **`onelake://` WRITE forward callbacks** — appended 3 vtable entries
   `onelake_open_write`/`onelake_write`/`onelake_close_write`; the C++ `ArrowNetOneLakeFileSystem` `OpenFile(write)`/
   `Write` (sequential append → managed `OneLakeForwardFs` create/append/flush) make **`COPY … TO 'onelake://…'` +

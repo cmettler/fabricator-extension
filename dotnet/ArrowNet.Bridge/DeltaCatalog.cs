@@ -123,6 +123,8 @@ public sealed class DeltaCatalog : IBackendCatalog
     // follow-ups). Purely a byte-source switch inside ScanTable — no C++/ABI change.
     private readonly bool _nativeRead;
 
+    private static readonly Microsoft.Extensions.Logging.ILogger _log = ArrowNetLog.CreateLogger("ArrowNet.Delta");
+
     public DeltaCatalog(string root) : this(root, "{}") { }
 
     public DeltaCatalog(string root, string? optionsJson)
@@ -569,9 +571,22 @@ public sealed class DeltaCatalog : IBackendCatalog
         // Projection is left to DuckDB above the scan (the full schema is returned, mapped by name) — same as
         // the global arrownet_delta_scan; column-pruning into parquet would need a projected-schema stream.
         var spec = ScanSpec.Parse(specJson);
+        var filterVals = ReadFilterValues(filterValues);
         EngineeredWood.Expressions.Predicate? filter = spec?.Filter is { } node
-            ? new DeltaFilterBuilder(ReadFilterValues(filterValues)).Build(node)
+            ? new DeltaFilterBuilder(filterVals).Build(node)
             : null;
+
+        // Opt-in native read (native_read true): DuckDB's own read_parquet decodes the files. A per-file loop
+        // pushes projection + the static filter + Delta-log FILE pruning, excludes each file's deletion vector,
+        // and computes the transient _metadata.row_id — so plain SELECT, DELETE/UPDATE (rowid) and time travel
+        // ALL run natively (no fallback). Snapshot pinning gives a consistent cut across a multi-table query.
+        // See DeltaNativeReader + docs/multifile-delta.md §"Concrete plan".
+        if (_nativeRead)
+        {
+            return ScanNative(opener, path, spec, filterVals);
+        }
+
+        // ---- engineered-wood C# reader (default: native_read off) ----
         // Time travel: `FROM t AT (VERSION => n)` / `AT (TIMESTAMP => ts)` — a read-only snapshot, so it uses
         // the plain stream (no rowid) and advertises the schema AS OF that version (which can differ from the
         // latest, e.g. before an ADD COLUMN). Delta supports BOTH version and timestamp (unlike the SQL provider,
@@ -614,28 +629,35 @@ public sealed class DeltaCatalog : IBackendCatalog
                 schemaWithRowId, DeltaReader.StreamWithRowIds(opener, path, columns: null, filter, default));
         }
 
-        // Opt-in native read (native_read true): source the bytes through DuckDB's own parquet reader instead of
-        // engineered-wood's C#. Only for a plain, no-DV table (the rowid + time-travel branches above already
-        // returned; a DV table can't be honored without a DeleteFilter, so it falls back). read_parquet over the
-        // exact active file set gives tuned decode + cross-file parallelism + ExternalFileCache (over onelake://
-        // for OneLake). DuckDB still projects + filters above this scan (the pushed `filter` is only used by the
-        // C# fallback). The host query's own schema is authoritative; arrow_ingest maps to the bind schema by name.
-        if (_nativeRead)
+        return new AsyncEnumerableArrowStream(userSchema, DeltaReader.Stream(opener, path, columns: null, filter, default));
+    }
+
+    // Native read (native_read true): resolve the snapshot (explicit AT > per-transaction pinned version >
+    // latest), then let DuckDB's read_parquet decode the files via DeltaNativeReader. Pinning gives a consistent
+    // cut across a multi-table query (all implicit-AT scans in one DuckDB transaction pin to the same instant).
+    private IArrowArrayStream ScanNative(nint opener, string path, ScanSpec? spec, IReadOnlyList<object?> filterVals)
+    {
+        string? unit = null, value = null;
+        if (spec?.At is { } at)
         {
-            var (files, hasDv) = DeltaReader.GetActiveFileUrisWithDv(opener, path);
-            if (!hasDv)
+            unit = at.Unit;
+            value = at.Value; // explicit AT overrides the per-transaction pin
+        }
+        else
+        {
+            long txn = AmbientTransaction.Current;
+            if (txn != 0)
             {
-                if (files.Count == 0)
-                {
-                    // No data files yet — the C# reader yields an empty stream matching the schema.
-                    return new AsyncEnumerableArrowStream(userSchema, DeltaReader.Stream(opener, path, columns: null, filter, default));
-                }
-                var list = string.Join(",", files.Select(f => "'" + f.Replace("'", "''") + "'"));
-                return Host.Query($"SELECT * FROM read_parquet([{list}])");
+                long v = SnapshotPinning.PinVersion(txn, path,
+                    inst => DeltaReader.ResolveVersionAsOf(opener, path, inst, _log), System.DateTime.UtcNow);
+                unit = "version";
+                value = v.ToString(System.Globalization.CultureInfo.InvariantCulture);
             }
         }
-
-        return new AsyncEnumerableArrowStream(userSchema, DeltaReader.Stream(opener, path, columns: null, filter, default));
+        var userSchema = unit is null
+            ? DeltaReader.GetSchema(opener, path)
+            : DeltaReader.GetSchemaAt(opener, path, unit, value!);
+        return DeltaNativeReader.Read(opener, path, userSchema, spec, filterVals, unit, value);
     }
 
     private static IReadOnlyList<object?> ReadFilterValues(IArrowArrayStream? filterValues)

@@ -8,10 +8,13 @@ using Apache.Arrow;
 using Apache.Arrow.Ipc;
 using Apache.Arrow.Types;
 using EngineeredWood.DeltaLake;
+using EngineeredWood.DeltaLake.Actions;
+using EngineeredWood.DeltaLake.DeletionVectors;
 using EngineeredWood.DeltaLake.Table;
 using EngineeredWood.IO;
 using EngineeredWood.Expressions;
 using EngineeredWood.Parquet;
+using Microsoft.Extensions.Logging;
 
 namespace ArrowNet.Bridge;
 
@@ -49,28 +52,97 @@ internal static class DeltaReader
         }
     }
 
-    /// <summary>Like <see cref="GetActiveFileUris"/> but ALSO reports whether ANY active file carries a deletion
-    /// vector. The catalog's opt-in <c>native_read</c> path (docs/multifile-delta.md slice 1e) routes a plain scan
-    /// through DuckDB's native <c>read_parquet</c> over these files, which cannot honor a DV (there is no
-    /// DeleteFilter on that path) — so a DV table must fall back to the C# reader. One table-open serves both.</summary>
-    public static (IReadOnlyList<string> Files, bool HasDeletionVectors) GetActiveFileUrisWithDv(nint opener, string path)
+    /// <summary>One active data file for the native reader: its global path-sorted <paramref name="Ordinal"/>
+    /// (matching engineered-wood's <c>OrderedActiveFiles</c> so a `(Ordinal&lt;&lt;40)|file_row_number` rowid
+    /// round-trips to <c>DeleteByRowIdsAsync</c>), the readable <paramref name="Uri"/> (onelake:// for OneLake),
+    /// and the sorted deleted row positions <paramref name="Dv"/> (empty = no DV).</summary>
+    public sealed record NativeScanFile(int Ordinal, string Uri, long[] Dv);
+
+    /// <summary>The result of <see cref="ListNativeScanFiles"/>: the resolved snapshot <see cref="Version"/>, the
+    /// surviving (post-prune) <see cref="Files"/> in path-sorted global-ordinal order, and <see cref="AnyUri"/> =
+    /// any active file's URI (pre-prune) for a schema probe when everything was pruned.</summary>
+    public sealed class NativeScanList
+    {
+        public long Version { get; init; }
+        public IReadOnlyList<NativeScanFile> Files { get; init; } = System.Array.Empty<NativeScanFile>();
+        public string? AnyUri { get; init; }
+    }
+
+    /// <summary>Resolves the version whose commit is at/just-before <paramref name="instantUtc"/> (via the
+    /// always-written <c>commitInfo.timestamp</c>); falls back to the latest version if the timestamp can't be
+    /// resolved (e.g. an external table with no commit timestamps). Used for per-transaction snapshot pinning.</summary>
+    public static long ResolveVersionAsOf(nint opener, string path, DateTime instantUtc, ILogger log)
     {
         var fs = TableFileSystems.Create(opener, path);
         var table = DeltaTable.OpenAsync(fs).GetAwaiter().GetResult();
         try
         {
-            var root = ToReadableRoot(path);
-            var uris = new List<string>();
-            bool hasDv = false;
-            foreach (var add in table.CurrentSnapshot.ActiveFiles.Values)
+            try
             {
-                uris.Add(root + "/" + add.Path.Replace('\\', '/').TrimStart('/'));
+                var snap = table.GetSnapshotAtTimestampAsync(new DateTimeOffset(instantUtc, TimeSpan.Zero), default)
+                    .GetAwaiter().GetResult();
+                log.LogDebug("delta snapshot pin: {Path} as-of {Instant:o} -> v{Version}", path, instantUtc, snap.Version);
+                return snap.Version;
+            }
+            catch (Exception ex)
+            {
+                long latest = table.CurrentSnapshot.Version;
+                log.LogDebug("delta snapshot pin: {Path} as-of {Instant:o} unresolved ({Err}); pinning latest v{Version}",
+                    path, instantUtc, ex.Message, latest);
+                return latest;
+            }
+        }
+        finally
+        {
+            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+    }
+
+    /// <summary>Lists the active data files for a native read: resolves the snapshot (latest / at
+    /// <paramref name="unit"/>+<paramref name="value"/>), assigns each file its GLOBAL path-sorted ordinal
+    /// (rowid parity), applies best-effort Delta-log FILE pruning via <paramref name="prune"/> (skip a file whose
+    /// stats/partitions can't match), and resolves each surviving file's deletion-vector positions.</summary>
+    public static NativeScanList ListNativeScanFiles(
+        nint opener, string path, string? unit, string? value, Predicate? prune, ILogger log)
+    {
+        var fs = TableFileSystems.Create(opener, path);
+        var table = DeltaTable.OpenAsync(fs).GetAwaiter().GetResult();
+        try
+        {
+            var snap = unit is null
+                ? table.CurrentSnapshot
+                : ResolveSnapshotAsync(table, unit, value ?? "", default).AsTask().GetAwaiter().GetResult();
+            var root = ToReadableRoot(path);
+            // GLOBAL path-sorted ordinal over ALL active files (matches engineered-wood OrderedActiveFiles), then prune.
+            var ordered = new List<AddFile>(snap.ActiveFiles.Values);
+            ordered.Sort((a, b) => string.CompareOrdinal(a.Path, b.Path));
+            var pruner = prune is null ? null : new DeltaFilePruner(snap.Schema, snap.Metadata.PartitionColumns);
+            var dvReader = new DeletionVectorReader(fs);
+            var files = new List<NativeScanFile>();
+            string? anyUri = null;
+            int pruned = 0;
+            for (int ordinal = 0; ordinal < ordered.Count; ordinal++)
+            {
+                var add = ordered[ordinal];
+                var uri = root + "/" + add.Path.Replace('\\', '/').TrimStart('/');
+                anyUri ??= uri;
+                if (pruner is not null && !pruner.ShouldInclude(add, prune!))
+                {
+                    pruned++;
+                    continue;
+                }
+                long[] dv = System.Array.Empty<long>();
                 if (add.DeletionVector is not null)
                 {
-                    hasDv = true;
+                    var deleted = dvReader.ReadAsync(add.DeletionVector).GetAwaiter().GetResult();
+                    dv = deleted.ToArray();
+                    System.Array.Sort(dv);
                 }
+                files.Add(new NativeScanFile(ordinal, uri, dv));
             }
-            return (uris, hasDv);
+            log.LogDebug("delta native list: {Path} v{Version} active={Active} scanned={Scanned} pruned={Pruned}",
+                path, snap.Version, ordered.Count, files.Count, pruned);
+            return new NativeScanList { Version = snap.Version, Files = files, AnyUri = anyUri };
         }
         finally
         {
