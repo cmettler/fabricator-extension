@@ -386,6 +386,58 @@ httpfs sends it, to verify; (3) **DROP/RENAME dir-ops** — `fs_remove_dir`→`R
 `fs_move_dir`→`MoveFile` may be unimplemented on httpfs' S3 FS (as on Azure DFS, where we route to the SDK), so
 DROP/RENAME could fail on S3 while CREATE/INSERT/CTAS/COPY/SELECT/DELETE/UPDATE (file writes, no dir-ops) work.
 
+### Decision (2026-07-03): the C# native reader is the target path; C++ MFR only for CPU-bound-local
+
+After grounding the analysis, the C++ MultiFileReader's advantages over a **pure-C# native reader** (C# lists +
+orchestrates, DuckDB's `read_parquet` does the native decode via `Host.Query`) reduce to almost nothing for the
+**cloud lakehouse target** (OneLake/MinIO, I/O-dominated):
+
+- **Native decode + ExternalFileCache** — C# gets it (via `read_parquet`).
+- **rowid/DML** — C# computes it in SQL: `(ordinal::BIGINT << 40) | file_row_number` (relative-path-sorted
+  ordinal), matching engineered-wood's `DeleteByRowIdsAsync` decode. No `get_virtual_columns` needed (the
+  catalog entry already declares the rowid virtual column; the scan just produces `_metadata.row_id`).
+- **DV** — C# drops deleted positions per file.
+- **Projection + static filter** — pushed into the `read_parquet` SQL.
+- **Static Delta-log FILE pruning + early-stop (LIMIT)** — per-file decision point in the C# loop.
+- **Dynamic (join/TopN) filters** — NOT MFR-exclusive: they flow to any table function with `filter_pushdown =
+  true` via `TableFunctionInitInput::filters` (PhysicalTableScan merges `op.dynamic_filters` at source-state
+  init, `physical_table_scan.cpp:35-36`). C# can read them at init and translate to `read_parquet … WHERE`
+  (caveat: `filter_pushdown = true` removes filters from the plan → must translate the full set faithfully;
+  today we use `filter_pushdown = false` + `pushdown_complex_filter` for superset-safe partial pushdown).
+- **Mid-scan-materializing filters** — even the MFR only prunes the *not-yet-opened* tail (already-open files
+  aren't re-pruned; `InitializeReader` fixes a file's row-group skip at open), and that tail shrinks with high
+  parallelism. A C# per-file loop + a **live-filter host-callback** (re-read the outer scan's filters before
+  each file) matches the MFR's tail-pruning exactly. So this is *closable* in C#, not a categorical MFR edge.
+
+The **only structural, non-replicable** MFR advantage is **downstream multi-lane parallelism** (the MFR feeds
+#threads pipeline lanes; our bridge exports one Arrow stream = one `get_next` lane). That matters for
+**CPU-bound local** star-schema joins over huge local parquet, and is **secondary for cloud I/O** (where
+concurrent file *fetch* — which C# does via prefetch/bounded-channel — is the bottleneck). And it is **additive
+later**: partition the file list into N groups, one Arrow stream + per-thread local state per group,
+`MaxThreads = N` — this does NOT touch the rowid/DV/filter design (the ordinal is global-path-sorted regardless
+of which thread reads a file). So we build the single-stream C# reader now and layer multi-lane on later.
+
+**⇒ Target = the pure-C# native reader.** Build the C++ MFR (`arrownet_delta_mfr_scan`, slices 1a/1b, already
+done as a standalone function) only if CPU-bound-local multi-lane Delta scans become a real goal.
+
+### Concrete plan — C# native catalog reader (supersedes the `native_read` Host.Query slice `9f5ec40`)
+
+1. **Slice 1 (C#-only, no ABI):** grow `DeltaCatalog.ScanTable`'s `native_read` branch from one
+   `read_parquet([list])` into a **per-file loop** (prefetch/bounded-channel ≈ threads) that per file emits
+   `SELECT <projected>, (ordinal<<40)|file_row_number AS "_metadata.row_id" FROM read_parquet(<file>,
+   file_row_number => true) [WHERE <static>]` via `Host.Query`, yields its batches, applies the file's **DV**
+   (drop deleted positions), and does **Delta-log file pruning** (skip a file whose `add` stats/partition
+   values can't match the static filter) — the per-file decision point + early-stop. rowid ⇒ **DML works
+   natively** (no C#-reader fallback for DELETE/UPDATE). File list is **relative-path-sorted** for ordinal
+   parity. Time-travel `AT` → list files as of the version.
+2. **Slice 2 (optional, small ABI):** a **live-filter host-callback** so the per-file loop reads the outer
+   scan's current (incl. dynamic/join) filters before each file → `read_parquet … WHERE` → dynamic file/
+   row-group pruning at the per-file decision point (closes the mid-scan-filter gap).
+3. **Slice 3 (later, additive):** downstream **multi-lane parallelism** — partition the file list across N
+   per-thread Arrow streams (`MaxThreads = N`); no change to rowid/DV/filter.
+4. Snapshot consistency (the per-transaction UTC instant → implicit `AT`) applies to this reader exactly as to
+   the catalog generally (see above).
+
 ## Recommendation — phased (build on demand)
 
 1. **Phase A — read-only (the big win).** Generic `ArrowNetMultiFileList/Reader` in `arrownet-core` +

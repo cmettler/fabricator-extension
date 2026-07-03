@@ -1180,6 +1180,21 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   the #threads look-ahead); (d) **S3/MinIO write** works with an S3 secret + NO opener conflict (`_fabricCredential`
   null → host-FS + opener secret), caveats: httpfs must be linked for tests, EXCLUSIVE_CREATE (commit put-if-absent)
   may not be enforced on S3 httpfs (concurrent-writer safety), DROP/RENAME dir-ops may be unimplemented on the S3 FS.
+  **DECISION (2026-07-03): the pure-C# native reader is the target path, NOT the C++ MFR fold.** Analysis showed the
+  MFR's advantages all replicate in a C#-orchestrates-`read_parquet`-via-`Host.Query` reader for the cloud target:
+  native decode + cache (read_parquet), rowid/DML (`(ordinal<<40)|file_row_number` in SQL, no `get_virtual_columns`),
+  DV (drop positions per file), projection + static filter (into read_parquet WHERE), Delta-log file pruning +
+  early-stop (per-file loop), and even **dynamic (join) filters are NOT MFR-exclusive** (they flow to any
+  `filter_pushdown=true` table function via `input.filters`, `physical_table_scan.cpp:35-36`; mid-scan-materializing
+  filters only prune the not-yet-opened tail even in the MFR, closable in C# via a per-file live-filter callback).
+  The ONLY non-replicable MFR edge = **downstream multi-lane parallelism** (one Arrow stream = one `get_next` lane),
+  relevant for CPU-bound-local star-schema joins, **secondary for cloud I/O**, and **additive later** (partition the
+  file list into N per-thread streams — doesn't touch rowid/DV/filter, ordinal stays global-path-sorted). Plan
+  (docs/multifile-delta.md §"Concrete plan"): grow the `native_read` branch into a per-file loop
+  (prefetch/bounded-channel ≈ threads) with `file_row_number` rowid/DML + DV + projection + static filter + log
+  file-pruning (slice 1, C#-only), optional live-filter host-callback for dynamic pruning (slice 2), multi-lane
+  parallelism (slice 3). Build the C++ `arrownet_delta_mfr_scan` MFR (slices 1a/1b done, standalone) only if
+  CPU-bound-local multi-lane becomes a goal.
   v56 = **`onelake://` WRITE forward callbacks** — appended 3 vtable entries
   `onelake_open_write`/`onelake_write`/`onelake_close_write`; the C++ `ArrowNetOneLakeFileSystem` `OpenFile(write)`/
   `Write` (sequential append → managed `OneLakeForwardFs` create/append/flush) make **`COPY … TO 'onelake://…'` +
