@@ -16,6 +16,18 @@
 > 1c — partition-value constants; 1d — `Complex/DynamicFilterPushdown` → re-call `delta_list_files` with the filter
 > (the `push` arg) so engineered-wood prunes files by log stats; 1e — fold into the ATTACH catalog (credential
 > available there for the OneLake log read). Below is the full design.
+>
+> **Slice 1b DONE (2026-07-03) — deletion vectors (correctness):** `delta_list_files` now emits per file the
+> DELETED row positions (`"dv":[…]`, resolved by engineered-wood's `DeletionVectorReader`); the C++ side gained a
+> custom `ArrowNetDeltaMultiFileList` (per-file DV parallel to the file list), an `InitializeGlobalState` override
+> (so `FinalizeBind` can reach the list), and `FinalizeBind` attaches an `ArrowNetDeltaDeleteFilter` (over the
+> sorted deleted positions) to the parquet reader → DuckDB's native read EXCLUDES the deleted rows. Matches the C#
+> reader on a `deletion_vectors true` table (`test/verify_delta_mfr_dv.test`, 23). **Two gotchas:** (1) the parquet
+> reader hands `Filter()` an uninitialized `SelectionVector` (`Initialize(nullptr)` → null buffer), so the
+> DeleteFilter MUST `result_sel.Initialize(STANDARD_VECTOR_SIZE)` before writing (else segfault — matches the delta
+> ext); (2) **bare `count(*)` uses the parquet row-group metadata path and does NOT apply the DeleteFilter → it
+> OVER-COUNTS on a DV table** (any column/predicate scan is DV-correct; disabling that metadata-count optimization
+> for the delta reader is a follow-up). No ABI bump. Next: 1c partition constants, 1d pushdown, 1e catalog fold.
 
 > **Phase-A pre-spike DONE (2026-07-03):** `arrownet_delta_native_scan(path)` — engineered-wood lists the EXACT
 > active data files + schema (`DeltaReader.GetActiveFileUris`, the `add` set, NOT a glob), and DuckDB's **native

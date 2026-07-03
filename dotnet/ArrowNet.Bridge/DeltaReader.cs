@@ -56,18 +56,54 @@ internal static class DeltaReader
     /// slice. Paths are absolute URIs (onelake:// for OneLake → native + cached).</summary>
     public static string ListScanFilesJson(nint opener, string path, string? pushJson)
     {
-        var files = GetActiveFileUris(opener, path);
-        var sb = new StringBuilder("[");
-        for (int i = 0; i < files.Count; i++)
+        var fs = TableFileSystems.Create(opener, path);
+        var table = DeltaTable.OpenAsync(fs).GetAwaiter().GetResult();
+        try
         {
-            if (i > 0)
+            var root = ToReadableRoot(path);
+            var dvReader = new EngineeredWood.DeltaLake.DeletionVectors.DeletionVectorReader(fs);
+            var sb = new StringBuilder("[");
+            bool first = true;
+            foreach (var add in table.CurrentSnapshot.ActiveFiles.Values)
             {
-                sb.Append(',');
+                if (!first)
+                {
+                    sb.Append(',');
+                }
+                first = false;
+                var uri = root + "/" + add.Path.Replace('\\', '/').TrimStart('/');
+                sb.Append("{\"path\":\"").Append(uri.Replace("\\", "\\\\").Replace("\"", "\\\"")).Append('"');
+                // Slice 1b — deletion vectors: resolve the file's DV to the deleted ROW POSITIONS (sorted), so the
+                // C++ MultiFileReader attaches a DeleteFilter and DuckDB's native read excludes them. Positions are
+                // relative to the file (0-based physical order), matching read_parquet's row order.
+                if (add.DeletionVector is not null)
+                {
+                    var deleted = dvReader.ReadAsync(add.DeletionVector).GetAwaiter().GetResult();
+                    if (deleted.Count > 0)
+                    {
+                        var sorted = deleted.ToArray();
+                        System.Array.Sort(sorted);
+                        sb.Append(",\"dv\":[");
+                        for (int i = 0; i < sorted.Length; i++)
+                        {
+                            if (i > 0)
+                            {
+                                sb.Append(',');
+                            }
+                            sb.Append(sorted[i]);
+                        }
+                        sb.Append(']');
+                    }
+                }
+                sb.Append('}');
             }
-            sb.Append("{\"path\":\"").Append(files[i].Replace("\\", "\\\\").Replace("\"", "\\\"")).Append("\"}");
+            sb.Append(']');
+            return sb.ToString();
         }
-        sb.Append(']');
-        return sb.ToString();
+        finally
+        {
+            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
     }
 
     // The table root as a URI DuckDB's native reader can open: an abfss-OneLake root → onelake:// (our VFS

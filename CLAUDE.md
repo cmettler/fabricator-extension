@@ -1134,7 +1134,14 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   EXACT active `add` files as JSON `[{"path":<uri>}]`, onelake:// for OneLake) → a `SimpleMultiFileList`; DuckDB's
   **native parquet MultiFileReader** reads them (cached). The C++ MultiFileReader foundation for DV / partition /
   dynamic-filter pushdown (later slices 1b–1e); `parquet` statically linked (extension_config.cmake). Live/local:
-  `test/verify_delta_mfr_scan.test` (36, matches the C# reader). v56 = **`onelake://` WRITE forward callbacks** — appended 3 vtable entries
+  `test/verify_delta_mfr_scan.test` (36, matches the C# reader). **Slice 1b DONE (deletion vectors, no ABI bump):**
+  `delta_list_files` emits per file the deleted row positions (`"dv":[…]`, via engineered-wood's
+  `DeletionVectorReader`); C++ gained a custom `ArrowNetDeltaMultiFileList` (per-file DV) + `InitializeGlobalState`
+  override + `FinalizeBind` attaching an `ArrowNetDeltaDeleteFilter` → DuckDB's native read EXCLUDES deleted rows
+  (`test/verify_delta_mfr_dv.test`, 23). Gotchas: the DeleteFilter must `result_sel.Initialize(STANDARD_VECTOR_SIZE)`
+  before writing (reader passes a null sel_vector → else segfault); **bare `count(*)` over-counts on a DV table**
+  (empty-projection parquet-metadata count path skips the DeleteFilter — use a column scan; follow-up can disable
+  it). Next: 1c partition constants, 1d filter pushdown, 1e catalog fold. v56 = **`onelake://` WRITE forward callbacks** — appended 3 vtable entries
   `onelake_open_write`/`onelake_write`/`onelake_close_write`; the C++ `ArrowNetOneLakeFileSystem` `OpenFile(write)`/
   `Write` (sequential append → managed `OneLakeForwardFs` create/append/flush) make **`COPY … TO 'onelake://…'` +
   any DuckDB writer** write to OneLake (Phase-3 step-3 slice 2; live-validated: COPY a parquet, read back 5/5).
