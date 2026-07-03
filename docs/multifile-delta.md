@@ -307,6 +307,85 @@ partly reverses "thin C++"; mitigated by keeping it provider-agnostic in `arrown
 No benefit for SQL Server / DAX — a Delta/lakehouse-only investment. (4) DV correctness: engineered-wood must
 decode DVs to a bool/position set matching `file_row_number` semantics (its roaring reader is fixed).
 
+## Native-read fold — design decisions captured (planning, 2026-07-03)
+
+Three decisions/findings from planning the direct MultiFileReader-in-catalog fold (the real 1e, superseding the
+`native_read` Host.Query slice `9f5ec40`).
+
+### Rowid is a VIRTUAL COLUMN, not a bind-time decision (corrects an earlier worry)
+
+The concern "`BuildScanFunction` can't know at bind time whether the rowid is requested → native path must be
+read-only" was **wrong**. duckdb-delta sets `function.get_virtual_columns = DeltaVirtualColumns`
+(`delta_scan.cpp:104`), which declares `file_row_number` (`COLUMN_IDENTIFIER_FILE_ROW_NUMBER`), `rowid`
+(`COLUMN_IDENTIFIER_ROW_ID`) and `delta_file_number` as **virtual columns on the TableFunction**
+(`delta_scan.cpp:57-67`). The rowid is therefore a **projected virtual column requested at scan-init via
+`column_ids`** and produced on demand — never a bind decision. `file_row_number` is a native parquet virtual
+column (physical within-file position); the file ordinal is `reader_data.reader->file_list_idx.GetIndex()`
+(duckdb-delta stashes it via `constant_map`, `delta_multi_file_reader.cpp:77`). So our transient rowid
+`(fileOrdinal << 40) | file_row_number` is exactly `file_list_idx << 40 | file_row_number`, produced in
+`FinalizeChunk`. **Native DML is thus achievable directly** (no read-only compromise for the rowid reason). The
+three real constraints that remain: (1) the file list handed to the MFR must be **relative-path-sorted** so
+`file_list_idx` == engineered-wood's `OrderedActiveFiles` ordinal (`string.CompareOrdinal` on the relative
+`add.path`) — the one critical parity point for `DeleteByRowIdsAsync` decode; (2) DV: `file_row_number` is the
+absolute (pre-DeleteFilter) physical position, matching engineered-wood's absolute-position DV decode; (3)
+schema evolution — missing columns are NULL-backfilled in the MFR via `constant_map`/`default_expression`
+(duckdb-delta `delta_multi_file_reader.cpp:96-101,157-159`), so evolved/time-travel tables need that wiring,
+else fall back to the C# reader.
+
+### Snapshot consistency across multiple Delta tables (a join) — capture a per-transaction instant
+
+Each table scan resolves its snapshot **independently** at `CreateFileList`/`ScanTable` time (true for BOTH the
+C# reader today and the native path — a pre-existing property, not new). A join over A and B where a writer
+commits to B between the two ABI calls reads B newer than A; a re-scan of one table can also see a different
+version. Fix (matches Delta snapshot-isolation semantics): **at transaction start, capture one UTC instant** in
+our per-DuckDB-transaction state (`AmbientTransaction`/`TxnState`, keyed on `global_transaction_id`, ABI v35),
+and pass it as an **implicit `AT (TIMESTAMP)`** into `catalog_list_scan_files(handle, schema, table, at)` for
+every scan lacking an explicit `AT`. engineered-wood resolves instant→version via the now-always-written
+`commitInfo.timestamp` (no `in_commit_timestamps` opt-in needed). **Explicit `AT` overrides** per table. Also
+**cache the resolved version per `(txn, catalog, schema, table)`** so re-scans are stable and timestamp→version
+resolves once. Autocommit ⇒ one instant per statement (a single join reads a consistent cut); explicit `BEGIN`
+⇒ one instant for the whole transaction (repeatable read). Caveat: timestamp→version is inherently fuzzy
+(writer/reader clock skew) → pinning the resolved version (not re-deriving from the timestamp each scan) is the
+robust form. Parallel ABI calls on one `DeltaCatalog` are fine — `DeltaTable.OpenAsync` per call is independent
+and the `[ThreadStatic]` opener/credential are set per call.
+
+### Dynamic filters + parallelism (inherited from parquet_scan — nothing to build, one tuning knob)
+
+Verified against `duckdb/src/include/duckdb/common/multi_file/multi_file_function.hpp`: `global_state.filters =
+input.filters.get()` (`:522`) is a **live pointer** to the scan's `TableFilterSet` incl. the hash-join-populated
+dynamic filters. At **each file open**, `TryOpenNextFile` → `InitializeReader(..., global_state.filters, ...)`
+(`:307-309`) consults the **current** filters for row-group pruning + whole-file skip (`SKIP_READING_FILE`).
+Plus a one-time file-list prune at init (`MultiFileFilterPushdown`→`DynamicFilterPushdown`, `:491`; dynamic
+filters usually not ready yet there). Concurrency = `TaskScheduler::NumberOfThreads()` (`:525`, look-ahead
+`:273`), optionally capped by the interface `MaxThreads` (`:553`) — so ≈ #threads files in flight. **Key
+consequence:** dynamic filters apply only to **not-yet-opened** files (an in-flight file scan is never
+re-pruned), so a **very high thread count opens many files before the join's dynamic filter materializes →
+they escape pruning**. Moderate parallelism lets the build side produce the filter early so later file opens
+are pruned — a real parallelism-vs-late-filter trade-off (self-bounded by the #threads look-ahead). The native
+fold **inherits all of this for free** from the cloned `parquet_scan` + our `ArrowNetDeltaMultiFileList` (static
++ dynamic, row-group + file-skip) — no extra work. The only lever is deckeling a Delta scan's parallelism via
+the interface `MaxThreads` if we ever want to prioritize dynamic-filter effectiveness over raw parallelism
+(feintuning, not required). Later 1d-file can also push the **static** filter into `catalog_list_scan_files` so
+engineered-wood drops whole files by Delta-log stats before DuckDB opens them (log-level file pruning on top of
+row-group pruning).
+
+### Cloud writes (S3 / MinIO) — works with S3 secrets, no opener conflict; three caveats
+
+The opener model is uniform, so **writing to MinIO/S3 works when an S3 secret is present, with no S3-specific
+opener conflict**: an `s3://` root has `_fabricCredential == null` → `TableFileSystems.Create` picks
+`DuckDbTableFileSystem` (host `fs_*` callbacks) → DuckDB's `OpenerFileSystem(context)` auto-pushes the opener's
+`FileOpener` → resolves the best-scoped S3 secret. The `[ThreadStatic]` opener is re-established on the
+background bulk consumer thread by `BulkSession` (same as local/OneLake); `AmbientOneLakeCredential` stays null
+so the OneLake SDK path is never taken. Caveats (NOT opener conflicts): (1) **httpfs must be present** — the
+test binaries statically link only `json`/`icu`/`parquet`, so `s3://` needs `duckdb_extension_load(httpfs)` for
+tests (the real loadable autoloads it); (2) **commit atomicity** — the Delta commit's put-if-absent guard rides
+`RenameAsync`→`TryOpenWriteExclusive` (`EXCLUSIVE_CREATE`); DuckDB's httpfs S3 write likely does not emit a
+conditional PUT (`If-None-Match`), so single-writer works but concurrent writers could clobber a version
+(lost commit; OCC-retry can't fire if the conflict isn't surfaced) — MinIO supports conditional PUT only if
+httpfs sends it, to verify; (3) **DROP/RENAME dir-ops** — `fs_remove_dir`→`RemoveDirectory` /
+`fs_move_dir`→`MoveFile` may be unimplemented on httpfs' S3 FS (as on Azure DFS, where we route to the SDK), so
+DROP/RENAME could fail on S3 while CREATE/INSERT/CTAS/COPY/SELECT/DELETE/UPDATE (file writes, no dir-ops) work.
+
 ## Recommendation — phased (build on demand)
 
 1. **Phase A — read-only (the big win).** Generic `ArrowNetMultiFileList/Reader` in `arrownet-core` +

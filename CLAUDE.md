@@ -1166,7 +1166,21 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `read_parquet` BY NAME (holds for engineered-wood/Spark plain tables; decimals align at `Decimal128`). **Remaining
   (heavier follow-up) = the full MultiFileReader-in-catalog fold** (native DeleteFilter for DV, dynamic join/TopN
   filter pushdown into row-groups, native rowid via `file_row_number`+path-sorted ordinal for DML, native time
-  travel). v56 = **`onelake://` WRITE forward callbacks** — appended 3 vtable entries
+  travel). **Direct-fold design decisions captured (docs/multifile-delta.md §"Native-read fold"):** (a) **rowid is
+  a VIRTUAL COLUMN** (duckdb-delta sets `function.get_virtual_columns` declaring `file_row_number`/`rowid`/
+  `delta_file_number`) requested at scan-init, NOT a bind-time decision → native DML is achievable directly; our
+  transient rowid `(fileOrdinal<<40)|file_row_number` = `file_list_idx<<40 | file_row_number` in `FinalizeChunk`,
+  needing a **relative-path-sorted** file list to match engineered-wood's `OrderedActiveFiles` ordinal; (b)
+  **snapshot consistency across a multi-table join** — capture one UTC instant per DuckDB transaction
+  (`AmbientTransaction`/`TxnState`, v35) and pass it as an implicit `AT (TIMESTAMP)` into `catalog_list_scan_files`
+  (explicit `AT` overrides; resolved via always-on `commitInfo.timestamp`; cache the resolved version per
+  (txn,table)); (c) **dynamic filters + parallelism** inherited from `parquet_scan` for free — `global_state.filters`
+  is a live pointer applied per-file-at-open, so dynamic filters only prune NOT-YET-opened files and a very high
+  thread count opens files before the join filter materializes (parallelism-vs-late-filter trade-off, self-bounded by
+  the #threads look-ahead); (d) **S3/MinIO write** works with an S3 secret + NO opener conflict (`_fabricCredential`
+  null → host-FS + opener secret), caveats: httpfs must be linked for tests, EXCLUSIVE_CREATE (commit put-if-absent)
+  may not be enforced on S3 httpfs (concurrent-writer safety), DROP/RENAME dir-ops may be unimplemented on the S3 FS.
+  v56 = **`onelake://` WRITE forward callbacks** — appended 3 vtable entries
   `onelake_open_write`/`onelake_write`/`onelake_close_write`; the C++ `ArrowNetOneLakeFileSystem` `OpenFile(write)`/
   `Write` (sequential append → managed `OneLakeForwardFs` create/append/flush) make **`COPY … TO 'onelake://…'` +
   any DuckDB writer** write to OneLake (Phase-3 step-3 slice 2; live-validated: COPY a parquet, read back 5/5).
