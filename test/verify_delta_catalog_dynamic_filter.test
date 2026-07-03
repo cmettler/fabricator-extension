@@ -1,0 +1,80 @@
+# name: test/verify_delta_catalog_dynamic_filter.test
+# description: Delta folder-catalog `native_read true` — runtime filter pushdown into the native read_parquet
+#              scan (docs/multifile-delta.md §"Batch 2 slice 2"). filter_pushdown=true (via the catalog's
+#              exact_filter_pushdown capability) makes DuckDB (a) deliver hash-join DYNAMIC filters to the
+#              scan and (b) stop re-applying the pushed static filters — both applied EXACTLY as a
+#              read_parquet WHERE (target is DuckDB, so 1:1). This asserts correctness; the actual pushed
+#              WHERE is proven via duckdb_logs (the C# native reader logs each per-file read_parquet SQL).
+#              Set ARROWNET_DELTA_WRITE_DIR (writable). Local FS.
+# group: [mssql_net]
+
+require mssql_net
+
+require parquet
+
+require-env ARROWNET_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catdynfilter' AS lake (TYPE arrownet, PROVIDER 'delta', native_read true);
+
+statement ok
+CREATE TABLE lake.main.big AS SELECT i AS id, 'v' || i AS name FROM range(1, 1001) AS r(i);
+
+statement ok
+CREATE TABLE lake.main.dim AS SELECT * FROM (VALUES (3), (7), (42)) AS d(id);
+
+# ---- static filter: under filter_pushdown=true the WHERE is erased from the plan and applied EXACTLY by the
+#      scan. Includes a string <> (now pushed exactly since the read_parquet target is DuckDB). ----
+query IT
+SELECT id, name FROM lake.main.big WHERE id > 997 AND name <> 'v999' ORDER BY id;
+----
+998	v998
+1000	v1000
+
+# equality + IN + range, exact
+query I
+SELECT id FROM lake.main.big WHERE id IN (10, 20, 30) AND id >= 20 ORDER BY id;
+----
+20
+30
+
+# ---- dynamic (hash-join) filter: DuckDB pushes the build-side key set/range into big's native scan ----
+query IT
+SELECT b.id, b.name FROM lake.main.big b JOIN lake.main.dim d ON b.id = d.id ORDER BY b.id;
+----
+3	v3
+7	v7
+42	v42
+
+# join result is correct under aggregation too
+query I
+SELECT count(*) FROM lake.main.big b JOIN lake.main.dim d ON b.id = d.id;
+----
+3
+
+# ---- prove the filters actually reached read_parquet (not just re-applied above the scan) ----
+statement ok
+CALL enable_logging(storage='memory');
+
+# re-run the join so its per-file read_parquet SQL is logged
+query I
+SELECT count(*) FROM lake.main.big b JOIN lake.main.dim d ON b.id = d.id;
+----
+3
+
+# the dynamic join bound (an IN-list and/or a min/max range on id) was spliced into the read_parquet WHERE
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type = 'ArrowNet.Delta.Native' AND message LIKE '%read_parquet%WHERE%"id"%';
+----
+true
+
+# and NO leaked "optional:" prefix (OptionalFilter children are unwrapped)
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'ArrowNet.Delta.Native' AND message LIKE '%optional:%';
+----
+0
+
+statement ok
+DETACH lake;

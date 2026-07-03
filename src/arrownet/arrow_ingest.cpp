@@ -11,6 +11,10 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/planner/table_filter.hpp"
+#include "duckdb/planner/filter/optional_filter.hpp"
+#include "duckdb/planner/filter/dynamic_filter.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 
 #include <algorithm>
@@ -199,7 +203,131 @@ static void JsonEscape(const string &s, string &out) {
 // Builds the projection spec `{"columns":["a","b"]}` for a catalog scan: the set of
 // provider columns to fetch = requested real columns + (rowid source columns, if a
 // rowid was requested). Empty result => fetch the first column (COUNT(*)-style).
-static string BuildScanSpec(const ArrowStreamBindData &bind_data, const vector<column_t> &output_column_ids) {
+// A DuckDB double-quoted identifier ("col", with any embedded " doubled) for the native SQL WHERE.
+static void SqlIdentIngest(const string &s, string &out) {
+	out += '"';
+	for (char c : s) {
+		if (c == '"') {
+			out += "\"\"";
+		} else {
+			out += c;
+		}
+	}
+	out += '"';
+}
+
+// Render one live TableFilter to a DuckDB SQL predicate on `qcol` (an already-quoted identifier). Returns
+// true + appends to `out` iff rendered. The native target IS DuckDB (read_parquet), so TableFilter::ToString
+// yields EXACT SQL for the mandatory kinds (constant/IN/null/conjunction/expression). Only OPTIONAL / DYNAMIC
+// / BLOOM are handled specially — and all three are "not required for correctness" (DuckDB never relies on
+// the scan to apply them: the join/topn re-applies), so returning false for them is always safe.
+static bool RenderTableFilter(const TableFilter &f, const string &qcol, string &out) {
+	switch (f.filter_type) {
+	case TableFilterType::OPTIONAL_FILTER: {
+		auto &opt = f.Cast<OptionalFilter>();
+		if (!opt.child_filter) {
+			return false;
+		}
+		return RenderTableFilter(*opt.child_filter, qcol, out); // optional: fine to skip if child unrenderable
+	}
+	case TableFilterType::DYNAMIC_FILTER: {
+		// A runtime join/topn bound: DynamicFilter::ToString is a debug string, so reach the resolved inner
+		// ConstantFilter under the shared lock. Not yet materialized => skip (best-effort pruning).
+		auto &dyn = f.Cast<DynamicFilter>();
+		if (!dyn.filter_data) {
+			return false;
+		}
+		lock_guard<mutex> lock(dyn.filter_data->lock);
+		if (!dyn.filter_data->initialized || !dyn.filter_data->filter) {
+			return false;
+		}
+		out += dyn.filter_data->filter->ToString(qcol);
+		return true;
+	}
+	case TableFilterType::BLOOM_FILTER:
+		return false; // probabilistic; not exact SQL — always OptionalFilter-wrapped, so skip-safe
+	case TableFilterType::CONJUNCTION_AND:
+	case TableFilterType::CONJUNCTION_OR: {
+		// Recurse per child (do NOT use ToString: a child may be an OptionalFilter/DynamicFilter whose
+		// ToString is not plain SQL — "optional: …" — and would leak into the predicate).
+		bool is_and = f.filter_type == TableFilterType::CONJUNCTION_AND;
+		// ConjunctionFilter (the base holding child_filters) has no ::TYPE, so Cast<> the concrete subtype.
+		const ConjunctionFilter &conj =
+		    is_and ? static_cast<const ConjunctionFilter &>(f.Cast<ConjunctionAndFilter>())
+		           : static_cast<const ConjunctionFilter &>(f.Cast<ConjunctionOrFilter>());
+		vector<string> parts;
+		for (auto &child : conj.child_filters) {
+			string cs;
+			if (RenderTableFilter(*child, qcol, cs) && !cs.empty()) {
+				parts.push_back(std::move(cs));
+			} else if (!is_and) {
+				return false; // OR: dropping a branch narrows the result (a subset) — unsafe, skip the whole OR
+			}
+			// AND: dropping a child only widens (superset). Its children here are optional (join) or renderable
+			// constants; a mandatory constant always renders, so nothing correctness-bearing is dropped.
+		}
+		if (parts.empty()) {
+			return false;
+		}
+		out += '(';
+		for (idx_t i = 0; i < parts.size(); i++) {
+			if (i) {
+				out += is_and ? " AND " : " OR ";
+			}
+			out += parts[i];
+		}
+		out += ')';
+		return true;
+	}
+	default:
+		// Constant / IN / IS [NOT] NULL / expression / struct: DuckDB's own render == exact SQL for the
+		// read_parquet (DuckDB) target. These are the MANDATORY (erased-from-plan) filters we must apply.
+		out += f.ToString(qcol);
+		return true;
+	}
+}
+
+// Render the scan's LIVE TableFilterSet (static WHERE constants that DuckDB erased from the plan under
+// filter_pushdown=true, PLUS any runtime dynamic/join filters) into one DuckDB SQL predicate for the native
+// (read_parquet) path. Column keys map through the scanned column list to provider names (exactly as
+// PhysicalTableScan::GetFilterInfo does). Empty unless the scan advertised filter_pushdown (the exact-filter
+// native catalog) and DuckDB delivered filters. See docs/multifile-delta.md §"Batch 2 slice 2".
+static string RenderLiveFilters(const ArrowStreamBindData &bind_data, TableFunctionInitInput &input) {
+	if (!input.filters) {
+		return string();
+	}
+	vector<string> conds;
+	for (auto &entry : input.filters->filters) {
+		idx_t key = entry.first;
+		if (key >= input.column_ids.size()) {
+			continue;
+		}
+		auto col_id = input.column_ids[key];
+		if (col_id == COLUMN_IDENTIFIER_ROW_ID || (idx_t)col_id >= bind_data.names.size()) {
+			continue; // rowid / virtual / out-of-range: no filter pushed on those
+		}
+		string qcol;
+		SqlIdentIngest(bind_data.names[(idx_t)col_id], qcol);
+		string rendered;
+		if (RenderTableFilter(*entry.second, qcol, rendered) && !rendered.empty()) {
+			conds.push_back(std::move(rendered));
+		}
+	}
+	if (conds.empty()) {
+		return string();
+	}
+	string sql;
+	for (idx_t i = 0; i < conds.size(); i++) {
+		if (i) {
+			sql += " AND ";
+		}
+		sql += conds[i];
+	}
+	return sql;
+}
+
+static string BuildScanSpec(const ArrowStreamBindData &bind_data, const vector<column_t> &output_column_ids,
+                            const string &live_filter_sql) {
 	vector<string> cols;
 	auto add = [&](idx_t table_idx) {
 		if (table_idx >= bind_data.names.size()) {
@@ -248,9 +376,20 @@ static string BuildScanSpec(const ArrowStreamBindData &bind_data, const vector<c
 	}
 	// A 1:1 SQL rendering of the same predicates (literals inlined) — consumed only by a provider whose
 	// scan target is DuckDB itself (native Delta read_parquet); foreign-engine providers ignore it.
+	// `live_filter_sql` (slice 2) renders the runtime TableFilterSet (DuckDB-erased static filters + dynamic
+	// join filters, filter_pushdown=true only) — it holds the MANDATORY filters, so it must be applied; the
+	// bind-time `native_filter_sql` (slice 1, complex filters DuckDB still re-applies) is additional
+	// superset-safe pruning. Combine both with AND (either may be empty).
+	string native_filter = live_filter_sql;
 	if (!bind_data.native_filter_sql.empty()) {
+		if (!native_filter.empty()) {
+			native_filter += " AND ";
+		}
+		native_filter += bind_data.native_filter_sql;
+	}
+	if (!native_filter.empty()) {
 		json += ",\"native_filter\":";
-		JsonEscape(bind_data.native_filter_sql, json);
+		JsonEscape(native_filter, json);
 	}
 	// TOP (n) is only safe with no pushed filter: a best-effort filter returns a
 	// superset, so limiting before exact (DuckDB) filtering could drop valid rows.
@@ -350,7 +489,11 @@ unique_ptr<GlobalTableFunctionState> ArrowStreamInitGlobal(ClientContext &contex
 	ArrowScanRequest request;
 	unique_ptr<arrownet::ArrowProducer> value_producer; // must outlive the factory() call
 	if (bind_data.push_projection) {
-		request.spec_json = BuildScanSpec(bind_data, gstate->output_column_ids);
+		// Render the live runtime filters (static-erased + dynamic/join) for an exact-filter native scan
+		// (filter_pushdown=true); empty for SQL/DAX/non-native (input.filters null). This runs per execution,
+		// so a hash-join dynamic filter materialized before the probe scan is captured here.
+		string live_filter_sql = RenderLiveFilters(bind_data, input);
+		request.spec_json = BuildScanSpec(bind_data, gstate->output_column_ids, live_filter_sql);
 		if (!bind_data.filter_constants.empty()) {
 			value_producer = BuildFilterValues(context, bind_data.filter_constants);
 			request.filter_values = value_producer->Stream();

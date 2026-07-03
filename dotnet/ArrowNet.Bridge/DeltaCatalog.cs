@@ -380,6 +380,14 @@ public sealed class DeltaCatalog : IBackendCatalog
         MetadataKind.Snapshots => SnapshotsStream(schema, table),
         // Change Data Feed (arrownet_delta_changes): arg1 = 'schema.table' ref, arg2 = "from:to" (to empty => latest).
         MetadataKind.Changes => ChangesStream(schema, table),
+        // Capability profile (property, value). `exact_filter_pushdown` = whether the host may set
+        // filter_pushdown=true on this catalog's scan: TRUE only under native_read, where every scan routes
+        // through read_parquet on the host DuckDB and applies the pushed WHERE EXACTLY (1:1, same engine).
+        // With native_read off the engineered-wood reader only PRUNES (superset), so DuckDB must keep
+        // re-applying — filter_pushdown stays false. See docs/multifile-delta.md §"Batch 2 slice 2".
+        MetadataKind.ServerInfo => TwoColumn(
+            "property", new[] { "exact_filter_pushdown" },
+            "value", new[] { _nativeRead ? "true" : "false" }),
         // No row-count/NDV stats surfaced, no functions.
         _ => EmptyStringTable("name"),
     };
@@ -1027,6 +1035,23 @@ public sealed class DeltaCatalog : IBackendCatalog
         var b = new StringArray.Builder();
         foreach (var v in values) { b.Append(v); }
         return new InMemoryArrayStream(schema, new[] { new RecordBatch(schema, new IArrowArray[] { b.Build() }, values.Count) });
+    }
+
+    private static IArrowArrayStream TwoColumn(string n0, IReadOnlyList<string> c0, string n1, IReadOnlyList<string> c1)
+    {
+        var schema = new Schema(new[]
+        {
+            new Field(n0, StringType.Default, nullable: true),
+            new Field(n1, StringType.Default, nullable: true),
+        }, null);
+        static IArrowArray Build(IReadOnlyList<string> vals)
+        {
+            var b = new StringArray.Builder();
+            foreach (var v in vals) { b.Append(v); }
+            return b.Build();
+        }
+        return new InMemoryArrayStream(schema,
+            new[] { new RecordBatch(schema, new[] { Build(c0), Build(c1) }, c0.Count) });
     }
 
     private static IArrowArrayStream ThreeColumn(string n0, IReadOnlyList<string> c0, string n1,

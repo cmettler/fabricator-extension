@@ -572,9 +572,16 @@ TableFunction ArrowNetTableEntry::BuildScanFunction(ClientContext &context, uniq
 	function.projection_pushdown = true;
 	// Best-effort filter pushdown: the callback serializes superset-safe predicates
 	// and leaves them in place, so DuckDB still applies every filter (correctness).
-	// filter_pushdown stays false (its TableFilterSet path removes filters from the
-	// plan, which would be unsafe for partial/approximate pushdown).
 	function.pushdown_complex_filter = ArrowNetComplexFilterPushdown;
+	// filter_pushdown is normally FALSE — DuckDB's TableFilterSet path REMOVES the pushed filters from the
+	// plan (trusts the scan to apply them), which is unsafe for our best-effort/superset providers. Enable it
+	// ONLY when the provider applies pushed filters EXACTLY (the Delta native_read catalog: every scan reads
+	// via read_parquet on the host DuckDB, 1:1). That also makes DuckDB deliver runtime dynamic (join) filters
+	// to the scan (arrow_ingest renders the live TableFilterSet into the native WHERE). SQL Server / DAX /
+	// non-native Delta keep it false (unchanged). See docs/multifile-delta.md §"Batch 2 slice 2".
+	if (ParentCatalog().Cast<ArrowNetCatalog>().ExactFilterPushdown()) {
+		function.filter_pushdown = true;
+	}
 	function.cardinality = ArrowNetScanCardinality;
 	function.statistics = ArrowNetScanStatistics;
 	function.get_bind_info = arrownet::ArrowStreamGetBindInfo;

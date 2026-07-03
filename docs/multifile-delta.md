@@ -477,20 +477,32 @@ done as a standalone function) only if CPU-bound-local multi-lane Delta scans be
      `verify_delta_catalog_native_read` (66) + delete (28) / update (63) / partition (54) green; live smoke shows
      `read_parquet(…) WHERE "id" > 3` reaching the engine. This is the mechanism **slice 2 reuses**: it renders the
      execute-time `TableFilterSet` into the same `native_filter` field via `TableFilter::ToString`.
-   - **(2b-slice-2) live dynamic filters — the hard, shared-core part (TODO).** The native scan must (i) set
-     `filter_pushdown = true` on the `arrownet_scan` variant so DuckDB delivers `input.filters` (incl. the
-     hash-join `DynamicTableFilter`, wrapped in `OptionalFilter`) at execute time; the **mandatory** `ConstantFilter`s
-     it then removes from the plan must be applied faithfully (1:1 via `TableFilter::ToString` on DuckDB — trivially
-     correct), while **`OptionalFilter`/`DynamicFilter` are pruning-only** (their `FilterSelection` is a no-op → the
-     join re-applies), so pushing them is pure best-effort and skipping any we can't render (or that isn't yet
-     `initialized`) is always correct — this **collapses most of the earlier "must be complete" risk**; (ii)
-     `arrow_ingest` exposes the live filters to the C# scan factory via a **host callback that re-renders the current
-     `TableFilterSet`** (unwrap `OptionalFilter` → child; resolve `DynamicFilter` via `filter_data` under its lock,
-     rendering the inner `ConstantFilter` when `initialized`, else skip — note `DynamicFilter::ToString` itself is a
-     debug string, NOT the bound) into `spec_json.native_filter` on demand; (iii) `DeltaNativeReader` calls it before
-     each file open → `read_parquet … WHERE`. This touches the **provider-shared `arrow_ingest` scan path** (SQL/DAX
-     also use it) → validate the full suite. Higher risk; do it deliberately. Correctness is unaffected if deferred
-     (DuckDB re-applies every filter above the scan — only join-driven file/row-group *pruning* is missed).
+   - **(2b-slice-2) live dynamic/join filters — DONE (C++/C#, NO ABI).** Delivered without a per-file host
+     callback: a hash join builds its side **before** the probe scan inits, so the dynamic bound is already
+     materialized when `ArrowStreamInitGlobal` runs → rendering `input.filters` **once at scan-init** captures it.
+     Pieces: (i) a **C#-declared catalog capability** — `DeltaCatalog` returns `exact_filter_pushdown=true` (only
+     under `native_read`) on the `ServerInfo` metadata; C++ `FetchExactFilterPushdown` caches it on
+     `ArrowNetCatalog`, and `BuildScanFunction` sets `function.filter_pushdown = ExactFilterPushdown()`. This gates
+     the flip to the **native_read Delta catalog only** — SQL Server / DAX / non-native Delta keep
+     `filter_pushdown=false` (their `ServerInfo` lacks the property → false → unchanged; verified: SQL Server
+     filter/projection/limit/orderby/catalog_filter/table_functions suites all green). Safe because `native_read`
+     routes **every** scan through `read_parquet` (exact 1:1), so DuckDB erasing the pushed static filters is fine;
+     (ii) `arrow_ingest::RenderLiveFilters` walks the live `TableFilterSet` at init (keys → provider names exactly
+     as `PhysicalTableScan::GetFilterInfo`: `column_ids[key]` → `names[col]`) and `RenderTableFilter` emits DuckDB
+     SQL — **unwrap `OptionalFilter` → child; resolve `DynamicFilter` under `filter_data->lock` (render the inner
+     `ConstantFilter` if `initialized`, else skip — `DynamicFilter::ToString` is a debug string, not the bound);
+     skip bare `BLOOM` (always Optional-wrapped → skip-safe); recurse `CONJUNCTION_AND/OR` per child (NOT
+     `ToString`, which would leak the `optional:` prefix from Optional children); everything else →
+     `TableFilter::ToString` (exact SQL on the DuckDB target)** — combined with the slice-1 bind-time
+     `native_filter` into `spec_json.native_filter`. **`OptionalFilter`/`DynamicFilter`/`BLOOM` are pruning-only**
+     (`FilterSelection` is a no-op → the join re-applies), so skipping any we can't render is always correct; the
+     **mandatory** erased static filters render 1:1 → correct. **Bonus:** string `<>`/ordering now pushes exactly
+     on the native path (the live render is collation-free on the DuckDB target, unlike the superset-safe bind-time
+     subset). Verified: `verify_delta_catalog_dynamic_filter` (21 — static exact WHERE incl. string `<>`, IN+range,
+     hash-join dynamic filter into `read_parquet(...) WHERE ("id" IN (…) AND "id">=… AND "id"<=…)`, no `optional:`
+     leak) + native_read (66) / delete (28) / update (63) / partition (54) / dv (48) / time_travel (48) green.
+     **Remaining nuance:** a dynamic filter refined *mid-scan* (e.g. TopN) is captured only as of scan-init
+     (best-effort — a later per-file re-render would need a host callback; not needed for hash joins).
 3. **Slice 3 (later, additive):** downstream **multi-lane parallelism** — partition the file list across N
    per-thread Arrow streams (`MaxThreads = N`); no change to rowid/DV/filter.
 4. Snapshot consistency (the per-transaction UTC instant → implicit `AT`) applies to this reader exactly as to

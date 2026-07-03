@@ -99,6 +99,23 @@ bool FetchBinaryCollation(ArrowNetHandle handle) {
 	return false;
 }
 
+bool FetchExactFilterPushdown(ArrowNetHandle handle) {
+	// Read the provider profile and look for the `exact_filter_pushdown` flag: TRUE => the provider applies
+	// pushed table filters exactly (currently the Delta native_read catalog, which reads via read_parquet on
+	// the host DuckDB), so the host may set filter_pushdown=true. Best-effort: any failure / missing row =>
+	// false (filter_pushdown stays off — the safe superset-and-DuckDB-re-applies default).
+	ArrowArrayStream stream;
+	std::memset(&stream, 0, sizeof(stream));
+	arrownet::GetMetadata(handle, ARROWNET_META_SERVER_INFO, "", "", stream);
+	auto rows = ReadStringTable(stream, 2); // property, value
+	for (idx_t i = 0; i < rows[0].size(); i++) {
+		if (rows[0][i] == "exact_filter_pushdown") {
+			return rows[1][i] == "true";
+		}
+	}
+	return false;
+}
+
 vector<ArrowNetTableInfo> DiscoverTables(ArrowNetHandle handle) {
 	ArrowArrayStream stream;
 	std::memset(&stream, 0, sizeof(stream));

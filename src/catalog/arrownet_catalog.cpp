@@ -59,6 +59,15 @@ void ArrowNetCatalog::LoadCatalog(ClientContext &context) {
 		string_order_pushable_ = false;
 	}
 
+	// Whether the provider applies pushed filters exactly => the scan may advertise filter_pushdown=true (so
+	// DuckDB delivers runtime dynamic/join filters). True only for the Delta native_read catalog; default off
+	// keeps the safe superset model for SQL Server / DAX / non-native Delta. See docs/multifile-delta.md §"Batch 2".
+	try {
+		exact_filter_pushdown_ = FetchExactFilterPushdown(handle_);
+	} catch (...) {
+		exact_filter_pushdown_ = false;
+	}
+
 	auto ensure_schema = [&](const string &schema_name) -> ArrowNetSchemaEntry & {
 		auto it = schemas_.find(schema_name);
 		if (it != schemas_.end()) {

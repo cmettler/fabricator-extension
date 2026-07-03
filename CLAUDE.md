@@ -1210,8 +1210,21 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `ARROWNET_LOG_FILE` → file sink; factory pluggable for a future DuckDB-forwarding provider) traces the resolved
   snapshot version, file list (active/scanned/pruned), and each per-file `read_parquet` SQL. Verified:
   `test/verify_delta_catalog_native_read.test` (66); Delta write/delete/update/decimal/time_travel/changes
-  unregressed. **Remaining: slice 2** (live-filter host-callback → dynamic/join filter pushdown per file, ABI) +
-  **slice 3** (multi-lane, deferred by user).
+  unregressed. **Slice 2 DONE (dynamic/join filter pushdown, C++/C#, NO ABI — the predicted per-file host
+  callback was unnecessary):** a hash join builds before the probe scan inits, so the runtime filter set is
+  rendered ONCE at `ArrowStreamInitGlobal`. A C#-declared catalog capability (`DeltaCatalog` →
+  `exact_filter_pushdown=true` on `ServerInfo`, ONLY under `native_read`) → C++ `FetchExactFilterPushdown` →
+  `BuildScanFunction` sets `function.filter_pushdown=true` for the native catalog ONLY (SQL Server / DAX /
+  non-native Delta stay false → unchanged, verified). `arrow_ingest::RenderLiveFilters`/`RenderTableFilter` walk
+  the live `TableFilterSet` (keys→names as `PhysicalTableScan::GetFilterInfo`), emitting exact DuckDB SQL: unwrap
+  `OptionalFilter`, resolve `DynamicFilter` under its lock (skip if not `initialized`), skip bare `BLOOM` (all
+  three are pruning-only — the join re-applies — so skip-safe), recurse `CONJUNCTION` per child (not `ToString`,
+  which leaks `optional:`), else `TableFilter::ToString`; merged into `spec_json.native_filter` (slice-1 channel).
+  Mandatory erased static filters render 1:1 (read_parquet target IS DuckDB) → correct; bonus: string `<>`/ordering
+  now pushes exactly on the native path. `test/verify_delta_catalog_dynamic_filter.test` (21) + native_read (66) /
+  delete (28) / update (63) / partition (54) / dv (48) / time_travel (48) + SQL Server pushdown suites green.
+  Nuance: a mid-scan-refined dynamic filter (TopN) is captured only as of scan-init (best-effort). **Remaining:
+  slice 3** (multi-lane, deferred by user).
   v56 = **`onelake://` WRITE forward callbacks** — appended 3 vtable entries
   `onelake_open_write`/`onelake_write`/`onelake_close_write`; the C++ `ArrowNetOneLakeFileSystem` `OpenFile(write)`/
   `Write` (sequential append → managed `OneLakeForwardFs` create/append/flush) make **`COPY … TO 'onelake://…'` +

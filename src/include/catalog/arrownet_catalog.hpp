@@ -46,6 +46,17 @@ public:
 		return string_order_pushable_;
 	}
 
+	//! Whether the host may set `filter_pushdown = true` on this catalog's table scan — i.e. whether the
+	//! provider applies pushed table filters EXACTLY (not merely as a superset prune). True only for the
+	//! Delta `native_read` catalog, where every scan routes through DuckDB's own `read_parquet` and the
+	//! pushed WHERE is 1:1 (same engine). Enables receiving DuckDB's runtime dynamic (join) filters, whose
+	//! delivery is gated on `filter_pushdown`. Detected once at LoadCatalog from the provider profile;
+	//! default false keeps the safe superset-and-DuckDB-re-applies model for SQL Server / DAX / non-native
+	//! Delta. See docs/multifile-delta.md §"Batch 2 slice 2".
+	bool ExactFilterPushdown() const {
+		return exact_filter_pushdown_;
+	}
+
 	//! The catalog-type string identifying an attached catalog as ours (the provider
 	//! identity — becomes generic in the multi-provider rename). Centralized so the
 	//! "is this our catalog?" checks don't repeat the literal.
@@ -96,6 +107,9 @@ private:
 	string db_path_;
 	//! Whether the database collation is binary (detected at LoadCatalog) => string ORDER BY is pushable.
 	bool string_order_pushable_ = false;
+	//! Whether the provider applies pushed filters exactly (detected at LoadCatalog) => filter_pushdown=true
+	//! is safe on the scan (currently: Delta native_read only). See ExactFilterPushdown().
+	bool exact_filter_pushdown_ = false;
 	mutex schema_lock_;
 	case_insensitive_map_t<unique_ptr<ArrowNetSchemaEntry>> schemas_;
 };

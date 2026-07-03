@@ -33,6 +33,12 @@ vector<string> DiscoverSchemas(ArrowNetHandle handle);
 //! so string-keyed ORDER BY+LIMIT can be pushed down safely. Best-effort: false on any failure.
 bool FetchBinaryCollation(ArrowNetHandle handle);
 
+//! Whether the provider applies pushed filters EXACTLY (read from ARROWNET_META_SERVER_INFO's
+//! `exact_filter_pushdown` property). True => the host may set `filter_pushdown = true` on the scan (so
+//! DuckDB delivers runtime dynamic/join filters and stops re-applying the pushed ones). Currently true only
+//! for the Delta native_read catalog. Best-effort: false on any failure (the safe default).
+bool FetchExactFilterPushdown(ArrowNetHandle handle);
+
 //! Discovers user tables + views across all schemas.
 vector<ArrowNetTableInfo> DiscoverTables(ArrowNetHandle handle);
 
