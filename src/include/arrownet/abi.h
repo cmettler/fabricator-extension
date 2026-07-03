@@ -740,13 +740,20 @@ typedef struct ArrowNetHostServices {
 	// Used to RENAME a Delta catalog table (move its whole `<table>/` folder; OneLake renames via the DFS SDK
 	// directly instead, since Azure MoveFile is unimplemented).
 	int32_t (*fs_move_dir)(ArrowNetHandle opener, const char *src, const char *dest, char **err);
+
+	// Forward a managed .NET-logging event into DuckDB's internal logging (duckdb_logs), so the ILogger trace
+	// (queries, filters, files) is visible in the engine's own log alongside the optional file sink. `level` is
+	// the stable code 0 Trace / 1 Debug / 2 Info / 3 Warning / 4 Error / 5 Critical (ArrowNetLog.LevelCode);
+	// `log_type` = the logger category, `message` = the formatted line. Best-effort (no error out); a no-op if
+	// the host has no database/logger. Additive host-service entry (ABI v58).
+	void (*host_log)(int32_t level, const char *log_type, const char *message);
 } ArrowNetHostServices;
 
 // Max serialized size of a spillable aggregate's per-group state (the inline, pointer-free
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 57
+#define ARROWNET_ABI_VERSION 58
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

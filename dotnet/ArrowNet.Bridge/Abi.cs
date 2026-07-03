@@ -252,6 +252,9 @@ public unsafe struct ArrowNetHostServices
     // int32 fs_move_dir(void* opener, const char* src, const char* dest, char** err) — directory rename/move
     // (FileSystem::MoveFile; atomic on local, unimplemented on object stores).
     public delegate* unmanaged[Cdecl]<nint, byte*, byte*, byte**, int> FsMoveDir;
+    // void host_log(int32 level, const char* log_type, const char* message) — forward an ILogger event into
+    // DuckDB's internal logging (duckdb_logs). Best-effort; no error out. Additive (ABI v58).
+    public delegate* unmanaged[Cdecl]<int, byte*, byte*, void> HostLog;
 }
 
 /// <summary>Mirrors <c>ArrowNetHostInputs</c> in abi.h — named Arrow streams handed to host_query as data-in

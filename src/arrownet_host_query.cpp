@@ -15,6 +15,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
@@ -212,9 +213,43 @@ static unique_ptr<TableRef> NamedSourceReplacement(ClientContext &, ReplacementS
 	return std::move(table_function);
 }
 
+// host_log — forward a managed ILogger event into DuckDB's internal logging (duckdb_logs). Best-effort: a
+// no-op until the DB is known, and any logging failure is swallowed (logging must never fault the extension).
+static void HostLogService(int32_t level, const char *log_type, const char *message) {
+	if (!g_host_db) {
+		return;
+	}
+	LogLevel lvl;
+	switch (level) {
+	case 0:
+		lvl = LogLevel::LOG_TRACE;
+		break;
+	case 1:
+		lvl = LogLevel::LOG_DEBUG;
+		break;
+	case 3:
+		lvl = LogLevel::LOG_WARNING;
+		break;
+	case 4:
+		lvl = LogLevel::LOG_ERROR;
+		break;
+	case 5:
+		lvl = LogLevel::LOG_FATAL;
+		break;
+	default:
+		lvl = LogLevel::LOG_INFO;
+		break;
+	}
+	try {
+		Logger::Get(*g_host_db).WriteLog(log_type ? log_type : "ArrowNet", lvl, message ? message : "");
+	} catch (...) {
+	}
+}
+
 void RegisterHostQuery(ExtensionLoader &loader) {
 	g_host_db = &loader.GetDatabaseInstance();
 	arrownet::SetHostQueryService(HostQueryService); // make host_query callable from C# (added to the host block)
+	arrownet::SetHostLog(HostLogService);            // forward ILogger events into DuckDB's internal logging
 	DBConfig::GetConfig(loader.GetDatabaseInstance()).replacement_scans.emplace_back(NamedSourceReplacement);
 	TableFunction fn("arrownet_host_query", {LogicalType::VARCHAR}, arrownet::ArrowStreamScan, HostQueryBind,
 	                 arrownet::ArrowStreamInitGlobal, arrownet::ArrowStreamInitLocal);

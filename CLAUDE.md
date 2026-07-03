@@ -1127,7 +1127,8 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v57** (v57 = **`delta_list_files`** — one appended vtable entry for the native-read
+- **Current version: ABI v58** (v58 = additive `host_log` on `ArrowNetHostServices` — forward managed ILogger events into DuckDB internal logging; wired + lockstep-verified, `duckdb_logs` surfacing pending an enable-config detail; file sink is the working trace).
+- **Prior: v57** (v57 = **`delta_list_files`** — one appended vtable entry for the native-read
   MultiFileReader path (docs/multifile-delta.md Phase A slice 1a): `arrownet_delta_mfr_scan(path)` clones
   `parquet_scan` + swaps in `ArrowNetDeltaMultiFileReader` (`src/arrownet/arrownet_delta_mfr.cpp`), whose
   `CreateFileList` calls `delta_list_files(path, push_json)` → C# `DeltaReader.ListScanFilesJson` (engineered-wood's

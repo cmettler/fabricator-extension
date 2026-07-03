@@ -446,14 +446,18 @@ done as a standalone function) only if CPU-bound-local multi-lane Delta scans be
 
    **Batch 2 — exact remaining ABI work (for a fresh, well-budgeted session; NOT started — an unfinished ABI
    bump breaks the extension):**
-   - **(2a) DuckDB log forwarding — the C# seam is DONE + committed** (`ArrowNetLog.EnableHostForwarding` +
-     `HostForwardingLoggerProvider`, inert until wired). Remaining = *additive* ABI: append a `host_log(level,
-     category, message)` fn-ptr to `ArrowNetHostServices` (host→managed struct, like `fs_*`), bump
-     `ARROWNET_ABI_VERSION`; C++ implements it by calling DuckDB's logger (investigate the 1.5.4 `Logger`/
-     `LogManager` API — needs a `DatabaseInstance`/`ClientContext`); `HostFs` exposes a `Log` wrapper;
-     `Bootstrap.Initialize` reads the new host field and calls `ArrowNetLog.EnableHostForwarding((lvl,cat,msg) =>
-     HostFs.Log(...))`. Level codes are the stable contract in `ArrowNetLog.LevelCode` (0 Trace…5 Critical).
-     Low risk (additive host-service entry); one C++ rebuild (unittest+shell+loadable).
+   - **(2a) DuckDB log forwarding — WIRED (ABI v58), lockstep-verified; duckdb_logs surfacing PENDING.** The
+     additive `host_log(level, log_type, message)` entry is appended to `ArrowNetHostServices`; C++
+     `HostLogService` (in `arrownet_host_query.cpp`, reusing the `g_host_db` `DatabaseInstance*`) maps the level
+     and calls `Logger::Get(*g_host_db).WriteLog(...)`; `HostFs.Log` + `Bootstrap` wire
+     `ArrowNetLog.EnableHostForwarding` when the host provides the callback (level codes stable in
+     `ArrowNetLog.LevelCode`, 0 Trace…5 Critical). **Verified:** ABI v58 boots (no mismatch) + `native_read` (66)
+     + Delta suites green — the bump is safe, the forwarding path is exercised (no-op-safe). **NOT yet confirmed:**
+     entries did NOT appear in `duckdb_logs` under `PRAGMA enable_logging` (0 rows). Likely root cause: logging
+     through `Logger::Get(DatabaseInstance&)` (instance scope) while `PRAGMA enable_logging` configures the
+     *connection*-level logger, so the instance logger's `ShouldLog` filters it. Follow-up (small): log through a
+     context that reflects the enabled config (or set the instance LogManager level), then confirm `duckdb_logs`.
+     **The file sink (Batch 1) is the working trace meanwhile.**
    - **(2b) live dynamic filters — the hard, shared-core part.** The native scan must (i) set
      `filter_pushdown = true` on the `arrownet_scan` variant so DuckDB delivers `input.filters` (incl. the
      hash-join `DynamicTableFilterSet`) — BUT `filter_pushdown = true` removes filters from the plan, so C# must

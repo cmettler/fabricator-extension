@@ -303,6 +303,12 @@ void SetHostQueryService(HostQueryFn fn) {
 	g_host_services.host_query = fn;
 }
 
+void SetHostLog(HostLogFn fn) {
+	// Patches the host_log field (DuckDB internal-logging forward), like SetHostQueryService. At extension load,
+	// before the bridge boots.
+	g_host_services.host_log = fn;
+}
+
 // -----------------------------------------------------------------------------
 // vtable convenience wrappers
 // -----------------------------------------------------------------------------

@@ -27,6 +27,27 @@ internal static unsafe class HostFs
     /// <summary>True once the host registered usable filesystem callbacks.</summary>
     public static bool Available => _set && _h.FsOpenRead != null;
 
+    /// <summary>True once the host registered the host_log callback (DuckDB internal logging forward).</summary>
+    public static bool CanLog => _set && _h.HostLog != null;
+
+    /// <summary>Forwards a log event into DuckDB's internal logging (duckdb_logs). Best-effort — never throws.</summary>
+    public static void Log(int level, string category, string message)
+    {
+        if (!CanLog)
+        {
+            return;
+        }
+        var catPtr = Marshal.StringToCoTaskMemUTF8(category);
+        var msgPtr = Marshal.StringToCoTaskMemUTF8(message);
+        try { _h.HostLog(level, (byte*)catPtr, (byte*)msgPtr); }
+        catch { /* logging must never fault the extension */ }
+        finally
+        {
+            Marshal.FreeCoTaskMem(catPtr);
+            Marshal.FreeCoTaskMem(msgPtr);
+        }
+    }
+
     /// <summary>Opens a file for reading via DuckDB's FileSystem; <paramref name="opener"/> resolves secrets.</summary>
     public static nint OpenRead(nint opener, string path)
     {

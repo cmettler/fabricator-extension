@@ -43,6 +43,11 @@ using HostQueryFn = int32_t (*)(const char *sql, struct ArrowArrayStream *params
                                 struct ArrowNetHostInputs *inputs, struct ArrowArrayStream *out, char **err);
 void SetHostQueryService(HostQueryFn fn);
 
+// Register the host_log callback (DuckDB internal-logging forward). Patched onto the shared host-services block
+// at load, like SetHostQueryService. See ArrowNetHostServices::host_log in abi.h.
+using HostLogFn = void (*)(int32_t level, const char *log_type, const char *message);
+void SetHostLog(HostLogFn fn);
+
 // SPIKE: ask the managed side to open `path` via the host FileSystem callbacks (using `opener` for secret
 // resolution) and return a short human-readable result (head/tail bytes + size). Proves C#->host FS reads.
 std::string FsSpike(ArrowNetHandle opener, const std::string &path);

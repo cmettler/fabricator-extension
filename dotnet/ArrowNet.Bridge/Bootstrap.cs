@@ -32,6 +32,12 @@ public static unsafe class Bootstrap
         if (host is not null)
         {
             HostFs.Set(*host);
+            // Forward ILogger output into DuckDB's internal logging (duckdb_logs) when the host provides host_log.
+            // The file sink (ARROWNET_LOG_LEVEL/_FILE) stays independent; this adds the engine-log route.
+            if (HostFs.CanLog)
+            {
+                ArrowNetLog.EnableHostForwarding((level, category, message) => HostFs.Log(level, category, message));
+            }
         }
 
         // A built-in demo named source (data-in by name): query it as `arrownet_scan('arrownet_demo_numbers')`
@@ -45,7 +51,7 @@ public static unsafe class Bootstrap
             return new InMemoryArrayStream(schema, new[] { batch });
         });
 
-        vtable->AbiVersion = 57;
+        vtable->AbiVersion = 58;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
