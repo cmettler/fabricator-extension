@@ -1141,7 +1141,15 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   (`test/verify_delta_mfr_dv.test`, 23). Gotchas: the DeleteFilter must `result_sel.Initialize(STANDARD_VECTOR_SIZE)`
   before writing (reader passes a null sel_vector → else segfault); **bare `count(*)` over-counts on a DV table**
   (empty-projection parquet-metadata count path skips the DeleteFilter — use a column scan; follow-up can disable
-  it). Next: 1c partition constants, 1d filter pushdown, 1e catalog fold. v56 = **`onelake://` WRITE forward callbacks** — appended 3 vtable entries
+  it). **1c (partition) + 1d (filter pushdown) LARGELY ALREADY WORK via the inherited parquet_scan (verified):**
+  `arrownet_delta_mfr_scan` clones parquet_scan → inherits **filter pushdown** (EXPLAIN shows `Filters:` INSIDE the
+  scan → static + dynamic filters prune row-groups natively, no custom Complex/DynamicFilterPushdown) + **hive
+  partitioning** (engineered-wood's `<col>=<value>/` layout → `region` resolves from the path; verified on a
+  PARTITIONED BY table). So 1a+1b + inherited features = a nearly complete native read (reader + projection +
+  filter/row-group pushdown + hive partitions + parallelism + ExternalFileCache + DV). **Remaining:** 1d-file =
+  Delta-log FILE-level pruning (optimization over row-group pruning; needs an engineered-wood prune-by-predicate
+  API), 1c-edge = log-authoritative partition injection for typed/NULL edge cases, the bare-count(*)-on-DV fix, and
+  **1e = fold the native read into the ATTACH catalog** (the productive step; credential available there). v56 = **`onelake://` WRITE forward callbacks** — appended 3 vtable entries
   `onelake_open_write`/`onelake_write`/`onelake_close_write`; the C++ `ArrowNetOneLakeFileSystem` `OpenFile(write)`/
   `Write` (sequential append → managed `OneLakeForwardFs` create/append/flush) make **`COPY … TO 'onelake://…'` +
   any DuckDB writer** write to OneLake (Phase-3 step-3 slice 2; live-validated: COPY a parquet, read back 5/5).

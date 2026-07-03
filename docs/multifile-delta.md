@@ -27,7 +27,23 @@
 > DeleteFilter MUST `result_sel.Initialize(STANDARD_VECTOR_SIZE)` before writing (else segfault — matches the delta
 > ext); (2) **bare `count(*)` uses the parquet row-group metadata path and does NOT apply the DeleteFilter → it
 > OVER-COUNTS on a DV table** (any column/predicate scan is DV-correct; disabling that metadata-count optimization
-> for the delta reader is a follow-up). No ABI bump. Next: 1c partition constants, 1d pushdown, 1e catalog fold.
+> for the delta reader is a follow-up). No ABI bump.
+>
+> **1c (partition) + 1d (filter pushdown) — LARGELY ALREADY WORK via the inherited parquet_scan (verified 2026-07-03):**
+> because `arrownet_delta_mfr_scan` clones `parquet_scan`, it inherits **filter pushdown** and **hive partitioning**.
+> (1) **Filters push to the row-group level automatically** — `EXPLAIN … WHERE id>7` shows `Filters: id>7` INSIDE
+> the scan operator (no separate FILTER), so static AND dynamic (join/TopN) filters prune row-groups in the native
+> read with no custom `Complex/DynamicFilterPushdown`. (2) **Partition columns resolve automatically** — engineered-
+> wood writes Hive layout (`<col>=<value>/*.parquet`) and the inherited `hive_partitioning` recovers the value from
+> the path (verified: a `PARTITIONED BY (region)` table reads `region` correctly through the mfr scan). So 1a+1b +
+> the inherited parquet features already give a nearly complete native Delta read (native reader + projection +
+> filter/row-group pushdown + hive partitions + parallelism + ExternalFileCache + DV). **What genuinely remains:**
+> (1d-file) Delta-**log**-stats FILE-level pruning (skip whole files without opening — a pure optimization over the
+> row-group pruning; needs an engineered-wood "prune files by predicate" API, deferred); (1c-edge) log-authoritative
+> partition-value injection for edge cases hive inference misses (typed/NULL partitions — robustness follow-up);
+> and the bare-`count(*)`-on-DV fix. **1e — fold the native read into the ATTACH catalog** (make `SELECT … FROM
+> lake.main.t` use the MultiFileReader instead of the C# reader; credential available there for the OneLake log
+> read) is the remaining PRODUCTIVE step and the natural next slice.
 
 > **Phase-A pre-spike DONE (2026-07-03):** `arrownet_delta_native_scan(path)` — engineered-wood lists the EXACT
 > active data files + schema (`DeltaReader.GetActiveFileUris`, the `add` set, NOT a glob), and DuckDB's **native
