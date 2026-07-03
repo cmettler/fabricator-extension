@@ -1127,7 +1127,14 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v56** (v56 = **`onelake://` WRITE forward callbacks** — appended 3 vtable entries
+- **Current version: ABI v57** (v57 = **`delta_list_files`** — one appended vtable entry for the native-read
+  MultiFileReader path (docs/multifile-delta.md Phase A slice 1a): `arrownet_delta_mfr_scan(path)` clones
+  `parquet_scan` + swaps in `ArrowNetDeltaMultiFileReader` (`src/arrownet/arrownet_delta_mfr.cpp`), whose
+  `CreateFileList` calls `delta_list_files(path, push_json)` → C# `DeltaReader.ListScanFilesJson` (engineered-wood's
+  EXACT active `add` files as JSON `[{"path":<uri>}]`, onelake:// for OneLake) → a `SimpleMultiFileList`; DuckDB's
+  **native parquet MultiFileReader** reads them (cached). The C++ MultiFileReader foundation for DV / partition /
+  dynamic-filter pushdown (later slices 1b–1e); `parquet` statically linked (extension_config.cmake). Live/local:
+  `test/verify_delta_mfr_scan.test` (36, matches the C# reader). v56 = **`onelake://` WRITE forward callbacks** — appended 3 vtable entries
   `onelake_open_write`/`onelake_write`/`onelake_close_write`; the C++ `ArrowNetOneLakeFileSystem` `OpenFile(write)`/
   `Write` (sequential append → managed `OneLakeForwardFs` create/append/flush) make **`COPY … TO 'onelake://…'` +
   any DuckDB writer** write to OneLake (Phase-3 step-3 slice 2; live-validated: COPY a parquet, read back 5/5).

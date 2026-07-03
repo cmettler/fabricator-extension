@@ -45,7 +45,7 @@ public static unsafe class Bootstrap
             return new InMemoryArrayStream(schema, new[] { batch });
         });
 
-        vtable->AbiVersion = 56;
+        vtable->AbiVersion = 57;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -105,6 +105,7 @@ public static unsafe class Bootstrap
         vtable->OneLakeOpenWrite = &OneLakeOpenWrite;
         vtable->OneLakeWrite = &OneLakeWrite;
         vtable->OneLakeCloseWrite = &OneLakeCloseWrite;
+        vtable->DeltaListFiles = &DeltaListFiles;
         return ArrowNetStatus.Ok;
     }
 
@@ -659,6 +660,26 @@ public static unsafe class Bootstrap
                 OneLakeForwardFs.CloseWrite(h);
                 Handles.Free(file);
             }
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    // Delta native-read (MultiFileList): return the active files of the Delta table as a JSON array
+    // [{"path":"<uri>", ...}]. The host reads the _delta_log via the active opener (set before this call).
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int DeltaListFiles(byte* path, byte* pushJson, byte** outJson, byte** err)
+    {
+        try
+        {
+            var p = Marshal.PtrToStringUTF8((nint)path) ?? string.Empty;
+            var push = Marshal.PtrToStringUTF8((nint)pushJson);
+            var json = DeltaReader.ListScanFilesJson(AmbientOpener.Current, p, push);
+            *outJson = (byte*)Marshal.StringToCoTaskMemUTF8(json); // host frees via free_error
             return ArrowNetStatus.Ok;
         }
         catch (Exception ex)

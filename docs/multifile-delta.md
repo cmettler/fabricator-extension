@@ -1,4 +1,21 @@
-# MultiFileReader + engineered-wood — native-parquet Delta path (design; Phase-A pre-spike BUILT)
+# MultiFileReader + engineered-wood — native-parquet Delta path (design; Phase-A slices BUILDING)
+
+> **Phase-A slice 1a DONE (2026-07-03, ABI v57) — the real MultiFileReader integration:**
+> `arrownet_delta_mfr_scan(path)` clones `parquet_scan` and swaps in `ArrowNetDeltaMultiFileReader` (a DuckDB
+> `MultiFileReader`, `src/arrownet/arrownet_delta_mfr.cpp`) whose `CreateFileList` gets the EXACT active files from
+> engineered-wood (new ABI `delta_list_files` → JSON `[{"path":…}]` → a `SimpleMultiFileList`); DuckDB's **native
+> parquet MultiFileReader** reads them (cached over `onelake://` for OneLake). Matches the C# reader row-for-row
+> (`test/verify_delta_mfr_scan.test`, 36). This is the **C++ foundation** the rest builds on — chosen over
+> extending the host_query pre-spike because the MultiFileReader framework is where DV, partition elimination, and
+> dynamic-filter file pruning live (confirmed in duckdb-delta: `DeltaMultiFileList::DynamicFilterPushdown` +
+> `PushdownInternal` prune files by the Delta-log `add` stats — static AND dynamic; partition values from the log
+> both prune + inject as constants; `FinalizeBind` attaches a per-file `DeltaDeleteFilter`). The host_query path
+> (`arrownet_delta_native_scan`) can't do any of those (it sees only parquet footers, no `_delta_log`) → it stays
+> the simple/no-DV fallback. **Next slices (on this foundation):** 1b — a custom `ArrowNetDeltaMultiFileList`
+> holding per-file metadata + `FinalizeBind` → `DeltaDeleteFilter` from a C#-supplied DV bitmap (DV **correctness**);
+> 1c — partition-value constants; 1d — `Complex/DynamicFilterPushdown` → re-call `delta_list_files` with the filter
+> (the `push` arg) so engineered-wood prunes files by log stats; 1e — fold into the ATTACH catalog (credential
+> available there for the OneLake log read). Below is the full design.
 
 > **Phase-A pre-spike DONE (2026-07-03):** `arrownet_delta_native_scan(path)` — engineered-wood lists the EXACT
 > active data files + schema (`DeltaReader.GetActiveFileUris`, the `add` set, NOT a glob), and DuckDB's **native

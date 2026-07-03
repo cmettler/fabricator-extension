@@ -202,6 +202,10 @@ public unsafe struct ArrowNetVTable
     public delegate* unmanaged[Cdecl]<nint, void*, long, byte**, int> OneLakeWrite;
     // int32 onelake_close_write(void* file, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte**, int> OneLakeCloseWrite;
+    // Delta native-read (MultiFileList): the active files of the Delta table at `path` as a JSON array
+    // [{"path":"<uri>", ...}]. `push_json` = pushed filters (empty ⇒ none). See abi.h delta_list_files.
+    // int32 delta_list_files(char* path, char* push_json, char** out_json, char** err)
+    public delegate* unmanaged[Cdecl]<byte*, byte*, byte**, byte**, int> DeltaListFiles;
 }
 
 /// <summary>

@@ -10,6 +10,7 @@
 
 #include "arrownet/clr_host.hpp"
 #include "arrownet/arrownet_onelake_fs.hpp"
+#include "arrownet/arrownet_delta_mfr.hpp"
 #include "catalog/arrownet_catalog.hpp"
 #include "catalog/arrownet_metadata.hpp"
 #include "catalog/arrownet_schema_entry.hpp"
@@ -473,6 +474,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	RegisterProviderSettings(loader);
 	arrownet::RegisterOneLakeFileSystem(loader.GetDatabaseInstance()); // onelake:// VFS subsystem (docs/filesystem-bridge.md §3)
+	arrownet::RegisterDeltaMultiFileScan(loader); // arrownet_delta_mfr_scan — native Delta read (docs/multifile-delta.md Phase A)
 	RegisterArrowNetGlobalFunctions(loader); // connection-free global functions (docs/global-functions.md)
 	RegisterArrowNetOptimizer(DBConfig::GetConfig(loader.GetDatabaseInstance()));
 	RegisterArrowNetInOutFinalizer(DBConfig::GetConfig(loader.GetDatabaseInstance()));

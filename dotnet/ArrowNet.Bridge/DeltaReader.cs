@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.CompilerServices;
+using System.Text;
 using System.Threading;
 using Apache.Arrow;
 using Apache.Arrow.Ipc;
@@ -46,6 +47,27 @@ internal static class DeltaReader
         {
             table.DisposeAsync().AsTask().GetAwaiter().GetResult();
         }
+    }
+
+    /// <summary>The active data files of the Delta table as a JSON array of objects <c>[{"path":"&lt;uri&gt;"}]</c>
+    /// for the C++ MultiFileReader (docs/multifile-delta.md Phase A). Slice 1a: paths only (the exact `add` set,
+    /// NOT a glob). Partition values + deletion vectors (later slices) become extra keys on each object; the
+    /// <paramref name="pushJson"/> pushed-filter arg is accepted now and applied for file pruning in a later
+    /// slice. Paths are absolute URIs (onelake:// for OneLake → native + cached).</summary>
+    public static string ListScanFilesJson(nint opener, string path, string? pushJson)
+    {
+        var files = GetActiveFileUris(opener, path);
+        var sb = new StringBuilder("[");
+        for (int i = 0; i < files.Count; i++)
+        {
+            if (i > 0)
+            {
+                sb.Append(',');
+            }
+            sb.Append("{\"path\":\"").Append(files[i].Replace("\\", "\\\\").Replace("\"", "\\\"")).Append("\"}");
+        }
+        sb.Append(']');
+        return sb.ToString();
     }
 
     // The table root as a URI DuckDB's native reader can open: an abfss-OneLake root → onelake:// (our VFS

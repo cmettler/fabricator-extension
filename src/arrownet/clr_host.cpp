@@ -616,6 +616,24 @@ void OneLakeCloseWrite(ArrowNetHandle file) {
 	}
 }
 
+std::string DeltaListFiles(const std::string &path, const std::string &push_json) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.delta_list_files) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide delta_list_files");
+	}
+	char *err = nullptr;
+	char *out_json = nullptr;
+	int32_t rc = vt.delta_list_files(path.c_str(), push_json.c_str(), &out_json, &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: delta_list_files failed");
+	}
+	std::string result = out_json ? out_json : "[]";
+	if (out_json && vt.free_error) {
+		vt.free_error(out_json);
+	}
+	return result;
+}
+
 void ListSecretFields(ArrowArrayStream &out) {
 	const ArrowNetVTable &vt = GetBridge();
 	if (!vt.list_secret_fields) {

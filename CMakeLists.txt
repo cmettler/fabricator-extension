@@ -21,6 +21,7 @@ set(EXTENSION_SOURCES
     src/arrownet_optimizer.cpp
     src/arrownet/clr_host.cpp
     src/arrownet/arrownet_onelake_fs.cpp
+    src/arrownet/arrownet_delta_mfr.cpp
     src/arrownet/arrow_ingest.cpp
     src/arrownet/arrow_produce.cpp
     src/catalog/arrownet_metadata.cpp

@@ -77,6 +77,11 @@ ArrowNetHandle OneLakeOpenWrite(const std::string &path, const std::string &cred
 void OneLakeWrite(ArrowNetHandle file, const void *buffer, int64_t nr_bytes);
 void OneLakeCloseWrite(ArrowNetHandle file);
 
+// Delta native-read (MultiFileList): the active data files of the Delta table at `path` as a JSON array
+// [{"path":"<uri>", ...}] (the `add` set, not a glob). `push_json` = pushed filters (empty = none). The
+// managed side reads the _delta_log via the active opener (set via SetActiveOpener before this call).
+std::string DeltaListFiles(const std::string &path, const std::string &push_json);
+
 // -----------------------------------------------------------------------------
 // Convenience wrappers over the vtable. Each throws duckdb::IOException carrying
 // the managed error message (and releases it via free_error) on failure.

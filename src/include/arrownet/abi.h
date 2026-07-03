@@ -649,6 +649,18 @@ typedef struct ArrowNetVTable {
 	int32_t (*onelake_open_write)(const char *path, const char *cred_json, ArrowNetHandle *out_file, char **err);
 	int32_t (*onelake_write)(ArrowNetHandle file, const void *buffer, int64_t nr_bytes, char **err);
 	int32_t (*onelake_close_write)(ArrowNetHandle file, char **err);
+
+	// -------------------------------------------------------------------------
+	// Delta native-read via DuckDB's MultiFileReader (docs/multifile-delta.md Phase A). The host's
+	// ArrowNetDeltaMultiFileReader (a DuckDB MultiFileReader that clones parquet_scan) asks the managed side for
+	// the EXACT active data files of the Delta table at `path` — the snapshot `add` set, NOT a glob — as a JSON
+	// array of objects: [{"path":"<uri>"[, "partitionValues":{..}, "deletionVector":"<base64>", "recordCount":N]}].
+	// Paths are absolute URIs DuckDB's native reader can open (onelake:// for OneLake → native + ExternalFileCache);
+	// the managed side uses the active host-FS opener (set_active_opener) to read the `_delta_log`. DuckDB's parquet
+	// reader then reads the files; partition values + deletion vectors (later slices) attach per file. The `push`
+	// arg carries pushed-down filters as JSON (empty ⇒ none) so the managed side prunes files by the Delta log
+	// stats (static + dynamic filter pushdown); an empty result column of files is valid (everything pruned).
+	int32_t (*delta_list_files)(const char *path, const char *push_json, char **out_json, char **err);
 } ArrowNetVTable;
 
 // -----------------------------------------------------------------------------
@@ -734,7 +746,7 @@ typedef struct ArrowNetHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 56
+#define ARROWNET_ABI_VERSION 57
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen
