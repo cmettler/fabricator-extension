@@ -10,6 +10,8 @@
 #include "catalog/arrownet_metadata.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/common/column_index.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "duckdb/planner/tableref/bound_at_clause.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -413,13 +415,38 @@ private:
 // LEAVE every expression in `filters` (best-effort) so DuckDB still applies them all.
 // Shared with the table-function scan (arrownet_schema_entry.cpp); declared in
 // arrownet_table_entry.hpp.
-void ArrowNetComplexFilterPushdown(ClientContext &, LogicalGet &get, FunctionData *bind_data_p,
+void ArrowNetComplexFilterPushdown(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
                                    vector<unique_ptr<Expression>> &filters) {
 	auto &bind_data = bind_data_p->Cast<arrownet::ArrowStreamBindData>();
 	bind_data.filter_json.clear();
 	bind_data.filter_constants.clear();
 	bind_data.native_filter_sql.clear();
+
+	// Diagnostic (duckdb_logs, type 'ArrowNet.Pushdown'): DuckDB may call this callback MORE THAN ONCE per
+	// plan (e.g. once with the static predicates, again as dynamic/join filters materialize), and we
+	// clear+rebuild each time — so this logs the incoming expression list + what we serialized, to make the
+	// call pattern (count, static vs later, replace-vs-merge) observable. Gated by ShouldLog so it's free when
+	// logging is off. See docs/multifile-delta.md §"Batch 2".
+	auto log_result = [&](idx_t serialized) {
+		auto &logger = Logger::Get(context);
+		if (!logger.ShouldLog("ArrowNet.Pushdown", LogLevel::LOG_INFO)) {
+			return;
+		}
+		string exprs;
+		for (auto &f : filters) {
+			if (!exprs.empty()) {
+				exprs += " ; ";
+			}
+			exprs += f->ToString();
+		}
+		logger.WriteLog("ArrowNet.Pushdown", LogLevel::LOG_INFO,
+		                StringUtil::Format("pushdown_complex_filter: %llu expr in [%s] -> %llu pushed; native_filter=[%s]",
+		                                   (unsigned long long)filters.size(), exprs.c_str(),
+		                                   (unsigned long long)serialized, bind_data.native_filter_sql.c_str()));
+	};
+
 	if (filters.empty()) {
+		log_result(0);
 		return;
 	}
 	FilterSerializer ser(get, bind_data.filter_constants, bind_data.string_order_pushable);
@@ -434,12 +461,14 @@ void ArrowNetComplexFilterPushdown(ClientContext &, LogicalGet &get, FunctionDat
 	}
 	if (parts.empty()) {
 		bind_data.filter_constants.clear();
+		log_result(0);
 		return;
 	}
 	// The filters vector is an implicit AND (both the JSON tree and the native SQL WHERE).
 	if (parts.size() == 1) {
 		bind_data.filter_json = parts[0];
 		bind_data.native_filter_sql = sql_parts[0];
+		log_result(1);
 		return;
 	}
 	string json = "{\"op\":\"and\",\"children\":[";
@@ -455,6 +484,7 @@ void ArrowNetComplexFilterPushdown(ClientContext &, LogicalGet &get, FunctionDat
 	json += "]}";
 	bind_data.filter_json = std::move(json);
 	bind_data.native_filter_sql = std::move(sql);
+	log_result(parts.size());
 }
 
 ArrowNetTableEntry::ArrowNetTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
