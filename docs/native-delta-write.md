@@ -1,8 +1,10 @@
 # Native Delta write — DuckDB parquet writer + engineered-wood metadata
 
-> **Status: P0 spike + P1 (INSERT/CTAS/append) + P3 (DELETE) + P4 (UPDATE) copy-on-write native-write half DONE
-> (2026-07-04); fully-native `read_parquet` rewrite + SQL-join UPDATE substitution + CDF native change files +
-> row tracking (P5) + alias-default + live OneLake still open — see §10.**
+> **Status: P0 spike + P1 (INSERT/CTAS/append) + P3 (DELETE) + P4 (UPDATE) copy-on-write native-write half +
+> P5-append (row tracking) DONE (2026-07-04), and VALIDATED LIVE on Fabric OneLake (write DML round-trips +
+> DuckDB-native-writer bloom signature over `onelake://`). Still open: fully-native `read_parquet` rewrite +
+> SQL-join UPDATE substitution + CDF native change files + P5-rewrite (materialize id/version on rewrite) +
+> alias-default — see §10.**
 > Completes the "inversion" begun by the native *read* path
 > (`docs/multifile-delta.md` §"Native-read fold"): C# is a pure Delta-**metadata** provider, and DuckDB's
 > native parquet reader **and writer** do all data-file I/O. engineered-wood's weakest surface (its parquet
@@ -221,7 +223,13 @@ The whole point is standard-readability, which EW's writer kept failing. Every p
 1. **delta-kernel-rs reads it** — via DuckDB's *official* `delta_scan` on the native-written table (the
    reference reader Spark/Fabric use). This is the gate EW's writer repeatedly failed (footer/`path_in_schema`).
 2. **Fabric OneLake conversion + SQL-endpoint query** — write to a live lakehouse, confirm it registers and is
-   queryable (the end-to-end check we've been doing for DV/CDF/ICT).
+   queryable (the end-to-end check we've been doing for DV/CDF/ICT). **VALIDATED LIVE (2026-07-04):** on
+   workspace `Test` / lakehouse `LH` (schema-enabled), `native_write true` CTAS + INSERT + DELETE + UPDATE on
+   `lake.dbo.arrownet_nwtest` all round-tripped correctly over `onelake://` (via the v56 OneLake write
+   callbacks + DuckDB's native parquet writer), and a 5000-row low-cardinality table showed the
+   **DuckDB-native-writer bloom signature** on the dict-encoded column via `parquet_metadata('onelake://…')`
+   (engineered-wood writes no bloom). Fabric-portal conversion / SQL-endpoint query is the user's final
+   confirmation, as for the DV/CDF/ICT paths.
 3. **Round-trip parity** — our own reader + the standalone-EW provider read the native-written table with
    identical results (incl. decimals, temporal, the types EW's codec mangled).
 4. **Bloom filter present** — confirm DuckDB auto-wrote bloom filters (`parquet_metadata` shows

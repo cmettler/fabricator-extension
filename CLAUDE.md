@@ -1760,10 +1760,14 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   true` → EW materializes the row-id column into `physicalBatch` + assigns `baseRowId`/`defaultRowCommitVersion`
   on the `add` before the writer, so DuckDB just emits the bytes (writer-v7 + `rowTracking`, `baseRowId` 0/5,
   delta_scan reads it). `verify_delta_catalog_native_write.test` (87 — INSERT/CTAS/append + bloom signature +
-  DELETE + UPDATE + row_tracking + durability); default update/delete/dv/changes unregressed. **Still pending:
-  the P5 REWRITE half (materialize row_id+row_commit_version pair on copy-on-write DELETE/UPDATE) + fully-native
-  `read_parquet` rewrite read half + SQL-join UPDATE substitution (retire `BuildArray`) + CDF native change
-  files + delta-alias default-on + live OneLake/Fabric validation.**
+  DELETE + UPDATE + row_tracking + durability); default update/delete/dv/changes unregressed. **VALIDATED LIVE
+  on Fabric OneLake (2026-07-04):** workspace `Test` / lakehouse `LH` (schema-enabled) — `native_write true`
+  CTAS + INSERT + DELETE + UPDATE on `lake.dbo.arrownet_nwtest` round-tripped correctly over `onelake://` (v56
+  OneLake write callbacks + DuckDB's native writer), and a 5000-row low-card table showed the DuckDB bloom
+  signature on the dict column via `parquet_metadata('onelake://…')` (EW writes none) — confirming DuckDB (not
+  EW) wrote the OneLake parquet. **Still pending: the P5 REWRITE half (materialize row_id+row_commit_version on
+  copy-on-write DELETE/UPDATE) + fully-native `read_parquet` rewrite read half + SQL-join UPDATE substitution
+  (retire `BuildArray`) + CDF native change files + delta-alias default-on.**
   **OCC RETRY DONE (concurrent writers):**
   engineered-wood `WriteCommitAsync` throws `DeltaConflictException` when a concurrent writer takes the target
   version; `DeltaWriter.Write`/`Create` (append/CTAS/create) catch it and retry by reopening at the new latest
