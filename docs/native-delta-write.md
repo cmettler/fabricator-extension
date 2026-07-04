@@ -2,9 +2,12 @@
 
 > **Status: P0 spike + P1 (INSERT/CTAS/append) + P3 (DELETE) + P4 (UPDATE) copy-on-write native-write half +
 > P5-append (row tracking) DONE (2026-07-04), and VALIDATED LIVE on Fabric OneLake (write DML round-trips +
-> DuckDB-native-writer bloom signature over `onelake://`). Still open: fully-native `read_parquet` rewrite +
-> SQL-join UPDATE substitution + CDF native change files + P5-rewrite (materialize id/version on rewrite) +
-> alias-default — see §10.**
+> DuckDB-native-writer bloom signature over `onelake://`). The FULLY-NATIVE copy-on-write REWRITE + SQL-join
+> UPDATE substitution is now DONE too (2026-07-04, commit `143c09d`): DELETE/UPDATE read the source via
+> `read_parquet` AND apply the row-level transform in DuckDB SQL (WHERE-filter / LEFT JOIN), retiring the
+> in-process `BuildArray`; DV-aware + schema-evolution backfill; validated by the official `delta_scan` +
+> LIVE on Fabric OneLake. Still open: CDF native change files + P5-rewrite (materialize id/version on rewrite)
+> + alias-default — see §10.**
 > Completes the "inversion" begun by the native *read* path
 > (`docs/multifile-delta.md` §"Native-read fold"): C# is a pure Delta-**metadata** provider, and DuckDB's
 > native parquet reader **and writer** do all data-file I/O. engineered-wood's weakest surface (its parquet
@@ -301,8 +304,27 @@ The whole point is standard-readability, which EW's writer kept failing. Every p
   — the SQL-join substitution to retire it is the deferred refinement), and commits `remove(old)+add(new)`. §9
   acid test PASSED locally (constant/string/expression updates → `delta_scan` matches, exact decimals). Test +
   33 assertions in `verify_delta_catalog_native_write.test` (now 68); default-path update/delete/dv/changes
-  unregressed. **Still deferred: SQL-join substitution (retire `BuildArray`), CDF pre/post-image native change
-  files, and the fully-native `read_parquet` rewrite read half.**
+  unregressed.
+- **P3+P4 fully-native REWRITE (read half) DONE (2026-07-04, commit `143c09d`).** DELETE/UPDATE now read the
+  source AND apply the row-level transform in DuckDB SQL, not just write natively. New engineered-wood seam
+  **`IDataFileRewriter`** (`DeltaTableOptions.DataFileRewriter`): the copy-on-write DELETE/UPDATE loops delegate
+  the source read + transform to it for the clean shape (no column mapping, no partitions, no type widening, no
+  CDF), falling back to EW's own reader + in-process transform otherwise. ArrowNet's `NativeParquetDataFileRewriter`
+  runs, per affected file, `SELECT <cols> FROM read_parquet(src, file_row_number => true) WHERE file_row_number
+  NOT IN (<deleted positions>)` (DELETE) or a `LEFT JOIN` against the (position → new SET values) rows bound as an
+  Arrow view, substituting via `CASE` (UPDATE) — **retiring the in-process typed `BuildArray`** for the native
+  path. **DV-aware** (the file's existing deletion-vector positions are passed as `excludePositions`, so a
+  copy-on-write UPDATE on a DV table rewrites only live rows) and **schema-evolution backfill** (the rewriter
+  probes the source file's columns and emits a typed `NULL` for a column ADDed after the file was written — no
+  gate needed). **Stats stay EXACT via EW's `StatsCollector`** on the returned batches: `RETURN_STATS` /
+  `parquet_metadata` surface DECODED VARCHAR min/max, whose float/double rounding could skip live rows (violates
+  the exact-or-nothing rule) — so the stats bridge is StatsCollector-on-the-batches, NOT the footer strings. §9
+  acid test PASSED (official `delta_scan` reads the native-rewritten table — exact decimal/date/double, DELETE +
+  UPDATE applied) AND **VALIDATED LIVE on Fabric OneLake** (`read_parquet('onelake://…')` source read + native
+  write over `onelake://`, DELETE + UPDATE round-trip, decimals exact). `verify_delta_catalog_native_write.test`
+  (147 — native DELETE/UPDATE + compose, DV-table UPDATE, schema-evolution UPDATE, durability); default-path +
+  delete/update/dv/changes/partition suites unregressed. **Still deferred: CDF pre/post-image native change files
+  (CDF tables keep the EW-read path) + P5-rewrite (materialize id/version on rewrite).**
 - **P5 — row tracking**: **the APPEND half already works FREE on the native path (verified 2026-07-04).**
   With `row_tracking true` + `native_write true`, engineered-wood materializes the row-id column into
   `physicalBatch` and assigns `baseRowId`/`defaultRowCommitVersion` on the `add` BEFORE the writer is called, so

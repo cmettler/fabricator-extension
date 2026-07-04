@@ -1786,10 +1786,33 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   EW) wrote the OneLake parquet. **Partitioned `native_write` DONE (2026-07-04):** EW splits by partition +
   calls the writer per Hive-partition file; `NativeParquetDataFileWriter` creates the `<col>=<value>/` parent
   dir first (`HostFs.CreateDir`, best-effort) since DuckDB's single-file COPY doesn't mkdir — also the
-  prerequisite for native CDF `_change_data/`. `verify_delta_catalog_native_write.test` (107). **Still pending:
-  the P5 REWRITE half (materialize row_id+row_commit_version on
-  copy-on-write DELETE/UPDATE) + fully-native `read_parquet` rewrite read half + SQL-join UPDATE substitution
-  (retire `BuildArray`) + CDF native change files + delta-alias default-on.**
+  prerequisite for native CDF `_change_data/`. `verify_delta_catalog_native_write.test` (107).
+  **Fully-native copy-on-write REWRITE + SQL-join UPDATE substitution DONE (2026-07-04, commit `143c09d`) —
+  read half native, `BuildArray` retired for the native path.** DELETE/UPDATE now READ the source via
+  `read_parquet` AND apply the row-level transform in DuckDB SQL, not just write natively. New engineered-wood
+  seam **`IDataFileRewriter`** (`DeltaTableOptions.DataFileRewriter`, next to `DataFileWriter`): the copy-on-write
+  DELETE/UPDATE loops delegate the source read + transform to it for the clean shape (no column mapping, no
+  partitions, no type widening, no CDF — gated in EW), falling back to EW's own reader + the in-process
+  `rewriteFile`/`TakeRows` transform otherwise. ArrowNet's `NativeParquetDataFileRewriter` (a *reader*: returns
+  the transformed batches; EW keeps stats/writer/commit) runs per affected file `SELECT <cols> FROM
+  read_parquet(src, file_row_number => true) WHERE file_row_number NOT IN (<deleted positions, bound anti-join>)`
+  (DELETE) or a `LEFT JOIN` against the (position → new SET values) rows bound as an Arrow view, substituting via
+  `CASE WHEN u.__arrownet_pos IS NOT NULL THEN u.<col> ELSE p.<col> END` (UPDATE) — **retiring the in-process
+  typed `BuildArray`** for the native path. **DV-aware** (the file's existing deletion-vector positions are
+  passed as `excludePositions`, so a copy-on-write UPDATE on a DV table rewrites only live rows) + **schema-
+  evolution backfill** (the rewriter probes the source file's columns via `read_parquet … LIMIT 0` and emits a
+  typed `CAST(NULL AS <t>)` for a column ADDed after the file was written — no gate needed). **Stats stay EXACT
+  via EW's `StatsCollector` on the returned batches** — `RETURN_STATS`/`parquet_metadata` surface DECODED VARCHAR
+  min/max whose float/double rounding could skip live rows (violates the exact-or-nothing rule), so the stats
+  bridge is StatsCollector-on-the-batches NOT the footer strings. Verified: §9 acid test (official `delta_scan`/
+  delta-kernel reads the native-rewritten table — exact decimal/date/double, DELETE + UPDATE applied) +
+  **LIVE on Fabric OneLake** (`read_parquet('onelake://…')` source read + native write over `onelake://`, DELETE
+  + UPDATE round-trip, decimals exact); `verify_delta_catalog_native_write.test` (147 — + DV-table UPDATE +
+  schema-evolution UPDATE); default-path + delete/update/dv/changes/partition unregressed. **Still pending:
+  the P5 REWRITE half (materialize `row_id`+`row_commit_version` on copy-on-write DELETE/UPDATE — the deferred
+  gap in BOTH paths, a deep EW row-tracking change) + CDF native change files (CDF tables keep the EW-read path
+  today — needs the rewriter to also produce the deleted/pre/post-image rows + `CdfWriter` on the native writer)
+  + delta-alias default-on.**
   **OCC RETRY DONE (concurrent writers):**
   engineered-wood `WriteCommitAsync` throws `DeltaConflictException` when a concurrent writer takes the target
   version; `DeltaWriter.Write`/`Create` (append/CTAS/create) catch it and retry by reopening at the new latest
