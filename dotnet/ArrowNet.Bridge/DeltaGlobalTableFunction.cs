@@ -361,7 +361,8 @@ internal static class DeltaWriter
     /// <paramref name="spec"/> (null =&gt; defaults) carries the resolved per-write tuning (compression /
     /// row-group size / bloom-filter columns) from the ATTACH options + the <c>delta_write_options</c> setting.</summary>
     internal static DeltaTableOptions Options(DeltaWriteSpec? spec = null,
-                                              IDataFileWriter? dataFileWriter = null) => DeltaTableOptions.Default with
+                                              IDataFileWriter? dataFileWriter = null,
+                                              IDataFileRewriter? dataFileRewriter = null) => DeltaTableOptions.Default with
     {
         ParquetWriteOptions = new ParquetWriteOptions
         {
@@ -374,6 +375,8 @@ internal static class DeltaWriter
         },
         // native_write: DuckDB's parquet writer produces the data files; engineered-wood keeps the _delta_log.
         DataFileWriter = dataFileWriter,
+        // native_write rewrite: DuckDB's read_parquet reads the source + applies the DELETE/UPDATE transform in SQL.
+        DataFileRewriter = dataFileRewriter,
     };
 
     // Catalog tables are written as PLAIN Delta — NO table features (no row tracking, no deletion vectors).

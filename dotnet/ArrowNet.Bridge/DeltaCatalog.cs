@@ -894,6 +894,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         var userSchema = DeltaReader.GetSchema(opener, path);
         var fields = userSchema.FieldsList;
         var setSlotByColumn = new int[fields.Count];
+        var setSlotField = new Field[setColNames.Count]; // the canonical user field for each SET slot
         for (int c = 0; c < fields.Count; c++)
         {
             setSlotByColumn[c] = -1;
@@ -902,9 +903,65 @@ public sealed class DeltaCatalog : IBackendCatalog
                 if (string.Equals(fields[c].Name, setColNames[j], System.StringComparison.OrdinalIgnoreCase))
                 {
                     setSlotByColumn[c] = j;
+                    setSlotField[j] = fields[c];
                     break;
                 }
             }
+        }
+
+        // 2b. native_write: build the per-file-ordinal (position -> new SET values) Arrow view the native rewriter
+        //     LEFT JOINs against — so DuckDB applies the substitution in SQL and BuildArray is retired for the
+        //     supported shape. Keyed [__arrownet_pos:int64 ++ <set columns, canonical name+type>]. Built here (this
+        //     is where the boxed new values live); the rewriter binds it. Fallback (unsupported shape / no host
+        //     query) leaves rewriter null → engineered-wood reads + the rewriteFile callback substitutes in-process.
+        IDataFileRewriter? rewriter = null;
+        if (_nativeWrite && NativeParquetDataFileRewriter.Available)
+        {
+            var rowsByOrdinal = new Dictionary<int, List<KeyValuePair<long, object?[]>>>();
+            foreach (var kv in updates)
+            {
+                int ord = (int)(kv.Key >> RowIdPositionBits);
+                if (!rowsByOrdinal.TryGetValue(ord, out var list))
+                {
+                    list = new List<KeyValuePair<long, object?[]>>();
+                    rowsByOrdinal[ord] = list;
+                }
+                list.Add(kv);
+            }
+            var updatesByOrdinal = new Dictionary<int, RecordBatch>(rowsByOrdinal.Count);
+            long posMask = (1L << RowIdPositionBits) - 1;
+            foreach (var (ord, rows) in rowsByOrdinal)
+            {
+                var posBuilder = new Int64Array.Builder();
+                var colVals = new List<object?>[setColNames.Count];
+                for (int j = 0; j < setColNames.Count; j++)
+                {
+                    colVals[j] = new List<object?>(rows.Count);
+                }
+                foreach (var kv in rows)
+                {
+                    posBuilder.Append(kv.Key & posMask);
+                    for (int j = 0; j < setColNames.Count; j++)
+                    {
+                        colVals[j].Add(kv.Value[j]);
+                    }
+                }
+                var batchFields = new List<Field>(setColNames.Count + 1)
+                {
+                    new Field("__arrownet_pos", Int64Type.Default, nullable: false),
+                };
+                var batchArrays = new List<IArrowArray>(setColNames.Count + 1) { posBuilder.Build() };
+                for (int j = 0; j < setColNames.Count; j++)
+                {
+                    var field = setSlotField[j];
+                    batchArrays.Add(BuildArray(field.DataType, colVals[j]));
+                    batchFields.Add(new Field(field.Name, field.DataType, nullable: true));
+                }
+                var batchSchema = new Apache.Arrow.Schema(batchFields, null);
+                updatesByOrdinal[ord] = new RecordBatch(batchSchema, batchArrays, rows.Count);
+            }
+            var setColCanonical = setSlotField.Select(f => f.Name).ToList();
+            rewriter = new NativeParquetDataFileRewriter(path, userSchema, setColCanonical, updatesByOrdinal);
         }
 
         // 3. Per-file copy-on-write: engineered-wood rewrites ONLY the files containing a matched row. For each
@@ -941,7 +998,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 outBatches.Add(new RecordBatch(userSchema, newCols, batch.Length));
             }
             return outBatches;
-        }, default, _nativeWrite);
+        }, default, _nativeWrite, rewriter);
 
         _log.LogInformation("delta update {Schema}.{Table}: rows={Rows} set_cols={SetCols} native_write={Native}",
             schemaName, tableName, updates.Count, setColNames.Count, _nativeWrite);

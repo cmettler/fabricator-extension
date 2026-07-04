@@ -314,18 +314,24 @@ internal static class DeltaReader
         var fs = TableFileSystems.Create(opener, path);
         // Open with the standard WRITE options (OmitPathInSchema=false) so the copy-on-write rewrite emits
         // standard-readable parquet — DeltaTableOptions.Default would drop path_in_schema (TProtocolException).
-        // native_write => DuckDB's parquet writer produces the rewritten survivor file (bloom/stats/footer);
-        // engineered-wood still selects/reads the affected files and commits remove(old)+add(new).
+        // native_write => DuckDB's parquet writer produces the rewritten survivor file (bloom/stats/footer) AND
+        // DuckDB's read_parquet reads the source + drops the deleted positions (the rewriter, retiring the
+        // engineered-wood reader for the clean shape). engineered-wood still selects the affected files, computes
+        // stats, and commits remove(old)+add(new).
         var writer = nativeWrite && NativeParquetDataFileWriter.Available
             ? new NativeParquetDataFileWriter(path)
             : null;
-        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(dataFileWriter: writer), ct)
+        var rewriter = nativeWrite && NativeParquetDataFileRewriter.Available
+            ? new NativeParquetDataFileRewriter(path, GetSchema(opener, path))
+            : null;
+        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(dataFileWriter: writer, dataFileRewriter: rewriter), ct)
             .AsTask().GetAwaiter().GetResult();
         try
         {
             long deleted = table.DeleteByRowIdsAsync(rowIds, ct).AsTask().GetAwaiter().GetResult().RowsDeleted;
-            DmlLog.LogInformation("delta delete-rewrite {Path}: deleted={Deleted} writer={Writer}",
-                path, deleted, writer is null ? "engineered-wood" : "native-duckdb");
+            DmlLog.LogInformation("delta delete-rewrite {Path}: deleted={Deleted} writer={Writer} rewriter={Rewriter}",
+                path, deleted, writer is null ? "engineered-wood" : "native-duckdb",
+                rewriter is null ? "engineered-wood" : "native-duckdb");
             return deleted;
         }
         catch (DeltaConflictException)
@@ -652,21 +658,26 @@ internal static class DeltaReader
     /// them as plain remove+add with a clean schema. Opens with the standard write options (path_in_schema).</summary>
     public static void UpdateByRowIds(nint opener, string path, IReadOnlyCollection<long> rowIds,
         System.Func<long, IReadOnlyList<RecordBatch>, IReadOnlyList<RecordBatch>> rewriteFile, CancellationToken ct,
-        bool nativeWrite = false)
+        bool nativeWrite = false, IDataFileRewriter? rewriter = null)
     {
         var fs = TableFileSystems.Create(opener, path);
-        // native_write => DuckDB's parquet writer produces the rewritten file (bloom/stats/footer); EW still
-        // reads the affected files, applies the SET substitution (rewriteFile), and commits remove(old)+add(new).
+        // native_write => DuckDB's parquet writer produces the rewritten file (bloom/stats/footer) AND, when the
+        // caller supplied a rewriter, DuckDB's read_parquet reads the source + applies the SET substitution via a
+        // LEFT JOIN (retiring the in-process BuildArray). EW still selects the affected files, computes stats, and
+        // commits remove(old)+add(new). Without a rewriter (unsupported shape) EW reads + the rewriteFile callback
+        // applies the substitution in-process.
         var writer = nativeWrite && NativeParquetDataFileWriter.Available
             ? new NativeParquetDataFileWriter(path)
             : null;
-        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(dataFileWriter: writer), ct)
+        var table = DeltaTable.OpenAsync(fs,
+                DeltaWriter.Options(dataFileWriter: writer, dataFileRewriter: rewriter), ct)
             .AsTask().GetAwaiter().GetResult();
         try
         {
             table.UpdateByRowIdsAsync(rowIds, rewriteFile, ct).AsTask().GetAwaiter().GetResult();
-            DmlLog.LogInformation("delta update-rewrite {Path}: rowids={RowIds} writer={Writer}",
-                path, rowIds.Count, writer is null ? "engineered-wood" : "native-duckdb");
+            DmlLog.LogInformation("delta update-rewrite {Path}: rowids={RowIds} writer={Writer} rewriter={Rewriter}",
+                path, rowIds.Count, writer is null ? "engineered-wood" : "native-duckdb",
+                rewriter is null ? "engineered-wood" : "native-duckdb");
         }
         catch (DeltaConflictException)
         {

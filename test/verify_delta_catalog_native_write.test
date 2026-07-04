@@ -219,3 +219,67 @@ SELECT id, name FROM rt2.main.t ORDER BY id;
 
 statement ok
 DETACH rt2;
+
+# ---- DV table + native_write: DELETE uses deletion vectors (no data rewrite); a subsequent UPDATE is
+#      copy-on-write and the native rewriter must EXCLUDE the file's DV positions (passed as excludePositions)
+#      so only live rows are rewritten. ----
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/nwdv' AS dv (TYPE arrownet, PROVIDER 'delta', native_write true, deletion_vectors true);
+
+statement ok
+CREATE TABLE dv.main.t AS SELECT i AS id, (i * 1.0)::DECIMAL(10,2) AS amt FROM range(1, 11) AS r(i);
+
+# DV delete rows 2,4,6 (no file rewrite — a fresh DV + remove/add).
+statement ok
+DELETE FROM dv.main.t WHERE id IN (2, 4, 6);
+
+# UPDATE a live row: copy-on-write rewrite that must skip the DV-deleted physical positions.
+statement ok
+UPDATE dv.main.t SET amt = 999.00 WHERE id = 5;
+
+query IR
+SELECT id, amt FROM dv.main.t ORDER BY id;
+----
+1	1.00
+3	3.00
+5	999.00
+7	7.00
+8	8.00
+9	9.00
+10	10.00
+
+query I
+SELECT count(*) FROM dv.main.t;
+----
+7
+
+statement ok
+DETACH dv;
+
+# ---- schema evolution + native_write: a column ADDed after a file was written is absent from that file's
+#      parquet; an UPDATE that rewrites the OLD file must backfill the new column as NULL (the rewriter probes
+#      the file's columns and emits a typed NULL for the missing one). ----
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/nwse' AS se (TYPE arrownet, PROVIDER 'delta', native_write true);
+
+statement ok
+CREATE TABLE se.main.t AS SELECT i AS id, 'v' || i AS name FROM range(1, 6) AS r(i);
+
+statement ok
+ALTER TABLE se.main.t ADD COLUMN extra INTEGER;
+
+# UPDATE a row in the OLD file (which has no `extra` column) — the rewrite backfills extra=NULL for survivors.
+statement ok
+UPDATE se.main.t SET name = 'upd' WHERE id = 2;
+
+query ITI
+SELECT id, name, extra FROM se.main.t ORDER BY id;
+----
+1	v1	NULL
+2	upd	NULL
+3	v3	NULL
+4	v4	NULL
+5	v5	NULL
+
+statement ok
+DETACH se;
