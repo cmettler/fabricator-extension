@@ -12,18 +12,23 @@ namespace ArrowNet.Bridge;
 /// execution, on the SAME thread (the calls are synchronous). The host-FS binding reads it in
 /// <c>Bind</c> (schema) and <c>Execute</c> (data); a SQL/compute binding never touches it.
 ///
-/// It is <c>[ThreadStatic]</c> so concurrent scans on different threads carry independent openers. The opener
-/// is valid only for the duration of the call it precedes, so a host-FS reader must do its IO (or materialize)
-/// synchronously within <c>Bind</c>/<c>Execute</c> — it must not capture the opener for a later, lazy read.
+/// It is an <see cref="System.Threading.AsyncLocal{T}"/> so concurrent scans on different threads carry
+/// independent openers AND the value flows across <c>await</c> points / into threadpool continuations — so a
+/// sync ABI-facing method may delegate to an <c>async</c> core (with <c>ConfigureAwait(false)</c>) without
+/// losing the opener when the continuation resumes on a different pool thread. For the current all-sync code
+/// this behaves exactly like the former <c>[ThreadStatic]</c> (set + read on the same synchronous flow; the
+/// value set by one ABI call persists to the next call on the same thread). The opener is valid only for the
+/// duration of the call it precedes, so a host-FS reader must do its IO (or materialize) synchronously within
+/// <c>Bind</c>/<c>Execute</c> — it must not capture the opener for a later, lazy read.
 /// </summary>
 public static class AmbientOpener
 {
-    [ThreadStatic] private static nint _current;
+    private static readonly System.Threading.AsyncLocal<nint> _current = new();
 
-    /// <summary>The active host-FS opener on this thread (0 = none).</summary>
+    /// <summary>The active host-FS opener on this flow (0 = none).</summary>
     public static nint Current
     {
-        get => _current;
-        set => _current = value;
+        get => _current.Value;
+        set => _current.Value = value;
     }
 }

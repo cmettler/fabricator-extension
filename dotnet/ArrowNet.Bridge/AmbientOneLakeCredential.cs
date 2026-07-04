@@ -6,20 +6,21 @@ namespace ArrowNet.Bridge;
 /// The Fabric credential (resolved by <see cref="FabricCredentialResolver"/> from the ATTACH'd azure secret, or
 /// the ambient managed/workspace identity) in effect on this thread — read by <see cref="TableFileSystems.Create"/>
 /// to build a direct-SDK <see cref="OneLakeDataLakeFileSystem"/> for OneLake roots instead of routing IO through
-/// DuckDB's azure extension. Mirrors <see cref="AmbientOpener"/>: <c>[ThreadStatic]</c> (concurrent scans carry
-/// independent credentials), set by <c>DeltaCatalog</c> immediately before it calls into the reader/writer, and
-/// re-established on the bulk consumer thread (<c>BulkSession</c>) across the thread hop. <c>null</c> => no Fabric
-/// credential in scope, so IO falls back to the host-FS path (local / S3 / plain ADLS, or OneLake via duckdb-azure).
+/// DuckDB's azure extension. Mirrors <see cref="AmbientOpener"/>: an <see cref="System.Threading.AsyncLocal{T}"/>
+/// (concurrent scans carry independent credentials, and the value flows across <c>await</c>/pool-thread hops),
+/// set by <c>DeltaCatalog</c> immediately before it calls into the reader/writer, and re-established on the bulk
+/// consumer thread (<c>BulkSession</c>) across the thread hop. <c>null</c> => no Fabric credential in scope, so IO
+/// falls back to the host-FS path (local / S3 / plain ADLS, or OneLake via duckdb-azure).
 /// </summary>
 public static class AmbientOneLakeCredential
 {
-    [System.ThreadStatic] private static TokenCredential? _current;
+    private static readonly System.Threading.AsyncLocal<TokenCredential?> _current = new();
 
-    /// <summary>The active Fabric credential on this thread (null = none).</summary>
+    /// <summary>The active Fabric credential on this flow (null = none).</summary>
     public static TokenCredential? Current
     {
-        get => _current;
-        set => _current = value;
+        get => _current.Value;
+        set => _current.Value = value;
     }
 }
 

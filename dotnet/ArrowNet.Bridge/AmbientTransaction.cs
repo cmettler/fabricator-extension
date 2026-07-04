@@ -9,8 +9,10 @@ namespace ArrowNet.Bridge;
 /// The host sets it via the <c>set_active_txn</c> ABI entry IMMEDIATELY before each connection-using call,
 /// on the SAME thread (the call is synchronous), so a backend can read it without the id having to be
 /// threaded through every method signature + internal SQL helper. <c>0</c> means "no specific transaction"
-/// (a fresh/pooled connection — autocommit-style). It is <c>[ThreadStatic]</c>, so concurrent ABI calls on
-/// different threads carry independent ids.
+/// (a fresh/pooled connection — autocommit-style). It is an <see cref="System.Threading.AsyncLocal{T}"/>, so
+/// concurrent ABI calls on different threads carry independent ids AND the id flows across <c>await</c> points
+/// (enabling a sync-wrapper → <c>async</c>-core refactor without losing it on a pool-thread hop); for the
+/// current all-sync code this behaves exactly like the former <c>[ThreadStatic]</c>.
 ///
 /// The one place the id must cross a thread is the streaming bulk consumer (a background task on a pool
 /// thread): there the host captures the id at <c>begin_bulk</c> and the consumer re-establishes it on its
@@ -18,14 +20,14 @@ namespace ArrowNet.Bridge;
 /// </summary>
 public static class AmbientTransaction
 {
-    [ThreadStatic] private static long _current;
-    [ThreadStatic] private static bool _joinOnly;
+    private static readonly System.Threading.AsyncLocal<long> _current = new();
+    private static readonly System.Threading.AsyncLocal<bool> _joinOnly = new();
 
-    /// <summary>The active DuckDB transaction id on this thread (0 = none / autocommit).</summary>
+    /// <summary>The active DuckDB transaction id on this flow (0 = none / autocommit).</summary>
     public static long Current
     {
-        get => _current;
-        set => _current = value;
+        get => _current.Value;
+        set => _current.Value = value;
     }
 
     /// <summary>
@@ -40,7 +42,7 @@ public static class AmbientTransaction
     /// </summary>
     public static bool JoinOnly
     {
-        get => _joinOnly;
-        set => _joinOnly = value;
+        get => _joinOnly.Value;
+        set => _joinOnly.Value = value;
     }
 }

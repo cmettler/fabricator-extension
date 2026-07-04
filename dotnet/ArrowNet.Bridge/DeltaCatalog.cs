@@ -771,6 +771,8 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// <paramref name="ifExists"/> is satisfied either way.</summary>
     public void DropTable(string schemaName, string tableName, bool ifExists)
     {
+        _log.LogInformation("delta drop table {Schema}.{Table} (onelake={OneLake})",
+            schemaName, tableName, FabricLakehouse.IsOneLake(_root));
         if (FabricLakehouse.IsOneLake(_root))
         {
             FabricLakehouse.DeleteDirectory(TablePath(schemaName, tableName), _fabricCredential);
@@ -998,6 +1000,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// table name.</summary>
     public void AlterTable(int k, string s, string t, string? a1, string? a2, Field? c, int f)
     {
+        _log.LogInformation("delta alter {Schema}.{Table}: kind={Kind} arg={Arg}", s, t, k, a1);
         switch (k)
         {
             case AlterKind.AddColumn:
