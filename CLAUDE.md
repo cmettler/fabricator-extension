@@ -144,6 +144,24 @@ current code still uses the single-provider `mssql_net` naming):
 ## Next up (open threads for future sessions)
 
 In-flight / planned refactors (all C#-only unless noted; tests stay green per slice):
+- **Sync-over-async cleanup (Bridge) — ENABLER DONE (`0533eb7`), refactor DEFERRED.** The Bridge blocks the
+  C++↔C# boundary with `.GetAwaiter().GetResult()` sprinkled at every `await` site. This is **correct + safe**
+  here (the hostfxr CLR has NO `SynchronizationContext`, so sync-over-async can't deadlock; the ABI is
+  synchronous), just ugly + slightly worse for exception unwrapping — so there's **no urgency**. The clean shape
+  = a sync ABI-facing method that blocks ONCE on a private `async` core (`ConfigureAwait(false)` throughout).
+  **The landmine** is the ambients (`AmbientOpener`/`AmbientTransaction`/`AmbientOneLakeCredential`): they were
+  `[ThreadStatic]`, so a real-async core with `ConfigureAwait(false)` would hop pool threads and LOSE the
+  opener/credential/txn mid-op (silent — passes local tests where opener=0 works, breaks on OneLake + explicit
+  txns). **Fixed as the prerequisite: converted to `AsyncLocal<T>` (`0533eb7`)** — flows across await/pool-thread
+  hops, behavior-identical for the current sync code (validated: full local delta catalog suite + a live OneLake
+  CTAS/DELETE/readback/DROP, so the opener+credential still cross the `set_active_opener`→use ABI-call boundary).
+  So the refactor is now UNBLOCKED. **When: later + incremental** (leaf-first — `DeltaReader` read/write have a
+  clean single-blocking-point shape — one seam at a time, `verify_delta_catalog_*` after each; never interleaved
+  with feature work), and adopt the sync-wrapper→async-core shape as a **convention for NEW code now**.
+  `IAsyncDisposable` is lower value (the C++ boundary disposes synchronously → keep a sync `Dispose()` that blocks
+  once on `DisposeAsync()`; use `await using` only INSIDE the async cores). Logging note: keep it OUT of the hot
+  ambient accessors + per-row/scan paths (log-spam + file-sink serialization risk); the write/DML path logging
+  (`3d60cb5`) + DDL logging (`0533eb7`) sit at low-frequency decision points only.
 - **Discovered TVF/proc wrapper extraction — DONE** (`SqlServerProcedure.cs` `6da8033`,
   `SqlServerTableValuedFunction.cs` `eb6c34e`). The inline TVF/proc SQL moved out of `SqlServerCatalog`
   into top-level `internal` wrappers (like `SqlServerScalarFunction`/`SqlServerTvfEach`), so
