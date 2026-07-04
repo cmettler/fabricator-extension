@@ -1918,21 +1918,30 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `defaultRowCommitVersion` per file (high-water mark derived on snapshot rebuild — no domainMetadata action),
   prepends commitInfo, and writes with OCC retry. **Row tracking rides on `baseRowId`** (no physical
   `__delta_row_id` column — the collect+native path injects one; its ABSENCE in the streamed parquet is the test
-  signal that streaming ran). **v1 stats = numRecords only** (from `RETURN_STATS.count`, exact — correctness-safe:
-  row tracking + count(*) work; min/max deferred → files just aren't skip-optimized, a documented quality gap vs
-  the collect path's full EW `StatsCollector` stats; enrich later by translating `RETURN_STATS.column_statistics`
-  with a float/double omit policy). **Falls back to the collect path** (`Materialize` + `Write`, `data` untouched —
+  signal that streaming ran). **FULL data-skipping stats** (min/max/nullCount + numRecords) are emitted for the
+  streamed file — parsed from DuckDB's `RETURN_STATS.column_statistics` (a **MAP(colname → MAP(statname → text))** —
+  a map-of-maps, everything stringified; `NativeParquetDataFileWriter.BuildDeltaStats` walks both `MapArray`
+  levels via `KeyValues`) and typed from the write schema into the Delta stats JSON via an **exact-or-omit**
+  policy: min/max emitted for integer / decimal / string / boolean / date / naive-timestamp (decoded text is
+  exact; integers/decimals via `WriteRawValue` so no double round-trip; timestamp space→'T'), and **OMITTED for
+  float/double** (decoded text may round → a too-narrow min could wrongly skip a file — correctness-safe by
+  omission) and tz-timestamp / time / nested (format risk); `nullCount` + `numRecords` always (exact integers).
+  On any parse hiccup it falls back to numRecords-only (never fails the write for stats). So the streamed file
+  gets the SAME skipping quality as the collect path (better on float/double, which the collect path emits
+  possibly-imprecise). **Falls back to the collect path** (`Materialize` + `Write`, `data` untouched —
   the fallback is decided BEFORE any COPY, checked via EW's new `DeltaTable.SupportsExternalDataFileCommit`
   predicate + `Metadata.PartitionColumns`, so no orphan file) for: partitioned target (native OR existing),
   `replace_where`, `schema_mode=merge`, or a table needing EW's own writer (column mapping / identity /
   IcebergCompat). The **EW-codec path (`native_write` off) is unchanged** — still collects (the user's call: only
   the native path streams). DELETE/UPDATE (rewriter paths) unaffected. Shared `NativeParquetDataFileWriter.RunCopy`
-  (live stream → COPY, returns rows+size) backs both the per-file `IDataFileWriter` and the streaming writer.
-  Verified: `test/verify_delta_catalog_native_write_streaming.test` (18 — no `__delta_row_id` in the streamed
-  file, bloom signature present, 8000-row append, partitioned fallback) + native_write (147) + optimize/partition/
+  (live stream → COPY, returns rows+size + optional Delta stats JSON) backs both the per-file `IDataFileWriter`
+  (stats null — EW collects its own) and the streaming writer (passes the write schema).
+  Verified: `test/verify_delta_catalog_native_write_streaming.test` (20 — no `__delta_row_id` in the streamed
+  file, bloom signature present, **min/max/nullCount in the commit: int→JSON number, string→JSON string,
+  double→omitted**, 8000-row append, partitioned fallback) + native_write (147) + optimize/partition/
   overwrite_merge/write/native_read/decimal/changes/time_travel/alter/snapshots unregressed; **live OneLake**
   (CTAS 5000 + append→8000 + DELETE→7920 over `onelake://`, log confirms `stream-write … native COPY, single
-  file, bounded memory`).
+  file, bounded memory`; the OneLake commit carries `minValues`/`maxValues`/`nullCount` — verified).
   **OCC RETRY DONE (concurrent writers):**
   engineered-wood `WriteCommitAsync` throws `DeltaConflictException` when a concurrent writer takes the target
   version; `DeltaWriter.Write`/`Create` (append/CTAS/create) catch it and retry by reopening at the new latest

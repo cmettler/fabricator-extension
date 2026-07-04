@@ -42,6 +42,28 @@ FROM parquet_metadata('${ARROWNET_DELTA_WRITE_DIR}/nwstream/t/*.parquet');
 ----
 1
 
+# DATA-SKIPPING STATS: the streamed file's Delta `add` carries FULL min/max/nullCount (built from DuckDB's
+# RETURN_STATS.column_statistics, typed by the write schema) — not just numRecords. The stats string is embedded
+# in the add action with inner quotes escaped as " (System.Text.Json default), so we un-escape with
+# replace(content, chr(92)||'u0022', '"') and match with normal quotes. Exactly ONE commit (the CTAS, id 1..5000)
+# has minValues.id=1 + maxValues.id=5000, emitted as JSON NUMBERS (integer stats are exact).
+query I
+WITH j AS (SELECT replace(content, chr(92)||'u0022', '"') AS c
+           FROM read_text('${ARROWNET_DELTA_WRITE_DIR}/nwstream/t/_delta_log/*.json'))
+SELECT count(*) FROM j
+WHERE c LIKE '%"minValues":{"id":1,%' AND c LIKE '%"maxValues":{"id":5000,%' AND c LIKE '%"nullCount"%';
+----
+1
+
+# The string column `v` gets string min/max ('v0'..'v6'); `id`/`v` have no nulls (nullCount 0).
+query I
+WITH j AS (SELECT replace(content, chr(92)||'u0022', '"') AS c
+           FROM read_text('${ARROWNET_DELTA_WRITE_DIR}/nwstream/t/_delta_log/*.json'))
+SELECT count(*) FROM j
+WHERE c LIKE '%"v":"v0"%' AND c LIKE '%"v":"v6"%' AND c LIKE '%"nullCount":{"id":0,"v":0}%';
+----
+1
+
 # Append (INSERT) also streams — still no injected row-id column, data complete.
 statement ok
 INSERT INTO lake.main.t SELECT i, 'v' || (i % 7) FROM range(5001, 8001) AS r(i);

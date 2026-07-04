@@ -556,14 +556,17 @@ internal static class DeltaWriter
                 table.SetSchemaAsync(data.Schema, default).AsTask().GetAwaiter().GetResult();
             }
 
-            // Stream the whole input into ONE parquet file. RETURN_STATS gives its row count + byte size.
+            // Stream the whole input into ONE parquet file. RETURN_STATS gives its row count + byte size AND the
+            // Delta stats JSON (min/max/nullCount, built from column_statistics + typed by data.Schema) — so the
+            // streamed file gets FULL data-skipping stats, not just numRecords.
             string fileRel = $"{System.Guid.NewGuid():N}.parquet";
-            var (rows, size) = NativeParquetDataFileWriter.RunCopy(writableRoot, fileRel, data, default);
+            var (rows, size, stats) = NativeParquetDataFileWriter.RunCopy(
+                writableRoot, fileRel, data, default, statsSchema: data.Schema);
             rowsWritten = rows;
             // 0 rows → reference no file (an empty COPY output would be an unreferenced orphan); an Overwrite still
             // commits its removes (clears the table), an Append commits an empty version.
             var files = rows > 0
-                ? new List<WrittenDataFile> { new(fileRel, size, rows, null, null) }
+                ? new List<WrittenDataFile> { new(fileRel, size, rows, null, stats) }
                 : new List<WrittenDataFile>();
             long version = table.CommitDataFilesAsync(files, mode, default).AsTask().GetAwaiter().GetResult();
             Log.LogInformation(
