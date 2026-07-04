@@ -2074,6 +2074,22 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   1433, `sa` / `Arrow_Net_123!` (test-only). DBs `ArrowTest` and `TestDB`. Connstr needs
   `TrustServerCertificate=true;Encrypt=true`. `sqlcmd` v18 in-container:
   `docker exec mssql-arrownet /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Arrow_Net_123!' -C`.
+- **Copy-paste test env** (Bash tool; test-only creds — the REAL Fabric SP lives only in the gitignored
+  `dax_secret.sql`, never here). Run the loadable/shell/unittest from `build/release/`:
+  ```bash
+  export ARROWNET_MANAGED_DIR=build/release/extension/mssql_net/arrownet
+  DSN='Server=localhost,1433;Database=TestDB;User Id=sa;Password=Arrow_Net_123!;TrustServerCertificate=true;Encrypt=true'
+  export MSSQL_TESTDB_DSN="$DSN" MSSQL_TEST_SERVER="$DSN" MSSQL_TEST_CONNECTION_STRING="$DSN"
+  # a Delta catalog verify test needs a writable base dir:
+  export ARROWNET_DELTA_WRITE_DIR="$(mktemp -d)"      # each test file wants its OWN fresh dir
+  # run one test at a time (the runner concatenates multiple filters into one bad glob):
+  build/release/test/unittest.exe --test-dir . "test/verify_delta_catalog_native_write.test"
+  # trace the write path: prepend ARROWNET_LOG_LEVEL=Debug (logs off by default)
+  # live Fabric OneLake: a .sql script starting with  .read dax_secret.sql  then
+  #   ATTACH 'abfss://Test@onelake.dfs.fabric.microsoft.com/LH.Lakehouse/Tables' AS lake
+  #     (TYPE arrownet, PROVIDER 'delta', SECRET fabric_sp, READ_ONLY false [, native_write true]);
+  #   piped:  build/release/duckdb.exe -unsigned -batch < script.sql   (LH = schema-enabled, dbo)
+  ```
 
 ## Key decisions & constraints
 
