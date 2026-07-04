@@ -43,7 +43,18 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
         {
             throw new InvalidOperationException("native delta write: no batches to write");
         }
-        var uri = _writableRoot + "/" + relativePath.Replace('\\', '/').TrimStart('/');
+        var rel = relativePath.Replace('\\', '/').TrimStart('/');
+        var uri = _writableRoot + "/" + rel;
+        // DuckDB's single-file COPY does NOT create the target's parent directory, so a partitioned file
+        // (region=US/<uuid>.parquet) or a _change_data file would fail. Create it first (recursive, idempotent).
+        // Best-effort: on an object store (OneLake/S3) directories are implicit — CreateDirectory may be a no-op
+        // or unimplemented, and the blob write creates the path anyway, so a failure here is not fatal.
+        int slash = rel.LastIndexOf('/');
+        if (slash > 0)
+        {
+            try { HostFs.CreateDir(AmbientOpener.Current, _writableRoot + "/" + rel.Substring(0, slash)); }
+            catch { /* object-store implicit dirs / unimplemented CreateDirectory — the COPY still writes */ }
+        }
         var sql =
             $"COPY (SELECT * FROM {InputName}) TO '{uri.Replace("'", "''")}' " +
             "(FORMAT parquet, WRITE_BLOOM_FILTER true, RETURN_STATS)";

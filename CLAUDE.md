@@ -1765,7 +1765,11 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   CTAS + INSERT + DELETE + UPDATE on `lake.dbo.arrownet_nwtest` round-tripped correctly over `onelake://` (v56
   OneLake write callbacks + DuckDB's native writer), and a 5000-row low-card table showed the DuckDB bloom
   signature on the dict column via `parquet_metadata('onelake://…')` (EW writes none) — confirming DuckDB (not
-  EW) wrote the OneLake parquet. **Still pending: the P5 REWRITE half (materialize row_id+row_commit_version on
+  EW) wrote the OneLake parquet. **Partitioned `native_write` DONE (2026-07-04):** EW splits by partition +
+  calls the writer per Hive-partition file; `NativeParquetDataFileWriter` creates the `<col>=<value>/` parent
+  dir first (`HostFs.CreateDir`, best-effort) since DuckDB's single-file COPY doesn't mkdir — also the
+  prerequisite for native CDF `_change_data/`. `verify_delta_catalog_native_write.test` (107). **Still pending:
+  the P5 REWRITE half (materialize row_id+row_commit_version on
   copy-on-write DELETE/UPDATE) + fully-native `read_parquet` rewrite read half + SQL-join UPDATE substitution
   (retire `BuildArray`) + CDF native change files + delta-alias default-on.**
   **OCC RETRY DONE (concurrent writers):**

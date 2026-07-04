@@ -82,6 +82,14 @@ Recommendation: prototype with (B) to de-risk the writer/stats/commit quickly, t
 multiple files. engineered-wood records one `add` per file with the partition values (it already reads
 `Metadata.PartitionColumns`). The native `PARTITIONED BY` clause (ABI v51) drives this.
 
+**DONE (2026-07-04):** partitioned `native_write` works — EW splits by partition and calls the writer once per
+Hive-partition file (`region=US/<uuid>.parquet`). The one wrinkle: DuckDB's **single-file `COPY` does NOT create
+the target's parent directory**, so `NativeParquetDataFileWriter` creates `<col>=<value>/` first
+(`HostFs.CreateDir`, recursive/idempotent; best-effort — object stores have implicit dirs, so a failure there is
+non-fatal since the blob write creates the path). Verified in `verify_delta_catalog_native_write.test`
+(per-partition counts + partition-column filter + re-attach). This same parent-dir create is the prerequisite
+for native CDF `_change_data/` files (deferred).
+
 ## 4. The stats bridge (the one genuinely new piece)
 
 The Delta `add` needs `numRecords` + per-column `{min, max, nullCount}`. Today EW computes them while

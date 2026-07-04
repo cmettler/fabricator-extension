@@ -130,6 +130,27 @@ SELECT count(*) FROM lake.main.u;
 ----
 4
 
+# ---- partitioned native write: DuckDB writes one file per Hive partition subdir (the writer creates the
+#      <col>=<value>/ parent dir, which a single-file COPY does not do on its own) ----
+statement ok
+CREATE TABLE lake.main.p PARTITIONED BY (region) AS
+  SELECT * FROM (VALUES (1, 'US', 10), (2, 'US', 20), (3, 'EU', 30), (4, 'EU', 40), (5, 'APAC', 50))
+  AS t(id, region, amt);
+
+query TII
+SELECT region, count(*), sum(amt) FROM lake.main.p GROUP BY region ORDER BY region;
+----
+APAC	1	50
+EU	2	70
+US	2	30
+
+# Filter on the partition column reads only the matching partition's file.
+query II
+SELECT id, amt FROM lake.main.p WHERE region = 'EU' ORDER BY id;
+----
+3	30
+4	40
+
 # ---- durability: detach + re-attach re-discovers the native-written tables from the _delta_log ----
 statement ok
 DETACH lake;
@@ -151,6 +172,13 @@ query I
 SELECT count(*) FROM lake2.main.d;
 ----
 4
+
+query TI
+SELECT region, count(*) FROM lake2.main.p GROUP BY region ORDER BY region;
+----
+APAC	1
+EU	2
+US	2
 
 statement ok
 DETACH lake2;
