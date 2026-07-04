@@ -1746,8 +1746,14 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   native-write signature (EW default writes no bloom). `test/verify_delta_catalog_native_write.test` (36); default
   path unregressed (write/decimal/temporal/partition/overwrite_merge/update/delete green). **Opt-in only (default
   off);** the `delta`-alias default-on is deferred (needs the resolved provider name threaded to the
-  `DeltaCatalog` ctor — a separate policy step). DELETE/UPDATE rewrites still use EW's codec (P3/P4); live
-  OneLake/Fabric validation of the native-write path pending.
+  `DeltaCatalog` ctor — a separate policy step). **P3 (DELETE) DONE (2026-07-04):** under `native_write` the
+  copy-on-write DELETE rewrites the survivor file with DuckDB's native writer too (the `IDataFileWriter` seam
+  generalized to a batch **list** — a rewrite writes a file's survivor batches as one parquet), EW still
+  selects/reads the affected files + commits `remove`+`add`; the READ half stays EW's reader (fully-native
+  `read_parquet … WHERE file_row_number NOT IN` rewrite deferred), DV-mode delete unchanged (no data rewrite).
+  Acid-tested (delta_scan reads the 5 survivors, exact decimals); `verify_delta_catalog_native_write.test` (48);
+  default delete/dv/update unregressed. **UPDATE (P4) + fully-native rewrite + live OneLake/Fabric validation
+  pending.**
   **OCC RETRY DONE (concurrent writers):**
   engineered-wood `WriteCommitAsync` throws `DeltaConflictException` when a concurrent writer takes the target
   version; `DeltaWriter.Write`/`Create` (append/CTAS/create) catch it and retry by reopening at the new latest

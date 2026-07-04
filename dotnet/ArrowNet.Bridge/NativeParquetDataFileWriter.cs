@@ -36,18 +36,30 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
     /// engineered-wood writer otherwise.</summary>
     internal static bool Available => Host.CanQuery;
 
-    public ValueTask<long> WriteAsync(RecordBatch batch, string relativePath, CancellationToken cancellationToken)
+    public ValueTask<long> WriteAsync(IReadOnlyList<RecordBatch> batches, string relativePath,
+                                      CancellationToken cancellationToken)
     {
+        if (batches.Count == 0)
+        {
+            throw new InvalidOperationException("native delta write: no batches to write");
+        }
         var uri = _writableRoot + "/" + relativePath.Replace('\\', '/').TrimStart('/');
         var sql =
             $"COPY (SELECT * FROM {InputName}) TO '{uri.Replace("'", "''")}' " +
             "(FORMAT parquet, WRITE_BLOOM_FILTER true, RETURN_STATS)";
-        Log.LogInformation("delta native write {Uri} rows={Rows}", uri, batch.Length);
+        long rows = 0;
+        foreach (var b in batches)
+        {
+            rows += b.Length;
+        }
+        Log.LogInformation("delta native write {Uri} rows={Rows} batches={Batches}", uri, rows, batches.Count);
 
-        // The batch is bound as a fresh single-batch Arrow stream (the host consumes + releases it).
+        // Bind the batches as a fresh Arrow stream (the host dequeues + exports each; InMemoryArrayStream only
+        // disposes UNdequeued batches, and the C export doesn't free managed buffers — so the caller's batches
+        // stay valid for its subsequent stats collection). One parquet file is written from the whole stream.
         var input = new (string, IArrowArrayStream)[]
         {
-            (InputName, new InMemoryArrayStream(batch.Schema, new[] { batch })),
+            (InputName, new InMemoryArrayStream(batches[0].Schema, batches)),
         };
         using var result = Host.Query(sql, input);
         long size = ReadFileSize(result, cancellationToken);

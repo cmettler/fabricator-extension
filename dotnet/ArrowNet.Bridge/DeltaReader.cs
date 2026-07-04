@@ -306,12 +306,19 @@ internal static class DeltaReader
 
     /// <summary>Deletes the rows whose transient <c>_metadata.row_id</c> is in <paramref name="rowIds"/>
     /// (deletion vectors). Returns the number of rows deleted.</summary>
-    public static long DeleteByRowIds(nint opener, string path, IReadOnlyCollection<long> rowIds, CancellationToken ct)
+    public static long DeleteByRowIds(nint opener, string path, IReadOnlyCollection<long> rowIds,
+                                      CancellationToken ct, bool nativeWrite = false)
     {
         var fs = TableFileSystems.Create(opener, path);
         // Open with the standard WRITE options (OmitPathInSchema=false) so the copy-on-write rewrite emits
         // standard-readable parquet — DeltaTableOptions.Default would drop path_in_schema (TProtocolException).
-        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).AsTask().GetAwaiter().GetResult();
+        // native_write => DuckDB's parquet writer produces the rewritten survivor file (bloom/stats/footer);
+        // engineered-wood still selects/reads the affected files and commits remove(old)+add(new).
+        var writer = nativeWrite && NativeParquetDataFileWriter.Available
+            ? new NativeParquetDataFileWriter(path)
+            : null;
+        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(dataFileWriter: writer), ct)
+            .AsTask().GetAwaiter().GetResult();
         try
         {
             return table.DeleteByRowIdsAsync(rowIds, ct).AsTask().GetAwaiter().GetResult().RowsDeleted;

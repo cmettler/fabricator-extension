@@ -819,9 +819,11 @@ public sealed class DeltaCatalog : IBackendCatalog
         var path = TablePath(schemaName, tableName);
         // Follow the TABLE's config: deletion-vector tables get the no-rewrite DV delete; everything else is
         // copy-on-write. (Honors external DV tables regardless of this catalog's create-time flag.)
+        // DV-mode delete writes no data file (just a new DV + remove/add) → native writer N/A; copy-on-write
+        // rewrite honors native_write (DuckDB writes the survivor file).
         return DeltaReader.IsDeletionVectorsEnabled(opener, path)
             ? DeltaReader.DeleteByRowIdsViaVectors(opener, path, ids, default)
-            : DeltaReader.DeleteByRowIds(opener, path, ids, default);
+            : DeltaReader.DeleteByRowIds(opener, path, ids, default, _nativeWrite);
     }
 
     public IArrowArrayStream ExecuteQuery(string sql) => throw Unsupported("raw query");

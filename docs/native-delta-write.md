@@ -1,7 +1,8 @@
 # Native Delta write — DuckDB parquet writer + engineered-wood metadata
 
-> **Status: P0 spike + P1 (INSERT/CTAS/append) DONE (2026-07-04); DELETE/UPDATE (P3/P4) + alias-default + live
-> OneLake still open — see §10.** Completes the "inversion" begun by the native *read* path
+> **Status: P0 spike + P1 (INSERT/CTAS/append) + P3 (DELETE copy-on-write rewrite, native write half) DONE
+> (2026-07-04); UPDATE (P4) + fully-native rewrite + alias-default + live OneLake still open — see §10.**
+> Completes the "inversion" begun by the native *read* path
 > (`docs/multifile-delta.md` §"Native-read fold"): C# is a pure Delta-**metadata** provider, and DuckDB's
 > native parquet reader **and writer** do all data-file I/O. engineered-wood's weakest surface (its parquet
 > reader/writer — source of every decimal/DV-format/DataPage-V2/signed-min-max/`path_in_schema` bug we fixed)
@@ -267,9 +268,18 @@ The whole point is standard-readability, which EW's writer kept failing. Every p
   threaded to the `DeltaCatalog` ctor — a separate, mechanism-independent policy step). DELETE/UPDATE rewrites
   still use EW's codec (P3/P4). Live OneLake/Fabric validation of the native-write path is pending.
 - **P2 — input-binding (A) DONE as part of P1** (gate B was never needed — `Host.Query(inputs)` already exists).
-- **P3 — DELETE** (copy-on-write native rewrite + DV-mode unchanged) + CDF delete change files. Rowid decode
-  invariant (§5.1) is the gate.
-- **P4 — UPDATE** (SQL-join substitution, retire `BuildArray`) + CDF pre/post images.
+- **P3 — DELETE copy-on-write rewrite DONE (2026-07-04, native WRITE half).** Under `native_write true` the
+  copy-on-write DELETE rewrites the surviving rows into a **DuckDB-written** parquet file (the same
+  `IDataFileWriter` seam, now generalized to a batch **list** so the rewrite's per-file survivor batches write
+  as one file); engineered-wood still selects/reads the affected files and commits `remove(old)+add(new)`. The
+  **read half stays EW's reader** (survivor filtering via `TakeRows`, decimal-correct since the earlier fix) —
+  the fully-native `read_parquet … WHERE file_row_number NOT IN (…)` rewrite (§5, retiring EW's data-file read)
+  is a later refinement. **DV-mode DELETE is unchanged** (no data rewrite → native writer N/A). §9 acid test
+  PASSED locally (10 rows → delete evens → the official `delta_scan` reads the 5 survivors with exact decimals).
+  `test/verify_delta_catalog_native_write.test` (48 — incl. DELETE + compose + durability); default-path
+  delete/dv/update unregressed. CDF delete change files + fully-native rewrite still open.
+- **P4 — UPDATE** (native rewrite via the same list-form seam; SQL-join substitution to retire `BuildArray`) +
+  CDF pre/post images.
 - **P5 — row tracking**: `baseRowId` + `defaultRowCommitVersion` on the `add` from RETURN_STATS/commit
   version on append (§6.1, metadata only); DV-mode preservation (free); materialize the
   `_metadata.row_id`+`_metadata.row_commit_version` pair on rewrite (§6.2) or documented deferral. (Also
