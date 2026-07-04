@@ -282,11 +282,21 @@ public:
 	void MoveFile(const string &, const string &, optional_ptr<FileOpener>) override {
 		throw NotImplementedException("onelake:// FileSystem is read-only");
 	}
+	// Directory ops: OneLake / ADLS Gen2 directories are IMPLICIT (a blob write at `<dir>/<file>`
+	// materializes the whole hierarchy). DuckDB's partitioned COPY (PARTITION_BY) checks the target directory
+	// during setup — support those checks so a partitioned COPY to onelake:// works (the Hive col=val/ files
+	// are then written by OpenFile-for-writing, exactly as in the single-file path).
+	bool DirectoryExists(const string &, optional_ptr<FileOpener>) override {
+		// Report the target as not-yet-a-directory: DuckDB then calls CreateDirectory (a no-op here) and
+		// proceeds to write. Correct because dirs are implicit — no explicit dir need pre-exist.
+		return false;
+	}
 	void CreateDirectory(const string &, optional_ptr<FileOpener>) override {
-		throw NotImplementedException("onelake:// FileSystem is read-only");
+		// No-op: an ADLS Gen2 / OneLake directory is created implicitly by the first blob written under it
+		// (OneLakeOpenWrite → DataLakeFileClient.CreateAsync materializes the parent hierarchy).
 	}
 	void RemoveDirectory(const string &, optional_ptr<FileOpener>) override {
-		throw NotImplementedException("onelake:// FileSystem is read-only");
+		throw NotImplementedException("onelake:// FileSystem: RemoveDirectory is not supported");
 	}
 
 	std::string GetName() const override {

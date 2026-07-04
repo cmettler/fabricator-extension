@@ -1936,25 +1936,26 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   returns one row PER FILE → each becomes a `WrittenDataFile` with its `partitionValues` (from `partition_keys`, a
   `MAP(colname→value)`) + per-file stats, all committed in one `CommitDataFilesAsync`. `RunCopy` returns per-file
   `CopiedFile` records (relpath from `filename`, rows, size, partitionValues, stats); the shared `ReadFileStats`
-  parses both. **Falls back to the collect path** (`Materialize` + `Write`, `data` untouched — the fallback is
-  decided BEFORE any COPY via EW's `SupportsExternalDataFileCommit` + `Metadata.PartitionColumns`, so no orphan
-  file) for: `replace_where`, `schema_mode=merge`, a table needing EW's own writer (column mapping / identity /
-  IcebergCompat), **and a PARTITIONED write on OneLake** — DuckDB's partitioned COPY needs a writable DIRECTORY
-  target, which the `onelake://` C++ FileSystem doesn't yet support (it stats the table root as a file: *"exists
-  and is a file, not a directory"*); the single-file (non-partitioned) OneLake write works. On the OneLake
-  partitioned fallback the collect path still uses DuckDB's native PER-FILE writer (one single-file COPY per
-  partition — a FILE target, which OneLake supports) → native parquet quality (bloom/stats), just RAM-bounded.
-  **Follow-up to stream OneLake partitioned: add directory-target support to `arrownet_onelake_fs` (C++).** The
-  **EW-codec path (`native_write` off) is unchanged** — still collects (the user's call: only the native path
-  streams). DELETE/UPDATE (rewriter paths) unaffected.
+  parses both. **Partitioned streaming works on OneLake too** — DuckDB's partitioned COPY needs a writable
+  DIRECTORY target, which the `onelake://` C++ FileSystem now supports: `ArrowNetOneLakeFileSystem` overrides
+  `DirectoryExists`→false + `CreateDirectory`→no-op (ADLS Gen2 dirs are implicit — a blob write materializes the
+  hierarchy), and the managed `OneLakeForwardFs.Exists` returns FALSE for a directory (via the `hdi_isfolder`
+  metadata marker) so DuckDB's setup doesn't mistake the table root for a file (the old *"exists and is a file,
+  not a directory"* error). With `APPEND true` + `FILENAME_PATTERN '{uuid}'`, `CheckDirectory` early-returns and
+  the per-partition files are written by `OpenFile`-for-writing (the same mechanism the single-file path uses).
+  **Falls back to the collect path** (`Materialize` + `Write`, `data` untouched — the fallback is decided BEFORE
+  any COPY via EW's `SupportsExternalDataFileCommit` + `Metadata.PartitionColumns`, so no orphan file) only for:
+  `replace_where`, `schema_mode=merge`, or a table needing EW's own writer (column mapping / identity /
+  IcebergCompat). The **EW-codec path (`native_write` off) is unchanged** — still collects (the user's call: only
+  the native path streams). DELETE/UPDATE (rewriter paths) unaffected.
   Verified: `test/verify_delta_catalog_native_write_streaming.test` (29 — no `__delta_row_id` in the streamed
   file, bloom signature present, **min/max/nullCount in the commit: int→JSON number, string→JSON string,
   double→omitted**, 8000-row append, **partitioned CTAS+INSERT stream: Hive layout, partition column excluded, no
   `__delta_row_id`, per-file partitionValues+stats in the commit**) + native_write (147) + optimize/partition/
   overwrite_merge/update/dv/write/native_read/decimal/changes/time_travel/alter/snapshots unregressed; **live
-  OneLake** (non-partitioned CTAS 5000 + append→8000 + DELETE→7920 over `onelake://`, log confirms `stream-write …
-  native COPY … bounded memory`, commit carries `minValues`/`maxValues`/`nullCount`; partitioned CTAS+INSERT
-  round-trips via the per-file-native collect fallback).
+  OneLake** (non-partitioned CTAS 5000 + append→8000 + DELETE→7920; **partitioned CTAS+INSERT stream —
+  `partitioned copy onelake://… → committed v1/v2 files=3 (native COPY, bounded memory)`, 200 rows/region**;
+  commit carries `minValues`/`maxValues`/`nullCount`).
   **OCC RETRY DONE (concurrent writers):**
   engineered-wood `WriteCommitAsync` throws `DeltaConflictException` when a concurrent writer takes the target
   version; `DeltaWriter.Write`/`Create` (append/CTAS/create) catch it and retry by reopening at the new latest

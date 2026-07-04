@@ -541,21 +541,13 @@ internal static class DeltaWriter
             cancellationToken: default).AsTask().GetAwaiter().GetResult();
         try
         {
-            // Decide ALL fallbacks BEFORE writing any file / touching the log, so a fallback leaves no orphan.
-            // (1) A table needing engineered-wood's own writer (column mapping / identity / iceberg).
+            // Fall back BEFORE writing any file / touching the log (so a fallback leaves no orphan): a table
+            // needing engineered-wood's own writer (column mapping / identity / iceberg) can't use external commit.
             if (!table.SupportsExternalDataFileCommit)
             {
                 return null;
             }
             var partCols = table.CurrentSnapshot.Metadata.PartitionColumns;
-            // (2) A PARTITIONED write on OneLake: DuckDB's partitioned COPY needs a writable DIRECTORY target,
-            // which the onelake:// FileSystem doesn't yet support (it stats the table root as a file) — the
-            // single-file (non-partitioned) OneLake write works. Fall back to the collect path on OneLake for
-            // partitioned; local/S3 partitioned streams natively.
-            if (partCols.Count > 0 && FabricLakehouse.IsOneLake(path))
-            {
-                return null;
-            }
             if (mode == DeltaWriteMode.Overwrite)
             {
                 // CREATE OR REPLACE / CTAS-replace / schema_mode=overwrite: adopt the incoming schema (metadata-only,

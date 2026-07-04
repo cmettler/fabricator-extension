@@ -165,11 +165,29 @@ internal static class OneLakeForwardFs
         return sb.ToString();
     }
 
+    /// <summary>Does a FILE exist at exactly <paramref name="path"/>? Returns FALSE for a directory — DuckDB's
+    /// partitioned-COPY setup calls FileExists on the target and errors ("exists and is a file") if a directory
+    /// reports as a file; a directory must report absent-as-a-file so the write proceeds via CreateDirectory.
+    /// (ADLS Gen2 / OneLake is a hierarchical namespace: a directory carries the <c>hdi_isfolder=true</c>
+    /// metadata marker; a file does not.)</summary>
     public static bool Exists(string path, string? credJson)
     {
         var (fs, p) = Parse(path);
         var client = FsClient(fs, Cred(credJson)).GetFileClient(p);
-        return client.ExistsAsync().GetAwaiter().GetResult().Value;
+        try
+        {
+            var props = client.GetPropertiesAsync().GetAwaiter().GetResult().Value;
+            if (props.Metadata is { } m && m.TryGetValue("hdi_isfolder", out var folder)
+                && string.Equals(folder, "true", StringComparison.OrdinalIgnoreCase))
+            {
+                return false; // it's a directory, not a file
+            }
+            return true; // exists and is a file
+        }
+        catch (RequestFailedException ex) when (ex.Status == 404)
+        {
+            return false;
+        }
     }
 
     // ---- WRITE (slice 2): a plain OneLake file write (COPY … TO 'onelake://…'), sequential append. ----
