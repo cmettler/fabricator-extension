@@ -374,19 +374,18 @@ static string BuildScanSpec(const ArrowStreamBindData &bind_data, const vector<c
 		json += ",\"filter\":";
 		json += bind_data.filter_json; // already a JSON object
 	}
-	// A 1:1 SQL rendering of the same predicates (literals inlined) — consumed only by a provider whose
-	// scan target is DuckDB itself (native Delta read_parquet); foreign-engine providers ignore it.
-	// `live_filter_sql` (slice 2) renders the runtime TableFilterSet (DuckDB-erased static filters + dynamic
-	// join filters, filter_pushdown=true only) — it holds the MANDATORY filters, so it must be applied; the
-	// bind-time `native_filter_sql` (slice 1, complex filters DuckDB still re-applies) is additional
-	// superset-safe pruning. Combine both with AND (either may be empty).
-	string native_filter = live_filter_sql;
-	if (!bind_data.native_filter_sql.empty()) {
-		if (!native_filter.empty()) {
-			native_filter += " AND ";
-		}
-		native_filter += bind_data.native_filter_sql;
-	}
+	// A 1:1 SQL rendering of the same predicates (literals inlined) — consumed only by a provider whose scan
+	// target is DuckDB itself (native Delta read_parquet); foreign-engine providers ignore it. Two sources:
+	//   • `live_filter_sql` (slice 2): the execute-time TableFilterSet (DuckDB-erased static filters + dynamic
+	//     join filters; filter_pushdown=true only). Holds the MANDATORY filters and is per-column complete.
+	//   • `bind_data.native_filter_sql` (slice 1): the bind-time pushdown_complex_filter render.
+	// When live filters fired they SUBSUME the bind render for per-column predicates (and push more — e.g. the
+	// comparisons the superset-safe bind subset drops), so we emit ONLY the live filter to avoid the
+	// double-render of the same predicate. Fall back to the bind render only when no live filters fired.
+	// Correctness-neutral: the sole thing not emitted when live filters win is read_parquet row-group pruning
+	// for cross-column disjunctions (which the per-column TableFilterSet can't represent) — file-level pruning
+	// still uses filter_json, and DuckDB re-applies the complex filter above the scan. See docs/multifile-delta.md.
+	const string &native_filter = !live_filter_sql.empty() ? live_filter_sql : bind_data.native_filter_sql;
 	if (!native_filter.empty()) {
 		json += ",\"native_filter\":";
 		JsonEscape(native_filter, json);
