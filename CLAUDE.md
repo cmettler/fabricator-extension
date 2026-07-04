@@ -1717,7 +1717,12 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   (2026-07-04).** Under DV-default, DVs + merge-on-read append small files accumulate, so bin-pack compaction
   matters: `mssql_net_exec('<catalog>', 'OPTIMIZE <schema.table>')` (+ `VACUUM <schema.table> [RETAIN <hours>
   HOURS] [DRY RUN]`) → `DeltaCatalog.ExecuteNonQuery` → `DeltaReader.Optimize`/`Vacuum` → engineered-wood
-  `CompactAsync`/`VacuumAsync` (mirrors the delta-rs provider's maintenance dialect). **`CompactionExecutor` fixed
+  `CompactAsync`/`VacuumAsync` (mirrors the delta-rs provider's maintenance dialect). **Under `native_write` the
+  OPTIMIZE compacted files are written by DuckDB's native writer too** (`CompactionExecutor` gained an
+  `IDataFileWriter` branch; `DeltaReader.Optimize` opens with the native writer when `_nativeWrite`) — so an
+  OPTIMIZE KEEPS the native-write quality (bloom/stats/decimal) instead of reverting to the EW codec. Proven: the
+  compacted file (after OPTIMIZE+VACUUM leaves only it) carries the native bloom signature (bloom on the
+  dict-encoded `grp`, none on all-distinct `id`); validated LIVE on Fabric OneLake. **`CompactionExecutor` fixed
   to be DV-AWARE** — it now EXCLUDES each candidate file's deletion-vector-deleted rows (else compaction would
   RESURRECT them — a data bug, since DV is the default) + strips the internal `__delta_row_id` + carries each
   removed file's DV on the `remove`. **The exec path now threads the host-FS opener** (`mssql_net_extension.cpp`

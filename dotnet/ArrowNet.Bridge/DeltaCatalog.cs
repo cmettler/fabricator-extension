@@ -870,8 +870,8 @@ public sealed class DeltaCatalog : IBackendCatalog
         switch (tokens[0].ToUpperInvariant())
         {
             case "OPTIMIZE":
-                _log.LogInformation("delta exec OPTIMIZE {Schema}.{Table}", schema, table);
-                return DeltaReader.Optimize(opener, path, default);
+                _log.LogInformation("delta exec OPTIMIZE {Schema}.{Table} native_write={Native}", schema, table, _nativeWrite);
+                return DeltaReader.Optimize(opener, path, default, _nativeWrite);
             case "VACUUM":
             {
                 bool dryRun = HasToken(tokens, "DRY");

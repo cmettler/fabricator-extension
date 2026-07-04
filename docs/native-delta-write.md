@@ -348,7 +348,13 @@ The whole point is standard-readability, which EW's writer kept failing. Every p
   `__delta_row_id` + carry the removed files' DVs. The exec path now threads the host-FS opener
   (`SetActiveOpener` in `MssqlNetExecFunction`; a fresh-connection OPTIMIZE segfaulted without it). Compaction
   still assigns fresh baseRowIds (the stable-id caveat above); DATA is correct (delta_scan + live Fabric).
-  `test/verify_delta_catalog_optimize.test`. Compaction
+  `test/verify_delta_catalog_optimize.test`.
+- **Native-writer compaction (2026-07-04).** Under `native_write`, OPTIMIZE's compacted files are also produced by
+  DuckDB's native writer (`CompactionExecutor` gained an `IDataFileWriter` branch; `DeltaReader.Optimize` opens
+  with the native writer when `_nativeWrite`) — so an OPTIMIZE keeps the native-write quality (bloom/stats)
+  instead of reverting to the EW codec. Proven: after OPTIMIZE+VACUUM the sole remaining compacted file carries
+  the native bloom signature (bloom on the dict `grp`, none on all-distinct `id`); `verify_delta_catalog_optimize.test`
+  + live Fabric OneLake. Compaction
   (`CompactionExecutor`) is **not wired into this provider** (no OPTIMIZE command — latent) AND currently would
   BREAK stable ids for a spec reader: it assigns a fresh `baseRowId` per compacted file and EW does not declare
   `delta.rowTracking.materializedRowIdColumnName`, so delta-kernel/Spark compute ids from `baseRowId + position`

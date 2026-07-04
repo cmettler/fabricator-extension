@@ -92,3 +92,43 @@ SELECT id, v FROM lake2.main.t ORDER BY id;
 
 statement ok
 DETACH lake2;
+
+# ---- native_write: OPTIMIZE writes the compacted files with DuckDB's native writer (bloom/stats), not the
+#      engineered-wood codec — so an OPTIMIZE keeps the native-write quality. ----
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/optnw' AS nw (TYPE arrownet, PROVIDER 'delta', native_write true);
+
+statement ok
+CREATE TABLE nw.main.t AS SELECT i AS id, 'cat' || (i % 5) AS grp FROM range(1, 1001) AS r(i);
+
+statement ok
+INSERT INTO nw.main.t SELECT i, 'cat' || (i % 5) FROM range(1001, 2001) AS r(i);
+
+statement ok
+INSERT INTO nw.main.t SELECT i, 'cat' || (i % 5) FROM range(2001, 3001) AS r(i);
+
+# Compact the 3 files, then VACUUM the originals away so ONLY the compacted file remains.
+statement ok
+SELECT mssql_net_exec('nw', 'OPTIMIZE main.t');
+
+statement ok
+SELECT mssql_net_exec('nw', 'VACUUM main.t RETAIN 0 HOURS');
+
+query I
+SELECT count(*) FROM nw.main.t;
+----
+3000
+
+# The remaining compacted file carries the DuckDB native-writer signature: a bloom filter on the dict-encoded
+# `grp` (5 distinct) but NOT on the all-distinct `id`. The engineered-wood codec writes no bloom, so this proves
+# the native writer produced the compacted file.
+query II
+SELECT
+  max(CASE WHEN path_in_schema = 'grp' AND bloom_filter_offset IS NOT NULL THEN 1 ELSE 0 END) AS grp_bloom,
+  max(CASE WHEN path_in_schema = 'id' AND bloom_filter_offset IS NOT NULL THEN 1 ELSE 0 END) AS id_bloom
+FROM parquet_metadata('${ARROWNET_DELTA_WRITE_DIR}/optnw/t/*.parquet');
+----
+1	0
+
+statement ok
+DETACH nw;

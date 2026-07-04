@@ -656,15 +656,22 @@ internal static class DeltaReader
     /// EXCLUDING deletion-vector-deleted rows (so it also materializes DV deletions). Returns 0 (not row-affecting).
     /// Compaction re-assigns row-tracking baseRowIds (stable-id preservation across compaction needs materialized
     /// row-id columns — a separate slice); the DATA is correct.</summary>
-    public static long Optimize(nint opener, string path, CancellationToken ct)
+    public static long Optimize(nint opener, string path, CancellationToken ct, bool nativeWrite = false)
     {
         var fs = TableFileSystems.Create(opener, path);
-        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).AsTask().GetAwaiter().GetResult();
+        // native_write => DuckDB's parquet writer produces the compacted files (bloom/stats/footer), so an
+        // OPTIMIZE keeps the native-write quality instead of reverting to the engineered-wood codec.
+        var writer = nativeWrite && NativeParquetDataFileWriter.Available
+            ? new NativeParquetDataFileWriter(path)
+            : null;
+        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(dataFileWriter: writer), ct)
+            .AsTask().GetAwaiter().GetResult();
         try
         {
             var v = table.CompactAsync(null, ct).AsTask().GetAwaiter().GetResult();
-            DmlLog.LogInformation("delta optimize {Path}: {Result}", path,
-                v.HasValue ? $"compacted → v{v.Value}" : "nothing to compact");
+            DmlLog.LogInformation("delta optimize {Path}: {Result} writer={Writer}", path,
+                v.HasValue ? $"compacted → v{v.Value}" : "nothing to compact",
+                writer is null ? "engineered-wood" : "native-duckdb");
             return 0;
         }
         finally
