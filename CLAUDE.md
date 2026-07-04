@@ -1724,7 +1724,13 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   Delta stats have no string-min/max truncation + only top-level primitives; DVs are inline/UUID-relative only,
   one file per delete; features only settable at create (matches our design). Both cheap defensive fixes are
   DEFERRED until a concrete reader complains. Full list: [docs/delta-catalog.md](docs/delta-catalog.md)
-  §"engineered-wood interop caveats".
+  §"engineered-wood interop caveats". **The structural fix for all of these = the native-write inversion**
+  (DuckDB's parquet writer for data files + engineered-wood only for the `_delta_log` metadata) — **design +
+  phasing (incl. rowid/row-commit-version materialization for DML + CDF + a future DuckLake→Delta bridge):
+  [docs/native-delta-write.md](docs/native-delta-write.md)**. Positioning: one backend, a `native_write`
+  toggle symmetric to `native_read`, with the `delta` alias defaulting both on (hybrid = prod) vs
+  `engineeredwooddelta` (pure EW = sample/driver-test). Design sketched; P0 spike (native CTAS → stats bridge
+  → EW commit → delta-kernel/Fabric read + bloom check) in progress.
   **OCC RETRY DONE (concurrent writers):**
   engineered-wood `WriteCommitAsync` throws `DeltaConflictException` when a concurrent writer takes the target
   version; `DeltaWriter.Write`/`Create` (append/CTAS/create) catch it and retry by reopening at the new latest
