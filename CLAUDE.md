@@ -1756,10 +1756,14 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   DuckDB's native writer (same list-form seam at the UPDATE site); EW reads the affected files, applies the SET
   substitution (still C# `BuildArray` — the SQL-join substitution is deferred), and commits `remove`+`add`.
   Acid-tested (constant/string/expression updates → delta_scan matches, exact decimals).
-  `verify_delta_catalog_native_write.test` (68 — INSERT/CTAS/append + bloom signature + DELETE + UPDATE +
-  durability); default update/delete/dv/changes unregressed. **Fully-native `read_parquet` rewrite read half +
-  SQL-join UPDATE substitution (retire `BuildArray`) + CDF native change files + row tracking (P5) + delta-alias
-  default-on + live OneLake/Fabric validation all still pending.**
+  **P5-append (row tracking) works FREE on the native path (2026-07-04):** `row_tracking true` + `native_write
+  true` → EW materializes the row-id column into `physicalBatch` + assigns `baseRowId`/`defaultRowCommitVersion`
+  on the `add` before the writer, so DuckDB just emits the bytes (writer-v7 + `rowTracking`, `baseRowId` 0/5,
+  delta_scan reads it). `verify_delta_catalog_native_write.test` (87 — INSERT/CTAS/append + bloom signature +
+  DELETE + UPDATE + row_tracking + durability); default update/delete/dv/changes unregressed. **Still pending:
+  the P5 REWRITE half (materialize row_id+row_commit_version pair on copy-on-write DELETE/UPDATE) + fully-native
+  `read_parquet` rewrite read half + SQL-join UPDATE substitution (retire `BuildArray`) + CDF native change
+  files + delta-alias default-on + live OneLake/Fabric validation.**
   **OCC RETRY DONE (concurrent writers):**
   engineered-wood `WriteCommitAsync` throws `DeltaConflictException` when a concurrent writer takes the target
   version; `DeltaWriter.Write`/`Create` (append/CTAS/create) catch it and retry by reopening at the new latest

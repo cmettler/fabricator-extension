@@ -287,10 +287,15 @@ The whole point is standard-readability, which EW's writer kept failing. Every p
   33 assertions in `verify_delta_catalog_native_write.test` (now 68); default-path update/delete/dv/changes
   unregressed. **Still deferred: SQL-join substitution (retire `BuildArray`), CDF pre/post-image native change
   files, and the fully-native `read_parquet` rewrite read half.**
-- **P5 — row tracking**: `baseRowId` + `defaultRowCommitVersion` on the `add` from RETURN_STATS/commit
-  version on append (§6.1, metadata only); DV-mode preservation (free); materialize the
-  `_metadata.row_id`+`_metadata.row_commit_version` pair on rewrite (§6.2) or documented deferral. (Also
-  unblocks per-row `snapshot_id`.)
+- **P5 — row tracking**: **the APPEND half already works FREE on the native path (verified 2026-07-04).**
+  With `row_tracking true` + `native_write true`, engineered-wood materializes the row-id column into
+  `physicalBatch` and assigns `baseRowId`/`defaultRowCommitVersion` on the `add` BEFORE the writer is called, so
+  DuckDB's writer simply emits the bytes: commit-0 declares writer-v7 + `rowTracking` + `delta.enableRowTracking`,
+  the two write commits get `baseRowId:0` (CTAS, 5 rows) / `baseRowId:5` (append), and the official `delta_scan`
+  (delta-kernel-rs) reads it. `verify_delta_catalog_native_write.test` covers it (87 assertions). **Still open:**
+  the *rewrite* half (§6.2) — materialize the `_metadata.row_id`+`_metadata.row_commit_version` pair on
+  copy-on-write DELETE/UPDATE so survivors keep their original id/version (today the rewrite doesn't preserve
+  stable ids across UPDATE); DV-mode delete preserves them free. (Also unblocks per-row `snapshot_id`.)
 
 Each slice: build, `verify_delta_catalog_*` green, then the §9 acid test.
 

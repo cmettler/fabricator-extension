@@ -154,3 +154,40 @@ SELECT count(*) FROM lake2.main.d;
 
 statement ok
 DETACH lake2;
+
+# ---- row tracking composes with native_write (P5 append: baseRowId/defaultRowCommitVersion on the add,
+#      EW-assigned; the materialized row-id column rides in physicalBatch → DuckDB's writer emits it for free) ----
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/nwrt' AS rt (TYPE arrownet, PROVIDER 'delta', native_write true, row_tracking true);
+
+statement ok
+CREATE TABLE rt.main.t AS SELECT i AS id, 'v' || i AS name FROM range(1, 6) AS r(i);
+
+statement ok
+INSERT INTO rt.main.t VALUES (99, 'x');
+
+query I
+SELECT count(*) FROM rt.main.t;
+----
+6
+
+statement ok
+DETACH rt;
+
+# Re-attach (writer-v7 rowTracking table) re-discovers + reads back — proves the native-written row-tracking
+# table is a valid, standard Delta table (delta_scan/delta-kernel reads it; verified out-of-band).
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/nwrt' AS rt2 (TYPE arrownet, PROVIDER 'delta');
+
+query IT
+SELECT id, name FROM rt2.main.t ORDER BY id;
+----
+1	v1
+2	v2
+3	v3
+4	v4
+5	v5
+99	x
+
+statement ok
+DETACH rt2;
