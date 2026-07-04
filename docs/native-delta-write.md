@@ -226,9 +226,25 @@ The whole point is standard-readability, which EW's writer kept failing. Every p
 
 ## 10. Phasing
 
-- **P0 — spike:** native-write **one fresh table** (CTAS) via option (B), stats via RETURN_STATS→`add`, commit
-  via EW. Gate: delta-kernel + Fabric read it, bloom filters present. *Highest-value de-risk — proves the
-  writer + stats bridge + standard-readability before any DML.*
+- **P0 — spike: format-level acid test DONE (2026-07-04).** Proven with zero C#/EW code: DuckDB-written
+  parquet + a **hand-authored `_delta_log`** (protocol v1/2 + metaData + commitInfo + `add`) is read correctly
+  by the **official `delta_scan` (delta-kernel-rs — the reference reader Spark/Fabric use)** — 5/5 rows, exact
+  types + aggregation. This is the test EW's own writer repeatedly failed; **DuckDB's parquet is
+  standard-readable out of the box.** Feasibility gates all green (see below). *Remaining P0→P1 = wire it
+  through the EW `WriteCoreAsync` seam + the Arrow→COPY input path — productionization, now known-feasible.*
+  **Findings:**
+  - **Bloom** (`WRITE_BLOOM_FILTER true`): DuckDB writes bloom filters **only for dictionary-encoded columns**
+    (`FinalizeWrite`/`FlushDictionary`, `templated_column_writer.hpp:294`) — i.e. low/medium-cardinality
+    lookup/join columns, exactly where bloom helps; high-cardinality all-distinct columns are (correctly) not
+    dict-encoded → no bloom. It was encoding-gated, **not** `PARQUET_VERSION` (V2 made no difference). Pass
+    `WRITE_BLOOM_FILTER true` on the COPY.
+  - **Stats bridge is simpler than §4 assumed** for the bulk path: the streamed Arrow batches are in hand, so
+    stats come from EW's existing `StatsCollector.Collect(batches)` — **no `RETURN_STATS` needed** there.
+    `RETURN_STATS`/`parquet_metadata` is only for a pure rewrite where we don't re-hold the batches.
+  - **Gate A (EW external-file commit) is clean:** `AddFile` is a `public record`, `TransactionLog`.
+    `WriteCommitAsync(version, actions)` is public, and `WriteCoreAsync` (which already assigns `BaseRowId`,
+    stats, the `AddFile`, and commits) is the surgical injection seam — swap "EW writes the parquet" for "an
+    injected writer (DuckDB COPY) produces the file + path/size," everything else unchanged.
 - **P1 — INSERT/append + partitioning** on the native path; `native_write` option + `delta` alias default.
 - **P2 — input-binding (A)** (retire the temp-IPC double write).
 - **P3 — DELETE** (copy-on-write native rewrite + DV-mode unchanged) + CDF delete change files. Rowid decode
