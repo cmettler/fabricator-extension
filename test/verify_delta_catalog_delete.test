@@ -11,7 +11,7 @@ require mssql_net
 require-env ARROWNET_DELTA_WRITE_DIR
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogdel' AS lake (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogdel' AS lake (TYPE arrownet, PROVIDER 'delta', deletion_vectors false);
 
 statement ok
 CREATE TABLE lake.main.t (id INTEGER, name VARCHAR);
@@ -60,7 +60,7 @@ statement ok
 DETACH lake;
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogdel' AS lake2 (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogdel' AS lake2 (TYPE arrownet, PROVIDER 'delta', deletion_vectors false);
 
 query IT
 SELECT id, name FROM lake2.main.t ORDER BY id;

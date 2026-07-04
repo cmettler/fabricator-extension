@@ -1,0 +1,80 @@
+# name: test/verify_delta_catalog_dv_default.test
+# description: Deletion vectors are the DEFAULT DML mode for the Delta catalog (the modern Delta standard). A
+#              plain `PROVIDER 'delta'` DELETE marks rows in a DV (no file rewrite) — proven by the on-disk
+#              parquet file count staying at 1 after a DELETE. `deletion_vectors false` opts OUT to plain
+#              copy-on-write (max-compat, minReader 1) — which rewrites the file, leaving a second parquet on
+#              disk. Set ARROWNET_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
+# group: [mssql_net]
+
+require mssql_net
+
+require parquet
+
+require-env ARROWNET_DELTA_WRITE_DIR
+
+# ---- DEFAULT (no option) => deletion vectors: DELETE does NOT rewrite the data file ----
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/dvdef' AS lake (TYPE arrownet, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE lake.main.t AS SELECT i AS id, 'v' || i AS name FROM range(1, 7) AS r(i);
+
+# One data file after the create.
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/dvdef/t/*.parquet');
+----
+1
+
+statement ok
+DELETE FROM lake.main.t WHERE id = 2;
+
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
+----
+1	v1
+3	v3
+4	v4
+5	v5
+6	v6
+
+# STILL one data file — the DELETE wrote a deletion vector, not a rewritten file (DV is the default).
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/dvdef/t/*.parquet');
+----
+1
+
+statement ok
+DETACH lake;
+
+# ---- OPT-OUT (deletion_vectors false) => copy-on-write: DELETE rewrites the file (a 2nd parquet on disk) ----
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cowout' AS cow (TYPE arrownet, PROVIDER 'delta', deletion_vectors false);
+
+statement ok
+CREATE TABLE cow.main.t AS SELECT i AS id, 'v' || i AS name FROM range(1, 7) AS r(i);
+
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/cowout/t/*.parquet');
+----
+1
+
+statement ok
+DELETE FROM cow.main.t WHERE id = 2;
+
+query IT
+SELECT id, name FROM cow.main.t ORDER BY id;
+----
+1	v1
+3	v3
+4	v4
+5	v5
+6	v6
+
+# TWO data files — the copy-on-write DELETE rewrote the survivors into a new file (the old one lingers on disk).
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/cowout/t/*.parquet');
+----
+2
+
+statement ok
+DETACH cow;

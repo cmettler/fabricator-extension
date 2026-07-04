@@ -137,7 +137,12 @@ public sealed class DeltaCatalog : IBackendCatalog
         var (clean, credential) = FabricLakehouse.Extract(root);
         _root = Normalize(clean).TrimEnd('/');
         _fabricCredential = credential;
-        _deletionVectorsOnCreate = ParseBoolOption(optionsJson, "deletion_vectors");
+        // Deletion vectors are the DEFAULT DML mode (the modern Delta standard: DELETE marks rows in a DV bitmap
+        // instead of rewriting the whole file — cheap, and it preserves row-tracking ids/versions for free).
+        // Opt OUT with `deletion_vectors false` for the maximally-compatible plain copy-on-write table (minReader
+        // 1, no reader-v3 bump) — e.g. a consumer that can't read reader-v3 DV tables. DV enables reader-v3 +
+        // the deletionVectors + rowTracking features; validated live on Fabric (SQL-endpoint-queryable).
+        _deletionVectorsOnCreate = ParseBoolOption(optionsJson, "deletion_vectors", defaultValue: true);
         _rowTrackingOnCreate = ParseBoolOption(optionsJson, "row_tracking");
         _inCommitTimestampsOnCreate = ParseBoolOption(optionsJson, "in_commit_timestamps");
         _changeDataFeedOnCreate = ParseBoolOption(optionsJson, "change_data_feed");
@@ -168,11 +173,16 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// (<see cref="OneLake"/> is null for non-OneLake roots, so the two arms are mutually exclusive.)</summary>
     private bool SchemaLayout => OneLake()?.SchemaEnabled == true || (OneLake() is null && _schemas);
 
-    private static bool ParseBoolOption(string? optionsJson, string key)
+    private static bool ParseBoolOption(string? optionsJson, string key) =>
+        ParseBoolOption(optionsJson, key, defaultValue: false);
+
+    /// <summary>Parses a boolean ATTACH option. Returns <paramref name="defaultValue"/> when the key is ABSENT
+    /// (so a default-on option like <c>deletion_vectors</c> can be opted OUT with an explicit <c>false</c>).</summary>
+    private static bool ParseBoolOption(string? optionsJson, string key, bool defaultValue)
     {
         if (string.IsNullOrEmpty(optionsJson))
         {
-            return false;
+            return defaultValue;
         }
         try
         {
@@ -187,7 +197,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         catch (JsonException)
         {
         }
-        return false;
+        return defaultValue;
     }
 
     /// <summary>Reads a string ATTACH option (null if absent/blank/unparseable).</summary>

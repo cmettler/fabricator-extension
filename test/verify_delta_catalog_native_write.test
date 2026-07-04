@@ -15,7 +15,7 @@ require-env ARROWNET_DELTA_WRITE_DIR
 
 # ATTACH a fresh (empty) Delta catalog root with native writes on.
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/nwcatalog' AS lake (TYPE arrownet, PROVIDER 'delta', native_write true);
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/nwcatalog' AS lake (TYPE arrownet, PROVIDER 'delta', native_write true, deletion_vectors false);
 
 # CTAS — createTable => Overwrite; DuckDB writes the parquet, EW commits the add. Decimals + dates are the
 # types EW's codec historically mangled — they must round-trip exactly through DuckDB's writer.
@@ -156,7 +156,7 @@ statement ok
 DETACH lake;
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/nwcatalog' AS lake2 (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/nwcatalog' AS lake2 (TYPE arrownet, PROVIDER 'delta', deletion_vectors false);
 
 query IR
 SELECT count(*), sum(amt) FROM lake2.main.t;
@@ -260,7 +260,7 @@ DETACH dv;
 #      parquet; an UPDATE that rewrites the OLD file must backfill the new column as NULL (the rewriter probes
 #      the file's columns and emits a typed NULL for the missing one). ----
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/nwse' AS se (TYPE arrownet, PROVIDER 'delta', native_write true);
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/nwse' AS se (TYPE arrownet, PROVIDER 'delta', native_write true, deletion_vectors false);
 
 statement ok
 CREATE TABLE se.main.t AS SELECT i AS id, 'v' || i AS name FROM range(1, 6) AS r(i);
