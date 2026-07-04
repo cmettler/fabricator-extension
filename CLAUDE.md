@@ -1699,8 +1699,18 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   for free (no rewrite). `DeltaCatalog._deletionVectorsOnCreate` now defaults **true** (`ParseBoolOption` gained a
   defaulted overload distinguishing absent → default from explicit false). **Opt OUT with `deletion_vectors
   false`** for a plain copy-on-write table (`minReader 1`, no reader-v3 bump) — e.g. a consumer that can't read
-  reader-v3 DV tables. Copy-on-write stays the fallback (opt-out) + the compaction path; UPDATE remains
-  copy-on-write (on a DV table it excludes the file's DV positions). `test/verify_delta_catalog_dv_default.test`
+  reader-v3 DV tables. Copy-on-write stays the fallback (opt-out) + the compaction path. **UPDATE on a DV table
+  is MERGE-ON-READ** (engineered-wood `UpdateViaVectorsAsync`, picked internally by `UpdateByRowIdsAsync` when
+  `delta.enableDeletionVectors` + clean shape [no mapping/partitions/type-widening/CDF]): DV-delete the matched
+  OLD rows (union their positions into the file's DV — NO file rewrite) + APPEND their post-image rows as one
+  small new file, committed atomically as `remove`(old,oldDV)+`add`(same,newDV)+`add`(post-image file). Big
+  write-amplification win for a small update on a large file, and it re-ids FEWER rows than copy-on-write (which
+  re-ids every row in the rewritten file — only the appended rows get fresh ids; non-updated rows keep their
+  original id/version). Stable-id preservation across UPDATE (the appended rows keeping their ORIGINAL id) still
+  needs materialized row-id columns (a separate slice). Validated: official `delta_scan` reads the DV-original +
+  appended result + LIVE on Fabric OneLake; `test/verify_delta_catalog_dv_default.test` asserts the append is
+  small (a 2-row post-image file beside the 10-row original, not a 10-row rewrite). Non-DV (opt-out) UPDATE stays
+  copy-on-write (native rewriter under `native_write`). `test/verify_delta_catalog_dv_default.test`
   proves default ⇒ DV (on-disk parquet count stays 1 after DELETE = no rewrite) vs `deletion_vectors false` ⇒
   copy-on-write (2 files = rewrite); the CoW-intent tests (`verify_delta_catalog_delete` + the native_write CoW
   catalogs) are pinned `deletion_vectors false` to keep that coverage. **Compaction row-tracking caveat (NOT yet

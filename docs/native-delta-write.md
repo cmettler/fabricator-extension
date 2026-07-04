@@ -335,8 +335,12 @@ The whole point is standard-readability, which EW's writer kept failing. Every p
   copy-on-write DELETE/UPDATE so survivors keep their original id/version (today the rewrite doesn't preserve
   stable ids across UPDATE); DV-mode delete preserves them free. (Also unblocks per-row `snapshot_id`.)
 - **DV is now the DEFAULT DML mode (2026-07-04, commit `66e97f5`)** — see the CLAUDE.md Delta bullet. This
-  RELOCATES the row-tracking-on-rewrite gap: DV DELETE preserves ids/versions for free (no rewrite), so the only
-  rewrites left are copy-on-write UPDATE (opt-out / DV-table) and **compaction**. Compaction
+  RELOCATES the row-tracking-on-rewrite gap: DV DELETE preserves ids/versions for free (no rewrite), and
+  **UPDATE on a DV table is now MERGE-ON-READ** (DV-delete the old rows + append a small post-image file — no
+  full-file rewrite; engineered-wood `UpdateViaVectorsAsync`), so the only true rewrites left are copy-on-write
+  UPDATE (opt-out / non-DV tables) and **compaction**. Merge-on-read already re-ids fewer rows than copy-on-write
+  (only the appended rows), but stable-id preservation (appended rows keeping their ORIGINAL id) still needs the
+  materialized row-id columns — the same materialize-on-rewrite machinery as compaction. Compaction
   (`CompactionExecutor`) is **not wired into this provider** (no OPTIMIZE command — latent) AND currently would
   BREAK stable ids for a spec reader: it assigns a fresh `baseRowId` per compacted file and EW does not declare
   `delta.rowTracking.materializedRowIdColumnName`, so delta-kernel/Spark compute ids from `baseRowId + position`

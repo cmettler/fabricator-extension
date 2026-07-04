@@ -78,3 +78,43 @@ SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/cowout/t/*.parquet');
 
 statement ok
 DETACH cow;
+
+# ---- MERGE-ON-READ UPDATE (DV default): UPDATE DV-deletes the old rows and APPENDS only the post-image rows
+#      (a small file) instead of rewriting the whole file ----
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/mor' AS mor (TYPE arrownet, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE mor.main.t AS SELECT i AS id, 'v' || i AS name FROM range(1, 11) AS r(i);
+
+statement ok
+UPDATE mor.main.t SET name = 'X' WHERE id IN (3, 7);
+
+query IT
+SELECT id, name FROM mor.main.t ORDER BY id;
+----
+1	v1
+2	v2
+3	X
+4	v4
+5	v5
+6	v6
+7	X
+8	v8
+9	v9
+10	v10
+
+# The original 10-row file PERSISTS (DV marks the 2 updated rows) and a SMALL 2-row post-image file is appended
+# — merge-on-read, NOT a full-file copy-on-write rewrite (which would produce a second 10-row file).
+query I
+SELECT min(num_rows) FROM parquet_file_metadata('${ARROWNET_DELTA_WRITE_DIR}/mor/t/*.parquet');
+----
+2
+
+query I
+SELECT max(num_rows) FROM parquet_file_metadata('${ARROWNET_DELTA_WRITE_DIR}/mor/t/*.parquet');
+----
+10
+
+statement ok
+DETACH mor;
