@@ -1713,17 +1713,29 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   copy-on-write (native rewriter under `native_write`). `test/verify_delta_catalog_dv_default.test`
   proves default ⇒ DV (on-disk parquet count stays 1 after DELETE = no rewrite) vs `deletion_vectors false` ⇒
   copy-on-write (2 files = rewrite); the CoW-intent tests (`verify_delta_catalog_delete` + the native_write CoW
-  catalogs) are pinned `deletion_vectors false` to keep that coverage. **Compaction row-tracking caveat (NOT yet
-  wired/reachable in this provider — no OPTIMIZE command; latent):** engineered-wood's `CompactionExecutor`
-  currently assigns a FRESH `baseRowId` from the high-water mark per compacted file and does NOT declare
-  `delta.rowTracking.materializedRowIdColumnName`, so a spec reader (delta-kernel/Spark) computes row ids from
-  `baseRowId + position` and a compaction would CHANGE every row's stable id (it does copy the physical
-  `__delta_row_id` column through, but readers ignore it since it's undeclared). Correct compaction under row
-  tracking requires DECLARING the materialized row-id + row-commit-version column names in metadata and
-  materializing BOTH on the rewrite (rows from several source files mix → a single `baseRowId` can't represent
-  them) — a focused engineered-wood slice needing delta-kernel round-trip validation. Under DV-default this is
-  low-urgency: **DV DELETE preserves row tracking for free** (no rewrite), so the only rewrites are copy-on-write
-  UPDATE (opt-out/DV-table) + compaction (unwired). **Activate DV explicitly** with the ATTACH option
+  catalogs) are pinned `deletion_vectors false` to keep that coverage. **OPTIMIZE + VACUUM maintenance WIRED
+  (2026-07-04).** Under DV-default, DVs + merge-on-read append small files accumulate, so bin-pack compaction
+  matters: `mssql_net_exec('<catalog>', 'OPTIMIZE <schema.table>')` (+ `VACUUM <schema.table> [RETAIN <hours>
+  HOURS] [DRY RUN]`) → `DeltaCatalog.ExecuteNonQuery` → `DeltaReader.Optimize`/`Vacuum` → engineered-wood
+  `CompactAsync`/`VacuumAsync` (mirrors the delta-rs provider's maintenance dialect). **`CompactionExecutor` fixed
+  to be DV-AWARE** — it now EXCLUDES each candidate file's deletion-vector-deleted rows (else compaction would
+  RESURRECT them — a data bug, since DV is the default) + strips the internal `__delta_row_id` + carries each
+  removed file's DV on the `remove`. **The exec path now threads the host-FS opener** (`mssql_net_extension.cpp`
+  `MssqlNetExecFunction` calls `SetActiveOpener` before `ExecuteDml`; C++-only, no ABI) — without it a
+  fresh-connection OPTIMIZE segfaulted (the Delta provider's `_delta_log` listing needs the opener; SQL Server /
+  delta-rs ignore it). Validated: `test/verify_delta_catalog_optimize.test` (30 — 4 small files + DV-delete →
+  OPTIMIZE consolidates, deleted rows NOT resurrected, VACUUM cleans, durability) + delta_scan + LIVE Fabric
+  OneLake (`compacted → v6`, data {1,3} correct). **Row-tracking-on-rewrite caveat (compaction + merge-on-read
+  UPDATE):** the compacted/appended files get a FRESH `baseRowId`, and EW does NOT declare
+  `delta.rowTracking.materializedRowIdColumnName`, so a spec reader (delta-kernel/Spark) computes ids from
+  `baseRowId + position` → a rewrite CHANGES the stable id of the rewritten rows (compaction: all rows;
+  merge-on-read UPDATE: only the updated rows — non-updated keep their id). The DATA is correct (delta_scan +
+  Fabric validated); only external stable-row-tracking is imperfect across a rewrite. Correct preservation
+  requires DECLARING the materialized row-id + row-commit-version columns + materializing BOTH on the rewrite (rows
+  from several source files mix → a single `baseRowId` can't represent them) — a focused engineered-wood slice
+  needing Spark/delta-kernel row-id round-trip validation (+ Fabric-conversion risk from a new feature
+  declaration), deferred. Under DV-default it's low-urgency: **DV DELETE preserves row tracking for free** (no
+  rewrite). **Activate DV explicitly** with the ATTACH option
   `deletion_vectors true` (now also the default) → tables CREATED in that catalog enable the `deletionVectors` +
   `rowTracking` features (`DeltaWriter.DeletionVectorConfig`; `CreateAsync` declares reader-v3 + the features).
   DELETE follows the TABLE's `delta.enableDeletionVectors` config (`DeltaReader.IsDeletionVectorsEnabled`):

@@ -340,7 +340,15 @@ The whole point is standard-readability, which EW's writer kept failing. Every p
   full-file rewrite; engineered-wood `UpdateViaVectorsAsync`), so the only true rewrites left are copy-on-write
   UPDATE (opt-out / non-DV tables) and **compaction**. Merge-on-read already re-ids fewer rows than copy-on-write
   (only the appended rows), but stable-id preservation (appended rows keeping their ORIGINAL id) still needs the
-  materialized row-id columns — the same materialize-on-rewrite machinery as compaction. Compaction
+  materialized row-id columns — the same materialize-on-rewrite machinery as compaction.
+- **OPTIMIZE + VACUUM WIRED + compaction made DV-aware (2026-07-04).** `mssql_net_exec('<catalog>',
+  'OPTIMIZE <schema.table>' | 'VACUUM <schema.table> [RETAIN <h> HOURS] [DRY RUN]')` → `DeltaCatalog.ExecuteNonQuery`
+  → engineered-wood `CompactAsync`/`VacuumAsync`. `CompactionExecutor` was fixed to EXCLUDE each candidate's
+  deletion-vector-deleted rows (else compaction resurrects them — a data bug under DV-default) + strip
+  `__delta_row_id` + carry the removed files' DVs. The exec path now threads the host-FS opener
+  (`SetActiveOpener` in `MssqlNetExecFunction`; a fresh-connection OPTIMIZE segfaulted without it). Compaction
+  still assigns fresh baseRowIds (the stable-id caveat above); DATA is correct (delta_scan + live Fabric).
+  `test/verify_delta_catalog_optimize.test`. Compaction
   (`CompactionExecutor`) is **not wired into this provider** (no OPTIMIZE command — latent) AND currently would
   BREAK stable ids for a spec reader: it assigns a fresh `baseRowId` per compacted file and EW does not declare
   `delta.rowTracking.materializedRowIdColumnName`, so delta-kernel/Spark compute ids from `baseRowId + position`

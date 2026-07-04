@@ -1,0 +1,94 @@
+# name: test/verify_delta_catalog_optimize.test
+# description: Delta catalog maintenance — OPTIMIZE (bin-pack compaction) + VACUUM via
+#              mssql_net_exec('<catalog>', 'OPTIMIZE|VACUUM <schema.table> …'). Under DV-default, deletion
+#              vectors + merge-on-read append small files accumulate, so OPTIMIZE consolidates them. CRITICAL:
+#              compaction must EXCLUDE deletion-vector-deleted rows (not resurrect them). Set
+#              ARROWNET_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
+# group: [mssql_net]
+
+require mssql_net
+
+require parquet
+
+require-env ARROWNET_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/optcat' AS lake (TYPE arrownet, PROVIDER 'delta');
+
+# Several small files (one per INSERT) — compaction candidates.
+statement ok
+CREATE TABLE lake.main.t AS SELECT 1 AS id, 'a' AS v;
+
+statement ok
+INSERT INTO lake.main.t VALUES (2, 'b');
+
+statement ok
+INSERT INTO lake.main.t VALUES (3, 'c');
+
+statement ok
+INSERT INTO lake.main.t VALUES (4, 'd');
+
+# DV-delete two rows (deletion vectors are the default) — no file rewrite.
+statement ok
+DELETE FROM lake.main.t WHERE id IN (2, 4);
+
+query IT
+SELECT id, v FROM lake.main.t ORDER BY id;
+----
+1	a
+3	c
+
+# Four small data files before compaction.
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/optcat/t/*.parquet');
+----
+4
+
+# OPTIMIZE: bin-pack the small files, EXCLUDING the DV-deleted rows. Returns 0 (not row-affecting).
+query I
+SELECT mssql_net_exec('lake', 'OPTIMIZE main.t');
+----
+0
+
+# The DV-deleted rows must NOT be resurrected by compaction — still exactly {1,3}.
+query IT
+SELECT id, v FROM lake.main.t ORDER BY id;
+----
+1	a
+3	c
+
+# Compaction added a consolidated file (the old small files linger on disk until VACUUM).
+query I
+SELECT count(*) > 4 FROM glob('${ARROWNET_DELTA_WRITE_DIR}/optcat/t/*.parquet');
+----
+true
+
+# VACUUM DRY RUN reports without deleting (RETAIN 0 HOURS so the just-superseded files are eligible).
+statement ok
+SELECT mssql_net_exec('lake', 'VACUUM main.t RETAIN 0 HOURS DRY RUN');
+
+# Real VACUUM removes the unreferenced small files; the data is unchanged.
+statement ok
+SELECT mssql_net_exec('lake', 'VACUUM main.t RETAIN 0 HOURS');
+
+query IT
+SELECT id, v FROM lake.main.t ORDER BY id;
+----
+1	a
+3	c
+
+# Durability: detach + re-attach reads the compacted (+ vacuumed) table correctly.
+statement ok
+DETACH lake;
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/optcat' AS lake2 (TYPE arrownet, PROVIDER 'delta');
+
+query IT
+SELECT id, v FROM lake2.main.t ORDER BY id;
+----
+1	a
+3	c
+
+statement ok
+DETACH lake2;

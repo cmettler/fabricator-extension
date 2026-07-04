@@ -405,6 +405,9 @@ static void MssqlNetExecFunction(DataChunk &args, ExpressionState &state, Vector
 			// connection). See docs/dbt-hooks.md. handle is unused by set_active_txn (the ambient is per-thread).
 			arrownet::SetActiveTxn(handle, (int64_t)MetaTransaction::Get(context).global_transaction_id,
 			                       /*join_only=*/true);
+			// Host-FS opener for a raw exec against a host-FS provider (the Delta catalog's OPTIMIZE/VACUUM read +
+			// write the _delta_log/data through DuckDB's FileSystem). No-op for SQL Server / delta-rs (they ignore it).
+			arrownet::SetActiveOpener(reinterpret_cast<ArrowNetHandle>(&context));
 			result_data[i] = arrownet::ExecuteDml(handle, StringValue::Get(sql_value), &schema_may_change);
 		} catch (...) {
 			if (owns) {

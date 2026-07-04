@@ -846,7 +846,63 @@ public sealed class DeltaCatalog : IBackendCatalog
     }
 
     public IArrowArrayStream ExecuteQuery(string sql) => throw Unsupported("raw query");
-    public long ExecuteNonQuery(string sql) => throw Unsupported("exec");
+
+    // Maintenance command dialect, invoked via mssql_net_exec('<catalog>', '<cmd>'):
+    //   OPTIMIZE <table>                      -- bin-pack small files (excludes DV-deleted rows)
+    //   VACUUM   <table> [RETAIN <hours> HOURS] [DRY RUN]
+    // <table> is '<schema>.<table>' (schema defaults to 'main'; qualify on a schema-enabled lakehouse). Returns
+    // the affected count (VACUUM = files deleted; OPTIMIZE = 0). Important under DV-default: DVs + merge-on-read
+    // append small files accumulate, so OPTIMIZE consolidates them (and materializes DV deletions).
+    public long ExecuteNonQuery(string sql)
+    {
+        var text = (sql ?? string.Empty).Trim();
+        var tokens = text.Split(new[] { ' ', '\t', '\r', '\n' }, System.StringSplitOptions.RemoveEmptyEntries);
+        if (tokens.Length < 2)
+        {
+            throw Unsupported($"exec '{text}' — expected OPTIMIZE|VACUUM <table> …");
+        }
+        var opener = Opener();
+        int dot = tokens[1].IndexOf('.');
+        var (schema, table) = dot >= 0
+            ? (tokens[1].Substring(0, dot), tokens[1].Substring(dot + 1))
+            : ("main", tokens[1]);
+        var path = TablePath(schema, table);
+        switch (tokens[0].ToUpperInvariant())
+        {
+            case "OPTIMIZE":
+                _log.LogInformation("delta exec OPTIMIZE {Schema}.{Table}", schema, table);
+                return DeltaReader.Optimize(opener, path, default);
+            case "VACUUM":
+            {
+                bool dryRun = HasToken(tokens, "DRY");
+                double? retentionHours = null;
+                int r = TokenIndex(tokens, "RETAIN");
+                if (r >= 0 && r + 1 < tokens.Length && double.TryParse(tokens[r + 1],
+                        System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var h))
+                {
+                    retentionHours = h;
+                }
+                _log.LogInformation("delta exec VACUUM {Schema}.{Table} dry_run={Dry}", schema, table, dryRun);
+                return DeltaReader.Vacuum(opener, path, dryRun, retentionHours, default);
+            }
+            default:
+                throw Unsupported($"exec verb '{tokens[0]}' — supported: OPTIMIZE, VACUUM");
+        }
+    }
+
+    private static bool HasToken(string[] tokens, string token) => TokenIndex(tokens, token) >= 0;
+
+    private static int TokenIndex(string[] tokens, string token)
+    {
+        for (int i = 0; i < tokens.Length; i++)
+        {
+            if (string.Equals(tokens[i], token, System.StringComparison.OrdinalIgnoreCase))
+            {
+                return i;
+            }
+        }
+        return -1;
+    }
 
     /// <summary>UPDATE = rowid-based copy-on-write: <paramref name="data"/> carries the new SET-column values
     /// (columns 0..<paramref name="setColumnCount"/>-1, named by the target column) + the transient

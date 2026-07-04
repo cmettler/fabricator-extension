@@ -652,6 +652,48 @@ internal static class DeltaReader
         }
     }
 
+    /// <summary>Maintenance: bin-pack COMPACTION (OPTIMIZE) — consolidates small files into larger ones,
+    /// EXCLUDING deletion-vector-deleted rows (so it also materializes DV deletions). Returns 0 (not row-affecting).
+    /// Compaction re-assigns row-tracking baseRowIds (stable-id preservation across compaction needs materialized
+    /// row-id columns — a separate slice); the DATA is correct.</summary>
+    public static long Optimize(nint opener, string path, CancellationToken ct)
+    {
+        var fs = TableFileSystems.Create(opener, path);
+        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).AsTask().GetAwaiter().GetResult();
+        try
+        {
+            var v = table.CompactAsync(null, ct).AsTask().GetAwaiter().GetResult();
+            DmlLog.LogInformation("delta optimize {Path}: {Result}", path,
+                v.HasValue ? $"compacted → v{v.Value}" : "nothing to compact");
+            return 0;
+        }
+        finally
+        {
+            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+    }
+
+    /// <summary>Maintenance: VACUUM — deletes data files no longer referenced by the log and older than the
+    /// retention period (default the table's <c>VacuumRetention</c>). <paramref name="dryRun"/> lists without
+    /// deleting. Returns the number of files deleted (0 on a dry run).</summary>
+    public static long Vacuum(nint opener, string path, bool dryRun, double? retentionHours, CancellationToken ct)
+    {
+        var fs = TableFileSystems.Create(opener, path);
+        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).AsTask().GetAwaiter().GetResult();
+        try
+        {
+            System.TimeSpan? retention = retentionHours is { } h ? System.TimeSpan.FromHours(h) : null;
+            var r = table.VacuumAsync(retention, dryRun, ct).AsTask().GetAwaiter().GetResult();
+            DmlLog.LogInformation("delta vacuum {Path}: files_deleted={Files} dry_run={Dry}",
+                path, r.FilesDeleted, dryRun);
+            return r.FilesDeleted;
+        }
+        finally
+        {
+            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+    }
+
     /// <summary>Per-file copy-on-write UPDATE: only files containing a target <paramref name="rowIds"/> are
     /// rewritten. <paramref name="rewriteFile"/> (ordinal, the file's batches) returns the same rows with the SET
     /// columns modified on matched positions (the caller owns the typed substitution); engineered-wood re-writes
