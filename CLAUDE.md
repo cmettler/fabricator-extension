@@ -1732,17 +1732,26 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   fresh-connection OPTIMIZE segfaulted (the Delta provider's `_delta_log` listing needs the opener; SQL Server /
   delta-rs ignore it). Validated: `test/verify_delta_catalog_optimize.test` (30 — 4 small files + DV-delete →
   OPTIMIZE consolidates, deleted rows NOT resurrected, VACUUM cleans, durability) + delta_scan + LIVE Fabric
-  OneLake (`compacted → v6`, data {1,3} correct). **Row-tracking-on-rewrite caveat (compaction + merge-on-read
-  UPDATE):** the compacted/appended files get a FRESH `baseRowId`, and EW does NOT declare
-  `delta.rowTracking.materializedRowIdColumnName`, so a spec reader (delta-kernel/Spark) computes ids from
-  `baseRowId + position` → a rewrite CHANGES the stable id of the rewritten rows (compaction: all rows;
-  merge-on-read UPDATE: only the updated rows — non-updated keep their id). The DATA is correct (delta_scan +
-  Fabric validated); only external stable-row-tracking is imperfect across a rewrite. Correct preservation
-  requires DECLARING the materialized row-id + row-commit-version columns + materializing BOTH on the rewrite (rows
-  from several source files mix → a single `baseRowId` can't represent them) — a focused engineered-wood slice
-  needing Spark row-id round-trip validation (delta-kernel via DuckDB `delta_scan` + delta-rs via delta-dotnet
-  both HIDE Delta row ids — probed, neither exposes them). **A VALIDATOR WAS FOUND + THE UPDATE-PATH
-  MATERIALIZATION BUILT + VALIDATED (2026-07-04)** — see "Materialized row tracking (`materialize_row_tracking`)"
+  OneLake (`compacted → v6`, data {1,3} correct). **Row-tracking-on-rewrite (compaction + merge-on-read UPDATE)
+  — NOW PRESERVED under `materialize_row_tracking true` (2026-07-04, Fabric-Spark-validated).** By default the
+  compacted/appended files get a FRESH `baseRowId` and EW does NOT declare the materialized row-tracking columns,
+  so a spec reader (delta-kernel/Spark) computes ids from `baseRowId + position` → a rewrite CHANGES the stable id
+  of the rewritten rows (the DATA is always correct — delta_scan + Fabric validated — only external
+  stable-row-tracking drifts). With **`materialize_row_tracking true`** both the UPDATE-append AND **compaction**
+  now materialize the ORIGINAL ids: the UPDATE case needs only `__delta_row_id` (appended rows share the new
+  commit version = the file's `defaultRowCommitVersion`), but **compaction mixes rows from several source files**,
+  so `CompactionExecutor` materializes BOTH `__delta_row_id` (source `baseRowId + position`, or the source's own
+  materialized id when present) AND `__delta_row_commit_version` (the source file's `defaultRowCommitVersion`) —
+  a single `baseRowId`/`defaultRowCommitVersion` on the compacted `add` can't represent them (new
+  `RowTrackingWriter.AddRowIdAndCommitVersionColumns` + the compaction read loop tracking survivor id/version
+  arrays aligned with the DV filter's keep order). **Validated live on Fabric Spark (2026-07-04):** after
+  CTAS+2×INSERT (3 files) → OPTIMIZE+VACUUM, Spark reads `_metadata.row_id` = 0,1,2 (PRESERVED write-order ids,
+  NOT the fresh `base_row_id`=3 range) and `_metadata.row_commit_version` = 1,2,3 (per-row original versions,
+  overriding the single `default_row_commit_version`=1). Local write-shape test
+  `test/verify_delta_catalog_compaction_rowtracking.test` (24 — compacted parquet carries original ids + 3
+  distinct versions + durability); default (non-materialize) compaction path unchanged
+  (`verify_delta_catalog_optimize` green). **Fabric Spark row-id validator:** the preview **Microsoft ADO.NET
+  Driver for Fabric Data Engineering**
   below. **Fabric Spark row-id validator:** the preview **Microsoft ADO.NET Driver for Fabric Data Engineering**
   (`Microsoft.Spark.Livy.AdoNet`, download-center zip) — its own session-create POST 404s, but the underlying
   **Fabric Livy REST API** works with the `fabric_sp` SP (`ClientSecretCredential`, `livyApi` version
@@ -1801,10 +1810,17 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   bumped) — matching Spark's own writer's reference behavior; untouched rows keep ids 0,2. Local write-shape test
   `verify_delta_catalog_materialize_rowtracking.test` (the appended row carries `__delta_row_id=1`); the row-id
   READBACK is Spark-only (see the validator below). **Default OFF** (no new feature declaration on the DV-default
-  path → no Fabric-conversion risk to the validated path). **Still pending: compaction materialization** (rows
-  from several files mix → needs materializing BOTH `__delta_row_id` AND `__delta_row_commit_version` with each
-  row's original id+version; the UPDATE case didn't need the version column since the appended rows share the new
-  commit version = the file's `defaultRowCommitVersion`).
+  path → no Fabric-conversion risk to the validated path). **Compaction materialization — DONE + Fabric-Spark-
+  validated (2026-07-04).** Because compaction mixes rows from several source files into one file, `CompactionExecutor`
+  materializes BOTH `__delta_row_id` (each source's `baseRowId + position`, or the source's own materialized id when
+  present) AND `__delta_row_commit_version` (each source's `defaultRowCommitVersion`) — a single
+  `baseRowId`/`defaultRowCommitVersion` on the compacted `add` can't represent them (new
+  `RowTrackingWriter.AddRowIdAndCommitVersionColumns`; the compaction read loop builds survivor id/version arrays
+  in the DV filter's keep order so they stay aligned). Validated live: CTAS+2×INSERT (3 files) → OPTIMIZE+VACUUM,
+  Spark reads `_metadata.row_id` = 0,1,2 (preserved, not the fresh `base_row_id`=3 range) and
+  `_metadata.row_commit_version` = 1,2,3 (per-row originals, overriding the single `default_row_commit_version`=1).
+  `test/verify_delta_catalog_compaction_rowtracking.test` (24); default compaction path (`verify_delta_catalog_optimize`)
+  unchanged.
   **engineered-wood WRITE interop caveats (reviewed 2026-07-02; from its `doc/known-issues.md`):** engineered-wood
   is a from-scratch C# Parquet/Delta stack, so the write path diverges from Spark/parquet-mr in a few subtle ways —
   none a show-stopper (Fabric/DuckDB/arrow-rs read our output, validated live), but the two "Spark-ecosystem
