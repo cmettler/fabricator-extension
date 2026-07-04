@@ -122,6 +122,10 @@ public sealed class DeltaCatalog : IBackendCatalog
     // falls back to the C# reader (the native path has no DeleteFilter / rowid / snapshot logic — those are
     // follow-ups). Purely a byte-source switch inside ScanTable — no C++/ABI change.
     private readonly bool _nativeRead;
+    // ATTACH option `native_write true` (docs/native-delta-write.md): INSERT/CTAS/append data files are produced
+    // by DuckDB's native parquet writer (COPY … TO … FORMAT parquet) instead of engineered-wood's codec; the
+    // _delta_log commit stays in engineered-wood. Opt-in (default off); DELETE/UPDATE rewrites are a later slice.
+    private readonly bool _nativeWrite;
 
     private static readonly Microsoft.Extensions.Logging.ILogger _log = ArrowNetLog.CreateLogger("ArrowNet.Delta");
 
@@ -142,6 +146,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         _defaultBloomColumns = ParseListOption(optionsJson, "bloom_filter_columns");
         _mergeSchemaOnWrite = ParseBoolOption(optionsJson, "merge_schema");
         _nativeRead = ParseBoolOption(optionsJson, "native_read");
+        _nativeWrite = ParseBoolOption(optionsJson, "native_write");
     }
 
     /// <summary>Returns the host-FS opener for this thread and, in the same breath, publishes this catalog's
@@ -720,7 +725,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                           inCommitTimestamps: _inCommitTimestampsOnCreate,
                           changeDataFeed: _changeDataFeedOnCreate,
                           rowTracking: _rowTrackingOnCreate,
-                          spec: spec);
+                          spec: spec, nativeWrite: _nativeWrite);
         return rows;
     }
 

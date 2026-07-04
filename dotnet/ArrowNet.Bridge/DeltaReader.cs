@@ -209,7 +209,7 @@ internal static class DeltaReader
 
     // The table root as a URI DuckDB's native reader can open: an abfss-OneLake root → onelake:// (our VFS
     // subsystem, cached); everything else (local / s3 / already onelake://) passes through unchanged.
-    private static string ToReadableRoot(string path)
+    internal static string ToReadableRoot(string path)
     {
         var p = path.Replace('\\', '/').TrimEnd('/');
         if (p.StartsWith("abfss://", StringComparison.OrdinalIgnoreCase)

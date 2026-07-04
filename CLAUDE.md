@@ -1729,8 +1729,25 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   phasing (incl. rowid/row-commit-version materialization for DML + CDF + a future DuckLake→Delta bridge):
   [docs/native-delta-write.md](docs/native-delta-write.md)**. Positioning: one backend, a `native_write`
   toggle symmetric to `native_read`, with the `delta` alias defaulting both on (hybrid = prod) vs
-  `engineeredwooddelta` (pure EW = sample/driver-test). Design sketched; P0 spike (native CTAS → stats bridge
-  → EW commit → delta-kernel/Fabric read + bloom check) in progress.
+  `engineeredwooddelta` (pure EW = sample/driver-test). **P0 spike + P1 (INSERT/CTAS/append) DONE (2026-07-04,
+  C#-only + one EW seam, NO ABI/C++).** The **`native_write true`** ATTACH option routes INSERT/CTAS/append data
+  files through DuckDB's OWN native parquet writer; the `_delta_log` commit stays engineered-wood. **The EW
+  seam** = `DeltaTableOptions.DataFileWriter` (new `IDataFileWriter`): `WriteCoreAsync` delegates each partition
+  file's parquet bytes to it instead of the built-in `ParquetFileWriter` — partition split / row tracking /
+  column mapping / stats / the `add` / commit / OCC unchanged (override null by default → default path
+  byte-identical). ArrowNet's `NativeParquetDataFileWriter` binds the streamed batch via the existing
+  `Host.Query(sql, inputs)` (host-query v42–v45 — so **gate A input-binding worked directly; the temp-IPC gate B
+  was never needed**) and runs `COPY (SELECT * FROM <batch>) TO '<root>/<file>' (FORMAT parquet,
+  WRITE_BLOOM_FILTER true, RETURN_STATS)`, reading back `file_size_bytes` for `add.Size` (stats stay EW's
+  `StatsCollector.Collect(batches)` — batches in hand). URIs reuse `DeltaReader.ToReadableRoot` (onelake://
+  rewrite). **§9 acid test PASSED (local):** the official `delta_scan` (delta-kernel-rs) reads it (6 rows, exact
+  `DECIMAL(10,2)`+`DATE` — the types EW's codec mangled), and **bloom filters flow through** on dict-encoded
+  columns (`grp` 5-distinct → `has_bloom=true`; `id` all-distinct → none) = the maturity win AND a deterministic
+  native-write signature (EW default writes no bloom). `test/verify_delta_catalog_native_write.test` (36); default
+  path unregressed (write/decimal/temporal/partition/overwrite_merge/update/delete green). **Opt-in only (default
+  off);** the `delta`-alias default-on is deferred (needs the resolved provider name threaded to the
+  `DeltaCatalog` ctor — a separate policy step). DELETE/UPDATE rewrites still use EW's codec (P3/P4); live
+  OneLake/Fabric validation of the native-write path pending.
   **OCC RETRY DONE (concurrent writers):**
   engineered-wood `WriteCommitAsync` throws `DeltaConflictException` when a concurrent writer takes the target
   version; `DeltaWriter.Write`/`Create` (append/CTAS/create) catch it and retry by reopening at the new latest

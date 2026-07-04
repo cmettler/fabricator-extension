@@ -342,7 +342,8 @@ internal static class DeltaWriter
     /// (delta-kernel / Spark / Fabric) reject the footer with <c>TProtocolException: Invalid data</c>.
     /// <paramref name="spec"/> (null =&gt; defaults) carries the resolved per-write tuning (compression /
     /// row-group size / bloom-filter columns) from the ATTACH options + the <c>delta_write_options</c> setting.</summary>
-    internal static DeltaTableOptions Options(DeltaWriteSpec? spec = null) => DeltaTableOptions.Default with
+    internal static DeltaTableOptions Options(DeltaWriteSpec? spec = null,
+                                              IDataFileWriter? dataFileWriter = null) => DeltaTableOptions.Default with
     {
         ParquetWriteOptions = new ParquetWriteOptions
         {
@@ -353,6 +354,8 @@ internal static class DeltaWriter
                 ? new HashSet<string>(bloom, System.StringComparer.Ordinal)
                 : null,
         },
+        // native_write: DuckDB's parquet writer produces the data files; engineered-wood keeps the _delta_log.
+        DataFileWriter = dataFileWriter,
     };
 
     // Catalog tables are written as PLAIN Delta — NO table features (no row tracking, no deletion vectors).
@@ -412,12 +415,18 @@ internal static class DeltaWriter
     public static long Write(nint opener, string path, Schema schema, IReadOnlyList<RecordBatch> batches,
                              DeltaWriteMode mode, CancellationToken ct, bool deletionVectors = false,
                              bool inCommitTimestamps = false, bool changeDataFeed = false,
-                             bool rowTracking = false, DeltaWriteSpec? spec = null)
+                             bool rowTracking = false, DeltaWriteSpec? spec = null, bool nativeWrite = false)
     {
+        // native_write: DuckDB's parquet writer produces the data-file bytes (via COPY on a fresh host
+        // connection); engineered-wood keeps the _delta_log commit. Falls back to EW's codec if host_query is
+        // unavailable. Only the data write is affected — partitioning/stats/row-tracking/commit are unchanged.
+        var dataFileWriter = nativeWrite && NativeParquetDataFileWriter.Available
+            ? new NativeParquetDataFileWriter(path)
+            : null;
         for (int attempt = 1; ; attempt++)
         {
             var fs = TableFileSystems.Create(opener, path);
-            var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(spec),
+            var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(spec, dataFileWriter),
                                                      partitionColumns: spec?.PartitionColumns,
                                                      configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed),
                                                      cancellationToken: ct).AsTask().GetAwaiter().GetResult();

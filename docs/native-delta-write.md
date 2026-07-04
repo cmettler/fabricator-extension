@@ -1,6 +1,7 @@
 # Native Delta write — DuckDB parquet writer + engineered-wood metadata
 
-> **Status: design sketch (nothing built).** Completes the "inversion" begun by the native *read* path
+> **Status: P0 spike + P1 (INSERT/CTAS/append) DONE (2026-07-04); DELETE/UPDATE (P3/P4) + alias-default + live
+> OneLake still open — see §10.** Completes the "inversion" begun by the native *read* path
 > (`docs/multifile-delta.md` §"Native-read fold"): C# is a pure Delta-**metadata** provider, and DuckDB's
 > native parquet reader **and writer** do all data-file I/O. engineered-wood's weakest surface (its parquet
 > reader/writer — source of every decimal/DV-format/DataPage-V2/signed-min-max/`path_in_schema` bug we fixed)
@@ -245,8 +246,27 @@ The whole point is standard-readability, which EW's writer kept failing. Every p
     `WriteCommitAsync(version, actions)` is public, and `WriteCoreAsync` (which already assigns `BaseRowId`,
     stats, the `AddFile`, and commits) is the surgical injection seam — swap "EW writes the parquet" for "an
     injected writer (DuckDB COPY) produces the file + path/size," everything else unchanged.
-- **P1 — INSERT/append + partitioning** on the native path; `native_write` option + `delta` alias default.
-- **P2 — input-binding (A)** (retire the temp-IPC double write).
+- **P1 — INSERT/CTAS/append DONE (2026-07-04, C#-only + one EW seam, no ABI/C++).** The `native_write true`
+  ATTACH option routes INSERT/CTAS/append through DuckDB's native parquet writer; the `_delta_log` commit stays
+  in engineered-wood. **Input binding used gate (A) directly** — the existing `Host.Query(sql, inputs)`
+  (host-query v42–v45) binds the streamed Arrow batch as a connection-scoped view, so the temp-IPC gate (B) was
+  skipped entirely. **The EW seam** = `DeltaTableOptions.DataFileWriter` (a new `IDataFileWriter` interface):
+  when set, `WriteCoreAsync` delegates each partition file's parquet bytes to it instead of the built-in
+  `ParquetFileWriter` — everything else (partition split, row tracking, column mapping, stats, the `add` action,
+  the commit, OCC retry) is unchanged (the override is null by default → the default path is byte-identical).
+  ArrowNet's `NativeParquetDataFileWriter` runs `COPY (SELECT * FROM <bound batch>) TO '<root>/<file>' (FORMAT
+  parquet, WRITE_BLOOM_FILTER true, RETURN_STATS)` on a fresh host connection and reads back `file_size_bytes`
+  for `add.Size`; stats come from EW's own `StatsCollector.Collect(batches)` (batches in hand — no RETURN_STATS
+  dependency for stats, per the P0 finding). URIs reuse `DeltaReader.ToReadableRoot` (onelake:// rewrite). **§9
+  acid test PASSED locally:** the official `delta_scan` (delta-kernel-rs) reads the native-written table (6 rows,
+  exact `DECIMAL(10,2)` + `DATE`), and bloom filters flow through on dict-encoded columns (`grp` 5-distinct →
+  `has_bloom=true`; `id` all-distinct → none — the concrete maturity win, and a deterministic native-write
+  signature since EW's default writes no bloom). `test/verify_delta_catalog_native_write.test` (36); the default
+  (EW-codec) path unregressed (write/decimal/temporal/partition/overwrite_merge/update/delete all green).
+  **Opt-in only (default off); the `delta`-alias default-on is deferred** (needs the resolved provider name
+  threaded to the `DeltaCatalog` ctor — a separate, mechanism-independent policy step). DELETE/UPDATE rewrites
+  still use EW's codec (P3/P4). Live OneLake/Fabric validation of the native-write path is pending.
+- **P2 — input-binding (A) DONE as part of P1** (gate B was never needed — `Host.Query(inputs)` already exists).
 - **P3 — DELETE** (copy-on-write native rewrite + DV-mode unchanged) + CDF delete change files. Rowid decode
   invariant (§5.1) is the gate.
 - **P4 — UPDATE** (SQL-join substitution, retire `BuildArray`) + CDF pre/post images.
