@@ -27,6 +27,8 @@ namespace ArrowNet.Bridge;
 /// </summary>
 internal static class DeltaReader
 {
+    private static readonly ILogger DmlLog = ArrowNetLog.CreateLogger("ArrowNet.Delta.Write");
+
     /// <summary>The EXACT active data-file URIs of the current snapshot (the `add` set, NOT a glob — a glob would
     /// include tombstoned files). Relative `add.path`s are resolved against the table root; an abfss-OneLake root
     /// is rewritten to the <c>onelake://</c> scheme so DuckDB's native reader routes them to our FileSystem
@@ -321,7 +323,10 @@ internal static class DeltaReader
             .AsTask().GetAwaiter().GetResult();
         try
         {
-            return table.DeleteByRowIdsAsync(rowIds, ct).AsTask().GetAwaiter().GetResult().RowsDeleted;
+            long deleted = table.DeleteByRowIdsAsync(rowIds, ct).AsTask().GetAwaiter().GetResult().RowsDeleted;
+            DmlLog.LogInformation("delta delete-rewrite {Path}: deleted={Deleted} writer={Writer}",
+                path, deleted, writer is null ? "engineered-wood" : "native-duckdb");
+            return deleted;
         }
         catch (DeltaConflictException)
         {
@@ -660,6 +665,8 @@ internal static class DeltaReader
         try
         {
             table.UpdateByRowIdsAsync(rowIds, rewriteFile, ct).AsTask().GetAwaiter().GetResult();
+            DmlLog.LogInformation("delta update-rewrite {Path}: rowids={RowIds} writer={Writer}",
+                path, rowIds.Count, writer is null ? "engineered-wood" : "native-duckdb");
         }
         catch (DeltaConflictException)
         {

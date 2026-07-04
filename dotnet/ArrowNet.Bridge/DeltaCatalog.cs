@@ -6,6 +6,7 @@ using Apache.Arrow;
 using Apache.Arrow.Ipc;
 using Apache.Arrow.Types;
 using EngineeredWood.DeltaLake.Table;
+using Microsoft.Extensions.Logging;
 
 namespace ArrowNet.Bridge;
 
@@ -707,6 +708,8 @@ public sealed class DeltaCatalog : IBackendCatalog
     {
         // sortColumns (native SORTED BY) is a SQL-Server-warehouse CLUSTER BY concept; Delta doesn't cluster — ignored.
         var opener = Opener();
+        _log.LogInformation("delta bulk {Schema}.{Table}: create={Create} replace={Replace} native_write={Native}",
+            schemaName, tableName, createTable, replace, _nativeWrite);
         var (schema, batches, rows) = DeltaWriter.Materialize(data, default);
         // Partition columns take effect only at table creation; an INSERT (Append) into an existing table
         // preserves the table's declared partitioning (engineered-wood reads it from the metadata).
@@ -821,7 +824,11 @@ public sealed class DeltaCatalog : IBackendCatalog
         // copy-on-write. (Honors external DV tables regardless of this catalog's create-time flag.)
         // DV-mode delete writes no data file (just a new DV + remove/add) → native writer N/A; copy-on-write
         // rewrite honors native_write (DuckDB writes the survivor file).
-        return DeltaReader.IsDeletionVectorsEnabled(opener, path)
+        bool dvMode = DeltaReader.IsDeletionVectorsEnabled(opener, path);
+        _log.LogInformation("delta delete {Schema}.{Table}: rows={Rows} mode={Mode} native_write={Native}",
+            schemaName, tableName, ids.Count, dvMode ? "deletion-vector" : "copy-on-write",
+            !dvMode && _nativeWrite);
+        return dvMode
             ? DeltaReader.DeleteByRowIdsViaVectors(opener, path, ids, default)
             : DeltaReader.DeleteByRowIds(opener, path, ids, default, _nativeWrite);
     }
@@ -934,6 +941,8 @@ public sealed class DeltaCatalog : IBackendCatalog
             return outBatches;
         }, default, _nativeWrite);
 
+        _log.LogInformation("delta update {Schema}.{Table}: rows={Rows} set_cols={SetCols} native_write={Native}",
+            schemaName, tableName, updates.Count, setColNames.Count, _nativeWrite);
         return updates.Count; // each distinct rowid is one updated row
     }
 

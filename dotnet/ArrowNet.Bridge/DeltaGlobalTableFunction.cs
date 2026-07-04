@@ -9,6 +9,7 @@ using Apache.Arrow.Ipc;
 using Apache.Arrow.Types;
 using EngineeredWood.DeltaLake.Table;
 using EngineeredWood.Parquet;
+using Microsoft.Extensions.Logging;
 
 namespace ArrowNet.Bridge;
 
@@ -337,6 +338,23 @@ internal sealed record DeltaWriteSpec(
 /// </summary>
 internal static class DeltaWriter
 {
+    private static readonly Microsoft.Extensions.Logging.ILogger Log =
+        ArrowNetLog.CreateLogger("ArrowNet.Delta.Write");
+
+    // Compact one-line summary of the write's feature flags + tuning for the log.
+    private static string DescribeSpec(DeltaWriteSpec? spec, bool dv, bool rowTracking, bool ict, bool cdf)
+    {
+        var parts = new List<string>();
+        if (dv) { parts.Add("deletion_vectors"); }
+        if (rowTracking) { parts.Add("row_tracking"); }
+        if (ict) { parts.Add("in_commit_timestamps"); }
+        if (cdf) { parts.Add("change_data_feed"); }
+        if (spec?.PartitionColumns is { Count: > 0 } pc) { parts.Add("partition_by=" + string.Join("/", pc)); }
+        if (spec?.SchemaMode is { } sm && sm != DeltaSchemaMode.None) { parts.Add("schema_mode=" + sm); }
+        if (spec?.ReplaceWhere is { Count: > 0 }) { parts.Add("replace_where"); }
+        return parts.Count == 0 ? "plain" : string.Join(",", parts);
+    }
+
     /// <summary>Delta table options for ALL engineered-wood writes (initial write AND the copy-on-write DELETE
     /// rewrite): the parquet writer MUST emit <c>path_in_schema</c> (OmitPathInSchema=false) or standard readers
     /// (delta-kernel / Spark / Fabric) reject the footer with <c>TProtocolException: Invalid data</c>.
@@ -423,8 +441,19 @@ internal static class DeltaWriter
         var dataFileWriter = nativeWrite && NativeParquetDataFileWriter.Available
             ? new NativeParquetDataFileWriter(path)
             : null;
+        long totalRows = 0;
+        foreach (var b in batches) { totalRows += b.Length; }
+        Log.LogInformation(
+            "delta write {Path}: mode={Mode} rows={Rows} batches={Batches} writer={Writer} spec=[{Spec}]",
+            path, mode, totalRows, batches.Count, dataFileWriter is null ? "engineered-wood" : "native-duckdb",
+            DescribeSpec(spec, deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed));
         for (int attempt = 1; ; attempt++)
         {
+            if (attempt > 1)
+            {
+                Log.LogWarning("delta write {Path}: commit conflict — reopening at latest (attempt {Attempt}/{Max})",
+                    path, attempt, MaxCommitAttempts);
+            }
             var fs = TableFileSystems.Create(opener, path);
             var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(spec, dataFileWriter),
                                                      partitionColumns: spec?.PartitionColumns,
@@ -445,9 +474,11 @@ internal static class DeltaWriter
                     MergeSchema(table, schema, ct);
                 }
                 // replace_where => atomic partition-overwrite (one commit); otherwise the requested append/overwrite.
-                return spec?.ReplaceWhere is { Count: > 0 } parts
+                long version = spec?.ReplaceWhere is { Count: > 0 } parts
                     ? table.OverwritePartitionsAsync(batches, parts, ct).AsTask().GetAwaiter().GetResult()
                     : table.WriteAsync(batches, mode, ct).AsTask().GetAwaiter().GetResult();
+                Log.LogInformation("delta write {Path}: committed v{Version}", path, version);
+                return version;
             }
             catch (EngineeredWood.DeltaLake.DeltaConflictException) when (attempt < MaxCommitAttempts)
             {
@@ -492,6 +523,8 @@ internal static class DeltaWriter
                               bool deletionVectors = false, bool inCommitTimestamps = false,
                               bool changeDataFeed = false, bool rowTracking = false, DeltaWriteSpec? spec = null)
     {
+        Log.LogInformation("delta create {Path}: cols={Cols} spec=[{Spec}]", path, schema.FieldsList.Count,
+            DescribeSpec(spec, deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed));
         for (int attempt = 1; ; attempt++)
         {
             var fs = TableFileSystems.Create(opener, path);
@@ -503,6 +536,7 @@ internal static class DeltaWriter
                                                          configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed),
                                                          cancellationToken: ct).AsTask().GetAwaiter().GetResult();
                 table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                Log.LogDebug("delta create {Path}: opened/created (commit-0 if new)", path);
                 return;
             }
             catch (EngineeredWood.DeltaLake.DeltaConflictException) when (attempt < MaxCommitAttempts)
