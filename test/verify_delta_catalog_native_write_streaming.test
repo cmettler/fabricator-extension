@@ -1,0 +1,95 @@
+# name: test/verify_delta_catalog_native_write_streaming.test
+# description: native_write STREAMING bulk write (bounded memory — for RAM-limited Fabric notebooks). INSERT/CTAS/
+#              append stream straight into DuckDB's parquet COPY (the input is never fully collected in C#), then
+#              commit the single add via engineered-wood's commit-only CommitDataFilesAsync. PROOF the streaming
+#              path ran (not the collect+native path): the collect path injects a physical __delta_row_id column
+#              into the parquet for a row-tracking table, but the streaming path does NOT (row tracking rides on
+#              the commit's baseRowId; DuckDB COPY writes only the user columns). Partitioned tables fall back to
+#              the collect path (still correct). Set ARROWNET_DELTA_WRITE_DIR. Local FS.
+# group: [mssql_net]
+
+require mssql_net
+
+require parquet
+
+require-env ARROWNET_DELTA_WRITE_DIR
+
+# DV-default is on → row tracking is enabled, so the collect+native path WOULD inject __delta_row_id.
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/nwstream' AS lake (TYPE arrownet, PROVIDER 'delta', native_write true);
+
+# CTAS (Overwrite) — streams to one parquet file.
+statement ok
+CREATE TABLE lake.main.t AS SELECT i AS id, 'v' || (i % 7) AS v FROM range(1, 5001) AS r(i);
+
+query IT
+SELECT count(*), sum(id) FROM lake.main.t;
+----
+5000	12502500
+
+# STREAMING PROOF: the data file has NO physical __delta_row_id column (the collect+native path would inject it
+# for this row-tracking table). Row tracking still works via the commit's baseRowId — no physical column needed.
+query I
+SELECT count(*) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/nwstream/t/*.parquet') WHERE name = '__delta_row_id';
+----
+0
+
+# The DuckDB native-writer bloom signature is present on the dict-encoded `v` (7 distinct) — confirming DuckDB
+# (not engineered-wood) wrote the streamed parquet.
+query I
+SELECT max(CASE WHEN path_in_schema = 'v' AND bloom_filter_offset IS NOT NULL THEN 1 ELSE 0 END)
+FROM parquet_metadata('${ARROWNET_DELTA_WRITE_DIR}/nwstream/t/*.parquet');
+----
+1
+
+# Append (INSERT) also streams — still no injected row-id column, data complete.
+statement ok
+INSERT INTO lake.main.t SELECT i, 'v' || (i % 7) FROM range(5001, 8001) AS r(i);
+
+query I
+SELECT count(*) FROM lake.main.t;
+----
+8000
+
+query I
+SELECT count(*) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/nwstream/t/*.parquet') WHERE name = '__delta_row_id';
+----
+0
+
+# Durability across re-attach.
+statement ok
+DETACH lake;
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/nwstream' AS lake2 (TYPE arrownet, PROVIDER 'delta', native_write true);
+
+query I
+SELECT count(*) FROM lake2.main.t;
+----
+8000
+
+statement ok
+DETACH lake2;
+
+# ---- Partitioned native_write FALLS BACK to the collect path (single-file streaming can't partition) — still
+#      correct: data round-trips and lands in the Hive layout. ----
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/nwstreampart' AS lp (TYPE arrownet, PROVIDER 'delta', native_write true);
+
+statement ok
+CREATE TABLE lp.main.p PARTITIONED BY (region) AS
+  SELECT i AS id, ['US','EU','APAC'][(i % 3) + 1] AS region FROM range(1, 301) AS r(i);
+
+query I
+SELECT count(*) FROM lp.main.p;
+----
+300
+
+# The Hive partition layout was produced (fallback path partitions correctly).
+query I
+SELECT count(DISTINCT region) FROM lp.main.p;
+----
+3
+
+statement ok
+DETACH lp;

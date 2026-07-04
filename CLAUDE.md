@@ -1904,6 +1904,35 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   gap in BOTH paths, a deep EW row-tracking change) + CDF native change files (CDF tables keep the EW-read path
   today — needs the rewriter to also produce the deleted/pre/post-image rows + `CdfWriter` on the native writer)
   + delta-alias default-on.**
+  **STREAMING native bulk write — bounded memory (2026-07-04, C#-only + one EW seam, NO ABI/C++; live-OneLake
+  validated).** The prior native_write INSERT/CTAS/append path fully COLLECTED the dataset in C# first
+  (`DeltaWriter.Materialize` — an Arrow-IPC round-trip into a `List<RecordBatch>`) before writing — bounded by
+  RAM, a problem in a Fabric notebook. **`native_write true` now STREAMS** the bulk write: `DeltaWriter.TryWriteStreaming`
+  binds the LIVE channel stream (the same `ChannelArrowStream` the SQL Server path feeds `SqlBulkCopy`, cap 8,
+  backpressured) straight into ONE DuckDB `COPY (SELECT * FROM <stream>) TO '<root>/<uuid>.parquet' (FORMAT
+  parquet, WRITE_BLOOM_FILTER true, RETURN_STATS)` — DuckDB pulls batches incrementally + streams row-groups to
+  disk, so the whole dataset NEVER materializes in C#. `RETURN_STATS` yields the file's `count`(→numRecords) +
+  `file_size_bytes`(→add.Size); the single `add` is committed via the **new EW commit-only seam**
+  `DeltaTable.CommitDataFilesAsync(IReadOnlyList<WrittenDataFile>, mode)` — the commit half of `WriteCoreAsync`,
+  factored out: it builds the `add`(+ `remove`s for Overwrite), assigns row-tracking `baseRowId`/
+  `defaultRowCommitVersion` per file (high-water mark derived on snapshot rebuild — no domainMetadata action),
+  prepends commitInfo, and writes with OCC retry. **Row tracking rides on `baseRowId`** (no physical
+  `__delta_row_id` column — the collect+native path injects one; its ABSENCE in the streamed parquet is the test
+  signal that streaming ran). **v1 stats = numRecords only** (from `RETURN_STATS.count`, exact — correctness-safe:
+  row tracking + count(*) work; min/max deferred → files just aren't skip-optimized, a documented quality gap vs
+  the collect path's full EW `StatsCollector` stats; enrich later by translating `RETURN_STATS.column_statistics`
+  with a float/double omit policy). **Falls back to the collect path** (`Materialize` + `Write`, `data` untouched —
+  the fallback is decided BEFORE any COPY, checked via EW's new `DeltaTable.SupportsExternalDataFileCommit`
+  predicate + `Metadata.PartitionColumns`, so no orphan file) for: partitioned target (native OR existing),
+  `replace_where`, `schema_mode=merge`, or a table needing EW's own writer (column mapping / identity /
+  IcebergCompat). The **EW-codec path (`native_write` off) is unchanged** — still collects (the user's call: only
+  the native path streams). DELETE/UPDATE (rewriter paths) unaffected. Shared `NativeParquetDataFileWriter.RunCopy`
+  (live stream → COPY, returns rows+size) backs both the per-file `IDataFileWriter` and the streaming writer.
+  Verified: `test/verify_delta_catalog_native_write_streaming.test` (18 — no `__delta_row_id` in the streamed
+  file, bloom signature present, 8000-row append, partitioned fallback) + native_write (147) + optimize/partition/
+  overwrite_merge/write/native_read/decimal/changes/time_travel/alter/snapshots unregressed; **live OneLake**
+  (CTAS 5000 + append→8000 + DELETE→7920 over `onelake://`, log confirms `stream-write … native COPY, single
+  file, bounded memory`).
   **OCC RETRY DONE (concurrent writers):**
   engineered-wood `WriteCommitAsync` throws `DeltaConflictException` when a concurrent writer takes the target
   version; `DeltaWriter.Write`/`Create` (append/CTAS/create) catch it and retry by reopening at the new latest

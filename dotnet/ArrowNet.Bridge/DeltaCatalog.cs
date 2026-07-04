@@ -727,7 +727,6 @@ public sealed class DeltaCatalog : IBackendCatalog
         var opener = Opener();
         _log.LogInformation("delta bulk {Schema}.{Table}: create={Create} replace={Replace} native_write={Native}",
             schemaName, tableName, createTable, replace, _nativeWrite);
-        var (schema, batches, rows) = DeltaWriter.Materialize(data, default);
         // Partition columns take effect only at table creation; an INSERT (Append) into an existing table
         // preserves the table's declared partitioning (engineered-wood reads it from the metadata).
         var spec = ResolveWriteSpec(createTable || replace ? partitionColumns : null, schemaMode);
@@ -740,7 +739,32 @@ public sealed class DeltaCatalog : IBackendCatalog
         {
             spec = spec with { ReplaceWhere = null };
         }
-        DeltaWriter.Write(opener, TablePath(schemaName, tableName), schema, batches, mode, default,
+        var tablePath = TablePath(schemaName, tableName);
+
+        // native_write: STREAM straight to DuckDB's parquet writer (bounded memory — important for a Fabric
+        // notebook). TryWriteStreaming returns null (WITHOUT consuming `data`) for cases the single-file streaming
+        // commit can't represent (partitioned / replace_where / schema_mode=merge / column-mapping / identity /
+        // iceberg) → fall through to the collect path below with `data` intact.
+        if (_nativeWrite)
+        {
+            var streamedVersion = DeltaWriter.TryWriteStreaming(
+                opener, tablePath, data, mode,
+                deletionVectors: _deletionVectorsOnCreate,
+                inCommitTimestamps: _inCommitTimestampsOnCreate,
+                changeDataFeed: _changeDataFeedOnCreate,
+                rowTracking: _rowTrackingOnCreate,
+                spec: spec, materializeRowTracking: _materializeRowTracking,
+                out var streamedRows);
+            if (streamedVersion is not null)
+            {
+                return streamedRows;
+            }
+        }
+
+        // Collect path: materialize the whole stream in C# (bounded by RAM), then write via engineered-wood's
+        // codec OR DuckDB's per-file writer (native_write, non-streamable case: partitioned/merge/…).
+        var (schema, batches, rows) = DeltaWriter.Materialize(data, default);
+        DeltaWriter.Write(opener, tablePath, schema, batches, mode, default,
                           deletionVectors: _deletionVectorsOnCreate,
                           inCommitTimestamps: _inCommitTimestampsOnCreate,
                           changeDataFeed: _changeDataFeedOnCreate,

@@ -510,6 +510,73 @@ internal static class DeltaWriter
         }
     }
 
+    /// <summary>
+    /// STREAMING native write (bounded memory — for a Fabric notebook where RAM is limited): streams
+    /// <paramref name="data"/> straight into ONE parquet file via DuckDB's native <c>COPY</c> (the stream is
+    /// pull-based, so the whole dataset never lands in C# memory), then commits the single <c>add</c> via
+    /// engineered-wood's commit-only <see cref="DeltaTable.CommitDataFilesAsync"/>. This is the <b>native_write</b>
+    /// counterpart of <see cref="Write"/> that avoids the <see cref="Materialize"/> full-collect.
+    /// <para>Returns the committed version, or <c>null</c> when streaming does NOT apply and the caller must fall
+    /// back to the collect path (<see cref="Materialize"/> + <see cref="Write"/>): a partitioned target (native or
+    /// existing), <c>replace_where</c>, <c>schema_mode=merge</c>, or a table needing engineered-wood's own writer
+    /// (column mapping / identity / IcebergCompat). On <c>null</c> NO file was written (checked before COPY), so
+    /// there is no orphan.</para>
+    /// </summary>
+    public static long? TryWriteStreaming(
+        nint opener, string path, IArrowArrayStream data, DeltaWriteMode mode,
+        bool deletionVectors, bool inCommitTimestamps, bool changeDataFeed, bool rowTracking,
+        DeltaWriteSpec? spec, bool materializeRowTracking, out long rowsWritten)
+    {
+        rowsWritten = 0;
+        // Cases the single-file streaming commit can't represent → fall back to the batch path.
+        if (spec?.PartitionColumns is { Count: > 0 }) { return null; }
+        if (spec?.ReplaceWhere is { Count: > 0 }) { return null; }
+        if (spec?.SchemaMode == DeltaSchemaMode.Merge) { return null; }
+
+        var writableRoot = DeltaReader.ToReadableRoot(path);
+        var fs = TableFileSystems.Create(opener, path);
+        var table = DeltaTable.OpenOrCreateAsync(
+            fs, data.Schema, Options(spec),
+            partitionColumns: null,
+            configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, materializeRowTracking),
+            cancellationToken: default).AsTask().GetAwaiter().GetResult();
+        try
+        {
+            // An EXISTING partitioned table must partition its data (a flat single-file write would corrupt the
+            // layout); a table needing engineered-wood's own writer (column mapping / identity / iceberg) likewise.
+            // Decide BEFORE writing any file so the fallback leaves no orphan.
+            if (table.CurrentSnapshot.Metadata.PartitionColumns.Count > 0 || !table.SupportsExternalDataFileCommit)
+            {
+                return null;
+            }
+            if (mode == DeltaWriteMode.Overwrite)
+            {
+                // CREATE OR REPLACE / CTAS-replace / schema_mode=overwrite: adopt the incoming schema (metadata-only,
+                // no-op if identical), then the commit's removes drop the old files.
+                table.SetSchemaAsync(data.Schema, default).AsTask().GetAwaiter().GetResult();
+            }
+
+            // Stream the whole input into ONE parquet file. RETURN_STATS gives its row count + byte size.
+            string fileRel = $"{System.Guid.NewGuid():N}.parquet";
+            var (rows, size) = NativeParquetDataFileWriter.RunCopy(writableRoot, fileRel, data, default);
+            rowsWritten = rows;
+            // 0 rows → reference no file (an empty COPY output would be an unreferenced orphan); an Overwrite still
+            // commits its removes (clears the table), an Append commits an empty version.
+            var files = rows > 0
+                ? new List<WrittenDataFile> { new(fileRel, size, rows, null, null) }
+                : new List<WrittenDataFile>();
+            long version = table.CommitDataFilesAsync(files, mode, default).AsTask().GetAwaiter().GetResult();
+            Log.LogInformation(
+                "delta stream-write {Path}: committed v{Version} rows={Rows} (native COPY, single file, bounded memory)",
+                path, version, rows);
+            return version;
+        }
+        finally
+        {
+            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+    }
+
     /// <summary>Evolves the table schema for merge_schema: for each field in <paramref name="incoming"/> whose
     /// name is absent from the table's current schema, adds it as a NULLABLE column (engineered-wood
     /// <c>AddColumnAsync</c> — a metadata-only commit; old files read the new column back as NULL). Case-insensitive

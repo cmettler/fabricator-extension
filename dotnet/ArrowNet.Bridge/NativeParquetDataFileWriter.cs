@@ -43,8 +43,27 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
         {
             throw new InvalidOperationException("native delta write: no batches to write");
         }
+        // Bind the batches as a fresh Arrow stream (the host dequeues + exports each; InMemoryArrayStream only
+        // disposes UNdequeued batches, and the C export doesn't free managed buffers — so the caller's batches
+        // stay valid for its subsequent stats collection). One parquet file is written from the whole stream.
+        var src = new InMemoryArrayStream(batches[0].Schema, batches);
+        var (_, size) = RunCopy(_writableRoot, relativePath, src, cancellationToken);
+        return new ValueTask<long>(size);
+    }
+
+    /// <summary>
+    /// Streams <paramref name="src"/> (a pull-based Arrow stream — the whole dataset never materializes here) into
+    /// <c>&lt;writableRoot&gt;/&lt;relativePath&gt;</c> via DuckDB's native <c>COPY … TO … (FORMAT parquet,
+    /// WRITE_BLOOM_FILTER true, RETURN_STATS)</c>, creating the parent directory first (best-effort). Returns the
+    /// written file's total (rowCount, sizeBytes) read back from <c>RETURN_STATS</c>. Shared by the per-file
+    /// <see cref="IDataFileWriter"/> path (which binds an already-materialized batch list) and the streaming
+    /// bulk-write path (which binds the live channel stream, so the write is bounded-memory).
+    /// </summary>
+    internal static (long Rows, long Size) RunCopy(
+        string writableRoot, string relativePath, IArrowArrayStream src, CancellationToken ct)
+    {
         var rel = relativePath.Replace('\\', '/').TrimStart('/');
-        var uri = _writableRoot + "/" + rel;
+        var uri = writableRoot + "/" + rel;
         // DuckDB's single-file COPY does NOT create the target's parent directory, so a partitioned file
         // (region=US/<uuid>.parquet) or a _change_data file would fail. Create it first (recursive, idempotent).
         // Best-effort: on an object store (OneLake/S3) directories are implicit — CreateDirectory may be a no-op
@@ -52,51 +71,35 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
         int slash = rel.LastIndexOf('/');
         if (slash > 0)
         {
-            try { HostFs.CreateDir(AmbientOpener.Current, _writableRoot + "/" + rel.Substring(0, slash)); }
+            try { HostFs.CreateDir(AmbientOpener.Current, writableRoot + "/" + rel.Substring(0, slash)); }
             catch { /* object-store implicit dirs / unimplemented CreateDirectory — the COPY still writes */ }
         }
         var sql =
             $"COPY (SELECT * FROM {InputName}) TO '{uri.Replace("'", "''")}' " +
             "(FORMAT parquet, WRITE_BLOOM_FILTER true, RETURN_STATS)";
-        long rows = 0;
-        foreach (var b in batches)
-        {
-            rows += b.Length;
-        }
-        Log.LogInformation("delta native write {Uri} rows={Rows} batches={Batches}", uri, rows, batches.Count);
-
-        // Bind the batches as a fresh Arrow stream (the host dequeues + exports each; InMemoryArrayStream only
-        // disposes UNdequeued batches, and the C export doesn't free managed buffers — so the caller's batches
-        // stay valid for its subsequent stats collection). One parquet file is written from the whole stream.
-        var input = new (string, IArrowArrayStream)[]
-        {
-            (InputName, new InMemoryArrayStream(batches[0].Schema, batches)),
-        };
+        Log.LogInformation("delta native copy {Uri}", uri);
+        var input = new (string, IArrowArrayStream)[] { (InputName, src) };
         using var result = Host.Query(sql, input);
-        long size = ReadFileSize(result, cancellationToken);
-        return new ValueTask<long>(size);
+        return ReadCountAndSize(result, ct);
     }
 
     // RETURN_STATS emits one row per written file: (filename, count, file_size_bytes, footer_size_bytes,
     // column_statistics, partition_keys). A single-file COPY writes exactly one row → sum defensively anyway.
-    private static long ReadFileSize(IArrowArrayStream result, CancellationToken ct)
+    private static (long Rows, long Size) ReadCountAndSize(IArrowArrayStream result, CancellationToken ct)
     {
-        long total = 0;
+        long rows = 0, size = 0;
         RecordBatch? b;
         while ((b = result.ReadNextRecordBatchAsync(ct).AsTask().GetAwaiter().GetResult()) is not null)
         {
-            var idx = b.Schema.GetFieldIndex("file_size_bytes");
-            if (idx < 0)
-            {
-                continue;
-            }
-            var col = b.Column(idx);
+            int sizeIdx = b.Schema.GetFieldIndex("file_size_bytes");
+            int countIdx = b.Schema.GetFieldIndex("count");
             for (int i = 0; i < b.Length; i++)
             {
-                total += ToLong(col, i);
+                if (sizeIdx >= 0) size += ToLong(b.Column(sizeIdx), i);
+                if (countIdx >= 0) rows += ToLong(b.Column(countIdx), i);
             }
         }
-        return total;
+        return (rows, size);
     }
 
     private static long ToLong(IArrowArray col, int i) => col switch
