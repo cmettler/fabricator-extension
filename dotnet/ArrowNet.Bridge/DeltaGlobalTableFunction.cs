@@ -393,8 +393,16 @@ internal static class DeltaWriter
     /// <paramref name="deletionVectors"/> => DV + row-tracking fast-delete; <paramref name="inCommitTimestamps"/>
     /// => <c>delta.enableInCommitTimestamps</c> (a WRITER-only feature) so AT (TIMESTAMP =&gt; ...) time travel
     /// can resolve a timestamp to a version.</summary>
+    // Delta materialized row-tracking column names (opt-in). Declaring these makes a spec reader (Spark) expose
+    // `_metadata.row_id`/`_metadata.row_commit_version`; a rewrite that materializes these physical columns
+    // preserves the original stable id across UPDATE/compaction. The row-id column name matches what
+    // engineered-wood's RowTrackingWriter writes (`__delta_row_id`).
+    internal const string MaterializedRowIdColumn = "__delta_row_id";
+    internal const string MaterializedRowCommitVersionColumn = "__delta_row_commit_version";
+
     private static Dictionary<string, string>? CreateConfig(
-        bool deletionVectors, bool rowTracking, bool inCommitTimestamps, bool changeDataFeed)
+        bool deletionVectors, bool rowTracking, bool inCommitTimestamps, bool changeDataFeed,
+        bool materializeRowTracking = false)
     {
         if (!deletionVectors && !rowTracking && !inCommitTimestamps && !changeDataFeed)
         {
@@ -419,6 +427,13 @@ internal static class DeltaWriter
         {
             config["delta.enableChangeDataFeed"] = "true";
         }
+        if (materializeRowTracking && (deletionVectors || rowTracking))
+        {
+            // Declare the materialized row-tracking columns so Spark exposes `_metadata.row_id` and honors the
+            // materialized id we write on a rewrite (preserving stable ids across UPDATE/compaction).
+            config["delta.rowTracking.materializedRowIdColumnName"] = MaterializedRowIdColumn;
+            config["delta.rowTracking.materializedRowCommitVersionColumnName"] = MaterializedRowCommitVersionColumn;
+        }
         return config;
     }
 
@@ -436,7 +451,8 @@ internal static class DeltaWriter
     public static long Write(nint opener, string path, Schema schema, IReadOnlyList<RecordBatch> batches,
                              DeltaWriteMode mode, CancellationToken ct, bool deletionVectors = false,
                              bool inCommitTimestamps = false, bool changeDataFeed = false,
-                             bool rowTracking = false, DeltaWriteSpec? spec = null, bool nativeWrite = false)
+                             bool rowTracking = false, DeltaWriteSpec? spec = null, bool nativeWrite = false,
+                             bool materializeRowTracking = false)
     {
         // native_write: DuckDB's parquet writer produces the data-file bytes (via COPY on a fresh host
         // connection); engineered-wood keeps the _delta_log commit. Falls back to EW's codec if host_query is
@@ -460,7 +476,7 @@ internal static class DeltaWriter
             var fs = TableFileSystems.Create(opener, path);
             var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(spec, dataFileWriter),
                                                      partitionColumns: spec?.PartitionColumns,
-                                                     configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed),
+                                                     configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, materializeRowTracking),
                                                      cancellationToken: ct).AsTask().GetAwaiter().GetResult();
             try
             {
@@ -524,7 +540,8 @@ internal static class DeltaWriter
     /// <paramref name="deletionVectors"/> enables the DV+rowTracking features (opt-in fast-delete).</summary>
     public static void Create(nint opener, string path, Schema schema, CancellationToken ct,
                               bool deletionVectors = false, bool inCommitTimestamps = false,
-                              bool changeDataFeed = false, bool rowTracking = false, DeltaWriteSpec? spec = null)
+                              bool changeDataFeed = false, bool rowTracking = false, DeltaWriteSpec? spec = null,
+                              bool materializeRowTracking = false)
     {
         Log.LogInformation("delta create {Path}: cols={Cols} spec=[{Spec}]", path, schema.FieldsList.Count,
             DescribeSpec(spec, deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed));
@@ -536,7 +553,7 @@ internal static class DeltaWriter
                 // OpenOrCreate writes commit-0 for a new table (or opens an existing one — no commit, no conflict).
                 var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(spec),
                                                          partitionColumns: spec?.PartitionColumns,
-                                                         configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed),
+                                                         configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, materializeRowTracking),
                                                          cancellationToken: ct).AsTask().GetAwaiter().GetResult();
                 table.DisposeAsync().AsTask().GetAwaiter().GetResult();
                 Log.LogDebug("delta create {Path}: opened/created (commit-0 if new)", path);

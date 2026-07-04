@@ -127,6 +127,12 @@ public sealed class DeltaCatalog : IBackendCatalog
     // by DuckDB's native parquet writer (COPY … TO … FORMAT parquet) instead of engineered-wood's codec; the
     // _delta_log commit stays in engineered-wood. Opt-in (default off); DELETE/UPDATE rewrites are a later slice.
     private readonly bool _nativeWrite;
+    // ATTACH option `materialize_row_tracking true` (opt-in; default off): a row-tracking table declares the Delta
+    // `delta.rowTracking.materializedRowIdColumnName` so a spec reader (Spark) exposes `_metadata.row_id`, AND a
+    // copy-on-write/merge-on-read rewrite materializes each rewritten row's ORIGINAL stable id (instead of a fresh
+    // base_row_id) so row ids are preserved across UPDATE (and, later, compaction). Validated via the Fabric Spark
+    // Livy harness. Default OFF keeps the validated DV-default path untouched (no new feature declaration).
+    private readonly bool _materializeRowTracking;
 
     private static readonly Microsoft.Extensions.Logging.ILogger _log = ArrowNetLog.CreateLogger("ArrowNet.Delta");
 
@@ -153,6 +159,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         _mergeSchemaOnWrite = ParseBoolOption(optionsJson, "merge_schema");
         _nativeRead = ParseBoolOption(optionsJson, "native_read");
         _nativeWrite = ParseBoolOption(optionsJson, "native_write");
+        _materializeRowTracking = ParseBoolOption(optionsJson, "materialize_row_tracking");
     }
 
     /// <summary>Returns the host-FS opener for this thread and, in the same breath, publishes this catalog's
@@ -738,7 +745,8 @@ public sealed class DeltaCatalog : IBackendCatalog
                           inCommitTimestamps: _inCommitTimestampsOnCreate,
                           changeDataFeed: _changeDataFeedOnCreate,
                           rowTracking: _rowTrackingOnCreate,
-                          spec: spec, nativeWrite: _nativeWrite);
+                          spec: spec, nativeWrite: _nativeWrite,
+                          materializeRowTracking: _materializeRowTracking);
         return rows;
     }
 
@@ -754,7 +762,8 @@ public sealed class DeltaCatalog : IBackendCatalog
                               inCommitTimestamps: _inCommitTimestampsOnCreate,
                               changeDataFeed: _changeDataFeedOnCreate,
                               rowTracking: _rowTrackingOnCreate,
-                              spec: ResolveWriteSpec(partitionColumns, schemaModeArg: null));
+                              spec: ResolveWriteSpec(partitionColumns, schemaModeArg: null),
+                              materializeRowTracking: _materializeRowTracking);
 
     /// <summary>CREATE SCHEMA. In <c>schemas</c> mode (non-OneLake) it materializes the <c>&lt;root&gt;/&lt;schema&gt;/</c>
     /// subfolder so a subsequent CREATE TABLE lands there (and the schema is rediscovered once it holds a table).

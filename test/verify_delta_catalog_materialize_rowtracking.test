@@ -1,0 +1,52 @@
+# name: test/verify_delta_catalog_materialize_rowtracking.test
+# description: The `materialize_row_tracking true` ATTACH option (opt-in) — a row-tracking table declares the Delta
+#              materialized row-id column, and a merge-on-read UPDATE materializes each rewritten row's ORIGINAL
+#              stable id (base_row_id + position) into the physical __delta_row_id column instead of a fresh id, so
+#              the row id is PRESERVED across UPDATE. This is the write-shape check (the appended updated row
+#              carries its original __delta_row_id); the end-to-end row-id readback is validated on Fabric Spark
+#              (delta-kernel/delta-rs don't expose Delta row ids). Set ARROWNET_DELTA_WRITE_DIR. Local FS.
+# group: [mssql_net]
+
+require mssql_net
+
+require parquet
+
+require-env ARROWNET_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/matrt' AS lake (TYPE arrownet, PROVIDER 'delta', materialize_row_tracking true);
+
+statement ok
+CREATE TABLE lake.main.t AS SELECT i AS id, 'v' || i AS v FROM range(1, 4) AS r(i);
+
+# Baseline: the create file materializes __delta_row_id = base_row_id + position (0,1,2).
+query II
+SELECT id, "__delta_row_id" FROM read_parquet('${ARROWNET_DELTA_WRITE_DIR}/matrt/t/*.parquet', union_by_name=true) ORDER BY id;
+----
+1	0
+2	1
+3	2
+
+# Merge-on-read UPDATE of id=2: DV-deletes the old row 2, appends the post-image row carrying its ORIGINAL id.
+statement ok
+UPDATE lake.main.t SET v = 'X' WHERE id = 2;
+
+query IT
+SELECT id, v FROM lake.main.t ORDER BY id;
+----
+1	v1
+2	X
+3	v3
+
+# The APPENDED updated row (id=2, v='X') carries __delta_row_id = 1 (its ORIGINAL id), NOT a fresh base_row_id —
+# so a spec reader (Spark) preserves the row id across the UPDATE. (Both the old DV-deleted row 2 and the new
+# one have __delta_row_id=1; filtering on v='X' isolates the appended post-image row.)
+query I
+SELECT DISTINCT "__delta_row_id"
+FROM read_parquet('${ARROWNET_DELTA_WRITE_DIR}/matrt/t/*.parquet', union_by_name=true)
+WHERE id = 2 AND v = 'X';
+----
+1
+
+statement ok
+DETACH lake;

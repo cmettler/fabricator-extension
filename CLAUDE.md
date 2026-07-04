@@ -1706,8 +1706,10 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   small new file, committed atomically as `remove`(old,oldDV)+`add`(same,newDV)+`add`(post-image file). Big
   write-amplification win for a small update on a large file, and it re-ids FEWER rows than copy-on-write (which
   re-ids every row in the rewritten file — only the appended rows get fresh ids; non-updated rows keep their
-  original id/version). Stable-id preservation across UPDATE (the appended rows keeping their ORIGINAL id) still
-  needs materialized row-id columns (a separate slice). Validated: official `delta_scan` reads the DV-original +
+  original id/version). **Stable-id preservation across UPDATE is now DONE (opt-in `materialize_row_tracking
+  true`) + VALIDATED ON FABRIC SPARK** — see the "Materialized row tracking" bullet below (the appended row
+  carries its ORIGINAL `__delta_row_id`, so Spark reads `_metadata.row_id` preserved; default off keeps the
+  validated DV path untouched). Validated: official `delta_scan` reads the DV-original +
   appended result + LIVE on Fabric OneLake; `test/verify_delta_catalog_dv_default.test` asserts the append is
   small (a 2-row post-image file beside the 10-row original, not a 10-row rewrite). Non-DV (opt-out) UPDATE stays
   copy-on-write (native rewriter under `native_write`). `test/verify_delta_catalog_dv_default.test`
@@ -1738,19 +1740,16 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   Fabric validated); only external stable-row-tracking is imperfect across a rewrite. Correct preservation
   requires DECLARING the materialized row-id + row-commit-version columns + materializing BOTH on the rewrite (rows
   from several source files mix → a single `baseRowId` can't represent them) — a focused engineered-wood slice
-  needing Spark/delta-kernel row-id round-trip validation (+ Fabric-conversion risk from a new feature
-  declaration), deferred. **PROBED 2026-07-04 for a local validator → NONE exists in our stack:** neither
-  delta-kernel via DuckDB `delta_scan` (its `DESCRIBE` shows only the logical schema — no row-id metadata column)
-  NOR delta-rs via delta-dotnet (`QueryAsync`/`ReadAsArrowTableAsync` — the managed API has ZERO row-tracking
-  surface, and the Rust bridge registers the plain DataFusion table provider with no row-index/row-id column)
-  exposes a Delta stable row id to a reader. So stable-id-across-rewrite can ONLY be validated on Spark (or an
-  engine that surfaces row tracking) → the materialization stays deferred until such a validator exists; building
-  it blind on a Fabric-targeting provider is the exact unvalidatable-correctness anti-pattern this codebase avoids.
-  EW's row-tracking internals are also half-built (writes physical `__delta_row_id` but never declares
-  `delta.rowTracking.materializedRowIdColumnName`; `RowTrackingWriter.RowIdColumn="__delta_row_id"` vs
-  `RowTrackingConfig.RowIdColumnName="_metadata.row_id"` disagree) — a proper spec-compliance pass is the
-  prerequisite. Under DV-default it's low-urgency: **DV DELETE preserves row tracking for free** (no
-  rewrite). **Activate DV explicitly** with the ATTACH option
+  needing Spark row-id round-trip validation (delta-kernel via DuckDB `delta_scan` + delta-rs via delta-dotnet
+  both HIDE Delta row ids — probed, neither exposes them). **A VALIDATOR WAS FOUND + THE UPDATE-PATH
+  MATERIALIZATION BUILT + VALIDATED (2026-07-04)** — see "Materialized row tracking (`materialize_row_tracking`)"
+  below. **Fabric Spark row-id validator:** the preview **Microsoft ADO.NET Driver for Fabric Data Engineering**
+  (`Microsoft.Spark.Livy.AdoNet`, download-center zip) — its own session-create POST 404s, but the underlying
+  **Fabric Livy REST API** works with the `fabric_sp` SP (`ClientSecretCredential`, `livyApi` version
+  `2023-12-01`) and Spark exposes `_metadata.row_id`/`_metadata.row_commit_version`. Harness =
+  `scratchpad/sparkprobe` (drives Livy raw: create session → `POST /statements` Spark SQL → read output; reads
+  the SP from `dax_secret.sql` at runtime). This is THE way to validate Delta row tracking end-to-end.
+  **Activate DV explicitly** with the ATTACH option
   `deletion_vectors true` (now also the default) → tables CREATED in that catalog enable the `deletionVectors` +
   `rowTracking` features (`DeltaWriter.DeletionVectorConfig`; `CreateAsync` declares reader-v3 + the features).
   DELETE follows the TABLE's `delta.enableDeletionVectors` config (`DeltaReader.IsDeletionVectorsEnabled`):
@@ -1787,6 +1786,25 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   for cross-snapshot retry, which DuckDB never needs → `row_tracking` is a **write-side interop feature for external
   readers**, not a DML mechanism. `verify_delta_catalog_row_tracking.test` (33 — feature declared, baseRowId
   materialized, DELETE/UPDATE/INSERT unaffected). See [docs/delta-catalog.md](docs/delta-catalog.md).
+  **Materialized row tracking (`materialize_row_tracking true`, opt-in) — STABLE ROW ID PRESERVED ACROSS
+  MERGE-ON-READ UPDATE, VALIDATED ON FABRIC SPARK (2026-07-04).** The gap: our merge-on-read UPDATE appends the
+  post-image row in a NEW file, so its `base_row_id + row_index` changed (stable id 1→3) — proven via Spark
+  (`_metadata.base_row_id`). Root cause: EW enabled row tracking but never declared
+  `delta.rowTracking.materializedRowIdColumnName`, so Spark couldn't even synthesize `_metadata.row_id` for our
+  tables, and the UPDATE-append wrote a fresh `__delta_row_id`. **Fix (opt-in):** `materialize_row_tracking true`
+  → `DeltaCatalog._materializeRowTracking` → `CreateConfig` declares
+  `delta.rowTracking.materializedRowIdColumnName=__delta_row_id` (+ `...RowCommitVersionColumnName`) at create;
+  engineered-wood `UpdateViaVectorsAsync` materializes each appended row's **ORIGINAL** stable id
+  (`sourceAddFile.BaseRowId + position`) into `__delta_row_id` (new `RowTrackingWriter.AddRowIdColumn(batch,
+  Int64Array)` overload) instead of a fresh id. **Validated live on Fabric Spark:** after `UPDATE … WHERE id=2`,
+  Spark reads `_metadata.row_id=1` (PRESERVED, was 3 without this) + `_metadata.row_commit_version=2` (correctly
+  bumped) — matching Spark's own writer's reference behavior; untouched rows keep ids 0,2. Local write-shape test
+  `verify_delta_catalog_materialize_rowtracking.test` (the appended row carries `__delta_row_id=1`); the row-id
+  READBACK is Spark-only (see the validator below). **Default OFF** (no new feature declaration on the DV-default
+  path → no Fabric-conversion risk to the validated path). **Still pending: compaction materialization** (rows
+  from several files mix → needs materializing BOTH `__delta_row_id` AND `__delta_row_commit_version` with each
+  row's original id+version; the UPDATE case didn't need the version column since the appended rows share the new
+  commit version = the file's `defaultRowCommitVersion`).
   **engineered-wood WRITE interop caveats (reviewed 2026-07-02; from its `doc/known-issues.md`):** engineered-wood
   is a from-scratch C# Parquet/Delta stack, so the write path diverges from Spark/parquet-mr in a few subtle ways —
   none a show-stopper (Fabric/DuckDB/arrow-rs read our output, validated live), but the two "Spark-ecosystem
