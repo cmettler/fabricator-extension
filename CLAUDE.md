@@ -1693,8 +1693,28 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `DeleteAsync` — report upstream. **Finding:** the Delta `rowTracking` FEATURE is NOT actually needed for DV
   deletes — an ABSOLUTE-position transient `(file, position)` rowid composes correctly across repeated DV deletes
   (the parquet file is never rewritten, so absolute positions are stable); rowTracking only adds stable-ids-across-
-  compaction, which our DML doesn't use. **DELETION-VECTOR MODE DONE — opt-in, delta-kernel-verified.** Activate
-  with the ATTACH option `deletion_vectors true` → tables CREATED in that catalog enable the `deletionVectors` +
+  compaction, which our DML doesn't use. **DELETION VECTORS ARE THE DEFAULT DML MODE (2026-07-04, commit
+  `66e97f5`).** New Delta catalog tables use deletion vectors by default (the modern Delta standard): a DELETE
+  marks rows in a DV bitmap instead of rewriting the file — cheap, and it preserves row-tracking ids/versions
+  for free (no rewrite). `DeltaCatalog._deletionVectorsOnCreate` now defaults **true** (`ParseBoolOption` gained a
+  defaulted overload distinguishing absent → default from explicit false). **Opt OUT with `deletion_vectors
+  false`** for a plain copy-on-write table (`minReader 1`, no reader-v3 bump) — e.g. a consumer that can't read
+  reader-v3 DV tables. Copy-on-write stays the fallback (opt-out) + the compaction path; UPDATE remains
+  copy-on-write (on a DV table it excludes the file's DV positions). `test/verify_delta_catalog_dv_default.test`
+  proves default ⇒ DV (on-disk parquet count stays 1 after DELETE = no rewrite) vs `deletion_vectors false` ⇒
+  copy-on-write (2 files = rewrite); the CoW-intent tests (`verify_delta_catalog_delete` + the native_write CoW
+  catalogs) are pinned `deletion_vectors false` to keep that coverage. **Compaction row-tracking caveat (NOT yet
+  wired/reachable in this provider — no OPTIMIZE command; latent):** engineered-wood's `CompactionExecutor`
+  currently assigns a FRESH `baseRowId` from the high-water mark per compacted file and does NOT declare
+  `delta.rowTracking.materializedRowIdColumnName`, so a spec reader (delta-kernel/Spark) computes row ids from
+  `baseRowId + position` and a compaction would CHANGE every row's stable id (it does copy the physical
+  `__delta_row_id` column through, but readers ignore it since it's undeclared). Correct compaction under row
+  tracking requires DECLARING the materialized row-id + row-commit-version column names in metadata and
+  materializing BOTH on the rewrite (rows from several source files mix → a single `baseRowId` can't represent
+  them) — a focused engineered-wood slice needing delta-kernel round-trip validation. Under DV-default this is
+  low-urgency: **DV DELETE preserves row tracking for free** (no rewrite), so the only rewrites are copy-on-write
+  UPDATE (opt-out/DV-table) + compaction (unwired). **Activate DV explicitly** with the ATTACH option
+  `deletion_vectors true` (now also the default) → tables CREATED in that catalog enable the `deletionVectors` +
   `rowTracking` features (`DeltaWriter.DeletionVectorConfig`; `CreateAsync` declares reader-v3 + the features).
   DELETE follows the TABLE's `delta.enableDeletionVectors` config (`DeltaReader.IsDeletionVectorsEnabled`):
   DV-enabled → `DeleteByRowIdsViaVectorsAsync` (union the new in-file positions into the file's DV, write a fresh

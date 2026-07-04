@@ -334,6 +334,17 @@ The whole point is standard-readability, which EW's writer kept failing. Every p
   the *rewrite* half (§6.2) — materialize the `_metadata.row_id`+`_metadata.row_commit_version` pair on
   copy-on-write DELETE/UPDATE so survivors keep their original id/version (today the rewrite doesn't preserve
   stable ids across UPDATE); DV-mode delete preserves them free. (Also unblocks per-row `snapshot_id`.)
+- **DV is now the DEFAULT DML mode (2026-07-04, commit `66e97f5`)** — see the CLAUDE.md Delta bullet. This
+  RELOCATES the row-tracking-on-rewrite gap: DV DELETE preserves ids/versions for free (no rewrite), so the only
+  rewrites left are copy-on-write UPDATE (opt-out / DV-table) and **compaction**. Compaction
+  (`CompactionExecutor`) is **not wired into this provider** (no OPTIMIZE command — latent) AND currently would
+  BREAK stable ids for a spec reader: it assigns a fresh `baseRowId` per compacted file and EW does not declare
+  `delta.rowTracking.materializedRowIdColumnName`, so delta-kernel/Spark compute ids from `baseRowId + position`
+  and every row's id changes (it copies the physical `__delta_row_id` through, but undeclared → readers ignore
+  it). Correct compaction under row tracking = declare the materialized row-id + row-commit-version column names
+  in metadata + materialize BOTH on the rewrite (mixed source files → no single `baseRowId`) — a focused EW
+  slice needing delta-kernel validation. Same materialize-on-rewrite machinery would then also close the P5
+  copy-on-write-UPDATE gap above.
 
 Each slice: build, `verify_delta_catalog_*` green, then the §9 acid test.
 
