@@ -528,8 +528,7 @@ internal static class DeltaWriter
         DeltaWriteSpec? spec, bool materializeRowTracking, out long rowsWritten)
     {
         rowsWritten = 0;
-        // Cases the single-file streaming commit can't represent → fall back to the batch path.
-        if (spec?.PartitionColumns is { Count: > 0 }) { return null; }
+        // Cases the streaming commit can't represent → fall back to the batch path.
         if (spec?.ReplaceWhere is { Count: > 0 }) { return null; }
         if (spec?.SchemaMode == DeltaSchemaMode.Merge) { return null; }
 
@@ -537,15 +536,23 @@ internal static class DeltaWriter
         var fs = TableFileSystems.Create(opener, path);
         var table = DeltaTable.OpenOrCreateAsync(
             fs, data.Schema, Options(spec),
-            partitionColumns: null,
+            partitionColumns: spec?.PartitionColumns,   // set on a partitioned CTAS create; ignored for an INSERT
             configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, materializeRowTracking),
             cancellationToken: default).AsTask().GetAwaiter().GetResult();
         try
         {
-            // An EXISTING partitioned table must partition its data (a flat single-file write would corrupt the
-            // layout); a table needing engineered-wood's own writer (column mapping / identity / iceberg) likewise.
-            // Decide BEFORE writing any file so the fallback leaves no orphan.
-            if (table.CurrentSnapshot.Metadata.PartitionColumns.Count > 0 || !table.SupportsExternalDataFileCommit)
+            // Decide ALL fallbacks BEFORE writing any file / touching the log, so a fallback leaves no orphan.
+            // (1) A table needing engineered-wood's own writer (column mapping / identity / iceberg).
+            if (!table.SupportsExternalDataFileCommit)
+            {
+                return null;
+            }
+            var partCols = table.CurrentSnapshot.Metadata.PartitionColumns;
+            // (2) A PARTITIONED write on OneLake: DuckDB's partitioned COPY needs a writable DIRECTORY target,
+            // which the onelake:// FileSystem doesn't yet support (it stats the table root as a file) — the
+            // single-file (non-partitioned) OneLake write works. Fall back to the collect path on OneLake for
+            // partitioned; local/S3 partitioned streams natively.
+            if (partCols.Count > 0 && FabricLakehouse.IsOneLake(path))
             {
                 return null;
             }
@@ -556,22 +563,44 @@ internal static class DeltaWriter
                 table.SetSchemaAsync(data.Schema, default).AsTask().GetAwaiter().GetResult();
             }
 
-            // Stream the whole input into ONE parquet file. RETURN_STATS gives its row count + byte size AND the
-            // Delta stats JSON (min/max/nullCount, built from column_statistics + typed by data.Schema) — so the
-            // streamed file gets FULL data-skipping stats, not just numRecords.
-            string fileRel = $"{System.Guid.NewGuid():N}.parquet";
-            var (rows, size, stats) = NativeParquetDataFileWriter.RunCopy(
-                writableRoot, fileRel, data, default, statsSchema: data.Schema);
-            rowsWritten = rows;
-            // 0 rows → reference no file (an empty COPY output would be an unreferenced orphan); an Overwrite still
-            // commits its removes (clears the table), an Append commits an empty version.
-            var files = rows > 0
-                ? new List<WrittenDataFile> { new(fileRel, size, rows, null, stats) }
-                : new List<WrittenDataFile>();
+            // RETURN_STATS gives per-file row count + byte size + the Delta stats JSON (min/max/nullCount, typed by
+            // data.Schema) — so streamed files get FULL data-skipping stats. The whole input is pulled through
+            // DuckDB's COPY, never materialized in C# (bounded memory).
+            List<WrittenDataFile> files;
+            if (partCols.Count > 0)
+            {
+                // Partitioned: DuckDB COPY PARTITION_BY streams the Hive col=val/ layout in one pass — one+ files
+                // per partition, each with its partition values (from RETURN_STATS.partition_keys) + stats.
+                var copied = NativeParquetDataFileWriter.RunCopyPartitioned(
+                    writableRoot, partCols, data, default, statsSchema: data.Schema);
+                files = new List<WrittenDataFile>(copied.Count);
+                long total = 0;
+                foreach (var cf in copied)
+                {
+                    if (cf.Rows == 0) { continue; }
+                    total += cf.Rows;
+                    files.Add(new WrittenDataFile(cf.RelativePath, cf.Size, cf.Rows, cf.PartitionValues, cf.Stats));
+                }
+                rowsWritten = total;
+            }
+            else
+            {
+                // Non-partitioned: stream into ONE parquet file.
+                string fileRel = $"{System.Guid.NewGuid():N}.parquet";
+                var (rows, size, stats) = NativeParquetDataFileWriter.RunCopy(
+                    writableRoot, fileRel, data, default, statsSchema: data.Schema);
+                rowsWritten = rows;
+                // 0 rows → reference no file (an empty COPY output would be an unreferenced orphan); an Overwrite
+                // still commits its removes (clears the table), an Append commits an empty version.
+                files = rows > 0
+                    ? new List<WrittenDataFile> { new(fileRel, size, rows, null, stats) }
+                    : new List<WrittenDataFile>();
+            }
+
             long version = table.CommitDataFilesAsync(files, mode, default).AsTask().GetAwaiter().GetResult();
             Log.LogInformation(
-                "delta stream-write {Path}: committed v{Version} rows={Rows} (native COPY, single file, bounded memory)",
-                path, version, rows);
+                "delta stream-write {Path}: committed v{Version} rows={Rows} files={Files} (native COPY, bounded memory)",
+                path, version, rowsWritten, files.Count);
             return version;
         }
         finally

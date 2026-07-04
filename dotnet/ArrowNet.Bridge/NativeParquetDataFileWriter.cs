@@ -64,6 +64,11 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
     /// <c>statsSchema=null</c> — engineered-wood computes its own stats over the in-hand batches) and the streaming
     /// bulk-write path (which passes the write schema, since it never holds the batches to stat them itself).
     /// </summary>
+    /// <summary>One parquet file written by a COPY, as read back from RETURN_STATS.</summary>
+    internal readonly record struct CopiedFile(
+        string RelativePath, long Rows, long Size,
+        Dictionary<string, string>? PartitionValues, string? Stats);
+
     internal static (long Rows, long Size, string? Stats) RunCopy(
         string writableRoot, string relativePath, IArrowArrayStream src, CancellationToken ct,
         Schema? statsSchema = null)
@@ -86,36 +91,95 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
         Log.LogInformation("delta native copy {Uri}", uri);
         var input = new (string, IArrowArrayStream)[] { (InputName, src) };
         using var result = Host.Query(sql, input);
-        return ReadStats(result, ct, statsSchema);
+        var files = ReadFileStats(result, ct, statsSchema, writableRoot);
+        long rows = 0, size = 0;
+        foreach (var f in files) { rows += f.Rows; size += f.Size; }
+        return (rows, size, files.Count > 0 ? files[0].Stats : null);
+    }
+
+    /// <summary>
+    /// STREAMING partitioned write: streams <paramref name="src"/> into DuckDB's native <c>COPY … TO
+    /// '&lt;root&gt;' (FORMAT parquet, PARTITION_BY (cols), APPEND true, FILENAME_PATTERN '{uuid}', RETURN_STATS)</c>
+    /// — DuckDB produces the Hive <c>col=val/&lt;uuid&gt;.parquet</c> layout in one pull-based pass (bounded memory),
+    /// excluding the partition columns from the files (Delta convention; values live in the returned
+    /// <c>partition_keys</c>). Returns one <see cref="CopiedFile"/> per written file (relative path, row count,
+    /// size, partition values, and — when <paramref name="statsSchema"/> is set — the Delta stats JSON).
+    /// <c>APPEND</c> + a unique <c>{uuid}</c> filename add new files without disturbing existing partitions (the
+    /// Delta log's add/remove decides overwrite-vs-append; old files are logically removed, physically VACUUMed).
+    /// </summary>
+    internal static List<CopiedFile> RunCopyPartitioned(
+        string writableRoot, IReadOnlyList<string> partitionColumns, IArrowArrayStream src,
+        CancellationToken ct, Schema? statsSchema)
+    {
+        var quoted = string.Join(", ", partitionColumns.Select(c => "\"" + c.Replace("\"", "\"\"") + "\""));
+        var sql =
+            $"COPY (SELECT * FROM {InputName}) TO '{writableRoot.Replace("'", "''")}' " +
+            $"(FORMAT parquet, PARTITION_BY ({quoted}), APPEND true, FILENAME_PATTERN '{{uuid}}', " +
+            "WRITE_BLOOM_FILTER true, RETURN_STATS)";
+        Log.LogInformation("delta native partitioned copy {Root} by [{Cols}]", writableRoot, quoted);
+        var input = new (string, IArrowArrayStream)[] { (InputName, src) };
+        using var result = Host.Query(sql, input);
+        return ReadFileStats(result, ct, statsSchema, writableRoot);
     }
 
     // RETURN_STATS emits one row per written file: (filename, count, file_size_bytes, footer_size_bytes,
-    // column_statistics, partition_keys). A single-file COPY writes exactly one row → sum count/size defensively;
-    // the Delta stats JSON (when requested) is built from the FIRST file's column_statistics (single-file path).
-    private static (long Rows, long Size, string? Stats) ReadStats(
-        IArrowArrayStream result, CancellationToken ct, Schema? statsSchema)
+    // column_statistics, partition_keys). Build one CopiedFile per row — relative path from `filename`, partition
+    // values from `partition_keys` (a MAP(colname → value)), and the Delta stats JSON from `column_statistics`
+    // when a schema was supplied.
+    private static List<CopiedFile> ReadFileStats(
+        IArrowArrayStream result, CancellationToken ct, Schema? statsSchema, string writableRoot)
     {
-        long rows = 0, size = 0;
-        string? stats = null;
+        var files = new List<CopiedFile>();
         RecordBatch? b;
         while ((b = result.ReadNextRecordBatchAsync(ct).AsTask().GetAwaiter().GetResult()) is not null)
         {
+            int fnIdx = b.Schema.GetFieldIndex("filename");
             int sizeIdx = b.Schema.GetFieldIndex("file_size_bytes");
             int countIdx = b.Schema.GetFieldIndex("count");
             int statsIdx = b.Schema.GetFieldIndex("column_statistics");
+            int pkIdx = b.Schema.GetFieldIndex("partition_keys");
             for (int i = 0; i < b.Length; i++)
             {
                 long fileRows = countIdx >= 0 ? ToLong(b.Column(countIdx), i) : 0;
-                if (sizeIdx >= 0) size += ToLong(b.Column(sizeIdx), i);
-                rows += fileRows;
-                // Build the Delta stats for the single written file (first row) when a schema was supplied.
-                if (statsSchema is not null && stats is null && statsIdx >= 0)
-                {
-                    stats = BuildDeltaStats(b.Column(statsIdx), i, fileRows, statsSchema);
-                }
+                long fileSize = sizeIdx >= 0 ? ToLong(b.Column(sizeIdx), i) : 0;
+                string rel = fnIdx >= 0 && b.Column(fnIdx) is StringArray fn && !fn.IsNull(i)
+                    ? Relativize(fn.GetString(i), writableRoot) : "";
+                var parts = pkIdx >= 0 ? ReadPartitionKeys(b.Column(pkIdx), i) : null;
+                string? stats = statsSchema is not null && statsIdx >= 0
+                    ? BuildDeltaStats(b.Column(statsIdx), i, fileRows, statsSchema) : null;
+                files.Add(new CopiedFile(rel, fileRows, fileSize, parts, stats));
             }
         }
-        return (rows, size, stats);
+        return files;
+    }
+
+    // Strip the table-root prefix from a RETURN_STATS filename and normalize to forward slashes. DuckDB returns
+    // the root part as given (forward slashes) but may use backslashes in the partition subdirs on Windows.
+    private static string Relativize(string filename, string writableRoot)
+    {
+        var f = filename.Replace('\\', '/');
+        var root = writableRoot.Replace('\\', '/').TrimEnd('/');
+        int idx = f.IndexOf(root, StringComparison.OrdinalIgnoreCase);
+        return idx >= 0 ? f.Substring(idx + root.Length).TrimStart('/') : f;
+    }
+
+    // partition_keys is a MAP(VARCHAR colname → VARCHAR value) — one entry per partition column (unquoted names).
+    private static Dictionary<string, string>? ReadPartitionKeys(IArrowArray col, int row)
+    {
+        if (col is not MapArray map) return null;
+        var kv = (StructArray)map.KeyValues;
+        var names = (StringArray)kv.Fields[0];
+        var vals = (StringArray)kv.Fields[1];
+        int start = map.ValueOffsets[row];
+        int end = map.ValueOffsets[row + 1];
+        if (end <= start) return null;
+        var d = new Dictionary<string, string>();
+        for (int e = start; e < end; e++)
+        {
+            if (names.IsNull(e)) continue;
+            d[names.GetString(e)] = vals.IsNull(e) ? "" : vals.GetString(e);
+        }
+        return d.Count > 0 ? d : null;
     }
 
     private static long ToLong(IArrowArray col, int i) => col switch

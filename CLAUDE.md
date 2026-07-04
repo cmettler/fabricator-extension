@@ -1928,20 +1928,33 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   omission) and tz-timestamp / time / nested (format risk); `nullCount` + `numRecords` always (exact integers).
   On any parse hiccup it falls back to numRecords-only (never fails the write for stats). So the streamed file
   gets the SAME skipping quality as the collect path (better on float/double, which the collect path emits
-  possibly-imprecise). **Falls back to the collect path** (`Materialize` + `Write`, `data` untouched —
-  the fallback is decided BEFORE any COPY, checked via EW's new `DeltaTable.SupportsExternalDataFileCommit`
-  predicate + `Metadata.PartitionColumns`, so no orphan file) for: partitioned target (native OR existing),
-  `replace_where`, `schema_mode=merge`, or a table needing EW's own writer (column mapping / identity /
-  IcebergCompat). The **EW-codec path (`native_write` off) is unchanged** — still collects (the user's call: only
-  the native path streams). DELETE/UPDATE (rewriter paths) unaffected. Shared `NativeParquetDataFileWriter.RunCopy`
-  (live stream → COPY, returns rows+size + optional Delta stats JSON) backs both the per-file `IDataFileWriter`
-  (stats null — EW collects its own) and the streaming writer (passes the write schema).
-  Verified: `test/verify_delta_catalog_native_write_streaming.test` (20 — no `__delta_row_id` in the streamed
+  possibly-imprecise). **PARTITIONED writes STREAM too (local/S3)** — `DeltaWriter.TryWriteStreaming` branches on
+  the table's `Metadata.PartitionColumns`: non-partitioned → one COPY to a single file; partitioned →
+  `NativeParquetDataFileWriter.RunCopyPartitioned` runs ONE `COPY … TO '<root>' (PARTITION_BY (cols), APPEND true,
+  FILENAME_PATTERN '{uuid}', RETURN_STATS)` that streams the whole Hive `col=val/<uuid>.parquet` layout in a
+  single pass (bounded memory), excluding the partition columns from the files (Delta convention); `RETURN_STATS`
+  returns one row PER FILE → each becomes a `WrittenDataFile` with its `partitionValues` (from `partition_keys`, a
+  `MAP(colname→value)`) + per-file stats, all committed in one `CommitDataFilesAsync`. `RunCopy` returns per-file
+  `CopiedFile` records (relpath from `filename`, rows, size, partitionValues, stats); the shared `ReadFileStats`
+  parses both. **Falls back to the collect path** (`Materialize` + `Write`, `data` untouched — the fallback is
+  decided BEFORE any COPY via EW's `SupportsExternalDataFileCommit` + `Metadata.PartitionColumns`, so no orphan
+  file) for: `replace_where`, `schema_mode=merge`, a table needing EW's own writer (column mapping / identity /
+  IcebergCompat), **and a PARTITIONED write on OneLake** — DuckDB's partitioned COPY needs a writable DIRECTORY
+  target, which the `onelake://` C++ FileSystem doesn't yet support (it stats the table root as a file: *"exists
+  and is a file, not a directory"*); the single-file (non-partitioned) OneLake write works. On the OneLake
+  partitioned fallback the collect path still uses DuckDB's native PER-FILE writer (one single-file COPY per
+  partition — a FILE target, which OneLake supports) → native parquet quality (bloom/stats), just RAM-bounded.
+  **Follow-up to stream OneLake partitioned: add directory-target support to `arrownet_onelake_fs` (C++).** The
+  **EW-codec path (`native_write` off) is unchanged** — still collects (the user's call: only the native path
+  streams). DELETE/UPDATE (rewriter paths) unaffected.
+  Verified: `test/verify_delta_catalog_native_write_streaming.test` (29 — no `__delta_row_id` in the streamed
   file, bloom signature present, **min/max/nullCount in the commit: int→JSON number, string→JSON string,
-  double→omitted**, 8000-row append, partitioned fallback) + native_write (147) + optimize/partition/
-  overwrite_merge/write/native_read/decimal/changes/time_travel/alter/snapshots unregressed; **live OneLake**
-  (CTAS 5000 + append→8000 + DELETE→7920 over `onelake://`, log confirms `stream-write … native COPY, single
-  file, bounded memory`; the OneLake commit carries `minValues`/`maxValues`/`nullCount` — verified).
+  double→omitted**, 8000-row append, **partitioned CTAS+INSERT stream: Hive layout, partition column excluded, no
+  `__delta_row_id`, per-file partitionValues+stats in the commit**) + native_write (147) + optimize/partition/
+  overwrite_merge/update/dv/write/native_read/decimal/changes/time_travel/alter/snapshots unregressed; **live
+  OneLake** (non-partitioned CTAS 5000 + append→8000 + DELETE→7920 over `onelake://`, log confirms `stream-write …
+  native COPY … bounded memory`, commit carries `minValues`/`maxValues`/`nullCount`; partitioned CTAS+INSERT
+  round-trips via the per-file-native collect fallback).
   **OCC RETRY DONE (concurrent writers):**
   engineered-wood `WriteCommitAsync` throws `DeltaConflictException` when a concurrent writer takes the target
   version; `DeltaWriter.Write`/`Create` (append/CTAS/create) catch it and retry by reopening at the new latest
