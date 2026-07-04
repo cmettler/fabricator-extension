@@ -646,10 +646,17 @@ internal static class DeltaReader
     /// columns modified on matched positions (the caller owns the typed substitution); engineered-wood re-writes
     /// them as plain remove+add with a clean schema. Opens with the standard write options (path_in_schema).</summary>
     public static void UpdateByRowIds(nint opener, string path, IReadOnlyCollection<long> rowIds,
-        System.Func<long, IReadOnlyList<RecordBatch>, IReadOnlyList<RecordBatch>> rewriteFile, CancellationToken ct)
+        System.Func<long, IReadOnlyList<RecordBatch>, IReadOnlyList<RecordBatch>> rewriteFile, CancellationToken ct,
+        bool nativeWrite = false)
     {
         var fs = TableFileSystems.Create(opener, path);
-        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).AsTask().GetAwaiter().GetResult();
+        // native_write => DuckDB's parquet writer produces the rewritten file (bloom/stats/footer); EW still
+        // reads the affected files, applies the SET substitution (rewriteFile), and commits remove(old)+add(new).
+        var writer = nativeWrite && NativeParquetDataFileWriter.Available
+            ? new NativeParquetDataFileWriter(path)
+            : null;
+        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(dataFileWriter: writer), ct)
+            .AsTask().GetAwaiter().GetResult();
         try
         {
             table.UpdateByRowIdsAsync(rowIds, rewriteFile, ct).AsTask().GetAwaiter().GetResult();

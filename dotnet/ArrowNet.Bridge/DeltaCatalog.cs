@@ -932,7 +932,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 outBatches.Add(new RecordBatch(userSchema, newCols, batch.Length));
             }
             return outBatches;
-        }, default);
+        }, default, _nativeWrite);
 
         return updates.Count; // each distinct rowid is one updated row
     }

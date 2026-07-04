@@ -1,7 +1,8 @@
 # Native Delta write — DuckDB parquet writer + engineered-wood metadata
 
-> **Status: P0 spike + P1 (INSERT/CTAS/append) + P3 (DELETE copy-on-write rewrite, native write half) DONE
-> (2026-07-04); UPDATE (P4) + fully-native rewrite + alias-default + live OneLake still open — see §10.**
+> **Status: P0 spike + P1 (INSERT/CTAS/append) + P3 (DELETE) + P4 (UPDATE) copy-on-write native-write half DONE
+> (2026-07-04); fully-native `read_parquet` rewrite + SQL-join UPDATE substitution + CDF native change files +
+> row tracking (P5) + alias-default + live OneLake still open — see §10.**
 > Completes the "inversion" begun by the native *read* path
 > (`docs/multifile-delta.md` §"Native-read fold"): C# is a pure Delta-**metadata** provider, and DuckDB's
 > native parquet reader **and writer** do all data-file I/O. engineered-wood's weakest surface (its parquet
@@ -278,8 +279,14 @@ The whole point is standard-readability, which EW's writer kept failing. Every p
   PASSED locally (10 rows → delete evens → the official `delta_scan` reads the 5 survivors with exact decimals).
   `test/verify_delta_catalog_native_write.test` (48 — incl. DELETE + compose + durability); default-path
   delete/dv/update unregressed. CDF delete change files + fully-native rewrite still open.
-- **P4 — UPDATE** (native rewrite via the same list-form seam; SQL-join substitution to retire `BuildArray`) +
-  CDF pre/post images.
+- **P4 — UPDATE copy-on-write rewrite DONE (2026-07-04, native WRITE half).** Under `native_write true` the
+  UPDATE rewrite writes the modified file with DuckDB's native writer (same list-form seam at the UPDATE site);
+  EW reads the affected files, applies the SET substitution (still the C# `BuildArray` inverse of `ReadScalar`
+  — the SQL-join substitution to retire it is the deferred refinement), and commits `remove(old)+add(new)`. §9
+  acid test PASSED locally (constant/string/expression updates → `delta_scan` matches, exact decimals). Test +
+  33 assertions in `verify_delta_catalog_native_write.test` (now 68); default-path update/delete/dv/changes
+  unregressed. **Still deferred: SQL-join substitution (retire `BuildArray`), CDF pre/post-image native change
+  files, and the fully-native `read_parquet` rewrite read half.**
 - **P5 — row tracking**: `baseRowId` + `defaultRowCommitVersion` on the `add` from RETURN_STATS/commit
   version on append (§6.1, metadata only); DV-mode preservation (free); materialize the
   `_metadata.row_id`+`_metadata.row_commit_version` pair on rewrite (§6.2) or documented deferral. (Also

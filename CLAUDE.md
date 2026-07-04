@@ -1751,9 +1751,15 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   generalized to a batch **list** — a rewrite writes a file's survivor batches as one parquet), EW still
   selects/reads the affected files + commits `remove`+`add`; the READ half stays EW's reader (fully-native
   `read_parquet … WHERE file_row_number NOT IN` rewrite deferred), DV-mode delete unchanged (no data rewrite).
-  Acid-tested (delta_scan reads the 5 survivors, exact decimals); `verify_delta_catalog_native_write.test` (48);
-  default delete/dv/update unregressed. **UPDATE (P4) + fully-native rewrite + live OneLake/Fabric validation
-  pending.**
+  Acid-tested (delta_scan reads the 5 survivors, exact decimals); default delete/dv/update unregressed.
+  **P4 (UPDATE) DONE (2026-07-04):** the copy-on-write UPDATE rewrite likewise writes the modified file with
+  DuckDB's native writer (same list-form seam at the UPDATE site); EW reads the affected files, applies the SET
+  substitution (still C# `BuildArray` — the SQL-join substitution is deferred), and commits `remove`+`add`.
+  Acid-tested (constant/string/expression updates → delta_scan matches, exact decimals).
+  `verify_delta_catalog_native_write.test` (68 — INSERT/CTAS/append + bloom signature + DELETE + UPDATE +
+  durability); default update/delete/dv/changes unregressed. **Fully-native `read_parquet` rewrite read half +
+  SQL-join UPDATE substitution (retire `BuildArray`) + CDF native change files + row tracking (P5) + delta-alias
+  default-on + live OneLake/Fabric validation all still pending.**
   **OCC RETRY DONE (concurrent writers):**
   engineered-wood `WriteCommitAsync` throws `DeltaConflictException` when a concurrent writer takes the target
   version; `DeltaWriter.Write`/`Create` (append/CTAS/create) catch it and retry by reopening at the new latest

@@ -101,6 +101,35 @@ SELECT count(*) FROM lake.main.d;
 ----
 4
 
+# ---- UPDATE (copy-on-write): the rewritten file is produced by DuckDB's native writer ----
+statement ok
+CREATE TABLE lake.main.u AS SELECT i AS id, (i * 1.5)::DECIMAL(10,2) AS amt, 'v' || i AS name FROM range(1, 6) AS r(i);
+
+# Single-row update (constant + string), then an expression update over odd ids.
+statement ok
+UPDATE lake.main.u SET amt = amt + 100, name = 'upd' WHERE id = 3;
+
+statement ok
+UPDATE lake.main.u SET amt = amt * 2 WHERE id % 2 = 1;
+
+query IRT
+SELECT id, amt, name FROM lake.main.u ORDER BY id;
+----
+1	3.00	v1
+2	3.00	v2
+3	209.00	upd
+4	6.00	v4
+5	15.00	v5
+
+# UPDATE composes with DELETE on the same native table.
+statement ok
+DELETE FROM lake.main.u WHERE id = 2;
+
+query I
+SELECT count(*) FROM lake.main.u;
+----
+4
+
 # ---- durability: detach + re-attach re-discovers the native-written tables from the _delta_log ----
 statement ok
 DETACH lake;
