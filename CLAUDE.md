@@ -2051,6 +2051,37 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `_metadata.row_commit_version` = 1,2,3 (per-row originals, overriding the single `default_row_commit_version`=1).
   `test/verify_delta_catalog_compaction_rowtracking.test` (24); default compaction path (`verify_delta_catalog_optimize`)
   unchanged.
+  **known-issues Delta SWEEP — FIXED (2026-07-05, EW `5e0bba2` + Bridge `50e37ca`; kernel-validated, delta+deltars
+  suites green, EW DeltaLake 168 + Table 141 green):** (1) **CHECKPOINT corruption (critical)** — `CheckpointWriter`
+  dropped `add.deletionVector` (+ `baseRowId`/`defaultRowCommitVersion`) and the protocol
+  `readerFeatures`/`writerFeatures`, so with DV-default DML and `CheckpointInterval=10` **deleted rows RESURRECTED
+  after 10 commits** (even same-session; repro'd then fixed writer+reader). Also made checkpoints
+  delta-kernel-readable: `metaData.format.options` emitted + top-level action structs NULLABLE per the spec schema
+  (kernel rejects always-present structs with null required children — the DV struct is nullable too). (2)
+  **Partition-value interop** — null partitions = JSON null in `add.partitionValues` (`__HIVE_DEFAULT_PARTITION__`
+  is only the DIRECTORY name; serializer + checkpoint map values null-safe); reads decode null/sentinel/missing as
+  typed NULL columns (`BuildConstantArray` also gained Int16/Int8/Float/Double/Decimal128 + invariant culture +
+  THROWS on unsupported instead of a wrong-typed string fallback; `GetStringValue` same policy on write); decimal
+  partitions dot-notation; timestamp partition values emit the no-fraction spec form when fraction==0. (3) **PATH
+  ENCODING (new EW `DeltaPath`)** — partition dirs use Spark's `escapePathName` (escapes `:` `%` `/` …, NOT space —
+  Windows-safe), and **`add.path` is the URL-ENCODED form of the on-disk relative path (spec), URL-DECODED at every
+  EW read site + the Bridge native-reader URI builders** (rowid ordinal sort stays on the RAW encoded add.path on
+  both sides); vacuum protects encoded+decoded names; pre-fix EW tables whose add.path held literal `%XX` need a
+  rewrite (documented). This also makes Spark tables with escaped paths (spaces etc.) readable by us. (4)
+  **`timestampNtz` feature** — a schema containing `timestamp_ntz` (any naive DuckDB TIMESTAMP!) now declares the
+  required reader+writer feature at create; `AddColumnAsync`/`SetSchemaAsync` emit a protocol UPGRADE in the same
+  commit when introducing it (legacy versions upgraded to table-features mode with implied features enumerated —
+  `LegacyWriter/ReaderFeatures`); previously Spark/kernel REJECTED every table with a naive-timestamp column.
+  `generatedColumns` allowlisted + enforced like invariants. (5) **Stats/row-tracking** — `tightBounds:false` on
+  DV-carrying adds; string min/max truncated at 32 chars Spark-style (max side last-char-incremented, omitted when
+  impossible); **`delta.rowTracking` domainMetadata high-water mark emitted on every id-assigning commit**
+  (write/external-commit/merge-on-read-update/compaction) and preferred via max() on snapshot rebuild — without it
+  removes REGRESSED the derived mark and a later writer could reassign used row ids; `rowTracking` accepted as a
+  READER feature; `commitInfo` gains `engineInfo`+`operationParameters`. **Known kernel quirk (not ours):**
+  duckdb-delta/delta-kernel reads a column-MAPPED partitioned table's partition column as all-NULL (physical-keyed
+  partitionValues per the Spark convention we validated live; Spark reads it fine). Remaining documented gaps:
+  checkpoint tombstones + `add.tags`, binary partition values (clean error), orphan DV `.bin` vacuum, nested-field
+  stats.
   **engineered-wood WRITE interop caveats (reviewed 2026-07-02; from its `doc/known-issues.md`):** engineered-wood
   is a from-scratch C# Parquet/Delta stack, so the write path diverges from Spark/parquet-mr in a few subtle ways —
   none a show-stopper (Fabric/DuckDB/arrow-rs read our output, validated live), but the two "Spark-ecosystem
