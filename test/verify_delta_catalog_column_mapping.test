@@ -286,6 +286,80 @@ SELECT id, zone FROM pt2.main.sales WHERE zone = 'US' ORDER BY id;
 statement ok
 DETACH pt2;
 
+# ================= NESTED columns under mapping (default id): native_write only ==============================
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmnested' AS ns (TYPE arrownet, PROVIDER 'delta', native_write true);
+
+statement ok
+CREATE TABLE ns.main.t AS
+  SELECT 1 AS id, {'a': 10, 'b': 'x'} AS s UNION ALL SELECT 2, {'a': 20, 'b': 'y'};
+
+statement ok
+INSERT INTO ns.main.t VALUES (3, {'a': 30, 'b': 'z'});
+
+# Nested reads via the default reader: whole struct, member projection, member predicate.
+query II
+SELECT id, s.a FROM ns.main.t WHERE s.a > 15 ORDER BY id;
+----
+2	20
+3	30
+
+# The parquet stores PHYSICAL names + field_ids at EVERY level (nested children too — the recursive FIELD_IDS
+# via __duckdb_field_id; the logical names are absent) — the layout Spark/delta-kernel resolve.
+query I
+SELECT count(*) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/cmnested/t/*.parquet')
+WHERE name IN ('id', 's', 'a', 'b');
+----
+0
+
+query I
+SELECT count(DISTINCT field_id) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/cmnested/t/*.parquet')
+WHERE field_id IS NOT NULL;
+----
+4
+
+# RENAME of the struct column is metadata-only; old data reads under the new name (nested children map by
+# their stable physicalName/id through the recursive rename).
+statement ok
+ALTER TABLE ns.main.t RENAME COLUMN s TO payload;
+
+query II
+SELECT id, payload.a FROM ns.main.t ORDER BY id;
+----
+1	10
+2	20
+3	30
+
+statement ok
+DETACH ns;
+
+# The NATIVE reader renames nested children back to logical too.
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmnested' AS ns2 (TYPE arrownet, PROVIDER 'delta', native_read true);
+
+query IT
+SELECT id, payload.b FROM ns2.main.t ORDER BY id;
+----
+1	x
+2	y
+3	z
+
+statement ok
+DETACH ns2;
+
+# WITHOUT native_write, a nested write on a mapping table errors with guidance (the EW-codec writer maps
+# names/ids at the top level only — a nested file it wrote would read as NULLs in Spark/delta-kernel).
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmnestedew' AS ne (TYPE arrownet, PROVIDER 'delta');
+
+statement error
+CREATE TABLE ne.main.t AS SELECT 1 AS id, {'a': 1} AS s;
+----
+require the native streaming write
+
+statement ok
+DETACH ne;
+
 # ================= 'none' opts out (plain table; logical == physical name, no protocol bump) =================
 statement ok
 ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmnone' AS pn (TYPE arrownet, PROVIDER 'delta', column_mapping 'none');

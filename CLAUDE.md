@@ -1364,10 +1364,50 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   renamed partition column). NOTE: DuckDB's official `delta_scan` (duckdb-delta/kernel) reads mapped PARTITIONED
   tables' partition column as NULL — a kernel-side integration gap (our layout matches Spark's own convention;
   Spark is the reference).
+  **NESTED-type column mapping — DONE (2026-07-05, third pass; kernel-validated).** Nested (STRUCT) columns on a
+  mapping table now follow the spec at EVERY level: data files store nested struct children under PHYSICAL
+  `col-<guid>` names + field_ids (both were LOGICAL/id-less before → delta-kernel read nested children as
+  all-NULL — the top-level bug one level down; the Delta metadata was already recursive via
+  `AssignColumnMapping`). Per the user's direction the nested WRITE is **native (COPY) only**:
+  - **`ArrowColumnMappingRename` (Bridge)** — the C#-side analog of duckdb-delta's `MultiFileColumnMapper`:
+    recursive logical↔physical rename of an Arrow schema/batch/stream driven by the EW Delta schema
+    (physicalName metadata), matching EITHER name at every level (tolerant of aliased/legacy sources). Arrays
+    are rebuilt by re-wrapping `ArrayData` with the renamed type tree — zero copy. Structs recurse to any depth;
+    lists/maps recurse into struct elements.
+  - **WRITE (streaming COPY)**: `TryWriteStreaming` renames the input STREAM to physical (all levels — replacing
+    the old top-level SQL alias) and stamps a RECURSIVE `FIELD_IDS` spec (`DeltaWriter.BuildFieldIdsSpec` —
+    struct fields via DuckDB's `__duckdb_field_id` sentinel; list/map emit their own id as a leaf, struct-fields
+    INSIDE list/map not yet stamped — follow-up). The **EW-codec (collect) path is GATED for nested+mapping**
+    (clear error → use `native_write` or `column_mapping 'none'`): EW's writer renames/stamps top-level only, so
+    its nested files would be silently Spark-unreadable. Nested WITHOUT mapping stays allowed on both paths.
+  - **READ**: the native reader renames nested children physical→logical per batch
+    (`NativeScanList.MappedSchema`); the DEFAULT (EW) reader path gets the same recursive rename in
+    `DeltaReader.Stream/StreamWithRowIds/StreamAt/StreamWithRowIdsAt` (EW's own `RenameColumns`/`RenameByFieldId`
+    are top-level-only — upstream-fix candidate). AT-version streams rename per the AS-OF snapshot's schema.
+  - **EW fix**: `LogicalSchemaString` strips mapping metadata RECURSIVELY — without it a fresh nested CTAS
+    falsely "differed" in SetSchema's no-op compare and re-assigned every column id (the file/metadata id
+    mismatch seen in the baseline probe).
+  Verified: `verify_delta_catalog_column_mapping.test` (185 — nested CTAS/INSERT via native_write, member
+  projection/predicate, physical names + 4 distinct field_ids in the parquet, struct-column RENAME reading old
+  data, native_read nested, the EW-codec gate error); official `delta_scan` (delta-kernel) reads the nested
+  mapped table incl. after the RENAME; full delta suite 35/35; live OneLake nested CTAS+RENAME+INSERT
+  round-trip (`lake.dbo.arrownet_cmnested`) + Fabric Spark read.
+  **BUG FIXED while stabilizing (latent, pre-existing): bulk-session double-complete.** `complete_bulk` CONSUMES
+  the session handle managed-side EVEN WHEN IT RETURNS AN ERROR, but the COPY/CTAS/INSERT `Finalize` set
+  `bulk_completed = true` only AFTER the call — a thrown provider error left the flag false, so the gstate
+  destructor called `CompleteBulk(abort)` AGAIN on the freed value. GCHandle slots are RECYCLED → the second
+  free killed an arbitrary unrelated live handle → intermittent (~1 in 4) `commit_transaction failed: stale
+  catalog handle` on LATER statements (surfaced by the new PARTITION_OVERWRITE guardrail tests, which made an
+  erroring complete_bulk a routine path). Fix: all three operators mark the session consumed BEFORE the call.
+  Also `Bootstrap.RunTransactionOp` no longer falls back to `Active.OpenCatalog("")` on an unresolvable handle
+  (nonsense "empty connection string" errors) — it now throws a real stale-handle diagnostic incl. what the
+  handle resolves to.
   **Known follow-ups**: EW-codec path stats still keyed by LOGICAL names under mapping (advisory-only —
   skipping, not correctness; streaming path is spec-correct), CDC `_change_data` files written with logical names
   (read-side tolerant), a mapping REPLACE that CHANGES the schema still collects (SetSchema fresh-id re-assign
-  must precede the COPY; one-shot admin op), nested-type mapping (below).
+  must precede the COPY; one-shot admin op), struct-fields inside LIST/MAP not stamped with field_ids on write
+  (read-side recursion handles them), EW's own reader nested rename is Bridge-side only (upstream candidate),
+  CDF feed on nested mapped tables untested.
   **WRITING to a Spark-created (external) table — DONE (2026-07-05, EW-only; live Fabric-Spark round-trip).** An
   INSERT initially failed at engineered-wood's `ProtocolVersions.ValidateWriteSupport`: *"unsupported writer
   features: [appendOnly, invariants]"*. Root cause (grounded in the table's `_delta_log` protocol): enabling

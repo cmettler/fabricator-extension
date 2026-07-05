@@ -99,10 +99,13 @@ SinkCombineResultType ArrowNetPhysicalCreateTableAs::Combine(ExecutionContext &c
 SinkFinalizeType ArrowNetPhysicalCreateTableAs::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
                                                          OperatorSinkFinalizeInput &input) const {
 	auto &gstate = input.global_state.Cast<ArrowNetCtasGlobalState>();
-	// Signal end-of-stream and wait for the background load (and the CREATE TABLE) to finish.
-	gstate.total = (idx_t)arrownet::CompleteBulk(gstate.bulk_session, /*abort=*/false);
+	// Signal end-of-stream and wait for the background load (and the CREATE TABLE) to finish. complete_bulk
+	// CONSUMES the session even on error — mark it consumed BEFORE the call so a thrown provider error can't
+	// lead the destructor to double-complete a freed (and possibly recycled) handle.
+	auto session = gstate.bulk_session;
 	gstate.bulk_completed = true;
 	gstate.bulk_session = nullptr;
+	gstate.total = (idx_t)arrownet::CompleteBulk(session, /*abort=*/false);
 	// Make the new table visible in the attached catalog for this session.
 	if (info_.schema_entry) {
 		const_cast<ArrowNetSchemaEntry &>(*info_.schema_entry).AddTable(info_.table_name, "BASE TABLE");

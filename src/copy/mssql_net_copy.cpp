@@ -191,10 +191,15 @@ static void CopyToCombine(ExecutionContext &context, FunctionData &bind_data, Gl
 static void CopyToFinalize(ClientContext &context, FunctionData &bind_data_p, GlobalFunctionData &gstate_p) {
 	auto &bind_data = bind_data_p.Cast<ArrowNetCopyBindData>();
 	auto &gstate = gstate_p.Cast<ArrowNetCopyGlobalState>();
-	// Signal end-of-stream and wait for the background load to drain.
-	arrownet::CompleteBulk(gstate.bulk_session, /*abort=*/false);
+	// Signal end-of-stream and wait for the background load to drain. complete_bulk CONSUMES the session
+	// (the managed side frees the handle even when the call returns an error), so mark it consumed BEFORE the
+	// call — if it throws with the flag still false, the gstate destructor would CompleteBulk(abort) AGAIN on
+	// the freed value, and GCHandle slots are recycled: the double-free kills an unrelated live handle
+	// (surfaced as intermittent "stale catalog handle" commit failures after an erroring COPY).
+	auto session = gstate.bulk_session;
 	gstate.bulk_completed = true;
 	gstate.bulk_session = nullptr;
+	arrownet::CompleteBulk(session, /*abort=*/false);
 
 	// Register the target in the attached catalog so it's queryable immediately
 	// (also invalidates any stale cached entry, e.g. for CREATE_TABLE/REPLACE).

@@ -845,8 +845,14 @@ public static unsafe class Bootstrap
     {
         try
         {
+            // No fallback here: a transaction op on an unresolvable handle means the host holds a STALE catalog
+            // handle (GCHandle slots are reused after a DETACH frees them, so the old value may resolve to an
+            // arbitrary unrelated object) — surface it as the diagnostic it is instead of opening a nonsense
+            // default catalog with an empty connection string.
             var catalog = Handles.Resolve<IBackendCatalog>(handle)
-                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+                          ?? throw new InvalidOperationException(
+                              $"ArrowNet: transaction op on a stale/unknown catalog handle 0x{handle:x} "
+                              + $"(resolves to: {Handles.Resolve<object>(handle)?.GetType().FullName ?? "<freed>"})");
             op(catalog);
             return ArrowNetStatus.Ok;
         }

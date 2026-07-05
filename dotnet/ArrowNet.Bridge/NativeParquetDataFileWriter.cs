@@ -77,7 +77,7 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
     internal static (long Rows, long Size, string? Stats) RunCopy(
         string writableRoot, string relativePath, IArrowArrayStream src, CancellationToken ct,
         Schema? statsSchema = null, IReadOnlyDictionary<string, int>? fieldIds = null,
-        IReadOnlyDictionary<string, string>? renameToPhysical = null)
+        IReadOnlyDictionary<string, string>? renameToPhysical = null, string? fieldIdsSpec = null)
     {
         var rel = relativePath.Replace('\\', '/').TrimStart('/');
         var uri = writableRoot + "/" + rel;
@@ -93,7 +93,8 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
         }
         var sql =
             $"COPY (SELECT {SelectList(src.Schema, renameToPhysical)} FROM {InputName}) TO '{uri.Replace("'", "''")}' " +
-            "(FORMAT parquet, WRITE_BLOOM_FILTER true, RETURN_STATS" + FieldIdsClause(fieldIds) + ")";
+            "(FORMAT parquet, WRITE_BLOOM_FILTER true, RETURN_STATS"
+            + (fieldIdsSpec is not null ? ", FIELD_IDS " + fieldIdsSpec : FieldIdsClause(fieldIds)) + ")";
         Log.LogInformation("delta native copy {Uri}", uri);
         var input = new (string, IArrowArrayStream)[] { (InputName, src) };
         using var result = Host.Query(sql, input);
@@ -116,15 +117,16 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
     internal static List<CopiedFile> RunCopyPartitioned(
         string writableRoot, IReadOnlyList<string> partitionColumns, IArrowArrayStream src,
         CancellationToken ct, Schema? statsSchema, IReadOnlyDictionary<string, int>? fieldIds = null,
-        IReadOnlyDictionary<string, string>? renameToPhysical = null)
+        IReadOnlyDictionary<string, string>? renameToPhysical = null, string? fieldIdsSpec = null)
     {
-        // Under column mapping the projection aliases logical -> physical, so `partitionColumns` must already be
-        // the PHYSICAL (output) names — dirs, RETURN_STATS.partition_keys, and FIELD_IDS all key by them.
+        // Under column mapping the input stream was renamed to physical names, so `partitionColumns` must
+        // already be the PHYSICAL (output) names — dirs, RETURN_STATS.partition_keys, and FIELD_IDS key by them.
         var quoted = string.Join(", ", partitionColumns.Select(c => "\"" + c.Replace("\"", "\"\"") + "\""));
         var sql =
             $"COPY (SELECT {SelectList(src.Schema, renameToPhysical)} FROM {InputName}) TO '{writableRoot.Replace("'", "''")}' " +
             $"(FORMAT parquet, PARTITION_BY ({quoted}), APPEND true, FILENAME_PATTERN '{{uuid}}', " +
-            "WRITE_BLOOM_FILTER true, RETURN_STATS" + FieldIdsClause(fieldIds) + ")";
+            "WRITE_BLOOM_FILTER true, RETURN_STATS"
+            + (fieldIdsSpec is not null ? ", FIELD_IDS " + fieldIdsSpec : FieldIdsClause(fieldIds)) + ")";
         Log.LogInformation("delta native partitioned copy {Root} by [{Cols}]", writableRoot, quoted);
         var input = new (string, IArrowArrayStream)[] { (InputName, src) };
         using var result = Host.Query(sql, input);

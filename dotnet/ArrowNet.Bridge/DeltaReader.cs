@@ -80,9 +80,15 @@ internal static class DeltaReader
         /// resolves each file's parquet <c>field_id → physical parquet name</c> (via <c>parquet_schema</c>) and
         /// composes logical → field_id → physical name, then aliases as for name mode — so it reads BOTH an
         /// engineered-wood id-mode table (logical names in the files) AND an external Spark/Databricks id-mode table
-        /// (col-&lt;guid&gt; physical names), and survives a column RENAME (field_id is stable). Top-level columns
-        /// only; a nested mapped column needs recursive field-id remapping (a later slice).</summary>
+        /// (col-&lt;guid&gt; physical names), and survives a column RENAME (field_id is stable).</summary>
         public IReadOnlyDictionary<string, int>? LogicalToFieldId { get; init; }
+
+        /// <summary>The snapshot's mapped Delta schema, set ONLY for a column-mapping table with NESTED
+        /// (struct-carrying) fields: nested children arrive from <c>read_parquet</c> under their PHYSICAL names
+        /// (a flat SELECT alias can't rename struct children), so the native reader applies
+        /// <see cref="ArrowColumnMappingRename"/> to each batch (a zero-copy recursive type-tree rename back to
+        /// the logical names). Null for flat tables (fully handled by the top-level alias).</summary>
+        public EngineeredWood.DeltaLake.Schema.StructType? MappedSchema { get; init; }
     }
 
     /// <summary>Resolves the version whose commit is at/just-before <paramref name="instantUtc"/> (via the
@@ -190,12 +196,18 @@ internal static class DeltaReader
                 var map = EngineeredWood.DeltaLake.Schema.ColumnMapping.BuildLogicalToFieldIdMap(snap.Schema);
                 logicalToFieldId = map.Count > 0 ? map : null;
             }
+            // Nested mapped fields (struct children under physical names in the files) need the recursive
+            // batch rename — carry the mapped schema so the reader can apply it.
+            var mappedSchema = mode != EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None
+                               && ArrowColumnMappingRename.HasNestedFields(snap.Schema)
+                ? snap.Schema : null;
             log.LogDebug("delta native list: {Path} v{Version} active={Active} scanned={Scanned} pruned={Pruned} colmap={Map}",
                 path, snap.Version, ordered.Count, files.Count, pruned, mode);
             return new NativeScanList
             {
                 Version = snap.Version, Files = files, AnyUri = anyUri,
                 LogicalToPhysical = logicalToPhysical, LogicalToFieldId = logicalToFieldId,
+                MappedSchema = mappedSchema,
             };
         }
         finally
@@ -310,6 +322,17 @@ internal static class DeltaReader
         return StreamImpl(fs, options, columns, filter, ct);
     }
 
+    // Returns the snapshot's mapped Delta schema when the table has column mapping AND nested (struct-carrying)
+    // fields — the engineered-wood reader renames only TOP-LEVEL columns back to logical (RenameColumns /
+    // RenameByFieldId), so nested struct children still carry their physical names and need the recursive
+    // batch rename. Null (no transform) for flat or unmapped tables.
+    private static EngineeredWood.DeltaLake.Schema.StructType? NestedMappedSchema(
+        EngineeredWood.DeltaLake.Snapshot.Snapshot snap)
+        => EngineeredWood.DeltaLake.Schema.ColumnMapping.GetMode(snap.Metadata.Configuration)
+               != EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None
+           && ArrowColumnMappingRename.HasNestedFields(snap.Schema)
+            ? snap.Schema : null;
+
     private static async IAsyncEnumerable<RecordBatch> StreamImpl(
         ITableFileSystem fs, DeltaTableOptions options, IReadOnlyList<string>? columns,
         Predicate? filter, [EnumeratorCancellation] CancellationToken ct)
@@ -317,9 +340,12 @@ internal static class DeltaReader
         var table = await DeltaTable.OpenAsync(fs, options, ct).ConfigureAwait(false);
         try
         {
+            var nested = NestedMappedSchema(table.CurrentSnapshot);
             await foreach (var batch in table.ReadAllAsync(columns, filter, ct).ConfigureAwait(false))
             {
-                yield return batch;
+                yield return nested is null
+                    ? batch
+                    : ArrowColumnMappingRename.RenameBatch(batch, nested, toPhysical: false);
             }
         }
         finally
@@ -347,9 +373,12 @@ internal static class DeltaReader
         var table = await DeltaTable.OpenAsync(fs, options, ct).ConfigureAwait(false);
         try
         {
+            var nested = NestedMappedSchema(table.CurrentSnapshot);
             await foreach (var batch in table.ReadAllWithRowIdsAsync(columns, filter, ct).ConfigureAwait(false))
             {
-                yield return batch;
+                yield return nested is null
+                    ? batch
+                    : ArrowColumnMappingRename.RenameBatch(batch, nested, toPhysical: false);
             }
         }
         finally
@@ -482,10 +511,13 @@ internal static class DeltaReader
         try
         {
             var snap = await ResolveSnapshotAsync(table, unit, value, ct).ConfigureAwait(false);
+            var nested = NestedMappedSchema(snap); // the AS-OF snapshot names the columns
             await foreach (var batch in table.ReadAtVersionAsync(snap.Version, columns, filter, ct)
                                .ConfigureAwait(false))
             {
-                yield return batch;
+                yield return nested is null
+                    ? batch
+                    : ArrowColumnMappingRename.RenameBatch(batch, nested, toPhysical: false);
             }
         }
         finally
@@ -652,10 +684,13 @@ internal static class DeltaReader
         try
         {
             var snap = await ResolveSnapshotAsync(table, unit, value, ct).ConfigureAwait(false);
+            var nested = NestedMappedSchema(snap); // the AS-OF snapshot names the columns
             await foreach (var batch in table.ReadAtVersionWithRowIdsAsync(snap.Version, columns, filter, ct)
                                .ConfigureAwait(false))
             {
-                yield return batch;
+                yield return nested is null
+                    ? batch
+                    : ArrowColumnMappingRename.RenameBatch(batch, nested, toPhysical: false);
             }
         }
         finally

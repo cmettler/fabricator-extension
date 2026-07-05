@@ -136,7 +136,11 @@ internal static class DeltaNativeReader
             var probeFile = new DeltaReader.NativeScanFile(0, probe, System.Array.Empty<long>());
             var sql = FileSql(dataCols, wantRowId, where: null, probeFile, LogToPhys(listing, probe)) + " LIMIT 0";
             using var s = Host.Query(sql);
-            return s.Schema;
+            // Nested mapped fields: the probed schema carries physical struct-child names — rename to logical
+            // (top level is already logical via the SELECT alias; the transform passes it through).
+            return listing.MappedSchema is { } ms
+                ? ArrowColumnMappingRename.RenameSchema(s.Schema, ms, toPhysical: false)
+                : s.Schema;
         }
         var fields = new List<Field>();
         foreach (var c in dataCols)
@@ -194,6 +198,12 @@ internal static class DeltaNativeReader
                                 if (b is null)
                                 {
                                     break;
+                                }
+                                // Nested mapped fields: rename physical struct-child names back to logical
+                                // (zero-copy type-tree rewrap; top level already logical via the SELECT alias).
+                                if (listing.MappedSchema is { } ms)
+                                {
+                                    b = ArrowColumnMappingRename.RenameBatch(b, ms, toPhysical: false);
                                 }
                                 await writer.WriteAsync(b, ct).ConfigureAwait(false);
                             }

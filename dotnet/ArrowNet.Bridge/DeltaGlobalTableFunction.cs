@@ -489,6 +489,21 @@ internal static class DeltaWriter
                                                      cancellationToken: ct).AsTask().GetAwaiter().GetResult();
             try
             {
+                // NESTED columns + column mapping require the native streaming COPY (TryWriteStreaming): this
+                // collect path writes via engineered-wood's codec (or the per-file host writer), whose
+                // physical-rename + field-id stamping is TOP-LEVEL only — nested struct fields would land under
+                // logical names without ids, which spec readers (Spark/delta-kernel) resolve to NULL. Error with
+                // guidance rather than write a silently-unreadable file.
+                if (HasNestedColumns(schema)
+                    && EngineeredWood.DeltaLake.Schema.ColumnMapping.GetMode(table.CurrentSnapshot.Metadata.Configuration)
+                       != EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None)
+                {
+                    throw new System.NotSupportedException(
+                        "Nested (STRUCT/LIST/MAP) columns on a column-mapping Delta table require the native "
+                        + "streaming write: ATTACH with `native_write true` (and avoid replace_where / "
+                        + "SCHEMA_MODE / a schema-changing REPLACE for nested tables), or opt out of mapping "
+                        + "with `column_mapping 'none'`.");
+                }
                 if (mode == DeltaWriteMode.Overwrite)
                 {
                     // A true replace (CREATE OR REPLACE / CTAS-replace / COPY REPLACE / schema_mode=overwrite):
@@ -572,19 +587,25 @@ internal static class DeltaWriter
             var partCols = table.CurrentSnapshot.Metadata.PartitionColumns;
             var mappingMode = EngineeredWood.DeltaLake.Schema.ColumnMapping.GetMode(
                 table.CurrentSnapshot.Metadata.Configuration);
-            IReadOnlyDictionary<string, int>? fieldIds = null;
-            IReadOnlyDictionary<string, string>? renameToPhysical = null;
+            string? fieldIdsSpec = null;
             Schema statsSchema = data.Schema;
             IReadOnlyList<string> copyPartCols = partCols;
+            IArrowArrayStream copySource = data;
             if (mappingMode != EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None)
             {
                 var snapSchema = table.CurrentSnapshot.Schema;
-                renameToPhysical = EngineeredWood.DeltaLake.Schema.ColumnMapping.BuildLogicalToPhysicalMap(
+                var renameToPhysical = EngineeredWood.DeltaLake.Schema.ColumnMapping.BuildLogicalToPhysicalMap(
                     snapSchema, mappingMode);
-                // Partitioned mapping table: the COPY partitions by the PHYSICAL column names (the projection
-                // aliased every column), so RETURN_STATS.partition_keys — and therefore the committed
-                // partitionValues — come back keyed PHYSICAL, the Delta-spec convention Spark uses (physical keys
-                // survive a partition-column RENAME). Directory names follow; readers treat paths as opaque.
+                // The COPY must emit the PHYSICAL layout at EVERY level (Delta spec: data files use physical
+                // names in both modes — nested struct fields included, which a flat SELECT alias cannot rename).
+                // Rename the input stream itself (a zero-copy Arrow type-tree rewrap); the COPY then writes
+                // SELECT * of the already-physical stream. Lazy — nothing is consumed until the COPY pulls, so
+                // the fallback `return null` paths below leave `data` intact for the collect path.
+                copySource = ArrowColumnMappingRename.Wrap(data, snapSchema, toPhysical: true);
+                // Partitioned mapping table: PARTITION_BY uses the PHYSICAL column names (matching the renamed
+                // stream), so RETURN_STATS.partition_keys — and therefore the committed partitionValues — come
+                // back keyed PHYSICAL, the Delta-spec convention Spark uses (physical keys survive a
+                // partition-column RENAME). Directory names follow; readers treat paths as opaque.
                 if (partCols.Count > 0)
                 {
                     var phys = new List<string>(partCols.Count);
@@ -594,17 +615,11 @@ internal static class DeltaWriter
                     }
                     copyPartCols = phys;
                 }
-                // FIELD_IDS is keyed by the COPY's OUTPUT (physical) column names. Partition columns are excluded
-                // (COPY PARTITION_BY leaves them out of the data files).
-                var partSet = new HashSet<string>(partCols, System.StringComparer.Ordinal);
-                var logToId = EngineeredWood.DeltaLake.Schema.ColumnMapping.BuildLogicalToFieldIdMap(snapSchema);
-                var physIds = new Dictionary<string, int>();
-                foreach (var kv in logToId)
-                {
-                    if (partSet.Contains(kv.Key)) { continue; }
-                    physIds[renameToPhysical.TryGetValue(kv.Key, out var p) ? p : kv.Key] = kv.Value;
-                }
-                fieldIds = physIds.Count > 0 ? physIds : null;
+                // FIELD_IDS keyed by the COPY's OUTPUT (physical) names — RECURSIVE for struct fields (the
+                // __duckdb_field_id sentinel), so nested columns carry their delta.columnMapping.id in the
+                // parquet. Partition columns are excluded (COPY PARTITION_BY leaves them out of the files).
+                fieldIdsSpec = BuildFieldIdsSpec(snapSchema,
+                    partCols.Count > 0 ? new HashSet<string>(partCols, System.StringComparer.Ordinal) : null);
                 // Stats in the Delta log are keyed by the PHYSICAL column names (spec) — type them from a
                 // physical-renamed copy of the write schema so BuildDeltaStats emits physical keys.
                 var physFields = new List<Field>(data.Schema.FieldsList.Count);
@@ -648,11 +663,11 @@ internal static class DeltaWriter
             {
                 // Partitioned: DuckDB COPY PARTITION_BY streams the Hive col=val/ layout in one pass — one+ files
                 // per partition, each with its partition values (from RETURN_STATS.partition_keys) + stats. Under
-                // mapping the projection aliases every column to its physical name and partitions by the PHYSICAL
+                // mapping the stream was renamed to physical names (all levels) and partitions by the PHYSICAL
                 // names, so dirs + partitionValues keys are physical (Delta spec) and FIELD_IDS stamp the files.
                 var copied = NativeParquetDataFileWriter.RunCopyPartitioned(
-                    writableRoot, copyPartCols, data, default, statsSchema: statsSchema,
-                    fieldIds: fieldIds, renameToPhysical: renameToPhysical);
+                    writableRoot, copyPartCols, copySource, default, statsSchema: statsSchema,
+                    fieldIdsSpec: fieldIdsSpec);
                 files = new List<WrittenDataFile>(copied.Count);
                 long total = 0;
                 foreach (var cf in copied)
@@ -665,12 +680,12 @@ internal static class DeltaWriter
             }
             else
             {
-                // Non-partitioned: stream into ONE parquet file (for a mapping table the COPY renames the columns
-                // to their physical names + stamps FIELD_IDS; stats are typed/keyed by the physical schema).
+                // Non-partitioned: stream into ONE parquet file (for a mapping table the stream was renamed to
+                // physical names at every level + FIELD_IDS stamps the ids recursively; stats keyed physical).
                 string fileRel = $"{System.Guid.NewGuid():N}.parquet";
                 var (rows, size, stats) = NativeParquetDataFileWriter.RunCopy(
-                    writableRoot, fileRel, data, default, statsSchema: statsSchema, fieldIds: fieldIds,
-                    renameToPhysical: renameToPhysical);
+                    writableRoot, fileRel, copySource, default, statsSchema: statsSchema,
+                    fieldIdsSpec: fieldIdsSpec);
                 rowsWritten = rows;
                 // 0 rows → reference no file (an empty COPY output would be an unreferenced orphan); an Overwrite
                 // still commits its removes (clears the table), an Append commits an empty version.
@@ -692,6 +707,74 @@ internal static class DeltaWriter
             table.DisposeAsync().AsTask().GetAwaiter().GetResult();
         }
     }
+
+    /// <summary>Renders the COPY <c>FIELD_IDS</c> spec from a column-mapping Delta schema: keys are the PHYSICAL
+    /// column names (matching the physically-renamed COPY input stream), values the <c>delta.columnMapping.id</c>;
+    /// a STRUCT field renders recursively via DuckDB's <c>__duckdb_field_id</c> sentinel so nested columns carry
+    /// their ids in the parquet. List/map fields emit their own id as a leaf (struct fields INSIDE a list/map are
+    /// not yet stamped — a documented follow-up; plain lists/maps of primitives need no inner mapping).
+    /// <paramref name="excludeTopLogical"/> drops partition columns (excluded from the data files). Returns null
+    /// when no field carries an id (a non-mapping table).</summary>
+    internal static string? BuildFieldIdsSpec(
+        EngineeredWood.DeltaLake.Schema.StructType schema, ISet<string>? excludeTopLogical)
+    {
+        var sb = new System.Text.StringBuilder("{");
+        bool any = false;
+        foreach (var f in schema.Fields)
+        {
+            if (excludeTopLogical?.Contains(f.Name) == true) { continue; }
+            AppendFieldIdEntry(sb, f, ref any);
+        }
+        sb.Append('}');
+        return any ? sb.ToString() : null;
+    }
+
+    private static void AppendFieldIdEntry(
+        System.Text.StringBuilder sb, EngineeredWood.DeltaLake.Schema.StructField f, ref bool any)
+    {
+        int? id = EngineeredWood.DeltaLake.Schema.ColumnMapping.GetFieldId(f);
+        if (id is null) { return; }
+        if (any) { sb.Append(", "); }
+        any = true;
+        string phys = EngineeredWood.DeltaLake.Schema.ColumnMapping.GetPhysicalName(
+            f, EngineeredWood.DeltaLake.Schema.ColumnMappingMode.Name); // mapping-on ⇒ returns physicalName
+        sb.Append('\'').Append(phys.Replace("'", "''")).Append("': ");
+        if (f.Type is EngineeredWood.DeltaLake.Schema.StructType st)
+        {
+            sb.Append("{__duckdb_field_id: ").Append(id.Value);
+            bool childAny = true; // the sentinel counts as the first entry — children always append with ", "
+            foreach (var child in st.Fields)
+            {
+                AppendFieldIdEntry(sb, child, ref childAny);
+            }
+            sb.Append('}');
+        }
+        else
+        {
+            sb.Append(id.Value);
+        }
+    }
+
+    /// <summary>True when any field (at any depth) contains a STRUCT — the gate for nested column-mapping
+    /// handling (the EW-codec writer maps names/ids at the top level only, so nested + mapping must go through
+    /// the native streaming COPY).</summary>
+    internal static bool HasNestedColumns(Schema schema)
+    {
+        foreach (var f in schema.FieldsList)
+        {
+            if (ContainsStruct(f.DataType)) { return true; }
+        }
+        return false;
+    }
+
+    private static bool ContainsStruct(Apache.Arrow.Types.IArrowType t) => t switch
+    {
+        Apache.Arrow.Types.StructType => true,
+        Apache.Arrow.Types.ListType lt => ContainsStruct(lt.ValueField.DataType),
+        Apache.Arrow.Types.LargeListType llt => ContainsStruct(llt.ValueField.DataType),
+        Apache.Arrow.Types.MapType mt => ContainsStruct(mt.KeyField.DataType) || ContainsStruct(mt.ValueField.DataType),
+        _ => false,
+    };
 
     /// <summary>True when the two schemas declare the same column names in the same order (logical shape; types
     /// not compared — a same-name different-type replace falls back via the streamed COPY's own bind).</summary>

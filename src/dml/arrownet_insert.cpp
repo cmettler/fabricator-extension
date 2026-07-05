@@ -131,10 +131,13 @@ SinkFinalizeType ArrowNetPhysicalInsert::Finalize(Pipeline &pipeline, Event &eve
 		arrownet::InsertReturning(handle_, target_.schema_name, target_.table_name, *gstate.producer->Stream(), out);
 		gstate.returning_reader = make_uniq<arrownet::ArrowStreamReader>(context, out);
 	} else {
-		// Signal end-of-stream and wait for the background bulk load to drain.
-		gstate.total = (idx_t)arrownet::CompleteBulk(gstate.bulk_session, /*abort=*/false);
+		// Signal end-of-stream and wait for the background bulk load to drain. complete_bulk CONSUMES the
+		// session even on error — mark it consumed BEFORE the call so a thrown provider error can't lead the
+		// destructor to double-complete a freed (and possibly recycled) handle.
+		auto session = gstate.bulk_session;
 		gstate.bulk_completed = true;
 		gstate.bulk_session = nullptr;
+		gstate.total = (idx_t)arrownet::CompleteBulk(session, /*abort=*/false);
 	}
 	return SinkFinalizeType::READY;
 }
