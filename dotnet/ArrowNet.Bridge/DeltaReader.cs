@@ -44,7 +44,7 @@ internal static class DeltaReader
             var uris = new List<string>();
             foreach (var add in table.CurrentSnapshot.ActiveFiles.Values)
             {
-                uris.Add(root + "/" + add.Path.Replace('\\', '/').TrimStart('/'));
+                uris.Add(root + "/" + EngineeredWood.DeltaLake.DeltaPath.Decode(add.Path).Replace('\\', '/').TrimStart('/'));
             }
             return uris;
         }
@@ -147,7 +147,7 @@ internal static class DeltaReader
             for (int ordinal = 0; ordinal < ordered.Count; ordinal++)
             {
                 var add = ordered[ordinal];
-                var uri = root + "/" + add.Path.Replace('\\', '/').TrimStart('/');
+                var uri = root + "/" + EngineeredWood.DeltaLake.DeltaPath.Decode(add.Path).Replace('\\', '/').TrimStart('/');
                 anyUri ??= uri;
                 if (pruner is not null && !pruner.ShouldInclude(add, prune!))
                 {
@@ -238,7 +238,7 @@ internal static class DeltaReader
                     sb.Append(',');
                 }
                 first = false;
-                var uri = root + "/" + add.Path.Replace('\\', '/').TrimStart('/');
+                var uri = root + "/" + EngineeredWood.DeltaLake.DeltaPath.Decode(add.Path).Replace('\\', '/').TrimStart('/');
                 sb.Append("{\"path\":\"").Append(uri.Replace("\\", "\\\\").Replace("\"", "\\\"")).Append('"');
                 // Slice 1b — deletion vectors: resolve the file's DV to the deleted ROW POSITIONS (sorted), so the
                 // C++ MultiFileReader attaches a DeleteFilter and DuckDB's native read excludes them. Positions are
