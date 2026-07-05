@@ -436,8 +436,14 @@ public sealed class DeltaRsCatalog : IBackendCatalog
     // already maps to delta-rs SchemaMode::Merge in the bridge, so merge = force Append.
     public long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable,
                            bool replace, bool checkConstraints, long txnId, IReadOnlyList<string>? partitionColumns,
-                           IReadOnlyList<string>? sortColumns, string? schemaMode)
+                           IReadOnlyList<string>? sortColumns, string? schemaMode, bool partitionOverwrite)
     {
+        if (partitionOverwrite)
+        {
+            throw new NotSupportedException(
+                "deltars provider: COPY PARTITION_OVERWRITE is not supported yet (use the engineeredwooddelta "
+                + "provider, or delta-rs replace_where via a future MERGE surface).");
+        }
         // sortColumns (SORTED BY) is a warehouse CLUSTER BY concept — Delta doesn't cluster; ignored.
         bool merge = string.Equals(schemaMode, "merge", StringComparison.OrdinalIgnoreCase);
         bool overwriteSchema = string.Equals(schemaMode, "overwrite", StringComparison.OrdinalIgnoreCase);

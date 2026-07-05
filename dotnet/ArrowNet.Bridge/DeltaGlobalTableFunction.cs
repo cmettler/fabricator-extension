@@ -328,7 +328,12 @@ internal sealed record DeltaWriteSpec(
     IReadOnlyDictionary<string, string>? ReplaceWhere = null,
     // schema_mode (SCHEMA_MODE COPY option / delta_write_options): Merge = append+union new columns;
     // Overwrite = replace data + adopt the incoming schema. None = write-mode default.
-    DeltaSchemaMode SchemaMode = DeltaSchemaMode.None);
+    DeltaSchemaMode SchemaMode = DeltaSchemaMode.None,
+    // PARTITION_OVERWRITE COPY option: DYNAMIC partition overwrite (Spark partitionOverwriteMode=dynamic) —
+    // the partitions PRESENT IN THE INPUT are atomically replaced in one commit (their current files removed +
+    // the new files added); untouched partitions kept. Append-shaped only; requires a partitioned table.
+    // Unlike ReplaceWhere (a STATIC, user-supplied partition filter) the target set is derived from the data.
+    bool DynamicPartitionOverwrite = false);
 
 /// <summary>
 /// Writes a Delta Lake table via engineered-wood through the host FileSystem (the <see cref="DuckDbTableFileSystem"/>
@@ -352,6 +357,7 @@ internal static class DeltaWriter
         if (spec?.PartitionColumns is { Count: > 0 } pc) { parts.Add("partition_by=" + string.Join("/", pc)); }
         if (spec?.SchemaMode is { } sm && sm != DeltaSchemaMode.None) { parts.Add("schema_mode=" + sm); }
         if (spec?.ReplaceWhere is { Count: > 0 }) { parts.Add("replace_where"); }
+        if (spec?.DynamicPartitionOverwrite == true) { parts.Add("partition_overwrite"); }
         return parts.Count == 0 ? "plain" : string.Join(",", parts);
     }
 
@@ -497,10 +503,13 @@ internal static class DeltaWriter
                     // Append + UNION: add any incoming column absent from the table (nullable) before appending.
                     MergeSchema(table, schema, ct);
                 }
-                // replace_where => atomic partition-overwrite (one commit); otherwise the requested append/overwrite.
+                // replace_where => STATIC partition-overwrite; PARTITION_OVERWRITE => DYNAMIC (partitions present
+                // in the input); otherwise the requested append/overwrite. Each is one atomic commit.
                 long version = spec?.ReplaceWhere is { Count: > 0 } parts
                     ? table.OverwritePartitionsAsync(batches, parts, ct).AsTask().GetAwaiter().GetResult()
-                    : table.WriteAsync(batches, mode, ct).AsTask().GetAwaiter().GetResult();
+                    : spec?.DynamicPartitionOverwrite == true
+                        ? table.DynamicOverwriteAsync(batches, ct).AsTask().GetAwaiter().GetResult()
+                        : table.WriteAsync(batches, mode, ct).AsTask().GetAwaiter().GetResult();
                 Log.LogInformation("delta write {Path}: committed v{Version}", path, version);
                 return version;
             }
@@ -607,6 +616,13 @@ internal static class DeltaWriter
                 }
                 statsSchema = new Schema(physFields, null);
             }
+            // PARTITION_OVERWRITE requires a partitioned target — with none there is no partition to scope the
+            // overwrite to (an unpartitioned "dynamic overwrite" would be a disguised full replace; error instead).
+            if (spec?.DynamicPartitionOverwrite == true && partCols.Count == 0)
+            {
+                throw new System.ArgumentException(
+                    "PARTITION_OVERWRITE requires a partitioned table (the target has no partition columns).");
+            }
             if (mode == DeltaWriteMode.Overwrite)
             {
                 if (mappingMode == EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None)
@@ -663,7 +679,9 @@ internal static class DeltaWriter
                     : new List<WrittenDataFile>();
             }
 
-            long version = table.CommitDataFilesAsync(files, mode, default).AsTask().GetAwaiter().GetResult();
+            long version = table.CommitDataFilesAsync(
+                files, mode, dynamicPartitionOverwrite: spec?.DynamicPartitionOverwrite == true,
+                cancellationToken: default).AsTask().GetAwaiter().GetResult();
             Log.LogInformation(
                 "delta stream-write {Path}: committed v{Version} rows={Rows} files={Files} (native COPY, bounded memory)",
                 path, version, rowsWritten, files.Count);

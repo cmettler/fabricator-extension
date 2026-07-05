@@ -1145,7 +1145,32 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v58** (v58 = additive `host_log` on `ArrowNetHostServices` — forward managed ILogger events into DuckDB internal logging; wired + lockstep-verified + **`duckdb_logs` surfacing CONFIRMED LIVE**: `CALL enable_logging(storage='memory')` then `SELECT * FROM duckdb_logs WHERE type LIKE 'ArrowNet%'` shows the events with the ILogger category as `type` [`ArrowNet.Delta`/`.Native`] + mapped `log_level`. The earlier 0-rows was two red herrings, not a code bug: the enable form is `CALL enable_logging(...)` not `PRAGMA`, and the **shell** defaults log storage to a console-printing sink [`storage='memory'` is the `unittest`/API default]. `WriteLog` bypasses `ShouldLog` + the client flushes the log buffer per query, so no instance-vs-connection-logger issue. The `ARROWNET_LOG_LEVEL`+`ARROWNET_LOG_FILE` file sink is the always-on independent trace).
+- **Current version: ABI v59** (v59 = `begin_bulk` gained an `int32 partition_overwrite` arg — the
+  **`PARTITION_OVERWRITE` COPY option**: DYNAMIC partition overwrite (Spark `partitionOverwriteMode=dynamic`) —
+  `COPY src TO 'cat.sch.t' (FORMAT mssql_net, CREATE_TABLE false, PARTITION_OVERWRITE true)` atomically replaces
+  exactly the partitions PRESENT IN THE INPUT in ONE Delta commit (their active files removed + the new files
+  added — a log-level swap, no physical delete, so time travel keeps working; unlike DuckDB COPY's local-only
+  physical OVERWRITE flag); untouched partitions are unaffected. The SQL-friendly successor to the
+  `delta_write_options` `replace_where` setting (which stays for INSERT — STATIC explicit filter vs this DYNAMIC
+  data-derived one; combining both errors). Guards: C++ bind rejects it with CREATE_TABLE/REPLACE; the provider
+  rejects SCHEMA_MODE 'overwrite' combos + an unpartitioned target; providers WITHOUT partition semantics
+  (SQL Server/DAX/deltars) REJECT it when set — an overwrite flag must never be silently ignored (deliberate
+  break from the advisory schema/sort-option precedent). Delta: STREAMS under `native_write` (the partitioned
+  COPY runs as usual; EW `CommitDataFilesAsync(dynamicPartitionOverwrite:)` derives the touched set from the
+  written files' partitionValues and removes the matching active files) and collects otherwise (EW
+  `DynamicOverwriteAsync` → `WriteCoreAsync(dynamicPartitionOverwrite:)` collects touched canonical partition
+  keys during the write — `CanonicalPartitionKey`, physical-keyed under mapping with logical-key tolerance for
+  old commits). `appendOnly` enforcement treats it as a non-append (it removes files).
+  **CDF respects it**: the overwrite commit carries no `_change_data` files, so the feed INFERS the swap —
+  removed files' rows → `delete`, added files → `insert` (Spark's representation of an overwrite). Making that
+  correct fixed TWO PRE-EXISTING CDF-inference gaps (EW `CdfReader` rewritten to take the current snapshot):
+  (1) on a PARTITIONED table the inferred rows lacked the partition column (data files exclude it — now re-added
+  from the action's `partitionValues` via `PartitionUtils.AddPartitionColumns`, dual logical|physical keys);
+  (2) a removed/added file's **deletion vector** was ignored — already-DV-deleted rows were re-reported as
+  deletes (now excluded via `DeletionVectorFilter`; they were reported when the DV committed).
+  `test/verify_delta_catalog_partition_overwrite.test` (85 — collect + streaming, one-commit swap, time travel,
+  CDF feed incl. the DV edge, guardrails).)
+- **Prior: v58** (v58 = additive `host_log` on `ArrowNetHostServices` — forward managed ILogger events into DuckDB internal logging; wired + lockstep-verified + **`duckdb_logs` surfacing CONFIRMED LIVE**: `CALL enable_logging(storage='memory')` then `SELECT * FROM duckdb_logs WHERE type LIKE 'ArrowNet%'` shows the events with the ILogger category as `type` [`ArrowNet.Delta`/`.Native`] + mapped `log_level`. The earlier 0-rows was two red herrings, not a code bug: the enable form is `CALL enable_logging(...)` not `PRAGMA`, and the **shell** defaults log storage to a console-printing sink [`storage='memory'` is the `unittest`/API default]. `WriteLog` bypasses `ShouldLog` + the client flushes the log buffer per query, so no instance-vs-connection-logger issue. The `ARROWNET_LOG_LEVEL`+`ARROWNET_LOG_FILE` file sink is the always-on independent trace).
 - **Prior: v57** (v57 = **`delta_list_files`** — one appended vtable entry for the native-read
   MultiFileReader path (docs/multifile-delta.md Phase A slice 1a): `arrownet_delta_mfr_scan(path)` clones
   `parquet_scan` + swaps in `ArrowNetDeltaMultiFileReader` (`src/arrownet/arrownet_delta_mfr.cpp`), whose

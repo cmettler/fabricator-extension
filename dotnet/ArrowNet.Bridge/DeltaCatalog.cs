@@ -753,12 +753,12 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// becomes exactly these rows); otherwise Append (INSERT). One Delta commit. Returns rows written.</summary>
     public long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable,
                            bool replace, bool checkConstraints, long txnId, IReadOnlyList<string>? partitionColumns,
-                           IReadOnlyList<string>? sortColumns, string? schemaMode)
+                           IReadOnlyList<string>? sortColumns, string? schemaMode, bool partitionOverwrite)
     {
         // sortColumns (native SORTED BY) is a SQL-Server-warehouse CLUSTER BY concept; Delta doesn't cluster — ignored.
         var opener = Opener();
-        _log.LogInformation("delta bulk {Schema}.{Table}: create={Create} replace={Replace} native_write={Native}",
-            schemaName, tableName, createTable, replace, _nativeWrite);
+        _log.LogInformation("delta bulk {Schema}.{Table}: create={Create} replace={Replace} native_write={Native} partition_overwrite={PartOw}",
+            schemaName, tableName, createTable, replace, _nativeWrite, partitionOverwrite);
         // Partition columns take effect only at table creation; an INSERT (Append) into an existing table
         // preserves the table's declared partitioning (engineered-wood reads it from the metadata).
         var spec = ResolveWriteSpec(createTable || replace ? partitionColumns : null, schemaMode);
@@ -770,6 +770,26 @@ public sealed class DeltaCatalog : IBackendCatalog
         if (overwrite && spec?.ReplaceWhere is not null)
         {
             spec = spec with { ReplaceWhere = null };
+        }
+        // PARTITION_OVERWRITE (dynamic partition overwrite): append-shaped only (the C++ COPY already rejects
+        // CREATE_TABLE/REPLACE; SCHEMA_MODE 'overwrite' can still force a full replace → reject the combo), and
+        // mutually exclusive with the STATIC replace_where filter (one target-set source, not two).
+        if (partitionOverwrite)
+        {
+            if (overwrite)
+            {
+                throw new System.ArgumentException(
+                    "PARTITION_OVERWRITE cannot be combined with a full replace (CREATE_TABLE/REPLACE/"
+                    + "SCHEMA_MODE 'overwrite') — it appends into an existing partitioned table, atomically "
+                    + "replacing only the partitions present in the input.");
+            }
+            if (spec?.ReplaceWhere is { Count: > 0 })
+            {
+                throw new System.ArgumentException(
+                    "PARTITION_OVERWRITE (dynamic — target partitions derived from the input) cannot be combined "
+                    + "with replace_where (static — an explicit partition filter); use one or the other.");
+            }
+            spec = (spec ?? new DeltaWriteSpec(null, null, null, null)) with { DynamicPartitionOverwrite = true };
         }
         var tablePath = TablePath(schemaName, tableName);
 

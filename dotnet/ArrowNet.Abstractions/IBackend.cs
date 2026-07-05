@@ -150,9 +150,15 @@ public interface IBackendCatalog : IDisposable
     /// <paramref name="schemaMode"/> (null if unset) is a COPY <c>SCHEMA_MODE</c> option —
     /// "merge" (append + union new source columns) or "overwrite" (replace data + adopt the
     /// incoming source schema). A Delta-provider concept; other providers ignore it.
+    /// <paramref name="partitionOverwrite"/> is the COPY <c>PARTITION_OVERWRITE</c> option —
+    /// DYNAMIC partition overwrite: the partitions present in the input are atomically
+    /// replaced (one commit removes their current files + adds the new ones); untouched
+    /// partitions are unaffected. Append-shaped only + requires a partitioned target. A
+    /// Delta-provider concept; providers without partition semantics MUST REJECT it when
+    /// true (silently ignoring an overwrite flag would be a correctness surprise).
     long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable, bool replace,
                     bool checkConstraints, long txnId, IReadOnlyList<string>? partitionColumns,
-                    IReadOnlyList<string>? sortColumns, string? schemaMode);
+                    IReadOnlyList<string>? sortColumns, string? schemaMode, bool partitionOverwrite);
 
     /// <summary>
     /// rowid-based DELETE. <paramref name="keys"/> columns (named by Arrow field)

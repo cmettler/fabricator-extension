@@ -32,6 +32,10 @@ struct ArrowNetCopyBindData : public FunctionData {
 	bool create_table = true;
 	bool replace = false;
 	string schema_mode; // SCHEMA_MODE COPY option: "" | "merge" | "overwrite" (Delta provider)
+	// PARTITION_OVERWRITE COPY option: dynamic partition overwrite — the partitions present in the input are
+	// atomically replaced (one Delta commit), untouched partitions kept. Requires CREATE_TABLE false (append
+	// shape) + a partitioned target; validated provider-side. Delta-only (other providers reject it when set).
+	bool partition_overwrite = false;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto result = make_uniq<ArrowNetCopyBindData>();
@@ -134,6 +138,11 @@ static unique_ptr<FunctionData> CopyToBind(ClientContext &context, CopyFunctionB
 	bind_data->create_table = GetBoolOption(input.info.options, "CREATE_TABLE", true);
 	bind_data->replace = GetBoolOption(input.info.options, "REPLACE", false);
 	bind_data->schema_mode = GetStringOption(input.info.options, "SCHEMA_MODE");
+	bind_data->partition_overwrite = GetBoolOption(input.info.options, "PARTITION_OVERWRITE", false);
+	if (bind_data->partition_overwrite && (bind_data->create_table || bind_data->replace)) {
+		throw BinderException("mssql_net COPY: PARTITION_OVERWRITE requires CREATE_TABLE false (it appends into an "
+		                      "existing partitioned table, atomically replacing the partitions present in the input)");
+	}
 	return std::move(bind_data);
 }
 
@@ -151,7 +160,8 @@ static unique_ptr<GlobalFunctionData> CopyToInitGlobal(ClientContext &context, F
 	gstate->bulk_session = arrownet::BeginBulk(bind_data.handle, bind_data.schema_name, bind_data.table_name,
 	                                           bind_data.create_table, bind_data.replace, /*check_constraints=*/false,
 	                                           (int64_t)context.ActiveTransaction().global_transaction_id, schema,
-	                                           /*partition_columns=*/"", /*sort_columns=*/"", bind_data.schema_mode);
+	                                           /*partition_columns=*/"", /*sort_columns=*/"", bind_data.schema_mode,
+	                                           bind_data.partition_overwrite);
 	return std::move(gstate);
 }
 

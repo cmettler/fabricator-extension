@@ -830,8 +830,16 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     public long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable, bool replace,
                            bool checkConstraints, long txnId, IReadOnlyList<string>? partitionColumns,
-                           IReadOnlyList<string>? sortColumns, string? schemaMode)
+                           IReadOnlyList<string>? sortColumns, string? schemaMode, bool partitionOverwrite)
     {
+        if (partitionOverwrite)
+        {
+            // An overwrite flag must never be silently ignored: SQL Server's bulk path has no partition
+            // semantics, so honoring it is impossible — reject rather than quietly appending.
+            throw new NotSupportedException(
+                "COPY PARTITION_OVERWRITE is a Delta-provider option (dynamic partition overwrite); "
+                + "the SQL Server provider has no table-partition semantics on the bulk path.");
+        }
         // partitionColumns is a Delta/lakehouse concept; SQL Server table partitioning is out of scope here — ignored.
         // sortColumns (native SORTED BY) becomes a Fabric Warehouse WITH (CLUSTER BY (cols)) on the created table.
         // schemaMode (COPY SCHEMA_MODE merge/overwrite) is a Delta concept — ignored here (SQL Server REPLACE already

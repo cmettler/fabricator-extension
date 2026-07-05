@@ -51,7 +51,7 @@ public static unsafe class Bootstrap
             return new InMemoryArrayStream(schema, new[] { batch });
         });
 
-        vtable->AbiVersion = 58;
+        vtable->AbiVersion = 59;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -212,7 +212,8 @@ public static unsafe class Bootstrap
             var stream = CArrowArrayStreamImporter.ImportArrayStream(input);
             long rows = catalog.BulkInsert(schemaName, tableName, stream, createTable != 0, replace != 0,
                                            checkConstraints: false, txnId: AmbientTransaction.Current,
-                                           partitionColumns: null, sortColumns: null, schemaMode: null);
+                                           partitionColumns: null, sortColumns: null, schemaMode: null,
+                                           partitionOverwrite: false);
             if (affected is not null)
             {
                 *affected = rows;
@@ -741,7 +742,8 @@ public static unsafe class Bootstrap
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static int BeginBulk(nint handle, byte* schema, byte* table, int createTable, int replace,
                                  int checkConstraints, long txnId, CArrowSchema* schemaIn, byte* partitionColumns,
-                                 byte* sortColumns, byte* schemaMode, nint* outSession, byte** err)
+                                 byte* sortColumns, byte* schemaMode, int partitionOverwrite, nint* outSession,
+                                 byte** err)
     {
         try
         {
@@ -766,7 +768,8 @@ public static unsafe class Bootstrap
             // statement (complete_bulk blocks until the consumer finishes), so the opener is live at write time.
             var opener = AmbientOpener.Current;
             var session = new BulkSession(catalog, schemaName, tableName, arrowSchema, createTable != 0, replace != 0,
-                                          checkConstraints != 0, txnId, opener, partition, sort, schemaModeStr);
+                                          checkConstraints != 0, txnId, opener, partition, sort, schemaModeStr,
+                                          partitionOverwrite != 0);
             *outSession = Handles.Alloc(session);
             return ArrowNetStatus.Ok;
         }

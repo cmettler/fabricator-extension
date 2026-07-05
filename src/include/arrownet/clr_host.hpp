@@ -221,7 +221,7 @@ void InsertReturning(ArrowNetHandle handle, const std::string &schema, const std
 ArrowNetHandle BeginBulk(ArrowNetHandle handle, const std::string &schema, const std::string &table, bool create_table,
                          bool replace, bool check_constraints, int64_t txn_id, ArrowSchema &schema_in,
                          const std::string &partition_columns = "", const std::string &sort_columns = "",
-                         const std::string &schema_mode = "");
+                         const std::string &schema_mode = "", bool partition_overwrite = false);
 
 // Record the DuckDB transaction id in effect on this thread (global_transaction_id), so the next
 // connection-using bridge call keys its per-transaction provider connection by it. Call immediately before

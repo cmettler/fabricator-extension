@@ -1077,7 +1077,7 @@ void InsertReturning(ArrowNetHandle handle, const std::string &schema, const std
 ArrowNetHandle BeginBulk(ArrowNetHandle handle, const std::string &schema, const std::string &table, bool create_table,
                          bool replace, bool check_constraints, int64_t txn_id, ArrowSchema &schema_in,
                          const std::string &partition_columns, const std::string &sort_columns,
-                         const std::string &schema_mode) {
+                         const std::string &schema_mode, bool partition_overwrite) {
 	const ArrowNetVTable &vt = GetBridge();
 	if (!vt.begin_bulk) {
 		throw duckdb::IOException("ArrowNet: bridge does not provide begin_bulk");
@@ -1088,7 +1088,8 @@ ArrowNetHandle BeginBulk(ArrowNetHandle handle, const std::string &schema, const
 	                           check_constraints ? 1 : 0, txn_id, &schema_in,
 	                           partition_columns.empty() ? nullptr : partition_columns.c_str(),
 	                           sort_columns.empty() ? nullptr : sort_columns.c_str(),
-	                           schema_mode.empty() ? nullptr : schema_mode.c_str(), &session, &err);
+	                           schema_mode.empty() ? nullptr : schema_mode.c_str(),
+	                           partition_overwrite ? 1 : 0, &session, &err);
 	if (rc != ARROWNET_OK) {
 		ThrowManagedError(vt, err, "ArrowNet: begin_bulk failed");
 	}

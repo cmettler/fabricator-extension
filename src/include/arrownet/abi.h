@@ -308,10 +308,18 @@ typedef struct ArrowNetVTable {
 	// WITH (CLUSTER BY (cols)) layout (ignored on box SQL Server and by Delta / DAX).
 	// `schema_mode` (nullable): a COPY SCHEMA_MODE option — "merge" (append + union new source columns) or
 	// "overwrite" (replace data + adopt the incoming source schema). Delta-provider concept; ignored elsewhere.
+	// `partition_overwrite` (1/0): the COPY PARTITION_OVERWRITE option — DYNAMIC partition overwrite (Spark's
+	// partitionOverwriteMode=dynamic): the partitions PRESENT IN THE INPUT are atomically replaced (ONE Delta
+	// commit removes their currently-active files + adds the new ones — a log-level swap, no physical delete, so
+	// time travel keeps working and it is cloud-safe, unlike DuckDB COPY's local-only OVERWRITE); partitions the
+	// input does not touch are unaffected. Append-shaped only (rejected with create_table/replace — a full
+	// replace contradicts a partition-scoped one) and requires a partitioned target. Delta-provider concept;
+	// providers without partition semantics REJECT it when set (silently ignoring an overwrite flag would be a
+	// correctness surprise, unlike the advisory schema/sort options above).
 	int32_t (*begin_bulk)(ArrowNetHandle handle, const char *schema, const char *table, int32_t create_table,
 	                      int32_t replace, int32_t check_constraints, int64_t txn_id, struct ArrowSchema *schema_in,
 	                      const char *partition_columns, const char *sort_columns, const char *schema_mode,
-	                      ArrowNetHandle *out_session, char **err);
+	                      int32_t partition_overwrite, ArrowNetHandle *out_session, char **err);
 
 	// push_batch enqueues one record batch into the session. The managed side
 	// imports `batch` (taking ownership and releasing it); the caller never
@@ -753,7 +761,7 @@ typedef struct ArrowNetHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 58
+#define ARROWNET_ABI_VERSION 59
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen
