@@ -134,6 +134,13 @@ public sealed class DeltaCatalog : IBackendCatalog
     // Livy harness. Default OFF keeps the validated DV-default path untouched (no new feature declaration).
     private readonly bool _materializeRowTracking;
 
+    // ATTACH option `column_mapping 'name'|'id'` (default none): tables CREATED in this catalog enable Delta
+    // column mapping — physical column names (col-<guid>) decoupled from logical names, so a later RENAME/DROP
+    // COLUMN is a metadata-only commit. engineered-wood's CreateAsync assigns the physical names + bumps the
+    // protocol (reader v2 / writer v5). Our read (physical→logical alias / EW RenameByFieldId) + write (EW codec
+    // RenameToPhysical / SetParquetFieldIds) already handle mapped tables. Only affects table CREATION.
+    private readonly EngineeredWood.DeltaLake.Schema.ColumnMappingMode _columnMappingMode;
+
     private static readonly Microsoft.Extensions.Logging.ILogger _log = ArrowNetLog.CreateLogger("ArrowNet.Delta");
 
     public DeltaCatalog(string root) : this(root, "{}") { }
@@ -160,6 +167,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         _nativeRead = ParseBoolOption(optionsJson, "native_read");
         _nativeWrite = ParseBoolOption(optionsJson, "native_write");
         _materializeRowTracking = ParseBoolOption(optionsJson, "materialize_row_tracking");
+        _columnMappingMode = ParseColumnMappingOption(optionsJson);
     }
 
     /// <summary>Returns the host-FS opener for this thread and, in the same breath, publishes this catalog's
@@ -205,6 +213,28 @@ public sealed class DeltaCatalog : IBackendCatalog
         {
         }
         return defaultValue;
+    }
+
+    /// <summary>Parses the <c>column_mapping</c> ATTACH option for tables CREATED in this catalog (<c>'name'</c> /
+    /// <c>'none'</c>, case-insensitive; default None). <c>'id'</c> is rejected: engineered-wood's id-mode writes
+    /// the LOGICAL column names into the data files (matching by field-id), which our native reader can't yet map
+    /// by field-id — use <c>'name'</c> (the standard/Databricks-default column-mapping mode). READING external
+    /// (Spark/Databricks) id-mode tables IS supported (their files use physical names). Throws on any other
+    /// value.</summary>
+    private static EngineeredWood.DeltaLake.Schema.ColumnMappingMode ParseColumnMappingOption(string? optionsJson)
+    {
+        var s = ParseStringOption(optionsJson, "column_mapping");
+        if (string.IsNullOrWhiteSpace(s)) { return EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None; }
+        return s.Trim().ToLowerInvariant() switch
+        {
+            "none" or "" => EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None,
+            "name" => EngineeredWood.DeltaLake.Schema.ColumnMappingMode.Name,
+            "id" => throw new System.ArgumentException(
+                "column_mapping 'id' is not supported for tables created by this provider "
+                + "(use 'name', the standard column-mapping mode). Reading external id-mode tables is supported."),
+            _ => throw new System.ArgumentException(
+                $"column_mapping: unknown mode '{s}' (expected 'name' or 'none')."),
+        };
     }
 
     /// <summary>Reads a string ATTACH option (null if absent/blank/unparseable).</summary>
@@ -744,8 +774,11 @@ public sealed class DeltaCatalog : IBackendCatalog
         // native_write: STREAM straight to DuckDB's parquet writer (bounded memory — important for a Fabric
         // notebook). TryWriteStreaming returns null (WITHOUT consuming `data`) for cases the single-file streaming
         // commit can't represent (partitioned / replace_where / schema_mode=merge / column-mapping / identity /
-        // iceberg) → fall through to the collect path below with `data` intact.
-        if (_nativeWrite)
+        // iceberg) → fall through to the collect path below with `data` intact. A column-mapping catalog is gated
+        // OUT here: streaming would OpenOrCreate the table WITHOUT the mapping mode (a plain table) before the
+        // SupportsExternalDataFileCommit fallback fires — so mapping must go through the collect path, which
+        // creates the table WITH the mode (DeltaWriter.Write → columnMapping) and writes via the EW codec.
+        if (_nativeWrite && _columnMappingMode == EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None)
         {
             var streamedVersion = DeltaWriter.TryWriteStreaming(
                 opener, tablePath, data, mode,
@@ -770,7 +803,8 @@ public sealed class DeltaCatalog : IBackendCatalog
                           changeDataFeed: _changeDataFeedOnCreate,
                           rowTracking: _rowTrackingOnCreate,
                           spec: spec, nativeWrite: _nativeWrite,
-                          materializeRowTracking: _materializeRowTracking);
+                          materializeRowTracking: _materializeRowTracking,
+                          columnMapping: _columnMappingMode);
         return rows;
     }
 
@@ -787,7 +821,8 @@ public sealed class DeltaCatalog : IBackendCatalog
                               changeDataFeed: _changeDataFeedOnCreate,
                               rowTracking: _rowTrackingOnCreate,
                               spec: ResolveWriteSpec(partitionColumns, schemaModeArg: null),
-                              materializeRowTracking: _materializeRowTracking);
+                              materializeRowTracking: _materializeRowTracking,
+                              columnMapping: _columnMappingMode);
 
     /// <summary>CREATE SCHEMA. In <c>schemas</c> mode (non-OneLake) it materializes the <c>&lt;root&gt;/&lt;schema&gt;/</c>
     /// subfolder so a subsequent CREATE TABLE lands there (and the schema is rediscovered once it holds a table).

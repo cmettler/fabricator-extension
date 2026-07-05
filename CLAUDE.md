@@ -1260,6 +1260,24 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `RenameByFieldId` for id) — confirmed on the same tables. **Top-level columns only** (a nested mapped column
   would need field-id matching via `parquet_schema.field_id` — deferred, clean follow-up mirroring
   duckdb-delta's `MultiFileColumnMapper`). Spark-created via the `scratchpad/sparkprobe createcolmap` harness.
+  **CREATING a column-mapping table — the `column_mapping 'name'` ATTACH option — DONE (2026-07-05; live
+  Fabric-Spark round-trip).** `ATTACH … (PROVIDER 'delta', column_mapping 'name')` → tables CREATED in the catalog
+  enable Delta column mapping (`DeltaCatalog._columnMappingMode` → `DeltaWriter.Create`/`Write` → EW
+  `OpenOrCreateAsync(columnMappingMode:)` → `CreateAsync` assigns physical `col-<guid>` names + bumps the protocol).
+  Two EW fixes made the created table Spark-readable (our lenient reader tolerated the gaps; Spark didn't):
+  (1) `CreateAsync` now DECLARES `columnMapping` in BOTH the reader + writer feature lists when in table-features
+  mode (reader v3 / writer v7 — forced by the DV default), else Spark throws `DELTA_FEATURES_PROTOCOL_METADATA_MISMATCH`;
+  (2) `DeltaSchemaSerializer` emits `delta.columnMapping.id` as a JSON NUMBER (Delta field-id is numeric — Spark's
+  `Metadata.getLong` threw "String cannot be cast to Long" on the old string form). The write rides the existing
+  EW-codec `RenameToPhysical` path (streaming is gated off for a mapping catalog — it'd create a plain table before
+  the fallback). **`'id'` is REJECTED for CREATE** (clean error): EW's id-mode writes the LOGICAL names into the
+  files (matching by field-id), which our native reader can't yet map by field-id — use `'name'` (the standard/
+  Databricks-default mode). READING external Spark/Databricks id-mode tables is unaffected (supported). Validated:
+  `test/verify_delta_catalog_column_mapping.test` (27 — name-mode create/insert/read + native_read, physical names
+  in the parquet, mode declared, `'id'`+unknown rejected) + write/native_write/delete/update unregressed; **live
+  OneLake**: a name-mode table CREATED by our provider is read correctly by Spark (rows + count + `mode=name`).
+  Follow-up for `'id'` create: field-id-based native read (`parquet_schema.field_id`) — same as the nested-column
+  follow-up above.
   **WRITING to a Spark-created (external) table — DONE (2026-07-05, EW-only; live Fabric-Spark round-trip).** An
   INSERT initially failed at engineered-wood's `ProtocolVersions.ValidateWriteSupport`: *"unsupported writer
   features: [appendOnly, invariants]"*. Root cause (grounded in the table's `_delta_log` protocol): enabling

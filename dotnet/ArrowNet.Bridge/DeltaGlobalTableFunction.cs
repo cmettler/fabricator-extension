@@ -452,7 +452,9 @@ internal static class DeltaWriter
                              DeltaWriteMode mode, CancellationToken ct, bool deletionVectors = false,
                              bool inCommitTimestamps = false, bool changeDataFeed = false,
                              bool rowTracking = false, DeltaWriteSpec? spec = null, bool nativeWrite = false,
-                             bool materializeRowTracking = false)
+                             bool materializeRowTracking = false,
+                             EngineeredWood.DeltaLake.Schema.ColumnMappingMode columnMapping =
+                                 EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None)
     {
         // native_write: DuckDB's parquet writer produces the data-file bytes (via COPY on a fresh host
         // connection); engineered-wood keeps the _delta_log commit. Falls back to EW's codec if host_query is
@@ -477,14 +479,20 @@ internal static class DeltaWriter
             var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(spec, dataFileWriter),
                                                      partitionColumns: spec?.PartitionColumns,
                                                      configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, materializeRowTracking),
+                                                     columnMappingMode: columnMapping,
                                                      cancellationToken: ct).AsTask().GetAwaiter().GetResult();
             try
             {
-                if (mode == DeltaWriteMode.Overwrite)
+                if (mode == DeltaWriteMode.Overwrite
+                    && EngineeredWood.DeltaLake.Schema.ColumnMapping.GetMode(table.CurrentSnapshot.Metadata.Configuration)
+                       == EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None)
                 {
                     // A true replace (CREATE OR REPLACE / CTAS-replace / COPY REPLACE / schema_mode=overwrite):
                     // the table adopts EXACTLY the incoming schema (add/drop/retype) — a metadata-only commit,
                     // no-op if identical or a freshly-created table — then the Overwrite removes the old files.
+                    // SKIPPED for a column-mapping table: EW's SetSchema can't reassign field ids, and a fresh
+                    // CTAS already created the table with the correct schema+mapping (a REPLACE that changes the
+                    // schema of an existing mapping table is an EW limitation — the existing schema is kept).
                     table.SetSchemaAsync(schema, ct).AsTask().GetAwaiter().GetResult();
                 }
                 else if (spec?.SchemaMode == DeltaSchemaMode.Merge)
@@ -632,7 +640,9 @@ internal static class DeltaWriter
     public static void Create(nint opener, string path, Schema schema, CancellationToken ct,
                               bool deletionVectors = false, bool inCommitTimestamps = false,
                               bool changeDataFeed = false, bool rowTracking = false, DeltaWriteSpec? spec = null,
-                              bool materializeRowTracking = false)
+                              bool materializeRowTracking = false,
+                              EngineeredWood.DeltaLake.Schema.ColumnMappingMode columnMapping =
+                                  EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None)
     {
         Log.LogInformation("delta create {Path}: cols={Cols} spec=[{Spec}]", path, schema.FieldsList.Count,
             DescribeSpec(spec, deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed));
@@ -645,6 +655,7 @@ internal static class DeltaWriter
                 var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(spec),
                                                          partitionColumns: spec?.PartitionColumns,
                                                          configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, materializeRowTracking),
+                                                         columnMappingMode: columnMapping,
                                                          cancellationToken: ct).AsTask().GetAwaiter().GetResult();
                 table.DisposeAsync().AsTask().GetAwaiter().GetResult();
                 Log.LogDebug("delta create {Path}: opened/created (commit-0 if new)", path);

@@ -1,0 +1,81 @@
+# name: test/verify_delta_catalog_column_mapping.test
+# description: The `column_mapping 'name'|'id'` ATTACH option — tables CREATED in the catalog enable Delta column
+#              mapping (physical col-<guid> names decoupled from logical). engineered-wood's CreateAsync assigns the
+#              physical names + bumps the protocol; our read (physical→logical) + write (EW codec) handle mapped
+#              tables. Verifies: create+insert+read round-trips, the parquet uses PHYSICAL names (not logical), the
+#              commit declares the mode, and native_read reads it too. Set ARROWNET_DELTA_WRITE_DIR. Local FS.
+# group: [mssql_net]
+
+require mssql_net
+
+require parquet
+
+require-env ARROWNET_DELTA_WRITE_DIR
+
+# ---- name mode ----
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmname' AS nm (TYPE arrownet, PROVIDER 'delta', column_mapping 'name');
+
+statement ok
+CREATE TABLE nm.main.t AS SELECT i AS id, 'v' || i AS v FROM range(1, 4) AS r(i);
+
+statement ok
+INSERT INTO nm.main.t VALUES (4, 'v4');
+
+# Read round-trips with LOGICAL names (the reader maps physical col-<guid> → id/v).
+query IT
+SELECT id, v FROM nm.main.t ORDER BY id;
+----
+1	v1
+2	v2
+3	v3
+4	v4
+
+# The data files use PHYSICAL names (col-<guid>) — the logical names id/v are ABSENT from the parquet schema.
+query I
+SELECT count(*) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/cmname/t/*.parquet') WHERE name IN ('id', 'v');
+----
+0
+
+query I
+SELECT count(DISTINCT name) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/cmname/t/*.parquet') WHERE name LIKE 'col-%';
+----
+2
+
+# The create commit declares column mapping mode = name.
+query I
+SELECT count(*) FROM read_text('${ARROWNET_DELTA_WRITE_DIR}/cmname/t/_delta_log/00000000000000000000.json')
+WHERE replace(content, chr(92)||'u0022', '"') LIKE '%"delta.columnMapping.mode":"name"%';
+----
+1
+
+statement ok
+DETACH nm;
+
+# Re-attach WITHOUT the option (mode is a table property, not an ATTACH-time read concern) → still reads.
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmname' AS nm2 (TYPE arrownet, PROVIDER 'delta', native_read true);
+
+query IT
+SELECT id, v FROM nm2.main.t ORDER BY id;
+----
+1	v1
+2	v2
+3	v3
+4	v4
+
+statement ok
+DETACH nm2;
+
+# ---- 'id' mode → rejected for CREATE (EW writes logical names in id-mode files; use 'name'). The error surfaces
+#      at ATTACH (open_catalog validates eagerly). Reading EXTERNAL Spark id-mode tables is supported separately. ----
+statement error
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmid' AS im (TYPE arrownet, PROVIDER 'delta', column_mapping 'id');
+----
+column_mapping 'id' is not supported
+
+# ---- unknown mode → clean error at ATTACH ----
+statement error
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmbad' AS bad (TYPE arrownet, PROVIDER 'delta', column_mapping 'bogus');
+----
+unknown mode
