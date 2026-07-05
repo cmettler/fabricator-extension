@@ -1034,7 +1034,9 @@ public sealed class DeltaCatalog : IBackendCatalog
                         var vals = new object?[setColumnCount];
                         for (int j = 0; j < setColumnCount; j++)
                         {
-                            vals[j] = ArrowValueReader.ReadScalar(b.Column(j), i);
+                            // Deep variant: a STRUCT SET value becomes a Dictionary (deep-copied — the batch
+                            // is disposed after this loop).
+                            vals[j] = ArrowValueReader.ReadScalarDeep(b.Column(j), i);
                         }
                         updates[rid] = vals;
                     }
@@ -1063,6 +1065,28 @@ public sealed class DeltaCatalog : IBackendCatalog
                     break;
                 }
             }
+        }
+
+        // STRUCT SET values on a COLUMN-MAPPING table are gated: the copy-on-write rewrite goes through the
+        // EW-codec writer (the native rewriter is gated to unmapped tables in EW), whose physical-rename +
+        // field-id stamping is top-level only — the rebuilt struct's children would land under logical names
+        // without ids (silently unreadable for spec readers, like the gated nested EW-codec write). Scalar SET
+        // columns on a mapped table are fine (unchanged struct columns pass through with their physical names).
+        bool structSet = false;
+        foreach (var f in setSlotField)
+        {
+            if (f is not null && DeltaWriter.HasNestedColumns(new Apache.Arrow.Schema(new[] { f }, null)))
+            {
+                structSet = true;
+                break;
+            }
+        }
+        if (structSet && DeltaReader.IsColumnMapped(opener, path))
+        {
+            throw new NotSupportedException(
+                "UPDATE of a nested (STRUCT) column on a column-mapping Delta table is not supported yet — the "
+                + "copy-on-write rewrite cannot produce the spec nested layout. Opt the table out of mapping "
+                + "(`column_mapping 'none'`) or replace the rows via DELETE + INSERT.");
         }
 
         // 2b. native_write: build the per-file-ordinal (position -> new SET values) Arrow view the native rewriter
@@ -1147,7 +1171,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                         long rid = rids.GetValue(i) ?? -1;
                         values.Add(updates.TryGetValue(rid, out var nv)
                             ? nv[slot]
-                            : ArrowValueReader.ReadScalar(batch.Column(c), i));
+                            : ArrowValueReader.ReadScalarDeep(batch.Column(c), i));
                     }
                     newCols[c] = BuildArray(fields[c].DataType, values);
                 }
@@ -1183,6 +1207,39 @@ public sealed class DeltaCatalog : IBackendCatalog
             case StringType: { var b = new StringArray.Builder(); foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append((string)v); } return b.Build(); }
             case Date32Type: { var b = new Date32Array.Builder(); foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append(System.DateOnly.FromDateTime((System.DateTime)v)); } return b.Build(); }
             case TimestampType ts: { var b = new TimestampArray.Builder(ts); foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append(v is System.DateTimeOffset dto ? dto : new System.DateTimeOffset(System.DateTime.SpecifyKind((System.DateTime)v, System.DateTimeKind.Utc))); } return b.Build(); }
+            case Apache.Arrow.Types.StructType st:
+            {
+                // A struct value is a Dictionary<string, object?> from ReadScalarDeep (or null for a NULL row).
+                // Build each child column recursively from the extracted member values; rebuild the struct's own
+                // validity bitmap.
+                int n = values.Count;
+                var validity = new ArrowBuffer.BitmapBuilder(n);
+                int nulls = 0;
+                var childVals = new List<object?>[st.Fields.Count];
+                for (int c = 0; c < st.Fields.Count; c++)
+                {
+                    childVals[c] = new List<object?>(n);
+                }
+                foreach (var v in values)
+                {
+                    bool isNull = v is null;
+                    validity.Append(!isNull);
+                    if (isNull) { nulls++; }
+                    var dict = v as System.Collections.Generic.IReadOnlyDictionary<string, object?>;
+                    for (int c = 0; c < st.Fields.Count; c++)
+                    {
+                        childVals[c].Add(dict is not null && dict.TryGetValue(st.Fields[c].Name, out var cv)
+                            ? cv : null);
+                    }
+                }
+                var childData = new ArrayData[st.Fields.Count];
+                for (int c = 0; c < st.Fields.Count; c++)
+                {
+                    childData[c] = BuildArray(st.Fields[c].DataType, childVals[c]).Data;
+                }
+                var data = new ArrayData(st, n, nulls, 0, new[] { validity.Build() }, childData);
+                return Apache.Arrow.ArrowArrayFactory.BuildArray(data);
+            }
             default: throw new NotSupportedException($"delta UPDATE: unsupported SET column type {type.TypeId}");
         }
     }

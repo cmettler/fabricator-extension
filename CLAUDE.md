@@ -1414,12 +1414,43 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   fields all carry physical names+ids, kernel-read verified; (4) **EW-codec stats keyed PHYSICAL under mapping**
   (`WriteCoreAsync` collects over the top-level-renamed batch — stats cover top-level primitives only, so the
   flat rename suffices; matches the streaming writer + spec readers' skipping).
-  **Known limitations**: UPDATE with a STRUCT SET value fails in the C++ update value-marshaling
-  ("unsupported filter value type Struct" — pre-existing, orthogonal to mapping; clean error, table intact);
-  CDC `_change_data` files written with logical names (read-side tolerant); a mapping REPLACE that CHANGES the
-  schema still collects (SetSchema fresh-id re-assign must precede the COPY; one-shot admin op); map-of-struct
-  field_ids not stamped on write (read recursion handles them); EW's own reader nested rename is Bridge-side
-  only (upstream candidate).
+  **STRUCT UPDATE + EW parquet-writer bug hunt (fifth pass, same day).** `UPDATE t SET s = {'a':…}` (struct SET
+  values) now works on UNMAPPED tables via `ArrowValueReader.ReadScalarDeep` (struct → `Dictionary<string,object?>`
+  recursive, deep-copied; kept SEPARATE from `ReadScalar` — filter callers rely on unsupported-type throws
+  meaning "don't push") + a `BuildArray` StructType case (children built recursively, validity rebuilt). Works on
+  both writers incl. `SET s = NULL`; MAPPED tables gate struct-SET with guidance (`DeltaReader.IsColumnMapped`
+  — the EW-codec rewrite can't produce the spec nested layout; scalar SET on mapped nested tables works).
+  Chasing kernel "Out of buffer" on the merge-on-read post-images uncovered **three EW parquet-WRITER bugs**
+  (NOT documented limitations — known-issues.md's write-reject list never included struct/list/map; minimal
+  repro harness `scratchpad/ewstruct`):
+  1. **Null-struct child misalignment** (`NestedLevelWriter`): a null STRUCT row was treated like a null LIST
+     (no child slot), but Arrow struct children are 1:1 with parent rows — every child value after a null
+     struct row shifted one slot (def levels + values both wrong → file unreadable by DuckDB/kernel; only our
+     lenient reader tolerated it). Fixed by threading an explicit per-level VALUE MAP from struct parents
+     through struct/leaf/list/map decomposition (+ the sliced-struct case: children are NOT sliced with the
+     parent, so the map bakes in `Data.Offset` — same subtlety as the TakeRows fix).
+  2. **`ExpandArray` default 8-byte stride**: unknown fixed-width leaf types expanded as `long` — corrupting
+     Int8/Int16/Date32/Time32/… whenever expansion triggered. Now width-dispatched; genuinely unsupported
+     types throw instead of corrupting.
+  3. **All-null pages declared a delta encoding with a 0-byte payload** — DELTA_BINARY_PACKED /
+     DELTA_LENGTH_BYTE_ARRAY require a header even for zero values → readers underrun ("Out of buffer"). An
+     all-null page now declares PLAIN (the only encoding whose empty representation is valid). This hit ANY
+     all-null column page (e.g. a merge-on-read post-image whose struct is NULL, an all-null flat column page).
+  **Plus the cheap known-issues interop fixes** (user: "if we can fix EW issues then fix"): ns-timestamp/time
+  `converted_type` OMITTED (no ns variant exists — was mislabeled micros, 1000x for converted_type-trusting
+  readers); `SchemaConverter.FromArrowField` PRESERVES per-field metadata (comments/mapping ids/invariants;
+  `PARQUET:*` transport keys filtered); deprecated `Statistics.min`/`max` restricted to signed-order-safe types
+  (parquet-mr parity — UTF-8/binary/unsigned/decimal-FLBA get `min_value`/`max_value` only); the stale
+  known-issues `column_orders`-never-written entry removed (ColumnOrderBuilder already populates it);
+  known-issues.md updated accordingly.
+  Verified: repro trio (all-null / mixed / no-null structs) reads in DuckDB; struct UPDATE round-trips +
+  kernel-reads on both writers; `verify_delta_catalog_column_mapping` 232 assertions; full delta suite 35/35 +
+  SQL suites; EW's own parquet test suite.
+  **Known limitations**: struct SET on MAPPED tables gated (above); CDC `_change_data` files written with
+  logical names (read-side tolerant); a mapping REPLACE that CHANGES the schema still collects (SetSchema
+  fresh-id re-assign must precede the COPY; one-shot admin op); map-of-struct field_ids not stamped on write
+  (read recursion handles them); EW's own reader nested rename is Bridge-side only (upstream candidate);
+  `ToArrowField` (Delta→Arrow) still drops metadata.
   **WRITING to a Spark-created (external) table — DONE (2026-07-05, EW-only; live Fabric-Spark round-trip).** An
   INSERT initially failed at engineered-wood's `ProtocolVersions.ValidateWriteSupport`: *"unsupported writer
   features: [appendOnly, invariants]"*. Root cause (grounded in the table's `_delta_log` protocol): enabling

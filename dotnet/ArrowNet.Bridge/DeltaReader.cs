@@ -745,6 +745,23 @@ internal static class DeltaReader
         }
     }
 
+    /// <summary>True when the table at <paramref name="path"/> has column mapping enabled (either mode) — a
+    /// cheap log-only open used to gate operations whose rewrite path can't produce the mapped layout.</summary>
+    public static bool IsColumnMapped(nint opener, string path)
+    {
+        var fs = TableFileSystems.Create(opener, path);
+        var table = DeltaTable.OpenAsync(fs).GetAwaiter().GetResult();
+        try
+        {
+            return EngineeredWood.DeltaLake.Schema.ColumnMapping.GetMode(table.CurrentSnapshot.Metadata.Configuration)
+                   != EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None;
+        }
+        finally
+        {
+            table.Dispose();
+        }
+    }
+
     /// <summary>Renames a column as a metadata-only commit (no file rewrite) — engineered-wood
     /// <see cref="DeltaTable.RenameColumnAsync"/>. Requires a column-mapping table (the field keeps its
     /// physicalName + columnMapping.id, so old files read unchanged under the new logical name); a plain table is

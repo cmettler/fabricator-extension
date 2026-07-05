@@ -428,6 +428,60 @@ SELECT count(*) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/cmnone/t/*.parq
 statement ok
 DETACH pn;
 
+# ================= STRUCT UPDATE (unmapped tables; mapped struct-SET is gated) =================
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmsupd' AS su (TYPE arrownet, PROVIDER 'delta', column_mapping 'none');
+
+statement ok
+CREATE TABLE su.main.t AS SELECT 1 AS id, {'a': 10, 'b': 'x'} AS s UNION ALL SELECT 2, {'a': 20, 'b': 'y'};
+
+# Struct SET value round-trips (merge-on-read post-image under the DV default).
+statement ok
+UPDATE su.main.t SET s = {'a': 99, 'b': 'q'} WHERE id = 2;
+
+query IIT
+SELECT id, s.a, s.b FROM su.main.t ORDER BY id;
+----
+1	10	x
+2	99	q
+
+# Setting the whole struct NULL works (the all-null post-image page was a writer bug: a 0-value page declared a
+# delta encoding whose header is mandatory — now PLAIN, standard-readable).
+statement ok
+UPDATE su.main.t SET s = NULL WHERE id = 1;
+
+query II
+SELECT id, s IS NULL FROM su.main.t ORDER BY id;
+----
+1	true
+2	false
+
+statement ok
+DETACH su;
+
+# On a MAPPED table (the default) a struct SET is gated with guidance; scalar SET on a nested table works.
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmsupdm' AS sm (TYPE arrownet, PROVIDER 'delta', native_write true);
+
+statement ok
+CREATE TABLE sm.main.t AS SELECT 1 AS id, {'a': 10} AS s;
+
+statement error
+UPDATE sm.main.t SET s = {'a': 2} WHERE id = 1;
+----
+not supported yet
+
+statement ok
+UPDATE sm.main.t SET id = 7 WHERE id = 1;
+
+query II
+SELECT id, s.a FROM sm.main.t;
+----
+7	10
+
+statement ok
+DETACH sm;
+
 # ================= unknown mode → clean error at ATTACH =================
 statement error
 ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmbad' AS bad (TYPE arrownet, PROVIDER 'delta', column_mapping 'bogus');
