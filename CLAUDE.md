@@ -1260,17 +1260,28 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `RenameByFieldId` for id) — confirmed on the same tables. **Top-level columns only** (a nested mapped column
   would need field-id matching via `parquet_schema.field_id` — deferred, clean follow-up mirroring
   duckdb-delta's `MultiFileColumnMapper`). Spark-created via the `scratchpad/sparkprobe createcolmap` harness.
-  **WRITING to a Spark-created (external) table is BLOCKED — but NOT by column mapping.** An INSERT through our
-  provider fails at engineered-wood's `ProtocolVersions.ValidateWriteSupport`: *"This table requires unsupported
-  writer features: [appendOnly, invariants]"*. Spark stamps every table with the `appendOnly` + `invariants`
-  writer features by default, and EW's `SupportedWriterFeatures` set (which DOES include `columnMapping`/
-  `deletionVectors`/`rowTracking`/…) omits those two → it rejects the write before column mapping matters. So the
-  column-mapping WRITE path (logical→physical alias + `FIELD_IDS`) is moot until EW tolerates those features —
-  a SEPARATE, larger effort orthogonal to mapping: honor `appendOnly` (reject overwrite/delete/update, allow
-  append) + `invariants` (enforce any declared column CHECK constraints, else accept). Deferred — writing to
-  externally-Spark-managed tables is niche (the lakehouse pattern is READ external tables, WRITE tables our
-  provider creates, which are fully supported). Once EW accepts the protocol, the mapping-write alias+FIELD_IDS
-  is a small add on top.
+  **WRITING to a Spark-created (external) table — DONE (2026-07-05, EW-only; live Fabric-Spark round-trip).** An
+  INSERT initially failed at engineered-wood's `ProtocolVersions.ValidateWriteSupport`: *"unsupported writer
+  features: [appendOnly, invariants]"*. Root cause (grounded in the table's `_delta_log` protocol): enabling
+  `columnMapping`+`deletionVectors` upgrades the table to the writer-v7 "table features" protocol, which
+  ENUMERATES the legacy writer-v2 features `appendOnly` + `invariants` EXPLICITLY — even though neither is ACTIVE
+  (`delta.appendOnly` isn't set; no constraints declared). EW's allowlist just lacked the two names. Fix:
+  (1) added `appendOnly`/`invariants`/`checkConstraints` to `SupportedWriterFeatures`; (2) new
+  `DeltaTable.HonorWriterFeatures(isAppend)` (called from `WriteCoreAsync`/`CommitDataFilesAsync` + the rowid
+  DELETE/UPDATE entrypoints) enforces them **only when active**: `appendOnly` → a non-append write throws when
+  `delta.appendOnly=true`; `invariants`/`checkConstraints` (arbitrary SQL expressions in a column's
+  `delta.invariants` metadata / `delta.constraints.*` config — which we can't evaluate in the C# writer) → the
+  write is REJECTED with a clear error rather than silently writing possibly-violating data (Delta constraints
+  are write-time-only; NOT NULL is schema nullability, unaffected). A table that merely LISTS the features (the
+  common v7-upgrade case) writes normally. **Column-mapping WRITE rides the existing EW-codec collect path**
+  (`WriteCoreAsync` → `RenameToPhysical` for name mode / `SetParquetFieldIds` for id mode) — no new alias/FIELD_IDS
+  code needed. Validated LIVE: INSERT (4,'d'),(5,'e') into the Spark name-mode table `arrownet_cm_name` via our
+  provider → committed v3 → **Spark reads all 5 rows back through the column mapping** (round-trip). Local Delta
+  write/delete/update/dv/native_write suites unregressed (HonorWriterFeatures is a no-op on our own mode=none
+  tables). **STREAMING native write to a mapping table stays on the collect path** (`SupportsExternalDataFileCommit`
+  is false for mapping → `Materialize`+EW codec, correct but RAM-bounded); bounded-memory streaming to an EXTERNAL
+  mapping table (COPY `FIELD_IDS` + physical-name alias) is deferred — niche (you bulk-write tables our provider
+  creates, which stream; external mapping tables are typically read).
   v56 = **`onelake://` WRITE forward callbacks** — appended 3 vtable entries
   `onelake_open_write`/`onelake_write`/`onelake_close_write`; the C++ `ArrowNetOneLakeFileSystem` `OpenFile(write)`/
   `Write` (sequential append → managed `OneLakeForwardFs` create/append/flush) make **`COPY … TO 'onelake://…'` +
