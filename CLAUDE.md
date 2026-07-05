@@ -1260,6 +1260,17 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `RenameByFieldId` for id) — confirmed on the same tables. **Top-level columns only** (a nested mapped column
   would need field-id matching via `parquet_schema.field_id` — deferred, clean follow-up mirroring
   duckdb-delta's `MultiFileColumnMapper`). Spark-created via the `scratchpad/sparkprobe createcolmap` harness.
+  **WRITING to a Spark-created (external) table is BLOCKED — but NOT by column mapping.** An INSERT through our
+  provider fails at engineered-wood's `ProtocolVersions.ValidateWriteSupport`: *"This table requires unsupported
+  writer features: [appendOnly, invariants]"*. Spark stamps every table with the `appendOnly` + `invariants`
+  writer features by default, and EW's `SupportedWriterFeatures` set (which DOES include `columnMapping`/
+  `deletionVectors`/`rowTracking`/…) omits those two → it rejects the write before column mapping matters. So the
+  column-mapping WRITE path (logical→physical alias + `FIELD_IDS`) is moot until EW tolerates those features —
+  a SEPARATE, larger effort orthogonal to mapping: honor `appendOnly` (reject overwrite/delete/update, allow
+  append) + `invariants` (enforce any declared column CHECK constraints, else accept). Deferred — writing to
+  externally-Spark-managed tables is niche (the lakehouse pattern is READ external tables, WRITE tables our
+  provider creates, which are fully supported). Once EW accepts the protocol, the mapping-write alias+FIELD_IDS
+  is a small add on top.
   v56 = **`onelake://` WRITE forward callbacks** — appended 3 vtable entries
   `onelake_open_write`/`onelake_write`/`onelake_close_write`; the C++ `ArrowNetOneLakeFileSystem` `OpenFile(write)`/
   `Write` (sequential append → managed `OneLakeForwardFs` create/append/flush) make **`COPY … TO 'onelake://…'` +
