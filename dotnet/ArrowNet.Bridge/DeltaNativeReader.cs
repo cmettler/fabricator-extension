@@ -61,16 +61,40 @@ internal static class DeltaNativeReader
         int prefetch = Prefetch();
 
         Log.LogInformation(
-            "delta native scan {Path}: v{Version} files={Files} cols=[{Cols}] rowid={RowId} where=[{Where}] prefetch={Prefetch}",
-            path, listing.Version, listing.Files.Count, string.Join(",", dataCols), wantRowId, where ?? "", prefetch);
+            "delta native scan {Path}: v{Version} files={Files} cols=[{Cols}] rowid={RowId} where=[{Where}] prefetch={Prefetch} colmap={Map}",
+            path, listing.Version, listing.Files.Count, string.Join(",", dataCols), wantRowId, where ?? "", prefetch,
+            listing.LogicalToPhysical is not null);
 
         return new AsyncEnumerableArrowStream(schema, StreamFiles(listing, dataCols, wantRowId, where, prefetch));
     }
 
     // The per-file SELECT (ordinal folded into the rowid expression); file_row_number is read but only surfaces
     // as _metadata.row_id (and drives the DV exclusion) — never as an output column.
-    private static string FileSql(IReadOnlyList<string> dataCols, bool wantRowId, string? where, DeltaReader.NativeScanFile f)
+    private static string FileSql(IReadOnlyList<string> dataCols, bool wantRowId, string? where,
+                                  DeltaReader.NativeScanFile f, IReadOnlyDictionary<string, string>? logToPhys)
     {
+        // The scan source. No column mapping: read_parquet exposes the data columns by their logical name +
+        // file_row_number. Column mapping (name/id): the file stores PHYSICAL names, so alias physical→logical in
+        // an inner query — then the OUTER projection, user filter, rowid, and DV condition all reference logical
+        // names + file_row_number unchanged (no filter rewrite; DuckDB pushes the outer filter into read_parquet).
+        string source;
+        if (logToPhys is null)
+        {
+            source = $"read_parquet('{f.Uri.Replace("'", "''")}', file_row_number => true)";
+        }
+        else
+        {
+            var inner = new List<string>(dataCols.Count + 1);
+            foreach (var c in dataCols)
+            {
+                inner.Add(logToPhys.TryGetValue(c, out var phys) && phys != c
+                    ? $"{Quote(phys)} AS {Quote(c)}"
+                    : Quote(c));
+            }
+            inner.Add("file_row_number");
+            source = $"(SELECT {string.Join(", ", inner)} FROM read_parquet('{f.Uri.Replace("'", "''")}', file_row_number => true))";
+        }
+
         var sb = new StringBuilder("SELECT ");
         sb.Append(dataCols.Count == 0 ? "" : string.Join(", ", dataCols.Select(Quote)));
         if (wantRowId)
@@ -85,7 +109,7 @@ internal static class DeltaNativeReader
         {
             sb.Append("1"); // degenerate projection (e.g. COUNT(*) with no columns) — a constant keeps SQL valid
         }
-        sb.Append($" FROM read_parquet('{f.Uri.Replace("'", "''")}', file_row_number => true)");
+        sb.Append($" FROM {source}");
         var conds = new List<string>(2);
         if (!string.IsNullOrEmpty(where))
         {
@@ -110,7 +134,7 @@ internal static class DeltaNativeReader
         if (listing.AnyUri is { } probe)
         {
             var probeFile = new DeltaReader.NativeScanFile(0, probe, System.Array.Empty<long>());
-            var sql = FileSql(dataCols, wantRowId, where: null, probeFile) + " LIMIT 0";
+            var sql = FileSql(dataCols, wantRowId, where: null, probeFile, listing.LogicalToPhysical) + " LIMIT 0";
             using var s = Host.Query(sql);
             return s.Schema;
         }
@@ -161,7 +185,7 @@ internal static class DeltaNativeReader
                     {
                         try
                         {
-                            var sql = FileSql(dataCols, wantRowId, where, file);
+                            var sql = FileSql(dataCols, wantRowId, where, file, listing.LogicalToPhysical);
                             Log.LogDebug("delta native file: {Sql}", sql);
                             using var s = Host.Query(sql);
                             while (true)

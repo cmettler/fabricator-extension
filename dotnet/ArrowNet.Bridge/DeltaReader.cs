@@ -68,6 +68,12 @@ internal static class DeltaReader
         public long Version { get; init; }
         public IReadOnlyList<NativeScanFile> Files { get; init; } = System.Array.Empty<NativeScanFile>();
         public string? AnyUri { get; init; }
+
+        /// <summary>For a column-mapping table (name OR id mode): logical column name → the PHYSICAL name the
+        /// column is stored under in the parquet files. Null when column mapping is off (the common case). The
+        /// native reader aliases <c>"physical" AS "logical"</c> so the scan output uses logical names — mirroring
+        /// how engineered-wood's own reader maps by physical name.</summary>
+        public IReadOnlyDictionary<string, string>? LogicalToPhysical { get; init; }
     }
 
     /// <summary>Resolves the version whose commit is at/just-before <paramref name="instantUtc"/> (via the
@@ -142,9 +148,35 @@ internal static class DeltaReader
                 }
                 files.Add(new NativeScanFile(ordinal, uri, dv));
             }
-            log.LogDebug("delta native list: {Path} v{Version} active={Active} scanned={Scanned} pruned={Pruned}",
-                path, snap.Version, ordered.Count, files.Count, pruned);
-            return new NativeScanList { Version = snap.Version, Files = files, AnyUri = anyUri };
+            // Column-mapping tables (name/id mode) store columns under PHYSICAL names — capture logical→physical
+            // (from THIS snapshot's schema, so time travel to a pre-rename version maps correctly) so the native
+            // reader can alias them back. We read `delta.columnMapping.physicalName` from each field's metadata
+            // DIRECTLY (not ColumnMapping.GetPhysicalName, which returns the logical name in id mode — EW matches
+            // id mode by field-id): Delta assigns a physicalName in BOTH modes and Spark writes the parquet columns
+            // under it, so a `"physical" AS "logical"` alias works for both. (Top-level columns only; a nested
+            // mapped column would need field-id matching — deferred.) Null for the common no-mapping case.
+            var mode = EngineeredWood.DeltaLake.Schema.ColumnMapping.GetMode(snap.Metadata.Configuration);
+            IReadOnlyDictionary<string, string>? logicalToPhysical = null;
+            if (mode != EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None)
+            {
+                var map = new Dictionary<string, string>();
+                foreach (var field in snap.Schema.Fields)
+                {
+                    if (field.Metadata is { } md
+                        && md.TryGetValue(EngineeredWood.DeltaLake.Schema.ColumnMapping.PhysicalNameKey, out var phys)
+                        && !string.IsNullOrEmpty(phys) && phys != field.Name)
+                    {
+                        map[field.Name] = phys;
+                    }
+                }
+                logicalToPhysical = map.Count > 0 ? map : null;
+            }
+            log.LogDebug("delta native list: {Path} v{Version} active={Active} scanned={Scanned} pruned={Pruned} colmap={Map}",
+                path, snap.Version, ordered.Count, files.Count, pruned, mode);
+            return new NativeScanList
+            {
+                Version = snap.Version, Files = files, AnyUri = anyUri, LogicalToPhysical = logicalToPhysical,
+            };
         }
         finally
         {

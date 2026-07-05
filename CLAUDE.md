@@ -1243,6 +1243,23 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   delete (28) / update (63) / partition (54) / dv (48) / time_travel (48) + SQL Server pushdown suites green.
   Nuance: a mid-scan-refined dynamic filter (TopN) is captured only as of scan-init (best-effort). **Remaining:
   slice 3** (multi-lane, deferred by user).
+  **COLUMN MAPPING on the native read — DONE (2026-07-05, C#-only, no ABI; live Fabric-Spark-validated).** A
+  column-mapping Delta table (`delta.columnMapping.mode` = `name` or `id`) stores columns under PHYSICAL names
+  (`col-<guid>`), so the plain `read_parquet` SELECT-by-logical-name failed (*"Referenced column 'id' not found;
+  candidates: col-…"*). Fixed by mimicking the MultiFileReader's identifier mapping in the C# reader: `DeltaReader`
+  captures logical→physical from THIS snapshot's field metadata (`delta.columnMapping.physicalName`, read DIRECTLY
+  — `ColumnMapping.GetPhysicalName` returns the logical name in id mode since EW matches id mode by field-id, but
+  Delta writes a physicalName in BOTH modes and Spark stores the parquet columns under it) onto `NativeScanList.
+  LogicalToPhysical`; `DeltaNativeReader.FileSql` then reads through an **inner alias subquery** `(SELECT "phys" AS
+  "logical", …, file_row_number FROM read_parquet(…))` so the OUTER projection, user filter (incl. filters on a
+  mapped/renamed column), rowid, and DV condition all reference logical names unchanged — no filter rewrite, and
+  DuckDB pushes the outer filter down into `read_parquet` (mapped to the physical column) for row-group pruning.
+  Validated LIVE on Fabric Spark-created tables (`arrownet_cm_name` name mode + `arrownet_cm_id` id mode, each with
+  a post-create column RENAME so logical≠physical): both read correctly via `native_read`, incl. filter on the
+  mapped column + aggregation. The default (EW) reader already handled both modes (`RenameColumns` for name /
+  `RenameByFieldId` for id) — confirmed on the same tables. **Top-level columns only** (a nested mapped column
+  would need field-id matching via `parquet_schema.field_id` — deferred, clean follow-up mirroring
+  duckdb-delta's `MultiFileColumnMapper`). Spark-created via the `scratchpad/sparkprobe createcolmap` harness.
   v56 = **`onelake://` WRITE forward callbacks** — appended 3 vtable entries
   `onelake_open_write`/`onelake_write`/`onelake_close_write`; the C++ `ArrowNetOneLakeFileSystem` `OpenFile(write)`/
   `Write` (sequential append → managed `OneLakeForwardFs` create/append/flush) make **`COPY … TO 'onelake://…'` +
