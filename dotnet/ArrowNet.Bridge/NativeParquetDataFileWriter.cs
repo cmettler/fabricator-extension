@@ -49,8 +49,13 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
         // Bind the batches as a fresh Arrow stream (the host dequeues + exports each; InMemoryArrayStream only
         // disposes UNdequeued batches, and the C export doesn't free managed buffers — so the caller's batches
         // stay valid for its subsequent stats collection). One parquet file is written from the whole stream.
+        // A column-mapping rewrite/compaction hands us batches engineered-wood already annotated with
+        // `PARQUET:field_id` (via SetParquetFieldIds); DuckDB's COPY does NOT read Arrow field metadata, so lift
+        // those ids into an explicit FIELD_IDS clause — else the native-written file would lose its field ids and
+        // an id-mode reader couldn't map it.
         var src = new InMemoryArrayStream(batches[0].Schema, batches);
-        var (_, size, _) = RunCopy(_writableRoot, relativePath, src, cancellationToken);
+        var (_, size, _) = RunCopy(_writableRoot, relativePath, src, cancellationToken,
+                                   fieldIds: FieldIdsFromMetadata(batches[0].Schema));
         return new ValueTask<long>(size);
     }
 
@@ -71,7 +76,8 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
 
     internal static (long Rows, long Size, string? Stats) RunCopy(
         string writableRoot, string relativePath, IArrowArrayStream src, CancellationToken ct,
-        Schema? statsSchema = null)
+        Schema? statsSchema = null, IReadOnlyDictionary<string, int>? fieldIds = null,
+        IReadOnlyDictionary<string, string>? renameToPhysical = null)
     {
         var rel = relativePath.Replace('\\', '/').TrimStart('/');
         var uri = writableRoot + "/" + rel;
@@ -86,8 +92,8 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
             catch { /* object-store implicit dirs / unimplemented CreateDirectory — the COPY still writes */ }
         }
         var sql =
-            $"COPY (SELECT * FROM {InputName}) TO '{uri.Replace("'", "''")}' " +
-            "(FORMAT parquet, WRITE_BLOOM_FILTER true, RETURN_STATS)";
+            $"COPY (SELECT {SelectList(src.Schema, renameToPhysical)} FROM {InputName}) TO '{uri.Replace("'", "''")}' " +
+            "(FORMAT parquet, WRITE_BLOOM_FILTER true, RETURN_STATS" + FieldIdsClause(fieldIds) + ")";
         Log.LogInformation("delta native copy {Uri}", uri);
         var input = new (string, IArrowArrayStream)[] { (InputName, src) };
         using var result = Host.Query(sql, input);
@@ -109,13 +115,13 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
     /// </summary>
     internal static List<CopiedFile> RunCopyPartitioned(
         string writableRoot, IReadOnlyList<string> partitionColumns, IArrowArrayStream src,
-        CancellationToken ct, Schema? statsSchema)
+        CancellationToken ct, Schema? statsSchema, IReadOnlyDictionary<string, int>? fieldIds = null)
     {
         var quoted = string.Join(", ", partitionColumns.Select(c => "\"" + c.Replace("\"", "\"\"") + "\""));
         var sql =
             $"COPY (SELECT * FROM {InputName}) TO '{writableRoot.Replace("'", "''")}' " +
             $"(FORMAT parquet, PARTITION_BY ({quoted}), APPEND true, FILENAME_PATTERN '{{uuid}}', " +
-            "WRITE_BLOOM_FILTER true, RETURN_STATS)";
+            "WRITE_BLOOM_FILTER true, RETURN_STATS" + FieldIdsClause(fieldIds) + ")";
         Log.LogInformation("delta native partitioned copy {Root} by [{Cols}]", writableRoot, quoted);
         var input = new (string, IArrowArrayStream)[] { (InputName, src) };
         using var result = Host.Query(sql, input);
@@ -323,4 +329,65 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
     // DuckDB keys column_statistics by the QUOTED column name (e.g. "id"); strip one surrounding double-quote pair.
     private static string Unquote(string s) =>
         s.Length >= 2 && s[0] == '"' && s[^1] == '"' ? s.Substring(1, s.Length - 2) : s;
+
+    // The COPY inner projection: `*` normally, or an explicit `"logical" AS "physical"` alias list for a
+    // column-mapping table (per the Delta protocol, data files must use the PHYSICAL column names in BOTH name
+    // and id mode — the input stream carries logical names, so the COPY renames on the way out).
+    private static string SelectList(Schema schema, IReadOnlyDictionary<string, string>? renameToPhysical)
+    {
+        if (renameToPhysical is null || renameToPhysical.Count == 0)
+        {
+            return "*";
+        }
+        var parts = new List<string>(schema.FieldsList.Count);
+        foreach (var f in schema.FieldsList)
+        {
+            parts.Add(renameToPhysical.TryGetValue(f.Name, out var phys) && phys != f.Name
+                ? $"{QuoteIdent(f.Name)} AS {QuoteIdent(phys)}"
+                : QuoteIdent(f.Name));
+        }
+        return string.Join(", ", parts);
+    }
+
+    private static string QuoteIdent(string s) => "\"" + s.Replace("\"", "\"\"") + "\"";
+
+    // Renders the COPY `FIELD_IDS {'col': id, …}` option so DuckDB's parquet writer stamps each column's Delta
+    // `columnMapping.id` into the parquet field_id — the identity an id-mode reader maps by. Keys are the OUTPUT
+    // (physical) column names. Empty/null → no clause (a non-mapping table). String-literal keys tolerate
+    // arbitrary column names. Top-level columns only; a nested mapped column would use the
+    // `{'s': {__duckdb_field_id: 1, 'c': 2}}` recursion (a later slice).
+    private static string FieldIdsClause(IReadOnlyDictionary<string, int>? fieldIds)
+    {
+        if (fieldIds is null || fieldIds.Count == 0)
+        {
+            return "";
+        }
+        var sb = new System.Text.StringBuilder(", FIELD_IDS {");
+        bool first = true;
+        foreach (var kv in fieldIds)
+        {
+            if (!first) { sb.Append(", "); }
+            first = false;
+            sb.Append('\'').Append(kv.Key.Replace("'", "''")).Append("': ").Append(kv.Value.ToString(CultureInfo.InvariantCulture));
+        }
+        sb.Append('}');
+        return sb.ToString();
+    }
+
+    // Lifts `PARQUET:field_id` Arrow field metadata (set by engineered-wood's SetParquetFieldIds on a
+    // column-mapping rewrite/compaction) into a logical-name → field_id map for FieldIdsClause. Null when no field
+    // carries the metadata (the common non-mapping case) → no FIELD_IDS clause.
+    private static IReadOnlyDictionary<string, int>? FieldIdsFromMetadata(Schema schema)
+    {
+        Dictionary<string, int>? map = null;
+        foreach (var f in schema.FieldsList)
+        {
+            if (f.Metadata is { } md && md.TryGetValue("PARQUET:field_id", out var s)
+                && int.TryParse(s, out var id))
+            {
+                (map ??= new Dictionary<string, int>())[f.Name] = id;
+            }
+        }
+        return map;
+    }
 }

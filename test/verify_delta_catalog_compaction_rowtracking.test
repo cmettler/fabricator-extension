@@ -14,7 +14,7 @@ require parquet
 require-env ARROWNET_DELTA_WRITE_DIR
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/compactrt' AS lake (TYPE arrownet, PROVIDER 'delta', materialize_row_tracking true);
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/compactrt' AS lake (TYPE arrownet, PROVIDER 'delta', column_mapping 'none', materialize_row_tracking true);
 
 # Three separately-written small files → three distinct (baseRowId, defaultRowCommitVersion) source ranges.
 # CTAS (id=10) → base_row_id 0; each INSERT bumps the high-water mark → base_row_id 1, then 2. Each is written
@@ -81,7 +81,7 @@ statement ok
 DETACH lake;
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/compactrt' AS lake2 (TYPE arrownet, PROVIDER 'delta', materialize_row_tracking true);
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/compactrt' AS lake2 (TYPE arrownet, PROVIDER 'delta', column_mapping 'none', materialize_row_tracking true);
 
 query I
 SELECT id FROM lake2.main.t ORDER BY id;

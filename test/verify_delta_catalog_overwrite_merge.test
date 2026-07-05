@@ -16,7 +16,7 @@ require mssql_net
 require-env ARROWNET_DELTA_WRITE_DIR
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/owm' AS lake (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/owm' AS lake (TYPE arrownet, PROVIDER 'delta', column_mapping 'none');
 
 # ================= replace_where: atomic partition overwrite =================
 statement ok

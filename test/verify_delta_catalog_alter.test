@@ -1,9 +1,9 @@
 # name: test/verify_delta_catalog_alter.test
-# description: Delta folder-as-catalog SCHEMA EVOLUTION. Only ALTER TABLE ... ADD COLUMN is supported — a
-#              metadata-only commit appending a nullable column (no file rewrite). Rows written BEFORE the ADD
-#              read back NULL for the new column (engineered-wood backfills the missing column); rows written
-#              AFTER carry the value. RENAME/DROP/ALTER COLUMN TYPE raise a clean "not supported" error. Set
-#              ARROWNET_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
+# description: Delta folder-as-catalog SCHEMA EVOLUTION. ADD COLUMN (metadata-only commit appending a nullable
+#              column — no file rewrite; old rows read NULL, backfilled), RENAME COLUMN and DROP COLUMN
+#              (metadata-only on a column-mapping table — the default — the field keeps / retires its
+#              columnMapping.id + physicalName; readers reconcile old files) are supported. ALTER COLUMN TYPE
+#              raises a clean "not supported" error. Set ARROWNET_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
 # group: [mssql_net]
 
 require mssql_net
@@ -87,17 +87,35 @@ SELECT id, name, score, tag FROM lake2.main.t ORDER BY id;
 4	a4	40	NULL
 5	a5	50	hot
 
-# Other ALTER kinds are cleanly unsupported on Delta.
-statement error
+# RENAME COLUMN is a metadata-only commit on a column-mapping table (the default) — the field keeps its
+# columnMapping.id + physicalName, so existing data files read unchanged under the new logical name.
+statement ok
 ALTER TABLE lake2.main.t RENAME COLUMN name TO label;
-----
-not supported
 
-statement error
+query ITIT
+SELECT id, label, score, tag FROM lake2.main.t ORDER BY id;
+----
+1	a1	NULL	NULL
+2	a2	NULL	NULL
+3	a3	NULL	NULL
+4	a4	40	NULL
+5	a5	50	hot
+
+# DROP COLUMN is also metadata-only under column mapping — old files keep the physical column, readers
+# reconcile it away against the current schema.
+statement ok
 ALTER TABLE lake2.main.t DROP COLUMN tag;
-----
-not supported
 
+query ITI
+SELECT id, label, score FROM lake2.main.t ORDER BY id;
+----
+1	a1	NULL
+2	a2	NULL
+3	a3	NULL
+4	a4	40
+5	a5	50
+
+# ALTER COLUMN TYPE is still cleanly unsupported on Delta.
 statement error
 ALTER TABLE lake2.main.t ALTER COLUMN score TYPE BIGINT;
 ----

@@ -215,25 +215,27 @@ public sealed class DeltaCatalog : IBackendCatalog
         return defaultValue;
     }
 
-    /// <summary>Parses the <c>column_mapping</c> ATTACH option for tables CREATED in this catalog (<c>'name'</c> /
-    /// <c>'none'</c>, case-insensitive; default None). <c>'id'</c> is rejected: engineered-wood's id-mode writes
-    /// the LOGICAL column names into the data files (matching by field-id), which our native reader can't yet map
-    /// by field-id — use <c>'name'</c> (the standard/Databricks-default column-mapping mode). READING external
-    /// (Spark/Databricks) id-mode tables IS supported (their files use physical names). Throws on any other
-    /// value.</summary>
+    /// <summary>Parses the <c>column_mapping</c> ATTACH option for tables CREATED in this catalog (<c>'id'</c> /
+    /// <c>'name'</c> / <c>'none'</c>, case-insensitive; default None). <c>'id'</c> maps columns by the Delta
+    /// <c>delta.columnMapping.id</c> (== the parquet <c>field_id</c>) — the standard identity, stable across a
+    /// RENAME, and what the native reader resolves via <c>parquet_schema</c> (see
+    /// <see cref="DeltaNativeReader"/>). <c>'name'</c> maps by <c>physicalName</c> (col-&lt;guid&gt;). READING an
+    /// external (Spark/Databricks) id- or name-mode table works regardless of this option (the mode is a table
+    /// property). Throws on any other value.</summary>
     private static EngineeredWood.DeltaLake.Schema.ColumnMappingMode ParseColumnMappingOption(string? optionsJson)
     {
         var s = ParseStringOption(optionsJson, "column_mapping");
-        if (string.IsNullOrWhiteSpace(s)) { return EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None; }
+        // Default (option absent) = ID mode: the standard column-mapping identity, so a later RENAME COLUMN is a
+        // metadata-only commit (no rewrite) out of the box. Opt out with `column_mapping 'none'` for a plain table
+        // (logical == physical name, no protocol bump — e.g. a consumer that can't read a writer-v7 table).
+        if (string.IsNullOrWhiteSpace(s)) { return EngineeredWood.DeltaLake.Schema.ColumnMappingMode.Id; }
         return s.Trim().ToLowerInvariant() switch
         {
             "none" or "" => EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None,
             "name" => EngineeredWood.DeltaLake.Schema.ColumnMappingMode.Name,
-            "id" => throw new System.ArgumentException(
-                "column_mapping 'id' is not supported for tables created by this provider "
-                + "(use 'name', the standard column-mapping mode). Reading external id-mode tables is supported."),
+            "id" => EngineeredWood.DeltaLake.Schema.ColumnMappingMode.Id,
             _ => throw new System.ArgumentException(
-                $"column_mapping: unknown mode '{s}' (expected 'name' or 'none')."),
+                $"column_mapping: unknown mode '{s}' (expected 'id', 'name', or 'none')."),
         };
     }
 
@@ -773,12 +775,11 @@ public sealed class DeltaCatalog : IBackendCatalog
 
         // native_write: STREAM straight to DuckDB's parquet writer (bounded memory — important for a Fabric
         // notebook). TryWriteStreaming returns null (WITHOUT consuming `data`) for cases the single-file streaming
-        // commit can't represent (partitioned / replace_where / schema_mode=merge / column-mapping / identity /
-        // iceberg) → fall through to the collect path below with `data` intact. A column-mapping catalog is gated
-        // OUT here: streaming would OpenOrCreate the table WITHOUT the mapping mode (a plain table) before the
-        // SupportsExternalDataFileCommit fallback fires — so mapping must go through the collect path, which
-        // creates the table WITH the mode (DeltaWriter.Write → columnMapping) and writes via the EW codec.
-        if (_nativeWrite && _columnMappingMode == EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None)
+        // commit can't represent (partitioned+mapping / replace_where / schema_mode=merge / mapping-replace with a
+        // schema change / identity / iceberg) → fall through to the collect path with `data` intact. Column-mapping
+        // tables (BOTH modes) stream: TryWriteStreaming creates the table WITH the mode, and the COPY renames the
+        // columns to their PHYSICAL names + stamps FIELD_IDS (the Delta-spec file layout for both modes).
+        if (_nativeWrite)
         {
             var streamedVersion = DeltaWriter.TryWriteStreaming(
                 opener, tablePath, data, mode,
@@ -787,7 +788,8 @@ public sealed class DeltaCatalog : IBackendCatalog
                 changeDataFeed: _changeDataFeedOnCreate,
                 rowTracking: _rowTrackingOnCreate,
                 spec: spec, materializeRowTracking: _materializeRowTracking,
-                out var streamedRows);
+                out var streamedRows,
+                columnMapping: _columnMappingMode);
             if (streamedVersion is not null)
             {
                 return streamedRows;
@@ -1205,6 +1207,27 @@ public sealed class DeltaCatalog : IBackendCatalog
                 DeltaReader.AddColumn(Opener(), TablePath(s, t), field, default);
                 return;
             }
+            case AlterKind.RenameColumn:
+            {
+                // a1 = old column name, a2 = new column name (C++ RenameColumnInfo). Metadata-only commit on a
+                // column-mapping table (the field keeps its physicalName + columnMapping.id); EW rejects a plain
+                // table (which would need a full rewrite). Opener threaded for the host-FS log write.
+                string oldCol = a1 ?? throw new System.InvalidOperationException(
+                    "delta RENAME COLUMN requires the old column name.");
+                string newCol = a2 ?? throw new System.InvalidOperationException(
+                    "delta RENAME COLUMN requires the new column name.");
+                DeltaReader.RenameColumn(Opener(), TablePath(s, t), oldCol, newCol, default);
+                return;
+            }
+            case AlterKind.DropColumn:
+            {
+                // a1 = column name. Metadata-only commit on a column-mapping table (old files keep the physical
+                // column; readers reconcile it away); EW rejects a plain table (would need a full rewrite).
+                string dropCol = a1 ?? throw new System.InvalidOperationException(
+                    "delta DROP COLUMN requires the column name.");
+                DeltaReader.DropColumn(Opener(), TablePath(s, t), dropCol, default);
+                return;
+            }
             case AlterKind.RenameTable:
             {
                 string newName = a1 ?? throw new System.InvalidOperationException(
@@ -1223,7 +1246,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 return;
             }
             default:
-                throw Unsupported("ALTER TABLE (only ADD COLUMN and RENAME TABLE are supported on Delta)");
+                throw Unsupported("ALTER TABLE (only ADD/RENAME/DROP COLUMN and RENAME TABLE are supported on Delta)");
         }
     }
 

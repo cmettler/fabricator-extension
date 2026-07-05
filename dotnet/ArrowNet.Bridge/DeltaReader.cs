@@ -69,11 +69,20 @@ internal static class DeltaReader
         public IReadOnlyList<NativeScanFile> Files { get; init; } = System.Array.Empty<NativeScanFile>();
         public string? AnyUri { get; init; }
 
-        /// <summary>For a column-mapping table (name OR id mode): logical column name → the PHYSICAL name the
-        /// column is stored under in the parquet files. Null when column mapping is off (the common case). The
-        /// native reader aliases <c>"physical" AS "logical"</c> so the scan output uses logical names — mirroring
-        /// how engineered-wood's own reader maps by physical name.</summary>
+        /// <summary>For a <b>name-mode</b> column-mapping table: logical column name → the PHYSICAL name the
+        /// column is stored under in the parquet files. Null when column mapping is off (the common case) OR in id
+        /// mode (see <see cref="LogicalToFieldId"/>). The native reader aliases <c>"physical" AS "logical"</c> so the
+        /// scan output uses logical names — mirroring how engineered-wood's own reader maps by physical name.</summary>
         public IReadOnlyDictionary<string, string>? LogicalToPhysical { get; init; }
+
+        /// <summary>For an <b>id-mode</b> column-mapping table: logical column name → its Delta
+        /// <c>delta.columnMapping.id</c> (== the parquet <c>field_id</c>). Null unless id mode. The native reader
+        /// resolves each file's parquet <c>field_id → physical parquet name</c> (via <c>parquet_schema</c>) and
+        /// composes logical → field_id → physical name, then aliases as for name mode — so it reads BOTH an
+        /// engineered-wood id-mode table (logical names in the files) AND an external Spark/Databricks id-mode table
+        /// (col-&lt;guid&gt; physical names), and survives a column RENAME (field_id is stable). Top-level columns
+        /// only; a nested mapped column needs recursive field-id remapping (a later slice).</summary>
+        public IReadOnlyDictionary<string, int>? LogicalToFieldId { get; init; }
     }
 
     /// <summary>Resolves the version whose commit is at/just-before <paramref name="instantUtc"/> (via the
@@ -148,16 +157,21 @@ internal static class DeltaReader
                 }
                 files.Add(new NativeScanFile(ordinal, uri, dv));
             }
-            // Column-mapping tables (name/id mode) store columns under PHYSICAL names — capture logical→physical
-            // (from THIS snapshot's schema, so time travel to a pre-rename version maps correctly) so the native
-            // reader can alias them back. We read `delta.columnMapping.physicalName` from each field's metadata
-            // DIRECTLY (not ColumnMapping.GetPhysicalName, which returns the logical name in id mode — EW matches
-            // id mode by field-id): Delta assigns a physicalName in BOTH modes and Spark writes the parquet columns
-            // under it, so a `"physical" AS "logical"` alias works for both. (Top-level columns only; a nested
-            // mapped column would need field-id matching — deferred.) Null for the common no-mapping case.
+            // Column-mapping tables store columns decoupled from the logical name — capture the mapping (from THIS
+            // snapshot's schema, so time travel to a pre-rename version maps correctly) so the native reader can
+            // alias physical→logical. Two mechanisms, one per mode:
+            //   • NAME mode → logical → PHYSICAL name (read `delta.columnMapping.physicalName` directly; Spark writes
+            //     the parquet columns under it, and the physical name is STABLE across renames → probe-free).
+            //   • ID mode → logical → field_id (`delta.columnMapping.id`); the reader resolves each file's parquet
+            //     field_id → physical name (via parquet_schema) and composes logical → physical. Field-id (not
+            //     physicalName) because engineered-wood's id-mode writer keeps LOGICAL names in the files (matching
+            //     by field-id) while declaring a col-<guid> physicalName — so a physicalName alias would fail there;
+            //     field-id reads BOTH the EW-created and the external-Spark (col-<guid>) layout, and survives rename.
+            // (Top-level columns only; a nested mapped column needs recursive field-id remapping — a later slice.)
             var mode = EngineeredWood.DeltaLake.Schema.ColumnMapping.GetMode(snap.Metadata.Configuration);
             IReadOnlyDictionary<string, string>? logicalToPhysical = null;
-            if (mode != EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None)
+            IReadOnlyDictionary<string, int>? logicalToFieldId = null;
+            if (mode == EngineeredWood.DeltaLake.Schema.ColumnMappingMode.Name)
             {
                 var map = new Dictionary<string, string>();
                 foreach (var field in snap.Schema.Fields)
@@ -171,11 +185,17 @@ internal static class DeltaReader
                 }
                 logicalToPhysical = map.Count > 0 ? map : null;
             }
+            else if (mode == EngineeredWood.DeltaLake.Schema.ColumnMappingMode.Id)
+            {
+                var map = EngineeredWood.DeltaLake.Schema.ColumnMapping.BuildLogicalToFieldIdMap(snap.Schema);
+                logicalToFieldId = map.Count > 0 ? map : null;
+            }
             log.LogDebug("delta native list: {Path} v{Version} active={Active} scanned={Scanned} pruned={Pruned} colmap={Map}",
                 path, snap.Version, ordered.Count, files.Count, pruned, mode);
             return new NativeScanList
             {
-                Version = snap.Version, Files = files, AnyUri = anyUri, LogicalToPhysical = logicalToPhysical,
+                Version = snap.Version, Files = files, AnyUri = anyUri,
+                LogicalToPhysical = logicalToPhysical, LogicalToFieldId = logicalToFieldId,
             };
         }
         finally
@@ -677,6 +697,49 @@ internal static class DeltaReader
         catch (DeltaConflictException)
         {
             throw ConcurrentModification("ADD COLUMN");
+        }
+        finally
+        {
+            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+    }
+
+    /// <summary>Renames a column as a metadata-only commit (no file rewrite) — engineered-wood
+    /// <see cref="DeltaTable.RenameColumnAsync"/>. Requires a column-mapping table (the field keeps its
+    /// physicalName + columnMapping.id, so old files read unchanged under the new logical name); a plain table is
+    /// rejected there.</summary>
+    public static void RenameColumn(nint opener, string path, string oldName, string newName, CancellationToken ct)
+    {
+        var fs = TableFileSystems.Create(opener, path);
+        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).AsTask().GetAwaiter().GetResult();
+        try
+        {
+            table.RenameColumnAsync(oldName, newName, ct).AsTask().GetAwaiter().GetResult();
+        }
+        catch (DeltaConflictException)
+        {
+            throw ConcurrentModification("RENAME COLUMN");
+        }
+        finally
+        {
+            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+    }
+
+    /// <summary>Drops a column as a metadata-only commit (no file rewrite) — engineered-wood
+    /// <see cref="DeltaTable.DropColumnAsync"/>. Requires a column-mapping table (old files keep the physical
+    /// column; readers reconcile it away against the current schema); a plain table is rejected there.</summary>
+    public static void DropColumn(nint opener, string path, string name, CancellationToken ct)
+    {
+        var fs = TableFileSystems.Create(opener, path);
+        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).AsTask().GetAwaiter().GetResult();
+        try
+        {
+            table.DropColumnAsync(name, ct).AsTask().GetAwaiter().GetResult();
+        }
+        catch (DeltaConflictException)
+        {
+            throw ConcurrentModification("DROP COLUMN");
         }
         finally
         {

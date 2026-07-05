@@ -1,9 +1,11 @@
 # name: test/verify_delta_catalog_column_mapping.test
-# description: The `column_mapping 'name'|'id'` ATTACH option — tables CREATED in the catalog enable Delta column
-#              mapping (physical col-<guid> names decoupled from logical). engineered-wood's CreateAsync assigns the
-#              physical names + bumps the protocol; our read (physical→logical) + write (EW codec) handle mapped
-#              tables. Verifies: create+insert+read round-trips, the parquet uses PHYSICAL names (not logical), the
-#              commit declares the mode, and native_read reads it too. Set ARROWNET_DELTA_WRITE_DIR. Local FS.
+# description: The `column_mapping 'id'|'name'|'none'` ATTACH option (DEFAULT = 'id'). Tables CREATED in the catalog
+#              enable Delta column mapping so a later RENAME COLUMN is a metadata-only commit (no rewrite). id mode
+#              maps columns by the parquet field_id (the native reader resolves field_id -> physical name via
+#              parquet_schema, so it reads EW-created + external-Spark layouts and survives a RENAME); name mode maps
+#              by physicalName (col-<guid>). native_write id mode streams with FIELD_IDS stamped. Verifies: create +
+#              insert + read (default reader + native_read + native_write), RENAME across mixed-vintage files, the
+#              parquet carries field_ids, and 'none' opts out. Set ARROWNET_DELTA_WRITE_DIR. Local FS.
 # group: [mssql_net]
 
 require mssql_net
@@ -12,7 +14,7 @@ require parquet
 
 require-env ARROWNET_DELTA_WRITE_DIR
 
-# ---- name mode ----
+# ================= name mode (explicit) =================
 statement ok
 ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmname' AS nm (TYPE arrownet, PROVIDER 'delta', column_mapping 'name');
 
@@ -42,39 +44,202 @@ SELECT count(DISTINCT name) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/cmn
 ----
 2
 
-# The create commit declares column mapping mode = name.
-query I
-SELECT count(*) FROM read_text('${ARROWNET_DELTA_WRITE_DIR}/cmname/t/_delta_log/00000000000000000000.json')
-WHERE replace(content, chr(92)||'u0022', '"') LIKE '%"delta.columnMapping.mode":"name"%';
-----
-1
-
 statement ok
 DETACH nm;
 
-# Re-attach WITHOUT the option (mode is a table property, not an ATTACH-time read concern) → still reads.
+# ================= id mode (explicit) =================
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmname' AS nm2 (TYPE arrownet, PROVIDER 'delta', native_read true);
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmid' AS im (TYPE arrownet, PROVIDER 'delta', column_mapping 'id');
+
+statement ok
+CREATE TABLE im.main.t AS SELECT i AS id, 'v' || i AS val FROM range(1, 4) AS r(i);
+
+statement ok
+INSERT INTO im.main.t VALUES (4, 'v4');
 
 query IT
-SELECT id, v FROM nm2.main.t ORDER BY id;
+SELECT id, val FROM im.main.t ORDER BY id;
 ----
 1	v1
 2	v2
 3	v3
 4	v4
 
-statement ok
-DETACH nm2;
-
-# ---- 'id' mode → rejected for CREATE (EW writes logical names in id-mode files; use 'name'). The error surfaces
-#      at ATTACH (open_catalog validates eagerly). Reading EXTERNAL Spark id-mode tables is supported separately. ----
-statement error
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmid' AS im (TYPE arrownet, PROVIDER 'delta', column_mapping 'id');
+# The commit declares id mode.
+query I
+SELECT count(*) FROM read_text('${ARROWNET_DELTA_WRITE_DIR}/cmid/t/_delta_log/00000000000000000000.json')
+WHERE replace(content, chr(92)||'u0022', '"') LIKE '%"delta.columnMapping.mode":"id"%';
 ----
-column_mapping 'id' is not supported
+1
 
-# ---- unknown mode → clean error at ATTACH ----
+# Per the Delta spec, id-mode data files ALSO use PHYSICAL col-<guid> names (the logical names are absent) —
+# this is what makes them readable by Spark / delta-kernel.
+query I
+SELECT count(*) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/cmid/t/*.parquet') WHERE name IN ('id', 'val');
+----
+0
+
+# ... AND carry field_ids (the id-mode identity readers resolve by).
+query I
+SELECT count(DISTINCT field_id) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/cmid/t/*.parquet') WHERE field_id IS NOT NULL;
+----
+2
+
+# RENAME COLUMN — metadata-only (field keeps its columnMapping.id); old files stored 'val', new files store 'label'.
+statement ok
+ALTER TABLE im.main.t RENAME COLUMN val TO label;
+
+statement ok
+INSERT INTO im.main.t VALUES (5, 'v5');
+
+# All rows read under the NEW logical name across mixed-vintage files (EW reader maps by field_id).
+query IT
+SELECT id, label FROM im.main.t ORDER BY id;
+----
+1	v1
+2	v2
+3	v3
+4	v4
+5	v5
+
+statement ok
+DETACH im;
+
+# The NATIVE reader (parquet field_id -> physical-name resolver) reads the mixed-vintage files under 'label'.
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmid' AS im2 (TYPE arrownet, PROVIDER 'delta', native_read true);
+
+query IT
+SELECT id, label FROM im2.main.t ORDER BY id;
+----
+1	v1
+2	v2
+3	v3
+4	v4
+5	v5
+
+statement ok
+DETACH im2;
+
+# ================= default = id mode (no option) → RENAME works out of the box =================
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmdefault' AS d (TYPE arrownet, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE d.main.t AS SELECT i AS a, i * 10 AS b FROM range(1, 4) AS r(i);
+
+# The default catalog declares id mode (so RENAME is metadata-only).
+query I
+SELECT count(*) FROM read_text('${ARROWNET_DELTA_WRITE_DIR}/cmdefault/t/_delta_log/00000000000000000000.json')
+WHERE replace(content, chr(92)||'u0022', '"') LIKE '%"delta.columnMapping.mode":"id"%';
+----
+1
+
+statement ok
+ALTER TABLE d.main.t RENAME COLUMN b TO doubled;
+
+query II
+SELECT a, doubled FROM d.main.t ORDER BY a;
+----
+1	10
+2	20
+3	30
+
+# ADD + DROP COLUMN are metadata-only too (fresh column id on ADD; readers reconcile old files on DROP).
+statement ok
+ALTER TABLE d.main.t ADD COLUMN note VARCHAR;
+
+statement ok
+INSERT INTO d.main.t VALUES (4, 40, 'n4');
+
+query IIT
+SELECT a, doubled, note FROM d.main.t ORDER BY a;
+----
+1	10	NULL
+2	20	NULL
+3	30	NULL
+4	40	n4
+
+statement ok
+ALTER TABLE d.main.t DROP COLUMN doubled;
+
+query IT
+SELECT a, note FROM d.main.t ORDER BY a;
+----
+1	NULL
+2	NULL
+3	NULL
+4	n4
+
+# OPTIMIZE (compaction) preserves the column-mapping identity: the compacted file keeps the physical names +
+# field_ids, so the data reads back unchanged (incl. across the earlier RENAME/ADD/DROP).
+statement ok
+INSERT INTO d.main.t VALUES (5, 'n5');
+
+statement ok
+SELECT mssql_net_exec('d', 'OPTIMIZE main.t');
+
+statement ok
+SELECT mssql_net_exec('d', 'VACUUM main.t RETAIN 0 HOURS');
+
+query IT
+SELECT a, note FROM d.main.t ORDER BY a;
+----
+1	NULL
+2	NULL
+3	NULL
+4	n4
+5	n5
+
+statement ok
+DETACH d;
+
+# ================= id mode + native_write (streaming, FIELD_IDS stamped) =================
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmidnw' AS nw (TYPE arrownet, PROVIDER 'delta', column_mapping 'id', native_write true);
+
+statement ok
+CREATE TABLE nw.main.t AS SELECT i AS id, 'v' || i AS val FROM range(1, 6) AS r(i);
+
+statement ok
+INSERT INTO nw.main.t VALUES (6, 'v6');
+
+query IT
+SELECT id, val FROM nw.main.t ORDER BY id;
+----
+1	v1
+2	v2
+3	v3
+4	v4
+5	v5
+6	v6
+
+# The native-written parquet carries field_ids (DuckDB COPY FIELD_IDS), so the id-mode reader maps it.
+query I
+SELECT count(DISTINCT field_id) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/cmidnw/t/*.parquet') WHERE field_id IS NOT NULL;
+----
+2
+
+statement ok
+DETACH nw;
+
+# ================= 'none' opts out (plain table; logical == physical name, no protocol bump) =================
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmnone' AS pn (TYPE arrownet, PROVIDER 'delta', column_mapping 'none');
+
+statement ok
+CREATE TABLE pn.main.t AS SELECT 1 AS id, 'a' AS v;
+
+# Plain table: the logical names ARE the parquet column names (no col-<guid>).
+query I
+SELECT count(*) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/cmnone/t/*.parquet') WHERE name IN ('id', 'v');
+----
+2
+
+statement ok
+DETACH pn;
+
+# ================= unknown mode → clean error at ATTACH =================
 statement error
 ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmbad' AS bad (TYPE arrownet, PROVIDER 'delta', column_mapping 'bogus');
 ----

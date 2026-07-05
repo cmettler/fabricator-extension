@@ -16,7 +16,7 @@ require-env ARROWNET_DELTA_WRITE_DIR
 
 # DV-default is on → row tracking is enabled, so the collect+native path WOULD inject __delta_row_id.
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/nwstream' AS lake (TYPE arrownet, PROVIDER 'delta', native_write true);
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/nwstream' AS lake (TYPE arrownet, PROVIDER 'delta', column_mapping 'none', native_write true);
 
 # CTAS (Overwrite) — streams to one parquet file.
 statement ok
@@ -83,7 +83,7 @@ statement ok
 DETACH lake;
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/nwstream' AS lake2 (TYPE arrownet, PROVIDER 'delta', native_write true);
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/nwstream' AS lake2 (TYPE arrownet, PROVIDER 'delta', column_mapping 'none', native_write true);
 
 query I
 SELECT count(*) FROM lake2.main.t;
@@ -97,7 +97,7 @@ DETACH lake2;
 #      fallback. Data lands in the Hive layout; each partition file excludes the partition column + has no
 #      injected __delta_row_id (streaming signal); the commit carries per-file partitionValues + stats. ----
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/nwstreampart' AS lp (TYPE arrownet, PROVIDER 'delta', native_write true);
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/nwstreampart' AS lp (TYPE arrownet, PROVIDER 'delta', column_mapping 'none', native_write true);
 
 statement ok
 CREATE TABLE lp.main.p PARTITIONED BY (region) AS

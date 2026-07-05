@@ -63,7 +63,7 @@ internal static class DeltaNativeReader
         Log.LogInformation(
             "delta native scan {Path}: v{Version} files={Files} cols=[{Cols}] rowid={RowId} where=[{Where}] prefetch={Prefetch} colmap={Map}",
             path, listing.Version, listing.Files.Count, string.Join(",", dataCols), wantRowId, where ?? "", prefetch,
-            listing.LogicalToPhysical is not null);
+            listing.LogicalToPhysical is not null ? "name" : listing.LogicalToFieldId is not null ? "id" : "none");
 
         return new AsyncEnumerableArrowStream(schema, StreamFiles(listing, dataCols, wantRowId, where, prefetch));
     }
@@ -134,7 +134,7 @@ internal static class DeltaNativeReader
         if (listing.AnyUri is { } probe)
         {
             var probeFile = new DeltaReader.NativeScanFile(0, probe, System.Array.Empty<long>());
-            var sql = FileSql(dataCols, wantRowId, where: null, probeFile, listing.LogicalToPhysical) + " LIMIT 0";
+            var sql = FileSql(dataCols, wantRowId, where: null, probeFile, LogToPhys(listing, probe)) + " LIMIT 0";
             using var s = Host.Query(sql);
             return s.Schema;
         }
@@ -185,7 +185,7 @@ internal static class DeltaNativeReader
                     {
                         try
                         {
-                            var sql = FileSql(dataCols, wantRowId, where, file, listing.LogicalToPhysical);
+                            var sql = FileSql(dataCols, wantRowId, where, file, LogToPhys(listing, file.Uri));
                             Log.LogDebug("delta native file: {Sql}", sql);
                             using var s = Host.Query(sql);
                             while (true)
@@ -218,6 +218,64 @@ internal static class DeltaNativeReader
             yield return b;
         }
         await pump.ConfigureAwait(false); // observe pump faults
+    }
+
+    // Resolves the effective logical→physical column-name map for ONE file of a column-mapping table:
+    //   • name mode → the file-independent physicalName map from the listing (probe-free);
+    //   • id mode   → probe THIS file's parquet `field_id → physical name` (footer read only) and compose
+    //                 logical → field_id → physical name (per-file, so it stays correct across a column RENAME
+    //                 where old + new files store the same field_id under different physical names);
+    //   • no mapping → null (FileSql reads by logical name directly).
+    private static IReadOnlyDictionary<string, string>? LogToPhys(DeltaReader.NativeScanList listing, string uri)
+    {
+        if (listing.LogicalToPhysical is { } phys)
+        {
+            return phys;
+        }
+        if (listing.LogicalToFieldId is not { } logToFid)
+        {
+            return null;
+        }
+        var fieldIdToName = ProbeFieldIds(uri);
+        var map = new Dictionary<string, string>();
+        foreach (var kv in logToFid)
+        {
+            if (fieldIdToName.TryGetValue(kv.Value, out var physName) && physName != kv.Key)
+            {
+                map[kv.Key] = physName;
+            }
+        }
+        return map.Count > 0 ? map : null;
+    }
+
+    // Reads a parquet file's `field_id → physical column name` (top-level + nested nodes) via parquet_schema —
+    // a footer-only read. Rows with no field_id (e.g. the schema root) are skipped.
+    private static Dictionary<int, string> ProbeFieldIds(string uri)
+    {
+        var result = new Dictionary<int, string>();
+        var sql = $"SELECT name, CAST(field_id AS BIGINT) AS fid FROM parquet_schema('{uri.Replace("'", "''")}') WHERE field_id IS NOT NULL";
+        using var s = Host.Query(sql);
+        while (true)
+        {
+            var batch = s.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+            if (batch is null)
+            {
+                break;
+            }
+            using (batch)
+            {
+                var names = (StringArray)batch.Column(0);
+                var fids = (Int64Array)batch.Column(1);
+                for (int i = 0; i < batch.Length; i++)
+                {
+                    if (fids.IsValid(i) && !names.IsNull(i))
+                    {
+                        result[(int)fids.GetValue(i)!.Value] = names.GetString(i);
+                    }
+                }
+            }
+        }
+        return result;
     }
 
     private static int Prefetch()

@@ -14,7 +14,7 @@ require-env ARROWNET_DELTA_WRITE_DIR
 
 # ---- DEFAULT (no option) => deletion vectors: DELETE does NOT rewrite the data file ----
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/dvdef' AS lake (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/dvdef' AS lake (TYPE arrownet, PROVIDER 'delta', column_mapping 'none');
 
 statement ok
 CREATE TABLE lake.main.t AS SELECT i AS id, 'v' || i AS name FROM range(1, 7) AS r(i);
@@ -48,7 +48,7 @@ DETACH lake;
 
 # ---- OPT-OUT (deletion_vectors false) => copy-on-write: DELETE rewrites the file (a 2nd parquet on disk) ----
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cowout' AS cow (TYPE arrownet, PROVIDER 'delta', deletion_vectors false);
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cowout' AS cow (TYPE arrownet, PROVIDER 'delta', column_mapping 'none', deletion_vectors false);
 
 statement ok
 CREATE TABLE cow.main.t AS SELECT i AS id, 'v' || i AS name FROM range(1, 7) AS r(i);
@@ -82,7 +82,7 @@ DETACH cow;
 # ---- MERGE-ON-READ UPDATE (DV default): UPDATE DV-deletes the old rows and APPENDS only the post-image rows
 #      (a small file) instead of rewriting the whole file ----
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/mor' AS mor (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/mor' AS mor (TYPE arrownet, PROVIDER 'delta', column_mapping 'none');
 
 statement ok
 CREATE TABLE mor.main.t AS SELECT i AS id, 'v' || i AS name FROM range(1, 11) AS r(i);

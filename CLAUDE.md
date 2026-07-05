@@ -1269,15 +1269,56 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   mode (reader v3 / writer v7 — forced by the DV default), else Spark throws `DELTA_FEATURES_PROTOCOL_METADATA_MISMATCH`;
   (2) `DeltaSchemaSerializer` emits `delta.columnMapping.id` as a JSON NUMBER (Delta field-id is numeric — Spark's
   `Metadata.getLong` threw "String cannot be cast to Long" on the old string form). The write rides the existing
-  EW-codec `RenameToPhysical` path (streaming is gated off for a mapping catalog — it'd create a plain table before
-  the fallback). **`'id'` is REJECTED for CREATE** (clean error): EW's id-mode writes the LOGICAL names into the
-  files (matching by field-id), which our native reader can't yet map by field-id — use `'name'` (the standard/
-  Databricks-default mode). READING external Spark/Databricks id-mode tables is unaffected (supported). Validated:
-  `test/verify_delta_catalog_column_mapping.test` (27 — name-mode create/insert/read + native_read, physical names
-  in the parquet, mode declared, `'id'`+unknown rejected) + write/native_write/delete/update unregressed; **live
-  OneLake**: a name-mode table CREATED by our provider is read correctly by Spark (rows + count + `mode=name`).
-  Follow-up for `'id'` create: field-id-based native read (`parquet_schema.field_id`) — same as the nested-column
-  follow-up above.
+  EW-codec `RenameToPhysical` path.
+  **COLUMN MAPPING IS NOW THE DEFAULT — `column_mapping 'id'` (default) | `'name'` | `'none'` (2026-07-05, second
+  pass).** Tables CREATED in a Delta catalog default to **id-mode column mapping**, so `ALTER TABLE … RENAME
+  COLUMN` / `DROP COLUMN` work out of the box as **metadata-only commits** (no rewrite); opt out with
+  `column_mapping 'none'` for a plain minimal-protocol table. What made the default sound:
+  - **EW spec fix — id-mode files now use PHYSICAL names** (the earlier "id writes logical names" behavior was an
+    EW spec violation: the Delta protocol requires physical names + parquet `field_id` in BOTH modes — Spark's
+    id-mode files are `col-<guid>`+ids). `ColumnMapping.GetPhysicalName`/`BuildLogical↔PhysicalMap`/
+    `FindFieldIdForArrowField` are now mode-agnostic (mapping-on ⇒ physical), so every EW write path (codec write,
+    copy-on-write rewrite, DV update) emits physical names + field_ids for id mode too. **Proven with the
+    reference reader**: DuckDB's official `delta_scan` (delta-kernel-rs — what Spark/Fabric use) reads our
+    default-id tables correctly incl. after RENAME+ADD+DROP (it read ALL-NULLs on the old logical-named layout —
+    the bug that triggered this pass). The old `'id'-REJECTED` note above is SUPERSEDED.
+  - **Field-id native read**: `NativeScanList.LogicalToFieldId` (id mode; `LogicalToPhysical` stays for name
+    mode) + `DeltaNativeReader.LogToPhys` probes each file's `parquet_schema` (`field_id → physical name`,
+    footer-only) and composes logical→field_id→physical for the alias subquery — per-file, so mixed-vintage files
+    across a RENAME read correctly, and both EW-created and external-Spark id layouts work.
+  - **RENAME/ADD/DROP COLUMN under mapping** (all metadata-only): EW `RenameColumnAsync` (keeps id+physicalName),
+    `AddColumnAsync` now assigns a fresh id (`max(columnMapping.maxColumnId, schema-max)+1`) + physicalName +
+    bumps maxColumnId, new `DropColumnAsync` (retires the id; partition columns + last column rejected);
+    `BackfillMissingColumns` reconciles EXTRA columns away too (DROP) — not just missing (ADD). Plain tables:
+    RENAME/DROP still cleanly rejected (would need a full rewrite); ADD works as before. Bridge:
+    `DeltaCatalog.AlterTable` gained RenameColumn/DropColumn cases → `DeltaReader.RenameColumn`/`DropColumn`.
+  - **`native_write` STREAMS mapping tables (both modes)**: the COPY projection aliases `"logical" AS "physical"`
+    (`NativeParquetDataFileWriter.SelectList`) + stamps `FIELD_IDS {'<physical>': id}`; stats are typed/keyed by a
+    physical-renamed schema (spec: stats keys are physical). EW `SupportsExternalDataFileCommit` now allows
+    mapping (caller contract: physical names + field_ids + physical-keyed stats documented on the property);
+    `TryWriteStreaming` passes `columnMappingMode` to OpenOrCreate (a NEW table is created WITH the mode), skips
+    `SetSchemaAsync` for a same-shape mapping replace, and falls back to collect for partitioned-mapping or a
+    mapping replace that CHANGES the schema. EW `SetSchemaAsync` now supports mapping (re-assigns fresh field ids
+    continuing from maxColumnId — sound for REPLACE since the paired Overwrite removes the old files) with a
+    LOGICAL-shape no-op compare (`LogicalSchemaString` — the SchemaString always differs by ids). **`CREATE OR
+    REPLACE` with a changed schema works on mapping tables** (collect path).
+  - **Compaction (OPTIMIZE) is mapping-aware**: `CompactionExecutor` widens against a physical-renamed target
+    schema, reconciles each source batch to the current column set (`BackfillMissingColumns` — mixed ADD/DROP
+    vintages compact correctly; also fixes plain-table compaction-after-ADD, a pre-existing hole), and rebuilds
+    CLEAN + `SetParquetFieldIds` so the compacted file KEEPS the mapping identity (without this it read back
+    all-NULL). **CDF is mapping-aware**: `CdfReader` renames physical→logical on inferred (data-file) + `_change_data`
+    reads (`ReadChangesAsync` passes the current `physicalToLogical`).
+  Validated: `test/verify_delta_catalog_column_mapping.test` (122 — name/id create+read, physical names + field_ids
+  in the parquet for BOTH modes, RENAME across mixed-vintage files via default+native readers, default=id declares
+  the mode + RENAME/ADD/DROP + OPTIMIZE/VACUUM round-trip, id+native_write streams with FIELD_IDS, 'none' opt-out,
+  unknown-mode error); `verify_delta_catalog_alter.test` (116 — ADD/RENAME/DROP positive, TYPE rejected); FULL
+  delta suite 34/34 + SQL Server function suites green. Raw-file-shape tests pinned `column_mapping 'none'`
+  (native_write/streaming/dv_default/materialize_rowtracking/optimize/compaction_rowtracking/overwrite_merge/
+  mfr_dv — they assert physical parquet layouts or use the non-mapping-aware C++ MFR spike). Live: OneLake
+  default-id CTAS + RENAME + ADD + post-rename INSERT round-trip (`lake.dbo.arrownet_cmidlive`, native_write
+  streaming). **Known follow-ups**: EW-codec path stats still keyed by LOGICAL names under mapping (advisory-only —
+  skipping, not correctness; streaming path is spec-correct), CDC `_change_data` files written with logical names
+  (read-side tolerant), partitioned+mapping falls back to collect, nested-type mapping (below).
   **WRITING to a Spark-created (external) table — DONE (2026-07-05, EW-only; live Fabric-Spark round-trip).** An
   INSERT initially failed at engineered-wood's `ProtocolVersions.ValidateWriteSupport`: *"unsupported writer
   features: [appendOnly, invariants]"*. Root cause (grounded in the table's `_delta_log` protocol): enabling

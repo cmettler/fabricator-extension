@@ -13,7 +13,7 @@ require parquet
 require-env ARROWNET_DELTA_WRITE_DIR
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/optcat' AS lake (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/optcat' AS lake (TYPE arrownet, PROVIDER 'delta', column_mapping 'none');
 
 # Several small files (one per INSERT) — compaction candidates.
 statement ok
@@ -82,7 +82,7 @@ statement ok
 DETACH lake;
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/optcat' AS lake2 (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/optcat' AS lake2 (TYPE arrownet, PROVIDER 'delta', column_mapping 'none');
 
 query IT
 SELECT id, v FROM lake2.main.t ORDER BY id;
@@ -96,7 +96,7 @@ DETACH lake2;
 # ---- native_write: OPTIMIZE writes the compacted files with DuckDB's native writer (bloom/stats), not the
 #      engineered-wood codec — so an OPTIMIZE keeps the native-write quality. ----
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/optnw' AS nw (TYPE arrownet, PROVIDER 'delta', native_write true);
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/optnw' AS nw (TYPE arrownet, PROVIDER 'delta', column_mapping 'none', native_write true);
 
 statement ok
 CREATE TABLE nw.main.t AS SELECT i AS id, 'cat' || (i % 5) AS grp FROM range(1, 1001) AS r(i);

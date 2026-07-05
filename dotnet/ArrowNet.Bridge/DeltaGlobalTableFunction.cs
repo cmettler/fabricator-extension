@@ -483,16 +483,13 @@ internal static class DeltaWriter
                                                      cancellationToken: ct).AsTask().GetAwaiter().GetResult();
             try
             {
-                if (mode == DeltaWriteMode.Overwrite
-                    && EngineeredWood.DeltaLake.Schema.ColumnMapping.GetMode(table.CurrentSnapshot.Metadata.Configuration)
-                       == EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None)
+                if (mode == DeltaWriteMode.Overwrite)
                 {
                     // A true replace (CREATE OR REPLACE / CTAS-replace / COPY REPLACE / schema_mode=overwrite):
                     // the table adopts EXACTLY the incoming schema (add/drop/retype) — a metadata-only commit,
                     // no-op if identical or a freshly-created table — then the Overwrite removes the old files.
-                    // SKIPPED for a column-mapping table: EW's SetSchema can't reassign field ids, and a fresh
-                    // CTAS already created the table with the correct schema+mapping (a REPLACE that changes the
-                    // schema of an existing mapping table is an EW limitation — the existing schema is kept).
+                    // On a column-mapping table EW re-assigns fresh field ids for the new schema (sound because the
+                    // Overwrite drops the old-schema files); a fresh CTAS is a no-op (schema already matches).
                     table.SetSchemaAsync(schema, ct).AsTask().GetAwaiter().GetResult();
                 }
                 else if (spec?.SchemaMode == DeltaSchemaMode.Merge)
@@ -533,7 +530,9 @@ internal static class DeltaWriter
     public static long? TryWriteStreaming(
         nint opener, string path, IArrowArrayStream data, DeltaWriteMode mode,
         bool deletionVectors, bool inCommitTimestamps, bool changeDataFeed, bool rowTracking,
-        DeltaWriteSpec? spec, bool materializeRowTracking, out long rowsWritten)
+        DeltaWriteSpec? spec, bool materializeRowTracking, out long rowsWritten,
+        EngineeredWood.DeltaLake.Schema.ColumnMappingMode columnMapping =
+            EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None)
     {
         rowsWritten = 0;
         // Cases the streaming commit can't represent → fall back to the batch path.
@@ -542,25 +541,73 @@ internal static class DeltaWriter
 
         var writableRoot = DeltaReader.ToReadableRoot(path);
         var fs = TableFileSystems.Create(opener, path);
+        // Pass columnMapping so a NEW table is created WITH the mode (an existing table keeps its own mode). Only
+        // id mode reaches here as a mapping table (name mode stays on the codec path, gated by the caller) — an
+        // id-mode table's data files carry field_ids, which the external commit + native reader both handle.
         var table = DeltaTable.OpenOrCreateAsync(
             fs, data.Schema, Options(spec),
             partitionColumns: spec?.PartitionColumns,   // set on a partitioned CTAS create; ignored for an INSERT
             configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, materializeRowTracking),
+            columnMappingMode: columnMapping,
             cancellationToken: default).AsTask().GetAwaiter().GetResult();
         try
         {
             // Fall back BEFORE writing any file / touching the log (so a fallback leaves no orphan): a table
-            // needing engineered-wood's own writer (column mapping / identity / iceberg) can't use external commit.
+            // needing engineered-wood's own writer (identity / iceberg) can't use external commit. A
+            // column-mapping table (BOTH modes) CAN stream: the COPY renames the columns to their PHYSICAL names
+            // (Delta spec: data files use physical names in both modes) and stamps the field_ids (FIELD_IDS).
             if (!table.SupportsExternalDataFileCommit)
             {
                 return null;
             }
             var partCols = table.CurrentSnapshot.Metadata.PartitionColumns;
+            var mappingMode = EngineeredWood.DeltaLake.Schema.ColumnMapping.GetMode(
+                table.CurrentSnapshot.Metadata.Configuration);
+            IReadOnlyDictionary<string, int>? fieldIds = null;
+            IReadOnlyDictionary<string, string>? renameToPhysical = null;
+            Schema statsSchema = data.Schema;
+            if (mappingMode != EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None)
+            {
+                // A PARTITIONED mapping table would need physical-name partition dirs + partitionValues, which the
+                // native PARTITION_BY path can't emit yet → fall back to the EW codec for that combination.
+                if (partCols.Count > 0) { return null; }
+                var snapSchema = table.CurrentSnapshot.Schema;
+                renameToPhysical = EngineeredWood.DeltaLake.Schema.ColumnMapping.BuildLogicalToPhysicalMap(
+                    snapSchema, mappingMode);
+                // FIELD_IDS is keyed by the COPY's OUTPUT (physical) column names.
+                var logToId = EngineeredWood.DeltaLake.Schema.ColumnMapping.BuildLogicalToFieldIdMap(snapSchema);
+                var physIds = new Dictionary<string, int>();
+                foreach (var kv in logToId)
+                {
+                    physIds[renameToPhysical.TryGetValue(kv.Key, out var p) ? p : kv.Key] = kv.Value;
+                }
+                fieldIds = physIds.Count > 0 ? physIds : null;
+                // Stats in the Delta log are keyed by the PHYSICAL column names (spec) — type them from a
+                // physical-renamed copy of the write schema so BuildDeltaStats emits physical keys.
+                var physFields = new List<Field>(data.Schema.FieldsList.Count);
+                foreach (var f in data.Schema.FieldsList)
+                {
+                    physFields.Add(renameToPhysical.TryGetValue(f.Name, out var p) && p != f.Name
+                        ? new Field(p, f.DataType, f.IsNullable)
+                        : f);
+                }
+                statsSchema = new Schema(physFields, null);
+            }
             if (mode == DeltaWriteMode.Overwrite)
             {
-                // CREATE OR REPLACE / CTAS-replace / schema_mode=overwrite: adopt the incoming schema (metadata-only,
-                // no-op if identical), then the commit's removes drop the old files.
-                table.SetSchemaAsync(data.Schema, default).AsTask().GetAwaiter().GetResult();
+                if (mappingMode == EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None)
+                {
+                    // CREATE OR REPLACE / CTAS-replace / schema_mode=overwrite: adopt the incoming schema
+                    // (metadata-only, no-op if identical), then the commit's removes drop the old files.
+                    table.SetSchemaAsync(data.Schema, default).AsTask().GetAwaiter().GetResult();
+                }
+                else if (!SameLogicalColumns(table.ArrowSchema, data.Schema))
+                {
+                    // A REPLACE that CHANGES a mapping table's schema needs fresh field-id assignment
+                    // (SetSchemaAsync's mapping branch) AND the maps above recomputed — keep that on the collect
+                    // path. A fresh CTAS / same-shape replace streams (the maps already match).
+                    return null;
+                }
             }
 
             // RETURN_STATS gives per-file row count + byte size + the Delta stats JSON (min/max/nullCount, typed by
@@ -585,10 +632,12 @@ internal static class DeltaWriter
             }
             else
             {
-                // Non-partitioned: stream into ONE parquet file.
+                // Non-partitioned: stream into ONE parquet file (for a mapping table the COPY renames the columns
+                // to their physical names + stamps FIELD_IDS; stats are typed/keyed by the physical schema).
                 string fileRel = $"{System.Guid.NewGuid():N}.parquet";
                 var (rows, size, stats) = NativeParquetDataFileWriter.RunCopy(
-                    writableRoot, fileRel, data, default, statsSchema: data.Schema);
+                    writableRoot, fileRel, data, default, statsSchema: statsSchema, fieldIds: fieldIds,
+                    renameToPhysical: renameToPhysical);
                 rowsWritten = rows;
                 // 0 rows → reference no file (an empty COPY output would be an unreferenced orphan); an Overwrite
                 // still commits its removes (clears the table), an Append commits an empty version.
@@ -607,6 +656,21 @@ internal static class DeltaWriter
         {
             table.DisposeAsync().AsTask().GetAwaiter().GetResult();
         }
+    }
+
+    /// <summary>True when the two schemas declare the same column names in the same order (logical shape; types
+    /// not compared — a same-name different-type replace falls back via the streamed COPY's own bind).</summary>
+    private static bool SameLogicalColumns(Schema a, Schema b)
+    {
+        if (a.FieldsList.Count != b.FieldsList.Count) { return false; }
+        for (int i = 0; i < a.FieldsList.Count; i++)
+        {
+            if (!string.Equals(a.FieldsList[i].Name, b.FieldsList[i].Name, System.StringComparison.Ordinal))
+            {
+                return false;
+            }
+        }
+        return true;
     }
 
     /// <summary>Evolves the table schema for merge_schema: for each field in <paramref name="incoming"/> whose
