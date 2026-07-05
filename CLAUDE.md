@@ -1402,12 +1402,24 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   Also `Bootstrap.RunTransactionOp` no longer falls back to `Active.OpenCatalog("")` on an unresolvable handle
   (nonsense "empty connection string" errors) — it now throws a real stale-handle diagnostic incl. what the
   handle resolves to.
-  **Known follow-ups**: EW-codec path stats still keyed by LOGICAL names under mapping (advisory-only —
-  skipping, not correctness; streaming path is spec-correct), CDC `_change_data` files written with logical names
-  (read-side tolerant), a mapping REPLACE that CHANGES the schema still collects (SetSchema fresh-id re-assign
-  must precede the COPY; one-shot admin op), struct-fields inside LIST/MAP not stamped with field_ids on write
-  (read-side recursion handles them), EW's own reader nested rename is Bridge-side only (upstream candidate),
-  CDF feed on nested mapped tables untested.
+  **Nested follow-ups CLOSED (same day, fourth pass):** (1) **CDF on nested mapped tables** — the feed leaked
+  physical struct-child names → `DeltaReader.GetChanges` applies the recursive rename (CDF metadata columns pass
+  through); (2) **DELETE on nested tables** — EW `DeletionVectorFilter.TakeRows` + `PartitionUtils.TakeRows`
+  gained a recursive `StructArray` case (children indexed at parentOffset+r — `StructArray.Fields` does NOT
+  incorporate the parent offset; validity rebuilt), so the DV-delete's CDC capture + copy-on-write survivor
+  filtering work on struct columns (previously a clean throw); verified insert/insert/delete feed with logical
+  nested names; (3) **struct-in-LIST field_ids** — `BuildFieldIdsSpec` renders
+  `{'<phys>': {__duckdb_field_id: id, 'element': {<children>}}}` (DuckDB accepts an element dict without its own
+  sentinel — the element node has no Delta id, unrepresentable in the Delta schema); list column + element-struct
+  fields all carry physical names+ids, kernel-read verified; (4) **EW-codec stats keyed PHYSICAL under mapping**
+  (`WriteCoreAsync` collects over the top-level-renamed batch — stats cover top-level primitives only, so the
+  flat rename suffices; matches the streaming writer + spec readers' skipping).
+  **Known limitations**: UPDATE with a STRUCT SET value fails in the C++ update value-marshaling
+  ("unsupported filter value type Struct" — pre-existing, orthogonal to mapping; clean error, table intact);
+  CDC `_change_data` files written with logical names (read-side tolerant); a mapping REPLACE that CHANGES the
+  schema still collects (SetSchema fresh-id re-assign must precede the COPY; one-shot admin op); map-of-struct
+  field_ids not stamped on write (read recursion handles them); EW's own reader nested rename is Bridge-side
+  only (upstream candidate).
   **WRITING to a Spark-created (external) table — DONE (2026-07-05, EW-only; live Fabric-Spark round-trip).** An
   INSERT initially failed at engineered-wood's `ProtocolVersions.ValidateWriteSupport`: *"unsupported writer
   features: [appendOnly, invariants]"*. Root cause (grounded in the table's `_delta_log` protocol): enabling

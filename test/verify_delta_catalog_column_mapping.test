@@ -347,6 +347,58 @@ SELECT id, payload.b FROM ns2.main.t ORDER BY id;
 statement ok
 DETACH ns2;
 
+# Struct-in-LIST maps too: the list column + the element-struct's fields all carry physical names + field_ids
+# (the recursive FIELD_IDS 'element' form), and read back under logical names.
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmlist' AS ls (TYPE arrownet, PROVIDER 'delta', native_write true);
+
+statement ok
+CREATE TABLE ls.main.t AS SELECT 1 AS id, [{'x': 1}, {'x': 2}] AS items;
+
+query II
+SELECT id, items[2].x FROM ls.main.t;
+----
+1	2
+
+query I
+SELECT count(DISTINCT field_id) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/cmlist/t/*.parquet')
+WHERE field_id IS NOT NULL;
+----
+3
+
+statement ok
+DETACH ls;
+
+# DELETE on a nested mapped table works (DV mode; the CDC capture takes struct rows), and the CDF feed
+# surfaces nested members under LOGICAL names (recursive rename over the inferred + cdc change rows).
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmnestcdf' AS nc (TYPE arrownet, PROVIDER 'delta', change_data_feed true, native_write true);
+
+statement ok
+CREATE TABLE nc.main.t AS SELECT 1 AS id, {'a': 10, 'b': 'x'} AS s;
+
+statement ok
+INSERT INTO nc.main.t VALUES (2, {'a': 20, 'b': 'y'});
+
+statement ok
+DELETE FROM nc.main.t WHERE id = 1;
+
+query II
+SELECT id, s.a FROM nc.main.t;
+----
+2	20
+
+query TIIT
+SELECT _change_type, id, s.a, s.b FROM arrownet_delta_changes('nc', 'main.t', 1, 3)
+ORDER BY _commit_version, _change_type, id;
+----
+insert	1	10	x
+insert	2	20	y
+delete	1	10	x
+
+statement ok
+DETACH nc;
+
 # WITHOUT native_write, a nested write on a mapping table errors with guidance (the EW-codec writer maps
 # names/ids at the top level only — a nested file it wrote would read as NULLs in Spark/delta-kernel).
 statement ok

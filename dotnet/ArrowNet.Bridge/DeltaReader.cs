@@ -607,9 +607,15 @@ internal static class DeltaReader
                     "ATTACH with 'change_data_feed true' and create the table so future commits capture changes.");
 
             long end = toVersion < 0 ? table.CurrentSnapshot.Version : toVersion;
+            // Nested mapped fields: change rows inferred from data files carry PHYSICAL struct-child names
+            // (CdfReader's rename is top-level) — apply the recursive rename; the CDF metadata columns
+            // (_change_type/...) are not table columns and pass through untouched.
+            var nested = NestedMappedSchema(table.CurrentSnapshot);
             await foreach (var batch in table.ReadChangesAsync(fromVersion, end, ct).ConfigureAwait(false))
             {
-                yield return batch;
+                yield return nested is null
+                    ? batch
+                    : ArrowColumnMappingRename.RenameBatch(batch, nested, toPhysical: false);
             }
         }
         finally

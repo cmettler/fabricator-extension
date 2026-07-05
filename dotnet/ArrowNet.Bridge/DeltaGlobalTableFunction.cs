@@ -739,19 +739,44 @@ internal static class DeltaWriter
         string phys = EngineeredWood.DeltaLake.Schema.ColumnMapping.GetPhysicalName(
             f, EngineeredWood.DeltaLake.Schema.ColumnMappingMode.Name); // mapping-on ⇒ returns physicalName
         sb.Append('\'').Append(phys.Replace("'", "''")).Append("': ");
-        if (f.Type is EngineeredWood.DeltaLake.Schema.StructType st)
+        AppendFieldIdValue(sb, f.Type, id.Value);
+    }
+
+    // The FIELD_IDS VALUE for one field: a bare id for a leaf; for a struct the __duckdb_field_id sentinel plus
+    // the children; for a list/map of structs, the id plus the inner struct's children under DuckDB's structural
+    // child names ('element' / 'key'+'value' — those inner nodes carry no Delta id of their own, which DuckDB
+    // accepts: a nested dict without the sentinel assigns ids only to its children).
+    private static void AppendFieldIdValue(
+        System.Text.StringBuilder sb, EngineeredWood.DeltaLake.Schema.DeltaDataType type, int id)
+    {
+        switch (type)
         {
-            sb.Append("{__duckdb_field_id: ").Append(id.Value);
-            bool childAny = true; // the sentinel counts as the first entry — children always append with ", "
-            foreach (var child in st.Fields)
+            case EngineeredWood.DeltaLake.Schema.StructType st:
             {
-                AppendFieldIdEntry(sb, child, ref childAny);
+                sb.Append("{__duckdb_field_id: ").Append(id);
+                bool childAny = true; // the sentinel counts as the first entry — children append with ", "
+                foreach (var child in st.Fields)
+                {
+                    AppendFieldIdEntry(sb, child, ref childAny);
+                }
+                sb.Append('}');
+                return;
             }
-            sb.Append('}');
-        }
-        else
-        {
-            sb.Append(id.Value);
+            case EngineeredWood.DeltaLake.Schema.ArrayType at
+                when at.ElementType is EngineeredWood.DeltaLake.Schema.StructType est:
+            {
+                sb.Append("{__duckdb_field_id: ").Append(id).Append(", 'element': {");
+                bool childAny = false;
+                foreach (var child in est.Fields)
+                {
+                    AppendFieldIdEntry(sb, child, ref childAny);
+                }
+                sb.Append("}}");
+                return;
+            }
+            default:
+                sb.Append(id); // primitive / list-of-primitive / map — the field's own id only
+                return;
         }
     }
 
