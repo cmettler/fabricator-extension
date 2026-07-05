@@ -566,19 +566,33 @@ internal static class DeltaWriter
             IReadOnlyDictionary<string, int>? fieldIds = null;
             IReadOnlyDictionary<string, string>? renameToPhysical = null;
             Schema statsSchema = data.Schema;
+            IReadOnlyList<string> copyPartCols = partCols;
             if (mappingMode != EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None)
             {
-                // A PARTITIONED mapping table would need physical-name partition dirs + partitionValues, which the
-                // native PARTITION_BY path can't emit yet → fall back to the EW codec for that combination.
-                if (partCols.Count > 0) { return null; }
                 var snapSchema = table.CurrentSnapshot.Schema;
                 renameToPhysical = EngineeredWood.DeltaLake.Schema.ColumnMapping.BuildLogicalToPhysicalMap(
                     snapSchema, mappingMode);
-                // FIELD_IDS is keyed by the COPY's OUTPUT (physical) column names.
+                // Partitioned mapping table: the COPY partitions by the PHYSICAL column names (the projection
+                // aliased every column), so RETURN_STATS.partition_keys — and therefore the committed
+                // partitionValues — come back keyed PHYSICAL, the Delta-spec convention Spark uses (physical keys
+                // survive a partition-column RENAME). Directory names follow; readers treat paths as opaque.
+                if (partCols.Count > 0)
+                {
+                    var phys = new List<string>(partCols.Count);
+                    foreach (var pc in partCols)
+                    {
+                        phys.Add(renameToPhysical.TryGetValue(pc, out var p) ? p : pc);
+                    }
+                    copyPartCols = phys;
+                }
+                // FIELD_IDS is keyed by the COPY's OUTPUT (physical) column names. Partition columns are excluded
+                // (COPY PARTITION_BY leaves them out of the data files).
+                var partSet = new HashSet<string>(partCols, System.StringComparer.Ordinal);
                 var logToId = EngineeredWood.DeltaLake.Schema.ColumnMapping.BuildLogicalToFieldIdMap(snapSchema);
                 var physIds = new Dictionary<string, int>();
                 foreach (var kv in logToId)
                 {
+                    if (partSet.Contains(kv.Key)) { continue; }
                     physIds[renameToPhysical.TryGetValue(kv.Key, out var p) ? p : kv.Key] = kv.Value;
                 }
                 fieldIds = physIds.Count > 0 ? physIds : null;
@@ -617,9 +631,12 @@ internal static class DeltaWriter
             if (partCols.Count > 0)
             {
                 // Partitioned: DuckDB COPY PARTITION_BY streams the Hive col=val/ layout in one pass — one+ files
-                // per partition, each with its partition values (from RETURN_STATS.partition_keys) + stats.
+                // per partition, each with its partition values (from RETURN_STATS.partition_keys) + stats. Under
+                // mapping the projection aliases every column to its physical name and partitions by the PHYSICAL
+                // names, so dirs + partitionValues keys are physical (Delta spec) and FIELD_IDS stamp the files.
                 var copied = NativeParquetDataFileWriter.RunCopyPartitioned(
-                    writableRoot, partCols, data, default, statsSchema: data.Schema);
+                    writableRoot, copyPartCols, data, default, statsSchema: statsSchema,
+                    fieldIds: fieldIds, renameToPhysical: renameToPhysical);
                 files = new List<WrittenDataFile>(copied.Count);
                 long total = 0;
                 foreach (var cf in copied)

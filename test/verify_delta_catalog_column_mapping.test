@@ -223,6 +223,69 @@ SELECT count(DISTINCT field_id) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}
 statement ok
 DETACH nw;
 
+# ================= partitioned + mapping (default id): STREAMS via COPY PARTITION_BY (physical names) ========
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmpart' AS pt (TYPE arrownet, PROVIDER 'delta', native_write true);
+
+statement ok
+CREATE TABLE pt.main.sales PARTITIONED BY (region) AS
+  SELECT * FROM (VALUES (1,'US',10),(2,'EU',20),(3,'US',30),(4,'APAC',40)) AS t(id,region,amt);
+
+statement ok
+INSERT INTO pt.main.sales VALUES (5,'EU',50);
+
+query TII
+SELECT region, count(*), sum(amt) FROM pt.main.sales GROUP BY region ORDER BY region;
+----
+APAC	1	40
+EU	2	70
+US	2	40
+
+# Partition-pruning predicate works (partitionValues keyed physical, dual-resolved by the pruner).
+query II
+SELECT id, amt FROM pt.main.sales WHERE region = 'EU' ORDER BY id;
+----
+2	20
+5	50
+
+# The Hive dirs use PHYSICAL partition-column names (Delta spec: partitionValues track the physical name;
+# paths are opaque to readers — Spark reads this table, validated live).
+query I
+SELECT count(*) > 0 FROM glob('${ARROWNET_DELTA_WRITE_DIR}/cmpart/sales/col-*=US/*.parquet');
+----
+true
+
+# RENAME the PARTITION column — metadata-only; partitionColumns updates to the new logical name while the
+# committed partitionValues (physical keys) stay valid, so old data reads under the new name.
+statement ok
+ALTER TABLE pt.main.sales RENAME COLUMN region TO zone;
+
+statement ok
+INSERT INTO pt.main.sales VALUES (6,'EU',60);
+
+query TII
+SELECT zone, count(*), sum(amt) FROM pt.main.sales GROUP BY zone ORDER BY zone;
+----
+APAC	1	40
+EU	3	130
+US	2	40
+
+statement ok
+DETACH pt;
+
+# Re-attach: durable across sessions.
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmpart' AS pt2 (TYPE arrownet, PROVIDER 'delta');
+
+query IT
+SELECT id, zone FROM pt2.main.sales WHERE zone = 'US' ORDER BY id;
+----
+1	US
+3	US
+
+statement ok
+DETACH pt2;
+
 # ================= 'none' opts out (plain table; logical == physical name, no protocol bump) =================
 statement ok
 ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmnone' AS pn (TYPE arrownet, PROVIDER 'delta', column_mapping 'none');

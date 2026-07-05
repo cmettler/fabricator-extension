@@ -115,11 +115,14 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
     /// </summary>
     internal static List<CopiedFile> RunCopyPartitioned(
         string writableRoot, IReadOnlyList<string> partitionColumns, IArrowArrayStream src,
-        CancellationToken ct, Schema? statsSchema, IReadOnlyDictionary<string, int>? fieldIds = null)
+        CancellationToken ct, Schema? statsSchema, IReadOnlyDictionary<string, int>? fieldIds = null,
+        IReadOnlyDictionary<string, string>? renameToPhysical = null)
     {
+        // Under column mapping the projection aliases logical -> physical, so `partitionColumns` must already be
+        // the PHYSICAL (output) names — dirs, RETURN_STATS.partition_keys, and FIELD_IDS all key by them.
         var quoted = string.Join(", ", partitionColumns.Select(c => "\"" + c.Replace("\"", "\"\"") + "\""));
         var sql =
-            $"COPY (SELECT * FROM {InputName}) TO '{writableRoot.Replace("'", "''")}' " +
+            $"COPY (SELECT {SelectList(src.Schema, renameToPhysical)} FROM {InputName}) TO '{writableRoot.Replace("'", "''")}' " +
             $"(FORMAT parquet, PARTITION_BY ({quoted}), APPEND true, FILENAME_PATTERN '{{uuid}}', " +
             "WRITE_BLOOM_FILTER true, RETURN_STATS" + FieldIdsClause(fieldIds) + ")";
         Log.LogInformation("delta native partitioned copy {Root} by [{Cols}]", writableRoot, quoted);

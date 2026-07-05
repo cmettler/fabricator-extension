@@ -1316,9 +1316,33 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   (native_write/streaming/dv_default/materialize_rowtracking/optimize/compaction_rowtracking/overwrite_merge/
   mfr_dv — they assert physical parquet layouts or use the non-mapping-aware C++ MFR spike). Live: OneLake
   default-id CTAS + RENAME + ADD + post-rename INSERT round-trip (`lake.dbo.arrownet_cmidlive`, native_write
-  streaming). **Known follow-ups**: EW-codec path stats still keyed by LOGICAL names under mapping (advisory-only —
+  streaming).
+  **PARTITIONED + mapping (second pass, same day) — STREAMS + full Spark round-trip.** Convention settled
+  EMPIRICALLY against a Spark-created partitioned id-mode fixture (`arrownet_cm_part`, via `sparkprobe
+  createpartcm` + `_delta_log` inspection): `metaData.partitionColumns` = LOGICAL names (updated by a
+  partition-column RENAME), `add.partitionValues` keys = **PHYSICAL** names (stable across the rename — the
+  reason they're physical), `add.path` = opaque (Spark writes no Hive dirs under mapping; paths are opaque to
+  readers, so our physical-named Hive dirs are spec-fine). Implemented: EW `WriteCoreAsync` tracks
+  partitionValues (+ dirs) by physical name under mapping; `RenameColumnAsync` also updates
+  `metaData.partitionColumns` (without this a renamed partition column broke reads/writes/kernel);
+  `PartitionValuesMatch` (replace_where file selection), `PartitionUtils.AddPartitionColumns` (read-side re-add)
+  and `DeltaFilePruner` (partition pruning + stats) all do DUAL lookup (logical | physical key) so old
+  logical-keyed EW commits, new physical-keyed ones, AND external Spark tables all resolve. Bridge:
+  `TryWriteStreaming` no longer falls back for partitioned mapping — `RunCopyPartitioned` gets the aliased
+  projection + `PARTITION_BY (<physical>)` + physical-keyed FIELD_IDS (partition cols excluded — not in the
+  files) + physical stats schema; `RETURN_STATS.partition_keys` then come back physical = the committed
+  partitionValues. Validated: local smoke (rename of the partition column mid-life, pruning), full delta suite
+  34/34 (`verify_delta_catalog_column_mapping` 157 — incl. partitioned CTAS streams/physical dirs/prune/rename/
+  durability; `verify_delta_catalog_partition` 54 unchanged), and LIVE both directions: **Spark reads our
+  partitioned mapped table** (`arrownet_cmpartlive`, created via native_write streaming with BOTH a data and the
+  partition column renamed) AND **our provider reads Spark's** `arrownet_cm_part` (values + agg + pruning on the
+  renamed partition column). NOTE: DuckDB's official `delta_scan` (duckdb-delta/kernel) reads mapped PARTITIONED
+  tables' partition column as NULL — a kernel-side integration gap (our layout matches Spark's own convention;
+  Spark is the reference).
+  **Known follow-ups**: EW-codec path stats still keyed by LOGICAL names under mapping (advisory-only —
   skipping, not correctness; streaming path is spec-correct), CDC `_change_data` files written with logical names
-  (read-side tolerant), partitioned+mapping falls back to collect, nested-type mapping (below).
+  (read-side tolerant), a mapping REPLACE that CHANGES the schema still collects (SetSchema fresh-id re-assign
+  must precede the COPY; one-shot admin op), nested-type mapping (below).
   **WRITING to a Spark-created (external) table — DONE (2026-07-05, EW-only; live Fabric-Spark round-trip).** An
   INSERT initially failed at engineered-wood's `ProtocolVersions.ValidateWriteSupport`: *"unsupported writer
   features: [appendOnly, invariants]"*. Root cause (grounded in the table's `_delta_log` protocol): enabling
