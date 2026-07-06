@@ -489,21 +489,9 @@ internal static class DeltaWriter
                                                      cancellationToken: ct).AsTask().GetAwaiter().GetResult();
             try
             {
-                // NESTED columns + column mapping require the native streaming COPY (TryWriteStreaming): this
-                // collect path writes via engineered-wood's codec (or the per-file host writer), whose
-                // physical-rename + field-id stamping is TOP-LEVEL only — nested struct fields would land under
-                // logical names without ids, which spec readers (Spark/delta-kernel) resolve to NULL. Error with
-                // guidance rather than write a silently-unreadable file.
-                if (HasNestedColumns(schema)
-                    && EngineeredWood.DeltaLake.Schema.ColumnMapping.GetMode(table.CurrentSnapshot.Metadata.Configuration)
-                       != EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None)
-                {
-                    throw new System.NotSupportedException(
-                        "Nested (STRUCT/LIST/MAP) columns on a column-mapping Delta table require the native "
-                        + "streaming write: ATTACH with `native_write true` (and avoid replace_where / "
-                        + "SCHEMA_MODE / a schema-changing REPLACE for nested tables), or opt out of mapping "
-                        + "with `column_mapping 'none'`.");
-                }
+                // NESTED columns + column mapping are handled by engineered-wood's RECURSIVE physical-rename
+                // + field-id stamping (ColumnMappingRecursive.ToPhysical in WriteCoreAsync), so this collect
+                // path writes the spec nested layout too — the old top-level-only gate is lifted.
                 if (mode == DeltaWriteMode.Overwrite)
                 {
                     // A true replace (CREATE OR REPLACE / CTAS-replace / COPY REPLACE / schema_mode=overwrite):
@@ -711,8 +699,9 @@ internal static class DeltaWriter
     /// <summary>Renders the COPY <c>FIELD_IDS</c> spec from a column-mapping Delta schema: keys are the PHYSICAL
     /// column names (matching the physically-renamed COPY input stream), values the <c>delta.columnMapping.id</c>;
     /// a STRUCT field renders recursively via DuckDB's <c>__duckdb_field_id</c> sentinel so nested columns carry
-    /// their ids in the parquet. List/map fields emit their own id as a leaf (struct fields INSIDE a list/map are
-    /// not yet stamped — a documented follow-up; plain lists/maps of primitives need no inner mapping).
+    /// their ids in the parquet. Struct fields INSIDE a list/map render under DuckDB's structural child names
+    /// (<c>'element'</c> / <c>'key'</c>+<c>'value'</c> — those inner nodes carry no Delta id of their own);
+    /// plain lists/maps of primitives emit the field's own id as a leaf.
     /// <paramref name="excludeTopLogical"/> drops partition columns (excluded from the data files). Returns null
     /// when no field carries an id (a non-mapping table).</summary>
     internal static string? BuildFieldIdsSpec(
@@ -762,23 +751,92 @@ internal static class DeltaWriter
                 sb.Append('}');
                 return;
             }
-            case EngineeredWood.DeltaLake.Schema.ArrayType at
-                when at.ElementType is EngineeredWood.DeltaLake.Schema.StructType est:
+            case EngineeredWood.DeltaLake.Schema.ArrayType at when ContainsStructDelta(at.ElementType):
             {
-                sb.Append("{__duckdb_field_id: ").Append(id).Append(", 'element': {");
-                bool childAny = false;
-                foreach (var child in est.Fields)
+                sb.Append("{__duckdb_field_id: ").Append(id).Append(", 'element': ");
+                AppendInnerNode(sb, at.ElementType);
+                sb.Append('}');
+                return;
+            }
+            case EngineeredWood.DeltaLake.Schema.MapType mt
+                when ContainsStructDelta(mt.KeyType) || ContainsStructDelta(mt.ValueType):
+            {
+                sb.Append("{__duckdb_field_id: ").Append(id);
+                if (ContainsStructDelta(mt.KeyType))
                 {
-                    AppendFieldIdEntry(sb, child, ref childAny);
+                    sb.Append(", 'key': ");
+                    AppendInnerNode(sb, mt.KeyType);
                 }
-                sb.Append("}}");
+                if (ContainsStructDelta(mt.ValueType))
+                {
+                    sb.Append(", 'value': ");
+                    AppendInnerNode(sb, mt.ValueType);
+                }
+                sb.Append('}');
                 return;
             }
             default:
-                sb.Append(id); // primitive / list-of-primitive / map — the field's own id only
+                sb.Append(id); // primitive / list-of-primitive / map-of-primitive — the field's own id only
                 return;
         }
     }
+
+    // An INNER node of a list/map (the 'element' / 'key' / 'value' slot): it has no Delta id of its own —
+    // a struct renders its children as entries, a nested list/map recurses one level deeper.
+    private static void AppendInnerNode(
+        System.Text.StringBuilder sb, EngineeredWood.DeltaLake.Schema.DeltaDataType type)
+    {
+        switch (type)
+        {
+            case EngineeredWood.DeltaLake.Schema.StructType st:
+            {
+                sb.Append('{');
+                bool childAny = false;
+                foreach (var child in st.Fields)
+                {
+                    AppendFieldIdEntry(sb, child, ref childAny);
+                }
+                sb.Append('}');
+                return;
+            }
+            case EngineeredWood.DeltaLake.Schema.ArrayType at:
+                sb.Append("{'element': ");
+                AppendInnerNode(sb, at.ElementType);
+                sb.Append('}');
+                return;
+            case EngineeredWood.DeltaLake.Schema.MapType mt:
+            {
+                sb.Append('{');
+                bool first = true;
+                if (ContainsStructDelta(mt.KeyType))
+                {
+                    sb.Append("'key': ");
+                    AppendInnerNode(sb, mt.KeyType);
+                    first = false;
+                }
+                if (ContainsStructDelta(mt.ValueType))
+                {
+                    if (!first) { sb.Append(", "); }
+                    sb.Append("'value': ");
+                    AppendInnerNode(sb, mt.ValueType);
+                }
+                sb.Append('}');
+                return;
+            }
+            default:
+                sb.Append("{}"); // primitive inner slot — nothing to stamp
+                return;
+        }
+    }
+
+    private static bool ContainsStructDelta(EngineeredWood.DeltaLake.Schema.DeltaDataType t) => t switch
+    {
+        EngineeredWood.DeltaLake.Schema.StructType => true,
+        EngineeredWood.DeltaLake.Schema.ArrayType at => ContainsStructDelta(at.ElementType),
+        EngineeredWood.DeltaLake.Schema.MapType mt =>
+            ContainsStructDelta(mt.KeyType) || ContainsStructDelta(mt.ValueType),
+        _ => false,
+    };
 
     /// <summary>True when any field (at any depth) contains a STRUCT — the gate for nested column-mapping
     /// handling (the EW-codec writer maps names/ids at the top level only, so nested + mapping must go through

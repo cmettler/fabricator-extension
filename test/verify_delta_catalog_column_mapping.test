@@ -399,15 +399,49 @@ delete	1	10	x
 statement ok
 DETACH nc;
 
-# WITHOUT native_write, a nested write on a mapping table errors with guidance (the EW-codec writer maps
-# names/ids at the top level only — a nested file it wrote would read as NULLs in Spark/delta-kernel).
+# WITHOUT native_write the EW-codec collect path also writes nested mapping tables in the spec layout
+# (ColumnMappingRecursive.ToPhysical: physical names + field ids at every level — the old top-level-only
+# gate is lifted). STRUCT SET UPDATE works on the mapped table too (the copy-on-write rewrite renames the
+# source batches to logical for the substitution, then back to physical for the rewrite).
 statement ok
 ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmnestedew' AS ne (TYPE arrownet, PROVIDER 'delta');
 
-statement error
-CREATE TABLE ne.main.t AS SELECT 1 AS id, {'a': 1} AS s;
+statement ok
+CREATE TABLE ne.main.t AS SELECT * FROM (VALUES (1, {'a': 10, 'b': 'x'}), (2, {'a': 20, 'b': 'y'})) v(id, s);
+
+# Nested struct children are stored under physical col-<guid> names (spec) — no logical child names in the file.
+query I
+SELECT count(*) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/cmnestedew/t/*.parquet') WHERE name IN ('a', 'b');
 ----
-require the native streaming write
+0
+
+query I
+SELECT count(*) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/cmnestedew/t/*.parquet') WHERE name LIKE 'col-%';
+----
+4
+
+# STRUCT SET on the MAPPED table: updated row changed, pass-through row keeps its values.
+statement ok
+UPDATE ne.main.t SET s = {'a': 99, 'b': 'upd'} WHERE id = 2;
+
+query III
+SELECT id, s.a, s.b FROM ne.main.t ORDER BY id;
+----
+1	10	x
+2	99	upd
+
+# ...and across a column RENAME (metadata-only under mapping).
+statement ok
+ALTER TABLE ne.main.t RENAME COLUMN s TO payload;
+
+statement ok
+UPDATE ne.main.t SET payload = {'a': 77, 'b': 'r'} WHERE id = 1;
+
+query III
+SELECT id, payload.a, payload.b FROM ne.main.t ORDER BY id;
+----
+1	77	r
+2	99	upd
 
 statement ok
 DETACH ne;
@@ -459,17 +493,21 @@ SELECT id, s IS NULL FROM su.main.t ORDER BY id;
 statement ok
 DETACH su;
 
-# On a MAPPED table (the default) a struct SET is gated with guidance; scalar SET on a nested table works.
+# On a MAPPED table (the default) struct SET works too (recursive physical rename + field ids on the
+# rewrite); scalar SET on a nested table keeps working alongside.
 statement ok
 ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmsupdm' AS sm (TYPE arrownet, PROVIDER 'delta', native_write true);
 
 statement ok
 CREATE TABLE sm.main.t AS SELECT 1 AS id, {'a': 10} AS s;
 
-statement error
+statement ok
 UPDATE sm.main.t SET s = {'a': 2} WHERE id = 1;
+
+query II
+SELECT id, s.a FROM sm.main.t;
 ----
-not supported yet
+1	2
 
 statement ok
 UPDATE sm.main.t SET id = 7 WHERE id = 1;
@@ -477,7 +515,7 @@ UPDATE sm.main.t SET id = 7 WHERE id = 1;
 query II
 SELECT id, s.a FROM sm.main.t;
 ----
-7	10
+7	2
 
 statement ok
 DETACH sm;

@@ -269,6 +269,12 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   connstr-style global functions; **delta is better kept bespoke** (its host-FS-opener need is special) unless the
   global table-fn bind/execute ABI gains an opener arg (SQL fns ignore it). Build it when the 2nd lakehouse
   format/provider arrives; until then delta stays the hand-written ~60-line `arrownet_delta.cpp`.
+- **VARIANT for the Delta provider** — **design only, nothing built: [docs/variant-support.md](docs/variant-support.md)**.
+  Fabric Runtime 2.0 (Spark 4.1/Delta 4.1) supports VARIANT (experimental, Spark-experiences-only — the SQL
+  endpoint does NOT read variant tables yet); DuckDB 1.5.4 reads/writes parquet Variant natively (incl.
+  shredding); C# is a pure pass-through (no stats/partition/filter machinery needed) → native-path-gated
+  design mirroring the timestampNtz feature pattern; ONE spike first (how DuckDB exports VARIANT over the
+  Arrow C boundary; guaranteed fallback = SQL-side `variant_to_parquet_variant` conversion).
 - **DAX / ADOMD 2nd provider** (the "one binary, many providers" goal) — **design + slices:
   [docs/dax-provider.md](docs/dax-provider.md)**. **Slice 1 DONE + validated against a live local Power BI
   Desktop instance**: new project `ArrowNet.AnalysisServices` (`DaxBackend : IBackend` provider `"dax"`,
@@ -1377,7 +1383,8 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   - **WRITE (streaming COPY)**: `TryWriteStreaming` renames the input STREAM to physical (all levels — replacing
     the old top-level SQL alias) and stamps a RECURSIVE `FIELD_IDS` spec (`DeltaWriter.BuildFieldIdsSpec` —
     struct fields via DuckDB's `__duckdb_field_id` sentinel; list/map emit their own id as a leaf, struct-fields
-    INSIDE list/map not yet stamped — follow-up). The **EW-codec (collect) path is GATED for nested+mapping**
+    INSIDE list/map not yet stamped — follow-up). The **EW-codec (collect) path was GATED for nested+mapping (gate LIFTED 2026-07-06 via
+    `ColumnMappingRecursive.ToPhysical` — see Known limitations)**
     (clear error → use `native_write` or `column_mapping 'none'`): EW's writer renames/stamps top-level only, so
     its nested files would be silently Spark-unreadable. Nested WITHOUT mapping stays allowed on both paths.
   - **READ**: the native reader renames nested children physical→logical per batch
@@ -1418,7 +1425,8 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   values) now works on UNMAPPED tables via `ArrowValueReader.ReadScalarDeep` (struct → `Dictionary<string,object?>`
   recursive, deep-copied; kept SEPARATE from `ReadScalar` — filter callers rely on unsupported-type throws
   meaning "don't push") + a `BuildArray` StructType case (children built recursively, validity rebuilt). Works on
-  both writers incl. `SET s = NULL`; MAPPED tables gate struct-SET with guidance (`DeltaReader.IsColumnMapped`
+  both writers incl. `SET s = NULL`; MAPPED tables initially gated struct-SET (LIFTED 2026-07-06 — see Known
+  limitations) (`DeltaReader.IsColumnMapped`
   — the EW-codec rewrite can't produce the spec nested layout; scalar SET on mapped nested tables works).
   Chasing kernel "Out of buffer" on the merge-on-read post-images uncovered **three EW parquet-WRITER bugs**
   (NOT documented limitations — known-issues.md's write-reject list never included struct/list/map; minimal
@@ -1446,11 +1454,31 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   Verified: repro trio (all-null / mixed / no-null structs) reads in DuckDB; struct UPDATE round-trips +
   kernel-reads on both writers; `verify_delta_catalog_column_mapping` 232 assertions; full delta suite 35/35 +
   SQL suites; EW's own parquet test suite.
-  **Known limitations**: struct SET on MAPPED tables gated (above); CDC `_change_data` files written with
-  logical names (read-side tolerant); a mapping REPLACE that CHANGES the schema still collects (SetSchema
-  fresh-id re-assign must precede the COPY; one-shot admin op); map-of-struct field_ids not stamped on write
-  (read recursion handles them); EW's own reader nested rename is Bridge-side only (upstream candidate);
-  `ToArrowField` (Delta→Arrow) still drops metadata.
+  **Known limitations**: a mapping REPLACE that CHANGES the schema still collects (SetSchema fresh-id
+  re-assign must precede the COPY; one-shot admin op); `ToArrowField` (Delta→Arrow) still drops metadata.
+  **Closed 2026-07-06:** (a) **map-of-struct field_ids on the COPY FIELD_IDS spec** — `BuildFieldIdsSpec`
+  renders map fields as `{__duckdb_field_id: id, 'key': …, 'value': …}` (+ `AppendInnerNode` recursion for
+  arbitrarily deep list/map-of-struct; structural element/key/value nodes carry no id, per DuckDB); validated:
+  a `MAP(VARCHAR, STRUCT)` column under id mapping + native_write writes inner struct children physical-named
+  with their ids (parquet_schema-verified) and kernel-reads. (b) **EW's own reader now renames nested levels**
+  — `ColumnMappingRecursive.ToLogical` (the read direction of the same transform, no id stamping) is wired
+  into EW `ReadFileAsync` (after the flat `RenameByFieldId`/`RenameColumns`), the `UpdateAsync` predicate
+  read, and `CdfReader`'s three feed yield sites — EW standalone now returns logical nested names; the
+  Bridge's `ArrowColumnMappingRename` read-side wraps stay as tolerant no-ops. **BOTH former gates are LIFTED (2026-07-06,
+  kernel-validated, `column_mapping` test 251):** (a) **struct SET on MAPPED tables works** — new EW
+  `ColumnMappingRecursive.ToPhysical` (recursive physical rename + PARQUET:field_id at EVERY level, tolerant
+  either-name matching, zero-copy ArrayData rewrap — the EW-side sibling of the Bridge's
+  `ArrowColumnMappingRename`) replaced the top-level-only `RenameToPhysical`+`SetParquetFieldIds` pair at all
+  mapped write sites (CoW DELETE/UPDATE rewrites, UpdateViaVectors append, UpdateAsync, WriteCoreAsync codec,
+  CdfWriter); PLUS the crux found in validation: EW hands the rewrite callback source batches with PHYSICAL
+  nested child names (EW read rename is top-level only), so `BuildArray`'s logical-name carry-over of
+  NON-updated rows read NULL — `DeltaReader.UpdateByRowIds` now wraps the callback to rename source batches
+  to LOGICAL first (recursive, Bridge `ArrowColumnMappingRename`), EW's recursive ToPhysical converts back.
+  Works across a column RENAME; pass-through rows keep values; kernel reads exact. (b) **the EW-codec
+  (collect) nested+mapping write gate is lifted** — WriteCoreAsync now writes nested physical names + ids, so
+  a nested CTAS/INSERT on a mapped table works WITHOUT `native_write` (kernel-validated). (CDC `_change_data`
+  files are written PHYSICAL-named + field_id'd under mapping via the same recursive transform in `CdfWriter`;
+  `_change_type` stays unmapped; Spark reads cdc parquet through the table mapping.)
   **WRITING to a Spark-created (external) table — DONE (2026-07-05, EW-only; live Fabric-Spark round-trip).** An
   INSERT initially failed at engineered-wood's `ProtocolVersions.ValidateWriteSupport`: *"unsupported writer
   features: [appendOnly, invariants]"*. Root cause (grounded in the table's `_delta_log` protocol): enabling
@@ -2079,9 +2107,14 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   removes REGRESSED the derived mark and a later writer could reassign used row ids; `rowTracking` accepted as a
   READER feature; `commitInfo` gains `engineInfo`+`operationParameters`. **Known kernel quirk (not ours):**
   duckdb-delta/delta-kernel reads a column-MAPPED partitioned table's partition column as all-NULL (physical-keyed
-  partitionValues per the Spark convention we validated live; Spark reads it fine). Remaining documented gaps:
-  checkpoint tombstones + `add.tags`, binary partition values (clean error), orphan DV `.bin` vacuum, nested-field
-  stats.
+  partitionValues per the Spark convention we validated live; Spark reads it fine). **Second pass (same day):**
+  (6) **checkpoint REMOVE TOMBSTONES** — snapshots track tombstones (`Snapshot.Tombstones`, keyed by
+  ReconciliationKey — a DV remove+re-add of the same path keeps the old-(path,DV) tombstone, correct);
+  checkpoints include unexpired ones (`delta.deletedFileRetentionDuration` honored when parseable, default 7d)
+  + `add.tags` preserved through checkpoints; (7) **CDF `_change_data` files under mapping** written
+  PHYSICAL-named + field_id'd like data files (`CdfWriter` gets the snapshot; `_change_type` stays unmapped) —
+  Spark reads cdc parquet through the table mapping. Remaining documented gaps: binary partition values (clean
+  error), orphan DV `.bin` vacuum, nested-field stats.
   **engineered-wood WRITE interop caveats (reviewed 2026-07-02; from its `doc/known-issues.md`):** engineered-wood
   is a from-scratch C# Parquet/Delta stack, so the write path diverges from Spark/parquet-mr in a few subtle ways —
   none a show-stopper (Fabric/DuckDB/arrow-rs read our output, validated live), but the two "Spark-ecosystem

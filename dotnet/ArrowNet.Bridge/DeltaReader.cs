@@ -876,6 +876,25 @@ internal static class DeltaReader
             .AsTask().GetAwaiter().GetResult();
         try
         {
+            // On a nested column-mapping table the source batches engineered-wood hands the callback carry
+            // PHYSICAL nested child names (EW's read rename is top-level only) — rename them to LOGICAL first
+            // so the typed substitution (BuildArray carries over unmatched rows by logical name) sees the
+            // table schema; EW's recursive ToPhysical converts the returned batches back for the rewrite.
+            var snapSchema = table.CurrentSnapshot.Schema;
+            if (EngineeredWood.DeltaLake.Schema.ColumnMapping.GetMode(
+                    table.CurrentSnapshot.Metadata.Configuration)
+                    != EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None
+                && ArrowColumnMappingRename.HasNestedFields(snapSchema))
+            {
+                var inner = rewriteFile;
+                rewriteFile = (ordinal, batches) =>
+                {
+                    var logical = new List<RecordBatch>(batches.Count);
+                    foreach (var b in batches)
+                        logical.Add(ArrowColumnMappingRename.RenameBatch(b, snapSchema, toPhysical: false));
+                    return inner(ordinal, logical);
+                };
+            }
             table.UpdateByRowIdsAsync(rowIds, rewriteFile, ct).AsTask().GetAwaiter().GetResult();
             DmlLog.LogInformation("delta update-rewrite {Path}: rowids={RowIds} writer={Writer} rewriter={Rewriter}",
                 path, rowIds.Count, writer is null ? "engineered-wood" : "native-duckdb",

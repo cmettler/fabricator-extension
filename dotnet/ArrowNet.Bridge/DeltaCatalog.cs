@@ -1067,27 +1067,11 @@ public sealed class DeltaCatalog : IBackendCatalog
             }
         }
 
-        // STRUCT SET values on a COLUMN-MAPPING table are gated: the copy-on-write rewrite goes through the
-        // EW-codec writer (the native rewriter is gated to unmapped tables in EW), whose physical-rename +
-        // field-id stamping is top-level only — the rebuilt struct's children would land under logical names
-        // without ids (silently unreadable for spec readers, like the gated nested EW-codec write). Scalar SET
-        // columns on a mapped table are fine (unchanged struct columns pass through with their physical names).
-        bool structSet = false;
-        foreach (var f in setSlotField)
-        {
-            if (f is not null && DeltaWriter.HasNestedColumns(new Apache.Arrow.Schema(new[] { f }, null)))
-            {
-                structSet = true;
-                break;
-            }
-        }
-        if (structSet && DeltaReader.IsColumnMapped(opener, path))
-        {
-            throw new NotSupportedException(
-                "UPDATE of a nested (STRUCT) column on a column-mapping Delta table is not supported yet — the "
-                + "copy-on-write rewrite cannot produce the spec nested layout. Opt the table out of mapping "
-                + "(`column_mapping 'none'`) or replace the rows via DELETE + INSERT.");
-        }
+        // STRUCT SET values work on COLUMN-MAPPING tables too: the copy-on-write rewrite applies
+        // engineered-wood's RECURSIVE physical-rename + field-id stamping (ColumnMappingRecursive.ToPhysical),
+        // so a substituted struct column (rebuilt logical-named from the table schema by BuildArray) lands in
+        // the spec nested layout; pass-through columns read from data files are already physical and just get
+        // their ids stamped.
 
         // 2b. native_write: build the per-file-ordinal (position -> new SET values) Arrow view the native rewriter
         //     LEFT JOINs against — so DuckDB applies the substitution in SQL and BuildArray is retired for the
