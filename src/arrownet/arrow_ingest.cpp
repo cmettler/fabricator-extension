@@ -15,6 +15,8 @@
 #include "duckdb/planner/filter/optional_filter.hpp"
 #include "duckdb/planner/filter/dynamic_filter.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/in_filter.hpp"
 #include "duckdb/planner/filter/struct_filter.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 
@@ -312,6 +314,227 @@ static bool RenderTableFilter(const TableFilter &f, const string &qcol, string &
 	}
 }
 
+// ---- Live TableFilterSet -> FilterNode JSON (structured, for provider PRUNING) ------------------------
+// The SQL rendering above (RenderTableFilter) is the APPLICATION channel; this is the PRUNING channel:
+// the same live filters (erased statics + materialized dynamic/join filters) serialized as the FilterNode
+// tree the provider's stats-based skipping consumes (Delta file pruning + parquet row-group/bloom pruning)
+// — a dynamic join filter is a true predicate of the query, so pruning with it is superset-correct, and it
+// is exactly the filter the bind-time pushdown_complex_filter channel can never carry (it materializes at
+// run time). Constants are appended to a PER-EXECUTION copy of the constants vector (never the shared bind
+// data). Best-effort: an unconvertible node is dropped (AND) or drops its whole disjunction (OR).
+
+static const char *LiveCmpToken(ExpressionType t) {
+	switch (t) {
+	case ExpressionType::COMPARE_EQUAL:
+		return "=";
+	case ExpressionType::COMPARE_NOTEQUAL:
+		return "<>";
+	case ExpressionType::COMPARE_LESSTHAN:
+		return "<";
+	case ExpressionType::COMPARE_GREATERTHAN:
+		return ">";
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		return "<=";
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		return ">=";
+	default:
+		return nullptr; // (not-)distinct etc.: not consumed by the pruning evaluators
+	}
+}
+
+// Emit the column reference body: `"col":"name"` for a plain column, `"path":["s","a"]` for a struct
+// member (mirrors the bind-time FilterSerializer contract in arrownet_table_entry.cpp).
+static void LiveJsonColumnRef(const vector<string> &path, string &out) {
+	if (path.size() == 1) {
+		out += "\"col\":";
+		JsonEscape(path[0], out);
+		return;
+	}
+	out += "\"path\":[";
+	for (idx_t i = 0; i < path.size(); i++) {
+		if (i) {
+			out += ',';
+		}
+		JsonEscape(path[i], out);
+	}
+	out += ']';
+}
+
+// Serialize one live TableFilter on the column identified by `path` (leaf type `type`) into a FilterNode
+// JSON object, appending its constants to `constants`. Returns false = not convertible (skip-safe for the
+// pruning consumer). String ordering comparisons are gated like the bind-time serializer.
+static bool LiveFilterNode(const TableFilter &f, vector<string> &path, const LogicalType &type,
+                           vector<Value> &constants, bool string_order_pushable, string &out) {
+	switch (f.filter_type) {
+	case TableFilterType::OPTIONAL_FILTER: {
+		auto &opt = f.Cast<OptionalFilter>();
+		return opt.child_filter && LiveFilterNode(*opt.child_filter, path, type, constants, string_order_pushable, out);
+	}
+	case TableFilterType::DYNAMIC_FILTER: {
+		auto &dyn = f.Cast<DynamicFilter>();
+		if (!dyn.filter_data) {
+			return false;
+		}
+		lock_guard<mutex> lock(dyn.filter_data->lock);
+		if (!dyn.filter_data->initialized || !dyn.filter_data->filter) {
+			return false; // not yet materialized: nothing to prune with
+		}
+		return LiveFilterNode(*dyn.filter_data->filter, path, type, constants, string_order_pushable, out);
+	}
+	case TableFilterType::CONSTANT_COMPARISON: {
+		auto &cf = f.Cast<ConstantFilter>();
+		const char *tok = LiveCmpToken(cf.comparison_type);
+		if (!tok || cf.constant.IsNull()) {
+			return false;
+		}
+		if (type.id() == LogicalTypeId::VARCHAR && !string_order_pushable && string(tok) != "=") {
+			return false; // string ordering: only pushable for a byte-ordered source
+		}
+		idx_t idx = constants.size();
+		constants.push_back(cf.constant);
+		out += "{\"op\":\"compare\",\"cmp\":\"";
+		out += tok;
+		out += "\",";
+		LiveJsonColumnRef(path, out);
+		out += ",\"val\":" + to_string(idx) + "}";
+		return true;
+	}
+	case TableFilterType::IS_NULL:
+	case TableFilterType::IS_NOT_NULL:
+		out += "{\"op\":\"";
+		out += f.filter_type == TableFilterType::IS_NULL ? "is_null" : "is_not_null";
+		out += "\",";
+		LiveJsonColumnRef(path, out);
+		out += "}";
+		return true;
+	case TableFilterType::IN_FILTER: {
+		auto &in = f.Cast<InFilter>();
+		if (in.values.empty()) {
+			return false;
+		}
+		for (auto &v : in.values) {
+			if (v.IsNull()) {
+				return false;
+			}
+		}
+		out += "{\"op\":\"in\",";
+		LiveJsonColumnRef(path, out);
+		out += ",\"vals\":[";
+		for (idx_t i = 0; i < in.values.size(); i++) {
+			if (i) {
+				out += ',';
+			}
+			out += to_string(constants.size());
+			constants.push_back(in.values[i]);
+		}
+		out += "]}";
+		return true;
+	}
+	case TableFilterType::STRUCT_EXTRACT: {
+		auto &sf = f.Cast<StructFilter>();
+		if (type.id() != LogicalTypeId::STRUCT) {
+			return false;
+		}
+		auto &members = StructType::GetChildTypes(type);
+		if (sf.child_idx >= members.size()) {
+			return false;
+		}
+		// Member name from the struct type at the bound index (exact case — matches parquet/stats keys).
+		path.push_back(members[sf.child_idx].first);
+		bool ok = sf.child_filter &&
+		          LiveFilterNode(*sf.child_filter, path, members[sf.child_idx].second, constants,
+		                         string_order_pushable, out);
+		path.pop_back();
+		return ok;
+	}
+	case TableFilterType::CONJUNCTION_AND:
+	case TableFilterType::CONJUNCTION_OR: {
+		bool is_and = f.filter_type == TableFilterType::CONJUNCTION_AND;
+		const ConjunctionFilter &conj =
+		    is_and ? static_cast<const ConjunctionFilter &>(f.Cast<ConjunctionAndFilter>())
+		           : static_cast<const ConjunctionFilter &>(f.Cast<ConjunctionOrFilter>());
+		vector<string> parts;
+		// Constants appended by a dropped OR branch must not leak — stage into a scratch vector first.
+		vector<Value> scratch = constants;
+		for (auto &child : conj.child_filters) {
+			string cs;
+			if (LiveFilterNode(*child, path, type, scratch, string_order_pushable, cs)) {
+				parts.push_back(std::move(cs));
+			} else if (!is_and) {
+				return false; // OR: dropping a branch would narrow (unsafe for pruning)
+			}
+			// AND: dropping a child only widens (superset) — fine.
+		}
+		if (parts.empty()) {
+			return false;
+		}
+		constants = std::move(scratch);
+		if (parts.size() == 1) {
+			out += parts[0];
+			return true;
+		}
+		out += "{\"op\":\"";
+		out += is_and ? "and" : "or";
+		out += "\",\"children\":[";
+		for (idx_t i = 0; i < parts.size(); i++) {
+			if (i) {
+				out += ',';
+			}
+			out += parts[i];
+		}
+		out += "]}";
+		return true;
+	}
+	default:
+		return false; // EXPRESSION_FILTER / BLOOM_FILTER: not convertible (bloom is pruning-only anyway)
+	}
+}
+
+// Serialize the scan's live TableFilterSet into one FilterNode JSON tree (implicit AND across columns),
+// appending its constants to the per-execution `constants` vector. Empty unless the scan advertised
+// filter_pushdown (the exact-mode catalog) and DuckDB delivered filters.
+static string SerializeLiveFilters(const ArrowStreamBindData &bind_data, TableFunctionInitInput &input,
+                                   vector<Value> &constants) {
+	if (!input.filters) {
+		return string();
+	}
+	vector<string> parts;
+	for (auto &entry : input.filters->filters) {
+		idx_t key = entry.first;
+		if (key >= input.column_ids.size()) {
+			continue;
+		}
+		auto col_id = input.column_ids[key];
+		if (col_id == COLUMN_IDENTIFIER_ROW_ID || (idx_t)col_id >= bind_data.names.size()) {
+			continue; // rowid / virtual / out-of-range: no filter pushed on those
+		}
+		vector<string> path {bind_data.names[(idx_t)col_id]};
+		const LogicalType &type = (idx_t)col_id < bind_data.return_types.size()
+		                              ? bind_data.return_types[(idx_t)col_id]
+		                              : LogicalType(LogicalTypeId::ANY);
+		string node;
+		if (LiveFilterNode(*entry.second, path, type, constants, bind_data.string_order_pushable, node) &&
+		    !node.empty()) {
+			parts.push_back(std::move(node));
+		}
+	}
+	if (parts.empty()) {
+		return string();
+	}
+	if (parts.size() == 1) {
+		return parts[0];
+	}
+	string json = "{\"op\":\"and\",\"children\":[";
+	for (idx_t i = 0; i < parts.size(); i++) {
+		if (i) {
+			json += ',';
+		}
+		json += parts[i];
+	}
+	json += "]}";
+	return json;
+}
+
 // Render the scan's LIVE TableFilterSet (static WHERE constants that DuckDB erased from the plan under
 // filter_pushdown=true, PLUS any runtime dynamic/join filters) into one DuckDB SQL predicate for the native
 // (read_parquet) path. Column keys map through the scanned column list to provider names (exactly as
@@ -352,7 +575,7 @@ static string RenderLiveFilters(const ArrowStreamBindData &bind_data, TableFunct
 }
 
 static string BuildScanSpec(const ArrowStreamBindData &bind_data, const vector<column_t> &output_column_ids,
-                            const string &live_filter_sql) {
+                            const string &live_filter_sql, const string &live_filter_json) {
 	vector<string> cols;
 	auto add = [&](idx_t table_idx) {
 		if (table_idx >= bind_data.names.size()) {
@@ -395,9 +618,21 @@ static string BuildScanSpec(const ArrowStreamBindData &bind_data, const vector<c
 		JsonEscape(cols[i], json);
 	}
 	json += "]";
-	if (!bind_data.filter_json.empty()) {
+	// The structured predicate for provider PRUNING: the bind-time serialization (incl. cross-column
+	// disjunction shapes the per-column TableFilterSet can't represent) AND-merged with the live
+	// TableFilterSet render (which adds the runtime dynamic/join filters). Both are true predicates of
+	// the query, so the conjunction is superset-correct; duplicated statics are idempotent for pruning.
+	if (!bind_data.filter_json.empty() || !live_filter_json.empty()) {
 		json += ",\"filter\":";
-		json += bind_data.filter_json; // already a JSON object
+		if (!bind_data.filter_json.empty() && !live_filter_json.empty()) {
+			json += "{\"op\":\"and\",\"children\":[";
+			json += bind_data.filter_json;
+			json += ',';
+			json += live_filter_json;
+			json += "]}";
+		} else {
+			json += bind_data.filter_json.empty() ? live_filter_json : bind_data.filter_json;
+		}
 	}
 	// A 1:1 SQL rendering of the same predicates (literals inlined) — consumed only by a provider whose scan
 	// target is DuckDB itself (native Delta read_parquet); foreign-engine providers ignore it. Two sources:
@@ -417,10 +652,10 @@ static string BuildScanSpec(const ArrowStreamBindData &bind_data, const vector<c
 	}
 	// TOP (n) is only safe with no pushed filter: a best-effort filter returns a
 	// superset, so limiting before exact (DuckDB) filtering could drop valid rows.
-	if (bind_data.top_n >= 0 && bind_data.filter_json.empty()) {
+	if (bind_data.top_n >= 0 && bind_data.filter_json.empty() && live_filter_json.empty()) {
 		json += ",\"top\":" + to_string(bind_data.top_n);
 	}
-	if (!bind_data.order_by_json.empty() && bind_data.filter_json.empty()) {
+	if (!bind_data.order_by_json.empty() && bind_data.filter_json.empty() && live_filter_json.empty()) {
 		json += ",\"order_by\":" + bind_data.order_by_json; // already a JSON array
 	}
 	// Time travel (AT clause): orthogonal to projection/filter/order — always emitted when set so the
@@ -525,13 +760,18 @@ unique_ptr<GlobalTableFunctionState> ArrowStreamInitGlobal(ClientContext &contex
 	ArrowScanRequest request;
 	unique_ptr<arrownet::ArrowProducer> value_producer; // must outlive the factory() call
 	if (bind_data.push_projection) {
-		// Render the live runtime filters (static-erased + dynamic/join) for an exact-filter native scan
-		// (filter_pushdown=true); empty for SQL/DAX/non-native (input.filters null). This runs per execution,
-		// so a hash-join dynamic filter materialized before the probe scan is captured here.
+		// Render the live runtime filters (static-erased + dynamic/join) for an exact-filter scan
+		// (filter_pushdown=true); empty for SQL/DAX/non-exact (input.filters null). This runs per execution,
+		// so a hash-join dynamic filter materialized before the probe scan is captured here — twice: as the
+		// exact SQL the provider APPLIES (native_filter) and as the structured FilterNode tree it PRUNES
+		// with (file/row-group skipping; the constants extend a PER-EXECUTION copy of the bind constants —
+		// bind data is shared across executions and must not be mutated).
 		string live_filter_sql = RenderLiveFilters(bind_data, input);
-		request.spec_json = BuildScanSpec(bind_data, input.column_ids, live_filter_sql);
-		if (!bind_data.filter_constants.empty()) {
-			value_producer = BuildFilterValues(context, bind_data.filter_constants);
+		vector<Value> filter_constants = bind_data.filter_constants;
+		string live_filter_json = SerializeLiveFilters(bind_data, input, filter_constants);
+		request.spec_json = BuildScanSpec(bind_data, input.column_ids, live_filter_sql, live_filter_json);
+		if (!filter_constants.empty()) {
+			value_producer = BuildFilterValues(context, filter_constants);
 			request.filter_values = value_producer->Stream();
 		}
 	}

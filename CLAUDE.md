@@ -1436,6 +1436,24 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   nesting, cross-mode agreement none/static/exact, exact-mode DML with struct WHERE, **name- AND id-mapped
   native_read struct filters via the rebuild** incl. NULL-struct semantics, unmapped native_read, plain +
   mapped codec); delta suite 42/42 + SQL Server suites green.
+  **DYNAMIC-filter I/O PRUNING DONE (2026-07-06, third pass — C++-only, no ABI).** The live TableFilterSet
+  render at scan init now has a SECOND, structured channel: `SerializeLiveFilters` (arrow_ingest.cpp, beside
+  `RenderLiveFilters`) converts the erased statics + **materialized dynamic/join filters** into a FilterNode
+  JSON tree — AND-merged with the bind-time `filter_json` in `BuildScanSpec` (both are true predicates;
+  duplicated statics are idempotent for pruning) — so a hash-join's runtime bounds now drive engineered-wood
+  **Delta file pruning + parquet row-group/bloom skipping** on BOTH Delta paths (previously dynamics reached
+  only the SQL channel = read_parquet row-groups on native; the codec path got nothing). Handles
+  Constant/IsNull/In/Conjunction/Optional/Dynamic(under its lock)/StructFilter(→ path nodes); OR is
+  all-or-nothing with constants staged in a scratch vector so a dropped branch can't leak indices; constants
+  extend a **PER-EXECUTION copy** of the bind constants (bind data is shared across executions — never
+  mutated); string-ordering gate honored; TOP/ORDER-BY spec emission now also gated on the live JSON (a
+  pushed TOP over a superset-filtered scan could drop rows). Proven: JOIN probe scan logs `active=2 scanned=1
+  pruned=1` (the out-of-range file skipped BEFORE any I/O) with the IN + min/max bounds also in the WHERE.
+  SQL Server/DAX unaffected (input.filters exists only under exact-mode filter_pushdown). Same pass: the **6
+  EW Parquet.Tests decimal assertions rewritten for the committed Decimal128 widening** (read tests assert
+  Decimal128Type/Array with preserved precision/scale; roundtrips write narrow → read wide, values lossless)
+  — EW Parquet.Tests now 573/585, the remaining 12 = the pre-existing ALP bit-exact + parquet-testing sweep
+  failures (separate triage).
   **COLUMN MAPPING on the native read — DONE (2026-07-05, C#-only, no ABI; live Fabric-Spark-validated).** A
   column-mapping Delta table (`delta.columnMapping.mode` = `name` or `id`) stores columns under PHYSICAL names
   (`col-<guid>`), so the plain `read_parquet` SELECT-by-logical-name failed (*"Referenced column 'id' not found;
