@@ -42,11 +42,22 @@ internal sealed class NativeParquetDataFileReader : IDataFileReader
         var rel = relativePath.Replace('\\', '/').TrimStart('/');
         var uri = _root + "/" + rel;
 
-        // Explicit projection: either the requested physical columns, or the file's own column set (probed
-        // footer-only) — needed to exclude the file_row_number ordering column from the output either way.
-        IReadOnlyList<string> cols = physicalColumns is { Count: > 0 }
-            ? physicalColumns
-            : ProbeColumns(uri);
+        // Explicit projection intersected with the file's ACTUAL columns (probed footer-only): a requested
+        // column may be absent from this file (a partial-column INSERT / a later-ADDed column) and
+        // read_parquet errors on unknown names — the Delta layer backfills the absent ones as typed NULLs.
+        // An empty intersection falls back to all columns (the row count must still come from the file).
+        // The explicit list also excludes the file_row_number ordering column from the output.
+        IReadOnlyList<string> present = ProbeColumns(uri);
+        IReadOnlyList<string> cols = present;
+        if (physicalColumns is { Count: > 0 })
+        {
+            var presentSet = new HashSet<string>(present, StringComparer.Ordinal);
+            var kept = physicalColumns.Where(presentSet.Contains).ToList();
+            if (kept.Count > 0)
+            {
+                cols = kept;
+            }
+        }
         string select = string.Join(", ", cols.Select(Quote));
 
         var sql = $"SELECT {select} FROM read_parquet('{uri.Replace("'", "''")}', file_row_number => true) "

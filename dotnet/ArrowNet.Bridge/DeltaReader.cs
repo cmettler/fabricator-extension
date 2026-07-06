@@ -317,7 +317,11 @@ internal static class DeltaReader
         nint opener, string path, IReadOnlyList<string>? columns, Predicate? filter, CancellationToken ct)
     {
         var fs = TableFileSystems.Create(opener, path);
-        var parquet = filter is null ? ParquetReadOptions.Default : new ParquetReadOptions { Filter = filter };
+        var parquet = filter is null
+            ? ParquetReadOptions.Default
+            // Bloom probing refines row-group pruning when min/max stats are inconclusive (point lookups
+            // on high-cardinality columns) — natively-written files carry blooms on dict-encoded columns.
+            : new ParquetReadOptions { Filter = filter, FilterUseBloomFilters = true };
         var options = DeltaTableOptions.Default with { ParquetReadOptions = parquet };
         return StreamImpl(fs, options, columns, filter, ct);
     }
@@ -361,7 +365,11 @@ internal static class DeltaReader
         nint opener, string path, IReadOnlyList<string>? columns, Predicate? filter, CancellationToken ct)
     {
         var fs = TableFileSystems.Create(opener, path);
-        var parquet = filter is null ? ParquetReadOptions.Default : new ParquetReadOptions { Filter = filter };
+        var parquet = filter is null
+            ? ParquetReadOptions.Default
+            // Bloom probing refines row-group pruning when min/max stats are inconclusive (point lookups
+            // on high-cardinality columns) — natively-written files carry blooms on dict-encoded columns.
+            : new ParquetReadOptions { Filter = filter, FilterUseBloomFilters = true };
         var options = DeltaTableOptions.Default with { ParquetReadOptions = parquet };
         return StreamWithRowIdsImpl(fs, options, columns, filter, ct);
     }
@@ -503,7 +511,11 @@ internal static class DeltaReader
         CancellationToken ct)
     {
         var fs = TableFileSystems.Create(opener, path);
-        var parquet = filter is null ? ParquetReadOptions.Default : new ParquetReadOptions { Filter = filter };
+        var parquet = filter is null
+            ? ParquetReadOptions.Default
+            // Bloom probing refines row-group pruning when min/max stats are inconclusive (point lookups
+            // on high-cardinality columns) — natively-written files carry blooms on dict-encoded columns.
+            : new ParquetReadOptions { Filter = filter, FilterUseBloomFilters = true };
         var options = DeltaTableOptions.Default with { ParquetReadOptions = parquet };
         return StreamAtImpl(fs, options, columns, filter, unit, value, ct);
     }
@@ -682,7 +694,11 @@ internal static class DeltaReader
         CancellationToken ct)
     {
         var fs = TableFileSystems.Create(opener, path);
-        var parquet = filter is null ? ParquetReadOptions.Default : new ParquetReadOptions { Filter = filter };
+        var parquet = filter is null
+            ? ParquetReadOptions.Default
+            // Bloom probing refines row-group pruning when min/max stats are inconclusive (point lookups
+            // on high-cardinality columns) — natively-written files carry blooms on dict-encoded columns.
+            : new ParquetReadOptions { Filter = filter, FilterUseBloomFilters = true };
         var options = DeltaTableOptions.Default with { ParquetReadOptions = parquet };
         return StreamWithRowIdsAtImpl(fs, options, columns, filter, unit, value, ct);
     }

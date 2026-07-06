@@ -661,6 +661,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         if (spec?.At is { } at)
         {
             var atSchema = DeltaReader.GetSchemaAt(opener, path, at.Unit, at.Value);
+            var (atProjCols, atProjected) = ProjectFor(atSchema, spec);
             // DuckDB may still request the virtual rowid for a time-travel scan (its count(*)-via-rowid
             // optimization). Produce it (version-aware transient rowid) so the stream matches what DuckDB asked
             // for; otherwise the rowid (BIGINT) it expects collides with the first user column (the
@@ -668,35 +669,73 @@ public sealed class DeltaCatalog : IBackendCatalog
             bool wantRowIdAt = spec.Columns is { } atCols && atCols.Contains(RowIdColumn);
             if (wantRowIdAt)
             {
-                var atFields = new List<Field>(atSchema.FieldsList)
+                var atFields = new List<Field>(atProjected.FieldsList)
                 {
                     new Field(RowIdColumn, Int64Type.Default, nullable: false),
                 };
                 return new AsyncEnumerableArrowStream(
-                    new Schema(atFields, atSchema.Metadata),
-                    DeltaReader.StreamWithRowIdsAt(opener, path, columns: null, filter, at.Unit, at.Value, default));
+                    new Schema(atFields, atProjected.Metadata),
+                    DeltaReader.StreamWithRowIdsAt(opener, path, atProjCols, filter, at.Unit, at.Value, default));
             }
             return new AsyncEnumerableArrowStream(
-                atSchema, DeltaReader.StreamAt(opener, path, columns: null, filter, at.Unit, at.Value, default));
+                atProjected, DeltaReader.StreamAt(opener, path, atProjCols, filter, at.Unit, at.Value, default));
         }
 
         var userSchema = DeltaReader.GetSchema(opener, path);
+        var (projCols, projected) = ProjectFor(userSchema, spec);
 
         // When the scan requests the virtual rowid (UPDATE/DELETE plans), stream WITH the trailing
         // _metadata.row_id column and advertise it in the schema; DuckDB maps the requested output by name.
         bool wantRowId = spec?.Columns is { } cols && cols.Contains(RowIdColumn);
         if (wantRowId)
         {
-            var fields = new List<Field>(userSchema.FieldsList)
+            var fields = new List<Field>(projected.FieldsList)
             {
                 new Field(RowIdColumn, Int64Type.Default, nullable: false),
             };
-            var schemaWithRowId = new Schema(fields, userSchema.Metadata);
+            var schemaWithRowId = new Schema(fields, projected.Metadata);
             return new AsyncEnumerableArrowStream(
-                schemaWithRowId, DeltaReader.StreamWithRowIds(opener, path, columns: null, filter, default));
+                schemaWithRowId, DeltaReader.StreamWithRowIds(opener, path, projCols, filter, default));
         }
 
-        return new AsyncEnumerableArrowStream(userSchema, DeltaReader.Stream(opener, path, columns: null, filter, default));
+        return new AsyncEnumerableArrowStream(projected, DeltaReader.Stream(opener, path, projCols, filter, default));
+    }
+
+    /// <summary>
+    /// PROJECTION into the engineered-wood decode: maps the scan's requested columns to the column list the
+    /// EW reader should decode (row groups are read column-selectively) plus the matching stream schema —
+    /// the TABLE-ORDER subset of the full schema (engineered-wood's BackfillMissingColumns reconciles each
+    /// batch to exactly that set, so schema and batches agree; arrow_ingest maps by name). The virtual rowid
+    /// is excluded here (the dedicated streams append it). Falls back to the full schema when nothing (or
+    /// everything) is projected, or when the requested set resolves to no user column (a bare count(*)).
+    /// </summary>
+    private static (IReadOnlyList<string>? Columns, Schema Schema) ProjectFor(Schema fullSchema, ScanSpec? spec)
+    {
+        if (spec?.Columns is not { } requested)
+        {
+            return (null, fullSchema);
+        }
+        var set = new HashSet<string>(requested, System.StringComparer.Ordinal);
+        set.Remove(RowIdColumn);
+        if (set.Count == 0 || set.Count >= fullSchema.FieldsList.Count)
+        {
+            return (null, fullSchema);
+        }
+        var fields = new List<Field>(set.Count);
+        var names = new List<string>(set.Count);
+        foreach (var f in fullSchema.FieldsList)
+        {
+            if (set.Contains(f.Name))
+            {
+                fields.Add(f);
+                names.Add(f.Name);
+            }
+        }
+        if (fields.Count == 0 || fields.Count == fullSchema.FieldsList.Count)
+        {
+            return (null, fullSchema);
+        }
+        return (names, new Schema(fields, fullSchema.Metadata));
     }
 
     // Native read (native_read true): resolve the snapshot (explicit AT > per-transaction pinned version >
