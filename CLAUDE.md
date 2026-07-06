@@ -323,6 +323,24 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   `FromArrowType` throws on a variant list-element/map-entry marker instead of silently degrading it to
   `binary` (the degradation bug the probe found). Struct-nested variant maps fine at the EW schema layer
   (an external Spark table could carry it; reads may work) — only WRITES are gated.
+  **Fourth pass — CODEC-PATH variant (tier 1, `VariantTransport`): the native-flag requirement for plain
+  CREATE/INSERT/SELECT is GONE** (`verify_delta_catalog_variant.test` 102). Key discovery: EW's PARQUET
+  layer already had complete, tested unshredded variant (the pinned **Apache.Arrow 23.0.0 nuget contains
+  `VariantArray` + `VariantType` extension** — the release-content question is answered; EW's
+  `ArrowToSchemaConverter` maps the extension → VARIANT-annotated group, `NestedLevelWriter` unwraps it,
+  the reader wraps back via `ParquetReadOptions.ExtensionRegistry`, round-trip tests in
+  `VariantArrayRoundTripTests` — EW's known-issues "VARIANT not supported" note is STALE). The missing
+  piece was Delta-layer glue: **`EngineeredWood.DeltaLake.Table/VariantTransport`** converts the
+  `arrownet.variant` blob transport ⇄ `VariantArray`/bare storage struct — write side in `WriteCoreAsync`'s
+  codec branch (replacing the gate; splits each blob via the self-delimiting metadata header), read side in
+  `ProcessFileBatchesAsync` after the renames (struct→blob+tag; a host-reader blob passes through;
+  **shredded files [typed_value child] → clean error** — reassembly needs a variant engine). Bridge:
+  `EnsureVariantWritable` keeps only the top-level-only + CDF rejections; `ThrowIfVariantCodecRead` removed.
+  Cross-codec matrix: codec-written (unshredded) is read by EVERYONE (kernel-validated + native reader);
+  native-written is SHREDDED by default → codec read = the clean shredded error (native/Spark/kernel read
+  it fine). Codec REWRITES (UPDATE/CoW/OPTIMIZE) stay gated by the EW backstop on codec-only catalogs
+  (their write sites aren't transformed; DV DELETE works). Tier 2/3 (shredded read / shredded write in EW)
+  deferred — blueprints: DuckDB in-tree + Apache.Arrow.Scalars.Variant/Operations.
 - **Delta IDENTITY columns — DONE (2026-07-06)**: the v53 generated-column marker (`id BIGINT AS (0)`) now
   works on the Delta provider (`test/verify_delta_catalog_identity.test`, 38; kernel-reads). The heavy lifting
   ALREADY EXISTED in engineered-wood (`IdentityColumn` config/metadata keys + `IdentityColumnWriter.ProcessBatch`

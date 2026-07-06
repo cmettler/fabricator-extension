@@ -657,7 +657,6 @@ public sealed class DeltaCatalog : IBackendCatalog
         if (spec?.At is { } at)
         {
             var atSchema = DeltaReader.GetSchemaAt(opener, path, at.Unit, at.Value);
-            ThrowIfVariantCodecRead(atSchema);
             // DuckDB may still request the virtual rowid for a time-travel scan (its count(*)-via-rowid
             // optimization). Produce it (version-aware transient rowid) so the stream matches what DuckDB asked
             // for; otherwise the rowid (BIGINT) it expects collides with the first user column (the
@@ -678,7 +677,6 @@ public sealed class DeltaCatalog : IBackendCatalog
         }
 
         var userSchema = DeltaReader.GetSchema(opener, path);
-        ThrowIfVariantCodecRead(userSchema);
 
         // When the scan requests the virtual rowid (UPDATE/DELETE plans), stream WITH the trailing
         // _metadata.row_id column and advertise it in the schema; DuckDB maps the requested output by name.
@@ -824,29 +822,15 @@ public sealed class DeltaCatalog : IBackendCatalog
         {
             return;
         }
-        if (!_nativeWrite || !_nativeRead)
-        {
-            throw new System.NotSupportedException(
-                "VARIANT columns require the native paths — ATTACH the Delta catalog with "
-                + "native_write true AND native_read true (DuckDB's own parquet writer/reader handle the "
-                + "variant layout; the built-in codec cannot).");
-        }
+        // The codec paths handle variant now (engineered-wood's VariantTransport writes the annotated group
+        // via VariantArray and reads it back to the transport blob), so no native-path requirement remains
+        // for plain CREATE/INSERT/SELECT. CoW rewrites/compaction on a codec-only catalog are still rejected
+        // by the EW backstop (their write sites aren't transformed) — DV DELETE works, and DV is the default.
         if (_changeDataFeedOnCreate)
         {
             throw new System.NotSupportedException(
                 "VARIANT columns cannot be combined with change_data_feed true (the CDC change files are "
-                + "written by the built-in codec, which cannot emit the variant layout).");
-        }
-    }
-
-    // Called on the codec-read branch only (the native path handles variant).
-    private static void ThrowIfVariantCodecRead(Schema schema)
-    {
-        if (SchemaHasVariant(schema))
-        {
-            throw new System.NotSupportedException(
-                "Reading a table with VARIANT columns requires the native_read true ATTACH option "
-                + "(DuckDB's own parquet reader decodes the variant layout; the built-in codec cannot).");
+                + "written by the built-in codec, which does not emit the variant layout there).");
         }
     }
 

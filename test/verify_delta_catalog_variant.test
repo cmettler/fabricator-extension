@@ -156,23 +156,57 @@ SELECT id, v::VARCHAR FROM lake2.main.vt ORDER BY id;
 6	{'nested': {'deep': [1, 2]}}
 9	{'a': 1, 'b': x}
 
-# ---- gates: a catalog WITHOUT the native paths rejects variant with actionable errors ----
+# ---- the codec paths handle variant now (no native-flag requirement for CREATE/INSERT/SELECT) ----
 statement ok
 ATTACH '${ARROWNET_DELTA_WRITE_DIR}/varplain' AS plain (TYPE arrownet, PROVIDER 'delta', column_mapping 'none');
 
-statement error
+statement ok
 CREATE TABLE plain.main.vt (id INTEGER, v VARIANT);
-----
-VARIANT columns require the native paths
 
-# Reading an existing variant table through a codec-read catalog is rejected (not silently misread).
+# Cross-codec reads: the codec reader handles UNSHREDDED variant groups; DuckDB's native writer SHREDS
+# small variants by default (typed_value columns), which the codec cannot reassemble — reading the
+# natively-written table through a codec-only catalog is a clean error, not a misread. (The reverse —
+# native reading a codec-written table — always works: the codec writes unshredded.)
 statement ok
 ATTACH '${ARROWNET_DELTA_WRITE_DIR}/varcatalog' AS codecread (TYPE arrownet, PROVIDER 'delta', column_mapping 'none');
 
 statement error
-SELECT count(v) FROM codecread.main.vt;
+SELECT id, v::VARCHAR FROM codecread.main.vt ORDER BY id;
 ----
-native_read
+SHREDDED variant
+
+# ---- pure codec path (no native flags): engineered-wood WRITES the annotated variant group too ----
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/varcodec' AS codecrw (TYPE arrownet, PROVIDER 'delta', column_mapping 'none');
+
+statement ok
+CREATE TABLE codecrw.main.cvt (id INTEGER, v VARIANT);
+
+statement ok
+INSERT INTO codecrw.main.cvt VALUES (1, {'a': 1}::VARIANT), (2, NULL), (3, 'txt'::VARIANT);
+
+query ITI
+SELECT id, v::VARCHAR, v IS NULL FROM codecrw.main.cvt ORDER BY id;
+----
+1	{'a': 1}	false
+2	NULL	true
+3	txt	false
+
+# DV DELETE works on the codec path (bitmap only, no data rewrite).
+statement ok
+DELETE FROM codecrw.main.cvt WHERE id = 3;
+
+query I
+SELECT count(*) FROM codecrw.main.cvt;
+----
+2
+
+# Codec REWRITES stay gated by the engineered-wood backstop (only the plain write path is transformed;
+# rewrites need the host codec pair — use native_read+native_write for UPDATE/OPTIMIZE).
+statement error
+UPDATE codecrw.main.cvt SET id = 9 WHERE id = 1;
+----
+not supported yet
 
 # change_data_feed cannot combine with variant (CDC files are codec-written).
 statement ok
