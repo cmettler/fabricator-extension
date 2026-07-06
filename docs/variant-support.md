@@ -44,7 +44,38 @@ So the data path can be **DuckDB-native end to end** (the `native_read`/`native_
 already ship): DuckDB writes/reads the variant parquet; EW only does the `_delta_log`; C# only
 moves opaque Arrow structs.
 
-## The one unknown to SPIKE first
+## SPIKE RESULTS (2026-07-06, executed against our build — definitive)
+
+1. **In-engine VARIANT is fully functional** in DuckDB 1.5.4: `{'a':1}::VARIANT` literals,
+   `typeof(...)='VARIANT'`, and a native parquet `COPY`/`read_parquet` round-trip preserves the type.
+2. **VARIANT does NOT cross the Arrow C boundary**: pushing a VARIANT column through
+   `arrownet_delta_write` (DuckDB→C# Arrow export) throws `Not implemented Error: Unsupported Arrow
+   type VARIANT` — outcome 3 of the options below is the ONLY path; there is no extension-type export
+   to allow through.
+3. **The transport form CROSSES and CONVERTS BOTH WAYS**:
+   `variant_to_parquet_variant(v)` (parquet ext scalar) → type `PARQUET_VARIANT` (struct-of-blobs
+   alias) — crossed the boundary and committed via `arrownet_delta_write` successfully; and the
+   REVERSE CAST EXISTS: `<parquet_variant>::VARIANT` → `VARIANT`. So the boundary recipe is:
+   OUT of DuckDB = wrap the column `variant_to_parquet_variant(v) AS v`; INTO DuckDB = `v::VARIANT`.
+
+**Implementation implications:**
+- **native_read** (`Host.Query` SQL we control): the per-file `read_parquet` SELECT casts a variant
+  column `v::VARIANT`? — NO: `read_parquet` already returns VARIANT in-engine; the problem is the
+  RESULT crossing back C++←C# is the C# side pulling DuckDB output — wrap the projection with
+  `variant_to_parquet_variant(v) AS v` in the reader SQL, and have `arrow_ingest`'s bind schema
+  declare the column VARIANT with a C++-side cast `PARQUET_VARIANT→VARIANT` on ingest (or surface
+  the transport struct + cast in the catalog scan SQL layer).
+- **native_write streaming COPY**: the COPY input stream arrives FROM C# as the transport struct;
+  the COPY SQL casts back (`v::VARIANT`) so DuckDB's parquet writer emits the annotated VARIANT
+  (+ shredding settings apply).
+- **The catalog bulk INSERT/CTAS path is the hard part**: chunks export via the C++ `ArrowAppender`
+  (not SQL) → a VARIANT column throws at export. The C++ bulk/insert/CTAS operators must pre-cast
+  VARIANT columns to the transport struct before appending (a bound cast exists — the reverse cast
+  was verified; verify/use `BoundCastExpression` VARIANT→PARQUET_VARIANT, else bind the
+  `variant_to_parquet_variant` scalar from the catalog). Same in reverse for scan ingest.
+- EW/Delta schema work (type `"variant"` + `variantType` feature) is unchanged from the plan below.
+
+## The one unknown to SPIKE first (RESOLVED above — kept for context)
 
 **How does DuckDB 1.5.4 export VARIANT across the Arrow C interface?** `arrow_converter.cpp` has no
 explicit VARIANT case — it routes through the Arrow-extension registry (`config.GetArrowExtension`),
