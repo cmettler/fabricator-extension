@@ -785,8 +785,41 @@ public sealed class DeltaCatalog : IBackendCatalog
         return false;
     }
 
+    // True when a variant marker sits BELOW the top level (struct/list/map, any depth).
+    private static bool HasNestedVariant(Schema schema)
+    {
+        foreach (var f in schema.FieldsList)
+        {
+            if (TypeHasVariant(f.DataType))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static bool TypeHasVariant(Apache.Arrow.Types.IArrowType type) => type switch
+    {
+        StructType st => st.Fields.Any(FieldHasVariant),
+        ListType lt => EngineeredWood.DeltaLake.Schema.SchemaConverter.IsVariantArrowField(lt.ValueField)
+                       || TypeHasVariant(lt.ValueDataType),
+        MapType mt => EngineeredWood.DeltaLake.Schema.SchemaConverter.IsVariantArrowField(mt.KeyField)
+                      || EngineeredWood.DeltaLake.Schema.SchemaConverter.IsVariantArrowField(mt.ValueField)
+                      || TypeHasVariant(mt.KeyField.DataType) || TypeHasVariant(mt.ValueField.DataType),
+        _ => false,
+    };
+
     private void EnsureVariantWritable(Schema schema)
     {
+        // Nested variant (struct/list/map, any depth) cannot be WRITTEN: DuckDB's parquet writer rejects a
+        // non-root VARIANT ("requires a transform, but is not a root column"), so the table would be
+        // unusable — fail the CREATE/INSERT with the reason instead.
+        if (HasNestedVariant(schema))
+        {
+            throw new System.NotSupportedException(
+                "VARIANT is only supported as a TOP-LEVEL column (DuckDB's parquet writer cannot write a "
+                + "VARIANT nested inside a struct/list/map).");
+        }
         if (!SchemaHasVariant(schema))
         {
             return;

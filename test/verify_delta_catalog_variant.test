@@ -182,3 +182,51 @@ statement error
 CREATE TABLE cdf.main.vt (id INTEGER, v VARIANT);
 ----
 cannot be combined with change_data_feed
+
+# ---- column mapping (the catalog DEFAULT, id mode): variant + mapping work together ----
+# The variant column gets a physical col-<guid> name + delta.columnMapping.id; the parquet stores the
+# annotated variant group under the physical name WITH its field_id; RENAME COLUMN is metadata-only.
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/varmapped' AS mapped (TYPE arrownet, PROVIDER 'delta', native_read true, native_write true);
+
+statement ok
+CREATE TABLE mapped.main.mv (id INTEGER, v VARIANT);
+
+statement ok
+INSERT INTO mapped.main.mv VALUES (1, {'a': 1}::VARIANT), (2, NULL), (3, [7, 8]::VARIANT);
+
+query IT
+SELECT id, v::VARCHAR FROM mapped.main.mv ORDER BY id;
+----
+1	{'a': 1}
+2	NULL
+3	[7, 8]
+
+statement ok
+ALTER TABLE mapped.main.mv RENAME COLUMN v TO payload;
+
+query T
+SELECT payload::VARCHAR FROM mapped.main.mv WHERE id = 3;
+----
+[7, 8]
+
+# UPDATE of the variant value AFTER the rename (the mapped rewrite path, physical-name resolution).
+statement ok
+UPDATE mapped.main.mv SET payload = {'upd': 9}::VARIANT WHERE id = 1;
+
+query T
+SELECT payload::VARCHAR FROM mapped.main.mv WHERE id = 1;
+----
+{'upd': 9}
+
+# ---- nested variant is rejected up front: DuckDB's parquet writer cannot write a non-root VARIANT
+# ("requires a transform, but is not a root column") — a nested-variant table would be unusable.
+statement error
+CREATE TABLE mapped.main.sv (id INTEGER, s STRUCT(tag VARCHAR, v VARIANT));
+----
+TOP-LEVEL column
+
+statement error
+CREATE TABLE mapped.main.lv (id INTEGER, l VARIANT[]);
+----
+TOP-LEVEL column

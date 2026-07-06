@@ -313,8 +313,16 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   every rewrite (`DeltaTable.CleanField`, 4 sites) now preserves `ARROW:extension:*` metadata** — it stripped
   ALL metadata, which would silently drop the variant tag on any rewrite. Seam caveat: id-mode projection
   under the seam resolves by physical NAME (field-id resolution needs the parquet footer the seam hides —
-  exact for spec-written files). Regression: delta 39/39 + EW 141/168 green. Remaining: list/map-nested
-  variant rejected at the EW schema layer; mapped-variant tables untested (tests pin `column_mapping 'none'`).
+  exact for spec-written files). Regression: delta 39/39 + EW 141/168 green. **Third pass closed both
+  loose ends** (`verify_delta_catalog_variant.test` now 87): (a) **mapped variant WORKS with zero code**
+  (id-mode default: physical `col-<guid>` + field_id on the variant group in the parquet, RENAME COLUMN
+  metadata-only, UPDATE of the variant value post-rename, kernel-reads — the FIELD_IDS-on-VARIANT concern
+  didn't materialize); (b) **variant is TOP-LEVEL-only, enforced up front**: DuckDB's parquet writer
+  REJECTS a non-root VARIANT ("requires a transform, but is not a root column" — upstream limitation), so
+  `EnsureVariantWritable` rejects struct/list/map-nested variant at CREATE with that reason, and EW's
+  `FromArrowType` throws on a variant list-element/map-entry marker instead of silently degrading it to
+  `binary` (the degradation bug the probe found). Struct-nested variant maps fine at the EW schema layer
+  (an external Spark table could carry it; reads may work) — only WRITES are gated.
 - **Delta IDENTITY columns — DONE (2026-07-06)**: the v53 generated-column marker (`id BIGINT AS (0)`) now
   works on the Delta provider (`test/verify_delta_catalog_identity.test`, 38; kernel-reads). The heavy lifting
   ALREADY EXISTED in engineered-wood (`IdentityColumn` config/metadata keys + `IdentityColumnWriter.ProcessBatch`
