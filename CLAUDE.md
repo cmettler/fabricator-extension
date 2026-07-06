@@ -340,7 +340,15 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   native-written is SHREDDED by default → codec read = the clean shredded error (native/Spark/kernel read
   it fine). Codec REWRITES (UPDATE/CoW/OPTIMIZE) stay gated by the EW backstop on codec-only catalogs
   (their write sites aren't transformed; DV DELETE works). Tier 2/3 (shredded read / shredded write in EW)
-  deferred — blueprints: DuckDB in-tree + Apache.Arrow.Scalars.Variant/Operations.
+  deferred — blueprints: DuckDB in-tree + **the pinned Apache.Arrow.Scalars ships the FULL variant toolkit**
+  (`VariantBuilder`/`VariantValueWriter`/`VariantMetadataBuilder` + readers — tier 2's engine exists).
+  **Codec form VALIDATED LIVE on Fabric Spark 4.1 (fifth pass)** after one fix: EW emitted the parquet
+  `VariantType` annotation as an EMPTY thrift struct — **Spark requires `specification_version` (= 1)**
+  (generic `FAILED_READ_FILE`; kernel/DuckDB tolerate the empty form; DuckDB's writer sets it too). Isolated
+  via an A/B/C matrix on OneLake (codec+variant failed, codec+rowTracking-no-variant read fine → the
+  annotation, not encodings/row-id). With the version byte written (`MetadataEncoder` case 16), Spark reads
+  BOTH codec-written OneLake variant tables (object/null/array exact, default DV+rowTracking config
+  included). Fix recorded in EW doc/upstream-candidates.md slice 1.
 - **Delta IDENTITY columns — DONE (2026-07-06)**: the v53 generated-column marker (`id BIGINT AS (0)`) now
   works on the Delta provider (`test/verify_delta_catalog_identity.test`, 38; kernel-reads). The heavy lifting
   ALREADY EXISTED in engineered-wood (`IdentityColumn` config/metadata keys + `IdentityColumnWriter.ProcessBatch`
