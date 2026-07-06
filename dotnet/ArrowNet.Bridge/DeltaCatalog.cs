@@ -134,7 +134,8 @@ public sealed class DeltaCatalog : IBackendCatalog
     // Livy harness. Default OFF keeps the validated DV-default path untouched (no new feature declaration).
     private readonly bool _materializeRowTracking;
 
-    // ATTACH option `column_mapping 'name'|'id'` (default none): tables CREATED in this catalog enable Delta
+    // ATTACH option `column_mapping 'name'|'id'|'none'` (default NAME — Fabric-T-SQL-endpoint-compatible;
+    // the endpoint rejects id-mode tables): tables CREATED in this catalog enable Delta
     // column mapping — physical column names (col-<guid>) decoupled from logical names, so a later RENAME/DROP
     // COLUMN is a metadata-only commit. engineered-wood's CreateAsync assigns the physical names + bumps the
     // protocol (reader v2 / writer v5). Our read (physical→logical alias / EW RenameByFieldId) + write (EW codec
@@ -216,7 +217,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     }
 
     /// <summary>Parses the <c>column_mapping</c> ATTACH option for tables CREATED in this catalog (<c>'id'</c> /
-    /// <c>'name'</c> / <c>'none'</c>, case-insensitive; default None). <c>'id'</c> maps columns by the Delta
+    /// <c>'name'</c> / <c>'none'</c>, case-insensitive; default <c>name</c>). <c>'id'</c> maps columns by the Delta
     /// <c>delta.columnMapping.id</c> (== the parquet <c>field_id</c>) — the standard identity, stable across a
     /// RENAME, and what the native reader resolves via <c>parquet_schema</c> (see
     /// <see cref="DeltaNativeReader"/>). <c>'name'</c> maps by <c>physicalName</c> (col-&lt;guid&gt;). READING an
@@ -225,10 +226,13 @@ public sealed class DeltaCatalog : IBackendCatalog
     private static EngineeredWood.DeltaLake.Schema.ColumnMappingMode ParseColumnMappingOption(string? optionsJson)
     {
         var s = ParseStringOption(optionsJson, "column_mapping");
-        // Default (option absent) = ID mode: the standard column-mapping identity, so a later RENAME COLUMN is a
-        // metadata-only commit (no rewrite) out of the box. Opt out with `column_mapping 'none'` for a plain table
-        // (logical == physical name, no protocol bump — e.g. a consumer that can't read a writer-v7 table).
-        if (string.IsNullOrWhiteSpace(s)) { return EngineeredWood.DeltaLake.Schema.ColumnMappingMode.Id; }
+        // Default (option absent) = NAME mode: a later RENAME/DROP COLUMN is a metadata-only commit (no
+        // rewrite) out of the box, AND the table stays readable by the Fabric T-SQL endpoint — which REJECTS
+        // id-mode tables outright ("Unsupported column mapping mode: id"; validated live 2026-07-06) while
+        // Spark/kernel/DuckDB read both modes. Id mode remains opt-in (`column_mapping 'id'`) for its
+        // field-id-based resolution; `column_mapping 'none'` gives a plain table (logical == physical name,
+        // no protocol bump — e.g. a consumer that can't read a writer-v7 table).
+        if (string.IsNullOrWhiteSpace(s)) { return EngineeredWood.DeltaLake.Schema.ColumnMappingMode.Name; }
         return s.Trim().ToLowerInvariant() switch
         {
             "none" or "" => EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None,

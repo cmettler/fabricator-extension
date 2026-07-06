@@ -369,6 +369,14 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   DuckDB-native-written form, whose SQL NULL reads as JSON null in Spark). The Operations builder's
   OPTIONAL-field-groups deviation (spec says REQUIRED) is tolerated by ALL strict readers
   (Spark/kernel/DuckDB) — arrow-dotnet upstream-mention material, not a blocker.
+  **Fabric T-SQL endpoint verdicts (user-tested live 2026-07-06):** (a) **id-mode column mapping is
+  UNSUPPORTED** — the table doesn't even LIST (`UnsupportedColumnMappingMode`); `name`/none are fine;
+  our catalog DEFAULT is id → open decision: flip the default to 'name' for endpoint reach (name has the
+  same metadata-only RENAME/DROP). (b) struct/list columns degrade GRACEFULLY (table reads, nested
+  columns silently omitted — the endpoint projects scalars only). (c) **a VARIANT column errors the
+  ENTIRE table at footer parse** ("Msg 15813 … Thrift LogicalType that is not recognized" — their parquet
+  stack predates the VARIANT logical type; even scalar projections fail). Guidance: endpoint-reachable
+  semi-structured data → JSON (VARCHAR) columns, NOT VARIANT; VARIANT = Spark/DuckDB/kernel pipelines.
 - **Delta IDENTITY columns — DONE (2026-07-06)**: the v53 generated-column marker (`id BIGINT AS (0)`) now
   works on the Delta provider (`test/verify_delta_catalog_identity.test`, 38; kernel-reads). The heavy lifting
   ALREADY EXISTED in engineered-wood (`IdentityColumn` config/metadata keys + `IdentityColumnWriter.ProcessBatch`
@@ -1409,10 +1417,16 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   (2) `DeltaSchemaSerializer` emits `delta.columnMapping.id` as a JSON NUMBER (Delta field-id is numeric — Spark's
   `Metadata.getLong` threw "String cannot be cast to Long" on the old string form). The write rides the existing
   EW-codec `RenameToPhysical` path.
-  **COLUMN MAPPING IS NOW THE DEFAULT — `column_mapping 'id'` (default) | `'name'` | `'none'` (2026-07-05, second
-  pass).** Tables CREATED in a Delta catalog default to **id-mode column mapping**, so `ALTER TABLE … RENAME
-  COLUMN` / `DROP COLUMN` work out of the box as **metadata-only commits** (no rewrite); opt out with
-  `column_mapping 'none'` for a plain minimal-protocol table. What made the default sound:
+  **COLUMN MAPPING IS THE DEFAULT — `column_mapping 'name'` (DEFAULT since 2026-07-06) | `'id'` | `'none'`.**
+  Tables CREATED in a Delta catalog default to **name-mode column mapping**, so `ALTER TABLE … RENAME
+  COLUMN` / `DROP COLUMN` work out of the box as **metadata-only commits** (no rewrite) AND the table stays
+  readable by the **Fabric T-SQL endpoint — which REJECTS id-mode tables outright**
+  (`UnsupportedColumnMappingMode`, user-validated live 2026-07-06; Spark/kernel/DuckDB read both modes).
+  The default was `id` from 2026-07-05 until this finding; id stays opt-in for its field-id resolution.
+  Opt out with `column_mapping 'none'` for a plain minimal-protocol table.
+  (`verify_delta_catalog_column_mapping.test` asserts the name default; the explicit-id sections keep
+  id-mode coverage.) The original id-default rationale + mechanics (all mode-agnostic — physical names +
+  field_ids are written in BOTH modes):
   - **EW spec fix — id-mode files now use PHYSICAL names** (the earlier "id writes logical names" behavior was an
     EW spec violation: the Delta protocol requires physical names + parquet `field_id` in BOTH modes — Spark's
     id-mode files are `col-<guid>`+ids). `ColumnMapping.GetPhysicalName`/`BuildLogical↔PhysicalMap`/

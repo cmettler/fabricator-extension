@@ -121,17 +121,18 @@ SELECT id, label FROM im2.main.t ORDER BY id;
 statement ok
 DETACH im2;
 
-# ================= default = id mode (no option) → RENAME works out of the box =================
+# ================= default = NAME mode (no option) → RENAME works out of the box AND the table stays
+# readable by the Fabric T-SQL endpoint (which rejects id-mode tables: UnsupportedColumnMappingMode) ====
 statement ok
 ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmdefault' AS d (TYPE arrownet, PROVIDER 'delta');
 
 statement ok
 CREATE TABLE d.main.t AS SELECT i AS a, i * 10 AS b FROM range(1, 4) AS r(i);
 
-# The default catalog declares id mode (so RENAME is metadata-only).
+# The default catalog declares NAME mode (so RENAME is metadata-only + the endpoint reads it).
 query I
 SELECT count(*) FROM read_text('${ARROWNET_DELTA_WRITE_DIR}/cmdefault/t/_delta_log/00000000000000000000.json')
-WHERE replace(content, chr(92)||'u0022', '"') LIKE '%"delta.columnMapping.mode":"id"%';
+WHERE replace(content, chr(92)||'u0022', '"') LIKE '%"delta.columnMapping.mode":"name"%';
 ----
 1
 
@@ -223,7 +224,7 @@ SELECT count(DISTINCT field_id) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}
 statement ok
 DETACH nw;
 
-# ================= partitioned + mapping (default id): STREAMS via COPY PARTITION_BY (physical names) ========
+# ================= partitioned + mapping (the NAME default): STREAMS via COPY PARTITION_BY (physical names) ========
 statement ok
 ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmpart' AS pt (TYPE arrownet, PROVIDER 'delta', native_write true);
 
@@ -286,7 +287,7 @@ SELECT id, zone FROM pt2.main.sales WHERE zone = 'US' ORDER BY id;
 statement ok
 DETACH pt2;
 
-# ================= NESTED columns under mapping (default id): native_write only ==============================
+# ================= NESTED columns under mapping (the NAME default): native_write only ==============================
 statement ok
 ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmnested' AS ns (TYPE arrownet, PROVIDER 'delta', native_write true);
 
