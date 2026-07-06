@@ -1459,8 +1459,14 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   metadata commit then streamed Overwrite, kernel-validated with a full schema swap incl. nested struct) and
   `ToArrowField` (Delta→Arrow) preserves per-field metadata (the reverse of `FromArrowField`). Deliberately
   REMAINING: binary partition values (clean error — the spec byte-escape encoding is not implemented; exotic),
-  orphan DV `.bin` vacuum (we only write inline DVs — no `.bin` files to orphan), nested-field stats
-  (top-level primitives only; a write+prune-side project when a real workload needs nested skipping).
+  orphan DV `.bin` vacuum (we only write inline DVs — no `.bin` files to orphan). **Nested-field stats are
+  BUILT (EW `850ffad`):** `StatsCollector` recurses into struct leaves — spec nested JSON objects for
+  minValues/maxValues/nullCount; nullCount EXACT per leaf (parent-null OR child-null — IS NULL pruning needs
+  exactness); min/max via the flat collectors (parent-null slots can only WIDEN bounds → superset, prune-safe);
+  32-char string truncation at every level; physical-keyed at every level under mapping (the codec stats batch
+  now goes through the recursive `ToPhysical`). Applies to the EW-codec/collect + rewrite/compaction paths;
+  the streamed native COPY keeps DuckDB's `RETURN_STATS` (top-level — DuckDB reports no nested column stats;
+  a follow-up if it ever does). Kernel reads the nested-stats tables fine.
   **Closed 2026-07-06:** (a) **map-of-struct field_ids on the COPY FIELD_IDS spec** — `BuildFieldIdsSpec`
   renders map fields as `{__duckdb_field_id: id, 'key': …, 'value': …}` (+ `AppendInnerNode` recursion for
   arbitrarily deep list/map-of-struct; structural element/key/value nodes carry no id, per DuckDB); validated:
