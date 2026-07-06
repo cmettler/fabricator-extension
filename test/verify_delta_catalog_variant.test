@@ -1,0 +1,153 @@
+# name: test/verify_delta_catalog_variant.test
+# description: VARIANT columns on the Delta catalog (docs/variant-support.md). VARIANT crosses the C++<->C#
+#              Arrow boundary as the arrownet.variant single-blob transport (metadata||value) via the Arrow
+#              type extension registered at load; the data files are written/read by DuckDB's OWN parquet
+#              writer/reader (annotated variant, shredding-capable) — so variant tables REQUIRE native_read +
+#              native_write (clean gate errors otherwise). The _delta_log declares the variantType
+#              reader+writer feature (reader v3 / writer v7); delta-kernel reads the result (validated).
+#              DV DELETE works (no data rewrite); UPDATE / CoW DELETE / OPTIMIZE are gated (clean errors).
+#              Set ARROWNET_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
+# group: [mssql_net]
+
+require mssql_net
+
+require parquet
+
+require json
+
+require-env ARROWNET_DELTA_WRITE_DIR
+
+# ---- catalog with the native paths on: variant is fully supported ----
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/varcatalog' AS lake (TYPE arrownet, PROVIDER 'delta', column_mapping 'none', native_read true, native_write true);
+
+statement ok
+CREATE TABLE lake.main.vt (id INTEGER, v VARIANT);
+
+# INSERT: object, NULL, array, string, number — the full shape range crosses the boundary.
+statement ok
+INSERT INTO lake.main.vt VALUES
+  (1, {'a': 1, 'b': 'x'}::VARIANT),
+  (2, NULL),
+  (3, [1, 2, 3]::VARIANT),
+  (4, 'plain text'::VARIANT),
+  (5, 42::VARIANT);
+
+# The column comes back as a real VARIANT (bind schema from the tagged transport field).
+query I
+SELECT DISTINCT typeof(v) FROM lake.main.vt WHERE v IS NOT NULL;
+----
+VARIANT
+
+query IT
+SELECT id, v::VARCHAR FROM lake.main.vt ORDER BY id;
+----
+1	{'a': 1, 'b': x}
+2	NULL
+3	[1, 2, 3]
+4	plain text
+5	42
+
+# NULL semantics survive the crossing exactly (a NULL variant is a NULL row, not an empty value).
+query I
+SELECT id FROM lake.main.vt WHERE v IS NULL;
+----
+2
+
+# variant member access works above the scan (struct-style dot access on VARIANT).
+query I
+SELECT (v).a::INTEGER FROM lake.main.vt WHERE id = 1;
+----
+1
+
+# CTAS with a variant column (schema adopted from the SELECT).
+statement ok
+CREATE TABLE lake.main.vt2 AS SELECT id, v FROM lake.main.vt WHERE id IN (1, 3);
+
+query IT
+SELECT id, v::VARCHAR FROM lake.main.vt2 ORDER BY id;
+----
+1	{'a': 1, 'b': x}
+3	[1, 2, 3]
+
+# Appending INSERT into the existing variant table (second data file).
+statement ok
+INSERT INTO lake.main.vt VALUES (6, {'nested': {'deep': [1, 2]}}::VARIANT);
+
+query T
+SELECT v::VARCHAR FROM lake.main.vt WHERE id = 6;
+----
+{'nested': {'deep': [1, 2]}}
+
+# ---- feature declaration: the variantType reader+writer feature rides commit 0 ----
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('lake', 'vt');
+----
+3
+
+# ---- DML: DV DELETE works (bitmap only, no data-file rewrite); UPDATE is cleanly gated ----
+statement ok
+DELETE FROM lake.main.vt WHERE id = 5;
+
+query IT
+SELECT id, v::VARCHAR FROM lake.main.vt ORDER BY id;
+----
+1	{'a': 1, 'b': x}
+2	NULL
+3	[1, 2, 3]
+4	plain text
+6	{'nested': {'deep': [1, 2]}}
+
+statement error
+UPDATE lake.main.vt SET id = 9 WHERE id = 1;
+----
+UPDATE on a table with VARIANT columns is not supported yet
+
+# OPTIMIZE (compaction) is gated too — the rewrite read half would strip the annotation.
+statement error
+SELECT mssql_net_exec('lake', 'OPTIMIZE main.vt');
+----
+OPTIMIZE (compaction) on a table with VARIANT columns is not supported yet
+
+# Re-attach durability: the variant table reads back on a fresh catalog handle.
+statement ok
+DETACH lake;
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/varcatalog' AS lake2 (TYPE arrownet, PROVIDER 'delta', column_mapping 'none', native_read true, native_write true);
+
+query IT
+SELECT id, v::VARCHAR FROM lake2.main.vt ORDER BY id;
+----
+1	{'a': 1, 'b': x}
+2	NULL
+3	[1, 2, 3]
+4	plain text
+6	{'nested': {'deep': [1, 2]}}
+
+# ---- gates: a catalog WITHOUT the native paths rejects variant with actionable errors ----
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/varplain' AS plain (TYPE arrownet, PROVIDER 'delta', column_mapping 'none');
+
+statement error
+CREATE TABLE plain.main.vt (id INTEGER, v VARIANT);
+----
+VARIANT columns require the native paths
+
+# Reading an existing variant table through a codec-read catalog is rejected (not silently misread).
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/varcatalog' AS codecread (TYPE arrownet, PROVIDER 'delta', column_mapping 'none');
+
+statement error
+SELECT count(v) FROM codecread.main.vt;
+----
+native_read
+
+# change_data_feed cannot combine with variant (CDC files are codec-written).
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/varcdf' AS cdf (TYPE arrownet, PROVIDER 'delta', column_mapping 'none', native_read true, native_write true, change_data_feed true);
+
+statement error
+CREATE TABLE cdf.main.vt (id INTEGER, v VARIANT);
+----
+cannot be combined with change_data_feed

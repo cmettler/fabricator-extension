@@ -2297,6 +2297,15 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 sb.Append(Quote(field.Name)).Append(IdentityClause(profile));
                 continue;
             }
+            if (EngineeredWood.DeltaLake.Schema.SchemaConverter.IsVariantArrowField(field))
+            {
+                // A DuckDB VARIANT crosses the boundary as an arrownet.variant-tagged blob (the Delta
+                // provider's transport). Mapping it to VARBINARY would silently store opaque variant bytes —
+                // reject instead (before the arrow extension existed this failed at export with a clean error).
+                throw new NotSupportedException(
+                    $"Column '{field.Name}' is a DuckDB VARIANT — not supported by the SQL Server provider "
+                    + "(cast it to JSON/VARCHAR first, e.g. v::JSON).");
+            }
             sb.Append(Quote(field.Name)).Append(' ').Append(MapArrowToSqlType(field.DataType, profile))
               .Append(field.IsNullable ? " NULL" : " NOT NULL");
             if (defaultMap.TryGetValue(i, out var defaultValue))

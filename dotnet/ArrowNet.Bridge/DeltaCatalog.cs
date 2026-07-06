@@ -657,6 +657,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         if (spec?.At is { } at)
         {
             var atSchema = DeltaReader.GetSchemaAt(opener, path, at.Unit, at.Value);
+            ThrowIfVariantCodecRead(atSchema);
             // DuckDB may still request the virtual rowid for a time-travel scan (its count(*)-via-rowid
             // optimization). Produce it (version-aware transient rowid) so the stream matches what DuckDB asked
             // for; otherwise the rowid (BIGINT) it expects collides with the first user column (the
@@ -677,6 +678,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         }
 
         var userSchema = DeltaReader.GetSchema(opener, path);
+        ThrowIfVariantCodecRead(userSchema);
 
         // When the scan requests the virtual rowid (UPDATE/DELETE plans), stream WITH the trailing
         // _metadata.row_id column and advertise it in the schema; DuckDB maps the requested output by name.
@@ -746,6 +748,75 @@ public sealed class DeltaCatalog : IBackendCatalog
         }
     }
 
+    // ---- VARIANT gates ----
+    // A VARIANT column crosses the boundary as the tagged transport struct (arrow.parquet.variant) and its
+    // parquet layout is the annotated variant group — only DuckDB's own parquet reader/writer produce/consume
+    // that layout, so variant tables REQUIRE the native paths. The EW backstops (DeltaTable) also reject codec
+    // writes/rewrites, but gating here gives the actionable ATTACH-option error up front.
+
+    private static bool SchemaHasVariant(Schema schema)
+    {
+        foreach (var f in schema.FieldsList)
+        {
+            if (FieldHasVariant(f))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static bool FieldHasVariant(Field field)
+    {
+        if (EngineeredWood.DeltaLake.Schema.SchemaConverter.IsVariantArrowField(field))
+        {
+            return true;
+        }
+        if (field.DataType is StructType st)
+        {
+            foreach (var child in st.Fields)
+            {
+                if (FieldHasVariant(child))
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private void EnsureVariantWritable(Schema schema)
+    {
+        if (!SchemaHasVariant(schema))
+        {
+            return;
+        }
+        if (!_nativeWrite || !_nativeRead)
+        {
+            throw new System.NotSupportedException(
+                "VARIANT columns require the native paths — ATTACH the Delta catalog with "
+                + "native_write true AND native_read true (DuckDB's own parquet writer/reader handle the "
+                + "variant layout; the built-in codec cannot).");
+        }
+        if (_changeDataFeedOnCreate)
+        {
+            throw new System.NotSupportedException(
+                "VARIANT columns cannot be combined with change_data_feed true (the CDC change files are "
+                + "written by the built-in codec, which cannot emit the variant layout).");
+        }
+    }
+
+    // Called on the codec-read branch only (the native path handles variant).
+    private static void ThrowIfVariantCodecRead(Schema schema)
+    {
+        if (SchemaHasVariant(schema))
+        {
+            throw new System.NotSupportedException(
+                "Reading a table with VARIANT columns requires the native_read true ATTACH option "
+                + "(DuckDB's own parquet reader decodes the variant layout; the built-in codec cannot).");
+        }
+    }
+
     // ---- write surface (INSERT / CTAS / COPY via the streaming bulk path) ----
 
     /// <summary>Streaming bulk write (INSERT / CTAS / COPY). Runs on the bulk consumer thread; the host-FS
@@ -759,6 +830,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         var opener = Opener();
         _log.LogInformation("delta bulk {Schema}.{Table}: create={Create} replace={Replace} native_write={Native} partition_overwrite={PartOw}",
             schemaName, tableName, createTable, replace, _nativeWrite, partitionOverwrite);
+        EnsureVariantWritable(data.Schema);
         // Partition columns take effect only at table creation; an INSERT (Append) into an existing table
         // preserves the table's declared partitioning (engineered-wood reads it from the metadata).
         var spec = ResolveWriteSpec(createTable || replace ? partitionColumns : null, schemaMode);
@@ -836,8 +908,12 @@ public sealed class DeltaCatalog : IBackendCatalog
                             string? primaryKey, string? uniques, string? defaults,
                             IReadOnlyList<string>? partitionColumns, IReadOnlyList<string>? sortColumns,
                             IReadOnlyList<string>? identityColumns)
+    {
+        // Commit 0 itself is metadata-only, but a variant table is unusable without the native paths — fail
+        // the CREATE up front with the actionable ATTACH-option error rather than at the first INSERT/SELECT.
+        EnsureVariantWritable(columns);
         // sortColumns (CLUSTER BY) + identityColumns (SQL Server IDENTITY) are SQL-Server concepts — Delta ignores.
-        => DeltaWriter.Create(Opener(), TablePath(schemaName, tableName), columns, default,
+        DeltaWriter.Create(Opener(), TablePath(schemaName, tableName), columns, default,
                               deletionVectors: _deletionVectorsOnCreate,
                               inCommitTimestamps: _inCommitTimestampsOnCreate,
                               changeDataFeed: _changeDataFeedOnCreate,
@@ -845,6 +921,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                               spec: ResolveWriteSpec(partitionColumns, schemaModeArg: null),
                               materializeRowTracking: _materializeRowTracking,
                               columnMapping: _columnMappingMode);
+    }
 
     /// <summary>CREATE SCHEMA. In <c>schemas</c> mode (non-OneLake) it materializes the <c>&lt;root&gt;/&lt;schema&gt;/</c>
     /// subfolder so a subsequent CREATE TABLE lands there (and the schema is rediscovered once it holds a table).

@@ -11,6 +11,7 @@
 #include "arrownet/clr_host.hpp"
 #include "arrownet/arrownet_onelake_fs.hpp"
 #include "arrownet/arrownet_delta_mfr.hpp"
+#include "arrownet/arrownet_variant.hpp"
 #include "catalog/arrownet_catalog.hpp"
 #include "catalog/arrownet_metadata.hpp"
 #include "catalog/arrownet_schema_entry.hpp"
@@ -481,6 +482,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	RegisterArrowNetGlobalFunctions(loader); // connection-free global functions (docs/global-functions.md)
 	RegisterArrowNetOptimizer(DBConfig::GetConfig(loader.GetDatabaseInstance()));
 	RegisterArrowNetInOutFinalizer(DBConfig::GetConfig(loader.GetDatabaseInstance()));
+	// VARIANT over the Arrow C boundary: registers the arrow.parquet.variant type extension so VARIANT
+	// crosses every export/import path as the tagged transport struct (see arrownet_variant.hpp).
+	arrownet::RegisterArrowNetVariantExtension(loader.GetDatabaseInstance());
 
 	TableFunction test_scan("arrownet_test_scan", {LogicalType::VARCHAR}, arrownet::ArrowStreamScan, TestScanBind,
 	                        arrownet::ArrowStreamInitGlobal, arrownet::ArrowStreamInitLocal);

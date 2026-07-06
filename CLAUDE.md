@@ -269,12 +269,39 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   connstr-style global functions; **delta is better kept bespoke** (its host-FS-opener need is special) unless the
   global table-fn bind/execute ABI gains an opener arg (SQL fns ignore it). Build it when the 2nd lakehouse
   format/provider arrives; until then delta stays the hand-written ~60-line `arrownet_delta.cpp`.
-- **VARIANT for the Delta provider** — **design only, nothing built: [docs/variant-support.md](docs/variant-support.md)**.
-  Fabric Runtime 2.0 (Spark 4.1/Delta 4.1) supports VARIANT (experimental, Spark-experiences-only — the SQL
-  endpoint does NOT read variant tables yet); DuckDB 1.5.4 reads/writes parquet Variant natively (incl.
-  shredding); C# is a pure pass-through (no stats/partition/filter machinery needed) → native-path-gated
-  design mirroring the timestampNtz feature pattern; ONE spike first (how DuckDB exports VARIANT over the
-  Arrow C boundary; guaranteed fallback = SQL-side `variant_to_parquet_variant` conversion).
+- **VARIANT for the Delta provider — V1 BUILT (2026-07-06): [docs/variant-support.md](docs/variant-support.md)
+  §"AS BUILT"**. `CREATE TABLE lake.s.t (v VARIANT)` / CTAS / INSERT / SELECT / **DV-DELETE** work under
+  `native_read true, native_write true` (`test/verify_delta_catalog_variant.test`, 55; **delta-kernel reads
+  the result** — the unverified-kernel risk is resolved). The mechanism is NOT the planned per-operator
+  pre-cast: **one `ArrowTypeExtension` registered at load** (`src/arrownet/arrownet_variant.cpp` —
+  `RegisterArrowNetVariantExtension`; the exporter's `default:` branch consults the registry UNGATED by
+  `arrow_lossless_conversion`) makes VARIANT cross EVERY Arrow boundary transparently (bulk/CTAS/COPY
+  appenders, host-query result AND input streams — so the streaming COPY sees real VARIANT with no SQL cast —
+  scan ingest, `FetchTableColumns` bind schema). Conversions = the parquet extension's scalars via
+  `FunctionBinder`/`ExpressionExecutor` (`variant_to_parquet_variant` out / `variant_bytes_to_variant` in).
+  **Transport = ONE self-delimiting BLOB per row** (metadata bytes ++ value bytes), marker
+  **`arrownet.variant`** — NOT the canonical struct: `ArrowAppender::FinalizeChild` walks the LOGICAL type's
+  children (VARIANT = 4) against the internal-type appender (2) → a nested internal type crashes upstream
+  ("index 2 within vector of size 2"; upstream-PR candidate: use `extension_data->GetInternalType()` there);
+  a LEAF internal type (the bool8/geoarrow shape) sidesteps it. EW: `"variant"` primitive ⇄ tagged blob
+  (`SchemaConverter.VariantExtensionName`), `variantType` reader+writer feature at create + protocol upgrade
+  on ADD COLUMN/SetSchema via the generalized `UpgradeProtocolForFeatures`/`RequiredSchemaFeatures` (replaced
+  `UpgradeProtocolForTimestampNtz`), allowlists, stats leaf (nullCount only). Gates (clean errors): variant
+  requires native_read+native_write (Bridge, at CREATE/INSERT/scan), CDF-on-create rejected, EW backstops
+  reject codec data writes + CoW DELETE / **UPDATE** / **OPTIMIZE** ("would strip the VARIANT annotation" —
+  the rewrite READ half is the codec reader even under native_write; DV DELETE is exempt = works, and DV is
+  the default). Gotchas: NULL rows can arrive as VALID zero-length blobs (validity dropped in the crossing) —
+  ingest maps empty→NULL (minimal `01 00 00 00` variant-null substitution, spec-exact `v IS NULL` round-trip);
+  member access = dot `(v).a` (`variant_extract('$.a')` returns NULL in 1.5.4; `->` casts via JSON and fails);
+  DuckDB's writer SHREDS small variants by default (read-transparent). Regression: delta 39/39, SQL fn suites
+  11/11, EW 168+141. **Fabric Runtime 2.0 VALIDATED LIVE (Spark 4.1.1, both directions)**: we write
+  (`lake.dbo.arrownet_varlive`, onelake:// streaming COPY) → Spark `to_json`/`variant_get` read it exactly;
+  Spark writes (`arrownet_var_spark`, `parse_json`) → we read typed VARIANT + dot access + correct SQL-NULL.
+  One nuance: a SQL-NULL variant WE write reads in Spark as variant JSON-null (`v IS NULL` false there;
+  DuckDB reads the same file as SQL NULL — DuckDB-writer representation, not transport). The **SQL Server
+  provider REJECTS variant columns** cleanly (`BuildCreateTable` guard — else the tagged blob would silently
+  become VARBINARY; cast `v::JSON` to move variant into SQL Server). Remaining = V2 (lift UPDATE/OPTIMIZE via
+  a variant-aware native read half; list/map-nested variant is rejected at the EW schema layer).
 - **DAX / ADOMD 2nd provider** (the "one binary, many providers" goal) — **design + slices:
   [docs/dax-provider.md](docs/dax-provider.md)**. **Slice 1 DONE + validated against a live local Power BI
   Desktop instance**: new project `ArrowNet.AnalysisServices` (`DaxBackend : IBackend` provider `"dax"`,

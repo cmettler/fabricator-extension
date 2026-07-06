@@ -1,6 +1,87 @@
-# VARIANT support for the Delta provider — design (nothing built)
+# VARIANT support for the Delta provider
 
-Status: DESIGN ONLY (researched 2026-07-06). Goal: `CREATE TABLE lake.s.t (v VARIANT)` /
+Status: **V1 BUILT (2026-07-06)** — `CREATE TABLE lake.s.t (v VARIANT)` / CTAS / INSERT / SELECT /
+DV-DELETE work on the Delta folder-catalog under `native_read true, native_write true`;
+`test/verify_delta_catalog_variant.test` (55 assertions); **delta-kernel reads the result** (validated —
+the "kernel variantType support unverified" risk below is resolved). Fabric Runtime 2.0 Spark validation
+is the remaining step. See "AS BUILT" below; the design sections after it are the original research.
+
+## AS BUILT (differs from the planned design in two important ways)
+
+1. **No per-operator pre-casts, no SQL wrapping — ONE Arrow type extension.** DuckDB's Arrow export hits its
+   `default:` branch for VARIANT and consults the **`ArrowTypeExtension` registry UNCONDITIONALLY** (not
+   gated on `arrow_lossless_conversion` — verified in `arrow_converter.cpp` `SetArrowFormat`). So
+   `RegisterArrowNetVariantExtension` (`src/arrownet/arrownet_variant.cpp`, registered at extension load,
+   idempotent) makes EVERY boundary crossing transparent: bulk INSERT/CTAS/COPY appenders, host-query result
+   streams, create-table schema export, scan ingest, the catalog bind schema (`FetchTableColumns` →
+   `PopulateArrowTableSchema` is registry-aware), and the host-query INPUT stream import (so the streaming
+   COPY sees real VARIANT with no cast in the SQL). The conversions delegate to the parquet extension's
+   scalars via `FunctionBinder`+`ExpressionExecutor` (parquet is statically linked; no parquet internals
+   linked): `variant_to_parquet_variant(v)` out, `variant_bytes_to_variant(blob)` in.
+2. **The transport is ONE self-delimiting BLOB per row (`arrownet.variant`), NOT the canonical
+   `arrow.parquet.variant` struct.** The value = parquet-variant metadata bytes immediately followed by the
+   value bytes (the metadata header is self-delimiting — exactly the byte form `variant_bytes_to_variant`
+   consumes). Reason: **upstream appender bug** — `ArrowAppender::Finalize`/`FinalizeChild` passes the
+   LOGICAL type (VARIANT, whose struct info has 4 children: keys/children/values/data) to the child
+   appender's finalize, which walks those children against the appender initialized for the INTERNAL type →
+   a NESTED internal type (the canonical `struct<metadata,value>`) crashes with "Attempted to access index 2
+   within vector of size 2". No built-in extension has a nested internal type (bool8/geoarrow/bignum are all
+   leaves), so a LEAF internal type sidesteps the bug entirely. Upstream-PR candidate: `FinalizeChild` should
+   use `append_data.extension_data->GetInternalType()` when set. The EW/C# marker is
+   `SchemaConverter.VariantExtensionName = "arrownet.variant"` (field metadata `ARROW:extension:name`).
+
+Other findings from the build:
+- **NULL variant rows**: the parquet binary decoder rejects an empty metadata buffer outright (does not
+  consult validity), and a NULL row can arrive at the ingest conversion as a VALID zero-length blob
+  (validity dropped somewhere in the C# crossing). The ingest substitutes the minimal valid "variant null"
+  encoding (`01 00 00 00`) for null/empty rows and re-invalidates them after conversion — NULL semantics
+  round-trip exactly (`v IS NULL` works).
+- **`variant_extract(v, '$.a')` returns NULL** in 1.5.4; struct-style dot access `(v).a` works. The `->`
+  operator casts via JSON and fails on the VARIANT repr.
+- The DuckDB parquet writer **shreds** small variants by default (`typed_value` columns appear); reads are
+  shredding-transparent via `read_parquet`.
+- `PARQUET_VARIANT` (the transform's return alias) blocks `struct_extract`/dot access on its result — the
+  alias prevents the STRUCT function match. Irrelevant to the blob transport, but a trap for SQL-side use.
+
+EW/Delta layer (as planned): schema type `"variant"` ⇄ tagged blob in `SchemaConverter` (marker stripped
+from Delta metadata like `PARQUET:*`); `variantType` reader+writer feature at create + on
+`AddColumnAsync`/`SetSchemaAsync` via the generalized `UpgradeProtocolForFeatures`/`RequiredSchemaFeatures`
+(replacing `UpgradeProtocolForTimestampNtz`); `ProtocolVersions` allowlists; `StatsCollector` treats a
+variant field as a LEAF (nullCount only — automatic for the blob transport, guarded anyway).
+
+Gates (clean errors): Bridge `DeltaCatalog` — CREATE/CTAS/INSERT with variant require
+`native_write true` AND `native_read true`; `change_data_feed true` rejected at CREATE (CDC files are
+codec-written); codec-path reads of a variant table rejected ("requires native_read"). EW backstops
+(`DeltaTable`) — codec parquet write on a variant schema throws; `DeleteByRowIdsAsync` (copy-on-write),
+`UpdateByRowIdsAsync`, `CompactAsync` throw ("would strip the parquet VARIANT annotation" — the rewrite
+READ half is the codec reader even under native_write). **DV DELETE works** (bitmap-only, no data rewrite —
+and DV is the catalog default). Lifting UPDATE/OPTIMIZE needs a variant-aware read half (the native
+rewriter path, clean-shape-gated in EW) — follow-up.
+
+**Fabric Runtime 2.0 validation — DONE (2026-07-06, live, both directions).** Workspace `Test` / lakehouse
+`LH` runs **Spark 4.1.1**; `scratchpad/sparkprobe variant`:
+- **We write → Spark reads**: `lake.dbo.arrownet_varlive` (native_write streaming COPY over `onelake://`,
+  object / NULL / array / string rows) — Spark `to_json(v)` returns `{"a":1,"b":"x"}` / `[1,2,3]` /
+  `"plain"` exactly, and `variant_get(v, '$.a', 'int')` = 1.
+- **Spark writes → we read**: `arrownet_var_spark` (`CREATE TABLE … (v VARIANT) USING delta` +
+  `parse_json` inserts) — our provider reads it typed VARIANT with dot access (`(v).x` = 10) and correct
+  SQL-NULL semantics (`v IS NULL` matches Spark's NULL row).
+- **Known NULL nuance (one direction)**: a SQL-NULL variant WE write reads in Spark as a **variant
+  JSON-null value** (`to_json` = `"null"`, `v IS NULL` = false), while DuckDB reads the same file back as
+  SQL NULL — DuckDB's parquet writer's representation choice for null variants, not a transport bug
+  (Spark's own SQL-NULL row round-trips as SQL NULL through us). Revisit only if it bites a consumer.
+
+Also: the **SQL Server provider rejects variant columns** with a clean error (`BuildCreateTable` — before
+the arrow extension existed a VARIANT CTAS failed at export; without the guard it would now silently map
+the tagged blob to VARBINARY). Cast to JSON/VARCHAR to move variant data into SQL Server.
+
+Remaining: V2 per below (lift UPDATE/OPTIMIZE via a variant-aware native read half; list/map-nested
+variant; EW-codec write annotation).
+
+---
+
+The sections below are the ORIGINAL design/research (kept for context; superseded where the AS BUILT
+section says otherwise). Goal: `CREATE TABLE lake.s.t (v VARIANT)` /
 CTAS / INSERT / SELECT on the Delta folder-catalog, Spark-4.1-interoperable.
 
 ## Landscape (verified)
