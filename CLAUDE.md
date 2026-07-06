@@ -1454,8 +1454,13 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   Verified: repro trio (all-null / mixed / no-null structs) reads in DuckDB; struct UPDATE round-trips +
   kernel-reads on both writers; `verify_delta_catalog_column_mapping` 232 assertions; full delta suite 35/35 +
   SQL suites; EW's own parquet test suite.
-  **Known limitations**: a mapping REPLACE that CHANGES the schema still collects (SetSchema fresh-id
-  re-assign must precede the COPY; one-shot admin op); `ToArrowField` (Delta→Arrow) still drops metadata.
+  **Known limitations (2026-07-06 wrap-up):** a mapping REPLACE that CHANGES the schema now STREAMS
+  (`TryWriteStreaming` adopts the new schema via `SetSchemaAsync` BEFORE building the maps/FIELD_IDS/COPY —
+  metadata commit then streamed Overwrite, kernel-validated with a full schema swap incl. nested struct) and
+  `ToArrowField` (Delta→Arrow) preserves per-field metadata (the reverse of `FromArrowField`). Deliberately
+  REMAINING: binary partition values (clean error — the spec byte-escape encoding is not implemented; exotic),
+  orphan DV `.bin` vacuum (we only write inline DVs — no `.bin` files to orphan), nested-field stats
+  (top-level primitives only; a write+prune-side project when a real workload needs nested skipping).
   **Closed 2026-07-06:** (a) **map-of-struct field_ids on the COPY FIELD_IDS spec** — `BuildFieldIdsSpec`
   renders map fields as `{__duckdb_field_id: id, 'key': …, 'value': …}` (+ `AppendInnerNode` recursion for
   arbitrarily deep list/map-of-struct; structural element/key/value nodes carry no id, per DuckDB); validated:

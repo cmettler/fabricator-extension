@@ -572,6 +572,19 @@ internal static class DeltaWriter
             {
                 return null;
             }
+            // A REPLACE that CHANGES a mapping table's schema: adopt the new schema FIRST (SetSchemaAsync's
+            // mapping branch assigns fresh field ids — sound because the paired Overwrite removes the old
+            // files), so the maps / FIELD_IDS / COPY below are built from the NEW schema and the write can
+            // STREAM (previously this shape fell back to the collect path). Metadata-only commit; the same
+            // two-commit shape the collect path used.
+            if (mode == DeltaWriteMode.Overwrite
+                && EngineeredWood.DeltaLake.Schema.ColumnMapping.GetMode(
+                       table.CurrentSnapshot.Metadata.Configuration)
+                   != EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None
+                && !SameLogicalColumns(table.ArrowSchema, data.Schema))
+            {
+                table.SetSchemaAsync(data.Schema, default).AsTask().GetAwaiter().GetResult();
+            }
             var partCols = table.CurrentSnapshot.Metadata.PartitionColumns;
             var mappingMode = EngineeredWood.DeltaLake.Schema.ColumnMapping.GetMode(
                 table.CurrentSnapshot.Metadata.Configuration);
@@ -634,13 +647,8 @@ internal static class DeltaWriter
                     // (metadata-only, no-op if identical), then the commit's removes drop the old files.
                     table.SetSchemaAsync(data.Schema, default).AsTask().GetAwaiter().GetResult();
                 }
-                else if (!SameLogicalColumns(table.ArrowSchema, data.Schema))
-                {
-                    // A REPLACE that CHANGES a mapping table's schema needs fresh field-id assignment
-                    // (SetSchemaAsync's mapping branch) AND the maps above recomputed — keep that on the collect
-                    // path. A fresh CTAS / same-shape replace streams (the maps already match).
-                    return null;
-                }
+                // (a schema-changing mapping REPLACE already adopted the new schema above, so the maps
+                // match; nothing further to do here)
             }
 
             // RETURN_STATS gives per-file row count + byte size + the Delta stats JSON (min/max/nullCount, typed by
