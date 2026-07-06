@@ -349,6 +349,26 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   annotation, not encodings/row-id). With the version byte written (`MetadataEncoder` case 16), Spark reads
   BOTH codec-written OneLake variant tables (object/null/array exact, default DV+rowTracking config
   included). Fix recorded in EW doc/upstream-candidates.md slice 1.
+  **Sixth pass — FULL SHREDDING for the EW codec (tiers 2+3, `verify_delta_catalog_variant.test` 133).**
+  The entire engine came from **`Apache.Arrow.Operations` 23.0.0 (published nuget, now referenced by EW
+  DeltaLake.Table)**: `ShredSchemaInferer` (per-file schema from the column's values), `VariantShredder`
+  (rows → typed+residual with a SHARED metadata dictionary so residual field-name refs stay valid),
+  `ShreddedVariantArrayBuilder` (the shredded Arrow storage), and
+  `VariantArrayShreddingExtensions.GetLogicalVariantValue` (per-row reassembly of ANY spec layout).
+  `VariantTransport` now: WRITE = parse blobs → infer → shred when a schema applies (uniform
+  objects/primitives/arrays; mixed stays unshredded; **SQL-null rows re-applied as storage VALIDITY** after
+  the builder — distinct from variant JSON null); READ = `typed_value` present (or no `value` column) →
+  `GetLogicalVariantValue` + `VariantBuilder.Encode` per row (passthrough concat kept for unshredded).
+  **Cross-validated: DuckDB native, delta-kernel AND raw `read_parquet` all decode the codec-SHREDDED file
+  exactly** (incl. the residual-merge row with an extra field), and the codec reads DuckDB-native-shredded
+  tables — the cross-codec matrix is now FULL (both write both forms' semantics, both read everything).
+  **Spark VALIDATED LIVE on the codec-SHREDDED form** (`lake.dbo.arrownet_varshred`, sparkprobe
+  `variantshred`): all rows exact via `to_json` incl. the residual merge; `variant_get` on a SHREDDED
+  field works (Spark exploits the typed columns); and the SQL NULL round-trips as TRUE SQL NULL
+  (`WHERE v IS NULL` matches — the storage-validity null; NOTE this is BETTER than the unshredded
+  DuckDB-native-written form, whose SQL NULL reads as JSON null in Spark). The Operations builder's
+  OPTIONAL-field-groups deviation (spec says REQUIRED) is tolerated by ALL strict readers
+  (Spark/kernel/DuckDB) — arrow-dotnet upstream-mention material, not a blocker.
 - **Delta IDENTITY columns — DONE (2026-07-06)**: the v53 generated-column marker (`id BIGINT AS (0)`) now
   works on the Delta provider (`test/verify_delta_catalog_identity.test`, 38; kernel-reads). The heavy lifting
   ALREADY EXISTED in engineered-wood (`IdentityColumn` config/metadata keys + `IdentityColumnWriter.ProcessBatch`

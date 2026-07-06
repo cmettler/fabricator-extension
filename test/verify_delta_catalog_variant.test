@@ -163,17 +163,20 @@ ATTACH '${ARROWNET_DELTA_WRITE_DIR}/varplain' AS plain (TYPE arrownet, PROVIDER 
 statement ok
 CREATE TABLE plain.main.vt (id INTEGER, v VARIANT);
 
-# Cross-codec reads: the codec reader handles UNSHREDDED variant groups; DuckDB's native writer SHREDS
-# small variants by default (typed_value columns), which the codec cannot reassemble — reading the
-# natively-written table through a codec-only catalog is a clean error, not a misread. (The reverse —
-# native reading a codec-written table — always works: the codec writes unshredded.)
+# Cross-codec reads: the codec reader reassembles ANY spec layout — including the SHREDDED files
+# DuckDB's native writer produces by default (typed_value columns merged with residual bytes via
+# Apache.Arrow.Operations) — so a codec-only catalog reads the natively-written table exactly.
 statement ok
 ATTACH '${ARROWNET_DELTA_WRITE_DIR}/varcatalog' AS codecread (TYPE arrownet, PROVIDER 'delta', column_mapping 'none');
 
-statement error
+query IT
 SELECT id, v::VARCHAR FROM codecread.main.vt ORDER BY id;
 ----
-SHREDDED variant
+2	NULL
+3	NULL
+4	{'replaced': true}
+6	{'nested': {'deep': [1, 2]}}
+9	{'a': 1, 'b': x}
 
 # ---- pure codec path (no native flags): engineered-wood WRITES the annotated variant group too ----
 statement ok
@@ -207,6 +210,38 @@ statement error
 UPDATE codecrw.main.cvt SET id = 9 WHERE id = 1;
 ----
 not supported yet
+
+# ---- codec SHREDDING: a uniform column shreds on write (typed_value columns = the data-skipping form
+# spec readers exploit); an extra field rides the residual and merges back exactly on read.
+statement ok
+CREATE TABLE codecrw.main.shred AS SELECT * FROM (VALUES
+  (1, {'a': 10, 'b': 'x'}::VARIANT),
+  (2, {'a': 20, 'b': 'y'}::VARIANT),
+  (3, NULL::VARIANT),
+  (4, {'a': 40, 'b': 'z', 'extra': [1, 2]}::VARIANT)) t(id, v);
+
+query ITI
+SELECT id, v::VARCHAR, v IS NULL FROM codecrw.main.shred ORDER BY id;
+----
+1	{'a': 10, 'b': x}	false
+2	{'a': 20, 'b': y}	false
+3	NULL	true
+4	{'a': 40, 'b': z, 'extra': [1, 2]}	false
+
+# The file really is shredded (typed_value columns present in the parquet).
+query I
+SELECT count(*) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/varcodec/shred/*.parquet') WHERE name = 'typed_value';
+----
+3
+
+# DuckDB's own variant decode (read_parquet) agrees with the codec's shredded layout.
+query IT
+SELECT id, v::VARCHAR FROM read_parquet('${ARROWNET_DELTA_WRITE_DIR}/varcodec/shred/*.parquet') ORDER BY id;
+----
+1	{'a': 10, 'b': x}
+2	{'a': 20, 'b': y}
+3	NULL
+4	{'a': 40, 'b': z, 'extra': [1, 2]}
 
 # change_data_feed cannot combine with variant (CDC files are codec-written).
 statement ok
