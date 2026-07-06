@@ -390,22 +390,27 @@ internal static class DeltaReader
     /// <summary>Deletes the rows whose transient <c>_metadata.row_id</c> is in <paramref name="rowIds"/>
     /// (deletion vectors). Returns the number of rows deleted.</summary>
     public static long DeleteByRowIds(nint opener, string path, IReadOnlyCollection<long> rowIds,
-                                      CancellationToken ct, bool nativeWrite = false)
+                                      CancellationToken ct, bool nativeWrite = false, bool nativeRead = false)
     {
         var fs = TableFileSystems.Create(opener, path);
         // Open with the standard WRITE options (OmitPathInSchema=false) so the copy-on-write rewrite emits
         // standard-readable parquet — DeltaTableOptions.Default would drop path_in_schema (TProtocolException).
         // native_write => DuckDB's parquet writer produces the rewritten survivor file (bloom/stats/footer) AND
         // DuckDB's read_parquet reads the source + drops the deleted positions (the rewriter, retiring the
-        // engineered-wood reader for the clean shape). engineered-wood still selects the affected files, computes
-        // stats, and commits remove(old)+add(new).
+        // engineered-wood reader for the clean shape). native_read => the FALLBACK read half (shapes the rewriter
+        // is gated off for) also decodes through read_parquet (the IDataFileReader seam — variant-preserving).
+        // engineered-wood still selects the affected files, computes stats, and commits remove(old)+add(new).
         var writer = nativeWrite && NativeParquetDataFileWriter.Available
             ? new NativeParquetDataFileWriter(path)
             : null;
         var rewriter = nativeWrite && NativeParquetDataFileRewriter.Available
             ? new NativeParquetDataFileRewriter(path, GetSchema(opener, path))
             : null;
-        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(dataFileWriter: writer, dataFileRewriter: rewriter), ct)
+        var fileReader = nativeRead && NativeParquetDataFileReader.Available
+            ? new NativeParquetDataFileReader(path)
+            : null;
+        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(dataFileWriter: writer, dataFileRewriter: rewriter,
+                                                                 dataFileReader: fileReader), ct)
             .AsTask().GetAwaiter().GetResult();
         try
         {
@@ -809,15 +814,21 @@ internal static class DeltaReader
     /// EXCLUDING deletion-vector-deleted rows (so it also materializes DV deletions). Returns 0 (not row-affecting).
     /// Compaction re-assigns row-tracking baseRowIds (stable-id preservation across compaction needs materialized
     /// row-id columns — a separate slice); the DATA is correct.</summary>
-    public static long Optimize(nint opener, string path, CancellationToken ct, bool nativeWrite = false)
+    public static long Optimize(nint opener, string path, CancellationToken ct, bool nativeWrite = false,
+                                bool nativeRead = false)
     {
         var fs = TableFileSystems.Create(opener, path);
         // native_write => DuckDB's parquet writer produces the compacted files (bloom/stats/footer), so an
         // OPTIMIZE keeps the native-write quality instead of reverting to the engineered-wood codec.
+        // native_read => the compaction READ half decodes the candidate files through read_parquet too
+        // (the IDataFileReader seam) — with the writer, compaction preserves the variant annotation.
         var writer = nativeWrite && NativeParquetDataFileWriter.Available
             ? new NativeParquetDataFileWriter(path)
             : null;
-        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(dataFileWriter: writer), ct)
+        var fileReader = nativeRead && NativeParquetDataFileReader.Available
+            ? new NativeParquetDataFileReader(path)
+            : null;
+        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(dataFileWriter: writer, dataFileReader: fileReader), ct)
             .AsTask().GetAwaiter().GetResult();
         try
         {
@@ -860,19 +871,23 @@ internal static class DeltaReader
     /// them as plain remove+add with a clean schema. Opens with the standard write options (path_in_schema).</summary>
     public static void UpdateByRowIds(nint opener, string path, IReadOnlyCollection<long> rowIds,
         System.Func<long, IReadOnlyList<RecordBatch>, IReadOnlyList<RecordBatch>> rewriteFile, CancellationToken ct,
-        bool nativeWrite = false, IDataFileRewriter? rewriter = null)
+        bool nativeWrite = false, IDataFileRewriter? rewriter = null, bool nativeRead = false)
     {
         var fs = TableFileSystems.Create(opener, path);
         // native_write => DuckDB's parquet writer produces the rewritten file (bloom/stats/footer) AND, when the
         // caller supplied a rewriter, DuckDB's read_parquet reads the source + applies the SET substitution via a
         // LEFT JOIN (retiring the in-process BuildArray). EW still selects the affected files, computes stats, and
         // commits remove(old)+add(new). Without a rewriter (unsupported shape) EW reads + the rewriteFile callback
-        // applies the substitution in-process.
+        // applies the substitution in-process — native_read routes THAT read through read_parquet too (the
+        // IDataFileReader seam), which also feeds the merge-on-read matched-row reads.
         var writer = nativeWrite && NativeParquetDataFileWriter.Available
             ? new NativeParquetDataFileWriter(path)
             : null;
+        var fileReader = nativeRead && NativeParquetDataFileReader.Available
+            ? new NativeParquetDataFileReader(path)
+            : null;
         var table = DeltaTable.OpenAsync(fs,
-                DeltaWriter.Options(dataFileWriter: writer, dataFileRewriter: rewriter), ct)
+                DeltaWriter.Options(dataFileWriter: writer, dataFileRewriter: rewriter, dataFileReader: fileReader), ct)
             .AsTask().GetAwaiter().GetResult();
         try
         {

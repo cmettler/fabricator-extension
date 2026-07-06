@@ -300,8 +300,35 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   One nuance: a SQL-NULL variant WE write reads in Spark as variant JSON-null (`v IS NULL` false there;
   DuckDB reads the same file as SQL NULL — DuckDB-writer representation, not transport). The **SQL Server
   provider REJECTS variant columns** cleanly (`BuildCreateTable` guard — else the tagged blob would silently
-  become VARBINARY; cast `v::JSON` to move variant into SQL Server). Remaining = V2 (lift UPDATE/OPTIMIZE via
-  a variant-aware native read half; list/map-nested variant is rejected at the EW schema layer).
+  become VARBINARY; cast `v::JSON` to move variant into SQL Server). **V2 DONE — UPDATE/CoW-DELETE/OPTIMIZE
+  LIFTED via the `IDataFileReader` codec seam** (docs/variant-support.md §"AS BUILT" second pass): EW gained
+  the read-side counterpart of `IDataFileWriter` (`DeltaTableOptions.DataFileReader` — RAW physical batches
+  in FILE ORDER, DV rows included; `ReadFileAsync` + `CompactionExecutor` route through it; the per-batch
+  pipeline extracted as `ProcessFileBatchesAsync`); Bridge `NativeParquetDataFileReader` = `read_parquet(...,
+  file_row_number => true) ORDER BY file_row_number` (explicit order — positions are correctness), wired on
+  `native_read` into DeleteByRowIds/UpdateByRowIds/Optimize. With BOTH seams the EW variant gates return
+  early → variant UPDATE (incl. SET of the variant value — `BuildArray` Binary case + the rewriter
+  update-view keeps the marker metadata so the bound view types as VARIANT) + CoW DELETE + OPTIMIZE all work,
+  kernel-validated post-DML (`verify_delta_catalog_variant.test` 72). **Crux fix: the clean-rebuild before
+  every rewrite (`DeltaTable.CleanField`, 4 sites) now preserves `ARROW:extension:*` metadata** — it stripped
+  ALL metadata, which would silently drop the variant tag on any rewrite. Seam caveat: id-mode projection
+  under the seam resolves by physical NAME (field-id resolution needs the parquet footer the seam hides —
+  exact for spec-written files). Regression: delta 39/39 + EW 141/168 green. Remaining: list/map-nested
+  variant rejected at the EW schema layer; mapped-variant tables untested (tests pin `column_mapping 'none'`).
+- **Delta IDENTITY columns — DONE (2026-07-06)**: the v53 generated-column marker (`id BIGINT AS (0)`) now
+  works on the Delta provider (`test/verify_delta_catalog_identity.test`, 38; kernel-reads). The heavy lifting
+  ALREADY EXISTED in engineered-wood (`IdentityColumn` config/metadata keys + `IdentityColumnWriter.ProcessBatch`
+  per-batch generation + same-commit `delta.identity.highWaterMark` update in `WriteCoreAsync`;
+  `SupportsExternalDataFileCommit=false` for identity tables → the streaming COPY path falls back to collect,
+  which under `native_write` STILL emits native parquet via the `IDataFileWriter` seam) — only two pieces were
+  missing: (1) EW `CreateAsync` now declares the **`identityColumns` writer feature** (writer-only, v7 list)
+  when the schema carries `delta.identity.*` metadata; (2) Bridge `DeltaCatalog.CreateTable` attaches
+  `IdentityColumn.CreateMetadata(1,1,false)` (GENERATED ALWAYS) to the marked fields (previously ignored;
+  kept nullable=true DuckDB-side — the INSERT stream carries NULLs that ProcessBatch replaces). Values
+  continue across statements + re-attach (hwm in schema metadata); an explicit NULL is engine-assigned.
+  **OCC retry is SAFE for identity appends** (better than Spark, which rejects concurrent identity txns):
+  the retry reopens at the new version and ProcessBatch REGENERATES from the fresh snapshot's high-water
+  mark (input batches unmutated) — no baked-values problem, no special-casing needed.
 - **DAX / ADOMD 2nd provider** (the "one binary, many providers" goal) — **design + slices:
   [docs/dax-provider.md](docs/dax-provider.md)**. **Slice 1 DONE + validated against a live local Power BI
   Desktop instance**: new project `ArrowNet.AnalysisServices` (`DaxBackend : IBackend` provider `"dax"`,

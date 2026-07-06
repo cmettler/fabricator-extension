@@ -912,7 +912,42 @@ public sealed class DeltaCatalog : IBackendCatalog
         // Commit 0 itself is metadata-only, but a variant table is unusable without the native paths — fail
         // the CREATE up front with the actionable ATTACH-option error rather than at the first INSERT/SELECT.
         EnsureVariantWritable(columns);
-        // sortColumns (CLUSTER BY) + identityColumns (SQL Server IDENTITY) are SQL-Server concepts — Delta ignores.
+        // sortColumns (CLUSTER BY) is a SQL-Server-warehouse concept — Delta ignores it.
+        // identityColumns (the DuckDB `AS (0)` generated-column marker, v53): Delta has NATIVE identity —
+        // attach delta.identity.* metadata (start 1, step 1, GENERATED ALWAYS) to the marked fields.
+        // engineered-wood does the rest: the identityColumns writer feature at create, per-batch value
+        // generation on every write (IdentityColumnWriter.ProcessBatch), and the highWaterMark update in the
+        // SAME commit. Streaming falls back to the collect path for identity tables
+        // (SupportsExternalDataFileCommit=false), which under native_write still emits native parquet via the
+        // IDataFileWriter seam. An OCC-retried append REGENERATES values from the fresh snapshot's high-water
+        // mark (the input batches are not mutated), so concurrent identity appends are safe — unlike Spark,
+        // which rejects concurrent transactions on identity tables outright.
+        if (identityColumns is { Count: > 0 })
+        {
+            var idSet = new HashSet<string>(identityColumns, System.StringComparer.OrdinalIgnoreCase);
+            var withIdentity = new List<Field>(columns.FieldsList.Count);
+            foreach (var f in columns.FieldsList)
+            {
+                if (idSet.Contains(f.Name))
+                {
+                    var meta = new Dictionary<string, string>(
+                        EngineeredWood.DeltaLake.Schema.IdentityColumn.CreateMetadata(
+                            start: 1, step: 1, allowExplicitInsert: false));
+                    if (f.Metadata is { } src)
+                    {
+                        foreach (var kv in src) { meta[kv.Key] = kv.Value; }
+                    }
+                    // Keep nullable=true on the DuckDB-facing schema: the INSERT stream carries NULLs for the
+                    // engine-assigned column (ProcessBatch replaces them); files never actually hold nulls.
+                    withIdentity.Add(new Field(f.Name, f.DataType, nullable: true, meta));
+                }
+                else
+                {
+                    withIdentity.Add(f);
+                }
+            }
+            columns = new Schema(withIdentity, columns.Metadata);
+        }
         DeltaWriter.Create(Opener(), TablePath(schemaName, tableName), columns, default,
                               deletionVectors: _deletionVectorsOnCreate,
                               inCommitTimestamps: _inCommitTimestampsOnCreate,
@@ -1009,7 +1044,7 @@ public sealed class DeltaCatalog : IBackendCatalog
             !dvMode && _nativeWrite);
         return dvMode
             ? DeltaReader.DeleteByRowIdsViaVectors(opener, path, ids, default)
-            : DeltaReader.DeleteByRowIds(opener, path, ids, default, _nativeWrite);
+            : DeltaReader.DeleteByRowIds(opener, path, ids, default, _nativeWrite, _nativeRead);
     }
 
     public IArrowArrayStream ExecuteQuery(string sql) => throw Unsupported("raw query");
@@ -1038,7 +1073,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         {
             case "OPTIMIZE":
                 _log.LogInformation("delta exec OPTIMIZE {Schema}.{Table} native_write={Native}", schema, table, _nativeWrite);
-                return DeltaReader.Optimize(opener, path, default, _nativeWrite);
+                return DeltaReader.Optimize(opener, path, default, _nativeWrite, _nativeRead);
             case "VACUUM":
             {
                 bool dryRun = HasToken(tokens, "DRY");
@@ -1196,7 +1231,9 @@ public sealed class DeltaCatalog : IBackendCatalog
                 {
                     var field = setSlotField[j];
                     batchArrays.Add(BuildArray(field.DataType, colVals[j]));
-                    batchFields.Add(new Field(field.Name, field.DataType, nullable: true));
+                    // Keep the field metadata: the arrownet.variant transport marker types the bound view's
+                    // column as VARIANT in the host engine (else the CASE substitution mismatches BLOB/VARIANT).
+                    batchFields.Add(new Field(field.Name, field.DataType, nullable: true, field.Metadata));
                 }
                 var batchSchema = new Apache.Arrow.Schema(batchFields, null);
                 updatesByOrdinal[ord] = new RecordBatch(batchSchema, batchArrays, rows.Count);
@@ -1239,7 +1276,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 outBatches.Add(new RecordBatch(userSchema, newCols, batch.Length));
             }
             return outBatches;
-        }, default, _nativeWrite, rewriter);
+        }, default, _nativeWrite, rewriter, _nativeRead);
 
         _log.LogInformation("delta update {Schema}.{Table}: rows={Rows} set_cols={SetCols} native_write={Native}",
             schemaName, tableName, updates.Count, setColNames.Count, _nativeWrite);
@@ -1266,6 +1303,8 @@ public sealed class DeltaCatalog : IBackendCatalog
             case DoubleType: { var b = new DoubleArray.Builder(); foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append((double)v); } return b.Build(); }
             case Decimal128Type d: { var b = new Decimal128Array.Builder(d); foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append((decimal)v); } return b.Build(); }
             case StringType: { var b = new StringArray.Builder(); foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append((string)v); } return b.Build(); }
+            // BLOB — incl. the arrownet.variant transport (a VARIANT SET value crosses as its blob form).
+            case BinaryType: { var b = new BinaryArray.Builder(); foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append(((byte[])v).AsSpan()); } return b.Build(); }
             case Date32Type: { var b = new Date32Array.Builder(); foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append(System.DateOnly.FromDateTime((System.DateTime)v)); } return b.Build(); }
             case TimestampType ts: { var b = new TimestampArray.Builder(ts); foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append(v is System.DateTimeOffset dto ? dto : new System.DateTimeOffset(System.DateTime.SpecifyKind((System.DateTime)v, System.DateTimeKind.Utc))); } return b.Build(); }
             case Apache.Arrow.Types.StructType st:

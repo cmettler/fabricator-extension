@@ -85,7 +85,7 @@ SELECT count(*) FROM arrownet_delta_snapshots('lake', 'vt');
 ----
 3
 
-# ---- DML: DV DELETE works (bitmap only, no data-file rewrite); UPDATE is cleanly gated ----
+# ---- DML: with BOTH native seams (read_parquet decodes + COPY encodes) the full DML surface works ----
 statement ok
 DELETE FROM lake.main.vt WHERE id = 5;
 
@@ -98,16 +98,47 @@ SELECT id, v::VARCHAR FROM lake.main.vt ORDER BY id;
 4	plain text
 6	{'nested': {'deep': [1, 2]}}
 
-statement error
+# UPDATE of a NON-variant column on a variant table: the variant column passes through the rewrite
+# (merge-on-read post-image under the DV default) with its annotation intact.
+statement ok
 UPDATE lake.main.vt SET id = 9 WHERE id = 1;
-----
-UPDATE on a table with VARIANT columns is not supported yet
 
-# OPTIMIZE (compaction) is gated too — the rewrite read half would strip the annotation.
-statement error
-SELECT mssql_net_exec('lake', 'OPTIMIZE main.vt');
+query IT
+SELECT id, v::VARCHAR FROM lake.main.vt WHERE id = 9;
 ----
-OPTIMIZE (compaction) on a table with VARIANT columns is not supported yet
+9	{'a': 1, 'b': x}
+
+# UPDATE of the variant VALUE itself (the SET value crosses as the transport blob and is substituted).
+statement ok
+UPDATE lake.main.vt SET v = {'replaced': true}::VARIANT WHERE id = 4;
+
+query IT
+SELECT id, v::VARCHAR FROM lake.main.vt WHERE id = 4;
+----
+4	{'replaced': true}
+
+# UPDATE variant to NULL and back.
+statement ok
+UPDATE lake.main.vt SET v = NULL WHERE id = 3;
+
+query I
+SELECT count(*) FROM lake.main.vt WHERE v IS NULL;
+----
+2
+
+# OPTIMIZE (compaction): the read half decodes through read_parquet, the write half through COPY —
+# the annotation survives the bin-pack; deleted/updated state is preserved.
+statement ok
+SELECT mssql_net_exec('lake', 'OPTIMIZE main.vt');
+
+query IT
+SELECT id, v::VARCHAR FROM lake.main.vt ORDER BY id;
+----
+2	NULL
+3	NULL
+4	{'replaced': true}
+6	{'nested': {'deep': [1, 2]}}
+9	{'a': 1, 'b': x}
 
 # Re-attach durability: the variant table reads back on a fresh catalog handle.
 statement ok
@@ -119,11 +150,11 @@ ATTACH '${ARROWNET_DELTA_WRITE_DIR}/varcatalog' AS lake2 (TYPE arrownet, PROVIDE
 query IT
 SELECT id, v::VARCHAR FROM lake2.main.vt ORDER BY id;
 ----
-1	{'a': 1, 'b': x}
 2	NULL
-3	[1, 2, 3]
-4	plain text
+3	NULL
+4	{'replaced': true}
 6	{'nested': {'deep': [1, 2]}}
+9	{'a': 1, 'b': x}
 
 # ---- gates: a catalog WITHOUT the native paths rejects variant with actionable errors ----
 statement ok

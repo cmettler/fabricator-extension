@@ -368,7 +368,8 @@ internal static class DeltaWriter
     /// row-group size / bloom-filter columns) from the ATTACH options + the <c>delta_write_options</c> setting.</summary>
     internal static DeltaTableOptions Options(DeltaWriteSpec? spec = null,
                                               IDataFileWriter? dataFileWriter = null,
-                                              IDataFileRewriter? dataFileRewriter = null) => DeltaTableOptions.Default with
+                                              IDataFileRewriter? dataFileRewriter = null,
+                                              IDataFileReader? dataFileReader = null) => DeltaTableOptions.Default with
     {
         ParquetWriteOptions = new ParquetWriteOptions
         {
@@ -383,6 +384,9 @@ internal static class DeltaWriter
         DataFileWriter = dataFileWriter,
         // native_write rewrite: DuckDB's read_parquet reads the source + applies the DELETE/UPDATE transform in SQL.
         DataFileRewriter = dataFileRewriter,
+        // native_read: DuckDB's read_parquet decodes data files for the rewrite/compaction READ halves (raw
+        // physical batches in file order) — with the writer, the full host codec pair (variant-preserving).
+        DataFileReader = dataFileReader,
     };
 
     // Catalog tables are written as PLAIN Delta — NO table features (no row tracking, no deletion vectors).

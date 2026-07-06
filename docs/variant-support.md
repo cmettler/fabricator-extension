@@ -51,12 +51,26 @@ variant field as a LEAF (nullCount only — automatic for the blob transport, gu
 
 Gates (clean errors): Bridge `DeltaCatalog` — CREATE/CTAS/INSERT with variant require
 `native_write true` AND `native_read true`; `change_data_feed true` rejected at CREATE (CDC files are
-codec-written); codec-path reads of a variant table rejected ("requires native_read"). EW backstops
-(`DeltaTable`) — codec parquet write on a variant schema throws; `DeleteByRowIdsAsync` (copy-on-write),
-`UpdateByRowIdsAsync`, `CompactAsync` throw ("would strip the parquet VARIANT annotation" — the rewrite
-READ half is the codec reader even under native_write). **DV DELETE works** (bitmap-only, no data rewrite —
-and DV is the catalog default). Lifting UPDATE/OPTIMIZE needs a variant-aware read half (the native
-rewriter path, clean-shape-gated in EW) — follow-up.
+codec-written); codec-path reads of a variant table rejected ("requires native_read").
+
+**UPDATE / copy-on-write DELETE / OPTIMIZE — LIFTED via the `IDataFileReader` codec seam (second pass).**
+EW gained the read-side counterpart of `IDataFileWriter`: `DeltaTableOptions.DataFileReader`
+(`IDataFileReader.ReadAsync(relativePath, physicalColumns, ct)` → RAW batches, physical names, FILE ORDER,
+DV rows included — order is a correctness requirement, every consumer is position-keyed). `ReadFileAsync`
+and `CompactionExecutor` route their raw decode through it when set (the shared per-batch pipeline —
+rename/DV/backfill/partitions/rowid — is unchanged; extracted as `ProcessFileBatchesAsync`). The Bridge's
+`NativeParquetDataFileReader` implements it with `read_parquet(..., file_row_number => true) ORDER BY
+file_row_number` (explicit order — a user can disable preserve_insertion_order), wired on `native_read`
+into DeleteByRowIds/UpdateByRowIds/Optimize. With BOTH seams set the EW variant-rewrite gates return early
+(the host codec preserves the annotation end to end), so UPDATE (non-variant columns AND the variant value
+itself — SET values cross as the transport blob, `BuildArray` gained the Binary case, and the rewriter's
+update-view field keeps the marker metadata so the bound view types as VARIANT), CoW DELETE, and OPTIMIZE
+all work — kernel-validated post-DML. Three supporting fixes: the clean-rebuild before every rewrite now
+preserves `ARROW:extension:*` field metadata (`DeltaTable.CleanField` — it previously stripped ALL
+metadata, which would silently drop the variant tag on any rewrite); id-mode projection under the seam
+resolves by physical NAME (field-id resolution needs the parquet footer the seam hides; spec files carry
+physicalName in both modes); the seam reader is also the compaction read half (`CompactAsync` passes it).
+EW backstop remains for codec-only tables: the gates still throw when either seam is missing.
 
 **Fabric Runtime 2.0 validation — DONE (2026-07-06, live, both directions).** Workspace `Test` / lakehouse
 `LH` runs **Spark 4.1.1**; `scratchpad/sparkprobe variant`:
