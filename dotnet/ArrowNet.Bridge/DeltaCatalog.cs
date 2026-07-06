@@ -142,6 +142,20 @@ public sealed class DeltaCatalog : IBackendCatalog
     // RenameToPhysical / SetParquetFieldIds) already handle mapped tables. Only affects table CREATION.
     private readonly EngineeredWood.DeltaLake.Schema.ColumnMappingMode _columnMappingMode;
 
+    // ATTACH option `pushdown_filters 'none'|'static'|'dynamic'|'all'` (duckdb-delta parity) — how much of
+    // the query's filters this catalog's scans consume:
+    //   none    — no pushdown at all (pure fallback: DuckDB filters everything above the scan).
+    //   static  — the bind-time filter is pushed BEST-EFFORT for engineered-wood file/row-group/bloom
+    //             pruning (superset-safe; DuckDB re-applies). The codec default.
+    //   dynamic/all — EXACT mode: the scan declares filter_pushdown=true, DuckDB hands the live
+    //             TableFilterSet (static + dynamic JOIN filters) and ERASES the statics from the plan; the
+    //             host renders it 1:1 to SQL (spec.native_filter). native_read applies it inside
+    //             read_parquet; the codec path applies it EXACTLY per batch via HostBatchFilter. 'dynamic'
+    //             is accepted as an alias of 'all' on this provider (the erasure contract is all-or-nothing).
+    //             The native_read default. Downgrades to 'static' when host queries are unavailable.
+    private enum PushdownMode { None, Static, Exact }
+    private readonly PushdownMode _pushdownMode;
+
     private static readonly Microsoft.Extensions.Logging.ILogger _log = ArrowNetLog.CreateLogger("ArrowNet.Delta");
 
     public DeltaCatalog(string root) : this(root, "{}") { }
@@ -169,6 +183,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         _nativeWrite = ParseBoolOption(optionsJson, "native_write");
         _materializeRowTracking = ParseBoolOption(optionsJson, "materialize_row_tracking");
         _columnMappingMode = ParseColumnMappingOption(optionsJson);
+        _pushdownMode = ParsePushdownFiltersOption(optionsJson, _nativeRead);
     }
 
     /// <summary>Returns the host-FS opener for this thread and, in the same breath, publishes this catalog's
@@ -241,6 +256,34 @@ public sealed class DeltaCatalog : IBackendCatalog
             _ => throw new System.ArgumentException(
                 $"column_mapping: unknown mode '{s}' (expected 'id', 'name', or 'none')."),
         };
+    }
+
+    private static PushdownMode ParsePushdownFiltersOption(string? optionsJson, bool nativeRead)
+    {
+        var s = ParseStringOption(optionsJson, "pushdown_filters");
+        PushdownMode mode;
+        if (string.IsNullOrWhiteSpace(s))
+        {
+            // Defaults preserve prior behavior: exact under native_read, best-effort static otherwise.
+            mode = nativeRead ? PushdownMode.Exact : PushdownMode.Static;
+        }
+        else
+        {
+            mode = s.Trim().ToLowerInvariant() switch
+            {
+                "none" => PushdownMode.None,
+                "static" => PushdownMode.Static,
+                "dynamic" or "all" => PushdownMode.Exact,
+                _ => throw new System.ArgumentException(
+                    $"pushdown_filters: unknown mode '{s}' (expected 'none', 'static', 'dynamic', or 'all')."),
+            };
+        }
+        // Exact application needs the host engine (read_parquet WHERE / HostBatchFilter).
+        if (mode == PushdownMode.Exact && !Host.CanQuery)
+        {
+            mode = PushdownMode.Static;
+        }
+        return mode;
     }
 
     /// <summary>Reads a string ATTACH option (null if absent/blank/unparseable).</summary>
@@ -440,13 +483,12 @@ public sealed class DeltaCatalog : IBackendCatalog
         // Change Data Feed (arrownet_delta_changes): arg1 = 'schema.table' ref, arg2 = "from:to" (to empty => latest).
         MetadataKind.Changes => ChangesStream(schema, table),
         // Capability profile (property, value). `exact_filter_pushdown` = whether the host may set
-        // filter_pushdown=true on this catalog's scan: TRUE only under native_read, where every scan routes
-        // through read_parquet on the host DuckDB and applies the pushed WHERE EXACTLY (1:1, same engine).
-        // With native_read off the engineered-wood reader only PRUNES (superset), so DuckDB must keep
-        // re-applying — filter_pushdown stays false. See docs/multifile-delta.md §"Batch 2 slice 2".
+        // filter_pushdown=true on this catalog's scans — governed by the pushdown_filters mode: EXACT mode
+        // applies the erased TableFilterSet 1:1 (read_parquet WHERE under native_read; HostBatchFilter per
+        // batch on the codec path); None/Static keep filter_pushdown=false so DuckDB re-applies everything.
         MetadataKind.ServerInfo => TwoColumn(
             "property", new[] { "exact_filter_pushdown" },
-            "value", new[] { _nativeRead ? "true" : "false" }),
+            "value", new[] { _pushdownMode == PushdownMode.Exact ? "true" : "false" }),
         // No row-count/NDV stats surfaced, no functions.
         _ => EmptyStringTable("name"),
     };
@@ -638,7 +680,15 @@ public sealed class DeltaCatalog : IBackendCatalog
         // Projection is left to DuckDB above the scan (the full schema is returned, mapped by name) — same as
         // the global arrownet_delta_scan; column-pruning into parquet would need a projected-schema stream.
         var spec = ScanSpec.Parse(specJson);
+        _log.LogDebug("delta scan {Schema}.{Table}: mode={Mode} native_filter={NF}",
+            schemaName, tableName, _pushdownMode, spec?.NativeFilter ?? "<none>");
         var filterVals = ReadFilterValues(filterValues);
+        if (_pushdownMode == PushdownMode.None && spec is not null)
+        {
+            // Pure fallback: consume no filters at all — DuckDB applies everything above the scan.
+            spec.Filter = null;
+            spec.NativeFilter = null;
+        }
         EngineeredWood.Expressions.Predicate? filter = spec?.Filter is { } node
             ? new DeltaFilterBuilder(filterVals).Build(node)
             : null;
@@ -669,16 +719,16 @@ public sealed class DeltaCatalog : IBackendCatalog
             bool wantRowIdAt = spec.Columns is { } atCols && atCols.Contains(RowIdColumn);
             if (wantRowIdAt)
             {
-                var atFields = new List<Field>(atProjected.FieldsList)
-                {
-                    new Field(RowIdColumn, Int64Type.Default, nullable: false),
-                };
-                return new AsyncEnumerableArrowStream(
-                    new Schema(atFields, atProjected.Metadata),
-                    DeltaReader.StreamWithRowIdsAt(opener, path, atProjCols, filter, at.Unit, at.Value, default));
+                var atSchemaWithRowId = new Schema(
+                    new List<Field>(atProjected.FieldsList)
+                    {
+                        new Field(RowIdColumn, Int64Type.Default, nullable: false),
+                    }, atProjected.Metadata);
+                return new AsyncEnumerableArrowStream(atSchemaWithRowId, WithExactFilter(atSchemaWithRowId,
+                    DeltaReader.StreamWithRowIdsAt(opener, path, atProjCols, filter, at.Unit, at.Value, default), spec));
             }
-            return new AsyncEnumerableArrowStream(
-                atProjected, DeltaReader.StreamAt(opener, path, atProjCols, filter, at.Unit, at.Value, default));
+            return new AsyncEnumerableArrowStream(atProjected, WithExactFilter(atProjected,
+                DeltaReader.StreamAt(opener, path, atProjCols, filter, at.Unit, at.Value, default), spec));
         }
 
         var userSchema = DeltaReader.GetSchema(opener, path);
@@ -694,12 +744,22 @@ public sealed class DeltaCatalog : IBackendCatalog
                 new Field(RowIdColumn, Int64Type.Default, nullable: false),
             };
             var schemaWithRowId = new Schema(fields, projected.Metadata);
-            return new AsyncEnumerableArrowStream(
-                schemaWithRowId, DeltaReader.StreamWithRowIds(opener, path, projCols, filter, default));
+            return new AsyncEnumerableArrowStream(schemaWithRowId, WithExactFilter(schemaWithRowId,
+                DeltaReader.StreamWithRowIds(opener, path, projCols, filter, default), spec));
         }
 
-        return new AsyncEnumerableArrowStream(projected, DeltaReader.Stream(opener, path, projCols, filter, default));
+        return new AsyncEnumerableArrowStream(projected, WithExactFilter(projected,
+            DeltaReader.Stream(opener, path, projCols, filter, default), spec));
     }
+
+    // EXACT mode on the codec path: the host rendered the erased TableFilterSet to SQL
+    // (spec.native_filter) — apply it per batch via the host engine (see HostBatchFilter). A no-op when
+    // exact mode is off or nothing was rendered (then DuckDB re-applies as usual).
+    private System.Collections.Generic.IAsyncEnumerable<RecordBatch> WithExactFilter(
+        Schema schema, System.Collections.Generic.IAsyncEnumerable<RecordBatch> source, ScanSpec? spec)
+        => _pushdownMode == PushdownMode.Exact && !string.IsNullOrWhiteSpace(spec?.NativeFilter)
+            ? HostBatchFilter.Apply(schema, source, spec!.NativeFilter!)
+            : source;
 
     /// <summary>
     /// PROJECTION into the engineered-wood decode: maps the scan's requested columns to the column list the

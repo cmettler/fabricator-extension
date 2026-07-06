@@ -1,0 +1,127 @@
+# name: test/verify_delta_catalog_filter_modes.test
+# description: The `pushdown_filters` ATTACH option (duckdb-delta parity: 'none'|'static'|'dynamic'|'all')
+#              on the Delta catalog. none = no pushdown (pure fallback); static = best-effort
+#              file/row-group/bloom pruning (codec default; DuckDB re-applies); dynamic/all = EXACT mode:
+#              the scan declares filter_pushdown=true, DuckDB ERASES the pushed static filters from the
+#              plan and delivers hash-join DYNAMIC filters, and the host-rendered TableFilterSet SQL is
+#              applied EXACTLY — inside read_parquet under native_read, and per batch via HostBatchFilter
+#              (SELECT * FROM <batch> WHERE ... on the host engine) on the CODEC path. Correctness across
+#              modes is the safety net: under exact mode a dropped filter would return surplus rows.
+#              Set ARROWNET_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
+# group: [mssql_net]
+
+require mssql_net
+
+require parquet
+
+require-env ARROWNET_DELTA_WRITE_DIR
+
+# One data root, read through catalogs with different modes.
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/fmodes' AS w (TYPE arrownet, PROVIDER 'delta', column_mapping 'none');
+
+statement ok
+CREATE TABLE w.main.t AS
+SELECT i AS id, 'name' || (i % 7) AS name, (i % 5) * 1.5 AS amt,
+       CASE WHEN i % 11 = 0 THEN NULL ELSE 'g' || (i % 3) END AS grp
+FROM range(1, 501) AS r(i);
+
+statement ok
+CREATE TABLE w.main.dim AS SELECT * FROM (VALUES (10), (250), (499)) d(id);
+
+# ---- EXACT mode ('all') on the CODEC path: erased statics must be applied by the scan ----
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/fmodes' AS f_all (TYPE arrownet, PROVIDER 'delta', column_mapping 'none', pushdown_filters 'all');
+
+query I
+SELECT count(*) FROM f_all.main.t WHERE id = 250;
+----
+1
+
+query IT
+SELECT id, name FROM f_all.main.t WHERE id > 495 ORDER BY id;
+----
+496	name6
+497	name0
+498	name1
+499	name2
+500	name3
+
+query I
+SELECT count(*) FROM f_all.main.t WHERE grp IS NULL;
+----
+45
+
+query I
+SELECT count(*) FROM f_all.main.t WHERE name IN ('name0', 'name3') AND amt > 1.0;
+----
+114
+
+query I
+SELECT count(*) FROM f_all.main.t WHERE id BETWEEN 100 AND 199 AND (grp = 'g1' OR grp IS NULL);
+----
+40
+
+# hash-join dynamic filters flow to the scan and the join result is exact
+query I
+SELECT count(*) FROM f_all.main.t b JOIN f_all.main.dim d ON b.id = d.id;
+----
+3
+
+# ---- 'dynamic' is an accepted alias of 'all' on this provider ----
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/fmodes' AS f_dyn (TYPE arrownet, PROVIDER 'delta', column_mapping 'none', pushdown_filters 'dynamic');
+
+query I
+SELECT count(*) FROM f_dyn.main.t WHERE id = 250 OR id = 10;
+----
+2
+
+# ---- 'static' (the codec default) and 'none' (pure fallback) agree with exact mode ----
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/fmodes' AS f_static (TYPE arrownet, PROVIDER 'delta', column_mapping 'none', pushdown_filters 'static');
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/fmodes' AS f_none (TYPE arrownet, PROVIDER 'delta', column_mapping 'none', pushdown_filters 'none');
+
+query III
+SELECT (SELECT count(*) FROM f_all.main.t   WHERE id % 2 = 0 AND grp = 'g1'),
+       (SELECT count(*) FROM f_static.main.t WHERE id % 2 = 0 AND grp = 'g1'),
+       (SELECT count(*) FROM f_none.main.t   WHERE id % 2 = 0 AND grp = 'g1');
+----
+75	75	75
+
+# ---- exact mode composes with the rowid (DML) scans: the WHERE filters the target rows exactly ----
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/fmodes2' AS m (TYPE arrownet, PROVIDER 'delta', column_mapping 'none', pushdown_filters 'all');
+
+statement ok
+CREATE TABLE m.main.d AS SELECT i AS id, 'v' || i AS v FROM range(1, 11) AS r(i);
+
+statement ok
+DELETE FROM m.main.d WHERE id > 8;
+
+statement ok
+UPDATE m.main.d SET v = 'changed' WHERE id = 3;
+
+query IT
+SELECT id, v FROM m.main.d WHERE v = 'changed' OR id >= 7 ORDER BY id;
+----
+3	changed
+7	v7
+8	v8
+
+# ---- native_read keeps its exact default; 'static' downgrades it cleanly ----
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/fmodes' AS n_static (TYPE arrownet, PROVIDER 'delta', column_mapping 'none', native_read true, pushdown_filters 'static');
+
+query I
+SELECT count(*) FROM n_static.main.t WHERE id = 250;
+----
+1
+
+# ---- unknown mode is a clean error ----
+statement error
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/fmodes' AS bad (TYPE arrownet, PROVIDER 'delta', pushdown_filters 'sometimes');
+----
+pushdown_filters: unknown mode
