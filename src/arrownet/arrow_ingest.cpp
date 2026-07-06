@@ -15,6 +15,7 @@
 #include "duckdb/planner/filter/optional_filter.hpp"
 #include "duckdb/planner/filter/dynamic_filter.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/struct_filter.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 
 #include <algorithm>
@@ -246,6 +247,30 @@ static bool RenderTableFilter(const TableFilter &f, const string &qcol, string &
 	}
 	case TableFilterType::BLOOM_FILTER:
 		return false; // probabilistic; not exact SQL — always OptionalFilter-wrapped, so skip-safe
+	case TableFilterType::STRUCT_EXTRACT: {
+		// A struct-member filter (`WHERE (s).a = 5`, erased into the set under exact mode): rebase the
+		// child filter onto an explicit struct_extract — exact DuckDB SQL and robust to member names the
+		// bare ToString dot form (`"s".a`) would mis-quote. NOTE: on a COLUMN-MAPPED table this SQL still
+		// references the LOGICAL member name, which the native (read_parquet) path cannot bind (nested
+		// children carry physical names inside the files) — that pre-existing combination fails loudly at
+		// the per-file bind; the fix belongs in the C# native reader (rebuild mapped structs logically).
+		// The codec exact path is fine: its per-batch filter runs over logically-renamed batches.
+		auto &sf = f.Cast<StructFilter>();
+		string member;
+		if (!sf.child_name.empty()) {
+			member = "struct_extract(" + qcol + ", '";
+			for (char c : sf.child_name) {
+				member += c;
+				if (c == '\'') {
+					member += '\''; // SQL string-literal escape
+				}
+			}
+			member += "')";
+		} else {
+			member = "struct_extract_at(" + qcol + ", " + to_string(sf.child_idx + 1) + ")";
+		}
+		return RenderTableFilter(*sf.child_filter, member, out);
+	}
 	case TableFilterType::CONJUNCTION_AND:
 	case TableFilterType::CONJUNCTION_OR: {
 		// Recurse per child (do NOT use ToString: a child may be an OptionalFilter/DynamicFilter whose
@@ -280,7 +305,7 @@ static bool RenderTableFilter(const TableFilter &f, const string &qcol, string &
 		return true;
 	}
 	default:
-		// Constant / IN / IS [NOT] NULL / expression / struct: DuckDB's own render == exact SQL for the
+		// Constant / IN / IS [NOT] NULL / expression: DuckDB's own render == exact SQL for the
 		// read_parquet (DuckDB) target. These are the MANDATORY (erased-from-plan) filters we must apply.
 		out += f.ToString(qcol);
 		return true;
@@ -481,7 +506,19 @@ unique_ptr<GlobalTableFunctionState> ArrowStreamInitGlobal(ClientContext &contex
                                                            TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<ArrowStreamBindData>();
 	auto gstate = make_uniq<ArrowStreamGlobalState>();
-	gstate->output_column_ids = input.column_ids;
+	// The scan's OUTPUT columns. projection_ids (indexes into column_ids; empty = all) is DuckDB's
+	// filter_prune contract — an optimizer-pruned output subset of the scanned columns. Our functions
+	// don't set filter_prune today (see the struct-filter NOTE in arrownet_table_entry.cpp), so this is
+	// currently always the empty=identity case; honoring it keeps the scan correct if that ever changes.
+	// The provider FETCH below stays the full column_ids so filter-referenced columns remain available
+	// to the native WHERE / the provider's exact per-batch filter.
+	if (input.projection_ids.empty()) {
+		gstate->output_column_ids = input.column_ids;
+	} else {
+		for (auto proj : input.projection_ids) {
+			gstate->output_column_ids.push_back(input.column_ids[proj]);
+		}
+	}
 
 	// Catalog scans push the projected column list (and superset-safe filters) to the
 	// provider; raw queries fetch the full result (the SQL is user-supplied).
@@ -492,7 +529,7 @@ unique_ptr<GlobalTableFunctionState> ArrowStreamInitGlobal(ClientContext &contex
 		// (filter_pushdown=true); empty for SQL/DAX/non-native (input.filters null). This runs per execution,
 		// so a hash-join dynamic filter materialized before the probe scan is captured here.
 		string live_filter_sql = RenderLiveFilters(bind_data, input);
-		request.spec_json = BuildScanSpec(bind_data, gstate->output_column_ids, live_filter_sql);
+		request.spec_json = BuildScanSpec(bind_data, input.column_ids, live_filter_sql);
 		if (!bind_data.filter_constants.empty()) {
 			value_producer = BuildFilterValues(context, bind_data.filter_constants);
 			request.filter_values = value_producer->Stream();

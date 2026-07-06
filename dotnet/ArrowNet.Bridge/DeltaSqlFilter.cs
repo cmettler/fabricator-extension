@@ -25,11 +25,28 @@ internal static class DeltaSqlFilter
         "and" => And(node, values),
         "or" => Or(node, values),
         "compare" => Compare(node, values),
-        "is_null" => node.Col is { } c ? $"{Quote(c)} IS NULL" : null,
-        "is_not_null" => node.Col is { } c ? $"{Quote(c)} IS NOT NULL" : null,
+        "is_null" => Ref(node) is { } c ? $"{c} IS NULL" : null,
+        "is_not_null" => Ref(node) is { } c ? $"{c} IS NOT NULL" : null,
         "in" => In(node, values),
         _ => null,
     };
+
+    // The column reference: a plain column, or a struct-member path rendered as an explicit struct_extract
+    // chain — exact DuckDB SQL (the native reader rebuilds mapped structs with LOGICAL member names, so the
+    // logical reference binds on mapped tables too).
+    private static string? Ref(FilterNode node)
+    {
+        if (node.Path is { Count: > 0 } p)
+        {
+            var expr = Quote(p[0]);
+            for (int i = 1; i < p.Count; i++)
+            {
+                expr = $"struct_extract({expr}, '{p[i].Replace("'", "''")}')";
+            }
+            return expr;
+        }
+        return node.Col is { } c ? Quote(c) : null;
+    }
 
     private static string? And(FilterNode node, IReadOnlyList<object?> values)
     {
@@ -60,7 +77,7 @@ internal static class DeltaSqlFilter
 
     private static string? Compare(FilterNode node, IReadOnlyList<object?> values)
     {
-        if (node.Col is not { } col || node.Val is not int idx || idx < 0 || idx >= values.Count)
+        if (Ref(node) is not { } col || node.Val is not int idx || idx < 0 || idx >= values.Count)
         {
             return null;
         }
@@ -78,12 +95,12 @@ internal static class DeltaSqlFilter
             ">=" => ">=",
             _ => null, // is_distinct / is_not_distinct: not pushed
         };
-        return op is null ? null : $"{Quote(col)} {op} {lit}";
+        return op is null ? null : $"{col} {op} {lit}";
     }
 
     private static string? In(FilterNode node, IReadOnlyList<object?> values)
     {
-        if (node.Col is not { } col || node.Vals is not { Count: > 0 } idxs)
+        if (Ref(node) is not { } col || node.Vals is not { Count: > 0 } idxs)
         {
             return null;
         }
@@ -96,7 +113,7 @@ internal static class DeltaSqlFilter
             }
             lits.Add(lit);
         }
-        return $"{Quote(col)} IN ({string.Join(", ", lits)})";
+        return $"{col} IN ({string.Join(", ", lits)})";
     }
 
     // Renders a CLR constant to a SQL literal, or null if its type isn't pushed here (matches DeltaFilterBuilder).

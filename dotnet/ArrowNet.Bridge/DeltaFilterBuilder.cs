@@ -39,11 +39,18 @@ internal sealed class DeltaFilterBuilder
         "and" => BuildAnd(node),
         "or" => BuildOr(node),
         "compare" => BuildCompare(node),
-        "is_null" => node.Col is { } c ? Expressions.IsNull(c) : null,
-        "is_not_null" => node.Col is { } c ? Expressions.IsNotNull(c) : null,
+        "is_null" => RefName(node) is { } c ? Expressions.IsNull(c) : null,
+        "is_not_null" => RefName(node) is { } c ? Expressions.IsNotNull(c) : null,
         "in" => BuildIn(node),
         _ => null,
     };
+
+    // A STRUCT-member reference arrives as `path` (["s","a"]); engineered-wood's evaluators resolve the
+    // dotted form at every layer — flattened Delta file stats ("s.a"), Parquet row-group leaf paths
+    // (ColumnDescriptor.DottedPath) and bloom probing. A plain column stays `col`. Ambiguity (a literal
+    // dotted column name colliding with a struct path) is poisoned engineered-wood-side, never guessed.
+    private static string? RefName(FilterNode node) =>
+        node.Path is { Count: > 0 } p ? string.Join(".", p) : node.Col;
 
     // AND: keep the pushable children (dropping unpushable ones still yields a superset).
     private Predicate? BuildAnd(FilterNode node)
@@ -76,7 +83,7 @@ internal sealed class DeltaFilterBuilder
 
     private Predicate? BuildCompare(FilterNode node)
     {
-        if (node.Col is not { } col || node.Val is not int idx || idx < 0 || idx >= _values.Count)
+        if (RefName(node) is not { } col || node.Val is not int idx || idx < 0 || idx >= _values.Count)
         {
             return null;
         }
@@ -104,7 +111,7 @@ internal sealed class DeltaFilterBuilder
 
     private Predicate? BuildIn(FilterNode node)
     {
-        if (node.Col is not { } col || node.Vals is not { Count: > 0 } idxs)
+        if (RefName(node) is not { } col || node.Vals is not { Count: > 0 } idxs)
         {
             return null;
         }

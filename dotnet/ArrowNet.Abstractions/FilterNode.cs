@@ -20,6 +20,11 @@ namespace ArrowNet.Bridge;
 /// <item><c>is_null</c>/<c>is_not_null</c> — <c>col</c></item>
 /// <item><c>in</c> — <c>col</c>, <c>vals</c></item>
 /// </list>
+///
+/// <para>A STRUCT-member predicate (<c>WHERE (s).a = 5</c>) carries <c>path</c> — the full member path
+/// including the top-level column (<c>["s","a"]</c>) — and <c>col</c> is null. A renderer that doesn't
+/// understand paths throws on the missing <c>col</c> and its caller falls back to pushing nothing
+/// (superset-safe); only providers with nested columns (Delta) resolve it, for stats-based pruning.</para>
 /// </summary>
 public sealed class FilterNode
 {
@@ -34,6 +39,9 @@ public sealed class FilterNode
 
     [JsonPropertyName("col")]
     public string? Col { get; set; }
+
+    [JsonPropertyName("path")]
+    public List<string>? Path { get; set; }
 
     [JsonPropertyName("val")]
     public int? Val { get; set; }

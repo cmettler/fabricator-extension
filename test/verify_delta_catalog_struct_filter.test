@@ -1,0 +1,267 @@
+# name: test/verify_delta_catalog_struct_filter.test
+# description: STRUCT-member filter pushdown on the Delta catalog. A `WHERE (s).a = 5` predicate is
+#              serialized as a dotted-path FilterNode ("path":["s","a"]) and drives engineered-wood
+#              file-level (nested Delta stats) + parquet row-group/bloom pruning on the codec path —
+#              superset-safe (DuckDB re-applies; an unresolvable path just forfeits pruning). Under
+#              EXACT mode (pushdown_filters 'all' / native_read) DuckDB ERASES the struct filter into
+#              the TableFilterSet; the scan applies it exactly as struct_extract SQL — per batch over
+#              logically-renamed batches on the codec path, and inside read_parquet on the native path,
+#              where a COLUMN-MAPPED table's struct columns are REBUILT with logical member names
+#              (CASE + struct_pack over the physical children; id mode resolves nested children via the
+#              file's parquet field_ids). Correctness across modes is the safety net.
+#              Set ARROWNET_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
+# group: [mssql_net]
+
+require mssql_net
+
+require parquet
+
+require-env ARROWNET_DELTA_WRITE_DIR
+
+# One data root (default column mapping = name), read through catalogs with different modes.
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/structf' AS w (TYPE arrownet, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE w.main.t AS
+SELECT i AS id,
+       {'a': CASE WHEN i % 11 = 0 THEN NULL ELSE i END,
+        'b': 'x' || (i % 5),
+        'n': {'c': i * 2}} AS s
+FROM range(1, 501) AS r(i);
+
+# a second file so file-level pruning has something to skip
+statement ok
+INSERT INTO w.main.t
+SELECT i AS id, {'a': i, 'b': 'y' || (i % 5), 'n': {'c': i * 2}} AS s
+FROM range(1001, 1101) AS r(i);
+
+# (created up front so the later f_none/f_all ATTACHes discover it)
+statement ok
+CREATE TABLE w.main.dim AS SELECT * FROM (VALUES (10), (250), (1050)) d(k);
+
+# ---- codec path (static default): struct-member predicates, all shapes ----
+query I
+SELECT count(*) FROM w.main.t WHERE (s).a = 250;
+----
+1
+
+query II
+SELECT id, (s).a FROM w.main.t WHERE (s).a > 1095 ORDER BY id;
+----
+1096	1096
+1097	1097
+1098	1098
+1099	1099
+1100	1100
+
+query I
+SELECT count(*) FROM w.main.t WHERE (s).b = 'x1';
+----
+100
+
+query I
+SELECT count(*) FROM w.main.t WHERE (s).a IS NULL;
+----
+45
+
+query I
+SELECT count(*) FROM w.main.t WHERE (s).a IS NOT NULL;
+----
+555
+
+# nested-nested member ((s).n.c) — a two-level path
+query I
+SELECT count(*) FROM w.main.t WHERE (s).n.c = 500;
+----
+1
+
+query I
+SELECT count(*) FROM w.main.t WHERE (s).a IN (10, 250, 1050);
+----
+3
+
+# 100..199 minus the 9 NULLed multiples of 11 (110..198)
+query I
+SELECT count(*) FROM w.main.t WHERE (s).a BETWEEN 100 AND 199;
+----
+91
+
+# mixed: struct member + top-level column, AND / OR
+query I
+SELECT count(*) FROM w.main.t WHERE (s).a > 400 AND id <= 500;
+----
+91
+
+query I
+SELECT count(*) FROM w.main.t WHERE (s).a = 250 OR id = 10;
+----
+2
+
+# aggregation over a member predicate
+query I
+SELECT sum((s).n.c) FROM w.main.t WHERE (s).a BETWEEN 1001 AND 1010;
+----
+20110
+
+# ---- cross-mode agreement: none / static / exact must all return the same result ----
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/structf' AS f_none (TYPE arrownet, PROVIDER 'delta', pushdown_filters 'none');
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/structf' AS f_all (TYPE arrownet, PROVIDER 'delta', pushdown_filters 'all');
+
+query III
+SELECT (SELECT count(*) FROM w.main.t      WHERE (s).a % 2 = 0 AND (s).b = 'x1'),
+       (SELECT count(*) FROM f_none.main.t WHERE (s).a % 2 = 0 AND (s).b = 'x1'),
+       (SELECT count(*) FROM f_all.main.t  WHERE (s).a % 2 = 0 AND (s).b = 'x1');
+----
+46	46	46
+
+# ---- EXACT mode: the struct veto keeps erased-filter correctness (incl. IS NULL + ranges) ----
+query I
+SELECT count(*) FROM f_all.main.t WHERE (s).a = 250;
+----
+1
+
+query I
+SELECT count(*) FROM f_all.main.t WHERE (s).a IS NULL;
+----
+45
+
+query I
+SELECT count(*) FROM f_all.main.t WHERE (s).n.c > 2100 AND (s).b = 'y1';
+----
+10
+
+# hash-join with a struct member in the probe-side predicate
+query I
+SELECT count(*) FROM f_all.main.t b JOIN f_all.main.dim d ON b.id = d.k WHERE (b.s).a = d.k;
+----
+3
+
+# ---- native_read + column mapping (name default): the reader REBUILDS mapped struct columns with
+# LOGICAL member names in SQL (CASE + struct_pack over the physical children), so the erased
+# StructFilter's struct_extract SQL binds inside the per-file read_parquet query ----
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/structf' AS nm (TYPE arrownet, PROVIDER 'delta', native_read true);
+
+query I
+SELECT count(*) FROM nm.main.t WHERE (s).a = 250;
+----
+1
+
+query I
+SELECT count(*) FROM nm.main.t WHERE (s).a IS NULL;
+----
+45
+
+# two-level nested member + a mixed top-level predicate
+query I
+SELECT count(*) FROM nm.main.t WHERE (s).n.c = 500 AND id < 1000;
+----
+1
+
+# NULL structs stay NULL through the rebuild (whole-struct IS NULL semantics preserved)
+query II
+SELECT count(*) FILTER (s IS NULL), count(*) FILTER ((s).a IS NULL) FROM nm.main.t;
+----
+0	45
+
+query II
+SELECT id, (s).b FROM nm.main.t WHERE (s).a IN (10, 1050) ORDER BY id;
+----
+10	x0
+1050	y0
+
+# ---- native_read + ID-mode mapping: nested children resolved via THIS file's parquet field_ids ----
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/structid' AS iw (TYPE arrownet, PROVIDER 'delta', column_mapping 'id');
+
+statement ok
+CREATE TABLE iw.main.t AS
+SELECT i AS id, {'a': i, 'n': {'c': i * 2}} AS s FROM range(1, 101) AS r(i);
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/structid' AS ir (TYPE arrownet, PROVIDER 'delta', column_mapping 'id', native_read true);
+
+query I
+SELECT count(*) FROM ir.main.t WHERE (s).a > 90;
+----
+10
+
+query I
+SELECT count(*) FROM ir.main.t WHERE (s).n.c = 100;
+----
+1
+
+# ---- native_read (exact default) on an UNMAPPED table: the erased StructFilter renders as
+# struct_extract SQL directly inside read_parquet (no rebuild needed) ----
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/structnat' AS n_w (TYPE arrownet, PROVIDER 'delta', column_mapping 'none');
+
+statement ok
+CREATE TABLE n_w.main.t AS
+SELECT i AS id,
+       {'a': CASE WHEN i % 11 = 0 THEN NULL ELSE i END, 'b': 'x' || (i % 5)} AS s
+FROM range(1, 501) AS r(i);
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/structnat' AS n_r (TYPE arrownet, PROVIDER 'delta', column_mapping 'none', native_read true);
+
+query I
+SELECT count(*) FROM n_r.main.t WHERE (s).a = 250;
+----
+1
+
+# i%5==1 with a<100 = {1,6,...,96} (20) minus the NULLed multiples of 11 (11, 66)
+query I
+SELECT count(*) FROM n_r.main.t WHERE (s).b = 'x1' AND (s).a < 100;
+----
+18
+
+query I
+SELECT count(*) FROM n_r.main.t WHERE (s).a IS NULL;
+----
+45
+
+# ---- DML with a struct-member WHERE (rowid scan under exact mode) ----
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/structdml' AS m (TYPE arrownet, PROVIDER 'delta', pushdown_filters 'all');
+
+statement ok
+CREATE TABLE m.main.d AS SELECT i AS id, {'a': i, 'b': 'v' || i} AS s FROM range(1, 11) AS r(i);
+
+statement ok
+DELETE FROM m.main.d WHERE (s).a > 8;
+
+query I
+SELECT count(*) FROM m.main.d;
+----
+8
+
+statement ok
+UPDATE m.main.d SET id = id + 100 WHERE (s).a = 3;
+
+query II
+SELECT id, (s).a FROM m.main.d WHERE (s).a IN (3, 7) ORDER BY (s).a;
+----
+103	3
+7	7
+
+# ---- plain (unmapped) table: same predicates, logical==physical layout ----
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/structplain' AS p (TYPE arrownet, PROVIDER 'delta', column_mapping 'none');
+
+statement ok
+CREATE TABLE p.main.t AS SELECT i AS id, {'a': i, 'b': 'x' || (i % 3)} AS s FROM range(1, 101) AS r(i);
+
+query I
+SELECT count(*) FROM p.main.t WHERE (s).a <= 10;
+----
+10
+
+query I
+SELECT count(*) FROM p.main.t WHERE (s).b = 'x2' AND (s).a > 90;
+----
+3

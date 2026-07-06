@@ -18,7 +18,9 @@
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "duckdb/function/scalar/struct_utils.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
@@ -137,6 +139,63 @@ private:
 		return true;
 	}
 
+	// Resolve a column ref OR a struct_extract(...) chain over one to its provider column PATH
+	// (path[0] = the top-level column name, then the member names down to the leaf) + the LEAF type.
+	// `WHERE (s).a = 5` arrives here as struct_extract(s, 'a') = 5 (bind_columnref/CreateStructExtract);
+	// nested access nests the calls. Member names are resolved from the child struct type via the bound
+	// extract index (StructExtractBindData) — exact case, matching parquet/stats keys — which also covers
+	// struct_extract_at's positional form.
+	bool ColumnPath(const Expression &e, vector<string> &path, LogicalType &type) {
+		if (e.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+			auto &func = e.Cast<BoundFunctionExpression>();
+			if ((func.function.name != "struct_extract" && func.function.name != "struct_extract_at") ||
+			    func.children.size() != 2 || !func.bind_info) {
+				return false;
+			}
+			if (!ColumnPath(*func.children[0], path, type)) {
+				return false;
+			}
+			auto &parent_type = func.children[0]->return_type;
+			if (parent_type.id() != LogicalTypeId::STRUCT) {
+				return false; // VARIANT member access etc.: not a plain struct path
+			}
+			auto member = func.bind_info->Cast<StructExtractBindData>().index;
+			auto &members = StructType::GetChildTypes(parent_type);
+			if (member >= members.size()) {
+				return false;
+			}
+			path.push_back(members[member].first);
+			type = e.return_type;
+			return true;
+		}
+		string name;
+		if (!ColumnName(e, name, type)) {
+			return false;
+		}
+		path.clear();
+		path.push_back(std::move(name));
+		return true;
+	}
+
+	// Emit the column reference into the JSON object body: a plain column as `"col":"name"`, a
+	// struct-member path as `"path":["s","a"]` with NO "col" — a renderer without path support then
+	// throws/skips (falls back to no pushdown) instead of mis-rendering the top-level column.
+	static void JsonColumnRef(const vector<string> &path, string &out) {
+		if (path.size() == 1) {
+			out += "\"col\":";
+			JsonStr(path[0], out);
+			return;
+		}
+		out += "\"path\":[";
+		for (idx_t i = 0; i < path.size(); i++) {
+			if (i) {
+				out += ',';
+			}
+			JsonStr(path[i], out);
+		}
+		out += ']';
+	}
+
 	// Comparison operator -> JSON token; "" if not a pushable comparison.
 	static const char *CmpToken(ExpressionType t) {
 		switch (t) {
@@ -206,19 +265,23 @@ private:
 		bool flipped = false;
 		auto lc = cmp.left->GetExpressionClass();
 		auto rc = cmp.right->GetExpressionClass();
-		if (lc == ExpressionClass::BOUND_COLUMN_REF && rc == ExpressionClass::BOUND_CONSTANT) {
+		// Column side = a plain column ref OR a struct_extract chain (ColumnPath validates the shape).
+		auto is_col_side = [](ExpressionClass c) {
+			return c == ExpressionClass::BOUND_COLUMN_REF || c == ExpressionClass::BOUND_FUNCTION;
+		};
+		if (is_col_side(lc) && rc == ExpressionClass::BOUND_CONSTANT) {
 			col = cmp.left.get();
 			constant = cmp.right.get();
-		} else if (rc == ExpressionClass::BOUND_COLUMN_REF && lc == ExpressionClass::BOUND_CONSTANT) {
+		} else if (is_col_side(rc) && lc == ExpressionClass::BOUND_CONSTANT) {
 			col = cmp.right.get();
 			constant = cmp.left.get();
 			flipped = true;
 		} else {
 			return false;
 		}
-		string name;
+		vector<string> path;
 		LogicalType coltype;
-		if (!ColumnName(*col, name, coltype)) {
+		if (!ColumnPath(*col, path, coltype)) {
 			return false;
 		}
 		if (flipped) {
@@ -235,15 +298,21 @@ private:
 		idx_t idx = AddConstant(value);
 		out = "{\"op\":\"compare\",\"cmp\":\"";
 		out += tok;
-		out += "\",\"col\":";
-		JsonStr(name, out);
+		out += "\",";
+		JsonColumnRef(path, out);
 		out += ",\"val\":" + to_string(idx) + "}";
 		sql.clear();
-		SqlIdent(name, sql);
-		sql += ' ';
-		sql += CmpSqlToken(tok);
-		sql += ' ';
-		sql += value.ToSQLString();
+		// Struct-member predicates get NO native-SQL twin: the native read runs over the provider's storage
+		// layout, where a column-mapped table's nested children carry PHYSICAL names — a rendered logical
+		// member access would mis-bind the per-file query. The JSON path (stats pruning) is layout-translated
+		// by the provider; applying fewer predicates as SQL is always superset-safe.
+		if (path.size() == 1) {
+			SqlIdent(path[0], sql);
+			sql += ' ';
+			sql += CmpSqlToken(tok);
+			sql += ' ';
+			sql += value.ToSQLString();
+		}
 		return true;
 	}
 
@@ -253,31 +322,33 @@ private:
 			if (op.children.size() != 1) {
 				return false;
 			}
-			string name;
+			vector<string> path;
 			LogicalType coltype;
-			if (!ColumnName(*op.children[0], name, coltype)) {
+			if (!ColumnPath(*op.children[0], path, coltype)) {
 				return false;
 			}
 			out = "{\"op\":\"";
 			out += type == ExpressionType::OPERATOR_IS_NULL ? "is_null" : "is_not_null";
-			out += "\",\"col\":";
-			JsonStr(name, out);
+			out += "\",";
+			JsonColumnRef(path, out);
 			out += "}";
 			sql.clear();
-			SqlIdent(name, sql);
-			sql += type == ExpressionType::OPERATOR_IS_NULL ? " IS NULL" : " IS NOT NULL";
+			if (path.size() == 1) { // struct-member: JSON only (see Comparison)
+				SqlIdent(path[0], sql);
+				sql += type == ExpressionType::OPERATOR_IS_NULL ? " IS NULL" : " IS NOT NULL";
+			}
 			return true;
 		}
 		if (type == ExpressionType::COMPARE_IN) {
 			// children[0] = column, children[1..] = constants (IN-rewriting runs after
 			// filter pushdown, so IN is still a single operator here). IN is positive
 			// equality => superset-safe for all types (incl VARCHAR).
-			if (op.children.size() < 2 || op.children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+			if (op.children.size() < 2) {
 				return false;
 			}
-			string name;
+			vector<string> path;
 			LogicalType coltype;
-			if (!ColumnName(*op.children[0], name, coltype)) {
+			if (!ColumnPath(*op.children[0], path, coltype)) {
 				return false;
 			}
 			vector<Value> values;
@@ -291,22 +362,31 @@ private:
 				}
 				values.push_back(v);
 			}
-			out = "{\"op\":\"in\",\"col\":";
-			JsonStr(name, out);
+			bool emit_sql = path.size() == 1; // struct-member: JSON only (see Comparison)
+			out = "{\"op\":\"in\",";
+			JsonColumnRef(path, out);
 			out += ",\"vals\":[";
 			sql.clear();
-			SqlIdent(name, sql);
-			sql += " IN (";
+			if (emit_sql) {
+				SqlIdent(path[0], sql);
+				sql += " IN (";
+			}
 			for (idx_t i = 0; i < values.size(); i++) {
 				if (i) {
 					out += ',';
-					sql += ", ";
+					if (emit_sql) {
+						sql += ", ";
+					}
 				}
 				out += to_string(AddConstant(values[i]));
-				sql += values[i].ToSQLString();
+				if (emit_sql) {
+					sql += values[i].ToSQLString();
+				}
 			}
 			out += "]}";
-			sql += ')';
+			if (emit_sql) {
+				sql += ')';
+			}
 			return true;
 		}
 		return false; // OPERATOR_NOT etc.: leave to DuckDB
@@ -339,28 +419,51 @@ private:
 			sql = sql_parts[0];
 			return true;
 		}
-		const char *joiner = is_and ? " AND " : " OR ";
 		out = "{\"op\":\"";
 		out += is_and ? "and" : "or";
 		out += "\",\"children\":[";
-		sql = "(";
 		for (idx_t i = 0; i < parts.size(); i++) {
 			if (i) {
 				out += ',';
-				sql += joiner;
 			}
 			out += parts[i];
-			sql += sql_parts[i];
 		}
 		out += "]}";
+		// The SQL twin per child may be EMPTY (struct-member predicates are JSON-only): AND may skip an
+		// empty child (fewer predicates = superset); OR must drop the whole disjunction (a narrowed branch
+		// would be a subset). The JSON above is unaffected.
+		sql.clear();
+		vector<string> sqls;
+		for (auto &cs : sql_parts) {
+			if (!cs.empty()) {
+				sqls.push_back(cs);
+			} else if (is_or) {
+				return true; // JSON emitted; no SQL twin for the OR
+			}
+		}
+		if (sqls.empty()) {
+			return true;
+		}
+		if (sqls.size() == 1) {
+			sql = sqls[0];
+			return true;
+		}
+		const char *joiner = is_and ? " AND " : " OR ";
+		sql = "(";
+		for (idx_t i = 0; i < sqls.size(); i++) {
+			if (i) {
+				sql += joiner;
+			}
+			sql += sqls[i];
+		}
 		sql += ')';
 		return true;
 	}
 
 	bool Between(const BoundBetweenExpression &b, string &out, string &sql) {
-		string name;
+		vector<string> path;
 		LogicalType coltype;
-		if (!ColumnName(*b.input, name, coltype)) {
+		if (!ColumnPath(*b.input, path, coltype)) {
 			return false;
 		}
 		if (coltype.id() == LogicalTypeId::VARCHAR && !string_order_pushable_) {
@@ -381,26 +484,29 @@ private:
 		const char *hi_op = b.upper_inclusive ? "<=" : "<";
 		out = "{\"op\":\"and\",\"children\":[{\"op\":\"compare\",\"cmp\":\"";
 		out += lo_op;
-		out += "\",\"col\":";
-		JsonStr(name, out);
+		out += "\",";
+		JsonColumnRef(path, out);
 		out += ",\"val\":" + to_string(lo_idx) + "},{\"op\":\"compare\",\"cmp\":\"";
 		out += hi_op;
-		out += "\",\"col\":";
-		JsonStr(name, out);
+		out += "\",";
+		JsonColumnRef(path, out);
 		out += ",\"val\":" + to_string(hi_idx) + "}]}";
-		sql = "(";
-		SqlIdent(name, sql);
-		sql += ' ';
-		sql += lo_op;
-		sql += ' ';
-		sql += lo.ToSQLString();
-		sql += " AND ";
-		SqlIdent(name, sql);
-		sql += ' ';
-		sql += hi_op;
-		sql += ' ';
-		sql += hi.ToSQLString();
-		sql += ')';
+		sql.clear();
+		if (path.size() == 1) { // struct-member: JSON only (see Comparison)
+			sql = "(";
+			SqlIdent(path[0], sql);
+			sql += ' ';
+			sql += lo_op;
+			sql += ' ';
+			sql += lo.ToSQLString();
+			sql += " AND ";
+			SqlIdent(path[0], sql);
+			sql += ' ';
+			sql += hi_op;
+			sql += ' ';
+			sql += hi.ToSQLString();
+			sql += ')';
+		}
 		return true;
 	}
 
@@ -418,9 +524,6 @@ private:
 void ArrowNetComplexFilterPushdown(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
                                    vector<unique_ptr<Expression>> &filters) {
 	auto &bind_data = bind_data_p->Cast<arrownet::ArrowStreamBindData>();
-	bind_data.filter_json.clear();
-	bind_data.filter_constants.clear();
-	bind_data.native_filter_sql.clear();
 
 	// Diagnostic (duckdb_logs, type 'ArrowNet.Pushdown'): DuckDB may call this callback MORE THAN ONCE per
 	// plan (e.g. once with the static predicates, again as dynamic/join filters materialize), and we
@@ -446,9 +549,18 @@ void ArrowNetComplexFilterPushdown(ClientContext &context, LogicalGet &get, Func
 	};
 
 	if (filters.empty()) {
+		// A later optimizer round can re-invoke this callback with an EMPTY list — under exact mode
+		// (filter_pushdown=true) the first round's predicates were ERASED into the TableFilterSet, so
+		// they no longer appear here. KEEP the previous serialization: those predicates are still the
+		// query's own (and still applied via the erased set / re-applied by DuckDB), so pruning with
+		// them stays superset-correct — clearing would silently forfeit file/row-group pruning on every
+		// exact-mode scan.
 		log_result(0);
 		return;
 	}
+	bind_data.filter_json.clear();
+	bind_data.filter_constants.clear();
+	bind_data.native_filter_sql.clear();
 	FilterSerializer ser(get, bind_data.filter_constants, bind_data.string_order_pushable);
 	vector<string> parts;
 	vector<string> sql_parts;
@@ -464,7 +576,9 @@ void ArrowNetComplexFilterPushdown(ClientContext &context, LogicalGet &get, Func
 		log_result(0);
 		return;
 	}
-	// The filters vector is an implicit AND (both the JSON tree and the native SQL WHERE).
+	// The filters vector is an implicit AND (both the JSON tree and the native SQL WHERE). A part's SQL
+	// twin may be EMPTY (struct-member predicates are JSON-only) — an AND may simply skip it (fewer
+	// predicates applied = superset; DuckDB re-applies everything).
 	if (parts.size() == 1) {
 		bind_data.filter_json = parts[0];
 		bind_data.native_filter_sql = sql_parts[0];
@@ -476,10 +590,14 @@ void ArrowNetComplexFilterPushdown(ClientContext &context, LogicalGet &get, Func
 	for (idx_t i = 0; i < parts.size(); i++) {
 		if (i) {
 			json += ',';
-			sql += " AND ";
 		}
 		json += parts[i];
-		sql += sql_parts[i];
+		if (!sql_parts[i].empty()) {
+			if (!sql.empty()) {
+				sql += " AND ";
+			}
+			sql += sql_parts[i];
+		}
 	}
 	json += "]}";
 	bind_data.filter_json = std::move(json);
@@ -493,6 +611,14 @@ ArrowNetTableEntry::ArrowNetTableEntry(Catalog &catalog, SchemaCatalogEntry &sch
     : TableCatalogEntry(catalog, schema, info), handle_(handle), rowid_columns_(std::move(rowid_columns)),
       virtual_rowid_columns_(std::move(virtual_rowid_columns)), rowid_type_(std::move(rowid_type)) {
 }
+
+// NOTE on struct filters under exact mode (filter_pushdown=true): a `WHERE (s).a = 5` becomes an
+// erased StructFilter in the TableFilterSet, which the scan MUST apply — RenderTableFilter
+// (arrow_ingest.cpp) renders it as struct_extract SQL. DuckDB's `supports_pushdown_type` veto (pull
+// struct filters back out of the scan) was tried and REJECTED: it requires `filter_prune`-maintained
+// projection_ids, and DuckDB's veto path (plan_get.cpp) corrupts rowid DML plans whose projection_ids
+// are empty (RemoveUnusedColumns early-outs on everything_referenced) and crashes on rowid entries
+// (function-level virtual_columns.at) — upstream only pairs the veto with the DML-less arrow scan.
 
 // Cardinality callback: hands the optimizer the table's approximate row count so
 // join ordering has a real estimate. Unknown (-1) => no statistics reported.

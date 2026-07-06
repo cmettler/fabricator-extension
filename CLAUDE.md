@@ -1390,6 +1390,52 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   delete (28) / update (63) / partition (54) / dv (48) / time_travel (48) + SQL Server pushdown suites green.
   Nuance: a mid-scan-refined dynamic filter (TopN) is captured only as of scan-init (best-effort). **Remaining:
   slice 3** (multi-lane, deferred by user).
+  **STRUCT-member filter pushdown/PRUNING DONE (2026-07-06).** `WHERE (s).a = 5` (arrives at
+  `pushdown_complex_filter` as a `struct_extract` `BoundFunctionExpression` chain — verified in DuckDB source;
+  the ColumnIndex-with-children rewrite is projections-only and runs AFTER filter pushdown) is now serialized
+  as a **dotted-path FilterNode** (`"path":["s","a"]`, `col` null — a renderer without path support throws →
+  its caller falls back to no pushdown, superset-safe; SQL Server/DAX can't have struct columns) and drives
+  engineered-wood **file-level pruning via nested Delta stats + parquet row-group/bloom pruning**:
+  `FilterSerializer::ColumnPath` unwraps `struct_extract`/`struct_extract_at` (member names resolved from the
+  child struct type via the bound `StructExtractBindData` index — exact case), all shapes (compare / IS NULL /
+  IN / BETWEEN / conjunctions); `DeltaFilterBuilder` joins the path to EW's dotted convention ("s.a") which the
+  parquet `StatisticsAccessor`/bloom probe ALREADY resolve natively (`ColumnDescriptor.DottedPath`); EW
+  `ColumnStats.Parse` now FLATTENS nested minValues/maxValues/nullCount into dotted keys (nested nullCount was
+  previously dropped at parse) + `DeltaFilePruner` registers struct leaves dotted (dual logical|physical under
+  column mapping; a literal dotted column name colliding with a struct path is POISONED — no pruning, never a
+  guess; EW `NestedStatsPruningTests` 6). **Nested nodes emit NO native-SQL twin** (JSON-only): the rendered
+  logical member access would mis-bind inside `read_parquet` on a column-mapped table (physical child names) —
+  so the Conjunction/top-level SQL joins tolerate empty per-part SQL (AND skips = superset; OR drops its whole
+  SQL twin). **Exact mode**: the erased StructFilter renders as proper `struct_extract("s",'name')` SQL (new
+  `RenderTableFilter` STRUCT_EXTRACT case — the bare `ToString` dot form mis-quotes exotic names); works on the
+  codec path (HostBatchFilter runs over logically-renamed batches → mapped tables fine), unmapped native, AND
+  **column-mapped native_read via the LOGICAL STRUCT REBUILD** (second pass, same day): `DeltaNativeReader`'s
+  per-file inner subquery rebuilds each mapped struct column with logical member names — `CASE WHEN "col-s" IS
+  NULL THEN NULL ELSE struct_pack("a" := ("col-s")."col-a", …) END AS "s"` (recursive; the CASE preserves
+  NULL-struct semantics — bare struct_pack would materialize a non-NULL struct of NULLs; quoted named args
+  verified). Child names resolve per level via `StoredChildName`: **id mode through THIS file's parquet
+  field_ids** (`FileMapping.FieldIdToName` — the pre-existing per-file footer probe, reads every vintage incl.
+  old EW id-files that stored logical names) else the declared `physicalName` (name mode), else logical.
+  `NeedsRebuild` skips no-op trees (unmapped/equal names keep the plain alias + parquet filter pushdown);
+  list/map members pass through unrebuilt (per-batch `ArrowColumnMappingRename` still fixes their inner names —
+  its tolerant either-name matching makes it a no-op on rebuilt columns). `DeltaSqlFilter` also renders path
+  nodes as `struct_extract` chains (a nested-only WHERE now applies in-query on the static native path too).
+  **DuckDB's `supports_pushdown_type` veto was tried and REJECTED** (would pull
+  struct filters back out of the scan): it requires `filter_prune`-maintained projection_ids and DuckDB's veto
+  path (plan_get.cpp) corrupts rowid DML plans (RemoveUnusedColumns early-outs on everything_referenced →
+  empty projection_ids → the veto's append turns identity into a 1-column projection) and crashes on rowid
+  entries (`virtual_columns.at` reads the FUNCTION-level hook, not the entry's) — upstream only pairs it with
+  the DML-less arrow scan; upstream-report candidate. `ArrowStreamInitGlobal` now honors `input.projection_ids`
+  (the filter_prune contract, currently always empty=identity — defensive). **CRUX BUG FIXED en route (latent,
+  affected ALL exact-mode scans): `pushdown_complex_filter` is re-invoked by a later optimizer round with an
+  EMPTY list once the first round's predicates were erased into the TableFilterSet — the callback's
+  clear-on-entry WIPED `filter_json`, silently forfeiting Delta file pruning on every exact-mode
+  (native_read / `pushdown_filters 'all'`) scan.** Now an empty re-invocation KEEPS the previous serialization
+  (still the query's own predicates → pruning stays superset-correct); proven: `delta native list … pruned=1`
+  on a nested predicate. `test/verify_delta_catalog_struct_filter.test` (67 — all predicate shapes, two-level
+  nesting, cross-mode agreement none/static/exact, exact-mode DML with struct WHERE, **name- AND id-mapped
+  native_read struct filters via the rebuild** incl. NULL-struct semantics, unmapped native_read, plain +
+  mapped codec); delta suite 42/42 + SQL Server suites green.
   **COLUMN MAPPING on the native read — DONE (2026-07-05, C#-only, no ABI; live Fabric-Spark-validated).** A
   column-mapping Delta table (`delta.columnMapping.mode` = `name` or `id`) stores columns under PHYSICAL names
   (`col-<guid>`), so the plain `read_parquet` SELECT-by-logical-name failed (*"Referenced column 'id' not found;
