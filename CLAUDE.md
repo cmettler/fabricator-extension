@@ -384,8 +384,10 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   `ARROWNET_ALTER_ADD_FIELD/DROP_FIELD/RENAME_FIELD` kinds (additive enum values 9-11; paths cross as a
   JSON array of segments since names may contain dots; the new field rides the existing single-field
   Arrow stream). EW gained the nested analogs `AddFieldAsync`/`RenameFieldAsync`/`DropFieldAsync`
-  (`TransformStructAt` schema rebuild at any depth; mapping assigns a fresh id+physicalName to an added
-  field — struct-typed additions REJECTED under mapping since descendants would need ids; rename/drop
+  (`TransformStructAt` schema rebuild at any depth; mapping assigns ids+physicalNames to an added field
+  RECURSIVELY via the create-time `AssignColumnMapping` — struct/array/map-typed additions get ids on
+  every descendant; the same helper FIXED a latent top-level `AddColumnAsync` bug that committed
+  spec-violating metadata for struct-typed adds under mapping, kernel-validated; rename/drop
   require mapping, same rule as top-level; protocol upgrade fires for schema-driven features of the new
   type). **The crux: the read reconciliation is now RECURSIVE** — `BackfillMissingColumns` +
   `ReconcileColumn` rebuild a struct whose child set differs from the current schema (ADDed member -> a
@@ -397,7 +399,7 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   delta-kernel reads the evolved tables exactly (standard metadata commits).
   `test/verify_delta_catalog_nested_alter.test` (71 — two-level adds, mixed-vintage reads + predicates,
   rename/drop, DV DELETE + UPDATE on evolved tables, re-attach durability, unmapped guards, struct-typed
-  add allowed plain/rejected mapped, + native_read over evolved mixed-vintage tables); delta suite green;
+  add on plain AND mapped incl. top-level, + native_read over evolved mixed-vintage tables — now 100); delta suite green;
   EW 147+168. SQL Server/DAX reject the new kinds cleanly. **The native_read PRESENCE PROBE (second pass,
   same day) lifted the evolution limitations — and fixed the PRE-EXISTING top-level one:** `native_read`
   of a file predating ANY added column/member failed loudly in BOTH mapping modes (top-level: the alias/

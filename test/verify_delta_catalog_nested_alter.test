@@ -211,13 +211,25 @@ ALTER TABLE p.main.t ADD COLUMN s.a INT;
 ----
 already exists
 
-# struct-typed field additions are rejected on a MAPPING table (descendants would need ids)
-statement error
+# struct-typed field additions work on BOTH plain and MAPPING tables — under mapping the whole
+# new subtree gets column ids + physical names recursively (the create-time assigner)
+statement ok
 ALTER TABLE w.main.t ADD COLUMN s.deep STRUCT(q INT);
-----
-not supported
 
-# ...but allowed on a plain table
+statement ok
+INSERT INTO w.main.t VALUES (200, {'alpha': 2000, 'n': {'x': 20, 'y': 21}, 'deep': {'q': 9}});
+
+query II
+SELECT (s).deep.q, count(*) OVER () FROM w.main.t WHERE id = 200;
+----
+9	1
+
+# old rows read the whole new subtree as NULL
+query I
+SELECT count(*) FROM w.main.t WHERE (s).deep IS NULL OR (s).deep.q IS NULL;
+----
+4
+
 statement ok
 ALTER TABLE p.main.t ADD COLUMN s.deep STRUCT(q INT);
 
@@ -229,3 +241,21 @@ SELECT id, (s).deep.q, (s).b FROM p.main.t ORDER BY id;
 ----
 1	NULL	NULL
 2	7	x
+
+# a struct-typed TOP-LEVEL add on a MAPPING table also assigns ids recursively (this previously
+# committed spec-violating metadata — descendants without column ids)
+statement ok
+ALTER TABLE w.main.t ADD COLUMN extra2 STRUCT(m VARCHAR, k INT);
+
+statement ok
+INSERT INTO w.main.t VALUES (201, {'alpha': 2010, 'n': {'x': 21, 'y': 22}, 'deep': {'q': 10}}, {'m': 'hello', 'k': 42});
+
+query II
+SELECT (extra2).m, (extra2).k FROM w.main.t WHERE id = 201;
+----
+hello	42
+
+query I
+SELECT count(*) FROM w.main.t WHERE extra2 IS NULL;
+----
+5
