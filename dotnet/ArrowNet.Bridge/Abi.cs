@@ -281,6 +281,12 @@ public static class AlterKind
     public const int SetDefault = 7;
     public const int DropDefault = 8;
 
+    // Nested STRUCT-field evolution (`ALTER TABLE t ADD/DROP/RENAME COLUMN s.f ...`). The field path
+    // crosses in a1 as a JSON array of segments (names may contain dots).
+    public const int AddField = 9;     // a1 = the CONTAINING struct's path; `column` = the new field
+    public const int DropField = 10;   // a1 = the field's full path
+    public const int RenameField = 11; // a1 = the field's full path; a2 = the new name
+
     /// <summary>flags bit 0: the if-(not-)exists guard.</summary>
     public const int FlagIfExists = 1;
 }

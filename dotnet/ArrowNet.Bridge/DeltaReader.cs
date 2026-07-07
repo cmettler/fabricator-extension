@@ -89,6 +89,11 @@ internal static class DeltaReader
         /// <see cref="ArrowColumnMappingRename"/> to each batch (a zero-copy recursive type-tree rename back to
         /// the logical names). Null for flat tables (fully handled by the top-level alias).</summary>
         public EngineeredWood.DeltaLake.Schema.StructType? MappedSchema { get; init; }
+
+        /// <summary>The snapshot's FULL Delta schema (always set — mapping or not). Drives the native
+        /// reader's per-file presence handling: stored names, field ids and typed NULL backfill for
+        /// columns/members a file predates (schema evolution).</summary>
+        public EngineeredWood.DeltaLake.Schema.StructType? TableSchema { get; init; }
     }
 
     /// <summary>Resolves the version whose commit is at/just-before <paramref name="instantUtc"/> (via the
@@ -207,7 +212,7 @@ internal static class DeltaReader
             {
                 Version = snap.Version, Files = files, AnyUri = anyUri,
                 LogicalToPhysical = logicalToPhysical, LogicalToFieldId = logicalToFieldId,
-                MappedSchema = mappedSchema,
+                MappedSchema = mappedSchema, TableSchema = snap.Schema,
             };
         }
         finally
@@ -759,6 +764,67 @@ internal static class DeltaReader
         catch (DeltaConflictException)
         {
             throw ConcurrentModification("ADD COLUMN");
+        }
+        finally
+        {
+            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+    }
+
+    /// <summary>Adds a field INSIDE a nested struct (metadata-only; <paramref name="containerPath"/> names
+    /// the containing struct). Old files backfill the new member as NULL on read.</summary>
+    public static void AddField(
+        nint opener, string path, IReadOnlyList<string> containerPath, Field field, CancellationToken ct)
+    {
+        var fs = TableFileSystems.Create(opener, path);
+        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).AsTask().GetAwaiter().GetResult();
+        try
+        {
+            table.AddFieldAsync(containerPath, field, ct).AsTask().GetAwaiter().GetResult();
+        }
+        catch (DeltaConflictException)
+        {
+            throw ConcurrentModification("ADD COLUMN (nested field)");
+        }
+        finally
+        {
+            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+    }
+
+    /// <summary>Renames a field INSIDE a nested struct (metadata-only; requires column mapping).</summary>
+    public static void RenameField(
+        nint opener, string path, IReadOnlyList<string> fieldPath, string newName, CancellationToken ct)
+    {
+        var fs = TableFileSystems.Create(opener, path);
+        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).AsTask().GetAwaiter().GetResult();
+        try
+        {
+            table.RenameFieldAsync(fieldPath, newName, ct).AsTask().GetAwaiter().GetResult();
+        }
+        catch (DeltaConflictException)
+        {
+            throw ConcurrentModification("RENAME COLUMN (nested field)");
+        }
+        finally
+        {
+            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+    }
+
+    /// <summary>Drops a field INSIDE a nested struct (metadata-only; requires column mapping).</summary>
+    public static void DropField(
+        nint opener, string path, IReadOnlyList<string> fieldPath, CancellationToken ct)
+    {
+        var fs = TableFileSystems.Create(opener, path);
+        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).AsTask().GetAwaiter().GetResult();
+        try
+        {
+            table.DropFieldAsync(fieldPath, ct).AsTask().GetAwaiter().GetResult();
+        }
+        catch (DeltaConflictException)
+        {
+            throw ConcurrentModification("DROP COLUMN (nested field)");
         }
         finally
         {

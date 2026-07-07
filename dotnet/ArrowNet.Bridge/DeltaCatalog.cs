@@ -1540,6 +1540,32 @@ public sealed class DeltaCatalog : IBackendCatalog
                 DeltaReader.DropColumn(Opener(), TablePath(s, t), dropCol, default);
                 return;
             }
+            case AlterKind.AddField:
+            {
+                // a1 = JSON path of the CONTAINING struct; `c` = the new field (metadata-only commit;
+                // old files backfill NULL on read via the recursive schema-evolution reconcile).
+                var col = c ?? throw new System.InvalidOperationException(
+                    "delta ADD COLUMN (nested field) requires a field definition.");
+                var container = ParseJsonPath(a1, "ADD COLUMN (nested field)");
+                DeltaReader.AddField(Opener(), TablePath(s, t), container, col, default);
+                return;
+            }
+            case AlterKind.RenameField:
+            {
+                // a1 = JSON full path of the field; a2 = the new name (requires column mapping).
+                var fieldPath = ParseJsonPath(a1, "RENAME COLUMN (nested field)");
+                string newFieldName = a2 ?? throw new System.InvalidOperationException(
+                    "delta RENAME COLUMN (nested field) requires the new name.");
+                DeltaReader.RenameField(Opener(), TablePath(s, t), fieldPath, newFieldName, default);
+                return;
+            }
+            case AlterKind.DropField:
+            {
+                // a1 = JSON full path of the field (requires column mapping; readers reconcile old files).
+                var fieldPath = ParseJsonPath(a1, "DROP COLUMN (nested field)");
+                DeltaReader.DropField(Opener(), TablePath(s, t), fieldPath, default);
+                return;
+            }
             case AlterKind.RenameTable:
             {
                 string newName = a1 ?? throw new System.InvalidOperationException(
@@ -1558,8 +1584,24 @@ public sealed class DeltaCatalog : IBackendCatalog
                 return;
             }
             default:
-                throw Unsupported("ALTER TABLE (only ADD/RENAME/DROP COLUMN and RENAME TABLE are supported on Delta)");
+                throw Unsupported("ALTER TABLE (only ADD/RENAME/DROP COLUMN — top-level or nested struct field — "
+                                  + "and RENAME TABLE are supported on Delta)");
         }
+    }
+
+    // A nested-field path from the host: a JSON array of segments (["s","inner","f"] — names may contain dots).
+    private static IReadOnlyList<string> ParseJsonPath(string? json, string operation)
+    {
+        if (string.IsNullOrEmpty(json))
+        {
+            throw new System.InvalidOperationException($"delta {operation} requires a field path.");
+        }
+        var segments = System.Text.Json.JsonSerializer.Deserialize<List<string>>(json!);
+        if (segments is not { Count: > 0 })
+        {
+            throw new System.InvalidOperationException($"delta {operation}: invalid field path '{json}'.");
+        }
+        return segments;
     }
 
     public Schema GetFunctionParamSchema(string s, string f) => throw NoFunctions();

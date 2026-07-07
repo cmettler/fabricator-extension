@@ -2340,6 +2340,33 @@ void ArrowNetSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 	table_types_.erase(info.name);
 	entries_.erase(info.name);
 }
+// A nested-field path as a JSON array of segments (["s","inner","f"]) — segment names may contain dots,
+// so a joined string would be ambiguous. Consumed by the provider's field-evolution alter kinds.
+static string JsonPathArray(const vector<string> &path) {
+	string json = "[";
+	for (idx_t i = 0; i < path.size(); i++) {
+		if (i) {
+			json += ',';
+		}
+		json += '"';
+		for (char c : path[i]) {
+			switch (c) {
+			case '"':
+				json += "\\\"";
+				break;
+			case '\\':
+				json += "\\\\";
+				break;
+			default:
+				json += c;
+			}
+		}
+		json += '"';
+	}
+	json += ']';
+	return json;
+}
+
 void ArrowNetSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 	if (info.type != AlterType::ALTER_TABLE) {
 		throw NotImplementedException("mssql_net: only ALTER TABLE is supported");
@@ -2423,6 +2450,36 @@ void ArrowNetSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info)
 		producer.Finish();
 		arrownet::AlterTable(handle_, name, table, ARROWNET_ALTER_COLUMN_TYPE, ct.column_name, "", producer.Stream(),
 		                     0);
+		refresh(table);
+		break;
+	}
+	case AlterTableType::ADD_FIELD: {
+		// `ALTER TABLE t ADD COLUMN s.f <type>` — add a field INSIDE a nested struct. The containing
+		// struct's path crosses as a JSON array (segments may contain dots); the new field's name + type
+		// travel as the single-field zero-row Arrow stream, exactly like ADD_COLUMN.
+		auto &af = table_info.Cast<AddFieldInfo>();
+		int32_t flags = af.if_field_not_exists ? ARROWNET_ALTER_FLAG_IF_EXISTS : 0;
+		vector<LogicalType> types {af.new_field.Type()};
+		vector<string> names {af.new_field.Name()};
+		arrownet::ArrowProducer producer(types, names, arrownet::BoundaryClientProperties(context));
+		producer.Finish();
+		arrownet::AlterTable(handle_, name, table, ARROWNET_ALTER_ADD_FIELD, JsonPathArray(af.column_path), "",
+		                     producer.Stream(), flags);
+		refresh(table);
+		break;
+	}
+	case AlterTableType::REMOVE_FIELD: {
+		auto &rf = table_info.Cast<RemoveFieldInfo>();
+		int32_t flags = rf.if_column_exists ? ARROWNET_ALTER_FLAG_IF_EXISTS : 0;
+		arrownet::AlterTable(handle_, name, table, ARROWNET_ALTER_DROP_FIELD, JsonPathArray(rf.column_path), "",
+		                     nullptr, flags);
+		refresh(table);
+		break;
+	}
+	case AlterTableType::RENAME_FIELD: {
+		auto &rf = table_info.Cast<RenameFieldInfo>();
+		arrownet::AlterTable(handle_, name, table, ARROWNET_ALTER_RENAME_FIELD, JsonPathArray(rf.column_path),
+		                     rf.new_name, nullptr, 0);
 		refresh(table);
 		break;
 	}

@@ -128,6 +128,12 @@ typedef enum {
 	ARROWNET_ALTER_DROP_NOT_NULL = 6, // arg1 = column name
 	ARROWNET_ALTER_SET_DEFAULT = 7,   // arg1 = column name; arg2 = "-" (DEFAULT NULL) or "b"+base64(literal)
 	ARROWNET_ALTER_DROP_DEFAULT = 8,  // arg1 = column name
+	// Nested STRUCT-field evolution (DuckDB `ALTER TABLE t ADD/DROP/RENAME COLUMN s.f ...`). Field paths
+	// cross as a JSON array of segments (names may contain dots). Additive enum values — no ABI bump.
+	ARROWNET_ALTER_ADD_FIELD = 9,     // arg1 = JSON path of the CONTAINING struct; `column` carries the new
+	                                  // field (name + type); flag0 = if_not_exists
+	ARROWNET_ALTER_DROP_FIELD = 10,   // arg1 = JSON full path of the field; flag0 = if_exists
+	ARROWNET_ALTER_RENAME_FIELD = 11, // arg1 = JSON full path of the field; arg2 = new field name
 } ArrowNetAlterKind;
 
 #define ARROWNET_ALTER_FLAG_IF_EXISTS 1

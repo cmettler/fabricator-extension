@@ -69,48 +69,69 @@ internal static class DeltaNativeReader
         return new AsyncEnumerableArrowStream(schema, StreamFiles(listing, dataCols, wantRowId, where, prefetch));
     }
 
-    // The effective column-name mapping for ONE file of a column-mapping table: the top-level logical→physical
-    // alias map, plus (id mode) THIS file's parquet `field_id → stored name` for every schema node — the
-    // struct-rebuild's per-level child resolution (reads every vintage/layout, incl. old engineered-wood
-    // id-mode files that stored LOGICAL names under field_ids).
+    // Everything the per-file SQL needs to know about ONE data file: the top-level logical→physical alias
+    // map (column mapping), and this file's ACTUAL parquet schema nodes (paths + field ids, footer-probed) —
+    // driving stored-name resolution (every vintage/layout) AND per-file PRESENCE: a column/member the file
+    // predates (schema evolution) is emitted as a typed NULL instead of a mis-binding reference.
     private readonly record struct FileMapping(
         IReadOnlyDictionary<string, string>? LogToPhys,
-        IReadOnlyDictionary<int, string>? FieldIdToName);
+        FileNodes Nodes);
+
+    private const char PathSep = ''; // joins stored-name path segments (names may contain dots)
 
     // The per-file SELECT (ordinal folded into the rowid expression); file_row_number is read but only surfaces
     // as _metadata.row_id (and drives the DV exclusion) — never as an output column.
     private static string FileSql(IReadOnlyList<string> dataCols, bool wantRowId, string? where,
                                   DeltaReader.NativeScanFile f, FileMapping fm,
-                                  DeltaSchema.StructType? mappedSchema)
+                                  DeltaSchema.StructType? tableSchema)
     {
-        // The scan source. No column mapping: read_parquet exposes the data columns by their logical name +
-        // file_row_number. Column mapping (name/id): the file stores PHYSICAL names, so alias physical→logical in
-        // an inner query — then the OUTER projection, user filter, rowid, and DV condition all reference logical
-        // names + file_row_number unchanged (no filter rewrite; DuckDB pushes the outer filter into read_parquet).
-        // A mapped STRUCT column is additionally REBUILT with logical member names (see RebuildExpr) so a pushed
-        // struct-member predicate (`struct_extract("s",'a') …`) binds — nested children are physical-named
-        // inside the files, which a plain top-level alias cannot fix.
+        // Per-column projection over THIS file's actual layout:
+        //   • column mapping: alias the stored PHYSICAL name to the logical one; a mapped STRUCT whose shape
+        //     differs from the file (renamed/added/dropped members) is REBUILT with logical member names
+        //     (RebuildExpr) so a pushed struct-member predicate binds;
+        //   • schema evolution: a column/member ADDed after this file was written is emitted as
+        //     CAST(NULL AS <type>) (presence via the footer-probed node paths/field ids); a DROPped member
+        //     disappears because the rebuild projects only the CURRENT members.
+        // The OUTER projection, user filter, rowid and DV condition all reference logical names unchanged.
+        var inner = new List<string>(dataCols.Count + 1);
+        bool needsInner = false;
+        foreach (var c in dataCols)
+        {
+            var field = FindField(tableSchema, c);
+            string stored = field is not null
+                ? StoredChildName(field, fm)
+                : fm.LogToPhys is { } m && m.TryGetValue(c, out var p) ? p : c;
+            string expr;
+            if (field is not null && !Present(field, stored, fm))
+            {
+                expr = $"CAST(NULL AS {TypeText(field.Type)})";
+                needsInner = true;
+            }
+            else if (field?.Type is DeltaSchema.StructType st && StructShapeDiffers(st, stored, fm))
+            {
+                expr = RebuildExpr(field.Type, Quote(stored), stored, fm);
+                needsInner = true;
+            }
+            else
+            {
+                expr = Quote(stored);
+                if (!string.Equals(stored, c, StringComparison.Ordinal))
+                {
+                    needsInner = true;
+                }
+            }
+            inner.Add(string.Equals(expr, Quote(c), StringComparison.Ordinal)
+                ? Quote(c)
+                : $"{expr} AS {Quote(c)}");
+        }
+
         string source;
-        if (fm.LogToPhys is null && mappedSchema is null)
+        if (!needsInner)
         {
             source = $"read_parquet('{f.Uri.Replace("'", "''")}', file_row_number => true)";
         }
         else
         {
-            var inner = new List<string>(dataCols.Count + 1);
-            foreach (var c in dataCols)
-            {
-                string phys = fm.LogToPhys is { } m && m.TryGetValue(c, out var p) ? p : c;
-                var field = mappedSchema?.Fields.FirstOrDefault(x => x.Name == c);
-                if (field is not null && NeedsRebuild(field.Type, fm))
-                {
-                    inner.Add($"{RebuildExpr(field.Type, Quote(phys), fm)} AS {Quote(c)}");
-                }
-                else
-                {
-                    inner.Add(phys != c ? $"{Quote(phys)} AS {Quote(c)}" : Quote(c));
-                }
-            }
             inner.Add("file_row_number");
             source = $"(SELECT {string.Join(", ", inner)} FROM read_parquet('{f.Uri.Replace("'", "''")}', file_row_number => true))";
         }
@@ -155,7 +176,7 @@ internal static class DeltaNativeReader
         {
             var probeFile = new DeltaReader.NativeScanFile(0, probe, System.Array.Empty<long>());
             var sql = FileSql(dataCols, wantRowId, where: null, probeFile,
-                              ResolveFileMapping(listing, probe), listing.MappedSchema) + " LIMIT 0";
+                              ResolveFileMapping(listing, probe), listing.TableSchema) + " LIMIT 0";
             using var s = Host.Query(sql);
             // Nested mapped fields: the probed schema carries physical struct-child names — rename to logical
             // (top level is already logical via the SELECT alias; the transform passes it through).
@@ -211,7 +232,7 @@ internal static class DeltaNativeReader
                         try
                         {
                             var sql = FileSql(dataCols, wantRowId, where, file,
-                                              ResolveFileMapping(listing, file.Uri), listing.MappedSchema);
+                                              ResolveFileMapping(listing, file.Uri), listing.TableSchema);
                             Log.LogDebug("delta native file: {Sql}", sql);
                             using var s = Host.Query(sql);
                             while (true)
@@ -261,24 +282,28 @@ internal static class DeltaNativeReader
     //   • no mapping → empty (FileSql reads by logical name directly).
     private static FileMapping ResolveFileMapping(DeltaReader.NativeScanList listing, string uri)
     {
+        // ALWAYS probe the file's actual schema nodes (footer-only; the footer is fetched again by the
+        // subsequent read_parquet, so the bytes are cache-warm): presence is what lets a file predating a
+        // schema evolution read correctly (absent columns/members become typed NULLs) — in every mapping
+        // mode, at every nesting level.
+        var nodes = ProbeFileNodes(uri);
         if (listing.LogicalToPhysical is { } phys)
         {
-            return new FileMapping(phys, null);
+            return new FileMapping(phys, nodes);
         }
         if (listing.LogicalToFieldId is not { } logToFid)
         {
-            return default;
+            return new FileMapping(null, nodes);
         }
-        var fieldIdToName = ProbeFieldIds(uri);
         var map = new Dictionary<string, string>();
         foreach (var kv in logToFid)
         {
-            if (fieldIdToName.TryGetValue(kv.Value, out var physName) && physName != kv.Key)
+            if (nodes.FieldIdToName.TryGetValue(kv.Value, out var physName) && physName != kv.Key)
             {
                 map[kv.Key] = physName;
             }
         }
-        return new FileMapping(map.Count > 0 ? map : null, fieldIdToName);
+        return new FileMapping(map.Count > 0 ? map : null, nodes);
     }
 
     // The stored (in-file) name of a mapped field at ANY nesting level: id mode resolves through THIS file's
@@ -287,10 +312,7 @@ internal static class DeltaNativeReader
     // mode; Spark + engineered-wood both store columns under it), else the logical name.
     private static string StoredChildName(DeltaSchema.StructField field, FileMapping fm)
     {
-        if (fm.FieldIdToName is { } fids && field.Metadata is { } byId
-            && byId.TryGetValue(DeltaSchema.ColumnMapping.FieldIdKey, out var idText)
-            && int.TryParse(idText, System.Globalization.NumberStyles.Integer, CultureInfo.InvariantCulture, out var fid)
-            && fids.TryGetValue(fid, out var stored))
+        if (FieldIdOf(field) is { } fid && fm.Nodes.FieldIdToName.TryGetValue(fid, out var stored))
         {
             return stored;
         }
@@ -303,11 +325,81 @@ internal static class DeltaNativeReader
         return field.Name;
     }
 
-    // True when a struct tree contains any member whose stored name differs from its logical name — the plain
-    // top-level alias then isn't enough and the column needs the struct_pack rebuild.
-    private static bool NeedsRebuild(DeltaSchema.DeltaDataType type, FileMapping fm)
-        => type is DeltaSchema.StructType st
-           && st.Fields.Any(ch => StoredChildName(ch, fm) != ch.Name || NeedsRebuild(ch.Type, fm));
+    private static int? FieldIdOf(DeltaSchema.StructField field)
+        => field.Metadata is { } md
+           && md.TryGetValue(DeltaSchema.ColumnMapping.FieldIdKey, out var idText)
+           && int.TryParse(idText, System.Globalization.NumberStyles.Integer,
+                           CultureInfo.InvariantCulture, out var fid)
+            ? fid
+            : null;
+
+    // True when THIS file physically contains the field: by its declared column-mapping field id when the
+    // file carries one, else by its stored-name path. False = the file predates the field (schema
+    // evolution) -> the SQL emits a typed NULL instead of a mis-binding reference.
+    private static bool Present(DeltaSchema.StructField field, string storedPath, FileMapping fm)
+        => (FieldIdOf(field) is { } fid && fm.Nodes.FieldIdToName.ContainsKey(fid))
+           || fm.Nodes.Paths.Contains(storedPath);
+
+    private static DeltaSchema.StructField? FindField(DeltaSchema.StructType? schema, string name)
+    {
+        if (schema is null)
+        {
+            return null;
+        }
+        foreach (var f in schema.Fields)
+        {
+            if (string.Equals(f.Name, name, StringComparison.Ordinal))
+            {
+                return f;
+            }
+        }
+        foreach (var f in schema.Fields)
+        {
+            if (string.Equals(f.Name, name, StringComparison.OrdinalIgnoreCase))
+            {
+                return f;
+            }
+        }
+        return null;
+    }
+
+    // True when the struct column's CURRENT member tree differs from what THIS file stores — a mapped
+    // rename (stored != logical), a member the file predates (ADD), a member the file still carries that
+    // the schema dropped (DROP), or any of those recursively — so the column needs the struct_pack rebuild
+    // (which projects exactly the current members, backfilling absent ones as typed NULLs).
+    private static bool StructShapeDiffers(DeltaSchema.StructType st, string parentPath, FileMapping fm)
+    {
+        var expectedStored = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var ch in st.Fields)
+        {
+            var stored = StoredChildName(ch, fm);
+            expectedStored.Add(stored);
+            if (!string.Equals(stored, ch.Name, StringComparison.Ordinal))
+            {
+                return true;
+            }
+            var childPath = parentPath + PathSep + stored;
+            if (!Present(ch, childPath, fm))
+            {
+                return true;
+            }
+            if (ch.Type is DeltaSchema.StructType cst && StructShapeDiffers(cst, childPath, fm))
+            {
+                return true;
+            }
+        }
+        if (fm.Nodes.Children.TryGetValue(parentPath, out var fileChildren))
+        {
+            foreach (var child in fileChildren)
+            {
+                if (!expectedStored.Contains(child))
+                {
+                    return true; // dropped member still in the file -> project members explicitly
+                }
+            }
+        }
+        return false;
+    }
 
     // Rebuilds a MAPPED struct column with LOGICAL member names in SQL:
     //   CASE WHEN src IS NULL THEN NULL ELSE struct_pack("a" := (src)."col-a", …) END
@@ -316,7 +408,7 @@ internal static class DeltaNativeReader
     // NULL (struct_pack alone would materialize a non-NULL struct of NULLs). List/map members pass through
     // unrebuilt: their inner struct names stay physical (the per-batch ArrowColumnMappingRename fixes them,
     // and no StructFilter can reach inside a list/map).
-    private static string RebuildExpr(DeltaSchema.DeltaDataType type, string src, FileMapping fm)
+    private static string RebuildExpr(DeltaSchema.DeltaDataType type, string src, string srcPath, FileMapping fm)
     {
         if (type is not DeltaSchema.StructType st || st.Fields.Count == 0)
         {
@@ -325,19 +417,74 @@ internal static class DeltaNativeReader
         var parts = new List<string>(st.Fields.Count);
         foreach (var ch in st.Fields)
         {
-            var childSrc = $"({src}).{Quote(StoredChildName(ch, fm))}";
-            parts.Add($"{Quote(ch.Name)} := {RebuildExpr(ch.Type, childSrc, fm)}");
+            var stored = StoredChildName(ch, fm);
+            var childPath = srcPath + PathSep + stored;
+            string expr;
+            if (!Present(ch, childPath, fm))
+            {
+                // This file predates the member (nested schema evolution) -> a typed NULL child.
+                expr = $"CAST(NULL AS {TypeText(ch.Type)})";
+            }
+            else
+            {
+                var childSrc = $"({src}).{Quote(stored)}";
+                expr = RebuildExpr(ch.Type, childSrc, childPath, fm);
+            }
+            parts.Add($"{Quote(ch.Name)} := {expr}");
         }
         return $"CASE WHEN {src} IS NULL THEN NULL ELSE struct_pack({string.Join(", ", parts)}) END";
     }
 
-    // Reads a parquet file's `field_id → physical column name` (top-level + nested nodes) via parquet_schema —
-    // a footer-only read. Rows with no field_id (e.g. the schema root) are skipped.
-    private static Dictionary<int, string> ProbeFieldIds(string uri)
+    // The DuckDB type text for a Delta type — the CAST target for schema-evolution NULL backfill. Struct
+    // member names are the LOGICAL names (matching the rebuilt/renamed output convention).
+    private static string TypeText(DeltaSchema.DeltaDataType type) => type switch
     {
-        var result = new Dictionary<int, string>();
-        var sql = $"SELECT name, CAST(field_id AS BIGINT) AS fid FROM parquet_schema('{uri.Replace("'", "''")}') WHERE field_id IS NOT NULL";
+        DeltaSchema.PrimitiveType pt => pt.TypeName switch
+        {
+            "string" => "VARCHAR",
+            "long" => "BIGINT",
+            "integer" => "INTEGER",
+            "short" => "SMALLINT",
+            "byte" => "TINYINT",
+            "double" => "DOUBLE",
+            "float" => "FLOAT",
+            "boolean" => "BOOLEAN",
+            "binary" => "BLOB",
+            "date" => "DATE",
+            "timestamp" => "TIMESTAMPTZ",     // Delta timestamp is UTC-adjusted -> TIMESTAMP WITH TIME ZONE
+            "timestamp_ntz" => "TIMESTAMP",
+            var dec when dec.StartsWith("decimal(", StringComparison.Ordinal) => dec.ToUpperInvariant(),
+            var other => throw new NotSupportedException(
+                $"delta native read: no NULL-backfill type mapping for '{other}'."),
+        },
+        DeltaSchema.StructType st =>
+            "STRUCT(" + string.Join(", ", st.Fields.Select(f => $"{Quote(f.Name)} {TypeText(f.Type)}")) + ")",
+        DeltaSchema.ArrayType at => TypeText(at.ElementType) + "[]",
+        DeltaSchema.MapType mt => $"MAP({TypeText(mt.KeyType)}, {TypeText(mt.ValueType)})",
+        _ => throw new NotSupportedException(
+            $"delta native read: no NULL-backfill type mapping for '{type}'."),
+    };
+
+    // ONE file's actual parquet schema nodes, footer-probed via parquet_schema: every node's stored-name
+    // PATH (PathSep-joined, root excluded), each node's field id when present, and the direct children per
+    // node — presence + stored-name resolution for column mapping AND schema evolution.
+    private sealed class FileNodes
+    {
+        public HashSet<string> Paths { get; } = new(StringComparer.Ordinal);
+        public Dictionary<int, string> FieldIdToName { get; } = new();
+        public Dictionary<string, List<string>> Children { get; } = new(StringComparer.Ordinal);
+    }
+
+    private static FileNodes ProbeFileNodes(string uri)
+    {
+        var nodes = new FileNodes();
+        // parquet_schema emits the footer's flat DFS pre-order (name, num_children); reconstruct each
+        // node's path with a stack. The first row is the schema root (skipped; its children are depth 1).
+        var sql = "SELECT name, CAST(num_children AS BIGINT), CAST(field_id AS BIGINT) "
+                  + $"FROM parquet_schema('{uri.Replace("'", "''")}')";
         using var s = Host.Query(sql);
+        var stack = new Stack<(string Path, long Remaining)>();
+        bool sawRoot = false;
         while (true)
         {
             var batch = s.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
@@ -348,17 +495,47 @@ internal static class DeltaNativeReader
             using (batch)
             {
                 var names = (StringArray)batch.Column(0);
-                var fids = (Int64Array)batch.Column(1);
+                var childCounts = (Int64Array)batch.Column(1);
+                var fids = (Int64Array)batch.Column(2);
                 for (int i = 0; i < batch.Length; i++)
                 {
-                    if (fids.IsValid(i) && !names.IsNull(i))
+                    string name = names.GetString(i);
+                    long children = childCounts.IsValid(i) ? childCounts.GetValue(i)!.Value : 0;
+                    if (!sawRoot)
                     {
-                        result[(int)fids.GetValue(i)!.Value] = names.GetString(i);
+                        sawRoot = true;
+                        stack.Push(("", children));
+                        continue;
+                    }
+                    if (stack.Count == 0)
+                    {
+                        break; // malformed ordering — stop rather than misattribute paths
+                    }
+                    var (parentPath, remaining) = stack.Pop();
+                    stack.Push((parentPath, remaining - 1));
+                    string path = parentPath.Length == 0 ? name : parentPath + PathSep + name;
+                    nodes.Paths.Add(path);
+                    if (!nodes.Children.TryGetValue(parentPath, out var siblings))
+                    {
+                        nodes.Children[parentPath] = siblings = new List<string>();
+                    }
+                    siblings.Add(name);
+                    if (fids.IsValid(i))
+                    {
+                        nodes.FieldIdToName[(int)fids.GetValue(i)!.Value] = name;
+                    }
+                    if (children > 0)
+                    {
+                        stack.Push((path, children));
+                    }
+                    while (stack.Count > 0 && stack.Peek().Remaining == 0)
+                    {
+                        stack.Pop();
                     }
                 }
             }
         }
-        return result;
+        return nodes;
     }
 
     private static int Prefetch()

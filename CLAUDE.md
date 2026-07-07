@@ -377,6 +377,44 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   ENTIRE table at footer parse** ("Msg 15813 … Thrift LogicalType that is not recognized" — their parquet
   stack predates the VARIANT logical type; even scalar projections fail). Guidance: endpoint-reachable
   semi-structured data → JSON (VARCHAR) columns, NOT VARIANT; VARIANT = Spark/DuckDB/kernel pipelines.
+- **NESTED STRUCT-field schema evolution — DONE (2026-07-07; additive alter kinds, NO ABI bump).**
+  DuckDB's field DDL (`ALTER TABLE t ADD/DROP/RENAME COLUMN s.f ...` — `AddFieldInfo`/`RemoveFieldInfo`/
+  `RenameFieldInfo` with a `column_path`, first-class in 1.5.4) now works on the Delta catalog as
+  METADATA-ONLY commits. C++ `Alter` gained ADD_FIELD/REMOVE_FIELD/RENAME_FIELD cases → new
+  `ARROWNET_ALTER_ADD_FIELD/DROP_FIELD/RENAME_FIELD` kinds (additive enum values 9-11; paths cross as a
+  JSON array of segments since names may contain dots; the new field rides the existing single-field
+  Arrow stream). EW gained the nested analogs `AddFieldAsync`/`RenameFieldAsync`/`DropFieldAsync`
+  (`TransformStructAt` schema rebuild at any depth; mapping assigns a fresh id+physicalName to an added
+  field — struct-typed additions REJECTED under mapping since descendants would need ids; rename/drop
+  require mapping, same rule as top-level; protocol upgrade fires for schema-driven features of the new
+  type). **The crux: the read reconciliation is now RECURSIVE** — `BackfillMissingColumns` +
+  `ReconcileColumn` rebuild a struct whose child set differs from the current schema (ADDed member -> a
+  typed all-NULL child sized to the PHYSICAL child length [parent offset+len, the TakeRows convention],
+  DROPped member removed, children recursed; parent validity/offset preserved) — shared by the reader,
+  compaction and the rewrite paths, so DML on evolved tables just works. `MakeNullArray` extended
+  (struct/list/Decimal256/Date64/Time32/Time64 + honest THROW on unknown types — it silently backfilled
+  a StringArray before, a latent wrong-type corruption for non-primitive top-level adds).
+  delta-kernel reads the evolved tables exactly (standard metadata commits).
+  `test/verify_delta_catalog_nested_alter.test` (71 — two-level adds, mixed-vintage reads + predicates,
+  rename/drop, DV DELETE + UPDATE on evolved tables, re-attach durability, unmapped guards, struct-typed
+  add allowed plain/rejected mapped, + native_read over evolved mixed-vintage tables); delta suite green;
+  EW 147+168. SQL Server/DAX reject the new kinds cleanly. **The native_read PRESENCE PROBE (second pass,
+  same day) lifted the evolution limitations — and fixed the PRE-EXISTING top-level one:** `native_read`
+  of a file predating ANY added column/member failed loudly in BOTH mapping modes (top-level: the alias/
+  projection referenced a column absent from the old file — broken since slice 1, just never tested;
+  nested: the struct rebuild referenced the new member). Now `ResolveFileMapping` ALWAYS footer-probes
+  each file's `parquet_schema` (`ProbeFileNodes` — DFS path reconstruction via the num_children stack:
+  node PATHS [PathSep=-joined, dot-safe], per-node field ids, direct-children map; the id-mode
+  fid probe is subsumed; the footer bytes are cache-warm for the subsequent read_parquet). `FileSql` is
+  now presence-aware per column: absent top-level -> `CAST(NULL AS <type>) AS "c"`; a struct whose
+  CURRENT member tree differs from the file (`StructShapeDiffers`: mapped rename, ADDed member [absent
+  by fid OR stored path], DROPped member [extra file children], recursive) -> the struct_pack REBUILD
+  with `CAST(NULL AS ...)` for absent members; `TypeText(DeltaDataType)` renders the DuckDB cast targets
+  (timestamp->TIMESTAMPTZ, timestamp_ntz->TIMESTAMP, decimal(p,s) passthrough, STRUCT(..) recursive
+  with LOGICAL member names, arrays/maps; variant -> loud throw). This ALSO fixes the advertised-schema
+  staleness (ProbeSchema's LIMIT-0 probe file could be an OLD vintage — its FileSql now emits the
+  current shape). Cost: one footer-only host query per file on every native scan (was id-mode-only).
+  `verify_delta_catalog_nested_alter.test` now 91 (native_read evolved sections, both modes).
 - **Delta write-side NOT NULL enforcement — DONE (2026-07-07; C#-only, no ABI).** Found by adapting
   duckdb-delta's `non_nullable` test: our Delta INSERT happily wrote a NULL into a column whose Delta schema
   declared `nullable:false` (a spec violation — writers MUST enforce; Spark trusts non-nullable schemas on
