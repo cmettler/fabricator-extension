@@ -98,7 +98,7 @@ public sealed class StubBackend : IBackend
         {
         }
 
-        public void BeginTransaction()
+        public void BeginTransaction(bool isExplicit)
         {
         }
 

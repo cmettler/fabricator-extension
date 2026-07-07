@@ -634,7 +634,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     // begin is a no-op: the connection + provider transaction are pinned lazily on the first write
     // (BeginWrite), keyed by the ambient transaction id. A read-only transaction never creates state.
-    public void BeginTransaction()
+    public void BeginTransaction(bool isExplicit)
     {
     }
 

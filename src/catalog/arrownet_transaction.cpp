@@ -6,6 +6,7 @@
 
 #include "arrownet/clr_host.hpp"
 #include "catalog/arrownet_catalog.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 
 namespace duckdb {
@@ -33,7 +34,10 @@ Transaction &ArrowNetTransactionManager::StartTransaction(ClientContext &context
 	// keyed by the active transaction id. Best-effort: a failure here must not abort the statement.
 	try {
 		arrownet::SetActiveTxn(handle_, result.txn_id_);
-		arrownet::BeginTransaction(handle_);
+		// Explicit user BEGIN vs the implicit per-statement autocommit wrapper: a provider that buffers
+		// transactional DML (the Delta provider) may only change statement-visible semantics for an
+		// explicit transaction.
+		arrownet::BeginTransaction(handle_, !context.transaction.IsAutoCommit());
 	} catch (...) {
 	}
 	return result;
@@ -47,6 +51,10 @@ ErrorData ArrowNetTransactionManager::CommitTransaction(ClientContext &context, 
 	}
 	try {
 		arrownet::SetActiveTxn(handle_, txn_id);
+		// Host-FS opener for a Delta-catalog COMMIT: flushing the transaction's buffered appends writes the
+		// _delta_log commit through DuckDB's FileSystem (secret resolution needs the ClientContext). No-op
+		// for providers that don't use the host FS (SQL Server / DAX).
+		arrownet::SetActiveOpener(reinterpret_cast<ArrowNetHandle>(&context));
 		arrownet::CommitTransaction(handle_);
 	} catch (std::exception &ex) {
 		return ErrorData(ex);

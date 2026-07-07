@@ -286,7 +286,10 @@ public interface IBackendCatalog : IDisposable
     /// provider transaction (lazily, on the first write); subsequent DML runs on
     /// it until <see cref="CommitTransaction"/> / <see cref="RollbackTransaction"/>.
     /// </summary>
-    void BeginTransaction();
+    /// <summary><paramref name="isExplicit"/> is true for a user BEGIN..COMMIT, false for the implicit
+    /// per-statement autocommit wrapper (v60) — a provider buffering transactional DML may only change
+    /// statement-visible semantics for explicit transactions.</summary>
+    void BeginTransaction(bool isExplicit);
 
     /// <summary>Commits the pinned transaction (no-op if none was opened).</summary>
     void CommitTransaction();

@@ -196,7 +196,7 @@ void AlterTable(ArrowNetHandle handle, const std::string &schema, const std::str
 // Transaction boundaries (see abi.h). Begin enters transaction mode; the managed
 // side pins a connection + provider transaction on the first write. Commit/Rollback
 // finish it. All throw duckdb::IOException with the managed message on failure.
-void BeginTransaction(ArrowNetHandle handle);
+void BeginTransaction(ArrowNetHandle handle, bool is_explicit);
 void CommitTransaction(ArrowNetHandle handle);
 void RollbackTransaction(ArrowNetHandle handle);
 

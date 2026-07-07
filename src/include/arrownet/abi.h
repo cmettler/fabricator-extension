@@ -270,7 +270,11 @@ typedef struct ArrowNetVTable {
 	// mode all DML (execute_dml/bulk_insert/execute_delete/execute_update) runs on
 	// the pinned connection so commit/rollback are atomic. Reads stay on their own
 	// connections. begin on an already-open transaction is a no-op.
-	int32_t (*begin_transaction)(ArrowNetHandle handle, char **err);
+	// `is_explicit` (v60): 1 when the DuckDB transaction is a user BEGIN..COMMIT,
+	// 0 for the implicit per-statement autocommit wrapper — a provider that buffers
+	// transactional DML (the Delta provider) changes statement-visible semantics
+	// only for explicit transactions; autocommit keeps the direct per-statement paths.
+	int32_t (*begin_transaction)(ArrowNetHandle handle, int32_t is_explicit, char **err);
 	int32_t (*commit_transaction)(ArrowNetHandle handle, char **err);
 	int32_t (*rollback_transaction)(ArrowNetHandle handle, char **err);
 
@@ -767,7 +771,7 @@ typedef struct ArrowNetHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 59
+#define ARROWNET_ABI_VERSION 60
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

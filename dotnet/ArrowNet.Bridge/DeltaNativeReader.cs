@@ -41,7 +41,10 @@ internal static class DeltaNativeReader
     /// = the resolved time-travel/pinned snapshot ("version"/"timestamp"), or null for latest.</summary>
     public static IArrowArrayStream Read(
         nint opener, string path, Schema userSchema, ScanSpec? spec,
-        IReadOnlyList<object?> filterValues, string? unit, string? value)
+        IReadOnlyList<object?> filterValues, string? unit, string? value,
+        IReadOnlyList<EngineeredWood.DeltaLake.Table.WrittenDataFile>? pendingFiles = null,
+        IReadOnlyDictionary<int, HashSet<long>>? pendingDeletes = null,
+        EngineeredWood.DeltaLake.Schema.StructType? pendingSchema = null)
     {
         bool wantRowId = spec?.Columns is { } c0 && c0.Contains(RowIdColumn);
         var dataCols = spec?.Columns is { Count: > 0 } cols
@@ -57,7 +60,23 @@ internal static class DeltaNativeReader
             ? spec!.NativeFilter
             : spec?.Filter is { } node2 ? DeltaSqlFilter.ToWhere(node2, filterValues) : null;
 
-        var listing = DeltaReader.ListNativeScanFiles(opener, path, unit, value, prune, Log);
+        var listing = DeltaReader.ListNativeScanFiles(opener, path, unit, value, prune, Log,
+                                                      schemaOverride: pendingSchema);
+        if (pendingFiles is { Count: > 0 })
+        {
+            // Read-your-writes: this transaction's streamed-but-uncommitted files join the per-file loop
+            // (same probe / WHERE / DV=none mechanics as committed files — they're real parquet on storage,
+            // Hive-layout included). High disjoint ordinals: no collision with active files or the buffered-
+            // batch overlay's 0x700000 base, and in-transaction DML is rejected anyway.
+            listing = WithPendingFiles(listing, path, pendingFiles);
+        }
+        if (pendingDeletes is { Count: > 0 })
+        {
+            // Read-your-writes for buffered DML: the transaction's pending-DELETEd positions join each
+            // file's DV exclusion (ordinals are pinned-snapshot ordinals — the caller pinned this scan to
+            // exactly that version).
+            listing = WithPendingDeletes(listing, pendingDeletes);
+        }
         var schema = ProbeSchema(listing, userSchema, dataCols, wantRowId);
         int prefetch = Prefetch();
 
@@ -67,6 +86,67 @@ internal static class DeltaNativeReader
             listing.LogicalToPhysical is not null ? "name" : listing.LogicalToFieldId is not null ? "id" : "none");
 
         return new AsyncEnumerableArrowStream(schema, StreamFiles(listing, dataCols, wantRowId, where, prefetch));
+    }
+
+    // Merges the transaction's pending-DELETEd positions into the per-file DV exclusion lists (positions
+    // keyed by the same pinned-snapshot global ordinal the listing carries).
+    private static DeltaReader.NativeScanList WithPendingDeletes(
+        DeltaReader.NativeScanList listing, IReadOnlyDictionary<int, HashSet<long>> pendingDeletes)
+    {
+        var files = new List<DeltaReader.NativeScanFile>(listing.Files.Count);
+        foreach (var f in listing.Files)
+        {
+            if (pendingDeletes.TryGetValue(f.Ordinal, out var extra) && extra.Count > 0)
+            {
+                var merged = new HashSet<long>(f.Dv);
+                merged.UnionWith(extra);
+                var arr = new long[merged.Count];
+                merged.CopyTo(arr);
+                System.Array.Sort(arr);
+                files.Add(f with { Dv = arr });
+            }
+            else
+            {
+                files.Add(f);
+            }
+        }
+        return new DeltaReader.NativeScanList
+        {
+            Version = listing.Version,
+            Files = files,
+            AnyUri = listing.AnyUri,
+            LogicalToPhysical = listing.LogicalToPhysical,
+            LogicalToFieldId = listing.LogicalToFieldId,
+            MappedSchema = listing.MappedSchema,
+            TableSchema = listing.TableSchema,
+        };
+    }
+
+    // Appends the transaction's pending (uncommitted) streamed files to the committed listing, keeping all
+    // snapshot-derived properties (mapping, schema). Ordinal base 0x780000 — disjoint from real file ordinals
+    // AND the buffered-batch synthetic rowid base (0x700000), so a count(*)-via-rowid scan stays unique.
+    private static DeltaReader.NativeScanList WithPendingFiles(
+        DeltaReader.NativeScanList listing, string path,
+        IReadOnlyList<EngineeredWood.DeltaLake.Table.WrittenDataFile> pendingFiles)
+    {
+        var root = DeltaReader.ToReadableRoot(path);
+        var files = new List<DeltaReader.NativeScanFile>(listing.Files.Count + pendingFiles.Count);
+        files.AddRange(listing.Files);
+        for (int i = 0; i < pendingFiles.Count; i++)
+        {
+            var uri = root + "/" + pendingFiles[i].RelativePath.Replace('\\', '/').TrimStart('/');
+            files.Add(new DeltaReader.NativeScanFile(0x780000 + i, uri, System.Array.Empty<long>()));
+        }
+        return new DeltaReader.NativeScanList
+        {
+            Version = listing.Version,
+            Files = files,
+            AnyUri = listing.AnyUri ?? (files.Count > 0 ? files[files.Count - 1].Uri : null),
+            LogicalToPhysical = listing.LogicalToPhysical,
+            LogicalToFieldId = listing.LogicalToFieldId,
+            MappedSchema = listing.MappedSchema,
+            TableSchema = listing.TableSchema,
+        };
     }
 
     // Everything the per-file SQL needs to know about ONE data file: the top-level logical→physical alias

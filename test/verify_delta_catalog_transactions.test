@@ -1,0 +1,1584 @@
+# name: test/verify_delta_catalog_transactions.test
+# description: Explicit DuckDB transactions on the Delta provider — slice 1 (append buffering) + slice 2
+#              (buffered DELETE/UPDATE = snapshot isolation). Appends buffer per DuckDB transaction; DELETE/
+#              UPDATE inside an explicit BEGIN buffer as deletion-vector positions (+ post-image rows) against
+#              the transaction's pinned base version. COMMIT flushes everything as ONE atomic Delta commit per
+#              table, conflict-ABORTING if a concurrent writer moved the table (first-committer-wins snapshot
+#              isolation); ROLLBACK discards (uncommitted parquet = invisible orphans, vacuum's job). Reads
+#              inside the transaction overlay all pending changes (read-your-writes); explicit AT time travel
+#              excludes them. Autocommit is UNCHANGED (per-statement commits, direct DML paths incl. CDF +
+#              copy-on-write). Guards: DDL/maintenance/non-append writes with pending changes; DML on rows
+#              inserted in the same transaction; DV-off / CDF tables inside explicit transactions.
+# group: [mssql_net]
+
+require mssql_net
+
+require-env ARROWNET_DELTA_WRITE_DIR
+
+# ============================================================================
+# 1. Codec catalog: atomic multi-INSERT + rollback (slice 1)
+# ============================================================================
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_codec' AS lake (TYPE arrownet, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE lake.main.t (id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO lake.main.t VALUES (1, 'pre');
+
+# Baseline: v0 CREATE + v1 WRITE.
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('lake', 't');
+----
+2
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO lake.main.t VALUES (2, 'a');
+
+statement ok
+INSERT INTO lake.main.t SELECT i, 'b' || i FROM range(3, 5) AS r(i);
+
+# Read-your-writes: the buffered rows are visible mid-transaction.
+query I
+SELECT count(*) FROM lake.main.t;
+----
+4
+
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
+----
+1	pre
+2	a
+3	b3
+4	b4
+
+query I
+SELECT sum(id) FROM lake.main.t WHERE id >= 2;
+----
+9
+
+statement ok
+INSERT INTO lake.main.t VALUES (5, 'c');
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM lake.main.t;
+----
+5
+
+# ...as ONE new Delta commit (2 snapshots before, exactly 3 after — not 5).
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('lake', 't');
+----
+3
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO lake.main.t VALUES (100, 'doomed');
+
+query I
+SELECT count(*) FROM lake.main.t;
+----
+6
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM lake.main.t;
+----
+5
+
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('lake', 't');
+----
+3
+
+# ============================================================================
+# 2. Buffered DELETE (slice 2): visible mid-txn, one commit, rollback undoes
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+DELETE FROM lake.main.t WHERE id IN (2, 4);
+
+# The deleted rows disappear mid-transaction (read-your-writes over the pending deletion vector)...
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
+----
+1	pre
+3	b3
+5	c
+
+# ...aggregates and filters compose over the exclusion...
+query I
+SELECT count(*) FROM lake.main.t WHERE id >= 1;
+----
+3
+
+statement ok
+ROLLBACK;
+
+# ...and ROLLBACK brings them back (nothing was committed).
+query I
+SELECT count(*) FROM lake.main.t;
+----
+5
+
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('lake', 't');
+----
+3
+
+# Now the committing case: DELETE + a second DELETE in the same transaction compose.
+statement ok
+BEGIN;
+
+statement ok
+DELETE FROM lake.main.t WHERE id = 2;
+
+statement ok
+DELETE FROM lake.main.t WHERE id = 4;
+
+query I
+SELECT count(*) FROM lake.main.t;
+----
+3
+
+statement ok
+COMMIT;
+
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
+----
+1	pre
+3	b3
+5	c
+
+# Exactly ONE new Delta commit for both DELETEs, with operation DELETE.
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('lake', 't');
+----
+4
+
+query T
+SELECT operation FROM arrownet_delta_snapshots('lake', 't') ORDER BY version DESC LIMIT 1;
+----
+DELETE
+
+# ============================================================================
+# 3. Buffered UPDATE (slice 2): post-image visible mid-txn, one UPDATE commit
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE lake.main.t SET name = 'updated' WHERE id = 3;
+
+# The post-image is visible mid-transaction; the old row is gone.
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
+----
+1	pre
+3	updated
+5	c
+
+# Expression UPDATE composes on top (of a committed row).
+statement ok
+UPDATE lake.main.t SET id = id + 100 WHERE id = 5;
+
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
+----
+1	pre
+3	updated
+105	c
+
+statement ok
+COMMIT;
+
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
+----
+1	pre
+3	updated
+105	c
+
+# One commit for both UPDATEs, operation UPDATE.
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('lake', 't');
+----
+5
+
+query T
+SELECT operation FROM arrownet_delta_snapshots('lake', 't') ORDER BY version DESC LIMIT 1;
+----
+UPDATE
+
+# UPDATE + ROLLBACK restores the pre-image.
+statement ok
+BEGIN;
+
+statement ok
+UPDATE lake.main.t SET name = 'doomed' WHERE id = 1;
+
+query T
+SELECT name FROM lake.main.t WHERE id = 1;
+----
+doomed
+
+statement ok
+ROLLBACK;
+
+query T
+SELECT name FROM lake.main.t WHERE id = 1;
+----
+pre
+
+# ============================================================================
+# 4. Mixed INSERT + DELETE + UPDATE in ONE transaction = ONE fused commit
+# ============================================================================
+
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('lake', 't');
+----
+5
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO lake.main.t VALUES (7, 'ins');
+
+statement ok
+DELETE FROM lake.main.t WHERE id = 105;
+
+statement ok
+UPDATE lake.main.t SET name = 'mix' WHERE id = 3;
+
+# Composition mid-transaction: insert visible, delete applied, update applied.
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
+----
+1	pre
+3	mix
+7	ins
+
+statement ok
+COMMIT;
+
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
+----
+1	pre
+3	mix
+7	ins
+
+# ONE commit for all three statements, operation TRANSACTION (mixed kinds).
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('lake', 't');
+----
+6
+
+query T
+SELECT operation FROM arrownet_delta_snapshots('lake', 't') ORDER BY version DESC LIMIT 1;
+----
+TRANSACTION
+
+# ============================================================================
+# 5. Guards: DDL/maintenance with pending changes; DML on same-txn inserts
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO lake.main.t VALUES (8, 'pending');
+
+statement error
+ALTER TABLE lake.main.t ADD COLUMN extra INTEGER;
+----
+after buffered data changes
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement ok
+DELETE FROM lake.main.t WHERE id = 7;
+
+statement error
+DROP TABLE lake.main.t;
+----
+uncommitted buffered changes
+
+statement ok
+ROLLBACK;
+
+# DELETE of a row inserted in the SAME transaction is rejected (later slice).
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO lake.main.t VALUES (9, 'fresh');
+
+statement error
+DELETE FROM lake.main.t WHERE id = 9;
+----
+inserted in the same transaction
+
+statement ok
+ROLLBACK;
+
+# UPDATE of a row updated in the SAME transaction (its post-image is a pending row) is rejected too.
+statement ok
+BEGIN;
+
+statement ok
+UPDATE lake.main.t SET name = 'first' WHERE id = 1;
+
+statement error
+UPDATE lake.main.t SET name = 'second' WHERE id = 1;
+----
+inserted in the same transaction
+
+statement ok
+ROLLBACK;
+
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
+----
+1	pre
+3	mix
+7	ins
+
+# ============================================================================
+# 6. Conflict-abort: a concurrent writer moving the table aborts the COMMIT
+# ============================================================================
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+DELETE FROM lake.main.t WHERE id = 3;
+
+# A second connection commits between con1's pin and its COMMIT (autocommit append).
+statement ok con2
+INSERT INTO lake.main.t VALUES (50, 'racer');
+
+# con1's COMMIT conflict-aborts (its deletion positions are coupled to the pinned version).
+statement error con1
+COMMIT;
+----
+transaction conflict
+
+# The racer's row is there; con1's delete was rolled back (first-committer-wins).
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
+----
+1	pre
+3	mix
+7	ins
+50	racer
+
+# ============================================================================
+# 7. Guards: DV-off and CDF tables reject buffered DML (autocommit works)
+# ============================================================================
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_cow' AS cowlake (TYPE arrownet, PROVIDER 'delta', deletion_vectors false);
+
+statement ok
+CREATE TABLE cowlake.main.c AS SELECT 1 AS i UNION ALL SELECT 2;
+
+statement ok
+BEGIN;
+
+statement error
+DELETE FROM cowlake.main.c WHERE i = 1;
+----
+requires deletion vectors
+
+statement ok
+ROLLBACK;
+
+# Autocommit DELETE on the same table works (direct copy-on-write path, unchanged).
+statement ok
+DELETE FROM cowlake.main.c WHERE i = 1;
+
+query I
+SELECT count(*) FROM cowlake.main.c;
+----
+1
+
+statement ok
+DETACH cowlake;
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_cdf' AS cdflake (TYPE arrownet, PROVIDER 'delta', change_data_feed true);
+
+statement ok
+CREATE TABLE cdflake.main.f AS SELECT 1 AS i UNION ALL SELECT 2;
+
+statement ok
+BEGIN;
+
+statement error
+DELETE FROM cdflake.main.f WHERE i = 1;
+----
+Change-Data-Feed
+
+statement ok
+ROLLBACK;
+
+# Autocommit DELETE keeps full CDF capture (direct path).
+statement ok
+DELETE FROM cdflake.main.f WHERE i = 1;
+
+query I
+SELECT count(*) FROM cdflake.main.f;
+----
+1
+
+statement ok
+DETACH cdflake;
+
+# ============================================================================
+# 8. Multi-table transaction = one commit PER TABLE (appends)
+# ============================================================================
+
+statement ok
+CREATE TABLE lake.main.u (v INTEGER);
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO lake.main.t VALUES (60, 'multi');
+
+statement ok
+INSERT INTO lake.main.u VALUES (10), (20);
+
+query I
+SELECT (SELECT count(*) FROM lake.main.t) + (SELECT count(*) FROM lake.main.u);
+----
+7
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM lake.main.t;
+----
+5
+
+query I
+SELECT sum(v) FROM lake.main.u;
+----
+30
+
+# ============================================================================
+# 9. Explicit AT time travel excludes pending; re-attach durability
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO lake.main.u VALUES (30);
+
+query I
+SELECT count(*) FROM lake.main.u;
+----
+3
+
+query I
+SELECT count(*) FROM lake.main.u AT (VERSION => 1);
+----
+2
+
+statement ok
+ROLLBACK;
+
+statement ok
+DETACH lake;
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_codec' AS lake (TYPE arrownet, PROVIDER 'delta');
+
+query I
+SELECT count(*) FROM lake.main.u;
+----
+2
+
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
+----
+1	pre
+3	mix
+7	ins
+50	racer
+60	multi
+
+statement ok
+DETACH lake;
+
+# ============================================================================
+# 10. native_write catalog: streamed files + buffered DML fuse at COMMIT
+# ============================================================================
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_native' AS nlake (TYPE arrownet, PROVIDER 'delta', native_write true);
+
+statement ok
+CREATE TABLE nlake.main.nt (id INTEGER, grp VARCHAR);
+
+statement ok
+INSERT INTO nlake.main.nt SELECT i, 'g' || (i % 3) FROM range(1, 11) AS r(i);
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO nlake.main.nt SELECT i, 'h' || (i % 3) FROM range(100, 1100) AS r(i);
+
+statement ok
+DELETE FROM nlake.main.nt WHERE id <= 3;
+
+query I
+SELECT count(*) FROM nlake.main.nt;
+----
+1007
+
+query I
+SELECT min(id) FROM nlake.main.nt;
+----
+4
+
+statement ok
+UPDATE nlake.main.nt SET grp = 'upd' WHERE id = 5;
+
+query T
+SELECT grp FROM nlake.main.nt WHERE id = 5;
+----
+upd
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM nlake.main.nt;
+----
+1007
+
+query T
+SELECT grp FROM nlake.main.nt WHERE id = 5;
+----
+upd
+
+# CREATE (v0) + seed INSERT (v1) + ONE fused transaction commit (v2).
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('nlake', 'nt');
+----
+3
+
+# ROLLBACK on the streamed path: files written but never committed.
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO nlake.main.nt VALUES (9999, 'doomed');
+
+statement ok
+DELETE FROM nlake.main.nt WHERE id = 4;
+
+query I
+SELECT count(*) FROM nlake.main.nt;
+----
+1007
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM nlake.main.nt;
+----
+1007
+
+query I
+SELECT min(id) FROM nlake.main.nt;
+----
+4
+
+statement ok
+DETACH nlake;
+
+# ============================================================================
+# 11. native_read catalog: buffered DML read-your-writes on the native scan
+# ============================================================================
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_nread' AS rlake (TYPE arrownet, PROVIDER 'delta', native_write true, native_read true);
+
+statement ok
+CREATE TABLE rlake.main.rt (id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO rlake.main.rt VALUES (1, 'a'), (2, 'b'), (3, 'c');
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO rlake.main.rt VALUES (4, 'pending');
+
+statement ok
+DELETE FROM rlake.main.rt WHERE id = 2;
+
+# Native per-file scan: pending file included, pending-deleted row excluded.
+query IT
+SELECT id, name FROM rlake.main.rt ORDER BY id;
+----
+1	a
+3	c
+4	pending
+
+statement ok
+UPDATE rlake.main.rt SET name = 'upd' WHERE id = 3;
+
+query IT
+SELECT id, name FROM rlake.main.rt ORDER BY id;
+----
+1	a
+3	upd
+4	pending
+
+statement ok
+COMMIT;
+
+query IT
+SELECT id, name FROM rlake.main.rt ORDER BY id;
+----
+1	a
+3	upd
+4	pending
+
+# CREATE + seed + one fused commit.
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('rlake', 'rt');
+----
+3
+
+statement ok
+DETACH rlake;
+
+# ============================================================================
+# 12. Autocommit is unchanged: one statement = one commit, direct DML paths
+# ============================================================================
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_codec' AS alake (TYPE arrownet, PROVIDER 'delta');
+
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('alake', 'u');
+----
+2
+
+statement ok
+INSERT INTO alake.main.u VALUES (40);
+
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('alake', 'u');
+----
+3
+
+# Autocommit DELETE goes through the direct deletion-vector path — one DELETE version.
+statement ok
+DELETE FROM alake.main.u WHERE v = 10;
+
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('alake', 'u');
+----
+4
+
+query T
+SELECT operation FROM arrownet_delta_snapshots('alake', 'u') ORDER BY version DESC LIMIT 1;
+----
+DELETE
+
+query I
+SELECT sum(v) FROM alake.main.u;
+----
+60
+
+statement ok
+DETACH alake;
+
+# ============================================================================
+# 13. Buffered ALTER ADD COLUMN (slice 3): ALTER + DML in ONE atomic commit
+# ============================================================================
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_codec' AS dlake (TYPE arrownet, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE dlake.main.a (id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO dlake.main.a VALUES (1, 'x'), (2, 'y');
+
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('dlake', 'a');
+----
+2
+
+statement ok
+BEGIN;
+
+statement ok
+ALTER TABLE dlake.main.a ADD COLUMN extra INTEGER;
+
+# The pending column is visible mid-transaction — existing rows read NULL.
+query I
+SELECT count(*) FROM dlake.main.a WHERE extra IS NULL;
+----
+2
+
+statement ok
+INSERT INTO dlake.main.a VALUES (3, 'z', 42);
+
+query ITI
+SELECT id, name, extra FROM dlake.main.a ORDER BY id;
+----
+1	x	NULL
+2	y	NULL
+3	z	42
+
+# DML composes on top of the pending schema change.
+statement ok
+DELETE FROM dlake.main.a WHERE id = 1;
+
+query ITI
+SELECT id, name, extra FROM dlake.main.a ORDER BY id;
+----
+2	y	NULL
+3	z	42
+
+statement ok
+COMMIT;
+
+query ITI
+SELECT id, name, extra FROM dlake.main.a ORDER BY id;
+----
+2	y	NULL
+3	z	42
+
+# ALTER + INSERT + DELETE all landed as ONE Delta commit (metaData + add + DV actions).
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('dlake', 'a');
+----
+3
+
+query T
+SELECT operation FROM arrownet_delta_snapshots('dlake', 'a') ORDER BY version DESC LIMIT 1;
+----
+TRANSACTION
+
+# ============================================================================
+# 14. ROLLBACK undoes the buffered ALTER (column + data gone, no version)
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+ALTER TABLE dlake.main.a ADD COLUMN doomed VARCHAR;
+
+statement ok
+INSERT INTO dlake.main.a VALUES (4, 'w', 7, 'gone');
+
+query I
+SELECT count(*) FROM dlake.main.a WHERE doomed IS NOT NULL;
+----
+1
+
+statement ok
+ROLLBACK;
+
+# The column no longer exists...
+statement error
+SELECT doomed FROM dlake.main.a;
+----
+doomed
+
+# ...the row is gone, and no Delta version was written.
+query I
+SELECT count(*) FROM dlake.main.a;
+----
+2
+
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('dlake', 'a');
+----
+3
+
+# ============================================================================
+# 15. Chained ADD COLUMNs (the dbt append_new_columns shape) + UPDATE on the new column
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+ALTER TABLE dlake.main.a ADD COLUMN c1 INTEGER;
+
+statement ok
+ALTER TABLE dlake.main.a ADD COLUMN c2 VARCHAR;
+
+statement ok
+INSERT INTO dlake.main.a (id, name, c1, c2) VALUES (5, 'v', 1, 'one');
+
+# UPDATE can SET a column added in the SAME transaction (on a committed row).
+statement ok
+UPDATE dlake.main.a SET c1 = 99 WHERE id = 2;
+
+query IIT
+SELECT id, c1, c2 FROM dlake.main.a ORDER BY id;
+----
+2	99	NULL
+3	NULL	NULL
+5	1	one
+
+statement ok
+COMMIT;
+
+query IIT
+SELECT id, c1, c2 FROM dlake.main.a ORDER BY id;
+----
+2	99	NULL
+3	NULL	NULL
+5	1	one
+
+# Still ONE commit for both ALTERs + INSERT + UPDATE.
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('dlake', 'a');
+----
+4
+
+# ============================================================================
+# 16. Guards + status quo: ALTER after data changes; other kinds stay immediate
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO dlake.main.a VALUES (6, 'u', NULL, NULL, NULL);
+
+statement error
+ALTER TABLE dlake.main.a ADD COLUMN late INTEGER;
+----
+after buffered data changes
+
+statement ok
+ROLLBACK;
+
+# RENAME COLUMN is transactional too (3b): ROLLBACK undoes it.
+statement ok
+BEGIN;
+
+statement ok
+ALTER TABLE dlake.main.a RENAME COLUMN name TO label;
+
+query T
+SELECT label FROM dlake.main.a WHERE id = 2;
+----
+y
+
+statement ok
+ROLLBACK;
+
+statement error
+SELECT label FROM dlake.main.a;
+----
+label
+
+query T
+SELECT name FROM dlake.main.a WHERE id = 2;
+----
+y
+
+# Autocommit ALTER is unchanged (immediate commit).
+statement ok
+ALTER TABLE dlake.main.a ADD COLUMN auto1 INTEGER;
+
+query I
+SELECT count(*) FROM dlake.main.a WHERE auto1 IS NULL;
+----
+3
+
+statement ok
+DETACH dlake;
+
+# ============================================================================
+# 17. Buffered ALTER on the native paths (native_write collect + native_read scan)
+# ============================================================================
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_nread' AS xlake (TYPE arrownet, PROVIDER 'delta', native_write true, native_read true);
+
+statement ok
+CREATE TABLE xlake.main.xt (id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO xlake.main.xt VALUES (1, 'a'), (2, 'b');
+
+statement ok
+BEGIN;
+
+statement ok
+ALTER TABLE xlake.main.xt ADD COLUMN score DOUBLE;
+
+# Native per-file scan backfills the pending column as typed NULL for committed files.
+query ITR
+SELECT id, name, score FROM xlake.main.xt ORDER BY id;
+----
+1	a	NULL
+2	b	NULL
+
+statement ok
+INSERT INTO xlake.main.xt VALUES (3, 'c', 1.5);
+
+statement ok
+DELETE FROM xlake.main.xt WHERE id = 1;
+
+query ITR
+SELECT id, name, score FROM xlake.main.xt ORDER BY id;
+----
+2	b	NULL
+3	c	1.5
+
+statement ok
+COMMIT;
+
+query ITR
+SELECT id, name, score FROM xlake.main.xt ORDER BY id;
+----
+2	b	NULL
+3	c	1.5
+
+# CREATE + seed + one fused ALTER+INSERT+DELETE commit.
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('xlake', 'xt');
+----
+3
+
+statement ok
+DETACH xlake;
+
+# ============================================================================
+# 18. Buffered RENAME COLUMN (3b): data reads under the new name mid-txn
+# ============================================================================
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_codec' AS elake (TYPE arrownet, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE elake.main.r (id INTEGER, val VARCHAR);
+
+statement ok
+INSERT INTO elake.main.r VALUES (1, 'a'), (2, 'b');
+
+statement ok
+BEGIN;
+
+statement ok
+ALTER TABLE elake.main.r RENAME COLUMN val TO title;
+
+# The committed DATA reads under the new name (the rename-map overlay — not NULL-backfilled!).
+query IT
+SELECT id, title FROM elake.main.r ORDER BY id;
+----
+1	a
+2	b
+
+statement ok
+INSERT INTO elake.main.r VALUES (3, 'c');
+
+# Filter on the renamed column reaches committed data.
+statement ok
+DELETE FROM elake.main.r WHERE title = 'a';
+
+query IT
+SELECT id, title FROM elake.main.r ORDER BY id;
+----
+2	b
+3	c
+
+statement ok
+COMMIT;
+
+query IT
+SELECT id, title FROM elake.main.r ORDER BY id;
+----
+2	b
+3	c
+
+# CREATE + seed + ONE fused RENAME+INSERT+DELETE commit.
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('elake', 'r');
+----
+3
+
+query T
+SELECT operation FROM arrownet_delta_snapshots('elake', 'r') ORDER BY version DESC LIMIT 1;
+----
+TRANSACTION
+
+# ROLLBACK undoes a buffered rename.
+statement ok
+BEGIN;
+
+statement ok
+ALTER TABLE elake.main.r RENAME COLUMN title TO doomed;
+
+query T
+SELECT doomed FROM elake.main.r WHERE id = 2;
+----
+b
+
+statement ok
+ROLLBACK;
+
+statement error
+SELECT doomed FROM elake.main.r;
+----
+doomed
+
+query T
+SELECT title FROM elake.main.r WHERE id = 2;
+----
+b
+
+# ============================================================================
+# 19. Buffered DROP COLUMN (3b): gone mid-txn, rollback restores
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+ALTER TABLE elake.main.r DROP COLUMN title;
+
+statement error
+SELECT title FROM elake.main.r;
+----
+title
+
+statement ok
+INSERT INTO elake.main.r VALUES (4);
+
+query I
+SELECT id FROM elake.main.r ORDER BY id;
+----
+2
+3
+4
+
+statement ok
+ROLLBACK;
+
+# The column (and its data) is back; the insert is gone.
+query IT
+SELECT id, title FROM elake.main.r ORDER BY id;
+----
+2	b
+3	c
+
+# Committing case: pure DROP transaction = one DROP COLUMNS commit.
+statement ok
+BEGIN;
+
+statement ok
+ALTER TABLE elake.main.r DROP COLUMN title;
+
+statement ok
+COMMIT;
+
+statement error
+SELECT title FROM elake.main.r;
+----
+title
+
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('elake', 'r');
+----
+4
+
+query T
+SELECT operation FROM arrownet_delta_snapshots('elake', 'r') ORDER BY version DESC LIMIT 1;
+----
+DROP COLUMNS
+
+# ============================================================================
+# 20. Chained mixed ALTERs (add + rename-of-pending-add + add) + INSERT
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+ALTER TABLE elake.main.r ADD COLUMN x INTEGER;
+
+# Renaming a column ADDed in the same transaction composes (no committed data to remap).
+statement ok
+ALTER TABLE elake.main.r RENAME COLUMN x TO y;
+
+statement ok
+ALTER TABLE elake.main.r ADD COLUMN z VARCHAR;
+
+statement ok
+INSERT INTO elake.main.r VALUES (5, 7, 'zz');
+
+query IIT
+SELECT id, y, z FROM elake.main.r ORDER BY id;
+----
+2	NULL	NULL
+3	NULL	NULL
+5	7	zz
+
+statement ok
+COMMIT;
+
+query IIT
+SELECT id, y, z FROM elake.main.r ORDER BY id;
+----
+2	NULL	NULL
+3	NULL	NULL
+5	7	zz
+
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('elake', 'r');
+----
+5
+
+query T
+SELECT operation FROM arrownet_delta_snapshots('elake', 'r') ORDER BY version DESC LIMIT 1;
+----
+TRANSACTION
+
+# ============================================================================
+# 21. Buffered NESTED field ALTERs (3c): ADD/DROP FIELD + INSERT in one commit
+# ============================================================================
+
+statement ok
+CREATE TABLE elake.main.n (id INTEGER, s STRUCT(a INTEGER, b VARCHAR));
+
+statement ok
+INSERT INTO elake.main.n VALUES (1, {'a': 10, 'b': 'x'});
+
+statement ok
+BEGIN;
+
+statement ok
+ALTER TABLE elake.main.n ADD COLUMN s.c DOUBLE;
+
+statement ok
+ALTER TABLE elake.main.n DROP COLUMN s.b;
+
+# The committed row reads with the pending struct shape: added member NULL, dropped member gone.
+query IIR
+SELECT id, (s).a, (s).c FROM elake.main.n ORDER BY id;
+----
+1	10	NULL
+
+statement ok
+INSERT INTO elake.main.n VALUES (3, {'a': 30, 'c': 3.5});
+
+query IIR
+SELECT id, (s).a, (s).c FROM elake.main.n ORDER BY id;
+----
+1	10	NULL
+3	30	3.5
+
+statement ok
+COMMIT;
+
+query IIR
+SELECT id, (s).a, (s).c FROM elake.main.n ORDER BY id;
+----
+1	10	NULL
+3	30	3.5
+
+# CREATE + seed + ONE fused nested-ALTERs+INSERT commit.
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('elake', 'n');
+----
+3
+
+query T
+SELECT operation FROM arrownet_delta_snapshots('elake', 'n') ORDER BY version DESC LIMIT 1;
+----
+TRANSACTION
+
+# Rollback restores the old struct shape (incl. the dropped member's data).
+statement ok
+BEGIN;
+
+statement ok
+ALTER TABLE elake.main.n DROP COLUMN s.a;
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT id, (s).a FROM elake.main.n ORDER BY id;
+----
+1	10
+3	30
+
+# ============================================================================
+# 22. Boundaries: nested RENAME FIELD stays immediate; partition-column rename guard
+# ============================================================================
+
+# Nested RENAME FIELD is NOT buffered — it commits immediately and survives ROLLBACK (pinned behavior).
+statement ok
+BEGIN;
+
+statement ok
+ALTER TABLE elake.main.n RENAME COLUMN s.a TO q;
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT id, (s).q FROM elake.main.n ORDER BY id;
+----
+1	10
+3	30
+
+# RENAME of a PARTITION column inside a transaction is rejected (the flush's partition split would miss).
+statement ok
+CREATE TABLE elake.main.p (id INTEGER, region VARCHAR) PARTITIONED BY (region);
+
+statement ok
+INSERT INTO elake.main.p VALUES (1, 'US'), (2, 'EU');
+
+statement ok
+BEGIN;
+
+statement error
+ALTER TABLE elake.main.p RENAME COLUMN region TO r2;
+----
+partition column
+
+statement ok
+ROLLBACK;
+
+query IT
+SELECT id, region FROM elake.main.p ORDER BY id;
+----
+1	US
+2	EU
+
+statement ok
+DETACH elake;
+
+# ============================================================================
+# 23. Buffered CREATE TABLE (slice 4): table exists only in the buffer until COMMIT
+# ============================================================================
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_codec' AS flake (TYPE arrownet, PROVIDER 'delta');
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE flake.main.c (id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO flake.main.c VALUES (1, 'a'), (2, 'b');
+
+statement ok
+INSERT INTO flake.main.c VALUES (3, 'c');
+
+# Mid-transaction the table is fully queryable from the buffer.
+query IT
+SELECT id, name FROM flake.main.c ORDER BY id;
+----
+1	a
+2	b
+3	c
+
+query I
+SELECT count(*) FROM flake.main.c;
+----
+3
+
+statement ok
+COMMIT;
+
+query IT
+SELECT id, name FROM flake.main.c ORDER BY id;
+----
+1	a
+2	b
+3	c
+
+# The flush wrote today's CTAS shape: v0 CREATE TABLE + ONE WRITE for all buffered inserts.
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('flake', 'c');
+----
+2
+
+# ============================================================================
+# 24. ROLLBACK of a buffered CREATE: the table never existed
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE flake.main.d (i INTEGER);
+
+statement ok
+INSERT INTO flake.main.d VALUES (9);
+
+query I
+SELECT count(*) FROM flake.main.d;
+----
+1
+
+statement ok
+ROLLBACK;
+
+statement error
+SELECT * FROM flake.main.d;
+----
+
+statement ok
+DETACH flake;
+
+# Re-attach: the rolled-back table left NOTHING on storage.
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_codec' AS flake2 (TYPE arrownet, PROVIDER 'delta');
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'flake2' AND table_name = 'd';
+----
+0
+
+# ============================================================================
+# 25. Buffered CTAS + extra INSERT: one CREATE + one WRITE at COMMIT
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE flake2.main.e AS SELECT i AS id FROM range(1, 6) r(i);
+
+query I
+SELECT count(*) FROM flake2.main.e;
+----
+5
+
+statement ok
+INSERT INTO flake2.main.e VALUES (100);
+
+query I
+SELECT count(*) FROM flake2.main.e;
+----
+6
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM flake2.main.e;
+----
+6
+
+query I
+SELECT max(id) FROM flake2.main.e;
+----
+100
+
+# CTAS rows + the extra INSERT flushed as ONE data commit.
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('flake2', 'e');
+----
+2
+
+# ============================================================================
+# 26. CREATE + DROP in one transaction cancels out (nothing ever on storage)
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE flake2.main.f (x INTEGER);
+
+statement ok
+INSERT INTO flake2.main.f VALUES (1);
+
+statement ok
+DROP TABLE flake2.main.f;
+
+statement ok
+COMMIT;
+
+statement error
+SELECT * FROM flake2.main.f;
+----
+
+# ============================================================================
+# 27. Guards on pending-created tables: ALTER + DML rejected with clear errors
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE flake2.main.g (x INTEGER);
+
+statement error
+ALTER TABLE flake2.main.g ADD COLUMN y INTEGER;
+----
+created in the same transaction
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE flake2.main.g (x INTEGER);
+
+statement ok
+INSERT INTO flake2.main.g VALUES (1);
+
+statement error
+DELETE FROM flake2.main.g WHERE x = 1;
+----
+created in the same transaction
+
+statement ok
+ROLLBACK;
+
+# ============================================================================
+# 28. Empty buffered CREATE + partitioned CTAS-in-transaction
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE flake2.main.h (a INTEGER);
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM flake2.main.h;
+----
+0
+
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('flake2', 'h');
+----
+1
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE flake2.main.pt (id INTEGER, region VARCHAR) PARTITIONED BY (region);
+
+statement ok
+INSERT INTO flake2.main.pt VALUES (1, 'US'), (2, 'EU'), (3, 'US');
+
+query I
+SELECT count(*) FROM flake2.main.pt WHERE region = 'US';
+----
+2
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM flake2.main.pt WHERE region = 'US';
+----
+2
+
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('flake2', 'pt');
+----
+2
+
+statement ok
+DETACH flake2;
+
+# ============================================================================
+# 29. native_write catalog: buffered CTAS (collect path) + rollback + retry
+# ============================================================================
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_native' AS nl2 (TYPE arrownet, PROVIDER 'delta', native_write true);
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE nl2.main.nc AS SELECT i AS id FROM range(1, 501) r(i);
+
+query I
+SELECT count(*) FROM nl2.main.nc;
+----
+500
+
+statement ok
+ROLLBACK;
+
+statement error
+SELECT count(*) FROM nl2.main.nc;
+----
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE nl2.main.nc AS SELECT i AS id FROM range(1, 501) r(i);
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM nl2.main.nc;
+----
+500
+
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('nl2', 'nc');
+----
+2
+
+statement ok
+DETACH nl2;

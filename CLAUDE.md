@@ -1331,7 +1331,13 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v59** (v59 = `begin_bulk` gained an `int32 partition_overwrite` arg — the
+- **Current version: ABI v60** (v60 = `begin_transaction` gained an `int32 is_explicit` arg — 1 for a user
+  `BEGIN..COMMIT`, 0 for the implicit per-statement autocommit wrapper (C++ reads
+  `context.transaction.IsAutoCommit()` in `ArrowNetTransactionManager::StartTransaction`). Drives the Delta
+  provider's **buffered transactional DML** (slice 2 — see the explicit-transactions bullet): DELETE/UPDATE
+  buffer ONLY in explicit transactions; autocommit keeps the direct per-statement paths (CDF capture,
+  copy-on-write) byte-identical. Other providers ignore the flag.)
+- **Prior: v59** (v59 = `begin_bulk` gained an `int32 partition_overwrite` arg — the
   **`PARTITION_OVERWRITE` COPY option**: DYNAMIC partition overwrite (Spark `partitionOverwriteMode=dynamic`) —
   `COPY src TO 'cat.sch.t' (FORMAT mssql_net, CREATE_TABLE false, PARTITION_OVERWRITE true)` atomically replaces
   exactly the partitions PRESENT IN THE INPUT in ONE Delta commit (their active files removed + the new files
@@ -2518,7 +2524,114 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   DELETE/UPDATE do NOT retry (their absolute positions are tied to the scanned snapshot; a concurrent change
   invalidates them) — `DeltaReader` surfaces a clear "concurrent modification — retry the statement" error.
   Verified: 4 parallel processes appending 200 rows each to ONE local Delta table → 800/800 distinct, no lost
-  commits, no surfaced conflicts. **PROVIDER RENAMED to `engineeredwooddelta`** (the engineered-wood-backed Delta
+  commits, no surfaced conflicts.
+  **EXPLICIT TRANSACTIONS — SNAPSHOT-ISOLATED, BUFFERED (slices 1–4, 2026-07-07).** The engineered-wood
+  Delta provider buffers a DuckDB transaction's writes per (txn, table) (`DeltaTxnBuffer`, keyed by the v35
+  `AmbientTransaction` id) and flushes at COMMIT as **ONE atomic Delta commit per table** (Delta has no
+  cross-table txn); **ROLLBACK discards** (streamed-but-uncommitted parquet = invisible orphans → vacuum,
+  Spark's rollback shape). **Slice 1 — appends (all txns incl. autocommit, semantics-neutral there):**
+  `native_write` streams files as before but PARKS the `WrittenDataFile` list
+  (`TryWriteStreaming(deferCommitTo:)`; flush = `CommitDataFilesAsync` with OCC retry — appends are
+  snapshot-independent); the codec path parks materialized batches (flush = `DeltaWriter.Write`).
+  **Slice 2 — buffered DELETE/UPDATE = snapshot isolation (EXPLICIT txns only, gated by the v60
+  `begin_transaction(is_explicit)` flag; autocommit keeps the direct per-statement paths — CDF capture,
+  copy-on-write — byte-identical):** DELETE buffers (pinned-snapshot file ordinal → absolute positions)
+  per table (`BufferDeleteRows` — rowids decoded Bridge-side); UPDATE buffers its old rows the same way +
+  builds post-image rows at statement time (`BufferUpdateRows`: EW `ReadRowsByRowIdsAsync` reads exactly
+  the matched rows, DEEP-COPIED via Arrow-IPC — EW batch buffers don't outlive the open table — then the
+  SET values substitute via the existing `BuildArray`; post-images join the pending append batches).
+  **PinnedVersion** = the version the DML's scan read (`SnapshotPinning.TryGetPinned` on native_read, else
+  current); all later in-txn scans of that table read EXACTLY that version. **Flush fusion**
+  (`FlushDmlTransaction`): validate `CurrentSnapshot.Version == PinnedVersion` (else **conflict-ABORT** —
+  first-committer-wins SI, clear "transaction conflict … retry" error; verified with a two-connection racer
+  test), write pending batches as files via the new EW **`WriteDataFilesAsync`** (write-no-commit half of
+  the batch path: partition split, recursive mapping rename+field-ids, variant transport, `IDataFileWriter`
+  seam, stats; NO row-id materialization — baseRowId assigned at commit like the streaming writer), compute
+  DV actions via the new EW **`ComputeDeletionVectorActionsAsync`** (positionsByOrdinal → remove/add pairs
+  with unioned inline DVs — pure metadata, no CDF), then ONE
+  **`CommitDataFilesAsync(files, Append, extraActions: dvActions, expectedVersion: pinned, operation:)`**
+  (extended: extraActions join the commit; expectedVersion ⇒ conflict-abort instead of the append retry;
+  `HonorWriterFeatures(isAppend:false)` when removes present). commitInfo operation = DELETE / UPDATE /
+  WRITE when single-kind, TRANSACTION when mixed. **Read-your-writes** on every in-txn scan: codec appends
+  concat `ProjectPending` (`ArrayData.Clone` per yield; list snapshotted; synthetic rowid
+  `(0x700000<<40)|pos`); with pending DML the codec scan is FORCED onto `StreamWithRowIdsAt(pinned)` and
+  `DeltaTxnBuffer.ExcludeDeleted` drops the pending-deleted rows (rowid col removed again unless requested);
+  native_read merges pending deletes into each file's DV exclusion (`WithPendingDeletes`) + appends pending
+  FILES to the per-file loop (ordinals from 0x780000) + honors the buffer pin over SnapshotPinning; a
+  `native_write`-without-`native_read` catalog mid-txn routes scans through `ScanNative`. Explicit `AT`
+  time travel EXCLUDES pending. **Guards (never silently non-atomic — clean errors with the autocommit
+  escape):** buffered DML requires DV-enabled + non-CDF tables (UPDATE additionally
+  `SupportsExternalDataFileCommit` + not materialize_row_tracking); DML on rows inserted/updated in the
+  SAME transaction ("COMMIT the inserts first" — pending rowids ≥ 0x700000); DROP/CREATE-OR-REPLACE/
+  OPTIMIZE/VACUUM/non-append writes with ANY pending changes ("uncommitted buffered changes — COMMIT
+  first"). A statement error ABORTS the DuckDB txn. **Slice 3 — buffered `ALTER TABLE … ADD COLUMN`
+  (top-level; explicit txns):** the metaData (+ merged protocol-upgrade) action is computed at statement
+  time via the new EW **`ComputeAddColumn(field, baseMetadata, baseProtocol)`** (compute-only extraction of
+  AddColumnAsync — chained adds compose against the previous pending metadata/protocol; Bridge
+  `MergeProtocol` unions feature lists) and parked on the buffer (`PendingMetadata`/`PendingProtocol`/
+  `PendingDeltaSchema`/`PendingArrowSchema`); it joins the SAME fused commit → **ALTER + INSERT + DELETE +
+  UPDATE in one BEGIN..COMMIT = ONE atomic Delta version** (kernel-validated: delta-kernel reads the fused
+  metaData+protocol+DV+adds commit exactly), and ROLLBACK undoes the column. Overlays: `GetMetadata(Columns)`
+  serves the pending schema (covers DuckDB's bind + the C++ eager post-ALTER re-fetch); codec scans strip
+  pending-only names from the EW projection and RECONCILE each batch to the pending shape
+  (`ReconcileBatch` — added columns backfilled via the typed-NULL `BuildArray`; `ExcludeDeleted` now derives
+  its output shape from each batch); native scans pass the pending Delta schema into
+  `ListNativeScanFiles(schemaOverride:)` so the per-file presence machinery emits `CAST(NULL AS type)`
+  exactly like committed schema evolution (mapping maps recomputed from the pending schema — the added
+  column's id/physicalName was assigned by the compute step); the buffered UPDATE's read-back reconciles
+  before substitution (so `UPDATE t SET <new column> = …` works in the same txn); flush writes batches via
+  `WriteDataFilesAsync(schemaOverride:)` and `BulkInsert` skips the streamed COPY under a pending ALTER
+  (collect path, still native-written via the writer seam); pure-ALTER commit operation = the tracked kind
+  ("ADD COLUMNS"/"RENAME COLUMN"/"DROP COLUMNS", several kinds → "ALTER TABLE"), mixed with data =
+  "TRANSACTION". Order rule: ALTERs must come BEFORE the transaction's data changes ("after buffered data
+  changes" error — writes then run schema-overridden; changing the schema under buffered rows is
+  unsupported). **Slices 3b+3c — buffered RENAME/DROP COLUMN + nested ADD/DROP FIELD** (same mechanism; EW
+  gained the chainable compute-only counterparts `ComputeRenameColumn`/`ComputeDropColumn`/`ComputeAddField`/
+  `ComputeDropField` + the public **`ReconcileBatchToFields`** export of the read path's RECURSIVE
+  schema-evolution reconcile — which made the nested codec overlay free). RENAME's read overlay is a
+  **rename map** (pending name → committed name, composed across chained renames; a renamed pending-ADDed
+  column deliberately has no entry): the codec projection translates pending→committed names for the EW
+  read, `ReconcileBatch` re-labels batch columns committed→pending BEFORE the recursive reconcile (a naive
+  name-match would silently NULL a renamed column — the trap that kept rename out of 3a), and the native
+  path gets rename free (mapping physical names/field-ids are rename-stable, maps recomputed from the
+  pending schema). DROP falls out of the reconcile's project-target-fields semantics. `AlterOps` on the
+  buffer tracks kinds. Boundaries: **nested RENAME FIELD** stays IMMEDIATE (a per-level nested name map in
+  the overlay — deferred; pinned in the test) + **RENAME of a partition column** in a txn is rejected (the
+  flush's partition split runs against committed partition columns; clear error) + RENAME TABLE stays
+  immediate (physical folder move). **Slice 4 — buffered CREATE TABLE / CTAS (fresh tables, explicit
+  txns):** the table exists ONLY in the buffer until COMMIT (`PendingCreate` +
+  `PendingArrowSchema`/`CreatePartitionColumns`; NOTHING touches the `_delta_log` before the flush — the
+  key constraint is that DuckDB's rollback callback has no ClientContext/opener, so rollback can only
+  DISCARD, never clean storage). Scans (`ScanPendingCreated` — both codec + native entry points) and
+  binds (`GetMetadata(Columns)` via `PendingArrowSchema`) serve entirely from the buffer; CTAS collects
+  (the streamed COPY would OpenOrCreate commit-0 mid-txn — the append branch also skips streaming under
+  `PendingCreate`); the flush = today's autocommit CTAS commit shape (v0 CREATE TABLE + ONE WRITE for ALL
+  buffered rows — CTAS + later INSERTs merge; single-commit CTAS = EW follow-up), with a concurrent
+  same-name create conflict-aborting (commit-0 put-if-absent arbitrates; pre-check for the clear error).
+  **CREATE + DROP in one txn cancels out** (`RemoveTable` — nothing ever on storage). Boundaries:
+  ALTER/DELETE/UPDATE on a pending-created table error cleanly ("created in the same transaction — COMMIT
+  the CREATE first"); identity-marked creates + CREATE OR REPLACE + CTAS over an existing table stay
+  immediate (replace removes are snapshot-coupled; identity needs EW's committing writer). dbt is
+  unaffected either way (a buffered model build is simply atomic now). Spark-style logical rebase on
+  conflict = a later refinement. C++: `CommitTransaction` sets `SetActiveOpener(&context)`
+  before the ABI call (the flush writes `_delta_log` through the host FS); rollback needs no opener (the C++
+  `InvalidateAllEntries` on rollback drops the pending-schema catalog entry).
+  `test/verify_delta_catalog_transactions.test` (542 — atomic multi-INSERT, buffered DELETE/UPDATE with
+  mid-txn visibility + rollback-undoes + one-commit-per-txn + operation names, mixed
+  INSERT+DELETE+UPDATE→TRANSACTION, conflict-abort via a second connection, DV-off/CDF/same-txn-row guards,
+  multi-table, AT-excludes-pending, re-attach durability, native_write fused flush (1000-row stream +
+  DELETE + UPDATE), native_read read-your-writes, autocommit version counts + direct-DELETE path, buffered
+  ALTER+DML fused commit + rollback-undoes-column + chained ADDs + SET-on-added-column + ALTER-after-data
+  guard + both native paths, buffered RENAME (data under the new name mid-txn + filter-on-renamed +
+  rollback restores) + DROP (rollback restores column+data; pure-DROP op name) + chained
+  add→rename-pending→add mixed + nested ADD/DROP FIELD fused with INSERT + nested-RENAME-stays-immediate +
+  partition-column-rename guard, buffered CREATE + CTAS (mid-txn queryable, rollback-leaves-nothing incl.
+  re-attach proof, CTAS+INSERT one WRITE, CREATE+DROP cancels, pending-create ALTER/DML guards, empty
+  create, partitioned CTAS-in-txn, native_write CTAS + rollback + retry));
+  `verify_delta_catalog_constraints.test` §4 re-pinned; full delta sweep 45/45; EW DeltaLake 168 + Table
+  147 (both TFMs); SQL fn suites 7/7 (v60 lockstep); kernel readback of the fused commits
+  (metaData+protocol+DV+adds, rename+nested-add/drop, and buffered-CREATE shapes) via the official delta
+  extension. **PROVIDER RENAMED to `engineeredwooddelta`** (the engineered-wood-backed Delta
   provider), with **`delta` + `deltalake` kept as aliases** (non-breaking — `BackendRegistry` resolves Name +
   Aliases case-insensitively; all `verify_delta_*` tests still ATTACH with `PROVIDER 'delta'`). The distinct
   primary name reserves space for a future delta-rs/delta-kernel production provider. `test/verify_delta_rename.test`

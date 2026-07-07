@@ -1028,13 +1028,13 @@ void AlterTable(ArrowNetHandle handle, const std::string &schema, const std::str
 	}
 }
 
-void BeginTransaction(ArrowNetHandle handle) {
+void BeginTransaction(ArrowNetHandle handle, bool is_explicit) {
 	const ArrowNetVTable &vt = GetBridge();
 	if (!vt.begin_transaction) {
 		throw duckdb::IOException("ArrowNet: bridge does not provide begin_transaction");
 	}
 	char *err = nullptr;
-	if (vt.begin_transaction(handle, &err) != ARROWNET_OK) {
+	if (vt.begin_transaction(handle, is_explicit ? 1 : 0, &err) != ARROWNET_OK) {
 		ThrowManagedError(vt, err, "ArrowNet: begin_transaction failed");
 	}
 }

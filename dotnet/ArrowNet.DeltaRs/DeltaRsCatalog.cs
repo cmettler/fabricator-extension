@@ -695,7 +695,7 @@ public sealed class DeltaRsCatalog : IBackendCatalog
 
     // ---- transactions (Delta is per-commit; no cross-statement transaction) ----
 
-    public void BeginTransaction() { }
+    public void BeginTransaction(bool isExplicit) { }
     public void CommitTransaction() { }
     public void RollbackTransaction() { }
 

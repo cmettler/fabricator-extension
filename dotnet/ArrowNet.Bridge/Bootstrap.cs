@@ -51,7 +51,7 @@ public static unsafe class Bootstrap
             return new InMemoryArrayStream(schema, new[] { batch });
         });
 
-        vtable->AbiVersion = 59;
+        vtable->AbiVersion = 60;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -833,7 +833,8 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int BeginTransaction(nint handle, byte** err) => RunTransactionOp(handle, c => c.BeginTransaction(), err);
+    private static int BeginTransaction(nint handle, int isExplicit, byte** err) =>
+        RunTransactionOp(handle, c => c.BeginTransaction(isExplicit != 0), err);
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static int CommitTransaction(nint handle, byte** err) => RunTransactionOp(handle, c => c.CommitTransaction(), err);

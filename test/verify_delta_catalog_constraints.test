@@ -7,10 +7,9 @@
 #              can't declare nested NOT NULL, external Spark tables can), on the collect AND the streaming
 #              (native_write) path. (2) All-NULL column stats (their issue #297 class): the commit must
 #              carry min/max-less stats and pruning must not mis-skip. (3) Partition equality + single-value
-#              IN (their issue #303 class) must not over-prune. (4) Explicit-transaction semantics PINNED:
-#              our Delta writes commit PER STATEMENT — multiple INSERTs in a BEGIN are separate Delta
-#              commits and ROLLBACK does NOT undo them (divergence from duckdb-delta, which buffers until
-#              COMMIT; Delta has no cross-statement transaction in this provider — documented behavior).
+#              IN (their issue #303 class) must not over-prune. (4) Explicit-transaction semantics: appends
+#              BUFFER per DuckDB transaction and flush as ONE Delta commit per table at COMMIT; ROLLBACK
+#              discards them (duckdb-delta parity — full coverage in verify_delta_catalog_transactions.test).
 #              Set ARROWNET_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
 # group: [mssql_net]
 
@@ -186,8 +185,9 @@ SELECT count(*) FROM w.main.pt WHERE part = 41;
 ----
 0
 
-# ---- (4) explicit-transaction semantics PINNED (divergence, documented): Delta writes commit PER
-#          STATEMENT — no cross-statement atomicity, ROLLBACK does not undo a committed write ----
+# ---- (4) explicit-transaction semantics: APPENDS BUFFER per DuckDB transaction and flush as ONE Delta
+#          commit per table at COMMIT; ROLLBACK discards them (duckdb-delta parity — full coverage in
+#          verify_delta_catalog_transactions.test) ----
 statement ok
 CREATE TABLE w.main.txn AS SELECT 1 AS i;
 
@@ -217,15 +217,15 @@ INSERT INTO w.main.txn VALUES (4);
 statement ok
 ROLLBACK;
 
-# the INSERT committed to the Delta log despite the ROLLBACK (per-statement commits — pinned behavior)
+# the ROLLBACK discarded the buffered INSERT (atomic explicit transactions)
 query I
 SELECT count(*) FROM w.main.txn;
 ----
-4
+3
 
-# each INSERT above is its own Delta version: the CTAS data write + 2 in the BEGIN..COMMIT
-# + 1 rolled-back-but-committed
+# the CTAS data write is one WRITE version; the two INSERTs in BEGIN..COMMIT flushed as ONE more;
+# the rolled-back INSERT wrote nothing
 query I
 SELECT count(*) FROM arrownet_delta_snapshots('w', 'txn') WHERE operation = 'WRITE';
 ----
-4
+2

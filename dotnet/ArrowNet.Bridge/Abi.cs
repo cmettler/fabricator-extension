@@ -64,7 +64,7 @@ public unsafe struct ArrowNetVTable
     public delegate* unmanaged[Cdecl]<nint, byte*, byte*, int, byte*, byte*, CArrowArrayStream*, int, byte**, int> AlterTable;
 
     // int32 begin/commit/rollback_transaction(void* handle, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte**, int> BeginTransaction;
+    public delegate* unmanaged[Cdecl]<nint, int, byte**, int> BeginTransaction;
     public delegate* unmanaged[Cdecl]<nint, byte**, int> CommitTransaction;
     public delegate* unmanaged[Cdecl]<nint, byte**, int> RollbackTransaction;
 

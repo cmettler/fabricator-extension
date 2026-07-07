@@ -633,7 +633,7 @@ internal sealed class DaxCatalog : IBackendCatalog
 
     // Transactions: ADOMD/DAX is read-only — accept BEGIN/COMMIT/ROLLBACK as no-ops so a wrapping
     // DuckDB transaction over read-only DAX queries doesn't fail.
-    public void BeginTransaction() { }
+    public void BeginTransaction(bool isExplicit) { }
     public void CommitTransaction() { }
     public void RollbackTransaction() { }
 

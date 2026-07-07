@@ -51,6 +51,11 @@ public static class SnapshotPinning
         return snap.Versions.GetOrAdd(tableKey, _ => resolve(snap.InstantUtc));
     }
 
+    /// <summary>The already-pinned version for <paramref name="tableKey"/> in this transaction, or null when
+    /// no scan pinned it yet (buffered DML uses this so its ordinals match the version the DML's scan read).</summary>
+    public static long? TryGetPinned(long txnId, string tableKey)
+        => Txns.TryGetValue(txnId, out var snap) && snap.Versions.TryGetValue(tableKey, out var v) ? v : null;
+
     /// <summary>Drops all pinned state for a transaction (call on commit/rollback if a hook is available; the
     /// cap makes this optional — memory is bounded regardless).</summary>
     public static void Release(long txnId) => Txns.TryRemove(txnId, out _);

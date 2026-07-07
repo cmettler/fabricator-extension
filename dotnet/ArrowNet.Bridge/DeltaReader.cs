@@ -131,7 +131,8 @@ internal static class DeltaReader
     /// (rowid parity), applies best-effort Delta-log FILE pruning via <paramref name="prune"/> (skip a file whose
     /// stats/partitions can't match), and resolves each surviving file's deletion-vector positions.</summary>
     public static NativeScanList ListNativeScanFiles(
-        nint opener, string path, string? unit, string? value, Predicate? prune, ILogger log)
+        nint opener, string path, string? unit, string? value, Predicate? prune, ILogger log,
+        EngineeredWood.DeltaLake.Schema.StructType? schemaOverride = null)
     {
         var fs = TableFileSystems.Create(opener, path);
         var table = DeltaTable.OpenAsync(fs).GetAwaiter().GetResult();
@@ -140,11 +141,15 @@ internal static class DeltaReader
             var snap = unit is null
                 ? table.CurrentSnapshot
                 : ResolveSnapshotAsync(table, unit, value ?? "", default).AsTask().GetAwaiter().GetResult();
+            // schemaOverride: a buffered transaction's PENDING (ALTERed) schema — presence handling, mapping
+            // maps and pruning key off it so a pending-added column reads as typed NULL from every committed
+            // file (the same machinery as committed schema evolution; no stats => pruning stays superset-safe).
+            var schemaForMaps = schemaOverride ?? snap.Schema;
             var root = ToReadableRoot(path);
             // GLOBAL path-sorted ordinal over ALL active files (matches engineered-wood OrderedActiveFiles), then prune.
             var ordered = new List<AddFile>(snap.ActiveFiles.Values);
             ordered.Sort((a, b) => string.CompareOrdinal(a.Path, b.Path));
-            var pruner = prune is null ? null : new DeltaFilePruner(snap.Schema, snap.Metadata.PartitionColumns);
+            var pruner = prune is null ? null : new DeltaFilePruner(schemaForMaps, snap.Metadata.PartitionColumns);
             var dvReader = new DeletionVectorReader(fs);
             var files = new List<NativeScanFile>();
             string? anyUri = null;
@@ -185,7 +190,7 @@ internal static class DeltaReader
             if (mode == EngineeredWood.DeltaLake.Schema.ColumnMappingMode.Name)
             {
                 var map = new Dictionary<string, string>();
-                foreach (var field in snap.Schema.Fields)
+                foreach (var field in schemaForMaps.Fields)
                 {
                     if (field.Metadata is { } md
                         && md.TryGetValue(EngineeredWood.DeltaLake.Schema.ColumnMapping.PhysicalNameKey, out var phys)
@@ -198,21 +203,21 @@ internal static class DeltaReader
             }
             else if (mode == EngineeredWood.DeltaLake.Schema.ColumnMappingMode.Id)
             {
-                var map = EngineeredWood.DeltaLake.Schema.ColumnMapping.BuildLogicalToFieldIdMap(snap.Schema);
+                var map = EngineeredWood.DeltaLake.Schema.ColumnMapping.BuildLogicalToFieldIdMap(schemaForMaps);
                 logicalToFieldId = map.Count > 0 ? map : null;
             }
             // Nested mapped fields (struct children under physical names in the files) need the recursive
             // batch rename — carry the mapped schema so the reader can apply it.
             var mappedSchema = mode != EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None
-                               && ArrowColumnMappingRename.HasNestedFields(snap.Schema)
-                ? snap.Schema : null;
+                               && ArrowColumnMappingRename.HasNestedFields(schemaForMaps)
+                ? schemaForMaps : null;
             log.LogDebug("delta native list: {Path} v{Version} active={Active} scanned={Scanned} pruned={Pruned} colmap={Map}",
                 path, snap.Version, ordered.Count, files.Count, pruned, mode);
             return new NativeScanList
             {
                 Version = snap.Version, Files = files, AnyUri = anyUri,
                 LogicalToPhysical = logicalToPhysical, LogicalToFieldId = logicalToFieldId,
-                MappedSchema = mappedSchema, TableSchema = snap.Schema,
+                MappedSchema = mappedSchema, TableSchema = schemaForMaps,
             };
         }
         finally
@@ -466,6 +471,99 @@ internal static class DeltaReader
         finally
         {
             table.Dispose();
+        }
+    }
+
+    /// <summary>The table properties buffered (explicit-transaction) DML needs, probed in ONE table open,
+    /// plus the current version (the pin fallback when no scan pinned the transaction yet).</summary>
+    public readonly record struct TxnDmlProfile(
+        bool DvEnabled, bool CdfEnabled, bool SupportsExternalCommit, long Version);
+
+    public static TxnDmlProfile GetTxnDmlProfile(nint opener, string path)
+    {
+        var fs = TableFileSystems.Create(opener, path);
+        var table = DeltaTable.OpenAsync(fs).GetAwaiter().GetResult();
+        try
+        {
+            var cfg = table.CurrentSnapshot.Metadata.Configuration;
+            bool dv = cfg is not null
+                && cfg.TryGetValue("delta.enableDeletionVectors", out var v)
+                && string.Equals(v, "true", System.StringComparison.OrdinalIgnoreCase);
+            bool cdf = cfg is not null
+                && cfg.TryGetValue("delta.enableChangeDataFeed", out var c)
+                && string.Equals(c, "true", System.StringComparison.OrdinalIgnoreCase);
+            return new TxnDmlProfile(dv, cdf, table.SupportsExternalDataFileCommit,
+                                     table.CurrentSnapshot.Version);
+        }
+        finally
+        {
+            table.Dispose();
+        }
+    }
+
+    /// <summary>Runs a compute-only schema change (the <c>Compute*</c> family — ADD/RENAME/DROP COLUMN,
+    /// nested ADD/DROP FIELD) against the table WITHOUT committing: the buffered transaction parks the
+    /// returned actions and fuses them into its ONE commit. Chained changes pass the previous pending
+    /// metadata/protocol as the base via the closure.</summary>
+    public static DeltaTable.DeferredSchemaChange ComputeSchemaChange(
+        nint opener, string path, Func<DeltaTable, DeltaTable.DeferredSchemaChange> compute)
+    {
+        var fs = TableFileSystems.Create(opener, path);
+        var table = DeltaTable.OpenAsync(fs).GetAwaiter().GetResult();
+        try
+        {
+            return compute(table);
+        }
+        finally
+        {
+            table.Dispose();
+        }
+    }
+
+    /// <summary>Reads exactly the rows identified by the given transient rowids, as DEEP-COPIED batches
+    /// (Arrow-IPC round-trip — engineered-wood batch buffers do not outlive the open table) WITH the
+    /// trailing virtual <c>_metadata.row_id</c> column. The read-back step of a buffered UPDATE.</summary>
+    public static List<RecordBatch> ReadRowsByRowIds(
+        nint opener, string path, IReadOnlyCollection<long> rowIds, CancellationToken ct)
+    {
+        var fs = TableFileSystems.Create(opener, path);
+        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options()).GetAwaiter().GetResult();
+        try
+        {
+            var ms = new System.IO.MemoryStream();
+            Apache.Arrow.Ipc.ArrowStreamWriter? w = null;
+            var e = table.ReadRowsByRowIdsAsync(rowIds, ct).GetAsyncEnumerator(ct);
+            try
+            {
+                while (e.MoveNextAsync().AsTask().GetAwaiter().GetResult())
+                {
+                    var b = e.Current;
+                    w ??= new Apache.Arrow.Ipc.ArrowStreamWriter(ms, b.Schema, leaveOpen: true);
+                    w.WriteRecordBatchAsync(b, ct).GetAwaiter().GetResult();
+                }
+            }
+            finally
+            {
+                e.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            }
+            var result = new List<RecordBatch>();
+            if (w is not null)
+            {
+                w.WriteEndAsync(ct).GetAwaiter().GetResult();
+                w.Dispose();
+                ms.Position = 0;
+                using var r = new Apache.Arrow.Ipc.ArrowStreamReader(ms);
+                RecordBatch? rb;
+                while ((rb = r.ReadNextRecordBatchAsync(ct).AsTask().GetAwaiter().GetResult()) is not null)
+                {
+                    result.Add(rb);
+                }
+            }
+            return result;
+        }
+        finally
+        {
+            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
         }
     }
 

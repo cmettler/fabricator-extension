@@ -564,8 +564,17 @@ internal static class DeltaWriter
         bool deletionVectors, bool inCommitTimestamps, bool changeDataFeed, bool rowTracking,
         DeltaWriteSpec? spec, bool materializeRowTracking, out long rowsWritten,
         EngineeredWood.DeltaLake.Schema.ColumnMappingMode columnMapping =
-            EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None)
+            EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None,
+        List<WrittenDataFile>? deferCommitTo = null)
     {
+        // Transaction-deferred commit: the caller (an explicit-transaction append) wants the files WRITTEN
+        // but the Delta commit PARKED — CommitTransaction flushes everything as one atomic commit. Only a
+        // plain Append can defer (an Overwrite's removes are snapshot-coupled).
+        if (deferCommitTo is not null && (mode != DeltaWriteMode.Append || spec?.DynamicPartitionOverwrite == true))
+        {
+            throw new System.InvalidOperationException(
+                "TryWriteStreaming: only a plain Append can defer its commit.");
+        }
         rowsWritten = 0;
         // Cases the streaming commit can't represent → fall back to the batch path.
         if (spec?.ReplaceWhere is { Count: > 0 }) { return null; }
@@ -717,6 +726,16 @@ internal static class DeltaWriter
                     : new List<WrittenDataFile>();
             }
 
+            if (deferCommitTo is not null)
+            {
+                // Explicit transaction: files are on storage, the commit is parked — CommitTransaction
+                // flushes the whole buffer as ONE Delta commit; ROLLBACK leaves them as invisible orphans.
+                deferCommitTo.AddRange(files);
+                Log.LogInformation(
+                    "delta stream-write {Path}: deferred {Files} file(s) rows={Rows} to the transaction commit",
+                    path, files.Count, rowsWritten);
+                return -1;
+            }
             long version = table.CommitDataFilesAsync(
                 files, mode, dynamicPartitionOverwrite: spec?.DynamicPartitionOverwrite == true,
                 cancellationToken: default).AsTask().GetAwaiter().GetResult();
