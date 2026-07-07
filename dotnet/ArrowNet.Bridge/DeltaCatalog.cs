@@ -1299,6 +1299,21 @@ public sealed class DeltaCatalog : IBackendCatalog
             }
         }
 
+        // NOT NULL enforcement on the SET values: a Delta writer must honor the declared nullability
+        // (top-level + struct-field — a struct SET value is the ReadScalarDeep dictionary, walked
+        // recursively; a key missing from the dictionary is an implicit NULL).
+        for (int j = 0; j < setColNames.Count; j++)
+        {
+            if (setSlotField[j] is not { } targetField)
+            {
+                continue;
+            }
+            foreach (var kv in updates)
+            {
+                DeltaNullability.ValidateSetValue(kv.Value[j], targetField, tableName);
+            }
+        }
+
         // STRUCT SET values work on COLUMN-MAPPING tables too: the copy-on-write rewrite applies
         // engineered-wood's RECURSIVE physical-rename + field-id stamping (ColumnMappingRecursive.ToPhysical),
         // so a substituted struct column (rebuilt logical-named from the table schema by BuildArray) lands in

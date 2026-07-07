@@ -377,6 +377,30 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   ENTIRE table at footer parse** ("Msg 15813 … Thrift LogicalType that is not recognized" — their parquet
   stack predates the VARIANT logical type; even scalar projections fail). Guidance: endpoint-reachable
   semi-structured data → JSON (VARCHAR) columns, NOT VARIANT; VARIANT = Spark/DuckDB/kernel pipelines.
+- **Delta write-side NOT NULL enforcement — DONE (2026-07-07; C#-only, no ABI).** Found by adapting
+  duckdb-delta's `non_nullable` test: our Delta INSERT happily wrote a NULL into a column whose Delta schema
+  declared `nullable:false` (a spec violation — writers MUST enforce; Spark trusts non-nullable schemas on
+  read). New Bridge `DeltaNullability` (driven by the table's authoritative Delta schema, active only when it
+  carries a constraint): per-batch validation on the **collect path** (`DeltaWriter.Write`, Append — before any
+  file is written) + a **lazy validating stream wrapper** on the streaming path (`TryWriteStreaming`, wraps
+  BEFORE the physical rename; fallback `return null` leaves the stream unconsumed) + **UPDATE SET** validation
+  (`ExecuteUpdate` — scalar + the ReadScalarDeep struct dictionary, recursive; missing key = implicit NULL).
+  Covers NESTED constraints (struct fields incl. deep nesting, list `containsNull=false`, map
+  `valueContainsNull=false` — parent-validity-masked per row, children indexed at `Data.Offset + i` per the
+  TakeRows convention) — external Spark tables declare these even though DuckDB DDL can't. Errors match DuckDB
+  wording: `NOT NULL constraint failed: <table>.<path>`. Overwrite/REPLACE/CTAS adopt the input schema →
+  deliberately not validated (drop+recreate semantics). Partial-column INSERT omitting a non-nullable column =
+  implicit NULL → error. **Adopted from duckdb-delta** (test survey 2026-07-07): the
+  `null_constraints_structs` fixture (`test/fixtures/` — Spark-declared nested non-nullables; their
+  `null_constraints_lists` fixture was dropped — its commits are pretty-printed multi-line JSON, spec says
+  NDJSON, EW rightly rejects it), the issue-297 class (all-NULL column stats + prune safety), the issue-303
+  class (partition equality / single-value IN must not over-prune), and **explicit-transaction semantics
+  PINNED as a documented divergence**: our Delta writes commit PER STATEMENT — multiple INSERTs in a BEGIN are
+  separate Delta commits and ROLLBACK does NOT undo them (duckdb-delta buffers appends until COMMIT; a
+  per-transaction append buffer is a possible future). `test/verify_delta_catalog_constraints.test` (50).
+  Still open from the survey: a DAT conformance test (the delta-incubator Delta Acceptance Testing corpus via
+  `require-env ARROWNET_DAT_PATH` — validates default/native_read/deltars readers against golden tables incl.
+  Spark checkpoints).
 - **Delta IDENTITY columns — DONE (2026-07-06)**: the v53 generated-column marker (`id BIGINT AS (0)`) now
   works on the Delta provider (`test/verify_delta_catalog_identity.test`, 38; kernel-reads). The heavy lifting
   ALREADY EXISTED in engineered-wood (`IdentityColumn` config/metadata keys + `IdentityColumnWriter.ProcessBatch`

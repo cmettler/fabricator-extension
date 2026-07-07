@@ -1,0 +1,231 @@
+# name: test/verify_delta_catalog_constraints.test
+# description: Delta write-side constraint + edge-case semantics, adapted from duckdb-delta's suite.
+#              (1) NOT NULL enforcement: a Delta WRITER must honor the table's declared nullability
+#              (readers trust it — Spark reads a non-nullable column without null checks), so INSERT /
+#              UPDATE that would introduce a NULL fails BEFORE anything commits — top-level, struct-field
+#              and nested-struct-field (via the duckdb-delta null_constraints_structs fixture; DuckDB DDL
+#              can't declare nested NOT NULL, external Spark tables can), on the collect AND the streaming
+#              (native_write) path. (2) All-NULL column stats (their issue #297 class): the commit must
+#              carry min/max-less stats and pruning must not mis-skip. (3) Partition equality + single-value
+#              IN (their issue #303 class) must not over-prune. (4) Explicit-transaction semantics PINNED:
+#              our Delta writes commit PER STATEMENT — multiple INSERTs in a BEGIN are separate Delta
+#              commits and ROLLBACK does NOT undo them (divergence from duckdb-delta, which buffers until
+#              COMMIT; Delta has no cross-statement transaction in this provider — documented behavior).
+#              Set ARROWNET_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
+# group: [mssql_net]
+
+require mssql_net
+
+require parquet
+
+require-env ARROWNET_DELTA_WRITE_DIR
+
+# ---- (1a) top-level NOT NULL on a table we create ----
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cons' AS w (TYPE arrownet, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE w.main.t (i INT NOT NULL, s VARCHAR);
+
+statement ok
+INSERT INTO w.main.t VALUES (1, 'a'), (2, 'b');
+
+statement error
+INSERT INTO w.main.t VALUES (NULL, 'c');
+----
+NOT NULL constraint failed: t.i
+
+# a multi-row insert with one bad row commits NOTHING
+statement error
+INSERT INTO w.main.t VALUES (3, 'd'), (NULL, 'e');
+----
+NOT NULL constraint failed: t.i
+
+# a partial-column INSERT omitting the non-nullable column is an implicit NULL
+statement error
+INSERT INTO w.main.t (s) VALUES ('f');
+----
+NOT NULL constraint failed: t.i
+
+query II
+SELECT count(*), sum(i) FROM w.main.t;
+----
+2	3
+
+# UPDATE SET NULL on the non-nullable column is rejected; a valid UPDATE passes
+statement error
+UPDATE w.main.t SET i = NULL WHERE s = 'a';
+----
+NOT NULL constraint failed: t.i
+
+statement ok
+UPDATE w.main.t SET i = 10 WHERE s = 'a';
+
+query II
+SELECT count(*), sum(i) FROM w.main.t;
+----
+2	12
+
+# ---- (1b) the streaming (native_write) path enforces too ----
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cons' AS n (TYPE arrownet, PROVIDER 'delta', native_write true);
+
+statement error
+INSERT INTO n.main.t VALUES (NULL, 'g');
+----
+NOT NULL constraint failed: t.i
+
+query I
+SELECT count(*) FROM n.main.t;
+----
+2
+
+# CTAS / CREATE OR REPLACE adopt the INPUT schema (all-nullable) — no constraint carried, insert of NULL ok
+statement ok
+CREATE TABLE w.main.ctas AS SELECT i, s FROM w.main.t;
+
+statement ok
+INSERT INTO w.main.ctas VALUES (NULL, 'ok');
+
+# ---- (1c) NESTED constraints via the duckdb-delta fixture (Spark-declared struct-field nullability;
+#           error-only — a failing collect-path insert writes nothing, keeping the fixture pristine) ----
+statement ok
+ATTACH 'test/fixtures' AS fx (TYPE arrownet, PROVIDER 'delta');
+
+query I
+SELECT count(*) FROM fx.main.null_constraints_structs;
+----
+10
+
+statement error
+INSERT INTO fx.main.null_constraints_structs VALUES (NULL, {'value': 1}, {'value': {'a': 1, 'b': 1}});
+----
+NOT NULL constraint failed: null_constraints_structs.i
+
+statement error
+INSERT INTO fx.main.null_constraints_structs VALUES (1, NULL, {'value': {'a': 1, 'b': 1}});
+----
+NOT NULL constraint failed: null_constraints_structs.struct
+
+statement error
+INSERT INTO fx.main.null_constraints_structs VALUES (1, {'value': NULL}, {'value': {'a': 1, 'b': 1}});
+----
+NOT NULL constraint failed: null_constraints_structs.struct.value
+
+statement error
+INSERT INTO fx.main.null_constraints_structs VALUES (1, {'value': 1}, {'value': {'a': 1, 'b': NULL}});
+----
+NOT NULL constraint failed: null_constraints_structs.nested_struct.value.b
+
+# UPDATE with a struct SET value carrying a nested NULL is rejected (dictionary walk)
+statement error
+UPDATE fx.main.null_constraints_structs SET "struct" = {'value': NULL} WHERE i = 0;
+----
+NOT NULL constraint failed: null_constraints_structs.struct.value
+
+query I
+SELECT count(*) FROM fx.main.null_constraints_structs;
+----
+10
+
+# ---- (2) all-NULL column stats (issue-297 class): commit works, stats stay honest, pruning stays safe ----
+statement ok
+CREATE TABLE w.main.ns (i INT, v DOUBLE);
+
+statement ok
+INSERT INTO w.main.ns VALUES (42, 1.5);
+
+statement ok
+INSERT INTO w.main.ns VALUES (NULL, NULL);
+
+query II
+SELECT count(*), count(i) FROM w.main.ns;
+----
+2	1
+
+# the all-NULL file must not be wrongly pruned for IS NULL, nor wrongly kept rows dropped for equality
+query I
+SELECT count(*) FROM w.main.ns WHERE i IS NULL;
+----
+1
+
+query I
+SELECT count(*) FROM w.main.ns WHERE i = 42;
+----
+1
+
+query I
+SELECT count(*) FROM w.main.ns WHERE i IS NOT NULL AND v > 1.0;
+----
+1
+
+# ---- (3) partition equality + single-value IN (issue-303 class): must not over-prune ----
+statement ok
+CREATE TABLE w.main.pt (part INT, x INT) PARTITIONED BY (part);
+
+statement ok
+INSERT INTO w.main.pt SELECT 42 AS part, i AS x FROM range(1, 17) AS r(i);
+
+query I
+SELECT count(*) FROM w.main.pt WHERE part = 42;
+----
+16
+
+query I
+SELECT count(*) FROM w.main.pt WHERE part IN (42);
+----
+16
+
+query I
+SELECT count(*) FROM w.main.pt WHERE part IN (41, 42);
+----
+16
+
+query I
+SELECT count(*) FROM w.main.pt WHERE part = 41;
+----
+0
+
+# ---- (4) explicit-transaction semantics PINNED (divergence, documented): Delta writes commit PER
+#          STATEMENT — no cross-statement atomicity, ROLLBACK does not undo a committed write ----
+statement ok
+CREATE TABLE w.main.txn AS SELECT 1 AS i;
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO w.main.txn VALUES (2);
+
+statement ok
+INSERT INTO w.main.txn VALUES (3);
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM w.main.txn;
+----
+3
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO w.main.txn VALUES (4);
+
+statement ok
+ROLLBACK;
+
+# the INSERT committed to the Delta log despite the ROLLBACK (per-statement commits — pinned behavior)
+query I
+SELECT count(*) FROM w.main.txn;
+----
+4
+
+# each INSERT above is its own Delta version: the CTAS data write + 2 in the BEGIN..COMMIT
+# + 1 rolled-back-but-committed
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('w', 'txn') WHERE operation = 'WRITE';
+----
+4

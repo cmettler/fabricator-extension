@@ -347,6 +347,14 @@ internal static class DeltaWriter
         ArrowNetLog.CreateLogger("ArrowNet.Delta.Write");
 
     // Compact one-line summary of the write's feature flags + tuning for the log.
+    // The table's display name for constraint errors: the last path segment.
+    private static string TableNameFromPath(string path)
+    {
+        var trimmed = path.Replace('\\', '/').TrimEnd('/');
+        int slash = trimmed.LastIndexOf('/');
+        return slash >= 0 ? trimmed.Substring(slash + 1) : trimmed;
+    }
+
     private static string DescribeSpec(DeltaWriteSpec? spec, bool dv, bool rowTracking, bool ict, bool cdf)
     {
         var parts = new List<string>();
@@ -493,6 +501,14 @@ internal static class DeltaWriter
                                                      cancellationToken: ct).AsTask().GetAwaiter().GetResult();
             try
             {
+                // NOT NULL enforcement: an APPEND into an existing table must honor its declared nullability
+                // (incl. nested struct/list/map constraints on external tables). Overwrite/replace adopts the
+                // INPUT schema (nullable), matching drop+recreate semantics — nothing to enforce there.
+                if (mode == DeltaWriteMode.Append)
+                {
+                    DeltaNullability.ValidateBatches(
+                        batches, table.CurrentSnapshot.Schema, TableNameFromPath(path));
+                }
                 // NESTED columns + column mapping are handled by engineered-wood's RECURSIVE physical-rename
                 // + field-id stamping (ColumnMappingRecursive.ToPhysical in WriteCoreAsync), so this collect
                 // path writes the spec nested layout too — the old top-level-only gate is lifted.
@@ -588,6 +604,13 @@ internal static class DeltaWriter
                 && !SameLogicalColumns(table.ArrowSchema, data.Schema))
             {
                 table.SetSchemaAsync(data.Schema, default).AsTask().GetAwaiter().GetResult();
+            }
+            // NOT NULL enforcement on the streamed APPEND: wrap the input with the per-batch validator
+            // (lazy — a later fallback `return null` leaves the stream unconsumed for the collect path,
+            // which validates on its own). Overwrite adopts the input schema — nothing to enforce.
+            if (mode == DeltaWriteMode.Append)
+            {
+                data = DeltaNullability.Wrap(data, table.CurrentSnapshot.Schema, TableNameFromPath(path));
             }
             var partCols = table.CurrentSnapshot.Metadata.PartitionColumns;
             var mappingMode = EngineeredWood.DeltaLake.Schema.ColumnMapping.GetMode(
