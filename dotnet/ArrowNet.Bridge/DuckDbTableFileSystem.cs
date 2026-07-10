@@ -74,9 +74,20 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
     public ValueTask<bool> ExistsAsync(string path, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        // Glob the exact (wildcard-free) resolved path; a hit => it exists.
-        var json = HostFs.Glob(_opener, Resolve(path));
-        return new ValueTask<bool>(ParseGlob(json).Count > 0);
+        // NOT a glob probe: DuckDB's S3 (httpfs) glob ECHOES a wildcard-free path back without checking
+        // the object store, so a literal glob reported every path as existing — which made engineered-wood's
+        // commit-0 existence pre-check throw a phantom DeltaConflictException on S3/MinIO. Probing by
+        // opening for read (a HEAD on object stores) is existence-accurate on every backend.
+        try
+        {
+            nint file = HostFs.OpenRead(_opener, Resolve(path));
+            HostFs.Close(file);
+            return new ValueTask<bool>(true);
+        }
+        catch
+        {
+            return new ValueTask<bool>(false);
+        }
     }
 
     public ValueTask<byte[]> ReadAllBytesAsync(string path, CancellationToken cancellationToken = default)

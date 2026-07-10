@@ -2904,10 +2904,58 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   that ATTACH it directly). The corpus is regenerated from `D:\repos\mssql-extension/test/sql` by
   `scripts/gen_mssqlcompat_tests.sh`; it lives at `test/mssqlcompat/` and is **gitignored** (keep the
   duckdb submodule clean).
-- **Test DB:** Docker `mcr.microsoft.com/mssql/server:2022-latest`, container `mssql-arrownet`, port
-  1433, `sa` / `Arrow_Net_123!` (test-only). DBs `ArrowTest` and `TestDB`. Connstr needs
-  `TrustServerCertificate=true;Encrypt=true`. `sqlcmd` v18 in-container:
+- **Test env (docker compose, `docker/docker-compose.yml` — replaced the ad-hoc container 2026-07-10):**
+  SQL Server 2025 (`mcr.microsoft.com/mssql/server:2025-latest`, container `mssql-arrownet`, port 1433,
+  `sa` / `Arrow_Net_123!`, DBs `ArrowTest` + `TestDB` — created by `docker/provision.ps1`; all other test
+  objects self-provision inside the tests) + **MinIO** (S3-compatible: `miniouser` / `miniosecret123` —
+  deliberately ALPHANUMERIC, SQL's S3 credential requires it; bucket `arrownet`; S3 API 9000 / console
+  9001; **HTTPS** via the self-signed cert from `docker/certs/generate-certs.ps1`, SANs
+  `minio`/`localhost`/`127.0.0.1` — SQL Server's `s3://` connector REQUIRES TLS, trusted via the compose
+  mount at `/var/opt/mssql/security/ca-certificates`). Bring-up: certs → compose up → provision
+  (docker/README.md). Connstr needs `TrustServerCertificate=true;Encrypt=true`. `sqlcmd` v18 in-container:
   `docker exec mssql-arrownet /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Arrow_Net_123!' -C`.
+- **S3 / MinIO / SQL Server data virtualization (2026-07-10).** `httpfs` is now statically linked
+  (`extension_config.cmake` — out-of-tree pin `duckdb-httpfs @ c3f215ab`, the sha DuckDB v1.5.4's own CI
+  uses; needs OpenSSL+curl via the vcpkg toolchain: `vcpkg install openssl:x64-windows-static
+  curl:x64-windows-static`, configure with `-DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake
+  -DVCPKG_TARGET_TRIPLET=x64-windows-static` — the `-static` triplet must match the /MT build). The
+  engineered-wood Delta catalog works on `s3://` (MinIO): ATTACH/discovery, CREATE/CTAS/INSERT, pushdown,
+  DV DELETE + merge-on-read UPDATE, snapshots, explicit transactions, re-attach, and the
+  native_write/native_read variant — `test/verify_delta_catalog_s3.test` (60, gated
+  `ARROWNET_S3_ENDPOINT`; re-runnable via CREATE OR REPLACE against the persistent bucket). Self-signed
+  TLS: `SET GLOBAL enable_curl_server_cert_verification = false` (GLOBAL — the transaction flush runs on
+  its own connection; production alternative `ca_cert_file`). **Four real bugs found by the S3 rig:**
+  (1) `DuckDbTableFileSystem.ExistsAsync` probed via a wildcard-free glob — httpfs' S3 glob ECHOES
+  literal paths back without checking the store, so every commit-0 hit a phantom "version 0 already
+  exists"; now probes via OpenRead (a HEAD on object stores). (2) The transaction flush used the
+  committing context as opener, but the SECRET MANAGER requires an ACTIVE transaction ("ActiveTransaction
+  called without active transaction" on s3) — `ArrowNetTransactionManager::CommitTransaction` now gives
+  the flush its OWN short-lived `Connection` + transaction as the opener (local paths need no secrets, so
+  no local test ever saw this). (3) EW `WriteCoreAsync`'s Overwrite-removes omitted the file's
+  `deletionVector`, so a REPLACE over a DV-carrying file never matched the active (path,DV) entry — the
+  file stayed active FOREVER (duplicated rows after CREATE OR REPLACE of a DV-deleted table); one-line
+  fix mirroring CommitDataFilesAsync. (4) **EW `CheckpointReader.ExtractMetadata` DROPPED
+  `metaData.configuration`** — after the first checkpoint (interval 10) a table silently lost
+  `enableDeletionVectors`/`enableChangeDataFeed`/`columnMapping.mode`/`maxColumnId`, and the loss is
+  VIRAL (the NEXT checkpoint persists the config-less metadata — permanently poisoned even after the fix;
+  wipe/re-create such tables). Fixed via the existing `GetStringMapField`. **The full circle — SQL Server
+  reads our Delta from MinIO:** SQL Server 2025 (17.x) reads CSV/Parquet/**DELTA** on S3 **natively** (no
+  PolyBase package, no `sp_configure 'polybase enabled'`, no TF13702 — those are 2022 requirements;
+  `mssql-server-polybase` exists for 17.x/Ubuntu 24.04 but is only needed for RDBMS connectors).
+  `test/verify_mssql_s3_polybase.test` (70, gated `MSSQL_TESTDB_DSN` + `ARROWNET_S3_ENDPOINT` +
+  `ARROWNET_S3_SQL_ENDPOINT`): our provider CTASes to `s3://arrownet/polybase` → `mssql_net_exec`
+  provisions MASTER KEY + `DATABASE SCOPED CREDENTIAL (IDENTITY='S3 Access Key', SECRET='key:secret')` +
+  `EXTERNAL DATA SOURCE (LOCATION='s3://minio:9000/')` + `EXTERNAL FILE FORMAT (FORMAT_TYPE=DELTA)` →
+  `OPENROWSET(BULK '/arrownet/polybase/trips', FORMAT='DELTA', DATA_SOURCE='s3_ds')` matches row-for-row
+  → `CREATE EXTERNAL TABLE` + read back through the ATTACHed catalog as a normal scan (DuckDB →
+  mssql_net → SQL Server → S3 delta reader → MinIO → table written by our Delta provider). **SQL Server's
+  DELTA reader = Delta protocol 1.0 ONLY** — the interop table MUST be written `deletion_vectors false,
+  column_mapping 'none'` (a DV-default reader-v3 table errors — pinned; same finding class as the Fabric
+  T-SQL endpoint). Partitioned delta: the external table reads the partition column as NULL, OPENROWSET
+  reads it correctly (documented MS limitation). S3 caveats (documented, unchanged): no put-if-absent on
+  httpfs S3 (single-writer; `arrownet_fs_write_probe` shows EXCLUSIVE_CREATE unguarded), `MoveFile`
+  unimplemented (RENAME TABLE fails); `DROP EXTERNAL TABLE IF EXISTS` is not T-SQL (use
+  `IF OBJECT_ID(...) IS NOT NULL DROP EXTERNAL TABLE ...`).
 - **Copy-paste test env** (Bash tool; test-only creds — the REAL Fabric SP lives only in the gitignored
   `dax_secret.sql`, never here). Run the loadable/shell/unittest from `build/release/`:
   ```bash
@@ -2916,9 +2964,14 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   export MSSQL_TESTDB_DSN="$DSN" MSSQL_TEST_SERVER="$DSN" MSSQL_TEST_CONNECTION_STRING="$DSN"
   # a Delta catalog verify test needs a writable base dir:
   export ARROWNET_DELTA_WRITE_DIR="$(mktemp -d)"      # each test file wants its OWN fresh dir
+  # S3/MinIO tests (docker compose stack must be up):
+  export ARROWNET_S3_ENDPOINT=localhost:9000          # gates verify_delta_catalog_s3
+  export ARROWNET_S3_SQL_ENDPOINT=minio:9000          # + MSSQL_TESTDB_DSN gates verify_mssql_s3_polybase
   # run one test at a time (the runner concatenates multiple filters into one bad glob):
   build/release/test/unittest.exe --test-dir . "test/verify_delta_catalog_native_write.test"
   # trace the write path: prepend ARROWNET_LOG_LEVEL=Debug (logs off by default)
+  # NOTE: the sqllogictest runner AUTO-SKIPS a test whose error message contains 'HTTP' (network-flake
+  # tolerance) — an S3 test that "skips" may actually be FAILING; reproduce via the shell to see why.
   # live Fabric OneLake: a .sql script starting with  .read dax_secret.sql  then
   #   ATTACH 'abfss://Test@onelake.dfs.fabric.microsoft.com/LH.Lakehouse/Tables' AS lake
   #     (TYPE arrownet, PROVIDER 'delta', SECRET fabric_sp, READ_ONLY false [, native_write true]);

@@ -7,6 +7,7 @@
 #include "arrownet/clr_host.hpp"
 #include "catalog/arrownet_catalog.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/connection.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 
 namespace duckdb {
@@ -51,11 +52,25 @@ ErrorData ArrowNetTransactionManager::CommitTransaction(ClientContext &context, 
 	}
 	try {
 		arrownet::SetActiveTxn(handle_, txn_id);
-		// Host-FS opener for a Delta-catalog COMMIT: flushing the transaction's buffered appends writes the
-		// _delta_log commit through DuckDB's FileSystem (secret resolution needs the ClientContext). No-op
-		// for providers that don't use the host FS (SQL Server / DAX).
+		// Host-FS opener for a Delta-catalog COMMIT: flushing the transaction's buffered changes writes the
+		// _delta_log through DuckDB's FileSystem with SECRET resolution (s3:// / az:// / onelake://). The
+		// CALLER's transaction is no longer active inside TransactionManager::CommitTransaction, and the
+		// secret manager requires an active one (httpfs S3 fails with "ActiveTransaction called without
+		// active transaction") — so the flush gets its OWN short-lived connection + transaction as the
+		// opener. Local paths need no secrets; SQL Server / DAX ignore the opener entirely.
+		Connection flush_conn(db.GetDatabase());
+		flush_conn.BeginTransaction();
+		arrownet::SetActiveOpener(reinterpret_cast<ArrowNetHandle>(flush_conn.context.get()));
+		try {
+			arrownet::CommitTransaction(handle_);
+		} catch (...) {
+			arrownet::SetActiveOpener(reinterpret_cast<ArrowNetHandle>(&context));
+			flush_conn.Rollback();
+			throw;
+		}
+		// The flush connection was only an opener (secret lookups + FS IO) — nothing of its own to commit.
 		arrownet::SetActiveOpener(reinterpret_cast<ArrowNetHandle>(&context));
-		arrownet::CommitTransaction(handle_);
+		flush_conn.Rollback();
 	} catch (std::exception &ex) {
 		return ErrorData(ex);
 	}

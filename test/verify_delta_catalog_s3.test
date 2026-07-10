@@ -1,0 +1,192 @@
+# name: test/verify_delta_catalog_s3.test
+# description: The engineered-wood Delta folder-catalog on S3-COMPATIBLE storage (MinIO): all IO through
+#              DuckDB's FileSystem (httpfs) + an s3 secret — discovery (host-FS glob), CREATE/CTAS/INSERT,
+#              filter pushdown, DV DELETE + merge-on-read UPDATE (no dir-ops), snapshots, explicit
+#              transactions, re-ATTACH durability, and the native_write/native_read variant (COPY +
+#              read_parquet over s3://). Uses the docker/docker-compose.yml MinIO (bucket `arrownet`,
+#              test-only creds; HTTPS via the self-signed cert — httpfs does not pin the CA).
+#              Re-runnable against a persistent bucket: every table is CREATE OR REPLACE'd (DROP TABLE
+#              is exercised at the end — httpfs implements s3 file deletion for the recursive dir-remove).
+# group: [mssql_net]
+
+require mssql_net
+
+require httpfs
+
+require parquet
+
+require-env ARROWNET_S3_ENDPOINT
+
+# The test rig's MinIO serves a SELF-SIGNED cert (SQL Server trusts it via its CA mount; DuckDB's
+# curl-based httpfs verifies against the system store) — disable verification GLOBALLY (the transaction
+# flush runs on its own connection, which must inherit it).
+# (Production alternative: SET ca_cert_file = '<path to docker/certs/public.crt>'.)
+statement ok
+SET GLOBAL enable_curl_server_cert_verification = false;
+
+statement ok
+CREATE SECRET minio_s3 (TYPE s3, KEY_ID 'miniouser', SECRET 'miniosecret123',
+                        ENDPOINT '${ARROWNET_S3_ENDPOINT}', URL_STYLE 'path', REGION 'us-east-1',
+                        USE_SSL true);
+
+# ---- ATTACH an s3:// Delta catalog root (READ_ONLY false: DuckDB auto-bumps remote ATTACHes) ----
+statement ok
+ATTACH 's3://arrownet/lake' AS s3lake (TYPE arrownet, PROVIDER 'delta', READ_ONLY false);
+
+# ---- CREATE + INSERT + read back ----
+statement ok
+CREATE OR REPLACE TABLE s3lake.main.t AS
+SELECT i AS id, 'name' || i AS name, i * 1.5 AS score FROM range(1, 6) r(i);
+
+query ITR
+SELECT id, name, score FROM s3lake.main.t ORDER BY id;
+----
+1	name1	1.5
+2	name2	3.0
+3	name3	4.5
+4	name4	6.0
+5	name5	7.5
+
+statement ok
+INSERT INTO s3lake.main.t VALUES (6, 'name6', 9.0);
+
+query I
+SELECT count(*) FROM s3lake.main.t;
+----
+6
+
+# Filter pushdown (engineered-wood file/row-group pruning is superset-safe; DuckDB re-applies).
+query IT
+SELECT id, name FROM s3lake.main.t WHERE id >= 5 ORDER BY id;
+----
+5	name5
+6	name6
+
+query I
+SELECT sum(id) FROM s3lake.main.t WHERE score > 4.0;
+----
+18
+
+# ---- DV DELETE (metadata-only — no dir ops) + merge-on-read UPDATE ----
+statement ok
+DELETE FROM s3lake.main.t WHERE id IN (2, 4);
+
+query I
+SELECT count(*) FROM s3lake.main.t;
+----
+4
+
+statement ok
+UPDATE s3lake.main.t SET name = 'updated' WHERE id = 3;
+
+query T
+SELECT name FROM s3lake.main.t WHERE id = 3;
+----
+updated
+
+# ---- snapshots/history over S3 ----
+# CREATE OR REPLACE = v0 CREATE + v1 WRITE on a fresh table (a re-run adds versions — assert shape only).
+query I
+SELECT count(*) >= 4 FROM arrownet_delta_snapshots('s3lake', 't');
+----
+true
+
+query T
+SELECT operation FROM arrownet_delta_snapshots('s3lake', 't') ORDER BY version DESC LIMIT 1;
+----
+UPDATE
+
+# ---- explicit transaction on S3: fused commit + rollback ----
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO s3lake.main.t VALUES (10, 'txn', 0.0);
+
+statement ok
+DELETE FROM s3lake.main.t WHERE id = 5;
+
+query I
+SELECT count(*) FROM s3lake.main.t;
+----
+4
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM s3lake.main.t;
+----
+4
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO s3lake.main.t VALUES (99, 'doomed', 0.0);
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM s3lake.main.t;
+----
+4
+
+# ---- re-ATTACH durability (rediscovery from the s3 _delta_log glob) ----
+statement ok
+DETACH s3lake;
+
+statement ok
+ATTACH 's3://arrownet/lake' AS s3lake2 (TYPE arrownet, PROVIDER 'delta', READ_ONLY false);
+
+query I
+SELECT count(*) FROM s3lake2.main.t;
+----
+4
+
+query IT
+SELECT id, name FROM s3lake2.main.t WHERE id IN (3, 10) ORDER BY id;
+----
+3	updated
+10	txn
+
+statement ok
+DETACH s3lake2;
+
+# ---- native_write + native_read catalog on S3: DuckDB's COPY writes, read_parquet reads ----
+statement ok
+ATTACH 's3://arrownet/lake' AS s3n (TYPE arrownet, PROVIDER 'delta', READ_ONLY false,
+                                    native_write true, native_read true);
+
+statement ok
+CREATE OR REPLACE TABLE s3n.main.nt AS SELECT i AS id, i % 3 AS grp FROM range(1, 1001) r(i);
+
+query I
+SELECT count(*) FROM s3n.main.nt;
+----
+1000
+
+query I
+SELECT count(*) FROM s3n.main.nt WHERE grp = 0;
+----
+333
+
+statement ok
+DELETE FROM s3n.main.nt WHERE id <= 10;
+
+query II
+SELECT count(*), min(id) FROM s3n.main.nt;
+----
+990	11
+
+statement ok
+UPDATE s3n.main.nt SET grp = 99 WHERE id = 11;
+
+query I
+SELECT grp FROM s3n.main.nt WHERE id = 11;
+----
+99
+
+statement ok
+DETACH s3n;

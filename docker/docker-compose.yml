@@ -1,0 +1,85 @@
+# Test environment for mssql_net: SQL Server 2025 + MinIO (S3-compatible object storage).
+#
+# Bring-up (see docker/README.md):
+#   1. pwsh docker/certs/generate-certs.ps1     # self-signed TLS cert for MinIO (gitignored output)
+#   2. docker compose -f docker/docker-compose.yml up -d
+#   3. pwsh docker/provision.ps1                # creates the ArrowTest + TestDB databases
+#
+# SQL Server 2025 (17.x) reads CSV/Parquet/DELTA on S3 NATIVELY (no PolyBase package/service needed
+# for file queries — the data-virtualization guide: "no longer requires installing or running PolyBase
+# services"). The S3 connector REQUIRES HTTPS: MinIO auto-enables TLS from the certs mounted at
+# /root/.minio/certs, and SQL Server trusts the self-signed cert via the CA file mounted at
+# /var/opt/mssql/security/ca-certificates (read once at process start). The cert's SANs must cover the
+# host SQL uses in LOCATION ('s3://minio:9000/') and the host the DuckDB tests use ('localhost:9000').
+#
+# Fallback (NOT installed by default — only needed for RDBMS connectors, not S3 file queries):
+#   mssql-server-polybase exists for 2025/Ubuntu 24.04. To add it, build a custom image:
+#     FROM mcr.microsoft.com/mssql/server:2025-latest
+#     USER root
+#     RUN curl -fsSL https://packages.microsoft.com/config/ubuntu/24.04/mssql-server-2025.list \
+#           > /etc/apt/sources.list.d/mssql-server.list \
+#      && apt-get update && ACCEPT_EULA=Y apt-get install -y mssql-server-polybase \
+#      && rm -rf /var/lib/apt/lists/*
+#     USER mssql
+#
+# MinIO credentials are TEST-ONLY and deliberately ALPHANUMERIC — SQL Server's S3 credential requires
+# "Access Key ID and Secret Key ID must only contain alphanumeric values".
+
+name: mssql-arrownet
+
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2025-latest
+    container_name: mssql-arrownet
+    ports:
+      - "1433:1433"
+    environment:
+      - ACCEPT_EULA=Y
+      - MSSQL_SA_PASSWORD=Arrow_Net_123!
+    volumes:
+      - mssql-data:/var/opt/mssql
+      # CA trust for the MinIO self-signed cert (SQL Server on Linux reads this folder at startup).
+      - ./certs/public.crt:/var/opt/mssql/security/ca-certificates/minio.crt:ro
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Arrow_Net_123!' -C -Q 'SELECT 1' -b -o /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  minio:
+    image: minio/minio:latest
+    container_name: minio-arrownet
+    ports:
+      - "9000:9000"   # S3 API (HTTPS — certs auto-enable TLS)
+      - "9001:9001"   # web console
+    environment:
+      - MINIO_ROOT_USER=miniouser
+      - MINIO_ROOT_PASSWORD=miniosecret123
+    volumes:
+      - minio-data:/data
+      - ./certs:/root/.minio/certs:ro
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-k", "-f", "https://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+  # One-shot bucket bootstrap: creates the `arrownet` test bucket (idempotent).
+  createbucket:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local https://minio:9000 miniouser miniosecret123 --api S3v4 --insecure &&
+      mc mb --ignore-existing local/arrownet --insecure &&
+      echo 'bucket arrownet ready'
+      "
+
+volumes:
+  mssql-data:
+  minio-data:

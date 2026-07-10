@@ -1,0 +1,156 @@
+# name: test/verify_mssql_s3_polybase.test
+# description: The FULL CIRCLE — our Delta provider writes a table to MinIO (s3://), and SQL Server 2025
+#              reads it back over its NATIVE S3 data virtualization (no PolyBase package needed on 17.x),
+#              driven through our mssql provider: OPENROWSET(FORMAT='DELTA') + CREATE EXTERNAL TABLE, both
+#              provisioned via mssql_net_exec and read via mssql_net_query / a normal catalog scan. The
+#              SQL-side DELTA reader supports Delta protocol 1.0 ONLY, so the interop table is written
+#              with deletion_vectors false + column_mapping 'none' (plain minReader-1); a DV-default
+#              table is pinned as NOT readable. Requires the docker/docker-compose.yml stack (MinIO with
+#              the self-signed TLS cert SQL Server trusts via /var/opt/mssql/security/ca-certificates).
+# group: [mssql_net]
+
+require mssql_net
+
+require httpfs
+
+require-env MSSQL_TESTDB_DSN
+
+require-env ARROWNET_S3_ENDPOINT
+
+require-env ARROWNET_S3_SQL_ENDPOINT
+
+# The test rig's MinIO serves a SELF-SIGNED cert (SQL Server trusts it via its CA mount; DuckDB's
+# curl-based httpfs verifies against the system store) — disable verification GLOBALLY (the transaction
+# flush runs on its own connection, which must inherit it).
+# (Production alternative: SET ca_cert_file = '<path to docker/certs/public.crt>'.)
+statement ok
+SET GLOBAL enable_curl_server_cert_verification = false;
+
+statement ok
+CREATE SECRET minio_s3 (TYPE s3, KEY_ID 'miniouser', SECRET 'miniosecret123',
+                        ENDPOINT '${ARROWNET_S3_ENDPOINT}', URL_STYLE 'path', REGION 'us-east-1',
+                        USE_SSL true);
+
+# ---- 1. our Delta provider writes the interop table (PLAIN delta: protocol 1.0-readable) ----
+statement ok
+ATTACH 's3://arrownet/polybase' AS plake (TYPE arrownet, PROVIDER 'delta', READ_ONLY false,
+                                          deletion_vectors false, column_mapping 'none');
+
+statement ok
+CREATE OR REPLACE TABLE plake.main.trips AS
+SELECT i AS id, CAST(i * 100 AS BIGINT) AS amount, 'city' || (i % 3) AS city,
+       CAST(i AS DOUBLE) / 4 AS score, DATE '2026-01-01' + i::INT AS d
+FROM range(1, 9) r(i);
+
+query IITR
+SELECT id, amount, city, score FROM plake.main.trips ORDER BY id LIMIT 3;
+----
+1	100	city1	0.25
+2	200	city2	0.5
+3	300	city0	0.75
+
+# ---- 2. SQL Server side: self-provision the S3 credential/data source/file format ----
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS sqldb (TYPE mssql_net);
+
+statement ok
+SELECT mssql_net_exec('sqldb',
+  'IF NOT EXISTS (SELECT 1 FROM sys.symmetric_keys WHERE name = ''##MS_DatabaseMasterKey##'')
+     CREATE MASTER KEY ENCRYPTION BY PASSWORD = ''Arrow_Net_123!MK''');
+
+statement ok
+SELECT mssql_net_exec('sqldb',
+  'IF NOT EXISTS (SELECT 1 FROM sys.database_scoped_credentials WHERE name = ''s3_dc'')
+     CREATE DATABASE SCOPED CREDENTIAL s3_dc WITH IDENTITY = ''S3 Access Key'',
+       SECRET = ''miniouser:miniosecret123''');
+
+statement ok
+SELECT mssql_net_exec('sqldb',
+  'IF NOT EXISTS (SELECT 1 FROM sys.external_data_sources WHERE name = ''s3_ds'')
+     CREATE EXTERNAL DATA SOURCE s3_ds WITH (LOCATION = ''s3://${ARROWNET_S3_SQL_ENDPOINT}/'',
+       CREDENTIAL = s3_dc)');
+
+statement ok
+SELECT mssql_net_exec('sqldb',
+  'IF NOT EXISTS (SELECT 1 FROM sys.external_file_formats WHERE name = ''DeltaFileFormat'')
+     CREATE EXTERNAL FILE FORMAT DeltaFileFormat WITH (FORMAT_TYPE = DELTA)');
+
+# ---- 3. OPENROWSET(FORMAT='DELTA'): SQL Server reads what our provider wrote ----
+query IIT
+SELECT id, amount, city FROM mssql_net_query('sqldb',
+  'SELECT id, amount, city FROM OPENROWSET(BULK ''/arrownet/polybase/trips'', FORMAT = ''DELTA'',
+     DATA_SOURCE = ''s3_ds'') AS r ORDER BY id')
+ORDER BY id;
+----
+1	100	city1
+2	200	city2
+3	300	city0
+4	400	city1
+5	500	city2
+6	600	city0
+7	700	city1
+8	800	city2
+
+query II
+SELECT cnt, total FROM mssql_net_query('sqldb',
+  'SELECT COUNT(*) AS cnt, SUM(amount) AS total FROM OPENROWSET(BULK ''/arrownet/polybase/trips'',
+     FORMAT = ''DELTA'', DATA_SOURCE = ''s3_ds'') AS r');
+----
+8	3600
+
+# ---- 4. CREATE EXTERNAL TABLE + read it through the ATTACHed catalog as a normal table scan ----
+statement ok
+SELECT mssql_net_exec('sqldb',
+  'IF OBJECT_ID(''dbo.s3_delta_trips'') IS NOT NULL DROP EXTERNAL TABLE dbo.s3_delta_trips');
+
+statement ok
+SELECT mssql_net_exec('sqldb',
+  'CREATE EXTERNAL TABLE dbo.s3_delta_trips (id INT, amount BIGINT, city VARCHAR(20),
+     score FLOAT, d DATE)
+   WITH (LOCATION = ''/arrownet/polybase/trips'', DATA_SOURCE = s3_ds,
+         FILE_FORMAT = DeltaFileFormat)');
+
+statement ok
+SELECT mssql_refresh_cache('sqldb');
+
+# Our provider scanning a SQL Server EXTERNAL table whose data lives in MinIO, written by our Delta
+# provider — DuckDB -> mssql_net -> SQL Server -> S3 delta reader -> MinIO.
+query IIT
+SELECT id, amount, city FROM sqldb.dbo.s3_delta_trips ORDER BY id LIMIT 4;
+----
+1	100	city1
+2	200	city2
+3	300	city0
+4	400	city1
+
+query I
+SELECT count(*) FROM sqldb.dbo.s3_delta_trips;
+----
+8
+
+# ---- 5. negative pin: a DV-default table (reader v3) is NOT readable by SQL Server's 1.0 reader ----
+statement ok
+ATTACH 's3://arrownet/polybase-dv' AS dvlake (TYPE arrownet, PROVIDER 'delta', READ_ONLY false);
+
+statement ok
+CREATE OR REPLACE TABLE dvlake.main.dvt AS SELECT 1 AS i;
+
+statement error
+SELECT * FROM mssql_net_query('sqldb',
+  'SELECT * FROM OPENROWSET(BULK ''/arrownet/polybase-dv/dvt'', FORMAT = ''DELTA'',
+     DATA_SOURCE = ''s3_ds'') AS r');
+----
+
+statement ok
+DETACH dvlake;
+
+# ---- 6. teardown (external objects; the delta data stays for re-runs — CREATE OR REPLACE resets it) ----
+statement ok
+SELECT mssql_net_exec('sqldb',
+  'IF OBJECT_ID(''dbo.s3_delta_trips'') IS NOT NULL DROP EXTERNAL TABLE dbo.s3_delta_trips');
+
+statement ok
+DETACH plake;
+
+statement ok
+DETACH sqldb;

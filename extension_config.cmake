@@ -21,3 +21,13 @@ duckdb_extension_load(icu)
 # `read_parquet([...])` on the host engine to read Delta data files with DuckDB's native reader. The shell
 # ships parquet, but the test binaries need it linked (v0.0.1 can't autoload it).
 duckdb_extension_load(parquet)
+
+# And `httpfs` — s3:// (MinIO) targets for the Delta providers (verify_delta_catalog_s3 +
+# verify_mssql_s3_polybase). Out-of-tree since DuckDB 1.3 — pinned to the SAME sha DuckDB v1.5.4's own
+# CI uses (duckdb/.github/config/extensions/httpfs.cmake). Requires OpenSSL + curl: configure with the
+# vcpkg toolchain + `-DVCPKG_TARGET_TRIPLET=x64-windows-static` (static CRT, matching /MT) after
+# `vcpkg install openssl:x64-windows-static curl:x64-windows-static`.
+duckdb_extension_load(httpfs
+    GIT_URL https://github.com/duckdb/duckdb-httpfs
+    GIT_TAG c3f215ab360f04dc3d3d5305fa81849c0121f111
+)
