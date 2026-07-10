@@ -280,3 +280,56 @@ DROP TABLE s3cdf.main.f;
 
 statement ok
 DETACH s3cdf;
+
+# ----------------------------------------------------------------------------
+# 10. COPY … (FORMAT delta) — path-targeted Delta write straight to s3://, NO ATTACH
+#     (transient catalog; same CREATE/append/REPLACE/SCHEMA_MODE/PARTITION_OVERWRITE features).
+#     Re-runnable: the plain default COPY overwrites (create-or-replace semantics).
+# ----------------------------------------------------------------------------
+
+statement ok
+COPY (SELECT i::INT AS id, 'v' || i AS val FROM range(1,5) t(i))
+  TO 's3://arrownet/copyfmt/t1' (FORMAT delta);
+
+query II
+SELECT count(*), sum(id) FROM arrownet_delta_scan('s3://arrownet/copyfmt/t1');
+----
+4	10
+
+# append (parked by the provider, flushed by the COPY's own transient-catalog commit)
+statement ok
+COPY (SELECT 5::INT AS id, 'v5' AS val)
+  TO 's3://arrownet/copyfmt/t1' (FORMAT delta, CREATE_TABLE false);
+
+query II
+SELECT count(*), sum(id) FROM arrownet_delta_scan('s3://arrownet/copyfmt/t1');
+----
+5	15
+
+# partitioned create + dynamic partition overwrite, all over s3://
+statement ok
+COPY (SELECT i::INT AS id, CASE WHEN i%2=0 THEN 'EU' ELSE 'US' END AS region FROM range(1,7) t(i))
+  TO 's3://arrownet/copyfmt/pt' (FORMAT delta, PARTITION_COLUMNS 'region');
+
+statement ok
+COPY (SELECT 100::INT AS id, 'US' AS region)
+  TO 's3://arrownet/copyfmt/pt' (FORMAT delta, CREATE_TABLE false, PARTITION_OVERWRITE true);
+
+query III
+SELECT region, count(*), sum(id) FROM arrownet_delta_scan('s3://arrownet/copyfmt/pt')
+GROUP BY region ORDER BY region;
+----
+EU	3	12
+US	1	100
+
+# the written table ATTACHes as a normal Delta catalog table
+statement ok
+ATTACH 's3://arrownet/copyfmt' AS s3cf (TYPE arrownet, PROVIDER 'delta');
+
+query I
+SELECT count(*) FROM s3cf.main.t1;
+----
+5
+
+statement ok
+DETACH s3cf;

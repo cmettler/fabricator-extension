@@ -1331,7 +1331,80 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
-- **Current version: ABI v60** (v60 = `begin_transaction` gained an `int32 is_explicit` arg — 1 for a user
+- **`COPY … TO '<path>/<table>' (FORMAT delta, …)` — path-targeted Delta write, NO ATTACH (2026-07-10,
+  C++-only, no ABI).** A third registered copy function (`"delta"` beside `mssql_net`/`bcp`; the official
+  duckdb-delta extension registers NO copy function — its only write surface is INSERT into an attached
+  table — so the name is free and the capability is ours alone): the target is a raw path (local / `s3://` /
+  `onelake://` / abfss), split into `<root>/<table>`; the bind opens NOTHING — `CopyToInitGlobal` opens a
+  **transient per-execution engineered-wood catalog** (`arrownet::OpenCatalog(root, "delta", options_json)`,
+  flat layout, owned by the copy global state) and streams through the EXACT catalog-COPY bulk machinery, so
+  the write disposition is the **`MODE` option — the Spark/delta-rs save-mode vocabulary**: `'overwrite'`
+  (the default when no options given — create or fully replace, COPY-to-file intuition) | `'append'`
+  (create-if-missing + append-if-exists — Spark `mode=append`; EW's append path OpenOrCreates commit-0) |
+  `'error'`/`'errorifexists'` (Spark's default save mode — fail on an existing target) | `'ignore'` (silent
+  no-op on existing) | `'error_if_not_exists'` (strict append — fail on a MISSING target instead of
+  implicitly provisioning; the inverse of 'error', no Spark equivalent) | `'overwrite_partitions'` (dynamic
+  partition overwrite — Spark has no mode name for it, it's `overwrite` + the `partitionOverwriteMode=dynamic`
+  conf; with PARTITION_COLUMNS a MISSING target is created PARTITIONED and the first run is a plain append —
+  idempotent first-run; without them a missing target is rejected UP FRONT provider-side, since the
+  append-shaped implicit create would otherwise leave an empty unpartitioned commit-0 behind before the
+  partitioned-target guard fired). **`PARTITION_COLUMNS` is allowed with EVERY mode and applies whenever the
+  write actually CREATES the table** (explicit or implicit — the `createTable||replace` gate in `BulkInsert`
+  was dropped; EW's `OpenOrCreateAsync(partitionColumns:)` applies them at creation only; a mismatched
+  PARTITION_COLUMNS on APPEND is tolerated + ignored; NOTE under the default name-mapping the Hive dirs carry
+  the PHYSICAL `col-<guid>` names per the Spark convention — `COLUMN_MAPPING 'none'` for logical-named dirs).
+  **REPARTITION-on-overwrite (2026-07-10): `MODE 'overwrite'` + PARTITION_COLUMNS differing from an EXISTING
+  table's partitioning CHANGES the partitioning** — the Delta protocol allows a new
+  `metaData.partitionColumns` ONLY when every active file is removed in the same commit (readers interpret
+  each `add.partitionValues` against the current partition schema), i.e. exactly a full overwrite (Spark:
+  `overwriteSchema=true` + new `partitionBy`; there is NO `ALTER TABLE … PARTITIONED BY`). EW
+  `WriteAsync(repartitionTo:)` → `WriteCoreAsync` splits by the NEW columns + folds the metaData swap into
+  the overwrite commit (guarded: full overwrite only — a partition-scoped/dynamic overwrite would keep
+  nonconforming files; coordinated with the identity-HWM metadata so one commit never carries two metaData
+  actions); the streaming path falls back to collect for this shape (`TryWriteStreaming` returns null — no
+  metaData-swap support there; checked BEFORE SetSchemaAsync so the fallback leaves no half-done commit).
+  Absence of PARTITION_COLUMNS on overwrite = keep the current partitioning (no implicit departitioning);
+  kernel-validated (delta_scan reads the repartitioned table). Previously this case SILENTLY kept the old
+  partitioning — a real gap found by probing the protocol question. The dispositions (`error`/`ignore`/
+  `error_if_not_exists`) are checked provider-side: the per-statement disposition rides the TRANSIENT
+  catalog's options JSON (`copy_disposition` — sound because that catalog serves exactly one COPY;
+  `DeltaCatalog.BulkInsert` probes `TableExists`; the ignore no-op returns without consuming the stream —
+  BulkSession's finally drains). The legacy **`CREATE_TABLE`/`REPLACE`/`PARTITION_OVERWRITE` flags** (shared
+  with `FORMAT mssql_net`) still work but CANNOT be mixed with `MODE`; `SCHEMA_MODE 'merge'|'overwrite'`
+  composes with either spelling, plus **`PARTITION_COLUMNS 'a,b'`** (create-time Hive
+  partitioning — deliberately NOT the generic `PARTITION_BY`, which DuckDB's planner intercepts for
+  file-based copies) and **provider-option passthrough** (`NATIVE_WRITE` — defaults TRUE here, bounded-memory
+  streaming; `DELETION_VECTORS`/`COLUMN_MAPPING` — e.g. `DELETION_VECTORS false, COLUMN_MAPPING 'none'` for a
+  SQL-Server-/protocol-1.0-readable table; `ROW_TRACKING`/`MATERIALIZE_ROW_TRACKING`/`CHANGE_DATA_FEED`/
+  `IN_COMMIT_TIMESTAMPS`/`COMPRESSION`/`ROW_GROUP_SIZE`/`BLOOM_FILTER_COLUMNS`). **The transaction crux:** the
+  provider PARKS plain appends per (txn, table) and flushes at `commit_transaction` — a transient handle has
+  no TransactionManager, so the COPY drives it itself: finalize does `SetActiveTxn(handle, txn_id)` +
+  `arrownet::CommitTransaction(handle)` (no-op for create/replace, flushes the parked append as ONE commit) +
+  `CloseCatalog`; the gstate destructor is the failure backstop (`RollbackTransaction` — discard-only, no
+  opener needed — then close). ⇒ the COPY is its own atomic Delta commit and deliberately does NOT roll back
+  with a surrounding DuckDB BEGIN (file-COPY semantics; the transient catalog's buffer is invisible to the
+  user txn). Verified: `test/verify_delta_copy_format.test` (41 — create/overwrite/append-flush/replace/
+  partitioned + dynamic partition overwrite/schema merge+overwrite/protocol-shape pins/ATTACH-reads-it-back/
+  path validation), S3 section in `verify_delta_catalog_s3.test` (131 — COPY to `s3://arrownet/copyfmt` incl.
+  partition overwrite + re-ATTACH), catalog-COPY suites unregressed (partition_overwrite 90 / overwrite_merge
+  47 / native_write_streaming 29), **live OneLake** (`COPY … TO 'onelake://Test/LH.Lakehouse/Tables/dbo/…'
+  (FORMAT delta)` → native streamed v1 + exact readback; an `onelake://` root doesn't match the
+  `FabricLakehouse.IsOneLake` abfss check, so it rides the plain host-FS path with opener-resolved secrets —
+  which is exactly right). Kernel reads the outputs (known quirk unchanged: kernel shows a MAPPED partitioned
+  table's partition column as NULL; plain shape exact).
+- **Current version: ABI v61** (v61 = **`onelake://` is now WRITE-COMPLETE for Delta commits** —
+  `onelake_open_write` gained an `int32 exclusive` arg (put-if-absent via ADLS conditional create,
+  `If-None-Match:*` — the C++ onelake FS now honors `EXCLUSIVE_CREATE` instead of silently ignoring it) and
+  one appended entry `onelake_remove(path, cred_json)` (`DataLakeFileClient.DeleteIfExists`, idempotent) backs
+  `RemoveFile` — engineered-wood's commit rename is emulated as exclusive-create-copy + DELETE-SOURCE, so both
+  were needed before **`arrownet_delta_write(<input>, path := 'onelake://…')` works** (previously abfss:// only;
+  live-validated, v3 Overwrite commit + exact readback). Same pass, C++-only: `CreateDirRecursive`
+  (arrownet_fs_spike.cpp) got a **scheme-authority recursion FLOOR** — the old guard only matched a literal
+  trailing `scheme://`, and since the onelake FS reports `DirectoryExists=false` always (implicit ADLS dirs),
+  the recursion walked past `onelake://Test` to `onelake:` which fell through to the LOCAL filesystem
+  ("Failed to create directory \"onelake:\""); abfss:// never hit it because duckdb-azure answers the
+  ancestor-exists probe. `MoveFile` on the onelake FS still throws (RENAME TABLE keeps the DFS-SDK route).)
+- **Prior: v60** (v60 = `begin_transaction` gained an `int32 is_explicit` arg — 1 for a user
   `BEGIN..COMMIT`, 0 for the implicit per-statement autocommit wrapper (C++ reads
   `context.transaction.IsAutoCommit()` in `ArrowNetTransactionManager::StartTransaction`). Drives the Delta
   provider's **buffered transactional DML** (slice 2 — see the explicit-transactions bullet): DELETE/UPDATE

@@ -526,13 +526,28 @@ internal static class DeltaWriter
                     // Append + UNION: add any incoming column absent from the table (nullable) before appending.
                     MergeSchema(table, schema, ct);
                 }
+                // Repartition-on-overwrite: PARTITION_COLUMNS on a FULL overwrite of an EXISTING table whose
+                // partitioning differs → the new partitionColumns commit atomically with the file swap
+                // (protocol-legal only then; Spark's overwriteSchema + new partitionBy). A fresh create
+                // already matches (OpenOrCreate applied them) → no-op.
+                System.Collections.Generic.IReadOnlyList<string>? repartitionTo = null;
+                if (mode == DeltaWriteMode.Overwrite
+                    && spec?.ReplaceWhere is not { Count: > 0 }
+                    && spec?.DynamicPartitionOverwrite != true
+                    && spec?.PartitionColumns is { Count: > 0 } reqCols
+                    && !System.Linq.Enumerable.SequenceEqual(
+                           reqCols, table.CurrentSnapshot.Metadata.PartitionColumns))
+                {
+                    repartitionTo = reqCols;
+                }
                 // replace_where => STATIC partition-overwrite; PARTITION_OVERWRITE => DYNAMIC (partitions present
                 // in the input); otherwise the requested append/overwrite. Each is one atomic commit.
                 long version = spec?.ReplaceWhere is { Count: > 0 } parts
                     ? table.OverwritePartitionsAsync(batches, parts, ct).AsTask().GetAwaiter().GetResult()
                     : spec?.DynamicPartitionOverwrite == true
                         ? table.DynamicOverwriteAsync(batches, ct).AsTask().GetAwaiter().GetResult()
-                        : table.WriteAsync(batches, mode, ct).AsTask().GetAwaiter().GetResult();
+                        : table.WriteAsync(batches, mode, ct, repartitionTo: repartitionTo)
+                            .AsTask().GetAwaiter().GetResult();
                 Log.LogInformation("delta write {Path}: committed v{Version}", path, version);
                 return version;
             }
@@ -598,6 +613,18 @@ internal static class DeltaWriter
             // column-mapping table (BOTH modes) CAN stream: the COPY renames the columns to their PHYSICAL names
             // (Delta spec: data files use physical names in both modes) and stamps the field_ids (FIELD_IDS).
             if (!table.SupportsExternalDataFileCommit)
+            {
+                return null;
+            }
+            // Repartition-on-overwrite (PARTITION_COLUMNS differing from an EXISTING table's partitioning):
+            // the streaming commit has no metaData-swap support → collect path, whose WriteAsync(repartitionTo:)
+            // folds the new partitionColumns into the overwrite commit. A fresh create already matches
+            // (OpenOrCreate above applied them) → streams as usual. Checked BEFORE SetSchemaAsync so a
+            // fallback leaves no half-done metadata commit behind.
+            if (mode == DeltaWriteMode.Overwrite
+                && spec?.PartitionColumns is { Count: > 0 } reqPartCols
+                && !System.Linq.Enumerable.SequenceEqual(
+                       reqPartCols, table.CurrentSnapshot.Metadata.PartitionColumns))
             {
                 return null;
             }

@@ -202,7 +202,13 @@ public sealed class DeltaCatalog : IBackendCatalog
         _materializeRowTracking = ParseBoolOption(optionsJson, "materialize_row_tracking");
         _columnMappingMode = ParseColumnMappingOption(optionsJson);
         _pushdownMode = ParsePushdownFiltersOption(optionsJson, _nativeRead);
+        _copyDisposition = ParseStringOption(optionsJson, "copy_disposition");
     }
+
+    // COPY (FORMAT delta) MODE 'error'|'ignore' — set only on the COPY's TRANSIENT catalog (which serves
+    // exactly one statement, so a per-statement disposition may ride the catalog options): a create-shaped
+    // bulk onto an EXISTING target fails ('error', Spark's default save mode) or silently no-ops ('ignore').
+    private readonly string? _copyDisposition;
 
     /// <summary>Returns the host-FS opener for this thread and, in the same breath, publishes this catalog's
     /// Fabric credential to <see cref="AmbientOneLakeCredential"/> so the filesystem factory
@@ -1167,9 +1173,10 @@ public sealed class DeltaCatalog : IBackendCatalog
         _log.LogInformation("delta bulk {Schema}.{Table}: create={Create} replace={Replace} native_write={Native} partition_overwrite={PartOw}",
             schemaName, tableName, createTable, replace, _nativeWrite, partitionOverwrite);
         EnsureVariantWritable(data.Schema);
-        // Partition columns take effect only at table creation; an INSERT (Append) into an existing table
-        // preserves the table's declared partitioning (engineered-wood reads it from the metadata).
-        var spec = ResolveWriteSpec(createTable || replace ? partitionColumns : null, schemaMode);
+        // Partition columns are ALWAYS forwarded but take effect only when the write actually CREATES the
+        // table (explicit CREATE/REPLACE, or the append shape's implicit create-if-missing) — engineered-wood's
+        // OpenOrCreateAsync applies them at creation and an existing table keeps its metadata partitioning.
+        var spec = ResolveWriteSpec(partitionColumns, schemaMode);
         // Data mode: schema_mode=overwrite forces a full replace (adopt the source schema); CREATE/CTAS/REPLACE
         // also overwrite; otherwise it's an append (INSERT / COPY create_table=false / schema_mode=merge).
         bool overwrite = createTable || replace || spec?.SchemaMode == DeltaSchemaMode.Overwrite;
@@ -1200,6 +1207,49 @@ public sealed class DeltaCatalog : IBackendCatalog
             spec = (spec ?? new DeltaWriteSpec(null, null, null, null)) with { DynamicPartitionOverwrite = true };
         }
         var tablePath = TablePath(schemaName, tableName);
+
+        // Dynamic partition overwrite is append-SHAPED, so a missing target is implicitly created. With
+        // PARTITION_COLUMNS supplied it is created PARTITIONED and the first write is a plain append
+        // (dynamic overwrite matches no pre-existing files) — the idempotent first-run shape. WITHOUT them
+        // the implicit create would be unpartitioned and only THEN fail the partitioned-target guard,
+        // leaving an empty commit-0 behind — reject that up front, before anything touches storage.
+        if (partitionOverwrite && !TableExists(tablePath) && partitionColumns is not { Count: > 0 })
+        {
+            throw new System.InvalidOperationException(
+                $"PARTITION_OVERWRITE: target table '{schemaName}.{tableName}' does not exist — supply "
+                + "PARTITION_COLUMNS to create it partitioned, or create it first.");
+        }
+
+        // COPY (FORMAT delta) MODE dispositions (transient-catalog-only option; the transient catalog serves
+        // exactly one statement). 'error'/'ignore' are create-shaped: an EXISTING target fails / silently
+        // no-ops (Spark save-mode semantics; a missing target is created by either). 'error_if_not_exists'
+        // is append-shaped: a MISSING target fails instead of being implicitly provisioned (strict append —
+        // the inverse of 'error'; no Spark equivalent). Returning without consuming `data` is safe —
+        // BulkSession's finally drains.
+        if (_copyDisposition is not null)
+        {
+            if (createTable && TableExists(tablePath))
+            {
+                if (_copyDisposition == "error")
+                {
+                    throw new System.InvalidOperationException(
+                        $"delta COPY MODE 'error': target table '{schemaName}.{tableName}' already exists "
+                        + "(use MODE 'overwrite', 'append' or 'ignore').");
+                }
+                if (_copyDisposition == "ignore")
+                {
+                    _log.LogInformation("delta bulk {Schema}.{Table}: MODE 'ignore' — target exists, no-op",
+                        schemaName, tableName);
+                    return 0;
+                }
+            }
+            if (_copyDisposition == "error_if_not_exists" && !TableExists(tablePath))
+            {
+                throw new System.InvalidOperationException(
+                    $"delta COPY MODE 'error_if_not_exists': target table '{schemaName}.{tableName}' does "
+                    + "not exist (use MODE 'append' to create it implicitly).");
+            }
+        }
 
         // Explicit transaction (slice 4): a FRESH-table CTAS buffers — the CREATE parks on the buffer, the
         // data collects as pending batches, and the flush creates + writes at COMMIT (nothing touches the
