@@ -169,7 +169,9 @@ public:
 		auto cred = ResolveCredJson(path, opener);
 		if (flags.OpenForWriting()) {
 			// Plain sequential file write (COPY … TO 'onelake://…') — create/overwrite, appends follow.
-			auto handle = OneLakeOpenWrite(path, cred);
+			// EXCLUSIVE_CREATE => put-if-absent (ADLS conditional create) — the atomic-commit primitive
+			// engineered-wood's rename emulation rides on (an existing target fails the open).
+			auto handle = OneLakeOpenWrite(path, cred, flags.ExclusiveCreate());
 			return make_uniq<ArrowNetOneLakeFileHandle>(*this, path, flags, handle, 0, /*is_write=*/true);
 		}
 		int64_t size = 0;
@@ -275,12 +277,14 @@ public:
 	void FileSync(FileHandle &) override {
 		// The managed side flushes + commits on close (OneLakeCloseWrite); nothing to do mid-stream.
 	}
-	// --- other mutate ops: not supported ---
-	void RemoveFile(const string &, optional_ptr<FileOpener>) override {
-		throw NotImplementedException("onelake:// FileSystem is read-only");
+	// Single-file delete (idempotent) — engineered-wood's commit rename is emulated as
+	// exclusive-create-copy + delete-source, so a Delta write over onelake:// needs RemoveFile (v61).
+	void RemoveFile(const string &path, optional_ptr<FileOpener> opener) override {
+		OneLakeRemove(path, ResolveCredJson(path, opener));
 	}
+	// --- other mutate ops: not supported ---
 	void MoveFile(const string &, const string &, optional_ptr<FileOpener>) override {
-		throw NotImplementedException("onelake:// FileSystem is read-only");
+		throw NotImplementedException("onelake:// FileSystem: MoveFile is not supported");
 	}
 	// Directory ops: OneLake / ADLS Gen2 directories are IMPLICIT (a blob write at `<dir>/<file>`
 	// materializes the whole hierarchy). DuckDB's partitioned COPY (PARTITION_BY) checks the target directory

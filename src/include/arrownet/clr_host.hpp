@@ -76,11 +76,13 @@ std::string OneLakeGlob(const std::string &pattern, const std::string &cred_json
 bool OneLakeExists(const std::string &path, const std::string &cred_json);
 
 // onelake:// WRITE (slice 2): a plain sequential file write (COPY … TO 'onelake://…'). OneLakeOpenWrite
-// creates/overwrites the file and returns a managed write handle; OneLakeWrite appends; OneLakeCloseWrite
-// flushes + frees the handle.
-ArrowNetHandle OneLakeOpenWrite(const std::string &path, const std::string &cred_json);
+// creates/overwrites the file (`exclusive` => put-if-absent, ADLS conditional create — EXCLUSIVE_CREATE
+// semantics, v61) and returns a managed write handle; OneLakeWrite appends; OneLakeCloseWrite flushes +
+// frees the handle. OneLakeRemove deletes a single file (idempotent, v61).
+ArrowNetHandle OneLakeOpenWrite(const std::string &path, const std::string &cred_json, bool exclusive);
 void OneLakeWrite(ArrowNetHandle file, const void *buffer, int64_t nr_bytes);
 void OneLakeCloseWrite(ArrowNetHandle file);
+void OneLakeRemove(const std::string &path, const std::string &cred_json);
 
 // Delta native-read (MultiFileList): the active data files of the Delta table at `path` as a JSON array
 // [{"path":"<uri>", ...}] (the `add` set, not a glob). `push_json` = pushed filters (empty = none). The

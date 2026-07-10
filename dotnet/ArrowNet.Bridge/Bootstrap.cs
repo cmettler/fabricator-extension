@@ -51,7 +51,7 @@ public static unsafe class Bootstrap
             return new InMemoryArrayStream(schema, new[] { batch });
         });
 
-        vtable->AbiVersion = 60;
+        vtable->AbiVersion = 61;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -112,6 +112,7 @@ public static unsafe class Bootstrap
         vtable->OneLakeWrite = &OneLakeWrite;
         vtable->OneLakeCloseWrite = &OneLakeCloseWrite;
         vtable->DeltaListFiles = &DeltaListFiles;
+        vtable->OneLakeRemove = &OneLakeRemove;
         return ArrowNetStatus.Ok;
     }
 
@@ -622,14 +623,31 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int OneLakeOpenWrite(byte* path, byte* credJson, nint* outFile, byte** err)
+    private static int OneLakeOpenWrite(byte* path, byte* credJson, int exclusive, nint* outFile, byte** err)
     {
         try
         {
             var p = Marshal.PtrToStringUTF8((nint)path) ?? string.Empty;
             var cj = Marshal.PtrToStringUTF8((nint)credJson);
-            var handle = OneLakeForwardFs.OpenWrite(p, cj);
+            var handle = OneLakeForwardFs.OpenWrite(p, cj, exclusive != 0);
             *outFile = Handles.Alloc(handle);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int OneLakeRemove(byte* path, byte* credJson, byte** err)
+    {
+        try
+        {
+            var p = Marshal.PtrToStringUTF8((nint)path) ?? string.Empty;
+            var cj = Marshal.PtrToStringUTF8((nint)credJson);
+            OneLakeForwardFs.Remove(p, cj);
             return ArrowNetStatus.Ok;
         }
         catch (Exception ex)

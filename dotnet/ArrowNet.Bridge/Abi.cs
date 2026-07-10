@@ -198,8 +198,9 @@ public unsafe struct ArrowNetVTable
     // int32 onelake_exists(char* path, char* cred_json, int32* out_exists, char** err)
     public delegate* unmanaged[Cdecl]<byte*, byte*, int*, byte**, int> OneLakeExists;
     // onelake:// WRITE (slice 2): create/overwrite a plain OneLake file (COPY … TO 'onelake://…').
-    // int32 onelake_open_write(char* path, char* cred_json, void** out_file, char** err)
-    public delegate* unmanaged[Cdecl]<byte*, byte*, nint*, byte**, int> OneLakeOpenWrite;
+    // `exclusive` != 0 => put-if-absent (ADLS conditional create) — EXCLUSIVE_CREATE semantics (v61).
+    // int32 onelake_open_write(char* path, char* cred_json, int32 exclusive, void** out_file, char** err)
+    public delegate* unmanaged[Cdecl]<byte*, byte*, int, nint*, byte**, int> OneLakeOpenWrite;
     // int32 onelake_write(void* file, void* buffer, int64 nr_bytes, char** err)
     public delegate* unmanaged[Cdecl]<nint, void*, long, byte**, int> OneLakeWrite;
     // int32 onelake_close_write(void* file, char** err)
@@ -208,6 +209,10 @@ public unsafe struct ArrowNetVTable
     // [{"path":"<uri>", ...}]. `push_json` = pushed filters (empty ⇒ none). See abi.h delta_list_files.
     // int32 delta_list_files(char* path, char* push_json, char** out_json, char** err)
     public delegate* unmanaged[Cdecl]<byte*, byte*, byte**, byte**, int> DeltaListFiles;
+    // Delete a single onelake:// file (DataLakeFileClient.DeleteIfExists — idempotent). Appended at v61 so
+    // the onelake:// FileSystem supports RemoveFile (engineered-wood's rename emulation deletes its source).
+    // int32 onelake_remove(char* path, char* cred_json, char** err)
+    public delegate* unmanaged[Cdecl]<byte*, byte*, byte**, int> OneLakeRemove;
 }
 
 /// <summary>

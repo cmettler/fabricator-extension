@@ -199,13 +199,31 @@ internal static class OneLakeForwardFs
         public long Position { get; set; }
     }
 
-    /// <summary>Create (overwrite) the target file and return a write handle.</summary>
-    public static WriteHandle OpenWrite(string path, string? credJson)
+    /// <summary>
+    /// Create the target file and return a write handle. <paramref name="exclusive"/> = put-if-absent
+    /// (ADLS conditional create, If-None-Match:* — the atomic-commit primitive EXCLUSIVE_CREATE maps to;
+    /// an existing target fails the create); otherwise create/overwrite.
+    /// </summary>
+    public static WriteHandle OpenWrite(string path, string? credJson, bool exclusive = false)
     {
         var (fs, p) = Parse(path);
         var client = FsClient(fs, Cred(credJson)).GetFileClient(p);
-        client.CreateAsync().GetAwaiter().GetResult(); // create/overwrite (0-length); appends follow
+        var options = exclusive
+            ? new DataLakePathCreateOptions
+            {
+                Conditions = new DataLakeRequestConditions { IfNoneMatch = ETag.All },
+            }
+            : null;
+        client.CreateAsync(options).GetAwaiter().GetResult(); // 0-length; appends follow
         return new WriteHandle { Client = client, Position = 0 };
+    }
+
+    /// <summary>Delete a single file (idempotent — no error if absent).</summary>
+    public static void Remove(string path, string? credJson)
+    {
+        var (fs, p) = Parse(path);
+        var client = FsClient(fs, Cred(credJson)).GetFileClient(p);
+        client.DeleteIfExistsAsync().GetAwaiter().GetResult();
     }
 
     /// <summary>Append `data` at the current position.</summary>

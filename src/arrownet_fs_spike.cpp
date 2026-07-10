@@ -218,17 +218,28 @@ int32_t HostFsRemove(ArrowNetHandle opener, const char *path, char **err) {
 }
 
 // Recursive mkdir -p: DuckDB's CreateDirectory is single-level, so create the parent chain. Recurses up until
-// an existing ancestor (drive root / scheme authority), then creates downward. Idempotent; object stores treat
-// directories as implicit (CreateDirectory is a no-op/marker), so the recursion is harmless there.
+// an existing ancestor, then creates downward. Idempotent; object stores treat directories as implicit
+// (CreateDirectory is a no-op/marker), so the recursion is harmless there. For a scheme path
+// ("scheme://authority/seg/…") the recursion FLOOR is the authority: a filesystem whose DirectoryExists is
+// always-false (onelake://) would otherwise walk past it, and the stripped prefixes ("onelake:") no longer
+// match the scheme's VFS and fall through to the LOCAL filesystem.
 void CreateDirRecursive(FileSystem &fs, const std::string &path) {
 	if (path.empty() || fs.DirectoryExists(path)) {
 		return;
 	}
+	size_t floor_len = 0; // never recurse to a parent at or above this length
+	auto scheme = path.find("://");
+	if (scheme != std::string::npos) {
+		auto first_path_slash = path.find('/', scheme + 3);
+		floor_len = (first_path_slash == std::string::npos) ? path.size() : first_path_slash;
+	}
+	if (path.size() <= floor_len) {
+		return; // the bare authority itself — nothing to create
+	}
 	auto slash = path.find_last_of('/');
-	if (slash != std::string::npos && slash > 0) {
+	if (slash != std::string::npos && slash > floor_len) {
 		std::string parent = path.substr(0, slash);
-		// Stop at a scheme authority ("abfss://c@host") — has no '/' after "://".
-		if (!parent.empty() && parent.find("://") != parent.size() - 3 && !fs.DirectoryExists(parent)) {
+		if (!fs.DirectoryExists(parent)) {
 			CreateDirRecursive(fs, parent);
 		}
 	}
