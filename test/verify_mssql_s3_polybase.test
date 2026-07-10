@@ -128,6 +128,26 @@ SELECT count(*) FROM sqldb.dbo.s3_delta_trips;
 ----
 8
 
+# ---- 4b. copy-on-write DML keeps the table SQL-Server-readable (plain remove+add, protocol 1.0) ----
+statement ok
+DELETE FROM plake.main.trips WHERE id IN (2, 7);
+
+statement ok
+UPDATE plake.main.trips SET city = 'rewritten' WHERE id = 5;
+
+query IIT
+SELECT id, amount, city FROM mssql_net_query('sqldb',
+  'SELECT id, amount, city FROM OPENROWSET(BULK ''/arrownet/polybase/trips'', FORMAT = ''DELTA'',
+     DATA_SOURCE = ''s3_ds'') AS r ORDER BY id')
+ORDER BY id;
+----
+1	100	city1
+3	300	city0
+4	400	city1
+5	500	rewritten
+6	600	city0
+8	800	city2
+
 # ---- 5. negative pin: a DV-default table (reader v3) is NOT readable by SQL Server's 1.0 reader ----
 statement ok
 ATTACH 's3://arrownet/polybase-dv' AS dvlake (TYPE arrownet, PROVIDER 'delta', READ_ONLY false);
@@ -143,6 +163,91 @@ SELECT * FROM mssql_net_query('sqldb',
 
 statement ok
 DETACH dvlake;
+
+# ...and a NAME-mapped table is rejected too — with a SPECIFIC error (SQL Server's reader recognizes
+# the columnMapping feature and refuses it: "19725: Column mapping is not enabled").
+statement ok
+ATTACH 's3://arrownet/polybase-cm' AS cmlake (TYPE arrownet, PROVIDER 'delta', READ_ONLY false,
+                                              deletion_vectors false, column_mapping 'name');
+
+statement ok
+CREATE OR REPLACE TABLE cmlake.main.cmt AS SELECT 1 AS i, 'x' AS v;
+
+statement error
+SELECT * FROM mssql_net_query('sqldb',
+  'SELECT * FROM OPENROWSET(BULK ''/arrownet/polybase-cm/cmt'', FORMAT = ''DELTA'',
+     DATA_SOURCE = ''s3_ds'') AS r');
+----
+Column mapping
+
+statement ok
+DETACH cmlake;
+
+# ---- 5b. IDENTITY is a WRITER-only feature (writer v7, reader stays 1) — SQL Server READS it ----
+statement ok
+ATTACH 's3://arrownet/polybase-id' AS idlake (TYPE arrownet, PROVIDER 'delta', READ_ONLY false,
+                                              deletion_vectors false, column_mapping 'none');
+
+statement ok
+DROP TABLE IF EXISTS idlake.main.ids;
+
+statement ok
+CREATE TABLE idlake.main.ids (id BIGINT AS (0), name VARCHAR);
+
+statement ok
+INSERT INTO idlake.main.ids (name) VALUES ('a'), ('b'), ('c');
+
+query IT
+SELECT id, name FROM mssql_net_query('sqldb',
+  'SELECT id, name FROM OPENROWSET(BULK ''/arrownet/polybase-id/ids'', FORMAT = ''DELTA'',
+     DATA_SOURCE = ''s3_ds'') AS r ORDER BY id')
+ORDER BY id;
+----
+1	a
+2	b
+3	c
+
+statement ok
+DROP TABLE idlake.main.ids;
+
+statement ok
+DETACH idlake;
+
+# ---- 5c. Change Data Feed is a WRITER-only feature too — SQL Server reads the CURRENT state ----
+statement ok
+ATTACH 's3://arrownet/polybase-cdf' AS cdflake (TYPE arrownet, PROVIDER 'delta', READ_ONLY false,
+                                                change_data_feed true, deletion_vectors false,
+                                                column_mapping 'none');
+
+statement ok
+DROP TABLE IF EXISTS cdflake.main.f;
+
+statement ok
+CREATE TABLE cdflake.main.f (id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO cdflake.main.f VALUES (1, 'a'), (2, 'b'), (3, 'c');
+
+statement ok
+DELETE FROM cdflake.main.f WHERE id = 2;
+
+statement ok
+UPDATE cdflake.main.f SET name = 'upd' WHERE id = 3;
+
+query IT
+SELECT id, name FROM mssql_net_query('sqldb',
+  'SELECT id, name FROM OPENROWSET(BULK ''/arrownet/polybase-cdf/f'', FORMAT = ''DELTA'',
+     DATA_SOURCE = ''s3_ds'') AS r ORDER BY id')
+ORDER BY id;
+----
+1	a
+3	upd
+
+statement ok
+DROP TABLE cdflake.main.f;
+
+statement ok
+DETACH cdflake;
 
 # ---- 6. teardown (external objects; the delta data stays for re-runs — CREATE OR REPLACE resets it) ----
 statement ok

@@ -2950,12 +2950,31 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   → `CREATE EXTERNAL TABLE` + read back through the ATTACHed catalog as a normal scan (DuckDB →
   mssql_net → SQL Server → S3 delta reader → MinIO → table written by our Delta provider). **SQL Server's
   DELTA reader = Delta protocol 1.0 ONLY** — the interop table MUST be written `deletion_vectors false,
-  column_mapping 'none'` (a DV-default reader-v3 table errors — pinned; same finding class as the Fabric
-  T-SQL endpoint). Partitioned delta: the external table reads the partition column as NULL, OPENROWSET
-  reads it correctly (documented MS limitation). S3 caveats (documented, unchanged): no put-if-absent on
-  httpfs S3 (single-writer; `arrownet_fs_write_probe` shows EXCLUSIVE_CREATE unguarded), `MoveFile`
-  unimplemented (RENAME TABLE fails); `DROP EXTERNAL TABLE IF EXISTS` is not T-SQL (use
-  `IF OBJECT_ID(...) IS NOT NULL DROP EXTERNAL TABLE ...`).
+  column_mapping 'none'`: a DV-default reader-v3 table errors, and a NAME-mapped table is rejected with
+  the SPECIFIC error `19725: Column mapping is not enabled` (the reader recognizes the feature but gates
+  it off — both pinned; same finding class as the Fabric T-SQL endpoint). Copy-on-write DELETE/UPDATE on
+  the plain table KEEP it SQL-Server-readable (plain remove+add stays protocol 1.0 — OPENROWSET reads the
+  post-DML state exactly; pinned), so the full DML lifecycle works for SQL-Server-facing tables — just on
+  the CoW path instead of DVs. Partitioned delta: the external table reads the partition column as NULL, OPENROWSET
+  reads it correctly (documented MS limitation). **IDENTITY on S3 works end-to-end** (v53 marker; values continue
+  across re-attach — hwm durable on MinIO) **and stays SQL-Server-readable** (identityColumns is a
+  WRITER-only feature, reader stays v1 — pinned). **DROP TABLE on S3 works via a per-file fallback**:
+  httpfs' S3 `RemoveDirectory` re-lists keys WITHOUT the scheme prefix and fails its own remove ("URL
+  needs to start with s3://"), so `DeltaCatalog.DropTable` catches the failure and deletes glob(`/**`)
+  file-by-file + the zero-byte directory-marker keys (`RemoveFile` IS implemented for s3). S3 caveats
+  (documented, unchanged): no put-if-absent on httpfs S3 (single-writer; `arrownet_fs_write_probe` shows
+  EXCLUSIVE_CREATE unguarded), `MoveFile` unimplemented (RENAME TABLE fails); `DROP EXTERNAL TABLE IF
+  EXISTS` is not T-SQL (use `IF OBJECT_ID(...) IS NOT NULL DROP EXTERNAL TABLE ...`). **CDF on S3 works end-to-end** (change files write to + read
+  from the bucket; the feed is exact) **and a CDF table stays SQL-Server-readable** (changeDataFeed is
+  writer-only too — pinned). **FIFTH S3-rig bug (EW, parquet-layer):** `ColumnChunkWriter.CompressTo`
+  returned a 0-BYTE payload for an empty input — but a valid snappy stream of nothing is the single
+  `0x00` length varint, so an ALL-NULL DataPage-V2 values section was "corrupt snappy" to strict decoders
+  → **SQL Server failed every table whose read crossed an EW CHECKPOINT** (checkpoints are full of
+  all-null column chunks; error 19787 on the `.checkpoint.parquet`; DuckDB/kernel tolerate 0 bytes). Fix:
+  let the codec encode emptiness (Snappier emits the valid empty stream); verified — SQL Server reads
+  through a fresh v10 checkpoint (12-version table, exact counts). EW Parquet.Tests 585/585. Test sizes
+  now: verify_delta_catalog_s3 114, verify_mssql_s3_polybase 118 (+ column-mapping/identity/CDF pins,
+  CoW-DML readability, DROP-on-S3, CDF feed over S3).
 - **Copy-paste test env** (Bash tool; test-only creds — the REAL Fabric SP lives only in the gitignored
   `dax_secret.sql`, never here). Run the loadable/shell/unittest from `build/release/`:
   ```bash

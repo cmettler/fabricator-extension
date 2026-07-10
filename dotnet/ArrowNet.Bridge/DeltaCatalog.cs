@@ -2076,7 +2076,50 @@ public sealed class DeltaCatalog : IBackendCatalog
         {
             throw Unsupported("DROP TABLE (host does not provide a recursive directory-delete callback)");
         }
-        HostFs.RemoveDir(Opener(), TablePath(schemaName, tableName));
+        try
+        {
+            HostFs.RemoveDir(Opener(), TablePath(schemaName, tableName));
+        }
+        catch (System.Exception ex)
+        {
+            // httpfs' S3 RemoveDirectory re-lists keys WITHOUT the scheme prefix and then fails its own
+            // per-file remove ("URL needs to start with s3://") — fall back to a provider-side recursive
+            // delete: glob every object under the table prefix and remove them file-by-file (object-store
+            // directories are implicit, and RemoveFile IS implemented for s3).
+            _log.LogInformation(
+                "delta drop {Schema}.{Table}: RemoveDirectory failed ({Err}) — per-file fallback",
+                schemaName, tableName, ex.Message);
+            RemoveDirByFiles(TablePath(schemaName, tableName));
+        }
+    }
+
+    // Recursive object-store delete without RemoveDirectory: remove every globbed object under the
+    // prefix, then the zero-byte directory-marker keys CreateDirectory may have left (best-effort).
+    private void RemoveDirByFiles(string dir)
+    {
+        var opener = Opener();
+        var json = HostFs.Glob(opener, dir + "/**");
+        using (var doc = JsonDocument.Parse(json))
+        {
+            foreach (var el in doc.RootElement.EnumerateArray())
+            {
+                var path = el.GetProperty("path").GetString();
+                if (string.IsNullOrEmpty(path))
+                {
+                    continue;
+                }
+                try
+                {
+                    HostFs.Remove(opener, path);
+                }
+                catch
+                {
+                    // best-effort per object (a marker key or an already-deleted object)
+                }
+            }
+        }
+        try { HostFs.Remove(opener, dir + "/_delta_log/"); } catch { }
+        try { HostFs.Remove(opener, dir + "/"); } catch { }
     }
 
     /// <summary>DELETE = rowid-based via Delta row tracking: <paramref name="keys"/> is a stream whose single

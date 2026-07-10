@@ -190,3 +190,93 @@ SELECT grp FROM s3n.main.nt WHERE id = 11;
 
 statement ok
 DETACH s3n;
+
+# ---- Delta IDENTITY on S3 (the v53 generated-column marker): engine-assigned values, high-water
+# continuation across re-attach, and DROP TABLE (per-file fallback — httpfs has no S3 RemoveDirectory) ----
+statement ok
+ATTACH 's3://arrownet/lake' AS s3id (TYPE arrownet, PROVIDER 'delta', READ_ONLY false);
+
+statement ok
+DROP TABLE IF EXISTS s3id.main.idt;
+
+statement ok
+CREATE TABLE s3id.main.idt (id BIGINT AS (0), name VARCHAR);
+
+statement ok
+INSERT INTO s3id.main.idt (name) VALUES ('a'), ('b'), ('c');
+
+query IT
+SELECT id, name FROM s3id.main.idt ORDER BY id;
+----
+1	a
+2	b
+3	c
+
+statement ok
+DETACH s3id;
+
+statement ok
+ATTACH 's3://arrownet/lake' AS s3id2 (TYPE arrownet, PROVIDER 'delta', READ_ONLY false);
+
+statement ok
+INSERT INTO s3id2.main.idt (name) VALUES ('d');
+
+query IT
+SELECT id, name FROM s3id2.main.idt WHERE id >= 3 ORDER BY id;
+----
+3	c
+4	d
+
+statement ok
+DROP TABLE s3id2.main.idt;
+
+statement ok
+DETACH s3id2;
+
+statement ok
+ATTACH 's3://arrownet/lake' AS s3id3 (TYPE arrownet, PROVIDER 'delta', READ_ONLY false);
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 's3id3' AND table_name = 'idt';
+----
+0
+
+statement ok
+DETACH s3id3;
+
+# ---- Change Data Feed on S3: change files write to + read from the bucket (CoW capture path) ----
+statement ok
+ATTACH 's3://arrownet/lake-cdf' AS s3cdf (TYPE arrownet, PROVIDER 'delta', READ_ONLY false,
+                                          change_data_feed true, deletion_vectors false, column_mapping 'none');
+
+statement ok
+DROP TABLE IF EXISTS s3cdf.main.f;
+
+statement ok
+CREATE TABLE s3cdf.main.f (id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO s3cdf.main.f VALUES (1, 'a'), (2, 'b'), (3, 'c');
+
+statement ok
+DELETE FROM s3cdf.main.f WHERE id = 2;
+
+statement ok
+UPDATE s3cdf.main.f SET name = 'upd' WHERE id = 3;
+
+query TIIT
+SELECT _change_type, _commit_version, id, name
+FROM arrownet_delta_changes('s3cdf', 'f', 0) ORDER BY _commit_version, _change_type, id;
+----
+insert	1	1	a
+insert	1	2	b
+insert	1	3	c
+delete	2	2	b
+update_postimage	3	3	upd
+update_preimage	3	3	c
+
+statement ok
+DROP TABLE s3cdf.main.f;
+
+statement ok
+DETACH s3cdf;
