@@ -203,7 +203,23 @@ public sealed class DeltaCatalog : IBackendCatalog
         _columnMappingMode = ParseColumnMappingOption(optionsJson);
         _pushdownMode = ParsePushdownFiltersOption(optionsJson, _nativeRead);
         _copyDisposition = ParseStringOption(optionsJson, "copy_disposition");
+        var isolation = ParseStringOption(optionsJson, "isolation_level");
+        _serializable = isolation?.Replace("_", "").ToLowerInvariant() switch
+        {
+            null or "" or "writeserializable" => false,
+            "serializable" => true,
+            _ => throw new System.ArgumentException(
+                $"delta: unknown isolation_level '{isolation}' — expected 'serializable' or 'write_serializable'."),
+        };
     }
+
+    // ATTACH option `isolation_level 'write_serializable'|'serializable'` (Spark's delta.isolationLevel):
+    // how explicit transactions treat CONCURRENT BLIND APPENDS at COMMIT. write_serializable (the default —
+    // Spark's default too) lets the COMMIT logically reorder before them (they pass the rebase even when
+    // they match the transaction's reads); serializable makes commit order the logical order — a concurrent
+    // append matching the transaction's read predicates conflict-aborts. All other checks (metadata /
+    // protocol / delete-delete / delete-read) are identical at both levels.
+    private readonly bool _serializable;
 
     // COPY (FORMAT delta) MODE 'error'|'ignore' — set only on the COPY's TRANSIENT catalog (which serves
     // exactly one statement, so a per-statement disposition may ride the catalog options): a create-shaped
@@ -706,8 +722,9 @@ public sealed class DeltaCatalog : IBackendCatalog
         // Projection is left to DuckDB above the scan (the full schema is returned, mapped by name) — same as
         // the global arrownet_delta_scan; column-pruning into parquet would need a projected-schema stream.
         var spec = ScanSpec.Parse(specJson);
-        _log.LogDebug("delta scan {Schema}.{Table}: mode={Mode} native_filter={NF}",
-            schemaName, tableName, _pushdownMode, spec?.NativeFilter ?? "<none>");
+        _log.LogDebug("delta scan {Schema}.{Table}: mode={Mode} native_filter={NF} spec={Spec}",
+            schemaName, tableName, _pushdownMode, spec?.NativeFilter ?? "<none>",
+            spec is null ? "<null>" : (spec.Columns is null ? "no-cols" : $"cols={spec.Columns.Count}"));
         var filterVals = ReadFilterValues(filterValues);
         if (_pushdownMode == PushdownMode.None && spec is not null)
         {
@@ -718,6 +735,41 @@ public sealed class DeltaCatalog : IBackendCatalog
         EngineeredWood.Expressions.Predicate? filter = spec?.Filter is { } node
             ? new DeltaFilterBuilder(filterVals).Build(node)
             : null;
+
+        // READ-SET recording (explicit transactions; Spark ConflictChecker parity): the pushed predicate —
+        // a superset of the rows this scan consumes (unpushed residue filters ABOVE the scan, so the files
+        // it can touch are exactly those the pushed part matches) — or whole-table when nothing pushed.
+        // Feeds the logical rebase's concurrentAppend/concurrentDeleteRead checks at COMMIT. Explicit AT
+        // scans read committed history, not the transaction's snapshot — excluded. Under SERIALIZABLE the
+        // first read also pins the transaction's base version (the rebase walks pin+1..latest; without a
+        // pin an append-only transaction's reads would have no base to check against).
+        // spec == null is the BIND-TIME schema probe (no projection, no filter — not a data read);
+        // every real scan carries a spec with at least its projected columns.
+        long scanTxn = AmbientTransaction.Current;
+        if (spec is not null && scanTxn != 0 && spec.At is null && _txnBuffer.IsExplicit(scanTxn))
+        {
+            var readPending = _txnBuffer.GetOrCreate(scanTxn, path);
+            if (filter is null)
+            {
+                readPending.ReadWholeTable = true;
+            }
+            else
+            {
+                readPending.ReadPredicates.Add(filter);
+            }
+            // SNAPSHOT ISOLATION for reads (default): the transaction's FIRST scan captures one UTC
+            // instant (SnapshotPinning, per txn) and each table resolves it to a version on first touch —
+            // every scan in the transaction then reads that consistent cut (the codec branch below routes
+            // through the AT-version streams; the native path already did). Also the rebase base for the
+            // COMMIT conflict check. A table CREATED in this transaction has nothing on storage to pin
+            // (it is served from the buffer).
+            if (!readPending.PendingCreate)
+            {
+                readPending.PinnedVersion ??= SnapshotPinning.TryGetPinned(scanTxn, path)
+                    ?? SnapshotPinning.PinVersion(scanTxn, path,
+                        inst => DeltaReader.ResolveVersionAsOf(opener, path, inst, _log), System.DateTime.UtcNow);
+            }
+        }
 
         // Opt-in native read (native_read true): DuckDB's own read_parquet decodes the files. A per-file loop
         // pushes projection + the static filter + Delta-log FILE pruning, excludes each file's deletion vector,
@@ -780,10 +832,26 @@ public sealed class DeltaCatalog : IBackendCatalog
             return ScanCodecWithPendingDml(opener, path, spec, filter, pendingScan);
         }
 
+        // SNAPSHOT ISOLATION (default): inside an explicit transaction, plain codec reads run AT the
+        // transaction's pinned version — the instant captured at the transaction's FIRST scan, resolved to
+        // a version per table (SnapshotPinning; recorded above, but also consulted directly since a
+        // read-only buffer entry is invisible through Get()). A concurrent writer's commits are therefore
+        // NOT visible mid-transaction; autocommit statements keep reading latest (a single codec statement
+        // is one snapshot anyway). The buffer pin (DML/ALTER) has priority — same source, same value.
+        long? pinnedRead = pendingScan?.PinnedVersion;
+        if (pinnedRead is null && scanTxn != 0 && _txnBuffer.IsExplicit(scanTxn))
+        {
+            pinnedRead = SnapshotPinning.TryGetPinned(scanTxn, path);
+        }
+        string? pinnedReadValue = pinnedRead?.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
         // Pending buffered ALTER: advertise the PENDING schema. The engineered-wood read below knows only
         // the COMMITTED columns, so pending-only names are stripped from its projection and each batch is
         // RECONCILED to the advertised shape afterwards (added columns backfilled as typed NULLs).
-        var userSchema = pendingScan?.PendingArrowSchema ?? DeltaReader.GetSchema(opener, path);
+        var userSchema = pendingScan?.PendingArrowSchema
+            ?? (pinnedReadValue is null
+                ? DeltaReader.GetSchema(opener, path)
+                : DeltaReader.GetSchemaAt(opener, path, "version", pinnedReadValue));
         var (projCols, projected) = ProjectFor(userSchema, spec);
         bool reconcile = pendingScan?.PendingMetadata is not null;
         var renameRev = reconcile ? CommittedToPending(pendingScan!) : null;
@@ -792,7 +860,9 @@ public sealed class DeltaCatalog : IBackendCatalog
         {
             // Translate pending names to the COMMITTED names the data is stored under (renamed columns),
             // dropping pending-only columns (added — nothing to read; the reconcile backfills NULLs).
-            var committed = DeltaReader.GetSchema(opener, path);
+            var committed = pinnedReadValue is null
+                ? DeltaReader.GetSchema(opener, path)
+                : DeltaReader.GetSchemaAt(opener, path, "version", pinnedReadValue);
             var keep = new List<string>();
             foreach (var pc in projCols)
             {
@@ -819,7 +889,9 @@ public sealed class DeltaCatalog : IBackendCatalog
                 new Field(RowIdColumn, Int64Type.Default, nullable: false),
             };
             var schemaWithRowId = new Schema(fields, projected.Metadata);
-            var rowIdStream = DeltaReader.StreamWithRowIds(opener, path, ewProjCols, filter, default);
+            var rowIdStream = pinnedReadValue is null
+                ? DeltaReader.StreamWithRowIds(opener, path, ewProjCols, filter, default)
+                : DeltaReader.StreamWithRowIdsAt(opener, path, ewProjCols, filter, "version", pinnedReadValue, default);
             var rowIdBase = reconcile ? ReconcileToSchema(rowIdStream, schemaWithRowId, renameRev) : rowIdStream;
             var rowIdOverlaid = pendingScan is { Batches.Count: > 0 }
                 ? DeltaTxnBuffer.Concat(rowIdBase,
@@ -829,7 +901,9 @@ public sealed class DeltaCatalog : IBackendCatalog
                 WithExactFilter(schemaWithRowId, rowIdOverlaid, spec));
         }
 
-        var plainStream = DeltaReader.Stream(opener, path, ewProjCols, filter, default);
+        var plainStream = pinnedReadValue is null
+            ? DeltaReader.Stream(opener, path, ewProjCols, filter, default)
+            : DeltaReader.StreamAt(opener, path, ewProjCols, filter, "version", pinnedReadValue, default);
         var plainBase = reconcile ? ReconcileToSchema(plainStream, projected, renameRev) : plainStream;
         var plainOverlaid = pendingScan is { Batches.Count: > 0 }
             ? DeltaTxnBuffer.Concat(plainBase,
@@ -1475,11 +1549,17 @@ public sealed class DeltaCatalog : IBackendCatalog
                 {
                     FlushCreateTransaction(opener, kv.Key, txnId, pending);
                 }
-                else if (pending.DeletedByOrdinal.Count > 0 || pending.PendingMetadata is not null)
+                else if (pending.DeletedByOrdinal.Count > 0 || pending.PendingMetadata is not null
+                         || (_serializable && pending.HasReads && pending.PinnedVersion is not null
+                             && (pending.Files.Count > 0 || pending.Batches.Count > 0)))
                 {
                     // Buffered DML and/or a buffered schema change: everything (metaData + protocol upgrade
-                    // + DV deletes + appends + post-images) fuses into ONE atomic commit with conflict-abort
-                    // against the pinned base version.
+                    // + DV deletes + appends + post-images) fuses into ONE atomic commit, rebase-checked
+                    // against the pinned base version. Under SERIALIZABLE an append-only transaction that
+                    // READ the table routes here too (its reads must be checked against concurrent commits
+                    // — commit order is logical order); under write_serializable it stays on the blind
+                    // fast path below (a deliberate, documented divergence from Spark's deleteRead check
+                    // for append-only transactions).
                     FlushDmlTransaction(opener, kv.Key, txnId, pending);
                 }
                 else if (pending.Files.Count > 0)
@@ -2038,18 +2118,18 @@ public sealed class DeltaCatalog : IBackendCatalog
         try
         {
             long pinned = pending.PinnedVersion!.Value;
-            if (table.CurrentSnapshot.Version != pinned)
-            {
-                throw new System.InvalidOperationException(
-                    $"delta transaction conflict on '{tablePath}': the table moved from version {pinned} to "
-                    + $"{table.CurrentSnapshot.Version} while the transaction was open — the transaction is "
-                    + "rolled back; retry it.");
-            }
+            // The transaction's changes were computed against the PINNED snapshot: DV positions are keyed
+            // by ITS path-sorted file ordinals, ALTERs chained against ITS metadata. Resolve it explicitly
+            // (a concurrent writer may have advanced the table) — the rebase check below decides whether
+            // committing on top of the newer snapshot is safe.
+            var pinnedSnap = table.CurrentSnapshot.Version == pinned
+                ? table.CurrentSnapshot
+                : table.GetSnapshotAtVersionAsync(pinned).AsTask().GetAwaiter().GetResult();
             var files = new List<EngineeredWood.DeltaLake.Table.WrittenDataFile>(pending.Files);
             if (pending.Batches.Count > 0)
             {
                 DeltaNullability.ValidateBatches(pending.Batches,
-                    pending.PendingDeltaSchema ?? table.CurrentSnapshot.Schema,
+                    pending.PendingDeltaSchema ?? pinnedSnap.Schema,
                     tablePath.Substring(tablePath.LastIndexOf('/') + 1));
                 files.AddRange(table.WriteDataFilesAsync(pending.Batches, default,
                         schemaOverride: pending.PendingDeltaSchema)
@@ -2060,7 +2140,8 @@ public sealed class DeltaCatalog : IBackendCatalog
             {
                 deletes[kv.Key] = kv.Value;
             }
-            var (dvActions, rowsDeleted) = table.ComputeDeletionVectorActionsAsync(deletes)
+            var (dvActions, rowsDeleted) = table.ComputeDeletionVectorActionsAsync(deletes,
+                    resolveAgainst: pinnedSnap)
                 .AsTask().GetAwaiter().GetResult();
             // The buffered schema change (metaData + merged protocol upgrade) joins the SAME commit.
             var extra = new List<EngineeredWood.DeltaLake.Actions.DeltaAction>();
@@ -2081,12 +2162,65 @@ public sealed class DeltaCatalog : IBackendCatalog
                 : pending.HasAlter
                     ? (pending.AlterOps.Count == 1 ? pending.AlterOps.First() : "ALTER TABLE")
                     : "WRITE";
-            long v = table.CommitDataFilesAsync(files, DeltaWriteMode.Append, cancellationToken: default,
-                    extraActions: extra, expectedVersion: pinned, operation: operation)
-                .AsTask().GetAwaiter().GetResult();
-            _log.LogInformation(
-                "delta txn {Txn} commit {Path}: v{Version} op={Op} (files={Files}, rows+={Rows}, rows-={Deleted})",
-                txnId, tablePath, v, operation, files.Count, pending.Rows, rowsDeleted);
+            // Spark-style LOGICAL REBASE: a concurrent commit only aborts the transaction when it ACTUALLY
+            // conflicts — the checker passes commuting concurrent commits (our DV remove+add pairs still
+            // reference unchanged active files, and the commit re-derives row-id/identity high-water marks
+            // from the snapshot it lands on) and throws on a real conflict: metadata/protocol change,
+            // delete/delete on a file we modify, a concurrent delete of a file our READS consumed, or —
+            // per the isolation level — a concurrent append matching our read predicates (serializable:
+            // always; write_serializable, the Spark-default: only from non-blind-append commits). The loop
+            // covers a writer landing BETWEEN our validation and our commit: reopen at the new latest,
+            // re-validate, retry (bounded).
+            for (int attempt = 1; ; attempt++)
+            {
+                if (table.CurrentSnapshot.Version != pinned)
+                {
+                    _log.LogInformation(
+                        "delta txn {Txn} rebase-check {Path}: v{Pinned}->v{Latest} reads=[preds={Preds} whole={Whole}] serializable={Ser}",
+                        txnId, tablePath, pinned, table.CurrentSnapshot.Version,
+                        pending.ReadPredicates.Count, pending.ReadWholeTable, _serializable);
+                    try
+                    {
+                        table.CheckLogicalRebaseAsync(pinnedSnap, extra,
+                                readPredicates: pending.ReadPredicates,
+                                readWholeTable: pending.ReadWholeTable,
+                                serializable: _serializable)
+                            .AsTask().GetAwaiter().GetResult();
+                    }
+                    catch (EngineeredWood.DeltaLake.DeltaConflictException ex)
+                    {
+                        throw new System.InvalidOperationException(
+                            $"delta transaction conflict on '{tablePath}': the table moved from version "
+                            + $"{pinned} to {table.CurrentSnapshot.Version} while the transaction was open and "
+                            + $"the concurrent changes do not commute ({ex.Message}) — the transaction is "
+                            + "rolled back; retry it.");
+                    }
+                    _log.LogInformation(
+                        "delta txn {Txn} rebase {Path}: pinned v{Pinned} -> committing on v{Latest} "
+                        + "(concurrent commits are non-conflicting appends)",
+                        txnId, tablePath, pinned, table.CurrentSnapshot.Version);
+                }
+                try
+                {
+                    long v = table.CommitDataFilesAsync(files, DeltaWriteMode.Append, cancellationToken: default,
+                            extraActions: extra, expectedVersion: table.CurrentSnapshot.Version,
+                            operation: operation)
+                        .AsTask().GetAwaiter().GetResult();
+                    _log.LogInformation(
+                        "delta txn {Txn} commit {Path}: v{Version} op={Op} (files={Files}, rows+={Rows}, rows-={Deleted})",
+                        txnId, tablePath, v, operation, files.Count, pending.Rows, rowsDeleted);
+                    return;
+                }
+                catch (EngineeredWood.DeltaLake.DeltaConflictException)
+                    when (attempt < DeltaWriter.MaxCommitAttempts)
+                {
+                    // Another writer took the version mid-flush — reopen at the new latest and re-validate.
+                    table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                    table = EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(
+                            fs, DeltaWriter.Options(null, dataFileWriter))
+                        .AsTask().GetAwaiter().GetResult();
+                }
+            }
         }
         finally
         {

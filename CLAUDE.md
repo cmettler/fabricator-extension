@@ -2613,11 +2613,57 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   builds post-image rows at statement time (`BufferUpdateRows`: EW `ReadRowsByRowIdsAsync` reads exactly
   the matched rows, DEEP-COPIED via Arrow-IPC — EW batch buffers don't outlive the open table — then the
   SET values substitute via the existing `BuildArray`; post-images join the pending append batches).
-  **PinnedVersion** = the version the DML's scan read (`SnapshotPinning.TryGetPinned` on native_read, else
-  current); all later in-txn scans of that table read EXACTLY that version. **Flush fusion**
-  (`FlushDmlTransaction`): validate `CurrentSnapshot.Version == PinnedVersion` (else **conflict-ABORT** —
-  first-committer-wins SI, clear "transaction conflict … retry" error; verified with a two-connection racer
-  test), write pending batches as files via the new EW **`WriteDataFilesAsync`** (write-no-commit half of
+  **SNAPSHOT READS ARE THE DEFAULT (2026-07-11)**: inside an explicit transaction, the FIRST scan captures
+  one UTC instant (`SnapshotPinning`, per txn — the MVCC snapshot-at-first-read shape, like Postgres
+  REPEATABLE READ; capturing at literal BEGIN is impossible since catalogs are touched lazily) and each
+  table resolves it to a version on first touch — EVERY scan in the transaction then reads that consistent
+  cut on BOTH paths (native always did; the CODEC plain/rowid reads now route through
+  `GetSchemaAt`/`StreamAt`/`StreamWithRowIdsAt` at the pin — previously codec reads floated to latest until
+  the first DML pinned). A concurrent commit is invisible mid-transaction; autocommit is unchanged (a
+  single codec statement is one snapshot anyway; native pins per statement for the cross-table cut).
+  Recording happens in `ScanTable` alongside the read-set capture (skipped for pending-CREATED tables —
+  nothing on storage to pin, the gotcha found in the build). **PinnedVersion** (= the pin above; the DML
+  paths reuse it via `TryGetPinned ?? profile.Version`, so buffered positions are always consistent with
+  what the pinned scans read); duckdb-delta's `VERSION`/`PIN_SNAPSHOT` ATTACH options were considered and
+  REJECTED for the folder-catalog (they pin ONE table — duckdb-delta attaches a single table; a
+  catalog-wide version is meaningless across tables — the per-txn instant→per-table-version mapping is the
+  correct multi-table analog and is now the default). **Flush fusion**
+  (`FlushDmlTransaction`) with **Spark-style LOGICAL REBASE on concurrent writers (2026-07-11), FULL
+  ConflictChecker parity incl. READ-PREDICATE tracking**: when the table moved past PinnedVersion, EW
+  **`CheckLogicalRebaseAsync(pinnedSnapshot, plannedActions, readPredicates, readWholeTable,
+  serializable)`** walks the concurrent commit range (pinned+1..latest via `TransactionLog.ReadCommitAsync`)
+  and decides whether the concurrent commits COMMUTE — commuting appends pass (the COMMIT rebases on top:
+  DV ordinals/old-DVs resolve against the PINNED snapshot via
+  `ComputeDeletionVectorActionsAsync(resolveAgainst:)` since the newer snapshot's path-sorted ordinals
+  differ, the remove+add pairs stay valid because the touched files are unchanged, and row-id/identity
+  high-water marks re-derive from the snapshot committed onto); REAL conflicts abort with the clear
+  "transaction conflict … the concurrent changes do not commute" error. **The four checks (Spark
+  ConflictChecker parity)**: metadataChangedCheck (schema/partitioning/config — buffered ALTERs chained
+  against pinned metadata), protocolChangedCheck, concurrentDeleteDeleteCheck (any planned `RemoveFile`
+  whose (path, DV) is no longer active unchanged — covers concurrent DELETE/UPDATE/OPTIMIZE of a file we
+  modify), and the **READ-SET checks**: concurrentDeleteReadCheck (a concurrent data-changing remove of a
+  file our reads consumed) + concurrentAppendCheck (a concurrent data-changing add matching our reads —
+  from non-blind-append commits always; from blind appends only under `isolation_level 'serializable'`).
+  **The read set**: `ScanTable` records every explicit-txn scan's PUSHED predicate (the built EW
+  `Predicate` — a superset of the rows consumed, since unpushed residue filters above the scan) or a
+  whole-table flag when nothing pushed, on `DeltaTxnBuffer.PendingAppends.ReadPredicates`/`ReadWholeTable`
+  (deliberately NOT in `HasAny` — read-only entries trip no guards; `spec == null` scans are the BIND-TIME
+  schema probe, excluded — the gotcha found in the build: every statement's first ScanTable call is the
+  probe with no spec, which recorded a false whole-table read). Predicate-vs-file matching =
+  `DeltaFilePruner.ShouldInclude` over the pinned schema (partition values exact, stats conservative);
+  `dataChange=false` actions (OPTIMIZE) are exempt from the read checks (rows unchanged; a compaction of a
+  file we MODIFY still hits delete/delete). **The `isolation_level` ATTACH option**
+  (`'write_serializable'` default = Spark's default | `'serializable'`): serializable makes commit order
+  the logical order — blind appends matching the reads abort too — and the FIRST read of a table also PINS
+  the txn's base version (`SnapshotPinning`), so an APPEND-ONLY transaction that read the table routes
+  through the checked flush (under write_serializable it stays on the blind OCC path — a documented
+  divergence: Spark would deleteRead-check append-only txns too). The commit runs `expectedVersion:
+  CurrentSnapshot.Version` in a bounded reopen+revalidate retry loop (a writer landing mid-flush).
+  Two-connection racer tests pin all outcomes: append→rebase-success (both changes land), same-file
+  delete/delete→abort, concurrent ALTER→abort, serializable+predicate-matching append→abort,
+  serializable+non-matching append→rebase-success (stats exclude), whole-table-read (unpushable WHERE) +
+  concurrent delete of an unmodified file→deleteRead abort. Flush mechanics: write pending batches as files via the new
+  EW **`WriteDataFilesAsync`** (write-no-commit half of
   the batch path: partition split, recursive mapping rename+field-ids, variant transport, `IDataFileWriter`
   seam, stats; NO row-id materialization — baseRowId assigned at commit like the streaming writer), compute
   DV actions via the new EW **`ComputeDeletionVectorActionsAsync`** (positionsByOrdinal → remove/add pairs
@@ -2686,7 +2732,8 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   the CREATE first"); identity-marked creates + CREATE OR REPLACE + CTAS over an existing table stay
   immediate (replace removes are snapshot-coupled; identity needs EW's committing writer). dbt is
   unaffected either way (a buffered model build is simply atomic now). Spark-style logical rebase on
-  conflict = a later refinement. C++: `CommitTransaction` sets `SetActiveOpener(&context)`
+  conflict: DONE 2026-07-11 — see the flush-fusion paragraph above (`CheckLogicalRebase`,
+  WriteSerializable). C++: `CommitTransaction` sets `SetActiveOpener(&context)`
   before the ABI call (the flush writes `_delta_log` through the host FS); rollback needs no opener (the C++
   `InvalidateAllEntries` on rollback drops the pending-schema catalog entry).
   `test/verify_delta_catalog_transactions.test` (542 — atomic multi-INSERT, buffered DELETE/UPDATE with

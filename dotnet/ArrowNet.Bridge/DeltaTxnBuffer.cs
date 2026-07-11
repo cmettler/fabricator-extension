@@ -74,6 +74,16 @@ internal sealed class DeltaTxnBuffer
 
         public bool HasAny => Rows > 0 || DeletedByOrdinal.Count > 0 || PendingMetadata is not null
                               || PendingCreate;
+
+        // ---- READ SET (Spark ConflictChecker parity, for the logical rebase at COMMIT) ----
+        // The PUSHED predicate of every in-transaction scan of this table — a superset of the rows the
+        // scan actually consumed (DuckDB applies any unpushed residue above the scan, but the source only
+        // returned rows matching the pushed part) — or ReadWholeTable when a scan had no pushable filter.
+        // Deliberately NOT part of HasAny: a read-only entry must not trip pending-changes guards, and
+        // Get() must keep returning null for it (no overlay). Only recorded in EXPLICIT transactions.
+        public List<EngineeredWood.Expressions.Predicate> ReadPredicates { get; } = new();
+        public bool ReadWholeTable;
+        public bool HasReads => ReadWholeTable || ReadPredicates.Count > 0;
     }
 
     private readonly ConcurrentDictionary<long, ConcurrentDictionary<string, PendingAppends>> _byTxn = new();

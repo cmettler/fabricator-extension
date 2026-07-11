@@ -3,8 +3,10 @@
 #              (buffered DELETE/UPDATE = snapshot isolation). Appends buffer per DuckDB transaction; DELETE/
 #              UPDATE inside an explicit BEGIN buffer as deletion-vector positions (+ post-image rows) against
 #              the transaction's pinned base version. COMMIT flushes everything as ONE atomic Delta commit per
-#              table, conflict-ABORTING if a concurrent writer moved the table (first-committer-wins snapshot
-#              isolation); ROLLBACK discards (uncommitted parquet = invisible orphans, vacuum's job). Reads
+#              table, with Spark-style LOGICAL REBASE on concurrent writers (WriteSerializable: blind appends
+#              commute and the COMMIT rebases on top of them; a real conflict — metadata/protocol change or
+#              delete/delete on the same file — conflict-ABORTS); ROLLBACK discards (uncommitted parquet =
+#              invisible orphans, vacuum's job). Reads
 #              inside the transaction overlay all pending changes (read-your-writes); explicit AT time travel
 #              excludes them. Autocommit is UNCHANGED (per-statement commits, direct DML paths incl. CDF +
 #              copy-on-write). Guards: DDL/maintenance/non-append writes with pending changes; DML on rows
@@ -367,8 +369,12 @@ SELECT id, name FROM lake.main.t ORDER BY id;
 7	ins
 
 # ============================================================================
-# 6. Conflict-abort: a concurrent writer moving the table aborts the COMMIT
+# 6. Concurrent writers: Spark-style LOGICAL REBASE (WriteSerializable) — a concurrent commit only
+#    aborts the transaction when it ACTUALLY conflicts. Blind appends commute (the COMMIT rebases on
+#    top of them); a delete/delete on the same file or a concurrent metadata change conflict-aborts.
 # ============================================================================
+
+# --- 6a. a concurrent APPEND does NOT abort — the COMMIT rebases and both changes land ---
 
 statement ok con1
 BEGIN;
@@ -380,13 +386,164 @@ DELETE FROM lake.main.t WHERE id = 3;
 statement ok con2
 INSERT INTO lake.main.t VALUES (50, 'racer');
 
-# con1's COMMIT conflict-aborts (its deletion positions are coupled to the pinned version).
+# con1's COMMIT succeeds: the append commutes with the buffered delete (the DV positions were resolved
+# against the PINNED snapshot; the touched file is unchanged in the newer one).
+statement ok con1
+COMMIT;
+
+# BOTH changes are in: the racer's row present AND con1's delete applied.
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
+----
+1	pre
+7	ins
+50	racer
+
+# --- 6b. delete/delete on the SAME file is a REAL conflict ---
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+DELETE FROM lake.main.t WHERE id = 50;
+
+# The racer deletes the SAME row (autocommit DV commit) — the file's deletion vector changes under con1.
+statement ok con2
+DELETE FROM lake.main.t WHERE id = 50;
+
 statement error con1
 COMMIT;
 ----
 transaction conflict
 
-# The racer's row is there; con1's delete was rolled back (first-committer-wins).
+# con2's delete won (first committer); con1 was rolled back.
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
+----
+1	pre
+7	ins
+
+statement ok
+INSERT INTO lake.main.t VALUES (50, 'racer');
+
+# --- 6c. a concurrent METADATA change (ALTER) is a REAL conflict ---
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+DELETE FROM lake.main.t WHERE id = 7;
+
+statement ok con2
+ALTER TABLE lake.main.t ADD COLUMN extra INTEGER;
+
+statement error con1
+COMMIT;
+----
+transaction conflict
+
+# con1's delete was rolled back; the concurrent column is there.
+query I
+SELECT count(*) FROM lake.main.t WHERE id = 7;
+----
+1
+
+statement ok con2
+ALTER TABLE lake.main.t DROP COLUMN extra;
+
+# --- 6d. isolation_level 'serializable': a concurrent blind append MATCHING the transaction's read
+#     predicate is a REAL conflict (commit order = logical order — the DELETE's WHERE would have seen the
+#     appended row). Under the default write_serializable the same append passes (6a). ---
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_codec' AS serlake (TYPE arrownet, PROVIDER 'delta', isolation_level 'serializable');
+
+statement ok con1
+BEGIN;
+
+# the DELETE's scan records read predicate id = 1
+statement ok con1
+DELETE FROM serlake.main.t WHERE id = 1;
+
+# a blind append whose rows MATCH the read predicate (file stats: min=max=1)
+statement ok con2
+INSERT INTO lake.main.t VALUES (1, 'dup');
+
+statement error con1
+COMMIT;
+----
+transaction conflict
+
+# con1's delete rolled back; the concurrent duplicate landed
+query I
+SELECT count(*) FROM lake.main.t WHERE id = 1;
+----
+2
+
+statement ok
+DELETE FROM lake.main.t WHERE name = 'dup';
+
+# … and a blind append NOT matching the read predicate rebases fine even under serializable
+statement ok con1
+BEGIN;
+
+statement ok con1
+DELETE FROM serlake.main.t WHERE id = 7;
+
+statement ok con2
+INSERT INTO lake.main.t VALUES (900, 'far');
+
+statement ok con1
+COMMIT;
+
+query I
+SELECT count(*) FROM lake.main.t WHERE id IN (7, 900);
+----
+1
+
+statement ok
+DELETE FROM lake.main.t WHERE id = 900;
+
+statement ok
+INSERT INTO lake.main.t VALUES (7, 'ins');
+
+statement ok
+DETACH serlake;
+
+# --- 6e. concurrentDeleteRead (both isolation levels): a concurrent delete of a file the transaction
+#     READ — here a whole-table read (unpushable predicate) — conflicts even though the transaction
+#     modifies a DIFFERENT file. ---
+
+statement ok con1
+BEGIN;
+
+# `id % 100 = 50` is not pushable → the scan records a WHOLE-TABLE read; it deletes id=50 only
+statement ok con1
+DELETE FROM lake.main.t WHERE id % 100 = 50;
+
+# the racer deletes id=1 — a DIFFERENT file, but one con1's whole-table read consumed
+statement ok con2
+DELETE FROM lake.main.t WHERE id = 1;
+
+statement error con1
+COMMIT;
+----
+transaction conflict
+
+# con1 rolled back (id 50 intact); con2's delete won
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
+----
+7	ins
+50	racer
+
+# restore the section-entry state for the sections below
+statement ok
+INSERT INTO lake.main.t VALUES (1, 'pre');
+
+statement ok
+INSERT INTO lake.main.t VALUES (3, 'mix');
+
 query IT
 SELECT id, name FROM lake.main.t ORDER BY id;
 ----
@@ -394,6 +551,45 @@ SELECT id, name FROM lake.main.t ORDER BY id;
 3	mix
 7	ins
 50	racer
+
+# --- 6f. SNAPSHOT READS by default: inside an explicit transaction, reads pin to the version resolved
+#     at the transaction's FIRST scan (one instant per txn, mapped to a version per table) — a concurrent
+#     commit is INVISIBLE mid-transaction, on the codec path too (the native path always pinned). ---
+
+statement ok con1
+BEGIN;
+
+# first scan pins the transaction's snapshot
+query I con1
+SELECT count(*) FROM lake.main.t;
+----
+4
+
+statement ok con2
+INSERT INTO lake.main.t VALUES (600, 'invisible');
+
+# repeatable read: the concurrent insert is NOT visible (was: reads floated to latest)
+query I con1
+SELECT count(*) FROM lake.main.t;
+----
+4
+
+query I con1
+SELECT count(*) FROM lake.main.t WHERE id = 600;
+----
+0
+
+statement ok con1
+COMMIT;
+
+# after COMMIT a fresh statement sees it
+query I
+SELECT count(*) FROM lake.main.t WHERE id = 600;
+----
+1
+
+statement ok
+DELETE FROM lake.main.t WHERE id = 600;
 
 # ============================================================================
 # 7. Guards: DV-off and CDF tables reject buffered DML (autocommit works)
