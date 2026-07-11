@@ -316,6 +316,15 @@ public static class MetadataKind
     // Delta only: the Change Data Feed (table cols ++ _change_type/_commit_version/_commit_timestamp). arg1 =
     // 'schema.table' ref, arg2 = "from:to" (to empty => latest). Surfaced by arrownet_delta_changes(...).
     public const int Changes = 9;
+    // Delta only: the latest APPLICATION TRANSACTION version for an app id (the `txn` action — idempotent
+    // appends). arg1 = 'schema.table' ref, arg2 = app_id. Returns 1 row (app_id VARCHAR, version BIGINT —
+    // NULL when never set). Surfaced by arrownet_delta_get_transaction_version(...).
+    public const int TxnVersion = 10;
+    // Delta only: PARK an application-transaction version on the CURRENT explicit transaction (compared-and-
+    // swapped + committed atomically with the transaction's fused commit at COMMIT). arg1 = 'schema.table'
+    // ref, arg2 = "app_id\nversion\nexpected" (expected empty = must-not-exist). Returns the echoed row.
+    // Surfaced by arrownet_delta_set_transaction_version(...).
+    public const int SetTxnVersion = 11;
 }
 
 internal static class ArrowNetStatus

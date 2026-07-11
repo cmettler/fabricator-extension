@@ -367,6 +367,60 @@ static unique_ptr<FunctionData> ChangesBind(ClientContext &context, TableFunctio
 	return std::move(bind_data);
 }
 
+// --- arrownet_delta_get/set_transaction_version — Delta idempotent appends (the `txn` action) ---------------
+// get(catalog, 'schema.table', app_id) -> (app_id, version|NULL): the app's committed high-water mark.
+// set(catalog, 'schema.table', app_id, version [, expected_previous]) -> the echoed row: PARKS the version on
+// the CURRENT explicit transaction; at COMMIT it is compared-and-swapped against the latest snapshot and the
+// `txn` action commits ATOMICALLY with the transaction's fused commit — a retried batch whose first attempt
+// landed fails the CAS instead of duplicating data (duckdb-delta / Spark txnAppId parity). Both schemas are
+// FIXED and set here directly — deliberately NO PopulateReturnSchema probe, so the (side-effecting) factory
+// runs only at EXECUTION, where the ambient transaction id is established by ArrowStreamInitGlobal.
+static void TxnVersionSchema(vector<LogicalType> &return_types, vector<string> &names) {
+	return_types = {LogicalType::VARCHAR, LogicalType::BIGINT};
+	names = {"app_id", "version"};
+}
+
+static unique_ptr<FunctionData> GetTxnVersionBind(ClientContext &context, TableFunctionBindInput &input,
+                                                  vector<LogicalType> &return_types, vector<string> &names) {
+	auto catalog_name = input.inputs[0].GetValue<string>();
+	auto table_ref = input.inputs[1].GetValue<string>();
+	auto app_id = input.inputs[2].GetValue<string>();
+
+	auto bind_data = make_uniq<MssqlNetFunctionsBindData>();
+	bind_data->handle = ResolveConnection(context, catalog_name, bind_data->owns_handle);
+	auto handle = bind_data->handle;
+	bind_data->factory = [handle, table_ref, app_id](const arrownet::ArrowScanRequest &, ArrowArrayStream &out) {
+		arrownet::GetMetadata(handle, ARROWNET_META_TXN_VERSION, table_ref, app_id, out);
+	};
+	TxnVersionSchema(return_types, names);
+	return std::move(bind_data);
+}
+
+static unique_ptr<FunctionData> SetTxnVersionBind(ClientContext &context, TableFunctionBindInput &input,
+                                                  vector<LogicalType> &return_types, vector<string> &names) {
+	auto catalog_name = input.inputs[0].GetValue<string>();
+	auto table_ref = input.inputs[1].GetValue<string>();
+	auto app_id = input.inputs[2].GetValue<string>();
+	if (app_id.find('\n') != string::npos) {
+		throw BinderException("arrownet_delta_set_transaction_version: app_id must not contain a newline");
+	}
+	int64_t version = input.inputs[3].GetValue<int64_t>();
+	// expected_previous omitted or NULL => "must not exist yet" (first batch of the app).
+	string expected = (input.inputs.size() > 4 && !input.inputs[4].IsNull())
+	                      ? std::to_string(input.inputs[4].GetValue<int64_t>())
+	                      : string();
+	string payload = app_id + "\n" + std::to_string(version) + "\n" + expected;
+
+	auto bind_data = make_uniq<MssqlNetFunctionsBindData>();
+	bind_data->handle = ResolveConnection(context, catalog_name, bind_data->owns_handle);
+	auto handle = bind_data->handle;
+	bind_data->factory = [handle, table_ref, payload](const arrownet::ArrowScanRequest &, ArrowArrayStream &out) {
+		arrownet::GetMetadata(handle, ARROWNET_META_SET_TXN_VERSION, table_ref, payload, out);
+	};
+	TxnVersionSchema(return_types, names);
+	return std::move(bind_data);
+}
+
 // --- mssql_net_exec(connection_string VARCHAR, sql VARCHAR) -> BIGINT --------
 // Executes arbitrary T-SQL (DDL/DML/EXEC) against SQL Server and returns the
 // number of rows affected. Volatile (always executed, never constant-folded).
@@ -535,6 +589,23 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(changes_fn);
 	changes_fn.arguments = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT};
 	loader.RegisterFunction(changes_fn);
+
+	// arrownet_delta_get/set_transaction_version — Delta application-transaction versions (idempotent
+	// appends): get the committed high-water mark / park a CAS'd version on the current explicit txn.
+	TableFunction get_txn_fn("arrownet_delta_get_transaction_version",
+	                         {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                         arrownet::ArrowStreamScan, GetTxnVersionBind, arrownet::ArrowStreamInitGlobal,
+	                         arrownet::ArrowStreamInitLocal);
+	loader.RegisterFunction(get_txn_fn);
+	TableFunction set_txn_fn("arrownet_delta_set_transaction_version",
+	                         {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                          LogicalType::BIGINT, LogicalType::BIGINT},
+	                         arrownet::ArrowStreamScan, SetTxnVersionBind, arrownet::ArrowStreamInitGlobal,
+	                         arrownet::ArrowStreamInitLocal);
+	loader.RegisterFunction(set_txn_fn);
+	set_txn_fn.arguments = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                        LogicalType::BIGINT}; // expected omitted => must-not-exist (first batch)
+	loader.RegisterFunction(set_txn_fn);
 
 	ScalarFunction exec_fn("mssql_net_exec", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BIGINT,
 	                       MssqlNetExecFunction);

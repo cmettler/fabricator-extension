@@ -646,6 +646,23 @@ internal static class DeltaReader
         }
     }
 
+    /// <summary>The latest APPLICATION TRANSACTION version recorded for <paramref name="appId"/> (the Delta
+    /// <c>txn</c> action's per-app high-water mark — the idempotent-append mechanism), or null when the app
+    /// never committed one. Reads the Delta log only.</summary>
+    public static long? GetAppTransactionVersion(nint opener, string path, string appId)
+    {
+        var fs = TableFileSystems.Create(opener, path);
+        var table = DeltaTable.OpenAsync(fs).AsTask().GetAwaiter().GetResult();
+        try
+        {
+            return table.CurrentSnapshot.AppTransactions.TryGetValue(appId, out var txn) ? txn.Version : null;
+        }
+        finally
+        {
+            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+    }
+
     /// <summary>The table's commit history (the snapshots/versions view) as an Arrow stream:
     /// <c>(version BIGINT, timestamp TIMESTAMP, operation VARCHAR, operation_parameters VARCHAR)</c>, oldest
     /// first. <c>timestamp</c> is non-null only on tables that record it (inCommitTimestamps or a commitInfo

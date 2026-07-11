@@ -2662,7 +2662,24 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   Two-connection racer tests pin all outcomes: append→rebase-success (both changes land), same-file
   delete/delete→abort, concurrent ALTER→abort, serializable+predicate-matching append→abort,
   serializable+non-matching append→rebase-success (stats exclude), whole-table-read (unpushable WHERE) +
-  concurrent delete of an unmodified file→deleteRead abort. Flush mechanics: write pending batches as files via the new
+  concurrent delete of an unmodified file→deleteRead abort. **IDEMPOTENT APPENDS (2026-07-11) — Delta
+  APPLICATION TRANSACTIONS (the `txn` action; duckdb-delta/Spark txnAppId parity, additive metadata kinds
+  10/11 — NO ABI bump):** `CALL arrownet_delta_set_transaction_version(catalog, 'schema.table', app_id,
+  version [, expected_previous])` PARKS the version on the current EXPLICIT transaction
+  (`DeltaTxnBuffer.AppTxnVersions`; requires BEGIN — error otherwise; also pins the base version, so an
+  append-only producer transaction routes through the checked flush); at COMMIT the flush
+  compares-and-swaps against the LATEST snapshot's `AppTransactions` on EVERY retry-loop attempt (expected
+  omitted/NULL = must-not-exist) and emits one spec `txn` action per app ATOMICALLY with the fused commit —
+  a retried batch whose first attempt actually landed (crash-after-commit, the failure class plain OCC
+  can't protect) fails the CAS with "transaction version conflict" instead of duplicating data.
+  `arrownet_delta_get_transaction_version(catalog, 'schema.table', app_id)` reads the committed
+  high-water mark (NULL row when never set; EW `Snapshot.AppTransactions` — the read side always existed).
+  The C++ binds set the FIXED (app_id, version) schema directly — deliberately NO PopulateReturnSchema
+  probe, so the side-effecting factory runs only at EXECUTION where ArrowStreamInitGlobal establishes the
+  ambient txn (the bind-time probe would see no transaction and throw). kernel-reads the txn-action
+  commits; `test/verify_delta_txn_version.test` (51 — lifecycle, blind-retry CAS failure + no duplicates,
+  chained expected, two-producer race → exactly one wins, per-app independence, ROLLBACK discards,
+  re-attach durability). Flush mechanics: write pending batches as files via the new
   EW **`WriteDataFilesAsync`** (write-no-commit half of
   the batch path: partition split, recursive mapping rename+field-ids, variant transport, `IDataFileWriter`
   seam, stats; NO row-id materialization — baseRowId assigned at commit like the streaming writer), compute

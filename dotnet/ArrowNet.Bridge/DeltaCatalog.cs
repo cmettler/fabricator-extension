@@ -522,6 +522,8 @@ public sealed class DeltaCatalog : IBackendCatalog
         // Snapshots/history (arrownet_delta_snapshots): arg1=schema, arg2=table. Schema is required on a
         // schema-enabled lakehouse; defaults to "main" on a flat catalog.
         MetadataKind.Snapshots => SnapshotsStream(schema, table),
+        MetadataKind.TxnVersion => TxnVersionStream(schema, table),
+        MetadataKind.SetTxnVersion => SetTxnVersionStream(schema, table),
         // Change Data Feed (arrownet_delta_changes): arg1 = 'schema.table' ref, arg2 = "from:to" (to empty => latest).
         MetadataKind.Changes => ChangesStream(schema, table),
         // Capability profile (property, value). `exact_filter_pushdown` = whether the host may set
@@ -603,6 +605,117 @@ public sealed class DeltaCatalog : IBackendCatalog
             if (parts.Length > 1 && long.TryParse(parts[1], out var t)) { to = t; }
         }
         return DeltaReader.GetChanges(Opener(), TablePath(resolvedSchema, table), from, to);
+    }
+
+    // Resolve a '<schema>.<table>' reference (schema mandatory on a schema-enabled lakehouse, defaults to
+    // "main" on a flat catalog) to the table's folder path. Shared by the txn-version functions.
+    private string ResolveTableRefPath(string? tableRef, string context)
+    {
+        if (string.IsNullOrEmpty(tableRef))
+        {
+            throw new System.ArgumentException($"{context}: a table is required ('schema.table').");
+        }
+        string? schema = null;
+        string table = tableRef!;
+        int dot = tableRef!.IndexOf('.');
+        if (dot >= 0)
+        {
+            schema = tableRef.Substring(0, dot);
+            table = tableRef.Substring(dot + 1);
+        }
+        string resolvedSchema;
+        if (!string.IsNullOrEmpty(schema))
+        {
+            resolvedSchema = schema!;
+        }
+        else if (SchemaLayout)
+        {
+            throw new System.InvalidOperationException(
+                $"{context}: a schema is required on a schema-enabled lakehouse — use 'schema.table'.");
+        }
+        else
+        {
+            resolvedSchema = MainSchema;
+        }
+        return TablePath(resolvedSchema, table);
+    }
+
+    // arrownet_delta_get_transaction_version: the latest `txn`-action version for an app id — the Delta
+    // idempotent-append high-water mark. 1 row: (app_id, version — NULL when the app never committed one).
+    private IArrowArrayStream TxnVersionStream(string? tableRef, string? appId)
+    {
+        if (string.IsNullOrEmpty(appId))
+        {
+            throw new System.ArgumentException("delta transaction version: an app_id is required.");
+        }
+        var path = ResolveTableRefPath(tableRef, "delta transaction version");
+        long? version = DeltaReader.GetAppTransactionVersion(Opener(), path, appId!);
+        return AppTxnRow(appId!, version);
+    }
+
+    // arrownet_delta_set_transaction_version: PARK an application-transaction version on the current
+    // explicit transaction. At COMMIT the flush compares-and-swaps it against the LATEST snapshot's
+    // AppTransactions (expected null = "must not exist yet") and emits the `txn` action ATOMICALLY with the
+    // transaction's fused commit — a retried batch whose first attempt landed then FAILS the CAS instead of
+    // duplicating data (Delta's exactly-once mechanism; duckdb-delta / Spark txnAppId parity).
+    private IArrowArrayStream SetTxnVersionStream(string? tableRef, string? payload)
+    {
+        var path = ResolveTableRefPath(tableRef, "delta set transaction version");
+        var parts = (payload ?? string.Empty).Split('\n');
+        if (parts.Length < 2 || string.IsNullOrEmpty(parts[0]) || !long.TryParse(parts[1], out var version))
+        {
+            throw new System.ArgumentException(
+                "delta set transaction version: app_id and version are required.");
+        }
+        string appId = parts[0];
+        long? expected = parts.Length > 2 && parts[2].Length > 0 && long.TryParse(parts[2], out var e)
+            ? e
+            : null;
+        long txnId = AmbientTransaction.Current;
+        if (txnId == 0 || !_txnBuffer.IsExplicit(txnId))
+        {
+            throw new System.InvalidOperationException(
+                "delta set transaction version: requires an explicit transaction (BEGIN … COMMIT) — the "
+                + "version is compared-and-swapped atomically with the transaction's commit.");
+        }
+        var pending = _txnBuffer.GetOrCreate(txnId, path);
+        if (pending.PendingCreate)
+        {
+            throw new System.NotSupportedException(
+                "delta set transaction version: not supported on a table created in the same transaction.");
+        }
+        // Pin the transaction's base version (like any read) so the flush has a rebase base even for an
+        // otherwise append-only transaction.
+        pending.PinnedVersion ??= SnapshotPinning.TryGetPinned(txnId, path)
+            ?? SnapshotPinning.PinVersion(txnId, path,
+                inst => DeltaReader.ResolveVersionAsOf(Opener(), path, inst, _log), System.DateTime.UtcNow);
+        pending.AppTxnVersions[appId] = (version, expected);
+        _log.LogInformation(
+            "delta txn {Txn} set app-transaction {Path}: app='{App}' version={Version} expected={Expected}",
+            txnId, path, appId, version, expected?.ToString() ?? "<none>");
+        return AppTxnRow(appId, version);
+    }
+
+    private static IArrowArrayStream AppTxnRow(string appId, long? version)
+    {
+        var schema = new Schema(new[]
+        {
+            new Field("app_id", StringType.Default, nullable: false),
+            new Field("version", Int64Type.Default, nullable: true),
+        }, null);
+        var apps = new StringArray.Builder();
+        apps.Append(appId);
+        var versions = new Int64Array.Builder();
+        if (version is { } v)
+        {
+            versions.Append(v);
+        }
+        else
+        {
+            versions.AppendNull();
+        }
+        return new InMemoryArrayStream(schema,
+            new[] { new RecordBatch(schema, new IArrowArray[] { apps.Build(), versions.Build() }, 1) });
     }
 
     /// <summary>The catalog's schemas: the lakehouse schemas for a schema-enabled OneLake lakehouse; for a
@@ -1550,6 +1663,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                     FlushCreateTransaction(opener, kv.Key, txnId, pending);
                 }
                 else if (pending.DeletedByOrdinal.Count > 0 || pending.PendingMetadata is not null
+                         || pending.AppTxnVersions.Count > 0
                          || (_serializable && pending.HasReads && pending.PinnedVersion is not null
                              && (pending.Files.Count > 0 || pending.Batches.Count > 0)))
                 {
@@ -2153,6 +2267,18 @@ public sealed class DeltaCatalog : IBackendCatalog
             {
                 extra.Add(meta);
             }
+            // Application-transaction versions (idempotent appends): one `txn` action per app, committed
+            // ATOMICALLY with the fused commit; the CAS against the LATEST snapshot runs in the retry loop.
+            long nowMs = System.DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            foreach (var kv in pending.AppTxnVersions)
+            {
+                extra.Add(new EngineeredWood.DeltaLake.Actions.TransactionId
+                {
+                    AppId = kv.Key,
+                    Version = kv.Value.Version,
+                    LastUpdated = nowMs,
+                });
+            }
             extra.AddRange(dvActions);
             int kinds = (pending.HasAppend ? 1 : 0) + (pending.HasDelete ? 1 : 0) + (pending.HasUpdate ? 1 : 0)
                         + (pending.HasAlter ? 1 : 0);
@@ -2173,6 +2299,23 @@ public sealed class DeltaCatalog : IBackendCatalog
             // re-validate, retry (bounded).
             for (int attempt = 1; ; attempt++)
             {
+                // Application-transaction CAS (idempotent appends): validated against the LATEST snapshot
+                // on every attempt — a retried batch whose first attempt actually landed finds the app's
+                // version already advanced and fails HERE instead of duplicating data.
+                foreach (var kv in pending.AppTxnVersions)
+                {
+                    long? current = table.CurrentSnapshot.AppTransactions.TryGetValue(kv.Key, out var appTxn)
+                        ? appTxn.Version
+                        : null;
+                    if (current != kv.Value.Expected)
+                    {
+                        throw new System.InvalidOperationException(
+                            $"delta transaction version conflict on '{tablePath}' for app '{kv.Key}': expected "
+                            + $"previous version {kv.Value.Expected?.ToString() ?? "<none>"}, found "
+                            + $"{current?.ToString() ?? "<none>"} — the batch was already committed or another "
+                            + "writer advanced it; the transaction is rolled back.");
+                    }
+                }
                 if (table.CurrentSnapshot.Version != pinned)
                 {
                     _log.LogInformation(

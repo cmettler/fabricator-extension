@@ -72,8 +72,15 @@ internal sealed class DeltaTxnBuffer
         public bool PendingCreate;
         public IReadOnlyList<string>? CreatePartitionColumns;
 
+        // ---- APPLICATION TRANSACTION versions (Delta `txn` action — idempotent appends) ----
+        // appId -> (version to commit, expected previous version — null = "must not exist yet").
+        // Parked by arrownet_delta_set_transaction_version; the flush validates the CAS against the LATEST
+        // snapshot and emits one `txn` action per app in the SAME fused commit.
+        public Dictionary<string, (long Version, long? Expected)> AppTxnVersions { get; } =
+            new(System.StringComparer.Ordinal);
+
         public bool HasAny => Rows > 0 || DeletedByOrdinal.Count > 0 || PendingMetadata is not null
-                              || PendingCreate;
+                              || PendingCreate || AppTxnVersions.Count > 0;
 
         // ---- READ SET (Spark ConflictChecker parity, for the logical rebase at COMMIT) ----
         // The PUSHED predicate of every in-transaction scan of this table — a superset of the rows the

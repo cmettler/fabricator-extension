@@ -110,6 +110,13 @@ typedef enum {
 	                               // operation_parameters); arg1 = schema, arg2 = table
 	ARROWNET_META_CHANGES = 9,     // Delta only: the Change Data Feed; arg1 = 'schema.table' ref,
 	                               // arg2 = "from:to" version range (to empty => latest)
+	ARROWNET_META_TXN_VERSION = 10,     // Delta only: latest application-transaction (`txn`) version for an
+	                                    // app id; arg1 = 'schema.table' ref, arg2 = app_id. 1 row:
+	                                    // (app_id, version — NULL when never set). Additive, no ABI bump.
+	ARROWNET_META_SET_TXN_VERSION = 11, // Delta only: PARK an application-transaction version on the current
+	                                    // explicit transaction (CAS + `txn` action at COMMIT — idempotent
+	                                    // appends). arg1 = 'schema.table' ref, arg2 = "app\nversion\nexpected"
+	                                    // (expected empty = must-not-exist). Additive, no ABI bump.
 } ArrowNetMetadataKind;
 
 // -----------------------------------------------------------------------------

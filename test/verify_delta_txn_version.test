@@ -1,0 +1,207 @@
+# name: test/verify_delta_txn_version.test
+# description: Idempotent appends via Delta APPLICATION TRANSACTIONS (the `txn` action; duckdb-delta /
+#              Spark txnAppId parity). arrownet_delta_set_transaction_version(catalog, 'schema.table',
+#              app_id, version [, expected_previous]) PARKS the version on the current explicit
+#              transaction; at COMMIT it is compared-and-swapped against the latest snapshot and the txn
+#              action commits ATOMICALLY with the transaction's fused commit — a retried batch whose first
+#              attempt landed fails the CAS instead of duplicating data.
+#              arrownet_delta_get_transaction_version reads the committed high-water mark.
+# group: [mssql_net]
+
+require mssql_net
+
+require-env ARROWNET_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txnver' AS lake (TYPE arrownet, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE lake.main.t (id INTEGER);
+
+# ----------------------------------------------------------------------------
+# 1. get before any set: NULL high-water mark
+# ----------------------------------------------------------------------------
+
+query TI
+SELECT * FROM arrownet_delta_get_transaction_version('lake', 't', 'loader');
+----
+loader	NULL
+
+# ----------------------------------------------------------------------------
+# 2. the setter requires an explicit transaction (the CAS is atomic with the COMMIT)
+# ----------------------------------------------------------------------------
+
+statement error
+CALL arrownet_delta_set_transaction_version('lake', 't', 'loader', 1);
+----
+requires an explicit transaction
+
+# ----------------------------------------------------------------------------
+# 3. batch 1 (expected omitted = must-not-exist) commits atomically with the data
+# ----------------------------------------------------------------------------
+
+statement ok
+BEGIN;
+
+query TI
+CALL arrownet_delta_set_transaction_version('lake', 't', 'loader', 1);
+----
+loader	1
+
+statement ok
+INSERT INTO lake.main.t VALUES (1), (2);
+
+statement ok
+COMMIT;
+
+query TI
+SELECT * FROM arrownet_delta_get_transaction_version('lake', 't', 'loader');
+----
+loader	1
+
+query I
+SELECT count(*) FROM lake.main.t;
+----
+2
+
+# ----------------------------------------------------------------------------
+# 4. a blind RETRY of batch 1 fails the CAS at COMMIT — no duplicate data
+# ----------------------------------------------------------------------------
+
+statement ok
+BEGIN;
+
+statement ok
+CALL arrownet_delta_set_transaction_version('lake', 't', 'loader', 1);
+
+statement ok
+INSERT INTO lake.main.t VALUES (1), (2);
+
+statement error
+COMMIT;
+----
+transaction version conflict
+
+query I
+SELECT count(*) FROM lake.main.t;
+----
+2
+
+# ----------------------------------------------------------------------------
+# 5. the next batch with the correct expected_previous succeeds
+# ----------------------------------------------------------------------------
+
+statement ok
+BEGIN;
+
+statement ok
+CALL arrownet_delta_set_transaction_version('lake', 't', 'loader', 2, 1);
+
+statement ok
+INSERT INTO lake.main.t VALUES (3);
+
+statement ok
+COMMIT;
+
+query TI
+SELECT * FROM arrownet_delta_get_transaction_version('lake', 't', 'loader');
+----
+loader	2
+
+query II
+SELECT count(*), sum(id) FROM lake.main.t;
+----
+3	6
+
+# a wrong expected_previous fails
+statement ok
+BEGIN;
+
+statement ok
+CALL arrownet_delta_set_transaction_version('lake', 't', 'loader', 5, 3);
+
+statement error
+COMMIT;
+----
+transaction version conflict
+
+# ----------------------------------------------------------------------------
+# 6. concurrent producers racing the SAME batch: exactly one wins
+# ----------------------------------------------------------------------------
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+CALL arrownet_delta_set_transaction_version('lake', 't', 'job2', 1);
+
+statement ok con1
+INSERT INTO lake.main.t VALUES (100);
+
+# the racer commits the same (app, version) first
+statement ok con2
+BEGIN;
+
+statement ok con2
+CALL arrownet_delta_set_transaction_version('lake', 't', 'job2', 1);
+
+statement ok con2
+INSERT INTO lake.main.t VALUES (100);
+
+statement ok con2
+COMMIT;
+
+statement error con1
+COMMIT;
+----
+transaction version conflict
+
+# exactly one 100 landed
+query I
+SELECT count(*) FROM lake.main.t WHERE id = 100;
+----
+1
+
+# distinct app ids are independent
+query TI
+SELECT * FROM arrownet_delta_get_transaction_version('lake', 't', 'job2');
+----
+job2	1
+
+query TI
+SELECT * FROM arrownet_delta_get_transaction_version('lake', 't', 'loader');
+----
+loader	2
+
+# ----------------------------------------------------------------------------
+# 7. ROLLBACK discards the parked version (no txn action committed)
+# ----------------------------------------------------------------------------
+
+statement ok
+BEGIN;
+
+statement ok
+CALL arrownet_delta_set_transaction_version('lake', 't', 'loader', 3, 2);
+
+statement ok
+ROLLBACK;
+
+query TI
+SELECT * FROM arrownet_delta_get_transaction_version('lake', 't', 'loader');
+----
+loader	2
+
+# ----------------------------------------------------------------------------
+# 8. durability: the high-water mark survives re-attach (it lives in the Delta log)
+# ----------------------------------------------------------------------------
+
+statement ok
+DETACH lake;
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txnver' AS lake2 (TYPE arrownet, PROVIDER 'delta');
+
+query TI
+SELECT * FROM arrownet_delta_get_transaction_version('lake2', 't', 'loader');
+----
+loader	2
