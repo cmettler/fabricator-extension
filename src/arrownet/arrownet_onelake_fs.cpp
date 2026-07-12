@@ -166,6 +166,34 @@ class ArrowNetOneLakeFileSystem : public FileSystem {
 public:
 	unique_ptr<FileHandle> OpenFile(const string &path, FileOpenFlags flags,
 	                                optional_ptr<FileOpener> opener) override {
+		return OpenInternal(path, flags, opener, /*known_size=*/-1);
+	}
+
+	// Extended open: a glob-fed open (read_parquet('onelake://…/*.parquet'), the Delta native reader's
+	// file list) carries the listing's extended_info — a known file_size lets the managed open SKIP its
+	// per-file GetProperties round trip (constructing the DataLake client does no IO).
+	bool SupportsOpenFileExtended() const override {
+		return true;
+	}
+	unique_ptr<FileHandle> OpenFileExtended(const OpenFileInfo &file, FileOpenFlags flags,
+	                                        optional_ptr<FileOpener> opener) override {
+		int64_t known_size = -1;
+		if (file.extended_info && !flags.OpenForWriting()) {
+			auto it = file.extended_info->options.find("file_size");
+			if (it != file.extended_info->options.end()) {
+				try {
+					known_size = it->second.GetValue<int64_t>();
+				} catch (...) {
+					known_size = -1;
+				}
+			}
+		}
+		return OpenInternal(file.path, flags, opener, known_size);
+	}
+
+private:
+	unique_ptr<FileHandle> OpenInternal(const string &path, FileOpenFlags flags, optional_ptr<FileOpener> opener,
+	                                    int64_t known_size) {
 		auto cred = ResolveCredJson(path, opener);
 		if (flags.OpenForWriting()) {
 			// Plain sequential file write (COPY … TO 'onelake://…') — create/overwrite, appends follow.
@@ -175,9 +203,11 @@ public:
 			return make_uniq<ArrowNetOneLakeFileHandle>(*this, path, flags, handle, 0, /*is_write=*/true);
 		}
 		int64_t size = 0;
-		auto handle = OneLakeOpen(path, cred, size);
+		auto handle = OneLakeOpen(path, cred, size, known_size);
 		return make_uniq<ArrowNetOneLakeFileHandle>(*this, path, flags, handle, size, /*is_write=*/false);
 	}
+
+public:
 
 	void Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) override {
 		auto &h = handle.Cast<ArrowNetOneLakeFileHandle>();
@@ -250,7 +280,29 @@ public:
 			auto obj = json.substr(open, close - open + 1);
 			std::string p;
 			if (ExtractJsonString(obj, "path", p) && !p.empty()) {
-				result.emplace_back(p);
+				OpenFileInfo info(p);
+				// Everything the DataLake listing carries for FREE rides along under the same
+				// extended_info keys httpfs fills (file_size / last_modified / etag) — so consumers
+				// (HostFsGlob, the parquet metadata probe, OpenFileExtended below) never need a
+				// per-file properties round trip for them.
+				int64_t size = ExtractJsonInt(obj, "size");
+				int64_t modified_ms = ExtractJsonInt(obj, "last_modified");
+				std::string etag;
+				bool has_etag = ExtractJsonString(obj, "etag", etag) && !etag.empty();
+				if (size >= 0 || modified_ms >= 0 || has_etag) {
+					info.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
+					if (size >= 0) {
+						info.extended_info->options["file_size"] = Value::UBIGINT((uint64_t)size);
+					}
+					if (modified_ms >= 0) {
+						info.extended_info->options["last_modified"] =
+						    Value::TIMESTAMP(timestamp_t(modified_ms * 1000)); // epoch ms -> micros
+					}
+					if (has_etag) {
+						info.extended_info->options["etag"] = Value(etag);
+					}
+				}
+				result.push_back(std::move(info));
 			}
 			pos = close + 1;
 		}

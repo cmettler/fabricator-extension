@@ -1392,7 +1392,20 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `FabricLakehouse.IsOneLake` abfss check, so it rides the plain host-FS path with opener-resolved secrets —
   which is exactly right). Kernel reads the outputs (known quirk unchanged: kernel shows a MAPPED partitioned
   table's partition column as NULL; plain shape exact).
-- **Current version: ABI v61** (v61 = **`onelake://` is now WRITE-COMPLETE for Delta commits** —
+- **Current version: ABI v62** (v62 = **listing-metadata riding + skip-HEAD opens on `onelake://`**:
+  `onelake_open` gained an `int64 known_size` arg (−1 = fetch) — the managed open SKIPS its per-file
+  GetProperties round trip when the size is already known. Sources of "known": the OneLake DataLake
+  listing now emits `size` + `last_modified` + `etag` in the glob JSON (all FREE fields of GetPaths), the
+  C++ `ArrowNetOneLakeFileSystem::Glob` surfaces them as `OpenFileInfo.extended_info` under the SAME keys
+  httpfs fills (`file_size`/`last_modified`/`etag`), and the FS now opts into DuckDB's
+  **`SupportsOpenFileExtended`/`OpenFileExtended`** so glob-fed opens (read_parquet globs, file lists)
+  carry the info through — the exact mechanism httpfs uses to skip its HEAD request. Same pass, NO-bump
+  fixes: **`HostFsGlob` no longer does OpenFile+GetFileSize PER MATCHED FILE** (on a fuse mount an open
+  can DOWNLOAD the blob — this was the 258 s-ATTACH root cause; on S3 a HEAD per match) — size now comes
+  from the glob entry's `extended_info` (object stores fill it in the LIST response, verified in httpfs
+  s3fs.cpp) else −1, and the managed `DuckDbTableFileSystem.ListAsync` fills LOCAL files via a cheap
+  `FileInfo.Length` (only consumer of size = VACUUM's bytes metric, best-effort by design).)
+- **Prior: v61** (v61 = **`onelake://` is now WRITE-COMPLETE for Delta commits** —
   `onelake_open_write` gained an `int32 exclusive` arg (put-if-absent via ADLS conditional create,
   `If-None-Match:*` — the C++ onelake FS now honors `EXCLUSIVE_CREATE` instead of silently ignoring it) and
   one appended entry `onelake_remove(path, cred_json)` (`DataLakeFileClient.DeleteIfExists`, idempotent) backs
@@ -3022,6 +3035,80 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
 - **Managed publish:** `pwsh scripts/publish-managed.ps1` → publishes `ArrowNet.SqlServer` (+ Bridge +
   self-contained .NET 10 runtime) into `build/release/extension/mssql_net/arrownet/`. A C#-only change
   needs only a republish (no C++ rebuild) unless an ABI signature changed.
+- **TWO DEPLOYMENT MODES + PROVIDED-RUNTIME hosting (2026-07-12; Windows + Linux validated, Fabric live).**
+  All extension projects multi-target **`net10.0;net8.0`** (`dotnet/Directory.Build.props`; EW already did)
+  with `RollForward=LatestMajor`. `publish-managed.ps1 -Mode Framework [-Rid linux-x64]` produces a
+  **framework-dependent** payload (~35 MB win / ~25 MB zipped linux vs ~250 MB self-contained; net8.0 +
+  rollForward ⇒ ONE payload runs on .NET 8 AND 10+). `clr_host` detects the layout by **hostfxr's presence
+  in the managed dir** (self-contained carries it): absent ⇒ resolve a PROVIDED .NET install —
+  **`ARROWNET_DOTNET_ROOT` > `DOTNET_ROOT` > platform defaults** (win `%ProgramFiles%\dotnet`; linux
+  `/etc/dotnet/install_location`, `/usr/share/dotnet`, `/usr/lib/dotnet`; mac `/usr/local/share/dotnet`) —
+  load `<root>/host/fxr/<highest>/hostfxr` and pass the root via `hostfxr_initialize_parameters.dotnet_root`
+  (NO env mutation; `host_path=null` = current process). **Gotcha found: a dotnet_root with FORWARD slashes
+  fails at CreateCoreCLR with a cryptic E_INVALIDARG** (framework resolution tolerates them) — clr_host
+  normalizes on Windows. Validated: FDD on the global install (rolls to newest), full suites on a
+  net8-ONLY private root via `ARROWNET_DOTNET_ROOT` (the "local .NET 10 beside global .NET 8" selector,
+  inverted), `DOTNET_ROLL_FORWARD` respected, SC unchanged (the publish script CLEANS the output dir on a
+  mode change — a stale hostfxr would flip the detection).
+- **LINUX (linux_amd64) BUILDS + FULL SUITES GREEN (WSL Ubuntu 22.04, gcc 11 — glibc 2.35 baseline runs on
+  Fabric's Azure Linux 3).** Build = same configure as Windows minus vcvars, plus
+  `-DOVERRIDE_GIT_DESCRIBE=v1.5.4` (no .git in the copied tree) + vcpkg toolchain with `x64-linux`
+  (openssl+curl for httpfs); the C++ compiled with ZERO changes (the clr_host ifdefs held). Suites on
+  linux + the apt `dotnet-runtime-8.0` (auto-probed at `/usr/lib/dotnet`, no env var): delta transactions
+  596 / txn_version 51 / SQL Server-over-docker scalar 26 + custom 89 / **S3-MinIO 131** / copy_format 96.
+  **CROSS-PLATFORM BUG found by the first Linux run: EW `ListVersionsAsync` returned commit versions in RAW
+  DIRECTORY-LISTING order** — Windows/S3/ADLS list sorted, but Linux readdir returns inode-hash order, and
+  the callers assume ascending replay (SnapshotBuilder's latest-wins metadata/protocol, timestamp
+  resolution's monotonic early-break, the history view). Symptom: the per-txn snapshot pin resolved "now"
+  to v0 → an in-transaction DELETE scanned an empty snapshot and silently deleted nothing. Fixed at the
+  source (materialize + sort ascending; the log dir is bounded by the checkpoint interval).
+- **FABRIC NOTEBOOK VALIDATED LIVE (2026-07-12, Livy pyspark on workspace `Test`/`LH`):** the Fabric
+  compute is **Azure Linux 3** (`6.6.141.1-1.azl3`) with **dotnet preinstalled at `/usr/share/dotnet`,
+  .NET 8.0.28 ONLY, no DOTNET_ROOT set** — our default probe finds it with ZERO configuration. Flow:
+  upload `mssql_net.duckdb_extension` (linux_amd64) + the zipped FDD payload to the lakehouse
+  `Files/arrownet_ext/` (OneLake DFS), then in the session: `pip install --force-reinstall duckdb==1.5.4`
+  (never import duckdb in the kernel before the pip — read the preinstalled version via
+  `importlib.metadata`; the duckdb work runs in a SUBPROCESS interpreter, which also isolates a crash from
+  the kernel), stage to /tmp, `ARROWNET_MANAGED_DIR` + `load_extension` → `arrownet_version()` works,
+  delta CTAS + explicit transaction correct. Driver: `scratchpad/fabricnb` (gitignored; reads the SP from
+  dax_secret.sql) — `dotnet run livy` = the Spark-session path; raw Livy sessions have NO
+  `/lakehouse/default` fuse mount — the probe stages via `spark.sparkContext.binaryFiles(abfss://…)` there.
+  **The TRUE PYTHON-NOTEBOOK path is ALSO validated (RunNotebook job, 75 s):** the notebook session runs
+  Azure Linux 3 + dotnet 8.0.27 at `/usr/share/dotnet` (only runtime, no DOTNET_ROOT) and — unlike the Livy
+  session — HAS the fuse mount AND a **preinstalled duckdb 1.2.2**; `pip install --force-reinstall
+  duckdb==1.5.4` overrides it (works without a kernel restart BECAUSE duckdb is never imported in the
+  kernel), the extension loads on the preinstalled .NET 8, the delta transaction smoke passes, and a Delta
+  table written through the fuse mount (`ATTACH '/lakehouse/default/Files/…'`) reads back. Fabric-API
+  gotchas hit on the way: **Notebook-item CREATION is not SP-enabled on this tenant** (`403
+  FeatureNotAvailable`, bare create too — the notebook must be created interactively ONCE; the SP-driven
+  `updateDefinition` + `RunNotebook` then work), `updateDefinition?updateMetadata=true` requires a
+  `.platform` part (omit the flag — the default-lakehouse binding rides in the ipynb metadata), and the
+  portal can save a display name with a TRAILING SPACE (`'arrownet_ext_probe '`) — resolve by trimmed
+  comparison. `dotnet run run` = update+run the existing notebook; `upload` = refresh the OneLake
+  distribution (`LH/Files/arrownet_ext/`). **The MANAGED Tables area works through the fuse mount** —
+  `ATTACH '/lakehouse/default/Tables' (TYPE arrownet, PROVIDER 'delta', schemas true)`: credential-free
+  read + CREATE + explicit-txn append on `tlake.dbo.*`, all sub-second per op (single-writer only: the
+  commit's O_EXCL put-if-absent is doubtful over fuse — concurrent writers should use abfss/onelake).
+  **PERF (measured per-step): the notebook's in-session work went ~305 s → ~15 s** via two fixes:
+  (1) **local-root discovery fast path** (`DeltaCatalog.DiscoverTablePairs`): a root that
+  `Directory.Exists` (fuse mount, any local dir) discovers via direct System.IO enumeration
+  (schema dirs → table dirs → `Directory.Exists(_delta_log)`) instead of the host glob — the glob's
+  commit-file matching + per-match stat was **258 s over fuse on the populated LH → 2 s**; object stores
+  keep the glob. **Root cause of the old cost, now ALSO fixed at the source: `HostFsGlob` did an
+  `OpenFile(READ)+GetFileSize` PER MATCHED FILE** (DuckDB's FileSystem has no path-stat — size needs a
+  handle) purely for a `size` field discovery never reads — and on a fuse mount an open can DOWNLOAD the
+  blob into the local cache, so the old ATTACH effectively downloaded every commit json of every table
+  (on S3 it was a HEAD per match). Now: size comes from the glob entry's `extended_info["file_size"]`
+  when the filesystem's listing provides it (object stores), else -1 → the managed
+  `DuckDbTableFileSystem.ListAsync` fills LOCAL files via a cheap `FileInfo.Length` metadata stat,
+  unknown ⇒ 0 (the only consumer is VACUUM's bytes-to-delete metric — best-effort by design). The
+  wildcard-on-contents glob shape (`…/_delta_log/*.json`) itself is CORRECT for object stores — a
+  "directory" doesn't exist as an object there; only a FILE under it proves the table — which is why the
+  glob remains the object-store path and only local roots take the System.IO walk.
+  (2) the **duckdb wheel ships with the distribution** and installs
+  `pip --no-deps --no-compile --target /tmp/arrownet_pyduck` + `PYTHONPATH` for the probe subprocess
+  (37 s PyPI force-reinstall → 3.3 s; the session's own duckdb stays untouched). Remaining wall-clock ≈
+  Fabric job scheduling/session spin-up (~45–60 s, not ours).
 - **Managed-dir resolution gotcha:** `clr_host` looks for the bridge in `ARROWNET_MANAGED_DIR`, else an
   `arrownet/` folder *next to the loaded module*. For the static `duckdb.exe`/`unittest.exe` the module IS
   the exe, so the default lookup is `build/release/arrownet` (next to `duckdb.exe`) — but

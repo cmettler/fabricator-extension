@@ -776,7 +776,29 @@ public sealed class DeltaCatalog : IBackendCatalog
             return pairs;
         }
 
-        // Local / S3 / plain ADLS: glob the commit files. schemas mode = two levels deep, else one.
+        // PLAIN LOCAL root (incl. the Fabric notebook fuse mount /lakehouse/default/Tables): discover via
+        // direct System.IO enumeration — schema dirs → table dirs → Directory.Exists(_delta_log). O(dirs)
+        // syscalls instead of the host glob, whose commit-file matching + per-match stat is minutes over a
+        // fuse mount (measured: 258 s ATTACH on a populated lakehouse → ~1 s with this path).
+        if (System.IO.Directory.Exists(_root))
+        {
+            foreach (var schemaDir in _schemas
+                         ? System.IO.Directory.EnumerateDirectories(_root)
+                         : new[] { _root })
+            {
+                string schemaName2 = _schemas ? System.IO.Path.GetFileName(schemaDir) : MainSchema;
+                foreach (var tableDir in System.IO.Directory.EnumerateDirectories(schemaDir))
+                {
+                    if (System.IO.Directory.Exists(System.IO.Path.Combine(tableDir, "_delta_log")))
+                    {
+                        pairs.Add((schemaName2, System.IO.Path.GetFileName(tableDir)));
+                    }
+                }
+            }
+            return pairs;
+        }
+
+        // Object stores (S3 / plain ADLS): glob the commit files. schemas mode = two levels deep, else one.
         var glob = _schemas ? _root + "/*/*/_delta_log/*.json" : _root + "/*/_delta_log/*.json";
         var json = HostFs.Glob(Opener(), glob);
         using var doc = JsonDocument.Parse(json);

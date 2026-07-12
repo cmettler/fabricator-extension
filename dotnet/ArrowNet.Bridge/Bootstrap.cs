@@ -51,7 +51,7 @@ public static unsafe class Bootstrap
             return new InMemoryArrayStream(schema, new[] { batch });
         });
 
-        vtable->AbiVersion = 61;
+        vtable->AbiVersion = 62;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -543,13 +543,13 @@ public static unsafe class Bootstrap
     //      resolved from the opener ("{}"/empty ⇒ DefaultAzureCredential).
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int OneLakeOpen(byte* path, byte* credJson, nint* outFile, long* outSize, byte** err)
+    private static int OneLakeOpen(byte* path, byte* credJson, long knownSize, nint* outFile, long* outSize, byte** err)
     {
         try
         {
             var p = Marshal.PtrToStringUTF8((nint)path) ?? string.Empty;
             var cj = Marshal.PtrToStringUTF8((nint)credJson);
-            var (handle, size) = OneLakeForwardFs.Open(p, cj);
+            var (handle, size) = OneLakeForwardFs.Open(p, cj, knownSize);
             *outFile = Handles.Alloc(handle);
             *outSize = size;
             return ArrowNetStatus.Ok;

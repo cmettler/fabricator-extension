@@ -656,7 +656,10 @@ typedef struct ArrowNetVTable {
 	// the VFS, DuckDB's native readers + ExternalFileCache use it uniformly (see docs/filesystem-bridge.md §3).
 	// Read-only surface for now (write ops on the C++ FS throw NotImplemented). *out_file = an opaque managed
 	// file handle (close via onelake_close); *out_size = the file length (read at open, cached C++-side).
-	int32_t (*onelake_open)(const char *path, const char *cred_json, ArrowNetHandle *out_file, int64_t *out_size,
+	// `known_size` >= 0 (from a listing's extended info) skips the per-file GetProperties round trip (v62);
+	// -1 = fetch the length at open.
+	int32_t (*onelake_open)(const char *path, const char *cred_json, int64_t known_size, ArrowNetHandle *out_file,
+	                        int64_t *out_size,
 	                        char **err);
 	// Read nr_bytes at absolute offset `location` into buffer (host-owned). The managed side does the range GET.
 	int32_t (*onelake_read)(ArrowNetHandle file, void *buffer, int64_t nr_bytes, int64_t location, char **err);
@@ -788,7 +791,7 @@ typedef struct ArrowNetHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 61
+#define ARROWNET_ABI_VERSION 62
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

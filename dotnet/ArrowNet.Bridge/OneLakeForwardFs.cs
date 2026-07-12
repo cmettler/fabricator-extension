@@ -64,12 +64,16 @@ internal static class OneLakeForwardFs
     private static DataLakeFileSystemClient FsClient(string fsName, TokenCredential cred)
         => new DataLakeFileSystemClient(new Uri($"https://{OneLakeHost}/{fsName}"), cred);
 
-    /// <summary>Open a file for reading: returns the handle + the file length.</summary>
-    public static (Handle Handle, long Size) Open(string path, string? credJson)
+    /// <summary>Open a file for reading: returns the handle + the file length. <paramref name="knownSize"/>
+    /// &gt;= 0 (from a listing's extended info) skips the per-file GetProperties round trip — constructing the
+    /// client itself does no IO, so a known-size open costs NOTHING until the first read.</summary>
+    public static (Handle Handle, long Size) Open(string path, string? credJson, long knownSize = -1)
     {
         var (fs, p) = Parse(path);
         var client = FsClient(fs, Cred(credJson)).GetFileClient(p);
-        long len = client.GetPropertiesAsync().GetAwaiter().GetResult().Value.ContentLength;
+        long len = knownSize >= 0
+            ? knownSize
+            : client.GetPropertiesAsync().GetAwaiter().GetResult().Value.ContentLength;
         return (new Handle { Client = client, Length = len }, len);
     }
 
@@ -153,8 +157,21 @@ internal static class OneLakeForwardFs
                     sb.Append(',');
                 }
                 firstItem = false;
+                // Everything the listing gives us for FREE rides along: size + last_modified + etag (the
+                // same keys httpfs surfaces) — the C++ side turns them into OpenFileInfo.extended_info so
+                // subsequent opens skip the per-file properties round trip.
                 sb.Append("{\"path\":\"onelake://").Append(fs).Append('/').Append(name.Replace("\"", "\\\""))
-                  .Append("\",\"size\":").Append(item.ContentLength ?? 0).Append('}');
+                  .Append("\",\"size\":").Append(item.ContentLength ?? 0);
+                if (item.LastModified != default)
+                {
+                    sb.Append(",\"last_modified\":").Append(item.LastModified.ToUnixTimeMilliseconds());
+                }
+                var etag = item.ETag.ToString();
+                if (!string.IsNullOrEmpty(etag))
+                {
+                    sb.Append(",\"etag\":\"").Append(etag.Replace("\\", "\\\\").Replace("\"", "\\\"")).Append('"');
+                }
+                sb.Append('}');
             }
         }
         catch (RequestFailedException ex) when (ex.Status == 404)

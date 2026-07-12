@@ -105,12 +105,21 @@ int32_t HostFsGlob(ArrowNetHandle opener, const char *pattern, char **out_json, 
 		std::string json = "[";
 		for (idx_t i = 0; i < files.size(); i++) {
 			const std::string &p = files[i].path;
+			// Size is BEST-EFFORT from the listing itself (object-store globs fill extended_info for free).
+			// Deliberately NO OpenFile-per-match: over a fuse mount an open can DOWNLOAD the blob into the
+			// local cache — the old open-per-commit-json made a lakehouse ATTACH take minutes — and on S3
+			// it was a HEAD per match. -1 = unknown; the managed side fills local files via a cheap stat
+			// and treats it as unknown otherwise (the only consumer is vacuum's bytes metric).
 			int64_t size = -1;
-			try {
-				auto h = fs.OpenFile(p, FileOpenFlags::FILE_FLAGS_READ);
-				size = static_cast<int64_t>(h->GetFileSize());
-			} catch (...) {
-				size = -1; // best-effort; the managed side falls back to a size query if it needs one
+			if (files[i].extended_info) {
+				auto it = files[i].extended_info->options.find("file_size");
+				if (it != files[i].extended_info->options.end()) {
+					try {
+						size = it->second.GetValue<int64_t>();
+					} catch (...) {
+						size = -1;
+					}
+				}
 			}
 			if (i) {
 				json += ",";

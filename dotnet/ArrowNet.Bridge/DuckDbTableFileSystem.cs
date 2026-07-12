@@ -60,7 +60,24 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
         foreach (var entry in ParseGlob(json))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            yield return new TableFileInfo(ToRelative(entry.Path), entry.Size, DateTimeOffset.UnixEpoch);
+            // The host glob no longer opens each match for its size (an open can DOWNLOAD the blob on a
+            // fuse mount — the old open-per-commit-json made a lakehouse ATTACH take minutes); object-store
+            // listings carry the size, local files get it here via a cheap metadata stat. Unknown stays 0 —
+            // the only size consumer is vacuum's bytes-to-delete metric.
+            long size = entry.Size;
+            if (size < 0)
+            {
+                try
+                {
+                    var fi = new System.IO.FileInfo(entry.Path);
+                    size = fi.Exists ? fi.Length : 0;
+                }
+                catch
+                {
+                    size = 0;
+                }
+            }
+            yield return new TableFileInfo(ToRelative(entry.Path), size, DateTimeOffset.UnixEpoch);
         }
         await Task.CompletedTask.ConfigureAwait(false);
     }

@@ -188,7 +188,8 @@ public unsafe struct ArrowNetVTable
     // onelake:// FileSystem forward callbacks (Phase-3): the C++ onelake FS subsystem forwards read ops here to
     // the managed Azure DataLake SDK. cred_json = the azure secret fields the host resolved from the opener.
     // int32 onelake_open(char* path, char* cred_json, void** out_file, int64* out_size, char** err)
-    public delegate* unmanaged[Cdecl]<byte*, byte*, nint*, long*, byte**, int> OneLakeOpen;
+    // int32 onelake_open(char* path, char* cred_json, int64 known_size, void** out_file, int64* out_size, char** err)
+    public delegate* unmanaged[Cdecl]<byte*, byte*, long, nint*, long*, byte**, int> OneLakeOpen;
     // int32 onelake_read(void* file, void* buffer, int64 nr_bytes, int64 location, char** err)
     public delegate* unmanaged[Cdecl]<nint, void*, long, long, byte**, int> OneLakeRead;
     // void onelake_close(void* file)
