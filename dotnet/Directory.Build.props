@@ -1,6 +1,13 @@
 <Project>
   <PropertyGroup>
-    <TargetFramework>net10.0</TargetFramework>
+    <!-- net8.0 = the LOWEST supported runtime (the Fabric-notebook preinstalled .NET 8); the
+         framework-dependent publish targets it with rollForward=LatestMajor so ONE payload runs on
+         .NET 8 AND 10+. net10.0 stays the self-contained default. EW already multi-targets net8.0. -->
+    <TargetFrameworks>net10.0;net8.0</TargetFrameworks>
+    <!-- The framework-dependent payload targets net8.0 and ROLLS FORWARD to any newer major (a .NET 10
+         install runs the same payload) — the runtime is selected by the native host's dotnet-root
+         resolution (ARROWNET_DOTNET_ROOT > DOTNET_ROOT > global install), not by the TFM. -->
+    <RollForward>LatestMajor</RollForward>
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>

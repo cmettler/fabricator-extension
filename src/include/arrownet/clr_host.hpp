@@ -69,7 +69,9 @@ bool NamedInputExists(const std::string &name);
 // forwards its read ops to the managed Azure DataLake SDK. `cred_json` = the azure secret fields the host
 // resolved from the calling opener (empty/"{}" => DefaultAzureCredential). Read-only for now. OneLakeOpen
 // returns an opaque managed handle (close via OneLakeClose) + the file length in `out_size`.
-ArrowNetHandle OneLakeOpen(const std::string &path, const std::string &cred_json, int64_t &out_size);
+// `known_size` >= 0 (from a listing) skips the per-file properties round trip (v62); -1 = fetch.
+ArrowNetHandle OneLakeOpen(const std::string &path, const std::string &cred_json, int64_t &out_size,
+                           int64_t known_size = -1);
 void OneLakeRead(ArrowNetHandle file, void *buffer, int64_t nr_bytes, int64_t location);
 void OneLakeClose(ArrowNetHandle file);
 std::string OneLakeGlob(const std::string &pattern, const std::string &cred_json);

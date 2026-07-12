@@ -20,10 +20,14 @@ typedef wchar_t host_char_t;
 #else
 #include <dlfcn.h>
 #include <climits>
+#include <dirent.h>
+#include <sys/stat.h>
 typedef char host_char_t;
 #define ANET_CDECL
 #define ANET_STDCALL
 #endif
+
+#include <vector>
 
 namespace arrownet {
 
@@ -33,6 +37,14 @@ namespace arrownet {
 // Self-contained deployments must be initialized via the command-line entry;
 // hostfxr_initialize_for_runtime_config rejects self-contained components with
 // "Initialization for self-contained components is not supported".
+// Optional init parameters: `dotnet_root` selects WHICH .NET install resolves the frameworks — the hook the
+// framework-dependent deployment uses (no process-env mutation needed).
+struct hostfxr_initialize_parameters {
+	size_t size;
+	const host_char_t *host_path;
+	const host_char_t *dotnet_root;
+};
+
 typedef int32_t(ANET_CDECL *hostfxr_initialize_for_dotnet_command_line_fn)(int argc, const host_char_t **argv,
                                                                            const void *parameters,
                                                                            void **host_context_handle);
@@ -167,6 +179,154 @@ const char *HostFxrLeaf() {
 #endif
 }
 
+// ---- framework-dependent hosting: locate a PROVIDED .NET install ----
+
+bool DirExists(const std::string &path) {
+#if defined(_WIN32)
+	DWORD attrs = GetFileAttributesW(ToHostString(path).c_str());
+	return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY);
+#else
+	struct stat st;
+	return stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+#endif
+}
+
+std::vector<std::string> ListSubdirs(const std::string &dir) {
+	std::vector<std::string> names;
+#if defined(_WIN32)
+	WIN32_FIND_DATAW fd;
+	HANDLE h = FindFirstFileW((ToHostString(dir) + L"\\*").c_str(), &fd);
+	if (h != INVALID_HANDLE_VALUE) {
+		do {
+			if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && fd.cFileName[0] != L'.') {
+				int len = WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, nullptr, 0, nullptr, nullptr);
+				std::string name((size_t)len, '\0');
+				WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, &name[0], len, nullptr, nullptr);
+				while (!name.empty() && name.back() == '\0') {
+					name.pop_back();
+				}
+				names.push_back(name);
+			}
+		} while (FindNextFileW(h, &fd));
+		FindClose(h);
+	}
+#else
+	DIR *d = opendir(dir.c_str());
+	if (d) {
+		while (struct dirent *e = readdir(d)) {
+			if (e->d_name[0] == '.') {
+				continue;
+			}
+			if (DirExists(PathJoin(dir, e->d_name))) {
+				names.push_back(e->d_name);
+			}
+		}
+		closedir(d);
+	}
+#endif
+	return names;
+}
+
+// Numeric dotted-version compare ("10.0.7" > "8.0.26"); a prerelease suffix ("-preview…") stops the parse
+// of that segment, which is good enough for picking the newest hostfxr.
+bool VersionLess(const std::string &a, const std::string &b) {
+	size_t ia = 0, ib = 0;
+	while (ia < a.size() || ib < b.size()) {
+		long va = 0, vb = 0;
+		while (ia < a.size() && a[ia] >= '0' && a[ia] <= '9') {
+			va = va * 10 + (a[ia++] - '0');
+		}
+		while (ib < b.size() && b[ib] >= '0' && b[ib] <= '9') {
+			vb = vb * 10 + (b[ib++] - '0');
+		}
+		if (va != vb) {
+			return va < vb;
+		}
+		while (ia < a.size() && a[ia] != '.') {
+			ia++;
+		}
+		while (ib < b.size() && b[ib] != '.') {
+			ib++;
+		}
+		if (ia < a.size()) {
+			ia++;
+		}
+		if (ib < b.size()) {
+			ib++;
+		}
+	}
+	return false;
+}
+
+// The hostfxr of a .NET install: <root>/host/fxr/<highest version>/<hostfxr lib>. Empty when absent.
+std::string FindHostFxrInRoot(const std::string &root) {
+	std::string fxr_dir = PathJoin(PathJoin(root, "host"), "fxr");
+	if (!DirExists(fxr_dir)) {
+		return std::string();
+	}
+	std::string best;
+	for (auto &name : ListSubdirs(fxr_dir)) {
+		if (best.empty() || VersionLess(best, name)) {
+			best = name;
+		}
+	}
+	if (best.empty()) {
+		return std::string();
+	}
+	std::string candidate = PathJoin(PathJoin(fxr_dir, best.c_str()), HostFxrLeaf());
+	return FileExists(candidate) ? candidate : std::string();
+}
+
+// Resolve the .NET install a framework-dependent payload should run on:
+// ARROWNET_DOTNET_ROOT (explicit override — e.g. a private .NET 10 next to a global .NET 8) >
+// DOTNET_ROOT (the standard env) > the platform's global install locations. `probed` collects what was
+// tried, for the error message.
+std::string ResolveDotnetRoot(std::string &probed) {
+	const char *env_names[] = {"ARROWNET_DOTNET_ROOT", "DOTNET_ROOT"};
+	for (auto *name : env_names) {
+		std::string root = EnvOrEmpty(name);
+		if (!root.empty()) {
+			probed += std::string(name) + "=" + root + "; ";
+			if (DirExists(root)) {
+				return root;
+			}
+		}
+	}
+#if defined(_WIN32)
+	std::string pf = EnvOrEmpty("ProgramFiles");
+	if (!pf.empty()) {
+		std::string root = PathJoin(pf, "dotnet");
+		probed += root + "; ";
+		if (DirExists(root)) {
+			return root;
+		}
+	}
+#else
+	// /etc/dotnet/install_location holds the registered install dir (one path per line; optional
+	// arch-suffixed variants exist — the plain file is the common case, incl. Azure Linux/Mariner).
+	{
+		std::ifstream f("/etc/dotnet/install_location");
+		std::string line;
+		if (f.good() && std::getline(f, line)) {
+			while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' ')) {
+				line.pop_back();
+			}
+			probed += "install_location=" + line + "; ";
+			if (!line.empty() && DirExists(line)) {
+				return line;
+			}
+		}
+	}
+	for (auto *root : {"/usr/share/dotnet", "/usr/lib/dotnet", "/usr/local/share/dotnet"}) {
+		probed += std::string(root) + "; ";
+		if (DirExists(root)) {
+			return root;
+		}
+	}
+#endif
+	return std::string();
+}
+
 // ---- loaded state ----
 std::once_flag g_once;
 ArrowNetVTable g_vtable {};
@@ -195,7 +355,37 @@ void LoadOnce() {
 		return;
 	}
 
+	// Deployment-mode detection: a SELF-CONTAINED publish carries its own hostfxr next to the assemblies;
+	// a FRAMEWORK-DEPENDENT publish doesn't — then a PROVIDED .NET install is resolved
+	// (ARROWNET_DOTNET_ROOT > DOTNET_ROOT > the global install) and ITS hostfxr is used, with the install
+	// passed as `dotnet_root` so the runtimeconfig (net8.0, rollForward=LatestMajor) resolves against it.
 	std::string hostfxr_path = PathJoin(g_managed_dir, HostFxrLeaf());
+	std::string dotnet_root; // non-empty => framework-dependent
+	if (!FileExists(hostfxr_path)) {
+		std::string probed;
+		dotnet_root = ResolveDotnetRoot(probed);
+#if defined(_WIN32)
+		// CoreCLR rejects a dotnet_root containing FORWARD slashes with E_INVALIDARG at CreateCoreCLR
+		// (framework RESOLUTION tolerates them — the failure is late and cryptic). Normalize.
+		for (auto &c : dotnet_root) {
+			if (c == '/') {
+				c = '\\';
+			}
+		}
+#endif
+		if (dotnet_root.empty()) {
+			g_load_error = "ArrowNet: framework-dependent layout (no " + std::string(HostFxrLeaf()) + " in " +
+			               g_managed_dir + ") but no .NET install found — set ARROWNET_DOTNET_ROOT (probed: " +
+			               probed + ")";
+			return;
+		}
+		hostfxr_path = FindHostFxrInRoot(dotnet_root);
+		if (hostfxr_path.empty()) {
+			g_load_error = "ArrowNet: no hostfxr under " + dotnet_root +
+			               "/host/fxr — is this a .NET runtime install? (set ARROWNET_DOTNET_ROOT to one)";
+			return;
+		}
+	}
 	void *hostfxr = LoadLib(hostfxr_path);
 	if (!hostfxr) {
 		g_load_error = "ArrowNet: failed to load hostfxr from " + hostfxr_path;
@@ -231,11 +421,22 @@ void LoadOnce() {
 
 	void *ctx = nullptr;
 	const host_char_t *argv[1] = {app_dll_h.c_str()};
-	int32_t rc = init_fn(1, argv, nullptr, &ctx);
+	// Framework-dependent: pass the resolved install as dotnet_root so hostfxr resolves the shared
+	// framework THERE (an explicit ARROWNET_DOTNET_ROOT wins over any global install — e.g. a private
+	// .NET 10 beside a machine-wide .NET 8). Self-contained: no parameters, exactly as before.
+	auto dotnet_root_h = ToHostString(dotnet_root);
+	hostfxr_initialize_parameters params {};
+	params.size = sizeof(params);
+	// host_path = the NATIVE host executable; null lets hostfxr use the current process (we are a library
+	// loaded into duckdb/python — the managed dll is NOT a valid host_path and CoreCLR rejects it).
+	params.host_path = nullptr;
+	params.dotnet_root = dotnet_root_h.c_str();
+	int32_t rc = init_fn(1, argv, dotnet_root.empty() ? nullptr : &params, &ctx);
 	// Negative codes are failures; small positive codes are success variants.
 	if (rc < 0 || ctx == nullptr) {
 		g_load_error = "ArrowNet: hostfxr_initialize_for_dotnet_command_line failed (0x" +
-		               std::to_string((uint32_t)rc) + ") for " + app_dll;
+		               std::to_string((uint32_t)rc) + ") for " + app_dll +
+		               (dotnet_root.empty() ? "" : " (dotnet_root=" + dotnet_root + ")");
 		return;
 	}
 
@@ -525,14 +726,15 @@ bool NamedInputExists(const std::string &name) {
 	}
 }
 
-ArrowNetHandle OneLakeOpen(const std::string &path, const std::string &cred_json, int64_t &out_size) {
+ArrowNetHandle OneLakeOpen(const std::string &path, const std::string &cred_json, int64_t &out_size,
+                           int64_t known_size) {
 	const ArrowNetVTable &vt = GetBridge();
 	if (!vt.onelake_open) {
 		throw duckdb::IOException("ArrowNet: bridge does not provide onelake_open");
 	}
 	char *err = nullptr;
 	ArrowNetHandle file = nullptr;
-	int32_t rc = vt.onelake_open(path.c_str(), cred_json.c_str(), &file, &out_size, &err);
+	int32_t rc = vt.onelake_open(path.c_str(), cred_json.c_str(), known_size, &file, &out_size, &err);
 	if (rc != ARROWNET_OK) {
 		ThrowManagedError(vt, err, "ArrowNet: onelake_open failed");
 	}
