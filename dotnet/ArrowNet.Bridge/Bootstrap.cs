@@ -51,7 +51,7 @@ public static unsafe class Bootstrap
             return new InMemoryArrayStream(schema, new[] { batch });
         });
 
-        vtable->AbiVersion = 62;
+        vtable->AbiVersion = 64;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -113,6 +113,7 @@ public static unsafe class Bootstrap
         vtable->OneLakeCloseWrite = &OneLakeCloseWrite;
         vtable->DeltaListFiles = &DeltaListFiles;
         vtable->OneLakeRemove = &OneLakeRemove;
+        vtable->OneLakeMove = &OneLakeMove;
         return ArrowNetStatus.Ok;
     }
 
@@ -543,15 +544,18 @@ public static unsafe class Bootstrap
     //      resolved from the opener ("{}"/empty ⇒ DefaultAzureCredential).
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int OneLakeOpen(byte* path, byte* credJson, long knownSize, nint* outFile, long* outSize, byte** err)
+    private static int OneLakeOpen(byte* path, byte* credJson, long knownSize, nint* outFile, long* outSize,
+                                   byte** outEtag, long* outModifiedMs, byte** err)
     {
         try
         {
             var p = Marshal.PtrToStringUTF8((nint)path) ?? string.Empty;
             var cj = Marshal.PtrToStringUTF8((nint)credJson);
-            var (handle, size) = OneLakeForwardFs.Open(p, cj, knownSize);
+            var (handle, size, etag, modifiedMs) = OneLakeForwardFs.Open(p, cj, knownSize);
             *outFile = Handles.Alloc(handle);
             *outSize = size;
+            *outEtag = etag is null ? null : (byte*)Marshal.StringToCoTaskMemUTF8(etag); // host frees via free_error
+            *outModifiedMs = modifiedMs;
             return ArrowNetStatus.Ok;
         }
         catch (Exception ex)
@@ -648,6 +652,24 @@ public static unsafe class Bootstrap
             var p = Marshal.PtrToStringUTF8((nint)path) ?? string.Empty;
             var cj = Marshal.PtrToStringUTF8((nint)credJson);
             OneLakeForwardFs.Remove(p, cj);
+            return ArrowNetStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return ArrowNetStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int OneLakeMove(byte* src, byte* dest, byte* credJson, byte** err)
+    {
+        try
+        {
+            var s2 = Marshal.PtrToStringUTF8((nint)src) ?? string.Empty;
+            var d = Marshal.PtrToStringUTF8((nint)dest) ?? string.Empty;
+            var cj = Marshal.PtrToStringUTF8((nint)credJson);
+            OneLakeForwardFs.Move(s2, d, cj);
             return ArrowNetStatus.Ok;
         }
         catch (Exception ex)

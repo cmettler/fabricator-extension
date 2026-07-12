@@ -139,8 +139,9 @@ int64_t ExtractJsonInt(const std::string &obj, const std::string &key) {
 class ArrowNetOneLakeFileHandle : public FileHandle {
 public:
 	ArrowNetOneLakeFileHandle(FileSystem &fs, const string &path, FileOpenFlags flags, ArrowNetHandle handle,
-	                          int64_t size, bool is_write)
-	    : FileHandle(fs, path, flags), managed_handle(handle), file_size(size), position(0), write_mode(is_write) {
+	                          int64_t size, bool is_write, std::string etag_p = "", int64_t modified_ms = -1)
+	    : FileHandle(fs, path, flags), managed_handle(handle), file_size(size), position(0), write_mode(is_write),
+	      etag(std::move(etag_p)), last_modified(modified_ms >= 0 ? timestamp_t(modified_ms * 1000) : timestamp_t(0)) {
 	}
 	~ArrowNetOneLakeFileHandle() override {
 		Close();
@@ -160,6 +161,10 @@ public:
 	int64_t file_size;
 	idx_t position;
 	bool write_mode;
+	// Cache-validation identity, when known (from the listing's extended_info, or the managed
+	// properties fetch on a bare open). Backs GetVersionTag/GetLastModifiedTime below.
+	std::string etag;
+	timestamp_t last_modified;
 };
 
 class ArrowNetOneLakeFileSystem : public FileSystem {
@@ -178,22 +183,38 @@ public:
 	unique_ptr<FileHandle> OpenFileExtended(const OpenFileInfo &file, FileOpenFlags flags,
 	                                        optional_ptr<FileOpener> opener) override {
 		int64_t known_size = -1;
+		std::string known_etag;
+		int64_t known_modified_ms = -1;
 		if (file.extended_info && !flags.OpenForWriting()) {
-			auto it = file.extended_info->options.find("file_size");
-			if (it != file.extended_info->options.end()) {
+			auto &options = file.extended_info->options;
+			auto it = options.find("file_size");
+			if (it != options.end()) {
 				try {
 					known_size = it->second.GetValue<int64_t>();
 				} catch (...) {
 					known_size = -1;
 				}
 			}
+			auto etag_it = options.find("etag");
+			if (etag_it != options.end() && !etag_it->second.IsNull()) {
+				known_etag = StringValue::Get(etag_it->second);
+			}
+			auto mod_it = options.find("last_modified");
+			if (mod_it != options.end() && !mod_it->second.IsNull()) {
+				try {
+					known_modified_ms = mod_it->second.GetValue<timestamp_t>().value / 1000; // micros -> ms
+				} catch (...) {
+					known_modified_ms = -1;
+				}
+			}
 		}
-		return OpenInternal(file.path, flags, opener, known_size);
+		return OpenInternal(file.path, flags, opener, known_size, known_etag, known_modified_ms);
 	}
 
 private:
 	unique_ptr<FileHandle> OpenInternal(const string &path, FileOpenFlags flags, optional_ptr<FileOpener> opener,
-	                                    int64_t known_size) {
+	                                    int64_t known_size, std::string known_etag = "",
+	                                    int64_t known_modified_ms = -1) {
 		auto cred = ResolveCredJson(path, opener);
 		if (flags.OpenForWriting()) {
 			// Plain sequential file write (COPY … TO 'onelake://…') — create/overwrite, appends follow.
@@ -203,8 +224,12 @@ private:
 			return make_uniq<ArrowNetOneLakeFileHandle>(*this, path, flags, handle, 0, /*is_write=*/true);
 		}
 		int64_t size = 0;
-		auto handle = OneLakeOpen(path, cred, size, known_size);
-		return make_uniq<ArrowNetOneLakeFileHandle>(*this, path, flags, handle, size, /*is_write=*/false);
+		// A bare open (known_size < 0) fetches properties managed-side — which also carries the etag +
+		// mtime (v63); a known-size open takes them from the listing's extended_info instead (no fetch).
+		auto handle = OneLakeOpen(path, cred, size, known_size, known_size < 0 ? &known_etag : nullptr,
+		                          known_size < 0 ? &known_modified_ms : nullptr);
+		return make_uniq<ArrowNetOneLakeFileHandle>(*this, path, flags, handle, size, /*is_write=*/false,
+		                                            std::move(known_etag), known_modified_ms);
 	}
 
 public:
@@ -230,10 +255,17 @@ public:
 		return handle.Cast<ArrowNetOneLakeFileHandle>().file_size;
 	}
 
-	// The parquet reader / ExternalFileCache asks for the mtime as a cache version tag. Delta data files are
-	// immutable (a new commit writes a new file), so a constant is correct — and avoids an extra round-trip.
+	// Cache-validation identity for DuckDB's ExternalFileCache (validate_external_file_cache defaults to
+	// VALIDATE_ALL, and IsValid prefers the version tag when either side has one — exact etag comparison,
+	// so an in-place overwrite invalidates the cached ranges). Both values come for FREE: from the
+	// listing's extended_info on glob-fed opens, or the properties fetch a bare open does anyway — never
+	// an extra round trip. Unknown ⇒ empty tag + mtime 0, which degrades to today's assume-valid behavior
+	// (correct for immutable Delta data files).
+	string GetVersionTag(FileHandle &handle) override {
+		return handle.Cast<ArrowNetOneLakeFileHandle>().etag;
+	}
 	timestamp_t GetLastModifiedTime(FileHandle &handle) override {
-		return timestamp_t(0);
+		return handle.Cast<ArrowNetOneLakeFileHandle>().last_modified;
 	}
 
 	void Seek(FileHandle &handle, idx_t location) override {
@@ -334,9 +366,12 @@ public:
 	void RemoveFile(const string &path, optional_ptr<FileOpener> opener) override {
 		OneLakeRemove(path, ResolveCredJson(path, opener));
 	}
-	// --- other mutate ops: not supported ---
-	void MoveFile(const string &, const string &, optional_ptr<FileOpener>) override {
-		throw NotImplementedException("onelake:// FileSystem: MoveFile is not supported");
+	// Atomic single-file rename via the ADLS Gen2 DFS native rename (metadata op, overwrites the
+	// destination — MoveFile semantics). Makes DuckDB's default COPY tmp-file staging work on
+	// onelake:// (COPY to an EXISTING file writes <file>.tmp then MoveFile — taken because onelake://
+	// classifies as LOCAL in DuckDB's hardcoded remote-prefix list, unlike abfss://).
+	void MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener) override {
+		OneLakeMove(source, target, ResolveCredJson(source, opener));
 	}
 	// Directory ops: OneLake / ADLS Gen2 directories are IMPLICIT (a blob write at `<dir>/<file>`
 	// materializes the whole hierarchy). DuckDB's partitioned COPY (PARTITION_BY) checks the target directory

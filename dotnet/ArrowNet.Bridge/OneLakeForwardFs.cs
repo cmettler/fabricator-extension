@@ -64,17 +64,23 @@ internal static class OneLakeForwardFs
     private static DataLakeFileSystemClient FsClient(string fsName, TokenCredential cred)
         => new DataLakeFileSystemClient(new Uri($"https://{OneLakeHost}/{fsName}"), cred);
 
-    /// <summary>Open a file for reading: returns the handle + the file length. <paramref name="knownSize"/>
-    /// &gt;= 0 (from a listing's extended info) skips the per-file GetProperties round trip — constructing the
-    /// client itself does no IO, so a known-size open costs NOTHING until the first read.</summary>
-    public static (Handle Handle, long Size) Open(string path, string? credJson, long knownSize = -1)
+    /// <summary>Open a file for reading: returns the handle + the file length (+ the cache-validation
+    /// identity when a properties fetch happened). <paramref name="knownSize"/> &gt;= 0 (from a listing's
+    /// extended info) skips the per-file GetProperties round trip — constructing the client itself does no
+    /// IO, so a known-size open costs NOTHING until the first read (the host then takes etag/mtime from the
+    /// listing's extended info instead).</summary>
+    public static (Handle Handle, long Size, string? ETag, long ModifiedMs) Open(
+        string path, string? credJson, long knownSize = -1)
     {
         var (fs, p) = Parse(path);
         var client = FsClient(fs, Cred(credJson)).GetFileClient(p);
-        long len = knownSize >= 0
-            ? knownSize
-            : client.GetPropertiesAsync().GetAwaiter().GetResult().Value.ContentLength;
-        return (new Handle { Client = client, Length = len }, len);
+        if (knownSize >= 0)
+        {
+            return (new Handle { Client = client, Length = knownSize }, knownSize, null, -1);
+        }
+        var props = client.GetPropertiesAsync().GetAwaiter().GetResult().Value;
+        return (new Handle { Client = client, Length = props.ContentLength }, props.ContentLength,
+                props.ETag.ToString(), props.LastModified.ToUnixTimeMilliseconds());
     }
 
     /// <summary>Read exactly <paramref name="nrBytes"/> at absolute <paramref name="location"/> into
@@ -233,6 +239,24 @@ internal static class OneLakeForwardFs
             : null;
         client.CreateAsync(options).GetAwaiter().GetResult(); // 0-length; appends follow
         return new WriteHandle { Client = client, Position = 0 };
+    }
+
+    /// <summary>Atomic single-file rename via the DFS endpoint's native rename (a metadata op, not a copy;
+    /// overwrites an existing destination — MoveFile semantics). Src and dest must be in the same workspace
+    /// filesystem. The destination path is filesystem-relative (no workspace prefix) with the
+    /// <c>&lt;item&gt;.Lakehouse</c> as its leading segment — exactly what <see cref="Parse"/> yields (the
+    /// same OneLake quirk <c>FabricLakehouse.RenameDirectory</c> documents).</summary>
+    public static void Move(string src, string dest, string? credJson)
+    {
+        var (srcFs, srcPath) = Parse(src);
+        var (destFs, destPath) = Parse(dest);
+        if (!string.Equals(srcFs, destFs, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new NotSupportedException(
+                $"onelake_move: cross-workspace rename is not supported ('{srcFs}' -> '{destFs}')");
+        }
+        var client = FsClient(srcFs, Cred(credJson)).GetFileClient(srcPath);
+        client.RenameAsync(destPath).GetAwaiter().GetResult();
     }
 
     /// <summary>Delete a single file (idempotent — no error if absent).</summary>

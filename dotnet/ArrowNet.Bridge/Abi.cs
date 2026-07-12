@@ -188,8 +188,9 @@ public unsafe struct ArrowNetVTable
     // onelake:// FileSystem forward callbacks (Phase-3): the C++ onelake FS subsystem forwards read ops here to
     // the managed Azure DataLake SDK. cred_json = the azure secret fields the host resolved from the opener.
     // int32 onelake_open(char* path, char* cred_json, void** out_file, int64* out_size, char** err)
-    // int32 onelake_open(char* path, char* cred_json, int64 known_size, void** out_file, int64* out_size, char** err)
-    public delegate* unmanaged[Cdecl]<byte*, byte*, long, nint*, long*, byte**, int> OneLakeOpen;
+    // int32 onelake_open(char* path, char* cred_json, int64 known_size, void** out_file, int64* out_size,
+    //                    char** out_etag, int64* out_modified_ms, char** err)
+    public delegate* unmanaged[Cdecl]<byte*, byte*, long, nint*, long*, byte**, long*, byte**, int> OneLakeOpen;
     // int32 onelake_read(void* file, void* buffer, int64 nr_bytes, int64 location, char** err)
     public delegate* unmanaged[Cdecl]<nint, void*, long, long, byte**, int> OneLakeRead;
     // void onelake_close(void* file)
@@ -214,6 +215,11 @@ public unsafe struct ArrowNetVTable
     // the onelake:// FileSystem supports RemoveFile (engineered-wood's rename emulation deletes its source).
     // int32 onelake_remove(char* path, char* cred_json, char** err)
     public delegate* unmanaged[Cdecl]<byte*, byte*, byte**, int> OneLakeRemove;
+
+    // Atomic onelake:// file rename via the DFS native rename (overwrites the destination — MoveFile
+    // semantics; backs DuckDB's COPY tmp-file staging on onelake://). Appended at v64.
+    // int32 onelake_move(char* src, char* dest, char* cred_json, char** err)
+    public delegate* unmanaged[Cdecl]<byte*, byte*, byte*, byte**, int> OneLakeMove;
 }
 
 /// <summary>

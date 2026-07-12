@@ -727,14 +727,26 @@ bool NamedInputExists(const std::string &name) {
 }
 
 ArrowNetHandle OneLakeOpen(const std::string &path, const std::string &cred_json, int64_t &out_size,
-                           int64_t known_size) {
+                           int64_t known_size, std::string *out_etag, int64_t *out_modified_ms) {
 	const ArrowNetVTable &vt = GetBridge();
 	if (!vt.onelake_open) {
 		throw duckdb::IOException("ArrowNet: bridge does not provide onelake_open");
 	}
 	char *err = nullptr;
+	char *etag = nullptr;
+	int64_t modified_ms = -1;
 	ArrowNetHandle file = nullptr;
-	int32_t rc = vt.onelake_open(path.c_str(), cred_json.c_str(), known_size, &file, &out_size, &err);
+	int32_t rc = vt.onelake_open(path.c_str(), cred_json.c_str(), known_size, &file, &out_size, &etag,
+	                             &modified_ms, &err);
+	if (etag) {
+		if (out_etag) {
+			*out_etag = etag;
+		}
+		vt.free_error(etag);
+	}
+	if (out_modified_ms) {
+		*out_modified_ms = modified_ms;
+	}
 	if (rc != ARROWNET_OK) {
 		ThrowManagedError(vt, err, "ArrowNet: onelake_open failed");
 	}
@@ -812,6 +824,18 @@ void OneLakeRemove(const std::string &path, const std::string &cred_json) {
 	int32_t rc = vt.onelake_remove(path.c_str(), cred_json.c_str(), &err);
 	if (rc != ARROWNET_OK) {
 		ThrowManagedError(vt, err, "ArrowNet: onelake_remove failed");
+	}
+}
+
+void OneLakeMove(const std::string &src, const std::string &dest, const std::string &cred_json) {
+	const ArrowNetVTable &vt = GetBridge();
+	if (!vt.onelake_move) {
+		throw duckdb::IOException("ArrowNet: bridge does not provide onelake_move");
+	}
+	char *err = nullptr;
+	int32_t rc = vt.onelake_move(src.c_str(), dest.c_str(), cred_json.c_str(), &err);
+	if (rc != ARROWNET_OK) {
+		ThrowManagedError(vt, err, "ArrowNet: onelake_move failed");
 	}
 }
 

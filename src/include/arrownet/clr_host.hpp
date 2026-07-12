@@ -69,9 +69,12 @@ bool NamedInputExists(const std::string &name);
 // forwards its read ops to the managed Azure DataLake SDK. `cred_json` = the azure secret fields the host
 // resolved from the calling opener (empty/"{}" => DefaultAzureCredential). Read-only for now. OneLakeOpen
 // returns an opaque managed handle (close via OneLakeClose) + the file length in `out_size`.
-// `known_size` >= 0 (from a listing) skips the per-file properties round trip (v62); -1 = fetch.
+// `known_size` >= 0 (from a listing) skips the per-file properties round trip (v62); -1 = fetch. When the
+// managed side fetches properties (v63) it also returns the cache-validation identity: `out_etag` /
+// `out_modified_ms` (epoch ms, -1 unknown) — untouched on the skip path (the caller uses listing values).
 ArrowNetHandle OneLakeOpen(const std::string &path, const std::string &cred_json, int64_t &out_size,
-                           int64_t known_size = -1);
+                           int64_t known_size = -1, std::string *out_etag = nullptr,
+                           int64_t *out_modified_ms = nullptr);
 void OneLakeRead(ArrowNetHandle file, void *buffer, int64_t nr_bytes, int64_t location);
 void OneLakeClose(ArrowNetHandle file);
 std::string OneLakeGlob(const std::string &pattern, const std::string &cred_json);
@@ -85,6 +88,9 @@ ArrowNetHandle OneLakeOpenWrite(const std::string &path, const std::string &cred
 void OneLakeWrite(ArrowNetHandle file, const void *buffer, int64_t nr_bytes);
 void OneLakeCloseWrite(ArrowNetHandle file);
 void OneLakeRemove(const std::string &path, const std::string &cred_json);
+// Atomic onelake:// single-file rename via the DFS native rename (overwrites the destination —
+// MoveFile semantics; backs DuckDB's COPY tmp-file staging, v64). Same-workspace only.
+void OneLakeMove(const std::string &src, const std::string &dest, const std::string &cred_json);
 
 // Delta native-read (MultiFileList): the active data files of the Delta table at `path` as a JSON array
 // [{"path":"<uri>", ...}] (the `add` set, not a glob). `push_json` = pushed filters (empty = none). The

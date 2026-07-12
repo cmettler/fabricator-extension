@@ -657,9 +657,12 @@ typedef struct ArrowNetVTable {
 	// Read-only surface for now (write ops on the C++ FS throw NotImplemented). *out_file = an opaque managed
 	// file handle (close via onelake_close); *out_size = the file length (read at open, cached C++-side).
 	// `known_size` >= 0 (from a listing's extended info) skips the per-file GetProperties round trip (v62);
-	// -1 = fetch the length at open.
+	// -1 = fetch the length at open. When the managed side DOES fetch properties (v63), it also returns the
+	// file's `out_etag` (owned UTF-8, freed via free_error; null when unknown) and `out_modified_ms`
+	// (epoch ms; -1 unknown) — the cache-validation identity the host surfaces via GetVersionTag /
+	// GetLastModifiedTime so DuckDB's external file cache detects in-place overwrites (VALIDATE_ALL default).
 	int32_t (*onelake_open)(const char *path, const char *cred_json, int64_t known_size, ArrowNetHandle *out_file,
-	                        int64_t *out_size,
+	                        int64_t *out_size, char **out_etag, int64_t *out_modified_ms,
 	                        char **err);
 	// Read nr_bytes at absolute offset `location` into buffer (host-owned). The managed side does the range GET.
 	int32_t (*onelake_read)(ArrowNetHandle file, void *buffer, int64_t nr_bytes, int64_t location, char **err);
@@ -699,6 +702,12 @@ typedef struct ArrowNetVTable {
 	// exclusive-create-copy + DELETE-SOURCE, so a Delta write over onelake:// (arrownet_delta_write) needs it.
 	// cred_json as above.
 	int32_t (*onelake_remove)(const char *path, const char *cred_json, char **err);
+	// Atomic single-file rename via the ADLS Gen2 DFS native rename (a metadata op, not a copy;
+	// overwrites an existing destination — MoveFile semantics). Appended at v64 so DuckDB's COPY
+	// tmp-file staging (`<file>.tmp` -> target, taken because onelake:// classifies as LOCAL in the
+	// hardcoded remote-prefix list) works on onelake://. dest is a full onelake:// path in the SAME
+	// workspace filesystem; cred_json as above.
+	int32_t (*onelake_move)(const char *src, const char *dest, const char *cred_json, char **err);
 } ArrowNetVTable;
 
 // -----------------------------------------------------------------------------
@@ -791,7 +800,7 @@ typedef struct ArrowNetHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define ARROWNET_AGG_SPILL_CAP 1024
 
-#define ARROWNET_ABI_VERSION 62
+#define ARROWNET_ABI_VERSION 64
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(ArrowNetVTable) as seen

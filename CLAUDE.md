@@ -1392,7 +1392,34 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `FabricLakehouse.IsOneLake` abfss check, so it rides the plain host-FS path with opener-resolved secrets —
   which is exactly right). Kernel reads the outputs (known quirk unchanged: kernel shows a MAPPED partitioned
   table's partition column as NULL; plain shape exact).
-- **Current version: ABI v62** (v62 = **listing-metadata riding + skip-HEAD opens on `onelake://`**:
+- **Current version: ABI v64** (v64 = **`onelake_move`** — atomic single-file rename via the ADLS Gen2
+  DFS **native rename** (`DataLakeFileClient.RenameAsync`, a metadata op that overwrites an existing
+  destination = MoveFile semantics; destination path filesystem-relative with the `<item>.Lakehouse`
+  leading segment, same quirk as `FabricLakehouse.RenameDirectory`; same-workspace only). The onelake FS
+  now implements `MoveFile`, which makes **DuckDB's default COPY tmp-file staging work on `onelake://`**:
+  COPY to an EXISTING file writes `<file>.tmp` then `MoveFile` — a branch taken ONLY because `onelake://`
+  classifies as LOCAL in DuckDB's hardcoded remote-prefix list (`bind_copy.cpp` forces
+  `use_tmp_file=false` for remote schemes like `abfss://`, so duckdb-azure never hits its missing
+  MoveFile). Previously the overwrite threw "MoveFile is not supported" unless `USE_TMP_FILE false`;
+  live-validated (default COPY over an existing onelake file → new data, no `.tmp` leftover). NOTE:
+  engineered-wood's Delta COMMIT rename deliberately stays on the exclusive-create-copy + delete
+  emulation (it needs put-if-absent on the destination; a plain rename overwrites).)
+- **Prior: v63** (v63 = **etag/mtime-backed cache validation on `onelake://`** —
+  `onelake_open` gained `char **out_etag` (owned UTF-8, freed via free_error) + `int64 *out_modified_ms`
+  outs: when the managed open DOES fetch properties (bare open, `known_size<0`) it returns the file's
+  ETag + LastModified alongside the size (the SAME response — zero extra IO); a known-size open leaves
+  them untouched and the host takes them from the listing's `extended_info` (v62 already carried
+  `etag`/`last_modified` there). Both land on `ArrowNetOneLakeFileHandle`, and the FS now overrides
+  **`GetVersionTag`** (returns the etag) + `GetLastModifiedTime` (the real mtime; 0 when unknown).
+  Why this matters: `onelake://` is NOT in DuckDB's hardcoded `EXTENSION_FILE_PREFIXES` remote list →
+  `IsRemoteFile()=false`, but the cache-validation default is **`validate_external_file_cache =
+  'VALIDATE_ALL'`** — validation RUNS for onelake, and `ExternalFileCache::IsValid` prefers the version
+  tag whenever either side has one (exact etag compare; empty-vs-empty falls to the mtime + 10s-threshold
+  path, which with our previous constant-0 mtime degenerated to always-valid). So cached ranges of an
+  IN-PLACE OVERWRITTEN onelake file are now invalidated by default — for free, since the etag always
+  rides an existing response. Unknown identity (no listing info on a bare open that skipped properties —
+  can't happen; both sources covered) degrades to the old immutable-file assumption.)
+- **Prior: v62** (v62 = **listing-metadata riding + skip-HEAD opens on `onelake://`**:
   `onelake_open` gained an `int64 known_size` arg (−1 = fetch) — the managed open SKIPS its per-file
   GetProperties round trip when the size is already known. Sources of "known": the OneLake DataLake
   listing now emits `size` + `last_modified` + `etag` in the glob JSON (all FREE fields of GetPaths), the
