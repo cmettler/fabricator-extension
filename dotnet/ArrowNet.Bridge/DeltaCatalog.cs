@@ -1108,12 +1108,36 @@ public sealed class DeltaCatalog : IBackendCatalog
         if (pending.Files.Count > 0)
         {
             string root = DeltaReader.ToReadableRoot(path);
-            var parts = new List<string>(pending.Files.Count);
+            // Partitioned pending CTAS: the data files EXCLUDE the partition columns — render each
+            // file's partitionValues (physical-keyed under mapping) as typed literals, per file (the
+            // same log-authoritative rule the committed native reader applies; paths never parsed).
+            var partCols = pending.CreatePartitionColumns ?? (IReadOnlyList<string>)System.Array.Empty<string>();
+            var deltaSchema = pending.PendingDeltaSchema
+                ?? EngineeredWood.DeltaLake.Schema.SchemaConverter.FromArrowSchema(pending.PendingArrowSchema!);
+            var logToPhys = pending.PendingDeltaSchema is { } m0
+                ? EngineeredWood.DeltaLake.Schema.ColumnMapping.BuildLogicalToPhysicalMap(m0, _columnMappingMode)
+                : null;
+            var selects = new List<string>(pending.Files.Count);
             foreach (var f in pending.Files)
             {
-                parts.Add("'" + (root + "/" + f.RelativePath).Replace("'", "''") + "'");
+                var sel = new System.Text.StringBuilder("SELECT *");
+                foreach (var pc in partCols)
+                {
+                    var dfield = deltaSchema.Fields.FirstOrDefault(x =>
+                        string.Equals(x.Name, pc, System.StringComparison.OrdinalIgnoreCase));
+                    string typeText = dfield is not null ? DeltaNativeReader.TypeText(dfield.Type) : "VARCHAR";
+                    string stored = logToPhys is not null && logToPhys.TryGetValue(pc, out var pp) ? pp : pc;
+                    string? pv = DeltaNativeReader.LookupPartitionValue(f.PartitionValues, pc, stored);
+                    sel.Append(pv is null
+                        ? $", CAST(NULL AS {typeText}) AS \"{pc}\""
+                        : $", CAST('{pv.Replace("'", "''")}' AS {typeText}) AS \"{pc}\"");
+                }
+                sel.Append(" FROM read_parquet('")
+                   .Append((root + "/" + f.RelativePath).Replace("'", "''"))
+                   .Append("')");
+                selects.Add(sel.ToString());
             }
-            var sql = "SELECT * FROM read_parquet([" + string.Join(", ", parts) + "])";
+            var sql = string.Join(" UNION ALL ", selects);
             var source = Host.Query(sql);
             if (pending.PendingDeltaSchema is { } assigned)
             {
@@ -1481,13 +1505,14 @@ public sealed class DeltaCatalog : IBackendCatalog
                 // files at statement time (no _delta_log touched — the flush's CREATE reuses the
                 // pre-assigned column-mapping schema and one commit references the files; ROLLBACK
                 // leaves orphans in a log-less folder, not a table to any reader). Bounded memory for a
-                // huge CTAS inside BEGIN..COMMIT. Partitioned pending creates keep the collect path
-                // (their read-back would need Hive-dir reconstruction).
-                if (_nativeWrite && partitionColumns is not { Count: > 0 })
+                // huge CTAS inside BEGIN..COMMIT. Partitioned CTAS streams too (COPY PARTITION_BY; the
+                // read-back renders each file's partitionValues as typed literals).
+                if (_nativeWrite)
                 {
                     var ctasSchema = data.Schema;
                     var cfiles = DeltaWriter.TryStreamCreateFiles(
-                        opener, tablePath, data, _columnMappingMode, out var sRows, out var assigned);
+                        opener, tablePath, data, _columnMappingMode, out var sRows, out var assigned,
+                        partitionColumns);
                     if (cfiles is not null)
                     {
                         pendingC.PendingCreate = true;
@@ -1583,6 +1608,34 @@ public sealed class DeltaCatalog : IBackendCatalog
             if (!tryStream || pending.PendingMetadata is not null)
             {
                 var (bschema, bbatches, brows) = DeltaWriter.Materialize(data, default);
+                // Pending-created IDENTITY table: generate the engine values NOW from the parked
+                // schema's identity metadata (marks chain across the transaction's statements) —
+                // read-your-writes shows the real ids, and the flush writes the pre-generated batches
+                // + bakes the final marks into commit-0.
+                if (pending.PendingCreate && pending.PendingArrowSchema is { } pcArrow)
+                {
+                    var pcDelta = EngineeredWood.DeltaLake.Schema.SchemaConverter.FromArrowSchema(pcArrow);
+                    bool hasIdentity = false;
+                    foreach (var pf in pcDelta.Fields)
+                    {
+                        if (EngineeredWood.DeltaLake.Schema.IdentityColumn.GetConfig(pf) is not null)
+                        {
+                            hasIdentity = true;
+                            break;
+                        }
+                    }
+                    if (hasIdentity)
+                    {
+                        var (genBatches, marks) = EngineeredWood.DeltaLake.Table.DeltaTable
+                            .GenerateIdentityValuesForSchema(pcDelta, bbatches,
+                                pending.PendingIdentityHwm.Count > 0 ? pending.PendingIdentityHwm : null);
+                        bbatches = new List<RecordBatch>(genBatches);
+                        foreach (var kv in marks)
+                        {
+                            pending.PendingIdentityHwm[kv.Key] = kv.Value;
+                        }
+                    }
+                }
                 if (cdfAppend)
                 {
                     WriteCdcFiles(opener, tablePath, pending, bbatches, "insert");
@@ -1651,6 +1704,66 @@ public sealed class DeltaCatalog : IBackendCatalog
 
     /// <summary>Creates an empty Delta table (commit 0 with the schema). Idempotent (OpenOrCreate), so
     /// <paramref name="ifNotExists"/> is satisfied; PK/UNIQUE/DEFAULT are ignored (Delta has no such constraints).</summary>
+    // identityColumns (the DuckDB `AS (0)` generated-column marker, v53): Delta has NATIVE identity —
+    // attach delta.identity.* metadata (start 1, step 1, GENERATED ALWAYS) to the marked fields.
+    // Keep nullable=true on the DuckDB-facing schema: the INSERT stream carries NULLs for the
+    // engine-assigned column (generation replaces them); files never actually hold nulls.
+    private static Schema WithIdentityMetadata(Schema columns, IReadOnlyList<string>? identityColumns)
+    {
+        if (identityColumns is not { Count: > 0 })
+        {
+            return columns;
+        }
+        var idSet = new HashSet<string>(identityColumns, System.StringComparer.OrdinalIgnoreCase);
+        var withIdentity = new List<Field>(columns.FieldsList.Count);
+        foreach (var f in columns.FieldsList)
+        {
+            if (idSet.Contains(f.Name))
+            {
+                var meta = new Dictionary<string, string>(
+                    EngineeredWood.DeltaLake.Schema.IdentityColumn.CreateMetadata(
+                        start: 1, step: 1, allowExplicitInsert: false));
+                if (f.Metadata is { } src)
+                {
+                    foreach (var kv in src) { meta[kv.Key] = kv.Value; }
+                }
+                withIdentity.Add(new Field(f.Name, f.DataType, nullable: true, meta));
+            }
+            else
+            {
+                withIdentity.Add(f);
+            }
+        }
+        return new Schema(withIdentity, columns.Metadata);
+    }
+
+    // Bakes a buffered transaction's final identity high-water marks into the parked ARROW schema's
+    // field metadata — commit-0 then carries the marks the transaction's pre-generated values consumed
+    // (no separate metaData action; nobody can have consumed ids from a never-committed table).
+    private static Schema BakeIdentityMarks(Schema columns, IReadOnlyDictionary<string, long> marks)
+    {
+        var fields = new List<Field>(columns.FieldsList.Count);
+        foreach (var f in columns.FieldsList)
+        {
+            if (marks.TryGetValue(f.Name, out var hwm))
+            {
+                var meta = new Dictionary<string, string>();
+                if (f.Metadata is { } src)
+                {
+                    foreach (var kv in src) { meta[kv.Key] = kv.Value; }
+                }
+                meta[EngineeredWood.DeltaLake.Schema.IdentityColumn.HighWaterMarkKey] =
+                    hwm.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                fields.Add(new Field(f.Name, f.DataType, f.IsNullable, meta));
+            }
+            else
+            {
+                fields.Add(f);
+            }
+        }
+        return new Schema(fields, columns.Metadata);
+    }
+
     public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists,
                             string? primaryKey, string? uniques, string? defaults,
                             IReadOnlyList<string>? partitionColumns, IReadOnlyList<string>? sortColumns,
@@ -1659,12 +1772,15 @@ public sealed class DeltaCatalog : IBackendCatalog
         // Commit 0 itself is metadata-only, but a variant table is unusable without the native paths — fail
         // the CREATE up front with the actionable ATTACH-option error rather than at the first INSERT/SELECT.
         EnsureVariantWritable(columns);
+        // identityColumns metadata is attached BEFORE the buffer gate so a BUFFERED identity create
+        // parks the marked schema — INSERTs into the pending table then generate values at statement
+        // time from it (chained marks), and the flush bakes the final high-water marks into commit-0.
+        columns = WithIdentityMetadata(columns, identityColumns);
         // Explicit transaction (slice 4): a FRESH-table CREATE buffers — the table exists only in the
-        // transaction buffer until COMMIT (nothing touches the _delta_log; ROLLBACK discards). Identity-
-        // marked creates stay immediate (engineered-wood's committing writer owns identity generation);
-        // CREATE over an EXISTING table also stays immediate (OpenOrCreate no-op, today's semantics).
+        // transaction buffer until COMMIT (nothing touches the _delta_log; ROLLBACK discards).
+        // CREATE over an EXISTING table stays immediate (OpenOrCreate no-op, today's semantics).
         long createTxn = AmbientTransaction.Current;
-        if (_txnBuffer.IsExplicit(createTxn) && identityColumns is not { Count: > 0 }
+        if (_txnBuffer.IsExplicit(createTxn)
             && !TableExists(TablePath(schemaName, tableName)))
         {
             BufferCreateTable(createTxn, TablePath(schemaName, tableName), schemaName, tableName,
@@ -1684,29 +1800,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         // which rejects concurrent transactions on identity tables outright.
         if (identityColumns is { Count: > 0 })
         {
-            var idSet = new HashSet<string>(identityColumns, System.StringComparer.OrdinalIgnoreCase);
-            var withIdentity = new List<Field>(columns.FieldsList.Count);
-            foreach (var f in columns.FieldsList)
-            {
-                if (idSet.Contains(f.Name))
-                {
-                    var meta = new Dictionary<string, string>(
-                        EngineeredWood.DeltaLake.Schema.IdentityColumn.CreateMetadata(
-                            start: 1, step: 1, allowExplicitInsert: false));
-                    if (f.Metadata is { } src)
-                    {
-                        foreach (var kv in src) { meta[kv.Key] = kv.Value; }
-                    }
-                    // Keep nullable=true on the DuckDB-facing schema: the INSERT stream carries NULLs for the
-                    // engine-assigned column (ProcessBatch replaces them); files never actually hold nulls.
-                    withIdentity.Add(new Field(f.Name, f.DataType, nullable: true, meta));
-                }
-                else
-                {
-                    withIdentity.Add(f);
-                }
-            }
-            columns = new Schema(withIdentity, columns.Metadata);
+            // (metadata already attached above — WithIdentityMetadata)
         }
         DeltaWriter.Create(Opener(), TablePath(schemaName, tableName), columns, default,
                               deletionVectors: _deletionVectorsOnCreate,
@@ -2524,7 +2618,12 @@ public sealed class DeltaCatalog : IBackendCatalog
                 $"delta transaction conflict on '{tablePath}': the table was created concurrently while "
                 + "the transaction was open — the transaction is rolled back; retry it.");
         }
-        DeltaWriter.Create(opener, tablePath, pending.PendingArrowSchema!, default,
+        // Buffered identity create: commit-0's schema carries the FINAL chained high-water marks — the
+        // transaction's pre-generated values are already consumed as of the table's first version.
+        var createSchema = pending.PendingIdentityHwm.Count > 0
+            ? BakeIdentityMarks(pending.PendingArrowSchema!, pending.PendingIdentityHwm)
+            : pending.PendingArrowSchema!;
+        DeltaWriter.Create(opener, tablePath, createSchema, default,
                            deletionVectors: _deletionVectorsOnCreate,
                            inCommitTimestamps: _inCommitTimestampsOnCreate,
                            changeDataFeed: _changeDataFeedOnCreate,
@@ -2537,7 +2636,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                            // (physical names are random GUIDs).
                            preAssignedSchema: pending.PendingDeltaSchema);
         long v = 0;
-        if (pending.Files.Count > 0)
+        if (pending.Files.Count > 0 || (pending.Batches.Count > 0 && pending.PendingIdentityHwm.Count > 0))
         {
             // Eagerly-streamed CTAS files (+ any later collected batches) reference the fresh table in
             // ONE write commit (v0 create + v1 write — today's flush shape).
@@ -2552,10 +2651,15 @@ public sealed class DeltaCatalog : IBackendCatalog
                 var all = new List<EngineeredWood.DeltaLake.Table.WrittenDataFile>(pending.Files);
                 if (pending.Batches.Count > 0)
                 {
-                    all.AddRange(t2.WriteDataFilesAsync(pending.Batches, default)
+                    // identityValuesPreGenerated: the batches carry values generated at statement time
+                    // against the chained marks; regenerating here (the committing writer's default)
+                    // would double-consume the mark and diverge from read-your-writes.
+                    all.AddRange(t2.WriteDataFilesAsync(pending.Batches, default,
+                            identityValuesPreGenerated: pending.PendingIdentityHwm.Count > 0)
                         .AsTask().GetAwaiter().GetResult());
                 }
-                v = t2.CommitDataFilesAsync(all, DeltaWriteMode.Append, cancellationToken: default)
+                v = t2.CommitDataFilesAsync(all, DeltaWriteMode.Append, cancellationToken: default,
+                        identityValuesPreGenerated: pending.PendingIdentityHwm.Count > 0)
                     .AsTask().GetAwaiter().GetResult();
             }
             finally

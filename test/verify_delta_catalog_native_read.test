@@ -170,3 +170,62 @@ SELECT sum(id) FROM ttlake.main.t;
 
 statement ok
 COMMIT;
+
+# ============================================================================
+# Partitioned tables under native_read: partition columns come from the LOG's
+# per-file partitionValues as typed literals (the data files exclude them; the
+# presence probe previously NULL-backfilled them — a real bug, both modes)
+# ============================================================================
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/nr_part' AS np (TYPE arrownet, PROVIDER 'delta', native_write true, native_read true, column_mapping 'none');
+
+statement ok
+CREATE TABLE np.main.t PARTITIONED BY (region) AS
+  SELECT i AS id, CASE i % 3 WHEN 0 THEN 'US' WHEN 1 THEN 'EU' ELSE 'APAC' END AS region
+  FROM range(1, 31) r(i);
+
+query TI
+SELECT region, count(*) FROM np.main.t GROUP BY region ORDER BY region;
+----
+APAC	10
+EU	10
+US	10
+
+query IT
+SELECT id, region FROM np.main.t WHERE id = 5;
+----
+5	APAC
+
+# filter ON the partition column (literal participates in the WHERE + log pruning)
+query I
+SELECT count(*) FROM np.main.t WHERE region = 'EU';
+----
+10
+
+statement ok
+DETACH np;
+
+# MAPPED (default name mode): partitionValues are keyed by the PHYSICAL column name — dual lookup
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/nr_partm' AS npm (TYPE arrownet, PROVIDER 'delta', native_write true, native_read true);
+
+statement ok
+CREATE TABLE npm.main.t PARTITIONED BY (region) AS
+  SELECT i AS id, CASE i % 3 WHEN 0 THEN 'US' WHEN 1 THEN 'EU' ELSE 'APAC' END AS region
+  FROM range(1, 31) r(i);
+
+query TI
+SELECT region, count(*) FROM npm.main.t GROUP BY region ORDER BY region;
+----
+APAC	10
+EU	10
+US	10
+
+query I
+SELECT count(*) FROM npm.main.t WHERE region = 'US' AND id % 3 = 0;
+----
+10
+
+statement ok
+DETACH npm;

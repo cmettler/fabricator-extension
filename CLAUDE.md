@@ -317,6 +317,40 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     **The deltars provider gets the same for free via storage_options**: delta-rs enables native S3
     conditional-put locking with `conditional_put: "etag"` (no DynamoDB `AWS_S3_LOCKING_PROVIDER`
     needed) — add it to `DeltaRsCatalog`'s `storage_options` when S3 discovery lands.
+  - **Partitioned × native_read BUG FIXED + partitioned pending-CTAS lifted (2026-07-13).** Probing the
+    "why keep partitioned pending-creates buffered" question exposed a REAL committed-read bug: under
+    `native_read`, a PARTITIONED table's partition column read **all-NULL in BOTH mapping modes** — the
+    per-file presence probe saw it absent from the parquet footer and NULL-backfilled it like schema
+    evolution (hive auto-detection never engaged; the combination was untested). Fix is
+    log-authoritative: `NativeScanFile` carries each add's `partitionValues` +
+    `NativeScanList.PartitionColumns`, and `FileSql` renders partition columns as **typed literals**
+    (`CAST('US' AS VARCHAR) AS "region"`; dual logical|physical key lookup — new mapped commits key
+    physical, old EW commits logical; missing/sentinel ⇒ NULL) — never path parsing (partitionValues is
+    the spec's authoritative source; paths are opaque). WHERE/pruning on the partition column work
+    (outer WHERE sees the literal; DeltaFilePruner already pruned by partitionValues).
+    `verify_delta_catalog_native_read` 66→88 (both modes, GROUP BY/filter pins). **The same literal
+    machinery lifted the partitioned pending-CTAS collect gate**: `TryStreamCreateFiles` gained the
+    partitioned branch (`RunCopyPartitioned` — Hive layout streamed in one COPY, physical dirs +
+    FIELD_IDS-minus-partition-cols under mapping, per-file partitionValues on the `WrittenDataFile`s),
+    and `ScanPendingCreated`'s read-back renders per-file partition literals (physical→logical via the
+    pre-assigned schema; `TypeText`/`LookupPartitionValue` widened internal for reuse). §39 pins the
+    streamed partitioned CTAS-in-txn (Hive dirs pre-COMMIT + zero log entries, read-your-writes incl.
+    GROUP BY/filter on the partition column, v0+v1 commit); kernel reads the fused commit;
+    `verify_delta_catalog_transactions` 912.
+  - **Buffered IDENTITY create — LIFTED (2026-07-13, same pass):** `CREATE TABLE t (id BIGINT AS (0), …)`
+    inside `BEGIN..COMMIT` is now TRANSACTIONAL (was immediate — a ROLLBACK couldn't undo it). Simpler
+    than the committed-table identity case because a never-committed table has NO concurrent-HWM problem:
+    the identity metadata attaches BEFORE the buffer gate (shared `WithIdentityMetadata`); INSERTs into
+    the pending table generate values at STATEMENT time from the parked schema via the new EW **static**
+    `DeltaTable.GenerateIdentityValuesForSchema(schema, batches, chained)` (the instance method now
+    delegates; marks chain via `PendingIdentityHwm` — read-your-writes shows REAL ids, previously NULLs
+    would have shown); the flush **bakes the final marks into commit-0's schema metadata**
+    (`BakeIdentityMarks` — no separate metaData action) and writes the batches with
+    `identityValuesPreGenerated: true` (regeneration would double-consume the mark). §40 (create leaves
+    zero log entries pre-COMMIT, chained distinct ids, HWM continues post-commit in autocommit,
+    ROLLBACK leaves nothing); kernel-exact (ids 1..3 buffered + 4 autocommit);
+    `verify_delta_catalog_transactions` 934, identity 38 unchanged. Remaining batch-park cases:
+    iceberg, identity-under-pending-ALTER, autocommit codec (by design).
   - **dbt REGRESSION found + FIXED by re-running the lakehouse harness (2026-07-13):** dbt's table
     materialization swaps via `CREATE <model>__dbt_tmp AS …; ALTER <model> RENAME TO <model>__dbt_backup;
     ALTER <model>__dbt_tmp RENAME TO <model>; COMMIT` — the second RENAME hits a table CREATED in the

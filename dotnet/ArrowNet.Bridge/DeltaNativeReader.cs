@@ -135,7 +135,8 @@ internal static class DeltaNativeReader
         for (int i = 0; i < pendingFiles.Count; i++)
         {
             var uri = root + "/" + pendingFiles[i].RelativePath.Replace('\\', '/').TrimStart('/');
-            files.Add(new DeltaReader.NativeScanFile(0x780000 + i, uri, System.Array.Empty<long>()));
+            files.Add(new DeltaReader.NativeScanFile(0x780000 + i, uri, System.Array.Empty<long>(),
+                pendingFiles[i].PartitionValues is { Count: > 0 } pv ? pv : null));
         }
         return new DeltaReader.NativeScanList
         {
@@ -146,6 +147,7 @@ internal static class DeltaNativeReader
             LogicalToFieldId = listing.LogicalToFieldId,
             MappedSchema = listing.MappedSchema,
             TableSchema = listing.TableSchema,
+            PartitionColumns = listing.PartitionColumns,
         };
     }
 
@@ -159,11 +161,41 @@ internal static class DeltaNativeReader
 
     private const char PathSep = ''; // joins stored-name path segments (names may contain dots)
 
+    private static bool ContainsName(IReadOnlyList<string> names, string c)
+    {
+        foreach (var n in names)
+        {
+            if (string.Equals(n, c, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // A file's partition value for a column: try the LOGICAL key then the PHYSICAL (stored) key —
+    // new mapped commits key physical, old EW commits logical. Missing key / the Hive null-dir
+    // sentinel => SQL NULL.
+    internal static string? LookupPartitionValue(IReadOnlyDictionary<string, string>? values,
+                                                 string logical, string stored)
+    {
+        if (values is null)
+        {
+            return null;
+        }
+        if (!values.TryGetValue(logical, out var v) && !values.TryGetValue(stored, out v))
+        {
+            return null;
+        }
+        return v is null || v.Length == 0 || v == "__HIVE_DEFAULT_PARTITION__" ? null : v;
+    }
+
     // The per-file SELECT (ordinal folded into the rowid expression); file_row_number is read but only surfaces
     // as _metadata.row_id (and drives the DV exclusion) — never as an output column.
     private static string FileSql(IReadOnlyList<string> dataCols, bool wantRowId, string? where,
                                   DeltaReader.NativeScanFile f, FileMapping fm,
-                                  DeltaSchema.StructType? tableSchema)
+                                  DeltaSchema.StructType? tableSchema,
+                                  IReadOnlyList<string>? partitionCols = null)
     {
         // Per-column projection over THIS file's actual layout:
         //   • column mapping: alias the stored PHYSICAL name to the logical one; a mapped STRUCT whose shape
@@ -182,7 +214,19 @@ internal static class DeltaNativeReader
                 ? StoredChildName(field, fm)
                 : fm.LogToPhys is { } m && m.TryGetValue(c, out var p) ? p : c;
             string expr;
-            if (field is not null && !Present(field, stored, fm))
+            if (partitionCols is not null && field is not null && ContainsName(partitionCols, c))
+            {
+                // Partition columns are ABSENT from the data files — the log's per-file partitionValues
+                // is the authoritative source (paths are opaque; the presence probe would otherwise
+                // NULL-backfill them like schema evolution). Keys are PHYSICAL under column mapping
+                // (new commits) or logical (old EW commits) — dual lookup, sentinel/missing => NULL.
+                string? pv = LookupPartitionValue(f.PartitionValues, c, stored);
+                expr = pv is null
+                    ? $"CAST(NULL AS {TypeText(field.Type)})"
+                    : $"CAST('{pv.Replace("'", "''")}' AS {TypeText(field.Type)})";
+                needsInner = true;
+            }
+            else if (field is not null && !Present(field, stored, fm))
             {
                 expr = $"CAST(NULL AS {TypeText(field.Type)})";
                 needsInner = true;
@@ -256,7 +300,8 @@ internal static class DeltaNativeReader
         {
             var probeFile = new DeltaReader.NativeScanFile(0, probe, System.Array.Empty<long>());
             var sql = FileSql(dataCols, wantRowId, where: null, probeFile,
-                              ResolveFileMapping(listing, probe), listing.TableSchema) + " LIMIT 0";
+                              ResolveFileMapping(listing, probe), listing.TableSchema,
+                              listing.PartitionColumns) + " LIMIT 0";
             using var s = Host.Query(sql);
             // Nested mapped fields: the probed schema carries physical struct-child names — rename to logical
             // (top level is already logical via the SELECT alias; the transform passes it through).
@@ -312,7 +357,8 @@ internal static class DeltaNativeReader
                         try
                         {
                             var sql = FileSql(dataCols, wantRowId, where, file,
-                                              ResolveFileMapping(listing, file.Uri), listing.TableSchema);
+                                              ResolveFileMapping(listing, file.Uri), listing.TableSchema,
+                                              listing.PartitionColumns);
                             Log.LogDebug("delta native file: {Sql}", sql);
                             using var s = Host.Query(sql);
                             while (true)
@@ -517,7 +563,7 @@ internal static class DeltaNativeReader
 
     // The DuckDB type text for a Delta type — the CAST target for schema-evolution NULL backfill. Struct
     // member names are the LOGICAL names (matching the rebuilt/renamed output convention).
-    private static string TypeText(DeltaSchema.DeltaDataType type) => type switch
+    internal static string TypeText(DeltaSchema.DeltaDataType type) => type switch
     {
         DeltaSchema.PrimitiveType pt => pt.TypeName switch
         {

@@ -58,13 +58,20 @@ internal static class DeltaReader
     /// (matching engineered-wood's <c>OrderedActiveFiles</c> so a `(Ordinal&lt;&lt;40)|file_row_number` rowid
     /// round-trips to <c>DeleteByRowIdsAsync</c>), the readable <paramref name="Uri"/> (onelake:// for OneLake),
     /// and the sorted deleted row positions <paramref name="Dv"/> (empty = no DV).</summary>
-    public sealed record NativeScanFile(int Ordinal, string Uri, long[] Dv);
+    public sealed record NativeScanFile(int Ordinal, string Uri, long[] Dv,
+                                        IReadOnlyDictionary<string, string>? PartitionValues = null);
 
     /// <summary>The result of <see cref="ListNativeScanFiles"/>: the resolved snapshot <see cref="Version"/>, the
     /// surviving (post-prune) <see cref="Files"/> in path-sorted global-ordinal order, and <see cref="AnyUri"/> =
     /// any active file's URI (pre-prune) for a schema probe when everything was pruned.</summary>
     public sealed class NativeScanList
     {
+        /// <summary>The table's partition columns (LOGICAL names — metaData.partitionColumns). The
+        /// per-file SQL emits each file's partitionValues as typed literals for them: a partition
+        /// column is ABSENT from the data files, and the log is the authoritative source (paths are
+        /// opaque — never parsed).</summary>
+        public IReadOnlyList<string> PartitionColumns { get; init; } = System.Array.Empty<string>();
+
         public long Version { get; init; }
         public IReadOnlyList<NativeScanFile> Files { get; init; } = System.Array.Empty<NativeScanFile>();
         public string? AnyUri { get; init; }
@@ -171,7 +178,8 @@ internal static class DeltaReader
                     dv = deleted.ToArray();
                     System.Array.Sort(dv);
                 }
-                files.Add(new NativeScanFile(ordinal, uri, dv));
+                files.Add(new NativeScanFile(ordinal, uri, dv,
+                    add.PartitionValues is { Count: > 0 } ? add.PartitionValues : null));
             }
             // Column-mapping tables store columns decoupled from the logical name — capture the mapping (from THIS
             // snapshot's schema, so time travel to a pre-rename version maps correctly) so the native reader can
@@ -215,7 +223,8 @@ internal static class DeltaReader
                 path, snap.Version, ordered.Count, files.Count, pruned, mode);
             return new NativeScanList
             {
-                Version = snap.Version, Files = files, AnyUri = anyUri,
+                Version = snap.Version,
+                PartitionColumns = snap.Metadata.PartitionColumns, Files = files, AnyUri = anyUri,
                 LogicalToPhysical = logicalToPhysical, LogicalToFieldId = logicalToFieldId,
                 MappedSchema = mappedSchema, TableSchema = schemaForMaps,
             };

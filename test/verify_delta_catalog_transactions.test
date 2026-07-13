@@ -2809,3 +2809,168 @@ SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_dbtswap_n/m__dbt_tmp/
 
 statement ok
 DETACH dwn;
+
+# ============================================================================
+# 39. Partitioned pending CTAS STREAMS (native_write): Hive layout on storage
+#     before COMMIT; read-back renders per-file partitionValues as literals
+# ============================================================================
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_partctas' AS pc (TYPE arrownet, PROVIDER 'delta', native_write true);
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE pc.main.pt PARTITIONED BY (region) AS
+  SELECT i AS id, CASE i % 3 WHEN 0 THEN 'US' WHEN 1 THEN 'EU' ELSE 'APAC' END AS region
+  FROM range(1, 301) r(i);
+
+# streamed: Hive partition dirs on storage, NO _delta_log yet
+query I
+SELECT count(*) > 0 FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_partctas/pt/*/*.parquet');
+----
+true
+
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_partctas/pt/_delta_log/*.json');
+----
+0
+
+# read-your-writes INCLUDING the partition column (typed literals from partitionValues)
+query I
+SELECT count(*) FROM pc.main.pt;
+----
+300
+
+query TI
+SELECT region, count(*) FROM pc.main.pt GROUP BY region ORDER BY region;
+----
+APAC	100
+EU	100
+US	100
+
+query I
+SELECT count(*) FROM pc.main.pt WHERE region = 'EU' AND id % 3 = 1;
+----
+100
+
+statement ok
+COMMIT;
+
+# v0 CREATE (partitioned, pre-assigned mapping) + ONE write commit
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_partctas/pt/_delta_log/*.json');
+----
+2
+
+query TI
+SELECT region, count(*) FROM pc.main.pt GROUP BY region ORDER BY region;
+----
+APAC	100
+EU	100
+US	100
+
+query IT
+SELECT id, region FROM pc.main.pt WHERE id = 7;
+----
+7	EU
+
+statement ok
+DETACH pc;
+
+# ============================================================================
+# 40. Buffered IDENTITY create: CREATE (marked) + INSERTs in one transaction —
+#     values generated at statement time from the parked schema (chained),
+#     the flush bakes the final high-water mark into commit-0
+# ============================================================================
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_ident2' AS ic (TYPE arrownet, PROVIDER 'delta');
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE ic.main.t (id BIGINT AS (0), v VARCHAR);
+
+# nothing on storage before COMMIT (the identity create is now transactional)
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_ident2/t/_delta_log/*.json');
+----
+0
+
+statement ok
+INSERT INTO ic.main.t (v) VALUES ('a'), ('b');
+
+# read-your-writes shows REAL engine-assigned ids
+query I
+SELECT count(DISTINCT id) FROM ic.main.t;
+----
+2
+
+query I
+SELECT count(*) FROM ic.main.t WHERE id IS NULL;
+----
+0
+
+# a second statement chains the pending mark — no duplicates
+statement ok
+INSERT INTO ic.main.t (v) VALUES ('c');
+
+query I
+SELECT count(DISTINCT id) FROM ic.main.t;
+----
+3
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(DISTINCT id) FROM ic.main.t;
+----
+3
+
+query I
+SELECT max(id) FROM ic.main.t;
+----
+3
+
+# the baked high-water mark continues in a later autocommit insert (no id reuse)
+statement ok
+INSERT INTO ic.main.t (v) VALUES ('d');
+
+query I
+SELECT count(DISTINCT id) FROM ic.main.t;
+----
+4
+
+query I
+SELECT max(id) FROM ic.main.t;
+----
+4
+
+# ROLLBACK leaves nothing (the create never touched storage)
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE ic.main.doomed (id BIGINT AS (0), v VARCHAR);
+
+statement ok
+INSERT INTO ic.main.doomed (v) VALUES ('x');
+
+statement ok
+ROLLBACK;
+
+statement error
+SELECT count(*) FROM ic.main.doomed;
+----
+
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_ident2/doomed/_delta_log/*.json');
+----
+0
+
+statement ok
+DETACH ic;
