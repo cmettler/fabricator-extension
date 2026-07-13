@@ -144,6 +144,56 @@ current code still uses the single-provider `mssql_net` naming):
 ## Next up (open threads for future sessions)
 
 In-flight / planned refactors (all C#-only unless noted; tests stay green per slice):
+- **Eager-write DeltaTxnBuffer (PLANNED, analysis 2026-07-13 — nothing built).** Goal: the buffer holds
+  Delta ACTIONS only; data files are ALWAYS written eagerly to storage at statement time (Spark's
+  OptimisticTransaction shape — files land immediately, commit deferred, rollback = invisible orphans for
+  VACUUM). Kills the three RAM-bound shapes (CTAS-in-txn, insert-under-pending-ALTER, UPDATE post-images)
+  and unifies the read overlays. Slices, each independently shippable
+  (`verify_delta_catalog_transactions` is the gate):
+  - **A (no EW change):** (1) eager UPDATE post-images — write them as a parquet file at statement time
+    (merge-on-read shape with a deferred commit: park DV positions + the post-image `WrittenDataFile`);
+    (2) thread a pending-metadata override into `TryWriteStreaming` (projection/FIELD_IDS/stats schema
+    from the PENDING schema — `WriteDataFilesAsync(schemaOverride:)` already exists for the collect path)
+    so insert-under-pending-ALTER STREAMS.
+  - **B (small EW seam):** write-files-WITHOUT-snapshot (the streaming write half taking
+    (fs, root, pendingMetadata, options) instead of `CurrentSnapshot` — mapping ids are pre-assigned in
+    the parked CREATE metadata, `AssignColumnMapping` is deterministic) → CTAS-in-txn streams eagerly;
+    rollback leaves orphan parquet in a `_delta_log`-less folder (not a table to any reader; harmless).
+  - **C (unification — "virtual DeltaTable"):** `DeltaTxnBuffer` becomes a pending ACTION list; reads
+    query a synthetic snapshot = pinned snapshot ⊕ pending actions (EW `SnapshotBuilder` already replays
+    action lists — needs an open-at-synthetic-snapshot entry). Replaces `ProjectPending`/`ExcludeDeleted`/
+    `ReconcileBatch`/`ScanPendingCreated`/`WithPendingDeletes` as special cases. Enables **CDF in
+    transactions** (write `_change_data` files eagerly — the buffered DML has the pre/post rows in hand;
+    park `cdc` actions into the fused commit; rebase-safe: if the rebase succeeds, delete-delete +
+    deleteRead already guarantee our touched files were untouched, so the CDC content stays exact) and
+    optionally lifts the same-txn-DML guard (a pending `add` can legally carry a DV, so DELETE/UPDATE of
+    same-txn inserts becomes representable). **Codec catalogs go eager-per-statement** via
+    `WriteDataFilesAsync` at statement end — memory caps at ONE statement (the codec's autocommit
+    profile; root cause of codec collect = EW's parquet writer has no streaming input, only DuckDB's COPY
+    consumes the live channel — a streaming EW writer is deliberately NOT pursued).
+  - **D (S3 multi-writer commits — our own conditional PUT):** httpfs never passes `If-None-Match`, so S3
+    is documented single-writer; S3 has real conditional PUTs (late 2024) and **EW already ships the
+    code**: `EngineeredWood.Aws.S3TableFileSystem.RenameAsync` = server-side copy with
+    `If-None-Match:"*"` (412 → false → `DeltaConflictException`) — exactly the put-if-absent commit
+    primitive. Wiring: Bridge references `EngineeredWood.Aws` (AWSSDK.S3, publish grows accordingly);
+    for `s3://` roots either swap the whole EW-side `ITableFileSystem` or (leaner, recommended) a hybrid
+    wrapper delegating everything to `DuckDbTableFileSystem` EXCEPT `RenameAsync` → the SDK conditional
+    copy (keeps opener-resolved secrets + host caching for data IO; CopyObject is server-side so the temp
+    object is readable). Credentials: resolve the DuckDB **s3 secret** (key_id/secret/endpoint/region/
+    url_style/use_ssl) — via the ATTACH `SECRET` v39 marker like OneLake's SP, else scope-match from the
+    opener, else the SDK default chain; MinIO needs `ServiceURL` + `ForcePathStyle` — so the secret's
+    **`URL_STYLE 'path'`** must map to `ForcePathStyle=true` (vhost default otherwise). MinIO supports
+    If-None-Match (2024+) → the docker rig can pin the race: two concurrent committers → exactly one
+    wins, loser rebases. Outcome: S3 moves from single-writer to safe multi-process/multi-engine.
+    **The deltars provider gets the same for free via storage_options**: delta-rs enables native S3
+    conditional-put locking with `conditional_put: "etag"` (no DynamoDB `AWS_S3_LOCKING_PROVIDER`
+    needed) — add it to `DeltaRsCatalog`'s `storage_options` when S3 discovery lands.
+  - **Stays immediate:** identity creates (value generation + HWM update are coupled inside EW's
+    committing writer — `WriteDataFilesAsync` rejects identity tables by design), DROP/OPTIMIZE/VACUUM
+    (physical/administrative — no rollback semantics possible). CREATE-OR-REPLACE + partition-overwrite
+    are REPRESENTABLE as actions later (snapshot-tied removes: delete-delete guards them; needs
+    whole-table-read recording, and note Spark's WriteSerializable permits the concurrent-blind-append
+    reorder past an overwrite) — keep guarded until after slice C.
 - **Sync-over-async cleanup (Bridge) — ENABLER DONE (`0533eb7`), refactor DEFERRED.** The Bridge blocks the
   C++↔C# boundary with `.GetAwaiter().GetResult()` sprinkled at every `await` site. This is **correct + safe**
   here (the hostfxr CLR has NO `SynchronizationContext`, so sync-over-async can't deadlock; the ABI is
