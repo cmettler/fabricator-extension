@@ -39,6 +39,13 @@ internal static class TableFileSystems
         {
             return new OneLakeDataLakeFileSystem(path, cred);
         }
+        // s3:// with a commit credential in scope: the hybrid FS — host-FS data IO, AWS-SDK
+        // conditional-PUT commit rename (real put-if-absent; httpfs's is unguarded on S3).
+        var s3 = AmbientS3Credential.Current;
+        if (s3 is not null && path.TrimStart().StartsWith("s3://", System.StringComparison.OrdinalIgnoreCase))
+        {
+            return new S3CommitFileSystem(new DuckDbTableFileSystem(opener, path), path, s3);
+        }
         return new DuckDbTableFileSystem(opener, path);
     }
 }

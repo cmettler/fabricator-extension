@@ -58,6 +58,14 @@ public sealed class DeltaBackend : IBackend
         {
             return FabricLakehouse.AppendCredMarker(baseConnString, fields);
         }
+        // An s3 secret on an s3:// ATTACH: carry its fields so the commit rename runs a REAL
+        // conditional PUT through the AWS SDK (httpfs never passes If-None-Match — without this,
+        // S3 catalogs are single-writer). Data IO stays on the host-FS/opener path.
+        if (secretType.Equals("s3", System.StringComparison.OrdinalIgnoreCase)
+            && baseConnString.TrimStart().StartsWith("s3://", System.StringComparison.OrdinalIgnoreCase))
+        {
+            return S3CommitCredential.AppendMarker(baseConnString, fields);
+        }
         return baseConnString;
     }
 
@@ -82,6 +90,9 @@ public sealed class DeltaCatalog : IBackendCatalog
     // tables (and, for a schema-enabled lakehouse, an Entra SQL token). Null for local/S3/ADLS (glob discovery)
     // or when no secret was supplied.
     private readonly Azure.Core.TokenCredential? _fabricCredential;
+    // For an s3:// root ATTACHed with an s3 SECRET: the commit-rename conditional-PUT credential
+    // (multi-writer safety). Null => host-FS rename (single-writer, the documented httpfs caveat).
+    private readonly S3CommitCredential? _s3Credential;
     // Lazily-resolved OneLake shape (schema-enabled flag + discovered tables); null for non-OneLake roots.
     private FabricLakehouse.OneLakeInfo? _oneLake;
     private bool _oneLakeResolved;
@@ -181,6 +192,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     public DeltaCatalog(string root, string? optionsJson)
     {
         var (clean, credential) = FabricLakehouse.Extract(root);
+        (clean, _s3Credential) = S3CommitCredential.Extract(clean);
         _root = Normalize(clean).TrimEnd('/');
         _fabricCredential = credential;
         // Deletion vectors are the DEFAULT DML mode (the modern Delta standard: DELETE marks rows in a DV bitmap
@@ -236,6 +248,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     private nint Opener()
     {
         AmbientOneLakeCredential.Current = _fabricCredential;
+        AmbientS3Credential.Current = _s3Credential;
         return AmbientOpener.Current;
     }
 

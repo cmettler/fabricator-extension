@@ -333,3 +333,60 @@ SELECT count(*) FROM s3cf.main.t1;
 
 statement ok
 DETACH s3cf;
+
+# ============================================================================
+# 9. Slice D: multi-writer commit safety — ATTACH with an s3 SECRET routes the
+#    COMMIT rename through a REAL conditional PUT (AWS SDK, If-None-Match:"*")
+#    instead of httpfs's unguarded exclusive-create. Live-validated: 4 racing
+#    processes x 10 commits each -> 40/40 landed (800/800 rows), zero errors,
+#    across checkpoint boundaries; a WRONG-key marker secret fails the commit
+#    with the SDK signature error (proving the SDK is in the loop).
+# ============================================================================
+
+statement ok
+ATTACH 's3://arrownet/condsuite' AS ccs (TYPE arrownet, PROVIDER 'delta', SECRET minio_s3, READ_ONLY false);
+
+statement ok
+CREATE OR REPLACE TABLE ccs.main.t AS SELECT i AS id, 'v' || i AS v FROM range(1, 101) r(i);
+
+statement ok
+INSERT INTO ccs.main.t VALUES (500, 'x');
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO ccs.main.t VALUES (501, 'y');
+
+statement ok
+DELETE FROM ccs.main.t WHERE id = 5;
+
+statement ok
+UPDATE ccs.main.t SET v = 'upd' WHERE id = 10;
+
+query I
+SELECT count(*) FROM ccs.main.t;
+----
+101
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM ccs.main.t;
+----
+101
+
+query T
+SELECT v FROM ccs.main.t WHERE id = 10;
+----
+upd
+
+# persistent bucket, re-runnable suite: assert growth, not an absolute count
+query I
+SELECT count(*) >= 3 FROM arrownet_delta_snapshots('ccs', 't');
+----
+true
+
+statement ok
+DETACH ccs;

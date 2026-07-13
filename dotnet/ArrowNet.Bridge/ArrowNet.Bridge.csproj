@@ -39,6 +39,9 @@
          DROP TABLE (DuckDB's azure FileSystem has no RemoveDirectory). The Fabric API is kept only for the
          schema-enabled flag (GetLakehouse.DefaultSchema) + name->GUID resolution. Same SP credential throughout. -->
     <PackageReference Include="Azure.Storage.Files.DataLake" Version="12.21.0" />
+    <!-- S3 conditional-PUT commit rename (multi-writer Delta commits on S3/MinIO; httpfs's
+         exclusive-create is unguarded there) — see S3CommitFileSystem. -->
+    <PackageReference Include="AWSSDK.S3" Version="4.*" />
     <!-- Microsoft.Data.SqlClient: the SQL Server backend (ArrowNet.SqlServer) + the DAX SQL-endpoint path. The
          Delta provider no longer uses it (OneLake discovery moved to the DFS endpoint above). -->
     <PackageReference Include="Microsoft.Data.SqlClient" Version="6.0.2" />

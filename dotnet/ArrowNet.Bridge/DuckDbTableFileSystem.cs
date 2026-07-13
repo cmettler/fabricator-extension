@@ -109,24 +109,42 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
 
     public ValueTask<byte[]> ReadAllBytesAsync(string path, CancellationToken cancellationToken = default)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        nint file = HostFs.OpenRead(_opener, Resolve(path));
-        try
+        // Bounded reopen-retry for MUTABLE small files (this method's callers: _last_checkpoint +
+        // commit JSONs; only _last_checkpoint is overwritten in place). On an object store, DuckDB's
+        // httpfs validates the etag recorded at open against the range read — a CONCURRENT writer's
+        // checkpoint changes it mid-read and the read throws ("ETag on reading file ... has changed").
+        // Reopening reads a consistent NEWER copy, which is always valid for a checkpoint pointer.
+        // Data files are immutable (a new commit writes a new file), so they never hit this.
+        for (int attempt = 1; ; attempt++)
         {
-            long size = HostFs.Size(file);
-            var buffer = new byte[size];
-            if (size > 0)
+            cancellationToken.ThrowIfCancellationRequested();
+            try
             {
-                fixed (byte* bp = buffer)
+                nint file = HostFs.OpenRead(_opener, Resolve(path));
+                try
                 {
-                    HostFs.Read(file, bp, size, 0);
+                    long size = HostFs.Size(file);
+                    var buffer = new byte[size];
+                    if (size > 0)
+                    {
+                        fixed (byte* bp = buffer)
+                        {
+                            HostFs.Read(file, bp, size, 0);
+                        }
+                    }
+                    return new ValueTask<byte[]>(buffer);
+                }
+                finally
+                {
+                    HostFs.Close(file);
                 }
             }
-            return new ValueTask<byte[]>(buffer);
-        }
-        finally
-        {
-            HostFs.Close(file);
+            catch (Exception ex) when (attempt < 4
+                                       && ex.Message.Contains("ETag on reading file",
+                                                              StringComparison.OrdinalIgnoreCase))
+            {
+                // concurrent in-place overwrite — reopen for a consistent newer copy
+            }
         }
     }
 

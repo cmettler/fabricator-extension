@@ -287,20 +287,33 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     position parking, the flush's DV split, the same-txn-DML routing). The overlay composition IS the
     virtual table, with the ordinal spaces disjoint by construction (recorded on ScanCodec's doc
     comment). Gate: transactions 861 unchanged + the FULL delta sweep (36 suites) green.
-  - **D (S3 multi-writer commits — our own conditional PUT):** httpfs never passes `If-None-Match`, so S3
-    is documented single-writer; S3 has real conditional PUTs (late 2024) and **EW already ships the
-    code**: `EngineeredWood.Aws.S3TableFileSystem.RenameAsync` = server-side copy with
-    `If-None-Match:"*"` (412 → false → `DeltaConflictException`) — exactly the put-if-absent commit
-    primitive. Wiring: Bridge references `EngineeredWood.Aws` (AWSSDK.S3, publish grows accordingly);
-    for `s3://` roots either swap the whole EW-side `ITableFileSystem` or (leaner, recommended) a hybrid
-    wrapper delegating everything to `DuckDbTableFileSystem` EXCEPT `RenameAsync` → the SDK conditional
-    copy (keeps opener-resolved secrets + host caching for data IO; CopyObject is server-side so the temp
-    object is readable). Credentials: resolve the DuckDB **s3 secret** (key_id/secret/endpoint/region/
-    url_style/use_ssl) — via the ATTACH `SECRET` v39 marker like OneLake's SP, else scope-match from the
-    opener, else the SDK default chain; MinIO needs `ServiceURL` + `ForcePathStyle` — so the secret's
-    **`URL_STYLE 'path'`** must map to `ForcePathStyle=true` (vhost default otherwise). MinIO supports
-    If-None-Match (2024+) → the docker rig can pin the race: two concurrent committers → exactly one
-    wins, loser rebases. Outcome: S3 moves from single-writer to safe multi-process/multi-engine.
+  - **D — DONE (2026-07-13): S3 MULTI-WRITER COMMITS via our own conditional PUT.** httpfs never passes
+    `If-None-Match`, so plain-ATTACH S3 stays documented single-writer; **ATTACH with an s3 `SECRET`**
+    (`ATTACH 's3://…' (…, PROVIDER 'delta', SECRET minio_s3, READ_ONLY false)`) routes the COMMIT rename
+    through a REAL put-if-absent: new Bridge `S3CommitFileSystem` (S3CommitFileSystem.cs) — the HYBRID
+    FS: all data IO delegates to `DuckDbTableFileSystem` (opener secrets, host transport/caching), but
+    `RenameAsync` = SDK **GetObject(temp) → PutObject(target, If-None-Match:"*") → Delete(temp)** (412 →
+    false → `DeltaConflictException` → the OCC/rebase machinery). **CRITICAL PROBE FINDING: a
+    conditional CopyObject is SILENTLY UNGUARDED on MinIO** (the copy succeeds over an existing target —
+    AWS's documented conditional writes are PutObject/CompleteMultipartUpload only), so EW's
+    `S3TableFileSystem.RenameAsync` copy-based primitive gave NO commit safety — **fixed in EW** to the
+    same Get→conditional-Put→Delete shape. Wiring mirrors OneLake: `DeltaBackend.BuildConnectionString`
+    s3-secret branch → `S3CommitCredential.AppendMarker` (`;ArrowNetS3Cred=`) → catalog `_s3Credential`
+    → `Opener()` publishes `AmbientS3Credential` → `TableFileSystems.Create` wraps s3:// roots.
+    Credential mapping: key_id/secret/session_token/endpoint/region; `URL_STYLE 'path'` →
+    `ForcePathStyle`; `USE_SSL`; a CUSTOM endpoint tolerates self-signed certs (the rig posture — AWS
+    default endpoint keeps full validation); empty key_id → the SDK default chain. **Second finding:
+    `S3CommitFileSystem.ReadAllBytesAsync` goes through the SDK too** — httpfs pins the etag recorded at
+    open (and re-serves it from its caches), so a concurrent writer's IN-PLACE `_last_checkpoint`
+    overwrite failed host reads with "ETag … has changed" EVEN ACROSS REOPENS; a plain GetObject always
+    returns a consistent copy (small files only — data files stay host-path: immutable + cache-friendly;
+    a bounded etag-retry also went into `DuckDbTableFileSystem.ReadAllBytesAsync` for the secretless
+    path). **VALIDATED LIVE on MinIO:** 4 racing processes × 10 commits × 20 rows → **40/40 commits,
+    800/800 rows, zero errors, across 4 checkpoint boundaries** (before the SDK-reads fix: loud
+    checkpoint-read failures, NO silent loss — the guard held); a WRONG-key marker secret fails the
+    commit with the SDK signature error while data IO succeeds (proving the SDK is in the loop);
+    `verify_delta_catalog_s3.test` §9 (144 — SECRET-route lifecycle incl. fused txn; secretless
+    sections unchanged). Outcome: S3 catalogs with a SECRET are safe multi-process/multi-engine.
     **The deltars provider gets the same for free via storage_options**: delta-rs enables native S3
     conditional-put locking with `conditional_put: "etag"` (no DynamoDB `AWS_S3_LOCKING_PROVIDER`
     needed) — add it to `DeltaRsCatalog`'s `storage_options` when S3 discovery lands.
