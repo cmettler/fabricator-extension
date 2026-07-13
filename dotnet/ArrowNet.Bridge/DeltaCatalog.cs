@@ -2125,6 +2125,9 @@ public sealed class DeltaCatalog : IBackendCatalog
     // buffered streamed files at 0x780000) — buffered DML can only target COMMITTED rows (modifying rows
     // inserted in the same transaction is a later slice).
     private const long PendingOrdinalBase = 0x700000;
+    // Pending eagerly-written FILES enter the native per-file scan with ordinals 0x780000+idx (idx =
+    // index into pending.Files) — same-transaction DELETEs of their rows key DeletedByOrdinal there.
+    private const long PendingFileOrdinalBase = 0x780000;
     private const long RowIdPosMask = (1L << RowIdPositionBits) - 1;
 
     // Eligibility for buffered (explicit-transaction) DML. Never silently non-atomic: an ineligible shape
@@ -2203,11 +2206,35 @@ public sealed class DeltaCatalog : IBackendCatalog
         foreach (var rid in ids)
         {
             long ordinal = rid >> RowIdPositionBits;
-            if (ordinal >= PendingOrdinalBase)
+            if (ordinal >= PendingOrdinalBase && ordinal < PendingFileOrdinalBase)
             {
+                // In-memory pending BATCH rows (identity-under-ALTER / iceberg fallbacks) — practically
+                // unreachable on DML-eligible tables now that appends eager-write to files.
                 throw new System.NotSupportedException(
                     $"delta: {(forUpdate ? "UPDATE" : "DELETE")} of rows inserted in the same transaction "
                     + "is not supported yet — COMMIT the inserts first.");
+            }
+            if (ordinal >= PendingFileOrdinalBase)
+            {
+                // Same-transaction DML lift (C3): the row lives in one of THIS transaction's eagerly
+                // written pending files — its add will be born with an inline deletion vector at flush.
+                // The 0x780000+idx ordinal keys slot straight into DeletedByOrdinal: the native reader's
+                // pending-file exclusion matches them, and the flush splits them off to
+                // CommitDataFilesAsync(deletedPositionsByFileIndex). CDF is guarded (the insert-cdc
+                // file was already written with the row); UPDATE of pending rows stays guarded.
+                if (forUpdate)
+                {
+                    throw new System.NotSupportedException(
+                        "delta: UPDATE of rows inserted in the same transaction is not supported yet — "
+                        + "COMMIT the inserts first.");
+                }
+                if (pending.CdfEnabled == true || profile.CdfEnabled)
+                {
+                    throw new System.NotSupportedException(
+                        "delta: DELETE of rows inserted in the same transaction is not supported on a "
+                        + "Change-Data-Feed table (their insert was already captured in the feed) — "
+                        + "COMMIT the inserts first.");
+                }
             }
             if (!pending.DeletedByOrdinal.TryGetValue((int)ordinal, out var set))
             {
@@ -2600,14 +2627,30 @@ public sealed class DeltaCatalog : IBackendCatalog
                         schemaOverride: pending.PendingDeltaSchema)
                     .AsTask().GetAwaiter().GetResult());
             }
+            // Split the delete set: committed-file ordinals resolve against the PINNED snapshot
+            // (remove+add DV pairs); pending-file ordinals (0x780000+idx, this transaction's own eager
+            // files) become inline DVs BORN ON their adds at commit — the rows never reach any
+            // committed version.
             var deletes = new Dictionary<int, IReadOnlyCollection<long>>(pending.DeletedByOrdinal.Count);
+            Dictionary<int, IReadOnlyCollection<long>>? pendingFileDeletes = null;
+            long pendingRowsDeleted = 0;
             foreach (var kv in pending.DeletedByOrdinal)
             {
-                deletes[kv.Key] = kv.Value;
+                if (kv.Key >= PendingFileOrdinalBase)
+                {
+                    pendingFileDeletes ??= new Dictionary<int, IReadOnlyCollection<long>>();
+                    pendingFileDeletes[kv.Key - (int)PendingFileOrdinalBase] = kv.Value;
+                    pendingRowsDeleted += kv.Value.Count;
+                }
+                else
+                {
+                    deletes[kv.Key] = kv.Value;
+                }
             }
             var (dvActions, rowsDeleted) = table.ComputeDeletionVectorActionsAsync(deletes,
                     resolveAgainst: pinnedSnap)
                 .AsTask().GetAwaiter().GetResult();
+            rowsDeleted += pendingRowsDeleted;
             // The buffered schema change (metaData + merged protocol upgrade) joins the SAME commit.
             // Eagerly-generated identity high-water marks compose INTO that metaData action (a commit
             // must not carry two metaData actions) — or form their own when there is no buffered ALTER.
@@ -2711,7 +2754,8 @@ public sealed class DeltaCatalog : IBackendCatalog
                     long v = table.CommitDataFilesAsync(files, DeltaWriteMode.Append, cancellationToken: default,
                             extraActions: extra, expectedVersion: table.CurrentSnapshot.Version,
                             operation: operation,
-                            identityValuesPreGenerated: pending.PendingIdentityHwm.Count > 0)
+                            identityValuesPreGenerated: pending.PendingIdentityHwm.Count > 0,
+                            deletedPositionsByFileIndex: pendingFileDeletes)
                         .AsTask().GetAwaiter().GetResult();
                     _log.LogInformation(
                         "delta txn {Txn} commit {Path}: v{Version} op={Op} (files={Files}, rows+={Rows}, rows-={Deleted})",

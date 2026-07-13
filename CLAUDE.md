@@ -257,13 +257,25 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     resolution. §36 pins it with a two-connection racer (three appends land between pin and UPDATE;
     the correct pre-image is captured deterministically — previously luck-of-the-uuid-sort);
     `verify_delta_catalog_transactions` now 805.
-  - **C3 (virtual-snapshot unification) — DEFERRED, now a REFACTOR not a capability:** with A/B/C1/C2
-    the buffer already IS "actions + positions" (batches remain only in the narrow fallbacks above).
-    Remaining value: collapse `ProjectPending`/`ExcludeDeleted`/`ReconcileBatch`/`ScanPendingCreated`/
-    `WithPendingDeletes` into one synthetic snapshot (pinned ⊕ pending actions via EW `SnapshotBuilder`
-    replay + an open-at-synthetic-snapshot entry) and lift the same-txn-DML guard (a pending `add` can
-    legally carry a DV). Organizational payoff against a 732-assertion-pinned working subsystem — do it
-    as its own pass, not incrementally.
+  - **C3 same-txn-DML lift — DONE (2026-07-13): DELETE of rows inserted in the SAME transaction.**
+    The eager-write architecture made it cheap: all DML-eligible tables park FILES now, so a
+    same-transaction delete = an inline deletion vector BORN ON our own pending add. Routing: rowid
+    ordinals ≥ `PendingFileOrdinalBase` (0x780000, = index into `pending.Files`) key straight into
+    `DeletedByOrdinal` — the native reader's pending-file exclusion (`WithPendingDeletes` matches by
+    ordinal, and pending files carry 0x780000+idx) serves read-your-writes with ZERO new read code; the
+    flush splits high keys off to the new EW
+    `CommitDataFilesAsync(deletedPositionsByFileIndex:)` (builds the inline DV via
+    `DeletionVectorWriter.CreateAsync` + marks the add's stats `tightBounds:false` via the existing
+    `StatsWithLooseBounds`) while committed-ordinal keys keep the pinned-snapshot DV-pair path. Mixed
+    committed+pending deletes in one statement work. Still guarded (clean errors): UPDATE of same-txn
+    rows; same-txn DELETE on CDF tables (the insert-cdc file already captured the row); in-memory
+    BATCH rows (0x700000..0x77ffff — the identity-under-ALTER/iceberg fallbacks, practically
+    unreachable). Buffered DML's DvEnabled requirement covers the add-DV's reader-v3 need. §37 (+ the
+    old "rejected (later slice)" pin converted positive): codec + native_write catalogs, partial +
+    mixed deletes, rollback discards both halves, guards — `verify_delta_catalog_transactions` now
+    861; **delta-kernel reads the born-with-DV add exactly** (9 rows, deleted ids absent). The
+    virtual-snapshot READ unification (collapse ProjectPending/ExcludeDeleted/ReconcileBatch/
+    ScanPendingCreated into a synthetic pinned⊕pending snapshot) remains a deferred pure refactor.
   - **D (S3 multi-writer commits — our own conditional PUT):** httpfs never passes `If-None-Match`, so S3
     is documented single-writer; S3 has real conditional PUTs (late 2024) and **EW already ships the
     code**: `EngineeredWood.Aws.S3TableFileSystem.RenameAsync` = server-side copy with

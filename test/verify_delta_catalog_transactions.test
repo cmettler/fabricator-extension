@@ -331,17 +331,21 @@ uncommitted buffered changes
 statement ok
 ROLLBACK;
 
-# DELETE of a row inserted in the SAME transaction is rejected (later slice).
+# DELETE of a row inserted in the SAME transaction now WORKS (C3 lift — the pending file's add is
+# born with an inline DV; full coverage in section 37).
 statement ok
 BEGIN;
 
 statement ok
 INSERT INTO lake.main.t VALUES (9, 'fresh');
 
-statement error
+statement ok
 DELETE FROM lake.main.t WHERE id = 9;
+
+query I
+SELECT count(*) FROM lake.main.t WHERE id = 9;
 ----
-inserted in the same transaction
+0
 
 statement ok
 ROLLBACK;
@@ -2531,3 +2535,173 @@ SELECT id, v FROM vr.main.vrt ORDER BY id;
 
 statement ok
 DETACH vr;
+
+# ============================================================================
+# 37. Same-transaction DML lift (C3): DELETE of rows inserted in THIS
+#     transaction — the pending file's add is born with an inline DV
+# ============================================================================
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_selfdml' AS sd (TYPE arrownet, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE sd.main.t (id INTEGER, v VARCHAR);
+
+statement ok
+INSERT INTO sd.main.t VALUES (1, 'committed1'), (2, 'committed2');
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO sd.main.t SELECT i, 'pending' || i FROM range(10, 20) AS r(i);
+
+query I
+SELECT count(*) FROM sd.main.t;
+----
+12
+
+# delete SOME of the rows inserted in this very transaction
+statement ok
+DELETE FROM sd.main.t WHERE id IN (12, 14, 16);
+
+query I
+SELECT count(*) FROM sd.main.t;
+----
+9
+
+# and a MIXED delete: one committed row + one pending row in the same statement
+statement ok
+DELETE FROM sd.main.t WHERE id IN (2, 18);
+
+query I
+SELECT count(*) FROM sd.main.t;
+----
+7
+
+query I
+SELECT min(id) FROM sd.main.t WHERE id >= 10;
+----
+10
+
+statement ok
+COMMIT;
+
+# ONE fused commit; the deleted pending rows never reached any committed version
+query IT
+SELECT id, v FROM sd.main.t ORDER BY id;
+----
+1	committed1
+10	pending10
+11	pending11
+13	pending13
+15	pending15
+17	pending17
+19	pending19
+
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('sd', 't');
+----
+3
+
+# rollback: pending inserts AND their same-txn deletes discard together
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO sd.main.t VALUES (100, 'x'), (101, 'y');
+
+statement ok
+DELETE FROM sd.main.t WHERE id = 100;
+
+query I
+SELECT count(*) FROM sd.main.t;
+----
+8
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM sd.main.t;
+----
+7
+
+# UPDATE of same-txn rows stays guarded
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO sd.main.t VALUES (200, 'p');
+
+statement error
+UPDATE sd.main.t SET v = 'q' WHERE id = 200;
+----
+COMMIT the inserts first
+
+statement ok
+ROLLBACK;
+
+statement ok
+DETACH sd;
+
+# same-txn DELETE on a native_write catalog (streamed pending file)
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_selfdml_n' AS sdn (TYPE arrownet, PROVIDER 'delta', native_write true);
+
+statement ok
+CREATE TABLE sdn.main.t (id INTEGER, v VARCHAR);
+
+statement ok
+INSERT INTO sdn.main.t VALUES (1, 'seed');
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO sdn.main.t SELECT i, 'p' || i FROM range(10, 1010) AS r(i);
+
+statement ok
+DELETE FROM sdn.main.t WHERE id % 2 = 0 AND id >= 10;
+
+query I
+SELECT count(*) FROM sdn.main.t;
+----
+501
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM sdn.main.t;
+----
+501
+
+query I
+SELECT count(*) FROM sdn.main.t WHERE id % 2 = 0 AND id >= 10;
+----
+0
+
+statement ok
+DETACH sdn;
+
+# CDF tables: same-txn DELETE rejected (the insert-cdc already captured the row)
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_cdf2' AS sdc (TYPE arrownet, PROVIDER 'delta', change_data_feed true);
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO sdc.main.t VALUES (500, 'cdcpend');
+
+statement error
+DELETE FROM sdc.main.t WHERE id = 500;
+----
+COMMIT the inserts first
+
+statement ok
+ROLLBACK;
+
+statement ok
+DETACH sdc;
