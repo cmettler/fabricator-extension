@@ -273,9 +273,20 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     unreachable). Buffered DML's DvEnabled requirement covers the add-DV's reader-v3 need. §37 (+ the
     old "rejected (later slice)" pin converted positive): codec + native_write catalogs, partial +
     mixed deletes, rollback discards both halves, guards — `verify_delta_catalog_transactions` now
-    861; **delta-kernel reads the born-with-DV add exactly** (9 rows, deleted ids absent). The
-    virtual-snapshot READ unification (collapse ProjectPending/ExcludeDeleted/ReconcileBatch/
-    ScanPendingCreated into a synthetic pinned⊕pending snapshot) remains a deferred pure refactor.
+    861; **delta-kernel reads the born-with-DV add exactly** (9 rows, deleted ids absent).
+  - **C3 virtual-table refactor — DONE (2026-07-13, behavior-identical):** the codec read paths
+    collapsed into ONE **`ScanCodec`** — the codec-path virtual-table read (pinned base stream ⊕
+    pending-delete exclusion [rowid stream forced when needed] ⊕ pending-ALTER schema/reconcile ⊕
+    pending-batch overlay; every step conditional, so no-pending scans pass straight through).
+    `ScanCodecWithPendingDml` deleted (it was ~80% a copy of ScanTable's tail); shared
+    `SchemaWithRowId` + `TranslateProjectionToCommitted` helpers; net −28 lines. **The EW-synthetic-
+    Snapshot form ("pinned ⊕ pending actions" as a real `Snapshot`) was evaluated and REJECTED on an
+    architectural finding:** EW's `OrderedActiveFiles` path-sorts the WHOLE active set, so uuid-named
+    pending files would interleave into the committed ordinal range and break the transient-rowid
+    contract every layer shares (committed ordinals < 0x700000, pending files at 0x780000+idx — scans,
+    position parking, the flush's DV split, the same-txn-DML routing). The overlay composition IS the
+    virtual table, with the ordinal spaces disjoint by construction (recorded on ScanCodec's doc
+    comment). Gate: transactions 861 unchanged + the FULL delta sweep (36 suites) green.
   - **D (S3 multi-writer commits — our own conditional PUT):** httpfs never passes `If-None-Match`, so S3
     is documented single-writer; S3 has real conditional PUTs (late 2024) and **EW already ships the
     code**: `EngineeredWood.Aws.S3TableFileSystem.RenameAsync` = server-side copy with

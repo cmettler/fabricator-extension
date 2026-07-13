@@ -960,13 +960,6 @@ public sealed class DeltaCatalog : IBackendCatalog
             // a native_write catalog by construction; after COMMIT scans return to the codec path).
             return ScanNative(opener, path, spec, filterVals);
         }
-        if (pendingScan is { DeletedByOrdinal.Count: > 0 })
-        {
-            // Buffered DML read-your-writes on the codec path: stream WITH rowids AT the pinned base
-            // version, drop this transaction's pending-deleted rows, then overlay the pending batches.
-            return ScanCodecWithPendingDml(opener, path, spec, filter, pendingScan);
-        }
-
         // SNAPSHOT ISOLATION (default): inside an explicit transaction, plain codec reads run AT the
         // transaction's pinned version — the instant captured at the transaction's FIRST scan, resolved to
         // a version per table (SnapshotPinning; recorded above, but also consulted directly since a
@@ -979,127 +972,112 @@ public sealed class DeltaCatalog : IBackendCatalog
             pinnedRead = SnapshotPinning.TryGetPinned(scanTxn, path);
         }
         string? pinnedReadValue = pinnedRead?.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        return ScanCodec(opener, path, spec, filter, pendingScan, pinnedReadValue);
+    }
 
+    // The codec-path VIRTUAL-TABLE read: the pinned base stream overlaid with this transaction's
+    // buffered changes — pending DELETEs excluded (the base is forced onto the rowid stream so
+    // positions can be matched), a pending ALTER's schema advertised (projection translated to the
+    // committed names, batches reconciled), pending in-memory batches concatenated. One composition
+    // serves plain reads, rowid (DML-plan) reads, and buffered-DML read-your-writes; no-pending scans
+    // pass straight through it (every overlay step is conditional).
+    //
+    // Deliberately NOT an engineered-wood synthetic Snapshot (the "pinned ⊕ pending actions" form):
+    // EW's OrderedActiveFiles path-sorts the WHOLE active set, so uuid-named pending files would
+    // interleave into the committed ordinal range and break the transient-rowid contract that scans,
+    // position parking, the flush's DV resolution and the same-txn-DML routing all share (committed
+    // ordinals < 0x700000, pending files at 0x780000+idx). The overlay composition IS the virtual
+    // table, with the ordinal spaces kept disjoint by construction.
+    private IArrowArrayStream ScanCodec(nint opener, string path, ScanSpec? spec,
+                                        EngineeredWood.Expressions.Predicate? filter,
+                                        DeltaTxnBuffer.PendingAppends? pending, string? pinnedReadValue)
+    {
+        // Buffered DML forces the rowid stream: positions decode against the PINNED version's ordinals
+        // (BufferDeleteRows guarantees PinnedVersion is set whenever DeletedByOrdinal is non-empty).
+        bool hasDeletes = pending is { DeletedByOrdinal.Count: > 0 };
         // Pending buffered ALTER: advertise the PENDING schema. The engineered-wood read below knows only
         // the COMMITTED columns, so pending-only names are stripped from its projection and each batch is
         // RECONCILED to the advertised shape afterwards (added columns backfilled as typed NULLs).
-        var userSchema = pendingScan?.PendingArrowSchema
+        var userSchema = pending?.PendingArrowSchema
             ?? (pinnedReadValue is null
                 ? DeltaReader.GetSchema(opener, path)
                 : DeltaReader.GetSchemaAt(opener, path, "version", pinnedReadValue));
         var (projCols, projected) = ProjectFor(userSchema, spec);
-        bool reconcile = pendingScan?.PendingMetadata is not null;
-        var renameRev = reconcile ? CommittedToPending(pendingScan!) : null;
-        var ewProjCols = projCols;
-        if (reconcile && projCols is not null)
-        {
-            // Translate pending names to the COMMITTED names the data is stored under (renamed columns),
-            // dropping pending-only columns (added — nothing to read; the reconcile backfills NULLs).
-            var committed = pinnedReadValue is null
-                ? DeltaReader.GetSchema(opener, path)
-                : DeltaReader.GetSchemaAt(opener, path, "version", pinnedReadValue);
-            var keep = new List<string>();
-            foreach (var pc in projCols)
-            {
-                var src = pendingScan!.RenameMap.TryGetValue(pc, out var orig) ? orig : pc;
-                foreach (var fl in committed.FieldsList)
-                {
-                    if (string.Equals(fl.Name, src, System.StringComparison.OrdinalIgnoreCase))
-                    {
-                        keep.Add(src);
-                        break;
-                    }
-                }
-            }
-            ewProjCols = keep.Count > 0 ? keep : null;
-        }
-
-        // When the scan requests the virtual rowid (UPDATE/DELETE plans), stream WITH the trailing
-        // _metadata.row_id column and advertise it in the schema; DuckDB maps the requested output by name.
+        bool reconcile = pending?.PendingMetadata is not null;
+        var renameRev = reconcile ? CommittedToPending(pending!) : null;
+        var ewProjCols = reconcile
+            ? TranslateProjectionToCommitted(projCols, opener, path, pinnedReadValue, pending!)
+            : projCols;
+        // When the scan requests the virtual rowid (UPDATE/DELETE plans), advertise it in the schema;
+        // DuckDB maps the requested output by name. Pending deletes need the rowid internally even when
+        // the scan didn't ask (dropped again after the exclusion).
         bool wantRowId = spec?.Columns is { } cols && cols.Contains(RowIdColumn);
-        if (wantRowId)
+        bool needRowId = wantRowId || hasDeletes;
+        var outSchema = wantRowId ? SchemaWithRowId(projected) : projected;
+        System.Collections.Generic.IAsyncEnumerable<RecordBatch> stream;
+        if (needRowId)
         {
-            var fields = new List<Field>(projected.FieldsList)
-            {
-                new Field(RowIdColumn, Int64Type.Default, nullable: false),
-            };
-            var schemaWithRowId = new Schema(fields, projected.Metadata);
-            var rowIdStream = pinnedReadValue is null
+            stream = pinnedReadValue is null
                 ? DeltaReader.StreamWithRowIds(opener, path, ewProjCols, filter, default)
                 : DeltaReader.StreamWithRowIdsAt(opener, path, ewProjCols, filter, "version", pinnedReadValue, default);
-            var rowIdBase = reconcile ? ReconcileToSchema(rowIdStream, schemaWithRowId, renameRev) : rowIdStream;
-            var rowIdOverlaid = pendingScan is { Batches.Count: > 0 }
-                ? DeltaTxnBuffer.Concat(rowIdBase,
-                    DeltaTxnBuffer.ProjectPending(pendingScan, schemaWithRowId, RowIdColumn, PendingRowIdOrdinal))
-                : rowIdBase;
-            return new AsyncEnumerableArrowStream(schemaWithRowId,
-                WithExactFilter(schemaWithRowId, rowIdOverlaid, spec));
-        }
-
-        var plainStream = pinnedReadValue is null
-            ? DeltaReader.Stream(opener, path, ewProjCols, filter, default)
-            : DeltaReader.StreamAt(opener, path, ewProjCols, filter, "version", pinnedReadValue, default);
-        var plainBase = reconcile ? ReconcileToSchema(plainStream, projected, renameRev) : plainStream;
-        var plainOverlaid = pendingScan is { Batches.Count: > 0 }
-            ? DeltaTxnBuffer.Concat(plainBase,
-                DeltaTxnBuffer.ProjectPending(pendingScan, projected, RowIdColumn, PendingRowIdOrdinal))
-            : plainBase;
-        return new AsyncEnumerableArrowStream(projected, WithExactFilter(projected, plainOverlaid, spec));
-    }
-
-    // Codec-path read-your-writes for buffered DML: the base scan is FORCED onto the rowid stream at the
-    // transaction's pinned version (rowids drive the pending-delete exclusion AND ordinals must match the
-    // buffered positions); the rowid column is dropped again unless the scan asked for it; pending (insert +
-    // post-image) batches overlay on top.
-    private IArrowArrayStream ScanCodecWithPendingDml(
-        nint opener, string path, ScanSpec? spec, EngineeredWood.Expressions.Predicate? filter,
-        DeltaTxnBuffer.PendingAppends pending)
-    {
-        string pv = pending.PinnedVersion!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
-        var committedAt = DeltaReader.GetSchemaAt(opener, path, "version", pv);
-        // A pending buffered ALTER's schema wins for the ADVERTISED shape; the base stream reads only the
-        // committed columns and reconciles afterwards.
-        var userSchema = pending.PendingArrowSchema ?? committedAt;
-        var (projCols, projected) = ProjectFor(userSchema, spec);
-        bool wantRowId = spec?.Columns is { } cols && cols.Contains(RowIdColumn);
-        var outSchema = wantRowId
-            ? new Schema(
-                new List<Field>(projected.FieldsList)
-                {
-                    new Field(RowIdColumn, Int64Type.Default, nullable: false),
-                }, projected.Metadata)
-            : projected;
-        var ewProjCols = projCols;
-        if (pending.PendingMetadata is not null && projCols is not null)
-        {
-            var keep = new List<string>();
-            foreach (var pc in projCols)
+            if (hasDeletes)
             {
-                var src = pending.RenameMap.TryGetValue(pc, out var orig) ? orig : pc;
-                foreach (var fl in committedAt.FieldsList)
-                {
-                    if (string.Equals(fl.Name, src, System.StringComparison.OrdinalIgnoreCase))
-                    {
-                        keep.Add(src);
-                        break;
-                    }
-                }
+                stream = DeltaTxnBuffer.ExcludeDeleted(
+                    stream, pending!.DeletedByOrdinal, dropRowId: !wantRowId, RowIdPositionBits);
             }
-            ewProjCols = keep.Count > 0 ? keep : null;
         }
-        var baseStream = DeltaReader.StreamWithRowIdsAt(opener, path, ewProjCols, filter, "version", pv, default);
-        var stream = DeltaTxnBuffer.ExcludeDeleted(
-            baseStream, pending.DeletedByOrdinal, dropRowId: !wantRowId, RowIdPositionBits);
-        if (pending.PendingMetadata is not null)
+        else
         {
-            stream = ReconcileToSchema(stream, outSchema, CommittedToPending(pending));
+            stream = pinnedReadValue is null
+                ? DeltaReader.Stream(opener, path, ewProjCols, filter, default)
+                : DeltaReader.StreamAt(opener, path, ewProjCols, filter, "version", pinnedReadValue, default);
         }
-        if (pending.Batches.Count > 0)
+        if (reconcile)
+        {
+            stream = ReconcileToSchema(stream, outSchema, renameRev);
+        }
+        if (pending is { Batches.Count: > 0 })
         {
             stream = DeltaTxnBuffer.Concat(stream,
                 DeltaTxnBuffer.ProjectPending(pending, outSchema, RowIdColumn, PendingRowIdOrdinal));
         }
         return new AsyncEnumerableArrowStream(outSchema, WithExactFilter(outSchema, stream, spec));
+    }
+
+    // The projected schema with the trailing virtual _metadata.row_id column appended.
+    private static Schema SchemaWithRowId(Schema projected) =>
+        new Schema(new List<Field>(projected.FieldsList)
+        {
+            new Field(RowIdColumn, Int64Type.Default, nullable: false),
+        }, projected.Metadata);
+
+    // Translate a pending-ALTER projection to the COMMITTED names the data is stored under (renamed
+    // columns), dropping pending-only columns (added — nothing to read; the reconcile backfills NULLs).
+    private IReadOnlyList<string>? TranslateProjectionToCommitted(
+        IReadOnlyList<string>? projCols, nint opener, string path, string? pinnedReadValue,
+        DeltaTxnBuffer.PendingAppends pending)
+    {
+        if (projCols is null)
+        {
+            return null;
+        }
+        var committed = pinnedReadValue is null
+            ? DeltaReader.GetSchema(opener, path)
+            : DeltaReader.GetSchemaAt(opener, path, "version", pinnedReadValue);
+        var keep = new List<string>();
+        foreach (var pc in projCols)
+        {
+            var src = pending.RenameMap.TryGetValue(pc, out var orig) ? orig : pc;
+            foreach (var fl in committed.FieldsList)
+            {
+                if (string.Equals(fl.Name, src, System.StringComparison.OrdinalIgnoreCase))
+                {
+                    keep.Add(src);
+                    break;
+                }
+            }
+        }
+        return keep.Count > 0 ? keep : null;
     }
 
     // A table created in THIS transaction exists only in the buffer (no _delta_log) — serve the scan
@@ -1112,13 +1090,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     {
         var (_, projected) = ProjectFor(pending.PendingArrowSchema!, spec);
         bool wantRowId = spec?.Columns is { } cols && cols.Contains(RowIdColumn);
-        var outSchema = wantRowId
-            ? new Schema(
-                new List<Field>(projected.FieldsList)
-                {
-                    new Field(RowIdColumn, Int64Type.Default, nullable: false),
-                }, projected.Metadata)
-            : projected;
+        var outSchema = wantRowId ? SchemaWithRowId(projected) : projected;
         var stream = DeltaTxnBuffer.ProjectPending(pending, outSchema, RowIdColumn, PendingRowIdOrdinal);
         if (pending.Files.Count > 0)
         {

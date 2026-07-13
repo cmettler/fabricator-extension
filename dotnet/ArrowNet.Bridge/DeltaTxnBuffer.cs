@@ -19,13 +19,17 @@ namespace ArrowNet.Bridge;
 /// at statement end and behavior is identical to per-statement commits; only explicit
 /// <c>BEGIN … COMMIT/ROLLBACK</c> changes semantics (atomic multi-INSERT, rollback undoes).
 ///
-/// <para>Two buffer shapes, decided by the catalog's write path: the STREAMING native write parks the
-/// already-written files' <see cref="WrittenDataFile"/> records (bounded memory — bytes are on storage);
-/// the codec/collect write parks the materialized <see cref="RecordBatch"/>es (RAM-bounded, like the
-/// collect path itself). Reads inside the transaction overlay the pending data (read-your-writes);
-/// non-append operations on a table with pending appends are rejected (append-only transactions —
-/// buffered DML/DDL are later slices). Atomicity is PER TABLE: Delta has no cross-table transaction, so a
-/// multi-table COMMIT writes one Delta commit per table, sequentially.</para>
+/// <para>EAGER-WRITE model: in explicit transactions the DATA is always written to storage at statement
+/// time (streamed COPY under native_write, per-statement WriteDataFilesAsync otherwise) and the buffer
+/// holds ACTIONS + POSITIONS — WrittenDataFile records, deleted positions per pinned-snapshot ordinal
+/// (0x780000+idx for this transaction's own pending files — same-txn DELETEs become DVs born on their
+/// adds), pending metaData/protocol, CdcFile actions, identity high-water marks, app-txn versions.
+/// In-memory RecordBatches survive only in narrow fallbacks (iceberg, identity-under-ALTER, partitioned
+/// pending-create, autocommit's park-and-flush-at-statement-end). Reads inside the transaction go
+/// through the VIRTUAL-TABLE overlays (DeltaCatalog.ScanCodec / the native reader's pending inputs /
+/// ScanPendingCreated) — read-your-writes across appends, deletes, updates, ALTERs and created tables.
+/// Atomicity is PER TABLE: Delta has no cross-table transaction, so a multi-table COMMIT writes one
+/// Delta commit per table, sequentially.</para>
 /// </summary>
 internal sealed class DeltaTxnBuffer
 {
