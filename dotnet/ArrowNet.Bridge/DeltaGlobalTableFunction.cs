@@ -574,12 +574,70 @@ internal static class DeltaWriter
     /// (column mapping / identity / IcebergCompat). On <c>null</c> NO file was written (checked before COPY), so
     /// there is no orphan.</para>
     /// </summary>
+    /// <summary>
+    /// Eager-write plan, slice B: stream a buffered-transaction CTAS's data files for a table that does
+    /// NOT exist yet — nothing touches the <c>_delta_log</c> (the flush's CREATE with
+    /// <paramref name="assignedSchema"/> + one commit references them; ROLLBACK leaves orphan parquet in
+    /// a log-less folder, invisible to every reader). Column-mapping physical names/ids are assigned
+    /// HERE (they are random GUIDs — the create must reuse them, never re-assign). Non-partitioned only
+    /// (the partitioned pending-create keeps the collect path); returns null when streaming is
+    /// unavailable, leaving <paramref name="data"/> unconsumed for the collect path.
+    /// </summary>
+    public static List<WrittenDataFile>? TryStreamCreateFiles(
+        nint opener, string path, IArrowArrayStream data,
+        EngineeredWood.DeltaLake.Schema.ColumnMappingMode columnMapping,
+        out long rowsWritten, out EngineeredWood.DeltaLake.Schema.StructType? assignedSchema)
+    {
+        rowsWritten = 0;
+        assignedSchema = null;
+        if (!NativeParquetDataFileWriter.Available)
+        {
+            return null;
+        }
+        var writableRoot = DeltaReader.ToReadableRoot(path);
+        string? fieldIdsSpec = null;
+        Schema statsSchema = data.Schema;
+        IArrowArrayStream copySource = data;
+        if (columnMapping != EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None)
+        {
+            var delta = EngineeredWood.DeltaLake.Schema.SchemaConverter.FromArrowSchema(data.Schema);
+            var (mapped, _) = EngineeredWood.DeltaLake.Schema.ColumnMapping.AssignColumnMapping(delta);
+            assignedSchema = mapped;
+            // Same physical layout the open-table streaming path emits: recursive physical rename +
+            // FIELD_IDS + physical-keyed stats, all driven by the just-assigned schema.
+            copySource = ArrowColumnMappingRename.Wrap(data, mapped, toPhysical: true);
+            fieldIdsSpec = BuildFieldIdsSpec(mapped, null);
+            var renameToPhysical = EngineeredWood.DeltaLake.Schema.ColumnMapping.BuildLogicalToPhysicalMap(
+                mapped, columnMapping);
+            var physFields = new List<Field>(data.Schema.FieldsList.Count);
+            foreach (var f in data.Schema.FieldsList)
+            {
+                physFields.Add(renameToPhysical.TryGetValue(f.Name, out var pn) && pn != f.Name
+                    ? new Field(pn, f.DataType, f.IsNullable)
+                    : f);
+            }
+            statsSchema = new Schema(physFields, null);
+        }
+        // The table FOLDER does not exist yet (no create ran) — make it (recursive, best-effort: object
+        // stores have implicit dirs and the blob write creates the path anyway).
+        try { HostFs.CreateDir(AmbientOpener.Current, writableRoot); }
+        catch { /* implicit dirs / unimplemented CreateDirectory */ }
+        string fileRel = $"{System.Guid.NewGuid():N}.parquet";
+        var (rows, size, stats) = NativeParquetDataFileWriter.RunCopy(
+            writableRoot, fileRel, copySource, default, statsSchema: statsSchema, fieldIdsSpec: fieldIdsSpec);
+        rowsWritten = rows;
+        return rows > 0
+            ? new List<WrittenDataFile> { new(fileRel, size, rows, null, stats) }
+            : new List<WrittenDataFile>();
+    }
+
     public static long? TryWriteStreaming(
         nint opener, string path, IArrowArrayStream data, DeltaWriteMode mode,
         bool deletionVectors, bool inCommitTimestamps, bool changeDataFeed, bool rowTracking,
         DeltaWriteSpec? spec, bool materializeRowTracking, out long rowsWritten,
         EngineeredWood.DeltaLake.Schema.ColumnMappingMode columnMapping =
             EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None,
+        EngineeredWood.DeltaLake.Schema.StructType? pendingSchema = null,
         List<WrittenDataFile>? deferCommitTo = null)
     {
         // Transaction-deferred commit: the caller (an explicit-transaction append) wants the files WRITTEN
@@ -589,6 +647,15 @@ internal static class DeltaWriter
         {
             throw new System.InvalidOperationException(
                 "TryWriteStreaming: only a plain Append can defer its commit.");
+        }
+        // pendingSchema = a buffered transaction's PENDING (ALTERed) schema, deferred appends only: the
+        // input carries columns the committed snapshot doesn't know yet, so the pending schema drives the
+        // NOT NULL wrap + the mapping rename/FIELD_IDS/stats keying below; the paired metaData action
+        // joins the fused commit at flush.
+        if (pendingSchema is not null && deferCommitTo is null)
+        {
+            throw new System.InvalidOperationException(
+                "TryWriteStreaming: pendingSchema requires a deferred (transaction-buffered) append.");
         }
         rowsWritten = 0;
         // Cases the streaming commit can't represent → fall back to the batch path.
@@ -646,7 +713,8 @@ internal static class DeltaWriter
             // which validates on its own). Overwrite adopts the input schema — nothing to enforce.
             if (mode == DeltaWriteMode.Append)
             {
-                data = DeltaNullability.Wrap(data, table.CurrentSnapshot.Schema, TableNameFromPath(path));
+                data = DeltaNullability.Wrap(data, pendingSchema ?? table.CurrentSnapshot.Schema,
+                                             TableNameFromPath(path));
             }
             var partCols = table.CurrentSnapshot.Metadata.PartitionColumns;
             var mappingMode = EngineeredWood.DeltaLake.Schema.ColumnMapping.GetMode(
@@ -657,7 +725,7 @@ internal static class DeltaWriter
             IArrowArrayStream copySource = data;
             if (mappingMode != EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None)
             {
-                var snapSchema = table.CurrentSnapshot.Schema;
+                var snapSchema = pendingSchema ?? table.CurrentSnapshot.Schema;
                 var renameToPhysical = EngineeredWood.DeltaLake.Schema.ColumnMapping.BuildLogicalToPhysicalMap(
                     snapSchema, mappingMode);
                 // The COPY must emit the PHYSICAL layout at EVERY level (Delta spec: data files use physical
@@ -988,7 +1056,8 @@ internal static class DeltaWriter
                               bool changeDataFeed = false, bool rowTracking = false, DeltaWriteSpec? spec = null,
                               bool materializeRowTracking = false,
                               EngineeredWood.DeltaLake.Schema.ColumnMappingMode columnMapping =
-                                  EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None)
+                                  EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None,
+                              EngineeredWood.DeltaLake.Schema.StructType? preAssignedSchema = null)
     {
         Log.LogInformation("delta create {Path}: cols={Cols} spec=[{Spec}]", path, schema.FieldsList.Count,
             DescribeSpec(spec, deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed));
@@ -1002,6 +1071,7 @@ internal static class DeltaWriter
                                                          partitionColumns: spec?.PartitionColumns,
                                                          configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, materializeRowTracking),
                                                          columnMappingMode: columnMapping,
+                                                         preAssignedSchema: preAssignedSchema,
                                                          cancellationToken: ct).AsTask().GetAwaiter().GetResult();
                 table.DisposeAsync().AsTask().GetAwaiter().GetResult();
                 Log.LogDebug("delta create {Path}: opened/created (commit-0 if new)", path);

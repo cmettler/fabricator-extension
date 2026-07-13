@@ -950,7 +950,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         if (pendingScan is { PendingCreate: true })
         {
             // Table created in THIS transaction: it exists only in the buffer (no _delta_log yet).
-            return ScanPendingCreated(pendingScan, spec);
+            return ScanPendingCreated(path, pendingScan, spec);
         }
         if (pendingScan is { Files.Count: > 0 })
         {
@@ -1103,9 +1103,12 @@ public sealed class DeltaCatalog : IBackendCatalog
     }
 
     // A table created in THIS transaction exists only in the buffer (no _delta_log) — serve the scan
-    // entirely from the pending batches (synthetic rowids for the count(*)/DML-plan paths; DML against
-    // pending rows is rejected with its own clear error).
-    private IArrowArrayStream ScanPendingCreated(DeltaTxnBuffer.PendingAppends pending, ScanSpec? spec)
+    // from the pending batches plus any eagerly-STREAMED pending files (slice B: a native_write CTAS's
+    // data is already on storage, read back via the host's read_parquet and renamed physical->logical
+    // through the pre-assigned mapping schema). Synthetic rowids for the count(*)/DML-plan paths; DML
+    // against pending rows is rejected with its own clear error.
+    private IArrowArrayStream ScanPendingCreated(string path, DeltaTxnBuffer.PendingAppends pending,
+                                                 ScanSpec? spec)
     {
         var (_, projected) = ProjectFor(pending.PendingArrowSchema!, spec);
         bool wantRowId = spec?.Columns is { } cols && cols.Contains(RowIdColumn);
@@ -1116,8 +1119,27 @@ public sealed class DeltaCatalog : IBackendCatalog
                     new Field(RowIdColumn, Int64Type.Default, nullable: false),
                 }, projected.Metadata)
             : projected;
-        return new AsyncEnumerableArrowStream(outSchema, WithExactFilter(outSchema,
-            DeltaTxnBuffer.ProjectPending(pending, outSchema, RowIdColumn, PendingRowIdOrdinal), spec));
+        var stream = DeltaTxnBuffer.ProjectPending(pending, outSchema, RowIdColumn, PendingRowIdOrdinal);
+        if (pending.Files.Count > 0)
+        {
+            string root = DeltaReader.ToReadableRoot(path);
+            var parts = new List<string>(pending.Files.Count);
+            foreach (var f in pending.Files)
+            {
+                parts.Add("'" + (root + "/" + f.RelativePath).Replace("'", "''") + "'");
+            }
+            var sql = "SELECT * FROM read_parquet([" + string.Join(", ", parts) + "])";
+            var source = Host.Query(sql);
+            if (pending.PendingDeltaSchema is { } assigned)
+            {
+                // The files carry PHYSICAL column names (mapping pre-assigned at the eager write).
+                source = ArrowColumnMappingRename.Wrap(source, assigned, toPhysical: false);
+            }
+            var raw = DeltaTxnBuffer.AsEnumerable(source);
+            stream = DeltaTxnBuffer.Concat(
+                DeltaTxnBuffer.ProjectStream(raw, outSchema, RowIdColumn, PendingRowIdOrdinal + 1), stream);
+        }
+        return new AsyncEnumerableArrowStream(outSchema, WithExactFilter(outSchema, stream, spec));
     }
 
     // True when the table exists COMMITTED on storage (its _delta_log opens). Routes CREATE/CTAS between
@@ -1195,7 +1217,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         if (pendingNative is { PendingCreate: true })
         {
             // Table created in THIS transaction: nothing on storage to list — serve from the buffer.
-            return ScanPendingCreated(pendingNative, spec);
+            return ScanPendingCreated(path, pendingNative, spec);
         }
         if (spec?.At is { } at)
         {
@@ -1470,6 +1492,32 @@ public sealed class DeltaCatalog : IBackendCatalog
             var pendingC = _txnBuffer.GetOrCreate(txnId, tablePath);
             if (!pendingC.HasAny)
             {
+                // Eager-write plan, slice B: on a native_write catalog the CTAS data STREAMS to parquet
+                // files at statement time (no _delta_log touched — the flush's CREATE reuses the
+                // pre-assigned column-mapping schema and one commit references the files; ROLLBACK
+                // leaves orphans in a log-less folder, not a table to any reader). Bounded memory for a
+                // huge CTAS inside BEGIN..COMMIT. Partitioned pending creates keep the collect path
+                // (their read-back would need Hive-dir reconstruction).
+                if (_nativeWrite && partitionColumns is not { Count: > 0 })
+                {
+                    var ctasSchema = data.Schema;
+                    var cfiles = DeltaWriter.TryStreamCreateFiles(
+                        opener, tablePath, data, _columnMappingMode, out var sRows, out var assigned);
+                    if (cfiles is not null)
+                    {
+                        pendingC.PendingCreate = true;
+                        pendingC.PendingArrowSchema = ctasSchema;
+                        pendingC.PendingDeltaSchema = assigned; // mapping pre-assignment (null when 'none')
+                        pendingC.CreatePartitionColumns = partitionColumns;
+                        pendingC.HasAppend = true;
+                        pendingC.Files.AddRange(cfiles);
+                        pendingC.Rows += sRows;
+                        _log.LogInformation(
+                            "delta bulk {Schema}.{Table}: buffered CREATE + {Rows} row(s) for txn {Txn} (CTAS, streamed files)",
+                            schemaName, tableName, sRows, txnId);
+                        return sRows;
+                    }
+                }
                 var (cschema, cbatches, crows) = DeltaWriter.Materialize(data, default);
                 pendingC.PendingCreate = true;
                 pendingC.PendingArrowSchema = cschema;
@@ -1502,8 +1550,28 @@ public sealed class DeltaCatalog : IBackendCatalog
         {
             var pending = _txnBuffer.GetOrCreate(txnId, tablePath);
             pending.HasAppend = true;
-            if (_nativeWrite && pending.PendingMetadata is null && !pending.PendingCreate)
+            // slice C2: on a CDF table EVERY buffered statement writes its cdc counterpart (a commit
+            // carrying any cdc action is read cdc-ONLY — inference is disabled — so appends fused with
+            // DML would otherwise vanish from the feed). Probed once per (txn, table); partitioned CDF
+            // stays on inference (its appends commit cdc-less and its DML is rejected, so commits are
+            // never mixed). Insert-cdc needs the batches in hand -> CDF appends skip the streamed path.
+            if (_txnBuffer.IsExplicit(txnId) && !pending.PendingCreate && pending.CdfEnabled is null)
             {
+                var prof = DeltaReader.GetTxnDmlProfile(opener, tablePath);
+                pending.CdfEnabled = prof.CdfEnabled && !prof.Partitioned && prof.SupportsExternalCommit;
+                if (pending.CdfEnabled == true)
+                {
+                    pending.PinnedVersion ??= SnapshotPinning.TryGetPinned(txnId, tablePath) ?? prof.Version;
+                }
+            }
+            bool cdfAppend = pending.CdfEnabled == true;
+            bool tryStream = _nativeWrite && !pending.PendingCreate && !cdfAppend;
+            if (tryStream)
+            {
+                // Eager-write plan, slice A: a PENDING BUFFERED ALTER streams too — the pending schema
+                // (whose added columns already carry their column-mapping ids/physical names) drives the
+                // NOT NULL wrap + rename maps + FIELD_IDS inside TryWriteStreaming, and the streamed
+                // files fuse with the metaData action into the one commit at COMMIT.
                 var deferred = DeltaWriter.TryWriteStreaming(
                     opener, tablePath, data, mode,
                     deletionVectors: _deletionVectorsOnCreate,
@@ -1513,6 +1581,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                     spec: spec, materializeRowTracking: _materializeRowTracking,
                     out var deferredRows,
                     columnMapping: _columnMappingMode,
+                    pendingSchema: pending.PendingDeltaSchema,
                     deferCommitTo: pending.Files);
                 if (deferred is not null)
                 {
@@ -1521,12 +1590,34 @@ public sealed class DeltaCatalog : IBackendCatalog
                         schemaName, tableName, deferredRows, txnId);
                     return deferredRows;
                 }
-                // Streaming not applicable (identity/iceberg fall back to the collect writer) — commit
-                // immediately as before; append+append commute, so pending appends stay correct.
+                // Streaming not applicable (identity/iceberg fall back to the collect writer). With NO
+                // pending ALTER: commit immediately as before (append+append commute, pending appends
+                // stay correct). With a pending ALTER the data must NOT commit before the schema does —
+                // collect it under the buffer instead (below).
             }
-            else
+            if (!tryStream || pending.PendingMetadata is not null)
             {
                 var (bschema, bbatches, brows) = DeltaWriter.Materialize(data, default);
+                if (cdfAppend)
+                {
+                    WriteCdcFiles(opener, tablePath, pending, bbatches, "insert");
+                }
+                // slice C1: in an EXPLICIT transaction the statement's batches become a data file NOW
+                // (memory caps at one statement); autocommit keeps the batch park (flushes at statement
+                // end anyway — byte-identical to per-statement commits).
+                if (_txnBuffer.IsExplicit(txnId)
+                    && TryEagerWriteBatches(opener, tablePath, pending, bbatches, tableName))
+                {
+                    foreach (var b in bbatches)
+                    {
+                        b.Dispose();
+                    }
+                    pending.Rows += brows;
+                    _log.LogInformation(
+                        "delta bulk {Schema}.{Table}: buffered {Rows} row(s) for txn {Txn} (eager file)",
+                        schemaName, tableName, brows, txnId);
+                    return brows;
+                }
                 pending.BatchSchema ??= bschema;
                 pending.Batches.AddRange(bbatches);
                 pending.Rows += brows;
@@ -1685,7 +1776,8 @@ public sealed class DeltaCatalog : IBackendCatalog
                     FlushCreateTransaction(opener, kv.Key, txnId, pending);
                 }
                 else if (pending.DeletedByOrdinal.Count > 0 || pending.PendingMetadata is not null
-                         || pending.AppTxnVersions.Count > 0
+                         || pending.AppTxnVersions.Count > 0 || pending.PendingCdc.Count > 0
+                         || pending.PendingIdentityHwm.Count > 0
                          || (_serializable && pending.HasReads && pending.PinnedVersion is not null
                              && (pending.Files.Count > 0 || pending.Batches.Count > 0)))
                 {
@@ -2045,11 +2137,12 @@ public sealed class DeltaCatalog : IBackendCatalog
                 $"delta: {op} inside an explicit transaction requires deletion vectors on the table (this "
                 + "table has them disabled) — run it in autocommit (copy-on-write), or COMMIT first.");
         }
-        if (p.CdfEnabled)
+        if (p.CdfEnabled && (p.Partitioned || !p.SupportsExternalCommit))
         {
             throw new System.NotSupportedException(
-                $"delta: {op} inside an explicit transaction is not supported on a Change-Data-Feed table "
-                + "yet — run it in autocommit (full CDF capture applies there).");
+                $"delta: {op} inside an explicit transaction is not supported on a "
+                + (p.Partitioned ? "PARTITIONED" : "identity/IcebergCompat")
+                + " Change-Data-Feed table yet — run it in autocommit (full CDF capture applies there).");
         }
         if (forUpdate && !p.SupportsExternalCommit)
         {
@@ -2057,7 +2150,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 "delta: UPDATE inside an explicit transaction is not supported on identity/IcebergCompat "
                 + "tables — run it in autocommit.");
         }
-        if (forUpdate && _materializeRowTracking)
+        if (forUpdate && _materializeRowTracking && p.Partitioned)
         {
             throw new System.NotSupportedException(
                 "delta: UPDATE inside an explicit transaction is not supported with materialize_row_tracking "
@@ -2077,10 +2170,35 @@ public sealed class DeltaCatalog : IBackendCatalog
                 $"delta: {(forUpdate ? "UPDATE" : "DELETE")} on a table created in the same transaction is "
                 + "not supported yet — COMMIT the CREATE first.");
         }
-        var profile = DeltaReader.GetTxnDmlProfile(Opener(), path);
+        var delOpener = Opener();
+        var profile = DeltaReader.GetTxnDmlProfile(delOpener, path);
         EnsureBufferedDmlEligible(profile, forUpdate ? "UPDATE" : "DELETE", forUpdate);
         var pending = _txnBuffer.GetOrCreate(txnId, path);
+        if (profile.CdfEnabled && pending.PendingMetadata is not null)
+        {
+            throw new System.NotSupportedException(
+                "delta: DML on a Change-Data-Feed table cannot follow a buffered ALTER in the same "
+                + "transaction — COMMIT the ALTER first.");
+        }
         pending.PinnedVersion ??= SnapshotPinning.TryGetPinned(txnId, path) ?? profile.Version;
+        if (profile.CdfEnabled && !forUpdate && ids.Count > 0)
+        {
+            // slice C2: the deleted rows' CONTENT goes into an eager _change_data file (the position set
+            // parked below has no row values; this is the one extra read CDF costs a buffered DELETE).
+            var deleted = DeltaReader.ReadRowsByRowIds(delOpener, path, ids, default,
+                atVersion: pending.PinnedVersion);
+            try
+            {
+                WriteCdcFiles(delOpener, path, pending, deleted.ConvertAll(DropTrailingRowId), "delete");
+            }
+            finally
+            {
+                foreach (var b in deleted)
+                {
+                    b.Dispose();
+                }
+            }
+        }
         long added = 0;
         foreach (var rid in ids)
         {
@@ -2150,11 +2268,34 @@ public sealed class DeltaCatalog : IBackendCatalog
             readTarget = new Schema(
                 new List<Field>(fields) { new Field(RowIdColumn, Int64Type.Default, nullable: false) }, null);
         }
+        if (profile.CdfEnabled && pending.PendingMetadata is not null)
+        {
+            throw new System.NotSupportedException(
+                "delta: DML on a Change-Data-Feed table cannot follow a buffered ALTER in the same "
+                + "transaction — COMMIT the ALTER first.");
+        }
         long matched = 0;
         var postImages = new List<RecordBatch>();
-        foreach (var raw in DeltaReader.ReadRowsByRowIds(opener, path, updates.Keys, default))
+        var preImages = profile.CdfEnabled ? new List<RecordBatch>() : null;
+        // materialize_row_tracking: the post-image rows must carry their ORIGINAL stable ids in the
+        // declared __delta_row_id column (identity preserved across the UPDATE — Spark's reference
+        // behavior). Resolved as baseRowId[ordinal] + position against the ordinal-ordered active set,
+        // the same rule EW's merge-on-read update applies; collected flat, aligned with postImages.
+        List<long>? stableIds = null;
+        IReadOnlyList<long?>? orderedBaseIds = null;
+        if (_materializeRowTracking)
+        {
+            stableIds = new List<long>();
+            orderedBaseIds = DeltaReader.GetOrderedActiveBaseRowIds(opener, path,
+                atVersion: pending.PinnedVersion);
+        }
+        // The rowids' ordinals are PINNED-version path-sort positions — read back AT that version so a
+        // concurrent commuting append (which shifts the ordering) can never make us read the wrong files.
+        foreach (var raw in DeltaReader.ReadRowsByRowIds(opener, path, updates.Keys, default,
+                     atVersion: pending.PinnedVersion))
         {
             var batch = readTarget is null ? raw : ReconcileBatch(raw, readTarget, CommittedToPending(pending));
+            preImages?.Add(DropTrailingRowId(batch));
             var rids = (Int64Array)batch.Column(batch.ColumnCount - 1);
             var newCols = new IArrowArray[fields.Count];
             for (int c = 0; c < fields.Count; c++)
@@ -2188,16 +2329,174 @@ public sealed class DeltaCatalog : IBackendCatalog
                         pending.DeletedByOrdinal[(int)ordinal] = set;
                     }
                     set.Add(rid & RowIdPosMask);
+                    if (stableIds is not null)
+                    {
+                        long baseId = ordinal >= 0 && ordinal < orderedBaseIds!.Count
+                            ? orderedBaseIds[(int)ordinal] ?? 0
+                            : 0;
+                        stableIds.Add(baseId + (rid & RowIdPosMask));
+                    }
                 }
             }
         }
         pending.BatchSchema ??= userSchema;
-        pending.Batches.AddRange(postImages);
+        if (preImages is not null)
+        {
+            // slice C2: eager CDC capture — pre-images (committed values, read back above) + the
+            // post-images built from the SET substitution, exactly the autocommit merge-on-read pair.
+            WriteCdcFiles(opener, path, pending, preImages, "update_preimage");
+            WriteCdcFiles(opener, path, pending, postImages, "update_postimage");
+        }
+        // Eager post-image write (eager-write plan, slices A + C1): the post-image rows become a
+        // parquet file NOW — the merge-on-read shape with a deferred commit — and only the
+        // WrittenDataFile action parks on the buffer, so a large UPDATE no longer holds its post-images
+        // in memory until COMMIT. Native_write AND codec catalogs both (the codec writes via EW's own
+        // writer; buffered-UPDATE eligibility already guarantees SupportsExternalDataFileCommit + not
+        // materialize_row_tracking). The pending-FILES read overlay (ScanNative routing) serves
+        // read-your-writes; ROLLBACK leaves the file as an invisible orphan (vacuum's job). NOT NULL is
+        // validated inside the helper (the flush only validates Batches).
+        if (TryEagerWriteBatches(opener, path, pending, postImages, tableName,
+                                 materializedRowIds: stableIds))
+        {
+            foreach (var b in postImages)
+            {
+                b.Dispose();
+            }
+        }
+        else if (stableIds is not null)
+        {
+            // A materialize post-image MUST carry its original ids — the batch-park flush path cannot
+            // bake them, so an eager-write failure here is a hard error, not a fallback.
+            throw new System.NotSupportedException(
+                "delta: UPDATE inside an explicit transaction on a materialized-row-tracking table "
+                + "could not write its post-images eagerly — run it in autocommit.");
+        }
+        else
+        {
+            pending.Batches.AddRange(postImages);
+        }
         pending.Rows += matched;
         pending.HasUpdate = true;
         _log.LogInformation("delta txn {Txn} buffer update {Schema}.{Table}: rows={Rows} pinned=v{Pin}",
             txnId, schemaName, tableName, matched, pending.PinnedVersion);
         return matched;
+    }
+
+    // Eager CDC capture (slice C2): write the _change_data file(s) for a buffered statement NOW — the
+    // rows are in hand exactly here — and park only the CdcFile actions (they fuse into the
+    // transaction's single commit; ROLLBACK leaves them as invisible orphans). Unpartitioned CDF tables
+    // only (the eligibility/probe guards enforce it), so partitionValues stay empty.
+    private void WriteCdcFiles(nint opener, string tablePath, DeltaTxnBuffer.PendingAppends pending,
+                               IReadOnlyList<RecordBatch> rows, string changeType)
+    {
+        if (rows.Count == 0)
+        {
+            return;
+        }
+        var fs = TableFileSystems.Create(opener, tablePath);
+        var table = EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(fs, DeltaWriter.Options())
+            .AsTask().GetAwaiter().GetResult();
+        try
+        {
+            foreach (var b in rows)
+            {
+                if (b.Length == 0)
+                {
+                    continue;
+                }
+                pending.PendingCdc.Add(table.WriteChangeDataFileAsync(b, changeType)
+                    .AsTask().GetAwaiter().GetResult());
+            }
+        }
+        finally
+        {
+            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+    }
+
+    // The rowid-carrying read-back batches end with the virtual _metadata.row_id column — the CDC rows
+    // must not include it.
+    private static RecordBatch DropTrailingRowId(RecordBatch b)
+    {
+        int n = b.ColumnCount - 1;
+        var fields = new List<Field>(n);
+        var cols = new List<IArrowArray>(n);
+        for (int i = 0; i < n; i++)
+        {
+            fields.Add(b.Schema.FieldsList[i]);
+            cols.Add(b.Column(i));
+        }
+        return new RecordBatch(new Schema(fields, b.Schema.Metadata), cols, b.Length);
+    }
+
+    // Eager-write plan, slice C1: write a statement's collected batches to data file(s) NOW (EW's codec
+    // writer — or DuckDB's under native_write via the IDataFileWriter seam) and park only the
+    // WrittenDataFile actions, so a codec-catalog transaction caps at ONE statement's memory (the
+    // codec's own autocommit profile). Mid-transaction reads route through ScanNative once
+    // pending.Files is non-empty — the same read_parquet path native_write-without-native_read
+    // catalogs already use (and native_read validates broadly against codec-written files). Explicit
+    // transactions only (autocommit keeps the byte-identical park-batches → DeltaWriter.Write shape).
+    // Returns false (nothing written, batches untouched) for: a pending-created table (nothing on
+    // storage to open) or identity/iceberg (no external-commit support). materialize_row_tracking
+    // catalogs eager-write like everyone: a FRESH append needs no physical __delta_row_id column —
+    // readers derive ids from the commit-assigned baseRowId + position (the validated streamed-native
+    // behavior, and what the flush's own WriteDataFilesAsync batch path already produces); the
+    // materialized column is an override for rows whose ORIGINAL ids must survive a rewrite
+    // (compaction / merge-on-read post-images), not a requirement for new rows.
+    private bool TryEagerWriteBatches(nint opener, string tablePath, DeltaTxnBuffer.PendingAppends pending,
+                                      IReadOnlyList<RecordBatch> batches, string tableName,
+                                      IReadOnlyList<long>? materializedRowIds = null)
+    {
+        if (pending.PendingCreate || batches.Count == 0)
+        {
+            return false;
+        }
+        var fs = TableFileSystems.Create(opener, tablePath);
+        var writer = _nativeWrite && NativeParquetDataFileWriter.Available
+            ? new NativeParquetDataFileWriter(tablePath)
+            : null;
+        var table = EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(
+                fs, DeltaWriter.Options(ResolveWriteSpec(null, null), writer))
+            .AsTask().GetAwaiter().GetResult();
+        try
+        {
+            IReadOnlyList<RecordBatch> toWrite = batches;
+            bool identity = false;
+            if (!table.SupportsExternalDataFileCommit)
+            {
+                // Identity appends eager-write too: values are generated NOW from the pinned/chained
+                // high-water mark (read-your-writes shows the REAL ids, which the batch park never
+                // could) and the flush fuses the HWM metaData into the one commit. Concurrent identity
+                // consumers abort via the rebase's metadata check (their commit carries metaData) —
+                // Spark's own policy. Iceberg and pending-ALTER-on-identity stay on the batch park.
+                if (table.IsIcebergCompat || !table.HasIdentityColumns
+                    || pending.PendingMetadata is not null)
+                {
+                    return false;
+                }
+                identity = true;
+                var (gen, marks) = table.GenerateIdentityValues(batches,
+                    pending.PendingIdentityHwm.Count > 0 ? pending.PendingIdentityHwm : null);
+                toWrite = gen;
+                foreach (var kv in marks)
+                {
+                    pending.PendingIdentityHwm[kv.Key] = kv.Value;
+                }
+                pending.PinnedVersion ??= table.CurrentSnapshot.Version; // the flush's rebase base
+            }
+            DeltaNullability.ValidateBatches(toWrite,
+                pending.PendingDeltaSchema ?? table.CurrentSnapshot.Schema, tableName);
+            pending.Files.AddRange(table.WriteDataFilesAsync(toWrite, default,
+                    schemaOverride: pending.PendingDeltaSchema,
+                    identityValuesPreGenerated: identity,
+                    materializedRowIds: materializedRowIds)
+                .AsTask().GetAwaiter().GetResult());
+            return true;
+        }
+        finally
+        {
+            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
     }
 
     // COMMIT flush for a transaction-CREATED table: nothing touched the _delta_log before now. Uses
@@ -2220,9 +2519,39 @@ public sealed class DeltaCatalog : IBackendCatalog
                            rowTracking: _rowTrackingOnCreate,
                            spec: ResolveWriteSpec(pending.CreatePartitionColumns, schemaModeArg: null),
                            materializeRowTracking: _materializeRowTracking,
-                           columnMapping: _columnMappingMode);
+                           columnMapping: _columnMappingMode,
+                           // slice B: an eagerly-streamed CTAS's files were written against THIS
+                           // pre-assigned mapping schema — the create must reuse it, never re-assign
+                           // (physical names are random GUIDs).
+                           preAssignedSchema: pending.PendingDeltaSchema);
         long v = 0;
-        if (pending.Batches.Count > 0)
+        if (pending.Files.Count > 0)
+        {
+            // Eagerly-streamed CTAS files (+ any later collected batches) reference the fresh table in
+            // ONE write commit (v0 create + v1 write — today's flush shape).
+            var fs2 = TableFileSystems.Create(opener, tablePath);
+            var w2 = _nativeWrite && NativeParquetDataFileWriter.Available
+                ? new NativeParquetDataFileWriter(tablePath)
+                : null;
+            var t2 = EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(fs2, DeltaWriter.Options(null, w2))
+                .AsTask().GetAwaiter().GetResult();
+            try
+            {
+                var all = new List<EngineeredWood.DeltaLake.Table.WrittenDataFile>(pending.Files);
+                if (pending.Batches.Count > 0)
+                {
+                    all.AddRange(t2.WriteDataFilesAsync(pending.Batches, default)
+                        .AsTask().GetAwaiter().GetResult());
+                }
+                v = t2.CommitDataFilesAsync(all, DeltaWriteMode.Append, cancellationToken: default)
+                    .AsTask().GetAwaiter().GetResult();
+            }
+            finally
+            {
+                t2.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            }
+        }
+        else if (pending.Batches.Count > 0)
         {
             v = DeltaWriter.Write(opener, tablePath, pending.BatchSchema!, pending.Batches,
                                   DeltaWriteMode.Append, default,
@@ -2280,15 +2609,27 @@ public sealed class DeltaCatalog : IBackendCatalog
                     resolveAgainst: pinnedSnap)
                 .AsTask().GetAwaiter().GetResult();
             // The buffered schema change (metaData + merged protocol upgrade) joins the SAME commit.
+            // Eagerly-generated identity high-water marks compose INTO that metaData action (a commit
+            // must not carry two metaData actions) — or form their own when there is no buffered ALTER.
             var extra = new List<EngineeredWood.DeltaLake.Actions.DeltaAction>();
             if (pending.PendingProtocol is { } proto)
             {
                 extra.Add(proto);
             }
-            if (pending.PendingMetadata is { } meta)
+            var metaAction = pending.PendingMetadata;
+            if (pending.PendingIdentityHwm.Count > 0)
+            {
+                metaAction = table.BuildIdentityMetadataAction(pending.PendingIdentityHwm, metaAction);
+            }
+            if (metaAction is { } meta)
             {
                 extra.Add(meta);
             }
+            // slice C2: the eagerly-written _change_data files join the fused commit (cdc actions carry
+            // DataChange=false — concurrent readers' dataChange checks ignore them; rebase safety: if the
+            // rebase passes, delete-delete/deleteRead already guaranteed our touched files are unchanged,
+            // so the captured CDC content stays exact).
+            extra.AddRange(pending.PendingCdc);
             // Application-transaction versions (idempotent appends): one `txn` action per app, committed
             // ATOMICALLY with the fused commit; the CAS against the LATEST snapshot runs in the retry loop.
             long nowMs = System.DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -2369,7 +2710,8 @@ public sealed class DeltaCatalog : IBackendCatalog
                 {
                     long v = table.CommitDataFilesAsync(files, DeltaWriteMode.Append, cancellationToken: default,
                             extraActions: extra, expectedVersion: table.CurrentSnapshot.Version,
-                            operation: operation)
+                            operation: operation,
+                            identityValuesPreGenerated: pending.PendingIdentityHwm.Count > 0)
                         .AsTask().GetAwaiter().GetResult();
                     _log.LogInformation(
                         "delta txn {Txn} commit {Path}: v{Version} op={Op} (files={Files}, rows+={Rows}, rows-={Deleted})",

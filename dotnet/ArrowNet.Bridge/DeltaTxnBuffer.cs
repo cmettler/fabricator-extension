@@ -72,6 +72,23 @@ internal sealed class DeltaTxnBuffer
         public bool PendingCreate;
         public IReadOnlyList<string>? CreatePartitionColumns;
 
+        // ---- Eager CDC capture (slice C2, CDF tables in explicit transactions) ----
+        // _change_data files are written at STATEMENT time (the rows are in hand: appended batches,
+        // read-back deleted rows, update pre/post images) and their CdcFile actions park here — they
+        // fuse into the transaction's ONE commit at flush. Because a commit carrying ANY cdc action is
+        // read cdc-ONLY by the CDF reader (inference disabled), EVERY buffered statement on a CDF table
+        // writes its cdc counterpart, inserts included. CdfEnabled caches the per-(txn, table) probe.
+        public List<EngineeredWood.DeltaLake.Actions.CdcFile> PendingCdc { get; } = new();
+        public bool? CdfEnabled;
+
+        // ---- Eager identity appends (chained high-water marks) ----
+        // Identity values are GENERATED at statement time from the pinned snapshot's HWM (chained here
+        // across the transaction's statements) and baked into the eagerly-written files; the flush
+        // commits the final marks as the fused commit's metaData. A concurrent identity-consuming
+        // commit necessarily carries its own metaData action -> the rebase metadata check aborts us
+        // (Spark's concurrent-identity policy), so baked values never land on a moved HWM.
+        public Dictionary<string, long> PendingIdentityHwm { get; } = new(StringComparer.Ordinal);
+
         // ---- APPLICATION TRANSACTION versions (Delta `txn` action — idempotent appends) ----
         // appId -> (version to commit, expected previous version — null = "must not exist yet").
         // Parked by arrownet_delta_set_transaction_version; the flush validates the CAS against the LATEST
@@ -250,6 +267,45 @@ internal sealed class DeltaTxnBuffer
                         batch.Column(c), keep));
             }
             yield return new RecordBatch(outSchema, columns, keep.Count);
+        }
+    }
+
+    /// <summary>
+    /// Projects a TRANSIENT batch stream (a host read of eagerly-written pending files) to the scan's
+    /// advertised schema — columns matched by name (ownership moves: the projected batch references the
+    /// source arrays directly and the consumer disposes them; unlike <see cref="ProjectPending"/> there
+    /// is no parked original to protect). The trailing virtual rowid, when requested, is synthesized
+    /// like ProjectPending's (scan-local uniqueness only — DML against pending rows is rejected).
+    /// </summary>
+    public static async IAsyncEnumerable<RecordBatch> ProjectStream(
+        IAsyncEnumerable<RecordBatch> source, Schema target, string rowIdColumn, long rowIdOrdinalBase,
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        long position = 0;
+        await foreach (var batch in source.WithCancellation(ct).ConfigureAwait(false))
+        {
+            var arrays = new List<IArrowArray>(target.FieldsList.Count);
+            foreach (var field in target.FieldsList)
+            {
+                if (string.Equals(field.Name, rowIdColumn, StringComparison.Ordinal))
+                {
+                    var b = new Int64Array.Builder();
+                    for (int i = 0; i < batch.Length; i++)
+                    {
+                        b.Append((rowIdOrdinalBase << 40) | position++);
+                    }
+                    arrays.Add(b.Build());
+                    continue;
+                }
+                int idx = FindColumn(batch.Schema, field.Name);
+                if (idx < 0)
+                {
+                    throw new InvalidOperationException(
+                        $"delta transaction read: pending data file lacks column '{field.Name}'.");
+                }
+                arrays.Add(batch.Column(idx));
+            }
+            yield return new RecordBatch(target, arrays, batch.Length);
         }
     }
 

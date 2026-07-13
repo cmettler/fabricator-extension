@@ -150,27 +150,120 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   VACUUM). Kills the three RAM-bound shapes (CTAS-in-txn, insert-under-pending-ALTER, UPDATE post-images)
   and unifies the read overlays. Slices, each independently shippable
   (`verify_delta_catalog_transactions` is the gate):
-  - **A (no EW change):** (1) eager UPDATE post-images — write them as a parquet file at statement time
-    (merge-on-read shape with a deferred commit: park DV positions + the post-image `WrittenDataFile`);
-    (2) thread a pending-metadata override into `TryWriteStreaming` (projection/FIELD_IDS/stats schema
-    from the PENDING schema — `WriteDataFilesAsync(schemaOverride:)` already exists for the collect path)
-    so insert-under-pending-ALTER STREAMS.
-  - **B (small EW seam):** write-files-WITHOUT-snapshot (the streaming write half taking
-    (fs, root, pendingMetadata, options) instead of `CurrentSnapshot` — mapping ids are pre-assigned in
-    the parked CREATE metadata, `AssignColumnMapping` is deterministic) → CTAS-in-txn streams eagerly;
-    rollback leaves orphan parquet in a `_delta_log`-less folder (not a table to any reader; harmless).
-  - **C (unification — "virtual DeltaTable"):** `DeltaTxnBuffer` becomes a pending ACTION list; reads
-    query a synthetic snapshot = pinned snapshot ⊕ pending actions (EW `SnapshotBuilder` already replays
-    action lists — needs an open-at-synthetic-snapshot entry). Replaces `ProjectPending`/`ExcludeDeleted`/
-    `ReconcileBatch`/`ScanPendingCreated`/`WithPendingDeletes` as special cases. Enables **CDF in
-    transactions** (write `_change_data` files eagerly — the buffered DML has the pre/post rows in hand;
-    park `cdc` actions into the fused commit; rebase-safe: if the rebase succeeds, delete-delete +
-    deleteRead already guarantee our touched files were untouched, so the CDC content stays exact) and
-    optionally lifts the same-txn-DML guard (a pending `add` can legally carry a DV, so DELETE/UPDATE of
-    same-txn inserts becomes representable). **Codec catalogs go eager-per-statement** via
-    `WriteDataFilesAsync` at statement end — memory caps at ONE statement (the codec's autocommit
-    profile; root cause of codec collect = EW's parquet writer has no streaming input, only DuckDB's COPY
-    consumes the live channel — a streaming EW writer is deliberately NOT pursued).
+  - **A — DONE (2026-07-13, C#-only, no ABI):** (1) eager UPDATE post-images — on a `native_write`
+    catalog `BufferUpdateRows` writes them as a parquet file at statement time
+    (`table.WriteDataFilesAsync(postImages, schemaOverride: pending.PendingDeltaSchema)` → parks
+    `WrittenDataFile`s into `pending.Files` instead of batches; NOT NULL validated at statement time
+    since the flush only validates Batches; the existing pending-FILES ScanNative routing +
+    `DeltaNativeReader(pendingFiles/pendingDeletes/pendingSchema)` serve read-your-writes; ROLLBACK
+    orphans the file). (2) `TryWriteStreaming` gained a `pendingSchema` param (deferred-append-only,
+    guarded) driving the NOT NULL wrap + mapping rename/FIELD_IDS/stats keying — so
+    insert-under-pending-ALTER STREAMS (the `BulkInsert` gate no longer excludes `PendingMetadata`;
+    a streaming fallback (identity/iceberg) under a pending ALTER still collects — the data must not
+    commit before the schema). Codec catalogs keep in-memory batches (slice C).
+    `verify_delta_catalog_transactions.test` §30 (629, +33 write-shape pins: post-image file on storage
+    before COMMIT with the log unmoved, streamed 1000-row ALTER'd insert mid-txn, commit adds no data
+    file, rollback leaves the orphan); full delta sweep green (native_write 147 / native_read 66 /
+    update 63 / alter 116 / column_mapping 251 / constraints 50 / dv_default 58 / write 31 / variant 133
+    / partition 54 / nested_alter 100).
+  - **B — DONE (2026-07-13, C#-only + one EW param):** CTAS-in-transaction STREAMS on `native_write`
+    catalogs. `DeltaWriter.TryStreamCreateFiles` writes the CTAS data to a parquet file in the (not yet
+    existing) table folder via the native COPY — **no `_delta_log` is touched** — and parks
+    `WrittenDataFile`s + the **pre-assigned column-mapping schema** (`ColumnMapping.AssignColumnMapping`
+    runs at BUFFER time — physical names are RANDOM GUIDs, `GeneratePhysicalName` = `col-{Guid}`, so the
+    correction to the plan: assignment is NOT deterministic and must happen once, before the files). The
+    EW seam is `CreateAsync`/`OpenOrCreateAsync(preAssignedSchema:)` — the create adopts the parked
+    schema instead of re-assigning (maxId via `GetMaxColumnId`). Flush = v0 CREATE (pre-assigned) + ONE
+    `CommitDataFilesAsync` fusing the streamed files with any later collected batches;
+    `ScanPendingCreated` reads the pending files back via host `read_parquet` +
+    `ArrowColumnMappingRename.Wrap(toPhysical:false)` + the new `DeltaTxnBuffer.ProjectStream`
+    (transient-source projector, ownership moves — unlike `ProjectPending`'s clone-and-keep). Rollback
+    leaves orphan parquet in a `_delta_log`-less folder (not a table to any reader; same-name re-create
+    works — pinned). Partitioned pending creates keep the collect path (read-back would need Hive-dir
+    reconstruction). `verify_delta_catalog_transactions.test` §31 (653, +24 pins: file on storage with
+    ZERO log entries mid-txn, read-your-writes incl. WHERE + later-INSERT overlay, v0+v1 commit shape,
+    the all-NULL-on-physical-name-mismatch cross-check, rollback orphan + re-create);
+    **delta-kernel reads the eager-CTAS commit exactly** (delta_scan probe); sweep green (native_write
+    147 / write 31 / column_mapping 251 / update 63 / partition 54 / native_read 66 / txn_version 51 /
+    copy_format 96).
+  - **C1 — DONE (2026-07-13, C#-only): codec catalogs go eager-per-statement.** In EXPLICIT transactions
+    (autocommit keeps the byte-identical park-batches shape) a statement's collected batches become a
+    data file at statement end via the shared `TryEagerWriteBatches` (`WriteDataFilesAsync` — EW codec
+    writer, or DuckDB's under native_write; write-tuning spec passed; NOT NULL validated at statement
+    time) — codec-transaction memory caps at ONE statement. The A1 UPDATE post-image eager write now
+    uses the same helper (codec included). Mid-txn reads route through the existing
+    Files>0→`ScanNative` path — now exercised on pure-codec catalogs (read_parquet reads codec files,
+    already broadly validated by the native_read suite). Fallbacks that still park batches:
+    identity/iceberg (no external commit), `materialize_row_tracking` (codec appends must materialize
+    `__delta_row_id`, only EW's committing writer does), pending-created tables (later INSERTs).
+    §32 (+28 pins) — and the pre-existing codec-txn sections §1–9 (400+ assertions) pass unchanged on
+    the new path.
+  - **C2 — DONE (2026-07-13): CDF in explicit transactions** (was rejected — a real user-facing hole).
+    Every buffered statement on an (unpartitioned) CDF table writes its `_change_data` file at
+    STATEMENT time and parks the `CdcFile` action (`DeltaTxnBuffer.PendingCdc`), fused into the ONE
+    commit at flush — **inserts included**: a commit carrying ANY cdc action is read cdc-ONLY by the
+    CDF reader (inference disabled), so appends fused with DML would otherwise vanish from the feed.
+    Mechanics: appends → insert-cdc from the statement's batches (CDF appends skip the streamed path —
+    the rows must be in hand; probed once per (txn, table) via `TxnDmlProfile` + cached
+    `CdfEnabled`, which also pins the base version so the CDF flush always has a rebase base);
+    DELETE → one extra `ReadRowsByRowIds` read-back for the deleted rows' content (the position set has
+    no values); UPDATE → pre-images (read-back, committed values) + post-images, the autocommit
+    merge-on-read pair. EW seam: public `DeltaTable.WriteChangeDataFileAsync` (wraps the internal
+    `CdfWriter.WriteAsync`; cdc actions carry `DataChange=false` so concurrent readers' dataChange
+    checks ignore them; rebase-safe — delete-delete/deleteRead guarantee our touched files unchanged,
+    so captured CDC content stays exact). Still guarded (clean errors): PARTITIONED CDF tables
+    (cdc partitionValues/column re-add semantics deferred — their buffered appends stay cdc-less +
+    inference-correct since their DML is rejected, commits never mix) and DML-after-buffered-ALTER on
+    CDF (cdc files would be written against the pre-ALTER shape). §7 rewritten (positive: cdc file on
+    storage pre-COMMIT, log unmoved, rollback orphans it) + §33 (fused-commit feed EXACT per type:
+    2 inserts + delete + update pre/post with correct values; pure-append txn feed; autocommit
+    inference intact) — `verify_delta_catalog_transactions` now 732; changes 73 / dv_default 58 / dv 48
+    / update 63 / delete 28 / native_write 147 / write 31 / partition_overwrite 90 / txn_version 51 /
+    constraints 50 green.
+  - **Eager-write EDGE LIFTS — DONE (2026-07-13, follow-up pass):** (a) **materialize_row_tracking
+    appends eager-write** (the C1 gate was over-conservative — a FRESH append needs no physical
+    `__delta_row_id`; readers derive `baseRowId + position`, the validated streamed-native shape the
+    flush's own `WriteDataFilesAsync` batch path already produced). (b) **IDENTITY appends eager-write
+    with abort-on-concurrent-consumption**: values GENERATED at statement time from the pinned/chained
+    HWM (`DeltaTxnBuffer.PendingIdentityHwm` chains across statements; read-your-writes now shows REAL
+    ids — the batch park showed NULLs), files written via
+    `WriteDataFilesAsync(identityValuesPreGenerated:)` and committed via
+    `CommitDataFilesAsync(identityValuesPreGenerated:)` (both gates gained the bypass; Iceberg still
+    rejected); the flush composes the HWM into the (single) metaData action
+    (`BuildIdentityMetadataAction(marks, pending.PendingMetadata)` — never two metaData actions). EW
+    seams: `DeltaTable.GenerateIdentityValues(batches, chainedHwm)` (wraps `IdentityColumnWriter.
+    ProcessBatch` with seeded configs) + `BuildIdentityMetadataAction` + `HasIdentityColumns`/
+    `IsIcebergCompat`. Concurrency = Spark's policy for FREE: a concurrent identity-consuming commit
+    necessarily carries metaData → the rebase metadataChangedCheck aborts us (vs autocommit's
+    regenerate-retry — a deliberate liveness trade on the rare same-table-concurrent-insert);
+    non-consuming concurrent commits rebase fine. Identity×CDF in a txn is REJECTED (cdc capture would
+    precede value generation → NULL ids in the feed; the CDF probe also excludes identity tables so
+    their pure appends stay inference-correct). Kernel-validated (fused identity commit → 5 distinct
+    ids 1..5 via delta_scan). (c) **materialize UPDATE post-images bake the ORIGINAL stable ids**:
+    lifted the buffered-UPDATE materialize rejection (now partitioned-only); stable id =
+    `baseRowId[ordinal] + position` against the ordinal-ordered active set (EW's own merge-on-read
+    rule — line-checked: it does NOT read source materialized columns either), via new EW
+    `OrderedActiveBaseRowIds()` + `WriteDataFilesAsync(materializedRowIds:)` (flat/aligned,
+    unpartitioned-only like merge-on-read; appended after ToPhysical). An eager-write failure on a
+    materialize UPDATE is a HARD error (the batch park can't bake ids — never silently degrade).
+    §34+§35 (781 total): materialize txn-append file-on-storage; identity chained ids across
+    statements + distinct-after-commit + HWM continuation + rollback-regeneration; the post-image
+    parquet carries `__delta_row_id` with the ORIGINAL id (=1 for row 2). **The pre-existing
+    read-back race is FIXED (same pass)**: `ReadRowsByRowIdsAsync` + `OrderedActiveBaseRowIdsAsync`
+    gained `atVersion` (resolve the snapshot the rowids were SCANNED against — ordinals are path-sort
+    positions in THAT active set), and all three consumers (buffered UPDATE read-back, CDF-DELETE
+    read-back, materialize base-id resolution) pass `pending.PinnedVersion` — a concurrent commuting
+    append between the transaction's first scan and its DML statement can no longer shift the ordinal
+    resolution. §36 pins it with a two-connection racer (three appends land between pin and UPDATE;
+    the correct pre-image is captured deterministically — previously luck-of-the-uuid-sort);
+    `verify_delta_catalog_transactions` now 805.
+  - **C3 (virtual-snapshot unification) — DEFERRED, now a REFACTOR not a capability:** with A/B/C1/C2
+    the buffer already IS "actions + positions" (batches remain only in the narrow fallbacks above).
+    Remaining value: collapse `ProjectPending`/`ExcludeDeleted`/`ReconcileBatch`/`ScanPendingCreated`/
+    `WithPendingDeletes` into one synthetic snapshot (pinned ⊕ pending actions via EW `SnapshotBuilder`
+    replay + an open-at-synthetic-snapshot entry) and lift the same-txn-DML guard (a pending `add` can
+    legally carry a DV). Organizational payoff against a 732-assertion-pinned working subsystem — do it
+    as its own pass, not incrementally.
   - **D (S3 multi-writer commits — our own conditional PUT):** httpfs never passes `If-None-Match`, so S3
     is documented single-writer; S3 has real conditional PUTs (late 2024) and **EW already ships the
     code**: `EngineeredWood.Aws.S3TableFileSystem.RenameAsync` = server-side copy with

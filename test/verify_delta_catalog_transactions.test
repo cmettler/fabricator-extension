@@ -630,16 +630,38 @@ ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_cdf' AS cdflake (TYPE arrownet, PROVIDER
 statement ok
 CREATE TABLE cdflake.main.f AS SELECT 1 AS i UNION ALL SELECT 2;
 
+# slice C2: buffered DML on a CDF table now WORKS — the _change_data file is written eagerly at
+# statement time and its cdc action fuses into the transaction's one commit.
 statement ok
 BEGIN;
 
-statement error
+statement ok
 DELETE FROM cdflake.main.f WHERE i = 1;
+
+# the cdc file is on storage before COMMIT, the log unmoved
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_cdf/f/_change_data/*.parquet');
 ----
-Change-Data-Feed
+1
+
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_cdf/f/_delta_log/*.json');
+----
+2
 
 statement ok
 ROLLBACK;
+
+# rollback: the cdc file stays as an invisible orphan; the feed is untouched
+query I
+SELECT count(*) FROM cdflake.main.f;
+----
+2
+
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_cdf/f/_delta_log/*.json');
+----
+2
 
 # Autocommit DELETE keeps full CDF capture (direct path).
 statement ok
@@ -1778,3 +1800,734 @@ SELECT count(*) FROM arrownet_delta_snapshots('nl2', 'nc');
 
 statement ok
 DETACH nl2;
+
+# ============================================================================
+# 30. Eager-write slice A (native_write): UPDATE post-images + inserts under a
+#     pending ALTER hit STORAGE at statement time — only the commit is deferred
+# ============================================================================
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_native' AS eag (TYPE arrownet, PROVIDER 'delta', native_write true);
+
+statement ok
+CREATE TABLE eag.main.et (id INTEGER, v VARCHAR);
+
+statement ok
+INSERT INTO eag.main.et SELECT i, 'x' || i FROM range(1, 6) AS r(i);
+
+# baseline: one data file, two commits (create + insert)
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_native/et/*.parquet');
+----
+1
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE eag.main.et SET v = 'upd' WHERE id = 3;
+
+# the post-image file is ON STORAGE before COMMIT (eager write, deferred commit)...
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_native/et/*.parquet');
+----
+2
+
+# ...but the log has NOT moved
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_native/et/_delta_log/*.json');
+----
+2
+
+query T
+SELECT v FROM eag.main.et WHERE id = 3;
+----
+upd
+
+statement ok
+COMMIT;
+
+# the commit references the already-written file: one new log entry, no new data file
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_native/et/_delta_log/*.json');
+----
+3
+
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_native/et/*.parquet');
+----
+2
+
+query T
+SELECT v FROM eag.main.et WHERE id = 3;
+----
+upd
+
+# --- insert under a pending buffered ALTER now STREAMS (was: collected in memory) ---
+statement ok
+BEGIN;
+
+statement ok
+ALTER TABLE eag.main.et ADD COLUMN score DOUBLE;
+
+statement ok
+INSERT INTO eag.main.et SELECT i, 'n' || i, i * 0.5 FROM range(100, 1100) AS r(i);
+
+# the 1000-row insert streamed to a data file before COMMIT
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_native/et/*.parquet');
+----
+3
+
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_native/et/_delta_log/*.json');
+----
+3
+
+# read-your-writes through the streamed pending file, pending schema applied
+query ITR
+SELECT id, v, score FROM eag.main.et WHERE id = 100;
+----
+100	n100	50.0
+
+statement ok
+COMMIT;
+
+# metaData (ALTER) + the streamed add fused into ONE commit
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_native/et/_delta_log/*.json');
+----
+4
+
+query I
+SELECT count(*) FROM eag.main.et;
+----
+1005
+
+query R
+SELECT score FROM eag.main.et WHERE id = 105;
+----
+52.5
+
+query R
+SELECT score FROM eag.main.et WHERE id = 3;
+----
+NULL
+
+# ROLLBACK of an eager UPDATE: the post-image file stays as an invisible orphan,
+# data + log unchanged (vacuum's job — Spark's rollback shape)
+statement ok
+BEGIN;
+
+statement ok
+UPDATE eag.main.et SET v = 'doomed' WHERE id = 4;
+
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_native/et/*.parquet');
+----
+4
+
+statement ok
+ROLLBACK;
+
+query T
+SELECT v FROM eag.main.et WHERE id = 4;
+----
+x4
+
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_native/et/_delta_log/*.json');
+----
+4
+
+statement ok
+DETACH eag;
+
+# ============================================================================
+# 31. Eager-write slice B (native_write): CTAS-in-transaction STREAMS its data
+#     to storage at statement time — no _delta_log until COMMIT
+# ============================================================================
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_native' AS eb (TYPE arrownet, PROVIDER 'delta', native_write true);
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE eb.main.bt AS SELECT i AS id, 'v' || i AS v FROM range(1, 1001) r(i);
+
+# the CTAS data is ON STORAGE (streamed file)...
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_native/bt/*.parquet');
+----
+1
+
+# ...but NO _delta_log exists yet (nothing committed)
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_native/bt/_delta_log/*.json');
+----
+0
+
+# read-your-writes serves from the streamed file (physical->logical rename through the
+# pre-assigned mapping schema; default column_mapping is 'name')
+query I
+SELECT count(*) FROM eb.main.bt;
+----
+1000
+
+query T
+SELECT v FROM eb.main.bt WHERE id = 42;
+----
+v42
+
+# a later INSERT into the pending table collects + overlays
+statement ok
+INSERT INTO eb.main.bt VALUES (5000, 'extra');
+
+query I
+SELECT count(*) FROM eb.main.bt;
+----
+1001
+
+statement ok
+COMMIT;
+
+# v0 CREATE (with the PRE-ASSIGNED physical names the streamed file was written under) + ONE write
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_native/bt/_delta_log/*.json');
+----
+2
+
+# committed reads resolve the mapping — a physical-name mismatch would read all-NULL here
+query I
+SELECT count(*) FROM eb.main.bt WHERE v IS NOT NULL;
+----
+1001
+
+query T
+SELECT v FROM eb.main.bt WHERE id = 42;
+----
+v42
+
+query T
+SELECT v FROM eb.main.bt WHERE id = 5000;
+----
+extra
+
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('eb', 'bt');
+----
+2
+
+# ROLLBACK: streamed CTAS file stays as an orphan in a LOG-LESS folder — not a table to anyone
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE eb.main.doomed AS SELECT i AS id FROM range(1, 101) r(i);
+
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_native/doomed/*.parquet');
+----
+1
+
+statement ok
+ROLLBACK;
+
+statement error
+SELECT count(*) FROM eb.main.doomed;
+----
+
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_native/doomed/_delta_log/*.json');
+----
+0
+
+# re-creating the same name in autocommit works; the orphan stays invisible
+statement ok
+CREATE TABLE eb.main.doomed AS SELECT i AS id FROM range(1, 4) r(i);
+
+query I
+SELECT count(*) FROM eb.main.doomed;
+----
+3
+
+statement ok
+DETACH eb;
+
+# ============================================================================
+# 32. Eager-write slice C1 (CODEC catalog, explicit txns): a statement's rows
+#     become a data file at statement end — memory caps at one statement
+# ============================================================================
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_eagercodec' AS ec (TYPE arrownet, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE ec.main.ct (id INTEGER, v VARCHAR);
+
+statement ok
+INSERT INTO ec.main.ct SELECT i, 'x' || i FROM range(1, 6) AS r(i);
+
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_eagercodec/ct/*.parquet');
+----
+1
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO ec.main.ct SELECT i, 'y' || i FROM range(100, 600) AS r(i);
+
+# the insert is a data file ON STORAGE (EW codec writer), log unmoved
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_eagercodec/ct/*.parquet');
+----
+2
+
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_eagercodec/ct/_delta_log/*.json');
+----
+2
+
+# read-your-writes on a CODEC catalog with pending files (routes via the native per-file reader)
+query I
+SELECT count(*) FROM ec.main.ct;
+----
+505
+
+query T
+SELECT v FROM ec.main.ct WHERE id = 100;
+----
+y100
+
+# buffered UPDATE: post-image file written eagerly (codec writer)
+statement ok
+UPDATE ec.main.ct SET v = 'upd' WHERE id = 3;
+
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_eagercodec/ct/*.parquet');
+----
+3
+
+query T
+SELECT v FROM ec.main.ct WHERE id = 3;
+----
+upd
+
+statement ok
+DELETE FROM ec.main.ct WHERE id = 4;
+
+query I
+SELECT count(*) FROM ec.main.ct;
+----
+504
+
+statement ok
+COMMIT;
+
+# ONE fused commit; the eagerly-written files are referenced, none rewritten
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_eagercodec/ct/_delta_log/*.json');
+----
+3
+
+query I
+SELECT count(*) FROM ec.main.ct;
+----
+504
+
+query T
+SELECT v FROM ec.main.ct WHERE id = 3;
+----
+upd
+
+# ROLLBACK: eager codec files stay as invisible orphans
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO ec.main.ct VALUES (9999, 'doomed');
+
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_eagercodec/ct/*.parquet');
+----
+4
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM ec.main.ct;
+----
+504
+
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_eagercodec/ct/_delta_log/*.json');
+----
+3
+
+# autocommit stays on the classic per-statement codec write path (unchanged)
+statement ok
+INSERT INTO ec.main.ct VALUES (7777, 'auto');
+
+query T
+SELECT v FROM ec.main.ct WHERE id = 7777;
+----
+auto
+
+statement ok
+DETACH ec;
+
+# ============================================================================
+# 33. Slice C2: full CDF capture in explicit transactions — the fused commit's
+#     feed is exact (cdc-only rule: inserts, deletes, update pre/post images)
+# ============================================================================
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_cdf2' AS cf (TYPE arrownet, PROVIDER 'delta', change_data_feed true);
+
+statement ok
+CREATE TABLE cf.main.t (id INTEGER, v VARCHAR);
+
+statement ok
+INSERT INTO cf.main.t VALUES (1, 'a'), (2, 'b'), (3, 'c');
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO cf.main.t VALUES (4, 'd'), (5, 'e');
+
+statement ok
+DELETE FROM cf.main.t WHERE id = 2;
+
+statement ok
+UPDATE cf.main.t SET v = 'A' WHERE id = 1;
+
+# read-your-writes across all three
+query IT
+SELECT id, v FROM cf.main.t ORDER BY id;
+----
+1	A
+3	c
+4	d
+5	e
+
+statement ok
+COMMIT;
+
+query IT
+SELECT id, v FROM cf.main.t ORDER BY id;
+----
+1	A
+3	c
+4	d
+5	e
+
+# ONE fused commit (create=0, seed=1, txn=2)
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('cf', 't');
+----
+3
+
+# the fused version's feed: 2 inserts + 1 delete + update pre/post — exact, nothing inferred
+query TII
+SELECT _change_type, count(*), min(id)
+FROM arrownet_delta_changes('cf', 't', 2, 2)
+GROUP BY _change_type ORDER BY _change_type;
+----
+delete	1	2
+insert	2	4
+update_postimage	1	1
+update_preimage	1	1
+
+# update images carry the right values
+query T
+SELECT v FROM arrownet_delta_changes('cf', 't', 2, 2) WHERE _change_type = 'update_preimage';
+----
+a
+
+query T
+SELECT v FROM arrownet_delta_changes('cf', 't', 2, 2) WHERE _change_type = 'update_postimage';
+----
+A
+
+# the seed autocommit insert stays inference-based and intact
+query TI
+SELECT _change_type, count(*) FROM arrownet_delta_changes('cf', 't', 1, 1) GROUP BY _change_type;
+----
+insert	3
+
+# a pure-append explicit txn on a CDF table: commits WITH cdc (insert rows) — feed still exact
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO cf.main.t VALUES (6, 'f');
+
+statement ok
+COMMIT;
+
+query TI
+SELECT _change_type, count(*) FROM arrownet_delta_changes('cf', 't', 3, 3) GROUP BY _change_type;
+----
+insert	1
+
+statement ok
+DETACH cf;
+
+# ============================================================================
+# 34. Eager appends on materialize_row_tracking + IDENTITY tables
+# ============================================================================
+
+# --- materialize_row_tracking: fresh appends need no physical __delta_row_id (baseRowId at commit) ---
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_mat' AS mt (TYPE arrownet, PROVIDER 'delta', row_tracking true, materialize_row_tracking true);
+
+statement ok
+CREATE TABLE mt.main.m (id INTEGER, v VARCHAR);
+
+statement ok
+INSERT INTO mt.main.m VALUES (1, 'a');
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO mt.main.m SELECT i, 'v' || i FROM range(10, 210) r(i);
+
+# eagerly on storage, log unmoved
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_mat/m/*.parquet');
+----
+2
+
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_mat/m/_delta_log/*.json');
+----
+2
+
+query I
+SELECT count(*) FROM mt.main.m;
+----
+201
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM mt.main.m;
+----
+201
+
+statement ok
+DETACH mt;
+
+# --- identity: values generated at STATEMENT time from the pinned/chained HWM ---
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_ident' AS idl (TYPE arrownet, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE idl.main.t (id BIGINT AS (0), v VARCHAR);
+
+statement ok
+INSERT INTO idl.main.t (v) VALUES ('a'), ('b');
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO idl.main.t (v) VALUES ('c'), ('d');
+
+# eager file on storage, log unmoved
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_ident/t/*.parquet');
+----
+2
+
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_ident/t/_delta_log/*.json');
+----
+2
+
+# read-your-writes shows the REAL generated ids (the batch park showed NULLs)
+query I
+SELECT count(DISTINCT id) FROM idl.main.t;
+----
+4
+
+query I
+SELECT count(*) FROM idl.main.t WHERE id IS NULL;
+----
+0
+
+# a second statement CHAINS the pending high-water mark — no duplicate ids
+statement ok
+INSERT INTO idl.main.t (v) VALUES ('e'), ('f');
+
+query I
+SELECT count(DISTINCT id) FROM idl.main.t;
+----
+6
+
+statement ok
+COMMIT;
+
+# committed: 6 distinct engine-assigned values, one fused commit (create=0, seed=1, txn=2)
+query I
+SELECT count(DISTINCT id) FROM idl.main.t;
+----
+6
+
+query I
+SELECT count(*) FROM arrownet_delta_snapshots('idl', 't');
+----
+3
+
+# the committed HWM continues in a later autocommit insert (no reuse of txn-consumed ids)
+statement ok
+INSERT INTO idl.main.t (v) VALUES ('g');
+
+query I
+SELECT count(DISTINCT id) FROM idl.main.t;
+----
+7
+
+# ROLLBACK discards baked values; the next transaction regenerates from the COMMITTED mark
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO idl.main.t (v) VALUES ('doomed');
+
+statement ok
+ROLLBACK;
+
+statement ok
+INSERT INTO idl.main.t (v) VALUES ('h');
+
+query I
+SELECT count(DISTINCT id) FROM idl.main.t;
+----
+8
+
+statement ok
+DETACH idl;
+
+# ============================================================================
+# 35. Materialize_row_tracking UPDATE in a transaction: post-images bake the
+#     ORIGINAL stable row ids into the declared __delta_row_id column
+# ============================================================================
+
+# column_mapping 'none': the pins below read the RAW parquet files by logical column name.
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_mat' AS mu (TYPE arrownet, PROVIDER 'delta', row_tracking true, materialize_row_tracking true, column_mapping 'none');
+
+statement ok
+CREATE TABLE mu.main.u (id INTEGER, v VARCHAR);
+
+statement ok
+INSERT INTO mu.main.u VALUES (1, 'a'), (2, 'b'), (3, 'c');
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE mu.main.u SET v = 'B' WHERE id = 2;
+
+query T
+SELECT v FROM mu.main.u WHERE id = 2;
+----
+B
+
+statement ok
+COMMIT;
+
+query IT
+SELECT id, v FROM mu.main.u ORDER BY id;
+----
+1	a
+2	B
+3	c
+
+# both files carry the materialized column (the autocommit codec seed materializes via EW's
+# committing writer; the post-image bakes the ORIGINAL ids)
+query I
+SELECT count(DISTINCT file_name) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/txn_mat/u/*.parquet') WHERE name = '__delta_row_id';
+----
+2
+
+# the baked id is the ORIGINAL stable id of row 2 (seed file baseRowId=0 -> position 1)
+query I
+SELECT "__delta_row_id" FROM read_parquet('${ARROWNET_DELTA_WRITE_DIR}/txn_mat/u/*.parquet', union_by_name=true) WHERE v = 'B';
+----
+1
+
+statement ok
+DETACH mu;
+
+# ============================================================================
+# 36. Version-pinned read-back: an UPDATE's post-image content is read AT the
+#     transaction's pinned version — concurrent appends (which can shift the
+#     path-sort ordinals) can never make it read the wrong rows
+# ============================================================================
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_codec' AS vr (TYPE arrownet, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE vr.main.vrt (id INTEGER, v VARCHAR);
+
+statement ok
+INSERT INTO vr.main.vrt VALUES (1, 'one'), (2, 'two'), (3, 'three');
+
+statement ok con1
+BEGIN;
+
+# pin the transaction's snapshot with a scan
+query I con1
+SELECT count(*) FROM vr.main.vrt;
+----
+3
+
+# a second connection lands several appends between the pin and the UPDATE —
+# each new file can sort anywhere in the ordinal ordering
+statement ok con2
+INSERT INTO vr.main.vrt VALUES (100, 'x');
+
+statement ok con2
+INSERT INTO vr.main.vrt VALUES (101, 'y');
+
+statement ok con2
+INSERT INTO vr.main.vrt VALUES (102, 'z');
+
+# the UPDATE's read-back resolves ordinals against the PINNED snapshot: it must
+# capture 'two' (the correct pre-image), regardless of where the new files sorted
+statement ok con1
+UPDATE vr.main.vrt SET v = 'TWO' WHERE id = 2;
+
+query T con1
+SELECT v FROM vr.main.vrt WHERE id = 2;
+----
+TWO
+
+# the flush rebases over the commuting appends and commits
+statement ok con1
+COMMIT;
+
+# both sides landed: the racer's rows AND the correct update
+query IT
+SELECT id, v FROM vr.main.vrt ORDER BY id;
+----
+1	one
+2	TWO
+3	three
+100	x
+101	y
+102	z
+
+statement ok
+DETACH vr;

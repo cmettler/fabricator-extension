@@ -477,7 +477,25 @@ internal static class DeltaReader
     /// <summary>The table properties buffered (explicit-transaction) DML needs, probed in ONE table open,
     /// plus the current version (the pin fallback when no scan pinned the transaction yet).</summary>
     public readonly record struct TxnDmlProfile(
-        bool DvEnabled, bool CdfEnabled, bool SupportsExternalCommit, long Version);
+        bool DvEnabled, bool CdfEnabled, bool SupportsExternalCommit, long Version, bool Partitioned);
+
+    /// <summary>The active files' baseRowIds in transient-rowid ordinal order (see
+    /// <see cref="DeltaTable.OrderedActiveBaseRowIds"/>) — resolves a matched row's ORIGINAL stable id
+    /// for the buffered UPDATE's materialized post-images.</summary>
+    public static IReadOnlyList<long?> GetOrderedActiveBaseRowIds(nint opener, string path,
+                                                                  long? atVersion = null)
+    {
+        var fs = TableFileSystems.Create(opener, path);
+        var table = DeltaTable.OpenAsync(fs).GetAwaiter().GetResult();
+        try
+        {
+            return table.OrderedActiveBaseRowIdsAsync(atVersion).AsTask().GetAwaiter().GetResult();
+        }
+        finally
+        {
+            table.Dispose();
+        }
+    }
 
     public static TxnDmlProfile GetTxnDmlProfile(nint opener, string path)
     {
@@ -493,7 +511,8 @@ internal static class DeltaReader
                 && cfg.TryGetValue("delta.enableChangeDataFeed", out var c)
                 && string.Equals(c, "true", System.StringComparison.OrdinalIgnoreCase);
             return new TxnDmlProfile(dv, cdf, table.SupportsExternalDataFileCommit,
-                                     table.CurrentSnapshot.Version);
+                                     table.CurrentSnapshot.Version,
+                                     table.CurrentSnapshot.Metadata.PartitionColumns.Count > 0);
         }
         finally
         {
@@ -524,7 +543,8 @@ internal static class DeltaReader
     /// (Arrow-IPC round-trip — engineered-wood batch buffers do not outlive the open table) WITH the
     /// trailing virtual <c>_metadata.row_id</c> column. The read-back step of a buffered UPDATE.</summary>
     public static List<RecordBatch> ReadRowsByRowIds(
-        nint opener, string path, IReadOnlyCollection<long> rowIds, CancellationToken ct)
+        nint opener, string path, IReadOnlyCollection<long> rowIds, CancellationToken ct,
+        long? atVersion = null)
     {
         var fs = TableFileSystems.Create(opener, path);
         var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options()).GetAwaiter().GetResult();
@@ -532,7 +552,7 @@ internal static class DeltaReader
         {
             var ms = new System.IO.MemoryStream();
             Apache.Arrow.Ipc.ArrowStreamWriter? w = null;
-            var e = table.ReadRowsByRowIdsAsync(rowIds, ct).GetAsyncEnumerator(ct);
+            var e = table.ReadRowsByRowIdsAsync(rowIds, ct, atVersion).GetAsyncEnumerator(ct);
             try
             {
                 while (e.MoveNextAsync().AsTask().GetAwaiter().GetResult())
