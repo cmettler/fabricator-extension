@@ -3249,6 +3249,58 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// full rewrite (clean error). For ADD COLUMN <paramref name="a1"/> = the new column's name and
     /// <paramref name="c"/> carries its Arrow type + nullability; for RENAME TABLE <paramref name="a1"/> = the new
     /// table name.</summary>
+    // RENAME TABLE of a PENDING-CREATED table: nothing is on storage under the old name except this
+    // transaction's eagerly-streamed files (slice B) — move them to the new folder (atomic dir move
+    // where the FS supports it, per-file copy+delete otherwise: object stores) and re-key the buffer.
+    // The flush then creates the table at the FINAL path. Codec pending-creates park batches (no files)
+    // — pure re-key.
+    private void RenamePendingCreated(long txnId, string schemaName, string tableName, string newName,
+                                      DeltaTxnBuffer.PendingAppends pending)
+    {
+        string oldPath = TablePath(schemaName, tableName);
+        string newPath = TablePath(schemaName, newName);
+        if (_txnBuffer.HasPending(txnId, newPath) || TableExists(newPath))
+        {
+            throw new System.InvalidOperationException(
+                $"delta RENAME TABLE: target '{schemaName}.{newName}' already exists.");
+        }
+        var opener = Opener();
+        if (pending.Files.Count > 0)
+        {
+            if (FabricLakehouse.IsOneLake(_root))
+            {
+                FabricLakehouse.RenameDirectory(oldPath, newPath, _fabricCredential);
+            }
+            else
+            {
+                try
+                {
+                    HostFs.MoveDir(opener, oldPath, newPath);
+                }
+                catch
+                {
+                    // Object store without directory move (S3): the folder holds ONLY this
+                    // transaction's eager files — copy each and delete the source.
+                    var src = new DuckDbTableFileSystem(opener, oldPath);
+                    var dst = new DuckDbTableFileSystem(opener, newPath);
+                    foreach (var wf in pending.Files)
+                    {
+                        var bytes = src.ReadAllBytesAsync(wf.RelativePath).AsTask().GetAwaiter().GetResult();
+                        dst.WriteAllBytesAsync(wf.RelativePath, bytes).AsTask().GetAwaiter().GetResult();
+                        src.DeleteAsync(wf.RelativePath).AsTask().GetAwaiter().GetResult();
+                    }
+                }
+            }
+        }
+        if (!_txnBuffer.RenameTable(txnId, oldPath, newPath))
+        {
+            throw new System.InvalidOperationException(
+                $"delta RENAME TABLE: could not re-key the pending table '{schemaName}.{tableName}'.");
+        }
+        _log.LogInformation("delta txn {Txn} rename pending-created {Old} -> {New} ({Files} file(s) moved)",
+            txnId, oldPath, newPath, pending.Files.Count);
+    }
+
     public void AlterTable(int k, string s, string t, string? a1, string? a2, Field? c, int f)
     {
         // Explicit transaction (slice 3): schema-evolution ALTERs buffer — the metaData (+ protocol)
@@ -3304,6 +3356,19 @@ public sealed class DeltaCatalog : IBackendCatalog
                         ParseJsonPath(a1, "DROP COLUMN (nested field)"));
                     return;
             }
+        }
+        // RENAME TABLE of a table CREATED in this transaction (dbt's table materialization: CREATE
+        // <model>__dbt_tmp AS …; ALTER <model> RENAME TO <model>__dbt_backup; ALTER <model>__dbt_tmp
+        // RENAME TO <model>; COMMIT): the table exists only in the buffer, so the rename re-keys the
+        // buffer entry and moves any eagerly-written files to the new folder — the flush then creates
+        // the table at its FINAL path.
+        if (k == AlterKind.RenameTable
+            && _txnBuffer.Get(alterTxn, TablePath(s, t)) is { PendingCreate: true } pendingRen)
+        {
+            string renTo = a1 ?? throw new System.InvalidOperationException(
+                "delta RENAME TABLE requires a new table name.");
+            RenamePendingCreated(alterTxn, s, t, renTo, pendingRen);
+            return;
         }
         ThrowIfPendingAppends(TablePath(s, t), "ALTER TABLE");
         _log.LogInformation("delta alter {Schema}.{Table}: kind={Kind} arg={Arg}", s, t, k, a1);

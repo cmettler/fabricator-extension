@@ -142,6 +142,16 @@ internal sealed class DeltaTxnBuffer
 
     public bool HasPending(long txnId, string tablePath) => Get(txnId, tablePath) is not null;
 
+    /// <summary>Re-keys ONE table's buffer under a new path (RENAME TABLE of a table CREATED in the same
+    /// transaction — dbt's tmp-swap shape; the caller moves any eagerly-written files). False when the
+    /// old path has no buffer or the new path already has one.</summary>
+    public bool RenameTable(long txnId, string oldPath, string newPath)
+    {
+        return _byTxn.TryGetValue(txnId, out var tables)
+               && tables.TryRemove(oldPath, out var p)
+               && tables.TryAdd(newPath, p);
+    }
+
     /// <summary>Discards ONE table's buffer (a CREATE + DROP inside the same transaction cancels out —
     /// nothing ever touched storage).</summary>
     public void RemoveTable(long txnId, string tablePath)

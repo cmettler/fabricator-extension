@@ -2705,3 +2705,107 @@ ROLLBACK;
 
 statement ok
 DETACH sdc;
+
+# ============================================================================
+# 38. RENAME TABLE of a pending-created table — dbt's table-materialization
+#     swap (CREATE tmp AS ...; RENAME old->backup; RENAME tmp->old; COMMIT)
+# ============================================================================
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_dbtswap' AS dw (TYPE arrownet, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE dw.main.m AS SELECT 1 AS id, 'old' AS v;
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE dw.main.m__dbt_tmp AS SELECT i AS id, 'new' || i AS v FROM range(1, 51) r(i);
+
+statement ok
+ALTER TABLE dw.main.m RENAME TO m__dbt_backup;
+
+statement ok
+ALTER TABLE dw.main.m__dbt_tmp RENAME TO m;
+
+# read-your-writes under the FINAL name
+query I
+SELECT count(*) FROM dw.main.m;
+----
+50
+
+statement ok
+COMMIT;
+
+statement ok
+DROP TABLE dw.main.m__dbt_backup;
+
+query IT
+SELECT id, v FROM dw.main.m WHERE id = 7;
+----
+7	new7
+
+query I
+SELECT count(*) FROM dw.main.m;
+----
+50
+
+statement ok
+DETACH dw;
+
+# same swap on a native_write catalog (the pending create carries eagerly-STREAMED files — the
+# rename must move them to the new folder)
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_dbtswap_n' AS dwn (TYPE arrownet, PROVIDER 'delta', native_write true);
+
+statement ok
+CREATE TABLE dwn.main.m AS SELECT 1 AS id, 'old' AS v;
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE dwn.main.m__dbt_tmp AS SELECT i AS id, 'new' || i AS v FROM range(1, 501) r(i);
+
+# the eager file is on storage under the TMP folder
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_dbtswap_n/m__dbt_tmp/*.parquet');
+----
+1
+
+statement ok
+ALTER TABLE dwn.main.m RENAME TO m__dbt_backup;
+
+statement ok
+ALTER TABLE dwn.main.m__dbt_tmp RENAME TO m;
+
+query I
+SELECT count(*) FROM dwn.main.m;
+----
+500
+
+statement ok
+COMMIT;
+
+statement ok
+DROP TABLE dwn.main.m__dbt_backup;
+
+query I
+SELECT count(*) FROM dwn.main.m;
+----
+500
+
+# the files moved with the rename: table folder has data + log, tmp folder has no log
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_dbtswap_n/m/*.parquet');
+----
+1
+
+query I
+SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_dbtswap_n/m__dbt_tmp/_delta_log/*.json');
+----
+0
+
+statement ok
+DETACH dwn;

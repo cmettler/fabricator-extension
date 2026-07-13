@@ -317,6 +317,34 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     **The deltars provider gets the same for free via storage_options**: delta-rs enables native S3
     conditional-put locking with `conditional_put: "etag"` (no DynamoDB `AWS_S3_LOCKING_PROVIDER`
     needed) — add it to `DeltaRsCatalog`'s `storage_options` when S3 discovery lands.
+  - **dbt REGRESSION found + FIXED by re-running the lakehouse harness (2026-07-13):** dbt's table
+    materialization swaps via `CREATE <model>__dbt_tmp AS …; ALTER <model> RENAME TO <model>__dbt_backup;
+    ALTER <model>__dbt_tmp RENAME TO <model>; COMMIT` — the second RENAME hits a table CREATED in the
+    same transaction, which the buffered-CREATE work rejected ("uncommitted buffered changes"), failing
+    EVERY dbt table model on Delta targets (and the already-executed immediate old→backup folder rename
+    is NOT undone by the rollback — the pre-existing non-transactional-RENAME hole made it worse). Fix:
+    **RENAME TABLE of a PENDING-CREATED table** re-keys the buffer (`DeltaTxnBuffer.RenameTable`) and
+    moves any eagerly-streamed files to the new folder (OneLake DFS rename / `HostFs.MoveDir` / per-file
+    copy+delete fallback for S3); the flush then creates the table at its FINAL path. §38 pins the dbt
+    swap on codec + native_write catalogs (`verify_delta_catalog_transactions` 888).
+    **dbt harness status (all re-validated):** `lakehouse` (OneLake) `dbt run --threads 4` PASS=4/4
+    (~77s); NEW **`minio` target** (S3 Delta catalog; profile s3 secret + the onelake_attach plugin
+    gained `curl_insecure` for the rig's self-signed TLS; the ATTACH `SECRET minio_s3` also engages the
+    slice-D conditional commits) PASS=4/4 (~9s). NEW **`delta_external` materialization**
+    (`macros/delta_external.sql`): dbt-duckdb's built-in `external` whitelists csv/parquet/json, so a
+    custom materialization runs `COPY (model) TO '<location>' (FORMAT delta, MODE …)` (any location —
+    s3://, onelake://, local; no ATTACH) + registers a view over `arrownet_delta_scan(location)` for
+    downstream refs (model config: `database=target.database` so the view lands in the writable local
+    db); demo `models/ext_delta.sql` aggregates a Delta-catalog model → standalone Delta table on
+    MinIO, read-back verified. NEW **dbt SNAPSHOTS work on Delta catalogs** (`snapshots/customers_snap`,
+    check strategy): the SCD-2 merge = staging CTAS (a buffered pending-create the post-snapshot DROP
+    cancels) + UPDATE (close old versions) + INSERT (new versions) in ONE dbt transaction — the buffered
+    DML machinery end-to-end. Crux: dbt-duckdb's `make_temp_relation` NULLS database/schema → the
+    staging lands in the LOCAL db and DuckDB's one-write-database-per-transaction rule kills the merge
+    ("a single transaction can only write to a single attached database") — project macro
+    `build_snapshot_staging_table` override stages IN THE TARGET'S database
+    (`macros/snapshot_staging.sql`). SCD-2 validated on MinIO (changed row: old version closed by the
+    UPDATE + new current INSERTed; new key inserted) AND live OneLake (bronze→silver, two versions).
   - **Stays immediate:** identity creates (value generation + HWM update are coupled inside EW's
     committing writer — `WriteDataFilesAsync` rejects identity tables by design), DROP/OPTIMIZE/VACUUM
     (physical/administrative — no rollback semantics possible). CREATE-OR-REPLACE + partition-overwrite
