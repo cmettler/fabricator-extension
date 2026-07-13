@@ -109,7 +109,7 @@ equivalent):
 | ALTER ADD/RENAME/DROP COLUMN, nested ADD/DROP FIELD | metaData (+ protocol upgrade) computed at statement time, parked; joins the fused commit; overlays serve the pending schema mid-txn | ALTERs must precede the txn's data changes; nested RENAME FIELD stays immediate; RENAME of a partition column rejected in a txn |
 | RENAME TABLE | immediate (physical folder move) — **except** a pending-created table, which re-keys the buffer + moves the eagerly-streamed files (the dbt tmp-swap case) | |
 | CREATE OR REPLACE, DROP, OPTIMIZE, VACUUM | **immediate**, never buffered; rejected with "uncommitted buffered changes" if the table has pending changes | replace removes are snapshot-coupled; DROP/VACUUM are physical |
-| CDF tables (any DML/append) | the statement's `_change_data` file is written eagerly and the cdc action parked — **including plain inserts** (a commit carrying any cdc action is read cdc-only, so appends fused with DML would otherwise vanish from the feed) | partitioned CDF tables and DML-after-buffered-ALTER on CDF rejected; identity×CDF in a txn rejected |
+| CDF tables (any DML/append) | the statement's `_change_data` files are written eagerly (split per partition, partition columns excluded from the bytes) and the cdc actions parked — **including plain inserts** (a commit carrying any cdc action is read cdc-only, so appends fused with DML would otherwise vanish from the feed) | DML-after-buffered-ALTER on CDF rejected; identity×CDF in a txn rejected |
 | `arrownet_delta_set_transaction_version(…)` | parks the app-transaction version; flush CASes it against the latest snapshot and emits the spec `txn` action atomically with the fused commit (idempotent-append protection) | requires an explicit transaction |
 
 A statement error **aborts the whole DuckDB transaction** (standard DuckDB behavior); the buffer is
@@ -121,7 +121,7 @@ From `EnsureBufferedDmlEligible` + the buffering gates:
 
 - Buffered DELETE/UPDATE ⇒ table must have **deletion vectors** (else: autocommit copy-on-write).
 - Buffered UPDATE ⇒ additionally not identity/IcebergCompat.
-- CDF + (partitioned ∨ identity/IcebergCompat) ⇒ buffered DML rejected.
+- CDF + identity/IcebergCompat ⇒ buffered DML rejected (partitioned CDF works).
 - DML on a CDF table after a buffered ALTER ⇒ rejected (cdc files would be pre-ALTER-shaped).
 - DML/ALTER on a **pending-created** table ⇒ rejected ("COMMIT the CREATE first"); a later INSERT
   into it is fine (it joins the create's single WRITE).

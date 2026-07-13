@@ -230,8 +230,11 @@ insert	4
 update_postimage	1
 update_preimage	1
 
-# ---- the REMAINING P5-rewrite gap: CDF × PARTITIONED still takes copy-on-write (the cdc
-#      partitionValues corner), whose new add carries no row tracking ----
+# ---- CDF × PARTITIONED merge-on-read (slice 4): the last gate — ids preserved, and the feed's
+#      partition column comes from the cdc action's partitionValues (cdc files exclude it from the
+#      bytes, the data-file convention; a partition-key SET shows old/new partitions in pre/post).
+#      The only shapes still falling to copy-on-write (row tracking lost) are type-widened and
+#      IcebergCompat tables — neither creatable by this provider. ----
 
 statement ok
 CREATE TABLE lake4.main.cdp (id BIGINT, region VARCHAR, s VARCHAR) PARTITIONED BY (region);
@@ -240,12 +243,57 @@ statement ok
 INSERT INTO lake4.main.cdp SELECT r, CASE WHEN r % 2 = 0 THEN 'US' ELSE 'EU' END, 'v' || r FROM range(4) t(r);
 
 statement ok
-UPDATE lake4.main.cdp SET s = 'cow' WHERE id = 1;
+UPDATE lake4.main.cdp SET s = 'mor' WHERE id = 1;
 
 query II
-SELECT id, __delta_row_id IS NULL FROM lake4.main.cdp WHERE id = 1;
+SELECT id, __delta_row_id FROM lake4.main.cdp WHERE id = 1;
 ----
-1	true
+1	2
+
+query TTIT
+SELECT _change_type, region, id, s FROM arrownet_delta_changes('lake4', 'main.cdp', 2) ORDER BY _change_type;
+----
+update_postimage	EU	1	mor
+update_preimage	EU	1	v1
+
+# partition-key SET: the feed shows the move (pre in the old partition, post in the new)
+statement ok
+UPDATE lake4.main.cdp SET region = 'APAC' WHERE id = 3;
+
+query TTI
+SELECT _change_type, region, id FROM arrownet_delta_changes('lake4', 'main.cdp', 3) ORDER BY _change_type;
+----
+update_postimage	APAC	3
+update_preimage	EU	3
+
+query II
+SELECT id, __delta_row_id IS NOT NULL FROM lake4.main.cdp WHERE id = 3;
+----
+3	true
+
+# buffered txn on partitioned CDF (guard lifted): one fused commit, exact feed
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO lake4.main.cdp VALUES (20, 'US', 'v20');
+
+statement ok
+UPDATE lake4.main.cdp SET s = 'txn' WHERE id = 2;
+
+statement ok
+DELETE FROM lake4.main.cdp WHERE id = 0;
+
+statement ok
+COMMIT;
+
+query TTIT
+SELECT _change_type, region, id, s FROM arrownet_delta_changes('lake4', 'main.cdp', 4) ORDER BY _change_type, id;
+----
+delete	US	0	v0
+insert	US	20	v20
+update_postimage	US	2	txn
+update_preimage	US	2	v2
 
 statement ok
 DETACH lake4;

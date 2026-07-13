@@ -1599,7 +1599,7 @@ public sealed class DeltaCatalog : IBackendCatalog
             if (_txnBuffer.IsExplicit(txnId) && !pending.PendingCreate && pending.CdfEnabled is null)
             {
                 var prof = DeltaReader.GetTxnDmlProfile(opener, tablePath);
-                pending.CdfEnabled = prof.CdfEnabled && !prof.Partitioned && prof.SupportsExternalCommit;
+                pending.CdfEnabled = prof.CdfEnabled && prof.SupportsExternalCommit;
                 if (pending.CdfEnabled == true)
                 {
                     pending.PinnedVersion ??= SnapshotPinning.TryGetPinned(txnId, tablePath) ?? prof.Version;
@@ -2245,12 +2245,11 @@ public sealed class DeltaCatalog : IBackendCatalog
                 $"delta: {op} inside an explicit transaction requires deletion vectors on the table (this "
                 + "table has them disabled) — run it in autocommit (copy-on-write), or COMMIT first.");
         }
-        if (p.CdfEnabled && (p.Partitioned || !p.SupportsExternalCommit))
+        if (p.CdfEnabled && !p.SupportsExternalCommit)
         {
             throw new System.NotSupportedException(
-                $"delta: {op} inside an explicit transaction is not supported on a "
-                + (p.Partitioned ? "PARTITIONED" : "identity/IcebergCompat")
-                + " Change-Data-Feed table yet — run it in autocommit (full CDF capture applies there).");
+                $"delta: {op} inside an explicit transaction is not supported on an identity/IcebergCompat "
+                + "Change-Data-Feed table yet — run it in autocommit (full CDF capture applies there).");
         }
         if (forUpdate && !p.SupportsExternalCommit)
         {
@@ -2534,7 +2533,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 {
                     continue;
                 }
-                pending.PendingCdc.Add(table.WriteChangeDataFileAsync(b, changeType)
+                pending.PendingCdc.AddRange(table.WriteChangeDataFileAsync(b, changeType)
                     .AsTask().GetAwaiter().GetResult());
             }
         }

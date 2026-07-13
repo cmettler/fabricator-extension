@@ -564,13 +564,12 @@ defaultRowCommitVersion)` — the durable identity, vs the transient `rowid` loc
   gate lifts; the source file's own materialized ids are honored, so it holds post-OPTIMIZE too; a SET of
   the PARTITION column moves the row to its new partition with identity intact); DV DELETE removes the id;
   OPTIMIZE preserves both (compaction materializes); a transaction's pending rows read NULL (baseRowId
-  assigned at commit). CDF tables preserve too (merge-on-read emits update_preimage/postimage cdc files;
-  the commit is read cdc-only so nothing double-counts). **Known gap (pinned):** an UPDATE on a
-  CDF × PARTITIONED (or type-widened) table still takes the copy-on-write rewrite, whose new `add`
-  carries no row tracking (the deferred P5-rewrite gap) — those rows read NULL. Follow-up: the buffered
-  path's read-back still resolves ids by `baseRowId + ordinal position` (no materialized-source read) —
-  same post-OPTIMIZE caveat there.
-- Test: `test/verify_delta_row_tracking_virtual.test` (127).
+  assigned at commit). CDF tables preserve too — partitioned included (merge-on-read emits per-partition
+  update_preimage/postimage cdc files; the commit is read cdc-only so nothing double-counts). The only
+  shapes still taking copy-on-write (row tracking lost) are type-widened and IcebergCompat tables —
+  neither creatable by this provider. Follow-up: the buffered path's read-back still resolves ids by
+  `baseRowId + ordinal position` (no materialized-source read) — the post-OPTIMIZE caveat there.
+- Test: `test/verify_delta_row_tracking_virtual.test` (165).
 
 ## Recommendation — phased (build on demand)
 

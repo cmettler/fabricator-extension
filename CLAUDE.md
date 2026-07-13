@@ -2016,6 +2016,67 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   the CDF×partitioned CoW-NULL pin as the last remaining shape); changes 73 / update / dv_default / dv /
   variant / column_mapping / delete / materialize / row_tracking / native_write / partition /
   transactions 934 + EW 168 & 147 green.
+  **FABRIC LIVE VALIDATION — FULL PASS (2026-07-13, workspace Test / LH; + ONE REAL EW FIX).** The whole
+  2026-07-13 row-tracking/merge-on-read block validated on all three surfaces. Our provider created on
+  OneLake: `lake.dbo.arrownet_rtdef` (pure defaults → mapped + DV + materialized row tracking, MoR UPDATE),
+  `arrownet_rtpart` (partitioned MoR + partition-key SET US→APAC), `arrownet_rtcdf` (CDF MoR). **Spark
+  (Livy, sparkprobe `rtmatrix`)**: reads every table with EXACT `_metadata.row_id`/`_metadata.
+  row_commit_version` (id 2 preserved/ver 2; the APAC-moved row keeps id 4; mapped PARTITIONED partition
+  column reads fine — Spark, unlike kernel), `table_changes` shows exactly pre+post for the MoR commit,
+  and **Spark WROTE BACK** (UPDATE id=3 → Spark itself preserved row_id 3 honoring OUR materialized
+  declaration; INSERT → fresh id from the continued HWM). **SQL endpoint** (after the usual metadata-sync
+  lag): all three tables registered + queryable incl. post-Spark state. **Our read-back of Spark's write
+  initially 404'd — a REAL pre-existing EW bug: on-disk (`storageType "u"`) deletion vectors were
+  unreadable** (never exercised — EW only writes inline DVs; Spark's DV UPDATE writes `.bin` files). Three
+  spec bugs in `DeletionVectorReader`: resolved to `_delta_log/` (spec: TABLE ROOT + the optional
+  random-prefix DIRECTORY from pathOrInlineDv's leading chars), UUID built with .NET's little-endian
+  `Guid(byte[])` (spec: canonical big-endian/Java rendering — now formatted by hand), and the offset slice
+  ignored the on-disk framing (spec: `<dataSize: 4-byte BE int><bitmap><CRC-32>` with offset at the size
+  field — now detected by the size-field match, bitmap extracted, CRC unverified; raw-slice fallback kept).
+  With the fix our reader matches Spark's own view byte-for-byte through Spark's u-DV. dv 48 / dv_default
+  58 / update 63 / delete 28 / changes 73 / native_read 88 unregressed; validation tables left on LH for
+  inspection.
+  **MERGE-ON-READ UPDATE: CDF × PARTITIONED LIFTED (slice 4 — the FULL MATRIX is complete) + ON-DISK
+  DELETION VECTORS FIXED BOTH WAYS (2026-07-13, EW + Bridge guards).** The last MoR gate: cdc files now
+  follow the DATA-FILE convention on partitioned tables — new `CdfWriter.WriteSplitAsync` splits the
+  change rows by partition (rows arrive WITH partition columns from the read paths; `SplitByPartition`
+  excludes them from the file bytes; per-file `partitionValues` physical-keyed under mapping), which also
+  makes a partition-key SET's update_postimage land in its NEW partition's cdc file (feed shows pre=EU,
+  post=APAC). ALL cdc emission sites route through it (MoR + CoW UPDATE pre/post, rowid + DV DELETE,
+  predicate UpdateAsync, the buffered `WriteChangeDataFileAsync` wrapper — now returns the split list);
+  `CdfReader.ReadCdcFileAsync` re-adds partition columns from the cdc action's partitionValues
+  (presence-checked for legacy baked-in files; the file's `_change_type` column detached around
+  AddPartitionColumns since Spark cdc files may mix change types per row). Bridge: the buffered
+  partitioned-CDF guards lifted (`CdfEnabled` probe + `EnsureBufferedDmlEligible` keep only
+  identity/IcebergCompat) — buffered INSERT+UPDATE+DELETE on a partitioned CDF table fuses into ONE
+  commit with an exact feed. The MoR gate is now just: DV-enabled, not IcebergCompat, no type widening.
+  **The full matrix (DV + mapping name/id + partitions + CDF + row tracking + identity, autocommit AND
+  explicit txn) is COMPLETE**; the only shapes still falling to CoW (row tracking lost) are type-widened +
+  IcebergCompat — neither creatable by this provider, so the CoW-NULL pin is retired.
+  **On-disk ("u") deletion vectors — BOTH sides were spec-broken, found by the slice-4 gate + the Fabric
+  write-back:** the READER fixes (table root + prefix dir, canonical big-endian UUID, the
+  `<version><size BE><bitmap><CRC>` framing) landed in the Fabric-validation pass; this pass fixed the
+  WRITER (`DeletionVectorWriter.CreateFileAsync` wrote a raw blob to `_delta_log/` under a
+  little-endian-Guid name — internally consistent with the old reader, unreadable by Spark/kernel; any
+  DELETE whose bitmap exceeded the 1 KB inline threshold has been writing these all along). Now writes the
+  spec shape (table root, canonical name, framing + CRC-32 via System.IO.Hashing — new DeltaLake package
+  ref); the reader keeps a LEGACY fallback (`_delta_log/` + little-endian name) so old tables read.
+  **delta-kernel now reads our large-DV deletes exactly** (20k rows, 6667 scattered deletions → on-disk
+  DV; count + predicate exact) — previously every external reader broke on them. VACUUM safety checked:
+  it only sweeps `.parquet`, so live `.bin` DVs are never deleted (orphaned `.bin`s stay uncollected — the
+  documented gap, now with real orphans possible).
+  `verify_delta_row_tracking_virtual.test` now 165 (partitioned-CDF MoR preservation + the partition-move
+  feed + the buffered fused feed); transactions 934 / changes 73 / dv 48 / dv_default 58 / update /
+  delete / optimize / partition / partition_overwrite / column_mapping 251 / variant 133 / native_write
+  147 / native_read 88 / time_travel / snapshots + EW 168 & 147 (all TFMs) green.
+  **Slice-4 LIVE VALIDATION — FULL PASS (2026-07-13, workspace Test / LH):** our provider created on
+  OneLake `lakecdf.dbo.arrownet_rtcdfp` (partitioned CDF + row tracking: MoR UPDATE, partition-key SET
+  US→APAC, DV DELETE) and `lake.dbo.arrownet_bigdv` (20k rows, scattered DELETE → the new SPEC-SHAPED
+  ON-DISK DV over OneLake). **Spark** (sparkprobe `dvcdfp`): reads the on-disk DV exactly (13333/1/19999,
+  zero deleted ids) and `table_changes` returns the partitioned MoR feed byte-identical to ours (per-
+  partition cdc incl. the EU→APAC pre/post pair + the delete; `_metadata.row_id` preserved). **SQL
+  endpoint**: reads BOTH tables exactly — including decoding the on-disk `.bin` deletion vector (the
+  endpoint's DV support covers our inline AND on-disk forms) and the partitioned-CDF post-DML state.
   **ROW TRACKING NOW IMPLIES MATERIALIZATION — `materialize_row_tracking` DROPPED (2026-07-13, C#-only).**
   Spark parity: `delta.enableRowTracking` promises ids stable across rewrites, implemented via the
   materialized columns (Spark auto-declares them at enablement) — our opt-in split was Fabric-conversion
