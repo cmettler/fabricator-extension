@@ -2069,6 +2069,12 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   feed + the buffered fused feed); transactions 934 / changes 73 / dv 48 / dv_default 58 / update /
   delete / optimize / partition / partition_overwrite / column_mapping 251 / variant 133 / native_write
   147 / native_read 88 / time_travel / snapshots + EW 168 & 147 (all TFMs) green.
+  **ROW TRACKING × PolyBase — WORKS (probed live + pinned 2026-07-13):** a `row_tracking true` table
+  (writer v7, minReader stays 1) on the PolyBase recipe (`deletion_vectors false, column_mapping 'none'`)
+  reads exactly via SQL Server OPENROWSET — INCLUDING after OPTIMIZE materializes the physical
+  `__delta_row_id` column into the compacted file (the reader ignores extra parquet columns not in the
+  Delta schema). So the full SQL-Server-facing lifecycle is: CoW DML + identity + CDF + row tracking all
+  OK; only DV (reader v3) and column mapping are hard rejections. `verify_mssql_s3_polybase` §5c (129).
   **Slice-4 LIVE VALIDATION — FULL PASS (2026-07-13, workspace Test / LH):** our provider created on
   OneLake `lakecdf.dbo.arrownet_rtcdfp` (partitioned CDF + row tracking: MoR UPDATE, partition-key SET
   US→APAC, DV DELETE) and `lake.dbo.arrownet_bigdv` (20k rows, scattered DELETE → the new SPEC-SHAPED

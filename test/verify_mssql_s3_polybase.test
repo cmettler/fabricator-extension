@@ -249,6 +249,42 @@ DROP TABLE cdflake.main.f;
 statement ok
 DETACH cdflake;
 
+# ---- 5c. ROW TRACKING stays SQL-Server-readable (writer-only, minReader stays 1) — including after
+#      OPTIMIZE materializes the physical __delta_row_id column into the compacted file (an extra
+#      parquet column not in the Delta schema; the reader ignores it). Live-probed 2026-07-13. ----
+
+statement ok
+ATTACH 's3://arrownet/polybase-rt' AS rtlake (TYPE arrownet, PROVIDER 'delta', READ_ONLY false,
+                                              native_read true, native_write true,
+                                              deletion_vectors false, column_mapping 'none',
+                                              row_tracking true);
+
+statement ok
+CREATE OR REPLACE TABLE rtlake.main.f AS SELECT r AS id, 'v' || r AS name FROM range(6) t(r);
+
+statement ok
+INSERT INTO rtlake.main.f SELECT r, 'v' || r FROM range(6, 12) t(r);
+
+query III
+SELECT cnt, mn, mx FROM mssql_net_query('sqldb',
+  'SELECT count(*) AS cnt, min(id) AS mn, max(id) AS mx FROM OPENROWSET(BULK ''/arrownet/polybase-rt/f'',
+     FORMAT = ''DELTA'', DATA_SOURCE = ''s3_ds'') AS r');
+----
+12	0	11
+
+statement ok
+SELECT mssql_net_exec('rtlake', 'OPTIMIZE main.f');
+
+query III
+SELECT cnt, mn, mx FROM mssql_net_query('sqldb',
+  'SELECT count(*) AS cnt, min(id) AS mn, max(id) AS mx FROM OPENROWSET(BULK ''/arrownet/polybase-rt/f'',
+     FORMAT = ''DELTA'', DATA_SOURCE = ''s3_ds'') AS r');
+----
+12	0	11
+
+statement ok
+DETACH rtlake;
+
 # ---- 6. teardown (external objects; the delta data stays for re-runs — CREATE OR REPLACE resets it) ----
 statement ok
 SELECT mssql_net_exec('sqldb',
