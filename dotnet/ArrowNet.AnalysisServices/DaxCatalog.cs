@@ -137,6 +137,7 @@ internal sealed class DaxCatalog : IBackendCatalog
             // daxevaltable is a 'collector' (whole-table); daxeach is a streaming 'inout' (per-row).
             "kind", new[] { "proc", "collector", "inout" }),
         MetadataKind.ServerInfo => EmptyStringTable("property", "value"),
+        MetadataKind.VirtualColumns => EmptyStringTable("name", "type"),
         _ => EmptyStringTable("name"),
     };
 

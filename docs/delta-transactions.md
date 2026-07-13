@@ -57,7 +57,7 @@ at roughly one statement.
 **Remaining batch-park fallbacks** (by design, collect instead of eager file): IcebergCompat
 tables, identity appends **under a pending ALTER**, and the autocommit codec path (semantics-
 identical, flushes immediately). Everything else — CTAS, partitioned CTAS, inserts under a buffered
-ALTER, UPDATE post-images, identity appends, materialize_row_tracking appends — writes files at
+ALTER, UPDATE post-images, identity appends, row-tracking appends — writes files at
 statement time.
 
 ---
@@ -104,7 +104,7 @@ equivalent):
 | CREATE + identity marker | buffered; INSERTs generate real ids at statement time from the parked schema, marks chain; flush bakes final HWM into commit-0 | |
 | DELETE | rowids decoded to (pinned ordinal → positions), parked in `DeletedByOrdinal`; flush emits DV remove/add pairs | requires **deletion vectors enabled** on the table |
 | DELETE of rows inserted in the same txn | works — positions keyed on the pending file's ordinal (≥ `0x780000`); flush builds an **inline DV born on our own add** | in-memory batch rows (`0x700000..0x77ffff`) rejected |
-| UPDATE | old rows parked as delete positions + post-image rows **eagerly written** as a file; read-back is version-pinned (`atVersion: PinnedVersion`) | requires DV + `SupportsExternalCommit` (not identity/IcebergCompat); materialize_row_tracking bakes ORIGINAL stable ids (unpartitioned only) |
+| UPDATE | old rows parked as delete positions + post-image rows **eagerly written** as a file; read-back is version-pinned (`atVersion: PinnedVersion`) | requires DV + `SupportsExternalCommit` (not identity/IcebergCompat); on row-tracking tables the post-images bake the ORIGINAL stable ids (materialization is implied by row tracking; partitioned works) |
 | UPDATE of same-txn rows | **rejected** ("COMMIT the inserts first") | |
 | ALTER ADD/RENAME/DROP COLUMN, nested ADD/DROP FIELD | metaData (+ protocol upgrade) computed at statement time, parked; joins the fused commit; overlays serve the pending schema mid-txn | ALTERs must precede the txn's data changes; nested RENAME FIELD stays immediate; RENAME of a partition column rejected in a txn |
 | RENAME TABLE | immediate (physical folder move) — **except** a pending-created table, which re-keys the buffer + moves the eagerly-streamed files (the dbt tmp-swap case) | |
@@ -120,8 +120,7 @@ discarded on rollback.
 From `EnsureBufferedDmlEligible` + the buffering gates:
 
 - Buffered DELETE/UPDATE ⇒ table must have **deletion vectors** (else: autocommit copy-on-write).
-- Buffered UPDATE ⇒ additionally not identity/IcebergCompat; with `materialize_row_tracking`, not
-  partitioned.
+- Buffered UPDATE ⇒ additionally not identity/IcebergCompat.
 - CDF + (partitioned ∨ identity/IcebergCompat) ⇒ buffered DML rejected.
 - DML on a CDF table after a buffered ALTER ⇒ rejected (cdc files would be pre-ALTER-shaped).
 - DML/ALTER on a **pending-created** table ⇒ rejected ("COMMIT the CREATE first"); a later INSERT

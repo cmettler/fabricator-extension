@@ -1158,8 +1158,20 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         // The detected capability profile as (property, value) rows — the mssql_server_info() diagnostic.
         // Built from the in-memory profile (not a re-query), so it surfaces the derived flags.
         MetadataKind.ServerInfo => ServerInfoStream(),
+        // No provider virtual columns (the Delta catalog's stable row-tracking pair has no SQL analog).
+        MetadataKind.VirtualColumns => EmptyStringTable("name", "type"),
         _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "mssql_net: unknown metadata kind"),
     };
+
+    private static IArrowArrayStream EmptyStringTable(params string[] columns)
+    {
+        var builder = new Schema.Builder();
+        foreach (var c in columns)
+        {
+            builder.Field(new Field(c, StringType.Default, nullable: true));
+        }
+        return new InMemoryArrayStream(builder.Build(), System.Array.Empty<RecordBatch>());
+    }
 
     // Builds a two-column (property, value) stream from the detected ServerProfile. Accessing Profile
     // detects it (via the non-MARS probe) on first use; for an attached catalog it is already cached.

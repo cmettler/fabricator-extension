@@ -1878,6 +1878,161 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   Decimal128Type/Array with preserved precision/scale; roundtrips write narrow → read wide, values lossless)
   — EW Parquet.Tests now 573/585, the remaining 12 = the pre-existing ALP bit-exact + parquet-testing sweep
   failures (separate triage).
+  **ROWID FAST PATH + LATE MATERIALIZATION — DONE (2026-07-13, C++/C#, no ABI).** The `native_read` Delta
+  scan opts into DuckDB's late-materialization rewrite (`function.late_materialization = true` + the
+  FUNCTION-level `get_row_id_columns` hook — distinct from the entry-level `GetRowIdColumns` that serves
+  DML planning; the flag defaults FALSE and only DuckDB's own seq_scan/read_duckdb set it, so the rewrite
+  never fired on extension scans before): `ORDER BY x LIMIT n` becomes TopN-on-a-narrow-scan + **SEMI join
+  back on rowid** (JoinFilterPushdown supports SEMI → the tiny build side's dynamic min/max — and for small
+  builds an IN-list — lands on the probe scan's rowid column via the exact-mode `input.filters`). Rowid
+  filters (dynamic + user `WHERE rowid =/IN/range`) are now SERIALIZED — `SerializeLiveFilters`/
+  `RenderLiveFilters` previously SKIPPED `COLUMN_IDENTIFIER_ROW_ID`, which in exact mode was a **latent
+  correctness bug** (an ERASED static `WHERE rowid = X` was silently unapplied); they now resolve it to the
+  single virtual rowid name (`_metadata.row_id`, gated `virtual_rowid_columns.size()==1`) — and **DECODED
+  by the native reader** (`DeltaRowIdFilter`): the ordinal half (`rowid >> 40`) selects EXACTLY the matching
+  files (no stats — the transient rowid is a LOCATOR, which is why `__delta_row_id`-style stats are not
+  needed for fast access), the position half becomes a per-file `file_row_number` predicate which the
+  parquet reader ROW-GROUP-prunes (verified: `ParquetColumnSchema::Stats` synthesizes exact per-row-group
+  min/max for FILE_ROW_NUMBER). Rowid conjuncts are STRIPPED from the EW prune tree (no rowid stats;
+  dropping an AND-conjunct widens = superset-safe) while the rendered SQL keeps them exact — the per-file
+  SELECT aliases the rowid expression and DuckDB permits SELECT-alias references in WHERE. Enablement
+  required **`ArrowStreamBindData::Copy`** (the rewrite clones the fetch-side get's bind data via
+  `LateMaterializationHelper::CreateLHSGet`; `schema_root`/`arrow_table` are bind-time-only — nothing reads
+  them after PopulateReturnSchema, scans build per-scan converters from the live stream — so the copy
+  shares everything else and leaves them empty). Gated to `ExactFilterPushdown()` + virtual BIGINT rowid ⇒
+  **Delta native_read only** (SQL Server/DAX deliberately off: their TopN pushdown is superior and a
+  join-back would re-scan the server; entry-level rowid/DML unaffected). Fetch cost = O(matched files):
+  LIMIT 1 → `files 3 -> 1` + `file_row_number IN (p)`. NOT used by DML — UPDATE/DELETE/MERGE plans scan
+  ONCE with the WHERE pushed and rowids flow UP to the modify operator (no rowid-filtered re-scan exists
+  there). Fixed en route: `WithPendingDeletes` dropped `PartitionColumns` from its listing rebuild (a
+  partitioned table with buffered DELETEs read its partition column as NULL mid-txn under native_read).
+  `test/verify_delta_late_materialization.test` (57 — TopN + prepared re-exec, point/IN/range/edge-bound/
+  contradictory rowid lookups [layout-independent counts: file ordinals are path-sorted RANDOM uuids], DV
+  composition, pending-file ordinals inside a txn, non-native catalog unaffected, duckdb_logs pins of
+  `rowid prune … 3 -> 1` + `file_row_number IN`); regression: native_read 88 / dynamic_filter 21 /
+  struct_filter 67 / update 63 / delete 28 / dv_default 58 / time_travel 48 / transactions 934 + SQL
+  scalar/table-fn/pushdown suites green. `docker/provision.ps1` now also creates the shared read-only
+  `dbo.TestSimplePK` fixture (7 suites read it; nothing re-created it after the compose migration).
+  **STABLE ROW-TRACKING VIRTUAL COLUMNS — DONE (2026-07-13, additive metadata kind 12, NO ABI bump).**
+  `SELECT __delta_row_id, __delta_row_commit_version FROM lake.s.t` works on **row-tracking tables under
+  `native_read`** (the Delta materialized-column names; Spark's `_metadata.row_id`/`_metadata.
+  row_commit_version` equivalents): queryable by name, EXCLUDED from `SELECT *`, per row =
+  `COALESCE(materialized __delta_row_id column, baseRowId + file_row_number)` /
+  `COALESCE(materialized version, defaultRowCommitVersion)` — distinct from the transient `rowid` (a
+  locator), these are the durable identity. Mechanism = **generic provider virtual columns**:
+  `ARROWNET_META_VIRTUAL_COLUMNS = 12` (arg1/2 = schema/table → (name, type-text) rows; best-effort
+  try/catch fetch in `GetOrCreateEntry`; every other provider returns empty) → the entry registers them in
+  `GetVirtualColumns()` at `arrownet::ProviderVirtualBase()` (= `VIRTUAL_COLUMN_START + 0x100`; DuckDB's
+  `TableBinding` maps virtual names for bare-name binding, and a REAL same-named column shadows the
+  virtual) → `ArrowStreamBindData.provider_virtual_columns` → `BuildScanSpec` fetches by name,
+  `BuildProjectionMapping` resolves 1:1 by name, and both live-filter serializers resolve virtual-id
+  filters (exact-mode erased `WHERE __delta_row_id = k` applied exactly, like the rowid fix). C#:
+  `DeltaCatalog` advertises the pair gated on `_nativeRead` + `delta.enableRowTracking` (flag cached per
+  path by the Columns fetch via `GetSchemaAndRowTracking` — no extra `_delta_log` read on entry
+  materialization, the OneLake cost concern); `NativeScanFile` carries `BaseRowId`/`CommitVersion` from
+  the add actions; `DeltaNativeReader.RowTrackingExpr` renders the per-file expression (materialized
+  presence via the existing footer probe). Semantics validated: append ids follow COMMIT order
+  (deterministic); **buffered (explicit-txn) UPDATE preserves the id + bumps the version** (post-images
+  bake materialized ids); DV DELETE removes the id; **OPTIMIZE preserves both** (compaction materializes);
+  a txn's PENDING rows read NULL (baseRowId assigned at commit); non-tracked tables / codec catalogs
+  don't bind the names (clean binder error). **Pinned known gap:** an AUTOCOMMIT UPDATE on a (default)
+  column-mapped table takes the copy-on-write rewrite whose new add carries NO row tracking (the
+  documented deferred P5-rewrite gap) — those rows read NULL until the EW rewrite materializes ids.
+  NOTE: with `deletion_vectors` defaulting true (which enables rowTracking), most default-catalog tables
+  are row-tracking → the columns bind broadly under native_read.
+  `test/verify_delta_row_tracking_virtual.test` (87); regression: transactions 934 / row_tracking 33 /
+  materialize 17 / compaction_rowtracking 24 / native_read 88 / dv_default 58 / update 63 /
+  column_mapping 251 / late_materialization 57 + SQL scalar/table-fn/procs/orderby green (SQL/DAX/deltars/
+  stub each gained an explicit empty VirtualColumns metadata case).
+  **MERGE-ON-READ UPDATE: COLUMN-MAPPING GATE LIFTED (slice 1 of the full-matrix plan, 2026-07-13, EW-only).**
+  The MoR eligibility check in EW `UpdateByRowIdsAsync` still required `mappingMode == None` — a **stale
+  gate**: the 2026-07-06 `ColumnMappingRecursive.ToPhysical` pass had already made `UpdateViaVectorsAsync`'s
+  post-image append mapping-capable, but the caller's condition was never relaxed, so since `column_mapping
+  'name'` became the default (same day) EVERY autocommit UPDATE on a default-created table silently took
+  copy-on-write (full-file rewrite + the P5 row-tracking loss; unnoticed because the DV/MoR suites pin
+  `column_mapping 'none'`). Now lifted: autocommit UPDATE on mapped (name AND id) DV tables is merge-on-read
+  on both writer modes — kernel (delta-kernel) reads the commits exactly; the commit shape is
+  remove+add(same path, DV, **baseRowId preserved**) + post-image add. **Two more EW fixes in the pass:**
+  (1) the post-image add's stats were collected over the LOGICAL-named batches — now over the
+  physical-renamed, pre-`__delta_row_id` batches (spec: stats keys are physical under mapping);
+  (2) **materialized-source ids honored**: updating a row in a file that ITSELF carries materialized
+  `__delta_row_id` (a compacted file, an earlier update's post-image) resolved the id as `baseRowId +
+  position` = the file-LOCAL id — silently changing row identity post-OPTIMIZE (caught by the new virtual-
+  columns pin: id 9 read 18 after OPTIMIZE→UPDATE). `ProcessFileBatchesAsync`/`ReadFileAsync` gained an
+  optional `strippedRowIdsOut` collector (the strip already had the ids in hand) and `UpdateViaVectorsAsync`
+  prefers the source's materialized value per row. **The BUFFERED path still has this post-OPTIMIZE caveat**
+  (its read-back resolves via `OrderedActiveBaseRowIds` + ordinal arithmetic, no materialized-source read —
+  follow-up). Remaining MoR gates (the rest of the full-matrix plan): partitions (slice 2 — route the append
+  through `WriteDataFilesAsync` for the partition split), CDF (slice 3/4 — pre/post-image cdc emission;
+  rows already in hand), type widening (validation-only). **PolyBase interop tables are unaffected** (DV
+  off ⇒ MoR never engages; their protocol-1.0 CoW path is untouched). No memory-shape change: both UPDATE
+  paths materialize one affected file at a time (pre-existing; MoR appends only the matched rows).
+  Noted for separate triage (pre-existing, surfaced while probing): `(v).a` member access reads NULL on a
+  `CREATE TABLE + INSERT CAST(… AS VARIANT)` shape while the full `v` value + kernel read are exact (both
+  reader paths; before any UPDATE — not MoR-related; the variant suite's own dot-access pins pass).
+  `verify_delta_row_tracking_virtual.test` now 93 (autocommit UPDATE on the mapped default table preserves
+  `__delta_row_id` + bumps the version — incl. a post-OPTIMIZE source; the remaining-CoW pin moved to a
+  PARTITIONED table); full delta sweep (update 63 / dv_default 58 / dv 48 / variant 133 / column_mapping
+  251 / changes 73 / delete 28 / materialize 17 / compaction 24 / row_tracking 33 / native_write 147 /
+  native_read 88 / nested_alter 100 / constraints 50 / partition 54 / time_travel 48 / transactions 934 /
+  late_mat 57) + EW DeltaLake 168 & Table 147 (all TFMs) green.
+  **MERGE-ON-READ UPDATE: PARTITION GATE LIFTED (slice 2, 2026-07-13, EW + one Bridge guard removal).**
+  Partitioned DV tables now take merge-on-read too: `UpdateViaVectorsAsync`'s post-image append routes
+  through **`WriteDataFilesAsync`** when the table is partitioned (partition split → Hive dirs + per-file
+  physical-keyed partitionValues + per-file stats + the `IDataFileWriter` seam), and builds the `add`s from
+  the returned `WrittenDataFile`s exactly as `CommitDataFilesAsync` does (`DeltaPath.Encode`, baseRowId
+  sequencing per file, numRecords-fallback stats, HWM domainMetadata). **A SET of the PARTITION column just
+  works** — the post-image row lands in its new partition's file (DV-delete in the old partition, add in the
+  new; verified: `region=EU → APAC/` dir in the commit, identity preserved). **`WriteDataFilesAsync`'s
+  `materializedRowIds` unpartitioned-only restriction is lifted** — the id column is attached BEFORE the
+  partition split (rides the regrouping with its row), then strip→ToPhysical→re-append per partition file
+  (out of stats) — which also lifted the Bridge's buffered `materialize_row_tracking × partitioned UPDATE`
+  rejection (`EnsureBufferedDmlEligible`). MoR passes `identityValuesPreGenerated: true` (post-images carry
+  their existing identity values; regeneration would reassign) and the MoR gate gained `!IsIcebergCompat`
+  (WriteDataFilesAsync rejects iceberg; falls to CoW). Remaining MoR gates: **CDF** (slice 3/4 — the last
+  CoW-with-row-tracking-loss shape, pinned) and type widening (validation-only). Unpartitioned MoR keeps the
+  single-file bespoke append unchanged (slice-1-validated); the partitioned path writes one file per
+  (post-image batch × partition) — small-file inefficiency only, OPTIMIZE compacts. Kernel-validated:
+  unmapped partitioned MoR reads exactly (partition column included); mapped partitioned shows the known
+  kernel partition-column-NULL quirk (all commits of such tables, not MoR-specific; Spark is the reference).
+  `verify_delta_row_tracking_virtual.test` now 110 (partitioned MoR preservation + partition-key SET moves
+  the row with identity intact + buffered partitioned materialize UPDATE + the CDF CoW-NULL pin); sweep:
+  update/dv_default/dv/variant/column_mapping/changes/delete/materialize/compaction/row_tracking/
+  native_write/native_read/partition 54/partition_overwrite 90/constraints/identity 38/transactions 934 +
+  EW 168 & 147 green.
+  **MERGE-ON-READ UPDATE: CDF GATE LIFTED (slice 3, 2026-07-13, EW-only).** Unpartitioned Change-Data-Feed
+  tables now take merge-on-read too: `UpdateViaVectorsAsync` emits **`update_preimage`/`update_postimage`
+  cdc files per affected file** — the exact copy-on-write shapes (pre = the matched OLD rows from the
+  source batch, post = the substituted rows; `CdfWriter.WriteAsync` handles the physical rename + the
+  unmapped `_change_type` column) — and since a commit carrying ANY cdc action is read cdc-ONLY, the DV
+  re-add and the post-image add never double-count in the feed (verified: the update commit's feed is
+  EXACTLY one pre + one post; the full feed = 5 inserts + 1 pre + 1 post). Row-tracking identity is
+  preserved on CDF tables now too. The MoR gate is down to: DV-enabled AND NOT (CDF × PARTITIONED — the
+  cdc partitionValues/column semantics corner, same as the buffered path, slice 4) AND no type widening
+  AND not IcebergCompat. **The full matrix from the plan is now: mapping (name+id) ✓ / partitions ✓ /
+  CDF-unpartitioned ✓ / identity ✓ / row tracking + materialize ✓ — autocommit AND explicit txn; remaining:
+  CDF × partitioned (slice 4) + the type-widening validation pass.**
+  `verify_delta_row_tracking_virtual.test` now 127 (CDF MoR preservation + the exact cdc-only feed pins +
+  the CDF×partitioned CoW-NULL pin as the last remaining shape); changes 73 / update / dv_default / dv /
+  variant / column_mapping / delete / materialize / row_tracking / native_write / partition /
+  transactions 934 + EW 168 & 147 green.
+  **ROW TRACKING NOW IMPLIES MATERIALIZATION — `materialize_row_tracking` DROPPED (2026-07-13, C#-only).**
+  Spark parity: `delta.enableRowTracking` promises ids stable across rewrites, implemented via the
+  materialized columns (Spark auto-declares them at enablement) — our opt-in split was Fabric-conversion
+  caution that's since been validated away. Now `DeltaWriter.CreateConfig` declares
+  `delta.rowTracking.materializedRowIdColumnName`/`...RowCommitVersionColumnName` WHENEVER row tracking is
+  on (standalone `row_tracking true` OR the `deletion_vectors` default) — so **default-created tables
+  preserve `__delta_row_id` across UPDATE/OPTIMIZE out of the box** (verified: pure-default catalog, id
+  preserved + version bumped, kernel-exact). The ATTACH option is REMOVED (an old `materialize_row_tracking
+  true` in an ATTACH is silently ignored — providers parse known keys only); the buffered-UPDATE bake gate
+  switched from the catalog flag to the TABLE's declared materialized column (`TxnDmlProfile` gained
+  `MaterializeRowIds`) — so tables created by OLDER versions without the declaration keep their old behavior
+  (config-driven, never an undeclared physical column). Appends still never materialize (readers derive
+  baseRowId + position). Tests updated (the option stripped from materialize_rowtracking 17 /
+  compaction_rowtracking 24 / transactions §34-§36 / row_tracking_virtual 127 — all pass on the implied
+  default); sweep green (update / dv_default / dv / variant / column_mapping 251 / changes / delete /
+  native_write 147 / native_write_streaming 29 / native_read / partition / partition_overwrite 90 /
+  optimize 40 / identity / constraints / copy_format 96 / transactions 934 / row_tracking 33).
   **COLUMN MAPPING on the native read — DONE (2026-07-05, C#-only, no ABI; live Fabric-Spark-validated).** A
   column-mapping Delta table (`delta.columnMapping.mode` = `name` or `id`) stores columns under PHYSICAL names
   (`col-<guid>`), so the plain `read_parquet` SELECT-by-logical-name failed (*"Referenced column 'id' not found;
@@ -2674,7 +2829,9 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   for cross-snapshot retry, which DuckDB never needs → `row_tracking` is a **write-side interop feature for external
   readers**, not a DML mechanism. `verify_delta_catalog_row_tracking.test` (33 — feature declared, baseRowId
   materialized, DELETE/UPDATE/INSERT unaffected). See [docs/delta-catalog.md](docs/delta-catalog.md).
-  **Materialized row tracking (`materialize_row_tracking true`, opt-in) — STABLE ROW ID PRESERVED ACROSS
+  **Materialized row tracking (SUPERSEDED 2026-07-13: the `materialize_row_tracking` ATTACH option is
+  GONE — materialization is now IMPLIED whenever row tracking is enabled, incl. via the DV default; see
+  the consolidation bullet. Historical record of the original opt-in below.) — STABLE ROW ID PRESERVED ACROSS
   MERGE-ON-READ UPDATE, VALIDATED ON FABRIC SPARK (2026-07-04).** The gap: our merge-on-read UPDATE appends the
   post-image row in a NEW file, so its `base_row_id + row_index` changed (stable id 1→3) — proven via Spark
   (`_metadata.base_row_id`). Root cause: EW enabled row tracking but never declared

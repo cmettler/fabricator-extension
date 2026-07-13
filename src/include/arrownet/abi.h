@@ -117,6 +117,12 @@ typedef enum {
 	                                    // explicit transaction (CAS + `txn` action at COMMIT — idempotent
 	                                    // appends). arg1 = 'schema.table' ref, arg2 = "app\nversion\nexpected"
 	                                    // (expected empty = must-not-exist). Additive, no ABI bump.
+	ARROWNET_META_VIRTUAL_COLUMNS = 12, // provider-declared VIRTUAL columns for a table (arg1 = schema,
+	                                    // arg2 = table): two string columns (name, type-text). The host
+	                                    // registers them as queryable-by-name virtual columns (not in
+	                                    // SELECT *). Delta: __delta_row_id / __delta_row_commit_version
+	                                    // (stable row tracking) under native_read + enableRowTracking;
+	                                    // others: empty. Additive, no ABI bump; fetch is best-effort.
 } ArrowNetMetadataKind;
 
 // -----------------------------------------------------------------------------

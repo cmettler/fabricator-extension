@@ -180,6 +180,25 @@ vector<string> FetchRowIdColumns(ArrowNetHandle handle, const string &schema_nam
 	return rows[0];
 }
 
+vector<std::pair<string, string>> FetchVirtualColumns(ArrowNetHandle handle, const string &schema_name,
+                                                      const string &table_name) {
+	// Best-effort: a provider that doesn't implement the kind (or returns an unexpected shape) simply
+	// contributes no virtual columns — never fail entry materialization over this.
+	vector<std::pair<string, string>> result;
+	try {
+		ArrowArrayStream stream;
+		std::memset(&stream, 0, sizeof(stream));
+		arrownet::GetMetadata(handle, ARROWNET_META_VIRTUAL_COLUMNS, schema_name, table_name, stream);
+		auto rows = ReadStringTable(stream, 2); // name, type-text
+		for (idx_t i = 0; i < rows[0].size(); i++) {
+			result.emplace_back(rows[0][i], rows[1][i]);
+		}
+	} catch (...) {
+		result.clear();
+	}
+	return result;
+}
+
 int64_t FetchRowCount(ArrowNetHandle handle, const string &schema_name, const string &table_name) {
 	// Approximate row count from partition stats (cheap metadata read); -1 if unknown.
 	ArrowArrayStream stream;

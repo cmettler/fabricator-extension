@@ -27,7 +27,8 @@ class ArrowNetTableEntry : public TableCatalogEntry {
 public:
 	ArrowNetTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info, ArrowNetHandle handle,
 	                   vector<idx_t> rowid_columns, LogicalType rowid_type,
-	                   vector<string> virtual_rowid_columns = {});
+	                   vector<string> virtual_rowid_columns = {},
+	                   vector<std::pair<string, LogicalType>> provider_virtual_columns = {});
 
 	//! Produces a table scan that streams `SELECT * FROM [schema].[table]` from
 	//! SQL Server as Arrow into DuckDB.
@@ -75,6 +76,10 @@ private:
 	vector<idx_t> rowid_columns_;
 	//! Virtual rowid source column names (provider-supplied, not in the user schema); empty => none.
 	vector<string> virtual_rowid_columns_;
+	//! Provider-declared virtual columns beyond the rowid (name, type): queryable by name, not in
+	//! SELECT * — e.g. the Delta catalog's stable __delta_row_id / __delta_row_commit_version.
+	//! Registered in GetVirtualColumns at arrownet::ProviderVirtualBase() + index.
+	vector<std::pair<string, LogicalType>> provider_virtual_columns_;
 	//! rowid type: scalar (single column) or STRUCT (compound key).
 	LogicalType rowid_type_;
 	//! Lazily-fetched approximate row count for the optimizer (-2 = not yet fetched,

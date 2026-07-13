@@ -332,6 +332,12 @@ public static class MetadataKind
     // ref, arg2 = "app_id\nversion\nexpected" (expected empty = must-not-exist). Returns the echoed row.
     // Surfaced by arrownet_delta_set_transaction_version(...).
     public const int SetTxnVersion = 11;
+    // Provider-declared VIRTUAL columns for a table (arg1=schema, arg2=table): two string columns
+    // (name, type-text). Registered by the host as queryable-by-name virtual columns (NOT part of
+    // SELECT *). Delta (native_read + delta.enableRowTracking only): __delta_row_id +
+    // __delta_row_commit_version (both BIGINT — the STABLE row-tracking id/version, unlike the
+    // transient _metadata.row_id rowid). Other providers: empty.
+    public const int VirtualColumns = 12;
 }
 
 internal static class ArrowNetStatus

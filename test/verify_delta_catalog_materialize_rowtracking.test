@@ -14,7 +14,7 @@ require parquet
 require-env ARROWNET_DELTA_WRITE_DIR
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/matrt' AS lake (TYPE arrownet, PROVIDER 'delta', column_mapping 'none', materialize_row_tracking true);
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/matrt' AS lake (TYPE arrownet, PROVIDER 'delta', column_mapping 'none');
 
 statement ok
 CREATE TABLE lake.main.t AS SELECT i AS id, 'v' || i AS v FROM range(1, 4) AS r(i);

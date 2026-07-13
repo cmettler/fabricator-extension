@@ -2289,7 +2289,7 @@ DETACH cf;
 
 # --- materialize_row_tracking: fresh appends need no physical __delta_row_id (baseRowId at commit) ---
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_mat' AS mt (TYPE arrownet, PROVIDER 'delta', row_tracking true, materialize_row_tracking true);
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_mat' AS mt (TYPE arrownet, PROVIDER 'delta', row_tracking true);
 
 statement ok
 CREATE TABLE mt.main.m (id INTEGER, v VARCHAR);
@@ -2428,7 +2428,7 @@ DETACH idl;
 
 # column_mapping 'none': the pins below read the RAW parquet files by logical column name.
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_mat' AS mu (TYPE arrownet, PROVIDER 'delta', row_tracking true, materialize_row_tracking true, column_mapping 'none');
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_mat' AS mu (TYPE arrownet, PROVIDER 'delta', row_tracking true, column_mapping 'none');
 
 statement ok
 CREATE TABLE mu.main.u (id INTEGER, v VARCHAR);

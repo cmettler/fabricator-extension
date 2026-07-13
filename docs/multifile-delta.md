@@ -508,6 +508,70 @@ done as a standalone function) only if CPU-bound-local multi-lane Delta scans be
 4. Snapshot consistency (the per-transaction UTC instant → implicit `AT`) applies to this reader exactly as to
    the catalog generally (see above).
 
+### Rowid fast path + late materialization (DONE 2026-07-13)
+
+The native reader now serves **rowid-filtered scans in O(matched files)**, and the scan opts into DuckDB's
+**late-materialization** rewrite so `ORDER BY x LIMIT n` fetches only the TopN rows' files:
+
+- **Enablement (C++):** `function.late_materialization = true` + the function-level `get_row_id_columns`
+  hook (BuildScanFunction; gated on `ExactFilterPushdown()` + the virtual BIGINT rowid ⇒ Delta
+  `native_read` only — SQL Server/DAX keep the flag off: their TopN pushdown is superior and a join-back
+  would re-scan the server). The rewrite clones the fetch-side get's bind data
+  (`LateMaterializationHelper::CreateLHSGet` → `bind_data->Copy()`), so `ArrowStreamBindData::Copy` was
+  implemented — `schema_root`/`arrow_table` are bind-time-only and stay empty in the copy.
+- **Plan shape:** TopN over a narrow scan (order key + rowid) builds the SEMI-join side; the fetch scan
+  probes. `JoinFilterPushdownOptimizer` supports SEMI joins, so the build side's **dynamic rowid filter**
+  (min/max; an IN-list for small builds) lands in the probe scan's `input.filters`.
+- **Serialization (C++):** `SerializeLiveFilters`/`RenderLiveFilters` previously skipped
+  `COLUMN_IDENTIFIER_ROW_ID` — under exact mode that was a latent correctness bug for erased static
+  `WHERE rowid = X` filters. Both now resolve it to the virtual rowid name (`_metadata.row_id`); the
+  rendered SQL binds because the per-file SELECT aliases the rowid expression (DuckDB permits SELECT-alias
+  references in WHERE).
+- **Decode (C#, `DeltaRowIdFilter`):** the rowid is a **locator** — `ordinal = rowid >> 40` selects the
+  files exactly (no stats), `position = rowid & (2^40−1)` becomes a per-file `file_row_number` predicate,
+  which the parquet reader **row-group-prunes**: `ParquetColumnSchema::Stats` synthesizes exact
+  per-row-group min/max for FILE_ROW_NUMBER (min = cumulative offset, max = offset+rows−1, exact). Rowid
+  conjuncts are stripped from the engineered-wood prune tree (it has no rowid stats; dropping an
+  AND-conjunct only widens). This is also why materialized `__delta_row_id` stats are NOT needed for fast
+  row access — stable ids are identity (survive rewrites), the transient rowid is the locator.
+- **Not DML:** UPDATE/DELETE/MERGE plans scan once with the WHERE pushed and rowids flow *up* to the
+  modify operator — no rowid-filtered re-scan exists there. The fast path serves the late-materialization
+  join-back and user `WHERE rowid …` queries.
+- Test: `test/verify_delta_late_materialization.test` (57 — layout-independent count assertions since file
+  ordinals are path-sorted random uuids, plus duckdb_logs pins of the prune + the `file_row_number` form).
+
+### Stable row-tracking virtual columns (DONE 2026-07-13)
+
+`__delta_row_id` / `__delta_row_commit_version` (the Delta materialized-column names — Spark's
+`_metadata.row_id`/`_metadata.row_commit_version` equivalents) are queryable **virtual columns** on
+row-tracking tables under `native_read`: excluded from `SELECT *`, bound by bare name, per row
+`COALESCE(materialized column, baseRowId + file_row_number)` and `COALESCE(materialized version,
+defaultRowCommitVersion)` — the durable identity, vs the transient `rowid` locator.
+
+- **Generic mechanism (any provider):** metadata kind `ARROWNET_META_VIRTUAL_COLUMNS = 12` returns
+  (name, type-text) rows per table (best-effort; other providers return empty). The entry registers them
+  at `arrownet::ProviderVirtualBase()` (`VIRTUAL_COLUMN_START + 0x100`) in `GetVirtualColumns()` —
+  DuckDB's `TableBinding` maps virtual names for bare-name binding, real same-named columns shadow. The
+  scan fetches them by name (`BuildScanSpec`), maps output 1:1 by name (`BuildProjectionMapping`), and
+  the live-filter serializers resolve virtual-id filters so an exact-mode erased
+  `WHERE __delta_row_id = k` is applied exactly.
+- **Delta gating:** advertised only when the catalog is `native_read` AND the table has
+  `delta.enableRowTracking` (flag cached per path by the Columns fetch — no extra `_delta_log` read at
+  entry materialization). Since `deletion_vectors` (default true) enables rowTracking, most
+  default-catalog tables qualify.
+- **Semantics:** ids follow commit order (deterministic); UPDATE preserves the id and bumps the version —
+  buffered (post-images bake materialized ids) AND autocommit (merge-on-read since the mapping + partition
+  gate lifts; the source file's own materialized ids are honored, so it holds post-OPTIMIZE too; a SET of
+  the PARTITION column moves the row to its new partition with identity intact); DV DELETE removes the id;
+  OPTIMIZE preserves both (compaction materializes); a transaction's pending rows read NULL (baseRowId
+  assigned at commit). CDF tables preserve too (merge-on-read emits update_preimage/postimage cdc files;
+  the commit is read cdc-only so nothing double-counts). **Known gap (pinned):** an UPDATE on a
+  CDF × PARTITIONED (or type-widened) table still takes the copy-on-write rewrite, whose new `add`
+  carries no row tracking (the deferred P5-rewrite gap) — those rows read NULL. Follow-up: the buffered
+  path's read-back still resolves ids by `baseRowId + ordinal position` (no materialized-source read) —
+  same post-OPTIMIZE caveat there.
+- Test: `test/verify_delta_row_tracking_virtual.test` (127).
+
 ## Recommendation — phased (build on demand)
 
 1. **Phase A — read-only (the big win).** Generic `ArrowNetMultiFileList/Reader` in `arrownet-core` +

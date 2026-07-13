@@ -1,0 +1,289 @@
+# name: test/verify_delta_row_tracking_virtual.test
+# description: Delta `native_read` — the STABLE row-tracking id + commit version as provider VIRTUAL columns
+#              (__delta_row_id / __delta_row_commit_version, the Delta materialized-column names): queryable
+#              by name, excluded from SELECT *, advertised only for row-tracking tables on native_read
+#              catalogs (ARROWNET_META_VIRTUAL_COLUMNS). Per row: COALESCE(materialized column, baseRowId +
+#              file position) / defaultRowCommitVersion — so a buffered (explicit-txn) UPDATE preserves the
+#              id and bumps the version (post-images bake materialized ids), OPTIMIZE preserves both
+#              (compaction materializes), a DV DELETE removes the row's id. baseRowId is assigned in COMMIT
+#              order, so id values are deterministic (unlike file ordinals). The autocommit copy-on-write
+#              UPDATE (mapped tables take CoW, not merge-on-read) loses row tracking on the rewritten file —
+#              the documented deferred P5-rewrite gap — which reads as NULL (honest, pinned below).
+#              Set ARROWNET_DELTA_WRITE_DIR (writable). Local FS.
+# group: [mssql_net]
+
+require mssql_net
+
+require parquet
+
+require-env ARROWNET_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/rtvirt' AS lake (TYPE arrownet, PROVIDER 'delta', native_read true, native_write true, row_tracking true);
+
+# v0 CREATE + v1 WRITE (ids 0..4), v2 WRITE (ids 5..9) — ids follow commit order
+statement ok
+CREATE TABLE lake.main.rt AS SELECT r AS id, 'v' || r AS s FROM range(5) t(r);
+
+statement ok
+INSERT INTO lake.main.rt SELECT r, 'v' || r FROM range(5, 10) t(r);
+
+# ---- stable ids + per-row commit versions ----
+
+query III
+SELECT id, __delta_row_id, __delta_row_commit_version FROM lake.main.rt ORDER BY __delta_row_id;
+----
+0	0	1
+1	1	1
+2	2	1
+3	3	1
+4	4	1
+5	5	2
+6	6	2
+7	7	2
+8	8	2
+9	9	2
+
+# virtual columns are NOT part of SELECT *
+query IT
+SELECT * FROM lake.main.rt ORDER BY id LIMIT 1;
+----
+0	v0
+
+# filter by stable id (exact-mode erased filter on a virtual column — applied by the scan)
+query I
+SELECT id FROM lake.main.rt WHERE __delta_row_id = 7;
+----
+7
+
+# the transient rowid still works alongside
+query I
+SELECT count(DISTINCT rowid) FROM lake.main.rt;
+----
+10
+
+# ---- buffered (explicit-txn) UPDATE preserves the stable id, bumps the commit version ----
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE lake.main.rt SET s = 'upd' WHERE id = 2;
+
+statement ok
+COMMIT;
+
+query ITII
+SELECT id, s, __delta_row_id, __delta_row_commit_version FROM lake.main.rt WHERE id IN (1, 2, 3) ORDER BY id;
+----
+1	v1	1	1
+2	upd	2	3
+3	v3	3	1
+
+# ---- DV DELETE removes the row's id; survivors keep theirs ----
+
+statement ok
+DELETE FROM lake.main.rt WHERE id = 6;
+
+query I
+SELECT count(*) FROM lake.main.rt WHERE __delta_row_id = 6;
+----
+0
+
+query I
+SELECT count(*) FROM lake.main.rt WHERE __delta_row_id IN (5, 7);
+----
+2
+
+# ---- OPTIMIZE (compaction) preserves ids + versions via materialized columns ----
+
+query I
+SELECT mssql_net_exec('lake', 'OPTIMIZE main.rt');
+----
+0
+
+query III
+SELECT id, __delta_row_id, __delta_row_commit_version FROM lake.main.rt WHERE id IN (0, 2, 9) ORDER BY id;
+----
+0	0	1
+2	2	3
+9	9	2
+
+# ---- explicit transaction: PENDING (uncommitted) rows have no baseRowId yet => NULL; real after COMMIT ----
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO lake.main.rt SELECT r, 'v' || r FROM range(20, 23) t(r);
+
+query II
+SELECT id, __delta_row_id IS NULL FROM lake.main.rt WHERE id >= 20 ORDER BY id;
+----
+20	true
+21	true
+22	true
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM lake.main.rt WHERE id >= 20 AND __delta_row_id IS NOT NULL;
+----
+3
+
+# ---- autocommit UPDATE on the (default) column-mapped table: MERGE-ON-READ since the mapping-gate
+#      lift — the stable id is preserved (materialized on the post-image) and the version bumps,
+#      identical to the buffered path ----
+
+statement ok
+UPDATE lake.main.rt SET s = 'mor' WHERE id = 9;
+
+query II
+SELECT __delta_row_id, __delta_row_commit_version FROM lake.main.rt WHERE id = 9;
+----
+9	7
+
+# ---- PARTITIONED merge-on-read (slice 2): the id survives an UPDATE — including a SET of the
+#      PARTITION column, which moves the row to its new partition's file with identity intact ----
+
+statement ok
+CREATE TABLE lake.main.pt (id BIGINT, region VARCHAR, s VARCHAR) PARTITIONED BY (region);
+
+statement ok
+INSERT INTO lake.main.pt SELECT r, CASE WHEN r % 2 = 0 THEN 'US' ELSE 'EU' END, 'v' || r FROM range(6) t(r);
+
+query I
+SELECT count(*) FROM lake.main.pt WHERE __delta_row_id IS NOT NULL;
+----
+6
+
+statement ok
+UPDATE lake.main.pt SET s = 'mor' WHERE id = 2;
+
+query II
+SELECT id, __delta_row_id IS NOT NULL FROM lake.main.pt WHERE id = 2;
+----
+2	true
+
+statement ok
+UPDATE lake.main.pt SET region = 'APAC' WHERE id = 3;
+
+query ITI
+SELECT id, region, count(*) OVER () FROM lake.main.pt WHERE __delta_row_id IS NOT NULL AND id = 3;
+----
+3	APAC	1
+
+query I
+SELECT count(*) FROM lake.main.pt WHERE region = 'APAC';
+----
+1
+
+# buffered partitioned UPDATE with materialize (gate lifted with the partition-split id carry)
+statement ok
+BEGIN;
+
+statement ok
+UPDATE lake.main.pt SET s = 'txn' WHERE id = 4;
+
+statement ok
+COMMIT;
+
+query II
+SELECT id, __delta_row_id IS NOT NULL FROM lake.main.pt WHERE id = 4;
+----
+4	true
+
+# ---- CDF merge-on-read (slice 3): the id survives an UPDATE on a Change-Data-Feed table, and the
+#      feed reads EXACTLY pre+post images (the commit is cdc-only — the DV re-add and the post-image
+#      add never double-count as inserts) ----
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/rtvirt3' AS lake4 (TYPE arrownet, PROVIDER 'delta', native_read true, native_write true, row_tracking true, change_data_feed true);
+
+statement ok
+CREATE TABLE lake4.main.cd AS SELECT r AS id, 'v' || r AS s FROM range(4) t(r);
+
+query I
+SELECT count(*) FROM lake4.main.cd WHERE __delta_row_id IS NOT NULL;
+----
+4
+
+statement ok
+UPDATE lake4.main.cd SET s = 'mor' WHERE id = 1;
+
+query II
+SELECT id, __delta_row_id FROM lake4.main.cd WHERE id = 1;
+----
+1	1
+
+query TIT
+SELECT _change_type, id, s FROM arrownet_delta_changes('lake4', 'main.cd', 2) ORDER BY _change_type;
+----
+update_postimage	1	mor
+update_preimage	1	v1
+
+query TI
+SELECT _change_type, count(*) FROM arrownet_delta_changes('lake4', 'main.cd', 0) GROUP BY _change_type ORDER BY _change_type;
+----
+insert	4
+update_postimage	1
+update_preimage	1
+
+# ---- the REMAINING P5-rewrite gap: CDF × PARTITIONED still takes copy-on-write (the cdc
+#      partitionValues corner), whose new add carries no row tracking ----
+
+statement ok
+CREATE TABLE lake4.main.cdp (id BIGINT, region VARCHAR, s VARCHAR) PARTITIONED BY (region);
+
+statement ok
+INSERT INTO lake4.main.cdp SELECT r, CASE WHEN r % 2 = 0 THEN 'US' ELSE 'EU' END, 'v' || r FROM range(4) t(r);
+
+statement ok
+UPDATE lake4.main.cdp SET s = 'cow' WHERE id = 1;
+
+query II
+SELECT id, __delta_row_id IS NULL FROM lake4.main.cdp WHERE id = 1;
+----
+1	true
+
+statement ok
+DETACH lake4;
+
+# ---- gating ----
+
+# a table WITHOUT row tracking: the names simply don't exist
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/rtvirt2' AS lake2 (TYPE arrownet, PROVIDER 'delta', native_read true, deletion_vectors false, row_tracking false);
+
+statement ok
+CREATE TABLE lake2.main.nt AS SELECT 1 AS a;
+
+statement error
+SELECT __delta_row_id FROM lake2.main.nt;
+----
+not found
+
+# a NON-native (codec) catalog does not advertise the virtual columns even on a row-tracking table
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/rtvirt' AS lake3 (TYPE arrownet, PROVIDER 'delta', READ_ONLY true);
+
+statement error
+SELECT __delta_row_id FROM lake3.main.rt;
+----
+not found
+
+# the same table's DATA still reads fine on the codec catalog
+query I
+SELECT count(*) FROM lake3.main.rt;
+----
+12
+
+statement ok
+DETACH lake3;
+
+statement ok
+DETACH lake2;
+
+statement ok
+DETACH lake;

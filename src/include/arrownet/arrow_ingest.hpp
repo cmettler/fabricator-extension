@@ -43,6 +43,16 @@ struct ArrowScanRequest {
 // throw a duckdb::Exception on failure (it will propagate to the SQL caller).
 using StreamFactory = std::function<void(const ArrowScanRequest &request, ArrowArrayStream &out)>;
 
+// The virtual-column-id base for PROVIDER-declared virtual columns (queryable-by-name columns the
+// provider serves on request but that are not part of the user schema / SELECT * — e.g. the Delta
+// catalog's stable __delta_row_id / __delta_row_commit_version). Id = base + index into
+// ArrowStreamBindData::provider_virtual_columns. Must be >= VIRTUAL_COLUMN_START (2^63; enforced by
+// TableBinding); offset past the MultiFileReader identifiers (2^63..2^63+2) and well below
+// COLUMN_IDENTIFIER_ROW_ID/EMPTY (2^64-1/-2).
+inline duckdb::column_t ProviderVirtualBase() {
+	return duckdb::VIRTUAL_COLUMN_START + 0x100;
+}
+
 // Bind data for any table function that streams Arrow from the bridge.
 struct ArrowStreamBindData : public duckdb::TableFunctionData {
 	//! Owned copy of the result schema (populated during bind).
@@ -116,11 +126,17 @@ struct ArrowStreamBindData : public duckdb::TableFunctionData {
 	duckdb::LogicalType rowid_type;
 
 	//! Virtual rowid source columns: rowid columns the provider supplies on request but that are NOT part of
-	//! the user-visible schema (so they have no index into `names`) — e.g. the Delta catalog's stable
+	//! the user-visible schema (so they have no index into `names`) — e.g. the Delta catalog's transient
 	//! `_metadata.row_id`. When non-empty (rowid_source_columns is then empty), these names are added to the
 	//! scan's fetch list when a rowid is requested, and `arrow_ingest` resolves their result positions BY NAME
 	//! for BuildRowId. SQL Server uses real columns (rowid_source_columns); this is the lakehouse path.
 	duckdb::vector<duckdb::string> virtual_rowid_columns;
+
+	//! Provider-declared virtual columns beyond the rowid (name, DuckDB type): queryable by name, excluded
+	//! from SELECT *, served by the provider as ordinary result columns when fetched — e.g. the Delta
+	//! catalog's stable __delta_row_id / __delta_row_commit_version (row-tracking tables under native_read).
+	//! Column id = arrownet::ProviderVirtualBase() + index. Resolved BY NAME in the result, 1:1.
+	duckdb::vector<std::pair<duckdb::string, duckdb::LogicalType>> provider_virtual_columns;
 
 	//! Approximate table row count for the optimizer's cardinality estimate; -1 =>
 	//! unknown (no NodeStatistics reported). Set for catalog table scans.
@@ -129,6 +145,13 @@ struct ArrowStreamBindData : public duckdb::TableFunctionData {
 	//! For catalog tables: the backing table entry, so LogicalGet::GetTable()
 	//! resolves (required for UPDATE/DELETE). Null for raw table functions.
 	duckdb::optional_ptr<duckdb::TableCatalogEntry> table;
+
+	//! Required by DuckDB's late-materialization rewrite (LateMaterializationHelper::CreateLHSGet clones
+	//! the scan's bind data for the fetch-side get). Copies every post-bind member; `schema_root` /
+	//! `arrow_table` are deliberately NOT copied — they are bind-time-only artifacts (PopulateReturnSchema
+	//! fills return_types/names from them and nothing reads them afterwards: scans build their own
+	//! per-scan converters from the live stream in ArrowStreamInitGlobal).
+	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override;
 };
 
 // get_bind_info callback so DuckDB can recover the table entry from a scan

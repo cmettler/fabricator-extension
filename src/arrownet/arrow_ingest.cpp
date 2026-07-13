@@ -134,6 +134,34 @@ void ReadArrowSchema(ClientContext &context, ArrowSchema &arrow_schema, vector<L
 	ReadSchemaColumns(context, schema_root.arrow_schema, arrow_table, return_types, names, nullptr);
 }
 
+// See the header note: schema_root/arrow_table are bind-time-only, so the copy shares everything else
+// and leaves them empty. Used by the late-materialization rewrite's fetch-side get (CreateLHSGet).
+unique_ptr<FunctionData> ArrowStreamBindData::Copy() const {
+	auto copy = make_uniq<ArrowStreamBindData>();
+	copy->column_ids = column_ids; // TableFunctionData base
+	copy->return_types = return_types;
+	copy->names = names;
+	copy->column_nullable = column_nullable;
+	copy->column_ndv = column_ndv;
+	copy->push_projection = push_projection;
+	copy->factory = factory;
+	copy->filter_json = filter_json;
+	copy->filter_constants = filter_constants;
+	copy->native_filter_sql = native_filter_sql;
+	copy->top_n = top_n;
+	copy->order_by_json = order_by_json;
+	copy->string_order_pushable = string_order_pushable;
+	copy->at_unit = at_unit;
+	copy->at_value = at_value;
+	copy->rowid_source_columns = rowid_source_columns;
+	copy->rowid_type = rowid_type;
+	copy->virtual_rowid_columns = virtual_rowid_columns;
+	copy->provider_virtual_columns = provider_virtual_columns;
+	copy->row_count = row_count;
+	copy->table = table;
+	return std::move(copy);
+}
+
 void PopulateReturnSchema(ClientContext &context, ArrowStreamBindData &bind_data,
                           vector<LogicalType> &return_types, vector<string> &names) {
 	// Produce a throwaway stream solely to read the schema, then release it. A bare
@@ -505,13 +533,33 @@ static string SerializeLiveFilters(const ArrowStreamBindData &bind_data, TableFu
 			continue;
 		}
 		auto col_id = input.column_ids[key];
-		if (col_id == COLUMN_IDENTIFIER_ROW_ID || (idx_t)col_id >= bind_data.names.size()) {
-			continue; // rowid / virtual / out-of-range: no filter pushed on those
+		string col_name;
+		LogicalType col_type;
+		if (col_id == COLUMN_IDENTIFIER_ROW_ID) {
+			// A filter on the ROWID column (late-materialization semi join / WHERE rowid = ...): resolvable
+			// only for a single VIRTUAL rowid (Delta's `_metadata.row_id`, a named provider column). Exact
+			// mode is native_read-only, whose rowid is always that single virtual BIGINT — so a mandatory
+			// erased rowid filter is never silently dropped here.
+			if (bind_data.virtual_rowid_columns.size() != 1) {
+				continue;
+			}
+			col_name = bind_data.virtual_rowid_columns[0];
+			col_type = bind_data.rowid_type;
+		} else if (col_id >= ProviderVirtualBase() &&
+		           col_id < ProviderVirtualBase() + bind_data.provider_virtual_columns.size()) {
+			// Provider virtual column (e.g. Delta's stable __delta_row_id): filter by declared name/type.
+			auto &vc = bind_data.provider_virtual_columns[(idx_t)(col_id - ProviderVirtualBase())];
+			col_name = vc.first;
+			col_type = vc.second;
+		} else if ((idx_t)col_id >= bind_data.names.size()) {
+			continue; // out-of-range/virtual: no filter pushed on those
+		} else {
+			col_name = bind_data.names[(idx_t)col_id];
+			col_type = (idx_t)col_id < bind_data.return_types.size() ? bind_data.return_types[(idx_t)col_id]
+			                                                         : LogicalType(LogicalTypeId::ANY);
 		}
-		vector<string> path {bind_data.names[(idx_t)col_id]};
-		const LogicalType &type = (idx_t)col_id < bind_data.return_types.size()
-		                              ? bind_data.return_types[(idx_t)col_id]
-		                              : LogicalType(LogicalTypeId::ANY);
+		vector<string> path {col_name};
+		const LogicalType &type = col_type;
 		string node;
 		if (LiveFilterNode(*entry.second, path, type, constants, bind_data.string_order_pushable, node) &&
 		    !node.empty()) {
@@ -551,11 +599,26 @@ static string RenderLiveFilters(const ArrowStreamBindData &bind_data, TableFunct
 			continue;
 		}
 		auto col_id = input.column_ids[key];
-		if (col_id == COLUMN_IDENTIFIER_ROW_ID || (idx_t)col_id >= bind_data.names.size()) {
-			continue; // rowid / virtual / out-of-range: no filter pushed on those
+		string col_name;
+		if (col_id == COLUMN_IDENTIFIER_ROW_ID) {
+			// Rowid filter (late-materialization semi join / WHERE rowid = ...): render against the virtual
+			// rowid's provider name — the native reader's per-file SELECT aliases the rowid expression to
+			// exactly that name, and DuckDB permits SELECT-alias references in WHERE.
+			if (bind_data.virtual_rowid_columns.size() != 1) {
+				continue;
+			}
+			col_name = bind_data.virtual_rowid_columns[0];
+		} else if (col_id >= ProviderVirtualBase() &&
+		           col_id < ProviderVirtualBase() + bind_data.provider_virtual_columns.size()) {
+			// Provider virtual column: the per-file SELECT aliases it to its declared name too.
+			col_name = bind_data.provider_virtual_columns[(idx_t)(col_id - ProviderVirtualBase())].first;
+		} else if ((idx_t)col_id >= bind_data.names.size()) {
+			continue; // out-of-range/virtual: no filter pushed on those
+		} else {
+			col_name = bind_data.names[(idx_t)col_id];
 		}
 		string qcol;
-		SqlIdentIngest(bind_data.names[(idx_t)col_id], qcol);
+		SqlIdentIngest(col_name, qcol);
 		string rendered;
 		if (RenderTableFilter(*entry.second, qcol, rendered) && !rendered.empty()) {
 			conds.push_back(std::move(rendered));
@@ -587,9 +650,16 @@ static string BuildScanSpec(const ArrowStreamBindData &bind_data, const vector<c
 		}
 	};
 	bool need_rowid = false;
+	auto virtual_base = ProviderVirtualBase();
 	for (auto col_id : output_column_ids) {
 		if (col_id == COLUMN_IDENTIFIER_ROW_ID) {
 			need_rowid = true;
+		} else if (col_id >= virtual_base && col_id < virtual_base + bind_data.provider_virtual_columns.size()) {
+			// Provider virtual column (e.g. Delta's stable __delta_row_id): fetch by its declared name.
+			const string &vn = bind_data.provider_virtual_columns[(idx_t)(col_id - virtual_base)].first;
+			if (std::find(cols.begin(), cols.end(), vn) == cols.end()) {
+				cols.push_back(vn);
+			}
 		} else {
 			add((idx_t)col_id);
 		}
@@ -722,8 +792,18 @@ static void BuildProjectionMapping(const ArrowStreamBindData &bind_data, const v
 	};
 
 	gstate.output_source_pos.clear();
+	auto virtual_base = arrownet::ProviderVirtualBase();
 	for (auto col_id : gstate.output_column_ids) {
-		gstate.output_source_pos.push_back(col_id == COLUMN_IDENTIFIER_ROW_ID ? -1 : (int64_t)resolve((idx_t)col_id));
+		if (col_id == COLUMN_IDENTIFIER_ROW_ID) {
+			gstate.output_source_pos.push_back(-1);
+		} else if (col_id >= virtual_base &&
+		           col_id < virtual_base + bind_data.provider_virtual_columns.size()) {
+			// Provider virtual column: a plain 1:1 result column, resolved BY NAME (it has no table index).
+			auto it = pos_by_name.find(bind_data.provider_virtual_columns[(idx_t)(col_id - virtual_base)].first);
+			gstate.output_source_pos.push_back(it != pos_by_name.end() ? (int64_t)it->second : 0);
+		} else {
+			gstate.output_source_pos.push_back((int64_t)resolve((idx_t)col_id));
+		}
 	}
 	gstate.rowid_source_pos.clear();
 	for (auto src : bind_data.rowid_source_columns) {

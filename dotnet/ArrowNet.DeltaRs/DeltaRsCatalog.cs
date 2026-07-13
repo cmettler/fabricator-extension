@@ -149,6 +149,14 @@ public sealed class DeltaRsCatalog : IBackendCatalog
         MetadataKind.RowId => SingleColumn("name", RowIdColumns(schema!, table!)),
         MetadataKind.Snapshots => SnapshotsStream(schema, table),
         MetadataKind.Changes => ChangesStream(schema, table),
+        // No provider virtual columns (stable row-tracking virtuals are an engineeredwooddelta feature).
+        MetadataKind.VirtualColumns => new InMemoryArrayStream(
+            new Schema(new[]
+            {
+                new Field("name", StringType.Default, nullable: true),
+                new Field("type", StringType.Default, nullable: true),
+            }, metadata: null),
+            System.Array.Empty<RecordBatch>()),
         _ => SingleColumn("name", System.Array.Empty<string>()),
     };
 

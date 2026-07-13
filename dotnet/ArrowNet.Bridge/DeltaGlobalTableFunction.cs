@@ -419,8 +419,7 @@ internal static class DeltaWriter
     internal const string MaterializedRowCommitVersionColumn = "__delta_row_commit_version";
 
     private static Dictionary<string, string>? CreateConfig(
-        bool deletionVectors, bool rowTracking, bool inCommitTimestamps, bool changeDataFeed,
-        bool materializeRowTracking = false)
+        bool deletionVectors, bool rowTracking, bool inCommitTimestamps, bool changeDataFeed)
     {
         if (!deletionVectors && !rowTracking && !inCommitTimestamps && !changeDataFeed)
         {
@@ -445,10 +444,14 @@ internal static class DeltaWriter
         {
             config["delta.enableChangeDataFeed"] = "true";
         }
-        if (materializeRowTracking && (deletionVectors || rowTracking))
+        if (deletionVectors || rowTracking)
         {
-            // Declare the materialized row-tracking columns so Spark exposes `_metadata.row_id` and honors the
-            // materialized id we write on a rewrite (preserving stable ids across UPDATE/compaction).
+            // Row tracking IMPLIES materialization (Spark parity: enableRowTracking promises ids stable
+            // across rewrites, implemented via the materialized columns — Spark auto-declares them at
+            // enablement). Rewrites (merge-on-read post-images, compaction, buffered UPDATE post-images)
+            // bake each row's ORIGINAL id into the declared column; plain appends never materialize
+            // (readers derive baseRowId + position). The old opt-in `materialize_row_tracking` ATTACH
+            // option is gone — the declaration always rides row tracking.
             config["delta.rowTracking.materializedRowIdColumnName"] = MaterializedRowIdColumn;
             config["delta.rowTracking.materializedRowCommitVersionColumnName"] = MaterializedRowCommitVersionColumn;
         }
@@ -470,7 +473,6 @@ internal static class DeltaWriter
                              DeltaWriteMode mode, CancellationToken ct, bool deletionVectors = false,
                              bool inCommitTimestamps = false, bool changeDataFeed = false,
                              bool rowTracking = false, DeltaWriteSpec? spec = null, bool nativeWrite = false,
-                             bool materializeRowTracking = false,
                              EngineeredWood.DeltaLake.Schema.ColumnMappingMode columnMapping =
                                  EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None)
     {
@@ -496,7 +498,7 @@ internal static class DeltaWriter
             var fs = TableFileSystems.Create(opener, path);
             var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(spec, dataFileWriter),
                                                      partitionColumns: spec?.PartitionColumns,
-                                                     configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, materializeRowTracking),
+                                                     configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed),
                                                      columnMappingMode: columnMapping,
                                                      cancellationToken: ct).AsTask().GetAwaiter().GetResult();
             try
@@ -669,7 +671,7 @@ internal static class DeltaWriter
     public static long? TryWriteStreaming(
         nint opener, string path, IArrowArrayStream data, DeltaWriteMode mode,
         bool deletionVectors, bool inCommitTimestamps, bool changeDataFeed, bool rowTracking,
-        DeltaWriteSpec? spec, bool materializeRowTracking, out long rowsWritten,
+        DeltaWriteSpec? spec, out long rowsWritten,
         EngineeredWood.DeltaLake.Schema.ColumnMappingMode columnMapping =
             EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None,
         EngineeredWood.DeltaLake.Schema.StructType? pendingSchema = null,
@@ -705,7 +707,7 @@ internal static class DeltaWriter
         var table = DeltaTable.OpenOrCreateAsync(
             fs, data.Schema, Options(spec),
             partitionColumns: spec?.PartitionColumns,   // set on a partitioned CTAS create; ignored for an INSERT
-            configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, materializeRowTracking),
+            configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed),
             columnMappingMode: columnMapping,
             cancellationToken: default).AsTask().GetAwaiter().GetResult();
         try
@@ -1089,7 +1091,6 @@ internal static class DeltaWriter
     public static void Create(nint opener, string path, Schema schema, CancellationToken ct,
                               bool deletionVectors = false, bool inCommitTimestamps = false,
                               bool changeDataFeed = false, bool rowTracking = false, DeltaWriteSpec? spec = null,
-                              bool materializeRowTracking = false,
                               EngineeredWood.DeltaLake.Schema.ColumnMappingMode columnMapping =
                                   EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None,
                               EngineeredWood.DeltaLake.Schema.StructType? preAssignedSchema = null)
@@ -1104,7 +1105,7 @@ internal static class DeltaWriter
                 // OpenOrCreate writes commit-0 for a new table (or opens an existing one — no commit, no conflict).
                 var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(spec),
                                                          partitionColumns: spec?.PartitionColumns,
-                                                         configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, materializeRowTracking),
+                                                         configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed),
                                                          columnMappingMode: columnMapping,
                                                          preAssignedSchema: preAssignedSchema,
                                                          cancellationToken: ct).AsTask().GetAwaiter().GetResult();

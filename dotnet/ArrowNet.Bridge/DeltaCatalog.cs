@@ -138,13 +138,6 @@ public sealed class DeltaCatalog : IBackendCatalog
     // by DuckDB's native parquet writer (COPY … TO … FORMAT parquet) instead of engineered-wood's codec; the
     // _delta_log commit stays in engineered-wood. Opt-in (default off); DELETE/UPDATE rewrites are a later slice.
     private readonly bool _nativeWrite;
-    // ATTACH option `materialize_row_tracking true` (opt-in; default off): a row-tracking table declares the Delta
-    // `delta.rowTracking.materializedRowIdColumnName` so a spec reader (Spark) exposes `_metadata.row_id`, AND a
-    // copy-on-write/merge-on-read rewrite materializes each rewritten row's ORIGINAL stable id (instead of a fresh
-    // base_row_id) so row ids are preserved across UPDATE (and, later, compaction). Validated via the Fabric Spark
-    // Livy harness. Default OFF keeps the validated DV-default path untouched (no new feature declaration).
-    private readonly bool _materializeRowTracking;
-
     // ATTACH option `column_mapping 'name'|'id'|'none'` (default NAME — Fabric-T-SQL-endpoint-compatible;
     // the endpoint rejects id-mode tables): tables CREATED in this catalog enable Delta
     // column mapping — physical column names (col-<guid>) decoupled from logical names, so a later RENAME/DROP
@@ -211,7 +204,6 @@ public sealed class DeltaCatalog : IBackendCatalog
         _mergeSchemaOnWrite = ParseBoolOption(optionsJson, "merge_schema");
         _nativeRead = ParseBoolOption(optionsJson, "native_read");
         _nativeWrite = ParseBoolOption(optionsJson, "native_write");
-        _materializeRowTracking = ParseBoolOption(optionsJson, "materialize_row_tracking");
         _columnMappingMode = ParseColumnMappingOption(optionsJson);
         _pushdownMode = ParsePushdownFiltersOption(optionsJson, _nativeRead);
         _copyDisposition = ParseStringOption(optionsJson, "copy_disposition");
@@ -525,13 +517,16 @@ public sealed class DeltaCatalog : IBackendCatalog
         MetadataKind.Tables => DiscoverTables(),
         // Columns = a zero-row stream whose SCHEMA describes the table's columns (engineered-wood's Delta schema).
         MetadataKind.Columns => new InMemoryArrayStream(
-            _txnBuffer.Get(AmbientTransaction.Current, TablePath(schema!, table!))?.PendingArrowSchema
-                ?? DeltaReader.GetSchema(Opener(), TablePath(schema!, table!)),
-            System.Array.Empty<RecordBatch>()),
+            ColumnsSchema(TablePath(schema!, table!)), System.Array.Empty<RecordBatch>()),
         // RowId: always surface the virtual _metadata.row_id — a TRANSIENT (file, position) rowid computed at
         // scan time (no row-tracking feature needed; works on ANY Delta table). Enables UPDATE/DELETE
         // (rowid-based, mirrors the SQL Server backend); DELETE is copy-on-write (plain add/remove).
         MetadataKind.RowId => SingleColumn("name", new[] { RowIdColumn }),
+        // Provider virtual columns: the STABLE row-tracking id + commit version as queryable-by-name virtual
+        // columns (__delta_row_id / __delta_row_commit_version — the Delta materialized-column names; excluded
+        // from SELECT *). native_read + delta.enableRowTracking tables only — the native reader derives them
+        // per file (COALESCE(materialized, baseRowId + file_row_number) / defaultRowCommitVersion).
+        MetadataKind.VirtualColumns => VirtualColumnsStream(TablePath(schema!, table!)),
         // Snapshots/history (arrownet_delta_snapshots): arg1=schema, arg2=table. Schema is required on a
         // schema-enabled lakehouse; defaults to "main" on a flat catalog.
         MetadataKind.Snapshots => SnapshotsStream(schema, table),
@@ -549,6 +544,42 @@ public sealed class DeltaCatalog : IBackendCatalog
         // No row-count/NDV stats surfaced, no functions.
         _ => EmptyStringTable("name"),
     };
+
+    // rowTracking flag per table path, filled by ColumnsSchema (the column fetch that ALWAYS precedes the
+    // virtual-columns fetch in the host's entry materialization) — so VirtualColumnsStream normally costs no
+    // extra _delta_log read (the OneLake enumeration concern).
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, bool> _rowTrackingByPath = new();
+
+    // The Columns metadata schema: a buffered transaction's pending (CREATE/ALTER) shape wins; otherwise one
+    // table open that also caches the row-tracking flag for VirtualColumnsStream.
+    private Schema ColumnsSchema(string path)
+    {
+        if (_txnBuffer.Get(AmbientTransaction.Current, path)?.PendingArrowSchema is { } pendingSchema)
+        {
+            return pendingSchema;
+        }
+        var schema = DeltaReader.GetSchemaAndRowTracking(Opener(), path, out bool rowTracking);
+        _rowTrackingByPath[path] = rowTracking;
+        return schema;
+    }
+
+    // Provider virtual columns for one table: __delta_row_id + __delta_row_commit_version (BIGINT), advertised
+    // only when the catalog reads natively (the per-file SQL derives them) AND the table tracks rows. A real
+    // user column with the same name shadows the virtual one at bind (DuckDB's TableBinding prefers real names).
+    private IArrowArrayStream VirtualColumnsStream(string path)
+    {
+        bool rowTracking = false;
+        if (_nativeRead && !_rowTrackingByPath.TryGetValue(path, out rowTracking))
+        {
+            DeltaReader.GetSchemaAndRowTracking(Opener(), path, out rowTracking);
+            _rowTrackingByPath[path] = rowTracking;
+        }
+        return _nativeRead && rowTracking
+            ? TwoColumn(
+                "name", new[] { DeltaNativeReader.RowTrackingIdColumn, DeltaNativeReader.RowTrackingVersionColumn },
+                "type", new[] { "BIGINT", "BIGINT" })
+            : TwoColumn("name", System.Array.Empty<string>(), "type", System.Array.Empty<string>());
+    }
 
     /// <summary>The commit history of <paramref name="schema"/>.<paramref name="table"/> as an Arrow stream
     /// (version, timestamp, operation, operation_parameters). <paramref name="schema"/> is required on a
@@ -1588,8 +1619,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                     inCommitTimestamps: _inCommitTimestampsOnCreate,
                     changeDataFeed: _changeDataFeedOnCreate,
                     rowTracking: _rowTrackingOnCreate,
-                    spec: spec, materializeRowTracking: _materializeRowTracking,
-                    out var deferredRows,
+                    spec: spec,                    out var deferredRows,
                     columnMapping: _columnMappingMode,
                     pendingSchema: pending.PendingDeltaSchema,
                     deferCommitTo: pending.Files);
@@ -1679,8 +1709,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 inCommitTimestamps: _inCommitTimestampsOnCreate,
                 changeDataFeed: _changeDataFeedOnCreate,
                 rowTracking: _rowTrackingOnCreate,
-                spec: spec, materializeRowTracking: _materializeRowTracking,
-                out var streamedRows,
+                spec: spec,                out var streamedRows,
                 columnMapping: _columnMappingMode);
             if (streamedVersion is not null)
             {
@@ -1697,7 +1726,6 @@ public sealed class DeltaCatalog : IBackendCatalog
                           changeDataFeed: _changeDataFeedOnCreate,
                           rowTracking: _rowTrackingOnCreate,
                           spec: spec, nativeWrite: _nativeWrite,
-                          materializeRowTracking: _materializeRowTracking,
                           columnMapping: _columnMappingMode);
         return rows;
     }
@@ -1808,7 +1836,6 @@ public sealed class DeltaCatalog : IBackendCatalog
                               changeDataFeed: _changeDataFeedOnCreate,
                               rowTracking: _rowTrackingOnCreate,
                               spec: ResolveWriteSpec(partitionColumns, schemaModeArg: null),
-                              materializeRowTracking: _materializeRowTracking,
                               columnMapping: _columnMappingMode);
     }
 
@@ -1884,7 +1911,6 @@ public sealed class DeltaCatalog : IBackendCatalog
                         changeDataFeed: _changeDataFeedOnCreate,
                         rowTracking: _rowTrackingOnCreate,
                         spec: ResolveWriteSpec(null, null), nativeWrite: _nativeWrite,
-                        materializeRowTracking: _materializeRowTracking,
                         columnMapping: _columnMappingMode);
                     _log.LogInformation("delta txn {Txn} commit {Path}: v{Version} ({Rows} buffered row(s))",
                         txnId, kv.Key, v, pending.Rows);
@@ -2232,12 +2258,9 @@ public sealed class DeltaCatalog : IBackendCatalog
                 "delta: UPDATE inside an explicit transaction is not supported on identity/IcebergCompat "
                 + "tables — run it in autocommit.");
         }
-        if (forUpdate && _materializeRowTracking && p.Partitioned)
-        {
-            throw new System.NotSupportedException(
-                "delta: UPDATE inside an explicit transaction is not supported with materialize_row_tracking "
-                + "— run it in autocommit (preserved stable row ids apply there).");
-        }
+        // Materialized row tracking (implied by row tracking) × partitioned UPDATE: supported since the
+        // WriteDataFilesAsync partition
+        // split learned to carry materialized ids (the id column rides the split).
     }
 
     // Buffers a DELETE (or an UPDATE's old-row half): decode each transient rowid into (pinned-snapshot file
@@ -2383,13 +2406,14 @@ public sealed class DeltaCatalog : IBackendCatalog
         long matched = 0;
         var postImages = new List<RecordBatch>();
         var preImages = profile.CdfEnabled ? new List<RecordBatch>() : null;
-        // materialize_row_tracking: the post-image rows must carry their ORIGINAL stable ids in the
+        // Materialized row tracking (implied by row tracking — the table declares the materialized
+        // columns): the post-image rows must carry their ORIGINAL stable ids in the
         // declared __delta_row_id column (identity preserved across the UPDATE — Spark's reference
         // behavior). Resolved as baseRowId[ordinal] + position against the ordinal-ordered active set,
         // the same rule EW's merge-on-read update applies; collected flat, aligned with postImages.
         List<long>? stableIds = null;
         IReadOnlyList<long?>? orderedBaseIds = null;
-        if (_materializeRowTracking)
+        if (profile.MaterializeRowIds)
         {
             stableIds = new List<long>();
             orderedBaseIds = DeltaReader.GetOrderedActiveBaseRowIds(opener, path,
@@ -2458,7 +2482,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         // WrittenDataFile action parks on the buffer, so a large UPDATE no longer holds its post-images
         // in memory until COMMIT. Native_write AND codec catalogs both (the codec writes via EW's own
         // writer; buffered-UPDATE eligibility already guarantees SupportsExternalDataFileCommit + not
-        // materialize_row_tracking). The pending-FILES read overlay (ScanNative routing) serves
+        // materialized row tracking). The pending-FILES read overlay (ScanNative routing) serves
         // read-your-writes; ROLLBACK leaves the file as an invisible orphan (vacuum's job). NOT NULL is
         // validated inside the helper (the flush only validates Batches).
         if (TryEagerWriteBatches(opener, path, pending, postImages, tableName,
@@ -2543,7 +2567,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     // catalogs already use (and native_read validates broadly against codec-written files). Explicit
     // transactions only (autocommit keeps the byte-identical park-batches → DeltaWriter.Write shape).
     // Returns false (nothing written, batches untouched) for: a pending-created table (nothing on
-    // storage to open) or identity/iceberg (no external-commit support). materialize_row_tracking
+    // storage to open) or identity/iceberg (no external-commit support). Materialized row tracking
     // catalogs eager-write like everyone: a FRESH append needs no physical __delta_row_id column —
     // readers derive ids from the commit-assigned baseRowId + position (the validated streamed-native
     // behavior, and what the flush's own WriteDataFilesAsync batch path already produces); the
@@ -2629,7 +2653,6 @@ public sealed class DeltaCatalog : IBackendCatalog
                            changeDataFeed: _changeDataFeedOnCreate,
                            rowTracking: _rowTrackingOnCreate,
                            spec: ResolveWriteSpec(pending.CreatePartitionColumns, schemaModeArg: null),
-                           materializeRowTracking: _materializeRowTracking,
                            columnMapping: _columnMappingMode,
                            // slice B: an eagerly-streamed CTAS's files were written against THIS
                            // pre-assigned mapping schema — the create must reuse it, never re-assign
@@ -2676,7 +2699,6 @@ public sealed class DeltaCatalog : IBackendCatalog
                                   changeDataFeed: _changeDataFeedOnCreate,
                                   rowTracking: _rowTrackingOnCreate,
                                   spec: ResolveWriteSpec(null, null), nativeWrite: _nativeWrite,
-                                  materializeRowTracking: _materializeRowTracking,
                                   columnMapping: _columnMappingMode);
         }
         _log.LogInformation("delta txn {Txn} commit-create {Path}: v{Version} ({Rows} buffered row(s))",

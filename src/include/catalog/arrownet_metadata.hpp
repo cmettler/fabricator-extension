@@ -77,6 +77,13 @@ void FetchTableColumns(ClientContext &context, ArrowNetHandle handle, const stri
 //! if the table has no PK or unique index.
 vector<string> FetchRowIdColumns(ArrowNetHandle handle, const string &schema_name, const string &table_name);
 
+//! Provider-declared VIRTUAL columns for a table: (name, type-text) pairs the provider serves as
+//! queryable-by-name virtual columns (not part of SELECT *) — e.g. the Delta catalog's stable
+//! row-tracking __delta_row_id / __delta_row_commit_version. Best-effort: any failure (a provider
+//! without the metadata kind) returns empty.
+vector<std::pair<string, string>> FetchVirtualColumns(ArrowNetHandle handle, const string &schema_name,
+                                                      const string &table_name);
+
 //! Approximate table row count (from partition stats) for the optimizer's
 //! cardinality estimate. Returns -1 if unknown (e.g. a view or no stats).
 int64_t FetchRowCount(ArrowNetHandle handle, const string &schema_name, const string &table_name);

@@ -199,8 +199,30 @@ optional_ptr<CatalogEntry> ArrowNetSchemaEntry::GetOrCreateEntry(ClientContext &
 		rowid_type = LogicalType::STRUCT(std::move(children));
 	}
 
+	// Provider-declared VIRTUAL columns (queryable by name, excluded from SELECT *) — e.g. the Delta
+	// catalog's stable __delta_row_id / __delta_row_commit_version on row-tracking tables under
+	// native_read. Best-effort (empty for providers without the metadata kind); an unknown declared
+	// type is skipped rather than guessed.
+	vector<std::pair<string, LogicalType>> provider_virtual_columns;
+	for (auto &vc : FetchVirtualColumns(handle_, name, table_name)) {
+		LogicalType vt;
+		if (vc.second == "BIGINT") {
+			vt = LogicalType::BIGINT;
+		} else if (vc.second == "INTEGER") {
+			vt = LogicalType::INTEGER;
+		} else if (vc.second == "VARCHAR") {
+			vt = LogicalType::VARCHAR;
+		} else if (vc.second == "DOUBLE") {
+			vt = LogicalType::DOUBLE;
+		} else {
+			continue;
+		}
+		provider_virtual_columns.emplace_back(vc.first, std::move(vt));
+	}
+
 	auto entry = make_uniq<ArrowNetTableEntry>(catalog, *this, info, handle_, std::move(rowid_indices),
-	                                           std::move(rowid_type), std::move(virtual_rowid_columns));
+	                                           std::move(rowid_type), std::move(virtual_rowid_columns),
+	                                           std::move(provider_virtual_columns));
 	auto &ref = *entry;
 	entries_[table_name] = std::move(entry);
 	return &ref;

@@ -58,8 +58,13 @@ internal static class DeltaReader
     /// (matching engineered-wood's <c>OrderedActiveFiles</c> so a `(Ordinal&lt;&lt;40)|file_row_number` rowid
     /// round-trips to <c>DeleteByRowIdsAsync</c>), the readable <paramref name="Uri"/> (onelake:// for OneLake),
     /// and the sorted deleted row positions <paramref name="Dv"/> (empty = no DV).</summary>
+    /// <summary><paramref name="BaseRowId"/>/<paramref name="CommitVersion"/> = the add action's row-tracking
+    /// fields (null when the table doesn't track rows, or for a transaction's PENDING files — ids are assigned
+    /// at commit): they drive the <c>__delta_row_id</c>/<c>__delta_row_commit_version</c> virtual columns
+    /// (stable id = baseRowId + position unless a materialized column overrides).</summary>
     public sealed record NativeScanFile(int Ordinal, string Uri, long[] Dv,
-                                        IReadOnlyDictionary<string, string>? PartitionValues = null);
+                                        IReadOnlyDictionary<string, string>? PartitionValues = null,
+                                        long? BaseRowId = null, long? CommitVersion = null);
 
     /// <summary>The result of <see cref="ListNativeScanFiles"/>: the resolved snapshot <see cref="Version"/>, the
     /// surviving (post-prune) <see cref="Files"/> in path-sorted global-ordinal order, and <see cref="AnyUri"/> =
@@ -179,7 +184,8 @@ internal static class DeltaReader
                     System.Array.Sort(dv);
                 }
                 files.Add(new NativeScanFile(ordinal, uri, dv,
-                    add.PartitionValues is { Count: > 0 } ? add.PartitionValues : null));
+                    add.PartitionValues is { Count: > 0 } ? add.PartitionValues : null,
+                    add.BaseRowId, add.DefaultRowCommitVersion));
             }
             // Column-mapping tables store columns decoupled from the logical name — capture the mapping (from THIS
             // snapshot's schema, so time travel to a pre-rename version maps correctly) so the native reader can
@@ -314,6 +320,27 @@ internal static class DeltaReader
         var table = DeltaTable.OpenAsync(fs).GetAwaiter().GetResult();
         try
         {
+            return table.ArrowSchema;
+        }
+        finally
+        {
+            table.Dispose();
+        }
+    }
+
+    /// <summary>Like <see cref="GetSchema"/> but also reports whether <c>delta.enableRowTracking</c> is set —
+    /// in the SAME table open, so the catalog's column fetch can cache the flag for the (immediately
+    /// following) virtual-columns metadata fetch without a second <c>_delta_log</c> read (OneLake cost).</summary>
+    public static Schema GetSchemaAndRowTracking(nint opener, string path, out bool rowTracking)
+    {
+        var fs = TableFileSystems.Create(opener, path);
+        var table = DeltaTable.OpenAsync(fs).GetAwaiter().GetResult();
+        try
+        {
+            var cfg = table.CurrentSnapshot.Metadata.Configuration;
+            rowTracking = cfg is not null
+                && cfg.TryGetValue("delta.enableRowTracking", out var v)
+                && string.Equals(v, "true", System.StringComparison.OrdinalIgnoreCase);
             return table.ArrowSchema;
         }
         finally
@@ -484,9 +511,13 @@ internal static class DeltaReader
     }
 
     /// <summary>The table properties buffered (explicit-transaction) DML needs, probed in ONE table open,
-    /// plus the current version (the pin fallback when no scan pinned the transaction yet).</summary>
+    /// plus the current version (the pin fallback when no scan pinned the transaction yet).
+    /// <paramref name="MaterializeRowIds"/> = the table declares
+    /// <c>delta.rowTracking.materializedRowIdColumnName</c> (implied by row tracking on our created tables) —
+    /// UPDATE post-images then bake each row's ORIGINAL stable id into that column.</summary>
     public readonly record struct TxnDmlProfile(
-        bool DvEnabled, bool CdfEnabled, bool SupportsExternalCommit, long Version, bool Partitioned);
+        bool DvEnabled, bool CdfEnabled, bool SupportsExternalCommit, long Version, bool Partitioned,
+        bool MaterializeRowIds);
 
     /// <summary>The active files' baseRowIds in transient-rowid ordinal order (see
     /// <see cref="DeltaTable.OrderedActiveBaseRowIds"/>) — resolves a matched row's ORIGINAL stable id
@@ -519,9 +550,13 @@ internal static class DeltaReader
             bool cdf = cfg is not null
                 && cfg.TryGetValue("delta.enableChangeDataFeed", out var c)
                 && string.Equals(c, "true", System.StringComparison.OrdinalIgnoreCase);
+            bool matIds = cfg is not null
+                && cfg.TryGetValue("delta.rowTracking.materializedRowIdColumnName", out var m)
+                && !string.IsNullOrEmpty(m);
             return new TxnDmlProfile(dv, cdf, table.SupportsExternalDataFileCommit,
                                      table.CurrentSnapshot.Version,
-                                     table.CurrentSnapshot.Metadata.PartitionColumns.Count > 0);
+                                     table.CurrentSnapshot.Metadata.PartitionColumns.Count > 0,
+                                     matIds);
         }
         finally
         {

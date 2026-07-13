@@ -35,6 +35,16 @@ internal static class DeltaNativeReader
 {
     private const string RowIdColumn = "_metadata.row_id";
     private const int RowIdPositionBits = 40;
+
+    /// <summary>The STABLE row-tracking id virtual column (the Delta materialized-column name): per row
+    /// <c>COALESCE(materialized __delta_row_id, baseRowId + position)</c>. Advertised (and served) only on
+    /// native_read catalogs for tables with <c>delta.enableRowTracking</c>; NULL for a transaction's pending
+    /// (uncommitted) files — baseRowId is assigned at commit.</summary>
+    internal const string RowTrackingIdColumn = "__delta_row_id";
+
+    /// <summary>The stable per-row commit version (materialized __delta_row_commit_version, else the file's
+    /// defaultRowCommitVersion). Same gating as <see cref="RowTrackingIdColumn"/>.</summary>
+    internal const string RowTrackingVersionColumn = "__delta_row_commit_version";
     private static readonly ILogger Log = ArrowNetLog.CreateLogger("ArrowNet.Delta.Native");
 
     /// <summary>Builds the Arrow stream for a native Delta scan. <paramref name="unit"/>/<paramref name="value"/>
@@ -51,8 +61,26 @@ internal static class DeltaNativeReader
             ? cols.Where(c => c != RowIdColumn).ToList()
             : userSchema.FieldsList.Select(f => f.Name).ToList();
 
+        // ROWID fast path: a filter on `_metadata.row_id` (late-materialization semi join / WHERE rowid=…)
+        // decodes EXACTLY — ordinal half → file selection, position half → per-file file_row_number predicate
+        // (parquet row-group skip). The rowid conjuncts are STRIPPED from the engineered-wood prune tree
+        // (it has no rowid stats; dropping a conjunct only widens = superset-safe).
+        var rowIdFilter = DeltaRowIdFilter.Extract(spec?.Filter, filterValues, RowIdColumn);
+        var pruneNode = rowIdFilter is not null ? DeltaRowIdFilter.Strip(spec?.Filter, RowIdColumn) : spec?.Filter;
+
         // Static filter → engineered-wood predicate (Delta-log FILE pruning) + SQL WHERE (read_parquet row-group pruning).
-        Predicate? prune = spec?.Filter is { } node ? new DeltaFilterBuilder(filterValues).Build(node) : null;
+        Predicate? prune = null;
+        if (pruneNode is { } node)
+        {
+            try
+            {
+                prune = new DeltaFilterBuilder(filterValues).Build(node);
+            }
+            catch
+            {
+                prune = null; // unbuildable shape (e.g. rowid inside an OR): forfeit file pruning, never correctness
+            }
+        }
         // Prefer the host's 1:1 native SQL rendering (literals inlined, DuckDB self-render → exact). It carries the
         // SAME superset-safe predicates as spec.Filter, so it's correctness-neutral (DuckDB re-applies above the
         // scan). Fall back to translating the FilterNode ourselves when the host didn't emit one.
@@ -77,6 +105,18 @@ internal static class DeltaNativeReader
             // exactly that version).
             listing = WithPendingDeletes(listing, pendingDeletes);
         }
+        if (rowIdFilter is not null)
+        {
+            // Exact file selection by the rowid's ordinal half — no stats, no I/O; applies uniformly to
+            // committed AND pending-file ordinals (one encoding). Position bounds land per file below.
+            var kept = listing.Files.Where(f => rowIdFilter.OrdinalMayMatch(f.Ordinal)).ToList();
+            if (kept.Count != listing.Files.Count)
+            {
+                Log.LogInformation("delta native rowid prune {Path}: files {Before} -> {After}",
+                                   path, listing.Files.Count, kept.Count);
+                listing = WithFiles(listing, kept);
+            }
+        }
         var schema = ProbeSchema(listing, userSchema, dataCols, wantRowId);
         int prefetch = Prefetch();
 
@@ -85,7 +125,8 @@ internal static class DeltaNativeReader
             path, listing.Version, listing.Files.Count, string.Join(",", dataCols), wantRowId, where ?? "", prefetch,
             listing.LogicalToPhysical is not null ? "name" : listing.LogicalToFieldId is not null ? "id" : "none");
 
-        return new AsyncEnumerableArrowStream(schema, StreamFiles(listing, dataCols, wantRowId, where, prefetch));
+        return new AsyncEnumerableArrowStream(
+            schema, StreamFiles(listing, dataCols, wantRowId, where, prefetch, rowIdFilter));
     }
 
     // Merges the transaction's pending-DELETEd positions into the per-file DV exclusion lists (positions
@@ -110,17 +151,23 @@ internal static class DeltaNativeReader
                 files.Add(f);
             }
         }
-        return new DeltaReader.NativeScanList
+        return WithFiles(listing, files);
+    }
+
+    // Clones the listing with a different file list, keeping every snapshot-derived property.
+    private static DeltaReader.NativeScanList WithFiles(
+        DeltaReader.NativeScanList listing, List<DeltaReader.NativeScanFile> files) =>
+        new()
         {
             Version = listing.Version,
             Files = files,
-            AnyUri = listing.AnyUri,
+            AnyUri = listing.AnyUri ?? (files.Count > 0 ? files[files.Count - 1].Uri : null),
             LogicalToPhysical = listing.LogicalToPhysical,
             LogicalToFieldId = listing.LogicalToFieldId,
             MappedSchema = listing.MappedSchema,
             TableSchema = listing.TableSchema,
+            PartitionColumns = listing.PartitionColumns,
         };
-    }
 
     // Appends the transaction's pending (uncommitted) streamed files to the committed listing, keeping all
     // snapshot-derived properties (mapping, schema). Ordinal base 0x780000 — disjoint from real file ordinals
@@ -138,17 +185,7 @@ internal static class DeltaNativeReader
             files.Add(new DeltaReader.NativeScanFile(0x780000 + i, uri, System.Array.Empty<long>(),
                 pendingFiles[i].PartitionValues is { Count: > 0 } pv ? pv : null));
         }
-        return new DeltaReader.NativeScanList
-        {
-            Version = listing.Version,
-            Files = files,
-            AnyUri = listing.AnyUri ?? (files.Count > 0 ? files[files.Count - 1].Uri : null),
-            LogicalToPhysical = listing.LogicalToPhysical,
-            LogicalToFieldId = listing.LogicalToFieldId,
-            MappedSchema = listing.MappedSchema,
-            TableSchema = listing.TableSchema,
-            PartitionColumns = listing.PartitionColumns,
-        };
+        return WithFiles(listing, files);
     }
 
     // Everything the per-file SQL needs to know about ONE data file: the top-level logical→physical alias
@@ -160,6 +197,26 @@ internal static class DeltaNativeReader
         FileNodes Nodes);
 
     private const char PathSep = ''; // joins stored-name path segments (names may contain dots)
+
+    // The per-file expression for a stable row-tracking virtual column. The materialized physical column
+    // (footer-probed presence; stored under its literal name — materialized columns are not column-mapped)
+    // wins per row where non-NULL; else baseRowId + file_row_number (id) / the constant
+    // defaultRowCommitVersion (version); a file with neither (pending/no row tracking) reads NULL.
+    private static string RowTrackingExpr(string name, DeltaReader.NativeScanFile f, FileMapping fm)
+    {
+        bool isId = string.Equals(name, RowTrackingIdColumn, StringComparison.Ordinal);
+        string? derived = isId
+            ? f.BaseRowId is { } b
+                ? $"(CAST({b.ToString(CultureInfo.InvariantCulture)} AS BIGINT) + file_row_number)" : null
+            : f.CommitVersion is { } v
+                ? $"CAST({v.ToString(CultureInfo.InvariantCulture)} AS BIGINT)" : null;
+        bool hasMaterialized = fm.Nodes.Paths.Contains(name);
+        if (hasMaterialized)
+        {
+            return derived is null ? Quote(name) : $"COALESCE({Quote(name)}, {derived})";
+        }
+        return derived ?? "CAST(NULL AS BIGINT)";
+    }
 
     private static bool ContainsName(IReadOnlyList<string> names, string c)
     {
@@ -195,7 +252,8 @@ internal static class DeltaNativeReader
     private static string FileSql(IReadOnlyList<string> dataCols, bool wantRowId, string? where,
                                   DeltaReader.NativeScanFile f, FileMapping fm,
                                   DeltaSchema.StructType? tableSchema,
-                                  IReadOnlyList<string>? partitionCols = null)
+                                  IReadOnlyList<string>? partitionCols = null,
+                                  string? rowIdCond = null)
     {
         // Per-column projection over THIS file's actual layout:
         //   • column mapping: alias the stored PHYSICAL name to the logical one; a mapped STRUCT whose shape
@@ -214,7 +272,17 @@ internal static class DeltaNativeReader
                 ? StoredChildName(field, fm)
                 : fm.LogToPhys is { } m && m.TryGetValue(c, out var p) ? p : c;
             string expr;
-            if (partitionCols is not null && field is not null && ContainsName(partitionCols, c))
+            if (string.Equals(c, RowTrackingIdColumn, StringComparison.Ordinal)
+                || string.Equals(c, RowTrackingVersionColumn, StringComparison.Ordinal))
+            {
+                // Stable row-tracking virtual columns: derived per file from the add action's
+                // baseRowId/defaultRowCommitVersion, overridden by the materialized physical column when THIS
+                // file carries one (merge-on-read/buffered-UPDATE post-images, compacted files,
+                // external Spark writers). Pending (uncommitted) files have no baseRowId yet => NULL.
+                expr = RowTrackingExpr(c, f, fm);
+                needsInner = true;
+            }
+            else if (partitionCols is not null && field is not null && ContainsName(partitionCols, c))
             {
                 // Partition columns are ABSENT from the data files — the log's per-file partitionValues
                 // is the authoritative source (paths are opaque; the presence probe would otherwise
@@ -275,10 +343,18 @@ internal static class DeltaNativeReader
             sb.Append("1"); // degenerate projection (e.g. COUNT(*) with no columns) — a constant keeps SQL valid
         }
         sb.Append($" FROM {source}");
-        var conds = new List<string>(2);
+        var conds = new List<string>(3);
         if (!string.IsNullOrEmpty(where))
         {
             conds.Add(where!);
+        }
+        if (!string.IsNullOrEmpty(rowIdCond))
+        {
+            // The decoded rowid constraint's position half: a plain file_row_number predicate, which
+            // DuckDB's parquet reader prunes ROW GROUPS with (it synthesizes exact per-row-group min/max
+            // for file_row_number) — unlike the aliased rowid expression in `where`, which is exact but
+            // not zone-map-prunable.
+            conds.Add(rowIdCond!);
         }
         if (f.Dv.Length > 0)
         {
@@ -317,6 +393,13 @@ internal static class DeltaNativeReader
             {
                 fields.Add(f);
             }
+            else if (string.Equals(c, RowTrackingIdColumn, StringComparison.Ordinal)
+                     || string.Equals(c, RowTrackingVersionColumn, StringComparison.Ordinal))
+            {
+                // Stable row-tracking virtual columns aren't in the user schema — synthesize their field
+                // so an empty table's advertised schema still matches what the scan requested.
+                fields.Add(new Field(c, Int64Type.Default, nullable: true));
+            }
         }
         if (wantRowId)
         {
@@ -327,7 +410,8 @@ internal static class DeltaNativeReader
 
     private static async IAsyncEnumerable<RecordBatch> StreamFiles(
         DeltaReader.NativeScanList listing, IReadOnlyList<string> dataCols, bool wantRowId, string? where,
-        int prefetch, [EnumeratorCancellation] CancellationToken ct = default)
+        int prefetch, DeltaRowIdFilter? rowIdFilter = null,
+        [EnumeratorCancellation] CancellationToken ct = default)
     {
         if (listing.Files.Count == 0)
         {
@@ -358,7 +442,7 @@ internal static class DeltaNativeReader
                         {
                             var sql = FileSql(dataCols, wantRowId, where, file,
                                               ResolveFileMapping(listing, file.Uri), listing.TableSchema,
-                                              listing.PartitionColumns);
+                                              listing.PartitionColumns, rowIdFilter?.PositionCondition(file.Ordinal));
                             Log.LogDebug("delta native file: {Sql}", sql);
                             using var s = Host.Query(sql);
                             while (true)

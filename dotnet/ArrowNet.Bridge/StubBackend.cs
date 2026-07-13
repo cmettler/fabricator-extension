@@ -46,6 +46,7 @@ public sealed class StubBackend : IBackend
             MetadataKind.Tables => EmptyStringTable("schema_name", "table_name", "table_type"),
             // Zero-row stream whose schema describes the (stub) table columns.
             MetadataKind.Columns => new InMemoryArrayStream(ScanSchema(), System.Array.Empty<RecordBatch>()),
+            MetadataKind.VirtualColumns => EmptyStringTable("name", "type"),
             _ => EmptyStringTable("name"),
         };
 

@@ -607,9 +607,11 @@ void ArrowNetComplexFilterPushdown(ClientContext &context, LogicalGet &get, Func
 
 ArrowNetTableEntry::ArrowNetTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
                                        ArrowNetHandle handle, vector<idx_t> rowid_columns, LogicalType rowid_type,
-                                       vector<string> virtual_rowid_columns)
+                                       vector<string> virtual_rowid_columns,
+                                       vector<std::pair<string, LogicalType>> provider_virtual_columns)
     : TableCatalogEntry(catalog, schema, info), handle_(handle), rowid_columns_(std::move(rowid_columns)),
-      virtual_rowid_columns_(std::move(virtual_rowid_columns)), rowid_type_(std::move(rowid_type)) {
+      virtual_rowid_columns_(std::move(virtual_rowid_columns)),
+      provider_virtual_columns_(std::move(provider_virtual_columns)), rowid_type_(std::move(rowid_type)) {
 }
 
 // NOTE on struct filters under exact mode (filter_pushdown=true): a `WHERE (s).a = 5` becomes an
@@ -645,6 +647,16 @@ static unique_ptr<BaseStatistics> ArrowNetScanStatistics(ClientContext &context,
 	auto stats = BaseStatistics::CreateUnknown(bind_data.return_types[column_index]);
 	stats.SetDistinctCount(static_cast<idx_t>(bind_data.column_ndv[column_index]));
 	return make_uniq<BaseStatistics>(std::move(stats));
+}
+
+// Function-level rowid hook for DuckDB's late-materialization rewrite (distinct from the entry-level
+// GetRowIdColumns, which serves DML planning): declares that this scan's row identity is the standard
+// rowid virtual column. Only installed (with function.late_materialization) for scans whose rowid the
+// provider can filter FAST — see BuildScanFunction.
+static vector<column_t> ArrowNetScanRowIdColumns(ClientContext &context, optional_ptr<FunctionData> bind_data_p) {
+	vector<column_t> result;
+	result.emplace_back(COLUMN_IDENTIFIER_ROW_ID);
+	return result;
 }
 
 TableFunction ArrowNetTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) {
@@ -711,6 +723,7 @@ TableFunction ArrowNetTableEntry::BuildScanFunction(ClientContext &context, uniq
 	// Propagate rowid info so the scan can synthesize the rowid column.
 	data->rowid_source_columns = rowid_columns_;
 	data->virtual_rowid_columns = virtual_rowid_columns_; // Delta `_metadata.row_id` (not a user column)
+	data->provider_virtual_columns = provider_virtual_columns_; // stable __delta_row_id / _commit_version
 	data->rowid_type = rowid_type_;
 	data->table = this; // lets LogicalGet::GetTable() resolve (UPDATE/DELETE)
 
@@ -737,6 +750,16 @@ TableFunction ArrowNetTableEntry::BuildScanFunction(ClientContext &context, uniq
 	// non-native Delta keep it false (unchanged). See docs/multifile-delta.md §"Batch 2 slice 2".
 	if (ParentCatalog().Cast<ArrowNetCatalog>().ExactFilterPushdown()) {
 		function.filter_pushdown = true;
+		// Late materialization (ORDER BY ... LIMIT n → TopN on a narrow scan + SEMI-join back on rowid):
+		// profitable ONLY here — the join's dynamic rowid filter decodes in the native reader to exact
+		// (fileOrdinal → file selection, position → file_row_number row-group skip), so the fetch side is
+		// O(matched files), not a second full scan. Requires the single virtual BIGINT rowid (Delta
+		// `_metadata.row_id`); SQL Server / DAX stay off (their TopN pushdown is superior, and a join-back
+		// would re-scan the server). NOTE: the rewrite clones the bind data (ArrowStreamBindData::Copy).
+		if (HasVirtualRowId() && rowid_type_.id() == LogicalTypeId::BIGINT) {
+			function.late_materialization = true;
+			function.get_row_id_columns = ArrowNetScanRowIdColumns;
+		}
 	}
 	function.cardinality = ArrowNetScanCardinality;
 	function.statistics = ArrowNetScanStatistics;
@@ -758,6 +781,13 @@ virtual_column_map_t ArrowNetTableEntry::GetVirtualColumns() const {
 		// Expose a rowid backed by the PK / unique-index columns (SQL Server) or a virtual
 		// provider column (Delta `_metadata.row_id`).
 		result.insert(make_pair(COLUMN_IDENTIFIER_ROW_ID, TableColumn("rowid", rowid_type_)));
+	}
+	// Provider-declared virtual columns (queryable by name, excluded from SELECT *) — e.g. the Delta
+	// catalog's stable __delta_row_id / __delta_row_commit_version. A REAL column with the same name
+	// shadows the virtual one (TableBinding only maps a virtual name that isn't already taken).
+	for (idx_t i = 0; i < provider_virtual_columns_.size(); i++) {
+		result.insert(make_pair(arrownet::ProviderVirtualBase() + i,
+		                        TableColumn(provider_virtual_columns_[i].first, provider_virtual_columns_[i].second)));
 	}
 	// Otherwise no virtual columns (no DuckDB rowid) — scans then don't require
 	// projection pushdown for the virtual column.

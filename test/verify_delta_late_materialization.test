@@ -1,0 +1,210 @@
+# name: test/verify_delta_late_materialization.test
+# description: Delta `native_read` — the ROWID fast path. The scan opts into DuckDB's late-materialization
+#              rewrite (function.late_materialization + get_row_id_columns), so `ORDER BY ... LIMIT n`
+#              becomes TopN-on-a-narrow-scan + SEMI-join back on rowid; the join's dynamic rowid filter
+#              (and any user `WHERE rowid ...`) is DECODED by the native reader — the ordinal half selects
+#              exactly the matching files (no stats), the position half becomes a per-file
+#              `file_row_number` predicate (parquet row-group skip via its synthesized min/max). The fetch
+#              side is O(matched files), never a second full scan. File ordinals are path-sort positions of
+#              RANDOM uuids, so assertions use counts/ranges (layout-independent), plus duckdb_logs pins of
+#              the prune + the file_row_number rewrite. Set ARROWNET_DELTA_WRITE_DIR (writable). Local FS.
+# group: [mssql_net]
+
+require mssql_net
+
+require parquet
+
+require-env ARROWNET_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/latemat' AS lake (TYPE arrownet, PROVIDER 'delta', native_read true, native_write true);
+
+# three data files, 1000 rows each (positions 0..999 per file)
+statement ok
+CREATE TABLE lake.main.lm AS SELECT r AS id, r*10 AS x, 'row' || r AS s FROM range(1000) t(r);
+
+statement ok
+INSERT INTO lake.main.lm SELECT r, r*10, 'row' || r FROM range(1000, 2000) t(r);
+
+statement ok
+INSERT INTO lake.main.lm SELECT r, r*10, 'row' || r FROM range(2000, 3000) t(r);
+
+# ---- the TopN rewrite: correctness of the semi-join-on-rowid plan ----
+
+query IIT
+SELECT * FROM lake.main.lm ORDER BY x DESC LIMIT 1;
+----
+2999	29990	row2999
+
+query IIT
+SELECT * FROM lake.main.lm ORDER BY x ASC LIMIT 2;
+----
+0	0	row0
+1	10	row1
+
+# TopN + WHERE (the filter rides both the narrow and the fetch scan — bind data is cloned)
+query IIT
+SELECT * FROM lake.main.lm WHERE id < 1500 ORDER BY x DESC LIMIT 1;
+----
+1499	14990	row1499
+
+# prepared re-execution (the rewrite's cloned bind data is reused across executions)
+statement ok
+PREPARE lm_top AS SELECT id FROM lake.main.lm ORDER BY x DESC LIMIT 1;
+
+query I
+EXECUTE lm_top;
+----
+2999
+
+query I
+EXECUTE lm_top;
+----
+2999
+
+# ---- user-written rowid filters: decoded to (file, position) — layout-independent count assertions
+#      (every ordinal 0..2 exists with 1000 rows, whichever uuid sorts where) ----
+
+# point lookup: exactly one row = position 5 of the ordinal-1 file
+query I
+SELECT count(*) FROM lake.main.lm WHERE rowid = (1::BIGINT << 40) + 5;
+----
+1
+
+# IN over two files
+query I
+SELECT count(*) FROM lake.main.lm WHERE rowid IN ((0::BIGINT << 40) + 1, (2::BIGINT << 40) + 7);
+----
+2
+
+# range = exactly the ordinal-1 file
+query I
+SELECT count(*) FROM lake.main.lm WHERE rowid >= (1::BIGINT << 40) AND rowid < (2::BIGINT << 40);
+----
+1000
+
+# range with position bounds on the edge files
+query I
+SELECT count(*) FROM lake.main.lm WHERE rowid >= (0::BIGINT << 40) + 990 AND rowid <= (1::BIGINT << 40) + 9;
+----
+20
+
+# contradictory range ⇒ empty (no file read)
+query I
+SELECT count(*) FROM lake.main.lm WHERE rowid > (2::BIGINT << 40) + 5 AND rowid < (1::BIGINT << 40);
+----
+0
+
+# rowid filter combined with a data predicate (the data half still prunes/applies)
+query I
+SELECT count(*) FROM lake.main.lm WHERE rowid < (3::BIGINT << 40) AND id >= 2995;
+----
+5
+
+# self-referential shape: fetch-by-rowid of rows found by a data predicate (any plan; exactness pin)
+query I
+SELECT count(*) FROM lake.main.lm WHERE rowid IN (SELECT rowid FROM lake.main.lm WHERE id IN (5, 1500, 2999));
+----
+3
+
+# ---- log pins: the rewrite fired, files were pruned, and the position filter took the
+#      row-group-skippable file_row_number form ----
+
+statement ok
+CALL enable_logging(storage='memory');
+
+query IIT
+SELECT * FROM lake.main.lm ORDER BY x DESC LIMIT 1;
+----
+2999	29990	row2999
+
+query I
+SELECT count(*) FROM lake.main.lm WHERE rowid = (1::BIGINT << 40) + 5;
+----
+1
+
+# the fetch/lookup scans pruned the file list by the rowid's ordinal half
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type = 'ArrowNet.Delta.Native' AND message LIKE '%rowid prune%files 3 -> 1%';
+----
+true
+
+# and the position half was rewritten to a file_row_number predicate (zone-map prunable)
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type = 'ArrowNet.Delta.Native' AND message LIKE '%file_row_number IN (5)%';
+----
+true
+
+statement ok
+CALL disable_logging();
+
+# ---- deletion vectors compose: positions are absolute, DV exclusion ANDs with the rowid condition ----
+
+statement ok
+DELETE FROM lake.main.lm WHERE id = 1500;
+
+query I
+SELECT count(*) FROM lake.main.lm;
+----
+2999
+
+# the deleted row's rowid no longer matches; its neighbors do
+query I
+SELECT count(*) FROM lake.main.lm WHERE rowid IN (SELECT rowid FROM lake.main.lm WHERE id BETWEEN 1499 AND 1501);
+----
+2
+
+query IIT
+SELECT * FROM lake.main.lm ORDER BY x DESC LIMIT 1;
+----
+2999	29990	row2999
+
+# ---- explicit transaction: the rewrite + rowid decode over pending (uncommitted) files ----
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO lake.main.lm SELECT r, r*10, 'row' || r FROM range(5000, 5010) t(r);
+
+query IIT
+SELECT * FROM lake.main.lm ORDER BY x DESC LIMIT 1;
+----
+5009	50090	row5009
+
+# pending-file ordinals (0x780000+) participate in the range decode
+query I
+SELECT count(*) FROM lake.main.lm WHERE rowid >= (2097152::BIGINT << 40);
+----
+10
+
+statement ok
+COMMIT;
+
+query IIT
+SELECT * FROM lake.main.lm ORDER BY x DESC LIMIT 1;
+----
+5009	50090	row5009
+
+# ---- a NON-native catalog is unaffected (no exact mode ⇒ no erased rowid filters; DuckDB applies) ----
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/latemat' AS lake2 (TYPE arrownet, PROVIDER 'delta', READ_ONLY true);
+
+query I
+SELECT count(*) FROM lake2.main.lm WHERE rowid IN (SELECT rowid FROM lake2.main.lm WHERE id IN (5, 2999));
+----
+2
+
+query IIT
+SELECT * FROM lake2.main.lm ORDER BY x DESC LIMIT 1;
+----
+5009	50090	row5009
+
+statement ok
+DETACH lake2;
+
+statement ok
+DETACH lake;
