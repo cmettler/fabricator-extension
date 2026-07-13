@@ -2879,7 +2879,9 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   invalidates them) — `DeltaReader` surfaces a clear "concurrent modification — retry the statement" error.
   Verified: 4 parallel processes appending 200 rows each to ONE local Delta table → 800/800 distinct, no lost
   commits, no surfaced conflicts.
-  **EXPLICIT TRANSACTIONS — SNAPSHOT-ISOLATED, BUFFERED (slices 1–4, 2026-07-07).** The engineered-wood
+  **EXPLICIT TRANSACTIONS — SNAPSHOT-ISOLATED, BUFFERED (slices 1–4, 2026-07-07). Consolidated
+  semantics reference (modes × paths × isolation, rebase checks, guards, multi-writer by storage):
+  [docs/delta-transactions.md](docs/delta-transactions.md).** The engineered-wood
   Delta provider buffers a DuckDB transaction's writes per (txn, table) (`DeltaTxnBuffer`, keyed by the v35
   `AmbientTransaction` id) and flushes at COMMIT as **ONE atomic Delta commit per table** (Delta has no
   cross-table txn); **ROLLBACK discards** (streamed-but-uncommitted parquet = invisible orphans → vacuum,
