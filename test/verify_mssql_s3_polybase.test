@@ -282,6 +282,30 @@ SELECT cnt, mn, mx FROM mssql_net_query('sqldb',
 ----
 12	0	11
 
+# CoW UPDATE (DV off => copy-on-write) now PRESERVES the stable row id — the rewrite materializes
+# __delta_row_id + __delta_row_commit_version into the new file; the PolyBase reader ignores both
+# extra columns and reads the post-update state exactly.
+statement ok
+UPDATE rtlake.main.f SET name = 'upd' WHERE id = 5;
+
+# re-run-safe (the persistent bucket's HWM keeps growing): rows 4 and 5 were inserted consecutively,
+# so a PRESERVED id keeps the +1 relationship — a re-id would jump to a fresh HWM value.
+query I
+SELECT (SELECT __delta_row_id FROM rtlake.main.f WHERE id = 5)
+     - (SELECT __delta_row_id FROM rtlake.main.f WHERE id = 4);
+----
+1
+
+query IT
+SELECT id, name FROM mssql_net_query('sqldb',
+  'SELECT id, name FROM OPENROWSET(BULK ''/arrownet/polybase-rt/f'', FORMAT = ''DELTA'',
+     DATA_SOURCE = ''s3_ds'') AS r WHERE id IN (4, 5, 6) ORDER BY id')
+ORDER BY id;
+----
+4	v4
+5	upd
+6	v6
+
 statement ok
 DETACH rtlake;
 

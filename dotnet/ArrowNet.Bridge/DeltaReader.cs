@@ -585,10 +585,14 @@ internal static class DeltaReader
 
     /// <summary>Reads exactly the rows identified by the given transient rowids, as DEEP-COPIED batches
     /// (Arrow-IPC round-trip — engineered-wood batch buffers do not outlive the open table) WITH the
-    /// trailing virtual <c>_metadata.row_id</c> column. The read-back step of a buffered UPDATE.</summary>
+    /// trailing virtual <c>_metadata.row_id</c> column. The read-back step of a buffered UPDATE.
+    /// <paramref name="sourceTrackingOut"/> (optional): one row-aligned entry per returned batch with each
+    /// row's ORIGINAL stable id/commit version (materialized source value else baseRowId + position) —
+    /// plain value arrays, valid after the table closes.</summary>
     public static List<RecordBatch> ReadRowsByRowIds(
         nint opener, string path, IReadOnlyCollection<long> rowIds, CancellationToken ct,
-        long? atVersion = null)
+        long? atVersion = null,
+        List<(long?[] Ids, long?[] Versions)>? sourceTrackingOut = null)
     {
         var fs = TableFileSystems.Create(opener, path);
         var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options()).GetAwaiter().GetResult();
@@ -596,7 +600,7 @@ internal static class DeltaReader
         {
             var ms = new System.IO.MemoryStream();
             Apache.Arrow.Ipc.ArrowStreamWriter? w = null;
-            var e = table.ReadRowsByRowIdsAsync(rowIds, ct, atVersion).GetAsyncEnumerator(ct);
+            var e = table.ReadRowsByRowIdsAsync(rowIds, ct, atVersion, sourceTrackingOut).GetAsyncEnumerator(ct);
             try
             {
                 while (e.MoveNextAsync().AsTask().GetAwaiter().GetResult())

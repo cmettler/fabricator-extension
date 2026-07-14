@@ -2406,23 +2406,24 @@ public sealed class DeltaCatalog : IBackendCatalog
         var postImages = new List<RecordBatch>();
         var preImages = profile.CdfEnabled ? new List<RecordBatch>() : null;
         // Materialized row tracking (implied by row tracking — the table declares the materialized
-        // columns): the post-image rows must carry their ORIGINAL stable ids in the
-        // declared __delta_row_id column (identity preserved across the UPDATE — Spark's reference
-        // behavior). Resolved as baseRowId[ordinal] + position against the ordinal-ordered active set,
-        // the same rule EW's merge-on-read update applies; collected flat, aligned with postImages.
-        List<long>? stableIds = null;
-        IReadOnlyList<long?>? orderedBaseIds = null;
+        // columns): the post-image rows must carry their ORIGINAL stable ids in the declared
+        // __delta_row_id column (identity preserved across the UPDATE — Spark's reference behavior).
+        // Resolved BY THE READ-BACK per row: the source file's materialized value where present (a
+        // compacted / CoW-rewritten source — the post-OPTIMIZE case) else baseRowId + position.
+        List<long?>? stableIdsRaw = null;
+        List<(long?[] Ids, long?[] Versions)>? srcTracking = null;
         if (profile.MaterializeRowIds)
         {
-            stableIds = new List<long>();
-            orderedBaseIds = DeltaReader.GetOrderedActiveBaseRowIds(opener, path,
-                atVersion: pending.PinnedVersion);
+            stableIdsRaw = new List<long?>();
+            srcTracking = new List<(long?[] Ids, long?[] Versions)>();
         }
         // The rowids' ordinals are PINNED-version path-sort positions — read back AT that version so a
         // concurrent commuting append (which shifts the ordering) can never make us read the wrong files.
+        int rbIdx = -1;
         foreach (var raw in DeltaReader.ReadRowsByRowIds(opener, path, updates.Keys, default,
-                     atVersion: pending.PinnedVersion))
+                     atVersion: pending.PinnedVersion, sourceTrackingOut: srcTracking))
         {
+            rbIdx++;
             var batch = readTarget is null ? raw : ReconcileBatch(raw, readTarget, CommittedToPending(pending));
             preImages?.Add(DropTrailingRowId(batch));
             var rids = (Int64Array)batch.Column(batch.ColumnCount - 1);
@@ -2458,15 +2459,23 @@ public sealed class DeltaCatalog : IBackendCatalog
                         pending.DeletedByOrdinal[(int)ordinal] = set;
                     }
                     set.Add(rid & RowIdPosMask);
-                    if (stableIds is not null)
+                    if (stableIdsRaw is not null)
                     {
-                        long baseId = ordinal >= 0 && ordinal < orderedBaseIds!.Count
-                            ? orderedBaseIds[(int)ordinal] ?? 0
-                            : 0;
-                        stableIds.Add(baseId + (rid & RowIdPosMask));
+                        var ids = srcTracking is not null && rbIdx < srcTracking.Count
+                            ? srcTracking[rbIdx].Ids : null;
+                        stableIdsRaw.Add(ids is not null && i < ids.Length ? ids[i] : null);
                     }
                 }
             }
+        }
+        // Every id resolvable => bake the originals; ANY unresolvable row (a pre-row-tracking source
+        // file) => write the post-images WITHOUT materialized ids (fresh ids for the whole statement —
+        // never a wrong or colliding id).
+        List<long>? stableIds = null;
+        if (stableIdsRaw is not null && stableIdsRaw.Count == matched
+            && stableIdsRaw.TrueForAll(x => x.HasValue))
+        {
+            stableIds = stableIdsRaw.ConvertAll(x => x!.Value);
         }
         pending.BatchSchema ??= userSchema;
         if (preImages is not null)
@@ -2513,8 +2522,8 @@ public sealed class DeltaCatalog : IBackendCatalog
 
     // Eager CDC capture (slice C2): write the _change_data file(s) for a buffered statement NOW — the
     // rows are in hand exactly here — and park only the CdcFile actions (they fuse into the
-    // transaction's single commit; ROLLBACK leaves them as invisible orphans). Unpartitioned CDF tables
-    // only (the eligibility/probe guards enforce it), so partitionValues stay empty.
+    // transaction's single commit; ROLLBACK leaves them as invisible orphans). Partitioned tables split
+    // per partition inside WriteChangeDataFileAsync (partition columns excluded from the cdc bytes).
     private void WriteCdcFiles(nint opener, string tablePath, DeltaTxnBuffer.PendingAppends pending,
                                IReadOnlyList<RecordBatch> rows, string changeType)
     {

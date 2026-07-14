@@ -63,7 +63,8 @@ internal sealed class NativeParquetDataFileRewriter : IDataFileRewriter
 
     public async IAsyncEnumerable<RecordBatch> ReadRewriteAsync(
         int fileOrdinal, string sourceRelativePath, IReadOnlyCollection<long> excludePositions,
-        [EnumeratorCancellation] CancellationToken cancellationToken)
+        [EnumeratorCancellation] CancellationToken cancellationToken,
+        RowTrackingRewrite? rowTracking = null)
     {
         var rel = sourceRelativePath.Replace('\\', '/').TrimStart('/');
         var uri = _root + "/" + rel;
@@ -89,7 +90,7 @@ internal sealed class NativeParquetDataFileRewriter : IDataFileRewriter
             inputs.Add((ExclInput, ExcludeStream(excludePositions)));
         }
 
-        var sql = BuildSql(uri, present, updates is not null, excludePositions.Count > 0);
+        var sql = BuildSql(uri, present, updates is not null, excludePositions.Count > 0, rowTracking);
         Log.LogDebug("delta native rewrite: {Sql}", sql);
 
         using var stream = inputs.Count > 0 ? Host.Query(sql, inputs) : Host.Query(sql);
@@ -106,13 +107,17 @@ internal sealed class NativeParquetDataFileRewriter : IDataFileRewriter
 
     // SELECT the user columns (aliased to their logical names, in schema order); a SET column is substituted from
     // the bound update view when its row matched (CASE on the join key), an absent column is a typed NULL.
-    private string BuildSql(string uri, HashSet<string> present, bool hasUpdates, bool hasExclude)
+    // With rowTracking, two trailing columns materialize each row's ORIGINAL stable id + commit version
+    // (the source file's materialized value where present, else baseRowId + file_row_number / the source
+    // default; an update-matched row's version = the new commit) — the IDataFileRewriter contract.
+    private string BuildSql(string uri, HashSet<string> present, bool hasUpdates, bool hasExclude,
+                            RowTrackingRewrite? rowTracking)
     {
         var setSet = _setColumns is null
             ? null
             : new HashSet<string>(_setColumns, StringComparer.OrdinalIgnoreCase);
 
-        var projections = new List<string>(_userSchema.FieldsList.Count);
+        var projections = new List<string>(_userSchema.FieldsList.Count + 2);
         foreach (var f in _userSchema.FieldsList)
         {
             string q = Quote(f.Name);
@@ -126,6 +131,34 @@ internal sealed class NativeParquetDataFileRewriter : IDataFileRewriter
             {
                 projections.Add($"{src} AS {q}");
             }
+        }
+
+        if (rowTracking is not null)
+        {
+            const string IdCol = "\"__delta_row_id\"";
+            const string VerCol = "\"__delta_row_commit_version\"";
+            string idExpr = present.Contains("__delta_row_id")
+                ? rowTracking.SourceBaseRowId is { } b1
+                    ? $"COALESCE(p.{IdCol}, CAST({b1.ToString(CultureInfo.InvariantCulture)} AS BIGINT) + p.file_row_number)"
+                    : $"p.{IdCol}"
+                : rowTracking.SourceBaseRowId is { } b2
+                    ? $"(CAST({b2.ToString(CultureInfo.InvariantCulture)} AS BIGINT) + p.file_row_number)"
+                    : "CAST(NULL AS BIGINT)";
+            projections.Add($"{idExpr} AS {IdCol}");
+            string verExpr = present.Contains("__delta_row_commit_version")
+                ? rowTracking.SourceDefaultCommitVersion is { } d1
+                    ? $"COALESCE(p.{VerCol}, CAST({d1.ToString(CultureInfo.InvariantCulture)} AS BIGINT))"
+                    : $"p.{VerCol}"
+                : rowTracking.SourceDefaultCommitVersion is { } d2
+                    ? $"CAST({d2.ToString(CultureInfo.InvariantCulture)} AS BIGINT)"
+                    : "CAST(NULL AS BIGINT)";
+            if (hasUpdates)
+            {
+                verExpr = $"CASE WHEN u.{Quote(PosColumn)} IS NOT NULL THEN "
+                    + $"CAST({rowTracking.NewCommitVersion.ToString(CultureInfo.InvariantCulture)} AS BIGINT) "
+                    + $"ELSE {verExpr} END";
+            }
+            projections.Add($"{verExpr} AS {VerCol}");
         }
 
         var sb = new StringBuilder("SELECT ");

@@ -2069,6 +2069,45 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   feed + the buffered fused feed); transactions 934 / changes 73 / dv 48 / dv_default 58 / update /
   delete / optimize / partition / partition_overwrite / column_mapping 251 / variant 133 / native_write
   147 / native_read 88 / time_travel / snapshots + EW 168 & 147 (all TFMs) green.
+  **P5 REWRITE GAP CLOSED — COPY-ON-WRITE DELETE/UPDATE MATERIALIZE ROW-TRACKING IDS (2026-07-14, EW +
+  Bridge rewriter; motivated by PolyBase-recipe tables synced to Fabric via SHORTCUT needing update-stable
+  ids).** Both CoW loops (`DeleteByRowIdsAsync` survivors + `UpdateByRowIdsAsync` rewrites) now bake each
+  row's ORIGINAL `__delta_row_id` + `__delta_row_commit_version` into the rewritten file (the compaction
+  rule; an UPDATED row's version = the new commit) AND assign fresh `baseRowId`/`defaultRowCommitVersion`
+  on the new add + the HWM domainMetadata (the old CoW add carried NONE — a spec gap). Per-row source =
+  the source file's materialized value where present (chained rewrites carry through) else
+  `baseRowId + originalPosition`; NULL when underivable (pre-row-tracking sources — readers then derive a
+  fresh id for exactly that row; the materialized columns are written NULLABLE for this,
+  `AddRowIdAndCommitVersionColumns(nullable:)`). **Two byte paths:** codec — `ReadFileAsync`/
+  `ProcessFileBatchesAsync` gained a `strippedVersionsOut` collector (the version column was dropped by
+  the schema reconcile with its VALUES lost) and the loops build row-aligned arrays from in-hand
+  positions; native — **`IDataFileRewriter.ReadRewriteAsync` gained an optional `RowTrackingRewrite`
+  record** (SourceBaseRowId, SourceDefaultCommitVersion, NewCommitVersion) and the Bridge
+  `NativeParquetDataFileRewriter` projects the two columns IN SQL (`COALESCE(source materialized,
+  base + file_row_number)`; the UPDATE join's CASE sets the new version on matched rows), returned
+  TRAILING per the contract and detached around clean/ToPhysical EW-side (`DetachRowTrackingColumns`);
+  stats collect over the detached user batches. Gated on the table's DECLARED materialized column
+  (config-driven — old undeclared tables just get the fresh base/default spec fix). **VALIDATED:** smoke
+  incl. the chained rewrite (2nd UPDATE of an already-rewritten file keeps ids + old versions); kernel
+  reads the outputs; **Spark reads the OneLake CoW table's `_metadata.row_id` PRESERVED while showing the
+  mechanics** (`base_row_id=12` fresh + shuffled `row_index`, yet row_id = original — the override
+  working); **PolyBase OPENROWSET reads the rewritten file with BOTH extra columns exactly**
+  (`verify_mssql_s3_polybase` §5c extended, 137 — the update-stable-ids × protocol-1.0 combination now
+  COMPOSES; the id pin is RELATIVE (+1 between consecutive rows) since the persistent bucket's HWM grows
+  across re-runs). `verify_delta_row_tracking_virtual` now 247 (CoW preservation on the PolyBase recipe,
+  both writer modes, chained); full sweep green (delete 28 / update 63 / dv 48 / dv_default 58 / changes
+  73 / native_write 147 / native_read 88 / column_mapping 251 / variant 133 / compaction 24 / materialize
+  17 / row_tracking 33 / optimize 40 / partition 54 / constraints 50 / transactions 934) + EW 168 & 147.
+  The ONLY remaining CoW-without-id-preservation shapes: type-widened + IcebergCompat (not creatable by
+  this provider). **The BUFFERED-path post-OPTIMIZE caveat is CLOSED too (same pass):**
+  `ReadRowsByRowIdsAsync` gained an optional `sourceRowTrackingOut` collector (one row-aligned entry per
+  yielded batch: original id/version = the source's MATERIALIZED value else baseRowId + position — plain
+  `long?[]` value arrays, valid past table dispose, unlike the batches' Arrow buffers), threaded through
+  the Bridge wrapper; `BufferUpdateRows` now takes its stableIds from the read-back (the
+  `GetOrderedActiveBaseRowIds` ordinal-arithmetic call is gone from that path) — so a buffered UPDATE of
+  a COMPACTED file bakes the ORIGINAL id (pinned: post-OPTIMIZE buffered UPDATE keeps `__delta_row_id=4`).
+  ANY unresolvable row (pre-row-tracking source) disables materialization for the whole statement (fresh
+  ids — never a wrong/colliding id; replaces the old `?? 0` flaw).
   **ROW TRACKING × PolyBase — WORKS (probed live + pinned 2026-07-13):** a `row_tracking true` table
   (writer v7, minReader stays 1) on the PolyBase recipe (`deletion_vectors false, column_mapping 'none'`)
   reads exactly via SQL Server OPENROWSET — INCLUDING after OPTIMIZE materializes the physical

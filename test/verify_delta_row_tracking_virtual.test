@@ -109,6 +109,23 @@ SELECT id, __delta_row_id, __delta_row_commit_version FROM lake.main.rt WHERE id
 2	2	3
 9	9	2
 
+# buffered UPDATE of the COMPACTED file (post-OPTIMIZE): the read-back resolves the original id from
+# the source's MATERIALIZED column (the compacted file's baseRowId is fresh — ordinal arithmetic would
+# bake the wrong id; the closed follow-up gap)
+statement ok
+BEGIN;
+
+statement ok
+UPDATE lake.main.rt SET s = 'opt' WHERE id = 4;
+
+statement ok
+COMMIT;
+
+query II
+SELECT __delta_row_id, s FROM lake.main.rt WHERE id = 4;
+----
+4	opt
+
 # ---- explicit transaction: PENDING (uncommitted) rows have no baseRowId yet => NULL; real after COMMIT ----
 
 statement ok
@@ -142,7 +159,7 @@ UPDATE lake.main.rt SET s = 'mor' WHERE id = 9;
 query II
 SELECT __delta_row_id, __delta_row_commit_version FROM lake.main.rt WHERE id = 9;
 ----
-9	7
+9	8
 
 # ---- PARTITIONED merge-on-read (slice 2): the id survives an UPDATE — including a SET of the
 #      PARTITION column, which moves the row to its new partition's file with identity intact ----
@@ -297,6 +314,91 @@ update_preimage	US	2	v2
 
 statement ok
 DETACH lake4;
+
+# ---- COPY-ON-WRITE preservation (the closed P5 gap): a DV-OFF row-tracking table (the PolyBase /
+#      protocol-1.0 recipe — e.g. synced to Fabric via a shortcut) keeps stable ids through CoW
+#      UPDATE/DELETE: the rewrite materializes each survivor's ORIGINAL id + commit version (source
+#      materialized value where the file was itself rewritten before, else baseRowId + position). ----
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/rtvirtcow' AS lake5 (TYPE arrownet, PROVIDER 'delta', native_read true, native_write true, deletion_vectors false, column_mapping 'none', row_tracking true);
+
+statement ok
+CREATE TABLE lake5.main.cw (id BIGINT, s VARCHAR);
+
+statement ok
+INSERT INTO lake5.main.cw SELECT r, 'v' || r FROM range(6) t(r);
+
+# CoW UPDATE (native rewriter): the updated row keeps its id, version bumps; others untouched
+statement ok
+UPDATE lake5.main.cw SET s = 'upd' WHERE id = 2;
+
+query IIII rowsort
+SELECT id, __delta_row_id, __delta_row_commit_version, s = 'upd' FROM lake5.main.cw;
+----
+0	0	1	false
+1	1	1	false
+2	2	2	true
+3	3	1	false
+4	4	1	false
+5	5	1	false
+
+# CoW DELETE: survivors keep ids + versions
+statement ok
+DELETE FROM lake5.main.cw WHERE id = 4;
+
+query III rowsort
+SELECT id, __delta_row_id, __delta_row_commit_version FROM lake5.main.cw;
+----
+0	0	1
+1	1	1
+2	2	2
+3	3	1
+5	5	1
+
+# chained: updating the ALREADY-rewritten file (materialized source values carry through)
+statement ok
+UPDATE lake5.main.cw SET s = 'up2' WHERE id = 3;
+
+query III rowsort
+SELECT id, __delta_row_id, __delta_row_commit_version FROM lake5.main.cw;
+----
+0	0	1
+1	1	1
+2	2	2
+3	3	4
+5	5	1
+
+statement ok
+DETACH lake5;
+
+# same shapes through the EW codec writer/reader (no native_write)
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/rtvirtcow2' AS lake6 (TYPE arrownet, PROVIDER 'delta', native_read true, deletion_vectors false, column_mapping 'none', row_tracking true);
+
+statement ok
+CREATE TABLE lake6.main.cw (id BIGINT, s VARCHAR);
+
+statement ok
+INSERT INTO lake6.main.cw SELECT r, 'v' || r FROM range(6) t(r);
+
+statement ok
+UPDATE lake6.main.cw SET s = 'upd' WHERE id = 2;
+
+statement ok
+DELETE FROM lake6.main.cw WHERE id = 4;
+
+query III rowsort
+SELECT id, __delta_row_id, __delta_row_commit_version FROM lake6.main.cw;
+----
+0	0	1
+1	1	1
+2	2	2
+3	3	1
+5	5	1
+
+statement ok
+DETACH lake6;
 
 # ---- gating ----
 

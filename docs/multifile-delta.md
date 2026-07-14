@@ -565,11 +565,14 @@ defaultRowCommitVersion)` — the durable identity, vs the transient `rowid` loc
   the PARTITION column moves the row to its new partition with identity intact); DV DELETE removes the id;
   OPTIMIZE preserves both (compaction materializes); a transaction's pending rows read NULL (baseRowId
   assigned at commit). CDF tables preserve too — partitioned included (merge-on-read emits per-partition
-  update_preimage/postimage cdc files; the commit is read cdc-only so nothing double-counts). The only
-  shapes still taking copy-on-write (row tracking lost) are type-widened and IcebergCompat tables —
-  neither creatable by this provider. Follow-up: the buffered path's read-back still resolves ids by
-  `baseRowId + ordinal position` (no materialized-source read) — the post-OPTIMIZE caveat there.
-- Test: `test/verify_delta_row_tracking_virtual.test` (165).
+  update_preimage/postimage cdc files; the commit is read cdc-only so nothing double-counts). COPY-ON-WRITE
+  DELETE/UPDATE preserve as well (the closed P5 gap: the rewrite materializes each survivor's original
+  id + commit version — so DV-off/protocol-1.0 tables, e.g. the PolyBase recipe synced to Fabric via a
+  shortcut, keep update-stable ids). No creatable shape loses row tracking anymore (type-widened /
+  IcebergCompat CoW would, but this provider can't create them). The buffered path's read-back resolves
+  ids per row from the source's materialized value (else baseRowId + position) — the post-OPTIMIZE
+  caveat is closed.
+- Test: `test/verify_delta_row_tracking_virtual.test` (252).
 
 ## Recommendation — phased (build on demand)
 
