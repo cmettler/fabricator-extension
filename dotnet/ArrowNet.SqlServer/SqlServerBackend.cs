@@ -158,6 +158,21 @@ public sealed class SqlServerBackend : IBackend
             throw new ArgumentException("mssql_net: the ATTACH target for an azure secret must include a Server");
         }
 
+        // An azure access_token secret (PROVIDER access_token — the common Fabric-notebook pattern) carries a
+        // ready-minted token: applied via SqlConnection.AccessToken like the native access_token field. The
+        // token must be SQL-audience (https://database.windows.net/) — a storage-scoped token from the same
+        // pattern is rejected by the server (18456). NOT auto-refreshed (see the mssql_net access_token note).
+        var azAccessToken = F("access_token");
+        if (azAccessToken.Length > 0)
+        {
+            if (!builder.ContainsKey("Encrypt"))
+            {
+                builder["Encrypt"] = true;
+            }
+            builder["TrustServerCertificate"] = true;
+            return builder.ConnectionString + SqlServerCatalog.AccessTokenKeyword + azAccessToken;
+        }
+
         var azProvider = F("provider").ToLowerInvariant();
         var clientId = F("client_id");
         var clientSecret = F("client_secret");
@@ -376,6 +391,10 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // when none is otherwise specified. The mssql_add_identity SET setting overrides this per session (turn OFF
     // for fact tables that don't need a surrogate key). Resolved by ResolveAddIdentity().
     private readonly bool _addIdentityOnCreate;
+    // Ambient Fabric-notebook credential (token-service-backed, refreshing) — set in the ctor when the
+    // connstr carries no credential AND the process runs on Fabric compute. Applied per connection open via
+    // SqlConnection.AccessTokenCallback (so tokens refresh, unlike the static _accessToken).
+    private readonly ArrowNet.Bridge.FabricNotebookCredential? _fabricAmbientCredential;
 
     public SqlServerCatalog(string connectionString, string optionsJson)
     {
@@ -402,6 +421,33 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         else
         {
             connStr = connectionString;
+        }
+        // Ambient Fabric-notebook auth: on Fabric compute (token service present) a connstr that carries NO
+        // credential — bare, or an explicit Authentication=Active Directory Default (which SqlClient would
+        // run through DefaultAzureCredential, PROVEN sourceless on Fabric compute) — switches to a REFRESHING
+        // AccessTokenCallback minting SQL-audience tokens from the Fabric token service (the session's
+        // executing identity: interactive user / pipeline SP / workspace identity). Strictly gated: never
+        // engages off-Fabric or when any credential (token, password, integrated, other AD modes) is given.
+        if (_accessToken is null && ArrowNet.Bridge.FabricNotebookCredential.IsAvailable)
+        {
+            try
+            {
+                var probe = new SqlConnectionStringBuilder(connStr);
+                bool noCredential = probe.Password.Length == 0 && probe.UserID.Length == 0 &&
+                                    !probe.IntegratedSecurity &&
+                                    probe.Authentication is SqlAuthenticationMethod.NotSpecified
+                                        or SqlAuthenticationMethod.ActiveDirectoryDefault;
+                if (noCredential)
+                {
+                    probe.Remove("Authentication");
+                    connStr = probe.ConnectionString;
+                    _fabricAmbientCredential = new ArrowNet.Bridge.FabricNotebookCredential();
+                }
+            }
+            catch
+            {
+                // unparseable connstr — leave it untouched; SqlClient reports the real error at connect
+            }
         }
         // Defer the MARS decision to first-connection profile detection: MARS is forced only when the
         // engine supports it (box SQL Server / Azure SQL DB), since Synapse/Fabric reject a MARS
@@ -603,6 +649,17 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         if (_accessToken is not null)
         {
             connection.AccessToken = _accessToken;
+        }
+        else if (_fabricAmbientCredential is not null)
+        {
+            var cred = _fabricAmbientCredential;
+            connection.AccessTokenCallback = async (_, ct) =>
+            {
+                var token = await cred.GetTokenAsync(
+                    new Azure.Core.TokenRequestContext(new[] { ArrowNet.Bridge.FabricCredentialResolver.SqlScope }),
+                    ct).ConfigureAwait(false);
+                return new SqlAuthenticationToken(token.Token, token.ExpiresOn);
+            };
         }
         return connection;
     }

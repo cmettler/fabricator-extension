@@ -385,6 +385,49 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     are REPRESENTABLE as actions later (snapshot-tied removes: delete-delete guards them; needs
     whole-table-read recording, and note Spark's WriteSerializable permits the concurrent-blind-append
     reorder past an overwrite) — keep guarded until after slice C.
+- **Fabric-notebook AMBIENT AUTH — DONE + VALIDATED LIVE (2026-07-14, C#-only, no ABI).** In a Fabric
+  notebook/Spark session ALL THREE providers work with ZERO credentials: **SQL**
+  (`ATTACH 'Server=<endpoint>;Database=<wh>'` bare, or `authentication 'default'`) against Warehouse AND
+  Lakehouse SQL endpoints; **Delta-on-OneLake** (`ATTACH 'abfss://…/Tables' (TYPE arrownet, PROVIDER
+  'delta', READ_ONLY false)` — no SECRET); **DAX** (`ATTACH 'Data Source=powerbi://…;Initial
+  Catalog=<model>' (PROVIDER 'dax')` — **AdomdClient PROVEN on Fabric Linux compute** (the old
+  "Linux-TBD" is resolved; sempy uses Adomd.NET on the same image); at a WORKSPACE XMLA endpoint the
+  model SCHEMA binds by the semantic-model GUID (not displayName), and an EMPTY default model errors
+  "DAX Evaluate queries work only on databases which have at least one table" — iterate models).
+  Mechanism = **`FabricNotebookCredential`** (Bridge): DefaultAzureCredential is SOURCELESS on Fabric
+  compute (no IMDS, no AZURE_* env — every chain link fails, proven live), so NO SqlClient
+  `Authentication=Active Directory *` keyword can work there; the ambient identity is brokered by the
+  Fabric TOKEN SERVICE (the same local service `notebookutils.credentials.getToken` fronts):
+  `GET {AZURE_FABRIC_TOKEN_SERVICE_URL}?resource=<audience>` with `x-ms-partner-token` = the spark-conf
+  `trident.session.token` (env `MSNOTEBOOKUTILS_TRIDENT_SESSION_TOKEN` — **NOT**
+  `/opt/token-service/tokenservice.config.json`'s sessionToken, a DIFFERENT cluster-level token that
+  401s `SignedPayloadValidationException`; found by request ablation on the live runtime) + MANDATORY
+  `x-ms-proxy-host` (host of `trident.lakehouse.tokenservice.endpoint`, 400 without) + cluster id
+  (`AZURE_FABRIC_CLUSTER_IDENTIFIER`) + tenant (tid claim of the session token); response body = the
+  raw AAD token; cached per resource, re-minted 5 min pre-expiry ⇒ **REFRESHING, PER-SCOPE tokens**
+  (fabric-REST + storage + SQL + powerbi audiences — the multi-audience need one static token can't
+  cover). Wiring: `FabricCredentialResolver.AmbientChain()` (FabricNotebookCredential when the Fabric
+  env markers exist, else DefaultAzureCredential) replaced every direct DefaultAzureCredential fallback
+  (resolver Build + ResolveForRemoteTarget, FabricLakehouse ×3, OneLakeForwardFs); **SQL ambient
+  interception** in `SqlServerCatalog`: a NO-credential connstr (bare / AD-Default; never when any
+  password/token/integrated/other-AD auth is present) on Fabric compute switches to
+  `SqlConnection.AccessTokenCallback` minting database.windows.net tokens (SqlClient re-acquires per
+  connection open); DAX refresh = the existing `AdomdConnection.OnAccessTokenExpired` → fresh mint.
+  UNDOCUMENTED internal protocol — engaged ONLY when the env markers exist (off-Fabric byte-identical,
+  local suites green); re-capture harness = scratchpad/fabricnb's token-service ablation step.
+  **Also: duckdb AZURE `PROVIDER access_token` secrets are now consumed** (the common Fabric-notebook
+  blog pattern): the SQL provider maps the field onto `SqlConnection.AccessToken` (the token must be
+  database.windows.net-audience — a storage-scoped one 18456s; validated live) and
+  `FabricCredentialResolver.Resolve` serves it as a static credential (expiry from the JWT exp; NO
+  refresh — re-create the secret). **Pinned gap:** an abfss OneLake ATTACH with a STATIC storage-token
+  azure secret fails at the Fabric REST hop (401 InvalidToken — a single-token secret can't serve the
+  fabric + storage audiences) — in notebooks use the ambient no-secret form instead. Identity context:
+  interactive = the user; pipeline / on-demand job = the submitting SP / workspace identity (probe
+  showed `idtyp: app`). Notebook probe: `scratchpad/fabricnb` (pbi-vs-database token audiences —
+  the SQL endpoint REJECTS powerbi/api-audience tokens with 18456; bare/default ambient SQL; secretless
+  delta abfss read; DAX daxeval → 2; azure-secret forms; `notebookutils` token-passing forms, now
+  superseded by ambient). Local-catalog gotcha re-proven: `SHOW ALL TABLES`/`duckdb_tables()` scan EVERY
+  attached catalog (the populated-LH fuse hang) — use catalog-qualified/targeted queries in notebooks.
 - **Sync-over-async cleanup (Bridge) — ENABLER DONE (`0533eb7`), refactor DEFERRED.** The Bridge blocks the
   C++↔C# boundary with `.GetAwaiter().GetResult()` sprinkled at every `await` site. This is **correct + safe**
   here (the hostfxr CLR has NO `SynchronizationContext`, so sync-over-async can't deadlock; the ABI is

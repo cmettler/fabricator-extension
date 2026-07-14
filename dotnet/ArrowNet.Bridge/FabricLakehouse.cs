@@ -99,7 +99,7 @@ public static class FabricLakehouse
     /// authenticates both the Fabric API and the DFS endpoint.</summary>
     internal static OneLakeInfo Resolve(string root, TokenCredential? credential)
     {
-        var cred = credential ?? new DefaultAzureCredential();
+        var cred = credential ?? FabricCredentialResolver.AmbientChain();
         var (workspaceSeg, lakehouseSeg) = ParseOneLake(root);
         Guid workspaceId = ResolveWorkspaceId(workspaceSeg, cred);
         Guid lakehouseId = ResolveLakehouseId(workspaceId, lakehouseSeg, cred);
@@ -279,7 +279,7 @@ public static class FabricLakehouse
     /// <see cref="ListChildDirectories"/> for why sync hangs under the CLR).</summary>
     public static void DeleteDirectory(string abfssDir, TokenCredential? credential)
     {
-        var cred = credential ?? new DefaultAzureCredential();
+        var cred = credential ?? FabricCredentialResolver.AmbientChain();
         var (host, fileSystem, pathUnderFs) = ParseAbfss(abfssDir.Replace('\\', '/').TrimEnd('/'));
         var dirClient = new DataLakeDirectoryClient(
             new Uri($"https://{host}/{fileSystem}/{pathUnderFs}"), cred);
@@ -294,7 +294,7 @@ public static class FabricLakehouse
     /// <see cref="ListChildDirectories"/>).</summary>
     public static void RenameDirectory(string abfssSrc, string abfssDest, TokenCredential? credential)
     {
-        var cred = credential ?? new DefaultAzureCredential();
+        var cred = credential ?? FabricCredentialResolver.AmbientChain();
         var (host, fileSystem, srcPath) = ParseAbfss(abfssSrc.Replace('\\', '/').TrimEnd('/'));
         var (_, _, destPath) = ParseAbfss(abfssDest.Replace('\\', '/').TrimEnd('/'));
         var dirClient = new DataLakeDirectoryClient(

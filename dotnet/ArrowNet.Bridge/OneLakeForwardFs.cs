@@ -55,7 +55,7 @@ internal static class OneLakeForwardFs
     {
         if (string.IsNullOrWhiteSpace(credJson) || credJson == "{}")
         {
-            return new DefaultAzureCredential();
+            return FabricCredentialResolver.AmbientChain();
         }
         var fields = JsonSerializer.Deserialize<Dictionary<string, string>>(credJson) ?? new();
         return FabricCredentialResolver.Resolve(fields);

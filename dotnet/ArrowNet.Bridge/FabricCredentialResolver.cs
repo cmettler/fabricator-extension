@@ -47,7 +47,58 @@ public static class FabricCredentialResolver
     public static TokenCredential Resolve(IReadOnlyDictionary<string, string> fields)
     {
         string F(string key) => fields.TryGetValue(key, out var v) ? v ?? string.Empty : string.Empty;
+        // An azure access_token secret (PROVIDER access_token — the common Fabric-notebook pattern:
+        // ACCESS_TOKEN = notebookutils.credentials.getToken('storage')) IS the credential: serve it as-is,
+        // expiry from the JWT. NOT auto-refreshed (the token source lives outside this process) —
+        // re-create the secret to refresh.
+        var accessToken = F("access_token");
+        if (accessToken.Length > 0)
+        {
+            return new StaticTokenCredential(accessToken);
+        }
         return Build(F("provider"), F("tenant_id"), F("client_id"), F("client_secret"));
+    }
+
+    /// <summary>A fixed, pre-minted token served for every scope request (the token's audience must match
+    /// what the caller needs — e.g. storage for OneLake). Expiry parsed from the JWT <c>exp</c> claim.</summary>
+    private sealed class StaticTokenCredential : TokenCredential
+    {
+        private readonly AccessToken _token;
+
+        public StaticTokenCredential(string token)
+        {
+            _token = new AccessToken(token, JwtExpiry(token));
+        }
+
+        public override AccessToken GetToken(TokenRequestContext requestContext, CancellationToken cancellationToken)
+            => _token;
+
+        public override ValueTask<AccessToken> GetTokenAsync(TokenRequestContext requestContext, CancellationToken cancellationToken)
+            => new(_token);
+
+        private static DateTimeOffset JwtExpiry(string token)
+        {
+            try
+            {
+                var parts = token.Split('.');
+                if (parts.Length == 3)
+                {
+                    var payload = parts[1].Replace('-', '+').Replace('_', '/');
+                    payload += new string('=', (4 - payload.Length % 4) % 4);
+                    var json = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(payload));
+                    using var doc = System.Text.Json.JsonDocument.Parse(json);
+                    if (doc.RootElement.TryGetProperty("exp", out var exp) && exp.TryGetInt64(out var seconds))
+                    {
+                        return DateTimeOffset.FromUnixTimeSeconds(seconds);
+                    }
+                }
+            }
+            catch
+            {
+                // opaque token — fall through to a conservative fixed lifetime
+            }
+            return DateTimeOffset.UtcNow.AddHours(1);
+        }
     }
 
     /// <summary>Resolve from explicit SP strings (for callers that hold the fields as plain strings, e.g. the
@@ -71,10 +122,18 @@ public static class FabricCredentialResolver
                 ? new ManagedIdentityCredential(clientId)
                 : new ManagedIdentityCredential();
         }
-        // credential_chain / default / no secret → the ambient chain (Fabric workspace/managed identity, or
-        // local env / az CLI / VS).
-        return new DefaultAzureCredential();
+        // credential_chain / default / no secret → the ambient chain.
+        return AmbientChain();
     }
+
+    /// <summary>The ambient credential: on Fabric notebook/Spark compute the token-service-backed
+    /// <see cref="FabricNotebookCredential"/> (DefaultAzureCredential has NO source there — no IMDS, no env;
+    /// validated live 2026-07-14), everywhere else <see cref="DefaultAzureCredential"/> (env / managed
+    /// identity / VS / az CLI).</summary>
+    public static TokenCredential AmbientChain()
+        => FabricNotebookCredential.IsAvailable
+            ? new FabricNotebookCredential()
+            : new DefaultAzureCredential();
 
     /// <summary>"Active Directory Default"-style fallback for a target with no attached secret: a remote
     /// (<c>scheme://</c>) endpoint with no inline password / user id gets a <see cref="DefaultAzureCredential"/>;
@@ -84,7 +143,7 @@ public static class FabricCredentialResolver
         var lower = connectionString.ToLowerInvariant();
         bool remote = lower.Contains("://"); // cloud endpoints use a scheme:// data source; on-prem/localhost don't
         bool hasInlineAuth = lower.Contains("password=") || lower.Contains("pwd=") || lower.Contains("user id=");
-        return remote && !hasInlineAuth ? new DefaultAzureCredential() : null;
+        return remote && !hasInlineAuth ? AmbientChain() : null;
     }
 
     /// <summary>Acquire a scoped access token (Azure.Identity caches + refreshes internally, so per-call use is
