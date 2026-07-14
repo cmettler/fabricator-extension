@@ -540,6 +540,47 @@ The native reader now serves **rowid-filtered scans in O(matched files)**, and t
 - Test: `test/verify_delta_late_materialization.test` (57 — layout-independent count assertions since file
   ordinals are path-sorted random uuids, plus duckdb_logs pins of the prune + the `file_row_number` form).
 
+#### What else `late_materialization = true` enables (full trigger inventory)
+
+Beyond the TopN (`ORDER BY x LIMIT n`) rewrite above, the flag opts the scan into three more optimizer
+rewrites (source: `duckdb/src/optimizer/late_materialization.cpp` +
+`topn_window_elimination.cpp`, v1.5.4):
+
+1. **Plain `LIMIT` — two shapes only.** The limit must be a **constant**. Small limits
+   (≤ `late_materialization_max_rows`, setting default **50**) rewrite **only when there is an OFFSET**
+   (a small bare LIMIT stops the scan early anyway; `LIMIT 10 OFFSET 100000` skips the offset on the
+   narrow scan and fetches back only 10 full-width rows). **Large limits**
+   (50 < n ≤ a hardcoded 1,000,000, `OptimizeLargeLimit`) rewrite only when the rowids will be
+   *consecutive*: nothing but projections between the LIMIT and the scan, no table filters, and
+   `preserve_insertion_order = true` (else the limit runs in parallel and the join-back can pessimize).
+2. **`SAMPLE`** — a row-count sample (`USING SAMPLE 100`, not a percentage) up to the same
+   50-row-default threshold: sample the narrow scan, fetch the sampled rows back by rowid.
+3. **Top-N window elimination** — the rewrite turning `QUALIFY row_number() OVER (PARTITION BY … ORDER
+   BY …) <= k` / top-1-per-group patterns into an aggregate consults its own
+   `CanUseLateMaterialization`: with the flag, it aggregates only `(partition keys, order key, rowid)`
+   and joins back for the payload columns; without it, it must struct-pack every referenced column
+   through `arg_max`. It even tolerates a join between the window and the scan when all projected
+   columns trace to one table. Big win for wide-table top-n-per-group on the native reader.
+
+**Shared bail-outs** (all shapes): only projections/filters between the operator and the scan, no
+volatile expressions, and skipped when the query references (nearly) all scanned columns anyway — no
+width saving, no rewrite.
+
+**What every rewrite produces / effects on this extension:**
+- The plan gains a **second scan of the same table** + a **SEMI join on rowid** — the reason
+  `ArrowStreamBindData::Copy()` exists (`CreateLHSGet` clones the fetch-side get's bind data). Each
+  scan is a separate provider execution; the per-transaction snapshot pin keeps them on one version.
+- The fetch-back side gets the **dynamic rowid filter** from JoinFilterPushdown (min/max + IN-list for
+  small builds) — exactly what `DeltaRowIdFilter` decodes into exact file selection +
+  `file_row_number` row-group pruning. Without that decode, every rewrite would trade one narrow scan
+  for a full-width full rescan (a pessimization); with it, the fetch touches only matched files/row
+  groups.
+- For TopN the optimizer **re-sorts the fetched rows after the join** (the join loses order) — a small
+  trailing sort appears in the plan.
+- Scoped to Delta `native_read` only (the `ExactFilterPushdown()` gate): SQL Server/DAX never see these
+  plan shapes — on a remote SQL source the join-back would be a second server round trip, while their
+  server-side TopN pushdown is strictly better; on Delta it's local parquet I/O we prune precisely.
+
 ### Stable row-tracking virtual columns (DONE 2026-07-13)
 
 `__delta_row_id` / `__delta_row_commit_version` (the Delta materialized-column names — Spark's
