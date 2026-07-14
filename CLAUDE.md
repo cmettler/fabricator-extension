@@ -414,7 +414,15 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   `SqlConnection.AccessTokenCallback` minting database.windows.net tokens (SqlClient re-acquires per
   connection open); DAX refresh = the existing `AdomdConnection.OnAccessTokenExpired` → fresh mint.
   UNDOCUMENTED internal protocol — engaged ONLY when the env markers exist (off-Fabric byte-identical,
-  local suites green); re-capture harness = scratchpad/fabricnb's token-service ablation step.
+  local suites green); re-capture harness = scratchpad/fabricnb's token-service ablation step. **Drift
+  risk is LOW: sempy's own leaf (`fabric.analytics.environment.notebook_plugin.token_service_client.
+  TokenServiceClient`, source-verified 2026-07-14) uses the IDENTICAL request** — same URL composition,
+  same `trident.session.token` partner token (config file read ONLY for tokenServiceEndpoint+clusterName),
+  same proxy-host, JWT-exp expiry; the contract is load-bearing for sempy/SynapseML/notebookutils (their
+  resource shortforms `pbi`/`storage`/`sql`/`keyvault`/`kusto`/`ml` also work beside full audience URLs;
+  they send moniker=clusterName, we send the artifact id — both accepted). sempy also ships the SAME
+  managed AdomdClient via pythonnet with the SAME AccessToken+OnAccessTokenExpired wiring — independent
+  confirmation of our DAX stack on Fabric Linux.
   **Also: duckdb AZURE `PROVIDER access_token` secrets are now consumed** (the common Fabric-notebook
   blog pattern): the SQL provider maps the field onto `SqlConnection.AccessToken` (the token must be
   database.windows.net-audience — a storage-scoped one 18456s; validated live) and
