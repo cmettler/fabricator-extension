@@ -77,6 +77,12 @@ public:
 	//! re-fetch cached from the now-undone (uncommitted) schema. See Alter() / fabricator_transaction.cpp.
 	void InvalidateEntryCache();
 
+	//! Scoped lazy invalidation: drop only the MATERIALIZED entries whose name matches `matches` (keep the
+	//! discovered name lists — an ALTER'd object re-fetches its fresh schema on next access; a DROPped one
+	//! self-heals on the next access when the column re-fetch fails). Backs fabricator_invalidate_cache with a
+	//! name regex — refresh only the objects you touched, leaving the rest of the cache warm.
+	void InvalidateMatching(const std::function<bool(const string &)> &matches);
+
 	void Scan(ClientContext &context, CatalogType type, const std::function<void(CatalogEntry &)> &callback) override;
 	void Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) override;
 	optional_ptr<CatalogEntry> LookupEntry(CatalogTransaction transaction,

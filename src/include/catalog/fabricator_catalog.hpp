@@ -35,6 +35,12 @@ public:
 	//! now-undone uncommitted schema. See FabricatorSchemaEntry::Alter / fabricator_transaction.cpp.
 	void InvalidateAllEntries();
 
+	//! Scoped invalidation: drop materialized entries whose name matches the icase regex `pattern`, keeping
+	//! the discovered name lists (lazy re-fetch on next access). UNBOUNDED by the ATTACH object filter — a
+	//! targeted refresh reaches any object by name (the filter bounds enumeration, not targeted access; see
+	//! HasObjectFilter). Backs fabricator_invalidate_cache(catalog, name_regex). Throws on a bad regex.
+	void InvalidateMatching(const string &pattern);
+
 	FabricatorHandle GetHandle() const {
 		return handle_;
 	}
@@ -55,6 +61,20 @@ public:
 	//! Delta. See docs/multifile-delta.md §"Batch 2 slice 2".
 	bool ExactFilterPushdown() const {
 		return exact_filter_pushdown_;
+	}
+
+	//! Whether an ATTACH object filter (schema_filter / table_filter / function_filter) is active. When set,
+	//! the discovered name list (per schema) is a FILTERED SUBSET, so a targeted lookup miss is ambiguous —
+	//! it may be a real object the filter merely excluded from ENUMERATION. The filter bounds enumeration
+	//! (SHOW TABLES / full refresh), NOT targeted-by-name access: FabricatorSchemaEntry::GetOrCreateEntry
+	//! lazily fetches an out-of-enumeration table by name when this is true (cached in entries_, never added
+	//! to the enumerated set). With no filter, the discovery list is authoritative so a miss is genuinely
+	//! absent (no wasted round-trip). Set at ATTACH from the presence of a filter option.
+	void SetObjectFilter(bool has_filter) {
+		has_object_filter_ = has_filter;
+	}
+	bool HasObjectFilter() const {
+		return has_object_filter_;
 	}
 
 	//! The catalog-type string identifying an attached catalog as ours (the provider
@@ -106,6 +126,7 @@ private:
 	FabricatorHandle handle_;
 	string db_path_;
 	//! Whether the database collation is binary (detected at LoadCatalog) => string ORDER BY is pushable.
+	bool has_object_filter_ = false;
 	bool string_order_pushable_ = false;
 	//! Whether the provider applies pushed filters exactly (detected at LoadCatalog) => filter_pushdown=true
 	//! is safe on the scan (currently: Delta native_read only). See ExactFilterPushdown().

@@ -1674,19 +1674,30 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   both, cleanup); function suites unregressed (functions 13 / scalar 26 / procs 24 / table 33 / custom 89 /
   catalog_filter 7).
 - **Open design items (refresh)** — deliberated, not yet built:
-  - **Targeted/scoped refresh.** `fabricator_refresh_cache` is arity-1 (whole catalog); `fabricator_invalidate_cache
-    (catalog[,schema[,table]])` accepts the schema/table args for native-extension compat but **ignores
-    them** (always a full refresh — a valid superset). The `fabricator_exec` auto-refresh (gated by
-    `mssql_exec_invalidate_cache`) is likewise a **full** `RefreshCache`: the C# DDL detector returns only a
-    bool `schema_may_change` (no object/schema name crosses the ABI), so there's nothing to scope to — and
-    it deliberately doesn't parse the statement. Idea: rename the `table` arg to a generic **object name** +
-    implement scoped re-discovery for whichever kind it is (table/view/function/proc); the exec path would
-    additionally need C# to surface the touched object (not just the bool flag). **Native parity:** the C++
-    mssql extension's `mssql_exec` does the same — full `catalog.InvalidateMetadataCache()` gated by its own
-    bool `ExecSqlMayChangeSchema`, no scoping; it only scopes (`InvalidateSchema`/table-set) in
-    catalog-driven DDL where the name is known (as we do via per-entry eviction). It invalidates *lazily*
-    (mark stale + evict, reload on next access) vs our *eager* `RefreshCache` re-discovery — so scoping the
-    exec path would exceed native parity, and a lazy mark-stale would be cheaper here too.
+  - **Scoped refresh — DONE (2026-07-15).** `fabricator_invalidate_cache(catalog, name_regex)` — a non-empty
+    2nd arg is an icase name pattern: SCOPED invalidation of only the MATCHING objects (drop their materialized
+    entries; an ALTER'd one re-fetches its fresh schema on next access, a DROPped one self-heals when the
+    column re-fetch fails), leaving the rest of the cache warm — "refresh only what I touched via
+    fabricator_exec". No regex (arity 1, or an empty/NULL 2nd arg) = full `RefreshCache` (whole catalog within
+    its filtered enumeration baseline). C++ `FabricatorCatalog::InvalidateMatching(pattern)` compiles the
+    std::regex (bad pattern → clean error) + per-schema `FabricatorSchemaEntry::InvalidateMatching(pred)` evicts
+    the matching *_entries_ caches (keeps the name lists). No ABI/C# change. `test/verify_invalidate_scoped.test`
+    (18). The legacy `(catalog, schema, table)` arity still works (3rd arg ignored). The `fabricator_exec`
+    auto-refresh (gated by `mssql_exec_invalidate_cache`) stays a **full** `RefreshCache` — the C# DDL detector
+    returns only a bool `schema_may_change` (no object name crosses the ABI), so it can't auto-scope; do a
+    manual `fabricator_invalidate_cache(cat, '<regex>')` for scoped, or full otherwise.
+  - **ATTACH object filter is ENUMERATION-ONLY, not a cage — DONE (2026-07-15).** `schema_filter`/`table_filter`/
+    `function_filter` make ATTACH fast on a huge catalog by discovering a SUBSET — but they bound ENUMERATION
+    (SHOW TABLES / `duckdb_tables` / full refresh), NOT targeted-by-name access. `FabricatorSchemaEntry::
+    GetOrCreateEntry` now, on a miss WHEN an object filter is active (`FabricatorCatalog::HasObjectFilter`, set
+    at ATTACH from the presence of a *_filter option), FETCHES the table by name (the miss may be a real table
+    the filter merely excluded from enumeration); the entry is cached in `entries_` but NOT added to
+    `table_types_`, so enumeration stays filtered while `db.schema.OutOfFilterTable` resolves. Without a filter,
+    the discovery list is authoritative so a miss is genuinely absent (no wasted round-trip — CREATE-new is
+    unaffected). This means a restrictive perf-filter no longer CAGES the catalog: you can always reach an
+    object by name (and a scoped `invalidate_cache` reconciles it), the filter is just a discovery speed-up. The
+    filter was never a security boundary anyway (`fabricator_query` bypasses the catalog). `verify_invalidate_scoped`
+    covers it; `verify_catalog_filter` (enumeration counts) unchanged.
 
 ## C ABI contract (`src/include/fabricator/abi.h`)
 

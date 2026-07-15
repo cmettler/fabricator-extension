@@ -539,7 +539,23 @@ static void FabricatorRefreshCacheFunction(DataChunk &args, ExpressionState &sta
 			throw BinderException("fabricator_refresh_cache: catalog '%s' is not a fabricator catalog (type: %s)", name,
 			                      catalog.GetCatalogType());
 		}
-		catalog.Cast<FabricatorCatalog>().RefreshCache(context);
+		// fabricator_invalidate_cache(catalog, name_regex): a non-empty 2nd arg is a name pattern — SCOPED
+		// invalidation of only the matching objects (drop their materialized entries; they re-fetch / self-heal
+		// on next access), UNBOUNDED by the ATTACH filter, leaving the rest of the cache warm. Refresh only what
+		// you touched via fabricator_exec. No pattern (arity 1, or an empty/NULL 2nd arg) => full re-discovery
+		// of the whole catalog within its filtered enumeration baseline. The optional 3rd arg is legacy, ignored.
+		string pattern;
+		if (args.ColumnCount() >= 2) {
+			auto pat_value = args.GetValue(1, i);
+			if (!pat_value.IsNull()) {
+				pattern = StringValue::Get(pat_value);
+			}
+		}
+		if (!pattern.empty()) {
+			catalog.Cast<FabricatorCatalog>().InvalidateMatching(pattern);
+		} else {
+			catalog.Cast<FabricatorCatalog>().RefreshCache(context);
+		}
 		result_data[i] = true;
 	}
 }

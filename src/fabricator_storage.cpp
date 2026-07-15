@@ -181,6 +181,13 @@ static unique_ptr<Catalog> FabricatorAttach(optional_ptr<StorageExtensionInfo> s
 		// into the managed side; a bad filter regex now surfaces here as the managed open error.
 		auto handle = fabricator::OpenCatalog(connection_string, provider, options_json);
 		auto catalog = make_uniq<FabricatorCatalog>(db, name, handle, RedactConnectionString(connection_string));
+		// An object filter (schema_filter/table_filter/function_filter) makes the discovered name list a
+		// FILTERED SUBSET — so a targeted lookup miss may be a real table the filter merely excluded from
+		// enumeration. Flag it so GetOrCreateEntry lazily fetches such a table by name (the filter bounds
+		// enumeration, not targeted access). The keys ride options_json lowercased+quoted.
+		catalog->SetObjectFilter(options_json.find("\"schema_filter\"") != string::npos ||
+		                         options_json.find("\"table_filter\"") != string::npos ||
+		                         options_json.find("\"function_filter\"") != string::npos);
 		catalog->LoadCatalog(context); // discover schemas + tables (also validates the connection)
 		return std::move(catalog);
 	} catch (const std::exception &ex) {

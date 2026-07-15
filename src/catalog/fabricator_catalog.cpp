@@ -5,6 +5,8 @@
 #include "catalog/fabricator_catalog.hpp"
 #include "catalog/fabricator_partition_util.hpp"
 
+#include <regex>
+
 #include "fabricator/clr_host.hpp"
 #include "catalog/fabricator_metadata.hpp"
 #include "catalog/fabricator_schema_entry.hpp"
@@ -128,6 +130,19 @@ void FabricatorCatalog::InvalidateAllEntries() {
 	lock_guard<mutex> lock(schema_lock_);
 	for (auto &entry : schemas_) {
 		entry.second->InvalidateEntryCache();
+	}
+}
+
+void FabricatorCatalog::InvalidateMatching(const string &pattern) {
+	std::regex re;
+	try {
+		re = std::regex(pattern, std::regex::ECMAScript | std::regex::icase);
+	} catch (const std::regex_error &e) {
+		throw InvalidInputException("fabricator_invalidate_cache: invalid name pattern '%s': %s", pattern, e.what());
+	}
+	lock_guard<mutex> lock(schema_lock_);
+	for (auto &entry : schemas_) {
+		entry.second->InvalidateMatching([&re](const string &n) { return std::regex_search(n, re); });
 	}
 }
 

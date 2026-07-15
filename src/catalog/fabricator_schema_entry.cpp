@@ -129,6 +129,26 @@ void FabricatorSchemaEntry::InvalidateEntryCache() {
 	aggregate_function_entries_.clear();
 }
 
+void FabricatorSchemaEntry::InvalidateMatching(const std::function<bool(const string &)> &matches) {
+	// Like InvalidateEntryCache but scoped: drop only the materialized entries whose NAME matches. The name
+	// lists are kept, so an ALTER'd object re-fetches its fresh schema on next access and a DROPped one
+	// self-heals (its column re-fetch fails -> GetOrCreateEntry evicts it). Everything else stays warm.
+	lock_guard<mutex> lock(entry_lock_);
+	auto evict = [&](auto &cache) {
+		for (auto it = cache.begin(); it != cache.end();) {
+			if (matches(it->first)) {
+				it = cache.erase(it);
+			} else {
+				++it;
+			}
+		}
+	};
+	evict(entries_);
+	evict(function_entries_);
+	evict(table_function_entries_);
+	evict(aggregate_function_entries_);
+}
+
 optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext &context, const string &table_name) {
 	lock_guard<mutex> lock(entry_lock_);
 	auto cached = entries_.find(table_name);
@@ -136,9 +156,15 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext
 		return cached->second.get();
 	}
 	auto type_it = table_types_.find(table_name);
-	if (type_it == table_types_.end()) {
+	if (type_it == table_types_.end() && !catalog.Cast<FabricatorCatalog>().HasObjectFilter()) {
+		// No object filter: the discovered name list is the FULL enumeration, so a miss is genuinely absent.
 		return nullptr;
 	}
+	// A miss WITH an object filter active is ambiguous: the discovered list is a filtered subset, so this may
+	// be a real table the filter merely excluded from ENUMERATION. The filter bounds enumeration, not targeted
+	// access — so fetch by name. A genuine absence throws in FetchTableColumns below and is treated as
+	// not-found. The entry is cached in entries_ (fast repeat access) but NOT added to table_types_, so it
+	// stays out of enumeration (SHOW TABLES / full refresh keep the filtered view).
 
 	vector<string> names;
 	vector<LogicalType> types;

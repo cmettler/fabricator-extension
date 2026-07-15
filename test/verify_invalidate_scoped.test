@@ -1,0 +1,83 @@
+# name: test/verify_invalidate_scoped.test
+# description: fabricator_invalidate_cache(catalog[, name_regex]) — a name regex SCOPES the invalidation to
+#              matching objects (refresh only what you touched; leave the rest of the cache warm). No regex =
+#              full re-discovery of the catalog. Also: the ATTACH filter is enumeration-only (targeted access
+#              reaches an out-of-filter object by name).
+# group: [fabricator]
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.inv_a');
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.inv_b');
+
+statement ok
+CREATE TABLE db.dbo.inv_a (id INT);
+
+statement ok
+CREATE TABLE db.dbo.inv_b (id INT);
+
+# access both -> materialize their (1-column) schema in the catalog cache
+query I
+SELECT count(*) FROM db.dbo.inv_a;
+----
+0
+
+query I
+SELECT count(*) FROM db.dbo.inv_b;
+----
+0
+
+# ALTER both on the server via a RAW exec (no auto-invalidate) -> both cached entries are now stale
+statement ok
+SELECT fabricator_exec('db', 'ALTER TABLE dbo.inv_a ADD extra INT');
+
+statement ok
+SELECT fabricator_exec('db', 'ALTER TABLE dbo.inv_b ADD extra INT');
+
+# stale: 'extra' is not in the cached schema yet
+statement error
+SELECT extra FROM db.dbo.inv_a;
+----
+
+# SCOPED invalidate of ONLY inv_a
+statement ok
+SELECT fabricator_invalidate_cache('db', '^inv_a$');
+
+# inv_a re-fetched (only the matching object) -> 'extra' resolves
+query I
+SELECT count(extra) FROM db.dbo.inv_a;
+----
+0
+
+# no regex -> full re-discovery of the catalog picks up inv_b's ALTER too
+statement ok
+SELECT fabricator_invalidate_cache('db');
+
+query I
+SELECT count(extra) FROM db.dbo.inv_b;
+----
+0
+
+# a bad regex errors cleanly
+statement error
+SELECT fabricator_invalidate_cache('db', '[unclosed');
+----
+invalid name pattern
+
+# cleanup
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.inv_a');
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.inv_b');
+
+statement ok
+DETACH db;
