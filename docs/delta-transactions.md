@@ -173,7 +173,14 @@ our own adds); extra actions (metaData/protocol from buffered ALTERs, cdc action
 actions) join the single `CommitDataFilesAsync(expectedVersion: …)`. commitInfo operation = the
 statement kind when single-kind (WRITE/DELETE/UPDATE/"ADD COLUMNS"/…), `TRANSACTION` when mixed.
 
-### Conflict detection = Spark ConflictChecker parity (file/action-level)
+### Conflict detection = Spark ConflictChecker parity (file/action-level) + row-level DV reconciliation
+
+Under `write_serializable`, before the checks below, DML deletion-vector pairs are REBASED onto the
+latest snapshot (`RebaseDvDmlActionsAsync`): a concurrent DV swap of the same file re-unions when the
+touched rows are disjoint (row-level concurrency, §10.4) — so the delete/delete check then passes
+naturally, and the read checks skip DV-swap commits (`rowLevelDml`). Same-row overlap throws the
+row-level conflict; a concurrently rewritten/compacted file stays a conflict. Under `serializable`
+no rebase happens — everything below applies strictly to the pinned-resolved actions.
 
 When the table moved past `PinnedVersion`, `CheckLogicalRebaseAsync` walks the concurrent commits
 `pinned+1 … latest` and runs four checks. Row-tracking ids play **no** role in detection — the
@@ -291,7 +298,134 @@ data. Read the committed high-water mark with `arrownet_delta_get_transaction_ve
 
 ---
 
-## 10. deltars provider (out of scope here)
+## 10. Databricks / Spark comparison — worked SQL scenarios
+
+Reference: [Databricks isolation levels](https://docs.databricks.com/aws/en/optimizations/isolation/isolation-levels)
++ [row-level concurrency](https://docs.databricks.com/aws/en/optimizations/isolation/row-level-concurrency).
+Summary: we implement the SAME two write-isolation levels with the same semantics and default
+(`write_serializable` | `serializable`, Spark ConflictChecker parity, §6), but reads and multi-statement
+behavior differ in our favor, while Databricks' proprietary row-level concurrency and the
+`delta.isolationLevel` table property are things we don't have. Scenario notation: session A = us or
+Databricks as stated, session B = any concurrent writer (another process/engine).
+
+### 10.1 Repeatable reads across statements — WE ARE STRONGER
+
+```sql
+-- session A                                   -- session B
+BEGIN;
+SELECT count(*) FROM lake.main.t;  -- 100
+                                               INSERT INTO t VALUES (...);  -- commits v+1
+SELECT count(*) FROM lake.main.t;  -- STILL 100 (snapshot pinned at first read)
+COMMIT;
+```
+
+Ours: both SELECTs read the SAME pinned snapshot (MVCC / REPEATABLE READ, §3) — B's commit is
+invisible mid-transaction. **Classic Databricks/Spark: there is no multi-statement transaction at
+all** — each SELECT is its own query with its own snapshot, so the second SELECT returns 101 under
+BOTH of their isolation levels (those govern write conflicts, not cross-query read stability; their
+multi-statement-transactions preview via UC coordinated commits is the exception). Same caveat for
+us in autocommit: without BEGIN we also re-resolve per statement (deliberate Spark parity).
+
+### 10.2 Atomic multi-statement write + ROLLBACK — WE ARE STRONGER
+
+```sql
+BEGIN;
+INSERT INTO lake.main.t SELECT ...;   -- buffered (files eager, commit deferred)
+DELETE FROM lake.main.t WHERE k = 3;  -- buffered DV
+UPDATE lake.main.t SET v = 9 WHERE k = 5;
+ROLLBACK;                             -- NOTHING happened (orphan parquet for VACUUM)
+-- or COMMIT;                         -- ONE Delta commit, operation=TRANSACTION
+```
+
+Ours: one atomic Delta version per table, real ROLLBACK. Classic Databricks/Spark: three separate
+commits, no undo — a failure mid-script leaves the first statements applied. (Their preview feature
+targets this gap; different mechanism.)
+
+### 10.3 Concurrent blind append during a transaction — PARITY
+
+```sql
+-- session A (ours)                            -- session B
+BEGIN;
+INSERT INTO lake.main.t VALUES (1);
+                                               INSERT INTO t VALUES (2);  -- commits first
+COMMIT;  -- rebase: appends commute -> BOTH land, no error
+```
+
+Same outcome as Databricks under WriteSerializable (blind appends never conflict). Under
+`serializable` + session A having READ `t` with a predicate matching B's rows, our COMMIT aborts —
+exactly their Serializable behavior. Documented divergence (§6): an APPEND-ONLY transaction that
+read the table stays on the blind path under write_serializable (Spark would run the read checks).
+
+### 10.4 Concurrent DML on the SAME FILE — PARITY+ (row-level concurrency, v1 2026-07-14)
+
+```sql
+-- session A                                   -- session B
+UPDATE t SET v = 1 WHERE id = 10;              UPDATE t SET v = 2 WHERE id = 20;
+-- rows 10 and 20 sit in the SAME parquet file → BOTH succeed
+```
+
+Databricks (DBR 14.3+, unpartitioned + DVs) and now US: concurrent UPDATE/DELETE touching
+**different rows of the same file** both land — the loser's COMMIT rebases its deletion-vector
+pairs onto the winner's state (`RebaseDvDmlActionsAsync`: the touched row sets are checked disjoint,
+the DVs re-union, post-image adds re-derive their row-id range). The SAME row modified by both →
+`row-level conflict on file '…': N row(s) … concurrently deleted or updated` (first committer wins,
+no lost update). OSS Spark, delta-rs, delta-kernel all still conflict at FILE level — this is
+otherwise Databricks-proprietary. Where we go BEYOND Databricks: it works on **partitioned** tables
+(the DV mechanics don't care) and inside **multi-statement transactions** (their row-level scope is
+per statement); the buffered-txn read checks relax to row level too (a concurrent DV swap of a file
+the transaction merely READ no longer aborts — `CheckLogicalRebaseAsync(rowLevelDml:)`). Applies
+under `write_serializable` only ( `serializable` keeps strict file-level checks) and to DV tables
+only (copy-on-write rewrites can't reconcile — the `deletion_vectors false` PolyBase recipe keeps
+file-level conflicts). v1 boundary: a concurrent **rewrite/compaction** of a touched file (OPTIMIZE,
+CoW) is still a path-level conflict — the possible v2 remaps rows across rewrites via
+`__delta_row_id`. Autocommit DML gets the same reconciliation via a bounded commit-retry loop.
+Test: `test/verify_delta_row_level_concurrency.test` (49 — disjoint same-file DELETE/UPDATE compose,
+same-row conflicts, OPTIMIZE-during conflicts, serializable strict, three-writer pile-up;
+kernel-validated readback).
+
+### 10.5 WriteSerializable's "state that never existed" — PARITY (same artifact)
+
+```sql
+-- session A (long DELETE)                     -- session B
+DELETE FROM t WHERE grp = 'x';                 INSERT INTO t VALUES ('x', 99);  -- blind append
+-- both succeed under write_serializable; history may order the INSERT *before* the DELETE
+-- even though it committed after -> a reader can see a snapshot with the new row already
+-- present but the old rows not yet deleted (never a "real" serial state).
+```
+
+We inherit the same reordering artifact by design (it's what write_serializable means). It's also
+why CREATE-OR-REPLACE / partition-overwrite are guarded inside our explicit transactions: a
+concurrent blind append could logically reorder past the overwrite. `serializable` removes the
+artifact on both systems (the append aborts instead).
+
+### 10.6 `delta.isolationLevel` table property — GAP (ours is per-catalog)
+
+```sql
+-- set by a Databricks writer:
+ALTER TABLE t SET TBLPROPERTIES ('delta.isolationLevel' = 'Serializable');
+```
+
+Databricks/Spark honor this per table, from any cluster. We do NOT read it — our level comes from
+the `isolation_level` ATTACH option (per catalog). A table marked Serializable by Spark gets
+write_serializable treatment from us. Cheap follow-up: honor the property as the per-table default
+with the ATTACH option as override.
+
+### 10.7 Cross-TABLE atomicity — CAVEAT ON OUR SIDE
+
+```sql
+BEGIN;
+INSERT INTO lake.main.a VALUES (1);
+INSERT INTO lake.main.b VALUES (2);
+COMMIT;   -- one Delta commit per TABLE, flushed sequentially
+```
+
+Delta has no multi-table commit: each table's flush is atomic, but a crash between the two flushes
+leaves `a` committed and `b` not. Classic Databricks has the same limitation (worse — per
+statement); their UC coordinated-commits preview is the only mechanism that spans tables.
+
+---
+
+## 11. deltars provider (out of scope here)
 
 The `deltars` provider has **no transaction buffer**: every statement is its own delta-rs commit
 regardless of `BEGIN..COMMIT`, ROLLBACK does not undo them, DELETE/UPDATE are copy-on-write MERGEs

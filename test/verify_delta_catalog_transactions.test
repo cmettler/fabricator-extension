@@ -514,9 +514,11 @@ INSERT INTO lake.main.t VALUES (7, 'ins');
 statement ok
 DETACH serlake;
 
-# --- 6e. concurrentDeleteRead (both isolation levels): a concurrent delete of a file the transaction
-#     READ — here a whole-table read (unpushable predicate) — conflicts even though the transaction
-#     modifies a DIFFERENT file. ---
+# --- 6e. ROW-LEVEL CONCURRENCY (write_serializable, Databricks-style): a concurrent DV delete of a
+#     DIFFERENT row no longer conflicts — even when the transaction's read was whole-table and even on
+#     the SAME file's deletion vector (the rebase re-unions the disjoint row sets). Only Databricks has
+#     this (OSS Spark conflicts at file level). Under `serializable` the strict file-level
+#     deleteRead/delete-delete checks remain (pinned below). ---
 
 statement ok con1
 BEGIN;
@@ -525,21 +527,45 @@ BEGIN;
 statement ok con1
 DELETE FROM lake.main.t WHERE id % 100 = 50;
 
-# the racer deletes id=1 — a DIFFERENT file, but one con1's whole-table read consumed
+# the racer deletes id=1 — a DIFFERENT row (concurrent DV commit)
 statement ok con2
 DELETE FROM lake.main.t WHERE id = 1;
+
+# ROW-LEVEL rebase: the touched rows are disjoint → BOTH deletes land (was: deleteRead conflict)
+statement ok con1
+COMMIT;
+
+query IT
+SELECT id, name FROM lake.main.t ORDER BY id;
+----
+7	ins
+
+# the strict counterpart: under `serializable` the same shape still conflicts at file level
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_codec' AS serlake2 (TYPE arrownet, PROVIDER 'delta', isolation_level 'serializable');
+
+statement ok
+INSERT INTO lake.main.t VALUES (901, 'ser'), (902, 'ser2');
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+DELETE FROM serlake2.main.t WHERE id % 1000 = 901;
+
+statement ok con2
+DELETE FROM lake.main.t WHERE id = 902;
 
 statement error con1
 COMMIT;
 ----
 transaction conflict
 
-# con1 rolled back (id 50 intact); con2's delete won
-query IT
-SELECT id, name FROM lake.main.t ORDER BY id;
-----
-7	ins
-50	racer
+statement ok
+DETACH serlake2;
+
+statement ok
+DELETE FROM lake.main.t WHERE id = 901;
 
 # restore the section-entry state for the sections below
 statement ok
@@ -547,6 +573,9 @@ INSERT INTO lake.main.t VALUES (1, 'pre');
 
 statement ok
 INSERT INTO lake.main.t VALUES (3, 'mix');
+
+statement ok
+INSERT INTO lake.main.t VALUES (50, 'racer');
 
 query IT
 SELECT id, name FROM lake.main.t ORDER BY id;

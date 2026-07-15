@@ -3229,7 +3229,13 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   Verified: 4 parallel processes appending 200 rows each to ONE local Delta table → 800/800 distinct, no lost
   commits, no surfaced conflicts.
   **EXPLICIT TRANSACTIONS — SNAPSHOT-ISOLATED, BUFFERED (slices 1–4, 2026-07-07). Consolidated
-  semantics reference (modes × paths × isolation, rebase checks, guards, multi-writer by storage):
+  semantics reference (modes × paths × isolation, rebase checks, guards, multi-writer by storage
+  + §10 Databricks-comparison SQL scenarios — repeatable reads + atomic multi-statement + true
+  ROLLBACK are OUR advantages over classic Databricks/Spark [no multi-statement txns there,
+  snapshot per QUERY]; Databricks' advantages = row-level concurrency [DBR 14.3+, DV-based
+  same-file disjoint-row DML — we conflict at FILE level like OSS Spark] and the
+  `delta.isolationLevel` TABLE property [we only honor the per-catalog ATTACH option — follow-up:
+  read the property as the per-table default]):
   [docs/delta-transactions.md](docs/delta-transactions.md).** The engineered-wood
   Delta provider buffers a DuckDB transaction's writes per (txn, table) (`DeltaTxnBuffer`, keyed by the v35
   `AmbientTransaction` id) and flushes at COMMIT as **ONE atomic Delta commit per table** (Delta has no
@@ -3294,7 +3300,32 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   Two-connection racer tests pin all outcomes: append→rebase-success (both changes land), same-file
   delete/delete→abort, concurrent ALTER→abort, serializable+predicate-matching append→abort,
   serializable+non-matching append→rebase-success (stats exclude), whole-table-read (unpushable WHERE) +
-  concurrent delete of an unmodified file→deleteRead abort. **IDEMPOTENT APPENDS (2026-07-11) — Delta
+  concurrent delete of an unmodified file→deleteRead abort. **ROW-LEVEL CONCURRENCY v1 (2026-07-14,
+  Databricks-style — OSS Spark/delta-rs/kernel are all FILE-level): concurrent DML touching the SAME
+  FILE no longer conflicts when the touched ROWS are disjoint** (under `write_serializable` only;
+  `serializable` keeps strict file-level checks; DV tables only — CoW rewrites can't reconcile, so
+  the `deletion_vectors false` PolyBase recipe keeps file conflicts). Mechanism = EW
+  **`RebaseDvDmlActionsAsync`**: the loser's DV remove+add pairs re-target onto the LATEST snapshot —
+  path must still be active (a concurrent OPTIMIZE/CoW rewrite stays a conflict; v2 idea = row-id
+  remap across rewrites via `__delta_row_id`), OUR newly-deleted positions must be DISJOINT from the
+  concurrent deletions (absolute in-file positions are stable across DV swaps — same-row overlap ⇒
+  "row-level conflict on file … N row(s) … concurrently deleted or updated"), then remove(path,
+  currentDV) + add(path, currentDV ∪ ours); post-image adds re-derive baseRowId/version + the HWM
+  action from the target snapshot. Wired THREE places: the buffered-flush retry loop (rebases per
+  attempt; `CheckLogicalRebaseAsync(rowLevelDml:)` relaxes deleteRead for still-active paths +
+  concurrentAppend for swap re-adds — so a txn that READ a file concurrently DV-swapped no longer
+  aborts) + BOTH autocommit DML paths (`DeleteByRowIdsViaVectorsAsync`/`UpdateByRowIdsAsync` gained
+  `rowLevelRetry` — a bounded reload+rebase+retry loop replaces the old "retry the statement" error).
+  BEYOND Databricks: works on PARTITIONED tables and inside multi-statement transactions (theirs is
+  unpartitioned + per-statement). Semantics note: position-targeted DML can't produce write skew
+  (SET values derive only from the matched row), so the relaxation is serial-equivalent. Transactions
+  §6e REWRITTEN (the old whole-table-read deleteRead abort now COMMITS — both deletes land — with a
+  `serializable` strict counterpart pinned; suite 941); `test/verify_delta_row_level_concurrency.test`
+  (49 — same-file disjoint DELETE/UPDATE compose, same-row conflicts, buffered UPDATE post-image
+  rebases + keeps row-tracking id, OPTIMIZE-during conflicts, serializable strict, three-writer
+  pile-up); kernel reads the rebased commits exactly; dv 48 / dv_default 58 / update 63 / delete 28 /
+  changes 73 / row_tracking_virtual 299 / txn_version 51 / optimize 40 + EW 168 & 147 (all TFMs)
+  green. Semantics doc: docs/delta-transactions.md §6 + §10.4 (now PARITY+). **IDEMPOTENT APPENDS (2026-07-11) — Delta
   APPLICATION TRANSACTIONS (the `txn` action; duckdb-delta/Spark txnAppId parity, additive metadata kinds
   10/11 — NO ABI bump):** `CALL arrownet_delta_set_transaction_version(catalog, 'schema.table', app_id,
   version [, expected_previous])` PARKS the version on the current EXPLICIT transaction

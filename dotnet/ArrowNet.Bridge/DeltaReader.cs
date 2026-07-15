@@ -495,9 +495,11 @@ internal static class DeltaReader
     // A rowid DELETE/UPDATE cannot be safely retried on a commit conflict: its absolute positions were computed
     // against the scanned snapshot, which a concurrent writer has changed. Surface a clear, retryable-by-the-user
     // error instead (re-running re-scans and recomputes the rowids).
-    private static System.InvalidOperationException ConcurrentModification(string op) =>
-        new($"delta: concurrent modification during {op} — another writer committed; the row positions are no "
-            + "longer valid. Retry the statement.");
+    private static System.InvalidOperationException ConcurrentModification(
+        string op, DeltaConflictException? detail = null) =>
+        new($"delta: concurrent modification during {op} — another writer committed"
+            + (detail is not null ? $" ({detail.Message})" : "; the row positions are no longer valid")
+            + ". Retry the statement.");
 
     /// <summary>True if the Delta table at <paramref name="path"/> has <c>delta.enableDeletionVectors=true</c>
     /// — DELETE then uses deletion vectors (no file rewrite) instead of copy-on-write.</summary>
@@ -646,17 +648,18 @@ internal static class DeltaReader
     /// <summary>DELETE via deletion vectors (no file rewrite) — for tables with deletion vectors enabled.
     /// <paramref name="rowIds"/> are ABSOLUTE transient rowids. Returns rows deleted.</summary>
     public static long DeleteByRowIdsViaVectors(nint opener, string path, IReadOnlyCollection<long> rowIds,
-                                                CancellationToken ct)
+                                                CancellationToken ct, bool rowLevelRetry = false)
     {
         var fs = TableFileSystems.Create(opener, path);
         var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).AsTask().GetAwaiter().GetResult();
         try
         {
-            return table.DeleteByRowIdsViaVectorsAsync(rowIds, ct).AsTask().GetAwaiter().GetResult().RowsDeleted;
+            return table.DeleteByRowIdsViaVectorsAsync(rowIds, ct, rowLevelRetry: rowLevelRetry)
+                .AsTask().GetAwaiter().GetResult().RowsDeleted;
         }
-        catch (DeltaConflictException)
+        catch (DeltaConflictException ex)
         {
-            throw ConcurrentModification("DELETE");
+            throw ConcurrentModification("DELETE", ex);
         }
         finally
         {
@@ -1144,7 +1147,8 @@ internal static class DeltaReader
     /// them as plain remove+add with a clean schema. Opens with the standard write options (path_in_schema).</summary>
     public static void UpdateByRowIds(nint opener, string path, IReadOnlyCollection<long> rowIds,
         System.Func<long, IReadOnlyList<RecordBatch>, IReadOnlyList<RecordBatch>> rewriteFile, CancellationToken ct,
-        bool nativeWrite = false, IDataFileRewriter? rewriter = null, bool nativeRead = false)
+        bool nativeWrite = false, IDataFileRewriter? rewriter = null, bool nativeRead = false,
+        bool rowLevelRetry = false)
     {
         var fs = TableFileSystems.Create(opener, path);
         // native_write => DuckDB's parquet writer produces the rewritten file (bloom/stats/footer) AND, when the
@@ -1183,14 +1187,15 @@ internal static class DeltaReader
                     return inner(ordinal, logical);
                 };
             }
-            table.UpdateByRowIdsAsync(rowIds, rewriteFile, ct).AsTask().GetAwaiter().GetResult();
+            table.UpdateByRowIdsAsync(rowIds, rewriteFile, ct, rowLevelRetry: rowLevelRetry)
+                .AsTask().GetAwaiter().GetResult();
             DmlLog.LogInformation("delta update-rewrite {Path}: rowids={RowIds} writer={Writer} rewriter={Rewriter}",
                 path, rowIds.Count, writer is null ? "engineered-wood" : "native-duckdb",
                 rewriter is null ? "engineered-wood" : "native-duckdb");
         }
-        catch (DeltaConflictException)
+        catch (DeltaConflictException ex)
         {
-            throw ConcurrentModification("UPDATE");
+            throw ConcurrentModification("UPDATE", ex);
         }
         finally
         {

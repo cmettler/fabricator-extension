@@ -2773,10 +2773,10 @@ public sealed class DeltaCatalog : IBackendCatalog
             // The buffered schema change (metaData + merged protocol upgrade) joins the SAME commit.
             // Eagerly-generated identity high-water marks compose INTO that metaData action (a commit
             // must not carry two metaData actions) — or form their own when there is no buffered ALTER.
-            var extra = new List<EngineeredWood.DeltaLake.Actions.DeltaAction>();
+            var baseExtra = new List<EngineeredWood.DeltaLake.Actions.DeltaAction>();
             if (pending.PendingProtocol is { } proto)
             {
-                extra.Add(proto);
+                baseExtra.Add(proto);
             }
             var metaAction = pending.PendingMetadata;
             if (pending.PendingIdentityHwm.Count > 0)
@@ -2785,26 +2785,25 @@ public sealed class DeltaCatalog : IBackendCatalog
             }
             if (metaAction is { } meta)
             {
-                extra.Add(meta);
+                baseExtra.Add(meta);
             }
             // slice C2: the eagerly-written _change_data files join the fused commit (cdc actions carry
             // DataChange=false — concurrent readers' dataChange checks ignore them; rebase safety: if the
             // rebase passes, delete-delete/deleteRead already guaranteed our touched files are unchanged,
             // so the captured CDC content stays exact).
-            extra.AddRange(pending.PendingCdc);
+            baseExtra.AddRange(pending.PendingCdc);
             // Application-transaction versions (idempotent appends): one `txn` action per app, committed
             // ATOMICALLY with the fused commit; the CAS against the LATEST snapshot runs in the retry loop.
             long nowMs = System.DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             foreach (var kv in pending.AppTxnVersions)
             {
-                extra.Add(new EngineeredWood.DeltaLake.Actions.TransactionId
+                baseExtra.Add(new EngineeredWood.DeltaLake.Actions.TransactionId
                 {
                     AppId = kv.Key,
                     Version = kv.Value.Version,
                     LastUpdated = nowMs,
                 });
             }
-            extra.AddRange(dvActions);
             int kinds = (pending.HasAppend ? 1 : 0) + (pending.HasDelete ? 1 : 0) + (pending.HasUpdate ? 1 : 0)
                         + (pending.HasAlter ? 1 : 0);
             string operation = kinds > 1 ? "TRANSACTION"
@@ -2824,6 +2823,32 @@ public sealed class DeltaCatalog : IBackendCatalog
             // re-validate, retry (bounded).
             for (int attempt = 1; ; attempt++)
             {
+                // ROW-LEVEL CONCURRENCY (write_serializable): when the table advanced, re-target the DV
+                // remove+add pairs onto the LATEST snapshot — a concurrent DV swap of the same file
+                // re-unions when the touched rows are DISJOINT (Databricks-style; same-row / rewrite
+                // conflicts throw). Under serializable the strict file-level delete-delete check applies
+                // to the pinned-resolved pairs unchanged.
+                var currentDv = dvActions;
+                if (dvActions.Count > 0 && !_serializable && table.CurrentSnapshot.Version != pinned)
+                {
+                    try
+                    {
+                        currentDv = table.RebaseDvDmlActionsAsync(dvActions, deletes, pinnedSnap,
+                                table.CurrentSnapshot)
+                            .AsTask().GetAwaiter().GetResult();
+                    }
+                    catch (EngineeredWood.DeltaLake.DeltaConflictException ex)
+                    {
+                        throw new System.InvalidOperationException(
+                            $"delta transaction conflict on '{tablePath}': the table moved from version "
+                            + $"{pinned} to {table.CurrentSnapshot.Version} while the transaction was open and "
+                            + $"the concurrent changes do not commute ({ex.Message}) — the transaction is "
+                            + "rolled back; retry it.");
+                    }
+                }
+                var extra = new List<EngineeredWood.DeltaLake.Actions.DeltaAction>(baseExtra.Count + currentDv.Count);
+                extra.AddRange(baseExtra);
+                extra.AddRange(currentDv);
                 // Application-transaction CAS (idempotent appends): validated against the LATEST snapshot
                 // on every attempt — a retried batch whose first attempt actually landed finds the app's
                 // version already advanced and fails HERE instead of duplicating data.
@@ -2852,7 +2877,8 @@ public sealed class DeltaCatalog : IBackendCatalog
                         table.CheckLogicalRebaseAsync(pinnedSnap, extra,
                                 readPredicates: pending.ReadPredicates,
                                 readWholeTable: pending.ReadWholeTable,
-                                serializable: _serializable)
+                                serializable: _serializable,
+                                rowLevelDml: !_serializable)
                             .AsTask().GetAwaiter().GetResult();
                     }
                     catch (EngineeredWood.DeltaLake.DeltaConflictException ex)
@@ -3029,8 +3055,10 @@ public sealed class DeltaCatalog : IBackendCatalog
         _log.LogInformation("delta delete {Schema}.{Table}: rows={Rows} mode={Mode} native_write={Native}",
             schemaName, tableName, ids.Count, dvMode ? "deletion-vector" : "copy-on-write",
             !dvMode && _nativeWrite);
+        // rowLevelRetry: Databricks-style ROW-LEVEL CONCURRENCY (write_serializable only) — a concurrent
+        // DV swap of the same file re-unions instead of conflicting when the touched rows are disjoint.
         return dvMode
-            ? DeltaReader.DeleteByRowIdsViaVectors(opener, path, ids, default)
+            ? DeltaReader.DeleteByRowIdsViaVectors(opener, path, ids, default, rowLevelRetry: !_serializable)
             : DeltaReader.DeleteByRowIds(opener, path, ids, default, _nativeWrite, _nativeRead);
     }
 
@@ -3291,7 +3319,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 outBatches.Add(new RecordBatch(userSchema, newCols, batch.Length));
             }
             return outBatches;
-        }, default, _nativeWrite, rewriter, _nativeRead);
+        }, default, _nativeWrite, rewriter, _nativeRead, rowLevelRetry: !_serializable);
 
         _log.LogInformation("delta update {Schema}.{Table}: rows={Rows} set_cols={SetCols} native_write={Native}",
             schemaName, tableName, updates.Count, setColNames.Count, _nativeWrite);

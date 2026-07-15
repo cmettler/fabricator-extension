@@ -1,0 +1,190 @@
+# name: test/verify_delta_row_level_concurrency.test
+# description: ROW-LEVEL CONCURRENCY (v1, Databricks-style — beyond OSS Spark's file-level conflicts):
+#              concurrent DML touching the SAME FILE no longer conflicts when the touched ROWS are
+#              disjoint — the COMMIT rebase re-unions the deletion vectors (RebaseDvDmlActionsAsync);
+#              the SAME row modified by both writers is a row-level conflict; a concurrent
+#              rewrite/compaction of a touched file remains a (path-level) conflict in v1. Applies under
+#              write_serializable (the default); `serializable` keeps the strict file-level checks.
+#              DV tables only (copy-on-write rewrites can't reconcile). Set ARROWNET_DELTA_WRITE_DIR.
+# group: [mssql_net]
+
+require mssql_net
+
+require parquet
+
+require-env ARROWNET_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/rowlevel' AS rl (TYPE arrownet, PROVIDER 'delta');
+
+# ONE file with rows 1..10 (single INSERT ⇒ single parquet) — every scenario below targets THIS file.
+statement ok
+CREATE TABLE rl.main.t AS SELECT r AS id, 'v' || r AS s FROM range(1, 11) t(r);
+
+# ---- 1. concurrent DELETEs, SAME file, DIFFERENT rows → both land (was: delete/delete abort) ----
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+DELETE FROM rl.main.t WHERE id = 2;
+
+# the racer's autocommit DV delete swaps the SAME file's deletion vector under con1
+statement ok con2
+DELETE FROM rl.main.t WHERE id = 4;
+
+statement ok con1
+COMMIT;
+
+query II
+SELECT count(*), sum(id) FROM rl.main.t;
+----
+8	49
+
+# ---- 2. the SAME row deleted by both → row-level conflict ----
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+DELETE FROM rl.main.t WHERE id = 6;
+
+statement ok con2
+DELETE FROM rl.main.t WHERE id = 6;
+
+statement error con1
+COMMIT;
+----
+row-level conflict
+
+# con2's delete won; con1 rolled back — id 6 deleted exactly once
+query II
+SELECT count(*), sum(id) FROM rl.main.t;
+----
+7	43
+
+# ---- 3. buffered UPDATE vs concurrent DELETE, same file, disjoint rows → both land;
+#         the UPDATE's row keeps its stable row-tracking id (post-image rebased) ----
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+UPDATE rl.main.t SET s = 'updated' WHERE id = 8;
+
+statement ok con2
+DELETE FROM rl.main.t WHERE id = 9;
+
+statement ok con1
+COMMIT;
+
+query IT
+SELECT id, s FROM rl.main.t WHERE id IN (8, 9);
+----
+8	updated
+
+query II
+SELECT count(*), sum(id) FROM rl.main.t;
+----
+6	34
+
+# ---- 4. UPDATE vs UPDATE of the SAME row → row-level conflict ----
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+UPDATE rl.main.t SET s = 'A' WHERE id = 10;
+
+statement ok con2
+UPDATE rl.main.t SET s = 'B' WHERE id = 10;
+
+statement error con1
+COMMIT;
+----
+row-level conflict
+
+# the first committer's value survives; no lost update
+query T
+SELECT s FROM rl.main.t WHERE id = 10;
+----
+B
+
+# ---- 5. a concurrent OPTIMIZE (file rewritten away) remains a conflict in v1 ----
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+DELETE FROM rl.main.t WHERE id = 1;
+
+query I con2
+SELECT mssql_net_exec('rl', 'OPTIMIZE main.t');
+----
+0
+
+statement error con1
+COMMIT;
+----
+transaction conflict
+
+query I
+SELECT count(*) FROM rl.main.t WHERE id = 1;
+----
+1
+
+# ---- 6. `serializable` keeps the STRICT file-level behavior (disjoint rows still conflict) ----
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/rowlevel' AS rlser (TYPE arrownet, PROVIDER 'delta', isolation_level 'serializable');
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+DELETE FROM rlser.main.t WHERE id = 3;
+
+statement ok con2
+DELETE FROM rl.main.t WHERE id = 5;
+
+statement error con1
+COMMIT;
+----
+transaction conflict
+
+# only the racer's delete applied
+query II
+SELECT count(*), sum(id) FROM rl.main.t;
+----
+5	29
+
+statement ok
+DETACH rlser;
+
+# ---- 7. three-writer pile-up: two racers land during the buffered txn, all three compose ----
+
+statement ok
+CREATE TABLE rl.main.p AS SELECT r AS id FROM range(1, 21) t(r);
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+DELETE FROM rl.main.p WHERE id = 10;
+
+statement ok con2
+DELETE FROM rl.main.p WHERE id = 11;
+
+statement ok con2
+DELETE FROM rl.main.p WHERE id = 12;
+
+statement ok con1
+COMMIT;
+
+query II
+SELECT count(*), sum(id) FROM rl.main.p;
+----
+17	177
+
+statement ok
+DETACH rl;
