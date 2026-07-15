@@ -94,8 +94,19 @@ converted; OneLakeForwardFs conformant) — verified the FULL delta sweep green 
 DeltaReader+EW-variant-fix / `382eda2` DeltaCatalog helpers / `a2fdb98` DeltaWriter / `97ca5f8` DeltaCatalog
 orchestrators+stream-loops / + this final `ReadValues`). Any remaining `.GetAwaiter().GetResult()` in the Delta bridge
 is now a single-blocking-point sync wrapper, not a per-await site. The ambient-loss landmine stays disarmed
-(AsyncLocal, `0533eb7`). Adopt the sync-wrapper→async-core shape for NEW code now. (The SQL Server / DAX bridges'
-sync-over-async, if any, stay the same incremental convention when next touched — they were never the Delta hot path.)
+(AsyncLocal, `0533eb7`). Adopt the sync-wrapper→async-core shape for NEW code now.
+**Whole-codebase scan (2026-07-15) — the anti-pattern was DELTA-ONLY; nothing else needs converting:** a sweep of
+every bridge assembly found the deeply-async-blocked-at-every-await anti-pattern existed ONLY in the Delta/EW bridge
+(now done). The rest are NOT the anti-pattern and should be LEFT ALONE (converting is zero-value churn — no deadlock
+risk since the hostfxr CLR has no `SynchronizationContext`, and the sync backend work dominates the thread anyway):
+**`SqlServerBackend`** uses SYNC `Microsoft.Data.SqlClient` (38 sync `Execute*`/`WriteToServer`, 0 async) — its only
+async touchpoints are Arrow C-stream boundary reads (`ReadNextRecordBatchAsync`), already block-once-per-batch in
+otherwise-synchronous methods (e.g. `ExecuteScalar`'s loop body is a pure-sync `fn.Invoke`); **DAX/`Fabricator.AnalysisServices`**
+is sync ADOMD (`ExecuteReader`, 0 async); **`Fabricator.DeltaRs`** already routes its delta-dotnet async ops through a
+`Run()`/`Run<T>()` block-once helper (15 uses); **`FabricLakehouse`** uses proper wrapper→core + single-await block-once;
+**`BulkSession`/`Bootstrap`** are single-await ABI-marshaling handlers (block-once). So the RAW `.GetAwaiter().GetResult()`
+grep counts across the bridges are now ALL either single-blocking-point sync wrappers or already-conformant
+Arrow-boundary reads — do NOT treat a nonzero count as remaining work. The sync-over-async initiative is DONE.
 
 **Rename-scope gap FIXED en route (2026-07-15):** the FABRICATOR rename (`2a26b7a`) renamed the C++ variant marker
 `kVariantExtensionName` → `"fabricator.variant"` but engineered-wood (a SIBLING repo, out of the blanket rename's
