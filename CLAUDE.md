@@ -1841,16 +1841,23 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   (`DeltaReader.Stream`/`StreamWithRowIds`/`StreamAt`/`StreamWithRowIdsAt` → their `*Impl` cores now take the
   opener, build an `InterruptScope`, and pass its token to `DeltaTable.OpenAsync`/`ReadAllAsync*` — EW already
   honors it, so a long OneLake/S3 batch read cancels between chunks). A never-tripped token is BYTE-NEUTRAL
-  (full delta sweep + SQL fn suites green at v65). **Remaining tiers (deferred, in the doc): Tier 2** —
-  convert `SqlServerBackend`'s hot scan/DML sites to **async SqlClient + token** (`ExecuteReaderAsync`/
-  `ReadAsync`/`ExecuteNonQueryAsync`; the token cancels natively — Microsoft's model, no `SqlCommand.Cancel()`
-  trick) and **`SqlBulkCopy` via the reader-throw** (feed `ArrowDataReader` the token → `ChannelArrowStream.
-  ReadNextRecordBatchAsync(ct)` → `WaitToReadAsync(ct)` throws out of `WriteToServer`, the mechanism
-  `BulkSession.Abort()` already proves — no `WriteToServerAsync` needed) + an optional `command_timeout`
-  setting (`CancelAfter`, closing the hung-socket hole); **Tier 3** — DAX/ADOMD via `AdomdCommand.Cancel()`
-  (no usable async); **Tier 4** — the arrow scan as a DuckDB async/BLOCKED source (`InterruptState`) to free
-  the task thread during I/O (native interrupt + better parallelism, bigger). Live Ctrl+C behavior is a
-  MANUAL check (a slow OneLake/SQL query + interrupt); the suites verify only behavior-neutrality.
+  (full delta sweep + SQL fn suites green at v65). **Tier 2 SQL Server DONE (2a `4d33f68` + 2b `6e952f6`,
+  C#-only):** the two long-running SQL windows now cancel. **2a — data scan:** `ExecuteQuery` uses
+  `OpenAsync`/`ExecuteReaderAsync(token)` + `DbDataReaderArrowStream` fetches with `ReadAsync(token)` (async
+  SqlClient honors the token natively — Microsoft's model, no `SqlCommand.Cancel()` trick; the stream owns the
+  `InterruptScope`; gated to data scans, short metadata reads stay uncancelled). **2b — bulk (INSERT/CTAS/COPY):**
+  `BulkSession` builds an `InterruptScope(opener)` + `token.Register`s its existing `Complete(abort)` teardown
+  (fault the channel → `WriteToServer` stops + rolls back AND a backpressure-parked `push_batch` unblocks — no
+  `WriteToServerAsync` needed); works for SQL bulk AND Delta streaming writes. **Load-bearing constraint found:**
+  `is_interrupted` derefs the opener as a `ClientContext*` and `AmbientOpener` is NEVER cleared, so interrupt
+  polling is only safe where the opener is set FRESH right before the op — the scan (`arrow_ingest`) and bulk
+  (`fabricator_insert`) do; **the DELETE/UPDATE modify operator does NOT set the opener**, so 2a/2b are safe but
+  **2c (DML async) must first add a `SetActiveOpener(&context)` to the modify operator** (C++, no ABI bump) — deferred
+  (DML is usually fast; lower value; `fabricator_exec` already has a fresh opener if wanted). **Remaining (deferred):
+  2c** DML async + **2d** `command_timeout` (`CancelAfter`, closes the hung-socket hole); **Tier 3** DAX/ADOMD via
+  `AdomdCommand.Cancel()` (no usable async); **Tier 4** the arrow scan as a DuckDB async/BLOCKED source
+  (`InterruptState`) to free the task thread during I/O (native interrupt + better parallelism, bigger). Live Ctrl+C
+  behavior is a MANUAL check (a slow OneLake/SQL query + interrupt); the suites verify only behavior-neutrality.
   **STALE-BINARY:** the ABI bump v64→v65 means the loadable + linux payload (last built at v64) are now
   ABI-mismatched — rebuild `fabricator_loadable_extension` (+ the linux payload) before the next dbt/notebook
   run, else `Bootstrap.Initialize returned … ABI version mismatch`.)

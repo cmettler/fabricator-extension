@@ -82,6 +82,30 @@ cancelled SqlClient command can leave its connection unusable — fine for poole
 drops it) and correct for the pinned-transaction connection (a cancelled query is aborting the txn anyway),
 but such a connection must be disposed, not reused.
 
+## As built
+
+- **Tier 1 (commit `8daac29`, ABI v65):** `is_interrupted(opener)` host callback + `InterruptScope` (CTS +
+  50 ms `Timer` poller; `Dispose` waits out the in-flight callback). Wired into the engineered-wood streaming
+  reads (`DeltaReader.Stream`/`StreamWithRowIds`/`StreamAt`/`StreamWithRowIdsAt`).
+- **Tier 2a (commit `4d33f68`) — SQL data scan:** `ExecuteQuery` uses `OpenAsync`/`ExecuteReaderAsync(token)`
+  and `DbDataReaderArrowStream` fetches with `ReadAsync(token)`; the stream owns the `InterruptScope`. Gated to
+  data scans (`!readYourWrites`) — short metadata reads stay uncancelled.
+- **Tier 2b (commit `6e952f6`) — bulk write (INSERT/CTAS/COPY):** `BulkSession` builds an `InterruptScope(opener)`
+  and `token.Register`s its existing `Complete(abort)` teardown — faulting the channel stops `WriteToServer` +
+  unblocks a backpressure-parked `push_batch`. Works for SQL bulk *and* Delta streaming writes.
+
+### The opener-freshness constraint (load-bearing)
+
+`is_interrupted` dereferences the opener as a `ClientContext*`, and **`AmbientOpener` is never cleared** (no
+`SetActiveOpener(0)`), so `AmbientOpener.Current` retains the last value set on the thread. Interrupt polling is
+therefore only safe where the opener was **freshly set right before** the operation — which is exactly the scan
+(`arrow_ingest` `SetActiveOpener(&context)` before the scan factory / init) and the bulk (`fabricator_insert.cpp`
+before `begin_bulk`). Both 2a and 2b capture a fresh opener, so they never poll a stale pointer. **The DELETE/UPDATE
+(modify) operator does NOT call `SetActiveOpener`**, so capturing `AmbientOpener.Current` there would poll a stale
+(possibly freed) context — 2c must not do that without first adding a `SetActiveOpener(&context)` to the modify
+operator (a C++ change; no ABI bump — the vtable is unchanged). `fabricator_exec` DOES set a fresh opener
+(`fabricator_extension.cpp:501`), so a raw-exec cancellation is safe if wanted.
+
 ## Tiers
 
 - **Tier 1 (this effort) — token source + wire the token-native paths.** `is_interrupted` host callback +
