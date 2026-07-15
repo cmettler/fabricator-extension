@@ -11,18 +11,18 @@
 #              excludes them. Autocommit is UNCHANGED (per-statement commits, direct DML paths incl. CDF +
 #              copy-on-write). Guards: DDL/maintenance/non-append writes with pending changes; DML on rows
 #              inserted in the same transaction; DV-off / CDF tables inside explicit transactions.
-# group: [mssql_net]
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
-require-env ARROWNET_DELTA_WRITE_DIR
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 # ============================================================================
 # 1. Codec catalog: atomic multi-INSERT + rollback (slice 1)
 # ============================================================================
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_codec' AS lake (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS lake (TYPE fabricator, PROVIDER 'delta');
 
 statement ok
 CREATE TABLE lake.main.t (id INTEGER, name VARCHAR);
@@ -32,7 +32,7 @@ INSERT INTO lake.main.t VALUES (1, 'pre');
 
 # Baseline: v0 CREATE + v1 WRITE.
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('lake', 't');
+SELECT count(*) FROM fabricator_delta_snapshots('lake', 't');
 ----
 2
 
@@ -77,7 +77,7 @@ SELECT count(*) FROM lake.main.t;
 
 # ...as ONE new Delta commit (2 snapshots before, exactly 3 after — not 5).
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('lake', 't');
+SELECT count(*) FROM fabricator_delta_snapshots('lake', 't');
 ----
 3
 
@@ -101,7 +101,7 @@ SELECT count(*) FROM lake.main.t;
 5
 
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('lake', 't');
+SELECT count(*) FROM fabricator_delta_snapshots('lake', 't');
 ----
 3
 
@@ -139,7 +139,7 @@ SELECT count(*) FROM lake.main.t;
 5
 
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('lake', 't');
+SELECT count(*) FROM fabricator_delta_snapshots('lake', 't');
 ----
 3
 
@@ -170,12 +170,12 @@ SELECT id, name FROM lake.main.t ORDER BY id;
 
 # Exactly ONE new Delta commit for both DELETEs, with operation DELETE.
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('lake', 't');
+SELECT count(*) FROM fabricator_delta_snapshots('lake', 't');
 ----
 4
 
 query T
-SELECT operation FROM arrownet_delta_snapshots('lake', 't') ORDER BY version DESC LIMIT 1;
+SELECT operation FROM fabricator_delta_snapshots('lake', 't') ORDER BY version DESC LIMIT 1;
 ----
 DELETE
 
@@ -220,12 +220,12 @@ SELECT id, name FROM lake.main.t ORDER BY id;
 
 # One commit for both UPDATEs, operation UPDATE.
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('lake', 't');
+SELECT count(*) FROM fabricator_delta_snapshots('lake', 't');
 ----
 5
 
 query T
-SELECT operation FROM arrownet_delta_snapshots('lake', 't') ORDER BY version DESC LIMIT 1;
+SELECT operation FROM fabricator_delta_snapshots('lake', 't') ORDER BY version DESC LIMIT 1;
 ----
 UPDATE
 
@@ -254,7 +254,7 @@ pre
 # ============================================================================
 
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('lake', 't');
+SELECT count(*) FROM fabricator_delta_snapshots('lake', 't');
 ----
 5
 
@@ -290,12 +290,12 @@ SELECT id, name FROM lake.main.t ORDER BY id;
 
 # ONE commit for all three statements, operation TRANSACTION (mixed kinds).
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('lake', 't');
+SELECT count(*) FROM fabricator_delta_snapshots('lake', 't');
 ----
 6
 
 query T
-SELECT operation FROM arrownet_delta_snapshots('lake', 't') ORDER BY version DESC LIMIT 1;
+SELECT operation FROM fabricator_delta_snapshots('lake', 't') ORDER BY version DESC LIMIT 1;
 ----
 TRANSACTION
 
@@ -460,7 +460,7 @@ ALTER TABLE lake.main.t DROP COLUMN extra;
 #     appended row). Under the default write_serializable the same append passes (6a). ---
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_codec' AS serlake (TYPE arrownet, PROVIDER 'delta', isolation_level 'serializable');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS serlake (TYPE fabricator, PROVIDER 'delta', isolation_level 'serializable');
 
 statement ok con1
 BEGIN;
@@ -542,7 +542,7 @@ SELECT id, name FROM lake.main.t ORDER BY id;
 
 # the strict counterpart: under `serializable` the same shape still conflicts at file level
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_codec' AS serlake2 (TYPE arrownet, PROVIDER 'delta', isolation_level 'serializable');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS serlake2 (TYPE fabricator, PROVIDER 'delta', isolation_level 'serializable');
 
 statement ok
 INSERT INTO lake.main.t VALUES (901, 'ser'), (902, 'ser2');
@@ -629,7 +629,7 @@ DELETE FROM lake.main.t WHERE id = 600;
 # ============================================================================
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_cow' AS cowlake (TYPE arrownet, PROVIDER 'delta', deletion_vectors false);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_cow' AS cowlake (TYPE fabricator, PROVIDER 'delta', deletion_vectors false);
 
 statement ok
 CREATE TABLE cowlake.main.c AS SELECT 1 AS i UNION ALL SELECT 2;
@@ -658,7 +658,7 @@ statement ok
 DETACH cowlake;
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_cdf' AS cdflake (TYPE arrownet, PROVIDER 'delta', change_data_feed true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_cdf' AS cdflake (TYPE fabricator, PROVIDER 'delta', change_data_feed true);
 
 statement ok
 CREATE TABLE cdflake.main.f AS SELECT 1 AS i UNION ALL SELECT 2;
@@ -673,12 +673,12 @@ DELETE FROM cdflake.main.f WHERE i = 1;
 
 # the cdc file is on storage before COMMIT, the log unmoved
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_cdf/f/_change_data/*.parquet');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_cdf/f/_change_data/*.parquet');
 ----
 1
 
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_cdf/f/_delta_log/*.json');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_cdf/f/_delta_log/*.json');
 ----
 2
 
@@ -692,7 +692,7 @@ SELECT count(*) FROM cdflake.main.f;
 2
 
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_cdf/f/_delta_log/*.json');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_cdf/f/_delta_log/*.json');
 ----
 2
 
@@ -769,7 +769,7 @@ statement ok
 DETACH lake;
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_codec' AS lake (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS lake (TYPE fabricator, PROVIDER 'delta');
 
 query I
 SELECT count(*) FROM lake.main.u;
@@ -793,7 +793,7 @@ DETACH lake;
 # ============================================================================
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_native' AS nlake (TYPE arrownet, PROVIDER 'delta', native_write true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_native' AS nlake (TYPE fabricator, PROVIDER 'delta', native_write true);
 
 statement ok
 CREATE TABLE nlake.main.nt (id INTEGER, grp VARCHAR);
@@ -843,7 +843,7 @@ upd
 
 # CREATE (v0) + seed INSERT (v1) + ONE fused transaction commit (v2).
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('nlake', 'nt');
+SELECT count(*) FROM fabricator_delta_snapshots('nlake', 'nt');
 ----
 3
 
@@ -883,7 +883,7 @@ DETACH nlake;
 # ============================================================================
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_nread' AS rlake (TYPE arrownet, PROVIDER 'delta', native_write true, native_read true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_nread' AS rlake (TYPE fabricator, PROVIDER 'delta', native_write true, native_read true);
 
 statement ok
 CREATE TABLE rlake.main.rt (id INTEGER, name VARCHAR);
@@ -930,7 +930,7 @@ SELECT id, name FROM rlake.main.rt ORDER BY id;
 
 # CREATE + seed + one fused commit.
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('rlake', 'rt');
+SELECT count(*) FROM fabricator_delta_snapshots('rlake', 'rt');
 ----
 3
 
@@ -942,10 +942,10 @@ DETACH rlake;
 # ============================================================================
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_codec' AS alake (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS alake (TYPE fabricator, PROVIDER 'delta');
 
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('alake', 'u');
+SELECT count(*) FROM fabricator_delta_snapshots('alake', 'u');
 ----
 2
 
@@ -953,7 +953,7 @@ statement ok
 INSERT INTO alake.main.u VALUES (40);
 
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('alake', 'u');
+SELECT count(*) FROM fabricator_delta_snapshots('alake', 'u');
 ----
 3
 
@@ -962,12 +962,12 @@ statement ok
 DELETE FROM alake.main.u WHERE v = 10;
 
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('alake', 'u');
+SELECT count(*) FROM fabricator_delta_snapshots('alake', 'u');
 ----
 4
 
 query T
-SELECT operation FROM arrownet_delta_snapshots('alake', 'u') ORDER BY version DESC LIMIT 1;
+SELECT operation FROM fabricator_delta_snapshots('alake', 'u') ORDER BY version DESC LIMIT 1;
 ----
 DELETE
 
@@ -984,7 +984,7 @@ DETACH alake;
 # ============================================================================
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_codec' AS dlake (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS dlake (TYPE fabricator, PROVIDER 'delta');
 
 statement ok
 CREATE TABLE dlake.main.a (id INTEGER, name VARCHAR);
@@ -993,7 +993,7 @@ statement ok
 INSERT INTO dlake.main.a VALUES (1, 'x'), (2, 'y');
 
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('dlake', 'a');
+SELECT count(*) FROM fabricator_delta_snapshots('dlake', 'a');
 ----
 2
 
@@ -1040,12 +1040,12 @@ SELECT id, name, extra FROM dlake.main.a ORDER BY id;
 
 # ALTER + INSERT + DELETE all landed as ONE Delta commit (metaData + add + DV actions).
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('dlake', 'a');
+SELECT count(*) FROM fabricator_delta_snapshots('dlake', 'a');
 ----
 3
 
 query T
-SELECT operation FROM arrownet_delta_snapshots('dlake', 'a') ORDER BY version DESC LIMIT 1;
+SELECT operation FROM fabricator_delta_snapshots('dlake', 'a') ORDER BY version DESC LIMIT 1;
 ----
 TRANSACTION
 
@@ -1083,7 +1083,7 @@ SELECT count(*) FROM dlake.main.a;
 2
 
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('dlake', 'a');
+SELECT count(*) FROM fabricator_delta_snapshots('dlake', 'a');
 ----
 3
 
@@ -1126,7 +1126,7 @@ SELECT id, c1, c2 FROM dlake.main.a ORDER BY id;
 
 # Still ONE commit for both ALTERs + INSERT + UPDATE.
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('dlake', 'a');
+SELECT count(*) FROM fabricator_delta_snapshots('dlake', 'a');
 ----
 4
 
@@ -1190,7 +1190,7 @@ DETACH dlake;
 # ============================================================================
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_nread' AS xlake (TYPE arrownet, PROVIDER 'delta', native_write true, native_read true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_nread' AS xlake (TYPE fabricator, PROVIDER 'delta', native_write true, native_read true);
 
 statement ok
 CREATE TABLE xlake.main.xt (id INTEGER, name VARCHAR);
@@ -1234,7 +1234,7 @@ SELECT id, name, score FROM xlake.main.xt ORDER BY id;
 
 # CREATE + seed + one fused ALTER+INSERT+DELETE commit.
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('xlake', 'xt');
+SELECT count(*) FROM fabricator_delta_snapshots('xlake', 'xt');
 ----
 3
 
@@ -1246,7 +1246,7 @@ DETACH xlake;
 # ============================================================================
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_codec' AS elake (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS elake (TYPE fabricator, PROVIDER 'delta');
 
 statement ok
 CREATE TABLE elake.main.r (id INTEGER, val VARCHAR);
@@ -1291,12 +1291,12 @@ SELECT id, title FROM elake.main.r ORDER BY id;
 
 # CREATE + seed + ONE fused RENAME+INSERT+DELETE commit.
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('elake', 'r');
+SELECT count(*) FROM fabricator_delta_snapshots('elake', 'r');
 ----
 3
 
 query T
-SELECT operation FROM arrownet_delta_snapshots('elake', 'r') ORDER BY version DESC LIMIT 1;
+SELECT operation FROM fabricator_delta_snapshots('elake', 'r') ORDER BY version DESC LIMIT 1;
 ----
 TRANSACTION
 
@@ -1376,12 +1376,12 @@ SELECT title FROM elake.main.r;
 title
 
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('elake', 'r');
+SELECT count(*) FROM fabricator_delta_snapshots('elake', 'r');
 ----
 4
 
 query T
-SELECT operation FROM arrownet_delta_snapshots('elake', 'r') ORDER BY version DESC LIMIT 1;
+SELECT operation FROM fabricator_delta_snapshots('elake', 'r') ORDER BY version DESC LIMIT 1;
 ----
 DROP COLUMNS
 
@@ -1423,12 +1423,12 @@ SELECT id, y, z FROM elake.main.r ORDER BY id;
 5	7	zz
 
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('elake', 'r');
+SELECT count(*) FROM fabricator_delta_snapshots('elake', 'r');
 ----
 5
 
 query T
-SELECT operation FROM arrownet_delta_snapshots('elake', 'r') ORDER BY version DESC LIMIT 1;
+SELECT operation FROM fabricator_delta_snapshots('elake', 'r') ORDER BY version DESC LIMIT 1;
 ----
 TRANSACTION
 
@@ -1477,12 +1477,12 @@ SELECT id, (s).a, (s).c FROM elake.main.n ORDER BY id;
 
 # CREATE + seed + ONE fused nested-ALTERs+INSERT commit.
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('elake', 'n');
+SELECT count(*) FROM fabricator_delta_snapshots('elake', 'n');
 ----
 3
 
 query T
-SELECT operation FROM arrownet_delta_snapshots('elake', 'n') ORDER BY version DESC LIMIT 1;
+SELECT operation FROM fabricator_delta_snapshots('elake', 'n') ORDER BY version DESC LIMIT 1;
 ----
 TRANSACTION
 
@@ -1554,7 +1554,7 @@ DETACH elake;
 # ============================================================================
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_codec' AS flake (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS flake (TYPE fabricator, PROVIDER 'delta');
 
 statement ok
 BEGIN;
@@ -1593,7 +1593,7 @@ SELECT id, name FROM flake.main.c ORDER BY id;
 
 # The flush wrote today's CTAS shape: v0 CREATE TABLE + ONE WRITE for all buffered inserts.
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('flake', 'c');
+SELECT count(*) FROM fabricator_delta_snapshots('flake', 'c');
 ----
 2
 
@@ -1627,7 +1627,7 @@ DETACH flake;
 
 # Re-attach: the rolled-back table left NOTHING on storage.
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_codec' AS flake2 (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS flake2 (TYPE fabricator, PROVIDER 'delta');
 
 query I
 SELECT count(*) FROM duckdb_tables() WHERE database_name = 'flake2' AND table_name = 'd';
@@ -1672,7 +1672,7 @@ SELECT max(id) FROM flake2.main.e;
 
 # CTAS rows + the extra INSERT flushed as ONE data commit.
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('flake2', 'e');
+SELECT count(*) FROM fabricator_delta_snapshots('flake2', 'e');
 ----
 2
 
@@ -1753,7 +1753,7 @@ SELECT count(*) FROM flake2.main.h;
 0
 
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('flake2', 'h');
+SELECT count(*) FROM fabricator_delta_snapshots('flake2', 'h');
 ----
 1
 
@@ -1780,7 +1780,7 @@ SELECT count(*) FROM flake2.main.pt WHERE region = 'US';
 2
 
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('flake2', 'pt');
+SELECT count(*) FROM fabricator_delta_snapshots('flake2', 'pt');
 ----
 2
 
@@ -1792,7 +1792,7 @@ DETACH flake2;
 # ============================================================================
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_native' AS nl2 (TYPE arrownet, PROVIDER 'delta', native_write true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_native' AS nl2 (TYPE fabricator, PROVIDER 'delta', native_write true);
 
 statement ok
 BEGIN;
@@ -1827,7 +1827,7 @@ SELECT count(*) FROM nl2.main.nc;
 500
 
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('nl2', 'nc');
+SELECT count(*) FROM fabricator_delta_snapshots('nl2', 'nc');
 ----
 2
 
@@ -1840,7 +1840,7 @@ DETACH nl2;
 # ============================================================================
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_native' AS eag (TYPE arrownet, PROVIDER 'delta', native_write true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_native' AS eag (TYPE fabricator, PROVIDER 'delta', native_write true);
 
 statement ok
 CREATE TABLE eag.main.et (id INTEGER, v VARCHAR);
@@ -1850,7 +1850,7 @@ INSERT INTO eag.main.et SELECT i, 'x' || i FROM range(1, 6) AS r(i);
 
 # baseline: one data file, two commits (create + insert)
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_native/et/*.parquet');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_native/et/*.parquet');
 ----
 1
 
@@ -1862,13 +1862,13 @@ UPDATE eag.main.et SET v = 'upd' WHERE id = 3;
 
 # the post-image file is ON STORAGE before COMMIT (eager write, deferred commit)...
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_native/et/*.parquet');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_native/et/*.parquet');
 ----
 2
 
 # ...but the log has NOT moved
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_native/et/_delta_log/*.json');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_native/et/_delta_log/*.json');
 ----
 2
 
@@ -1882,12 +1882,12 @@ COMMIT;
 
 # the commit references the already-written file: one new log entry, no new data file
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_native/et/_delta_log/*.json');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_native/et/_delta_log/*.json');
 ----
 3
 
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_native/et/*.parquet');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_native/et/*.parquet');
 ----
 2
 
@@ -1908,12 +1908,12 @@ INSERT INTO eag.main.et SELECT i, 'n' || i, i * 0.5 FROM range(100, 1100) AS r(i
 
 # the 1000-row insert streamed to a data file before COMMIT
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_native/et/*.parquet');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_native/et/*.parquet');
 ----
 3
 
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_native/et/_delta_log/*.json');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_native/et/_delta_log/*.json');
 ----
 3
 
@@ -1928,7 +1928,7 @@ COMMIT;
 
 # metaData (ALTER) + the streamed add fused into ONE commit
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_native/et/_delta_log/*.json');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_native/et/_delta_log/*.json');
 ----
 4
 
@@ -1956,7 +1956,7 @@ statement ok
 UPDATE eag.main.et SET v = 'doomed' WHERE id = 4;
 
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_native/et/*.parquet');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_native/et/*.parquet');
 ----
 4
 
@@ -1969,7 +1969,7 @@ SELECT v FROM eag.main.et WHERE id = 4;
 x4
 
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_native/et/_delta_log/*.json');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_native/et/_delta_log/*.json');
 ----
 4
 
@@ -1982,7 +1982,7 @@ DETACH eag;
 # ============================================================================
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_native' AS eb (TYPE arrownet, PROVIDER 'delta', native_write true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_native' AS eb (TYPE fabricator, PROVIDER 'delta', native_write true);
 
 statement ok
 BEGIN;
@@ -1992,13 +1992,13 @@ CREATE TABLE eb.main.bt AS SELECT i AS id, 'v' || i AS v FROM range(1, 1001) r(i
 
 # the CTAS data is ON STORAGE (streamed file)...
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_native/bt/*.parquet');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_native/bt/*.parquet');
 ----
 1
 
 # ...but NO _delta_log exists yet (nothing committed)
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_native/bt/_delta_log/*.json');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_native/bt/_delta_log/*.json');
 ----
 0
 
@@ -2028,7 +2028,7 @@ COMMIT;
 
 # v0 CREATE (with the PRE-ASSIGNED physical names the streamed file was written under) + ONE write
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_native/bt/_delta_log/*.json');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_native/bt/_delta_log/*.json');
 ----
 2
 
@@ -2049,7 +2049,7 @@ SELECT v FROM eb.main.bt WHERE id = 5000;
 extra
 
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('eb', 'bt');
+SELECT count(*) FROM fabricator_delta_snapshots('eb', 'bt');
 ----
 2
 
@@ -2061,7 +2061,7 @@ statement ok
 CREATE TABLE eb.main.doomed AS SELECT i AS id FROM range(1, 101) r(i);
 
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_native/doomed/*.parquet');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_native/doomed/*.parquet');
 ----
 1
 
@@ -2073,7 +2073,7 @@ SELECT count(*) FROM eb.main.doomed;
 ----
 
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_native/doomed/_delta_log/*.json');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_native/doomed/_delta_log/*.json');
 ----
 0
 
@@ -2095,7 +2095,7 @@ DETACH eb;
 # ============================================================================
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_eagercodec' AS ec (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_eagercodec' AS ec (TYPE fabricator, PROVIDER 'delta');
 
 statement ok
 CREATE TABLE ec.main.ct (id INTEGER, v VARCHAR);
@@ -2104,7 +2104,7 @@ statement ok
 INSERT INTO ec.main.ct SELECT i, 'x' || i FROM range(1, 6) AS r(i);
 
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_eagercodec/ct/*.parquet');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_eagercodec/ct/*.parquet');
 ----
 1
 
@@ -2116,12 +2116,12 @@ INSERT INTO ec.main.ct SELECT i, 'y' || i FROM range(100, 600) AS r(i);
 
 # the insert is a data file ON STORAGE (EW codec writer), log unmoved
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_eagercodec/ct/*.parquet');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_eagercodec/ct/*.parquet');
 ----
 2
 
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_eagercodec/ct/_delta_log/*.json');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_eagercodec/ct/_delta_log/*.json');
 ----
 2
 
@@ -2141,7 +2141,7 @@ statement ok
 UPDATE ec.main.ct SET v = 'upd' WHERE id = 3;
 
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_eagercodec/ct/*.parquet');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_eagercodec/ct/*.parquet');
 ----
 3
 
@@ -2163,7 +2163,7 @@ COMMIT;
 
 # ONE fused commit; the eagerly-written files are referenced, none rewritten
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_eagercodec/ct/_delta_log/*.json');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_eagercodec/ct/_delta_log/*.json');
 ----
 3
 
@@ -2185,7 +2185,7 @@ statement ok
 INSERT INTO ec.main.ct VALUES (9999, 'doomed');
 
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_eagercodec/ct/*.parquet');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_eagercodec/ct/*.parquet');
 ----
 4
 
@@ -2198,7 +2198,7 @@ SELECT count(*) FROM ec.main.ct;
 504
 
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_eagercodec/ct/_delta_log/*.json');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_eagercodec/ct/_delta_log/*.json');
 ----
 3
 
@@ -2220,7 +2220,7 @@ DETACH ec;
 # ============================================================================
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_cdf2' AS cf (TYPE arrownet, PROVIDER 'delta', change_data_feed true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_cdf2' AS cf (TYPE fabricator, PROVIDER 'delta', change_data_feed true);
 
 statement ok
 CREATE TABLE cf.main.t (id INTEGER, v VARCHAR);
@@ -2262,14 +2262,14 @@ SELECT id, v FROM cf.main.t ORDER BY id;
 
 # ONE fused commit (create=0, seed=1, txn=2)
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('cf', 't');
+SELECT count(*) FROM fabricator_delta_snapshots('cf', 't');
 ----
 3
 
 # the fused version's feed: 2 inserts + 1 delete + update pre/post — exact, nothing inferred
 query TII
 SELECT _change_type, count(*), min(id)
-FROM arrownet_delta_changes('cf', 't', 2, 2)
+FROM fabricator_delta_changes('cf', 't', 2, 2)
 GROUP BY _change_type ORDER BY _change_type;
 ----
 delete	1	2
@@ -2279,18 +2279,18 @@ update_preimage	1	1
 
 # update images carry the right values
 query T
-SELECT v FROM arrownet_delta_changes('cf', 't', 2, 2) WHERE _change_type = 'update_preimage';
+SELECT v FROM fabricator_delta_changes('cf', 't', 2, 2) WHERE _change_type = 'update_preimage';
 ----
 a
 
 query T
-SELECT v FROM arrownet_delta_changes('cf', 't', 2, 2) WHERE _change_type = 'update_postimage';
+SELECT v FROM fabricator_delta_changes('cf', 't', 2, 2) WHERE _change_type = 'update_postimage';
 ----
 A
 
 # the seed autocommit insert stays inference-based and intact
 query TI
-SELECT _change_type, count(*) FROM arrownet_delta_changes('cf', 't', 1, 1) GROUP BY _change_type;
+SELECT _change_type, count(*) FROM fabricator_delta_changes('cf', 't', 1, 1) GROUP BY _change_type;
 ----
 insert	3
 
@@ -2305,7 +2305,7 @@ statement ok
 COMMIT;
 
 query TI
-SELECT _change_type, count(*) FROM arrownet_delta_changes('cf', 't', 3, 3) GROUP BY _change_type;
+SELECT _change_type, count(*) FROM fabricator_delta_changes('cf', 't', 3, 3) GROUP BY _change_type;
 ----
 insert	1
 
@@ -2318,7 +2318,7 @@ DETACH cf;
 
 # --- materialize_row_tracking: fresh appends need no physical __delta_row_id (baseRowId at commit) ---
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_mat' AS mt (TYPE arrownet, PROVIDER 'delta', row_tracking true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_mat' AS mt (TYPE fabricator, PROVIDER 'delta', row_tracking true);
 
 statement ok
 CREATE TABLE mt.main.m (id INTEGER, v VARCHAR);
@@ -2334,12 +2334,12 @@ INSERT INTO mt.main.m SELECT i, 'v' || i FROM range(10, 210) r(i);
 
 # eagerly on storage, log unmoved
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_mat/m/*.parquet');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_mat/m/*.parquet');
 ----
 2
 
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_mat/m/_delta_log/*.json');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_mat/m/_delta_log/*.json');
 ----
 2
 
@@ -2361,7 +2361,7 @@ DETACH mt;
 
 # --- identity: values generated at STATEMENT time from the pinned/chained HWM ---
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_ident' AS idl (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_ident' AS idl (TYPE fabricator, PROVIDER 'delta');
 
 statement ok
 CREATE TABLE idl.main.t (id BIGINT AS (0), v VARCHAR);
@@ -2377,12 +2377,12 @@ INSERT INTO idl.main.t (v) VALUES ('c'), ('d');
 
 # eager file on storage, log unmoved
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_ident/t/*.parquet');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_ident/t/*.parquet');
 ----
 2
 
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_ident/t/_delta_log/*.json');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_ident/t/_delta_log/*.json');
 ----
 2
 
@@ -2416,7 +2416,7 @@ SELECT count(DISTINCT id) FROM idl.main.t;
 6
 
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('idl', 't');
+SELECT count(*) FROM fabricator_delta_snapshots('idl', 't');
 ----
 3
 
@@ -2457,7 +2457,7 @@ DETACH idl;
 
 # column_mapping 'none': the pins below read the RAW parquet files by logical column name.
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_mat' AS mu (TYPE arrownet, PROVIDER 'delta', row_tracking true, column_mapping 'none');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_mat' AS mu (TYPE fabricator, PROVIDER 'delta', row_tracking true, column_mapping 'none');
 
 statement ok
 CREATE TABLE mu.main.u (id INTEGER, v VARCHAR);
@@ -2489,13 +2489,13 @@ SELECT id, v FROM mu.main.u ORDER BY id;
 # both files carry the materialized column (the autocommit codec seed materializes via EW's
 # committing writer; the post-image bakes the ORIGINAL ids)
 query I
-SELECT count(DISTINCT file_name) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/txn_mat/u/*.parquet') WHERE name = '__delta_row_id';
+SELECT count(DISTINCT file_name) FROM parquet_schema('${FABRICATOR_DELTA_WRITE_DIR}/txn_mat/u/*.parquet') WHERE name = '__delta_row_id';
 ----
 2
 
 # the baked id is the ORIGINAL stable id of row 2 (seed file baseRowId=0 -> position 1)
 query I
-SELECT "__delta_row_id" FROM read_parquet('${ARROWNET_DELTA_WRITE_DIR}/txn_mat/u/*.parquet', union_by_name=true) WHERE v = 'B';
+SELECT "__delta_row_id" FROM read_parquet('${FABRICATOR_DELTA_WRITE_DIR}/txn_mat/u/*.parquet', union_by_name=true) WHERE v = 'B';
 ----
 1
 
@@ -2509,7 +2509,7 @@ DETACH mu;
 # ============================================================================
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_codec' AS vr (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS vr (TYPE fabricator, PROVIDER 'delta');
 
 statement ok
 CREATE TABLE vr.main.vrt (id INTEGER, v VARCHAR);
@@ -2571,7 +2571,7 @@ DETACH vr;
 # ============================================================================
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_selfdml' AS sd (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_selfdml' AS sd (TYPE fabricator, PROVIDER 'delta');
 
 statement ok
 CREATE TABLE sd.main.t (id INTEGER, v VARCHAR);
@@ -2629,7 +2629,7 @@ SELECT id, v FROM sd.main.t ORDER BY id;
 19	pending19
 
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('sd', 't');
+SELECT count(*) FROM fabricator_delta_snapshots('sd', 't');
 ----
 3
 
@@ -2676,7 +2676,7 @@ DETACH sd;
 
 # same-txn DELETE on a native_write catalog (streamed pending file)
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_selfdml_n' AS sdn (TYPE arrownet, PROVIDER 'delta', native_write true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_selfdml_n' AS sdn (TYPE fabricator, PROVIDER 'delta', native_write true);
 
 statement ok
 CREATE TABLE sdn.main.t (id INTEGER, v VARCHAR);
@@ -2716,7 +2716,7 @@ DETACH sdn;
 
 # CDF tables: same-txn DELETE rejected (the insert-cdc already captured the row)
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_cdf2' AS sdc (TYPE arrownet, PROVIDER 'delta', change_data_feed true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_cdf2' AS sdc (TYPE fabricator, PROVIDER 'delta', change_data_feed true);
 
 statement ok
 BEGIN;
@@ -2741,7 +2741,7 @@ DETACH sdc;
 # ============================================================================
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_dbtswap' AS dw (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_dbtswap' AS dw (TYPE fabricator, PROVIDER 'delta');
 
 statement ok
 CREATE TABLE dw.main.m AS SELECT 1 AS id, 'old' AS v;
@@ -2786,7 +2786,7 @@ DETACH dw;
 # same swap on a native_write catalog (the pending create carries eagerly-STREAMED files — the
 # rename must move them to the new folder)
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_dbtswap_n' AS dwn (TYPE arrownet, PROVIDER 'delta', native_write true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_dbtswap_n' AS dwn (TYPE fabricator, PROVIDER 'delta', native_write true);
 
 statement ok
 CREATE TABLE dwn.main.m AS SELECT 1 AS id, 'old' AS v;
@@ -2799,7 +2799,7 @@ CREATE TABLE dwn.main.m__dbt_tmp AS SELECT i AS id, 'new' || i AS v FROM range(1
 
 # the eager file is on storage under the TMP folder
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_dbtswap_n/m__dbt_tmp/*.parquet');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_dbtswap_n/m__dbt_tmp/*.parquet');
 ----
 1
 
@@ -2827,12 +2827,12 @@ SELECT count(*) FROM dwn.main.m;
 
 # the files moved with the rename: table folder has data + log, tmp folder has no log
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_dbtswap_n/m/*.parquet');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_dbtswap_n/m/*.parquet');
 ----
 1
 
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_dbtswap_n/m__dbt_tmp/_delta_log/*.json');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_dbtswap_n/m__dbt_tmp/_delta_log/*.json');
 ----
 0
 
@@ -2845,7 +2845,7 @@ DETACH dwn;
 # ============================================================================
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_partctas' AS pc (TYPE arrownet, PROVIDER 'delta', native_write true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_partctas' AS pc (TYPE fabricator, PROVIDER 'delta', native_write true);
 
 statement ok
 BEGIN;
@@ -2857,12 +2857,12 @@ CREATE TABLE pc.main.pt PARTITIONED BY (region) AS
 
 # streamed: Hive partition dirs on storage, NO _delta_log yet
 query I
-SELECT count(*) > 0 FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_partctas/pt/*/*.parquet');
+SELECT count(*) > 0 FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_partctas/pt/*/*.parquet');
 ----
 true
 
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_partctas/pt/_delta_log/*.json');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_partctas/pt/_delta_log/*.json');
 ----
 0
 
@@ -2889,7 +2889,7 @@ COMMIT;
 
 # v0 CREATE (partitioned, pre-assigned mapping) + ONE write commit
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_partctas/pt/_delta_log/*.json');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_partctas/pt/_delta_log/*.json');
 ----
 2
 
@@ -2915,7 +2915,7 @@ DETACH pc;
 # ============================================================================
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txn_ident2' AS ic (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_ident2' AS ic (TYPE fabricator, PROVIDER 'delta');
 
 statement ok
 BEGIN;
@@ -2925,7 +2925,7 @@ CREATE TABLE ic.main.t (id BIGINT AS (0), v VARCHAR);
 
 # nothing on storage before COMMIT (the identity create is now transactional)
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_ident2/t/_delta_log/*.json');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_ident2/t/_delta_log/*.json');
 ----
 0
 
@@ -2997,7 +2997,7 @@ SELECT count(*) FROM ic.main.doomed;
 ----
 
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/txn_ident2/doomed/_delta_log/*.json');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_ident2/doomed/_delta_log/*.json');
 ----
 0
 

@@ -2,7 +2,7 @@
 # description: provider selection — default, explicit PROVIDER, alias, scheme inference, unknown-provider error
 # group: [mssql]
 
-require mssql_net
+require fabricator
 
 require-env MSSQL_TESTDB_DSN
 
@@ -10,10 +10,10 @@ require-env MSSQL_TESTDB_URI
 
 # Default provider (no PROVIDER option) — preserves single-provider behavior.
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS p_default (TYPE mssql_net);
+ATTACH '${MSSQL_TESTDB_DSN}' AS p_default (TYPE fabricator);
 
 query I
-SELECT x FROM mssql_net_query('p_default', 'SELECT 1 AS x');
+SELECT x FROM fabricator_query('p_default', 'SELECT 1 AS x');
 ----
 1
 
@@ -22,10 +22,10 @@ DETACH p_default;
 
 # Explicit PROVIDER 'sqlserver'.
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS p_ss (TYPE mssql_net, PROVIDER 'sqlserver');
+ATTACH '${MSSQL_TESTDB_DSN}' AS p_ss (TYPE fabricator, PROVIDER 'sqlserver');
 
 query I
-SELECT x FROM mssql_net_query('p_ss', 'SELECT 1 AS x');
+SELECT x FROM fabricator_query('p_ss', 'SELECT 1 AS x');
 ----
 1
 
@@ -34,17 +34,17 @@ DETACH p_ss;
 
 # Alias 'mssql' resolves to the same backend.
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS p_alias (TYPE mssql_net, PROVIDER 'mssql');
+ATTACH '${MSSQL_TESTDB_DSN}' AS p_alias (TYPE fabricator, PROVIDER 'mssql');
 
 statement ok
 DETACH p_alias;
 
 # Scheme inference: mssql:// URI -> provider "mssql" (alias) without an explicit option.
 statement ok
-ATTACH '${MSSQL_TESTDB_URI}' AS p_uri (TYPE mssql_net);
+ATTACH '${MSSQL_TESTDB_URI}' AS p_uri (TYPE fabricator);
 
 query I
-SELECT x FROM mssql_net_query('p_uri', 'SELECT 1 AS x');
+SELECT x FROM fabricator_query('p_uri', 'SELECT 1 AS x');
 ----
 1
 
@@ -53,6 +53,6 @@ DETACH p_uri;
 
 # Unknown provider -> clean error (not an opaque connection failure).
 statement error
-ATTACH '${MSSQL_TESTDB_DSN}' AS p_bad (TYPE mssql_net, PROVIDER 'bogus');
+ATTACH '${MSSQL_TESTDB_DSN}' AS p_bad (TYPE fabricator, PROVIDER 'bogus');
 ----
 unknown provider

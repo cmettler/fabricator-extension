@@ -1,13 +1,13 @@
 # name: test/verify_plugin.test
-# description: Third-party plugin SPI (no ALC isolation) — a plugin assembly dropped into an ARROWNET_PLUGIN_DIR
+# description: Third-party plugin SPI (no ALC isolation) — a plugin assembly dropped into an FABRICATOR_PLUGIN_DIR
 #              folder is discovered at load, its IBackend registered, and its connection-free GLOBAL functions
-#              surfaced as bare fn(...) with NO ATTACH. Demo plugin: ArrowNet.SamplePlugin's plug_greet.
-#              Set ARROWNET_PLUGIN_DIR to the folder the sample plugin was built into. See docs/plugin-system.md.
-# group: [mssql_net]
+#              surfaced as bare fn(...) with NO ATTACH. Demo plugin: Fabricator.SamplePlugin's plug_greet.
+#              Set FABRICATOR_PLUGIN_DIR to the folder the sample plugin was built into. See docs/plugin-system.md.
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
-require-env ARROWNET_PLUGIN_DIR
+require-env FABRICATOR_PLUGIN_DIR
 
 # The plugin's global scalar resolves on a bare loaded extension — no ATTACH, no first-party involvement.
 query I
@@ -25,6 +25,6 @@ Hello, stranger (from plugin)
 
 # A built-in global function still works alongside the plugin's (both in the same registry, no conflict).
 query I
-SELECT arrownet_render('Hi {{ name }}', {'name':'plugin'});
+SELECT fabricator_render('Hi {{ name }}', {'name':'plugin'});
 ----
 Hi plugin

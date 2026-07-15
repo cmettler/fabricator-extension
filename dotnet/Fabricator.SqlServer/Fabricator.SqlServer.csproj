@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <RootNamespace>Fabricator.SqlServer</RootNamespace>
+    <AssemblyName>Fabricator.SqlServer</AssemblyName>
+    <Description>
+      SQL Server backend for the Fabricator bridge: executes T-SQL via
+      Microsoft.Data.SqlClient and streams results to DuckDB as Apache Arrow.
+      This is the composition root published beside the fabricator extension.
+    </Description>
+    <!-- This assembly is the published "app" the CoreCLR host initializes against. -->
+    <GenerateRuntimeConfigurationFiles>true</GenerateRuntimeConfigurationFiles>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Fluid.Core" Version="2.31.0" />
+    <ProjectReference Include="..\Fabricator.Abstractions\Fabricator.Abstractions.csproj" />
+    <ProjectReference Include="..\Fabricator.Bridge\Fabricator.Bridge.csproj" />
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="6.0.2" />
+  </ItemGroup>
+
+</Project>

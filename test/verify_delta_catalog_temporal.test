@@ -7,15 +7,15 @@
 #              PartitionUtils had no decimal case. Both now filter every fixed-width type generically and THROW
 #              on a truly unsupported type. (Delta has no TIME / unsigned type, so those aren't exercised here —
 #              the parallel Time32->Time64 read fix is a general parquet-correctness fix, not Delta-reachable.)
-#              Set ARROWNET_DELTA_WRITE_DIR. Local FS.
-# group: [mssql_net]
+#              Set FABRICATOR_DELTA_WRITE_DIR. Local FS.
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
-require-env ARROWNET_DELTA_WRITE_DIR
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/temporal' AS lake (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/temporal' AS lake (TYPE fabricator, PROVIDER 'delta');
 
 # DATE (Date32), TIMESTAMP (Timestamp us), DECIMAL — the three Delta-valid fixed-width types the survivor
 # filter did not handle (Date/Timestamp had NO case at all; decimal was the earlier fix).
@@ -85,7 +85,7 @@ DETACH lake;
 
 # Durability: re-attach and re-read the DELETE'd + partitioned tables.
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/temporal' AS lake (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/temporal' AS lake (TYPE fabricator, PROVIDER 'delta');
 
 query ITTR
 SELECT id, d, ts, dec FROM lake.main.t ORDER BY id;

@@ -1,24 +1,24 @@
 # name: test/verify_delta_rs_copy.test
-# description: delta-rs provider COPY (FORMAT mssql_net). Semantics match the engineered-wood provider:
+# description: delta-rs provider COPY (FORMAT mssql). Semantics match the engineered-wood provider:
 #              CREATE_TABLE false => append; the default (createTable) or a replace => overwrite (the table
 #              becomes exactly the COPY'd rows); COPY to a non-existent table creates it. SCHEMA_MODE 'overwrite'
 #              replaces data + adopts the incoming schema; 'merge' is a clean error (delta-dotnet's InsertOptions
 #              is overwrite-only). Requires the delta-rs native libs (publish-managed.ps1 -IncludeDeltaRs). Local FS.
-# group: [mssql_net]
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
-require-env ARROWNET_DELTA_WRITE_DIR
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/drcp' AS lake (TYPE arrownet, PROVIDER 'deltars');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/drcp' AS lake (TYPE fabricator, PROVIDER 'deltars');
 
 statement ok
 CREATE TABLE lake.main.t AS SELECT * FROM (VALUES (1,'a'),(2,'b')) v(id,name);
 
 # COPY with CREATE_TABLE false => append.
 statement ok
-COPY (SELECT 3 AS id, 'c' AS name) TO 'lake.main.t' (FORMAT mssql_net, CREATE_TABLE false);
+COPY (SELECT 3 AS id, 'c' AS name) TO 'lake.main.t' (FORMAT mssql, CREATE_TABLE false);
 
 query IT
 SELECT id, name FROM lake.main.t ORDER BY id;
@@ -29,7 +29,7 @@ SELECT id, name FROM lake.main.t ORDER BY id;
 
 # COPY default (createTable) => overwrite: the table becomes exactly the COPY'd rows.
 statement ok
-COPY (SELECT 9 AS id, 'z' AS name) TO 'lake.main.t' (FORMAT mssql_net);
+COPY (SELECT 9 AS id, 'z' AS name) TO 'lake.main.t' (FORMAT mssql);
 
 query IT
 SELECT id, name FROM lake.main.t ORDER BY id;
@@ -38,7 +38,7 @@ SELECT id, name FROM lake.main.t ORDER BY id;
 
 # COPY to a non-existent table creates it.
 statement ok
-COPY (SELECT 1 AS k, 2 AS v) TO 'lake.main.fresh' (FORMAT mssql_net);
+COPY (SELECT 1 AS k, 2 AS v) TO 'lake.main.fresh' (FORMAT mssql);
 
 query II
 SELECT k, v FROM lake.main.fresh;
@@ -50,7 +50,7 @@ statement ok
 CREATE TABLE lake.main.ow AS SELECT * FROM (VALUES (1,'a',100),(2,'b',200)) v(id,val,old);
 
 statement ok
-COPY (SELECT 9 AS id, 'z' AS val, 777 AS newcol) TO 'lake.main.ow' (FORMAT mssql_net, SCHEMA_MODE 'overwrite');
+COPY (SELECT 9 AS id, 'z' AS val, 777 AS newcol) TO 'lake.main.ow' (FORMAT mssql, SCHEMA_MODE 'overwrite');
 
 query ITI
 SELECT id, val, newcol FROM lake.main.ow ORDER BY id;
@@ -65,7 +65,7 @@ SELECT count(*) FROM (DESCRIBE lake.main.ow);
 # SCHEMA_MODE 'merge' — append + union the new source column (old rows read NULL). The bridge maps a plain
 # Append (OverwriteSchema=false) to delta-rs SchemaMode::Merge, so merge = force Append.
 statement ok
-COPY (SELECT 5 AS id, 'e' AS name, 42 AS extra) TO 'lake.main.t' (FORMAT mssql_net, SCHEMA_MODE 'merge');
+COPY (SELECT 5 AS id, 'e' AS name, 42 AS extra) TO 'lake.main.t' (FORMAT mssql, SCHEMA_MODE 'merge');
 
 query ITI
 SELECT id, name, extra FROM lake.main.t ORDER BY id;

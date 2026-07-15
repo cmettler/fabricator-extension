@@ -2,22 +2,22 @@
 # description: The FULL CIRCLE — our Delta provider writes a table to MinIO (s3://), and SQL Server 2025
 #              reads it back over its NATIVE S3 data virtualization (no PolyBase package needed on 17.x),
 #              driven through our mssql provider: OPENROWSET(FORMAT='DELTA') + CREATE EXTERNAL TABLE, both
-#              provisioned via mssql_net_exec and read via mssql_net_query / a normal catalog scan. The
+#              provisioned via fabricator_exec and read via fabricator_query / a normal catalog scan. The
 #              SQL-side DELTA reader supports Delta protocol 1.0 ONLY, so the interop table is written
 #              with deletion_vectors false + column_mapping 'none' (plain minReader-1); a DV-default
 #              table is pinned as NOT readable. Requires the docker/docker-compose.yml stack (MinIO with
 #              the self-signed TLS cert SQL Server trusts via /var/opt/mssql/security/ca-certificates).
-# group: [mssql_net]
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
 require httpfs
 
 require-env MSSQL_TESTDB_DSN
 
-require-env ARROWNET_S3_ENDPOINT
+require-env FABRICATOR_S3_ENDPOINT
 
-require-env ARROWNET_S3_SQL_ENDPOINT
+require-env FABRICATOR_S3_SQL_ENDPOINT
 
 # The test rig's MinIO serves a SELF-SIGNED cert (SQL Server trusts it via its CA mount; DuckDB's
 # curl-based httpfs verifies against the system store) — disable verification GLOBALLY (the transaction
@@ -28,12 +28,12 @@ SET GLOBAL enable_curl_server_cert_verification = false;
 
 statement ok
 CREATE SECRET minio_s3 (TYPE s3, KEY_ID 'miniouser', SECRET 'miniosecret123',
-                        ENDPOINT '${ARROWNET_S3_ENDPOINT}', URL_STYLE 'path', REGION 'us-east-1',
+                        ENDPOINT '${FABRICATOR_S3_ENDPOINT}', URL_STYLE 'path', REGION 'us-east-1',
                         USE_SSL true);
 
 # ---- 1. our Delta provider writes the interop table (PLAIN delta: protocol 1.0-readable) ----
 statement ok
-ATTACH 's3://arrownet/polybase' AS plake (TYPE arrownet, PROVIDER 'delta', READ_ONLY false,
+ATTACH 's3://fabricator/polybase' AS plake (TYPE fabricator, PROVIDER 'delta', READ_ONLY false,
                                           deletion_vectors false, column_mapping 'none');
 
 statement ok
@@ -51,34 +51,34 @@ SELECT id, amount, city, score FROM plake.main.trips ORDER BY id LIMIT 3;
 
 # ---- 2. SQL Server side: self-provision the S3 credential/data source/file format ----
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS sqldb (TYPE mssql_net);
+ATTACH '${MSSQL_TESTDB_DSN}' AS sqldb (TYPE fabricator);
 
 statement ok
-SELECT mssql_net_exec('sqldb',
+SELECT fabricator_exec('sqldb',
   'IF NOT EXISTS (SELECT 1 FROM sys.symmetric_keys WHERE name = ''##MS_DatabaseMasterKey##'')
      CREATE MASTER KEY ENCRYPTION BY PASSWORD = ''Arrow_Net_123!MK''');
 
 statement ok
-SELECT mssql_net_exec('sqldb',
+SELECT fabricator_exec('sqldb',
   'IF NOT EXISTS (SELECT 1 FROM sys.database_scoped_credentials WHERE name = ''s3_dc'')
      CREATE DATABASE SCOPED CREDENTIAL s3_dc WITH IDENTITY = ''S3 Access Key'',
        SECRET = ''miniouser:miniosecret123''');
 
 statement ok
-SELECT mssql_net_exec('sqldb',
+SELECT fabricator_exec('sqldb',
   'IF NOT EXISTS (SELECT 1 FROM sys.external_data_sources WHERE name = ''s3_ds'')
-     CREATE EXTERNAL DATA SOURCE s3_ds WITH (LOCATION = ''s3://${ARROWNET_S3_SQL_ENDPOINT}/'',
+     CREATE EXTERNAL DATA SOURCE s3_ds WITH (LOCATION = ''s3://${FABRICATOR_S3_SQL_ENDPOINT}/'',
        CREDENTIAL = s3_dc)');
 
 statement ok
-SELECT mssql_net_exec('sqldb',
+SELECT fabricator_exec('sqldb',
   'IF NOT EXISTS (SELECT 1 FROM sys.external_file_formats WHERE name = ''DeltaFileFormat'')
      CREATE EXTERNAL FILE FORMAT DeltaFileFormat WITH (FORMAT_TYPE = DELTA)');
 
 # ---- 3. OPENROWSET(FORMAT='DELTA'): SQL Server reads what our provider wrote ----
 query IIT
-SELECT id, amount, city FROM mssql_net_query('sqldb',
-  'SELECT id, amount, city FROM OPENROWSET(BULK ''/arrownet/polybase/trips'', FORMAT = ''DELTA'',
+SELECT id, amount, city FROM fabricator_query('sqldb',
+  'SELECT id, amount, city FROM OPENROWSET(BULK ''/fabricator/polybase/trips'', FORMAT = ''DELTA'',
      DATA_SOURCE = ''s3_ds'') AS r ORDER BY id')
 ORDER BY id;
 ----
@@ -92,29 +92,29 @@ ORDER BY id;
 8	800	city2
 
 query II
-SELECT cnt, total FROM mssql_net_query('sqldb',
-  'SELECT COUNT(*) AS cnt, SUM(amount) AS total FROM OPENROWSET(BULK ''/arrownet/polybase/trips'',
+SELECT cnt, total FROM fabricator_query('sqldb',
+  'SELECT COUNT(*) AS cnt, SUM(amount) AS total FROM OPENROWSET(BULK ''/fabricator/polybase/trips'',
      FORMAT = ''DELTA'', DATA_SOURCE = ''s3_ds'') AS r');
 ----
 8	3600
 
 # ---- 4. CREATE EXTERNAL TABLE + read it through the ATTACHed catalog as a normal table scan ----
 statement ok
-SELECT mssql_net_exec('sqldb',
+SELECT fabricator_exec('sqldb',
   'IF OBJECT_ID(''dbo.s3_delta_trips'') IS NOT NULL DROP EXTERNAL TABLE dbo.s3_delta_trips');
 
 statement ok
-SELECT mssql_net_exec('sqldb',
+SELECT fabricator_exec('sqldb',
   'CREATE EXTERNAL TABLE dbo.s3_delta_trips (id INT, amount BIGINT, city VARCHAR(20),
      score FLOAT, d DATE)
-   WITH (LOCATION = ''/arrownet/polybase/trips'', DATA_SOURCE = s3_ds,
+   WITH (LOCATION = ''/fabricator/polybase/trips'', DATA_SOURCE = s3_ds,
          FILE_FORMAT = DeltaFileFormat)');
 
 statement ok
-SELECT mssql_refresh_cache('sqldb');
+SELECT fabricator_refresh_cache('sqldb');
 
 # Our provider scanning a SQL Server EXTERNAL table whose data lives in MinIO, written by our Delta
-# provider — DuckDB -> mssql_net -> SQL Server -> S3 delta reader -> MinIO.
+# provider — DuckDB -> fabricator -> SQL Server -> S3 delta reader -> MinIO.
 query IIT
 SELECT id, amount, city FROM sqldb.dbo.s3_delta_trips ORDER BY id LIMIT 4;
 ----
@@ -136,8 +136,8 @@ statement ok
 UPDATE plake.main.trips SET city = 'rewritten' WHERE id = 5;
 
 query IIT
-SELECT id, amount, city FROM mssql_net_query('sqldb',
-  'SELECT id, amount, city FROM OPENROWSET(BULK ''/arrownet/polybase/trips'', FORMAT = ''DELTA'',
+SELECT id, amount, city FROM fabricator_query('sqldb',
+  'SELECT id, amount, city FROM OPENROWSET(BULK ''/fabricator/polybase/trips'', FORMAT = ''DELTA'',
      DATA_SOURCE = ''s3_ds'') AS r ORDER BY id')
 ORDER BY id;
 ----
@@ -150,14 +150,14 @@ ORDER BY id;
 
 # ---- 5. negative pin: a DV-default table (reader v3) is NOT readable by SQL Server's 1.0 reader ----
 statement ok
-ATTACH 's3://arrownet/polybase-dv' AS dvlake (TYPE arrownet, PROVIDER 'delta', READ_ONLY false);
+ATTACH 's3://fabricator/polybase-dv' AS dvlake (TYPE fabricator, PROVIDER 'delta', READ_ONLY false);
 
 statement ok
 CREATE OR REPLACE TABLE dvlake.main.dvt AS SELECT 1 AS i;
 
 statement error
-SELECT * FROM mssql_net_query('sqldb',
-  'SELECT * FROM OPENROWSET(BULK ''/arrownet/polybase-dv/dvt'', FORMAT = ''DELTA'',
+SELECT * FROM fabricator_query('sqldb',
+  'SELECT * FROM OPENROWSET(BULK ''/fabricator/polybase-dv/dvt'', FORMAT = ''DELTA'',
      DATA_SOURCE = ''s3_ds'') AS r');
 ----
 
@@ -167,15 +167,15 @@ DETACH dvlake;
 # ...and a NAME-mapped table is rejected too — with a SPECIFIC error (SQL Server's reader recognizes
 # the columnMapping feature and refuses it: "19725: Column mapping is not enabled").
 statement ok
-ATTACH 's3://arrownet/polybase-cm' AS cmlake (TYPE arrownet, PROVIDER 'delta', READ_ONLY false,
+ATTACH 's3://fabricator/polybase-cm' AS cmlake (TYPE fabricator, PROVIDER 'delta', READ_ONLY false,
                                               deletion_vectors false, column_mapping 'name');
 
 statement ok
 CREATE OR REPLACE TABLE cmlake.main.cmt AS SELECT 1 AS i, 'x' AS v;
 
 statement error
-SELECT * FROM mssql_net_query('sqldb',
-  'SELECT * FROM OPENROWSET(BULK ''/arrownet/polybase-cm/cmt'', FORMAT = ''DELTA'',
+SELECT * FROM fabricator_query('sqldb',
+  'SELECT * FROM OPENROWSET(BULK ''/fabricator/polybase-cm/cmt'', FORMAT = ''DELTA'',
      DATA_SOURCE = ''s3_ds'') AS r');
 ----
 Column mapping
@@ -185,7 +185,7 @@ DETACH cmlake;
 
 # ---- 5b. IDENTITY is a WRITER-only feature (writer v7, reader stays 1) — SQL Server READS it ----
 statement ok
-ATTACH 's3://arrownet/polybase-id' AS idlake (TYPE arrownet, PROVIDER 'delta', READ_ONLY false,
+ATTACH 's3://fabricator/polybase-id' AS idlake (TYPE fabricator, PROVIDER 'delta', READ_ONLY false,
                                               deletion_vectors false, column_mapping 'none');
 
 statement ok
@@ -198,8 +198,8 @@ statement ok
 INSERT INTO idlake.main.ids (name) VALUES ('a'), ('b'), ('c');
 
 query IT
-SELECT id, name FROM mssql_net_query('sqldb',
-  'SELECT id, name FROM OPENROWSET(BULK ''/arrownet/polybase-id/ids'', FORMAT = ''DELTA'',
+SELECT id, name FROM fabricator_query('sqldb',
+  'SELECT id, name FROM OPENROWSET(BULK ''/fabricator/polybase-id/ids'', FORMAT = ''DELTA'',
      DATA_SOURCE = ''s3_ds'') AS r ORDER BY id')
 ORDER BY id;
 ----
@@ -215,7 +215,7 @@ DETACH idlake;
 
 # ---- 5c. Change Data Feed is a WRITER-only feature too — SQL Server reads the CURRENT state ----
 statement ok
-ATTACH 's3://arrownet/polybase-cdf' AS cdflake (TYPE arrownet, PROVIDER 'delta', READ_ONLY false,
+ATTACH 's3://fabricator/polybase-cdf' AS cdflake (TYPE fabricator, PROVIDER 'delta', READ_ONLY false,
                                                 change_data_feed true, deletion_vectors false,
                                                 column_mapping 'none');
 
@@ -235,8 +235,8 @@ statement ok
 UPDATE cdflake.main.f SET name = 'upd' WHERE id = 3;
 
 query IT
-SELECT id, name FROM mssql_net_query('sqldb',
-  'SELECT id, name FROM OPENROWSET(BULK ''/arrownet/polybase-cdf/f'', FORMAT = ''DELTA'',
+SELECT id, name FROM fabricator_query('sqldb',
+  'SELECT id, name FROM OPENROWSET(BULK ''/fabricator/polybase-cdf/f'', FORMAT = ''DELTA'',
      DATA_SOURCE = ''s3_ds'') AS r ORDER BY id')
 ORDER BY id;
 ----
@@ -254,7 +254,7 @@ DETACH cdflake;
 #      parquet column not in the Delta schema; the reader ignores it). Live-probed 2026-07-13. ----
 
 statement ok
-ATTACH 's3://arrownet/polybase-rt' AS rtlake (TYPE arrownet, PROVIDER 'delta', READ_ONLY false,
+ATTACH 's3://fabricator/polybase-rt' AS rtlake (TYPE fabricator, PROVIDER 'delta', READ_ONLY false,
                                               native_read true, native_write true,
                                               deletion_vectors false, column_mapping 'none',
                                               row_tracking true);
@@ -266,18 +266,18 @@ statement ok
 INSERT INTO rtlake.main.f SELECT r, 'v' || r FROM range(6, 12) t(r);
 
 query III
-SELECT cnt, mn, mx FROM mssql_net_query('sqldb',
-  'SELECT count(*) AS cnt, min(id) AS mn, max(id) AS mx FROM OPENROWSET(BULK ''/arrownet/polybase-rt/f'',
+SELECT cnt, mn, mx FROM fabricator_query('sqldb',
+  'SELECT count(*) AS cnt, min(id) AS mn, max(id) AS mx FROM OPENROWSET(BULK ''/fabricator/polybase-rt/f'',
      FORMAT = ''DELTA'', DATA_SOURCE = ''s3_ds'') AS r');
 ----
 12	0	11
 
 statement ok
-SELECT mssql_net_exec('rtlake', 'OPTIMIZE main.f');
+SELECT fabricator_exec('rtlake', 'OPTIMIZE main.f');
 
 query III
-SELECT cnt, mn, mx FROM mssql_net_query('sqldb',
-  'SELECT count(*) AS cnt, min(id) AS mn, max(id) AS mx FROM OPENROWSET(BULK ''/arrownet/polybase-rt/f'',
+SELECT cnt, mn, mx FROM fabricator_query('sqldb',
+  'SELECT count(*) AS cnt, min(id) AS mn, max(id) AS mx FROM OPENROWSET(BULK ''/fabricator/polybase-rt/f'',
      FORMAT = ''DELTA'', DATA_SOURCE = ''s3_ds'') AS r');
 ----
 12	0	11
@@ -297,8 +297,8 @@ SELECT (SELECT __delta_row_id FROM rtlake.main.f WHERE id = 5)
 1
 
 query IT
-SELECT id, name FROM mssql_net_query('sqldb',
-  'SELECT id, name FROM OPENROWSET(BULK ''/arrownet/polybase-rt/f'', FORMAT = ''DELTA'',
+SELECT id, name FROM fabricator_query('sqldb',
+  'SELECT id, name FROM OPENROWSET(BULK ''/fabricator/polybase-rt/f'', FORMAT = ''DELTA'',
      DATA_SOURCE = ''s3_ds'') AS r WHERE id IN (4, 5, 6) ORDER BY id')
 ORDER BY id;
 ----
@@ -311,7 +311,7 @@ DETACH rtlake;
 
 # ---- 6. teardown (external objects; the delta data stays for re-runs — CREATE OR REPLACE resets it) ----
 statement ok
-SELECT mssql_net_exec('sqldb',
+SELECT fabricator_exec('sqldb',
   'IF OBJECT_ID(''dbo.s3_delta_trips'') IS NOT NULL DROP EXTERNAL TABLE dbo.s3_delta_trips');
 
 statement ok

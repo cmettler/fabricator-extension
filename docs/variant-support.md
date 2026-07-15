@@ -11,14 +11,14 @@ is the remaining step. See "AS BUILT" below; the design sections after it are th
 1. **No per-operator pre-casts, no SQL wrapping — ONE Arrow type extension.** DuckDB's Arrow export hits its
    `default:` branch for VARIANT and consults the **`ArrowTypeExtension` registry UNCONDITIONALLY** (not
    gated on `arrow_lossless_conversion` — verified in `arrow_converter.cpp` `SetArrowFormat`). So
-   `RegisterArrowNetVariantExtension` (`src/arrownet/arrownet_variant.cpp`, registered at extension load,
+   `RegisterFabricatorVariantExtension` (`src/fabricator/fabricator_variant.cpp`, registered at extension load,
    idempotent) makes EVERY boundary crossing transparent: bulk INSERT/CTAS/COPY appenders, host-query result
    streams, create-table schema export, scan ingest, the catalog bind schema (`FetchTableColumns` →
    `PopulateArrowTableSchema` is registry-aware), and the host-query INPUT stream import (so the streaming
    COPY sees real VARIANT with no cast in the SQL). The conversions delegate to the parquet extension's
    scalars via `FunctionBinder`+`ExpressionExecutor` (parquet is statically linked; no parquet internals
    linked): `variant_to_parquet_variant(v)` out, `variant_bytes_to_variant(blob)` in.
-2. **The transport is ONE self-delimiting BLOB per row (`arrownet.variant`), NOT the canonical
+2. **The transport is ONE self-delimiting BLOB per row (`fabricator.variant`), NOT the canonical
    `arrow.parquet.variant` struct.** The value = parquet-variant metadata bytes immediately followed by the
    value bytes (the metadata header is self-delimiting — exactly the byte form `variant_bytes_to_variant`
    consumes). Reason: **upstream appender bug** — `ArrowAppender::Finalize`/`FinalizeChild` passes the
@@ -28,7 +28,7 @@ is the remaining step. See "AS BUILT" below; the design sections after it are th
    within vector of size 2". No built-in extension has a nested internal type (bool8/geoarrow/bignum are all
    leaves), so a LEAF internal type sidesteps the bug entirely. Upstream-PR candidate: `FinalizeChild` should
    use `append_data.extension_data->GetInternalType()` when set. The EW/C# marker is
-   `SchemaConverter.VariantExtensionName = "arrownet.variant"` (field metadata `ARROW:extension:name`).
+   `SchemaConverter.VariantExtensionName = "fabricator.variant"` (field metadata `ARROW:extension:name`).
 
 Other findings from the build:
 - **NULL variant rows**: the parquet binary decoder rejects an empty metadata buffer outright (does not
@@ -74,10 +74,10 @@ EW backstop remains for codec-only tables: the gates still throw when either sea
 
 **Fabric Runtime 2.0 validation — DONE (2026-07-06, live, both directions).** Workspace `Test` / lakehouse
 `LH` runs **Spark 4.1.1**; `scratchpad/sparkprobe variant`:
-- **We write → Spark reads**: `lake.dbo.arrownet_varlive` (native_write streaming COPY over `onelake://`,
+- **We write → Spark reads**: `lake.dbo.fabricator_varlive` (native_write streaming COPY over `onelake://`,
   object / NULL / array / string rows) — Spark `to_json(v)` returns `{"a":1,"b":"x"}` / `[1,2,3]` /
   `"plain"` exactly, and `variant_get(v, '$.a', 'int')` = 1.
-- **Spark writes → we read**: `arrownet_var_spark` (`CREATE TABLE … (v VARIANT) USING delta` +
+- **Spark writes → we read**: `fabricator_var_spark` (`CREATE TABLE … (v VARIANT) USING delta` +
   `parse_json` inserts) — our provider reads it typed VARIANT with dot access (`(v).x` = 10) and correct
   SQL-NULL semantics (`v IS NULL` matches Spark's NULL row).
 - **Known NULL nuance (one direction)**: a SQL-NULL variant WE write reads in Spark as a **variant
@@ -144,12 +144,12 @@ moves opaque Arrow structs.
 1. **In-engine VARIANT is fully functional** in DuckDB 1.5.4: `{'a':1}::VARIANT` literals,
    `typeof(...)='VARIANT'`, and a native parquet `COPY`/`read_parquet` round-trip preserves the type.
 2. **VARIANT does NOT cross the Arrow C boundary**: pushing a VARIANT column through
-   `arrownet_delta_write` (DuckDB→C# Arrow export) throws `Not implemented Error: Unsupported Arrow
+   `fabricator_delta_write` (DuckDB→C# Arrow export) throws `Not implemented Error: Unsupported Arrow
    type VARIANT` — outcome 3 of the options below is the ONLY path; there is no extension-type export
    to allow through.
 3. **The transport form CROSSES and CONVERTS BOTH WAYS**:
    `variant_to_parquet_variant(v)` (parquet ext scalar) → type `PARQUET_VARIANT` (struct-of-blobs
-   alias) — crossed the boundary and committed via `arrownet_delta_write` successfully; and the
+   alias) — crossed the boundary and committed via `fabricator_delta_write` successfully; and the
    REVERSE CAST EXISTS: `<parquet_variant>::VARIANT` → `VARIANT`. So the boundary recipe is:
    OUT of DuckDB = wrap the column `variant_to_parquet_variant(v) AS v`; INTO DuckDB = `v::VARIANT`.
 
@@ -174,7 +174,7 @@ moves opaque Arrow structs.
 
 **How does DuckDB 1.5.4 export VARIANT across the Arrow C interface?** `arrow_converter.cpp` has no
 explicit VARIANT case — it routes through the Arrow-extension registry (`config.GetArrowExtension`),
-and our boundary pins the STANDARD encoding (`arrownet::BoundaryClientProperties`,
+and our boundary pins the STANDARD encoding (`fabricator::BoundaryClientProperties`,
 `arrow_lossless_conversion=false`). Outcomes:
 1. Exports as the `arrow.parquet.variant`-style extension struct → pure pass-through, nothing to do.
 2. Exports only under lossless/extension mode → allow THAT extension through the boundary (a
@@ -186,7 +186,7 @@ and our boundary pins the STANDARD encoding (`arrownet::BoundaryClientProperties
    can inject both transparently — **this fallback is guaranteed to work** because it never crosses
    the boundary as VARIANT at all, only as a plain struct of blobs.
 
-Spike script: `SELECT {'metadata': ..}::VARIANT`-ish value via `arrownet_query`-style round-trip;
+Spike script: `SELECT {'metadata': ..}::VARIANT`-ish value via `fabricator_query`-style round-trip;
 plus `COPY (SELECT <variant>) TO parquet` + `read_parquet` under `Host.Query`.
 
 ## Implementation plan (phased, mirrors the timestampNtz pattern)
@@ -224,7 +224,7 @@ plus `COPY (SELECT <variant>) TO parquet` + `read_parquet` under `Host.Query`.
 - EW-codec write annotation (lift the codec gate) — needs the parquet VARIANT logical type in EW's
   writer (`ArrowToSchemaConverter` + logical-type annotation on the group).
 - C#-side variant ops via `Apache.Arrow.Operations` (variant↔JSON global scalar, e.g.
-  `arrownet_variant_to_json`) — only then does the arrow-dotnet Variant API matter.
+  `fabricator_variant_to_json`) — only then does the arrow-dotnet Variant API matter.
 - SQL Server provider mapping (VARIANT → `json`/`nvarchar(max)` via the JSON path) + DuckLake
   interop (DuckLake supports variant natively — relevant for a future DuckLake bridge).
 

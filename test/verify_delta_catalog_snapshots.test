@@ -1,19 +1,19 @@
 # name: test/verify_delta_catalog_snapshots.test
-# description: Delta folder-as-catalog SNAPSHOTS / history. arrownet_delta_snapshots('<catalog>', '<schema.>table')
+# description: Delta folder-as-catalog SNAPSHOTS / history. fabricator_delta_snapshots('<catalog>', '<schema.>table')
 #              returns the table's commit history (version, timestamp, operation, operation_parameters) from the
 #              _delta_log — the DuckLake-style snapshots view to pick a version for time travel. First arg = the
 #              ATTACH'd catalog name (resolved to its root/layout — no abfss path); second = the table, schema-
 #              qualified (schema mandatory on a schema-enabled lakehouse, defaults to "main" on a flat catalog).
 #              timestamp/operation are populated only when the table records commitInfo (in_commit_timestamps).
-#              Set ARROWNET_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
-# group: [mssql_net]
+#              Set FABRICATOR_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
-require-env ARROWNET_DELTA_WRITE_DIR
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogsnap' AS lake (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/catalogsnap' AS lake (TYPE fabricator, PROVIDER 'delta');
 
 statement ok
 CREATE TABLE lake.main.t (id INTEGER);
@@ -29,13 +29,13 @@ INSERT INTO lake.main.t VALUES (3);
 
 # 4 commits: v0 (CREATE) + 3 INSERTs.
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('lake', 'main.t');
+SELECT count(*) FROM fabricator_delta_snapshots('lake', 'main.t');
 ----
 4
 
 # The version column is the full 0..3 history.
 query I
-SELECT version FROM arrownet_delta_snapshots('lake', 'main.t') ORDER BY version;
+SELECT version FROM fabricator_delta_snapshots('lake', 'main.t') ORDER BY version;
 ----
 0
 1
@@ -44,19 +44,19 @@ SELECT version FROM arrownet_delta_snapshots('lake', 'main.t') ORDER BY version;
 
 # A bare table name resolves to "main" on a flat catalog.
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('lake', 't');
+SELECT count(*) FROM fabricator_delta_snapshots('lake', 't');
 ----
 4
 
 # commitInfo is written on EVERY commit (default), so plain tables get operation + timestamp on all versions.
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('lake', 't') WHERE timestamp IS NOT NULL AND operation IS NOT NULL;
+SELECT count(*) FROM fabricator_delta_snapshots('lake', 't') WHERE timestamp IS NOT NULL AND operation IS NOT NULL;
 ----
 4
 
 # v0 is the CREATE TABLE commit; the rest are WRITEs.
 query IT
-SELECT version, operation FROM arrownet_delta_snapshots('lake', 't') ORDER BY version;
+SELECT version, operation FROM fabricator_delta_snapshots('lake', 't') ORDER BY version;
 ----
 0	CREATE TABLE
 1	WRITE
@@ -68,7 +68,7 @@ DETACH lake;
 
 # With in_commit_timestamps, data commits carry a timestamp + operation (the create commit v0 stays null).
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogsnap_ict' AS ict (TYPE arrownet, PROVIDER 'delta', in_commit_timestamps true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/catalogsnap_ict' AS ict (TYPE fabricator, PROVIDER 'delta', in_commit_timestamps true);
 
 statement ok
 CREATE TABLE ict.main.t AS SELECT 1 AS id;
@@ -78,13 +78,13 @@ INSERT INTO ict.main.t VALUES (2);
 
 # All commits have a timestamp (v0 CREATE TABLE + the CTAS data write + the INSERT).
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('ict', 'main.t') WHERE timestamp IS NOT NULL;
+SELECT count(*) FROM fabricator_delta_snapshots('ict', 'main.t') WHERE timestamp IS NOT NULL;
 ----
 3
 
 # The two data commits are WRITEs (v0 is CREATE TABLE).
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('ict', 'main.t') WHERE operation = 'WRITE';
+SELECT count(*) FROM fabricator_delta_snapshots('ict', 'main.t') WHERE operation = 'WRITE';
 ----
 2
 
@@ -92,7 +92,7 @@ SELECT count(*) FROM arrownet_delta_snapshots('ict', 'main.t') WHERE operation =
 query I
 SELECT count(*) FROM (
   SELECT version, timestamp, lag(timestamp) OVER (ORDER BY version) AS prev
-  FROM arrownet_delta_snapshots('ict', 'main.t')
+  FROM fabricator_delta_snapshots('ict', 'main.t')
 ) WHERE timestamp IS NOT NULL AND prev IS NOT NULL AND timestamp < prev;
 ----
 0

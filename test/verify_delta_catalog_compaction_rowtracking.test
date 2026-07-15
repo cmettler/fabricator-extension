@@ -4,17 +4,17 @@
 #              Compaction therefore MATERIALIZES each row's ORIGINAL stable id (__delta_row_id) AND commit version
 #              (__delta_row_commit_version), so a spec reader (Spark) preserves both across OPTIMIZE. This is the
 #              write-shape check (the compacted parquet carries the original per-source ids + distinct versions);
-#              the end-to-end row-id readback is validated on Fabric Spark. Set ARROWNET_DELTA_WRITE_DIR. Local FS.
-# group: [mssql_net]
+#              the end-to-end row-id readback is validated on Fabric Spark. Set FABRICATOR_DELTA_WRITE_DIR. Local FS.
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
 require parquet
 
-require-env ARROWNET_DELTA_WRITE_DIR
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/compactrt' AS lake (TYPE arrownet, PROVIDER 'delta', column_mapping 'none');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/compactrt' AS lake (TYPE fabricator, PROVIDER 'delta', column_mapping 'none');
 
 # Three separately-written small files → three distinct (baseRowId, defaultRowCommitVersion) source ranges.
 # CTAS (id=10) → base_row_id 0; each INSERT bumps the high-water mark → base_row_id 1, then 2. Each is written
@@ -29,17 +29,17 @@ statement ok
 INSERT INTO lake.main.t VALUES (30);
 
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/compactrt/t/*.parquet');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/compactrt/t/*.parquet');
 ----
 3
 
 # OPTIMIZE consolidates the three tiny files into one (they're far under the target file size).
 statement ok
-SELECT mssql_net_exec('lake', 'OPTIMIZE main.t');
+SELECT fabricator_exec('lake', 'OPTIMIZE main.t');
 
 # VACUUM the superseded originals away so ONLY the compacted file remains — the read below then reflects it.
 statement ok
-SELECT mssql_net_exec('lake', 'VACUUM main.t RETAIN 0 HOURS');
+SELECT fabricator_exec('lake', 'VACUUM main.t RETAIN 0 HOURS');
 
 # Data is unchanged and complete after compaction.
 query I
@@ -53,7 +53,7 @@ SELECT id FROM lake.main.t ORDER BY id;
 # baseRowId + position), NOT a fresh high-water-mark range — so Spark reads the row id preserved across OPTIMIZE.
 query II
 SELECT id, "__delta_row_id"
-FROM read_parquet('${ARROWNET_DELTA_WRITE_DIR}/compactrt/t/*.parquet', union_by_name=true)
+FROM read_parquet('${FABRICATOR_DELTA_WRITE_DIR}/compactrt/t/*.parquet', union_by_name=true)
 ORDER BY id;
 ----
 10	0
@@ -65,14 +65,14 @@ ORDER BY id;
 # not represent them). The versions increase with write order (CTAS < INSERT#1 < INSERT#2 == id order).
 query I
 SELECT count(DISTINCT "__delta_row_commit_version")
-FROM read_parquet('${ARROWNET_DELTA_WRITE_DIR}/compactrt/t/*.parquet', union_by_name=true);
+FROM read_parquet('${FABRICATOR_DELTA_WRITE_DIR}/compactrt/t/*.parquet', union_by_name=true);
 ----
 3
 
 query I
 SELECT
-  (SELECT "__delta_row_commit_version" FROM read_parquet('${ARROWNET_DELTA_WRITE_DIR}/compactrt/t/*.parquet', union_by_name=true) WHERE id = 10)
-  < (SELECT "__delta_row_commit_version" FROM read_parquet('${ARROWNET_DELTA_WRITE_DIR}/compactrt/t/*.parquet', union_by_name=true) WHERE id = 30);
+  (SELECT "__delta_row_commit_version" FROM read_parquet('${FABRICATOR_DELTA_WRITE_DIR}/compactrt/t/*.parquet', union_by_name=true) WHERE id = 10)
+  < (SELECT "__delta_row_commit_version" FROM read_parquet('${FABRICATOR_DELTA_WRITE_DIR}/compactrt/t/*.parquet', union_by_name=true) WHERE id = 30);
 ----
 true
 
@@ -81,7 +81,7 @@ statement ok
 DETACH lake;
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/compactrt' AS lake2 (TYPE arrownet, PROVIDER 'delta', column_mapping 'none');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/compactrt' AS lake2 (TYPE fabricator, PROVIDER 'delta', column_mapping 'none');
 
 query I
 SELECT id FROM lake2.main.t ORDER BY id;

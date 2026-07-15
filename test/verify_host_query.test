@@ -1,68 +1,68 @@
 # name: test/verify_host_query.test
-# description: arrownet_host_query(sql) — run a query on a FRESH host DuckDB connection (own context/txn)
+# description: fabricator_host_query(sql) — run a query on a FRESH host DuckDB connection (own context/txn)
 #              and stream the result back as Arrow through the ingest path. Pure C++ (no SQL Server / no
 #              live backend), so it runs anywhere the extension loads. See docs/host-query.md.
-# group: [mssql_net]
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
 # Basic round-trip: a literal projection run on a fresh host connection.
 query II
-SELECT x, y FROM arrownet_host_query('SELECT 42 AS x, ''hi'' AS y');
+SELECT x, y FROM fabricator_host_query('SELECT 42 AS x, ''hi'' AS y');
 ----
 42	hi
 
 # Multi-chunk streaming (1000 rows > a vector) materialized + streamed back.
 query II
-SELECT count(*), sum(i) FROM arrownet_host_query('SELECT * FROM range(1000) t(i)');
+SELECT count(*), sum(i) FROM fabricator_host_query('SELECT * FROM range(1000) t(i)');
 ----
 1000	499500
 
 # Projection + filter are applied ABOVE the host-query scan (DuckDB owns them).
 query I
-SELECT y FROM arrownet_host_query('SELECT 1 x, ''a'' y UNION ALL SELECT 2, ''b''') WHERE x = 2;
+SELECT y FROM fabricator_host_query('SELECT 1 x, ''a'' y UNION ALL SELECT 2, ''b''') WHERE x = 2;
 ----
 b
 
 # Reuse a DuckDB feature (the catalog) through the fresh host connection.
 query I
-SELECT c > 0 FROM arrownet_host_query('SELECT count(*) c FROM duckdb_functions()');
+SELECT c > 0 FROM fabricator_host_query('SELECT count(*) c FROM duckdb_functions()');
 ----
 true
 
 # A query error surfaces as an error (not silent empty).
 statement error
-SELECT * FROM arrownet_host_query('SELECT * FROM a_table_that_does_not_exist_xyz');
+SELECT * FROM fabricator_host_query('SELECT * FROM a_table_that_does_not_exist_xyz');
 ----
 
-# Ambient named-source registry: arrownet_scan(name) scans a source registered in C# (Host.RegisterSource).
-# `arrownet_demo_numbers` is a built-in demo source ([10,20,30]); no catalog/ATTACH needed.
+# Ambient named-source registry: fabricator_scan(name) scans a source registered in C# (Host.RegisterSource).
+# `fabricator_demo_numbers` is a built-in demo source ([10,20,30]); no catalog/ATTACH needed.
 query I
-SELECT value FROM arrownet_scan('arrownet_demo_numbers') ORDER BY value;
+SELECT value FROM fabricator_scan('fabricator_demo_numbers') ORDER BY value;
 ----
 10
 20
 30
 
 query I
-SELECT sum(value)::BIGINT FROM arrownet_scan('arrownet_demo_numbers');
+SELECT sum(value)::BIGINT FROM fabricator_scan('fabricator_demo_numbers');
 ----
 60
 
 # An unregistered name errors clearly (not a silent empty result).
 statement error
-SELECT * FROM arrownet_scan('no_such_source_xyz');
+SELECT * FROM fabricator_scan('no_such_source_xyz');
 ----
 
-# Replacement scan: a BARE table name matching a registered source resolves to arrownet_scan automatically,
+# Replacement scan: a BARE table name matching a registered source resolves to fabricator_scan automatically,
 # so it's usable like any table (here in an aggregate + a filter).
 query I
-SELECT sum(value)::BIGINT FROM arrownet_demo_numbers;
+SELECT sum(value)::BIGINT FROM fabricator_demo_numbers;
 ----
 60
 
 query I
-SELECT count(*) FROM arrownet_demo_numbers WHERE value > 15;
+SELECT count(*) FROM fabricator_demo_numbers WHERE value > 15;
 ----
 2
 

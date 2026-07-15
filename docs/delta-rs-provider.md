@@ -10,21 +10,21 @@ full DuckDB-native rowid DML) and `deltars` (opt-in, production-grade reads/writ
 
 ## Implementation status — v1 BUILT + verified (local FS)
 
-A working `deltars` provider is implemented in the new `dotnet/ArrowNet.DeltaRs` project (`DeltaRsBackend` +
+A working `deltars` provider is implemented in the new `dotnet/Fabricator.DeltaRs` project (`DeltaRsBackend` +
 `DeltaRsCatalog` + `StorageOptionsCodec`), registered in `BackendRegistry` (default list; skipped if the
 assembly/native libs aren't published) and published opt-in via `publish-managed.ps1 -IncludeDeltaRs` (brings
 `DeltaLake.dll` + the two native Rust DLLs). **No ABI/C++ change** — pure-C# sibling provider. Verified end to
 end on Windows via `test/verify_delta_rs.test` (25 assertions) and a live shell smoke:
 
-- **Working**: `ATTACH … (TYPE arrownet, PROVIDER 'deltars')` (+ alias `'delta-rs'`); discovery (local FS);
+- **Working**: `ATTACH … (TYPE fabricator, PROVIDER 'deltars')` (+ alias `'delta-rs'`); discovery (local FS);
   metadata (schemas/tables/columns); **scan** (owned `Apache.Arrow.Table` via `ReadAsArrowTableAsync`, streamed
   as batches); **filter pushdown** (FilterNode → DataFusion WHERE, see below); **CREATE/CTAS/INSERT/COPY**
-  (append + overwrite; `COPY … (FORMAT mssql_net)` — `CREATE_TABLE false`→append, default→overwrite, new
+  (append + overwrite; `COPY … (FORMAT mssql)` — `CREATE_TABLE false`→append, default→overwrite, new
   table→create; `SCHEMA_MODE 'overwrite'` adopts the incoming schema (SchemaMode::Overwrite), `'merge'` appends
   + unions new source columns, old rows NULL (SchemaMode::Merge — see below)); **DELETE + UPDATE** (rowid →
   record-batch MERGE, see below); **time travel** (`AT (VERSION => n)`,
-  via QueryAsync, see below); **snapshots** (`arrownet_delta_snapshots` → `HistoryAsync`); **Change Data Feed**
-  (`change_data_feed` option + `arrownet_delta_changes`, see below); **maintenance** (OPTIMIZE / Z-ORDER /
+  via QueryAsync, see below); **snapshots** (`fabricator_delta_snapshots` → `HistoryAsync`); **Change Data Feed**
+  (`change_data_feed` option + `fabricator_delta_changes`, see below); **maintenance** (OPTIMIZE / Z-ORDER /
   VACUUM / CHECKPOINT, see below); re-attach durability. Tests: `verify_delta_rs.test` (56) +
   `_maintenance` (12) + `_pushdown` (27) + `_cdf` (31) + `_time_travel` (39) + `_copy` (29) + `_alter` (47). No regression to
   the engineered-wood provider.
@@ -38,10 +38,10 @@ end on Windows via `test/verify_delta_rs.test` (25 assertions) and a live shell 
   is our empty CREATE commit anyway). **TIMESTAMP travel works too** (`LoadDateTimeAsync` resolves the version
   as of the instant): `now()`/future → the latest snapshot, an instant before commit-0 → the empty v0.
 - **Change Data Feed**: `ATTACH '(… change_data_feed true)'` enables `delta.enableChangeDataFeed` on tables
-  created in the catalog; read the row-level feed via `arrownet_delta_changes('<catalog>', '<schema.>table',
+  created in the catalog; read the row-level feed via `fabricator_delta_changes('<catalog>', '<schema.>table',
   from [, to])` → `QueryTableChangesAsync` (`_change_type` / `_commit_version` / `_commit_timestamp`).
 - **Maintenance** (delta-rs ops engineered-wood lacks) via a small command dialect on
-  `mssql_net_exec('<catalog>', '<cmd>')` (implemented in `ExecuteNonQuery`, C#-only, no ABI/C++ change):
+  `fabricator_exec('<catalog>', '<cmd>')` (implemented in `ExecuteNonQuery`, C#-only, no ABI/C++ change):
   `OPTIMIZE <table> [ZORDER (c1, …)]` (bin-pack or Z-order clustering), `VACUUM <table> [RETAIN <h> HOURS]
   [DRY RUN]`, `CHECKPOINT <table>` (`<table>` = `<schema>.<table>`, schema defaults to `main`). Verified:
   OPTIMIZE commits an `OPTIMIZE` version, Z-ORDER, CHECKPOINT, VACUUM DRY RUN, data survives, unknown verb
@@ -87,15 +87,15 @@ end on Windows via `test/verify_delta_rs.test` (25 assertions) and a live shell 
   [WHEN NOT MATCHED BY SOURCE THEN DELETE]` as **one native delta-rs MERGE commit** (single-pass upsert, more
   efficient + more expressive than the rowid DELETE+INSERT decomposition; the canonical Databricks/Spark
   upsert). Not automatic because DuckDB's own `MERGE` decomposes into rowid DML for a custom catalog (never
-  handed to us as a MERGE), so it needs a **dedicated entry point** — most naturally an `mssql_net_exec`
+  handed to us as a MERGE), so it needs a **dedicated entry point** — most naturally an `fabricator_exec`
   MERGE dialect. **Design catch:** `MergeAsync(mergeSql, records, schema)` takes the source as materialized
   `RecordBatch`es named by the `USING <alias>`, not a live subquery — so the surface must accept a source
-  query whose rows we materialize and feed in as that alias (e.g. `arrownet_delta_merge(catalog, mergeSql,
+  query whose rows we materialize and feed in as that alias (e.g. `fabricator_delta_merge(catalog, mergeSql,
   (SELECT …))`).
 
 ### Cloud (OneLake) — DONE + live-validated (2026-07)
 
-`ATTACH 'abfss://<ws>@onelake.dfs.fabric.microsoft.com/<lh>.Lakehouse/Tables' (TYPE arrownet, PROVIDER
+`ATTACH 'abfss://<ws>@onelake.dfs.fabric.microsoft.com/<lh>.Lakehouse/Tables' (TYPE fabricator, PROVIDER
 'deltars', SECRET <azure_sp>)` discovers + reads OneLake tables. Validated live against `LH_no_schema`
 (flat): all 4 tables discovered under `main`, `load_a` → 2000 rows, filter pushdown works.
 
@@ -113,7 +113,7 @@ How it's wired:
 - **Scan / time-travel / snapshots / CDF / DML** all flow through `TableUri` + `storage_options`, so they work
   on OneLake too. **Writes are live-validated**: CTAS + INSERT + read-back + **DROP TABLE** (recursive DFS
   delete via `FabricLakehouse.DeleteOneLakeDirectory` on the GUID-abfss path — the delete engineered-wood uses
-  live) round-tripped on `LH_no_schema` (create `arrownet_deltars_wtest`, 3→4 rows, drop). `READ_ONLY false`
+  live) round-tripped on `LH_no_schema` (create `fabricator_deltars_wtest`, 3→4 rows, drop). `READ_ONLY false`
   is required on the ATTACH (DuckDB force-bumps a remote abfss ATTACH to read-only under AUTOMATIC). OneLake
   **RENAME** is deferred (a DFS-rename path-form nuance, untestable locally). A OneLake ATTACH of a lakehouse with a very large table is
   still slow on *full enumeration* (`information_schema.tables` etc.) — the per-table column materialization,
@@ -246,14 +246,14 @@ its two native DLLs (the +240 MB cost). A net10 host referencing the net9.0 asse
 | `ScanTable(specJson, filterValues)` | `QueryAsync(SelectQuery "SELECT <cols> FROM t WHERE <pred>")` → `IAsyncEnumerable<RecordBatch>` | ✅ streaming + **file/stats-skipping pushdown** via DataFusion; translate our `FilterNode`→SQL WHERE. (`ReadAsArrowTableAsync` materializes the whole table — only for small/whole reads) |
 | `BulkInsert` (create/replace/append) | `CreateTableAsync` + `InsertAsync(SaveMode.Append/Overwrite)`; `InsertAsync(IArrowArrayStream)` streams; `MaxRowsPerGroup` tuning | ✅ clean; **standard-compliant writes** (kills the Fabric/Spark read-compat battles) |
 | time travel (`spec.At`) | `LoadTableAsync{Version=n}` / `LoadDateTimeAsync(ts)` | ✅ native **version and timestamp** |
-| `arrownet_delta_snapshots` | `HistoryAsync(limit)` → `CommitInfo[]` (operation, params, timestamp, isolation, blind-append) | ✅ richer than ours |
-| `arrownet_delta_changes` (CDF) | `QueryTableChangesAsync(start, end)` → `_change_type`/`_commit_version`/`_commit_timestamp` | ✅ native |
+| `fabricator_delta_snapshots` | `HistoryAsync(limit)` → `CommitInfo[]` (operation, params, timestamp, isolation, blind-append) | ✅ richer than ours |
+| `fabricator_delta_changes` (CDF) | `QueryTableChangesAsync(start, end)` → `_change_type`/`_commit_version`/`_commit_timestamp` | ✅ native |
 | **`ExecuteDelete(keys)`** | `DeleteAsync(predicate)` — no rowid/position API | ⚠️ **mismatch — see below** |
 | **`ExecuteUpdate(setCols, data)`** | `UpdateAsync(sqlString)` — no rowid/position API | ⚠️ **mismatch** |
 | `AlterTable(AddColumn)` | *no add-column API* (only `InsertOptions.OverwriteSchema` on a write) | ❌ **regresses** vs engineered-wood's `AddColumnAsync` |
 | `CreateSchema`/`DropSchema` | *our* directory layout (delta-dotnet is single-table) | reuse existing |
 | `DropTable` | *our* recursive dir delete (`fs_remove_dir` / DFS) | reuse existing |
-| — **new capabilities** | `VacuumAsync`, `OptimizeAsync` (BinPack / **ZOrder**), `CheckpointAsync`, `RestoreAsync`, `AddConstraintsAsync` (CHECK), `MergeAsync` | ✨ expose as functions (`arrownet_delta_optimize(...)`, `_vacuum`, `_checkpoint`, `_merge`) — the catalog table-function machinery already exists |
+| — **new capabilities** | `VacuumAsync`, `OptimizeAsync` (BinPack / **ZOrder**), `CheckpointAsync`, `RestoreAsync`, `AddConstraintsAsync` (CHECK), `MergeAsync` | ✨ expose as functions (`fabricator_delta_optimize(...)`, `_vacuum`, `_checkpoint`, `_merge`) — the catalog table-function machinery already exists |
 
 ## The DML crux (the hard part)
 
@@ -272,7 +272,7 @@ So `DELETE FROM lake.t WHERE …` / `UPDATE …` through DuckDB syntax has three
 - **(a) reconstruct a predicate** from the scanned key rows → `WHERE (k1,k2) IN ((…),(…))` → `DeleteAsync`.
   Works only when the table has a real unique key (Fabric/Delta tables often don't). Fragile.
 - **(b) passthrough functions** — expose delete/update/merge as explicit functions
-  (`arrownet_delta_merge(...)`, a predicate-delete function) that call delta-rs directly. Full power, but not
+  (`fabricator_delta_merge(...)`, a predicate-delete function) that call delta-rs directly. Full power, but not
   DuckDB `DELETE`/`UPDATE` syntax.
 - **(c) defer UPDATE/DELETE** in v1 (read + append/overwrite + maintenance only) and route rowid DML to the
   `engineeredwooddelta` provider.
@@ -294,7 +294,7 @@ So `DELETE FROM lake.t WHERE …` / `UPDATE …` through DuckDB syntax has three
    + `HistoryAsync` snapshots + CDF. Pure win, low risk.
 2. **Append/overwrite writes** — `CreateTableAsync` + `InsertAsync`; standard-compliant, Fabric-safe by
    construction.
-3. **Maintenance functions** — `arrownet_delta_optimize`/`_vacuum`/`_checkpoint`/`_zorder` (catalog-bound or
+3. **Maintenance functions** — `fabricator_delta_optimize`/`_vacuum`/`_checkpoint`/`_zorder` (catalog-bound or
    global table functions; the machinery exists).
 4. **DML** — passthrough functions first (`_delta_merge`, predicate delete); attempt rowid-parity via
    key-reconstruction only when a unique key exists.
@@ -302,7 +302,7 @@ So `DELETE FROM lake.t WHERE …` / `UPDATE …` through DuckDB syntax has three
 ## Skeleton sketch
 
 ```csharp
-// dotnet/ArrowNet.DeltaRs/DeltaRsBackend.cs  (new project, refs DeltaLake.Net + Apache.Arrow 23.0.0)
+// dotnet/Fabricator.DeltaRs/DeltaRsBackend.cs  (new project, refs DeltaLake.Net + Apache.Arrow 23.0.0)
 internal sealed class DeltaRsBackend : IBackend
 {
     public string Name => "deltars";

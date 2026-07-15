@@ -7,28 +7,28 @@
 #              tables (CREATE + CTAS), skipped when a column is explicitly marked or the name already exists. The
 #              engine assigns identity values on INSERT (the column is absent from the source, so SqlBulkCopy's
 #              name-based mapping skips it). Runs on box SQL Server (IDENTITY(1,1), sequential from 1).
-# group: [mssql_net]
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql_net);
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
 
 statement ok
-DROP TABLE IF EXISTS db.dbo.arrownet_idt1;
+DROP TABLE IF EXISTS db.dbo.fabricator_idt1;
 
 # --- (1) generated-column marker → IDENTITY ---
 statement ok
-CREATE TABLE db.dbo.arrownet_idt1 (OrderID BIGINT AS (0), CustomerID INTEGER);
+CREATE TABLE db.dbo.fabricator_idt1 (OrderID BIGINT AS (0), CustomerID INTEGER);
 
 statement ok
-INSERT INTO db.dbo.arrownet_idt1 (CustomerID) VALUES (100),(200),(300);
+INSERT INTO db.dbo.fabricator_idt1 (CustomerID) VALUES (100),(200),(300);
 
 # OrderID is engine-assigned (box IDENTITY(1,1) → 1,2,3 in insert order).
 query II
-SELECT OrderID, CustomerID FROM db.dbo.arrownet_idt1 ORDER BY CustomerID;
+SELECT OrderID, CustomerID FROM db.dbo.fabricator_idt1 ORDER BY CustomerID;
 ----
 1	100
 2	200
@@ -36,8 +36,8 @@ SELECT OrderID, CustomerID FROM db.dbo.arrownet_idt1 ORDER BY CustomerID;
 
 # It is a real IDENTITY column in SQL Server metadata.
 query I
-SELECT * FROM mssql_net_query('${MSSQL_TESTDB_DSN}',
-  'SELECT COLUMNPROPERTY(OBJECT_ID(''dbo.arrownet_idt1''),''OrderID'',''IsIdentity'')');
+SELECT * FROM fabricator_query('${MSSQL_TESTDB_DSN}',
+  'SELECT COLUMNPROPERTY(OBJECT_ID(''dbo.fabricator_idt1''),''OrderID'',''IsIdentity'')');
 ----
 1
 
@@ -46,32 +46,32 @@ statement ok
 SET mssql_add_identity=true;
 
 statement ok
-DROP TABLE IF EXISTS db.dbo.arrownet_idt2;
+DROP TABLE IF EXISTS db.dbo.fabricator_idt2;
 
 statement ok
-CREATE TABLE db.dbo.arrownet_idt2 (a INTEGER, b INTEGER);
+CREATE TABLE db.dbo.fabricator_idt2 (a INTEGER, b INTEGER);
 
 statement ok
-INSERT INTO db.dbo.arrownet_idt2 (a,b) VALUES (1,2),(3,4);
+INSERT INTO db.dbo.fabricator_idt2 (a,b) VALUES (1,2),(3,4);
 
-# The auto column arrownet_idt2_id is present + engine-assigned.
+# The auto column fabricator_idt2_id is present + engine-assigned.
 query III
-SELECT * FROM mssql_net_query('${MSSQL_TESTDB_DSN}',
-  'SELECT arrownet_idt2_id, a, b FROM dbo.arrownet_idt2 ORDER BY a');
+SELECT * FROM fabricator_query('${MSSQL_TESTDB_DSN}',
+  'SELECT fabricator_idt2_id, a, b FROM dbo.fabricator_idt2 ORDER BY a');
 ----
 1	1	2
 2	3	4
 
 # --- (3) CTAS + add_identity ---
 statement ok
-DROP TABLE IF EXISTS db.dbo.arrownet_idt3;
+DROP TABLE IF EXISTS db.dbo.fabricator_idt3;
 
 statement ok
-CREATE TABLE db.dbo.arrownet_idt3 AS SELECT * FROM (VALUES (10),(20),(30)) AS t(v);
+CREATE TABLE db.dbo.fabricator_idt3 AS SELECT * FROM (VALUES (10),(20),(30)) AS t(v);
 
 query II
-SELECT * FROM mssql_net_query('${MSSQL_TESTDB_DSN}',
-  'SELECT arrownet_idt3_id, v FROM dbo.arrownet_idt3 ORDER BY v');
+SELECT * FROM fabricator_query('${MSSQL_TESTDB_DSN}',
+  'SELECT fabricator_idt3_id, v FROM dbo.fabricator_idt3 ORDER BY v');
 ----
 1	10
 2	20
@@ -79,17 +79,17 @@ SELECT * FROM mssql_net_query('${MSSQL_TESTDB_DSN}',
 
 # --- add_identity is skipped when the target name already exists (no double column) ---
 statement ok
-DROP TABLE IF EXISTS db.dbo.arrownet_idt4;
+DROP TABLE IF EXISTS db.dbo.fabricator_idt4;
 
 statement ok
-CREATE TABLE db.dbo.arrownet_idt4 (arrownet_idt4_id INTEGER, x INTEGER);
+CREATE TABLE db.dbo.fabricator_idt4 (fabricator_idt4_id INTEGER, x INTEGER);
 
 statement ok
-INSERT INTO db.dbo.arrownet_idt4 (arrownet_idt4_id, x) VALUES (99, 7);
+INSERT INTO db.dbo.fabricator_idt4 (fabricator_idt4_id, x) VALUES (99, 7);
 
-# The user's own arrownet_idt4_id is kept as a normal INT (not overwritten by an auto identity).
+# The user's own fabricator_idt4_id is kept as a normal INT (not overwritten by an auto identity).
 query II
-SELECT arrownet_idt4_id, x FROM db.dbo.arrownet_idt4;
+SELECT fabricator_idt4_id, x FROM db.dbo.fabricator_idt4;
 ----
 99	7
 
@@ -98,17 +98,17 @@ SET mssql_add_identity=false;
 
 # --- an IDENTITY column is usable as the rowid when the table has NO PK/UNIQUE (enables UPDATE/DELETE) ---
 statement ok
-DROP TABLE IF EXISTS db.dbo.arrownet_idrid;
+DROP TABLE IF EXISTS db.dbo.fabricator_idrid;
 
 statement ok
-CREATE TABLE db.dbo.arrownet_idrid (OrderID BIGINT AS (0), val VARCHAR, qty INTEGER);
+CREATE TABLE db.dbo.fabricator_idrid (OrderID BIGINT AS (0), val VARCHAR, qty INTEGER);
 
 statement ok
-INSERT INTO db.dbo.arrownet_idrid (val, qty) VALUES ('a',1),('b',2),('c',3);
+INSERT INTO db.dbo.fabricator_idrid (val, qty) VALUES ('a',1),('b',2),('c',3);
 
 # rowid resolves to the identity column (box IDENTITY(1,1) → 1,2,3).
 query I
-SELECT rowid FROM db.dbo.arrownet_idrid ORDER BY qty;
+SELECT rowid FROM db.dbo.fabricator_idrid ORDER BY qty;
 ----
 1
 2
@@ -116,10 +116,10 @@ SELECT rowid FROM db.dbo.arrownet_idrid ORDER BY qty;
 
 # UPDATE via the identity rowid.
 statement ok
-UPDATE db.dbo.arrownet_idrid SET qty = qty + 100 WHERE val = 'b';
+UPDATE db.dbo.fabricator_idrid SET qty = qty + 100 WHERE val = 'b';
 
 query TI
-SELECT val, qty FROM db.dbo.arrownet_idrid ORDER BY val;
+SELECT val, qty FROM db.dbo.fabricator_idrid ORDER BY val;
 ----
 a	1
 b	102
@@ -127,48 +127,48 @@ c	3
 
 # DELETE via the identity rowid.
 statement ok
-DELETE FROM db.dbo.arrownet_idrid WHERE val = 'a';
+DELETE FROM db.dbo.fabricator_idrid WHERE val = 'a';
 
 query TI
-SELECT val, qty FROM db.dbo.arrownet_idrid ORDER BY val;
+SELECT val, qty FROM db.dbo.fabricator_idrid ORDER BY val;
 ----
 b	102
 c	3
 
 statement ok
-DROP TABLE db.dbo.arrownet_idrid;
+DROP TABLE db.dbo.fabricator_idrid;
 
 # --- with add_identity OFF, no auto column is added (a plain table) ---
 statement ok
-DROP TABLE IF EXISTS db.dbo.arrownet_idt5;
+DROP TABLE IF EXISTS db.dbo.fabricator_idt5;
 
 statement ok
-CREATE TABLE db.dbo.arrownet_idt5 (a INTEGER);
+CREATE TABLE db.dbo.fabricator_idt5 (a INTEGER);
 
 statement ok
-INSERT INTO db.dbo.arrownet_idt5 VALUES (1);
+INSERT INTO db.dbo.fabricator_idt5 VALUES (1);
 
 # Exactly one column (no surrogate key).
 query I
-SELECT count(*) FROM mssql_net_query('${MSSQL_TESTDB_DSN}',
-  'SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME=''arrownet_idt5''');
+SELECT count(*) FROM fabricator_query('${MSSQL_TESTDB_DSN}',
+  'SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME=''fabricator_idt5''');
 ----
 1
 
 statement ok
-DROP TABLE db.dbo.arrownet_idt1;
+DROP TABLE db.dbo.fabricator_idt1;
 
 statement ok
-DROP TABLE db.dbo.arrownet_idt2;
+DROP TABLE db.dbo.fabricator_idt2;
 
 statement ok
-DROP TABLE db.dbo.arrownet_idt3;
+DROP TABLE db.dbo.fabricator_idt3;
 
 statement ok
-DROP TABLE db.dbo.arrownet_idt4;
+DROP TABLE db.dbo.fabricator_idt4;
 
 statement ok
-DROP TABLE db.dbo.arrownet_idt5;
+DROP TABLE db.dbo.fabricator_idt5;
 
 statement ok
 DETACH db;

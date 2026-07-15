@@ -3,17 +3,17 @@
 #              the data files through DuckDB's NATIVE parquet reader (Host.Query over the exact active file set)
 #              instead of engineered-wood's C# reader. Opt-in, read-only: rowid DML, time travel, and DV tables
 #              transparently fall back to the C# reader (verified here to stay correct). Byte-source switch only —
-#              writes/DDL/DML are unchanged. Set ARROWNET_DELTA_WRITE_DIR (writable). Local FS.
-# group: [mssql_net]
+#              writes/DDL/DML are unchanged. Set FABRICATOR_DELTA_WRITE_DIR (writable). Local FS.
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
 require parquet
 
-require-env ARROWNET_DELTA_WRITE_DIR
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catnative' AS lake (TYPE arrownet, PROVIDER 'delta', native_read true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/catnative' AS lake (TYPE fabricator, PROVIDER 'delta', native_read true);
 
 # CREATE + INSERT use the ordinary C# bulk write path (native_read only affects reads).
 statement ok
@@ -90,7 +90,7 @@ SELECT id, name FROM lake.main.t ORDER BY id;
 
 # ---- A DV table on a native_read catalog falls back to the C# reader (still correct) ----
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catnativedv' AS dvlake (TYPE arrownet, PROVIDER 'delta', native_read true, deletion_vectors true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/catnativedv' AS dvlake (TYPE fabricator, PROVIDER 'delta', native_read true, deletion_vectors true);
 
 statement ok
 CREATE TABLE dvlake.main.d AS SELECT i AS id FROM range(1, 8) AS r(i);
@@ -114,7 +114,7 @@ SELECT count(id), sum(id) FROM dvlake.main.d;
 
 # ---- Time travel via the native reader (AT VERSION resolves the snapshot; read_parquet reads those files) ----
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catnativett' AS ttlake (TYPE arrownet, PROVIDER 'delta', native_read true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/catnativett' AS ttlake (TYPE fabricator, PROVIDER 'delta', native_read true);
 
 # Empty CREATE = commit v0; each INSERT is its own commit (v1, v2, v3).
 statement ok
@@ -178,7 +178,7 @@ COMMIT;
 # ============================================================================
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/nr_part' AS np (TYPE arrownet, PROVIDER 'delta', native_write true, native_read true, column_mapping 'none');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nr_part' AS np (TYPE fabricator, PROVIDER 'delta', native_write true, native_read true, column_mapping 'none');
 
 statement ok
 CREATE TABLE np.main.t PARTITIONED BY (region) AS
@@ -208,7 +208,7 @@ DETACH np;
 
 # MAPPED (default name mode): partitionValues are keyed by the PHYSICAL column name — dual lookup
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/nr_partm' AS npm (TYPE arrownet, PROVIDER 'delta', native_write true, native_read true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nr_partm' AS npm (TYPE fabricator, PROVIDER 'delta', native_write true, native_read true);
 
 statement ok
 CREATE TABLE npm.main.t PARTITIONED BY (region) AS

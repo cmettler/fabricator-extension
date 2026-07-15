@@ -5,14 +5,14 @@
 #              seam. RENAME TABLE moves the table folder (local). RENAME/DROP COLUMN + ALTER TYPE need column
 #              mapping → clean error. Requires the delta-rs native libs (publish-managed.ps1 -IncludeDeltaRs).
 #              Local FS.
-# group: [mssql_net]
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
-require-env ARROWNET_DELTA_WRITE_DIR
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/dra' AS lake (TYPE arrownet, PROVIDER 'deltars');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/dra' AS lake (TYPE fabricator, PROVIDER 'deltars');
 
 statement ok
 CREATE TABLE lake.main.t AS SELECT * FROM (VALUES (1,'a'),(2,'b')) v(id,name);
@@ -65,7 +65,7 @@ statement ok
 DETACH lake;
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/dra' AS lake (TYPE arrownet, PROVIDER 'deltars');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/dra' AS lake (TYPE fabricator, PROVIDER 'deltars');
 
 query I
 SELECT count(*) FROM lake.main.t2;

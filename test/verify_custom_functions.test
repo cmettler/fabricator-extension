@@ -2,12 +2,12 @@
 # description: Provider-authored custom C# scalar + table functions are callable as db.schema.fn(args) at attach time
 # group: [mssql]
 
-require mssql_net
+require fabricator
 
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS cdb (TYPE mssql_net);
+ATTACH '${MSSQL_TESTDB_DSN}' AS cdb (TYPE fabricator);
 
 # dbo.cf_add is a custom C# function (an ArrowScalarFunction baked into the provider), NOT a
 # SQL Server object — surfaced into the attached catalog like a discovered function.
@@ -62,13 +62,13 @@ SELECT cdb.dbo.cf_host_param(0);
 
 # It is discovered like any catalog function...
 query TTT
-SELECT schema_name, name, kind FROM mssql_net_functions('cdb') WHERE name = 'cf_add';
+SELECT schema_name, name, kind FROM fabricator_functions('cdb') WHERE name = 'cf_add';
 ----
 dbo	cf_add	scalar
 
 # ...yet there is NO such object in SQL Server — proving it is the C#-authored custom function.
 query I
-SELECT cnt FROM mssql_net_query('cdb', 'SELECT COUNT(*) AS cnt FROM sys.objects WHERE name = ''cf_add''');
+SELECT cnt FROM fabricator_query('cdb', 'SELECT COUNT(*) AS cnt FROM sys.objects WHERE name = ''cf_add''');
 ----
 0
 
@@ -97,7 +97,7 @@ SELECT count(*), sum(value) FROM cdb.dbo.cf_range(5);
 
 # Discovered as a table function — again with no backing SQL Server object.
 query TT
-SELECT name, kind FROM mssql_net_functions('cdb') WHERE name = 'cf_range';
+SELECT name, kind FROM fabricator_functions('cdb') WHERE name = 'cf_range';
 ----
 cf_range	table
 
@@ -127,13 +127,13 @@ SELECT count(*), max(running) FROM cdb.dbo.cf_running_sum((SELECT v.n FROM (VALU
 
 # Discovered with kind 'inout', and (like the others) no backing SQL Server object.
 query TT
-SELECT name, kind FROM mssql_net_functions('cdb') WHERE name IN ('cf_tag', 'cf_running_sum') ORDER BY name;
+SELECT name, kind FROM fabricator_functions('cdb') WHERE name IN ('cf_tag', 'cf_running_sum') ORDER BY name;
 ----
 cf_running_sum	inout
 cf_tag	inout
 
 query I
-SELECT cnt FROM mssql_net_query('cdb', 'SELECT COUNT(*) AS cnt FROM sys.objects WHERE name IN (''cf_tag'', ''cf_running_sum'')');
+SELECT cnt FROM fabricator_query('cdb', 'SELECT COUNT(*) AS cnt FROM sys.objects WHERE name IN (''cf_tag'', ''cf_running_sum'')');
 ----
 0
 
@@ -227,12 +227,12 @@ SELECT count(*), max(rownum) FROM cdb.dbo.cf_exchange((SELECT t.n::INTEGER FROM 
 
 # Discovered as kind 'inout' (same as the per-chunk custom in-out), with no backing SQL Server object.
 query TT
-SELECT name, kind FROM mssql_net_functions('cdb') WHERE name = 'cf_exchange';
+SELECT name, kind FROM fabricator_functions('cdb') WHERE name = 'cf_exchange';
 ----
 cf_exchange	inout
 
 query I
-SELECT cnt FROM mssql_net_query('cdb', 'SELECT COUNT(*) AS cnt FROM sys.objects WHERE name = ''cf_exchange''');
+SELECT cnt FROM fabricator_query('cdb', 'SELECT COUNT(*) AS cnt FROM sys.objects WHERE name = ''cf_exchange''');
 ----
 0
 

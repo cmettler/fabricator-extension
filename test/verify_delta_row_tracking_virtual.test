@@ -2,24 +2,24 @@
 # description: Delta `native_read` — the STABLE row-tracking id + commit version as provider VIRTUAL columns
 #              (__delta_row_id / __delta_row_commit_version, the Delta materialized-column names): queryable
 #              by name, excluded from SELECT *, advertised only for row-tracking tables on native_read
-#              catalogs (ARROWNET_META_VIRTUAL_COLUMNS). Per row: COALESCE(materialized column, baseRowId +
+#              catalogs (FABRICATOR_META_VIRTUAL_COLUMNS). Per row: COALESCE(materialized column, baseRowId +
 #              file position) / defaultRowCommitVersion — so a buffered (explicit-txn) UPDATE preserves the
 #              id and bumps the version (post-images bake materialized ids), OPTIMIZE preserves both
 #              (compaction materializes), a DV DELETE removes the row's id. baseRowId is assigned in COMMIT
 #              order, so id values are deterministic (unlike file ordinals). The autocommit copy-on-write
 #              UPDATE (mapped tables take CoW, not merge-on-read) loses row tracking on the rewritten file —
 #              the documented deferred P5-rewrite gap — which reads as NULL (honest, pinned below).
-#              Set ARROWNET_DELTA_WRITE_DIR (writable). Local FS.
-# group: [mssql_net]
+#              Set FABRICATOR_DELTA_WRITE_DIR (writable). Local FS.
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
 require parquet
 
-require-env ARROWNET_DELTA_WRITE_DIR
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/rtvirt' AS lake (TYPE arrownet, PROVIDER 'delta', native_read true, native_write true, row_tracking true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/rtvirt' AS lake (TYPE fabricator, PROVIDER 'delta', native_read true, native_write true, row_tracking true);
 
 # v0 CREATE + v1 WRITE (ids 0..4), v2 WRITE (ids 5..9) — ids follow commit order
 statement ok
@@ -98,7 +98,7 @@ SELECT count(*) FROM lake.main.rt WHERE __delta_row_id IN (5, 7);
 # ---- OPTIMIZE (compaction) preserves ids + versions via materialized columns ----
 
 query I
-SELECT mssql_net_exec('lake', 'OPTIMIZE main.rt');
+SELECT fabricator_exec('lake', 'OPTIMIZE main.rt');
 ----
 0
 
@@ -216,7 +216,7 @@ SELECT id, __delta_row_id IS NOT NULL FROM lake.main.pt WHERE id = 4;
 #      add never double-count as inserts) ----
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/rtvirt3' AS lake4 (TYPE arrownet, PROVIDER 'delta', native_read true, native_write true, row_tracking true, change_data_feed true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/rtvirt3' AS lake4 (TYPE fabricator, PROVIDER 'delta', native_read true, native_write true, row_tracking true, change_data_feed true);
 
 statement ok
 CREATE TABLE lake4.main.cd AS SELECT r AS id, 'v' || r AS s FROM range(4) t(r);
@@ -235,13 +235,13 @@ SELECT id, __delta_row_id FROM lake4.main.cd WHERE id = 1;
 1	1
 
 query TIT
-SELECT _change_type, id, s FROM arrownet_delta_changes('lake4', 'main.cd', 2) ORDER BY _change_type;
+SELECT _change_type, id, s FROM fabricator_delta_changes('lake4', 'main.cd', 2) ORDER BY _change_type;
 ----
 update_postimage	1	mor
 update_preimage	1	v1
 
 query TI
-SELECT _change_type, count(*) FROM arrownet_delta_changes('lake4', 'main.cd', 0) GROUP BY _change_type ORDER BY _change_type;
+SELECT _change_type, count(*) FROM fabricator_delta_changes('lake4', 'main.cd', 0) GROUP BY _change_type ORDER BY _change_type;
 ----
 insert	4
 update_postimage	1
@@ -268,7 +268,7 @@ SELECT id, __delta_row_id FROM lake4.main.cdp WHERE id = 1;
 1	2
 
 query TTIT
-SELECT _change_type, region, id, s FROM arrownet_delta_changes('lake4', 'main.cdp', 2) ORDER BY _change_type;
+SELECT _change_type, region, id, s FROM fabricator_delta_changes('lake4', 'main.cdp', 2) ORDER BY _change_type;
 ----
 update_postimage	EU	1	mor
 update_preimage	EU	1	v1
@@ -278,7 +278,7 @@ statement ok
 UPDATE lake4.main.cdp SET region = 'APAC' WHERE id = 3;
 
 query TTI
-SELECT _change_type, region, id FROM arrownet_delta_changes('lake4', 'main.cdp', 3) ORDER BY _change_type;
+SELECT _change_type, region, id FROM fabricator_delta_changes('lake4', 'main.cdp', 3) ORDER BY _change_type;
 ----
 update_postimage	APAC	3
 update_preimage	EU	3
@@ -305,7 +305,7 @@ statement ok
 COMMIT;
 
 query TTIT
-SELECT _change_type, region, id, s FROM arrownet_delta_changes('lake4', 'main.cdp', 4) ORDER BY _change_type, id;
+SELECT _change_type, region, id, s FROM fabricator_delta_changes('lake4', 'main.cdp', 4) ORDER BY _change_type, id;
 ----
 delete	US	0	v0
 insert	US	20	v20
@@ -321,7 +321,7 @@ DETACH lake4;
 #      materialized value where the file was itself rewritten before, else baseRowId + position). ----
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/rtvirtcow' AS lake5 (TYPE arrownet, PROVIDER 'delta', native_read true, native_write true, deletion_vectors false, column_mapping 'none', row_tracking true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/rtvirtcow' AS lake5 (TYPE fabricator, PROVIDER 'delta', native_read true, native_write true, deletion_vectors false, column_mapping 'none', row_tracking true);
 
 statement ok
 CREATE TABLE lake5.main.cw (id BIGINT, s VARCHAR);
@@ -374,7 +374,7 @@ DETACH lake5;
 
 # same shapes through the EW codec writer/reader (no native_write)
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/rtvirtcow2' AS lake6 (TYPE arrownet, PROVIDER 'delta', native_read true, deletion_vectors false, column_mapping 'none', row_tracking true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/rtvirtcow2' AS lake6 (TYPE fabricator, PROVIDER 'delta', native_read true, deletion_vectors false, column_mapping 'none', row_tracking true);
 
 statement ok
 CREATE TABLE lake6.main.cw (id BIGINT, s VARCHAR);
@@ -404,7 +404,7 @@ DETACH lake6;
 
 # a table WITHOUT row tracking: the names simply don't exist
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/rtvirt2' AS lake2 (TYPE arrownet, PROVIDER 'delta', native_read true, deletion_vectors false, row_tracking false);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/rtvirt2' AS lake2 (TYPE fabricator, PROVIDER 'delta', native_read true, deletion_vectors false, row_tracking false);
 
 statement ok
 CREATE TABLE lake2.main.nt AS SELECT 1 AS a;
@@ -416,7 +416,7 @@ not found
 
 # a NON-native (codec) catalog does not advertise the virtual columns even on a row-tracking table
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/rtvirt' AS lake3 (TYPE arrownet, PROVIDER 'delta', READ_ONLY true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/rtvirt' AS lake3 (TYPE fabricator, PROVIDER 'delta', READ_ONLY true);
 
 statement error
 SELECT __delta_row_id FROM lake3.main.rt;
@@ -447,7 +447,7 @@ DETACH lake;
 #      without a unique key, version-based incremental extracts. ----
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/rtfast' AS lakef (TYPE arrownet, PROVIDER 'delta', native_read true, native_write true, row_tracking true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/rtfast' AS lakef (TYPE fabricator, PROVIDER 'delta', native_read true, native_write true, row_tracking true);
 
 # three derived files: ids 0-4 (v1), 5-9 (v2), 10-14 (v3)
 statement ok
@@ -470,14 +470,14 @@ SELECT id, s, __delta_row_id FROM lakef.main.ft WHERE __delta_row_id = 7;
 
 query I
 SELECT count(*) >= 2 FROM duckdb_logs
-WHERE type = 'ArrowNet.Delta.Native' AND message LIKE '%rowtracking skip%';
+WHERE type = 'Fabricator.Delta.Native' AND message LIKE '%rowtracking skip%';
 ----
 true
 
 # and the surviving file's condition took the row-group-skippable file_row_number form (id 7 - base 5 = 2)
 query I
 SELECT count(*) > 0 FROM duckdb_logs
-WHERE type = 'ArrowNet.Delta.Native' AND message LIKE '%file_row_number IN (2)%';
+WHERE type = 'Fabricator.Delta.Native' AND message LIKE '%file_row_number IN (2)%';
 ----
 true
 
@@ -496,7 +496,7 @@ SELECT count(*) FROM lakef.main.ft WHERE __delta_row_id >= 12;
 
 query I
 SELECT count(*) > 0 FROM duckdb_logs
-WHERE type = 'ArrowNet.Delta.Native' AND message LIKE '%file_row_number >= 2%';
+WHERE type = 'Fabricator.Delta.Native' AND message LIKE '%file_row_number >= 2%';
 ----
 true
 
@@ -517,7 +517,7 @@ CALL disable_logging();
 # ---- materialized files (post-OPTIMIZE): the constraint pushes onto the PHYSICAL column ----
 
 query I
-SELECT mssql_net_exec('lakef', 'OPTIMIZE main.ft');
+SELECT fabricator_exec('lakef', 'OPTIMIZE main.ft');
 ----
 0
 
@@ -534,7 +534,7 @@ SELECT id, s, __delta_row_id FROM lakef.main.ft WHERE __delta_row_id = 7;
 # derived-fallback rows visible)
 query I
 SELECT count(*) > 0 FROM duckdb_logs
-WHERE type = 'ArrowNet.Delta.Native' AND message LIKE '%OR "__delta_row_id" IS NULL%';
+WHERE type = 'Fabricator.Delta.Native' AND message LIKE '%OR "__delta_row_id" IS NULL%';
 ----
 true
 

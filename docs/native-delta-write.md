@@ -72,7 +72,7 @@ The batches arrive at C# as Arrow; DuckDB's `COPY` needs to *scan* them. Two opt
 prototype**:
 
 - **(A) Bind an input Arrow stream into `host_query`** (small ABI extension): `COPY (SELECT * FROM
-  __arrownet_input) TO …` where `__arrownet_input` is the C#-exported stream. Zero extra materialization;
+  __fabricator_input) TO …` where `__fabricator_input` is the C#-exported stream. Zero extra materialization;
   cleanest. Cost: one additive ABI entry (host_query gains an optional bound input stream).
 - **(B) Temp Arrow-IPC file:** C# writes batches to a temp `.arrow`, `COPY (SELECT * FROM read_arrow('<tmp>'))
   TO …`. No ABI change, but a double write (IPC temp + parquet). Fine as a first prototype; replace with (A).
@@ -213,7 +213,7 @@ CDF stays entirely a `_delta_log`/`_change_data` concern; native write only chan
 - **UPDATE:** two change rows per matched row — pre-image (`update_preimage`, from the old file) and post-image
   (`update_postimage`, the new values) — each a native `COPY` with the literal `_change_type` column added.
   Reuse the same `<updates_input>` join as §5.
-- **Read side** (`arrownet_delta_changes`) is done and unchanged. The `_commit_version`/`_commit_timestamp`
+- **Read side** (`fabricator_delta_changes`) is done and unchanged. The `_commit_version`/`_commit_timestamp`
   come from the always-on `commitInfo` (already emitted).
 - **Guard:** CDF capture only when `delta.enableChangeDataFeed` (the `change_data_feed true` catalog option),
   same as today; `DropVirtualRowId` before writing the change file so schemas match (the SIGSEGV fix stays
@@ -236,7 +236,7 @@ The whole point is standard-readability, which EW's writer kept failing. Every p
 2. **Fabric OneLake conversion + SQL-endpoint query** — write to a live lakehouse, confirm it registers and is
    queryable (the end-to-end check we've been doing for DV/CDF/ICT). **VALIDATED LIVE (2026-07-04):** on
    workspace `Test` / lakehouse `LH` (schema-enabled), `native_write true` CTAS + INSERT + DELETE + UPDATE on
-   `lake.dbo.arrownet_nwtest` all round-tripped correctly over `onelake://` (via the v56 OneLake write
+   `lake.dbo.fabricator_nwtest` all round-tripped correctly over `onelake://` (via the v56 OneLake write
    callbacks + DuckDB's native parquet writer), and a 5000-row low-cardinality table showed the
    **DuckDB-native-writer bloom signature** on the dict-encoded column via `parquet_metadata('onelake://…')`
    (engineered-wood writes no bloom). Fabric-portal conversion / SQL-endpoint query is the user's final
@@ -275,7 +275,7 @@ The whole point is standard-readability, which EW's writer kept failing. Every p
   when set, `WriteCoreAsync` delegates each partition file's parquet bytes to it instead of the built-in
   `ParquetFileWriter` — everything else (partition split, row tracking, column mapping, stats, the `add` action,
   the commit, OCC retry) is unchanged (the override is null by default → the default path is byte-identical).
-  ArrowNet's `NativeParquetDataFileWriter` runs `COPY (SELECT * FROM <bound batch>) TO '<root>/<file>' (FORMAT
+  Fabricator's `NativeParquetDataFileWriter` runs `COPY (SELECT * FROM <bound batch>) TO '<root>/<file>' (FORMAT
   parquet, WRITE_BLOOM_FILTER true, RETURN_STATS)` on a fresh host connection and reads back `file_size_bytes`
   for `add.Size`; stats come from EW's own `StatsCollector.Collect(batches)` (batches in hand — no RETURN_STATS
   dependency for stats, per the P0 finding). URIs reuse `DeltaReader.ToReadableRoot` (onelake:// rewrite). **§9
@@ -309,7 +309,7 @@ The whole point is standard-readability, which EW's writer kept failing. Every p
   source AND apply the row-level transform in DuckDB SQL, not just write natively. New engineered-wood seam
   **`IDataFileRewriter`** (`DeltaTableOptions.DataFileRewriter`): the copy-on-write DELETE/UPDATE loops delegate
   the source read + transform to it for the clean shape (no column mapping, no partitions, no type widening, no
-  CDF), falling back to EW's own reader + in-process transform otherwise. ArrowNet's `NativeParquetDataFileRewriter`
+  CDF), falling back to EW's own reader + in-process transform otherwise. Fabricator's `NativeParquetDataFileRewriter`
   runs, per affected file, `SELECT <cols> FROM read_parquet(src, file_row_number => true) WHERE file_row_number
   NOT IN (<deleted positions>)` (DELETE) or a `LEFT JOIN` against the (position → new SET values) rows bound as an
   Arrow view, substituting via `CASE` (UPDATE) — **retiring the in-process typed `BuildArray`** for the native
@@ -341,12 +341,12 @@ The whole point is standard-readability, which EW's writer kept failing. Every p
   UPDATE (opt-out / non-DV tables) and **compaction**. Merge-on-read already re-ids fewer rows than copy-on-write
   (only the appended rows), but stable-id preservation (appended rows keeping their ORIGINAL id) still needs the
   materialized row-id columns — the same materialize-on-rewrite machinery as compaction.
-- **OPTIMIZE + VACUUM WIRED + compaction made DV-aware (2026-07-04).** `mssql_net_exec('<catalog>',
+- **OPTIMIZE + VACUUM WIRED + compaction made DV-aware (2026-07-04).** `fabricator_exec('<catalog>',
   'OPTIMIZE <schema.table>' | 'VACUUM <schema.table> [RETAIN <h> HOURS] [DRY RUN]')` → `DeltaCatalog.ExecuteNonQuery`
   → engineered-wood `CompactAsync`/`VacuumAsync`. `CompactionExecutor` was fixed to EXCLUDE each candidate's
   deletion-vector-deleted rows (else compaction resurrects them — a data bug under DV-default) + strip
   `__delta_row_id` + carry the removed files' DVs. The exec path now threads the host-FS opener
-  (`SetActiveOpener` in `MssqlNetExecFunction`; a fresh-connection OPTIMIZE segfaulted without it). Compaction
+  (`SetActiveOpener` in `FabricatorExecFunction`; a fresh-connection OPTIMIZE segfaulted without it). Compaction
   still assigns fresh baseRowIds (the stable-id caveat above); DATA is correct (delta_scan + live Fabric).
   `test/verify_delta_catalog_optimize.test`.
 - **Native-writer compaction (2026-07-04).** Under `native_write`, OPTIMIZE's compacted files are also produced by

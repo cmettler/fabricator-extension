@@ -1,6 +1,6 @@
 # Multi-edition support — Synapse, Fabric Warehouse, Lakehouse SQL endpoint
 
-> Design for connecting `mssql_net` to engines beyond box SQL Server / Azure SQL Database:
+> Design for connecting `fabricator` to engines beyond box SQL Server / Azure SQL Database:
 > Azure **Synapse** dedicated pools, **Fabric Warehouse**, and the **Lakehouse SQL analytics
 > endpoint**. These differ from box SQL Server in connection capabilities (no MARS, snapshot
 > isolation) **and** in their type systems and collation. The strategy: **detect a server
@@ -8,7 +8,7 @@
 > never collation-*prescriptive*. Status: **slices 1–3 implemented + validated end-to-end against a
 > real Fabric Warehouse** (edition 11, `Latin1_General_100_BIN2_UTF8`; ATTACH + catalog discovery work,
 > the connection succeeds MARS-free) — `ServerProfile` detection
-> (`dotnet/ArrowNet.SqlServer/ServerProfile.cs`) + the `mssql_server_info(catalog)` diagnostic + profile-
+> (`dotnet/Fabricator.SqlServer/ServerProfile.cs`) + the `fabricator_server_info(catalog)` diagnostic + profile-
 > driven type mapping (§3) + connection mode (`mssql_mars` tri-state, pooled reads, SNAPSHOT writes — §2,
 > [transactions.md](transactions.md) §5.1) + collation-aware string `ORDER BY` pushdown (§4/§6.6) + the
 > JSON read-side gate (§3.3) + granular read-side types (§3.4: `time(7)`/`datetime2(7)`→ns,
@@ -111,7 +111,7 @@ Covered in [transactions.md](transactions.md) §5.1 — summarized here because 
 
 ## 3. Type mapping (profile-driven `MapArrowToSqlType`)
 
-Today `MapArrowToSqlType` ([SqlServerBackend.cs:2044-2079](../dotnet/ArrowNet.SqlServer/SqlServerBackend.cs#L2044-L2079))
+Today `MapArrowToSqlType` ([SqlServerBackend.cs:2044-2079](../dotnet/Fabricator.SqlServer/SqlServerBackend.cs#L2044-L2079))
 hardcodes the box answers. It becomes profile-parameterized:
 
 | DuckDB / Arrow | Box SQL Server / Azure SQL DB | Fabric Warehouse / Lakehouse |
@@ -128,7 +128,7 @@ hardcodes the box answers. It becomes profile-parameterized:
 - **`TIMESTAMP` without time zone → `datetime2(scale)`, verbatim. No conversion, no DuckDB
   timezone involved.** Naive wall-clock both sides; DuckDB `TIMESTAMP` is µs = `datetime2(6)`
   exactly (so `datetime2(6)` is lossless on Fabric; box may use 7). The value path already hands SQL
-  a plain `DateTime` for the no-tz case ([ArrowValueReader.cs:49-51](../dotnet/ArrowNet.SqlServer/ArrowValueReader.cs#L49-L51)).
+  a plain `DateTime` for the no-tz case ([ArrowValueReader.cs:49-51](../dotnet/Fabricator.SqlServer/ArrowValueReader.cs#L49-L51)).
 - **`TIMESTAMPTZ` is an *instant*** — internally UTC µs, and it crosses Arrow as an instant. So
   `.UtcDateTime` is the stored value: `datetimeoffset(7)` where it exists, else UTC `datetime2(6)` on
   Fabric. **No session timezone is needed to store** (the Arrow `int64` is already the UTC epoch; the
@@ -152,8 +152,8 @@ hardcodes the box answers. It becomes profile-parameterized:
 
 Three *separable* concerns — today they're conflated into one blunt knob:
 
-- **Existing — `mssql_ctas_text_type`** ([registered at mssql_net_extension.cpp:99](../src/mssql_net_extension.cpp#L99),
-  read into the CREATE path at [arrownet_schema_entry.cpp:1654-1667](../src/catalog/arrownet_schema_entry.cpp#L1654-L1667),
+- **Existing — `mssql_ctas_text_type`** ([registered at fabricator_extension.cpp:99](../src/fabricator_extension.cpp#L99),
+  read into the CREATE path at [fabricator_schema_entry.cpp:1654-1667](../src/catalog/fabricator_schema_entry.cpp#L1654-L1667),
   default `NVARCHAR(MAX)`): a **whole-type-string** override applied **uniformly to every text column**
   in CTAS/CREATE — a native-compat knob, not a policy. `SET mssql_ctas_text_type='VARCHAR(8000)'`
   works but is all-or-nothing. (`mssql_convert_varchar_max` is a registered compat boolean, read-side,
@@ -281,7 +281,7 @@ ENFORCED` metadata hints, and **only added via `ALTER TABLE ADD CONSTRAINT`** �
 ENFORCED` per key (named `PK_<table>` / `UQ_<table>_<n>`), run as separate statements; box SQL Server keeps the
 inline single-statement form. The hints are **not enforced** (Fabric never checks uniqueness) but **do appear
 in `sys.indexes`** (`is_primary_key` / `is_unique`), which is exactly what our rowid discovery
-([`RowIdSql`](../dotnet/ArrowNet.SqlServer/SqlServerBackend.cs)) reads — so a keyed warehouse table gets a
+([`RowIdSql`](../dotnet/Fabricator.SqlServer/SqlServerBackend.cs)) reads — so a keyed warehouse table gets a
 **rowid**, enabling **UPDATE / DELETE**. Validated end-to-end on Fabric (2026-06-24): `CREATE TABLE … PRIMARY
 KEY` via the extension produced a `NONCLUSTERED NOT ENFORCED` PK, and rowid-based UPDATE/DELETE worked.
 **Caveat:** because the key is NOT ENFORCED, Fabric permits duplicate "key" values; a rowid-based UPDATE/DELETE
@@ -326,9 +326,9 @@ store). Verified: `test/verify_columnstore.test`.
 - **String `ORDER BY` pushdown** — **DONE** (slice 6). We used to never push `ORDER BY` on string keys
   (collation/sort-order mismatch risk). A **binary** collation sorts by byte value — identical to DuckDB —
   so the profile now *safely re-enables* string `ORDER BY`+`LIMIT` (TopN) pushdown when `IsBinaryCollation`.
-  Wiring (no ABI): `ArrowNetCatalog` caches the flag at `LoadCatalog` via `FetchBinaryCollation` (reads the
-  existing `ARROWNET_META_SERVER_INFO` profile), the scan bind threads it onto
-  `ArrowStreamBindData::string_order_pushable`, and `arrownet_optimizer.cpp`'s `TryPushTopN` gate becomes
+  Wiring (no ABI): `FabricatorCatalog` caches the flag at `LoadCatalog` via `FetchBinaryCollation` (reads the
+  existing `FABRICATOR_META_SERVER_INFO` profile), the scan bind threads it onto
+  `ArrowStreamBindData::string_order_pushable`, and `fabricator_optimizer.cpp`'s `TryPushTopN` gate becomes
   `is_string && !string_order_pushable`. Verified: `test/verify_collation_pushdown.test` (binary DB →
   pushed) + `test/verify_orderby_pushdown.test` (CI_AS box → not pushed, both correct).
 
@@ -380,7 +380,7 @@ point, not something we can fix by picking a default:
 
 1. **`ServerProfile` detection** at OpenCatalog (the foundation everything keys off). **DONE** — slice 1
    (`ServerProfile.cs`, lazy detection via a non-MARS probe, MARS gated on `SupportsMars`); slice 2 added
-   the `mssql_server_info(catalog)` diagnostic + `test/verify_server_profile.test`.
+   the `fabricator_server_info(catalog)` diagnostic + `test/verify_server_profile.test`.
 2. **Profile-driven `MapArrowToSqlType`** (`VARCHAR`/`NVARCHAR` by `HasNVarchar`, `datetime2`/`time` scale
    by `MaxDateTime2Scale`, tz → `datetimeoffset`-or-UTC-`datetime2` by `HasDatetimeOffset`). **DONE** — slice 3,
    box-preserving (edition 3 → identical output); **validated live on Fabric**: a CTAS of a
@@ -403,7 +403,7 @@ point, not something we can fix by picking a default:
    `arrow.json`; json statically embedded; `test/verify_json.test`). **Write-side deferred** to §3.4 (the
    boundary forces `arrow_lossless_conversion` off, so DuckDB `JSON` reaches C# as plain `Utf8`).
 6. **Collation-aware pushdown relaxation** (string `ORDER BY` on binary collations) — optimization.
-   **DONE** — no ABI: `FetchBinaryCollation` (reuses `ARROWNET_META_SERVER_INFO`) caches the flag on the
+   **DONE** — no ABI: `FetchBinaryCollation` (reuses `FABRICATOR_META_SERVER_INFO`) caches the flag on the
    catalog at `LoadCatalog`; scan bind → `ArrowStreamBindData::string_order_pushable`; optimizer gate
    relaxed to `is_string && !string_order_pushable`. `test/verify_collation_pushdown.test` (binary) +
    `test/verify_orderby_pushdown.test` (non-binary, explicit not-pushed proof).

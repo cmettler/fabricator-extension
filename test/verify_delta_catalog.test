@@ -1,34 +1,34 @@
 # name: test/verify_delta_catalog.test
-# description: The Delta folder-as-catalog provider — ATTACH a Delta root (TYPE arrownet, PROVIDER 'delta'),
+# description: The Delta folder-as-catalog provider — ATTACH a Delta root (TYPE fabricator, PROVIDER 'delta'),
 #              discover tables (subdirs with _delta_log/) under a flat `main` schema, and SELECT them (filter
-#              pushdown + cross-table joins). Read-only slice. Writes the tables first via arrownet_delta_write,
-#              then attaches the folder. Set ARROWNET_DELTA_WRITE_DIR to a WRITABLE base path. See
+#              pushdown + cross-table joins). Read-only slice. Writes the tables first via fabricator_delta_write,
+#              then attaches the folder. Set FABRICATOR_DELTA_WRITE_DIR to a WRITABLE base path. See
 #              docs/delta-catalog.md. (NOTE: table auto-discovery needs a working directory-recursion glob —
 #              OneLake/ADLS currently can't, a DuckDB azure-extension limitation; this runs on a local FS.)
-# group: [mssql_net]
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
-require-env ARROWNET_DELTA_WRITE_DIR
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 # Create two Delta tables under <dir>/catalog/ via the write collector.
 query I
-SELECT rows_written FROM arrownet_delta_write(
+SELECT rows_written FROM fabricator_delta_write(
   (SELECT i AS id, 'a' || i AS name FROM range(1, 6) t(i)),
-  path := '${ARROWNET_DELTA_WRITE_DIR}/catalog/orders');
+  path := '${FABRICATOR_DELTA_WRITE_DIR}/catalog/orders');
 ----
 5
 
 query I
-SELECT rows_written FROM arrownet_delta_write(
+SELECT rows_written FROM fabricator_delta_write(
   (SELECT i AS k, i * 10 AS v FROM range(1, 4) t(i)),
-  path := '${ARROWNET_DELTA_WRITE_DIR}/catalog/items');
+  path := '${FABRICATOR_DELTA_WRITE_DIR}/catalog/items');
 ----
 3
 
 # ATTACH the folder as a Delta catalog — the tables are discovered under the flat `main` schema.
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalog' AS lake (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/catalog' AS lake (TYPE fabricator, PROVIDER 'delta');
 
 query T
 SELECT table_name FROM duckdb_tables() WHERE database_name = 'lake' ORDER BY table_name;

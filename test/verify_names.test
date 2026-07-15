@@ -1,0 +1,32 @@
+# name: test/verify_names.test
+# description: Canonical provider-agnostic surface — ATTACH (TYPE fabricator) + fabricator_query/_exec/_version.
+# group: [fabricator]
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+# Version scalar resolves.
+query I
+SELECT fabricator_version() IS NOT NULL;
+----
+true
+
+# ATTACH with the provider-agnostic storage-extension keyword.
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS gdb (TYPE fabricator);
+
+# Raw-query table function against the attached catalog.
+query I
+SELECT x FROM fabricator_query('gdb', 'SELECT 42 AS x');
+----
+42
+
+# Raw-exec scalar (returns affected rows; >= 0).
+query I
+SELECT fabricator_exec('gdb', 'SELECT 1') >= 0;
+----
+true
+
+statement ok
+DETACH gdb;

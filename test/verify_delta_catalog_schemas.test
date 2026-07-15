@@ -3,15 +3,15 @@
 #              a two-level <root>/<schema>/<table> layout so DuckDB schemas other than "main" map to subfolders.
 #              CREATE SCHEMA materializes the subfolder; tables of the same name in different schemas don't
 #              collide; discovery + DROP SCHEMA are schema-aware; the layout survives re-attach. Without the
-#              option the catalog stays flat (main-only). Set ARROWNET_DELTA_WRITE_DIR to a WRITABLE base. Local FS.
-# group: [mssql_net]
+#              option the catalog stays flat (main-only). Set FABRICATOR_DELTA_WRITE_DIR to a WRITABLE base. Local FS.
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
-require-env ARROWNET_DELTA_WRITE_DIR
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogschemas' AS lake (TYPE arrownet, PROVIDER 'delta', schemas true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/catalogschemas' AS lake (TYPE fabricator, PROVIDER 'delta', schemas true);
 
 statement ok
 CREATE SCHEMA lake.staging;
@@ -54,7 +54,7 @@ statement ok
 DETACH lake;
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogschemas' AS lake (TYPE arrownet, PROVIDER 'delta', schemas true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/catalogschemas' AS lake (TYPE fabricator, PROVIDER 'delta', schemas true);
 
 query I
 SELECT v FROM lake.staging.dup;
@@ -91,7 +91,7 @@ statement ok
 DETACH lake;
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogschemas' AS lake (TYPE arrownet, PROVIDER 'delta', schemas true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/catalogschemas' AS lake (TYPE fabricator, PROVIDER 'delta', schemas true);
 
 query I
 SELECT id FROM lake.staging.t1b;
@@ -106,7 +106,7 @@ statement ok
 DETACH lake;
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogschemas' AS lake (TYPE arrownet, PROVIDER 'delta', schemas true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/catalogschemas' AS lake (TYPE fabricator, PROVIDER 'delta', schemas true);
 
 # staging is gone; main.dup survives.
 query I

@@ -1,22 +1,22 @@
 # name: test/verify_granular_types.test
 # description: granular read mapping — time(7)/datetime2(7) -> ns (7th digit preserved); scale<=6 µs; decimal (p,s); uniqueidentifier -> UUID (warehouse-support §3.4)
-# group: [mssql_net]
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql_net);
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
 
 statement ok
-SELECT mssql_net_exec('db', 'IF OBJECT_ID(''dbo.gt'',''U'') IS NOT NULL DROP TABLE dbo.gt; CREATE TABLE dbo.gt (id INT PRIMARY KEY, dt2_7 datetime2(7), dt2_3 datetime2(3), t7 time(7), t0 time(0), dec1 decimal(18,4), dto datetimeoffset(7), g uniqueidentifier)');
+SELECT fabricator_exec('db', 'IF OBJECT_ID(''dbo.gt'',''U'') IS NOT NULL DROP TABLE dbo.gt; CREATE TABLE dbo.gt (id INT PRIMARY KEY, dt2_7 datetime2(7), dt2_3 datetime2(3), t7 time(7), t0 time(0), dec1 decimal(18,4), dto datetimeoffset(7), g uniqueidentifier)');
 
 statement ok
-SELECT mssql_net_exec('db', 'INSERT INTO dbo.gt VALUES (1, ''2024-01-02 12:34:56.1234567'', ''2024-01-02 12:34:56.123'', ''12:34:56.1234567'', ''12:34:56'', 12345.6789, ''2024-01-02 12:34:56.1234567 +00:00'', ''6F9619FF-8B86-D011-B42D-00C04FC964FF'')');
+SELECT fabricator_exec('db', 'INSERT INTO dbo.gt VALUES (1, ''2024-01-02 12:34:56.1234567'', ''2024-01-02 12:34:56.123'', ''12:34:56.1234567'', ''12:34:56'', 12345.6789, ''2024-01-02 12:34:56.1234567 +00:00'', ''6F9619FF-8B86-D011-B42D-00C04FC964FF'')');
 
 statement ok
-SELECT mssql_refresh_cache('db');
+SELECT fabricator_refresh_cache('db');
 
 # Scale 7 -> nanosecond DuckDB types (the 100ns digit is preserved); scale <=6 -> microsecond (the common
 # types, full date range); decimal carries (precision, scale); datetimeoffset stays TIMESTAMPTZ (µs);
@@ -34,7 +34,7 @@ SELECT dt2_7::VARCHAR, dt2_3::VARCHAR, t7::VARCHAR, dec1::VARCHAR, g::VARCHAR FR
 2024-01-02 12:34:56.1234567	2024-01-02 12:34:56.123	12:34:56.1234567	12345.6789	6f9619ff-8b86-d011-b42d-00c04fc964ff
 
 statement ok
-SELECT mssql_net_exec('db', 'DROP TABLE dbo.gt');
+SELECT fabricator_exec('db', 'DROP TABLE dbo.gt');
 
 statement ok
 DETACH db;

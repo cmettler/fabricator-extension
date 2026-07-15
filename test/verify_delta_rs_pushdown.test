@@ -4,14 +4,14 @@
 #              every predicate above the scan, so an over-approximation stays correct. Unpushable predicates
 #              render as TRUE. Requires the delta-rs native libs published (publish-managed.ps1 -IncludeDeltaRs).
 #              Local FS.
-# group: [mssql_net]
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
-require-env ARROWNET_DELTA_WRITE_DIR
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/drp' AS lake (TYPE arrownet, PROVIDER 'deltars');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/drp' AS lake (TYPE fabricator, PROVIDER 'deltars');
 
 statement ok
 CREATE TABLE lake.main.t AS SELECT * FROM (VALUES

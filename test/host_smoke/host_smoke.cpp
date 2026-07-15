@@ -1,18 +1,18 @@
 //===----------------------------------------------------------------------===//
-//                         ArrowNet — host smoke test
+//                         Fabricator — host smoke test
 //
 // Standalone validation of the runtime spine WITHOUT DuckDB: boots CoreCLR via
-// hostfxr, loads ArrowNet.Bridge, fills the vtable, opens a (stub) catalog,
+// hostfxr, loads Fabricator.Bridge, fills the vtable, opens a (stub) catalog,
 // executes a query, and reads the exported Arrow C stream — proving the
 // C++ <-> C# Arrow interop end to end. The DuckDB ingestion step
 // (ArrowTableFunction::ArrowToDuckDB) is exercised separately by the full
 // extension build.
 //
-// Requires ARROWNET_MANAGED_DIR to point at a self-contained publish of
-// ArrowNet.Bridge (containing hostfxr + ArrowNet.Bridge.dll + runtimeconfig).
+// Requires FABRICATOR_MANAGED_DIR to point at a self-contained publish of
+// Fabricator.Bridge (containing hostfxr + Fabricator.Bridge.dll + runtimeconfig).
 //===----------------------------------------------------------------------===//
 
-#include "arrownet/abi.h"
+#include "fabricator/abi.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -36,7 +36,7 @@ typedef int32_t(ANET_CDECL *get_runtime_delegate_fn)(void *, int32_t, void **);
 typedef int(ANET_STDCALL *load_assembly_and_get_function_pointer_fn)(const host_char_t *, const host_char_t *,
                                                                      const host_char_t *, const host_char_t *,
                                                                      void *, void **);
-typedef int32_t(ANET_CDECL *bootstrap_fn)(ArrowNetVTable *, int32_t);
+typedef int32_t(ANET_CDECL *bootstrap_fn)(FabricatorVTable *, int32_t);
 
 static const host_char_t *const kUnmanagedCallersOnly = reinterpret_cast<const host_char_t *>(-1);
 static constexpr int kHdtLoadAssembly = 5;
@@ -76,8 +76,8 @@ static void *Sym(void *lib, const char *n) {
 	} while (0)
 
 int main() {
-	const char *managed = std::getenv("ARROWNET_MANAGED_DIR");
-	CHECK(managed && *managed, "ARROWNET_MANAGED_DIR not set");
+	const char *managed = std::getenv("FABRICATOR_MANAGED_DIR");
+	CHECK(managed && *managed, "FABRICATOR_MANAGED_DIR not set");
 	std::string dir = managed;
 	char sep = dir.back() == '/' || dir.back() == '\\' ? '\0' : '/';
 	auto join = [&](const char *leaf) { return sep ? dir + sep + leaf : dir + leaf; };
@@ -100,7 +100,7 @@ int main() {
 	CHECK(init_fn && get_delegate, "hostfxr exports missing");
 
 	void *ctx = nullptr;
-	auto asm_w = H(join("ArrowNet.Bridge.dll"));
+	auto asm_w = H(join("Fabricator.Bridge.dll"));
 	const host_char_t *argv[1] = {asm_w.c_str()};
 	int32_t rc = init_fn(1, argv, nullptr, &ctx);
 	CHECK(rc >= 0 && ctx, "hostfxr_initialize_for_dotnet_command_line failed");
@@ -111,19 +111,19 @@ int main() {
 	auto load_assembly = (load_assembly_and_get_function_pointer_fn)load_ptr;
 
 	void *boot_ptr = nullptr;
-	rc = load_assembly(H(join("ArrowNet.Bridge.dll")).c_str(), H("ArrowNet.Bridge.Bootstrap, ArrowNet.Bridge").c_str(),
+	rc = load_assembly(H(join("Fabricator.Bridge.dll")).c_str(), H("Fabricator.Bridge.Bootstrap, Fabricator.Bridge").c_str(),
 	                   H("Initialize").c_str(), kUnmanagedCallersOnly, nullptr, &boot_ptr);
 	CHECK(rc == 0 && boot_ptr, "load Bootstrap.Initialize failed");
 
-	ArrowNetVTable vt;
+	FabricatorVTable vt;
 	std::memset(&vt, 0, sizeof(vt));
 	rc = ((bootstrap_fn)boot_ptr)(&vt, (int32_t)sizeof(vt));
 	CHECK(rc == 0, "Bootstrap.Initialize returned non-zero");
-	CHECK(vt.abi_version == ARROWNET_ABI_VERSION, "ABI version mismatch");
+	CHECK(vt.abi_version == FABRICATOR_ABI_VERSION, "ABI version mismatch");
 	CHECK(vt.open_catalog && vt.execute_query && vt.close_catalog && vt.free_error, "vtable not fully populated");
 	std::printf("vtable populated (abi_version=%d)\n", vt.abi_version);
 
-	ArrowNetHandle handle = nullptr;
+	FabricatorHandle handle = nullptr;
 	char *err = nullptr;
 	rc = vt.open_catalog("", &handle, &err);
 	CHECK(rc == 0, err ? err : "open_catalog failed");

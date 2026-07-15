@@ -4,24 +4,24 @@
 #              stable id (base_row_id + position) into the physical __delta_row_id column instead of a fresh id, so
 #              the row id is PRESERVED across UPDATE. This is the write-shape check (the appended updated row
 #              carries its original __delta_row_id); the end-to-end row-id readback is validated on Fabric Spark
-#              (delta-kernel/delta-rs don't expose Delta row ids). Set ARROWNET_DELTA_WRITE_DIR. Local FS.
-# group: [mssql_net]
+#              (delta-kernel/delta-rs don't expose Delta row ids). Set FABRICATOR_DELTA_WRITE_DIR. Local FS.
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
 require parquet
 
-require-env ARROWNET_DELTA_WRITE_DIR
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/matrt' AS lake (TYPE arrownet, PROVIDER 'delta', column_mapping 'none');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/matrt' AS lake (TYPE fabricator, PROVIDER 'delta', column_mapping 'none');
 
 statement ok
 CREATE TABLE lake.main.t AS SELECT i AS id, 'v' || i AS v FROM range(1, 4) AS r(i);
 
 # Baseline: the create file materializes __delta_row_id = base_row_id + position (0,1,2).
 query II
-SELECT id, "__delta_row_id" FROM read_parquet('${ARROWNET_DELTA_WRITE_DIR}/matrt/t/*.parquet', union_by_name=true) ORDER BY id;
+SELECT id, "__delta_row_id" FROM read_parquet('${FABRICATOR_DELTA_WRITE_DIR}/matrt/t/*.parquet', union_by_name=true) ORDER BY id;
 ----
 1	0
 2	1
@@ -43,7 +43,7 @@ SELECT id, v FROM lake.main.t ORDER BY id;
 # one have __delta_row_id=1; filtering on v='X' isolates the appended post-image row.)
 query I
 SELECT DISTINCT "__delta_row_id"
-FROM read_parquet('${ARROWNET_DELTA_WRITE_DIR}/matrt/t/*.parquet', union_by_name=true)
+FROM read_parquet('${FABRICATOR_DELTA_WRITE_DIR}/matrt/t/*.parquet', union_by_name=true)
 WHERE id = 2 AND v = 'X';
 ----
 1

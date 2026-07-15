@@ -1,8 +1,8 @@
 # name: test/verify_connection_mode.test
 # description: mssql_mars tri-state (auto|true|false) + the MARS-off pooled-read path (warehouse connection mode, slice 3 of warehouse-support §6)
-# group: [mssql_net]
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
 require-env MSSQL_TESTDB_DSN
 
@@ -16,7 +16,7 @@ statement ok
 SET mssql_mars='false';
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql_net);
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
 
 statement ok
 DROP TABLE IF EXISTS db.dbo.cm_a;
@@ -76,7 +76,7 @@ statement ok
 SET mssql_mars='bogus';
 
 statement error
-ATTACH '${MSSQL_TESTDB_DSN}' AS db2 (TYPE mssql_net);
+ATTACH '${MSSQL_TESTDB_DSN}' AS db2 (TYPE fabricator);
 ----
 invalid mssql_mars
 
@@ -86,7 +86,7 @@ SET mssql_mars='auto';
 
 # auto re-attaches normally (MARS on for box SQL Server -> read-your-writes restored).
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS db3 (TYPE mssql_net);
+ATTACH '${MSSQL_TESTDB_DSN}' AS db3 (TYPE fabricator);
 
 statement ok
 DETACH db3;

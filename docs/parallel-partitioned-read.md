@@ -1,7 +1,7 @@
 # Parallel partitioned reads (ConnectorX-style) — design idea, DEFERRED
 
 > Status: **design note only — nothing built.** Captures supporting ConnectorX-style `partition_on` /
-> `partition_num` parallel reads in `arrownet_query` + custom `IArrowTableFunction`s. Builds on the existing
+> `partition_num` parallel reads in `fabricator_query` + custom `IArrowTableFunction`s. Builds on the existing
 > arrow scan + the `daxeval` named-parameter pattern. No ABI change for the simple form (A); the full
 > core-utilization form (B) needs a parallel multi-stream scan.
 
@@ -86,20 +86,20 @@ All three feed the same machinery: planner → predicate list → A (`ParallelMe
 `partition_strategy` selector (`range` | `hash` | `values`, default `hash` for arbitrary columns / `range`
 for the ConnectorX-compatible numeric case) generalizes cleanly.
 
-## Fitting it into `arrownet_query`
+## Fitting it into `fabricator_query`
 
-`arrownet_query` is the raw-query path (C++ `QueryBind` → C# scan), not an `IArrowTableFunction`. Add two
+`fabricator_query` is the raw-query path (C++ `QueryBind` → C# scan), not an `IArrowTableFunction`. Add two
 **optional NAMED parameters** (the `daxeval` pattern — named ⇒ optional, doesn't break the 2-arg call):
 
 ```sql
 -- range (ConnectorX-compatible)
-SELECT * FROM arrownet_query('db', 'SELECT * FROM lineitem',
+SELECT * FROM fabricator_query('db', 'SELECT * FROM lineitem',
                              partition_on := 'l_orderkey', partition_num := 10);
 -- hash bucket (any column, balanced, no probe)
-SELECT * FROM arrownet_query('db', 'SELECT * FROM orders',
+SELECT * FROM fabricator_query('db', 'SELECT * FROM orders',
                              partition_on := 'o_custkey', partition_num := 10, partition_strategy := 'hash');
 -- distinct values (multi-column, logical partitions)
-SELECT * FROM arrownet_query('db', 'SELECT * FROM sales',
+SELECT * FROM fabricator_query('db', 'SELECT * FROM sales',
                              partition_on := 'region, year', partition_strategy := 'values');
 ```
 

@@ -4,37 +4,37 @@
 #              Power BI Desktop / SSAS / Fabric instance), so this is gated by require-env and asserts
 #              MODEL-AGNOSTIC invariants (no hardcoded counts) — it passes against ANY tabular model you
 #              point it at. Set:
-#                ARROWNET_DAX_DSN   e.g. 'pbidesktop://' (local PBI Desktop autodetect) or
+#                FABRICATOR_DAX_DSN   e.g. 'pbidesktop://' (local PBI Desktop autodetect) or
 #                                   'Data Source=localhost:<port>' / a Fabric/SSAS XMLA connstr
-#                ARROWNET_DAX_TABLE  a fully-qualified, quoted table reference, e.g. pbi."Model"."Customer"
-#                ARROWNET_DAX_COL    a quoted column of that table that has some NULLs, e.g. "Country"
-#                ARROWNET_DAX_SCHEMA the catalog.schema prefix the model lives under, e.g. pbi."Model"
+#                FABRICATOR_DAX_TABLE  a fully-qualified, quoted table reference, e.g. pbi."Model"."Customer"
+#                FABRICATOR_DAX_COL    a quoted column of that table that has some NULLs, e.g. "Country"
+#                FABRICATOR_DAX_SCHEMA the catalog.schema prefix the model lives under, e.g. pbi."Model"
 #                                    (daxeval registers under the model schema, whose name varies)
-# group: [mssql_net]
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
-require-env ARROWNET_DAX_DSN
+require-env FABRICATOR_DAX_DSN
 
-require-env ARROWNET_DAX_TABLE
+require-env FABRICATOR_DAX_TABLE
 
-require-env ARROWNET_DAX_COL
+require-env FABRICATOR_DAX_COL
 
-require-env ARROWNET_DAX_SCHEMA
+require-env FABRICATOR_DAX_SCHEMA
 
 statement ok
-ATTACH '${ARROWNET_DAX_DSN}' AS pbi (TYPE mssql_net, PROVIDER 'dax');
+ATTACH '${FABRICATOR_DAX_DSN}' AS pbi (TYPE fabricator, PROVIDER 'dax');
 
 # A model table is reachable and non-empty (EVALUATE scan streams rows).
 query I
-SELECT count(*) > 0 FROM ${ARROWNET_DAX_TABLE};
+SELECT count(*) > 0 FROM ${FABRICATOR_DAX_TABLE};
 ----
 true
 
 # Projection preserves the row count (the SELECTCOLUMNS scan path).
 query I
-SELECT (SELECT count(*) FROM ${ARROWNET_DAX_TABLE})
-     = (SELECT count(*) FROM (SELECT ${ARROWNET_DAX_COL} FROM ${ARROWNET_DAX_TABLE}) s);
+SELECT (SELECT count(*) FROM ${FABRICATOR_DAX_TABLE})
+     = (SELECT count(*) FROM (SELECT ${FABRICATOR_DAX_COL} FROM ${FABRICATOR_DAX_TABLE}) s);
 ----
 true
 
@@ -42,23 +42,23 @@ true
 # FILTER('T', ISBLANK(c)) and FILTER('T', NOT(ISBLANK(c))); DuckDB re-applies, so the only way the two
 # parts sum to the total is if the pushed FILTER drops/duplicates nothing.
 query I
-SELECT (SELECT count(*) FROM ${ARROWNET_DAX_TABLE})
-     = (SELECT count(*) FROM ${ARROWNET_DAX_TABLE} WHERE ${ARROWNET_DAX_COL} IS NULL)
-     + (SELECT count(*) FROM ${ARROWNET_DAX_TABLE} WHERE ${ARROWNET_DAX_COL} IS NOT NULL);
+SELECT (SELECT count(*) FROM ${FABRICATOR_DAX_TABLE})
+     = (SELECT count(*) FROM ${FABRICATOR_DAX_TABLE} WHERE ${FABRICATOR_DAX_COL} IS NULL)
+     + (SELECT count(*) FROM ${FABRICATOR_DAX_TABLE} WHERE ${FABRICATOR_DAX_COL} IS NOT NULL);
 ----
 true
 
 # IS NOT NULL pushdown returns exactly the non-null rows (must equal count(col), which ignores NULLs).
 query I
-SELECT (SELECT count(*) FROM ${ARROWNET_DAX_TABLE} WHERE ${ARROWNET_DAX_COL} IS NOT NULL)
-     = (SELECT count(${ARROWNET_DAX_COL}) FROM ${ARROWNET_DAX_TABLE});
+SELECT (SELECT count(*) FROM ${FABRICATOR_DAX_TABLE} WHERE ${FABRICATOR_DAX_COL} IS NOT NULL)
+     = (SELECT count(${FABRICATOR_DAX_COL}) FROM ${FABRICATOR_DAX_TABLE});
 ----
 true
 
 # A contradictory predicate returns no rows.
 query I
-SELECT count(*) FROM ${ARROWNET_DAX_TABLE}
-WHERE ${ARROWNET_DAX_COL} IS NULL AND ${ARROWNET_DAX_COL} IS NOT NULL;
+SELECT count(*) FROM ${FABRICATOR_DAX_TABLE}
+WHERE ${FABRICATOR_DAX_COL} IS NULL AND ${FABRICATOR_DAX_COL} IS NOT NULL;
 ----
 0
 
@@ -79,41 +79,41 @@ true
 # at bind (the DAX result's columns). Args are NAMED (daxeval registers as a 'proc'), so `expression :=`.
 # These DAX expressions reference no model data, so they're model-agnostic.
 query I
-SELECT n FROM ${ARROWNET_DAX_SCHEMA}.daxeval(expression := 'EVALUATE ROW("n", 42)');
+SELECT n FROM ${FABRICATOR_DAX_SCHEMA}.daxeval(expression := 'EVALUATE ROW("n", 42)');
 ----
 42
 
 # Multi-row result via a DAX table constructor (3 rows).
 query I
-SELECT count(*) FROM ${ARROWNET_DAX_SCHEMA}.daxeval(expression := 'EVALUATE {1, 2, 3}');
+SELECT count(*) FROM ${FABRICATOR_DAX_SCHEMA}.daxeval(expression := 'EVALUATE {1, 2, 3}');
 ----
 3
 
 # Parameter binding: daxeval(expression, params := '{json}') binds each JSON entry as an ADOMD @parameter
 # the DAX references as @<name> (40 + 2 = 42). Mixed-type params + the no-param call both stay model-agnostic.
 query I
-SELECT result::BIGINT FROM ${ARROWNET_DAX_SCHEMA}.daxeval(
+SELECT result::BIGINT FROM ${FABRICATOR_DAX_SCHEMA}.daxeval(
   expression := 'EVALUATE ROW("result", @a + @b)', params := '{"a": 40, "b": 2}');
 ----
 42
 
 # A string parameter flows through (DAX string concat).
 query I
-SELECT greeting FROM ${ARROWNET_DAX_SCHEMA}.daxeval(
+SELECT greeting FROM ${FABRICATOR_DAX_SCHEMA}.daxeval(
   expression := 'EVALUATE ROW("greeting", @who)', params := '{"who": "world"}');
 ----
 world
 
 # params also accepts a DuckDB STRUCT (type-safe, no JSON quoting): {'a': 40, 'b': 2} -> @a, @b.
 query I
-SELECT result::BIGINT FROM ${ARROWNET_DAX_SCHEMA}.daxeval(
+SELECT result::BIGINT FROM ${FABRICATOR_DAX_SCHEMA}.daxeval(
   expression := 'EVALUATE ROW("result", @a + @b)', params := {'a': 40, 'b': 2});
 ----
 42
 
 # A STRUCT string field.
 query I
-SELECT greeting FROM ${ARROWNET_DAX_SCHEMA}.daxeval(
+SELECT greeting FROM ${FABRICATOR_DAX_SCHEMA}.daxeval(
   expression := 'EVALUATE ROW("greeting", @who)', params := {'who': 'world'});
 ----
 world
@@ -121,7 +121,7 @@ world
 # daxevaltable(<input>, expression := …): inject a DuckDB-side table into DAX as _input and evaluate once.
 # Model-agnostic (the injected table is a VALUES list; the DAX references only _input).
 query II
-SELECT id, name FROM ${ARROWNET_DAX_SCHEMA}.daxevaltable(
+SELECT id, name FROM ${FABRICATOR_DAX_SCHEMA}.daxevaltable(
   (SELECT * FROM (VALUES (1, 'a'), (2, 'b')) v(id, name)), expression := 'EVALUATE _input') ORDER BY id;
 ----
 1	a
@@ -129,7 +129,7 @@ SELECT id, name FROM ${ARROWNET_DAX_SCHEMA}.daxevaltable(
 
 # A whole-table DAX computation over the injected table (10+20+30 = 60).
 query I
-SELECT total FROM ${ARROWNET_DAX_SCHEMA}.daxevaltable(
+SELECT total FROM ${FABRICATOR_DAX_SCHEMA}.daxevaltable(
   (SELECT * FROM (VALUES (10), (20), (30)) v(x)), expression := 'EVALUATE ROW("total", SUMX(_input, _input[x]))');
 ----
 60
@@ -137,14 +137,14 @@ SELECT total FROM ${ARROWNET_DAX_SCHEMA}.daxevaltable(
 # daxevaltable is a COLLECTOR (pipeline breaker), so the injected input may span MANY chunks — the earlier
 # streaming form capped it at a single 2048-row batch. 5000 rows: sum(0..4999) = 12497500 (whole-table SUMX).
 query I
-SELECT total FROM ${ARROWNET_DAX_SCHEMA}.daxevaltable(
+SELECT total FROM ${FABRICATOR_DAX_SCHEMA}.daxevaltable(
   (SELECT i::INTEGER AS x FROM range(5000) t(i)), expression := 'EVALUATE ROW("total", SUMX(_input, _input[x]))');
 ----
 12497500
 
 # The whole 5000-row input is echoed back (every row collected before evaluation).
 query I
-SELECT count(*) FROM ${ARROWNET_DAX_SCHEMA}.daxevaltable(
+SELECT count(*) FROM ${FABRICATOR_DAX_SCHEMA}.daxevaltable(
   (SELECT i::INTEGER AS x FROM range(5000) t(i)), expression := 'EVALUATE _input');
 ----
 5000
@@ -152,7 +152,7 @@ SELECT count(*) FROM ${ARROWNET_DAX_SCHEMA}.daxevaltable(
 # daxeach(<input>, expression := …): run the DAX once per input row, binding each input column as @<col>.
 # Output = the DAX result per row. Model-agnostic (VALUES + @params; no model data).
 query II
-SELECT n, sq FROM ${ARROWNET_DAX_SCHEMA}.daxeach(
+SELECT n, sq FROM ${FABRICATOR_DAX_SCHEMA}.daxeach(
   (SELECT * FROM (VALUES (3), (4), (5)) v(n)), expression := 'EVALUATE ROW("n", @n, "sq", @n * @n)') ORDER BY n;
 ----
 3	9
@@ -161,7 +161,7 @@ SELECT n, sq FROM ${ARROWNET_DAX_SCHEMA}.daxeach(
 
 # A row may yield multiple result rows (2 input rows x 3 = 6) — per-row, unbounded-input streaming.
 query I
-SELECT count(*) FROM ${ARROWNET_DAX_SCHEMA}.daxeach(
+SELECT count(*) FROM ${FABRICATOR_DAX_SCHEMA}.daxeach(
   (SELECT * FROM (VALUES (1), (2)) v(k)), expression := 'EVALUATE { @k, @k + 10, @k + 20 }');
 ----
 6

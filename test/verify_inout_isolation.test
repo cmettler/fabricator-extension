@@ -4,30 +4,30 @@
 #              CROSS APPLY queries share one consistent view.
 # group: [mssql]
 
-require mssql_net
+require fabricator
 
 require-env MSSQL_TESTDB_DSN
 
 # Setup: create a TVF that reports its session's current transaction isolation level
 # (1=ReadUncommitted, 2=ReadCommitted, 3=RepeatableRead, 4=Serializable, 5=Snapshot). @d is ignored
 # — it only gives the TVF a parameter so it gets an `_each` in-out alias. (The 'snapshot' case below
-# needs `ALTER DATABASE TestDB SET ALLOW_SNAPSHOT_ISOLATION ON`, which can't run via mssql_net_exec —
+# needs `ALTER DATABASE TestDB SET ALLOW_SNAPSHOT_ISOLATION ON`, which can't run via fabricator_exec —
 # the test DB has it enabled out-of-band.)
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS setupdb (TYPE mssql_net);
+ATTACH '${MSSQL_TESTDB_DSN}' AS setupdb (TYPE fabricator);
 
 statement ok
-SELECT mssql_net_exec('setupdb', 'CREATE OR ALTER FUNCTION dbo.tf_iso(@d INT) RETURNS TABLE AS RETURN (SELECT CAST(transaction_isolation_level AS INT) AS iso FROM sys.dm_exec_sessions WHERE session_id = @@SPID)');
+SELECT fabricator_exec('setupdb', 'CREATE OR ALTER FUNCTION dbo.tf_iso(@d INT) RETURNS TABLE AS RETURN (SELECT CAST(transaction_isolation_level AS INT) AS iso FROM sys.dm_exec_sessions WHERE session_id = @@SPID)');
 
 statement ok
 DETACH setupdb;
 
 # Per-catalog default isolation via the ATTACH option: serializable (4).
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS isodb (TYPE mssql_net, isolation_level 'serializable');
+ATTACH '${MSSQL_TESTDB_DSN}' AS isodb (TYPE fabricator, isolation_level 'serializable');
 
 statement ok
-SELECT mssql_refresh_cache('isodb');
+SELECT fabricator_refresh_cache('isodb');
 
 # Every per-chunk CROSS APPLY of the in-out call runs on the one pinned connection at the ATTACH default.
 query I
@@ -75,7 +75,7 @@ statement ok
 SET mssql_isolation_level = '';
 
 statement ok
-SELECT mssql_net_exec('isodb', 'DROP FUNCTION IF EXISTS dbo.tf_iso');
+SELECT fabricator_exec('isodb', 'DROP FUNCTION IF EXISTS dbo.tf_iso');
 
 statement ok
 DETACH isodb;

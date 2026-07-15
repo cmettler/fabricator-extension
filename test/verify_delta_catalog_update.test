@@ -1,16 +1,16 @@
 # name: test/verify_delta_catalog_update.test
 # description: Delta folder-as-catalog UPDATE — rowid-based copy-on-write (the transient (file,position) rowid +
 #              full-table overwrite via the proven write path, so the result is plain Delta + standard-readable).
-#              UPDATE SET on matched rows, single + multi-row + expression updates. Set ARROWNET_DELTA_WRITE_DIR
+#              UPDATE SET on matched rows, single + multi-row + expression updates. Set FABRICATOR_DELTA_WRITE_DIR
 #              to a WRITABLE base path. Local FS.
-# group: [mssql_net]
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
-require-env ARROWNET_DELTA_WRITE_DIR
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogupd' AS lake (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/catalogupd' AS lake (TYPE fabricator, PROVIDER 'delta');
 
 statement ok
 CREATE TABLE lake.main.t (id INTEGER, name VARCHAR, amt INTEGER);
@@ -61,7 +61,7 @@ statement ok
 DETACH lake;
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogupd' AS lake2 (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/catalogupd' AS lake2 (TYPE fabricator, PROVIDER 'delta');
 
 query ITI
 SELECT id, name, amt FROM lake2.main.t ORDER BY id;

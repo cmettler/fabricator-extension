@@ -1,17 +1,17 @@
 # name: test/verify_delta_rs_cdf.test
 # description: delta-rs provider Change Data Feed. ATTACH with 'change_data_feed true' → tables created in the
 #              catalog enable delta.enableChangeDataFeed, so INSERT/DELETE/UPDATE capture change data; read via
-#              arrownet_delta_changes('<catalog>', '<schema.>table', from [, to]) → the row-level feed with
+#              fabricator_delta_changes('<catalog>', '<schema.>table', from [, to]) → the row-level feed with
 #              _change_type / _commit_version / _commit_timestamp (delta-dotnet QueryTableChangesAsync).
 #              Requires the delta-rs native libs published (publish-managed.ps1 -IncludeDeltaRs). Local FS.
-# group: [mssql_net]
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
-require-env ARROWNET_DELTA_WRITE_DIR
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/drc' AS lake (TYPE arrownet, PROVIDER 'deltars', change_data_feed true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/drc' AS lake (TYPE fabricator, PROVIDER 'deltars', change_data_feed true);
 
 # v0 = CREATE, v1 = the CTAS write (3 inserts).
 statement ok
@@ -28,7 +28,7 @@ DELETE FROM lake.main.t WHERE id = 2;
 # Full change feed from version 1: the 3 CTAS inserts (v1), the insert (v2), the delete (v3).
 query TITI
 SELECT _change_type, id, name, _commit_version
-FROM arrownet_delta_changes('lake', 'main.t', 1)
+FROM fabricator_delta_changes('lake', 'main.t', 1)
 ORDER BY _commit_version, id;
 ----
 insert	1	a	1
@@ -39,13 +39,13 @@ delete	2	b	3
 
 # Bounded range [2, 2]: only the v2 insert.
 query TI
-SELECT _change_type, id FROM arrownet_delta_changes('lake', 'main.t', 2, 2) ORDER BY id;
+SELECT _change_type, id FROM fabricator_delta_changes('lake', 'main.t', 2, 2) ORDER BY id;
 ----
 insert	4
 
 # Change-type breakdown across the whole feed.
 query TI
-SELECT _change_type, count(*) FROM arrownet_delta_changes('lake', 'main.t', 1) GROUP BY _change_type ORDER BY _change_type;
+SELECT _change_type, count(*) FROM fabricator_delta_changes('lake', 'main.t', 1) GROUP BY _change_type ORDER BY _change_type;
 ----
 delete	1
 insert	4

@@ -2,24 +2,24 @@
 # description: Provider-authored custom C# aggregate functions (UDAF) — db.schema.fn(args) in GROUP BY / parallel / OVER
 # group: [mssql]
 
-require mssql_net
+require fabricator
 
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS adb (TYPE mssql_net);
+ATTACH '${MSSQL_TESTDB_DSN}' AS adb (TYPE fabricator);
 
 # dbo.cf_product / dbo.cf_bit_or are custom C# aggregates (IArrowAggregateFunction baked into the provider),
 # NOT SQL Server objects — surfaced into the attached catalog and registered as DuckDB aggregate functions.
 query TTT
-SELECT schema_name, name, kind FROM mssql_net_functions('adb') WHERE name IN ('cf_product', 'cf_bit_or') ORDER BY name;
+SELECT schema_name, name, kind FROM fabricator_functions('adb') WHERE name IN ('cf_product', 'cf_bit_or') ORDER BY name;
 ----
 dbo	cf_bit_or	aggregate
 dbo	cf_product	aggregate
 
 # ...yet there is NO such object in SQL Server — proving they are the C#-authored custom aggregates.
 query I
-SELECT cnt FROM mssql_net_query('adb', 'SELECT COUNT(*) AS cnt FROM sys.objects WHERE name IN (''cf_product'',''cf_bit_or'')');
+SELECT cnt FROM fabricator_query('adb', 'SELECT COUNT(*) AS cnt FROM sys.objects WHERE name IN (''cf_product'',''cf_bit_or'')');
 ----
 0
 
@@ -136,7 +136,7 @@ true
 
 # Discovered with kind='aggregate_spill' (vs 'aggregate' for the fast in-memory ones).
 query TTT
-SELECT schema_name, name, kind FROM mssql_net_functions('adb') WHERE name = 'cf_sum_spill';
+SELECT schema_name, name, kind FROM fabricator_functions('adb') WHERE name = 'cf_sum_spill';
 ----
 dbo	cf_sum_spill	aggregate_spill
 
@@ -210,7 +210,7 @@ true
 
 # Holistic => fast mode: discovered as 'aggregate' (not 'aggregate_spill' — an unbounded collection can't spill).
 query TTT
-SELECT schema_name, name, kind FROM mssql_net_functions('adb') WHERE name = 'cf_median';
+SELECT schema_name, name, kind FROM fabricator_functions('adb') WHERE name = 'cf_median';
 ----
 dbo	cf_median	aggregate
 

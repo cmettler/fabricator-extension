@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <RootNamespace>Fabricator.AnalysisServices</RootNamespace>
+    <AssemblyName>Fabricator.AnalysisServices</AssemblyName>
+    <Description>
+      Analysis Services / DAX backend for the Fabricator bridge: connects to a Power BI / SSAS / Fabric
+      semantic model via Microsoft.AnalysisServices.AdomdClient, discovers metadata via $SYSTEM DMVs, and
+      evaluates DAX, streaming results to DuckDB as Apache Arrow. The second provider behind the one
+      fabricator binary (provider name "dax"). See docs/dax-provider.md.
+    </Description>
+    <!-- Published beside Fabricator.SqlServer + Bridge into the extension's fabricator/ dir; the CoreCLR host
+         initializes against Fabricator.Bridge's runtimeconfig and discovers this backend by assembly name. -->
+    <GenerateRuntimeConfigurationFiles>true</GenerateRuntimeConfigurationFiles>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Fabricator.Abstractions\Fabricator.Abstractions.csproj" />
+    <ProjectReference Include="..\Fabricator.Bridge\Fabricator.Bridge.csproj" />
+    <PackageReference Include="Microsoft.AnalysisServices.AdomdClient" Version="19.114.0" />
+    <!-- Entra token acquisition for Fabric/AAS XMLA: mint a Power BI-scoped token from the same Azure
+         principal the SqlServer warehouse uses (service principal / managed identity / default chain),
+         set as AdomdConnection.AccessToken (ADOMD has no interactive flow in the CLR host). -->
+    <PackageReference Include="Azure.Identity" Version="1.13.2" />
+  </ItemGroup>
+
+</Project>

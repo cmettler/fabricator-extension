@@ -1,4 +1,4 @@
-# mssql_net — DuckDB ⇄ SQL Server via a C# (CoreCLR) Arrow bridge
+# fabricator — DuckDB ⇄ SQL Server via a C# (CoreCLR) Arrow bridge
 
 A DuckDB extension that connects to **Microsoft SQL Server** by hosting a C# layer (via **CoreCLR**)
 **in-process** and exchanging data + metadata as **Apache Arrow** over the Arrow C Stream Interface
@@ -10,7 +10,7 @@ that extension speaks the TDS wire protocol directly in C++. This one delegates 
 to C# using **`Microsoft.Data.SqlClient`** — the C++ extension only registers DuckDB functions and
 ingests the Arrow streams the bridge produces. Connection strings are therefore plain
 `Microsoft.Data.SqlClient` strings, and connection pooling / Windows & Azure auth come from SqlClient
-natively. The C++ core (`arrownet`) and managed `ArrowNet.Bridge` are transport- and backend-agnostic,
+natively. The C++ core (`fabricator`) and managed `Fabricator.Bridge` are transport- and backend-agnostic,
 intended for reuse by a future Power BI / DAX connector.
 
 **Works against box SQL Server, Azure SQL Database, and the Microsoft Fabric / Synapse warehouse family.**
@@ -19,7 +19,7 @@ isolation) and type mapping (collation-driven `VARCHAR`/`NVARCHAR`, `datetime2` 
 including Fabric Warehouse over an Entra service principal. See
 [Microsoft Fabric & Synapse](#microsoft-fabric--synapse-warehouse).
 
-**One binary, multiple providers.** The C++ core (`arrownet`) and managed `ArrowNet.Bridge` are
+**One binary, multiple providers.** The C++ core (`fabricator`) and managed `Fabricator.Bridge` are
 provider-agnostic, and the same extension hosts several backends selected at ATTACH via `PROVIDER` (or
 inferred from the connection scheme):
 
@@ -37,7 +37,7 @@ inferred from the connection scheme):
 
 | Area | Feature | Status |
 |------|---------|--------|
-| **Connect** | `ATTACH (TYPE mssql_net)` — connection string, `mssql://` URI, `CREATE SECRET` | ✅ |
+| **Connect** | `ATTACH (TYPE mssql)` — connection string, `mssql://` URI, `CREATE SECRET` | ✅ |
 | | Azure Entra ID / Fabric auth (service principal, managed identity, default, token, …) | ✅ |
 | | `schema_filter` / `table_filter` (regex) | ✅ |
 | | ATTACH-time connection validation (no orphan catalog on failure) | ✅ |
@@ -56,10 +56,10 @@ inferred from the connection scheme):
 | | CHECK/FK constraint enforcement on INSERT | ✅ (`SqlBulkCopyOptions.CheckConstraints`; COPY/CTAS skip for speed) |
 | **DDL** | CREATE/DROP TABLE, CREATE/DROP SCHEMA, ALTER TABLE | ✅ |
 | | PRIMARY KEY / UNIQUE / NOT NULL / literal DEFAULT on CREATE | ✅ |
-| | CHECK constraints, non-literal DEFAULTs | ❌ (use `mssql_net_exec`) |
+| | CHECK constraints, non-literal DEFAULTs | ❌ (use `fabricator_exec`) |
 | **Tx** | BEGIN / COMMIT / ROLLBACK (connection pinning, read-your-writes) | ✅ |
-| **Functions** | `mssql_net_query`, `mssql_net_exec`, `mssql_refresh_cache`, `mssql_invalidate_cache`, `mssql_version` | ✅ |
-| | `mssql_net_functions(catalog)` — list discovered routines | ✅ |
+| **Functions** | `fabricator_query`, `fabricator_exec`, `fabricator_refresh_cache`, `fabricator_invalidate_cache`, `fabricator_version` | ✅ |
+| | `fabricator_functions(catalog)` — list discovered routines | ✅ |
 | **Callable** | Discovered scalar UDFs → `db.schema.fn(args)` (vectorized over Arrow) | ✅ |
 | | Discovered table-valued functions → `SELECT * FROM db.schema.tvf(args)` (+ projection/filter pushdown) | ✅ |
 | | Discovered stored procedures → `SELECT * FROM db.schema.proc(name := val)` (named/optional + OUTPUT params) | ✅ |
@@ -68,7 +68,7 @@ inferred from the connection scheme):
 | | — configurable isolation (consistent snapshot per call); per-row procs run in DuckDB's transaction | ✅ |
 | | **Custom C# aggregates** (UDAF) → `db.schema.agg(x)` in `GROUP BY` / parallel / `OVER(…)`; opt-in disk-spill (`SupportsSpill`) | ✅ |
 | | Load-time *global* functions (connection-free); proc multi-result-set / `INOUT` params | ❌ deferred |
-| **Warehouse** | Auto-detected server profile (edition / version / collation) + `mssql_server_info()` | ✅ Fabric Warehouse validated |
+| **Warehouse** | Auto-detected server profile (edition / version / collation) + `fabricator_server_info()` | ✅ Fabric Warehouse validated |
 | | Connection mode: `mssql_mars` (auto per engine), pooled reads + SNAPSHOT writes when MARS off | ✅ |
 | | Collation-adaptive `VARCHAR`/`NVARCHAR`; binary-collation string `ORDER BY` pushdown | ✅ |
 | | PK/UNIQUE as `NONCLUSTERED NOT ENFORCED` (via ALTER) → rowid → UPDATE/DELETE on Fabric | ✅ |
@@ -87,7 +87,7 @@ next to the extension (no .NET install required on the host).
 ```sql
 -- Connection string (a valid Microsoft.Data.SqlClient string)
 ATTACH 'Server=host,1433;Database=db;User Id=sa;Password=***;TrustServerCertificate=true;Encrypt=true'
-  AS mssql (TYPE mssql_net);
+  AS mssql (TYPE mssql);
 
 SELECT * FROM mssql.dbo.people WHERE id > 1;   -- automatic streaming scan + filter pushdown
 SELECT count(*) FROM mssql.dbo.people;
@@ -97,30 +97,30 @@ DETACH mssql;
 
 ## Connection Configuration
 
-A `mssql_net` connection is given **either** a `Microsoft.Data.SqlClient` connection string, the
+A `fabricator` connection is given **either** a `Microsoft.Data.SqlClient` connection string, the
 `mssql://` URI convenience form, **or** a stored secret.
 
 ```sql
 -- ADO.NET / SqlClient connection string
 ATTACH 'Server=host,1433;Database=db;User Id=sa;Password=***;TrustServerCertificate=true;Encrypt=true'
-  AS mssql (TYPE mssql_net);
+  AS mssql (TYPE mssql);
 
 -- mssql:// URI (encrypt defaults on; ?encrypt=false to disable)
-ATTACH 'mssql://sa:***@host:1433/db' AS mssql (TYPE mssql_net);
+ATTACH 'mssql://sa:***@host:1433/db' AS mssql (TYPE fabricator);
 
 -- Restrict catalog discovery on large servers (case-insensitive regex, partial match)
 ATTACH 'Server=...;Database=...' AS mssql
-  (TYPE mssql_net, schema_filter '^(dbo|sales)$', table_filter '^fact_');
+  (TYPE mssql, schema_filter '^(dbo|sales)$', table_filter '^fact_');
 ```
 
 ### Secrets
 
 ```sql
 -- SQL auth. Password/access_token are redacted in duckdb_secrets().
-CREATE SECRET sql1 (TYPE mssql_net,
+CREATE SECRET sql1 (TYPE mssql,
   host 'host', port 1433, database 'db', user 'sa', password '***', use_encrypt true);
-ATTACH '' AS mssql (TYPE mssql_net, SECRET sql1);
-SELECT * FROM mssql_net_query('sql1', 'SELECT 1');
+ATTACH '' AS mssql (TYPE fabricator, SECRET sql1);
+SELECT * FROM fabricator_query('sql1', 'SELECT 1');
 ```
 
 Secret field names mirror the native `mssql` extension for cross-compatibility:
@@ -133,17 +133,17 @@ Secret field names mirror the native `mssql` extension for cross-compatibility:
 need no extra code:
 
 ```sql
-CREATE SECRET fab_sp (TYPE mssql_net,            -- service principal
+CREATE SECRET fab_sp (TYPE mssql,            -- service principal
   host 'xxx.datawarehouse.fabric.microsoft.com', database 'wh',
   authentication 'service_principal', user '<app-client-id>', password '<client-secret>');
-CREATE SECRET fab_mi (TYPE mssql_net,            -- (user-assigned) managed identity
+CREATE SECRET fab_mi (TYPE mssql,            -- (user-assigned) managed identity
   host '...', database 'wh', authentication 'managed_identity', user '<mi-client-id>');
-CREATE SECRET fab_def (TYPE mssql_net,           -- DefaultAzureCredential chain
+CREATE SECRET fab_def (TYPE mssql,           -- DefaultAzureCredential chain
   host '...', database 'wh', authentication 'default');
-CREATE SECRET fab_tok (TYPE mssql_net,           -- bring-your-own Entra token
+CREATE SECRET fab_tok (TYPE mssql,           -- bring-your-own Entra token
   host '...', database 'wh', access_token '<jwt>');
 -- also: interactive, device_code, workload_identity, password.
-ATTACH '' AS fab (TYPE mssql_net, SECRET fab_sp);
+ATTACH '' AS fab (TYPE fabricator, SECRET fab_sp);
 ```
 
 ### Integrated / Windows authentication
@@ -158,7 +158,7 @@ ATTACH validates the connection up front and creates **no** catalog on failure (
 never leaked):
 
 ```sql
-ATTACH 'Server=nonexistent.host,1433;Database=db;User Id=sa;Password=pass' AS db (TYPE mssql_net);
+ATTACH 'Server=nonexistent.host,1433;Database=db;User Id=sa;Password=pass' AS db (TYPE fabricator);
 -- Error: MSSQL connection validation failed: <cause>
 ```
 
@@ -167,16 +167,16 @@ ATTACH 'Server=nonexistent.host,1433;Database=db;User Id=sa;Password=pass' AS db
 Beyond box SQL Server, the extension connects to **Fabric Warehouse**, the **Lakehouse SQL analytics
 endpoint**, and **Synapse** pools. At ATTACH it detects a **server capability profile** (engine edition +
 product version + database collation) once and adapts automatically — no configuration needed. Inspect it
-with `mssql_server_info(catalog)`:
+with `fabricator_server_info(catalog)`:
 
 ```sql
 -- Fabric Warehouse via an Entra service principal:
-CREATE SECRET fab (TYPE mssql_net,
+CREATE SECRET fab (TYPE mssql,
   host 'xxxxx.datawarehouse.fabric.microsoft.com', database 'My Warehouse',
   authentication 'service_principal', user '<app-client-id>', password '<client-secret>');
-ATTACH '' AS wh (TYPE mssql_net, SECRET fab);
+ATTACH '' AS wh (TYPE fabricator, SECRET fab);
 
-SELECT property, value FROM mssql_server_info('wh');
+SELECT property, value FROM fabricator_server_info('wh');
 -- engine_edition=11, supports_mars=false, has_nvarchar=false, has_datetimeoffset=false,
 -- max_datetime2_scale=6, is_utf8_collation=true, is_binary_collation=true, default_write_isolation=snapshot
 ```
@@ -218,7 +218,7 @@ What the profile drives automatically:
   on INSERT (the identity column is absent from the source, so it's left for the engine).
   ```sql
   CREATE TABLE wh.dbo.Orders (OrderID BIGINT AS (0), CustomerID INT, Amount DECIMAL(10,2));  -- OrderID → IDENTITY
-  ATTACH '...' AS wh (TYPE mssql_net, add_identity true);   -- every created table gets <table>_id
+  ATTACH '...' AS wh (TYPE fabricator, add_identity true);   -- every created table gets <table>_id
   ```
   An IDENTITY column is also usable as the **`rowid`**, so `UPDATE`/`DELETE` work on a table whose only key is
   its identity column (no PK/unique). Precedence flips by engine: a **warehouse prefers the identity** (Fabric
@@ -283,13 +283,13 @@ SELECT rowid, name FROM mssql.dbo.products LIMIT 5;
 ## Transactions
 
 `BEGIN`/`COMMIT`/`ROLLBACK` map to a real SQL Server transaction. A connection is pinned (lazily, on
-the first write); all DML — catalog INSERT/UPDATE/DELETE and `mssql_net_exec` — runs on it, and reads
+the first write); all DML — catalog INSERT/UPDATE/DELETE and `fabricator_exec` — runs on it, and reads
 inside the transaction use it too (read-your-writes), so `ROLLBACK` undoes everything.
 
 ```sql
 BEGIN;
 INSERT INTO mssql.dbo.people (id, name) VALUES (9, 'temp');
-SELECT mssql_net_exec('mssql', 'UPDATE dbo.people SET salary = 0 WHERE id = 1');
+SELECT fabricator_exec('mssql', 'UPDATE dbo.people SET salary = 0 WHERE id = 1');
 SELECT count(*) FROM mssql.dbo.people;   -- sees the uncommitted INSERT
 ROLLBACK;                                -- both statements undone
 ```
@@ -311,7 +311,7 @@ DELETE FROM mssql.dbo.people WHERE id = 3;
 INSERT streams through `SqlBulkCopy` with `CheckConstraints` enabled, so a CHECK / FOREIGN KEY
 violation fails just like a classic INSERT (CTAS/COPY skip constraint checking for bulk-load speed).
 `IDENTITY` columns are preserved when the source supplies them (`KeepIdentity`) and auto-generated
-otherwise. UPDATE/DELETE require a primary key or unique index (otherwise use `mssql_net_exec`); they do
+otherwise. UPDATE/DELETE require a primary key or unique index (otherwise use `fabricator_exec`); they do
 not support RETURNING.
 
 ## CREATE TABLE AS / COPY TO
@@ -322,8 +322,8 @@ table from the Arrow schema. Both are bounded-memory (the dataset is never fully
 ```sql
 CREATE TABLE mssql.dbo.summary AS SELECT region, count(*) AS n FROM big GROUP BY region;
 
-COPY (SELECT * FROM src) TO 'mssql://mssql/dbo/target' (FORMAT mssql_net);
-COPY src TO 'mssql.dbo.target'  (FORMAT mssql_net);
+COPY (SELECT * FROM src) TO 'mssql://mssql/dbo/target' (FORMAT mssql);
+COPY src TO 'mssql.dbo.target'  (FORMAT mssql);
 COPY src TO 'mssql.dbo.target'  (FORMAT 'bcp');               -- 'bcp' is an accepted alias
 COPY src TO 'mssql.dbo.target'  (FORMAT 'bcp', REPLACE true); -- drop + recreate
 ```
@@ -387,7 +387,7 @@ DROP SCHEMA mssql.staging;
 ```
 
 For SQL Server-specific features (IDENTITY, CHECK, indexes, FKs, non-literal DEFAULTs), use
-`mssql_net_exec`.
+`fabricator_exec`.
 
 ### Temporary tables
 
@@ -395,29 +395,29 @@ For SQL Server-specific features (IDENTITY, CHECK, indexes, FKs, non-literal DEF
 its own in-memory/spillable `temp` catalog and forbids qualifying one with an attached catalog (`TEMPORARY
 table names can only use the "temp" catalog`), so it never reaches the provider. Just use DuckDB's native temp
 tables for transient data (faster — no round-trip, no connection affinity). If you specifically need a
-*server-side* `#temp` (e.g. staging for a complex `EXEC`), create and use it via `mssql_net_exec` **inside a
+*server-side* `#temp` (e.g. staging for a complex `EXEC`), create and use it via `fabricator_exec` **inside a
 DuckDB `BEGIN`** so all calls share the one pinned connection — and only on a **MARS engine (box SQL Server)**:
 `#temp` tables are connection-scoped, so they don't survive across autocommit calls, and on Fabric/Synapse
 (MARS off → pooled reads) they aren't visible to subsequent statements.
 
 ## Function Reference
 
-### `mssql_net_query(context, sql) -> TABLE`
+### `fabricator_query(context, sql) -> TABLE`
 
 Stream a raw T-SQL query. `context` may be a connection string, a secret name, or an attached-catalog
 name (reuses that catalog's connection).
 
 ```sql
-SELECT id, name FROM mssql_net_query('Server=...;Database=...', 'SELECT id, name FROM dbo.people');
-SELECT * FROM mssql_net_query('mssql', 'SELECT id, name FROM dbo.people');   -- attached catalog
+SELECT id, name FROM fabricator_query('Server=...;Database=...', 'SELECT id, name FROM dbo.people');
+SELECT * FROM fabricator_query('mssql', 'SELECT id, name FROM dbo.people');   -- attached catalog
 ```
 
-### `mssql_net_exec(context, sql) -> BIGINT`
+### `fabricator_exec(context, sql) -> BIGINT`
 
 Execute arbitrary T-SQL (DDL/DML/EXEC); returns rows affected (0 for DDL / no-row statements).
 
 ```sql
-SELECT mssql_net_exec('mssql', 'UPDATE dbo.people SET salary = salary + 1 WHERE id <= 2');
+SELECT fabricator_exec('mssql', 'UPDATE dbo.people SET salary = salary + 1 WHERE id <= 2');
 ```
 
 Multiple statements separated by `;` (including multiline) run as **one batch** in a single call (return
@@ -425,35 +425,35 @@ value = aggregate rows affected). `GO` is **not** supported — it's a sqlcmd/SS
 (use `;`, or separate calls). For cross-statement atomicity, wrap in `BEGIN…COMMIT` or a DuckDB `BEGIN`.
 
 ```sql
-SELECT mssql_net_exec('mssql', 'CREATE TABLE dbo.t (id int); INSERT INTO dbo.t VALUES (1),(2)');
+SELECT fabricator_exec('mssql', 'CREATE TABLE dbo.t (id int); INSERT INTO dbo.t VALUES (1),(2)');
 ```
 
-### `mssql_refresh_cache(catalog)` / `mssql_invalidate_cache(catalog [, schema [, table]])`
+### `fabricator_refresh_cache(catalog)` / `fabricator_invalidate_cache(catalog [, schema [, table]])`
 
 Refresh cached catalog metadata after creating/dropping tables out-of-band (e.g. via
-`mssql_net_exec`). `mssql_net_refresh_cache` / `mssql_net_invalidate_cache` are aliases.
+`fabricator_exec`). `fabricator_refresh_cache` / `fabricator_invalidate_cache` are aliases.
 
 ```sql
-SELECT mssql_net_exec('mssql', 'CREATE TABLE dbo.t (id INT)');
-SELECT mssql_refresh_cache('mssql');
+SELECT fabricator_exec('mssql', 'CREATE TABLE dbo.t (id INT)');
+SELECT fabricator_refresh_cache('mssql');
 SELECT * FROM mssql.dbo.t;
 
--- ...or auto-invalidate after DDL run via mssql_net_exec (off by default; DDL detected in C#):
+-- ...or auto-invalidate after DDL run via fabricator_exec (off by default; DDL detected in C#):
 SET mssql_exec_invalidate_cache = true;
-SELECT mssql_net_exec('mssql', 'CREATE TABLE dbo.t2 (id INT)');
+SELECT fabricator_exec('mssql', 'CREATE TABLE dbo.t2 (id INT)');
 SELECT * FROM mssql.dbo.t2;   -- visible immediately
 ```
 
-### `mssql_server_info(catalog) -> TABLE(property, value)`
+### `fabricator_server_info(catalog) -> TABLE(property, value)`
 
 The detected server capability profile for an attached catalog (edition, version, collation, and the
 derived flags: `supports_mars`, `has_nvarchar`, `has_datetimeoffset`, `max_datetime2_scale`,
 `has_native_json`, `is_utf8_collation`, `is_binary_collation`, `default_write_isolation`, …). See
 [Microsoft Fabric & Synapse](#microsoft-fabric--synapse-warehouse).
 
-### `mssql_version() -> VARCHAR`
+### `fabricator_version() -> VARCHAR`
 
-Extension version (compatibility shim). `arrownet_managed_dir()` / `arrownet_test_scan('x')` are
+Extension version (compatibility shim). `fabricator_managed_dir()` / `fabricator_test_scan('x')` are
 diagnostics for the CoreCLR + Arrow spine.
 
 ## Callable Functions
@@ -461,11 +461,11 @@ diagnostics for the CoreCLR + Arrow spine.
 On `ATTACH`, the extension discovers the database's scalar UDFs, table-valued functions, and stored
 procedures and registers them as **DuckDB catalog functions**, resolved as `db.schema.name(...)`.
 Signatures and result schemas are resolved lazily on first use (so attach stays cheap) and refreshed by
-`mssql_refresh_cache`. All execution is vectorized over Arrow; the C++ side is provider-agnostic (the
-SQL lives in C#). `mssql_net_functions('db')` lists what was discovered.
+`fabricator_refresh_cache`. All execution is vectorized over Arrow; the C++ side is provider-agnostic (the
+SQL lives in C#). `fabricator_functions('db')` lists what was discovered.
 
 ```sql
-SELECT schema_name, name, kind FROM mssql_net_functions('mssql');   -- kind: scalar | table | proc | inout
+SELECT schema_name, name, kind FROM fabricator_functions('mssql');   -- kind: scalar | table | proc | inout
 ```
 
 ### Scalar UDFs
@@ -501,7 +501,7 @@ SELECT sum, diff, return_value FROM mssql.dbo.usp_addsub(a := 10, b := 3);   -- 
 
 You can author functions in **C#** (no SQL Server object needed) and they surface into every attached
 catalog like discovered ones. Implement `ICatalogScalarFunction`, `IArrowTableFunction`,
-`IArrowInOutFunction`, or `IArrowAggregateFunction` (in `ArrowNet.Bridge`) and register them in
+`IArrowInOutFunction`, or `IArrowAggregateFunction` (in `Fabricator.Bridge`) and register them in
 `CustomFunctions` — each receives an Arrow `RecordBatch` and returns Arrow, fully vectorized.
 
 ### Table-in-out (`fn_each`)
@@ -525,7 +525,7 @@ SELECT * FROM mssql.dbo.usp_process_each((SELECT id FROM mssql.dbo.queue));
   `SET mssql_isolation_level` (`read uncommitted` / `read committed` / `repeatable read` / `serializable`
   / `snapshot`; `snapshot` needs `ALLOW_SNAPSHOT_ISOLATION ON`):
   ```sql
-  ATTACH 'mssql://…' AS mssql (TYPE mssql_net, isolation_level 'snapshot');
+  ATTACH 'mssql://…' AS mssql (TYPE fabricator, isolation_level 'snapshot');
   SET mssql_isolation_level = 'serializable';   -- session override
   ```
 - **Stored-proc writes are transactional:** the per-row `EXEC`s run on DuckDB's transaction, so they
@@ -542,7 +542,7 @@ aggregates and usable wherever DuckDB allows one — `GROUP BY`, parallel aggreg
 contexts — over **any** data (local or remote). They reduce in C#; there need be no SQL Server object.
 
 ```sql
-ATTACH 'mssql://…' AS mssql (TYPE mssql_net);
+ATTACH 'mssql://…' AS mssql (TYPE fabricator);
 
 -- dbo.cf_product is a C# UDAF (no PRODUCT aggregate exists in SQL Server):
 SELECT cf_product(x) FROM (VALUES (2),(3),(4)) t(x);         -- 24
@@ -580,7 +580,7 @@ the native extension's batching/pooling/TDS knobs don't apply).
 | `mssql_cluster_by` | **Active** | Comma-separated columns → Fabric Warehouse/Synapse `WITH (CLUSTER BY (cols))` on created tables (fallback for a native `SORTED BY` clause; no-op on box) |
 | `mssql_add_identity` | **Active** | Auto-add a `BIGINT IDENTITY` surrogate key (`<table>_id`) to created tables (CREATE + CTAS); overrides the per-catalog `add_identity` ATTACH option (`SET false` to skip for fact tables) |
 | `mssql_ctas_text_type` | **Active** | Whole-type override for text columns on CREATE/CTAS/COPY (e.g. `'VARCHAR(64)'`); wins over the collation choice + length |
-| `mssql_exec_invalidate_cache` | **Active** | Auto-invalidate the catalog cache after DDL run via `mssql_net_exec` (default `false`) |
+| `mssql_exec_invalidate_cache` | **Active** | Auto-invalidate the catalog cache after DDL run via `fabricator_exec` (default `false`) |
 | `mssql_isolation_level` | **Active** | SQL transaction isolation level for table-in-out (`fn_each`) calls; overrides the ATTACH `isolation_level` per session (empty ⇒ provider default) |
 | `mssql_insert_batch_size`, `mssql_insert_max_rows_per_statement`, `mssql_insert_max_sql_bytes`, `mssql_insert_use_returning_output` | Accepted | Registered with defaults + `>= 1` validation; no-op (INSERT streams via SqlBulkCopy) |
 | `mssql_connection_*`, `mssql_*_timeout`, `mssql_min_connections`, `mssql_connection_cache` | Accepted | No-op (SqlClient pools by connection string) |
@@ -619,12 +619,12 @@ name is `engineeredwooddelta`.)
 
 ```sql
 -- Local / S3 / ADLS folder catalog
-ATTACH '/lake/root' AS lake (TYPE mssql_net, PROVIDER 'delta');
+ATTACH '/lake/root' AS lake (TYPE fabricator, PROVIDER 'delta');
 
 -- Fabric OneLake (READ_ONLY false is REQUIRED — DuckDB forces remote ATTACH read-only otherwise;
 -- one azure service-principal secret serves DuckDB IO + the OneLake DFS endpoint)
 ATTACH 'abfss://Workspace@onelake.dfs.fabric.microsoft.com/LH.Lakehouse/Tables'
-  AS lake (TYPE mssql_net, PROVIDER 'delta', SECRET fabric_sp, READ_ONLY false);
+  AS lake (TYPE mssql, PROVIDER 'delta', SECRET fabric_sp, READ_ONLY false);
 
 SELECT * FROM lake.main.t WHERE id > 10;          -- streaming scan + file/row-group filter pushdown
 ```
@@ -638,8 +638,8 @@ SELECT * FROM lake.main.t WHERE id > 10;          -- streaming scan + file/row-g
 | `DROP TABLE`, `ALTER TABLE … ADD COLUMN`, `RENAME TABLE` (local + OneLake) | ✅ |
 | Multi-schema: `schemas true` (local/S3 `<root>/<schema>/<table>`); schema-enabled OneLake lakehouses | ✅ |
 | Time travel: `FROM t AT (VERSION => n)` and `AT (TIMESTAMP => ts)` | ✅ |
-| Snapshots/history: `arrownet_delta_snapshots('<catalog>', '<schema.>table')` | ✅ |
-| **Change Data Feed**: `change_data_feed true` + `arrownet_delta_changes('<catalog>', '<schema.>table', from[, to])` | ✅ |
+| Snapshots/history: `fabricator_delta_snapshots('<catalog>', '<schema.>table')` | ✅ |
+| **Change Data Feed**: `change_data_feed true` + `fabricator_delta_changes('<catalog>', '<schema.>table', from[, to])` | ✅ |
 | **Partitioning**: native `CREATE TABLE … PARTITIONED BY (cols)` (or the `delta_write_options` setting) → Hive `col=value/` layout | ✅ |
 | **Write tuning**: compression / row-group size / bloom filters via ATTACH options or the `delta_write_options` JSON setting | ✅ |
 | Concurrent writers (OCC retry on append/CTAS; rowid DML is snapshot-bound) | ✅ |
@@ -647,14 +647,14 @@ SELECT * FROM lake.main.t WHERE id > 10;          -- streaming scan + file/row-g
 ```sql
 -- Time travel + history
 SELECT * FROM lake.main.t AT (VERSION => 3);
-SELECT version, operation, timestamp FROM arrownet_delta_snapshots('lake', 'main.t') ORDER BY version;
+SELECT version, operation, timestamp FROM fabricator_delta_snapshots('lake', 'main.t') ORDER BY version;
 
 -- Change Data Feed (enable per catalog at ATTACH, then read the row-level feed)
-ATTACH '/lake/root' AS cdf (TYPE mssql_net, PROVIDER 'delta', change_data_feed true);
+ATTACH '/lake/root' AS cdf (TYPE fabricator, PROVIDER 'delta', change_data_feed true);
 CREATE TABLE cdf.main.t AS SELECT * FROM (VALUES (1,'a'),(2,'b')) v(id,val);
 DELETE FROM cdf.main.t WHERE id = 2;
 SELECT _change_type, id, val, _commit_version, _commit_timestamp
-  FROM arrownet_delta_changes('cdf', 'main.t', 0);     -- to omitted => latest
+  FROM fabricator_delta_changes('cdf', 'main.t', 0);     -- to omitted => latest
 -- insert/insert (v1), delete (v2): each row tagged with its commit version + timestamp (epoch ms)
 ```
 
@@ -674,7 +674,7 @@ JSON setting** (the setting overlays the ATTACH defaults per key; its `partition
 native clause). Applies to CREATE / INSERT / CTAS / COPY.
 
 ```sql
-ATTACH '/lake' AS lake (TYPE mssql_net, PROVIDER 'delta',
+ATTACH '/lake' AS lake (TYPE fabricator, PROVIDER 'delta',
   compression 'zstd', row_group_size 1000000, bloom_filter_columns 'id,email');
 
 SET delta_write_options = '{"compression":"zstd","row_group_size":1000000,
@@ -703,8 +703,8 @@ Two more write options (also via `delta_write_options`):
   exactly the new SELECT's schema (a dropped column is gone, a new one appears), like DuckDB's drop+create.
   ```sql
   COPY (SELECT id, val, new_col FROM …) TO 'lake.main.t'
-    (FORMAT mssql_net, CREATE_TABLE false, SCHEMA_MODE 'merge');       -- append + add new_col (old rows NULL)
-  COPY (SELECT … FROM …) TO 'lake.main.t' (FORMAT mssql_net, SCHEMA_MODE 'overwrite');  -- replace data + schema
+    (FORMAT mssql, CREATE_TABLE false, SCHEMA_MODE 'merge');       -- append + add new_col (old rows NULL)
+  COPY (SELECT … FROM …) TO 'lake.main.t' (FORMAT mssql, SCHEMA_MODE 'overwrite');  -- replace data + schema
   ```
   For append-time evolution via `INSERT`, use `ALTER TABLE ADD COLUMN` (supported) then `INSERT`.
 
@@ -722,7 +722,7 @@ corresponding option is set. Full design: [`docs/delta-catalog.md`](docs/delta-c
 ### Managed bridge
 
 ```bash
-dotnet build dotnet/ArrowNet.Bridge -c Release
+dotnet build dotnet/Fabricator.Bridge -c Release
 pwsh scripts/publish-managed.ps1     # self-contained publish next to the built extension
 ```
 
@@ -750,36 +750,36 @@ cmake -G Ninja -DEXTENSION_STATIC_BUILD=1 `
   -DENABLE_EXTENSION_AUTOLOADING=1 -DENABLE_EXTENSION_AUTOINSTALL=1 `
   -DENABLE_UNITTEST_CPP_TESTS=FALSE -DCMAKE_BUILD_TYPE=Release `
   -S <repo>/duckdb -B <repo>/build/release
-cmake --build build/release --target mssql_net_loadable_extension duckdb shell
+cmake --build build/release --target fabricator_loadable_extension duckdb shell
 ```
 
-Produces `build/release/extension/mssql_net/mssql_net.duckdb_extension` and a `build/release/duckdb.exe`
-that already embeds the extension (no `LOAD` needed). The bridge is located via `ARROWNET_MANAGED_DIR`,
-else an `arrownet/` folder next to the loaded module — `publish-managed.ps1` writes it to
-`build/release/extension/mssql_net/arrownet`, so when running `duckdb.exe` directly set
-`ARROWNET_MANAGED_DIR` to that folder:
+Produces `build/release/extension/fabricator/fabricator.duckdb_extension` and a `build/release/duckdb.exe`
+that already embeds the extension (no `LOAD` needed). The bridge is located via `FABRICATOR_MANAGED_DIR`,
+else an `fabricator/` folder next to the loaded module — `publish-managed.ps1` writes it to
+`build/release/extension/fabricator/fabricator`, so when running `duckdb.exe` directly set
+`FABRICATOR_MANAGED_DIR` to that folder:
 
 ```powershell
-$env:ARROWNET_MANAGED_DIR = "$PWD/build/release/extension/mssql_net/arrownet"
-build/release/duckdb.exe -unsigned -c "ATTACH 'mssql://…' AS db (TYPE mssql_net); SELECT …"
+$env:FABRICATOR_MANAGED_DIR = "$PWD/build/release/extension/fabricator/fabricator"
+build/release/duckdb.exe -unsigned -c "ATTACH 'mssql://…' AS db (TYPE fabricator); SELECT …"
 ```
 
 ## Layout
 
 ```
 src/                         C++ DuckDB extension
-  include/arrownet/abi.h     C ABI vtable + Arrow C structs (shared contract)
-  arrownet/                  CoreCLR host + Arrow ingest/produce (generic core, namespace arrownet)
+  include/fabricator/abi.h     C ABI vtable + Arrow C structs (shared contract)
+  fabricator/                  CoreCLR host + Arrow ingest/produce (generic core, namespace fabricator)
   catalog/  dml/  copy/      catalog, DML, COPY operators (provider-agnostic — no T-SQL in C++)
                              catalog/ also registers discovered + custom scalar/table/proc/table-in-out
                              functions and the table-in-out OperatorFinalize optimizer extension
-  arrownet_optimizer.cpp     LIMIT / TopN pushdown optimizer extension
-  mssql_net_extension.cpp    extension entry + mssql_net_query / _exec / cache / version functions
-  mssql_net_storage.cpp      ATTACH (TYPE mssql_net); mssql_net_secret.cpp  secret type
-dotnet/ArrowNet.Bridge/      backend-agnostic managed bridge (ABI, Arrow, IBackend, streaming bulk)
+  fabricator_optimizer.cpp     LIMIT / TopN pushdown optimizer extension
+  fabricator_extension.cpp    extension entry + fabricator_query / _exec / cache / version functions
+  fabricator_storage.cpp      ATTACH (TYPE fabricator); fabricator_secret.cpp  secret type
+dotnet/Fabricator.Bridge/      backend-agnostic managed bridge (ABI, Arrow, IBackend, streaming bulk)
                              also hosts the Delta provider (DeltaCatalog/DeltaReader over engineered-wood)
-dotnet/ArrowNet.SqlServer/   Microsoft.Data.SqlClient backend + composition root
-dotnet/ArrowNet.AnalysisServices/  Power BI / DAX (ADOMD) backend — PROVIDER 'dax'
+dotnet/Fabricator.SqlServer/   Microsoft.Data.SqlClient backend + composition root
+dotnet/Fabricator.AnalysisServices/  Power BI / DAX (ADOMD) backend — PROVIDER 'dax'
 scripts/publish-managed.ps1  self-contained publish of the bridge + .NET runtime
 test/                        verify_*.test + mssqlcompat/ (regenerated from the native extension)
 CMakeLists.txt, Makefile, extension_config.cmake, vcpkg.json, CLAUDE.md

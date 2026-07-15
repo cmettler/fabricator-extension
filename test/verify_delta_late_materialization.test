@@ -7,17 +7,17 @@
 #              `file_row_number` predicate (parquet row-group skip via its synthesized min/max). The fetch
 #              side is O(matched files), never a second full scan. File ordinals are path-sort positions of
 #              RANDOM uuids, so assertions use counts/ranges (layout-independent), plus duckdb_logs pins of
-#              the prune + the file_row_number rewrite. Set ARROWNET_DELTA_WRITE_DIR (writable). Local FS.
-# group: [mssql_net]
+#              the prune + the file_row_number rewrite. Set FABRICATOR_DELTA_WRITE_DIR (writable). Local FS.
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
 require parquet
 
-require-env ARROWNET_DELTA_WRITE_DIR
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/latemat' AS lake (TYPE arrownet, PROVIDER 'delta', native_read true, native_write true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/latemat' AS lake (TYPE fabricator, PROVIDER 'delta', native_read true, native_write true);
 
 # three data files, 1000 rows each (positions 0..999 per file)
 statement ok
@@ -126,14 +126,14 @@ SELECT count(*) FROM lake.main.lm WHERE rowid = (1::BIGINT << 40) + 5;
 # the fetch/lookup scans pruned the file list by the rowid's ordinal half
 query I
 SELECT count(*) > 0 FROM duckdb_logs
-WHERE type = 'ArrowNet.Delta.Native' AND message LIKE '%rowid prune%files 3 -> 1%';
+WHERE type = 'Fabricator.Delta.Native' AND message LIKE '%rowid prune%files 3 -> 1%';
 ----
 true
 
 # and the position half was rewritten to a file_row_number predicate (zone-map prunable)
 query I
 SELECT count(*) > 0 FROM duckdb_logs
-WHERE type = 'ArrowNet.Delta.Native' AND message LIKE '%file_row_number IN (5)%';
+WHERE type = 'Fabricator.Delta.Native' AND message LIKE '%file_row_number IN (5)%';
 ----
 true
 
@@ -191,7 +191,7 @@ SELECT * FROM lake.main.lm ORDER BY x DESC LIMIT 1;
 # ---- a NON-native catalog is unaffected (no exact mode ⇒ no erased rowid filters; DuckDB applies) ----
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/latemat' AS lake2 (TYPE arrownet, PROVIDER 'delta', READ_ONLY true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/latemat' AS lake2 (TYPE fabricator, PROVIDER 'delta', READ_ONLY true);
 
 query I
 SELECT count(*) FROM lake2.main.lm WHERE rowid IN (SELECT rowid FROM lake2.main.lm WHERE id IN (5, 2999));

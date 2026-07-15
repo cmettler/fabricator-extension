@@ -1,25 +1,25 @@
 # name: test/verify_delta_catalog_variant.test
 # description: VARIANT columns on the Delta catalog (docs/variant-support.md). VARIANT crosses the C++<->C#
-#              Arrow boundary as the arrownet.variant single-blob transport (metadata||value) via the Arrow
+#              Arrow boundary as the fabricator.variant single-blob transport (metadata||value) via the Arrow
 #              type extension registered at load; the data files are written/read by DuckDB's OWN parquet
 #              writer/reader (annotated variant, shredding-capable) — so variant tables REQUIRE native_read +
 #              native_write (clean gate errors otherwise). The _delta_log declares the variantType
 #              reader+writer feature (reader v3 / writer v7); delta-kernel reads the result (validated).
 #              DV DELETE works (no data rewrite); UPDATE / CoW DELETE / OPTIMIZE are gated (clean errors).
-#              Set ARROWNET_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
-# group: [mssql_net]
+#              Set FABRICATOR_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
 require parquet
 
 require json
 
-require-env ARROWNET_DELTA_WRITE_DIR
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 # ---- catalog with the native paths on: variant is fully supported ----
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/varcatalog' AS lake (TYPE arrownet, PROVIDER 'delta', column_mapping 'none', native_read true, native_write true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/varcatalog' AS lake (TYPE fabricator, PROVIDER 'delta', column_mapping 'none', native_read true, native_write true);
 
 statement ok
 CREATE TABLE lake.main.vt (id INTEGER, v VARIANT);
@@ -81,7 +81,7 @@ SELECT v::VARCHAR FROM lake.main.vt WHERE id = 6;
 
 # ---- feature declaration: the variantType reader+writer feature rides commit 0 ----
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('lake', 'vt');
+SELECT count(*) FROM fabricator_delta_snapshots('lake', 'vt');
 ----
 3
 
@@ -129,7 +129,7 @@ SELECT count(*) FROM lake.main.vt WHERE v IS NULL;
 # OPTIMIZE (compaction): the read half decodes through read_parquet, the write half through COPY —
 # the annotation survives the bin-pack; deleted/updated state is preserved.
 statement ok
-SELECT mssql_net_exec('lake', 'OPTIMIZE main.vt');
+SELECT fabricator_exec('lake', 'OPTIMIZE main.vt');
 
 query IT
 SELECT id, v::VARCHAR FROM lake.main.vt ORDER BY id;
@@ -145,7 +145,7 @@ statement ok
 DETACH lake;
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/varcatalog' AS lake2 (TYPE arrownet, PROVIDER 'delta', column_mapping 'none', native_read true, native_write true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/varcatalog' AS lake2 (TYPE fabricator, PROVIDER 'delta', column_mapping 'none', native_read true, native_write true);
 
 query IT
 SELECT id, v::VARCHAR FROM lake2.main.vt ORDER BY id;
@@ -158,7 +158,7 @@ SELECT id, v::VARCHAR FROM lake2.main.vt ORDER BY id;
 
 # ---- the codec paths handle variant now (no native-flag requirement for CREATE/INSERT/SELECT) ----
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/varplain' AS plain (TYPE arrownet, PROVIDER 'delta', column_mapping 'none');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/varplain' AS plain (TYPE fabricator, PROVIDER 'delta', column_mapping 'none');
 
 statement ok
 CREATE TABLE plain.main.vt (id INTEGER, v VARIANT);
@@ -167,7 +167,7 @@ CREATE TABLE plain.main.vt (id INTEGER, v VARIANT);
 # DuckDB's native writer produces by default (typed_value columns merged with residual bytes via
 # Apache.Arrow.Operations) — so a codec-only catalog reads the natively-written table exactly.
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/varcatalog' AS codecread (TYPE arrownet, PROVIDER 'delta', column_mapping 'none');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/varcatalog' AS codecread (TYPE fabricator, PROVIDER 'delta', column_mapping 'none');
 
 query IT
 SELECT id, v::VARCHAR FROM codecread.main.vt ORDER BY id;
@@ -180,7 +180,7 @@ SELECT id, v::VARCHAR FROM codecread.main.vt ORDER BY id;
 
 # ---- pure codec path (no native flags): engineered-wood WRITES the annotated variant group too ----
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/varcodec' AS codecrw (TYPE arrownet, PROVIDER 'delta', column_mapping 'none');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/varcodec' AS codecrw (TYPE fabricator, PROVIDER 'delta', column_mapping 'none');
 
 statement ok
 CREATE TABLE codecrw.main.cvt (id INTEGER, v VARIANT);
@@ -230,13 +230,13 @@ SELECT id, v::VARCHAR, v IS NULL FROM codecrw.main.shred ORDER BY id;
 
 # The file really is shredded (typed_value columns present in the parquet).
 query I
-SELECT count(*) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/varcodec/shred/*.parquet') WHERE name = 'typed_value';
+SELECT count(*) FROM parquet_schema('${FABRICATOR_DELTA_WRITE_DIR}/varcodec/shred/*.parquet') WHERE name = 'typed_value';
 ----
 3
 
 # DuckDB's own variant decode (read_parquet) agrees with the codec's shredded layout.
 query IT
-SELECT id, v::VARCHAR FROM read_parquet('${ARROWNET_DELTA_WRITE_DIR}/varcodec/shred/*.parquet') ORDER BY id;
+SELECT id, v::VARCHAR FROM read_parquet('${FABRICATOR_DELTA_WRITE_DIR}/varcodec/shred/*.parquet') ORDER BY id;
 ----
 1	{'a': 10, 'b': x}
 2	{'a': 20, 'b': y}
@@ -245,7 +245,7 @@ SELECT id, v::VARCHAR FROM read_parquet('${ARROWNET_DELTA_WRITE_DIR}/varcodec/sh
 
 # change_data_feed cannot combine with variant (CDC files are codec-written).
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/varcdf' AS cdf (TYPE arrownet, PROVIDER 'delta', column_mapping 'none', native_read true, native_write true, change_data_feed true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/varcdf' AS cdf (TYPE fabricator, PROVIDER 'delta', column_mapping 'none', native_read true, native_write true, change_data_feed true);
 
 statement error
 CREATE TABLE cdf.main.vt (id INTEGER, v VARIANT);
@@ -256,7 +256,7 @@ cannot be combined with change_data_feed
 # The variant column gets a physical col-<guid> name + delta.columnMapping.id; the parquet stores the
 # annotated variant group under the physical name WITH its field_id; RENAME COLUMN is metadata-only.
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/varmapped' AS mapped (TYPE arrownet, PROVIDER 'delta', native_read true, native_write true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/varmapped' AS mapped (TYPE fabricator, PROVIDER 'delta', native_read true, native_write true);
 
 statement ok
 CREATE TABLE mapped.main.mv (id INTEGER, v VARIANT);

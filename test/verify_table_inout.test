@@ -3,25 +3,25 @@
 #              once per input row via SQL-Server CROSS APPLY (parallel input coordinated in C#).
 # group: [mssql]
 
-require mssql_net
+require fabricator
 
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS iodb (TYPE mssql_net);
+ATTACH '${MSSQL_TESTDB_DSN}' AS iodb (TYPE fabricator);
 
 # A 1-arg inline TVF returning rows 1..n; a 2-arg TVF (multi-column input); a TVF that errors for n=0.
 statement ok
-SELECT mssql_net_exec('iodb', 'CREATE OR ALTER FUNCTION dbo.tf_io(@n INT) RETURNS TABLE AS RETURN (SELECT TOP (@n) CAST(ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS INT) AS m FROM sys.all_objects)');
+SELECT fabricator_exec('iodb', 'CREATE OR ALTER FUNCTION dbo.tf_io(@n INT) RETURNS TABLE AS RETURN (SELECT TOP (@n) CAST(ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS INT) AS m FROM sys.all_objects)');
 
 statement ok
-SELECT mssql_net_exec('iodb', 'CREATE OR ALTER FUNCTION dbo.tf_kv(@id INT, @label VARCHAR(20)) RETURNS TABLE AS RETURN (SELECT @id*10 AS v, @label AS lbl)');
+SELECT fabricator_exec('iodb', 'CREATE OR ALTER FUNCTION dbo.tf_kv(@id INT, @label VARCHAR(20)) RETURNS TABLE AS RETURN (SELECT @id*10 AS v, @label AS lbl)');
 
 statement ok
-SELECT mssql_net_exec('iodb', 'CREATE OR ALTER FUNCTION dbo.tf_div(@n INT) RETURNS TABLE AS RETURN (SELECT 100/@n AS q)');
+SELECT fabricator_exec('iodb', 'CREATE OR ALTER FUNCTION dbo.tf_div(@n INT) RETURNS TABLE AS RETURN (SELECT 100/@n AS q)');
 
 statement ok
-SELECT mssql_refresh_cache('iodb');
+SELECT fabricator_refresh_cache('iodb');
 
 # The scalar-arg scan form (4c) is unchanged and coexists with the `_each` in-out alias.
 query I
@@ -111,13 +111,13 @@ SELECT n, m FROM iodb.dbo.tf_io_each((SELECT v.n FROM (VALUES(2)) v(n))) ORDER B
 2	2
 
 statement ok
-SELECT mssql_net_exec('iodb', 'DROP FUNCTION IF EXISTS dbo.tf_io');
+SELECT fabricator_exec('iodb', 'DROP FUNCTION IF EXISTS dbo.tf_io');
 
 statement ok
-SELECT mssql_net_exec('iodb', 'DROP FUNCTION IF EXISTS dbo.tf_kv');
+SELECT fabricator_exec('iodb', 'DROP FUNCTION IF EXISTS dbo.tf_kv');
 
 statement ok
-SELECT mssql_net_exec('iodb', 'DROP FUNCTION IF EXISTS dbo.tf_div');
+SELECT fabricator_exec('iodb', 'DROP FUNCTION IF EXISTS dbo.tf_div');
 
 statement ok
 DETACH iodb;

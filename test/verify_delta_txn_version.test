@@ -1,19 +1,19 @@
 # name: test/verify_delta_txn_version.test
 # description: Idempotent appends via Delta APPLICATION TRANSACTIONS (the `txn` action; duckdb-delta /
-#              Spark txnAppId parity). arrownet_delta_set_transaction_version(catalog, 'schema.table',
+#              Spark txnAppId parity). fabricator_delta_set_transaction_version(catalog, 'schema.table',
 #              app_id, version [, expected_previous]) PARKS the version on the current explicit
 #              transaction; at COMMIT it is compared-and-swapped against the latest snapshot and the txn
 #              action commits ATOMICALLY with the transaction's fused commit — a retried batch whose first
 #              attempt landed fails the CAS instead of duplicating data.
-#              arrownet_delta_get_transaction_version reads the committed high-water mark.
-# group: [mssql_net]
+#              fabricator_delta_get_transaction_version reads the committed high-water mark.
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
-require-env ARROWNET_DELTA_WRITE_DIR
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txnver' AS lake (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txnver' AS lake (TYPE fabricator, PROVIDER 'delta');
 
 statement ok
 CREATE TABLE lake.main.t (id INTEGER);
@@ -23,7 +23,7 @@ CREATE TABLE lake.main.t (id INTEGER);
 # ----------------------------------------------------------------------------
 
 query TI
-SELECT * FROM arrownet_delta_get_transaction_version('lake', 't', 'loader');
+SELECT * FROM fabricator_delta_get_transaction_version('lake', 't', 'loader');
 ----
 loader	NULL
 
@@ -32,7 +32,7 @@ loader	NULL
 # ----------------------------------------------------------------------------
 
 statement error
-CALL arrownet_delta_set_transaction_version('lake', 't', 'loader', 1);
+CALL fabricator_delta_set_transaction_version('lake', 't', 'loader', 1);
 ----
 requires an explicit transaction
 
@@ -44,7 +44,7 @@ statement ok
 BEGIN;
 
 query TI
-CALL arrownet_delta_set_transaction_version('lake', 't', 'loader', 1);
+CALL fabricator_delta_set_transaction_version('lake', 't', 'loader', 1);
 ----
 loader	1
 
@@ -55,7 +55,7 @@ statement ok
 COMMIT;
 
 query TI
-SELECT * FROM arrownet_delta_get_transaction_version('lake', 't', 'loader');
+SELECT * FROM fabricator_delta_get_transaction_version('lake', 't', 'loader');
 ----
 loader	1
 
@@ -72,7 +72,7 @@ statement ok
 BEGIN;
 
 statement ok
-CALL arrownet_delta_set_transaction_version('lake', 't', 'loader', 1);
+CALL fabricator_delta_set_transaction_version('lake', 't', 'loader', 1);
 
 statement ok
 INSERT INTO lake.main.t VALUES (1), (2);
@@ -95,7 +95,7 @@ statement ok
 BEGIN;
 
 statement ok
-CALL arrownet_delta_set_transaction_version('lake', 't', 'loader', 2, 1);
+CALL fabricator_delta_set_transaction_version('lake', 't', 'loader', 2, 1);
 
 statement ok
 INSERT INTO lake.main.t VALUES (3);
@@ -104,7 +104,7 @@ statement ok
 COMMIT;
 
 query TI
-SELECT * FROM arrownet_delta_get_transaction_version('lake', 't', 'loader');
+SELECT * FROM fabricator_delta_get_transaction_version('lake', 't', 'loader');
 ----
 loader	2
 
@@ -118,7 +118,7 @@ statement ok
 BEGIN;
 
 statement ok
-CALL arrownet_delta_set_transaction_version('lake', 't', 'loader', 5, 3);
+CALL fabricator_delta_set_transaction_version('lake', 't', 'loader', 5, 3);
 
 statement error
 COMMIT;
@@ -133,7 +133,7 @@ statement ok con1
 BEGIN;
 
 statement ok con1
-CALL arrownet_delta_set_transaction_version('lake', 't', 'job2', 1);
+CALL fabricator_delta_set_transaction_version('lake', 't', 'job2', 1);
 
 statement ok con1
 INSERT INTO lake.main.t VALUES (100);
@@ -143,7 +143,7 @@ statement ok con2
 BEGIN;
 
 statement ok con2
-CALL arrownet_delta_set_transaction_version('lake', 't', 'job2', 1);
+CALL fabricator_delta_set_transaction_version('lake', 't', 'job2', 1);
 
 statement ok con2
 INSERT INTO lake.main.t VALUES (100);
@@ -164,12 +164,12 @@ SELECT count(*) FROM lake.main.t WHERE id = 100;
 
 # distinct app ids are independent
 query TI
-SELECT * FROM arrownet_delta_get_transaction_version('lake', 't', 'job2');
+SELECT * FROM fabricator_delta_get_transaction_version('lake', 't', 'job2');
 ----
 job2	1
 
 query TI
-SELECT * FROM arrownet_delta_get_transaction_version('lake', 't', 'loader');
+SELECT * FROM fabricator_delta_get_transaction_version('lake', 't', 'loader');
 ----
 loader	2
 
@@ -181,13 +181,13 @@ statement ok
 BEGIN;
 
 statement ok
-CALL arrownet_delta_set_transaction_version('lake', 't', 'loader', 3, 2);
+CALL fabricator_delta_set_transaction_version('lake', 't', 'loader', 3, 2);
 
 statement ok
 ROLLBACK;
 
 query TI
-SELECT * FROM arrownet_delta_get_transaction_version('lake', 't', 'loader');
+SELECT * FROM fabricator_delta_get_transaction_version('lake', 't', 'loader');
 ----
 loader	2
 
@@ -199,9 +199,9 @@ statement ok
 DETACH lake;
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/txnver' AS lake2 (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txnver' AS lake2 (TYPE fabricator, PROVIDER 'delta');
 
 query TI
-SELECT * FROM arrownet_delta_get_transaction_version('lake2', 't', 'loader');
+SELECT * FROM fabricator_delta_get_transaction_version('lake2', 't', 'loader');
 ----
 loader	2

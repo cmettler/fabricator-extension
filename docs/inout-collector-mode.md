@@ -9,20 +9,20 @@
 > `kind`. Reuses the v28 exchange ABI verbatim (no bump).
 >
 > **As-built notes** (where the build refined the sketch below):
-> - **C# author API** (`ArrowNet.Bridge`): `IArrowCollectorTableFunction` (`SchemaName`/`Name`/`InputSchema`/
+> - **C# author API** (`Fabricator.Bridge`): `IArrowCollectorTableFunction` (`SchemaName`/`Name`/`InputSchema`/
 >   `Bind(args, inputSchema)`) + `IArrowCollectorBinding` (`OutputSchema` + `Collect(allInput, ct)`), plus a
 >   `StaticCollectorFunction` fixed-schema base. A public `CollectorInOutBinding` adapter wraps an
 >   `IArrowCollectorBinding` as an `IArrowInOutBinding` (`DoExchange = Collect`) so it flows through the existing
 >   `inout_bind`/`inout_exchange_open` marshaling + `InOutExchangeStream` pump **with no ABI change**. Registry
 >   `CustomCollector`; `InOutBind` checks it first; `FunctionsMetadataSql` emits `kind='collector'`.
-> - **C++** (`arrownet_schema_entry.cpp`): a dedicated `ArrowNetCollector*` operator — the in-out `Execute`
->   buffers each input chunk into an `arrownet::ArrowProducer` (held on the refcounted `CollectorHolder`, which
->   outlives both phases) and emits 0 rows; the injected `ArrowNetCollectorPhysical` is a real **Sink+Source**
+> - **C++** (`fabricator_schema_entry.cpp`): a dedicated `FabricatorCollector*` operator — the in-out `Execute`
+>   buffers each input chunk into an `fabricator::ArrowProducer` (held on the refcounted `CollectorHolder`, which
+>   outlives both phases) and emits 0 rows; the injected `FabricatorCollectorPhysical` is a real **Sink+Source**
 >   (`IsSink`+`IsSource`) whose `Finalize` (once, all-branches-done) calls `inout_exchange_open` over the
 >   complete buffered input, and whose `GetDataInternal` **streams** the C# output — pulling the
 >   `ArrowStreamReader` one vector-slice at a time (`Pull`/`HasPending`/`Drain`), so the output is **never
->   materialized**. `WrapArrowNetInOutNodes` routes a collector `LogicalGet` (identified by `in_out_function ==
->   ArrowNetCollectorFunction`) to this wrapper; the streaming exchange path is unchanged. `kind='collector'` is
+>   materialized**. `WrapFabricatorInOutNodes` routes a collector `LogicalGet` (identified by `in_out_function ==
+>   FabricatorCollectorFunction`) to this wrapper; the streaming exchange path is unchanged. `kind='collector'` is
 >   additive (no ABI bump). Registration: `AddCollectorFunction` / `custom_collector_functions_` /
 >   `GetOrCreateCustomCollectorFunction`.
 > - **Input buffered, output streamed.** Input is fully buffered before `Collect` runs (inherent — a collector
@@ -118,7 +118,7 @@ is the correct "all input done" signal — which is exactly what the Sink+Source
 
 **Untouched:**
 - The entire streaming `DoExchange` path — `IArrowInOutFunction`/`IArrowInOutBinding`, the gate, the per-chunk
-  sentinel, the `ArrowNetExchange*` operator. The two modes coexist, selected by `kind`.
+  sentinel, the `FabricatorExchange*` operator. The two modes coexist, selected by `kind`.
 
 **Reused AS-IS — no new ABI:**
 - The v28 entries `inout_bind` / `inout_exchange_open` / `inout_bind_close`. The **data contract is identical**:

@@ -5,18 +5,18 @@
 #              parquet_schema, so it reads EW-created + external-Spark layouts and survives a RENAME); name mode maps
 #              by physicalName (col-<guid>). native_write id mode streams with FIELD_IDS stamped. Verifies: create +
 #              insert + read (default reader + native_read + native_write), RENAME across mixed-vintage files, the
-#              parquet carries field_ids, and 'none' opts out. Set ARROWNET_DELTA_WRITE_DIR. Local FS.
-# group: [mssql_net]
+#              parquet carries field_ids, and 'none' opts out. Set FABRICATOR_DELTA_WRITE_DIR. Local FS.
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
 require parquet
 
-require-env ARROWNET_DELTA_WRITE_DIR
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 # ================= name mode (explicit) =================
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmname' AS nm (TYPE arrownet, PROVIDER 'delta', column_mapping 'name');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/cmname' AS nm (TYPE fabricator, PROVIDER 'delta', column_mapping 'name');
 
 statement ok
 CREATE TABLE nm.main.t AS SELECT i AS id, 'v' || i AS v FROM range(1, 4) AS r(i);
@@ -35,12 +35,12 @@ SELECT id, v FROM nm.main.t ORDER BY id;
 
 # The data files use PHYSICAL names (col-<guid>) — the logical names id/v are ABSENT from the parquet schema.
 query I
-SELECT count(*) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/cmname/t/*.parquet') WHERE name IN ('id', 'v');
+SELECT count(*) FROM parquet_schema('${FABRICATOR_DELTA_WRITE_DIR}/cmname/t/*.parquet') WHERE name IN ('id', 'v');
 ----
 0
 
 query I
-SELECT count(DISTINCT name) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/cmname/t/*.parquet') WHERE name LIKE 'col-%';
+SELECT count(DISTINCT name) FROM parquet_schema('${FABRICATOR_DELTA_WRITE_DIR}/cmname/t/*.parquet') WHERE name LIKE 'col-%';
 ----
 2
 
@@ -49,7 +49,7 @@ DETACH nm;
 
 # ================= id mode (explicit) =================
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmid' AS im (TYPE arrownet, PROVIDER 'delta', column_mapping 'id');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/cmid' AS im (TYPE fabricator, PROVIDER 'delta', column_mapping 'id');
 
 statement ok
 CREATE TABLE im.main.t AS SELECT i AS id, 'v' || i AS val FROM range(1, 4) AS r(i);
@@ -67,7 +67,7 @@ SELECT id, val FROM im.main.t ORDER BY id;
 
 # The commit declares id mode.
 query I
-SELECT count(*) FROM read_text('${ARROWNET_DELTA_WRITE_DIR}/cmid/t/_delta_log/00000000000000000000.json')
+SELECT count(*) FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/cmid/t/_delta_log/00000000000000000000.json')
 WHERE replace(content, chr(92)||'u0022', '"') LIKE '%"delta.columnMapping.mode":"id"%';
 ----
 1
@@ -75,13 +75,13 @@ WHERE replace(content, chr(92)||'u0022', '"') LIKE '%"delta.columnMapping.mode":
 # Per the Delta spec, id-mode data files ALSO use PHYSICAL col-<guid> names (the logical names are absent) —
 # this is what makes them readable by Spark / delta-kernel.
 query I
-SELECT count(*) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/cmid/t/*.parquet') WHERE name IN ('id', 'val');
+SELECT count(*) FROM parquet_schema('${FABRICATOR_DELTA_WRITE_DIR}/cmid/t/*.parquet') WHERE name IN ('id', 'val');
 ----
 0
 
 # ... AND carry field_ids (the id-mode identity readers resolve by).
 query I
-SELECT count(DISTINCT field_id) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/cmid/t/*.parquet') WHERE field_id IS NOT NULL;
+SELECT count(DISTINCT field_id) FROM parquet_schema('${FABRICATOR_DELTA_WRITE_DIR}/cmid/t/*.parquet') WHERE field_id IS NOT NULL;
 ----
 2
 
@@ -107,7 +107,7 @@ DETACH im;
 
 # The NATIVE reader (parquet field_id -> physical-name resolver) reads the mixed-vintage files under 'label'.
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmid' AS im2 (TYPE arrownet, PROVIDER 'delta', native_read true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/cmid' AS im2 (TYPE fabricator, PROVIDER 'delta', native_read true);
 
 query IT
 SELECT id, label FROM im2.main.t ORDER BY id;
@@ -124,14 +124,14 @@ DETACH im2;
 # ================= default = NAME mode (no option) → RENAME works out of the box AND the table stays
 # readable by the Fabric T-SQL endpoint (which rejects id-mode tables: UnsupportedColumnMappingMode) ====
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmdefault' AS d (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/cmdefault' AS d (TYPE fabricator, PROVIDER 'delta');
 
 statement ok
 CREATE TABLE d.main.t AS SELECT i AS a, i * 10 AS b FROM range(1, 4) AS r(i);
 
 # The default catalog declares NAME mode (so RENAME is metadata-only + the endpoint reads it).
 query I
-SELECT count(*) FROM read_text('${ARROWNET_DELTA_WRITE_DIR}/cmdefault/t/_delta_log/00000000000000000000.json')
+SELECT count(*) FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/cmdefault/t/_delta_log/00000000000000000000.json')
 WHERE replace(content, chr(92)||'u0022', '"') LIKE '%"delta.columnMapping.mode":"name"%';
 ----
 1
@@ -178,10 +178,10 @@ statement ok
 INSERT INTO d.main.t VALUES (5, 'n5');
 
 statement ok
-SELECT mssql_net_exec('d', 'OPTIMIZE main.t');
+SELECT fabricator_exec('d', 'OPTIMIZE main.t');
 
 statement ok
-SELECT mssql_net_exec('d', 'VACUUM main.t RETAIN 0 HOURS');
+SELECT fabricator_exec('d', 'VACUUM main.t RETAIN 0 HOURS');
 
 query IT
 SELECT a, note FROM d.main.t ORDER BY a;
@@ -197,7 +197,7 @@ DETACH d;
 
 # ================= id mode + native_write (streaming, FIELD_IDS stamped) =================
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmidnw' AS nw (TYPE arrownet, PROVIDER 'delta', column_mapping 'id', native_write true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/cmidnw' AS nw (TYPE fabricator, PROVIDER 'delta', column_mapping 'id', native_write true);
 
 statement ok
 CREATE TABLE nw.main.t AS SELECT i AS id, 'v' || i AS val FROM range(1, 6) AS r(i);
@@ -217,7 +217,7 @@ SELECT id, val FROM nw.main.t ORDER BY id;
 
 # The native-written parquet carries field_ids (DuckDB COPY FIELD_IDS), so the id-mode reader maps it.
 query I
-SELECT count(DISTINCT field_id) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/cmidnw/t/*.parquet') WHERE field_id IS NOT NULL;
+SELECT count(DISTINCT field_id) FROM parquet_schema('${FABRICATOR_DELTA_WRITE_DIR}/cmidnw/t/*.parquet') WHERE field_id IS NOT NULL;
 ----
 2
 
@@ -226,7 +226,7 @@ DETACH nw;
 
 # ================= partitioned + mapping (the NAME default): STREAMS via COPY PARTITION_BY (physical names) ========
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmpart' AS pt (TYPE arrownet, PROVIDER 'delta', native_write true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/cmpart' AS pt (TYPE fabricator, PROVIDER 'delta', native_write true);
 
 statement ok
 CREATE TABLE pt.main.sales PARTITIONED BY (region) AS
@@ -252,7 +252,7 @@ SELECT id, amt FROM pt.main.sales WHERE region = 'EU' ORDER BY id;
 # The Hive dirs use PHYSICAL partition-column names (Delta spec: partitionValues track the physical name;
 # paths are opaque to readers — Spark reads this table, validated live).
 query I
-SELECT count(*) > 0 FROM glob('${ARROWNET_DELTA_WRITE_DIR}/cmpart/sales/col-*=US/*.parquet');
+SELECT count(*) > 0 FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/cmpart/sales/col-*=US/*.parquet');
 ----
 true
 
@@ -276,7 +276,7 @@ DETACH pt;
 
 # Re-attach: durable across sessions.
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmpart' AS pt2 (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/cmpart' AS pt2 (TYPE fabricator, PROVIDER 'delta');
 
 query IT
 SELECT id, zone FROM pt2.main.sales WHERE zone = 'US' ORDER BY id;
@@ -289,7 +289,7 @@ DETACH pt2;
 
 # ================= NESTED columns under mapping (the NAME default): native_write only ==============================
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmnested' AS ns (TYPE arrownet, PROVIDER 'delta', native_write true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/cmnested' AS ns (TYPE fabricator, PROVIDER 'delta', native_write true);
 
 statement ok
 CREATE TABLE ns.main.t AS
@@ -308,13 +308,13 @@ SELECT id, s.a FROM ns.main.t WHERE s.a > 15 ORDER BY id;
 # The parquet stores PHYSICAL names + field_ids at EVERY level (nested children too — the recursive FIELD_IDS
 # via __duckdb_field_id; the logical names are absent) — the layout Spark/delta-kernel resolve.
 query I
-SELECT count(*) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/cmnested/t/*.parquet')
+SELECT count(*) FROM parquet_schema('${FABRICATOR_DELTA_WRITE_DIR}/cmnested/t/*.parquet')
 WHERE name IN ('id', 's', 'a', 'b');
 ----
 0
 
 query I
-SELECT count(DISTINCT field_id) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/cmnested/t/*.parquet')
+SELECT count(DISTINCT field_id) FROM parquet_schema('${FABRICATOR_DELTA_WRITE_DIR}/cmnested/t/*.parquet')
 WHERE field_id IS NOT NULL;
 ----
 4
@@ -336,7 +336,7 @@ DETACH ns;
 
 # The NATIVE reader renames nested children back to logical too.
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmnested' AS ns2 (TYPE arrownet, PROVIDER 'delta', native_read true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/cmnested' AS ns2 (TYPE fabricator, PROVIDER 'delta', native_read true);
 
 query IT
 SELECT id, payload.b FROM ns2.main.t ORDER BY id;
@@ -351,7 +351,7 @@ DETACH ns2;
 # Struct-in-LIST maps too: the list column + the element-struct's fields all carry physical names + field_ids
 # (the recursive FIELD_IDS 'element' form), and read back under logical names.
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmlist' AS ls (TYPE arrownet, PROVIDER 'delta', native_write true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/cmlist' AS ls (TYPE fabricator, PROVIDER 'delta', native_write true);
 
 statement ok
 CREATE TABLE ls.main.t AS SELECT 1 AS id, [{'x': 1}, {'x': 2}] AS items;
@@ -362,7 +362,7 @@ SELECT id, items[2].x FROM ls.main.t;
 1	2
 
 query I
-SELECT count(DISTINCT field_id) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/cmlist/t/*.parquet')
+SELECT count(DISTINCT field_id) FROM parquet_schema('${FABRICATOR_DELTA_WRITE_DIR}/cmlist/t/*.parquet')
 WHERE field_id IS NOT NULL;
 ----
 3
@@ -373,7 +373,7 @@ DETACH ls;
 # DELETE on a nested mapped table works (DV mode; the CDC capture takes struct rows), and the CDF feed
 # surfaces nested members under LOGICAL names (recursive rename over the inferred + cdc change rows).
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmnestcdf' AS nc (TYPE arrownet, PROVIDER 'delta', change_data_feed true, native_write true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/cmnestcdf' AS nc (TYPE fabricator, PROVIDER 'delta', change_data_feed true, native_write true);
 
 statement ok
 CREATE TABLE nc.main.t AS SELECT 1 AS id, {'a': 10, 'b': 'x'} AS s;
@@ -390,7 +390,7 @@ SELECT id, s.a FROM nc.main.t;
 2	20
 
 query TIIT
-SELECT _change_type, id, s.a, s.b FROM arrownet_delta_changes('nc', 'main.t', 1, 3)
+SELECT _change_type, id, s.a, s.b FROM fabricator_delta_changes('nc', 'main.t', 1, 3)
 ORDER BY _commit_version, _change_type, id;
 ----
 insert	1	10	x
@@ -405,19 +405,19 @@ DETACH nc;
 # gate is lifted). STRUCT SET UPDATE works on the mapped table too (the copy-on-write rewrite renames the
 # source batches to logical for the substitution, then back to physical for the rewrite).
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmnestedew' AS ne (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/cmnestedew' AS ne (TYPE fabricator, PROVIDER 'delta');
 
 statement ok
 CREATE TABLE ne.main.t AS SELECT * FROM (VALUES (1, {'a': 10, 'b': 'x'}), (2, {'a': 20, 'b': 'y'})) v(id, s);
 
 # Nested struct children are stored under physical col-<guid> names (spec) — no logical child names in the file.
 query I
-SELECT count(*) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/cmnestedew/t/*.parquet') WHERE name IN ('a', 'b');
+SELECT count(*) FROM parquet_schema('${FABRICATOR_DELTA_WRITE_DIR}/cmnestedew/t/*.parquet') WHERE name IN ('a', 'b');
 ----
 0
 
 query I
-SELECT count(*) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/cmnestedew/t/*.parquet') WHERE name LIKE 'col-%';
+SELECT count(*) FROM parquet_schema('${FABRICATOR_DELTA_WRITE_DIR}/cmnestedew/t/*.parquet') WHERE name LIKE 'col-%';
 ----
 4
 
@@ -449,14 +449,14 @@ DETACH ne;
 
 # ================= 'none' opts out (plain table; logical == physical name, no protocol bump) =================
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmnone' AS pn (TYPE arrownet, PROVIDER 'delta', column_mapping 'none');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/cmnone' AS pn (TYPE fabricator, PROVIDER 'delta', column_mapping 'none');
 
 statement ok
 CREATE TABLE pn.main.t AS SELECT 1 AS id, 'a' AS v;
 
 # Plain table: the logical names ARE the parquet column names (no col-<guid>).
 query I
-SELECT count(*) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/cmnone/t/*.parquet') WHERE name IN ('id', 'v');
+SELECT count(*) FROM parquet_schema('${FABRICATOR_DELTA_WRITE_DIR}/cmnone/t/*.parquet') WHERE name IN ('id', 'v');
 ----
 2
 
@@ -465,7 +465,7 @@ DETACH pn;
 
 # ================= STRUCT UPDATE (unmapped tables; mapped struct-SET is gated) =================
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmsupd' AS su (TYPE arrownet, PROVIDER 'delta', column_mapping 'none');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/cmsupd' AS su (TYPE fabricator, PROVIDER 'delta', column_mapping 'none');
 
 statement ok
 CREATE TABLE su.main.t AS SELECT 1 AS id, {'a': 10, 'b': 'x'} AS s UNION ALL SELECT 2, {'a': 20, 'b': 'y'};
@@ -497,7 +497,7 @@ DETACH su;
 # On a MAPPED table (the default) struct SET works too (recursive physical rename + field ids on the
 # rewrite); scalar SET on a nested table keeps working alongside.
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmsupdm' AS sm (TYPE arrownet, PROVIDER 'delta', native_write true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/cmsupdm' AS sm (TYPE fabricator, PROVIDER 'delta', native_write true);
 
 statement ok
 CREATE TABLE sm.main.t AS SELECT 1 AS id, {'a': 10} AS s;
@@ -523,6 +523,6 @@ DETACH sm;
 
 # ================= unknown mode → clean error at ATTACH =================
 statement error
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cmbad' AS bad (TYPE arrownet, PROVIDER 'delta', column_mapping 'bogus');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/cmbad' AS bad (TYPE fabricator, PROVIDER 'delta', column_mapping 'bogus');
 ----
 unknown mode

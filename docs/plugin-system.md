@@ -1,11 +1,11 @@
 # Plugin system (third-party backends + global functions)
 
 > Status: **default-context SPI BUILT + verified; ALC isolation DEFERRED.** A plugin (a folder of managed
-> assemblies) dropped into an **`ARROWNET_PLUGIN_DIR`** folder is discovered at load, its `IBackend`(s)
+> assemblies) dropped into an **`FABRICATOR_PLUGIN_DIR`** folder is discovered at load, its `IBackend`(s)
 > registered, and its **global functions** surfaced as a bare `fn(...)` with NO ATTACH — verified end-to-end
-> (`ArrowNet.SamplePlugin`'s `plug_greet`, `test/verify_plugin.test`). Loaded into the **default (non-isolated)**
+> (`Fabricator.SamplePlugin`'s `plug_greet`, `test/verify_plugin.test`). Loaded into the **default (non-isolated)**
 > context for now; per-plugin `AssemblyLoadContext` **isolation** (for conflicting transitive deps) is the
-> deferred upgrade — a loader-internal swap, no contract change. The contract assembly **`ArrowNet.Abstractions`
+> deferred upgrade — a loader-internal swap, no contract change. The contract assembly **`Fabricator.Abstractions`
 > is extracted** (a plugin references it + Apache.Arrow only — see recommendation #2). Builds on `BackendRegistry` +
 > [docs/global-functions.md](global-functions.md) + [docs/provider-extensibility.md](provider-extensibility.md).
 > The load-bearing constraint regardless of ALC: **Apache.Arrow must be shared, never isolated**.
@@ -13,21 +13,21 @@
 > **As-built (no-ALC SPI)** — the one non-obvious real-world finding: hostfxr loads the bridge into a
 > **non-default ALC**, so the loader must load plugins into the **bridge's own context**
 > (`AssemblyLoadContext.GetLoadContext(typeof(BackendRegistry).Assembly)`), NOT `AssemblyLoadContext.Default`.
-> Loading into Default made the plugin bind to a *separate* copy of `ArrowNet.Bridge` (from the plugin dir) → its
+> Loading into Default made the plugin bind to a *separate* copy of `Fabricator.Bridge` (from the plugin dir) → its
 > `IBackend` was a different, non-assignable type → 0 backends registered. The loader (`BackendRegistry`):
-> splits `ARROWNET_PLUGIN_DIR` (comma list of dirs), installs a `Resolving` hook on the host context (probes the
+> splits `FABRICATOR_PLUGIN_DIR` (comma list of dirs), installs a `Resolving` hook on the host context (probes the
 > plugin dirs for a plugin's private transitive deps), skips assemblies already loaded in the host context (the
-> shared set — `ArrowNet.Bridge`, `Apache.Arrow`, built-in providers — so a plugin-dir copy of the bridge isn't
+> shared set — `Fabricator.Bridge`, `Apache.Arrow`, built-in providers — so a plugin-dir copy of the bridge isn't
 > reflected + its `StubBackend` re-registered), and `LoadFromAssemblyPath`s the rest into the host context,
 > reflecting for `IBackend`. The scan runs inside `Discover()` (first `BackendRegistry.All()`, at load — before
 > the `list_global_functions` union), so a plugin's global functions register with **no ABI/C++ change**. No-op
-> when `ARROWNET_PLUGIN_DIR` is unset. Sample: `dotnet/ArrowNet.SamplePlugin` (a catalog-less `IBackend` whose
+> when `FABRICATOR_PLUGIN_DIR` is unset. Sample: `dotnet/Fabricator.SamplePlugin` (a catalog-less `IBackend` whose
 > only job is to contribute the global scalar `plug_greet`), built to a folder and pointed at via the env var.
 
 ## Why / when
 
-Today the bridge loads providers (`ArrowNet.SqlServer`, `ArrowNet.AnalysisServices`) by reflection into the
-**default** ALC (`BackendRegistry`, env `ARROWNET_BACKEND_ASSEMBLY`). They're all version-aligned with the
+Today the bridge loads providers (`Fabricator.SqlServer`, `Fabricator.AnalysisServices`) by reflection into the
+**default** ALC (`BackendRegistry`, env `FABRICATOR_BACKEND_ASSEMBLY`). They're all version-aligned with the
 bridge, so they share one of everything — fine. A plugin system adds value only when plugins have **genuinely
 conflicting managed deps** (e.g. two providers needing different Azure SDK / Newtonsoft versions) or are
 **third-party** (you don't control their dependency graph). ALC isolation gives each plugin its own private
@@ -54,15 +54,15 @@ Therefore:
   engineered-wood, JSON, …) but **never for Arrow**. (engineered-wood works in a plugin ALC precisely because
   it is already Arrow-23-aligned; a plugin needing a *different* Arrow for some private lib simply cannot.)
 
-## The shared boundary for arrownet
+## The shared boundary for fabricator
 
-Extract a thin **`ArrowNet.Abstractions`** assembly = the interfaces + the Arrow-typed contract POCOs
+Extract a thin **`Fabricator.Abstractions`** assembly = the interfaces + the Arrow-typed contract POCOs
 (`IBackend`, `IBackendCatalog`, `IScalarFunction`/`ICatalog*`, `ITableFunction`/`IArrowTableFunctionBinding`,
 `IInOutFunction`, `ICollectorTableFunction`, `IAggregateFunction`/`IArrowAggregateState`/`IAggregateSession`,
 `ProviderSetting`, `SecretField`, `TableFunctionScan`, `ScanSpec`, `FilterNode`, `IBoundTable`, …). Shared
-(default context). `ArrowNet.Bridge` references it and keeps the ABI/marshaling/`Bootstrap`/`GlobalFunctions`/
+(default context). `Fabricator.Bridge` references it and keeps the ABI/marshaling/`Bootstrap`/`GlobalFunctions`/
 `BackendRegistry` (also default context — it's the hostfxr entry assembly). A plugin references **only**
-`ArrowNet.Abstractions` + `Apache.Arrow` (both host-provided, NOT copied into the plugin dir) + its own private
+`Fabricator.Abstractions` + `Apache.Arrow` (both host-provided, NOT copied into the plugin dir) + its own private
 deps.
 
 Why a separate Abstractions rather than "bridge = contracts": plugins should bind to a **minimal, stable
@@ -71,7 +71,7 @@ also guarantees every type in a contract signature is shared (Abstractions / Apa
 method exposes a plugin-private type, which would otherwise force *that* dependency to be shared too.
 
 **The complete shared set** (returned as `null` from a plugin's `Load`, i.e. resolved from the default context):
-`ArrowNet.Abstractions`, `Apache.Arrow`, `Apache.Arrow.C`, and the BCL/`System.*` (the runtime shares framework
+`Fabricator.Abstractions`, `Apache.Arrow`, `Apache.Arrow.C`, and the BCL/`System.*` (the runtime shares framework
 assemblies automatically).
 
 ## PluginLoadContext — the one correction over the textbook sketch
@@ -84,7 +84,7 @@ consulting the resolver:
 ```csharp
 private static readonly HashSet<string> Shared = new(StringComparer.OrdinalIgnoreCase)
 {
-    "ArrowNet.Abstractions", "Apache.Arrow", "Apache.Arrow.C",
+    "Fabricator.Abstractions", "Apache.Arrow", "Apache.Arrow.C",
     // BCL/System.* are shared by the runtime automatically.
 };
 
@@ -149,19 +149,19 @@ discipline (and the restrictions collectible ALCs impose). We never unload a plu
 
 ## Recommendation (sequenced)
 
-1. **Default-context plugin-dir loader — DONE** (this build): `ARROWNET_PLUGIN_DIR` scan in `BackendRegistry`,
+1. **Default-context plugin-dir loader — DONE** (this build): `FABRICATOR_PLUGIN_DIR` scan in `BackendRegistry`,
    plugins loaded into the **bridge's** ALC (not Default — see As-built), additive beside the env-assembly
-   discovery. Plugins reference `ArrowNet.Bridge` directly (no `Abstractions` needed without ALC — everything is
+   discovery. Plugins reference `Fabricator.Bridge` directly (no `Abstractions` needed without ALC — everything is
    one context). Sample plugin + `verify_plugin.test`. **Plugins must align their full dependency closure with
    the host** (Apache.Arrow always; every other shared dep too — there is no version isolation without ALC).
-2. **Extract `ArrowNet.Abstractions` — DONE** — the contract surface (the `I*Function`/`IBackend`/`IBoundTable`/
+2. **Extract `Fabricator.Abstractions` — DONE** — the contract surface (the `I*Function`/`IBackend`/`IBoundTable`/
    `IAggregateSession` interfaces + `ProviderSetting`/`SecretField`/`TableFunctionScan`/`ScanSpec`/`FilterNode`)
-   is now a separate assembly, **kept in the `ArrowNet.Bridge` namespace** (assembly split only — zero source
-   churn). `ArrowNet.Bridge` references it (the ABI/marshaling/`Bootstrap`/`BackendRegistry`/Static-bases/
+   is now a separate assembly, **kept in the `Fabricator.Bridge` namespace** (assembly split only — zero source
+   churn). `Fabricator.Bridge` references it (the ABI/marshaling/`Bootstrap`/`BackendRegistry`/Static-bases/
    adapters stay in Bridge); the `BackendRegistry`, `InOutExchangeStream`/`InOutExchange`, and
-   `CollectorInOutBinding` impls split back out of their old interface files into Bridge. `ArrowNet.SamplePlugin`
-   now references **`ArrowNet.Abstractions` ONLY** (+ Apache.Arrow, host-provided) — a lean, Bridge-independent
-   plugin surface (its plugin folder is just `ArrowNet.Abstractions.dll` + the plugin dll). Behavior-preserving;
+   `CollectorInOutBinding` impls split back out of their old interface files into Bridge. `Fabricator.SamplePlugin`
+   now references **`Fabricator.Abstractions` ONLY** (+ Apache.Arrow, host-provided) — a lean, Bridge-independent
+   plugin surface (its plugin folder is just `Fabricator.Abstractions.dll` + the plugin dll). Behavior-preserving;
    full `verify_*` suite + `verify_plugin` green.
 3. **ALC isolation** (deferred) — a loader-internal swap (`host.LoadFromAssemblyPath` → a per-plugin
    `PluginLoadContext`) with the shared-name allowlist `Load` above (non-collectible). **Adopt only when a real

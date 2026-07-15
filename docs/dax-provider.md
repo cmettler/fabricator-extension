@@ -2,16 +2,16 @@
 
 > Status: **in progress.** Slice 1 (project + `dax` provider + connection modes + ATTACH) **DONE + validated**
 > against a live local Power BI Desktop instance. This is the "one binary, many providers" goal made real:
-> a second `IBackend` (`ArrowNet.AnalysisServices`) hosted by the same arrownet core + bridge, reached via
-> `ATTACH … (TYPE mssql_net, PROVIDER 'dax')`. Reference for the design: the old Arrow-Flight server
+> a second `IBackend` (`Fabricator.AnalysisServices`) hosted by the same fabricator core + bridge, reached via
+> `ATTACH … (TYPE fabricator, PROVIDER 'dax')`. Reference for the design: the old Arrow-Flight server
 > `D:\repos\SqlServerFlights` (`Airport/Flights/SemanticModel/*`, `Airport/Catalogs/SemanticModelFlightCatalog.cs`).
 
-## Why it fits arrownet with almost no C++
+## Why it fits fabricator with almost no C++
 
 A semantic model maps onto the existing catalog/scan/function machinery; the new work is **a C# provider**,
 not C++:
 
-| DAX concept | arrownet home (reused) |
+| DAX concept | fabricator home (reused) |
 |---|---|
 | semantic model = catalog; models→schemas, tables, columns | `IBackend.OpenCatalog` + `IBackendCatalog.GetMetadata` (DMV queries) → the C++ catalog core |
 | table scan → `EVALUATE SELECTCOLUMNS('T', …)` | `IBackendCatalog.ScanTable` (projection pushdown; filter best-effort/skip) |
@@ -63,13 +63,13 @@ which caps at 19.84.1) loads in net10 (win-x64), connects to local PBI Desktop, 
 
 ## Architecture
 
-- **`ArrowNet.AnalysisServices`** (new project) — `DaxBackend : IBackend` (provider `"dax"`, aliases
+- **`Fabricator.AnalysisServices`** (new project) — `DaxBackend : IBackend` (provider `"dax"`, aliases
   `adomd`/`powerbi`/`ssas`/`fabric`) + `DaxCatalog : IBackendCatalog` + `PowerBiDesktop` (port detection).
-  References `ArrowNet.Bridge` + `Microsoft.AnalysisServices.AdomdClient`.
-- **Discovery:** `BackendRegistry` loads the assemblies in `ARROWNET_BACKEND_ASSEMBLY` (default now
-  `ArrowNet.SqlServer,ArrowNet.AnalysisServices`; a missing assembly is skipped). SqlServer loads first → it
-  stays the default provider, so existing `mssql_net` ATTACHes (no `PROVIDER`) are unchanged.
-- **Publish:** `publish-managed.ps1` publishes both providers into the same `arrownet/` dir (Bridge +
+  References `Fabricator.Bridge` + `Microsoft.AnalysisServices.AdomdClient`.
+- **Discovery:** `BackendRegistry` loads the assemblies in `FABRICATOR_BACKEND_ASSEMBLY` (default now
+  `Fabricator.SqlServer,Fabricator.AnalysisServices`; a missing assembly is skipped). SqlServer loads first → it
+  stays the default provider, so existing `fabricator` ATTACHes (no `PROVIDER`) are unchanged.
+- **Publish:** `publish-managed.ps1` publishes both providers into the same `fabricator/` dir (Bridge +
   SqlClient + AdomdClient + both backend dlls); the CoreCLR host initializes against Bridge's runtimeconfig.
 - **Connection modes** (`DaxBackend.ResolveConnectionString`): empty target or a `pbidesktop[://]` /
   `localhost` marker → auto-detect the local PBI port → `Data Source=localhost:<port>`; any other target is
@@ -87,9 +87,9 @@ which caps at 19.84.1) loads in net10 (win-x64), connects to local PBI Desktop, 
 ## Slice plan
 
 1. **Project + `dax` provider + connection modes + ATTACH** — **DONE + validated.** `ATTACH 'pbidesktop://'
-   AS pbi (TYPE mssql_net, PROVIDER 'dax')` connects to the live local instance; `GetMetadata(Schemas)` =
+   AS pbi (TYPE fabricator, PROVIDER 'dax')` connects to the live local instance; `GetMetadata(Schemas)` =
    model name(s) from `TMSCHEMA_MODEL`, so the model shows as a DuckDB schema. SqlServer unregressed; unknown
-   provider errors cleanly listing `sqlserver, dax`. (TYPE is still `mssql_net` — the generic `arrownet`
+   provider errors cleanly listing `sqlserver, dax`. (TYPE is still `fabricator` — the generic `fabricator`
    rename is deferred to when this provider matures.)
 - **System ($SYSTEM DMV) tables** — **DONE + validated.** A curated set of VertiPaq/`$SYSTEM` DMVs is
   exposed as tables under a **`system` schema** in the same catalog (`db.system."TMSCHEMA_TABLES"`, etc.).
@@ -118,8 +118,8 @@ which caps at 19.84.1) loads in net10 (win-x64), connects to local PBI Desktop, 
    test: `test/verify_dax.test`** — gated by `require-env` (a live model isn't a portable fixture) and
    asserting **model-agnostic invariants** (non-empty scan; projection preserves row count; `IS NULL` +
    `IS NOT NULL` pushdown partitions all rows = superset-safe/complete; `IS NOT NULL` == `count(col)`;
-   contradiction → 0). Set `ARROWNET_DAX_DSN` (e.g. `pbidesktop://`), `ARROWNET_DAX_TABLE` (a quoted table
-   ref), `ARROWNET_DAX_COL` (a column with some NULLs); it runs against any tabular model and skips
+   contradiction → 0). Set `FABRICATOR_DAX_DSN` (e.g. `pbidesktop://`), `FABRICATOR_DAX_TABLE` (a quoted table
+   ref), `FABRICATOR_DAX_COL` (a column with some NULLs); it runs against any tabular model and skips
    otherwise.
    - **Filter pushdown** (`DaxFilterBuilder`): the C++ catalog scan already passes the pushed predicate
      (`spec.Filter` + `filterValues`) to `ScanTable`; we render it into a DAX boolean and wrap the table in
@@ -178,23 +178,23 @@ which caps at 19.84.1) loads in net10 (win-x64), connects to local PBI Desktop, 
    - **How the struct crosses with no ABI change**: `params` is declared in `GetFunctionParamSchema` as the
      **`NullType` sentinel** = "accept any value". There's no Arrow type for DuckDB `ANY`, so the host treats a
      `SQLNULL`-typed named parameter as `ANY` (`GetOrCreateTableFunction`), and the shared table-bind
-     marshaling keeps the supplied value's **runtime** type for such a param (`ArrowNetTableFunctionBind`) —
+     marshaling keeps the supplied value's **runtime** type for such a param (`FabricatorTableFunctionBind`) —
      so a `STRUCT` literal marshals across as a real Arrow struct instead of being coerced to the declared
      type. The guard is `LogicalTypeId::SQLNULL`-only, so every other function (concrete-typed params) is
      unaffected — full SQL function suite green (procs 24, TVFs 33, scalar 26, custom 85, in-out 63/31/17).
    - Validated live: no-param `EVALUATE ROW(…)` (schema from arbitrary DAX), `COUNTROWS`/`SUMMARIZECOLUMNS`,
      `EVALUATE {1,2,3}`, full-table `EVALUATE 'T'` (multi-batch streaming), **and** parameter binding —
      numeric `@a + @b`, a string `@who`, and a param in a table filter (`FILTER(…, [Value] > @t)`).
-     `verify_dax.test` covers it (model-agnostic `ROW`/table-constructor/param cases; needs `ARROWNET_DAX_SCHEMA`).
+     `verify_dax.test` covers it (model-agnostic `ROW`/table-constructor/param cases; needs `FABRICATOR_DAX_SCHEMA`).
 5. **`daxevaltable` in-out** — **DONE + validated.** `daxevaltable(<input>, expression := 'EVALUATE …')`
    injects the input table into the DAX as a table named `_input` (`DEFINE TABLE _input = DATATABLE(…)`
    prepended; the expression is a single `EVALUATE` referencing `_input`), evaluates ONCE, returns the
    result. Registered `kind='inout'`; resolved by `InOutBind` → `DaxEvalTableBinding`; the DATATABLE literal
    (`DaxDataTable`: Arrow→DATATABLE type map + value formatting) is built from the input rows, output schema
    probed at bind via a 1-row dummy DATATABLE. **Required wiring the long-deferred cost args through the
-   shared exchange** (C++ `arrownet_schema_entry.cpp`): `GetOrCreateCustomInOutFunction` now declares the
+   shared exchange** (C++ `fabricator_schema_entry.cpp`): `GetOrCreateCustomInOutFunction` now declares the
    function's constant args as **named parameters** (tolerant `FetchFunctionParamSchema` — empty for a
-   no-arg custom in-out like `cf_tag`, so unchanged), and `ArrowNetExchangeBind` marshals the supplied named
+   no-arg custom in-out like `cf_tag`, so unchanged), and `FabricatorExchangeBind` marshals the supplied named
    params into the `inout_bind` args (else `nullptr` — `_each` declares none, so unchanged). No ABI change.
    **Whole-table limit:** the exchange has no emit-at-end hook (a whole-table op is a pipeline breaker; the
    operator's finalize drain *discards* trailing output), so the result is emitted during the input chunk's
@@ -217,7 +217,7 @@ which caps at 19.84.1) loads in net10 (win-x64), connects to local PBI Desktop, 
    from an Azure principal and set `AdomdConnection.AccessToken` (with an `OnAccessTokenExpired` refresh
    callback — mirrors how `SqlServerCatalog` sets `SqlConnection.AccessToken`). The principal is the **same
    azure service-principal secret the Fabric Warehouse uses** (reused via the v39 foreign-secret path):
-   `ATTACH 'Data Source=powerbi://…;Initial Catalog=<model>' AS m (TYPE mssql_net, PROVIDER 'dax', SECRET
+   `ATTACH 'Data Source=powerbi://…;Initial Catalog=<model>' AS m (TYPE fabricator, PROVIDER 'dax', SECRET
    <azure_sp>)` → `DaxBackend.BuildConnectionString` carries the secret fields to the catalog (a connstr
    marker), which builds a `ClientSecretCredential` / `ManagedIdentityCredential` (`DaxTokenAuth`). A
    secretless remote XMLA endpoint falls back to `DefaultAzureCredential` (the "Active Directory Default"
@@ -237,7 +237,7 @@ expression (`TMSCHEMA_EXPRESSIONS`):
 - **Model2 = DirectLake on SQL** — `Sql.Database("…datawarehouse.fabric.microsoft.com", "486cd767…")`
 
 The OneLake *item id* equals the SQL *database* — the same warehouse, two source modes. **The bypass is
-proven:** `ATTACH 'Server=…datawarehouse.fabric.microsoft.com;Database=486cd767…' (TYPE mssql_net, SECRET
+proven:** `ATTACH 'Server=…datawarehouse.fabric.microsoft.com;Database=486cd767…' (TYPE fabricator, SECRET
 <azure_sp>)` and `SELECT count(*) FROM wh.dbo.Trip` returns **2,838,927 rows — identical to the DAX scan of
 the model table**. So the DMVs hand us everything to route a DAX model's table scans to the SQL endpoint.
 
@@ -297,7 +297,7 @@ already does) removes only the value-caching hazards — no **constant-folding**
 The needed properties — *runs, exactly once per intended unit, in order* — aren't expressible on a scalar at
 all. They ARE what a source operator gives: a table function is materialized + evaluated once as written, and
 the `_each` in-out additionally pins `MaxThreads=1`, serializing commits by construction. So, mirroring
-`mssql_net_exec` (a table function used for effect), **apply is a table function, never a scalar.**
+`fabricator_exec` (a table function used for effect), **apply is a table function, never a scalar.**
 
 **Bind-constant vs. table-argument (how to take DYNAMIC input).** A plain table function resolves its
 arguments at **bind time**, so an arg must be a bind-constant (a literal, or a scalar folded over literals) —
@@ -313,7 +313,7 @@ lateral-capable apply is `apply_tmdl_each(<rows>)`; no new "lateral table functi
 **The function family (each in its natural shape; TOM-backed):**
 - **`render_tmdl(template, args…)` — scalar (pure):** the templating engine — composes/chains anywhere, runs
   per row. Authored as a custom `ICatalogScalarFunction` (the 4e machinery) — or, connection-free, a global
-  `arrownet_render` (see [global-functions.md](global-functions.md)) — or just DuckDB `format`/`concat`.
+  `fabricator_render` (see [global-functions.md](global-functions.md)) — or just DuckDB `format`/`concat`.
 - **`<model>.tmdl()` — table function (pure read):** scripts the model to TMDL, one row per object/document
   `(path, content)`. `tmdl_of('Table','Sales')` scalar = one object (pure read → scalar is fine here).
 - **`<model>.apply_tmdl(text)` — table function (effect, status row):** apply one; arg is a bind-constant, so
@@ -353,5 +353,5 @@ multi-fragment commit); (3) whole-model replace + DDL→model auto-sync — defe
   (`Initial Catalog`) is the real model selector.
 - **Multi-instance local PBI** — autodetect picks the newest *listening* workspace port (across all
   editions); a way to target a specific open file (by window title / workspace) is a later nicety.
-- **The generic rename** (`TYPE arrownet`, `arrownet_query`/`_exec`) — do it once the DAX provider is real,
+- **The generic rename** (`TYPE fabricator`, `fabricator_query`/`_exec`) — do it once the DAX provider is real,
   per the "Next up" thread in CLAUDE.md.

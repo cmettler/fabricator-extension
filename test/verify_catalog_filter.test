@@ -1,14 +1,14 @@
 # name: test/verify_catalog_filter.test
 # description: Verify schema_filter / table_filter ATTACH options restrict catalog discovery
-# group: [mssql_net]
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
 require-env MSSQL_TESTDB_DSN
 
 # table_filter (icase regex, substring) restricts discovery to matching tables.
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS dbfilt (TYPE mssql_net, table_filter '^TestSimplePK$');
+ATTACH '${MSSQL_TESTDB_DSN}' AS dbfilt (TYPE fabricator, table_filter '^TestSimplePK$');
 
 query I
 SELECT count(*) FROM duckdb_tables() WHERE database_name = 'dbfilt';
@@ -26,7 +26,7 @@ DETACH dbfilt;
 
 # schema_filter restricting to a non-existent schema yields an empty catalog.
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS dbempty (TYPE mssql_net, schema_filter '^no_such_schema$');
+ATTACH '${MSSQL_TESTDB_DSN}' AS dbempty (TYPE fabricator, schema_filter '^no_such_schema$');
 
 query I
 SELECT count(*) FROM duckdb_tables() WHERE database_name = 'dbempty';

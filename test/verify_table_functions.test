@@ -2,27 +2,27 @@
 # description: Discovered table-valued functions are callable as SELECT * FROM db.schema.tvf(args) over Arrow
 # group: [mssql]
 
-require mssql_net
+require fabricator
 
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS tfdb (TYPE mssql_net);
+ATTACH '${MSSQL_TESTDB_DSN}' AS tfdb (TYPE fabricator);
 
 # Inline TVF, multi-column inline TVF, and a multi-statement TVF. Distinct tf_* names
 # so this can't clash with other function tests.
 statement ok
-SELECT mssql_net_exec('tfdb', 'CREATE OR ALTER FUNCTION dbo.tf_nums(@n INT) RETURNS TABLE AS RETURN (SELECT v.n FROM (VALUES(1),(2),(3),(4),(5)) v(n) WHERE v.n <= @n)');
+SELECT fabricator_exec('tfdb', 'CREATE OR ALTER FUNCTION dbo.tf_nums(@n INT) RETURNS TABLE AS RETURN (SELECT v.n FROM (VALUES(1),(2),(3),(4),(5)) v(n) WHERE v.n <= @n)');
 
 statement ok
-SELECT mssql_net_exec('tfdb', 'CREATE OR ALTER FUNCTION dbo.tf_pair(@a INT, @b VARCHAR(20)) RETURNS TABLE AS RETURN (SELECT @a AS id, @b AS label)');
+SELECT fabricator_exec('tfdb', 'CREATE OR ALTER FUNCTION dbo.tf_pair(@a INT, @b VARCHAR(20)) RETURNS TABLE AS RETURN (SELECT @a AS id, @b AS label)');
 
 statement ok
-SELECT mssql_net_exec('tfdb', 'CREATE OR ALTER FUNCTION dbo.tf_ms(@n INT) RETURNS @t TABLE(n INT, sq INT) AS BEGIN INSERT @t SELECT v.n, v.n*v.n FROM (VALUES(1),(2),(3),(4)) v(n) WHERE v.n <= @n; RETURN; END');
+SELECT fabricator_exec('tfdb', 'CREATE OR ALTER FUNCTION dbo.tf_ms(@n INT) RETURNS @t TABLE(n INT, sq INT) AS BEGIN INSERT @t SELECT v.n, v.n*v.n FROM (VALUES(1),(2),(3),(4)) v(n) WHERE v.n <= @n; RETURN; END');
 
-# New TVFs are picked up on a cache refresh (DDL via mssql_net_exec does not auto-invalidate).
+# New TVFs are picked up on a cache refresh (DDL via fabricator_exec does not auto-invalidate).
 statement ok
-SELECT mssql_refresh_cache('tfdb');
+SELECT fabricator_refresh_cache('tfdb');
 
 # Inline TVF, called positionally in a FROM clause.
 query I
@@ -56,7 +56,7 @@ SELECT sq FROM tfdb.dbo.tf_ms(4) WHERE sq > 4 ORDER BY sq;
 # Proof the projection + filter were pushed to SQL Server (not just applied locally by
 # DuckDB): a statement `... FROM [dbo].[tf_ms](@a0) WHERE ...` reached the server.
 query I
-SELECT hit FROM mssql_net_query('tfdb',
+SELECT hit FROM fabricator_query('tfdb',
   'SELECT CAST(CASE WHEN EXISTS (
      SELECT 1 FROM sys.dm_exec_query_stats qs
      CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
@@ -97,13 +97,13 @@ statement ok
 DEALLOCATE tf_reuse;
 
 statement ok
-SELECT mssql_net_exec('tfdb', 'DROP FUNCTION IF EXISTS dbo.tf_nums');
+SELECT fabricator_exec('tfdb', 'DROP FUNCTION IF EXISTS dbo.tf_nums');
 
 statement ok
-SELECT mssql_net_exec('tfdb', 'DROP FUNCTION IF EXISTS dbo.tf_pair');
+SELECT fabricator_exec('tfdb', 'DROP FUNCTION IF EXISTS dbo.tf_pair');
 
 statement ok
-SELECT mssql_net_exec('tfdb', 'DROP FUNCTION IF EXISTS dbo.tf_ms');
+SELECT fabricator_exec('tfdb', 'DROP FUNCTION IF EXISTS dbo.tf_ms');
 
 statement ok
 DETACH tfdb;

@@ -10,18 +10,18 @@
 #              IN (their issue #303 class) must not over-prune. (4) Explicit-transaction semantics: appends
 #              BUFFER per DuckDB transaction and flush as ONE Delta commit per table at COMMIT; ROLLBACK
 #              discards them (duckdb-delta parity — full coverage in verify_delta_catalog_transactions.test).
-#              Set ARROWNET_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
-# group: [mssql_net]
+#              Set FABRICATOR_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
 require parquet
 
-require-env ARROWNET_DELTA_WRITE_DIR
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 # ---- (1a) top-level NOT NULL on a table we create ----
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cons' AS w (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/cons' AS w (TYPE fabricator, PROVIDER 'delta');
 
 statement ok
 CREATE TABLE w.main.t (i INT NOT NULL, s VARCHAR);
@@ -67,7 +67,7 @@ SELECT count(*), sum(i) FROM w.main.t;
 
 # ---- (1b) the streaming (native_write) path enforces too ----
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/cons' AS n (TYPE arrownet, PROVIDER 'delta', native_write true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/cons' AS n (TYPE fabricator, PROVIDER 'delta', native_write true);
 
 statement error
 INSERT INTO n.main.t VALUES (NULL, 'g');
@@ -89,7 +89,7 @@ INSERT INTO w.main.ctas VALUES (NULL, 'ok');
 # ---- (1c) NESTED constraints via the duckdb-delta fixture (Spark-declared struct-field nullability;
 #           error-only — a failing collect-path insert writes nothing, keeping the fixture pristine) ----
 statement ok
-ATTACH 'test/fixtures' AS fx (TYPE arrownet, PROVIDER 'delta');
+ATTACH 'test/fixtures' AS fx (TYPE fabricator, PROVIDER 'delta');
 
 query I
 SELECT count(*) FROM fx.main.null_constraints_structs;
@@ -226,6 +226,6 @@ SELECT count(*) FROM w.main.txn;
 # the CTAS data write is one WRITE version; the two INSERTs in BEGIN..COMMIT flushed as ONE more;
 # the rolled-back INSERT wrote nothing
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('w', 'txn') WHERE operation = 'WRITE';
+SELECT count(*) FROM fabricator_delta_snapshots('w', 'txn') WHERE operation = 'WRITE';
 ----
 2

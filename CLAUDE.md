@@ -1,11 +1,11 @@
-# CLAUDE.md — project knowledge for `mssql_net`
+# CLAUDE.md — project knowledge for `fabricator`
 
 > Canonical project memory. Maintained in the repo (not in per-user agent memory) so it's
 > easy to edit and shared across machines. Keep this current as the implementation evolves.
 
 ## What this is
 
-`mssql_net` is a **DuckDB extension** that connects DuckDB to **Microsoft SQL Server** by hosting a
+`fabricator` is a **DuckDB extension** that connects DuckDB to **Microsoft SQL Server** by hosting a
 C# layer (**CoreCLR, in-process**) and exchanging data + metadata as **Apache Arrow** over the Arrow
 C Stream Interface (`ArrowArrayStream`). It is a direct, in-process replacement for the Arrow-Flight
 transport used by the "Airport" extension.
@@ -15,46 +15,98 @@ target), **all SQL Server I/O happens in C# via `Microsoft.Data.SqlClient`**; th
 registers DuckDB functions and ingests Arrow. Full phased plan:
 `C:\Users\c.mettler\.claude\plans\i-want-to-create-soft-crown.md`.
 
+### THE FABRICATOR RENAME (2026-07-15, breaking — no aliases)
+
+The extension + generic core was renamed **ArrowNet/`mssql_net` → `Fabricator`/`fabricator`** ahead of publish
+(one branch: `refactor/fabricator-rename`). All the old `mssql_net_*` and `arrownet_*` names are **GONE** — no
+back-compat aliases were kept (user decision). What is now `fabricator`:
+- **Extension**: `LOAD fabricator`, `ATTACH … (TYPE fabricator)`, catalog-type string `"fabricator"`, entry
+  `DUCKDB_CPP_EXTENSION_ENTRY(fabricator, …)`, artifact `fabricator.duckdb_extension`.
+- **User functions**: `fabricator_query` / `fabricator_exec` / `fabricator_refresh_cache` /
+  `fabricator_invalidate_cache` / `fabricator_version` / `fabricator_server_info` / `fabricator_functions` /
+  all `fabricator_delta_*` (single registration each — the old dual `mssql_net_*`+`arrownet_*` aliasing removed).
+- **C++**: namespace `fabricator`, dirs `src/fabricator/` + `src/include/fabricator/`, files `fabricator_*.cpp/hpp`
+  (incl. `fabricator_extension`/`_secret`/`_storage`, `copy/fabricator_copy`), classes `Fabricator*` (catalog/
+  schema-entry/etc.), internal scan fn `"fabricator_scan"`.
+- **C#**: projects/assemblies/namespaces `Fabricator.Bridge` / `.SqlServer` / `.AnalysisServices` / `.DeltaRs` /
+  `.Abstractions` / `.SamplePlugin`; bridge entry `Fabricator.Bridge.Bootstrap`; managed dir published to
+  `build/release/extension/fabricator/fabricator/`.
+- **Env vars / ABI constants**: `FABRICATOR_*` (`FABRICATOR_MANAGED_DIR`, `_DOTNET_ROOT`, `_BACKEND_ASSEMBLY`,
+  `_PLUGIN_DIR`, `_LOG_LEVEL`/`_LOG_FILE`, `_DELTA_WRITE_DIR`, `_DELTA_PREFETCH`, `_ABI_VERSION`, `_META_*`, …).
+
+**Provider-scoped names deliberately KEPT** (a setting/URI/secret/format names its PROVIDER, not the extension —
+the DAX provider has `dax_*`, Delta `delta_*`): the ~35 SQL-Server settings stay `mssql_*` (`mssql_mars`,
+`mssql_isolation_level`, `mssql_default_varchar_length`, …); the SQL `mssql://` URI shorthand; the SQL secret
+**`TYPE mssql`** (was `mssql_net`); the SQL bulk COPY **`FORMAT mssql`** (+ `bcp`); `PROVIDER 'sqlserver'|'delta'|
+'dax'|'deltars'|'engineeredwooddelta'`; secret FIELD names. **Gotcha for future edits:** `TYPE mssql` in an
+ATTACH is the storage-extension keyword → must be `fabricator`; `TYPE mssql` in a CREATE SECRET is the secret
+type → stays `mssql`. Renamed on the branch + validated (representative verify sweep green; loadable rebuilt).
+
+### BRIDGE-CROSSING LOGGING (2026-07-15, additive, off by default)
+
+Expanded the `FabricatorLog` (ILogger) coverage so a query/filter/mode/DDL/crossing is visible without a
+profiler. Off by default (`FABRICATOR_LOG_LEVEL`, file sink `FABRICATOR_LOG_FILE`, + the `host_log` forwarding to
+`duckdb_logs`). Categories: **`Fabricator.Bridge`** — EVERY *failed* ABI crossing logged centrally (a
+`[CallerMemberName]` on `Bootstrap.SetError` records the op name + exception, so no per-handler code), plus
+`open_catalog` (provider+options; connstr NEVER logged — password) / `get_metadata` (kind+args) control
+crossings; **`Fabricator.Sql`** (new, in `SqlServerCatalog`) — every T-SQL statement: scans with the pushed
+projection/WHERE/TOP/ORDER BY, the connection routing (pinned/pooled, read-your-writes, txn id, param count),
+DML (`dml … DELETE/UPDATE …`), DDL (`ddl create/alter …`), and bulk (`bulk <table>: create/replace/
+checkConstraints/options` + `N rows copied`); **`Fabricator.Delta*`** — already rich (bulk/write/scan mode /
+native_filter / active·scanned·pruned files / resolved snapshot version). Logging OFF is byte-neutral (verify
+suites unaffected). It immediately surfaced a pre-existing caught load-time `GetFunctionParamSchema` null-`fields`
+WARN (benign — global functions pass).
+
+### Sync-over-async cleanup — CONVENTION established, remainder is incremental
+
+The documented shape (thin sync ABI wrapper that blocks ONCE on a private `async` core using
+`ConfigureAwait(false)` throughout) is now demonstrated + verified on the leaf `DeltaReader.GetActiveFileUris`
+(exemplar with an inline doc comment; native_read suite green — confirms the AsyncLocal ambients flow across the
+pool-thread hops). The remaining ~147 `.GetAwaiter().GetResult()`-at-every-await sites (DeltaReader 65 more,
+DeltaCatalog 29, DeltaGlobalTableFunction/OneLakeForwardFs/… ) are the **prescribed incremental follow-up** —
+leaf-first, one seam at a time, `verify_delta_catalog_*` after each, never a blind sweep (the ambient-loss
+landmine only surfaces on live OneLake / explicit txns). Adopt the sync-wrapper→async-core shape for NEW code now.
+
 ## Architecture (layered for reuse)
 
 Layered so a future **Power BI / DAX** connector reuses the same C++ core + managed bridge:
 
-- **C++ generic core** — `namespace arrownet`, dirs `src/arrownet/` + `src/include/arrownet/`:
+- **C++ generic core** — `namespace fabricator`, dirs `src/fabricator/` + `src/include/fabricator/`:
   `clr_host` (CoreCLR bootstrap + vtable wrappers), `arrow_ingest` (ArrowArrayStream → DataChunk),
   `arrow_produce` (DataChunk → ArrowArray), `abi.h` (the C ABI contract).
-- **C++ DuckDB-API layer** — `namespace duckdb`, classes named `ArrowNet*`, files `arrownet_*`:
-  catalog / schema_entry / table_entry / transaction / metadata (`src/catalog/arrownet_*`), DML
-  insert / modify / ctas (`src/dml/arrownet_*`), optimizer (`src/arrownet_optimizer.cpp`). The
-  internal catalog scan function is `"arrownet_scan"`.
-- **C++ provider layer** — keeps the `mssql_net` / `MssqlNet*` name: extension entry
-  (`src/mssql_net_extension.cpp`), `mssql_net_secret`, `mssql_net_storage` (ATTACH/connstr),
-  `src/copy/mssql_net_copy.cpp`, and all user-facing names (extension `mssql_net`, functions
-  `mssql_net_query`/`_exec`/`_refresh_cache`/`_invalidate_cache`, `TYPE mssql_net`, `mssql_*`
-  settings, `mssql://` URI, the `"mssql_net"` catalog-type string).
-- **C# `ArrowNet.Bridge`** (`dotnet/ArrowNet.Bridge`) — backend-agnostic: C-ABI `[UnmanagedCallersOnly]`
+- **C++ DuckDB-API layer** — `namespace duckdb`, classes named `Fabricator*`, files `fabricator_*`:
+  catalog / schema_entry / table_entry / transaction / metadata (`src/catalog/fabricator_*`), DML
+  insert / modify / ctas (`src/dml/fabricator_*`), optimizer (`src/fabricator_optimizer.cpp`). The
+  internal catalog scan function is `"fabricator_scan"`.
+- **C++ provider layer** — keeps the `fabricator` / `Fabricator*` name: extension entry
+  (`src/fabricator_extension.cpp`), `fabricator_secret`, `fabricator_storage` (ATTACH/connstr),
+  `src/copy/fabricator_copy.cpp`, and all user-facing names (extension `fabricator`, functions
+  `fabricator_query`/`_exec`/`_refresh_cache`/`_invalidate_cache`, `TYPE mssql`, `mssql_*`
+  settings, `mssql://` URI, the `"fabricator"` catalog-type string).
+- **C# `Fabricator.Bridge`** (`dotnet/Fabricator.Bridge`) — backend-agnostic: C-ABI `[UnmanagedCallersOnly]`
   exports + vtable (`Bootstrap.cs`, `Abi.cs`), handle table, Arrow export/import, `IBackend`/
   `IBackendCatalog`, `ArrowDataReader` (IArrowArrayStream→DbDataReader), `BulkSession`/
   `ChannelArrowStream` (streaming bulk), `StubBackend`.
-- **C# `ArrowNet.SqlServer`** (`dotnet/ArrowNet.SqlServer`) — the `Microsoft.Data.SqlClient` backend +
+- **C# `Fabricator.SqlServer`** (`dotnet/Fabricator.SqlServer`) — the `Microsoft.Data.SqlClient` backend +
   composition root; published self-contained next to the extension. Discovered via `BackendRegistry`
-  reflection (env `ARROWNET_BACKEND_ASSEMBLY`, default `ArrowNet.SqlServer`).
+  reflection (env `FABRICATOR_BACKEND_ASSEMBLY`, default `Fabricator.SqlServer`).
 
 ### Target architecture: ONE binary, MULTIPLE providers (corrected goal, 2026-06-20)
 
-The end goal is a **single `arrownet` extension binary that hosts several providers** (SQL Server via
+The end goal is a **single `fabricator` extension binary that hosts several providers** (SQL Server via
 SqlClient, Power BI/DAX via ADOMD, …) — NOT a separate binary per provider. Implications (planned;
-current code still uses the single-provider `mssql_net` naming):
+current code still uses the single-provider `fabricator` naming):
 
-- **Generic user-facing names**: `arrownet_query` / `arrownet_exec` (not `mssql_net_query`). The user is
+- **Generic user-facing names**: `fabricator_query` / `fabricator_exec` (not `fabricator_query`). The user is
   fine breaking `gen_mssqlcompat_tests.sh` and renaming the kept tests.
 - **Dispatch is handle/catalog-based** and already works: `Handles.Resolve<IBackendCatalog>(handle)`
   returns a backend-specific catalog, so any ABI call already routes to the right provider. Multi-provider
   mainly needs: C# `BackendRegistry` keyed by provider name (providers self-register, not `Active`=one) +
-  **provider selection at open time** (`ATTACH … (TYPE arrownet, PROVIDER 'sqlserver')`, or inferred from
+  **provider selection at open time** (`ATTACH … (TYPE fabricator, PROVIDER 'sqlserver')`, or inferred from
   the `mssql://`/`dax://` scheme, or the secret's provider). `open_catalog` ABI gains a `provider` arg; the
-  catalog-type string becomes the generic `"arrownet"` (provider stored on the catalog).
+  catalog-type string becomes the generic `"fabricator"` (provider stored on the catalog).
 - **Provider-specific logic lives in C#**: connection-string assembly + auth mapping (move out of
-  `mssql_net_secret.cpp`), type mapping, all SQL. The C++ `arrownet` core owns registration + dispatch +
+  `fabricator_secret.cpp`), type mapping, all SQL. The C++ `fabricator` core owns registration + dispatch +
   the function machinery, reused verbatim by every provider.
 - **Custom scalar / table / table-in-out functions** (Airport-style, Phase 3) drive this. Two registration
   phases through one ABI shape (`list_global_functions(provider)` / `list_catalog_functions(handle)` +
@@ -62,27 +114,27 @@ current code still uses the single-provider `mssql_net` naming):
   decl_id): **(A) load-time global** via `loader.RegisterFunction` — DuckDB only allows global registration
   during `Extension::Load()`, so this forces the **bridge to boot at extension load** (not lazily);
   **(B) attach-time catalog-bound** — discovered SQL Server procs/UDFs become `ScalarFunctionCatalogEntry`/
-  `TableFunctionCatalogEntry` in `ArrowNetSchemaEntry` (resolved as `db.schema.proc(args)`, refreshable via
-  the existing cache invalidation). New core file `arrownet_functions.{hpp,cpp}` holds this. Table-in-out
+  `TableFunctionCatalogEntry` in `FabricatorSchemaEntry` (resolved as `db.schema.proc(args)`, refreshable via
+  the existing cache invalidation). New core file `fabricator_functions.{hpp,cpp}` holds this. Table-in-out
   (`in_out_function`) is the hard part → Phase 4. **Full design: [docs/custom-functions-design.md](docs/custom-functions-design.md)**
   (ABI, the C# authoring API — lambda / attribute(SQLCLR-style, columnar) / derived — and
   `sp_describe_first_result_set` late-binding for table procs).
 - Suggested order: (1) **C# multi-backend registry — DONE** (`BackendRegistry` is provider-keyed:
   `IBackend.Name`/`Aliases`, `Resolve(provider)`, `Active`=default; multi-assembly discovery via
-  `ARROWNET_BACKEND_ASSEMBLY` comma-list; SqlServer = `"sqlserver"`/alias `"mssql"`. Behavior-preserving —
+  `FABRICATOR_BACKEND_ASSEMBLY` comma-list; SqlServer = `"sqlserver"`/alias `"mssql"`. Behavior-preserving —
   `Active` still routes to SqlServer); (2) **provider selection — DONE** (`open_catalog(provider,…)` ABI
   v17 → `BackendRegistry.Resolve`; ATTACH `PROVIDER` option + `scheme://` inference; clean unknown-provider
-  error). The **generic names are now live as ADDITIVE ALIASES** (no breakage): `arrownet_query`/`arrownet_exec`/
-  `arrownet_functions`/`arrownet_server_info` (+ the existing `arrownet_version`) and `ATTACH … (TYPE arrownet)`
-  (the storage extension is registered under both `mssql_net` and `arrownet`) — `test/verify_generic_names.test`.
-  The **breaking removal** of the `mssql_net_*` names (+ catalog-type string `"arrownet"`, settings/secret/URI
+  error). The **generic names are now live as ADDITIVE ALIASES** (no breakage): `fabricator_query`/`fabricator_exec`/
+  `fabricator_functions`/`fabricator_server_info` (+ the existing `fabricator_version`) and `ATTACH … (TYPE fabricator)`
+  (the storage extension is registered under both `fabricator` and `fabricator`) — `test/verify_generic_names.test`.
+  The **breaking removal** of the `fabricator_*` names (+ catalog-type string `"fabricator"`, settings/secret/URI
   scheme rename, compat-corpus regen) remains the separate full-rename pass;
-  (3) **connstr/auth → C# — DONE** (`build_connection_string` ABI v18: `mssql_net_secret.cpp` reads the
+  (3) **connstr/auth → C# — DONE** (`build_connection_string` ABI v18: `fabricator_secret.cpp` reads the
   secret + emits its fields as JSON, `SqlServerBackend.BuildConnectionString` assembles the SqlClient
   connstr; `MapAuthentication`/`QuoteConnValue`/the access-token marker are now C#-only — C++ has no connstr
-  knowledge); (4) dynamic functions — **(4a) function discovery DONE** (`mssql_net_functions(catalog)` table
-  fn + `ARROWNET_META_FUNCTIONS`); **(4b) attach-time catalog-bound scalar UDFs DONE** (discovered scalar
-  UDFs become `ScalarFunctionCatalogEntry` in `ArrowNetSchemaEntry`, resolved as `db.schema.fn(args)` and
+  knowledge); (4) dynamic functions — **(4a) function discovery DONE** (`fabricator_functions(catalog)` table
+  fn + `FABRICATOR_META_FUNCTIONS`); **(4b) attach-time catalog-bound scalar UDFs DONE** (discovered scalar
+  UDFs become `ScalarFunctionCatalogEntry` in `FabricatorSchemaEntry`, resolved as `db.schema.fn(args)` and
   executed over Arrow — ABI v19); **(4c) attach-time catalog-bound table-valued functions DONE** (discovered
   TVFs become `TableFunctionCatalogEntry`, resolved as `SELECT * FROM db.schema.tvf(args)`, with real
   SQL-level projection + best-effort filter pushdown reusing the table scan's machinery — ABI v21);
@@ -102,7 +154,7 @@ current code still uses the single-provider `mssql_net` naming):
   overload coexisting with the scalar-arg scan form under one name (`bind_table_function.cpp`: "TABLE
   parameter, and multiple function overloads — not supported") → the in-out form is a **separate `_each`
   catalog entry** (single TABLE overload), the scan form (4c) keeps the bare name; alias tracked in
-  `ArrowNetSchemaEntry::inout_functions_`. (2) **Output is emitted SYNCHRONOUSLY per input chunk** (each
+  `FabricatorSchemaEntry::inout_functions_`. (2) **Output is emitted SYNCHRONOUSLY per input chunk** (each
   `inout_push` runs that chunk's CROSS APPLY to completion + returns its full output) → there is **no tail**,
   so emitting rows never depends on detecting which parallel branch finishes last. This replaced an unsound
   first attempt (an atomic last-branch counter in `in_out_function_final`): `PhysicalUnion::BuildPipelines`
@@ -116,7 +168,7 @@ current code still uses the single-provider `mssql_net` naming):
   BIGINT→INT, error+recover). **(4g-custom) custom C#-authored table-in-out DONE** (now `IArrowInOutFunction` /
   the `StaticInOutFunction` base — in-out analog of 4e/4f): a pure-C# **per-chunk streaming** table-in-out (no SQL object), may keep mutable
   state across chunks (running aggregate); surfaced as `kind='inout'` → C++ `AddInOutFunction` registers a
-  bare-name `{TABLE}` entry (`GetOrCreateCustomInOutFunction` + `ArrowNetCustomInOutBind`, output = the fn's
+  bare-name `{TABLE}` entry (`GetOrCreateCustomInOutFunction` + `FabricatorCustomInOutBind`, output = the fn's
   full declared schema, no input echo), dispatched in C# (`CustomInOut` factory registry → fresh instance per
   session; `CustomInOutSessionImpl` runs `Process(chunk)`). Reuses the 4g operator path — no new ABI/C++
   operator. Verified: `test/verify_custom_functions.test` (cf_tag per-row, cf_running_sum stateful 4999-row
@@ -133,8 +185,8 @@ current code still uses the single-provider `mssql_net` naming):
   proc result columns; result-set procs only). Verified: `test/verify_proc_inout.test` (echo output, autocommit
   commit, row-failure rolls back the whole statement, explicit-`BEGIN` read-your-writes + `ROLLBACK` undoes —
   31 assertions). **(4g-finalize) the injected `OperatorFinalize` DONE**: an `OptimizerExtension`
-  (`RegisterArrowNetInOutFinalizer`) wraps each in-out `LogicalGet` (identified by `function.in_out_function
-  == ArrowNetInOutFunction`) in a pass-through `LogicalExtensionOperator` whose `PhysicalOperator`
+  (`RegisterFabricatorInOutFinalizer`) wraps each in-out `LogicalGet` (identified by `function.in_out_function
+  == FabricatorInOutFunction`) in a pass-through `LogicalExtensionOperator` whose `PhysicalOperator`
   (`PhysicalOperatorType::EXTENSION`) forwards rows 1:1 and, in `OperatorFinalize`, calls `holder->Finish()`
   → C# `inout_finish`. This is the reliable single "in-out finished" signal (fires **once**, sink-level, even
   above a parallel UNION — verified empirically + via `MetaPipeline`/executor finish-event scheduling),
@@ -298,7 +350,7 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     AWS's documented conditional writes are PutObject/CompleteMultipartUpload only), so EW's
     `S3TableFileSystem.RenameAsync` copy-based primitive gave NO commit safety — **fixed in EW** to the
     same Get→conditional-Put→Delete shape. Wiring mirrors OneLake: `DeltaBackend.BuildConnectionString`
-    s3-secret branch → `S3CommitCredential.AppendMarker` (`;ArrowNetS3Cred=`) → catalog `_s3Credential`
+    s3-secret branch → `S3CommitCredential.AppendMarker` (`;FabricatorS3Cred=`) → catalog `_s3Credential`
     → `Opener()` publishes `AmbientS3Credential` → `TableFileSystems.Create` wraps s3:// roots.
     Credential mapping: key_id/secret/session_token/endpoint/region; `URL_STYLE 'path'` →
     `ForcePathStyle`; `USE_SSL`; a CUSTOM endpoint tolerates self-signed certs (the rig posture — AWS
@@ -367,7 +419,7 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     slice-D conditional commits) PASS=4/4 (~9s). NEW **`delta_external` materialization**
     (`macros/delta_external.sql`): dbt-duckdb's built-in `external` whitelists csv/parquet/json, so a
     custom materialization runs `COPY (model) TO '<location>' (FORMAT delta, MODE …)` (any location —
-    s3://, onelake://, local; no ATTACH) + registers a view over `arrownet_delta_scan(location)` for
+    s3://, onelake://, local; no ATTACH) + registers a view over `fabricator_delta_scan(location)` for
     downstream refs (model config: `database=target.database` so the view lands in the writable local
     db); demo `models/ext_delta.sql` aggregates a Delta-catalog model → standalone Delta table on
     MinIO, read-back verified. NEW **dbt SNAPSHOTS work on Delta catalogs** (`snapshots/customers_snap`,
@@ -388,7 +440,7 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
 - **Fabric-notebook AMBIENT AUTH — DONE + VALIDATED LIVE (2026-07-14, C#-only, no ABI).** In a Fabric
   notebook/Spark session ALL THREE providers work with ZERO credentials: **SQL**
   (`ATTACH 'Server=<endpoint>;Database=<wh>'` bare, or `authentication 'default'`) against Warehouse AND
-  Lakehouse SQL endpoints; **Delta-on-OneLake** (`ATTACH 'abfss://…/Tables' (TYPE arrownet, PROVIDER
+  Lakehouse SQL endpoints; **Delta-on-OneLake** (`ATTACH 'abfss://…/Tables' (TYPE fabricator, PROVIDER
   'delta', READ_ONLY false)` — no SECRET); **DAX** (`ATTACH 'Data Source=powerbi://…;Initial
   Catalog=<model>' (PROVIDER 'dax')` — **AdomdClient PROVEN on Fabric Linux compute** (the old
   "Linux-TBD" is resolved; sempy uses Adomd.NET on the same image); at a WORKSPACE XMLA endpoint the
@@ -476,9 +528,9 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   resolution), threaded to the C# binding via **one appended ABI entry `set_active_opener`** — a per-thread
   ambient (`AmbientOpener`, mirroring `set_active_txn`) the host sets in the shared table bind/init hooks
   (`PopulateReturnSchema` + `ArrowStreamInitGlobal`), read by the host-FS binding in `Bind`/`Execute`. NO opener
-  param + NO new operator (the v29 table session is reused verbatim). **`arrownet_delta_scan` migrated to a
+  param + NO new operator (the v29 table session is reused verbatim). **`fabricator_delta_scan` migrated to a
   pure-C# global host-FS `ITableFunction`** (`DeltaGlobalTableFunction`, Bridge, over engineered-wood +
-  `DuckDbTableFileSystem`, declared in `CustomFunctions.GlobalTable`); the bespoke `arrownet_delta.cpp` + the
+  `DuckDbTableFileSystem`, declared in `CustomFunctions.GlobalTable`); the bespoke `fabricator_delta.cpp` + the
   `delta_schema`/`delta_scan` ABI entries were **removed** — so a NEW lakehouse format (Iceberg/Lance/…) is added
   with **zero C++** (a pure-C# `ITableFunction` reading `AmbientOpener.Current` + files via the host `fs_*`
   callbacks, declared as a global). `test/verify_delta.test` (60), `test/verify_global_functions.test` (63), full
@@ -492,7 +544,7 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   `BETWEEN` push incl. strings. The SQL catalog scan shares the encoder + flag, so it ALSO pushes string
   ordering/`BETWEEN` under a binary `_BIN2` collation (latent win, `dm_exec`-proven in
   `verify_collation_pushdown`); discovered SQL TVFs stay equality-only (collation-dependent). The C# signal
-  rides the `list_global_functions` metadata (a `string_order` column) → `ArrowNetTableFunctionInfo` →
+  rides the `list_global_functions` metadata (a `string_order` column) → `FabricatorTableFunctionInfo` →
   `bind_data.string_order_pushable`; no ABI bump.
   The predicate drives the Delta file pruner `ReadAllAsync(columns, filter)` AND per-file Parquet row-group
   pruning via `ParquetReadOptions.Filter` on a per-scan `DeltaTableOptions` — no engineered-wood change). Column
@@ -504,9 +556,9 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   via `loader.RegisterFunction`. **Slice 1 built + verified**: `list_global_functions` enumerates the
   provider-union at load + a **`handle==0`** branch on `get_function_*_schema`/`execute_scalar` resolves a
   function by name against the C# `GlobalFunctions` registry; `IBackend.GlobalScalarFunctions` declares them;
-  C++ `RegisterArrowNetGlobalFunctions` builds a `ScalarFunction` per scalar decl (shared
-  `BuildArrowNetScalarFunction`, handle=0) at load (best-effort — skipped if the bridge can't boot). Demo
-  **`arrownet_render(template, params)`** — the **Fluid/Liquid** template engine (secure-by-default,
+  C++ `RegisterFabricatorGlobalFunctions` builds a `ScalarFunction` per scalar decl (shared
+  `BuildFabricatorScalarFunction`, handle=0) at load (best-effort — skipped if the bridge can't boot). Demo
+  **`fabricator_render(template, params)`** — the **Fluid/Liquid** template engine (secure-by-default,
   parse-once cached); `params` accepts a **DuckDB STRUCT** (`{'name':'x'}`, type-safe) OR a JSON string via the
   **`SQLNULL→ANY` sentinel now wired for scalars** (the scalar builder maps SQLNULL→ANY + marshals the exec chunk
   by its runtime `DataChunk::GetTypes()`, not the declared signature; `Invoke` reads a StructArray or StringArray).
@@ -521,18 +573,18 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   v29 `table_bind` / v28 `inout_bind` sessions). C# = a base/derived interface split per kind (`IScalarFunction`
   + `ICatalogScalarFunction` [rename of `IArrowScalarFunction`], same for `ITableFunction`/`IInOutFunction`/
   `ICollectorTableFunction`) + `IBackend.GlobalScalarFunctions`/`GlobalTableFunctions`/`GlobalInOutFunctions`/
-  `GlobalCollectorFunctions`; C++ `RegisterArrowNetGlobalFunctions` branches on `kind` at load →
-  `loader.RegisterFunction`. Slices: (1) scalar **DONE** — template engine **`arrownet_render`** via **Fluid**
-  (Liquid, secure-by-default); (2) in-out/collector **DONE** (pure-C#, **no opener**; demos `arrownet_tag`
-  streaming + `arrownet_collect_sum` collector; `inout_bind` handle-0 → C# global registry; reuses the v28
-  exchange ABI, no bump — enables the effectful global *apply* half, e.g. `arrownet_apply_tmdl` collector);
+  `GlobalCollectorFunctions`; C++ `RegisterFabricatorGlobalFunctions` branches on `kind` at load →
+  `loader.RegisterFunction`. Slices: (1) scalar **DONE** — template engine **`fabricator_render`** via **Fluid**
+  (Liquid, secure-by-default); (2) in-out/collector **DONE** (pure-C#, **no opener**; demos `fabricator_tag`
+  streaming + `fabricator_collect_sum` collector; `inout_bind` handle-0 → C# global registry; reuses the v28
+  exchange ABI, no bump — enables the effectful global *apply* half, e.g. `fabricator_apply_tmdl` collector);
   (3) compute/connstr table **DONE** (`table_bind` handle-0 → `GlobalFunctions.ResolveTable` over the v29
   session; the handle-0 `get_function_param_schema` is kind-agnostic via `GlobalFunctions.ParamSchema`;
-  `BindingBoundTable` moved to the Bridge; demos `arrownet_seq` fixed-schema + `arrownet_columns` arg-dependent
+  `BindingBoundTable` moved to the Bridge; demos `fabricator_seq` fixed-schema + `fabricator_columns` arg-dependent
   schema); (4) aggregate **DONE** (`IAggregateFunction` base + `ICatalogAggregateFunction`; `AggSessionImpl` →
   the Bridge as public `AggregateSession` shared by catalog+global; `agg_open` handle-0 →
   `GlobalFunctions.ResolveAggregate`; `ParamSchema`/`ReturnField` kind-agnostic; shared
-  `BuildArrowNetAggregateFunction`; reuses the v25/v26 `agg_*` ABI; demo `arrownet_product` — GROUP BY/parallel/
+  `BuildFabricatorAggregateFunction`; reuses the v25/v26 `agg_*` ABI; demo `fabricator_product` — GROUP BY/parallel/
   OVER); (5) **deferred** host-FS table (secret-backed readers like delta) — needs an **opener arg** on
   `table_bind`, delta stays bespoke until a 2nd such reader.
   Composes with TMDL = render-via-(global)scalar then apply-via-(global)table/collector. The rest of this bullet
@@ -542,37 +594,37 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   (connection-free, bare `fn(...)`, registered at `Extension::Load`). **This does NOT break the catalog-only
   concept — the two are orthogonal scopes that coexist**: catalog-bound = needs an ATTACH'd catalog + its
   connection (discovered SQL UDFs/procs/TVFs, custom fns using the catalog's SQL conn); global = connection-free
-  (`arrownet_delta_scan(path)`, future `arrownet_iceberg_scan`, lakehouse readers — they belong to no SQL Server
+  (`fabricator_delta_scan(path)`, future `fabricator_iceberg_scan`, lakehouse readers — they belong to no SQL Server
   catalog). **The original objection has dissolved:** Phase 3 deferred global functions to avoid booting the CLR
   at `Extension::Load()`, but the settings refactor (v33) + the fs/delta spike already boot the bridge
   best-effort at load. So global functions are now the natural **4th member of the "provider declares; core
   stays name-agnostic" family** (after settings v33 / ATTACH options v37 / secret fields v38): a
   `list_global_functions(provider)` ABI at load → C++ registers each declared scalar/table function
   **generically** (dispatch to C# by name/`decl_id`), the provider authoring them in C# with **zero per-function
-  C++**. `arrownet_delta_scan` is **already a global function** (bespoke `RegisterDeltaScan` in
-  `arrownet_delta.cpp`) — proof the scope exists. **Two wrinkles found while scoping the generic build (why it's
+  C++**. `fabricator_delta_scan` is **already a global function** (bespoke `RegisterDeltaScan` in
+  `fabricator_delta.cpp`) — proof the scope exists. **Two wrinkles found while scoping the generic build (why it's
   deferred until a 2nd lakehouse format/provider lands, not justified by one function):** (1) **arg-dependent
   output schema** — a global table fn's columns depend on its args (delta's schema comes from the `path`), so the
   generic registration must use the v27/v29 `table_bind`(args→schema+binding) shape, not the no-arg
   `get_function_output_schema`; (2) **the opener vs SQL-connection split** — `table_bind`/`table_execute` pass the
-  **catalog handle** to C# (SQL fns use the catalog's `SqlConnection`), but `arrownet_delta_scan` needs the
+  **catalog handle** to C# (SQL fns use the catalog's `SqlConnection`), but `fabricator_delta_scan` needs the
   **host-FS opener (ClientContext)** for IO, which that path doesn't thread through. So **"build the generic
   global path" and "migrate delta onto it" are separable**: the generic path is cleanest for connection/
   connstr-style global functions; **delta is better kept bespoke** (its host-FS-opener need is special) unless the
   global table-fn bind/execute ABI gains an opener arg (SQL fns ignore it). Build it when the 2nd lakehouse
-  format/provider arrives; until then delta stays the hand-written ~60-line `arrownet_delta.cpp`.
+  format/provider arrives; until then delta stays the hand-written ~60-line `fabricator_delta.cpp`.
 - **VARIANT for the Delta provider — V1 BUILT (2026-07-06): [docs/variant-support.md](docs/variant-support.md)
   §"AS BUILT"**. `CREATE TABLE lake.s.t (v VARIANT)` / CTAS / INSERT / SELECT / **DV-DELETE** work under
   `native_read true, native_write true` (`test/verify_delta_catalog_variant.test`, 55; **delta-kernel reads
   the result** — the unverified-kernel risk is resolved). The mechanism is NOT the planned per-operator
-  pre-cast: **one `ArrowTypeExtension` registered at load** (`src/arrownet/arrownet_variant.cpp` —
-  `RegisterArrowNetVariantExtension`; the exporter's `default:` branch consults the registry UNGATED by
+  pre-cast: **one `ArrowTypeExtension` registered at load** (`src/fabricator/fabricator_variant.cpp` —
+  `RegisterFabricatorVariantExtension`; the exporter's `default:` branch consults the registry UNGATED by
   `arrow_lossless_conversion`) makes VARIANT cross EVERY Arrow boundary transparently (bulk/CTAS/COPY
   appenders, host-query result AND input streams — so the streaming COPY sees real VARIANT with no SQL cast —
   scan ingest, `FetchTableColumns` bind schema). Conversions = the parquet extension's scalars via
   `FunctionBinder`/`ExpressionExecutor` (`variant_to_parquet_variant` out / `variant_bytes_to_variant` in).
   **Transport = ONE self-delimiting BLOB per row** (metadata bytes ++ value bytes), marker
-  **`arrownet.variant`** — NOT the canonical struct: `ArrowAppender::FinalizeChild` walks the LOGICAL type's
+  **`fabricator.variant`** — NOT the canonical struct: `ArrowAppender::FinalizeChild` walks the LOGICAL type's
   children (VARIANT = 4) against the internal-type appender (2) → a nested internal type crashes upstream
   ("index 2 within vector of size 2"; upstream-PR candidate: use `extension_data->GetInternalType()` there);
   a LEAF internal type (the bool8/geoarrow shape) sidesteps it. EW: `"variant"` primitive ⇄ tagged blob
@@ -587,8 +639,8 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   member access = dot `(v).a` (`variant_extract('$.a')` returns NULL in 1.5.4; `->` casts via JSON and fails);
   DuckDB's writer SHREDS small variants by default (read-transparent). Regression: delta 39/39, SQL fn suites
   11/11, EW 168+141. **Fabric Runtime 2.0 VALIDATED LIVE (Spark 4.1.1, both directions)**: we write
-  (`lake.dbo.arrownet_varlive`, onelake:// streaming COPY) → Spark `to_json`/`variant_get` read it exactly;
-  Spark writes (`arrownet_var_spark`, `parse_json`) → we read typed VARIANT + dot access + correct SQL-NULL.
+  (`lake.dbo.fabricator_varlive`, onelake:// streaming COPY) → Spark `to_json`/`variant_get` read it exactly;
+  Spark writes (`fabricator_var_spark`, `parse_json`) → we read typed VARIANT + dot access + correct SQL-NULL.
   One nuance: a SQL-NULL variant WE write reads in Spark as variant JSON-null (`v IS NULL` false there;
   DuckDB reads the same file as SQL NULL — DuckDB-writer representation, not transport). The **SQL Server
   provider REJECTS variant columns** cleanly (`BuildCreateTable` guard — else the tagged blob would silently
@@ -623,7 +675,7 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   the reader wraps back via `ParquetReadOptions.ExtensionRegistry`, round-trip tests in
   `VariantArrayRoundTripTests` — EW's known-issues "VARIANT not supported" note is STALE). The missing
   piece was Delta-layer glue: **`EngineeredWood.DeltaLake.Table/VariantTransport`** converts the
-  `arrownet.variant` blob transport ⇄ `VariantArray`/bare storage struct — write side in `WriteCoreAsync`'s
+  `fabricator.variant` blob transport ⇄ `VariantArray`/bare storage struct — write side in `WriteCoreAsync`'s
   codec branch (replacing the gate; splits each blob via the self-delimiting metadata header), read side in
   `ProcessFileBatchesAsync` after the renames (struct→blob+tag; a host-reader blob passes through;
   **shredded files [typed_value child] → clean error** — reassembly needs a variant engine). Bridge:
@@ -654,7 +706,7 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   **Cross-validated: DuckDB native, delta-kernel AND raw `read_parquet` all decode the codec-SHREDDED file
   exactly** (incl. the residual-merge row with an extra field), and the codec reads DuckDB-native-shredded
   tables — the cross-codec matrix is now FULL (both write both forms' semantics, both read everything).
-  **Spark VALIDATED LIVE on the codec-SHREDDED form** (`lake.dbo.arrownet_varshred`, sparkprobe
+  **Spark VALIDATED LIVE on the codec-SHREDDED form** (`lake.dbo.fabricator_varshred`, sparkprobe
   `variantshred`): all rows exact via `to_json` incl. the residual merge; `variant_get` on a SHREDDED
   field works (Spark exploits the typed columns); and the SQL NULL round-trips as TRUE SQL NULL
   (`WHERE v IS NULL` matches — the storage-validity null; NOTE this is BETTER than the unshredded
@@ -673,7 +725,7 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   DuckDB's field DDL (`ALTER TABLE t ADD/DROP/RENAME COLUMN s.f ...` — `AddFieldInfo`/`RemoveFieldInfo`/
   `RenameFieldInfo` with a `column_path`, first-class in 1.5.4) now works on the Delta catalog as
   METADATA-ONLY commits. C++ `Alter` gained ADD_FIELD/REMOVE_FIELD/RENAME_FIELD cases → new
-  `ARROWNET_ALTER_ADD_FIELD/DROP_FIELD/RENAME_FIELD` kinds (additive enum values 9-11; paths cross as a
+  `FABRICATOR_ALTER_ADD_FIELD/DROP_FIELD/RENAME_FIELD` kinds (additive enum values 9-11; paths cross as a
   JSON array of segments since names may contain dots; the new field rides the existing single-field
   Arrow stream). EW gained the nested analogs `AddFieldAsync`/`RenameFieldAsync`/`DropFieldAsync`
   (`TransformStructAt` schema rebuild at any depth; mapping assigns ids+physicalNames to an added field
@@ -731,7 +783,7 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   separate Delta commits and ROLLBACK does NOT undo them (duckdb-delta buffers appends until COMMIT; a
   per-transaction append buffer is a possible future). `test/verify_delta_catalog_constraints.test` (50).
   Still open from the survey: a DAT conformance test (the delta-incubator Delta Acceptance Testing corpus via
-  `require-env ARROWNET_DAT_PATH` — validates default/native_read/deltars readers against golden tables incl.
+  `require-env FABRICATOR_DAT_PATH` — validates default/native_read/deltars readers against golden tables incl.
   Spark checkpoints).
 - **Delta IDENTITY columns — DONE (2026-07-06)**: the v53 generated-column marker (`id BIGINT AS (0)`) now
   works on the Delta provider (`test/verify_delta_catalog_identity.test`, 38; kernel-reads). The heavy lifting
@@ -749,15 +801,15 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   mark (input batches unmutated) — no baked-values problem, no special-casing needed.
 - **DAX / ADOMD 2nd provider** (the "one binary, many providers" goal) — **design + slices:
   [docs/dax-provider.md](docs/dax-provider.md)**. **Slice 1 DONE + validated against a live local Power BI
-  Desktop instance**: new project `ArrowNet.AnalysisServices` (`DaxBackend : IBackend` provider `"dax"`,
+  Desktop instance**: new project `Fabricator.AnalysisServices` (`DaxBackend : IBackend` provider `"dax"`,
   aliases `adomd`/`powerbi`/`ssas`/`fabric`; `DaxCatalog : IBackendCatalog`; `PowerBiDesktop` port detection).
-  `ATTACH 'pbidesktop://' AS pbi (TYPE mssql_net, PROVIDER 'dax')` auto-detects the local msmdsrv port
+  `ATTACH 'pbidesktop://' AS pbi (TYPE fabricator, PROVIDER 'dax')` auto-detects the local msmdsrv port
   (Windows-only, newest workspace's `msmdsrv.port.txt`) → AdomdConnection; `GetMetadata(Schemas)` = model
   name(s) from `$SYSTEM.TMSCHEMA_MODEL` so the model shows as a DuckDB schema. Other targets pass through as
   an ADOMD connstr (SSAS/Fabric/AAS). **No ABI/C++ change — pure C# provider** reusing the catalog/scan/
-  function machinery. `BackendRegistry` default is now `ArrowNet.SqlServer,ArrowNet.AnalysisServices` (missing
+  function machinery. `BackendRegistry` default is now `Fabricator.SqlServer,Fabricator.AnalysisServices` (missing
   assembly skipped; SqlServer stays default → existing ATTACHes unchanged); `publish-managed.ps1` publishes
-  both into one `arrownet/` dir (Bridge + SqlClient + `Microsoft.AnalysisServices.AdomdClient` 19.96.1 — the
+  both into one `fabricator/` dir (Bridge + SqlClient + `Microsoft.AnalysisServices.AdomdClient` 19.96.1 — the
   plain managed package, **not** `.retail.amd64`). Connection round-trip de-risked via `scratchpad/dax-spike`
   (AdomdClient loads in net10, DMV + `EVALUATE` + `GetSchemaTable` all work). DAX is **read-only** (writes
   throw; BEGIN/COMMIT/ROLLBACK no-op). **Key analysis findings** (from `D:\repos\SqlServerFlights`): schema
@@ -787,14 +839,14 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   provider declares an "accept any value" named param as the **`NullType` sentinel** → C++ registers a
   `SQLNULL`-typed named param as `LogicalType::ANY` (`GetOrCreateTableFunction`) so DuckDB passes the literal
   UNCAST, and the shared table-bind marshaling keeps the value's **runtime** type for a `SQLNULL`-declared
-  param (`ArrowNetTableFunctionBind`) so a `STRUCT` marshals as a real Arrow struct. The guard is
+  param (`FabricatorTableFunctionBind`) so a `STRUCT` marshals as a real Arrow struct. The guard is
   `SQLNULL`-only → every concrete-typed function is unaffected (full SQL fn suite green). Validated
   numeric/string/filter params, struct + JSON. No ABI change — reuses the proc named-param marshaling + v29
   table session), **`daxevaltable(<input>, expression
   := …)` in-out** (slice 5 — injects the input table as a DAX `DATATABLE` named `_input`, evaluates once,
   `DaxEvalTableBinding`/`DaxDataTable`; this required wiring **cost args (named params) through the shared
   exchange** — `GetOrCreateCustomInOutFunction` declares named params via a tolerant `FetchFunctionParamSchema`
-  (empty for cf_tag → unchanged) + `ArrowNetExchangeBind` marshals supplied named params into `inout_bind`
+  (empty for cf_tag → unchanged) + `FabricatorExchangeBind` marshals supplied named params into `inout_bind`
   args, else nullptr (`_each` unchanged); no ABI bump. Whole-table op, but the exchange has no emit-at-end
   hook [finalize drain discards trailing output] — **this single-chunk cap is now LIFTED: `daxevaltable` is a
   [collector](docs/inout-collector-mode.md)** (see below), so an arbitrarily large injected table works
@@ -803,8 +855,8 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   streaming exchange, picked by a new additive `kind='collector'`; reuses the v28
   `inout_bind`/`inout_exchange_open` ABI as-is (no bump). C# `IArrowCollectorTableFunction`/
   `IArrowCollectorBinding` (+ `StaticCollectorFunction` base, the `CollectorInOutBinding` adapter); C++
-  `ArrowNetCollector*` (in-out `Execute` buffers input into an `ArrowProducer` on the refcounted holder; the
-  injected `ArrowNetCollectorPhysical` Sink+Source opens the exchange at Finalize and **streams** the C# output
+  `FabricatorCollector*` (in-out `Execute` buffers input into an `ArrowProducer` on the refcounted holder; the
+  injected `FabricatorCollectorPhysical` Sink+Source opens the exchange at Finalize and **streams** the C# output
   — the Source pulls the `ArrowStreamReader` a vector-slice at a time, so **input is fully buffered (inherent)
   but output is never materialized**). SqlServer demo `dbo.cf_collect` (`test/verify_collector.test`, 40 —
   whole-table total, 5000-row multi-chunk, sequential-UNION threads=1, empty, NULLs, prepared re-exec; +50k-row
@@ -853,13 +905,13 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   `apply_tmdl_each` (in-out, N serialized commits) / **`apply_tmdl_agg` (4h aggregate — collect many
   fragments, ONE atomic commit at finalize; side-effect-safe since the effect is in Finalize, run once
   single-threaded)**. Then the **generic rename**
-  (`arrownet_query`/`_exec`, catalog-type `"arrownet"`) + `BackendRegistry` multi-provider polish are due.
+  (`fabricator_query`/`_exec`, catalog-type `"fabricator"`) + `BackendRegistry` multi-provider polish are due.
 - **Multi-edition support** (Synapse / Fabric Warehouse / Lakehouse SQL endpoint) — **design:
   [docs/warehouse-support.md](docs/warehouse-support.md)**. **Slices 1–4 DONE + validated end-to-end against
   a real Fabric Warehouse** (edition 11, `BIN2_UTF8`): (1) `ServerProfile` (`ServerProfile.cs`) detected
   lazily on first connection via a **non-MARS probe** (so Fabric/Synapse, which reject a MARS connection, are
   classified before the MARS decision); **MARS gated on `profile.SupportsMars`** (the connection only works on
-  Fabric because of this); (2) `mssql_server_info(catalog)` diagnostic (`test/verify_server_profile.test`);
+  Fabric because of this); (2) `fabricator_server_info(catalog)` diagnostic (`test/verify_server_profile.test`);
   (3) **profile-driven `MapArrowToSqlType`** — `NVARCHAR`→`VARCHAR` by `HasNVarchar`, `datetime2`/`time` scale
   by `MaxDateTime2Scale`, tz→`datetimeoffset`|UTC-`datetime2` by `HasDatetimeOffset`; box-preserving; CTAS to
   Fabric verified (`varchar(MAX)`+`datetime2(6)`, µs round-trip; **Fabric accepts `varchar(MAX)`**). Read +
@@ -880,7 +932,7 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   with `SET name='<default>'`, not `RESET` (matters for `.test` hygiene across files). Verified:
   `test/verify_connection_mode.test` (20). (5) **collation-aware string `ORDER BY` pushdown** (no ABI):
   `FetchBinaryCollation` (reads the `SERVER_INFO` profile) caches a flag on the catalog at `LoadCatalog` →
-  scan `bind_data.string_order_pushable` → `arrownet_optimizer` gate `is_string && !string_order_pushable`;
+  scan `bind_data.string_order_pushable` → `fabricator_optimizer` gate `is_string && !string_order_pushable`;
   string keys push only on a binary (`_BIN`/`_BIN2`) collation (byte-order sort == DuckDB).
   `test/verify_collation_pushdown.test` + `test/verify_orderby_pushdown.test`. (6) **JSON read-side gate**
   (C#-only): a SQL `json` column is tagged `arrow.json` in `SqlArrowMapping.ToArrowField` → DuckDB imports it
@@ -949,27 +1001,27 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   stays name-agnostic" model).
 - **Plugin system (third-party backends + global functions)** — **default-context SPI BUILT + verified; ALC
   isolation deferred: [docs/plugin-system.md](docs/plugin-system.md)**. A plugin dropped into an
-  **`ARROWNET_PLUGIN_DIR`** folder is discovered at load (`BackendRegistry.ScanPluginDirectories`), its
+  **`FABRICATOR_PLUGIN_DIR`** folder is discovered at load (`BackendRegistry.ScanPluginDirectories`), its
   `IBackend`(s) registered + global functions surfaced as bare `fn(...)` with NO ATTACH — no ABI/C++ change (the
-  scan runs in `Discover()` before the `list_global_functions` union). Demo `ArrowNet.SamplePlugin`'s
+  scan runs in `Discover()` before the `list_global_functions` union). Demo `Fabricator.SamplePlugin`'s
   `plug_greet` (`test/verify_plugin.test`). **Key finding: plugins load into the BRIDGE's ALC**
   (`AssemblyLoadContext.GetLoadContext(typeof(BackendRegistry).Assembly)`), NOT `Default` — hostfxr loads the
-  bridge into a non-default context, so loading into Default bound the plugin to a separate `ArrowNet.Bridge`
+  bridge into a non-default context, so loading into Default bound the plugin to a separate `Fabricator.Bridge`
   copy (different, non-assignable `IBackend` → 0 backends). The loader skips host-context-loaded assemblies (the
   shared set) + a `Resolving` hook probes plugin dirs for private deps. **Plugins must align their full
   dependency closure with the host (Apache.Arrow always)** — no version isolation without ALC. **The contract
-  assembly `ArrowNet.Abstractions` is extracted** (the `I*Function`/`IBackend`/`IBoundTable`/`IAggregateSession`
+  assembly `Fabricator.Abstractions` is extracted** (the `I*Function`/`IBackend`/`IBoundTable`/`IAggregateSession`
   interfaces + `ProviderSetting`/`SecretField`/`TableFunctionScan`/`ScanSpec`/`FilterNode`, kept in the
-  `ArrowNet.Bridge` namespace — assembly split only, zero source churn; Bridge references it, the
-  ABI/marshaling/`BackendRegistry`/Static-bases/adapters stay in Bridge). `ArrowNet.SamplePlugin` references
+  `Fabricator.Bridge` namespace — assembly split only, zero source churn; Bridge references it, the
+  ABI/marshaling/`BackendRegistry`/Static-bases/adapters stay in Bridge). `Fabricator.SamplePlugin` references
   **Abstractions only** (+ Apache.Arrow) — Bridge-independent. Per-plugin `AssemblyLoadContext` isolation (for
   conflicting deps) is a deferred, non-breaking loader-internal upgrade. **Crux for that day:
   `Apache.Arrow`(+`.C`) MUST be SHARED (default context), never isolated** — every cross-boundary call traffics
   Arrow types, and cross-ALC types aren't assignable, so all plugins pin the bridge's Arrow version (isolation
   frees their OTHER deps only). The one fix over the textbook sketch: the `PluginLoadContext.Load` must return
-  null for an explicit **shared-name allowlist** (`ArrowNet.Abstractions` + `Apache.Arrow`/`.C`) BEFORE the
+  null for an explicit **shared-name allowlist** (`Fabricator.Abstractions` + `Apache.Arrow`/`.C`) BEFORE the
   resolver, else `AssemblyDependencyResolver` loads an isolated Arrow copy and breaks everything. Clean shape:
-  extract a thin shared **`ArrowNet.Abstractions`** (interfaces + Arrow-typed contracts) + non-collectible
+  extract a thin shared **`Fabricator.Abstractions`** (interfaces + Arrow-typed contracts) + non-collectible
   per-plugin ALCs, additive beside the default-context first-party providers (which gain nothing from isolation).
   Adopt isolation only when a real dependency conflict / third-party plugin lands.
 
@@ -980,14 +1032,14 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
 Implemented and verified:
 - **ATTACH + catalog**: schemas/tables/views, three-part naming, cross-catalog joins; `schema_filter`/
   `table_filter` (case-insensitive regex); ATTACH-time connection validation (no orphan catalog on
-  failure); `mssql://` URI; `CREATE SECRET (TYPE mssql_net, …)` incl. Azure Entra/Fabric auth.
+  failure); `mssql://` URI; `CREATE SECRET (TYPE mssql, …)` incl. Azure Entra/Fabric auth.
 - **Read path** fully in C# behind `get_metadata`/`scan_table` ABI calls — **C++ has zero T-SQL**.
 - **Pushdown**: projection (by-name), filter (best-effort via `pushdown_complex_filter`, never erases →
   DuckDB always re-applies; superset-safe shapes only), bare `LIMIT` (`TOP n`), `ORDER BY`+`LIMIT`
   (TopN, gated: NULL-order compatible, no pushed filter, and **string keys only under a binary database
   collation** — `ArrowStreamBindData::string_order_pushable`, set at scan bind from
-  `ArrowNetCatalog::StringOrderPushable()`, which `LoadCatalog` caches via `FetchBinaryCollation` reading
-  the `ARROWNET_META_SERVER_INFO` profile; binary `_BIN/_BIN2` collation sorts bytewise == DuckDB. No ABI.
+  `FabricatorCatalog::StringOrderPushable()`, which `LoadCatalog` caches via `FetchBinaryCollation` reading
+  the `FABRICATOR_META_SERVER_INFO` profile; binary `_BIN/_BIN2` collation sorts bytewise == DuckDB. No ABI.
   `test/verify_collation_pushdown.test`).
 - **Statistics → optimizer**: cardinality (row count from `sys.dm_db_partition_stats`) + per-column NDV
   (leading-column histogram). **min/max deliberately NOT reported** (DuckDB prunes filters on min/max →
@@ -1003,8 +1055,8 @@ Implemented and verified:
   exists (as before).
 - **Time travel** (`FROM cat.t AT (TIMESTAMP => ts)`) → SQL Server temporal tables `FOR SYSTEM_TIME AS OF`
   (`eeae2e2`). The AT clause is a **bind-time, per-table-reference constant** (not per-scan pushdown), so it
-  flows through the binding: `ArrowNetCatalog::SupportsTimeTravel()→true` (else the binder rejects it with
-  "Catalog type does not support time travel" before the scan), `ArrowNetTableEntry::GetScanFunction(EntryLookupInfo)`
+  flows through the binding: `FabricatorCatalog::SupportsTimeTravel()→true` (else the binder rejects it with
+  "Catalog type does not support time travel" before the scan), `FabricatorTableEntry::GetScanFunction(EntryLookupInfo)`
   reads `lookup_info.GetAtClause()` {unit,value} onto `ArrowStreamBindData` (the basic + lookup overloads share
   `BuildScanFunction`), `BuildScanSpec` folds it into the existing `spec_json` (`"at":{unit,value}` — **no new
   ABI**), and C# `ScanFromSource` emits the timestamp travel per engine profile: **box / Azure SQL** →
@@ -1045,9 +1097,9 @@ Implemented and verified:
     new `set_active_txn(handle, txn_id)` ABI entry that the host calls immediately before each
     connection-using call (same thread, synchronous); `begin_bulk`'s old `autocommit` arg became `txn_id`
     (the bulk runs on a background thread so the id is captured + re-established by the consumer). C++ sources
-    `MetaTransaction::Get(context).global_transaction_id` (`ArrowNetTransaction::txn_id_` for lifecycle;
+    `MetaTransaction::Get(context).global_transaction_id` (`FabricatorTransaction::txn_id_` for lifecycle;
     `arrow_ingest` `ArrowStreamInitGlobal` centrally for all scans/read-your-writes; the DDL/DML/exchange/
-    `FetchTableColumns`/`mssql_net_exec` callsites via `catalog/arrownet_txn_util.hpp`'s `ArrowNetSetActiveTxn`).
+    `FetchTableColumns`/`fabricator_exec` callsites via `catalog/fabricator_txn_util.hpp`'s `FabricatorSetActiveTxn`).
     So concurrent DuckDB transactions (e.g. **dbt `--threads N`** building several models at once) each get
     their OWN provider connection instead of colliding on one non-thread-safe `SqlConnection` (was error
     **595**). Matches the native `mssql-extension`'s per-`MSSQLTransaction` connection. **Validated: `dbt run
@@ -1061,8 +1113,8 @@ Implemented and verified:
     OneLake REQUIRES — DuckDB bumps a remote `abfss://` ATTACH to read-only under AUTOMATIC); instead a tiny
     dbt-duckdb **plugin** (`dbt_mssql_test/plugins/onelake_attach.py`) ATTACHes `mssql` writable in
     `configure_connection` (runs per connection, AFTER the profile `secrets:` create `fabric_sp` and BEFORE dbt's
-    per-connection schema creation — so all of dbt's cursors see the catalog). Uses `TYPE mssql_net` (the loadable
-    registers that storage-extension name; `arrownet` is a shell-only alias) + `PROVIDER 'delta'`. **CRITICAL —
+    per-connection schema creation — so all of dbt's cursors see the catalog). Uses `TYPE mssql` (the loadable
+    registers that storage-extension name; `fabricator` is a shell-only alias) + `PROVIDER 'delta'`. **CRITICAL —
     point it at an EMPTY lakehouse** (validated against the flat `LH_no_schema`, schema `main`): dbt runs
     `information_schema.tables` before building, which scans the **WHOLE `mssql` catalog** (the
     `WHERE table_schema=…` filters AFTER), and our catalog **materializes every table during enumeration**
@@ -1083,14 +1135,14 @@ Implemented and verified:
     delta-rs read schema across all types.) Per-target
     schema via `+schema: "{{ target.schema }}"` (box/fabric `dbo`, lakehouse `main`). **The loadable extension
     must be rebuilt on an
-    ABI bump** (`cmake --build … --target mssql_net_loadable_extension`) — dbt loads the loadable, not the
+    ABI bump** (`cmake --build … --target fabricator_loadable_extension`) — dbt loads the loadable, not the
     static `unittest`/`duckdb.exe`, so a stale loadable vs a freshly-published bridge throws
     `Bootstrap.Initialize returned 2` (ABI mismatch).
   - **dbt pre/post hooks — behavior + limitations: [docs/dbt-hooks.md](docs/dbt-hooks.md)** (validated box +
     Fabric). Highlights: an **in-transaction post-hook error rolls back the model's CREATE on BOTH box AND
     Fabric** (Fabric Warehouse supports transactional DDL rollback — unlike Snowflake). SQL-Server-specific
-    DDL in a hook (index/PK/UNIQUE) must call `mssql_net_exec`. A **default in-txn** post-hook touching the
-    model via `mssql_net_exec` now runs **atomically with the model** (ABI v36 join-only: the exec runs on the
+    DDL in a hook (index/PK/UNIQUE) must call `fabricator_exec`. A **default in-txn** post-hook touching the
+    model via `fabricator_exec` now runs **atomically with the model** (ABI v36 join-only: the exec runs on the
     model's own pinned connection — box: model + index in ~0.3s; previously a 30s self-block). `transaction:
     false` still works (model commits first; non-atomic post-processing). Fabric **`CREATE INDEX` is
     unsupported** (`22424`) — a provider limitation no hook can avoid (the in-txn form then rolls the model
@@ -1102,18 +1154,18 @@ Implemented and verified:
     cached entry, so the next bind (in a different transaction, no pinned connection) re-fetched columns
     (`SELECT * FROM <model> WHERE 1=0`) on a **pooled** connection that blocked `LCK_M_IS` on the ALTER's
     still-uncommitted Sch-M lock → 30s timeout → re-eviction → "Table does not exist" (captured via
-    `sys.dm_os_waiting_tasks`). **Fix (C++-only): `ArrowNetSchemaEntry::Alter` re-fetches the columns
+    `sys.dm_os_waiting_tasks`). **Fix (C++-only): `FabricatorSchemaEntry::Alter` re-fetches the columns
     EAGERLY on the model's OWN connection** (which owns the Sch-M lock → read-your-writes, no block) and
     caches them, so the later bind finds the entry cached and never issues the blocking pooled re-fetch.
     Since that cached entry reflects the uncommitted schema, **`RollbackTransaction` calls
-    `ArrowNetCatalog::InvalidateAllEntries()`** (drops materialized entries, keeps name lists for lazy
+    `FabricatorCatalog::InvalidateAllEntries()`** (drops materialized entries, keeps name lists for lazy
     re-fetch) so a rolled-back ALTER leaves no stale schema (verified). Same family as the post-hook
     join-only fix — keep in-transaction work on the transaction's own connection.
-- **Functions**: `mssql_net_query` (raw scan), `mssql_net_exec` (raw exec) — both accept a connstr, a
-  secret name, OR an attached-catalog name; `mssql_refresh_cache`/`mssql_invalidate_cache` (+ `_net_`
-  aliases, arities 1/2/3); `mssql_version()`; `arrownet_managed_dir()` / `arrownet_test_scan()` /
-  `mssql_server_info(catalog)` (diag — the latter surfaces the detected `ServerProfile`).
-- **Cache invalidation after DDL via `mssql_net_exec`**: DDL detection in C# (`SqlDdl.MayChangeSchema`),
+- **Functions**: `fabricator_query` (raw scan), `fabricator_exec` (raw exec) — both accept a connstr, a
+  secret name, OR an attached-catalog name; `fabricator_refresh_cache`/`fabricator_invalidate_cache` (+ `_net_`
+  aliases, arities 1/2/3); `fabricator_version()`; `fabricator_managed_dir()` / `fabricator_test_scan()` /
+  `fabricator_server_info(catalog)` (diag — the latter surfaces the detected `ServerProfile`).
+- **Cache invalidation after DDL via `fabricator_exec`**: DDL detection in C# (`SqlDdl.MayChangeSchema`),
   gated by `SET mssql_exec_invalidate_cache` (default false, Postgres-scanner parity).
 
 Compat suite: ~96/122 of the C++ mssql-extension tests pass (corpus regenerated from upstream via
@@ -1197,14 +1249,14 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
   distinct targets, `batch` = `[int64 slot, BLOB source]` — a target may repeat, e.g. the window segment-tree
   merges several nodes into one frame state; `out` = BLOB[G] merged) + `agg_finalize_spill(session, states,
   out)` (`states` = BLOB[N]; `out` = one result column). For a spillable aggregate the per-group state is
-  serialized into a fixed, pointer-free state blob (`[uint32 len][byte data[ARROWNET_AGG_SPILL_CAP]]`, cap =
+  serialized into a fixed, pointer-free state blob (`[uint32 len][byte data[FABRICATOR_AGG_SPILL_CAP]]`, cap =
   1 KB) so DuckDB's external GROUP BY spills it; state crosses as an Arrow BLOB column (NULL row = fresh).
 
 ### Callable scalar UDFs (4b)
-- **Discovery**: `ArrowNetCatalog::LoadCatalog`/`RefreshCache` call `DiscoverFunctions` (reads
-  `ARROWNET_META_FUNCTIONS`, first 3 string cols) and `AddScalarFunction(name)` for every `kind=='scalar'`
-  in a matched schema. Names cached in `ArrowNetSchemaEntry::scalar_functions_`; entries materialized lazily.
-- **Registration**: `ArrowNetSchemaEntry::LookupEntry`/`Scan` now handle `CatalogType::SCALAR_FUNCTION_ENTRY`
+- **Discovery**: `FabricatorCatalog::LoadCatalog`/`RefreshCache` call `DiscoverFunctions` (reads
+  `FABRICATOR_META_FUNCTIONS`, first 3 string cols) and `AddScalarFunction(name)` for every `kind=='scalar'`
+  in a matched schema. Names cached in `FabricatorSchemaEntry::scalar_functions_`; entries materialized lazily.
+- **Registration**: `FabricatorSchemaEntry::LookupEntry`/`Scan` now handle `CatalogType::SCALAR_FUNCTION_ENTRY`
   → `GetOrCreateScalarFunction` fetches the param + return schemas (`FetchFunctionParamSchema` /
   `FetchFunctionReturnType`), builds a `ScalarFunction` with a **capturing-lambda** callback (no bind/
   function_info dance — `scalar_function_t` is `std::function`), and caches a `ScalarFunctionCatalogEntry`.
@@ -1228,11 +1280,11 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
   `INFORMATION_SCHEMA.ROUTINE_COLUMNS`. **Deferred**: stored procs (need `sp_describe_first_result_set`/
   `EXEC`/named params/`_OUTPUT_`).
 - **Discovery + registration**: `LoadCatalog`/`RefreshCache` `AddTableFunction(name)` for every
-  `kind=='table'` in a matched schema (`table_functions_`). `ArrowNetSchemaEntry::LookupEntry`/`Scan` handle
+  `kind=='table'` in a matched schema (`table_functions_`). `FabricatorSchemaEntry::LookupEntry`/`Scan` handle
   `CatalogType::TABLE_FUNCTION_ENTRY` → `GetOrCreateTableFunction` builds a `TableFunctionCatalogEntry` and
   caches it (stale-on-fetch self-heals, like the table/scalar paths).
 - **Bind**: `table_function_bind_t` is a **raw fn pointer** (can't capture, unlike `scalar_function_t`), so
-  the identity rides an `ArrowNetTableFunctionInfo : TableFunctionInfo` on the `TableFunction`, read in the
+  the identity rides an `FabricatorTableFunctionInfo : TableFunctionInfo` on the `TableFunction`, read in the
   static bind via `input.info`. The bind (1) resolves the output schema via `get_function_output_schema`
   (zero-row → `PopulateReturnSchema`, so the TVF isn't executed just to bind), then (2) installs a capturing
   `StreamFactory` (which **is** `std::function`) that marshals the constant call args (`input.inputs`) into a
@@ -1240,8 +1292,8 @@ INSERT, CTAS and COPY stream record batches to the provider instead of buffering
   `ArrowStreamInitGlobal`/`Local`.
 - **Projection + filter pushdown (real, SQL-level)**: the TVF reuses the **catalog table scan's** pushdown
   machinery. `push_projection=true` on the bind_data + `projection_pushdown=true` + `pushdown_complex_filter
-  = ArrowNetComplexFilterPushdown` (extracted from `arrownet_table_entry.cpp` out of its anon namespace,
-  declared in `arrownet_table_entry.hpp`, shared by both scans). The scan factory forwards the request's
+  = FabricatorComplexFilterPushdown` (extracted from `fabricator_table_entry.cpp` out of its anon namespace,
+  declared in `fabricator_table_entry.hpp`, shared by both scans). The scan factory forwards the request's
   `spec_json`+`filter_values` to `execute_table`. So C# emits `SELECT <cols> FROM [s].[f](@a0,…) WHERE
   <filter>` — inline TVFs get inlined by SQL Server → genuine pushdown. Best-effort + never-erase (DuckDB
   re-applies every predicate), like the table scan.
@@ -1282,7 +1334,7 @@ v29 table-function session, and the v30 removal of the dead `execute_table`/`exe
   (resolve a per-plan binding → output schema/return types + `supports_pushdown` + an opaque handle) /
   `table_execute` (run the scan, per execution) / `table_close` (free the binding at plan teardown), the
   session-handle successor to `get_function_output_schema`+`execute_table`/`execute_proc` in the table scan.
-  C++ `ArrowNetTableFunctionBind` uses them; the `is_proc` **execute** branch is gone (`table_execute`
+  C++ `FabricatorTableFunctionBind` uses them; the `is_proc` **execute** branch is gone (`table_execute`
   unifies TVF/proc/custom — C# `SqlServerCatalog.TableBind` classifies + returns an `IBoundTable`:
   `TvfBoundTable` (SQL pushdown) or `BindingBoundTable` (proc positional / custom by-name)). `push_projection`
   = the binding's `supports_pushdown` (= `!is_proc`, behavior-preserving; `is_proc` survives only for the
@@ -1325,7 +1377,7 @@ v29 table-function session, and the v30 removal of the dead `execute_table`/`exe
   param omitted → SQL Server errors. (TVFs stay **positional** — `input.inputs`.)
 - **Unified with TVFs**: `table_functions_` is a `name -> is_proc` map; discovery routes `kind=='proc'`
   → `AddTableFunction(name, true)`. Procs reuse the **same** `TableFunctionCatalogEntry` registration +
-  static bind via an `is_proc` flag on `ArrowNetTableFunctionInfo`. Proc branch: factory calls
+  static bind via an `is_proc` flag on `FabricatorTableFunctionInfo`. Proc branch: factory calls
   `execute_proc` (not `execute_table`), `push_projection=false`, and **no** `pushdown_complex_filter` — a
   proc's `EXEC` isn't inline-wrappable, so DuckDB projects + filters locally.
 - **Output schema** (`SqlServerCatalog.GetFunctionOutputSchema`): TVFs use `INFORMATION_SCHEMA.ROUTINE_COLUMNS`;
@@ -1389,12 +1441,12 @@ v29 table-function session, and the v30 removal of the dead `execute_table`/`exe
   output = the echoed input columns (typed as `tf`'s **parameters** — C# CASTs the VALUES to them) ++
   `tf`'s output columns. Read-only (a TVF can't modify data). The input table's columns map **positionally**
   to `tf`'s params.
-- **Registration** (`arrownet_schema_entry.cpp`): `AddTableFunction(name,false)` also registers
+- **Registration** (`fabricator_schema_entry.cpp`): `AddTableFunction(name,false)` also registers
   `inout_functions_["<name>_each"] = name`; `GetOrCreateTableFunction` resolves the alias via
   `GetOrCreateInOutFunction` → a single `{LogicalType::TABLE}` `TableFunction` (`in_out_function` only,
   `function_info.func` = the **base** TVF). A real same-named `_each` function wins (matched first). `Scan`
   lists the aliases so they're discoverable.
-- **Operator** (all in the anon namespace of `arrownet_schema_entry.cpp`): `ArrowNetInOutBind` (output
+- **Operator** (all in the anon namespace of `fabricator_schema_entry.cpp`): `FabricatorInOutBind` (output
   schema, no execution) / `…InitGlobal` (`ToArrowSchema` + `inout_open` into the holder) / `…InitLocal`
   (trivial) / `…Function` (`inout_push` → the chunk's **full** output, drained across `HAVE_MORE_OUTPUT`,
   then `NEED_MORE_INPUT`). **Synchronous per chunk → no tail → no `in_out_function_final`, no counter.**
@@ -1409,7 +1461,7 @@ v29 table-function session, and the v30 removal of the dead `execute_table`/`exe
 - **Isolation / consistent view**: the in-out session opens ONE SQL transaction (ADO.NET `SqlTransaction`,
   MARS-compatible) wrapping all its per-chunk CROSS APPLY queries, at a configurable isolation level — so a
   call sees one consistent snapshot even if another process modifies the data between chunks. Level from the
-  ATTACH `isolation_level` option (per-catalog default, `ArrowNetCatalog::isolation_level_`) overridable by
+  ATTACH `isolation_level` option (per-catalog default, `FabricatorCatalog::isolation_level_`) overridable by
   `SET mssql_isolation_level` (resolved in C++ `ResolveInOutIsolation`, passed via `inout_open`'s v24
   `isolation` arg). `SqlServerCatalog.BeginInOutScope` maps it (`read uncommitted`/`read committed`/
   `repeatable read`/`serializable`/`snapshot`; snapshot needs `ALLOW_SNAPSHOT_ISOLATION ON`); `Finish`
@@ -1430,7 +1482,7 @@ v29 table-function session, and the v30 removal of the dead `execute_table`/`exe
   invoked serially per session) and declares its **full** output (no input echo). There is no emit-at-end
   hook (a whole-table aggregate is a pipeline breaker, not a streaming in-out). Surfaced via
   `FunctionsMetadataSql` as `kind='inout'`; C++ `AddInOutFunction` registers a bare-name `{TABLE}` entry
-  (`GetOrCreateCustomInOutFunction` + `ArrowNetCustomInOutBind`, reusing the 4g operator callbacks — no new
+  (`GetOrCreateCustomInOutFunction` + `FabricatorCustomInOutBind`, reusing the 4g operator callbacks — no new
   ABI). C# `CustomInOut` is a **factory** registry (fresh
   instance per session so state can't leak across queries); `InOutOpen` dispatches to `CustomInOutSessionImpl`
   (runs `Process` per push) ahead of the CROSS APPLY path. Demos `CustomFunctions.InOut`: `dbo.cf_tag`
@@ -1446,9 +1498,9 @@ v29 table-function session, and the v30 removal of the dead `execute_table`/`exe
   back with **DuckDB's** transaction (autocommit + explicit `BEGIN`); the gate (`MaxThreads=1`) serializes the
   EXECs on the pinned connection. (Was the 4g push `ProcInOutSessionImpl`, retired in `9056eae`.) Verified:
   `test/verify_proc_inout.test`.
-- **OperatorFinalize cleanup signal (4g-finalize)**: an `OptimizerExtension` (`RegisterArrowNetInOutFinalizer`,
+- **OperatorFinalize cleanup signal (4g-finalize)**: an `OptimizerExtension` (`RegisterFabricatorInOutFinalizer`,
   registered at load) wraps each in-out `LogicalGet` (identified by `function.in_out_function ==
-  ArrowNetInOutFunction`, RTTI-free) in a pass-through `LogicalExtensionOperator`; its `PhysicalOperator`
+  FabricatorInOutFunction`, RTTI-free) in a pass-through `LogicalExtensionOperator`; its `PhysicalOperator`
   (`PhysicalOperatorType::EXTENSION`) forwards rows 1:1 (`Execute = chunk.Reference(input)`) and, in
   `OperatorFinalize`, calls `holder->Finish()` → C# `inout_finish`. Fires **once**, sink-level, even above a
   parallel UNION (unlike per-branch `in_out_function_final`) — a reliable C# resource-cleanup hook + the clean
@@ -1468,7 +1520,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   (`SqlServerProcEach` — per-row `EXEC` on **DuckDB's pinned write** connection (`BeginWrite`), no commit/
   dispose, so the proc's writes commit/roll back with DuckDB's COMMIT/ROLLBACK). The gate (`MaxThreads=1`)
   serializes the proc EXECs on the pinned connection; the transactional contract (autocommit / explicit-BEGIN
-  read-your-writes + ROLLBACK) holds — verified by `verify_proc_inout`. The 4g push operator (`ArrowNetInOut*`)
+  read-your-writes + ROLLBACK) holds — verified by `verify_proc_inout`. The 4g push operator (`FabricatorInOut*`)
   + the `inout_open`/`push`/`finish`/`abort` ABI + `IInOutSession`/`InOutOpen` were **removed at ABI v31**
   (`49e6d94`); the exchange is the only in-out path.
 - **Author API** (`IArrowInOutBinding`, Bridge): `Schema OutputSchema` + `IAsyncEnumerable<RecordBatch>
@@ -1498,14 +1550,14 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   (`SqlServerTvfEach.cs`) runs the per-row CROSS APPLY inside `DoExchange` on one pinned connection +
   transaction (the streaming successor to the deleted `InOutSessionImpl`). `InOutExchange.EmptyBatch` builds
   the length-0 sentinel matching the output schema.
-- **C++ operator** (`arrownet_schema_entry.cpp`, anon ns): `ArrowNetExchange{Bind,InitGlobal,InitLocal,Function}`
-  + `ArrowNetExchangeGlobalState` (the gate `std::mutex`, the single input `slot`, `input_eof`, the output
+- **C++ operator** (`fabricator_schema_entry.cpp`, anon ns): `FabricatorExchange{Bind,InitGlobal,InitLocal,Function}`
+  + `FabricatorExchangeGlobalState` (the gate `std::mutex`, the single input `slot`, `input_eof`, the output
   reader, `MaxThreads()=1`) + a host-side input stream whose get_next hands the gate-holder's slot to C#.
   `Execute` holds the gate across the chunk's HAVE_MORE_OUTPUT cycle (ownership in the per-thread local state),
   releases it on the sentinel/EOF **or on a thrown managed error** (RAII-style — never leaks). `ArrowStreamReader`
   gained **sentinel-aware** `Pull()`/`HasPending()`/`Drain()` (its `Read()` skips empty batches, so the sentinel
   needs explicit length inspection + <=STANDARD_VECTOR_SIZE slicing). **EOF is the injected `OperatorFinalize`**
-  (`ArrowNetExchangeFinalizePhysical`, parallel to the 4g one): once, sink-level, after all branches it sets
+  (`FabricatorExchangeFinalizePhysical`, parallel to the 4g one): once, sink-level, after all branches it sets
   `input_eof` + drains the output to terminal-null so the managed `DoExchange` finishes + disposes — NOT a
   producer counter (the rejected premature-finish design). `ExchangeHolder` (refcounted on the bind data) frees
   the binding once. Registration: custom in-out (`GetOrCreateCustomInOutFunction`) + **every** `_each`
@@ -1532,10 +1584,10 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   re-executions, so correctness needs no destructor. (State-in-C# was the user's call: matches the existing
   handle-based architecture, no per-call (de)serialization; the trade-off is that the managed map isn't visible
   to DuckDB's memory manager → no disk-spill for billions of distinct keys.)
-- **Session**: opened in the aggregate `bind` (a `FunctionData` = `ArrowNetAggregateBindData` holding a
+- **Session**: opened in the aggregate `bind` (a `FunctionData` = `FabricatorAggregateBindData` holding a
   refcounted `AggSessionHolder`; its destructor calls `agg_close`). `bind` runs once per bound plan; update/
   combine/finalize/destructor reach the session via `AggregateInputData.bind_data`. Identity (handle/schema/
-  func) + the counter ride on `ArrowNetAggregateFunctionInfo : AggregateFunctionInfo` (reachable from
+  func) + the counter ride on `FabricatorAggregateFunctionInfo : AggregateFunctionInfo` (reachable from
   `initialize` via `function.function_info`, which has no `bind_data`).
 - **Two correctness rules from the DuckDB source** (both verified): (1) **read state pointers via
   `UnifiedVectorFormat`, never `FlatVector::GetData<data_ptr_t>`** — the ungrouped path passes a **CONSTANT**
@@ -1550,9 +1602,9 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   row** — strictly worse for a marshaled bridge — so we deliberately don't implement it. The window paths churn
   many transient states, so the **destructor IS wired** (`agg_destroy`) to bound the C# map; `agg_close` is the
   backstop.
-- **C++** (`arrownet_schema_entry.cpp`, anon ns): `ArrowNetAggregate{StateSize,Init,Bind,Update,SimpleUpdate,
+- **C++** (`fabricator_schema_entry.cpp`, anon ns): `FabricatorAggregate{StateSize,Init,Bind,Update,SimpleUpdate,
   Combine,Finalize,Destroy}` static callbacks marshal `[id ++ inputs]` / `[target_id, source_id]` / `[id]`
-  Arrow batches (`ArrowAppender` + `arrownet::Agg*`); finalize ingests the single result column via
+  Arrow batches (`ArrowAppender` + `fabricator::Agg*`); finalize ingests the single result column via
   `ArrowStreamReader` + `VectorOperations::Copy`. The aggregate callbacks get **no `ClientContext`** (unlike
   scalar/table execution), so the connection context + client properties are captured at `bind`.
   `GetOrCreateAggregateFunction` mirrors `GetOrCreateScalarFunction` → an `AggregateFunctionCatalogEntry`
@@ -1563,7 +1615,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
 - **Opt-in disk-spill (`SupportsSpill`, ABI v26)**: by default the state lives in C# (fast, bounded by managed
   memory, no spill). A provider can instead set `IArrowAggregateFunction.SupportsSpill=true` (+ implement
   `IArrowAggregateState.Serialize()`/`Load()`) → **bytes-in-blob mode**: the per-group state is serialized into
-  DuckDB's fixed, pointer-free state blob (`[uint32 len][byte data[ARROWNET_AGG_SPILL_CAP=1 KB]]`) so DuckDB's
+  DuckDB's fixed, pointer-free state blob (`[uint32 len][byte data[FABRICATOR_AGG_SPILL_CAP=1 KB]]`) so DuckDB's
   external GROUP BY spills it to disk under memory pressure. Surfaced as `kind='aggregate_spill'`; `state_size`/
   `initialize` (sentinel len, no C# call) and update/combine/finalize/destroy all branch on the `spillable`
   flag (on `function_info` for the first two, `bind_data` for the rest). The spill callbacks marshal state as
@@ -1598,14 +1650,14 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   distinct — parallel *fetch* (form A: C# runs N range queries concurrently + `ParallelMerge` → the existing
   single-stream scan, no ABI) vs parallel DuckDB *pipeline/core usage* (form B: N streams → N scan threads via
   a parallel multi-stream scan = the native form of the proven `UNION ALL` core-saturation trick; bigger). On
-  `arrownet_query` the two surface as optional NAMED params (the `daxeval` pattern); a custom
+  `fabricator_query` the two surface as optional NAMED params (the `daxeval` pattern); a custom
   `IArrowTableFunction` could return `IAsyncEnumerable<IAsyncEnumerable<RecordBatch>>` (outer = partitions).
 - **Open design items (filters + refresh)** — deliberated, not yet built:
   - A **`function_filter`** ATTACH option (icase regex on the function name), symmetric with `table_filter`,
     to gate which UDFs/TVFs register when a catalog has many. Today functions are schema-filtered only.
-  - **Targeted/scoped refresh.** `mssql_refresh_cache` is arity-1 (whole catalog); `mssql_invalidate_cache
+  - **Targeted/scoped refresh.** `fabricator_refresh_cache` is arity-1 (whole catalog); `fabricator_invalidate_cache
     (catalog[,schema[,table]])` accepts the schema/table args for native-extension compat but **ignores
-    them** (always a full refresh — a valid superset). The `mssql_net_exec` auto-refresh (gated by
+    them** (always a full refresh — a valid superset). The `fabricator_exec` auto-refresh (gated by
     `mssql_exec_invalidate_cache`) is likewise a **full** `RefreshCache`: the C# DDL detector returns only a
     bool `schema_may_change` (no object/schema name crosses the ABI), so there's nothing to scope to — and
     it deliberately doesn't parse the statement. Idea: rename the `table` arg to a generic **object name** +
@@ -1617,18 +1669,18 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
     (mark stale + evict, reload on next access) vs our *eager* `RefreshCache` re-discovery — so scoping the
     exec path would exceed native parity, and a lazy mark-stale would be cheaper here too.
 
-## C ABI contract (`src/include/arrownet/abi.h`)
+## C ABI contract (`src/include/fabricator/abi.h`)
 
-- The managed `Bootstrap.Initialize` fills an `ArrowNetVTable` of C function pointers; tabular results
+- The managed `Bootstrap.Initialize` fills an `FabricatorVTable` of C function pointers; tabular results
   flow through caller-allocated `ArrowArrayStream`; errors = status code + owned UTF-8 string freed via
   `free_error`. C# error messages prepend the provider error number when available (`FormatError`
   duck-types an `int Number` property → e.g. `"2627: …"`; provider-agnostic, no SqlClient ref in Bridge).
 - **`COPY … TO '<path>/<table>' (FORMAT delta, …)` — path-targeted Delta write, NO ATTACH (2026-07-10,
-  C++-only, no ABI).** A third registered copy function (`"delta"` beside `mssql_net`/`bcp`; the official
+  C++-only, no ABI).** A third registered copy function (`"delta"` beside `fabricator`/`bcp`; the official
   duckdb-delta extension registers NO copy function — its only write surface is INSERT into an attached
   table — so the name is free and the capability is ours alone): the target is a raw path (local / `s3://` /
   `onelake://` / abfss), split into `<root>/<table>`; the bind opens NOTHING — `CopyToInitGlobal` opens a
-  **transient per-execution engineered-wood catalog** (`arrownet::OpenCatalog(root, "delta", options_json)`,
+  **transient per-execution engineered-wood catalog** (`fabricator::OpenCatalog(root, "delta", options_json)`,
   flat layout, owned by the copy global state) and streams through the EXACT catalog-COPY bulk machinery, so
   the write disposition is the **`MODE` option — the Spark/delta-rs save-mode vocabulary**: `'overwrite'`
   (the default when no options given — create or fully replace, COPY-to-file intuition) | `'append'`
@@ -1662,7 +1714,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   catalog's options JSON (`copy_disposition` — sound because that catalog serves exactly one COPY;
   `DeltaCatalog.BulkInsert` probes `TableExists`; the ignore no-op returns without consuming the stream —
   BulkSession's finally drains). The legacy **`CREATE_TABLE`/`REPLACE`/`PARTITION_OVERWRITE` flags** (shared
-  with `FORMAT mssql_net`) still work but CANNOT be mixed with `MODE`; `SCHEMA_MODE 'merge'|'overwrite'`
+  with `FORMAT mssql`) still work but CANNOT be mixed with `MODE`; `SCHEMA_MODE 'merge'|'overwrite'`
   composes with either spelling, plus **`PARTITION_COLUMNS 'a,b'`** (create-time Hive
   partitioning — deliberately NOT the generic `PARTITION_BY`, which DuckDB's planner intercepts for
   file-based copies) and **provider-option passthrough** (`NATIVE_WRITE` — defaults TRUE here, bounded-memory
@@ -1671,13 +1723,13 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `IN_COMMIT_TIMESTAMPS`/`COMPRESSION`/`ROW_GROUP_SIZE`/`BLOOM_FILTER_COLUMNS`). **The transaction crux:** the
   provider PARKS plain appends per (txn, table) and flushes at `commit_transaction` — a transient handle has
   no TransactionManager, so the COPY drives it itself: finalize does `SetActiveTxn(handle, txn_id)` +
-  `arrownet::CommitTransaction(handle)` (no-op for create/replace, flushes the parked append as ONE commit) +
+  `fabricator::CommitTransaction(handle)` (no-op for create/replace, flushes the parked append as ONE commit) +
   `CloseCatalog`; the gstate destructor is the failure backstop (`RollbackTransaction` — discard-only, no
   opener needed — then close). ⇒ the COPY is its own atomic Delta commit and deliberately does NOT roll back
   with a surrounding DuckDB BEGIN (file-COPY semantics; the transient catalog's buffer is invisible to the
   user txn). Verified: `test/verify_delta_copy_format.test` (41 — create/overwrite/append-flush/replace/
   partitioned + dynamic partition overwrite/schema merge+overwrite/protocol-shape pins/ATTACH-reads-it-back/
-  path validation), S3 section in `verify_delta_catalog_s3.test` (131 — COPY to `s3://arrownet/copyfmt` incl.
+  path validation), S3 section in `verify_delta_catalog_s3.test` (131 — COPY to `s3://fabricator/copyfmt` incl.
   partition overwrite + re-ATTACH), catalog-COPY suites unregressed (partition_overwrite 90 / overwrite_merge
   47 / native_write_streaming 29), **live OneLake** (`COPY … TO 'onelake://Test/LH.Lakehouse/Tables/dbo/…'
   (FORMAT delta)` → native streamed v1 + exact readback; an `onelake://` root doesn't match the
@@ -1701,7 +1753,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   outs: when the managed open DOES fetch properties (bare open, `known_size<0`) it returns the file's
   ETag + LastModified alongside the size (the SAME response — zero extra IO); a known-size open leaves
   them untouched and the host takes them from the listing's `extended_info` (v62 already carried
-  `etag`/`last_modified` there). Both land on `ArrowNetOneLakeFileHandle`, and the FS now overrides
+  `etag`/`last_modified` there). Both land on `FabricatorOneLakeFileHandle`, and the FS now overrides
   **`GetVersionTag`** (returns the etag) + `GetLastModifiedTime` (the real mtime; 0 when unknown).
   Why this matters: `onelake://` is NOT in DuckDB's hardcoded `EXTENSION_FILE_PREFIXES` remote list →
   `IsRemoteFile()=false`, but the cache-validation default is **`validate_external_file_cache =
@@ -1715,7 +1767,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `onelake_open` gained an `int64 known_size` arg (−1 = fetch) — the managed open SKIPS its per-file
   GetProperties round trip when the size is already known. Sources of "known": the OneLake DataLake
   listing now emits `size` + `last_modified` + `etag` in the glob JSON (all FREE fields of GetPaths), the
-  C++ `ArrowNetOneLakeFileSystem::Glob` surfaces them as `OpenFileInfo.extended_info` under the SAME keys
+  C++ `FabricatorOneLakeFileSystem::Glob` surfaces them as `OpenFileInfo.extended_info` under the SAME keys
   httpfs fills (`file_size`/`last_modified`/`etag`), and the FS now opts into DuckDB's
   **`SupportsOpenFileExtended`/`OpenFileExtended`** so glob-fed opens (read_parquet globs, file lists)
   carry the info through — the exact mechanism httpfs uses to skip its HEAD request. Same pass, NO-bump
@@ -1729,22 +1781,22 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `If-None-Match:*` — the C++ onelake FS now honors `EXCLUSIVE_CREATE` instead of silently ignoring it) and
   one appended entry `onelake_remove(path, cred_json)` (`DataLakeFileClient.DeleteIfExists`, idempotent) backs
   `RemoveFile` — engineered-wood's commit rename is emulated as exclusive-create-copy + DELETE-SOURCE, so both
-  were needed before **`arrownet_delta_write(<input>, path := 'onelake://…')` works** (previously abfss:// only;
+  were needed before **`fabricator_delta_write(<input>, path := 'onelake://…')` works** (previously abfss:// only;
   live-validated, v3 Overwrite commit + exact readback). Same pass, C++-only: `CreateDirRecursive`
-  (arrownet_fs_spike.cpp) got a **scheme-authority recursion FLOOR** — the old guard only matched a literal
+  (fabricator_fs_spike.cpp) got a **scheme-authority recursion FLOOR** — the old guard only matched a literal
   trailing `scheme://`, and since the onelake FS reports `DirectoryExists=false` always (implicit ADLS dirs),
   the recursion walked past `onelake://Test` to `onelake:` which fell through to the LOCAL filesystem
   ("Failed to create directory \"onelake:\""); abfss:// never hit it because duckdb-azure answers the
   ancestor-exists probe. `MoveFile` on the onelake FS still throws (RENAME TABLE keeps the DFS-SDK route).)
 - **Prior: v60** (v60 = `begin_transaction` gained an `int32 is_explicit` arg — 1 for a user
   `BEGIN..COMMIT`, 0 for the implicit per-statement autocommit wrapper (C++ reads
-  `context.transaction.IsAutoCommit()` in `ArrowNetTransactionManager::StartTransaction`). Drives the Delta
+  `context.transaction.IsAutoCommit()` in `FabricatorTransactionManager::StartTransaction`). Drives the Delta
   provider's **buffered transactional DML** (slice 2 — see the explicit-transactions bullet): DELETE/UPDATE
   buffer ONLY in explicit transactions; autocommit keeps the direct per-statement paths (CDF capture,
   copy-on-write) byte-identical. Other providers ignore the flag.)
 - **Prior: v59** (v59 = `begin_bulk` gained an `int32 partition_overwrite` arg — the
   **`PARTITION_OVERWRITE` COPY option**: DYNAMIC partition overwrite (Spark `partitionOverwriteMode=dynamic`) —
-  `COPY src TO 'cat.sch.t' (FORMAT mssql_net, CREATE_TABLE false, PARTITION_OVERWRITE true)` atomically replaces
+  `COPY src TO 'cat.sch.t' (FORMAT mssql, CREATE_TABLE false, PARTITION_OVERWRITE true)` atomically replaces
   exactly the partitions PRESENT IN THE INPUT in ONE Delta commit (their active files removed + the new files
   added — a log-level swap, no physical delete, so time travel keeps working; unlike DuckDB COPY's local-only
   physical OVERWRITE flag); untouched partitions are unaffected. The SQL-friendly successor to the
@@ -1767,23 +1819,23 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   deletes (now excluded via `DeletionVectorFilter`; they were reported when the DV committed).
   `test/verify_delta_catalog_partition_overwrite.test` (85 — collect + streaming, one-commit swap, time travel,
   CDF feed incl. the DV edge, guardrails).)
-- **Prior: v58** (v58 = additive `host_log` on `ArrowNetHostServices` — forward managed ILogger events into DuckDB internal logging; wired + lockstep-verified + **`duckdb_logs` surfacing CONFIRMED LIVE**: `CALL enable_logging(storage='memory')` then `SELECT * FROM duckdb_logs WHERE type LIKE 'ArrowNet%'` shows the events with the ILogger category as `type` [`ArrowNet.Delta`/`.Native`] + mapped `log_level`. The earlier 0-rows was two red herrings, not a code bug: the enable form is `CALL enable_logging(...)` not `PRAGMA`, and the **shell** defaults log storage to a console-printing sink [`storage='memory'` is the `unittest`/API default]. `WriteLog` bypasses `ShouldLog` + the client flushes the log buffer per query, so no instance-vs-connection-logger issue. The `ARROWNET_LOG_LEVEL`+`ARROWNET_LOG_FILE` file sink is the always-on independent trace).
+- **Prior: v58** (v58 = additive `host_log` on `FabricatorHostServices` — forward managed ILogger events into DuckDB internal logging; wired + lockstep-verified + **`duckdb_logs` surfacing CONFIRMED LIVE**: `CALL enable_logging(storage='memory')` then `SELECT * FROM duckdb_logs WHERE type LIKE 'Fabricator%'` shows the events with the ILogger category as `type` [`Fabricator.Delta`/`.Native`] + mapped `log_level`. The earlier 0-rows was two red herrings, not a code bug: the enable form is `CALL enable_logging(...)` not `PRAGMA`, and the **shell** defaults log storage to a console-printing sink [`storage='memory'` is the `unittest`/API default]. `WriteLog` bypasses `ShouldLog` + the client flushes the log buffer per query, so no instance-vs-connection-logger issue. The `FABRICATOR_LOG_LEVEL`+`FABRICATOR_LOG_FILE` file sink is the always-on independent trace).
 - **Prior: v57** (v57 = **`delta_list_files`** — one appended vtable entry for the native-read
-  MultiFileReader path (docs/multifile-delta.md Phase A slice 1a): `arrownet_delta_mfr_scan(path)` clones
-  `parquet_scan` + swaps in `ArrowNetDeltaMultiFileReader` (`src/arrownet/arrownet_delta_mfr.cpp`), whose
+  MultiFileReader path (docs/multifile-delta.md Phase A slice 1a): `fabricator_delta_mfr_scan(path)` clones
+  `parquet_scan` + swaps in `FabricatorDeltaMultiFileReader` (`src/fabricator/fabricator_delta_mfr.cpp`), whose
   `CreateFileList` calls `delta_list_files(path, push_json)` → C# `DeltaReader.ListScanFilesJson` (engineered-wood's
   EXACT active `add` files as JSON `[{"path":<uri>}]`, onelake:// for OneLake) → a `SimpleMultiFileList`; DuckDB's
   **native parquet MultiFileReader** reads them (cached). The C++ MultiFileReader foundation for DV / partition /
   dynamic-filter pushdown (later slices 1b–1e); `parquet` statically linked (extension_config.cmake). Live/local:
   `test/verify_delta_mfr_scan.test` (36, matches the C# reader). **Slice 1b DONE (deletion vectors, no ABI bump):**
   `delta_list_files` emits per file the deleted row positions (`"dv":[…]`, via engineered-wood's
-  `DeletionVectorReader`); C++ gained a custom `ArrowNetDeltaMultiFileList` (per-file DV) + `InitializeGlobalState`
-  override + `FinalizeBind` attaching an `ArrowNetDeltaDeleteFilter` → DuckDB's native read EXCLUDES deleted rows
+  `DeletionVectorReader`); C++ gained a custom `FabricatorDeltaMultiFileList` (per-file DV) + `InitializeGlobalState`
+  override + `FinalizeBind` attaching an `FabricatorDeltaDeleteFilter` → DuckDB's native read EXCLUDES deleted rows
   (`test/verify_delta_mfr_dv.test`, 23). Gotchas: the DeleteFilter must `result_sel.Initialize(STANDARD_VECTOR_SIZE)`
   before writing (reader passes a null sel_vector → else segfault); **bare `count(*)` over-counts on a DV table**
   (empty-projection parquet-metadata count path skips the DeleteFilter — use a column scan; follow-up can disable
   it). **1c (partition) + 1d (filter pushdown) LARGELY ALREADY WORK via the inherited parquet_scan (verified):**
-  `arrownet_delta_mfr_scan` clones parquet_scan → inherits **filter pushdown** (EXPLAIN shows `Filters:` INSIDE the
+  `fabricator_delta_mfr_scan` clones parquet_scan → inherits **filter pushdown** (EXPLAIN shows `Filters:` INSIDE the
   scan → static + dynamic filters prune row-groups natively, no custom Complex/DynamicFilterPushdown) + **hive
   partitioning** (engineered-wood's `<col>=<value>/` layout → `region` resolves from the path; verified on a
   PARTITIONED BY table). So 1a+1b + inherited features = a nearly complete native read (reader + projection +
@@ -1834,9 +1886,9 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   (docs/multifile-delta.md §"Concrete plan"): grow the `native_read` branch into a per-file loop
   (prefetch/bounded-channel ≈ threads) with `file_row_number` rowid/DML + DV + projection + static filter + log
   file-pruning (slice 1, C#-only), optional live-filter host-callback for dynamic pruning (slice 2), multi-lane
-  parallelism (slice 3). Build the C++ `arrownet_delta_mfr_scan` MFR (slices 1a/1b done, standalone) only if
+  parallelism (slice 3). Build the C++ `fabricator_delta_mfr_scan` MFR (slices 1a/1b done, standalone) only if
   CPU-bound-local multi-lane becomes a goal. **Slice 1 DONE (2026-07-03, C#-only, no ABI):** `DeltaNativeReader`
-  is a **per-file loop** (`ARROWNET_DELTA_PREFETCH`, default 1 = sequential, >1 = concurrent file fetch) emitting
+  is a **per-file loop** (`FABRICATOR_DELTA_PREFETCH`, default 1 = sequential, >1 = concurrent file fetch) emitting
   per file `SELECT <proj>[, ((ord::BIGINT<<40)|file_row_number) AS "_metadata.row_id"] FROM read_parquet(<file>,
   file_row_number => true) [WHERE <static> [AND file_row_number NOT IN (dv)]]` via `Host.Query` — so plain SELECT,
   **DELETE/UPDATE (native rowid via file_row_number, no C#-reader fallback)**, DV exclusion, projection, static
@@ -1846,8 +1898,8 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   captures one UTC instant per DuckDB transaction (`AmbientTransaction`, keyed on the txn id — fires per statement
   in autocommit, once per explicit `BEGIN`) → resolves+pins the version per (txn,table) via
   `DeltaReader.ResolveVersionAsOf` (commitInfo.timestamp; falls back to latest), so a multi-table join reads a
-  consistent cut. **Logging DONE (ILogger, C#-only):** `ArrowNetLog` (off by default; `ARROWNET_LOG_LEVEL` +
-  `ARROWNET_LOG_FILE` → file sink; factory pluggable for a future DuckDB-forwarding provider) traces the resolved
+  consistent cut. **Logging DONE (ILogger, C#-only):** `FabricatorLog` (off by default; `FABRICATOR_LOG_LEVEL` +
+  `FABRICATOR_LOG_FILE` → file sink; factory pluggable for a future DuckDB-forwarding provider) traces the resolved
   snapshot version, file list (active/scanned/pruned), and each per-file `read_parquet` SQL. Verified:
   `test/verify_delta_catalog_native_read.test` (66); Delta write/delete/update/decimal/time_travel/changes
   unregressed. **Slice 2 DONE (dynamic/join filter pushdown, C++/C#, NO ABI — the predicted per-file host
@@ -1971,9 +2023,9 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `COALESCE(materialized __delta_row_id column, baseRowId + file_row_number)` /
   `COALESCE(materialized version, defaultRowCommitVersion)` — distinct from the transient `rowid` (a
   locator), these are the durable identity. Mechanism = **generic provider virtual columns**:
-  `ARROWNET_META_VIRTUAL_COLUMNS = 12` (arg1/2 = schema/table → (name, type-text) rows; best-effort
+  `FABRICATOR_META_VIRTUAL_COLUMNS = 12` (arg1/2 = schema/table → (name, type-text) rows; best-effort
   try/catch fetch in `GetOrCreateEntry`; every other provider returns empty) → the entry registers them in
-  `GetVirtualColumns()` at `arrownet::ProviderVirtualBase()` (= `VIRTUAL_COLUMN_START + 0x100`; DuckDB's
+  `GetVirtualColumns()` at `fabricator::ProviderVirtualBase()` (= `VIRTUAL_COLUMN_START + 0x100`; DuckDB's
   `TableBinding` maps virtual names for bare-name binding, and a REAL same-named column shadows the
   virtual) → `ArrowStreamBindData.provider_virtual_columns` → `BuildScanSpec` fetches by name,
   `BuildProjectionMapping` resolves 1:1 by name, and both live-filter serializers resolve virtual-id
@@ -2024,7 +2076,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   between FILTER and DELETE, so the child chunk ends with the BOOLEAN mark (crash
   `Vector::Reference … BIGINT referenced BOOLEAN`; a same-width plan could have deleted wrong rows).
   Fix mirrors upstream `DuckCatalog::PlanDelete`: the rowid position comes from
-  `LogicalDelete::expressions[0]` (the bound row-identifier ref) → `ArrowNetModifyTarget.
+  `LogicalDelete::expressions[0]` (the bound row-identifier ref) → `FabricatorModifyTarget.
   rowid_child_index`; UPDATE keeps the last-column contract (its binder-built projection guarantees it,
   as upstream PhysicalUpdate assumes). `verify_delta_row_tracking_virtual.test` now 299 (fast-path
   sections: point/IN/range + version filters with duckdb_logs skip pins + the `file_row_number` rewrite
@@ -2104,8 +2156,8 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   transactions 934 + EW 168 & 147 green.
   **FABRIC LIVE VALIDATION — FULL PASS (2026-07-13, workspace Test / LH; + ONE REAL EW FIX).** The whole
   2026-07-13 row-tracking/merge-on-read block validated on all three surfaces. Our provider created on
-  OneLake: `lake.dbo.arrownet_rtdef` (pure defaults → mapped + DV + materialized row tracking, MoR UPDATE),
-  `arrownet_rtpart` (partitioned MoR + partition-key SET US→APAC), `arrownet_rtcdf` (CDF MoR). **Spark
+  OneLake: `lake.dbo.fabricator_rtdef` (pure defaults → mapped + DV + materialized row tracking, MoR UPDATE),
+  `fabricator_rtpart` (partitioned MoR + partition-key SET US→APAC), `fabricator_rtcdf` (CDF MoR). **Spark
   (Livy, sparkprobe `rtmatrix`)**: reads every table with EXACT `_metadata.row_id`/`_metadata.
   row_commit_version` (id 2 preserved/ver 2; the APAC-moved row keeps id 4; mapped PARTITIONED partition
   column reads fine — Spark, unlike kernel), `table_changes` shows exactly pre+post for the MoR commit,
@@ -2201,8 +2253,8 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   Delta schema). So the full SQL-Server-facing lifecycle is: CoW DML + identity + CDF + row tracking all
   OK; only DV (reader v3) and column mapping are hard rejections. `verify_mssql_s3_polybase` §5c (129).
   **Slice-4 LIVE VALIDATION — FULL PASS (2026-07-13, workspace Test / LH):** our provider created on
-  OneLake `lakecdf.dbo.arrownet_rtcdfp` (partitioned CDF + row tracking: MoR UPDATE, partition-key SET
-  US→APAC, DV DELETE) and `lake.dbo.arrownet_bigdv` (20k rows, scattered DELETE → the new SPEC-SHAPED
+  OneLake `lakecdf.dbo.fabricator_rtcdfp` (partitioned CDF + row tracking: MoR UPDATE, partition-key SET
+  US→APAC, DV DELETE) and `lake.dbo.fabricator_bigdv` (20k rows, scattered DELETE → the new SPEC-SHAPED
   ON-DISK DV over OneLake). **Spark** (sparkprobe `dvcdfp`): reads the on-disk DV exactly (13333/1/19999,
   zero deleted ids) and `table_changes` returns the partitioned MoR feed byte-identical to ours (per-
   partition cdc incl. the EU→APAC pre/post pair + the delete; `_metadata.row_id` preserved). **SQL
@@ -2236,7 +2288,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   "logical", …, file_row_number FROM read_parquet(…))` so the OUTER projection, user filter (incl. filters on a
   mapped/renamed column), rowid, and DV condition all reference logical names unchanged — no filter rewrite, and
   DuckDB pushes the outer filter down into `read_parquet` (mapped to the physical column) for row-group pruning.
-  Validated LIVE on Fabric Spark-created tables (`arrownet_cm_name` name mode + `arrownet_cm_id` id mode, each with
+  Validated LIVE on Fabric Spark-created tables (`fabricator_cm_name` name mode + `fabricator_cm_id` id mode, each with
   a post-create column RENAME so logical≠physical): both read correctly via `native_read`, incl. filter on the
   mapped column + aggregation. The default (EW) reader already handled both modes (`RenameColumns` for name /
   `RenameByFieldId` for id) — confirmed on the same tables. **Top-level columns only** (a nested mapped column
@@ -2303,10 +2355,10 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   delta suite 34/34 + SQL Server function suites green. Raw-file-shape tests pinned `column_mapping 'none'`
   (native_write/streaming/dv_default/materialize_rowtracking/optimize/compaction_rowtracking/overwrite_merge/
   mfr_dv — they assert physical parquet layouts or use the non-mapping-aware C++ MFR spike). Live: OneLake
-  default-id CTAS + RENAME + ADD + post-rename INSERT round-trip (`lake.dbo.arrownet_cmidlive`, native_write
+  default-id CTAS + RENAME + ADD + post-rename INSERT round-trip (`lake.dbo.fabricator_cmidlive`, native_write
   streaming).
   **PARTITIONED + mapping (second pass, same day) — STREAMS + full Spark round-trip.** Convention settled
-  EMPIRICALLY against a Spark-created partitioned id-mode fixture (`arrownet_cm_part`, via `sparkprobe
+  EMPIRICALLY against a Spark-created partitioned id-mode fixture (`fabricator_cm_part`, via `sparkprobe
   createpartcm` + `_delta_log` inspection): `metaData.partitionColumns` = LOGICAL names (updated by a
   partition-column RENAME), `add.partitionValues` keys = **PHYSICAL** names (stable across the rename — the
   reason they're physical), `add.path` = opaque (Spark writes no Hive dirs under mapping; paths are opaque to
@@ -2322,8 +2374,8 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   partitionValues. Validated: local smoke (rename of the partition column mid-life, pruning), full delta suite
   34/34 (`verify_delta_catalog_column_mapping` 157 — incl. partitioned CTAS streams/physical dirs/prune/rename/
   durability; `verify_delta_catalog_partition` 54 unchanged), and LIVE both directions: **Spark reads our
-  partitioned mapped table** (`arrownet_cmpartlive`, created via native_write streaming with BOTH a data and the
-  partition column renamed) AND **our provider reads Spark's** `arrownet_cm_part` (values + agg + pruning on the
+  partitioned mapped table** (`fabricator_cmpartlive`, created via native_write streaming with BOTH a data and the
+  partition column renamed) AND **our provider reads Spark's** `fabricator_cm_part` (values + agg + pruning on the
   renamed partition column). NOTE: DuckDB's official `delta_scan` (duckdb-delta/kernel) reads mapped PARTITIONED
   tables' partition column as NULL — a kernel-side integration gap (our layout matches Spark's own convention;
   Spark is the reference).
@@ -2355,7 +2407,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   projection/predicate, physical names + 4 distinct field_ids in the parquet, struct-column RENAME reading old
   data, native_read nested, the EW-codec gate error); official `delta_scan` (delta-kernel) reads the nested
   mapped table incl. after the RENAME; full delta suite 35/35; live OneLake nested CTAS+RENAME+INSERT
-  round-trip (`lake.dbo.arrownet_cmnested`) + Fabric Spark read.
+  round-trip (`lake.dbo.fabricator_cmnested`) + Fabric Spark read.
   **BUG FIXED while stabilizing (latent, pre-existing): bulk-session double-complete.** `complete_bulk` CONSUMES
   the session handle managed-side EVEN WHEN IT RETURNS AN ERROR, but the COPY/CTAS/INSERT `Finalize` set
   `bulk_completed = true` only AFTER the call — a thrown provider error left the flag false, so the gstate
@@ -2462,7 +2514,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   are write-time-only; NOT NULL is schema nullability, unaffected). A table that merely LISTS the features (the
   common v7-upgrade case) writes normally. **Column-mapping WRITE rides the existing EW-codec collect path**
   (`WriteCoreAsync` → `RenameToPhysical` for name mode / `SetParquetFieldIds` for id mode) — no new alias/FIELD_IDS
-  code needed. Validated LIVE: INSERT (4,'d'),(5,'e') into the Spark name-mode table `arrownet_cm_name` via our
+  code needed. Validated LIVE: INSERT (4,'d'),(5,'e') into the Spark name-mode table `fabricator_cm_name` via our
   provider → committed v3 → **Spark reads all 5 rows back through the column mapping** (round-trip). Local Delta
   write/delete/update/dv/native_write suites unregressed (HonorWriterFeatures is a no-op on our own mode=none
   tables). **STREAMING native write to a mapping table stays on the collect path** (`SupportsExternalDataFileCommit`
@@ -2470,7 +2522,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   mapping table (COPY `FIELD_IDS` + physical-name alias) is deferred — niche (you bulk-write tables our provider
   creates, which stream; external mapping tables are typically read).
   v56 = **`onelake://` WRITE forward callbacks** — appended 3 vtable entries
-  `onelake_open_write`/`onelake_write`/`onelake_close_write`; the C++ `ArrowNetOneLakeFileSystem` `OpenFile(write)`/
+  `onelake_open_write`/`onelake_write`/`onelake_close_write`; the C++ `FabricatorOneLakeFileSystem` `OpenFile(write)`/
   `Write` (sequential append → managed `OneLakeForwardFs` create/append/flush) make **`COPY … TO 'onelake://…'` +
   any DuckDB writer** write to OneLake (Phase-3 step-3 slice 2; live-validated: COPY a parquet, read back 5/5).
   `read_csv`/`read_json` reads already worked via the slice-1 OpenFile/Read path, so any reader/writer now works on
@@ -2478,7 +2530,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `read_parquet('onelake://…')` path (`duckdb_external_file_cache()` shows the file cached). Non-sequential writes +
   directory ops throw; caching engineered-wood's reverse `fs_*` reads deferred (low value). v55 = **`onelake://` FileSystem forward callbacks** — appended 5 vtable entries
   `onelake_open`/`onelake_read`/`onelake_close`/`onelake_glob`/`onelake_exists` (host C++ → managed). A C++
-  `ArrowNetOneLakeFileSystem : FileSystem` (`src/arrownet/arrownet_onelake_fs.{hpp,cpp}`) is registered in DuckDB's
+  `FabricatorOneLakeFileSystem : FileSystem` (`src/fabricator/fabricator_onelake_fs.{hpp,cpp}`) is registered in DuckDB's
   VFS at load (`RegisterOneLakeFileSystem`, `CanHandleFile` = the `onelake://` scheme) and forwards its **read** ops
   to the managed Azure DataLake SDK (`OneLakeForwardFs`, reusing the step-2 `OneLakeDataLakeFileSystem` logic) — so
   DuckDB's **native parquet reader + ExternalFileCache** use OneLake uniformly, bypassing duckdb-azure. Credential =
@@ -2509,12 +2561,12 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `KeepIdentity`), so only CREATE-side emission was new. Delta / DAX ignore `identity_columns`. Validated:
   `test/verify_identity.test` (45 — marker→IDENTITY [IsIdentity=1], add_identity SET, CTAS, skip-if-present,
   OFF=no column) + SqlServer/Delta suites unregressed; **live on Fabric Warehouse** (generated marker → real
-  IDENTITY, 3 distinct auto values; add_identity CTAS → `arrownet_idfab2_id`, 4 distinct). v52 = **native `SORTED BY` → Fabric Warehouse `CLUSTER BY`** — appended a
+  IDENTITY, 3 distinct auto values; add_identity CTAS → `fabricator_idfab2_id`, 4 distinct). v52 = **native `SORTED BY` → Fabric Warehouse `CLUSTER BY`** — appended a
   `sort_columns` param (nullable, comma-separated) to **both** `create_table` and `begin_bulk`, mirroring the v51
   `partition_columns`. DuckDB v1.5.4 parses `CREATE TABLE [t] SORTED BY (cols) [AS …]` into
-  `CreateTableInfo::sort_keys`; `ArrowNetCatalog::SupportsCreateTable` now permits BOTH partition_keys AND
+  `CreateTableInfo::sort_keys`; `FabricatorCatalog::SupportsCreateTable` now permits BOTH partition_keys AND
   sort_keys (only the WITH-options clause stays rejected). C++ extracts the sort columns (reusing
-  `arrownet::PartitionColumnsArg`) in the DDL create + CTAS and passes them; the **SQL Server provider maps them
+  `fabricator::PartitionColumnsArg`) in the DDL create + CTAS and passes them; the **SQL Server provider maps them
   to a Fabric Warehouse / Synapse `WITH (CLUSTER BY (cols))`** layout in `BuildCreateTable` — **only on a
   warehouse profile** (`profile.IsWarehouse`; box SQL Server has no such syntax → the clause is a no-op there),
   for both explicit CREATE and CTAS. A **`mssql_cluster_by` session setting** (comma-separated columns) is the
@@ -2526,9 +2578,9 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   comma-separated column names) to **both** `create_table` and `begin_bulk` (a signature change, not a slot add).
   DuckDB v1.5.4 parses `CREATE TABLE [t] PARTITIONED BY (cols) [AS …]` into `CreateTableInfo::partition_keys`
   (clause precedes `AS` for CTAS); the base `Catalog::SupportsCreateTable` REJECTS any partition_keys, so
-  `ArrowNetCatalog::SupportsCreateTable` is overridden to **permit** them (SORTED BY + WITH-options stay
-  unsupported). C++ extracts the column names (`arrownet::PartitionColumnsArg`, `catalog/arrownet_partition_util.hpp`
-  — column-refs only) in the DDL create (`ArrowNetSchemaEntry::CreateTable`) and CTAS (`ArrowNetCtasInfo`), passes
+  `FabricatorCatalog::SupportsCreateTable` is overridden to **permit** them (SORTED BY + WITH-options stay
+  unsupported). C++ extracts the column names (`fabricator::PartitionColumnsArg`, `catalog/fabricator_partition_util.hpp`
+  — column-refs only) in the DDL create (`FabricatorSchemaEntry::CreateTable`) and CTAS (`FabricatorCtasInfo`), passes
   them to `create_table`/`begin_bulk`; C# `SplitColumnList` → `IReadOnlyList<string>` → `DeltaCatalog` →
   engineered-wood `CreateAsync(partitionColumns:)` (Hive `<table>/<col>=<value>/*.parquet`, reads
   `Metadata.PartitionColumns` so INSERT/Append preserve the layout). **Provider-agnostic**: SQL Server / DAX
@@ -2539,7 +2591,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   overrides the setting's `partition_by`. engineered-wood's `ParquetWriteOptions` is delta-rs-class (auto
   dictionary + always-on min/max stats; bloom off by default). Validated: `test/verify_delta_catalog_partition.test`
   (54 — native CTAS/empty-CREATE+INSERT/multi-column/setting/override/re-attach), full Delta suite + SqlServer
-  columnstore (CREATE+CTAS) unregressed, native partitioning **live on Fabric OneLake** (`LH.dbo.arrownet_parttest`,
+  columnstore (CREATE+CTAS) unregressed, native partitioning **live on Fabric OneLake** (`LH.dbo.fabricator_parttest`,
   `region=US/EU/APAC`). **`delta_write_options` also carries `replace_where`** (C#-only, no ABI): **`replace_where`
   = `{partcol:val,…}`** turns an INSERT into an ATOMIC partition-overwrite — engineered-wood
   `DeltaTable.OverwritePartitionsAsync` (new; `WriteAsync`→ private `WriteCoreAsync` core with an
@@ -2598,15 +2650,15 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   DATE/TIMESTAMP/DECIMAL through DELETE, UPDATE, native partitioned write, re-attach durability); full Delta
   catalog suite unregressed.
   v50 = **directory move/rename** — appended `fs_move_dir(opener,src,dest,…)` to
-  `ArrowNetHostServices` (the reverse host→managed struct): maps to DuckDB's `FileSystem::MoveFile` — an atomic
+  `FabricatorHostServices` (the reverse host→managed struct): maps to DuckDB's `FileSystem::MoveFile` — an atomic
   directory rename on a local filesystem; object stores (S3/Azure DFS) throw "not implemented". Powers **local/S3
   Delta catalog RENAME TABLE** (`DeltaCatalog.AlterTable` RenameTable → `HostFs.MoveDir`; OneLake still renames via
   the DFS SDK since Azure `MoveFile` is unimplemented). `test/verify_delta_catalog_schemas.test`. v49 =
   **recursive directory delete** — appended `fs_remove_dir(opener,path,…)` to
-  `ArrowNetHostServices` (the reverse host→managed struct, not the vtable): deletes a directory RECURSIVELY via
+  `FabricatorHostServices` (the reverse host→managed struct, not the vtable): deletes a directory RECURSIVELY via
   DuckDB's `FileSystem::RemoveDirectory` (idempotent — no error if absent). Powers **Delta catalog DROP TABLE**
   (`DeltaCatalog.DropTable` → `HostFs.RemoveDir` removes the table's whole `<root>/<table>/` folder; opener
-  threaded by `DropEntry`'s `ArrowNetSetActiveTxn`). `test/verify_delta_catalog_write.test` (31). **OneLake DROP
+  threaded by `DropEntry`'s `FabricatorSetActiveTxn`). `test/verify_delta_catalog_write.test` (31). **OneLake DROP
   goes a different route** (`fs_remove_dir` → `FileSystem::RemoveDirectory` throws `AzureDfsStorageFileSystem:
   RemoveDirectory is not implemented!` — duckdb-azure has no recursive-delete on the DFS endpoint): `DropTable`
   branches on `FabricLakehouse.IsOneLake(root)` → a **direct ADLS Gen2 / OneLake DFS recursive delete**
@@ -2615,9 +2667,9 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   Validated live 2026-06-30 on both `LH` (schema-enabled) and `LH_no_schema` (flat). See the OneLake-discovery
   paragraph below — discovery + DROP now share the DFS endpoint. v48 =
   **host-FS WRITE surface** — the Delta write-back foundation: appended five
-  WRITE callbacks to `ArrowNetHostServices` (the reverse host→managed struct, not the vtable) —
+  WRITE callbacks to `FabricatorHostServices` (the reverse host→managed struct, not the vtable) —
   `fs_open_write(opener,path,exclusive,…)` / `fs_write` / `fs_close_write` / `fs_remove` / `fs_create_dir` — plus
-  the `ARROWNET_ALREADY_EXISTS=4` status. `exclusive=1` opens with `EXCLUSIVE_CREATE` (the put-if-absent commit
+  the `FABRICATOR_ALREADY_EXISTS=4` status. `exclusive=1` opens with `EXCLUSIVE_CREATE` (the put-if-absent commit
   primitive — honored on OneLake/ADLS + POSIX; returns `ALREADY_EXISTS` if the target exists). `fs_create_dir`
   is recursive (mkdir -p; DuckDB's is single-level). The C# `DuckDbTableFileSystem` write methods
   (`CreateAsync`/`WriteAllBytesAsync`/`RenameAsync`/`DeleteAsync` + `DuckDbSequentialFile`) sit on these;
@@ -2625,7 +2677,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   on local and is *unimplemented* on Azure DFS — so the commit's put-if-absent guard rides `EXCLUSIVE_CREATE`,
   and engineered-wood's temp+rename commit works unchanged (a conflicting target → `RenameAsync` returns false
   → `DeltaConflictException`). `HostFsGlob` now normalizes a not-found glob (object-store 404) to empty so a
-  brand-new table's missing `_delta_log/` reads as "create". Demo `arrownet_delta_write_demo(path)` — a global
+  brand-new table's missing `_delta_log/` reads as "create". Demo `fabricator_delta_write_demo(path)` — a global
   host-FS table fn writing a fixed 5-row Delta table via engineered-wood (`DeltaWriteMode.Overwrite`,
   idempotent), validated end-to-end (write+read round-trip) on **local AND a live OneLake lakehouse** (SP
   azure secret). `test/verify_delta_write.test`. Single-writer; concurrent commits work where `EXCLUSIVE_CREATE`
@@ -2635,28 +2687,28 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   (engineered-wood `ActionSerializer` — were omitted when empty/null, non-nullable for strict readers); (3)
   parquet `path_in_schema` (engineered-wood `OmitPathInSchema` defaults TRUE → drops this REQUIRED field →
   `TProtocolException: Invalid data`) — fixed our side via `ParquetWriteOptions { OmitPathInSchema = false }` in
-  `DeltaWriteDemoFunction`. With all three, delta-kernel-rs reads it locally; a fresh `Tables/dbo/arrownet` table
+  `DeltaWriteDemoFunction`. With all three, delta-kernel-rs reads it locally; a fresh `Tables/dbo/fabricator` table
   written to OneLake for Fabric. (#1/#2 are engineered-wood-repo patches; #3 is a write option. DuckDB's official
   `delta_scan` can't LIST a OneLake `_delta_log` — a delta-kernel azure/secret quirk, "No files in log segment" —
   so OneLake validation is via our reader + the local delta-kernel read. A table written BEFORE the fixes stays
-  broken on its version-0 metaData → write a fresh one.) **`arrownet_delta_write(<input>, path := '…')`** — a
+  broken on its version-0 metaData → write a fresh one.) **`fabricator_delta_write(<input>, path := '…')`** — a
   global host-FS **collector** that writes ANY input table (a DuckDB query result) to a Delta table (Overwrite),
   returning `(version, rows_written)`; buffers input (Arrow-IPC round-trip copy), commits one version via the
   shared `DeltaWriter`. Cost args ride as NAMED params (`Parameters` added to `IInOutFunction`/
   `ICollectorTableFunction` + handle-0 `GlobalFunctions.ParamSchema`); the opener is threaded into the collector
   Source `GetDataInternal` (where C# `Collect` runs — Finalize-only was racy) AND into the shared
-  `ArrowNetSetActiveTxn` helper (so any connection-using callsite sets it). Validated local + a live OneLake
-  managed table (`Tables/dbo/arrownet_query`). `test/verify_delta_write.test` (18). **Delta folder-as-catalog
+  `FabricatorSetActiveTxn` helper (so any connection-using callsite sets it). Validated local + a live OneLake
+  managed table (`Tables/dbo/fabricator_query`). `test/verify_delta_write.test` (18). **Delta folder-as-catalog
   (READ + WRITE) DONE**: `DeltaBackend` (3rd `IBackend`, `"delta"`/`"deltalake"`, registered explicitly in
   `BackendRegistry.Discover` — Bridge-resident) + `DeltaCatalog`. `ATTACH '/lake'
-  (TYPE arrownet, PROVIDER 'delta')` discovers subdirs-with-`_delta_log/` as tables under a flat `main` schema
+  (TYPE fabricator, PROVIDER 'delta')` discovers subdirs-with-`_delta_log/` as tables under a flat `main` schema
   (glob `<root>/*/_delta_log/*.json`), columns via `DeltaReader.GetSchema`, scan via `DeltaReader.Stream` with
   filter pushdown. The opener is threaded into the catalog metadata path (`LoadCatalog`/`RefreshCache` call
-  `ArrowNetSetActiveTxn` before discovery; `FetchTableColumns` already did). `test/verify_delta_catalog.test`
+  `FabricatorSetActiveTxn` before discovery; `FetchTableColumns` already did). `test/verify_delta_catalog.test`
   (17 — discovery + filter + join, LOCAL). **CATALOG STREAMING WRITE DONE** (the chosen slice): `CREATE TABLE`/
   `INSERT`/CTAS/COPY stream straight to engineered-wood via the **standard bulk path** (`begin_bulk`/`push_batch`/
   `complete_bulk` → `BulkSession` → `DeltaCatalog.BulkInsert`), exactly like the SQL/DAX backends — the global
-  `arrownet_delta_write` collector is no longer needed for the catalog case (it stays as the no-ATTACH function
+  `fabricator_delta_write` collector is no longer needed for the catalog case (it stays as the no-ATTACH function
   form). **Opener threading into the bulk path:** `SetActiveOpener(&context)` is set immediately before
   `BeginBulk` in the insert/CTAS/COPY operators; `BulkSession` captures it at `begin_bulk` and **re-establishes
   `AmbientOpener.Current` (+ the txn id) on its background consumer thread** (the opener's `ClientContext` stays
@@ -2665,9 +2717,9 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   ignored — Delta has none); `DeltaWriter.Materialize` IPC-round-trips the streamed batches for the commit. NO
   ABI change (reuses bulk + the v47 `set_active_opener`). `test/verify_delta_catalog_write.test` (31 — CREATE/
   INSERT/append/CTAS/aggregate + DROP TABLE + detach/re-attach durability, LOCAL). **DROP TABLE DONE** (ABI v49
-  — appended `fs_remove_dir` to `ArrowNetHostServices`: recursive directory delete via DuckDB's
+  — appended `fs_remove_dir` to `FabricatorHostServices`: recursive directory delete via DuckDB's
   `FileSystem::RemoveDirectory`, idempotent; `DeltaCatalog.DropTable` deletes the table's whole `<root>/<table>/`
-  folder via `HostFs.RemoveDir(AmbientOpener.Current, …)`, opener threaded by `DropEntry`'s `ArrowNetSetActiveTxn`).
+  folder via `HostFs.RemoveDir(AmbientOpener.Current, …)`, opener threaded by `DropEntry`'s `FabricatorSetActiveTxn`).
   **DELETE DONE — copy-on-write via a TRANSIENT (file,position) rowid; tables are PLAIN Delta (no features)**
   (mirrors the SQL Server backend's rowid DML — reuses the existing rowid operators wholesale, NO OptimizerExtension/
   custom operator, NO ABI change). **Why this shape (3 live-Fabric iterations):** DuckDB doesn't expose the WHERE
@@ -2692,7 +2744,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   and the footer is malformed. With both, delta-kernel reads our copy-on-write output (verified locally via
   DuckDB's official `delta_scan` — the reference reader Spark/Fabric use). **Virtual rowid
   threading** (the crux — `_metadata.row_id` is NOT a user column; surfacing it as one would break INSERT):
-  `FetchRowIdColumns` returning a name absent from the schema is treated as a VIRTUAL rowid — `ArrowNetTableEntry`/
+  `FetchRowIdColumns` returning a name absent from the schema is treated as a VIRTUAL rowid — `FabricatorTableEntry`/
   `ArrowStreamBindData` carry the NAMES (not indices) in `virtual_rowid_columns`, `HasRowId`/`GetVirtualColumns`/
   `GetRowIdColumns` honor them, `BuildScanSpec` adds them to the fetch list when rowid is requested, `arrow_ingest`
   resolves their result positions BY NAME for `BuildRowId`, and `BuildModifyTarget` uses the virtual names +
@@ -2702,7 +2754,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `ScanTable` streams WITH the row-id column when requested; `ExecuteDelete` collects the ids → `DeleteByRowIdsAsync`.
   `test/verify_delta_catalog_delete.test` (28 — equality/range/name predicates + durable across re-attach +
   DELETE-all). **Live Fabric: plain-Delta CTAS+DELETE validated end-to-end** on the schema-enabled `LH` lakehouse
-  (`arrownet_deltest4`: v0 protocol = minReader 1/minWriter 2/no features, DELETE = plain remove+add, our read
+  (`fabricator_deltest4`: v0 protocol = minReader 1/minWriter 2/no features, DELETE = plain remove+add, our read
   correct); the OneLake table-format conversion is expected to succeed on plain Delta (pending user confirm — the
   earlier row-tracking/DV tables failed conversion). **A transient rowid is valid only within one snapshot** (a
   scan's rowids must be consumed by the DELETE before another write changes the file set — true for a single
@@ -2710,15 +2762,15 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   the new SET-column values (named) + the transient `_metadata.row_id` per row; it builds a `rowid → new values`
   map and calls engineered-wood `UpdateByRowIdsAsync(rowIds, rewriteFile)`, which rewrites ONLY the files
   containing a matched row (decoded from `rowid >> 40`) — each affected file's batches are handed back via the
-  `rewriteFile` callback, where ArrowNet rebuilds the SET columns on the matched positions as CLEAN Apache.Arrow
+  `rewriteFile` callback, where Fabricator rebuilds the SET columns on the matched positions as CLEAN Apache.Arrow
   batches (`BuildArray`, a typed inverse of `ArrowValueReader.ReadScalar` — bool/ints/uints/float/double/
   decimal128/string/date32/timestamp; rowid recomputed as `(ordinal << 40) | positionInFile` to match the scan),
   and engineered-wood re-writes them as plain `remove`+`add` with a CLEAN schema (the parquet-footer fix). The
-  typed substitution stays in ArrowNet (reuses `BuildArray`/`ReadScalar`); engineered-wood stays generic (file
+  typed substitution stays in Fabricator (reuses `BuildArray`/`ReadScalar`); engineered-wood stays generic (file
   selection + read + clean write). Unaffected files are untouched. NO C++ change (reuses the DELETE virtual-rowid
   planning + the `ExecuteUpdate` ABI). Verified single-row / multi-row / expression (`amt=amt+1`) updates,
   UPDATE∘DELETE composition, re-attach durability, a delta-kernel `delta_scan` read-back, AND live on Fabric
-  (`arrownet_updtest` on the schema-enabled `LH` lakehouse). `test/verify_delta_catalog_update.test` (63).
+  (`fabricator_updtest` on the schema-enabled `LH` lakehouse). `test/verify_delta_catalog_update.test` (63).
   **SCHEMA EVOLUTION — `ALTER TABLE … ADD COLUMN` DONE** (the only supported ALTER kind on Delta): a
   **metadata-only commit** appending a nullable column (NO file rewrite) — engineered-wood `DeltaTable.AddColumnAsync`
   writes a new `MetadataAction` (current Arrow schema ++ the new field → `SchemaConverter.FromArrowSchema` →
@@ -2727,7 +2779,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `MakeNullArray`, in `ReadFileAsync` before the rowid append): a column added after a data file was written is
   absent from that file's parquet, so each batch is reconciled to the current schema — present columns by name, the
   missing one as an all-NULL typed array (no-op fast path when the file already has every column). `DeltaReader.AddColumn`
-  → `DeltaCatalog.AlterTable`; `a1`=name, the `Field` carries type+nullability. C++ `ArrowNetSchemaEntry::Alter` now
+  → `DeltaCatalog.AlterTable`; `a1`=name, the `Field` carries type+nullability. C++ `FabricatorSchemaEntry::Alter` now
   **`SetActiveOpener` before the alter** (host-FS opener for the Delta metadata write; no-op for SQL) + the existing
   eager column re-fetch surfaces the new column in-session. NO ABI change (reuses the v2 `alter_table` entry).
   Standard-compliant by construction (a textbook metaData commit on already-standard data files →
@@ -2748,7 +2800,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   ABI v49.)
   **Multi-schema for local/S3 — the `schemas true` ATTACH option (DONE)**: by default a non-OneLake Delta catalog is
   FLAT (single `main` schema; the schema component is ignored, so `db.staging.t` and `db.main.t` would both map to
-  `<root>/t` — a silent collision footgun). `ATTACH '…' (TYPE arrownet, PROVIDER 'delta', schemas true)` switches it
+  `<root>/t` — a silent collision footgun). `ATTACH '…' (TYPE fabricator, PROVIDER 'delta', schemas true)` switches it
   to the two-level `<root>/<schema>/<table>` layout (the same layout a schema-enabled OneLake lakehouse uses):
   `DeltaCatalog._schemas` (parsed from the forwarded ATTACH options JSON, like `deletion_vectors`) drives
   `SchemaLayout` → `TablePath` nests by schema; `DiscoverTablePairs` globs the two-level
@@ -2762,7 +2814,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   survive re-attach** (no `_delta_log` to glob) — a documented limitation. **Gotcha found:** unqualified
   `staging.t` resolves to DuckDB's DEFAULT (memory) catalog, not the attached one — always use `db.schema.table`.
   **TIME TRAVEL — `FROM t AT (VERSION => n)` DONE** (C#-only; the plumbing already existed —
-  `ArrowNetCatalog::SupportsTimeTravel()` is `true` for all providers and the `AT` clause already flows to the
+  `FabricatorCatalog::SupportsTimeTravel()` is `true` for all providers and the `AT` clause already flows to the
   scan's `spec_json` as `"at":{unit,value}` → `ScanSpec.At`, which the SQL backend uses for `FOR SYSTEM_TIME AS
   OF`). `DeltaCatalog.ScanTable` now honors `spec.At`: `DeltaReader.StreamAt` / `GetSchemaAt` resolve the
   snapshot (engineered-wood `ReadAtVersionAsync` + `GetSnapshotAtVersionAsync`) and stream as of that version,
@@ -2802,13 +2854,13 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `test/verify_delta_catalog_time_travel.test` (47 — version 0/1/2/3, filter pushdown, multi-version
   count/JOIN/UNION, re-attach durability, plain-table timestamp error, and `in_commit_timestamps` timestamp
   travel [local]).
-  **Snapshots/history function — DONE: `arrownet_delta_snapshots('<catalog>', '<schema.>table')`** (DuckLake-style
+  **Snapshots/history function — DONE: `fabricator_delta_snapshots('<catalog>', '<schema.>table')`** (DuckLake-style
   snapshots view). First arg = the ATTACH'd catalog NAME (resolved to its handle via `ResolveConnection` — no
   abfss path needed, the catalog's own `TablePath` builds the location); second = the table, schema-qualified
   (schema **mandatory on a schema-enabled lakehouse**, defaults to `main` on a flat catalog; C++ splits on the
   first `.`, C# resolves the default/required schema). Returns `(version BIGINT, timestamp TIMESTAMP, operation
   VARCHAR, operation_parameters VARCHAR)` from the `_delta_log`. C++ `SnapshotsBind` mirrors `ServerInfoBind`
-  (catalog→handle, factory = `GetMetadata(handle, ARROWNET_META_SNAPSHOTS=8, schema, table)`, reuses
+  (catalog→handle, factory = `GetMetadata(handle, FABRICATOR_META_SNAPSHOTS=8, schema, table)`, reuses
   `ArrowStreamScan`); C# `DeltaCatalog.GetMetadata(Snapshots)` → `DeltaReader.GetSnapshots` → engineered-wood
   `DeltaTable.GetHistoryAsync` (new — `ListVersionsAsync` + `ReadCommitAsync` → `CommitInfo`). **Additive enum →
   NO ABI bump.** **`commitInfo` is now written on EVERY commit by default** (engineered-wood
@@ -2821,7 +2873,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `commitInfo.timestamp` is enough to resolve a snapshot, so the `in_commit_timestamps` feature is now only needed
   for the **in-protocol monotonic** guarantee (Spark/Fabric interop), NOT for local timestamp travel. A far-future
   instant → latest version; an instant before commit-0 → clean "No commit found" error
-  (`test/verify_delta_catalog_time_travel.test`, 48). Validated local + **live Fabric**: `LH2.dbo.arrownet_ict2` (ICT) AND a PLAIN table on
+  (`test/verify_delta_catalog_time_travel.test`, 48). Validated local + **live Fabric**: `LH2.dbo.fabricator_ict2` (ICT) AND a PLAIN table on
   `LH_no_schema` both show v0 `CREATE TABLE` + `WRITE`s with timestamps — and the plain `commitInfo` table on
   `LH_no_schema` (no time-travel setting) **registers + is SQL-endpoint-queryable** in Fabric (confirmed), i.e.
   always-on `commitInfo` is Fabric-safe on plain writer-v2 tables. `test/verify_delta_catalog_snapshots.test`
@@ -2837,11 +2889,11 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   **capture CDC change files**: blind appends infer naturally, and the rowid copy-on-write DELETE/UPDATE +
   DV-delete paths emit `_change_data/*.parquet` (`CdfConfig.Delete`/`UpdatePreimage`/`UpdatePostimage`) — they
   already read the changed rows for the rewrite, so capture is "for free" there. **Read** via
-  **`arrownet_delta_changes('<catalog>', '<schema.>table', from [, to])`** (2 overloads — `to` omitted/-1 ⇒
+  **`fabricator_delta_changes('<catalog>', '<schema.>table', from [, to])`** (2 overloads — `to` omitted/-1 ⇒
   latest): the row-level feed between two versions with `_change_type` (insert/delete/update_preimage/
   update_postimage) ++ `_commit_version BIGINT` ++ `_commit_timestamp BIGINT` (epoch ms, from the always-on
   commitInfo). C++ `ChangesBind` mirrors `SnapshotsBind` (catalog→handle, arg2 = `"from:to"`, factory =
-  `GetMetadata(handle, ARROWNET_META_CHANGES=9, schema.table, range)`); C# `DeltaCatalog.GetMetadata(Changes)` →
+  `GetMetadata(handle, FABRICATOR_META_CHANGES=9, schema.table, range)`); C# `DeltaCatalog.GetMetadata(Changes)` →
   `DeltaReader.GetChanges` → engineered-wood `DeltaTable.ReadChangesAsync`. **Additive enum → NO ABI bump.** **Two
   fixes that made the read work:** (1) the rowid-DML CDC capture must drop the **virtual** `_metadata.row_id`
   trailing column (`DropVirtualRowId` — NOT `RowTrackingWriter.StripRowIdColumn`, which strips the *physical*
@@ -2854,7 +2906,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   "Change Data Feed is not enabled" otherwise (Spark `DELTA_CHANGE_DATA_FEED_NOT_ENABLED` parity). Validated local
   (`test/verify_delta_catalog_changes.test`, 45 — full feed + change-type breakdown + pre/post images + bounded
   ranges + 3-arg-latest + CDF-off error) AND **live Fabric** (`Test`/`LH` schema-enabled: CTAS → DELETE → UPDATE
-  on `lake.dbo.arrownet_cdftest` → correct feed [3 ins/v1, del/v2, upd pre+post/v3] + snapshots v0 CREATE/v1
+  on `lake.dbo.fabricator_cdftest` → correct feed [3 ins/v1, del/v2, upd pre+post/v3] + snapshots v0 CREATE/v1
   WRITE/v2 DELETE/v3 UPDATE). **OneLake table discovery + DROP
   — via the ADLS Gen2 / OneLake DFS endpoint directly** (`FabricLakehouse`, Bridge; `Azure.Storage.Files.DataLake`
   12.21.0): DuckDB's azure glob can't recurse a OneLake `_delta_log` tree (mid-path wildcard → `type must be
@@ -2882,7 +2934,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   (`GetPathsAsync`/`DeleteIfExistsAsync` + `GetAwaiter().GetResult()` at the boundary): the SYNC `GetPaths` uses
   `HttpClient.Send`, whose sync transport HANGS under the hostfxr-hosted CLR (a single discovery never returns —
   isolated to the sync path; the same call is ~1s in a normal console host) — same reason every other Bridge IO
-  path is async. Auth = the **ATTACH'd azure SP secret** (`ATTACH '…OneLake…' (TYPE arrownet, PROVIDER 'delta',
+  path is async. Auth = the **ATTACH'd azure SP secret** (`ATTACH '…OneLake…' (TYPE fabricator, PROVIDER 'delta',
   SECRET <azure_sp>)` → v39 foreign-secret path → `DeltaBackend.BuildConnectionString` appends a cred marker on
   the root → `DeltaCatalog` mints a `ClientSecretCredential`, mirroring DAX); the data files are still
   read/written through DuckDB's FileSystem (the opener + a DuckDB azure secret) — the DFS endpoint is used for
@@ -2895,7 +2947,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `GetMetadata(Schemas)` returns the lakehouse schemas (+ always the `DefaultSchema`), and `TablePath` is
   schema-aware (`<root>/<schema>/<table>` when schema-enabled, else flat `<root>/<table>`). **Validated live
   end-to-end:** on both lakehouses, DFS discovery + CTAS + scan + DROP (DFS recursive delete, confirmed the table
-  dir is gone); plus on `LH` CTAS into `lake.dbo.arrownet_deltest` → `DELETE WHERE id=2` (deletion-vector commit)
+  dir is gone); plus on `LH` CTAS into `lake.dbo.fabricator_deltest` → `DELETE WHERE id=2` (deletion-vector commit)
   → `SELECT` returns 1,a/3,c. **`READ_ONLY false` is REQUIRED** for OneLake writes: DuckDB force-bumps any remote
   (`abfss://`) ATTACH to read-only when the access mode is AUTOMATIC (`database_manager.cpp:105`); Delta supports
   remote writes, so set it explicitly. **Caveat:** `SHOW TABLES` / `duckdb_tables()` over a OneLake catalog is
@@ -2943,7 +2995,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   copy-on-write (2 files = rewrite); the CoW-intent tests (`verify_delta_catalog_delete` + the native_write CoW
   catalogs) are pinned `deletion_vectors false` to keep that coverage. **OPTIMIZE + VACUUM maintenance WIRED
   (2026-07-04).** Under DV-default, DVs + merge-on-read append small files accumulate, so bin-pack compaction
-  matters: `mssql_net_exec('<catalog>', 'OPTIMIZE <schema.table>')` (+ `VACUUM <schema.table> [RETAIN <hours>
+  matters: `fabricator_exec('<catalog>', 'OPTIMIZE <schema.table>')` (+ `VACUUM <schema.table> [RETAIN <hours>
   HOURS] [DRY RUN]`) → `DeltaCatalog.ExecuteNonQuery` → `DeltaReader.Optimize`/`Vacuum` → engineered-wood
   `CompactAsync`/`VacuumAsync` (mirrors the delta-rs provider's maintenance dialect). **Under `native_write` the
   OPTIMIZE compacted files are written by DuckDB's native writer too** (`CompactionExecutor` gained an
@@ -2953,8 +3005,8 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   dict-encoded `grp`, none on all-distinct `id`); validated LIVE on Fabric OneLake. **`CompactionExecutor` fixed
   to be DV-AWARE** — it now EXCLUDES each candidate file's deletion-vector-deleted rows (else compaction would
   RESURRECT them — a data bug, since DV is the default) + strips the internal `__delta_row_id` + carries each
-  removed file's DV on the `remove`. **The exec path now threads the host-FS opener** (`mssql_net_extension.cpp`
-  `MssqlNetExecFunction` calls `SetActiveOpener` before `ExecuteDml`; C++-only, no ABI) — without it a
+  removed file's DV on the `remove`. **The exec path now threads the host-FS opener** (`fabricator_extension.cpp`
+  `FabricatorExecFunction` calls `SetActiveOpener` before `ExecuteDml`; C++-only, no ABI) — without it a
   fresh-connection OPTIMIZE segfaulted (the Delta provider's `_delta_log` listing needs the opener; SQL Server /
   delta-rs ignore it). Validated: `test/verify_delta_catalog_optimize.test` (30 — 4 small files + DV-delete →
   OPTIMIZE consolidates, deleted rows NOT resurrected, VACUUM cleans, durability) + delta_scan + LIVE Fabric
@@ -3002,7 +3054,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   (`storageType:"i"`, `cardinality:2` = the two deleted rows) + row-tracking `baseRowId`/`defaultRowCommitVersion`;
   our read returned the correct survivors (1,3,5). Confirms the RoaringBitmap format fix writes correctly to
   OneLake. **FABRIC READS IT — confirmed (user-verified live, 2026-07):** the reader-v3 + inline-DV table
-  (`LH.dbo.arrownet_ewdv_live`) registers in Fabric AND is **SQL-endpoint-queryable** with the deleted rows
+  (`LH.dbo.fabricator_ewdv_live`) registers in Fabric AND is **SQL-endpoint-queryable** with the deleted rows
   removed. So engineered-wood's DV mode is END-TO-END validated on OneLake: DV write → our read → Fabric SQL
   endpoint. (This supersedes the earlier row-tracking/DV Fabric-conversion failures, which were the pre-fix
   byte-format/protocol bugs; the current inline-DV format is Fabric-readable. Contrast the delta-rs provider,
@@ -3108,7 +3160,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   seam** = `DeltaTableOptions.DataFileWriter` (new `IDataFileWriter`): `WriteCoreAsync` delegates each partition
   file's parquet bytes to it instead of the built-in `ParquetFileWriter` — partition split / row tracking /
   column mapping / stats / the `add` / commit / OCC unchanged (override null by default → default path
-  byte-identical). ArrowNet's `NativeParquetDataFileWriter` binds the streamed batch via the existing
+  byte-identical). Fabricator's `NativeParquetDataFileWriter` binds the streamed batch via the existing
   `Host.Query(sql, inputs)` (host-query v42–v45 — so **gate A input-binding worked directly; the temp-IPC gate B
   was never needed**) and runs `COPY (SELECT * FROM <batch>) TO '<root>/<file>' (FORMAT parquet,
   WRITE_BLOOM_FILTER true, RETURN_STATS)`, reading back `file_size_bytes` for `add.Size` (stats stay EW's
@@ -3135,7 +3187,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   delta_scan reads it). `verify_delta_catalog_native_write.test` (87 — INSERT/CTAS/append + bloom signature +
   DELETE + UPDATE + row_tracking + durability); default update/delete/dv/changes unregressed. **VALIDATED LIVE
   on Fabric OneLake (2026-07-04):** workspace `Test` / lakehouse `LH` (schema-enabled) — `native_write true`
-  CTAS + INSERT + DELETE + UPDATE on `lake.dbo.arrownet_nwtest` round-tripped correctly over `onelake://` (v56
+  CTAS + INSERT + DELETE + UPDATE on `lake.dbo.fabricator_nwtest` round-tripped correctly over `onelake://` (v56
   OneLake write callbacks + DuckDB's native writer), and a 5000-row low-card table showed the DuckDB bloom
   signature on the dict column via `parquet_metadata('onelake://…')` (EW writes none) — confirming DuckDB (not
   EW) wrote the OneLake parquet. **Partitioned `native_write` DONE (2026-07-04):** EW splits by partition +
@@ -3148,11 +3200,11 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   seam **`IDataFileRewriter`** (`DeltaTableOptions.DataFileRewriter`, next to `DataFileWriter`): the copy-on-write
   DELETE/UPDATE loops delegate the source read + transform to it for the clean shape (no column mapping, no
   partitions, no type widening, no CDF — gated in EW), falling back to EW's own reader + the in-process
-  `rewriteFile`/`TakeRows` transform otherwise. ArrowNet's `NativeParquetDataFileRewriter` (a *reader*: returns
+  `rewriteFile`/`TakeRows` transform otherwise. Fabricator's `NativeParquetDataFileRewriter` (a *reader*: returns
   the transformed batches; EW keeps stats/writer/commit) runs per affected file `SELECT <cols> FROM
   read_parquet(src, file_row_number => true) WHERE file_row_number NOT IN (<deleted positions, bound anti-join>)`
   (DELETE) or a `LEFT JOIN` against the (position → new SET values) rows bound as an Arrow view, substituting via
-  `CASE WHEN u.__arrownet_pos IS NOT NULL THEN u.<col> ELSE p.<col> END` (UPDATE) — **retiring the in-process
+  `CASE WHEN u.__fabricator_pos IS NOT NULL THEN u.<col> ELSE p.<col> END` (UPDATE) — **retiring the in-process
   typed `BuildArray`** for the native path. **DV-aware** (the file's existing deletion-vector positions are
   passed as `excludePositions`, so a copy-on-write UPDATE on a DV table rewrites only live rows) + **schema-
   evolution backfill** (the rewriter probes the source file's columns via `read_parquet … LIMIT 0` and emits a
@@ -3201,7 +3253,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `MAP(colname→value)`) + per-file stats, all committed in one `CommitDataFilesAsync`. `RunCopy` returns per-file
   `CopiedFile` records (relpath from `filename`, rows, size, partitionValues, stats); the shared `ReadFileStats`
   parses both. **Partitioned streaming works on OneLake too** — DuckDB's partitioned COPY needs a writable
-  DIRECTORY target, which the `onelake://` C++ FileSystem now supports: `ArrowNetOneLakeFileSystem` overrides
+  DIRECTORY target, which the `onelake://` C++ FileSystem now supports: `FabricatorOneLakeFileSystem` overrides
   `DirectoryExists`→false + `CreateDirectory`→no-op (ADLS Gen2 dirs are implicit — a blob write materializes the
   hierarchy), and the managed `OneLakeForwardFs.Exists` returns FALSE for a directory (via the `hdi_isfolder`
   metadata marker) so DuckDB's setup doesn't mistake the table root for a file (the old *"exists and is a file,
@@ -3354,11 +3406,21 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   gate counts in this file are historical). doc/upstream-candidates.md refreshed: on-disk-DV second
   pass in slice 2, row-tracking preservation + MoR matrix + S3 conditional-put in slice 8, NEW slice 9
   (row-level concurrency), test pointers per slice. Fork pushed through `d09b966` (PR #4 auto-tracks).
-  STALE-BINARY NOTE: the linux notebook payload (`build/linux-payload`) + the loadable were last built
-  BEFORE the mark-join DELETE C++ fix (`d8db9f9`) — rebuild both before the next Fabric-notebook or
-  dbt run.** **IDEMPOTENT APPENDS (2026-07-11) — Delta
+  STALE-BINARY NOTE: ~~the linux notebook payload + the loadable were built BEFORE the mark-join DELETE
+  fix~~ — **REBUILT 2026-07-15 on the Fabricator-rename branch** (post-rename + post-DELETE-fix):
+  `build/linux-payload/fabricator.duckdb_extension` (34 MB, linux_amd64) + `fabricator-fdd-linux-x64.zip`
+  (loose-root FDD, net8.0) + the Windows loadable `build/release/extension/fabricator/fabricator.duckdb_extension`
+  are all current. The `scratchpad/fabricnb` driver was updated to the fabricator payload names (its Fabric
+  NOTEBOOK item name stays `arrownet_ext_probe` — the SP can't recreate notebooks). Linux build: rsync the
+  renamed `src/` into WSL `~/sqlext`, `cmake --build … --target fabricator_loadable_extension`.
+  **LINUX LOAD-SMOKE VALIDATED (no dotnet needed pre-installed):** the FDD payload is framework-dependent, so
+  a **downloaded-and-extracted** .NET 8 runtime suffices — `dotnet-install.sh --runtime dotnet --install-dir
+  ~/dotnet8` (no root/install), `export DOTNET_ROOT=~/dotnet8` + `FABRICATOR_MANAGED_DIR=<extracted FDD zip>`,
+  then the duckdb 1.5.4 wheel (`pip install --target`, no venv) `load_extension`s the loadable. On WSL Ubuntu
+  22.04 (glibc 2.35 = Fabric Azure-Linux-3 baseline): `fabricator_version()`, delta CTAS/scan/filter-pushdown,
+  and rowid DELETE all pass — so the payload is proven to LOAD + RUN on linux, not just compile.** **IDEMPOTENT APPENDS (2026-07-11) — Delta
   APPLICATION TRANSACTIONS (the `txn` action; duckdb-delta/Spark txnAppId parity, additive metadata kinds
-  10/11 — NO ABI bump):** `CALL arrownet_delta_set_transaction_version(catalog, 'schema.table', app_id,
+  10/11 — NO ABI bump):** `CALL fabricator_delta_set_transaction_version(catalog, 'schema.table', app_id,
   version [, expected_previous])` PARKS the version on the current EXPLICIT transaction
   (`DeltaTxnBuffer.AppTxnVersions`; requires BEGIN — error otherwise; also pins the base version, so an
   append-only producer transaction routes through the checked flush); at COMMIT the flush
@@ -3366,7 +3428,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   omitted/NULL = must-not-exist) and emits one spec `txn` action per app ATOMICALLY with the fused commit —
   a retried batch whose first attempt actually landed (crash-after-commit, the failure class plain OCC
   can't protect) fails the CAS with "transaction version conflict" instead of duplicating data.
-  `arrownet_delta_get_transaction_version(catalog, 'schema.table', app_id)` reads the committed
+  `fabricator_delta_get_transaction_version(catalog, 'schema.table', app_id)` reads the committed
   high-water mark (NULL row when never set; EW `Snapshot.AppTransactions` — the read side always existed).
   The C++ binds set the FIXED (app_id, version) schema directly — deliberately NO PopulateReturnSchema
   probe, so the side-effecting factory runs only at EXECUTION where ArrowStreamInitGlobal establishes the
@@ -3473,12 +3535,12 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   object_store cloud IO); DELETE/UPDATE now work by mapping DuckDB's rowid DML to a **record-batch MERGE**
   (all columns = the rowid; see below), so `deltars` coexists as an opt-in read/write/**DML**/maintenance
   provider (`engineeredwooddelta` stays the default, incl. ALTER). **v1 BUILT +
-  verified (local FS)**: `dotnet/ArrowNet.DeltaRs` (`DeltaRsBackend`/`DeltaRsCatalog`/`StorageOptionsCodec`),
+  verified (local FS)**: `dotnet/Fabricator.DeltaRs` (`DeltaRsBackend`/`DeltaRsCatalog`/`StorageOptionsCodec`),
   registered in `BackendRegistry` (skipped if not published), opt-in publish via `publish-managed.ps1
   -IncludeDeltaRs` (adds `DeltaLake.dll` + the ~240 MB native `delta_rs_bridge.dll`/`delta_kernel_ffi.dll`);
   NO ABI/C++ change. Working: `ATTACH … (PROVIDER 'deltars')` (+ alias `delta-rs`), scan (via
   `ReadAsArrowTableAsync` — NOT DataFusion `QueryAsync`, whose schema diverged and SIGSEGV'd arrow_ingest),
-  CREATE/CTAS/INSERT/**COPY** (append+overwrite; `COPY … (FORMAT mssql_net)`: CREATE_TABLE false→append,
+  CREATE/CTAS/INSERT/**COPY** (append+overwrite; `COPY … (FORMAT mssql)`: CREATE_TABLE false→append,
   default→overwrite, new-table→create; `SCHEMA_MODE 'overwrite'` adopts schema [SchemaMode::Overwrite],
   `'merge'` appends + unions new source columns/old rows NULL [the bridge's `table_insert` maps a plain Append
   with `overwrite_schema=false` to delta-rs `SchemaMode::Merge`, so merge = force Append]), metadata, snapshots
@@ -3495,13 +3557,13 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   **no `deletion_vectors` ATTACH option** for delta-rs (declaring the feature would only bump the table to
   reader-v3, risking Fabric-converter breakage, for zero DV benefit) — use the `engineeredwooddelta` provider's
   `deletion_vectors true` for real DVs. **Maintenance** (OPTIMIZE / Z-ORDER / VACUUM / CHECKPOINT —
-  ops engineered-wood lacks) via a command dialect on `mssql_net_exec('<catalog>', 'OPTIMIZE main.t ZORDER
+  ops engineered-wood lacks) via a command dialect on `fabricator_exec('<catalog>', 'OPTIMIZE main.t ZORDER
   (id)' | 'VACUUM … [DRY RUN]' | 'CHECKPOINT main.t')` (C#-only `ExecuteNonQuery`, no ABI change;
   `test/verify_delta_rs_maintenance.test`, 12). **Filter pushdown** (FilterNode→DataFusion WHERE via QueryAsync,
   superset-safe/unpushable→TRUE; `_pushdown` 27), **time travel** (`AT (VERSION => n)` via QueryAsync — DataFusion
   reads the loaded snapshot, sidestepping the kernel-only `ReadAsArrowTableAsync`; composes with pushdown;
   `_time_travel` 36; VERSION 0 reads latest — delta-dotnet `Version=0` sentinel), and **Change Data Feed**
-  (`change_data_feed` ATTACH option + `arrownet_delta_changes`; `_cdf` 31) all work. **ALTER ADD COLUMN**
+  (`change_data_feed` ATTACH option + `fabricator_delta_changes`; `_cdf` 31) all work. **ALTER ADD COLUMN**
   works via a 0-row merge-append (Append+OverwriteSchema=false → `SchemaMode::Merge` unions the widened schema,
   old rows NULL — pure delta-dotnet, all backends, no engineered-wood IO seam) + **RENAME TABLE** (local folder
   move); `_alter` 47. **Deferred (clean error): RENAME/DROP COLUMN + ALTER TYPE** (need column mapping), cloud
@@ -3531,7 +3593,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   resolves DuckDB secrets while reading through the host `fs_*` callbacks; set in the shared `PopulateReturnSchema`
   + `ArrowStreamInitGlobal` arrow-scan hooks, read by the host-FS binding in `Bind`/`Execute`. **REMOVED**
   `delta_schema`/`delta_scan` (a mid-struct removal → offsets of later entries shift; `abi.h` ↔ `Abi.cs` kept in
-  lockstep, function/delta suites the gate): `arrownet_delta_scan` is now a pure-C# global `ITableFunction`
+  lockstep, function/delta suites the gate): `fabricator_delta_scan` is now a pure-C# global `ITableFunction`
   (`DeltaGlobalTableFunction`) on the v29 table session — a new lakehouse format costs zero C++. See the
   load-time-global-functions bullet + [docs/global-functions.md](docs/global-functions.md) §"Host-FS global table
   functions". v46 = **load-time global functions**: appended one vtable entry
@@ -3541,15 +3603,15 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   (all five global kinds — scalar/in-out/collector/table/aggregate — reuse it).
   v42–v45 = the **host-query** feature, prior session. v41 (its `delta_schema`/`delta_scan`, removed at v47) was
   the **Delta lakehouse reader on the filesystem bridge** SPIKE: appended
-  `delta_schema`/`delta_scan` to the vtable + `fs_glob` to `ArrowNetHostServices`. `arrownet_delta_scan(path)`
+  `delta_schema`/`delta_scan` to the vtable + `fs_glob` to `FabricatorHostServices`. `fabricator_delta_scan(path)`
   reads a Delta Lake table via **engineered-wood** (Curt Hagenlocher's pure-C# Delta), with ALL IO through
   DuckDB's `FileSystem` over the host callbacks — so local/`az://`/`s3://`/`https://` + DuckDB secrets all work.
   C# `DuckDbTableFileSystem : ITableFileSystem` (root-relative paths, read-only) + `DuckDbRandomAccessFile` over
   the callbacks; `DeltaReader` = `delta_schema` (bind, `OpenAsync().ArrowSchema`, no data) + `delta_scan`
   (execute, `ReadAllAsync()` **materialized** into an `InMemoryArrayStream` while the opener is valid); C++
-  `arrownet_delta.cpp` binds via `DeltaSchema`+`ReadArrowSchema`, scans via `DeltaScan`+`ArrowStreamReader`.
+  `fabricator_delta.cpp` binds via `DeltaSchema`+`ReadArrowSchema`, scans via `DeltaScan`+`ArrowStreamReader`.
   DuckDB applies projection/filter/aggregation above the scan. engineered-wood is referenced from
-  `ArrowNet.Bridge` (sibling repo `D:\repos\engineered-wood`, **Apache.Arrow 23.0.0 aligned**, net10.0) +
+  `Fabricator.Bridge` (sibling repo `D:\repos\engineered-wood`, **Apache.Arrow 23.0.0 aligned**, net10.0) +
   published transitively. **One local engineered-wood patch:** `ActionSerializer` read optional `add`/`remove`
   numeric fields (`baseRowId`/`defaultRowCommitVersion`/remove `size`/`deletionTimestamp` — the **Delta
   row-tracking** fields) with a bare `GetInt64()` that throws on delta-rs's explicit `"field":null`; guarded with
@@ -3560,7 +3622,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   architecture of DuckDB's own `delta` ext, swapping delta-kernel-rs for the C# log layer), with a cheaper
   `host_query`+`read_parquet` middle-ground first — is captured as a design note (deferred, nothing built):
   [docs/multifile-delta.md](docs/multifile-delta.md). **Phase-A pre-spike BUILT (2026-07-03):**
-  `arrownet_delta_native_scan(path)` — engineered-wood lists the EXACT active files + schema
+  `fabricator_delta_native_scan(path)` — engineered-wood lists the EXACT active files + schema
   (`DeltaReader.GetActiveFileUris`, the `add` set not a glob), DuckDB's NATIVE parquet reader reads them via
   `read_parquet([...])` on the host engine (`Host.Query`/host_query); OneLake file URIs rewritten to `onelake://`
   → native + ExternalFileCache-cached. Matches the C# reader row-for-row (`test/verify_delta_native_scan.test`,
@@ -3574,9 +3636,9 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   reader/writer, source of the decimal/DV-format/DataPage-V2/signed-min-max issues) FALLS AWAY; its strongest
   part (the `_delta_log` layer) stays. **The wiring trick** (from duckdb-delta): don't build `MultiFileFunction<>`
   — **clone `parquet_scan` + inject `function.get_multi_file_reader`**, inheriting all encodings + multi-file
-  parallelism + dynamic (join/TopN) filter pushdown for free; custom = `ArrowNetMultiFileList : SimpleMultiFileList`
-  (file list) + `ArrowNetMultiFileReader : MultiFileReader` (~8 overrides), ~400–1700 LOC provider-agnostic C++
-  in `arrownet-core`, reuses `ParquetMultiFileInfo` verbatim. **DVs are ~free** (native `BaseFileReader::deletion_filter`
+  parallelism + dynamic (join/TopN) filter pushdown for free; custom = `FabricatorMultiFileList : SimpleMultiFileList`
+  (file list) + `FabricatorMultiFileReader : MultiFileReader` (~8 overrides), ~400–1700 LOC provider-agnostic C++
+  in `fabricator-core`, reuses `ParquetMultiFileInfo` verbatim. **DVs are ~free** (native `BaseFileReader::deletion_filter`
   hook — attach a `DeleteFilter` from the C#-supplied DV). **Row tracking / commit version / CDF are all LOG-side
   (C#), orthogonal to who writes parquet, and EASIER here**: `baseRowId` assigned on commit from the exact per-file
   `WRITTEN_FILE_STATISTICS` row_count + the `delta.rowTracking` domainMetadata high-water mark (the one gap to
@@ -3588,11 +3650,11 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   writer — so DV-DELETE rides on Phase A/read alone); copy-on-write DELETE + UPDATE use the native writer;
   merge-on-read DV-UPDATE (DV old + small postimage file) is an optional later refinement. Biggest cost =
   coupling to DuckDB's churning
-  MultiFileReader internals (mitigated: provider-agnostic, in `arrownet-core`); no benefit for SQL Server / DAX
+  MultiFileReader internals (mitigated: provider-agnostic, in `fabricator-core`); no benefit for SQL Server / DAX
   (Delta-only). Phased: A read-only (host_query+read_parquet pre-spike optional) → B native write → C DML+CDF.
   A separate deferred note,
   [docs/delta-catalog.md](docs/delta-catalog.md), covers a **Delta WRITE-BACK** path: expose a Delta **folder
-  as an ATTACH catalog root** (`ATTACH '/lake/root' (TYPE arrownet, PROVIDER 'delta')`; each `_delta_log` subdir
+  as an ATTACH catalog root** (`ATTACH '/lake/root' (TYPE fabricator, PROVIDER 'delta')`; each `_delta_log` subdir
   = a table, discovered via `fs_glob`) as the 3rd `IBackend` reusing the provider-agnostic C++ catalog/scan/DML
   wholesale. engineered-wood is full read-write (INSERT/DELETE/UPDATE via `WriteAsync`/`DeleteAsync`/`UpdateAsync`
   + deletion vectors + commit writing; NO merge). Clean first slice = read + INSERT + CREATE (no rowid); the one
@@ -3604,19 +3666,19 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   isn't plumbed through the Delta filter path (small engineered-wood fix); and **dynamic (join/TopN) filters**
   can be applied by reading the live `TableFilterSet` (`TableFunctionInitInput.filters`) at execute time +
   merging into the predicate — the Delta scan's per-file C# loop even lets it re-check before each file. v40 =
-  filesystem reverse-callback SPIKE/foundation: a new `ArrowNetHostServices`
+  filesystem reverse-callback SPIKE/foundation: a new `FabricatorHostServices`
   struct (host→managed function pointers: `fs_open_read`/`fs_size`/`fs_read`/`fs_close`/`free_str`) is passed
   to `Bootstrap.Initialize(vtable, size, host)` so the managed side can call back into DuckDB's `FileSystem`
-  (secret-backed remote IO via DuckDB), plus an `fs_spike` vtable entry + `arrownet_fs_spike(path)` table fn
+  (secret-backed remote IO via DuckDB), plus an `fs_spike` vtable entry + `fabricator_fs_spike(path)` table fn
   that proves it. Key finding: `FileSystem::GetFileSystem(context)` is an `OpenerFileSystem` that AUTO-pushes
   the context's `FileOpener` (secrets) — open with NO explicit opener. Validated: local parquet (PAR1 footer)
   + remote https via httpfs (range GET). Foundation for a future C# lakehouse-format provider (engineered-wood
   Delta/Iceberg/Lance/… reusing DuckDB IO + secrets). See [docs/filesystem-bridge.md](docs/filesystem-bridge.md).
   v39 = foreign-secret consumption: `build_connection_string` gained
   `secret_type` + `base_connstr` args so a provider can reuse a secret of ANOTHER extension's type. C++
-  `BuildConnectionStringFromSecret` resolves ANY secret (`IsMssqlNetSecret`→`IsKnownSecret`) and passes the
+  `BuildConnectionStringFromSecret` resolves ANY secret (`IsFabricatorSecret`→`IsKnownSecret`) and passes the
   type + fields + the ATTACH target to C#; `SqlServerBackend` maps an `azure` service_principal/managed_identity
-  secret to Entra auth merged onto the ATTACH target (`ATTACH 'Server=…;Database=…' (TYPE mssql_net, SECRET
+  secret to Entra auth merged onto the ATTACH target (`ATTACH 'Server=…;Database=…' (TYPE fabricator, SECRET
   <azure_sp>)`), and rejects `credential_chain` (storage-scoped/lazy token) pointing to
   authentication='Active Directory Default'. Validated end-to-end against a live Fabric Warehouse (manual);
   error paths in `verify_azure_secret.test` (`require azure`). See [docs/provider-extensibility.md](docs/provider-extensibility.md) §2.1.
@@ -3624,18 +3686,18 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   appended; the provider declares its secret type + fields in C# (`IBackend.SecretType`/`SecretFields`), and
   `RegisterProviderSecrets` registers one DuckDB secret type per declared type generically (fields = the
   `CREATE SECRET` named params; one shared `CreateProviderSecret` keyed by `input.type`). The C++ core names
-  no secret type/field — the `kHost…` constants, `ValidateFields`, and `CreateMssqlNetSecret` are gone;
-  validation moved to C# `BuildConnectionString` (surfaces at connect time). `IsMssqlNetSecret`→
+  no secret type/field — the `kHost…` constants, `ValidateFields`, and `CreateFabricatorSecret` are gone;
+  validation moved to C# `BuildConnectionString` (surfaces at connect time). `IsFabricatorSecret`→
   `IsProviderSecret`. See [docs/provider-extensibility.md](docs/provider-extensibility.md) §2.
   v37 = the ATTACH-options→C# refactor: `open_catalog` gained an `options_json`
   arg carrying the provider-owned ATTACH options as a flat JSON object, and `inout_exchange_open` dropped its
-  `isolation` arg. `MssqlNetAttach` now extracts only PROVIDER/SECRET (meta) and forwards every other option
+  `isolation` arg. `FabricatorAttach` now extracts only PROVIDER/SECRET (meta) and forwards every other option
   as JSON; C# `SqlServerCatalog` parses `schema_filter`/`table_filter` (applied in `get_metadata`, with the
   regex validated C#-side) + `isolation_level` (resolved with `mssql_isolation_level` in `InOutBind`). The
   C++ `CatalogFilters`/`ValidateCatalogFilters`/`ResolveInOutIsolation` + the catalog's filter/isolation
   members are gone; function discovery is schema-filtered by only registering functions whose schema is
   already registered. See [docs/provider-extensibility.md](docs/provider-extensibility.md) §3.
-  v36 = the `mssql_net_exec` join-only refinement: `set_active_txn` gained an
+  v36 = the `fabricator_exec` join-only refinement: `set_active_txn` gained an
   `int32 join_only` arg — a raw exec joins the active transaction's pinned connection iff one already exists
   (atomic with an in-flight DuckDB-managed write, e.g. a dbt post-hook adding an index to the model), else
   autocommits without pinning; fixes the in-transaction-hook self-block, see [docs/dbt-hooks.md](docs/dbt-hooks.md) §3.
@@ -3664,12 +3726,12 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   v27 added a nullable `args` 1-row stream to `get_function_output_schema` so a
   custom table function's output schema can depend on its constant arguments — the **table `Bind`** capability;
   see "Callable table functions (4c)". v26 appended the three spillable-aggregate entries `agg_update_spill`/
-  `agg_combine_spill`/`agg_finalize_spill` + the `ARROWNET_AGG_SPILL_CAP` constant — 4h opt-in spill; v25
+  `agg_combine_spill`/`agg_finalize_spill` + the `FABRICATOR_AGG_SPILL_CAP` constant — 4h opt-in spill; v25
   appended the six custom-aggregate entries `agg_open`/`agg_update`/`agg_combine`/`agg_finalize`/`agg_destroy`/
   `agg_close` — 4h; v24 added `inout_open`'s `isolation` arg so the in-out session runs its per-chunk CROSS
   APPLY in one transaction at that SQL isolation level for a consistent view). **Bump rule:** when you add a
   vtable entry OR change a signature, bump
-  **BOTH** `ARROWNET_ABI_VERSION` in `abi.h` AND `vtable->AbiVersion = N` in `Bootstrap.Initialize`,
+  **BOTH** `FABRICATOR_ABI_VERSION` in `abi.h` AND `vtable->AbiVersion = N` in `Bootstrap.Initialize`,
   else the host throws "ABI version mismatch". Adding an *enum value* (e.g. a new metadata/alter kind)
   is additive and needs NO bump.
 - Ownership: the managed side **consumes/releases** every `ArrowArrayStream`/`ArrowSchema`/`ArrowArray`
@@ -3678,7 +3740,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
 ## Build & test
 
 - **Target DuckDB v1.5.4** (new extension API: `Extension::Load(ExtensionLoader&)` +
-  `loader.RegisterFunction(...)` + `DUCKDB_CPP_EXTENSION_ENTRY(mssql_net, loader)`). Submodules pinned
+  `loader.RegisterFunction(...)` + `DUCKDB_CPP_EXTENSION_ENTRY(fabricator, loader)`). Submodules pinned
   to `duckdb@08e34c4` (v1.5.4) + `extension-ci-tools@v1.5.3` (no 1.5.4 branch exists; v1.5.3 is the
   latest tooling for the 1.5.x line). `duckdb` is a **shallow** clone — bump via
   `git -C duckdb fetch --depth 1 origin <sha> && git -C duckdb checkout <sha>`.
@@ -3695,17 +3757,17 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   *and* built loadable):
   - `shell` → `build/release/duckdb.exe` (interactive shell; **embeds** the extension).
   - `unittest` → `build/release/test/unittest.exe` (runs the `.test` suites; **embeds** the extension).
-  - `mssql_net_loadable_extension` → `build/release/extension/mssql_net/mssql_net.duckdb_extension`
+  - `fabricator_loadable_extension` → `build/release/extension/fabricator/fabricator.duckdb_extension`
     (the loadable; needed to `LOAD` into a duckdb that does NOT embed it — e.g. the **official `duckdb==1.5.4`
     Python wheel** for the dbt-duckdb concurrency tests). **To load into the official wheel, reconfigure with
     `-DOVERRIDE_GIT_DESCRIBE=v1.5.4`** so the extension footer declares `duckdb_version=v1.5.4` — the shallow
     submodule has no git tag, so it otherwise defaults to `v0.0.1` and the official engine rejects it on the
     version check (NOT bypassed by `allow_unsigned_extensions`). Then `LOAD` with `allow_unsigned_extensions`
-    + set `ARROWNET_MANAGED_DIR` (the bridge isn't next to the python `.pyd`). Verified loads + ATTACH +
+    + set `FABRICATOR_MANAGED_DIR` (the bridge isn't next to the python `.pyd`). Verified loads + ATTACH +
     query against the official wheel. (This also fixes `json`/`icu` autoload, though we embed those.)
   - `cmake --build build/release` (no `--target`) builds all of them.
   - **After changing C++ extension code, rebuild the target whose binary you'll run.** Building only
-    `mssql_net_loadable_extension` then running `duckdb.exe`/`unittest.exe` runs the STALE embedded copy
+    `fabricator_loadable_extension` then running `duckdb.exe`/`unittest.exe` runs the STALE embedded copy
     (a `LOAD '<path>'` is then a no-op). This is the #1 "my change didn't take" trap.
 - Full configure (first time), run inside vcvars64:
   `cmake -G Ninja -DEXTENSION_STATIC_BUILD=1 -DDUCKDB_EXTENSION_CONFIGS=<repo>/extension_config.cmake
@@ -3713,8 +3775,8 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   -DENABLE_EXTENSION_AUTOINSTALL=1 -DENABLE_UNITTEST_CPP_TESTS=FALSE -DCMAKE_BUILD_TYPE=Release
   -S <repo>/duckdb -B <repo>/build/release`. `EXTENSION_VERSION "0.0.1"` is set in
   `extension_config.cmake` (the repo has commits now, but keep it — avoids relying on `git describe`).
-- **Managed publish:** `pwsh scripts/publish-managed.ps1` → publishes `ArrowNet.SqlServer` (+ Bridge +
-  self-contained .NET 10 runtime) into `build/release/extension/mssql_net/arrownet/`. A C#-only change
+- **Managed publish:** `pwsh scripts/publish-managed.ps1` → publishes `Fabricator.SqlServer` (+ Bridge +
+  self-contained .NET 10 runtime) into `build/release/extension/fabricator/fabricator/`. A C#-only change
   needs only a republish (no C++ rebuild) unless an ABI signature changed.
 - **TWO DEPLOYMENT MODES + PROVIDED-RUNTIME hosting (2026-07-12; Windows + Linux validated, Fabric live).**
   All extension projects multi-target **`net10.0;net8.0`** (`dotnet/Directory.Build.props`; EW already did)
@@ -3722,13 +3784,13 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   **framework-dependent** payload (~35 MB win / ~25 MB zipped linux vs ~250 MB self-contained; net8.0 +
   rollForward ⇒ ONE payload runs on .NET 8 AND 10+). `clr_host` detects the layout by **hostfxr's presence
   in the managed dir** (self-contained carries it): absent ⇒ resolve a PROVIDED .NET install —
-  **`ARROWNET_DOTNET_ROOT` > `DOTNET_ROOT` > platform defaults** (win `%ProgramFiles%\dotnet`; linux
+  **`FABRICATOR_DOTNET_ROOT` > `DOTNET_ROOT` > platform defaults** (win `%ProgramFiles%\dotnet`; linux
   `/etc/dotnet/install_location`, `/usr/share/dotnet`, `/usr/lib/dotnet`; mac `/usr/local/share/dotnet`) —
   load `<root>/host/fxr/<highest>/hostfxr` and pass the root via `hostfxr_initialize_parameters.dotnet_root`
   (NO env mutation; `host_path=null` = current process). **Gotcha found: a dotnet_root with FORWARD slashes
   fails at CreateCoreCLR with a cryptic E_INVALIDARG** (framework resolution tolerates them) — clr_host
   normalizes on Windows. Validated: FDD on the global install (rolls to newest), full suites on a
-  net8-ONLY private root via `ARROWNET_DOTNET_ROOT` (the "local .NET 10 beside global .NET 8" selector,
+  net8-ONLY private root via `FABRICATOR_DOTNET_ROOT` (the "local .NET 10 beside global .NET 8" selector,
   inverted), `DOTNET_ROLL_FORWARD` respected, SC unchanged (the publish script CLEANS the output dir on a
   mode change — a stale hostfxr would flip the detection).
 - **LINUX (linux_amd64) BUILDS + FULL SUITES GREEN (WSL Ubuntu 22.04, gcc 11 — glibc 2.35 baseline runs on
@@ -3746,11 +3808,11 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
 - **FABRIC NOTEBOOK VALIDATED LIVE (2026-07-12, Livy pyspark on workspace `Test`/`LH`):** the Fabric
   compute is **Azure Linux 3** (`6.6.141.1-1.azl3`) with **dotnet preinstalled at `/usr/share/dotnet`,
   .NET 8.0.28 ONLY, no DOTNET_ROOT set** — our default probe finds it with ZERO configuration. Flow:
-  upload `mssql_net.duckdb_extension` (linux_amd64) + the zipped FDD payload to the lakehouse
-  `Files/arrownet_ext/` (OneLake DFS), then in the session: `pip install --force-reinstall duckdb==1.5.4`
+  upload `fabricator.duckdb_extension` (linux_amd64) + the zipped FDD payload to the lakehouse
+  `Files/fabricator_ext/` (OneLake DFS), then in the session: `pip install --force-reinstall duckdb==1.5.4`
   (never import duckdb in the kernel before the pip — read the preinstalled version via
   `importlib.metadata`; the duckdb work runs in a SUBPROCESS interpreter, which also isolates a crash from
-  the kernel), stage to /tmp, `ARROWNET_MANAGED_DIR` + `load_extension` → `arrownet_version()` works,
+  the kernel), stage to /tmp, `FABRICATOR_MANAGED_DIR` + `load_extension` → `fabricator_version()` works,
   delta CTAS + explicit transaction correct. Driver: `scratchpad/fabricnb` (gitignored; reads the SP from
   dax_secret.sql) — `dotnet run livy` = the Spark-session path; raw Livy sessions have NO
   `/lakehouse/default` fuse mount — the probe stages via `spark.sparkContext.binaryFiles(abfss://…)` there.
@@ -3764,10 +3826,10 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   FeatureNotAvailable`, bare create too — the notebook must be created interactively ONCE; the SP-driven
   `updateDefinition` + `RunNotebook` then work), `updateDefinition?updateMetadata=true` requires a
   `.platform` part (omit the flag — the default-lakehouse binding rides in the ipynb metadata), and the
-  portal can save a display name with a TRAILING SPACE (`'arrownet_ext_probe '`) — resolve by trimmed
+  portal can save a display name with a TRAILING SPACE (`'fabricator_ext_probe '`) — resolve by trimmed
   comparison. `dotnet run run` = update+run the existing notebook; `upload` = refresh the OneLake
-  distribution (`LH/Files/arrownet_ext/`). **The MANAGED Tables area works through the fuse mount** —
-  `ATTACH '/lakehouse/default/Tables' (TYPE arrownet, PROVIDER 'delta', schemas true)`: credential-free
+  distribution (`LH/Files/fabricator_ext/`). **The MANAGED Tables area works through the fuse mount** —
+  `ATTACH '/lakehouse/default/Tables' (TYPE fabricator, PROVIDER 'delta', schemas true)`: credential-free
   read + CREATE + explicit-txn append on `tlake.dbo.*`, all sub-second per op (single-writer only: the
   commit's O_EXCL put-if-absent is doubtful over fuse — concurrent writers should use abfss/onelake).
   **PERF (measured per-step): the notebook's in-session work went ~305 s → ~15 s** via two fixes:
@@ -3787,38 +3849,38 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   "directory" doesn't exist as an object there; only a FILE under it proves the table — which is why the
   glob remains the object-store path and only local roots take the System.IO walk.
   (2) the **duckdb wheel ships with the distribution** and installs
-  `pip --no-deps --no-compile --target /tmp/arrownet_pyduck` + `PYTHONPATH` for the probe subprocess
+  `pip --no-deps --no-compile --target /tmp/fabricator_pyduck` + `PYTHONPATH` for the probe subprocess
   (37 s PyPI force-reinstall → 3.3 s; the session's own duckdb stays untouched). Remaining wall-clock ≈
   Fabric job scheduling/session spin-up (~45–60 s, not ours).
-- **Managed-dir resolution gotcha:** `clr_host` looks for the bridge in `ARROWNET_MANAGED_DIR`, else an
-  `arrownet/` folder *next to the loaded module*. For the static `duckdb.exe`/`unittest.exe` the module IS
-  the exe, so the default lookup is `build/release/arrownet` (next to `duckdb.exe`) — but
-  `publish-managed.ps1` lands the bridge in `build/release/extension/mssql_net/arrownet`. So when running
-  an exe **directly** you MUST set `ARROWNET_MANAGED_DIR` to that publish dir (symptom otherwise:
-  `ArrowNet: failed to load hostfxr from …\build\release\arrownet\hostfxr.dll`). Manual smoke, e.g.:
-  `ARROWNET_MANAGED_DIR=…/extension/mssql_net/arrownet build/release/duckdb.exe -unsigned -batch < q.sql`.
+- **Managed-dir resolution gotcha:** `clr_host` looks for the bridge in `FABRICATOR_MANAGED_DIR`, else an
+  `fabricator/` folder *next to the loaded module*. For the static `duckdb.exe`/`unittest.exe` the module IS
+  the exe, so the default lookup is `build/release/fabricator` (next to `duckdb.exe`) — but
+  `publish-managed.ps1` lands the bridge in `build/release/extension/fabricator/fabricator`. So when running
+  an exe **directly** you MUST set `FABRICATOR_MANAGED_DIR` to that publish dir (symptom otherwise:
+  `Fabricator: failed to load hostfxr from …\build\release\fabricator\hostfxr.dll`). Manual smoke, e.g.:
+  `FABRICATOR_MANAGED_DIR=…/extension/fabricator/fabricator build/release/duckdb.exe -unsigned -batch < q.sql`.
 - **CoreCLR hosting:** init via `hostfxr_initialize_for_dotnet_command_line` (argv[0] =
-  `ArrowNet.Bridge.dll`) then `hdt_load_assembly_and_get_function_pointer`.
+  `Fabricator.Bridge.dll`) then `hdt_load_assembly_and_get_function_pointer`.
   `hostfxr_initialize_for_runtime_config` FAILS for self-contained deployments. The bridge finds its
-  files via `ARROWNET_MANAGED_DIR`, else an `arrownet/` folder next to the extension binary.
+  files via `FABRICATOR_MANAGED_DIR`, else an `fabricator/` folder next to the extension binary.
 - **C++ standard gotcha:** DuckDB compiles extensions pre-C++17 → `std::string/wstring::data()` is
   `const`; use `&s[0]` for `MultiByteToWideChar`/`WideCharToMultiByte` out buffers.
 - **Tests:** `build/release/test/unittest.exe --test-dir <repo-root> "test/mssqlcompat/<dir>/*"` (and
-  `test/verify_*.test`). Set `ARROWNET_MANAGED_DIR=build/release/extension/mssql_net/arrownet` +
+  `test/verify_*.test`). Set `FABRICATOR_MANAGED_DIR=build/release/extension/fabricator/fabricator` +
   `MSSQL_TESTDB_DSN` (and `MSSQL_TEST_SERVER`/`_CONNECTION_STRING` = the same full DSN for the tests
   that ATTACH it directly). The corpus is regenerated from `D:\repos\mssql-extension/test/sql` by
   `scripts/gen_mssqlcompat_tests.sh`; it lives at `test/mssqlcompat/` and is **gitignored** (keep the
   duckdb submodule clean).
 - **Test env (docker compose, `docker/docker-compose.yml` — replaced the ad-hoc container 2026-07-10):**
-  SQL Server 2025 (`mcr.microsoft.com/mssql/server:2025-latest`, container `mssql-arrownet`, port 1433,
+  SQL Server 2025 (`mcr.microsoft.com/mssql/server:2025-latest`, container `mssql-fabricator`, port 1433,
   `sa` / `Arrow_Net_123!`, DBs `ArrowTest` + `TestDB` — created by `docker/provision.ps1`; all other test
   objects self-provision inside the tests) + **MinIO** (S3-compatible: `miniouser` / `miniosecret123` —
-  deliberately ALPHANUMERIC, SQL's S3 credential requires it; bucket `arrownet`; S3 API 9000 / console
+  deliberately ALPHANUMERIC, SQL's S3 credential requires it; bucket `fabricator`; S3 API 9000 / console
   9001; **HTTPS** via the self-signed cert from `docker/certs/generate-certs.ps1`, SANs
   `minio`/`localhost`/`127.0.0.1` — SQL Server's `s3://` connector REQUIRES TLS, trusted via the compose
   mount at `/var/opt/mssql/security/ca-certificates`). Bring-up: certs → compose up → provision
   (docker/README.md). Connstr needs `TrustServerCertificate=true;Encrypt=true`. `sqlcmd` v18 in-container:
-  `docker exec mssql-arrownet /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Arrow_Net_123!' -C`.
+  `docker exec mssql-fabricator /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Arrow_Net_123!' -C`.
 - **S3 / MinIO / SQL Server data virtualization (2026-07-10).** `httpfs` is now statically linked
   (`extension_config.cmake` — out-of-tree pin `duckdb-httpfs @ c3f215ab`, the sha DuckDB v1.5.4's own CI
   uses; needs OpenSSL+curl via the vcpkg toolchain: `vcpkg install openssl:x64-windows-static
@@ -3827,14 +3889,14 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   engineered-wood Delta catalog works on `s3://` (MinIO): ATTACH/discovery, CREATE/CTAS/INSERT, pushdown,
   DV DELETE + merge-on-read UPDATE, snapshots, explicit transactions, re-attach, and the
   native_write/native_read variant — `test/verify_delta_catalog_s3.test` (60, gated
-  `ARROWNET_S3_ENDPOINT`; re-runnable via CREATE OR REPLACE against the persistent bucket). Self-signed
+  `FABRICATOR_S3_ENDPOINT`; re-runnable via CREATE OR REPLACE against the persistent bucket). Self-signed
   TLS: `SET GLOBAL enable_curl_server_cert_verification = false` (GLOBAL — the transaction flush runs on
   its own connection; production alternative `ca_cert_file`). **Four real bugs found by the S3 rig:**
   (1) `DuckDbTableFileSystem.ExistsAsync` probed via a wildcard-free glob — httpfs' S3 glob ECHOES
   literal paths back without checking the store, so every commit-0 hit a phantom "version 0 already
   exists"; now probes via OpenRead (a HEAD on object stores). (2) The transaction flush used the
   committing context as opener, but the SECRET MANAGER requires an ACTIVE transaction ("ActiveTransaction
-  called without active transaction" on s3) — `ArrowNetTransactionManager::CommitTransaction` now gives
+  called without active transaction" on s3) — `FabricatorTransactionManager::CommitTransaction` now gives
   the flush its OWN short-lived `Connection` + transaction as the opener (local paths need no secrets, so
   no local test ever saw this). (3) EW `WriteCoreAsync`'s Overwrite-removes omitted the file's
   `deletionVector`, so a REPLACE over a DV-carrying file never matched the active (path,DV) entry — the
@@ -3847,13 +3909,13 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   reads our Delta from MinIO:** SQL Server 2025 (17.x) reads CSV/Parquet/**DELTA** on S3 **natively** (no
   PolyBase package, no `sp_configure 'polybase enabled'`, no TF13702 — those are 2022 requirements;
   `mssql-server-polybase` exists for 17.x/Ubuntu 24.04 but is only needed for RDBMS connectors).
-  `test/verify_mssql_s3_polybase.test` (70, gated `MSSQL_TESTDB_DSN` + `ARROWNET_S3_ENDPOINT` +
-  `ARROWNET_S3_SQL_ENDPOINT`): our provider CTASes to `s3://arrownet/polybase` → `mssql_net_exec`
+  `test/verify_mssql_s3_polybase.test` (70, gated `MSSQL_TESTDB_DSN` + `FABRICATOR_S3_ENDPOINT` +
+  `FABRICATOR_S3_SQL_ENDPOINT`): our provider CTASes to `s3://fabricator/polybase` → `fabricator_exec`
   provisions MASTER KEY + `DATABASE SCOPED CREDENTIAL (IDENTITY='S3 Access Key', SECRET='key:secret')` +
   `EXTERNAL DATA SOURCE (LOCATION='s3://minio:9000/')` + `EXTERNAL FILE FORMAT (FORMAT_TYPE=DELTA)` →
-  `OPENROWSET(BULK '/arrownet/polybase/trips', FORMAT='DELTA', DATA_SOURCE='s3_ds')` matches row-for-row
+  `OPENROWSET(BULK '/fabricator/polybase/trips', FORMAT='DELTA', DATA_SOURCE='s3_ds')` matches row-for-row
   → `CREATE EXTERNAL TABLE` + read back through the ATTACHed catalog as a normal scan (DuckDB →
-  mssql_net → SQL Server → S3 delta reader → MinIO → table written by our Delta provider). **SQL Server's
+  fabricator → SQL Server → S3 delta reader → MinIO → table written by our Delta provider). **SQL Server's
   DELTA reader = Delta protocol 1.0 ONLY** — the interop table MUST be written `deletion_vectors false,
   column_mapping 'none'`: a DV-default reader-v3 table errors, and a NAME-mapped table is rejected with
   the SPECIFIC error `19725: Column mapping is not enabled` (the reader recognizes the feature but gates
@@ -3867,7 +3929,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   httpfs' S3 `RemoveDirectory` re-lists keys WITHOUT the scheme prefix and fails its own remove ("URL
   needs to start with s3://"), so `DeltaCatalog.DropTable` catches the failure and deletes glob(`/**`)
   file-by-file + the zero-byte directory-marker keys (`RemoveFile` IS implemented for s3). S3 caveats
-  (documented, unchanged): no put-if-absent on httpfs S3 (single-writer; `arrownet_fs_write_probe` shows
+  (documented, unchanged): no put-if-absent on httpfs S3 (single-writer; `fabricator_fs_write_probe` shows
   EXCLUSIVE_CREATE unguarded), `MoveFile` unimplemented (RENAME TABLE fails); `DROP EXTERNAL TABLE IF
   EXISTS` is not T-SQL (use `IF OBJECT_ID(...) IS NOT NULL DROP EXTERNAL TABLE ...`). **CDF on S3 works end-to-end** (change files write to + read
   from the bucket; the feed is exact) **and a CDF table stays SQL-Server-readable** (changeDataFeed is
@@ -3883,22 +3945,22 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
 - **Copy-paste test env** (Bash tool; test-only creds — the REAL Fabric SP lives only in the gitignored
   `dax_secret.sql`, never here). Run the loadable/shell/unittest from `build/release/`:
   ```bash
-  export ARROWNET_MANAGED_DIR=build/release/extension/mssql_net/arrownet
+  export FABRICATOR_MANAGED_DIR=build/release/extension/fabricator/fabricator
   DSN='Server=localhost,1433;Database=TestDB;User Id=sa;Password=Arrow_Net_123!;TrustServerCertificate=true;Encrypt=true'
   export MSSQL_TESTDB_DSN="$DSN" MSSQL_TEST_SERVER="$DSN" MSSQL_TEST_CONNECTION_STRING="$DSN"
   # a Delta catalog verify test needs a writable base dir:
-  export ARROWNET_DELTA_WRITE_DIR="$(mktemp -d)"      # each test file wants its OWN fresh dir
+  export FABRICATOR_DELTA_WRITE_DIR="$(mktemp -d)"      # each test file wants its OWN fresh dir
   # S3/MinIO tests (docker compose stack must be up):
-  export ARROWNET_S3_ENDPOINT=localhost:9000          # gates verify_delta_catalog_s3
-  export ARROWNET_S3_SQL_ENDPOINT=minio:9000          # + MSSQL_TESTDB_DSN gates verify_mssql_s3_polybase
+  export FABRICATOR_S3_ENDPOINT=localhost:9000          # gates verify_delta_catalog_s3
+  export FABRICATOR_S3_SQL_ENDPOINT=minio:9000          # + MSSQL_TESTDB_DSN gates verify_mssql_s3_polybase
   # run one test at a time (the runner concatenates multiple filters into one bad glob):
   build/release/test/unittest.exe --test-dir . "test/verify_delta_catalog_native_write.test"
-  # trace the write path: prepend ARROWNET_LOG_LEVEL=Debug (logs off by default)
+  # trace the write path: prepend FABRICATOR_LOG_LEVEL=Debug (logs off by default)
   # NOTE: the sqllogictest runner AUTO-SKIPS a test whose error message contains 'HTTP' (network-flake
   # tolerance) — an S3 test that "skips" may actually be FAILING; reproduce via the shell to see why.
   # live Fabric OneLake: a .sql script starting with  .read dax_secret.sql  then
   #   ATTACH 'abfss://Test@onelake.dfs.fabric.microsoft.com/LH.Lakehouse/Tables' AS lake
-  #     (TYPE arrownet, PROVIDER 'delta', SECRET fabric_sp, READ_ONLY false [, native_write true]);
+  #     (TYPE fabricator, PROVIDER 'delta', SECRET fabric_sp, READ_ONLY false [, native_write true]);
   #   piped:  build/release/duckdb.exe -unsigned -batch < script.sql   (LH = schema-enabled, dbo)
   ```
 
@@ -3921,8 +3983,8 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   over-approximation (superset) is correct; map filters/projection **by name**, not positionally.
 - **C++ is provider-agnostic** — the operators only produce Arrow + table/column identity; every SQL
   Server specific (SqlBulkCopy, parameterized UPDATE/DELETE, type mapping, DDL generation, all `sys.*`)
-  lives in `ArrowNet.SqlServer`. Keep it that way.
-- **The C++↔C# Arrow boundary always uses STANDARD encoding** (`arrownet::BoundaryClientProperties`, used at
+  lives in `Fabricator.SqlServer`. Keep it that way.
+- **The C++↔C# Arrow boundary always uses STANDARD encoding** (`fabricator::BoundaryClientProperties`, used at
   every DuckDB→Arrow site instead of `context.GetClientProperties()`): it keeps the session time zone +
   Arrow output version but forces `arrow_lossless_conversion`/`arrow_offset_size`/`produce_arrow_string_view`/
   `arrow_use_list_view` to their standard form. Our bridge maps Arrow→provider types itself, so a user's
@@ -3935,8 +3997,8 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   difference, not a bug.
 - **CHECK constraints + non-literal DEFAULTs on CREATE: deliberately skipped** (per user).
 - **Commit only when asked.** The Python scaffold (`main.py`/`pyproject.toml`/`uv.lock`/
-  `.python-version`) is intentionally left untracked. `.gitignore` note: `**/arrownet/` would match the
-  *source* `src/arrownet/` + `src/include/arrownet/` — negations re-include them; never re-broaden it.
+  `.python-version`) is intentionally left untracked. `.gitignore` note: `**/fabricator/` would match the
+  *source* `src/fabricator/` + `src/include/fabricator/` — negations re-include them; never re-broaden it.
 
 ## Sibling repos (reference under `D:\repos\`)
 

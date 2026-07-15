@@ -1,23 +1,23 @@
 # name: test/verify_delta_native_scan.test
-# description: arrownet_delta_native_scan(path) — the native-read path (docs/multifile-delta.md Phase A pre-spike):
+# description: fabricator_delta_native_scan(path) — the native-read path (docs/multifile-delta.md Phase A pre-spike):
 #              engineered-wood lists the EXACT active data files + schema, and DuckDB's NATIVE parquet reader reads
 #              them via read_parquet run on the host engine (host_query). Must match the C# reader
-#              (arrownet_delta_scan) row-for-row. Plain tables (no DV/partition). Fixture: test/fixtures/delta_simple
-#              (a delta-rs-written table, 10 rows id/name/amount). Set ARROWNET_DELTA_DIR to its absolute path.
-# group: [mssql_net]
+#              (fabricator_delta_scan) row-for-row. Plain tables (no DV/partition). Fixture: test/fixtures/delta_simple
+#              (a delta-rs-written table, 10 rows id/name/amount). Set FABRICATOR_DELTA_DIR to its absolute path.
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
 # read_parquet must be loaded instance-wide so the host_query fresh connection sees it (the native path runs
 # read_parquet on the host engine). The shell/python wheel ship parquet; the test binary links it statically
 # (extension_config.cmake) and `require` loads it into the DatabaseInstance.
 require parquet
 
-require-env ARROWNET_DELTA_DIR
+require-env FABRICATOR_DELTA_DIR
 
 # Native read returns the full table, correct rows/types (schema resolved at bind from engineered-wood).
 query III
-SELECT id, name, amount FROM arrownet_delta_native_scan('${ARROWNET_DELTA_DIR}') ORDER BY id;
+SELECT id, name, amount FROM fabricator_delta_native_scan('${FABRICATOR_DELTA_DIR}') ORDER BY id;
 ----
 1	row_1	1.5
 2	row_2	3.0
@@ -32,22 +32,22 @@ SELECT id, name, amount FROM arrownet_delta_native_scan('${ARROWNET_DELTA_DIR}')
 
 # The native path and the C# reader agree exactly (count + sum).
 query II
-SELECT count(*), sum(id) FROM arrownet_delta_native_scan('${ARROWNET_DELTA_DIR}');
+SELECT count(*), sum(id) FROM fabricator_delta_native_scan('${FABRICATOR_DELTA_DIR}');
 ----
 10	55
 
 query II
-SELECT count(*), sum(id) FROM arrownet_delta_scan('${ARROWNET_DELTA_DIR}');
+SELECT count(*), sum(id) FROM fabricator_delta_scan('${FABRICATOR_DELTA_DIR}');
 ----
 10	55
 
 # Projection + filter are applied by DuckDB above the read_parquet scan (the binding advertises no pushdown).
 query I
-SELECT count(*) FROM arrownet_delta_native_scan('${ARROWNET_DELTA_DIR}') WHERE id > 7;
+SELECT count(*) FROM fabricator_delta_native_scan('${FABRICATOR_DELTA_DIR}') WHERE id > 7;
 ----
 3
 
 query I
-SELECT sum(amount) FROM arrownet_delta_native_scan('${ARROWNET_DELTA_DIR}') WHERE name = 'row_2';
+SELECT sum(amount) FROM fabricator_delta_native_scan('${FABRICATOR_DELTA_DIR}') WHERE name = 'row_2';
 ----
 3.0

@@ -1,4 +1,4 @@
-# Transactions & MARS — how `mssql_net` maps DuckDB transactions onto SQL Server
+# Transactions & MARS — how `fabricator` maps DuckDB transactions onto SQL Server
 
 > Reference for the transaction lifecycle across the C++ ⇄ C# boundary: how DuckDB's
 > autocommit / `BEGIN` / `COMMIT` / `ROLLBACK` drive the SQL Server connection, when a
@@ -59,7 +59,7 @@ three *distinct* deferral points:
 | Level | What | When |
 |-------|------|------|
 | **L1** | DuckDB `BeginTransaction()` (the `MetaTransaction`) | **Always**, per statement in autocommit (unconditional in `BeginQueryInternal`). |
-| **L2** | Extension `ArrowNetTransactionManager::StartTransaction` → C# `_inTransaction = true` | **Lazy on first catalog touch** within the transaction (via `MetaTransaction::GetTransaction`). |
+| **L2** | Extension `FabricatorTransactionManager::StartTransaction` → C# `_inTransaction = true` | **Lazy on first catalog touch** within the transaction (via `MetaTransaction::GetTransaction`). |
 | **L3** | C# pins the `SqlConnection` + opens the `SqlTransaction` (`BeginWrite`) | **Lazy on the first *write*** only. |
 
 So even a plain autocommit `SELECT * FROM mssql.dbo.t` runs L1 + L2 (flag flips), but **not** L3 — no
@@ -67,17 +67,17 @@ connection is pinned, the scan uses a pooled connection, and the statement-end c
 
 ## 3. How the extension participates
 
-`src/catalog/arrownet_transaction.cpp` (`ArrowNetTransactionManager`) is a thin participant in DuckDB's
+`src/catalog/fabricator_transaction.cpp` (`FabricatorTransactionManager`) is a thin participant in DuckDB's
 protocol:
 
-- `StartTransaction` → `arrownet::BeginTransaction(handle)` → C# `SqlServerCatalog.BeginTransaction()`,
+- `StartTransaction` → `fabricator::BeginTransaction(handle)` → C# `SqlServerCatalog.BeginTransaction()`,
   which only sets `_inTransaction = true` ("pin lazily on the first write"). **Best-effort** — a failure
   here must not abort the statement (a later write would fail loudly on its own).
-- `CommitTransaction` → `arrownet::CommitTransaction(handle)` → C# `EndTransaction(commit: true)`.
-- `RollbackTransaction` → `arrownet::RollbackTransaction(handle)` → C# `EndTransaction(commit: false)`.
+- `CommitTransaction` → `fabricator::CommitTransaction(handle)` → C# `EndTransaction(commit: true)`.
+- `RollbackTransaction` → `fabricator::RollbackTransaction(handle)` → C# `EndTransaction(commit: false)`.
   **Never throws** (rollback must be safe on every teardown path).
 
-C# transaction state lives on `SqlServerCatalog` in `dotnet/ArrowNet.SqlServer/SqlServerBackend.cs`
+C# transaction state lives on `SqlServerCatalog` in `dotnet/Fabricator.SqlServer/SqlServerBackend.cs`
 (`_txnLock`, `_inTransaction`, `_txnConnection`, `_txn`). `EndTransaction` commits/rolls back `_txn` if
 present, then disposes `_txn` + `_txnConnection` and clears `_inTransaction`. A read-only transaction
 reaches `EndTransaction` with `_txn == null` → a graceful no-op.
@@ -223,7 +223,7 @@ is *how* operations share that pinned connection:
   before the next runs. That header (not MARS) is how it does transactions; its code comment implying MARS
   is required for it is a misnomer — ALL_HEADERS + Transaction Descriptor is mandatory for `SQL_BATCH` in
   TDS 7.2+ regardless of MARS.
-- **`mssql_net` — two active result sets at once.** SqlClient + DuckDB's pull-based execution keep a
+- **`fabricator` — two active result sets at once.** SqlClient + DuckDB's pull-based execution keep a
   `SqlDataReader` open across many `get_next` calls, and we route that read *and* the transaction's DML
   through the one pinned connection (read-your-writes) → an open reader and a DML command live on the same
   connection → MARS.
@@ -235,7 +235,7 @@ pinned-connection transaction shape, opposite answer on MARS.
 ## 6. `INSERT INTO xx SELECT … FROM y` — pin timing is a race (and harmless)
 
 INSERT uses the streaming bulk path (`begin_bulk` / `push_batch` / `complete_bulk`,
-`dotnet/ArrowNet.Bridge/BulkSession.cs`). The pin is **deferred to a background task**: the `BulkSession`
+`dotnet/Fabricator.Bridge/BulkSession.cs`). The pin is **deferred to a background task**: the `BulkSession`
 ctor spins up `Task.Run(() => catalog.BulkInsert(...))`, and the pin happens inside that pool-thread task
 when `BulkInsert` → `BeginWrite()` runs. `SqlBulkCopy` then loads `xx` on the pinned connection + `SqlTransaction`.
 
@@ -257,7 +257,7 @@ decoupled, but it's not a pattern to rely on without a dedicated test.
 
 ## 7. Per-row stored procedures (`_each`) ride DuckDB's transaction
 
-`SqlServerProcEach` (the proc `_each` exchange binding, `dotnet/ArrowNet.SqlServer/SqlServerProcEach.cs`)
+`SqlServerProcEach` (the proc `_each` exchange binding, `dotnet/Fabricator.SqlServer/SqlServerProcEach.cs`)
 runs its per-row `EXEC` on **DuckDB's pinned write connection** via `BeginWrite()`, and deliberately does
 **not** commit or dispose the scope. So the proc's writes commit/roll back with **DuckDB's**
 `COMMIT`/`ROLLBACK` — atomic in autocommit *and* inside an explicit `BEGIN`, with no per-row commits. The

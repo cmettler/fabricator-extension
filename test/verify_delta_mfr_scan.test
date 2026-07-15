@@ -1,21 +1,21 @@
 # name: test/verify_delta_mfr_scan.test
-# description: arrownet_delta_mfr_scan(path) — Delta native read via DuckDB's MultiFileReader (docs/multifile-delta.md
+# description: fabricator_delta_mfr_scan(path) — Delta native read via DuckDB's MultiFileReader (docs/multifile-delta.md
 #              Phase A slice 1a). A clone of parquet_scan whose MultiFileReader gets the EXACT active data files from
 #              engineered-wood (delta_list_files → a SimpleMultiFileList); DuckDB's native parquet reader then reads
 #              them (cached over onelake:// for OneLake). This is the C++ MultiFileReader foundation for DV /
 #              partition / dynamic-filter pushdown (later slices). Must match the C# reader row-for-row. Plain tables.
-#              Fixture: test/fixtures/delta_simple (delta-rs, 10 rows id/name/amount). Set ARROWNET_DELTA_DIR.
-# group: [mssql_net]
+#              Fixture: test/fixtures/delta_simple (delta-rs, 10 rows id/name/amount). Set FABRICATOR_DELTA_DIR.
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
 require parquet
 
-require-env ARROWNET_DELTA_DIR
+require-env FABRICATOR_DELTA_DIR
 
 # Full scan through the MultiFileReader — correct rows/types (schema derived from the parquet files).
 query III
-SELECT id, name, amount FROM arrownet_delta_mfr_scan('${ARROWNET_DELTA_DIR}') ORDER BY id;
+SELECT id, name, amount FROM fabricator_delta_mfr_scan('${FABRICATOR_DELTA_DIR}') ORDER BY id;
 ----
 1	row_1	1.5
 2	row_2	3.0
@@ -30,22 +30,22 @@ SELECT id, name, amount FROM arrownet_delta_mfr_scan('${ARROWNET_DELTA_DIR}') OR
 
 # Agrees with the C# reader (count + sum).
 query II
-SELECT count(*), sum(id) FROM arrownet_delta_mfr_scan('${ARROWNET_DELTA_DIR}');
+SELECT count(*), sum(id) FROM fabricator_delta_mfr_scan('${FABRICATOR_DELTA_DIR}');
 ----
 10	55
 
 query II
-SELECT count(*), sum(id) FROM arrownet_delta_scan('${ARROWNET_DELTA_DIR}');
+SELECT count(*), sum(id) FROM fabricator_delta_scan('${FABRICATOR_DELTA_DIR}');
 ----
 10	55
 
 # Projection + filter applied by DuckDB above the MultiFileReader scan.
 query I
-SELECT count(*) FROM arrownet_delta_mfr_scan('${ARROWNET_DELTA_DIR}') WHERE id > 7;
+SELECT count(*) FROM fabricator_delta_mfr_scan('${FABRICATOR_DELTA_DIR}') WHERE id > 7;
 ----
 3
 
 query I
-SELECT sum(amount) FROM arrownet_delta_mfr_scan('${ARROWNET_DELTA_DIR}') WHERE name = 'row_2';
+SELECT sum(amount) FROM fabricator_delta_mfr_scan('${FABRICATOR_DELTA_DIR}') WHERE name = 'row_2';
 ----
 3.0

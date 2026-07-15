@@ -2,28 +2,28 @@
 # description: Discovered scalar UDFs are callable as db.schema.fn(args) over Arrow, incl. NULL round-trips (4b)
 # group: [mssql]
 
-require mssql_net
+require fabricator
 
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS scdb (TYPE mssql_net);
+ATTACH '${MSSQL_TESTDB_DSN}' AS scdb (TYPE fabricator);
 
 # Scalar UDFs to call: sc_add (NULL-propagating), sc_inc (returns non-NULL for a NULL
 # arg), sc_greet (string). Distinct names so this can't clash with verify_functions.test.
 statement ok
-SELECT mssql_net_exec('scdb', 'CREATE OR ALTER FUNCTION dbo.sc_add(@a INT, @b INT) RETURNS INT AS BEGIN RETURN @a + @b END');
+SELECT fabricator_exec('scdb', 'CREATE OR ALTER FUNCTION dbo.sc_add(@a INT, @b INT) RETURNS INT AS BEGIN RETURN @a + @b END');
 
 statement ok
-SELECT mssql_net_exec('scdb', 'CREATE OR ALTER FUNCTION dbo.sc_inc(@a INT) RETURNS INT AS BEGIN RETURN ISNULL(@a, -1) + 1 END');
+SELECT fabricator_exec('scdb', 'CREATE OR ALTER FUNCTION dbo.sc_inc(@a INT) RETURNS INT AS BEGIN RETURN ISNULL(@a, -1) + 1 END');
 
 statement ok
-SELECT mssql_net_exec('scdb', 'CREATE OR ALTER FUNCTION dbo.sc_greet(@n NVARCHAR(50)) RETURNS NVARCHAR(100) AS BEGIN RETURN ''Hello, '' + @n END');
+SELECT fabricator_exec('scdb', 'CREATE OR ALTER FUNCTION dbo.sc_greet(@n NVARCHAR(50)) RETURNS NVARCHAR(100) AS BEGIN RETURN ''Hello, '' + @n END');
 
-# Newly-created UDFs are picked up on a cache refresh (DDL via mssql_net_exec does not
+# Newly-created UDFs are picked up on a cache refresh (DDL via fabricator_exec does not
 # auto-invalidate the catalog cache by default).
 statement ok
-SELECT mssql_refresh_cache('scdb');
+SELECT fabricator_refresh_cache('scdb');
 
 # Basic scalar call.
 query I
@@ -72,13 +72,13 @@ SELECT scdb.dbo.sc_add(i, 1) FROM range(1, 3) t(i);
 No function matches
 
 statement ok
-SELECT mssql_net_exec('scdb', 'DROP FUNCTION IF EXISTS dbo.sc_add');
+SELECT fabricator_exec('scdb', 'DROP FUNCTION IF EXISTS dbo.sc_add');
 
 statement ok
-SELECT mssql_net_exec('scdb', 'DROP FUNCTION IF EXISTS dbo.sc_inc');
+SELECT fabricator_exec('scdb', 'DROP FUNCTION IF EXISTS dbo.sc_inc');
 
 statement ok
-SELECT mssql_net_exec('scdb', 'DROP FUNCTION IF EXISTS dbo.sc_greet');
+SELECT fabricator_exec('scdb', 'DROP FUNCTION IF EXISTS dbo.sc_greet');
 
 statement ok
 DETACH scdb;

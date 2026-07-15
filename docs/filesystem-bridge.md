@@ -20,7 +20,7 @@ credential-carrying opener on every call, matching engineered-wood's `IRandomAcc
 ## The mechanism (reverse callbacks)
 
 The vtable is C++→C# (the host fills it). The filesystem bridge is the **reverse direction**: the host
-provides `ArrowNetHostServices` (in `abi.h`) — a struct of function pointers the **managed side calls** to
+provides `FabricatorHostServices` (in `abi.h`) — a struct of function pointers the **managed side calls** to
 reach DuckDB's `FileSystem`:
 
 - `fs_open_read(opener, path, *out_file, err)` / `fs_size` / `fs_read(file, buf, nr, location, err)` /
@@ -38,11 +38,11 @@ wraps the callbacks.
 Secret-backed paths therefore resolve their DuckDB secret exactly as a native read does. The `opener`
 argument across the ABI is just the **`ClientContext`** of the operator that initiated the managed call
 (valid for that synchronous call) — secrets are context-scoped, so filesystem ops happen at points where the
-host holds a context (here: an `arrownet_fs_spike(path)` table-function execution).
+host holds a context (here: an `fabricator_fs_spike(path)` table-function execution).
 
 ## What the spike proves (validated)
 
-`arrownet_fs_spike(path)` (table function) → hands the managed side the `ClientContext` → C# opens the path
+`fabricator_fs_spike(path)` (table function) → hands the managed side the `ClientContext` → C# opens the path
 via the host callbacks, reads head + tail bytes + size, returns a string:
 
 - **Local parquet:** `ok size=41128 head='PAR1' tail='PAR1'` — reverse callback + offset footer read.
@@ -55,8 +55,8 @@ opener — and azure-secret resolution itself is already validated, see provider
 only piece not directly smoke-tested is a live `az://` blob (no blob store + file handy), but it shares the
 proven code path.
 
-> **Update (ABI v47): `arrownet_delta_scan` is now a connection-free GLOBAL host-FS table function, not a
-> bespoke C++ table function.** The bespoke `arrownet_delta.cpp` + the `delta_schema`/`delta_scan` vtable entries
+> **Update (ABI v47): `fabricator_delta_scan` is now a connection-free GLOBAL host-FS table function, not a
+> bespoke C++ table function.** The bespoke `fabricator_delta.cpp` + the `delta_schema`/`delta_scan` vtable entries
 > were removed; delta is a pure-C# global `ITableFunction` (`DeltaGlobalTableFunction`, declared in
 > `CustomFunctions.GlobalTable`) dispatched through the v29 table session (`table_bind`/`table_execute`). The
 > only new plumbing is the opener: a global host-FS reader needs the calling operator's `ClientContext` (for
@@ -66,13 +66,13 @@ proven code path.
 > functions". The DeltaReader / DuckDbTableFileSystem C# below are unchanged; only the dispatch moved. The
 > sections below describe the original (now-superseded) bespoke wiring.
 
-## Delta reader on the bridge — `arrownet_delta_scan(path)` (BUILT, validated; now a global host-FS fn)
+## Delta reader on the bridge — `fabricator_delta_scan(path)` (BUILT, validated; now a global host-FS fn)
 
-`arrownet_delta_scan('<delta table root>')` reads a Delta Lake table via engineered-wood, with **all IO going
+`fabricator_delta_scan('<delta table root>')` reads a Delta Lake table via engineered-wood, with **all IO going
 through DuckDB's FileSystem** over the host callbacks — so local, `az://`, `s3://`, `https://` paths and DuckDB
 secrets all work, one auth config shared with native reads.
 
-- **`HostFs.fs_glob`** added to `ArrowNetHostServices` (DuckDB `FileSystem::Glob` → JSON `[{path,size}]`) — the
+- **`HostFs.fs_glob`** added to `FabricatorHostServices` (DuckDB `FileSystem::Glob` → JSON `[{path,size}]`) — the
   directory listing engineered-wood needs to enumerate `_delta_log/`.
 - **C# `DuckDbTableFileSystem : ITableFileSystem`** + `DuckDbRandomAccessFile : IRandomAccessFile`
   (`DuckDbTableFileSystem.cs`) — read-only, over the host callbacks. Paths are root-relative (matching
@@ -83,7 +83,7 @@ secrets all work, one auth config shared with native reads.
 - **`DeltaReader`** (`DeltaReader.cs`): `delta_schema` (bind) = `DeltaTable.OpenAsync(fs).ArrowSchema` (no data
   read); `delta_scan` (execute) = `OpenAsync` + `ReadAllAsync()` **materialized** into an `InMemoryArrayStream`
   (all host IO happens while the opener/ClientContext is valid — the opener need not outlive the call).
-- **C++ `arrownet_delta_scan`** (`arrownet_delta.cpp`): bind → `DeltaSchema` → `ReadArrowSchema` → return
+- **C++ `fabricator_delta_scan`** (`fabricator_delta.cpp`): bind → `DeltaSchema` → `ReadArrowSchema` → return
   types; init_global → `DeltaScan` → `ArrowStreamReader`; scan → `Read()` per chunk. DuckDB applies
   projection/filter/aggregation above the scan.
 - **engineered-wood patch (local clone):** `ActionSerializer` read optional `add`/`remove` numeric fields
@@ -127,7 +127,7 @@ skipping, byte-order-sound) — all green. The Apache.Arrow version is aligned (
 
 ## Next (a real lakehouse provider — not built)
 
-- **More formats / a provider surface**: Iceberg/Lance/… via engineered-wood; promote `arrownet_delta_scan` to
+- **More formats / a provider surface**: Iceberg/Lance/… via engineered-wood; promote `fabricator_delta_scan` to
   a provider-style `ATTACH`-able lakehouse catalog. The reverse-callback set is already general (open/read/
   size/close/glob).
 - Watch: don't double-coalesce (httpfs vs engineered-wood's `CoalescingFileReader`); buffer-copy at the
@@ -135,22 +135,22 @@ skipping, byte-order-sound) — all green. The Apache.Arrow version is aligned (
 
 ## ABI
 
-v40 appended `fs_spike` to the vtable + introduced `ArrowNetHostServices` (passed to `Bootstrap.Initialize`,
+v40 appended `fs_spike` to the vtable + introduced `FabricatorHostServices` (passed to `Bootstrap.Initialize`,
 which gained the `host` param). **v41** appended `delta_schema`/`delta_scan` to the vtable and `fs_glob` to
-`ArrowNetHostServices`. **v47** REMOVED `delta_schema`/`delta_scan` (delta became a connection-free global
+`FabricatorHostServices`. **v47** REMOVED `delta_schema`/`delta_scan` (delta became a connection-free global
 host-FS `ITableFunction` on the v29 table session) and appended `set_active_opener` — a per-thread ambient
 opener (mirroring `set_active_txn`) so a global host-FS reader resolves DuckDB secrets through the `fs_*`
-callbacks. So `ArrowNetHostServices` (fs_open_read/size/read/close/glob + host_query) is the reusable C#
+callbacks. So `FabricatorHostServices` (fs_open_read/size/read/close/glob + host_query) is the reusable C#
 host-IO foundation, and a new lakehouse format is now pure-C# (declare a global `ITableFunction`). See
 docs/global-functions.md §"Host-FS global table functions".
 
-**v48** added the **WRITE** surface to `ArrowNetHostServices` — `fs_open_write`(exclusive)/`fs_write`/
-`fs_close_write`/`fs_remove`/`fs_create_dir`(recursive) + the `ARROWNET_ALREADY_EXISTS` status. The C#
+**v48** added the **WRITE** surface to `FabricatorHostServices` — `fs_open_write`(exclusive)/`fs_write`/
+`fs_close_write`/`fs_remove`/`fs_create_dir`(recursive) + the `FABRICATOR_ALREADY_EXISTS` status. The C#
 `DuckDbTableFileSystem` write methods sit on these; the Delta commit's put-if-absent rides `EXCLUSIVE_CREATE`
 (DuckDB `MoveFile` overwrites on local + is unimplemented on Azure DFS, so `RenameAsync` is emulated as
 exclusive-create-copy → false on an existing target → `DeltaConflictException`). `HostFsGlob` normalizes an
 object-store 404 (glob of a missing prefix) to empty. Validated end-to-end (write+read round-trip) on local +
-a live OneLake lakehouse via `arrownet_delta_write_demo(path)` (`test/verify_delta_write.test`). The Delta
+a live OneLake lakehouse via `fabricator_delta_write_demo(path)` (`test/verify_delta_write.test`). The Delta
 write-back foundation — see docs/delta-catalog.md (recommendation step 0).
 
 **v49** appended `fs_remove_dir`(opener,path) — a RECURSIVE directory delete (DuckDB's
@@ -164,7 +164,7 @@ callbacks for the `onelake://` FileSystem (slice 2): sequential create→append�
 
 **v55** appended 5 vtable entries `onelake_open`/`onelake_read`/`onelake_close`/`onelake_glob`/`onelake_exists`
 — the FORWARD callbacks (host C++ → managed) for the `onelake://` DuckDB FileSystem subsystem (Phase-3 step 3,
-read-only). The C++ `ArrowNetOneLakeFileSystem` (registered in the VFS at load) dispatches its reads to the
+read-only). The C++ `FabricatorOneLakeFileSystem` (registered in the VFS at load) dispatches its reads to the
 managed Azure DataLake SDK (`OneLakeForwardFs`), so DuckDB's native readers + `ExternalFileCache` use OneLake
 uniformly, bypassing duckdb-azure. Credential = the azure secret the host resolves from the opener (fields as
 JSON) → `FabricCredentialResolver`. See §3 above. (v51–v54 were the Delta partitioning / cluster-by / identity /
@@ -218,7 +218,7 @@ explicitly** to the filesystem instance (as we already do for DAX `DaxTokenAuth`
 ### The four pieces (sequenced)
 
 1. **`FabricCredentialResolver` — DONE (2026-07-02).** One shared C# `TokenCredential` in the Bridge
-   (`dotnet/ArrowNet.Bridge/FabricCredentialResolver.cs`, `public static`): `azure` SP secret present ⇒
+   (`dotnet/Fabricator.Bridge/FabricCredentialResolver.cs`, `public static`): `azure` SP secret present ⇒
    `ClientSecretCredential` (local / CI); `managed_identity` ⇒ `ManagedIdentityCredential`; else ⇒
    `DefaultAzureCredential` (Fabric: managed / workspace identity via the MSI endpoint; local: az CLI / env / VS).
    Scope constants `PowerBiScope` / `StorageScope` / `SqlScope` + `Resolve(fields)` / `MintCredential(strings)` /
@@ -231,7 +231,7 @@ explicitly** to the filesystem instance (as we already do for DAX `DaxTokenAuth`
    identity path must still be **verified in a live Fabric notebook** — `DefaultAzureCredential` should pick up the
    MSI endpoint, but that is assumption, not yet tested. This is the shared entry point step 2's OneLake FS consumes.
 2. **`OneLakeDataLakeFileSystem : ITableFileSystem` — DONE + LIVE-VALIDATED on Fabric (2026-07-02).** A full
-   read/write filesystem on `Azure.Storage.Files.DataLake` (`dotnet/ArrowNet.Bridge/OneLakeDataLakeFileSystem.cs`):
+   read/write filesystem on `Azure.Storage.Files.DataLake` (`dotnet/Fabricator.Bridge/OneLakeDataLakeFileSystem.cs`):
    `ListAsync` (GetPaths, 404→empty), `OpenReadAsync`/`ReadAllBytesAsync` (range GET + OpenRead), `CreateAsync`
    (put-if-absent via `DataLakePathCreateOptions.Conditions IfNoneMatch=*`), **`RenameAsync` = a TRUE atomic ADLS
    rename** (`DataLakeFileClient.RenameAsync` with `IfNoneMatch=*` → 409/412 ⇒ false = the Delta commit-conflict
@@ -241,7 +241,7 @@ explicitly** to the filesystem instance (as we already do for DAX `DaxTokenAuth`
    (`AmbientOneLakeCredential`, [ThreadStatic], mirroring `AmbientOpener`) ⇒ this FS; else `DuckDbTableFileSystem`.
    `DeltaCatalog.Opener()` publishes `_fabricCredential` to the ambient wherever it fetches the opener (incl. the bulk
    consumer thread — the FS is constructed synchronously there, capturing the credential before any async hop); the
-   connection-free global `arrownet_delta_*` functions clear the ambient (host-FS path). The 16
+   connection-free global `fabricator_delta_*` functions clear the ambient (host-FS path). The 16
    `new DuckDbTableFileSystem(...)` sites now route through the factory; `DeltaReader` helpers widened to
    `ITableFileSystem`. **Local regression green** (9 Delta suites, 412 assertions — the local suites exercise the
    credential-null fallback to `DuckDbTableFileSystem`). **Live-validated on Fabric** (workspace `Test`, flat
@@ -255,8 +255,8 @@ explicitly** to the filesystem instance (as we already do for DAX `DaxTokenAuth`
    `_delta_log/…json` (DFS `GetPaths` listing lag) → a stale/empty read that resolves within ~1-2s; observed once,
    did not reproduce. A future mitigation could trust the writer's known committed version instead of re-listing.
 3. **Register the C# FS as a DuckDB `onelake://` subsystem (forward callbacks) — SLICE 1 (read-only) DONE +
-   LIVE-VALIDATED on Fabric (2026-07-03, ABI v55).** A C++ `ArrowNetOneLakeFileSystem : FileSystem`
-   (`src/arrownet/arrownet_onelake_fs.{hpp,cpp}`) is registered in DuckDB's VFS at extension load
+   LIVE-VALIDATED on Fabric (2026-07-03, ABI v55).** A C++ `FabricatorOneLakeFileSystem : FileSystem`
+   (`src/fabricator/fabricator_onelake_fs.{hpp,cpp}`) is registered in DuckDB's VFS at extension load
    (`RegisterOneLakeFileSystem`, `CanHandleFile` = the `onelake://` scheme). Its read ops forward C++→C# via 5 new
    vtable entries (`onelake_open`/`onelake_read`/`onelake_close`/`onelake_glob`/`onelake_exists`) to
    `OneLakeForwardFs` (the managed Azure DataLake SDK, reusing step 2's logic). **The credential** is resolved

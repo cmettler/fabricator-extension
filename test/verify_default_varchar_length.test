@@ -1,13 +1,13 @@
 # name: test/verify_default_varchar_length.test
 # description: mssql_default_varchar_length bounds all created text columns (read from the provider settings store)
-# group: [mssql_net]
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql_net);
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
 
 statement ok
 DROP TABLE IF EXISTS db.dbo.dvl_test;
@@ -17,7 +17,7 @@ statement ok
 CREATE TABLE db.dbo.dvl_test (id INTEGER, label VARCHAR);
 
 query TI
-SELECT * FROM mssql_net_query('db',
+SELECT * FROM fabricator_query('db',
   'SELECT CAST(DATA_TYPE AS VARCHAR(32)), CHARACTER_MAXIMUM_LENGTH FROM INFORMATION_SCHEMA.COLUMNS
    WHERE TABLE_NAME = ''dvl_test'' AND COLUMN_NAME = ''label''');
 ----
@@ -34,7 +34,7 @@ statement ok
 CREATE TABLE db.dbo.dvl_test (id INTEGER, label VARCHAR);
 
 query TI
-SELECT * FROM mssql_net_query('db',
+SELECT * FROM fabricator_query('db',
   'SELECT CAST(DATA_TYPE AS VARCHAR(32)), CHARACTER_MAXIMUM_LENGTH FROM INFORMATION_SCHEMA.COLUMNS
    WHERE TABLE_NAME = ''dvl_test'' AND COLUMN_NAME = ''label''');
 ----
@@ -51,7 +51,7 @@ statement ok
 CREATE TABLE db.dbo.dvl_test (id INTEGER, label VARCHAR);
 
 query TI
-SELECT * FROM mssql_net_query('db',
+SELECT * FROM fabricator_query('db',
   'SELECT CAST(DATA_TYPE AS VARCHAR(32)), CHARACTER_MAXIMUM_LENGTH FROM INFORMATION_SCHEMA.COLUMNS
    WHERE TABLE_NAME = ''dvl_test'' AND COLUMN_NAME = ''label''');
 ----

@@ -1,16 +1,16 @@
 # Load-time global functions (connection-free) — plan
 
 > Status: **BUILT + verified for ALL FIVE kinds** — global **scalar** (ABI v46 `list_global_functions` +
-> handle-0 dispatch; `arrownet_render`, Fluid/Liquid), **in-out + collector** (`arrownet_tag` +
-> `arrownet_collect_sum`, handle-0 `inout_bind`), **table** (`arrownet_seq` fixed + `arrownet_columns`
-> ARG-DEPENDENT schema, handle-0 `table_bind` / v29 session), AND **aggregate** (`arrownet_product`, handle-0
+> handle-0 dispatch; `fabricator_render`, Fluid/Liquid), **in-out + collector** (`fabricator_tag` +
+> `fabricator_collect_sum`, handle-0 `inout_bind`), **table** (`fabricator_seq` fixed + `fabricator_columns`
+> ARG-DEPENDENT schema, handle-0 `table_bind` / v29 session), AND **aggregate** (`fabricator_product`, handle-0
 > `agg_open`; GROUP BY / parallel / OVER all work). All resolve as a bare `fn(...)` with NO ATTACH —
 > `test/verify_global_functions.test` (63). **The host-FS table sub-case is now DONE too (ABI v47)** — a global
 > table reader that does secret-backed IO through DuckDB's FileSystem (lakehouse readers like Delta). It needed
 > the calling operator's opener (ClientContext) threaded to the C# binding, solved by **one appended ABI entry
 > `set_active_opener`** (a per-thread ambient mirroring `set_active_txn`) set in the shared table bind/init hooks
-> and read by the binding — reusing the v29 table session verbatim, no new operator. **`arrownet_delta_scan` is
-> now a pure-C# global host-FS `ITableFunction`** (the bespoke `arrownet_delta.cpp` + the `delta_schema`/
+> and read by the binding — reusing the v29 table session verbatim, no new operator. **`fabricator_delta_scan` is
+> now a pure-C# global host-FS `ITableFunction`** (the bespoke `fabricator_delta.cpp` + the `delta_schema`/
 > `delta_scan` ABI entries were removed) — proof a new lakehouse format (Iceberg/Lance/…) is added with **zero
 > C++**. `test/verify_delta.test` (39). See §"Host-FS global table functions (DONE)" below.
 > The **Phase 3-A**: connection-free functions registered
@@ -27,12 +27,12 @@
 
 ## Why / the defining property
 
-A global function is **connection-free and ATTACH-free**: `SELECT arrownet_render('Hello {{name}}', {'name':'x'})`
-works on a bare DuckDB with the extension loaded — no `ATTACH … (TYPE arrownet)`, no SQL Server / DAX
+A global function is **connection-free and ATTACH-free**: `SELECT fabricator_render('Hello {{name}}', {'name':'x'})`
+works on a bare DuckDB with the extension loaded — no `ATTACH … (TYPE fabricator)`, no SQL Server / DAX
 connection. That is exactly right for:
-- a **template engine** (`arrownet_render(template, params)` → text) — pure compute, no backend;
-- future connection-free readers (`arrownet_iceberg_scan(path)`, lakehouse readers) — they belong to no
-  catalog (`arrownet_delta_scan` is **already** a global function — bespoke `RegisterDeltaScan`, proof the scope
+- a **template engine** (`fabricator_render(template, params)` → text) — pure compute, no backend;
+- future connection-free readers (`fabricator_iceberg_scan(path)`, lakehouse readers) — they belong to no
+  catalog (`fabricator_delta_scan` is **already** a global function — bespoke `RegisterDeltaScan`, proof the scope
   exists).
 
 The earlier objection (don't boot the CLR at load) **has dissolved**: the settings refactor (v33) + the fs/delta
@@ -65,7 +65,7 @@ thing is *enumerating* them at load. The catalog scalar path is `FetchFunctionPa
 `FetchFunctionReturnType` (→ `get_function_param_schema` / `get_function_return_schema`) + `execute_scalar`,
 all keyed by a catalog **handle**. Global functions have **no handle** → route on a **null/0 handle marker**.
 
-- **ADD** one vtable entry (bump `ARROWNET_ABI_VERSION` + `vtable->AbiVersion`):
+- **ADD** one vtable entry (bump `FABRICATOR_ABI_VERSION` + `vtable->AbiVersion`):
   ```c
   // List the provider-union of connection-free global functions (no handle — load-time). Metadata rows:
   // {name VARCHAR, kind VARCHAR, param_count INT, return_type VARCHAR}, same shape as the catalog functions
@@ -83,11 +83,11 @@ already anticipated it — "the existing `execute_scalar` with a handle-less mar
 
 ## C# authoring (provider declares; Bridge unions)
 
-- **Interface (extract a shared base, don't duplicate)** (`ArrowNet.Bridge`): `SchemaName` is the *only*
+- **Interface (extract a shared base, don't duplicate)** (`Fabricator.Bridge`): `SchemaName` is the *only*
   catalog-specific member, so factor it out — a global scalar is just a scalar without a catalog binding:
   ```csharp
   public interface IScalarFunction {                   // scope-independent: pure compute
-      string Name { get; }            // BARE name (registered as-is; arrownet_-prefixed by convention)
+      string Name { get; }            // BARE name (registered as-is; fabricator_-prefixed by convention)
       Schema Parameters { get; }      // arg fields (NullType sentinel = "any", reused from daxeval for STRUCT|JSON)
       Field Result { get; }           // fixed return type
       IArrowArray Invoke(RecordBatch args);            // vectorized over the arg batch
@@ -116,7 +116,7 @@ already anticipated it — "the existing `execute_scalar` with a handle-less mar
 
 ## C++ load-time registration (mirrors the catalog scalar build)
 
-A new `RegisterArrowNetGlobalFunctions(ExtensionLoader &loader)` called from `Extension::Load` (after the bridge
+A new `RegisterFabricatorGlobalFunctions(ExtensionLoader &loader)` called from `Extension::Load` (after the bridge
 is booted best-effort, as settings already are):
 1. `list_global_functions()` → the decl rows.
 2. For each `kind=='scalar'`: `FetchFunctionParamSchema(0, "", name)` + `FetchFunctionReturnType(0, "", name)`
@@ -177,7 +177,7 @@ discovery does), all dispatching with the **handle-0 marker** at *bind* time:
   `table_bind(0,"",name,args,&binding)` → output schema + a **concrete binding handle**; the scan factory calls
   `table_execute(binding,spec,filter,out)`; teardown `table_close(binding)`. Reuses the v29 session + the
   existing `arrow_ingest` scan verbatim.
-- **in-out** → register the `{LogicalType::TABLE}` **exchange** operator (the same `ArrowNetExchange*` used by
+- **in-out** → register the `{LogicalType::TABLE}` **exchange** operator (the same `FabricatorExchange*` used by
   `_each`/custom in-out) under the bare name; its bind marshals the input schema + cost named-params →
   `inout_bind(0,"",name,args,input_schema,&out_schema,&binding)`; `inout_exchange_open(binding,…)` runs it.
 - **collector** → register the `{TABLE}` **collector** (Sink+Source) operator under the bare name; bind →
@@ -187,7 +187,7 @@ In every case only the **bind** entry takes the handle-0 marker (→ C# routes t
 the binding handle it returns is a real, resolvable handle, so `table_execute`/`table_close` /
 `inout_exchange_open`/`inout_bind_close` are unchanged. **So global table + in-out cost zero new vtable entries**
 — just extend the handle-0 branch (added for scalar) to `table_bind` and `inout_bind`, and have C++
-`RegisterArrowNetGlobalFunctions` branch on `kind` to register the right operator.
+`RegisterFabricatorGlobalFunctions` branch on `kind` to register the right operator.
 
 ### Host-FS global table functions (DONE, ABI v47)
 
@@ -207,8 +207,8 @@ Iceberg/Lance next). The mechanism, built on the existing `kind='table'` global 
   table-function execution) and reads batches on demand as the host pulls (no materialization). Declared in
   `IBackend.GlobalTableFunctions`.
 - **Delta is the reference impl**: `DeltaGlobalTableFunction` (Bridge, over engineered-wood + `DuckDbTableFileSystem`)
-  registered via `CustomFunctions.GlobalTable`. The bespoke `arrownet_delta.cpp` + the `delta_schema`/`delta_scan`
-  ABI entries were removed; `arrownet_delta_scan(path)` now resolves as a global, enumerated by
+  registered via `CustomFunctions.GlobalTable`. The bespoke `fabricator_delta.cpp` + the `delta_schema`/`delta_scan`
+  ABI entries were removed; `fabricator_delta_scan(path)` now resolves as a global, enumerated by
   `list_global_functions` (`kind='table'`) and dispatched through the v29 table session. `test/verify_delta.test`.
 - **Streaming + filter pushdown** (DONE): the reader streams lazily (captures the opener, pulls one batch at a
   time — no materialization) and pushes the scan's `FilterNode` into engineered-wood's **file + row-group
@@ -230,27 +230,27 @@ Iceberg/Lance next). The mechanism, built on the existing `kind='table'` global 
 It bites exactly one sub-case: a **host-FS reader** (delta/iceberg/parquet over `az://`/`s3://` with **DuckDB
 secrets**), which needs the host `FileSystem` opened against a `ClientContext` for secret resolution — and the
 v29 `table_bind`/`table_execute` path doesn't thread a `ClientContext`/opener to C#. The filesystem bridge
-(`ArrowNetHostServices` fs callbacks, v40/v41) gives C# host IO, but secret-backed opens need the right context.
+(`FabricatorHostServices` fs callbacks, v40/v41) gives C# host IO, but secret-backed opens need the right context.
 **Resolved (ABI v47):** rather than an opener *param* on `table_bind`/`table_execute` (which would touch every
 catalog/proc/custom callsite + churn `IArrowTableFunctionBinding.Execute`), the opener is threaded as a
 **per-thread ambient** — one appended entry `set_active_opener(opener)` set in the shared `PopulateReturnSchema`
 + `ArrowStreamInitGlobal` hooks (beside `set_active_txn`), read by the host-FS binding from
 `AmbientOpener.Current`. SQL fns ignore it; the v29 session is otherwise untouched. Delta migrated onto it
-(bespoke `arrownet_delta.cpp` + `delta_schema`/`delta_scan` removed). See the "Host-FS global table functions
+(bespoke `fabricator_delta.cpp` + `delta_schema`/`delta_scan` removed). See the "Host-FS global table functions
 (DONE)" section above for the built shape.
 
 ### Effectful global table/in-out (the apply half)
 
 Side effects belong in **table / in-out / collector / aggregate-finalize**, never scalars (optimizer purity).
-So the effectful "apply" steps can be **global** too — e.g. a global `arrownet_apply_tmdl(<fragments>)`
+So the effectful "apply" steps can be **global** too — e.g. a global `fabricator_apply_tmdl(<fragments>)`
 **collector** (collect fragments → one atomic apply at Finalize, run once single-threaded) whose target is
-addressed by its args (a connstr/endpoint), composing with the global `arrownet_render` scalar: render (pure
+addressed by its args (a connstr/endpoint), composing with the global `fabricator_render` scalar: render (pure
 global scalar) → apply (effectful global collector), **both connection-free / no ATTACH**. A target that's
 inherently a live model/connection is more naturally catalog-bound; a target addressable by an arg works global.
 
 ## The template-engine demo (the motivator)
 
-A provider-agnostic core global, e.g. `arrownet_render(template VARCHAR, params <any>) → VARCHAR`:
+A provider-agnostic core global, e.g. `fabricator_render(template VARCHAR, params <any>) → VARCHAR`:
 - **Engine**: **Fluid** (`github.com/sebastienros/fluid`) — a pure-managed (.NET, MIT, on Parlot) **Liquid**
   template engine; published transitively like `Azure.Identity` / engineered-wood. Chosen over Scriban for this
   use because (a) **secure-by-default** — Liquid + opt-in `MemberAccessStrategy`, no arbitrary .NET eval, so a
@@ -271,50 +271,50 @@ A provider-agnostic core global, e.g. `arrownet_render(template VARCHAR, params 
   constant across a batch — a literal), render per row off the cached, thread-safe template.
 
 **Composition with TMDL** (the original driver, [docs/dax-provider.md](dax-provider.md) "TMDL"): the global
-scalar is the **"dynamically create a TMDL"** step — `arrownet_render(tmdl_template, params)` → a TMDL string —
+scalar is the **"dynamically create a TMDL"** step — `fabricator_render(tmdl_template, params)` → a TMDL string —
 which then feeds the **effectful apply** step (a table function / the collector `apply_tmdl`, never a
 side-effecting scalar). Render = pure global scalar; apply = catalog/collector. Clean separation of the pure and
 effectful halves, exactly as deliberated.
 
 ## Verification
 
-- `test/verify_global_functions.test`: **no ATTACH** throughout. Scalar: `SELECT arrownet_render('Hi {{name}}',
+- `test/verify_global_functions.test`: **no ATTACH** throughout. Scalar: `SELECT fabricator_render('Hi {{name}}',
   {'name':'x'})` → `Hi x`; vectorized over `range()`; NULL handling; the JSON-string param form; resolves on a
   bare loaded extension (no catalog); a collision test if two providers declare the same global name. Later
-  slices add: a global **table** fn (`SELECT * FROM arrownet_gen(3)`) proving arg-dependent output schema via
-  `table_bind` with no catalog; a global **in-out** (`SELECT * FROM arrownet_xform((SELECT …))`) and **collector**
+  slices add: a global **table** fn (`SELECT * FROM fabricator_gen(3)`) proving arg-dependent output schema via
+  `table_bind` with no catalog; a global **in-out** (`SELECT * FROM fabricator_xform((SELECT …))`) and **collector**
   proving the exchange/Sink+Source operators run handle-0 with no ATTACH.
 - Build: VS18 vcvars `--target unittest shell`; `publish-managed.ps1`. ABI bumped → rebuild **both** from one
   commit (exact-match ABI).
 
 ## Recommendation (sequenced)
 
-The **single new ABI entry (`list_global_functions`) + the `RegisterArrowNetGlobalFunctions` load hook** are
+The **single new ABI entry (`list_global_functions`) + the `RegisterFabricatorGlobalFunctions` load hook** are
 built once in slice 1; each later slice just extends the handle-0 branch to one more `*_bind` and adds the
 `kind` case in the load registrar — no further ABI.
 
 1. **Global scalar — DONE** (ABI v46): the `IScalarFunction`/`ICatalogScalarFunction` rename, `list_global_functions`
    + handle-0 reuse of `get_function_*_schema`/`execute_scalar`, `IBackend.GlobalScalarFunctions` (unioned by
-   `GlobalFunctions`), `RegisterArrowNetGlobalFunctions` at load (shared `BuildArrowNetScalarFunction`), the
-   `arrownet_render` (Fluid/Liquid) demo. `test/verify_global_functions.test`. Unblocks the TMDL render step.
+   `GlobalFunctions`), `RegisterFabricatorGlobalFunctions` at load (shared `BuildFabricatorScalarFunction`), the
+   `fabricator_render` (Fluid/Liquid) demo. `test/verify_global_functions.test`. Unblocks the TMDL render step.
 2. **Global in-out + collector (pure-C#) — DONE**: the `IInOutFunction`/`ICollectorTableFunction` base renames;
    the handle-0 branch on `inout_bind` resolves against the C# global registry (`GlobalFunctions.ResolveInOut`,
-   a collector wrapped as `CollectorInOutBinding`); `RegisterArrowNetGlobalFunctions` registers the
+   a collector wrapped as `CollectorInOutBinding`); `RegisterFabricatorGlobalFunctions` registers the
    exchange/collector operators by `kind` at load (handle 0). **No opener** (they transform their input). Demos
-   `arrownet_tag` (streaming) + `arrownet_collect_sum` (collector); `test/verify_global_functions.test`. Enables
-   the effectful global *apply* half (e.g. an `arrownet_apply_tmdl` collector).
+   `fabricator_tag` (streaming) + `fabricator_collect_sum` (collector); `test/verify_global_functions.test`. Enables
+   the effectful global *apply* half (e.g. an `fabricator_apply_tmdl` collector).
 3. **Global table (compute / connstr) — DONE**: the `ITableFunction` base rename; `table_bind` handle-0 →
    `GlobalFunctions.ResolveTable` (wraps the arg-dependent binding in the now-Bridge `BindingBoundTable`);
-   `RegisterArrowNetGlobalFunctions` registers `kind='table'` on the v29 session at load (handle 0, projection +
+   `RegisterFabricatorGlobalFunctions` registers `kind='table'` on the v29 session at load (handle 0, projection +
    best-effort filter pushdown). The handle-0 `get_function_param_schema` became kind-agnostic
-   (`GlobalFunctions.ParamSchema`). Demos `arrownet_seq` (fixed schema) + `arrownet_columns` (ARG-DEPENDENT
+   (`GlobalFunctions.ParamSchema`). Demos `fabricator_seq` (fixed schema) + `fabricator_columns` (ARG-DEPENDENT
    schema). No opener. `test/verify_global_functions.test`.
 4. **Global aggregate (UDAF) — DONE**: the `IAggregateFunction` base rename (`IArrowAggregateFunction` →
    `ICatalogAggregateFunction`); `AggSessionImpl` moved to the Bridge as the public `AggregateSession` (shared by
    catalog + global); `agg_open` handle-0 → `GlobalFunctions.ResolveAggregate`; the handle-0
    `get_function_param_schema`/`get_function_return_schema` cover the aggregate kind (`ParamSchema`/`ReturnField`);
-   `RegisterArrowNetGlobalFunctions` registers `kind='aggregate'`/`'aggregate_spill'` via a shared
-   `BuildArrowNetAggregateFunction` at load. Reuses the v25/v26 `agg_*` ABI (no bump). Demo `arrownet_product`;
+   `RegisterFabricatorGlobalFunctions` registers `kind='aggregate'`/`'aggregate_spill'` via a shared
+   `BuildFabricatorAggregateFunction` at load. Reuses the v25/v26 `agg_*` ABI (no bump). Demo `fabricator_product`;
    GROUP BY / parallel / OVER verified. `test/verify_global_functions.test`.
 5. **Global table (host-FS reader) — DONE (ABI v47)**: a global table reader that does secret-backed IO through
    DuckDB's FileSystem. The opener (the operator's `ClientContext`, carrying secret resolution) is threaded to
@@ -322,8 +322,8 @@ built once in slice 1; each later slice just extends the handle-0 branch to one 
    mirroring `set_active_txn`) the host sets in the shared table bind/init hooks (`PopulateReturnSchema` +
    `ArrowStreamInitGlobal`), read by the host-FS binding in `Bind` (schema) + `Execute` (data; materialized
    while the opener is valid). NO opener *param* on `table_bind`/`table_execute` and NO new operator — the v29
-   table session is reused verbatim. `arrownet_delta_scan` migrated to a pure-C# global host-FS `ITableFunction`
-   (`DeltaGlobalTableFunction`, declared in `CustomFunctions.GlobalTable`); the bespoke `arrownet_delta.cpp` +
+   table session is reused verbatim. `fabricator_delta_scan` migrated to a pure-C# global host-FS `ITableFunction`
+   (`DeltaGlobalTableFunction`, declared in `CustomFunctions.GlobalTable`); the bespoke `fabricator_delta.cpp` +
    the `delta_schema`/`delta_scan` ABI were removed. So a new lakehouse format (Iceberg/Lance/…) = a pure-C#
    `ITableFunction` whose `Bind`/`Execute` read `AmbientOpener.Current` + read files via `DuckDbTableFileSystem`,
    declared as a global — **zero C++**. `test/verify_delta.test` (39). See the §below + docs/filesystem-bridge.md.

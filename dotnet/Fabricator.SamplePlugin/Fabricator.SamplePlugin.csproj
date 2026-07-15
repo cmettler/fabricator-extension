@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <RootNamespace>Fabricator.SamplePlugin</RootNamespace>
+    <AssemblyName>Fabricator.SamplePlugin</AssemblyName>
+    <Description>
+      A sample THIRD-PARTY plugin for the fabricator bridge: a connection-free IBackend that contributes a
+      global scalar function (plug_greet). Built to a folder and discovered via FABRICATOR_PLUGIN_DIR; it
+      references Fabricator.Bridge + Apache.Arrow as HOST-PROVIDED (Private=false, not copied), so at runtime
+      they resolve to the bridge's default-context copies. See docs/plugin-system.md.
+    </Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- A plugin references ONLY the contract assembly (+ Apache.Arrow transitively), not the bridge internals
+         — host-provided, NOT copied (the loaded bridge supplies them). This is the minimal, stable plugin
+         surface the Abstractions split enables. -->
+    <ProjectReference Include="..\Fabricator.Abstractions\Fabricator.Abstractions.csproj" Private="false" />
+  </ItemGroup>
+
+</Project>

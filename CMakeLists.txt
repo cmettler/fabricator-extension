@@ -1,11 +1,11 @@
 cmake_minimum_required(VERSION 3.21)
 
 # Extension name — must match the DUCKDB_CPP_EXTENSION_ENTRY(...) symbol.
-set(TARGET_NAME mssql_net)
+set(TARGET_NAME fabricator)
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
-set(MSSQL_NET_EXTENSION_VERSION "0.0.1")
+set(FABRICATOR_EXTENSION_VERSION "0.0.1")
 
 project(${TARGET_NAME} CXX)
 
@@ -13,27 +13,27 @@ project(${TARGET_NAME} CXX)
 include_directories(src/include)
 
 set(EXTENSION_SOURCES
-    src/mssql_net_extension.cpp
-    src/mssql_net_secret.cpp
-    src/mssql_net_storage.cpp
-    src/arrownet_fs_spike.cpp
-    src/arrownet_host_query.cpp
-    src/arrownet_optimizer.cpp
-    src/arrownet/clr_host.cpp
-    src/arrownet/arrownet_onelake_fs.cpp
-    src/arrownet/arrownet_delta_mfr.cpp
-    src/arrownet/arrownet_variant.cpp
-    src/arrownet/arrow_ingest.cpp
-    src/arrownet/arrow_produce.cpp
-    src/catalog/arrownet_metadata.cpp
-    src/catalog/arrownet_catalog.cpp
-    src/catalog/arrownet_schema_entry.cpp
-    src/catalog/arrownet_table_entry.cpp
-    src/catalog/arrownet_transaction.cpp
-    src/dml/arrownet_insert.cpp
-    src/dml/arrownet_modify.cpp
-    src/dml/arrownet_ctas.cpp
-    src/copy/mssql_net_copy.cpp
+    src/fabricator_extension.cpp
+    src/fabricator_secret.cpp
+    src/fabricator_storage.cpp
+    src/fabricator_fs_spike.cpp
+    src/fabricator_host_query.cpp
+    src/fabricator_optimizer.cpp
+    src/fabricator/clr_host.cpp
+    src/fabricator/fabricator_onelake_fs.cpp
+    src/fabricator/fabricator_delta_mfr.cpp
+    src/fabricator/fabricator_variant.cpp
+    src/fabricator/arrow_ingest.cpp
+    src/fabricator/arrow_produce.cpp
+    src/catalog/fabricator_metadata.cpp
+    src/catalog/fabricator_catalog.cpp
+    src/catalog/fabricator_schema_entry.cpp
+    src/catalog/fabricator_table_entry.cpp
+    src/catalog/fabricator_transaction.cpp
+    src/dml/fabricator_insert.cpp
+    src/dml/fabricator_modify.cpp
+    src/dml/fabricator_ctas.cpp
+    src/copy/fabricator_copy.cpp
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
@@ -43,8 +43,8 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 target_link_libraries(${EXTENSION_NAME} ${CMAKE_DL_LIBS})
 target_link_libraries(${LOADABLE_EXTENSION_NAME} ${CMAKE_DL_LIBS})
 
-target_compile_definitions(${EXTENSION_NAME} PRIVATE MSSQL_NET_VERSION="${MSSQL_NET_EXTENSION_VERSION}")
-target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE MSSQL_NET_VERSION="${MSSQL_NET_EXTENSION_VERSION}")
+target_compile_definitions(${EXTENSION_NAME} PRIVATE FABRICATOR_VERSION="${FABRICATOR_EXTENSION_VERSION}")
+target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE FABRICATOR_VERSION="${FABRICATOR_EXTENSION_VERSION}")
 
 install(
     TARGETS ${EXTENSION_NAME}

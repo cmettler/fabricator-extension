@@ -1,25 +1,25 @@
 # name: test/verify_delta_write.test
-# description: arrownet_delta_write_demo(path) WRITES a Delta Lake table via engineered-wood through the host
+# description: fabricator_delta_write_demo(path) WRITES a Delta Lake table via engineered-wood through the host
 #              FileSystem write callbacks (the Delta write-back foundation — docs/delta-catalog.md). The commit
 #              uses the put-if-absent EXCLUSIVE_CREATE primitive (no MoveFile). Idempotent (Overwrite), so it
-#              round-trips deterministically with arrownet_delta_scan. Set ARROWNET_DELTA_WRITE_DIR to a
+#              round-trips deterministically with fabricator_delta_scan. Set FABRICATOR_DELTA_WRITE_DIR to a
 #              WRITABLE base path (local dir, or an abfss:// OneLake prefix with an azure secret already created).
-# group: [mssql_net]
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
-require-env ARROWNET_DELTA_WRITE_DIR
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 # Write the demo table (5 rows id/name) — returns the committed version + rows written. The table is created
 # on first run; Overwrite keeps it at exactly 5 rows on re-runs (version grows, row count is stable).
 query I
-SELECT rows_written FROM arrownet_delta_write_demo('${ARROWNET_DELTA_WRITE_DIR}/arrownet_delta_write_test');
+SELECT rows_written FROM fabricator_delta_write_demo('${FABRICATOR_DELTA_WRITE_DIR}/fabricator_delta_write_test');
 ----
 5
 
 # Read it back through the (read) Delta scan — proves the write bridge end-to-end.
 query IT
-SELECT id, name FROM arrownet_delta_scan('${ARROWNET_DELTA_WRITE_DIR}/arrownet_delta_write_test') ORDER BY id;
+SELECT id, name FROM fabricator_delta_scan('${FABRICATOR_DELTA_WRITE_DIR}/fabricator_delta_write_test') ORDER BY id;
 ----
 1	row_1
 2	row_2
@@ -29,27 +29,27 @@ SELECT id, name FROM arrownet_delta_scan('${ARROWNET_DELTA_WRITE_DIR}/arrownet_d
 
 # A committed version was produced (>= 1: version 0 = create, then the data write).
 query I
-SELECT version >= 1 FROM arrownet_delta_write_demo('${ARROWNET_DELTA_WRITE_DIR}/arrownet_delta_write_test');
+SELECT version >= 1 FROM fabricator_delta_write_demo('${FABRICATOR_DELTA_WRITE_DIR}/fabricator_delta_write_test');
 ----
 true
 
 # Still exactly 5 rows after the second (Overwrite) write — idempotent.
 query I
-SELECT count(*) FROM arrownet_delta_scan('${ARROWNET_DELTA_WRITE_DIR}/arrownet_delta_write_test');
+SELECT count(*) FROM fabricator_delta_scan('${FABRICATOR_DELTA_WRITE_DIR}/fabricator_delta_write_test');
 ----
 5
 
-# Collector form: arrownet_delta_write(<input>, path := '…') writes ANY input table (a query result) to a
+# Collector form: fabricator_delta_write(<input>, path := '…') writes ANY input table (a query result) to a
 # Delta table (Overwrite). Returns (version, rows_written); the written table round-trips via the scan.
 query I
-SELECT rows_written FROM arrownet_delta_write(
+SELECT rows_written FROM fabricator_delta_write(
   (SELECT i AS id, 'r' || i AS name FROM range(1, 11) t(i)),
-  path := '${ARROWNET_DELTA_WRITE_DIR}/arrownet_delta_query_test');
+  path := '${FABRICATOR_DELTA_WRITE_DIR}/fabricator_delta_query_test');
 ----
 10
 
 query IT
-SELECT id, name FROM arrownet_delta_scan('${ARROWNET_DELTA_WRITE_DIR}/arrownet_delta_query_test')
+SELECT id, name FROM fabricator_delta_scan('${FABRICATOR_DELTA_WRITE_DIR}/fabricator_delta_query_test')
 WHERE id > 8 ORDER BY id;
 ----
 9	r9

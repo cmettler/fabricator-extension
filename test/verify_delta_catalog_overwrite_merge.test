@@ -8,15 +8,15 @@
 #   * COPY SCHEMA_MODE 'merge': append + UNION new source columns (old rows NULL). COPY bypasses DuckDB's INSERT
 #     binder, so wider source schemas reach the provider (a plain INSERT of wider data can't — binder-blocked).
 #   * COPY SCHEMA_MODE 'overwrite': replace data + adopt the incoming source schema (drop/add columns).
-#   Set ARROWNET_DELTA_WRITE_DIR to a WRITABLE base path. Local FS. (Decimals avoided — a separate provider bug.)
-# group: [mssql_net]
+#   Set FABRICATOR_DELTA_WRITE_DIR to a WRITABLE base path. Local FS. (Decimals avoided — a separate provider bug.)
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
-require-env ARROWNET_DELTA_WRITE_DIR
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/owm' AS lake (TYPE arrownet, PROVIDER 'delta', column_mapping 'none');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/owm' AS lake (TYPE fabricator, PROVIDER 'delta', column_mapping 'none');
 
 # ================= replace_where: atomic partition overwrite =================
 statement ok
@@ -40,7 +40,7 @@ US	2	30
 
 # One commit for the swap (v0 CREATE, v1 initial, v2 partition overwrite).
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('lake', 'main.sales');
+SELECT count(*) FROM fabricator_delta_snapshots('lake', 'main.sales');
 ----
 3
 
@@ -90,7 +90,7 @@ CREATE TABLE lake.main.mrg AS SELECT * FROM (VALUES (1,'a')) AS t(id,val);
 
 statement ok
 COPY (SELECT * FROM (VALUES (2,'b',7),(3,'c',8)) AS t(id,val,extra)) TO 'lake.main.mrg'
-  (FORMAT mssql_net, CREATE_TABLE false, SCHEMA_MODE 'merge');
+  (FORMAT mssql, CREATE_TABLE false, SCHEMA_MODE 'merge');
 
 query ITI
 SELECT id, val, extra FROM lake.main.mrg ORDER BY id;
@@ -105,7 +105,7 @@ CREATE TABLE lake.main.ow AS SELECT * FROM (VALUES (1,'a',100),(2,'b',200)) AS t
 
 statement ok
 COPY (SELECT * FROM (VALUES (9,'z',777)) AS t(id,val,newcol)) TO 'lake.main.ow'
-  (FORMAT mssql_net, SCHEMA_MODE 'overwrite');
+  (FORMAT mssql, SCHEMA_MODE 'overwrite');
 
 # Data replaced; schema adopted (old dropped, newcol added).
 query ITI

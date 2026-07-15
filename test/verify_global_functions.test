@@ -1,29 +1,29 @@
 # name: test/verify_global_functions.test
 # description: Load-time GLOBAL (connection-free) functions — a bare fn(...) registered at extension load,
-#              usable with NO ATTACH and no SQL Server / DAX connection. Demo: arrownet_render (the Fluid /
+#              usable with NO ATTACH and no SQL Server / DAX connection. Demo: fabricator_render (the Fluid /
 #              Liquid template engine). Proves the global-function path end-to-end (list_global_functions +
 #              the handle-0 scalar dispatch). See docs/global-functions.md.
-# group: [mssql_net]
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
 # NOTE: no ATTACH, no require-env — a global function resolves on a bare loaded extension.
 
 # Basic render: Liquid substitution from a JSON params bag.
 query I
-SELECT arrownet_render('Hello {{ name }}, you have {{ n }} messages', '{"name":"world","n":3}');
+SELECT fabricator_render('Hello {{ name }}, you have {{ n }} messages', '{"name":"world","n":3}');
 ----
 Hello world, you have 3 messages
 
 # params as a DuckDB STRUCT (type-safe, no quoting) — the SQLNULL->ANY sentinel lets the same fn accept it.
 query I
-SELECT arrownet_render('Hello {{ name }}, you have {{ n }} messages', {'name':'world','n':3});
+SELECT fabricator_render('Hello {{ name }}, you have {{ n }} messages', {'name':'world','n':3});
 ----
 Hello world, you have 3 messages
 
 # STRUCT params vectorized over rows (each row's struct supplies that row's variables).
 query I
-SELECT arrownet_render('id={{ id }}', {'id': i}) AS r FROM range(3) t(i) ORDER BY r;
+SELECT fabricator_render('id={{ id }}', {'id': i}) AS r FROM range(3) t(i) ORDER BY r;
 ----
 id=0
 id=1
@@ -31,7 +31,7 @@ id=2
 
 # Vectorized over a batch (the template is a per-row column; params empty object).
 query I
-SELECT arrownet_render('row ' || i::VARCHAR, '{}') AS r FROM range(3) t(i) ORDER BY i;
+SELECT fabricator_render('row ' || i::VARCHAR, '{}') AS r FROM range(3) t(i) ORDER BY i;
 ----
 row 0
 row 1
@@ -39,49 +39,49 @@ row 2
 
 # Liquid control flow (if/else) — proves it's a real template engine, not just substitution.
 query I
-SELECT arrownet_render('{% if x > 1 %}big{% else %}small{% endif %}', '{"x":5}');
+SELECT fabricator_render('{% if x > 1 %}big{% else %}small{% endif %}', '{"x":5}');
 ----
 big
 
 # Liquid loop over a JSON array param.
 query I
-SELECT arrownet_render('{% for i in items %}{{ i }};{% endfor %}', '{"items":[1,2,3]}');
+SELECT fabricator_render('{% for i in items %}{{ i }};{% endfor %}', '{"items":[1,2,3]}');
 ----
 1;2;3;
 
 # A NULL template yields NULL (SPECIAL_HANDLING — the function sees NULL args).
 query I
-SELECT arrownet_render(NULL, '{"a":1}');
+SELECT fabricator_render(NULL, '{"a":1}');
 ----
 NULL
 
 # An unreferenced/empty params object renders the literal text.
 query I
-SELECT arrownet_render('static text', '{}');
+SELECT fabricator_render('static text', '{}');
 ----
 static text
 
 # Still resolves AFTER an ATTACH is in play elsewhere is not needed — but confirm it composes with a normal
 # query (no catalog dependency): used inside a CTE over generated rows.
 query I
-SELECT arrownet_render('id={{ id }}', '{"id":' || i::VARCHAR || '}') AS r FROM range(2) t(i) ORDER BY i;
+SELECT fabricator_render('id={{ id }}', '{"id":' || i::VARCHAR || '}') AS r FROM range(2) t(i) ORDER BY i;
 ----
 id=0
 id=1
 
 # ---- global TABLE-IN-OUT (streaming exchange) — bare fn(<input>), no ATTACH ----
-# arrownet_tag applies n -> (n, n*n) per input row on the streaming-exchange operator (handle-0 binding).
+# fabricator_tag applies n -> (n, n*n) per input row on the streaming-exchange operator (handle-0 binding).
 query II
-SELECT n, sq FROM arrownet_tag((SELECT * FROM (VALUES (2),(3),(4)) v(n))) ORDER BY n;
+SELECT n, sq FROM fabricator_tag((SELECT * FROM (VALUES (2),(3),(4)) v(n))) ORDER BY n;
 ----
 2	4
 3	9
 4	16
 
 # ---- global COLLECTOR (pipeline breaker) — bare fn(<input>), no ATTACH ----
-# arrownet_collect_sum emits every input row with the GLOBAL sum (only knowable after all input is seen).
+# fabricator_collect_sum emits every input row with the GLOBAL sum (only knowable after all input is seen).
 query II
-SELECT n, total FROM arrownet_collect_sum((SELECT i::INTEGER AS n FROM range(5) t(i))) ORDER BY n;
+SELECT n, total FROM fabricator_collect_sum((SELECT i::INTEGER AS n FROM range(5) t(i))) ORDER BY n;
 ----
 0	10
 1	10
@@ -92,14 +92,14 @@ SELECT n, total FROM arrownet_collect_sum((SELECT i::INTEGER AS n FROM range(5) 
 # The collector buffers ALL input (no single-chunk cap): 5000 rows, sum(0..4999) = 12497500.
 query II
 SELECT count(*), max(total)
-FROM arrownet_collect_sum((SELECT i::INTEGER AS n FROM range(5000) t(i)));
+FROM fabricator_collect_sum((SELECT i::INTEGER AS n FROM range(5000) t(i)));
 ----
 5000	12497500
 
 # ---- global TABLE functions — bare fn(args), no ATTACH (the v29 table session at handle 0) ----
-# Fixed output schema: arrownet_seq(n) -> (value, squared) for value = 1..n.
+# Fixed output schema: fabricator_seq(n) -> (value, squared) for value = 1..n.
 query II
-SELECT value, squared FROM arrownet_seq(4) ORDER BY value;
+SELECT value, squared FROM fabricator_seq(4) ORDER BY value;
 ----
 1	1
 2	4
@@ -108,33 +108,33 @@ SELECT value, squared FROM arrownet_seq(4) ORDER BY value;
 
 # DuckDB projects + filters above the scan (the binding reports no pushdown).
 query I
-SELECT squared FROM arrownet_seq(5) WHERE value > 3 ORDER BY squared;
+SELECT squared FROM fabricator_seq(5) WHERE value > 3 ORDER BY squared;
 ----
 16
 25
 
-# ARG-DEPENDENT output schema: arrownet_columns(n) returns n columns c1..cn, resolved at bind from the arg.
+# ARG-DEPENDENT output schema: fabricator_columns(n) returns n columns c1..cn, resolved at bind from the arg.
 query III
-SELECT c1, c2, c3 FROM arrownet_columns(3);
+SELECT c1, c2, c3 FROM fabricator_columns(3);
 ----
 1	2	3
 
 # A different arg => a different column set (proves the schema is bound per-call, not fixed).
 query I
-SELECT c5 FROM arrownet_columns(5);
+SELECT c5 FROM fabricator_columns(5);
 ----
 5
 
 # ---- global AGGREGATE (UDAF) — bare fn(args), no ATTACH (GROUP BY / parallel / OVER) ----
 # Ungrouped product: 2 * 3 * 4 = 24.
 query I
-SELECT arrownet_product(x) FROM (VALUES (2),(3),(4)) v(x);
+SELECT fabricator_product(x) FROM (VALUES (2),(3),(4)) v(x);
 ----
 24
 
 # GROUP BY: per-group product.
 query II
-SELECT g, arrownet_product(x) FROM (VALUES (1,2),(1,5),(2,3),(2,7)) v(g,x) GROUP BY g ORDER BY g;
+SELECT g, fabricator_product(x) FROM (VALUES (1,2),(1,5),(2,3),(2,7)) v(g,x) GROUP BY g ORDER BY g;
 ----
 1	10
 2	21
@@ -144,7 +144,7 @@ statement ok
 SET threads=4;
 
 query I
-SELECT arrownet_product(i + 1) = product(i + 1)::BIGINT FROM range(12) t(i);
+SELECT fabricator_product(i + 1) = product(i + 1)::BIGINT FROM range(12) t(i);
 ----
 true
 
@@ -153,7 +153,7 @@ RESET threads;
 
 # Window OVER — running product 1,2,6,24 (proves the segment-tree path drives our callbacks).
 query II
-SELECT i, arrownet_product(i + 1) OVER (ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+SELECT i, fabricator_product(i + 1) OVER (ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
 FROM range(4) t(i) ORDER BY i;
 ----
 0	1
@@ -163,6 +163,6 @@ FROM range(4) t(i) ORDER BY i;
 
 # Empty / all-NULL group => NULL (SUM-like empty value).
 query I
-SELECT arrownet_product(x::BIGINT) FROM (VALUES (NULL),(NULL)) v(x);
+SELECT fabricator_product(x::BIGINT) FROM (VALUES (NULL),(NULL)) v(x);
 ----
 NULL

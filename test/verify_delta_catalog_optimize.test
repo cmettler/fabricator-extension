@@ -1,19 +1,19 @@
 # name: test/verify_delta_catalog_optimize.test
 # description: Delta catalog maintenance — OPTIMIZE (bin-pack compaction) + VACUUM via
-#              mssql_net_exec('<catalog>', 'OPTIMIZE|VACUUM <schema.table> …'). Under DV-default, deletion
+#              fabricator_exec('<catalog>', 'OPTIMIZE|VACUUM <schema.table> …'). Under DV-default, deletion
 #              vectors + merge-on-read append small files accumulate, so OPTIMIZE consolidates them. CRITICAL:
 #              compaction must EXCLUDE deletion-vector-deleted rows (not resurrect them). Set
-#              ARROWNET_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
-# group: [mssql_net]
+#              FABRICATOR_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
 require parquet
 
-require-env ARROWNET_DELTA_WRITE_DIR
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/optcat' AS lake (TYPE arrownet, PROVIDER 'delta', column_mapping 'none');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/optcat' AS lake (TYPE fabricator, PROVIDER 'delta', column_mapping 'none');
 
 # Several small files (one per INSERT) — compaction candidates.
 statement ok
@@ -40,13 +40,13 @@ SELECT id, v FROM lake.main.t ORDER BY id;
 
 # Four small data files before compaction.
 query I
-SELECT count(*) FROM glob('${ARROWNET_DELTA_WRITE_DIR}/optcat/t/*.parquet');
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/optcat/t/*.parquet');
 ----
 4
 
 # OPTIMIZE: bin-pack the small files, EXCLUDING the DV-deleted rows. Returns 0 (not row-affecting).
 query I
-SELECT mssql_net_exec('lake', 'OPTIMIZE main.t');
+SELECT fabricator_exec('lake', 'OPTIMIZE main.t');
 ----
 0
 
@@ -59,17 +59,17 @@ SELECT id, v FROM lake.main.t ORDER BY id;
 
 # Compaction added a consolidated file (the old small files linger on disk until VACUUM).
 query I
-SELECT count(*) > 4 FROM glob('${ARROWNET_DELTA_WRITE_DIR}/optcat/t/*.parquet');
+SELECT count(*) > 4 FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/optcat/t/*.parquet');
 ----
 true
 
 # VACUUM DRY RUN reports without deleting (RETAIN 0 HOURS so the just-superseded files are eligible).
 statement ok
-SELECT mssql_net_exec('lake', 'VACUUM main.t RETAIN 0 HOURS DRY RUN');
+SELECT fabricator_exec('lake', 'VACUUM main.t RETAIN 0 HOURS DRY RUN');
 
 # Real VACUUM removes the unreferenced small files; the data is unchanged.
 statement ok
-SELECT mssql_net_exec('lake', 'VACUUM main.t RETAIN 0 HOURS');
+SELECT fabricator_exec('lake', 'VACUUM main.t RETAIN 0 HOURS');
 
 query IT
 SELECT id, v FROM lake.main.t ORDER BY id;
@@ -82,7 +82,7 @@ statement ok
 DETACH lake;
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/optcat' AS lake2 (TYPE arrownet, PROVIDER 'delta', column_mapping 'none');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/optcat' AS lake2 (TYPE fabricator, PROVIDER 'delta', column_mapping 'none');
 
 query IT
 SELECT id, v FROM lake2.main.t ORDER BY id;
@@ -96,7 +96,7 @@ DETACH lake2;
 # ---- native_write: OPTIMIZE writes the compacted files with DuckDB's native writer (bloom/stats), not the
 #      engineered-wood codec — so an OPTIMIZE keeps the native-write quality. ----
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/optnw' AS nw (TYPE arrownet, PROVIDER 'delta', column_mapping 'none', native_write true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/optnw' AS nw (TYPE fabricator, PROVIDER 'delta', column_mapping 'none', native_write true);
 
 statement ok
 CREATE TABLE nw.main.t AS SELECT i AS id, 'cat' || (i % 5) AS grp FROM range(1, 1001) AS r(i);
@@ -109,10 +109,10 @@ INSERT INTO nw.main.t SELECT i, 'cat' || (i % 5) FROM range(2001, 3001) AS r(i);
 
 # Compact the 3 files, then VACUUM the originals away so ONLY the compacted file remains.
 statement ok
-SELECT mssql_net_exec('nw', 'OPTIMIZE main.t');
+SELECT fabricator_exec('nw', 'OPTIMIZE main.t');
 
 statement ok
-SELECT mssql_net_exec('nw', 'VACUUM main.t RETAIN 0 HOURS');
+SELECT fabricator_exec('nw', 'VACUUM main.t RETAIN 0 HOURS');
 
 query I
 SELECT count(*) FROM nw.main.t;
@@ -126,7 +126,7 @@ query II
 SELECT
   max(CASE WHEN path_in_schema = 'grp' AND bloom_filter_offset IS NOT NULL THEN 1 ELSE 0 END) AS grp_bloom,
   max(CASE WHEN path_in_schema = 'id' AND bloom_filter_offset IS NOT NULL THEN 1 ELSE 0 END) AS id_bloom
-FROM parquet_metadata('${ARROWNET_DELTA_WRITE_DIR}/optnw/t/*.parquet');
+FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optnw/t/*.parquet');
 ----
 1	0
 

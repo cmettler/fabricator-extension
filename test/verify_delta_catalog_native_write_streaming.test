@@ -5,18 +5,18 @@
 #              path ran (not the collect+native path): the collect path injects a physical __delta_row_id column
 #              into the parquet for a row-tracking table, but the streaming path does NOT (row tracking rides on
 #              the commit's baseRowId; DuckDB COPY writes only the user columns). Partitioned tables fall back to
-#              the collect path (still correct). Set ARROWNET_DELTA_WRITE_DIR. Local FS.
-# group: [mssql_net]
+#              the collect path (still correct). Set FABRICATOR_DELTA_WRITE_DIR. Local FS.
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
 require parquet
 
-require-env ARROWNET_DELTA_WRITE_DIR
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 # DV-default is on → row tracking is enabled, so the collect+native path WOULD inject __delta_row_id.
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/nwstream' AS lake (TYPE arrownet, PROVIDER 'delta', column_mapping 'none', native_write true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nwstream' AS lake (TYPE fabricator, PROVIDER 'delta', column_mapping 'none', native_write true);
 
 # CTAS (Overwrite) — streams to one parquet file.
 statement ok
@@ -30,7 +30,7 @@ SELECT count(*), sum(id) FROM lake.main.t;
 # STREAMING PROOF: the data file has NO physical __delta_row_id column (the collect+native path would inject it
 # for this row-tracking table). Row tracking still works via the commit's baseRowId — no physical column needed.
 query I
-SELECT count(*) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/nwstream/t/*.parquet') WHERE name = '__delta_row_id';
+SELECT count(*) FROM parquet_schema('${FABRICATOR_DELTA_WRITE_DIR}/nwstream/t/*.parquet') WHERE name = '__delta_row_id';
 ----
 0
 
@@ -38,7 +38,7 @@ SELECT count(*) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/nwstream/t/*.pa
 # (not engineered-wood) wrote the streamed parquet.
 query I
 SELECT max(CASE WHEN path_in_schema = 'v' AND bloom_filter_offset IS NOT NULL THEN 1 ELSE 0 END)
-FROM parquet_metadata('${ARROWNET_DELTA_WRITE_DIR}/nwstream/t/*.parquet');
+FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/nwstream/t/*.parquet');
 ----
 1
 
@@ -49,7 +49,7 @@ FROM parquet_metadata('${ARROWNET_DELTA_WRITE_DIR}/nwstream/t/*.parquet');
 # has minValues.id=1 + maxValues.id=5000, emitted as JSON NUMBERS (integer stats are exact).
 query I
 WITH j AS (SELECT replace(content, chr(92)||'u0022', '"') AS c
-           FROM read_text('${ARROWNET_DELTA_WRITE_DIR}/nwstream/t/_delta_log/*.json'))
+           FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/nwstream/t/_delta_log/*.json'))
 SELECT count(*) FROM j
 WHERE c LIKE '%"minValues":{"id":1,%' AND c LIKE '%"maxValues":{"id":5000,%' AND c LIKE '%"nullCount"%';
 ----
@@ -58,7 +58,7 @@ WHERE c LIKE '%"minValues":{"id":1,%' AND c LIKE '%"maxValues":{"id":5000,%' AND
 # The string column `v` gets string min/max ('v0'..'v6'); `id`/`v` have no nulls (nullCount 0).
 query I
 WITH j AS (SELECT replace(content, chr(92)||'u0022', '"') AS c
-           FROM read_text('${ARROWNET_DELTA_WRITE_DIR}/nwstream/t/_delta_log/*.json'))
+           FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/nwstream/t/_delta_log/*.json'))
 SELECT count(*) FROM j
 WHERE c LIKE '%"v":"v0"%' AND c LIKE '%"v":"v6"%' AND c LIKE '%"nullCount":{"id":0,"v":0}%';
 ----
@@ -74,7 +74,7 @@ SELECT count(*) FROM lake.main.t;
 8000
 
 query I
-SELECT count(*) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/nwstream/t/*.parquet') WHERE name = '__delta_row_id';
+SELECT count(*) FROM parquet_schema('${FABRICATOR_DELTA_WRITE_DIR}/nwstream/t/*.parquet') WHERE name = '__delta_row_id';
 ----
 0
 
@@ -83,7 +83,7 @@ statement ok
 DETACH lake;
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/nwstream' AS lake2 (TYPE arrownet, PROVIDER 'delta', column_mapping 'none', native_write true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nwstream' AS lake2 (TYPE fabricator, PROVIDER 'delta', column_mapping 'none', native_write true);
 
 query I
 SELECT count(*) FROM lake2.main.t;
@@ -97,7 +97,7 @@ DETACH lake2;
 #      fallback. Data lands in the Hive layout; each partition file excludes the partition column + has no
 #      injected __delta_row_id (streaming signal); the commit carries per-file partitionValues + stats. ----
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/nwstreampart' AS lp (TYPE arrownet, PROVIDER 'delta', column_mapping 'none', native_write true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nwstreampart' AS lp (TYPE fabricator, PROVIDER 'delta', column_mapping 'none', native_write true);
 
 statement ok
 CREATE TABLE lp.main.p PARTITIONED BY (region) AS
@@ -122,14 +122,14 @@ US	200
 # Hive layout: parquet files under three partition directories (glob lists files, not bare dirs).
 query I
 SELECT count(DISTINCT regexp_extract(file, 'region=[^/\\]+'))
-FROM glob('${ARROWNET_DELTA_WRITE_DIR}/nwstreampart/p/region=*/*.parquet');
+FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/nwstreampart/p/region=*/*.parquet');
 ----
 3
 
 # Partition files EXCLUDE the partition column `region` (Delta convention) and carry NO injected __delta_row_id
 # (proves the native streaming COPY wrote them, not engineered-wood's collect+row-id path).
 query I
-SELECT count(*) FROM parquet_schema('${ARROWNET_DELTA_WRITE_DIR}/nwstreampart/p/region=US/*.parquet')
+SELECT count(*) FROM parquet_schema('${FABRICATOR_DELTA_WRITE_DIR}/nwstreampart/p/region=US/*.parquet')
 WHERE name IN ('region', '__delta_row_id');
 ----
 0
@@ -138,7 +138,7 @@ WHERE name IN ('region', '__delta_row_id');
 # partition files.
 query I
 WITH j AS (SELECT replace(content, chr(92)||'u0022', '"') AS c
-           FROM read_text('${ARROWNET_DELTA_WRITE_DIR}/nwstreampart/p/_delta_log/*.json'))
+           FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/nwstreampart/p/_delta_log/*.json'))
 SELECT count(*) FROM j
 WHERE c LIKE '%"partitionValues":{"region":"US"}%' AND c LIKE '%minValues%' AND c LIKE '%"id":%';
 ----

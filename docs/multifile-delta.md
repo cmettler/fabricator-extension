@@ -1,8 +1,8 @@
 # MultiFileReader + engineered-wood — native-parquet Delta path (design; Phase-A slices BUILDING)
 
 > **Phase-A slice 1a DONE (2026-07-03, ABI v57) — the real MultiFileReader integration:**
-> `arrownet_delta_mfr_scan(path)` clones `parquet_scan` and swaps in `ArrowNetDeltaMultiFileReader` (a DuckDB
-> `MultiFileReader`, `src/arrownet/arrownet_delta_mfr.cpp`) whose `CreateFileList` gets the EXACT active files from
+> `fabricator_delta_mfr_scan(path)` clones `parquet_scan` and swaps in `FabricatorDeltaMultiFileReader` (a DuckDB
+> `MultiFileReader`, `src/fabricator/fabricator_delta_mfr.cpp`) whose `CreateFileList` gets the EXACT active files from
 > engineered-wood (new ABI `delta_list_files` → JSON `[{"path":…}]` → a `SimpleMultiFileList`); DuckDB's **native
 > parquet MultiFileReader** reads them (cached over `onelake://` for OneLake). Matches the C# reader row-for-row
 > (`test/verify_delta_mfr_scan.test`, 36). This is the **C++ foundation** the rest builds on — chosen over
@@ -10,8 +10,8 @@
 > dynamic-filter file pruning live (confirmed in duckdb-delta: `DeltaMultiFileList::DynamicFilterPushdown` +
 > `PushdownInternal` prune files by the Delta-log `add` stats — static AND dynamic; partition values from the log
 > both prune + inject as constants; `FinalizeBind` attaches a per-file `DeltaDeleteFilter`). The host_query path
-> (`arrownet_delta_native_scan`) can't do any of those (it sees only parquet footers, no `_delta_log`) → it stays
-> the simple/no-DV fallback. **Next slices (on this foundation):** 1b — a custom `ArrowNetDeltaMultiFileList`
+> (`fabricator_delta_native_scan`) can't do any of those (it sees only parquet footers, no `_delta_log`) → it stays
+> the simple/no-DV fallback. **Next slices (on this foundation):** 1b — a custom `FabricatorDeltaMultiFileList`
 > holding per-file metadata + `FinalizeBind` → `DeltaDeleteFilter` from a C#-supplied DV bitmap (DV **correctness**);
 > 1c — partition-value constants; 1d — `Complex/DynamicFilterPushdown` → re-call `delta_list_files` with the filter
 > (the `push` arg) so engineered-wood prunes files by log stats; 1e — fold into the ATTACH catalog (credential
@@ -19,8 +19,8 @@
 >
 > **Slice 1b DONE (2026-07-03) — deletion vectors (correctness):** `delta_list_files` now emits per file the
 > DELETED row positions (`"dv":[…]`, resolved by engineered-wood's `DeletionVectorReader`); the C++ side gained a
-> custom `ArrowNetDeltaMultiFileList` (per-file DV parallel to the file list), an `InitializeGlobalState` override
-> (so `FinalizeBind` can reach the list), and `FinalizeBind` attaches an `ArrowNetDeltaDeleteFilter` (over the
+> custom `FabricatorDeltaMultiFileList` (per-file DV parallel to the file list), an `InitializeGlobalState` override
+> (so `FinalizeBind` can reach the list), and `FinalizeBind` attaches an `FabricatorDeltaDeleteFilter` (over the
 > sorted deleted positions) to the parquet reader → DuckDB's native read EXCLUDES the deleted rows. Matches the C#
 > reader on a `deletion_vectors true` table (`test/verify_delta_mfr_dv.test`, 23). **Two gotchas:** (1) the parquet
 > reader hands `Filter()` an uninitialized `SelectionVector` (`Initialize(nullptr)` → null buffer), so the
@@ -30,7 +30,7 @@
 > for the delta reader is a follow-up). No ABI bump.
 >
 > **1c (partition) + 1d (filter pushdown) — LARGELY ALREADY WORK via the inherited parquet_scan (verified 2026-07-03):**
-> because `arrownet_delta_mfr_scan` clones `parquet_scan`, it inherits **filter pushdown** and **hive partitioning**.
+> because `fabricator_delta_mfr_scan` clones `parquet_scan`, it inherits **filter pushdown** and **hive partitioning**.
 > (1) **Filters push to the row-group level automatically** — `EXPLAIN … WHERE id>7` shows `Filters: id>7` INSIDE
 > the scan operator (no separate FILTER), so static AND dynamic (join/TopN) filters prune row-groups in the native
 > read with no custom `Complex/DynamicFilterPushdown`. (2) **Partition columns resolve automatically** — engineered-
@@ -46,7 +46,7 @@
 > **1e slice 1 DONE (2026-07-03) — native read folded into the ATTACH catalog (opt-in, C#-only, NO ABI/C++):**
 > the Delta folder-catalog ATTACH option **`native_read true`** makes a plain `SELECT … FROM lake.main.t` source
 > its bytes through **DuckDB's own parquet reader** — `DeltaCatalog.ScanTable`'s plain-read branch runs
-> `Host.Query("SELECT * FROM read_parquet([<exact active files>])")` (the validated `arrownet_delta_native_scan`
+> `Host.Query("SELECT * FROM read_parquet([<exact active files>])")` (the validated `fabricator_delta_native_scan`
 > mechanism: engineered-wood lists the exact `add` set via `GetActiveFileUrisWithDv`; DuckDB's native reader reads
 > them with tuned decode + cross-file parallelism + ExternalFileCache, over `onelake://` for OneLake) instead of
 > engineered-wood's C# parquet reader. **This deliberately does NOT drive the C++ MultiFileReader from the catalog
@@ -68,10 +68,10 @@
 > heavier follow-up; slice-1 delivers the headline native-read win (tuned decode + parallelism + caching) with
 > near-zero risk. Below is the full design.
 
-> **Phase-A pre-spike DONE (2026-07-03):** `arrownet_delta_native_scan(path)` — engineered-wood lists the EXACT
+> **Phase-A pre-spike DONE (2026-07-03):** `fabricator_delta_native_scan(path)` — engineered-wood lists the EXACT
 > active data files + schema (`DeltaReader.GetActiveFileUris`, the `add` set, NOT a glob), and DuckDB's **native
 > parquet reader** reads them via `read_parquet([...])` run on the host engine (`Host.Query`/host_query). Matches
-> the C# reader (`arrownet_delta_scan`) row-for-row on the local fixture (`test/verify_delta_native_scan.test`,
+> the C# reader (`fabricator_delta_scan`) row-for-row on the local fixture (`test/verify_delta_native_scan.test`,
 > 36 assertions); for OneLake the file URIs are rewritten to `onelake://` so the read is native **and cached**
 > (ExternalFileCache, confirmed). C#-only (no ABI — reuses the `onelake://` FS v56 + host_query); `parquet` is now
 > statically linked into the test binaries (`extension_config.cmake`). **First slice: plain tables** — no deletion
@@ -160,15 +160,15 @@ latter is what column-mapping Delta tables need.
 is new in ~1.5; the delta ext notes const-correctness debt around `GetTotalFileCount`). We are pinned to
 1.5.4, but every DuckDB bump touches this glue. This is the single biggest architectural cost — it partly
 reverses our "C++ thin / all logic in C#" principle. Mitigation: the glue is **provider-agnostic** (it's
-"read a supplied list of parquet files with DV + column mapping") and lives in `arrownet-core`, reused by
+"read a supplied list of parquet files with DV + column mapping") and lives in `fabricator-core`, reused by
 every future lakehouse provider.
 
 ## Our shape: generic C++ core + a C# `ILakehouseSnapshot` interface
 
-**C++ (new, `arrownet-core`, provider-agnostic):** `ArrowNetMultiFileList : SimpleMultiFileList` +
-`ArrowNetMultiFileReader : MultiFileReader`, whose file list comes from an ABI metadata call (not
+**C++ (new, `fabricator-core`, provider-agnostic):** `FabricatorMultiFileList : SimpleMultiFileList` +
+`FabricatorMultiFileReader : MultiFileReader`, whose file list comes from an ABI metadata call (not
 Delta-specific — Iceberg/Lance/plain-parquet all just return a file list). Register e.g.
-`arrownet_delta_scan` by cloning `parquet_scan` + injecting `get_multi_file_reader`.
+`fabricator_delta_scan` by cloning `parquet_scan` + injecting `get_multi_file_reader`.
 
 **ABI (metadata plane — mirrors the kernel FFI, but as our ABI + Arrow):**
 
@@ -302,7 +302,7 @@ stream path today) + native parquet **write** (kills the DataPage-V2 / signed-mi
 Spark-compatible readable row ids for free + reusable across providers.
 
 **Costs / risks:** (1) new C++ coupling to DuckDB's churning `MultiFileReader` internals — the biggest price,
-partly reverses "thin C++"; mitigated by keeping it provider-agnostic in `arrownet-core`. (2) Two read paths
+partly reverses "thin C++"; mitigated by keeping it provider-agnostic in `fabricator-core`. (2) Two read paths
 (native for parquet-backed lakehouse; Arrow bridge for SQL/DAX) — acceptable, different provider kinds. (3)
 No benefit for SQL Server / DAX — a Delta/lakehouse-only investment. (4) DV correctness: engineered-wood must
 decode DVs to a bool/position set matching `file_row_number` semantics (its roaring reader is fixed).
@@ -362,7 +362,7 @@ consequence:** dynamic filters apply only to **not-yet-opened** files (an in-fli
 re-pruned), so a **very high thread count opens many files before the join's dynamic filter materializes →
 they escape pruning**. Moderate parallelism lets the build side produce the filter early so later file opens
 are pruned — a real parallelism-vs-late-filter trade-off (self-bounded by the #threads look-ahead). The native
-fold **inherits all of this for free** from the cloned `parquet_scan` + our `ArrowNetDeltaMultiFileList` (static
+fold **inherits all of this for free** from the cloned `parquet_scan` + our `FabricatorDeltaMultiFileList` (static
 + dynamic, row-group + file-skip) — no extra work. The only lever is deckeling a Delta scan's parallelism via
 the interface `MaxThreads` if we ever want to prioritize dynamic-filter effectiveness over raw parallelism
 (feintuning, not required). Later 1d-file can also push the **static** filter into `catalog_list_scan_files` so
@@ -417,14 +417,14 @@ later**: partition the file list into N groups, one Arrow stream + per-thread lo
 `MaxThreads = N` — this does NOT touch the rowid/DV/filter design (the ordinal is global-path-sorted regardless
 of which thread reads a file). So we build the single-stream C# reader now and layer multi-lane on later.
 
-**⇒ Target = the pure-C# native reader.** Build the C++ MFR (`arrownet_delta_mfr_scan`, slices 1a/1b, already
+**⇒ Target = the pure-C# native reader.** Build the C++ MFR (`fabricator_delta_mfr_scan`, slices 1a/1b, already
 done as a standalone function) only if CPU-bound-local multi-lane Delta scans become a real goal.
 
 ### Concrete plan — C# native catalog reader (supersedes the `native_read` Host.Query slice `9f5ec40`)
 
 1. **Slice 1 (C#-only, no ABI) — DONE (2026-07-03).** `DeltaCatalog.ScanTable`'s `native_read` branch grew from
    one `read_parquet([list])` into a **per-file loop** (`DeltaNativeReader`, prefetch/bounded-channel via
-   `ARROWNET_DELTA_PREFETCH`, default 1 = sequential, >1 = concurrent file fetch) that per file emits
+   `FABRICATOR_DELTA_PREFETCH`, default 1 = sequential, >1 = concurrent file fetch) that per file emits
    `SELECT <projected>[, ((ordinal::BIGINT << 40) | file_row_number) AS "_metadata.row_id"] FROM
    read_parquet(<file>, file_row_number => true) [WHERE <static> [AND file_row_number NOT IN (dv)]]` via
    `Host.Query`, yields its batches, excludes the file's **DV** (`NOT IN`), and does **Delta-log FILE pruning**
@@ -436,7 +436,7 @@ done as a standalone function) only if CPU-bound-local multi-lane Delta scans be
    Verified: `test/verify_delta_catalog_native_read.test` (66 — read/projection/filter/aggregate, multi-file
    append, DELETE+UPDATE via native rowid, DV exclusion, AT VERSION 0/1/2, explicit-transaction pinning); Delta
    catalog write/delete/update/decimal/time_travel/changes suites unregressed. **Logging (ILogger, C#-only):**
-   `ArrowNetLog` (off by default; `ARROWNET_LOG_LEVEL`+`ARROWNET_LOG_FILE` → a file sink; factory pluggable) traces
+   `FabricatorLog` (off by default; `FABRICATOR_LOG_LEVEL`+`FABRICATOR_LOG_FILE` → a file sink; factory pluggable) traces
    the resolved snapshot version, the file list (active/scanned/pruned), and each per-file `read_parquet` SQL.
    One local engineered-wood change: `DeltaFilePruner` made `public` (was `internal`). **Deferred within slice 1:**
    very large DVs use a big `NOT IN` list (fine for typical DV cardinality; a bitmap/anti-join is a later opt).
@@ -447,13 +447,13 @@ done as a standalone function) only if CPU-bound-local multi-lane Delta scans be
    **Batch 2 — exact remaining ABI work (for a fresh, well-budgeted session; NOT started — an unfinished ABI
    bump breaks the extension):**
    - **(2a) DuckDB log forwarding — WIRED (ABI v58), lockstep-verified, and `duckdb_logs` surfacing CONFIRMED
-     LIVE.** The additive `host_log(level, log_type, message)` entry is appended to `ArrowNetHostServices`; C++
-     `HostLogService` (in `arrownet_host_query.cpp`, reusing the `g_host_db` `DatabaseInstance*`) maps the level
+     LIVE.** The additive `host_log(level, log_type, message)` entry is appended to `FabricatorHostServices`; C++
+     `HostLogService` (in `fabricator_host_query.cpp`, reusing the `g_host_db` `DatabaseInstance*`) maps the level
      and calls `Logger::Get(*g_host_db).WriteLog(...)`; `HostFs.Log` + `Bootstrap` wire
-     `ArrowNetLog.EnableHostForwarding` when the host provides the callback (level codes stable in
-     `ArrowNetLog.LevelCode`, 0 Trace…5 Critical). **Confirmed:** with `CALL enable_logging(storage='memory')`,
-     `SELECT * FROM duckdb_logs WHERE type LIKE 'ArrowNet%'` returns the forwarded events with the ILogger
-     **category as the `type`** (`ArrowNet.Delta`, `ArrowNet.Delta.Native`) and the mapped `log_level` — a live
+     `FabricatorLog.EnableHostForwarding` when the host provides the callback (level codes stable in
+     `FabricatorLog.LevelCode`, 0 Trace…5 Critical). **Confirmed:** with `CALL enable_logging(storage='memory')`,
+     `SELECT * FROM duckdb_logs WHERE type LIKE 'Fabricator%'` returns the forwarded events with the ILogger
+     **category as the `type`** (`Fabricator.Delta`, `Fabricator.Delta.Native`) and the mapped `log_level` — a live
      native-read query surfaced all 6 events (snapshot pin, file list, per-file `read_parquet` SQL, etc.).
      **Two prior red herrings** (why an earlier smoke showed 0 rows): (i) the enable form is `CALL
      enable_logging(...)`, **not** `PRAGMA enable_logging` (which errors → config stays at default); (ii) the
@@ -462,9 +462,9 @@ done as a standalone function) only if CPU-bound-local multi-lane Delta scans be
      the `unittest`/API host anyway). `WriteLog` on the global logger writes regardless of `ShouldLog`, and the
      client flushes the log buffer at each query boundary, so no instance-vs-connection-logger issue exists. **No
      code change was needed** — the forwarding was correct; only the confirmation recipe. The file sink
-     (`ARROWNET_LOG_LEVEL`+`ARROWNET_LOG_FILE`, Batch 1) remains the always-available independent trace.
+     (`FABRICATOR_LOG_LEVEL`+`FABRICATOR_LOG_FILE`, Batch 1) remains the always-available independent trace.
    - **(2b-slice-1) host-rendered 1:1 native filter SQL — DONE (C++/C#, NO ABI).** The bind-time
-     `FilterSerializer` (`arrownet_table_entry.cpp`) now renders, alongside its superset-safe `filter_json`
+     `FilterSerializer` (`fabricator_table_entry.cpp`) now renders, alongside its superset-safe `filter_json`
      tree, an **equivalent DuckDB SQL predicate** with literals inlined via `Value::ToSQLString()` — same nodes,
      always produced together so they can't diverge (comparison/IN/IS [NOT] NULL/AND/OR/BETWEEN; column via a
      `"…"`-quoted identifier; `is_[not_]distinct` → `IS [NOT] DISTINCT FROM`). It rides `bind_data.native_filter_sql`
@@ -482,7 +482,7 @@ done as a standalone function) only if CPU-bound-local multi-lane Delta scans be
      materialized when `ArrowStreamInitGlobal` runs → rendering `input.filters` **once at scan-init** captures it.
      Pieces: (i) a **C#-declared catalog capability** — `DeltaCatalog` returns `exact_filter_pushdown=true` (only
      under `native_read`) on the `ServerInfo` metadata; C++ `FetchExactFilterPushdown` caches it on
-     `ArrowNetCatalog`, and `BuildScanFunction` sets `function.filter_pushdown = ExactFilterPushdown()`. This gates
+     `FabricatorCatalog`, and `BuildScanFunction` sets `function.filter_pushdown = ExactFilterPushdown()`. This gates
      the flip to the **native_read Delta catalog only** — SQL Server / DAX / non-native Delta keep
      `filter_pushdown=false` (their `ServerInfo` lacks the property → false → unchanged; verified: SQL Server
      filter/projection/limit/orderby/catalog_filter/table_functions suites all green). Safe because `native_read`
@@ -589,9 +589,9 @@ row-tracking tables under `native_read`: excluded from `SELECT *`, bound by bare
 `COALESCE(materialized column, baseRowId + file_row_number)` and `COALESCE(materialized version,
 defaultRowCommitVersion)` — the durable identity, vs the transient `rowid` locator.
 
-- **Generic mechanism (any provider):** metadata kind `ARROWNET_META_VIRTUAL_COLUMNS = 12` returns
+- **Generic mechanism (any provider):** metadata kind `FABRICATOR_META_VIRTUAL_COLUMNS = 12` returns
   (name, type-text) rows per table (best-effort; other providers return empty). The entry registers them
-  at `arrownet::ProviderVirtualBase()` (`VIRTUAL_COLUMN_START + 0x100`) in `GetVirtualColumns()` —
+  at `fabricator::ProviderVirtualBase()` (`VIRTUAL_COLUMN_START + 0x100`) in `GetVirtualColumns()` —
   DuckDB's `TableBinding` maps virtual names for bare-name binding, real same-named columns shadow. The
   scan fetches them by name (`BuildScanSpec`), maps output 1:1 by name (`BuildProjectionMapping`), and
   the live-filter serializers resolve virtual-id filters so an exact-mode erased
@@ -650,16 +650,16 @@ off-schema — Spark writes none either): everything needed is already at hand.
   child chunk ends with the BOOLEAN mark — `AppendModifyBatch`'s "rowid = last column" read the mark as
   the rowid (`Vector::Reference … BIGINT referenced BOOLEAN`). Fix mirrors upstream
   `DuckCatalog::PlanDelete`: the rowid position comes from `LogicalDelete::expressions[0]`
-  (`ArrowNetModifyTarget.rowid_child_index`); UPDATE keeps the last-column contract (binder-built
+  (`FabricatorModifyTarget.rowid_child_index`); UPDATE keeps the last-column contract (binder-built
   projection, as upstream `PhysicalUpdate` assumes).
 - Test: `test/verify_delta_row_tracking_virtual.test` (now 299 — skip pins via duckdb_logs, the
   `file_row_number` rewrite pin, the post-OPTIMIZE physical-column pushdown pin, mark-join dedup DELETE).
 
 ## Recommendation — phased (build on demand)
 
-1. **Phase A — read-only (the big win).** Generic `ArrowNetMultiFileList/Reader` in `arrownet-core` +
+1. **Phase A — read-only (the big win).** Generic `FabricatorMultiFileList/Reader` in `fabricator-core` +
    `list_scan_files`/`scan_schema` ABI + engineered-wood supplies list/DV/partitions/baseRowId. Native read
-   with pushdown + parallelism + DV. Keep the current `arrownet_delta_scan` C# read as a fallback; validate
+   with pushdown + parallelism + DV. Keep the current `fabricator_delta_scan` C# read as a fallback; validate
    against it. **Optional cheaper pre-spike:** `host_query` + `read_parquet([<files>])` (see
    [host-query.md](host-query.md)) with DV as an anti-joined C# input — days-scale, reuses existing plumbing,
    yields a real "native reader vs engineered-wood C# read" perf number before committing to the C++ work.

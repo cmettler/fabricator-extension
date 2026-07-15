@@ -6,15 +6,15 @@
 #              corruption), so emitting Decimal128 at the source is the fix (no Bridge-side widening). The
 #              copy-on-write DELETE/UPDATE survivor filter (DeletionVectorFilter.TakeRows) also handles decimals
 #              (byte-slice copy) — without it a decimal column passed through UNFILTERED (row-count mismatch =>
-#              corruption + crash). Set ARROWNET_DELTA_WRITE_DIR. Local FS.
-# group: [mssql_net]
+#              corruption + crash). Set FABRICATOR_DELTA_WRITE_DIR. Local FS.
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
-require-env ARROWNET_DELTA_WRITE_DIR
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/dec' AS lake (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/dec' AS lake (TYPE fabricator, PROVIDER 'delta');
 
 # Decimal32 (<=9 digits, INT32), Decimal64 (<=18, INT64), Decimal128 (<=38), + negatives.
 statement ok
@@ -82,7 +82,7 @@ statement ok
 DETACH lake;
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/dec' AS lake (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/dec' AS lake (TYPE fabricator, PROVIDER 'delta');
 
 query IRRR
 SELECT id, a, b, c FROM lake.main.d ORDER BY id;

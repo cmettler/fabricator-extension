@@ -1,13 +1,13 @@
 # name: test/verify_limit_pushdown.test
 # description: Verify a bare LIMIT pushes down as SELECT TOP (n) to SQL Server
-# group: [mssql_net]
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql_net);
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
 
 # A bare LIMIT returns the right number of rows.
 query I
@@ -17,7 +17,7 @@ SELECT count(*) FROM (SELECT id FROM db.dbo.TestSimplePK LIMIT 2);
 
 # ...and reached SQL Server as TOP (2).
 query I
-SELECT pushed FROM mssql_net_query('db',
+SELECT pushed FROM fabricator_query('db',
   'SELECT CAST(CASE WHEN EXISTS (
      SELECT 1 FROM sys.dm_exec_query_stats qs
      CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st

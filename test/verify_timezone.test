@@ -1,13 +1,13 @@
 # name: test/verify_timezone.test
 # description: under a non-UTC session TimeZone, a TIMESTAMPTZ preserves its instant and a naive TIMESTAMP is unshifted (warehouse-support §3.1)
-# group: [mssql_net]
+# group: [fabricator]
 #
 # Requires the icu extension (statically embedded, extension_config.cmake) for the TimeZone setting.
 # Validates the recommended naive<->naive semantic: we do NOT reinterpret a stored naive datetime2 as
 # session-local. A TIMESTAMPTZ is an instant — stored as UTC (datetimeoffset where it exists, else UTC
 # datetime2 on Fabric) and re-displayed in the session zone.
 
-require mssql_net
+require fabricator
 
 require icu
 
@@ -17,7 +17,7 @@ statement ok
 SET TimeZone='America/New_York';
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql_net);
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
 
 statement ok
 DROP TABLE IF EXISTS db.dbo.tz_probe;
@@ -28,7 +28,7 @@ CREATE TABLE db.dbo.tz_probe AS SELECT TIMESTAMPTZ '2024-07-01 12:00:00-04:00' A
 
 # tz instant -> datetimeoffset (box has it); naive -> datetime2.
 query TT
-SELECT CAST(DATA_TYPE AS VARCHAR(32)), CAST(COLUMN_NAME AS VARCHAR(32)) FROM mssql_net_query('db',
+SELECT CAST(DATA_TYPE AS VARCHAR(32)), CAST(COLUMN_NAME AS VARCHAR(32)) FROM fabricator_query('db',
   'SELECT DATA_TYPE, COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = ''tz_probe'' ORDER BY ORDINAL_POSITION');
 ----
 datetimeoffset	tstz
@@ -43,7 +43,7 @@ SELECT tstz::VARCHAR, tsnaive::VARCHAR FROM db.dbo.tz_probe;
 
 # Proof the stored datetimeoffset is the correct UTC instant (16:00Z), not the session-local wall clock.
 query T
-SELECT raw FROM mssql_net_query('db',
+SELECT raw FROM fabricator_query('db',
   'SELECT CAST(CONVERT(VARCHAR(40), SWITCHOFFSET(tstz, 0), 126) AS VARCHAR(40)) AS raw FROM dbo.tz_probe');
 ----
 2024-07-01T16:00:00+00:00

@@ -5,12 +5,12 @@
 #              discovery as kind='collector'. See docs/inout-collector-mode.md.
 # group: [mssql]
 
-require mssql_net
+require fabricator
 
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS cdb (TYPE mssql_net);
+ATTACH '${MSSQL_TESTDB_DSN}' AS cdb (TYPE fabricator);
 
 # dbo.cf_collect is a custom C# COLLECTOR (no SQL Server object): it reads the WHOLE input table, then emits
 # every input row n paired with the GLOBAL sum across all rows. The total is only knowable after all input is
@@ -87,13 +87,13 @@ NULL	12
 
 # Discovered as kind='collector'.
 query T
-SELECT kind FROM mssql_net_functions('cdb') WHERE name = 'cf_collect';
+SELECT kind FROM fabricator_functions('cdb') WHERE name = 'cf_collect';
 ----
 collector
 
 # NO backing SQL Server object (it is pure C#).
 query I
-SELECT cnt FROM mssql_net_query('cdb', 'SELECT COUNT(*) AS cnt FROM sys.objects WHERE name = ''cf_collect''');
+SELECT cnt FROM fabricator_query('cdb', 'SELECT COUNT(*) AS cnt FROM sys.objects WHERE name = ''cf_collect''');
 ----
 0
 

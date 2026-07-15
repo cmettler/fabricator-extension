@@ -5,17 +5,17 @@
 #              scan and (b) stop re-applying the pushed static filters — both applied EXACTLY as a
 #              read_parquet WHERE (target is DuckDB, so 1:1). This asserts correctness; the actual pushed
 #              WHERE is proven via duckdb_logs (the C# native reader logs each per-file read_parquet SQL).
-#              Set ARROWNET_DELTA_WRITE_DIR (writable). Local FS.
-# group: [mssql_net]
+#              Set FABRICATOR_DELTA_WRITE_DIR (writable). Local FS.
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
 require parquet
 
-require-env ARROWNET_DELTA_WRITE_DIR
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catdynfilter' AS lake (TYPE arrownet, PROVIDER 'delta', native_read true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/catdynfilter' AS lake (TYPE fabricator, PROVIDER 'delta', native_read true);
 
 statement ok
 CREATE TABLE lake.main.big AS SELECT i AS id, 'v' || i AS name FROM range(1, 1001) AS r(i);
@@ -65,14 +65,14 @@ SELECT count(*) FROM lake.main.big b JOIN lake.main.dim d ON b.id = d.id;
 # the dynamic join bound (an IN-list and/or a min/max range on id) was spliced into the read_parquet WHERE
 query I
 SELECT count(*) > 0 FROM duckdb_logs
-WHERE type = 'ArrowNet.Delta.Native' AND message LIKE '%read_parquet%WHERE%"id"%';
+WHERE type = 'Fabricator.Delta.Native' AND message LIKE '%read_parquet%WHERE%"id"%';
 ----
 true
 
 # and NO leaked "optional:" prefix (OptionalFilter children are unwrapped)
 query I
 SELECT count(*) FROM duckdb_logs
-WHERE type = 'ArrowNet.Delta.Native' AND message LIKE '%optional:%';
+WHERE type = 'Fabricator.Delta.Native' AND message LIKE '%optional:%';
 ----
 0
 

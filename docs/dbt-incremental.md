@@ -1,4 +1,4 @@
-# dbt incremental models + schema evolution with `mssql_net`
+# dbt incremental models + schema evolution with `fabricator`
 
 > Findings from the `dbt_mssql_test/` harness (gitignored), validated against **box SQL Server 2025** and a
 > **Fabric Warehouse** with the per-transaction connection model
@@ -54,7 +54,7 @@ session 57  (holds an incompatible lock on inc_a — the uncommitted ALTER … A
 
 ### The fix — eager same-connection re-fetch on ALTER
 
-`ArrowNetSchemaEntry::Alter` no longer evicts-and-waits-for-a-lazy-refetch. After the `ALTER` it **re-fetches
+`FabricatorSchemaEntry::Alter` no longer evicts-and-waits-for-a-lazy-refetch. After the `ALTER` it **re-fetches
 the columns eagerly, on the model's own connection** (the ambient transaction is set at the top of `Alter`,
 so the metadata read routes to session 57 — which *owns* the Sch-M lock, so a read-your-writes probe on the
 same session sees the new schema with **no lock wait**) and caches that fresh entry. The later bind (even in
@@ -62,8 +62,8 @@ a different transaction) then finds the entry **cached** and never issues the bl
 Result: concurrent schema evolution succeeds (~0.5 s/model).
 
 Because the eager re-fetch reflects the *uncommitted* schema, a transaction that later **rolls back** would
-leave a stale entry — so `ArrowNetTransactionManager::RollbackTransaction` calls
-`ArrowNetCatalog::InvalidateAllEntries()` (drops materialized entries, keeps the discovered name lists for a
+leave a stale entry — so `FabricatorTransactionManager::RollbackTransaction` calls
+`FabricatorCatalog::InvalidateAllEntries()` (drops materialized entries, keeps the discovered name lists for a
 lazy re-fetch) on rollback. Verified: `ALTER … ADD COLUMN` inside a transaction that `ROLLBACK`s leaves the
 table at its original schema (no stale column). The commit path needs nothing — the cached entry already
 matches the committed schema.

@@ -21,7 +21,7 @@ returns each `Table { Name, Location, Format }`. **Local / S3 / plain-ADLS roots
 `DeltaCatalog.DiscoverTables` branches on `FabricLakehouse.IsOneLake(_root)` (host contains `onelake.`).
 Workspace + lakehouse are parsed from `abfss://<ws>@onelake…/<lh>[.Lakehouse]/Tables`: GUID segments are used
 directly, display names are resolved via `WorkspacesClient`/`ItemsClient`. Auth = a `TokenCredential` minted from
-the **ATTACH'd azure SP secret** — `ATTACH '…OneLake…/Tables' (TYPE arrownet, PROVIDER 'delta', SECRET <azure_sp>,
+the **ATTACH'd azure SP secret** — `ATTACH '…OneLake…/Tables' (TYPE fabricator, PROVIDER 'delta', SECRET <azure_sp>,
 READ_ONLY false)` flows the secret through the v39 foreign-secret path → `DeltaBackend.BuildConnectionString`
 appends a base64 cred marker on the root → `DeltaCatalog` extracts it into a `ClientSecretCredential` (mirrors
 DAX). **Schema-enabled lakehouses** (`GetLakehouse.DefaultSchema` set; tables at `Tables/<schema>/<table>`) can't
@@ -43,7 +43,7 @@ is compaction-only). Row-group size IS controllable (`ParquetWriteOptions.RowGro
 default **122880** in `DeltaWriter`). To avoid the small-files problem on real writes, coalesce input batches.
 The **catalog streaming write is now implemented** (`CREATE TABLE`/`INSERT`/CTAS/COPY stream straight to
 engineered-wood via the standard bulk path, like the SQL/DAX backends) — so for the catalog case the global
-`arrownet_delta_write` collector is no longer needed (it remains as the connection-free, no-ATTACH function form).
+`fabricator_delta_write` collector is no longer needed (it remains as the connection-free, no-ATTACH function form).
 
 ## engineered-wood interop caveats (Parquet + Delta on write) — reviewed 2026-07-02
 
@@ -87,20 +87,20 @@ targeted engineered-wood/write-option changes, deferred until a concrete reader 
 > catalog (each `_delta_log` subdir = a table), reusing the existing multi-provider architecture so a Delta
 > table is read/written like any other catalog table. Write-back (INSERT / DELETE / UPDATE) is backed by
 > **engineered-wood**'s read-write Delta implementation. Builds on the validated filesystem bridge
-> ([docs/filesystem-bridge.md](filesystem-bridge.md)), the existing read-only `arrownet_delta_scan`
+> ([docs/filesystem-bridge.md](filesystem-bridge.md)), the existing read-only `fabricator_delta_scan`
 > ([docs/multifile-delta.md](multifile-delta.md)), and the provider model
 > ([docs/provider-extensibility.md](provider-extensibility.md)).
 
 ## Why
 
-Today Delta is a single **read-only global table function**, `arrownet_delta_scan(path)` (bespoke
-`arrownet_delta.cpp`, materialized C# read). There is **no write target** — a SQL `DELETE FROM <delta>` /
+Today Delta is a single **read-only global table function**, `fabricator_delta_scan(path)` (bespoke
+`fabricator_delta.cpp`, materialized C# read). There is **no write target** — a SQL `DELETE FROM <delta>` /
 `INSERT` has nothing to bind to. engineered-wood, however, is **full read-write** (see the capability survey
 below), so the missing piece is a *catalog* that turns a Delta location into addressable, writable table
 entries.
 
 A Delta "database" has no server and no namespace — it's just a **directory tree of tables**. So the natural
-catalog root is a **folder path**: `ATTACH '/lake/root' AS lake (TYPE arrownet, PROVIDER 'delta')`. Subdirs
+catalog root is a **folder path**: `ATTACH '/lake/root' AS lake (TYPE fabricator, PROVIDER 'delta')`. Subdirs
 containing a `_delta_log/` are the tables.
 
 ## It drops into the existing provider architecture (almost no new C++)
@@ -120,7 +120,7 @@ C++**.
 - **Namespace** — Delta has none. Simplest: **flat** — every `_delta_log` dir under the root is a table in a
   single `main` schema. Alternative: one subdir level = schema, next = table (a 2-level namespace). The folder
   root gives a 1-/2-level namespace for free; start flat.
-- **Scan** — reuse the engineered-wood `DeltaReader` already wired for `arrownet_delta_scan`, now per
+- **Scan** — reuse the engineered-wood `DeltaReader` already wired for `fabricator_delta_scan`, now per
   table-entry (projection/filter applied by DuckDB above the scan, as today; pushdown into the snapshot is a
   later optimization — see [docs/multifile-delta.md](multifile-delta.md)).
 
@@ -255,7 +255,7 @@ INSERT/DELETE = one Delta commit = atomic, which covers the common case.)
 
 ## Host-FS write capability — probe findings (the commit-primitive blocker)
 
-Before building any Delta write-back, `arrownet_fs_write_probe(base_path)` (a C++ spike in `arrownet_fs_spike.cpp`,
+Before building any Delta write-back, `fabricator_fs_write_probe(base_path)` (a C++ spike in `fabricator_fs_spike.cpp`,
 no ABI) exercises DuckDB's `FileSystem` write surface directly — the managed reverse-callbacks would forward to
 these same calls, and the opener/secret path is identical, so it faithfully answers "is DuckDB's FileSystem
 capable?" for local AND (when pointed at an `az://`/`s3://` prefix with a secret) object stores.
@@ -311,15 +311,15 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
 
 ## Recommendation (sequenced; build on demand)
 
-0. **Host-FS WRITE surface — DONE (ABI v48).** `ArrowNetHostServices` gained `fs_open_write`(exclusive) /
+0. **Host-FS WRITE surface — DONE (ABI v48).** `FabricatorHostServices` gained `fs_open_write`(exclusive) /
    `fs_write` / `fs_close_write` / `fs_remove` / `fs_create_dir`(recursive); `DuckDbTableFileSystem` implements
    the write side (`CreateAsync`/`WriteAllBytesAsync`/`RenameAsync`/`DeleteAsync` + `DuckDbSequentialFile`). The
    commit's put-if-absent rides `EXCLUSIVE_CREATE` (since DuckDB `MoveFile` overwrites on local + is unimplemented
    on Azure DFS, `RenameAsync` is emulated as exclusive-create-copy → returns false on an existing target →
    engineered-wood maps to `DeltaConflictException`). `HostFsGlob` normalizes object-store 404 to empty.
-   **Validated end-to-end on local AND a live OneLake lakehouse** by the `arrownet_delta_write_demo(path)` global
+   **Validated end-to-end on local AND a live OneLake lakehouse** by the `fabricator_delta_write_demo(path)` global
    host-FS table fn (writes a 5-row Delta table via engineered-wood, idempotent Overwrite, round-trips with
-   `arrownet_delta_scan`) — `test/verify_delta_write.test`. Single-writer; concurrent commits are safe where
+   `fabricator_delta_scan`) — `test/verify_delta_write.test`. Single-writer; concurrent commits are safe where
    `EXCLUSIVE_CREATE` is honored (OneLake/POSIX).
    - **Portability of engineered-wood output (validated with the REFERENCE reader, delta-kernel-rs via DuckDB's
      official `delta` extension).** engineered-wood's defaults are NOT readable by standard Delta/parquet tooling
@@ -341,10 +341,10 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
 1. **Folder-root `DeltaCatalog` + read — DONE (local; OneLake discovery caveat below).** `DeltaBackend` (3rd
    `IBackend`, name `"delta"`/`"deltalake"`, registered explicitly in `BackendRegistry.Discover` since it lives
    in the Bridge alongside `DeltaReader`) + `DeltaCatalog : IBackendCatalog` (read-only this slice; writes
-   throw). `ATTACH '/lake' AS lake (TYPE arrownet, PROVIDER 'delta')` → tables = immediate subdirs with a
+   throw). `ATTACH '/lake' AS lake (TYPE fabricator, PROVIDER 'delta')` → tables = immediate subdirs with a
    `_delta_log/` (globbed `<root>/*/_delta_log/*.json`), flat `main` schema; columns via `DeltaReader.GetSchema`;
    scan via `DeltaReader.Stream` with filter pushdown (projection left to DuckDB above). The host-FS **opener**
-   is threaded into the catalog metadata path: `LoadCatalog`/`RefreshCache` now call `ArrowNetSetActiveTxn`
+   is threaded into the catalog metadata path: `LoadCatalog`/`RefreshCache` now call `FabricatorSetActiveTxn`
    (which also sets the opener) before discovery, and `FetchTableColumns` already did. Validated on a LOCAL
    Delta root: `test/verify_delta_catalog.test` (17 — discovery, filter pushdown, aggregate, cross-table join).
    **OneLake table discovery uses the Fabric REST API** (the DuckDB azure glob can't recurse a OneLake
@@ -354,7 +354,7 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
    near the top of this doc for auth (the ATTACH'd azure SP secret) + workspace/lakehouse resolution. Live Fabric
    validation pending.
 2. **Write arbitrary data — DONE, both the function form AND the catalog (streaming) form.**
-   - **Function form** (`arrownet_delta_write(<input>, path := '…')`): a connection-free GLOBAL host-FS
+   - **Function form** (`fabricator_delta_write(<input>, path := '…')`): a connection-free GLOBAL host-FS
      **collector** (`DeltaWriteCollectorFunction`) that writes ANY input table (a DuckDB query result) to a Delta
      table at `path` (Overwrite), returning `(version, rows_written)`. It buffers the input (copying it out via an
      Arrow IPC round-trip — the operator frees each batch after consumption), then commits one Delta version
@@ -363,8 +363,8 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      the pull thread — setting it only in Finalize was racy). Cost args ride as NAMED params (`Parameters` added
      to `IInOutFunction`/`ICollectorTableFunction`, surfaced via the handle-0 `GlobalFunctions.ParamSchema`).
      Validated local (`test/verify_delta_write.test`, official delta-kernel read-back) + a live OneLake managed
-     table (`Tables/dbo/arrownet_query`, 20-row query result).
-   - **Catalog (streaming) form — DONE** (`ATTACH … (TYPE arrownet, PROVIDER 'delta')`; `CREATE TABLE` / `INSERT
+     table (`Tables/dbo/fabricator_query`, 20-row query result).
+   - **Catalog (streaming) form — DONE** (`ATTACH … (TYPE fabricator, PROVIDER 'delta')`; `CREATE TABLE` / `INSERT
      INTO lake.t` / CTAS / COPY): the catalog INSERT/CTAS/COPY operators now stream straight to engineered-wood
      via the **existing streaming bulk path** (`begin_bulk`/`push_batch`/`complete_bulk` → `BulkSession` →
      `DeltaCatalog.BulkInsert`), exactly like the SQL Server / DAX backends — no separate global collector needed
@@ -416,7 +416,7 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      lakehouses with time-travel on, plus local/S3 + delta-rs/Spark; on a Fabric lakehouse without the setting use
      plain tables (VERSION travel). A commit-file mtime path (timestamp travel on plain tables, no writer-v7) is a
      lower-priority option. VERSION travel is universal. `verify_delta_catalog_time_travel.test` (47).
-     **SNAPSHOTS / history — DONE: `arrownet_delta_snapshots('<catalog>', '<schema.>table')`** (DuckLake-style
+     **SNAPSHOTS / history — DONE: `fabricator_delta_snapshots('<catalog>', '<schema.>table')`** (DuckLake-style
      view). Catalog NAME (not a path; resolved to its handle, reusing the catalog's `TablePath`) + schema-qualified
      table (schema mandatory on schema-enabled, defaults to `main` flat). Returns `(version, timestamp, operation,
      operation_parameters)` from the `_delta_log` (engineered-wood `GetHistoryAsync`). New `MetadataKind.Snapshots`
@@ -435,7 +435,7 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      (writer-v7). INSERT/DELETE/UPDATE capture CDC change files: blind appends infer naturally; the rowid
      copy-on-write DELETE/UPDATE + DV-delete paths emit `_change_data/*.parquet` (Delete / UpdatePreimage /
      UpdatePostimage) — they already read the changed rows for the rewrite, so capture is essentially free.
-     **Read** via **`arrownet_delta_changes('<catalog>', '<schema.>table', from [, to])`** (2 overloads; `to`
+     **Read** via **`fabricator_delta_changes('<catalog>', '<schema.>table', from [, to])`** (2 overloads; `to`
      omitted/-1 ⇒ latest): the row-level feed with `_change_type` ++ `_commit_version BIGINT` ++
      `_commit_timestamp BIGINT` (epoch ms). New `MetadataKind.Changes=9` (additive, **no ABI bump**); C++
      `ChangesBind` mirrors `SnapshotsBind` (arg2 = `"from:to"`). **Two read-path fixes:** (1) the rowid-DML CDC
@@ -448,7 +448,7 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      changes from add/remove on a non-CDF table (misleading for copy-on-write), so `GetChanges` requires
      `CdfConfig.IsEnabled(config)` and throws "Change Data Feed is not enabled" otherwise (Spark
      `DELTA_CHANGE_DATA_FEED_NOT_ENABLED` parity). `verify_delta_catalog_changes.test` (45); live Fabric on
-     `Test`/`LH` (`lake.dbo.arrownet_cdftest`: CTAS → DELETE → UPDATE → correct feed + snapshot operations).
+     `Test`/`LH` (`lake.dbo.fabricator_cdftest`: CTAS → DELETE → UPDATE → correct feed + snapshot operations).
 
      **ROW TRACKING — DONE (STANDALONE ATTACH option).** ATTACH option **`row_tracking true`** → tables CREATEd
      in the catalog declare the Delta **`delta.enableRowTracking`** WRITER feature (writer-v7 + `domainMetadata`),
@@ -478,7 +478,7 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      instead of engineered-wood's C# reader: `DeltaCatalog.ScanTable`'s plain-read branch runs
      `Host.Query("SELECT * FROM read_parquet([<exact active files>])")` (files via
      `DeltaReader.GetActiveFileUrisWithDv`; tuned decode + cross-file parallelism + `ExternalFileCache`, over
-     `onelake://` for OneLake — the `arrownet_delta_native_scan` mechanism reused from the catalog). It is a pure
+     `onelake://` for OneLake — the `fabricator_delta_native_scan` mechanism reused from the catalog). It is a pure
      **byte-source switch** — all catalog plumbing (three-part names, stats, DML, time travel) is untouched — and
      deliberately NOT the C++ `MultiFileReader`-from-the-catalog fold (that would need a pre-bound parquet scan out
      of `GetScanFunction`, and `TableFunctionBindInput` wants a live `Binder`+`TableFunctionRef` the catalog entry
@@ -495,9 +495,9 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      **PARTITIONING + WRITE TUNING — DONE + VALIDATED LIVE ON FABRIC (ABI v51).** Two ways to declare partition
      columns: (1) the **native `CREATE TABLE [t] PARTITIONED BY (cols) [AS …]`** clause (DuckDB v1.5.4 parses it
      into `CreateTableInfo::partition_keys`; the clause precedes `AS` for CTAS) — the base
-     `Catalog::SupportsCreateTable` rejects any partition_keys, so `ArrowNetCatalog::SupportsCreateTable` is
+     `Catalog::SupportsCreateTable` rejects any partition_keys, so `FabricatorCatalog::SupportsCreateTable` is
      overridden to permit them (SORTED BY + WITH-options stay unsupported); C++ extracts the names
-     (`arrownet::PartitionColumnsArg`, column-refs only) in the DDL `CreateTable` + CTAS (`ArrowNetCtasInfo`) and
+     (`fabricator::PartitionColumnsArg`, column-refs only) in the DDL `CreateTable` + CTAS (`FabricatorCtasInfo`) and
      passes a comma-separated `partition_columns` arg through **`create_table` + `begin_bulk`** (the ABI v51 bump —
      a signature change on both, provider-agnostic: SQL Server / DAX ignore it); (2) the session
      **`delta_write_options`** JSON setting's `partition_by` (used when there's no native clause). engineered-wood's
@@ -510,7 +510,7 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      page version/size, float column order, KV metadata); our defaults auto-enable dictionary encoding + always
      collect min/max stats (driving file + row-group pruning), Snappy compression, bloom filters off — good
      defaults, nothing required. Validated: `verify_delta_catalog_partition.test` (54); native partitioning live on
-     Fabric OneLake (`LH.dbo.arrownet_parttest`, `region=US/EU/APAC`).
+     Fabric OneLake (`LH.dbo.fabricator_parttest`, `region=US/EU/APAC`).
 
      **ATOMIC PARTITION-OVERWRITE (`replace_where`) + SCHEMA MERGE (`merge_schema`) — DONE.** Two more
      `delta_write_options` keys (C#-only, no ABI). **`replace_where` = `{partcol:val,…}`**: an INSERT becomes an
@@ -565,12 +565,12 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
    design: write **plain Delta** (minReader 1 / minWriter 2, no features); the DuckDB rowid is a TRANSIENT
    `(fileOrdinal << 40) | rowPosition` (file ordinal in the path-sorted active set) computed at scan
    (`ReadAllWithRowIdsAsync`), and `DeleteByRowIdsAsync` decodes it → **copy-on-write** rewrite of each affected
-   file (plain `remove`+`add`, no DV). Validated live on the schema-enabled `LH` lakehouse (`arrownet_deltest4`:
+   file (plain `remove`+`add`, no DV). Validated live on the schema-enabled `LH` lakehouse (`fabricator_deltest4`:
    v0 protocol minReader 1/minWriter 2/no features, DELETE = plain remove+add). The virtual-rowid C++ threading +
    `DeltaCatalog.ExecuteDelete` wiring are unchanged from the SUPERSEDED notes — only the rowid *meaning*
    (transient, not stable) and the delete *mechanism* (rewrite, not DV) changed. **(SUPERSEDED below:)** the rowid
    pattern via Delta row tracking (mirrors the SQL Server
-   backend — reuses ArrowNet's existing rowid DML operators wholesale, no OptimizerExtension / custom operator).
+   backend — reuses Fabricator's existing rowid DML operators wholesale, no OptimizerExtension / custom operator).
    **Key finding that drove this:** DuckDB does NOT expose the WHERE predicate at the catalog's `PlanDelete`/
    `PlanUpdate` hook (`LogicalDelete` retains only the table + a rowid-producing child plan), so a "capture the
    FilterNode" predicate-delete is unsafe (the pushdown filter is a superset; a residual filter would over-delete)
@@ -582,14 +582,14 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      `__delta_row_id` physical column); (b) `DeltaTable.DeleteByRowIdsAsync(IReadOnlyCollection<long> rowIds)` —
      deletes by stable id via deletion vectors (reads each file's `__delta_row_id`, maps ids→positions, writes a
      DV + RemoveFile/add). Both require `delta.enableRowTracking=true`. Builds clean.
-   - **ArrowNet wiring — DELETE DONE** (`test/verify_delta_catalog_delete.test`, 28): (1) `DeltaCatalog.CreateTable`/
+   - **Fabricator wiring — DELETE DONE** (`test/verify_delta_catalog_delete.test`, 28): (1) `DeltaCatalog.CreateTable`/
      `BulkInsert` enable `delta.enableRowTracking=true` (catalog-created tables only; the global write
      collector/demo leave it OFF for max delta-kernel compatibility); (2) `DeltaCatalog.GetMetadata(RowId)` returns
      `_metadata.row_id` IFF the table has row tracking (external/legacy tables → no rowid → DML cleanly disabled);
      (3) **virtual-rowid threading in C++** — the rowid machinery resolved rowid names to INDICES into the user
-     column list (`arrownet_schema_entry.cpp`), but `_metadata.row_id` is NOT a user column (surfacing it as one
+     column list (`fabricator_schema_entry.cpp`), but `_metadata.row_id` is NOT a user column (surfacing it as one
      would break INSERT). So when `FetchRowIdColumns` returns names absent from the schema, they're a **virtual
-     rowid**: `ArrowNetTableEntry` + `ArrowStreamBindData` carry the NAMES (not indices) in `virtual_rowid_columns`,
+     rowid**: `FabricatorTableEntry` + `ArrowStreamBindData` carry the NAMES (not indices) in `virtual_rowid_columns`,
      `HasRowId()`/`GetVirtualColumns()`/`GetRowIdColumns()` honor them, `BuildScanSpec` adds them to the fetch list
      when rowid is requested, `arrow_ingest` resolves their result positions BY NAME for `BuildRowId`
      (rowid_type=BIGINT for a single virtual col), and `BuildModifyTarget` uses the virtual names + BIGINT. SQL

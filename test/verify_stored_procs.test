@@ -2,28 +2,28 @@
 # description: Stored procs callable as SELECT * FROM db.schema.proc(name := val) over Arrow (named/optional params)
 # group: [mssql]
 
-require mssql_net
+require fabricator
 
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS spdb (TYPE mssql_net);
+ATTACH '${MSSQL_TESTDB_DSN}' AS spdb (TYPE fabricator);
 
 # A proc with a determinable first result set + a required input parameter.
 statement ok
-SELECT mssql_net_exec('spdb', 'CREATE OR ALTER PROCEDURE dbo.usp_sc(@minSalary INT) AS BEGIN SET NOCOUNT ON; SELECT v.id, v.name, v.salary FROM (VALUES(1,''Alice'',100),(2,''Bob'',200),(3,''Carol'',300)) v(id,name,salary) WHERE v.salary >= @minSalary ORDER BY v.id; END');
+SELECT fabricator_exec('spdb', 'CREATE OR ALTER PROCEDURE dbo.usp_sc(@minSalary INT) AS BEGIN SET NOCOUNT ON; SELECT v.id, v.name, v.salary FROM (VALUES(1,''Alice'',100),(2,''Bob'',200),(3,''Carol'',300)) v(id,name,salary) WHERE v.salary >= @minSalary ORDER BY v.id; END');
 
 # A proc with an OPTIONAL parameter (SQL default) to exercise omission -> default fallback.
 statement ok
-SELECT mssql_net_exec('spdb', 'CREATE OR ALTER PROCEDURE dbo.usp_opt(@base INT, @bonus INT = 50) AS BEGIN SET NOCOUNT ON; SELECT @base + @bonus AS total; END');
+SELECT fabricator_exec('spdb', 'CREATE OR ALTER PROCEDURE dbo.usp_opt(@base INT, @bonus INT = 50) AS BEGIN SET NOCOUNT ON; SELECT @base + @bonus AS total; END');
 
 # A proc with OUTPUT params (+ an integer RETURN value) and no meaningful result set.
 statement ok
-SELECT mssql_net_exec('spdb', 'CREATE OR ALTER PROCEDURE dbo.usp_outp(@a INT, @b INT, @sum INT OUTPUT, @diff INT OUTPUT) AS BEGIN SET NOCOUNT ON; SET @sum=@a+@b; SET @diff=@a-@b; RETURN 42; END');
+SELECT fabricator_exec('spdb', 'CREATE OR ALTER PROCEDURE dbo.usp_outp(@a INT, @b INT, @sum INT OUTPUT, @diff INT OUTPUT) AS BEGIN SET NOCOUNT ON; SET @sum=@a+@b; SET @diff=@a-@b; RETURN 42; END');
 
-# New routines are picked up on a cache refresh (DDL via mssql_net_exec does not auto-invalidate).
+# New routines are picked up on a cache refresh (DDL via fabricator_exec does not auto-invalidate).
 statement ok
-SELECT mssql_refresh_cache('spdb');
+SELECT fabricator_refresh_cache('spdb');
 
 # Proc parameters are DuckDB named parameters (mirrors EXEC @name=val): name := value.
 # Output schema via sp_describe_first_result_set; executed via EXEC dbo.usp_sc @minSalary=@p0.
@@ -72,13 +72,13 @@ SELECT diff FROM spdb.dbo.usp_outp(a := 20, b := 5);
 15
 
 statement ok
-SELECT mssql_net_exec('spdb', 'DROP PROCEDURE IF EXISTS dbo.usp_sc');
+SELECT fabricator_exec('spdb', 'DROP PROCEDURE IF EXISTS dbo.usp_sc');
 
 statement ok
-SELECT mssql_net_exec('spdb', 'DROP PROCEDURE IF EXISTS dbo.usp_opt');
+SELECT fabricator_exec('spdb', 'DROP PROCEDURE IF EXISTS dbo.usp_opt');
 
 statement ok
-SELECT mssql_net_exec('spdb', 'DROP PROCEDURE IF EXISTS dbo.usp_outp');
+SELECT fabricator_exec('spdb', 'DROP PROCEDURE IF EXISTS dbo.usp_outp');
 
 statement ok
 DETACH spdb;

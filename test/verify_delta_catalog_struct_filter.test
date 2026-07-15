@@ -9,18 +9,18 @@
 #              where a COLUMN-MAPPED table's struct columns are REBUILT with logical member names
 #              (CASE + struct_pack over the physical children; id mode resolves nested children via the
 #              file's parquet field_ids). Correctness across modes is the safety net.
-#              Set ARROWNET_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
-# group: [mssql_net]
+#              Set FABRICATOR_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
 require parquet
 
-require-env ARROWNET_DELTA_WRITE_DIR
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 # One data root (default column mapping = name), read through catalogs with different modes.
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/structf' AS w (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/structf' AS w (TYPE fabricator, PROVIDER 'delta');
 
 statement ok
 CREATE TABLE w.main.t AS
@@ -106,10 +106,10 @@ SELECT sum((s).n.c) FROM w.main.t WHERE (s).a BETWEEN 1001 AND 1010;
 
 # ---- cross-mode agreement: none / static / exact must all return the same result ----
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/structf' AS f_none (TYPE arrownet, PROVIDER 'delta', pushdown_filters 'none');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/structf' AS f_none (TYPE fabricator, PROVIDER 'delta', pushdown_filters 'none');
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/structf' AS f_all (TYPE arrownet, PROVIDER 'delta', pushdown_filters 'all');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/structf' AS f_all (TYPE fabricator, PROVIDER 'delta', pushdown_filters 'all');
 
 query III
 SELECT (SELECT count(*) FROM w.main.t      WHERE (s).a % 2 = 0 AND (s).b = 'x1'),
@@ -144,7 +144,7 @@ SELECT count(*) FROM f_all.main.t b JOIN f_all.main.dim d ON b.id = d.k WHERE (b
 # LOGICAL member names in SQL (CASE + struct_pack over the physical children), so the erased
 # StructFilter's struct_extract SQL binds inside the per-file read_parquet query ----
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/structf' AS nm (TYPE arrownet, PROVIDER 'delta', native_read true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/structf' AS nm (TYPE fabricator, PROVIDER 'delta', native_read true);
 
 query I
 SELECT count(*) FROM nm.main.t WHERE (s).a = 250;
@@ -176,14 +176,14 @@ SELECT id, (s).b FROM nm.main.t WHERE (s).a IN (10, 1050) ORDER BY id;
 
 # ---- native_read + ID-mode mapping: nested children resolved via THIS file's parquet field_ids ----
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/structid' AS iw (TYPE arrownet, PROVIDER 'delta', column_mapping 'id');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/structid' AS iw (TYPE fabricator, PROVIDER 'delta', column_mapping 'id');
 
 statement ok
 CREATE TABLE iw.main.t AS
 SELECT i AS id, {'a': i, 'n': {'c': i * 2}} AS s FROM range(1, 101) AS r(i);
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/structid' AS ir (TYPE arrownet, PROVIDER 'delta', column_mapping 'id', native_read true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/structid' AS ir (TYPE fabricator, PROVIDER 'delta', column_mapping 'id', native_read true);
 
 query I
 SELECT count(*) FROM ir.main.t WHERE (s).a > 90;
@@ -198,7 +198,7 @@ SELECT count(*) FROM ir.main.t WHERE (s).n.c = 100;
 # ---- native_read (exact default) on an UNMAPPED table: the erased StructFilter renders as
 # struct_extract SQL directly inside read_parquet (no rebuild needed) ----
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/structnat' AS n_w (TYPE arrownet, PROVIDER 'delta', column_mapping 'none');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/structnat' AS n_w (TYPE fabricator, PROVIDER 'delta', column_mapping 'none');
 
 statement ok
 CREATE TABLE n_w.main.t AS
@@ -207,7 +207,7 @@ SELECT i AS id,
 FROM range(1, 501) AS r(i);
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/structnat' AS n_r (TYPE arrownet, PROVIDER 'delta', column_mapping 'none', native_read true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/structnat' AS n_r (TYPE fabricator, PROVIDER 'delta', column_mapping 'none', native_read true);
 
 query I
 SELECT count(*) FROM n_r.main.t WHERE (s).a = 250;
@@ -227,7 +227,7 @@ SELECT count(*) FROM n_r.main.t WHERE (s).a IS NULL;
 
 # ---- DML with a struct-member WHERE (rowid scan under exact mode) ----
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/structdml' AS m (TYPE arrownet, PROVIDER 'delta', pushdown_filters 'all');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/structdml' AS m (TYPE fabricator, PROVIDER 'delta', pushdown_filters 'all');
 
 statement ok
 CREATE TABLE m.main.d AS SELECT i AS id, {'a': i, 'b': 'v' || i} AS s FROM range(1, 11) AS r(i);
@@ -251,7 +251,7 @@ SELECT id, (s).a FROM m.main.d WHERE (s).a IN (3, 7) ORDER BY (s).a;
 
 # ---- plain (unmapped) table: same predicates, logical==physical layout ----
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/structplain' AS p (TYPE arrownet, PROVIDER 'delta', column_mapping 'none');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/structplain' AS p (TYPE fabricator, PROVIDER 'delta', column_mapping 'none');
 
 statement ok
 CREATE TABLE p.main.t AS SELECT i AS id, {'a': i, 'b': 'x' || (i % 3)} AS s FROM range(1, 101) AS r(i);

@@ -15,7 +15,7 @@ into one attached `mssql` catalog with **0 errors** (was: all 4 fail with 595), 
 dbt-duckdb runs N threads as N DuckDB connections (cursors) → **N concurrent DuckDB transactions against one
 attached catalog**. But the original model was **single-session per catalog**:
 
-- C++ `ArrowNetTransactionManager::StartTransaction` called `arrownet::BeginTransaction(handle_)` keyed **only by
+- C++ `FabricatorTransactionManager::StartTransaction` called `fabricator::BeginTransaction(handle_)` keyed **only by
   the catalog handle** — not by the transaction.
 - C# `SqlServerCatalog` held a **single shared** `_inTransaction` / `_txnConnection` / `_txn`.
 
@@ -74,17 +74,17 @@ Per-DuckDB-transaction provider connections, keyed by `global_transaction_id`:
 - **ABI v35**: `begin_bulk`'s `autocommit` arg became `int64 txn_id`; one new entry `set_active_txn(handle,
   txn_id)` sets the managed per-thread ambient. The host calls `set_active_txn` IMMEDIATELY before each
   connection-using call, on the same thread (the calls are synchronous).
-- **C++ sourcing**: `ArrowNetTransaction` stores `txn_id_` (= `MetaTransaction::Get(context)
+- **C++ sourcing**: `FabricatorTransaction` stores `txn_id_` (= `MetaTransaction::Get(context)
   .global_transaction_id`), captured at `StartTransaction`; lifecycle (`StartTransaction`/`CommitTransaction`/
   `RollbackTransaction`) sets it before begin/commit/rollback. Every connection-using operator sets it before
   its call: scans centrally in `arrow_ingest`'s `ArrowStreamInitGlobal` (covers all reads incl. TVF /
-  `mssql_net_query` — read-your-writes), DDL in `ArrowNetSchemaEntry::CreateTable/DropEntry/Alter` +
-  `ArrowNetCatalog::CreateSchema/DropSchema`, DML in `arrownet_modify`/`arrownet_insert`, the proc `_each`
-  exchange in `ArrowNetExchange{InitGlobal,Function}` (so its `BeginWrite` joins DuckDB's pinned write txn),
-  the catalog-visibility re-fetch in `FetchTableColumns`, and `mssql_net_exec`. `begin_bulk` carries the id
-  explicitly (background thread). Helper: `ArrowNetSetActiveTxn(handle, context)` in
-  `catalog/arrownet_txn_util.hpp`.
-- **`mssql_net_exec` join-only mode (ABI v36).** A raw exec can't blindly key to the active transaction: its
+  `fabricator_query` — read-your-writes), DDL in `FabricatorSchemaEntry::CreateTable/DropEntry/Alter` +
+  `FabricatorCatalog::CreateSchema/DropSchema`, DML in `fabricator_modify`/`fabricator_insert`, the proc `_each`
+  exchange in `FabricatorExchange{InitGlobal,Function}` (so its `BeginWrite` joins DuckDB's pinned write txn),
+  the catalog-visibility re-fetch in `FetchTableColumns`, and `fabricator_exec`. `begin_bulk` carries the id
+  explicitly (background thread). Helper: `FabricatorSetActiveTxn(handle, context)` in
+  `catalog/fabricator_txn_util.hpp`.
+- **`fabricator_exec` join-only mode (ABI v36).** A raw exec can't blindly key to the active transaction: its
   string-arg target never triggers DuckDB's transaction lifecycle, so a pinned connection it created would
   never be committed (rolled back at teardown). `set_active_txn` gained a `join_only` flag the exec sets:
   `BeginWrite` then runs on the active transaction's pinned connection **iff one already exists** (a

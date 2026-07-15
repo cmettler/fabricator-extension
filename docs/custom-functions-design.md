@@ -44,7 +44,7 @@ So a scalar's output is essentially static (matches the user's intuition); a tab
 Every custom function — authored or discovered — reduces to:
 
 ```csharp
-// ArrowNet.Bridge (provider-agnostic)
+// Fabricator.Bridge (provider-agnostic)
 public enum FunctionKind { Scalar, Table, TableInOut }
 
 // Mirror DuckDB's enums (duckdb/function/function.hpp) 1:1 — C++ sets ScalarFunction.stability /
@@ -110,15 +110,15 @@ explicit:
 - **Catalog-bound (attach-time, the main path):** the catalog *is* the attached database (implicit from
   the handle `list_catalog_functions` was called on). `TargetSchema` = the **SQL Server schema** the
   proc/UDF lives in (`dbo`, `sales`), so `dbo.usp_orders` → `mssql.dbo.usp_orders`. C++ adds the function
-  to the matching `ArrowNetSchemaEntry`. No auto-create — schema discovery already produced those entries
+  to the matching `FabricatorSchemaEntry`. No auto-create — schema discovery already produced those entries
   (ensure discovery includes schemas that contain *only* procs/functions).
 - **Global (load-time):** the catalog is the **system catalog** (implicit; the only sensible target — a
   function in an attached catalog would disappear on `DETACH`). `TargetSchema` defaults to `main` →
-  callable unqualified (`arrownet_query()`). A non-default schema in the system catalog *may* be
+  callable unqualified (`fabricator_query()`). A non-default schema in the system catalog *may* be
   auto-created (a schema is a cheap namespace, unlike a catalog), but for **collision-avoidance across
   providers prefer prefixing the name** (`mssql_query`, `dax_query`) over schema namespacing — a system
   schema named `mssql` collides conceptually with an attached catalog named `mssql`. Generic functions
-  stay `arrownet_*`.
+  stay `fabricator_*`.
 
 ### 3.2 Scalar semantics: stability & null handling
 
@@ -177,8 +177,8 @@ no "optional positional" — so any optional parameter *must* be a named paramet
 
 **Per-parameter attributes ride `ParamSchema` as Arrow field metadata** (the Airport convention — no extra
 ABI surface):
-- `arrownet:named` = `1` → register as a DuckDB **named parameter** (else a positional argument).
-- `arrownet:optional` = `1` → has a SQL Server default; not required (implies named).
+- `fabricator:named` = `1` → register as a DuckDB **named parameter** (else a positional argument).
+- `fabricator:optional` = `1` → has a SQL Server default; not required (implies named).
 
 **Mapping by source:**
 - **Scalar UDF / table-valued function** → **positional** (`SELECT dbo.f(x, y)`,
@@ -222,27 +222,27 @@ mechanisms so **no new Arrow-IPC parsing is needed in C++** (it reuses `Populate
 // Returns rows: decl_id (utf8), name (utf8), kind (int), late_bound (int), metadata (utf8).
 // (Param/output schemas are fetched per-decl below — keeps each row flat/string-readable.)
 int32_t (*list_global_functions)(const char *provider, ArrowArrayStream *out, char **err);
-int32_t (*list_catalog_functions)(ArrowNetHandle handle, ArrowArrayStream *out, char **err);
+int32_t (*list_catalog_functions)(FabricatorHandle handle, ArrowArrayStream *out, char **err);
 
 // Per-decl Arrow schemas as ZERO-ROW streams (C++ reads them like COLUMNS metadata → LogicalTypes).
-int32_t (*get_function_param_schema)(ArrowNetHandle handle, const char *decl_id,
+int32_t (*get_function_param_schema)(FabricatorHandle handle, const char *decl_id,
                                      ArrowArrayStream *out /*zero-row*/, char **err);
 // Scalar / fixed table: the output schema. (Late-bound tables: use bind_function instead.)
-int32_t (*get_function_output_schema)(ArrowNetHandle handle, const char *decl_id,
+int32_t (*get_function_output_schema)(FabricatorHandle handle, const char *decl_id,
                                       ArrowArrayStream *out /*zero-row*/, char **err);
 
 // Table late-binding: given the constant args (1-row Arrow batch, like filter_values), return the
 // output schema (zero-row stream). Called from the DuckDB TableFunction bind.
-int32_t (*bind_function)(ArrowNetHandle handle, const char *decl_id,
+int32_t (*bind_function)(FabricatorHandle handle, const char *decl_id,
                          ArrowArrayStream *args /*1-row, nullable*/, ArrowArrayStream *out, char **err);
 
 // Execute. Scalar: args = one batch (N rows) -> out = one batch (N rows, the single output column).
 //          Table:  args = 1-row batch of the constants    -> out = stream of result batches.
-int32_t (*execute_scalar)(ArrowNetHandle handle, const char *decl_id,
+int32_t (*execute_scalar)(FabricatorHandle handle, const char *decl_id,
                           ArrowArrayStream *args, ArrowArrayStream *out, char **err);
 // Table: spec_json {columns, filter, top} + filter_values mirror scan_table (§3.3) — projection +
 // best-effort filter pushdown into the TVF. Both nullable => no pushdown (full result).
-int32_t (*execute_table)(ArrowNetHandle handle, const char *decl_id, ArrowArrayStream *args,
+int32_t (*execute_table)(FabricatorHandle handle, const char *decl_id, ArrowArrayStream *args,
                          const char *spec_json, ArrowArrayStream *filter_values,
                          ArrowArrayStream *out, char **err);
 // execute_inout: Phase 4 (see §7).
@@ -343,15 +343,15 @@ TOPN(0, …)` to infer columns).
   functions attach-bound too (then we keep lazy loading).
 - **Attach-time / catalog-bound** (discovered procs/UDFs): on `LoadCatalog`/`RefreshCache`, call
   `list_catalog_functions(handle)` → add `ScalarFunctionCatalogEntry` / `TableFunctionCatalogEntry` to
-  the `ArrowNetSchemaEntry`, resolved as `db.schema.fn(args)`. Rides the existing cache invalidation
-  (`mssql_refresh_cache`). This is the Airport pattern and the bulk of real usage.
+  the `FabricatorSchemaEntry`, resolved as `db.schema.fn(args)`. Rides the existing cache invalidation
+  (`fabricator_refresh_cache`). This is the Airport pattern and the bulk of real usage.
 - **Bind callback** (table): extract the constant args → 1-row Arrow batch (via `arrow_produce`) →
   `bind_function(decl_id, args)` → zero-row stream → `PopulateReturnSchema` → `return_types`/`names`.
 - **Execute callback**: marshal the arg chunk → Arrow (`arrow_produce`) → `execute_scalar`/`execute_table`
   → ingest the result (`arrow_ingest`; scalar = one column into the result vector, table = the scan loop).
   Table functions also build the projection/filter `spec_json` + `filter_values` from `column_ids` + the
   pushed filters and pass them to `execute_table` — the same code path as catalog scans (§3.3).
-- New core files `src/arrownet/arrow_functions.{hpp,cpp}` (or `src/include/arrownet/`) hold this — generic,
+- New core files `src/fabricator/arrow_functions.{hpp,cpp}` (or `src/include/fabricator/`) hold this — generic,
   reused by every provider.
 
 **Table-in-out (Phase 4):** DuckDB's `in_out_function` + `OperatorResultType` (`NEED_INPUT` /
@@ -365,7 +365,7 @@ buffer signals. The hard part is **reliably detecting end-of-input** for cleanup
    discovered + provider functions **all catalog-bound** initially (keeps lazy load, simplest, covers the
    stored-proc use case); add load-time global functions only if a provider needs functions without an
    ATTACH.
-2. **Function naming / namespacing** — global authored functions: `arrownet_*` or provider-prefixed
+2. **Function naming / namespacing** — global authored functions: `fabricator_*` or provider-prefixed
    (`mssql_*`)? Catalog functions are naturally `db.schema.fn`. 
 3. **Attribute API surface** — vectorized-only, or also the row-convenience overload (§5b)?
 4. **Decl encoding** — flat rows + per-decl schema streams now, vs `ArrowSerializer` nested rows once
@@ -435,7 +435,7 @@ concrete build settled these points:
   `initialize` from a `std::atomic<int64_t>` on `function_info` (reachable from `initialize`, which has no
   bind_data). **Monotonic ids never collide** → correctness needs no destructor, even across prepared-statement
   re-executions (which share bind_data). The C# session is a `ConcurrentDictionary<id, accumulator>` opened in
-  the aggregate `bind` (stored on `ArrowNetAggregateBindData`; the holder destructor calls `agg_close`).
+  the aggregate `bind` (stored on `FabricatorAggregateBindData`; the holder destructor calls `agg_close`).
 
 - **ABI v25, six entries** (not the single `agg_update(ctx, batch, handles[])` of the sketch): `agg_open` /
   `agg_update` (`[int64 id ++ params]`) / `agg_combine` (`[target_id, source_id]`) / `agg_finalize`
@@ -460,7 +460,7 @@ concrete build settled these points:
   (fast) mode keeps the live accumulator in C# behind an id — bounded by managed memory, no spill. Setting
   `SupportsSpill=true` (+ `IArrowAggregateState.Serialize()`/`Load()`) switches to **bytes-in-blob mode**: the
   per-group state is serialized into DuckDB's fixed, pointer-free state blob
-  (`[uint32 len][byte data[ARROWNET_AGG_SPILL_CAP = 1 KB]]`), so DuckDB's external GROUP BY spills it to disk
+  (`[uint32 len][byte data[FABRICATOR_AGG_SPILL_CAP = 1 KB]]`), so DuckDB's external GROUP BY spills it to disk
   under memory pressure. The cost is (de)serialization on every update/combine/finalize, and a 1 KB cap on the
   serialized state — so it suits fixed/small state (sum/product/bitwise/avg/moments), not unbounded state
   (string concat). Surfaced as `kind='aggregate_spill'`; the C++ callbacks branch on the `spillable` flag and
@@ -472,13 +472,13 @@ concrete build settled these points:
 
 - **Resolution detail**: DuckDB stores scalar/aggregate/macro in one `functions` namespace and the binder looks
   up `SCALAR_FUNCTION_ENTRY` then dispatches on the returned entry's *actual* type — so
-  `ArrowNetSchemaEntry::LookupEntry(SCALAR_FUNCTION_ENTRY)` **falls back to the aggregate** (plus an explicit
+  `FabricatorSchemaEntry::LookupEntry(SCALAR_FUNCTION_ENTRY)` **falls back to the aggregate** (plus an explicit
   `AGGREGATE_FUNCTION_ENTRY` branch).
 
 ## 10. Build-on points (already in the repo)
 
 `arrow_produce` (DataChunk→Arrow, for args), `arrow_ingest` / `PopulateReturnSchema` (Arrow→DuckDB, for
-results + schema-from-zero-row-stream), `ArrowNetSchemaEntry` (hang catalog function entries here),
+results + schema-from-zero-row-stream), `FabricatorSchemaEntry` (hang catalog function entries here),
 `ArrowDataReader` / `DbDataReaderArrowStream` (C# query→Arrow streaming for `Execute`), the
 SqlClient→Arrow type mapping (reused by `Bind`/describe). The handle/`BackendRegistry` dispatch (once
 multi-provider) routes each `execute_*` to the right backend automatically.
@@ -647,8 +647,8 @@ So:
   It fires **once** even above a UNION (a UNION branch pipeline shares the base pipeline's single
   `PipelineFinishEvent` — `MetaPipeline::CreateUnionPipeline` doesn't `AddFinishEvent`, executor `else`
   branch — unlike per-branch `FinalExecute`; verified empirically). An `OptimizerExtension`
-  (`RegisterArrowNetInOutFinalizer`) wraps the in-out's `LogicalGet` (identified by `function.in_out_function
-  == ArrowNetInOutFunction`, RTTI-free) in a pass-through `LogicalExtensionOperator` whose `PhysicalOperator`
+  (`RegisterFabricatorInOutFinalizer`) wraps the in-out's `LogicalGet` (identified by `function.in_out_function
+  == FabricatorInOutFunction`, RTTI-free) in a pass-through `LogicalExtensionOperator` whose `PhysicalOperator`
   (`PhysicalOperatorType::EXTENSION`) forwards rows 1:1 and calls `holder->Finish()` → C# `inout_finish` in
   `OperatorFinalize`. For a read-only TVF that's the clean commit of its snapshot transaction; for procs/custom
   it's resource cleanup; the holder destructor's `inout_abort` stays the LIMIT/error backstop.
@@ -673,7 +673,7 @@ has a TABLE parameter, and multiple function overloads — this is not supported
 So the in-out form is a **separate catalog entry under its own name** — the convention is the discovered TVF
 name **+ `_each`** suffix (e.g. `tf_nums_each`), a `TableFunctionCatalogEntry` with a **single**
 `{LogicalType::TABLE}` function; the scan form (4c) keeps the bare name `tf_nums`. The synthetic alias is
-tracked in `ArrowNetSchemaEntry::inout_functions_` (`<name>_each` → base TVF), registered for every
+tracked in `FabricatorSchemaEntry::inout_functions_` (`<name>_each` → base TVF), registered for every
 discovered `kind='table'` (procs excluded — per-row procs are a later layer), and listed by `Scan` so it's
 discoverable. A *real* SQL Server function literally named `…_each` shadows the alias (the real name is
 matched first). The in-out bind's `function_info.func` is the **base** TVF name (the CROSS APPLY target).

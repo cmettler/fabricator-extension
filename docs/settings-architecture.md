@@ -20,7 +20,7 @@
 
 ## 1. Current architecture & why it doesn't scale
 
-**Definition** is hardcoded in C++ — [`RegisterCompatSettings`](../src/mssql_net_extension.cpp#L86) holds a
+**Definition** is hardcoded in C++ — [`RegisterCompatSettings`](../src/fabricator_extension.cpp#L86) holds a
 literal list of `mssql_*` names. That already breaks "C++ is provider-agnostic"; a DAX provider would need
 `dax_*` baked into the same core C++.
 
@@ -29,13 +29,13 @@ rides an ABI **method param** into C#:
 
 | Setting | Read site | Crosses as |
 |---|---|---|
-| `mssql_ctas_text_type` | [arrownet_schema_entry.cpp:1658](../src/catalog/arrownet_schema_entry.cpp#L1658) | `create_table`'s `text_type` param |
-| `mssql_isolation_level` | [arrownet_schema_entry.cpp:891](../src/catalog/arrownet_schema_entry.cpp#L891) | the in-out exchange's `isolation` param |
-| `mssql_exec_invalidate_cache` | [mssql_net_extension.cpp:253](../src/mssql_net_extension.cpp#L253) | read *and used* C++-side (never crosses) |
+| `mssql_ctas_text_type` | [fabricator_schema_entry.cpp:1658](../src/catalog/fabricator_schema_entry.cpp#L1658) | `create_table`'s `text_type` param |
+| `mssql_isolation_level` | [fabricator_schema_entry.cpp:891](../src/catalog/fabricator_schema_entry.cpp#L891) | the in-out exchange's `isolation` param |
+| `mssql_exec_invalidate_cache` | [fabricator_extension.cpp:253](../src/fabricator_extension.cpp#L253) | read *and used* C++-side (never crosses) |
 
 So every new C#-consumed setting = C++ registration + a C++ read site + a new ABI param — O(settings ×
 providers) churn. This is what blocked `mssql_default_varchar_length` (it would need new params on
-`create_table` **and** `begin_bulk`, since CTAS/COPY create via [`BeginBulk(create=true)`](../src/dml/arrownet_ctas.cpp#L65)).
+`create_table` **and** `begin_bulk`, since CTAS/COPY create via [`BeginBulk(create=true)`](../src/dml/fabricator_ctas.cpp#L65)).
 
 The rest of the registered settings (`mssql_connection_cache`, `mssql_order_pushdown`, …) are accepted
 no-ops for native-extension compatibility.

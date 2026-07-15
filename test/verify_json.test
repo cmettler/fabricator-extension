@@ -1,6 +1,6 @@
 # name: test/verify_json.test
 # description: SQL Server 2025 native json column reads back as DuckDB JSON (read-side JSON gate, warehouse-support §3.3)
-# group: [mssql_net]
+# group: [fabricator]
 #
 # Requires a native-json engine (SQL Server 2025 / Azure SQL DB) — the box test DB is 2025. The core
 # `json` extension is statically embedded (extension_config.cmake), so the DuckDB JSON type + functions
@@ -8,25 +8,25 @@
 # DuckDB only emits the arrow.json extension under arrow_lossless_conversion, which our C++<->C# boundary
 # forces OFF (the BOOLEAN->Int8 fix), so a DuckDB JSON column maps to nvarchar on write (asserted below).
 
-require mssql_net
+require fabricator
 
 require json
 
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql_net);
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
 
 # A real native `json` column must be created with raw DDL (the extension's CTAS maps DuckDB JSON ->
 # nvarchar, see the write-side assertion below).
 statement ok
-SELECT mssql_net_exec('db', 'IF OBJECT_ID(''dbo.json_rt'',''U'') IS NOT NULL DROP TABLE dbo.json_rt; CREATE TABLE dbo.json_rt (id INT NOT NULL PRIMARY KEY, j json NULL)');
+SELECT fabricator_exec('db', 'IF OBJECT_ID(''dbo.json_rt'',''U'') IS NOT NULL DROP TABLE dbo.json_rt; CREATE TABLE dbo.json_rt (id INT NOT NULL PRIMARY KEY, j json NULL)');
 
 statement ok
-SELECT mssql_net_exec('db', 'INSERT INTO dbo.json_rt VALUES (1, ''{"a":1,"b":[2,3]}''), (2, NULL)');
+SELECT fabricator_exec('db', 'INSERT INTO dbo.json_rt VALUES (1, ''{"a":1,"b":[2,3]}''), (2, NULL)');
 
 statement ok
-SELECT mssql_refresh_cache('db');
+SELECT fabricator_refresh_cache('db');
 
 # The json column lands as the DuckDB JSON logical type (via the canonical arrow.json extension).
 query T
@@ -59,7 +59,7 @@ statement ok
 CREATE TABLE db.dbo.json_w AS SELECT '{"x":1}'::JSON AS j;
 
 query T
-SELECT DATA_TYPE FROM mssql_net_query('db',
+SELECT DATA_TYPE FROM fabricator_query('db',
   'SELECT CAST(DATA_TYPE AS VARCHAR(32)) AS DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = ''json_w'' AND COLUMN_NAME = ''j''');
 ----
 nvarchar
@@ -68,7 +68,7 @@ statement ok
 DROP TABLE db.dbo.json_w;
 
 statement ok
-SELECT mssql_net_exec('db', 'DROP TABLE dbo.json_rt');
+SELECT fabricator_exec('db', 'DROP TABLE dbo.json_rt');
 
 statement ok
 DETACH db;

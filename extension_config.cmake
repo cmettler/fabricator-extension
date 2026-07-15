@@ -1,7 +1,7 @@
-# DuckDB extension build configuration for mssql_net.
+# DuckDB extension build configuration for fabricator.
 # EXTENSION_VERSION is set explicitly so the build does not require a git commit
 # in this repo (DuckDB otherwise derives the version via `git describe`).
-duckdb_extension_load(mssql_net
+duckdb_extension_load(fabricator
     SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}
     EXTENSION_VERSION "0.0.1"
     LOAD_TESTS
@@ -17,7 +17,7 @@ duckdb_extension_load(json)
 # non-UTC session zone. Same v0.0.1 autoload problem -> link it statically.
 duckdb_extension_load(icu)
 
-# And `parquet` — the native-read path (arrownet_delta_native_scan, docs/multifile-delta.md Phase A) runs
+# And `parquet` — the native-read path (fabricator_delta_native_scan, docs/multifile-delta.md Phase A) runs
 # `read_parquet([...])` on the host engine to read Delta data files with DuckDB's native reader. The shell
 # ships parquet, but the test binaries need it linked (v0.0.1 can't autoload it).
 duckdb_extension_load(parquet)

@@ -8,17 +8,17 @@
 #              re-attaches, and OCC retries (a retried append regenerates from the fresh snapshot's mark).
 #              Works on the codec path AND under native_write (identity tables fall back from streaming to
 #              the collect path, which still writes native parquet via the IDataFileWriter seam).
-#              Set ARROWNET_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
-# group: [mssql_net]
+#              Set FABRICATOR_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
 require parquet
 
-require-env ARROWNET_DELTA_WRITE_DIR
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/idcatalog' AS lake (TYPE arrownet, PROVIDER 'delta', column_mapping 'none', native_write true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/idcatalog' AS lake (TYPE fabricator, PROVIDER 'delta', column_mapping 'none', native_write true);
 
 statement ok
 CREATE TABLE lake.main.idt (id BIGINT AS (0), v VARCHAR);
@@ -67,7 +67,7 @@ statement ok
 DETACH lake;
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/idcatalog' AS lake2 (TYPE arrownet, PROVIDER 'delta', column_mapping 'none', native_write true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/idcatalog' AS lake2 (TYPE fabricator, PROVIDER 'delta', column_mapping 'none', native_write true);
 
 statement ok
 INSERT INTO lake2.main.idt (v) VALUES ('g');
@@ -91,7 +91,7 @@ SELECT count(*) FROM lake2.main.plain WHERE id IS NULL;
 
 # Identity also works on the pure codec path (no native flags).
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/idcodec' AS codec (TYPE arrownet, PROVIDER 'delta', column_mapping 'none');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/idcodec' AS codec (TYPE fabricator, PROVIDER 'delta', column_mapping 'none');
 
 statement ok
 CREATE TABLE codec.main.idt (id BIGINT AS (0), v VARCHAR);

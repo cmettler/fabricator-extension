@@ -1,4 +1,4 @@
-# Test environment for mssql_net: SQL Server 2025 + MinIO (S3-compatible object storage).
+# Test environment for fabricator: SQL Server 2025 + MinIO (S3-compatible object storage).
 #
 # Bring-up (see docker/README.md):
 #   1. pwsh docker/certs/generate-certs.ps1     # self-signed TLS cert for MinIO (gitignored output)
@@ -25,12 +25,12 @@
 # MinIO credentials are TEST-ONLY and deliberately ALPHANUMERIC — SQL Server's S3 credential requires
 # "Access Key ID and Secret Key ID must only contain alphanumeric values".
 
-name: mssql-arrownet
+name: mssql-fabricator
 
 services:
   sqlserver:
     image: mcr.microsoft.com/mssql/server:2025-latest
-    container_name: mssql-arrownet
+    container_name: mssql-fabricator
     ports:
       - "1433:1433"
     environment:
@@ -49,7 +49,7 @@ services:
 
   minio:
     image: minio/minio:latest
-    container_name: minio-arrownet
+    container_name: minio-fabricator
     ports:
       - "9000:9000"   # S3 API (HTTPS — certs auto-enable TLS)
       - "9001:9001"   # web console
@@ -67,7 +67,7 @@ services:
       retries: 12
       start_period: 5s
 
-  # One-shot bucket bootstrap: creates the `arrownet` test bucket (idempotent).
+  # One-shot bucket bootstrap: creates the `fabricator` test bucket (idempotent).
   createbucket:
     image: minio/mc:latest
     depends_on:
@@ -76,8 +76,8 @@ services:
     entrypoint: >
       /bin/sh -c "
       mc alias set local https://minio:9000 miniouser miniosecret123 --api S3v4 --insecure &&
-      mc mb --ignore-existing local/arrownet --insecure &&
-      echo 'bucket arrownet ready'
+      mc mb --ignore-existing local/fabricator --insecure &&
+      echo 'bucket fabricator ready'
       "
 
 volumes:

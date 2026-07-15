@@ -5,14 +5,14 @@
 #              (VERSION), snapshots (commit history), re-attach durability. UPDATE/DELETE/ALTER are deferred
 #              (delta-rs predicate DML doesn't map to DuckDB's rowid model — see docs/delta-rs-provider.md).
 #              Requires the delta-rs native libs published (publish-managed.ps1 -IncludeDeltaRs). Local FS.
-# group: [mssql_net]
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
-require-env ARROWNET_DELTA_WRITE_DIR
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/dr' AS lake (TYPE arrownet, PROVIDER 'deltars');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/dr' AS lake (TYPE fabricator, PROVIDER 'deltars');
 
 # CTAS (v0 = empty CREATE, v1 = the 3 rows).
 statement ok
@@ -49,9 +49,9 @@ SELECT id, name FROM lake.main.t AT (VERSION => 1) ORDER BY id;
 2	beta
 3	gamma
 
-# Snapshots / commit history (arrownet_delta_snapshots), oldest first (before the DML commits).
+# Snapshots / commit history (fabricator_delta_snapshots), oldest first (before the DML commits).
 query IT
-SELECT version, operation FROM arrownet_delta_snapshots('lake', 'main.t') ORDER BY version;
+SELECT version, operation FROM fabricator_delta_snapshots('lake', 'main.t') ORDER BY version;
 ----
 0	CREATE TABLE
 1	WRITE
@@ -97,7 +97,7 @@ statement ok
 DETACH lake;
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/dr' AS lake (TYPE arrownet, PROVIDER 'deltars');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/dr' AS lake (TYPE fabricator, PROVIDER 'deltars');
 
 query IT
 SELECT id, name FROM lake.main.t ORDER BY id;
@@ -111,7 +111,7 @@ statement ok
 DETACH lake;
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/dr' AS lake2 (TYPE arrownet, PROVIDER 'delta-rs');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/dr' AS lake2 (TYPE fabricator, PROVIDER 'delta-rs');
 
 query I
 SELECT count(*) FROM lake2.main.t;

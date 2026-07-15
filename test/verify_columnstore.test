@@ -1,11 +1,11 @@
 # name: test/verify_columnstore.test
 # description: mssql_default_table_type='clustered columnstore' creates a CCI table (box); PK/UNIQUE become NONCLUSTERED (warehouse-support §3.6)
-# group: [mssql_net]
+# group: [fabricator]
 #
 # Box SQL Server only (Fabric/Synapse tables are columnstore implicitly and reject an inline INDEX -> the
 # setting is a no-op there). End with SET ...='' (NOT RESET): RESET does not clear the provider settings store.
 
-require mssql_net
+require fabricator
 
 require-env MSSQL_TESTDB_DSN
 
@@ -13,7 +13,7 @@ statement ok
 SET mssql_default_table_type='clustered columnstore';
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql_net);
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
 
 statement ok
 DROP TABLE IF EXISTS db.dbo.cci_t;
@@ -26,7 +26,7 @@ INSERT INTO db.dbo.cci_t VALUES (1,'a'),(2,'b');
 
 # The table's clustered index is the columnstore, so the PK is NONCLUSTERED (type order: NONCLUSTERED=2 < CCI=5).
 query TI
-SELECT CAST(type_desc AS VARCHAR(24)), CAST(is_primary_key AS INTEGER) FROM mssql_net_query('db',
+SELECT CAST(type_desc AS VARCHAR(24)), CAST(is_primary_key AS INTEGER) FROM fabricator_query('db',
   'SELECT type_desc, is_primary_key FROM sys.indexes WHERE object_id = OBJECT_ID(''dbo.cci_t'') AND type > 0 ORDER BY type');
 ----
 NONCLUSTERED	1
@@ -50,7 +50,7 @@ statement ok
 CREATE TABLE db.dbo.cci_ctas AS SELECT 1 AS a, 'x' AS b;
 
 query T
-SELECT CAST(type_desc AS VARCHAR(24)) FROM mssql_net_query('db',
+SELECT CAST(type_desc AS VARCHAR(24)) FROM fabricator_query('db',
   'SELECT type_desc FROM sys.indexes WHERE object_id = OBJECT_ID(''dbo.cci_ctas'') AND type > 0');
 ----
 CLUSTERED COLUMNSTORE

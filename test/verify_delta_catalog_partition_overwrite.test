@@ -5,16 +5,16 @@
 #              delete, so time travel keeps working); untouched partitions are unaffected. Append-shaped only
 #              (CREATE_TABLE false required) + requires a partitioned target. Unlike the static
 #              delta_write_options replace_where, the target set is derived from the data. Set
-#              ARROWNET_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
-# group: [mssql_net]
+#              FABRICATOR_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
-require-env ARROWNET_DELTA_WRITE_DIR
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 # ================= collect path (EW codec writer) =================
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/pow' AS lake (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/pow' AS lake (TYPE fabricator, PROVIDER 'delta');
 
 statement ok
 CREATE TABLE lake.main.sales PARTITIONED BY (region) AS
@@ -23,7 +23,7 @@ CREATE TABLE lake.main.sales PARTITIONED BY (region) AS
 # The COPY touches US + EU (not APAC) → those two partitions are REPLACED, APAC is untouched.
 statement ok
 COPY (SELECT * FROM (VALUES (6,'US',600),(7,'EU',700),(8,'EU',800)) AS t(id,region,amt))
-TO 'lake.main.sales' (FORMAT mssql_net, CREATE_TABLE false, PARTITION_OVERWRITE true);
+TO 'lake.main.sales' (FORMAT mssql, CREATE_TABLE false, PARTITION_OVERWRITE true);
 
 query TII
 SELECT region, count(*), sum(amt) FROM lake.main.sales GROUP BY region ORDER BY region;
@@ -34,7 +34,7 @@ US	1	600
 
 # ONE commit for the whole swap (v0 CREATE, v1 initial CTAS, v2 the partition overwrite).
 query I
-SELECT count(*) FROM arrownet_delta_snapshots('lake', 'main.sales');
+SELECT count(*) FROM fabricator_delta_snapshots('lake', 'main.sales');
 ----
 3
 
@@ -49,7 +49,7 @@ US	2	30
 # A second dynamic overwrite touching only APAC leaves US/EU as-is.
 statement ok
 COPY (SELECT * FROM (VALUES (9,'APAC',900)) AS t(id,region,amt))
-TO 'lake.main.sales' (FORMAT mssql_net, CREATE_TABLE false, PARTITION_OVERWRITE true);
+TO 'lake.main.sales' (FORMAT mssql, CREATE_TABLE false, PARTITION_OVERWRITE true);
 
 query TII
 SELECT region, count(*), sum(amt) FROM lake.main.sales GROUP BY region ORDER BY region;
@@ -61,7 +61,7 @@ US	1	600
 # ---- guardrails ----
 # Default COPY (CREATE_TABLE true) + PARTITION_OVERWRITE → rejected at bind (a full replace contradicts it).
 statement error
-COPY (SELECT 1 AS id, 'US' AS region, 1 AS amt) TO 'lake.main.sales' (FORMAT mssql_net, PARTITION_OVERWRITE true);
+COPY (SELECT 1 AS id, 'US' AS region, 1 AS amt) TO 'lake.main.sales' (FORMAT mssql, PARTITION_OVERWRITE true);
 ----
 requires CREATE_TABLE false
 
@@ -70,7 +70,7 @@ statement ok
 CREATE TABLE lake.main.flat AS SELECT 1 AS id, 'x' AS v;
 
 statement error
-COPY (SELECT 2 AS id, 'y' AS v) TO 'lake.main.flat' (FORMAT mssql_net, CREATE_TABLE false, PARTITION_OVERWRITE true);
+COPY (SELECT 2 AS id, 'y' AS v) TO 'lake.main.flat' (FORMAT mssql, CREATE_TABLE false, PARTITION_OVERWRITE true);
 ----
 requires a partitioned table
 
@@ -79,7 +79,7 @@ statement ok
 SET delta_write_options='{"replace_where":{"region":"EU"}}';
 
 statement error
-COPY (SELECT 1 AS id, 'EU' AS region, 1 AS amt) TO 'lake.main.sales' (FORMAT mssql_net, CREATE_TABLE false, PARTITION_OVERWRITE true);
+COPY (SELECT 1 AS id, 'EU' AS region, 1 AS amt) TO 'lake.main.sales' (FORMAT mssql, CREATE_TABLE false, PARTITION_OVERWRITE true);
 ----
 cannot be combined
 
@@ -91,7 +91,7 @@ DETACH lake;
 
 # ================= CDF over a dynamic partition overwrite =================
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/powcdf' AS cdf (TYPE arrownet, PROVIDER 'delta', change_data_feed true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/powcdf' AS cdf (TYPE fabricator, PROVIDER 'delta', change_data_feed true);
 
 statement ok
 CREATE TABLE cdf.main.sales PARTITIONED BY (region) AS
@@ -101,10 +101,10 @@ CREATE TABLE cdf.main.sales PARTITIONED BY (region) AS
 # with the PARTITION COLUMN re-added from the action's partitionValues (data files exclude it).
 statement ok
 COPY (SELECT * FROM (VALUES (5,'EU',500)) AS t(id,region,amt))
-TO 'cdf.main.sales' (FORMAT mssql_net, CREATE_TABLE false, PARTITION_OVERWRITE true);
+TO 'cdf.main.sales' (FORMAT mssql, CREATE_TABLE false, PARTITION_OVERWRITE true);
 
 query TITI
-SELECT _change_type, id, region, amt FROM arrownet_delta_changes('cdf', 'main.sales', 2, 2)
+SELECT _change_type, id, region, amt FROM fabricator_delta_changes('cdf', 'main.sales', 2, 2)
 ORDER BY _change_type, id;
 ----
 delete	2	EU	20
@@ -121,10 +121,10 @@ INSERT INTO cdf.main.sales VALUES (7,'APAC',70);
 
 statement ok
 COPY (SELECT * FROM (VALUES (8,'APAC',800)) AS t(id,region,amt))
-TO 'cdf.main.sales' (FORMAT mssql_net, CREATE_TABLE false, PARTITION_OVERWRITE true);
+TO 'cdf.main.sales' (FORMAT mssql, CREATE_TABLE false, PARTITION_OVERWRITE true);
 
 query TITI
-SELECT _change_type, id, region, amt FROM arrownet_delta_changes('cdf', 'main.sales', 5, 5)
+SELECT _change_type, id, region, amt FROM fabricator_delta_changes('cdf', 'main.sales', 5, 5)
 ORDER BY _change_type, id;
 ----
 delete	7	APAC	70
@@ -135,7 +135,7 @@ DETACH cdf;
 
 # ================= streaming path (native_write) =================
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/pownw' AS nw (TYPE arrownet, PROVIDER 'delta', native_write true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/pownw' AS nw (TYPE fabricator, PROVIDER 'delta', native_write true);
 
 statement ok
 CREATE TABLE nw.main.sales PARTITIONED BY (region) AS
@@ -143,7 +143,7 @@ CREATE TABLE nw.main.sales PARTITIONED BY (region) AS
 
 statement ok
 COPY (SELECT * FROM (VALUES (4,'US',400),(5,'US',500)) AS t(id,region,amt))
-TO 'nw.main.sales' (FORMAT mssql_net, CREATE_TABLE false, PARTITION_OVERWRITE true);
+TO 'nw.main.sales' (FORMAT mssql, CREATE_TABLE false, PARTITION_OVERWRITE true);
 
 query TII
 SELECT region, count(*), sum(amt) FROM nw.main.sales GROUP BY region ORDER BY region;
@@ -157,7 +157,7 @@ statement ok
 DETACH nw;
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/pownw' AS nw2 (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/pownw' AS nw2 (TYPE fabricator, PROVIDER 'delta');
 
 query TII
 SELECT region, count(*), sum(amt) FROM nw2.main.sales GROUP BY region ORDER BY region;

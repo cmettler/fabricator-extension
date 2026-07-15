@@ -1,13 +1,13 @@
 # name: test/verify_cardinality.test
 # description: Verify the scan reports a row-count cardinality estimate to the optimizer
-# group: [mssql_net]
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql_net);
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
 
 # Binding the table fetches its approximate row count for the optimizer.
 statement ok
@@ -15,7 +15,7 @@ SELECT * FROM db.dbo.TestSimplePK LIMIT 1;
 
 # The partition-stats row-count query reached SQL Server.
 query I
-SELECT hit FROM mssql_net_query('db',
+SELECT hit FROM fabricator_query('db',
   'SELECT CAST(CASE WHEN EXISTS (
      SELECT 1 FROM sys.dm_exec_query_stats qs
      CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st

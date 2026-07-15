@@ -1,6 +1,6 @@
 # name: test/verify_collation_pushdown.test
 # description: under Fabric's BIN2_UTF8 collation, text maps to VARCHAR (UTF-8) and string ORDER BY+LIMIT pushes (warehouse-support §3/§4/§6.6)
-# group: [mssql_net]
+# group: [fabricator]
 #
 # Fixture (Fabric Warehouse's actual default collation — binary + UTF-8: byte-order string sort matching
 # DuckDB, and VARCHAR holds full Unicode):
@@ -9,21 +9,21 @@
 #   INSERT INTO dbo.names VALUES (1,'banana'),(2,'Apple'),(3,'cherry'),(4,'apple'),(5,'Banana');
 # Point MSSQL_BINCOLL_DSN at it (Database=BinCollTest). Env-gated, like the Fabric checks.
 
-require mssql_net
+require fabricator
 
 require-env MSSQL_BINCOLL_DSN
 
 statement ok
-ATTACH '${MSSQL_BINCOLL_DSN}' AS bdb (TYPE mssql_net);
+ATTACH '${MSSQL_BINCOLL_DSN}' AS bdb (TYPE fabricator);
 
 # Binary collation -> string ORDER BY pushdown enabled; UTF-8 collation -> text maps to VARCHAR.
 query T
-SELECT value FROM mssql_server_info('bdb') WHERE property = 'is_binary_collation';
+SELECT value FROM fabricator_server_info('bdb') WHERE property = 'is_binary_collation';
 ----
 true
 
 query T
-SELECT value FROM mssql_server_info('bdb') WHERE property = 'is_utf8_collation';
+SELECT value FROM fabricator_server_info('bdb') WHERE property = 'is_utf8_collation';
 ----
 true
 
@@ -36,7 +36,7 @@ statement ok
 CREATE TABLE bdb.dbo.coll_ctas AS SELECT 'x' AS s;
 
 query T
-SELECT DATA_TYPE FROM mssql_net_query('bdb',
+SELECT DATA_TYPE FROM fabricator_query('bdb',
   'SELECT CAST(DATA_TYPE AS VARCHAR(32)) AS DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = ''coll_ctas'' AND COLUMN_NAME = ''s''');
 ----
 varchar
@@ -55,7 +55,7 @@ Banana
 # Proof: TOP (n) + ORDER BY [name] (a STRING key) reached SQL Server — the relaxation a non-binary
 # collation would suppress.
 query I
-SELECT pushed FROM mssql_net_query('bdb',
+SELECT pushed FROM fabricator_query('bdb',
   'SELECT CAST(CASE WHEN EXISTS (
      SELECT 1 FROM sys.dm_exec_query_stats qs
      CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
@@ -83,7 +83,7 @@ SELECT id FROM bdb.dbo.names WHERE name BETWEEN 'Apple' AND 'Banana' ORDER BY id
 
 # Proof a string ordering comparison reached SQL Server (WHERE [name] > @p) — suppressed under a non-binary collation.
 query I
-SELECT pushed FROM mssql_net_query('bdb',
+SELECT pushed FROM fabricator_query('bdb',
   'SELECT CAST(CASE WHEN EXISTS (
      SELECT 1 FROM sys.dm_exec_query_stats qs
      CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st

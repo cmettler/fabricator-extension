@@ -1,0 +1,1777 @@
+using System.Collections.Generic;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using Microsoft.Extensions.Logging;
+using Apache.Arrow;
+using Apache.Arrow.C;
+using Apache.Arrow.Ipc;
+using Apache.Arrow.Types;
+
+namespace Fabricator.Bridge;
+
+/// <summary>
+/// Native entry point of the managed bridge. The C++ host loads this assembly
+/// via hostfxr and calls <see cref="Initialize"/> to populate the
+/// <c>FabricatorVTable</c> with function pointers to the static methods below.
+/// All boundary methods are <c>[UnmanagedCallersOnly]</c> (cdecl) and never let
+/// exceptions cross the ABI — they translate failures into a status code plus an
+/// owned UTF-8 error string.
+/// </summary>
+public static unsafe class Bootstrap
+{
+    // Traces bridge-boundary activity — every ABI crossing that FAILS is logged here centrally (see SetError:
+    // the CallerMemberName is the ABI op), plus control-path crossings (open/close/metadata/bind). The data
+    // path is traced in the providers (Fabricator.Sql / Fabricator.Delta). Off by default (FABRICATOR_LOG_LEVEL).
+    private static readonly ILogger BridgeLog = FabricatorLog.CreateLogger("Fabricator.Bridge");
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    public static int Initialize(FabricatorVTable* vtable, int size, FabricatorHostServices* host)
+    {
+        // Guard against a host built against a newer/larger struct than we know.
+        if (vtable is null || size < sizeof(FabricatorVTable))
+        {
+            return FabricatorStatus.InvalidArgument;
+        }
+
+        // Cache the host-services callbacks (reverse direction) so managed components can reach DuckDB's
+        // FileSystem (secret-backed remote IO). May be a zeroed block if the host registered none. SPIKE.
+        if (host is not null)
+        {
+            HostFs.Set(*host);
+            // Forward ILogger output into DuckDB's internal logging (duckdb_logs) when the host provides host_log.
+            // The file sink (FABRICATOR_LOG_LEVEL/_FILE) stays independent; this adds the engine-log route.
+            if (HostFs.CanLog)
+            {
+                FabricatorLog.EnableHostForwarding((level, category, message) => HostFs.Log(level, category, message));
+            }
+        }
+
+        // A built-in demo named source (data-in by name): query it as `fabricator_scan('fabricator_demo_numbers')`
+        // or, with the replacement scan, bare `FROM fabricator_demo_numbers`. Harmless; proves the registry.
+        Host.RegisterSource("fabricator_demo_numbers", () =>
+        {
+            var schema = new Apache.Arrow.Schema(
+                new[] { new Apache.Arrow.Field("value", Apache.Arrow.Types.Int64Type.Default, nullable: false) }, null);
+            var col = new Apache.Arrow.Int64Array.Builder().Append(10).Append(20).Append(30).Build();
+            var batch = new Apache.Arrow.RecordBatch(schema, new Apache.Arrow.IArrowArray[] { col }, 3);
+            return new InMemoryArrayStream(schema, new[] { batch });
+        });
+
+        vtable->AbiVersion = 64;
+        vtable->OpenCatalog = &OpenCatalog;
+        vtable->CloseCatalog = &CloseCatalog;
+        vtable->ExecuteQuery = &ExecuteQuery;
+        vtable->FreeError = &FreeError;
+        vtable->ExecuteDml = &ExecuteDml;
+        vtable->BulkInsert = &BulkInsert;
+        vtable->ExecuteDelete = &ExecuteDelete;
+        vtable->ExecuteUpdate = &ExecuteUpdate;
+        vtable->GetMetadata = &GetMetadata;
+        vtable->ScanTable = &ScanTable;
+        vtable->CreateTable = &CreateTable;
+        vtable->DropTable = &DropTable;
+        vtable->CreateSchema = &CreateSchema;
+        vtable->DropSchema = &DropSchema;
+        vtable->AlterTable = &AlterTable;
+        vtable->BeginTransaction = &BeginTransaction;
+        vtable->CommitTransaction = &CommitTransaction;
+        vtable->RollbackTransaction = &RollbackTransaction;
+        vtable->InsertReturning = &InsertReturning;
+        vtable->BeginBulk = &BeginBulk;
+        vtable->PushBatch = &PushBatch;
+        vtable->CompleteBulk = &CompleteBulk;
+        vtable->BuildConnectionString = &BuildConnectionString;
+        vtable->GetFunctionParamSchema = &GetFunctionParamSchema;
+        vtable->GetFunctionReturnSchema = &GetFunctionReturnSchema;
+        vtable->ExecuteScalar = &ExecuteScalar;
+        vtable->GetFunctionOutputSchema = &GetFunctionOutputSchema;
+        vtable->AggOpen = &AggOpen;
+        vtable->AggUpdate = &AggUpdate;
+        vtable->AggCombine = &AggCombine;
+        vtable->AggFinalize = &AggFinalize;
+        vtable->AggDestroy = &AggDestroy;
+        vtable->AggClose = &AggClose;
+        vtable->AggUpdateSpill = &AggUpdateSpill;
+        vtable->AggCombineSpill = &AggCombineSpill;
+        vtable->AggFinalizeSpill = &AggFinalizeSpill;
+        vtable->InOutBind = &InOutBind;
+        vtable->InOutExchangeOpen = &InOutExchangeOpen;
+        vtable->InOutBindClose = &InOutBindClose;
+        vtable->TableBind = &TableBind;
+        vtable->TableExecute = &TableExecute;
+        vtable->TableClose = &TableClose;
+        vtable->ListSettings = &ListSettings;
+        vtable->SetSetting = &SetSetting;
+        vtable->SetActiveTxn = &SetActiveTxn;
+        vtable->ListSecretFields = &ListSecretFields;
+        vtable->FsSpike = &FsSpike;
+        vtable->OpenNamedInput = &OpenNamedInput;
+        vtable->NamedInputExists = &NamedInputExists;
+        vtable->ListGlobalFunctions = &ListGlobalFunctions;
+        vtable->SetActiveOpener = &SetActiveOpener;
+        vtable->OneLakeOpen = &OneLakeOpen;
+        vtable->OneLakeRead = &OneLakeRead;
+        vtable->OneLakeClose = &OneLakeClose;
+        vtable->OneLakeGlob = &OneLakeGlob;
+        vtable->OneLakeExists = &OneLakeExists;
+        vtable->OneLakeOpenWrite = &OneLakeOpenWrite;
+        vtable->OneLakeWrite = &OneLakeWrite;
+        vtable->OneLakeCloseWrite = &OneLakeCloseWrite;
+        vtable->DeltaListFiles = &DeltaListFiles;
+        vtable->OneLakeRemove = &OneLakeRemove;
+        vtable->OneLakeMove = &OneLakeMove;
+        return FabricatorStatus.Ok;
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int OpenCatalog(byte* provider, byte* conn, byte* optionsJson, nint* outHandle, byte** err)
+    {
+        try
+        {
+            if (outHandle is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var providerName = Marshal.PtrToStringUTF8((nint)provider); // null/empty => default backend
+            var connStr = Marshal.PtrToStringUTF8((nint)conn) ?? string.Empty;
+            var options = Marshal.PtrToStringUTF8((nint)optionsJson) ?? string.Empty; // ATTACH options (JSON), provider-owned
+            // NOTE: connStr may carry a password — never log it. Provider + options (schema_filter/… ) are safe.
+            BridgeLog.LogDebug("abi open_catalog: provider={Provider} options={Options}",
+                string.IsNullOrEmpty(providerName) ? "(default)" : providerName, options);
+            var catalog = BackendRegistry.Resolve(providerName).OpenCatalog(connStr, options);
+            *outHandle = Handles.Alloc(catalog);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static void CloseCatalog(nint handle) => Handles.Free(handle);
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int ExecuteQuery(nint handle, byte* sql, CArrowArrayStream* outStream, byte** err)
+    {
+        try
+        {
+            if (outStream is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var query = Marshal.PtrToStringUTF8((nint)sql) ?? string.Empty;
+
+            IArrowArrayStream stream = catalog.ExecuteQuery(query);
+            CArrowArrayStreamExporter.ExportArrayStream(stream, outStream);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int ExecuteDml(nint handle, byte* sql, long* affected, int* schemaMayChange, byte** err)
+    {
+        try
+        {
+            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var statement = Marshal.PtrToStringUTF8((nint)sql) ?? string.Empty;
+            // DDL detection lives here (C#); the host invalidates its catalog cache
+            // when this is set (and the mssql_exec_invalidate_cache setting is on).
+            if (schemaMayChange is not null)
+            {
+                *schemaMayChange = SqlDdl.MayChangeSchema(statement) ? 1 : 0;
+            }
+            long rows = catalog.ExecuteNonQuery(statement);
+            if (affected is not null)
+            {
+                *affected = rows;
+            }
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int BulkInsert(nint handle, byte* schema, byte* table, int createTable, int replace,
+                                  CArrowArrayStream* input, long* affected, byte** err)
+    {
+        try
+        {
+            if (input is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
+
+            // We take ownership of the C stream (consume + release on dispose).
+            var stream = CArrowArrayStreamImporter.ImportArrayStream(input);
+            long rows = catalog.BulkInsert(schemaName, tableName, stream, createTable != 0, replace != 0,
+                                           checkConstraints: false, txnId: AmbientTransaction.Current,
+                                           partitionColumns: null, sortColumns: null, schemaMode: null,
+                                           partitionOverwrite: false);
+            if (affected is not null)
+            {
+                *affected = rows;
+            }
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int ExecuteDelete(nint handle, byte* schema, byte* table, CArrowArrayStream* keys, long* affected,
+                                     byte** err)
+    {
+        try
+        {
+            if (keys is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
+            var stream = CArrowArrayStreamImporter.ImportArrayStream(keys);
+            long rows = catalog.ExecuteDelete(schemaName, tableName, stream);
+            if (affected is not null)
+            {
+                *affected = rows;
+            }
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int ExecuteUpdate(nint handle, byte* schema, byte* table, int setCount, CArrowArrayStream* data,
+                                     long* affected, byte** err)
+    {
+        try
+        {
+            if (data is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
+            var stream = CArrowArrayStreamImporter.ImportArrayStream(data);
+            long rows = catalog.ExecuteUpdate(schemaName, tableName, setCount, stream);
+            if (affected is not null)
+            {
+                *affected = rows;
+            }
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int GetMetadata(nint handle, int kind, byte* arg1, byte* arg2, CArrowArrayStream* outStream,
+                                   byte** err)
+    {
+        try
+        {
+            if (outStream is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var a1 = Marshal.PtrToStringUTF8((nint)arg1);
+            var a2 = Marshal.PtrToStringUTF8((nint)arg2);
+            BridgeLog.LogDebug("abi get_metadata: kind={Kind} arg1={A1} arg2={A2}", kind, a1, a2);
+
+            IArrowArrayStream stream = catalog.GetMetadata(kind, a1, a2);
+            CArrowArrayStreamExporter.ExportArrayStream(stream, outStream);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int ScanTable(nint handle, byte* schema, byte* table, byte* specJson,
+                                 CArrowArrayStream* filterValues, CArrowArrayStream* outStream, byte** err)
+    {
+        try
+        {
+            if (outStream is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
+            var spec = Marshal.PtrToStringUTF8((nint)specJson); // null => full SELECT *
+
+            // Import the typed constant values (if any) the filter tree references.
+            IArrowArrayStream? values = filterValues is null
+                ? null
+                : CArrowArrayStreamImporter.ImportArrayStream(filterValues);
+
+            IArrowArrayStream stream = catalog.ScanTable(schemaName, tableName, spec, values);
+            CArrowArrayStreamExporter.ExportArrayStream(stream, outStream);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int CreateTable(nint handle, byte* schema, byte* table, CArrowArrayStream* columns, int ifNotExists,
+                                   byte* pkColumns, byte* uniqueColumns, byte* defaults, byte* partitionColumns,
+                                   byte* sortColumns, byte* identityColumns, byte** err)
+    {
+        try
+        {
+            if (columns is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
+            var pk = Marshal.PtrToStringUTF8((nint)pkColumns);
+            var uniques = Marshal.PtrToStringUTF8((nint)uniqueColumns);
+            var defaultSpec = Marshal.PtrToStringUTF8((nint)defaults);
+            var partition = SplitColumnList(Marshal.PtrToStringUTF8((nint)partitionColumns));
+            var sort = SplitColumnList(Marshal.PtrToStringUTF8((nint)sortColumns));
+            var identity = SplitColumnList(Marshal.PtrToStringUTF8((nint)identityColumns));
+
+            // We own the C stream; read its schema (the column layout) and release it. The text-column SQL
+            // type (mssql_ctas_text_type / mssql_default_varchar_length) is read from the settings store in C#.
+            using var stream = CArrowArrayStreamImporter.ImportArrayStream(columns);
+            catalog.CreateTable(schemaName, tableName, stream.Schema, ifNotExists != 0, pk, uniques, defaultSpec,
+                                partition, sort, identity);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int DropTable(nint handle, byte* schema, byte* table, int ifExists, byte** err)
+    {
+        try
+        {
+            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
+            catalog.DropTable(schemaName, tableName, ifExists != 0);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int CreateSchema(nint handle, byte* schema, int ifNotExists, byte** err)
+    {
+        try
+        {
+            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            catalog.CreateSchema(schemaName, ifNotExists != 0);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int DropSchema(nint handle, byte* schema, int ifExists, byte** err)
+    {
+        try
+        {
+            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            catalog.DropSchema(schemaName, ifExists != 0);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int AlterTable(nint handle, byte* schema, byte* table, int alterKind, byte* arg1, byte* arg2,
+                                  CArrowArrayStream* column, int flags, byte** err)
+    {
+        try
+        {
+            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
+            var a1 = Marshal.PtrToStringUTF8((nint)arg1);
+            var a2 = Marshal.PtrToStringUTF8((nint)arg2);
+
+            // ADD_COLUMN / COLUMN_TYPE carry the new column's type as a one-field schema.
+            Field? columnField = null;
+            if (column is not null)
+            {
+                using var stream = CArrowArrayStreamImporter.ImportArrayStream(column);
+                columnField = stream.Schema.FieldsList.Count > 0 ? stream.Schema.FieldsList[0] : null;
+            }
+            catalog.AlterTable(alterKind, schemaName, tableName, a1, a2, columnField, flags);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int InsertReturning(nint handle, byte* schema, byte* table, CArrowArrayStream* input,
+                                       CArrowArrayStream* outStream, byte** err)
+    {
+        try
+        {
+            if (input is null || outStream is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
+
+            var rows = CArrowArrayStreamImporter.ImportArrayStream(input);
+            IArrowArrayStream returned = catalog.InsertReturning(schemaName, tableName, rows);
+            CArrowArrayStreamExporter.ExportArrayStream(returned, outStream);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    // Set the DuckDB transaction id (global_transaction_id) in effect on THIS thread, so the subsequent
+    // connection-using call on the same thread keys its per-transaction provider connection by it. The host
+    // calls this immediately before each such call. 0 => no specific transaction (fresh/pooled connection).
+    // handle is unused (the ambient is per-thread + global; each catalog keys its own state dictionary by it).
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int SetActiveTxn(nint handle, long txnId, int joinOnly, byte** err)
+    {
+        AmbientTransaction.Current = txnId;
+        AmbientTransaction.JoinOnly = joinOnly != 0;
+        return FabricatorStatus.Ok;
+    }
+
+    // SPIKE: open `path` via the host FileSystem callbacks (using `opener` for secret resolution) and return
+    // head/tail bytes + size. Proves a managed component can do secret-backed remote IO through DuckDB.
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int FsSpike(nint opener, byte* path, byte** outResult, byte** err)
+    {
+        try
+        {
+            if (outResult is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var p = Marshal.PtrToStringUTF8((nint)path) ?? string.Empty;
+            var result = HostFileSystemSpike.Run(opener, p);
+            *outResult = (byte*)Marshal.StringToCoTaskMemUTF8(result); // host frees via free_error
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    // Record the calling operator's ClientContext as the active host-FS opener (per-thread ambient), so a
+    // connection-free GLOBAL host-FS table function (a lakehouse reader like fabricator_delta_scan) can resolve
+    // DuckDB secrets while reading through the host FileSystem callbacks. The host calls this immediately
+    // before each table-function bind + execution, on the same thread. 0 clears it. Mirrors SetActiveTxn.
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int SetActiveOpener(nint opener, byte** err)
+    {
+        AmbientOpener.Current = opener;
+        return FabricatorStatus.Ok;
+    }
+
+    // ---- onelake:// FileSystem forward callbacks (Phase-3): the C++ onelake FS forwards read ops here to the
+    //      managed Azure DataLake SDK (see OneLakeForwardFs). cred_json = the azure secret fields the host
+    //      resolved from the opener ("{}"/empty ⇒ DefaultAzureCredential).
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int OneLakeOpen(byte* path, byte* credJson, long knownSize, nint* outFile, long* outSize,
+                                   byte** outEtag, long* outModifiedMs, byte** err)
+    {
+        try
+        {
+            var p = Marshal.PtrToStringUTF8((nint)path) ?? string.Empty;
+            var cj = Marshal.PtrToStringUTF8((nint)credJson);
+            var (handle, size, etag, modifiedMs) = OneLakeForwardFs.Open(p, cj, knownSize);
+            *outFile = Handles.Alloc(handle);
+            *outSize = size;
+            *outEtag = etag is null ? null : (byte*)Marshal.StringToCoTaskMemUTF8(etag); // host frees via free_error
+            *outModifiedMs = modifiedMs;
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int OneLakeRead(nint file, void* buffer, long nrBytes, long location, byte** err)
+    {
+        try
+        {
+            var h = Handles.Resolve<OneLakeForwardFs.Handle>(file)
+                    ?? throw new InvalidOperationException("onelake_read: invalid file handle");
+            OneLakeForwardFs.Read(h, new Span<byte>(buffer, checked((int)nrBytes)), location);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static void OneLakeClose(nint file)
+    {
+        if (file != 0)
+        {
+            Handles.Free(file);
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int OneLakeGlob(byte* pattern, byte* credJson, byte** outJson, byte** err)
+    {
+        try
+        {
+            var pat = Marshal.PtrToStringUTF8((nint)pattern) ?? string.Empty;
+            var cj = Marshal.PtrToStringUTF8((nint)credJson);
+            var json = OneLakeForwardFs.Glob(pat, cj);
+            *outJson = (byte*)Marshal.StringToCoTaskMemUTF8(json); // host frees via free_error
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int OneLakeExists(byte* path, byte* credJson, int* outExists, byte** err)
+    {
+        try
+        {
+            var p = Marshal.PtrToStringUTF8((nint)path) ?? string.Empty;
+            var cj = Marshal.PtrToStringUTF8((nint)credJson);
+            *outExists = OneLakeForwardFs.Exists(p, cj) ? 1 : 0;
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int OneLakeOpenWrite(byte* path, byte* credJson, int exclusive, nint* outFile, byte** err)
+    {
+        try
+        {
+            var p = Marshal.PtrToStringUTF8((nint)path) ?? string.Empty;
+            var cj = Marshal.PtrToStringUTF8((nint)credJson);
+            var handle = OneLakeForwardFs.OpenWrite(p, cj, exclusive != 0);
+            *outFile = Handles.Alloc(handle);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int OneLakeRemove(byte* path, byte* credJson, byte** err)
+    {
+        try
+        {
+            var p = Marshal.PtrToStringUTF8((nint)path) ?? string.Empty;
+            var cj = Marshal.PtrToStringUTF8((nint)credJson);
+            OneLakeForwardFs.Remove(p, cj);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int OneLakeMove(byte* src, byte* dest, byte* credJson, byte** err)
+    {
+        try
+        {
+            var s2 = Marshal.PtrToStringUTF8((nint)src) ?? string.Empty;
+            var d = Marshal.PtrToStringUTF8((nint)dest) ?? string.Empty;
+            var cj = Marshal.PtrToStringUTF8((nint)credJson);
+            OneLakeForwardFs.Move(s2, d, cj);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int OneLakeWrite(nint file, void* buffer, long nrBytes, byte** err)
+    {
+        try
+        {
+            var h = Handles.Resolve<OneLakeForwardFs.WriteHandle>(file)
+                    ?? throw new InvalidOperationException("onelake_write: invalid file handle");
+            OneLakeForwardFs.Write(h, new ReadOnlySpan<byte>(buffer, checked((int)nrBytes)));
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int OneLakeCloseWrite(nint file, byte** err)
+    {
+        try
+        {
+            var h = Handles.Resolve<OneLakeForwardFs.WriteHandle>(file);
+            if (h is not null)
+            {
+                OneLakeForwardFs.CloseWrite(h);
+                Handles.Free(file);
+            }
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    // Delta native-read (MultiFileList): return the active files of the Delta table as a JSON array
+    // [{"path":"<uri>", ...}]. The host reads the _delta_log via the active opener (set before this call).
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int DeltaListFiles(byte* path, byte* pushJson, byte** outJson, byte** err)
+    {
+        try
+        {
+            var p = Marshal.PtrToStringUTF8((nint)path) ?? string.Empty;
+            var push = Marshal.PtrToStringUTF8((nint)pushJson);
+            var json = DeltaReader.ListScanFilesJson(AmbientOpener.Current, p, push);
+            *outJson = (byte*)Marshal.StringToCoTaskMemUTF8(json); // host frees via free_error
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    // Ambient named-source registry (data-in by name) — see Host.RegisterSource. open_named_input exports a
+    // fresh stream for the registered source (errors if none); named_input_exists reports registration.
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int OpenNamedInput(byte* name, CArrowArrayStream* outStream, byte** err)
+    {
+        try
+        {
+            if (outStream is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var n = Marshal.PtrToStringUTF8((nint)name) ?? string.Empty;
+            var stream = Host.OpenSource(n)
+                         ?? throw new InvalidOperationException($"fabricator: no named source registered as '{n}'");
+            CArrowArrayStreamExporter.ExportArrayStream(stream, outStream);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int NamedInputExists(byte* name, int* outExists, byte** err)
+    {
+        try
+        {
+            var n = Marshal.PtrToStringUTF8((nint)name) ?? string.Empty;
+            if (outExists != null)
+            {
+                *outExists = Host.SourceExists(n) ? 1 : 0;
+            }
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int BeginBulk(nint handle, byte* schema, byte* table, int createTable, int replace,
+                                 int checkConstraints, long txnId, CArrowSchema* schemaIn, byte* partitionColumns,
+                                 byte* sortColumns, byte* schemaMode, int partitionOverwrite, nint* outSession,
+                                 byte** err)
+    {
+        try
+        {
+            if (schemaIn is null || outSession is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            // Take ownership of the C schema (materialized into a managed Schema; the
+            // C struct is released by the importer).
+            var arrowSchema = CArrowSchemaImporter.ImportSchema(schemaIn);
+            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
+            var partition = SplitColumnList(Marshal.PtrToStringUTF8((nint)partitionColumns));
+            var sort = SplitColumnList(Marshal.PtrToStringUTF8((nint)sortColumns));
+            var schemaModeStr = Marshal.PtrToStringUTF8((nint)schemaMode);
+
+            // Capture the host-FS opener now (set by the C++ sink before begin_bulk, on this thread) so the
+            // background bulk consumer can re-establish it — a host-FS provider (the Delta catalog) writes
+            // through DuckDB's FileSystem on the consumer thread. The ClientContext stays valid for the
+            // statement (complete_bulk blocks until the consumer finishes), so the opener is live at write time.
+            var opener = AmbientOpener.Current;
+            var session = new BulkSession(catalog, schemaName, tableName, arrowSchema, createTable != 0, replace != 0,
+                                          checkConstraints != 0, txnId, opener, partition, sort, schemaModeStr,
+                                          partitionOverwrite != 0);
+            *outSession = Handles.Alloc(session);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int PushBatch(nint session, CArrowArray* batch, byte** err)
+    {
+        if (batch is null)
+        {
+            return FabricatorStatus.InvalidArgument;
+        }
+        RecordBatch? imported = null;
+        try
+        {
+            var s = Handles.Resolve<BulkSession>(session);
+            if (s is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            // Take ownership of the C array (zero-copy; released when the batch is disposed).
+            imported = CArrowArrayImporter.ImportRecordBatch(batch, s.Schema);
+            s.Push(imported); // ownership moves into the channel (or disposed if the consumer is gone)
+            imported = null;
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            imported?.Dispose();
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int CompleteBulk(nint session, int abort, long* affected, byte** err)
+    {
+        try
+        {
+            var s = Handles.Resolve<BulkSession>(session);
+            long rows = s?.Complete(abort != 0) ?? 0;
+            Handles.Free(session);
+            if (affected is not null)
+            {
+                *affected = rows;
+            }
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            // Free the handle even on failure (the background task has been observed).
+            Handles.Free(session);
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int BeginTransaction(nint handle, int isExplicit, byte** err) =>
+        RunTransactionOp(handle, c => c.BeginTransaction(isExplicit != 0), err);
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int CommitTransaction(nint handle, byte** err) => RunTransactionOp(handle, c => c.CommitTransaction(), err);
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int RollbackTransaction(nint handle, byte** err) => RunTransactionOp(handle, c => c.RollbackTransaction(), err);
+
+    private static int RunTransactionOp(nint handle, Action<IBackendCatalog> op, byte** err)
+    {
+        try
+        {
+            // No fallback here: a transaction op on an unresolvable handle means the host holds a STALE catalog
+            // handle (GCHandle slots are reused after a DETACH frees them, so the old value may resolve to an
+            // arbitrary unrelated object) — surface it as the diagnostic it is instead of opening a nonsense
+            // default catalog with an empty connection string.
+            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+                          ?? throw new InvalidOperationException(
+                              $"Fabricator: transaction op on a stale/unknown catalog handle 0x{handle:x} "
+                              + $"(resolves to: {Handles.Resolve<object>(handle)?.GetType().FullName ?? "<freed>"})");
+            op(catalog);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int BuildConnectionString(byte* provider, byte* secretType, byte* fieldsJson, byte* baseConnStr,
+                                             byte** outConnStr, byte** err)
+    {
+        try
+        {
+            if (outConnStr is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var providerName = Marshal.PtrToStringUTF8((nint)provider); // null/empty => default backend
+            var type = Marshal.PtrToStringUTF8((nint)secretType) ?? string.Empty; // the DuckDB secret type
+            var baseConn = Marshal.PtrToStringUTF8((nint)baseConnStr) ?? string.Empty; // ATTACH target (may be empty)
+            var json = Marshal.PtrToStringUTF8((nint)fieldsJson) ?? "{}";
+            var parsed = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, string>>(json)
+                         ?? new Dictionary<string, string>();
+            // Case-insensitive: secret field names may be stored lower-cased (ours) or differ by provider (azure).
+            var fields = new Dictionary<string, string>(parsed, StringComparer.OrdinalIgnoreCase);
+            var connStr = BackendRegistry.Resolve(providerName).BuildConnectionString(type, fields, baseConn);
+            *outConnStr = (byte*)Marshal.StringToCoTaskMemUTF8(connStr);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int GetFunctionParamSchema(nint handle, byte* schema, byte* func, CArrowSchema* outSchema,
+                                              byte** err)
+    {
+        try
+        {
+            if (outSchema is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
+            if (handle == 0) // global (connection-free) function — resolve by name (any kind), no catalog
+            {
+                CArrowSchemaExporter.ExportSchema(GlobalFunctions.ParamSchema(f), outSchema);
+                return FabricatorStatus.Ok;
+            }
+            var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            CArrowSchemaExporter.ExportSchema(catalog.GetFunctionParamSchema(s, f), outSchema);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int GetFunctionReturnSchema(nint handle, byte* schema, byte* func, CArrowSchema* outSchema,
+                                               byte** err)
+    {
+        try
+        {
+            if (outSchema is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
+            if (handle == 0) // global (connection-free) function — scalar or aggregate return type
+            {
+                CArrowSchemaExporter.ExportSchema(new Schema(new[] { GlobalFunctions.ReturnField(f) }, null), outSchema);
+                return FabricatorStatus.Ok;
+            }
+            var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            CArrowSchemaExporter.ExportSchema(catalog.GetFunctionReturnSchema(s, f), outSchema);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int ExecuteScalar(nint handle, byte* schema, byte* func, CArrowArrayStream* args,
+                                     CArrowArrayStream* outStream, byte** err)
+    {
+        try
+        {
+            if (args is null || outStream is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
+            var argStream = CArrowArrayStreamImporter.ImportArrayStream(args); // we own it
+            if (handle == 0) // global (connection-free) function
+            {
+                CArrowArrayStreamExporter.ExportArrayStream(
+                    GlobalFunctions.ExecuteScalar(GlobalFunctions.ResolveScalar(f), argStream), outStream);
+                return FabricatorStatus.Ok;
+            }
+            var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            CArrowArrayStreamExporter.ExportArrayStream(catalog.ExecuteScalar(s, f, argStream), outStream);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int GetFunctionOutputSchema(nint handle, byte* schema, byte* func, CArrowArrayStream* args,
+                                               CArrowSchema* outSchema, byte** err)
+    {
+        try
+        {
+            if (outSchema is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
+            // `args` (nullable) is a 1-row stream of the constant call args — a custom table function's output
+            // schema may depend on them. Discovered SQL functions ignore it.
+            RecordBatch? argsBatch = null;
+            if (args is not null)
+            {
+                using var argStream = CArrowArrayStreamImporter.ImportArrayStream(args); // we own it
+                argsBatch = argStream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+            }
+            CArrowSchemaExporter.ExportSchema(catalog.GetFunctionOutputSchema(s, f, argsBatch), outSchema);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    // (ExecuteTable / ExecuteProc handlers were removed at ABI v30 — superseded by the table-function
+    //  session TableBind / TableExecute / TableClose.)
+
+    // (The 4g table-in-out push handlers InOutOpen/InOutPush/InOutFinish/InOutAbort were removed at ABI v31 —
+    //  every `_each` form now runs on the streaming exchange: InOutBind / InOutExchangeOpen / InOutBindClose.)
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int InOutBind(nint handle, byte* schema, byte* func, CArrowArrayStream* args, CArrowSchema* inputSchema,
+                                 CArrowArrayStream* outSchema, nint* outBinding, byte** err)
+    {
+        try
+        {
+            if (inputSchema is null || outSchema is null || outBinding is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var inSchema = CArrowSchemaImporter.ImportSchema(inputSchema); // takes ownership of the C schema
+            // `args` (nullable) is a 1-row stream of the constant cost args (read synchronously below).
+            RecordBatch? argsBatch = null;
+            if (args is not null)
+            {
+                using var argStream = CArrowArrayStreamImporter.ImportArrayStream(args); // we own it
+                argsBatch = argStream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+            }
+            var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
+            // handle == 0 => a connection-free GLOBAL in-out / collector: resolve from the global registry by
+            // name (a collector is wrapped as an IArrowInOutBinding). Else the catalog path.
+            var binding = handle == 0
+                ? GlobalFunctions.ResolveInOut(f, argsBatch, inSchema)
+                : (Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty))
+                    .InOutBind(Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty, f, argsBatch, inSchema);
+            // Export the binding's full output schema as a zero-row stream so the host can read return types.
+            CArrowArrayStreamExporter.ExportArrayStream(
+                new InMemoryArrayStream(binding.OutputSchema, System.Array.Empty<RecordBatch>()), outSchema);
+            *outBinding = Handles.Alloc(binding);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int InOutExchangeOpen(nint binding, CArrowArrayStream* input,
+                                         CArrowArrayStream* output, byte** err)
+    {
+        try
+        {
+            if (input is null || output is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var b = Handles.Resolve<IArrowInOutBinding>(binding);
+            if (b is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            // Take ownership of the host's input stream; the pump pulls it (one chunk per gate tenure) + releases it.
+            // The SQL isolation was resolved + set on the binding at inout_bind (C#), so it is not passed here.
+            var inputStream = CArrowArrayStreamImporter.ImportArrayStream(input);
+            CArrowArrayStreamExporter.ExportArrayStream(new InOutExchangeStream(b, inputStream), output);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int InOutBindClose(nint binding, byte** err)
+    {
+        try
+        {
+            Handles.Resolve<IArrowInOutBinding>(binding)?.Dispose(); // idempotent
+            Handles.Free(binding);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int TableBind(nint handle, byte* schema, byte* func, CArrowArrayStream* args,
+                                 CArrowArrayStream* outSchema, int* supportsPushdown, nint* outBinding, byte** err)
+    {
+        try
+        {
+            if (outSchema is null || supportsPushdown is null || outBinding is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            // `args` (nullable) is a 1-row stream of the constant call args (read synchronously below).
+            RecordBatch? argsBatch = null;
+            if (args is not null)
+            {
+                using var argStream = CArrowArrayStreamImporter.ImportArrayStream(args); // we own it
+                argsBatch = argStream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+            }
+            var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
+            // handle == 0 => a connection-free GLOBAL table function: resolve from the global registry by name.
+            var bound = handle == 0
+                ? GlobalFunctions.ResolveTable(f, argsBatch)
+                : (Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty))
+                    .TableBind(Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty, f, argsBatch);
+            // Export the binding's output schema as a zero-row stream so the host can read return types.
+            CArrowArrayStreamExporter.ExportArrayStream(
+                new InMemoryArrayStream(bound.OutputSchema, System.Array.Empty<RecordBatch>()), outSchema);
+            *supportsPushdown = bound.SupportsPushdown ? 1 : 0;
+            *outBinding = Handles.Alloc(bound);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int TableExecute(nint binding, byte* specJson, CArrowArrayStream* filterValues,
+                                    CArrowArrayStream* outStream, byte** err)
+    {
+        try
+        {
+            if (outStream is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var bound = Handles.Resolve<IBoundTable>(binding);
+            if (bound is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var spec = Marshal.PtrToStringUTF8((nint)specJson); // null => SELECT *
+            IArrowArrayStream? filters =
+                filterValues is null ? null : CArrowArrayStreamImporter.ImportArrayStream(filterValues);
+            CArrowArrayStreamExporter.ExportArrayStream(bound.Execute(spec, filters), outStream);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int TableClose(nint binding, byte** err)
+    {
+        try
+        {
+            Handles.Resolve<IBoundTable>(binding)?.Dispose(); // idempotent
+            Handles.Free(binding);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Provider-declared settings (see docs/settings-architecture.md). list_settings returns ALL registered
+    // providers' declared settings (not catalog-scoped); set_setting pushes a value into the process-wide
+    // ProviderSettingsStore. Six string columns: provider, name, type, default, description, min.
+    // -------------------------------------------------------------------------
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int ListSettings(CArrowArrayStream* outStream, byte** err)
+    {
+        try
+        {
+            if (outStream is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var provider = new StringArray.Builder();
+            var name = new StringArray.Builder();
+            var type = new StringArray.Builder();
+            var def = new StringArray.Builder();
+            var desc = new StringArray.Builder();
+            var min = new StringArray.Builder();
+            int rows = 0;
+            foreach (var backend in BackendRegistry.All())
+            {
+                foreach (var s in backend.Settings)
+                {
+                    provider.Append(backend.Name);
+                    name.Append(s.Name);
+                    type.Append(s.Type switch
+                    {
+                        ProviderSettingType.Bool => "bool",
+                        ProviderSettingType.Long => "long",
+                        _ => "varchar",
+                    });
+                    var rendered = RenderSettingValue(s.Default);
+                    if (rendered is null) { def.AppendNull(); } else { def.Append(rendered); }
+                    desc.Append(s.Description ?? string.Empty);
+                    if (s.Min is long m) { min.Append(m.ToString()); } else { min.AppendNull(); }
+                    rows++;
+                }
+            }
+            var schema = new Schema(new[]
+            {
+                new Field("provider", StringType.Default, nullable: false),
+                new Field("name", StringType.Default, nullable: false),
+                new Field("type", StringType.Default, nullable: false),
+                new Field("default", StringType.Default, nullable: true),
+                new Field("description", StringType.Default, nullable: true),
+                new Field("min", StringType.Default, nullable: true),
+            }, metadata: null);
+            var batch = new RecordBatch(schema, new IArrowArray[]
+            {
+                provider.Build(), name.Build(), type.Build(), def.Build(), desc.Build(), min.Build(),
+            }, rows);
+            CArrowArrayStreamExporter.ExportArrayStream(new InMemoryArrayStream(schema, new[] { batch }), outStream);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    // Load-time GLOBAL functions (see docs/global-functions.md). Returns the provider-union of connection-free
+    // global functions so the host registers each as a bare fn(...) at extension load. Columns: name, kind,
+    // param_count, return_type (return_type meaningful for kind='scalar'). Per-function schemas + execution
+    // reuse the scalar entries with handle=0. Currently scalar only; table/in-out kinds slot in here later.
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int ListGlobalFunctions(CArrowArrayStream* outStream, byte** err)
+    {
+        try
+        {
+            if (outStream is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var name = new StringArray.Builder();
+            var kind = new StringArray.Builder();
+            // "1" iff the function's source orders strings byte/binary (string ordering + BETWEEN safe to push);
+            // only meaningful for table functions, "0" for the other kinds. Read by the C++ load-time registrar.
+            var stringOrder = new StringArray.Builder();
+            var paramCount = new Int32Array.Builder();
+            var returnType = new StringArray.Builder();
+            int rows = 0;
+            foreach (var fn in GlobalFunctions.AllScalars())
+            {
+                name.Append(fn.Name);
+                kind.Append("scalar");
+                stringOrder.Append("0");
+                paramCount.Append(fn.Parameters.FieldsList.Count);
+                returnType.Append(fn.Result.DataType.Name);
+                rows++;
+            }
+            foreach (var fn in GlobalFunctions.AllInOut())
+            {
+                name.Append(fn.Name);
+                kind.Append("inout");
+                stringOrder.Append("0");
+                paramCount.Append(fn.InputSchema.FieldsList.Count);
+                returnType.Append(string.Empty);
+                rows++;
+            }
+            foreach (var fn in GlobalFunctions.AllCollectors())
+            {
+                name.Append(fn.Name);
+                kind.Append("collector");
+                stringOrder.Append("0");
+                paramCount.Append(fn.InputSchema.FieldsList.Count);
+                returnType.Append(string.Empty);
+                rows++;
+            }
+            foreach (var fn in GlobalFunctions.AllTables())
+            {
+                name.Append(fn.Name);
+                kind.Append("table");
+                stringOrder.Append(fn.StringOrderPushable ? "1" : "0");
+                paramCount.Append(fn.Parameters.FieldsList.Count);
+                returnType.Append(string.Empty);
+                rows++;
+            }
+            foreach (var fn in GlobalFunctions.AllAggregates())
+            {
+                name.Append(fn.Name);
+                kind.Append(fn.SupportsSpill ? "aggregate_spill" : "aggregate");
+                stringOrder.Append("0");
+                paramCount.Append(fn.Parameters.FieldsList.Count);
+                returnType.Append(fn.Result.DataType.Name);
+                rows++;
+            }
+            var schema = new Schema(new[]
+            {
+                new Field("name", StringType.Default, nullable: false),
+                new Field("kind", StringType.Default, nullable: false),
+                new Field("string_order", StringType.Default, nullable: false),
+                new Field("param_count", Int32Type.Default, nullable: false),
+                new Field("return_type", StringType.Default, nullable: true),
+            }, metadata: null);
+            var batch = new RecordBatch(schema, new IArrowArray[]
+            {
+                name.Build(), kind.Build(), stringOrder.Build(), paramCount.Build(), returnType.Build(),
+            }, rows);
+            CArrowArrayStreamExporter.ExportArrayStream(new InMemoryArrayStream(schema, new[] { batch }), outStream);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    // Provider-declared secret fields (see docs/provider-extensibility.md §2). Returns ALL registered
+    // providers' secret types + fields so the host registers each secret type + its CREATE SECRET named
+    // parameters generically. Five columns: provider, secret_type, name, type ("varchar"|"integer"|
+    // "boolean"), redact ("1"|"0"). A provider with an empty SecretType contributes no rows.
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int ListSecretFields(CArrowArrayStream* outStream, byte** err)
+    {
+        try
+        {
+            if (outStream is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var provider = new StringArray.Builder();
+            var secretType = new StringArray.Builder();
+            var name = new StringArray.Builder();
+            var type = new StringArray.Builder();
+            var redact = new StringArray.Builder();
+            int rows = 0;
+            foreach (var backend in BackendRegistry.All())
+            {
+                if (string.IsNullOrEmpty(backend.SecretType))
+                {
+                    continue;
+                }
+                foreach (var f in backend.SecretFields)
+                {
+                    provider.Append(backend.Name);
+                    secretType.Append(backend.SecretType);
+                    name.Append(f.Name);
+                    type.Append(f.Type switch
+                    {
+                        SecretFieldType.Integer => "integer",
+                        SecretFieldType.Boolean => "boolean",
+                        _ => "varchar",
+                    });
+                    redact.Append(f.Redact ? "1" : "0");
+                    rows++;
+                }
+            }
+            var schema = new Schema(new[]
+            {
+                new Field("provider", StringType.Default, nullable: false),
+                new Field("secret_type", StringType.Default, nullable: false),
+                new Field("name", StringType.Default, nullable: false),
+                new Field("type", StringType.Default, nullable: false),
+                new Field("redact", StringType.Default, nullable: false),
+            }, metadata: null);
+            var batch = new RecordBatch(schema, new IArrowArray[]
+            {
+                provider.Build(), secretType.Build(), name.Build(), type.Build(), redact.Build(),
+            }, rows);
+            CArrowArrayStreamExporter.ExportArrayStream(new InMemoryArrayStream(schema, new[] { batch }), outStream);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    // Renders a setting default/value to the string transport form (bool -> true/false, long/int -> digits,
+    // anything else -> ToString); null => unset (the caller appends a null).
+    private static string? RenderSettingValue(object? value) => value switch
+    {
+        null => null,
+        bool b => b ? "true" : "false",
+        long l => l.ToString(),
+        int i => i.ToString(),
+        _ => value.ToString(),
+    };
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int SetSetting(byte* provider, byte* name, byte* value, byte** err)
+    {
+        try
+        {
+            var p = Marshal.PtrToStringUTF8((nint)provider) ?? string.Empty;
+            var n = Marshal.PtrToStringUTF8((nint)name) ?? string.Empty;
+            var v = Marshal.PtrToStringUTF8((nint)value); // null => unset / reset
+            ProviderSettingsStore.Instance.Set(p, n, v);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    // Function-independent import schemas for the aggregate ABI batches: combine carries two int64 id
+    // columns, finalize/destroy a single int64 id column. (Update's schema is per-function — the session
+    // exposes it as IAggregateSession.UpdateSchema. Field names are cosmetic on import — the session reads
+    // columns by position.)
+    private static readonly Schema AggCombineSchema =
+        new(new[] { new Field("target_id", Int64Type.Default, false), new Field("source_id", Int64Type.Default, false) },
+            null);
+    private static readonly Schema AggIdsSchema =
+        new(new[] { new Field("state_id", Int64Type.Default, false) }, null);
+    // Spillable-mode serialized per-group state column (NULL = fresh/empty group).
+    private static readonly Schema AggStateSchema =
+        new(new[] { new Field("state", BinaryType.Default, true) }, null);
+    // Spillable combine batch: a target-slot index + the source state to merge into that target.
+    private static readonly Schema AggCombineBatchSchema =
+        new(new[] { new Field("slot", Int64Type.Default, false), new Field("source", BinaryType.Default, true) }, null);
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int AggOpen(nint handle, byte* schema, byte* func, nint* outSession, byte** err)
+    {
+        try
+        {
+            if (outSession is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
+            // handle == 0 => a connection-free GLOBAL aggregate: open a session from the global registry by name.
+            var session = handle == 0
+                ? GlobalFunctions.ResolveAggregate(f)
+                : (Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty))
+                    .AggOpen(Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty, f);
+            *outSession = Handles.Alloc(session);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int AggUpdate(nint session, CArrowArray* batch, byte** err)
+    {
+        try
+        {
+            if (batch is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var s = Handles.Resolve<IAggregateSession>(session);
+            if (s is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var rb = CArrowArrayImporter.ImportRecordBatch(batch, s.UpdateSchema); // takes ownership
+            s.Update(rb);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int AggCombine(nint session, CArrowArray* batch, byte** err)
+    {
+        try
+        {
+            if (batch is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var s = Handles.Resolve<IAggregateSession>(session);
+            if (s is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var rb = CArrowArrayImporter.ImportRecordBatch(batch, AggCombineSchema); // takes ownership
+            s.Combine(rb);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int AggFinalize(nint session, CArrowArray* ids, CArrowArrayStream* outStream, byte** err)
+    {
+        try
+        {
+            if (ids is null || outStream is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var s = Handles.Resolve<IAggregateSession>(session);
+            if (s is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var rb = CArrowArrayImporter.ImportRecordBatch(ids, AggIdsSchema); // takes ownership
+            CArrowArrayStreamExporter.ExportArrayStream(s.Finalize(rb), outStream);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int AggDestroy(nint session, CArrowArray* ids, byte** err)
+    {
+        try
+        {
+            if (ids is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var rb = CArrowArrayImporter.ImportRecordBatch(ids, AggIdsSchema); // takes ownership (must release)
+            var s = Handles.Resolve<IAggregateSession>(session);
+            if (s is null)
+            {
+                rb.Dispose();
+                return FabricatorStatus.Ok; // session already closed — nothing to drop
+            }
+            s.Destroy(rb);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int AggClose(nint session, byte** err)
+    {
+        try
+        {
+            Handles.Resolve<IAggregateSession>(session)?.Close(); // idempotent
+            Handles.Free(session);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int AggUpdateSpill(nint session, CArrowArray* groupStates, CArrowArray* batch,
+                                      CArrowArrayStream* outStream, byte** err)
+    {
+        try
+        {
+            if (groupStates is null || batch is null || outStream is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var s = Handles.Resolve<IAggregateSession>(session);
+            if (s is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var states = CArrowArrayImporter.ImportRecordBatch(groupStates, AggStateSchema); // takes ownership
+            var rows = CArrowArrayImporter.ImportRecordBatch(batch, s.UpdateSchema);          // takes ownership
+            CArrowArrayStreamExporter.ExportArrayStream(s.UpdateSpill(states, rows), outStream);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int AggCombineSpill(nint session, CArrowArray* targetStates, CArrowArray* combineBatch,
+                                       CArrowArrayStream* outStream, byte** err)
+    {
+        try
+        {
+            if (targetStates is null || combineBatch is null || outStream is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var s = Handles.Resolve<IAggregateSession>(session);
+            if (s is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var target = CArrowArrayImporter.ImportRecordBatch(targetStates, AggStateSchema);       // takes ownership
+            var batch = CArrowArrayImporter.ImportRecordBatch(combineBatch, AggCombineBatchSchema); // takes ownership
+            CArrowArrayStreamExporter.ExportArrayStream(s.CombineSpill(target, batch), outStream);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int AggFinalizeSpill(nint session, CArrowArray* states, CArrowArrayStream* outStream, byte** err)
+    {
+        try
+        {
+            if (states is null || outStream is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var s = Handles.Resolve<IAggregateSession>(session);
+            if (s is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var batch = CArrowArrayImporter.ImportRecordBatch(states, AggStateSchema); // takes ownership
+            CArrowArrayStreamExporter.ExportArrayStream(s.FinalizeSpill(batch), outStream);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static void FreeError(byte* err)
+    {
+        if (err is not null)
+        {
+            Marshal.FreeCoTaskMem((nint)err);
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    // `op` binds to the calling ABI handler's method name via [CallerMemberName], so EVERY failed bridge
+    // crossing is logged centrally with its operation and exception — no per-handler logging needed.
+    private static void SetError(byte** err, Exception ex, [CallerMemberName] string op = "")
+    {
+        BridgeLog.LogWarning(ex, "abi {Op} failed: {Message}", op, ex.Message);
+        if (err is not null)
+        {
+            *err = (byte*)Marshal.StringToCoTaskMemUTF8(FormatError(ex));
+        }
+    }
+
+    /// <summary>Splits a comma-separated column list (from a native PARTITIONED BY clause, marshaled by C++) into a
+    /// trimmed non-empty list, or null when absent/empty. Providers that don't partition ignore the argument.</summary>
+    private static IReadOnlyList<string>? SplitColumnList(string? csv)
+    {
+        if (string.IsNullOrWhiteSpace(csv))
+        {
+            return null;
+        }
+        var list = new List<string>();
+        foreach (var part in csv.Split(','))
+        {
+            if (!string.IsNullOrWhiteSpace(part))
+            {
+                list.Add(part.Trim());
+            }
+        }
+        return list.Count > 0 ? list : null;
+    }
+
+    /// <summary>
+    /// Surfaces a provider error code (e.g. SqlException.Number = 2627 for a PK
+    /// violation) ahead of the message, so error-code assertions match the way the
+    /// native mssql extension reports TDS errors. The bridge stays provider-agnostic,
+    /// so we duck-type a public <c>int Number</c> property (SqlException has one)
+    /// rather than reference Microsoft.Data.SqlClient.
+    /// </summary>
+    private static string FormatError(Exception ex)
+    {
+        try
+        {
+            for (Exception? e = ex; e is not null; e = e.InnerException)
+            {
+                var prop = e.GetType().GetProperty("Number");
+                if (prop?.PropertyType == typeof(int) && prop.GetValue(e) is int number && number != 0)
+                {
+                    return $"{number}: {ex.Message}";
+                }
+            }
+        }
+        catch
+        {
+            // Reflection failed — fall back to the plain message.
+        }
+        return ex.Message;
+    }
+}

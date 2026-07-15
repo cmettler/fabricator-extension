@@ -4,14 +4,14 @@
 #              Composes with filter pushdown. NOTE: VERSION 0 reads as latest (delta-dotnet treats Version=0 as
 #              a "latest" sentinel; v0 is our empty CREATE commit), so tests use v1+. Requires the delta-rs
 #              native libs published (publish-managed.ps1 -IncludeDeltaRs). Local FS.
-# group: [mssql_net]
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
-require-env ARROWNET_DELTA_WRITE_DIR
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/drtt' AS lake (TYPE arrownet, PROVIDER 'deltars');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/drtt' AS lake (TYPE fabricator, PROVIDER 'deltars');
 
 # v1 = CTAS (3 rows).
 statement ok

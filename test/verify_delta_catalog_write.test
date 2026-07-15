@@ -1,18 +1,18 @@
 # name: test/verify_delta_catalog_write.test
 # description: The Delta folder-as-catalog provider WRITE path — CREATE TABLE / INSERT / CTAS / COPY stream
 #              straight to engineered-wood through the host FileSystem (the streaming bulk path, like the
-#              SQL/DAX backends), superseding the global arrownet_delta_write collector. createTable/replace =>
-#              Overwrite, plain INSERT => Append; one Delta commit per statement. Set ARROWNET_DELTA_WRITE_DIR
+#              SQL/DAX backends), superseding the global fabricator_delta_write collector. createTable/replace =>
+#              Overwrite, plain INSERT => Append; one Delta commit per statement. Set FABRICATOR_DELTA_WRITE_DIR
 #              to a WRITABLE base path. Local FS (OneLake auto-discovery is blocked by a DuckDB-azure glob bug).
-# group: [mssql_net]
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
-require-env ARROWNET_DELTA_WRITE_DIR
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 # ATTACH a fresh (empty) Delta catalog root — no tables discovered yet.
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogw' AS lake (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/catalogw' AS lake (TYPE fabricator, PROVIDER 'delta');
 
 # CREATE TABLE — writes an empty Delta table (commit 0, schema only).
 statement ok
@@ -87,7 +87,7 @@ DETACH lake;
 # Re-ATTACH proves the commits are durable + standard Delta (re-discovered from _delta_log).
 # `squares` was dropped, so only `t` remains.
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/catalogw' AS lake2 (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/catalogw' AS lake2 (TYPE fabricator, PROVIDER 'delta');
 
 query T
 SELECT table_name FROM duckdb_tables() WHERE database_name = 'lake2' ORDER BY table_name;

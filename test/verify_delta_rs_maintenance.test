@@ -1,16 +1,16 @@
 # name: test/verify_delta_rs_maintenance.test
 # description: delta-rs provider maintenance ops (engineered-wood has none) via a small command dialect on
-#              mssql_net_exec('<catalog>', '<cmd>'): OPTIMIZE [ZORDER (...)], VACUUM [RETAIN n HOURS] [DRY RUN],
+#              fabricator_exec('<catalog>', '<cmd>'): OPTIMIZE [ZORDER (...)], VACUUM [RETAIN n HOURS] [DRY RUN],
 #              CHECKPOINT. Pure C# (ExecuteNonQuery) — no ABI/C++ change. Requires the delta-rs native libs
 #              published (publish-managed.ps1 -IncludeDeltaRs). Local FS.
-# group: [mssql_net]
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
-require-env ARROWNET_DELTA_WRITE_DIR
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/drm' AS lake (TYPE arrownet, PROVIDER 'deltars');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/drm' AS lake (TYPE fabricator, PROVIDER 'deltars');
 
 # Several small writes create several small files (a bin-pack candidate).
 statement ok
@@ -24,19 +24,19 @@ INSERT INTO lake.main.t VALUES (5,'e');
 
 # OPTIMIZE (bin-pack) — commits a new OPTIMIZE version.
 query I
-SELECT mssql_net_exec('lake', 'OPTIMIZE main.t');
+SELECT fabricator_exec('lake', 'OPTIMIZE main.t');
 ----
 0
 
 # CHECKPOINT (log compaction; no new data version).
 query I
-SELECT mssql_net_exec('lake', 'CHECKPOINT main.t');
+SELECT fabricator_exec('lake', 'CHECKPOINT main.t');
 ----
 0
 
 # VACUUM DRY RUN (safe: lists, deletes nothing).
 query I
-SELECT mssql_net_exec('lake', 'VACUUM main.t RETAIN 168 HOURS DRY RUN');
+SELECT fabricator_exec('lake', 'VACUUM main.t RETAIN 168 HOURS DRY RUN');
 ----
 0
 
@@ -48,19 +48,19 @@ SELECT count(*) FROM lake.main.t;
 
 # OPTIMIZE is recorded in the commit history.
 query T
-SELECT operation FROM arrownet_delta_snapshots('lake', 'main.t') WHERE operation = 'OPTIMIZE';
+SELECT operation FROM fabricator_delta_snapshots('lake', 'main.t') WHERE operation = 'OPTIMIZE';
 ----
 OPTIMIZE
 
 # Z-order clustering (headline delta-rs feature) via the dialect.
 query I
-SELECT mssql_net_exec('lake', 'OPTIMIZE main.t ZORDER (id)');
+SELECT fabricator_exec('lake', 'OPTIMIZE main.t ZORDER (id)');
 ----
 0
 
 # An unknown maintenance verb errors cleanly.
 statement error
-SELECT mssql_net_exec('lake', 'FROBNICATE main.t');
+SELECT fabricator_exec('lake', 'FROBNICATE main.t');
 ----
 FROBNICATE
 

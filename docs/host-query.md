@@ -4,7 +4,7 @@
 > function) run a DuckDB query/statement **on the host's own engine** and exchange data as Apache Arrow —
 > reusing DuckDB features (functions, readers, extensions, the catalog) without re-implementing them, and
 > without going out-of-process. This is the C#→host reverse-callback companion to the v40 filesystem bridge
-> (`ArrowNetHostServices`); see [docs/filesystem-bridge.md](filesystem-bridge.md).
+> (`FabricatorHostServices`); see [docs/filesystem-bridge.md](filesystem-bridge.md).
 
 ## Why not ADBC / a second DuckDB
 
@@ -30,9 +30,9 @@ extension's own uncommitted writes. (Same-transaction read-your-writes would mea
 the corruption path; explicitly out of scope.) Each call is naturally **thread-safe** (own connection, no
 shared mutable state); a small connection pool is a later optimization (create-per-call first).
 
-## ABI — additions to `ArrowNetHostServices` (the reverse-direction struct)
+## ABI — additions to `FabricatorHostServices` (the reverse-direction struct)
 
-`ArrowNetHostServices` already carries host→managed function pointers the managed side calls (the v40
+`FabricatorHostServices` already carries host→managed function pointers the managed side calls (the v40
 `fs_*` callbacks). We append one primitive:
 
 ```c
@@ -43,20 +43,20 @@ shared mutable state); a small connection pool is a later optimization (create-p
 // the result as an ArrowArrayStream. The connection + result outlive `out` (released when `out` is released).
 int32_t (*host_query)(const char *sql,
                       struct ArrowArray *params /*nullable, 1-row*/,
-                      ArrowNetHostInputs *inputs /*nullable*/,
+                      FabricatorHostInputs *inputs /*nullable*/,
                       struct ArrowArrayStream *out, char **err);
 ```
 
-`ArrowNetHostInputs` = `{ int32_t count; const char **names; struct ArrowArrayStream **streams; }` — the
+`FabricatorHostInputs` = `{ int32_t count; const char **names; struct ArrowArrayStream **streams; }` — the
 managed caller hands over N named Arrow streams (it owns producing them; the host consumes/releases them when
-the query's connection is torn down). Bump `ARROWNET_ABI_VERSION` **and** the host-services `abi_version`.
+the query's connection is torn down). Bump `FABRICATOR_ABI_VERSION` **and** the host-services `abi_version`.
 
 **`exec_nonquery` is NOT a separate entry.** A DDL/DML statement returns a result in DuckDB too (DML → a
 1-row `BIGINT` count; DDL → empty), so `host_query` subsumes it. "Exec, return affected rows" is a thin **C#
 helper over `host_query`** (run, read the single count column if present, discard the stream) — keeping the
 ABI minimal. Both get parameter binding for free.
 
-## C++ side (`arrownet_host_query.cpp`, host service + the test/utility table function)
+## C++ side (`fabricator_host_query.cpp`, host service + the test/utility table function)
 
 - **`HostQuery(...)`** (the `host_query` callback): `Connection conn(*g_database)` (the `DatabaseInstance`
   captured at extension load, like the fs services); for each input `duckdb_arrow_scan(conn, name, stream)`
@@ -69,13 +69,13 @@ ABI minimal. Both get parameter binding for free.
   global the callback reads — `host_query` has no per-call opener (unlike the fs callbacks), it just needs the
   database to open a connection on.
 
-## C# side (`ArrowNet.Bridge`)
+## C# side (`Fabricator.Bridge`)
 
-- **`Abi.cs`**: add the `HostQuery` function-pointer field to `ArrowNetHostServices` (+ the `ArrowNetHostInputs`
+- **`Abi.cs`**: add the `HostQuery` function-pointer field to `FabricatorHostServices` (+ the `FabricatorHostInputs`
   struct).
 - **`Host` API** (mirrors `HostFs`): `Host.Query(string sql, RecordBatch? params = null, IReadOnlyDictionary<
   string, IArrowArrayStream>? inputs = null) → IArrowArrayStream` — marshals params to a 1-row Arrow array,
-  exports each input stream + the names into an `ArrowNetHostInputs`, calls the pointer, imports the result
+  exports each input stream + the names into an `FabricatorHostInputs`, calls the pointer, imports the result
   stream. `Host.ExecuteNonQuery(sql, params) → long` = the helper (run, read the count, discard).
 - This is the surface a provider backend / custom function uses to reuse the host engine.
 
@@ -88,16 +88,16 @@ ABI minimal. Both get parameter binding for free.
 2. **Replacement-scan layer (optional, ambient registry):** for "register a C# source by name once, then any
    query referencing that bare name resolves to it" (pandas-df style). A C# registry maps `name → Func<
    IArrowArrayStream>`; a C++ replacement scan registered on the `DBConfig` rewrites an unknown table name to a
-   `arrownet_scan('name')` `TableFunctionRef` when the name is registered (a `named_input_exists(name)` +
-   `open_named_input(name, out)` managed lookup). `arrownet_scan(name)` is a global table function that opens
+   `fabricator_scan('name')` `TableFunctionRef` when the name is registered (a `named_input_exists(name)` +
+   `open_named_input(name, out)` managed lookup). `fabricator_scan(name)` is a global table function that opens
    the registered stream and scans it via the existing `arrow_ingest` path. Single-use streams → the registry
    holds a **factory** so each scan gets a fresh stream. This layer is additive over (1) and is only needed for
    the ambient/by-bare-name ergonomics.
 
 ## Verification
 
-- A test table function `arrownet_host_query(sql)` (C++) that calls `HostQuery` directly proves the
-  fresh-connection run + param-free Arrow export (`SELECT * FROM arrownet_host_query('SELECT 42 AS x')`).
+- A test table function `fabricator_host_query(sql)` (C++) that calls `HostQuery` directly proves the
+  fresh-connection run + param-free Arrow export (`SELECT * FROM fabricator_host_query('SELECT 42 AS x')`).
 - A C# round-trip test — a custom C# table function whose `Execute` calls `Host.Query(...)` — proves
   SQL → our C# function → `host_query` → fresh host connection → Arrow → back, including the reentrancy safety
   (the nested run is on a fresh connection, so the outer query's context is untouched).
@@ -106,11 +106,11 @@ ABI minimal. Both get parameter binding for free.
 
 ## Implementation status
 
-- **Slice 1 — `arrownet_host_query(sql)`** (the C++ engine: fresh connection + self-owning Arrow result via
+- **Slice 1 — `fabricator_host_query(sql)`** (the C++ engine: fresh connection + self-owning Arrow result via
   the ingest path). DONE, `verify_host_query.test`.
 - **Slice 2 — C#-callable `host_query` host service (ABI v42→v43)** + public `Host.Query`/`Host.ExecuteNonQuery`.
   DONE; round-trip verified (`cf_host_answer` in `verify_custom_functions.test`).
-- **Slice 3 — named Arrow inputs (data-in)**: `host_query` gained `ArrowNetHostInputs` (ABI v43); the host
+- **Slice 3 — named Arrow inputs (data-in)**: `host_query` gained `FabricatorHostInputs` (ABI v43); the host
   registers each C#-provided stream as a connection-scoped view via `duckdb_arrow_scan` before the query.
   `Host.Query(sql, inputs)`. DONE; verified (`cf_host_sum` pushes a C# Arrow table into a host query and sums
   it on the host engine — `verify_custom_functions.test`).
@@ -123,20 +123,20 @@ ABI minimal. Both get parameter binding for free.
   re-releasing (which would double-free the exporter → NRE).
 - **Slice 5 — ambient named-source registry + replacement scan (ABI v45)**: `Host.RegisterSource(name,
   Func<IArrowArrayStream>)` registers a stream factory; two handle-less vtable entries (`open_named_input`,
-  `named_input_exists`) let the host resolve a name to a fresh stream. `arrownet_scan('name')` scans it; a
-  `DBConfig` **replacement scan** rewrites a bare unresolved name to `arrownet_scan('name')` when it's
+  `named_input_exists`) let the host resolve a name to a fresh stream. `fabricator_scan('name')` scans it; a
+  `DBConfig` **replacement scan** rewrites a bare unresolved name to `fabricator_scan('name')` when it's
   registered (so `FROM <name>` works), declining unknown names so a genuine "table does not exist" is left to
   DuckDB (`NamedInputExists` is non-throwing + bridge-tolerant). DONE; verified (`verify_host_query.test`, 15
-  — `arrownet_scan` + bare-name + unknown-name passthrough; built-in demo source `arrownet_demo_numbers`).
+  — `fabricator_scan` + bare-name + unknown-name passthrough; built-in demo source `fabricator_demo_numbers`).
 - **Slice 6 — streaming results**: `host_query` now uses `SendQuery` (and a streaming prepared `Execute`) so
   the result is fetched lazily (`StreamQueryResult.Fetch()` per `get_next`) — bounded memory for large
   results (validated to 1M rows). The holder keeps the connection (+ the prepared statement for params)
   alive; runtime errors that surface during `Fetch` (vs bind errors at `SendQuery`) are caught in `get_next`
   and reported via `get_last_error`. DONE.
-- **Deferred:** parameter binding for the ambient `arrownet_scan` (it resolves a registered source by NAME —
+- **Deferred:** parameter binding for the ambient `fabricator_scan` (it resolves a registered source by NAME —
   parameters belong on the scoped `host_query` path, which already binds them; a parameterized named source
-  would be a separate, larger design); and the **full breaking rename** (removing the `mssql_net_*` names;
-  the generic `arrownet_*`/`TYPE arrownet` names already exist as additive aliases — `verify_generic_names.test`).
+  would be a separate, larger design); and the **full breaking rename** (removing the `fabricator_*` names;
+  the generic `fabricator_*`/`TYPE fabricator` names already exist as additive aliases — `verify_generic_names.test`).
 
 ## Open / deferred
 

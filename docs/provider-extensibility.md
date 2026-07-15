@@ -33,12 +33,12 @@ values via `set_setting` into `ProviderSettingsStore` → the provider reads the
 ## 2. Secret fields — DONE (ABI v38)
 
 **Implemented.** The provider declares its secret type + fields in C#: `IBackend.SecretType` (e.g.
-`"mssql_net"`) + `IBackend.SecretFields` (a `SecretField` list — name / type (`varchar`/`integer`/`boolean`)
+`"fabricator"`) + `IBackend.SecretFields` (a `SecretField` list — name / type (`varchar`/`integer`/`boolean`)
 / `redact`). A new `list_secret_fields` ABI (the `list_settings` twin) is queried at extension load;
 `RegisterProviderSecrets` registers **one DuckDB secret type per declared `secret_type`** generically — the
 listed fields become the `CREATE SECRET` named parameters (redacting the marked ones) via one shared
 `CreateProviderSecret` (keyed by `input.type`). The C++ core names **no** secret type or field: the field
-constants (`kHost` …), `ValidateFields`, and `CreateMssqlNetSecret` are gone; `IsMssqlNetSecret` →
+constants (`kHost` …), `ValidateFields`, and `CreateFabricatorSecret` are gone; `IsFabricatorSecret` →
 `IsProviderSecret` and `BuildConnectionStringFromSecret` now check the registered-types map and pass the
 owning provider to `build_connection_string`.
 
@@ -55,7 +55,7 @@ full suite 30/30.
 
 A provider can also **reuse a secret of another extension's type** (e.g. DuckDB's `azure` secret) — useful
 both for SQL Entra auth and, later, for a storage-capable provider reading `azure`/`s3`/`http` creds. The
-mechanism: `BuildConnectionStringFromSecret` resolves a secret of **any** type (`IsMssqlNetSecret` →
+mechanism: `BuildConnectionStringFromSecret` resolves a secret of **any** type (`IsFabricatorSecret` →
 `IsKnownSecret` = "any secret exists"; the type-restricted check is gone) and passes `(secret_type,
 fields_json, base_connstr)` to `build_connection_string` (ABI v39 added `secret_type` + `base_connstr`). C#
 interprets the fields **per type** — so each provider handles the foreign types it understands; the core just
@@ -67,7 +67,7 @@ secrets are context-scoped, so there is no "fetch any secret from arbitrary C#" 
 `Password`=`CLIENT_SECRET`); `managed_identity` → `Active Directory Managed Identity` (+ `CLIENT_ID` for
 user-assigned). The azure secret carries **auth only** (its `ACCOUNT_NAME` is a storage account), so the
 server/database come from the **ATTACH target** (`base_connstr`), merged via `SqlConnectionStringBuilder`:
-`ATTACH 'Server=…;Database=…' AS d (TYPE mssql_net, SECRET <azure_sp>)`. `credential_chain` is rejected with a
+`ATTACH 'Server=…;Database=…' AS d (TYPE fabricator, SECRET <azure_sp>)`. `credential_chain` is rejected with a
 clear error (its token is storage-scoped + fetched lazily — no SQL-usable credential) pointing to
 `authentication='Active Directory Default'`, which makes SqlClient run the same chain scoped for SQL — also
 the answer for "DuckDB running inside Fabric/Azure with an ambient managed identity." Validated end-to-end:
@@ -76,7 +76,7 @@ credentials aren't in CI). Error paths: `verify_azure_secret.test` (`require azu
 
 ## 3. ATTACH options — DONE (ABI v37)
 
-**Implemented.** `open_catalog` gained an `options_json` arg: `MssqlNetAttach` now extracts only the two
+**Implemented.** `open_catalog` gained an `options_json` arg: `FabricatorAttach` now extracts only the two
 META options it must handle before the provider is resolved (**PROVIDER** — selects the backend, incl.
 `scheme://` inference; **SECRET** — resolved to a connstr), serializes **every other** ATTACH option into a
 flat JSON object, and forwards it. The provider-agnostic core names no provider-specific option. C#
@@ -90,7 +90,7 @@ schema is already registered (and the managed `schema_filter` kept non-matching 
 `DiscoverSchemas`). Validated: `verify_catalog_filter` + `verify_inout_isolation` + full suite 30/30; dbt
 `--threads 4` green. Below is the original design (retained for context).
 
-**Was (C++-hardcoded):** [mssql_net_storage.cpp](../src/mssql_net_storage.cpp) parsed options with a hardcoded
+**Was (C++-hardcoded):** [fabricator_storage.cpp](../src/fabricator_storage.cpp) parsed options with a hardcoded
 `if (lower == "schema_filter") …` chain (`schema_filter`/`table_filter`/`isolation_level`/`provider`/`secret`),
 all `mssql`-specific.
 
@@ -144,7 +144,7 @@ C++ core stays name-agnostic** — three instances of one pattern.
 
 ## Open decisions
 
-- **Secret type naming per provider** (`sqlserver`/`mssql` vs a generic `arrownet` type with a provider field?)
+- **Secret type naming per provider** (`sqlserver`/`mssql` vs a generic `fabricator` type with a provider field?)
   — still open; decide with the DAX provider (§2).
 - **ATTACH filter-location change** — RESOLVED: C#-side filtering matches the C++ semantics
   (`verify_catalog_filter` green; icase unanchored substring regex).

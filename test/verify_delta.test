@@ -1,16 +1,16 @@
 # name: test/verify_delta.test
-# description: arrownet_delta_scan reads a Delta Lake table via engineered-wood, IO through DuckDB's FileSystem
+# description: fabricator_delta_scan reads a Delta Lake table via engineered-wood, IO through DuckDB's FileSystem
 #              reverse-callbacks (SPIKE — docs/filesystem-bridge.md). Fixture: test/fixtures/delta_simple
-#              (a delta-rs-written table, 10 rows id/name/amount). Set ARROWNET_DELTA_DIR to its absolute path.
-# group: [mssql_net]
+#              (a delta-rs-written table, 10 rows id/name/amount). Set FABRICATOR_DELTA_DIR to its absolute path.
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
-require-env ARROWNET_DELTA_DIR
+require-env FABRICATOR_DELTA_DIR
 
 # Full scan: 10 rows, correct types resolved at bind via delta_schema.
 query III
-SELECT id, name, amount FROM arrownet_delta_scan('${ARROWNET_DELTA_DIR}') ORDER BY id;
+SELECT id, name, amount FROM fabricator_delta_scan('${FABRICATOR_DELTA_DIR}') ORDER BY id;
 ----
 1	row_1	1.5
 2	row_2	3.0
@@ -26,13 +26,13 @@ SELECT id, name, amount FROM arrownet_delta_scan('${ARROWNET_DELTA_DIR}') ORDER 
 # DuckDB applies projection / filter / aggregation above the materialized Arrow result.
 query IRT
 SELECT count(*), sum(amount), max(name)
-FROM arrownet_delta_scan('${ARROWNET_DELTA_DIR}') WHERE id > 7;
+FROM fabricator_delta_scan('${FABRICATOR_DELTA_DIR}') WHERE id > 7;
 ----
 3	40.5	row_9
 
 # Bind resolves the schema (column names + types) without reading data.
 query TT
-SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM arrownet_delta_scan('${ARROWNET_DELTA_DIR}')) ORDER BY column_name;
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM fabricator_delta_scan('${FABRICATOR_DELTA_DIR}')) ORDER BY column_name;
 ----
 amount	DOUBLE
 id	BIGINT
@@ -42,13 +42,13 @@ name	VARCHAR
 # engineered-wood Predicate). It is superset-safe — DuckDB re-applies every predicate — so these assert that no
 # matching row is ever dropped by the pruning. String equality ('=') pushes (byte-exact).
 query IRT
-SELECT id, amount, name FROM arrownet_delta_scan('${ARROWNET_DELTA_DIR}') WHERE name = 'row_3';
+SELECT id, amount, name FROM fabricator_delta_scan('${FABRICATOR_DELTA_DIR}') WHERE name = 'row_3';
 ----
 3	4.5	row_3
 
 # IN list pushes (any type).
 query I
-SELECT id FROM arrownet_delta_scan('${ARROWNET_DELTA_DIR}') WHERE id IN (1, 2, 10) ORDER BY id;
+SELECT id FROM fabricator_delta_scan('${FABRICATOR_DELTA_DIR}') WHERE id IN (1, 2, 10) ORDER BY id;
 ----
 1
 2
@@ -56,7 +56,7 @@ SELECT id FROM arrownet_delta_scan('${ARROWNET_DELTA_DIR}') WHERE id IN (1, 2, 1
 
 # AND of numeric range comparisons (both children push; AND keeps pushable children).
 query II
-SELECT id, amount FROM arrownet_delta_scan('${ARROWNET_DELTA_DIR}') WHERE id >= 5 AND amount < 12.0 ORDER BY id;
+SELECT id, amount FROM fabricator_delta_scan('${FABRICATOR_DELTA_DIR}') WHERE id >= 5 AND amount < 12.0 ORDER BY id;
 ----
 5	7.5
 6	9.0
@@ -65,7 +65,7 @@ SELECT id, amount FROM arrownet_delta_scan('${ARROWNET_DELTA_DIR}') WHERE id >= 
 # String ordering pushes too (Parquet byte-order stats match DuckDB's default binary string comparison): the
 # result must be exactly correct regardless. 'row_7','row_8','row_9' sort after 'row_5' bytewise.
 query IT
-SELECT id, name FROM arrownet_delta_scan('${ARROWNET_DELTA_DIR}') WHERE name > 'row_5' ORDER BY id;
+SELECT id, name FROM fabricator_delta_scan('${FABRICATOR_DELTA_DIR}') WHERE name > 'row_5' ORDER BY id;
 ----
 6	row_6
 7	row_7
@@ -75,6 +75,6 @@ SELECT id, name FROM arrownet_delta_scan('${ARROWNET_DELTA_DIR}') WHERE name > '
 # String '<>' (also pushed): a file/row-group is pruned only when all its values equal the literal; DuckDB
 # re-applies, so the result is exactly correct (9 rows).
 query I
-SELECT count(*) FROM arrownet_delta_scan('${ARROWNET_DELTA_DIR}') WHERE name <> 'row_1';
+SELECT count(*) FROM fabricator_delta_scan('${FABRICATOR_DELTA_DIR}') WHERE name <> 'row_1';
 ----
 9

@@ -1,83 +1,83 @@
 # name: test/verify_server_profile.test
-# description: mssql_server_info() surfaces the detected ServerProfile (warehouse-support slices 1+2)
-# group: [mssql_net]
+# description: fabricator_server_info() surfaces the detected ServerProfile (warehouse-support slices 1+2)
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql_net);
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
 
 # One (property, value) row per profile field.
 query I
-SELECT count(*) FROM mssql_server_info('db');
+SELECT count(*) FROM fabricator_server_info('db');
 ----
 14
 
 # Detected raw values for the test SQL Server 2025 (box, Developer edition).
 query I
-SELECT CAST(value AS INTEGER) FROM mssql_server_info('db') WHERE property = 'engine_edition';
+SELECT CAST(value AS INTEGER) FROM fabricator_server_info('db') WHERE property = 'engine_edition';
 ----
 3
 
 query I
-SELECT CAST(value AS INTEGER) FROM mssql_server_info('db') WHERE property = 'product_major_version';
+SELECT CAST(value AS INTEGER) FROM fabricator_server_info('db') WHERE property = 'product_major_version';
 ----
 17
 
 # Box SQL Server: MARS present, not a warehouse.
 query T
-SELECT value FROM mssql_server_info('db') WHERE property = 'supports_mars';
+SELECT value FROM fabricator_server_info('db') WHERE property = 'supports_mars';
 ----
 true
 
 query T
-SELECT value FROM mssql_server_info('db') WHERE property = 'is_warehouse';
+SELECT value FROM fabricator_server_info('db') WHERE property = 'is_warehouse';
 ----
 false
 
 # Full type system: NVARCHAR + DATETIMEOFFSET present, datetime2 scale 7.
 query T
-SELECT value FROM mssql_server_info('db') WHERE property = 'has_nvarchar';
+SELECT value FROM fabricator_server_info('db') WHERE property = 'has_nvarchar';
 ----
 true
 
 query T
-SELECT value FROM mssql_server_info('db') WHERE property = 'has_datetimeoffset';
+SELECT value FROM fabricator_server_info('db') WHERE property = 'has_datetimeoffset';
 ----
 true
 
 query I
-SELECT CAST(value AS INTEGER) FROM mssql_server_info('db') WHERE property = 'max_datetime2_scale';
+SELECT CAST(value AS INTEGER) FROM fabricator_server_info('db') WHERE property = 'max_datetime2_scale';
 ----
 7
 
 # SQL Server 2025 (major 17) has the native json type.
 query T
-SELECT value FROM mssql_server_info('db') WHERE property = 'has_native_json';
+SELECT value FROM fabricator_server_info('db') WHERE property = 'has_native_json';
 ----
 true
 
 # Collation SQL_Latin1_General_CP1_CI_AS -> not UTF-8, not binary, case-insensitive.
 query T
-SELECT value FROM mssql_server_info('db') WHERE property = 'is_utf8_collation';
+SELECT value FROM fabricator_server_info('db') WHERE property = 'is_utf8_collation';
 ----
 false
 
 query T
-SELECT value FROM mssql_server_info('db') WHERE property = 'is_binary_collation';
+SELECT value FROM fabricator_server_info('db') WHERE property = 'is_binary_collation';
 ----
 false
 
 query T
-SELECT value FROM mssql_server_info('db') WHERE property = 'is_case_sensitive';
+SELECT value FROM fabricator_server_info('db') WHERE property = 'is_case_sensitive';
 ----
 false
 
 # Box SQL Server: the pinned write transaction uses the connection/server default isolation.
 query T
-SELECT value FROM mssql_server_info('db') WHERE property = 'default_write_isolation';
+SELECT value FROM fabricator_server_info('db') WHERE property = 'default_write_isolation';
 ----
 (default)
 

@@ -8,17 +8,17 @@
 #              modified by both writers is a row-level conflict. Applies under write_serializable (the
 #              default; read checks are replaced by the row-level write validation); `serializable`
 #              keeps the strict file-level checks. DV + row-tracking tables (the defaults).
-#              Set ARROWNET_DELTA_WRITE_DIR.
-# group: [mssql_net]
+#              Set FABRICATOR_DELTA_WRITE_DIR.
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
 require parquet
 
-require-env ARROWNET_DELTA_WRITE_DIR
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/rowlevel' AS rl (TYPE arrownet, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/rowlevel' AS rl (TYPE fabricator, PROVIDER 'delta');
 
 # ONE file with rows 1..10 (single INSERT ⇒ single parquet) — every scenario below targets THIS file.
 statement ok
@@ -126,7 +126,7 @@ statement ok con1
 DELETE FROM rl.main.t WHERE id % 11 = 1;
 
 query I con2
-SELECT mssql_net_exec('rl', 'OPTIMIZE main.t');
+SELECT fabricator_exec('rl', 'OPTIMIZE main.t');
 ----
 0
 
@@ -147,7 +147,7 @@ SELECT count(*) FROM rl.main.t WHERE id = 1;
 # ---- 6. `serializable` keeps the STRICT file-level behavior (disjoint rows still conflict) ----
 
 statement ok
-ATTACH '${ARROWNET_DELTA_WRITE_DIR}/rowlevel' AS rlser (TYPE arrownet, PROVIDER 'delta', isolation_level 'serializable');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/rowlevel' AS rlser (TYPE fabricator, PROVIDER 'delta', isolation_level 'serializable');
 
 statement ok con1
 BEGIN;
@@ -212,7 +212,7 @@ statement ok con1
 UPDATE rl.main.q SET v = 'x' WHERE id = 3;
 
 query I con2
-SELECT mssql_net_exec('rl', 'OPTIMIZE main.q');
+SELECT fabricator_exec('rl', 'OPTIMIZE main.q');
 ----
 0
 
@@ -241,7 +241,7 @@ statement ok con1
 DELETE FROM rl.main.q WHERE id = 5;
 
 query I con2
-SELECT mssql_net_exec('rl', 'OPTIMIZE main.q');
+SELECT fabricator_exec('rl', 'OPTIMIZE main.q');
 ----
 0
 

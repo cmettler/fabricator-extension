@@ -1,0 +1,57 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <RootNamespace>Fabricator.Bridge</RootNamespace>
+    <AssemblyName>Fabricator.Bridge</AssemblyName>
+    <Description>
+      Reusable Arrow interop bridge loaded in-process by the native DuckDB
+      extension via CoreCLR hosting. Exposes a C ABI vtable (filled by
+      Bootstrap.Initialize) and streams Apache Arrow record batches to/from the
+      C++ host over the Arrow C Stream Interface.
+    </Description>
+    <!-- Generate the runtimeconfig.json even though this is a library, so the
+         native host can initialize the runtime against it. -->
+    <GenerateRuntimeConfigurationFiles>true</GenerateRuntimeConfigurationFiles>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Apache.Arrow" Version="23.0.0" />
+    <!-- .NET logging: trace the native Delta reader (per-file queries, applied static/dynamic filters, pruned
+         files, snapshot version). Off by default (NullLoggerFactory); env-driven file sink via FABRICATOR_LOG_LEVEL
+         + FABRICATOR_LOG_FILE. The ILoggerFactory is pluggable (FabricatorLog.Factory), so a DuckDB-forwarding
+         provider can be attached later. -->
+    <PackageReference Include="Microsoft.Extensions.Logging" Version="9.0.0" />
+    <!-- The stable contract surface (interfaces + Arrow-typed POCOs), split out so plugins can reference a
+         minimal shared assembly. Same Fabricator.Bridge namespace — assembly split only. -->
+    <ProjectReference Include="..\Fabricator.Abstractions\Fabricator.Abstractions.csproj" />
+    <!-- Fabric REST API: list OneLake lakehouse tables (TablesClient.ListTables) so the Delta folder-as-catalog
+         can ATTACH a OneLake root — DuckDB's azure glob can't enumerate a OneLake _delta_log tree (PR #174), so
+         OneLake table discovery uses the Fabric API instead of a glob (local/S3/ADLS keep the glob). Auth via the
+         ATTACH'd azure SP secret (ClientSecretCredential, Azure.Identity). -->
+    <PackageReference Include="Microsoft.Fabric.Api" Version="2.14.0" />
+    <PackageReference Include="Azure.Identity" Version="1.13.2" />
+    <!-- OneLake table discovery + DROP go through the ADLS Gen2 / OneLake DFS endpoint directly (the Azure SDK,
+         NOT DuckDB's azure extension): GetPaths enumerates Tables/<table> (flat) or Tables/<schema>/<table>
+         (schema-enabled) — immune to the duckdb-azure mid-path glob bug (PR #174) and the Fabric ListTables 400
+         on schema-enabled lakehouses, and free of SQL-endpoint sync lag — and DeleteDirectory(recursive) powers
+         DROP TABLE (DuckDB's azure FileSystem has no RemoveDirectory). The Fabric API is kept only for the
+         schema-enabled flag (GetLakehouse.DefaultSchema) + name->GUID resolution. Same SP credential throughout. -->
+    <PackageReference Include="Azure.Storage.Files.DataLake" Version="12.21.0" />
+    <!-- S3 conditional-PUT commit rename (multi-writer Delta commits on S3/MinIO; httpfs's
+         exclusive-create is unguarded there) — see S3CommitFileSystem. -->
+    <PackageReference Include="AWSSDK.S3" Version="4.*" />
+    <!-- Microsoft.Data.SqlClient: the SQL Server backend (Fabricator.SqlServer) + the DAX SQL-endpoint path. The
+         Delta provider no longer uses it (OneLake discovery moved to the DFS endpoint above). -->
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="6.0.2" />
+  </ItemGroup>
+
+  <!-- Lakehouse (Delta) reader: Curt Hagenlocher's engineered-wood (pure C#), IO delegated to DuckDB's
+       FileSystem via the host reverse-callbacks. Sibling repo at D:\repos\engineered-wood (Apache.Arrow 23.0.0
+       aligned, net10.0). SPIKE — see docs/filesystem-bridge.md. -->
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\engineered-wood\src\EngineeredWood.DeltaLake.Table\EngineeredWood.DeltaLake.Table.csproj" />
+  </ItemGroup>
+
+</Project>

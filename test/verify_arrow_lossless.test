@@ -1,13 +1,13 @@
 # name: test/verify_arrow_lossless.test
 # description: a global arrow_lossless_conversion=true must not pollute our write type mapping (the C++<->C# boundary forces standard Arrow)
-# group: [mssql_net]
+# group: [fabricator]
 
-require mssql_net
+require fabricator
 
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql_net);
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
 
 statement ok
 DROP TABLE IF EXISTS db.dbo.lossless_bool;
@@ -21,7 +21,7 @@ CREATE TABLE db.dbo.lossless_bool AS SELECT true AS b, 7 AS i;
 
 # BOOLEAN must still land as BIT (not SMALLINT), and the int as INT.
 query T
-SELECT DATA_TYPE FROM mssql_net_query('db',
+SELECT DATA_TYPE FROM fabricator_query('db',
   'SELECT CAST(DATA_TYPE AS VARCHAR(16)) AS DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS
    WHERE TABLE_NAME = ''lossless_bool'' ORDER BY ORDINAL_POSITION');
 ----
