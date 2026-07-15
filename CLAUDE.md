@@ -85,10 +85,17 @@ sync — RunCopy is synchronous). **`DeltaCatalog.cs` is now FULLY converted too
 (`ReadFilterValues`; `ExecuteDelete`/`ExecuteUpdate` — their rowid/update-stream drains extracted into
 `CollectRowIds`/`ParseUpdateStream` async-core helpers so the txn/rewrite branching stays sync; the S3-rename
 copy+delete fallback → `MoveFilesByCopy`). All open EW directly (or block once on a DeltaReader/DeltaWriter leaf
-wrapper). **Remaining sync-over-async sites (the prescribed incremental follow-up, leaf-first,
-`verify_delta_catalog_*` after each, never a blind sweep): the `DeltaGlobalTableFunction` reader filter-loop
-(one site) + the whole `OneLakeForwardFs` file.** The ambient-loss landmine stays disarmed (AsyncLocal, `0533eb7`).
-Adopt the sync-wrapper→async-core shape for NEW code now.
+wrapper). **The `DeltaGlobalTableFunction` reader filter-loop (`ReadValues`) is converted too, and `OneLakeForwardFs`
+was found ALREADY conformant** — every one of its methods has a SINGLE async call blocked once at the top (the
+documented block-once shape; `Glob` is already a proper wrapper→core), which IS the convention (the per-await
+anti-pattern only arises in MULTI-await methods; a single-await method blocking once is correct as-is). **⇒ the Delta
+bridge sync-over-async cleanup is COMPLETE** (DeltaReader / DeltaWriter / DeltaCatalog / DeltaGlobalTableFunction all
+converted; OneLakeForwardFs conformant) — verified the FULL delta sweep green after each increment (commits `38a9e7f`
+DeltaReader+EW-variant-fix / `382eda2` DeltaCatalog helpers / `a2fdb98` DeltaWriter / `97ca5f8` DeltaCatalog
+orchestrators+stream-loops / + this final `ReadValues`). Any remaining `.GetAwaiter().GetResult()` in the Delta bridge
+is now a single-blocking-point sync wrapper, not a per-await site. The ambient-loss landmine stays disarmed
+(AsyncLocal, `0533eb7`). Adopt the sync-wrapper→async-core shape for NEW code now. (The SQL Server / DAX bridges'
+sync-over-async, if any, stay the same incremental convention when next touched — they were never the Delta hot path.)
 
 **Rename-scope gap FIXED en route (2026-07-15):** the FABRICATOR rename (`2a26b7a`) renamed the C++ variant marker
 `kVariantExtensionName` → `"fabricator.variant"` but engineered-wood (a SIBLING repo, out of the blanket rename's

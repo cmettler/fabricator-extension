@@ -93,6 +93,9 @@ public sealed class DeltaGlobalTableFunction : ITableFunction
         }
 
         private static IReadOnlyList<object?> ReadValues(IArrowArrayStream? filterValues)
+            => ReadValuesAsync(filterValues).GetAwaiter().GetResult();
+
+        private static async Task<IReadOnlyList<object?>> ReadValuesAsync(IArrowArrayStream? filterValues)
         {
             if (filterValues is null)
             {
@@ -100,7 +103,7 @@ public sealed class DeltaGlobalTableFunction : ITableFunction
             }
             using (filterValues)
             {
-                var batch = filterValues.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+                var batch = await filterValues.ReadNextRecordBatchAsync().ConfigureAwait(false);
                 if (batch is null)
                 {
                     return System.Array.Empty<object?>();
