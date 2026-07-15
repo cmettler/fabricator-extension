@@ -22,7 +22,7 @@ namespace Fabricator.Bridge;
 /// <see cref="Token"/> is driven only by an optional linked token — behavior-neutral (a never-tripped token is
 /// identical to passing <c>default</c>).</para>
 /// </summary>
-internal sealed class InterruptScope : IDisposable
+public sealed class InterruptScope : IDisposable
 {
     // ~50 ms: imperceptible to a human Ctrl+C, and the poll is one atomic-read P/Invoke — negligible overhead.
     private const int PollMs = 50;

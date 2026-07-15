@@ -10,8 +10,13 @@ namespace Fabricator.Bridge;
 /// Streams a <see cref="DbDataReader"/> result set to the C++ host as Arrow
 /// record batches, one batch per <see cref="ReadNextRecordBatchAsync"/> call.
 /// Backend-agnostic (any ADO.NET provider); owns and disposes the reader,
-/// command, and connection. Reads synchronously so the Arrow C-stream exporter
-/// (which blocks on the returned task) never deadlocks.
+/// command, and connection. Rows are fetched with <c>ReadAsync</c> so a query
+/// interrupt (Ctrl+C / timeout) can cancel a blocking network fetch via the
+/// optional <see cref="InterruptScope"/>; the Arrow C-stream exporter still
+/// blocks once on the returned task (safe — the hostfxr CLR has no
+/// SynchronizationContext, so sync-over-async can't deadlock). See
+/// docs/cancellation.md. When no scope is supplied the token is <c>default</c>
+/// and behavior is identical to a plain synchronous read.
 /// </summary>
 public sealed class DbDataReaderArrowStream : IArrowArrayStream
 {
@@ -21,16 +26,21 @@ public sealed class DbDataReaderArrowStream : IArrowArrayStream
     private readonly IArrowType[] _columnTypes;
     private readonly int _batchSize;
     private readonly bool _ownsConnection;
+    private readonly InterruptScope? _interrupt;
+    private readonly CancellationToken _token;
     private bool _done;
 
     public DbDataReaderArrowStream(DbConnection connection, DbCommand command, DbDataReader reader,
-                                   int batchSize = 2048, bool ownsConnection = true)
+                                   int batchSize = 2048, bool ownsConnection = true,
+                                   InterruptScope? interrupt = null)
     {
         _connection = connection;
         _command = command;
         _reader = reader;
         _batchSize = batchSize;
         _ownsConnection = ownsConnection;
+        _interrupt = interrupt;
+        _token = interrupt?.Token ?? default;
 
         var columns = reader.GetColumnSchema();
         var fields = new Field[columns.Count];
@@ -46,9 +56,9 @@ public sealed class DbDataReaderArrowStream : IArrowArrayStream
     public Schema Schema { get; }
 
     public ValueTask<RecordBatch?> ReadNextRecordBatchAsync(CancellationToken cancellationToken = default)
-        => new(ReadNextBatch());
+        => ReadNextBatchAsync();
 
-    private RecordBatch? ReadNextBatch()
+    private async ValueTask<RecordBatch?> ReadNextBatchAsync()
     {
         if (_done)
         {
@@ -62,7 +72,10 @@ public sealed class DbDataReaderArrowStream : IArrowArrayStream
         }
 
         int rows = 0;
-        while (rows < _batchSize && _reader.Read())
+        // ReadAsync honors the interrupt token — a blocking network packet fetch cancels on Ctrl+C/timeout.
+        // For a provider without true async (e.g. ADOMD) DbDataReader.ReadAsync falls back to a synchronous
+        // read, so this is safe everywhere; for buffered rows it completes synchronously (no overhead spike).
+        while (rows < _batchSize && await _reader.ReadAsync(_token).ConfigureAwait(false))
         {
             for (int i = 0; i < appenders.Length; i++)
             {
@@ -102,5 +115,7 @@ public sealed class DbDataReaderArrowStream : IArrowArrayStream
         {
             _connection.Dispose();
         }
+        // Stop the interrupt poller before the ClientContext it polls is freed.
+        _interrupt?.Dispose();
     }
 }

@@ -845,6 +845,11 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 pinned is not null ? "pinned" : "pooled", readYourWrites ? " ryw" : "", txnId,
                 parameters?.Count ?? 0, Trunc(sql));
         }
+        // A DATA scan can run long (slow ExecuteReader, big row set) — wire a query-interrupt scope so Ctrl+C /
+        // timeout cancels the async SqlClient calls. A METADATA read (readYourWrites) is short + happens at
+        // bind/catalog time (no live scan context to poll), so it stays uncancelled. See docs/cancellation.md.
+        var interrupt = readYourWrites ? null : new InterruptScope(AmbientOpener.Current);
+        var token = interrupt?.Token ?? default;
         if (pinned is not null)
         {
             var pinnedCommand = pinned.CreateCommand();
@@ -852,8 +857,18 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             pinnedCommand.CommandType = CommandType.Text;
             pinnedCommand.Transaction = pinnedTransaction;
             AddParameters(pinnedCommand, parameters);
-            var pinnedReader = pinnedCommand.ExecuteReader();
-            return new DbDataReaderArrowStream(pinned, pinnedCommand, pinnedReader, ownsConnection: false);
+            try
+            {
+                var pinnedReader = pinnedCommand.ExecuteReaderAsync(token).GetAwaiter().GetResult();
+                return new DbDataReaderArrowStream(pinned, pinnedCommand, pinnedReader,
+                                                   ownsConnection: false, interrupt: interrupt);
+            }
+            catch
+            {
+                pinnedCommand.Dispose();
+                interrupt?.Dispose();
+                throw;
+            }
         }
 
         SqlConnection? connection = null;
@@ -861,18 +876,19 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         try
         {
             connection = OpenConnection();
-            connection.Open();
+            connection.OpenAsync(token).GetAwaiter().GetResult();
             command = connection.CreateCommand();
             command.CommandText = sql;
             command.CommandType = CommandType.Text;
             AddParameters(command, parameters);
-            var reader = command.ExecuteReader();
-            return new DbDataReaderArrowStream(connection, command, reader);
+            var reader = command.ExecuteReaderAsync(token).GetAwaiter().GetResult();
+            return new DbDataReaderArrowStream(connection, command, reader, interrupt: interrupt);
         }
         catch
         {
             command?.Dispose();
             connection?.Dispose();
+            interrupt?.Dispose();
             throw;
         }
     }
