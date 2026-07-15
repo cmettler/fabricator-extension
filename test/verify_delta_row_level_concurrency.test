@@ -1,11 +1,14 @@
 # name: test/verify_delta_row_level_concurrency.test
-# description: ROW-LEVEL CONCURRENCY (v1, Databricks-style — beyond OSS Spark's file-level conflicts):
-#              concurrent DML touching the SAME FILE no longer conflicts when the touched ROWS are
-#              disjoint — the COMMIT rebase re-unions the deletion vectors (RebaseDvDmlActionsAsync);
-#              the SAME row modified by both writers is a row-level conflict; a concurrent
-#              rewrite/compaction of a touched file remains a (path-level) conflict in v1. Applies under
-#              write_serializable (the default); `serializable` keeps the strict file-level checks.
-#              DV tables only (copy-on-write rewrites can't reconcile). Set ARROWNET_DELTA_WRITE_DIR.
+# description: ROW-LEVEL CONCURRENCY (v1+v2, Databricks-style and beyond — OSS Spark/delta-rs/kernel
+#              are all file-level; Databricks itself still conflicts with compaction): concurrent DML
+#              touching the SAME FILE composes when the touched ROWS are disjoint (the COMMIT rebase
+#              re-unions the deletion vectors), and v2 REMAPS rows ACROSS a concurrent rewrite
+#              (OPTIMIZE / copy-on-write) by STABLE ROW ID with the row's commit version as the
+#              concurrent-modification discriminator (RemapRowsAcrossRewriteAsync). The SAME row
+#              modified by both writers is a row-level conflict. Applies under write_serializable (the
+#              default; read checks are replaced by the row-level write validation); `serializable`
+#              keeps the strict file-level checks. DV + row-tracking tables (the defaults).
+#              Set ARROWNET_DELTA_WRITE_DIR.
 # group: [mssql_net]
 
 require mssql_net
@@ -110,28 +113,36 @@ SELECT s FROM rl.main.t WHERE id = 10;
 ----
 B
 
-# ---- 5. a concurrent OPTIMIZE (file rewritten away) remains a conflict in v1 ----
+# ---- 5. v2: a concurrent OPTIMIZE (file rewritten away) now COMPOSES — the DELETE's rows are
+#         REMAPPED onto the compacted file by STABLE ROW ID (beyond Databricks, which still conflicts
+#         with compaction). The unpushable WHERE also makes this a whole-table read — read checks are
+#         replaced by the row-level write validation under write_serializable. ----
 
 statement ok con1
 BEGIN;
 
+# unpushable predicate (whole-table read); matches id=1 only
 statement ok con1
-DELETE FROM rl.main.t WHERE id = 1;
+DELETE FROM rl.main.t WHERE id % 11 = 1;
 
 query I con2
 SELECT mssql_net_exec('rl', 'OPTIMIZE main.t');
 ----
 0
 
-statement error con1
+statement ok con1
 COMMIT;
+
+# the delete landed on the COMPACTED file (id 1 gone; everything else intact)
+query II
+SELECT count(*), sum(id) FROM rl.main.t;
 ----
-transaction conflict
+5	33
 
 query I
 SELECT count(*) FROM rl.main.t WHERE id = 1;
 ----
-1
+0
 
 # ---- 6. `serializable` keeps the STRICT file-level behavior (disjoint rows still conflict) ----
 
@@ -156,7 +167,7 @@ transaction conflict
 query II
 SELECT count(*), sum(id) FROM rl.main.t;
 ----
-5	29
+4	28
 
 statement ok
 DETACH rlser;
@@ -185,6 +196,68 @@ query II
 SELECT count(*), sum(id) FROM rl.main.p;
 ----
 17	177
+
+# ---- 8. v2: buffered UPDATE + concurrent OPTIMIZE compose (pre-image remapped, post-image kept) ----
+
+statement ok
+CREATE TABLE rl.main.q AS SELECT r AS id, 'a' || r AS v FROM range(1, 7) t(r);
+
+statement ok
+INSERT INTO rl.main.q SELECT r, 'a' || r FROM range(7, 11) t(r);
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+UPDATE rl.main.q SET v = 'x' WHERE id = 3;
+
+query I con2
+SELECT mssql_net_exec('rl', 'OPTIMIZE main.q');
+----
+0
+
+statement ok con1
+COMMIT;
+
+query IT
+SELECT id, v FROM rl.main.q WHERE id IN (2, 3, 4) ORDER BY id;
+----
+2	a2
+3	x
+4	a4
+
+query I
+SELECT count(*) FROM rl.main.q;
+----
+10
+
+# ---- 9. same row THROUGH a rewrite: the racer compacts AND deletes the row → row-level conflict
+#         (the stable id is gone from the post-rewrite state) ----
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+DELETE FROM rl.main.q WHERE id = 5;
+
+query I con2
+SELECT mssql_net_exec('rl', 'OPTIMIZE main.q');
+----
+0
+
+statement ok con2
+DELETE FROM rl.main.q WHERE id = 5;
+
+statement error con1
+COMMIT;
+----
+row-level conflict
+
+# deleted exactly once (by the racer)
+query I
+SELECT count(*) FROM rl.main.q;
+----
+9
 
 statement ok
 DETACH rl;

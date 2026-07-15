@@ -177,10 +177,12 @@ statement kind when single-kind (WRITE/DELETE/UPDATE/"ADD COLUMNS"/…), `TRANSA
 
 Under `write_serializable`, before the checks below, DML deletion-vector pairs are REBASED onto the
 latest snapshot (`RebaseDvDmlActionsAsync`): a concurrent DV swap of the same file re-unions when the
-touched rows are disjoint (row-level concurrency, §10.4) — so the delete/delete check then passes
-naturally, and the read checks skip DV-swap commits (`rowLevelDml`). Same-row overlap throws the
-row-level conflict; a concurrently rewritten/compacted file stays a conflict. Under `serializable`
-no rebase happens — everything below applies strictly to the pinned-resolved actions.
+touched rows are disjoint, and a concurrent REWRITE (OPTIMIZE / copy-on-write) of a touched file
+REMAPS the rows onto the new files by stable row id (`RemapRowsAcrossRewriteAsync`, row-level
+concurrency §10.4) — so the delete/delete check then passes naturally, and the read-set checks are
+fully skipped (`rowLevelDml` — the row-level write validation replaces them; same-row overlap or a
+concurrently updated/deleted target row throws the row-level conflict). Under `serializable` no
+rebase happens — everything below applies strictly to the pinned-resolved actions.
 
 When the table moved past `PinnedVersion`, `CheckLogicalRebaseAsync` walks the concurrent commits
 `pinned+1 … latest` and runs four checks. Row-tracking ids play **no** role in detection — the
@@ -376,12 +378,23 @@ per statement); the buffered-txn read checks relax to row level too (a concurren
 the transaction merely READ no longer aborts — `CheckLogicalRebaseAsync(rowLevelDml:)`). Applies
 under `write_serializable` only ( `serializable` keeps strict file-level checks) and to DV tables
 only (copy-on-write rewrites can't reconcile — the `deletion_vectors false` PolyBase recipe keeps
-file-level conflicts). v1 boundary: a concurrent **rewrite/compaction** of a touched file (OPTIMIZE,
-CoW) is still a path-level conflict — the possible v2 remaps rows across rewrites via
-`__delta_row_id`. Autocommit DML gets the same reconciliation via a bounded commit-retry loop.
-Test: `test/verify_delta_row_level_concurrency.test` (49 — disjoint same-file DELETE/UPDATE compose,
-same-row conflicts, OPTIMIZE-during conflicts, serializable strict, three-writer pile-up;
-kernel-validated readback).
+file-level conflicts). **v2 (same day): the rewrite boundary is GONE — a concurrent OPTIMIZE /
+copy-on-write rewrite of a touched file REMAPS instead of conflicting** (`RemapRowsAcrossRewriteAsync`):
+the tombstoned source file (still on storage until VACUUM) resolves the target rows' stable ids +
+ORIGINAL commit versions; the post-rewrite files are scanned for those ids (compaction-shaped
+`dataChange=false` adds first, early exit; fresh appends can't hold them — their derived ids sit above
+the base HWM); the row's **commit version is the concurrent-modification discriminator** (relocated
+untouched row keeps its original version; a concurrently UPDATED row carries the rewrite's version ⇒
+row-level conflict; an id found nowhere was concurrently DELETED ⇒ row-level conflict); the found
+positions become DV pairs on the NEW files. Requires row tracking (the default) — Databricks itself
+still conflicts with compaction here. Under `rowLevelDml` the read-set checks are fully replaced by
+the row-level write validation (WriteSerializable's definition: reads don't serialize — matches
+Databricks' matrix, where inserts/DML never conflict with a WS transaction's reads). Autocommit DML
+gets the same reconciliation via a bounded commit-retry loop.
+Test: `test/verify_delta_row_level_concurrency.test` (70 — disjoint same-file DELETE/UPDATE compose,
+same-row conflicts, DELETE and buffered UPDATE THROUGH a concurrent OPTIMIZE compose,
+same-row-through-rewrite conflicts, serializable strict, three-writer pile-up; kernel-validated
+readback of the remapped commits).
 
 ### 10.5 WriteSerializable's "state that never existed" — PARITY (same artifact)
 

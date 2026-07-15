@@ -3320,12 +3320,27 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   unpartitioned + per-statement). Semantics note: position-targeted DML can't produce write skew
   (SET values derive only from the matched row), so the relaxation is serial-equivalent. Transactions
   §6e REWRITTEN (the old whole-table-read deleteRead abort now COMMITS — both deletes land — with a
-  `serializable` strict counterpart pinned; suite 941); `test/verify_delta_row_level_concurrency.test`
-  (49 — same-file disjoint DELETE/UPDATE compose, same-row conflicts, buffered UPDATE post-image
-  rebases + keeps row-tracking id, OPTIMIZE-during conflicts, serializable strict, three-writer
-  pile-up); kernel reads the rebased commits exactly; dv 48 / dv_default 58 / update 63 / delete 28 /
-  changes 73 / row_tracking_virtual 299 / txn_version 51 / optimize 40 + EW 168 & 147 (all TFMs)
-  green. Semantics doc: docs/delta-transactions.md §6 + §10.4 (now PARITY+). **IDEMPOTENT APPENDS (2026-07-11) — Delta
+  `serializable` strict counterpart pinned; suite 941). **v2 (same day): the REWRITE boundary is gone —
+  a concurrent OPTIMIZE / CoW rewrite of a touched file REMAPS instead of conflicting**
+  (EW `RemapRowsAcrossRewriteAsync`, invoked from the rebase when a touched path vanished): the
+  TOMBSTONED source file (parquet on storage until VACUUM) is read at the base snapshot to resolve the
+  target rows' STABLE IDS + ORIGINAL commit versions (materialized columns else baseRowId+position /
+  defaultRowCommitVersion); the post-rewrite files (active-in-to \ active-in-from; compaction-shaped
+  dataChange=false candidates first, early exit; fresh appends can't hold the ids — derived ids sit
+  above the base HWM, so only materialized-id files match) are scanned for the ids; **the row's commit
+  version is the concurrent-modification discriminator** (relocated-untouched keeps its original
+  version — compaction + CoW pass-through both materialize it; concurrently UPDATED carries the
+  rewrite's version ⇒ row-level conflict; found NOWHERE ⇒ concurrently deleted ⇒ conflict — a
+  DV-hidden row resolves here too); found positions become DV pairs on the NEW files. Requires row
+  tracking (the default; no-tracking tables keep the path-level conflict). **Databricks itself still
+  conflicts on compaction — v2 is capability beyond ANY Delta engine.** The rowLevelDml read-check
+  relaxation is now a FULL skip (the row-level write validation replaces deleteRead+append checks —
+  WriteSerializable's reads-don't-serialize definition; matches Databricks' WS matrix). Racer test now
+  70 (DELETE + buffered UPDATE THROUGH a concurrent OPTIMIZE compose — value lands on the compacted
+  file, post-image kept; same-row-through-rewrite conflicts via the version discriminator / not-found);
+  kernel reads the remapped commits exactly; dv 48 / dv_default 58 / update 63 / delete 28 /
+  changes 73 / row_tracking_virtual 299 / txn_version 51 / optimize 40 / transactions 941 + EW 168 &
+  147 (all TFMs) green. Semantics doc: docs/delta-transactions.md §6 + §10.4 (now PARITY+). **IDEMPOTENT APPENDS (2026-07-11) — Delta
   APPLICATION TRANSACTIONS (the `txn` action; duckdb-delta/Spark txnAppId parity, additive metadata kinds
   10/11 — NO ABI bump):** `CALL arrownet_delta_set_transaction_version(catalog, 'schema.table', app_id,
   version [, expected_previous])` PARKS the version on the current EXPLICIT transaction
