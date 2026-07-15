@@ -1420,6 +1420,9 @@ public sealed class DeltaCatalog : IBackendCatalog
     }
 
     private static IReadOnlyList<object?> ReadFilterValues(IArrowArrayStream? filterValues)
+        => ReadFilterValuesAsync(filterValues).GetAwaiter().GetResult();
+
+    private static async Task<IReadOnlyList<object?>> ReadFilterValuesAsync(IArrowArrayStream? filterValues)
     {
         if (filterValues is null)
         {
@@ -1427,7 +1430,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         }
         using (filterValues)
         {
-            var batch = filterValues.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+            var batch = await filterValues.ReadNextRecordBatchAsync().ConfigureAwait(false);
             if (batch is null)
             {
                 return System.Array.Empty<object?>();
@@ -2758,6 +2761,10 @@ public sealed class DeltaCatalog : IBackendCatalog
     // 0's put-if-absent is the arbiter — the pre-check just gives the clear error).
     private void FlushCreateTransaction(nint opener, string tablePath, long txnId,
                                         DeltaTxnBuffer.PendingAppends pending)
+        => FlushCreateTransactionAsync(opener, tablePath, txnId, pending).GetAwaiter().GetResult();
+
+    private async Task FlushCreateTransactionAsync(nint opener, string tablePath, long txnId,
+                                        DeltaTxnBuffer.PendingAppends pending)
     {
         if (TableExists(tablePath))
         {
@@ -2790,8 +2797,8 @@ public sealed class DeltaCatalog : IBackendCatalog
             var w2 = _nativeWrite && NativeParquetDataFileWriter.Available
                 ? new NativeParquetDataFileWriter(tablePath)
                 : null;
-            var t2 = EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(fs2, DeltaWriter.Options(null, w2))
-                .AsTask().GetAwaiter().GetResult();
+            var t2 = await EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(fs2, DeltaWriter.Options(null, w2))
+                .ConfigureAwait(false);
             try
             {
                 var all = new List<EngineeredWood.DeltaLake.Table.WrittenDataFile>(pending.Files);
@@ -2800,17 +2807,17 @@ public sealed class DeltaCatalog : IBackendCatalog
                     // identityValuesPreGenerated: the batches carry values generated at statement time
                     // against the chained marks; regenerating here (the committing writer's default)
                     // would double-consume the mark and diverge from read-your-writes.
-                    all.AddRange(t2.WriteDataFilesAsync(pending.Batches, default,
+                    all.AddRange(await t2.WriteDataFilesAsync(pending.Batches, default,
                             identityValuesPreGenerated: pending.PendingIdentityHwm.Count > 0)
-                        .AsTask().GetAwaiter().GetResult());
+                        .ConfigureAwait(false));
                 }
-                v = t2.CommitDataFilesAsync(all, DeltaWriteMode.Append, cancellationToken: default,
+                v = await t2.CommitDataFilesAsync(all, DeltaWriteMode.Append, cancellationToken: default,
                         identityValuesPreGenerated: pending.PendingIdentityHwm.Count > 0)
-                    .AsTask().GetAwaiter().GetResult();
+                    .ConfigureAwait(false);
             }
             finally
             {
-                t2.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                await t2.DisposeAsync().ConfigureAwait(false);
             }
         }
         else if (pending.Batches.Count > 0)
@@ -2834,6 +2841,10 @@ public sealed class DeltaCatalog : IBackendCatalog
     // positions are snapshot-coupled.
     private void FlushDmlTransaction(nint opener, string tablePath, long txnId,
                                      DeltaTxnBuffer.PendingAppends pending)
+        => FlushDmlTransactionAsync(opener, tablePath, txnId, pending).GetAwaiter().GetResult();
+
+    private async Task FlushDmlTransactionAsync(nint opener, string tablePath, long txnId,
+                                     DeltaTxnBuffer.PendingAppends pending)
     {
         // Effective isolation = the TABLE's delta.isolationLevel property (cached on the buffer), NOT the
         // catalog-wide flag — so our OCC check + row-level relaxation conform to the guarantee the table
@@ -2843,8 +2854,8 @@ public sealed class DeltaCatalog : IBackendCatalog
         var dataFileWriter = _nativeWrite && NativeParquetDataFileWriter.Available
             ? new NativeParquetDataFileWriter(tablePath)
             : null;
-        var table = EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(fs, DeltaWriter.Options(null, dataFileWriter))
-            .AsTask().GetAwaiter().GetResult();
+        var table = await EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(fs, DeltaWriter.Options(null, dataFileWriter))
+            .ConfigureAwait(false);
         try
         {
             long pinned = pending.PinnedVersion!.Value;
@@ -2854,16 +2865,16 @@ public sealed class DeltaCatalog : IBackendCatalog
             // committing on top of the newer snapshot is safe.
             var pinnedSnap = table.CurrentSnapshot.Version == pinned
                 ? table.CurrentSnapshot
-                : table.GetSnapshotAtVersionAsync(pinned).AsTask().GetAwaiter().GetResult();
+                : await table.GetSnapshotAtVersionAsync(pinned).ConfigureAwait(false);
             var files = new List<EngineeredWood.DeltaLake.Table.WrittenDataFile>(pending.Files);
             if (pending.Batches.Count > 0)
             {
                 DeltaNullability.ValidateBatches(pending.Batches,
                     pending.PendingDeltaSchema ?? pinnedSnap.Schema,
                     tablePath.Substring(tablePath.LastIndexOf('/') + 1));
-                files.AddRange(table.WriteDataFilesAsync(pending.Batches, default,
+                files.AddRange(await table.WriteDataFilesAsync(pending.Batches, default,
                         schemaOverride: pending.PendingDeltaSchema)
-                    .AsTask().GetAwaiter().GetResult());
+                    .ConfigureAwait(false));
             }
             // Split the delete set: committed-file ordinals resolve against the PINNED snapshot
             // (remove+add DV pairs); pending-file ordinals (0x780000+idx, this transaction's own eager
@@ -2885,9 +2896,9 @@ public sealed class DeltaCatalog : IBackendCatalog
                     deletes[kv.Key] = kv.Value;
                 }
             }
-            var (dvActions, rowsDeleted) = table.ComputeDeletionVectorActionsAsync(deletes,
+            var (dvActions, rowsDeleted) = await table.ComputeDeletionVectorActionsAsync(deletes,
                     resolveAgainst: pinnedSnap)
-                .AsTask().GetAwaiter().GetResult();
+                .ConfigureAwait(false);
             rowsDeleted += pendingRowsDeleted;
             // The buffered schema change (metaData + merged protocol upgrade) joins the SAME commit.
             // Eagerly-generated identity high-water marks compose INTO that metaData action (a commit
@@ -2952,9 +2963,9 @@ public sealed class DeltaCatalog : IBackendCatalog
                 {
                     try
                     {
-                        currentDv = table.RebaseDvDmlActionsAsync(dvActions, deletes, pinnedSnap,
+                        currentDv = await table.RebaseDvDmlActionsAsync(dvActions, deletes, pinnedSnap,
                                 table.CurrentSnapshot)
-                            .AsTask().GetAwaiter().GetResult();
+                            .ConfigureAwait(false);
                     }
                     catch (EngineeredWood.DeltaLake.DeltaConflictException ex)
                     {
@@ -2993,12 +3004,12 @@ public sealed class DeltaCatalog : IBackendCatalog
                         pending.ReadPredicates.Count, pending.ReadWholeTable, tableSer);
                     try
                     {
-                        table.CheckLogicalRebaseAsync(pinnedSnap, extra,
+                        await table.CheckLogicalRebaseAsync(pinnedSnap, extra,
                                 readPredicates: pending.ReadPredicates,
                                 readWholeTable: pending.ReadWholeTable,
                                 serializable: tableSer,
                                 rowLevelDml: !tableSer)
-                            .AsTask().GetAwaiter().GetResult();
+                            .ConfigureAwait(false);
                     }
                     catch (EngineeredWood.DeltaLake.DeltaConflictException ex)
                     {
@@ -3015,12 +3026,12 @@ public sealed class DeltaCatalog : IBackendCatalog
                 }
                 try
                 {
-                    long v = table.CommitDataFilesAsync(files, DeltaWriteMode.Append, cancellationToken: default,
+                    long v = await table.CommitDataFilesAsync(files, DeltaWriteMode.Append, cancellationToken: default,
                             extraActions: extra, expectedVersion: table.CurrentSnapshot.Version,
                             operation: operation,
                             identityValuesPreGenerated: pending.PendingIdentityHwm.Count > 0,
                             deletedPositionsByFileIndex: pendingFileDeletes)
-                        .AsTask().GetAwaiter().GetResult();
+                        .ConfigureAwait(false);
                     _log.LogInformation(
                         "delta txn {Txn} commit {Path}: v{Version} op={Op} (files={Files}, rows+={Rows}, rows-={Deleted})",
                         txnId, tablePath, v, operation, files.Count, pending.Rows, rowsDeleted);
@@ -3030,16 +3041,16 @@ public sealed class DeltaCatalog : IBackendCatalog
                     when (attempt < DeltaWriter.MaxCommitAttempts)
                 {
                     // Another writer took the version mid-flush — reopen at the new latest and re-validate.
-                    table.DisposeAsync().AsTask().GetAwaiter().GetResult();
-                    table = EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(
+                    await table.DisposeAsync().ConfigureAwait(false);
+                    table = await EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(
                             fs, DeltaWriter.Options(null, dataFileWriter))
-                        .AsTask().GetAwaiter().GetResult();
+                        .ConfigureAwait(false);
                 }
             }
         }
         finally
         {
-            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            await table.DisposeAsync().ConfigureAwait(false);
         }
     }
 
@@ -3124,13 +3135,18 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// <summary>DELETE = rowid-based via Delta row tracking: <paramref name="keys"/> is a stream whose single
     /// <c>_metadata.row_id</c> Int64 column holds the stable ids of the rows to delete (DuckDB's scan produced
     /// them, applying the WHERE). Collected and applied via deletion vectors (<see cref="DeltaReader.DeleteByRowIds"/>).</summary>
-    public long ExecuteDelete(string schemaName, string tableName, IArrowArrayStream keys)
+    // Drains a rowid stream (a single Int64 _metadata.row_id column) to a list. The stream consumption is
+    // the sole async step of ExecuteDelete, isolated here so the delete's txn/DV branching stays synchronous.
+    private static List<long> CollectRowIds(IArrowArrayStream keys)
+        => CollectRowIdsAsync(keys).GetAwaiter().GetResult();
+
+    private static async Task<List<long>> CollectRowIdsAsync(IArrowArrayStream keys)
     {
-        var opener = Opener();
         var ids = new List<long>();
         using (keys)
         {
-            while (keys.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult() is { } batch)
+            RecordBatch? batch;
+            while ((batch = await keys.ReadNextRecordBatchAsync().ConfigureAwait(false)) is not null)
             {
                 using (batch)
                 {
@@ -3153,6 +3169,13 @@ public sealed class DeltaCatalog : IBackendCatalog
                 }
             }
         }
+        return ids;
+    }
+
+    public long ExecuteDelete(string schemaName, string tableName, IArrowArrayStream keys)
+    {
+        var opener = Opener();
+        var ids = CollectRowIds(keys);
         if (ids.Count == 0)
         {
             return 0;
@@ -3246,17 +3269,22 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// <c>_metadata.row_id</c> (last column). We re-scan the table with rowids, replace the SET columns on the
     /// matched rows (rebuilt as clean Apache.Arrow batches), and OVERWRITE via the proven write path — so the
     /// output is plain Delta + standard-readable (delta-kernel/Spark/Fabric). Returns rows updated.</summary>
-    public long ExecuteUpdate(string schemaName, string tableName, int setColumnCount, IArrowArrayStream data)
-    {
-        var opener = Opener();
-        var path = TablePath(schemaName, tableName);
+    // Drains the UPDATE stream — SET-column values (cols 0..setColumnCount-1, named by the target column) plus
+    // the transient _metadata.row_id (last column) — into (SET column names, rowid -> new SET values). The stream
+    // consumption is the sole async step of ExecuteUpdate, isolated here so the rewrite logic stays synchronous.
+    private static (List<string> SetColNames, Dictionary<long, object?[]> Updates) ParseUpdateStream(
+        IArrowArrayStream data, int setColumnCount)
+        => ParseUpdateStreamAsync(data, setColumnCount).GetAwaiter().GetResult();
 
-        // 1. Parse the update stream: rowid -> new SET values (aligned to the SET column order).
+    private static async Task<(List<string> SetColNames, Dictionary<long, object?[]> Updates)> ParseUpdateStreamAsync(
+        IArrowArrayStream data, int setColumnCount)
+    {
         var setColNames = new List<string>();
         var updates = new Dictionary<long, object?[]>();
         using (data)
         {
-            while (data.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult() is { } b)
+            RecordBatch? b;
+            while ((b = await data.ReadNextRecordBatchAsync().ConfigureAwait(false)) is not null)
             {
                 using (b)
                 {
@@ -3290,6 +3318,17 @@ public sealed class DeltaCatalog : IBackendCatalog
                 }
             }
         }
+        return (setColNames, updates);
+    }
+
+    public long ExecuteUpdate(string schemaName, string tableName, int setColumnCount, IArrowArrayStream data)
+    {
+        var opener = Opener();
+        var path = TablePath(schemaName, tableName);
+
+        // 1. Parse the update stream: rowid -> new SET values (aligned to the SET column order). The stream
+        // drain is the sole async step, isolated in the helper so the rewrite logic below stays synchronous.
+        var (setColNames, updates) = ParseUpdateStream(data, setColumnCount);
         if (updates.Count == 0)
         {
             return 0;
@@ -3535,6 +3574,25 @@ public sealed class DeltaCatalog : IBackendCatalog
     // where the FS supports it, per-file copy+delete otherwise: object stores) and re-key the buffer.
     // The flush then creates the table at the FINAL path. Codec pending-creates park batches (no files)
     // — pure re-key.
+    // Object-store fallback for a directory move (no MoveDir on S3): copy each of the transaction's eager
+    // files to the new path and delete the source. The per-file IO is the sole async step.
+    private static void MoveFilesByCopy(nint opener, string oldPath, string newPath,
+                                        IReadOnlyList<EngineeredWood.DeltaLake.Table.WrittenDataFile> files)
+        => MoveFilesByCopyAsync(opener, oldPath, newPath, files).GetAwaiter().GetResult();
+
+    private static async Task MoveFilesByCopyAsync(nint opener, string oldPath, string newPath,
+                                        IReadOnlyList<EngineeredWood.DeltaLake.Table.WrittenDataFile> files)
+    {
+        var src = new DuckDbTableFileSystem(opener, oldPath);
+        var dst = new DuckDbTableFileSystem(opener, newPath);
+        foreach (var wf in files)
+        {
+            var bytes = await src.ReadAllBytesAsync(wf.RelativePath).ConfigureAwait(false);
+            await dst.WriteAllBytesAsync(wf.RelativePath, bytes).ConfigureAwait(false);
+            await src.DeleteAsync(wf.RelativePath).ConfigureAwait(false);
+        }
+    }
+
     private void RenamePendingCreated(long txnId, string schemaName, string tableName, string newName,
                                       DeltaTxnBuffer.PendingAppends pending)
     {
@@ -3562,14 +3620,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 {
                     // Object store without directory move (S3): the folder holds ONLY this
                     // transaction's eager files — copy each and delete the source.
-                    var src = new DuckDbTableFileSystem(opener, oldPath);
-                    var dst = new DuckDbTableFileSystem(opener, newPath);
-                    foreach (var wf in pending.Files)
-                    {
-                        var bytes = src.ReadAllBytesAsync(wf.RelativePath).AsTask().GetAwaiter().GetResult();
-                        dst.WriteAllBytesAsync(wf.RelativePath, bytes).AsTask().GetAwaiter().GetResult();
-                        src.DeleteAsync(wf.RelativePath).AsTask().GetAwaiter().GetResult();
-                    }
+                    MoveFilesByCopy(opener, oldPath, newPath, pending.Files);
                 }
             }
         }

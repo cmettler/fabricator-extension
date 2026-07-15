@@ -79,13 +79,16 @@ compaction_rowtracking/copy_format/decimal/temporal/schemas/constraints/rename).
 DeltaWriter `Write`/`Create`/`Materialize`/`MergeSchema` + `TryWriteStreaming` (the `out rowsWritten` case → its async
 core returns a `(long? Result, long RowsWritten)` tuple, the sync wrapper unpacks the out — the compiler enforces
 every return is a tuple, so a missed conversion is a build error not a silent bug; `TryStreamCreateFiles` was already
-sync — RunCopy is synchronous); DeltaCatalog `FlushDeferredFiles`/`WriteCdcFiles`/`TryEagerWriteBatches` (open EW
-directly, no delegation → single blocking point). **Remaining sync-over-async sites (the prescribed incremental
-follow-up, leaf-first, `verify_delta_catalog_*` after each, never a blind sweep): DeltaCatalog orchestrators
-(`FlushDmlTransaction` ~200-line txn hot path, `FlushCreateTransaction`) + the bulk stream-consuming loops + the
-`DeltaGlobalTableFunction` reader filter-loop + OneLakeForwardFs/…** (the orchestrators call `DeltaWriter.*` sync
-wrappers — now that DeltaWriter is a leaf, converting them next gives a clean single-block). The ambient-loss landmine
-stays disarmed (AsyncLocal, `0533eb7`). Adopt the sync-wrapper→async-core shape for NEW code now.
+sync — RunCopy is synchronous). **`DeltaCatalog.cs` is now FULLY converted too**: the flush helpers
+(`FlushDeferredFiles`/`WriteCdcFiles`/`TryEagerWriteBatches`), the orchestrators (`FlushDmlTransaction` — the
+~200-line buffered-DML commit/rebase hot path — and `FlushCreateTransaction`), and the stream-consuming paths
+(`ReadFilterValues`; `ExecuteDelete`/`ExecuteUpdate` — their rowid/update-stream drains extracted into
+`CollectRowIds`/`ParseUpdateStream` async-core helpers so the txn/rewrite branching stays sync; the S3-rename
+copy+delete fallback → `MoveFilesByCopy`). All open EW directly (or block once on a DeltaReader/DeltaWriter leaf
+wrapper). **Remaining sync-over-async sites (the prescribed incremental follow-up, leaf-first,
+`verify_delta_catalog_*` after each, never a blind sweep): the `DeltaGlobalTableFunction` reader filter-loop
+(one site) + the whole `OneLakeForwardFs` file.** The ambient-loss landmine stays disarmed (AsyncLocal, `0533eb7`).
+Adopt the sync-wrapper→async-core shape for NEW code now.
 
 **Rename-scope gap FIXED en route (2026-07-15):** the FABRICATOR rename (`2a26b7a`) renamed the C++ variant marker
 `kVariantExtensionName` → `"fabricator.variant"` but engineered-wood (a SIBLING repo, out of the blanket rename's
