@@ -1848,13 +1848,20 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `InterruptScope`; gated to data scans, short metadata reads stay uncancelled). **2b — bulk (INSERT/CTAS/COPY):**
   `BulkSession` builds an `InterruptScope(opener)` + `token.Register`s its existing `Complete(abort)` teardown
   (fault the channel → `WriteToServer` stops + rolls back AND a backpressure-parked `push_batch` unblocks — no
-  `WriteToServerAsync` needed); works for SQL bulk AND Delta streaming writes. **Load-bearing constraint found:**
-  `is_interrupted` derefs the opener as a `ClientContext*` and `AmbientOpener` is NEVER cleared, so interrupt
-  polling is only safe where the opener is set FRESH right before the op — the scan (`arrow_ingest`) and bulk
-  (`fabricator_insert`) do; **the DELETE/UPDATE modify operator does NOT set the opener**, so 2a/2b are safe but
-  **2c (DML async) must first add a `SetActiveOpener(&context)` to the modify operator** (C++, no ABI bump) — deferred
-  (DML is usually fast; lower value; `fabricator_exec` already has a fresh opener if wanted). **Remaining (deferred):
-  2c** DML async + **2d** `command_timeout` (`CancelAfter`, closes the hung-socket hole); **Tier 3** DAX/ADOMD via
+  `WriteToServerAsync` needed); works for SQL bulk AND Delta streaming writes. **2c — SQL DML/exec DONE
+  (`<pending-commit>`, C#-only):** `ExecuteNonQuery` (raw `fabricator_exec`), `ExecuteDelete`, `ExecuteUpdate` run
+  their writes with `ExecuteNonQueryAsync(token)` under an `InterruptScope(AmbientOpener.Current)` (chunked
+  DELETE/UPDATE loops share one scope) — a long rowid DELETE/UPDATE or slow `fabricator_exec` cancels.
+  **Load-bearing constraint (verified):** `is_interrupted` derefs the opener as a `ClientContext*` and
+  `AmbientOpener` is NEVER cleared, so polling is only safe where the opener is set FRESH right before the op —
+  and EVERY write path does: scan (`arrow_ingest`), bulk (`fabricator_insert`), **the DELETE/UPDATE modify
+  operator** (`Finalize` → `FabricatorSetActiveTxn` → `SetActiveOpener`, `fabricator_txn_util.hpp` — the earlier
+  "modify doesn't set the opener" note was WRONG; it's inside that helper), and `fabricator_exec`
+  (`fabricator_extension.cpp:501`). So 2a/2b/2c capture the current statement's live `&context`. Paths WITHOUT a
+  preceding `SetActiveOpener` (metadata reads, DDL via CreateTable/AlterTable) are left uncancelled (short anyway).
+  **Remaining (deferred): Delta DML** (wire the scope token into `DeltaReader.DeleteByRowIds`/`UpdateByRowIds` — EW
+  already takes the ct; Tier 1 did EW reads, EW writes/DML are the analogous follow-up) + **2d** `command_timeout`
+  (`CancelAfter`, closes the hung-socket hole); **Tier 3** DAX/ADOMD via
   `AdomdCommand.Cancel()` (no usable async); **Tier 4** the arrow scan as a DuckDB async/BLOCKED source
   (`InterruptState`) to free the task thread during I/O (native interrupt + better parallelism, bigger). Live Ctrl+C
   behavior is a MANUAL check (a slow OneLake/SQL query + interrupt); the suites verify only behavior-neutrality.

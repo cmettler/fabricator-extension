@@ -907,6 +907,10 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     public long ExecuteNonQuery(string sql)
     {
+        // A raw exec (fabricator_exec) can be a slow DML (a big UPDATE/DELETE). Cancel it on query interrupt
+        // via the async SqlClient token. The opener is set fresh before the exec (FabricatorExecFunction), so
+        // AmbientOpener.Current is this statement's ClientContext. See docs/cancellation.md.
+        using var interrupt = new InterruptScope(AmbientOpener.Current);
         var (connection, transaction, owns) = BeginWrite();
         try
         {
@@ -917,7 +921,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             Log.LogDebug("exec [txn={Txn} own={Own}]: {Sql}", AmbientTransaction.Current, owns, Trunc(sql));
             // ExecuteNonQuery returns -1 for statements that don't affect rows
             // (DDL, SET, ...); report 0 for those (matches the C++ mssql extension).
-            var affected = Math.Max(0, command.ExecuteNonQuery());
+            var affected = Math.Max(0, command.ExecuteNonQueryAsync(interrupt.Token).GetAwaiter().GetResult());
             Log.LogDebug("exec done: affected={Affected}", affected);
             return affected;
         }
@@ -1023,6 +1027,10 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     public long ExecuteDelete(string schemaName, string tableName, IArrowArrayStream keys)
     {
+        // Cancel a long rowid DELETE (many chunked batches) on query interrupt. The opener is fresh here (the
+        // modify operator's Finalize calls FabricatorSetActiveTxn -> SetActiveOpener). See docs/cancellation.md.
+        using var interrupt = new InterruptScope(AmbientOpener.Current);
+        var token = interrupt.Token;
         var (connection, transaction, owns) = BeginWrite();
         try
         {
@@ -1065,7 +1073,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             cmd.CommandText = sb.ToString();
             if (Log.IsEnabled(LogLevel.Debug))
                 Log.LogDebug("dml {Schema}.{Table}: {Sql}", schemaName, tableName, Trunc(cmd.CommandText));
-            total += cmd.ExecuteNonQuery();
+            total += cmd.ExecuteNonQueryAsync(token).GetAwaiter().GetResult();
             batch.Clear();
         }
 
@@ -1096,6 +1104,10 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     public long ExecuteUpdate(string schemaName, string tableName, int setColumnCount, IArrowArrayStream data)
     {
+        // Cancel a long rowid UPDATE (one statement per matched row) on query interrupt. Opener is fresh (the
+        // modify Finalize's FabricatorSetActiveTxn -> SetActiveOpener). See docs/cancellation.md.
+        using var interrupt = new InterruptScope(AmbientOpener.Current);
+        var token = interrupt.Token;
         var (connection, transaction, owns) = BeginWrite();
         try
         {
@@ -1134,7 +1146,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             cmd.CommandText = sb.ToString();
             if (Log.IsEnabled(LogLevel.Debug))
                 Log.LogDebug("dml {Schema}.{Table}: {Sql}", schemaName, tableName, Trunc(cmd.CommandText));
-            total += cmd.ExecuteNonQuery();
+            total += cmd.ExecuteNonQueryAsync(token).GetAwaiter().GetResult();
         }
         return total;
         }

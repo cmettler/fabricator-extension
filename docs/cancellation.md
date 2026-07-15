@@ -93,18 +93,22 @@ but such a connection must be disposed, not reused.
 - **Tier 2b (commit `6e952f6`) — bulk write (INSERT/CTAS/COPY):** `BulkSession` builds an `InterruptScope(opener)`
   and `token.Register`s its existing `Complete(abort)` teardown — faulting the channel stops `WriteToServer` +
   unblocks a backpressure-parked `push_batch`. Works for SQL bulk *and* Delta streaming writes.
+- **Tier 2c (commit `<this>`) — SQL DML/exec:** `ExecuteNonQuery` (raw `fabricator_exec`), `ExecuteDelete`, and
+  `ExecuteUpdate` build an `InterruptScope(AmbientOpener.Current)` and run their DB writes with
+  `ExecuteNonQueryAsync(token)` (chunked loops share one scope), so a long rowid DELETE/UPDATE or a slow
+  `fabricator_exec` cancels.
 
 ### The opener-freshness constraint (load-bearing)
 
 `is_interrupted` dereferences the opener as a `ClientContext*`, and **`AmbientOpener` is never cleared** (no
 `SetActiveOpener(0)`), so `AmbientOpener.Current` retains the last value set on the thread. Interrupt polling is
-therefore only safe where the opener was **freshly set right before** the operation — which is exactly the scan
-(`arrow_ingest` `SetActiveOpener(&context)` before the scan factory / init) and the bulk (`fabricator_insert.cpp`
-before `begin_bulk`). Both 2a and 2b capture a fresh opener, so they never poll a stale pointer. **The DELETE/UPDATE
-(modify) operator does NOT call `SetActiveOpener`**, so capturing `AmbientOpener.Current` there would poll a stale
-(possibly freed) context — 2c must not do that without first adding a `SetActiveOpener(&context)` to the modify
-operator (a C++ change; no ABI bump — the vtable is unchanged). `fabricator_exec` DOES set a fresh opener
-(`fabricator_extension.cpp:501`), so a raw-exec cancellation is safe if wanted.
+therefore only safe where the opener was **freshly set right before** the operation. Every write path DOES set it
+fresh: the scan (`arrow_ingest` `SetActiveOpener(&context)`), the bulk (`fabricator_insert.cpp` before
+`begin_bulk`), the **DELETE/UPDATE modify operator** (`Finalize` → `FabricatorSetActiveTxn` → `SetActiveOpener`,
+`catalog/fabricator_txn_util.hpp`), and `fabricator_exec` (`fabricator_extension.cpp:501`). So 2a/2b/2c all capture
+the current statement's live `&context` — never a stale pointer. **What is NOT safe** is capturing
+`AmbientOpener.Current` in a path with no preceding `SetActiveOpener` (short metadata reads, DDL via
+`CreateTable`/`AlterTable`) — those are left uncancelled (they're short anyway).
 
 ## Tiers
 
