@@ -21,6 +21,13 @@ struct ArrowNetModifyTarget {
 	//! (the SET values precede the trailing rowid column).
 	vector<string> set_columns;
 	vector<LogicalType> set_types;
+	//! DELETE: the rowid column's position in the child chunk, from LogicalDelete::expressions[0]
+	//! (the bound row-identifier reference — DuckDB's own PhysicalDelete reads it the same way).
+	//! INVALID_INDEX = fall back to the last column (UPDATE keeps that: the binder builds its child
+	//! projection with the rowid last, matching upstream PhysicalUpdate's assumption). A mark-join
+	//! DELETE plan (WHERE x [NOT] IN (subquery)) has NO projection between FILTER and DELETE, so the
+	//! child chunk ends with the BOOLEAN mark — "last column" would reference the mark as the rowid.
+	idx_t rowid_child_index = DConstants::INVALID_INDEX;
 };
 
 //! DELETE FROM [schema].[table] WHERE <rowid predicates>, batched.

@@ -17,6 +17,7 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
@@ -387,6 +388,12 @@ PhysicalOperator &ArrowNetCatalog::PlanDelete(ClientContext &context, PhysicalPl
 		throw NotImplementedException("mssql_net: DELETE ... RETURNING is not supported yet");
 	}
 	auto target = BuildModifyTarget(op, op.table);
+	// The rowid's position in the child chunk comes from the bound row-identifier expression — NOT
+	// "the last column": a mark-join DELETE (WHERE x [NOT] IN (subquery)) feeds the raw FILTER output
+	// [cols..., rowid, mark] into the sink, so the last column is the BOOLEAN mark.
+	if (!op.expressions.empty() && op.expressions[0]->GetExpressionType() == ExpressionType::BOUND_REF) {
+		target.rowid_child_index = op.expressions[0]->Cast<BoundReferenceExpression>().index;
+	}
 	vector<LogicalType> result_types {LogicalType::BIGINT};
 	auto &del = planner.Make<ArrowNetPhysicalDelete>(std::move(result_types), op.estimated_cardinality,
 	                                                 std::move(target), handle_);

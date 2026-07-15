@@ -1995,7 +1995,42 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   materialize 17 / compaction_rowtracking 24 / native_read 88 / dv_default 58 / update 63 /
   column_mapping 251 / late_materialization 57 + SQL scalar/table-fn/procs/orderby green (SQL/DAX/deltars/
   stub each gained an explicit empty VirtualColumns metadata case).
-  **MERGE-ON-READ UPDATE: COLUMN-MAPPING GATE LIFTED (slice 1 of the full-matrix plan, 2026-07-13, EW-only).**
+  **STABLE-ID FAST PATH — DONE (2026-07-14, `DeltaRowTrackingFilter`): filters on
+  `__delta_row_id`/`__delta_row_commit_version` skip FILES + ROW GROUPS** (point lookups, dedup DELETEs
+  without a unique key, `version > X` incremental extracts) — NO log-stats writes needed (the materialized
+  column is off-schema; Spark writes no stats for it either, and neither do we). Per file, decided AFTER
+  the footer probe every native scan already runs: **derived file** (no materialized column — every plain
+  append) → the log alone bounds ids to `[baseRowId, baseRowId + stats.numRecords)` (`NativeScanFile.
+  NumRecords` added) — file SKIPPED on no intersection, else the constraint rewrites to a
+  `file_row_number` predicate (the same synthesized-zone-map machinery as the rowid path); the version is
+  a per-file CONSTANT (`defaultRowCommitVersion`) — whole-file match/skip; **materialized file**
+  (rewrites — ORIGINAL ids, decoupled from the fresh baseRowId, so the derived-range subtraction does NOT
+  apply) → the constraint pushes onto the PHYSICAL column in the per-file INNER WHERE as
+  `(pred(col) OR col IS NULL)` (single-column ⇒ parquet zone maps prune; the IS NULL arm keeps
+  derived-fallback rows visible); files with NULL BaseRowId under a value constraint (pre-enablement adds,
+  a txn's pending files) skip outright (the column reads NULL). Extraction = AND-reachable compare/IN
+  conjuncts + SINGLE-COLUMN OR-of-equals (how the live serializer renders erased/dynamic IN filters);
+  conjuncts stripped from the EW prune tree (no log stats — dropping widens). The condition sits on the
+  INNER subquery over read_parquet (inner WHERE binds source columns before SELECT aliases → hits the raw
+  physical column, not the COALESCE alias); superset-safe — the outer WHERE still applies the exact
+  predicate. NOTE OPTIMIZE consumes fresh baseRowId space for the compacted add (HWM jumps), so
+  post-compaction inserts get ids ABOVE the old range (pinned). Spark/OSS-delta have NO row-id skipping
+  (docs+source checked — `_metadata.row_id` is computed post-scan, file-constant-only metadata predicates)
+  — our stable-id lookups are now faster than Spark's on the same tables. Guidance stands: IDENTITY
+  columns for lookup keys (standard stats everywhere); row-ids for correlation + keyless dedup.
+  **CRITICAL PRE-EXISTING BUG FOUND + FIXED by the dedup test (C++, ALL providers):
+  `DELETE … WHERE x [NOT] IN (subquery)` read the WRONG child column as the rowid** —
+  `AppendModifyBatch` assumed "rowid = last column", but a mark-join DELETE plan has NO projection
+  between FILTER and DELETE, so the child chunk ends with the BOOLEAN mark (crash
+  `Vector::Reference … BIGINT referenced BOOLEAN`; a same-width plan could have deleted wrong rows).
+  Fix mirrors upstream `DuckCatalog::PlanDelete`: the rowid position comes from
+  `LogicalDelete::expressions[0]` (the bound row-identifier ref) → `ArrowNetModifyTarget.
+  rowid_child_index`; UPDATE keeps the last-column contract (its binder-built projection guarantees it,
+  as upstream PhysicalUpdate assumes). `verify_delta_row_tracking_virtual.test` now 299 (fast-path
+  sections: point/IN/range + version filters with duckdb_logs skip pins + the `file_row_number` rewrite
+  pin, post-OPTIMIZE materialized-column pushdown pin, DELETE by id list, mark-join dedup DELETE);
+  regression: transactions 934 / late_materialization 57 / native_read 88 / update 63 / delete 28 /
+  dynamic_filter 21 / SQL scalar 26 green.**
   The MoR eligibility check in EW `UpdateByRowIdsAsync` still required `mappingMode == None` — a **stale
   gate**: the 2026-07-06 `ColumnMappingRecursive.ToPhysical` pass had already made `UpdateViaVectorsAsync`'s
   post-image append mapping-capable, but the caller's condition was never relaxed, so since `column_mapping

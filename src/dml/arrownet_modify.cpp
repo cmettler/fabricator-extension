@@ -35,6 +35,7 @@ public:
 			types.push_back(target.rowid_types[i]);
 		}
 		key_count = target.rowid_columns.size();
+		rowid_child_index = target.rowid_child_index;
 		properties = arrownet::BoundaryClientProperties(context);
 		extension_types = ArrowTypeExtensionData::GetExtensionTypes(context, types);
 		producer = make_uniq<arrownet::ArrowProducer>(types, names, properties);
@@ -44,6 +45,9 @@ public:
 	vector<string> names;
 	idx_t set_count = 0;
 	idx_t key_count = 0;
+	//! DELETE: the rowid's position in the child chunk (INVALID_INDEX = last column — the UPDATE
+	//! contract, whose binder-built projection puts the rowid last).
+	idx_t rowid_child_index = DConstants::INVALID_INDEX;
 	ClientProperties properties;
 	unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>> extension_types;
 	unique_ptr<arrownet::ArrowProducer> producer;
@@ -69,7 +73,10 @@ static void ReferenceKeyColumns(DataChunk &out, idx_t out_offset, DataChunk &src
 // Builds an ArrowArray from a column layout that references the source chunk,
 // and enqueues it on the producer.
 static void AppendModifyBatch(ArrowNetModifyGlobalState &gstate, DataChunk &chunk, bool is_update) {
-	idx_t rowid_col = chunk.ColumnCount() - 1; // rowid is the last child column
+	// DELETE carries the rowid's actual child-chunk position (a mark-join plan's chunk ends with the
+	// BOOLEAN mark, not the rowid); UPDATE keeps the last-column contract (binder projection).
+	idx_t rowid_col = gstate.rowid_child_index != DConstants::INVALID_INDEX ? gstate.rowid_child_index
+	                                                                        : chunk.ColumnCount() - 1;
 	DataChunk produce;
 	produce.InitializeEmpty(gstate.types);
 	produce.SetCardinality(chunk.size());

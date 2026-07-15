@@ -62,9 +62,13 @@ internal static class DeltaReader
     /// fields (null when the table doesn't track rows, or for a transaction's PENDING files — ids are assigned
     /// at commit): they drive the <c>__delta_row_id</c>/<c>__delta_row_commit_version</c> virtual columns
     /// (stable id = baseRowId + position unless a materialized column overrides).</summary>
+    /// <summary><paramref name="NumRecords"/> = the add action's stats row count (null when the add carries
+    /// no stats — external writers): with <paramref name="BaseRowId"/> it bounds the file's DERIVED stable-id
+    /// range [baseRowId, baseRowId + numRecords) for the row-tracking filter fast path.</summary>
     public sealed record NativeScanFile(int Ordinal, string Uri, long[] Dv,
                                         IReadOnlyDictionary<string, string>? PartitionValues = null,
-                                        long? BaseRowId = null, long? CommitVersion = null);
+                                        long? BaseRowId = null, long? CommitVersion = null,
+                                        long? NumRecords = null);
 
     /// <summary>The result of <see cref="ListNativeScanFiles"/>: the resolved snapshot <see cref="Version"/>, the
     /// surviving (post-prune) <see cref="Files"/> in path-sorted global-ordinal order, and <see cref="AnyUri"/> =
@@ -183,9 +187,13 @@ internal static class DeltaReader
                     dv = deleted.ToArray();
                     System.Array.Sort(dv);
                 }
+                // numRecords from the add's stats (Parse is null/error-tolerant; 0 = absent → unknown, the
+                // derived-id range then stays unbounded above — external writers may omit stats).
+                var addStats = EngineeredWood.DeltaLake.Actions.ColumnStats.Parse(add.Stats);
+                long? numRecords = addStats is { NumRecords: > 0 } ? addStats.NumRecords : null;
                 files.Add(new NativeScanFile(ordinal, uri, dv,
                     add.PartitionValues is { Count: > 0 } ? add.PartitionValues : null,
-                    add.BaseRowId, add.DefaultRowCommitVersion));
+                    add.BaseRowId, add.DefaultRowCommitVersion, numRecords));
             }
             // Column-mapping tables store columns decoupled from the logical name — capture the mapping (from THIS
             // snapshot's schema, so time travel to a pre-rename version maps correctly) so the native reader can

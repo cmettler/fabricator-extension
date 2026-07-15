@@ -66,7 +66,23 @@ internal static class DeltaNativeReader
         // (parquet row-group skip). The rowid conjuncts are STRIPPED from the engineered-wood prune tree
         // (it has no rowid stats; dropping a conjunct only widens = superset-safe).
         var rowIdFilter = DeltaRowIdFilter.Extract(spec?.Filter, filterValues, RowIdColumn);
-        var pruneNode = rowIdFilter is not null ? DeltaRowIdFilter.Strip(spec?.Filter, RowIdColumn) : spec?.Filter;
+        // STABLE-ID fast path: filters on the row-tracking virtual columns skip whole files (derived-id
+        // ranges from the log; per-file constant versions) and push zone-map-prunable conditions into the
+        // per-file query (see DeltaRowTrackingFilter). Decided per file AFTER the footer probe (materialized
+        // presence is per file), so the skip happens in the pump.
+        var trackingFilter = DeltaRowTrackingFilter.Extract(
+            spec?.Filter, filterValues, RowTrackingIdColumn, RowTrackingVersionColumn);
+        var pruneNode = spec?.Filter;
+        if (rowIdFilter is not null)
+        {
+            pruneNode = DeltaRowIdFilter.Strip(pruneNode, RowIdColumn);
+        }
+        if (trackingFilter is not null)
+        {
+            // The Delta log has no stats for the row-tracking columns — strip their conjuncts so the
+            // engineered-wood pruner keeps working on the rest (dropping a conjunct only widens).
+            pruneNode = DeltaRowTrackingFilter.Strip(pruneNode, RowTrackingIdColumn, RowTrackingVersionColumn);
+        }
 
         // Static filter → engineered-wood predicate (Delta-log FILE pruning) + SQL WHERE (read_parquet row-group pruning).
         Predicate? prune = null;
@@ -126,7 +142,7 @@ internal static class DeltaNativeReader
             listing.LogicalToPhysical is not null ? "name" : listing.LogicalToFieldId is not null ? "id" : "none");
 
         return new AsyncEnumerableArrowStream(
-            schema, StreamFiles(listing, dataCols, wantRowId, where, prefetch, rowIdFilter));
+            schema, StreamFiles(listing, dataCols, wantRowId, where, prefetch, rowIdFilter, trackingFilter));
     }
 
     // Merges the transaction's pending-DELETEd positions into the per-file DV exclusion lists (positions
@@ -253,7 +269,8 @@ internal static class DeltaNativeReader
                                   DeltaReader.NativeScanFile f, FileMapping fm,
                                   DeltaSchema.StructType? tableSchema,
                                   IReadOnlyList<string>? partitionCols = null,
-                                  string? rowIdCond = null)
+                                  string? rowIdCond = null,
+                                  string? innerCond = null)
     {
         // Per-column projection over THIS file's actual layout:
         //   • column mapping: alias the stored PHYSICAL name to the logical one; a mapped STRUCT whose shape
@@ -317,6 +334,16 @@ internal static class DeltaNativeReader
                 : $"{expr} AS {Quote(c)}");
         }
 
+        // The row-tracking fast-path condition references RAW file columns / file_row_number, so it goes on
+        // the INNER query (over read_parquet directly — inner WHERE binds source columns before SELECT
+        // aliases, so a materialized "__delta_row_id" hits the physical column, not the COALESCE alias) —
+        // that's what lets parquet zone maps prune row groups. Superset-safe: the outer `where` still
+        // applies the exact predicate over the aliases.
+        if (innerCond is not null)
+        {
+            needsInner = true;
+        }
+        string innerWhere = innerCond is null ? "" : $" WHERE {innerCond}";
         string source;
         if (!needsInner)
         {
@@ -325,7 +352,7 @@ internal static class DeltaNativeReader
         else
         {
             inner.Add("file_row_number");
-            source = $"(SELECT {string.Join(", ", inner)} FROM read_parquet('{f.Uri.Replace("'", "''")}', file_row_number => true))";
+            source = $"(SELECT {string.Join(", ", inner)} FROM read_parquet('{f.Uri.Replace("'", "''")}', file_row_number => true){innerWhere})";
         }
 
         var sb = new StringBuilder("SELECT ");
@@ -410,7 +437,7 @@ internal static class DeltaNativeReader
 
     private static async IAsyncEnumerable<RecordBatch> StreamFiles(
         DeltaReader.NativeScanList listing, IReadOnlyList<string> dataCols, bool wantRowId, string? where,
-        int prefetch, DeltaRowIdFilter? rowIdFilter = null,
+        int prefetch, DeltaRowIdFilter? rowIdFilter = null, DeltaRowTrackingFilter? trackingFilter = null,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
         if (listing.Files.Count == 0)
@@ -440,9 +467,27 @@ internal static class DeltaNativeReader
                     {
                         try
                         {
+                            var fm = ResolveFileMapping(listing, file.Uri);
+                            string? trackingCond = null;
+                            if (trackingFilter is not null)
+                            {
+                                // Materialized presence comes from THIS file's footer probe (which the scan
+                                // needs anyway): a skipped file costs the probe but never a data read.
+                                trackingFilter.FileVerdict(
+                                    file,
+                                    idMaterialized: fm.Nodes.Paths.Contains(RowTrackingIdColumn),
+                                    versionMaterialized: fm.Nodes.Paths.Contains(RowTrackingVersionColumn),
+                                    out bool skipFile, out trackingCond);
+                                if (skipFile)
+                                {
+                                    Log.LogInformation("delta native rowtracking skip {Uri}", file.Uri);
+                                    return;
+                                }
+                            }
                             var sql = FileSql(dataCols, wantRowId, where, file,
-                                              ResolveFileMapping(listing, file.Uri), listing.TableSchema,
-                                              listing.PartitionColumns, rowIdFilter?.PositionCondition(file.Ordinal));
+                                              fm, listing.TableSchema,
+                                              listing.PartitionColumns, rowIdFilter?.PositionCondition(file.Ordinal),
+                                              trackingCond);
                             Log.LogDebug("delta native file: {Sql}", sql);
                             using var s = Host.Query(sql);
                             while (true)

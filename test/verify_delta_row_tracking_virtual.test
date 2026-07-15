@@ -437,3 +437,158 @@ DETACH lake2;
 
 statement ok
 DETACH lake;
+
+# ---- STABLE-ID FAST PATH: file skipping + zone-map-prunable per-file conditions for filters on the
+#      row-tracking virtual columns. Derived files (plain appends) prune from the LOG alone
+#      ([baseRowId, baseRowId+numRecords) for the id; the per-file CONSTANT defaultRowCommitVersion for
+#      the version) and the id constraint rewrites to a file_row_number predicate (parquet row-group
+#      skipping); materialized files (rewrites) push the constraint onto the PHYSICAL column
+#      ((pred OR IS NULL) — single-column, zone-map prunable). Use cases: point lookups, dedup DELETEs
+#      without a unique key, version-based incremental extracts. ----
+
+statement ok
+ATTACH '${ARROWNET_DELTA_WRITE_DIR}/rtfast' AS lakef (TYPE arrownet, PROVIDER 'delta', native_read true, native_write true, row_tracking true);
+
+# three derived files: ids 0-4 (v1), 5-9 (v2), 10-14 (v3)
+statement ok
+CREATE TABLE lakef.main.ft AS SELECT r AS id, 'v' || r AS s FROM range(5) t(r);
+
+statement ok
+INSERT INTO lakef.main.ft SELECT r, 'v' || r FROM range(5, 10) t(r);
+
+statement ok
+INSERT INTO lakef.main.ft SELECT r, 'v' || r FROM range(10, 15) t(r);
+
+statement ok
+CALL enable_logging(storage='memory');
+
+# point lookup: only the middle file can hold id 7 — the other two are SKIPPED from the log
+query ITI
+SELECT id, s, __delta_row_id FROM lakef.main.ft WHERE __delta_row_id = 7;
+----
+7	v7	7
+
+query I
+SELECT count(*) >= 2 FROM duckdb_logs
+WHERE type = 'ArrowNet.Delta.Native' AND message LIKE '%rowtracking skip%';
+----
+true
+
+# and the surviving file's condition took the row-group-skippable file_row_number form (id 7 - base 5 = 2)
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type = 'ArrowNet.Delta.Native' AND message LIKE '%file_row_number IN (2)%';
+----
+true
+
+# IN across two files: the middle file is skipped
+query II
+SELECT id, __delta_row_id FROM lakef.main.ft WHERE __delta_row_id IN (2, 12) ORDER BY id;
+----
+2	2
+12	12
+
+# range: only the last file qualifies
+query I
+SELECT count(*) FROM lakef.main.ft WHERE __delta_row_id >= 12;
+----
+3
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type = 'ArrowNet.Delta.Native' AND message LIKE '%file_row_number >= 2%';
+----
+true
+
+# version filter (the incremental-extract pattern): derived files match/skip WHOLE (per-file constant)
+query I
+SELECT count(*) FROM lakef.main.ft WHERE __delta_row_commit_version = 3;
+----
+5
+
+query I
+SELECT count(*) FROM lakef.main.ft WHERE __delta_row_commit_version >= 2;
+----
+10
+
+statement ok
+CALL disable_logging();
+
+# ---- materialized files (post-OPTIMIZE): the constraint pushes onto the PHYSICAL column ----
+
+query I
+SELECT mssql_net_exec('lakef', 'OPTIMIZE main.ft');
+----
+0
+
+statement ok
+CALL enable_logging(storage='memory');
+
+# the compacted file carries materialized ORIGINAL ids — lookup stays exact
+query ITI
+SELECT id, s, __delta_row_id FROM lakef.main.ft WHERE __delta_row_id = 7;
+----
+7	v7	7
+
+# the per-file condition is the zone-map-prunable physical-column form (OR IS NULL keeps
+# derived-fallback rows visible)
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type = 'ArrowNet.Delta.Native' AND message LIKE '%OR "__delta_row_id" IS NULL%';
+----
+true
+
+statement ok
+CALL disable_logging();
+
+# mixed table: a fresh derived file after the compaction — lookups on both kinds stay exact.
+# NOTE the compaction's new add consumed FRESH baseRowId space (15 rows -> HWM 30, the materialized
+# column preserving the original ids 0-14), so the post-OPTIMIZE INSERT's rows get stable ids 30-34.
+statement ok
+INSERT INTO lakef.main.ft SELECT r, 'v' || r FROM range(15, 20) t(r);
+
+query II
+SELECT id, __delta_row_id FROM lakef.main.ft WHERE __delta_row_id IN (7, 32) ORDER BY id;
+----
+7	7
+17	32
+
+# ---- DML through the fast path: DELETE by stable id ----
+
+query I
+DELETE FROM lakef.main.ft WHERE __delta_row_id IN (0, 14);
+----
+2
+
+query II
+SELECT count(*), sum(id) FROM lakef.main.ft;
+----
+18	176
+
+# the deleted ids are gone; their neighbors remain
+query I
+SELECT count(*) FROM lakef.main.ft WHERE __delta_row_id IN (0, 1, 13, 14);
+----
+2
+
+# ---- dedup DELETE without a unique key: keep min(__delta_row_id) per duplicate group ----
+
+statement ok
+CREATE TABLE lakef.main.dup AS SELECT r % 3 AS k, 'x' AS v FROM range(9) t(r);
+
+query I
+DELETE FROM lakef.main.dup
+WHERE __delta_row_id NOT IN (SELECT min(__delta_row_id) FROM lakef.main.dup GROUP BY k, v);
+----
+6
+
+# exactly one row per group survives — the FIRST-inserted one (ids 0,1,2)
+query ITI
+SELECT k, v, __delta_row_id FROM lakef.main.dup ORDER BY k;
+----
+0	x	0
+1	x	1
+2	x	2
+
+statement ok
+DETACH lakef;

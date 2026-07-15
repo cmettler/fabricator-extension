@@ -615,6 +615,46 @@ defaultRowCommitVersion)` — the durable identity, vs the transient `rowid` loc
   caveat is closed.
 - Test: `test/verify_delta_row_tracking_virtual.test` (252).
 
+### Stable-id fast path (DONE 2026-07-14)
+
+Filters on `__delta_row_id` / `__delta_row_commit_version` skip **files and row groups**
+(`DeltaRowTrackingFilter`) — point lookups, dedup DELETEs without a unique key
+(`DELETE … WHERE __delta_row_id NOT IN (SELECT min(__delta_row_id) … GROUP BY <all cols>)`), and
+`version > X` incremental extracts. **No Delta-log stats are written** for the columns (they're
+off-schema — Spark writes none either): everything needed is already at hand.
+
+- **Derived file** (no materialized physical column — every plain append): ids are exactly
+  `baseRowId + position`, so the LOG alone bounds the file to `[baseRowId, baseRowId + numRecords)`
+  (`NativeScanFile.NumRecords`, parsed from the add's stats) — skipped on no intersection, else the
+  constraint rewrites to a `file_row_number` predicate (exact synthesized per-row-group min/max ⇒
+  row-group skipping, the rowid-path machinery). The version is a per-file constant
+  (`defaultRowCommitVersion`) — whole-file match/skip.
+- **Materialized file** (rewrites carry ORIGINAL ids, decoupled from the fresh baseRowId — the
+  derived-range subtraction must NOT be applied): the constraint pushes onto the PHYSICAL column in the
+  per-file query's INNER WHERE as `(pred(col) OR col IS NULL)` — single-column ⇒ parquet zone maps
+  prune; the IS NULL arm keeps derived-fallback rows (pre-tracking sources) visible. Inner placement is
+  what binds the raw column instead of the COALESCE alias.
+- Files with NULL `baseRowId` under a value constraint (pre-enablement adds, pending txn files) skip
+  outright — the column reads NULL, which no value predicate matches.
+- Extraction: AND-reachable compare/IN conjuncts plus single-column OR-of-equals (the live serializer's
+  rendering of erased/dynamic IN filters); the conjuncts are stripped from the EW prune tree (no log
+  stats — dropping only widens). Everything emitted is a superset conjunct; the outer WHERE stays exact.
+- Gotcha pinned: OPTIMIZE's compacted add consumes fresh baseRowId space (HWM jump), so post-compaction
+  inserts get stable ids ABOVE the pre-compaction range.
+- Comparison: Spark/OSS-delta have NO skipping on `_metadata.row_id` (computed post-scan; metadata
+  predicates prune only file-constant fields) — stable-id lookups here are faster than Spark's on the
+  same tables. For pure lookup keys an IDENTITY column is still the portable answer (ordinary stats in
+  every engine); the row-id path shines for correlation + keyless dedup.
+- **Pre-existing DELETE bug found by the dedup test (fixed, all providers):**
+  `DELETE … WHERE x [NOT] IN (subquery)` plans a MARK join with no projection before the DELETE, so the
+  child chunk ends with the BOOLEAN mark — `AppendModifyBatch`'s "rowid = last column" read the mark as
+  the rowid (`Vector::Reference … BIGINT referenced BOOLEAN`). Fix mirrors upstream
+  `DuckCatalog::PlanDelete`: the rowid position comes from `LogicalDelete::expressions[0]`
+  (`ArrowNetModifyTarget.rowid_child_index`); UPDATE keeps the last-column contract (binder-built
+  projection, as upstream `PhysicalUpdate` assumes).
+- Test: `test/verify_delta_row_tracking_virtual.test` (now 299 — skip pins via duckdb_logs, the
+  `file_row_number` rewrite pin, the post-OPTIMIZE physical-column pushdown pin, mark-join dedup DELETE).
+
 ## Recommendation — phased (build on demand)
 
 1. **Phase A — read-only (the big win).** Generic `ArrowNetMultiFileList/Reader` in `arrownet-core` +
