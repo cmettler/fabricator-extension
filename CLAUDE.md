@@ -366,9 +366,15 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     commit with the SDK signature error while data IO succeeds (proving the SDK is in the loop);
     `verify_delta_catalog_s3.test` §9 (144 — SECRET-route lifecycle incl. fused txn; secretless
     sections unchanged). Outcome: S3 catalogs with a SECRET are safe multi-process/multi-engine.
-    **The deltars provider gets the same for free via storage_options**: delta-rs enables native S3
-    conditional-put locking with `conditional_put: "etag"` (no DynamoDB `AWS_S3_LOCKING_PROVIDER`
-    needed) — add it to `DeltaRsCatalog`'s `storage_options` when S3 discovery lands.
+    **The deltars provider could get the same for free via storage_options** (delta-rs enables native S3
+    conditional-put locking with `conditional_put: "etag"`, no DynamoDB `AWS_S3_LOCKING_PROVIDER` needed —
+    one line on `DeltaRsCatalog`'s `storage_options` when/if S3 discovery lands). **DECISION (2026-07-15): NOT
+    NEEDED / won't prioritize.** engineeredwooddelta ALREADY ships S3 multi-writer (codec + native_write, via
+    the hand-rolled `S3CommitFileSystem` conditional PUT, validated live on MinIO), so the etag option would
+    only bring the OPT-IN deltars provider to parity on a capability we already have — no concurrency gap to
+    close. deltars stays valuable for OTHER reasons (reference reader/writer, DataFusion pushdown, the
+    maintenance ops EW lacks: OPTIMIZE/Z-ORDER/VACUUM/CHECKPOINT/MERGE); if S3 *discovery* is ever wired for
+    those, adding the one storage-option line is trivial then. Do NOT re-propose it as an S3-concurrency item.
   - **Partitioned × native_read BUG FIXED + partitioned pending-CTAS lifted (2026-07-13).** Probing the
     "why keep partitioned pending-creates buffered" question exposed a REAL committed-read bug: under
     `native_read`, a PARTITIONED table's partition column read **all-NULL in BOTH mapping modes** — the
