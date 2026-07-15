@@ -188,15 +188,18 @@ internal static class DeltaReader
     /// always-written <c>commitInfo.timestamp</c>); falls back to the latest version if the timestamp can't be
     /// resolved (e.g. an external table with no commit timestamps). Used for per-transaction snapshot pinning.</summary>
     public static long ResolveVersionAsOf(nint opener, string path, DateTime instantUtc, ILogger log)
+        => ResolveVersionAsOfAsync(opener, path, instantUtc, log).GetAwaiter().GetResult();
+
+    private static async Task<long> ResolveVersionAsOfAsync(nint opener, string path, DateTime instantUtc, ILogger log)
     {
         var fs = TableFileSystems.Create(opener, path);
-        var table = DeltaTable.OpenAsync(fs).GetAwaiter().GetResult();
+        var table = await DeltaTable.OpenAsync(fs).ConfigureAwait(false);
         try
         {
             try
             {
-                var snap = table.GetSnapshotAtTimestampAsync(new DateTimeOffset(instantUtc, TimeSpan.Zero), default)
-                    .GetAwaiter().GetResult();
+                var snap = await table.GetSnapshotAtTimestampAsync(new DateTimeOffset(instantUtc, TimeSpan.Zero), default)
+                    .ConfigureAwait(false);
                 log.LogDebug("delta snapshot pin: {Path} as-of {Instant:o} -> v{Version}", path, instantUtc, snap.Version);
                 return snap.Version;
             }
@@ -210,7 +213,7 @@ internal static class DeltaReader
         }
         finally
         {
-            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            await table.DisposeAsync().ConfigureAwait(false);
         }
     }
 
@@ -221,14 +224,19 @@ internal static class DeltaReader
     public static NativeScanList ListNativeScanFiles(
         nint opener, string path, string? unit, string? value, Predicate? prune, ILogger log,
         EngineeredWood.DeltaLake.Schema.StructType? schemaOverride = null)
+        => ListNativeScanFilesAsync(opener, path, unit, value, prune, log, schemaOverride).GetAwaiter().GetResult();
+
+    private static async Task<NativeScanList> ListNativeScanFilesAsync(
+        nint opener, string path, string? unit, string? value, Predicate? prune, ILogger log,
+        EngineeredWood.DeltaLake.Schema.StructType? schemaOverride)
     {
         var fs = TableFileSystems.Create(opener, path);
-        var table = DeltaTable.OpenAsync(fs).GetAwaiter().GetResult();
+        var table = await DeltaTable.OpenAsync(fs).ConfigureAwait(false);
         try
         {
             var snap = unit is null
                 ? table.CurrentSnapshot
-                : ResolveSnapshotAsync(table, unit, value ?? "", default).AsTask().GetAwaiter().GetResult();
+                : await ResolveSnapshotAsync(table, unit, value ?? "", default).ConfigureAwait(false);
             // schemaOverride: a buffered transaction's PENDING (ALTERed) schema — presence handling, mapping
             // maps and pruning key off it so a pending-added column reads as typed NULL from every committed
             // file (the same machinery as committed schema evolution; no stats => pruning stays superset-safe).
@@ -255,7 +263,7 @@ internal static class DeltaReader
                 long[] dv = System.Array.Empty<long>();
                 if (add.DeletionVector is not null)
                 {
-                    var deleted = dvReader.ReadAsync(add.DeletionVector).GetAwaiter().GetResult();
+                    var deleted = await dvReader.ReadAsync(add.DeletionVector).ConfigureAwait(false);
                     dv = deleted.ToArray();
                     System.Array.Sort(dv);
                 }
@@ -317,7 +325,7 @@ internal static class DeltaReader
         }
         finally
         {
-            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            await table.DisposeAsync().ConfigureAwait(false);
         }
     }
 
@@ -327,9 +335,12 @@ internal static class DeltaReader
     /// <paramref name="pushJson"/> pushed-filter arg is accepted now and applied for file pruning in a later
     /// slice. Paths are absolute URIs (onelake:// for OneLake → native + cached).</summary>
     public static string ListScanFilesJson(nint opener, string path, string? pushJson)
+        => ListScanFilesJsonAsync(opener, path, pushJson).GetAwaiter().GetResult();
+
+    private static async Task<string> ListScanFilesJsonAsync(nint opener, string path, string? pushJson)
     {
         var fs = TableFileSystems.Create(opener, path);
-        var table = DeltaTable.OpenAsync(fs).GetAwaiter().GetResult();
+        var table = await DeltaTable.OpenAsync(fs).ConfigureAwait(false);
         try
         {
             var root = ToReadableRoot(path);
@@ -350,7 +361,7 @@ internal static class DeltaReader
                 // relative to the file (0-based physical order), matching read_parquet's row order.
                 if (add.DeletionVector is not null)
                 {
-                    var deleted = dvReader.ReadAsync(add.DeletionVector).GetAwaiter().GetResult();
+                    var deleted = await dvReader.ReadAsync(add.DeletionVector).ConfigureAwait(false);
                     if (deleted.Count > 0)
                     {
                         var sorted = deleted.ToArray();
@@ -374,7 +385,7 @@ internal static class DeltaReader
         }
         finally
         {
-            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            await table.DisposeAsync().ConfigureAwait(false);
         }
     }
 
@@ -395,16 +406,19 @@ internal static class DeltaReader
     /// <summary>Opens the Delta table at <paramref name="path"/> and returns its Arrow schema only (no data
     /// read). Used at table-function bind. <paramref name="opener"/> = the calling operator's ClientContext.</summary>
     public static Schema GetSchema(nint opener, string path)
+        => GetSchemaAsync(opener, path).GetAwaiter().GetResult();
+
+    private static async Task<Schema> GetSchemaAsync(nint opener, string path)
     {
         var fs = TableFileSystems.Create(opener, path);
-        var table = DeltaTable.OpenAsync(fs).GetAwaiter().GetResult();
+        var table = await DeltaTable.OpenAsync(fs).ConfigureAwait(false);
         try
         {
             return table.ArrowSchema;
         }
         finally
         {
-            table.Dispose();
+            await table.DisposeAsync().ConfigureAwait(false);
         }
     }
 
@@ -413,19 +427,26 @@ internal static class DeltaReader
     /// following) virtual-columns metadata fetch without a second <c>_delta_log</c> read (OneLake cost).</summary>
     public static Schema GetSchemaAndRowTracking(nint opener, string path, out bool rowTracking)
     {
+        var (schema, rt) = GetSchemaAndRowTrackingAsync(opener, path).GetAwaiter().GetResult();
+        rowTracking = rt;
+        return schema;
+    }
+
+    private static async Task<(Schema Schema, bool RowTracking)> GetSchemaAndRowTrackingAsync(nint opener, string path)
+    {
         var fs = TableFileSystems.Create(opener, path);
-        var table = DeltaTable.OpenAsync(fs).GetAwaiter().GetResult();
+        var table = await DeltaTable.OpenAsync(fs).ConfigureAwait(false);
         try
         {
             var cfg = table.CurrentSnapshot.Metadata.Configuration;
-            rowTracking = cfg is not null
+            bool rowTracking = cfg is not null
                 && cfg.TryGetValue("delta.enableRowTracking", out var v)
                 && string.Equals(v, "true", System.StringComparison.OrdinalIgnoreCase);
-            return table.ArrowSchema;
+            return (table.ArrowSchema, rowTracking);
         }
         finally
         {
-            table.Dispose();
+            await table.DisposeAsync().ConfigureAwait(false);
         }
     }
 
@@ -525,6 +546,10 @@ internal static class DeltaReader
     /// (deletion vectors). Returns the number of rows deleted.</summary>
     public static long DeleteByRowIds(nint opener, string path, IReadOnlyCollection<long> rowIds,
                                       CancellationToken ct, bool nativeWrite = false, bool nativeRead = false)
+        => DeleteByRowIdsAsync(opener, path, rowIds, ct, nativeWrite, nativeRead).GetAwaiter().GetResult();
+
+    private static async Task<long> DeleteByRowIdsAsync(nint opener, string path, IReadOnlyCollection<long> rowIds,
+                                      CancellationToken ct, bool nativeWrite, bool nativeRead)
     {
         var fs = TableFileSystems.Create(opener, path);
         // Open with the standard WRITE options (OmitPathInSchema=false) so the copy-on-write rewrite emits
@@ -538,17 +563,17 @@ internal static class DeltaReader
             ? new NativeParquetDataFileWriter(path)
             : null;
         var rewriter = nativeWrite && NativeParquetDataFileRewriter.Available
-            ? new NativeParquetDataFileRewriter(path, GetSchema(opener, path))
+            ? new NativeParquetDataFileRewriter(path, await GetSchemaAsync(opener, path).ConfigureAwait(false))
             : null;
         var fileReader = nativeRead && NativeParquetDataFileReader.Available
             ? new NativeParquetDataFileReader(path)
             : null;
-        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(dataFileWriter: writer, dataFileRewriter: rewriter,
+        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(dataFileWriter: writer, dataFileRewriter: rewriter,
                                                                  dataFileReader: fileReader), ct)
-            .AsTask().GetAwaiter().GetResult();
+            .ConfigureAwait(false);
         try
         {
-            long deleted = table.DeleteByRowIdsAsync(rowIds, ct).AsTask().GetAwaiter().GetResult().RowsDeleted;
+            long deleted = (await table.DeleteByRowIdsAsync(rowIds, ct).ConfigureAwait(false)).RowsDeleted;
             DmlLog.LogInformation("delta delete-rewrite {Path}: deleted={Deleted} writer={Writer} rewriter={Rewriter}",
                 path, deleted, writer is null ? "engineered-wood" : "native-duckdb",
                 rewriter is null ? "engineered-wood" : "native-duckdb");
@@ -560,7 +585,7 @@ internal static class DeltaReader
         }
         finally
         {
-            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            await table.DisposeAsync().ConfigureAwait(false);
         }
     }
 
@@ -576,9 +601,12 @@ internal static class DeltaReader
     /// <summary>True if the Delta table at <paramref name="path"/> has <c>delta.enableDeletionVectors=true</c>
     /// — DELETE then uses deletion vectors (no file rewrite) instead of copy-on-write.</summary>
     public static bool IsDeletionVectorsEnabled(nint opener, string path)
+        => IsDeletionVectorsEnabledAsync(opener, path).GetAwaiter().GetResult();
+
+    private static async Task<bool> IsDeletionVectorsEnabledAsync(nint opener, string path)
     {
         var fs = TableFileSystems.Create(opener, path);
-        var table = DeltaTable.OpenAsync(fs).GetAwaiter().GetResult();
+        var table = await DeltaTable.OpenAsync(fs).ConfigureAwait(false);
         try
         {
             var cfg = table.CurrentSnapshot.Metadata.Configuration;
@@ -588,7 +616,7 @@ internal static class DeltaReader
         }
         finally
         {
-            table.Dispose();
+            await table.DisposeAsync().ConfigureAwait(false);
         }
     }
 
@@ -606,23 +634,30 @@ internal static class DeltaReader
     /// for the buffered UPDATE's materialized post-images.</summary>
     public static IReadOnlyList<long?> GetOrderedActiveBaseRowIds(nint opener, string path,
                                                                   long? atVersion = null)
+        => GetOrderedActiveBaseRowIdsAsync(opener, path, atVersion).GetAwaiter().GetResult();
+
+    private static async Task<IReadOnlyList<long?>> GetOrderedActiveBaseRowIdsAsync(
+        nint opener, string path, long? atVersion)
     {
         var fs = TableFileSystems.Create(opener, path);
-        var table = DeltaTable.OpenAsync(fs).GetAwaiter().GetResult();
+        var table = await DeltaTable.OpenAsync(fs).ConfigureAwait(false);
         try
         {
-            return table.OrderedActiveBaseRowIdsAsync(atVersion).AsTask().GetAwaiter().GetResult();
+            return await table.OrderedActiveBaseRowIdsAsync(atVersion).ConfigureAwait(false);
         }
         finally
         {
-            table.Dispose();
+            await table.DisposeAsync().ConfigureAwait(false);
         }
     }
 
     public static TxnDmlProfile GetTxnDmlProfile(nint opener, string path)
+        => GetTxnDmlProfileAsync(opener, path).GetAwaiter().GetResult();
+
+    private static async Task<TxnDmlProfile> GetTxnDmlProfileAsync(nint opener, string path)
     {
         var fs = TableFileSystems.Create(opener, path);
-        var table = DeltaTable.OpenAsync(fs).GetAwaiter().GetResult();
+        var table = await DeltaTable.OpenAsync(fs).ConfigureAwait(false);
         try
         {
             var cfg = table.CurrentSnapshot.Metadata.Configuration;
@@ -642,7 +677,7 @@ internal static class DeltaReader
         }
         finally
         {
-            table.Dispose();
+            await table.DisposeAsync().ConfigureAwait(false);
         }
     }
 
@@ -652,16 +687,20 @@ internal static class DeltaReader
     /// metadata/protocol as the base via the closure.</summary>
     public static DeltaTable.DeferredSchemaChange ComputeSchemaChange(
         nint opener, string path, Func<DeltaTable, DeltaTable.DeferredSchemaChange> compute)
+        => ComputeSchemaChangeAsync(opener, path, compute).GetAwaiter().GetResult();
+
+    private static async Task<DeltaTable.DeferredSchemaChange> ComputeSchemaChangeAsync(
+        nint opener, string path, Func<DeltaTable, DeltaTable.DeferredSchemaChange> compute)
     {
         var fs = TableFileSystems.Create(opener, path);
-        var table = DeltaTable.OpenAsync(fs).GetAwaiter().GetResult();
+        var table = await DeltaTable.OpenAsync(fs).ConfigureAwait(false);
         try
         {
             return compute(table);
         }
         finally
         {
-            table.Dispose();
+            await table.DisposeAsync().ConfigureAwait(false);
         }
     }
 
@@ -675,9 +714,14 @@ internal static class DeltaReader
         nint opener, string path, IReadOnlyCollection<long> rowIds, CancellationToken ct,
         long? atVersion = null,
         List<(long?[] Ids, long?[] Versions)>? sourceTrackingOut = null)
+        => ReadRowsByRowIdsAsync(opener, path, rowIds, ct, atVersion, sourceTrackingOut).GetAwaiter().GetResult();
+
+    private static async Task<List<RecordBatch>> ReadRowsByRowIdsAsync(
+        nint opener, string path, IReadOnlyCollection<long> rowIds, CancellationToken ct,
+        long? atVersion, List<(long?[] Ids, long?[] Versions)>? sourceTrackingOut)
     {
         var fs = TableFileSystems.Create(opener, path);
-        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options()).GetAwaiter().GetResult();
+        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options()).ConfigureAwait(false);
         try
         {
             var ms = new System.IO.MemoryStream();
@@ -685,26 +729,26 @@ internal static class DeltaReader
             var e = table.ReadRowsByRowIdsAsync(rowIds, ct, atVersion, sourceTrackingOut).GetAsyncEnumerator(ct);
             try
             {
-                while (e.MoveNextAsync().AsTask().GetAwaiter().GetResult())
+                while (await e.MoveNextAsync().ConfigureAwait(false))
                 {
                     var b = e.Current;
                     w ??= new Apache.Arrow.Ipc.ArrowStreamWriter(ms, b.Schema, leaveOpen: true);
-                    w.WriteRecordBatchAsync(b, ct).GetAwaiter().GetResult();
+                    await w.WriteRecordBatchAsync(b, ct).ConfigureAwait(false);
                 }
             }
             finally
             {
-                e.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                await e.DisposeAsync().ConfigureAwait(false);
             }
             var result = new List<RecordBatch>();
             if (w is not null)
             {
-                w.WriteEndAsync(ct).GetAwaiter().GetResult();
+                await w.WriteEndAsync(ct).ConfigureAwait(false);
                 w.Dispose();
                 ms.Position = 0;
                 using var r = new Apache.Arrow.Ipc.ArrowStreamReader(ms);
                 RecordBatch? rb;
-                while ((rb = r.ReadNextRecordBatchAsync(ct).AsTask().GetAwaiter().GetResult()) is not null)
+                while ((rb = await r.ReadNextRecordBatchAsync(ct).ConfigureAwait(false)) is not null)
                 {
                     result.Add(rb);
                 }
@@ -713,7 +757,7 @@ internal static class DeltaReader
         }
         finally
         {
-            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            await table.DisposeAsync().ConfigureAwait(false);
         }
     }
 
@@ -721,13 +765,17 @@ internal static class DeltaReader
     /// <paramref name="rowIds"/> are ABSOLUTE transient rowids. Returns rows deleted.</summary>
     public static long DeleteByRowIdsViaVectors(nint opener, string path, IReadOnlyCollection<long> rowIds,
                                                 CancellationToken ct, bool rowLevelRetry = false)
+        => DeleteByRowIdsViaVectorsAsync(opener, path, rowIds, ct, rowLevelRetry).GetAwaiter().GetResult();
+
+    private static async Task<long> DeleteByRowIdsViaVectorsAsync(nint opener, string path,
+                                                IReadOnlyCollection<long> rowIds, CancellationToken ct, bool rowLevelRetry)
     {
         var fs = TableFileSystems.Create(opener, path);
-        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).AsTask().GetAwaiter().GetResult();
+        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).ConfigureAwait(false);
         try
         {
-            return table.DeleteByRowIdsViaVectorsAsync(rowIds, ct, rowLevelRetry: rowLevelRetry)
-                .AsTask().GetAwaiter().GetResult().RowsDeleted;
+            return (await table.DeleteByRowIdsViaVectorsAsync(rowIds, ct, rowLevelRetry: rowLevelRetry)
+                .ConfigureAwait(false)).RowsDeleted;
         }
         catch (DeltaConflictException ex)
         {
@@ -735,7 +783,7 @@ internal static class DeltaReader
         }
         finally
         {
-            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            await table.DisposeAsync().ConfigureAwait(false);
         }
     }
 
@@ -743,17 +791,20 @@ internal static class DeltaReader
     /// the latest, e.g. before an ADD COLUMN). <paramref name="unit"/> is "version" or "timestamp" (the DuckDB
     /// <c>AT</c> clause unit); <paramref name="value"/> is the BIGINT version or a parseable timestamp.</summary>
     public static Schema GetSchemaAt(nint opener, string path, string unit, string value)
+        => GetSchemaAtAsync(opener, path, unit, value).GetAwaiter().GetResult();
+
+    private static async Task<Schema> GetSchemaAtAsync(nint opener, string path, string unit, string value)
     {
         var fs = TableFileSystems.Create(opener, path);
-        var table = DeltaTable.OpenAsync(fs).GetAwaiter().GetResult();
+        var table = await DeltaTable.OpenAsync(fs).ConfigureAwait(false);
         try
         {
-            var snap = ResolveSnapshotAsync(table, unit, value, default).AsTask().GetAwaiter().GetResult();
+            var snap = await ResolveSnapshotAsync(table, unit, value, default).ConfigureAwait(false);
             return snap.ArrowSchema;
         }
         finally
         {
-            table.Dispose();
+            await table.DisposeAsync().ConfigureAwait(false);
         }
     }
 
@@ -801,16 +852,19 @@ internal static class DeltaReader
     /// <c>txn</c> action's per-app high-water mark — the idempotent-append mechanism), or null when the app
     /// never committed one. Reads the Delta log only.</summary>
     public static long? GetAppTransactionVersion(nint opener, string path, string appId)
+        => GetAppTransactionVersionAsync(opener, path, appId).GetAwaiter().GetResult();
+
+    private static async Task<long?> GetAppTransactionVersionAsync(nint opener, string path, string appId)
     {
         var fs = TableFileSystems.Create(opener, path);
-        var table = DeltaTable.OpenAsync(fs).AsTask().GetAwaiter().GetResult();
+        var table = await DeltaTable.OpenAsync(fs).ConfigureAwait(false);
         try
         {
             return table.CurrentSnapshot.AppTransactions.TryGetValue(appId, out var txn) ? txn.Version : null;
         }
         finally
         {
-            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            await table.DisposeAsync().ConfigureAwait(false);
         }
     }
 
@@ -1020,12 +1074,15 @@ internal static class DeltaReader
     /// <paramref name="path"/> as a metadata-only commit (no file rewrite); old files' missing values read back
     /// as NULL (engineered-wood backfills them). Opens with the standard write options (path_in_schema).</summary>
     public static void AddColumn(nint opener, string path, Field column, CancellationToken ct)
+        => AddColumnAsync(opener, path, column, ct).GetAwaiter().GetResult();
+
+    private static async Task AddColumnAsync(nint opener, string path, Field column, CancellationToken ct)
     {
         var fs = TableFileSystems.Create(opener, path);
-        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).AsTask().GetAwaiter().GetResult();
+        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).ConfigureAwait(false);
         try
         {
-            table.AddColumnAsync(column, ct).AsTask().GetAwaiter().GetResult();
+            await table.AddColumnAsync(column, ct).ConfigureAwait(false);
         }
         catch (DeltaConflictException)
         {
@@ -1033,7 +1090,7 @@ internal static class DeltaReader
         }
         finally
         {
-            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            await table.DisposeAsync().ConfigureAwait(false);
         }
     }
 
@@ -1041,12 +1098,16 @@ internal static class DeltaReader
     /// the containing struct). Old files backfill the new member as NULL on read.</summary>
     public static void AddField(
         nint opener, string path, IReadOnlyList<string> containerPath, Field field, CancellationToken ct)
+        => AddFieldAsync(opener, path, containerPath, field, ct).GetAwaiter().GetResult();
+
+    private static async Task AddFieldAsync(
+        nint opener, string path, IReadOnlyList<string> containerPath, Field field, CancellationToken ct)
     {
         var fs = TableFileSystems.Create(opener, path);
-        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).AsTask().GetAwaiter().GetResult();
+        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).ConfigureAwait(false);
         try
         {
-            table.AddFieldAsync(containerPath, field, ct).AsTask().GetAwaiter().GetResult();
+            await table.AddFieldAsync(containerPath, field, ct).ConfigureAwait(false);
         }
         catch (DeltaConflictException)
         {
@@ -1054,19 +1115,23 @@ internal static class DeltaReader
         }
         finally
         {
-            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            await table.DisposeAsync().ConfigureAwait(false);
         }
     }
 
     /// <summary>Renames a field INSIDE a nested struct (metadata-only; requires column mapping).</summary>
     public static void RenameField(
         nint opener, string path, IReadOnlyList<string> fieldPath, string newName, CancellationToken ct)
+        => RenameFieldAsync(opener, path, fieldPath, newName, ct).GetAwaiter().GetResult();
+
+    private static async Task RenameFieldAsync(
+        nint opener, string path, IReadOnlyList<string> fieldPath, string newName, CancellationToken ct)
     {
         var fs = TableFileSystems.Create(opener, path);
-        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).AsTask().GetAwaiter().GetResult();
+        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).ConfigureAwait(false);
         try
         {
-            table.RenameFieldAsync(fieldPath, newName, ct).AsTask().GetAwaiter().GetResult();
+            await table.RenameFieldAsync(fieldPath, newName, ct).ConfigureAwait(false);
         }
         catch (DeltaConflictException)
         {
@@ -1074,19 +1139,23 @@ internal static class DeltaReader
         }
         finally
         {
-            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            await table.DisposeAsync().ConfigureAwait(false);
         }
     }
 
     /// <summary>Drops a field INSIDE a nested struct (metadata-only; requires column mapping).</summary>
     public static void DropField(
         nint opener, string path, IReadOnlyList<string> fieldPath, CancellationToken ct)
+        => DropFieldAsync(opener, path, fieldPath, ct).GetAwaiter().GetResult();
+
+    private static async Task DropFieldAsync(
+        nint opener, string path, IReadOnlyList<string> fieldPath, CancellationToken ct)
     {
         var fs = TableFileSystems.Create(opener, path);
-        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).AsTask().GetAwaiter().GetResult();
+        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).ConfigureAwait(false);
         try
         {
-            table.DropFieldAsync(fieldPath, ct).AsTask().GetAwaiter().GetResult();
+            await table.DropFieldAsync(fieldPath, ct).ConfigureAwait(false);
         }
         catch (DeltaConflictException)
         {
@@ -1094,16 +1163,19 @@ internal static class DeltaReader
         }
         finally
         {
-            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            await table.DisposeAsync().ConfigureAwait(false);
         }
     }
 
     /// <summary>True when the table at <paramref name="path"/> has column mapping enabled (either mode) — a
     /// cheap log-only open used to gate operations whose rewrite path can't produce the mapped layout.</summary>
     public static bool IsColumnMapped(nint opener, string path)
+        => IsColumnMappedAsync(opener, path).GetAwaiter().GetResult();
+
+    private static async Task<bool> IsColumnMappedAsync(nint opener, string path)
     {
         var fs = TableFileSystems.Create(opener, path);
-        var table = DeltaTable.OpenAsync(fs).GetAwaiter().GetResult();
+        var table = await DeltaTable.OpenAsync(fs).ConfigureAwait(false);
         try
         {
             return EngineeredWood.DeltaLake.Schema.ColumnMapping.GetMode(table.CurrentSnapshot.Metadata.Configuration)
@@ -1111,7 +1183,7 @@ internal static class DeltaReader
         }
         finally
         {
-            table.Dispose();
+            await table.DisposeAsync().ConfigureAwait(false);
         }
     }
 
@@ -1120,12 +1192,16 @@ internal static class DeltaReader
     /// physicalName + columnMapping.id, so old files read unchanged under the new logical name); a plain table is
     /// rejected there.</summary>
     public static void RenameColumn(nint opener, string path, string oldName, string newName, CancellationToken ct)
+        => RenameColumnAsync(opener, path, oldName, newName, ct).GetAwaiter().GetResult();
+
+    private static async Task RenameColumnAsync(
+        nint opener, string path, string oldName, string newName, CancellationToken ct)
     {
         var fs = TableFileSystems.Create(opener, path);
-        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).AsTask().GetAwaiter().GetResult();
+        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).ConfigureAwait(false);
         try
         {
-            table.RenameColumnAsync(oldName, newName, ct).AsTask().GetAwaiter().GetResult();
+            await table.RenameColumnAsync(oldName, newName, ct).ConfigureAwait(false);
         }
         catch (DeltaConflictException)
         {
@@ -1133,7 +1209,7 @@ internal static class DeltaReader
         }
         finally
         {
-            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            await table.DisposeAsync().ConfigureAwait(false);
         }
     }
 
@@ -1141,12 +1217,15 @@ internal static class DeltaReader
     /// <see cref="DeltaTable.DropColumnAsync"/>. Requires a column-mapping table (old files keep the physical
     /// column; readers reconcile it away against the current schema); a plain table is rejected there.</summary>
     public static void DropColumn(nint opener, string path, string name, CancellationToken ct)
+        => DropColumnAsync(opener, path, name, ct).GetAwaiter().GetResult();
+
+    private static async Task DropColumnAsync(nint opener, string path, string name, CancellationToken ct)
     {
         var fs = TableFileSystems.Create(opener, path);
-        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).AsTask().GetAwaiter().GetResult();
+        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).ConfigureAwait(false);
         try
         {
-            table.DropColumnAsync(name, ct).AsTask().GetAwaiter().GetResult();
+            await table.DropColumnAsync(name, ct).ConfigureAwait(false);
         }
         catch (DeltaConflictException)
         {
@@ -1154,7 +1233,7 @@ internal static class DeltaReader
         }
         finally
         {
-            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            await table.DisposeAsync().ConfigureAwait(false);
         }
     }
 
@@ -1164,6 +1243,10 @@ internal static class DeltaReader
     /// row-id columns — a separate slice); the DATA is correct.</summary>
     public static long Optimize(nint opener, string path, CancellationToken ct, bool nativeWrite = false,
                                 bool nativeRead = false)
+        => OptimizeAsync(opener, path, ct, nativeWrite, nativeRead).GetAwaiter().GetResult();
+
+    private static async Task<long> OptimizeAsync(nint opener, string path, CancellationToken ct,
+                                bool nativeWrite, bool nativeRead)
     {
         var fs = TableFileSystems.Create(opener, path);
         // native_write => DuckDB's parquet writer produces the compacted files (bloom/stats/footer), so an
@@ -1176,11 +1259,11 @@ internal static class DeltaReader
         var fileReader = nativeRead && NativeParquetDataFileReader.Available
             ? new NativeParquetDataFileReader(path)
             : null;
-        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(dataFileWriter: writer, dataFileReader: fileReader), ct)
-            .AsTask().GetAwaiter().GetResult();
+        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(dataFileWriter: writer, dataFileReader: fileReader), ct)
+            .ConfigureAwait(false);
         try
         {
-            var v = table.CompactAsync(null, ct).AsTask().GetAwaiter().GetResult();
+            var v = await table.CompactAsync(null, ct).ConfigureAwait(false);
             DmlLog.LogInformation("delta optimize {Path}: {Result} writer={Writer}", path,
                 v.HasValue ? $"compacted → v{v.Value}" : "nothing to compact",
                 writer is null ? "engineered-wood" : "native-duckdb");
@@ -1188,7 +1271,7 @@ internal static class DeltaReader
         }
         finally
         {
-            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            await table.DisposeAsync().ConfigureAwait(false);
         }
     }
 
@@ -1196,20 +1279,24 @@ internal static class DeltaReader
     /// retention period (default the table's <c>VacuumRetention</c>). <paramref name="dryRun"/> lists without
     /// deleting. Returns the number of files deleted (0 on a dry run).</summary>
     public static long Vacuum(nint opener, string path, bool dryRun, double? retentionHours, CancellationToken ct)
+        => VacuumAsync(opener, path, dryRun, retentionHours, ct).GetAwaiter().GetResult();
+
+    private static async Task<long> VacuumAsync(
+        nint opener, string path, bool dryRun, double? retentionHours, CancellationToken ct)
     {
         var fs = TableFileSystems.Create(opener, path);
-        var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).AsTask().GetAwaiter().GetResult();
+        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).ConfigureAwait(false);
         try
         {
             System.TimeSpan? retention = retentionHours is { } h ? System.TimeSpan.FromHours(h) : null;
-            var r = table.VacuumAsync(retention, dryRun, ct).AsTask().GetAwaiter().GetResult();
+            var r = await table.VacuumAsync(retention, dryRun, ct).ConfigureAwait(false);
             DmlLog.LogInformation("delta vacuum {Path}: files_deleted={Files} dry_run={Dry}",
                 path, r.FilesDeleted, dryRun);
             return r.FilesDeleted;
         }
         finally
         {
-            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            await table.DisposeAsync().ConfigureAwait(false);
         }
     }
 
@@ -1221,6 +1308,12 @@ internal static class DeltaReader
         System.Func<long, IReadOnlyList<RecordBatch>, IReadOnlyList<RecordBatch>> rewriteFile, CancellationToken ct,
         bool nativeWrite = false, IDataFileRewriter? rewriter = null, bool nativeRead = false,
         bool rowLevelRetry = false)
+        => UpdateByRowIdsAsync(opener, path, rowIds, rewriteFile, ct, nativeWrite, rewriter, nativeRead, rowLevelRetry)
+            .GetAwaiter().GetResult();
+
+    private static async Task UpdateByRowIdsAsync(nint opener, string path, IReadOnlyCollection<long> rowIds,
+        System.Func<long, IReadOnlyList<RecordBatch>, IReadOnlyList<RecordBatch>> rewriteFile, CancellationToken ct,
+        bool nativeWrite, IDataFileRewriter? rewriter, bool nativeRead, bool rowLevelRetry)
     {
         var fs = TableFileSystems.Create(opener, path);
         // native_write => DuckDB's parquet writer produces the rewritten file (bloom/stats/footer) AND, when the
@@ -1235,9 +1328,9 @@ internal static class DeltaReader
         var fileReader = nativeRead && NativeParquetDataFileReader.Available
             ? new NativeParquetDataFileReader(path)
             : null;
-        var table = DeltaTable.OpenAsync(fs,
+        var table = await DeltaTable.OpenAsync(fs,
                 DeltaWriter.Options(dataFileWriter: writer, dataFileRewriter: rewriter, dataFileReader: fileReader), ct)
-            .AsTask().GetAwaiter().GetResult();
+            .ConfigureAwait(false);
         try
         {
             // On a nested column-mapping table the source batches engineered-wood hands the callback carry
@@ -1259,8 +1352,8 @@ internal static class DeltaReader
                     return inner(ordinal, logical);
                 };
             }
-            table.UpdateByRowIdsAsync(rowIds, rewriteFile, ct, rowLevelRetry: rowLevelRetry)
-                .AsTask().GetAwaiter().GetResult();
+            await table.UpdateByRowIdsAsync(rowIds, rewriteFile, ct, rowLevelRetry: rowLevelRetry)
+                .ConfigureAwait(false);
             DmlLog.LogInformation("delta update-rewrite {Path}: rowids={RowIds} writer={Writer} rewriter={Rewriter}",
                 path, rowIds.Count, writer is null ? "engineered-wood" : "native-duckdb",
                 rewriter is null ? "engineered-wood" : "native-duckdb");
@@ -1271,7 +1364,7 @@ internal static class DeltaReader
         }
         finally
         {
-            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            await table.DisposeAsync().ConfigureAwait(false);
         }
     }
 }

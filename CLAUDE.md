@@ -62,10 +62,33 @@ WARN (benign — global functions pass).
 The documented shape (thin sync ABI wrapper that blocks ONCE on a private `async` core using
 `ConfigureAwait(false)` throughout) is now demonstrated + verified on the leaf `DeltaReader.GetActiveFileUris`
 (exemplar with an inline doc comment; native_read suite green — confirms the AsyncLocal ambients flow across the
-pool-thread hops). The remaining ~147 `.GetAwaiter().GetResult()`-at-every-await sites (DeltaReader 65 more,
-DeltaCatalog 29, DeltaGlobalTableFunction/OneLakeForwardFs/… ) are the **prescribed incremental follow-up** —
-leaf-first, one seam at a time, `verify_delta_catalog_*` after each, never a blind sweep (the ambient-loss
-landmine only surfaces on live OneLake / explicit txns). Adopt the sync-wrapper→async-core shape for NEW code now.
+pool-thread hops). **`DeltaReader.cs` is now FULLY converted (2026-07-15, C#-only)**: every leaf ABI-facing method
+(the read-only log probes `GetSchema`/`GetSchemaAndRowTracking`/`IsDeletionVectorsEnabled`/`IsColumnMapped`/
+`GetTxnDmlProfile`/`GetAppTransactionVersion`/`GetOrderedActiveBaseRowIds`/`ComputeSchemaChange`/`ResolveVersionAsOf`/
+`GetSchemaAt`; the DML/maintenance ops `DeleteByRowIds`/`DeleteByRowIdsViaVectors`/`UpdateByRowIds`/`Optimize`/
+`Vacuum`/`AddColumn`/`AddField`/`RenameField`/`DropField`/`RenameColumn`/`DropColumn`; the list/read-back paths
+`ListNativeScanFiles`/`ListScanFilesJson`/`ReadRowsByRowIds`) is now a thin sync wrapper (`=> XxxAsync(...).GetAwaiter().GetResult()`)
+over a private `XxxAsync` core using `ConfigureAwait(false)` at every await — retiring the per-await
+`.GetAwaiter().GetResult()`/`.AsTask().GetAwaiter().GetResult()` form. (The `Stream*`/`GetChanges`/`GetSnapshots`
+paths already had async cores; their remaining single blocking points are deliberate schema-peeks, not per-await.)
+Verified: the FULL delta sweep green (24 suites, ~2500 assertions — write/delete/update/optimize/alter/native_read/
+native_write/native_write_streaming/transactions 941/time_travel/row_tracking_virtual 299/txn_version/late_mat/
+column_mapping/partition/partition_overwrite/dv/dv_default/variant 133/nested_alter/struct_filter/dynamic_filter/
+compaction_rowtracking/copy_format/decimal/temporal/schemas/constraints/rename). **Remaining sync-over-async sites
+(the prescribed incremental follow-up, leaf-first, `verify_delta_catalog_*` after each, never a blind sweep):
+DeltaCatalog ~29, DeltaGlobalTableFunction/OneLakeForwardFs/…** The ambient-loss landmine stays disarmed (AsyncLocal,
+`0533eb7`). Adopt the sync-wrapper→async-core shape for NEW code now.
+
+**Rename-scope gap FIXED en route (2026-07-15):** the FABRICATOR rename (`2a26b7a`) renamed the C++ variant marker
+`kVariantExtensionName` → `"fabricator.variant"` but engineered-wood (a SIBLING repo, out of the blanket rename's
+scope) kept `SchemaConverter.VariantExtensionName = "arrownet.variant"` — so the C++↔C# variant round-trip name
+MISMATCHED and every VARIANT column bound as raw `BLOB` (INSERT → "Can't convert VARIANT(OBJECT) to 'BLOB'"). The
+variant Arrow name is our PRIVATE boundary discriminator (re-stamped on every read from the Delta/parquet variant
+annotation — not persisted-authoritative), deliberately NOT the reserved-canonical `arrow.variant` (whose storage is
+`struct<metadata,value>`; ours is a single self-delimiting blob → a canonical name would collide with DuckDB/arrow-c++
+built-in handlers). Fixed EW → `"fabricator.variant"` (matches C++); `verify_delta_catalog_variant` 133 green. **This is
+an ENGINEERED-WOOD working-tree change — not yet committed/pushed** (EW commits/pushes only on explicit request /
+"ew push"); it must land in EW for a clean EW checkout to build variant correctly.
 
 ## Architecture (layered for reuse)
 
