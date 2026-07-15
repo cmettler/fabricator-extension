@@ -269,6 +269,10 @@ public unsafe struct FabricatorHostServices
     // void host_log(int32 level, const char* log_type, const char* message) — forward an ILogger event into
     // DuckDB's internal logging (duckdb_logs). Best-effort; no error out. Additive (ABI v58).
     public delegate* unmanaged[Cdecl]<int, byte*, byte*, void> HostLog;
+    // int32 is_interrupted(void* opener) — read the calling operator's ClientContext::interrupted (Ctrl+C /
+    // query timeout). Returns 1 if interrupted else 0 (0 for a null opener). Polled by InterruptScope to cancel
+    // long-running C# I/O. Additive (ABI v65). See docs/cancellation.md.
+    public delegate* unmanaged[Cdecl]<nint, int> IsInterrupted;
 }
 
 /// <summary>Mirrors <c>FabricatorHostInputs</c> in abi.h — named Arrow streams handed to host_query as data-in

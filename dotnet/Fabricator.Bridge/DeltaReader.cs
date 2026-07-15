@@ -470,7 +470,7 @@ internal static class DeltaReader
             // on high-cardinality columns) — natively-written files carry blooms on dict-encoded columns.
             : new ParquetReadOptions { Filter = filter, FilterUseBloomFilters = true };
         var options = DeltaTableOptions.Default with { ParquetReadOptions = parquet };
-        return StreamImpl(fs, options, columns, filter, ct);
+        return StreamImpl(opener, fs, options, columns, filter, ct);
     }
 
     // Returns the snapshot's mapped Delta schema when the table has column mapping AND nested (struct-carrying)
@@ -485,14 +485,19 @@ internal static class DeltaReader
             ? snap.Schema : null;
 
     private static async IAsyncEnumerable<RecordBatch> StreamImpl(
-        ITableFileSystem fs, DeltaTableOptions options, IReadOnlyList<string>? columns,
+        nint opener, ITableFileSystem fs, DeltaTableOptions options, IReadOnlyList<string>? columns,
         Predicate? filter, [EnumeratorCancellation] CancellationToken ct)
     {
-        var table = await DeltaTable.OpenAsync(fs, options, ct).ConfigureAwait(false);
+        // Cancel long-running reads (a big OneLake/S3 row-group) when the query is interrupted (Ctrl+C /
+        // timeout): the scope polls DuckDB's interrupt flag and trips this token, which engineered-wood honors
+        // between chunks. See docs/cancellation.md.
+        using var interrupt = new InterruptScope(opener, ct);
+        var token = interrupt.Token;
+        var table = await DeltaTable.OpenAsync(fs, options, token).ConfigureAwait(false);
         try
         {
             var nested = NestedMappedSchema(table.CurrentSnapshot);
-            await foreach (var batch in table.ReadAllAsync(columns, filter, ct).ConfigureAwait(false))
+            await foreach (var batch in table.ReadAllAsync(columns, filter, token).ConfigureAwait(false))
             {
                 yield return nested is null
                     ? batch
@@ -518,18 +523,20 @@ internal static class DeltaReader
             // on high-cardinality columns) — natively-written files carry blooms on dict-encoded columns.
             : new ParquetReadOptions { Filter = filter, FilterUseBloomFilters = true };
         var options = DeltaTableOptions.Default with { ParquetReadOptions = parquet };
-        return StreamWithRowIdsImpl(fs, options, columns, filter, ct);
+        return StreamWithRowIdsImpl(opener, fs, options, columns, filter, ct);
     }
 
     private static async IAsyncEnumerable<RecordBatch> StreamWithRowIdsImpl(
-        ITableFileSystem fs, DeltaTableOptions options, IReadOnlyList<string>? columns,
+        nint opener, ITableFileSystem fs, DeltaTableOptions options, IReadOnlyList<string>? columns,
         Predicate? filter, [EnumeratorCancellation] CancellationToken ct)
     {
-        var table = await DeltaTable.OpenAsync(fs, options, ct).ConfigureAwait(false);
+        using var interrupt = new InterruptScope(opener, ct);
+        var token = interrupt.Token;
+        var table = await DeltaTable.OpenAsync(fs, options, token).ConfigureAwait(false);
         try
         {
             var nested = NestedMappedSchema(table.CurrentSnapshot);
-            await foreach (var batch in table.ReadAllWithRowIdsAsync(columns, filter, ct).ConfigureAwait(false))
+            await foreach (var batch in table.ReadAllWithRowIdsAsync(columns, filter, token).ConfigureAwait(false))
             {
                 yield return nested is null
                     ? batch
@@ -822,19 +829,21 @@ internal static class DeltaReader
             // on high-cardinality columns) — natively-written files carry blooms on dict-encoded columns.
             : new ParquetReadOptions { Filter = filter, FilterUseBloomFilters = true };
         var options = DeltaTableOptions.Default with { ParquetReadOptions = parquet };
-        return StreamAtImpl(fs, options, columns, filter, unit, value, ct);
+        return StreamAtImpl(opener, fs, options, columns, filter, unit, value, ct);
     }
 
     private static async IAsyncEnumerable<RecordBatch> StreamAtImpl(
-        ITableFileSystem fs, DeltaTableOptions options, IReadOnlyList<string>? columns, Predicate? filter,
+        nint opener, ITableFileSystem fs, DeltaTableOptions options, IReadOnlyList<string>? columns, Predicate? filter,
         string unit, string value, [EnumeratorCancellation] CancellationToken ct)
     {
-        var table = await DeltaTable.OpenAsync(fs, options, ct).ConfigureAwait(false);
+        using var interrupt = new InterruptScope(opener, ct);
+        var token = interrupt.Token;
+        var table = await DeltaTable.OpenAsync(fs, options, token).ConfigureAwait(false);
         try
         {
-            var snap = await ResolveSnapshotAsync(table, unit, value, ct).ConfigureAwait(false);
+            var snap = await ResolveSnapshotAsync(table, unit, value, token).ConfigureAwait(false);
             var nested = NestedMappedSchema(snap); // the AS-OF snapshot names the columns
-            await foreach (var batch in table.ReadAtVersionAsync(snap.Version, columns, filter, ct)
+            await foreach (var batch in table.ReadAtVersionAsync(snap.Version, columns, filter, token)
                                .ConfigureAwait(false))
             {
                 yield return nested is null
@@ -1025,19 +1034,21 @@ internal static class DeltaReader
             // on high-cardinality columns) — natively-written files carry blooms on dict-encoded columns.
             : new ParquetReadOptions { Filter = filter, FilterUseBloomFilters = true };
         var options = DeltaTableOptions.Default with { ParquetReadOptions = parquet };
-        return StreamWithRowIdsAtImpl(fs, options, columns, filter, unit, value, ct);
+        return StreamWithRowIdsAtImpl(opener, fs, options, columns, filter, unit, value, ct);
     }
 
     private static async IAsyncEnumerable<RecordBatch> StreamWithRowIdsAtImpl(
-        ITableFileSystem fs, DeltaTableOptions options, IReadOnlyList<string>? columns, Predicate? filter,
+        nint opener, ITableFileSystem fs, DeltaTableOptions options, IReadOnlyList<string>? columns, Predicate? filter,
         string unit, string value, [EnumeratorCancellation] CancellationToken ct)
     {
-        var table = await DeltaTable.OpenAsync(fs, options, ct).ConfigureAwait(false);
+        using var interrupt = new InterruptScope(opener, ct);
+        var token = interrupt.Token;
+        var table = await DeltaTable.OpenAsync(fs, options, token).ConfigureAwait(false);
         try
         {
-            var snap = await ResolveSnapshotAsync(table, unit, value, ct).ConfigureAwait(false);
+            var snap = await ResolveSnapshotAsync(table, unit, value, token).ConfigureAwait(false);
             var nested = NestedMappedSchema(snap); // the AS-OF snapshot names the columns
-            await foreach (var batch in table.ReadAtVersionWithRowIdsAsync(snap.Version, columns, filter, ct)
+            await foreach (var batch in table.ReadAtVersionWithRowIdsAsync(snap.Version, columns, filter, token)
                                .ConfigureAwait(false))
             {
                 yield return nested is null

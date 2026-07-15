@@ -30,6 +30,22 @@ internal static unsafe class HostFs
     /// <summary>True once the host registered the host_log callback (DuckDB internal logging forward).</summary>
     public static bool CanLog => _set && _h.HostLog != null;
 
+    /// <summary>True once the host registered the is_interrupted callback (ClientContext interrupt flag).</summary>
+    public static bool CanInterrupt => _set && _h.IsInterrupted != null;
+
+    /// <summary>Reads the calling operator's interrupt flag (Ctrl+C / query timeout) via the host
+    /// <c>is_interrupted</c> callback. Returns false when unavailable or the opener is null. Polled by
+    /// <see cref="InterruptScope"/> to cancel long-running C# I/O. Never throws.</summary>
+    public static bool IsInterrupted(nint opener)
+    {
+        if (!CanInterrupt || opener == 0)
+        {
+            return false;
+        }
+        try { return _h.IsInterrupted(opener) != 0; }
+        catch { return false; }
+    }
+
     /// <summary>Forwards a log event into DuckDB's internal logging (duckdb_logs). Best-effort — never throws.</summary>
     public static void Log(int level, string category, string message)
     {

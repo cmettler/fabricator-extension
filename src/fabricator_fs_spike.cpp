@@ -305,6 +305,18 @@ int32_t HostFsMoveDir(FabricatorHandle opener, const char *src, const char *dest
 	}
 }
 
+// Read the calling operator's interrupt flag (ClientContext::interrupted — an atomic<bool> set by Ctrl+C via
+// Connection::Interrupt() or a query timeout). A managed poller (InterruptScope) calls this to cancel a
+// long-running C# I/O so the query stops promptly instead of hanging until the blocking call returns. No
+// error out — a null opener (defensive) or any inability to read simply reports "not interrupted".
+int32_t HostIsInterrupted(FabricatorHandle opener) {
+	auto *ctx = reinterpret_cast<ClientContext *>(opener);
+	if (!ctx) {
+		return 0;
+	}
+	return ctx->interrupted ? 1 : 0;
+}
+
 void InstallHostFsServices() {
 	FabricatorHostServices services {};
 	services.abi_version = FABRICATOR_ABI_VERSION;
@@ -321,6 +333,7 @@ void InstallHostFsServices() {
 	services.fs_create_dir = HostFsCreateDir;
 	services.fs_remove_dir = HostFsRemoveDir;
 	services.fs_move_dir = HostFsMoveDir;
+	services.is_interrupted = HostIsInterrupted;
 	fabricator::SetHostServices(services);
 }
 

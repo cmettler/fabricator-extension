@@ -806,13 +806,22 @@ typedef struct FabricatorHostServices {
 	// `log_type` = the logger category, `message` = the formatted line. Best-effort (no error out); a no-op if
 	// the host has no database/logger. Additive host-service entry (ABI v58).
 	void (*host_log)(int32_t level, const char *log_type, const char *message);
+
+	// Read the calling operator's interrupt flag (ClientContext::interrupted — set by Ctrl+C via
+	// Connection::Interrupt() or by a query timeout). `opener` is the same host FileOpener handle (a
+	// ClientContext*) the fs_* callbacks receive; returns 1 when the query is interrupted, else 0 (0 also for
+	// a null opener). Lets a managed poller (InterruptScope) trip a CancellationToken so long-running C# I/O
+	// (a blocking OneLake/S3/SQL read) is cancelled when a Ctrl+C would otherwise hang the shell — DuckDB only
+	// checks interruption BETWEEN operator calls, so a single blocking get_next is invisible to it. Additive
+	// host-service entry (ABI v65). See docs/cancellation.md.
+	int32_t (*is_interrupted)(FabricatorHandle opener);
 } FabricatorHostServices;
 
 // Max serialized size of a spillable aggregate's per-group state (the inline, pointer-free
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 64
+#define FABRICATOR_ABI_VERSION 65
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

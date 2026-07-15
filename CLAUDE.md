@@ -1824,7 +1824,37 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `FabricLakehouse.IsOneLake` abfss check, so it rides the plain host-FS path with opener-resolved secrets —
   which is exactly right). Kernel reads the outputs (known quirk unchanged: kernel shows a MAPPED partitioned
   table's partition column as NULL; plain shape exact).
-- **Current version: ABI v64** (v64 = **`onelake_move`** — atomic single-file rename via the ADLS Gen2
+- **Current version: ABI v65** (v65 = **`is_interrupted`** — a host→managed reverse callback on
+  `FabricatorHostServices` reading the calling operator's `ClientContext::interrupted` (the atomic set by
+  Ctrl+C via `Connection::Interrupt()` or a query timeout). The opener handle already IS a `ClientContext*`
+  (the `fs_*` secret-resolution handle), so `HostIsInterrupted` is a one-line cast+read. **Cancellation
+  Tier 1 — design + tiers: [docs/cancellation.md](docs/cancellation.md).** THE PROBLEM: C# CancellationTokens
+  were dead-wired (~124 `default` sites; the only real CTS was BulkSession's internal consumer-exit); sync
+  SqlClient/ADOMD ignore tokens; and the C++ extension never checked interruption — so a query parked inside a
+  single long-blocking C# I/O call (a big OneLake/S3 read, a slow SQL scan, a hung socket) could only be
+  cancelled AFTER that call returned (DuckDB cancels BETWEEN `get_next` calls — `pipeline_executor.cpp` throws
+  `InterruptException` on `context.interrupted` — but a blocked `get_next` holds the pipeline). THE FIX (this
+  slice): `is_interrupted` + a C# **`InterruptScope`** (a per-operation `CancellationTokenSource` + a
+  `System.Threading.Timer` polling `is_interrupted(opener)` every 50 ms on a pool thread — NOT the blocked
+  task thread — that trips the token on interrupt; `Dispose` waits for any in-flight callback so no poll
+  outlives the `ClientContext`). Wired into the **engineered-wood streaming read paths**
+  (`DeltaReader.Stream`/`StreamWithRowIds`/`StreamAt`/`StreamWithRowIdsAt` → their `*Impl` cores now take the
+  opener, build an `InterruptScope`, and pass its token to `DeltaTable.OpenAsync`/`ReadAllAsync*` — EW already
+  honors it, so a long OneLake/S3 batch read cancels between chunks). A never-tripped token is BYTE-NEUTRAL
+  (full delta sweep + SQL fn suites green at v65). **Remaining tiers (deferred, in the doc): Tier 2** —
+  convert `SqlServerBackend`'s hot scan/DML sites to **async SqlClient + token** (`ExecuteReaderAsync`/
+  `ReadAsync`/`ExecuteNonQueryAsync`; the token cancels natively — Microsoft's model, no `SqlCommand.Cancel()`
+  trick) and **`SqlBulkCopy` via the reader-throw** (feed `ArrowDataReader` the token → `ChannelArrowStream.
+  ReadNextRecordBatchAsync(ct)` → `WaitToReadAsync(ct)` throws out of `WriteToServer`, the mechanism
+  `BulkSession.Abort()` already proves — no `WriteToServerAsync` needed) + an optional `command_timeout`
+  setting (`CancelAfter`, closing the hung-socket hole); **Tier 3** — DAX/ADOMD via `AdomdCommand.Cancel()`
+  (no usable async); **Tier 4** — the arrow scan as a DuckDB async/BLOCKED source (`InterruptState`) to free
+  the task thread during I/O (native interrupt + better parallelism, bigger). Live Ctrl+C behavior is a
+  MANUAL check (a slow OneLake/SQL query + interrupt); the suites verify only behavior-neutrality.
+  **STALE-BINARY:** the ABI bump v64→v65 means the loadable + linux payload (last built at v64) are now
+  ABI-mismatched — rebuild `fabricator_loadable_extension` (+ the linux payload) before the next dbt/notebook
+  run, else `Bootstrap.Initialize returned … ABI version mismatch`.)
+- **Prior: ABI v64** (v64 = **`onelake_move`** — atomic single-file rename via the ADLS Gen2
   DFS **native rename** (`DataLakeFileClient.RenameAsync`, a metadata op that overwrites an existing
   destination = MoveFile semantics; destination path filesystem-relative with the `<item>.Lakehouse`
   leading segment, same quirk as `FabricLakehouse.RenameDirectory`; same-workspace only). The onelake FS
