@@ -123,6 +123,12 @@ typedef enum {
 	                                    // SELECT *). Delta: __delta_row_id / __delta_row_commit_version
 	                                    // (stable row tracking) under native_read + enableRowTracking;
 	                                    // others: empty. Additive, no ABI bump; fetch is best-effort.
+	FABRICATOR_META_TBLPROPERTIES = 13,     // Delta only: a table's delta.* properties as (property, value)
+	                                    // rows. arg1 = 'schema.table' ref. fabricator_delta_tblproperties(...).
+	FABRICATOR_META_SET_TBLPROPERTIES = 14, // Delta only: SET/UNSET table properties via a metaData commit.
+	                                    // arg1 = 'schema.table' ref, arg2 = JSON object of property->value
+	                                    // (null value = UNSET). fabricator_delta_set_tblproperties(...).
+	                                    // Additive, no ABI bump.
 } FabricatorMetadataKind;
 
 // -----------------------------------------------------------------------------

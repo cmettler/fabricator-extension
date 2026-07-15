@@ -338,6 +338,14 @@ public static class MetadataKind
     // __delta_row_commit_version (both BIGINT — the STABLE row-tracking id/version, unlike the
     // transient _metadata.row_id rowid). Other providers: empty.
     public const int VirtualColumns = 12;
+    // Delta only: a table's delta.* properties as (property, value) rows. arg1 = 'schema.table' ref.
+    // Surfaced by fabricator_delta_tblproperties(catalog, 'schema.table').
+    public const int TblProperties = 13;
+    // Delta only: SET/UNSET table properties via a metaData commit (merged configuration). arg1 =
+    // 'schema.table' ref, arg2 = a JSON object property->value (a null value UNSETs the key). Feature-
+    // enabling keys (delta.enable*, columnMapping.mode) are rejected — those need a protocol upgrade at
+    // CREATE. Surfaced by fabricator_delta_set_tblproperties(catalog, 'schema.table', properties).
+    public const int SetTblProperties = 14;
 }
 
 internal static class FabricatorStatus

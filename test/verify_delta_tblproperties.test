@@ -1,0 +1,136 @@
+# name: test/verify_delta_tblproperties.test
+# description: Generic Delta table-property functions (fabricator_delta_tblproperties / _set_tblproperties) +
+#              honoring delta.isolationLevel per-table (the TABLE property overrides the catalog default).
+# group: [fabricator]
+
+require fabricator
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+# ---- Slice 1: SET / READ / UNSET round-trip (metaData commit; kernel-valid) ----
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/tp' AS lake (TYPE fabricator, PROVIDER 'delta', deletion_vectors false, column_mapping 'none');
+
+statement ok
+CREATE TABLE lake.main.t AS SELECT i AS id FROM range(3) t(i);
+
+# a fresh plain table has no delta.* properties
+query I
+SELECT count(*) FROM fabricator_delta_tblproperties('lake', 'main.t');
+----
+0
+
+# SET two properties -> one metaData commit; the applied rows are echoed
+query TT
+SELECT property, value FROM fabricator_delta_set_tblproperties('lake', 'main.t', '{"delta.isolationLevel":"Serializable","custom.owner":"cm"}') ORDER BY 1;
+----
+custom.owner	cm
+delta.isolationLevel	Serializable
+
+# read back
+query TT
+SELECT property, value FROM fabricator_delta_tblproperties('lake', 'main.t') ORDER BY 1;
+----
+custom.owner	cm
+delta.isolationLevel	Serializable
+
+# UNSET (null value) removes the key
+statement ok
+SELECT * FROM fabricator_delta_set_tblproperties('lake', 'main.t', '{"custom.owner":null}');
+
+query T
+SELECT value FROM fabricator_delta_tblproperties('lake', 'main.t') WHERE property = 'delta.isolationLevel';
+----
+Serializable
+
+query I
+SELECT count(*) FROM fabricator_delta_tblproperties('lake', 'main.t') WHERE property = 'custom.owner';
+----
+0
+
+# feature-enabling keys are rejected (need a protocol upgrade at CREATE)
+statement error
+SELECT * FROM fabricator_delta_set_tblproperties('lake', 'main.t', '{"delta.enableChangeDataFeed":"true"}');
+----
+enables a table FEATURE
+
+# survives re-attach (it's a real metaData commit)
+statement ok
+DETACH lake;
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/tp' AS lake2 (TYPE fabricator, PROVIDER 'delta');
+
+query T
+SELECT value FROM fabricator_delta_tblproperties('lake2', 'main.t') WHERE property = 'delta.isolationLevel';
+----
+Serializable
+
+statement ok
+DETACH lake2;
+
+# ---- Slice 2: the TABLE's delta.isolationLevel OVERRIDES the catalog default ----
+# Both connections use a DEFAULT (write_serializable) catalog. With the table property = Serializable, a
+# concurrent blind append matching the transaction's read predicate is a REAL conflict — proving our writer
+# honors the TABLE property, not the catalog-wide default.
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/iso' AS db (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE db.main.t AS SELECT i AS id, 'x' AS name FROM range(10) t(i);
+
+# make the table Serializable via the generic setter (the catalog stays write_serializable default)
+statement ok
+SELECT * FROM fabricator_delta_set_tblproperties('db', 'main.t', '{"delta.isolationLevel":"Serializable"}');
+
+statement ok con1
+BEGIN;
+
+# the DELETE's scan records read predicate id = 1
+statement ok con1
+DELETE FROM db.main.t WHERE id = 1;
+
+# a concurrent blind append MATCHING that predicate (autocommit on the same path)
+statement ok con2
+INSERT INTO db.main.t VALUES (1, 'dup');
+
+# under Serializable (the TABLE property, overriding the write_serializable catalog default) this CONFLICTS
+statement error con1
+COMMIT;
+----
+transaction conflict
+
+# con1 rolled back; the concurrent duplicate landed
+query I
+SELECT count(*) FROM db.main.t WHERE id = 1;
+----
+2
+
+# Now UNSET the property -> the table falls back to the catalog default (write_serializable): the same
+# matching concurrent append COMMUTES (the commit rebases on top of it), no conflict.
+statement ok
+SELECT * FROM fabricator_delta_set_tblproperties('db', 'main.t', '{"delta.isolationLevel":null}');
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+DELETE FROM db.main.t WHERE id = 3;
+
+statement ok con2
+INSERT INTO db.main.t VALUES (3, 'dup2');
+
+# write_serializable: commutes -> COMMIT succeeds. con1's DELETE of the original id=3 applies AND con2's
+# appended (3,'dup2') is kept -> exactly one id=3 row remains (the dup), proving the commit landed.
+statement ok con1
+COMMIT;
+
+query I
+SELECT count(*) FROM db.main.t WHERE id = 3;
+----
+1
+
+statement ok
+DETACH db;

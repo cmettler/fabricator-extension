@@ -421,6 +421,42 @@ static unique_ptr<FunctionData> SetTxnVersionBind(ClientContext &context, TableF
 	return std::move(bind_data);
 }
 
+// fabricator_delta_tblproperties(catalog, 'schema.table') / _set_tblproperties(catalog, 'schema.table',
+// properties): read / SET the Delta table's delta.* properties. Both return (property, value) VARCHAR rows.
+static void TblPropertiesSchema(vector<LogicalType> &return_types, vector<string> &names) {
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
+	names = {"property", "value"};
+}
+
+static unique_ptr<FunctionData> TblPropertiesBind(ClientContext &context, TableFunctionBindInput &input,
+                                                  vector<LogicalType> &return_types, vector<string> &names) {
+	auto catalog_name = input.inputs[0].GetValue<string>();
+	auto table_ref = input.inputs[1].GetValue<string>();
+	auto bind_data = make_uniq<FabricatorFunctionsBindData>();
+	bind_data->handle = ResolveConnection(context, catalog_name, bind_data->owns_handle);
+	auto handle = bind_data->handle;
+	bind_data->factory = [handle, table_ref](const fabricator::ArrowScanRequest &, ArrowArrayStream &out) {
+		fabricator::GetMetadata(handle, FABRICATOR_META_TBLPROPERTIES, table_ref, "", out);
+	};
+	TblPropertiesSchema(return_types, names);
+	return std::move(bind_data);
+}
+
+static unique_ptr<FunctionData> SetTblPropertiesBind(ClientContext &context, TableFunctionBindInput &input,
+                                                     vector<LogicalType> &return_types, vector<string> &names) {
+	auto catalog_name = input.inputs[0].GetValue<string>();
+	auto table_ref = input.inputs[1].GetValue<string>();
+	auto properties = input.inputs[2].GetValue<string>(); // JSON object property->value (null = unset)
+	auto bind_data = make_uniq<FabricatorFunctionsBindData>();
+	bind_data->handle = ResolveConnection(context, catalog_name, bind_data->owns_handle);
+	auto handle = bind_data->handle;
+	bind_data->factory = [handle, table_ref, properties](const fabricator::ArrowScanRequest &, ArrowArrayStream &out) {
+		fabricator::GetMetadata(handle, FABRICATOR_META_SET_TBLPROPERTIES, table_ref, properties, out);
+	};
+	TblPropertiesSchema(return_types, names);
+	return std::move(bind_data);
+}
+
 // --- fabricator_exec(connection_string VARCHAR, sql VARCHAR) -> BIGINT --------
 // Executes arbitrary T-SQL (DDL/DML/EXEC) against SQL Server and returns the
 // number of rows affected. Volatile (always executed, never constant-folded).
@@ -597,6 +633,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 	set_txn_fn.arguments = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                        LogicalType::BIGINT}; // expected omitted => must-not-exist (first batch)
 	loader.RegisterFunction(set_txn_fn);
+
+	// fabricator_delta_tblproperties(catalog, 'schema.table') — read a Delta table's delta.* properties;
+	// fabricator_delta_set_tblproperties(catalog, 'schema.table', properties) — SET/UNSET them (metaData commit).
+	TableFunction tblprops_fn("fabricator_delta_tblproperties", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                          fabricator::ArrowStreamScan, TblPropertiesBind, fabricator::ArrowStreamInitGlobal,
+	                          fabricator::ArrowStreamInitLocal);
+	loader.RegisterFunction(tblprops_fn);
+	TableFunction set_tblprops_fn("fabricator_delta_set_tblproperties",
+	                              {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                              fabricator::ArrowStreamScan, SetTblPropertiesBind, fabricator::ArrowStreamInitGlobal,
+	                              fabricator::ArrowStreamInitLocal);
+	loader.RegisterFunction(set_tblprops_fn);
 
 	ScalarFunction exec_fn("fabricator_exec", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BIGINT,
 	                       FabricatorExecFunction);

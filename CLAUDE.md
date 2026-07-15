@@ -837,7 +837,19 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   the DAX references (`ReadStructParams`/`ParseDaxParams` → `BindDaxParams`, for both the bind probe + each
   execution; args read by field name). **The struct crosses with NO ABI change** via a generic marker: a
   provider declares an "accept any value" named param as the **`NullType` sentinel** → C++ registers a
-  `SQLNULL`-typed named param as `LogicalType::ANY` (`GetOrCreateTableFunction`) so DuckDB passes the literal
+  **FABRICATOR RENAME — LIVE-VALIDATED (2026-07-15):** the rename holds through the real tooling, not just the
+static unittest. **dbt** (`dbt_mssql_test`, gitignored — loads the rebuilt loadable into the official duckdb
+1.5.4 wheel): `box` target 10 models green (CTAS/incremental/index-post-hooks via `fabricator_exec`, threads=4);
+`minio` target s3 Delta green (`fabricator_delta_scan`). **Fabric notebook** (`scratchpad/fabricnb`, gitignored):
+25 probe steps pass — `load extension`, delta local/OneLake-fuse/create-read-txn/abfss-ambient, DAX ambient, and
+every SQL-auth form (bare/authentication-default ambient + database-audience/lakehouse/warehouse token secrets);
+the only 2 fails are documented-expected (pbi-audience token → 18456 reject; static-azure-secret abfss → the
+pinned single-audience gap, ambient works). TWO harness bugs found+fixed from the ATTACH-vs-CREATE-SECRET
+ambiguity (harnesses weren't in the tracked-code rename scope): probe `CREATE SECRET (TYPE fabricator)` →
+`TYPE mssql`; dbt `ext_delta.sql` s3 bucket `s3://arrownet` → `s3://fabricator` (the compose + tracked s3 tests
+use the `fabricator` bucket — `docker-compose.yml` was renamed too, so the MinIO bucket is `fabricator`).
+
+`SQLNULL`-typed named param as `LogicalType::ANY` (`GetOrCreateTableFunction`) so DuckDB passes the literal
   UNCAST, and the shared table-bind marshaling keeps the value's **runtime** type for a `SQLNULL`-declared
   param (`FabricatorTableFunctionBind`) so a `STRUCT` marshals as a real Arrow struct. The guard is
   `SQLNULL`-only → every concrete-typed function is unaffected (full SQL fn suite green). Validated
@@ -3286,8 +3298,28 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   ROLLBACK are OUR advantages over classic Databricks/Spark [no multi-statement txns there,
   snapshot per QUERY]; Databricks' advantages = row-level concurrency [DBR 14.3+, DV-based
   same-file disjoint-row DML — we conflict at FILE level like OSS Spark] and the
-  `delta.isolationLevel` TABLE property [we only honor the per-catalog ATTACH option — follow-up:
-  read the property as the per-table default]):
+  `delta.isolationLevel` TABLE property — **NOW HONORED (2026-07-15): the effective isolation for the
+  buffered-DML flush's OCC check + row-level relaxation is the TABLE's `delta.isolationLevel` (Serializable
+  vs the WriteSerializable default), read once per (txn,table) and cached on the buffer
+  (`PendingSerializable`); the ATTACH `isolation_level` option is the FALLBACK when the property is absent
+  (backward-compatible — property-less tables follow the catalog default). So our writer conforms to the
+  guarantee the table ADVERTISES, uniform with Spark — the whole reason Delta centralizes isolation as a
+  table property (mixed per-writer levels don't corrupt — each writer's own check preserves its own
+  guarantee — but they make the table's advertised guarantee non-uniform). Autocommit single-statement DML
+  still uses the catalog default for its row-level-retry resilience knob (documented minor divergence).
+  Change a table's level (or any `delta.*` config) with the new **`fabricator_delta_set_tblproperties(catalog,
+  'schema.table', '{"delta.isolationLevel":"Serializable"}')`** table function (SET/UNSET via ONE metaData
+  commit — merged `configuration`, rides `extraActions` like a buffered ALTER; feature-enabling keys
+  [`delta.enable*`, `columnMapping.mode`] rejected — those need a protocol upgrade at CREATE via the ATTACH
+  option; kernel-valid; re-attach-durable) + **`fabricator_delta_tblproperties(catalog, 'schema.table')`**
+  (READ, (property,value) rows). Both are table functions (side-effecting op must NOT be a scalar — optimizer
+  purity), additive metadata kinds 13/14 (NO ABI bump), Bridge-only (no EW/C++-operator change — just 2 binds).
+  `test/verify_delta_tblproperties.test` (34 — round-trip/UNSET/guard/re-attach + the property overriding a
+  write_serializable catalog in a two-connection racer). Regression-free (transactions 941 / row_level 70 /
+  update 63 / delete 28 / row_tracking_virtual 299 / dv_default 58 / txn_version 51 / changes 73 / native_write
+  147). **Deferred:** stamping `delta.isolationLevel` at CREATE from the ATTACH option (the SET function covers
+  it explicitly; auto-stamp is a convenience). **STALE-BINARY:** the loadable + linux payload predate the 2 new
+  C++ function binds — rebuild before the next dbt/notebook run.):
   [docs/delta-transactions.md](docs/delta-transactions.md).** The engineered-wood
   Delta provider buffers a DuckDB transaction's writes per (txn, table) (`DeltaTxnBuffer`, keyed by the v35
   `AmbientTransaction` id) and flushes at COMMIT as **ONE atomic Delta commit per table** (Delta has no

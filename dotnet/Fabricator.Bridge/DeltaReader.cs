@@ -63,6 +63,69 @@ internal static class DeltaReader
         }
     }
 
+    /// <summary>The table's Delta properties (<c>metaData.configuration</c> — the <c>delta.*</c> keys), a copy
+    /// (empty when none). Backs <c>fabricator_delta_tblproperties</c>.</summary>
+    public static IReadOnlyDictionary<string, string> GetTableProperties(nint opener, string path)
+        => GetTablePropertiesAsync(opener, path).GetAwaiter().GetResult();
+
+    private static async Task<IReadOnlyDictionary<string, string>> GetTablePropertiesAsync(nint opener, string path)
+    {
+        var fs = TableFileSystems.Create(opener, path);
+        var table = await DeltaTable.OpenAsync(fs).ConfigureAwait(false);
+        try
+        {
+            var cfg = table.CurrentSnapshot.Metadata.Configuration;
+            return cfg is null
+                ? new Dictionary<string, string>()
+                : cfg.ToDictionary(kv => kv.Key, kv => kv.Value);
+        }
+        finally
+        {
+            await table.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>SET/UNSET table properties as ONE metaData commit (merges <paramref name="updates"/> into the
+    /// current <c>configuration</c>; a null value UNSETs the key). Returns the new commit version. Backs
+    /// <c>fabricator_delta_set_tblproperties</c>. Pure config change — no protocol upgrade (the caller rejects
+    /// feature-enabling keys); the merged metaData rides <c>extraActions</c> exactly like a buffered ALTER.</summary>
+    public static long SetTableProperties(nint opener, string path, IReadOnlyList<KeyValuePair<string, string?>> updates)
+        => SetTablePropertiesAsync(opener, path, updates).GetAwaiter().GetResult();
+
+    private static async Task<long> SetTablePropertiesAsync(
+        nint opener, string path, IReadOnlyList<KeyValuePair<string, string?>> updates)
+    {
+        var fs = TableFileSystems.Create(opener, path);
+        var table = await DeltaTable.OpenAsync(fs).ConfigureAwait(false);
+        try
+        {
+            var snapshot = table.CurrentSnapshot;
+            var merged = snapshot.Metadata.Configuration is null
+                ? new Dictionary<string, string>()
+                : snapshot.Metadata.Configuration.ToDictionary(kv => kv.Key, kv => kv.Value);
+            foreach (var kv in updates)
+            {
+                if (kv.Value is null)
+                {
+                    merged.Remove(kv.Key);
+                }
+                else
+                {
+                    merged[kv.Key] = kv.Value;
+                }
+            }
+            var metaData = snapshot.Metadata with { Configuration = merged };
+            return await table.CommitDataFilesAsync(
+                System.Array.Empty<WrittenDataFile>(), DeltaWriteMode.Append,
+                extraActions: new DeltaAction[] { metaData },
+                expectedVersion: snapshot.Version, operation: "SET TBLPROPERTIES").ConfigureAwait(false);
+        }
+        finally
+        {
+            await table.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
     /// <summary>One active data file for the native reader: its global path-sorted <paramref name="Ordinal"/>
     /// (matching engineered-wood's <c>OrderedActiveFiles</c> so a `(Ordinal&lt;&lt;40)|file_row_number` rowid
     /// round-trips to <c>DeleteByRowIdsAsync</c>), the readable <paramref name="Uri"/> (onelake:// for OneLake),

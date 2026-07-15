@@ -47,6 +47,10 @@ internal sealed class DeltaTxnBuffer
         // (the flush conflict-aborts if the table moved).
         public Dictionary<int, HashSet<long>> DeletedByOrdinal { get; } = new();
         public long? PinnedVersion;
+        // The table's effective isolation (delta.isolationLevel): true = Serializable, false = WriteSerializable
+        // (the Spark default when the property is absent). Read once per (txn, table) and cached — the OCC
+        // conflict check + row-level relaxation at flush honor the TABLE's property, not a catalog-wide flag.
+        public bool? Serializable;
         public bool HasAppend;
         public bool HasDelete;
         public bool HasUpdate;

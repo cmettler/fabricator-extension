@@ -223,7 +223,34 @@ public sealed class DeltaCatalog : IBackendCatalog
     // they match the transaction's reads); serializable makes commit order the logical order — a concurrent
     // append matching the transaction's read predicates conflict-aborts. All other checks (metadata /
     // protocol / delete-delete / delete-read) are identical at both levels.
+    //
+    // NOTE: this ATTACH option is now only the CREATE-TIME DEFAULT semantics reference. The EFFECTIVE
+    // isolation for an EXISTING table's conflict check is the table's OWN delta.isolationLevel property
+    // (see PendingSerializable) — so our writer conforms to the guarantee the table advertises, uniform with
+    // Spark/other writers (the whole reason Delta makes isolation a TABLE property). Change a table's level
+    // with fabricator_delta_set_tblproperties. Autocommit single-statement DML still uses this catalog default
+    // for its row-level-retry resilience knob (a documented minor divergence; multi-statement serializability
+    // — where it matters — is honored per-table below).
     private readonly bool _serializable;
+
+    // The effective isolation for this transaction, read once and cached on the buffer (isolation is stable
+    // within a transaction): the TABLE's delta.isolationLevel property WINS; when the table doesn't declare
+    // one, the catalog's ATTACH isolation_level DEFAULT applies (backward-compatible — a property-less table
+    // follows the catalog default, and setting the property [fabricator_delta_set_tblproperties] makes the
+    // guarantee uniform across all writers). Used by the flush's OCC check + row-level relaxation.
+    private bool PendingSerializable(DeltaTxnBuffer.PendingAppends pending, string path)
+    {
+        if (pending.Serializable is { } cached)
+        {
+            return cached;
+        }
+        var cfg = DeltaReader.GetTableProperties(Opener(), path);
+        bool ser = cfg.TryGetValue("delta.isolationLevel", out var lvl)
+            ? lvl.Replace("_", "").Equals("serializable", System.StringComparison.OrdinalIgnoreCase)
+            : _serializable; // property absent => the catalog's ATTACH isolation_level default
+        pending.Serializable = ser;
+        return ser;
+    }
 
     // COPY (FORMAT delta) MODE 'error'|'ignore' — set only on the COPY's TRANSIENT catalog (which serves
     // exactly one statement, so a per-statement disposition may ride the catalog options): a create-shaped
@@ -532,6 +559,9 @@ public sealed class DeltaCatalog : IBackendCatalog
         MetadataKind.Snapshots => SnapshotsStream(schema, table),
         MetadataKind.TxnVersion => TxnVersionStream(schema, table),
         MetadataKind.SetTxnVersion => SetTxnVersionStream(schema, table),
+        // fabricator_delta_tblproperties / _set_tblproperties: read / set the table's delta.* properties.
+        MetadataKind.TblProperties => TblPropertiesStream(schema),
+        MetadataKind.SetTblProperties => SetTblPropertiesStream(schema, table),
         // Change Data Feed (fabricator_delta_changes): arg1 = 'schema.table' ref, arg2 = "from:to" (to empty => latest).
         MetadataKind.Changes => ChangesStream(schema, table),
         // Capability profile (property, value). `exact_filter_pushdown` = whether the host may set
@@ -760,6 +790,76 @@ public sealed class DeltaCatalog : IBackendCatalog
         }
         return new InMemoryArrayStream(schema,
             new[] { new RecordBatch(schema, new IArrowArray[] { apps.Build(), versions.Build() }, 1) });
+    }
+
+    // fabricator_delta_tblproperties(catalog, 'schema.table'): the table's delta.* properties as (property,
+    // value) rows, sorted by key.
+    private IArrowArrayStream TblPropertiesStream(string? tableRef)
+    {
+        var path = ResolveTableRefPath(tableRef, "delta tblproperties");
+        var props = DeltaReader.GetTableProperties(Opener(), path);
+        var keys = props.Keys.OrderBy(k => k, System.StringComparer.Ordinal).ToArray();
+        var vals = keys.Select(k => props[k]).ToArray();
+        return TwoColumn("property", keys, "value", vals);
+    }
+
+    // Table-FEATURE properties: enabling these requires a protocol upgrade (reader/writer feature + supporting
+    // metadata), so they can't be flipped by a plain metaData commit on an existing table — they're set at
+    // CREATE via the ATTACH option. A set_tblproperties attempt on one is rejected with a clear pointer.
+    private static readonly System.Collections.Generic.HashSet<string> FeatureProperties = new(System.StringComparer.OrdinalIgnoreCase)
+    {
+        "delta.enableDeletionVectors", "delta.enableChangeDataFeed", "delta.enableRowTracking",
+        "delta.enableInCommitTimestamps", "delta.columnMapping.mode",
+    };
+
+    // fabricator_delta_set_tblproperties(catalog, 'schema.table', properties): SET/UNSET delta.* properties via
+    // ONE metaData commit. `properties` is a JSON object {"delta.isolationLevel":"Serializable", …} (a null
+    // value UNSETs). Commits IMMEDIATELY (like OPTIMIZE/VACUUM) — an administrative metadata change, not part
+    // of a surrounding DuckDB transaction. Feature-enabling keys are rejected (set at CREATE).
+    private IArrowArrayStream SetTblPropertiesStream(string? tableRef, string? propsJson)
+    {
+        var path = ResolveTableRefPath(tableRef, "delta set tblproperties");
+        if (string.IsNullOrWhiteSpace(propsJson))
+        {
+            throw new System.ArgumentException(
+                "delta set tblproperties: a JSON object of property->value is required, e.g. "
+                + "'{\"delta.isolationLevel\":\"Serializable\"}'.");
+        }
+        var updates = new List<KeyValuePair<string, string?>>();
+        using (var doc = System.Text.Json.JsonDocument.Parse(propsJson!))
+        {
+            if (doc.RootElement.ValueKind != System.Text.Json.JsonValueKind.Object)
+            {
+                throw new System.ArgumentException("delta set tblproperties: properties must be a JSON object.");
+            }
+            foreach (var p in doc.RootElement.EnumerateObject())
+            {
+                if (FeatureProperties.Contains(p.Name))
+                {
+                    throw new System.NotSupportedException(
+                        $"delta set tblproperties: '{p.Name}' enables a table FEATURE that needs a protocol "
+                        + "upgrade — set it at CREATE via the ATTACH option (deletion_vectors / row_tracking / "
+                        + "change_data_feed / column_mapping), not on an existing table.");
+                }
+                string? val = p.Value.ValueKind switch
+                {
+                    System.Text.Json.JsonValueKind.Null => null,
+                    System.Text.Json.JsonValueKind.String => p.Value.GetString(),
+                    _ => p.Value.GetRawText(), // numbers/booleans -> their literal text (Delta config is string-typed)
+                };
+                updates.Add(new KeyValuePair<string, string?>(p.Name, val));
+            }
+        }
+        if (updates.Count == 0)
+        {
+            throw new System.ArgumentException("delta set tblproperties: no properties given.");
+        }
+        long version = DeltaReader.SetTableProperties(Opener(), path, updates);
+        _log.LogInformation("delta set tblproperties {Path}: {Count} propertie(s) -> v{Version}",
+            path, updates.Count, version);
+        var keys = updates.Select(u => u.Key).ToArray();
+        var vals = updates.Select(u => u.Value ?? "<unset>").ToArray();
+        return TwoColumn("property", keys, "value", vals);
     }
 
     /// <summary>The catalog's schemas: the lakehouse schemas for a schema-enabled OneLake lakehouse; for a
@@ -1884,8 +1984,9 @@ public sealed class DeltaCatalog : IBackendCatalog
                 else if (pending.DeletedByOrdinal.Count > 0 || pending.PendingMetadata is not null
                          || pending.AppTxnVersions.Count > 0 || pending.PendingCdc.Count > 0
                          || pending.PendingIdentityHwm.Count > 0
-                         || (_serializable && pending.HasReads && pending.PinnedVersion is not null
-                             && (pending.Files.Count > 0 || pending.Batches.Count > 0)))
+                         || (pending.HasReads && pending.PinnedVersion is not null
+                             && (pending.Files.Count > 0 || pending.Batches.Count > 0)
+                             && PendingSerializable(pending, kv.Key)))
                 {
                     // Buffered DML and/or a buffered schema change: everything (metaData + protocol upgrade
                     // + DV deletes + appends + post-images) fuses into ONE atomic commit, rebase-checked
@@ -2720,6 +2821,10 @@ public sealed class DeltaCatalog : IBackendCatalog
     private void FlushDmlTransaction(nint opener, string tablePath, long txnId,
                                      DeltaTxnBuffer.PendingAppends pending)
     {
+        // Effective isolation = the TABLE's delta.isolationLevel property (cached on the buffer), NOT the
+        // catalog-wide flag — so our OCC check + row-level relaxation conform to the guarantee the table
+        // advertises, uniform with Spark. Absent property => WriteSerializable (Spark's default).
+        bool tableSer = PendingSerializable(pending, tablePath);
         var fs = TableFileSystems.Create(opener, tablePath);
         var dataFileWriter = _nativeWrite && NativeParquetDataFileWriter.Available
             ? new NativeParquetDataFileWriter(tablePath)
@@ -2829,7 +2934,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 // conflicts throw). Under serializable the strict file-level delete-delete check applies
                 // to the pinned-resolved pairs unchanged.
                 var currentDv = dvActions;
-                if (dvActions.Count > 0 && !_serializable && table.CurrentSnapshot.Version != pinned)
+                if (dvActions.Count > 0 && !tableSer && table.CurrentSnapshot.Version != pinned)
                 {
                     try
                     {
@@ -2871,14 +2976,14 @@ public sealed class DeltaCatalog : IBackendCatalog
                     _log.LogInformation(
                         "delta txn {Txn} rebase-check {Path}: v{Pinned}->v{Latest} reads=[preds={Preds} whole={Whole}] serializable={Ser}",
                         txnId, tablePath, pinned, table.CurrentSnapshot.Version,
-                        pending.ReadPredicates.Count, pending.ReadWholeTable, _serializable);
+                        pending.ReadPredicates.Count, pending.ReadWholeTable, tableSer);
                     try
                     {
                         table.CheckLogicalRebaseAsync(pinnedSnap, extra,
                                 readPredicates: pending.ReadPredicates,
                                 readWholeTable: pending.ReadWholeTable,
-                                serializable: _serializable,
-                                rowLevelDml: !_serializable)
+                                serializable: tableSer,
+                                rowLevelDml: !tableSer)
                             .AsTask().GetAwaiter().GetResult();
                     }
                     catch (EngineeredWood.DeltaLake.DeltaConflictException ex)
