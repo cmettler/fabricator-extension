@@ -3340,7 +3340,23 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   file, post-image kept; same-row-through-rewrite conflicts via the version discriminator / not-found);
   kernel reads the remapped commits exactly; dv 48 / dv_default 58 / update 63 / delete 28 /
   changes 73 / row_tracking_virtual 299 / txn_version 51 / optimize 40 / transactions 941 + EW 168 &
-  147 (all TFMs) green. Semantics doc: docs/delta-transactions.md §6 + §10.4 (now PARITY+). **IDEMPOTENT APPENDS (2026-07-11) — Delta
+  147 (all TFMs) green. Semantics doc: docs/delta-transactions.md §6 + §10.4 (now PARITY+). **EW now carries SELF-CONTAINED
+  xunit suites for the whole transaction-era API surface (2026-07-14, for upstream review — Curt can run
+  them without our DuckDB harness): `RowLevelConcurrencyTests` (7 — v1/v2 racers via two table handles),
+  `LogicalRebaseTests` (7 — WriteSerializable vs Serializable blind-append semantics, stats-based read
+  matching, deleteRead/delete-delete/metadata, compaction exemption), `BufferedTransactionTests` (6 —
+  fused ALTER+INSERT+DELETE one-version commit, chained Compute*, ReconcileBatchToFields overlay,
+  ReadRowsByRowIdsAsync atVersion, expectedVersion abort, txn-action round-trip),
+  `SchemaWriteModesTests` (6 — SetSchemaAsync adopt/no-op, repartition-on-overwrite, static+dynamic
+  partition overwrite, appendOnly), `IdentityTransactionSeamsTests` (4 — mark chaining, fused HWM
+  commit, ForSchema pending-create, un-valued guard), `WriterFeatureEnforcementTests` (4),
+  `TimestampResolutionTests` (1) — Table.Tests now 182 (was 147 pre-row-level; older "EW 168 & 147"
+  gate counts in this file are historical). doc/upstream-candidates.md refreshed: on-disk-DV second
+  pass in slice 2, row-tracking preservation + MoR matrix + S3 conditional-put in slice 8, NEW slice 9
+  (row-level concurrency), test pointers per slice. Fork pushed through `d09b966` (PR #4 auto-tracks).
+  STALE-BINARY NOTE: the linux notebook payload (`build/linux-payload`) + the loadable were last built
+  BEFORE the mark-join DELETE C++ fix (`d8db9f9`) — rebuild both before the next Fabric-notebook or
+  dbt run.** **IDEMPOTENT APPENDS (2026-07-11) — Delta
   APPLICATION TRANSACTIONS (the `txn` action; duckdb-delta/Spark txnAppId parity, additive metadata kinds
   10/11 — NO ABI bump):** `CALL arrownet_delta_set_transaction_version(catalog, 'schema.table', app_id,
   version [, expected_previous])` PARKS the version on the current EXPLICIT transaction
