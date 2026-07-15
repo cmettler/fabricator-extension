@@ -74,10 +74,18 @@ paths already had async cores; their remaining single blocking points are delibe
 Verified: the FULL delta sweep green (24 suites, ~2500 assertions — write/delete/update/optimize/alter/native_read/
 native_write/native_write_streaming/transactions 941/time_travel/row_tracking_virtual 299/txn_version/late_mat/
 column_mapping/partition/partition_overwrite/dv/dv_default/variant 133/nested_alter/struct_filter/dynamic_filter/
-compaction_rowtracking/copy_format/decimal/temporal/schemas/constraints/rename). **Remaining sync-over-async sites
-(the prescribed incremental follow-up, leaf-first, `verify_delta_catalog_*` after each, never a blind sweep):
-DeltaCatalog ~29, DeltaGlobalTableFunction/OneLakeForwardFs/…** The ambient-loss landmine stays disarmed (AsyncLocal,
-`0533eb7`). Adopt the sync-wrapper→async-core shape for NEW code now.
+compaction_rowtracking/copy_format/decimal/temporal/schemas/constraints/rename). **`DeltaWriter` (in
+`DeltaGlobalTableFunction.cs`) + the self-contained `DeltaCatalog` flush helpers are ALSO converted (2026-07-15):**
+DeltaWriter `Write`/`Create`/`Materialize`/`MergeSchema` + `TryWriteStreaming` (the `out rowsWritten` case → its async
+core returns a `(long? Result, long RowsWritten)` tuple, the sync wrapper unpacks the out — the compiler enforces
+every return is a tuple, so a missed conversion is a build error not a silent bug; `TryStreamCreateFiles` was already
+sync — RunCopy is synchronous); DeltaCatalog `FlushDeferredFiles`/`WriteCdcFiles`/`TryEagerWriteBatches` (open EW
+directly, no delegation → single blocking point). **Remaining sync-over-async sites (the prescribed incremental
+follow-up, leaf-first, `verify_delta_catalog_*` after each, never a blind sweep): DeltaCatalog orchestrators
+(`FlushDmlTransaction` ~200-line txn hot path, `FlushCreateTransaction`) + the bulk stream-consuming loops + the
+`DeltaGlobalTableFunction` reader filter-loop + OneLakeForwardFs/…** (the orchestrators call `DeltaWriter.*` sync
+wrappers — now that DeltaWriter is a leaf, converting them next gives a clean single-block). The ambient-loss landmine
+stays disarmed (AsyncLocal, `0533eb7`). Adopt the sync-wrapper→async-core shape for NEW code now.
 
 **Rename-scope gap FIXED en route (2026-07-15):** the FABRICATOR rename (`2a26b7a`) renamed the C++ variant marker
 `kVariantExtensionName` → `"fabricator.variant"` but engineered-wood (a SIBLING repo, out of the blanket rename's
@@ -86,9 +94,9 @@ MISMATCHED and every VARIANT column bound as raw `BLOB` (INSERT → "Can't conve
 variant Arrow name is our PRIVATE boundary discriminator (re-stamped on every read from the Delta/parquet variant
 annotation — not persisted-authoritative), deliberately NOT the reserved-canonical `arrow.variant` (whose storage is
 `struct<metadata,value>`; ours is a single self-delimiting blob → a canonical name would collide with DuckDB/arrow-c++
-built-in handlers). Fixed EW → `"fabricator.variant"` (matches C++); `verify_delta_catalog_variant` 133 green. **This is
-an ENGINEERED-WOOD working-tree change — not yet committed/pushed** (EW commits/pushes only on explicit request /
-"ew push"); it must land in EW for a clean EW checkout to build variant correctly.
+built-in handlers). Fixed EW → `"fabricator.variant"` (matches C++); `verify_delta_catalog_variant` 133 green. **Committed LOCALLY in
+engineered-wood (`5e0ca3d`), NOT pushed** (user decision 2026-07-15: "commit to EW locally only"; EW pushes to the
+fork/PR #4 only on explicit "ew push"). It must be pushed for a clean fork checkout to build variant correctly.
 
 ## Architecture (layered for reuse)
 

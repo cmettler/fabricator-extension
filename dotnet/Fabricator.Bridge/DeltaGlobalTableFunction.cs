@@ -484,6 +484,17 @@ internal static class DeltaWriter
                              EngineeredWood.DeltaLake.Schema.ColumnMappingMode columnMapping =
                                  EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None,
                              bool serializable = false)
+        => WriteAsync(opener, path, schema, batches, mode, ct, deletionVectors, inCommitTimestamps,
+                      changeDataFeed, rowTracking, spec, nativeWrite, columnMapping, serializable)
+            .GetAwaiter().GetResult();
+
+    private static async Task<long> WriteAsync(nint opener, string path, Schema schema,
+                             IReadOnlyList<RecordBatch> batches,
+                             DeltaWriteMode mode, CancellationToken ct, bool deletionVectors,
+                             bool inCommitTimestamps, bool changeDataFeed,
+                             bool rowTracking, DeltaWriteSpec? spec, bool nativeWrite,
+                             EngineeredWood.DeltaLake.Schema.ColumnMappingMode columnMapping,
+                             bool serializable)
     {
         // native_write: DuckDB's parquet writer produces the data-file bytes (via COPY on a fresh host
         // connection); engineered-wood keeps the _delta_log commit. Falls back to EW's codec if host_query is
@@ -505,11 +516,11 @@ internal static class DeltaWriter
                     path, attempt, MaxCommitAttempts);
             }
             var fs = TableFileSystems.Create(opener, path);
-            var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(spec, dataFileWriter),
+            var table = await DeltaTable.OpenOrCreateAsync(fs, schema, Options(spec, dataFileWriter),
                                                      partitionColumns: spec?.PartitionColumns,
                                                      configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, serializable),
                                                      columnMappingMode: columnMapping,
-                                                     cancellationToken: ct).AsTask().GetAwaiter().GetResult();
+                                                     cancellationToken: ct).ConfigureAwait(false);
             try
             {
                 // NOT NULL enforcement: an APPEND into an existing table must honor its declared nullability
@@ -530,12 +541,12 @@ internal static class DeltaWriter
                     // no-op if identical or a freshly-created table — then the Overwrite removes the old files.
                     // On a column-mapping table EW re-assigns fresh field ids for the new schema (sound because the
                     // Overwrite drops the old-schema files); a fresh CTAS is a no-op (schema already matches).
-                    table.SetSchemaAsync(schema, ct).AsTask().GetAwaiter().GetResult();
+                    await table.SetSchemaAsync(schema, ct).ConfigureAwait(false);
                 }
                 else if (spec?.SchemaMode == DeltaSchemaMode.Merge)
                 {
                     // Append + UNION: add any incoming column absent from the table (nullable) before appending.
-                    MergeSchema(table, schema, ct);
+                    await MergeSchemaAsync(table, schema, ct).ConfigureAwait(false);
                 }
                 // Repartition-on-overwrite: PARTITION_COLUMNS on a FULL overwrite of an EXISTING table whose
                 // partitioning differs → the new partitionColumns commit atomically with the file swap
@@ -554,11 +565,11 @@ internal static class DeltaWriter
                 // replace_where => STATIC partition-overwrite; PARTITION_OVERWRITE => DYNAMIC (partitions present
                 // in the input); otherwise the requested append/overwrite. Each is one atomic commit.
                 long version = spec?.ReplaceWhere is { Count: > 0 } parts
-                    ? table.OverwritePartitionsAsync(batches, parts, ct).AsTask().GetAwaiter().GetResult()
+                    ? await table.OverwritePartitionsAsync(batches, parts, ct).ConfigureAwait(false)
                     : spec?.DynamicPartitionOverwrite == true
-                        ? table.DynamicOverwriteAsync(batches, ct).AsTask().GetAwaiter().GetResult()
-                        : table.WriteAsync(batches, mode, ct, repartitionTo: repartitionTo)
-                            .AsTask().GetAwaiter().GetResult();
+                        ? await table.DynamicOverwriteAsync(batches, ct).ConfigureAwait(false)
+                        : await table.WriteAsync(batches, mode, ct, repartitionTo: repartitionTo)
+                            .ConfigureAwait(false);
                 Log.LogInformation("delta write {Path}: committed v{Version}", path, version);
                 return version;
             }
@@ -568,7 +579,7 @@ internal static class DeltaWriter
             }
             finally
             {
-                table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                await table.DisposeAsync().ConfigureAwait(false);
             }
         }
     }
@@ -687,6 +698,22 @@ internal static class DeltaWriter
         List<WrittenDataFile>? deferCommitTo = null,
         bool serializable = false)
     {
+        var (result, rows) = TryWriteStreamingCoreAsync(opener, path, data, mode, deletionVectors,
+            inCommitTimestamps, changeDataFeed, rowTracking, spec, columnMapping, pendingSchema,
+            deferCommitTo, serializable).GetAwaiter().GetResult();
+        rowsWritten = rows;
+        return result;
+    }
+
+    private static async Task<(long? Result, long RowsWritten)> TryWriteStreamingCoreAsync(
+        nint opener, string path, IArrowArrayStream data, DeltaWriteMode mode,
+        bool deletionVectors, bool inCommitTimestamps, bool changeDataFeed, bool rowTracking,
+        DeltaWriteSpec? spec,
+        EngineeredWood.DeltaLake.Schema.ColumnMappingMode columnMapping,
+        EngineeredWood.DeltaLake.Schema.StructType? pendingSchema,
+        List<WrittenDataFile>? deferCommitTo,
+        bool serializable)
+    {
         // Transaction-deferred commit: the caller (an explicit-transaction append) wants the files WRITTEN
         // but the Delta commit PARKED — CommitTransaction flushes everything as one atomic commit. Only a
         // plain Append can defer (an Overwrite's removes are snapshot-coupled).
@@ -704,22 +731,22 @@ internal static class DeltaWriter
             throw new System.InvalidOperationException(
                 "TryWriteStreaming: pendingSchema requires a deferred (transaction-buffered) append.");
         }
-        rowsWritten = 0;
+        long rowsWritten = 0;
         // Cases the streaming commit can't represent → fall back to the batch path.
-        if (spec?.ReplaceWhere is { Count: > 0 }) { return null; }
-        if (spec?.SchemaMode == DeltaSchemaMode.Merge) { return null; }
+        if (spec?.ReplaceWhere is { Count: > 0 }) { return (null, rowsWritten); }
+        if (spec?.SchemaMode == DeltaSchemaMode.Merge) { return (null, rowsWritten); }
 
         var writableRoot = DeltaReader.ToReadableRoot(path);
         var fs = TableFileSystems.Create(opener, path);
         // Pass columnMapping so a NEW table is created WITH the mode (an existing table keeps its own mode). Only
         // id mode reaches here as a mapping table (name mode stays on the codec path, gated by the caller) — an
         // id-mode table's data files carry field_ids, which the external commit + native reader both handle.
-        var table = DeltaTable.OpenOrCreateAsync(
+        var table = await DeltaTable.OpenOrCreateAsync(
             fs, data.Schema, Options(spec),
             partitionColumns: spec?.PartitionColumns,   // set on a partitioned CTAS create; ignored for an INSERT
             configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, serializable),
             columnMappingMode: columnMapping,
-            cancellationToken: default).AsTask().GetAwaiter().GetResult();
+            cancellationToken: default).ConfigureAwait(false);
         try
         {
             // Fall back BEFORE writing any file / touching the log (so a fallback leaves no orphan): a table
@@ -728,7 +755,7 @@ internal static class DeltaWriter
             // (Delta spec: data files use physical names in both modes) and stamps the field_ids (FIELD_IDS).
             if (!table.SupportsExternalDataFileCommit)
             {
-                return null;
+                return (null, rowsWritten);
             }
             // Repartition-on-overwrite (PARTITION_COLUMNS differing from an EXISTING table's partitioning):
             // the streaming commit has no metaData-swap support → collect path, whose WriteAsync(repartitionTo:)
@@ -740,7 +767,7 @@ internal static class DeltaWriter
                 && !System.Linq.Enumerable.SequenceEqual(
                        reqPartCols, table.CurrentSnapshot.Metadata.PartitionColumns))
             {
-                return null;
+                return (null, rowsWritten);
             }
             // A REPLACE that CHANGES a mapping table's schema: adopt the new schema FIRST (SetSchemaAsync's
             // mapping branch assigns fresh field ids — sound because the paired Overwrite removes the old
@@ -753,7 +780,7 @@ internal static class DeltaWriter
                    != EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None
                 && !SameLogicalColumns(table.ArrowSchema, data.Schema))
             {
-                table.SetSchemaAsync(data.Schema, default).AsTask().GetAwaiter().GetResult();
+                await table.SetSchemaAsync(data.Schema, default).ConfigureAwait(false);
             }
             // NOT NULL enforcement on the streamed APPEND: wrap the input with the per-batch validator
             // (lazy — a later fallback `return null` leaves the stream unconsumed for the collect path,
@@ -823,7 +850,7 @@ internal static class DeltaWriter
                 {
                     // CREATE OR REPLACE / CTAS-replace / schema_mode=overwrite: adopt the incoming schema
                     // (metadata-only, no-op if identical), then the commit's removes drop the old files.
-                    table.SetSchemaAsync(data.Schema, default).AsTask().GetAwaiter().GetResult();
+                    await table.SetSchemaAsync(data.Schema, default).ConfigureAwait(false);
                 }
                 // (a schema-changing mapping REPLACE already adopted the new schema above, so the maps
                 // match; nothing further to do here)
@@ -876,19 +903,19 @@ internal static class DeltaWriter
                 Log.LogInformation(
                     "delta stream-write {Path}: deferred {Files} file(s) rows={Rows} to the transaction commit",
                     path, files.Count, rowsWritten);
-                return -1;
+                return (-1L, rowsWritten);
             }
-            long version = table.CommitDataFilesAsync(
+            long version = await table.CommitDataFilesAsync(
                 files, mode, dynamicPartitionOverwrite: spec?.DynamicPartitionOverwrite == true,
-                cancellationToken: default).AsTask().GetAwaiter().GetResult();
+                cancellationToken: default).ConfigureAwait(false);
             Log.LogInformation(
                 "delta stream-write {Path}: committed v{Version} rows={Rows} files={Files} (native COPY, bounded memory)",
                 path, version, rowsWritten, files.Count);
-            return version;
+            return (version, rowsWritten);
         }
         finally
         {
-            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            await table.DisposeAsync().ConfigureAwait(false);
         }
     }
 
@@ -1074,7 +1101,7 @@ internal static class DeltaWriter
     /// name is absent from the table's current schema, adds it as a NULLABLE column (engineered-wood
     /// <c>AddColumnAsync</c> — a metadata-only commit; old files read the new column back as NULL). Case-insensitive
     /// name match. Columns the incoming data lacks are left as-is (they read/append as NULL).</summary>
-    private static void MergeSchema(DeltaTable table, Schema incoming, CancellationToken ct)
+    private static async Task MergeSchemaAsync(DeltaTable table, Schema incoming, CancellationToken ct)
     {
         var existing = new HashSet<string>(
             table.ArrowSchema.FieldsList.Select(f => f.Name), System.StringComparer.OrdinalIgnoreCase);
@@ -1087,7 +1114,7 @@ internal static class DeltaWriter
             // Add as nullable regardless of the incoming field's flag (a newly-added column must be nullable so
             // pre-existing rows can back-fill NULL).
             var nullableField = new Field(field.Name, field.DataType, nullable: true);
-            table.AddColumnAsync(nullableField, ct).AsTask().GetAwaiter().GetResult();
+            await table.AddColumnAsync(nullableField, ct).ConfigureAwait(false);
             existing.Add(field.Name);
         }
     }
@@ -1105,6 +1132,16 @@ internal static class DeltaWriter
                                   EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None,
                               EngineeredWood.DeltaLake.Schema.StructType? preAssignedSchema = null,
                               bool serializable = false)
+        => CreateAsync(opener, path, schema, ct, deletionVectors, inCommitTimestamps, changeDataFeed,
+                       rowTracking, spec, columnMapping, preAssignedSchema, serializable)
+            .GetAwaiter().GetResult();
+
+    private static async Task CreateAsync(nint opener, string path, Schema schema, CancellationToken ct,
+                              bool deletionVectors, bool inCommitTimestamps,
+                              bool changeDataFeed, bool rowTracking, DeltaWriteSpec? spec,
+                              EngineeredWood.DeltaLake.Schema.ColumnMappingMode columnMapping,
+                              EngineeredWood.DeltaLake.Schema.StructType? preAssignedSchema,
+                              bool serializable)
     {
         Log.LogInformation("delta create {Path}: cols={Cols} spec=[{Spec}]", path, schema.FieldsList.Count,
             DescribeSpec(spec, deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed));
@@ -1114,13 +1151,13 @@ internal static class DeltaWriter
             try
             {
                 // OpenOrCreate writes commit-0 for a new table (or opens an existing one — no commit, no conflict).
-                var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(spec),
+                var table = await DeltaTable.OpenOrCreateAsync(fs, schema, Options(spec),
                                                          partitionColumns: spec?.PartitionColumns,
                                                          configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, serializable),
                                                          columnMappingMode: columnMapping,
                                                          preAssignedSchema: preAssignedSchema,
-                                                         cancellationToken: ct).AsTask().GetAwaiter().GetResult();
-                table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                                                         cancellationToken: ct).ConfigureAwait(false);
+                await table.DisposeAsync().ConfigureAwait(false);
                 Log.LogDebug("delta create {Path}: opened/created (commit-0 if new)", path);
                 return;
             }
@@ -1136,6 +1173,10 @@ internal static class DeltaWriter
     /// needs them retained for one commit. Returns the schema, batches, and total row count.</summary>
     public static (Schema Schema, List<RecordBatch> Batches, long Rows) Materialize(
         IArrowArrayStream stream, CancellationToken ct)
+        => MaterializeAsync(stream, ct).GetAwaiter().GetResult();
+
+    private static async Task<(Schema Schema, List<RecordBatch> Batches, long Rows)> MaterializeAsync(
+        IArrowArrayStream stream, CancellationToken ct)
     {
         var schema = stream.Schema;
         var ms = new MemoryStream();
@@ -1143,23 +1184,23 @@ internal static class DeltaWriter
         using (var w = new ArrowStreamWriter(ms, schema, leaveOpen: true))
         {
             RecordBatch? b;
-            while ((b = stream.ReadNextRecordBatchAsync(ct).AsTask().GetAwaiter().GetResult()) is not null)
+            while ((b = await stream.ReadNextRecordBatchAsync(ct).ConfigureAwait(false)) is not null)
             {
                 if (b.Length == 0)
                 {
                     continue;
                 }
-                w.WriteRecordBatchAsync(b, ct).GetAwaiter().GetResult();
+                await w.WriteRecordBatchAsync(b, ct).ConfigureAwait(false);
                 rows += b.Length;
             }
-            w.WriteEndAsync(ct).GetAwaiter().GetResult();
+            await w.WriteEndAsync(ct).ConfigureAwait(false);
         }
         var batches = new List<RecordBatch>();
         ms.Position = 0;
         using (var r = new ArrowStreamReader(ms))
         {
             RecordBatch? b;
-            while ((b = r.ReadNextRecordBatchAsync(ct).AsTask().GetAwaiter().GetResult()) is not null)
+            while ((b = await r.ReadNextRecordBatchAsync(ct).ConfigureAwait(false)) is not null)
             {
                 batches.Add(b);
             }
