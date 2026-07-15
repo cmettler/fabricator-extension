@@ -2046,17 +2046,21 @@ public sealed class DeltaCatalog : IBackendCatalog
     // (appends are snapshot-independent, so reopening at the new latest and re-committing is safe).
     private long FlushDeferredFiles(nint opener, string tablePath,
                                     System.Collections.Generic.IReadOnlyList<EngineeredWood.DeltaLake.Table.WrittenDataFile> files)
+        => FlushDeferredFilesAsync(opener, tablePath, files).GetAwaiter().GetResult();
+
+    private static async Task<long> FlushDeferredFilesAsync(nint opener, string tablePath,
+                                    System.Collections.Generic.IReadOnlyList<EngineeredWood.DeltaLake.Table.WrittenDataFile> files)
     {
         const int maxAttempts = 16;
         for (int attempt = 1; ; attempt++)
         {
             var fs = TableFileSystems.Create(opener, tablePath);
-            var table = EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(fs, DeltaWriter.Options())
-                .AsTask().GetAwaiter().GetResult();
+            var table = await EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(fs, DeltaWriter.Options())
+                .ConfigureAwait(false);
             try
             {
-                return table.CommitDataFilesAsync(files, DeltaWriteMode.Append, cancellationToken: default)
-                    .AsTask().GetAwaiter().GetResult();
+                return await table.CommitDataFilesAsync(files, DeltaWriteMode.Append, cancellationToken: default)
+                    .ConfigureAwait(false);
             }
             catch (EngineeredWood.DeltaLake.DeltaConflictException) when (attempt < maxAttempts)
             {
@@ -2064,7 +2068,7 @@ public sealed class DeltaCatalog : IBackendCatalog
             }
             finally
             {
-                table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                await table.DisposeAsync().ConfigureAwait(false);
             }
         }
     }
@@ -2627,14 +2631,18 @@ public sealed class DeltaCatalog : IBackendCatalog
     // per partition inside WriteChangeDataFileAsync (partition columns excluded from the cdc bytes).
     private void WriteCdcFiles(nint opener, string tablePath, DeltaTxnBuffer.PendingAppends pending,
                                IReadOnlyList<RecordBatch> rows, string changeType)
+        => WriteCdcFilesAsync(opener, tablePath, pending, rows, changeType).GetAwaiter().GetResult();
+
+    private static async Task WriteCdcFilesAsync(nint opener, string tablePath, DeltaTxnBuffer.PendingAppends pending,
+                               IReadOnlyList<RecordBatch> rows, string changeType)
     {
         if (rows.Count == 0)
         {
             return;
         }
         var fs = TableFileSystems.Create(opener, tablePath);
-        var table = EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(fs, DeltaWriter.Options())
-            .AsTask().GetAwaiter().GetResult();
+        var table = await EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(fs, DeltaWriter.Options())
+            .ConfigureAwait(false);
         try
         {
             foreach (var b in rows)
@@ -2643,13 +2651,13 @@ public sealed class DeltaCatalog : IBackendCatalog
                 {
                     continue;
                 }
-                pending.PendingCdc.AddRange(table.WriteChangeDataFileAsync(b, changeType)
-                    .AsTask().GetAwaiter().GetResult());
+                pending.PendingCdc.AddRange(await table.WriteChangeDataFileAsync(b, changeType)
+                    .ConfigureAwait(false));
             }
         }
         finally
         {
-            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            await table.DisposeAsync().ConfigureAwait(false);
         }
     }
 
@@ -2685,6 +2693,12 @@ public sealed class DeltaCatalog : IBackendCatalog
     private bool TryEagerWriteBatches(nint opener, string tablePath, DeltaTxnBuffer.PendingAppends pending,
                                       IReadOnlyList<RecordBatch> batches, string tableName,
                                       IReadOnlyList<long>? materializedRowIds = null)
+        => TryEagerWriteBatchesAsync(opener, tablePath, pending, batches, tableName, materializedRowIds)
+            .GetAwaiter().GetResult();
+
+    private async Task<bool> TryEagerWriteBatchesAsync(nint opener, string tablePath, DeltaTxnBuffer.PendingAppends pending,
+                                      IReadOnlyList<RecordBatch> batches, string tableName,
+                                      IReadOnlyList<long>? materializedRowIds)
     {
         if (pending.PendingCreate || batches.Count == 0)
         {
@@ -2694,9 +2708,9 @@ public sealed class DeltaCatalog : IBackendCatalog
         var writer = _nativeWrite && NativeParquetDataFileWriter.Available
             ? new NativeParquetDataFileWriter(tablePath)
             : null;
-        var table = EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(
+        var table = await EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(
                 fs, DeltaWriter.Options(ResolveWriteSpec(null, null), writer))
-            .AsTask().GetAwaiter().GetResult();
+            .ConfigureAwait(false);
         try
         {
             IReadOnlyList<RecordBatch> toWrite = batches;
@@ -2725,16 +2739,16 @@ public sealed class DeltaCatalog : IBackendCatalog
             }
             DeltaNullability.ValidateBatches(toWrite,
                 pending.PendingDeltaSchema ?? table.CurrentSnapshot.Schema, tableName);
-            pending.Files.AddRange(table.WriteDataFilesAsync(toWrite, default,
+            pending.Files.AddRange(await table.WriteDataFilesAsync(toWrite, default,
                     schemaOverride: pending.PendingDeltaSchema,
                     identityValuesPreGenerated: identity,
                     materializedRowIds: materializedRowIds)
-                .AsTask().GetAwaiter().GetResult());
+                .ConfigureAwait(false));
             return true;
         }
         finally
         {
-            table.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            await table.DisposeAsync().ConfigureAwait(false);
         }
     }
 
