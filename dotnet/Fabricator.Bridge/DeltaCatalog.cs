@@ -1722,7 +1722,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                     spec: spec,                    out var deferredRows,
                     columnMapping: _columnMappingMode,
                     pendingSchema: pending.PendingDeltaSchema,
-                    deferCommitTo: pending.Files);
+                    deferCommitTo: pending.Files, serializable: _serializable);
                 if (deferred is not null)
                 {
                     pending.Rows += deferredRows;
@@ -1810,7 +1810,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 changeDataFeed: _changeDataFeedOnCreate,
                 rowTracking: _rowTrackingOnCreate,
                 spec: spec,                out var streamedRows,
-                columnMapping: _columnMappingMode);
+                columnMapping: _columnMappingMode, serializable: _serializable);
             if (streamedVersion is not null)
             {
                 return streamedRows;
@@ -1826,7 +1826,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                           changeDataFeed: _changeDataFeedOnCreate,
                           rowTracking: _rowTrackingOnCreate,
                           spec: spec, nativeWrite: _nativeWrite,
-                          columnMapping: _columnMappingMode);
+                          columnMapping: _columnMappingMode, serializable: _serializable);
         return rows;
     }
 
@@ -1936,7 +1936,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                               changeDataFeed: _changeDataFeedOnCreate,
                               rowTracking: _rowTrackingOnCreate,
                               spec: ResolveWriteSpec(partitionColumns, schemaModeArg: null),
-                              columnMapping: _columnMappingMode);
+                              columnMapping: _columnMappingMode, serializable: _serializable);
     }
 
     /// <summary>CREATE SCHEMA. In <c>schemas</c> mode (non-OneLake) it materializes the <c>&lt;root&gt;/&lt;schema&gt;/</c>
@@ -2012,7 +2012,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                         changeDataFeed: _changeDataFeedOnCreate,
                         rowTracking: _rowTrackingOnCreate,
                         spec: ResolveWriteSpec(null, null), nativeWrite: _nativeWrite,
-                        columnMapping: _columnMappingMode);
+                        columnMapping: _columnMappingMode, serializable: _serializable);
                     _log.LogInformation("delta txn {Txn} commit {Path}: v{Version} ({Rows} buffered row(s))",
                         txnId, kv.Key, v, pending.Rows);
                 }
@@ -2808,7 +2808,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                                   changeDataFeed: _changeDataFeedOnCreate,
                                   rowTracking: _rowTrackingOnCreate,
                                   spec: ResolveWriteSpec(null, null), nativeWrite: _nativeWrite,
-                                  columnMapping: _columnMappingMode);
+                                  columnMapping: _columnMappingMode, serializable: _serializable);
         }
         _log.LogInformation("delta txn {Txn} commit-create {Path}: v{Version} ({Rows} buffered row(s))",
             txnId, tablePath, v, pending.Rows);

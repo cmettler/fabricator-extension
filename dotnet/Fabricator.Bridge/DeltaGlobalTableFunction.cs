@@ -419,13 +419,21 @@ internal static class DeltaWriter
     internal const string MaterializedRowCommitVersionColumn = "__delta_row_commit_version";
 
     private static Dictionary<string, string>? CreateConfig(
-        bool deletionVectors, bool rowTracking, bool inCommitTimestamps, bool changeDataFeed)
+        bool deletionVectors, bool rowTracking, bool inCommitTimestamps, bool changeDataFeed,
+        bool serializable = false)
     {
-        if (!deletionVectors && !rowTracking && !inCommitTimestamps && !changeDataFeed)
+        if (!deletionVectors && !rowTracking && !inCommitTimestamps && !changeDataFeed && !serializable)
         {
             return null;
         }
         var config = new Dictionary<string, string>(System.StringComparer.Ordinal);
+        if (serializable)
+        {
+            // Stamp the ATTACH isolation_level 'serializable' onto CREATEd tables so the table SELF-DECLARES
+            // its guarantee (all writers, us + Spark, then honor it uniformly). write_serializable is the
+            // Spark default => left ABSENT (no stamp), matching Spark's minimal metadata.
+            config["delta.isolationLevel"] = "Serializable";
+        }
         if (deletionVectors)
         {
             config["delta.enableDeletionVectors"] = "true";
@@ -474,7 +482,8 @@ internal static class DeltaWriter
                              bool inCommitTimestamps = false, bool changeDataFeed = false,
                              bool rowTracking = false, DeltaWriteSpec? spec = null, bool nativeWrite = false,
                              EngineeredWood.DeltaLake.Schema.ColumnMappingMode columnMapping =
-                                 EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None)
+                                 EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None,
+                             bool serializable = false)
     {
         // native_write: DuckDB's parquet writer produces the data-file bytes (via COPY on a fresh host
         // connection); engineered-wood keeps the _delta_log commit. Falls back to EW's codec if host_query is
@@ -498,7 +507,7 @@ internal static class DeltaWriter
             var fs = TableFileSystems.Create(opener, path);
             var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(spec, dataFileWriter),
                                                      partitionColumns: spec?.PartitionColumns,
-                                                     configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed),
+                                                     configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, serializable),
                                                      columnMappingMode: columnMapping,
                                                      cancellationToken: ct).AsTask().GetAwaiter().GetResult();
             try
@@ -675,7 +684,8 @@ internal static class DeltaWriter
         EngineeredWood.DeltaLake.Schema.ColumnMappingMode columnMapping =
             EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None,
         EngineeredWood.DeltaLake.Schema.StructType? pendingSchema = null,
-        List<WrittenDataFile>? deferCommitTo = null)
+        List<WrittenDataFile>? deferCommitTo = null,
+        bool serializable = false)
     {
         // Transaction-deferred commit: the caller (an explicit-transaction append) wants the files WRITTEN
         // but the Delta commit PARKED — CommitTransaction flushes everything as one atomic commit. Only a
@@ -707,7 +717,7 @@ internal static class DeltaWriter
         var table = DeltaTable.OpenOrCreateAsync(
             fs, data.Schema, Options(spec),
             partitionColumns: spec?.PartitionColumns,   // set on a partitioned CTAS create; ignored for an INSERT
-            configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed),
+            configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, serializable),
             columnMappingMode: columnMapping,
             cancellationToken: default).AsTask().GetAwaiter().GetResult();
         try
@@ -1093,7 +1103,8 @@ internal static class DeltaWriter
                               bool changeDataFeed = false, bool rowTracking = false, DeltaWriteSpec? spec = null,
                               EngineeredWood.DeltaLake.Schema.ColumnMappingMode columnMapping =
                                   EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None,
-                              EngineeredWood.DeltaLake.Schema.StructType? preAssignedSchema = null)
+                              EngineeredWood.DeltaLake.Schema.StructType? preAssignedSchema = null,
+                              bool serializable = false)
     {
         Log.LogInformation("delta create {Path}: cols={Cols} spec=[{Spec}]", path, schema.FieldsList.Count,
             DescribeSpec(spec, deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed));
@@ -1105,7 +1116,7 @@ internal static class DeltaWriter
                 // OpenOrCreate writes commit-0 for a new table (or opens an existing one — no commit, no conflict).
                 var table = DeltaTable.OpenOrCreateAsync(fs, schema, Options(spec),
                                                          partitionColumns: spec?.PartitionColumns,
-                                                         configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed),
+                                                         configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, serializable),
                                                          columnMappingMode: columnMapping,
                                                          preAssignedSchema: preAssignedSchema,
                                                          cancellationToken: ct).AsTask().GetAwaiter().GetResult();

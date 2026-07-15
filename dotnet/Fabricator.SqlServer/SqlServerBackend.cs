@@ -401,6 +401,10 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // mssql_isolation_level overrides it, resolved in InOutBind).
     private readonly Regex? _schemaFilter;
     private readonly Regex? _tableFilter;
+    // function_filter (icase regex on the routine NAME) gates which discovered scalar UDFs / TVFs / procs
+    // register — symmetric with table_filter (which is table-only). Applied to the Functions discovery in C#
+    // (schema_filter already gates functions by schema on the C++ side).
+    private readonly Regex? _functionFilter;
     private readonly string _isolationLevel = "";
     // ATTACH option `add_identity true`: created tables get an auto BIGINT IDENTITY surrogate key (<table>_id)
     // when none is otherwise specified. The mssql_add_identity SET setting overrides this per session (turn OFF
@@ -483,6 +487,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 {
                     case "schema_filter": _schemaFilter = CompileFilter("schema_filter", val); break;
                     case "table_filter": _tableFilter = CompileFilter("table_filter", val); break;
+                    case "function_filter": _functionFilter = CompileFilter("function_filter", val); break;
                     case "isolation_level": _isolationLevel = val; break;
                     case "add_identity":
                         _addIdentityOnCreate = string.Equals(val, "true", StringComparison.OrdinalIgnoreCase) || val == "1";
@@ -1242,7 +1247,9 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         MetadataKind.RowId => ExecuteMetadataQuery(RowIdSql(Require(schema, table).schema, Require(schema, table).table, Profile)),
         MetadataKind.RowCount => ExecuteMetadataQuery(RowCountSql(Require(schema, table).schema, Require(schema, table).table)),
         MetadataKind.ColumnNdv => ExecuteMetadataQuery(ColumnNdvSql(Require(schema, table).schema, Require(schema, table).table)),
-        MetadataKind.Functions => ExecuteMetadataQuery(FunctionsMetadataSql()),
+        MetadataKind.Functions => _functionFilter is null
+            ? ExecuteMetadataQuery(FunctionsMetadataSql())
+            : FilteredFunctions(),
         // The detected capability profile as (property, value) rows — the fabricator_server_info() diagnostic.
         // Built from the in-memory profile (not a re-query), so it surfaces the derived flags.
         MetadataKind.ServerInfo => ServerInfoStream(),
@@ -1365,6 +1372,73 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         }
         var batch = new RecordBatch(schema, new IArrowArray[] { schemas.Build(), tables.Build(), types.Build() }, n);
         return new InMemoryArrayStream(schema, new[] { batch });
+    }
+
+    // function_filter applied: only routines whose NAME matches the icase regex are surfaced (so the C++
+    // catalog registers only those). Type-preserving (the diagnostic fabricator_functions keeps param_count
+    // as INT) — filters the rows of the discovery stream, which schema/name/kind (string) + param_count (int)
+    // + return_type (string). schema_filter is applied C++-side (register only functions in registered schemas).
+    private IArrowArrayStream FilteredFunctions()
+    {
+        using var src = ExecuteMetadataQuery(FunctionsMetadataSql());
+        var schema = src.Schema;
+        int nameIdx = 1; // schema_name(0), name(1), kind(2), param_count(3), return_type(4)
+        var outBatches = new List<RecordBatch>();
+        while (true)
+        {
+            var batch = src.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+            if (batch is null)
+            {
+                break;
+            }
+            using (batch)
+            {
+                var names = (StringArray)batch.Column(nameIdx);
+                var keep = new List<int>();
+                for (int i = 0; i < batch.Length; i++)
+                {
+                    var nm = names.GetString(i);
+                    if (nm is not null && _functionFilter!.IsMatch(nm))
+                    {
+                        keep.Add(i);
+                    }
+                }
+                if (keep.Count == 0)
+                {
+                    continue;
+                }
+                var cols = new IArrowArray[batch.ColumnCount];
+                for (int c = 0; c < batch.ColumnCount; c++)
+                {
+                    cols[c] = TakeRows(batch.Column(c), keep);
+                }
+                outBatches.Add(new RecordBatch(schema, cols, keep.Count));
+            }
+        }
+        return new InMemoryArrayStream(schema, outBatches);
+    }
+
+    // Selects rows by index from a discovery column, preserving its Arrow type (Utf8 or Int32 — the only
+    // types the Functions metadata produces). Apache.Arrow C# has no built-in take, so rebuild via a builder.
+    private static IArrowArray TakeRows(IArrowArray col, List<int> idx)
+    {
+        switch (col)
+        {
+            case StringArray s:
+            {
+                var b = new StringArray.Builder();
+                foreach (var i in idx) { if (s.IsNull(i)) b.AppendNull(); else b.Append(s.GetString(i)); }
+                return b.Build();
+            }
+            case Int32Array a:
+            {
+                var b = new Int32Array.Builder();
+                foreach (var i in idx) { if (a.IsNull(i)) b.AppendNull(); else b.Append(a.GetValue(i)!.Value); }
+                return b.Build();
+            }
+            default:
+                throw new NotSupportedException($"function_filter: unexpected discovery column type {col.GetType().Name}");
+        }
     }
 
     // Discovered SQL Server routines + the provider's custom scalar/table functions, appended via

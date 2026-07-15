@@ -1664,9 +1664,16 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   a parallel multi-stream scan = the native form of the proven `UNION ALL` core-saturation trick; bigger). On
   `fabricator_query` the two surface as optional NAMED params (the `daxeval` pattern); a custom
   `IArrowTableFunction` could return `IAsyncEnumerable<IAsyncEnumerable<RecordBatch>>` (outer = partitions).
-- **Open design items (filters + refresh)** — deliberated, not yet built:
-  - A **`function_filter`** ATTACH option (icase regex on the function name), symmetric with `table_filter`,
-    to gate which UDFs/TVFs register when a catalog has many. Today functions are schema-filtered only.
+- **`function_filter` ATTACH option — DONE (2026-07-15).** `ATTACH … (TYPE fabricator, function_filter
+  '^ff_keep$')` — an icase regex on the routine NAME gates which discovered scalar UDFs / TVFs / procs register
+  (symmetric with `table_filter`, which is table-only; `schema_filter` still gates functions by schema C++-side).
+  Applied in C# `SqlServerCatalog.FilteredFunctions` (a type-preserving row filter over the Functions discovery
+  stream — the diagnostic `fabricator_functions` keeps `param_count` as INT; `DiscoverFunctions` C++-side only
+  reads the 3 string cols so it's tolerant). Parsed like schema_filter/table_filter (v37 ATTACH-options JSON, no
+  ABI change). `test/verify_function_filter.test` (15 — exact-anchor keeps one/drops the other, substring matches
+  both, cleanup); function suites unregressed (functions 13 / scalar 26 / procs 24 / table 33 / custom 89 /
+  catalog_filter 7).
+- **Open design items (refresh)** — deliberated, not yet built:
   - **Targeted/scoped refresh.** `fabricator_refresh_cache` is arity-1 (whole catalog); `fabricator_invalidate_cache
     (catalog[,schema[,table]])` accepts the schema/table args for native-extension compat but **ignores
     them** (always a full refresh — a valid superset). The `fabricator_exec` auto-refresh (gated by
@@ -3317,9 +3324,12 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `test/verify_delta_tblproperties.test` (34 — round-trip/UNSET/guard/re-attach + the property overriding a
   write_serializable catalog in a two-connection racer). Regression-free (transactions 941 / row_level 70 /
   update 63 / delete 28 / row_tracking_virtual 299 / dv_default 58 / txn_version 51 / changes 73 / native_write
-  147). **Deferred:** stamping `delta.isolationLevel` at CREATE from the ATTACH option (the SET function covers
-  it explicitly; auto-stamp is a convenience). **STALE-BINARY:** the loadable + linux payload predate the 2 new
-  C++ function binds — rebuild before the next dbt/notebook run.):
+  147). **CREATE-TIME STAMP — DONE (2026-07-15):** ATTACH `isolation_level 'serializable'` now stamps
+  `delta.isolationLevel=Serializable` into CREATEd tables (all 3 create paths — `DeltaWriter.Write`/
+  `TryWriteStreaming`/`Create` gained a `serializable` param threaded from `_serializable`); write_serializable
+  is the Spark default so it's left ABSENT (no stamp), matching Spark's minimal metadata. `verify_delta_tblproperties`
+  now 42 (serializable-ATTACH create stamps it; default create leaves it absent). **STALE-BINARY:** the loadable +
+  linux payload predate the 2 new C++ function binds — rebuild before the next dbt/notebook run.):
   [docs/delta-transactions.md](docs/delta-transactions.md).** The engineered-wood
   Delta provider buffers a DuckDB transaction's writes per (txn, table) (`DeltaTxnBuffer`, keyed by the v35
   `AmbientTransaction` id) and flushes at COMMIT as **ONE atomic Delta commit per table** (Delta has no

@@ -1,0 +1,64 @@
+# name: test/verify_function_filter.test
+# description: function_filter ATTACH option — an icase regex on the routine NAME gates which discovered
+#              scalar UDFs / TVFs / procs register (symmetric with table_filter, which is table-only).
+# group: [fabricator]
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+# provision two scalar UDFs on an unfiltered catalog
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS prov (TYPE fabricator);
+
+statement ok
+SELECT fabricator_exec('prov', 'CREATE OR ALTER FUNCTION dbo.ff_keep(@a INT, @b INT) RETURNS INT AS BEGIN RETURN @a + @b END');
+
+statement ok
+SELECT fabricator_exec('prov', 'CREATE OR ALTER FUNCTION dbo.ff_drop(@a INT) RETURNS INT AS BEGIN RETURN @a END');
+
+statement ok
+DETACH prov;
+
+# a catalog with function_filter '^ff_keep$' registers ONLY ff_keep
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS filt (TYPE fabricator, function_filter '^ff_keep$');
+
+# ff_keep is discovered + callable
+query I
+SELECT filt.dbo.ff_keep(2, 3);
+----
+5
+
+# ff_drop was filtered out -> not registered -> resolution fails
+statement error
+SELECT filt.dbo.ff_drop(7);
+----
+
+statement ok
+DETACH filt;
+
+# a substring pattern matches both (icase, unanchored)
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS filt2 (TYPE fabricator, function_filter 'ff_');
+
+query I
+SELECT filt2.dbo.ff_keep(10, 20) + filt2.dbo.ff_drop(5);
+----
+35
+
+statement ok
+DETACH filt2;
+
+# cleanup
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS cleanup (TYPE fabricator);
+
+statement ok
+SELECT fabricator_exec('cleanup', 'DROP FUNCTION IF EXISTS dbo.ff_keep');
+
+statement ok
+SELECT fabricator_exec('cleanup', 'DROP FUNCTION IF EXISTS dbo.ff_drop');
+
+statement ok
+DETACH cleanup;

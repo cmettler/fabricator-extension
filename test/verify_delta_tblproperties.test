@@ -134,3 +134,35 @@ SELECT count(*) FROM db.main.t WHERE id = 3;
 
 statement ok
 DETACH db;
+
+# ---- Create-time stamp: ATTACH isolation_level 'serializable' -> created tables self-declare it ----
+# (write_serializable is the Spark default -> left ABSENT, matching Spark's minimal metadata).
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/serc' AS sc (TYPE fabricator, PROVIDER 'delta', isolation_level 'serializable');
+
+statement ok
+CREATE TABLE sc.main.t AS SELECT i AS id FROM range(3) t(i);
+
+query T
+SELECT value FROM fabricator_delta_tblproperties('sc', 'main.t') WHERE property = 'delta.isolationLevel';
+----
+Serializable
+
+statement ok
+DETACH sc;
+
+# a default (write_serializable) catalog leaves the property ABSENT
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/defc' AS dc (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE dc.main.t AS SELECT i AS id FROM range(3) t(i);
+
+query I
+SELECT count(*) FROM fabricator_delta_tblproperties('dc', 'main.t') WHERE property = 'delta.isolationLevel';
+----
+0
+
+statement ok
+DETACH dc;
