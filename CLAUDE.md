@@ -260,8 +260,12 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   parses model SQL — it renders jinja and hands the text to the materialization, which wraps `compiled_code`
   in `daxeval(expression := '<body, quotes doubled>')` + `CREATE OR REPLACE TABLE {{ this }} AS …`
   (config `dax_catalog`/`dax_model`; jinja caveat: literal `{{`/`{%` in DAX needs `{% raw %}` — single
-  braces/table constructors fine). GOTCHAS: the **LH lakehouse's DEFAULT semantic model is EMPTY** → daxeval
-  errors ("needs at least one table") — the harness points at the populated warehouse model instead; a
+  braces/table constructors fine). The FULL LOOP is validated: the user-created **`LH_semtest`** semantic
+  model over the LH lakehouse (table `arrownet_bigdv`) → plain-DAX model `EVALUATE TOPN(100,
+  'arrownet_bigdv')` → `lake.dbt.bigdv_top100` back on the SAME lakehouse (100 rows exact; the plugin
+  attaches a LIST of models — `daxlh` = LH_semtest, `dax` = Test Warehouse Model2). GOTCHAS: the
+  **LH lakehouse's DEFAULT semantic model is EMPTY** → daxeval errors ("needs at least one table") — use a
+  user-created model (LH_semtest) or a populated one; a
   workspace XMLA endpoint WITHOUT `Initial Catalog` auto-binds the FIRST model with the schema named by
   GUID (give `Initial Catalog` → schema binds by name, e.g. `Model`); a `+schema:` in dbt_project.yml
   CONCATENATES with the profile schema (dbt default `generate_schema_name` → `dbt_dbt`) — set the schema in
