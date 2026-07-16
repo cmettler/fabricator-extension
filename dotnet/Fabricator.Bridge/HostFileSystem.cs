@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using System.Threading;
 using Apache.Arrow;
 using Apache.Arrow.C;
 using Apache.Arrow.Ipc;
@@ -313,11 +314,16 @@ internal static unsafe class HostFs
     /// <summary>
     /// Runs <paramref name="sql"/> on a FRESH host DuckDB connection (its own transaction) and returns the
     /// result as an Arrow stream the caller owns (dispose to release the connection + result). Lets a managed
-    /// component reuse the host engine — functions, readers, the catalog — over Arrow. See docs/host-query.md.
+    /// component reuse the host engine — functions, readers, the catalog — over Arrow. CANCELLABLE (v66):
+    /// the fresh connection is invisible to the USER query's Ctrl+C, so the returned stream carries an
+    /// InterruptScope on the AMBIENT opener (plus <paramref name="ct"/> if given) that trips
+    /// host_query_interrupt — an in-flight Fetch aborts at DuckDB's next check and surfaces as a stream
+    /// error. See docs/host-query.md + docs/cancellation.md.
     /// </summary>
     public static IArrowArrayStream Query(string sql,
                                           RecordBatch? parameters = null,
-                                          IReadOnlyList<(string Name, IArrowArrayStream Stream)>? inputs = null)
+                                          IReadOnlyList<(string Name, IArrowArrayStream Stream)>? inputs = null,
+                                          CancellationToken ct = default)
     {
         if (!CanQuery)
         {
@@ -359,14 +365,22 @@ internal static unsafe class HostFs
             }
 
             byte* err = null;
-            int rc = _h.HostQuery((byte*)sqlPtr, paramStream, hiPtr, cstream, &err);
+            // Request the interrupt handle only when the v66 pair is available (defensive vs an older host).
+            bool cancellable = _h.HostQueryInterrupt != null && _h.HostQueryInterruptFree != null;
+            void* interruptHandle = null;
+            int rc = _h.HostQuery((byte*)sqlPtr, paramStream, hiPtr, cstream,
+                                  cancellable ? &interruptHandle : null, &err);
             if (rc != 0)
             {
                 throw HostError("host_query", err);
             }
             var imported = CArrowArrayStreamImporter.ImportArrayStream(cstream);
             cstream = null; // ownership transferred to the imported stream (it frees the alloc on dispose)
-            return imported;
+            if (interruptHandle == null)
+            {
+                return imported;
+            }
+            return new InterruptibleQueryStream(imported, (nint)interruptHandle, ct);
         }
         finally
         {
@@ -411,6 +425,53 @@ internal static unsafe class HostFs
             _h.FreeStr(err);
         }
         return new System.IO.IOException($"host {op} failed: {msg}");
+    }
+
+    /// <summary>
+    /// Decorates a host_query result stream with CANCELLATION (v66): the fresh host connection is invisible
+    /// to the user query's own Ctrl+C, so an <see cref="InterruptScope"/> on the AMBIENT opener (captured at
+    /// Query() — the operator that initiated the work, set fresh by every write/scan path) trips
+    /// <c>host_query_interrupt</c> on interrupt, aborting an in-flight Fetch at DuckDB's next check. Dispose
+    /// order matters: the registration is disposed FIRST (waits out an in-flight interrupt callback), the
+    /// handle is freed LAST — so the callback can never touch a freed handle.
+    /// </summary>
+    private sealed class InterruptibleQueryStream : IArrowArrayStream
+    {
+        private readonly IArrowArrayStream _inner;
+        private readonly nint _handle;
+        private readonly InterruptScope _interrupt;
+        private System.Threading.CancellationTokenRegistration _reg;
+        private int _disposed;
+
+        public InterruptibleQueryStream(IArrowArrayStream inner, nint handle, System.Threading.CancellationToken linked)
+        {
+            _inner = inner;
+            _handle = handle;
+            _interrupt = new InterruptScope(AmbientOpener.Current, linked);
+            _reg = _interrupt.Token.Register(static state =>
+            {
+                var self = (InterruptibleQueryStream)state!;
+                _h.HostQueryInterrupt((void*)self._handle); // thread-safe; no-op once the query ended
+            }, this);
+        }
+
+        public Schema Schema => _inner.Schema;
+
+        public System.Threading.Tasks.ValueTask<RecordBatch?> ReadNextRecordBatchAsync(
+            System.Threading.CancellationToken cancellationToken = default)
+            => _inner.ReadNextRecordBatchAsync(cancellationToken);
+
+        public void Dispose()
+        {
+            if (System.Threading.Interlocked.Exchange(ref _disposed, 1) != 0)
+            {
+                return;
+            }
+            _reg.Dispose();       // waits out an in-flight interrupt callback
+            _interrupt.Dispose(); // stops the poller
+            _inner.Dispose();     // releases the host stream (connection + result)
+            _h.HostQueryInterruptFree((void*)_handle);
+        }
     }
 }
 

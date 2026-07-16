@@ -100,9 +100,19 @@ but such a connection must be disposed, not reused.
 - **Delta EW DML/maintenance (commit `54b05de`):** the EW write cores `DeleteByRowIds`, `DeleteByRowIdsViaVectors`,
   `UpdateByRowIds`, `Optimize`, `Vacuum` each build an `InterruptScope(opener, ct)` internally (like the Tier 1
   read paths) and pass its token to `OpenAsync` + the EW operation — so a slow OneLake/S3 copy-on-write/DV
-  rewrite, OPTIMIZE compaction, or VACUUM cancels (autocommit). The codec path honors the token throughout; on
-  the `native_write` path the log open/commit cancel but the parquet rewrite runs on a separate host_query
-  connection (uncancelled — a Tier-4 concern).
+  rewrite, OPTIMIZE compaction, or VACUUM cancels (autocommit). The codec path honors the token throughout.
+- **host_query cancellation (ABI v66)** — closes the last big window: EVERY `Host.Query` (the native_write
+  parquet writes/rewrites, `DeltaNativeReader`'s per-file `read_parquet` scans, `HostBatchFilter`, the codec
+  `IDataFileReader`) runs on a FRESH host `Connection` whose `ClientContext` is invisible to the user query's
+  Ctrl+C — a heavy first `Fetch` (the rewrite's anti-join build, a big COPY) was uncancellable. Now
+  `host_query` returns an opaque interrupt handle (`out_interrupt` = a heap `shared_ptr<ClientContext>` to the
+  fresh context) plus two appended host-service entries `host_query_interrupt` (thread-safe
+  `context->Interrupt()`; a no-op after the query ends — the shared_ptr keeps the context alive) and
+  `host_query_interrupt_free`. The C# `HostFs.Query` wraps the result in an `InterruptibleQueryStream`: an
+  `InterruptScope` on the AMBIENT opener (every write/scan path sets it fresh) whose token registration trips
+  the interrupt; dispose order = registration (waits out an in-flight callback) → scope → inner stream →
+  free-handle. CENTRALIZED — zero per-call-site changes; an in-flight `Fetch` aborts at DuckDB's next
+  between-tasks check and surfaces as a stream error.
 - **Buffered explicit-txn path (commit `<this>`):** the COMMIT-phase flushes (`FlushDmlTransaction` — including
   breaking OUT of the OCC/rebase retry loop via `ThrowIfCancellationRequested` + passing the token to
   `WriteDataFilesAsync`/`ComputeDeletionVectorActionsAsync`/`RebaseDvDmlActionsAsync`/`CheckLogicalRebaseAsync`/
@@ -150,7 +160,8 @@ the current statement's live `&context` — never a stale pointer. **What is NOT
   (`InterruptState`): run the I/O on a background thread, return `BLOCKED` so the task thread is *released*
   during I/O, resume via the InterruptState callback. Native interruption + better parallelism under slow I/O
   (today a blocked scan holds a whole task slot). Big change to `arrow_ingest`; do it only if scan concurrency
-  under slow I/O becomes a goal.
+  under slow I/O becomes a goal. (The `native_write` host_query rewrite, once bucketed here, was closed
+  separately by the v66 host_query cancellation — see the as-built list.)
 
 ## Caveats
 

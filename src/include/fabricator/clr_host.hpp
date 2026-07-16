@@ -40,8 +40,10 @@ void SetHostServices(const FabricatorHostServices &services);
 // load by the host-query module, after SetHostServices set the rest; both run before the bridge boots, so
 // order-independent). See FabricatorHostServices::host_query in abi.h.
 using HostQueryFn = int32_t (*)(const char *sql, struct ArrowArrayStream *params,
-                                struct FabricatorHostInputs *inputs, struct ArrowArrayStream *out, char **err);
-void SetHostQueryService(HostQueryFn fn);
+                                struct FabricatorHostInputs *inputs, struct ArrowArrayStream *out,
+                                void **out_interrupt, char **err);
+using HostQueryInterruptFn = void (*)(void *interrupt_handle);
+void SetHostQueryService(HostQueryFn fn, HostQueryInterruptFn interrupt_fn, HostQueryInterruptFn free_fn);
 
 // Register the host_log callback (DuckDB internal-logging forward). Patched onto the shared host-services block
 // at load, like SetHostQueryService. See FabricatorHostServices::host_log in abi.h.

@@ -498,10 +498,12 @@ void SetHostServices(const FabricatorHostServices &services) {
 	g_host_services = services; // must be called before the first GetBridge() (bridge boot)
 }
 
-void SetHostQueryService(HostQueryFn fn) {
-	// Patches just the host_query field on the shared host-services block (the fs services set the rest).
+void SetHostQueryService(HostQueryFn fn, HostQueryInterruptFn interrupt_fn, HostQueryInterruptFn free_fn) {
+	// Patches the host_query trio on the shared host-services block (the fs services set the rest).
 	// Both happen at extension load, before the bridge boots — order-independent.
 	g_host_services.host_query = fn;
+	g_host_services.host_query_interrupt = interrupt_fn;
+	g_host_services.host_query_interrupt_free = free_fn;
 }
 
 void SetHostLog(HostLogFn fn) {

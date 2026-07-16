@@ -1824,7 +1824,18 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `FabricLakehouse.IsOneLake` abfss check, so it rides the plain host-FS path with opener-resolved secrets —
   which is exactly right). Kernel reads the outputs (known quirk unchanged: kernel shows a MAPPED partitioned
   table's partition column as NULL; plain shape exact).
-- **Current version: ABI v65** (v65 = **`is_interrupted`** — a host→managed reverse callback on
+- **Current version: ABI v66** (v66 = **host_query CANCELLATION** — `host_query` gained a nullable
+  `void **out_interrupt` (a heap `shared_ptr<ClientContext>` to the query's FRESH context) + two appended
+  host-service entries `host_query_interrupt` (thread-safe `Interrupt()`; no-op after the query ends — the
+  shared_ptr keeps the context alive) / `host_query_interrupt_free`. Why: every `Host.Query` (native_write
+  parquet writes + rewrites, `DeltaNativeReader` per-file `read_parquet`, `HostBatchFilter`, codec
+  `IDataFileReader`) runs on a fresh connection INVISIBLE to the user query's Ctrl+C — a heavy first Fetch
+  (the rewrite's anti-join build, a big COPY) was uncancellable. The C# `HostFs.Query` CENTRALIZES the fix:
+  it wraps every result in an `InterruptibleQueryStream` (an `InterruptScope` on the AMBIENT opener whose
+  token trips the interrupt; dispose order = registration [waits in-flight] → scope → inner stream →
+  free-handle) — zero per-call-site changes. This closed the "native_write host_query rewrite" deferred
+  item; Tier 4 (async/BLOCKED source) remains the only deferred rearchitecture. See docs/cancellation.md.)
+- **Prior: ABI v65** (v65 = **`is_interrupted`** — a host→managed reverse callback on
   `FabricatorHostServices` reading the calling operator's `ClientContext::interrupted` (the atomic set by
   Ctrl+C via `Connection::Interrupt()` or a query timeout). The opener handle already IS a `ClientContext*`
   (the `fs_*` secret-resolution handle), so `HostIsInterrupted` is a one-line cast+read. **Cancellation
@@ -1883,14 +1894,12 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `AdomdCommand.Cancel()` (no usable async); **Tier 4** the arrow scan as a DuckDB async/BLOCKED source
   (`InterruptState`) to free the task thread during I/O (native interrupt + better parallelism, bigger). Live Ctrl+C
   behavior is a MANUAL check (a slow OneLake/SQL query + interrupt); the suites verify only behavior-neutrality.
-  **STALE-BINARY (v65 rebuild pending — the top standing item):** the ABI bump v64→v65 means the **loadable +
-  `duckdb.exe` shell + linux payload are ALL still at v64** — only `unittest.exe` was rebuilt at v65 (so the
-  `.test` suites pass, but the shell/dbt/notebook paths throw `ABI version mismatch (host=64, bridge=65)` and the
-  new `mssql_command_timeout` setting isn't registered there). Rebuild `cmake --build build/release` (all
-  targets: `unittest shell fabricator_loadable_extension`) inside the VS18 vcvars + republish the linux payload
-  (WSL) BEFORE any shell/dbt/notebook use. Everything since Tier 1 (all of Tier 2, Delta EW DML, buffered-txn
-  flush, 2d) was C#-only — a `pwsh scripts/publish-managed.ps1` already picks those up; only the v65 ABI bump
-  itself needs the C++ relink.)
+  **BINARY STATUS (2026-07-16): the WINDOWS targets are all CURRENT at v66** (full `cmake --build
+  build/release` — unittest + `duckdb.exe` shell + the loadable — rebuilt for the v66 bump; the earlier
+  v64-stale-shell condition is resolved, shell smoke green). **Only the LINUX payload
+  (`build/linux-payload/fabricator.duckdb_extension` + the FDD zip) is still pre-v65** — rebuild in WSL
+  (rsync `src/` → `~/sqlext`, `cmake --build … --target fabricator_loadable_extension`) before the next
+  notebook run.)
 - **Prior: ABI v64** (v64 = **`onelake_move`** — atomic single-file rename via the ADLS Gen2
   DFS **native rename** (`DataLakeFileClient.RenameAsync`, a metadata op that overwrites an existing
   destination = MoveFile semantics; destination path filesystem-relative with the `<item>.Lakehouse`

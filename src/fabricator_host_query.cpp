@@ -97,8 +97,12 @@ unique_ptr<FunctionData> HostQueryBind(ClientContext &context, TableFunctionBind
 } // namespace
 
 void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStream *params,
-                         const vector<HostQueryInput> &inputs, ArrowArrayStream &out) {
+                         const vector<HostQueryInput> &inputs, ArrowArrayStream &out,
+                         shared_ptr<ClientContext> *out_context) {
 	auto conn = make_uniq<Connection>(db); // FRESH connection: own context/transaction (see header)
+	if (out_context) {
+		*out_context = conn->context; // for out-of-band interruption (host_query_interrupt, ABI v66)
+	}
 	// Register each named Arrow input as a connection-scoped view (data-in). duckdb_arrow_scan reinterprets
 	// the opaque handle back to ArrowArrayStream* and creates a temp view; the stream is consumed + released
 	// by DuckDB during the (materializing) query below.
@@ -161,9 +165,12 @@ static char *DupErr(const string &msg) {
 }
 
 // The `host_query` host-service callback (C# -> host). Runs `sql` on a fresh connection + hands C# the
-// result as a self-owning ArrowArrayStream (C# imports + releases it). See abi.h / docs/host-query.md.
+// result as a self-owning ArrowArrayStream (C# imports + releases it). `out_interrupt` (nullable) receives
+// a heap shared_ptr<ClientContext> to the fresh context so the managed InterruptScope can cancel an
+// in-flight Fetch out-of-band (the fresh connection is invisible to the USER query's Ctrl+C). See abi.h /
+// docs/host-query.md / docs/cancellation.md.
 int32_t HostQueryService(const char *sql, ArrowArrayStream *params, FabricatorHostInputs *inputs,
-                         ArrowArrayStream *out, char **err) {
+                         ArrowArrayStream *out, void **out_interrupt, char **err) {
 	try {
 		if (!g_host_db) {
 			throw IOException("fabricator host_query: host database not available");
@@ -174,7 +181,14 @@ int32_t HostQueryService(const char *sql, ArrowArrayStream *params, FabricatorHo
 				in.push_back({string(inputs->names[i]), inputs->streams[i]});
 			}
 		}
-		MakeHostQueryStream(*g_host_db, sql ? string(sql) : string(), params, in, *out);
+		shared_ptr<ClientContext> ctx;
+		MakeHostQueryStream(*g_host_db, sql ? string(sql) : string(), params, in, *out,
+		                    out_interrupt ? &ctx : nullptr);
+		if (out_interrupt) {
+			// The handle owns a shared_ptr copy: an interrupt AFTER the result stream is released still
+			// dereferences a live (idle) context — a harmless no-op instead of a use-after-free.
+			*out_interrupt = new shared_ptr<ClientContext>(std::move(ctx));
+		}
 		return FABRICATOR_OK;
 	} catch (std::exception &e) {
 		if (err) {
@@ -182,6 +196,24 @@ int32_t HostQueryService(const char *sql, ArrowArrayStream *params, FabricatorHo
 		}
 		return 1;
 	}
+}
+
+// host_query_interrupt — trip the fresh context's interrupted flag (thread-safe atomic); an in-flight
+// Fetch aborts at DuckDB's next between-tasks check and surfaces as a get_next error. Best-effort.
+void HostQueryInterruptService(void *interrupt_handle) {
+	if (!interrupt_handle) {
+		return;
+	}
+	try {
+		(*static_cast<shared_ptr<ClientContext> *>(interrupt_handle))->Interrupt();
+	} catch (...) { // never fault the extension from a cancellation signal
+	}
+}
+
+// host_query_interrupt_free — release the handle (the managed wrapper calls this exactly once, after any
+// in-flight interrupt callback has been waited out).
+void HostQueryInterruptFreeService(void *interrupt_handle) {
+	delete static_cast<shared_ptr<ClientContext> *>(interrupt_handle);
 }
 
 // fabricator_scan(name) — scan an ambient named source (registered in C# via Host.RegisterSource). The factory
@@ -248,7 +280,8 @@ static void HostLogService(int32_t level, const char *log_type, const char *mess
 
 void RegisterHostQuery(ExtensionLoader &loader) {
 	g_host_db = &loader.GetDatabaseInstance();
-	fabricator::SetHostQueryService(HostQueryService); // make host_query callable from C# (added to the host block)
+	// Make host_query (+ its v66 interrupt pair) callable from C# (patched onto the host-services block).
+	fabricator::SetHostQueryService(HostQueryService, HostQueryInterruptService, HostQueryInterruptFreeService);
 	fabricator::SetHostLog(HostLogService);            // forward ILogger events into DuckDB's internal logging
 	DBConfig::GetConfig(loader.GetDatabaseInstance()).replacement_scans.emplace_back(NamedSourceReplacement);
 	TableFunction fn("fabricator_host_query", {LogicalType::VARCHAR}, fabricator::ArrowStreamScan, HostQueryBind,

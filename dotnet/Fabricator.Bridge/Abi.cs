@@ -244,10 +244,11 @@ public unsafe struct FabricatorHostServices
     // int32 fs_glob(void* opener, const char* pattern, char** out_json, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte*, byte**, byte**, int> FsGlob;
     // int32 host_query(const char* sql, ArrowArrayStream* params, FabricatorHostInputs* inputs,
-    //                  ArrowArrayStream* out, char** err) — run sql on a fresh host connection (binding a 1-row
-    // params batch positionally + registering named Arrow inputs as views first); result as Arrow (the managed
-    // caller imports + releases the stream). See docs/host-query.md.
-    public delegate* unmanaged[Cdecl]<byte*, CArrowArrayStream*, FabricatorHostInputs*, CArrowArrayStream*, byte**, int> HostQuery;
+    //                  ArrowArrayStream* out, void** out_interrupt, char** err) — run sql on a fresh host
+    // connection (binding a 1-row params batch positionally + registering named Arrow inputs as views first);
+    // result as Arrow (the managed caller imports + releases the stream). out_interrupt (nullable) receives an
+    // opaque cancellation handle for the query's fresh ClientContext (v66). See docs/host-query.md.
+    public delegate* unmanaged[Cdecl]<byte*, CArrowArrayStream*, FabricatorHostInputs*, CArrowArrayStream*, void**, byte**, int> HostQuery;
 
     // ---- WRITE surface (Delta write-back foundation; see docs/delta-catalog.md) ----
     // int32 fs_open_write(void* opener, const char* path, int32 exclusive, void** out_file, char** err)
@@ -273,6 +274,12 @@ public unsafe struct FabricatorHostServices
     // query timeout). Returns 1 if interrupted else 0 (0 for a null opener). Polled by InterruptScope to cancel
     // long-running C# I/O. Additive (ABI v65). See docs/cancellation.md.
     public delegate* unmanaged[Cdecl]<nint, int> IsInterrupted;
+    // void host_query_interrupt(void* interrupt_handle) — trip the fresh ClientContext behind a host_query
+    // result (thread-safe; callable any time, a no-op after the query ended). Additive (ABI v66).
+    public delegate* unmanaged[Cdecl]<void*, void> HostQueryInterrupt;
+    // void host_query_interrupt_free(void* interrupt_handle) — free the handle, exactly once, after any
+    // in-flight interrupt callback has been waited out (registration disposed first). Additive (ABI v66).
+    public delegate* unmanaged[Cdecl]<void*, void> HostQueryInterruptFree;
 }
 
 /// <summary>Mirrors <c>FabricatorHostInputs</c> in abi.h — named Arrow streams handed to host_query as data-in

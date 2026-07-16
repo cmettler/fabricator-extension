@@ -766,9 +766,15 @@ typedef struct FabricatorHostServices {
 	// transaction => committed-reads semantics. The result stream (and its connection) is owned by the
 	// managed caller, which releases it when done. `params` (nullable) is a 1-row Arrow stream whose columns
 	// bind POSITIONALLY to the statement's parameters (?, $1, …) via a prepared statement. `inputs` (nullable)
-	// registers named Arrow sources as connection-scoped views before the query (data-in). See docs/host-query.md.
+	// registers named Arrow sources as connection-scoped views before the query (data-in). `out_interrupt`
+	// (nullable): receives an opaque cancellation handle for THIS query's fresh ClientContext — trip it via
+	// host_query_interrupt (thread-safe, any time) and free it via host_query_interrupt_free once the result
+	// stream is released (the handle owns a shared_ptr, so a late interrupt is a harmless no-op on a dead
+	// query). The fresh connection is invisible to the USER query's Ctrl+C, so without this a long host-side
+	// fetch (the native_write rewrite's read_parquet JOIN, a big COPY) was uncancellable (ABI v66). See
+	// docs/host-query.md + docs/cancellation.md.
 	int32_t (*host_query)(const char *sql, struct ArrowArrayStream *params, struct FabricatorHostInputs *inputs,
-	                      struct ArrowArrayStream *out, char **err);
+	                      struct ArrowArrayStream *out, void **out_interrupt, char **err);
 
 	// -------------------------------------------------------------------------
 	// WRITE surface (foundation for a Delta WRITE-back through the host FileSystem; see docs/delta-catalog.md).
@@ -815,13 +821,22 @@ typedef struct FabricatorHostServices {
 	// checks interruption BETWEEN operator calls, so a single blocking get_next is invisible to it. Additive
 	// host-service entry (ABI v65). See docs/cancellation.md.
 	int32_t (*is_interrupted)(FabricatorHandle opener);
+
+	// Interrupt the fresh ClientContext behind a host_query result (handle from host_query's out_interrupt):
+	// sets its interrupted flag so an in-flight Fetch aborts at DuckDB's next check. Thread-safe, callable any
+	// time (incl. after the result stream is released — the handle keeps the context alive, the interrupt is
+	// then a no-op). Best-effort, never errors. Additive host-service entries (ABI v66).
+	void (*host_query_interrupt)(void *interrupt_handle);
+	// Free the interrupt handle (exactly once, after any in-flight host_query_interrupt has returned —
+	// the managed wrapper orders registration-dispose before this).
+	void (*host_query_interrupt_free)(void *interrupt_handle);
 } FabricatorHostServices;
 
 // Max serialized size of a spillable aggregate's per-group state (the inline, pointer-free
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 65
+#define FABRICATOR_ABI_VERSION 66
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

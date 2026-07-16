@@ -129,24 +129,28 @@ void FabricatorSchemaEntry::InvalidateEntryCache() {
 	aggregate_function_entries_.clear();
 }
 
+// Erase every cache entry whose NAME matches. A template function, NOT a generic lambda — the extension
+// compiles as C++11 on gcc (the CLAUDE.md pre-C++17 gotcha; MSVC was permissive).
+template <class MAP>
+static void EvictMatching(MAP &cache, const std::function<bool(const string &)> &matches) {
+	for (auto it = cache.begin(); it != cache.end();) {
+		if (matches(it->first)) {
+			it = cache.erase(it);
+		} else {
+			++it;
+		}
+	}
+}
+
 void FabricatorSchemaEntry::InvalidateMatching(const std::function<bool(const string &)> &matches) {
 	// Like InvalidateEntryCache but scoped: drop only the materialized entries whose NAME matches. The name
 	// lists are kept, so an ALTER'd object re-fetches its fresh schema on next access and a DROPped one
 	// self-heals (its column re-fetch fails -> GetOrCreateEntry evicts it). Everything else stays warm.
 	lock_guard<mutex> lock(entry_lock_);
-	auto evict = [&](auto &cache) {
-		for (auto it = cache.begin(); it != cache.end();) {
-			if (matches(it->first)) {
-				it = cache.erase(it);
-			} else {
-				++it;
-			}
-		}
-	};
-	evict(entries_);
-	evict(function_entries_);
-	evict(table_function_entries_);
-	evict(aggregate_function_entries_);
+	EvictMatching(entries_, matches);
+	EvictMatching(function_entries_, matches);
+	EvictMatching(table_function_entries_, matches);
+	EvictMatching(aggregate_function_entries_, matches);
 }
 
 optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext &context, const string &table_name) {

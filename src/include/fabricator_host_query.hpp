@@ -27,9 +27,11 @@ struct HostQueryInput {
 // result (the Connection + result live until `out` is released). When `params` is non-null it is a 1-row
 // Arrow stream whose columns bind positionally to the statement's parameters (via a prepared statement;
 // ownership is consumed here). Each `inputs` entry is registered as a connection-scoped view (so the SQL can
-// reference it by name) before the query. Throws on a query error.
+// reference it by name) before the query. `out_context` (nullable) receives the fresh connection's
+// ClientContext for out-of-band interruption (the v66 host_query cancellation). Throws on a query error.
 void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStream *params,
-                         const vector<HostQueryInput> &inputs, ArrowArrayStream &out);
+                         const vector<HostQueryInput> &inputs, ArrowArrayStream &out,
+                         shared_ptr<ClientContext> *out_context = nullptr);
 
 // Registers the `fabricator_host_query(VARCHAR)` table function.
 void RegisterHostQuery(ExtensionLoader &loader);
