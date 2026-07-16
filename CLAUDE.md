@@ -1883,9 +1883,14 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `AdomdCommand.Cancel()` (no usable async); **Tier 4** the arrow scan as a DuckDB async/BLOCKED source
   (`InterruptState`) to free the task thread during I/O (native interrupt + better parallelism, bigger). Live Ctrl+C
   behavior is a MANUAL check (a slow OneLake/SQL query + interrupt); the suites verify only behavior-neutrality.
-  **STALE-BINARY:** the ABI bump v64→v65 means the loadable + linux payload (last built at v64) are now
-  ABI-mismatched — rebuild `fabricator_loadable_extension` (+ the linux payload) before the next dbt/notebook
-  run, else `Bootstrap.Initialize returned … ABI version mismatch`.)
+  **STALE-BINARY (v65 rebuild pending — the top standing item):** the ABI bump v64→v65 means the **loadable +
+  `duckdb.exe` shell + linux payload are ALL still at v64** — only `unittest.exe` was rebuilt at v65 (so the
+  `.test` suites pass, but the shell/dbt/notebook paths throw `ABI version mismatch (host=64, bridge=65)` and the
+  new `mssql_command_timeout` setting isn't registered there). Rebuild `cmake --build build/release` (all
+  targets: `unittest shell fabricator_loadable_extension`) inside the VS18 vcvars + republish the linux payload
+  (WSL) BEFORE any shell/dbt/notebook use. Everything since Tier 1 (all of Tier 2, Delta EW DML, buffered-txn
+  flush, 2d) was C#-only — a `pwsh scripts/publish-managed.ps1` already picks those up; only the v65 ABI bump
+  itself needs the C++ relink.)
 - **Prior: ABI v64** (v64 = **`onelake_move`** — atomic single-file rename via the ADLS Gen2
   DFS **native rename** (`DataLakeFileClient.RenameAsync`, a metadata op that overwrites an existing
   destination = MoveFile semantics; destination path filesystem-relative with the `<item>.Lakehouse`
