@@ -715,24 +715,25 @@ internal static class DeltaReader
         }
     }
 
-    /// <summary>Reads exactly the rows identified by the given transient rowids, materialized, WITH the
-    /// trailing virtual <c>_metadata.row_id</c> column. The read-back step of a buffered UPDATE.
-    /// The batches are SELF-OWNED (engineered-wood arrays own their buffers — native memory behind
-    /// finalizer-backed refcounted handles) and stay valid after the table is disposed, so no copy is
-    /// needed (verified empirically 2026-07-16; the old Arrow-IPC deep copy here guarded against a
-    /// misdiagnosed CDF schema-mismatch bug, not a real buffer lifetime).
-    /// <paramref name="sourceTrackingOut"/> (optional): one row-aligned entry per returned batch with each
+    /// <summary>Reads exactly the rows identified by the given transient rowids, STREAMED LAZILY (one
+    /// batch in flight — the table stays open for the enumeration and is disposed when it completes or
+    /// is abandoned), WITH the trailing virtual <c>_metadata.row_id</c> column. The read-back step of a
+    /// buffered UPDATE / CDF DELETE. Yielded batches are SELF-OWNED (engineered-wood arrays own their
+    /// buffers) and stay valid after the table is disposed — the caller may retain or dispose them freely.
+    /// <paramref name="sourceTrackingOut"/> (optional): one row-aligned entry per yielded batch with each
     /// row's ORIGINAL stable id/commit version (materialized source value else baseRowId + position) —
-    /// plain value arrays.</summary>
-    public static List<RecordBatch> ReadRowsByRowIds(
+    /// plain value arrays; each batch's entry is appended BEFORE that batch is yielded, and the list is
+    /// complete only once the enumeration finishes.</summary>
+    public static IEnumerable<RecordBatch> ReadRowsByRowIds(
         nint opener, string path, IReadOnlyCollection<long> rowIds, CancellationToken ct,
         long? atVersion = null,
         List<(long?[] Ids, long?[] Versions)>? sourceTrackingOut = null)
-        => ReadRowsByRowIdsAsync(opener, path, rowIds, ct, atVersion, sourceTrackingOut).GetAwaiter().GetResult();
+        => BlockingEnumerable(ReadRowsByRowIdsAsync(opener, path, rowIds, atVersion, sourceTrackingOut, ct));
 
-    private static async Task<List<RecordBatch>> ReadRowsByRowIdsAsync(
-        nint opener, string path, IReadOnlyCollection<long> rowIds, CancellationToken ct,
-        long? atVersion, List<(long?[] Ids, long?[] Versions)>? sourceTrackingOut)
+    private static async IAsyncEnumerable<RecordBatch> ReadRowsByRowIdsAsync(
+        nint opener, string path, IReadOnlyCollection<long> rowIds,
+        long? atVersion, List<(long?[] Ids, long?[] Versions)>? sourceTrackingOut,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         // Cancel a slow buffered-UPDATE read-back of the matched rows over OneLake/S3 on interrupt.
         using var interrupt = new InterruptScope(opener, ct);
@@ -741,17 +742,34 @@ internal static class DeltaReader
         var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(), token).ConfigureAwait(false);
         try
         {
-            var result = new List<RecordBatch>();
-            await foreach (var b in table.ReadRowsByRowIdsAsync(rowIds, token, atVersion, sourceTrackingOut)
+            await foreach (var batch in table.ReadRowsByRowIdsAsync(rowIds, atVersion, sourceTrackingOut, token)
                                .ConfigureAwait(false))
             {
-                result.Add(b);
+                yield return batch;
             }
-            return result;
         }
         finally
         {
             await table.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    // Sync facade over an async stream for the synchronous ABI callers: blocks once per pulled item
+    // (the per-item analog of the sync-wrapper convention; safe — the hostfxr CLR has no
+    // SynchronizationContext). Equivalent to .NET 9's ToBlockingEnumerable, which the net8.0 target lacks.
+    private static IEnumerable<T> BlockingEnumerable<T>(IAsyncEnumerable<T> source)
+    {
+        var e = source.GetAsyncEnumerator();
+        try
+        {
+            while (e.MoveNextAsync().AsTask().GetAwaiter().GetResult())
+            {
+                yield return e.Current;
+            }
+        }
+        finally
+        {
+            e.DisposeAsync().AsTask().GetAwaiter().GetResult();
         }
     }
 

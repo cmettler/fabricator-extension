@@ -3495,6 +3495,17 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   the SAME commit (`7f0563a`), misattributed to buffer lifetime. `GetChanges` stays lazy purely for
   bounded memory. Batches imported over the C ABI (bulk channel) are a DIFFERENT lifetime domain — their
   copies (`DeltaWriter.Materialize`, `ProjectPending` clone) are NOT covered by this finding; leave them.
+  **Follow-up (same day, user's design): the read-back is now a LAZY STREAM** — `DeltaReader.
+  ReadRowsByRowIds` returns `IEnumerable<RecordBatch>` (async iterator holding the table open for the
+  enumeration + a net8-safe `BlockingEnumerable` adapter — .NET 9's `ToBlockingEnumerable` is unavailable
+  on the net8.0 target; EW's `ReadRowsByRowIdsAsync` param order changed to token-LAST, sourceTracking
+  entries appended BEFORE each yield so in-loop indexing works). The **CDF-DELETE capture is fully
+  streaming** (read-back → `DropRowIdStreaming` [per-batch dispose after consumption — the derived batch
+  aliases the source columns] → `WriteCdcFiles(IEnumerable<RecordBatch>)` with LAZY table open, so an
+  empty statement still never touches storage — one batch in flight, a huge CDF DELETE never materializes
+  its matched rows). The **buffered-UPDATE deliberately keeps its pre/post-image accumulation**: the
+  all-or-nothing stable-ids decision (original vs fresh `__delta_row_id`) is only known after the WHOLE
+  statement, so its post-images can't stream into the eager write without changing row-identity semantics.
   **SNAPSHOT READS ARE THE DEFAULT (2026-07-11)**: inside an explicit transaction, the FIRST scan captures
   one UTC instant (`SnapshotPinning`, per txn — the MVCC snapshot-at-first-read shape, like Postgres
   REPEATABLE READ; capturing at literal BEGIN is impossible since catalogs are touched lazily) and each

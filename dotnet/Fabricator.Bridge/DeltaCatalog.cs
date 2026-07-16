@@ -2403,19 +2403,12 @@ public sealed class DeltaCatalog : IBackendCatalog
         {
             // slice C2: the deleted rows' CONTENT goes into an eager _change_data file (the position set
             // parked below has no row values; this is the one extra read CDF costs a buffered DELETE).
-            var deleted = DeltaReader.ReadRowsByRowIds(delOpener, path, ids, default,
-                atVersion: pending.PinnedVersion);
-            try
-            {
-                WriteCdcFiles(delOpener, path, pending, deleted.ConvertAll(DropTrailingRowId), "delete");
-            }
-            finally
-            {
-                foreach (var b in deleted)
-                {
-                    b.Dispose();
-                }
-            }
+            // Fully STREAMING: read-back -> drop rowid -> per-batch cdc write, one batch in flight — a
+            // huge CDF DELETE never materializes its matched rows.
+            WriteCdcFiles(delOpener, path, pending,
+                DropRowIdStreaming(DeltaReader.ReadRowsByRowIds(delOpener, path, ids, default,
+                    atVersion: pending.PinnedVersion)),
+                "delete");
         }
         long added = 0;
         foreach (var rid in ids)
@@ -2639,22 +2632,18 @@ public sealed class DeltaCatalog : IBackendCatalog
     // transaction's single commit; ROLLBACK leaves them as invisible orphans). Partitioned tables split
     // per partition inside WriteChangeDataFileAsync (partition columns excluded from the cdc bytes).
     private void WriteCdcFiles(nint opener, string tablePath, DeltaTxnBuffer.PendingAppends pending,
-                               IReadOnlyList<RecordBatch> rows, string changeType)
+                               IEnumerable<RecordBatch> rows, string changeType)
         => WriteCdcFilesAsync(opener, tablePath, pending, rows, changeType).GetAwaiter().GetResult();
 
     private static async Task WriteCdcFilesAsync(nint opener, string tablePath, DeltaTxnBuffer.PendingAppends pending,
-                               IReadOnlyList<RecordBatch> rows, string changeType)
+                               IEnumerable<RecordBatch> rows, string changeType)
     {
-        if (rows.Count == 0)
-        {
-            return;
-        }
         // Cancel a slow buffered-statement CDC write on interrupt (opener fresh from the DML operator).
         using var interrupt = new InterruptScope(opener);
         var token = interrupt.Token;
-        var fs = TableFileSystems.Create(opener, tablePath);
-        var table = await EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(fs, DeltaWriter.Options(), token)
-            .ConfigureAwait(false);
+        // rows may be a STREAMING source (the DELETE read-back) — one batch in flight; the table is
+        // opened lazily on the first non-empty batch so an empty statement never touches storage.
+        EngineeredWood.DeltaLake.Table.DeltaTable? table = null;
         try
         {
             foreach (var b in rows)
@@ -2663,13 +2652,37 @@ public sealed class DeltaCatalog : IBackendCatalog
                 {
                     continue;
                 }
+                table ??= await EngineeredWood.DeltaLake.Table.DeltaTable
+                    .OpenAsync(TableFileSystems.Create(opener, tablePath), DeltaWriter.Options(), token)
+                    .ConfigureAwait(false);
                 pending.PendingCdc.AddRange(await table.WriteChangeDataFileAsync(b, changeType, token)
                     .ConfigureAwait(false));
             }
         }
         finally
         {
-            await table.DisposeAsync().ConfigureAwait(false);
+            if (table is not null)
+            {
+                await table.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+    }
+
+    // Streams the read-back through DropTrailingRowId, disposing each source batch once the consumer has
+    // moved past its derived batch (the derived batch ALIASES the source columns, so the source must stay
+    // alive until the consumer pulls the next item; enumerator disposal covers early termination).
+    private static IEnumerable<RecordBatch> DropRowIdStreaming(IEnumerable<RecordBatch> source)
+    {
+        foreach (var raw in source)
+        {
+            try
+            {
+                yield return DropTrailingRowId(raw);
+            }
+            finally
+            {
+                raw.Dispose();
+            }
         }
     }
 
