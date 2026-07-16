@@ -58,83 +58,34 @@ FabricatorSchemaEntry::FabricatorSchemaEntry(Catalog &catalog, CreateSchemaInfo 
     : SchemaCatalogEntry(catalog, info), handle_(handle) {
 }
 
-void FabricatorSchemaEntry::AddTable(const string &table_name, const string &table_type) {
-	lock_guard<mutex> lock(entry_lock_);
-	table_types_[table_name] = table_type;
-	// Drop any cached entry so the schema is re-fetched (e.g. after CREATE OR REPLACE).
-	entries_.erase(table_name);
-}
-
-void FabricatorSchemaEntry::AddScalarFunction(const string &func_name) {
-	lock_guard<mutex> lock(entry_lock_);
-	scalar_functions_.insert(func_name);
-	// Drop any cached entry so the signature is re-fetched (e.g. after CREATE OR ALTER).
-	function_entries_.erase(func_name);
-}
-
-void FabricatorSchemaEntry::AddTableFunction(const string &func_name, bool is_proc) {
-	lock_guard<mutex> lock(entry_lock_);
-	table_functions_[func_name] = is_proc;
-	table_function_entries_.erase(func_name);
-	// A discovered TVF or stored proc also gets a synthetic table-in-out alias `<name>_each` that applies
-	// it once per input row (4g): a TVF via SQL-Server CROSS APPLY, a proc via per-row EXEC (the managed
-	// side picks by object kind). Both echo the input columns + the function's output columns; a proc's
-	// per-row EXECs run in DuckDB's transaction (commit/rollback driven by DuckDB).
-	string each = func_name + "_each";
-	inout_functions_[each] = func_name;
-	table_function_entries_.erase(each);
-}
-
-void FabricatorSchemaEntry::AddInOutFunction(const string &func_name) {
-	lock_guard<mutex> lock(entry_lock_);
-	custom_inout_functions_.insert(func_name);
-	table_function_entries_.erase(func_name);
-}
-
-void FabricatorSchemaEntry::AddCollectorFunction(const string &func_name) {
-	lock_guard<mutex> lock(entry_lock_);
-	custom_collector_functions_.insert(func_name);
-	table_function_entries_.erase(func_name);
-}
-
-void FabricatorSchemaEntry::AddAggregateFunction(const string &func_name, bool spillable) {
-	lock_guard<mutex> lock(entry_lock_);
-	aggregate_functions_[func_name] = spillable;
-	// Drop any cached entry so the signature is re-fetched (e.g. after a cache refresh).
-	aggregate_function_entries_.erase(func_name);
-}
-
-void FabricatorSchemaEntry::ClearTables() {
-	lock_guard<mutex> lock(entry_lock_);
-	table_types_.clear();
-	entries_.clear();
-	scalar_functions_.clear();
-	function_entries_.clear();
-	table_functions_.clear();
-	inout_functions_.clear();
-	custom_inout_functions_.clear();
-	custom_collector_functions_.clear();
-	aggregate_functions_.clear();
-	table_function_entries_.clear();
-	aggregate_function_entries_.clear();
-}
-
-void FabricatorSchemaEntry::InvalidateEntryCache() {
-	// Keep the discovered NAME lists (table_types_, scalar_functions_, …); drop only the materialized
-	// entries so the next access re-fetches columns/rowid/return types from the (now committed) server state.
-	lock_guard<mutex> lock(entry_lock_);
-	entries_.clear();
-	function_entries_.clear();
-	table_function_entries_.clear();
-	aggregate_function_entries_.clear();
-}
-
-// Erase every cache entry whose NAME matches. A template function, NOT a generic lambda — the extension
-// compiles as C++11 on gcc (the CLAUDE.md pre-C++17 gotcha; MSVC was permissive).
+// Entry evictions RETIRE (never destroy): the lookup paths hand out raw pointers DuckDB's binder holds
+// across the lock (bind -> plan -> execute), so destroying a cached entry mid-session is a use-after-free
+// under concurrency (see the graveyard comment in the header). Plain templates, NOT generic lambdas — the
+// extension compiles as C++11 on gcc (the CLAUDE.md pre-C++17 gotcha; MSVC was permissive). Callers hold
+// entry_lock_.
 template <class MAP>
-static void EvictMatching(MAP &cache, const std::function<bool(const string &)> &matches) {
+static void RetireErase(MAP &cache, const string &key, vector<unique_ptr<CatalogEntry>> &graveyard) {
+	auto it = cache.find(key);
+	if (it != cache.end()) {
+		graveyard.push_back(std::move(it->second));
+		cache.erase(it);
+	}
+}
+
+template <class MAP>
+static void RetireAll(MAP &cache, vector<unique_ptr<CatalogEntry>> &graveyard) {
+	for (auto &kv : cache) {
+		graveyard.push_back(std::move(kv.second));
+	}
+	cache.clear();
+}
+
+template <class MAP>
+static void RetireMatching(MAP &cache, const std::function<bool(const string &)> &matches,
+                           vector<unique_ptr<CatalogEntry>> &graveyard) {
 	for (auto it = cache.begin(); it != cache.end();) {
 		if (matches(it->first)) {
+			graveyard.push_back(std::move(it->second));
 			it = cache.erase(it);
 		} else {
 			++it;
@@ -142,15 +93,86 @@ static void EvictMatching(MAP &cache, const std::function<bool(const string &)> 
 	}
 }
 
+void FabricatorSchemaEntry::AddTable(const string &table_name, const string &table_type) {
+	lock_guard<mutex> lock(entry_lock_);
+	table_types_[table_name] = table_type;
+	// Drop any cached entry so the schema is re-fetched (e.g. after CREATE OR REPLACE).
+	RetireErase(entries_, table_name, retired_entries_);
+}
+
+void FabricatorSchemaEntry::AddScalarFunction(const string &func_name) {
+	lock_guard<mutex> lock(entry_lock_);
+	scalar_functions_.insert(func_name);
+	// Drop any cached entry so the signature is re-fetched (e.g. after CREATE OR ALTER).
+	RetireErase(function_entries_, func_name, retired_entries_);
+}
+
+void FabricatorSchemaEntry::AddTableFunction(const string &func_name, bool is_proc) {
+	lock_guard<mutex> lock(entry_lock_);
+	table_functions_[func_name] = is_proc;
+	RetireErase(table_function_entries_, func_name, retired_entries_);
+	// A discovered TVF or stored proc also gets a synthetic table-in-out alias `<name>_each` that applies
+	// it once per input row (4g): a TVF via SQL-Server CROSS APPLY, a proc via per-row EXEC (the managed
+	// side picks by object kind). Both echo the input columns + the function's output columns; a proc's
+	// per-row EXECs run in DuckDB's transaction (commit/rollback driven by DuckDB).
+	string each = func_name + "_each";
+	inout_functions_[each] = func_name;
+	RetireErase(table_function_entries_, each, retired_entries_);
+}
+
+void FabricatorSchemaEntry::AddInOutFunction(const string &func_name) {
+	lock_guard<mutex> lock(entry_lock_);
+	custom_inout_functions_.insert(func_name);
+	RetireErase(table_function_entries_, func_name, retired_entries_);
+}
+
+void FabricatorSchemaEntry::AddCollectorFunction(const string &func_name) {
+	lock_guard<mutex> lock(entry_lock_);
+	custom_collector_functions_.insert(func_name);
+	RetireErase(table_function_entries_, func_name, retired_entries_);
+}
+
+void FabricatorSchemaEntry::AddAggregateFunction(const string &func_name, bool spillable) {
+	lock_guard<mutex> lock(entry_lock_);
+	aggregate_functions_[func_name] = spillable;
+	// Drop any cached entry so the signature is re-fetched (e.g. after a cache refresh).
+	RetireErase(aggregate_function_entries_, func_name, retired_entries_);
+}
+
+void FabricatorSchemaEntry::ClearTables() {
+	lock_guard<mutex> lock(entry_lock_);
+	table_types_.clear();
+	RetireAll(entries_, retired_entries_);
+	scalar_functions_.clear();
+	RetireAll(function_entries_, retired_entries_);
+	table_functions_.clear();
+	inout_functions_.clear();
+	custom_inout_functions_.clear();
+	custom_collector_functions_.clear();
+	aggregate_functions_.clear();
+	RetireAll(table_function_entries_, retired_entries_);
+	RetireAll(aggregate_function_entries_, retired_entries_);
+}
+
+void FabricatorSchemaEntry::InvalidateEntryCache() {
+	// Keep the discovered NAME lists (table_types_, scalar_functions_, …); drop only the materialized
+	// entries so the next access re-fetches columns/rowid/return types from the (now committed) server state.
+	lock_guard<mutex> lock(entry_lock_);
+	RetireAll(entries_, retired_entries_);
+	RetireAll(function_entries_, retired_entries_);
+	RetireAll(table_function_entries_, retired_entries_);
+	RetireAll(aggregate_function_entries_, retired_entries_);
+}
+
 void FabricatorSchemaEntry::InvalidateMatching(const std::function<bool(const string &)> &matches) {
 	// Like InvalidateEntryCache but scoped: drop only the materialized entries whose NAME matches. The name
 	// lists are kept, so an ALTER'd object re-fetches its fresh schema on next access and a DROPped one
 	// self-heals (its column re-fetch fails -> GetOrCreateEntry evicts it). Everything else stays warm.
 	lock_guard<mutex> lock(entry_lock_);
-	EvictMatching(entries_, matches);
-	EvictMatching(function_entries_, matches);
-	EvictMatching(table_function_entries_, matches);
-	EvictMatching(aggregate_function_entries_, matches);
+	RetireMatching(entries_, matches, retired_entries_);
+	RetireMatching(function_entries_, matches, retired_entries_);
+	RetireMatching(table_function_entries_, matches, retired_entries_);
+	RetireMatching(aggregate_function_entries_, matches, retired_entries_);
 }
 
 optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext &context, const string &table_name) {
@@ -179,7 +201,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext
 		// (e.g. dropped out-of-band via fabricator_exec). Treat it as not-found so
 		// CREATE TABLE IF NOT EXISTS / OR REPLACE see "absent" instead of an error.
 		table_types_.erase(table_name);
-		entries_.erase(table_name);
+		RetireErase(entries_, table_name, retired_entries_);
 		return nullptr;
 	}
 
@@ -345,7 +367,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateScalarFunction(Clie
 		// The discovered name is stale — the function no longer exists on the server
 		// (e.g. dropped out-of-band). Treat it as not-found rather than erroring.
 		scalar_functions_.erase(func_name);
-		function_entries_.erase(func_name);
+		RetireErase(function_entries_, func_name, retired_entries_);
 		return nullptr;
 	}
 
@@ -877,7 +899,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateAggregateFunction(C
 	} catch (std::exception &) {
 		// Stale discovery (the function no longer exists) — treat as not-found, like the scalar path.
 		aggregate_functions_.erase(func_name);
-		aggregate_function_entries_.erase(func_name);
+		RetireErase(aggregate_function_entries_, func_name, retired_entries_);
 		return nullptr;
 	}
 
@@ -1911,7 +1933,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(Clien
 	} catch (std::exception &) {
 		// Stale discovery (dropped out-of-band) — treat as not-found.
 		table_functions_.erase(func_name);
-		table_function_entries_.erase(func_name);
+		RetireErase(table_function_entries_, func_name, retired_entries_);
 		return nullptr;
 	}
 
@@ -1971,9 +1993,9 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateInOutFunction(Clien
 		// Stale discovery (base TVF dropped out-of-band) — treat as not-found, evicting both
 		// the alias and the base so the next lookup re-discovers.
 		inout_functions_.erase(each_name);
-		table_function_entries_.erase(each_name);
+		RetireErase(table_function_entries_, each_name, retired_entries_);
 		table_functions_.erase(base_func);
-		table_function_entries_.erase(base_func);
+		RetireErase(table_function_entries_, base_func, retired_entries_);
 		return nullptr;
 	}
 	if (arg_types.empty()) {
@@ -2390,7 +2412,7 @@ void FabricatorSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 
 	lock_guard<mutex> lock(entry_lock_);
 	table_types_.erase(info.name);
-	entries_.erase(info.name);
+	RetireErase(entries_, info.name, retired_entries_);
 }
 // A nested-field path as a JSON array of segments (["s","inner","f"]) — segment names may contain dots,
 // so a joined string would be ambiguous. Consumed by the provider's field-evolution alter kinds.
@@ -2446,7 +2468,7 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 	auto refresh = [&](const string &t) {
 		{
 			lock_guard<mutex> lock(entry_lock_);
-			entries_.erase(t);
+			RetireErase(entries_, t, retired_entries_);
 		}
 		try {
 			GetOrCreateEntry(context, t); // eager re-fetch on this txn's connection (no Sch-M self-block)
@@ -2463,9 +2485,9 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 		auto it = table_types_.find(table);
 		string type = it != table_types_.end() ? it->second : string("BASE TABLE");
 		table_types_.erase(table);
-		entries_.erase(table);
+		RetireErase(entries_, table, retired_entries_);
 		table_types_[rt.new_table_name] = type;
-		entries_.erase(rt.new_table_name);
+		RetireErase(entries_, rt.new_table_name, retired_entries_);
 		break;
 	}
 	case AlterTableType::RENAME_COLUMN: {

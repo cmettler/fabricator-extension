@@ -269,6 +269,7 @@ optional_ptr<CatalogEntry> FabricatorCatalog::CreateSchema(CatalogTransaction tr
 		if (info.on_conflict != OnCreateConflict::REPLACE_ON_CONFLICT) {
 			return it->second.get(); // already present (IGNORE / ERROR-but-cached)
 		}
+		retired_schemas_.push_back(std::move(it->second)); // retire, never destroy (see header)
 		schemas_.erase(it);
 	}
 	auto entry = make_uniq<FabricatorSchemaEntry>(*this, info, handle_);
@@ -281,7 +282,11 @@ void FabricatorCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 	FabricatorSetActiveTxn(handle_, context);
 	fabricator::DropSchema(handle_, info.name, if_exists);
 	lock_guard<mutex> lock(schema_lock_);
-	schemas_.erase(info.name);
+	auto it = schemas_.find(info.name);
+	if (it != schemas_.end()) {
+		retired_schemas_.push_back(std::move(it->second)); // retire, never destroy (see header)
+		schemas_.erase(it);
+	}
 }
 ErrorData FabricatorCatalog::SupportsCreateTable(BoundCreateTableInfo &info) {
 	// Permit PARTITIONED BY (Delta partitions the data) and SORTED BY (the SQL Server provider maps it to a

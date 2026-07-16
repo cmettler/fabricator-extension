@@ -4237,6 +4237,20 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   dropped out-of-band leaves no stale entry). Do NOT remove this to match
   `exec_invalidate_cache_setting.test`'s setting-OFF stale-cache footgun — it's a deliberate robustness
   difference, not a bug.
+- **Catalog-entry evictions RETIRE, never destroy (2026-07-16 — use-after-free fix).** Every eviction of
+  a materialized entry (`InvalidateEntryCache`/`InvalidateAllEntries` on rollback, `InvalidateMatching`,
+  the ALTER re-key/eager-refresh, DropEntry, CREATE-OR-REPLACE re-adds, all self-heal evicts — and the
+  catalog-level `schemas_` on DROP/REPLACE SCHEMA) moves the `unique_ptr` into a GRAVEYARD
+  (`retired_entries_` / `retired_schemas_`, freed at teardown) instead of destroying it: the lookup paths
+  hand DuckDB's binder RAW pointers held across bind→plan→execute, so a concurrent eviction destroying
+  the entry was a UAF — hit under `dbt --threads 4` incremental full-refresh (4×1M, box) as
+  `INTERNAL Error: CatalogEntry::ParentSchema called on catalog entry without schema` (the binder's
+  virtual call landing on the destroyed entry's REWOUND vptr — that error text is the fingerprint of a
+  destructed catalog entry; a concurrent thread's post-commit ROLLBACK → `InvalidateAllEntries` destroyed
+  the `__dbt_tmp` entry between the rename's bind lookup and its `ParentSchema()` call,
+  bind_simple.cpp:160). Stale-but-alive matches the cache's existing staleness semantics; schema entries
+  must outlive table entries (each entry's `ParentSchema()` is a REFERENCE into its schema entry). Never
+  "optimize" evictions back to immediate destruction.
 - **CHECK constraints + non-literal DEFAULTs on CREATE: deliberately skipped** (per user).
 - **Commit only when asked.** The Python scaffold (`main.py`/`pyproject.toml`/`uv.lock`/
   `.python-version`) is intentionally left untracked. `.gitignore` note: `**/fabricator/` would match the

@@ -133,6 +133,12 @@ private:
 	bool exact_filter_pushdown_ = false;
 	mutex schema_lock_;
 	case_insensitive_map_t<unique_ptr<FabricatorSchemaEntry>> schemas_;
+	// GRAVEYARD: evicted schema entries are RETIRED, never destroyed mid-session — binders hold raw
+	// pointers across the lock, AND every (possibly retired) table entry's ParentSchema() is a reference
+	// into its FabricatorSchemaEntry, so schemas must outlive their entries. Freed at catalog teardown.
+	// Guarded by schema_lock_. (Same use-after-free class as the schema-entry graveyard; see
+	// fabricator_schema_entry.hpp.)
+	vector<unique_ptr<FabricatorSchemaEntry>> retired_schemas_;
 };
 
 } // namespace duckdb

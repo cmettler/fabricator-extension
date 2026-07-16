@@ -137,6 +137,14 @@ private:
 	case_insensitive_map_t<unique_ptr<ScalarFunctionCatalogEntry>> function_entries_;
 	case_insensitive_map_t<unique_ptr<TableFunctionCatalogEntry>> table_function_entries_;
 	case_insensitive_map_t<unique_ptr<AggregateFunctionCatalogEntry>> aggregate_function_entries_;
+	// GRAVEYARD: evicted entries are RETIRED here, never destroyed mid-session. The lookup paths hand out
+	// RAW pointers that DuckDB's binder holds ACROSS the entry_lock_ (bind -> plan -> execute), so a
+	// concurrent eviction (RollbackTransaction -> InvalidateAllEntries, an ALTER's re-key, a self-heal)
+	// that destroyed the entry was a use-after-free — observed under dbt threads=4 as the binder's virtual
+	// call landing on the destroyed entry's rewound vptr ("CatalogEntry::ParentSchema called on catalog
+	// entry without schema"). Stale-but-alive matches the cache's existing staleness semantics; entries
+	// are small metadata, freed at schema-entry teardown. Guarded by entry_lock_.
+	vector<unique_ptr<CatalogEntry>> retired_entries_;
 };
 
 } // namespace duckdb
