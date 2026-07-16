@@ -731,20 +731,23 @@ internal static class DeltaReader
         nint opener, string path, IReadOnlyCollection<long> rowIds, CancellationToken ct,
         long? atVersion, List<(long?[] Ids, long?[] Versions)>? sourceTrackingOut)
     {
+        // Cancel a slow buffered-UPDATE read-back of the matched rows over OneLake/S3 on interrupt.
+        using var interrupt = new InterruptScope(opener, ct);
+        var token = interrupt.Token;
         var fs = TableFileSystems.Create(opener, path);
-        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options()).ConfigureAwait(false);
+        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(), token).ConfigureAwait(false);
         try
         {
             var ms = new System.IO.MemoryStream();
             Apache.Arrow.Ipc.ArrowStreamWriter? w = null;
-            var e = table.ReadRowsByRowIdsAsync(rowIds, ct, atVersion, sourceTrackingOut).GetAsyncEnumerator(ct);
+            var e = table.ReadRowsByRowIdsAsync(rowIds, token, atVersion, sourceTrackingOut).GetAsyncEnumerator(token);
             try
             {
                 while (await e.MoveNextAsync().ConfigureAwait(false))
                 {
                     var b = e.Current;
                     w ??= new Apache.Arrow.Ipc.ArrowStreamWriter(ms, b.Schema, leaveOpen: true);
-                    await w.WriteRecordBatchAsync(b, ct).ConfigureAwait(false);
+                    await w.WriteRecordBatchAsync(b, token).ConfigureAwait(false);
                 }
             }
             finally
@@ -754,12 +757,12 @@ internal static class DeltaReader
             var result = new List<RecordBatch>();
             if (w is not null)
             {
-                await w.WriteEndAsync(ct).ConfigureAwait(false);
+                await w.WriteEndAsync(token).ConfigureAwait(false);
                 w.Dispose();
                 ms.Position = 0;
                 using var r = new Apache.Arrow.Ipc.ArrowStreamReader(ms);
                 RecordBatch? rb;
-                while ((rb = await r.ReadNextRecordBatchAsync(ct).ConfigureAwait(false)) is not null)
+                while ((rb = await r.ReadNextRecordBatchAsync(token).ConfigureAwait(false)) is not null)
                 {
                     result.Add(rb);
                 }

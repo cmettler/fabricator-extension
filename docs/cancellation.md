@@ -97,14 +97,22 @@ but such a connection must be disposed, not reused.
   `ExecuteUpdate` build an `InterruptScope(AmbientOpener.Current)` and run their DB writes with
   `ExecuteNonQueryAsync(token)` (chunked loops share one scope), so a long rowid DELETE/UPDATE or a slow
   `fabricator_exec` cancels.
-- **Delta EW DML/maintenance (commit `<this>`):** the EW write cores `DeleteByRowIds`, `DeleteByRowIdsViaVectors`,
+- **Delta EW DML/maintenance (commit `54b05de`):** the EW write cores `DeleteByRowIds`, `DeleteByRowIdsViaVectors`,
   `UpdateByRowIds`, `Optimize`, `Vacuum` each build an `InterruptScope(opener, ct)` internally (like the Tier 1
   read paths) and pass its token to `OpenAsync` + the EW operation — so a slow OneLake/S3 copy-on-write/DV
-  rewrite, OPTIMIZE compaction, or VACUUM cancels. The codec path honors the token throughout; on the
-  `native_write` path the log open/commit cancel but the parquet rewrite runs on a separate host_query
-  connection (uncancelled — a Tier-4 concern). **Autocommit only** — a buffered (explicit-txn) DML commits at
-  flush (`FlushDmlTransaction`), which still uses `default` and is not yet wired (separate follow-up; txn
-  flushes are one atomic commit).
+  rewrite, OPTIMIZE compaction, or VACUUM cancels (autocommit). The codec path honors the token throughout; on
+  the `native_write` path the log open/commit cancel but the parquet rewrite runs on a separate host_query
+  connection (uncancelled — a Tier-4 concern).
+- **Buffered explicit-txn path (commit `<this>`):** the COMMIT-phase flushes (`FlushDmlTransaction` — including
+  breaking OUT of the OCC/rebase retry loop via `ThrowIfCancellationRequested` + passing the token to
+  `WriteDataFilesAsync`/`ComputeDeletionVectorActionsAsync`/`RebaseDvDmlActionsAsync`/`CheckLogicalRebaseAsync`/
+  `CommitDataFilesAsync`/`OpenAsync`; plus `FlushCreateTransaction` and `FlushDeferredFiles`) AND the
+  per-statement buffering (`WriteCdcFiles`, `TryEagerWriteBatches` eager data-file writes, and the
+  buffered-UPDATE `ReadRowsByRowIds` read-back) each build an `InterruptScope(opener)` (opener fresh from
+  `CommitTransaction` / the DML operator) and pass the token to their EW calls. **Safe** — a cancel before the
+  atomic `_delta_log` commit lands leaves invisible orphan files (VACUUM reclaims), i.e. it degrades to a
+  rollback; a cancel is not a `DeltaConflictException`, so it exits the retry loop instead of being swallowed as
+  a conflict.
 
 ### The opener-freshness constraint (load-bearing)
 

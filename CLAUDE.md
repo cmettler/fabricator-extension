@@ -1863,9 +1863,16 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `DeleteByRowIdsViaVectors`/`UpdateByRowIds`/`Optimize`/`Vacuum` each build an `InterruptScope(opener, ct)`
   internally (like the Tier 1 read paths) and pass the token to `OpenAsync` + the EW op — a slow OneLake/S3
   copy-on-write/DV rewrite, OPTIMIZE, or VACUUM cancels (codec path fully; native_write's parquet rewrite runs on
-  a separate host_query connection, uncancelled — Tier 4). AUTOCOMMIT only; a buffered explicit-txn DML commits at
-  `FlushDmlTransaction` (still `default`, not yet wired — separate follow-up). **Remaining (deferred): buffered-txn
-  flush** + **2d** `command_timeout` (`CancelAfter`, closes the hung-socket hole); **Tier 3** DAX/ADOMD via
+  a separate host_query connection, uncancelled — Tier 4). AUTOCOMMIT only. **Buffered explicit-txn path DONE
+  (`<pending-commit>`, C#-only):** the COMMIT-phase flushes (`FlushDmlTransaction` — incl. breaking OUT of the
+  OCC/rebase retry loop via `ThrowIfCancellationRequested`, token to `WriteDataFilesAsync`/`Compute…`/`Rebase…`/
+  `CheckLogicalRebaseAsync`/`CommitDataFilesAsync`/`OpenAsync`; `FlushCreateTransaction`; `FlushDeferredFiles`) +
+  the per-statement buffering (`WriteCdcFiles`, `TryEagerWriteBatches`, buffered-UPDATE `ReadRowsByRowIds`
+  read-back) each build an `InterruptScope(opener)` and pass the token to their EW calls. Safe: a cancel before
+  the atomic `_delta_log` commit lands = invisible orphan files (VACUUM reclaims) = rollback; a cancel isn't a
+  `DeltaConflictException` so it exits the retry loop, not swallowed as a conflict. transactions 941 / txn_version
+  51 / row_tracking_virtual 299 green. **Remaining (deferred): native_write host_query rewrite** (Tier 4) + **2d**
+  `command_timeout` (`CancelAfter`, closes the hung-socket hole); **Tier 3** DAX/ADOMD via
   `AdomdCommand.Cancel()` (no usable async); **Tier 4** the arrow scan as a DuckDB async/BLOCKED source
   (`InterruptState`) to free the task thread during I/O (native interrupt + better parallelism, bigger). Live Ctrl+C
   behavior is a MANUAL check (a slow OneLake/SQL query + interrupt); the suites verify only behavior-neutrality.

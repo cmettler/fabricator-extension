@@ -2054,15 +2054,21 @@ public sealed class DeltaCatalog : IBackendCatalog
     private static async Task<long> FlushDeferredFilesAsync(nint opener, string tablePath,
                                     System.Collections.Generic.IReadOnlyList<EngineeredWood.DeltaLake.Table.WrittenDataFile> files)
     {
+        // Cancel the COMMIT phase on query interrupt (Ctrl+C during a slow COMMIT / a spinning OCC retry loop) —
+        // safe: a cancel before the log commit lands leaves invisible orphan files (VACUUM reclaims them), i.e.
+        // it degrades to a rollback. Opener is fresh (CommitTransaction set it). See docs/cancellation.md.
+        using var interrupt = new InterruptScope(opener);
+        var token = interrupt.Token;
         const int maxAttempts = 16;
         for (int attempt = 1; ; attempt++)
         {
+            token.ThrowIfCancellationRequested(); // break out of the retry loop on interrupt
             var fs = TableFileSystems.Create(opener, tablePath);
-            var table = await EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(fs, DeltaWriter.Options())
+            var table = await EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(fs, DeltaWriter.Options(), token)
                 .ConfigureAwait(false);
             try
             {
-                return await table.CommitDataFilesAsync(files, DeltaWriteMode.Append, cancellationToken: default)
+                return await table.CommitDataFilesAsync(files, DeltaWriteMode.Append, cancellationToken: token)
                     .ConfigureAwait(false);
             }
             catch (EngineeredWood.DeltaLake.DeltaConflictException) when (attempt < maxAttempts)
@@ -2643,8 +2649,11 @@ public sealed class DeltaCatalog : IBackendCatalog
         {
             return;
         }
+        // Cancel a slow buffered-statement CDC write on interrupt (opener fresh from the DML operator).
+        using var interrupt = new InterruptScope(opener);
+        var token = interrupt.Token;
         var fs = TableFileSystems.Create(opener, tablePath);
-        var table = await EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(fs, DeltaWriter.Options())
+        var table = await EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(fs, DeltaWriter.Options(), token)
             .ConfigureAwait(false);
         try
         {
@@ -2654,7 +2663,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 {
                     continue;
                 }
-                pending.PendingCdc.AddRange(await table.WriteChangeDataFileAsync(b, changeType)
+                pending.PendingCdc.AddRange(await table.WriteChangeDataFileAsync(b, changeType, token)
                     .ConfigureAwait(false));
             }
         }
@@ -2707,12 +2716,15 @@ public sealed class DeltaCatalog : IBackendCatalog
         {
             return false;
         }
+        // Cancel a slow buffered-statement eager data-file write on interrupt (opener fresh from the DML operator).
+        using var interrupt = new InterruptScope(opener);
+        var token = interrupt.Token;
         var fs = TableFileSystems.Create(opener, tablePath);
         var writer = _nativeWrite && NativeParquetDataFileWriter.Available
             ? new NativeParquetDataFileWriter(tablePath)
             : null;
         var table = await EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(
-                fs, DeltaWriter.Options(ResolveWriteSpec(null, null), writer))
+                fs, DeltaWriter.Options(ResolveWriteSpec(null, null), writer), token)
             .ConfigureAwait(false);
         try
         {
@@ -2742,7 +2754,7 @@ public sealed class DeltaCatalog : IBackendCatalog
             }
             DeltaNullability.ValidateBatches(toWrite,
                 pending.PendingDeltaSchema ?? table.CurrentSnapshot.Schema, tableName);
-            pending.Files.AddRange(await table.WriteDataFilesAsync(toWrite, default,
+            pending.Files.AddRange(await table.WriteDataFilesAsync(toWrite, token,
                     schemaOverride: pending.PendingDeltaSchema,
                     identityValuesPreGenerated: identity,
                     materializedRowIds: materializedRowIds)
@@ -2766,6 +2778,10 @@ public sealed class DeltaCatalog : IBackendCatalog
     private async Task FlushCreateTransactionAsync(nint opener, string tablePath, long txnId,
                                         DeltaTxnBuffer.PendingAppends pending)
     {
+        // Cancel the create-commit phase on interrupt — safe (degrades to rollback; the table is never on
+        // storage until the commit lands). Opener fresh from CommitTransaction. See docs/cancellation.md.
+        using var interrupt = new InterruptScope(opener);
+        var token = interrupt.Token;
         if (TableExists(tablePath))
         {
             throw new System.InvalidOperationException(
@@ -2777,7 +2793,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         var createSchema = pending.PendingIdentityHwm.Count > 0
             ? BakeIdentityMarks(pending.PendingArrowSchema!, pending.PendingIdentityHwm)
             : pending.PendingArrowSchema!;
-        DeltaWriter.Create(opener, tablePath, createSchema, default,
+        DeltaWriter.Create(opener, tablePath, createSchema, token,
                            deletionVectors: _deletionVectorsOnCreate,
                            inCommitTimestamps: _inCommitTimestampsOnCreate,
                            changeDataFeed: _changeDataFeedOnCreate,
@@ -2797,7 +2813,7 @@ public sealed class DeltaCatalog : IBackendCatalog
             var w2 = _nativeWrite && NativeParquetDataFileWriter.Available
                 ? new NativeParquetDataFileWriter(tablePath)
                 : null;
-            var t2 = await EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(fs2, DeltaWriter.Options(null, w2))
+            var t2 = await EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(fs2, DeltaWriter.Options(null, w2), token)
                 .ConfigureAwait(false);
             try
             {
@@ -2807,11 +2823,11 @@ public sealed class DeltaCatalog : IBackendCatalog
                     // identityValuesPreGenerated: the batches carry values generated at statement time
                     // against the chained marks; regenerating here (the committing writer's default)
                     // would double-consume the mark and diverge from read-your-writes.
-                    all.AddRange(await t2.WriteDataFilesAsync(pending.Batches, default,
+                    all.AddRange(await t2.WriteDataFilesAsync(pending.Batches, token,
                             identityValuesPreGenerated: pending.PendingIdentityHwm.Count > 0)
                         .ConfigureAwait(false));
                 }
-                v = await t2.CommitDataFilesAsync(all, DeltaWriteMode.Append, cancellationToken: default,
+                v = await t2.CommitDataFilesAsync(all, DeltaWriteMode.Append, cancellationToken: token,
                         identityValuesPreGenerated: pending.PendingIdentityHwm.Count > 0)
                     .ConfigureAwait(false);
             }
@@ -2823,7 +2839,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         else if (pending.Batches.Count > 0)
         {
             v = DeltaWriter.Write(opener, tablePath, pending.BatchSchema!, pending.Batches,
-                                  DeltaWriteMode.Append, default,
+                                  DeltaWriteMode.Append, token,
                                   deletionVectors: _deletionVectorsOnCreate,
                                   inCommitTimestamps: _inCommitTimestampsOnCreate,
                                   changeDataFeed: _changeDataFeedOnCreate,
@@ -2846,6 +2862,13 @@ public sealed class DeltaCatalog : IBackendCatalog
     private async Task FlushDmlTransactionAsync(nint opener, string tablePath, long txnId,
                                      DeltaTxnBuffer.PendingAppends pending)
     {
+        // Cancel the DML-commit phase on interrupt (a slow buffered write over OneLake/S3, or a spinning
+        // OCC/rebase retry loop against a busy concurrent writer). SAFE: a cancel before the log commit lands
+        // leaves invisible orphan files (VACUUM reclaims), i.e. degrades to rollback; a cancel is not a
+        // DeltaConflictException so it breaks OUT of the retry loop rather than being swallowed as a conflict.
+        // Opener fresh from CommitTransaction. See docs/cancellation.md.
+        using var interrupt = new InterruptScope(opener);
+        var token = interrupt.Token;
         // Effective isolation = the TABLE's delta.isolationLevel property (cached on the buffer), NOT the
         // catalog-wide flag — so our OCC check + row-level relaxation conform to the guarantee the table
         // advertises, uniform with Spark. Absent property => WriteSerializable (Spark's default).
@@ -2854,7 +2877,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         var dataFileWriter = _nativeWrite && NativeParquetDataFileWriter.Available
             ? new NativeParquetDataFileWriter(tablePath)
             : null;
-        var table = await EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(fs, DeltaWriter.Options(null, dataFileWriter))
+        var table = await EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(fs, DeltaWriter.Options(null, dataFileWriter), token)
             .ConfigureAwait(false);
         try
         {
@@ -2865,14 +2888,14 @@ public sealed class DeltaCatalog : IBackendCatalog
             // committing on top of the newer snapshot is safe.
             var pinnedSnap = table.CurrentSnapshot.Version == pinned
                 ? table.CurrentSnapshot
-                : await table.GetSnapshotAtVersionAsync(pinned).ConfigureAwait(false);
+                : await table.GetSnapshotAtVersionAsync(pinned, token).ConfigureAwait(false);
             var files = new List<EngineeredWood.DeltaLake.Table.WrittenDataFile>(pending.Files);
             if (pending.Batches.Count > 0)
             {
                 DeltaNullability.ValidateBatches(pending.Batches,
                     pending.PendingDeltaSchema ?? pinnedSnap.Schema,
                     tablePath.Substring(tablePath.LastIndexOf('/') + 1));
-                files.AddRange(await table.WriteDataFilesAsync(pending.Batches, default,
+                files.AddRange(await table.WriteDataFilesAsync(pending.Batches, token,
                         schemaOverride: pending.PendingDeltaSchema)
                     .ConfigureAwait(false));
             }
@@ -2897,7 +2920,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 }
             }
             var (dvActions, rowsDeleted) = await table.ComputeDeletionVectorActionsAsync(deletes,
-                    resolveAgainst: pinnedSnap)
+                    resolveAgainst: pinnedSnap, cancellationToken: token)
                 .ConfigureAwait(false);
             rowsDeleted += pendingRowsDeleted;
             // The buffered schema change (metaData + merged protocol upgrade) joins the SAME commit.
@@ -2953,6 +2976,7 @@ public sealed class DeltaCatalog : IBackendCatalog
             // re-validate, retry (bounded).
             for (int attempt = 1; ; attempt++)
             {
+                token.ThrowIfCancellationRequested(); // break OUT of the OCC/rebase retry loop on interrupt
                 // ROW-LEVEL CONCURRENCY (write_serializable): when the table advanced, re-target the DV
                 // remove+add pairs onto the LATEST snapshot — a concurrent DV swap of the same file
                 // re-unions when the touched rows are DISJOINT (Databricks-style; same-row / rewrite
@@ -2964,7 +2988,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                     try
                     {
                         currentDv = await table.RebaseDvDmlActionsAsync(dvActions, deletes, pinnedSnap,
-                                table.CurrentSnapshot)
+                                table.CurrentSnapshot, cancellationToken: token)
                             .ConfigureAwait(false);
                     }
                     catch (EngineeredWood.DeltaLake.DeltaConflictException ex)
@@ -3008,7 +3032,8 @@ public sealed class DeltaCatalog : IBackendCatalog
                                 readPredicates: pending.ReadPredicates,
                                 readWholeTable: pending.ReadWholeTable,
                                 serializable: tableSer,
-                                rowLevelDml: !tableSer)
+                                rowLevelDml: !tableSer,
+                                cancellationToken: token)
                             .ConfigureAwait(false);
                     }
                     catch (EngineeredWood.DeltaLake.DeltaConflictException ex)
@@ -3026,7 +3051,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 }
                 try
                 {
-                    long v = await table.CommitDataFilesAsync(files, DeltaWriteMode.Append, cancellationToken: default,
+                    long v = await table.CommitDataFilesAsync(files, DeltaWriteMode.Append, cancellationToken: token,
                             extraActions: extra, expectedVersion: table.CurrentSnapshot.Version,
                             operation: operation,
                             identityValuesPreGenerated: pending.PendingIdentityHwm.Count > 0,
@@ -3043,7 +3068,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                     // Another writer took the version mid-flush — reopen at the new latest and re-validate.
                     await table.DisposeAsync().ConfigureAwait(false);
                     table = await EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(
-                            fs, DeltaWriter.Options(null, dataFileWriter))
+                            fs, DeltaWriter.Options(null, dataFileWriter), token)
                         .ConfigureAwait(false);
                 }
             }
