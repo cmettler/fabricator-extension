@@ -1890,8 +1890,15 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   = non-interactive/hung safety net). Default 0 removes the prior implicit SqlClient 30 s (a warehouse-query
   footgun). `test/verify_command_timeout.test` (6). The `io_timeout` for OneLake was DROPPED (httpfs/duckdb-azure
   have their own HTTP timeouts; a coarse whole-scope CancelAfter would mis-fire on long streaming reads).
-  **Remaining (deferred): native_write host_query rewrite** (Tier 4); **Tier 3** DAX/ADOMD via
-  `AdomdCommand.Cancel()` (no usable async); **Tier 4** the arrow scan as a DuckDB async/BLOCKED source
+  **Tier 3 DAX — DONE (2026-07-16, C#-only):** ADOMD has no async, so `InterruptScope` +
+  `AdomdCommand.Cancel()` (thread-safe server-side abort) from the poller thread, wired at the chokepoints:
+  `DaxCatalog.StreamCommand` (ALL data-returning DAX — scans/DMV/daxeval/daxevaltable; scope armed BEFORE
+  `ExecuteReader` so the long initial evaluation is covered, ownership transfers into `DaxArrowStream`,
+  disposed registration-first), `ProbeSchema` (the bind-time probe EXECUTES the query), and `DaxEachBinding`
+  (ctor probe + ONE scope covering every per-row ExecuteReader in `DoExchange`, linked to the exchange ct).
+  Metadata/DMV discovery reads stay uncancelled (SQL-provider policy); `AdomdConnection.Open` has no async —
+  accepted. `verify_dax` 29 green vs live PBI Desktop. The host_query rewrite window closed at v66.
+  **Remaining (deferred): Tier 4 only** — the arrow scan as a DuckDB async/BLOCKED source
   (`InterruptState`) to free the task thread during I/O (native interrupt + better parallelism, bigger). Live Ctrl+C
   behavior is a MANUAL check (a slow OneLake/SQL query + interrupt); the suites verify only behavior-neutrality.
   **BINARY STATUS (2026-07-16): the WINDOWS targets are all CURRENT at v66** (full `cmake --build

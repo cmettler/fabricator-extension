@@ -113,6 +113,17 @@ but such a connection must be disposed, not reused.
   the interrupt; dispose order = registration (waits out an in-flight callback) → scope → inner stream →
   free-handle. CENTRALIZED — zero per-call-site changes; an in-flight `Fetch` aborts at DuckDB's next
   between-tasks check and surfaces as a stream error.
+- **Tier 3 — DAX/ADOMD (C#-only):** ADOMD has no async, so the pattern is `InterruptScope` +
+  `AdomdCommand.Cancel()` from the poller thread (Cancel is the SqlCommand-style thread-safe server-side
+  abort; the cancelled call throws out of ExecuteReader/Read as a stream error). Wired at the chokepoints:
+  `DaxCatalog.StreamCommand` (ALL data-returning DAX — table scans, `system` DMVs, `daxeval`,
+  `daxevaltable` — the scope is armed BEFORE `ExecuteReader` so the long initial server-side evaluation is
+  covered, then ownership transfers into `DaxArrowStream` which disposes it registration-first);
+  `DaxCatalog.ProbeSchema` (the bind-time probe EXECUTES the query — a heavy daxeval binds slowly);
+  `DaxEachBinding` (the ctor's schema probe + ONE scope covering every per-row `ExecuteReader` in
+  `DoExchange` — the command instance is reused, linked to the exchange's own ct). Short discovery/DMV
+  metadata reads stay uncancelled (same policy as the SQL provider). `AdomdConnection.Open` remains
+  uncancellable (no async open — accepted).
 - **Buffered explicit-txn path (commit `<this>`):** the COMMIT-phase flushes (`FlushDmlTransaction` — including
   breaking OUT of the OCC/rebase retry loop via `ThrowIfCancellationRequested` + passing the token to
   `WriteDataFilesAsync`/`ComputeDeletionVectorActionsAsync`/`RebaseDvDmlActionsAsync`/`CheckLogicalRebaseAsync`/

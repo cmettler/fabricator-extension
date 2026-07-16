@@ -350,17 +350,30 @@ internal sealed class DaxCatalog : IBackendCatalog
                                              IReadOnlyList<KeyValuePair<string, object?>>? daxParams = null)
     {
         var conn = OpenConnection();
+        InterruptScope? interrupt = null;
+        CancellationTokenRegistration interruptReg = default;
         try
         {
             var cmd = conn.CreateCommand();
             cmd.CommandText = commandText;
             BindDaxParams(cmd, daxParams);
+            // Tier 3 cancellation: ADOMD has no async, so a poller on the calling operator's interrupt flag
+            // trips AdomdCommand.Cancel() from a pool thread — covering BOTH the initial server-side DAX
+            // evaluation (ExecuteReader below can run long) and mid-stream Read()s. Ownership transfers to
+            // the DaxArrowStream (disposed with it). See docs/cancellation.md.
+            interrupt = new InterruptScope(AmbientOpener.Current);
+            interruptReg = interrupt.Token.Register(static state =>
+            {
+                try { ((System.Data.IDbCommand)state!).Cancel(); } catch { /* cancellation must never fault */ }
+            }, cmd);
             var reader = cmd.ExecuteReader();
             var schema = knownSchema ?? ArrowSchemaFromReader(reader);
-            return new DaxArrowStream(conn, cmd, reader, schema, batchSize: 2048);
+            return new DaxArrowStream(conn, cmd, reader, schema, batchSize: 2048, interrupt, interruptReg);
         }
         catch
         {
+            interruptReg.Dispose();
+            interrupt?.Dispose();
             conn.Dispose();
             throw;
         }
@@ -375,6 +388,13 @@ internal sealed class DaxCatalog : IBackendCatalog
         using var cmd = conn.CreateCommand();
         cmd.CommandText = commandText;
         BindDaxParams(cmd, daxParams);
+        // The bind-time probe EXECUTES the query (ADOMD has no describe) — a heavy daxeval binds slowly, so
+        // it is cancellable like the scan (Tier 3).
+        using var interrupt = new InterruptScope(AmbientOpener.Current);
+        using var reg = interrupt.Token.Register(static state =>
+        {
+            try { ((System.Data.IDbCommand)state!).Cancel(); } catch { }
+        }, cmd);
         using var reader = cmd.ExecuteReader();
         return ArrowSchemaFromReader(reader);
     }

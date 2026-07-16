@@ -2,6 +2,7 @@ using System.Data;
 using Apache.Arrow;
 using Apache.Arrow.Ipc;
 using Apache.Arrow.Types;
+using Fabricator.Bridge;
 using Fabricator.Bridge.Conversion;
 
 namespace Fabricator.AnalysisServices;
@@ -22,15 +23,23 @@ internal sealed class DaxArrowStream : IArrowArrayStream
     private readonly IDataReader _reader;
     private readonly IArrowType[] _columnTypes;
     private readonly int _batchSize;
+    // Tier 3 cancellation (ADOMD has no async): the scope's poller trips AdomdCommand.Cancel() from a pool
+    // thread, aborting a mid-stream Read(). Owned here (armed by StreamCommand before ExecuteReader so the
+    // initial server-side evaluation is covered too); disposed FIRST so no Cancel() touches a disposed command.
+    private readonly InterruptScope? _interrupt;
+    private CancellationTokenRegistration _interruptReg;
     private bool _done;
 
     public DaxArrowStream(IDbConnection connection, IDbCommand command, IDataReader reader, Schema schema,
-                          int batchSize = 2048)
+                          int batchSize = 2048, InterruptScope? interrupt = null,
+                          CancellationTokenRegistration interruptReg = default)
     {
         _connection = connection;
         _command = command;
         _reader = reader;
         _batchSize = batchSize;
+        _interrupt = interrupt;
+        _interruptReg = interruptReg;
         Schema = schema;
         _columnTypes = new IArrowType[schema.FieldsList.Count];
         for (int i = 0; i < _columnTypes.Length; i++)
@@ -85,6 +94,8 @@ internal sealed class DaxArrowStream : IArrowArrayStream
 
     public void Dispose()
     {
+        _interruptReg.Dispose();     // waits out an in-flight Cancel() callback
+        _interrupt?.Dispose();       // stops the poller
         try { _reader.Dispose(); } catch { }
         try { _command.Dispose(); } catch { }
         try { _connection.Dispose(); } catch { }

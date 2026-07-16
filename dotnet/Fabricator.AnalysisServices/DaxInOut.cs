@@ -116,6 +116,12 @@ internal sealed class DaxEachBinding : IArrowInOutBinding
         {
             ((AdomdCommand)cmd).Parameters.Add(new AdomdParameter(f.Name, DBNull.Value));
         }
+        // The probe EXECUTES the expression — cancellable like the scan (Tier 3, ADOMD has no async).
+        using var interrupt = new InterruptScope(AmbientOpener.Current);
+        using var reg = interrupt.Token.Register(static state =>
+        {
+            try { ((System.Data.IDbCommand)state!).Cancel(); } catch { }
+        }, cmd);
         using var reader = cmd.ExecuteReader();
         OutputSchema = DaxCatalog.ArrowSchemaFromReader(reader);
     }
@@ -135,6 +141,13 @@ internal sealed class DaxEachBinding : IArrowInOutBinding
         {
             adomd.Parameters.Add(new AdomdParameter(_inputSchema.FieldsList[c].Name, DBNull.Value));
         }
+        // Tier 3 cancellation: ONE scope + registration covers every per-row ExecuteReader (the command
+        // instance is reused); disposed when the exchange enumerator ends or is abandoned.
+        using var interrupt = new InterruptScope(AmbientOpener.Current, ct);
+        using var interruptReg = interrupt.Token.Register(static state =>
+        {
+            try { ((System.Data.IDbCommand)state!).Cancel(); } catch { }
+        }, cmd);
 
         await foreach (var chunk in input.WithCancellation(ct))
         {
