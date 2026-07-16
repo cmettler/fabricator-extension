@@ -93,10 +93,18 @@ but such a connection must be disposed, not reused.
 - **Tier 2b (commit `6e952f6`) — bulk write (INSERT/CTAS/COPY):** `BulkSession` builds an `InterruptScope(opener)`
   and `token.Register`s its existing `Complete(abort)` teardown — faulting the channel stops `WriteToServer` +
   unblocks a backpressure-parked `push_batch`. Works for SQL bulk *and* Delta streaming writes.
-- **Tier 2c (commit `<this>`) — SQL DML/exec:** `ExecuteNonQuery` (raw `fabricator_exec`), `ExecuteDelete`, and
+- **Tier 2c (commit `6708c73`) — SQL DML/exec:** `ExecuteNonQuery` (raw `fabricator_exec`), `ExecuteDelete`, and
   `ExecuteUpdate` build an `InterruptScope(AmbientOpener.Current)` and run their DB writes with
   `ExecuteNonQueryAsync(token)` (chunked loops share one scope), so a long rowid DELETE/UPDATE or a slow
   `fabricator_exec` cancels.
+- **Delta EW DML/maintenance (commit `<this>`):** the EW write cores `DeleteByRowIds`, `DeleteByRowIdsViaVectors`,
+  `UpdateByRowIds`, `Optimize`, `Vacuum` each build an `InterruptScope(opener, ct)` internally (like the Tier 1
+  read paths) and pass its token to `OpenAsync` + the EW operation — so a slow OneLake/S3 copy-on-write/DV
+  rewrite, OPTIMIZE compaction, or VACUUM cancels. The codec path honors the token throughout; on the
+  `native_write` path the log open/commit cancel but the parquet rewrite runs on a separate host_query
+  connection (uncancelled — a Tier-4 concern). **Autocommit only** — a buffered (explicit-txn) DML commits at
+  flush (`FlushDmlTransaction`), which still uses `default` and is not yet wired (separate follow-up; txn
+  flushes are one atomic commit).
 
 ### The opener-freshness constraint (load-bearing)
 

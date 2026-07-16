@@ -558,6 +558,10 @@ internal static class DeltaReader
     private static async Task<long> DeleteByRowIdsAsync(nint opener, string path, IReadOnlyCollection<long> rowIds,
                                       CancellationToken ct, bool nativeWrite, bool nativeRead)
     {
+        // Cancel a long copy-on-write/DV rewrite (OneLake/S3) on query interrupt — the opener is fresh (the
+        // modify operator's Finalize set it via FabricatorSetActiveTxn). See docs/cancellation.md.
+        using var interrupt = new InterruptScope(opener, ct);
+        var token = interrupt.Token;
         var fs = TableFileSystems.Create(opener, path);
         // Open with the standard WRITE options (OmitPathInSchema=false) so the copy-on-write rewrite emits
         // standard-readable parquet — DeltaTableOptions.Default would drop path_in_schema (TProtocolException).
@@ -576,11 +580,11 @@ internal static class DeltaReader
             ? new NativeParquetDataFileReader(path)
             : null;
         var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(dataFileWriter: writer, dataFileRewriter: rewriter,
-                                                                 dataFileReader: fileReader), ct)
+                                                                 dataFileReader: fileReader), token)
             .ConfigureAwait(false);
         try
         {
-            long deleted = (await table.DeleteByRowIdsAsync(rowIds, ct).ConfigureAwait(false)).RowsDeleted;
+            long deleted = (await table.DeleteByRowIdsAsync(rowIds, token).ConfigureAwait(false)).RowsDeleted;
             DmlLog.LogInformation("delta delete-rewrite {Path}: deleted={Deleted} writer={Writer} rewriter={Rewriter}",
                 path, deleted, writer is null ? "engineered-wood" : "native-duckdb",
                 rewriter is null ? "engineered-wood" : "native-duckdb");
@@ -777,11 +781,13 @@ internal static class DeltaReader
     private static async Task<long> DeleteByRowIdsViaVectorsAsync(nint opener, string path,
                                                 IReadOnlyCollection<long> rowIds, CancellationToken ct, bool rowLevelRetry)
     {
+        using var interrupt = new InterruptScope(opener, ct);
+        var token = interrupt.Token;
         var fs = TableFileSystems.Create(opener, path);
-        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).ConfigureAwait(false);
+        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(), token).ConfigureAwait(false);
         try
         {
-            return (await table.DeleteByRowIdsViaVectorsAsync(rowIds, ct, rowLevelRetry: rowLevelRetry)
+            return (await table.DeleteByRowIdsViaVectorsAsync(rowIds, token, rowLevelRetry: rowLevelRetry)
                 .ConfigureAwait(false)).RowsDeleted;
         }
         catch (DeltaConflictException ex)
@@ -1259,6 +1265,10 @@ internal static class DeltaReader
     private static async Task<long> OptimizeAsync(nint opener, string path, CancellationToken ct,
                                 bool nativeWrite, bool nativeRead)
     {
+        // OPTIMIZE (compaction) rewrites many files — cancel a slow one on interrupt (opener set fresh by
+        // fabricator_exec). See docs/cancellation.md.
+        using var interrupt = new InterruptScope(opener, ct);
+        var token = interrupt.Token;
         var fs = TableFileSystems.Create(opener, path);
         // native_write => DuckDB's parquet writer produces the compacted files (bloom/stats/footer), so an
         // OPTIMIZE keeps the native-write quality instead of reverting to the engineered-wood codec.
@@ -1270,11 +1280,11 @@ internal static class DeltaReader
         var fileReader = nativeRead && NativeParquetDataFileReader.Available
             ? new NativeParquetDataFileReader(path)
             : null;
-        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(dataFileWriter: writer, dataFileReader: fileReader), ct)
+        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(dataFileWriter: writer, dataFileReader: fileReader), token)
             .ConfigureAwait(false);
         try
         {
-            var v = await table.CompactAsync(null, ct).ConfigureAwait(false);
+            var v = await table.CompactAsync(null, token).ConfigureAwait(false);
             DmlLog.LogInformation("delta optimize {Path}: {Result} writer={Writer}", path,
                 v.HasValue ? $"compacted → v{v.Value}" : "nothing to compact",
                 writer is null ? "engineered-wood" : "native-duckdb");
@@ -1295,12 +1305,14 @@ internal static class DeltaReader
     private static async Task<long> VacuumAsync(
         nint opener, string path, bool dryRun, double? retentionHours, CancellationToken ct)
     {
+        using var interrupt = new InterruptScope(opener, ct);
+        var token = interrupt.Token;
         var fs = TableFileSystems.Create(opener, path);
-        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).ConfigureAwait(false);
+        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(), token).ConfigureAwait(false);
         try
         {
             System.TimeSpan? retention = retentionHours is { } h ? System.TimeSpan.FromHours(h) : null;
-            var r = await table.VacuumAsync(retention, dryRun, ct).ConfigureAwait(false);
+            var r = await table.VacuumAsync(retention, dryRun, token).ConfigureAwait(false);
             DmlLog.LogInformation("delta vacuum {Path}: files_deleted={Files} dry_run={Dry}",
                 path, r.FilesDeleted, dryRun);
             return r.FilesDeleted;
@@ -1326,6 +1338,8 @@ internal static class DeltaReader
         System.Func<long, IReadOnlyList<RecordBatch>, IReadOnlyList<RecordBatch>> rewriteFile, CancellationToken ct,
         bool nativeWrite, IDataFileRewriter? rewriter, bool nativeRead, bool rowLevelRetry)
     {
+        using var interrupt = new InterruptScope(opener, ct);
+        var token = interrupt.Token;
         var fs = TableFileSystems.Create(opener, path);
         // native_write => DuckDB's parquet writer produces the rewritten file (bloom/stats/footer) AND, when the
         // caller supplied a rewriter, DuckDB's read_parquet reads the source + applies the SET substitution via a
@@ -1340,7 +1354,7 @@ internal static class DeltaReader
             ? new NativeParquetDataFileReader(path)
             : null;
         var table = await DeltaTable.OpenAsync(fs,
-                DeltaWriter.Options(dataFileWriter: writer, dataFileRewriter: rewriter, dataFileReader: fileReader), ct)
+                DeltaWriter.Options(dataFileWriter: writer, dataFileRewriter: rewriter, dataFileReader: fileReader), token)
             .ConfigureAwait(false);
         try
         {
@@ -1363,7 +1377,7 @@ internal static class DeltaReader
                     return inner(ordinal, logical);
                 };
             }
-            await table.UpdateByRowIdsAsync(rowIds, rewriteFile, ct, rowLevelRetry: rowLevelRetry)
+            await table.UpdateByRowIdsAsync(rowIds, rewriteFile, token, rowLevelRetry: rowLevelRetry)
                 .ConfigureAwait(false);
             DmlLog.LogInformation("delta update-rewrite {Path}: rowids={RowIds} writer={Writer} rewriter={Rewriter}",
                 path, rowIds.Count, writer is null ? "engineered-wood" : "native-duckdb",

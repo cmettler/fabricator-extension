@@ -1859,9 +1859,13 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   "modify doesn't set the opener" note was WRONG; it's inside that helper), and `fabricator_exec`
   (`fabricator_extension.cpp:501`). So 2a/2b/2c capture the current statement's live `&context`. Paths WITHOUT a
   preceding `SetActiveOpener` (metadata reads, DDL via CreateTable/AlterTable) are left uncancelled (short anyway).
-  **Remaining (deferred): Delta DML** (wire the scope token into `DeltaReader.DeleteByRowIds`/`UpdateByRowIds` — EW
-  already takes the ct; Tier 1 did EW reads, EW writes/DML are the analogous follow-up) + **2d** `command_timeout`
-  (`CancelAfter`, closes the hung-socket hole); **Tier 3** DAX/ADOMD via
+  **Delta EW DML/maintenance DONE (`<pending-commit>`, C#-only):** the EW write cores `DeleteByRowIds`/
+  `DeleteByRowIdsViaVectors`/`UpdateByRowIds`/`Optimize`/`Vacuum` each build an `InterruptScope(opener, ct)`
+  internally (like the Tier 1 read paths) and pass the token to `OpenAsync` + the EW op — a slow OneLake/S3
+  copy-on-write/DV rewrite, OPTIMIZE, or VACUUM cancels (codec path fully; native_write's parquet rewrite runs on
+  a separate host_query connection, uncancelled — Tier 4). AUTOCOMMIT only; a buffered explicit-txn DML commits at
+  `FlushDmlTransaction` (still `default`, not yet wired — separate follow-up). **Remaining (deferred): buffered-txn
+  flush** + **2d** `command_timeout` (`CancelAfter`, closes the hung-socket hole); **Tier 3** DAX/ADOMD via
   `AdomdCommand.Cancel()` (no usable async); **Tier 4** the arrow scan as a DuckDB async/BLOCKED source
   (`InterruptState`) to free the task thread during I/O (native interrupt + better parallelism, bigger). Live Ctrl+C
   behavior is a MANUAL check (a slow OneLake/SQL query + interrupt); the suites verify only behavior-neutrality.
