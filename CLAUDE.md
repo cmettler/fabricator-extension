@@ -248,6 +248,25 @@ current code still uses the single-provider `fabricator` naming):
 ## Next up (open threads for future sessions)
 
 In-flight / planned refactors (all C#-only unless noted; tests stay green per slice):
+- **dbt DAX→Delta pipeline — DONE + VALIDATED LIVE (2026-07-16): `dbt_dax_test/` (gitignored — NO creds in
+  the project).** A second dbt-duckdb harness proving DAX EVALUATE results materialized as OneLake Delta
+  tables: the `plugins/fabric_attach.py` plugin executes the repo-root `dax_secret.sql` per connection
+  (secrets never enter the project) then ATTACHes BOTH catalogs — `lake` (LH lakehouse, `PROVIDER 'delta'`,
+  `READ_ONLY false`) + `dax` (`PROVIDER 'dax'`, workspace XMLA `powerbi://…/Test;Initial Catalog=Test
+  Warehouse Model2`). TWO model shapes, both PASS: (1) plain SQL wrapping the DAX —
+  `SELECT … FROM dax."Model".daxeval(expression := 'EVALUATE …')`, ordinary `table` materialization CTASes
+  into `lake.dbt.*` (NOT `fabricator_exec` — daxeval is the result-returning surface); (2) **PLAIN DAX as
+  the whole model body** via the custom **`dax_table` materialization** (`macros/dax_table.sql`): dbt never
+  parses model SQL — it renders jinja and hands the text to the materialization, which wraps `compiled_code`
+  in `daxeval(expression := '<body, quotes doubled>')` + `CREATE OR REPLACE TABLE {{ this }} AS …`
+  (config `dax_catalog`/`dax_model`; jinja caveat: literal `{{`/`{%` in DAX needs `{% raw %}` — single
+  braces/table constructors fine). GOTCHAS: the **LH lakehouse's DEFAULT semantic model is EMPTY** → daxeval
+  errors ("needs at least one table") — the harness points at the populated warehouse model instead; a
+  workspace XMLA endpoint WITHOUT `Initial Catalog` auto-binds the FIRST model with the schema named by
+  GUID (give `Initial Catalog` → schema binds by name, e.g. `Model`); a `+schema:` in dbt_project.yml
+  CONCATENATES with the profile schema (dbt default `generate_schema_name` → `dbt_dbt`) — set the schema in
+  the PROFILE only. Run: `cd dbt_dax_test && ../dbt_mssql_test/.venv/Scripts/dbt.exe run` (~50s incl.
+  introspection; models 4-6s each).
 - **Eager-write DeltaTxnBuffer (PLANNED, analysis 2026-07-13 — nothing built).** Goal: the buffer holds
   Delta ACTIONS only; data files are ALWAYS written eagerly to storage at statement time (Spark's
   OptimisticTransaction shape — files land immediately, commit deferred, rollback = invisible orphans for
