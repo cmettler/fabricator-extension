@@ -739,18 +739,11 @@ internal static class DeltaReader
         using var interrupt = new InterruptScope(opener, ct);
         var token = interrupt.Token;
         var fs = TableFileSystems.Create(opener, path);
-        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(), token).ConfigureAwait(false);
-        try
+        await using var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(), token).ConfigureAwait(false);
+        await foreach (var batch in table.ReadRowsByRowIdsAsync(rowIds, atVersion, sourceTrackingOut, token)
+                           .ConfigureAwait(false))
         {
-            await foreach (var batch in table.ReadRowsByRowIdsAsync(rowIds, atVersion, sourceTrackingOut, token)
-                               .ConfigureAwait(false))
-            {
-                yield return batch;
-            }
-        }
-        finally
-        {
-            await table.DisposeAsync().ConfigureAwait(false);
+            yield return batch;
         }
     }
 
