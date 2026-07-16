@@ -111,7 +111,7 @@ SELECT count(*) FROM lake.main.lm WHERE rowid IN (SELECT rowid FROM lake.main.lm
 #      row-group-skippable file_row_number form ----
 
 statement ok
-CALL enable_logging(storage='memory');
+CALL enable_logging(level := 'debug', storage := 'memory');
 
 query IIT
 SELECT * FROM lake.main.lm ORDER BY x DESC LIMIT 1;

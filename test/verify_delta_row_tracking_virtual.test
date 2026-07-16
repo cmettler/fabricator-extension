@@ -460,7 +460,7 @@ statement ok
 INSERT INTO lakef.main.ft SELECT r, 'v' || r FROM range(10, 15) t(r);
 
 statement ok
-CALL enable_logging(storage='memory');
+CALL enable_logging(level := 'debug', storage := 'memory');
 
 # point lookup: only the middle file can hold id 7 — the other two are SKIPPED from the log
 query ITI
@@ -522,7 +522,7 @@ SELECT fabricator_exec('lakef', 'OPTIMIZE main.ft');
 0
 
 statement ok
-CALL enable_logging(storage='memory');
+CALL enable_logging(level := 'debug', storage := 'memory');
 
 # the compacted file carries materialized ORIGINAL ids — lookup stays exact
 query ITI

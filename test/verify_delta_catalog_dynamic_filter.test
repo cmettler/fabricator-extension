@@ -54,7 +54,7 @@ SELECT count(*) FROM lake.main.big b JOIN lake.main.dim d ON b.id = d.id;
 
 # ---- prove the filters actually reached read_parquet (not just re-applied above the scan) ----
 statement ok
-CALL enable_logging(storage='memory');
+CALL enable_logging(level := 'debug', storage := 'memory');
 
 # re-run the join so its per-file read_parquet SQL is logged
 query I

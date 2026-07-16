@@ -247,6 +247,10 @@ static unique_ptr<TableRef> NamedSourceReplacement(ClientContext &, ReplacementS
 
 // host_log — forward a managed ILogger event into DuckDB's internal logging (duckdb_logs). Best-effort: a
 // no-op until the DB is known, and any logging failure is swallowed (logging must never fault the extension).
+// GATED on ShouldLog (enabled + level + type filters) — Logger::WriteLog itself writes UNCONDITIONALLY, and
+// the shell's default log storage prints to the console, so ungated forwarding spammed every interactive
+// session with the bridge's Debug chatter. With the gate, semantics are DuckDB-native: silence until
+// `CALL enable_logging(...)`; the .test duckdb_logs pins on Debug messages enable with `level := 'debug'`.
 static void HostLogService(int32_t level, const char *log_type, const char *message) {
 	if (!g_host_db) {
 		return;
@@ -273,7 +277,12 @@ static void HostLogService(int32_t level, const char *log_type, const char *mess
 		break;
 	}
 	try {
-		Logger::Get(*g_host_db).WriteLog(log_type ? log_type : "Fabricator", lvl, message ? message : "");
+		auto &logger = Logger::Get(*g_host_db);
+		const char *type = log_type ? log_type : "Fabricator";
+		if (!logger.ShouldLog(type, lvl)) {
+			return;
+		}
+		logger.WriteLog(type, lvl, message ? message : "");
 	} catch (...) {
 	}
 }
