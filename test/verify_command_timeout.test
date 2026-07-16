@@ -1,0 +1,28 @@
+# name: test/verify_command_timeout.test
+# description: mssql_command_timeout setting (default 0=infinite) + command_timeout ATTACH option
+# group: [fabricator]
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+SET mssql_command_timeout=0;
+
+statement ok
+SET mssql_command_timeout=300;
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator, command_timeout '120');
+
+# catalog usable with the ATTACH command_timeout option (shared read-only fixture)
+query I
+SELECT count(*) >= 0 FROM db.dbo.TestSimplePK;
+----
+true
+
+statement ok
+DETACH db;
+
+statement ok
+SET mssql_command_timeout=0;

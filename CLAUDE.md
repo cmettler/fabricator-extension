@@ -1871,8 +1871,15 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   read-back) each build an `InterruptScope(opener)` and pass the token to their EW calls. Safe: a cancel before
   the atomic `_delta_log` commit lands = invisible orphan files (VACUUM reclaims) = rollback; a cancel isn't a
   `DeltaConflictException` so it exits the retry loop, not swallowed as a conflict. transactions 941 / txn_version
-  51 / row_tracking_virtual 299 green. **Remaining (deferred): native_write host_query rewrite** (Tier 4) + **2d**
-  `command_timeout` (`CancelAfter`, closes the hung-socket hole); **Tier 3** DAX/ADOMD via
+  51 / row_tracking_virtual 299 green. **2d — SQL command_timeout DONE (`<pending-commit>`, C#-only):** `mssql_command_timeout` setting
+  (seconds; **default 0 = infinite**) + a per-catalog `command_timeout` ATTACH option, resolved `SET ?? ATTACH
+  ?? 0` (`ResolveCommandTimeout`) → `SqlCommand.CommandTimeout` on scans/DML + `BulkCopyTimeout`. NATIVE,
+  server-enforced, PER-ROUND-TRIP (aborts a hung round-trip, doesn't kill a long-but-progressing scan — which a
+  client `CancelAfter` on the whole scope would); complements the interrupt token (token = Ctrl+C cancel; timeout
+  = non-interactive/hung safety net). Default 0 removes the prior implicit SqlClient 30 s (a warehouse-query
+  footgun). `test/verify_command_timeout.test` (6). The `io_timeout` for OneLake was DROPPED (httpfs/duckdb-azure
+  have their own HTTP timeouts; a coarse whole-scope CancelAfter would mis-fire on long streaming reads).
+  **Remaining (deferred): native_write host_query rewrite** (Tier 4); **Tier 3** DAX/ADOMD via
   `AdomdCommand.Cancel()` (no usable async); **Tier 4** the arrow scan as a DuckDB async/BLOCKED source
   (`InterruptState`) to free the task thread during I/O (native interrupt + better parallelism, bigger). Live Ctrl+C
   behavior is a MANUAL check (a slow OneLake/SQL query + interrupt); the suites verify only behavior-neutrality.

@@ -113,6 +113,18 @@ but such a connection must be disposed, not reused.
   atomic `_delta_log` commit lands leaves invisible orphan files (VACUUM reclaims), i.e. it degrades to a
   rollback; a cancel is not a `DeltaConflictException`, so it exits the retry loop instead of being swallowed as
   a conflict.
+- **2d — SQL command_timeout (commit `<this>`):** `mssql_command_timeout` provider setting (seconds; **default
+  0 = infinite**) + a per-catalog `command_timeout` ATTACH option, resolved `SET ?? ATTACH ?? 0`
+  (`ResolveCommandTimeout`) and applied as `SqlCommand.CommandTimeout` on the scan/DML commands +
+  `SqlBulkCopy.BulkCopyTimeout`. This is the NATIVE, server-enforced, **per-round-trip** timeout — it aborts a
+  hung SQL round-trip without killing a long-but-progressing scan (which a client-side `CancelAfter` on the
+  whole scope would). Complements the interrupt token: the token = user/query cancel (Ctrl+C); the timeout =
+  the non-interactive/hung safety net. Default 0 removes the previous implicit SqlClient 30 s (a footgun for
+  warehouse queries); re-impose one via the setting/option when hung-detection is wanted.
+  `test/verify_command_timeout.test`. **NOT done — `io_timeout` for OneLake/host-FS was considered and dropped:**
+  that I/O goes through httpfs/duckdb-azure, which have their own HTTP connect/read timeouts, so a genuinely
+  hung socket fails at the transport layer; a coarse whole-scope `CancelAfter` there would mis-fire on long
+  streaming reads. Ctrl+C covers the interactive case.
 
 ### The opener-freshness constraint (load-bearing)
 

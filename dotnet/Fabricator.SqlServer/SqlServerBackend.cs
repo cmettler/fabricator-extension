@@ -43,6 +43,10 @@ public sealed class SqlServerBackend : IBackend
                 Long("mssql_connection_limit"), Long("mssql_connection_timeout"), Long("mssql_acquire_timeout"),
                 Long("mssql_attach_validation_timeout"), Long("mssql_catalog_cache_ttl"), Long("mssql_copy_flush_rows"),
                 Long("mssql_idle_timeout"), Long("mssql_min_connections"),
+                Long("mssql_command_timeout",
+                     "fabricator: SqlCommand.CommandTimeout in seconds (0 = infinite, default) applied to scans / " +
+                     "DML / bulk — a hung SQL round-trip aborts (per-round-trip, so a long-but-progressing scan is " +
+                     "fine); overrides the per-catalog command_timeout ATTACH option", 0L, 0),
                 Str("mssql_ctas_text_type"),
                 Str("mssql_isolation_level", "fabricator: SQL transaction isolation level for table-in-out sessions"),
                 Str("mssql_mars", "fabricator: MARS mode — auto (default, per engine) | true | false"),
@@ -406,6 +410,9 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // (schema_filter already gates functions by schema on the C++ side).
     private readonly Regex? _functionFilter;
     private readonly string _isolationLevel = "";
+    // ATTACH option `command_timeout <seconds>` (0 = infinite, default): the catalog default SqlCommand.CommandTimeout
+    // for scans/DML/bulk. A SET mssql_command_timeout overrides it per session (ResolveCommandTimeout).
+    private readonly int _commandTimeout;
     // ATTACH option `add_identity true`: created tables get an auto BIGINT IDENTITY surrogate key (<table>_id)
     // when none is otherwise specified. The mssql_add_identity SET setting overrides this per session (turn OFF
     // for fact tables that don't need a surrogate key). Resolved by ResolveAddIdentity().
@@ -489,6 +496,9 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                     case "table_filter": _tableFilter = CompileFilter("table_filter", val); break;
                     case "function_filter": _functionFilter = CompileFilter("function_filter", val); break;
                     case "isolation_level": _isolationLevel = val; break;
+                    case "command_timeout":
+                        if (int.TryParse(val, out var ctSecs) && ctSecs >= 0) { _commandTimeout = ctSecs; }
+                        break;
                     case "add_identity":
                         _addIdentityOnCreate = string.Equals(val, "true", StringComparison.OrdinalIgnoreCase) || val == "1";
                         break;
@@ -855,6 +865,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             var pinnedCommand = pinned.CreateCommand();
             pinnedCommand.CommandText = sql;
             pinnedCommand.CommandType = CommandType.Text;
+            pinnedCommand.CommandTimeout = ResolveCommandTimeout();
             pinnedCommand.Transaction = pinnedTransaction;
             AddParameters(pinnedCommand, parameters);
             try
@@ -880,6 +891,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             command = connection.CreateCommand();
             command.CommandText = sql;
             command.CommandType = CommandType.Text;
+            command.CommandTimeout = ResolveCommandTimeout();
             AddParameters(command, parameters);
             var reader = command.ExecuteReaderAsync(token).GetAwaiter().GetResult();
             return new DbDataReaderArrowStream(connection, command, reader, interrupt: interrupt);
@@ -917,6 +929,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             using var command = connection.CreateCommand();
             command.CommandText = sql;
             command.CommandType = CommandType.Text;
+            command.CommandTimeout = ResolveCommandTimeout();
             command.Transaction = transaction;
             Log.LogDebug("exec [txn={Txn} own={Own}]: {Sql}", AmbientTransaction.Current, owns, Trunc(sql));
             // ExecuteNonQuery returns -1 for statements that don't affect rows
@@ -1004,7 +1017,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
             using var reader = new ArrowDataReader(data);
             using var bulk = new SqlBulkCopy(connection, options, transaction)
-                { DestinationTableName = qualified, BulkCopyTimeout = 0 };
+                { DestinationTableName = qualified, BulkCopyTimeout = ResolveCommandTimeout() };
             // Map by name (case-insensitive) so source/target column order need not match.
             foreach (var field in data.Schema.FieldsList)
             {
@@ -1049,6 +1062,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             }
             using var cmd = connection.CreateCommand();
             cmd.Transaction = transaction;
+            cmd.CommandTimeout = ResolveCommandTimeout();
             var sb = new StringBuilder("DELETE FROM ").Append(qualified).Append(" WHERE ");
             int p = 0;
             for (int r = 0; r < batch.Count; r++)
@@ -1121,6 +1135,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         {
             using var cmd = connection.CreateCommand();
             cmd.Transaction = transaction;
+            cmd.CommandTimeout = ResolveCommandTimeout();
             var sb = new StringBuilder("UPDATE ").Append(qualified).Append(" SET ");
             for (int c = 0; c < setColumnCount; c++)
             {
@@ -2252,6 +2267,18 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     // (AggregateSession — the id->accumulator UDAF session — now lives in Fabricator.Bridge, shared by
     // catalog-bound aggregates (AggOpen above) and connection-free global aggregates.)
+
+    // Effective SqlCommand.CommandTimeout (seconds; 0 = infinite) for scans / DML / bulk: a SET
+    // mssql_command_timeout (provider settings store) wins if set, else this catalog's command_timeout ATTACH
+    // option, else 0. Per-round-trip in ADO.NET (aborts a hung round-trip; a long-but-progressing scan is fine).
+    // See docs/cancellation.md. Complements the InterruptScope token (Ctrl+C) — this is the non-interactive/hung
+    // safety net; the token is user/query cancellation.
+    internal int ResolveCommandTimeout()
+    {
+        var set = ProviderSettingsStore.Instance.GetLong(SqlServerBackend.ProviderName, "mssql_command_timeout");
+        long v = set ?? _commandTimeout;
+        return v < 0 ? 0 : (int)v;
+    }
 
     // Maps an isolation_level string (ATTACH option / SET mssql_isolation_level) to ADO.NET. Empty =>
     // Unspecified (connection/provider default); a genuinely unknown name throws.
