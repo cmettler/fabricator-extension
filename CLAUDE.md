@@ -2395,7 +2395,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   this provider). **The BUFFERED-path post-OPTIMIZE caveat is CLOSED too (same pass):**
   `ReadRowsByRowIdsAsync` gained an optional `sourceRowTrackingOut` collector (one row-aligned entry per
   yielded batch: original id/version = the source's MATERIALIZED value else baseRowId + position — plain
-  `long?[]` value arrays, valid past table dispose, unlike the batches' Arrow buffers), threaded through
+  `long?[]` value arrays — trivially lifetime-free), threaded through
   the Bridge wrapper; `BufferUpdateRows` now takes its stableIds from the read-back (the
   `GetOrderedActiveBaseRowIds` ordinal-arithmetic call is gone from that path) — so a buffered UPDATE of
   a COMPACTED file bakes the ORIGINAL id (pinned: post-OPTIMIZE buffered UPDATE keeps `__delta_row_id=4`).
@@ -3054,8 +3054,10 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   trailing column (`DropVirtualRowId` — NOT `RowTrackingWriter.StripRowIdColumn`, which strips the *physical*
   `__delta_row_id`) before writing the change file, else the update_preimage batch has 6 cols vs 5 elsewhere → a
   schema mismatch across change batches → **arrow_ingest SIGSEGV**; (2) `DeltaReader.GetChanges` **streams lazily**
-  (peek-the-first-batch for the schema, table stays open for the whole enumeration — materializing then disposing
-  the table frees the batches' Arrow buffers = use-after-free, "Out of Range string size"). **CDF-enabled guard:**
+  (peek-the-first-batch for the schema, table stays open for the whole enumeration — kept for BOUNDED MEMORY; the
+  original "materializing then disposing the table frees the batches' Arrow buffers = use-after-free, 'Out of Range
+  string size'" diagnosis was DISPROVEN 2026-07-16 — see the lifetime-correction note in the buffered-DML slice-2
+  bullet; the corruption was almost certainly fix (1)'s schema mismatch). **CDF-enabled guard:**
   engineered-wood's `CdfReader` silently INFERS changes from add/remove on a non-CDF table (misleading for
   copy-on-write — survivors look like inserts), so `GetChanges` requires `CdfConfig.IsEnabled(config)` and throws
   "Change Data Feed is not enabled" otherwise (Spark `DELTA_CHANGE_DATA_FEED_NOT_ENABLED` parity). Validated local
@@ -3479,8 +3481,20 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   copy-on-write — byte-identical):** DELETE buffers (pinned-snapshot file ordinal → absolute positions)
   per table (`BufferDeleteRows` — rowids decoded Bridge-side); UPDATE buffers its old rows the same way +
   builds post-image rows at statement time (`BufferUpdateRows`: EW `ReadRowsByRowIdsAsync` reads exactly
-  the matched rows, DEEP-COPIED via Arrow-IPC — EW batch buffers don't outlive the open table — then the
-  SET values substitute via the existing `BuildArray`; post-images join the pending append batches).
+  the matched rows, then the SET values substitute via the existing `BuildArray`; post-images join the
+  pending append batches). **LIFETIME CORRECTION (2026-07-16, user-driven): the long-recorded "EW batch
+  buffers don't outlive the open table" belief is FALSE and the read-back's Arrow-IPC deep copy was
+  REMOVED** — EW batches are SELF-OWNED (every `ArrowArrayBuilder` output is a fresh
+  `Apache.Arrow.Memory.NativeBuffer` native allocation behind a refcounted `SharedMemoryHandle` WITH a
+  finalizer; decode-path `ArrayPool` rentals are all rent→copy-out→return in-scope; `DeltaTable.Dispose`
+  has been a no-op `_disposed` flag since EW's original April commit — it never freed anything). Proven
+  empirically (scratchpad/ewlifetime harness: materialize `ReadRowsByRowIdsAsync` + `ReadChangesAsync`
+  with NO copy → dispose table → 20 re-reads churning the ArrayPool + disposing churn batches → forced
+  GC+finalizers ×3 → all 20k rows byte-exact). The 2026-06-30 GetChanges "Out of Range string size" that
+  spawned the belief was almost certainly the CDF update_preimage 6-vs-5-column schema mismatch fixed in
+  the SAME commit (`7f0563a`), misattributed to buffer lifetime. `GetChanges` stays lazy purely for
+  bounded memory. Batches imported over the C ABI (bulk channel) are a DIFFERENT lifetime domain — their
+  copies (`DeltaWriter.Materialize`, `ProjectPending` clone) are NOT covered by this finding; leave them.
   **SNAPSHOT READS ARE THE DEFAULT (2026-07-11)**: inside an explicit transaction, the FIRST scan captures
   one UTC instant (`SnapshotPinning`, per txn — the MVCC snapshot-at-first-read shape, like Postgres
   REPEATABLE READ; capturing at literal BEGIN is impossible since catalogs are touched lazily) and each

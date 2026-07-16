@@ -715,12 +715,15 @@ internal static class DeltaReader
         }
     }
 
-    /// <summary>Reads exactly the rows identified by the given transient rowids, as DEEP-COPIED batches
-    /// (Arrow-IPC round-trip — engineered-wood batch buffers do not outlive the open table) WITH the
+    /// <summary>Reads exactly the rows identified by the given transient rowids, materialized, WITH the
     /// trailing virtual <c>_metadata.row_id</c> column. The read-back step of a buffered UPDATE.
+    /// The batches are SELF-OWNED (engineered-wood arrays own their buffers — native memory behind
+    /// finalizer-backed refcounted handles) and stay valid after the table is disposed, so no copy is
+    /// needed (verified empirically 2026-07-16; the old Arrow-IPC deep copy here guarded against a
+    /// misdiagnosed CDF schema-mismatch bug, not a real buffer lifetime).
     /// <paramref name="sourceTrackingOut"/> (optional): one row-aligned entry per returned batch with each
     /// row's ORIGINAL stable id/commit version (materialized source value else baseRowId + position) —
-    /// plain value arrays, valid after the table closes.</summary>
+    /// plain value arrays.</summary>
     public static List<RecordBatch> ReadRowsByRowIds(
         nint opener, string path, IReadOnlyCollection<long> rowIds, CancellationToken ct,
         long? atVersion = null,
@@ -738,34 +741,11 @@ internal static class DeltaReader
         var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(), token).ConfigureAwait(false);
         try
         {
-            var ms = new System.IO.MemoryStream();
-            Apache.Arrow.Ipc.ArrowStreamWriter? w = null;
-            var e = table.ReadRowsByRowIdsAsync(rowIds, token, atVersion, sourceTrackingOut).GetAsyncEnumerator(token);
-            try
-            {
-                while (await e.MoveNextAsync().ConfigureAwait(false))
-                {
-                    var b = e.Current;
-                    w ??= new Apache.Arrow.Ipc.ArrowStreamWriter(ms, b.Schema, leaveOpen: true);
-                    await w.WriteRecordBatchAsync(b, token).ConfigureAwait(false);
-                }
-            }
-            finally
-            {
-                await e.DisposeAsync().ConfigureAwait(false);
-            }
             var result = new List<RecordBatch>();
-            if (w is not null)
+            await foreach (var b in table.ReadRowsByRowIdsAsync(rowIds, token, atVersion, sourceTrackingOut)
+                               .ConfigureAwait(false))
             {
-                await w.WriteEndAsync(token).ConfigureAwait(false);
-                w.Dispose();
-                ms.Position = 0;
-                using var r = new Apache.Arrow.Ipc.ArrowStreamReader(ms);
-                RecordBatch? rb;
-                while ((rb = await r.ReadNextRecordBatchAsync(token).ConfigureAwait(false)) is not null)
-                {
-                    result.Add(rb);
-                }
+                result.Add(b);
             }
             return result;
         }
@@ -921,9 +901,12 @@ internal static class DeltaReader
     /// engineered-wood errors). Streams lazily.</summary>
     public static IArrowArrayStream GetChanges(nint opener, string path, long fromVersion, long toVersion)
     {
-        // Stream lazily (the table stays open for the whole enumeration — materializing then disposing frees the
-        // batches' Arrow buffers = use-after-free), and advertise the ACTUAL schema by peeking the first batch
-        // (hand-building it risks a column/type mismatch that SIGSEGVs arrow_ingest).
+        // Stream lazily (bounded memory — the feed can span many versions; the table stays open for the whole
+        // enumeration), and advertise the ACTUAL schema by peeking the first batch (hand-building it risks a
+        // column/type mismatch that SIGSEGVs arrow_ingest). NOTE the old "materializing then disposing the table
+        // frees the batches' Arrow buffers" rationale was DISPROVEN 2026-07-16 (EW batches are self-owned; the
+        // 2026-06-30 corruption was the CDF schema-mismatch fixed in the same pass) — laziness is kept purely
+        // for the memory bound.
         var enumerator = StreamChanges(opener, path, fromVersion, toVersion, default).GetAsyncEnumerator(default);
         bool hasFirst = enumerator.MoveNextAsync().AsTask().GetAwaiter().GetResult();
         var schema = hasFirst ? enumerator.Current.Schema : EmptyChangeSchema(opener, path);

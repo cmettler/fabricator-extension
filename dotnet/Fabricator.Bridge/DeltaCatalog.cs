@@ -2475,7 +2475,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     }
 
     // Buffers an UPDATE: the old rows join the pending deletion positions; the post-image rows (matched rows
-    // read back DEEP-COPIED with the SET values substituted) join the pending append batches — both flush in
+    // read back with the SET values substituted) join the pending append batches — both flush in
     // the ONE fused commit. Rows inserted in the same transaction are rejected (later slice).
     private long BufferUpdateRows(long txnId, string path, string schemaName, string tableName,
                                   Dictionary<long, object?[]> updates, int[] setSlotByColumn, Schema userSchema)
@@ -2547,7 +2547,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 int slot = setSlotByColumn[c];
                 if (slot < 0)
                 {
-                    newCols[c] = batch.Column(c); // unchanged column (deep-copied batch — safe to alias)
+                    newCols[c] = batch.Column(c); // unchanged column (batch owns its buffers — safe to alias)
                     continue;
                 }
                 var values = new List<object?>(batch.Length);
