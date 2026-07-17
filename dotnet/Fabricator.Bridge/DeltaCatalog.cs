@@ -3648,6 +3648,11 @@ public sealed class DeltaCatalog : IBackendCatalog
             {
                 FabricLakehouse.RenameDirectory(oldPath, newPath, _fabricCredential);
             }
+            else if (_s3Credential is not null && S3CommitFileSystem.IsS3(_root))
+            {
+                // SECRET-routed s3://: server-side CopyObject rename (no bytes through the client).
+                S3CommitFileSystem.RenameDirectory(oldPath, newPath, _s3Credential);
+            }
             else
             {
                 try
@@ -3656,8 +3661,8 @@ public sealed class DeltaCatalog : IBackendCatalog
                 }
                 catch
                 {
-                    // Object store without directory move (S3): the folder holds ONLY this
-                    // transaction's eager files — copy each and delete the source.
+                    // Object store without directory move (secretless S3): the folder holds ONLY this
+                    // transaction's eager files — copy each and delete the source through the host FS.
                     MoveFilesByCopy(opener, oldPath, newPath, pending.Files);
                 }
             }
@@ -3807,11 +3812,17 @@ public sealed class DeltaCatalog : IBackendCatalog
                 string newName = a1 ?? throw new System.InvalidOperationException(
                     "delta RENAME TABLE requires a new table name.");
                 // The table folder (incl. _delta_log) is moved; the schema is unchanged (RENAME TABLE renames
-                // within the same schema). OneLake → DFS atomic rename (Azure MoveFile is unimplemented); local/S3
-                // → the host FS move (FileSystem::MoveFile — atomic on local; an object store throws cleanly).
+                // within the same schema). OneLake → DFS atomic rename (Azure MoveFile is unimplemented);
+                // SECRET-routed s3:// → SDK server-side CopyObject rename (httpfs has no MoveFile; no data
+                // crosses the client); local → the host FS move (FileSystem::MoveFile, atomic). Secretless
+                // s3:// still throws cleanly (attach with a SECRET for rename support).
                 if (FabricLakehouse.IsOneLake(_root))
                 {
                     FabricLakehouse.RenameDirectory(TablePath(s, t), TablePath(s, newName), _fabricCredential);
+                }
+                else if (_s3Credential is not null && S3CommitFileSystem.IsS3(_root))
+                {
+                    S3CommitFileSystem.RenameDirectory(TablePath(s, t), TablePath(s, newName), _s3Credential);
                 }
                 else
                 {

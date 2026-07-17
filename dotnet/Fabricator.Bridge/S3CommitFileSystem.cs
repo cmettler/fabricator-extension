@@ -115,7 +115,18 @@ internal sealed class S3CommitFileSystem : ITableFileSystem
     {
         _inner = inner;
         _cred = cred;
-        var rest = rootS3Uri.Replace('\\', '/');
+        (_bucket, _prefix) = ParseS3Url(rootS3Uri);
+        _client = new Lazy<IAmazonS3>(() => BuildClient(_cred));
+    }
+
+    /// <summary>True when <paramref name="path"/> is an <c>s3://</c> URL.</summary>
+    public static bool IsS3(string path) =>
+        path.TrimStart().StartsWith("s3://", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Splits an s3 URL into (bucket, prefix) — prefix "" or with a trailing slash.</summary>
+    private static (string Bucket, string Prefix) ParseS3Url(string url)
+    {
+        var rest = url.Replace('\\', '/');
         const string scheme = "s3://";
         if (rest.StartsWith(scheme, StringComparison.OrdinalIgnoreCase))
         {
@@ -123,17 +134,17 @@ internal sealed class S3CommitFileSystem : ITableFileSystem
         }
         rest = rest.Trim('/');
         int slash = rest.IndexOf('/');
-        _bucket = slash < 0 ? rest : rest.Substring(0, slash);
-        _prefix = slash < 0 ? string.Empty : rest.Substring(slash + 1).TrimEnd('/') + "/";
-        _client = new Lazy<IAmazonS3>(BuildClient);
+        var bucket = slash < 0 ? rest : rest.Substring(0, slash);
+        var prefix = slash < 0 ? string.Empty : rest.Substring(slash + 1).TrimEnd('/') + "/";
+        return (bucket, prefix);
     }
 
-    private IAmazonS3 BuildClient()
+    private static IAmazonS3 BuildClient(S3CommitCredential cred)
     {
-        var cfg = new AmazonS3Config { ForcePathStyle = _cred.PathStyle };
-        if (!string.IsNullOrEmpty(_cred.Endpoint))
+        var cfg = new AmazonS3Config { ForcePathStyle = cred.PathStyle };
+        if (!string.IsNullOrEmpty(cred.Endpoint))
         {
-            cfg.ServiceURL = (_cred.UseSsl ? "https://" : "http://") + _cred.Endpoint;
+            cfg.ServiceURL = (cred.UseSsl ? "https://" : "http://") + cred.Endpoint;
             // custom endpoint (MinIO/on-prem): tolerate self-signed certs, like the DuckDB-side rig
             var handler = new System.Net.Http.HttpClientHandler
             {
@@ -141,16 +152,87 @@ internal sealed class S3CommitFileSystem : ITableFileSystem
             };
             cfg.HttpClientFactory = new PermissiveHttpClientFactory(handler);
         }
-        else if (!string.IsNullOrEmpty(_cred.Region))
+        else if (!string.IsNullOrEmpty(cred.Region))
         {
-            cfg.RegionEndpoint = Amazon.RegionEndpoint.GetBySystemName(_cred.Region);
+            cfg.RegionEndpoint = Amazon.RegionEndpoint.GetBySystemName(cred.Region);
         }
-        AWSCredentials creds = string.IsNullOrEmpty(_cred.KeyId)
+        AWSCredentials creds = string.IsNullOrEmpty(cred.KeyId)
             ? FallbackCredentialsFactory.GetCredentials() // SDK default chain (env/profile/role)
-            : string.IsNullOrEmpty(_cred.SessionToken)
-                ? new BasicAWSCredentials(_cred.KeyId, _cred.Secret)
-                : new SessionAWSCredentials(_cred.KeyId, _cred.Secret, _cred.SessionToken);
+            : string.IsNullOrEmpty(cred.SessionToken)
+                ? new BasicAWSCredentials(cred.KeyId, cred.Secret)
+                : new SessionAWSCredentials(cred.KeyId, cred.Secret, cred.SessionToken);
         return new AmazonS3Client(creds, cfg);
+    }
+
+    /// <summary>
+    /// Renames a whole table folder SERVER-SIDE: list every object under <paramref name="srcUrl"/>, copy
+    /// each to the same suffix under <paramref name="dstUrl"/> via <c>CopyObject</c> (in-cluster — no data
+    /// crosses the client, unlike a host-FS read/write fallback), then batch-delete the sources. Copy-ALL-
+    /// then-delete: a mid-copy failure leaves the SOURCE table fully intact (the partial destination is
+    /// inert garbage without its complete <c>_delta_log</c>). Backs committed-table RENAME TABLE on S3 —
+    /// httpfs has no MoveFile — and requires the SECRET-routed attach (the SDK credential). NOTE a single
+    /// CopyObject call caps at 5 GB/object (larger would need multipart copy; our data files are far
+    /// below — a violation surfaces as the SDK error with the source intact).
+    /// </summary>
+    public static void RenameDirectory(string srcUrl, string dstUrl, S3CommitCredential cred)
+        => RenameDirectoryAsync(srcUrl, dstUrl, cred).GetAwaiter().GetResult();
+
+    private static async Task RenameDirectoryAsync(string srcUrl, string dstUrl, S3CommitCredential cred)
+    {
+        // Cancellable on query interrupt (the opener is set fresh by the ALTER operator).
+        using var interrupt = new InterruptScope(AmbientOpener.Current);
+        var token = interrupt.Token;
+        var (srcBucket, srcPrefix) = ParseS3Url(srcUrl);
+        var (dstBucket, dstPrefix) = ParseS3Url(dstUrl);
+        if (!string.Equals(srcBucket, dstBucket, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new NotSupportedException(
+                $"delta RENAME TABLE on S3: source and destination must share a bucket ('{srcBucket}' vs '{dstBucket}').");
+        }
+        using var c = BuildClient(cred);
+        var keys = new List<string>();
+        string? continuation = null;
+        do
+        {
+            var resp = await c.ListObjectsV2Async(new ListObjectsV2Request
+            {
+                BucketName = srcBucket,
+                Prefix = srcPrefix,
+                ContinuationToken = continuation,
+            }, token).ConfigureAwait(false);
+            if (resp.S3Objects is not null)
+            {
+                foreach (var o in resp.S3Objects)
+                {
+                    keys.Add(o.Key);
+                }
+            }
+            continuation = resp.IsTruncated == true ? resp.NextContinuationToken : null;
+        } while (continuation is not null);
+        if (keys.Count == 0)
+        {
+            throw new FileNotFoundException($"delta RENAME TABLE: no objects under '{srcUrl}'.");
+        }
+        foreach (var key in keys)
+        {
+            await c.CopyObjectAsync(new CopyObjectRequest
+            {
+                SourceBucket = srcBucket,
+                SourceKey = key,
+                DestinationBucket = dstBucket,
+                DestinationKey = dstPrefix + key.Substring(srcPrefix.Length),
+            }, token).ConfigureAwait(false);
+        }
+        for (int i = 0; i < keys.Count; i += 1000) // DeleteObjects caps at 1000 keys per call
+        {
+            var batch = new List<KeyVersion>();
+            for (int j = i; j < keys.Count && j < i + 1000; j++)
+            {
+                batch.Add(new KeyVersion { Key = keys[j] });
+            }
+            await c.DeleteObjectsAsync(new DeleteObjectsRequest { BucketName = srcBucket, Objects = batch }, token)
+                .ConfigureAwait(false);
+        }
     }
 
     private sealed class PermissiveHttpClientFactory : Amazon.Runtime.HttpClientFactory

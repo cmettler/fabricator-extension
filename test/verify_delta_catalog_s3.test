@@ -390,3 +390,75 @@ true
 
 statement ok
 DETACH ccs;
+
+# ============================================================================
+# 10. Committed-table RENAME TABLE on S3 — SECRET-routed attach only: the SDK
+#     renames the whole folder SERVER-SIDE (list -> CopyObject per key ->
+#     batched delete; no data through the client). httpfs has no MoveFile, so
+#     a secretless attach still rejects RENAME cleanly. Re-runnable: the
+#     rename target is dropped up front.
+# ============================================================================
+
+statement ok
+ATTACH 's3://fabricator/condsuite' AS rns (TYPE fabricator, PROVIDER 'delta', SECRET minio_s3, READ_ONLY false);
+
+statement ok
+DROP TABLE IF EXISTS rns.main.rn_dst;
+
+statement ok
+CREATE OR REPLACE TABLE rns.main.rn_src AS SELECT i AS id, 'v' || i AS v FROM range(1, 51) r(i);
+
+# a DELETE first so the folder carries a DV commit too (multiple _delta_log entries move)
+statement ok
+DELETE FROM rns.main.rn_src WHERE id = 7;
+
+statement ok
+ALTER TABLE rns.main.rn_src RENAME TO rn_dst;
+
+query II
+SELECT count(*), sum(id) FROM rns.main.rn_dst;
+----
+49	1268
+
+query T
+SELECT v FROM rns.main.rn_dst WHERE id = 10;
+----
+v10
+
+# the old name is gone (folder moved, catalog re-keyed)
+query I
+SELECT count(*) FROM (SELECT * FROM information_schema.tables WHERE table_catalog = 'rns' AND table_name = 'rn_src');
+----
+0
+
+# durable: re-attach re-discovers only the new name
+statement ok
+DETACH rns;
+
+statement ok
+ATTACH 's3://fabricator/condsuite' AS rns (TYPE fabricator, PROVIDER 'delta', SECRET minio_s3, READ_ONLY false);
+
+query I
+SELECT count(*) FROM rns.main.rn_dst;
+----
+49
+
+query I
+SELECT count(*) FROM (SELECT * FROM information_schema.tables WHERE table_catalog = 'rns' AND table_name = 'rn_src');
+----
+0
+
+# rename works again post-re-attach (round-trip back, leaves the bucket re-runnable)
+statement ok
+ALTER TABLE rns.main.rn_dst RENAME TO rn_src2;
+
+query I
+SELECT count(*) FROM rns.main.rn_src2;
+----
+49
+
+statement ok
+DROP TABLE rns.main.rn_src2;
+
+statement ok
+DETACH rns;

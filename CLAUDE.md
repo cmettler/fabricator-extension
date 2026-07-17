@@ -4171,9 +4171,19 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   httpfs' S3 `RemoveDirectory` re-lists keys WITHOUT the scheme prefix and fails its own remove ("URL
   needs to start with s3://"), so `DeltaCatalog.DropTable` catches the failure and deletes glob(`/**`)
   file-by-file + the zero-byte directory-marker keys (`RemoveFile` IS implemented for s3). S3 caveats
-  (documented, unchanged): no put-if-absent on httpfs S3 (single-writer; `fabricator_fs_write_probe` shows
-  EXCLUSIVE_CREATE unguarded), `MoveFile` unimplemented (RENAME TABLE fails); `DROP EXTERNAL TABLE IF
-  EXISTS` is not T-SQL (use `IF OBJECT_ID(...) IS NOT NULL DROP EXTERNAL TABLE ...`). **CDF on S3 works end-to-end** (change files write to + read
+  (documented): no put-if-absent on httpfs S3 (single-writer without a SECRET; `fabricator_fs_write_probe`
+  shows EXCLUSIVE_CREATE unguarded); `DROP EXTERNAL TABLE IF EXISTS` is not T-SQL (use
+  `IF OBJECT_ID(...) IS NOT NULL DROP EXTERNAL TABLE ...`). **Committed-table RENAME TABLE on S3 — DONE
+  (2026-07-17, C#-only) for SECRET-routed attaches:** `S3CommitFileSystem.RenameDirectory` renames the whole
+  table folder SERVER-SIDE via the SDK (ListObjectsV2 → `CopyObject` per key — unconditional copies are fine,
+  only the CONDITIONAL CopyObject is unguarded on MinIO — → batched DeleteObjects; copy-ALL-then-delete so a
+  mid-failure leaves the source intact; no data crosses the client; 5 GB/object single-call CopyObject cap
+  noted). Wired in `DeltaCatalog.AlterTable` RenameTable + `RenamePendingCreated` (SDK preferred over the
+  per-file host-FS copy) when `_s3Credential` is present; SECRETLESS s3 keeps the clean "MoveFile is not
+  implemented" error. This unblocks **dbt table-model RE-DEPLOYS on S3-Delta** (the swap's two renames +
+  backup drop — previously any re-run of an existing table model failed; found by the 4x1M perf sweep).
+  `verify_delta_catalog_s3` §10 (161 — rename + DV commit moved, old name gone, re-attach durable,
+  round-trip); dbt minio full-refresh over EXISTING tables green. **CDF on S3 works end-to-end** (change files write to + read
   from the bucket; the feed is exact) **and a CDF table stays SQL-Server-readable** (changeDataFeed is
   writer-only too — pinned). **FIFTH S3-rig bug (EW, parquet-layer):** `ColumnChunkWriter.CompressTo`
   returned a 0-BYTE payload for an empty input — but a valid snappy stream of nothing is the single
