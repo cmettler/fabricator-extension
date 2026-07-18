@@ -457,9 +457,29 @@ internal static unsafe class HostFs
 
         public Schema Schema => _inner.Schema;
 
+        private bool _done;
+
         public System.Threading.Tasks.ValueTask<RecordBatch?> ReadNextRecordBatchAsync(
             System.Threading.CancellationToken cancellationToken = default)
-            => _inner.ReadNextRecordBatchAsync(cancellationToken);
+        {
+            // EOF LATCH: the host stream's get_next is NOT idempotent at end — a second call after the
+            // stream reported end re-Fetches the CLOSED StreamQueryResult ("Attempting to execute an
+            // unsuccessful or closed pending query result"). The Arrow C stream contract says end is
+            // sticky, so latch it here for every consumer (the same read-past-EOF class as the ADOMD
+            // reader — see DaxArrowStream's _done). The imported C stream completes synchronously, so
+            // the single block below never actually waits (and `await` is unavailable in this unsafe
+            // context anyway).
+            if (_done)
+            {
+                return new System.Threading.Tasks.ValueTask<RecordBatch?>((RecordBatch?)null);
+            }
+            var batch = _inner.ReadNextRecordBatchAsync(cancellationToken).AsTask().GetAwaiter().GetResult();
+            if (batch is null)
+            {
+                _done = true;
+            }
+            return new System.Threading.Tasks.ValueTask<RecordBatch?>(batch);
+        }
 
         public void Dispose()
         {

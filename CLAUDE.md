@@ -327,9 +327,25 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   (OneLake `fabricator_sorted` + sparkprobe):** 2000-row unsorted append (3 files) → our OPTIMIZE → 1
   file, counts exact, the provider commit on OneLake; **Spark DESCRIBE DETAIL fine with our tagged file,
   Spark OPTIMIZE judges the hilbert file clusteringQuality "ok" (avgCoverage 100) and rewrites NOTHING**,
-  Spark INSERT works. Remaining: ZCube-tagged incremental recluster (ours is full-table); multi-file
-  output via FILE_SIZE_BYTES (one output file per OPTIMIZE today); the EW-side root-cause of the
-  partitioned reader-seam gap.
+  Spark INSERT works.
+  **MULTI-FILE clustered output — DONE (same day, C#-only):** the rewrite splits into TARGET-SIZED files,
+  each a CONTIGUOUS cluster range (tight per-file min/max on all keys = the actual file-skipping payoff).
+  Target = the `delta.targetFileSize` table property (Databricks; plain bytes or b/kb/mb/gb suffix) else
+  128 MiB (== EW `CompactionOptions.TargetFileSize`, so clustered + bin-pack aim alike). **DuckDB's own
+  COPY `FILE_SIZE_BYTES` rotation is UNUSABLE for this — probed: the size-rotated sink writes from
+  parallel threads and does NOT preserve the query's order** (in-file inversions + interleaved ranges +
+  a 0-row trailing file) — so the split is OURS: single-file fast path when the estimated output fits
+  (~1.25× target; the whole rewrite stays ONE zero-crossing COPY), else the sorted stream comes back over
+  `HostFs.Query` and SEQUENTIAL per-file `RunCopy`s cut at BATCH boundaries (`BudgetedStream` — no
+  slicing, no lifetime hazards; rows-per-file estimated from the source adds' own bytes/rows stats).
+  **CRUX BUG FIXED en route (pre-existing, ALL Host.Query consumers): the host stream's `get_next` is NOT
+  idempotent at EOF** — a second call after end re-`Fetch()`es the CLOSED StreamQueryResult ("Attempting
+  to execute an unsuccessful or closed pending query result"; the DuckDB flavor of the ADOMD
+  read-past-EOF gotcha). Latched centrally in `InterruptibleQueryStream` (`_done` — Arrow C stream end is
+  sticky), protecting every consumer; my chunked loop was just the first to pull past EOF.
+  `verify_delta_clustered_optimize.test` now 55 (§5 multi-file: >1 file, per-file order, NO strictly
+  interleaving ranges, every add provider-tagged, counts exact). Remaining: ZCube-tagged incremental
+  recluster (ours is full-table); the EW-side root-cause of the partitioned reader-seam gap.
 - **`SORTED BY` → Delta ORDERED (clustered) writes — DONE (2026-07-18, C#-only, no ABI).** The v52 native
   clause (`CREATE TABLE lake.s.t SORTED BY (a,b) [AS …]` — `sort_columns` already crossed the ABI to
   `create_table`/`begin_bulk`; Delta previously ignored it) now drives the Delta provider:

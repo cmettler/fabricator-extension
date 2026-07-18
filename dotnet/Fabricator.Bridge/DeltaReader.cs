@@ -138,10 +138,12 @@ internal static class DeltaReader
     /// <summary><paramref name="NumRecords"/> = the add action's stats row count (null when the add carries
     /// no stats — external writers): with <paramref name="BaseRowId"/> it bounds the file's DERIVED stable-id
     /// range [baseRowId, baseRowId + numRecords) for the row-tracking filter fast path.</summary>
+    /// <summary><paramref name="SizeBytes"/> = the add action's file size (null when unknown): with
+    /// <paramref name="NumRecords"/> it estimates bytes-per-row for the clustered-OPTIMIZE file split.</summary>
     public sealed record NativeScanFile(int Ordinal, string Uri, long[] Dv,
                                         IReadOnlyDictionary<string, string>? PartitionValues = null,
                                         long? BaseRowId = null, long? CommitVersion = null,
-                                        long? NumRecords = null);
+                                        long? NumRecords = null, long? SizeBytes = null);
 
     /// <summary>The result of <see cref="ListNativeScanFiles"/>: the resolved snapshot <see cref="Version"/>, the
     /// surviving (post-prune) <see cref="Files"/> in path-sorted global-ordinal order, and <see cref="AnyUri"/> =
@@ -290,7 +292,8 @@ internal static class DeltaReader
                 long? numRecords = addStats is { NumRecords: > 0 } ? addStats.NumRecords : null;
                 files.Add(new NativeScanFile(ordinal, uri, dv,
                     add.PartitionValues is { Count: > 0 } ? add.PartitionValues : null,
-                    add.BaseRowId, add.DefaultRowCommitVersion, numRecords));
+                    add.BaseRowId, add.DefaultRowCommitVersion, numRecords,
+                    add.Size > 0 ? add.Size : null));
             }
             // Column-mapping tables store columns decoupled from the logical name — capture the mapping (from THIS
             // snapshot's schema, so time travel to a pre-rename version maps correctly) so the native reader can
@@ -1551,9 +1554,56 @@ internal static class DeltaReader
         var statsSchema = new Schema(statsFields, null);
         string? fieldIdsSpec = DeltaWriter.BuildFieldIdsSpec(snap.Schema, null);
 
-        string rel = $"{Guid.NewGuid():N}.parquet";
-        var copied = NativeParquetDataFileWriter.RunCopySql(
-            ToReadableRoot(path), rel, source, token, statsSchema, fieldIdsSpec);
+        // File split: ONE output file when the estimated output fits the target (the zero-crossing fast
+        // path — the whole rewrite runs inside one COPY), else SEQUENTIAL per-file COPYs cut at batch
+        // boundaries so every output file is a CONTIGUOUS cluster range with tight min/max on all keys.
+        // DuckDB's own FILE_SIZE_BYTES rotation is NOT usable here — the size-rotated sink writes from
+        // parallel threads and does NOT preserve the query's order (probed: interleaved ranges + in-file
+        // inversions), which would defeat the clustering. Rows-per-file is estimated from the source
+        // files' own add stats (bytes-per-row of the same data).
+        string root = ToReadableRoot(path);
+        long targetBytes = ResolveTargetFileSize(snap.Metadata.Configuration);
+        long estBytes = 0, estRows = 0;
+        bool sizesKnown = true;
+        foreach (var f in listing.Files)
+        {
+            if (f.SizeBytes is { } sb && f.NumRecords is { } nr)
+            {
+                estBytes += sb;
+                estRows += nr;
+            }
+            else
+            {
+                sizesKnown = false; // external add without stats — can't estimate, keep one file
+                break;
+            }
+        }
+        List<NativeParquetDataFileWriter.CopiedFile> copied;
+        if (!sizesKnown || estRows == 0 || estBytes <= targetBytes + targetBytes / 4)
+        {
+            copied = NativeParquetDataFileWriter.RunCopySql(
+                root, $"{Guid.NewGuid():N}.parquet", source, token, statsSchema, fieldIdsSpec);
+        }
+        else
+        {
+            long rowsPerFile = Math.Max(1024, (long)((double)targetBytes * estRows / estBytes));
+            copied = new List<NativeParquetDataFileWriter.CopiedFile>();
+            using var src = HostFs.Query(source, ct: token);
+            while (true)
+            {
+                var first = src.ReadNextRecordBatchAsync(token).AsTask().GetAwaiter().GetResult();
+                if (first is null)
+                {
+                    break;
+                }
+                string chunkRel = $"{Guid.NewGuid():N}.parquet";
+                using var chunk = new BudgetedStream(src, first, rowsPerFile, token);
+                var one = NativeParquetDataFileWriter.RunCopy(
+                    root, chunkRel, chunk, token, statsSchema, fieldIdsSpec: fieldIdsSpec);
+                copied.Add(new NativeParquetDataFileWriter.CopiedFile(
+                    chunkRel, one.Rows, one.Size, null, one.Stats));
+            }
+        }
         var files = new List<WrittenDataFile>(copied.Count);
         foreach (var cf in copied)
         {
@@ -1568,6 +1618,76 @@ internal static class DeltaReader
         catch (DeltaConflictException)
         {
             throw ConcurrentModification("OPTIMIZE");
+        }
+    }
+
+    /// <summary>The clustered rewrite's per-file size target: the <c>delta.targetFileSize</c> table property
+    /// (Databricks; plain bytes or a b/kb/mb/gb suffix), else 128 MiB — engineered-wood's own
+    /// <c>CompactionOptions.TargetFileSize</c> default, so clustered and bin-pack OPTIMIZE aim alike.</summary>
+    private static long ResolveTargetFileSize(IReadOnlyDictionary<string, string>? cfg)
+    {
+        const long Default = 128L * 1024 * 1024;
+        if (cfg is null || !cfg.TryGetValue("delta.targetFileSize", out var v) || string.IsNullOrWhiteSpace(v))
+        {
+            return Default;
+        }
+        v = v.Trim().ToLowerInvariant();
+        long mult = 1;
+        if (v.EndsWith("gb", StringComparison.Ordinal)) { mult = 1L << 30; v = v.Substring(0, v.Length - 2); }
+        else if (v.EndsWith("mb", StringComparison.Ordinal)) { mult = 1L << 20; v = v.Substring(0, v.Length - 2); }
+        else if (v.EndsWith("kb", StringComparison.Ordinal)) { mult = 1L << 10; v = v.Substring(0, v.Length - 2); }
+        else if (v.EndsWith("b", StringComparison.Ordinal)) { v = v.Substring(0, v.Length - 1); }
+        return long.TryParse(v.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var n) && n > 0
+            ? n * mult
+            : Default;
+    }
+
+    // One output file's slice of the shared sorted stream: yields `first`, then keeps pulling the SOURCE
+    // until the cumulative row count reaches the budget (cut at batch boundaries — no slicing, so an
+    // imported batch is never split across lifetimes). Does NOT own the source; the outer loop pulls the
+    // next file's first batch itself (null = source exhausted).
+    private sealed class BudgetedStream : IArrowArrayStream
+    {
+        private readonly IArrowArrayStream _src;
+        private readonly long _budget;
+        private readonly CancellationToken _ct;
+        private RecordBatch? _first;
+        private long _rows;
+
+        public BudgetedStream(IArrowArrayStream src, RecordBatch first, long budget, CancellationToken ct)
+        {
+            _src = src;
+            _first = first;
+            _budget = budget;
+            _ct = ct;
+        }
+
+        public Schema Schema => _src.Schema;
+
+        public ValueTask<RecordBatch?> ReadNextRecordBatchAsync(CancellationToken cancellationToken = default)
+        {
+            if (_first is { } f)
+            {
+                _first = null;
+                _rows = f.Length;
+                return new ValueTask<RecordBatch?>(f);
+            }
+            if (_rows >= _budget)
+            {
+                return new ValueTask<RecordBatch?>((RecordBatch?)null);
+            }
+            var next = _src.ReadNextRecordBatchAsync(_ct).AsTask().GetAwaiter().GetResult();
+            if (next is not null)
+            {
+                _rows += next.Length;
+            }
+            return new ValueTask<RecordBatch?>(next);
+        }
+
+        public void Dispose()
+        {
+            _first?.Dispose();
+            _first = null;
         }
     }
 

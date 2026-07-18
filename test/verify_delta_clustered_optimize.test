@@ -235,7 +235,57 @@ WHERE content LIKE '%"clusteringProvider"%';
 0
 
 # ============================================================================
-# 5. a plain (non-clustered) table still bin-packs as before
+# 5. MULTI-FILE recluster: delta.targetFileSize splits the clustered output into
+#    contiguous cluster ranges — sequential per-file COPYs cut at batch boundaries
+#    (DuckDB's own FILE_SIZE_BYTES rotation does NOT preserve order — parallel sink)
+# ============================================================================
+
+statement ok
+CREATE TABLE lake.main.m1 SORTED BY (id) AS
+SELECT (r * 91) % 40000 AS id, 'x' || r AS v FROM range(40000) t(r);
+
+statement ok
+INSERT INTO lake.main.m1 SELECT (r * 17) % 40000, 'y' || r FROM range(40000, 80000) t(r);
+
+statement ok
+SELECT * FROM fabricator_delta_set_tblproperties('lake', 'main.m1', '{"delta.targetFileSize":"100kb"}');
+
+query I
+SELECT fabricator_exec('lake', 'OPTIMIZE main.m1');
+----
+0
+
+query II
+SELECT count(*), count(DISTINCT rowid >> 40) > 1 FROM lake.main.m1;
+----
+80000	true
+
+# EVERY output file carries the clusteringProvider tag (adds in the OPTIMIZE commit == active files)
+query I
+SELECT (length(content) - length(replace(content, '"clusteringProvider"', ''))) / length('"clusteringProvider"')
+       = (SELECT count(DISTINCT rowid >> 40) FROM lake.main.m1)
+FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/clustopt/m1/_delta_log/*.json')
+WHERE content LIKE '%"clusteringProvider"%';
+----
+true
+
+# per-file order is nondecreasing (tie-tolerant)
+query I
+WITH o AS (SELECT id, lag(id) OVER (PARTITION BY rowid >> 40 ORDER BY rowid) AS p FROM lake.main.m1)
+SELECT count(*) FROM o WHERE p IS NOT NULL AND p > id;
+----
+0
+
+# the files are CONTIGUOUS cluster ranges: no two files' [min,max] strictly interleave
+# (a shared boundary value from a tie is a touch, not an overlap)
+query I
+WITH r AS (SELECT rowid >> 40 AS f, min(id) AS mn, max(id) AS mx FROM lake.main.m1 GROUP BY 1)
+SELECT count(*) FROM r a JOIN r b ON a.f < b.f AND a.mn < b.mx AND b.mn < a.mx;
+----
+0
+
+# ============================================================================
+# 6. a plain (non-clustered) table still bin-packs as before
 # ============================================================================
 
 statement ok
