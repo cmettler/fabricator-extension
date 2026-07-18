@@ -1557,10 +1557,13 @@ internal static class DeltaReader
         // File split: ONE output file when the estimated output fits the target (the zero-crossing fast
         // path — the whole rewrite runs inside one COPY), else SEQUENTIAL per-file COPYs cut at batch
         // boundaries so every output file is a CONTIGUOUS cluster range with tight min/max on all keys.
-        // DuckDB's own FILE_SIZE_BYTES rotation is NOT usable here — the size-rotated sink writes from
-        // parallel threads and does NOT preserve the query's order (probed: interleaved ranges + in-file
-        // inversions), which would defeat the clustering. Rows-per-file is estimated from the source
-        // files' own add stats (bytes-per-row of the same data).
+        // DuckDB's own FILE_SIZE_BYTES rotation is NOT usable here: the planner FORCE-disables order
+        // preservation for any rotated/per-thread/partitioned COPY regardless of the
+        // preserve_insertion_order setting, and the explicit PRESERVE_ORDER option THROWS with these
+        // parameters (plan_copy_to_file.cpp — "PRESERVE_ORDER is not supported with these parameters"),
+        // so the parallel sink interleaves the query's order across the rotating files (probed:
+        // interleaved ranges + in-file inversions), which would defeat the clustering. Rows-per-file is
+        // estimated from the source files' own add stats (bytes-per-row of the same data).
         string root = ToReadableRoot(path);
         long targetBytes = ResolveTargetFileSize(snap.Metadata.Configuration);
         long estBytes = 0, estRows = 0;

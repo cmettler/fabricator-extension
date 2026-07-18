@@ -332,9 +332,11 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   each a CONTIGUOUS cluster range (tight per-file min/max on all keys = the actual file-skipping payoff).
   Target = the `delta.targetFileSize` table property (Databricks; plain bytes or b/kb/mb/gb suffix) else
   128 MiB (== EW `CompactionOptions.TargetFileSize`, so clustered + bin-pack aim alike). **DuckDB's own
-  COPY `FILE_SIZE_BYTES` rotation is UNUSABLE for this — probed: the size-rotated sink writes from
-  parallel threads and does NOT preserve the query's order** (in-file inversions + interleaved ranges +
-  a 0-row trailing file) — so the split is OURS: single-file fast path when the estimated output fits
+  COPY `FILE_SIZE_BYTES` rotation is UNUSABLE for this — a HARD incompatibility, not a tunable: the
+  planner FORCE-disables order preservation for any rotated/per-thread/partitioned COPY regardless of
+  `preserve_insertion_order`, and the explicit `PRESERVE_ORDER` COPY option THROWS with these parameters
+  (`plan_copy_to_file.cpp:27-34`); probed: the parallel sink interleaves order across the rotating files**
+  (in-file inversions + interleaved ranges + a 0-row trailing file) — so the split is OURS: single-file fast path when the estimated output fits
   (~1.25× target; the whole rewrite stays ONE zero-crossing COPY), else the sorted stream comes back over
   `HostFs.Query` and SEQUENTIAL per-file `RunCopy`s cut at BATCH boundaries (`BudgetedStream` — no
   slicing, no lifetime hazards; rows-per-file estimated from the source adds' own bytes/rows stats).
