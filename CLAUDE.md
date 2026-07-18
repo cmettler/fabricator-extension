@@ -274,7 +274,27 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   exact, deleted ids invisible, **clusteringColumns intact in DESCRIBE DETAIL**, and a further Spark
   OPTIMIZE reclusters incl. our unclustered files. Remaining liquid follow-ups (not started): writing
   CLUSTERED files ourselves (hilbert_index layout in OPTIMIZE + `clusteringProvider` tagging),
-  `delta.clustering`-aware CREATE (declare clustering at create), ZCube incremental recluster.
+  ZCube incremental recluster.
+  **CLUSTERING-AWARE CREATE — DONE (2026-07-18, EW `13f7fce` local + Bridge pass-through): `SORTED BY`
+  now also DECLARES the table liquid-clustered.** EW `CreateAsync`/`OpenOrCreateAsync` gained
+  `clusteringColumns` (writer-v7 `clustering` + its `domainMetadata` dependency + the `delta.clustering`
+  domain in commit-0, byte-shaped like Spark's captured live form
+  `{"clusteringColumns":[["a"],["b"]],"domainName":"delta.clustering"}`); `DeltaWriter` passes
+  `clusteringColumns: sortedBy` at all three `OpenOrCreateAsync` sites — so a SORTED BY create is both
+  physically ordered AND advertises the clustering spec Spark's OPTIMIZE consumes. **SPEC FINDING (cost a
+  live None.get crash): the domain stores PHYSICAL column names.** OSS Spark's `ClusteringColumnInfo.apply`
+  (`ClusteringColumn.scala:97`, via `extractLogicalNames`) resolves the domain's paths against the schema's
+  PHYSICAL names — under our default `column_mapping 'name'` a logical-named domain made `DESCRIBE DETAIL`
+  AND `OPTIMIZE` crash with `None.get` (reads + INSERTs worked — only the clustering-info resolution
+  failed; the Spark-created reference table had no mapping so logical==physical masked it). Fix in EW:
+  callers supply LOGICAL names, CreateAsync resolves each through the mapping-assigned schema
+  (`ColumnMapping.GetPhysicalName`; unknown column → clear DeltaFormatException). EW `ClusteredTableTests`
+  now 6 (mapped-create physical-name pin + unknown-column throw; Table.Tests 188). **VALIDATED LIVE
+  (sparkprobe `verifyoursorted`):** our `CREATE TABLE lake.dbo.fabricator_sorted SORTED BY (grp,id) AS …`
+  (5000 rows, name-mapped, physical-name domain) → Spark `DESCRIBE DETAIL` shows
+  `clusteringColumns ["grp","id"]` + tableFeatures incl. clustering, **Spark OPTIMIZE runs its CLUSTERING
+  strategy** (clusteringStats + per-column clusteringQuality grp/id "ok"; no rewrite — the single file is
+  already sorted), counts exact, Spark INSERT works.
 - **`SORTED BY` → Delta ORDERED (clustered) writes — DONE (2026-07-18, C#-only, no ABI).** The v52 native
   clause (`CREATE TABLE lake.s.t SORTED BY (a,b) [AS …]` — `sort_columns` already crossed the ABI to
   `create_table`/`begin_bulk`; Delta previously ignored it) now drives the Delta provider:

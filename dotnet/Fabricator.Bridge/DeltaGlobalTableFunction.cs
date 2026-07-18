@@ -555,7 +555,8 @@ internal static class DeltaWriter
                                                      partitionColumns: spec?.PartitionColumns,
                                                      configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, serializable, sortedBy),
                                                      columnMappingMode: columnMapping,
-                                                     cancellationToken: ct).ConfigureAwait(false);
+                                                     cancellationToken: ct,
+                                                     clusteringColumns: sortedBy).ConfigureAwait(false);
             try
             {
                 // NOT NULL enforcement: an APPEND into an existing table must honor its declared nullability
@@ -781,7 +782,8 @@ internal static class DeltaWriter
             partitionColumns: spec?.PartitionColumns,   // set on a partitioned CTAS create; ignored for an INSERT
             configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, serializable, sortedBy),
             columnMappingMode: columnMapping,
-            cancellationToken: default).ConfigureAwait(false);
+            cancellationToken: default,
+            clusteringColumns: sortedBy).ConfigureAwait(false);
         try
         {
             // Fall back BEFORE writing any file / touching the log (so a fallback leaves no orphan): a table
@@ -1191,7 +1193,8 @@ internal static class DeltaWriter
                                                          configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, serializable, sortedBy),
                                                          columnMappingMode: columnMapping,
                                                          preAssignedSchema: preAssignedSchema,
-                                                         cancellationToken: ct).ConfigureAwait(false);
+                                                         cancellationToken: ct,
+                                                         clusteringColumns: sortedBy).ConfigureAwait(false);
                 await table.DisposeAsync().ConfigureAwait(false);
                 Log.LogDebug("delta create {Path}: opened/created (commit-0 if new)", path);
                 return;
