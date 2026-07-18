@@ -259,10 +259,22 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   neighbors in EVERY clustering key → tight per-file/row-group min-max on all keys → stats skipping for any
   predicate subset (pre-bucket with `width_bucket`). `test/verify_hilbert_index.test` (27 — full-grid
   unit-step property pins 2D+3D = the defining Hilbert property, U-order literals, clamp/NULL/errors, 100k
-  ordered CTAS); global_functions 63 unregressed. NOT yet (possible follow-ups): the `clustering` writer
-  feature allowlist in EW (writes to Databricks liquid-clustered tables — appends are legal unclustered;
-  EW models only `AddFile.ClusteringProvider` today), `delta.clustering` domainMetadata, ZCube
-  incremental OPTIMIZE.
+  ordered CTAS); global_functions 63 unregressed.
+  **WRITES TO LIQUID-CLUSTERED TABLES — DONE (2026-07-18, EW-only, local commit): the `clustering` writer
+  feature is allowlisted in EW `ProtocolVersions.SupportedWriterFeatures`** — previously EVERY write to a
+  Databricks/Fabric-Spark `CREATE TABLE … CLUSTER BY` table failed with "unsupported writer features:
+  [clustering]". The feature is advisory LAYOUT (the spec permits plain unclustered appends/DML; a later
+  clustering OPTIMIZE reclusters them), and the preservation obligations were ALREADY met (the
+  `delta.clustering` domainMetadata survives commits AND checkpoints — SnapshotBuilder/CheckpointWriter
+  carry all domains; `add.clusteringProvider` round-trips). EW `ClusteredTableTests` (3 — synthetic
+  clustered log append, domain-survives-checkpoint, provider round-trip; Table.Tests 185). **VALIDATED
+  LIVE (Fabric Spark 4.1, sparkprobe `createclustered`/`verifyclustered`):** Spark `CLUSTER BY (grp,id)`
+  create + OPTIMIZE (8 clustered files, reader v3/writer v7 with clustering+DV+domainMetadata) → OUR
+  append (500 rows) + DV DELETE (id%100) on `lake.dbo.fabricator_clustered` → Spark reads 1485/1/1499
+  exact, deleted ids invisible, **clusteringColumns intact in DESCRIBE DETAIL**, and a further Spark
+  OPTIMIZE reclusters incl. our unclustered files. Remaining liquid follow-ups (not started): writing
+  CLUSTERED files ourselves (hilbert_index layout in OPTIMIZE + `clusteringProvider` tagging),
+  `delta.clustering`-aware CREATE (declare clustering at create), ZCube incremental recluster.
 - **`SORTED BY` → Delta ORDERED (clustered) writes — DONE (2026-07-18, C#-only, no ABI).** The v52 native
   clause (`CREATE TABLE lake.s.t SORTED BY (a,b) [AS …]` — `sort_columns` already crossed the ABI to
   `create_table`/`begin_bulk`; Delta previously ignored it) now drives the Delta provider:
