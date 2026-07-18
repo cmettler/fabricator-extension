@@ -105,6 +105,29 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
     }
 
     /// <summary>
+    /// One COPY whose source is a raw SQL text instead of a bound Arrow stream — the clustered-OPTIMIZE
+    /// rewrite: <c>COPY (&lt;sourceSql&gt;) TO '&lt;root&gt;/&lt;relativePath&gt;'</c>, so the read (per-file
+    /// UNION ALL), the global ORDER BY (DuckDB's spilling sort) and the parquet write all run inside ONE
+    /// host query — the data never crosses the C ABI. The caller renders any logical→physical renames and
+    /// the ORDER BY into <paramref name="sourceSql"/> itself; <paramref name="statsSchema"/> (physical
+    /// names, user columns only — row-tracking columns excluded) drives the Delta stats JSON.
+    /// </summary>
+    internal static List<CopiedFile> RunCopySql(
+        string writableRoot, string relativePath, string sourceSql, CancellationToken ct,
+        Schema? statsSchema, string? fieldIdsSpec = null)
+    {
+        var rel = relativePath.Replace('\\', '/').TrimStart('/');
+        var uri = writableRoot + "/" + rel;
+        var sql =
+            $"COPY ({sourceSql}) TO '{uri.Replace("'", "''")}' " +
+            "(FORMAT parquet, WRITE_BLOOM_FILTER true, RETURN_STATS"
+            + (fieldIdsSpec is not null ? ", FIELD_IDS " + fieldIdsSpec : "") + ")";
+        Log.LogInformation("delta native clustered copy {Uri}", uri);
+        using var result = Host.Query(sql);
+        return ReadFileStats(result, ct, statsSchema, writableRoot);
+    }
+
+    /// <summary>
     /// STREAMING partitioned write: streams <paramref name="src"/> into DuckDB's native <c>COPY … TO
     /// '&lt;root&gt;' (FORMAT parquet, PARTITION_BY (cols), APPEND true, FILENAME_PATTERN '{uuid}', RETURN_STATS)</c>
     /// — DuckDB produces the Hive <c>col=val/&lt;uuid&gt;.parquet</c> layout in one pull-based pass (bounded memory),

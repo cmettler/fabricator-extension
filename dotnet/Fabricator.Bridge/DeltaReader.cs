@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -237,6 +238,22 @@ internal static class DeltaReader
             var snap = unit is null
                 ? table.CurrentSnapshot
                 : await ResolveSnapshotAsync(table, unit, value ?? "", default).ConfigureAwait(false);
+            return await BuildNativeScanListAsync(fs, path, snap, prune, log, schemaOverride).ConfigureAwait(false);
+        }
+        finally
+        {
+            await table.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    // The post-open core of ListNativeScanFilesAsync, callable against an ALREADY-OPEN table's snapshot —
+    // the clustered-OPTIMIZE rewrite lists against the SAME snapshot its commit pins (expectedVersion), so
+    // a writer landing between two separate opens can't produce a spurious conflict.
+    private static async Task<NativeScanList> BuildNativeScanListAsync(
+        EngineeredWood.IO.ITableFileSystem fs, string path, EngineeredWood.DeltaLake.Snapshot.Snapshot snap,
+        Predicate? prune, ILogger log, EngineeredWood.DeltaLake.Schema.StructType? schemaOverride)
+    {
+        {
             // schemaOverride: a buffered transaction's PENDING (ALTERed) schema — presence handling, mapping
             // maps and pruning key off it so a pending-added column reads as typed NULL from every committed
             // file (the same machinery as committed schema evolution; no stats => pruning stays superset-safe).
@@ -322,10 +339,6 @@ internal static class DeltaReader
                 LogicalToPhysical = logicalToPhysical, LogicalToFieldId = logicalToFieldId,
                 MappedSchema = mappedSchema, TableSchema = schemaForMaps,
             };
-        }
-        finally
-        {
-            await table.DisposeAsync().ConfigureAwait(false);
         }
     }
 
@@ -1302,6 +1315,34 @@ internal static class DeltaReader
             .ConfigureAwait(false);
         try
         {
+            if (fileReader is not null && table.CurrentSnapshot.Metadata.PartitionColumns.Count > 0)
+            {
+                // PRE-EXISTING GAP (found by the clustered-OPTIMIZE tests): the IDataFileReader seam returns
+                // per-file RAW batches WITHOUT the partition columns (they're not in the parquet), which
+                // misaligns engineered-wood's compaction pipeline on a PARTITIONED table
+                // (index-out-of-bounds; SIGSEGV when the writer seam consumes the misaligned batch).
+                // Reopen without the reader seam — EW's own reader re-adds partition columns correctly;
+                // the native WRITER seam keeps the output quality. DV DELETE/UPDATE are unaffected
+                // (merge-on-read; no seam-read rewrite on partitioned tables).
+                await table.DisposeAsync().ConfigureAwait(false);
+                table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(dataFileWriter: writer), token)
+                    .ConfigureAwait(false);
+            }
+            // A clustering-declared table (the delta.clustering domain, else the fabricator.sortedBy property)
+            // RECLUSTERS instead of bin-packing when the native writer is available: ONE host query reads every
+            // active file (DV rows excluded), globally re-orders — hilbert_index over ntile range-buckets for
+            // 2+ keys (Spark's range_partition_id shape, type-agnostic), plain ORDER BY for one — and COPYs the
+            // clustered file; ONE dataChange=false commit swaps the active set, tagging add.clusteringProvider.
+            // DuckDB's spilling sort does the reorder, so the rewrite streams (data never crosses the C ABI).
+            var clusterCols = writer is not null ? ResolveClusteringColumns(table) : null;
+            if (clusterCols is { Count: > 0 } && ClusteredRewriteEligible(table))
+            {
+                long? cv = await ClusteredRewriteAsync(fs, path, table, clusterCols, token).ConfigureAwait(false);
+                DmlLog.LogInformation("delta optimize {Path}: {Result} clustered by [{Cols}]", path,
+                    cv.HasValue ? $"reclustered → v{cv.Value}" : "nothing to recluster",
+                    string.Join(",", clusterCols));
+                return 0;
+            }
             var v = await table.CompactAsync(null, token).ConfigureAwait(false);
             DmlLog.LogInformation("delta optimize {Path}: {Result} writer={Writer}", path,
                 v.HasValue ? $"compacted → v{v.Value}" : "nothing to compact",
@@ -1311,6 +1352,222 @@ internal static class DeltaReader
         finally
         {
             await table.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>The table's clustering key as LOGICAL column names, or null when the table declares none (or
+    /// the declaration isn't usable — nested clustering paths, an unknown column). Sources, in order: the
+    /// <c>delta.clustering</c> domain (authoritative; stores PHYSICAL names — resolved back through the mapped
+    /// schema), else the <c>fabricator.sortedBy</c> property (tables created by SORTED BY before the domain
+    /// declaration existed).</summary>
+    private static IReadOnlyList<string>? ResolveClusteringColumns(DeltaTable table)
+    {
+        var snap = table.CurrentSnapshot;
+        var mode = EngineeredWood.DeltaLake.Schema.ColumnMapping.GetMode(snap.Metadata.Configuration);
+        if (snap.DomainMetadata.TryGetValue("delta.clustering", out var dm)
+            && dm is { Removed: false, Configuration: { Length: > 0 } cfgJson })
+        {
+            try
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(cfgJson);
+                if (doc.RootElement.TryGetProperty("clusteringColumns", out var colsEl)
+                    && colsEl.ValueKind == System.Text.Json.JsonValueKind.Array)
+                {
+                    var result = new List<string>();
+                    foreach (var pathEl in colsEl.EnumerateArray())
+                    {
+                        if (pathEl.ValueKind != System.Text.Json.JsonValueKind.Array || pathEl.GetArrayLength() != 1)
+                        {
+                            return null; // a NESTED clustering column — not supported, keep bin-pack
+                        }
+                        string stored = pathEl[0].GetString() ?? "";
+                        string? logical = null;
+                        foreach (var f in snap.Schema.Fields)
+                        {
+                            if (string.Equals(EngineeredWood.DeltaLake.Schema.ColumnMapping.GetPhysicalName(f, mode),
+                                              stored, StringComparison.Ordinal)
+                                || string.Equals(f.Name, stored, StringComparison.Ordinal))
+                            {
+                                logical = f.Name;
+                                break;
+                            }
+                        }
+                        if (logical is null)
+                        {
+                            return null; // stale/foreign declaration — never guess
+                        }
+                        result.Add(logical);
+                    }
+                    if (result.Count > 0)
+                    {
+                        return result;
+                    }
+                }
+            }
+            catch (System.Text.Json.JsonException)
+            {
+                return null;
+            }
+        }
+        if (snap.Metadata.Configuration is { } cfg
+            && cfg.TryGetValue(DeltaWriter.SortedByKey, out var sortedJson)
+            && DeltaWriter.ParseSortedBy(sortedJson) is { Count: > 0 } sorted)
+        {
+            var result = new List<string>(sorted.Count);
+            foreach (var c in sorted)
+            {
+                var f = snap.Schema.Fields.FirstOrDefault(
+                    x => string.Equals(x.Name, c, StringComparison.OrdinalIgnoreCase));
+                if (f is null)
+                {
+                    return null; // persisted column no longer in the schema
+                }
+                result.Add(f.Name);
+            }
+            return result;
+        }
+        return null;
+    }
+
+    // Shapes the clustered SQL rewrite can't serve — they fall back to bin-pack CompactAsync (which handles
+    // them via the reader/writer seams): partitioned tables (liquid clustering is unpartitioned by definition),
+    // identity/IcebergCompat (need engineered-wood's committing writer), variant columns (the tagged-blob
+    // transport isn't read_parquet-representable), and nested columns under column mapping (the recursive
+    // physical rename has no hook inside one SQL statement).
+    private static bool ClusteredRewriteEligible(DeltaTable table)
+    {
+        var snap = table.CurrentSnapshot;
+        if (snap.Metadata.PartitionColumns.Count > 0 || !table.SupportsExternalDataFileCommit)
+        {
+            return false;
+        }
+        var mode = EngineeredWood.DeltaLake.Schema.ColumnMapping.GetMode(snap.Metadata.Configuration);
+        foreach (var f in snap.Schema.Fields)
+        {
+            if (HasVariant(f.Type))
+            {
+                return false;
+            }
+            if (mode != EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None
+                && f.Type is not EngineeredWood.DeltaLake.Schema.PrimitiveType)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static bool HasVariant(EngineeredWood.DeltaLake.Schema.DeltaDataType t) => t switch
+    {
+        EngineeredWood.DeltaLake.Schema.PrimitiveType p =>
+            string.Equals(p.TypeName, "variant", StringComparison.OrdinalIgnoreCase),
+        EngineeredWood.DeltaLake.Schema.StructType st => st.Fields.Any(f => HasVariant(f.Type)),
+        EngineeredWood.DeltaLake.Schema.ArrayType a => HasVariant(a.ElementType),
+        EngineeredWood.DeltaLake.Schema.MapType m => HasVariant(m.KeyType) || HasVariant(m.ValueType),
+        _ => false,
+    };
+
+    private static async Task<long?> ClusteredRewriteAsync(
+        ITableFileSystem fs, string path, DeltaTable table,
+        IReadOnlyList<string> clusterCols, CancellationToken token)
+    {
+        var snap = table.CurrentSnapshot;
+        // List against the OPEN table's own snapshot (not a second open) so the commit's expectedVersion is
+        // exactly the version the rewrite read — a concurrent commit conflicts cleanly instead of racing.
+        var listing = await BuildNativeScanListAsync(fs, path, snap, prune: null, DmlLog, schemaOverride: null)
+            .ConfigureAwait(false);
+        bool anyDv = listing.Files.Any(f => f.Dv.Length > 0);
+        if (listing.Files.Count == 0 || (listing.Files.Count == 1 && !anyDv))
+        {
+            return null; // one DV-less file IS one contiguous clustered range — no-op (Spark parity)
+        }
+        var mode = EngineeredWood.DeltaLake.Schema.ColumnMapping.GetMode(snap.Metadata.Configuration);
+        // Every user column (logical names), plus the materialized row-tracking pair when the table declares
+        // them — the per-file COALESCE(materialized, baseRowId + position) bakes each row's ORIGINAL stable
+        // id/version into the clustered file (the compaction preservation rule).
+        bool materializeIds = snap.Metadata.Configuration is { } rtCfg
+            && rtCfg.TryGetValue("delta.rowTracking.materializedRowIdColumnName", out var mrc)
+            && string.Equals(mrc, DeltaNativeReader.RowTrackingIdColumn, StringComparison.Ordinal)
+            && rtCfg.TryGetValue("delta.rowTracking.materializedRowCommitVersionColumnName", out var mvc)
+            && string.Equals(mvc, DeltaNativeReader.RowTrackingVersionColumn, StringComparison.Ordinal);
+        var dataCols = new List<string>(snap.Schema.Fields.Count + 2);
+        foreach (var f in snap.Schema.Fields)
+        {
+            dataCols.Add(f.Name);
+        }
+        if (materializeIds)
+        {
+            dataCols.Add(DeltaNativeReader.RowTrackingIdColumn);
+            dataCols.Add(DeltaNativeReader.RowTrackingVersionColumn);
+        }
+        string inner = DeltaNativeReader.FullTableSql(listing, dataCols);
+
+        // The outermost projection renames logical → physical for the written file (data files carry physical
+        // names in BOTH mapping modes); the row-tracking columns keep their literal, unmapped names.
+        static string Q(string s) => "\"" + s.Replace("\"", "\"\"") + "\"";
+        var select = new List<string>(dataCols.Count);
+        foreach (var c in dataCols)
+        {
+            var f = snap.Schema.Fields.FirstOrDefault(x => string.Equals(x.Name, c, StringComparison.Ordinal));
+            string phys = f is null ? c : EngineeredWood.DeltaLake.Schema.ColumnMapping.GetPhysicalName(f, mode);
+            select.Add(string.Equals(phys, c, StringComparison.Ordinal) ? Q(c) : $"{Q(c)} AS {Q(phys)}");
+        }
+        string projection = string.Join(", ", select);
+        string source;
+        int bits = clusterCols.Count > 1 ? Math.Min(15, 63 / clusterCols.Count) : 0;
+        if (clusterCols.Count == 1 || bits < 1)
+        {
+            // One key (or a degenerate >63-key spec): plain lexicographic order — hilbert n=1 is the identity.
+            source = $"SELECT {projection} FROM ({inner}) ORDER BY "
+                     + string.Join(", ", clusterCols.Select(Q));
+        }
+        else
+        {
+            // Hilbert over per-key ntile range-buckets: rank-based bucketing is type-agnostic (strings, dates —
+            // no 63-bit truncation) and derives the value distribution from the data itself, exactly Spark's
+            // range_partition_id approach. Consecutive output rows are hilbert-neighbors in EVERY key.
+            long buckets = 1L << bits;
+            var tiles = new List<string>(clusterCols.Count);
+            var coords = new List<string>(clusterCols.Count);
+            for (int i = 0; i < clusterCols.Count; i++)
+            {
+                tiles.Add($"ntile({buckets.ToString(CultureInfo.InvariantCulture)}) OVER (ORDER BY {Q(clusterCols[i])}) - 1 AS __fabricator_h{i}");
+                coords.Add($"__fabricator_h{i}");
+            }
+            source = $"SELECT {projection} FROM (SELECT *, {string.Join(", ", tiles)} FROM ({inner})) "
+                     + $"ORDER BY hilbert_index([{string.Join(", ", coords)}], {bits})";
+        }
+
+        // Stats schema: PHYSICAL names, USER columns only — the row-tracking columns stay out of the Delta
+        // stats (the established materialized-column convention).
+        var arrow = EngineeredWood.DeltaLake.Schema.SchemaConverter.ToArrowSchema(snap.Schema);
+        var statsFields = new List<Field>(snap.Schema.Fields.Count);
+        for (int i = 0; i < snap.Schema.Fields.Count; i++)
+        {
+            statsFields.Add(new Field(
+                EngineeredWood.DeltaLake.Schema.ColumnMapping.GetPhysicalName(snap.Schema.Fields[i], mode),
+                arrow.FieldsList[i].DataType, nullable: true));
+        }
+        var statsSchema = new Schema(statsFields, null);
+        string? fieldIdsSpec = DeltaWriter.BuildFieldIdsSpec(snap.Schema, null);
+
+        string rel = $"{Guid.NewGuid():N}.parquet";
+        var copied = NativeParquetDataFileWriter.RunCopySql(
+            ToReadableRoot(path), rel, source, token, statsSchema, fieldIdsSpec);
+        var files = new List<WrittenDataFile>(copied.Count);
+        foreach (var cf in copied)
+        {
+            files.Add(new WrittenDataFile(cf.RelativePath, cf.Size, cf.Rows, null, cf.Stats));
+        }
+        try
+        {
+            return await table.CommitDataFilesAsync(files, DeltaWriteMode.Overwrite,
+                cancellationToken: token, expectedVersion: listing.Version, operation: "OPTIMIZE",
+                dataChange: false, clusteringProvider: "liquid").ConfigureAwait(false);
+        }
+        catch (DeltaConflictException)
+        {
+            throw ConcurrentModification("OPTIMIZE");
         }
     }
 

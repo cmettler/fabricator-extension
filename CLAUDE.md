@@ -295,6 +295,41 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   `clusteringColumns ["grp","id"]` + tableFeatures incl. clustering, **Spark OPTIMIZE runs its CLUSTERING
   strategy** (clusteringStats + per-column clusteringQuality grp/id "ok"; no rewrite — the single file is
   already sorted), counts exact, Spark INSERT works.
+  **CLUSTERED OPTIMIZE — DONE (2026-07-18, EW seam + Bridge, no ABI): OPTIMIZE on a clustering-declared
+  table RECLUSTERS instead of bin-packing.** Detection (`DeltaReader.ResolveClusteringColumns`): the
+  `delta.clustering` domain (authoritative, PHYSICAL names → resolved to logical via the mapped schema;
+  nested paths/unknown columns → bin-pack) else `fabricator.sortedBy` (pre-domain tables). Mechanism =
+  **ONE host query, data never crosses the C ABI**: `COPY (SELECT <logical→physical renames> FROM (<UNION
+  ALL of per-file FileSql — DV rows excluded, mapping/schema-evolution/row-tracking handled>) ORDER BY …)
+  TO <uuid>.parquet (RETURN_STATS, FIELD_IDS…)` — order = `hilbert_index` over per-key
+  `ntile(2^bits) OVER (ORDER BY col)` range-buckets for 2+ keys (bits=min(15,63/k); rank-based bucketing
+  is type-agnostic — strings/dates, no 63-bit truncation — and IS Spark's range_partition_id shape;
+  1 key = plain ORDER BY), then ONE commit via EW `CommitDataFilesAsync(Overwrite, dataChange:false,
+  clusteringProvider:"liquid", expectedVersion: <the listed version>, operation:"OPTIMIZE")` — new EW
+  params: `dataChange` (removes+adds; `HonorWriterFeatures` treats dataChange=false as appendOnly-legal)
+  + `clusteringProvider` stamped on adds. Row-tracking stable ids PRESERVED: when the table declares the
+  materialized columns, `__delta_row_id`/`__delta_row_commit_version` are projected as data columns (the
+  per-file COALESCE(materialized, baseRowId+position)) and ride the sort into the clustered file (out of
+  stats; the add gets fresh baseRowId per compaction semantics). The listing runs against the OPEN
+  table's own snapshot (`BuildNativeScanListAsync`, the extracted core of ListNativeScanFiles) so
+  expectedVersion can't race; a concurrent commit → clean "retry" error. NO-OP when active = 1 DV-less
+  file (Spark parity — no commit). Gates → bin-pack fallback: no native_write, partitioned (liquid
+  clustering is unpartitioned by definition), identity/IcebergCompat, variant, nested columns under
+  mapping. **PRE-EXISTING CRASH found by the new tests: partitioned × native_read OPTIMIZE** — the
+  IDataFileReader seam returns per-file batches WITHOUT partition columns → EW compaction misaligns
+  (index-out-of-bounds; SIGSEGV with the writer seam); guarded in `OptimizeAsync` (reopen without the
+  reader seam for partitioned tables; DV DML unaffected — probed). `test/verify_delta_clustered_optimize.test`
+  (46 — 2-key hilbert order pinned via deterministic ntile recompute [unique keys] + lag monotonicity,
+  DV rows not resurrected, stable id preserved, clusteringProvider+dataChange:false commit pins, no-op
+  re-OPTIMIZE, VACUUM→1 file, 1-key lexicographic, sortedBy-only detection, partitioned+plain fallbacks);
+  regression optimize 40/sorted_by 30/native_write 147/native_read 88/partition 54/row_tracking_virtual
+  299/transactions 941/tblproperties 42/late_mat 57/dynamic_filter 21 + EW 189&168. **VALIDATED LIVE
+  (OneLake `fabricator_sorted` + sparkprobe):** 2000-row unsorted append (3 files) → our OPTIMIZE → 1
+  file, counts exact, the provider commit on OneLake; **Spark DESCRIBE DETAIL fine with our tagged file,
+  Spark OPTIMIZE judges the hilbert file clusteringQuality "ok" (avgCoverage 100) and rewrites NOTHING**,
+  Spark INSERT works. Remaining: ZCube-tagged incremental recluster (ours is full-table); multi-file
+  output via FILE_SIZE_BYTES (one output file per OPTIMIZE today); the EW-side root-cause of the
+  partitioned reader-seam gap.
 - **`SORTED BY` → Delta ORDERED (clustered) writes — DONE (2026-07-18, C#-only, no ABI).** The v52 native
   clause (`CREATE TABLE lake.s.t SORTED BY (a,b) [AS …]` — `sort_columns` already crossed the ABI to
   `create_table`/`begin_bulk`; Delta previously ignored it) now drives the Delta provider:

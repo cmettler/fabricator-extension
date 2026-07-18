@@ -394,6 +394,25 @@ internal static class DeltaNativeReader
         return sb.ToString();
     }
 
+    /// <summary>The WHOLE table as one SQL text: the per-file SELECTs (logical names, DV exclusion, column
+    /// mapping, schema-evolution backfill, partition literals, row-tracking expressions for
+    /// <see cref="RowTrackingIdColumn"/>/<see cref="RowTrackingVersionColumn"/> entries in
+    /// <paramref name="dataCols"/>) joined by UNION ALL. Serves the clustered-OPTIMIZE rewrite, which needs a
+    /// single query it can ORDER BY globally (DuckDB's spilling sort) and feed straight into a COPY —
+    /// zero boundary crossings for the data. NOT usable for nested MAPPED columns (the per-batch
+    /// <see cref="ArrowColumnMappingRename"/> has no hook inside one SQL statement — callers gate).</summary>
+    internal static string FullTableSql(DeltaReader.NativeScanList listing, IReadOnlyList<string> dataCols)
+    {
+        var parts = new List<string>(listing.Files.Count);
+        foreach (var f in listing.Files)
+        {
+            parts.Add(FileSql(dataCols, wantRowId: false, where: null, f,
+                              ResolveFileMapping(listing, f.Uri), listing.TableSchema,
+                              listing.PartitionColumns));
+        }
+        return string.Join(" UNION ALL ", parts);
+    }
+
     // Advertises the EXACT read_parquet output schema (probed via LIMIT 0 over any active file), so the streamed
     // batches match by type. With no files, derives it from the user schema (+ the rowid field).
     private static Schema ProbeSchema(DeltaReader.NativeScanList listing, Schema userSchema,

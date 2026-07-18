@@ -1,0 +1,264 @@
+# name: test/verify_delta_clustered_optimize.test
+# description: CLUSTERED OPTIMIZE — on a clustering-declared table (the delta.clustering domain a SORTED BY
+#              create writes, else the fabricator.sortedBy property) OPTIMIZE RECLUSTERS instead of
+#              bin-packing: ONE host query reads every active file (DV rows excluded), globally re-orders
+#              (hilbert_index over ntile range-buckets for 2+ keys — Spark's range_partition_id shape — or a
+#              plain ORDER BY for one key) and COPYs the clustered output; ONE dataChange=false commit swaps
+#              the active set, tagging add.clusteringProvider = "liquid" (the OSS Spark value). Row-tracking
+#              stable ids are preserved (materialized into the clustered file). Requires native_write;
+#              partitioned / identity / variant / nested-mapped tables keep the bin-pack fallback.
+# group: [fabricator]
+
+require fabricator
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+# ============================================================================
+# 1. two-key hilbert recluster (default name mapping, native_write + native_read)
+# ============================================================================
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/clustopt' AS lake (TYPE fabricator, PROVIDER 'delta', native_read true, native_write true);
+
+# GLOBALLY UNIQUE values in both cluster keys ((r*91)%15000 over r in [0,15000) is a bijection —
+# gcd(91,15000)=1) so the hilbert-order pin below can recompute the ntile buckets deterministically
+# (tied values would make the ntile assignment order-dependent).
+statement ok
+CREATE TABLE lake.main.c1 SORTED BY (grp, id) AS
+SELECT r AS grp, (r * 91) % 15000 AS id, 'v' || r AS v FROM range(5000) t(r);
+
+statement ok
+INSERT INTO lake.main.c1 SELECT r, (r * 91) % 15000, 'v' || r FROM range(5000, 10000) t(r);
+
+statement ok
+INSERT INTO lake.main.c1 SELECT r, (r * 91) % 15000, 'v' || r FROM range(10000, 15000) t(r);
+
+# three files (CTAS + 2 appends), each individually sorted but globally interleaved
+query I
+SELECT count(DISTINCT rowid >> 40) FROM lake.main.c1;
+----
+3
+
+# a DV delete before the recluster — the deleted rows must NOT resurrect
+statement ok
+DELETE FROM lake.main.c1 WHERE grp % 100 = 7;
+
+query I
+SELECT count(*) FROM lake.main.c1;
+----
+14850
+
+# capture a known row's stable id pre-recluster (grp is unique => one row)
+query I
+SELECT __delta_row_id FROM lake.main.c1 WHERE grp = 4242;
+----
+4242
+
+# ----------------------------------------------------------------------------
+# RECLUSTER
+# ----------------------------------------------------------------------------
+
+query I
+SELECT fabricator_exec('lake', 'OPTIMIZE main.c1');
+----
+0
+
+# data exact, deleted rows still absent
+query II
+SELECT count(*), count(*) FILTER (WHERE grp % 100 = 7) FROM lake.main.c1;
+----
+14850	0
+
+# ONE active file now
+query I
+SELECT count(DISTINCT rowid >> 40) FROM lake.main.c1;
+----
+1
+
+# the stable row id survived the rewrite (materialized into the clustered file)
+query I
+SELECT __delta_row_id FROM lake.main.c1 WHERE grp = 4242;
+----
+4242
+
+# the commit is a REWRITE: operation OPTIMIZE, dataChange=false on removes AND adds, clusteringProvider
+# tagged on the add (the OSS Spark "liquid" value)
+query I
+SELECT count(*) FROM fabricator_delta_snapshots('lake', 'main.c1') WHERE operation = 'OPTIMIZE';
+----
+1
+
+query I
+SELECT count(*) FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/clustopt/c1/_delta_log/*.json')
+WHERE content LIKE '%"clusteringProvider":"liquid"%'
+  AND content LIKE '%"dataChange":false%';
+----
+1
+
+# no OTHER commit carries a clusteringProvider (only the recluster tags)
+query I
+SELECT count(*) FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/clustopt/c1/_delta_log/*.json')
+WHERE content LIKE '%"clusteringProvider"%';
+----
+1
+
+# HILBERT ORDER inside the clustered file: recompute the same ntile(2^15) range-buckets over the same
+# (unique-keyed) rows — the file's row order (rowid = position) must be nondecreasing in hilbert_index.
+query I
+WITH h AS (
+    SELECT rowid AS rid,
+           hilbert_index([ntile(32768) OVER (ORDER BY grp) - 1,
+                          ntile(32768) OVER (ORDER BY id) - 1], 15) AS hv
+    FROM lake.main.c1
+)
+SELECT count(*) FROM (SELECT hv, lag(hv) OVER (ORDER BY rid) AS ph FROM h) WHERE ph IS NOT NULL AND ph > hv;
+----
+0
+
+# re-OPTIMIZE on the single DV-less clustered file is a NO-OP (no new commit — Spark parity):
+# the OPTIMIZE commit stays the LATEST version and stays the only one
+query I
+SELECT fabricator_exec('lake', 'OPTIMIZE main.c1');
+----
+0
+
+query II
+SELECT count(*) FILTER (WHERE operation = 'OPTIMIZE'),
+       count(*) FILTER (WHERE operation = 'OPTIMIZE' AND version = (SELECT max(version) FROM fabricator_delta_snapshots('lake', 'main.c1')))
+FROM fabricator_delta_snapshots('lake', 'main.c1');
+----
+1	1
+
+# the old files are tombstones — VACUUM sweeps them, exactly one data file remains on disk
+# (a non-dry-run VACUUM also writes the VACUUM START/END history commits)
+query I
+SELECT fabricator_exec('lake', 'VACUUM main.c1 RETAIN 0 HOURS');
+----
+3
+
+query I
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/clustopt/c1/*.parquet');
+----
+1
+
+# ============================================================================
+# 2. single-key recluster = strict lexicographic order
+# ============================================================================
+
+statement ok
+CREATE TABLE lake.main.c2 SORTED BY (id) AS
+SELECT (r * 91) % 3000 AS id, r AS payload FROM range(3000) t(r);
+
+statement ok
+INSERT INTO lake.main.c2 SELECT (r * 17) % 3000, r FROM range(3000, 6000) t(r);
+
+query I
+SELECT fabricator_exec('lake', 'OPTIMIZE main.c2');
+----
+0
+
+query I
+SELECT count(DISTINCT rowid >> 40) FROM lake.main.c2;
+----
+1
+
+# strictly nondecreasing on id in file order (tie-tolerant)
+query I
+WITH o AS (SELECT id, lag(id) OVER (ORDER BY rowid) AS p FROM lake.main.c2)
+SELECT count(*) FROM o WHERE p IS NOT NULL AND p > id;
+----
+0
+
+query I
+SELECT count(*) FROM lake.main.c2;
+----
+6000
+
+# ============================================================================
+# 3. fabricator.sortedBy WITHOUT the domain (older tables) also drives the recluster
+# ============================================================================
+
+statement ok
+CREATE TABLE lake.main.c3 AS SELECT (r * 7) % 500 AS k, r AS payload FROM range(2000) t(r);
+
+statement ok
+INSERT INTO lake.main.c3 SELECT (r * 13) % 500, r FROM range(2000, 4000) t(r);
+
+statement ok
+SELECT * FROM fabricator_delta_set_tblproperties('lake', 'main.c3', '{"fabricator.sortedBy":"[\"k\"]"}');
+
+query I
+SELECT fabricator_exec('lake', 'OPTIMIZE main.c3');
+----
+0
+
+query I
+SELECT count(*) FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/clustopt/c3/_delta_log/*.json')
+WHERE content LIKE '%"clusteringProvider":"liquid"%';
+----
+1
+
+query I
+WITH o AS (SELECT k, lag(k) OVER (ORDER BY rowid) AS p FROM lake.main.c3)
+SELECT count(*) FROM o WHERE p IS NOT NULL AND p > k;
+----
+0
+
+# ============================================================================
+# 4. guard: a PARTITIONED table keeps the bin-pack fallback (no clusteringProvider)
+# ============================================================================
+
+statement ok
+CREATE TABLE lake.main.p1 PARTITIONED BY (region) AS
+SELECT ['US','EU','APAC'][(r % 3) + 1] AS region, r AS id FROM range(600) t(r);
+
+statement ok
+INSERT INTO lake.main.p1 SELECT ['US','EU','APAC'][(r % 3) + 1], r FROM range(600, 1200) t(r);
+
+statement ok
+SELECT * FROM fabricator_delta_set_tblproperties('lake', 'main.p1', '{"fabricator.sortedBy":"[\"id\"]"}');
+
+query I
+SELECT fabricator_exec('lake', 'OPTIMIZE main.p1');
+----
+0
+
+query I
+SELECT count(*) FROM lake.main.p1;
+----
+1200
+
+query I
+SELECT count(*) FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/clustopt/p1/_delta_log/*.json')
+WHERE content LIKE '%"clusteringProvider"%';
+----
+0
+
+# ============================================================================
+# 5. a plain (non-clustered) table still bin-packs as before
+# ============================================================================
+
+statement ok
+CREATE TABLE lake.main.n1 AS SELECT r AS id FROM range(1000) t(r);
+
+statement ok
+INSERT INTO lake.main.n1 SELECT r FROM range(1000, 2000) t(r);
+
+query I
+SELECT fabricator_exec('lake', 'OPTIMIZE main.n1');
+----
+0
+
+query I
+SELECT count(*) FROM lake.main.n1;
+----
+2000
+
+query I
+SELECT count(*) FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/clustopt/n1/_delta_log/*.json')
+WHERE content LIKE '%"clusteringProvider"%';
+----
+0
+
+statement ok
+DETACH lake;
