@@ -79,6 +79,8 @@ internal sealed class DeltaTxnBuffer
         // creates the table + writes all buffered rows (today's CTAS commit shape: v0 CREATE + one WRITE).
         public bool PendingCreate;
         public IReadOnlyList<string>? CreatePartitionColumns;
+        // SORTED BY columns of a pending CREATE/CTAS — persisted (fabricator.sortedBy) by the flush's create.
+        public IReadOnlyList<string>? CreateSortColumns;
 
         // ---- Eager CDC capture (slice C2, CDF tables in explicit transactions) ----
         // _change_data files are written at STATEMENT time (the rows are in hand: appended batches,

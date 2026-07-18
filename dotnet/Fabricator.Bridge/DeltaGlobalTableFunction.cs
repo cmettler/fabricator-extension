@@ -421,15 +421,47 @@ internal static class DeltaWriter
     internal const string MaterializedRowIdColumn = "__delta_row_id";
     internal const string MaterializedRowCommitVersionColumn = "__delta_row_commit_version";
 
+    /// <summary>Table config key persisting the CREATE-time <c>SORTED BY</c> columns (a JSON string array) —
+    /// our own key (not a delta.* feature; readable/changeable via fabricator_delta_(set_)tblproperties).
+    /// Appends without an explicit clause read it back and re-apply the ORDER BY, so the table's files KEEP
+    /// the clustered layout across INSERTs.</summary>
+    internal const string SortedByKey = "fabricator.sortedBy";
+
+    internal static string SerializeSortedBy(IReadOnlyList<string> cols)
+        => System.Text.Json.JsonSerializer.Serialize(cols);
+
+    internal static IReadOnlyList<string>? ParseSortedBy(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return null;
+        }
+        try
+        {
+            var cols = System.Text.Json.JsonSerializer.Deserialize<List<string>>(json!);
+            return cols is { Count: > 0 } ? cols : null;
+        }
+        catch
+        {
+            return null; // a hand-edited/unparseable property never fails a write — ordering is advisory
+        }
+    }
+
     private static Dictionary<string, string>? CreateConfig(
         bool deletionVectors, bool rowTracking, bool inCommitTimestamps, bool changeDataFeed,
-        bool serializable = false)
+        bool serializable = false, IReadOnlyList<string>? sortedBy = null)
     {
-        if (!deletionVectors && !rowTracking && !inCommitTimestamps && !changeDataFeed && !serializable)
+        if (!deletionVectors && !rowTracking && !inCommitTimestamps && !changeDataFeed && !serializable
+            && sortedBy is not { Count: > 0 })
         {
             return null;
         }
         var config = new Dictionary<string, string>(System.StringComparer.Ordinal);
+        if (sortedBy is { Count: > 0 })
+        {
+            // CREATE ... SORTED BY (cols): persist the ordered-write spec so later appends re-apply it.
+            config[SortedByKey] = SerializeSortedBy(sortedBy);
+        }
         if (serializable)
         {
             // Stamp the ATTACH isolation_level 'serializable' onto CREATEd tables so the table SELF-DECLARES
@@ -486,9 +518,9 @@ internal static class DeltaWriter
                              bool rowTracking = false, DeltaWriteSpec? spec = null, bool nativeWrite = false,
                              EngineeredWood.DeltaLake.Schema.ColumnMappingMode columnMapping =
                                  EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None,
-                             bool serializable = false)
+                             bool serializable = false, IReadOnlyList<string>? sortedBy = null)
         => WriteAsync(opener, path, schema, batches, mode, ct, deletionVectors, inCommitTimestamps,
-                      changeDataFeed, rowTracking, spec, nativeWrite, columnMapping, serializable)
+                      changeDataFeed, rowTracking, spec, nativeWrite, columnMapping, serializable, sortedBy)
             .GetAwaiter().GetResult();
 
     private static async Task<long> WriteAsync(nint opener, string path, Schema schema,
@@ -497,7 +529,7 @@ internal static class DeltaWriter
                              bool inCommitTimestamps, bool changeDataFeed,
                              bool rowTracking, DeltaWriteSpec? spec, bool nativeWrite,
                              EngineeredWood.DeltaLake.Schema.ColumnMappingMode columnMapping,
-                             bool serializable)
+                             bool serializable, IReadOnlyList<string>? sortedBy = null)
     {
         // native_write: DuckDB's parquet writer produces the data-file bytes (via COPY on a fresh host
         // connection); engineered-wood keeps the _delta_log commit. Falls back to EW's codec if host_query is
@@ -521,7 +553,7 @@ internal static class DeltaWriter
             var fs = TableFileSystems.Create(opener, path);
             var table = await DeltaTable.OpenOrCreateAsync(fs, schema, Options(spec, dataFileWriter),
                                                      partitionColumns: spec?.PartitionColumns,
-                                                     configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, serializable),
+                                                     configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, serializable, sortedBy),
                                                      columnMappingMode: columnMapping,
                                                      cancellationToken: ct).ConfigureAwait(false);
             try
@@ -699,11 +731,11 @@ internal static class DeltaWriter
             EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None,
         EngineeredWood.DeltaLake.Schema.StructType? pendingSchema = null,
         List<WrittenDataFile>? deferCommitTo = null,
-        bool serializable = false)
+        bool serializable = false, IReadOnlyList<string>? sortedBy = null)
     {
         var (result, rows) = TryWriteStreamingCoreAsync(opener, path, data, mode, deletionVectors,
             inCommitTimestamps, changeDataFeed, rowTracking, spec, columnMapping, pendingSchema,
-            deferCommitTo, serializable).GetAwaiter().GetResult();
+            deferCommitTo, serializable, sortedBy).GetAwaiter().GetResult();
         rowsWritten = rows;
         return result;
     }
@@ -715,7 +747,7 @@ internal static class DeltaWriter
         EngineeredWood.DeltaLake.Schema.ColumnMappingMode columnMapping,
         EngineeredWood.DeltaLake.Schema.StructType? pendingSchema,
         List<WrittenDataFile>? deferCommitTo,
-        bool serializable)
+        bool serializable, IReadOnlyList<string>? sortedBy = null)
     {
         // Transaction-deferred commit: the caller (an explicit-transaction append) wants the files WRITTEN
         // but the Delta commit PARKED — CommitTransaction flushes everything as one atomic commit. Only a
@@ -747,7 +779,7 @@ internal static class DeltaWriter
         var table = await DeltaTable.OpenOrCreateAsync(
             fs, data.Schema, Options(spec),
             partitionColumns: spec?.PartitionColumns,   // set on a partitioned CTAS create; ignored for an INSERT
-            configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, serializable),
+            configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, serializable, sortedBy),
             columnMappingMode: columnMapping,
             cancellationToken: default).ConfigureAwait(false);
         try
@@ -1134,9 +1166,9 @@ internal static class DeltaWriter
                               EngineeredWood.DeltaLake.Schema.ColumnMappingMode columnMapping =
                                   EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None,
                               EngineeredWood.DeltaLake.Schema.StructType? preAssignedSchema = null,
-                              bool serializable = false)
+                              bool serializable = false, IReadOnlyList<string>? sortedBy = null)
         => CreateAsync(opener, path, schema, ct, deletionVectors, inCommitTimestamps, changeDataFeed,
-                       rowTracking, spec, columnMapping, preAssignedSchema, serializable)
+                       rowTracking, spec, columnMapping, preAssignedSchema, serializable, sortedBy)
             .GetAwaiter().GetResult();
 
     private static async Task CreateAsync(nint opener, string path, Schema schema, CancellationToken ct,
@@ -1144,7 +1176,7 @@ internal static class DeltaWriter
                               bool changeDataFeed, bool rowTracking, DeltaWriteSpec? spec,
                               EngineeredWood.DeltaLake.Schema.ColumnMappingMode columnMapping,
                               EngineeredWood.DeltaLake.Schema.StructType? preAssignedSchema,
-                              bool serializable)
+                              bool serializable, IReadOnlyList<string>? sortedBy = null)
     {
         Log.LogInformation("delta create {Path}: cols={Cols} spec=[{Spec}]", path, schema.FieldsList.Count,
             DescribeSpec(spec, deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed));
@@ -1156,7 +1188,7 @@ internal static class DeltaWriter
                 // OpenOrCreate writes commit-0 for a new table (or opens an existing one — no commit, no conflict).
                 var table = await DeltaTable.OpenOrCreateAsync(fs, schema, Options(spec),
                                                          partitionColumns: spec?.PartitionColumns,
-                                                         configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, serializable),
+                                                         configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, serializable, sortedBy),
                                                          columnMappingMode: columnMapping,
                                                          preAssignedSchema: preAssignedSchema,
                                                          cancellationToken: ct).ConfigureAwait(false);

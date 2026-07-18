@@ -261,8 +261,30 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   unit-step property pins 2D+3D = the defining Hilbert property, U-order literals, clamp/NULL/errors, 100k
   ordered CTAS); global_functions 63 unregressed. NOT yet (possible follow-ups): the `clustering` writer
   feature allowlist in EW (writes to Databricks liquid-clustered tables — appends are legal unclustered;
-  EW models only `AddFile.ClusteringProvider` today), `delta.clustering` domainMetadata, a `cluster_by`
-  write-spec option auto-injecting the ORDER BY into the streamed bulk COPY, ZCube incremental OPTIMIZE.
+  EW models only `AddFile.ClusteringProvider` today), `delta.clustering` domainMetadata, ZCube
+  incremental OPTIMIZE.
+- **`SORTED BY` → Delta ORDERED (clustered) writes — DONE (2026-07-18, C#-only, no ABI).** The v52 native
+  clause (`CREATE TABLE lake.s.t SORTED BY (a,b) [AS …]` — `sort_columns` already crossed the ABI to
+  `create_table`/`begin_bulk`; Delta previously ignored it) now drives the Delta provider:
+  **ONE up-front interception in `DeltaCatalog.BulkInsert`** wraps the live input stream in
+  `SortStream` = `Host.Query("SELECT * FROM __fabricator_sort_input ORDER BY …", inputs)` — DuckDB's
+  EXTERNAL (disk-spilling) sort does the global reorder, the bridge stays streaming, and EVERY downstream
+  path (native COPY / codec collect / buffered CTAS / eager writes) consumes the already-sorted stream
+  (crucially the sort runs on OUR side of the ABI, downstream of any DuckDB source parallelism). The spec
+  PERSISTS as the **`fabricator.sortedBy` table property** (JSON array; threaded like the
+  `delta.isolationLevel` create stamp through `DeltaWriter.Create/Write/TryWriteStreaming` → `CreateConfig`;
+  buffered creates park `CreateSortColumns` on the txn buffer for the flush) — so **plain INSERTs re-apply
+  the ORDER BY** (`SortedByFromConfig`: read once per catalog instance via `DeltaReader.GetTableConfig`,
+  cached in `_sortedByCache`, invalidated on set_tblproperties/DROP/RENAME; persisted columns missing from
+  a write's schema are tolerantly skipped). Change/disable per table via
+  `fabricator_delta_set_tblproperties('lake','main.t','{"fabricator.sortedBy":null}')`. SORTED BY =
+  LEXICOGRAPHIC order (knowledge-free — works on a first load); for multi-key clustering put
+  `hilbert_index(...)` in an explicit ORDER BY (bucketing needs distribution knowledge — see the
+  hilbert_index bullet). `test/verify_delta_sorted_by.test` (30 — native + codec CTAS file order via
+  per-file rowid lag checks, append re-applies, UNSET disables, empty CREATE + first INSERT, buffered-txn
+  CTAS, re-attach durability); native_write 147 / write 31 / tblproperties 42 / transactions 941
+  unregressed. NOTE the SQL-Server-warehouse `SORTED BY → WITH (CLUSTER BY …)` mapping (v52) is untouched —
+  the same clause now means the analogous thing on both providers.
 - **dbt DAX→Delta pipeline — DONE + VALIDATED LIVE (2026-07-16): `dbt_dax_test/` (gitignored — NO creds in
   the project).** A second dbt-duckdb harness proving DAX EVALUATE results materialized as OneLake Delta
   tables: the `plugins/fabric_attach.py` plugin executes the repo-root `dax_secret.sql` per connection

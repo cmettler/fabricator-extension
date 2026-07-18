@@ -855,11 +855,61 @@ public sealed class DeltaCatalog : IBackendCatalog
             throw new System.ArgumentException("delta set tblproperties: no properties given.");
         }
         long version = DeltaReader.SetTableProperties(Opener(), path, updates);
+        _sortedByCache.TryRemove(path, out _); // fabricator.sortedBy may have changed — re-read on next append
         _log.LogInformation("delta set tblproperties {Path}: {Count} propertie(s) -> v{Version}",
             path, updates.Count, version);
         var keys = updates.Select(u => u.Key).ToArray();
         var vals = updates.Select(u => u.Value ?? "<unset>").ToArray();
         return TwoColumn("property", keys, "value", vals);
+    }
+
+    // fabricator.sortedBy per table path, read ONCE per catalog instance (an extra table open per append
+    // otherwise); invalidated on set_tblproperties / DROP / RENAME through this catalog. A property changed
+    // by ANOTHER writer takes effect here on re-attach — acceptable: the ordering is advisory LAYOUT, never
+    // correctness.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, IReadOnlyList<string>?>
+        _sortedByCache = new();
+
+    private IReadOnlyList<string>? SortedByFromConfig(nint opener, string path, Schema schema)
+    {
+        var cols = _sortedByCache.GetOrAdd(path, p =>
+            DeltaWriter.ParseSortedBy(DeltaReader.GetTableConfig(opener, p, DeltaWriter.SortedByKey)));
+        if (cols is not { Count: > 0 })
+        {
+            return null;
+        }
+        // Tolerate schema drift: order only by the persisted columns PRESENT in this write's schema.
+        var present = new List<string>(cols.Count);
+        foreach (var c in cols)
+        {
+            foreach (var f in schema.FieldsList)
+            {
+                if (string.Equals(f.Name, c, System.StringComparison.OrdinalIgnoreCase))
+                {
+                    present.Add(c);
+                    break;
+                }
+            }
+        }
+        return present.Count > 0 ? present : null;
+    }
+
+    // The ordered-write wrap: run the live input stream through the HOST engine's ORDER BY — DuckDB's
+    // EXTERNAL (disk-spilling) sort absorbs the global reorder, so the bridge pipeline stays streaming
+    // (channel backpressure feeds the sort; the sorted stream feeds whichever write path runs next).
+    private static IArrowArrayStream SortStream(IArrowArrayStream data, IReadOnlyList<string> cols)
+    {
+        var sb = new System.Text.StringBuilder("SELECT * FROM __fabricator_sort_input ORDER BY ");
+        for (int i = 0; i < cols.Count; i++)
+        {
+            if (i > 0)
+            {
+                sb.Append(", ");
+            }
+            sb.Append('"').Append(cols[i].Replace("\"", "\"\"")).Append('"');
+        }
+        return Host.Query(sb.ToString(),
+            new (string, IArrowArrayStream)[] { ("__fabricator_sort_input", data) });
     }
 
     /// <summary>The catalog's schemas: the lakehouse schemas for a schema-enabled OneLake lakehouse; for a
@@ -1542,11 +1592,27 @@ public sealed class DeltaCatalog : IBackendCatalog
                            bool replace, bool checkConstraints, long txnId, IReadOnlyList<string>? partitionColumns,
                            IReadOnlyList<string>? sortColumns, string? schemaMode, bool partitionOverwrite)
     {
-        // sortColumns (native SORTED BY) is a SQL-Server-warehouse CLUSTER BY concept; Delta doesn't cluster — ignored.
         var opener = Opener();
         _log.LogInformation("delta bulk {Schema}.{Table}: create={Create} replace={Replace} native_write={Native} partition_overwrite={PartOw}",
             schemaName, tableName, createTable, replace, _nativeWrite, partitionOverwrite);
         EnsureVariantWritable(data.Schema);
+        var tablePath = TablePath(schemaName, tableName);
+        // SORTED BY -> an ORDERED (clustered) write: an explicit CREATE/CTAS clause orders THIS write and
+        // is persisted (fabricator.sortedBy) at create; an append with no clause re-applies the persisted
+        // spec. The ORDER BY runs on the HOST engine (DuckDB's EXTERNAL, disk-spilling sort) over the live
+        // input stream — the bridge pipeline stays streaming, and EVERY downstream path (native COPY,
+        // codec collect, buffered CTAS, eager writes) consumes the already-SORTED stream from this one
+        // interception point. Ordered files carry tight min/max on the sort keys -> stats file skipping
+        // (pair with hilbert_index for multi-key clustering; see docs/global-functions.md).
+        var effectiveSort = sortColumns is { Count: > 0 }
+            ? sortColumns
+            : !createTable && !replace ? SortedByFromConfig(opener, tablePath, data.Schema) : null;
+        if (effectiveSort is { Count: > 0 } && HostFs.CanQuery)
+        {
+            _log.LogInformation("delta bulk {Schema}.{Table}: ordered write — ORDER BY [{Cols}] (host spillable sort)",
+                schemaName, tableName, string.Join(",", effectiveSort));
+            data = SortStream(data, effectiveSort);
+        }
         // Partition columns are ALWAYS forwarded but take effect only when the write actually CREATES the
         // table (explicit CREATE/REPLACE, or the append shape's implicit create-if-missing) — engineered-wood's
         // OpenOrCreateAsync applies them at creation and an existing table keeps its metadata partitioning.
@@ -1580,7 +1646,6 @@ public sealed class DeltaCatalog : IBackendCatalog
             }
             spec = (spec ?? new DeltaWriteSpec(null, null, null, null)) with { DynamicPartitionOverwrite = true };
         }
-        var tablePath = TablePath(schemaName, tableName);
 
         // Dynamic partition overwrite is append-SHAPED, so a missing target is implicitly created. With
         // PARTITION_COLUMNS supplied it is created PARTITIONED and the first write is a plain append
@@ -1653,6 +1718,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                         pendingC.PendingArrowSchema = ctasSchema;
                         pendingC.PendingDeltaSchema = assigned; // mapping pre-assignment (null when 'none')
                         pendingC.CreatePartitionColumns = partitionColumns;
+                        pendingC.CreateSortColumns = sortColumns; // SORTED BY persists at the flush's create
                         pendingC.HasAppend = true;
                         pendingC.Files.AddRange(cfiles);
                         pendingC.Rows += sRows;
@@ -1666,6 +1732,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 pendingC.PendingCreate = true;
                 pendingC.PendingArrowSchema = cschema;
                 pendingC.CreatePartitionColumns = partitionColumns;
+                pendingC.CreateSortColumns = sortColumns; // SORTED BY persists at the flush's create
                 pendingC.HasAppend = true;
                 pendingC.BatchSchema ??= cschema;
                 pendingC.Batches.AddRange(cbatches);
@@ -1813,7 +1880,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 changeDataFeed: _changeDataFeedOnCreate,
                 rowTracking: _rowTrackingOnCreate,
                 spec: spec,                out var streamedRows,
-                columnMapping: _columnMappingMode, serializable: _serializable);
+                columnMapping: _columnMappingMode, serializable: _serializable, sortedBy: sortColumns);
             if (streamedVersion is not null)
             {
                 return streamedRows;
@@ -1829,7 +1896,8 @@ public sealed class DeltaCatalog : IBackendCatalog
                           changeDataFeed: _changeDataFeedOnCreate,
                           rowTracking: _rowTrackingOnCreate,
                           spec: spec, nativeWrite: _nativeWrite,
-                          columnMapping: _columnMappingMode, serializable: _serializable);
+                          columnMapping: _columnMappingMode, serializable: _serializable,
+                          sortedBy: sortColumns);
         return rows;
     }
 
@@ -1915,11 +1983,12 @@ public sealed class DeltaCatalog : IBackendCatalog
             && !TableExists(TablePath(schemaName, tableName)))
         {
             BufferCreateTable(createTxn, TablePath(schemaName, tableName), schemaName, tableName,
-                              columns, ifNotExists, partitionColumns);
+                              columns, ifNotExists, partitionColumns, sortColumns);
             return;
         }
         ThrowIfPendingAppends(TablePath(schemaName, tableName), "CREATE (OR REPLACE) TABLE");
-        // sortColumns (CLUSTER BY) is a SQL-Server-warehouse concept — Delta ignores it.
+        // sortColumns (native SORTED BY): persisted as fabricator.sortedBy — every append then re-applies
+        // the ORDER BY (see BulkInsert), keeping the table's files in the clustered layout.
         // identityColumns (the DuckDB `AS (0)` generated-column marker, v53): Delta has NATIVE identity —
         // attach delta.identity.* metadata (start 1, step 1, GENERATED ALWAYS) to the marked fields.
         // engineered-wood does the rest: the identityColumns writer feature at create, per-batch value
@@ -1939,7 +2008,8 @@ public sealed class DeltaCatalog : IBackendCatalog
                               changeDataFeed: _changeDataFeedOnCreate,
                               rowTracking: _rowTrackingOnCreate,
                               spec: ResolveWriteSpec(partitionColumns, schemaModeArg: null),
-                              columnMapping: _columnMappingMode, serializable: _serializable);
+                              columnMapping: _columnMappingMode, serializable: _serializable,
+                              sortedBy: sortColumns);
     }
 
     /// <summary>CREATE SCHEMA. In <c>schemas</c> mode (non-OneLake) it materializes the <c>&lt;root&gt;/&lt;schema&gt;/</c>
@@ -2087,7 +2157,8 @@ public sealed class DeltaCatalog : IBackendCatalog
     // flush. Requires NO buffered data changes yet (add columns BEFORE the data statements — writes then
     // run schema-overridden; changing the schema under already-buffered rows/post-images is unsupported).
     private void BufferCreateTable(long txnId, string path, string schemaName, string tableName,
-                                   Schema columns, bool ifNotExists, IReadOnlyList<string>? partitionColumns)
+                                   Schema columns, bool ifNotExists, IReadOnlyList<string>? partitionColumns,
+                                   IReadOnlyList<string>? sortColumns)
     {
         var pending = _txnBuffer.GetOrCreate(txnId, path);
         if (pending.HasAny)
@@ -2103,6 +2174,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         pending.PendingCreate = true;
         pending.PendingArrowSchema = columns;
         pending.CreatePartitionColumns = partitionColumns;
+        pending.CreateSortColumns = sortColumns;
         _log.LogInformation("delta txn {Txn} buffer create {Schema}.{Table}: cols={Cols}",
             txnId, schemaName, tableName, columns.FieldsList.Count);
     }
@@ -2816,7 +2888,8 @@ public sealed class DeltaCatalog : IBackendCatalog
                            // slice B: an eagerly-streamed CTAS's files were written against THIS
                            // pre-assigned mapping schema — the create must reuse it, never re-assign
                            // (physical names are random GUIDs).
-                           preAssignedSchema: pending.PendingDeltaSchema);
+                           preAssignedSchema: pending.PendingDeltaSchema,
+                           sortedBy: pending.CreateSortColumns);
         long v = 0;
         if (pending.Files.Count > 0 || (pending.Batches.Count > 0 && pending.PendingIdentityHwm.Count > 0))
         {
@@ -3103,6 +3176,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// <paramref name="ifExists"/> is satisfied either way.</summary>
     public void DropTable(string schemaName, string tableName, bool ifExists)
     {
+        _sortedByCache.TryRemove(TablePath(schemaName, tableName), out _);
         long dropTxn = AmbientTransaction.Current;
         if (_txnBuffer.Get(dropTxn, TablePath(schemaName, tableName)) is { PendingCreate: true })
         {
@@ -3828,6 +3902,8 @@ public sealed class DeltaCatalog : IBackendCatalog
                 {
                     HostFs.MoveDir(Opener(), TablePath(s, t), TablePath(s, newName));
                 }
+                _sortedByCache.TryRemove(TablePath(s, t), out _);
+                _sortedByCache.TryRemove(TablePath(s, newName), out _);
                 return;
             }
             default:

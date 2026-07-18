@@ -1,0 +1,196 @@
+# name: test/verify_delta_sorted_by.test
+# description: CREATE TABLE ... SORTED BY (cols) on the Delta catalog = an ORDERED (clustered) write —
+#              the input stream is sorted on the HOST engine (DuckDB's external/spilling sort; the bridge
+#              pipeline stays streaming) and the spec is PERSISTED as the fabricator.sortedBy table
+#              property, so plain INSERTs (no clause) re-apply the ORDER BY and every file keeps tight
+#              min/max on the sort keys. Change/disable via fabricator_delta_set_tblproperties.
+# group: [fabricator]
+
+require fabricator
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+# ============================================================================
+# 1. native_write catalog: CTAS SORTED BY orders the file + persists the property
+# ============================================================================
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/sorted_nat' AS lake (TYPE fabricator, PROVIDER 'delta', native_read true, native_write true);
+
+# shuffled input (multiplicative scramble) -> the write must ORDER it
+statement ok
+CREATE TABLE lake.main.s1 SORTED BY (grp, id) AS
+SELECT (r * 37) % 100 AS grp, (r * 91) % 1000 AS id, r AS payload FROM range(5000) t(r);
+
+query I
+SELECT count(*) FROM lake.main.s1;
+----
+5000
+
+# the spec is persisted as a table property (JSON array)
+query T
+SELECT value FROM fabricator_delta_tblproperties('lake', 'main.s1') WHERE property = 'fabricator.sortedBy';
+----
+["grp","id"]
+
+# physical order: within the written file (rowid = position) the rows are lexicographically
+# nondecreasing on (grp, id)
+query I
+WITH o AS (
+    SELECT grp, id,
+           lag(grp) OVER (PARTITION BY rowid >> 40 ORDER BY rowid) AS pg,
+           lag(id)  OVER (PARTITION BY rowid >> 40 ORDER BY rowid) AS pi
+    FROM lake.main.s1
+)
+SELECT count(*) FROM o WHERE pg IS NOT NULL AND (pg > grp OR (pg = grp AND pi > id));
+----
+0
+
+# ============================================================================
+# 2. a plain INSERT (no clause) re-applies the persisted ORDER BY to ITS file
+# ============================================================================
+
+statement ok
+INSERT INTO lake.main.s1
+SELECT (r * 53) % 100 AS grp, (r * 17) % 1000 AS id, r AS payload FROM range(5000, 10000) t(r);
+
+query I
+SELECT count(*) FROM lake.main.s1;
+----
+10000
+
+# EVERY file (rowid >> 40 = file ordinal) is internally ordered
+query I
+WITH o AS (
+    SELECT grp, id,
+           lag(grp) OVER (PARTITION BY rowid >> 40 ORDER BY rowid) AS pg,
+           lag(id)  OVER (PARTITION BY rowid >> 40 ORDER BY rowid) AS pi
+    FROM lake.main.s1
+)
+SELECT count(*) FROM o WHERE pg IS NOT NULL AND (pg > grp OR (pg = grp AND pi > id));
+----
+0
+
+# ============================================================================
+# 3. UNSET disables the ordered write for later appends
+# ============================================================================
+
+statement ok
+SELECT * FROM fabricator_delta_set_tblproperties('lake', 'main.s1', '{"fabricator.sortedBy":null}');
+
+statement ok
+INSERT INTO lake.main.s1 VALUES (99, 5, -1), (1, 3, -1), (50, 7, -1);
+
+# the new 3-row file (payload = -1 marks it; file ordinals are path-sorted uuids, NOT chronological)
+# arrived UNSORTED (grp 99,1,50) — the property is gone so no reorder happened
+query I
+WITH f AS (
+    SELECT grp, rowid FROM lake.main.s1
+    WHERE rowid >> 40 = (SELECT rowid >> 40 FROM lake.main.s1 WHERE payload = -1 LIMIT 1)
+), o AS (
+    SELECT grp, lag(grp) OVER (ORDER BY rowid) AS pg FROM f
+)
+SELECT count(*) FROM o WHERE pg IS NOT NULL AND pg > grp;
+----
+1
+
+# ============================================================================
+# 4. codec (non-native) catalog: same behavior through the collect path
+# ============================================================================
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/sorted_codec' AS clake (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE clake.main.c1 SORTED BY (id) AS
+SELECT (r * 91) % 1000 AS id, r AS payload FROM range(3000) t(r);
+
+query T
+SELECT value FROM fabricator_delta_tblproperties('clake', 'main.c1') WHERE property = 'fabricator.sortedBy';
+----
+["id"]
+
+query I
+WITH o AS (
+    SELECT id, lag(id) OVER (PARTITION BY rowid >> 40 ORDER BY rowid) AS pi FROM clake.main.c1
+)
+SELECT count(*) FROM o WHERE pi IS NOT NULL AND pi > id;
+----
+0
+
+# ============================================================================
+# 5. empty CREATE ... SORTED BY persists the spec; the first INSERT is ordered
+# ============================================================================
+
+statement ok
+CREATE TABLE clake.main.c2 (grp BIGINT, v VARCHAR) SORTED BY (grp);
+
+query T
+SELECT value FROM fabricator_delta_tblproperties('clake', 'main.c2') WHERE property = 'fabricator.sortedBy';
+----
+["grp"]
+
+statement ok
+INSERT INTO clake.main.c2 SELECT (r * 37) % 50, 'v' || r FROM range(1000) t(r);
+
+query I
+WITH o AS (
+    SELECT grp, lag(grp) OVER (PARTITION BY rowid >> 40 ORDER BY rowid) AS pg FROM clake.main.c2
+)
+SELECT count(*) FROM o WHERE pg IS NOT NULL AND pg > grp;
+----
+0
+
+# ============================================================================
+# 6. buffered transaction: CTAS SORTED BY inside BEGIN..COMMIT — ordered data + property at the flush
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE clake.main.c3 SORTED BY (id) AS
+SELECT (r * 91) % 500 AS id, r AS payload FROM range(2000) t(r);
+
+statement ok
+COMMIT;
+
+query T
+SELECT value FROM fabricator_delta_tblproperties('clake', 'main.c3') WHERE property = 'fabricator.sortedBy';
+----
+["id"]
+
+query I
+WITH o AS (
+    SELECT id, lag(id) OVER (PARTITION BY rowid >> 40 ORDER BY rowid) AS pi FROM clake.main.c3
+)
+SELECT count(*) FROM o WHERE pi IS NOT NULL AND pi > id;
+----
+0
+
+# ============================================================================
+# 7. re-attach durability: the property survives; a fresh catalog instance re-applies it
+# ============================================================================
+
+statement ok
+DETACH clake;
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/sorted_codec' AS clake (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+INSERT INTO clake.main.c1 SELECT (r * 17) % 1000, r FROM range(3000, 5000) t(r);
+
+query I
+WITH o AS (
+    SELECT id, lag(id) OVER (PARTITION BY rowid >> 40 ORDER BY rowid) AS pi FROM clake.main.c1
+)
+SELECT count(*) FROM o WHERE pi IS NOT NULL AND pi > id;
+----
+0
+
+statement ok
+DETACH lake;
+
+statement ok
+DETACH clake;

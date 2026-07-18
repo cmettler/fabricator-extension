@@ -692,6 +692,27 @@ internal static class DeltaReader
         }
     }
 
+    /// <summary>Reads ONE table-configuration value — null when the key or the TABLE is absent (an
+    /// append-shaped implicit create has nothing to read). E.g. the <c>fabricator.sortedBy</c>
+    /// ordered-write spec an append re-applies.</summary>
+    public static string? GetTableConfig(nint opener, string path, string key)
+        => GetTableConfigAsync(opener, path, key).GetAwaiter().GetResult();
+
+    private static async Task<string?> GetTableConfigAsync(nint opener, string path, string key)
+    {
+        try
+        {
+            var fs = TableFileSystems.Create(opener, path);
+            await using var table = await DeltaTable.OpenAsync(fs).ConfigureAwait(false);
+            var cfg = table.CurrentSnapshot.Metadata.Configuration;
+            return cfg is not null && cfg.TryGetValue(key, out var v) ? v : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     /// <summary>Runs a compute-only schema change (the <c>Compute*</c> family — ADD/RENAME/DROP COLUMN,
     /// nested ADD/DROP FIELD) against the table WITHOUT committing: the buffered transaction parks the
     /// returned actions and fuses them into its ONE commit. Chained changes pass the previous pending
