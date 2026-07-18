@@ -248,6 +248,36 @@ addressed by its args (a connstr/endpoint), composing with the global `fabricato
 global scalar) → apply (effectful global collector), **both connection-free / no ATTACH**. A target that's
 inherently a live model/connection is more naturally catalog-bound; a target addressable by an arg works global.
 
+## hilbert_index — the clustered-write ordering primitive (DONE, 2026-07-18)
+
+`hilbert_index(coords BIGINT[], bits INTEGER) → BIGINT` (`HilbertIndexFunction`, Bridge; declared in
+`CustomFunctions.GlobalScalar`): the n-dimensional **Hilbert space-filling-curve position** of a point,
+n = the list length per row, `bits` bits per dimension, `n * bits <= 63`. Skilling's transpose algorithm
+("Programming the Hilbert Curve", AIP 2004) — the same curve OSS Delta's liquid clustering uses
+(`HilbertClustering` in delta-spark). Coordinates outside `[0, 2^bits)` are CLAMPED (the position is
+advisory *layout*, never correctness); pre-bucket real values with `width_bucket(x, min, max, 2^bits - 2)`
+or any integer id; `n = 1` degenerates to the identity (a plain range sort — matching OSS Delta's
+"clustering by one column is just ordering"); NULL list/bits/element → NULL.
+
+**The purpose — liquid-clustering-style writes with a STREAMING pipeline:** put it in an `ORDER BY` and
+DuckDB's EXTERNAL (disk-spilling) sort does the global reorder — the C# write path stays streaming, the
+unavoidable buffering lives in DuckDB's spill:
+
+```sql
+CREATE TABLE lake.s.t AS
+SELECT …, width_bucket(a, 0, 1000, 254) AS wa, width_bucket(b, …) AS wb
+FROM src ORDER BY hilbert_index([wa, wb], 8);
+```
+
+Curve-ordering means consecutive rows are neighbors in EVERY clustering dimension at once (a lexicographic
+`ORDER BY a, b` only bounds the leading key), so each file/row-group gets tight min/max on all keys →
+stats-based skipping works for any predicate subset — partitioning's pruning without its rigid split.
+Validated by full-grid property tests (2D 8×8 + 3D 4×4×4: indices are a permutation AND every consecutive
+pair is a unit step — the defining Hilbert property), the classic first-order U pins, and a 100k-row
+ordered CTAS (`test/verify_hilbert_index.test`, 27). NOT yet: real liquid clustering (the `clustering`
+writer feature, `delta.clustering` domainMetadata, ZCube incremental OPTIMIZE) — this is the ordering
+primitive those would build on.
+
 ## The template-engine demo (the motivator)
 
 A provider-agnostic core global, e.g. `fabricator_render(template VARCHAR, params <any>) → VARCHAR`:

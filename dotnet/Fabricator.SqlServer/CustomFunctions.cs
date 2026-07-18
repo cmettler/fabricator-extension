@@ -27,6 +27,10 @@ internal static class CustomFunctions
     public static readonly IReadOnlyList<IScalarFunction> GlobalScalar = new IScalarFunction[]
     {
         new CfRenderFunction(),
+        // hilbert_index(coords BIGINT[], bits) — n-dimensional Hilbert-curve position, for liquid-clustering-
+        // style ordered writes (ORDER BY hilbert_index(...) rides DuckDB's spilling sort; the write pipeline
+        // stays streaming). Provider-agnostic core (lives in the Bridge, like DeltaGlobalTableFunction).
+        new Fabricator.Bridge.HilbertIndexFunction(),
     };
 
     // Connection-free GLOBAL table-in-out (streaming exchange) functions — bare fn(<input>), no ATTACH.

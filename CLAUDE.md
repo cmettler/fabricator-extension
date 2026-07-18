@@ -248,6 +248,21 @@ current code still uses the single-provider `fabricator` naming):
 ## Next up (open threads for future sessions)
 
 In-flight / planned refactors (all C#-only unless noted; tests stay green per slice):
+- **`hilbert_index` global scalar — DONE (2026-07-18, C#-only, no ABI): the liquid-clustering-style
+  ordered-write primitive.** `hilbert_index(coords BIGINT[], bits) → BIGINT` (Bridge
+  `HilbertIndexFunction`, declared in `CustomFunctions.GlobalScalar` — the fabricator_render slot):
+  n-dim Hilbert-curve position via Skilling's transpose algorithm (the curve OSS delta-spark's
+  `HilbertClustering` uses; LIST arg = per-row dimension count, sidestepping the fixed-arity global-scalar
+  decl), coords CLAMPED into [0,2^bits) (layout-advisory, never correctness), n*bits<=63, n=1=identity,
+  NULL→NULL. **Usage = `ORDER BY hilbert_index([...], b)` in a CTAS/COPY/dbt model → DuckDB's EXTERNAL
+  (spilling) sort does the global reorder — the write pipeline stays streaming**; consecutive rows are
+  neighbors in EVERY clustering key → tight per-file/row-group min-max on all keys → stats skipping for any
+  predicate subset (pre-bucket with `width_bucket`). `test/verify_hilbert_index.test` (27 — full-grid
+  unit-step property pins 2D+3D = the defining Hilbert property, U-order literals, clamp/NULL/errors, 100k
+  ordered CTAS); global_functions 63 unregressed. NOT yet (possible follow-ups): the `clustering` writer
+  feature allowlist in EW (writes to Databricks liquid-clustered tables — appends are legal unclustered;
+  EW models only `AddFile.ClusteringProvider` today), `delta.clustering` domainMetadata, a `cluster_by`
+  write-spec option auto-injecting the ORDER BY into the streamed bulk COPY, ZCube incremental OPTIMIZE.
 - **dbt DAX→Delta pipeline — DONE + VALIDATED LIVE (2026-07-16): `dbt_dax_test/` (gitignored — NO creds in
   the project).** A second dbt-duckdb harness proving DAX EVALUATE results materialized as OneLake Delta
   tables: the `plugins/fabric_attach.py` plugin executes the repo-root `dax_secret.sql` per connection

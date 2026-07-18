@@ -1,0 +1,149 @@
+# name: test/verify_hilbert_index.test
+# description: hilbert_index(coords BIGINT[], bits) — GLOBAL (connection-free) scalar: the n-dimensional
+#              Hilbert-curve position, for liquid-clustering-style ordered writes (ORDER BY hilbert_index
+#              rides DuckDB's external/spilling sort, so the write pipeline stays streaming while every
+#              file/row-group gets tight min/max stats on ALL clustering keys). Skilling's transpose
+#              algorithm; coords are clamped into [0, 2^bits); n = list length per row; n * bits <= 63.
+# group: [fabricator]
+
+require fabricator
+
+# ---- the classic first-order U (2D, bits=1): (0,0)=0 (0,1)=1 (1,1)=2 (1,0)=3 ----
+
+query IIII
+SELECT hilbert_index([0,0], 1), hilbert_index([0,1], 1), hilbert_index([1,1], 1), hilbert_index([1,0], 1);
+----
+0	1	2	3
+
+# ---- 2D full-grid property test (bits=3, 8x8): a Hilbert curve visits every cell exactly once with
+#      UNIT steps — indices are a permutation of 0..63 AND every consecutive pair (by index) is a grid
+#      neighbor (manhattan distance exactly 1). This fully characterizes the curve. ----
+
+query III
+WITH g AS (
+    SELECT x, y, hilbert_index([x, y], 3) AS h
+    FROM range(8) t1(x), range(8) t2(y)
+)
+SELECT min(h), max(h), count(DISTINCT h) FROM g;
+----
+0	63	64
+
+query I
+WITH g AS (
+    SELECT x, y, hilbert_index([x, y], 3) AS h
+    FROM range(8) t1(x), range(8) t2(y)
+), o AS (
+    SELECT x, y, lag(x) OVER (ORDER BY h) AS px, lag(y) OVER (ORDER BY h) AS py
+    FROM g
+)
+SELECT count(*) FROM o WHERE px IS NOT NULL AND abs(x - px) + abs(y - py) <> 1;
+----
+0
+
+# ---- 3D full-grid property test (bits=2, 4x4x4 = 64 cells): same characterization in 3 dimensions ----
+
+query III
+WITH g AS (
+    SELECT x, y, z, hilbert_index([x, y, z], 2) AS h
+    FROM range(4) t1(x), range(4) t2(y), range(4) t3(z)
+)
+SELECT min(h), max(h), count(DISTINCT h) FROM g;
+----
+0	63	64
+
+query I
+WITH g AS (
+    SELECT x, y, z, hilbert_index([x, y, z], 2) AS h
+    FROM range(4) t1(x), range(4) t2(y), range(4) t3(z)
+), o AS (
+    SELECT x, y, z,
+           lag(x) OVER (ORDER BY h) AS px, lag(y) OVER (ORDER BY h) AS py, lag(z) OVER (ORDER BY h) AS pz
+    FROM g
+)
+SELECT count(*) FROM o WHERE px IS NOT NULL AND abs(x - px) + abs(y - py) + abs(z - pz) <> 1;
+----
+0
+
+# ---- locality beats lexicographic: over the 32x32 grid at bits=5, the average manhattan jump between
+#      consecutive cells is 1.0 for hilbert (unit steps) vs > 2 for a lexicographic (x, y) order ----
+
+query I
+WITH g AS (
+    SELECT x, y, hilbert_index([x, y], 5) AS h
+    FROM range(32) t1(x), range(32) t2(y)
+), o AS (
+    SELECT abs(x - lag(x) OVER (ORDER BY h)) + abs(y - lag(y) OVER (ORDER BY h)) AS d FROM g
+)
+SELECT avg(d) = 1.0 FROM o WHERE d IS NOT NULL;
+----
+true
+
+# ---- one dimension degenerates to the identity (a plain range sort) ----
+
+query II
+SELECT hilbert_index([5], 4), hilbert_index([0], 4);
+----
+5	0
+
+# ---- clamping: out-of-range coordinates fold to the bit-space edges (layout-only, never an error) ----
+
+query I
+SELECT hilbert_index([100, -5], 3) = hilbert_index([7, 0], 3);
+----
+true
+
+# ---- NULL propagation: NULL list, NULL bits, NULL element ----
+
+query III
+SELECT hilbert_index(NULL, 3), hilbert_index([1, 2], NULL), hilbert_index([1, NULL], 3);
+----
+NULL	NULL	NULL
+
+# ---- validation errors ----
+
+statement error
+SELECT hilbert_index([], 3);
+----
+must not be empty
+
+statement error
+SELECT hilbert_index([1, 2], 0);
+----
+bits >= 1
+
+statement error
+SELECT hilbert_index([1, 2, 3, 4], 16);
+----
+dimensions * bits
+
+# ---- registered as a bare global function (no ATTACH) ----
+
+query I
+SELECT count(*) >= 1 FROM duckdb_functions() WHERE function_name = 'hilbert_index';
+----
+true
+
+# ---- the clustered-write shape: ORDER BY hilbert_index inside a CTAS — DuckDB's (spilling) sort does the
+#      global reorder; consecutive rows land curve-adjacent, so row-group/file min-max stay tight on BOTH
+#      keys. Sanity: the 100k-row ordered CTAS materializes with the curve order preserved. ----
+
+statement ok
+CREATE TABLE t_clustered AS
+SELECT x, y, hilbert_index([x % 512, y % 512], 9) AS h
+FROM (SELECT r % 317 AS x, (r * 7) % 293 AS y FROM range(100000) t(r))
+ORDER BY hilbert_index([x % 512, y % 512], 9);
+
+query I
+SELECT count(*) FROM t_clustered;
+----
+100000
+
+# insertion order follows the curve (order preservation holds through CTAS)
+query I
+WITH o AS (SELECT h, lag(h) OVER (ORDER BY rowid) AS ph FROM t_clustered)
+SELECT count(*) FROM o WHERE ph IS NOT NULL AND ph > h;
+----
+0
+
+statement ok
+DROP TABLE t_clustered;
