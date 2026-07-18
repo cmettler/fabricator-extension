@@ -1318,19 +1318,6 @@ internal static class DeltaReader
             .ConfigureAwait(false);
         try
         {
-            if (fileReader is not null && table.CurrentSnapshot.Metadata.PartitionColumns.Count > 0)
-            {
-                // PRE-EXISTING GAP (found by the clustered-OPTIMIZE tests): the IDataFileReader seam returns
-                // per-file RAW batches WITHOUT the partition columns (they're not in the parquet), which
-                // misaligns engineered-wood's compaction pipeline on a PARTITIONED table
-                // (index-out-of-bounds; SIGSEGV when the writer seam consumes the misaligned batch).
-                // Reopen without the reader seam — EW's own reader re-adds partition columns correctly;
-                // the native WRITER seam keeps the output quality. DV DELETE/UPDATE are unaffected
-                // (merge-on-read; no seam-read rewrite on partitioned tables).
-                await table.DisposeAsync().ConfigureAwait(false);
-                table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(dataFileWriter: writer), token)
-                    .ConfigureAwait(false);
-            }
             // A clustering-declared table (the delta.clustering domain, else the fabricator.sortedBy property)
             // RECLUSTERS instead of bin-packing when the native writer is available: ONE host query reads every
             // active file (DV rows excluded), globally re-orders — hilbert_index over ntile range-buckets for

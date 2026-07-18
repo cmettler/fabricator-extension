@@ -205,7 +205,11 @@ SELECT count(*) FROM o WHERE p IS NOT NULL AND p > k;
 0
 
 # ============================================================================
-# 4. guard: a PARTITIONED table keeps the bin-pack fallback (no clusteringProvider)
+# 4. guard: a PARTITIONED table keeps the bin-pack fallback (no clusteringProvider),
+#    and that bin-pack compacts PER PARTITION — the pre-existing corruption this
+#    exposed mixed every partition into one file stamped with ONE partition's value
+#    (after OPTIMIZE all 1200 rows read a single region). This section runs under
+#    native_read + native_write, so it also pins the once-crashing reader-seam path.
 # ============================================================================
 
 statement ok
@@ -218,15 +222,30 @@ INSERT INTO lake.main.p1 SELECT ['US','EU','APAC'][(r % 3) + 1], r FROM range(60
 statement ok
 SELECT * FROM fabricator_delta_set_tblproperties('lake', 'main.p1', '{"fabricator.sortedBy":"[\"id\"]"}');
 
+query TI
+SELECT region, count(*) FROM lake.main.p1 GROUP BY region ORDER BY region;
+----
+APAC	400
+EU	400
+US	400
+
 query I
 SELECT fabricator_exec('lake', 'OPTIMIZE main.p1');
 ----
 0
 
-query I
-SELECT count(*) FROM lake.main.p1;
+# partition values EXACT after the compaction (the corruption pin) + one file per partition
+query TI
+SELECT region, count(*) FROM lake.main.p1 GROUP BY region ORDER BY region;
 ----
-1200
+APAC	400
+EU	400
+US	400
+
+query II
+SELECT count(DISTINCT rowid >> 40), count(DISTINCT region) FROM lake.main.p1;
+----
+3	3
 
 query I
 SELECT count(*) FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/clustopt/p1/_delta_log/*.json')

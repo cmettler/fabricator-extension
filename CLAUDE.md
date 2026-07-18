@@ -315,10 +315,7 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   expectedVersion can't race; a concurrent commit → clean "retry" error. NO-OP when active = 1 DV-less
   file (Spark parity — no commit). Gates → bin-pack fallback: no native_write, partitioned (liquid
   clustering is unpartitioned by definition), identity/IcebergCompat, variant, nested columns under
-  mapping. **PRE-EXISTING CRASH found by the new tests: partitioned × native_read OPTIMIZE** — the
-  IDataFileReader seam returns per-file batches WITHOUT partition columns → EW compaction misaligns
-  (index-out-of-bounds; SIGSEGV with the writer seam); guarded in `OptimizeAsync` (reopen without the
-  reader seam for partitioned tables; DV DML unaffected — probed). `test/verify_delta_clustered_optimize.test`
+  mapping. `test/verify_delta_clustered_optimize.test`
   (46 — 2-key hilbert order pinned via deterministic ntile recompute [unique keys] + lag monotonicity,
   DV rows not resurrected, stable id preserved, clusteringProvider+dataChange:false commit pins, no-op
   re-OPTIMIZE, VACUUM→1 file, 1-key lexicographic, sortedBy-only detection, partitioned+plain fallbacks);
@@ -347,7 +344,28 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   sticky), protecting every consumer; my chunked loop was just the first to pull past EOF.
   `verify_delta_clustered_optimize.test` now 55 (§5 multi-file: >1 file, per-file order, NO strictly
   interleaving ranges, every add provider-tagged, counts exact). Remaining: ZCube-tagged incremental
-  recluster (ours is full-table); the EW-side root-cause of the partitioned reader-seam gap.
+  recluster (ours is full-table).
+  **PARTITIONED COMPACTION — SILENT CORRUPTION FOUND + FIXED AT THE EW ROOT (2026-07-18, EW `13f7fce`+
+  local commit; the clustered-OPTIMIZE tests exposed it):** EW's `CompactionExecutor` compacted ALL
+  candidates into ONE file at the TABLE ROOT stamped with the FIRST candidate's `partitionValues` — after
+  a single OPTIMIZE on a partitioned table EVERY row read one partition's value (probed live: 400/400/400
+  across three regions → 1200 rows all "US"; the reader derives partition columns from the add's
+  partitionValues, so the corruption was total and silent on EVERY path — pure-EW included). The
+  NULL-backfill of partition columns into the compacted file also misaligned the `IDataFileReader` seam
+  (the index-out-of-bounds / SIGSEGV under native_read+native_write — the LOUD variant of the same gap).
+  **Fix (EW):** candidates group BY PARTITION (`CanonicalPartitionKey`, now internal — tolerant of mixed
+  logical/physical partitionValues vintages under mapping) and each ≥2-file group compacts independently
+  (`CompactGroupAsync`): adds carry the group's partitionValues + land in the group's Hive dir (inherited
+  encoded path prefix); the widening/backfill target schema EXCLUDES partition columns (data files never
+  carry them). Unpartitioned = single group (behavior unchanged); single-file partitions untouched;
+  all-DV-deleted groups left alone (conservative no-op parity). The Bridge's reopen-without-reader-seam
+  guard is REMOVED (the seam now aligns). EW `CompactionTests` +2 (per-partition values/files/Hive-dirs
+  pin + single-file-partition), Table.Tests 191; extension test §4 pins exact per-partition values + one
+  file per partition through the once-crashing native_read+native_write path
+  (`verify_delta_clustered_optimize` 68); sweep: optimize 40 / compaction_rowtracking 24 /
+  materialize_rowtracking 17 / row_tracking 33 / row_tracking_virtual 299 / sorted_by 30 / native_write
+  147 / native_read 88 / partition 54 / partition_overwrite 90 / transactions 941 / dv_default 58 /
+  column_mapping 251 / variant 133 green.
 - **`SORTED BY` → Delta ORDERED (clustered) writes — DONE (2026-07-18, C#-only, no ABI).** The v52 native
   clause (`CREATE TABLE lake.s.t SORTED BY (a,b) [AS …]` — `sort_columns` already crossed the ABI to
   `create_table`/`begin_bulk`; Delta previously ignored it) now drives the Delta provider:
