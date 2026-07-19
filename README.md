@@ -647,7 +647,7 @@ SELECT * FROM lake.main.t WHERE id > 10;          -- streaming scan + file/row-g
 | Discover tables (local/S3/ADLS host-FS glob; OneLake via the ADLS Gen2 DFS endpoint) | ✅ |
 | Streaming scan + filter pushdown (Delta file pruning + Parquet row-group skipping) | ✅ |
 | `CREATE TABLE` / `INSERT` / CTAS / COPY (streaming bulk via the standard write path) | ✅ |
-| `DELETE` / `UPDATE` — rowid copy-on-write (plain Delta) or deletion vectors (opt-in) | ✅ |
+| `DELETE` / `UPDATE` — rowid deletion-vectors / merge-on-read (default) or copy-on-write (`deletion_vectors false`) | ✅ |
 | `DROP TABLE`, `ALTER TABLE … ADD COLUMN`, `RENAME TABLE` (local + OneLake) | ✅ |
 | Multi-schema: `schemas true` (local/S3 `<root>/<schema>/<table>`); schema-enabled OneLake lakehouses | ✅ |
 | Time travel: `FROM t AT (VERSION => n)` and `AT (TIMESTAMP => ts)` | ✅ |
@@ -731,12 +731,29 @@ Two more write options (also via `delta_write_options`):
 Delta ATTACH options: `PROVIDER 'delta'`, `SECRET <azure_sp>` (OneLake/ADLS auth), `READ_ONLY false`
 (required for OneLake writes), `schemas true` (two-level layout on local/S3), `compression` / `row_group_size`
 / `bloom_filter_columns` (write-tuning defaults — `bloom_filter_columns` is EW-codec-only; `native_write`
-blooms automatically, see [above](#partitioning--write-tuning)), `deletion_vectors true`
-(DV-based DELETE/UPDATE), `change_data_feed true` (CDF capture), `in_commit_timestamps true` (in-protocol
-monotonic timestamps for Spark/Fabric interop — `AT (TIMESTAMP)` also resolves on plain tables via the
-always-on commit timestamp). Tables are written as **plain Delta** (minReader 1 / minWriter 2, no features)
-by default, so Spark / delta-kernel / Fabric OneLake conversion read them; features are added only when the
-corresponding option is set. Full design: [`docs/delta-catalog.md`](docs/delta-catalog.md).
+blooms automatically, see [above](#partitioning--write-tuning)), `deletion_vectors true|false`,
+`column_mapping 'name'|'id'|'none'`, `row_tracking true`, `change_data_feed true` (CDF capture),
+`in_commit_timestamps true` (in-protocol monotonic timestamps for Spark/Fabric interop — `AT (TIMESTAMP)`
+also resolves without it via the always-on commit timestamp), `native_read true` / `native_write true`
+(DuckDB's own Parquet reader/writer for data files), `isolation_level 'write_serializable'|'serializable'`.
+Any of these can also be set **per table** with `CREATE TABLE … WITH (…)` (above).
+
+**Defaults** (when no options are given):
+
+| Option | Default | Effect |
+|--------|---------|--------|
+| `deletion_vectors` | **`true`** | DV / merge-on-read DELETE+UPDATE (+ row tracking); bumps the table to reader v3 |
+| `column_mapping` | **`'name'`** | writer v7; metadata-only RENAME / DROP COLUMN; Fabric T-SQL-endpoint compatible |
+| `change_data_feed`, `in_commit_timestamps`, `row_tracking`, `native_read`, `native_write`, `schemas` | `false` / off | opt-in |
+| `isolation_level` | `write_serializable` | Spark's default; `serializable` also serializes blind appends |
+| `compression` | `snappy` | + auto dictionary encoding + always-on min/max stats |
+
+So a **default** table is read by Spark, delta-kernel, and Fabric Spark + OneLake conversion (all
+validated live) — but **not** by SQL Server's DELTA reader (**protocol 1.0 only**) or the Fabric T-SQL
+endpoint's id-mapping gate. For SQL-Server / PolyBase interop, create the table plain with
+`deletion_vectors false, column_mapping 'none'` (per-table `WITH (…)`, or at ATTACH for the whole catalog) —
+that yields a minReader-1 / minWriter-2 table every reader accepts. Full design:
+[`docs/delta-catalog.md`](docs/delta-catalog.md).
 
 ### Liquid clustering (SORTED BY, bucket, hilbert_index)
 
