@@ -24,8 +24,8 @@ provider-agnostic, and the same extension hosts several backends selected at ATT
 inferred from the connection scheme):
 
 - **`sqlserver`** (default) — Microsoft SQL Server / Azure SQL / Fabric & Synapse warehouse (this document).
-- **`delta`** — a **Delta Lake** folder/lakehouse as a read-write catalog (local, S3, ADLS, and **Fabric
-  OneLake**), with DML, time travel, snapshots, Change Data Feed, and **liquid clustering** (`SORTED BY`,
+- **`delta`** — a **Delta Lake** folder/lakehouse as a read-write catalog (**local**, **S3**, and **Fabric
+  OneLake** — the abfss target), with DML, time travel, snapshots, Change Data Feed, and **liquid clustering** (`SORTED BY`,
   `bucket()`/`hilbert_index()`, clustered `OPTIMIZE`). See [Delta Lake provider](#delta-lake-provider).
 - **`dax`** — **Power BI / Analysis Services** semantic models over ADOMD (read-only DAX). See
   [`docs/dax-provider.md`](docs/dax-provider.md).
@@ -626,16 +626,25 @@ the native extension's batching/pooling/TDS knobs don't apply).
 
 `PROVIDER 'delta'` attaches a **Delta Lake** root as a read-write DuckDB catalog. Each subdirectory with a
 `_delta_log/` is a table; data I/O goes through DuckDB's `FileSystem` (so `azure`/`httpfs` + DuckDB secrets
-work), and the Delta log layer is the pure-C# [engineered-wood](https://github.com/curthagenlocher/engineered-wood)
-library. Works on **local**, **S3**, **ADLS**, and **Fabric OneLake**. (Aliases: `deltalake`; the primary
-name is `engineeredwooddelta`.)
+work), and the Delta log layer is the pure-C# [engineered-wood](https://github.com/cmettler/engineered-wood)
+library (an in-tree submodule). (Aliases: `deltalake`; the primary name is `engineeredwooddelta`.)
+
+**Storage targets** — table *discovery* is supported on **local** filesystems (incl. the Fabric-notebook
+fuse mount), **S3** (via `httpfs`), and **Fabric OneLake** (the abfss endpoint). Discovery on a **generic,
+non-OneLake ADLS** container is *not* supported: DuckDB's `azure` glob can't recurse a mid-path
+`…/*/_delta_log/*.json` tree ([duckdb-azure #174](https://github.com/duckdb/duckdb-azure)), which is exactly
+why OneLake takes a different route (below). Local uses `System.IO` enumeration, S3 the host-FS glob, and
+**OneLake the Fabric [Unity Catalog REST API](https://learn.microsoft.com/fabric/onelake/onelake-unity-catalog)**
+(`onelake.table.fabric.microsoft.com/…/unity-catalog`) — so OneLake carries a REST dependency: it resolves
+the workspace/lakehouse name→GUID + the schema-enabled flag via the Fabric API, then lists tables from the
+UC endpoint. Data reads/writes + `DROP` still go through the OneLake DFS endpoint.
 
 ```sql
--- Local / S3 / ADLS folder catalog
+-- Local / S3 folder catalog
 ATTACH '/lake/root' AS lake (TYPE fabricator, PROVIDER 'delta');
 
 -- Fabric OneLake (READ_ONLY false is REQUIRED — DuckDB forces remote ATTACH read-only otherwise;
--- one azure service-principal secret serves DuckDB IO + the OneLake DFS endpoint)
+-- one azure service-principal secret serves DuckDB IO + the Fabric Unity Catalog REST discovery)
 ATTACH 'abfss://Workspace@onelake.dfs.fabric.microsoft.com/LH.Lakehouse/Tables'
   AS lake (TYPE mssql, PROVIDER 'delta', SECRET fabric_sp, READ_ONLY false);
 
@@ -644,7 +653,7 @@ SELECT * FROM lake.main.t WHERE id > 10;          -- streaming scan + file/row-g
 
 | Feature | Status |
 |---------|--------|
-| Discover tables (local/S3/ADLS host-FS glob; OneLake via the ADLS Gen2 DFS endpoint) | ✅ |
+| Discover tables — local (`System.IO`), S3 (host-FS glob), OneLake (Fabric Unity Catalog REST API) | ✅ (generic non-OneLake ADLS not supported — duckdb-azure glob #174) |
 | Streaming scan + filter pushdown (Delta file pruning + Parquet row-group skipping) | ✅ |
 | `CREATE TABLE` / `INSERT` / CTAS / COPY (streaming bulk via the standard write path) | ✅ |
 | `DELETE` / `UPDATE` — rowid deletion-vectors / merge-on-read (default) or copy-on-write (`deletion_vectors false`) | ✅ |
@@ -728,7 +737,7 @@ Two more write options (also via `delta_write_options`):
   ```
   For append-time evolution via `INSERT`, use `ALTER TABLE ADD COLUMN` (supported) then `INSERT`.
 
-Delta ATTACH options: `PROVIDER 'delta'`, `SECRET <azure_sp>` (OneLake/ADLS auth), `READ_ONLY false`
+Delta ATTACH options: `PROVIDER 'delta'`, `SECRET <azure_sp>` (OneLake auth), `READ_ONLY false`
 (required for OneLake writes), `schemas true` (two-level layout on local/S3), `compression` / `row_group_size`
 / `bloom_filter_columns` (write-tuning defaults — `bloom_filter_columns` is EW-codec-only; `native_write`
 blooms automatically, see [above](#partitioning--write-tuning)), `deletion_vectors true|false`,
