@@ -4196,8 +4196,8 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   (execute, `ReadAllAsync()` **materialized** into an `InMemoryArrayStream` while the opener is valid); C++
   `fabricator_delta.cpp` binds via `DeltaSchema`+`ReadArrowSchema`, scans via `DeltaScan`+`ArrowStreamReader`.
   DuckDB applies projection/filter/aggregation above the scan. engineered-wood is referenced from
-  `Fabricator.Bridge` (sibling repo `D:\repos\engineered-wood`, **Apache.Arrow 23.0.0 aligned**, net10.0) +
-  published transitively. **One local engineered-wood patch:** `ActionSerializer` read optional `add`/`remove`
+  `Fabricator.Bridge` (**in-tree git submodule `engineered-wood/` at the repo root**, pinned to the
+  `cmettler/engineered-wood` fork, **Apache.Arrow 23.0.0 aligned**, net10.0) + published transitively. **One local engineered-wood patch:** `ActionSerializer` read optional `add`/`remove`
   numeric fields (`baseRowId`/`defaultRowCommitVersion`/remove `size`/`deletionTimestamp` — the **Delta
   row-tracking** fields) with a bare `GetInt64()` that throws on delta-rs's explicit `"field":null`; guarded with
   `TokenType==Null?null:GetInt64()`. Validated: `test/verify_delta.test` (39 — fixture `test/fixtures/delta_simple`,
@@ -4329,6 +4329,18 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   to `duckdb@08e34c4` (v1.5.4) + `extension-ci-tools@v1.5.3` (no 1.5.4 branch exists; v1.5.3 is the
   latest tooling for the 1.5.x line). `duckdb` is a **shallow** clone — bump via
   `git -C duckdb fetch --depth 1 origin <sha> && git -C duckdb checkout <sha>`.
+- **engineered-wood is an in-tree git submodule** (`engineered-wood/` at the repo root, since
+  2026-07-19; was a `D:\repos\engineered-wood` sibling ProjectReference). Pinned to the
+  **`cmettler/engineered-wood` fork** (has our Fabricator patches; `upstream` = Curt's, PR #4).
+  `Fabricator.Bridge.csproj` references `..\..\engineered-wood\src\EngineeredWood.DeltaLake.Table\…`.
+  **Init NON-recursively** — `git submodule update --init engineered-wood` — to skip EW's nested
+  `parquet-testing` corpus (its test data, ~half a GB, not needed to build). **Workflow:** EW dev
+  happens INSIDE the submodule working tree (`engineered-wood/`); the build uses the working tree, so
+  day-to-day edits/commits there don't touch the parent's pin. To RECORD a known-good EW version in
+  fabricator: push EW to the fork FIRST (the pin must be fetchable), THEN bump the pointer
+  (`git add engineered-wood && git commit`). The old "EW commits local-only, push on explicit ew push"
+  habit still holds during dev — just push before pinning. (The old `D:\repos\engineered-wood` sibling
+  is now redundant; the scratchpad spike csprojs still point at it but scratchpad is gitignored.)
 - **Windows build needs the VS dev env** — a plain shell fails at *compile* with `Cannot open include
   file: 'stdint.h'`. **Use the VS 18 vcvars, NOT VS 2022:**
   `C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvars64.bat`. The build is
@@ -4611,6 +4623,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
 
 ## Sibling repos (reference under `D:\repos\`)
 
+(engineered-wood is no longer here — it's an in-tree submodule `engineered-wood/`, see "Build & test".)
 `mssql-extension` (C++ TDS — compat target; adapting permitted, it's the user's repo),
 `adbc_scanner` (Arrow→DuckDB ingestion pattern), `airport` (function-declaration pattern),
 `SqlServerFlights` (reusable C# SqlClient/DAX→Arrow; its `Airport/Data` `ArrowTypeConverter.cs`/`FlightField.cs`

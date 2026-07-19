@@ -48,10 +48,11 @@
   </ItemGroup>
 
   <!-- Lakehouse (Delta) reader: Curt Hagenlocher's engineered-wood (pure C#), IO delegated to DuckDB's
-       FileSystem via the host reverse-callbacks. Sibling repo at D:\repos\engineered-wood (Apache.Arrow 23.0.0
-       aligned, net10.0). SPIKE — see docs/filesystem-bridge.md. -->
+       FileSystem via the host reverse-callbacks. In-tree git submodule at <repo>/engineered-wood (pinned to
+       the cmettler/engineered-wood fork; Apache.Arrow 23.0.0 aligned, net10.0). Init non-recursively
+       (git submodule update [init] engineered-wood) to skip EW's nested parquet-testing corpus. -->
   <ItemGroup>
-    <ProjectReference Include="..\..\..\engineered-wood\src\EngineeredWood.DeltaLake.Table\EngineeredWood.DeltaLake.Table.csproj" />
+    <ProjectReference Include="..\..\engineered-wood\src\EngineeredWood.DeltaLake.Table\EngineeredWood.DeltaLake.Table.csproj" />
   </ItemGroup>
 
 </Project>

@@ -6,3 +6,7 @@
 	path = extension-ci-tools
 	url = https://github.com/duckdb/extension-ci-tools.git
 	branch = v1.5.3
+[submodule "engineered-wood"]
+	path = engineered-wood
+	url = https://github.com/cmettler/engineered-wood.git
+	branch = master
