@@ -4327,7 +4327,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
 ### Build from a fresh clone (Windows) — the quickstart
 
 The detail bullets below explain the *why* of each step + the gotchas; this is the from-zero sequence.
-`<repo>` = the checkout root (`D:\repos\sqlserver-extension`). Run every cmake/ninja command **inside a
+`<repo>` = the checkout root (`D:\repos\fabricator-extension`). Run every cmake/ninja command **inside a
 VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
 
 **Prerequisites** (install first):
