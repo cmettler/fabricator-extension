@@ -25,9 +25,18 @@ inferred from the connection scheme):
 
 - **`sqlserver`** (default) — Microsoft SQL Server / Azure SQL / Fabric & Synapse warehouse (this document).
 - **`delta`** — a **Delta Lake** folder/lakehouse as a read-write catalog (local, S3, ADLS, and **Fabric
-  OneLake**), with DML, time travel, snapshots, and Change Data Feed. See [Delta Lake provider](#delta-lake-provider).
+  OneLake**), with DML, time travel, snapshots, Change Data Feed, and **liquid clustering** (`SORTED BY`,
+  `bucket()`/`hilbert_index()`, clustered `OPTIMIZE`). See [Delta Lake provider](#delta-lake-provider).
 - **`dax`** — **Power BI / Analysis Services** semantic models over ADOMD (read-only DAX). See
   [`docs/dax-provider.md`](docs/dax-provider.md).
+
+**The providers compose.** `CREATE TABLE … WITH (…)` sets per-table Delta properties + write tuning
+([WITH options](#create-table--with--options)), and — the headline — a SQL Server **external table over S3**
+becomes **writable through this extension**: `INSERT` / `UPDATE` / `DELETE` on an S3 Delta (or Parquet)
+external table route to storage via the Delta writer, and one `CREATE TABLE … WITH (location=…,
+table_type='DELTA') AS …` writes the data + auto-provisions the external table — capabilities SQL Server
+has no native equivalent for (it cannot INSERT into an S3 external table, and cannot write Delta at all).
+See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 
 > Project knowledge & build notes for contributors live in [`CLAUDE.md`](CLAUDE.md), the full
 > warehouse design in [`docs/warehouse-support.md`](docs/warehouse-support.md), and the Delta catalog
@@ -56,7 +65,11 @@ inferred from the connection scheme):
 | | CHECK/FK constraint enforcement on INSERT | ✅ (`SqlBulkCopyOptions.CheckConstraints`; COPY/CTAS skip for speed) |
 | **DDL** | CREATE/DROP TABLE, CREATE/DROP SCHEMA, ALTER TABLE | ✅ |
 | | PRIMARY KEY / UNIQUE / NOT NULL / literal DEFAULT on CREATE | ✅ |
+| | `CREATE TABLE … WITH (…)` options (per-table Delta properties / write tuning / feature flags) | ✅ |
 | | CHECK constraints, non-literal DEFAULTs | ❌ (use `fabricator_exec`) |
+| **S3 external tables** | `INSERT` into a detected SQL Server S3 **Delta/Parquet** external table → routed to storage | ✅ |
+| | Identity-keyed `UPDATE` / `DELETE` on an S3 Delta external table | ✅ |
+| | `CREATE TABLE … WITH (location=…, table_type='DELTA'\|'PARQUET') [AS …]` — write + auto-provision the external table | ✅ |
 | **Tx** | BEGIN / COMMIT / ROLLBACK (connection pinning, read-your-writes) | ✅ |
 | **Functions** | `fabricator_query`, `fabricator_exec`, `fabricator_refresh_cache`, `fabricator_invalidate_cache`, `fabricator_version` | ✅ |
 | | `fabricator_functions(catalog)` — list discovered routines | ✅ |
@@ -641,8 +654,12 @@ SELECT * FROM lake.main.t WHERE id > 10;          -- streaming scan + file/row-g
 | Snapshots/history: `fabricator_delta_snapshots('<catalog>', '<schema.>table')` | ✅ |
 | **Change Data Feed**: `change_data_feed true` + `fabricator_delta_changes('<catalog>', '<schema.>table', from[, to])` | ✅ |
 | **Partitioning**: native `CREATE TABLE … PARTITIONED BY (cols)` (or the `delta_write_options` setting) → Hive `col=value/` layout | ✅ |
-| **Write tuning**: compression / row-group size / bloom filters via ATTACH options or the `delta_write_options` JSON setting | ✅ |
-| Concurrent writers (OCC retry on append/CTAS; rowid DML is snapshot-bound) | ✅ |
+| **Write tuning**: compression / row-group size / bloom filters via ATTACH options, the `delta_write_options` setting, or per-table `WITH (…)` | ✅ |
+| **Liquid clustering**: `SORTED BY (cols)`, `bucket()` / `hilbert_index()`, clustered `OPTIMIZE` (incremental ZCube), `ALTER … SET SORTED BY` | ✅ |
+| Per-table `WITH (…)` — Delta properties / feature-flag overrides / write tuning stamped in the CREATE commit | ✅ |
+| `native_write` / `native_read` — DuckDB's own Parquet reader/writer for data files (EW keeps the `_delta_log`) | ✅ |
+| VARIANT columns; `set_tblproperties` / `tblproperties`; `OPTIMIZE` / `VACUUM` maintenance | ✅ |
+| Concurrent writers: OCC retry (append/CTAS) + **row-level concurrency** (disjoint-row DML on DV tables); S3 multi-writer via a secret | ✅ |
 
 ```sql
 -- Time travel + history
@@ -717,6 +734,95 @@ always-on commit timestamp). Tables are written as **plain Delta** (minReader 1 
 by default, so Spark / delta-kernel / Fabric OneLake conversion read them; features are added only when the
 corresponding option is set. Full design: [`docs/delta-catalog.md`](docs/delta-catalog.md).
 
+### Liquid clustering (SORTED BY, bucket, hilbert_index)
+
+Delta tables can be **ordered-on-write** and **clustered on OPTIMIZE** for tight per-file min/max (data
+skipping). `CREATE TABLE … SORTED BY (cols)` persists the clustering spec and every write re-applies the
+order; a later `OPTIMIZE` *reclusters* (incremental ZCube — cost tracks new data, and Databricks/Fabric
+Spark recognize our cubes as their own). Two global scalars help build multi-key / bucketed layouts:
+
+```sql
+-- SORTED BY: lexicographic ordered writes + clustered OPTIMIZE
+CREATE TABLE lake.main.events SORTED BY (grp, id) AS SELECT * FROM src;
+CALL fabricator_exec('lake', 'OPTIMIZE main.events');            -- reclusters into contiguous ranges
+
+-- hilbert_index(coords[], bits): multi-dimensional locality in ONE ORDER BY key (liquid-clustering style)
+COPY (SELECT * FROM src ORDER BY hilbert_index([width_bucket(x,0,100,64), width_bucket(y,0,100,64)], 15))
+  TO 'lake.main.geo' (FORMAT delta);
+
+-- bucket(n, value): the Iceberg / DuckLake bucket transform (Murmur3, cross-engine-identical). Delta has no
+-- transform partitioning, so materialize the bucket column and PARTITION BY it; queries prune by folding
+-- bucket(n, <literal>) at plan time (the scalars are CONSISTENT, not volatile).
+CREATE TABLE lake.main.users PARTITIONED BY (ubucket) AS
+  SELECT *, bucket(8, user_name) AS ubucket FROM src;
+SELECT * FROM lake.main.users WHERE user_name = 'alice' AND ubucket = bucket(8, 'alice');  -- prunes to 1 file
+```
+
+`ALTER TABLE t SET SORTED BY (a, b)` / `RESET SORTED BY` re-keys an existing table (a metadata commit; the
+next `OPTIMIZE` reclusters by the new key). Scalar functions also declare **volatility** now
+(`IScalarFunction.IsVolatile`) — a pure function folds constant args at plan time, which is what makes
+`WHERE bucket_col = bucket(8, 'alice')` reach the scan as a partition filter.
+
+## CREATE TABLE … WITH (…) options
+
+`CREATE TABLE [AS] … WITH (key='value', …)` (parsed natively by DuckDB v1.5.4) passes per-table options to
+the provider. On the **Delta** provider three kinds of key are consumed, and unknown keys are **rejected**
+(never silently ignored):
+
+```sql
+-- write tuning (CTAS): DuckLake-parity names, winning over delta_write_options and the ATTACH defaults
+CREATE TABLE lake.main.t WITH (parquet_compression='zstd', parquet_row_group_size=1000000) AS SELECT …;
+
+-- per-table feature-flag overrides: the protocol-1.0 recipe for one table, no dedicated ATTACH
+CREATE TABLE lake.main.plain WITH (deletion_vectors=false, column_mapping='none') AS SELECT …;
+
+-- delta.* / fabricator.* table properties stamped in the CREATE commit (one commit, no follow-up set)
+CREATE TABLE lake.main.t WITH ("delta.isolationLevel"='Serializable', "fabricator.myTag"='hello') AS SELECT …;
+```
+
+Keys: `parquet_compression` / `parquet_row_group_size` / `parquet_bloom_filter_columns`; `deletion_vectors`
+/ `column_mapping` / `row_tracking` / `change_data_feed` / `in_commit_timestamps`; any quoted `delta.*` /
+`fabricator.*` property; and `table_type='DELTA'` / `format='parquet'` (validated no-ops, for the
+Iceberg-style DDL shape). The SQL Server provider's `WITH` keys drive external tables (next section); DAX
+and deltars reject options.
+
+## SQL Server external tables on S3
+
+SQL Server can read CSV / Parquet / **Delta** on S3 natively, but it can **never write** an S3 external
+table (and cannot write Delta at all). This extension makes those tables **writable** — the write is
+performed client-side and SQL Server keeps serving the reads:
+
+```sql
+ATTACH 'Server=…;Database=db' AS sqldb (TYPE fabricator);   -- SQL Server 2025 / Azure SQL / Fabric
+
+-- (A) INSERT into a DETECTED external table → routed to storage (Delta append / new Parquet file).
+--     The extension resolves the matching DuckDB s3 secret by bucket scope; SQL Server serves the read.
+INSERT INTO sqldb.dbo.trips_ext SELECT * FROM staging;
+SELECT count(*) FROM sqldb.dbo.trips_ext;                   -- SQL Server reads it back
+
+-- (B) One-statement CETAS-analog: write the Delta table client-side (protocol-1.0 plain, so SQL Server
+--     reads it) + auto-provision the EXTERNAL FILE FORMAT + EXTERNAL TABLE. data_source names a
+--     pre-provisioned EXTERNAL DATA SOURCE (no credentials cross this path).
+CREATE TABLE sqldb.dbo.sales
+  WITH (location='s3://minio:9000/lake/sales', table_type='DELTA', data_source='s3_ds')
+  AS SELECT * FROM src;
+
+-- (D) An IDENTITY column bridges the rowid domains → identity-keyed UPDATE / DELETE on the S3 Delta table
+--     (copy-on-write keeps it protocol-1.0 SQL-readable). Declare it with the empty-CREATE form:
+CREATE TABLE sqldb.dbo.dim (id BIGINT AS (0), name VARCHAR)
+  WITH (location='s3://minio:9000/lake/dim', table_type='DELTA', data_source='s3_ds');
+INSERT INTO sqldb.dbo.dim (name) VALUES ('a'), ('b');
+UPDATE sqldb.dbo.dim SET name = 'bee' WHERE id = 2;         -- resolved to a Delta rowid, applied on S3
+DELETE FROM sqldb.dbo.dim WHERE id = 1;
+```
+
+The identity column is the only sound bridge between SQL Server's scan (which produces identity values) and
+the Delta writer (which resolves them back to physical rowids via a pruned scan) — it is snapshot-independent
+and PolyBase-visible, unlike Delta's off-schema `_metadata.row_id`. `DROP TABLE` on a detected external table
+emits `DROP EXTERNAL TABLE` (metadata-only; the storage data stays). Storage writes are their own commit, so
+they are autocommit-only (rejected inside an explicit transaction). Full design:
+[`docs/create-table-with-options.md`](docs/create-table-with-options.md).
+
 ## Build
 
 ### Managed bridge
@@ -728,13 +834,20 @@ pwsh scripts/publish-managed.ps1     # self-contained publish next to the built 
 
 ### Extension
 
-Requires the submodules (`duckdb@v1.5.4` + `extension-ci-tools@v1.5.3`):
+Three submodules — init **non-recursively** (skips engineered-wood's ~½ GB nested `parquet-testing` corpus):
 
 ```bash
-git submodule update --init --recursive
-make                                 # builds DuckDB + the extension (POSIX/CI)
-pwsh scripts/publish-managed.ps1     # publish the bridge beside the extension
+git submodule update --init --depth 1 duckdb            # duckdb@v1.5.4 (shallow — large)
+git submodule update --init extension-ci-tools engineered-wood
 ```
+
+- **`duckdb@v1.5.4`** + **`extension-ci-tools@v1.5.3`** — the DuckDB source + build tooling.
+- **`engineered-wood`** — the pure-C# Delta/Parquet library (pinned to the
+  [`cmettler/engineered-wood`](https://github.com/cmettler/engineered-wood) fork), referenced in-tree by
+  `Fabricator.Bridge`.
+
+`httpfs` is linked unconditionally (for `s3://`), so it needs OpenSSL + curl from **vcpkg**:
+`vcpkg install openssl:x64-windows-static curl:x64-windows-static` (with `VCPKG_ROOT` set).
 
 On Windows, build with CMake + Ninja inside a **VS 18** dev environment — run
 `"C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvars64.bat"` first (a plain
@@ -749,9 +862,13 @@ cmake -G Ninja -DEXTENSION_STATIC_BUILD=1 `
   -DDUCKDB_EXPLICIT_PLATFORM=windows_amd64 `
   -DENABLE_EXTENSION_AUTOLOADING=1 -DENABLE_EXTENSION_AUTOINSTALL=1 `
   -DENABLE_UNITTEST_CPP_TESTS=FALSE -DCMAKE_BUILD_TYPE=Release `
+  -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+  -DVCPKG_TARGET_TRIPLET=x64-windows-static `
   -S <repo>/duckdb -B <repo>/build/release
 cmake --build build/release --target fabricator_loadable_extension duckdb shell
 ```
+
+(`CLAUDE.md` has the full from-a-fresh-clone quickstart + prerequisites.)
 
 Produces `build/release/extension/fabricator/fabricator.duckdb_extension` and a `build/release/duckdb.exe`
 that already embeds the extension (no `LOAD` needed). The bridge is located via `FABRICATOR_MANAGED_DIR`,
@@ -780,7 +897,16 @@ dotnet/Fabricator.Bridge/      backend-agnostic managed bridge (ABI, Arrow, IBac
                              also hosts the Delta provider (DeltaCatalog/DeltaReader over engineered-wood)
 dotnet/Fabricator.SqlServer/   Microsoft.Data.SqlClient backend + composition root
 dotnet/Fabricator.AnalysisServices/  Power BI / DAX (ADOMD) backend — PROVIDER 'dax'
+engineered-wood/             in-tree submodule: pure-C# Delta/Parquet library (the delta provider's log layer)
 scripts/publish-managed.ps1  self-contained publish of the bridge + .NET runtime
 test/                        verify_*.test + mssqlcompat/ (regenerated from the native extension)
 CMakeLists.txt, Makefile, extension_config.cmake, vcpkg.json, CLAUDE.md
 ```
+
+## License
+
+[MIT](LICENSE) © 2026 Christoph Mettler.
+
+Bundled submodules keep their own licenses (all MIT): [DuckDB](https://github.com/duckdb/duckdb),
+[extension-ci-tools](https://github.com/duckdb/extension-ci-tools), and
+[engineered-wood](https://github.com/cmettler/engineered-wood).
