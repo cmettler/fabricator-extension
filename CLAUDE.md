@@ -248,6 +248,23 @@ current code still uses the single-provider `fabricator` naming):
 ## Next up (open threads for future sessions)
 
 In-flight / planned refactors (all C#-only unless noted; tests stay green per slice):
+- **`CREATE TABLE … WITH (…)` options + SQL Server EXTERNAL TABLES — PLANNED (2026-07-19, nothing
+  built): [docs/create-table-with-options.md](docs/create-table-with-options.md).** DuckDB v1.5.4
+  already parses the clause (`CreateTableInfo::options`; we currently REJECT it in
+  `SupportsCreateTable`). Three slices, order A→C→B: **A** = thread `options_json` through
+  `create_table`+`begin_bulk` (ABI v67, the v51 partition_columns precedent) → Delta per-table
+  write tuning (`parquet_compression`/`parquet_row_group_size`/bloom), per-table CREATE-flag
+  overrides (`deletion_vectors`/`column_mapping`/… — the PolyBase recipe without a dedicated
+  ATTACH), and `delta.*`/`fabricator.*` TBLPROPERTIES stamped at CREATE (one commit); unknown keys
+  error, WITH > `delta_write_options` > ATTACH. **C** (no ABI) = detect S3 external tables in the
+  SQL catalog (`sys.external_tables` join, lazy at write time) and route INSERT through storage —
+  Delta append via `BackendRegistry.Resolve("delta").OpenCatalog` transient catalog / parquet =
+  new file COPY — a capability SQL Server itself lacks; DuckDB s3 secret resolved by bucket scope,
+  its ENDPOINT authoritative (SQL's LOCATION host is SQL's network view); autocommit-only + guards;
+  DROP routes to `DROP EXTERNAL TABLE`. **B** = `CREATE TABLE … WITH (location=…, table_type=
+  'DELTA'|'PARQUET' [, data_source=…, secret=…]) AS …` on the SQL provider: client-side write
+  (DELTA forced protocol-1.0 plain) + auto-provisioned MASTER KEY/credential/data source/file
+  format/external table — the `verify_mssql_s3_polybase` manual flow as one DDL.
 - **`hilbert_index` global scalar — DONE (2026-07-18, C#-only, no ABI): the liquid-clustering-style
   ordered-write primitive.** `hilbert_index(coords BIGINT[], bits) → BIGINT` (Bridge
   `HilbertIndexFunction`, declared in `CustomFunctions.GlobalScalar` — the fabricator_render slot):
