@@ -46,7 +46,7 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 
 | Area | Feature | Status |
 |------|---------|--------|
-| **Connect** | `ATTACH (TYPE mssql)` — connection string, `mssql://` URI, `CREATE SECRET` | ✅ |
+| **Connect** | `ATTACH (TYPE fabricator)` — connection string, `mssql://` URI, `CREATE SECRET` | ✅ |
 | | Azure Entra ID / Fabric auth (service principal, managed identity, default, token, …) | ✅ |
 | | `schema_filter` / `table_filter` (regex) | ✅ |
 | | ATTACH-time connection validation (no orphan catalog on failure) | ✅ |
@@ -100,7 +100,7 @@ next to the extension (no .NET install required on the host).
 ```sql
 -- Connection string (a valid Microsoft.Data.SqlClient string)
 ATTACH 'Server=host,1433;Database=db;User Id=sa;Password=***;TrustServerCertificate=true;Encrypt=true'
-  AS mssql (TYPE mssql);
+  AS mssql (TYPE fabricator);
 
 SELECT * FROM mssql.dbo.people WHERE id > 1;   -- automatic streaming scan + filter pushdown
 SELECT count(*) FROM mssql.dbo.people;
@@ -116,14 +116,14 @@ A `fabricator` connection is given **either** a `Microsoft.Data.SqlClient` conne
 ```sql
 -- ADO.NET / SqlClient connection string
 ATTACH 'Server=host,1433;Database=db;User Id=sa;Password=***;TrustServerCertificate=true;Encrypt=true'
-  AS mssql (TYPE mssql);
+  AS mssql (TYPE fabricator);
 
 -- mssql:// URI (encrypt defaults on; ?encrypt=false to disable)
 ATTACH 'mssql://sa:***@host:1433/db' AS mssql (TYPE fabricator);
 
 -- Restrict catalog discovery on large servers (case-insensitive regex, partial match)
 ATTACH 'Server=...;Database=...' AS mssql
-  (TYPE mssql, schema_filter '^(dbo|sales)$', table_filter '^fact_');
+  (TYPE fabricator, schema_filter '^(dbo|sales)$', table_filter '^fact_');
 ```
 
 ### Secrets
@@ -583,13 +583,15 @@ SELECT cf_bit_or(x) OVER (ORDER BY id) FROM t;                -- window (running
 
 ## Settings
 
-`SET mssql_*` settings are accepted for compatibility with the native extension. Two are **active**;
-the rest are accepted but currently no-ops (the C# backend uses `SqlBulkCopy` and SqlClient pooling, so
-the native extension's batching/pooling/TDS knobs don't apply).
+`SET mssql_*` settings; several are **active**, the rest are accepted for compatibility with the native
+extension but are currently no-ops (the C# backend uses `SqlBulkCopy` and SqlClient pooling, so the native
+extension's batching/pooling/TDS knobs don't apply). The Delta provider adds the `delta_write_options` JSON
+setting (see [Partitioning & write tuning](#partitioning--write-tuning)).
 
 | Setting | Status | Description |
 |---------|--------|-------------|
 | `mssql_mars` | **Active** | MARS mode: `auto` (default, per engine — off for Fabric/Synapse) \| `true` \| `false`. Resolved once at first connection — set **before** ATTACH |
+| `mssql_command_timeout` | **Active** | `SqlCommand.CommandTimeout` (seconds) for scans / DML / bulk; **default `0` = infinite**. Server-enforced per round-trip; overrides the per-catalog `command_timeout` ATTACH option |
 | `mssql_default_varchar_length` | **Active** | Length `n` for created text columns (`NVARCHAR(n)`/`VARCHAR(n)`); unset ⇒ `MAX`. Needed for indexable string keys |
 | `mssql_default_table_type` | **Active** | Created-table storage: `''` (rowstore) \| `clustered columnstore` (CCI, box/Azure; no-op on Fabric — columnstore already) |
 | `mssql_cluster_by` | **Active** | Comma-separated columns → Fabric Warehouse/Synapse `WITH (CLUSTER BY (cols))` on created tables (fallback for a native `SORTED BY` clause; no-op on box) |
@@ -648,7 +650,7 @@ ATTACH '/lake/root' AS lake (TYPE fabricator, PROVIDER 'delta');
 -- Fabric OneLake (READ_ONLY false is REQUIRED — DuckDB forces remote ATTACH read-only otherwise;
 -- one azure service-principal secret serves DuckDB IO + the Fabric Unity Catalog REST discovery)
 ATTACH 'abfss://Workspace@onelake.dfs.fabric.microsoft.com/LH.Lakehouse/Tables'
-  AS lake (TYPE mssql, PROVIDER 'delta', SECRET fabric_sp, READ_ONLY false);
+  AS lake (TYPE fabricator, PROVIDER 'delta', SECRET fabric_sp, READ_ONLY false);
 
 SELECT * FROM lake.main.t WHERE id > 10;          -- streaming scan + file/row-group filter pushdown
 ```
@@ -881,6 +883,46 @@ and PolyBase-visible, unlike Delta's off-schema `_metadata.row_id`. `DROP TABLE`
 emits `DROP EXTERNAL TABLE` (metadata-only; the storage data stays). Storage writes are their own commit, so
 they are autocommit-only (rejected inside an explicit transaction). Full design:
 [`docs/create-table-with-options.md`](docs/create-table-with-options.md).
+
+## Power BI / DAX provider
+
+`PROVIDER 'dax'` (aliases `adomd` / `powerbi` / `ssas` / `fabric`) attaches a **Power BI / Analysis
+Services semantic model** over ADOMD as a **read-only** DuckDB catalog. Tables come from the model
+(`$SYSTEM.TMSCHEMA_*`), scans run as `EVALUATE SELECTCOLUMNS(…)` with best-effort filter pushdown (`=` /
+`IN` / `ISBLANK` for any type; ordering comparisons for non-string), and a `system` schema exposes a
+curated set of VertiPaq / `$SYSTEM` DMVs.
+
+```sql
+-- Local Power BI Desktop (Windows — auto-detects the running msmdsrv port)
+ATTACH 'pbidesktop://' AS pbi (TYPE fabricator, PROVIDER 'dax');
+
+-- Fabric / AAS / SSAS XMLA endpoint (Entra via a foreign `azure` service-principal secret — the same
+-- kind used for OneLake, e.g. `fabric_sp` above; a remote endpoint without a secret uses DefaultAzureCredential)
+ATTACH 'Data Source=powerbi://api.powerbi.com/v1.0/myorg/WS;Initial Catalog=Model'
+  AS m (TYPE fabricator, PROVIDER 'dax', SECRET fabric_sp);
+
+SELECT * FROM pbi."Model"."Sales" WHERE Region = 'US';          -- scan + filter pushdown
+SELECT * FROM m.system."TMSCHEMA_TABLES";                        -- $SYSTEM DMV
+```
+
+Three DAX functions are exposed under the model schema (`expression` is a named param, so the optional
+ones coexist):
+
+```sql
+-- Evaluate arbitrary DAX; params bind as ADOMD @name (a DuckDB STRUCT or a JSON string)
+SELECT * FROM m."Model".daxeval(expression := 'EVALUATE TOPN(10, ''Sales'')');
+SELECT * FROM m."Model".daxeval(expression := 'EVALUATE FILTER(''Sales'', [Amt] > @min)',
+                                params := {'min': 1000});
+
+-- Inject a DuckDB input table as a DAX DATATABLE and evaluate once (collector — no row cap)
+SELECT * FROM m."Model".daxevaltable((SELECT * FROM ids), expression := 'EVALUATE …');
+-- …or once per input row (@column params)
+SELECT * FROM m."Model".daxeach((SELECT region FROM regions), expression := 'EVALUATE …');
+```
+
+Writes throw (semantic models are read-only through DAX); `BEGIN`/`COMMIT`/`ROLLBACK` are no-ops so a
+wrapping DuckDB transaction over read-only DAX doesn't fail. Full design + the DirectLake-passthrough /
+TMDL notes: [`docs/dax-provider.md`](docs/dax-provider.md).
 
 ## Build
 
