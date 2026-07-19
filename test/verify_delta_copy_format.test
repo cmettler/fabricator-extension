@@ -376,3 +376,85 @@ query I
 SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/copyfmt/rp/id=5/*.parquet');
 ----
 1
+
+# ----------------------------------------------------------------------------
+# SORTED_COLUMNS: the SORTED BY analog for the COPY surface — DECLARATIVE clustering.
+# Orders every run's stream; persisted at create (fabricator.sortedBy + the
+# delta.clustering domain, unpartitioned); an EXISTING table whose persisted spec
+# differs is RE-KEYED first, so repeated runs converge (dbt-style). Removal is DDL
+# (ALTER TABLE ... RESET SORTED BY).
+# ----------------------------------------------------------------------------
+
+statement ok
+COPY (SELECT ((i * 91) % 500)::INT AS id, 'v' || i AS val FROM range(500) t(i))
+  TO '${FABRICATOR_DELTA_WRITE_DIR}/copyfmt/sc' (FORMAT delta, SORTED_COLUMNS 'id');
+
+# the create persisted the property AND declared the clustering domain
+query I
+SELECT count(*) FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/copyfmt/sc/_delta_log/00000000000000000000.json')
+WHERE content LIKE '%fabricator.sortedBy%' AND content LIKE '%delta.clustering%';
+----
+1
+
+# the written file is ordered (fabricator_delta_scan preserves file order for a single file)
+query I
+WITH o AS (SELECT id, lag(id) OVER () AS p FROM fabricator_delta_scan('${FABRICATOR_DELTA_WRITE_DIR}/copyfmt/sc'))
+SELECT count(*) FROM o WHERE p IS NOT NULL AND p > id;
+----
+0
+
+# an append run with the SAME spec is metadata-idempotent: exactly ONE data commit, no re-key
+statement ok
+COPY (SELECT ((i * 17) % 500)::INT AS id, 'w' || i AS val FROM range(500, 1000) t(i))
+  TO '${FABRICATOR_DELTA_WRITE_DIR}/copyfmt/sc' (FORMAT delta, MODE 'append', SORTED_COLUMNS 'id');
+
+# (a create-COPY is two commits: the v0 CREATE + the v1 WRITE; the append adds exactly one)
+query I
+SELECT count(*) FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/copyfmt/sc/_delta_log/*.json');
+----
+3
+
+# a run with a CHANGED spec re-keys FIRST (a SET SORTED BY metadata commit), then appends:
+# two more commits, the property converged, the new file ordered by the NEW key
+statement ok
+COPY (SELECT ((i * 13) % 500)::INT AS id, 'x' || i AS val FROM range(1000, 1500) t(i))
+  TO '${FABRICATOR_DELTA_WRITE_DIR}/copyfmt/sc' (FORMAT delta, MODE 'append', SORTED_COLUMNS 'val');
+
+query I
+SELECT count(*) FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/copyfmt/sc/_delta_log/*.json');
+----
+5
+
+query I
+SELECT count(*) FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/copyfmt/sc/_delta_log/*.json')
+WHERE content LIKE '%"operation":"SET SORTED BY"%' AND content LIKE '%val%';
+----
+1
+
+query I
+SELECT count(*) FROM fabricator_delta_scan('${FABRICATOR_DELTA_WRITE_DIR}/copyfmt/sc');
+----
+1500
+
+# SORTED_COLUMNS + PARTITION_COLUMNS compose: property-only (no clustering domain — mutual exclusion),
+# per-partition files ordered
+statement ok
+COPY (SELECT ['US','EU'][(i % 2) + 1] AS region, ((i * 91) % 400)::INT AS id FROM range(400) t(i))
+  TO '${FABRICATOR_DELTA_WRITE_DIR}/copyfmt/scp' (FORMAT delta, PARTITION_COLUMNS 'region', SORTED_COLUMNS 'id');
+
+query I
+SELECT count(*) FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/copyfmt/scp/_delta_log/00000000000000000000.json')
+WHERE content LIKE '%delta.clustering%';
+----
+0
+
+query I
+SELECT count(*) FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/copyfmt/scp/_delta_log/00000000000000000000.json')
+WHERE content LIKE '%fabricator.sortedBy%';
+----
+1
+
+query I
+SELECT count(*) FROM fabricator_delta_scan('${FABRICATOR_DELTA_WRITE_DIR}/copyfmt/scp');
+----
+400

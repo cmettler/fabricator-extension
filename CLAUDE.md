@@ -434,6 +434,25 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   enumerated); `verify_delta_clustered_optimize` 138 (§7: DDL declare on plain table + protocol upgrade
   + INSERT re-applies order, domain re-key → incremental reorder by new key, RESET removes property+
   domain [removed:true pin], unknown-column/DESC/SET PARTITIONED BY guards, partitioned property-only).
+  **`SORTED_COLUMNS` COPY option — DONE (2026-07-19, C++ option-parse only, no ABI): DECLARATIVE
+  clustering for the no-ATTACH COPY surface** (dbt `delta_external` etc. — the SORTED BY analog next to
+  `PARTITION_COLUMNS`; deliberately NOT `ORDER_BY`, planner-intercepted). `COPY … TO '<path>/<t>'
+  (FORMAT delta, SORTED_COLUMNS 'a,b')` orders every run's stream (the existing v52 `begin_bulk
+  sort_columns` param — the C++ COPY passed "" before) and is **declarative, dbt-style convergent**: at
+  create it persists `fabricator.sortedBy` + declares the `delta.clustering` domain (unpartitioned);
+  on a run against an EXISTING table whose persisted spec DIFFERS, `DeltaCatalog.BulkInsert` RE-KEYS
+  FIRST (the SetSortedBy machinery — one metadata commit, property+domain; old ZCubes go stale → next
+  OPTIMIZE reclusters incrementally) then writes — so repeated runs are metadata-idempotent and a
+  config change converges the table on the next run. Runs AFTER the MODE dispositions (no metadata side
+  effects from 'error'/'ignore'); ABSENT option keeps the persisted spec (PARTITION_COLUMNS precedent);
+  REMOVAL is DDL (`ALTER … RESET SORTED BY` — an empty option value can't cross the column-list ABI,
+  `SplitColumnList` collapses it to null); changing the spec inside an explicit txn → clean error (the
+  re-key is an immediate commit). Composes with `PARTITION_COLUMNS` (property-only, no domain). Also
+  reaches the SQL Server provider (warehouse `CLUSTER BY` on CREATE_TABLE copies, v52 machinery — no
+  re-key surface there, create-time only). `verify_delta_copy_format` 109 (create persists property+
+  domain + ordered file, same-spec append = exactly one data commit, changed-spec run = SET SORTED BY
+  commit + data commit with the property converged, partitioned = property-only). NOTE a create-COPY is
+  TWO commits (v0 CREATE + v1 WRITE).
 - **`SORTED BY` → Delta ORDERED (clustered) writes — DONE (2026-07-18, C#-only, no ABI).** The v52 native
   clause (`CREATE TABLE lake.s.t SORTED BY (a,b) [AS …]` — `sort_columns` already crossed the ABI to
   `create_table`/`begin_bulk`; Delta previously ignored it) now drives the Delta provider:

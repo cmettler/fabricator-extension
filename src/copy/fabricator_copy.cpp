@@ -43,6 +43,8 @@ struct FabricatorCopyBindData : public FunctionData {
 	bool transient_delta = false;
 	string options_json;       // provider ATTACH-style options forwarded to the transient open_catalog
 	string partition_columns;  // PARTITION_COLUMNS COPY option (create-time Hive partitioning; Delta)
+	string sort_columns;       // SORTED_COLUMNS COPY option (ordered/clustered write; declarative — Delta
+	                           // re-keys an existing table whose persisted spec differs)
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto result = make_uniq<FabricatorCopyBindData>();
@@ -271,6 +273,12 @@ static unique_ptr<FunctionData> DeltaCopyToBind(ClientContext &context, CopyFunc
 		BindCommonCopyOptions(input.info.options, *bind_data, "delta");
 	}
 	bind_data->partition_columns = GetStringOption(input.info.options, "PARTITION_COLUMNS");
+	// SORTED_COLUMNS: the SORTED BY analog for the COPY surface (deliberately NOT ORDER_BY, which the
+	// planner intercepts). Orders THIS write's stream; on Delta it is DECLARATIVE — persisted at create
+	// (fabricator.sortedBy + the delta.clustering domain, unpartitioned) and an EXISTING table whose
+	// persisted spec differs is RE-KEYED first, so repeated runs converge (dbt-style). Removal is DDL:
+	// ALTER TABLE ... RESET SORTED BY (an empty option value cannot cross the column-list ABI).
+	bind_data->sort_columns = GetStringOption(input.info.options, "SORTED_COLUMNS");
 
 	// Provider options → the transient open_catalog's ATTACH-options JSON. NATIVE_WRITE defaults true.
 	string json = "{\"native_write\":\"" +
@@ -326,7 +334,7 @@ static unique_ptr<GlobalFunctionData> CopyToInitGlobal(ClientContext &context, F
 	gstate->bulk_session = fabricator::BeginBulk(handle, bind_data.schema_name, bind_data.table_name,
 	                                           bind_data.create_table, bind_data.replace, /*check_constraints=*/false,
 	                                           gstate->txn_id, schema, bind_data.partition_columns,
-	                                           /*sort_columns=*/"", bind_data.schema_mode,
+	                                           bind_data.sort_columns, bind_data.schema_mode,
 	                                           bind_data.partition_overwrite);
 	return std::move(gstate);
 }

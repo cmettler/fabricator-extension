@@ -1690,6 +1690,40 @@ public sealed class DeltaCatalog : IBackendCatalog
             }
         }
 
+        // SORTED_COLUMNS declarative convergence (the COPY surface): when the target EXISTS and its
+        // persisted fabricator.sortedBy differs from the declared columns, RE-KEY first — one metadata
+        // commit updating the property AND (unpartitioned) the delta.clustering domain, the SetSortedBy
+        // machinery — so repeated runs converge the table to the declared spec (dbt-style; old ZCubes go
+        // stale and the next OPTIMIZE reclusters incrementally). An ABSENT option keeps the persisted
+        // spec (the PARTITION_COLUMNS precedent); removal is DDL (ALTER TABLE … RESET SORTED BY). Runs
+        // AFTER the dispositions so MODE 'error'/'ignore' never take metadata side effects.
+        if (sortColumns is { Count: > 0 } && TableExists(tablePath))
+        {
+            var persisted = DeltaWriter.ParseSortedBy(
+                DeltaReader.GetTableConfig(opener, tablePath, DeltaWriter.SortedByKey));
+            bool same = persisted is not null && persisted.Count == sortColumns.Count;
+            for (int i = 0; same && i < persisted!.Count; i++)
+            {
+                same = string.Equals(persisted[i], sortColumns[i], System.StringComparison.OrdinalIgnoreCase);
+            }
+            if (!same)
+            {
+                if (_txnBuffer.IsExplicit(txnId))
+                {
+                    throw new System.NotSupportedException(
+                        "delta: changing SORTED_COLUMNS inside an explicit transaction is not supported "
+                        + "(the re-key is an immediate metadata commit) — COMMIT first, or align the "
+                        + "declared columns with the table's fabricator.sortedBy.");
+                }
+                _log.LogInformation(
+                    "delta bulk {Schema}.{Table}: SORTED_COLUMNS changed ([{Old}] -> [{New}]) — re-keying",
+                    schemaName, tableName,
+                    persisted is null ? "" : string.Join(",", persisted), string.Join(",", sortColumns));
+                DeltaReader.SetSortedBy(opener, tablePath, sortColumns, default);
+                _sortedByCache.TryRemove(tablePath, out _);
+            }
+        }
+
         // Explicit transaction (slice 4): a FRESH-table CTAS buffers — the CREATE parks on the buffer, the
         // data collects as pending batches, and the flush creates + writes at COMMIT (nothing touches the
         // _delta_log before then; ROLLBACK discards everything, no storage cleanup needed). CREATE OR
