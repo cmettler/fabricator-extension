@@ -1,0 +1,33 @@
+# Example dbt-duckdb profile for the DAX -> Delta pipeline.
+# COPY to profiles.yml (gitignored):  cp profiles.example.yml profiles.yml
+# NO credentials live in this file: the fabric_attach plugin executes a secret SQL file
+# (CREATE OR REPLACE SECRET fabric_sp (TYPE azure, PROVIDER service_principal, TENANT_ID …, CLIENT_ID …,
+# CLIENT_SECRET …)) on every connection, then attaches the fabricator catalogs. Point secret_sql at your
+# own gitignored file and replace the <PLACEHOLDER> workspace / lakehouse / semantic-model names. The
+# extension path is relative to this project dir (build it first — see the README).
+dbt_dax_test:
+  target: fabric
+  outputs:
+    fabric:
+      type: duckdb
+      path: 'dbt_dax.duckdb'
+      schema: dbt
+      threads: 2
+      config_options:
+        allow_unsigned_extensions: true
+      extensions:
+        - '../build/release/extension/fabricator/fabricator.duckdb_extension'
+      module_paths:
+        - 'plugins'
+      plugins:
+        - module: fabric_attach
+          config:
+            secret_sql: '<path-to-your-gitignored-secret.sql>'   # CREATE OR REPLACE SECRET fabric_sp (TYPE azure, …)
+            secret_name: 'fabric_sp'
+            # Delta-on-OneLake lakehouse (READ_ONLY false applied by the plugin)
+            lakehouse_path: 'abfss://<Workspace>@onelake.dfs.fabric.microsoft.com/<Lakehouse>.Lakehouse/Tables'
+            lakehouse_alias: 'lake'
+            # One or more DAX (Power BI / AAS) semantic models via XMLA. `daxeval` needs a model with >=1 table.
+            dax_attaches:
+              - xmla: 'Data Source=powerbi://api.powerbi.com/v1.0/myorg/<Workspace>;Initial Catalog=<Semantic Model>'
+                alias: 'dax'

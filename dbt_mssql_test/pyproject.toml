@@ -1,0 +1,5 @@
+[project]
+name = "dbt-mssql-test"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["dbt-duckdb>=1.9.0", "duckdb==1.5.4"]

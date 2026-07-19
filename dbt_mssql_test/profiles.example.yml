@@ -1,0 +1,97 @@
+# Example dbt-duckdb profile for the fabricator harness.
+# COPY to profiles.yml (gitignored) and fill in your own connection strings / secrets.
+#   cp profiles.example.yml profiles.yml
+# The `box` + `minio` targets match the committed docker rig (../docker/docker-compose.yml) and run as-is;
+# the `fabric` + `lakehouse` targets need your own Fabric workspace + Entra service principal — replace
+# every <PLACEHOLDER>. The extension path is relative to this project dir (build it first — see the README).
+dbt_mssql_test:
+  target: box
+  outputs:
+    # Local SQL Server (docker rig) — runnable as-is against docker/docker-compose.yml.
+    box:
+      type: duckdb
+      path: 'dbt_box.duckdb'
+      schema: dbo
+      threads: 4
+      config_options:
+        allow_unsigned_extensions: true
+      extensions:
+        - '../build/release/extension/fabricator/fabricator.duckdb_extension'
+      attach:
+        - path: 'Server=localhost,1433;Database=TestDB;User Id=sa;Password=Arrow_Net_123!;TrustServerCertificate=true;Encrypt=true'
+          type: fabricator
+          alias: mssql
+
+    # Fabric Warehouse via an Entra service principal (SQL endpoint). Replace the host + SP client id/secret.
+    fabric:
+      type: duckdb
+      path: 'dbt_fabric.duckdb'
+      schema: dbo
+      threads: 4
+      config_options:
+        allow_unsigned_extensions: true
+      extensions:
+        - '../build/release/extension/fabricator/fabricator.duckdb_extension'
+      attach:
+        - path: 'Server=<workspace>.datawarehouse.fabric.microsoft.com;Database=<Warehouse>;Authentication=Active Directory Service Principal;User Id=<client-id>;Password=<client-secret>;Encrypt=true;TrustServerCertificate=true'
+          type: fabricator
+          alias: mssql
+
+    # Fabric LAKEHOUSE via the Delta provider on OneLake. dbt-duckdb's attach: renderer can't emit
+    # 'READ_ONLY false' (which OneLake requires), so the onelake_attach plugin attaches 'mssql' writable in
+    # configure_connection — after the fabric_sp secret below is created. Replace the SP + the OneLake path.
+    lakehouse:
+      type: duckdb
+      path: 'dbt_lakehouse.duckdb'
+      schema: main
+      threads: 4
+      config_options:
+        allow_unsigned_extensions: true
+      extensions:
+        - '../build/release/extension/fabricator/fabricator.duckdb_extension'
+      secrets:
+        - type: azure
+          name: fabric_sp
+          provider: service_principal
+          tenant_id: '<tenant-id>'
+          client_id: '<client-id>'
+          client_secret: '<client-secret>'
+      module_paths:
+        - 'plugins'
+      plugins:
+        - module: onelake_attach
+          config:
+            path: 'abfss://<Workspace>@onelake.dfs.fabric.microsoft.com/<Lakehouse>.Lakehouse/Tables'
+            alias: mssql
+            provider: delta
+            secret: fabric_sp
+
+    # MinIO / S3 Delta catalog (docker rig; test-only creds) — runnable as-is with the docker stack.
+    minio:
+      type: duckdb
+      path: 'dbt_minio.duckdb'
+      schema: main
+      threads: 4
+      config_options:
+        allow_unsigned_extensions: true
+      extensions:
+        - '../build/release/extension/fabricator/fabricator.duckdb_extension'
+      secrets:
+        - type: s3
+          name: minio_s3
+          key_id: miniouser
+          secret: miniosecret123
+          endpoint: 'localhost:9000'
+          url_style: path
+          region: us-east-1
+          use_ssl: true
+      module_paths:
+        - 'plugins'
+      plugins:
+        - module: onelake_attach
+          config:
+            path: 's3://fabricator/dbtlake'
+            alias: mssql
+            provider: delta
+            secret: minio_s3
+            curl_insecure: true

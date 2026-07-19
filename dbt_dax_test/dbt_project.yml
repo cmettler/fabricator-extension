@@ -1,0 +1,18 @@
+name: 'dbt_dax_test'
+version: '1.0'
+config-version: 2
+profile: 'dbt_dax_test'
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+
+flags:
+  send_anonymous_usage_stats: false
+
+models:
+  dbt_dax_test:
+    # Materialize into the LAKEHOUSE Delta catalog (writable OneLake attach) — the DAX catalog is the
+    # read side only. The schema comes from the profile (`dbt`); a `+schema:` here would CONCATENATE
+    # (dbt's default generate_schema_name → `dbt_dbt`).
+    +database: lake
+    +materialized: table

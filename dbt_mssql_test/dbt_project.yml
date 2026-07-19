@@ -1,0 +1,24 @@
+name: 'dbt_mssql_test'
+version: '1.0'
+config-version: 2
+profile: 'dbt_mssql_test'
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+seed-paths: ["seeds"]
+
+flags:
+  send_anonymous_usage_stats: false
+
+models:
+  dbt_mssql_test:
+    +database: mssql
+    # Per-target schema (box/fabric: dbo; lakehouse: a dedicated empty schema). dbt introspects only the target
+    # schema before building, so a fresh schema keeps the OneLake catalog-introspection cost tiny.
+    +schema: "{{ target.schema }}"
+    +materialized: table
+
+seeds:
+  dbt_mssql_test:
+    +database: mssql
+    +schema: "{{ target.schema }}"

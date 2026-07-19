@@ -40,9 +40,21 @@ wheels/
 # Local credentials / connection recipes — contain live secrets, never commit.
 /fabric.md
 
-# dbt-duckdb concurrency/integration test harness — profiles.yml holds live connstrs/secrets.
-/dbt_mssql_test/
-/dbt_dax_test/
+# dbt-duckdb harnesses — the SOURCE (dbt_project.yml, models/, macros/, plugins/, seeds/,
+# snapshots/, pyproject.toml, uv.lock, profiles.example.yml) is tracked; SECRETS + generated
+# state are NOT. profiles.yml holds live connstrs/SP secrets → never commit (use the .example).
+dbt_mssql_test/profiles.yml
+dbt_dax_test/profiles.yml
+dbt_*/.venv/
+dbt_*/target/
+dbt_*/logs/
+dbt_*/dbt_packages/
+dbt_*/**/__pycache__/
+
+# DuckDB database state — generated, and can persist secrets (CREATE SECRET / attach connstrs);
+# never commit anywhere.
+*.duckdb
+*.duckdb.wal
 fabric-test.local.env
 dax_secret.sql
 
