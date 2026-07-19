@@ -249,8 +249,8 @@ current code still uses the single-provider `fabricator` naming):
 
 In-flight / planned refactors (all C#-only unless noted; tests stay green per slice):
 - **`CREATE TABLE … WITH (…)` options + SQL Server EXTERNAL TABLES —
-  [docs/create-table-with-options.md](docs/create-table-with-options.md). SLICES A (ABI v67) + C + D
-  DONE (2026-07-19); B planned.** DuckDB v1.5.4 parses the clause (`CreateTableInfo::options`).
+  [docs/create-table-with-options.md](docs/create-table-with-options.md). ALL FOUR SLICES DONE
+  (2026-07-19): A (ABI v67) + C + D + B.** DuckDB v1.5.4 parses the clause (`CreateTableInfo::options`).
   **A (DONE)** = `options_json` threaded through `create_table`+`begin_bulk` (v67; C++
   `TableOptionsArg` — constants only, flat string-valued JSON) → the Delta provider consumes THREE
   key kinds (`DeltaWithOptions.Parse`, guarded — unknown keys ERROR): per-statement **write tuning**
@@ -313,12 +313,27 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   SET-of-identity rejected, explicit-txn rejected (`GuardExternalDml`). `verify_mssql_s3_polybase`
   **209** (§6d: scan-via-SQL-Server + apply-via-Delta UPDATE incl. expression, DELETE, ids
   preserved, guards, zero-match DELETE); regression identity 64 / columnstore 20 / delta s3 161 /
-  arrow_lossless 10 green. Remaining slice:
-  **B** = `CREATE TABLE … WITH
-  (location=…, table_type='DELTA'|'PARQUET' [, data_source=…, secret=…]) AS …` on the SQL provider:
-  client-side write (DELTA forced protocol-1.0 plain; identity marker ALLOWED → slice-D-capable) +
-  auto-provisioned MASTER KEY/credential/data source/file format/external table — the
-  `verify_mssql_s3_polybase` manual flow as one DDL.
+  arrow_lossless 10 green.
+  **B — DONE (2026-07-19, C#-only): `CREATE TABLE … WITH (location=…, table_type='DELTA'|'PARQUET'
+  [, data_source=…, file_format=…]) [AS …]` on the SQL provider — the CETAS-analog, one DDL statement.**
+  Data-first/DDL-second: `ExternalTableRouting.CreateDeltaAs` (CTAS, `copy_disposition:'error'`) /
+  `CreateDeltaEmpty` (empty CREATE) write the client-side Delta table (protocol-1.0 plain, identity
+  marker rides through → slice-D-capable from birth), then `ProvisionExternalTable` auto-creates the
+  EXTERNAL FILE FORMAT (unless `file_format=` given) + EXTERNAL TABLE with a column list from the write
+  schema (`BuildExternalColumnList` — one source of truth). `data_source=` REQUIRED (no-secret-material
+  posture; `secret=` auto-provisioning rejected with a pointer). **Two type findings:** external text
+  columns need explicit lengths with a TYPE-DEPENDENT cap — `VARCHAR(8000)` but `NVARCHAR(4000)` (8000
+  is error 2717); the identity marker is ALLOWED with `location`+DELTA (declared plain BIGINT SQL-side).
+  Guards: CREATE OR REPLACE / explicit-txn / PK-UNIQUE-DEFAULT / PARQUET-empty-create / ICEBERG rejected.
+  **Pre-existing S3 bug found + fixed in the test:** an EMPTY `CREATE OR REPLACE TABLE t (cols)` over an
+  EXISTING S3 delta table fails "version 0 already exists" (the DropTable+create-v0 path's post-delete
+  `_delta_log` listing is stale within the one statement; a CTAS CREATE OR REPLACE is unaffected — it
+  Overwrites). Workaround: separate `DROP TABLE IF EXISTS` + `CREATE` (the view settles across the
+  statement boundary) — the polybase test's one empty-create-or-replace (iddml) uses the split.
+  `verify_mssql_s3_polybase` **252** (§6e auto-provision DDL round-trip + INSERT compose + guards; §6f
+  the FULL CIRCLE — empty CREATE + identity → INSERT → UPDATE → DELETE all through the SQL catalog),
+  re-runnable back-to-back; `verify_with_options_mssql` 9; regression identity 64 / columnstore 20 /
+  delta s3 161 / scalar 26 / procs 24 / native_write 147 green.
 - **`hilbert_index` global scalar — DONE (2026-07-18, C#-only, no ABI): the liquid-clustering-style
   ordered-write primitive.** `hilbert_index(coords BIGINT[], bits) → BIGINT` (Bridge
   `HilbertIndexFunction`, declared in `CustomFunctions.GlobalScalar` — the fabricator_render slot):

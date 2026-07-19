@@ -1,7 +1,6 @@
 # `CREATE TABLE … WITH (…)` options + SQL Server external tables (design)
 
-Status: **slices A (ABI v67) + C + D DONE (2026-07-19); B planned.** Four slices, ordered A → C → D → B
-by value/risk.
+Status: **ALL FOUR SLICES DONE (2026-07-19).** A (ABI v67) → C → D → B, ordered by value/risk.
 Origin: user request — DuckDB parses a `WITH (key='value', …)` clause on CREATE TABLE / CTAS
 (the Iceberg-style `WITH (location=…, table_type=…, format=…)` shape); we should surface those
 options to the C# providers to (1) set Delta TBLPROPERTIES + parquet write tuning per table,
@@ -303,7 +302,35 @@ succeeds, row simply absent).
 
 ---
 
-## Slice B — `CREATE TABLE … WITH (location=…, table_type=…)` on the SQL provider (CETAS-analog)
+## Slice B — `CREATE TABLE … WITH (location=…, table_type=…)` on the SQL provider (CETAS-analog) — **DONE**
+
+Built 2026-07-19. Notes:
+
+- The write is data-first, DDL-second: `CreateDeltaAs` (CTAS) / `CreateDeltaEmpty` (empty CREATE) write
+  the client-side Delta table (protocol-1.0 plain — `deletion_vectors false, column_mapping 'none'`;
+  CTAS uses `copy_disposition:'error'` so a pre-existing location fails), then `ProvisionExternalTable`
+  runs `CREATE EXTERNAL FILE FORMAT` (auto, unless `file_format=` given) + `CREATE EXTERNAL TABLE` with
+  a column list built from the write schema (`BuildExternalColumnList` — one source of truth, no drift).
+- `data_source=` is REQUIRED (names a pre-provisioned EXTERNAL DATA SOURCE — the no-secret-material
+  posture); `secret=` (credential auto-provisioning) is rejected with a pointer to `data_source=`.
+- Two type findings the build surfaced: (1) external-table text columns need explicit lengths, and the
+  cap DIFFERS — `VARCHAR(8000)` but `NVARCHAR(4000)` (its max explicit length; 8000 is error 2717).
+  (2) the identity marker (`id BIGINT AS (0)`) IS allowed with `location`+`table_type='DELTA'` (declared
+  plain BIGINT SQL-side) → the created table is slice-D DML-capable from birth.
+- Guards: `CREATE OR REPLACE` rejected (DROP first), explicit-txn rejected, PK/UNIQUE/DEFAULT rejected
+  with `location`, PARQUET empty-create rejected, ICEBERG rejected.
+- **Pre-existing S3 finding (fixed in the test, noted for the product):** an EMPTY
+  `CREATE OR REPLACE TABLE t (cols)` over an EXISTING S3 delta table fails with "version 0 already
+  exists" — the DropTable+create-v0 path's post-delete `_delta_log` listing is stale within the one
+  statement. A CTAS `CREATE OR REPLACE` is unaffected (it Overwrites — opens the existing table, commits
+  a new version). Workaround: separate `DROP TABLE IF EXISTS` + `CREATE` statements (the view settles
+  across the statement boundary). The polybase test's one empty-create-or-replace (iddml) uses the split.
+
+Verified: `verify_mssql_s3_polybase.test` **252** (§6e — full auto-provision DDL round-trip + INSERT
+compose + create-or-error + explicit-txn guards; §6f — the FULL CIRCLE: empty CREATE + identity marker →
+INSERT → UPDATE → DELETE, all through the SQL catalog with every byte on MinIO), re-runnable across
+back-to-back invocations; `verify_with_options_mssql.test` **9** (guards); regression identity 64 /
+columnstore 20 / delta s3 161 / scalar 26 / procs 24 / native_write 147. Original design below.
 
 Sugar over A (the option channel) + C (the writer): one DDL statement writes the data to S3
 client-side and provisions the SQL side — the whole `verify_mssql_s3_polybase` manual flow as DDL.

@@ -971,7 +971,36 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 "COPY PARTITION_OVERWRITE is a Delta-provider option (dynamic partition overwrite); "
                 + "the SQL Server provider has no table-partition semantics on the bulk path.");
         }
-        RejectWithOptions(optionsJson);
+        // CETAS-analog (slice B): CREATE TABLE ... WITH (location=..., table_type=...) AS ... — the data is
+        // written client-side to S3 (Delta/parquet), then the EXTERNAL TABLE is provisioned over it.
+        if (ParseWithOptions(optionsJson) is { } extCreate)
+        {
+            if (!createTable)
+            {
+                throw new NotSupportedException("WITH options apply to CREATE TABLE [AS], not to an append.");
+            }
+            if (replace)
+            {
+                throw new NotSupportedException(
+                    "CREATE OR REPLACE with WITH (location=...) is not supported — DROP the external "
+                    + "table first (the storage data is kept; delete/replace it explicitly).");
+            }
+            if (_explicitTxns.ContainsKey(txnId))
+            {
+                throw new NotSupportedException(
+                    "CREATE TABLE ... WITH (location=...) writes directly to storage and cannot roll back "
+                    + "with an explicit transaction — COMMIT first (autocommit only).");
+            }
+            var (clientUri, relLocation) = ParseExternalLocation(extCreate.Location);
+            var writeSchema = data.Schema; // capture before the stream is consumed
+            long extRows = extCreate.TableType == "DELTA"
+                ? ExternalTableRouting.CreateDeltaAs(clientUri, data, txnId, partitionColumns, sortColumns)
+                : ExternalTableRouting.AppendParquet(clientUri, data);
+            // Data first, DDL second: CREATE EXTERNAL TABLE validates the location, so the table must exist.
+            ProvisionExternalTable(extCreate, schemaName, tableName, relLocation,
+                                   BuildExternalColumnList(writeSchema));
+            return extRows;
+        }
         // A detected S3 external table's INSERT routes to STORAGE (slice C) — SQL Server itself can't
         // INSERT into it. Plain appends only; CTAS/replace over an external table is not a bulk shape here.
         if (!createTable && !replace && DetectExternalTable(schemaName, tableName) is { } externalTarget)
@@ -1067,7 +1096,17 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         // to storage (identity -> transient rowid resolution + the delta provider's own rowid DELETE).
         if (DetectExternalTable(schemaName, tableName) is { IdentityColumn: { } delIdCol } extDel)
         {
-            GuardExternalDml(schemaName, tableName, "DELETE FROM");
+            // A guard throw must not leak the imported key stream (a GC-finalized imported C stream
+            // outlives the host's struct and segfaults) — dispose it deterministically.
+            try
+            {
+                GuardExternalDml(schemaName, tableName, "DELETE FROM");
+            }
+            catch
+            {
+                keys.Dispose();
+                throw;
+            }
             return ExternalTableRouting.DeleteByIdentity(extDel.S3Uri!, delIdCol, keys, AmbientTransaction.Current);
         }
         // Cancel a long rowid DELETE (many chunked batches) on query interrupt. The opener is fresh here (the
@@ -1152,15 +1191,24 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         // itself is rejected — it is engine-assigned.
         if (DetectExternalTable(schemaName, tableName) is { IdentityColumn: { } updIdCol } extUpd)
         {
-            GuardExternalDml(schemaName, tableName, "UPDATE");
-            for (int j = 0; j < setColumnCount; j++)
+            // Guard throws must not leak the imported update stream (finalizer segfault) — dispose it.
+            try
             {
-                if (string.Equals(data.Schema.FieldsList[j].Name, updIdCol, StringComparison.OrdinalIgnoreCase))
+                GuardExternalDml(schemaName, tableName, "UPDATE");
+                for (int j = 0; j < setColumnCount; j++)
                 {
-                    throw new NotSupportedException(
-                        $"UPDATE of the identity column '{updIdCol}' on external table "
-                        + $"{schemaName}.{tableName} is not supported (engine-assigned).");
+                    if (string.Equals(data.Schema.FieldsList[j].Name, updIdCol, StringComparison.OrdinalIgnoreCase))
+                    {
+                        throw new NotSupportedException(
+                            $"UPDATE of the identity column '{updIdCol}' on external table "
+                            + $"{schemaName}.{tableName} is not supported (engine-assigned).");
+                    }
                 }
+            }
+            catch
+            {
+                data.Dispose();
+                throw;
             }
             return ExternalTableRouting.UpdateByIdentity(extUpd.S3Uri!, updIdCol, setColumnCount, data);
         }
@@ -1224,6 +1272,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     {
         if (DetectExternalTable(schemaName, tableName) is not null)
         {
+            rows.Dispose(); // never leak the imported stream to the finalizer
             throw new NotSupportedException(
                 $"INSERT ... RETURNING is not supported on external table {schemaName}.{tableName} "
                 + "(the write routes to storage, which returns no OUTPUT INSERTED rows) — "
@@ -1876,17 +1925,147 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         }
     }
 
-    // CREATE TABLE ... WITH (key='value', ...): the SQL Server provider knows no WITH keys yet — reject any
-    // (never silently ignore an option). Planned keys (location/table_type/data_source/secret — S3 external
-    // tables) land with docs/create-table-with-options.md slice B.
-    private static void RejectWithOptions(string? optionsJson)
+    // CREATE TABLE [AS] ... WITH (location=..., table_type=..., data_source=... [, file_format=...]) —
+    // the CETAS-analog (docs/create-table-with-options.md slice B): the DATA is written CLIENT-SIDE to the
+    // S3 location (Delta — which SQL Server could never write — or parquet), then the EXTERNAL TABLE is
+    // provisioned over it. `data_source` names a pre-provisioned EXTERNAL DATA SOURCE (the recommended,
+    // no-secret-material posture; credential auto-provisioning from a DuckDB secret is deferred). Unknown
+    // keys are rejected — a WITH option is never silently ignored.
+    private sealed record ExternalCreateSpec(string Location, string TableType, string DataSource,
+                                             string? FileFormat);
+
+    private static ExternalCreateSpec? ParseWithOptions(string? optionsJson)
     {
-        if (!string.IsNullOrEmpty(optionsJson))
+        if (string.IsNullOrEmpty(optionsJson))
+        {
+            return null;
+        }
+        string? location = null, tableType = null, dataSource = null, fileFormat = null;
+        using (var doc = System.Text.Json.JsonDocument.Parse(optionsJson))
+        {
+            foreach (var p in doc.RootElement.EnumerateObject())
+            {
+                string value = p.Value.ValueKind == System.Text.Json.JsonValueKind.String
+                    ? p.Value.GetString() ?? string.Empty
+                    : p.Value.ToString();
+                switch (p.Name.ToLowerInvariant())
+                {
+                    case "location":
+                        location = value;
+                        break;
+                    case "table_type":
+                        tableType = value.Trim().ToUpperInvariant();
+                        break;
+                    case "format":
+                        if (!value.Equals("parquet", StringComparison.OrdinalIgnoreCase))
+                        {
+                            throw new NotSupportedException(
+                                $"WITH format: '{value}' is not supported (data files are parquet).");
+                        }
+                        break;
+                    case "data_source":
+                        dataSource = value;
+                        break;
+                    case "file_format":
+                        fileFormat = value;
+                        break;
+                    case "secret":
+                        throw new NotSupportedException(
+                            "WITH secret: credential auto-provisioning is not supported yet — pre-provision "
+                            + "the DATABASE SCOPED CREDENTIAL + EXTERNAL DATA SOURCE once and pass "
+                            + "data_source='<name>' instead.");
+                    default:
+                        throw new NotSupportedException(
+                            $"unknown CREATE TABLE WITH option '{p.Name}' for the SQL Server provider "
+                            + "(supported: location, table_type, data_source, file_format).");
+                }
+            }
+        }
+        if (location is null)
         {
             throw new NotSupportedException(
-                "the SQL Server provider supports no CREATE TABLE WITH options yet "
-                + "(planned: location/table_type for S3 external tables).");
+                "the SQL Server provider's WITH options describe an S3 external table — "
+                + "location='s3://<sql-endpoint>/<bucket>/<path>' is required.");
         }
+        if (tableType is not ("DELTA" or "PARQUET"))
+        {
+            throw new NotSupportedException(
+                $"WITH table_type: '{tableType ?? "<missing>"}' is not supported (DELTA or PARQUET; "
+                + "ICEBERG has no writer).");
+        }
+        if (string.IsNullOrWhiteSpace(dataSource))
+        {
+            throw new NotSupportedException(
+                "WITH data_source: required — the name of a pre-provisioned EXTERNAL DATA SOURCE over the "
+                + "location's endpoint (credentials never cross this path).");
+        }
+        return new ExternalCreateSpec(location, tableType!, dataSource!, fileFormat);
+    }
+
+    // Splits the SQL-visible location (s3://<host>/<bucket>/<path>) into the CLIENT-side URI
+    // (s3://<bucket>/<path> — host discarded, the DuckDB s3 secret's ENDPOINT is authoritative) and the
+    // external table's LOCATION (/<bucket>/<path>, relative to the data source).
+    private static (string ClientUri, string RelLocation) ParseExternalLocation(string location)
+    {
+        const string prefix = "s3://";
+        var trimmed = location.Trim();
+        if (!trimmed.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new NotSupportedException(
+                $"WITH location: '{location}' — only s3:// locations are supported.");
+        }
+        var rest = trimmed.Substring(prefix.Length).TrimEnd('/');
+        int slash = rest.IndexOf('/');
+        var rel = slash >= 0 ? rest.Substring(slash + 1).Trim('/') : string.Empty;
+        if (slash < 0 || rel.IndexOf('/') < 0)
+        {
+            throw new NotSupportedException(
+                $"WITH location: '{location}' must be s3://<endpoint>/<bucket>/<path> "
+                + "(at least a bucket + a table folder).");
+        }
+        return (prefix + rel, "/" + rel);
+    }
+
+    // The external table's column declarations from the write schema — ONE source of truth, no drift.
+    // Text columns get an explicit length instead of (MAX): external-table declarations reject MAX on some
+    // engines, and the cap DIFFERS by type — VARCHAR(8000) but NVARCHAR(4000) (its max explicit length; a
+    // larger value is error 2717). Declaration-only — the parquet/delta data holds full values.
+    private string BuildExternalColumnList(Schema schema)
+    {
+        var parts = new List<string>(schema.FieldsList.Count);
+        foreach (var f in schema.FieldsList)
+        {
+            string type = MapArrowToSqlType(f.DataType, Profile);
+            if (type.EndsWith("(MAX)", StringComparison.OrdinalIgnoreCase))
+            {
+                string prefix = type.Substring(0, type.Length - "(MAX)".Length);
+                bool isN = prefix.TrimEnd().EndsWith("NVARCHAR", StringComparison.OrdinalIgnoreCase)
+                           || prefix.TrimEnd().EndsWith("NCHAR", StringComparison.OrdinalIgnoreCase);
+                type = prefix + (isN ? "(4000)" : "(8000)");
+            }
+            parts.Add(Quote(f.Name) + " " + type);
+        }
+        return string.Join(", ", parts);
+    }
+
+    // Provision the SQL side over data already written to storage: the (optional auto-created) file
+    // format + the external table. Runs on the write connection (autocommit — external DDL rejects user
+    // transactions anyway).
+    private void ProvisionExternalTable(ExternalCreateSpec spec, string schemaName, string tableName,
+                                        string relLocation, string columnList)
+    {
+        string ff = spec.FileFormat ?? (spec.TableType == "DELTA" ? "FabricatorDeltaFormat" : "FabricatorParquetFormat");
+        if (spec.FileFormat is null)
+        {
+            ExecuteNonQuery(
+                $"IF NOT EXISTS (SELECT 1 FROM sys.external_file_formats WHERE name = '{ff}') "
+                + $"CREATE EXTERNAL FILE FORMAT {Quote(ff)} WITH (FORMAT_TYPE = {spec.TableType})");
+        }
+        ExecuteNonQuery(
+            $"CREATE EXTERNAL TABLE {Quote(schemaName)}.{Quote(tableName)} ({columnList}) "
+            + $"WITH (LOCATION = '{relLocation.Replace("'", "''")}', DATA_SOURCE = {Quote(spec.DataSource)}, "
+            + $"FILE_FORMAT = {Quote(ff)})");
+        _externalInfo.TryRemove(ExternalKey(schemaName, tableName), out _); // probe fresh (now external)
     }
 
     public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists, string? primaryKey,
@@ -1894,7 +2073,37 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                             IReadOnlyList<string>? sortColumns, IReadOnlyList<string>? identityColumns,
                             string? optionsJson)
     {
-        RejectWithOptions(optionsJson);
+        // CETAS-analog, empty-CREATE shape (slice B): commit-0 Delta table + external table. The identity
+        // marker rides through to the Delta create (declared plain BIGINT SQL-side — external tables can't
+        // carry IDENTITY and don't need to), making the table slice-D DML-capable from birth.
+        if (ParseWithOptions(optionsJson) is { } extCreate)
+        {
+            if (extCreate.TableType != "DELTA")
+            {
+                throw new NotSupportedException(
+                    "an empty CREATE with WITH (location=...) needs table_type='DELTA' (a parquet external "
+                    + "table has no file to read until data exists — use CREATE TABLE ... AS instead).");
+            }
+            if (!string.IsNullOrEmpty(primaryKey) || !string.IsNullOrEmpty(uniques)
+                || !string.IsNullOrEmpty(defaults))
+            {
+                throw new NotSupportedException(
+                    "PRIMARY KEY / UNIQUE / DEFAULT cannot be combined with WITH (location=...) — "
+                    + "external tables carry no constraints (the IDENTITY marker IS supported).");
+            }
+            if (_explicitTxns.ContainsKey(AmbientTransaction.Current))
+            {
+                throw new NotSupportedException(
+                    "CREATE TABLE ... WITH (location=...) writes directly to storage and cannot roll back "
+                    + "with an explicit transaction — COMMIT first (autocommit only).");
+            }
+            var (clientUri, relLocation) = ParseExternalLocation(extCreate.Location);
+            ExternalTableRouting.CreateDeltaEmpty(clientUri, columns, partitionColumns, sortColumns,
+                                                  identityColumns);
+            ProvisionExternalTable(extCreate, schemaName, tableName, relLocation,
+                                   BuildExternalColumnList(columns));
+            return;
+        }
         _externalInfo.TryRemove(ExternalKey(schemaName, tableName), out _); // re-probe after re-create
         // partitionColumns is a Delta/lakehouse concept; not applied to SQL Server DDL here (ignored).
         // sortColumns (native SORTED BY) becomes a Fabric Warehouse WITH (CLUSTER BY (cols)) layout — see BuildCreateTable.

@@ -32,9 +32,14 @@ CREATE SECRET minio_s3 (TYPE s3, KEY_ID 'miniouser', SECRET 'miniosecret123',
                         USE_SSL true);
 
 # ---- 1. our Delta provider writes the interop table (PLAIN delta: protocol 1.0-readable) ----
+# Attach WITH the secret so the COMMIT rename routes through S3CommitFileSystem (SDK conditional PUT) —
+# CREATE OR REPLACE over an EXISTING table then works (plain httpfs never does put-if-absent, so its
+# DROP-then-recreate leaves version 0 -> "version 0 already exists"; the secret path is re-runnable).
+# The secret changes only the commit filesystem, not the table protocol — the interop tables stay
+# protocol-1.0 plain (deletion_vectors false, column_mapping none) so SQL Server's DELTA reader reads them.
 statement ok
 ATTACH 's3://fabricator/polybase' AS plake (TYPE fabricator, PROVIDER 'delta', READ_ONLY false,
-                                          deletion_vectors false, column_mapping 'none');
+                                          deletion_vectors false, column_mapping 'none', SECRET minio_s3);
 
 statement ok
 CREATE OR REPLACE TABLE plake.main.trips AS
@@ -446,8 +451,15 @@ DROP TABLE sqldb.dbo.s3_pq_ins;
 # the table stays protocol-1.0 SQL-readable). Identity values are snapshot-independent, so the two sides
 # never need to agree on a version.
 
+# DROP + CREATE as SEPARATE statements (not CREATE OR REPLACE): an EMPTY CREATE OR REPLACE over an
+# existing S3 table takes the DropTable+create-v0 path, whose post-delete _delta_log listing is stale
+# within the one statement -> "version 0 already exists" (a pre-existing S3 limitation; a CTAS
+# CREATE OR REPLACE is unaffected — it Overwrites the existing table). Separate statements settle the view.
 statement ok
-CREATE OR REPLACE TABLE plake.main.iddml (id BIGINT AS (0), name VARCHAR, val INTEGER);
+DROP TABLE IF EXISTS plake.main.iddml;
+
+statement ok
+CREATE TABLE plake.main.iddml (id BIGINT AS (0), name VARCHAR, val INTEGER);
 
 statement ok
 INSERT INTO plake.main.iddml (name, val) VALUES ('a', 1), ('b', 2), ('c', 3), ('d', 4);
@@ -531,6 +543,134 @@ SELECT count(*) FROM sqldb.dbo.s3_iddml;
 
 statement ok
 DROP TABLE sqldb.dbo.s3_iddml;
+
+# ---- 6e. the CETAS-analog DDL (slice B): CREATE TABLE ... WITH (location=..., table_type='DELTA') ----
+# One statement: the data is written CLIENT-SIDE as a protocol-1.0 Delta table on MinIO (something SQL
+# Server could never write), then the EXTERNAL TABLE is provisioned over it — the whole §2-§4 manual flow
+# as DDL. data_source names the pre-provisioned EXTERNAL DATA SOURCE (no secret material crosses).
+
+# per-run cleanup: drop leftover external objects + the delta folders (the CREATE is create-or-error)
+statement ok
+SELECT fabricator_refresh_cache('plake');
+
+statement ok
+SELECT fabricator_exec('sqldb',
+  'IF OBJECT_ID(''dbo.cetas_full'') IS NOT NULL DROP EXTERNAL TABLE dbo.cetas_full');
+
+statement ok
+SELECT fabricator_exec('sqldb',
+  'IF OBJECT_ID(''dbo.cetas_id'') IS NOT NULL DROP EXTERNAL TABLE dbo.cetas_id');
+
+statement ok
+DROP TABLE IF EXISTS plake.main.cetas_full;
+
+statement ok
+DROP TABLE IF EXISTS plake.main.cetas_id;
+
+# THE DDL: client-side Delta write + auto-provisioned file format + external table, one statement
+statement ok
+CREATE TABLE sqldb.dbo.cetas_full
+  WITH (location='s3://${FABRICATOR_S3_SQL_ENDPOINT}/fabricator/polybase/cetas_full',
+        table_type='DELTA', data_source='s3_ds')
+AS SELECT CAST(i AS BIGINT) AS id, 'c' || i AS name FROM range(1, 4) r(i);
+
+statement ok
+SELECT fabricator_refresh_cache('sqldb');
+
+# SQL Server serves the reads (catalog scan + OPENROWSET)
+query IT
+SELECT id, name FROM sqldb.dbo.cetas_full ORDER BY id;
+----
+1	c1
+2	c2
+3	c3
+
+query IT
+SELECT id, name FROM fabricator_query('sqldb',
+  'SELECT id, name FROM OPENROWSET(BULK ''/fabricator/polybase/cetas_full'', FORMAT = ''DELTA'',
+     DATA_SOURCE = ''s3_ds'') AS r ORDER BY id')
+ORDER BY id;
+----
+1	c1
+2	c2
+3	c3
+
+# slice C composes: INSERT through the catalog appends on storage
+statement ok
+INSERT INTO sqldb.dbo.cetas_full VALUES (100, 'ins');
+
+query I
+SELECT count(*) FROM sqldb.dbo.cetas_full;
+----
+4
+
+# guard: the client-side write is create-or-ERROR — a second table over the SAME (existing) location fails
+statement error
+CREATE TABLE sqldb.dbo.cetas_dup
+  WITH (location='s3://${FABRICATOR_S3_SQL_ENDPOINT}/fabricator/polybase/cetas_full',
+        table_type='DELTA', data_source='s3_ds')
+AS SELECT 1 AS id;
+----
+already exists
+
+# guard: no explicit transaction around a storage-writing CREATE
+statement ok
+BEGIN;
+
+statement error
+CREATE TABLE sqldb.dbo.cetas_txn
+  WITH (location='s3://${FABRICATOR_S3_SQL_ENDPOINT}/fabricator/polybase/cetas_txn',
+        table_type='DELTA', data_source='s3_ds')
+AS SELECT 1 AS id;
+----
+cannot roll back with an explicit
+
+statement ok
+ROLLBACK;
+
+# ---- 6f. the FULL CIRCLE: empty CREATE + IDENTITY marker -> INSERT (C) -> UPDATE/DELETE (D) ----
+# The identity marker (`id BIGINT AS (0)`) rides into the Delta create (engine-assigned ids; the external
+# declaration is plain BIGINT), so the table is DML-capable from birth — created, written, updated and
+# deleted entirely through the SQL catalog, with every byte on MinIO and SQL Server serving the reads.
+
+statement ok
+CREATE TABLE sqldb.dbo.cetas_id (id BIGINT AS (0), name VARCHAR)
+  WITH (location='s3://${FABRICATOR_S3_SQL_ENDPOINT}/fabricator/polybase/cetas_id',
+        table_type='DELTA', data_source='s3_ds');
+
+statement ok
+SELECT fabricator_refresh_cache('sqldb');
+
+statement ok
+INSERT INTO sqldb.dbo.cetas_id (name) VALUES ('a'), ('b'), ('c');
+
+query IT
+SELECT id, name FROM sqldb.dbo.cetas_id ORDER BY id;
+----
+1	a
+2	b
+3	c
+
+statement ok
+UPDATE sqldb.dbo.cetas_id SET name = 'bee' WHERE id = 2;
+
+statement ok
+DELETE FROM sqldb.dbo.cetas_id WHERE name = 'c';
+
+query IT
+SELECT id, name FROM fabricator_query('sqldb',
+  'SELECT id, name FROM OPENROWSET(BULK ''/fabricator/polybase/cetas_id'', FORMAT = ''DELTA'',
+     DATA_SOURCE = ''s3_ds'') AS r ORDER BY id')
+ORDER BY id;
+----
+1	a
+2	bee
+
+statement ok
+DROP TABLE sqldb.dbo.cetas_full;
+
+statement ok
+DROP TABLE sqldb.dbo.cetas_id;
 
 # ---- 7. teardown (external objects; the delta data stays for re-runs — CREATE OR REPLACE resets it) ----
 statement ok

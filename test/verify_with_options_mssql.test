@@ -1,8 +1,8 @@
 # name: test/verify_with_options_mssql.test
-# description: CREATE TABLE ... WITH (...) on the SQL Server provider — no keys are known yet, so ANY
-#              option is rejected (never silently ignored; slice B of docs/create-table-with-options.md
-#              adds location/table_type for S3 external tables). Split from verify_with_options.test so
-#              the Delta coverage runs without a SQL Server.
+# description: CREATE TABLE ... WITH (...) on the SQL Server provider — the keys describe an S3 EXTERNAL
+#              TABLE (slice B of docs/create-table-with-options.md: location/table_type/data_source/
+#              file_format); anything else is rejected, never silently ignored. The live external-table
+#              round-trip is in verify_mssql_s3_polybase.test (needs MinIO); this file pins the guards.
 # group: [fabricator]
 
 require fabricator
@@ -12,15 +12,52 @@ require-env MSSQL_TESTDB_DSN
 statement ok
 ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
 
+# unknown keys are rejected
 statement error
 CREATE TABLE db.dbo.with_opts_rejected (id INTEGER) WITH (parquet_compression='zstd');
 ----
-supports no CREATE TABLE WITH options
+unknown CREATE TABLE WITH option 'parquet_compression'
 
+# external-table keys are validated as a set: location alone lacks table_type
 statement error
-CREATE TABLE db.dbo.with_opts_rejected WITH (location='s3://bucket/t') AS SELECT 1 AS id;
+CREATE TABLE db.dbo.with_opts_rejected WITH (location='s3://minio:9000/bucket/t') AS SELECT 1 AS id;
 ----
-supports no CREATE TABLE WITH options
+table_type
+
+# ... and data_source is required (the no-secret-material posture)
+statement error
+CREATE TABLE db.dbo.with_opts_rejected
+  WITH (location='s3://minio:9000/bucket/t', table_type='DELTA') AS SELECT 1 AS id;
+----
+data_source
+
+# credential auto-provisioning is deferred — pre-provision + pass data_source
+statement error
+CREATE TABLE db.dbo.with_opts_rejected
+  WITH (location='s3://minio:9000/bucket/t', table_type='DELTA', secret='minio_s3') AS SELECT 1 AS id;
+----
+pre-provision
+
+# ICEBERG has no writer
+statement error
+CREATE TABLE db.dbo.with_opts_rejected
+  WITH (location='s3://minio:9000/bucket/t', table_type='ICEBERG', data_source='ds') AS SELECT 1 AS id;
+----
+ICEBERG has no writer
+
+# the location must carry bucket + table path
+statement error
+CREATE TABLE db.dbo.with_opts_rejected
+  WITH (location='s3://minio:9000/bucketonly', table_type='DELTA', data_source='ds') AS SELECT 1 AS id;
+----
+at least a bucket
+
+# empty CREATE needs DELTA (a parquet external table has no file until data exists)
+statement error
+CREATE TABLE db.dbo.with_opts_rejected (id INTEGER)
+  WITH (location='s3://minio:9000/bucket/t', table_type='PARQUET', data_source='ds');
+----
+use CREATE TABLE ... AS
 
 statement ok
 DETACH db;

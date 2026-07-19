@@ -92,6 +92,64 @@ public static class ExternalTableRouting
         }
     }
 
+    // ---- CREATE ... WITH (location=..., table_type=...) — the CETAS-analog client-side write (slice B) ---
+
+    /// <summary>CTAS data write for a `CREATE TABLE ... WITH (location=..., table_type='DELTA') AS ...`:
+    /// creates the Delta table at <paramref name="tableUri"/> and streams the data — protocol-1.0 plain
+    /// (`deletion_vectors false, column_mapping 'none'` — SQL Server's DELTA reader requirement), one
+    /// create+write. An EXISTING Delta table at the location fails (the transient catalog's 'error'
+    /// disposition) — this is CREATE, not OR REPLACE.</summary>
+    public static long CreateDeltaAs(string tableUri, IArrowArrayStream data, long txnId,
+                                     IReadOnlyList<string>? partitionColumns, IReadOnlyList<string>? sortColumns)
+    {
+        var (root, leaf) = SplitTable(tableUri);
+        Log.LogInformation("external delta CREATE AS: {Uri}", tableUri);
+        var catalog = BackendRegistry.Resolve("delta").OpenCatalog(root,
+            "{\"native_write\":\"true\",\"deletion_vectors\":\"false\",\"column_mapping\":\"none\","
+            + "\"copy_disposition\":\"error\"}");
+        try
+        {
+            long rows = catalog.BulkInsert("main", leaf, data, createTable: true, replace: false,
+                                           checkConstraints: false, txnId, partitionColumns, sortColumns,
+                                           schemaMode: null, partitionOverwrite: false, optionsJson: null);
+            catalog.CommitTransaction();
+            return rows;
+        }
+        catch
+        {
+            try { catalog.RollbackTransaction(); } catch { /* discard-only backstop */ }
+            throw;
+        }
+        finally
+        {
+            catalog.Dispose();
+        }
+    }
+
+    /// <summary>Empty-CREATE counterpart (commit-0 only): the Delta table at <paramref name="tableUri"/> with
+    /// the declared columns — the identity marker rides through (`delta.identity.*` on the marked fields), so
+    /// the created external table is slice-D DML-capable from birth.</summary>
+    public static void CreateDeltaEmpty(string tableUri, Schema columns,
+                                        IReadOnlyList<string>? partitionColumns,
+                                        IReadOnlyList<string>? sortColumns,
+                                        IReadOnlyList<string>? identityColumns)
+    {
+        var (root, leaf) = SplitTable(tableUri);
+        Log.LogInformation("external delta CREATE (empty): {Uri}", tableUri);
+        var catalog = BackendRegistry.Resolve("delta").OpenCatalog(root,
+            "{\"native_write\":\"true\",\"deletion_vectors\":\"false\",\"column_mapping\":\"none\"}");
+        try
+        {
+            catalog.CreateTable("main", leaf, columns, ifNotExists: false, primaryKey: null, uniques: null,
+                                defaults: null, partitionColumns, sortColumns, identityColumns,
+                                optionsJson: null);
+        }
+        finally
+        {
+            catalog.Dispose();
+        }
+    }
+
     // ---- identity-keyed UPDATE/DELETE (docs/create-table-with-options.md slice D) ------------------------
     // A Delta IDENTITY column bridges the two rowid domains: it is a REAL data column (the PolyBase scan
     // reads it), engine-assigned unique, trivially stable across rewrites, and it has standard min/max
@@ -130,11 +188,13 @@ public static class ExternalTableRouting
     /// protocol-1.0 table SQL-readable). Unresolved ids (concurrently deleted) match nothing.</summary>
     public static long DeleteByIdentity(string tableUri, string identityColumn, IArrowArrayStream keys, long txnId)
     {
+        // Consume + dispose the (imported) key stream FIRST — an imported C stream left to the GC finalizer
+        // outlives the C++ side's struct and segfaults; every exit below must not leak it.
+        var ids = CollectInt64(keys);
         var (root, leaf) = SplitTable(tableUri);
         var catalog = BackendRegistry.Resolve("delta").OpenCatalog(root, "{\"native_write\":\"true\"}");
         try
         {
-            var ids = CollectInt64(keys);
             if (ids.Count == 0)
             {
                 return 0;
@@ -176,13 +236,19 @@ public static class ExternalTableRouting
     public static long UpdateByIdentity(string tableUri, string identityColumn, int setColumnCount,
                                         IArrowArrayStream data)
     {
+        // Owned copies (the C-ABI input batches don't outlive the stream) — bounded by the statement's
+        // matched rows, same as the SQL provider's parameterized UPDATE batches. The imported stream is
+        // consumed + disposed HERE, deterministically (a GC-finalized imported stream segfaults).
+        Schema schema;
+        List<RecordBatch> batches;
+        using (data)
+        {
+            (schema, batches, _) = DeltaWriter.Materialize(data, default);
+        }
         var (root, leaf) = SplitTable(tableUri);
         var catalog = BackendRegistry.Resolve("delta").OpenCatalog(root, "{\"native_write\":\"true\"}");
         try
         {
-            // Owned copies (the C-ABI input batches don't outlive the stream) — bounded by the statement's
-            // matched rows, same as the SQL provider's parameterized UPDATE batches.
-            var (schema, batches, _) = DeltaWriter.Materialize(data, default);
             if (batches.Count == 0)
             {
                 return 0;
