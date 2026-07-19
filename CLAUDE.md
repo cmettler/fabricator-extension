@@ -4324,6 +4324,46 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
 
 ## Build & test
 
+### Build from a fresh clone (Windows) — the quickstart
+
+The detail bullets below explain the *why* of each step + the gotchas; this is the from-zero sequence.
+`<repo>` = the checkout root (`D:\repos\sqlserver-extension`). Run every cmake/ninja command **inside a
+VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
+
+**Prerequisites** (install first):
+- **Visual Studio 18** (or its Build Tools) with the C++ workload — the toolset the build links against.
+- **.NET SDK 10** (the managed projects target `net10.0;net8.0`; `publish-managed.ps1` needs the 10 SDK).
+- **CMake ≥ 3.21 + Ninja** (the generator).
+- **vcpkg** — bootstrapped, with `VCPKG_ROOT` set (supplies OpenSSL + curl for the statically-linked `httpfs`).
+- **PowerShell 7 (`pwsh`)** — runs the managed publish script.
+
+**Steps:**
+1. **Submodules** (three; NON-recursive — skip engineered-wood's ~½ GB nested `parquet-testing` corpus):
+   ```
+   git submodule update --init --depth 1 duckdb          # shallow (large repo)
+   git submodule update --init extension-ci-tools engineered-wood
+   ```
+2. **vcpkg deps** (once): `vcpkg install openssl:x64-windows-static curl:x64-windows-static`
+3. **Configure** (first time; ONE command WITH the vcpkg toolchain — httpfs is linked unconditionally so
+   these flags are mandatory, not optional):
+   ```
+   cmake -G Ninja -DEXTENSION_STATIC_BUILD=1 -DDUCKDB_EXTENSION_CONFIGS=<repo>/extension_config.cmake ^
+     -DDUCKDB_EXPLICIT_PLATFORM=windows_amd64 -DENABLE_EXTENSION_AUTOLOADING=1 ^
+     -DENABLE_EXTENSION_AUTOINSTALL=1 -DENABLE_UNITTEST_CPP_TESTS=FALSE -DCMAKE_BUILD_TYPE=Release ^
+     -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%/scripts/buildsystems/vcpkg.cmake ^
+     -DVCPKG_TARGET_TRIPLET=x64-windows-static ^
+     -S <repo>/duckdb -B <repo>/build/release
+   ```
+4. **Build the C++** (targets → binaries detailed below):
+   `cmake --build <repo>/build/release --target unittest shell fabricator_loadable_extension`
+5. **Publish the managed bridge**: `pwsh scripts/publish-managed.ps1` (lands in
+   `build/release/extension/fabricator/fabricator/`).
+6. **Run**: set `FABRICATOR_MANAGED_DIR=build/release/extension/fabricator/fabricator` before running
+   `duckdb.exe`/`unittest.exe` directly (see the managed-dir gotcha). Iteration: a C#-only change needs
+   only step 5; a C++ change needs step 4 for the target you'll run (the stale-embedded-copy trap below).
+
+### Reference (the why + gotchas)
+
 - **Target DuckDB v1.5.4** (new extension API: `Extension::Load(ExtensionLoader&)` +
   `loader.RegisterFunction(...)` + `DUCKDB_CPP_EXTENSION_ENTRY(fabricator, loader)`). Submodules pinned
   to `duckdb@08e34c4` (v1.5.4) + `extension-ci-tools@v1.5.3` (no 1.5.4 branch exists; v1.5.3 is the
