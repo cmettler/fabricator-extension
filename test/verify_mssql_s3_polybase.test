@@ -438,6 +438,100 @@ SELECT count(*) FROM plake.main.ins;
 statement ok
 DROP TABLE sqldb.dbo.s3_pq_ins;
 
+# ---- 6d. identity-keyed UPDATE/DELETE (slice D): a Delta IDENTITY column bridges the rowid domains ----
+# The external table has no PK/UNIQUE/IDENTITY SQL-side, but its Delta target's engine-assigned identity
+# column is a real, PolyBase-readable data column with standard stats — it becomes the entry's rowid. The
+# scan (through SQL Server) produces identity values; the DML resolves them back to transient rowids on
+# the Delta side with a PRUNED scan and runs the delta provider's own rowid DELETE/UPDATE (CoW here —
+# the table stays protocol-1.0 SQL-readable). Identity values are snapshot-independent, so the two sides
+# never need to agree on a version.
+
+statement ok
+CREATE OR REPLACE TABLE plake.main.iddml (id BIGINT AS (0), name VARCHAR, val INTEGER);
+
+statement ok
+INSERT INTO plake.main.iddml (name, val) VALUES ('a', 1), ('b', 2), ('c', 3), ('d', 4);
+
+statement ok
+SELECT fabricator_exec('sqldb',
+  'IF OBJECT_ID(''dbo.s3_iddml'') IS NOT NULL DROP EXTERNAL TABLE dbo.s3_iddml');
+
+statement ok
+SELECT fabricator_exec('sqldb',
+  'CREATE EXTERNAL TABLE dbo.s3_iddml (id BIGINT, name VARCHAR(20), val INT)
+   WITH (LOCATION = ''/fabricator/polybase/iddml'', DATA_SOURCE = s3_ds, FILE_FORMAT = DeltaFileFormat)');
+
+statement ok
+SELECT fabricator_refresh_cache('sqldb');
+
+# UPDATE through the ATTACHed SQL catalog — scanned via SQL Server, applied on the Delta side
+statement ok
+UPDATE sqldb.dbo.s3_iddml SET val = 99 WHERE name = 'b';
+
+# DELETE through the catalog
+statement ok
+DELETE FROM sqldb.dbo.s3_iddml WHERE val = 3;
+
+# SQL Server reads the post-DML state through the external table (CoW kept it protocol-1.0)
+query ITI
+SELECT id, name, val FROM fabricator_query('sqldb',
+  'SELECT id, name, val FROM OPENROWSET(BULK ''/fabricator/polybase/iddml'', FORMAT = ''DELTA'',
+     DATA_SOURCE = ''s3_ds'') AS r ORDER BY id')
+ORDER BY id;
+----
+1	a	1
+2	b	99
+4	d	4
+
+# our own delta view agrees; the engine-assigned ids are UNCHANGED by the UPDATE
+query ITI
+SELECT id, name, val FROM plake.main.iddml ORDER BY id;
+----
+1	a	1
+2	b	99
+4	d	4
+
+# multi-row UPDATE with an expression (arithmetic over the scanned values)
+statement ok
+UPDATE sqldb.dbo.s3_iddml SET val = val + 10 WHERE val < 50;
+
+query ITI
+SELECT id, name, val FROM sqldb.dbo.s3_iddml ORDER BY id;
+----
+1	a	11
+2	b	99
+4	d	14
+
+# guard: SET of the engine-assigned identity column is rejected
+statement error
+UPDATE sqldb.dbo.s3_iddml SET id = 100 WHERE name = 'a';
+----
+identity column
+
+# guard: storage-side DML cannot join an explicit transaction
+statement ok
+BEGIN;
+
+statement error
+DELETE FROM sqldb.dbo.s3_iddml WHERE name = 'a';
+----
+cannot roll back with an explicit
+
+statement ok
+ROLLBACK;
+
+# a DELETE whose ids match nothing (concurrently-deleted semantics) affects zero rows, no error
+statement ok
+DELETE FROM sqldb.dbo.s3_iddml WHERE val = 12345;
+
+query I
+SELECT count(*) FROM sqldb.dbo.s3_iddml;
+----
+3
+
+statement ok
+DROP TABLE sqldb.dbo.s3_iddml;
+
 # ---- 7. teardown (external objects; the delta data stays for re-runs — CREATE OR REPLACE resets it) ----
 statement ok
 SELECT fabricator_exec('sqldb',

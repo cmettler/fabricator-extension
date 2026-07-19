@@ -1,6 +1,6 @@
 # `CREATE TABLE … WITH (…)` options + SQL Server external tables (design)
 
-Status: **slices A (ABI v67) + C DONE (2026-07-19); D/B planned.** Four slices, ordered A → C → D → B
+Status: **slices A (ABI v67) + C + D DONE (2026-07-19); B planned.** Four slices, ordered A → C → D → B
 by value/risk.
 Origin: user request — DuckDB parses a `WITH (key='value', …)` clause on CREATE TABLE / CTAS
 (the Iceberg-style `WITH (location=…, table_type=…, format=…)` shape); we should surface those
@@ -229,7 +229,28 @@ rejection; DROP routes to `DROP EXTERNAL TABLE`; no-matching-secret error.
 
 ---
 
-## Slice D — identity-keyed UPDATE/DELETE routing (extends C, C#-only, no ABI)
+## Slice D — identity-keyed UPDATE/DELETE routing (extends C, C#-only, no ABI) — **DONE**
+
+Built 2026-07-19 as designed. Notes:
+
+- Resolution rides the **catalog surface**, not internal seams: `ExternalTableRouting.ResolveRowIds`
+  builds a `ScanSpec` (`{"columns":[<id>,"_metadata.row_id"],"filter":{"op":"in",...}}` + a 1-row Arrow
+  value batch, 500 ids/chunk) against the transient delta catalog — the IN predicate prunes files via the
+  identity column's standard stats; the wanted-set re-filter client-side is the exact predicate
+  (pushdown is superset-safe).
+- UPDATE alignment without row surgery: the rebuilt update stream keeps the SET columns and swaps the
+  key column for resolved transient rowids, with **NULL for unresolved ids** — the delta update parser
+  skips NULL rowids, which IS the concurrently-deleted-matches-nothing semantics for free.
+- The identity probe (`FindDeltaIdentityColumn` — `delta.identity.*` field metadata via
+  `SchemaConverter.FromArrowSchema`) rides the cached external-info probe; the rowid override is a
+  `GetMetadata(RowId)` branch returning the identity column name (the standard identity-as-rowid
+  machinery does the rest — zero C++).
+- Guards live: SET-of-identity rejected; explicit-txn rejected (shared `GuardExternalDml`).
+
+Verified: `verify_mssql_s3_polybase.test` **209** (§6d — UPDATE via OPENROWSET-backed scan + Delta CoW
+apply, expression UPDATE, DELETE, ids preserved, both guards, zero-match DELETE) + regression
+identity 64 / columnstore 20 / with_options_mssql 4 / delta s3 161 / arrow_lossless 10.
+Original design below.
 
 Slice C scoped UPDATE/DELETE out because the rowid domains don't mix: the scan runs through SQL
 Server (its rowid = PK/unique/identity of a *SQL* table — an external table has none), while the

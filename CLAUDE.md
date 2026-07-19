@@ -249,8 +249,8 @@ current code still uses the single-provider `fabricator` naming):
 
 In-flight / planned refactors (all C#-only unless noted; tests stay green per slice):
 - **`CREATE TABLE … WITH (…)` options + SQL Server EXTERNAL TABLES —
-  [docs/create-table-with-options.md](docs/create-table-with-options.md). SLICES A (ABI v67) + C DONE
-  (2026-07-19); D/B planned.** DuckDB v1.5.4 parses the clause (`CreateTableInfo::options`).
+  [docs/create-table-with-options.md](docs/create-table-with-options.md). SLICES A (ABI v67) + C + D
+  DONE (2026-07-19); B planned.** DuckDB v1.5.4 parses the clause (`CreateTableInfo::options`).
   **A (DONE)** = `options_json` threaded through `create_table`+`begin_bulk` (v67; C++
   `TableOptionsArg` — constants only, flat string-valued JSON) → the Delta provider consumes THREE
   key kinds (`DeltaWithOptions.Parse`, guarded — unknown keys ERROR): per-statement **write tuning**
@@ -299,13 +299,22 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   on the new compose network (SQL couldn't resolve `minio:9000`, error 13807) — the compose
   `mssql-fabricator` service is now the live 1433 server (old container STOPPED, not removed;
   provision.ps1 re-run; fresh volume — suites self-provision).**
-  Remaining slices, order D→B:
-  **D** = identity-keyed UPDATE/DELETE on detected external
-  Delta tables: a Delta IDENTITY column bridges the rowid domains (PolyBase-visible data column +
-  standard stats for pruned identity→position resolution on the Delta side, SNAPSHOT-INDEPENDENT —
-  the only sound bridge; the row-tracking `_metadata.row_id` can NOT serve this: the materialized
-  column is off-schema by spec + appends carry no physical id), rowid override → existing
-  `DeleteByRowIds`/`UpdateByRowIds`, CoW keeps protocol 1.0. **B** = `CREATE TABLE … WITH
+  **D — DONE (2026-07-19, C#-only): identity-keyed UPDATE/DELETE on detected external Delta tables.**
+  A Delta IDENTITY column bridges the rowid domains — PolyBase-visible data column + standard stats,
+  SNAPSHOT-INDEPENDENT (the only sound bridge; `_metadata.row_id` can NOT serve this: off-schema by
+  spec + appends carry no physical id). The cached external probe also resolves the identity column
+  (`ExternalTableRouting.FindDeltaIdentityColumn` — `delta.identity.*` field metadata); the entry's
+  rowid OVERRIDES to it (`RowIdMetadata` branch — the standard identity-as-rowid machinery, zero
+  C++); `ExecuteDelete`/`ExecuteUpdate` route to storage: identity→transient-rowid resolution via
+  chunked PRUNED `ScanSpec` IN-scans (`{"columns":[id,"_metadata.row_id"],"filter":in}` + value
+  batch, 500/chunk; superset-safe → exact client re-filter) → the delta provider's own rowid
+  DELETE/UPDATE (CoW keeps protocol 1.0). UPDATE alignment trick: unresolved ids become NULL rowids,
+  which the delta update parser SKIPS = concurrently-deleted-matches-nothing for free. Guards:
+  SET-of-identity rejected, explicit-txn rejected (`GuardExternalDml`). `verify_mssql_s3_polybase`
+  **209** (§6d: scan-via-SQL-Server + apply-via-Delta UPDATE incl. expression, DELETE, ids
+  preserved, guards, zero-match DELETE); regression identity 64 / columnstore 20 / delta s3 161 /
+  arrow_lossless 10 green. Remaining slice:
+  **B** = `CREATE TABLE … WITH
   (location=…, table_type='DELTA'|'PARQUET' [, data_source=…, secret=…]) AS …` on the SQL provider:
   client-side write (DELTA forced protocol-1.0 plain; identity marker ALLOWED → slice-D-capable) +
   auto-provisioned MASTER KEY/credential/data source/file format/external table — the

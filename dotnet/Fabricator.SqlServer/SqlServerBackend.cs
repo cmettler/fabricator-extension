@@ -1063,6 +1063,13 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     public long ExecuteDelete(string schemaName, string tableName, IArrowArrayStream keys)
     {
+        // slice D: a detected external DELTA table's rowid is its Delta IDENTITY column — the DELETE routes
+        // to storage (identity -> transient rowid resolution + the delta provider's own rowid DELETE).
+        if (DetectExternalTable(schemaName, tableName) is { IdentityColumn: { } delIdCol } extDel)
+        {
+            GuardExternalDml(schemaName, tableName, "DELETE FROM");
+            return ExternalTableRouting.DeleteByIdentity(extDel.S3Uri!, delIdCol, keys, AmbientTransaction.Current);
+        }
         // Cancel a long rowid DELETE (many chunked batches) on query interrupt. The opener is fresh here (the
         // modify operator's Finalize calls FabricatorSetActiveTxn -> SetActiveOpener). See docs/cancellation.md.
         using var interrupt = new InterruptScope(AmbientOpener.Current);
@@ -1141,6 +1148,22 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     public long ExecuteUpdate(string schemaName, string tableName, int setColumnCount, IArrowArrayStream data)
     {
+        // slice D: identity-keyed UPDATE routes to storage (see ExecuteDelete). SET of the identity column
+        // itself is rejected — it is engine-assigned.
+        if (DetectExternalTable(schemaName, tableName) is { IdentityColumn: { } updIdCol } extUpd)
+        {
+            GuardExternalDml(schemaName, tableName, "UPDATE");
+            for (int j = 0; j < setColumnCount; j++)
+            {
+                if (string.Equals(data.Schema.FieldsList[j].Name, updIdCol, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new NotSupportedException(
+                        $"UPDATE of the identity column '{updIdCol}' on external table "
+                        + $"{schemaName}.{tableName} is not supported (engine-assigned).");
+                }
+            }
+            return ExternalTableRouting.UpdateByIdentity(extUpd.S3Uri!, updIdCol, setColumnCount, data);
+        }
         // Cancel a long rowid UPDATE (one statement per matched row) on query interrupt. Opener is fresh (the
         // modify Finalize's FabricatorSetActiveTxn -> SetActiveOpener). See docs/cancellation.md.
         using var interrupt = new InterruptScope(AmbientOpener.Current);
@@ -1317,7 +1340,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         // C++ host reads that schema to learn the DuckDB column types.
         MetadataKind.Columns => ExecuteMetadataQuery($"SELECT * FROM {Quote(Require(schema, table).schema)}." +
                                              $"{Quote(Require(schema, table).table)} WHERE 1 = 0"),
-        MetadataKind.RowId => ExecuteMetadataQuery(RowIdSql(Require(schema, table).schema, Require(schema, table).table, Profile)),
+        MetadataKind.RowId => RowIdMetadata(Require(schema, table).schema, Require(schema, table).table),
         MetadataKind.RowCount => ExecuteMetadataQuery(RowCountSql(Require(schema, table).schema, Require(schema, table).table)),
         MetadataKind.ColumnNdv => ExecuteMetadataQuery(ColumnNdvSql(Require(schema, table).schema, Require(schema, table).table)),
         MetadataKind.Functions => _functionFilter is null
@@ -1330,6 +1353,22 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         MetadataKind.VirtualColumns => EmptyStringTable("name", "type"),
         _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "fabricator: unknown metadata kind"),
     };
+
+    // slice D: a detected external DELTA table with a Delta IDENTITY column advertises THAT column as its
+    // rowid (an external table has no PK/UNIQUE/IDENTITY SQL-side, so RowIdSql finds nothing) — the scan
+    // reads it as a normal column through PolyBase, and ExecuteDelete/ExecuteUpdate resolve the values back
+    // to transient rowids on the Delta side. Everything else keeps the standard PK/unique/identity discovery.
+    private IArrowArrayStream RowIdMetadata(string schemaName, string tableName)
+    {
+        if (DetectExternalTable(schemaName, tableName) is { IdentityColumn: { } idCol })
+        {
+            var s = new Schema(new[] { new Field("name", StringType.Default, nullable: false) }, metadata: null);
+            var names = new StringArray.Builder();
+            names.Append(idCol);
+            return new InMemoryArrayStream(s, new[] { new RecordBatch(s, new IArrowArray[] { names.Build() }, 1) });
+        }
+        return ExecuteMetadataQuery(RowIdSql(schemaName, tableName, Profile));
+    }
 
     private static IArrowArrayStream EmptyStringTable(params string[] columns)
     {
@@ -1737,7 +1776,12 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // a Delta append via a transient delta-provider catalog / one new parquet file — and SQL Server keeps
     // serving the reads. See ExternalTableRouting (Bridge) for the endpoint-asymmetry + atomicity rules.
 
-    private sealed record ExternalTableInfo(string? TableLocation, string? DataSourceLocation, string? FormatType);
+    private sealed record ExternalTableInfo(string? TableLocation, string? DataSourceLocation, string? FormatType,
+                                            string? IdentityColumn)
+    {
+        public string? S3Uri => ExternalTableRouting.ComposeS3Uri(DataSourceLocation, TableLocation);
+        public bool IsDelta => string.Equals((FormatType ?? "").Trim(), "DELTA", StringComparison.OrdinalIgnoreCase);
+    }
 
     // Lazy per-table cache (positive AND negative — a normal table's INSERT must not pay a metadata query
     // per statement). Invalidated on DROP/CREATE through this catalog; an out-of-band conversion of an
@@ -1765,9 +1809,18 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         {
             foreach (var row in ReadMetadataRows(sql, 3))
             {
-                Log.LogInformation("external table {Schema}.{Table}: location={Loc} source={Src} format={Fmt}",
-                    schemaName, tableName, row[0], row[1], row[2]);
-                return new ExternalTableInfo(row[0], row[1], row[2]);
+                var info = new ExternalTableInfo(row[0], row[1], row[2], IdentityColumn: null);
+                // slice D: a Delta IDENTITY column on the target enables identity-keyed UPDATE/DELETE —
+                // it becomes the entry's rowid (a real, PolyBase-readable data column). One `_delta_log`
+                // open, cached with the probe.
+                if (info.IsDelta && info.S3Uri is { } uri)
+                {
+                    info = info with { IdentityColumn = ExternalTableRouting.FindDeltaIdentityColumn(uri) };
+                }
+                Log.LogInformation(
+                    "external table {Schema}.{Table}: location={Loc} source={Src} format={Fmt} identity={Id}",
+                    schemaName, tableName, row[0], row[1], row[2], info.IdentityColumn ?? "<none>");
+                return info;
             }
         }
         catch (Exception ex)
@@ -1776,6 +1829,19 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 schemaName, tableName, ex.Message);
         }
         return null;
+    }
+
+    // Storage-side DML shares the INSERT's semantics: statement-atomic (its own Delta commit), so an
+    // explicit DuckDB transaction can't wrap it.
+    private void GuardExternalDml(string schemaName, string tableName, string verb)
+    {
+        if (_explicitTxns.ContainsKey(AmbientTransaction.Current))
+        {
+            throw new NotSupportedException(
+                $"{verb} external table {schemaName}.{tableName} writes directly to its storage (its own "
+                + "Delta commit) and cannot roll back with an explicit transaction — COMMIT first "
+                + "(autocommit only).");
+        }
     }
 
     private long ExternalTableInsert(ExternalTableInfo ext, string schemaName, string tableName,
