@@ -404,7 +404,16 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   `ClusteredTableTests`, 8). Incremental trade-off: cubes overlap in key ranges (point lookup ≤ N-cubes
   files) — same as Databricks. `verify_delta_clustered_optimize` 113 (§6: stable cube untouched across
   a fragmenting append cycle [2 active files = cube A + cube B], no-op when all stable, FULL → 1 file,
-  property-only key-change invalidation reorders by the NEW key).
+  property-only key-change invalidation reorders by the NEW key). **VALIDATED LIVE (sparkprobe
+  `verifyzcube`, Fabric Spark 4.1):** OneLake `fabricator_partclust` (PARTITIONED BY + SORTED BY: our
+  per-partition recluster 6→3 files, 2000/region exact, NO domain in commit-0) — Spark reads exact,
+  DESCRIBE DETAIL shows partitionColumns [region] + empty clusteringColumns, Spark OPTIMIZE runs fine
+  over our tagged files; `fabricator_sorted` (2 of our cubes: stable A untouched by the incremental run
+  + merged B) — counts exact, clusteringColumns intact, and **Spark's clustering OPTIMIZE RECOGNIZED
+  OUR CUBES AS ITS OWN: clusteringStats inputZCubeFiles=2/inputOtherFiles=0 (it parsed our ZCUBE_ID
+  tags), filesPassedToZCubeFilter=2, per-column quality "ok", ZERO rewrites** — full incremental-
+  clustering interop, both directions; Spark INSERT still works. Also pinned live: a lone DV-less
+  append file correctly SKIPS (joins the next round's merge).
 - **`SORTED BY` → Delta ORDERED (clustered) writes — DONE (2026-07-18, C#-only, no ABI).** The v52 native
   clause (`CREATE TABLE lake.s.t SORTED BY (a,b) [AS …]` — `sort_columns` already crossed the ABI to
   `create_table`/`begin_bulk`; Delta previously ignored it) now drives the Delta provider:
