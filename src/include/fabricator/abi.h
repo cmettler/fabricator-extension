@@ -153,6 +153,12 @@ typedef enum {
 	                                  // field (name + type); flag0 = if_not_exists
 	FABRICATOR_ALTER_DROP_FIELD = 10,   // arg1 = JSON full path of the field; flag0 = if_exists
 	FABRICATOR_ALTER_RENAME_FIELD = 11, // arg1 = JSON full path of the field; arg2 = new field name
+
+	// ALTER TABLE t SET SORTED BY (a, b) / RESET SORTED BY — declares/re-keys/removes the table's
+	// clustering (Delta: the delta.clustering domain + the fabricator.sortedBy ordered-write property).
+	// SET/RESET PARTITIONED BY crosses too so each provider errors meaningfully (none supports it yet).
+	FABRICATOR_ALTER_SET_SORTED_BY = 12,      // arg1 = JSON array of column names ([] = RESET)
+	FABRICATOR_ALTER_SET_PARTITIONED_BY = 13, // arg1 = JSON array of column names ([] = RESET)
 } FabricatorAlterKind;
 
 #define FABRICATOR_ALTER_FLAG_IF_EXISTS 1

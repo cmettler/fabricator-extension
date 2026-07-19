@@ -3914,9 +3914,28 @@ public sealed class DeltaCatalog : IBackendCatalog
                 _sortedByCache.TryRemove(TablePath(s, newName), out _);
                 return;
             }
+            case AlterKind.SetSortedBy:
+            {
+                // ALTER TABLE t SET SORTED BY (a, b) / RESET SORTED BY — a1 = JSON array ([] = RESET).
+                // ONE metadata commit updates the fabricator.sortedBy ordered-write property AND
+                // (unpartitioned) the delta.clustering declaration — the ALTER CLUSTER BY analog; a
+                // partitioned table takes the property only (clustering + partitioning are mutually
+                // exclusive). Immediate/administrative, like set_tblproperties.
+                IReadOnlyList<string> sortCols = string.IsNullOrEmpty(a1)
+                    ? []
+                    : System.Text.Json.JsonSerializer.Deserialize<List<string>>(a1!) ?? [];
+                DeltaReader.SetSortedBy(Opener(), TablePath(s, t), sortCols, default);
+                _sortedByCache.TryRemove(TablePath(s, t), out _); // the property changed — re-read on next append
+                return;
+            }
+            case AlterKind.SetPartitionedBy:
+                throw Unsupported(
+                    "SET/RESET PARTITIONED BY — changing a Delta table's partitioning requires a full "
+                    + "rewrite: COPY the data to the table's path with (FORMAT delta, MODE 'overwrite', "
+                    + "PARTITION_COLUMNS '…')");
             default:
                 throw Unsupported("ALTER TABLE (only ADD/RENAME/DROP COLUMN — top-level or nested struct field — "
-                                  + "and RENAME TABLE are supported on Delta)");
+                                  + "SET/RESET SORTED BY, and RENAME TABLE are supported on Delta)");
         }
     }
 

@@ -500,7 +500,123 @@ SELECT count(*) FROM o WHERE p IS NOT NULL AND p > payload;
 0
 
 # ============================================================================
-# 7. a plain (non-clustered) table still bin-packs as before
+# 7. ALTER TABLE SET/RESET SORTED BY — the domain re-key DDL (ALTER CLUSTER BY
+#    analog): ONE commit updates fabricator.sortedBy AND (unpartitioned) the
+#    delta.clustering domain, with the WRITER-ONLY protocol upgrade when needed.
+#    Re-keying a DOMAIN table now works (the earlier property-only limitation);
+#    old cubes go stale (ZCUBE_ZORDER_BY mismatch) and recluster incrementally.
+# ============================================================================
+
+statement ok
+CREATE TABLE lake.main.a1 AS SELECT (r * 91) % 4000 AS id, r AS payload FROM range(4000) t(r);
+
+statement ok
+INSERT INTO lake.main.a1 SELECT (r * 91) % 4000, r FROM range(4000, 8000) t(r);
+
+# declare clustering by DDL on a plain table — property + domain + writer-only protocol upgrade
+statement ok
+ALTER TABLE lake.main.a1 SET SORTED BY (id);
+
+query T
+SELECT value FROM fabricator_delta_tblproperties('lake', 'main.a1') WHERE property = 'fabricator.sortedBy';
+----
+["id"]
+
+query I
+SELECT count(*) FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/clustopt/a1/_delta_log/*.json')
+WHERE content LIKE '%delta.clustering%' AND content LIKE '%"operation":"SET SORTED BY"%';
+----
+1
+
+statement ok
+SELECT * FROM fabricator_delta_set_tblproperties('lake', 'main.a1', '{"fabricator.targetCubeSize":"1kb"}');
+
+query I
+SELECT fabricator_exec('lake', 'OPTIMIZE main.a1');
+----
+0
+
+query II
+SELECT count(*), count(DISTINCT rowid >> 40) FROM lake.main.a1;
+----
+8000	1
+
+# an INSERT now re-applies the DDL-declared order to its file
+statement ok
+INSERT INTO lake.main.a1 SELECT (r * 17) % 4000, r FROM range(8000, 9000) t(r);
+
+query I
+WITH o AS (SELECT id, lag(id) OVER (PARTITION BY rowid >> 40 ORDER BY rowid) AS p FROM lake.main.a1)
+SELECT count(*) FROM o WHERE p IS NOT NULL AND p > id;
+----
+0
+
+# RE-KEY the DOMAIN table by DDL (the case fabricator.sortedBy alone could not change): the old cube
+# goes stale and the next OPTIMIZE reorders EVERYTHING by the new key
+statement ok
+ALTER TABLE lake.main.a1 SET SORTED BY (payload);
+
+query I
+SELECT fabricator_exec('lake', 'OPTIMIZE main.a1');
+----
+0
+
+query II
+SELECT count(*), count(DISTINCT rowid >> 40) FROM lake.main.a1;
+----
+9000	1
+
+query I
+WITH o AS (SELECT payload, lag(payload) OVER (PARTITION BY rowid >> 40 ORDER BY rowid) AS p FROM lake.main.a1)
+SELECT count(*) FROM o WHERE p IS NOT NULL AND p > payload;
+----
+0
+
+# RESET SORTED BY: property + domain removed (one commit); the table is plain again
+statement ok
+ALTER TABLE lake.main.a1 RESET SORTED BY;
+
+query I
+SELECT count(*) FROM fabricator_delta_tblproperties('lake', 'main.a1') WHERE property = 'fabricator.sortedBy';
+----
+0
+
+query I
+SELECT count(*) FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/clustopt/a1/_delta_log/*.json')
+WHERE content LIKE '%"operation":"RESET SORTED BY"%' AND content LIKE '%"removed":true%';
+----
+1
+
+# guards: unknown column; DESC (clustering has no direction); SET PARTITIONED BY (needs a full rewrite)
+statement error
+ALTER TABLE lake.main.a1 SET SORTED BY (nope);
+----
+
+statement error
+ALTER TABLE lake.main.a1 SET SORTED BY (id DESC);
+----
+
+statement error
+ALTER TABLE lake.main.a1 SET PARTITIONED BY (id);
+----
+
+# partitioned table: SET SORTED BY takes the PROPERTY only (ordered writes) — never the domain
+statement ok
+ALTER TABLE lake.main.p1 SET SORTED BY (id);
+
+query T
+SELECT value FROM fabricator_delta_tblproperties('lake', 'main.p1') WHERE property = 'fabricator.sortedBy';
+----
+["id"]
+
+query I
+SELECT count(*) FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/clustopt/p1/_delta_log/*.json')
+WHERE content LIKE '%delta.clustering%';
+----
+0
+
+# ============================================================================
+# 8. a plain (non-clustered) table still bin-packs as before
 # ============================================================================
 
 statement ok

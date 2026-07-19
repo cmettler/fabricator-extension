@@ -127,6 +127,71 @@ internal static class DeltaReader
         }
     }
 
+    /// <summary>ALTER TABLE … SET SORTED BY (cols) / RESET SORTED BY (<paramref name="cols"/> empty):
+    /// ONE metadata commit updating the <c>fabricator.sortedBy</c> ordered-write property AND — on an
+    /// UNPARTITIONED table — the <c>delta.clustering</c> declaration (EW
+    /// <c>SetClusteringColumnsAsync</c>, the ALTER CLUSTER BY analog: domain re-key/removal + the
+    /// writer-only clustering/domainMetadata protocol upgrade when missing). A PARTITIONED table takes
+    /// the property only (clustering and partitioning are mutually exclusive). Changing the keys makes
+    /// existing ZCubes STALE (ZCUBE_ZORDER_BY mismatch) — the next OPTIMIZE reclusters them
+    /// incrementally.</summary>
+    public static void SetSortedBy(nint opener, string path, IReadOnlyList<string> cols, CancellationToken ct)
+        => SetSortedByAsync(opener, path, cols, ct).GetAwaiter().GetResult();
+
+    private static async Task<long> SetSortedByAsync(
+        nint opener, string path, IReadOnlyList<string> cols, CancellationToken ct)
+    {
+        var fs = TableFileSystems.Create(opener, path);
+        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).ConfigureAwait(false);
+        try
+        {
+            var snapshot = table.CurrentSnapshot;
+            // Validate + canonicalize the columns against the schema (case-insensitive) up front — a typo
+            // must not persist a dangling property/domain.
+            var canonical = new List<string>(cols.Count);
+            foreach (var c in cols)
+            {
+                var field = snapshot.Schema.Fields.FirstOrDefault(
+                    x => string.Equals(x.Name, c, StringComparison.OrdinalIgnoreCase))
+                    ?? throw new InvalidOperationException(
+                        $"delta SET SORTED BY: column '{c}' is not a column of the table.");
+                canonical.Add(field.Name);
+            }
+            var merged = snapshot.Metadata.Configuration is null
+                ? new Dictionary<string, string>()
+                : snapshot.Metadata.Configuration.ToDictionary(kv => kv.Key, kv => kv.Value);
+            if (canonical.Count > 0)
+            {
+                merged[DeltaWriter.SortedByKey] = DeltaWriter.SerializeSortedBy(canonical);
+            }
+            else
+            {
+                merged.Remove(DeltaWriter.SortedByKey);
+            }
+            var metaData = snapshot.Metadata with { Configuration = merged };
+            if (snapshot.Metadata.PartitionColumns.Count > 0)
+            {
+                return await table.CommitDataFilesAsync(
+                    System.Array.Empty<WrittenDataFile>(), DeltaWriteMode.Append,
+                    cancellationToken: ct, extraActions: new DeltaAction[] { metaData },
+                    expectedVersion: snapshot.Version,
+                    operation: canonical.Count > 0 ? "SET SORTED BY" : "RESET SORTED BY")
+                    .ConfigureAwait(false);
+            }
+            return await table.SetClusteringColumnsAsync(
+                canonical.Count > 0 ? canonical : null,
+                extraActions: new DeltaAction[] { metaData }, ct).ConfigureAwait(false);
+        }
+        catch (DeltaConflictException)
+        {
+            throw ConcurrentModification("SET SORTED BY");
+        }
+        finally
+        {
+            await table.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
     /// <summary>One active data file for the native reader: its global path-sorted <paramref name="Ordinal"/>
     /// (matching engineered-wood's <c>OrderedActiveFiles</c> so a `(Ordinal&lt;&lt;40)|file_row_number` rowid
     /// round-trips to <c>DeleteByRowIdsAsync</c>), the readable <paramref name="Uri"/> (onelake:// for OneLake),

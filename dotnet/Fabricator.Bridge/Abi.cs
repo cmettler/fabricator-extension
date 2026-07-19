@@ -310,6 +310,11 @@ public static class AlterKind
     public const int DropField = 10;   // a1 = the field's full path
     public const int RenameField = 11; // a1 = the field's full path; a2 = the new name
 
+    // ALTER TABLE t SET SORTED BY (a, b) / RESET SORTED BY — clustering re-key; a1 = JSON array of
+    // column names ([] = RESET). SET/RESET PARTITIONED BY crosses too (providers error meaningfully).
+    public const int SetSortedBy = 12;
+    public const int SetPartitionedBy = 13;
+
     /// <summary>flags bit 0: the if-(not-)exists guard.</summary>
     public const int FlagIfExists = 1;
 }

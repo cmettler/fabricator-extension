@@ -414,6 +414,26 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   tags), filesPassedToZCubeFilter=2, per-column quality "ok", ZERO rewrites** — full incremental-
   clustering interop, both directions; Spark INSERT still works. Also pinned live: a lone DV-less
   append file correctly SKIPS (joins the next round's merge).
+  **`ALTER TABLE … SET/RESET SORTED BY` — DONE (2026-07-19, C++ additive alter kinds 12/13 + EW seam +
+  Bridge): the DOMAIN RE-KEY DDL (the ALTER CLUSTER BY analog).** DuckDB v1.5.4 parses
+  `ALTER TABLE t SET SORTED BY (a, b)` / `RESET SORTED BY` natively (`AlterTableType::SET_SORTED_BY`;
+  its own tables throw — the clause exists FOR catalog extensions; there's also SET/RESET PARTITIONED
+  BY). C++ crosses both as additive `FABRICATOR_ALTER_SET_SORTED_BY=12`/`_SET_PARTITIONED_BY=13` (a1 =
+  JSON array, [] = RESET; plain ASC column refs only — DESC/expressions rejected, clustering has no
+  direction). Delta: ONE metadata commit updates the `fabricator.sortedBy` ordered-write property AND —
+  unpartitioned — the `delta.clustering` domain via new EW **`SetClusteringColumnsAsync`** (declare/
+  re-key/remove + `extraActions` fusion + **`UpgradeProtocolForWriterFeatures`** — the WRITER-ONLY twin
+  of UpgradeProtocolForFeatures: clustering/domainMetadata must NOT enter readerFeatures, a legacy
+  reader-1 table upgrades to writer-7 while staying reader-1). **This closes the earlier limitation:
+  re-keying a SORTED BY-created (domain) table now works by DDL** — the old cubes go stale
+  (ZCUBE_ZORDER_BY mismatch) and the next OPTIMIZE reclusters by the NEW key incrementally. A
+  PARTITIONED table takes the property only (ordered writes; mutual exclusion); `SET PARTITIONED BY` →
+  clean guidance error (repartitioning = COPY MODE 'overwrite' + PARTITION_COLUMNS); SQL Server/DAX
+  reject the kinds. `_sortedByCache` invalidated. EW `ClusteredTableTests` 10 (declare/re-key/remove/
+  no-op, partitioned throw, writer-only-upgrade pin: reader stays 1, legacy writer features
+  enumerated); `verify_delta_clustered_optimize` 138 (§7: DDL declare on plain table + protocol upgrade
+  + INSERT re-applies order, domain re-key → incremental reorder by new key, RESET removes property+
+  domain [removed:true pin], unknown-column/DESC/SET PARTITIONED BY guards, partitioned property-only).
 - **`SORTED BY` → Delta ORDERED (clustered) writes — DONE (2026-07-18, C#-only, no ABI).** The v52 native
   clause (`CREATE TABLE lake.s.t SORTED BY (a,b) [AS …]` — `sort_columns` already crossed the ABI to
   `create_table`/`begin_bulk`; Delta previously ignored it) now drives the Delta provider:

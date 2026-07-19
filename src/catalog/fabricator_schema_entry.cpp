@@ -2599,6 +2599,42 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 		refresh(table);
 		break;
 	}
+	case AlterTableType::SET_SORTED_BY: {
+		// ALTER TABLE t SET SORTED BY (a, b) / RESET SORTED BY (empty orders). Clustering has no sort
+		// direction — only plain (implicitly ascending) column names are accepted.
+		auto &ss = table_info.Cast<SetSortedByInfo>();
+		vector<string> cols;
+		for (auto &order : ss.orders) {
+			if (order.type == OrderType::DESCENDING) {
+				throw NotImplementedException(
+				    "fabricator: SET SORTED BY has no sort direction — use plain column names");
+			}
+			if (!order.expression || order.expression->type != ExpressionType::COLUMN_REF) {
+				throw NotImplementedException("fabricator: SET SORTED BY accepts plain column names only");
+			}
+			cols.push_back(order.expression->Cast<ColumnRefExpression>().GetColumnName());
+		}
+		fabricator::AlterTable(handle_, name, table, FABRICATOR_ALTER_SET_SORTED_BY, JsonPathArray(cols), "",
+		                       nullptr, 0);
+		refresh(table);
+		break;
+	}
+	case AlterTableType::SET_PARTITIONED_BY: {
+		// Crossed so the provider errors meaningfully (Delta: repartitioning needs a full rewrite —
+		// COPY ... MODE 'overwrite' + PARTITION_COLUMNS; SQL Server/DAX: unsupported).
+		auto &sp = table_info.Cast<SetPartitionedByInfo>();
+		vector<string> cols;
+		for (auto &key : sp.partition_keys) {
+			if (!key || key->type != ExpressionType::COLUMN_REF) {
+				throw NotImplementedException("fabricator: SET PARTITIONED BY accepts plain column names only");
+			}
+			cols.push_back(key->Cast<ColumnRefExpression>().GetColumnName());
+		}
+		fabricator::AlterTable(handle_, name, table, FABRICATOR_ALTER_SET_PARTITIONED_BY, JsonPathArray(cols),
+		                       "", nullptr, 0);
+		refresh(table);
+		break;
+	}
 	default:
 		throw NotImplementedException("fabricator: this ALTER TABLE variant is not supported yet");
 	}
