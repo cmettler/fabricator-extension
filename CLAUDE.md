@@ -342,8 +342,8 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   read-past-EOF gotcha). Latched centrally in `InterruptibleQueryStream` (`_done` — Arrow C stream end is
   sticky), protecting every consumer; my chunked loop was just the first to pull past EOF.
   `verify_delta_clustered_optimize.test` now 55 (§5 multi-file: >1 file, per-file order, NO strictly
-  interleaving ranges, every add provider-tagged, counts exact). Remaining: ZCube-tagged incremental
-  recluster (ours is full-table).
+  interleaving ranges, every add provider-tagged, counts exact). (The ZCube incremental recluster
+  noted here as remaining is DONE — see the later bullet.)
   **PARTITIONED COMPACTION — SILENT CORRUPTION FOUND + FIXED AT THE EW ROOT (2026-07-18, EW `13f7fce`+
   local commit; the clustered-OPTIMIZE tests exposed it):** EW's `CompactionExecutor` compacted ALL
   candidates into ONE file at the TABLE ROOT stamped with the FIRST candidate's `partitionValues` — after
@@ -2151,12 +2151,12 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   **Remaining (deferred): Tier 4 only** — the arrow scan as a DuckDB async/BLOCKED source
   (`InterruptState`) to free the task thread during I/O (native interrupt + better parallelism, bigger). Live Ctrl+C
   behavior is a MANUAL check (a slow OneLake/SQL query + interrupt); the suites verify only behavior-neutrality.
-  **BINARY STATUS (2026-07-16): the WINDOWS targets are all CURRENT at v66** (full `cmake --build
-  build/release` — unittest + `duckdb.exe` shell + the loadable — rebuilt for the v66 bump; the earlier
-  v64-stale-shell condition is resolved, shell smoke green). **Only the LINUX payload
-  (`build/linux-payload/fabricator.duckdb_extension` + the FDD zip) is still pre-v65** — rebuild in WSL
-  (rsync `src/` → `~/sqlext`, `cmake --build … --target fabricator_loadable_extension`) before the next
-  notebook run.)
+  **BINARY STATUS (2026-07-19): the WINDOWS targets are all CURRENT** (unittest + `duckdb.exe` shell +
+  the loadable rebuilt for the SET/RESET SORTED BY alter kinds 12/13 + the SORTED_COLUMNS COPY option;
+  ABI still v66 — the kinds are additive). **The LINUX payload
+  (`build/linux-payload/fabricator.duckdb_extension` + the FDD zip) is pre-v65 and lags the ENTIRE
+  2026-07-18/19 clustering arc** — rebuild in WSL (rsync `src/` → `~/sqlext`, `cmake --build … --target
+  fabricator_loadable_extension`) before the next notebook run.)
 - **Prior: ABI v64** (v64 = **`onelake_move`** — atomic single-file rename via the ADLS Gen2
   DFS **native rename** (`DataLakeFileClient.RenameAsync`, a metadata op that overwrites an existing
   destination = MoveFile semantics; destination path filesystem-relative with the `<item>.Lakehouse`
@@ -3879,7 +3879,8 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   fix~~ — **REBUILT 2026-07-15 on the Fabricator-rename branch** (post-rename + post-DELETE-fix):
   `build/linux-payload/fabricator.duckdb_extension` (34 MB, linux_amd64) + `fabricator-fdd-linux-x64.zip`
   (loose-root FDD, net8.0) + the Windows loadable `build/release/extension/fabricator/fabricator.duckdb_extension`
-  are all current. The `scratchpad/fabricnb` driver was updated to the fabricator payload names (its Fabric
+  were all current AS OF 2026-07-15 (the linux payload has since gone stale again — see the BINARY
+  STATUS note at the ABI-version bullet). The `scratchpad/fabricnb` driver was updated to the fabricator payload names (its Fabric
   NOTEBOOK item name stays `arrownet_ext_probe` — the SP can't recreate notebooks). Linux build: rsync the
   renamed `src/` into WSL `~/sqlext`, `cmake --build … --target fabricator_loadable_extension`.
   **LINUX LOAD-SMOKE VALIDATED (no dotnet needed pre-installed):** the FDD payload is framework-dependent, so
