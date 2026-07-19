@@ -719,10 +719,20 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     private readonly System.Collections.Concurrent.ConcurrentDictionary<long, TxnState> _txns = new();
 
-    // begin is a no-op: the connection + provider transaction are pinned lazily on the first write
-    // (BeginWrite), keyed by the ambient transaction id. A read-only transaction never creates state.
+    // Explicit user BEGIN..COMMIT transaction ids (v60 is_explicit; the ambient id is set by set_active_txn
+    // right before begin_transaction). Consulted by the external-table INSERT routing: a storage-side write
+    // commits its own Delta commit / parquet PUT and cannot roll back with the SQL catalog's transaction,
+    // so it is rejected inside an explicit transaction (autocommit only).
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<long, byte> _explicitTxns = new();
+
+    // The connection + provider transaction are pinned lazily on the first write (BeginWrite), keyed by the
+    // ambient transaction id; begin only records explicitness. A read-only transaction never creates state.
     public void BeginTransaction(bool isExplicit)
     {
+        if (isExplicit && AmbientTransaction.Current != 0)
+        {
+            _explicitTxns[AmbientTransaction.Current] = 1;
+        }
     }
 
     public void CommitTransaction() => EndTransaction(AmbientTransaction.Current, commit: true);
@@ -731,6 +741,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     private void EndTransaction(long txnId, bool commit)
     {
+        _explicitTxns.TryRemove(txnId, out _);
         if (!_txns.TryRemove(txnId, out var state))
         {
             return; // no write happened in this transaction (or already finished)
@@ -961,6 +972,16 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 + "the SQL Server provider has no table-partition semantics on the bulk path.");
         }
         RejectWithOptions(optionsJson);
+        // A detected S3 external table's INSERT routes to STORAGE (slice C) — SQL Server itself can't
+        // INSERT into it. Plain appends only; CTAS/replace over an external table is not a bulk shape here.
+        if (!createTable && !replace && DetectExternalTable(schemaName, tableName) is { } externalTarget)
+        {
+            return ExternalTableInsert(externalTarget, schemaName, tableName, data, checkConstraints, txnId);
+        }
+        if (createTable || replace)
+        {
+            _externalInfo.TryRemove(ExternalKey(schemaName, tableName), out _); // re-probe after re-create
+        }
         // partitionColumns is a Delta/lakehouse concept; SQL Server table partitioning is out of scope here — ignored.
         // sortColumns (native SORTED BY) becomes a Fabric Warehouse WITH (CLUSTER BY (cols)) on the created table.
         // schemaMode (COPY SCHEMA_MODE merge/overwrite) is a Delta concept — ignored here (SQL Server REPLACE already
@@ -1178,6 +1199,13 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     public IArrowArrayStream InsertReturning(string schemaName, string tableName, IArrowArrayStream rows)
     {
+        if (DetectExternalTable(schemaName, tableName) is not null)
+        {
+            throw new NotSupportedException(
+                $"INSERT ... RETURNING is not supported on external table {schemaName}.{tableName} "
+                + "(the write routes to storage, which returns no OUTPUT INSERTED rows) — "
+                + "use a plain INSERT.");
+        }
         var (connection, transaction, owns) = BeginWrite();
         try
         {
@@ -1702,6 +1730,86 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         ProviderSettingsStore.Instance.GetBool(SqlServerBackend.ProviderName, "mssql_add_identity")
         ?? _addIdentityOnCreate;
 
+    // ---- S3 external tables: write routing (docs/create-table-with-options.md slice C) -----------------
+    // SQL Server external tables are READ-ONLY for SQL Server itself (no INSERT into an S3 external table;
+    // CETAS exports parquet/CSV only and can never write Delta). When the INSERT target is a detected
+    // DELTA/PARQUET external table over an s3:// data source, the write routes DIRECTLY to storage —
+    // a Delta append via a transient delta-provider catalog / one new parquet file — and SQL Server keeps
+    // serving the reads. See ExternalTableRouting (Bridge) for the endpoint-asymmetry + atomicity rules.
+
+    private sealed record ExternalTableInfo(string? TableLocation, string? DataSourceLocation, string? FormatType);
+
+    // Lazy per-table cache (positive AND negative — a normal table's INSERT must not pay a metadata query
+    // per statement). Invalidated on DROP/CREATE through this catalog; an out-of-band conversion of an
+    // already-probed table is picked up on re-ATTACH (documented staleness).
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, ExternalTableInfo?> _externalInfo =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private static string ExternalKey(string schemaName, string tableName) => schemaName + "." + tableName;
+
+    private ExternalTableInfo? DetectExternalTable(string schemaName, string tableName) =>
+        _externalInfo.GetOrAdd(ExternalKey(schemaName, tableName), _ => ProbeExternalTable(schemaName, tableName));
+
+    private ExternalTableInfo? ProbeExternalTable(string schemaName, string tableName)
+    {
+        // sys.external_tables → data source location + file format. LEFT JOIN: an external table without a
+        // file format (RDBMS connectors) is detected but not routable. Profile-tolerant: an engine without
+        // the catalog views (or without data virtualization) probes as "not external".
+        string sql =
+            "SELECT et.location, eds.location, eff.format_type " +
+            "FROM sys.external_tables et " +
+            "JOIN sys.external_data_sources eds ON eds.data_source_id = et.data_source_id " +
+            "LEFT JOIN sys.external_file_formats eff ON eff.file_format_id = et.file_format_id " +
+            $"WHERE et.object_id = OBJECT_ID({ObjectLiteral(schemaName, tableName)})";
+        try
+        {
+            foreach (var row in ReadMetadataRows(sql, 3))
+            {
+                Log.LogInformation("external table {Schema}.{Table}: location={Loc} source={Src} format={Fmt}",
+                    schemaName, tableName, row[0], row[1], row[2]);
+                return new ExternalTableInfo(row[0], row[1], row[2]);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.LogDebug("external-table probe failed for {Schema}.{Table} (treated as not external): {Msg}",
+                schemaName, tableName, ex.Message);
+        }
+        return null;
+    }
+
+    private long ExternalTableInsert(ExternalTableInfo ext, string schemaName, string tableName,
+                                     IArrowArrayStream data, bool checkConstraints, long txnId)
+    {
+        if (_explicitTxns.ContainsKey(txnId))
+        {
+            throw new NotSupportedException(
+                $"INSERT into external table {schemaName}.{tableName} writes directly to its storage "
+                + "(its own Delta commit / parquet file) and cannot roll back with an explicit "
+                + "transaction — COMMIT first (autocommit only).");
+        }
+        var uri = ExternalTableRouting.ComposeS3Uri(ext.DataSourceLocation, ext.TableLocation)
+            ?? throw new NotSupportedException(
+                $"external table {schemaName}.{tableName} over data source location "
+                + $"'{ext.DataSourceLocation}' is not routable (s3:// data sources only).");
+        if (!ExternalTableRouting.CanRoute)
+        {
+            throw new NotSupportedException(
+                "external-table INSERT needs the host query surface (host_query) — unavailable here.");
+        }
+        switch ((ext.FormatType ?? string.Empty).Trim().ToUpperInvariant())
+        {
+            case "DELTA":
+                return ExternalTableRouting.AppendDelta(uri, data, checkConstraints, txnId);
+            case "PARQUET":
+                return ExternalTableRouting.AppendParquet(uri, data);
+            default:
+                throw new NotSupportedException(
+                    $"INSERT into a '{ext.FormatType}' external table is not supported (DELTA/PARQUET "
+                    + "only) — SQL Server itself cannot INSERT into S3 external tables at all.");
+        }
+    }
+
     // CREATE TABLE ... WITH (key='value', ...): the SQL Server provider knows no WITH keys yet — reject any
     // (never silently ignore an option). Planned keys (location/table_type/data_source/secret — S3 external
     // tables) land with docs/create-table-with-options.md slice B.
@@ -1721,6 +1829,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                             string? optionsJson)
     {
         RejectWithOptions(optionsJson);
+        _externalInfo.TryRemove(ExternalKey(schemaName, tableName), out _); // re-probe after re-create
         // partitionColumns is a Delta/lakehouse concept; not applied to SQL Server DDL here (ignored).
         // sortColumns (native SORTED BY) becomes a Fabric Warehouse WITH (CLUSTER BY (cols)) layout — see BuildCreateTable.
         // identityColumns (DuckDB GENERATED-column marker) become IDENTITY columns — see BuildCreateTable.
@@ -1804,7 +1913,20 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     public void DropTable(string schemaName, string tableName, bool ifExists)
     {
         string qualified = Quote(schemaName) + "." + Quote(tableName);
-        ExecuteNonQuery((ifExists ? "DROP TABLE IF EXISTS " : "DROP TABLE ") + qualified);
+        // A detected external table needs the EXTERNAL DDL form (SQL Server rejects plain DROP TABLE for
+        // them). Metadata-only — the storage data stays (document; no purge). No IF EXISTS form exists for
+        // DROP EXTERNAL TABLE pre-2025, so guard with OBJECT_ID.
+        if (DetectExternalTable(schemaName, tableName) is not null)
+        {
+            ExecuteNonQuery(ifExists
+                ? $"IF OBJECT_ID({ObjectLiteral(schemaName, tableName)}, 'U') IS NOT NULL DROP EXTERNAL TABLE {qualified}"
+                : "DROP EXTERNAL TABLE " + qualified);
+        }
+        else
+        {
+            ExecuteNonQuery((ifExists ? "DROP TABLE IF EXISTS " : "DROP TABLE ") + qualified);
+        }
+        _externalInfo.TryRemove(ExternalKey(schemaName, tableName), out _);
     }
 
     public void CreateSchema(string schemaName, bool ifNotExists)

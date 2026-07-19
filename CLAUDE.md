@@ -249,8 +249,8 @@ current code still uses the single-provider `fabricator` naming):
 
 In-flight / planned refactors (all C#-only unless noted; tests stay green per slice):
 - **`CREATE TABLE … WITH (…)` options + SQL Server EXTERNAL TABLES —
-  [docs/create-table-with-options.md](docs/create-table-with-options.md). SLICE A DONE (2026-07-19,
-  ABI v67); slices C/D/B planned.** DuckDB v1.5.4 parses the clause (`CreateTableInfo::options`).
+  [docs/create-table-with-options.md](docs/create-table-with-options.md). SLICES A (ABI v67) + C DONE
+  (2026-07-19); D/B planned.** DuckDB v1.5.4 parses the clause (`CreateTableInfo::options`).
   **A (DONE)** = `options_json` threaded through `create_table`+`begin_bulk` (v67; C++
   `TableOptionsArg` — constants only, flat string-valued JSON) → the Delta provider consumes THREE
   key kinds (`DeltaWithOptions.Parse`, guarded — unknown keys ERROR): per-statement **write tuning**
@@ -278,13 +278,29 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   Iceberg-shape no-ops) + `verify_with_options_mssql.test` (4). Regression: partition 54 / sorted_by
   30 / tblproperties 42 / native_write 147 / native_write_streaming 29 / copy_format 109 /
   transactions 941 / identity(delta) 38 / column_mapping 251 / dv_default 58 / columnstore 20 /
-  identity(sql) 64 / cluster_by 18 / custom_functions 89 green. Remaining slices, order C→D→B:
-  **C** (no ABI) = detect S3 external tables in the
-  SQL catalog (`sys.external_tables` join, lazy at write time) and route INSERT through storage —
-  Delta append via `BackendRegistry.Resolve("delta").OpenCatalog` transient catalog / parquet =
-  new file COPY — a capability SQL Server itself lacks; DuckDB s3 secret resolved by bucket scope,
-  its ENDPOINT authoritative (SQL's LOCATION host is SQL's network view); autocommit-only + guards;
-  DROP routes to `DROP EXTERNAL TABLE`. **D** = identity-keyed UPDATE/DELETE on detected external
+  identity(sql) 64 / cluster_by 18 / custom_functions 89 green.
+  **C — DONE (2026-07-19, C#-only, no ABI): INSERT INTO an S3 EXTERNAL TABLE routes to STORAGE** —
+  a capability SQL Server itself lacks (it can't INSERT into S3 external tables at all, and can't
+  write Delta ever). `SqlServerCatalog.DetectExternalTable` (lazy `sys.external_tables` join probe,
+  positive+negative cached per table, profile-tolerant, invalidated on DROP/CREATE) → Bridge-public
+  **`ExternalTableRouting`**: DELTA = transient delta catalog over the parent folder
+  (`BackendRegistry.Resolve("delta").OpenCatalog(root, native_write)` → BulkInsert parks →
+  `CommitTransaction()` flushes ONE Delta commit — the C# mirror of the COPY(FORMAT delta) finalize);
+  PARQUET = one `COPY … TO '<folder>/<uuid>.parquet'` host query. **Endpoint asymmetry**: SQL's
+  LOCATION host (`minio:9000`) is discarded — the DuckDB s3 secret (bucket-scope match) supplies the
+  client endpoint. Guards: explicit-txn rejection (`BeginTransaction(isExplicit)` now RECORDS explicit
+  txn ids — `set_active_txn` precedes it, verified), `INSERT…RETURNING` rejection, non-s3/non-DELTA/
+  PARQUET formats reject cleanly; appends never change table features so protocol-1.0 tables stay
+  SQL-readable; `DROP TABLE` on a detected external table emits **`DROP EXTERNAL TABLE`**
+  (metadata-only, data stays). `verify_mssql_s3_polybase` **167** (§6 Delta INSERT round-trip via
+  OPENROWSET + catalog scan, guards; §6b parquet INSERT; §6c DROP routing); regression: SQL fn suites
+  (26/33/24/31/63/13) + delta s3 161 / connection_mode 20 / time_travel 14 / orderby 7 green.
+  **ENV REPAIR en route: the live SQL container was the PRE-compose `mssql-arrownet` while MinIO was
+  on the new compose network (SQL couldn't resolve `minio:9000`, error 13807) — the compose
+  `mssql-fabricator` service is now the live 1433 server (old container STOPPED, not removed;
+  provision.ps1 re-run; fresh volume — suites self-provision).**
+  Remaining slices, order D→B:
+  **D** = identity-keyed UPDATE/DELETE on detected external
   Delta tables: a Delta IDENTITY column bridges the rowid domains (PolyBase-visible data column +
   standard stats for pruned identity→position resolution on the Delta side, SNAPSHOT-INDEPENDENT —
   the only sound bridge; the row-tracking `_metadata.row_id` can NOT serve this: the materialized

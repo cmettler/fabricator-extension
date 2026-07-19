@@ -309,7 +309,136 @@ ORDER BY id;
 statement ok
 DETACH rtlake;
 
-# ---- 6. teardown (external objects; the delta data stays for re-runs — CREATE OR REPLACE resets it) ----
+# ---- 6. INSERT INTO an external table routes to STORAGE (slice C) — a capability SQL Server lacks ----
+# The catalog detects the target (sys.external_tables → s3:// data source + DELTA/PARQUET format) and
+# writes DIRECTLY to the location: a Delta append (one commit, transient delta catalog) or one new parquet
+# file. The DuckDB s3 secret's ENDPOINT is authoritative (SQL's LOCATION host is ITS network view — the
+# FABRICATOR_S3_ENDPOINT vs FABRICATOR_S3_SQL_ENDPOINT split). SQL Server serves the reads as usual.
+
+# a fresh interop table with types matching the external declaration exactly
+statement ok
+CREATE OR REPLACE TABLE plake.main.ins AS
+SELECT CAST(i AS BIGINT) AS id, 'seed' || i AS name FROM range(1, 3) r(i);
+
+statement ok
+SELECT fabricator_exec('sqldb',
+  'IF OBJECT_ID(''dbo.s3_delta_ins'') IS NOT NULL DROP EXTERNAL TABLE dbo.s3_delta_ins');
+
+statement ok
+SELECT fabricator_exec('sqldb',
+  'CREATE EXTERNAL TABLE dbo.s3_delta_ins (id BIGINT, name VARCHAR(20))
+   WITH (LOCATION = ''/fabricator/polybase/ins'', DATA_SOURCE = s3_ds, FILE_FORMAT = DeltaFileFormat)');
+
+statement ok
+SELECT fabricator_refresh_cache('sqldb');
+
+# the INSERT goes through the ATTACHed SQL catalog — and lands in the Delta table on MinIO
+statement ok
+INSERT INTO sqldb.dbo.s3_delta_ins VALUES (100, 'newrow');
+
+# SQL Server reads the appended row through the SAME external table (CREATE OR REPLACE reset the delta
+# state this run, so counts are exact)
+query IT
+SELECT id, name FROM fabricator_query('sqldb',
+  'SELECT id, name FROM OPENROWSET(BULK ''/fabricator/polybase/ins'', FORMAT = ''DELTA'',
+     DATA_SOURCE = ''s3_ds'') AS r ORDER BY id')
+ORDER BY id;
+----
+1	seed1
+2	seed2
+100	newrow
+
+# ... and through the catalog's normal table scan of the external table
+query I
+SELECT count(*) FROM sqldb.dbo.s3_delta_ins;
+----
+3
+
+# our own delta view of the location agrees (the append kept the table protocol-1.0 plain)
+query I
+SELECT count(*) FROM plake.main.ins;
+----
+3
+
+# guard: the storage write is its own Delta commit — it cannot join an explicit DuckDB transaction
+statement ok
+BEGIN;
+
+statement error
+INSERT INTO sqldb.dbo.s3_delta_ins VALUES (101, 'txnrow');
+----
+cannot roll back with an explicit
+
+statement ok
+ROLLBACK;
+
+# guard: INSERT ... RETURNING has no OUTPUT INSERTED rows on the storage path
+statement error
+INSERT INTO sqldb.dbo.s3_delta_ins VALUES (102, 'retrow') RETURNING id;
+----
+not supported on external table
+
+# ---- 6b. PARQUET-format external table: INSERT = one new parquet file in the folder ----
+statement ok
+COPY (SELECT CAST(1 AS BIGINT) AS id, 'pqseed' AS name) TO 's3://fabricator/polybase/pq/seed.parquet' (FORMAT parquet);
+
+statement ok
+SELECT fabricator_exec('sqldb',
+  'IF NOT EXISTS (SELECT 1 FROM sys.external_file_formats WHERE name = ''ParquetFileFormat'')
+     CREATE EXTERNAL FILE FORMAT ParquetFileFormat WITH (FORMAT_TYPE = PARQUET)');
+
+statement ok
+SELECT fabricator_exec('sqldb',
+  'IF OBJECT_ID(''dbo.s3_pq_ins'') IS NOT NULL DROP EXTERNAL TABLE dbo.s3_pq_ins');
+
+statement ok
+SELECT fabricator_exec('sqldb',
+  'CREATE EXTERNAL TABLE dbo.s3_pq_ins (id BIGINT, name VARCHAR(20))
+   WITH (LOCATION = ''/fabricator/polybase/pq'', DATA_SOURCE = s3_ds, FILE_FORMAT = ParquetFileFormat)');
+
+statement ok
+SELECT fabricator_refresh_cache('sqldb');
+
+statement ok
+INSERT INTO sqldb.dbo.s3_pq_ins VALUES (200, 'pqnew');
+
+# the new file is visible through the external table (folder LOCATION reads all files; uuid-named INSERT
+# files ACCUMULATE across test re-runs on the persistent bucket -> tolerant pins)
+query I
+SELECT count(*) >= 2 FROM sqldb.dbo.s3_pq_ins;
+----
+true
+
+query I
+SELECT count(*) >= 1 FROM sqldb.dbo.s3_pq_ins WHERE id = 200 AND name = 'pqnew';
+----
+true
+
+query I
+SELECT count(*) >= 1 FROM sqldb.dbo.s3_pq_ins WHERE name = 'pqseed';
+----
+true
+
+# ---- 6c. DROP TABLE on a detected external table routes to DROP EXTERNAL TABLE (metadata-only) ----
+statement ok
+DROP TABLE sqldb.dbo.s3_delta_ins;
+
+query I
+SELECT count(*) FROM fabricator_query('sqldb',
+  'SELECT CAST(name AS VARCHAR(50)) AS name FROM sys.external_tables WHERE name = ''s3_delta_ins''');
+----
+0
+
+# the delta data itself STAYS on storage (metadata-only drop)
+query I
+SELECT count(*) FROM plake.main.ins;
+----
+3
+
+statement ok
+DROP TABLE sqldb.dbo.s3_pq_ins;
+
+# ---- 7. teardown (external objects; the delta data stays for re-runs — CREATE OR REPLACE resets it) ----
 statement ok
 SELECT fabricator_exec('sqldb',
   'IF OBJECT_ID(''dbo.s3_delta_trips'') IS NOT NULL DROP EXTERNAL TABLE dbo.s3_delta_trips');

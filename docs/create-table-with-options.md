@@ -1,7 +1,7 @@
 # `CREATE TABLE … WITH (…)` options + SQL Server external tables (design)
 
-Status: **slice A DONE (2026-07-19, ABI v67); C/D/B planned.** Four slices, ordered A → C → D → B by
-value/risk.
+Status: **slices A (ABI v67) + C DONE (2026-07-19); D/B planned.** Four slices, ordered A → C → D → B
+by value/risk.
 Origin: user request — DuckDB parses a `WITH (key='value', …)` clause on CREATE TABLE / CTAS
 (the Iceberg-style `WITH (location=…, table_type=…, format=…)` shape); we should surface those
 options to the C# providers to (1) set Delta TBLPROPERTIES + parquet write tuning per table,
@@ -139,11 +139,37 @@ tblproperties 42 / native_write 147 / copy_format 109.
 
 ---
 
-## Slice C — external-table detection + write routing (C#-only, **no ABI**)
+## Slice C — external-table detection + write routing (C#-only, **no ABI**) — **DONE**
 
-The highest-value slice: INSERT into a detected S3 external table routes through storage — a
-capability SQL Server itself does not have (it can't INSERT into S3 external tables at all, and can't
-write Delta ever).
+Built 2026-07-19 as planned. Notes from the build:
+
+- The routing lives in Bridge (`ExternalTableRouting` — public, so the SqlServer assembly reaches
+  `Host.Query`/`BackendRegistry` without widening internals): `AppendDelta` = transient delta catalog
+  over the parent folder (flat layout + native_write) → `BulkInsert` parks the append →
+  `CommitTransaction()` flushes it as ONE Delta commit (the C# mirror of the `COPY (FORMAT delta)`
+  finalize; `RollbackTransaction` on failure = discard-only backstop); `AppendParquet` = one
+  `COPY … TO '<folder>/<uuid>.parquet'` host query.
+- Detection: `SqlServerCatalog.DetectExternalTable` — lazy probe (`sys.external_tables` →
+  data source → LEFT JOIN file format), cached positive AND negative per table (a normal table's
+  INSERT never pays a repeat metadata query), profile-tolerant (probe failure ⇒ not external),
+  invalidated on DROP/CREATE/replace through the catalog.
+- Explicitness tracking: `BeginTransaction(isExplicit)` now records explicit txn ids (the ambient id
+  is set by `set_active_txn` immediately before — verified in `fabricator_transaction.cpp`); the
+  external INSERT rejects inside an explicit transaction.
+- `DROP TABLE` on a detected external table emits `DROP EXTERNAL TABLE` (OBJECT_ID-guarded for
+  IF EXISTS); `INSERT … RETURNING` rejects (no OUTPUT INSERTED rows on the storage path).
+- Test conventions: an exec-created external table needs `fabricator_refresh_cache` before catalog
+  access (existing §4 convention); parquet-INSERT pins are accumulation-tolerant (uuid files persist
+  across re-runs on the shared bucket).
+- Environment repair en route: the running SQL Server container was the PRE-compose `mssql-arrownet`
+  while MinIO was on the new compose network — SQL couldn't resolve `minio:9000` (error 13807). The
+  compose `mssql-fabricator` service is now the live one (old container stopped, provision re-run).
+
+Verified: `verify_mssql_s3_polybase.test` **167** (new §6 Delta INSERT round-trip via OPENROWSET +
+catalog scan + our own delta view, explicit-txn + RETURNING guards, §6b parquet INSERT, §6c DROP
+EXTERNAL TABLE routing with data-stays pin) + regression: SQL fn suites (scalar 26 / table 33 /
+procs 24 / proc_inout 31 / table_inout 63 / functions 13), delta s3 161, connection_mode 20,
+time_travel 14, orderby 7. Original design below.
 
 ### Detection
 
