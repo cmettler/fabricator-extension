@@ -79,7 +79,9 @@ public static class GlobalFunctions
     /// get_function_return_schema path). Throws for kinds without a scalar return (table/in-out/collector).</summary>
     public static Field ReturnField(string name)
     {
-        if (ScalarMap.Value.TryGetValue(name, out var s)) { return s.Result; }
+        // A pure scalar's field carries the CONSISTENT tag (fabricator.volatile = "0") so the C++
+        // registration folds constants — see ScalarFunctionMetadata.
+        if (ScalarMap.Value.TryGetValue(name, out var s)) { return ScalarFunctionMetadata.TagVolatility(s.Result, s); }
         if (AggregateMap.Value.TryGetValue(name, out var a)) { return a.Result; }
         throw new ArgumentException($"fabricator: global function '{name}' has no scalar return type");
     }

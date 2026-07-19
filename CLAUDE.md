@@ -260,6 +260,25 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   predicate subset (pre-bucket with `width_bucket`). `test/verify_hilbert_index.test` (27 — full-grid
   unit-step property pins 2D+3D = the defining Hilbert property, U-order literals, clamp/NULL/errors, 100k
   ordered CTAS); global_functions 63 unregressed.
+  **`bucket` global scalar + DECLARED SCALAR VOLATILITY — DONE (2026-07-19, C#+C++ lockstep, no ABI bump):
+  the Iceberg/DuckLake bucket transform** (`bucket(num_buckets, value) → INTEGER`, DuckLake arg order;
+  `BucketFunction`, Bridge, beside hilbert_index): Murmur3 x86-32 seed 0 over Iceberg's canonical byte
+  encodings (spec Appendix B — ints/dates→LE 8-byte long, ts/time→µs, decimal→minimal BE two's-complement
+  of the UNSCALED value, string→UTF-8, blob raw) then `(hash & Int32.Max) % n` — bucket values agree with
+  DuckLake/Iceberg/Spark (spec known-answer vectors pinned + cross-checked vs an independent murmur3);
+  NULL→NULL, float/double/bool rejected (Iceberg parity), value = the SQLNULL→ANY sentinel (runtime-type
+  dispatch). **Delta has no transform partitioning → bucket partitioning = materialize the column**:
+  `CREATE TABLE … PARTITIONED BY (user_bucket) AS SELECT *, bucket(8, user_name) AS user_bucket …`, prune
+  with `WHERE user_bucket = bucket(8, 'alice')`. **That pruning required the general capability the user
+  asked for: scalar functions now DECLARE volatility** — `IScalarFunction.IsVolatile` (default TRUE;
+  override false = PURE), riding the return-schema FIELD metadata `fabricator.volatile="0"` (the variant
+  metadata channel — absent=volatile, old bridges/plugins unchanged) → `FetchFunctionReturnType(out bool)`
+  → `BuildFabricatorScalarFunction` registers `FunctionStability::CONSISTENT` ⇒ constant args FOLD at plan
+  time (the folded literal is what reaches the scan as a partition filter; VOLATILE = never folded stays
+  the default for discovered/remote UDFs). Applies to global AND catalog custom scalars; hilbert_index is
+  now CONSISTENT too. `test/verify_bucket.test` (34 — vectors, distribution, guards, partitioned CTAS +
+  duckdb_logs `pruned=2` pin proving fold→prune); regressions global_functions 63 / hilbert 27 / scalar 26
+  / custom 89 / sorted_by 30 / clustered_optimize 138 green.
   **WRITES TO LIQUID-CLUSTERED TABLES — DONE (2026-07-18, EW-only, local commit): the `clustering` writer
   feature is allowlisted in EW `ProtocolVersions.SupportedWriterFeatures`** — previously EVERY write to a
   Databricks/Fabric-Spark `CREATE TABLE … CLUSTER BY` table failed with "unsupported writer features:

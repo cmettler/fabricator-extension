@@ -286,7 +286,8 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext
 // (GetOrCreateScalarFunction) and load-time global scalars (RegisterFabricatorGlobalFunctions).
 static ScalarFunction BuildFabricatorScalarFunction(FabricatorHandle handle, const string &schema_name,
                                                   const string &fn_name, vector<LogicalType> arg_types,
-                                                  vector<string> arg_names, LogicalType return_type) {
+                                                  vector<string> arg_names, LogicalType return_type,
+                                                  bool is_volatile) {
 	scalar_function_t exec = [handle, schema_name, fn_name, arg_names](
 	                             DataChunk &args, ExpressionState &state, Vector &result) {
 		auto &ctx = state.GetContext();
@@ -339,9 +340,12 @@ static ScalarFunction BuildFabricatorScalarFunction(FabricatorHandle handle, con
 	}
 	ScalarFunction fn(sig_types, return_type, exec);
 	fn.name = fn_name;
-	// A remote UDF may be non-deterministic / side-effecting (VOLATILE => never folded), and may return
-	// non-NULL for NULL inputs, so it must see NULL args (SPECIAL_HANDLING) rather than being short-circuited.
-	fn.SetStability(FunctionStability::VOLATILE);
+	// A remote UDF may be non-deterministic / side-effecting (VOLATILE => never folded) — the default. A
+	// function DECLARED pure (fabricator.volatile = "0" on its return field, e.g. hilbert_index / bucket) is
+	// CONSISTENT so constant args fold at plan time (partition pruning on `WHERE b = bucket(8, 'x')` depends
+	// on it). Either way it may return non-NULL for NULL inputs, so it must see NULL args (SPECIAL_HANDLING)
+	// rather than being short-circuited.
+	fn.SetStability(is_volatile ? FunctionStability::VOLATILE : FunctionStability::CONSISTENT);
 	fn.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	return fn;
 }
@@ -360,9 +364,10 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateScalarFunction(Clie
 	vector<string> arg_names;
 	vector<LogicalType> arg_types;
 	LogicalType return_type;
+	bool is_volatile = true;
 	try {
 		FetchFunctionParamSchema(context, handle_, name, func_name, arg_names, arg_types);
-		return_type = FetchFunctionReturnType(context, handle_, name, func_name);
+		return_type = FetchFunctionReturnType(context, handle_, name, func_name, &is_volatile);
 	} catch (std::exception &) {
 		// The discovered name is stale — the function no longer exists on the server
 		// (e.g. dropped out-of-band). Treat it as not-found rather than erroring.
@@ -372,7 +377,8 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateScalarFunction(Clie
 	}
 
 	// The per-call execution callback (shared with load-time global scalars).
-	ScalarFunction fn = BuildFabricatorScalarFunction(handle_, name, func_name, arg_types, arg_names, return_type);
+	ScalarFunction fn =
+	    BuildFabricatorScalarFunction(handle_, name, func_name, arg_types, arg_names, return_type, is_volatile);
 
 	CreateScalarFunctionInfo info(std::move(fn));
 	info.catalog = catalog.GetName();
@@ -1807,15 +1813,16 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				vector<string> arg_names;
 				vector<LogicalType> arg_types;
 				LogicalType return_type;
+				bool is_volatile = true;
 				try {
 					// handle = 0 + empty schema = the global marker; C# resolves the function by name.
 					FetchFunctionParamSchema(context, nullptr, "", fn_name, arg_names, arg_types);
-					return_type = FetchFunctionReturnType(context, nullptr, "", fn_name);
+					return_type = FetchFunctionReturnType(context, nullptr, "", fn_name, &is_volatile);
 				} catch (std::exception &) {
 					continue; // skip a global whose schema can't be resolved
 				}
-				ScalarFunction fn =
-				    BuildFabricatorScalarFunction(nullptr, "", fn_name, arg_types, arg_names, return_type);
+				ScalarFunction fn = BuildFabricatorScalarFunction(nullptr, "", fn_name, arg_types, arg_names,
+				                                                  return_type, is_volatile);
 				loader.RegisterFunction(fn);
 			} else if (kind == "inout" || kind == "collector") {
 				// A connection-free in-out / collector: a {TABLE}-param table function on the streaming-exchange

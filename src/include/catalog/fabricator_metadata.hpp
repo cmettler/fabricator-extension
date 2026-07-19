@@ -57,9 +57,11 @@ vector<FabricatorFunctionInfo> DiscoverFunctions(FabricatorHandle handle);
 void FetchFunctionParamSchema(ClientContext &context, FabricatorHandle handle, const string &schema_name,
                               const string &func_name, vector<string> &names, vector<LogicalType> &types);
 
-//! Resolves a scalar function's return type from its (single-field) return-schema stream.
+//! Resolves a scalar function's return type from its (single-field) return-schema stream. When
+//! out_volatile is given it also reads the volatility signal riding the result FIELD's metadata
+//! (fabricator.volatile = "0" => CONSISTENT/pure, constant-foldable; absent => VOLATILE, the default).
 LogicalType FetchFunctionReturnType(ClientContext &context, FabricatorHandle handle, const string &schema_name,
-                                    const string &func_name);
+                                    const string &func_name, bool *out_volatile = nullptr);
 
 //! Resolves a table-valued function's output column names + DuckDB types from the Arrow
 //! schema of its (zero-row) output-schema stream — reuses the C# type mapping.

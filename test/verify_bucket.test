@@ -1,0 +1,151 @@
+# name: test/verify_bucket.test
+# description: bucket(num_buckets, value) — GLOBAL (connection-free) scalar: the Iceberg/DuckLake bucket
+#              transform (Murmur3 x86-32 seed 0 over Iceberg's canonical byte encodings, then
+#              (hash & Int32.Max) % n). DuckLake arg order: bucket(8, user_name). Delta has no transform
+#              partitioning, so bucket PARTITIONING here = materialize the bucket as a column and
+#              PARTITION BY it; the function is CONSISTENT (constant-foldable), so
+#              WHERE bucket_col = bucket(8, '<literal>') folds at plan time and PRUNES partitions —
+#              pinned below via duckdb_logs. Known-answer vectors are the Iceberg spec's (Appendix B),
+#              cross-checked against an independent murmur3 implementation.
+# group: [fabricator]
+
+require fabricator
+
+require parquet
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+# ==== Iceberg spec known-answer vectors ====
+# n = Int32.Max exposes (hash & Int32.Max) directly: for hash h, bucket(2147483647, v) = h if h >= 0
+# else h + 2^31. Spec hashes: int/long 34 -> 2017239379; 'iceberg' -> 1210000089; date 2017-11-16
+# -> -653330422; ts 2017-11-16T22:31:08 -> -2047944441; time 22:31:08 -> -662762989; decimal 14.20
+# (unscaled 1420) -> -500754589; binary 00010203 -> -188683207.
+
+query IIII
+SELECT bucket(2147483647, 34),
+       bucket(2147483647, 34::BIGINT),
+       bucket(2147483647, 34::SMALLINT),
+       bucket(2147483647, 34::TINYINT);
+----
+2017239379	2017239379	2017239379	2017239379
+
+query IIII
+SELECT bucket(2147483647, 'iceberg'),
+       bucket(2147483647, DATE '2017-11-16'),
+       bucket(2147483647, TIMESTAMP '2017-11-16 22:31:08'),
+       bucket(2147483647, TIME '22:31:08');
+----
+1210000089	1494153226	99539207	1484720659
+
+# decimal hashes the UNSCALED value (scale matters — Iceberg semantics); blob hashes raw bytes
+query II
+SELECT bucket(2147483647, 14.20::DECIMAL(9,2)),
+       bucket(2147483647, '\x00\x01\x02\x03'::BLOB);
+----
+1646729059	1958800441
+
+# small-n moduli of the same hashes
+query IIII
+SELECT bucket(16, 34), bucket(8, 'alice'), bucket(8, 'bob'), bucket(8, 'charlie');
+----
+3	5	2	7
+
+# ==== vectorized over columns + distribution sanity ====
+
+# every bucket lands in [0, n); 1000 distinct strings spread over all 8 buckets
+query III
+WITH b AS (SELECT bucket(8, 'user_' || i) AS v FROM range(1000) t(i))
+SELECT min(v) >= 0, max(v) < 8, count(DISTINCT v) FROM b;
+----
+true	true	8
+
+# deterministic: same value => same bucket, per row over a column
+query I
+SELECT count(*) FROM range(500) t(i)
+WHERE bucket(64, i) <> bucket(64, i::BIGINT);
+----
+0
+
+# ==== NULL + guards ====
+
+query I
+SELECT bucket(8, NULL::VARCHAR) IS NULL;
+----
+true
+
+statement error
+SELECT bucket(0, 'x');
+----
+num_buckets must be in
+
+statement error
+SELECT bucket(NULL, 'x');
+----
+num_buckets must not be NULL
+
+statement error
+SELECT bucket(8, 1.5::DOUBLE);
+----
+not bucketable
+
+statement error
+SELECT bucket(8, true);
+----
+not bucketable
+
+# ==== bucket PARTITIONING on a Delta catalog (the DuckLake PARTITIONED BY (bucket(8, col)) analog) ====
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/bucketlake' AS lake (TYPE fabricator, PROVIDER 'delta', native_read true, native_write true);
+
+# materialize the bucket as a column and partition by it (alice->5, bob->2, charlie->7: three partitions)
+statement ok
+CREATE OR REPLACE TABLE lake.main.events PARTITIONED BY (user_bucket) AS
+SELECT u.user_name, i AS event_id, bucket(8, u.user_name) AS user_bucket
+FROM (VALUES ('alice'), ('bob'), ('charlie')) u(user_name), range(100) t(i);
+
+query I
+SELECT count(*) FROM lake.main.events;
+----
+300
+
+# the persisted partition value round-trips the transform: recompute == stored, on every row
+query I
+SELECT count(*) FROM lake.main.events WHERE user_bucket <> bucket(8, user_name);
+----
+0
+
+# the DuckLake-style query shape: high-cardinality key + its bucket as the pruning predicate
+query I
+SELECT count(*) FROM lake.main.events
+WHERE user_name = 'alice' AND user_bucket = bucket(8, 'alice');
+----
+100
+
+# ---- prove partition PRUNING: bucket(8, 'alice') folded to a constant at plan time (CONSISTENT),
+#      reached the scan as an ordinary partition filter, and skipped 2 of the 3 partition files ----
+
+statement ok
+CALL enable_logging(level := 'debug', storage := 'memory');
+
+query I
+SELECT count(*) FROM lake.main.events
+WHERE user_name = 'alice' AND user_bucket = bucket(8, 'alice');
+----
+100
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native list%pruned=2%';
+----
+true
+
+statement ok
+CALL disable_logging();
+
+# cleanup
+statement ok
+DROP TABLE lake.main.events;
+
+statement ok
+DETACH lake;

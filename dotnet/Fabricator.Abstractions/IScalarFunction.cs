@@ -22,6 +22,17 @@ public interface IScalarFunction
     Field Result { get; }
 
     /// <summary>
+    /// Whether the function is VOLATILE (default) — non-deterministic or side-effecting, never
+    /// constant-folded — or CONSISTENT (override to <c>false</c> for a PURE function: same inputs =&gt; same
+    /// output, no side effects). A CONSISTENT function over constant args folds to a literal at plan time,
+    /// which is what lets a predicate like <c>WHERE bucket_col = bucket(8, 'alice')</c> reach the scan as an
+    /// ordinary constant filter (partition/file pruning). Discovered SQL UDFs stay VOLATILE (a remote body
+    /// may read data or use nondeterminism); the flag rides the return-schema field metadata
+    /// (<c>fabricator.volatile</c>) — no ABI change.
+    /// </summary>
+    bool IsVolatile => true;
+
+    /// <summary>
     /// Computes the result column for a batch of argument rows. <paramref name="args"/> carries the
     /// columns described by <see cref="Parameters"/> (positional, same order); the returned array must
     /// have the same length as the batch and the Arrow type of <see cref="Result"/>. The function sees

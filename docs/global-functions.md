@@ -278,6 +278,38 @@ ordered CTAS (`test/verify_hilbert_index.test`, 27). NOT yet: real liquid cluste
 writer feature, `delta.clustering` domainMetadata, ZCube incremental OPTIMIZE) — this is the ordering
 primitive those would build on.
 
+## bucket — the Iceberg/DuckLake bucket transform (DONE, 2026-07-19)
+
+`bucket(num_buckets BIGINT, value ANY) → INTEGER` (`BucketFunction`, Bridge; declared in
+`CustomFunctions.GlobalScalar`; DuckLake's arg order `bucket(8, user_name)`): **Murmur3 x86-32 (seed 0)
+over Iceberg's canonical byte encodings** (spec Appendix B — ints/dates as the little-endian 8-byte long,
+timestamps/times as µs, decimals as the minimal big-endian two's-complement of the UNSCALED value [scale
+matters], strings UTF-8, blobs raw), then `(hash & Int32.Max) % n` — so values bucket IDENTICALLY in
+DuckLake, Iceberg, and Spark bucket transforms (spec known-answer vectors pinned, cross-checked against an
+independent murmur3). NULL value → NULL; `n` must be a positive INT32; float/double/boolean rejected (not
+bucketable in Iceberg either — cast first); the `value` param is the SQLNULL→ANY sentinel (runtime-type
+dispatch in `Invoke`).
+
+**The purpose — bucket PARTITIONING of high-cardinality keys.** DuckLake 1.0 partitions by the expression
+(`ALTER TABLE … SET PARTITIONED BY (bucket(8, user_name))`); Delta has no transform partitioning (a table
+partitions only by a real column), so the equivalent here is a MATERIALIZED bucket column:
+
+```sql
+CREATE TABLE lake.s.events PARTITIONED BY (user_bucket) AS
+SELECT *, bucket(8, user_name) AS user_bucket FROM src;
+-- pruning: the CONSISTENT function folds at plan time => an ordinary partition filter
+SELECT … FROM lake.s.events WHERE user_name = 'alice' AND user_bucket = bucket(8, 'alice');
+```
+
+**Scalar volatility is now a declared property** (built with/for this): `IScalarFunction.IsVolatile`
+(default **true** — remote/discovered UDFs stay VOLATILE) — override `false` for a PURE function; the flag
+rides the return-schema FIELD metadata (`fabricator.volatile = "0"`, read in `FetchFunctionReturnType`, no
+ABI change; absent = volatile, so old bridges/plugins keep their behavior) and the shared
+`BuildFabricatorScalarFunction` registers CONSISTENT ⇒ constant args fold to literals. Without it the
+pruning predicate above would never reach the scan. `hilbert_index` and `bucket` declare it; applies to
+global AND catalog custom scalars. `test/verify_bucket.test` (34 — spec vectors, distribution,
+NULL/guards, partitioned CTAS + a duckdb_logs `pruned=2` pin proving fold→prune end-to-end).
+
 ## The template-engine demo (the motivator)
 
 A provider-agnostic core global, e.g. `fabricator_render(template VARCHAR, params <any>) → VARCHAR`:

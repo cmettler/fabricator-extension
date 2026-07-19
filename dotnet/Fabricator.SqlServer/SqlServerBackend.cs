@@ -2010,7 +2010,9 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     {
         if (CustomScalar.TryGetValue($"{schemaName}.{functionName}", out var custom))
         {
-            return new Schema(new[] { custom.Result }, null);
+            // A pure custom scalar's field carries the CONSISTENT tag (constant folding) — see
+            // ScalarFunctionMetadata; discovered SQL UDFs below never tag (remote bodies stay VOLATILE).
+            return new Schema(new[] { ScalarFunctionMetadata.TagVolatility(custom.Result, custom) }, null);
         }
         if (CustomAgg.TryGetValue($"{schemaName}.{functionName}", out var customAgg))
         {

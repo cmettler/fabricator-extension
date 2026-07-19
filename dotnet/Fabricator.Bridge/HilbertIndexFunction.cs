@@ -28,6 +28,8 @@ public sealed class HilbertIndexFunction : IScalarFunction
 {
     public string Name => "hilbert_index";
 
+    public bool IsVolatile => false; // pure — constant-foldable
+
     public Schema Parameters => new(new[]
     {
         new Field("coords", new ListType(new Field("item", Int64Type.Default, nullable: true)), nullable: true),

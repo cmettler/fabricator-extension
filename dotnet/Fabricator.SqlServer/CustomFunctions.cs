@@ -31,6 +31,10 @@ internal static class CustomFunctions
         // style ordered writes (ORDER BY hilbert_index(...) rides DuckDB's spilling sort; the write pipeline
         // stays streaming). Provider-agnostic core (lives in the Bridge, like DeltaGlobalTableFunction).
         new Fabricator.Bridge.HilbertIndexFunction(),
+        // bucket(n, value) — the Iceberg/DuckLake Murmur3 bucket transform, for bucket PARTITIONING of
+        // high-cardinality keys: materialize `bucket(8, col)` as a column, PARTITION BY it, and prune with
+        // `WHERE bucket_col = bucket(8, <literal>)` (CONSISTENT => the constant side folds at plan time).
+        new Fabricator.Bridge.BucketFunction(),
     };
 
     // Connection-free GLOBAL table-in-out (streaming exchange) functions — bare fn(<input>), no ATTACH.

@@ -6,6 +6,7 @@
 
 #include "fabricator/clr_host.hpp"
 #include "catalog/fabricator_txn_util.hpp"
+#include "duckdb/common/arrow/schema_metadata.hpp"
 #include "duckdb/common/exception.hpp"
 
 #include <cstdint>
@@ -151,9 +152,22 @@ void FetchFunctionParamSchema(ClientContext &context, FabricatorHandle handle, c
 }
 
 LogicalType FetchFunctionReturnType(ClientContext &context, FabricatorHandle handle, const string &schema_name,
-                                    const string &func_name) {
+                                    const string &func_name, bool *out_volatile) {
 	ArrowSchema schema {};
 	fabricator::GetFunctionReturnSchema(handle, schema_name, func_name, schema);
+	if (out_volatile) {
+		// The volatility signal rides the result FIELD's metadata (the same C-ABI channel as extension-type
+		// markers): fabricator.volatile = "0" => CONSISTENT (pure, constant-foldable). ABSENT => VOLATILE —
+		// the historical default, so old bridges/plugins keep their behavior. Read BEFORE ReadArrowSchema
+		// consumes the struct.
+		*out_volatile = true;
+		if (schema.n_children > 0 && schema.children[0] && schema.children[0]->metadata) {
+			ArrowSchemaMetadata field_metadata(schema.children[0]->metadata);
+			if (field_metadata.GetOption("fabricator.volatile") == "0") {
+				*out_volatile = false;
+			}
+		}
+	}
 	vector<string> names;
 	vector<LogicalType> types;
 	fabricator::ReadArrowSchema(context, schema, types, names);
