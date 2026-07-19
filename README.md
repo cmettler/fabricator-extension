@@ -343,7 +343,9 @@ COPY src TO 'mssql.dbo.target'  (FORMAT 'bcp', REPLACE true); -- drop + recreate
 
 COPY target = `mssql://catalog/schema/table` or `catalog.schema.table` (3-part only — temp-table /
 empty-schema syntax is not supported). Options: `CREATE_TABLE` (default true), `REPLACE` (default
-false). The target is registered in the catalog (queryable immediately).
+false). The target is registered in the catalog (queryable immediately). (This is the `FORMAT mssql`
+catalog COPY; to write a **Delta** table to a raw path with no ATTACH, use `FORMAT delta` — see
+[`COPY … TO` a Delta path](#copy--to-a-delta-path-no-attach).)
 
 ### Type mapping (DuckDB → SQL Server, for CREATE / CTAS / COPY)
 
@@ -684,6 +686,33 @@ SELECT _change_type, id, val, _commit_version, _commit_timestamp
 -- insert/insert (v1), delete (v2): each row tagged with its commit version + timestamp (epoch ms)
 ```
 
+### `COPY … TO` a Delta path (no ATTACH)
+
+`COPY … TO '<path>' (FORMAT delta, …)` writes a Delta table to **any path** — local, `s3://`, `onelake://`,
+`abfss://` — with **no ATTACH** (a transient per-execution catalog does the write). The disposition is the
+Spark / delta-rs **save-mode vocabulary** via the `MODE` option, and the write is its **own atomic Delta
+commit** (it deliberately does *not* roll back with a surrounding DuckDB `BEGIN` — file-COPY semantics).
+The official duckdb-delta extension has no COPY writer, so this is unique to fabricator.
+
+```sql
+COPY (SELECT * FROM src) TO 's3://lake/sales' (FORMAT delta);                    -- MODE 'overwrite' (default)
+COPY new_rows          TO 's3://lake/sales' (FORMAT delta, MODE 'append');       -- create-if-missing + append
+COPY src               TO 's3://lake/sales' (FORMAT delta, MODE 'error');        -- fail if it exists (Spark default)
+COPY src               TO 's3://lake/sales' (FORMAT delta, MODE 'ignore');       -- silent no-op if it exists
+COPY eu                TO 's3://lake/sales' (FORMAT delta, MODE 'overwrite_partitions',
+                                             PARTITION_COLUMNS 'region');        -- dynamic partition overwrite
+```
+
+`MODE` values: `overwrite` (default) · `append` · `error`/`errorifexists` · `ignore` · `error_if_not_exists`
+(strict append — fail if *missing*) · `overwrite_partitions` (replace only the partitions present in the
+input, one commit). Also accepts `PARTITION_COLUMNS 'a,b'`, `SORTED_COLUMNS 'a,b'` (declarative
+clustering — converges on re-runs), `SCHEMA_MODE 'merge'|'overwrite'`, and the same provider knobs as ATTACH
+(`NATIVE_WRITE` — **defaults true** here for bounded-memory streaming; `DELETION_VECTORS` / `COLUMN_MAPPING`
+/ `ROW_TRACKING` / `CHANGE_DATA_FEED` / `IN_COMMIT_TIMESTAMPS` / `COMPRESSION` / `ROW_GROUP_SIZE` /
+`BLOOM_FILTER_COLUMNS`). For a SQL-Server-readable table: `MODE 'overwrite', DELETION_VECTORS false,
+COLUMN_MAPPING 'none'`. (The legacy `CREATE_TABLE` / `REPLACE` flags still work but cannot be combined with
+`MODE`.)
+
 ### Partitioning & write tuning
 
 Tables can be **partitioned** with the native DuckDB `PARTITIONED BY` clause (the column list comes before
@@ -778,7 +807,7 @@ CALL fabricator_exec('lake', 'OPTIMIZE main.events');            -- reclusters i
 
 -- hilbert_index(coords[], bits): multi-dimensional locality in ONE ORDER BY key (liquid-clustering style)
 COPY (SELECT * FROM src ORDER BY hilbert_index([width_bucket(x,0,100,64), width_bucket(y,0,100,64)], 15))
-  TO 'lake.main.geo' (FORMAT delta);
+  TO 's3://lake/geo' (FORMAT delta);      -- path-targeted Delta write (see 'COPY … TO a Delta path' above)
 
 -- bucket(n, value): the Iceberg / DuckLake bucket transform (Murmur3, cross-engine-identical). Delta has no
 -- transform partitioning, so materialize the bucket column and PARTITION BY it; queries prune by folding
