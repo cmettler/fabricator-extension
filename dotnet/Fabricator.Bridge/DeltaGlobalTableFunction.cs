@@ -556,7 +556,7 @@ internal static class DeltaWriter
                                                      configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, serializable, sortedBy),
                                                      columnMappingMode: columnMapping,
                                                      cancellationToken: ct,
-                                                     clusteringColumns: sortedBy).ConfigureAwait(false);
+                                                     clusteringColumns: spec?.PartitionColumns is { Count: > 0 } ? null : sortedBy).ConfigureAwait(false);
             try
             {
                 // NOT NULL enforcement: an APPEND into an existing table must honor its declared nullability
@@ -783,7 +783,7 @@ internal static class DeltaWriter
             configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, serializable, sortedBy),
             columnMappingMode: columnMapping,
             cancellationToken: default,
-            clusteringColumns: sortedBy).ConfigureAwait(false);
+            clusteringColumns: spec?.PartitionColumns is { Count: > 0 } ? null : sortedBy).ConfigureAwait(false);
         try
         {
             // Fall back BEFORE writing any file / touching the log (so a fallback leaves no orphan): a table
@@ -1194,7 +1194,7 @@ internal static class DeltaWriter
                                                          columnMappingMode: columnMapping,
                                                          preAssignedSchema: preAssignedSchema,
                                                          cancellationToken: ct,
-                                                         clusteringColumns: sortedBy).ConfigureAwait(false);
+                                                         clusteringColumns: spec?.PartitionColumns is { Count: > 0 } ? null : sortedBy).ConfigureAwait(false);
                 await table.DisposeAsync().ConfigureAwait(false);
                 Log.LogDebug("delta create {Path}: opened/created (commit-0 if new)", path);
                 return;

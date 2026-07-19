@@ -313,9 +313,8 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   stats; the add gets fresh baseRowId per compaction semantics). The listing runs against the OPEN
   table's own snapshot (`BuildNativeScanListAsync`, the extracted core of ListNativeScanFiles) so
   expectedVersion can't race; a concurrent commit → clean "retry" error. NO-OP when active = 1 DV-less
-  file (Spark parity — no commit). Gates → bin-pack fallback: no native_write, partitioned (liquid
-  clustering is unpartitioned by definition), identity/IcebergCompat, variant, nested columns under
-  mapping. `test/verify_delta_clustered_optimize.test`
+  file (Spark parity — no commit). Gates → bin-pack fallback: no native_write, identity/IcebergCompat,
+  variant, nested columns under mapping. `test/verify_delta_clustered_optimize.test`
   (46 — 2-key hilbert order pinned via deterministic ntile recompute [unique keys] + lag monotonicity,
   DV rows not resurrected, stable id preserved, clusteringProvider+dataChange:false commit pins, no-op
   re-OPTIMIZE, VACUUM→1 file, 1-key lexicographic, sortedBy-only detection, partitioned+plain fallbacks);
@@ -366,6 +365,27 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   materialize_rowtracking 17 / row_tracking 33 / row_tracking_virtual 299 / sorted_by 30 / native_write
   147 / native_read 88 / partition 54 / partition_overwrite 90 / transactions 941 / dv_default 58 /
   column_mapping 251 / variant 133 green.
+  **PARTITIONED × CLUSTERED — DONE (2026-07-18, EW guard + Bridge): `PARTITIONED BY` + `SORTED BY`
+  COMPOSE on one table, the Databricks ZORDER-on-partitioned analog.** (1) **A partitioned create
+  declares NO `delta.clustering`** — liquid clustering and partitioning are mutually exclusive
+  (Spark's CLUSTER BY REPLACES PARTITIONED BY; the combo put Spark's clustering-info paths in
+  None.get territory — probed, we WERE writing it): EW `CreateAsync` now THROWS on
+  clusteringColumns+partitionColumns (`ClusteredTableTests` 8) and `DeltaWriter` passes
+  `clusteringColumns: null` when `spec.PartitionColumns` present — the partitioned SORTED BY table
+  keeps only `fabricator.sortedBy`. (2) **Clustered OPTIMIZE now serves PARTITIONED tables as
+  PER-PARTITION recluster**: the listing groups by canonical partition key (physical-normalized, EW
+  parity), each fragmented group (≥2 files or any DV) rewrites into ordered file(s) in ITS Hive dir
+  with ITS partitionValues, and — the payoff of hand-built removes — **PARTIAL recluster**: clean
+  partitions' files stay ACTIVE, untouched (commit = Append + extraActions RemoveFile[dataChange:false]
+  for rewritten groups only; the unpartitioned path moved to the same shape — was mode=Overwrite).
+  Partitioned rewrites carry **NO clusteringProvider tag** (no liquid declaration exists for them);
+  unpartitioned keeps "liquid". Per-group ntile = per-partition range buckets (correct hilbert
+  locality within each partition); partition columns ride the INNER select as literals (a cluster key
+  may be one) but are EXCLUDED from the written files/stats/FIELD_IDS. NOTE: SORTED BY on partitioned
+  WRITES is approximate-only (the partitioned COPY is in the planner's force-unordered list — same
+  plan_copy_to_file.cpp rule), so OPTIMIZE is also what RESTORES strict order per partition.
+  `verify_delta_clustered_optimize` 80 (§4 rework: no-domain pin, per-partition order + exact values,
+  partial-recluster commit shape "2 removes + 1 add", no provider tag).
 - **`SORTED BY` → Delta ORDERED (clustered) writes — DONE (2026-07-18, C#-only, no ABI).** The v52 native
   clause (`CREATE TABLE lake.s.t SORTED BY (a,b) [AS …]` — `sort_columns` already crossed the ABI to
   `create_table`/`begin_bulk`; Delta previously ignored it) now drives the Delta provider:

@@ -1420,14 +1420,14 @@ internal static class DeltaReader
     }
 
     // Shapes the clustered SQL rewrite can't serve — they fall back to bin-pack CompactAsync (which handles
-    // them via the reader/writer seams): partitioned tables (liquid clustering is unpartitioned by definition),
-    // identity/IcebergCompat (need engineered-wood's committing writer), variant columns (the tagged-blob
-    // transport isn't read_parquet-representable), and nested columns under column mapping (the recursive
-    // physical rename has no hook inside one SQL statement).
+    // them via the reader/writer seams): identity/IcebergCompat (need engineered-wood's committing writer),
+    // variant columns (the tagged-blob transport isn't read_parquet-representable), and nested columns under
+    // column mapping (the recursive physical rename has no hook inside one SQL statement). PARTITIONED tables
+    // ARE served — as PER-PARTITION reclustering (the Databricks ZORDER-on-partitioned analog).
     private static bool ClusteredRewriteEligible(DeltaTable table)
     {
         var snap = table.CurrentSnapshot;
-        if (snap.Metadata.PartitionColumns.Count > 0 || !table.SupportsExternalDataFileCommit)
+        if (!table.SupportsExternalDataFileCommit)
         {
             return false;
         }
@@ -1466,15 +1466,52 @@ internal static class DeltaReader
         // exactly the version the rewrite read — a concurrent commit conflicts cleanly instead of racing.
         var listing = await BuildNativeScanListAsync(fs, path, snap, prune: null, DmlLog, schemaOverride: null)
             .ConfigureAwait(false);
-        bool anyDv = listing.Files.Any(f => f.Dv.Length > 0);
-        if (listing.Files.Count == 0 || (listing.Files.Count == 1 && !anyDv))
+        if (listing.Files.Count == 0)
         {
-            return null; // one DV-less file IS one contiguous clustered range — no-op (Spark parity)
+            return null;
         }
         var mode = EngineeredWood.DeltaLake.Schema.ColumnMapping.GetMode(snap.Metadata.Configuration);
+        bool partitioned = snap.Metadata.PartitionColumns.Count > 0;
+
+        // PARTITIONED tables recluster PER PARTITION (the Databricks ZORDER-on-partitioned analog; liquid
+        // clustering proper is unpartitioned, so partitioned rewrites carry NO clusteringProvider tag and
+        // NO delta.clustering declaration exists for them). Files group by their add.partitionValues —
+        // canonicalized with keys normalized to PHYSICAL names, so mixed logical/physical key vintages of
+        // one partition group together (EW's CanonicalPartitionKey parity). Unpartitioned = one "" group.
+        Dictionary<string, string>? keyToPhysical = null;
+        if (mode != EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None)
+        {
+            keyToPhysical = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var f in snap.Schema.Fields)
+            {
+                keyToPhysical[f.Name] = EngineeredWood.DeltaLake.Schema.ColumnMapping.GetPhysicalName(f, mode);
+            }
+        }
+        string KeyOf(IReadOnlyDictionary<string, string>? pv)
+        {
+            if (pv is null || pv.Count == 0)
+            {
+                return "";
+            }
+            var parts = new List<string>(pv.Count);
+            foreach (var kv in pv)
+            {
+                string k = keyToPhysical is not null && keyToPhysical.TryGetValue(kv.Key, out var p) ? p : kv.Key;
+                parts.Add(k + "=" + (kv.Value ?? "\u0000<null>"));
+            }
+            parts.Sort(StringComparer.Ordinal);
+            return string.Join("\u0001", parts);
+        }
+        var groups = listing.Files.GroupBy(f => KeyOf(f.PartitionValues), StringComparer.Ordinal).ToList();
+        var addsByKey = snap.ActiveFiles.Values
+            .GroupBy(a => KeyOf(a.PartitionValues), StringComparer.Ordinal)
+            .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.Ordinal);
+
         // Every user column (logical names), plus the materialized row-tracking pair when the table declares
         // them — the per-file COALESCE(materialized, baseRowId + position) bakes each row's ORIGINAL stable
-        // id/version into the clustered file (the compaction preservation rule).
+        // id/version into the clustered file (the compaction preservation rule). Partition columns join the
+        // INNER selection (FileSql renders them as typed literals — a cluster key may be one) but are
+        // EXCLUDED from the written file (Delta layout: values live in add.partitionValues).
         bool materializeIds = snap.Metadata.Configuration is { } rtCfg
             && rtCfg.TryGetValue("delta.rowTracking.materializedRowIdColumnName", out var mrc)
             && string.Equals(mrc, DeltaNativeReader.RowTrackingIdColumn, StringComparison.Ordinal)
@@ -1490,7 +1527,7 @@ internal static class DeltaReader
             dataCols.Add(DeltaNativeReader.RowTrackingIdColumn);
             dataCols.Add(DeltaNativeReader.RowTrackingVersionColumn);
         }
-        string inner = DeltaNativeReader.FullTableSql(listing, dataCols);
+        var partSet = new HashSet<string>(snap.Metadata.PartitionColumns, StringComparer.OrdinalIgnoreCase);
 
         // The outermost projection renames logical → physical for the written file (data files carry physical
         // names in BOTH mapping modes); the row-tracking columns keep their literal, unmapped names.
@@ -1498,21 +1535,23 @@ internal static class DeltaReader
         var select = new List<string>(dataCols.Count);
         foreach (var c in dataCols)
         {
+            if (partSet.Contains(c))
+            {
+                continue;
+            }
             var f = snap.Schema.Fields.FirstOrDefault(x => string.Equals(x.Name, c, StringComparison.Ordinal));
             string phys = f is null ? c : EngineeredWood.DeltaLake.Schema.ColumnMapping.GetPhysicalName(f, mode);
             select.Add(string.Equals(phys, c, StringComparison.Ordinal) ? Q(c) : $"{Q(c)} AS {Q(phys)}");
         }
         string projection = string.Join(", ", select);
-        string source;
         int bits = clusterCols.Count > 1 ? Math.Min(15, 63 / clusterCols.Count) : 0;
-        if (clusterCols.Count == 1 || bits < 1)
+        string BuildSource(string inner)
         {
-            // One key (or a degenerate >63-key spec): plain lexicographic order — hilbert n=1 is the identity.
-            source = $"SELECT {projection} FROM ({inner}) ORDER BY "
-                     + string.Join(", ", clusterCols.Select(Q));
-        }
-        else
-        {
+            if (clusterCols.Count == 1 || bits < 1)
+            {
+                // One key (or a degenerate >63-key spec): plain lexicographic order — hilbert n=1 is the identity.
+                return $"SELECT {projection} FROM ({inner}) ORDER BY " + string.Join(", ", clusterCols.Select(Q));
+            }
             // Hilbert over per-key ntile range-buckets: rank-based bucketing is type-agnostic (strings, dates —
             // no 63-bit truncation) and derives the value distribution from the data itself, exactly Spark's
             // range_partition_id approach. Consecutive output rows are hilbert-neighbors in EVERY key.
@@ -1524,25 +1563,30 @@ internal static class DeltaReader
                 tiles.Add($"ntile({buckets.ToString(CultureInfo.InvariantCulture)}) OVER (ORDER BY {Q(clusterCols[i])}) - 1 AS __fabricator_h{i}");
                 coords.Add($"__fabricator_h{i}");
             }
-            source = $"SELECT {projection} FROM (SELECT *, {string.Join(", ", tiles)} FROM ({inner})) "
-                     + $"ORDER BY hilbert_index([{string.Join(", ", coords)}], {bits})";
+            return $"SELECT {projection} FROM (SELECT *, {string.Join(", ", tiles)} FROM ({inner})) "
+                   + $"ORDER BY hilbert_index([{string.Join(", ", coords)}], {bits})";
         }
 
         // Stats schema: PHYSICAL names, USER columns only — the row-tracking columns stay out of the Delta
-        // stats (the established materialized-column convention).
+        // stats (the established materialized-column convention) and partition columns aren't in the files.
         var arrow = EngineeredWood.DeltaLake.Schema.SchemaConverter.ToArrowSchema(snap.Schema);
         var statsFields = new List<Field>(snap.Schema.Fields.Count);
         for (int i = 0; i < snap.Schema.Fields.Count; i++)
         {
+            if (partSet.Contains(snap.Schema.Fields[i].Name))
+            {
+                continue;
+            }
             statsFields.Add(new Field(
                 EngineeredWood.DeltaLake.Schema.ColumnMapping.GetPhysicalName(snap.Schema.Fields[i], mode),
                 arrow.FieldsList[i].DataType, nullable: true));
         }
         var statsSchema = new Schema(statsFields, null);
-        string? fieldIdsSpec = DeltaWriter.BuildFieldIdsSpec(snap.Schema, null);
+        string? fieldIdsSpec = DeltaWriter.BuildFieldIdsSpec(snap.Schema,
+            partitioned ? new HashSet<string>(snap.Metadata.PartitionColumns, StringComparer.Ordinal) : null);
 
-        // File split: ONE output file when the estimated output fits the target (the zero-crossing fast
-        // path — the whole rewrite runs inside one COPY), else SEQUENTIAL per-file COPYs cut at batch
+        // File split: ONE output file per group when its estimated output fits the target (the zero-crossing
+        // fast path — the whole group runs inside one COPY), else SEQUENTIAL per-file COPYs cut at batch
         // boundaries so every output file is a CONTIGUOUS cluster range with tight min/max on all keys.
         // DuckDB's own FILE_SIZE_BYTES rotation is NOT usable here: the planner FORCE-disables order
         // preservation for any rotated/per-thread/partitioned COPY regardless of the
@@ -1553,57 +1597,110 @@ internal static class DeltaReader
         // estimated from the source files' own add stats (bytes-per-row of the same data).
         string root = ToReadableRoot(path);
         long targetBytes = ResolveTargetFileSize(snap.Metadata.Configuration);
-        long estBytes = 0, estRows = 0;
-        bool sizesKnown = true;
-        foreach (var f in listing.Files)
+        long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var files = new List<WrittenDataFile>();
+        var removes = new List<DeltaAction>();
+
+        foreach (var g in groups)
         {
-            if (f.SizeBytes is { } sb && f.NumRecords is { } nr)
+            var groupFiles = g.ToList();
+            bool anyDv = groupFiles.Any(f => f.Dv.Length > 0);
+            if (groupFiles.Count == 1 && !anyDv)
             {
-                estBytes += sb;
-                estRows += nr;
+                continue; // one DV-less file IS one contiguous clustered range — leave the partition alone
+            }
+            // The group's Hive directory (decoded), inherited from its sources — one partition = one dir;
+            // "" for an unpartitioned table.
+            string rel0 = groupFiles[0].Uri.StartsWith(root + "/", StringComparison.Ordinal)
+                ? groupFiles[0].Uri.Substring(root.Length + 1) : groupFiles[0].Uri;
+            int dirSlash = rel0.LastIndexOf('/');
+            string dir = dirSlash >= 0 ? rel0.Substring(0, dirSlash + 1) : "";
+            var partitionValues = groupFiles[0].PartitionValues;
+
+            var subListing = new NativeScanList
+            {
+                Version = listing.Version,
+                PartitionColumns = listing.PartitionColumns,
+                Files = groupFiles,
+                AnyUri = groupFiles[0].Uri,
+                LogicalToPhysical = listing.LogicalToPhysical,
+                LogicalToFieldId = listing.LogicalToFieldId,
+                MappedSchema = listing.MappedSchema,
+                TableSchema = listing.TableSchema,
+            };
+            string source = BuildSource(DeltaNativeReader.FullTableSql(subListing, dataCols));
+
+            long estBytes = 0, estRows = 0;
+            bool sizesKnown = true;
+            foreach (var f in groupFiles)
+            {
+                if (f.SizeBytes is { } sb && f.NumRecords is { } nr)
+                {
+                    estBytes += sb;
+                    estRows += nr;
+                }
+                else
+                {
+                    sizesKnown = false; // external add without stats — can't estimate, keep one file
+                    break;
+                }
+            }
+            var copied = new List<NativeParquetDataFileWriter.CopiedFile>();
+            if (!sizesKnown || estRows == 0 || estBytes <= targetBytes + targetBytes / 4)
+            {
+                copied = NativeParquetDataFileWriter.RunCopySql(
+                    root, $"{dir}{Guid.NewGuid():N}.parquet", source, token, statsSchema, fieldIdsSpec);
             }
             else
             {
-                sizesKnown = false; // external add without stats — can't estimate, keep one file
-                break;
-            }
-        }
-        List<NativeParquetDataFileWriter.CopiedFile> copied;
-        if (!sizesKnown || estRows == 0 || estBytes <= targetBytes + targetBytes / 4)
-        {
-            copied = NativeParquetDataFileWriter.RunCopySql(
-                root, $"{Guid.NewGuid():N}.parquet", source, token, statsSchema, fieldIdsSpec);
-        }
-        else
-        {
-            long rowsPerFile = Math.Max(1024, (long)((double)targetBytes * estRows / estBytes));
-            copied = new List<NativeParquetDataFileWriter.CopiedFile>();
-            using var src = HostFs.Query(source, ct: token);
-            while (true)
-            {
-                var first = src.ReadNextRecordBatchAsync(token).AsTask().GetAwaiter().GetResult();
-                if (first is null)
+                long rowsPerFile = Math.Max(1024, (long)((double)targetBytes * estRows / estBytes));
+                using var src = HostFs.Query(source, ct: token);
+                while (true)
                 {
-                    break;
+                    var first = src.ReadNextRecordBatchAsync(token).AsTask().GetAwaiter().GetResult();
+                    if (first is null)
+                    {
+                        break;
+                    }
+                    string chunkRel = $"{dir}{Guid.NewGuid():N}.parquet";
+                    using var chunk = new BudgetedStream(src, first, rowsPerFile, token);
+                    var one = NativeParquetDataFileWriter.RunCopy(
+                        root, chunkRel, chunk, token, statsSchema, fieldIdsSpec: fieldIdsSpec);
+                    copied.Add(new NativeParquetDataFileWriter.CopiedFile(
+                        chunkRel, one.Rows, one.Size, null, one.Stats));
                 }
-                string chunkRel = $"{Guid.NewGuid():N}.parquet";
-                using var chunk = new BudgetedStream(src, first, rowsPerFile, token);
-                var one = NativeParquetDataFileWriter.RunCopy(
-                    root, chunkRel, chunk, token, statsSchema, fieldIdsSpec: fieldIdsSpec);
-                copied.Add(new NativeParquetDataFileWriter.CopiedFile(
-                    chunkRel, one.Rows, one.Size, null, one.Stats));
+            }
+            foreach (var cf in copied)
+            {
+                files.Add(new WrittenDataFile(cf.RelativePath, cf.Size, cf.Rows, partitionValues, cf.Stats));
+            }
+            // The group's old files become tombstones — removes hand-built from the SNAPSHOT's adds (full
+            // action fields incl. deletion vectors), joined by the same canonical key, so untouched
+            // partitions keep their files ACTIVE (partial recluster).
+            foreach (var add in addsByKey[g.Key])
+            {
+                removes.Add(new RemoveFile
+                {
+                    Path = add.Path,
+                    DeletionTimestamp = now,
+                    DataChange = false,
+                    ExtendedFileMetadata = true,
+                    PartitionValues = add.PartitionValues,
+                    Size = add.Size,
+                    DeletionVector = add.DeletionVector,
+                });
             }
         }
-        var files = new List<WrittenDataFile>(copied.Count);
-        foreach (var cf in copied)
+        if (files.Count == 0)
         {
-            files.Add(new WrittenDataFile(cf.RelativePath, cf.Size, cf.Rows, null, cf.Stats));
+            return null; // every partition already one contiguous DV-less range — no-op (Spark parity)
         }
         try
         {
-            return await table.CommitDataFilesAsync(files, DeltaWriteMode.Overwrite,
-                cancellationToken: token, expectedVersion: listing.Version, operation: "OPTIMIZE",
-                dataChange: false, clusteringProvider: "liquid").ConfigureAwait(false);
+            return await table.CommitDataFilesAsync(files, DeltaWriteMode.Append,
+                cancellationToken: token, extraActions: removes,
+                expectedVersion: listing.Version, operation: "OPTIMIZE",
+                dataChange: false, clusteringProvider: partitioned ? null : "liquid").ConfigureAwait(false);
         }
         catch (DeltaConflictException)
         {

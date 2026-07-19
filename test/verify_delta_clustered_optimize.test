@@ -205,22 +205,29 @@ SELECT count(*) FROM o WHERE p IS NOT NULL AND p > k;
 0
 
 # ============================================================================
-# 4. guard: a PARTITIONED table keeps the bin-pack fallback (no clusteringProvider),
-#    and that bin-pack compacts PER PARTITION — the pre-existing corruption this
-#    exposed mixed every partition into one file stamped with ONE partition's value
-#    (after OPTIMIZE all 1200 rows read a single region). This section runs under
-#    native_read + native_write, so it also pins the once-crashing reader-seam path.
+# 4. PARTITIONED tables: SORTED BY + PARTITIONED BY compose — the create declares NO
+#    delta.clustering (liquid clustering is unpartitioned by definition; declaring
+#    both crashed Spark's clustering-info paths), and OPTIMIZE reclusters PER
+#    PARTITION (the Databricks ZORDER-on-partitioned analog): each partition's files
+#    rewrite into ordered file(s) in that partition's Hive dir, values exact, NO
+#    clusteringProvider tag. This section runs under native_read + native_write,
+#    so it also pins the once-crashing reader-seam path — and the partition-value
+#    exactness pins the (fixed) all-rows-read-one-partition corruption.
 # ============================================================================
 
 statement ok
-CREATE TABLE lake.main.p1 PARTITIONED BY (region) AS
-SELECT ['US','EU','APAC'][(r % 3) + 1] AS region, r AS id FROM range(600) t(r);
+CREATE TABLE lake.main.p1 PARTITIONED BY (region) SORTED BY (id) AS
+SELECT ['US','EU','APAC'][(r % 3) + 1] AS region, (r * 91) % 600 AS id FROM range(600) t(r);
 
 statement ok
-INSERT INTO lake.main.p1 SELECT ['US','EU','APAC'][(r % 3) + 1], r FROM range(600, 1200) t(r);
+INSERT INTO lake.main.p1 SELECT ['US','EU','APAC'][(r % 3) + 1], (r * 17) % 600 FROM range(600, 1200) t(r);
 
-statement ok
-SELECT * FROM fabricator_delta_set_tblproperties('lake', 'main.p1', '{"fabricator.sortedBy":"[\"id\"]"}');
+# the partitioned create declares NEITHER the clustering domain NOR the feature
+query I
+SELECT count(*) FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/clustopt/p1/_delta_log/00000000000000000000.json')
+WHERE content LIKE '%delta.clustering%' OR content LIKE '%"clustering"%';
+----
+0
 
 query TI
 SELECT region, count(*) FROM lake.main.p1 GROUP BY region ORDER BY region;
@@ -234,7 +241,7 @@ SELECT fabricator_exec('lake', 'OPTIMIZE main.p1');
 ----
 0
 
-# partition values EXACT after the compaction (the corruption pin) + one file per partition
+# partition values EXACT after the recluster (the corruption pin) + one file per partition
 query TI
 SELECT region, count(*) FROM lake.main.p1 GROUP BY region ORDER BY region;
 ----
@@ -247,9 +254,55 @@ SELECT count(DISTINCT rowid >> 40), count(DISTINCT region) FROM lake.main.p1;
 ----
 3	3
 
+# each partition's file is ORDERED on the cluster key (the recluster, not just bin-pack)
+query I
+WITH o AS (SELECT id, lag(id) OVER (PARTITION BY rowid >> 40 ORDER BY rowid) AS p FROM lake.main.p1)
+SELECT count(*) FROM o WHERE p IS NOT NULL AND p > id;
+----
+0
+
+# the rewrite commit: OPTIMIZE operation, dataChange=false — but NO clusteringProvider
+# (no liquid declaration exists for partitioned tables)
+query I
+SELECT count(*) FROM fabricator_delta_snapshots('lake', 'main.p1') WHERE operation = 'OPTIMIZE';
+----
+1
+
 query I
 SELECT count(*) FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/clustopt/p1/_delta_log/*.json')
 WHERE content LIKE '%"clusteringProvider"%';
+----
+0
+
+# PARTIAL recluster: a fresh insert fragments ONE partition only ('US'); re-OPTIMIZE rewrites
+# just that partition — the other partitions' files stay ACTIVE (their paths keep their ordinals)
+statement ok
+INSERT INTO lake.main.p1 SELECT 'US', (r * 7) % 600 FROM range(1200, 1500) t(r);
+
+query I
+SELECT fabricator_exec('lake', 'OPTIMIZE main.p1');
+----
+0
+
+# the second OPTIMIZE commit removed exactly the US partition's 2 files and added 1
+query I
+SELECT count(*) FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/clustopt/p1/_delta_log/*.json')
+WHERE content LIKE '%"operation":"OPTIMIZE"%'
+  AND (length(content) - length(replace(content, '"remove":', ''))) / length('"remove":') = 2
+  AND (length(content) - length(replace(content, '"add":', ''))) / length('"add":') = 1;
+----
+1
+
+query TI
+SELECT region, count(*) FROM lake.main.p1 GROUP BY region ORDER BY region;
+----
+APAC	400
+EU	400
+US	700
+
+query I
+WITH o AS (SELECT id, lag(id) OVER (PARTITION BY rowid >> 40 ORDER BY rowid) AS p FROM lake.main.p1)
+SELECT count(*) FROM o WHERE p IS NOT NULL AND p > id;
 ----
 0
 
