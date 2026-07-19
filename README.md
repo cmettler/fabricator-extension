@@ -700,8 +700,11 @@ SET delta_write_options = '{"compression":"zstd","row_group_size":1000000,
 
 Compression: `snappy` (default) / `zstd` / `gzip` / `brotli` / `lz4` / `uncompressed` / …. Dictionary
 encoding is auto-enabled per column and min/max statistics are always collected (driving file + row-group
-pruning); bloom filters are off unless requested. (Partitioning is honored by the Delta provider; the
-SQL Server / DAX providers ignore `PARTITIONED BY`.)
+pruning). **`bloom_filter_columns` applies only to the EW codec writer** (the default write path); under
+`native_write` DuckDB's own Parquet writer produces the data files and blooms dictionary-encoded columns
+**automatically**, so the explicit column list is not used there. `compression` and `row_group_size` apply
+to both writers. (Partitioning is honored by the Delta provider; the SQL Server / DAX providers ignore
+`PARTITIONED BY`.)
 
 Two more write options (also via `delta_write_options`):
 
@@ -727,7 +730,8 @@ Two more write options (also via `delta_write_options`):
 
 Delta ATTACH options: `PROVIDER 'delta'`, `SECRET <azure_sp>` (OneLake/ADLS auth), `READ_ONLY false`
 (required for OneLake writes), `schemas true` (two-level layout on local/S3), `compression` / `row_group_size`
-/ `bloom_filter_columns` (write-tuning defaults), `deletion_vectors true`
+/ `bloom_filter_columns` (write-tuning defaults — `bloom_filter_columns` is EW-codec-only; `native_write`
+blooms automatically, see [above](#partitioning--write-tuning)), `deletion_vectors true`
 (DV-based DELETE/UPDATE), `change_data_feed true` (CDF capture), `in_commit_timestamps true` (in-protocol
 monotonic timestamps for Spark/Fabric interop — `AT (TIMESTAMP)` also resolves on plain tables via the
 always-on commit timestamp). Tables are written as **plain Delta** (minReader 1 / minWriter 2, no features)
