@@ -4338,10 +4338,14 @@ VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
 - **PowerShell 7 (`pwsh`)** — runs the managed publish script.
 
 **Steps:**
-1. **Submodules** (three; NON-recursive — skip engineered-wood's ~½ GB nested `parquet-testing` corpus):
+1. **Dependencies.** Only `engineered-wood` is a real git submodule (init NON-recursively — skips its
+   ~½ GB nested `parquet-testing` corpus). `duckdb` + `extension-ci-tools` are **gitignored manual
+   shallow clones** at pinned tags (NOT submodules — that's why there's no `git submodule` line for
+   them):
    ```
-   git submodule update --init --depth 1 duckdb          # shallow (large repo)
-   git submodule update --init extension-ci-tools engineered-wood
+   git submodule update --init engineered-wood
+   git clone --depth 1 --branch v1.5.4 https://github.com/duckdb/duckdb.git duckdb
+   git clone --depth 1 --branch v1.5.3 https://github.com/duckdb/extension-ci-tools.git extension-ci-tools
    ```
 2. **vcpkg deps** (once): `vcpkg install openssl:x64-windows-static curl:x64-windows-static`
 3. **Configure** (first time; ONE command WITH the vcpkg toolchain — httpfs is linked unconditionally so
@@ -4365,9 +4369,11 @@ VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
 ### Reference (the why + gotchas)
 
 - **Target DuckDB v1.5.4** (new extension API: `Extension::Load(ExtensionLoader&)` +
-  `loader.RegisterFunction(...)` + `DUCKDB_CPP_EXTENSION_ENTRY(fabricator, loader)`). Submodules pinned
-  to `duckdb@08e34c4` (v1.5.4) + `extension-ci-tools@v1.5.3` (no 1.5.4 branch exists; v1.5.3 is the
-  latest tooling for the 1.5.x line). `duckdb` is a **shallow** clone — bump via
+  `loader.RegisterFunction(...)` + `DUCKDB_CPP_EXTENSION_ENTRY(fabricator, loader)`). `duckdb` +
+  `extension-ci-tools` are **gitignored manual shallow clones** (NOT git submodules — `.gitmodules`
+  declares only `engineered-wood`), pinned to `duckdb@08e34c4` (v1.5.4) + `extension-ci-tools@v1.5.3`
+  (no 1.5.4 branch exists; v1.5.3 is the latest tooling for the 1.5.x line). Clone them per the
+  fresh-clone step 1 above; bump `duckdb` via
   `git -C duckdb fetch --depth 1 origin <sha> && git -C duckdb checkout <sha>`.
 - **engineered-wood is an in-tree git submodule** (`engineered-wood/` at the repo root, since
   2026-07-19; was a `D:\repos\engineered-wood` sibling ProjectReference). Pinned to the

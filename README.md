@@ -935,17 +935,20 @@ pwsh scripts/publish-managed.ps1     # self-contained publish next to the built 
 
 ### Extension
 
-Three submodules — init **non-recursively** (skips engineered-wood's ~½ GB nested `parquet-testing` corpus):
+Dependencies — one real git submodule + two gitignored manual shallow clones at pinned tags:
 
 ```bash
-git submodule update --init --depth 1 duckdb            # duckdb@v1.5.4 (shallow — large)
-git submodule update --init extension-ci-tools engineered-wood
+git submodule update --init engineered-wood             # the only real submodule (non-recursive)
+git clone --depth 1 --branch v1.5.4 https://github.com/duckdb/duckdb.git duckdb
+git clone --depth 1 --branch v1.5.3 https://github.com/duckdb/extension-ci-tools.git extension-ci-tools
 ```
 
-- **`duckdb@v1.5.4`** + **`extension-ci-tools@v1.5.3`** — the DuckDB source + build tooling.
-- **`engineered-wood`** — the pure-C# Delta/Parquet library (pinned to the
+- **`engineered-wood`** — the pure-C# Delta/Parquet library (a git submodule pinned to the
   [`cmettler/engineered-wood`](https://github.com/cmettler/engineered-wood) fork), referenced in-tree by
-  `Fabricator.Bridge`.
+  `Fabricator.Bridge`. Init NON-recursively (as above) to skip its ~½ GB nested `parquet-testing` corpus.
+- **`duckdb@v1.5.4`** + **`extension-ci-tools@v1.5.3`** — the DuckDB source + build tooling. These are
+  **gitignored manual clones**, NOT submodules (`.gitmodules` lists only `engineered-wood`), so they're
+  cloned explicitly at their pinned tags as shown.
 
 `httpfs` is linked unconditionally (for `s3://`), so it needs OpenSSL + curl from **vcpkg**:
 `vcpkg install openssl:x64-windows-static curl:x64-windows-static` (with `VCPKG_ROOT` set).
