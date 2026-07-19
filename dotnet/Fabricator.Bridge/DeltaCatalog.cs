@@ -3342,8 +3342,16 @@ public sealed class DeltaCatalog : IBackendCatalog
         switch (tokens[0].ToUpperInvariant())
         {
             case "OPTIMIZE":
-                _log.LogInformation("delta exec OPTIMIZE {Schema}.{Table} native_write={Native}", schema, table, _nativeWrite);
-                return DeltaReader.Optimize(opener, path, default, _nativeWrite, _nativeRead);
+            {
+                // OPTIMIZE <table> [FULL] — FULL forces a full recluster on a clustering-declared table
+                // (ignores ZCube identities; the Databricks `OPTIMIZE tbl FULL` dialect). No effect on
+                // plain bin-pack tables.
+                bool fullRecluster = tokens.Length > 2
+                    && string.Equals(tokens[2], "FULL", System.StringComparison.OrdinalIgnoreCase);
+                _log.LogInformation("delta exec OPTIMIZE {Schema}.{Table} native_write={Native} full={Full}",
+                    schema, table, _nativeWrite, fullRecluster);
+                return DeltaReader.Optimize(opener, path, default, _nativeWrite, _nativeRead, fullRecluster);
+            }
             case "VACUUM":
             {
                 bool dryRun = HasToken(tokens, "DRY");

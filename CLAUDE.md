@@ -386,6 +386,25 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   plan_copy_to_file.cpp rule), so OPTIMIZE is also what RESTORES strict order per partition.
   `verify_delta_clustered_optimize` 80 (§4 rework: no-domain pin, per-partition order + exact values,
   partial-recluster commit shape "2 removes + 1 add", no provider tag).
+  **ZCUBE INCREMENTAL RECLUSTER — DONE (2026-07-18, EW Tags seam + Bridge): OPTIMIZE cost tracks NEW
+  data, not table size.** Clustered outputs now carry **`tags["ZCUBE_ID"]`** (one fresh uuid per group
+  per run — Spark's incremental-clustering cube identity, same tag name) + **`tags["ZCUBE_ZORDER_BY"]`**
+  (the JSON key list the cube was clustered by). On the next OPTIMIZE, per group: files of a **STABLE
+  cube** (total size ≥ `fabricator.targetCubeSize`, default 100 GiB — Databricks' target cube size;
+  parsed like targetFileSize) clustered by the CURRENT keys are NEVER rewritten; candidates = the
+  UNCLUSTERED files (plain appends, pre-ZCube rewrites, **stale-key cubes** — `ZCUBE_ZORDER_BY`
+  mismatch re-enters them, so changing `fabricator.sortedBy` self-heals incrementally) + at most ONE
+  partial cube (the most recent by commit version; merging one per run bounds write amplification, OSS
+  parity). A lone DV-less candidate skips (joins the next round's merge). Removes = the candidates'
+  adds only (correlated by the add's encoded path — `NativeScanFile` gained `AddPath`/`ZCubeId`/
+  `ZCubeBy`). **`OPTIMIZE <table> FULL`** (the Databricks dialect) ignores cube identities — full
+  recluster; use it after changing keys on a DOMAIN-declared table (**the domain is the authoritative
+  key source — changing `fabricator.sortedBy` does NOT re-key a SORTED BY-created table**; pinned).
+  EW seam: `WrittenDataFile.Tags` → `CommitDataFilesAsync` stamps `add.tags` (round-trip pinned in
+  `ClusteredTableTests`, 8). Incremental trade-off: cubes overlap in key ranges (point lookup ≤ N-cubes
+  files) — same as Databricks. `verify_delta_clustered_optimize` 113 (§6: stable cube untouched across
+  a fragmenting append cycle [2 active files = cube A + cube B], no-op when all stable, FULL → 1 file,
+  property-only key-change invalidation reorders by the NEW key).
 - **`SORTED BY` → Delta ORDERED (clustered) writes — DONE (2026-07-18, C#-only, no ABI).** The v52 native
   clause (`CREATE TABLE lake.s.t SORTED BY (a,b) [AS …]` — `sort_columns` already crossed the ABI to
   `create_table`/`begin_bulk`; Delta previously ignored it) now drives the Delta provider:

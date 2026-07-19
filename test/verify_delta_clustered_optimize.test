@@ -357,7 +357,150 @@ SELECT count(*) FROM r a JOIN r b ON a.f < b.f AND a.mn < b.mx AND b.mn < a.mx;
 0
 
 # ============================================================================
-# 6. a plain (non-clustered) table still bin-packs as before
+# 6. ZCUBE INCREMENTAL recluster: clustered outputs carry tags[ZCUBE_ID] (+ the
+#    keys in ZCUBE_ZORDER_BY); a STABLE cube (>= fabricator.targetCubeSize,
+#    clustered by the current keys) is never rewritten — OPTIMIZE cost tracks NEW
+#    data. OPTIMIZE <t> FULL ignores cubes; changing the cluster keys invalidates
+#    old cubes (their files re-enter as candidates).
+# ============================================================================
+
+statement ok
+CREATE TABLE lake.main.z1 SORTED BY (id) AS
+SELECT (r * 91) % 9000 AS id, r AS payload FROM range(3000) t(r);
+
+statement ok
+INSERT INTO lake.main.z1 SELECT (r * 91) % 9000, r FROM range(3000, 6000) t(r);
+
+statement ok
+INSERT INTO lake.main.z1 SELECT (r * 91) % 9000, r FROM range(6000, 9000) t(r);
+
+# a tiny cube threshold so a one-file cube counts STABLE (observable incremental exclusion)
+statement ok
+SELECT * FROM fabricator_delta_set_tblproperties('lake', 'main.z1', '{"fabricator.targetCubeSize":"1kb"}');
+
+query I
+SELECT fabricator_exec('lake', 'OPTIMIZE main.z1');
+----
+0
+
+# one clustered file = cube A; the commit tags it
+query II
+SELECT count(*), count(DISTINCT rowid >> 40) FROM lake.main.z1;
+----
+9000	1
+
+query I
+SELECT count(*) FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/clustopt/z1/_delta_log/*.json')
+WHERE content LIKE '%"operation":"OPTIMIZE"%' AND content LIKE '%ZCUBE_ID%';
+----
+1
+
+# fresh appends fragment; the INCREMENTAL rewrite touches ONLY them — cube A stays active
+statement ok
+INSERT INTO lake.main.z1 SELECT (r * 91) % 9000, r FROM range(9000, 12000) t(r);
+
+statement ok
+INSERT INTO lake.main.z1 SELECT (r * 91) % 9000, r FROM range(12000, 15000) t(r);
+
+query I
+SELECT fabricator_exec('lake', 'OPTIMIZE main.z1');
+----
+0
+
+# TWO active files now: cube A (untouched) + cube B (the merged new data) — a FULL recluster
+# would have produced one
+query II
+SELECT count(*), count(DISTINCT rowid >> 40) FROM lake.main.z1;
+----
+15000	2
+
+query I
+SELECT count(*) FROM fabricator_delta_snapshots('lake', 'main.z1') WHERE operation = 'OPTIMIZE';
+----
+2
+
+# both cubes are internally ordered on the cluster key
+query I
+WITH o AS (SELECT id, lag(id) OVER (PARTITION BY rowid >> 40 ORDER BY rowid) AS p FROM lake.main.z1)
+SELECT count(*) FROM o WHERE p IS NOT NULL AND p > id;
+----
+0
+
+# all cubes stable + nothing new => NO-OP (no third OPTIMIZE commit)
+query I
+SELECT fabricator_exec('lake', 'OPTIMIZE main.z1');
+----
+0
+
+query I
+SELECT count(*) FROM fabricator_delta_snapshots('lake', 'main.z1') WHERE operation = 'OPTIMIZE';
+----
+2
+
+# OPTIMIZE FULL ignores cube identities: everything reclusters into ONE file
+query I
+SELECT fabricator_exec('lake', 'OPTIMIZE main.z1 FULL');
+----
+0
+
+query II
+SELECT count(*), count(DISTINCT rowid >> 40) FROM lake.main.z1;
+----
+15000	1
+
+query I
+SELECT count(*) FROM fabricator_delta_snapshots('lake', 'main.z1') WHERE operation = 'OPTIMIZE';
+----
+3
+
+# NOTE: on a SORTED BY-created table the delta.clustering DOMAIN is the authoritative key source —
+# changing fabricator.sortedBy does NOT change its cluster keys (Spark parity: the domain is altered
+# by CLUSTER BY DDL, not a property). Key-change invalidation is therefore pinned on a PROPERTY-ONLY
+# table (no domain): changing the keys makes old cubes STALE (ZCUBE_ZORDER_BY mismatch) — with new
+# data present their files re-enter as candidates and the rewrite orders by the NEW key.
+statement ok
+CREATE TABLE lake.main.z2 AS SELECT (r * 91) % 4000 AS id, r AS payload FROM range(4000) t(r);
+
+statement ok
+INSERT INTO lake.main.z2 SELECT (r * 91) % 4000, r FROM range(4000, 8000) t(r);
+
+statement ok
+SELECT * FROM fabricator_delta_set_tblproperties('lake', 'main.z2', '{"fabricator.sortedBy":"[\"id\"]","fabricator.targetCubeSize":"1kb"}');
+
+query I
+SELECT fabricator_exec('lake', 'OPTIMIZE main.z2');
+----
+0
+
+query II
+SELECT count(*), count(DISTINCT rowid >> 40) FROM lake.main.z2;
+----
+8000	1
+
+statement ok
+SELECT * FROM fabricator_delta_set_tblproperties('lake', 'main.z2', '{"fabricator.sortedBy":"[\"payload\"]"}');
+
+statement ok
+INSERT INTO lake.main.z2 SELECT (r * 91) % 4000, r FROM range(8000, 9000) t(r);
+
+query I
+SELECT fabricator_exec('lake', 'OPTIMIZE main.z2');
+----
+0
+
+query II
+SELECT count(*), count(DISTINCT rowid >> 40) FROM lake.main.z2;
+----
+9000	1
+
+query I
+WITH o AS (SELECT payload, lag(payload) OVER (PARTITION BY rowid >> 40 ORDER BY rowid) AS p FROM lake.main.z2)
+SELECT count(*) FROM o WHERE p IS NOT NULL AND p > payload;
+----
+0
+
+# ============================================================================
+# 7. a plain (non-clustered) table still bin-packs as before
 # ============================================================================
 
 statement ok

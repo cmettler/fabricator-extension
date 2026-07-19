@@ -139,11 +139,17 @@ internal static class DeltaReader
     /// no stats — external writers): with <paramref name="BaseRowId"/> it bounds the file's DERIVED stable-id
     /// range [baseRowId, baseRowId + numRecords) for the row-tracking filter fast path.</summary>
     /// <summary><paramref name="SizeBytes"/> = the add action's file size (null when unknown): with
-    /// <paramref name="NumRecords"/> it estimates bytes-per-row for the clustered-OPTIMIZE file split.</summary>
+    /// <paramref name="NumRecords"/> it estimates bytes-per-row for the clustered-OPTIMIZE file split.
+    /// <paramref name="AddPath"/> = the add action's ENCODED log-relative path (identity — correlates the
+    /// listing file back to its snapshot add for per-file removes). <paramref name="ZCubeId"/> /
+    /// <paramref name="ZCubeBy"/> = the add's <c>tags[ZCUBE_ID]</c> / <c>tags[ZCUBE_ZORDER_BY]</c>
+    /// (Spark's incremental-clustering cube identity + the keys it was clustered by).</summary>
     public sealed record NativeScanFile(int Ordinal, string Uri, long[] Dv,
                                         IReadOnlyDictionary<string, string>? PartitionValues = null,
                                         long? BaseRowId = null, long? CommitVersion = null,
-                                        long? NumRecords = null, long? SizeBytes = null);
+                                        long? NumRecords = null, long? SizeBytes = null,
+                                        string? AddPath = null, string? ZCubeId = null,
+                                        string? ZCubeBy = null);
 
     /// <summary>The result of <see cref="ListNativeScanFiles"/>: the resolved snapshot <see cref="Version"/>, the
     /// surviving (post-prune) <see cref="Files"/> in path-sorted global-ordinal order, and <see cref="AnyUri"/> =
@@ -293,7 +299,10 @@ internal static class DeltaReader
                 files.Add(new NativeScanFile(ordinal, uri, dv,
                     add.PartitionValues is { Count: > 0 } ? add.PartitionValues : null,
                     add.BaseRowId, add.DefaultRowCommitVersion, numRecords,
-                    add.Size > 0 ? add.Size : null));
+                    add.Size > 0 ? add.Size : null,
+                    add.Path,
+                    add.Tags is { } tg && tg.TryGetValue("ZCUBE_ID", out var zc) ? zc : null,
+                    add.Tags is { } tb && tb.TryGetValue("ZCUBE_ZORDER_BY", out var zb) ? zb : null));
             }
             // Column-mapping tables store columns decoupled from the logical name — capture the mapping (from THIS
             // snapshot's schema, so time travel to a pre-rename version maps correctly) so the native reader can
@@ -1293,11 +1302,11 @@ internal static class DeltaReader
     /// Compaction re-assigns row-tracking baseRowIds (stable-id preservation across compaction needs materialized
     /// row-id columns — a separate slice); the DATA is correct.</summary>
     public static long Optimize(nint opener, string path, CancellationToken ct, bool nativeWrite = false,
-                                bool nativeRead = false)
-        => OptimizeAsync(opener, path, ct, nativeWrite, nativeRead).GetAwaiter().GetResult();
+                                bool nativeRead = false, bool full = false)
+        => OptimizeAsync(opener, path, ct, nativeWrite, nativeRead, full).GetAwaiter().GetResult();
 
     private static async Task<long> OptimizeAsync(nint opener, string path, CancellationToken ct,
-                                bool nativeWrite, bool nativeRead)
+                                bool nativeWrite, bool nativeRead, bool full)
     {
         // OPTIMIZE (compaction) rewrites many files — cancel a slow one on interrupt (opener set fresh by
         // fabricator_exec). See docs/cancellation.md.
@@ -1327,10 +1336,10 @@ internal static class DeltaReader
             var clusterCols = writer is not null ? ResolveClusteringColumns(table) : null;
             if (clusterCols is { Count: > 0 } && ClusteredRewriteEligible(table))
             {
-                long? cv = await ClusteredRewriteAsync(fs, path, table, clusterCols, token).ConfigureAwait(false);
-                DmlLog.LogInformation("delta optimize {Path}: {Result} clustered by [{Cols}]", path,
+                long? cv = await ClusteredRewriteAsync(fs, path, table, clusterCols, full, token).ConfigureAwait(false);
+                DmlLog.LogInformation("delta optimize {Path}: {Result} clustered by [{Cols}] full={Full}", path,
                     cv.HasValue ? $"reclustered → v{cv.Value}" : "nothing to recluster",
-                    string.Join(",", clusterCols));
+                    string.Join(",", clusterCols), full);
                 return 0;
             }
             var v = await table.CompactAsync(null, token).ConfigureAwait(false);
@@ -1459,7 +1468,7 @@ internal static class DeltaReader
 
     private static async Task<long?> ClusteredRewriteAsync(
         ITableFileSystem fs, string path, DeltaTable table,
-        IReadOnlyList<string> clusterCols, CancellationToken token)
+        IReadOnlyList<string> clusterCols, bool full, CancellationToken token)
     {
         var snap = table.CurrentSnapshot;
         // List against the OPEN table's own snapshot (not a second open) so the commit's expectedVersion is
@@ -1601,14 +1610,75 @@ internal static class DeltaReader
         var files = new List<WrittenDataFile>();
         var removes = new List<DeltaAction>();
 
+        // ZCUBE INCREMENTAL (Spark parity): a clustered rewrite tags its outputs with a shared
+        // tags[ZCUBE_ID] (one fresh cube per group per run) + tags[ZCUBE_ZORDER_BY] (the keys it was
+        // clustered by). On the next OPTIMIZE, files of a STABLE cube (total size >= the target cube
+        // size, clustered by the CURRENT keys) are never rewritten — the candidates are the UNCLUSTERED
+        // files (plain appends, stale-key cubes, pre-ZCube rewrites) plus at most ONE partial cube (the
+        // most recent — merging one per run bounds write amplification), so OPTIMIZE cost tracks NEW
+        // data, not table size. `OPTIMIZE <table> FULL` ignores cubes and reclusters everything.
+        string byJson = System.Text.Json.JsonSerializer.Serialize(clusterCols);
+        long targetCubeBytes = ResolveSizeProperty(
+            snap.Metadata.Configuration, "fabricator.targetCubeSize", 100L * 1024 * 1024 * 1024);
         foreach (var g in groups)
         {
             var groupFiles = g.ToList();
-            bool anyDv = groupFiles.Any(f => f.Dv.Length > 0);
-            if (groupFiles.Count == 1 && !anyDv)
+            List<NativeScanFile> candidates;
+            if (full)
             {
-                continue; // one DV-less file IS one contiguous clustered range — leave the partition alone
+                candidates = groupFiles;
             }
+            else
+            {
+                var unclustered = new List<NativeScanFile>();
+                var cubes = new Dictionary<string, List<NativeScanFile>>(StringComparer.Ordinal);
+                foreach (var f in groupFiles)
+                {
+                    // a cube clustered by DIFFERENT keys is stale — its files re-enter as candidates
+                    if (f.ZCubeId is { } id && string.Equals(f.ZCubeBy, byJson, StringComparison.Ordinal))
+                    {
+                        if (!cubes.TryGetValue(id, out var members))
+                        {
+                            cubes[id] = members = new List<NativeScanFile>();
+                        }
+                        members.Add(f);
+                    }
+                    else
+                    {
+                        unclustered.Add(f);
+                    }
+                }
+                List<NativeScanFile>? mergeCube = null;
+                long mergeRecency = -1;
+                foreach (var kv in cubes)
+                {
+                    if (kv.Value.Sum(f => f.SizeBytes ?? 0) >= targetCubeBytes)
+                    {
+                        continue; // STABLE — never rewritten
+                    }
+                    long recency = kv.Value.Max(f => f.CommitVersion ?? 0);
+                    if (recency > mergeRecency)
+                    {
+                        mergeRecency = recency;
+                        mergeCube = kv.Value;
+                    }
+                }
+                candidates = unclustered;
+                if (mergeCube is not null
+                    && (unclustered.Count > 0 || mergeCube.Any(f => f.Dv.Length > 0)))
+                {
+                    candidates = unclustered.Concat(mergeCube).ToList();
+                }
+            }
+            if (candidates.Count == 0 || (candidates.Count == 1 && candidates[0].Dv.Length == 0))
+            {
+                continue; // nothing new to cluster (a lone DV-less file joins the next round's merge)
+            }
+            var cubeTags = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["ZCUBE_ID"] = Guid.NewGuid().ToString(),
+                ["ZCUBE_ZORDER_BY"] = byJson,
+            };
             // The group's Hive directory (decoded), inherited from its sources — one partition = one dir;
             // "" for an unpartitioned table.
             string rel0 = groupFiles[0].Uri.StartsWith(root + "/", StringComparison.Ordinal)
@@ -1621,8 +1691,8 @@ internal static class DeltaReader
             {
                 Version = listing.Version,
                 PartitionColumns = listing.PartitionColumns,
-                Files = groupFiles,
-                AnyUri = groupFiles[0].Uri,
+                Files = candidates,
+                AnyUri = candidates[0].Uri,
                 LogicalToPhysical = listing.LogicalToPhysical,
                 LogicalToFieldId = listing.LogicalToFieldId,
                 MappedSchema = listing.MappedSchema,
@@ -1632,7 +1702,7 @@ internal static class DeltaReader
 
             long estBytes = 0, estRows = 0;
             bool sizesKnown = true;
-            foreach (var f in groupFiles)
+            foreach (var f in candidates)
             {
                 if (f.SizeBytes is { } sb && f.NumRecords is { } nr)
                 {
@@ -1672,13 +1742,20 @@ internal static class DeltaReader
             }
             foreach (var cf in copied)
             {
-                files.Add(new WrittenDataFile(cf.RelativePath, cf.Size, cf.Rows, partitionValues, cf.Stats));
+                files.Add(new WrittenDataFile(cf.RelativePath, cf.Size, cf.Rows, partitionValues, cf.Stats,
+                    cubeTags));
             }
-            // The group's old files become tombstones — removes hand-built from the SNAPSHOT's adds (full
-            // action fields incl. deletion vectors), joined by the same canonical key, so untouched
-            // partitions keep their files ACTIVE (partial recluster).
+            // The candidates' old files become tombstones — removes hand-built from the SNAPSHOT's adds
+            // (full action fields incl. deletion vectors), joined by the add's encoded path, so untouched
+            // partitions AND stable cubes keep their files ACTIVE (partial/incremental recluster).
+            var candidatePaths = new HashSet<string>(
+                candidates.Select(f => f.AddPath).Where(x => x is not null)!, StringComparer.Ordinal);
             foreach (var add in addsByKey[g.Key])
             {
+                if (!candidatePaths.Contains(add.Path))
+                {
+                    continue;
+                }
                 removes.Add(new RemoveFile
                 {
                     Path = add.Path,
@@ -1712,9 +1789,14 @@ internal static class DeltaReader
     /// (Databricks; plain bytes or a b/kb/mb/gb suffix), else 128 MiB — engineered-wood's own
     /// <c>CompactionOptions.TargetFileSize</c> default, so clustered and bin-pack OPTIMIZE aim alike.</summary>
     private static long ResolveTargetFileSize(IReadOnlyDictionary<string, string>? cfg)
+        => ResolveSizeProperty(cfg, "delta.targetFileSize", 128L * 1024 * 1024);
+
+    /// <summary>A byte-size table property (plain bytes or a b/kb/mb/gb suffix); the default when absent
+    /// or unparseable. Also serves <c>fabricator.targetCubeSize</c> — the ZCube stability threshold for
+    /// incremental reclustering (default 100 GiB, the Databricks target cube size).</summary>
+    private static long ResolveSizeProperty(IReadOnlyDictionary<string, string>? cfg, string key, long Default)
     {
-        const long Default = 128L * 1024 * 1024;
-        if (cfg is null || !cfg.TryGetValue("delta.targetFileSize", out var v) || string.IsNullOrWhiteSpace(v))
+        if (cfg is null || !cfg.TryGetValue(key, out var v) || string.IsNullOrWhiteSpace(v))
         {
             return Default;
         }
