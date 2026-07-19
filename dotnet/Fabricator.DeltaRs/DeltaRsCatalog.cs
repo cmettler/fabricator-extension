@@ -444,13 +444,20 @@ public sealed class DeltaRsCatalog : IBackendCatalog
     // already maps to delta-rs SchemaMode::Merge in the bridge, so merge = force Append.
     public long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable,
                            bool replace, bool checkConstraints, long txnId, IReadOnlyList<string>? partitionColumns,
-                           IReadOnlyList<string>? sortColumns, string? schemaMode, bool partitionOverwrite)
+                           IReadOnlyList<string>? sortColumns, string? schemaMode, bool partitionOverwrite,
+                           string? optionsJson)
     {
         if (partitionOverwrite)
         {
             throw new NotSupportedException(
                 "deltars provider: COPY PARTITION_OVERWRITE is not supported yet (use the engineeredwooddelta "
                 + "provider, or delta-rs replace_where via a future MERGE surface).");
+        }
+        if (!string.IsNullOrEmpty(optionsJson))
+        {
+            throw new NotSupportedException(
+                "deltars provider: CREATE TABLE ... WITH (...) options are not supported "
+                + "(use the engineeredwooddelta provider).");
         }
         // sortColumns (SORTED BY) is a warehouse CLUSTER BY concept — Delta doesn't cluster; ignored.
         bool merge = string.Equals(schemaMode, "merge", StringComparison.OrdinalIgnoreCase);
@@ -526,8 +533,15 @@ public sealed class DeltaRsCatalog : IBackendCatalog
 
     public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists, string? primaryKey,
                             string? uniques, string? defaults, IReadOnlyList<string>? partitionColumns,
-                            IReadOnlyList<string>? sortColumns, IReadOnlyList<string>? identityColumns)
+                            IReadOnlyList<string>? sortColumns, IReadOnlyList<string>? identityColumns,
+                            string? optionsJson)
     {
+        if (!string.IsNullOrEmpty(optionsJson))
+        {
+            throw new NotSupportedException(
+                "deltars provider: CREATE TABLE ... WITH (...) options are not supported "
+                + "(use the engineeredwooddelta provider).");
+        }
         // Delta has no PK/UNIQUE/DEFAULT/IDENTITY — those args are ignored (as in the engineered-wood provider).
         var create = new TableCreateOptions(TableUri(schemaName, tableName), columns)
         {

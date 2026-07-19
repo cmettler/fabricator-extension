@@ -248,15 +248,38 @@ current code still uses the single-provider `fabricator` naming):
 ## Next up (open threads for future sessions)
 
 In-flight / planned refactors (all C#-only unless noted; tests stay green per slice):
-- **`CREATE TABLE … WITH (…)` options + SQL Server EXTERNAL TABLES — PLANNED (2026-07-19, nothing
-  built): [docs/create-table-with-options.md](docs/create-table-with-options.md).** DuckDB v1.5.4
-  already parses the clause (`CreateTableInfo::options`; we currently REJECT it in
-  `SupportsCreateTable`). Three slices, order A→C→B: **A** = thread `options_json` through
-  `create_table`+`begin_bulk` (ABI v67, the v51 partition_columns precedent) → Delta per-table
-  write tuning (`parquet_compression`/`parquet_row_group_size`/bloom), per-table CREATE-flag
-  overrides (`deletion_vectors`/`column_mapping`/… — the PolyBase recipe without a dedicated
-  ATTACH), and `delta.*`/`fabricator.*` TBLPROPERTIES stamped at CREATE (one commit); unknown keys
-  error, WITH > `delta_write_options` > ATTACH. **C** (no ABI) = detect S3 external tables in the
+- **`CREATE TABLE … WITH (…)` options + SQL Server EXTERNAL TABLES —
+  [docs/create-table-with-options.md](docs/create-table-with-options.md). SLICE A DONE (2026-07-19,
+  ABI v67); slices C/D/B planned.** DuckDB v1.5.4 parses the clause (`CreateTableInfo::options`).
+  **A (DONE)** = `options_json` threaded through `create_table`+`begin_bulk` (v67; C++
+  `TableOptionsArg` — constants only, flat string-valued JSON) → the Delta provider consumes THREE
+  key kinds (`DeltaWithOptions.Parse`, guarded — unknown keys ERROR): per-statement **write tuning**
+  (`parquet_compression`/`parquet_row_group_size`/`parquet_bloom_filter_columns`, DuckLake-parity
+  names + bare aliases; precedence WITH > `delta_write_options` > ATTACH; CTAS-only — rejected on an
+  empty CREATE), per-table **CREATE-flag overrides** (`deletion_vectors`/`column_mapping`/
+  `row_tracking`/`change_data_feed`/`in_commit_timestamps` — the protocol-1.0 PolyBase recipe
+  `WITH (deletion_vectors=false, column_mapping='none')` per table, no dedicated ATTACH), and
+  `delta.*`/`fabricator.*` **TBLPROPERTIES stamped in the CREATE commit** (rides
+  `DeltaWriteSpec.CreateProperties` → `CreateConfig` merge, WITH wins over derived keys;
+  `delta.enable*`/`delta.columnMapping.*`/`fabricator.sortedBy` spellings rejected with pointers to
+  the explicit keys/clauses). Buffered (explicit-txn) CREATE/CTAS parks the options on the txn
+  buffer (`PendingAppends.CreateOptions`) and the flush applies them. **Same pass closed a
+  PRE-EXISTING gap: the native_write COPY paths now carry the resolved tuning**
+  (`NativeParquetDataFileWriter.CopyTuning` → `COMPRESSION`/`ROW_GROUP_SIZE` COPY options on
+  RunCopy/RunCopyPartitioned + the per-file writer ctor) — previously `delta_write_options`
+  compression only reached the EW codec writer (bloom COLUMNS stay codec-only; DuckDB blooms
+  automatically). NOTE DuckDB's parquet writer has a row-group flush floor — tiny
+  `parquet_row_group_size` values (< ~2048) coalesce. Two findings: the parser LOWERCASES all WITH
+  keys (canonical re-casing of well-known `delta.*` keys C#-side; custom mixed-case keys → use
+  `set_tblproperties`) and bools arrive as postgres `'t'/'f'` (accepted). SQL Server/DAX/deltars
+  reject any options (never silent). `test/verify_with_options.test` (68 — tuning pins via
+  parquet_metadata, precedence, both flag-override directions incl. empty CREATE + a DV-off catalog
+  opting IN, property canonicalization + commit-0 stamp pin, buffered CTAS + ROLLBACK, 10 guards,
+  Iceberg-shape no-ops) + `verify_with_options_mssql.test` (4). Regression: partition 54 / sorted_by
+  30 / tblproperties 42 / native_write 147 / native_write_streaming 29 / copy_format 109 /
+  transactions 941 / identity(delta) 38 / column_mapping 251 / dv_default 58 / columnstore 20 /
+  identity(sql) 64 / cluster_by 18 / custom_functions 89 green. Remaining slices, order C→D→B:
+  **C** (no ABI) = detect S3 external tables in the
   SQL catalog (`sys.external_tables` join, lazy at write time) and route INSERT through storage —
   Delta append via `BackendRegistry.Resolve("delta").OpenCatalog` transient catalog / parquet =
   new file COPY — a capability SQL Server itself lacks; DuckDB s3 secret resolved by bucket scope,
@@ -2116,7 +2139,17 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `FabricLakehouse.IsOneLake` abfss check, so it rides the plain host-FS path with opener-resolved secrets —
   which is exactly right). Kernel reads the outputs (known quirk unchanged: kernel shows a MAPPED partitioned
   table's partition column as NULL; plain shape exact).
-- **Current version: ABI v66** (v66 = **host_query CANCELLATION** — `host_query` gained a nullable
+- **Current version: ABI v67** (v67 = **`options_json`** — `create_table` + `begin_bulk` each gained a
+  nullable `const char *options_json` carrying the `CREATE TABLE [AS] ... WITH (key='value', ...)` clause
+  as a flat JSON object of STRING values (`fabricator::TableOptionsArg` — constants only, one CAST level
+  unwrapped so `true`/`false` arrive as postgres `'t'/'f'`; `SupportsCreateTable` now PERMITS `options`).
+  The PROVIDER parses the keys it knows and REJECTS unknown ones — never silently ignored. Delta consumes
+  three key kinds (see the WITH-options bullet in "Next up"); SQL Server/DAX/deltars reject any options
+  (SQL Server's keys land with slice B). **Parser gotcha (load-bearing):** DuckDB's transformer LOWERCASES
+  every WITH key (`transformer.cpp TransformTableOptions` — quoting does NOT help), so case-sensitive
+  `delta.*` property keys are re-cased C#-side from a canonical well-known list (`DeltaWithOptions.
+  CanonicalKeys`); arbitrary mixed-case custom keys must use `fabricator_delta_set_tblproperties`.)
+- **Prior: ABI v66** (v66 = **host_query CANCELLATION** — `host_query` gained a nullable
   `void **out_interrupt` (a heap `shared_ptr<ClientContext>` to the query's FRESH context) + two appended
   host-service entries `host_query_interrupt` (thread-safe `Interrupt()`; no-op after the query ends — the
   shared_ptr keeps the context alive) / `host_query_interrupt_free`. Why: every `Host.Query` (native_write
@@ -2194,8 +2227,8 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   (`InterruptState`) to free the task thread during I/O (native interrupt + better parallelism, bigger). Live Ctrl+C
   behavior is a MANUAL check (a slow OneLake/SQL query + interrupt); the suites verify only behavior-neutrality.
   **BINARY STATUS (2026-07-19): the WINDOWS targets are all CURRENT** (unittest + `duckdb.exe` shell +
-  the loadable rebuilt for the SET/RESET SORTED BY alter kinds 12/13 + the SORTED_COLUMNS COPY option;
-  ABI still v66 — the kinds are additive). **The LINUX payload
+  the loadable rebuilt at **ABI v67** — the WITH-options `options_json` bump; a stale loadable vs the
+  fresh bridge throws the ABI-mismatch error). **The LINUX payload
   (`build/linux-payload/fabricator.duckdb_extension` + the FDD zip) is pre-v65 and lags the ENTIRE
   2026-07-18/19 clustering arc** — rebuild in WSL (rsync `src/` → `~/sqlext`, `cmake --build … --target
   fabricator_loadable_extension`) before the next notebook run.)

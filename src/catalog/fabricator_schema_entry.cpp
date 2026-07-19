@@ -2366,6 +2366,9 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::CreateTable(CatalogTransaction
 	// Native CREATE TABLE ... SORTED BY (cols): the SQL Server provider maps these to a Fabric Warehouse
 	// WITH (CLUSTER BY (cols)) layout (Delta / DAX ignore the arg).
 	string sort_arg = fabricator::PartitionColumnsArg(base.sort_keys);
+	// CREATE TABLE ... WITH (key='value', ...): a flat JSON object of provider options (v67) — the provider
+	// parses the keys it knows (Delta: per-table properties/write tuning) and REJECTS unknown ones.
+	string options_arg = fabricator::TableOptionsArg(base.options);
 
 	// A schema-only Arrow stream carries the column definitions to the backend. The text-column SQL type
 	// (mssql_ctas_text_type / mssql_default_varchar_length) is read C#-side from the provider settings store
@@ -2374,7 +2377,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::CreateTable(CatalogTransaction
 	producer.SetNullability(nullable);
 	producer.Finish();
 	fabricator::CreateTable(handle_, name, base.table, *producer.Stream(), if_not_exists, pk_arg, unique_arg,
-	                      defaults_arg, partition_arg, sort_arg, identity_arg);
+	                      defaults_arg, partition_arg, sort_arg, identity_arg, options_arg);
 
 	// Register the new table (also invalidates any cached entry) and return it.
 	AddTable(base.table, "BASE TABLE");

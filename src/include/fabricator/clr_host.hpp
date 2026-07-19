@@ -187,7 +187,8 @@ void ScanTable(FabricatorHandle handle, const std::string &schema, const std::st
 void CreateTable(FabricatorHandle handle, const std::string &schema, const std::string &table, ArrowArrayStream &columns,
                  bool if_not_exists, const std::string &pk_columns, const std::string &unique_columns,
                  const std::string &defaults, const std::string &partition_columns = "",
-                 const std::string &sort_columns = "", const std::string &identity_columns = "");
+                 const std::string &sort_columns = "", const std::string &identity_columns = "",
+                 const std::string &options_json = "");
 
 // DDL: drop a table (`if_exists` suppresses the missing-table error).
 void DropTable(FabricatorHandle handle, const std::string &schema, const std::string &table, bool if_exists);
@@ -233,7 +234,8 @@ void InsertReturning(FabricatorHandle handle, const std::string &schema, const s
 FabricatorHandle BeginBulk(FabricatorHandle handle, const std::string &schema, const std::string &table, bool create_table,
                          bool replace, bool check_constraints, int64_t txn_id, ArrowSchema &schema_in,
                          const std::string &partition_columns = "", const std::string &sort_columns = "",
-                         const std::string &schema_mode = "", bool partition_overwrite = false);
+                         const std::string &schema_mode = "", bool partition_overwrite = false,
+                         const std::string &options_json = "");
 
 // Record the DuckDB transaction id in effect on this thread (global_transaction_id), so the next
 // connection-using bridge call keys its per-transaction provider connection by it. Call immediately before

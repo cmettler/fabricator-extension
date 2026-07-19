@@ -1,0 +1,26 @@
+# name: test/verify_with_options_mssql.test
+# description: CREATE TABLE ... WITH (...) on the SQL Server provider — no keys are known yet, so ANY
+#              option is rejected (never silently ignored; slice B of docs/create-table-with-options.md
+#              adds location/table_type for S3 external tables). Split from verify_with_options.test so
+#              the Delta coverage runs without a SQL Server.
+# group: [fabricator]
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
+
+statement error
+CREATE TABLE db.dbo.with_opts_rejected (id INTEGER) WITH (parquet_compression='zstd');
+----
+supports no CREATE TABLE WITH options
+
+statement error
+CREATE TABLE db.dbo.with_opts_rejected WITH (location='s3://bucket/t') AS SELECT 1 AS id;
+----
+supports no CREATE TABLE WITH options
+
+statement ok
+DETACH db;

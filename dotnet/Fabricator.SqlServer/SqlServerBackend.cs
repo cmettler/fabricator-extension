@@ -949,7 +949,8 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     public long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable, bool replace,
                            bool checkConstraints, long txnId, IReadOnlyList<string>? partitionColumns,
-                           IReadOnlyList<string>? sortColumns, string? schemaMode, bool partitionOverwrite)
+                           IReadOnlyList<string>? sortColumns, string? schemaMode, bool partitionOverwrite,
+                           string? optionsJson)
     {
         if (partitionOverwrite)
         {
@@ -959,6 +960,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 "COPY PARTITION_OVERWRITE is a Delta-provider option (dynamic partition overwrite); "
                 + "the SQL Server provider has no table-partition semantics on the bulk path.");
         }
+        RejectWithOptions(optionsJson);
         // partitionColumns is a Delta/lakehouse concept; SQL Server table partitioning is out of scope here — ignored.
         // sortColumns (native SORTED BY) becomes a Fabric Warehouse WITH (CLUSTER BY (cols)) on the created table.
         // schemaMode (COPY SCHEMA_MODE merge/overwrite) is a Delta concept — ignored here (SQL Server REPLACE already
@@ -1700,10 +1702,25 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         ProviderSettingsStore.Instance.GetBool(SqlServerBackend.ProviderName, "mssql_add_identity")
         ?? _addIdentityOnCreate;
 
+    // CREATE TABLE ... WITH (key='value', ...): the SQL Server provider knows no WITH keys yet — reject any
+    // (never silently ignore an option). Planned keys (location/table_type/data_source/secret — S3 external
+    // tables) land with docs/create-table-with-options.md slice B.
+    private static void RejectWithOptions(string? optionsJson)
+    {
+        if (!string.IsNullOrEmpty(optionsJson))
+        {
+            throw new NotSupportedException(
+                "the SQL Server provider supports no CREATE TABLE WITH options yet "
+                + "(planned: location/table_type for S3 external tables).");
+        }
+    }
+
     public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists, string? primaryKey,
                             string? uniques, string? defaults, IReadOnlyList<string>? partitionColumns,
-                            IReadOnlyList<string>? sortColumns, IReadOnlyList<string>? identityColumns)
+                            IReadOnlyList<string>? sortColumns, IReadOnlyList<string>? identityColumns,
+                            string? optionsJson)
     {
+        RejectWithOptions(optionsJson);
         // partitionColumns is a Delta/lakehouse concept; not applied to SQL Server DDL here (ignored).
         // sortColumns (native SORTED BY) becomes a Fabric Warehouse WITH (CLUSTER BY (cols)) layout — see BuildCreateTable.
         // identityColumns (DuckDB GENERATED-column marker) become IDENTITY columns — see BuildCreateTable.

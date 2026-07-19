@@ -289,14 +289,11 @@ void FabricatorCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 	}
 }
 ErrorData FabricatorCatalog::SupportsCreateTable(BoundCreateTableInfo &info) {
-	// Permit PARTITIONED BY (Delta partitions the data) and SORTED BY (the SQL Server provider maps it to a
-	// Fabric Warehouse WITH (CLUSTER BY (cols)) layout) — the base Catalog rejects both. The WITH-options clause
-	// stays unsupported.
-	auto &base = info.Base().Cast<CreateTableInfo>();
-	if (!base.options.empty()) {
-		return ErrorData(ExceptionType::CATALOG,
-		                 StringUtil::Format("WITH clause is not supported for tables in a %s catalog", GetCatalogType()));
-	}
+	// Permit PARTITIONED BY (Delta partitions the data), SORTED BY (SQL Server maps it to a Fabric Warehouse
+	// WITH (CLUSTER BY (cols)) layout), AND the WITH (key='value', ...) options clause — the options cross the
+	// ABI as a flat JSON object (create_table/begin_bulk `options_json`, v67) and the PROVIDER parses the keys
+	// it knows (unknown keys are rejected provider-side, never silently ignored). The base Catalog rejects all
+	// three clauses.
 	return ErrorData();
 }
 PhysicalOperator &FabricatorCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
@@ -313,6 +310,7 @@ PhysicalOperator &FabricatorCatalog::PlanCreateTableAs(ClientContext &context, P
 	info.replace = op.info->base->on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT;
 	info.partition_columns = fabricator::PartitionColumnsArg(create_info.partition_keys); // native PARTITIONED BY
 	info.sort_columns = fabricator::PartitionColumnsArg(create_info.sort_keys);           // native SORTED BY (→ CLUSTER BY)
+	info.options_json = fabricator::TableOptionsArg(create_info.options);                 // WITH (key='value', ...)
 	info.handle = handle_;
 	info.schema_entry = &op.schema.Cast<FabricatorSchemaEntry>();
 

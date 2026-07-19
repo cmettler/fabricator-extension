@@ -266,10 +266,15 @@ typedef struct FabricatorVTable {
 	// `identity_columns` (nullable): comma-separated column names the host detected as DuckDB GENERATED columns
 	// (used as an IDENTITY marker — DuckDB has no IDENTITY concept). The SQL Server provider emits them as
 	// IDENTITY (box: IDENTITY(1,1); Fabric Warehouse: bare IDENTITY, BIGINT only); Delta / DAX ignore them.
+	// `options_json` (nullable, v67): the CREATE TABLE ... WITH (key='value', ...) options clause as a flat
+	// JSON object of string values ({"parquet_compression":"zstd", ...}). The PROVIDER parses the keys it
+	// knows (Delta: per-table write tuning + create-flag overrides + delta.*/fabricator.* properties) and
+	// REJECTS unknown keys — a WITH option is never silently ignored.
 	int32_t (*create_table)(FabricatorHandle handle, const char *schema, const char *table,
 	                        struct ArrowArrayStream *columns, int32_t if_not_exists, const char *pk_columns,
 	                        const char *unique_columns, const char *defaults, const char *partition_columns,
-	                        const char *sort_columns, const char *identity_columns, char **err);
+	                        const char *sort_columns, const char *identity_columns, const char *options_json,
+	                        char **err);
 
 	// DDL: drop a table. `if_exists` suppresses the error when it is absent.
 	int32_t (*drop_table)(FabricatorHandle handle, const char *schema, const char *table, int32_t if_exists, char **err);
@@ -351,10 +356,14 @@ typedef struct FabricatorVTable {
 	// replace contradicts a partition-scoped one) and requires a partitioned target. Delta-provider concept;
 	// providers without partition semantics REJECT it when set (silently ignoring an overwrite flag would be a
 	// correctness surprise, unlike the advisory schema/sort options above).
+	// `options_json` (nullable, v67): the CREATE TABLE AS ... WITH (key='value', ...) options clause as a flat
+	// JSON object of string values, present only on a CTAS (a plain INSERT/COPY bulk passes NULL). Same
+	// provider-parses/rejects-unknown contract as create_table's options_json.
 	int32_t (*begin_bulk)(FabricatorHandle handle, const char *schema, const char *table, int32_t create_table,
 	                      int32_t replace, int32_t check_constraints, int64_t txn_id, struct ArrowSchema *schema_in,
 	                      const char *partition_columns, const char *sort_columns, const char *schema_mode,
-	                      int32_t partition_overwrite, FabricatorHandle *out_session, char **err);
+	                      int32_t partition_overwrite, const char *options_json, FabricatorHandle *out_session,
+	                      char **err);
 
 	// push_batch enqueues one record batch into the session. The managed side
 	// imports `batch` (taking ownership and releasing it); the caller never
@@ -842,7 +851,7 @@ typedef struct FabricatorHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 66
+#define FABRICATOR_ABI_VERSION 67
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

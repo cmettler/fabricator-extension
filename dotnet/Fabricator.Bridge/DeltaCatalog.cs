@@ -1590,12 +1590,22 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// becomes exactly these rows); otherwise Append (INSERT). One Delta commit. Returns rows written.</summary>
     public long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable,
                            bool replace, bool checkConstraints, long txnId, IReadOnlyList<string>? partitionColumns,
-                           IReadOnlyList<string>? sortColumns, string? schemaMode, bool partitionOverwrite)
+                           IReadOnlyList<string>? sortColumns, string? schemaMode, bool partitionOverwrite,
+                           string? optionsJson)
     {
         var opener = Opener();
         _log.LogInformation("delta bulk {Schema}.{Table}: create={Create} replace={Replace} native_write={Native} partition_overwrite={PartOw}",
             schemaName, tableName, createTable, replace, _nativeWrite, partitionOverwrite);
         EnsureVariantWritable(data.Schema);
+        // CREATE TABLE AS ... WITH (key='value', ...): per-statement write tuning + per-table create-flag
+        // overrides + delta.*/fabricator.* properties (Parse rejects unknown/guarded keys). Only a
+        // create-shaped bulk carries options (the host passes them from the CTAS operator only).
+        var withOpts = DeltaWithOptions.Parse(optionsJson);
+        if (withOpts is not null && !createTable && !replace)
+        {
+            throw new System.ArgumentException(
+                "WITH options apply to CREATE TABLE [AS] — a plain append carries none.");
+        }
         var tablePath = TablePath(schemaName, tableName);
         // SORTED BY -> an ORDERED (clustered) write: an explicit CREATE/CTAS clause orders THIS write and
         // is persisted (fabricator.sortedBy) at create; an append with no clause re-applies the persisted
@@ -1616,7 +1626,10 @@ public sealed class DeltaCatalog : IBackendCatalog
         // Partition columns are ALWAYS forwarded but take effect only when the write actually CREATES the
         // table (explicit CREATE/REPLACE, or the append shape's implicit create-if-missing) — engineered-wood's
         // OpenOrCreateAsync applies them at creation and an existing table keeps its metadata partitioning.
-        var spec = ResolveWriteSpec(partitionColumns, schemaMode);
+        // WITH keys overlay the resolved spec LAST (precedence: WITH > delta_write_options > ATTACH defaults),
+        // and the create-flag overrides resolve against the catalog defaults.
+        var spec = ApplyWithOptions(ResolveWriteSpec(partitionColumns, schemaMode), withOpts);
+        var flags = EffectiveCreateFlags(withOpts);
         // Data mode: schema_mode=overwrite forces a full replace (adopt the source schema); CREATE/CTAS/REPLACE
         // also overwrite; otherwise it's an append (INSERT / COPY create_table=false / schema_mode=merge).
         bool overwrite = createTable || replace || spec?.SchemaMode == DeltaSchemaMode.Overwrite;
@@ -1744,8 +1757,8 @@ public sealed class DeltaCatalog : IBackendCatalog
                 {
                     var ctasSchema = data.Schema;
                     var cfiles = DeltaWriter.TryStreamCreateFiles(
-                        opener, tablePath, data, _columnMappingMode, out var sRows, out var assigned,
-                        partitionColumns);
+                        opener, tablePath, data, flags.ColumnMapping, out var sRows, out var assigned,
+                        partitionColumns, spec);
                     if (cfiles is not null)
                     {
                         pendingC.PendingCreate = true;
@@ -1753,6 +1766,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                         pendingC.PendingDeltaSchema = assigned; // mapping pre-assignment (null when 'none')
                         pendingC.CreatePartitionColumns = partitionColumns;
                         pendingC.CreateSortColumns = sortColumns; // SORTED BY persists at the flush's create
+                        pendingC.CreateOptions = withOpts;        // WITH flags/properties apply at the flush's create
                         pendingC.HasAppend = true;
                         pendingC.Files.AddRange(cfiles);
                         pendingC.Rows += sRows;
@@ -1767,6 +1781,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 pendingC.PendingArrowSchema = cschema;
                 pendingC.CreatePartitionColumns = partitionColumns;
                 pendingC.CreateSortColumns = sortColumns; // SORTED BY persists at the flush's create
+                pendingC.CreateOptions = withOpts;        // WITH flags/properties apply at the flush's create
                 pendingC.HasAppend = true;
                 pendingC.BatchSchema ??= cschema;
                 pendingC.Batches.AddRange(cbatches);
@@ -1819,12 +1834,12 @@ public sealed class DeltaCatalog : IBackendCatalog
                 // files fuse with the metaData action into the one commit at COMMIT.
                 var deferred = DeltaWriter.TryWriteStreaming(
                     opener, tablePath, data, mode,
-                    deletionVectors: _deletionVectorsOnCreate,
-                    inCommitTimestamps: _inCommitTimestampsOnCreate,
-                    changeDataFeed: _changeDataFeedOnCreate,
-                    rowTracking: _rowTrackingOnCreate,
+                    deletionVectors: flags.DeletionVectors,
+                    inCommitTimestamps: flags.InCommitTimestamps,
+                    changeDataFeed: flags.ChangeDataFeed,
+                    rowTracking: flags.RowTracking,
                     spec: spec,                    out var deferredRows,
-                    columnMapping: _columnMappingMode,
+                    columnMapping: flags.ColumnMapping,
                     pendingSchema: pending.PendingDeltaSchema,
                     deferCommitTo: pending.Files, serializable: _serializable);
                 if (deferred is not null)
@@ -1909,12 +1924,12 @@ public sealed class DeltaCatalog : IBackendCatalog
         {
             var streamedVersion = DeltaWriter.TryWriteStreaming(
                 opener, tablePath, data, mode,
-                deletionVectors: _deletionVectorsOnCreate,
-                inCommitTimestamps: _inCommitTimestampsOnCreate,
-                changeDataFeed: _changeDataFeedOnCreate,
-                rowTracking: _rowTrackingOnCreate,
+                deletionVectors: flags.DeletionVectors,
+                inCommitTimestamps: flags.InCommitTimestamps,
+                changeDataFeed: flags.ChangeDataFeed,
+                rowTracking: flags.RowTracking,
                 spec: spec,                out var streamedRows,
-                columnMapping: _columnMappingMode, serializable: _serializable, sortedBy: sortColumns);
+                columnMapping: flags.ColumnMapping, serializable: _serializable, sortedBy: sortColumns);
             if (streamedVersion is not null)
             {
                 return streamedRows;
@@ -1925,14 +1940,62 @@ public sealed class DeltaCatalog : IBackendCatalog
         // codec OR DuckDB's per-file writer (native_write, non-streamable case: partitioned/merge/…).
         var (schema, batches, rows) = DeltaWriter.Materialize(data, default);
         DeltaWriter.Write(opener, tablePath, schema, batches, mode, default,
-                          deletionVectors: _deletionVectorsOnCreate,
-                          inCommitTimestamps: _inCommitTimestampsOnCreate,
-                          changeDataFeed: _changeDataFeedOnCreate,
-                          rowTracking: _rowTrackingOnCreate,
+                          deletionVectors: flags.DeletionVectors,
+                          inCommitTimestamps: flags.InCommitTimestamps,
+                          changeDataFeed: flags.ChangeDataFeed,
+                          rowTracking: flags.RowTracking,
                           spec: spec, nativeWrite: _nativeWrite,
-                          columnMapping: _columnMappingMode, serializable: _serializable,
+                          columnMapping: flags.ColumnMapping, serializable: _serializable,
                           sortedBy: sortColumns);
         return rows;
+    }
+
+    /// <summary>The create-time feature flags for one statement: the WITH override where given, else the
+    /// catalog's ATTACH default — so a single table opts in/out (e.g. the protocol-1.0 recipe
+    /// <c>WITH (deletion_vectors=false, column_mapping='none')</c>) without a dedicated ATTACH.</summary>
+    private readonly record struct CreateFlags(
+        bool DeletionVectors, bool InCommitTimestamps, bool ChangeDataFeed, bool RowTracking,
+        EngineeredWood.DeltaLake.Schema.ColumnMappingMode ColumnMapping);
+
+    private CreateFlags EffectiveCreateFlags(DeltaWithOptions? w) => new(
+        w?.DeletionVectors ?? _deletionVectorsOnCreate,
+        w?.InCommitTimestamps ?? _inCommitTimestampsOnCreate,
+        w?.ChangeDataFeed ?? _changeDataFeedOnCreate,
+        w?.RowTracking ?? _rowTrackingOnCreate,
+        w?.ColumnMapping ?? _columnMappingMode);
+
+    /// <summary>Overlays the WITH clause's write tuning + delta.*/fabricator.* properties onto the resolved
+    /// write spec (WITH wins per key — the strongest layer above delta_write_options and the ATTACH defaults).</summary>
+    private static DeltaWriteSpec? ApplyWithOptions(DeltaWriteSpec? spec, DeltaWithOptions? w)
+    {
+        if (w is null || (!w.HasWriteTuning && w.Properties is not { Count: > 0 }))
+        {
+            return spec;
+        }
+        spec ??= new DeltaWriteSpec(null, null, null, null);
+        if (w.Compression is { } comp)
+        {
+            spec = spec with
+            {
+                Compression = ParseCompression(comp)
+                    ?? throw new System.ArgumentException(
+                        $"WITH parquet_compression: unknown codec '{comp}' "
+                        + "(expected snappy/zstd/gzip/brotli/lz4/uncompressed)."),
+            };
+        }
+        if (w.RowGroupSize is { } rg)
+        {
+            spec = spec with { RowGroupSize = rg };
+        }
+        if (w.BloomFilterColumns is { } bloom)
+        {
+            spec = spec with { BloomFilterColumns = bloom };
+        }
+        if (w.Properties is { Count: > 0 } props)
+        {
+            spec = spec with { CreateProperties = props };
+        }
+        return spec;
     }
 
     /// <summary>Creates an empty Delta table (commit 0 with the schema). Idempotent (OpenOrCreate), so
@@ -2000,11 +2063,23 @@ public sealed class DeltaCatalog : IBackendCatalog
     public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists,
                             string? primaryKey, string? uniques, string? defaults,
                             IReadOnlyList<string>? partitionColumns, IReadOnlyList<string>? sortColumns,
-                            IReadOnlyList<string>? identityColumns)
+                            IReadOnlyList<string>? identityColumns, string? optionsJson)
     {
         // Commit 0 itself is metadata-only, but a variant table is unusable without the native paths — fail
         // the CREATE up front with the actionable ATTACH-option error rather than at the first INSERT/SELECT.
         EnsureVariantWritable(columns);
+        // CREATE TABLE ... WITH (...): per-table create-flag overrides + delta.*/fabricator.* properties.
+        // Write-TUNING keys are per-statement and an empty CREATE writes no data — reject them here rather
+        // than silently not applying them (use CTAS, or SET delta_write_options for later INSERTs).
+        var withOpts = DeltaWithOptions.Parse(optionsJson);
+        if (withOpts is { HasWriteTuning: true })
+        {
+            throw new System.ArgumentException(
+                "WITH write-tuning options (parquet_compression / parquet_row_group_size / "
+                + "parquet_bloom_filter_columns) apply to the statement's write — use them on "
+                + "CREATE TABLE AS, or SET delta_write_options for later INSERTs.");
+        }
+        var flags = EffectiveCreateFlags(withOpts);
         // identityColumns metadata is attached BEFORE the buffer gate so a BUFFERED identity create
         // parks the marked schema — INSERTs into the pending table then generate values at statement
         // time from it (chained marks), and the flush bakes the final high-water marks into commit-0.
@@ -2017,7 +2092,7 @@ public sealed class DeltaCatalog : IBackendCatalog
             && !TableExists(TablePath(schemaName, tableName)))
         {
             BufferCreateTable(createTxn, TablePath(schemaName, tableName), schemaName, tableName,
-                              columns, ifNotExists, partitionColumns, sortColumns);
+                              columns, ifNotExists, partitionColumns, sortColumns, withOpts);
             return;
         }
         ThrowIfPendingAppends(TablePath(schemaName, tableName), "CREATE (OR REPLACE) TABLE");
@@ -2037,12 +2112,13 @@ public sealed class DeltaCatalog : IBackendCatalog
             // (metadata already attached above — WithIdentityMetadata)
         }
         DeltaWriter.Create(Opener(), TablePath(schemaName, tableName), columns, default,
-                              deletionVectors: _deletionVectorsOnCreate,
-                              inCommitTimestamps: _inCommitTimestampsOnCreate,
-                              changeDataFeed: _changeDataFeedOnCreate,
-                              rowTracking: _rowTrackingOnCreate,
-                              spec: ResolveWriteSpec(partitionColumns, schemaModeArg: null),
-                              columnMapping: _columnMappingMode, serializable: _serializable,
+                              deletionVectors: flags.DeletionVectors,
+                              inCommitTimestamps: flags.InCommitTimestamps,
+                              changeDataFeed: flags.ChangeDataFeed,
+                              rowTracking: flags.RowTracking,
+                              spec: ApplyWithOptions(ResolveWriteSpec(partitionColumns, schemaModeArg: null),
+                                                     withOpts),
+                              columnMapping: flags.ColumnMapping, serializable: _serializable,
                               sortedBy: sortColumns);
     }
 
@@ -2192,7 +2268,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     // run schema-overridden; changing the schema under already-buffered rows/post-images is unsupported).
     private void BufferCreateTable(long txnId, string path, string schemaName, string tableName,
                                    Schema columns, bool ifNotExists, IReadOnlyList<string>? partitionColumns,
-                                   IReadOnlyList<string>? sortColumns)
+                                   IReadOnlyList<string>? sortColumns, DeltaWithOptions? withOpts)
     {
         var pending = _txnBuffer.GetOrCreate(txnId, path);
         if (pending.HasAny)
@@ -2209,6 +2285,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         pending.PendingArrowSchema = columns;
         pending.CreatePartitionColumns = partitionColumns;
         pending.CreateSortColumns = sortColumns;
+        pending.CreateOptions = withOpts; // WITH flags/properties apply at the flush's create
         _log.LogInformation("delta txn {Txn} buffer create {Schema}.{Table}: cols={Cols}",
             txnId, schemaName, tableName, columns.FieldsList.Count);
     }
@@ -2912,13 +2989,19 @@ public sealed class DeltaCatalog : IBackendCatalog
         var createSchema = pending.PendingIdentityHwm.Count > 0
             ? BakeIdentityMarks(pending.PendingArrowSchema!, pending.PendingIdentityHwm)
             : pending.PendingArrowSchema!;
+        // The parked CREATE ... WITH (...) options: create-flag overrides + properties + write tuning
+        // (tuning applies to the flush's data-file writes below; the eagerly-streamed files already got it).
+        var flags = EffectiveCreateFlags(pending.CreateOptions);
+        var flushSpec = ApplyWithOptions(ResolveWriteSpec(null, null), pending.CreateOptions);
         DeltaWriter.Create(opener, tablePath, createSchema, token,
-                           deletionVectors: _deletionVectorsOnCreate,
-                           inCommitTimestamps: _inCommitTimestampsOnCreate,
-                           changeDataFeed: _changeDataFeedOnCreate,
-                           rowTracking: _rowTrackingOnCreate,
-                           spec: ResolveWriteSpec(pending.CreatePartitionColumns, schemaModeArg: null),
-                           columnMapping: _columnMappingMode,
+                           deletionVectors: flags.DeletionVectors,
+                           inCommitTimestamps: flags.InCommitTimestamps,
+                           changeDataFeed: flags.ChangeDataFeed,
+                           rowTracking: flags.RowTracking,
+                           spec: ApplyWithOptions(
+                               ResolveWriteSpec(pending.CreatePartitionColumns, schemaModeArg: null),
+                               pending.CreateOptions),
+                           columnMapping: flags.ColumnMapping,
                            // slice B: an eagerly-streamed CTAS's files were written against THIS
                            // pre-assigned mapping schema — the create must reuse it, never re-assign
                            // (physical names are random GUIDs).
@@ -2931,9 +3014,9 @@ public sealed class DeltaCatalog : IBackendCatalog
             // ONE write commit (v0 create + v1 write — today's flush shape).
             var fs2 = TableFileSystems.Create(opener, tablePath);
             var w2 = _nativeWrite && NativeParquetDataFileWriter.Available
-                ? new NativeParquetDataFileWriter(tablePath)
+                ? new NativeParquetDataFileWriter(tablePath, flushSpec)
                 : null;
-            var t2 = await EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(fs2, DeltaWriter.Options(null, w2), token)
+            var t2 = await EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(fs2, DeltaWriter.Options(flushSpec, w2), token)
                 .ConfigureAwait(false);
             try
             {
@@ -2960,12 +3043,12 @@ public sealed class DeltaCatalog : IBackendCatalog
         {
             v = DeltaWriter.Write(opener, tablePath, pending.BatchSchema!, pending.Batches,
                                   DeltaWriteMode.Append, token,
-                                  deletionVectors: _deletionVectorsOnCreate,
-                                  inCommitTimestamps: _inCommitTimestampsOnCreate,
-                                  changeDataFeed: _changeDataFeedOnCreate,
-                                  rowTracking: _rowTrackingOnCreate,
-                                  spec: ResolveWriteSpec(null, null), nativeWrite: _nativeWrite,
-                                  columnMapping: _columnMappingMode, serializable: _serializable);
+                                  deletionVectors: flags.DeletionVectors,
+                                  inCommitTimestamps: flags.InCommitTimestamps,
+                                  changeDataFeed: flags.ChangeDataFeed,
+                                  rowTracking: flags.RowTracking,
+                                  spec: flushSpec, nativeWrite: _nativeWrite,
+                                  columnMapping: flags.ColumnMapping, serializable: _serializable);
         }
         _log.LogInformation("delta txn {Txn} commit-create {Path}: v{Version} ({Rows} buffered row(s))",
             txnId, tablePath, v, pending.Rows);

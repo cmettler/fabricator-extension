@@ -78,7 +78,7 @@ public sealed class StubBackend : IBackend
         public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists,
                                 string? primaryKey, string? uniques, string? defaults,
                                 IReadOnlyList<string>? partitionColumns, IReadOnlyList<string>? sortColumns,
-                                IReadOnlyList<string>? identityColumns)
+                                IReadOnlyList<string>? identityColumns, string? optionsJson)
         {
         }
 
@@ -128,7 +128,7 @@ public sealed class StubBackend : IBackend
                                bool replace, bool checkConstraints, long txnId,
                                IReadOnlyList<string>? partitionColumns,
                                IReadOnlyList<string>? sortColumns, string? schemaMode,
-                               bool partitionOverwrite) => CountRows(data);
+                               bool partitionOverwrite, string? optionsJson) => CountRows(data);
 
         public long ExecuteDelete(string schemaName, string tableName, IArrowArrayStream keys) => CountRows(keys);
 

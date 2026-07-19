@@ -47,8 +47,9 @@ public unsafe struct FabricatorVTable
 
     // int32 create_table(void* handle, const char* schema, const char* table, ArrowArrayStream* columns,
     //                    int32 if_not_exists, const char* pk_columns, const char* unique_columns,
-    //                    const char* defaults, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, int, byte*, byte*, byte*, byte*, byte*, byte*, byte**, int> CreateTable;
+    //                    const char* defaults, const char* partition_columns, const char* sort_columns,
+    //                    const char* identity_columns, const char* options_json, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, int, byte*, byte*, byte*, byte*, byte*, byte*, byte*, byte**, int> CreateTable;
 
     // int32 drop_table(void* handle, const char* schema, const char* table, int32 if_exists, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte*, byte*, int, byte**, int> DropTable;
@@ -74,8 +75,8 @@ public unsafe struct FabricatorVTable
     // int32 begin_bulk(void* handle, const char* schema, const char* table, int32 create_table, int32 replace,
     //                  int32 check_constraints, int64 txn_id, ArrowSchema* schema_in, const char* partition_columns,
     //                  const char* sort_columns, const char* schema_mode, int32 partition_overwrite,
-    //                  void** out_session, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, int, int, int, long, CArrowSchema*, byte*, byte*, byte*, int, nint*, byte**, int> BeginBulk;
+    //                  const char* options_json, void** out_session, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, int, int, int, long, CArrowSchema*, byte*, byte*, byte*, int, byte*, nint*, byte**, int> BeginBulk;
 
     // int32 push_batch(void* session, ArrowArray* batch, char** err)
     public delegate* unmanaged[Cdecl]<nint, CArrowArray*, byte**, int> PushBatch;

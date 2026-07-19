@@ -29,10 +29,14 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
     // The table root as a URI DuckDB's writer can open (onelake:// for OneLake, else the local/s3 path). Files
     // are written to <root>/<relativePath> so they resolve identically to engineered-wood's own _fs mapping.
     private readonly string _writableRoot;
+    // Per-write parquet tuning (compression / row-group size) rendered into the COPY options. Null => DuckDB
+    // defaults (snappy, 122880-row groups) — the pre-tuning behavior.
+    private readonly DeltaWriteSpec? _spec;
 
-    internal NativeParquetDataFileWriter(string tablePath)
+    internal NativeParquetDataFileWriter(string tablePath, DeltaWriteSpec? spec = null)
     {
         _writableRoot = DeltaReader.ToReadableRoot(tablePath);
+        _spec = spec;
     }
 
     /// <summary>True when native write is usable (the host registered host_query). Falls back to the built-in
@@ -55,9 +59,43 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
         // an id-mode reader couldn't map it.
         var src = new InMemoryArrayStream(batches[0].Schema, batches);
         var (_, size, _) = RunCopy(_writableRoot, relativePath, src, cancellationToken,
-                                   fieldIds: FieldIdsFromMetadata(batches[0].Schema));
+                                   fieldIds: FieldIdsFromMetadata(batches[0].Schema), spec: _spec);
         return new ValueTask<long>(size);
     }
+
+    // Renders the resolved write tuning as native COPY options. COMPRESSION/ROW_GROUP_SIZE are DuckDB parquet
+    // COPY options; bloom-filter COLUMNS are an EW-codec-only knob (DuckDB's writer blooms dictionary-encoded
+    // columns automatically — WRITE_BLOOM_FILTER true is always set), so BloomFilterColumns is not rendered.
+    internal static string CopyTuning(DeltaWriteSpec? spec)
+    {
+        if (spec is null)
+        {
+            return string.Empty;
+        }
+        string s = string.Empty;
+        if (spec.Compression is { } codec)
+        {
+            s += ", COMPRESSION " + DuckDbCodecName(codec);
+        }
+        if (spec.RowGroupSize is { } rows)
+        {
+            s += ", ROW_GROUP_SIZE " + rows.ToString(CultureInfo.InvariantCulture);
+        }
+        return s;
+    }
+
+    private static string DuckDbCodecName(EngineeredWood.Compression.CompressionCodec codec) => codec switch
+    {
+        EngineeredWood.Compression.CompressionCodec.Uncompressed => "uncompressed",
+        EngineeredWood.Compression.CompressionCodec.Snappy => "snappy",
+        EngineeredWood.Compression.CompressionCodec.Gzip => "gzip",
+        EngineeredWood.Compression.CompressionCodec.Brotli => "brotli",
+        EngineeredWood.Compression.CompressionCodec.Zstd => "zstd",
+        EngineeredWood.Compression.CompressionCodec.Lz4 => "lz4_raw",
+        _ => throw new NotSupportedException(
+            $"parquet compression '{codec}' is not supported by DuckDB's native parquet writer "
+            + "(native_write) — use snappy/zstd/gzip/brotli/lz4/uncompressed."),
+    };
 
     /// <summary>
     /// Streams <paramref name="src"/> (a pull-based Arrow stream — the whole dataset never materializes here) into
@@ -77,7 +115,8 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
     internal static (long Rows, long Size, string? Stats) RunCopy(
         string writableRoot, string relativePath, IArrowArrayStream src, CancellationToken ct,
         Schema? statsSchema = null, IReadOnlyDictionary<string, int>? fieldIds = null,
-        IReadOnlyDictionary<string, string>? renameToPhysical = null, string? fieldIdsSpec = null)
+        IReadOnlyDictionary<string, string>? renameToPhysical = null, string? fieldIdsSpec = null,
+        DeltaWriteSpec? spec = null)
     {
         var rel = relativePath.Replace('\\', '/').TrimStart('/');
         var uri = writableRoot + "/" + rel;
@@ -93,7 +132,7 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
         }
         var sql =
             $"COPY (SELECT {SelectList(src.Schema, renameToPhysical)} FROM {InputName}) TO '{uri.Replace("'", "''")}' " +
-            "(FORMAT parquet, WRITE_BLOOM_FILTER true, RETURN_STATS"
+            "(FORMAT parquet, WRITE_BLOOM_FILTER true, RETURN_STATS" + CopyTuning(spec)
             + (fieldIdsSpec is not null ? ", FIELD_IDS " + fieldIdsSpec : FieldIdsClause(fieldIds)) + ")";
         Log.LogInformation("delta native copy {Uri}", uri);
         var input = new (string, IArrowArrayStream)[] { (InputName, src) };
@@ -140,7 +179,8 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
     internal static List<CopiedFile> RunCopyPartitioned(
         string writableRoot, IReadOnlyList<string> partitionColumns, IArrowArrayStream src,
         CancellationToken ct, Schema? statsSchema, IReadOnlyDictionary<string, int>? fieldIds = null,
-        IReadOnlyDictionary<string, string>? renameToPhysical = null, string? fieldIdsSpec = null)
+        IReadOnlyDictionary<string, string>? renameToPhysical = null, string? fieldIdsSpec = null,
+        DeltaWriteSpec? spec = null)
     {
         // Under column mapping the input stream was renamed to physical names, so `partitionColumns` must
         // already be the PHYSICAL (output) names — dirs, RETURN_STATS.partition_keys, and FIELD_IDS key by them.
@@ -148,7 +188,7 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
         var sql =
             $"COPY (SELECT {SelectList(src.Schema, renameToPhysical)} FROM {InputName}) TO '{writableRoot.Replace("'", "''")}' " +
             $"(FORMAT parquet, PARTITION_BY ({quoted}), APPEND true, FILENAME_PATTERN '{{uuid}}', " +
-            "WRITE_BLOOM_FILTER true, RETURN_STATS"
+            "WRITE_BLOOM_FILTER true, RETURN_STATS" + CopyTuning(spec)
             + (fieldIdsSpec is not null ? ", FIELD_IDS " + fieldIdsSpec : FieldIdsClause(fieldIds)) + ")";
         Log.LogInformation("delta native partitioned copy {Root} by [{Cols}]", writableRoot, quoted);
         var input = new (string, IArrowArrayStream)[] { (InputName, src) };

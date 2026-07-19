@@ -336,7 +336,11 @@ internal sealed record DeltaWriteSpec(
     // the partitions PRESENT IN THE INPUT are atomically replaced in one commit (their current files removed +
     // the new files added); untouched partitions kept. Append-shaped only; requires a partitioned table.
     // Unlike ReplaceWhere (a STATIC, user-supplied partition filter) the target set is derived from the data.
-    bool DynamicPartitionOverwrite = false);
+    bool DynamicPartitionOverwrite = false,
+    // CREATE TABLE ... WITH (...) delta.*/fabricator.* property keys (original case), merged into the
+    // CREATE's table configuration LAST (a WITH property wins over a derived key). Create-time only —
+    // ignored when the write doesn't create the table.
+    IReadOnlyDictionary<string, string>? CreateProperties = null);
 
 /// <summary>
 /// Writes a Delta Lake table via engineered-wood through the host FileSystem (the <see cref="DuckDbTableFileSystem"/>
@@ -449,10 +453,11 @@ internal static class DeltaWriter
 
     private static Dictionary<string, string>? CreateConfig(
         bool deletionVectors, bool rowTracking, bool inCommitTimestamps, bool changeDataFeed,
-        bool serializable = false, IReadOnlyList<string>? sortedBy = null)
+        bool serializable = false, IReadOnlyList<string>? sortedBy = null,
+        IReadOnlyDictionary<string, string>? extraProperties = null)
     {
         if (!deletionVectors && !rowTracking && !inCommitTimestamps && !changeDataFeed && !serializable
-            && sortedBy is not { Count: > 0 })
+            && sortedBy is not { Count: > 0 } && extraProperties is not { Count: > 0 })
         {
             return null;
         }
@@ -498,6 +503,16 @@ internal static class DeltaWriter
             config["delta.rowTracking.materializedRowIdColumnName"] = MaterializedRowIdColumn;
             config["delta.rowTracking.materializedRowCommitVersionColumnName"] = MaterializedRowCommitVersionColumn;
         }
+        if (extraProperties is not null)
+        {
+            // CREATE TABLE ... WITH (...) delta.*/fabricator.* properties — merged LAST so a WITH property
+            // wins over a derived key (e.g. delta.isolationLevel). Feature-enabling spellings were rejected
+            // at parse (DeltaWithOptions.GuardPropertyKey), so nothing here changes the protocol demands.
+            foreach (var kv in extraProperties)
+            {
+                config[kv.Key] = kv.Value;
+            }
+        }
         return config;
     }
 
@@ -534,8 +549,9 @@ internal static class DeltaWriter
         // native_write: DuckDB's parquet writer produces the data-file bytes (via COPY on a fresh host
         // connection); engineered-wood keeps the _delta_log commit. Falls back to EW's codec if host_query is
         // unavailable. Only the data write is affected — partitioning/stats/row-tracking/commit are unchanged.
+        // The resolved tuning (compression/row-group size) rides into the writer's COPY options.
         var dataFileWriter = nativeWrite && NativeParquetDataFileWriter.Available
-            ? new NativeParquetDataFileWriter(path)
+            ? new NativeParquetDataFileWriter(path, spec)
             : null;
         long totalRows = 0;
         foreach (var b in batches) { totalRows += b.Length; }
@@ -553,7 +569,7 @@ internal static class DeltaWriter
             var fs = TableFileSystems.Create(opener, path);
             var table = await DeltaTable.OpenOrCreateAsync(fs, schema, Options(spec, dataFileWriter),
                                                      partitionColumns: spec?.PartitionColumns,
-                                                     configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, serializable, sortedBy),
+                                                     configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, serializable, sortedBy, spec?.CreateProperties),
                                                      columnMappingMode: columnMapping,
                                                      cancellationToken: ct,
                                                      clusteringColumns: spec?.PartitionColumns is { Count: > 0 } ? null : sortedBy).ConfigureAwait(false);
@@ -645,7 +661,7 @@ internal static class DeltaWriter
         nint opener, string path, IArrowArrayStream data,
         EngineeredWood.DeltaLake.Schema.ColumnMappingMode columnMapping,
         out long rowsWritten, out EngineeredWood.DeltaLake.Schema.StructType? assignedSchema,
-        IReadOnlyList<string>? partitionColumns = null)
+        IReadOnlyList<string>? partitionColumns = null, DeltaWriteSpec? spec = null)
     {
         rowsWritten = 0;
         assignedSchema = null;
@@ -703,7 +719,7 @@ internal static class DeltaWriter
             // commit — and into the pending-file read-back's typed literals.
             var copied = NativeParquetDataFileWriter.RunCopyPartitioned(
                 writableRoot, copyPartCols, copySource, default, statsSchema: statsSchema,
-                fieldIdsSpec: fieldIdsSpec);
+                fieldIdsSpec: fieldIdsSpec, spec: spec);
             var pfiles = new List<WrittenDataFile>(copied.Count);
             long ptotal = 0;
             foreach (var cf in copied)
@@ -717,7 +733,8 @@ internal static class DeltaWriter
         }
         string fileRel = $"{System.Guid.NewGuid():N}.parquet";
         var (rows, size, stats) = NativeParquetDataFileWriter.RunCopy(
-            writableRoot, fileRel, copySource, default, statsSchema: statsSchema, fieldIdsSpec: fieldIdsSpec);
+            writableRoot, fileRel, copySource, default, statsSchema: statsSchema, fieldIdsSpec: fieldIdsSpec,
+            spec: spec);
         rowsWritten = rows;
         return rows > 0
             ? new List<WrittenDataFile> { new(fileRel, size, rows, null, stats) }
@@ -780,7 +797,7 @@ internal static class DeltaWriter
         var table = await DeltaTable.OpenOrCreateAsync(
             fs, data.Schema, Options(spec),
             partitionColumns: spec?.PartitionColumns,   // set on a partitioned CTAS create; ignored for an INSERT
-            configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, serializable, sortedBy),
+            configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, serializable, sortedBy, spec?.CreateProperties),
             columnMappingMode: columnMapping,
             cancellationToken: default,
             clusteringColumns: spec?.PartitionColumns is { Count: > 0 } ? null : sortedBy).ConfigureAwait(false);
@@ -905,7 +922,7 @@ internal static class DeltaWriter
                 // names, so dirs + partitionValues keys are physical (Delta spec) and FIELD_IDS stamp the files.
                 var copied = NativeParquetDataFileWriter.RunCopyPartitioned(
                     writableRoot, copyPartCols, copySource, default, statsSchema: statsSchema,
-                    fieldIdsSpec: fieldIdsSpec);
+                    fieldIdsSpec: fieldIdsSpec, spec: spec);
                 files = new List<WrittenDataFile>(copied.Count);
                 long total = 0;
                 foreach (var cf in copied)
@@ -923,7 +940,7 @@ internal static class DeltaWriter
                 string fileRel = $"{System.Guid.NewGuid():N}.parquet";
                 var (rows, size, stats) = NativeParquetDataFileWriter.RunCopy(
                     writableRoot, fileRel, copySource, default, statsSchema: statsSchema,
-                    fieldIdsSpec: fieldIdsSpec);
+                    fieldIdsSpec: fieldIdsSpec, spec: spec);
                 rowsWritten = rows;
                 // 0 rows → reference no file (an empty COPY output would be an unreferenced orphan); an Overwrite
                 // still commits its removes (clears the table), an Append commits an empty version.
@@ -1190,7 +1207,7 @@ internal static class DeltaWriter
                 // OpenOrCreate writes commit-0 for a new table (or opens an existing one — no commit, no conflict).
                 var table = await DeltaTable.OpenOrCreateAsync(fs, schema, Options(spec),
                                                          partitionColumns: spec?.PartitionColumns,
-                                                         configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, serializable, sortedBy),
+                                                         configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, serializable, sortedBy, spec?.CreateProperties),
                                                          columnMappingMode: columnMapping,
                                                          preAssignedSchema: preAssignedSchema,
                                                          cancellationToken: ct,

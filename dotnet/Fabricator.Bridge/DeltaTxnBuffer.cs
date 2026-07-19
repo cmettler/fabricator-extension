@@ -81,6 +81,9 @@ internal sealed class DeltaTxnBuffer
         public IReadOnlyList<string>? CreatePartitionColumns;
         // SORTED BY columns of a pending CREATE/CTAS — persisted (fabricator.sortedBy) by the flush's create.
         public IReadOnlyList<string>? CreateSortColumns;
+        // CREATE ... WITH (...) options of a pending CREATE/CTAS — the flush's create resolves its effective
+        // create flags (deletion_vectors/column_mapping/...) + delta.*/fabricator.* properties from them.
+        public DeltaWithOptions? CreateOptions;
 
         // ---- Eager CDC capture (slice C2, CDF tables in explicit transactions) ----
         // _change_data files are written at STATEMENT time (the rows are in hand: appended batches,

@@ -1,6 +1,7 @@
 # `CREATE TABLE … WITH (…)` options + SQL Server external tables (design)
 
-Status: **PLANNED, nothing built** (2026-07-19). Four slices, ordered A → C → D → B by value/risk.
+Status: **slice A DONE (2026-07-19, ABI v67); C/D/B planned.** Four slices, ordered A → C → D → B by
+value/risk.
 Origin: user request — DuckDB parses a `WITH (key='value', …)` clause on CREATE TABLE / CTAS
 (the Iceberg-style `WITH (location=…, table_type=…, format=…)` shape); we should surface those
 options to the C# providers to (1) set Delta TBLPROPERTIES + parquet write tuning per table,
@@ -57,9 +58,26 @@ AS SELECT …;   -- writes Delta to S3 client-side + provisions the SQL external
 
 ---
 
-## Slice A — WITH-options plumbing + Delta per-table properties/write tuning (ABI v67)
+## Slice A — WITH-options plumbing + Delta per-table properties/write tuning (ABI v67) — **DONE**
 
-The foundation: get the clause across the boundary, and make it useful on the Delta provider.
+Built 2026-07-19 as planned, plus three findings the build surfaced:
+
+- **DuckDB's parser LOWERCASES every WITH key** (`transformer.cpp TransformTableOptions` — quoting does
+  not help), but Delta config keys are case-sensitive. Well-known `delta.*`/`fabricator.*` keys are
+  re-cased C#-side from a canonical list (`DeltaWithOptions.CanonicalKeys` — isolationLevel,
+  targetFileSize, appendOnly, retention/durations, dataSkipping*, parquet.compression.codec, …);
+  arbitrary mixed-case custom keys must use `fabricator_delta_set_tblproperties` (JSON preserves case).
+- **Boolean literals arrive as postgres `'t'/'f'`** (a bare `true` parses as `CAST('t' AS BOOLEAN)` and
+  the constant extraction unwraps one CAST level) — the bool parser accepts them.
+- **Pre-existing gap closed en route: the native_write COPY paths carried NO write tuning** —
+  `delta_write_options` compression only reached the EW codec writer. `RunCopy`/`RunCopyPartitioned` +
+  the per-file `NativeParquetDataFileWriter` now render `COMPRESSION`/`ROW_GROUP_SIZE` from the resolved
+  spec (`CopyTuning`), so tuning applies uniformly (bloom-filter COLUMNS remain codec-only — DuckDB's
+  writer blooms dictionary-encoded columns automatically). Note DuckDB's writer has a row-group flush
+  floor: `parquet_row_group_size` below ~2048 coalesces.
+
+Verified: `test/verify_with_options.test` (68) + `test/verify_with_options_mssql.test` (4) + a
+14-suite regression sweep (see the CLAUDE.md bullet). Original design below.
 
 ### Surface (Delta provider)
 

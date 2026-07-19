@@ -1,0 +1,306 @@
+# name: test/verify_with_options.test
+# description: CREATE TABLE [AS] ... WITH (key='value', ...) options on the Delta provider (ABI v67 —
+#              docs/create-table-with-options.md slice A). Three key kinds: per-statement WRITE TUNING
+#              (parquet_compression / parquet_row_group_size / parquet_bloom_filter_columns — DuckLake-parity
+#              names; WITH > delta_write_options > ATTACH defaults), per-table CREATE-FLAG OVERRIDES
+#              (deletion_vectors / column_mapping / row_tracking / change_data_feed / in_commit_timestamps —
+#              e.g. the protocol-1.0 recipe without a dedicated ATTACH), and delta.*/fabricator.* TABLE
+#              PROPERTIES stamped in the CREATE commit itself (well-known keys re-cased to spec spelling —
+#              DuckDB's parser lowercases every WITH key). Unknown keys are REJECTED, never ignored.
+# group: [fabricator]
+
+require fabricator
+
+require parquet
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/optlake' AS lake (TYPE fabricator, PROVIDER 'delta', native_read true, native_write true);
+
+# ==== 1. write tuning (CTAS, native streaming COPY) ====
+
+statement ok
+CREATE OR REPLACE TABLE lake.main.tuned
+  WITH (parquet_compression='zstd', parquet_row_group_size=5000)
+AS SELECT i, 'v' || i AS s FROM range(20000) t(i);
+
+query I
+SELECT count(*) FROM lake.main.tuned;
+----
+20000
+
+query I
+SELECT DISTINCT compression FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlake/tuned/*.parquet')
+WHERE compression <> '';
+----
+ZSTD
+
+query I
+SELECT count(DISTINCT row_group_id) FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlake/tuned/*.parquet');
+----
+4
+
+# precedence: WITH beats the delta_write_options session setting; the setting still applies when no WITH
+statement ok
+SET delta_write_options = '{"compression":"gzip"}';
+
+statement ok
+CREATE OR REPLACE TABLE lake.main.tuned2 WITH (parquet_compression='zstd') AS SELECT 1 AS id;
+
+query I
+SELECT DISTINCT compression FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlake/tuned2/*.parquet')
+WHERE compression <> '';
+----
+ZSTD
+
+statement ok
+CREATE OR REPLACE TABLE lake.main.tuned3 AS SELECT 1 AS id;
+
+query I
+SELECT DISTINCT compression FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlake/tuned3/*.parquet')
+WHERE compression <> '';
+----
+GZIP
+
+statement ok
+SET delta_write_options = '';
+
+# ==== 2. per-table create-flag overrides ====
+
+# the protocol-1.0 recipe (SQL Server / PolyBase readable) on a DV-DEFAULT catalog: WITH opts this one
+# table out — plain minReader 1, no deletionVectors feature, no column mapping
+statement ok
+CREATE OR REPLACE TABLE lake.main.plainrec
+  WITH (deletion_vectors=false, column_mapping='none')
+AS SELECT i AS id FROM range(5) t(i);
+
+query I
+SELECT count(*) FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/optlake/plainrec/_delta_log/*.json')
+WHERE content LIKE '%deletionVectors%' OR content LIKE '%columnMapping%';
+----
+0
+
+query I
+SELECT count(*) FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/optlake/plainrec/_delta_log/*.json')
+WHERE content LIKE '%"minReaderVersion":1%';
+----
+1
+
+# a DEFAULT-created sibling in the same catalog keeps the catalog defaults (DV + mapping)
+statement ok
+CREATE OR REPLACE TABLE lake.main.defaults AS SELECT 1 AS id;
+
+query I
+SELECT count(*) FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/optlake/defaults/_delta_log/*.json')
+WHERE content LIKE '%delta.enableDeletionVectors%';
+----
+1
+
+# the reverse override: a DV-OFF catalog, one table opts IN
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/optlake2' AS lake2 (TYPE fabricator, PROVIDER 'delta', deletion_vectors false, column_mapping 'none');
+
+statement ok
+CREATE OR REPLACE TABLE lake2.main.dvon WITH (deletion_vectors=true) AS SELECT 1 AS id;
+
+query I
+SELECT count(*) FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/optlake2/dvon/_delta_log/*.json')
+WHERE content LIKE '%delta.enableDeletionVectors%';
+----
+1
+
+# flags also work on an EMPTY CREATE (DDL path, no AS)
+statement ok
+CREATE TABLE lake.main.plainrec2 (id INTEGER, s VARCHAR) WITH (deletion_vectors=false, column_mapping='none');
+
+statement ok
+INSERT INTO lake.main.plainrec2 VALUES (1, 'a'), (2, 'b');
+
+query II
+SELECT id, s FROM lake.main.plainrec2 ORDER BY id;
+----
+1	a
+2	b
+
+query I
+SELECT count(*) FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/optlake/plainrec2/_delta_log/*.json')
+WHERE content LIKE '%deletionVectors%' OR content LIKE '%columnMapping%';
+----
+0
+
+# ==== 3. delta.*/fabricator.* properties stamped at CREATE (one commit, no set_tblproperties two-step) ====
+
+statement ok
+CREATE OR REPLACE TABLE lake.main.proptest
+  WITH ("delta.isolationLevel"='Serializable', "fabricator.mytag"='hello')
+AS SELECT 1 AS id;
+
+# the well-known key is re-cased to its spec spelling (DuckDB's parser lowercases WITH keys)
+query II
+SELECT property, value FROM fabricator_delta_tblproperties('lake', 'main.proptest')
+WHERE property IN ('delta.isolationLevel', 'fabricator.mytag') ORDER BY 1;
+----
+delta.isolationLevel	Serializable
+fabricator.mytag	hello
+
+# stamped in commit-0 itself (the CREATE), not a follow-up property commit
+query I
+SELECT count(*) FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/optlake/proptest/_delta_log/00000000000000000000.json')
+WHERE content LIKE '%delta.isolationLevel%';
+----
+1
+
+# ==== 4. buffered (explicit-transaction) CREATE/CTAS parks the options; the flush applies them ====
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE lake.main.txnopt
+  WITH (deletion_vectors=false, column_mapping='none', "delta.isolationLevel"='Serializable')
+AS SELECT i AS id FROM range(7) t(i);
+
+# read-your-writes from the buffer (nothing on storage yet)
+query I
+SELECT count(*) FROM lake.main.txnopt;
+----
+7
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM lake.main.txnopt;
+----
+7
+
+query I
+SELECT count(*) FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/optlake/txnopt/_delta_log/*.json')
+WHERE content LIKE '%deletionVectors%' OR content LIKE '%columnMapping%';
+----
+0
+
+query II
+SELECT property, value FROM fabricator_delta_tblproperties('lake', 'main.txnopt')
+WHERE property = 'delta.isolationLevel' ORDER BY 1;
+----
+delta.isolationLevel	Serializable
+
+# ROLLBACK discards a buffered options-carrying CTAS entirely
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE lake.main.txngone WITH (deletion_vectors=false) AS SELECT 1 AS id;
+
+statement ok
+ROLLBACK;
+
+statement error
+SELECT count(*) FROM lake.main.txngone;
+----
+
+# ==== 5. guards — a WITH option is never silently ignored ====
+
+statement error
+CREATE OR REPLACE TABLE lake.main.bad WITH (nonsense='x') AS SELECT 1 AS id;
+----
+unknown CREATE TABLE WITH option 'nonsense'
+
+# write tuning has no write to apply to on an empty CREATE
+statement error
+CREATE TABLE lake.main.bad2 (id INTEGER) WITH (parquet_compression='zstd');
+----
+apply to the statement's write
+
+# feature-enabling property spellings point at the explicit keys
+statement error
+CREATE OR REPLACE TABLE lake.main.bad3 WITH ("delta.enableChangeDataFeed"='true') AS SELECT 1 AS id;
+----
+use the explicit WITH keys
+
+statement error
+CREATE OR REPLACE TABLE lake.main.bad4 WITH (location='s3://elsewhere/t') AS SELECT 1 AS id;
+----
+path IS its identity
+
+statement error
+CREATE OR REPLACE TABLE lake.main.bad5 WITH (partitioned_by='id') AS SELECT 1 AS id;
+----
+use the native clause
+
+statement error
+CREATE OR REPLACE TABLE lake.main.bad6 WITH (table_type='ICEBERG') AS SELECT 1 AS id;
+----
+ICEBERG has no writer
+
+statement error
+CREATE OR REPLACE TABLE lake.main.bad7 WITH (deletion_vectors='maybe') AS SELECT 1 AS id;
+----
+expected a boolean
+
+statement error
+CREATE OR REPLACE TABLE lake.main.bad8 WITH (parquet_row_group_size='lots') AS SELECT 1 AS id;
+----
+expected a positive integer
+
+# non-constant option values are rejected at bind (host-side)
+statement error
+CREATE OR REPLACE TABLE lake.main.bad9 WITH (parquet_compression=lower('ZSTD')) AS SELECT 1 AS id;
+----
+must be a constant value
+
+statement error
+CREATE OR REPLACE TABLE lake.main.bad10 WITH (deletion_vectors=NULL) AS SELECT 1 AS id;
+----
+must not be NULL
+
+# table_type='DELTA' / format='parquet' are validated no-ops (the Iceberg-style DDL shape)
+statement ok
+CREATE OR REPLACE TABLE lake.main.iceshape
+  WITH (table_type='DELTA', format='parquet')
+AS SELECT 1 AS id;
+
+query I
+SELECT count(*) FROM lake.main.iceshape;
+----
+1
+
+# ==== cleanup ====
+
+statement ok
+DROP TABLE lake.main.tuned;
+
+statement ok
+DROP TABLE lake.main.tuned2;
+
+statement ok
+DROP TABLE lake.main.tuned3;
+
+statement ok
+DROP TABLE lake.main.plainrec;
+
+statement ok
+DROP TABLE lake.main.plainrec2;
+
+statement ok
+DROP TABLE lake.main.defaults;
+
+statement ok
+DROP TABLE lake.main.proptest;
+
+statement ok
+DROP TABLE lake.main.txnopt;
+
+statement ok
+DROP TABLE lake.main.iceshape;
+
+statement ok
+DROP TABLE lake2.main.dvon;
+
+statement ok
+DETACH lake;
+
+statement ok
+DETACH lake2;

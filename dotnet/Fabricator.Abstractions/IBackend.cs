@@ -156,9 +156,13 @@ public interface IBackendCatalog : IDisposable
     /// partitions are unaffected. Append-shaped only + requires a partitioned target. A
     /// Delta-provider concept; providers without partition semantics MUST REJECT it when
     /// true (silently ignoring an overwrite flag would be a correctness surprise).
+    /// <paramref name="optionsJson"/> (null if none, v67) is the CTAS <c>WITH (key='value', ...)</c>
+    /// options clause as a flat JSON object of string values. The provider parses the keys it
+    /// knows and MUST REJECT unknown keys — a WITH option is never silently ignored.
     long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable, bool replace,
                     bool checkConstraints, long txnId, IReadOnlyList<string>? partitionColumns,
-                    IReadOnlyList<string>? sortColumns, string? schemaMode, bool partitionOverwrite);
+                    IReadOnlyList<string>? sortColumns, string? schemaMode, bool partitionOverwrite,
+                    string? optionsJson);
 
     /// <summary>
     /// rowid-based DELETE. <paramref name="keys"/> columns (named by Arrow field)
@@ -268,9 +272,13 @@ public interface IBackendCatalog : IDisposable
     /// <paramref name="identityColumns"/> are columns the host detected as DuckDB GENERATED
     /// columns (an IDENTITY marker); the SQL Server provider emits them as IDENTITY
     /// (box <c>IDENTITY(1,1)</c> / Fabric bare <c>IDENTITY</c>, BIGINT). Delta / DAX ignore them.
+    /// <paramref name="optionsJson"/> (null if none, v67) is the <c>WITH (key='value', ...)</c>
+    /// options clause as a flat JSON object of string values. The provider parses the keys it
+    /// knows and MUST REJECT unknown keys — a WITH option is never silently ignored.
     void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists, string? primaryKey,
                      string? uniques, string? defaults, IReadOnlyList<string>? partitionColumns,
-                     IReadOnlyList<string>? sortColumns, IReadOnlyList<string>? identityColumns);
+                     IReadOnlyList<string>? sortColumns, IReadOnlyList<string>? identityColumns,
+                     string? optionsJson);
 
     /// <summary>Drops a table; <paramref name="ifExists"/> suppresses the missing-table error.</summary>
     void DropTable(string schemaName, string tableName, bool ifExists);

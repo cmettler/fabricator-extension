@@ -24,6 +24,9 @@ struct FabricatorCtasInfo {
 	//! Comma-separated column names from a native SORTED BY clause (empty if none). The SQL Server provider maps
 	//! them to a Fabric Warehouse WITH (CLUSTER BY (cols)) layout on the created table; Delta / DAX ignore it.
 	string sort_columns;
+	//! The CREATE TABLE AS ... WITH (key='value', ...) options clause as a flat JSON object (empty if none).
+	//! Passed to begin_bulk (v67); the provider parses the keys it knows and rejects unknown ones.
+	string options_json;
 	FabricatorHandle handle = nullptr;
 	//! Schema entry to register the new table in (so it appears in the catalog).
 	optional_ptr<FabricatorSchemaEntry> schema_entry;
