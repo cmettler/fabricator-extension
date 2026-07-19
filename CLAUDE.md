@@ -261,10 +261,16 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   Delta append via `BackendRegistry.Resolve("delta").OpenCatalog` transient catalog / parquet =
   new file COPY — a capability SQL Server itself lacks; DuckDB s3 secret resolved by bucket scope,
   its ENDPOINT authoritative (SQL's LOCATION host is SQL's network view); autocommit-only + guards;
-  DROP routes to `DROP EXTERNAL TABLE`. **B** = `CREATE TABLE … WITH (location=…, table_type=
-  'DELTA'|'PARQUET' [, data_source=…, secret=…]) AS …` on the SQL provider: client-side write
-  (DELTA forced protocol-1.0 plain) + auto-provisioned MASTER KEY/credential/data source/file
-  format/external table — the `verify_mssql_s3_polybase` manual flow as one DDL.
+  DROP routes to `DROP EXTERNAL TABLE`. **D** = identity-keyed UPDATE/DELETE on detected external
+  Delta tables: a Delta IDENTITY column bridges the rowid domains (PolyBase-visible data column +
+  standard stats for pruned identity→position resolution on the Delta side, SNAPSHOT-INDEPENDENT —
+  the only sound bridge; the row-tracking `_metadata.row_id` can NOT serve this: the materialized
+  column is off-schema by spec + appends carry no physical id), rowid override → existing
+  `DeleteByRowIds`/`UpdateByRowIds`, CoW keeps protocol 1.0. **B** = `CREATE TABLE … WITH
+  (location=…, table_type='DELTA'|'PARQUET' [, data_source=…, secret=…]) AS …` on the SQL provider:
+  client-side write (DELTA forced protocol-1.0 plain; identity marker ALLOWED → slice-D-capable) +
+  auto-provisioned MASTER KEY/credential/data source/file format/external table — the
+  `verify_mssql_s3_polybase` manual flow as one DDL.
 - **`hilbert_index` global scalar — DONE (2026-07-18, C#-only, no ABI): the liquid-clustering-style
   ordered-write primitive.** `hilbert_index(coords BIGINT[], bits) → BIGINT` (Bridge
   `HilbertIndexFunction`, declared in `CustomFunctions.GlobalScalar` — the fabricator_render slot):

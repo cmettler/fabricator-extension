@@ -1,6 +1,6 @@
 # `CREATE TABLE … WITH (…)` options + SQL Server external tables (design)
 
-Status: **PLANNED, nothing built** (2026-07-19). Three slices, ordered A → C → B by value/risk.
+Status: **PLANNED, nothing built** (2026-07-19). Four slices, ordered A → C → D → B by value/risk.
 Origin: user request — DuckDB parses a `WITH (key='value', …)` clause on CREATE TABLE / CTAS
 (the Iceberg-style `WITH (location=…, table_type=…, format=…)` shape); we should surface those
 options to the C# providers to (1) set Delta TBLPROPERTIES + parquet write tuning per table,
@@ -167,8 +167,9 @@ No matching secret → clean error naming the URI.
 - **Statement-atomic, not txn-joined**: the storage write is its own Delta commit / parquet PUT and
   cannot roll back with a DuckDB transaction on the SQL catalog → **reject inside an explicit
   transaction** with a clean error (the SORTED_COLUMNS-in-txn precedent). Autocommit only, v1.
-- UPDATE / DELETE / ALTER on an external table: intercept with a clear error pointing at a direct
-  Delta ATTACH of the location (better than SQL Server's own error). 
+- UPDATE / DELETE on an external table WITHOUT an identity-keyed Delta target (see slice D), and
+  ALTER always: intercept with a clear error pointing at a direct Delta ATTACH of the location
+  (better than SQL Server's own error).
 - **DROP TABLE** on a detected external table emits `DROP EXTERNAL TABLE` (SQL Server rejects plain
   `DROP TABLE` for them) — metadata-only, data stays (document; no purge in v1).
 - Type risk: the external table's declared SQL types were mapped from the storage schema by whoever
@@ -181,6 +182,59 @@ our S3 table (existing flow) → `INSERT INTO db.dbo.ext_t VALUES …` through t
 read back via the external table AND OPENROWSET shows the new rows; the `_delta_log` gained exactly
 one append commit; parquet-format external table INSERT (new file, rows visible); explicit-txn
 rejection; DROP routes to `DROP EXTERNAL TABLE`; no-matching-secret error.
+
+---
+
+## Slice D — identity-keyed UPDATE/DELETE routing (extends C, C#-only, no ABI)
+
+Slice C scoped UPDATE/DELETE out because the rowid domains don't mix: the scan runs through SQL
+Server (its rowid = PK/unique/identity of a *SQL* table — an external table has none), while the
+Delta provider's DML wants its transient `(fileOrdinal << 40) | position` rowid, which only OUR
+scan of the Delta log can produce. **A Delta IDENTITY column dissolves this**: it is a real data
+column (PolyBase reads it — pinned), engine-assigned unique (HWM-tracked, OCC-safe), trivially
+stable across every rewrite (rewrites copy data verbatim), and it has **standard min/max stats in
+the Delta log** — so it is a cross-system key both sides can see and the Delta side can prune on.
+
+### Mechanism
+
+- **Detection** (rides the slice-C external-info probe): when the external table's Delta target
+  declares an identity column (`delta.identity.*` field metadata on a BIGINT column, read via one
+  cached `DeltaReader.GetSchema`), the entry advertises that column as its **rowid**
+  (`GetMetadata(RowId)` override — the same identity-as-rowid shape regular SQL tables already
+  use, so zero new C++ plumbing; the scan serves it as a normal projected column through PolyBase).
+- **`ExecuteDelete(rowids)`** (rowids = identity values): resolve identity → transient rowid on
+  the Delta side with a chunked pruned scan (`WHERE <id> IN (…)` → `StreamWithRowIds` projecting
+  the identity column; file skipping via the identity column's standard stats — the reason identity
+  is the right key), then the existing `DeleteByRowIds*` (DV or CoW per table config; the
+  PolyBase-recipe table is DV-off → CoW → stays protocol-1.0 readable, pinned). One Delta commit
+  per statement.
+- **`ExecuteUpdate(rowids, values)`**: same resolution keyed per row (identity → position), then
+  `UpdateByRowIds` with the post-images. SET of the identity column itself is rejected
+  (engine-assigned).
+- **Why this is semantically SOUND, not just convenient**: identity values are
+  **snapshot-independent** — the SQL-side scan and the Delta-side DML do not need to agree on a
+  version (unlike transient rowids, which are only valid within one snapshot). A row concurrently
+  deleted between scan and DML simply matches nothing; the per-statement OCC retry is safe, exactly
+  like identity appends. Bridging *position* rowids across the two systems would never have been
+  correct; bridging identity is.
+
+### Guards + trust
+
+- No identity column on the Delta target → UPDATE/DELETE stay rejected (slice C's error, now
+  pointing at "declare an IDENTITY column or use a direct Delta ATTACH").
+- Autocommit-only, statement-atomic (slice C semantics); explicit-txn rejection.
+- Trust assumption: identity uniqueness relies on all writers honoring the HWM (Spark + us do); a
+  rogue writer's duplicate would make the DML affect all duplicates — documented, same trust class
+  as any engine-assigned key.
+
+### Tests
+
+Extend the polybase suite: create the S3 Delta table WITH an identity marker → external table →
+`UPDATE db.dbo.ext_t SET x=… WHERE id=…` and `DELETE … WHERE …` through the ATTACHed catalog →
+OPENROWSET/external-table read shows the post-DML state exactly (CoW keeps protocol 1.0 — reuse
+the §5 pins); multi-row + chunked (large IN) DML; SET-identity rejection; no-identity table still
+rejects; concurrent-delete race (second connection removes a row between scan and DML → statement
+succeeds, row simply absent).
 
 ---
 
@@ -229,7 +283,14 @@ AS SELECT …;
   PARQUET → **rejected** (no file; SQL errors on an empty location anyway).
 - `CREATE OR REPLACE`: v1 **rejected** (follow-up: overwrite data + recreate the external DDL).
 - External DDL inside a user transaction is restricted by SQL Server → reject in explicit txn.
-- IDENTITY / PK / DEFAULT clauses: rejected in combination with `location` (external tables carry none).
+- PK / UNIQUE / DEFAULT clauses: rejected in combination with `location` (external tables carry none).
+- **The IDENTITY marker (`id BIGINT AS (0)`) IS allowed with `location` + `table_type='DELTA'`** —
+  it becomes a Delta identity column (writer-only, reader stays v1) and the external table declares
+  the column as plain BIGINT (SQL external tables can't carry IDENTITY and don't need to). This is
+  the recommended create shape: it makes the table **slice-D DML-capable** (identity-keyed
+  UPDATE/DELETE) and gives PolyBase a visible stable row identifier (`_metadata.row_id` itself is
+  unreachable there — the materialized row-tracking column is off-schema by spec and appends carry
+  no physical id at all). Rejected for `table_type='PARQUET'` (no engine to assign values).
 
 ### Tests
 
@@ -242,8 +303,9 @@ PARQUET create, missing secret).
 ## Execution order + gates
 
 1. **A** — ABI v67 + Delta options (self-contained; gate: `verify_with_options` + the regression list).
-2. **C** — detection + routing (no ABI; gate: extended `verify_mssql_s3_polybase` + SQL suites).
-3. **B** — CETAS-analog DDL (gate: `verify_mssql_external_create` + polybase suite).
+2. **C** — detection + INSERT routing (no ABI; gate: extended `verify_mssql_s3_polybase` + SQL suites).
+3. **D** — identity-keyed UPDATE/DELETE (small once C exists; gate: the polybase DML sections).
+4. **B** — CETAS-analog DDL (gate: `verify_mssql_external_create` + polybase suite).
 
 Each slice ships independently; commit per slice (session convention).
 
@@ -265,6 +327,8 @@ Each slice ships independently; commit per slice (session convention).
 ## Out of scope (documented, not built)
 
 `table_type='ICEBERG'` (no writer); CETAS-by-SQL-Server (SQL exporting parquet itself — our client-side
-write is strictly more capable, Delta included); UPDATE/DELETE routed to storage (rowid domains don't
-mix — use a direct Delta ATTACH); reading external tables via storage instead of SQL Server (reads stay
+write is strictly more capable, Delta included); UPDATE/DELETE on external tables WITHOUT an identity
+column (position rowids are snapshot-bound and can't bridge the two systems — slice D's identity key is
+the only sound bridge; use a direct Delta ATTACH otherwise); UPDATE/DELETE on PARQUET-format external
+tables (no log, no DML semantics); reading external tables via storage instead of SQL Server (reads stay
 SQL-side by design); `location` on the Delta provider; deltars participation.
