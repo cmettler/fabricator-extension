@@ -2486,12 +2486,13 @@ SELECT id, v FROM mu.main.u ORDER BY id;
 2	B
 3	c
 
-# both files carry the materialized column (the autocommit codec seed materializes via EW's
-# committing writer; the post-image bakes the ORIGINAL ids)
+# Only the post-image file carries the materialized column (EW master shape: a fresh APPEND — the
+# autocommit seed — materializes nothing, readers derive baseRowId + position; the buffered UPDATE's
+# post-image bakes the ORIGINAL ids so identity survives the rewrite).
 query I
 SELECT count(DISTINCT file_name) FROM parquet_schema('${FABRICATOR_DELTA_WRITE_DIR}/txn_mat/u/*.parquet') WHERE name = '__delta_row_id';
 ----
-2
+1
 
 # the baked id is the ORIGINAL stable id of row 2 (seed file baseRowId=0 -> position 1)
 query I

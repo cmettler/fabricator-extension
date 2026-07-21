@@ -19,13 +19,13 @@ ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/matrt' AS lake (TYPE fabricator, PROVIDER 
 statement ok
 CREATE TABLE lake.main.t AS SELECT i AS id, 'v' || i AS v FROM range(1, 4) AS r(i);
 
-# Baseline: the create file materializes __delta_row_id = base_row_id + position (0,1,2).
-query II
-SELECT id, "__delta_row_id" FROM read_parquet('${FABRICATOR_DELTA_WRITE_DIR}/matrt/t/*.parquet', union_by_name=true) ORDER BY id;
+# Baseline (EW master shape): a fresh APPEND materializes NOTHING — readers derive each row's id as
+# baseRowId + position, so the create file carries no physical __delta_row_id column. Only a REWRITE
+# (the merge-on-read post-image below) bakes the column, to preserve the ORIGINAL ids.
+query I
+SELECT count(*) FROM parquet_schema('${FABRICATOR_DELTA_WRITE_DIR}/matrt/t/*.parquet') WHERE name = '__delta_row_id';
 ----
-1	0
-2	1
-3	2
+0
 
 # Merge-on-read UPDATE of id=2: DV-deletes the old row 2, appends the post-image row carrying its ORIGINAL id.
 statement ok

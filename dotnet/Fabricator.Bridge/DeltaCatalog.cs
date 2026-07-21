@@ -2586,10 +2586,11 @@ public sealed class DeltaCatalog : IBackendCatalog
         {
             // slice C2: the deleted rows' CONTENT goes into an eager _change_data file (the position set
             // parked below has no row values; this is the one extra read CDF costs a buffered DELETE).
-            // Fully STREAMING: read-back -> drop rowid -> per-batch cdc write, one batch in flight — a
-            // huge CDF DELETE never materializes its matched rows.
+            // Fully STREAMING: read-back -> per-batch cdc write, one batch in flight — a huge CDF DELETE
+            // never materializes its matched rows. (EW master's read-back already yields USER columns
+            // only — no trailing rowid to drop.)
             WriteCdcFiles(delOpener, path, pending,
-                DropRowIdStreaming(DeltaReader.ReadRowsByRowIds(delOpener, path, ids, default,
+                DisposeAfterUse(DeltaReader.ReadRowsByRowIds(delOpener, path, ids, default,
                     atVersion: pending.PinnedVersion)),
                 "delete");
         }
@@ -2679,13 +2680,9 @@ public sealed class DeltaCatalog : IBackendCatalog
 
         var fields = userSchema.FieldsList;
         // Pending ALTER: the read-back batches carry only the COMMITTED columns — reconcile each to the
-        // pending shape (+ trailing rowid) so the substitution loop's positional indexing aligns.
-        Schema? readTarget = null;
-        if (pending.PendingMetadata is not null)
-        {
-            readTarget = new Schema(
-                new List<Field>(fields) { new Field(RowIdColumn, Int64Type.Default, nullable: false) }, null);
-        }
+        // pending shape so the substitution loop's positional indexing aligns. (EW master's read-back
+        // yields USER columns only; the rowid correlation key rides the rowIdsOut out-param.)
+        Schema? readTarget = pending.PendingMetadata is not null ? userSchema : null;
         if (profile.CdfEnabled && pending.PendingMetadata is not null)
         {
             throw new System.NotSupportedException(
@@ -2710,13 +2707,15 @@ public sealed class DeltaCatalog : IBackendCatalog
         // The rowids' ordinals are PINNED-version path-sort positions — read back AT that version so a
         // concurrent commuting append (which shifts the ordering) can never make us read the wrong files.
         int rbIdx = -1;
+        var ridsPerBatch = new List<Int64Array>();
         foreach (var raw in DeltaReader.ReadRowsByRowIds(opener, path, updates.Keys, default,
-                     atVersion: pending.PinnedVersion, sourceTrackingOut: srcTracking))
+                     atVersion: pending.PinnedVersion, sourceTrackingOut: srcTracking,
+                     rowIdsOut: ridsPerBatch))
         {
             rbIdx++;
             var batch = readTarget is null ? raw : ReconcileBatch(raw, readTarget, CommittedToPending(pending));
-            preImages?.Add(DropTrailingRowId(batch));
-            var rids = (Int64Array)batch.Column(batch.ColumnCount - 1);
+            preImages?.Add(batch);
+            var rids = ridsPerBatch[rbIdx];
             var newCols = new IArrowArray[fields.Count];
             for (int c = 0; c < fields.Count; c++)
             {
@@ -2812,10 +2811,9 @@ public sealed class DeltaCatalog : IBackendCatalog
 
     // Eager CDC capture (slice C2): write the _change_data file(s) for a buffered statement NOW — the
     // rows are in hand exactly here — and park only the CdcFile actions (they fuse into the
-    // transaction's single commit; ROLLBACK leaves them as invisible orphans).
-    // NOTE (EW master): WriteChangeDataFileAsync writes ONE file per call with caller-supplied
-    // partitionValues (the fork's per-partition split inside EW is gone) — partitioned CDF tables are
-    // re-guarded to autocommit until the Bridge splits the change rows itself.
+    // transaction's single commit; ROLLBACK leaves them as invisible orphans). The plural
+    // WriteChangeDataFilesAsync splits per partition (data-file convention), so partitioned CDF tables
+    // work too.
     private void WriteCdcFiles(nint opener, string tablePath, DeltaTxnBuffer.PendingAppends pending,
                                IEnumerable<RecordBatch> rows, string changeType)
         => WriteCdcFilesAsync(opener, tablePath, pending, rows, changeType).GetAwaiter().GetResult();
@@ -2837,21 +2835,10 @@ public sealed class DeltaCatalog : IBackendCatalog
                 {
                     continue;
                 }
-                if (table is null)
-                {
-                    table = await EngineeredWood.DeltaLake.Table.DeltaTable
-                        .OpenAsync(TableFileSystems.Create(opener, tablePath), DeltaWriter.Options(), token)
-                        .ConfigureAwait(false);
-                    if (table.CurrentSnapshot.Metadata.PartitionColumns is { Count: > 0 })
-                    {
-                        throw new System.NotSupportedException(
-                            "delta: change-data-feed capture on a PARTITIONED table is not supported inside "
-                            + "an explicit transaction on this engine version — run the statement in "
-                            + "autocommit (the direct DML paths capture partitioned CDC).");
-                    }
-                }
-                pending.PendingCdc.Add(await table.WriteChangeDataFileAsync(
-                        b, changeType, cancellationToken: token)
+                table ??= await EngineeredWood.DeltaLake.Table.DeltaTable
+                    .OpenAsync(TableFileSystems.Create(opener, tablePath), DeltaWriter.Options(), token)
+                    .ConfigureAwait(false);
+                pending.PendingCdc.AddRange(await table.WriteChangeDataFilesAsync(b, changeType, token)
                     .ConfigureAwait(false));
             }
         }
@@ -2864,37 +2851,22 @@ public sealed class DeltaCatalog : IBackendCatalog
         }
     }
 
-    // Streams the read-back through DropTrailingRowId, disposing each source batch once the consumer has
-    // moved past its derived batch (the derived batch ALIASES the source columns, so the source must stay
-    // alive until the consumer pulls the next item; enumerator disposal covers early termination).
-    private static IEnumerable<RecordBatch> DropRowIdStreaming(IEnumerable<RecordBatch> source)
+    // Streams the read-back, disposing each source batch once the consumer has moved past it
+    // (the finally runs when the consumer pulls the next item; enumerator disposal covers early
+    // termination) — keeps a huge streaming read at one batch in flight.
+    private static IEnumerable<RecordBatch> DisposeAfterUse(IEnumerable<RecordBatch> source)
     {
         foreach (var raw in source)
         {
             try
             {
-                yield return DropTrailingRowId(raw);
+                yield return raw;
             }
             finally
             {
                 raw.Dispose();
             }
         }
-    }
-
-    // The rowid-carrying read-back batches end with the virtual _metadata.row_id column — the CDC rows
-    // must not include it.
-    private static RecordBatch DropTrailingRowId(RecordBatch b)
-    {
-        int n = b.ColumnCount - 1;
-        var fields = new List<Field>(n);
-        var cols = new List<IArrowArray>(n);
-        for (int i = 0; i < n; i++)
-        {
-            fields.Add(b.Schema.FieldsList[i]);
-            cols.Add(b.Column(i));
-        }
-        return new RecordBatch(new Schema(fields, b.Schema.Metadata), cols, b.Length);
     }
 
     // Eager-write plan, slice C1: write a statement's collected batches to data file(s) NOW (EW's codec
