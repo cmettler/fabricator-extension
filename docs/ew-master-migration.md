@@ -1,6 +1,26 @@
 # Migration: re-pin fabricator onto clast-project/engineered-wood master
 
-Branch: `migrate/ew-clast-master` (off `main`). Status: **scoped, not started** (2026-07-21).
+Branch: `migrate/ew-clast-master` (off `main`). Status: **compile stage DONE (2026-07-21) — sweep running.**
+
+## Compile-stage outcome (supersedes the dry-compile inventory below)
+
+The dry compile had been SHALLOW — the real build surfaced 8 causes, 3 of which needed **additive EW
+patches** (the anticipated "fabricator patches on top of clast master" model). EW branch
+**`fabricator-patches`** (= `e48f449` + 2 commits, local): `0bfd020` DeltaFilePruner → public;
+`6ddfcc1` CreateAsync/OpenOrCreateAsync gain `configuration` (merged into commit-0, `delta.enable*`
+keys enable + declare their features — incl. NEW inCommitTimestamp/changeDataFeed derivation) +
+`preAssignedSchema` (buffered-CTAS pre-assigned mapping) + OpenOrCreate gains `columnMappingMode`;
+and WriteDataFilesAsync gains `materializedRowIds` (buffered-UPDATE stable-id bake, attached under the
+DECLARED materialized column name, nullable — master's convention). EW Table.Tests 411/411 +
+DeltaLake.Tests 210/210 green on the branch. Bridge-side (fabricator `d17db9a`): rewriter removal per
+guide §1 (+ the UPDATE SQL-join substitution block deleted — EW's rewriteFile callback is the path;
+the `UpdateByRowIdsAsync(RecordBatch updates)` host-join overload is a follow-up), UPDATE loses
+`rowLevelRetry` (master CoW UPDATE aborts on conflict; DV DELETE keeps it), writer seam →
+IAsyncEnumerable (first-batch peek + stream), **`VariantMarker`** (Bridge-owned `fabricator.variant`
+detector — master models variant as canonical `VariantType`, so the blob⇄struct TRANSPORT at the EW
+boundary is an OPEN follow-up; expect verify_delta_catalog_variant red), WriteChangeDataFileAsync →
+single CdcFile (buffered CDC on PARTITIONED tables re-guarded to autocommit — the fork's in-EW split
+is gone), NoWarn EWDELTA0001/EWPARQUET0002 (fabricator IS the in-tree impl of the Experimental seams).
 Authoritative upstream guide: `engineered-wood@e48f449:doc/pr4-to-master-migration.md` — written by Curt
 FOR fabricator, with a 7-step checklist. This doc = the fabricator-side state + scoping results.
 
@@ -13,10 +33,47 @@ buffered-transaction seam (M-A..M-D3 incl. `SetSchemaAsync`), rowid DML with our
 overloads (one source-compatible with our callback; one takes a RecordBatch of rowid+SET columns),
 nested-field ALTER, CDF spec-conformance. The fork/adapter strategy is dead; direct retarget is on.
 
+## Runtime-triage outcome (2026-07-21, sweep rounds 1–5) — near-complete
+
+EW `fabricator-patches` grew to **e48f449 + 4 commits** (`0bfd020` pruner public / `6ddfcc1` create-config
++ preAssignedSchema + materializedRowIds / `2007c39` rowIdsOut + derived-id fallback + CoW-CDF capture +
+plural `WriteChangeDataFilesAsync` + DV-aware CDF inference / `7981487` schema-evolved-compaction fixes:
+name-matched `WidenBatch` [positional pairing RELABELED one column's data as another's — silent-corruption
+class], per-batch reconcile in `CompactionExecutor`, rename-only array reuse in `ColumnMappingRecursive`).
+EW Table.Tests 412/412 + DeltaLake.Tests 210/210. Bridge rounds (fabricator `bb10e5b` + `5c0e7e3` + this):
+decimal widening via master's `DecimalOutput=Decimal128` read option centralized in
+`DeltaWriter.ReadOptions()` (narrow Decimal32/64 corrupt the Arrow C crossing — the 10.4<>1.5 class, hit
+~20 suites); UPDATE moved to the host-join `UpdateByRowIdsAsync(RecordBatch)`; **composed merge-on-read
+UPDATE** from master's primitives (DV-delete compute + post-image `WriteDataFilesAsync` with original ids
++ CDF pre/post capture + one fused `CommitDataFilesAsync`) — restores the fork's MoR shape, feed
+exactness, and id preservation; read-backs re-keyed on `rowIdsOut` (master yields NO trailing rowid
+column — the old blind last-column drop was silently removing a USER column from CDC capture); two pins
+updated to the master append shape (appends materialize nothing — readers derive baseRowId+position).
+
+**Green at full fork counts**: transactions 941, row_tracking_virtual 299, column_mapping 251, s3 161,
+native_write 147, alter 116, nested_alter 100, copy_format 109?/…, partition_overwrite 90, changes 73,
+update 63, dv_default 58, clustered_optimize 138, late_materialization 57, identity, temporal, decimal,
+struct_filter, optimize 40, materialize 12 (reshaped), … (final sweep = the authoritative list).
+
+**Open (2 workstreams, designs known):**
+1. **Variant transport** — master models variant as canonical `VariantType` (`arrow.parquet.variant`,
+   struct storage); the C++ boundary needs the LEAF-blob `fabricator.variant` form (canonical struct
+   crashes DuckDB's `ArrowAppender::FinalizeChild`; name collides with built-in handlers).
+   verify_delta_catalog_variant: 69/70 then SIGSEGV at the ABI crossing. Fix = port the fork's
+   `VariantTransport` semantics keyed on the marker (blob⇄`VariantArray` at EW's write/read boundary,
+   `FromArrowField` marker→"variant"), implemented over master's own VariantArray utilities — an EW
+   `fabricator-patches` commit, or discuss with Curt whether the marker-aware transport belongs upstream.
+2. **Row-level rebase across rewrites** — master's buffered flush aborts (clean
+   `DeltaConflictException`, correctness preserved) where the fork's v1/v2 rebased (`RebaseDvDmlActions`
+   row-disjoint re-union exists; the `RemapRowsAcrossRewriteAsync` stable-id remap across a concurrent
+   OPTIMIZE/CoW does not). verify_delta_row_level_concurrency: 30/31, failing §(buffered DML through a
+   concurrent compaction). Options: pin the abort (capability regression vs the fork's beyond-Databricks
+   arc) or port the remap as the next upstream proposal (pairs naturally with the parked `_metadata` RFC).
+
 ## Branch / working-tree state
 - fabricator: `migrate/ew-clast-master` (this branch). `main` clean; the committed submodule pin is
   STILL `99e2c3a` (our fork) — **do not move the pin (or .gitmodules) until the full sweep is green**.
-- EW submodule working tree: local branch `clast-master` = `upstream/master` (`e48f449`).
+- EW submodule working tree: local branch **`fabricator-patches`** (= `upstream/master` e48f449 + 4).
   ⚠ While on this branch the tree ≠ the pin — `main` builds only after `git -C engineered-wood checkout master`.
 - Parked EW branches (pushed to cmettler fork): `proto/metadata-dml` (`0db9507` — the _metadata RFC +
   prototype, revisit post-migration), `fix/vacuum-dv-orphans` (`1ecf28d` — fork-only; master's vacuum is
