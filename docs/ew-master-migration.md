@@ -57,9 +57,18 @@ changes 73, row_level 74 (with the abort pins), update 63, verify_delta 60, dv_d
 late_materialization 57, txn_version 51, + every other delta suite. Cross-provider spot-check green:
 **verify_mssql_s3_polybase 252/252** (the SQL-Server↔S3-Delta full circle — protocol-1.0 CoW DML now
 WITH CDF capture, identity slices, external-table DDL), with_options 68, SQL function suites
-(scalar 26 / custom 89 / table 33 / procs 24 / global 63). Remaining before the pin move: the variant
-transport port; live OneLake/Spark spot-checks; push `fabricator-patches` to the fork (explicit
-"ew push" authorization) so the pin is fetchable.
+(scalar 26 / custom 89 / table 33 / procs 24 / global 63).
+
+**`fabricator-patches` IS PUSHED to the fork** (cmettler/engineered-wood, branch `fabricator-patches`
+@ `7981487`) — the pin-move target is fetchable. Remaining before the pin move: the VARIANT TRANSPORT
+port (next session: port the fork's `VariantTransport` — `git show 99e2c3a:src/EngineeredWood.DeltaLake.Table/VariantTransport.cs`,
+316 lines — onto master's VariantType/extension-registry flow as another fabricator-patches commit:
+marker-tagged blob ⇄ VariantArray at WriteCoreAsync/ProcessFileBatchesAsync, `FromArrowField`
+marker→"variant"; gate = verify_delta_catalog_variant 133 + master's own VariantInteropTests);
+live OneLake/Spark spot-checks; then the pin/gitlink move + CLAUDE.md rewrite (EW workflow + the
+superseded fork-era notes). Upstream-discussion bundle for Curt = the fabricator-patches branch +
+the design questions recorded here (booleans-vs-configuration on CreateAsync; a separate entry point
+for preAssignedSchema; the buffered remap-across-rewrite follow-up).
 
 **Open (2 workstreams, designs known):**
 1. **Variant transport** — master models variant as canonical `VariantType` (`arrow.parquet.variant`,
