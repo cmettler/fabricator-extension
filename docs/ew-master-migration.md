@@ -50,10 +50,16 @@ exactness, and id preservation; read-backs re-keyed on `rowIdsOut` (master yield
 column — the old blind last-column drop was silently removing a USER column from CDC capture); two pins
 updated to the master append shape (appends materialize nothing — readers derive baseRowId+position).
 
-**Green at full fork counts**: transactions 941, row_tracking_virtual 299, column_mapping 251, s3 161,
-native_write 147, alter 116, nested_alter 100, copy_format 109?/…, partition_overwrite 90, changes 73,
-update 63, dv_default 58, clustered_optimize 138, late_materialization 57, identity, temporal, decimal,
-struct_filter, optimize 40, materialize 12 (reshaped), … (final sweep = the authoritative list).
+**FINAL SWEEP (2026-07-21): 48/49 delta files green, variant the ONLY red.** Full fork counts:
+transactions 941, row_tracking_virtual 299, column_mapping 251, s3 161, native_write 147,
+clustered_optimize 138, alter 116, nested_alter 100, copy_format 109, partition_overwrite 90,
+changes 73, row_level 74 (with the abort pins), update 63, verify_delta 60, dv_default 58,
+late_materialization 57, txn_version 51, + every other delta suite. Cross-provider spot-check green:
+**verify_mssql_s3_polybase 252/252** (the SQL-Server↔S3-Delta full circle — protocol-1.0 CoW DML now
+WITH CDF capture, identity slices, external-table DDL), with_options 68, SQL function suites
+(scalar 26 / custom 89 / table 33 / procs 24 / global 63). Remaining before the pin move: the variant
+transport port; live OneLake/Spark spot-checks; push `fabricator-patches` to the fork (explicit
+"ew push" authorization) so the pin is fetchable.
 
 **Open (2 workstreams, designs known):**
 1. **Variant transport** — master models variant as canonical `VariantType` (`arrow.parquet.variant`,
