@@ -43,24 +43,54 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
     /// engineered-wood writer otherwise.</summary>
     internal static bool Available => Host.CanQuery;
 
-    public ValueTask<long> WriteAsync(IReadOnlyList<RecordBatch> batches, string relativePath,
-                                      CancellationToken cancellationToken)
+    public async ValueTask<long> WriteAsync(IAsyncEnumerable<RecordBatch> batches, string relativePath,
+                                            CancellationToken cancellationToken)
     {
-        if (batches.Count == 0)
+        // Peek the FIRST batch — the COPY needs the schema up front (projection + FIELD_IDS) — then stream the
+        // rest through unchanged (the dataset never materializes here; a streaming caller stays streaming).
+        // The stream never disposes the batches (the C export doesn't free managed buffers), so a caller that
+        // holds them for its own stats collection is unaffected. A column-mapping rewrite/compaction hands us
+        // batches engineered-wood already annotated with `PARQUET:field_id` (via SetParquetFieldIds); DuckDB's
+        // COPY does NOT read Arrow field metadata, so lift those ids into an explicit FIELD_IDS clause — else
+        // the native-written file would lose its field ids and an id-mode reader couldn't map it.
+        var e = batches.GetAsyncEnumerator(cancellationToken);
+        RecordBatch first;
+        try
         {
-            throw new InvalidOperationException("native delta write: no batches to write");
+            if (!await e.MoveNextAsync().ConfigureAwait(false))
+            {
+                throw new InvalidOperationException("native delta write: no batches to write");
+            }
+            first = e.Current;
         }
-        // Bind the batches as a fresh Arrow stream (the host dequeues + exports each; InMemoryArrayStream only
-        // disposes UNdequeued batches, and the C export doesn't free managed buffers — so the caller's batches
-        // stay valid for its subsequent stats collection). One parquet file is written from the whole stream.
-        // A column-mapping rewrite/compaction hands us batches engineered-wood already annotated with
-        // `PARQUET:field_id` (via SetParquetFieldIds); DuckDB's COPY does NOT read Arrow field metadata, so lift
-        // those ids into an explicit FIELD_IDS clause — else the native-written file would lose its field ids and
-        // an id-mode reader couldn't map it.
-        var src = new InMemoryArrayStream(batches[0].Schema, batches);
+        catch
+        {
+            await e.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+        var src = new AsyncEnumerableArrowStream(first.Schema, FirstThenRest(first, e));
         var (_, size, _) = RunCopy(_writableRoot, relativePath, src, cancellationToken,
-                                   fieldIds: FieldIdsFromMetadata(batches[0].Schema), spec: _spec);
-        return new ValueTask<long>(size);
+                                   fieldIds: FieldIdsFromMetadata(first.Schema), spec: _spec);
+        return size;
+    }
+
+    // Re-chains the peeked first batch ahead of the remaining enumerator; the finally disposes the
+    // enumerator (running the source enumerable's own finally) at drain or stream teardown.
+    private static async IAsyncEnumerable<RecordBatch> FirstThenRest(
+        RecordBatch first, IAsyncEnumerator<RecordBatch> rest)
+    {
+        try
+        {
+            yield return first;
+            while (await rest.MoveNextAsync().ConfigureAwait(false))
+            {
+                yield return rest.Current;
+            }
+        }
+        finally
+        {
+            await rest.DisposeAsync().ConfigureAwait(false);
+        }
     }
 
     // Renders the resolved write tuning as native COPY options. COMPRESSION/ROW_GROUP_SIZE are DuckDB parquet

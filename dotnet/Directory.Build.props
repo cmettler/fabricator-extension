@@ -12,6 +12,10 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- engineered-wood (clast master) marks the codec seams (IDataFileWriter/IDataFileReader +
+         DeltaTableOptions.DataFileWriter/Reader) [Experimental("EWDELTA0001")] — fabricator IS the
+         in-tree implementation of those seams, so opt in deliberately. -->
+    <NoWarn>$(NoWarn);EWDELTA0001;EWPARQUET0002</NoWarn>
     <!-- The managed bridge is loaded in-process by a native host; it has no
          managed entry point of its own. -->
     <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == '' and $([MSBuild]::IsOSPlatform('Windows'))">win-x64</RuntimeIdentifier>

@@ -1515,7 +1515,7 @@ public sealed class DeltaCatalog : IBackendCatalog
 
     private static bool FieldHasVariant(Field field)
     {
-        if (EngineeredWood.DeltaLake.Schema.SchemaConverter.IsVariantArrowField(field))
+        if (VariantMarker.IsVariantArrowField(field))
         {
             return true;
         }
@@ -1548,10 +1548,10 @@ public sealed class DeltaCatalog : IBackendCatalog
     private static bool TypeHasVariant(Apache.Arrow.Types.IArrowType type) => type switch
     {
         StructType st => st.Fields.Any(FieldHasVariant),
-        ListType lt => EngineeredWood.DeltaLake.Schema.SchemaConverter.IsVariantArrowField(lt.ValueField)
+        ListType lt => VariantMarker.IsVariantArrowField(lt.ValueField)
                        || TypeHasVariant(lt.ValueDataType),
-        MapType mt => EngineeredWood.DeltaLake.Schema.SchemaConverter.IsVariantArrowField(mt.KeyField)
-                      || EngineeredWood.DeltaLake.Schema.SchemaConverter.IsVariantArrowField(mt.ValueField)
+        MapType mt => VariantMarker.IsVariantArrowField(mt.KeyField)
+                      || VariantMarker.IsVariantArrowField(mt.ValueField)
                       || TypeHasVariant(mt.KeyField.DataType) || TypeHasVariant(mt.ValueField.DataType),
         _ => false,
     };
@@ -2812,8 +2812,10 @@ public sealed class DeltaCatalog : IBackendCatalog
 
     // Eager CDC capture (slice C2): write the _change_data file(s) for a buffered statement NOW — the
     // rows are in hand exactly here — and park only the CdcFile actions (they fuse into the
-    // transaction's single commit; ROLLBACK leaves them as invisible orphans). Partitioned tables split
-    // per partition inside WriteChangeDataFileAsync (partition columns excluded from the cdc bytes).
+    // transaction's single commit; ROLLBACK leaves them as invisible orphans).
+    // NOTE (EW master): WriteChangeDataFileAsync writes ONE file per call with caller-supplied
+    // partitionValues (the fork's per-partition split inside EW is gone) — partitioned CDF tables are
+    // re-guarded to autocommit until the Bridge splits the change rows itself.
     private void WriteCdcFiles(nint opener, string tablePath, DeltaTxnBuffer.PendingAppends pending,
                                IEnumerable<RecordBatch> rows, string changeType)
         => WriteCdcFilesAsync(opener, tablePath, pending, rows, changeType).GetAwaiter().GetResult();
@@ -2835,10 +2837,21 @@ public sealed class DeltaCatalog : IBackendCatalog
                 {
                     continue;
                 }
-                table ??= await EngineeredWood.DeltaLake.Table.DeltaTable
-                    .OpenAsync(TableFileSystems.Create(opener, tablePath), DeltaWriter.Options(), token)
-                    .ConfigureAwait(false);
-                pending.PendingCdc.AddRange(await table.WriteChangeDataFileAsync(b, changeType, token)
+                if (table is null)
+                {
+                    table = await EngineeredWood.DeltaLake.Table.DeltaTable
+                        .OpenAsync(TableFileSystems.Create(opener, tablePath), DeltaWriter.Options(), token)
+                        .ConfigureAwait(false);
+                    if (table.CurrentSnapshot.Metadata.PartitionColumns is { Count: > 0 })
+                    {
+                        throw new System.NotSupportedException(
+                            "delta: change-data-feed capture on a PARTITIONED table is not supported inside "
+                            + "an explicit transaction on this engine version — run the statement in "
+                            + "autocommit (the direct DML paths capture partitioned CDC).");
+                    }
+                }
+                pending.PendingCdc.Add(await table.WriteChangeDataFileAsync(
+                        b, changeType, cancellationToken: token)
                     .ConfigureAwait(false));
             }
         }
@@ -3623,63 +3636,6 @@ public sealed class DeltaCatalog : IBackendCatalog
         // the spec nested layout; pass-through columns read from data files are already physical and just get
         // their ids stamped.
 
-        // 2b. native_write: build the per-file-ordinal (position -> new SET values) Arrow view the native rewriter
-        //     LEFT JOINs against — so DuckDB applies the substitution in SQL and BuildArray is retired for the
-        //     supported shape. Keyed [__fabricator_pos:int64 ++ <set columns, canonical name+type>]. Built here (this
-        //     is where the boxed new values live); the rewriter binds it. Fallback (unsupported shape / no host
-        //     query) leaves rewriter null → engineered-wood reads + the rewriteFile callback substitutes in-process.
-        IDataFileRewriter? rewriter = null;
-        if (_nativeWrite && NativeParquetDataFileRewriter.Available)
-        {
-            var rowsByOrdinal = new Dictionary<int, List<KeyValuePair<long, object?[]>>>();
-            foreach (var kv in updates)
-            {
-                int ord = (int)(kv.Key >> RowIdPositionBits);
-                if (!rowsByOrdinal.TryGetValue(ord, out var list))
-                {
-                    list = new List<KeyValuePair<long, object?[]>>();
-                    rowsByOrdinal[ord] = list;
-                }
-                list.Add(kv);
-            }
-            var updatesByOrdinal = new Dictionary<int, RecordBatch>(rowsByOrdinal.Count);
-            long posMask = (1L << RowIdPositionBits) - 1;
-            foreach (var (ord, rows) in rowsByOrdinal)
-            {
-                var posBuilder = new Int64Array.Builder();
-                var colVals = new List<object?>[setColNames.Count];
-                for (int j = 0; j < setColNames.Count; j++)
-                {
-                    colVals[j] = new List<object?>(rows.Count);
-                }
-                foreach (var kv in rows)
-                {
-                    posBuilder.Append(kv.Key & posMask);
-                    for (int j = 0; j < setColNames.Count; j++)
-                    {
-                        colVals[j].Add(kv.Value[j]);
-                    }
-                }
-                var batchFields = new List<Field>(setColNames.Count + 1)
-                {
-                    new Field("__fabricator_pos", Int64Type.Default, nullable: false),
-                };
-                var batchArrays = new List<IArrowArray>(setColNames.Count + 1) { posBuilder.Build() };
-                for (int j = 0; j < setColNames.Count; j++)
-                {
-                    var field = setSlotField[j];
-                    batchArrays.Add(BuildArray(field.DataType, colVals[j]));
-                    // Keep the field metadata: the fabricator.variant transport marker types the bound view's
-                    // column as VARIANT in the host engine (else the CASE substitution mismatches BLOB/VARIANT).
-                    batchFields.Add(new Field(field.Name, field.DataType, nullable: true, field.Metadata));
-                }
-                var batchSchema = new Apache.Arrow.Schema(batchFields, null);
-                updatesByOrdinal[ord] = new RecordBatch(batchSchema, batchArrays, rows.Count);
-            }
-            var setColCanonical = setSlotField.Select(f => f.Name).ToList();
-            rewriter = new NativeParquetDataFileRewriter(path, userSchema, setColCanonical, updatesByOrdinal);
-        }
-
         // 3. Per-file copy-on-write: engineered-wood rewrites ONLY the files containing a matched row. For each
         //    such file it hands us (fileOrdinal, the file's batches in read order); we rebuild the SET columns
         //    on the matched positions (rowid = (ordinal << RowIdPositionBits) | positionInFile — same encoding
@@ -3714,7 +3670,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 outBatches.Add(new RecordBatch(userSchema, newCols, batch.Length));
             }
             return outBatches;
-        }, default, _nativeWrite, rewriter, _nativeRead, rowLevelRetry: !_serializable);
+        }, default, _nativeWrite, _nativeRead);
 
         _log.LogInformation("delta update {Schema}.{Table}: rows={Rows} set_cols={SetCols} native_write={Native}",
             schemaName, tableName, updates.Count, setColNames.Count, _nativeWrite);

@@ -383,7 +383,6 @@ internal static class DeltaWriter
     /// row-group size / bloom-filter columns) from the ATTACH options + the <c>delta_write_options</c> setting.</summary>
     internal static DeltaTableOptions Options(DeltaWriteSpec? spec = null,
                                               IDataFileWriter? dataFileWriter = null,
-                                              IDataFileRewriter? dataFileRewriter = null,
                                               IDataFileReader? dataFileReader = null) => DeltaTableOptions.Default with
     {
         ParquetWriteOptions = new ParquetWriteOptions
@@ -396,9 +395,9 @@ internal static class DeltaWriter
                 : null,
         },
         // native_write: DuckDB's parquet writer produces the data files; engineered-wood keeps the _delta_log.
+        // (The former IDataFileRewriter — DuckDB applying the DELETE/UPDATE transform in SQL — was dropped
+        // upstream: EW master owns the rewrite semantics via its rowid DML; only the encoding seams remain.)
         DataFileWriter = dataFileWriter,
-        // native_write rewrite: DuckDB's read_parquet reads the source + applies the DELETE/UPDATE transform in SQL.
-        DataFileRewriter = dataFileRewriter,
         // native_read: DuckDB's read_parquet decodes data files for the rewrite/compaction READ halves (raw
         // physical batches in file order) — with the writer, the full host codec pair (variant-preserving).
         DataFileReader = dataFileReader,

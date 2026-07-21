@@ -655,29 +655,25 @@ internal static class DeltaReader
         var fs = TableFileSystems.Create(opener, path);
         // Open with the standard WRITE options (OmitPathInSchema=false) so the copy-on-write rewrite emits
         // standard-readable parquet — DeltaTableOptions.Default would drop path_in_schema (TProtocolException).
-        // native_write => DuckDB's parquet writer produces the rewritten survivor file (bloom/stats/footer) AND
-        // DuckDB's read_parquet reads the source + drops the deleted positions (the rewriter, retiring the
-        // engineered-wood reader for the clean shape). native_read => the FALLBACK read half (shapes the rewriter
-        // is gated off for) also decodes through read_parquet (the IDataFileReader seam — variant-preserving).
-        // engineered-wood still selects the affected files, computes stats, and commits remove(old)+add(new).
+        // native_write => DuckDB's parquet writer produces the rewritten survivor file (bloom/stats/footer);
+        // native_read => the read half decodes through read_parquet (the IDataFileReader seam —
+        // variant-preserving). EW master owns the rewrite TRANSFORM itself (the former IDataFileRewriter —
+        // read + drop-positions in one host SQL — was dropped upstream); it still selects the affected files,
+        // computes stats, and commits remove(old)+add(new).
         var writer = nativeWrite && NativeParquetDataFileWriter.Available
             ? new NativeParquetDataFileWriter(path)
-            : null;
-        var rewriter = nativeWrite && NativeParquetDataFileRewriter.Available
-            ? new NativeParquetDataFileRewriter(path, await GetSchemaAsync(opener, path).ConfigureAwait(false))
             : null;
         var fileReader = nativeRead && NativeParquetDataFileReader.Available
             ? new NativeParquetDataFileReader(path)
             : null;
-        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(dataFileWriter: writer, dataFileRewriter: rewriter,
+        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(dataFileWriter: writer,
                                                                  dataFileReader: fileReader), token)
             .ConfigureAwait(false);
         try
         {
             long deleted = (await table.DeleteByRowIdsAsync(rowIds, token).ConfigureAwait(false)).RowsDeleted;
-            DmlLog.LogInformation("delta delete-rewrite {Path}: deleted={Deleted} writer={Writer} rewriter={Rewriter}",
-                path, deleted, writer is null ? "engineered-wood" : "native-duckdb",
-                rewriter is null ? "engineered-wood" : "native-duckdb");
+            DmlLog.LogInformation("delta delete-rewrite {Path}: deleted={Deleted} writer={Writer}",
+                path, deleted, writer is null ? "engineered-wood" : "native-duckdb");
             return deleted;
         }
         catch (DeltaConflictException)
@@ -1958,24 +1954,22 @@ internal static class DeltaReader
     /// them as plain remove+add with a clean schema. Opens with the standard write options (path_in_schema).</summary>
     public static void UpdateByRowIds(nint opener, string path, IReadOnlyCollection<long> rowIds,
         System.Func<long, IReadOnlyList<RecordBatch>, IReadOnlyList<RecordBatch>> rewriteFile, CancellationToken ct,
-        bool nativeWrite = false, IDataFileRewriter? rewriter = null, bool nativeRead = false,
-        bool rowLevelRetry = false)
-        => UpdateByRowIdsAsync(opener, path, rowIds, rewriteFile, ct, nativeWrite, rewriter, nativeRead, rowLevelRetry)
+        bool nativeWrite = false, bool nativeRead = false)
+        => UpdateByRowIdsAsync(opener, path, rowIds, rewriteFile, ct, nativeWrite, nativeRead)
             .GetAwaiter().GetResult();
 
     private static async Task UpdateByRowIdsAsync(nint opener, string path, IReadOnlyCollection<long> rowIds,
         System.Func<long, IReadOnlyList<RecordBatch>, IReadOnlyList<RecordBatch>> rewriteFile, CancellationToken ct,
-        bool nativeWrite, IDataFileRewriter? rewriter, bool nativeRead, bool rowLevelRetry)
+        bool nativeWrite, bool nativeRead)
     {
         using var interrupt = new InterruptScope(opener, ct);
         var token = interrupt.Token;
         var fs = TableFileSystems.Create(opener, path);
-        // native_write => DuckDB's parquet writer produces the rewritten file (bloom/stats/footer) AND, when the
-        // caller supplied a rewriter, DuckDB's read_parquet reads the source + applies the SET substitution via a
-        // LEFT JOIN (retiring the in-process BuildArray). EW still selects the affected files, computes stats, and
-        // commits remove(old)+add(new). Without a rewriter (unsupported shape) EW reads + the rewriteFile callback
-        // applies the substitution in-process — native_read routes THAT read through read_parquet too (the
-        // IDataFileReader seam), which also feeds the merge-on-read matched-row reads.
+        // native_write => DuckDB's parquet writer produces the rewritten file (bloom/stats/footer). EW reads the
+        // affected files + hands the batches to the rewriteFile callback (the in-process typed substitution);
+        // native_read routes THAT read through read_parquet (the IDataFileReader seam). EW master owns the
+        // rewrite semantics — the former IDataFileRewriter SQL-join substitution was dropped upstream, and its
+        // row-tracking id projection is obsolete (master preserves ids through rewrites itself).
         var writer = nativeWrite && NativeParquetDataFileWriter.Available
             ? new NativeParquetDataFileWriter(path)
             : null;
@@ -1983,7 +1977,7 @@ internal static class DeltaReader
             ? new NativeParquetDataFileReader(path)
             : null;
         var table = await DeltaTable.OpenAsync(fs,
-                DeltaWriter.Options(dataFileWriter: writer, dataFileRewriter: rewriter, dataFileReader: fileReader), token)
+                DeltaWriter.Options(dataFileWriter: writer, dataFileReader: fileReader), token)
             .ConfigureAwait(false);
         try
         {
@@ -2006,11 +2000,12 @@ internal static class DeltaReader
                     return inner(ordinal, logical);
                 };
             }
-            await table.UpdateByRowIdsAsync(rowIds, rewriteFile, token, rowLevelRetry: rowLevelRetry)
+            // NOTE (EW master): the CoW UPDATE has no row-level retry (the fork's rowLevelRetry rebase is
+            // gone) — a concurrent commit aborts with DeltaConflictException → the retry-the-statement error.
+            await table.UpdateByRowIdsAsync(rowIds, rewriteFile, token)
                 .ConfigureAwait(false);
-            DmlLog.LogInformation("delta update-rewrite {Path}: rowids={RowIds} writer={Writer} rewriter={Rewriter}",
-                path, rowIds.Count, writer is null ? "engineered-wood" : "native-duckdb",
-                rewriter is null ? "engineered-wood" : "native-duckdb");
+            DmlLog.LogInformation("delta update-rewrite {Path}: rowids={RowIds} writer={Writer}",
+                path, rowIds.Count, writer is null ? "engineered-wood" : "native-duckdb");
         }
         catch (DeltaConflictException ex)
         {

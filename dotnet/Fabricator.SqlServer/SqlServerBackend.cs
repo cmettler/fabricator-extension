@@ -2945,7 +2945,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 sb.Append(Quote(field.Name)).Append(IdentityClause(profile));
                 continue;
             }
-            if (EngineeredWood.DeltaLake.Schema.SchemaConverter.IsVariantArrowField(field))
+            if (VariantMarker.IsVariantArrowField(field))
             {
                 // A DuckDB VARIANT crosses the boundary as an fabricator.variant-tagged blob (the Delta
                 // provider's transport). Mapping it to VARBINARY would silently store opaque variant bytes —
