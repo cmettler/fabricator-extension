@@ -1,11 +1,12 @@
 # name: test/verify_delta_catalog_variant.test
 # description: VARIANT columns on the Delta catalog (docs/variant-support.md). VARIANT crosses the C++<->C#
 #              Arrow boundary as the fabricator.variant single-blob transport (metadata||value) via the Arrow
-#              type extension registered at load; the data files are written/read by DuckDB's OWN parquet
-#              writer/reader (annotated variant, shredding-capable) — so variant tables REQUIRE native_read +
-#              native_write (clean gate errors otherwise). The _delta_log declares the variantType
+#              type extension registered at load; EW (clast master) models variant as the canonical
+#              arrow.parquet.variant internally and converts at its host boundary (VariantTransport, selected
+#              by DeltaTableOptions.VariantTransportBlob). BOTH byte paths work: the native seams (DuckDB's
+#              parquet writer/reader, annotated + shredding) AND the pure EW codec — incl. codec REWRITES
+#              (UPDATE / OPTIMIZE), which the fork gated. The _delta_log declares the variantType
 #              reader+writer feature (reader v3 / writer v7); delta-kernel reads the result (validated).
-#              DV DELETE works (no data rewrite); UPDATE / CoW DELETE / OPTIMIZE are gated (clean errors).
 #              Set FABRICATOR_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
 # group: [fabricator]
 
@@ -204,12 +205,36 @@ SELECT count(*) FROM codecrw.main.cvt;
 ----
 2
 
-# Codec REWRITES stay gated by the engineered-wood backstop (only the plain write path is transformed;
-# rewrites need the host codec pair — use native_read+native_write for UPDATE/OPTIMIZE).
-statement error
+# Codec REWRITES work too (EW master's codec is variant-native; the transport converts at its
+# boundary) — the fork-era "not supported yet" gate is gone: UPDATE on the pure-codec catalog
+# (merge-on-read under the DV default) carries the variant value through the rewrite.
+statement ok
 UPDATE codecrw.main.cvt SET id = 9 WHERE id = 1;
+
+query IT
+SELECT id, v::VARCHAR FROM codecrw.main.cvt ORDER BY id;
 ----
-not supported yet
+2	NULL
+9	{'a': 1}
+
+# SET of the variant VALUE itself on the codec path.
+statement ok
+UPDATE codecrw.main.cvt SET v = {'via': 'codec'}::VARIANT WHERE id = 9;
+
+query T
+SELECT v::VARCHAR FROM codecrw.main.cvt WHERE id = 9;
+----
+{'via': codec}
+
+# ... and codec OPTIMIZE (bin-pack) preserves variant through the compaction rewrite.
+statement ok
+SELECT fabricator_exec('codecrw', 'OPTIMIZE main.cvt');
+
+query IT
+SELECT id, v::VARCHAR FROM codecrw.main.cvt ORDER BY id;
+----
+2	NULL
+9	{'via': codec}
 
 # ---- codec SHREDDING: a uniform column shreds on write (typed_value columns = the data-skipping form
 # spec readers exploit); an extra field rides the residual and merges back exactly on read.

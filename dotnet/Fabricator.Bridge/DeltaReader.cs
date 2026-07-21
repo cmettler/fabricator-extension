@@ -504,7 +504,9 @@ internal static class DeltaReader
         var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options()).ConfigureAwait(false);
         try
         {
-            return table.ArrowSchema;
+            // Variant fields cross the C ABI in the fabricator.variant LEAF-binary transport form (EW
+            // master advertises the canonical VariantType) — align the bind schema with the batches.
+            return VariantMarker.ToTransportSchema(table.ArrowSchema);
         }
         finally
         {
@@ -532,7 +534,7 @@ internal static class DeltaReader
             bool rowTracking = cfg is not null
                 && cfg.TryGetValue("delta.enableRowTracking", out var v)
                 && string.Equals(v, "true", System.StringComparison.OrdinalIgnoreCase);
-            return (table.ArrowSchema, rowTracking);
+            return (VariantMarker.ToTransportSchema(table.ArrowSchema), rowTracking);
         }
         finally
         {
@@ -912,7 +914,7 @@ internal static class DeltaReader
         try
         {
             var snap = await ResolveSnapshotAsync(table, unit, value, default).ConfigureAwait(false);
-            return snap.ArrowSchema;
+            return VariantMarker.ToTransportSchema(snap.ArrowSchema);
         }
         finally
         {

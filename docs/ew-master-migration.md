@@ -50,7 +50,8 @@ exactness, and id preservation; read-backs re-keyed on `rowIdsOut` (master yield
 column — the old blind last-column drop was silently removing a USER column from CDC capture); two pins
 updated to the master append shape (appends materialize nothing — readers derive baseRowId+position).
 
-**FINAL SWEEP (2026-07-21): 48/49 delta files green, variant the ONLY red.** Full fork counts:
+**FINAL SWEEP (2026-07-21): 48/49 delta files green, variant the ONLY red** (variant CLOSED in the
+follow-up session — see "Variant transport port" below; the sweep is now 49/49). Full fork counts:
 transactions 941, row_tracking_virtual 299, column_mapping 251, s3 161, native_write 147,
 clustered_optimize 138, alter 116, nested_alter 100, copy_format 109, partition_overwrite 90,
 changes 73, row_level 74 (with the abort pins), update 63, verify_delta 60, dv_default 58,
@@ -59,26 +60,81 @@ late_materialization 57, txn_version 51, + every other delta suite. Cross-provid
 WITH CDF capture, identity slices, external-table DDL), with_options 68, SQL function suites
 (scalar 26 / custom 89 / table 33 / procs 24 / global 63).
 
-**`fabricator-patches` IS PUSHED to the fork** (cmettler/engineered-wood, branch `fabricator-patches`
-@ `7981487`) — the pin-move target is fetchable. Remaining before the pin move: the VARIANT TRANSPORT
-port (next session: port the fork's `VariantTransport` — `git show 99e2c3a:src/EngineeredWood.DeltaLake.Table/VariantTransport.cs`,
-316 lines — onto master's VariantType/extension-registry flow as another fabricator-patches commit:
-marker-tagged blob ⇄ VariantArray at WriteCoreAsync/ProcessFileBatchesAsync, `FromArrowField`
-marker→"variant"; gate = verify_delta_catalog_variant 133 + master's own VariantInteropTests);
-live OneLake/Spark spot-checks; then the pin/gitlink move + CLAUDE.md rewrite (EW workflow + the
-superseded fork-era notes). Upstream-discussion bundle for Curt = the fabricator-patches branch +
-the design questions recorded here (booleans-vs-configuration on CreateAsync; a separate entry point
-for preAssignedSchema; the buffered remap-across-rewrite follow-up).
+**`fabricator-patches` IS PUSHED to the fork** (cmettler/engineered-wood; the variant-port commits of
+the follow-up session extend it — push on the next explicit "push"). The VARIANT TRANSPORT port is
+**DONE** (see the section below). Remaining before the pin move: live OneLake/Spark spot-checks; then
+the pin/gitlink move + CLAUDE.md rewrite (EW workflow + the superseded fork-era notes).
+Upstream-discussion bundle for Curt = the fabricator-patches branch + the design questions recorded
+here (booleans-vs-configuration on CreateAsync; a separate entry point for preAssignedSchema; the
+buffered remap-across-rewrite follow-up; whether the marker-keyed variant transport + the three
+relabeling/width codec fixes belong upstream — the narrow-int corruption certainly does).
 
-**Open (2 workstreams, designs known):**
-1. **Variant transport** — master models variant as canonical `VariantType` (`arrow.parquet.variant`,
-   struct storage); the C++ boundary needs the LEAF-blob `fabricator.variant` form (canonical struct
-   crashes DuckDB's `ArrowAppender::FinalizeChild`; name collides with built-in handlers).
-   verify_delta_catalog_variant: 69/70 then SIGSEGV at the ABI crossing. Fix = port the fork's
-   `VariantTransport` semantics keyed on the marker (blob⇄`VariantArray` at EW's write/read boundary,
-   `FromArrowField` marker→"variant"), implemented over master's own VariantArray utilities — an EW
-   `fabricator-patches` commit, or discuss with Curt whether the marker-aware transport belongs upstream.
-2. **Row-level rebase across rewrites** — master's buffered flush aborts (clean
+## Variant transport port — DONE (2026-07-21 follow-up session); the sweep is 49/49
+
+**verify_delta_catalog_variant: GREEN at 144** (fork was 133; +11 = NEW positive coverage — see the
+capability gain below). Ported the fork's `VariantTransport` onto master's canonical-`VariantType` flow
+as EW `fabricator-patches` commits — the branch is now e48f449 + 7 (`ee7ee02` parquet narrow-int fix /
+`a622297` pass-through source-field fixes / `7fecc2b` the variant transport; LOCAL, push on explicit
+authorization) — adapted to master's architecture (the fork's INTERNAL representation
+was the blob with conversion at the parquet codec; master's internal representation stays the canonical
+`VariantArray` with conversion at the HOST boundary):
+
+- **EW `SchemaConverter`**: `VariantTransportExtensionName = "fabricator.variant"` +
+  `IsVariantTransportField`; `FromArrowField` maps a marker-tagged BINARY → `variant` (top-level +
+  struct-nested via the recursive field conversion; list/map inner markers rejected — the fork's
+  degradation guard); `FilterArrowMetadata` also drops `ARROW:extension:*` (transport hints never
+  persist into the Delta schema — fork parity).
+- **EW `VariantTransport`** (ported, over master's `VariantArray` + `Apache.Arrow.Operations` 23.0.0
+  shredding toolkit — new Table.csproj package ref): `ToVariantArrays` (write ingress, marker-keyed —
+  a no-op for canonical input, so master's own hosts/tests are unaffected; shreds uniform columns via
+  `ShredSchemaInferer`/`VariantShredder`, SQL-null as storage validity) + `ToTransportBlobs` (read
+  egress: `VariantArray` incl. shredded reassembly via `GetLogicalVariantValue`, bare struct, and
+  seam-delivered blob passthrough with marker re-tagging).
+- **EW `DeltaTableOptions.VariantTransportBlob`** (default false = canonical): selects the read
+  direction; wired at the `ProcessFileBatchesAsync` coercion point (replaces `VariantColumnCoercion.
+  Coerce` when set). The 4 write sites' CODEC branches call `ToVariantArrays` then re-apply the
+  `EmitVariantLogicalType` policy; the `IDataFileWriter` SEAM branches pass blobs through untouched
+  (the host writer produced the marker — it encodes the layout itself via the C++ ArrowTypeExtension).
+- **Bridge**: `DeltaWriter.Options()` sets `VariantTransportBlob = true`; `VariantMarker.
+  ToTransportSchema` (recursive `VariantType` → tagged BINARY) wraps the three EW-advertised schema
+  returns (`GetSchema`/`GetSchemaAndRowTracking`/`GetSchemaAt`) + the buffered-ALTER
+  `PendingArrowSchema`; the `EnsureVariantWritable` gates (nested placement, CDF) unchanged.
+- **THREE more genuine master bugs found + fixed en route** (same silent-relabeling/width class as the
+  compaction fixes): (1) `ValueWidener.WidenBatch` relabeled an UNCONVERTED column with the target type
+  when `WidenArray` passed an unsupported pair through (the blob-vs-VariantType pair leaked a canonical
+  extension label onto blob data → the seam writer's schema export failed registration); (2)
+  `SchemaEvolution.BackfillMissingColumns` relabeled PRESENT pass-through columns with the expected
+  field — now keeps the SOURCE field (only rebuilt/backfilled columns take the expected label); (3)
+  **`ColumnChunkWriter` narrow-int corruption (pre-existing, variant-independent!)**: 1-/2-byte Arrow
+  arrays (Int8/UInt8/Int16/UInt16 — Int32 parquet physical) were reinterpreted AT THE PHYSICAL WIDTH by
+  the value extraction (dictionary + PLAIN + V2 encoders), packing four int8 values per int read —
+  SILENT corruption whenever Arrow's 64-byte buffer padding hid the overrun (probed: a plain Int8
+  column wrote "successfully" then failed to read back). Fixed at the one chokepoint
+  (`WidenNarrowIntArray` in `WriteColumnCore`, beside the FLBA byte-reversal precedent); pinned by a
+  new `NarrowIntColumns_RoundTrip` theory (dictionary + plain paths, min/max/null values). This very
+  likely affected the FORK too (same encoder lineage) — TINYINT/SMALLINT Delta columns via the EW codec
+  were simply never test-covered. Upstream-candidate material, all three.
+- **CAPABILITY GAIN over the fork: pure-codec variant REWRITES work.** The fork gated codec-path
+  UPDATE/CoW/OPTIMIZE on variant tables ("not supported yet" backstops); master's variant-native codec
+  + the transport at its boundary handle them — the suite's gate pin flipped to positive coverage
+  (codec MoR UPDATE incl. SET of the variant value + codec OPTIMIZE, all read back exactly).
+- **New EW test `VariantTransportTests` (4)**: marker→variant schema mapping (+ no metadata pollution),
+  transport-written → canonical readback (byte-exact `VariantArray`), canonical-written → transport
+  readback (byte-exact blobs, SQL-null as null row), uniform-column shred + reassembly round-trip
+  (value halves byte-exact; reassembly may re-encode metadata header flag bits — asserted accordingly).
+
+**Gates (all green):** verify_delta_catalog_variant 144; EW DeltaLake.Table.Tests 416 + DeltaLake.Tests
+210; extension regression at full counts — transactions 941, row_tracking_virtual 299, column_mapping
+251, native_write 147, clustered_optimize 138, alter 116, nested_alter 100, native_read 88, changes 73,
+struct_filter 67, update 63, temporal 63, verify_delta 60 (global fabricator_delta_scan, blob-form reads),
+dv_default 58, late_materialization 57, decimal 47, optimize 40, native_write_streaming 29,
+compaction_rowtracking 24, materialize_rowtracking 12. (EW Parquet.Tests: the parquet-testing corpus
+submodule is NOT initialized in this checkout — its corpus-dependent tests fail on missing files
+independent of any code change; A/B'd with the narrow-int fix stashed: 114 failed on BOTH sides —
+zero new failures, +2 new passing NarrowInt pins with the fix.)
+
+**Open (1 workstream, design known):**
+1. **Row-level rebase across rewrites** — master's buffered flush aborts (clean
    `DeltaConflictException`, correctness preserved) where the fork's v1/v2 rebased (`RebaseDvDmlActions`
    row-disjoint re-union exists; the `RemapRowsAcrossRewriteAsync` stable-id remap across a concurrent
    OPTIMIZE/CoW does not). verify_delta_row_level_concurrency: 30/31, failing §(buffered DML through a

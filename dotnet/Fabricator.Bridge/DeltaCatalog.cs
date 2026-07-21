@@ -1496,10 +1496,11 @@ public sealed class DeltaCatalog : IBackendCatalog
     }
 
     // ---- VARIANT gates ----
-    // A VARIANT column crosses the boundary as the tagged transport struct (arrow.parquet.variant) and its
-    // parquet layout is the annotated variant group — only DuckDB's own parquet reader/writer produce/consume
-    // that layout, so variant tables REQUIRE the native paths. The EW backstops (DeltaTable) also reject codec
-    // writes/rewrites, but gating here gives the actionable ATTACH-option error up front.
+    // A VARIANT column crosses the C ABI as the fabricator.variant LEAF-binary transport (one
+    // metadata||value blob per row); EW models it canonically (arrow.parquet.variant) and converts at its
+    // host boundary (VariantTransport, selected by DeltaTableOptions.VariantTransportBlob). Both byte
+    // paths work — the native seams AND the EW codec, incl. codec rewrites. Only the placement/CDF
+    // gates below remain.
 
     private static bool SchemaHasVariant(Schema schema)
     {
@@ -1571,10 +1572,9 @@ public sealed class DeltaCatalog : IBackendCatalog
         {
             return;
         }
-        // The codec paths handle variant now (engineered-wood's VariantTransport writes the annotated group
-        // via VariantArray and reads it back to the transport blob), so no native-path requirement remains
-        // for plain CREATE/INSERT/SELECT. CoW rewrites/compaction on a codec-only catalog are still rejected
-        // by the EW backstop (their write sites aren't transformed) — DV DELETE works, and DV is the default.
+        // The codec paths handle variant fully (EW's VariantTransport converts the transport blob at its
+        // write sites and read pipeline) — CREATE/INSERT/SELECT AND rewrites (UPDATE/OPTIMIZE) work with
+        // no native-path requirement. Only the CDF combination remains gated.
         if (_changeDataFeedOnCreate)
         {
             throw new System.NotSupportedException(
@@ -2313,8 +2313,9 @@ public sealed class DeltaCatalog : IBackendCatalog
         pending.PendingMetadata = change.Metadata;
         pending.PendingProtocol = MergeProtocol(pending.PendingProtocol, change.ProtocolUpgrade);
         pending.PendingDeltaSchema = change.NewSchema;
-        pending.PendingArrowSchema =
-            EngineeredWood.DeltaLake.Schema.SchemaConverter.ToArrowSchema(change.NewSchema);
+        // Transport form: the overlay serves bind schemas, which cross the C ABI (variant = tagged binary).
+        pending.PendingArrowSchema = VariantMarker.ToTransportSchema(
+            EngineeredWood.DeltaLake.Schema.SchemaConverter.ToArrowSchema(change.NewSchema));
         pending.HasAlter = true;
         pending.AlterOps.Add(op);
     }
