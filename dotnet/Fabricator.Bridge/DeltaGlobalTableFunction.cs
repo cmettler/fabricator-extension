@@ -381,10 +381,26 @@ internal static class DeltaWriter
     /// (delta-kernel / Spark / Fabric) reject the footer with <c>TProtocolException: Invalid data</c>.
     /// <paramref name="spec"/> (null =&gt; defaults) carries the resolved per-write tuning (compression /
     /// row-group size / bloom-filter columns) from the ATTACH options + the <c>delta_write_options</c> setting.</summary>
+    /// <summary>Read options for ALL engineered-wood data-file reads: decimals widened to the classic
+    /// Decimal128/256 (EW master defaults to the physical-width Decimal32/64, which are mishandled crossing
+    /// the Arrow C data interface to DuckDB — read as 128-bit over the 4/8-byte buffer ⇒ corruption; the
+    /// widening is lossless, EW's decoders sign-extend). An optional row-group <paramref name="filter"/>
+    /// (+ bloom probing) composes on top.</summary>
+    internal static ParquetReadOptions ReadOptions(EngineeredWood.Expressions.Predicate? filter = null) =>
+        filter is null
+            ? ParquetReadOptions.Default with { DecimalOutput = DecimalOutputKind.Decimal128 }
+            : new ParquetReadOptions
+            {
+                Filter = filter,
+                FilterUseBloomFilters = true,
+                DecimalOutput = DecimalOutputKind.Decimal128,
+            };
+
     internal static DeltaTableOptions Options(DeltaWriteSpec? spec = null,
                                               IDataFileWriter? dataFileWriter = null,
                                               IDataFileReader? dataFileReader = null) => DeltaTableOptions.Default with
     {
+        ParquetReadOptions = ReadOptions(),
         ParquetWriteOptions = new ParquetWriteOptions
         {
             OmitPathInSchema = false, // REQUIRED field — standard readers (DuckDB/arrow-rs/Fabric) reject without it

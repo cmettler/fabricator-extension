@@ -3630,47 +3630,43 @@ public sealed class DeltaCatalog : IBackendCatalog
                                     updates, setSlotByColumn, userSchema);
         }
 
-        // STRUCT SET values work on COLUMN-MAPPING tables too: the copy-on-write rewrite applies
-        // engineered-wood's RECURSIVE physical-rename + field-id stamping (ColumnMappingRecursive.ToPhysical),
-        // so a substituted struct column (rebuilt logical-named from the table schema by BuildArray) lands in
-        // the spec nested layout; pass-through columns read from data files are already physical and just get
-        // their ids stamped.
-
-        // 3. Per-file copy-on-write: engineered-wood rewrites ONLY the files containing a matched row. For each
-        //    such file it hands us (fileOrdinal, the file's batches in read order); we rebuild the SET columns
-        //    on the matched positions (rowid = (ordinal << RowIdPositionBits) | positionInFile — same encoding
-        //    the scan emitted) and return the modified batches. Unaffected files are left untouched.
-        DeltaReader.UpdateByRowIds(opener, path, updates.Keys, (ordinal, batches) =>
+        // 3. Per-file copy-on-write via EW master's host-join UPDATE shape (pr4-to-master guide §1):
+        //    build ONE `updates` batch — the transient rowid column + one column per SET column (LOGICAL
+        //    table-column names, table-schema types via BuildArray) — and hand it to
+        //    UpdateByRowIdsAsync(updates). EW rewrites only the files containing a matched row,
+        //    substituting the SET columns keyed by rowid (type-agnostic concat+take — structs included);
+        //    pass-through rows/columns move by reference. Struct SET on COLUMN-MAPPING tables still works:
+        //    the rewrite applies EW's recursive ToPhysical, so the logical-named substituted struct lands
+        //    in the spec nested layout.
+        var ridBuilder = new Int64Array.Builder();
+        var updColVals = new List<object?>[setColNames.Count];
+        for (int j = 0; j < setColNames.Count; j++)
         {
-            // Each batch is the file's USER columns (0..fields.Count-1) + a trailing _metadata.row_id (last) =
-            // the ABSOLUTE rowid. Match each row by its rowid (robust even when the file has a deletion vector).
-            var outBatches = new List<RecordBatch>(batches.Count);
-            foreach (var batch in batches)
+            updColVals[j] = new List<object?>(updates.Count);
+        }
+        foreach (var kv in updates)
+        {
+            ridBuilder.Append(kv.Key);
+            for (int j = 0; j < setColNames.Count; j++)
             {
-                var rids = (Int64Array)batch.Column(batch.ColumnCount - 1);
-                var newCols = new IArrowArray[fields.Count];
-                for (int c = 0; c < fields.Count; c++)
-                {
-                    int slot = setSlotByColumn[c];
-                    if (slot < 0)
-                    {
-                        newCols[c] = batch.Column(c); // unchanged column
-                        continue;
-                    }
-                    var values = new List<object?>(batch.Length);
-                    for (int i = 0; i < batch.Length; i++)
-                    {
-                        long rid = rids.GetValue(i) ?? -1;
-                        values.Add(updates.TryGetValue(rid, out var nv)
-                            ? nv[slot]
-                            : ArrowValueReader.ReadScalarDeep(batch.Column(c), i));
-                    }
-                    newCols[c] = BuildArray(fields[c].DataType, values);
-                }
-                outBatches.Add(new RecordBatch(userSchema, newCols, batch.Length));
+                updColVals[j].Add(kv.Value[j]);
             }
-            return outBatches;
-        }, default, _nativeWrite, _nativeRead);
+        }
+        var updFields = new List<Field>(setColNames.Count + 1)
+        {
+            new Field(RowIdColumn, Int64Type.Default, nullable: false),
+        };
+        var updArrays = new List<IArrowArray>(setColNames.Count + 1) { ridBuilder.Build() };
+        for (int j = 0; j < setColNames.Count; j++)
+        {
+            var field = setSlotField[j];
+            updArrays.Add(BuildArray(field.DataType, updColVals[j]));
+            // Keep the field metadata: the fabricator.variant transport marker must ride the SET column.
+            updFields.Add(new Field(field.Name, field.DataType, nullable: true, field.Metadata));
+        }
+        var updatesBatch = new RecordBatch(
+            new Apache.Arrow.Schema(updFields, null), updArrays, updates.Count);
+        DeltaReader.UpdateByRowIds(opener, path, updatesBatch, default, _nativeWrite, _nativeRead);
 
         _log.LogInformation("delta update {Schema}.{Table}: rows={Rows} set_cols={SetCols} native_write={Native}",
             schemaName, tableName, updates.Count, setColNames.Count, _nativeWrite);
