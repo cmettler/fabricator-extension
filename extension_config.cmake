@@ -23,11 +23,12 @@ duckdb_extension_load(icu)
 duckdb_extension_load(parquet)
 
 # And `httpfs` — s3:// (MinIO) targets for the Delta providers (verify_delta_catalog_s3 +
-# verify_mssql_s3_polybase). Out-of-tree since DuckDB 1.3 — pinned to the SAME sha DuckDB v1.5.4's own
-# CI uses (duckdb/.github/config/extensions/httpfs.cmake). Requires OpenSSL + curl: configure with the
-# vcpkg toolchain + `-DVCPKG_TARGET_TRIPLET=x64-windows-static` (static CRT, matching /MT) after
+# verify_mssql_s3_polybase). Out-of-tree since DuckDB 1.3 — pinned to the SAME sha DuckDB v1.5.5's own
+# CI uses (duckdb/.github/config/extensions/httpfs.cmake; v1.5.5's tip commit IS the httpfs bump).
+# Requires OpenSSL + curl: configure with the vcpkg toolchain +
+# `-DVCPKG_TARGET_TRIPLET=x64-windows-static` (static CRT, matching /MT) after
 # `vcpkg install openssl:x64-windows-static curl:x64-windows-static`.
 duckdb_extension_load(httpfs
     GIT_URL https://github.com/duckdb/duckdb-httpfs
-    GIT_TAG c3f215ab360f04dc3d3d5305fa81849c0121f111
+    GIT_TAG 827222fb45a043a7a852d1f7aae46901492a3cda
 )

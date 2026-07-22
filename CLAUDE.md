@@ -2285,11 +2285,13 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   **Remaining (deferred): Tier 4 only** — the arrow scan as a DuckDB async/BLOCKED source
   (`InterruptState`) to free the task thread during I/O (native interrupt + better parallelism, bigger). Live Ctrl+C
   behavior is a MANUAL check (a slow OneLake/SQL query + interrupt); the suites verify only behavior-neutrality.
-  **BINARY STATUS (2026-07-19): the WINDOWS targets are all CURRENT** (unittest + `duckdb.exe` shell +
-  the loadable rebuilt at **ABI v67** — the WITH-options `options_json` bump; a stale loadable vs the
-  fresh bridge throws the ABI-mismatch error). **The LINUX payload
-  (`build/linux-payload/fabricator.duckdb_extension` + the FDD zip) is pre-v65 and lags the ENTIRE
-  2026-07-18/19 clustering arc** — rebuild in WSL (rsync `src/` → `~/sqlext`, `cmake --build … --target
+  **BINARY STATUS (2026-07-22): the WINDOWS targets are all CURRENT on DuckDB v1.5.5** (unittest +
+  `duckdb.exe` shell + the loadable rebuilt at ABI v67 on the v1.5.5 base + the EW clast-master engine;
+  a stale loadable vs the fresh bridge throws the ABI-mismatch error, and the OFFICIAL-WHEEL consumers
+  — dbt venvs, notebook flows — must move to `duckdb==1.5.5` before loading the new loadable). **The
+  LINUX payload (`build/linux-payload/fabricator.duckdb_extension` + the FDD zip) is pre-v65, lags the
+  clustering arc, the EW migration AND the 1.5.5 base** — rebuild in WSL (rsync `src/` → `~/sqlext`,
+  duckdb clone at v1.5.5, `-DOVERRIDE_GIT_DESCRIBE=v1.5.5`, `cmake --build … --target
   fabricator_loadable_extension`) before the next notebook run.)
 - **Prior: ABI v64** (v64 = **`onelake_move`** — atomic single-file rename via the ADLS Gen2
   DFS **native rename** (`DataLakeFileClient.RenameAsync`, a metadata op that overwrites an existing
@@ -4020,7 +4022,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   **LINUX LOAD-SMOKE VALIDATED (no dotnet needed pre-installed):** the FDD payload is framework-dependent, so
   a **downloaded-and-extracted** .NET 8 runtime suffices — `dotnet-install.sh --runtime dotnet --install-dir
   ~/dotnet8` (no root/install), `export DOTNET_ROOT=~/dotnet8` + `FABRICATOR_MANAGED_DIR=<extracted FDD zip>`,
-  then the duckdb 1.5.4 wheel (`pip install --target`, no venv) `load_extension`s the loadable. On WSL Ubuntu
+  then the duckdb wheel MATCHING the loadable's declared version (1.5.5 since the bump; `pip install --target`, no venv) `load_extension`s the loadable. On WSL Ubuntu
   22.04 (glibc 2.35 = Fabric Azure-Linux-3 baseline): `fabricator_version()`, delta CTAS/scan/filter-pushdown,
   and rowid DELETE all pass — so the payload is proven to LOAD + RUN on linux, not just compile.** **IDEMPOTENT APPENDS (2026-07-11) — Delta
   APPLICATION TRANSACTIONS (the `txn` action; duckdb-delta/Spark txnAppId parity, additive metadata kinds
@@ -4363,7 +4365,7 @@ VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
    them):
    ```
    git submodule update --init engineered-wood
-   git clone --depth 1 --branch v1.5.4 https://github.com/duckdb/duckdb.git duckdb
+   git clone --depth 1 --branch v1.5.5 https://github.com/duckdb/duckdb.git duckdb
    git clone --depth 1 --branch v1.5.3 https://github.com/duckdb/extension-ci-tools.git extension-ci-tools
    ```
 2. **vcpkg deps** (once): `vcpkg install openssl:x64-windows-static curl:x64-windows-static`
@@ -4387,13 +4389,24 @@ VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
 
 ### Reference (the why + gotchas)
 
-- **Target DuckDB v1.5.4** (new extension API: `Extension::Load(ExtensionLoader&)` +
+- **Target DuckDB v1.5.5** (since 2026-07-22; new extension API: `Extension::Load(ExtensionLoader&)` +
   `loader.RegisterFunction(...)` + `DUCKDB_CPP_EXTENSION_ENTRY(fabricator, loader)`). `duckdb` +
   `extension-ci-tools` are **gitignored manual shallow clones** (NOT git submodules — `.gitmodules`
-  declares only `engineered-wood`), pinned to `duckdb@08e34c4` (v1.5.4) + `extension-ci-tools@v1.5.3`
-  (no 1.5.4 branch exists; v1.5.3 is the latest tooling for the 1.5.x line). Clone them per the
+  declares only `engineered-wood`), pinned to `duckdb@d8cdaa33` (the v1.5.5 tag) +
+  `extension-ci-tools@v1.5.3` (still the latest tooling for the 1.5.x line). Clone them per the
   fresh-clone step 1 above; bump `duckdb` via
-  `git -C duckdb fetch --depth 1 origin <sha> && git -C duckdb checkout <sha>`.
+  `git -C duckdb fetch --depth 1 origin <sha> && git -C duckdb checkout <sha>` (a version bump also
+  means: re-run cmake with `-DOVERRIDE_GIT_DESCRIBE=v<new>`, match the out-of-tree httpfs pin in
+  `extension_config.cmake` to the sha in duckdb's `.github/config/extensions/httpfs.cmake`, and
+  `pip install duckdb==<new>` in the dbt/notebook envs — the official wheel rejects a loadable whose
+  declared version differs). **1.5.5 verification (2026-07-22):** C++ compiled unchanged, full delta
+  sweep + SQL function suites + s3 161/polybase 252 green on the new httpfs sha (`827222fb`).
+  **DuckDB's variant limitations are all UNFIXED in 1.5.5** (source-diffed + runtime-probed): the
+  `ArrowAppender::FinalizeChild` nested-extension crash (why the transport is a leaf blob), the
+  parquet writer's non-root-VARIANT rejection (why nested variant is gated), and `variant_extract`
+  returning NULL (dot access stays the way). 1.5.5 DOES fix an FLBA-decimal `RETURN_STATS` min/max
+  unification bug (big-endian stats compared as little-endian across row groups) — our native-write
+  Delta stats for precision>18 decimals in multi-row-group files are correct-by-upstream now.
 - **engineered-wood is an in-tree git submodule** (`engineered-wood/` at the repo root, since
   2026-07-19; was a `D:\repos\engineered-wood` sibling ProjectReference). Pinned to the
   **`fabricator-patches` branch on the `cmettler/engineered-wood` fork** = **clast-project master
@@ -4425,11 +4438,13 @@ VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
   - `shell` → `build/release/duckdb.exe` (interactive shell; **embeds** the extension).
   - `unittest` → `build/release/test/unittest.exe` (runs the `.test` suites; **embeds** the extension).
   - `fabricator_loadable_extension` → `build/release/extension/fabricator/fabricator.duckdb_extension`
-    (the loadable; needed to `LOAD` into a duckdb that does NOT embed it — e.g. the **official `duckdb==1.5.4`
+    (the loadable; needed to `LOAD` into a duckdb that does NOT embed it — e.g. the **official `duckdb==1.5.5`
     Python wheel** for the dbt-duckdb concurrency tests). **To load into the official wheel, reconfigure with
-    `-DOVERRIDE_GIT_DESCRIBE=v1.5.4`** so the extension footer declares `duckdb_version=v1.5.4` — the shallow
-    submodule has no git tag, so it otherwise defaults to `v0.0.1` and the official engine rejects it on the
-    version check (NOT bypassed by `allow_unsigned_extensions`). Then `LOAD` with `allow_unsigned_extensions`
+    `-DOVERRIDE_GIT_DESCRIBE=v1.5.5`** so the extension footer declares `duckdb_version=v1.5.5` — the shallow
+    clone has no git tag context, so it otherwise defaults to `v0.0.1` and the official engine rejects it on
+    the version check (NOT bypassed by `allow_unsigned_extensions`). The wheel version MUST match the declared
+    version — after the 1.5.5 bump, dbt venvs / notebook flows still on `duckdb==1.5.4` reject the new
+    loadable until they `pip install duckdb==1.5.5`. Then `LOAD` with `allow_unsigned_extensions`
     + set `FABRICATOR_MANAGED_DIR` (the bridge isn't next to the python `.pyd`). Verified loads + ATTACH +
     query against the official wheel. (This also fixes `json`/`icu` autoload, though we embed those.)
   - `cmake --build build/release` (no `--target`) builds all of them.
@@ -4476,7 +4491,7 @@ VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
   compute is **Azure Linux 3** (`6.6.141.1-1.azl3`) with **dotnet preinstalled at `/usr/share/dotnet`,
   .NET 8.0.28 ONLY, no DOTNET_ROOT set** — our default probe finds it with ZERO configuration. Flow:
   upload `fabricator.duckdb_extension` (linux_amd64) + the zipped FDD payload to the lakehouse
-  `Files/fabricator_ext/` (OneLake DFS), then in the session: `pip install --force-reinstall duckdb==1.5.4`
+  `Files/fabricator_ext/` (OneLake DFS), then in the session: `pip install --force-reinstall duckdb==1.5.5` (must match the loadable's declared version)
   (never import duckdb in the kernel before the pip — read the preinstalled version via
   `importlib.metadata`; the duckdb work runs in a SUBPROCESS interpreter, which also isolates a crash from
   the kernel), stage to /tmp, `FABRICATOR_MANAGED_DIR` + `load_extension` → `fabricator_version()` works,
@@ -4486,7 +4501,7 @@ VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
   **The TRUE PYTHON-NOTEBOOK path is ALSO validated (RunNotebook job, 75 s):** the notebook session runs
   Azure Linux 3 + dotnet 8.0.27 at `/usr/share/dotnet` (only runtime, no DOTNET_ROOT) and — unlike the Livy
   session — HAS the fuse mount AND a **preinstalled duckdb 1.2.2**; `pip install --force-reinstall
-  duckdb==1.5.4` overrides it (works without a kernel restart BECAUSE duckdb is never imported in the
+  duckdb==1.5.5` overrides it (works without a kernel restart BECAUSE duckdb is never imported in the
   kernel), the extension loads on the preinstalled .NET 8, the delta transaction smoke passes, and a Delta
   table written through the fuse mount (`ATTACH '/lakehouse/default/Files/…'`) reads back. Fabric-API
   gotchas hit on the way: **Notebook-item CREATION is not SP-enabled on this tenant** (`403
@@ -4549,7 +4564,8 @@ VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
   (docker/README.md). Connstr needs `TrustServerCertificate=true;Encrypt=true`. `sqlcmd` v18 in-container:
   `docker exec mssql-fabricator /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Arrow_Net_123!' -C`.
 - **S3 / MinIO / SQL Server data virtualization (2026-07-10).** `httpfs` is now statically linked
-  (`extension_config.cmake` — out-of-tree pin `duckdb-httpfs @ c3f215ab`, the sha DuckDB v1.5.4's own CI
+  (`extension_config.cmake` — out-of-tree pin `duckdb-httpfs @ 827222fb` since the 1.5.5 bump, always
+  the sha DuckDB's own CI
   uses; needs OpenSSL+curl via the vcpkg toolchain: `vcpkg install openssl:x64-windows-static
   curl:x64-windows-static`, configure with `-DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake
   -DVCPKG_TARGET_TRIPLET=x64-windows-static` — the `-static` triplet must match the /MT build). The
