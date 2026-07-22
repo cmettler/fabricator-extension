@@ -1,4 +1,4 @@
 [submodule "engineered-wood"]
 	path = engineered-wood
 	url = https://github.com/cmettler/engineered-wood.git
-	branch = master
+	branch = fabricator-patches
