@@ -1,6 +1,8 @@
 # Migration: re-pin fabricator onto clast-project/engineered-wood master
 
-Branch: `migrate/ew-clast-master` (off `main`). Status: **compile stage DONE (2026-07-21) — sweep running.**
+Branch: `migrate/ew-clast-master` (off `main`). Status: **COMPLETE (2026-07-22) — pin moved to
+`fabricator-patches` @ `7fecc2b` (pushed), 49/49 suites green, live OneLake/Spark validated.
+Remaining: merge this branch to `main` (user's call) + the Curt upstream bundle.**
 
 ## Compile-stage outcome (supersedes the dry-compile inventory below)
 
@@ -163,10 +165,12 @@ fixed to the fabricator-extension repo root):
    arc) or port the remap as the next upstream proposal (pairs naturally with the parked `_metadata` RFC).
 
 ## Branch / working-tree state
-- fabricator: `migrate/ew-clast-master` (this branch). `main` clean; the committed submodule pin is
-  STILL `99e2c3a` (our fork) — **do not move the pin (or .gitmodules) until the full sweep is green**.
-- EW submodule working tree: local branch **`fabricator-patches`** (= `upstream/master` e48f449 + 4).
-  ⚠ While on this branch the tree ≠ the pin — `main` builds only after `git -C engineered-wood checkout master`.
+- fabricator: `migrate/ew-clast-master` (this branch). **The pin IS moved** (2026-07-22): gitlink
+  `7fecc2b` = fork `fabricator-patches` (pushed), `.gitmodules` `branch = fabricator-patches`.
+  NOTE `main` still pins the fork lineage (`99e2c3a`) — checking out `main` needs
+  `git submodule update` to flip the EW tree back; merge this branch to `main` to retire that.
+- EW submodule working tree: branch **`fabricator-patches`** @ `7fecc2b` (= `upstream/master`
+  e48f449 + 7), in sync with the pin.
 - Parked EW branches (pushed to cmettler fork): `proto/metadata-dml` (`0db9507` — the _metadata RFC +
   prototype, revisit post-migration), `fix/vacuum-dv-orphans` (`1ecf28d` — fork-only; master's vacuum is
   already better). Local-only: `reconcile/clast` (superseded, deletable).
