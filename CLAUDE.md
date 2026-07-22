@@ -108,16 +108,35 @@ is sync ADOMD (`ExecuteReader`, 0 async); **`Fabricator.DeltaRs`** already route
 grep counts across the bridges are now ALL either single-blocking-point sync wrappers or already-conformant
 Arrow-boundary reads — do NOT treat a nonzero count as remaining work. The sync-over-async initiative is DONE.
 
-**Rename-scope gap FIXED en route (2026-07-15):** the FABRICATOR rename (`2a26b7a`) renamed the C++ variant marker
-`kVariantExtensionName` → `"fabricator.variant"` but engineered-wood (a SIBLING repo, out of the blanket rename's
-scope) kept `SchemaConverter.VariantExtensionName = "arrownet.variant"` — so the C++↔C# variant round-trip name
-MISMATCHED and every VARIANT column bound as raw `BLOB` (INSERT → "Can't convert VARIANT(OBJECT) to 'BLOB'"). The
-variant Arrow name is our PRIVATE boundary discriminator (re-stamped on every read from the Delta/parquet variant
-annotation — not persisted-authoritative), deliberately NOT the reserved-canonical `arrow.variant` (whose storage is
-`struct<metadata,value>`; ours is a single self-delimiting blob → a canonical name would collide with DuckDB/arrow-c++
-built-in handlers). Fixed EW → `"fabricator.variant"` (matches C++); `verify_delta_catalog_variant` 133 green. **Committed LOCALLY in
-engineered-wood (`5e0ca3d`), NOT pushed** (user decision 2026-07-15: "commit to EW locally only"; EW pushes to the
-fork/PR #4 only on explicit "ew push"). It must be pushed for a clean fork checkout to build variant correctly.
+### THE EW CLAST-MASTER RE-PIN (2026-07-22 — the current engine; full record: [docs/ew-master-migration.md](docs/ew-master-migration.md))
+
+The engineered-wood submodule pin moved from our long-lived fork lineage (`99e2c3a`) onto
+**clast-project/engineered-wood master (`e48f449`, Curt's PR#4-parity landing) + the additive
+`fabricator-patches` branch** (7 commits, pushed to the cmettler fork, pin `7fecc2b`;
+`.gitmodules` `branch = fabricator-patches`). The strategy: fabricator-specific needs live as a
+SMALL upstreamable patch set ON TOP of clast master — never a fork again — so future EW bumps are
+merge-master-into-fabricator-patches + re-pin. What the patches carry: `DeltaFilePruner` public;
+create-time `configuration`/`preAssignedSchema`/`materializedRowIds` params; rowid read-back
+`rowIdsOut` correlation + derived-id fallback + CoW CDF capture + partition-aware cdc writes +
+DV-aware CDF inference; schema-evolved compaction fixes; the **narrow-int parquet write-corruption
+fix** (1-/2-byte Arrow arrays reinterpreted at the 4-byte physical width — silent corruption,
+pre-existing, upstream-candidate); pass-through source-field relabel fixes (WidenBatch/
+BackfillMissingColumns); and the **variant TRANSPORT** (`SchemaConverter.VariantTransportExtensionName
+= "fabricator.variant"`, `VariantTransport` blob⇄`VariantArray` at EW's host boundary,
+`DeltaTableOptions.VariantTransportBlob` — EW's INTERNAL model is now the canonical
+`arrow.parquet.variant` `VariantType`; the Bridge sets the option in `DeltaWriter.Options()` and
+converts advertised schemas via `VariantMarker.ToTransportSchema`). Bridge-side migration:
+`IDataFileRewriter` retired (EW owns rewrite semantics; only the encoding seams remain), UPDATE on
+the host-join `UpdateByRowIdsAsync(RecordBatch)` + a composed merge-on-read (`MergeOnReadUpdateAsync`
+in DeltaReader), decimal widening via `DecimalOutput=Decimal128` read option, writer seam
+`IAsyncEnumerable`. **Capability gain: pure-codec variant REWRITES work** (the fork gated them);
+**capability regression (pinned, upstream follow-up): buffered DML through a concurrent
+OPTIMIZE/rewrite aborts cleanly + retries** (the fork's `RemapRowsAcrossRewriteAsync` stable-id remap
+isn't in master's buffered flush; autocommit DML still remaps). Validated: 49/49 delta suites at
+full counts (variant now 144), EW suites green, and the LIVE OneLake/Spark round-trip incl. row-id
+parity both directions + Spark decoding codec-written variant. **Fork-era EW notes below this point
+are HISTORICAL** — they describe the retired fork lineage; the mechanisms survive but live in the
+fabricator-patches shapes above.
 
 ## Architecture (layered for reuse)
 
@@ -4377,16 +4396,21 @@ VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
   `git -C duckdb fetch --depth 1 origin <sha> && git -C duckdb checkout <sha>`.
 - **engineered-wood is an in-tree git submodule** (`engineered-wood/` at the repo root, since
   2026-07-19; was a `D:\repos\engineered-wood` sibling ProjectReference). Pinned to the
-  **`cmettler/engineered-wood` fork** (has our Fabricator patches; `upstream` = Curt's, PR #4).
+  **`fabricator-patches` branch on the `cmettler/engineered-wood` fork** = **clast-project master
+  (`e48f449`) + our small additive patch set** (see "THE EW CLAST-MASTER RE-PIN" near the top;
+  `.gitmodules` `branch = fabricator-patches`; `upstream` remote = clast-project/engineered-wood).
   `Fabricator.Bridge.csproj` references `..\..\engineered-wood\src\EngineeredWood.DeltaLake.Table\…`.
   **Init NON-recursively** — `git submodule update --init engineered-wood` — to skip EW's nested
-  `parquet-testing` corpus (its test data, ~half a GB, not needed to build). **Workflow:** EW dev
-  happens INSIDE the submodule working tree (`engineered-wood/`); the build uses the working tree, so
-  day-to-day edits/commits there don't touch the parent's pin. To RECORD a known-good EW version in
-  fabricator: push EW to the fork FIRST (the pin must be fetchable), THEN bump the pointer
-  (`git add engineered-wood && git commit`). The old "EW commits local-only, push on explicit ew push"
-  habit still holds during dev — just push before pinning. (The old `D:\repos\engineered-wood` sibling
-  is now redundant; the scratchpad spike csprojs still point at it but scratchpad is gitignored.)
+  `parquet-testing` corpus (its test data, ~half a GB, not needed to build; note EW's own
+  Parquet.Tests corpus-dependent tests fail without it — expected). **Workflow:** EW dev happens
+  INSIDE the submodule working tree on `fabricator-patches`; the build uses the working tree, so
+  day-to-day edits/commits there don't touch the parent's pin. Keep every EW change as an ADDITIVE,
+  upstreamable commit on `fabricator-patches` (never fork-style divergence); to take a new upstream
+  EW, merge `upstream/master` into `fabricator-patches`, re-run the delta sweep, push, re-pin. To
+  RECORD a known-good EW version in fabricator: push EW to the fork FIRST (the pin must be
+  fetchable — pushes still only on the user's explicit authorization), THEN bump the pointer
+  (`git add engineered-wood && git commit`). (The old `D:\repos\engineered-wood` sibling is
+  redundant; the scratchpad spike csprojs still point at it but scratchpad is gitignored.)
 - **Windows build needs the VS dev env** — a plain shell fails at *compile* with `Cannot open include
   file: 'stdint.h'`. **Use the VS 18 vcvars, NOT VS 2022:**
   `C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvars64.bat`. The build is
@@ -4670,11 +4694,8 @@ VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
 ## Sibling repos (reference under `D:\repos\`)
 
 (engineered-wood is no longer here — it's an in-tree submodule `engineered-wood/`, see "Build & test".)
-`mssql-extension` (C++ TDS — compat target; adapting permitted, it's the user's repo),
-`adbc_scanner` (Arrow→DuckDB ingestion pattern), `airport` (function-declaration pattern),
 `SqlServerFlights` (reusable C# SqlClient/DAX→Arrow; its `Airport/Data` `ArrowTypeConverter.cs`/`FlightField.cs`
 are the granular type-conversion reference — original SQL type + precision/scale/length carried on Arrow
 field metadata for precise + lossless round-trip, and Arrow extension names `arrow.bool8`/`arrow.uuid`/
 `arrow.json` to disambiguate same-storage types; see [docs/warehouse-support.md](docs/warehouse-support.md)
-§3.4 for the future type-mapping refinement), `ArrowSerializer` (POCO↔Arrow for Phase 3),
-`vgi` (source-available — never copy code, design patterns only).
+§3.4 for the future type-mapping refinement), `ArrowSerializer` (POCO↔Arrow for Phase 3)
