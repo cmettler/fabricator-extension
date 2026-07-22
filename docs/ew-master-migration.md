@@ -62,8 +62,9 @@ WITH CDF capture, identity slices, external-table DDL), with_options 68, SQL fun
 
 **`fabricator-patches` IS PUSHED to the fork** (cmettler/engineered-wood; the variant-port commits of
 the follow-up session extend it — push on the next explicit "push"). The VARIANT TRANSPORT port is
-**DONE** (see the section below). Remaining before the pin move: live OneLake/Spark spot-checks; then
-the pin/gitlink move + CLAUDE.md rewrite (EW workflow + the superseded fork-era notes).
+**DONE** (see the section below), and the **LIVE OneLake/Spark spot-checks PASSED (2026-07-22)** —
+see "Live spot-checks" below. Remaining before the pin move: the pin/gitlink move + CLAUDE.md
+rewrite (EW workflow + the superseded fork-era notes) — the user's call.
 Upstream-discussion bundle for Curt = the fabricator-patches branch + the design questions recorded
 here (booleans-vs-configuration on CreateAsync; a separate entry point for preAssignedSchema; the
 buffered remap-across-rewrite follow-up; whether the marker-keyed variant transport + the three
@@ -132,6 +133,26 @@ compaction_rowtracking 24, materialize_rowtracking 12. (EW Parquet.Tests: the pa
 submodule is NOT initialized in this checkout — its corpus-dependent tests fail on missing files
 independent of any code change; A/B'd with the narrow-int fix stashed: 114 failed on BOTH sides —
 zero new failures, +2 new passing NarrowInt pins with the fix.)
+
+## Live spot-checks — FULL PASS (2026-07-22, workspace Test / LH, Fabric Spark via Livy)
+
+Both directions, on the EW-master engine (fabricator-patches @ 7fecc2b), validation tables left on
+LH for inspection (`sparkprobe verifymigration` re-runs the Spark half; sparkprobe's secret path was
+fixed to the fabricator-extension repo root):
+
+- **`lake.dbo.fabricator_mig`** (pure defaults: DV + row tracking + name mapping; native seams):
+  our CTAS + INSERT + composed merge-on-read UPDATE + DV DELETE over OneLake → our
+  `__delta_row_id`/`__delta_row_commit_version` readback shows id 2 with **row_id 1 preserved,
+  version 3** and id 5 gone; **Spark reads the identical cut** (`_metadata.row_id` 0,1,2,3,5 /
+  ver 3 on the updated row; DV-deleted row invisible); **Spark wrote back** (UPDATE id 3 — Spark
+  itself preserved row_id 2 honoring our materialized declaration; INSERT id 7 → fresh row_id 8,
+  correctly consuming the HWM past our post-image allocations) and **our provider re-read Spark's
+  writes exactly** — both engines agree on every row id, byte-for-byte.
+- **`lake.dbo.fabricator_migvar`** (VARIANT through the PURE EW CODEC — the new VariantTransport
+  over OneLake, no native flags): create + insert (object/NULL/array/string) + **codec MoR UPDATE
+  of the variant value** → our readback exact (incl. dot access + SQL-NULL semantics); **Spark
+  decodes the codec-written files exactly** — `to_json` all rows, `variant_get` on the object AND
+  on the MoR-updated value, `WHERE v IS NULL` matches only the SQL-NULL row.
 
 **Open (1 workstream, design known):**
 1. **Row-level rebase across rewrites** — master's buffered flush aborts (clean
