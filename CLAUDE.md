@@ -2285,14 +2285,26 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   **Remaining (deferred): Tier 4 only** — the arrow scan as a DuckDB async/BLOCKED source
   (`InterruptState`) to free the task thread during I/O (native interrupt + better parallelism, bigger). Live Ctrl+C
   behavior is a MANUAL check (a slow OneLake/SQL query + interrupt); the suites verify only behavior-neutrality.
-  **BINARY STATUS (2026-07-22): the WINDOWS targets are all CURRENT on DuckDB v1.5.5** (unittest +
-  `duckdb.exe` shell + the loadable rebuilt at ABI v67 on the v1.5.5 base + the EW clast-master engine;
-  a stale loadable vs the fresh bridge throws the ABI-mismatch error, and the OFFICIAL-WHEEL consumers
-  — dbt venvs, notebook flows — must move to `duckdb==1.5.5` before loading the new loadable). **The
-  LINUX payload (`build/linux-payload/fabricator.duckdb_extension` + the FDD zip) is pre-v65, lags the
-  clustering arc, the EW migration AND the 1.5.5 base** — rebuild in WSL (rsync `src/` → `~/sqlext`,
-  duckdb clone at v1.5.5, `-DOVERRIDE_GIT_DESCRIBE=v1.5.5`, `cmake --build … --target
-  fabricator_loadable_extension`) before the next notebook run.)
+  **BINARY STATUS (2026-07-23): ALL targets CURRENT on DuckDB v1.5.5 + the EW clast-master engine at
+  ABI v67.** Windows: unittest + `duckdb.exe` shell + the loadable (2026-07-22). Linux (2026-07-23):
+  `build/linux-payload/` fully refreshed — `fabricator.duckdb_extension` (35 MB, linux_amd64, built in
+  WSL Ubuntu 24.04; **glibc symbol ceiling 2.38 = Azure Linux 3's glibc, Fabric-compatible**), the FDD
+  zip (net8.0 loose-root, now incl. the AWSSDK assemblies), and the notebook wheel swapped to
+  `duckdb-1.5.5-cp310` (the 1.5.4 wheel removed — `fabricnb` globs `duckdb-*.whl`; its Program.cs 1.5.4
+  refs updated). Load-smoke green in WSL on the official 1.5.5 wheel + FDD + downloaded .NET 8 runtime
+  (load, delta CTAS, explicit txn, DELETE, variant cast). **VALIDATED LIVE ON FABRIC (2026-07-23,
+  fabricnb upload + RunNotebook): 16/18 probe steps green on the new payload — duckdb 1.5.5 wheel,
+  loadable on AZL3 (the glibc-2.38 ceiling holds live), fuse Tables incl. txn append, ambient
+  SQL/delta/DAX, token secrets; the 2 fails are the documented-expected pair (pbi-audience → 18456,
+  static-azure-secret abfss → the pinned single-audience 401).** NOTE the harness prints the result,
+  but the durable copy is `Files/fabricator_ext/result.json` on LH — fetchable from Windows via
+  `read_text('onelake://Test/LH.Lakehouse/Files/fabricator_ext/result.json')` after `.read
+  dax_secret.sql`. `fabricnb/Program.cs` repo path fixed to `d:\repos\fabricator-extension` (was the
+  pre-rename path). `dbt_mssql_test/.venv` (serves dbt_dax_test too) upgraded to `duckdb==1.5.5` — the venv is uv-managed (NO pip module; use
+  `uv pip install --python .venv/Scripts/python.exe`). Linux rebuild recipe unchanged: rsync `src/` +
+  `test/` + `extension_config.cmake` → WSL `~/sqlext`, fresh duckdb clone at v1.5.5,
+  `-DOVERRIDE_GIT_DESCRIBE=v1.5.5` + the `~/vcpkg` x64-linux toolchain, target
+  `fabricator_loadable_extension`.)
 - **Prior: ABI v64** (v64 = **`onelake_move`** — atomic single-file rename via the ADLS Gen2
   DFS **native rename** (`DataLakeFileClient.RenameAsync`, a metadata op that overwrites an existing
   destination = MoveFile semantics; destination path filesystem-relative with the `<item>.Lakehouse`
