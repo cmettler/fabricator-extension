@@ -156,13 +156,23 @@ fixed to the fabricator-extension repo root):
   decodes the codec-written files exactly** — `to_json` all rows, `variant_get` on the object AND
   on the MoR-updated value, `WHERE v IS NULL` matches only the SQL-NULL row.
 
-**Open (1 workstream, design known):**
-1. **Row-level rebase across rewrites** — master's buffered flush aborts (clean
-   `DeltaConflictException`, correctness preserved) where the fork's v1/v2 rebased (`RebaseDvDmlActions`
-   row-disjoint re-union exists; the `RemapRowsAcrossRewriteAsync` stable-id remap across a concurrent
-   OPTIMIZE/CoW does not). verify_delta_row_level_concurrency: 30/31, failing §(buffered DML through a
-   concurrent compaction). Options: pin the abort (capability regression vs the fork's beyond-Databricks
-   arc) or port the remap as the next upstream proposal (pairs naturally with the parked `_metadata` RFC).
+**Open workstreams: NONE — the last one closed 2026-07-23.**
+1. **Row-level rebase across rewrites — DONE (2026-07-23, EW-only, on `fabricator-patches`).** The
+   regression was never missing machinery, only a missing ROUTE: clast master already ships the full
+   stable-id remap as `RemapRowLevelDeletesAsync` (its "Layer 3 (B)", private, Spark-interop-validated)
+   serving master's own autocommit/`DeltaTransaction` surfaces — the buffered surface's
+   `RebaseDvDmlActionsAsync` just threw on a vanished path ("the explicit buffered remap-across-rewrite
+   is a follow-up"). The fix routes that case through the existing remap: vanished touched paths are
+   collected as `DeleteDvEdit`s (row tracking required — without it the clean rewrite conflict remains),
+   their staged DV pairs are dropped from the rebase, and the remap's new-file DV pairs are appended
+   (they keep the new files' own `baseRowId` — no HWM impact). No Bridge/ABI change — the flush's
+   rebase→check→commit loop is untouched (`CheckLogicalRebaseAsync`'s delete/delete check validates the
+   REMAPPED removes against the same snapshot). The fork's bespoke `RemapRowsAcrossRewriteAsync` stays
+   retired; buffered and autocommit now share ONE remap. EW `BufferedTransactionTests` +3
+   (compose-through-compaction, same-row row-level conflict, no-row-tracking conflict; Table.Tests 421);
+   `verify_delta_row_level_concurrency` back at the fork-era **70** (§5 buffered DELETE + §8 buffered
+   UPDATE compose through a concurrent OPTIMIZE, §9 same-row-through-rewrite = the precise "row-level
+   conflict"). This closes PR #4's "Known follow-up".
 
 ## Branch / working-tree state
 - fabricator: `migrate/ew-clast-master` (this branch). **The pin IS moved** (2026-07-22): gitlink

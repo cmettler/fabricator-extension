@@ -130,9 +130,18 @@ converts advertised schemas via `VariantMarker.ToTransportSchema`). Bridge-side 
 the host-join `UpdateByRowIdsAsync(RecordBatch)` + a composed merge-on-read (`MergeOnReadUpdateAsync`
 in DeltaReader), decimal widening via `DecimalOutput=Decimal128` read option, writer seam
 `IAsyncEnumerable`. **Capability gain: pure-codec variant REWRITES work** (the fork gated them);
-**capability regression (pinned, upstream follow-up): buffered DML through a concurrent
-OPTIMIZE/rewrite aborts cleanly + retries** (the fork's `RemapRowsAcrossRewriteAsync` stable-id remap
-isn't in master's buffered flush; autocommit DML still remaps). Validated: 49/49 delta suites at
+**the one capability regression is CLOSED (2026-07-23, EW-only on fabricator-patches): buffered DML
+through a concurrent OPTIMIZE/rewrite now REMAPS again** — clast master already shipped the full
+stable-id remap (`RemapRowLevelDeletesAsync`, its "Layer 3 (B)", serving autocommit +
+`DeltaTransaction`); the buffered surface's `RebaseDvDmlActionsAsync` just threw on a vanished path.
+Now it collects rewritten-away touched paths as `DeleteDvEdit`s and routes them through that SAME
+remap (row tracking required — without it the clean rewrite conflict remains; the remap's new-file DV
+pairs keep their own baseRowId, no HWM impact; the fork's bespoke `RemapRowsAcrossRewriteAsync` stays
+retired). No Bridge/ABI change. EW BufferedTransactionTests +3 (Table.Tests 421);
+`verify_delta_row_level_concurrency` back at the fork-era 70 (§5 buffered DELETE + §8 buffered UPDATE
+compose through OPTIMIZE; §9 = precise "row-level conflict"); regression transactions 941 /
+row_tracking_virtual 299 / optimize 40 / dv_default 58 / update 63 / delete 28 green. This closes
+PR #4's "Known follow-up". Original migration validation: 49/49 delta suites at
 full counts (variant now 144), EW suites green, and the LIVE OneLake/Spark round-trip incl. row-id
 parity both directions + Spark decoding codec-written variant. **Fork-era EW notes below this point
 are HISTORICAL** — they describe the retired fork lineage; the mechanisms survive but live in the

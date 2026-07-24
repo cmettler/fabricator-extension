@@ -4,11 +4,12 @@
 #              touching the SAME FILE composes when the touched ROWS are disjoint (the COMMIT rebase
 #              re-unions the deletion vectors), and v2 REMAPS rows ACROSS a concurrent rewrite
 #              (OPTIMIZE / copy-on-write) by STABLE ROW ID with the row's commit version as the
-#              concurrent-modification discriminator (RemapRowsAcrossRewriteAsync). The SAME row
-#              modified by both writers is a row-level conflict. Applies under write_serializable (the
-#              default; read checks are replaced by the row-level write validation); `serializable`
-#              keeps the strict file-level checks. DV + row-tracking tables (the defaults).
-#              Set FABRICATOR_DELTA_WRITE_DIR.
+#              concurrent-modification discriminator (EW's Layer 3 (B) RemapRowLevelDeletesAsync —
+#              shared by the autocommit AND the buffered surface, the latter via
+#              RebaseDvDmlActionsAsync). The SAME row modified by both writers is a row-level
+#              conflict. Applies under write_serializable (the default; read checks are replaced by
+#              the row-level write validation); `serializable` keeps the strict file-level checks.
+#              DV + row-tracking tables (the defaults). Set FABRICATOR_DELTA_WRITE_DIR.
 # group: [fabricator]
 
 require fabricator
@@ -113,12 +114,10 @@ SELECT s FROM rl.main.t WHERE id = 10;
 ----
 B
 
-# ---- 5. A concurrent OPTIMIZE (file rewritten away) under a BUFFERED transaction: EW master aborts
-#         with a CLEAN conflict ("the auto commit path remaps the rows by stable id; the explicit
-#         buffered remap-across-rewrite is a follow-up") — correctness preserved, no lost or phantom
-#         rows, and the retried statement lands on the compacted file. (The fork's stable-row-id remap
-#         made this compose without a retry — beyond Databricks, which still conflicts with compaction;
-#         re-proposing that remap for the buffered surface upstream is the recorded follow-up.) ----
+# ---- 5. A concurrent OPTIMIZE (file rewritten away) under a BUFFERED transaction COMPOSES: the
+#         rebase relocates the buffered delete's rows by STABLE ROW ID onto the compacted file
+#         (RemapRowLevelDeletesAsync — the same Layer 3 (B) machinery the autocommit path uses) and
+#         the COMMIT lands, no retry — beyond Databricks, which still conflicts with compaction. ----
 
 statement ok con1
 BEGIN;
@@ -132,21 +131,10 @@ SELECT fabricator_exec('rl', 'OPTIMIZE main.t');
 ----
 0
 
-statement error con1
-COMMIT;
-----
-concurrent rewrite/compaction
-
-# nothing lost, nothing phantom — the transaction rolled back cleanly
-query II
-SELECT count(*), sum(id) FROM rl.main.t;
-----
-6	34
-
-# the RETRY succeeds against the compacted table (the documented recovery)
 statement ok con1
-DELETE FROM rl.main.t WHERE id % 11 = 1;
+COMMIT;
 
+# both landed: the OPTIMIZE compacted AND the buffered delete removed id=1 through the rewrite
 query II
 SELECT count(*), sum(id) FROM rl.main.t;
 ----
@@ -210,9 +198,8 @@ SELECT count(*), sum(id) FROM rl.main.p;
 ----
 17	177
 
-# ---- 8. Buffered UPDATE + concurrent OPTIMIZE: EW master aborts with the clean conflict (the
-#         buffered remap-across-rewrite is the recorded upstream follow-up — see §5); the retry lands
-#         on the compacted file. ----
+# ---- 8. Buffered UPDATE THROUGH a concurrent OPTIMIZE composes: the update's DV half remaps onto
+#         the compacted file, the post-image add is untouched — the updated value lands, no retry. ----
 
 statement ok
 CREATE TABLE rl.main.q AS SELECT r AS id, 'a' || r AS v FROM range(1, 7) t(r);
@@ -231,14 +218,8 @@ SELECT fabricator_exec('rl', 'OPTIMIZE main.q');
 ----
 0
 
-statement error con1
-COMMIT;
-----
-concurrent rewrite/compaction
-
-# rolled back cleanly; the retried statement succeeds against the compacted table
 statement ok con1
-UPDATE rl.main.q SET v = 'x' WHERE id = 3;
+COMMIT;
 
 query IT
 SELECT id, v FROM rl.main.q WHERE id IN (2, 3, 4) ORDER BY id;
@@ -252,9 +233,9 @@ SELECT count(*) FROM rl.main.q;
 ----
 10
 
-# ---- 9. same row THROUGH a rewrite: the racer compacts AND deletes the row → a conflict either way.
-#         (EW master aborts at the rewrite itself — the buffered remap follow-up would surface the more
-#         precise "row-level conflict" the fork reported; both are clean aborts, deleted-exactly-once.) ----
+# ---- 9. same row THROUGH a rewrite: the racer compacts AND deletes the row → the remap finds the
+#         row's stable id gone (DV-hidden on the compacted file) → the precise row-level conflict;
+#         clean abort, deleted-exactly-once. ----
 
 statement ok con1
 BEGIN;
@@ -273,7 +254,7 @@ DELETE FROM rl.main.q WHERE id = 5;
 statement error con1
 COMMIT;
 ----
-conflict
+row-level conflict
 
 # deleted exactly once (by the racer)
 query I
