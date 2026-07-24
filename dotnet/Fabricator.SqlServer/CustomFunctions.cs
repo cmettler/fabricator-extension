@@ -80,6 +80,38 @@ internal static class CustomFunctions
         new GfProductFunction(),
     };
 
+    // Provider MACROs — SQL templates registered into DuckDB's system catalog at extension load, so they
+    // resolve as a bare fn(...) / FROM fn(...) in every database with no ATTACH. Each is one complete CREATE
+    // MACRO statement parsed by DuckDB itself (named-parameter defaults + overload sets + AS TABLE all work).
+    // A macro is expanded by the BINDER — parameters substitute as expressions, nothing crosses the bridge at
+    // runtime — so this is the cheapest way to ship sugar over our functions. When the SQL TEXT itself must
+    // depend on the arguments, use a SQL-generating table function instead.
+    // See docs/macros-and-sqlgen-functions.md.
+    public static readonly IReadOnlyList<MacroDefinition> GlobalMacros = new MacroDefinition[]
+    {
+        // Split fabricator's TRANSIENT Delta rowid — (fileOrdinal << 40) | rowPositionInFile, the DML locator
+        // exposed as _metadata.row_id — into its two halves. Diagnostics for the rowid/DV paths
+        // (docs/rowid-concepts.md); NOT the stable row-tracking id (that is __delta_row_id).
+        new MacroDefinition("fabricator_rowid_parts",
+            "CREATE MACRO fabricator_rowid_parts(rid) AS "
+            + "{'file_ordinal': rid >> 40, 'row_position': rid & ((1::BIGINT << 40) - 1)}"),
+        // The inverse — compose a transient rowid. An OVERLOAD SET (dispatch by arity): from the two halves,
+        // or round-tripping a fabricator_rowid_parts struct.
+        new MacroDefinition("fabricator_rowid_of",
+            "CREATE MACRO fabricator_rowid_of(file_ordinal, row_position) AS "
+            + "(file_ordinal::BIGINT << 40) | row_position, "
+            + "(parts) AS (parts.file_ordinal::BIGINT << 40) | parts.row_position"),
+        // Sugar over the bucket() global scalar with the DuckLake/Iceberg default bucket count — shows a
+        // NAMED PARAMETER WITH A DEFAULT crossing intact: fabricator_bucket_of(x), ..., n := 16, or
+        // positionally (..., 16 — DuckDB accepts either for a defaulted macro parameter).
+        new MacroDefinition("fabricator_bucket_of",
+            "CREATE MACRO fabricator_bucket_of(v, n := 8) AS bucket(n, v)"),
+        // A TABLE macro over the global Delta reader: peek at any Delta table by path, no ATTACH.
+        new MacroDefinition("fabricator_delta_head",
+            "CREATE MACRO fabricator_delta_head(path, n := 100) AS TABLE "
+            + "SELECT * FROM fabricator_delta_scan(path) LIMIT n"),
+    };
+
     public static readonly IReadOnlyList<ICatalogScalarFunction> Scalar = new ICatalogScalarFunction[]
     {
         new CfAddFunction(),

@@ -28,3 +28,31 @@ query I
 SELECT fabricator_render('Hi {{ name }}', {'name':'plugin'});
 ----
 Hi plugin
+
+# ---- plugin-declared MACROs (docs/macros-and-sqlgen-functions.md §1) ----
+# A plugin ships SQL templates the same way it ships functions: declare CREATE MACRO statements, the host
+# parses + registers them at load. No bridge or ABI involvement.
+
+query I
+SELECT plug_double(21);
+----
+42
+
+query II
+SELECT DISTINCT function_name, function_type FROM duckdb_functions() WHERE function_name = 'plug_double';
+----
+plug_double	macro
+
+# The plugin ALSO declares a deliberately MALFORMED macro (plug_bad_macro): it is skipped with a warning at
+# load and blocks nothing — its sibling macro above and the plugin's scalar below both work. (The warning
+# itself only reaches duckdb_logs when logging was enabled BEFORE the extension loaded — i.e. the LOAD
+# path, not this statically-linked binary; verify it there.)
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name = 'plug_bad_macro';
+----
+0
+
+query I
+SELECT plug_greet('after');
+----
+Hello, after (from plugin)

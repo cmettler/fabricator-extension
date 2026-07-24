@@ -32,6 +32,10 @@ public static class GlobalFunctions
         new(() => Build<IAggregateFunction>(b => b.GlobalAggregateFunctions, f => f.Name, "aggregate"),
             LazyThreadSafetyMode.ExecutionAndPublication);
 
+    private static readonly Lazy<IReadOnlyDictionary<string, MacroDefinition>> MacroMap =
+        new(() => Build<MacroDefinition>(b => b.GlobalMacros, m => m.Name, "macro"),
+            LazyThreadSafetyMode.ExecutionAndPublication);
+
     /// <summary>All declared global scalar functions (the provider union), for <c>list_global_functions</c>.</summary>
     public static IReadOnlyCollection<IScalarFunction> AllScalars() => (IReadOnlyCollection<IScalarFunction>)ScalarMap.Value.Values;
 
@@ -54,6 +58,11 @@ public static class GlobalFunctions
 
     /// <summary>All declared global aggregate functions, for <c>list_global_functions</c>.</summary>
     public static IReadOnlyCollection<IAggregateFunction> AllAggregates() => (IReadOnlyCollection<IAggregateFunction>)AggregateMap.Value.Values;
+
+    /// <summary>All declared provider MACROs (the provider union), for <c>list_global_functions</c>. Each carries
+    /// its full <c>CREATE MACRO</c> statement, which the host parses + registers at load — no execution path
+    /// (a macro is expanded by DuckDB's binder, so nothing ever crosses back).</summary>
+    public static IReadOnlyCollection<MacroDefinition> AllMacros() => (IReadOnlyCollection<MacroDefinition>)MacroMap.Value.Values;
 
     /// <summary>Open a session for a global aggregate by name (the handle-0 agg_open path). Throws if none.</summary>
     public static IAggregateSession ResolveAggregate(string name) =>

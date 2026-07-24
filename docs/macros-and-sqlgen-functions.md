@@ -1,7 +1,8 @@
 # C#-declared DuckDB macros + SQL-generating (bind-replace) table functions — design
 
-Status: **DESIGN — nothing built.** Written 2026-07-24 against DuckDB v1.5.5 source (the in-tree
-`duckdb/` clone) and the current fabricator global-function machinery (ABI v67).
+Status: **Phase A (macros) BUILT + VERIFIED 2026-07-24** (see §1.3 "AS BUILT"); Phases B/C (SQL-generating
+table functions) still design. Written against DuckDB v1.5.5 source (the in-tree `duckdb/` clone) and the
+fabricator global-function machinery (ABI v67).
 
 Two related features, one theme — letting a provider ship **SQL** instead of marshaled execution:
 
@@ -146,6 +147,41 @@ CREATE MACRO fabricator_delta_head(path, n := 100) AS TABLE
 
 Registered at load → available bare in every database, composable with all our functions, and the
 binder substitutes `rid` / `path` / `n` as **expressions** (no string interpolation anywhere).
+
+### 1.3 AS BUILT (2026-07-24)
+
+Shipped exactly as designed above — the DDL-text route, no ABI bump. Files:
+`dotnet/Fabricator.Abstractions/MacroDefinition.cs` (new) + `IBackend.GlobalMacros`;
+`GlobalFunctions.MacroMap`/`AllMacros()`; `Bootstrap.ListGlobalFunctions` (kind `macro` + the new `body`
+column); `RegisterFabricatorGlobalFunctions`'s `kind == "macro"` branch + `ReadStringTable(stream, 4)`
+(`src/catalog/fabricator_schema_entry.cpp`); demos in `Fabricator.SqlServer/CustomFunctions.GlobalMacros`
+and `Fabricator.SamplePlugin`. Tests: **`test/verify_macros.test` (41)** + `verify_plugin.test` (10, +4 for
+the plugin-macro sections). Regression: global_functions 63 / custom_functions 89 / hilbert 27 / bucket 34.
+
+Findings + deviations from the plan:
+
+- **Flags: `internal = true` only** — NOT the `DefaultFunctionGenerator`'s `temporary = true, internal = true`
+  pair. `BuiltinFunctions::AddFunction` (`built_in_functions.cpp:31-58`) sets only `internal`, and that is the
+  right parallel for a load-time system-catalog entry (`temporary` is a lazily-generated-default concern).
+  Verified: the entries behave like built-ins.
+- **A defaulted macro parameter also accepts a POSITIONAL argument**: `fabricator_bucket_of('alice', 16)`
+  works, not just `n := 16`. So a named default covers the "optional trailing arg" case completely — an
+  overload set is only needed for genuinely different signatures (different arity *shapes*).
+- **An overload set is ONE catalog entry but N rows in `duckdb_functions()`** (one per overload) — a
+  `DISTINCT`/count-aware test query is required (pinned in `verify_macros.test` §1).
+- **The load-time WARN is only observable on the `LOAD` path.** `DUCKDB_LOG_WARNING` at
+  `Extension::Load` cannot reach `duckdb_logs` in a statically-linked binary (the load precedes any query, so
+  logging can never have been enabled yet). With the loadable it works: `CALL enable_logging(...); LOAD
+  fabricator;`. The *behavioral* contract (skip, don't block) is what the tests pin — the sample plugin ships
+  a deliberately malformed `plug_bad_macro` beside a good `plug_double` for exactly that.
+- **Provider qualification is rejected, not ignored**: a `CREATE MACRO somecat.someschema.foo(...)` is skipped
+  with a warning (macros land in the system catalog's `main`; provider namespacing goes in the NAME prefix).
+  This settles open question #2 in favor of "force main".
+
+Demos now shipping (SQL Server provider = the always-present default, like `fabricator_render`):
+`fabricator_rowid_parts(rid)` (scalar → struct), `fabricator_rowid_of(ordinal, position)` /
+`(parts)` (**overload set**, the round-trip inverse), `fabricator_bucket_of(v, n := 8)` (**named default**),
+`fabricator_delta_head(path, n := 100)` (**table macro** over `fabricator_delta_scan`).
 
 #### Deliberately out of scope (deferred)
 
@@ -343,14 +379,8 @@ The `union_by_pattern` case is the one neither a macro (identifier list is dynam
 
 Each phase independently shippable; suites green per phase (the standing convention).
 
-- **Phase A — macros** (C# + C++ lockstep, decl-stream column, **no ABI bump**):
-  `MacroDefinition`/`IBackend.GlobalMacros` + `GlobalFunctions.MacroMap`; `ListGlobalFunctions`
-  emits kind `macro` + the `body` column; `ReadStringTable(stream, 4)` + the parse-and-register
-  branch. Demos: `fabricator_rowid_parts`, `fabricator_bucket_of`, `fabricator_delta_head`.
-  **`test/verify_macros.test`**: scalar macro (incl. named default + an overload set), table macro
-  over `fabricator_delta_scan` (requires `FABRICATOR_DELTA_WRITE_DIR`), visibility with no ATTACH,
-  composition with existing globals (`bucket`, `hilbert_index`), a malformed provider macro is
-  skipped with a WARN (pin via `duckdb_logs`), duplicate-name-across-providers fatal (unit-level).
+- **Phase A — macros — DONE (2026-07-24, see §1.3).** No ABI bump; `verify_macros.test` 41 +
+  `verify_plugin.test` 10.
 - **Phase B — global `table_sql`** (**ABI v68**, lockstep): the entry + `Abi.cs`/`Bootstrap.cs`
   handler + `ISqlTableFunction` + `GlobalFunctions.SqlTableMap` + the registrar branch + the shared
   `FabricatorSqlGenBindReplace`. Demo `fabricator_sql_seq`. **`test/verify_sqlgen.test`**: result +

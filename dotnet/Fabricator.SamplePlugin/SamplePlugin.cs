@@ -16,6 +16,18 @@ public sealed class SamplePluginBackend : IBackend
 
     public IEnumerable<IScalarFunction> GlobalScalarFunctions => new IScalarFunction[] { new PlugGreetFunction() };
 
+    /// <summary>
+    /// Macros a plugin ships — proving the SQL-template path needs no more from a plugin than the function path
+    /// (declare; the host parses + registers at load). The second entry is DELIBERATELY MALFORMED: it pins the
+    /// contract that a broken provider macro is SKIPPED with a warning and does NOT block its sibling (or the
+    /// extension). It is why loading this sample plugin prints one macro warning at load.
+    /// </summary>
+    public IEnumerable<MacroDefinition> GlobalMacros => new MacroDefinition[]
+    {
+        new MacroDefinition("plug_double", "CREATE MACRO plug_double(x) AS x * 2"),
+        new MacroDefinition("plug_bad_macro", "CREATE MACRO plug_bad_macro(x) AS x +"),
+    };
+
     public string BuildConnectionString(string secretType, IReadOnlyDictionary<string, string> fields,
                                         string baseConnString) =>
         throw new NotSupportedException("sampleplugin: global functions only (no catalog).");

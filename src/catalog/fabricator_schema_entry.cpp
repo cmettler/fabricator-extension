@@ -19,6 +19,7 @@
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/execution/execution_context.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "duckdb/execution/expression_executor_state.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
@@ -41,7 +42,10 @@
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/parsed_data/alter_table_info.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/parsed_data/create_aggregate_function_info.hpp"
+#include "duckdb/parser/parsed_data/create_macro_info.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
@@ -1792,13 +1796,15 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 		ArrowArrayStream stream;
 		std::memset(&stream, 0, sizeof(stream));
 		fabricator::ListGlobalFunctions(stream);
-		// Columns: name, kind, string_order, param_count(int), return_type. We read the three leading string
-		// columns (name, kind, string_order); the precise arg/return types come from the per-function fetch
-		// below (handle = 0 = global). string_order ("1"/"0") marks a byte-ordered-string table reader.
-		auto rows = ReadStringTable(stream, 3);
+		// Columns: name, kind, string_order, body, param_count(int), return_type. We read the FOUR leading
+		// string columns; the precise arg/return types come from the per-function fetch below (handle = 0 =
+		// global). string_order ("1"/"0") marks a byte-ordered-string table reader; body carries the complete
+		// CREATE MACRO statement for kind='macro' (empty for every other kind).
+		auto rows = ReadStringTable(stream, 4);
 		const auto &names = rows[0];
 		const auto &kinds = rows[1];
 		const auto &string_order = rows[2];
+		const auto &bodies = rows[3];
 		if (names.empty()) {
 			return; // no global functions declared
 		}
@@ -1899,6 +1905,44 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				fn_info->string_order_pushable = string_order[i] == "1";
 				tf.function_info = std::move(fn_info);
 				loader.RegisterFunction(tf);
+			} else if (kind == "macro") {
+				// A provider MACRO: a SQL TEMPLATE, not a marshaled function — the provider ships the complete
+				// CREATE MACRO statement and DuckDB's OWN parser owns the grammar (so named-parameter defaults,
+				// overload sets and `AS TABLE` all work, and the parsed statement carries the scalar/table kind).
+				// Registered into the SYSTEM catalog, like a built-in: bare fn(...) in every database, no ATTACH.
+				// Nothing crosses back at runtime — the binder expands it. See docs/macros-and-sqlgen-functions.md.
+				try {
+					Parser parser(context.GetParserOptions());
+					parser.ParseQuery(bodies[i]);
+					if (parser.statements.size() != 1 ||
+					    parser.statements[0]->type != StatementType::CREATE_STATEMENT) {
+						throw ParserException("expected a single CREATE MACRO statement");
+					}
+					auto &create = parser.statements[0]->Cast<CreateStatement>();
+					if (create.info->type != CatalogType::MACRO_ENTRY &&
+					    create.info->type != CatalogType::TABLE_MACRO_ENTRY) {
+						throw ParserException("expected CREATE MACRO (scalar) or CREATE MACRO ... AS TABLE");
+					}
+					auto info = unique_ptr_cast<CreateInfo, CreateMacroInfo>(std::move(create.info));
+					// Provider namespacing belongs in the NAME (fabricator_*), not a schema/catalog: these land
+					// in the system catalog's main schema. Reject a foreign qualification rather than ignore it.
+					if (!info->catalog.empty() ||
+					    !(info->schema.empty() || StringUtil::CIEquals(info->schema, DEFAULT_SCHEMA))) {
+						throw ParserException(
+						    "a provider macro must be unqualified (or main-qualified) — got catalog '%s' schema '%s'",
+						    info->catalog, info->schema);
+					}
+					info->catalog = INVALID_CATALOG;
+					info->schema = DEFAULT_SCHEMA;
+					info->internal = true; // a provider-shipped entry, like a built-in (BuiltinFunctions parity)
+					info->on_conflict = OnCreateConflict::ERROR_ON_CONFLICT; // a clash must be visible, not silent
+					loader.RegisterFunction(*info);
+				} catch (std::exception &ex) {
+					// Best-effort, like every other load-time registration: a broken provider macro must never
+					// block the extension. Surfaces as a DuckDB WARNING (shell + duckdb_logs).
+					DUCKDB_LOG_WARNING(context, StringUtil::Format("fabricator: global macro '%s' skipped: %s",
+					                                               fn_name, ex.what()));
+				}
 			}
 		}
 	} catch (std::exception &) {

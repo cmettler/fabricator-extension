@@ -1312,6 +1312,9 @@ public static unsafe class Bootstrap
             // "1" iff the function's source orders strings byte/binary (string ordering + BETWEEN safe to push);
             // only meaningful for table functions, "0" for the other kinds. Read by the C++ load-time registrar.
             var stringOrder = new StringArray.Builder();
+            // kind='macro' only: the provider's complete CREATE MACRO statement, parsed + registered by the
+            // C++ load-time registrar (DuckDB's own parser owns the grammar). Empty for every other kind.
+            var body = new StringArray.Builder();
             var paramCount = new Int32Array.Builder();
             var returnType = new StringArray.Builder();
             int rows = 0;
@@ -1320,6 +1323,7 @@ public static unsafe class Bootstrap
                 name.Append(fn.Name);
                 kind.Append("scalar");
                 stringOrder.Append("0");
+                body.Append(string.Empty);
                 paramCount.Append(fn.Parameters.FieldsList.Count);
                 returnType.Append(fn.Result.DataType.Name);
                 rows++;
@@ -1329,6 +1333,7 @@ public static unsafe class Bootstrap
                 name.Append(fn.Name);
                 kind.Append("inout");
                 stringOrder.Append("0");
+                body.Append(string.Empty);
                 paramCount.Append(fn.InputSchema.FieldsList.Count);
                 returnType.Append(string.Empty);
                 rows++;
@@ -1338,6 +1343,7 @@ public static unsafe class Bootstrap
                 name.Append(fn.Name);
                 kind.Append("collector");
                 stringOrder.Append("0");
+                body.Append(string.Empty);
                 paramCount.Append(fn.InputSchema.FieldsList.Count);
                 returnType.Append(string.Empty);
                 rows++;
@@ -1347,6 +1353,7 @@ public static unsafe class Bootstrap
                 name.Append(fn.Name);
                 kind.Append("table");
                 stringOrder.Append(fn.StringOrderPushable ? "1" : "0");
+                body.Append(string.Empty);
                 paramCount.Append(fn.Parameters.FieldsList.Count);
                 returnType.Append(string.Empty);
                 rows++;
@@ -1356,8 +1363,21 @@ public static unsafe class Bootstrap
                 name.Append(fn.Name);
                 kind.Append(fn.SupportsSpill ? "aggregate_spill" : "aggregate");
                 stringOrder.Append("0");
+                body.Append(string.Empty);
                 paramCount.Append(fn.Parameters.FieldsList.Count);
                 returnType.Append(fn.Result.DataType.Name);
+                rows++;
+            }
+            // MACROs: SQL templates registered into DuckDB's system catalog at load. No param/return metadata
+            // crosses — the parsed CREATE MACRO statement carries the signature AND the scalar/table kind.
+            foreach (var macro in GlobalFunctions.AllMacros())
+            {
+                name.Append(macro.Name);
+                kind.Append("macro");
+                stringOrder.Append("0");
+                body.Append(macro.CreateSql);
+                paramCount.Append(0);
+                returnType.Append(string.Empty);
                 rows++;
             }
             var schema = new Schema(new[]
@@ -1365,12 +1385,13 @@ public static unsafe class Bootstrap
                 new Field("name", StringType.Default, nullable: false),
                 new Field("kind", StringType.Default, nullable: false),
                 new Field("string_order", StringType.Default, nullable: false),
+                new Field("body", StringType.Default, nullable: false),
                 new Field("param_count", Int32Type.Default, nullable: false),
                 new Field("return_type", StringType.Default, nullable: true),
             }, metadata: null);
             var batch = new RecordBatch(schema, new IArrowArray[]
             {
-                name.Build(), kind.Build(), stringOrder.Build(), paramCount.Build(), returnType.Build(),
+                name.Build(), kind.Build(), stringOrder.Build(), body.Build(), paramCount.Build(), returnType.Build(),
             }, rows);
             CArrowArrayStreamExporter.ExportArrayStream(new InMemoryArrayStream(schema, new[] { batch }), outStream);
             return FabricatorStatus.Ok;

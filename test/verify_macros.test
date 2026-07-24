@@ -1,0 +1,152 @@
+# name: test/verify_macros.test
+# description: Provider-declared DuckDB MACROs (docs/macros-and-sqlgen-functions.md §1) — a provider ships
+#              complete CREATE MACRO statements (IBackend.GlobalMacros), the host hands each to DuckDB's OWN
+#              parser at extension load and registers the resulting CreateMacroInfo into the SYSTEM catalog.
+#              So a macro resolves as a bare fn(...) / FROM fn(...) in EVERY database with NO ATTACH, and the
+#              full grammar works: scalar + table macros, named-parameter defaults, overload sets. A macro is
+#              expanded by the BINDER (parameters substitute as expressions) — nothing crosses the bridge at
+#              runtime. Set FABRICATOR_DELTA_WRITE_DIR (the table-macro section writes a Delta table).
+# group: [fabricator]
+
+require fabricator
+
+require parquet
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+# ---- 1. registration: the declared macros are in the catalog, typed by KIND (the parsed statement decides) ----
+
+query II
+SELECT DISTINCT function_name, function_type FROM duckdb_functions()
+WHERE function_name IN ('fabricator_rowid_parts', 'fabricator_rowid_of', 'fabricator_bucket_of',
+                        'fabricator_delta_head')
+ORDER BY function_name;
+----
+fabricator_bucket_of	macro
+fabricator_delta_head	table_macro
+fabricator_rowid_of	macro
+fabricator_rowid_parts	macro
+
+# An OVERLOAD SET is one catalog entry with several macros — duckdb_functions() lists one row per overload
+# (2 for fabricator_rowid_of, 1 for a single-signature macro).
+query II
+SELECT count(*) FILTER (WHERE function_name = 'fabricator_rowid_of'),
+       count(*) FILTER (WHERE function_name = 'fabricator_rowid_parts')
+FROM duckdb_functions();
+----
+2	1
+
+# The body is the provider's, parsed by DuckDB (not re-serialized by us).
+query I
+SELECT macro_definition FROM duckdb_functions() WHERE function_name = 'fabricator_bucket_of';
+----
+bucket(n, v)
+
+# ---- 2. scalar macro: the transient-rowid splitter (docs/rowid-concepts.md concept 2) ----
+
+query II
+SELECT (fabricator_rowid_parts((3::BIGINT << 40) | 17)).file_ordinal,
+       (fabricator_rowid_parts((3::BIGINT << 40) | 17)).row_position;
+----
+3	17
+
+# Vectorized over a batch, and composable with ordinary SQL.
+query II
+SELECT (fabricator_rowid_parts(rid)).file_ordinal AS o, (fabricator_rowid_parts(rid)).row_position AS p
+FROM (VALUES ((1::BIGINT << 40) | 5), ((2::BIGINT << 40) | 0)) v(rid)
+ORDER BY o;
+----
+1	5
+2	0
+
+# ---- 3. NAMED PARAMETER WITH A DEFAULT — omitted, named, and positional all bind ----
+
+query III
+SELECT fabricator_bucket_of('alice') AS dflt,
+       fabricator_bucket_of('alice', n := 16) AS named,
+       fabricator_bucket_of('alice', 16) AS positional;
+----
+5	13	13
+
+# The default matches calling the underlying global scalar directly (the macro is pure sugar).
+query I
+SELECT fabricator_bucket_of('alice') = bucket(8, 'alice');
+----
+true
+
+# A macro parameter substitutes as an EXPRESSION, so a column reference works with no interpolation.
+query I
+SELECT count(DISTINCT fabricator_bucket_of(s)) BETWEEN 1 AND 8
+FROM (SELECT 'k' || r AS s FROM range(1, 50) t(r));
+----
+true
+
+# ---- 4. OVERLOAD SET (dispatch by arity): compose a rowid from halves, or from the parts struct ----
+
+query II
+SELECT fabricator_rowid_of(3, 17) AS from_halves,
+       fabricator_rowid_of(fabricator_rowid_parts((3::BIGINT << 40) | 17)) AS from_struct;
+----
+3298534883345	3298534883345
+
+# round-trip identity: parts -> rowid -> parts
+query I
+SELECT fabricator_rowid_of(fabricator_rowid_parts(rid)) = rid
+FROM (VALUES ((7::BIGINT << 40) | 123)) v(rid);
+----
+true
+
+# ---- 5. TABLE macro over the global Delta reader — FROM fn(...), no ATTACH needed to READ ----
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/macros' AS mlake (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE mlake.main.t AS SELECT r AS id, 'v' || r AS s FROM range(1, 11) t(r);
+
+statement ok
+DETACH mlake;
+
+# the table macro reads the Delta table BY PATH — the ATTACH above is gone
+query I
+SELECT count(*) FROM fabricator_delta_head('${FABRICATOR_DELTA_WRITE_DIR}/macros/t');
+----
+10
+
+query I
+SELECT count(*) FROM fabricator_delta_head('${FABRICATOR_DELTA_WRITE_DIR}/macros/t', n := 3);
+----
+3
+
+query IT
+SELECT id, s FROM fabricator_delta_head('${FABRICATOR_DELTA_WRITE_DIR}/macros/t', n := 2) ORDER BY id;
+----
+1	v1
+2	v2
+
+# a table macro is an ordinary relation: joins, aggregates, subqueries all bind
+query II
+SELECT count(*), sum(h.id)
+FROM fabricator_delta_head('${FABRICATOR_DELTA_WRITE_DIR}/macros/t') h
+WHERE h.id % 2 = 0;
+----
+5	30
+
+# ---- 6. system-catalog scope: macros resolve in a NEWLY attached database too (no per-db registration) ----
+
+statement ok
+ATTACH ':memory:' AS other;
+
+statement ok
+USE other;
+
+query I
+SELECT fabricator_bucket_of('alice');
+----
+5
+
+statement ok
+USE memory;
+
+statement ok
+DETACH other;

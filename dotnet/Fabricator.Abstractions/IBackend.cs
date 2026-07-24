@@ -71,6 +71,14 @@ public interface IBackend
     IEnumerable<IAggregateFunction> GlobalAggregateFunctions => System.Array.Empty<IAggregateFunction>();
 
     /// <summary>
+    /// DuckDB MACROs the provider ships — SQL templates registered at extension load into the SYSTEM catalog
+    /// (bare <c>fn(...)</c> / <c>FROM fn(...)</c>, no ATTACH, every database). Each is one complete
+    /// <c>CREATE MACRO</c> statement parsed by DuckDB itself, so scalar + table macros, named-parameter
+    /// defaults and overload sets all work. Empty by default. See docs/macros-and-sqlgen-functions.md.
+    /// </summary>
+    IEnumerable<MacroDefinition> GlobalMacros => System.Array.Empty<MacroDefinition>();
+
+    /// <summary>
     /// Builds a provider connection string from a secret's fields (the host reads the DuckDB secret and
     /// passes its key/values here). Keeps all provider connection-string / auth formatting in the backend —
     /// the C++ side has no knowledge of the provider's connstr dialect. The result is passed to

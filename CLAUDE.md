@@ -362,6 +362,34 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   the FULL CIRCLE — empty CREATE + identity → INSERT → UPDATE → DELETE all through the SQL catalog),
   re-runnable back-to-back; `verify_with_options_mssql` 9; regression identity 64 / columnstore 20 /
   delta s3 161 / scalar 26 / procs 24 / native_write 147 green.
+- **PROVIDER-DECLARED DuckDB MACROS — DONE (2026-07-24, C#+C++ lockstep, NO ABI bump; design +
+  as-built: [docs/macros-and-sqlgen-functions.md](docs/macros-and-sqlgen-functions.md) §1).** A provider
+  ships SQL TEMPLATES beside its marshaled functions: `IBackend.GlobalMacros` →
+  `MacroDefinition(Name, CreateSql)` where `CreateSql` is a **complete `CREATE MACRO` statement**; the C++
+  load-time registrar hands it to **DuckDB's OWN `Parser`** and registers the resulting `CreateMacroInfo`
+  via `ExtensionLoader::RegisterFunction(CreateMacroInfo&)` into the **SYSTEM catalog** (like a built-in ⇒
+  bare `fn(...)` / `FROM fn(...)` in EVERY database, no ATTACH). Because DuckDB parses it, the FULL grammar
+  works with zero bespoke encoding: scalar AND table macros (the parsed statement carries the kind),
+  named-parameter defaults, overload sets, no 8-param cap. **Nothing crosses the bridge at runtime** — the
+  binder expands the macro, substituting parameters as EXPRESSIONS (structure/identifiers frozen at
+  declaration ⇒ injection-free by construction). Declaration rides `list_global_functions` as kind `macro`
+  + a new leading `body` string column (`ReadStringTable(stream, 4)`) — the `string_order` no-bump
+  precedent. **Dividing rule vs the (planned) SQL-generating table functions: fixed SQL text + varying
+  VALUES ⇒ macro; SQL TEXT depends on the args ⇒ sqlgen (§2, not built).** Flags = `internal = true`
+  ONLY (`BuiltinFunctions` parity — not the `DefaultFunctionGenerator`'s `temporary` pair). Provider
+  qualification (`somecat.sch.foo`) is REJECTED, not ignored (macros land in system `main`; namespace via
+  the NAME prefix). Bad DDL ⇒ WARN + skip, never blocks the extension (**the load-time WARN only reaches
+  `duckdb_logs` on the LOAD path** — a static binary loads before logging can be enabled; the sample plugin
+  ships a deliberately malformed `plug_bad_macro` beside a good `plug_double` to pin skip-doesn't-block).
+  **Two findings:** a DEFAULTED macro param also binds POSITIONALLY (`fabricator_bucket_of('alice', 16)`,
+  not just `n := 16`) ⇒ overload sets are only for genuinely different arities; an overload set is ONE
+  catalog entry but N rows in `duckdb_functions()`. Demos (SqlServer = the always-present default provider,
+  the `fabricator_render` slot): `fabricator_rowid_parts(rid)` → `{file_ordinal, row_position}` (the
+  TRANSIENT rowid splitter, docs/rowid-concepts.md), `fabricator_rowid_of(ord, pos)` / `(parts)` (overload
+  set, the round-trip inverse), `fabricator_bucket_of(v, n := 8)` (named default over `bucket()`),
+  `fabricator_delta_head(path, n := 100)` (TABLE macro over `fabricator_delta_scan`). Plugins ship macros
+  too (`Fabricator.SamplePlugin`, zero bridge/ABI change). `test/verify_macros.test` (41) +
+  `verify_plugin.test` (10); regression global_functions 63 / custom_functions 89 / hilbert 27 / bucket 34.
 - **`hilbert_index` global scalar — DONE (2026-07-18, C#-only, no ABI): the liquid-clustering-style
   ordered-write primitive.** `hilbert_index(coords BIGINT[], bits) → BIGINT` (Bridge
   `HilbertIndexFunction`, declared in `CustomFunctions.GlobalScalar` — the fabricator_render slot):
