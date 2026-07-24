@@ -735,6 +735,23 @@ typedef struct FabricatorVTable {
 	// hardcoded remote-prefix list) works on onelake://. dest is a full onelake:// path in the SAME
 	// workspace filesystem; cred_json as above.
 	int32_t (*onelake_move)(const char *src, const char *dest, const char *cred_json, char **err);
+
+	// -------------------------------------------------------------------------
+	// SQL-GENERATING table functions (ABI v68; docs/macros-and-sqlgen-functions.md §2). Generate the
+	// replacement SQL for one call of a `table_sql` function — the managed side of DuckDB's bind_replace
+	// mechanism (what query_table() uses): the host parses the returned statement and SUBSTITUTES it for the
+	// function call in the plan, so NO data crosses this ABI at execution and the SQL binds as a native plan
+	// (keeping full pushdown into whatever it references, including this extension's own catalog scans).
+	//   handle == 0  => resolve `func` against the GLOBAL registry (`schema` empty, `catalog_name` empty);
+	//   handle != 0  => the catalog's registry (`schema`.`func`), with `catalog_name` = the DuckDB ATTACH
+	//                   alias so the generator can emit qualified references back into its own catalog.
+	// `args` is a 1-row batch of the CONSTANT call arguments — positional first (declared order), then the
+	// SUPPLIED named parameters identified by field name; nullable when the function takes none (consumed
+	// either way). *out_sql = an owned UTF-8 statement, freed by the host via free_error. Called at BIND
+	// time only, possibly repeatedly (EXPLAIN / DESCRIBE / a view re-bind), never during execution.
+	int32_t (*generate_table_sql)(FabricatorHandle handle, const char *schema, const char *func,
+	                              const char *catalog_name, struct ArrowArrayStream *args, char **out_sql,
+	                              char **err);
 } FabricatorVTable;
 
 // -----------------------------------------------------------------------------
@@ -851,7 +868,7 @@ typedef struct FabricatorHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 67
+#define FABRICATOR_ABI_VERSION 68
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

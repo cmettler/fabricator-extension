@@ -1,0 +1,213 @@
+# name: test/verify_sqlgen.test
+# description: SQL-GENERATING table functions (docs/macros-and-sqlgen-functions.md §2, ABI v68) — a provider
+#              declares ISqlTableFunction; at BIND time DuckDB hands it the constant args and the returned
+#              SELECT statement REPLACES the call in the plan (DuckDB's bind_replace, the query_table()
+#              mechanism). Consequences pinned here: the output schema is arg-dependent for free (no schema is
+#              declared anywhere), the function call VANISHES from the plan, and the generated SQL's own scans
+#              keep their pushdown — no data crosses the bridge at execution. Demos: fabricator_sql_seq
+#              (arg-dependent projection) and fabricator_delta_union (UNION over Delta tables BY PATH — the
+#              case a macro cannot express, since the SQL TEXT depends on the argument).
+#              Set FABRICATOR_DELTA_WRITE_DIR.
+# group: [fabricator]
+
+require fabricator
+
+require parquet
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+# ---- 1. registration: a table function with NO bind and NO scan — only bind_replace ----
+
+query II
+SELECT DISTINCT function_name, function_type FROM duckdb_functions()
+WHERE function_name IN ('fabricator_sql_seq', 'fabricator_delta_union')
+ORDER BY function_name;
+----
+fabricator_delta_union	table
+fabricator_sql_seq	table
+
+# ---- 2. the generated SQL is what runs ----
+
+query II
+SELECT * FROM fabricator_sql_seq(3) ORDER BY i;
+----
+1	1
+2	2
+3	3
+
+# ARG-DEPENDENT OUTPUT SCHEMA: the same function, a different column set — resolved by binding the generated
+# SQL, with no OutputSchema declared on the C# side at all.
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM fabricator_sql_seq(2));
+----
+2
+
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM fabricator_sql_seq(2, cols := 3));
+----
+4
+
+query IIII
+SELECT * FROM fabricator_sql_seq(2, cols := 3) ORDER BY i;
+----
+1	1	2	3
+2	2	4	6
+
+# A constant EXPRESSION argument folds before the generator sees it.
+query I
+SELECT count(*) FROM fabricator_sql_seq(1 + 2);
+----
+3
+
+# ---- 3. the call DISAPPEARS at bind: the plan is the generated SQL's, with no fabricator operator ----
+
+require json
+
+# The serialized OPTIMIZED plan mentions the generated SQL's own source (`range`) and contains NO fabricator
+# function at all: the call was replaced at bind, so execution never re-enters the extension.
+query II
+SELECT p LIKE '%"name":"range"%' AS is_native_range, p ILIKE '%fabricator%' AS has_fabricator
+FROM (SELECT json_serialize_plan('SELECT * FROM fabricator_sql_seq(3)', optimize := true)::VARCHAR AS p);
+----
+true	false
+
+# ---- 4. composition: the replacement is an ordinary plan subtree ----
+
+# aggregates, WHERE, ORDER BY + LIMIT
+query II
+SELECT count(*), sum(i) FROM fabricator_sql_seq(10) WHERE i % 2 = 0;
+----
+5	30
+
+# joins against a local table
+query II
+SELECT s.i, t.tag FROM fabricator_sql_seq(3) s
+JOIN (VALUES (1, 'one'), (3, 'three')) t(i, tag) ON t.i = s.i
+ORDER BY s.i;
+----
+1	one
+3	three
+
+# an alias + column aliases on the call site apply to the replacement
+query II
+SELECT q.a, q.b FROM fabricator_sql_seq(2) AS q(a, b) ORDER BY q.a;
+----
+1	1
+2	2
+
+# a VIEW over it re-binds (the generator runs again per bind — it must be deterministic)
+statement ok
+CREATE VIEW sqlgen_v AS SELECT * FROM fabricator_sql_seq(4);
+
+query II
+SELECT count(*), max(i) FROM sqlgen_v;
+----
+4	4
+
+statement ok
+DROP VIEW sqlgen_v;
+
+# PREPARE binds once; EXECUTE twice reuses that plan
+statement ok
+PREPARE sqlgen_p AS SELECT count(*) FROM fabricator_sql_seq(5);
+
+query I
+EXECUTE sqlgen_p;
+----
+5
+
+query I
+EXECUTE sqlgen_p;
+----
+5
+
+# ---- 5. errors: clear at bind, never a silent wrong result ----
+
+# NULL for a non-nullable declared parameter (the query_table() precedent, but per-parameter)
+statement error
+SELECT * FROM fabricator_sql_seq(NULL);
+----
+does not accept NULL for argument 'n'
+
+# the generator's own validation surfaces verbatim
+statement error
+SELECT * FROM fabricator_sql_seq(-1);
+----
+n must be >= 0
+
+statement error
+SELECT * FROM fabricator_sql_seq(3, cols := 0);
+----
+cols >= 1
+
+# an unknown named parameter is DuckDB's own binder error (candidates listed)
+statement error
+SELECT * FROM fabricator_sql_seq(2, bogus := 1);
+----
+Invalid named parameter "bogus"
+
+# arguments must be BIND-TIME CONSTANTS — a lateral column reference is rejected by DuckDB
+statement error
+SELECT * FROM range(3) t(i), fabricator_sql_seq(t.i);
+----
+does not support lateral join column parameters
+
+# ---- 6. fabricator_delta_union — the case a MACRO cannot express (the SQL text follows the argument) ----
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/sqlgen' AS sglake (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE sglake.main.a AS SELECT r AS id, 'a' AS src FROM range(1, 100) t(r);
+
+statement ok
+CREATE TABLE sglake.main.b AS SELECT r AS id, 'b' AS src FROM range(200, 300) t(r);
+
+statement ok
+DETACH sglake;
+
+# one relation over BOTH Delta tables, by path, with no ATTACH
+query II
+SELECT src, count(*) FROM fabricator_delta_union(
+    ['${FABRICATOR_DELTA_WRITE_DIR}/sqlgen/a', '${FABRICATOR_DELTA_WRITE_DIR}/sqlgen/b'])
+GROUP BY src ORDER BY src;
+----
+a	99
+b	100
+
+# a single-element list is just that table (the generator emits no UNION)
+query I
+SELECT count(*) FROM fabricator_delta_union(['${FABRICATOR_DELTA_WRITE_DIR}/sqlgen/a']);
+----
+99
+
+# an empty list is rejected by the generator
+statement error
+SELECT * FROM fabricator_delta_union(['x'][1:0]);
+----
+the path list is empty
+
+# ---- 7. PUSHDOWN SURVIVES: a WHERE over the union reaches EACH member scan (the structural win over a
+#         marshaled table function, which would stream every row through C# and filter above the scan) ----
+
+statement ok
+CALL enable_logging(level := 'debug', storage := 'memory');
+
+query I
+SELECT count(*) FROM fabricator_delta_union(
+    ['${FABRICATOR_DELTA_WRITE_DIR}/sqlgen/a', '${FABRICATOR_DELTA_WRITE_DIR}/sqlgen/b'])
+WHERE id > 250;
+----
+49
+
+# The predicate was pushed into the generated member scans — at least one push per scan. (Not an exact
+# count: pushdown_complex_filter is re-invoked by a later optimizer round, so the number of log lines is
+# optimizer-round-dependent; what matters is that the predicate reached the scans at all.)
+query I
+SELECT count(*) >= 2 FROM duckdb_logs
+WHERE type LIKE 'Fabricator%' AND message LIKE '%pushdown_complex_filter%' AND message LIKE '%id% > 250%';
+----
+true
+
+statement ok
+CALL disable_logging();

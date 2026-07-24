@@ -44,6 +44,8 @@
 #include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/parsed_data/create_aggregate_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_macro_info.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
@@ -122,6 +124,12 @@ void FabricatorSchemaEntry::AddTableFunction(const string &func_name, bool is_pr
 	string each = func_name + "_each";
 	inout_functions_[each] = func_name;
 	RetireErase(table_function_entries_, each, retired_entries_);
+}
+
+void FabricatorSchemaEntry::AddSqlTableFunction(const string &func_name) {
+	lock_guard<mutex> lock(entry_lock_);
+	sql_table_functions_.insert(func_name);
+	RetireErase(table_function_entries_, func_name, retired_entries_);
 }
 
 void FabricatorSchemaEntry::AddInOutFunction(const string &func_name) {
@@ -939,6 +947,10 @@ struct FabricatorTableFunctionInfo : public TableFunctionInfo {
 	vector<LogicalType> arg_types;
 	vector<string> arg_names;
 	bool is_proc = false;    // stored procedure (EXEC, no pushdown) vs TVF (FROM, pushdown)
+	// SQL-generating (`table_sql`, v68) functions only: the DuckDB ATTACH ALIAS of the catalog this entry
+	// belongs to (empty for a global function). Passed to generate_table_sql so a catalog-bound generator can
+	// emit references back into its own catalog — C# never sees the alias otherwise.
+	string catalog_name;
 	// The function's source orders strings the way DuckDB does (byte/binary), so string ordering comparisons +
 	// BETWEEN are superset-safe to push (e.g. a Delta/Parquet reader — byte-ordered stats). Default false:
 	// discovered SQL TVFs run on SQL Server under its (possibly case-insensitive) collation, so only string
@@ -1047,6 +1059,92 @@ unique_ptr<FunctionData> FabricatorTableFunctionBind(ClientContext &context, Tab
 	};
 	bind_data->push_projection = bind_state->supports_pushdown;
 	return std::move(bind_data);
+}
+
+// -----------------------------------------------------------------------------
+// SQL-GENERATING table functions (ABI v68; docs/macros-and-sqlgen-functions.md §2). A `table_sql` function
+// has NO bind and NO scan: only `bind_replace`, DuckDB's "rewrite this call into a plan subtree" hook (what
+// query_table() uses). At bind time the constant args cross to C#, which returns a SELECT statement; we parse
+// it and hand the binder a SubqueryRef, which it re-binds in the calling context. So the function call
+// DISAPPEARS at bind: what executes is a native DuckDB plan (with all of its pushdown/parallelism, including
+// into this extension's own catalog scans), and NO data crosses the ABI at execution.
+// -----------------------------------------------------------------------------
+
+// Parse a generated statement into a subquery ref — the shape query_table() uses (query_function.cpp's
+// ParseSubquery): exactly one SELECT statement. A PIVOT without an explicit IN list parses to a
+// MultiStatement and is rejected here, same as upstream.
+unique_ptr<TableRef> FabricatorParseGeneratedSelect(const string &sql, const ParserOptions &options,
+                                                   const string &fn_name) {
+	Parser parser(options);
+	parser.ParseQuery(sql);
+	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+		throw BinderException("fabricator function \"%s\" must generate exactly one SELECT statement (a PIVOT "
+		                      "needs an explicit IN list); generated: %s",
+		                      fn_name, sql);
+	}
+	auto select_stmt = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
+	return make_uniq<SubqueryRef>(std::move(select_stmt));
+}
+
+// Build the DuckDB signature of a SQL-generating table function from its ONE declared parameter schema:
+// positional fields first, then the NAMED ones (tagged fabricator.named="1", split by `is_named`). A
+// SQLNULL-declared parameter is the "accept any value" marker (registered as ANY so DuckDB passes the literal
+// UNCAST and its runtime type survives). Shared by the global (load-time) and catalog (attach-time) paths.
+void FabricatorBuildSqlGenSignature(const vector<string> &all_names, const vector<LogicalType> &all_types,
+                                    const vector<bool> &is_named, TableFunction &tf, vector<string> &arg_names,
+                                    vector<LogicalType> &arg_types) {
+	for (idx_t k = 0; k < all_names.size(); k++) {
+		auto type = all_types[k].id() == LogicalTypeId::SQLNULL ? LogicalType::ANY : all_types[k];
+		if (k < is_named.size() && is_named[k]) {
+			tf.named_parameters[all_names[k]] = type;
+		} else {
+			arg_names.push_back(all_names[k]);
+			arg_types.push_back(type);
+		}
+	}
+	tf.arguments = arg_types;
+}
+
+unique_ptr<TableRef> FabricatorSqlGenBindReplace(ClientContext &context, TableFunctionBindInput &input) {
+	auto &info = input.info->Cast<FabricatorTableFunctionInfo>();
+	// The generator may use its provider connection at bind time (a catalog-bound one listing matching
+	// tables) and/or read through the host FS; establish the transaction + opener ambients. Harmless for a
+	// global function (handle 0 — set_active_txn ignores the handle, the opener is just made available).
+	FabricatorSetActiveTxn(info.handle, context);
+
+	// The 1-row constant-arg batch: POSITIONAL args in declared order, then the SUPPLIED named parameters by
+	// name (the binder has already validated the names and cast each value to its declared type — except an
+	// ANY-declared one, whose runtime type is preserved on purpose).
+	vector<LogicalType> arg_types = info.arg_types;
+	vector<string> arg_names = info.arg_names;
+	vector<Value> arg_values = input.inputs;
+	for (auto &kv : input.named_parameters) {
+		arg_names.push_back(kv.first);
+		arg_types.push_back(kv.second.type());
+		arg_values.push_back(kv.second);
+	}
+
+	auto properties = fabricator::BoundaryClientProperties(context);
+	auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(context, arg_types);
+	fabricator::ArrowProducer producer(arg_types, arg_names, properties);
+	if (!arg_types.empty()) {
+		DataChunk chunk;
+		chunk.Initialize(Allocator::DefaultAllocator(), arg_types);
+		for (idx_t c = 0; c < arg_values.size(); c++) {
+			chunk.SetValue(c, 0, arg_values[c].DefaultCastAs(arg_types[c]));
+		}
+		chunk.SetCardinality(1);
+		ArrowAppender appender(arg_types, 1, properties, extension_types);
+		appender.Append(chunk, 0, 1, 1);
+		producer.AddBatch(appender.Finalize());
+	}
+	producer.Finish();
+
+	// The catalog ALIAS (what the user wrote in ATTACH) is only known here — a catalog-bound generator needs
+	// it to emit qualified references back into its own catalog. Empty for a global function.
+	string sql = fabricator::GenerateTableSql(info.handle, info.schema, info.func, info.catalog_name,
+	                                          producer.Stream());
+	return FabricatorParseGeneratedSelect(sql, context.GetParserOptions(), info.func);
 }
 
 
@@ -1905,6 +2003,34 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				fn_info->string_order_pushable = string_order[i] == "1";
 				tf.function_info = std::move(fn_info);
 				loader.RegisterFunction(tf);
+			} else if (kind == "table_sql") {
+				// A connection-free SQL-GENERATING table function: no bind, no scan — only bind_replace, so
+				// the call is rewritten into the generated SQL at bind time and nothing crosses at execution.
+				// handle = 0 so generate_table_sql resolves the generator against the C# global registry.
+				vector<string> all_names;
+				vector<LogicalType> all_types;
+				vector<bool> is_named;
+				try {
+					FetchFunctionParamSchema(context, nullptr, "", fn_name, all_names, all_types, &is_named);
+				} catch (std::exception &) {
+					continue;
+				}
+				// One declared schema carries both kinds: POSITIONAL fields, then NAMED ones tagged
+				// fabricator.named="1" (SqlGen.ParamSchema) — split them into the DuckDB signature.
+				vector<string> arg_names;
+				vector<LogicalType> arg_types;
+				TableFunction tf(fn_name, {}, nullptr, nullptr);
+				FabricatorBuildSqlGenSignature(all_names, all_types, is_named, tf, arg_names, arg_types);
+				tf.bind_replace = FabricatorSqlGenBindReplace;
+				auto fn_info = make_shared_ptr<FabricatorTableFunctionInfo>();
+				fn_info->handle = nullptr; // global marker
+				fn_info->schema = "";
+				fn_info->func = fn_name;
+				fn_info->arg_types = arg_types;
+				fn_info->arg_names = arg_names;
+				fn_info->is_proc = false;
+				tf.function_info = std::move(fn_info);
+				loader.RegisterFunction(tf);
 			} else if (kind == "macro") {
 				// A provider MACRO: a SQL TEMPLATE, not a marshaled function — the provider ships the complete
 				// CREATE MACRO statement and DuckDB's OWN parser owns the grammar (so named-parameter defaults,
@@ -1959,6 +2085,11 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(Clien
 	}
 	auto kind_it = table_functions_.find(func_name);
 	if (kind_it == table_functions_.end()) {
+		// A provider-authored SQL-GENERATING function (v68) is registered under the bare name: no bind/scan,
+		// only bind_replace (the call becomes the generated SQL).
+		if (sql_table_functions_.find(func_name) != sql_table_functions_.end()) {
+			return GetOrCreateSqlTableFunction(context, func_name);
+		}
 		// A provider-authored custom table-in-out (4g) is registered under the bare name.
 		if (custom_inout_functions_.find(func_name) != custom_inout_functions_.end()) {
 			return GetOrCreateCustomInOutFunction(context, func_name);
@@ -2017,6 +2148,49 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(Clien
 	fn_info->arg_types = arg_types;
 	fn_info->arg_names = arg_names;
 	fn_info->is_proc = is_proc;
+	tf.function_info = std::move(fn_info);
+
+	CreateTableFunctionInfo info(std::move(tf));
+	info.catalog = catalog.GetName();
+	info.schema = name;
+	auto entry = make_uniq<TableFunctionCatalogEntry>(catalog, *this, info);
+	auto &ref = *entry;
+	table_function_entries_[func_name] = std::move(entry);
+	return &ref;
+}
+
+// Build the catalog entry for a provider-authored SQL-GENERATING table function (v68): a table function with
+// NO bind and NO scan, only `bind_replace`, so `db.schema.fn(args)` is REPLACED at bind time by the SQL the
+// provider generates from its constant args. The entry carries this catalog's ATTACH ALIAS (catalog.GetName())
+// so the generator can emit qualified references back into it — C# has no other way to learn the alias.
+// Caller holds entry_lock_. See docs/macros-and-sqlgen-functions.md §2.
+optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateSqlTableFunction(ClientContext &context,
+                                                                           const string &func_name) {
+	vector<string> all_names;
+	vector<LogicalType> all_types;
+	vector<bool> is_named;
+	try {
+		FetchFunctionParamSchema(context, handle_, name, func_name, all_names, all_types, &is_named);
+	} catch (std::exception &) {
+		// Stale discovery (the provider no longer declares it) — treat as not-found, like the other paths.
+		sql_table_functions_.erase(func_name);
+		RetireErase(table_function_entries_, func_name, retired_entries_);
+		return nullptr;
+	}
+
+	vector<string> arg_names;
+	vector<LogicalType> arg_types;
+	TableFunction tf(func_name, {}, nullptr, nullptr);
+	FabricatorBuildSqlGenSignature(all_names, all_types, is_named, tf, arg_names, arg_types);
+	tf.bind_replace = FabricatorSqlGenBindReplace;
+	auto fn_info = make_shared_ptr<FabricatorTableFunctionInfo>();
+	fn_info->handle = handle_;
+	fn_info->schema = name;
+	fn_info->func = func_name;
+	fn_info->arg_types = arg_types;
+	fn_info->arg_names = arg_names;
+	fn_info->is_proc = false;
+	fn_info->catalog_name = catalog.GetName(); // the ATTACH alias — only known here
 	tf.function_info = std::move(fn_info);
 
 	CreateTableFunctionInfo info(std::move(tf));
@@ -2251,6 +2425,11 @@ void FabricatorSchemaEntry::Scan(ClientContext &context, CatalogType type,
 				names.push_back(fn);
 			}
 			for (auto &fn : custom_collector_functions_) {
+				names.push_back(fn);
+			}
+			// SQL-generating (bind_replace) functions are catalog table functions too — without this they
+			// resolve by name but never appear in duckdb_functions() / SHOW FUNCTIONS.
+			for (auto &fn : sql_table_functions_) {
 				names.push_back(fn);
 			}
 		}

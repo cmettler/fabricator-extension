@@ -1,0 +1,140 @@
+# name: test/verify_sqlgen_catalog.test
+# description: CATALOG-BOUND SQL-generating table functions (docs/macros-and-sqlgen-functions.md §2, ABI v68) —
+#              resolved as db.schema.fn(args), with the generator handed the catalog's DuckDB ATTACH ALIAS
+#              (which only the host knows) plus the live provider catalog for BIND-TIME LOOKUPS. Demo
+#              dbo.cf_union_by_pattern('sales_%'): it queries sys.tables at bind time and generates a UNION ALL
+#              over the matching tables as quoted three-part names. Two things a marshaled table function can't
+#              do are pinned here: the SQL TEXT follows the argument, and each member stays a real catalog scan
+#              — so a WHERE over the union is pushed into EVERY member's server-side query (proved from SQL
+#              Server's own plan cache). Needs MSSQL_TESTDB_DSN.
+# group: [fabricator]
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
+
+# fixtures: three tables, two of which match the pattern
+statement ok
+CREATE OR REPLACE TABLE db.dbo.sg_sales_2023 AS SELECT 1 AS id, 'a' AS nm, 2023 AS yr;
+
+statement ok
+CREATE OR REPLACE TABLE db.dbo.sg_sales_2024 AS SELECT 2 AS id, 'b' AS nm, 2024 AS yr;
+
+statement ok
+CREATE OR REPLACE TABLE db.dbo.sg_other AS SELECT 9 AS id, 'z' AS nm, 1999 AS yr;
+
+statement ok
+SELECT fabricator_invalidate_cache('db');
+
+# ---- 1. discovery: the provider's SQL-generating function is registered as a table function ----
+
+query II
+SELECT DISTINCT function_name, function_type FROM duckdb_functions()
+WHERE function_name = 'cf_union_by_pattern';
+----
+cf_union_by_pattern	table
+
+# it is discovered as kind='table_sql' (the diagnostic view of the same declaration)
+query I
+SELECT kind FROM fabricator_functions('db') WHERE name = 'cf_union_by_pattern';
+----
+table_sql
+
+# and it has NO SQL Server object behind it — it is pure C#
+query I
+SELECT count(*) FROM fabricator_query('db',
+    'SELECT 1 AS c FROM sys.objects WHERE name = ''cf_union_by_pattern''');
+----
+0
+
+# ---- 2. the generated SQL is what runs: the member list follows the ARGUMENT ----
+
+query III
+SELECT * FROM db.dbo.cf_union_by_pattern('sg_sales_%') ORDER BY id;
+----
+1	a	2023
+2	b	2024
+
+# a wider pattern pulls in the third table — same function, different SQL text (no macro can do this)
+query I
+SELECT count(*) FROM db.dbo.cf_union_by_pattern('sg_%');
+----
+3
+
+# the schema_name named parameter narrows the sweep
+query I
+SELECT count(*) FROM db.dbo.cf_union_by_pattern('sg_%', schema_name := 'dbo');
+----
+3
+
+# a pattern matching nothing is a clean bind error, not an empty result
+statement error
+SELECT * FROM db.dbo.cf_union_by_pattern('sg_nope_%');
+----
+no table matches
+
+# ---- 3. composition: the replacement is an ordinary plan subtree over CATALOG scans ----
+
+query II
+SELECT count(*), sum(yr) FROM db.dbo.cf_union_by_pattern('sg_sales_%') WHERE yr >= 2024;
+----
+1	2024
+
+query II
+SELECT u.nm, o.yr FROM db.dbo.cf_union_by_pattern('sg_sales_%') u
+JOIN db.dbo.sg_other o ON o.id = 9
+WHERE u.id = 1;
+----
+a	1999
+
+# prepared re-execution binds once and reuses the plan
+statement ok
+PREPARE sgc AS SELECT count(*) FROM db.dbo.cf_union_by_pattern('sg_sales_%');
+
+query I
+EXECUTE sgc;
+----
+2
+
+query I
+EXECUTE sgc;
+----
+2
+
+# ---- 4. THE PAYOFF: a WHERE over the union is pushed into EACH member's SERVER-SIDE query.
+#         A marshaled table function would stream every row through C# and filter above the scan; here each
+#         member is a normal catalog scan, so the predicate reaches SQL Server per table. Proved from the
+#         plan cache: both member statements carry a parameterized WHERE and a projected column list. ----
+
+query I
+SELECT count(*) FROM db.dbo.cf_union_by_pattern('sg_sales_%') WHERE yr = 2024 AND nm <> 'zz';
+----
+1
+
+# (CHARINDEX, not LIKE: the emitted SQL's [brackets] are LIKE character classes.) Each member table's own
+# statement carries BOTH a projected column list and the pushed WHERE — one row per member, hence 2.
+query I
+SELECT hits FROM fabricator_query('db',
+  'SELECT COUNT(*) AS hits FROM (
+     SELECT DISTINCT st.text FROM sys.dm_exec_query_stats qs
+     CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
+     WHERE (CHARINDEX(''FROM [dbo].[sg_sales_2024] WHERE [yr] ='', st.text) > 0
+         OR CHARINDEX(''FROM [dbo].[sg_sales_2023] WHERE [yr] ='', st.text) > 0)
+       AND CHARINDEX(''[id], [nm], [yr]'', st.text) > 0
+       AND CHARINDEX(''dm_exec'', st.text) = 0) x');
+----
+2
+
+# ---- 5. cleanup ----
+
+statement ok
+DROP TABLE db.dbo.sg_sales_2023;
+
+statement ok
+DROP TABLE db.dbo.sg_sales_2024;
+
+statement ok
+DROP TABLE db.dbo.sg_other;

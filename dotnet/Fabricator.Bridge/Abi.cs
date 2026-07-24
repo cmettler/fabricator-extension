@@ -221,6 +221,14 @@ public unsafe struct FabricatorVTable
     // semantics; backs DuckDB's COPY tmp-file staging on onelake://). Appended at v64.
     // int32 onelake_move(char* src, char* dest, char* cred_json, char** err)
     public delegate* unmanaged[Cdecl]<byte*, byte*, byte*, byte**, int> OneLakeMove;
+
+    // SQL-GENERATING table function (v68): generate the replacement SQL for one call — the managed side of
+    // DuckDB's bind_replace. handle == 0 => the global registry (schema/catalog_name empty); non-zero => the
+    // catalog's, with catalog_name = the ATTACH alias. `args` (nullable) = the 1-row constant-arg batch.
+    // int32 generate_table_sql(void* handle, char* schema, char* func, char* catalog_name,
+    //                          ArrowArrayStream* args, char** out_sql, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, byte*, CArrowArrayStream*, byte**, byte**, int>
+        GenerateTableSql;
 }
 
 /// <summary>

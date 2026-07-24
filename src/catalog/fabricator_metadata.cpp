@@ -145,9 +145,25 @@ vector<FabricatorFunctionInfo> DiscoverFunctions(FabricatorHandle handle) {
 }
 
 void FetchFunctionParamSchema(ClientContext &context, FabricatorHandle handle, const string &schema_name,
-                              const string &func_name, vector<string> &names, vector<LogicalType> &types) {
+                              const string &func_name, vector<string> &names, vector<LogicalType> &types,
+                              vector<bool> *out_named) {
 	ArrowSchema schema {};
 	fabricator::GetFunctionParamSchema(handle, schema_name, func_name, schema);
+	if (out_named) {
+		// Which parameters are NAMED rides each parameter FIELD's metadata (the same C-ABI channel as the
+		// volatility signal above): fabricator.named = "1". Only SQL-generating (`table_sql`) functions
+		// declare both kinds; absent => positional, so every other function is unaffected. Read BEFORE
+		// ReadArrowSchema consumes the struct.
+		out_named->clear();
+		for (int64_t c = 0; c < schema.n_children; c++) {
+			bool named = false;
+			if (schema.children[c] && schema.children[c]->metadata) {
+				ArrowSchemaMetadata field_metadata(schema.children[c]->metadata);
+				named = field_metadata.GetOption("fabricator.named") == "1";
+			}
+			out_named->push_back(named);
+		}
+	}
 	fabricator::ReadArrowSchema(context, schema, types, names);
 }
 

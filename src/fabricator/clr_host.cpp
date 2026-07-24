@@ -880,6 +880,29 @@ std::string DeltaListFiles(const std::string &path, const std::string &push_json
 	return result;
 }
 
+std::string GenerateTableSql(FabricatorHandle handle, const std::string &schema, const std::string &func,
+                             const std::string &catalog_name, ArrowArrayStream *args) {
+	const FabricatorVTable &vt = GetBridge();
+	if (!vt.generate_table_sql) {
+		throw duckdb::IOException("Fabricator: bridge does not provide generate_table_sql");
+	}
+	char *err = nullptr;
+	char *out_sql = nullptr;
+	int32_t rc = vt.generate_table_sql(handle, schema.c_str(), func.c_str(), catalog_name.c_str(), args,
+	                                   &out_sql, &err);
+	if (rc != FABRICATOR_OK) {
+		ThrowManagedError(vt, err, "Fabricator: generate_table_sql failed");
+	}
+	std::string result = out_sql ? out_sql : "";
+	if (out_sql && vt.free_error) {
+		vt.free_error(out_sql);
+	}
+	if (result.empty()) {
+		throw duckdb::IOException("Fabricator: generate_table_sql returned no SQL for function '%s'", func);
+	}
+	return result;
+}
+
 void ListSecretFields(ArrowArrayStream &out) {
 	const FabricatorVTable &vt = GetBridge();
 	if (!vt.list_secret_fields) {

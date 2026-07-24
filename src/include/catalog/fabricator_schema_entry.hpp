@@ -48,6 +48,13 @@ public:
 	//! schemas are resolved lazily on first lookup (procs use sp_describe + EXEC).
 	void AddTableFunction(const string &func_name, bool is_proc);
 
+	//! Registers a provider-authored SQL-GENERATING table function (`kind='table_sql'`, ABI v68): a table
+	//! function with NO bind and NO scan — only `bind_replace`, so the call `db.schema.fn(args)` is REPLACED
+	//! at bind time by the SQL the provider generates from its constant args. The generator is handed this
+	//! catalog's ATTACH alias so it can emit qualified references back into it, and the generated SQL binds
+	//! as a native plan (keeping its own pushdown). See docs/macros-and-sqlgen-functions.md §2.
+	void AddSqlTableFunction(const string &func_name);
+
 	//! Registers a provider-authored custom table-in-out function (4g, `kind='inout'`): a
 	//! `{LogicalType::TABLE}`-parameter table function under the bare name (no scalar-arg
 	//! scan form, no `_each` alias). Resolved as `SELECT * FROM db.schema.fn(<input table>)`;
@@ -110,6 +117,9 @@ private:
 	optional_ptr<CatalogEntry> GetOrCreateEntry(ClientContext &context, const string &table_name);
 	optional_ptr<CatalogEntry> GetOrCreateScalarFunction(ClientContext &context, const string &func_name);
 	optional_ptr<CatalogEntry> GetOrCreateTableFunction(ClientContext &context, const string &func_name);
+	//! Materializes a provider-authored SQL-GENERATING table function (v68): a bind_replace-only table
+	//! function whose call is rewritten into the provider's generated SQL at bind time.
+	optional_ptr<CatalogEntry> GetOrCreateSqlTableFunction(ClientContext &context, const string &func_name);
 	//! Materializes the synthetic `<base>_each` table-in-out alias (4g): a TABLE-parameter table
 	//! function applying the discovered TVF `base_func` once per input row via CROSS APPLY.
 	optional_ptr<CatalogEntry> GetOrCreateInOutFunction(ClientContext &context, const string &each_name,
@@ -129,6 +139,7 @@ private:
 	case_insensitive_set_t scalar_functions_;    // discovered scalar UDF names
 	case_insensitive_map_t<bool> table_functions_; // table-returning routine name -> is_proc (TVF=false)
 	case_insensitive_map_t<string> inout_functions_; // synthetic `<base>_each` alias -> base TVF name (4g)
+	case_insensitive_set_t sql_table_functions_;     // provider-authored SQL-generating (bind_replace) names
 	case_insensitive_set_t custom_inout_functions_;  // provider-authored custom table-in-out names (4g)
 	case_insensitive_set_t custom_collector_functions_; // provider-authored custom collector (pipeline-breaker) names
 	case_insensitive_map_t<bool> aggregate_functions_; // custom aggregate (UDAF) name -> spillable (4h)

@@ -108,6 +108,11 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 			schema.AddTableFunction(func.name, /*is_proc=*/false);
 		} else if (func.kind == "proc") {
 			schema.AddTableFunction(func.name, /*is_proc=*/true);
+		} else if (func.kind == "table_sql") {
+			// Provider-authored SQL-GENERATING table function (v68): registered with bind_replace only — the
+			// call `db.schema.fn(args)` is rewritten into the provider's generated SQL at bind time, so the
+			// referenced scans keep their own pushdown and no data crosses the bridge at execution.
+			schema.AddSqlTableFunction(func.name);
 		} else if (func.kind == "inout") {
 			// Provider-authored custom table-in-out (4g, pure C#): a {TABLE}-param table function under
 			// the bare name (no scalar-arg scan form, no `_each` alias — it is already in-out).
@@ -194,6 +199,11 @@ void FabricatorCatalog::RefreshCache(ClientContext &context) {
 			schema.AddTableFunction(func.name, /*is_proc=*/false);
 		} else if (func.kind == "proc") {
 			schema.AddTableFunction(func.name, /*is_proc=*/true);
+		} else if (func.kind == "table_sql") {
+			// Provider-authored SQL-GENERATING table function (v68): registered with bind_replace only — the
+			// call `db.schema.fn(args)` is rewritten into the provider's generated SQL at bind time, so the
+			// referenced scans keep their own pushdown and no data crosses the bridge at execution.
+			schema.AddSqlTableFunction(func.name);
 		} else if (func.kind == "inout") {
 			// Provider-authored custom table-in-out (4g, pure C#): a {TABLE}-param table function under
 			// the bare name (no scalar-arg scan form, no `_each` alias — it is already in-out).

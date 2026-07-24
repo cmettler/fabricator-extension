@@ -80,6 +80,17 @@ internal static class CustomFunctions
         new GfProductFunction(),
     };
 
+    // Connection-free GLOBAL SQL-GENERATING table functions — bare fn(args), no ATTACH. The call is REPLACED
+    // at bind time by the SQL the generator builds from the constant args (DuckDB's bind_replace), so the
+    // output schema is arg-dependent for free and NO data crosses the bridge at execution — each referenced
+    // scan keeps its own pushdown. Use when the SQL TEXT must depend on the args (a macro covers fixed text
+    // with varying values). See docs/macros-and-sqlgen-functions.md §2.
+    public static readonly IReadOnlyList<ISqlTableFunction> GlobalSqlTable = new ISqlTableFunction[]
+    {
+        new GfSqlSeqFunction(),
+        new GfDeltaUnionFunction(),
+    };
+
     // Provider MACROs — SQL templates registered into DuckDB's system catalog at extension load, so they
     // resolve as a bare fn(...) / FROM fn(...) in every database with no ATTACH. Each is one complete CREATE
     // MACRO statement parsed by DuckDB itself (named-parameter defaults + overload sets + AS TABLE all work).
@@ -131,6 +142,15 @@ internal static class CustomFunctions
     // three use the fixed-schema convenience base StaticInOutFunction (override OutputSchema + DoExchange; the
     // author owns the loop + sentinel, cross-chunk state in DoExchange locals — stateless cf_tag, cumulative
     // cf_running_sum, row-index cf_exchange).
+    // SQL-GENERATING table functions (ICatalogSqlTableFunction), singletons — surfaced as `kind='table_sql'`.
+    // The call `db.dbo.fn(args)` is REPLACED at bind time by SQL this generator builds, so nothing crosses the
+    // bridge at execution and every scan it references keeps its own pushdown. The generator gets the catalog's
+    // ATTACH alias + the live catalog (bind-time lookups). See docs/macros-and-sqlgen-functions.md §2.
+    public static readonly IReadOnlyList<ICatalogSqlTableFunction> SqlTable = new ICatalogSqlTableFunction[]
+    {
+        new CfUnionByPatternFunction(),
+    };
+
     public static readonly IReadOnlyList<ICatalogInOutFunction> InOut = new ICatalogInOutFunction[]
     {
         new CfTagFunction(),
@@ -935,6 +955,172 @@ internal sealed class GfCollectSumFunction : ICollectorTableFunction
         }
 
         public void Dispose() { }
+    }
+}
+
+// CATALOG-BOUND SQL-GENERATING table function: db.dbo.cf_union_by_pattern('sales_%') unions every table in
+// the catalog whose name matches the LIKE pattern into one relation. The member list is discovered at BIND time
+// on this catalog's own connection (sys.tables), then spliced into the generated SQL as quoted three-part
+// names — so the SQL TEXT depends on the argument, which no macro can express, and each member scan is a normal
+// catalog scan that keeps its projection/filter/TopN pushdown into SQL Server (which a marshaled table function
+// would forfeit by streaming every row through C#). See docs/macros-and-sqlgen-functions.md §2.
+internal sealed class CfUnionByPatternFunction : ICatalogSqlTableFunction
+{
+    public string SchemaName => "dbo";
+    public string Name => "cf_union_by_pattern";
+
+    public Schema Parameters => new(new[]
+    {
+        new Field("pattern", StringType.Default, nullable: false),
+    }, metadata: null);
+
+    // UNION ALL BY NAME (the member column sets differ) vs positional UNION ALL. Also `schema_filter`, so the
+    // sweep can be narrowed to one SQL schema.
+    public Schema NamedParameters => new(new[]
+    {
+        new Field("by_name", BooleanType.Default, nullable: true),
+        new Field("schema_name", StringType.Default, nullable: true),
+    }, metadata: null);
+
+    public string GenerateSql(SqlGenContext ctx, RecordBatch args)
+    {
+        string pattern = ((StringArray)args.Column("pattern")).GetString(0)!;
+        bool byName = ReadBool(args, "by_name") ?? false;
+        string? schemaFilter = ReadString(args, "schema_name");
+
+        // BIND-TIME LOOKUP on this catalog's own connection: which tables match? (T-SQL string literals —
+        // apostrophes doubled. LIKE metacharacters in the pattern are the caller's intent, not escaped.)
+        var sql = "SELECT s.name AS schema_name, t.name AS table_name FROM sys.tables t "
+                  + "JOIN sys.schemas s ON s.schema_id = t.schema_id "
+                  + $"WHERE t.name LIKE '{Tsql(pattern)}'"
+                  + (schemaFilter is null ? string.Empty : $" AND s.name = '{Tsql(schemaFilter)}'")
+                  + " ORDER BY s.name, t.name";
+        var members = new List<string>();
+        using (var stream = ctx.Catalog.ExecuteQuery(sql))
+        {
+            RecordBatch? batch;
+            while ((batch = stream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult()) is not null)
+            {
+                using (batch)
+                {
+                    var schemas = (StringArray)batch.Column(0);
+                    var tables = (StringArray)batch.Column(1);
+                    for (int i = 0; i < batch.Length; i++)
+                    {
+                        // Fully qualified with the ATTACH alias so each member binds as a catalog scan.
+                        members.Add("SELECT * FROM "
+                                    + DuckSql.QuoteName(ctx.CatalogName, schemas.GetString(i), tables.GetString(i)));
+                    }
+                }
+            }
+        }
+        if (members.Count == 0)
+        {
+            throw new ArgumentException(
+                $"cf_union_by_pattern: no table matches '{pattern}' in catalog '{ctx.CatalogName}'");
+        }
+        return string.Join(byName ? " UNION ALL BY NAME " : " UNION ALL ", members);
+    }
+
+    private static string Tsql(string s) => s.Replace("'", "''");
+
+    private static bool? ReadBool(RecordBatch args, string field)
+    {
+        int i = args.Schema.GetFieldIndex(field);
+        return i >= 0 && args.Column(i) is BooleanArray a && !a.IsNull(0) ? a.GetValue(0) : null;
+    }
+
+    private static string? ReadString(RecordBatch args, string field)
+    {
+        int i = args.Schema.GetFieldIndex(field);
+        return i >= 0 && args.Column(i) is StringArray a && !a.IsNull(0) ? a.GetString(0) : null;
+    }
+}
+
+// GLOBAL SQL-GENERATING table function (connection-free): fabricator_delta_union(paths[, by_name := …])
+// unions several Delta tables BY PATH in one relation — the SQL text (one fabricator_delta_scan per path)
+// depends on the argument, which is exactly what a macro cannot express. Since the call is REPLACED by that
+// SQL at bind time, each member scan keeps its own filter/projection pushdown and nothing streams through C#.
+// See docs/macros-and-sqlgen-functions.md §2.
+internal sealed class GfDeltaUnionFunction : ISqlTableFunction
+{
+    public string Name => "fabricator_delta_union";
+
+    public Schema Parameters => new(new[]
+    {
+        new Field("paths", new ListType(new Field("item", StringType.Default, nullable: true)), nullable: false),
+    }, metadata: null);
+
+    // UNION ALL BY NAME (column sets differ) vs positional UNION ALL — the query_table() option, named so it
+    // stays optional.
+    public Schema NamedParameters => new(new[]
+    {
+        new Field("by_name", BooleanType.Default, nullable: true),
+    }, metadata: null);
+
+    public string GenerateSql(RecordBatch args)
+    {
+        var list = (ListArray)args.Column("paths");
+        var items = (StringArray)list.GetSlicedValues(0);
+        if (items.Length == 0)
+        {
+            throw new ArgumentException("fabricator_delta_union: the path list is empty");
+        }
+        bool byName = false;
+        var byNameCol = args.Schema.GetFieldIndex("by_name");
+        if (byNameCol >= 0 && args.Column(byNameCol) is BooleanArray b && !b.IsNull(0))
+        {
+            byName = b.GetValue(0)!.Value;
+        }
+        var union = byName ? " UNION ALL BY NAME " : " UNION ALL ";
+        var parts = new List<string>(items.Length);
+        for (int i = 0; i < items.Length; i++)
+        {
+            var path = items.GetString(i)
+                       ?? throw new ArgumentException("fabricator_delta_union: NULL path in the list");
+            parts.Add($"SELECT * FROM fabricator_delta_scan({DuckSql.QuoteString(path)})");
+        }
+        return string.Join(union, parts);
+    }
+}
+
+// GLOBAL SQL-generating demo with an ARG-DEPENDENT OUTPUT SCHEMA — the capability the design calls out:
+// fabricator_sql_seq(n) generates `SELECT i, i*i AS sq FROM range(...)`, and fabricator_sql_seq(n, cols := 3)
+// widens the projection, so two calls of the same function bind to different column sets with no schema
+// declaration anywhere (the plan decides). Also the cheapest end-to-end pin of the bind_replace path.
+internal sealed class GfSqlSeqFunction : ISqlTableFunction
+{
+    public string Name => "fabricator_sql_seq";
+
+    public Schema Parameters => new(new[]
+    {
+        new Field("n", Int64Type.Default, nullable: false),
+    }, metadata: null);
+
+    public Schema NamedParameters => new(new[]
+    {
+        new Field("cols", Int64Type.Default, nullable: true),
+    }, metadata: null);
+
+    public string GenerateSql(RecordBatch args)
+    {
+        long n = ((Int64Array)args.Column("n")).GetValue(0)!.Value;
+        long cols = 1;
+        int idx = args.Schema.GetFieldIndex("cols");
+        if (idx >= 0 && args.Column(idx) is Int64Array c && !c.IsNull(0))
+        {
+            cols = c.GetValue(0)!.Value;
+        }
+        if (n < 0 || cols < 1)
+        {
+            throw new ArgumentException("fabricator_sql_seq: n must be >= 0 and cols >= 1");
+        }
+        var projection = new List<string> { "i" };
+        for (long k = 1; k <= cols; k++)
+        {
+            projection.Add($"i * {DuckSql.Literal(k)} AS {DuckSql.QuoteIdent("c" + k)}");
+        }
+        return $"SELECT {string.Join(", ", projection)} FROM range(1, {DuckSql.Literal(n + 1)}) t(i)";
     }
 }
 

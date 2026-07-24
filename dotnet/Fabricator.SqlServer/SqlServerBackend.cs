@@ -103,6 +103,7 @@ public sealed class SqlServerBackend : IBackend
     public IEnumerable<ICollectorTableFunction> GlobalCollectorFunctions => CustomFunctions.GlobalCollector;
     public IEnumerable<ITableFunction> GlobalTableFunctions => CustomFunctions.GlobalTable;
     public IEnumerable<IAggregateFunction> GlobalAggregateFunctions => CustomFunctions.GlobalAggregate;
+    public IEnumerable<ISqlTableFunction> GlobalSqlTableFunctions => CustomFunctions.GlobalSqlTable;
     public IEnumerable<MacroDefinition> GlobalMacros => CustomFunctions.GlobalMacros;
 
     public IBackendCatalog OpenCatalog(string connectionString, string optionsJson) =>
@@ -364,6 +365,15 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // discovered TVFs but dispatched to C# (see TableBind / GetFunctionParamSchema / GetFunctionOutputSchema).
     private static readonly IReadOnlyDictionary<string, ICatalogTableFunction> CustomTable =
         CustomFunctions.Table.ToDictionary(f => $"{f.SchemaName}.{f.Name}", StringComparer.OrdinalIgnoreCase);
+
+    // Provider-authored SQL-GENERATING table functions (ICatalogSqlTableFunction), keyed "schema.name"
+    // (case-insensitive). Surfaced as `kind='table_sql'` (see FunctionsMetadataSql) so the C++ catalog
+    // registers a bind_replace-only table function: the call `db.schema.fn(args)` is REPLACED at bind time by
+    // the SQL this generator builds (GenerateTableSql, handed the catalog's ATTACH alias), so the referenced
+    // scans keep their own pushdown and NO data crosses the bridge at execution. Use for SQL whose TEXT
+    // depends on the args (dynamic object names, UNION fan-out, bind-time metadata lookups).
+    private static readonly IReadOnlyDictionary<string, ICatalogSqlTableFunction> CustomSqlTable =
+        CustomFunctions.SqlTable.ToDictionary(f => $"{f.SchemaName}.{f.Name}", StringComparer.OrdinalIgnoreCase);
 
     // Provider-authored custom table-in-out functions (ICatalogInOutFunction), keyed "schema.name"
     // (case-insensitive). Surfaced as `kind='inout'` (see FunctionsMetadataSql) so the C++ catalog registers
@@ -1608,7 +1618,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     private static string FunctionsMetadataSql()
     {
         if (CustomScalar.Count == 0 && CustomTable.Count == 0 && CustomInOut.Count == 0 && CustomAgg.Count == 0 &&
-            CustomCollector.Count == 0)
+            CustomCollector.Count == 0 && CustomSqlTable.Count == 0)
         {
             return FunctionsSql;
         }
@@ -1627,6 +1637,14 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         {
             sb.Append(" UNION ALL SELECT '").Append(Esc(f.SchemaName)).Append("', '").Append(Esc(f.Name))
               .Append("', 'table', ").Append(f.Parameters.FieldsList.Count).Append(", ''");
+        }
+        foreach (var f in CustomSqlTable.Values)
+        {
+            // param_count = positional + named (the host splits them by the per-field fabricator.named tag on
+            // the param schema); no return type — the generated SQL's plan decides the output columns.
+            sb.Append(" UNION ALL SELECT '").Append(Esc(f.SchemaName)).Append("', '").Append(Esc(f.Name))
+              .Append("', 'table_sql', ")
+              .Append(f.Parameters.FieldsList.Count + f.NamedParameters.FieldsList.Count).Append(", ''");
         }
         foreach (var f in CustomInOut.Values)
         {
@@ -2393,8 +2411,30 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         {
             return customAgg.Parameters;
         }
+        if (CustomSqlTable.TryGetValue(key, out var customSqlTable))
+        {
+            // Positional ++ named (the latter tagged fabricator.named="1") in ONE schema — the host splits
+            // them when it registers the signature. See SqlGen.ParamSchema.
+            return SqlGen.ParamSchema(customSqlTable.Parameters, customSqlTable.NamedParameters);
+        }
         using var s = RoutineParamSchemaQuery(schemaName, functionName);
         return s.Schema;
+    }
+
+    /// <summary>
+    /// Generates the replacement SQL for a catalog-bound SQL-generating table function — the host parses it and
+    /// substitutes it for the call (bind_replace). <paramref name="catalogName"/> is this catalog's DuckDB
+    /// ATTACH alias, so a generator can emit references back into it; BIND-time only and possibly repeated, so
+    /// the generator must be deterministic and side-effect-free. See docs/macros-and-sqlgen-functions.md §2.
+    /// </summary>
+    public string GenerateTableSql(string schemaName, string functionName, string catalogName, RecordBatch? args)
+    {
+        if (!CustomSqlTable.TryGetValue($"{schemaName}.{functionName}", out var fn))
+        {
+            throw new NotSupportedException(
+                $"fabricator: no SQL-generating table function '{schemaName}.{functionName}'");
+        }
+        return SqlGen.Generate(fn, new SqlGenContext(catalogName, this), args);
     }
 
     // Zero-row Arrow stream of a routine's input parameters (typed-NULL SELECT reconstructed from

@@ -36,6 +36,10 @@ public static class GlobalFunctions
         new(() => Build<MacroDefinition>(b => b.GlobalMacros, m => m.Name, "macro"),
             LazyThreadSafetyMode.ExecutionAndPublication);
 
+    private static readonly Lazy<IReadOnlyDictionary<string, ISqlTableFunction>> SqlTableMap =
+        new(() => Build<ISqlTableFunction>(b => b.GlobalSqlTableFunctions, f => f.Name, "table_sql"),
+            LazyThreadSafetyMode.ExecutionAndPublication);
+
     /// <summary>All declared global scalar functions (the provider union), for <c>list_global_functions</c>.</summary>
     public static IReadOnlyCollection<IScalarFunction> AllScalars() => (IReadOnlyCollection<IScalarFunction>)ScalarMap.Value.Values;
 
@@ -64,6 +68,20 @@ public static class GlobalFunctions
     /// (a macro is expanded by DuckDB's binder, so nothing ever crosses back).</summary>
     public static IReadOnlyCollection<MacroDefinition> AllMacros() => (IReadOnlyCollection<MacroDefinition>)MacroMap.Value.Values;
 
+    /// <summary>All declared global SQL-generating table functions, for <c>list_global_functions</c>.</summary>
+    public static IReadOnlyCollection<ISqlTableFunction> AllSqlTables() => (IReadOnlyCollection<ISqlTableFunction>)SqlTableMap.Value.Values;
+
+    /// <summary>True iff <paramref name="name"/> is a global SQL-generating table function (used by
+    /// <see cref="ParamSchema"/> to return the positional++named-tagged parameter schema for that kind).</summary>
+    public static bool IsSqlTable(string name) => SqlTableMap.Value.ContainsKey(name);
+
+    /// <summary>Generate the replacement SQL for a global <c>table_sql</c> call (the handle-0
+    /// <c>generate_table_sql</c> path). Bind-time only; the returned statement replaces the call in the plan.</summary>
+    public static string GenerateTableSql(string name, RecordBatch? args) =>
+        SqlTableMap.Value.TryGetValue(name, out var fn)
+            ? SqlGen.Generate(fn, args)
+            : throw new ArgumentException($"fabricator: no global SQL-generating table function '{name}'");
+
     /// <summary>Open a session for a global aggregate by name (the handle-0 agg_open path). Throws if none.</summary>
     public static IAggregateSession ResolveAggregate(string name) =>
         AggregateMap.Value.TryGetValue(name, out var a)
@@ -77,6 +95,12 @@ public static class GlobalFunctions
     {
         if (ScalarMap.Value.TryGetValue(name, out var s)) { return s.Parameters; }
         if (TableMap.Value.TryGetValue(name, out var t)) { return t.Parameters; }
+        // A SQL-generating table function declares BOTH positional and named parameters; they cross as one
+        // schema with the named ones tagged (SqlGen.NamedParamKey) so the host can split them.
+        if (SqlTableMap.Value.TryGetValue(name, out var sq))
+        {
+            return SqlGen.ParamSchema(sq.Parameters, sq.NamedParameters);
+        }
         if (AggregateMap.Value.TryGetValue(name, out var a)) { return a.Parameters; }
         // In-out / collector cost args are declared as NAMED parameters (e.g. path := '…'); default empty.
         if (InOutMap.Value.TryGetValue(name, out var io)) { return io.Parameters; }

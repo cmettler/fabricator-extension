@@ -99,6 +99,14 @@ void OneLakeMove(const std::string &src, const std::string &dest, const std::str
 // managed side reads the _delta_log via the active opener (set via SetActiveOpener before this call).
 std::string DeltaListFiles(const std::string &path, const std::string &push_json);
 
+// SQL-generating table function (v68): generate the replacement SQL for one call. `handle` = 0 + empty
+// `schema`/`catalog_name` => the GLOBAL registry (resolve `func` by name); non-zero => the catalog's
+// registry, with `catalog_name` = the DuckDB ATTACH alias. `args` (nullable — no arguments) is the 1-row
+// constant-argument batch and is CONSUMED by the callee. Called at BIND time only. Throws
+// duckdb::IOException carrying the managed message on failure.
+std::string GenerateTableSql(FabricatorHandle handle, const std::string &schema, const std::string &func,
+                             const std::string &catalog_name, ArrowArrayStream *args);
+
 // -----------------------------------------------------------------------------
 // Convenience wrappers over the vtable. Each throws duckdb::IOException carrying
 // the managed error message (and releases it via free_error) on failure.

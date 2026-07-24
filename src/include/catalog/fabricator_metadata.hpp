@@ -54,8 +54,12 @@ vector<FabricatorFunctionInfo> DiscoverFunctions(FabricatorHandle handle);
 
 //! Resolves a scalar function's parameter names + DuckDB types from the Arrow schema of
 //! its (zero-row) param-schema stream — reuses the C# type mapping, no duplicate logic.
+//! When out_named is given, it also reports per parameter whether it is a NAMED (vs positional) parameter,
+//! read from the parameter FIELD's metadata (fabricator.named = "1"). Only SQL-generating (`table_sql`)
+//! functions declare both kinds; absent => positional, so every other function is unaffected.
 void FetchFunctionParamSchema(ClientContext &context, FabricatorHandle handle, const string &schema_name,
-                              const string &func_name, vector<string> &names, vector<LogicalType> &types);
+                              const string &func_name, vector<string> &names, vector<LogicalType> &types,
+                              vector<bool> *out_named = nullptr);
 
 //! Resolves a scalar function's return type from its (single-field) return-schema stream. When
 //! out_volatile is given it also reads the volatility signal riding the result FIELD's metadata

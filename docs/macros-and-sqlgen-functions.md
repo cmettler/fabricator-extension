@@ -1,8 +1,8 @@
 # C#-declared DuckDB macros + SQL-generating (bind-replace) table functions — design
 
-Status: **Phase A (macros) BUILT + VERIFIED 2026-07-24** (see §1.3 "AS BUILT"); Phases B/C (SQL-generating
-table functions) still design. Written against DuckDB v1.5.5 source (the in-tree `duckdb/` clone) and the
-fabricator global-function machinery (ABI v67).
+Status: **ALL THREE PHASES BUILT + VERIFIED 2026-07-24** — Phase A macros (§1.3 "AS BUILT", no ABI bump),
+Phases B+C SQL-generating table functions global + catalog-bound (§2.5 "AS BUILT", ABI v68). Written against
+DuckDB v1.5.5 source (the in-tree `duckdb/` clone) and the fabricator global-function machinery.
 
 Two related features, one theme — letting a provider ship **SQL** instead of marshaled execution:
 
@@ -374,6 +374,67 @@ The `union_by_pattern` case is the one neither a macro (identifier list is dynam
 `ITableFunction` (would stream everything through C#, losing per-table pushdown) can do well.
 
 ---
+
+### 2.5 AS BUILT (2026-07-24, ABI v68 — Phases B + C)
+
+Shipped as designed, with two deliberate refinements (below). Files:
+`Fabricator.Abstractions/ISqlTableFunction.cs` (`ISqlTableFunction` / `ICatalogSqlTableFunction` /
+`SqlGenContext`) + `DuckSql.cs` (quoting helpers) + `IBackend.GlobalSqlTableFunctions` +
+`IBackendCatalog.GenerateTableSql` (a throwing DIM, so no other provider changed);
+`Fabricator.Bridge/SqlGen.cs` (arg validation, the named-parameter tag, generation) +
+`GlobalFunctions.SqlTableMap`; `abi.h` `generate_table_sql` (appended, v68) + `clr_host` wrapper +
+`Abi.cs`/`Bootstrap.cs` handler; `fabricator_schema_entry.cpp`
+(`FabricatorSqlGenBindReplace` + `FabricatorParseGeneratedSelect` + `FabricatorBuildSqlGenSignature` +
+`GetOrCreateSqlTableFunction` + `AddSqlTableFunction`), `fabricator_catalog.cpp` discovery kind
+`table_sql`, `fabricator_metadata.cpp` (`FetchFunctionParamSchema(out_named)`). Demos:
+`fabricator_sql_seq` + `fabricator_delta_union` (global), `dbo.cf_union_by_pattern` (catalog-bound).
+Tests: **`test/verify_sqlgen.test` (59)** + **`test/verify_sqlgen_catalog.test` (30)**; regression: all 17
+function suites green (global_functions 63 / custom_functions 89 / scalar 26 / table 33 / procs 24 /
+aggregates 58 / table_inout 63 / proc_inout 31 / collector 40 / functions 13 / macros 41 / plugin 10 /
+catalog_filter 7 / function_filter 15 / invalidate_scoped 18).
+
+Refinements vs the plan:
+
+- **Named parameters cross on ONE schema, tagged in FIELD METADATA** — not a second ABI fetch. A
+  `table_sql` function's `get_function_param_schema` returns positional fields followed by named ones
+  carrying `fabricator.named = "1"` (`SqlGen.ParamSchema`); `FetchFunctionParamSchema` gained an optional
+  `out_named` flag vector read from that metadata BEFORE `ReadArrowSchema` consumes the struct — the exact
+  channel + shape the volatility signal already uses (`fabricator.volatile`). So no ABI entry beyond
+  `generate_table_sql`, and the split into DuckDB's `arguments` vs `named_parameters` happens in one shared
+  helper for both the global and catalog registration paths.
+- **The catalog-bound generator gets a `SqlGenContext`, not just the alias string.** It carries the ATTACH
+  alias AND the live `IBackendCatalog`, so a generator can LOOK THINGS UP at bind time — which is what makes
+  the flagship demo real: `cf_union_by_pattern` queries `sys.tables` on the catalog's own connection, then
+  emits the UNION over quoted three-part names. The global form keeps the plain
+  `GenerateSql(RecordBatch)` — connection-free is its defining property.
+
+Findings:
+
+- **The payoff is measured, not assumed.** `SELECT … FROM db.dbo.cf_union_by_pattern('sg_sales_%') WHERE
+  yr = 2024` reaches SQL Server as **two** statements — `(@p0 int)SELECT [id], [nm], [yr] FROM
+  [dbo].[sg_sales_2024] WHERE [yr] = @p0` and the same for `…_2023` — i.e. the predicate AND the projection
+  pushed into every member's server-side query (pinned from `dm_exec_query_stats`). A marshaled table
+  function would have streamed every row through C#. On the global side, `json_serialize_plan` of a
+  `fabricator_sql_seq` query contains **no** fabricator function at all: the call is gone after bind.
+- **`EXPLAIN` is not usable as a subquery** in DuckDB (parser error), so the "the call vanished" pin uses
+  `json_serialize_plan(sql, optimize := true)` — which IS subquery-usable and strictly better (it inspects
+  the optimized logical plan, not rendered text).
+- **`pushdown_complex_filter` log lines are optimizer-round-dependent** (the documented re-invocation), so
+  the Delta-side pushdown pin asserts `>= 2` (one per member scan), not an exact count.
+- **`Scan()` must enumerate the new registry too** — omitting `sql_table_functions_` from
+  `FabricatorSchemaEntry::Scan(TABLE_FUNCTION_ENTRY)` made the function resolvable BY NAME but invisible to
+  `duckdb_functions()` / `SHOW FUNCTIONS` (caught by the test's discovery section).
+- **T-SQL `LIKE` treats `[dbo]` as a character class**, so plan-cache assertions on emitted SQL must use
+  `CHARINDEX` (the pattern `verify_table_functions.test` already established).
+- Error surfaces are all clean and land at BIND: NULL for a non-nullable parameter (per-parameter message,
+  better than `query_table()`'s blanket rejection), the generator's own validation verbatim, an unknown named
+  parameter → DuckDB's candidate list, a non-constant argument → *"does not support lateral join column
+  parameters"*, and a non-single-SELECT generation → our own message. `PREPARE`/`EXECUTE` twice and a `VIEW`
+  over a call both work (the generator re-runs per bind — hence the determinism contract).
+
+Open question resolutions: #3 → shipped `DuckSql.QuoteIdent`/`QuoteName`/`Literal`/`QuoteString` only (no
+builder); #4 → LIST and BOOLEAN constants cross fine (`fabricator_delta_union(['a','b'], by_name := true)`),
+no JSON fallback needed; #5 (overload sets) → still deferred, unneeded so far.
 
 ## 3. Phasing, tests, effort
 

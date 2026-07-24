@@ -71,6 +71,14 @@ public interface IBackend
     IEnumerable<IAggregateFunction> GlobalAggregateFunctions => System.Array.Empty<IAggregateFunction>();
 
     /// <summary>
+    /// Connection-free GLOBAL SQL-generating table functions — registered at load as a bare <c>fn(args)</c>
+    /// whose call is REPLACED at bind time by the SQL the provider generates from its constant arguments
+    /// (DuckDB's <c>bind_replace</c>). No data crosses the bridge at execution. Empty by default. See
+    /// docs/macros-and-sqlgen-functions.md §2.
+    /// </summary>
+    IEnumerable<ISqlTableFunction> GlobalSqlTableFunctions => System.Array.Empty<ISqlTableFunction>();
+
+    /// <summary>
     /// DuckDB MACROs the provider ships — SQL templates registered at extension load into the SYSTEM catalog
     /// (bare <c>fn(...)</c> / <c>FROM fn(...)</c>, no ATTACH, every database). Each is one complete
     /// <c>CREATE MACRO</c> statement parsed by DuckDB itself, so scalar + table macros, named-parameter
@@ -248,6 +256,20 @@ public interface IBackendCatalog : IDisposable
     /// C# in-out. The gate-based exchange operator drives it.
     /// </summary>
     IArrowInOutBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema);
+
+    /// <summary>
+    /// Generates the replacement SQL for one call of a catalog-bound SQL-generating table function
+    /// (<see cref="ICatalogSqlTableFunction"/>) — the host parses it and substitutes it for the call
+    /// (<c>bind_replace</c>), so nothing streams through the bridge at execution.
+    /// <paramref name="catalogName"/> is the DuckDB ATTACH alias this call was resolved through (only the host
+    /// knows it), so the generator can qualify references back into this catalog;
+    /// <paramref name="args"/> (nullable) is a 1-row batch of the constant arguments — positional first, then
+    /// the supplied named ones by field name. BIND-time only, and possibly repeated (EXPLAIN / a view re-bind),
+    /// so it must be deterministic and side-effect-free. Providers without any such function throw.
+    /// </summary>
+    string GenerateTableSql(string schemaName, string functionName, string catalogName, RecordBatch? args) =>
+        throw new NotSupportedException(
+            $"provider: no SQL-generating table function '{schemaName}.{functionName}'");
 
     /// <summary>
     /// Opens a custom-aggregate session for <c>schema.func</c> (a provider-authored

@@ -57,7 +57,7 @@ public static unsafe class Bootstrap
             return new InMemoryArrayStream(schema, new[] { batch });
         });
 
-        vtable->AbiVersion = 67;
+        vtable->AbiVersion = 68;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -120,6 +120,7 @@ public static unsafe class Bootstrap
         vtable->DeltaListFiles = &DeltaListFiles;
         vtable->OneLakeRemove = &OneLakeRemove;
         vtable->OneLakeMove = &OneLakeMove;
+        vtable->GenerateTableSql = &GenerateTableSql;
         return FabricatorStatus.Ok;
     }
 
@@ -738,6 +739,44 @@ public static unsafe class Bootstrap
             var push = Marshal.PtrToStringUTF8((nint)pushJson);
             var json = DeltaReader.ListScanFilesJson(AmbientOpener.Current, p, push);
             *outJson = (byte*)Marshal.StringToCoTaskMemUTF8(json); // host frees via free_error
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    // SQL-GENERATING table function (v68): hand the constant call args to the function's generator and return
+    // the replacement SQL — the managed side of DuckDB's bind_replace (docs/macros-and-sqlgen-functions.md §2).
+    // BIND-time only; no data path. handle == 0 => the global registry; non-zero => the catalog's, with
+    // catalogName = the DuckDB ATTACH alias so a catalog-bound generator can qualify references back into it.
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int GenerateTableSql(nint handle, byte* schema, byte* func, byte* catalogName,
+                                       CArrowArrayStream* args, byte** outSql, byte** err)
+    {
+        try
+        {
+            if (outSql is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            RecordBatch? argsBatch = null;
+            if (args is not null)
+            {
+                using var argStream = CArrowArrayStreamImporter.ImportArrayStream(args); // we own it
+                argsBatch = argStream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+            }
+            var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
+            string sql = handle == 0
+                ? GlobalFunctions.GenerateTableSql(f, argsBatch)
+                : (Handles.Resolve<IBackendCatalog>(handle)
+                   ?? throw new InvalidOperationException(
+                       $"fabricator: generate_table_sql got a stale catalog handle for '{f}'"))
+                    .GenerateTableSql(Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty, f,
+                                      Marshal.PtrToStringUTF8((nint)catalogName) ?? string.Empty, argsBatch);
+            *outSql = (byte*)Marshal.StringToCoTaskMemUTF8(sql); // host frees via free_error
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)
@@ -1366,6 +1405,19 @@ public static unsafe class Bootstrap
                 body.Append(string.Empty);
                 paramCount.Append(fn.Parameters.FieldsList.Count);
                 returnType.Append(fn.Result.DataType.Name);
+                rows++;
+            }
+            // SQL-GENERATING table functions (v68): registered with bind_replace only — the call is rewritten
+            // into generated SQL at bind time. param_count is POSITIONAL + NAMED (the host splits them by the
+            // per-field fabricator.named tag on the param schema); no return type (the plan decides it).
+            foreach (var fn in GlobalFunctions.AllSqlTables())
+            {
+                name.Append(fn.Name);
+                kind.Append("table_sql");
+                stringOrder.Append("0");
+                body.Append(string.Empty);
+                paramCount.Append(fn.Parameters.FieldsList.Count + fn.NamedParameters.FieldsList.Count);
+                returnType.Append(string.Empty);
                 rows++;
             }
             // MACROs: SQL templates registered into DuckDB's system catalog at load. No param/return metadata
