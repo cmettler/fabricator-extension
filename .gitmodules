@@ -2,3 +2,6 @@
 	path = engineered-wood
 	url = https://github.com/cmettler/engineered-wood.git
 	branch = fabricator-patches
+[submodule "DuckDB.ExtensionKit"]
+	path = DuckDB.ExtensionKit
+	url = https://github.com/Giorgi/DuckDB.ExtensionKit.git

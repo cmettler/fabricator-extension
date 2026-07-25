@@ -4576,12 +4576,13 @@ VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
 - **PowerShell 7 (`pwsh`)** — runs the managed publish script.
 
 **Steps:**
-1. **Dependencies.** Only `engineered-wood` is a real git submodule (init NON-recursively — skips its
-   ~½ GB nested `parquet-testing` corpus). `duckdb` + `extension-ci-tools` are **gitignored manual
-   shallow clones** at pinned tags (NOT submodules — that's why there's no `git submodule` line for
-   them):
+1. **Dependencies.** Two real git submodules — `engineered-wood` (init NON-recursively: skips its
+   ~½ GB nested `parquet-testing` corpus) and `DuckDB.ExtensionKit` (MIT, pinned by sha, needed ONLY
+   to build the single-file distribution — the normal build never touches it). `duckdb` +
+   `extension-ci-tools` are **gitignored manual shallow clones** at pinned tags (NOT submodules —
+   that's why there's no `git submodule` line for them):
    ```
-   git submodule update --init engineered-wood
+   git submodule update --init engineered-wood DuckDB.ExtensionKit
    git clone --depth 1 --branch v1.5.5 https://github.com/duckdb/duckdb.git duckdb
    git clone --depth 1 --branch v1.5.3 https://github.com/duckdb/extension-ci-tools.git extension-ci-tools
    ```
@@ -4641,6 +4642,21 @@ VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
   fetchable — pushes still only on the user's explicit authorization), THEN bump the pointer
   (`git add engineered-wood && git commit`). (The old `D:\repos\engineered-wood` sibling is
   redundant; the scratchpad spike csprojs still point at it but scratchpad is gitignored.)
+- **DuckDB.ExtensionKit is an in-tree git submodule too** (`DuckDB.ExtensionKit/` at the root, since
+  2026-07-25; was a `D:\repos\DuckDB.ExtensionKit` absolute ProjectReference). MIT, upstream
+  `Giorgi/DuckDB.ExtensionKit`, **pinned by SHA (`882f080`) with no `branch =` line** — deliberately
+  NOT floating: the AOT shell depends on internals of the kit's `DuckDBExtApiV1` mirror, so an
+  unpinned bump could silently change the ABI surface. **It is NOT on NuGet** (checked: the
+  flat-container id 404s and a search returns 0 hits), so a `PackageReference` is not an option today;
+  a submodule also keeps it patchable, which matters because two upstream-candidate issues are already
+  known (the `duckdb_result` out-param typed as `nint*`, and `duckdb_fetch_chunk` typed as taking a
+  pointer when the C API takes the struct BY VALUE — see the distribution bullet's §15/§16 findings).
+  Only `dotnet/Fabricator.Installer` references it (`$(MSBuildThisFileDirectory)..\..\DuckDB.ExtensionKit`,
+  overridable via `-p:DuckDBExtensionKitPath=`), and nothing else in the repo builds that project — so a
+  missing submodule cannot break the normal build; the csproj errors with the exact `git submodule`
+  command instead. Switching a build between Windows and WSL over the SAME working tree makes the kit's
+  `obj/` restore for the other OS: the first cross-OS build can fail once in `ResolvePackageAssets`, and
+  simply re-running it succeeds.
 - **Windows build needs the VS dev env** — a plain shell fails at *compile* with `Cannot open include
   file: 'stdint.h'`. **Use the VS 18 vcvars, NOT VS 2022:**
   `C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvars64.bat`. The build is

@@ -96,8 +96,12 @@ SHA-256), and — decisively — **the entire extraction/packaging logic is plai
 testable as ordinary xunit on the Windows dev machine with no AOT and no DuckDB involved**.
 Only the final `dotnet publish -p:PublishAot=true` is per-platform.
 
-The substrate is **DuckDB.ExtensionKit** (MIT), a NativeAOT C# extension toolkit on DuckDB's
-C extension API:
+The substrate is **DuckDB.ExtensionKit** (MIT, upstream `Giorgi/DuckDB.ExtensionKit`), a NativeAOT C#
+extension toolkit on DuckDB's C extension API. It is vendored as an **in-tree git submodule pinned by
+SHA** (`DuckDB.ExtensionKit/`, no `branch =` line): it is not published on NuGet, and the shell
+depends on internals of its `DuckDBExtApiV1` mirror, so the version must be pinned rather than
+floated — and a submodule keeps it patchable, which the findings in §15 already argue for. Its
+features:
 
 - a source generator emits the `<name>_init_c_api` entry (`[UnmanagedCallersOnly]`,
   `CallConvCdecl`), performs the `duckdb_extension_access` handshake (`GetApi` → full
@@ -202,6 +206,14 @@ DuckDB's own footer is exactly this).
 Payload archive: single deflate zip (BCL `ZipArchive`), optionally Brotli-wrapped for the
 self-contained SKU (BCL `BrotliStream`, better ratio on the runtime). Built
 **deterministically** (fixed entry order + timestamps) so the payload SHA-256 is reproducible.
+
+**Scope of that guarantee (measured):** the *payload* is byte-reproducible; the *artifact* is not,
+because the NativeAOT link stamps a timestamp/debug GUID into the shell image, so rebuilding the
+shell changes the artifact's bytes while leaving the payload identical. That is the right way round:
+the idempotence marker is the PAYLOAD sha, so **rebuilding the installer shell does not force
+re-extraction on machines that already have the payload** — only a genuine payload change does.
+Verified by switching the kit reference (below) and re-packing: artifact hash changed, payload sha
+unchanged on both platforms.
 
 ### SKUs
 
@@ -527,7 +539,14 @@ What landed:
 4. **sqllogictest is the wrong harness** for this (see §9): our `unittest` binary embeds fabricator
    statically, so the chain-loaded core would collide with already-registered functions. The
    distribution is tested against a stock wheel instead.
-5. **Two build-mechanics traps**, both now encoded in the scripts: an AOT project must CLEAR the
+5. **The kit is vendored as a SHA-pinned submodule, not a local path** (added 2026-07-25 after phase
+   4). It is not on NuGet — the flat-container id 404s and a package search returns zero hits — so a
+   `PackageReference` is not available; a submodule pins exactly (the shell depends on the internals of
+   the kit's API-struct mirror) and keeps it patchable, which findings 2 and 3 above already argue for.
+   Switching the reference was verified behaviour-neutral: rebuilt the shell from the submodule,
+   repacked, and re-ran the smoke harness on both platforms — 12/12 each, and **both payload SHAs
+   unchanged**, which is the property that governs whether users re-extract.
+6. **Two build-mechanics traps**, both now encoded in the scripts: an AOT project must CLEAR the
    repo-wide `TargetFrameworks` (a single-value plural still counts as cross-targeting, and
    `dotnet publish` then demands `-f`); and `dotnet run` does not accept `--nologo` — it forwards it to
    the program, which sees it as argument one.

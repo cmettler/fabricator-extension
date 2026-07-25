@@ -26,8 +26,10 @@
     <DuckDBVersion>v1.2.0</DuckDBVersion>
     <AbiType>C_STRUCT</AbiType>
 
-    <!-- Overridable so a build machine can check the (MIT) kit out anywhere. -->
-    <DuckDBExtensionKitPath Condition="'$(DuckDBExtensionKitPath)' == ''">D:\repos\DuckDB.ExtensionKit</DuckDBExtensionKitPath>
+    <!-- The MIT kit is an in-tree submodule pinned to an exact commit, like engineered-wood: it is not
+         published on NuGet, and the shell depends on internals of its API-struct mirror, so the
+         version must be pinned rather than floated. Overridable for a checkout kept elsewhere. -->
+    <DuckDBExtensionKitPath Condition="'$(DuckDBExtensionKitPath)' == ''">$(MSBuildThisFileDirectory)..\..\DuckDB.ExtensionKit</DuckDBExtensionKitPath>
   </PropertyGroup>
 
   <ItemGroup>
@@ -45,7 +47,7 @@
 
   <Target Name="CheckExtensionKit" BeforeTargets="ResolveProjectReferences">
     <Error Condition="!Exists('$(DuckDBExtensionKitPath)\DuckDB.ExtensionKit\DuckDB.ExtensionKit.csproj')"
-           Text="DuckDB.ExtensionKit (MIT) not found at '$(DuckDBExtensionKitPath)'. Check it out and pass -p:DuckDBExtensionKitPath=&lt;path&gt;." />
+           Text="DuckDB.ExtensionKit (MIT) not found at '$(DuckDBExtensionKitPath)'. Run: git submodule update --init DuckDB.ExtensionKit  (or point -p:DuckDBExtensionKitPath=&lt;path&gt; at a checkout elsewhere)." />
   </Target>
 
 </Project>
