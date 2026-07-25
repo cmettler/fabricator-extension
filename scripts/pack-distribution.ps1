@@ -41,9 +41,20 @@ param(
 
     [string]$OutputDirectory,
 
+    # Override where the core loadable and the managed directory come from. Needed when packaging for
+    # another OS: NativeAOT and the C++ core must be BUILT on their target platform, but packing is
+    # platform-neutral, so a Windows machine can assemble a linux artifact from linux inputs.
+    [string]$CorePath,
+    [string]$ManagedPath,
+
     [switch]$SkipCore,
     [switch]$SkipManaged,
-    [switch]$SkipShell
+    [switch]$SkipShell,
+
+    # Also emit the two artifacts test/distribution/smoke_distribution.py uses to check the failure
+    # paths: one whose manifest targets a different DuckDB version, and one with no payload at all.
+    # They are per-platform (DuckDB checks the footer's platform first), hence siblings of the real one.
+    [switch]$WithNegatives
 )
 
 $ErrorActionPreference = 'Stop'
@@ -64,13 +75,21 @@ if (-not $Platform) {
 if (-not $OutputDirectory) { $OutputDirectory = Join-Path $repo "build/distribution/$Platform" }
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 
-$corePath = Join-Path $repo 'build/release/extension/fabricator/fabricator.duckdb_extension'
-$managedPath = Join-Path $repo 'build/release/extension/fabricator/fabricator'
+if (-not $CorePath) { $CorePath = Join-Path $repo 'build/release/extension/fabricator/fabricator.duckdb_extension' }
+if (-not $ManagedPath) { $ManagedPath = Join-Path $repo 'build/release/extension/fabricator/fabricator' }
+$corePath = $CorePath
+$managedPath = $ManagedPath
+
 $shellProject = Join-Path $repo 'dotnet/Fabricator.Installer'
-$shellLibrary = Join-Path $shellProject "bin/x64/Release/net10.0/$Rid/publish/Fabricator.Installer.dll"
-if ($Rid -notlike 'win-*') {
-    $shellLibrary = Join-Path $shellProject "bin/x64/Release/net10.0/$Rid/publish/Fabricator.Installer.so"
-}
+$shellName = if ($Rid -like 'win-*') { 'Fabricator.Installer.dll' }
+             elseif ($Rid -like 'osx-*') { 'Fabricator.Installer.dylib' }
+             else { 'Fabricator.Installer.so' }
+# The platform segment ('x64') is present or absent depending on how the build was invoked, so probe
+# rather than assume: a Windows publish lands under bin/x64/Release, a WSL one under bin/Release.
+$shellLibrary = @(
+    (Join-Path $shellProject "bin/x64/Release/net10.0/$Rid/publish/$shellName"),
+    (Join-Path $shellProject "bin/Release/net10.0/$Rid/publish/$shellName")
+) | Where-Object { Test-Path $_ } | Select-Object -First 1
 
 $artifact = Join-Path $OutputDirectory 'fabricator.duckdb_extension'
 $combined = Join-Path $OutputDirectory 'fabricator.combined'
@@ -103,7 +122,10 @@ if (-not $SkipShell) {
     & dotnet publish $shellProject -c Release -r $Rid -p:IlcUseEnvironmentalTools=true --nologo
     if ($LASTEXITCODE -ne 0) { throw 'dotnet publish (AOT) failed' }
 }
-if (-not (Test-Path $shellLibrary)) { throw "Installer shell not found: $shellLibrary" }
+if (-not $shellLibrary) {
+    throw "Installer shell ($shellName for $Rid) not found — publish it on a $Rid machine first: " +
+          "dotnet publish dotnet/Fabricator.Installer -c Release -r $Rid"
+}
 
 # --- 4. payload + polyglot artifact ----------------------------------------------------------
 Step 'Packing the payload'
@@ -132,6 +154,33 @@ if ($LASTEXITCODE -ne 0) { throw 'append_extension_metadata.py failed' }
 
 Remove-Item $combined -Force
 $size = (Get-Item $artifact).Length
+
+# --- 6. optional negative artifacts for the smoke harness -------------------------------------
+if ($WithNegatives) {
+    Step 'Building the negative artifacts'
+
+    $wrongDirectory = Join-Path $OutputDirectory '_negative'
+    New-Item -ItemType Directory -Force -Path $wrongDirectory | Out-Null
+    $wrongCombined = Join-Path $wrongDirectory 'fabricator.combined'
+    # Same payload, a manifest that claims a different DuckDB version: exercises the gate.
+    & dotnet run --project (Join-Path $repo 'dotnet/Fabricator.Installer.Pack') -c Release -- `
+        --core $corePath --managed $managedPath --library $shellLibrary `
+        --output $wrongCombined --payload (Join-Path $wrongDirectory 'payload.zip') `
+        --duckdb-version 'v0.0.0' --platform $Platform --fabricator-version $FabricatorVersion | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'packing the version-mismatch artifact failed' }
+    & python $metadataScript -l $wrongCombined -o (Join-Path $wrongDirectory 'fabricator.duckdb_extension') `
+        -n fabricator -p $Platform -dv $CApiVersion -ev 'v0.0.1' --abi-type C_STRUCT | Out-Null
+    Remove-Item $wrongCombined, (Join-Path $wrongDirectory 'payload.zip') -Force -ErrorAction SilentlyContinue
+
+    # The bare shell with a footer and nothing appended: exercises "this carries no payload".
+    $bareDirectory = Join-Path $OutputDirectory '_nopayload'
+    New-Item -ItemType Directory -Force -Path $bareDirectory | Out-Null
+    & python $metadataScript -l $shellLibrary -o (Join-Path $bareDirectory 'fabricator.duckdb_extension') `
+        -n fabricator -p $Platform -dv $CApiVersion -ev 'v0.0.1' --abi-type C_STRUCT | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'packing the payload-less artifact failed' }
+
+    Write-Host "negatives: $wrongDirectory, $bareDirectory"
+}
 
 Write-Host ''
 Write-Host "artifact : $artifact" -ForegroundColor Green

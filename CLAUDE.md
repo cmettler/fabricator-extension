@@ -276,15 +276,19 @@ current code still uses the single-provider `fabricator` naming):
 ## Next up (open threads for future sessions)
 
 In-flight / planned refactors (all C#-only unless noted; tests stay green per slice):
-- **SINGLE-FILE DISTRIBUTION — BUILT AND WORKING ON WINDOWS (2026-07-25; phases 1-3 of 5 —
-  remaining: linux artifact, user docs, CI): [docs/distribution-installer.md](docs/distribution-installer.md)
-  §12 (spike) + §14 (Installer.Core) + §15 (AOT shell + packaging).** ONE 61 MB
+- **SINGLE-FILE DISTRIBUTION — BUILT AND WORKING ON WINDOWS *AND LINUX* (2026-07-25; phases 1-4 of 5
+  — remaining: user-facing docs + CI): [docs/distribution-installer.md](docs/distribution-installer.md)
+  §12 (spike) + §14 (Installer.Core) + §15 (AOT shell + packaging) + §16 (linux).** ONE
   `fabricator.duckdb_extension` now installs and runs itself: `LOAD` it into an EMPTY extension
-  directory with ZERO env vars → 1.2 s cold (extract + chain-load + CLR boot), **0.01 s warm**,
-  then `fabricator_version()`, managed calls and a Delta CTAS round trip all work
-  (`test/distribution/smoke_distribution.py`, 12 checks incl. both must-not-touch-disk rejections).
-  Build it with `scripts/pack-distribution.ps1` (core → managed publish → AOT publish → pack →
-  footer; each step skippable). Ship ONE
+  directory with ZERO env vars → ~2 s cold (extract + chain-load + CLR boot), **0.01 s warm**, then
+  `fabricator_version()`, managed calls and a Delta CTAS round trip all work. **Both platforms pass
+  the same 12 checks** (`test/distribution/smoke_distribution.py`, incl. both must-not-touch-disk
+  rejections): **windows_amd64 61 MB standalone** (self-contained runtime) + **linux_amd64 40 MB
+  standard** (framework-dependent — the Fabric-notebook-relevant SKU; the bridge booted on the
+  preinstalled runtime with NO env vars). Build with `scripts/pack-distribution.ps1` (core → managed
+  publish → AOT publish → pack → footer; each step skippable, `-WithNegatives` emits the harness's
+  failure-path artifacts, `-CorePath`/`-ManagedPath` let ONE machine assemble another platform's
+  artifact since only the C++ core + AOT shell must be built on-target). Ship ONE
   `fabricator.duckdb_extension` per (DuckDB version × platform × SKU): a **NativeAOT C#
   installer extension** (on the MIT `DuckDB.ExtensionKit`, `D:\repos\DuckDB.ExtensionKit` —
   C_STRUCT ABI ⇒ DuckDB-version-portable outer shell) carrying the real payload
@@ -354,8 +358,25 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   `dotnet run` forwards an unrecognized `--nologo` to the program. **Loading BOTH spellings in one
   process is unsupported** (hostfxr initializes once per process; the second module's CLR fails and
   its global functions never register).
+  **PHASE 4 (§16) — LINUX DONE + the by-value ABI fix CONFIRMED on x64 SysV** (the platform where the
+  kit's pointer-shaped `fetch_chunk` signature would have been wrong: the gate + extdir resolution are
+  built on those reads, so a bad ABI would have failed the load before extraction — it didn't). AOT on
+  linux needed NOTHING beyond the distro clang 18 (no extra packages, and NOT
+  `IlcUseEnvironmentalTools` — that's a Windows/vswhere workaround); `dladdr` own-path discovery works
+  via the libc-then-libdl fallback. **THREE more findings:** (1) **negative test artifacts must be
+  PER-PLATFORM** — DuckDB checks the footer's platform BEFORE any extension code runs, so a Windows
+  negative on linux fails with "built for the platform windows_amd64" and proves nothing (it produced
+  two falsely-green PASSes on the first linux run; now generated as siblings of the real artifact by
+  `-WithNegatives`); (2) the publish output path is NOT stable across hosts — Windows lands under
+  `bin/x64/Release/...`, WSL under `bin/Release/...` (the platform segment appears only when the build
+  sets `Platform`), so the script PROBES both; (3) the harness's wheel must match the local interpreter
+  — the cp310 wheel kept in `build/linux-payload/` for the Fabric flow will NOT install on Ubuntu
+  24.04's python 3.12, and the harness must run from OUTSIDE the repo (the repo root's `duckdb/` source
+  dir shadows the module). **The linux core was rebuilt (35 MB, now exports BOTH entry symbols, ABI
+  v68) at `build/linux-dist/core/`** — NOTE `build/linux-payload/` (the separate Fabric-notebook
+  payload: loadable + loose-root FDD zip + wheel) is STILL the Jul-23 v67 build and remains stale.
   Phasing: spike ✅ → `Fabricator.Installer.Core` ✅ → AOT shell + `pack-distribution.ps1` +
-  the core dual entry symbol ✅ → linux artifact + user docs → CI matrix.
+  the core dual entry symbol ✅ → linux artifact ✅ → user-facing install docs + CI matrix.
 - **NativeAOT BRIDGE SKU (design only, 2026-07-25 — nothing built):
   [docs/aot-bridge.md](docs/aot-bridge.md).** An optional AOT-compiled variant of the
   managed layer (Bridge + providers → ONE native lib, `NativeLib=Shared`) beside the CoreCLR

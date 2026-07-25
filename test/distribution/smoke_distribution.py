@@ -138,8 +138,10 @@ def main() -> int:
 
     test_fresh_install(duckdb, artifact)
 
-    # Optional negatives: built by the same packer with a mismatched manifest / no payload at all.
-    directory = os.path.dirname(os.path.dirname(artifact))
+    # Optional negatives, built by `pack-distribution.ps1 -WithNegatives` as SIBLINGS of the real
+    # artifact: they must be per-platform, because DuckDB checks the footer's platform field before
+    # any extension code runs, so a Windows negative tells you nothing on Linux.
+    directory = os.path.dirname(artifact)
     wrong_version = os.path.join(directory, "_negative", "fabricator.duckdb_extension").replace(os.sep, "/")
     no_payload = os.path.join(directory, "_nopayload", "fabricator.duckdb_extension").replace(os.sep, "/")
 

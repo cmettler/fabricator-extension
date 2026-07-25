@@ -1,14 +1,15 @@
 # Single-file distribution: the NativeAOT C# installer extension
 
-Status: **BUILT AND WORKING ON WINDOWS** (phases 1–3 of 5; §12 spike, §14 `Installer.Core`,
-§15 the AOT shell + packaging). Remaining: the Linux artifact, user docs, CI. Goal: distribute
+Status: **BUILT AND WORKING ON WINDOWS AND LINUX** (phases 1–4 of 5; §12 spike, §14
+`Installer.Core`, §15 the AOT shell + packaging, §16 Linux). Remaining: user-facing docs and CI.
+Goal: distribute
 the fabricator extension (C++ loadable + the managed .NET payload) as **one `.duckdb_extension`
 file** that a user can `INSTALL`/`LOAD` like any other extension, with the runtime/assemblies
 extracted into DuckDB's extension directory at first load.
 
 ```sql
--- one 61 MB file, an empty extension directory, no environment variables:
-LOAD '<path>/fabricator.duckdb_extension';   -- 1.2 s first time, 0.01 s after
+-- ONE file (40 MB linux / 61 MB windows), an empty extension directory, no environment variables:
+LOAD '<path>/fabricator.duckdb_extension';   -- ~2 s first time, 0.01 s after
 SELECT fabricator_version();                 -- the core and its CLR are up
 ```
 
@@ -206,8 +207,11 @@ self-contained SKU (BCL `BrotliStream`, better ratio on the runtime). Built
 
 | SKU | payload | file size | requires |
 |---|---|---|---|
-| standard | core + FDD managed dir | ~20–25 MB (est.) | .NET 8+ on the machine (`FABRICATOR_DOTNET_ROOT`/`DOTNET_ROOT`/default probing — existing clr_host logic) |
-| standalone | core + self-contained managed dir | **58 MB (measured, §14)** | nothing |
+| standard | core + FDD managed dir | **40 MB** (measured on linux_amd64, §16) | .NET 8+ on the machine (`FABRICATOR_DOTNET_ROOT`/`DOTNET_ROOT`/default probing — existing clr_host logic) |
+| standalone | core + self-contained managed dir | **61 MB** (measured on windows_amd64, §15) | nothing |
+
+Those two numbers are not directly comparable — they differ in platform as well as SKU (the linux
+core is 35 MB against Windows' 23 MB, so the core, not the runtime, dominates the linux artifact).
 
 Same installer binary, same filename, different payload — the SKU is a download choice.
 
@@ -404,8 +408,8 @@ Measured artifact composition (real core as payload): `3,678,208` lib + `8,304,1
 2. **`Fabricator.Installer.Core` + full unit suite — DONE (2026-07-25)**, see §14.
 3. **AOT shell + `pack-distribution.ps1` + the core's dual entry symbol — DONE (2026-07-25)**, see
    §15: a real 61 MB Windows artifact installs and runs from one file.
-4. **Linux** (WSL AOT publish + smoke); README/user docs.
-5. **CI matrix + release automation**; osx deferred with the core's osx build.
+4. **Linux — DONE (2026-07-25)**, see §16: a 40 MB linux_amd64 artifact, same 12 checks green.
+5. **User-facing install docs + CI matrix + release automation**; osx deferred with the core's osx build.
 
 ## 14. Phase 2 as-built — `Fabricator.Installer.Core` (2026-07-25)
 
@@ -530,3 +534,62 @@ What landed:
 6. **Measured composition**: 2,882,560 B AOT shell + 61,111,666 B payload (368 entries: the 22.9 MB
    core plus the 115 MB self-contained managed dir) + 32 B index + manifest + 534 B footer =
    **63,995,127 B**.
+
+## 16. Phase 4 as-built — the Linux artifact (2026-07-25)
+
+**A 40 MB `linux_amd64` artifact passes the same 12 checks**, run in WSL (Ubuntu 24.04) against the
+official `duckdb==1.5.5` linux wheel:
+
+```
+[1] fresh install, no environment variables
+  PASS  LOAD succeeded  (2.64s cold)
+  PASS  the managed bridge booted and answers (zero configuration)
+  PASS  both the installer and the core report as loaded  ['fabricator', 'fabricator_core']
+  PASS  a Delta write/read round trip works through the extracted core
+  PASS  the second load took the fast path  (0.01s < 2.64s)
+[2] version mismatch / [3] artifact without a payload -> our messages, nothing written
+```
+
+Composition: 3,024,096 B AOT shell + 38,872,418 B payload (the 35 MB core + the
+framework-dependent managed dir) = 41,897,411 B. Cold 2.6 s, warm 0.01 s — same shape as Windows.
+
+This is the **standard (framework-dependent) SKU**, which is the one that matters for Fabric
+notebooks: the managed bridge booted with **no environment variables at all**, resolving the
+preinstalled runtime through clr_host's existing probe. So the artifact carries no .NET runtime and
+still needs no configuration.
+
+### What this validates and what it cost
+
+1. **The by-value `fetch_chunk` fix (§15 finding 2) is confirmed on x64 SysV.** This is the platform
+   where the kit's pointer-shaped signature would have been wrong. Reading the five settings is what
+   the gate and the directory resolution are built on, so a bad ABI would have produced a garbage
+   `internal_data` and failed the load before extraction. It loaded, gated, resolved and extracted
+   correctly — the fix was right, and reading duckdb.h beforehand saved debugging it here.
+2. **Own-path discovery works via `dladdr`.** The `libc`-then-`libdl` fallback resolved the
+   `.duckdb_extension` path on glibc 2.39.
+3. **AOT needed nothing beyond the distro clang** (18.1.3): no extra packages, no flags — and
+   notably **not** `IlcUseEnvironmentalTools`, which is a Windows/vswhere workaround.
+4. **Packing is genuinely platform-neutral.** Only the C++ core and the AOT shell must be built on
+   the target OS; the Windows machine assembled the linux artifact from those two inputs plus a
+   cross-published managed directory. Hence the new `-CorePath`/`-ManagedPath` overrides on
+   `pack-distribution.ps1`.
+
+### Findings
+
+1. **Negative test artifacts must be PER-PLATFORM.** DuckDB validates the footer's platform field
+   before any extension code runs, so a Windows negative loaded on Linux fails with "built for the
+   platform windows_amd64" and proves nothing about our gate. They are now generated as siblings of
+   the real artifact by `pack-distribution.ps1 -WithNegatives`, and the harness looks for them there —
+   a mistake worth encoding in the tooling rather than in a comment, since it produced two green-looking
+   PASSes for the wrong reason on the first Linux run.
+2. **The publish output path is not stable across hosts**: a Windows publish lands under
+   `bin/x64/Release/...`, a WSL one under `bin/Release/...` (the platform segment appears only when the
+   build sets `Platform`). The script probes both instead of assuming.
+3. **The csproj's kit-path guard earned its keep immediately** — the hardcoded `D:epos\...` default is
+   meaningless in WSL, and the build failed with the actionable message instead of a NuGet
+   "project not found". Pass `-p:DuckDBExtensionKitPath=/mnt/d/repos/DuckDB.ExtensionKit`.
+4. **Wheel/interpreter mismatch is a real friction point for the harness**: the cp310 wheel kept in
+   `build/linux-payload/` for the Fabric flow cannot be installed on Ubuntu 24.04's Python 3.12
+   ("not a supported wheel on this platform"). Install `duckdb==1.5.5` for the local interpreter
+   instead (`pip install --target`), and run the harness from outside the repo — the repo root contains
+   a `duckdb/` source directory that otherwise shadows the module.
