@@ -1,7 +1,9 @@
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
-# Configuration of extension
-EXT_NAME=mssql_net
+# Configuration of extension. MUST match the name in extension_config.cmake — the template makefile
+# derives build targets and the output path (build/<type>/extension/<name>/<name>.duckdb_extension)
+# from it, so a stale name silently builds/looks for the wrong artifact.
+EXT_NAME=fabricator
 EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 
 # Build the managed (C#) bridge into the extension output before/after the

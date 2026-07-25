@@ -5,3 +5,17 @@
 [submodule "DuckDB.ExtensionKit"]
 	path = DuckDB.ExtensionKit
 	url = https://github.com/Giorgi/DuckDB.ExtensionKit.git
+# The DuckDB we build against. Pinned to a RELEASE TAG sha (currently v1.5.5), not a branch tip:
+# this repo's branch (v1.5-variegata) tracks the 1.5 line, and the pin moves tag by tag within it.
+# No `branch =` line on purpose — `git submodule update --remote` would jump to an unreleased tip.
+# shallow: a depth-1 checkout has no tag context, so the build still needs -DOVERRIDE_GIT_DESCRIBE.
+[submodule "duckdb"]
+	path = duckdb
+	url = https://github.com/duckdb/duckdb.git
+	shallow = true
+# Build tooling (makefiles, vcpkg ports, append_extension_metadata.py). By convention its version
+# matches the DuckDB version — upstream branches are per-patch, so this is the v1.5.5 branch sha.
+[submodule "extension-ci-tools"]
+	path = extension-ci-tools
+	url = https://github.com/duckdb/extension-ci-tools.git
+	shallow = true

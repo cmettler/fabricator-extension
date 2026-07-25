@@ -8,10 +8,6 @@ cmake-build-*/
 [Oo]bj/
 *.user
 
-# DuckDB / extension submodules (added via .gitmodules; checkouts not committed)
-/duckdb/
-/extension-ci-tools/
-
 # Local managed publish placed next to the extension. The in-build output is
 # already covered by /build/ above; this guards any publish placed elsewhere.
 # Do NOT ignore the C++ core SOURCE, which lives under src/arrownet/.

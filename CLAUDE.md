@@ -4601,15 +4601,14 @@ VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
 - **PowerShell 7 (`pwsh`)** — runs the managed publish script.
 
 **Steps:**
-1. **Dependencies.** Two real git submodules — `engineered-wood` (init NON-recursively: skips its
-   ~½ GB nested `parquet-testing` corpus) and `DuckDB.ExtensionKit` (MIT, pinned by sha, needed ONLY
-   to build the single-file distribution — the normal build never touches it). `duckdb` +
-   `extension-ci-tools` are **gitignored manual shallow clones** at pinned tags (NOT submodules —
-   that's why there's no `git submodule` line for them):
+1. **Dependencies.** FOUR git submodules: `duckdb` + `extension-ci-tools` (the DuckDB source + build
+   tooling, both `shallow = true`), `engineered-wood` (the Delta engine), and `DuckDB.ExtensionKit`
+   (MIT, needed ONLY to build the single-file distribution — the normal build never touches it).
+   **Init NON-recursively** — `--recursive` would drag in engineered-wood's nested `parquet-testing`
+   corpus (~½ GB of test data the build does not need; EW's own corpus-dependent Parquet.Tests then
+   fail, which is expected):
    ```
-   git submodule update --init engineered-wood DuckDB.ExtensionKit
-   git clone --depth 1 --branch v1.5.5 https://github.com/duckdb/duckdb.git duckdb
-   git clone --depth 1 --branch v1.5.3 https://github.com/duckdb/extension-ci-tools.git extension-ci-tools
+   git submodule update --init          # NOT --recursive
    ```
 2. **vcpkg deps** (once): `vcpkg install openssl:x64-windows-static curl:x64-windows-static`
 3. **Configure** (first time; ONE command WITH the vcpkg toolchain — httpfs is linked unconditionally so
@@ -4634,11 +4633,18 @@ VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
 
 - **Target DuckDB v1.5.5** (since 2026-07-22; new extension API: `Extension::Load(ExtensionLoader&)` +
   `loader.RegisterFunction(...)` + `DUCKDB_CPP_EXTENSION_ENTRY(fabricator, loader)`). `duckdb` +
-  `extension-ci-tools` are **gitignored manual shallow clones** (NOT git submodules — `.gitmodules`
-  declares only `engineered-wood`), pinned to `duckdb@d8cdaa33` (the v1.5.5 tag) +
-  `extension-ci-tools@v1.5.3` (still the latest tooling for the 1.5.x line). Clone them per the
-  fresh-clone step 1 above; bump `duckdb` via
-  `git -C duckdb fetch --depth 1 origin <sha> && git -C duckdb checkout <sha>` (a version bump also
+  `extension-ci-tools` are **git submodules** (converted 2026-07-25 — previously gitignored manual
+  clones whose shas lived only in this prose, which had already drifted: the tooling pin said v1.5.3
+  while upstream had v1.5.4 AND v1.5.5 branches, and it pointed at a moving BRANCH TIP rather than a
+  sha. A submodule makes the pin a reviewable diff line and gives CI one deterministic bootstrap).
+  Pinned to `duckdb@d8cdaa33` (the v1.5.5 tag) + `extension-ci-tools@72e76e99` (its v1.5.5 branch —
+  by convention the tooling version matches the DuckDB version; upstream branches it per patch
+  release while duckdb itself branches per LINE, `v1.5-variegata`). Both carry `shallow = true`, so
+  `git describe` still has no tag context and the build still needs `-DOVERRIDE_GIT_DESCRIBE`.
+  Neither has a `branch =` line ON PURPOSE — `git submodule update --remote` would jump the pin to an
+  unreleased tip. Bump duckdb via
+  `git -C duckdb fetch --depth 1 origin <sha> && git -C duckdb checkout <sha>` then `git add duckdb`
+  (a version bump also
   means: re-run cmake with `-DOVERRIDE_GIT_DESCRIBE=v<new>`, match the out-of-tree httpfs pin in
   `extension_config.cmake` to the sha in duckdb's `.github/config/extensions/httpfs.cmake`, and
   `pip install duckdb==<new>` in the dbt/notebook envs — the official wheel rejects a loadable whose
@@ -4961,6 +4967,16 @@ VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
   must outlive table entries (each entry's `ParentSchema()` is a REFERENCE into its schema entry). Never
   "optimize" evictions back to immediate destruction.
 - **CHECK constraints + non-literal DEFAULTs on CREATE: deliberately skipped** (per user).
+- **BRANCH NAMING mirrors DuckDB's (adopted 2026-07-25).** The default branch is
+  **`v1.5-variegata`** — the same name DuckDB uses for its 1.5 release line (`refs/heads/v1.5-variegata`;
+  its predecessors are `v1.4-andium`, `v1.3-ossivalis`), which is also what the extension ecosystem
+  (duckdb-httpfs/-delta/-azure) does. The duckdb submodule pin belongs to the branch: `v1.5-variegata`
+  pins release tags within the 1.5 line and moves tag by tag. **`main` is RESERVED for tracking duckdb
+  `main`** (the next, unreleased version) and **does not exist yet** — deliberately: creating it means
+  absorbing continuous upstream API churn (the 1.5 `ExtensionLoader` break is the precedent) and
+  doubling CI minutes for zero consumers. Add it as a nightly allowed-to-fail branch when there's a 1.6
+  preview worth tracking. Note the sharp edge: `main` will eventually exist again but MEAN something
+  different, so don't treat a `main` reference in older notes as "the current line".
 - **Commit only when asked.** The Python scaffold (`main.py`/`pyproject.toml`/`uv.lock`/
   `.python-version`) is intentionally left untracked. `.gitignore` note: `**/fabricator/` would match the
   *source* `src/fabricator/` + `src/include/fabricator/` — negations re-include them; never re-broaden it.

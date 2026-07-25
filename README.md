@@ -1012,23 +1012,27 @@ pwsh scripts/publish-managed.ps1     # self-contained publish next to the built 
 
 ### Extension
 
-Dependencies — two git submodules + two gitignored manual shallow clones at pinned tags:
+Dependencies — four git submodules, all pinned by SHA. **Init non-recursively:**
 
 ```bash
-git submodule update --init engineered-wood DuckDB.ExtensionKit    # non-recursive, see below
-git clone --depth 1 --branch v1.5.5 https://github.com/duckdb/duckdb.git duckdb
-git clone --depth 1 --branch v1.5.3 https://github.com/duckdb/extension-ci-tools.git extension-ci-tools
+git submodule update --init          # NOT --recursive — see engineered-wood below
 ```
 
-- **`engineered-wood`** — the pure-C# Delta/Parquet library (a git submodule pinned to the
+- **`duckdb@v1.5.5`** + **`extension-ci-tools`** — the DuckDB source + build tooling, both
+  `shallow = true` so the checkout stays small. Neither has a `branch =` line, so
+  `git submodule update --remote` can't silently move the pin to an unreleased tip; bump them by
+  checking out a new SHA and committing the gitlink.
+- **`engineered-wood`** — the pure-C# Delta/Parquet library (pinned to the
   [`cmettler/engineered-wood`](https://github.com/cmettler/engineered-wood) fork), referenced in-tree by
-  `Fabricator.Bridge`. Init NON-recursively (as above) to skip its ~½ GB nested `parquet-testing` corpus.
+  `Fabricator.Bridge`. **This is why the init must be non-recursive:** it has a nested
+  `parquet-testing` submodule holding ~½ GB of Apache test data that the build does not need.
 - **`DuckDB.ExtensionKit`** — the MIT NativeAOT extension toolkit
-  ([`Giorgi/DuckDB.ExtensionKit`](https://github.com/Giorgi/DuckDB.ExtensionKit)), pinned by SHA. Needed
-  ONLY to build the single-file distribution artifact; nothing else in the repo references it, so you can
-  skip it for a normal build.
-- **`duckdb@v1.5.5`** + **`extension-ci-tools@v1.5.3`** — the DuckDB source + build tooling. These are
-  **gitignored manual clones**, NOT submodules, so they're cloned explicitly at their pinned tags as shown.
+  ([`Giorgi/DuckDB.ExtensionKit`](https://github.com/Giorgi/DuckDB.ExtensionKit)). Needed ONLY to build
+  the single-file distribution artifact; nothing else in the repo references it, so a normal build works
+  without it.
+
+This repo's default branch is **`v1.5-variegata`**, matching DuckDB's own name for the 1.5 release line;
+the `duckdb` pin moves tag by tag within that line. (`main` is reserved for tracking duckdb `main`.)
 
 `httpfs` is linked unconditionally (for `s3://`), so it needs OpenSSL + curl from **vcpkg**:
 `vcpkg install openssl:x64-windows-static curl:x64-windows-static` (with `VCPKG_ROOT` set).
