@@ -1,0 +1,173 @@
+# Tier 1: build the extension and run every suite that needs no external service.
+#
+# This is where the coverage is — 53 suites / 4152 assertions (measured 2026-07-25), the Delta
+# catalog work: transactions (941), row tracking (299), column mapping (251), native write (147),
+# clustered optimize (138), variant (144), row-level concurrency (70)... None of it needs SQL Server,
+# MinIO, Power BI Desktop or live Fabric credentials, only a writable directory and the fixtures
+# committed to this repo.
+#
+# Deliberately NOT in this workflow:
+#   * the 38 SQL Server suites and 3 S3/PolyBase ones — they need the docker/docker-compose.yml
+#     stack (SQL Server 2025 + MinIO + generated TLS certs). Tier 2, on a schedule.
+#   * DAX (needs Power BI Desktop) and live Fabric/OneLake (needs credentials that are gitignored
+#     by design). Not automatable; manual gates.
+#   * pack-distribution + smoke_distribution.py. They need their own toolchain (NativeAOT: the MSVC
+#     linker or clang) and a stock DuckDB wheel driven from OUTSIDE the repo, so they get their own
+#     workflow rather than making this one longer and harder to read.
+#
+# The heavy part is compiling DuckDB from source (the submodule pin), so this is path-filtered and
+# does not run on documentation commits.
+
+name: extension
+
+on:
+  push:
+    branches: [v1.5-variegata]
+    paths:
+      - src/**
+      - test/**
+      - dotnet/**
+      - scripts/**
+      - extension_config.cmake
+      - CMakeLists.txt
+      - Makefile
+      - .gitmodules
+      - .github/workflows/extension.yml
+  pull_request:
+    branches: [v1.5-variegata]
+    paths:
+      - src/**
+      - test/**
+      - dotnet/**
+      - scripts/**
+      - extension_config.cmake
+      - CMakeLists.txt
+      - Makefile
+      - .gitmodules
+      - .github/workflows/extension.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: extension-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # DuckDB's own public read-only vcpkg binary cache. Without it every run rebuilds OpenSSL from
+  # source for the statically linked httpfs, which dominates the wall clock.
+  VCPKG_BINARY_SOURCES: 'clear;http,https://vcpkg-cache.duckdb.org,read'
+  # The extension declares v0.0.1, so `git describe` on a shallow submodule cannot supply the real
+  # version and the artifact would be rejected by a stock DuckDB. Must match the duckdb pin.
+  DUCKDB_VERSION: v1.5.5
+
+defaults:
+  run:
+    # One script per step for both runners (windows-latest ships Git Bash). GitHub invokes bash with
+    # -eo pipefail, which matters here: several steps pipe, and without pipefail a failing build
+    # piped into anything would be masked by the last command's exit 0.
+    shell: bash
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            triplet: x64-linux
+            unittest: build/release/test/unittest
+          - os: windows-latest
+            triplet: x64-windows-static
+            unittest: build/release/test/unittest.exe
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.os }}
+    # The DuckDB compile dominates; generous but bounded so a hang cannot burn the budget.
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # `true`, NOT `recursive`. Both init the four top-level submodules (duckdb,
+          # extension-ci-tools, engineered-wood, DuckDB.ExtensionKit); only `recursive` would also
+          # pull engineered-wood's nested parquet-testing corpus, ~1/2 GB of Apache test data that
+          # nothing in this job reads. duckdb and extension-ci-tools are `shallow = true` in
+          # .gitmodules, so this stays reasonably cheap despite duckdb's size.
+          submodules: true
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          # 10 builds and runs the bridge; 8 is the deployment floor the bridge also targets, and
+          # supplies the runtime a framework-dependent publish resolves at load time.
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Install vcpkg dependencies (OpenSSL + curl for the statically linked httpfs)
+        run: |
+          # An `if`, not `[ ... ] && ...`: under -e the latter aborts the step on Linux, where the
+          # test is simply false.
+          if [ "$RUNNER_OS" = 'Windows' ]; then
+            vcpkg="$VCPKG_INSTALLATION_ROOT/vcpkg.exe"
+          else
+            vcpkg="$VCPKG_INSTALLATION_ROOT/vcpkg"
+          fi
+          "$vcpkg" install "openssl:${{ matrix.triplet }}" "curl:${{ matrix.triplet }}"
+
+      # Windows needs the C++ toolchain environment exported into the job; a plain shell cannot even
+      # find stdint.h. NOTE the local build requires VS 18 specifically, because a build dir
+      # CONFIGURED with VS 18's STL then linked with VS 2022 fails on missing vectorized-algorithm
+      # intrinsics (__std_find_first_not_of_trivial_pos_1 and friends). That is a MIXED-toolset
+      # artifact: a CI build compiles and links everything with one toolset, so whatever the runner
+      # image ships is self-consistent and fine.
+      - name: Export the MSVC environment
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do call "%%i\VC\Auxiliary\Build\vcvars64.bat"
+          set >> "%GITHUB_ENV%"
+
+      - name: Configure
+        run: |
+          # GITHUB_WORKSPACE, not $PWD: under Git Bash on Windows $PWD is the MSYS form (/d/a/...)
+          # which CMake does not understand, whereas GITHUB_WORKSPACE is a native path on both
+          # runners. Forward slashes appended to a Windows path are fine for CMake.
+          cmake -G Ninja -S duckdb -B build/release \
+            -DEXTENSION_STATIC_BUILD=1 \
+            -DDUCKDB_EXTENSION_CONFIGS="$GITHUB_WORKSPACE/extension_config.cmake" \
+            -DDUCKDB_EXPLICIT_PLATFORM=${{ runner.os == 'Windows' && 'windows_amd64' || 'linux_amd64' }} \
+            -DENABLE_EXTENSION_AUTOLOADING=1 -DENABLE_EXTENSION_AUTOINSTALL=1 \
+            -DENABLE_UNITTEST_CPP_TESTS=FALSE \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DOVERRIDE_GIT_DESCRIBE="$DUCKDB_VERSION" \
+            -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }}
+
+      - name: Build
+        run: cmake --build build/release --target unittest
+
+      - name: Publish the managed bridge
+        # Framework-dependent rather than self-contained: ~35 MB instead of ~250 MB, and the runner
+        # already has the .NET runtimes installed above. clr_host distinguishes the two layouts by
+        # whether hostfxr sits in the managed directory, and resolves a provided runtime via
+        # DOTNET_ROOT, which setup-dotnet exports.
+        run: pwsh -NoProfile -File scripts/publish-managed.ps1 -Mode Framework
+
+      - name: Run the hermetic suites
+        # One process per suite with a fresh scratch directory, and assertions that the set actually
+        # ran (nothing skipped, no "No tests ran", floors on suite and assertion counts). See the
+        # script's header for why batching them into one process is not an option.
+        env:
+          UNITTEST: ${{ matrix.unittest }}
+        run: scripts/run-hermetic-suites.sh
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ matrix.os }}
+          path: |
+            build/release/CMakeFiles/*.log
+            build/release/CMakeCache.txt
+          if-no-files-found: ignore
