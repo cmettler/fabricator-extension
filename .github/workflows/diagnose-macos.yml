@@ -62,15 +62,44 @@ jobs:
         run: |
           export FABRICATOR_DELTA_WRITE_DIR=$(mktemp -d)
           export FABRICATOR_DELTA_DIR="$PWD/test/fixtures/delta_simple"
+          # -k, NOT -o, for the backtrace: in batch mode lldb stops processing -o commands once the
+          # target stops unexpectedly, which is why the first attempt printed the SIGABRT stop report
+          # and then nothing. -k is precisely "commands to run when the target crashes".
+          #
           # Deliberately NOT breaking on throw (`break set -E c++`): DuckDB throws routinely for
-          # control flow, so lldb would stop dozens of times before the fatal one. Letting it run to
-          # SIGABRT and printing every thread is both simpler and more informative.
+          # control flow, so lldb would stop dozens of times before the fatal one.
           lldb -b \
             -o "run" \
-            -o "thread backtrace all" \
-            -o "quit" \
+            -k "thread backtrace all" \
+            -k "quit" \
             -- ./build/release/test/unittest --test-dir . "test/verify_global_functions.test" \
-            2>&1 | tail -160 || true
+            2>&1 | tail -200 || true
+
+      - name: A2 — minimal repro (the statement the bisect named, on its own)
+        env:
+          FABRICATOR_MANAGED_DIR: build/release/extension/fabricator/fabricator
+        run: |
+          export FABRICATOR_DELTA_WRITE_DIR=$(mktemp -d)
+          # If this alone aborts, the repro is two lines and the bug is in the global table-function
+          # path itself. If it PASSES, the failure needs the preceding statements, i.e. it is
+          # state-dependent — which points at teardown/reuse rather than this query.
+          cat > test/_minimal.test <<'EOF'
+          # name: test/_minimal.test
+          # group: [fabricator]
+
+          require fabricator
+
+          query I
+          SELECT squared FROM fabricator_seq(5) WHERE value > 3 ORDER BY squared;
+          ----
+          16
+          25
+          EOF
+          ./build/release/test/unittest --test-dir . "test/_minimal.test" 2>&1 | tail -20 || true
+          echo "--- again under lldb ---"
+          lldb -b -o "run" -k "thread backtrace all" -k "quit" \
+            -- ./build/release/test/unittest --test-dir . "test/_minimal.test" 2>&1 | tail -120 || true
+          rm -f test/_minimal.test
 
       - name: B — statement bisect (shortest failing prefix)
         env:
