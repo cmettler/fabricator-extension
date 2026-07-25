@@ -123,7 +123,7 @@ jobs:
         shell: bash
         env:
           UNITTEST: ${{ matrix.unittest }}
-        run: scripts/run-hermetic-suites.sh
+        run: scripts/run-suites.sh hermetic
 
       - name: Upload failure logs
         if: failure()
