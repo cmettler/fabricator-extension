@@ -4937,6 +4937,94 @@ VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
   #   piped:  build/release/duckdb.exe -unsigned -batch < script.sql   (LH = schema-enabled, dbo)
   ```
 
+### CI — introduced 2026-07-25 (`.github/workflows/`), tiered by what it needs
+
+Nothing existed before this; the repo was developed and validated by hand on one Windows box. The
+tiers are separated by their DEPENDENCIES, not by taste, and each is path-filtered so documentation
+commits do not compile DuckDB:
+
+| tier | workflow | what | trigger |
+|---|---|---|---|
+| 0 | `installer-core.yml` | `Fabricator.Installer.Core.Tests`, 92 × {net8.0,net10.0} × {win,linux}. No C++, no vcpkg, no submodules (the closure is Installer.Core + xunit). ~2 min | push/PR |
+| 1 | `extension.yml` | build + the **53 hermetic suites / 4152 assertions** (scratch dir + in-repo fixtures only). 3 platforms | push/PR |
+| 2 | `integration.yml` | the **42 service suites / 1221 assertions** via `docker/docker-compose.yml` (SQL Server 2025 + MinIO + generated certs + `provision.ps1`). linux only | schedule + dispatch |
+| — | manual | `verify_dax` (Power BI Desktop), live Fabric/OneLake (gitignored SP creds), the 7 deltars suites (`-IncludeDeltaRs`, ~240 MB) | by hand |
+
+**Suite selection is DERIVED, never a hand-kept list** — `scripts/list-hermetic-suites.sh` and
+`scripts/list-service-suites.sh` classify by the `require-env`/`require` directives each suite
+declares, so a new suite cannot silently sit outside CI. The accounting is complete and checked:
+**53 + 42 + 9 excluded = 104**, no overlap. `scripts/run-suites.sh <hermetic|service>` runs them ONE
+PROCESS PER SUITE with a fresh scratch dir, and asserts what `unittest` will not: nothing SKIPPED, the
+runner never says "No tests ran", and floors on the selected suite/assertion counts. The hermetic tier
+CLEARS the service env vars (proving hermeticity); the service tier DEMANDS them and names any that
+are missing.
+
+**Per-platform coverage is deliberately unequal — state it, never imply parity:**
+
+| | tier 1 | tier 2 | notes |
+|---|---|---|---|
+| `linux_amd64` | ✅ | ✅ | the Fabric deployment target |
+| `windows_amd64` | ✅ | (local only) | the development platform; DAX/ADOMD fully supported here |
+| `osx_arm64` | ✅ | ❌ impossible | hosted macOS runners **cannot run containers**, so SQL Server/MinIO are unreachable. Demand-driven (DuckDB's user base skews Apple Silicon); DAX untested |
+
+**Traps that cost real cycles — do not rediscover them:**
+- **A no-match sqllogictest filter exits ZERO** ("No tests ran"), and the filter is Catch-style, so a
+  MID-pattern `*` matches nothing (`test/verify_x*.test` fails, `test/verify_x*` works). A green run
+  proves nothing without a positive assertion.
+- **`unittest -f <list>` (batch mode) is unusable here**: one CLR per process means earlier suites'
+  finalizers run during later ones — SIGSEGV at suite 41/53 inside Apache.Arrow's
+  `ImportedArrowArrayStream` finalizer. One process per suite is not a style choice.
+- **`git update-index --chmod=+x` is required for CI scripts.** `core.fileMode=false` on Windows means
+  a local `chmod +x` is never recorded, and Linux then refuses to execute (exit 126).
+- **`.gitattributes` forces `*.sh` to LF.** With `core.autocrlf=true` a checkout would give the scripts
+  CRLF, breaking the shebang and — worse, silently — inverting `[ "$RUNNER_OS" = 'Windows' ]`.
+- **vcpkg infers manifest mode from the CURRENT DIRECTORY.** The steps `cd "$RUNNER_TEMP"` first; a
+  `vcpkg.json` at the repo root (there was a stale one, now deleted) makes `vcpkg install <pkg>` fail
+  outright. The build consumes the CLASSIC global tree, since CMake's source dir is the duckdb
+  submodule and it has no manifest.
+- **Do NOT set `-DOVERRIDE_GIT_DESCRIBE` for the TEST build.** It is required for the loadable (a stock
+  DuckDB rejects a version mismatch) but it changed autoload resolution enough to make fabricator's own
+  `Load` fail on `parquet_scan`. The packaging tier sets it; the test tier must not.
+- **`set >> $GITHUB_ENV` corrupts the environment.** GITHUB_ENV is line-oriented, so one variable
+  containing a newline breaks every later step; the MSVC step exports only PATH/INCLUDE/LIB/LIBPATH,
+  with the redirect written FIRST on each line (`echo VAR=%VAR%>>file` is misparsed when the value ends
+  in a digit).
+- **VS 18 is NOT an absolute requirement** (correcting the reference bullet above): the local failure is
+  a MIXED-toolset artifact — configure with VS 18's STL, link with VS 2022. CI compiles and links with
+  one toolset and the runner image's own works fine.
+
+**Reproducing a bare runner locally — the single most useful trick here.** Point the profile at an
+empty directory so no extensions are installed on disk:
+
+```bash
+EMPTY=$(mktemp -d); export USERPROFILE="$(cygpath -w $EMPTY)" HOME="$EMPTY"
+./scripts/run-suites.sh hermetic
+```
+
+DuckDB resolves `~/.duckdb/extensions` from there, so autoload-from-disk cannot mask a missing
+dependency. This turned a 25-minute push-and-wait loop into a 30-second check and immediately found
+five suites that passed **only** because this machine happens to have
+`~/.duckdb/extensions/v1.5.5/windows_amd64/parquet.duckdb_extension`. (Beware `HOME` under Git Bash: it
+is `/z/`, NOT the Windows profile, so a bare `ls ~/.duckdb` misleads.)
+
+**Two latent bugs CI found in its first hours, both destruction-order, both invisible on Windows** —
+the pattern to expect from a new platform, and the reason a passing platform proves nothing about this
+class of defect:
+1. **Aggregate state destructor = use-after-free (FIXED).** `PhysicalOperator::sink_state` is a
+   BASE-class member while the bound aggregate expressions owning the `FunctionData` are derived
+   members, so at plan teardown the bind data is already freed when the state destructor dereferences
+   it. Deterministic ordering, allocator-dependent fault: Linux SIGSEGV, macOS SIGABRT, Windows silent.
+   No destructor is registered now; `AggSessionHolder`'s `agg_close` reclaims.
+2. **`verify_global_functions` aborts on macOS** with `mutex lock failed: Invalid argument` at assertion
+   41 — under investigation via `.github/workflows/diagnose-macos.yml` (temporary; delete when fixed).
+   Assume latent, not macOS-specific, until proven otherwise.
+
+**Still to build:** a packaging tier (`pack-distribution.ps1` + `test/distribution/smoke_distribution.py`
+per platform — needs `OVERRIDE_GIT_DESCRIBE`, unlike tier 1) and a release job. **macOS Gatekeeper is
+a caveat CI structurally cannot cover**: a browser-downloaded `.duckdb_extension` carries
+`com.apple.quarantine`, which can refuse an unsigned dylib, while a runner never quarantines what it
+built. Needs a real Mac and an install-doc note.
+
 ## Key decisions & constraints
 
 - **Connection strings must be valid `Microsoft.Data.SqlClient` strings**, passed straight through. We

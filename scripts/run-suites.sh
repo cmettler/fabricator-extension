@@ -44,8 +44,9 @@ case "$TIER" in
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
+        # Floors measured 2026-07-25 against the compose stack: 42 suites / 1221 assertions, all green.
         : "${MIN_SUITES:=42}"
-        : "${MIN_ASSERTIONS:=0}"   # measured on the first green run, then pinned
+        : "${MIN_ASSERTIONS:=1221}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2
