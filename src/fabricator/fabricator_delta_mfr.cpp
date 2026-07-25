@@ -199,16 +199,33 @@ public:
 } // namespace
 
 void RegisterDeltaMultiFileScan(ExtensionLoader &loader) {
-	// The native read needs the parquet reader (statically linked here; autoload is a best-effort safety net).
+	// The native read needs the parquet reader. Try to bring it in, but note what this call actually
+	// does: ExtensionHelper::AutoLoadExtension autoinstalls and then LoadExternalExtension()s — it
+	// resolves an extension from DISK and never consults the statically linked set. So on a build where
+	// parquet is linked-but-not-yet-loaded it succeeds only if a parquet loadable happens to be
+	// installed in the extension directory.
 	try {
 		ExtensionHelper::AutoLoadExtension(loader.GetDatabaseInstance(), "parquet");
 	} catch (...) {
-		// parquet is linked into this build; a failed autoload is non-fatal.
+		// Non-fatal — see the TryGetTableFunction below.
 	}
 
 	// Clone parquet_scan and swap in our MultiFileReader (the duckdb-delta pattern): DuckDB's native parquet
 	// read machinery, driven by our managed file list.
-	auto &parquet_entry = loader.GetTableFunction("parquet_scan");
+	//
+	// TOLERATE ITS ABSENCE. This used to be an unconditional GetTableFunction, which THROWS — and because
+	// this runs during Load, one unavailable parquet took down the whole extension: every unrelated
+	// function (fabricator_query, the global scalars, the Delta catalog) became unusable with
+	// "Function with name \"parquet_scan\" not found". Skipping one secondary surface is the proportionate
+	// response. Official DuckDB builds have parquet built in, so this branch is not reachable there; it is
+	// reachable in a build where parquet is a separately-linked extension that nothing has loaded yet,
+	// which is exactly our own test binary (a suite must `require parquet` BEFORE `require fabricator` to
+	// exercise fabricator_delta_mfr_scan).
+	auto parquet_lookup = loader.TryGetTableFunction("parquet_scan");
+	if (!parquet_lookup) {
+		return;
+	}
+	auto &parquet_entry = parquet_lookup->Cast<TableFunctionCatalogEntry>();
 	auto function_set = parquet_entry.functions;
 	for (auto &function : function_set.functions) {
 		function.get_multi_file_reader = FabricatorDeltaMultiFileReader::CreateInstance;

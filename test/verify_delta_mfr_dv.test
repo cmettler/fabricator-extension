@@ -7,9 +7,9 @@
 #              (writable). Local FS.
 # group: [fabricator]
 
-require fabricator
-
 require parquet
+
+require fabricator
 
 require-env FABRICATOR_DELTA_WRITE_DIR
 

@@ -7,9 +7,9 @@
 #              Fixture: test/fixtures/delta_simple (delta-rs, 10 rows id/name/amount). Set FABRICATOR_DELTA_DIR.
 # group: [fabricator]
 
-require fabricator
-
 require parquet
+
+require fabricator
 
 require-env FABRICATOR_DELTA_DIR
 
