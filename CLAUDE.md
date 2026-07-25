@@ -2502,9 +2502,12 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   loadable on AZL3 (the glibc-2.38 ceiling holds live), fuse Tables incl. txn append, ambient
   SQL/delta/DAX, token secrets; the 2 fails are the documented-expected pair (pbi-audience → 18456,
   static-azure-secret abfss → the pinned single-audience 401).** NOTE the harness prints the result,
-  but the durable copy is `Files/fabricator_ext/result.json` on LH — fetchable from Windows via
-  `read_text('onelake://Test/LH.Lakehouse/Files/fabricator_ext/result.json')` after `.read
-  dax_secret.sql`. `fabricnb/Program.cs` repo path fixed to `d:\repos\fabricator-extension` (was the
+  but the durable copy is `Files/fabricator_ext/result.json` on LH. To fetch it from Windows: `.read
+  dax_secret.sql` then **`copy (select content from read_text('onelake://Test/LH.Lakehouse/Files/
+  fabricator_ext/result.json')) to '<ABSOLUTE windows path>' (format csv, quote '', header false);`** —
+  `read_text` is a TABLE function (a scalar call is a binder error), and the COPY target must be an
+  absolute Windows path since duckdb.exe does not resolve a bash-style `/tmp`. Then parse the JSON
+  locally (the probe's step list is the readable part). `fabricnb/Program.cs` repo path fixed to `d:\repos\fabricator-extension` (was the
   pre-rename path). `dbt_mssql_test/.venv` (serves dbt_dax_test too) upgraded to `duckdb==1.5.5` — the venv is uv-managed (NO pip module; use
   `uv pip install --python .venv/Scripts/python.exe`). Linux rebuild recipe unchanged: rsync `src/` +
   `test/` + `extension_config.cmake` → WSL `~/sqlext`, fresh duckdb clone at v1.5.5,
