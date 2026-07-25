@@ -1,0 +1,107 @@
+# TEMPORARY diagnostic workflow — delete once the macOS failure in verify_global_functions is fixed.
+#
+# The symptom: `libc++abi: terminating due to uncaught exception of type std::__1::system_error:
+# mutex lock failed: Invalid argument`, exit 134, at assertion 41 of 63. Windows and Linux pass that
+# suite, so the natural reading is "a macOS bug" — but the aggregate use-after-free this same tier
+# just found was equally broken on Windows and simply never faulted there, so the working assumption
+# is a LATENT destruction-order bug that macOS merely exposes. That deserves finding rather than
+# quarantining.
+#
+# Why one workflow rather than repeated bisection pushes: the DuckDB compile is ~20 minutes and the
+# diagnostics take seconds, so everything runs in ONE job after ONE build.
+#
+#   Step A  lldb backtrace. An uncaught C++ exception reaches abort() with the THROWING frame still
+#           on the stack (abort <- abort_message <- terminate handler <- std::terminate <- __cxa_throw
+#           <- std::__throw_system_error <- std::mutex::lock <- the caller we actually want), so a
+#           plain `bt all` at SIGABRT should name the mutex and its owner outright.
+#   Step B  statement bisect, as a fallback if lldb yields nothing useful. Cuts the suite at whole
+#           statement boundaries and finds the shortest prefix that still fails, which localises the
+#           failure to one SQL statement without a debugger.
+#
+# Both steps are best-effort (`|| true`) so one failing does not hide the other's output.
+
+name: diagnose-macos
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  diagnose:
+    runs-on: macos-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: ./.github/actions/build-extension
+        with:
+          triplet: arm64-osx
+          platform: osx_arm64
+
+      - name: Environment
+        run: |
+          sw_vers || true
+          clang --version | head -2 || true
+          lldb --version || true
+          # Debugging a process you own normally needs no extra privilege, but enable it anyway: on a
+          # locked-down image lldb otherwise fails to attach with a bare "not permitted".
+          sudo DevToolsSecurity -enable || true
+
+      - name: A — lldb backtrace at the abort
+        env:
+          FABRICATOR_MANAGED_DIR: build/release/extension/fabricator/fabricator
+        run: |
+          export FABRICATOR_DELTA_WRITE_DIR=$(mktemp -d)
+          export FABRICATOR_DELTA_DIR="$PWD/test/fixtures/delta_simple"
+          # Deliberately NOT breaking on throw (`break set -E c++`): DuckDB throws routinely for
+          # control flow, so lldb would stop dozens of times before the fatal one. Letting it run to
+          # SIGABRT and printing every thread is both simpler and more informative.
+          lldb -b \
+            -o "run" \
+            -o "thread backtrace all" \
+            -o "quit" \
+            -- ./build/release/test/unittest --test-dir . "test/verify_global_functions.test" \
+            2>&1 | tail -160 || true
+
+      - name: B — statement bisect (shortest failing prefix)
+        env:
+          FABRICATOR_MANAGED_DIR: build/release/extension/fabricator/fabricator
+        run: |
+          export FABRICATOR_DELTA_DIR="$PWD/test/fixtures/delta_simple"
+          src=test/verify_global_functions.test
+          # Line numbers where each statement/query block starts. Cutting immediately before one of
+          # these keeps every retained block whole, so a truncated file is still a valid suite.
+          starts=$(grep -nE '^(statement|query)' "$src" | cut -d: -f1)
+          total=$(printf '%s\n' $starts | wc -l | tr -d ' ')
+          echo "suite has $total statement blocks"
+          prev_end=''
+          idx=0
+          for line in $starts; do
+            idx=$((idx + 1))
+            if [ -z "$prev_end" ]; then prev_end=$line; continue; fi
+            head -n $((line - 1)) "$src" > test/_bisect.test
+            export FABRICATOR_DELTA_WRITE_DIR=$(mktemp -d)
+            if ./build/release/test/unittest --test-dir . "test/_bisect.test" >/tmp/b.log 2>&1; then
+              printf 'blocks 1..%-3s ok\n' "$((idx - 1))"
+            else
+              echo "=========================================================="
+              echo "FIRST FAILING PREFIX: blocks 1..$((idx - 1)), i.e. through line $((line - 1))"
+              echo "---- the statement that tips it over (block $((idx - 1))) ----"
+              sed -n "${prev_end},$((line - 1))p" "$src"
+              echo "---- runner output ----"
+              tail -25 /tmp/b.log
+              break
+            fi
+            prev_end=$line
+          done
+          rm -f test/_bisect.test
+          echo "(if nothing failed above, the failure needs the WHOLE suite — likely teardown, not one statement)"

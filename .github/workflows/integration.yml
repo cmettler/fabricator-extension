@@ -1,0 +1,110 @@
+# Tier 2: the suites that need real services — SQL Server 2025 and MinIO.
+#
+# 42 suites, the entire SQL Server provider surface plus the S3/PolyBase round trip: catalog and DML,
+# pushdown (filter/projection/limit/order-by/collation), scalar UDFs, TVFs, stored procedures,
+# table-in-out, custom functions and aggregates, secrets, server profiles, identity, columnstore,
+# time travel, and the full circle where SQL Server reads Delta tables we wrote to MinIO.
+#
+# Reuses the SAME stack the dev machine uses — docker/docker-compose.yml, docker/certs/, and
+# docker/provision.ps1 — rather than reimplementing services as GitHub `services:` containers. One
+# definition, so CI cannot drift from what a developer reproduces locally.
+#
+# ubuntu-latest ONLY, and that is a hard constraint rather than a preference: GitHub's hosted macOS
+# runners cannot run containers at all, and the Windows runners cannot run Linux containers. Which is
+# why the per-platform coverage table in the docs shows this tier for linux only.
+#
+# NOT nightly-by-default cheap: a full DuckDB compile (~22 min) plus services plus 42 suites. Hence
+# schedule + manual dispatch, never per-push.
+
+name: integration
+
+on:
+  schedule:
+    # 03:17 UTC — an odd minute, because the top of the hour is when everybody else's cron fires and
+    # hosted-runner queues visibly lengthen.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  service-suites:
+    runs-on: ubuntu-latest
+    name: linux_amd64 + SQL Server 2025 + MinIO
+    timeout-minutes: 150
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # `true`, not `recursive` — see .github/workflows/extension.yml for why (engineered-wood's
+          # nested parquet-testing corpus).
+          submodules: true
+
+      - uses: ./.github/actions/build-extension
+        with:
+          triplet: x64-linux
+          platform: linux_amd64
+
+      - name: Publish the sample plugin
+        # verify_plugin.test needs FABRICATOR_PLUGIN_DIR. net8.0 deliberately: plugins load into the
+        # BRIDGE's AssemblyLoadContext and must share its dependency closure (Apache.Arrow above all),
+        # and the bridge is published framework-dependent on net8.0 by the composite action.
+        run: |
+          dotnet publish dotnet/Fabricator.SamplePlugin -c Release -f net8.0 -r linux-x64 --nologo
+          ls dotnet/Fabricator.SamplePlugin/bin/Release/net8.0/linux-x64/publish/Fabricator.SamplePlugin.dll
+
+      - name: Generate the MinIO TLS certificate
+        # SQL Server's s3:// connector REFUSES plain HTTP, so MinIO must serve TLS even in tests. The
+        # certs are gitignored, so CI generates them; SANs cover `minio` (as SQL Server sees it inside
+        # the compose network) and localhost/127.0.0.1 (as the DuckDB tests see it from the host).
+        run: pwsh -NoProfile -File docker/certs/generate-certs.ps1
+
+      - name: Start SQL Server + MinIO
+        working-directory: docker
+        # Plain `up -d` rather than `--wait`: provision.ps1 does its own readiness polling, and
+        # `--wait` fails outright on a service that declares no healthcheck.
+        run: |
+          docker compose up -d
+          docker compose ps
+
+      - name: Provision databases and fixtures
+        # ArrowTest + TestDB, the shared read-only dbo.TestSimplePK fixture, and BinCollTest with its
+        # binary-UTF-8 collation (which verify_collation_pushdown needs and does NOT self-provision).
+        # Everything else the suites create themselves via fabricator_exec.
+        run: pwsh -NoProfile -File docker/provision.ps1
+
+      - name: Run the service suites
+        env:
+          UNITTEST: build/release/test/unittest
+          MSSQL_TESTDB_DSN: Server=localhost,1433;Database=TestDB;User Id=sa;Password=Arrow_Net_123!;TrustServerCertificate=true;Encrypt=true
+          MSSQL_TEST_SERVER: Server=localhost,1433;Database=TestDB;User Id=sa;Password=Arrow_Net_123!;TrustServerCertificate=true;Encrypt=true
+          MSSQL_TEST_CONNECTION_STRING: Server=localhost,1433;Database=TestDB;User Id=sa;Password=Arrow_Net_123!;TrustServerCertificate=true;Encrypt=true
+          MSSQL_BINCOLL_DSN: Server=localhost,1433;Database=BinCollTest;User Id=sa;Password=Arrow_Net_123!;TrustServerCertificate=true;Encrypt=true
+          MSSQL_TESTDB_URI: mssql://sa:Arrow_Net_123!@localhost:1433/TestDB
+          MSSQL_TEST_PASS: Arrow_Net_123!
+          # The two S3 endpoints differ ON PURPOSE and are not interchangeable: DuckDB reaches MinIO
+          # from the host via the published port, SQL Server reaches it by compose DNS from inside the
+          # network. The TLS SANs cover both names for exactly this reason.
+          FABRICATOR_S3_ENDPOINT: localhost:9000
+          FABRICATOR_S3_SQL_ENDPOINT: minio:9000
+          FABRICATOR_PLUGIN_DIR: dotnet/Fabricator.SamplePlugin/bin/Release/net8.0/linux-x64/publish
+        # The runner asserts nothing skipped, no "No tests ran", and floors on the selected counts —
+        # and for this tier it also fails fast if any variable above is missing, since a missing one
+        # would otherwise show up merely as a skipped suite in a green run.
+        run: scripts/run-suites.sh service
+
+      - name: Service logs on failure
+        if: failure()
+        working-directory: docker
+        run: |
+          echo "===== sqlserver ====="; docker compose logs --tail 120 sqlserver || true
+          echo "===== minio =====";     docker compose logs --tail 60 minio || true

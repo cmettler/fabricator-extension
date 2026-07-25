@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 #
-# Runs every suite that scripts/list-hermetic-suites.sh selects, and fails loudly unless they all
-# actually ran. Used by CI (Tier 1) and usable as-is on a dev machine.
+# Runs a TIER of suites, and fails loudly unless every selected suite actually ran.
+#
+#   run-suites.sh hermetic   (default) needs nothing but a scratch dir and the in-repo fixtures
+#   run-suites.sh service              needs the docker/docker-compose.yml stack: SQL Server + MinIO
+#
+# One runner for both so the assertions below — the part with the actual value — exist once. Used by
+# CI and usable as-is on a dev machine.
 #
 # ONE PROCESS PER SUITE, with a FRESH scratch directory each. Both halves are load-bearing, and
 # were established by watching the alternative fail:
@@ -28,6 +33,25 @@
 #   MANAGED    path to the published bridge  (default: build/release/extension/fabricator/fabricator)
 set -uo pipefail   # deliberately NOT -e: collect every failure, then report them together
 cd "$(dirname "$0")/.."
+
+TIER=${1:-hermetic}
+case "$TIER" in
+    hermetic)
+        SELECT_CMD=scripts/list-hermetic-suites.sh
+        # Floors measured 2026-07-25: 53 suites / 4152 assertions, all green.
+        : "${MIN_SUITES:=53}"
+        : "${MIN_ASSERTIONS:=4152}"
+        ;;
+    service)
+        SELECT_CMD=scripts/list-service-suites.sh
+        : "${MIN_SUITES:=42}"
+        : "${MIN_ASSERTIONS:=0}"   # measured on the first green run, then pinned
+        ;;
+    *)
+        echo "usage: $0 [hermetic|service]" >&2
+        exit 2
+        ;;
+esac
 
 if [ -z "${UNITTEST:-}" ]; then
     if [ -x build/release/test/unittest.exe ]; then
@@ -57,19 +81,39 @@ else
     export FABRICATOR_DELTA_DIR="$PWD/test/fixtures/delta_simple"
 fi
 
-# Anything that would let a service-dependent suite run half-configured is cleared, so this set is
-# provably the hermetic one.
-unset MSSQL_TESTDB_DSN MSSQL_TEST_SERVER MSSQL_TEST_CONNECTION_STRING MSSQL_BINCOLL_DSN \
-      MSSQL_TESTDB_URI MSSQL_TEST_PASS FABRICATOR_S3_ENDPOINT FABRICATOR_S3_SQL_ENDPOINT \
-      FABRICATOR_DAX_DSN FABRICATOR_PLUGIN_DIR 2>/dev/null || true
+if [ "$TIER" = 'hermetic' ]; then
+    # Anything that would let a service-dependent suite run half-configured is cleared, so this set
+    # is PROVABLY the hermetic one rather than hermetic by assumption.
+    unset MSSQL_TESTDB_DSN MSSQL_TEST_SERVER MSSQL_TEST_CONNECTION_STRING MSSQL_BINCOLL_DSN \
+          MSSQL_TESTDB_URI MSSQL_TEST_PASS FABRICATOR_S3_ENDPOINT FABRICATOR_S3_SQL_ENDPOINT \
+          FABRICATOR_DAX_DSN FABRICATOR_PLUGIN_DIR 2>/dev/null || true
+else
+    # Fail fast on a missing variable. Without this the affected suite would merely SKIP, the run
+    # would still be green, and the coverage would be silently gone — the exact failure mode this
+    # script exists to prevent.
+    missing=''
+    for v in MSSQL_TESTDB_DSN MSSQL_TEST_SERVER MSSQL_TEST_CONNECTION_STRING MSSQL_TESTDB_URI \
+             MSSQL_TEST_PASS MSSQL_BINCOLL_DSN FABRICATOR_S3_ENDPOINT FABRICATOR_S3_SQL_ENDPOINT \
+             FABRICATOR_PLUGIN_DIR; do
+        eval "val=\${$v:-}"
+        if [ -z "$val" ]; then
+            missing="$missing $v"
+        fi
+    done
+    if [ -n "$missing" ]; then
+        echo "ERROR: the service tier needs these environment variables:$missing" >&2
+        echo "       bring up docker/docker-compose.yml and run docker/provision.ps1 first." >&2
+        exit 1
+    fi
+fi
 
-suites=$(scripts/list-hermetic-suites.sh)
+suites=$("$SELECT_CMD")
 if [ -z "$suites" ]; then
-    echo "ERROR: no hermetic suites selected — the selection script is broken." >&2
+    echo "ERROR: no $TIER suites selected — $SELECT_CMD is broken." >&2
     exit 1
 fi
 expected=$(printf '%s\n' "$suites" | wc -l | tr -d ' ')
-echo "Running $expected hermetic suites, one process each."
+echo "Running $expected $TIER suites, one process each."
 echo "  unittest: $UNITTEST"
 echo "  managed : $MANAGED"
 echo "  fixture : $FABRICATOR_DELTA_DIR"
@@ -136,15 +180,13 @@ if [ "$ran" -ne "$expected" ]; then
     exit 1
 fi
 
-# Floors on the SELECTED set, measured on 2026-07-25 (53 suites / 4152 assertions, all green).
-# Without these, a suite that quietly gains a `require-env` drops out of the hermetic set and CI
-# stays green with less coverage: `ran == expected` would still hold, because `expected` shrank too.
-# Floors rather than equalities, so adding suites and assertions never breaks the build.
-: "${MIN_SUITES:=53}"
-: "${MIN_ASSERTIONS:=4152}"
+# Floors on the SELECTED set (values set per tier at the top). Without these, a suite that quietly
+# gains a `require-env` drops out of its tier and CI stays green with less coverage: `ran == expected`
+# would still hold, because `expected` shrank too. Floors rather than equalities, so adding suites and
+# assertions never breaks the build.
 if [ "$expected" -lt "$MIN_SUITES" ]; then
     echo "ERROR: only $expected suites were SELECTED, floor is $MIN_SUITES. A suite likely gained a" >&2
-    echo "       require-env and silently left the hermetic set. Check scripts/list-hermetic-suites.sh," >&2
+    echo "       require-env and silently left the $TIER set. Check $SELECT_CMD," >&2
     echo "       and if the drop is intended, lower MIN_SUITES here in the same commit." >&2
     exit 1
 fi
