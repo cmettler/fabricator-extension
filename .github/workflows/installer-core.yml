@@ -1,0 +1,103 @@
+# Tier 0 of this repo's CI: the single-file-distribution logic, unit tested as plain .NET.
+#
+# Deliberately the FIRST workflow, because it is the cheapest useful one — no C++ toolchain, no
+# vcpkg, no .NET publish, no SQL Server, no MinIO, no submodules. Two minutes, and it covers the
+# newest and least battle-worn code in the repo (the payload packer, the polyglot reader/writer,
+# DuckDB extension-directory resolution, the compatibility gate, the staging/locking extractor).
+#
+# The other tiers, when they land:
+#   Tier 1  build + the 54 delta suites that need only a writable directory, + pack + smoke  (~40 min/platform)
+#   Tier 2  the 38 SQL Server suites + 3 S3/PolyBase ones, via docker/docker-compose.yml      (scheduled)
+#   Tier 3  DAX (needs Power BI Desktop) and live Fabric/OneLake — NOT automatable, manual gates
+#
+# See CLAUDE.md; the branch is v1.5-variegata, mirroring DuckDB's 1.5 release line.
+
+name: installer-core
+
+on:
+  push:
+    branches: [v1.5-variegata]
+    paths:
+      - dotnet/Fabricator.Installer.Core/**
+      - dotnet/Fabricator.Installer.Core.Tests/**
+      - dotnet/Directory.Build.props
+      - .github/workflows/installer-core.yml
+  pull_request:
+    branches: [v1.5-variegata]
+    paths:
+      - dotnet/Fabricator.Installer.Core/**
+      - dotnet/Fabricator.Installer.Core.Tests/**
+      - dotnet/Directory.Build.props
+      - .github/workflows/installer-core.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: installer-core-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    # One bash script per step that works on both runners (windows-latest ships Git Bash).
+    # GitHub invokes it with -eo pipefail, which the test-count assertion below relies on:
+    # without pipefail a failing `dotnet test` piped into `tee` would be masked by tee's exit 0.
+    shell: bash
+
+jobs:
+  test:
+    # Both operating systems on purpose: three tests take a Windows-only path (the upgrade-in-use
+    # rename-aside promote, and path-separator normalisation), and the resolver's Windows behaviour
+    # differs from POSIX. Both target frameworks on purpose too: net8.0 is the deployment floor (the
+    # runtime preinstalled in Fabric notebooks), net10.0 the default.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        tfm: [net8.0, net10.0]
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.os }} / ${{ matrix.tfm }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # No submodules: this project's entire closure is Installer.Core (zero package
+          # references) plus xunit. Note that `submodules: recursive` would be actively harmful
+          # here — it pulls engineered-wood's nested parquet-testing corpus, ~1/2 GB of Apache
+          # test data that nothing in this job needs.
+          submodules: false
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          # SDK 10 builds both TFMs; the 8.0 SDK is what supplies the .NET 8 runtime needed to
+          # actually EXECUTE the net8.0 test run.
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Test
+        run: |
+          dotnet test dotnet/Fabricator.Installer.Core.Tests \
+            -c Release -f ${{ matrix.tfm }} --nologo \
+            | tee test-output.txt
+
+      # Tripwire against a silently shrinking suite. `dotnet test` exits 0 if a project builds and
+      # runs a REDUCED set of tests, so a green check alone does not prove coverage held — the same
+      # falsely-green failure mode that once produced two passing "negative" distribution checks
+      # which were in fact never exercising the code path. A floor (not an equality) is deliberate:
+      # adding tests must not break CI, losing them must.
+      - name: Assert the suite actually ran
+        env:
+          EXPECTED_MINIMUM: 92
+        run: |
+          passed=$(grep -oE 'Passed:[[:space:]]+[0-9]+' test-output.txt | grep -oE '[0-9]+' | head -1)
+          if [ -z "$passed" ]; then
+            echo "::error::Could not parse a test count out of the dotnet test output."
+            exit 1
+          fi
+          echo "passed=$passed (floor $EXPECTED_MINIMUM)"
+          if [ "$passed" -lt "$EXPECTED_MINIMUM" ]; then
+            echo "::error::Only $passed tests ran; expected at least $EXPECTED_MINIMUM. Tests were lost or silently skipped."
+            exit 1
+          fi
