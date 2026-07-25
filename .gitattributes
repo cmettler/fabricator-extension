@@ -1,0 +1,9 @@
+# Shell scripts MUST check out with LF on every platform.
+#
+# They are executed by bash — including Git Bash on Windows and on the CI runners, where every
+# workflow step uses `shell: bash`. A CR at end of line breaks the shebang (`bad interpreter:
+# .../bash^M`) and, more insidiously, string comparisons: a trailing \r makes `[ "$RUNNER_OS" =
+# 'Windows' ]` false on Windows. This repo's usual working-tree setting is core.autocrlf=true, so
+# without this rule the conversion is decided by whatever git config a machine or runner image
+# happens to have.
+*.sh text eol=lf
