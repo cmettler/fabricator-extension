@@ -850,25 +850,27 @@ void FabricatorAggregateFinalize(Vector &state, AggregateInputData &aggr_input_d
 	}
 }
 
-// Free the managed accumulators for these states. Wired so the window paths (which churn many transient
-// states) don't accumulate unbounded; the bind-data destructor's agg_close is the backstop. Must not throw.
-void FabricatorAggregateDestroy(Vector &state, AggregateInputData &aggr_input_data, idx_t count) {
-	if (count == 0) {
-		return;
-	}
-	try {
-		auto &bind = aggr_input_data.bind_data->Cast<FabricatorAggregateBindData>();
-		if (bind.spillable) {
-			return; // spillable state lives inline in the blob — nothing in C# to free
-		}
-		vector<int64_t> ids(count);
-		ReadStateIds(state, count, ids.data());
-		ArrowArray array = BuildIdBatch(bind.properties, ids.data(), count);
-		fabricator::AggDestroy(bind.holder->session, array);
-	} catch (...) {
-		// A destructor must not throw — memory cleanup is best-effort (the session close frees the rest).
-	}
-}
+// NO per-state destructor is registered — see BuildFabricatorAggregateFunction. It used to call
+// fabricator::AggDestroy(bind.holder->session, ...) to free the managed accumulators eagerly, which is a
+// USE-AFTER-FREE of the bind data:
+//
+//   PhysicalOperator::sink_state is a member of the BASE class, while the bound aggregate expressions that
+//   OWN the FunctionData are members of the derived operator (e.g. PhysicalUngroupedAggregate). C++ destroys
+//   derived members before base members, so at plan teardown the bind data is already gone by the time
+//   sink_state's destructor walks the aggregate states and invokes this callback.
+//
+// The ordering is deterministic; whether it FAULTS depends on whether the freed memory has been reused, so
+// it was invisible on Windows and fatal on POSIX — Linux SIGSEGV, macOS SIGABRT, both at the same
+// assertion in verify_global_functions. gdb showed the object fully recycled: shared_ptr use_count
+// 1499900208, get() = 0xd269a5bf5a0b0aef, garbage arg_types/arg_names, with only the vptr still plausible
+// enough for Cast<> to succeed.
+//
+// AggSessionHolder's own destructor calls agg_close, which drops the whole id->accumulator map for the
+// session, so nothing leaks beyond the query. What is given up is the eager release of the transient states
+// the window/segment-tree paths churn: those accumulators now live until the query's session closes.
+// Restoring that bound needs a design that does not depend on member destruction order — e.g. widening the
+// state blob past its 8-byte id to carry the session handle, so the callback need not touch bind data at
+// all. Correctness first; the optimisation can return deliberately.
 
 } // namespace
 
@@ -880,10 +882,14 @@ static AggregateFunction BuildFabricatorAggregateFunction(FabricatorHandle handl
                                                         const string &func_name, vector<LogicalType> arg_types,
                                                         vector<string> arg_names, LogicalType return_type,
                                                         bool spillable) {
+	// destructor = nullptr, deliberately: our state blob is a bare int64 id with no C++ resource to release,
+	// and a callback here cannot safely reach the bind data at plan teardown (see the comment above — it was
+	// a use-after-free that faulted on POSIX and hid on Windows). The managed accumulators are freed by
+	// AggSessionHolder's agg_close instead.
 	AggregateFunction fn(func_name, arg_types, return_type, FabricatorAggregateStateSize, FabricatorAggregateInit,
 	                     FabricatorAggregateUpdate, FabricatorAggregateCombine, FabricatorAggregateFinalize,
 	                     FunctionNullHandling::DEFAULT_NULL_HANDLING, FabricatorAggregateSimpleUpdate,
-	                     FabricatorAggregateBind, FabricatorAggregateDestroy);
+	                     FabricatorAggregateBind, nullptr);
 	auto fn_info = make_shared_ptr<FabricatorAggregateFunctionInfo>();
 	fn_info->handle = handle;
 	fn_info->schema = schema_name;
