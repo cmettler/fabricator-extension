@@ -2509,7 +2509,29 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `uv pip install --python .venv/Scripts/python.exe`). Linux rebuild recipe unchanged: rsync `src/` +
   `test/` + `extension_config.cmake` → WSL `~/sqlext`, fresh duckdb clone at v1.5.5,
   `-DOVERRIDE_GIT_DESCRIBE=v1.5.5` + the `~/vcpkg` x64-linux toolchain, target
-  `fabricator_loadable_extension`.)
+  `fabricator_loadable_extension`.
+  **THE FABRIC NOTEBOOK NOW USES THE SINGLE FILE — the three-piece payload is RETIRED (2026-07-25,
+  validated live).** `fabricnb` uploads ONE `fabricator.duckdb_extension` (the 40 MB linux_amd64
+  STANDARD/framework-dependent SKU from `scripts/pack-distribution.ps1`) instead of loadable + FDD zip +
+  `FABRICATOR_MANAGED_DIR`; the notebook stages that one file and just `load_extension`s it with **ZERO
+  env vars** — the installer unpacks the core + bridge into DuckDB's own extension directory itself.
+  **LIVE RESULT: 16/18 probe steps green (the 2 fails are the same documented-expected pair), i.e. NO
+  capability lost.** Load timings measured IN the notebook: **3.22 s cold** (extract 39 MB + chain-load +
+  CLR boot) and **0.18 s warm in a FRESH process** — the sha marker short-circuits extraction, proven on
+  Fabric. **KEY FINDING: the DEFAULT extension directory is WRITABLE in a Fabric notebook** —
+  `HOME=/home/trusted-service-user`, the bridge landed at
+  `/home/trusted-service-user/.duckdb/extensions/v1.5.5/linux_amd64/fabricator`, so NO
+  `SET extension_directory` is needed (the harness keeps a `/tmp` fallback attempt for environments where
+  HOME is not usable; it did not fire). Everything else still passes on the new payload: fuse Tables
+  (attach/read/create/txn append), delta local + lakehouse-files + abfss-ambient, warehouse SQL via
+  database-audience token / `authentication default` / bare connstr, lakehouse SQL endpoint, warehouse
+  ATTACH via token secret, azure access_token secret, and DAX ambient (14 tables, daxeval). The lakehouse
+  `Files/fabricator_ext/` folder is down to TWO uploads (artifact + the duckdb wheel, which is STILL
+  required because the core is CPP-ABI-locked to its DuckDB version while notebooks preinstall an older
+  one) — the FDD zip and a stale 1.5.4 wheel were deleted, and the driver now retires anything in that
+  folder that is not one of the current files. **⇒ `build/linux-payload/` no longer feeds the notebook
+  flow; the recurring "refresh the stale payload" chore is GONE** (that dir remains only as the raw linux
+  core + wheel source; `build/linux-dist/` holds the current v68 linux core).)
 - **Prior: ABI v64** (v64 = **`onelake_move`** — atomic single-file rename via the ADLS Gen2
   DFS **native rename** (`DataLakeFileClient.RenameAsync`, a metadata op that overwrites an existing
   destination = MoveFile semantics; destination path filesystem-relative with the `<item>.Lakehouse`
