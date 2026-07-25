@@ -115,7 +115,17 @@ The engineered-wood submodule pin moved from our long-lived fork lineage (`99e2c
 `fabricator-patches` branch** (7 commits, pushed to the cmettler fork, pin `7fecc2b`;
 `.gitmodules` `branch = fabricator-patches`). The strategy: fabricator-specific needs live as a
 SMALL upstreamable patch set ON TOP of clast master — never a fork again — so future EW bumps are
-merge-master-into-fabricator-patches + re-pin. What the patches carry: `DeltaFilePruner` public;
+merge-master-into-fabricator-patches + re-pin. What the patches carry: `DeltaFilePruner` public
+(**a replacement was proposed to Curt 2026-07-25 and is awaiting his call**: a `DeltaTable.PlanFiles(filter,
+snapshot, schema) -> IReadOnlyList<PlannedFile>` planning API instead of exposing the pruner class. The
+motivation is not encapsulation — it is that our one call site, `DeltaReader.BuildNativeScanListAsync`, also
+re-implements EW's PRIVATE `OrderedActiveFiles` ordering by hand, and that ordering defines the file ordinal
+in the transient rowid `(ordinal << 40) | position` which EW itself DECODES. Encoded by our copy, decoded by
+theirs, with nothing enforcing agreement; a planner that returns the ordinal deletes that hazard. The
+signature must carry three things or our call site cannot move: the PRE-prune global ordinal, an optional
+prune-schema override (we plan against a buffered txn's pending schema), and a caller-supplied snapshot (the
+clustered-OPTIMIZE rewrite lists against the same snapshot its commit pins). Deliberately NOT async and NOT
+DV-resolving — see the reply for why);
 create-time `configuration`/`preAssignedSchema`/`materializedRowIds` params; rowid read-back
 `rowIdsOut` correlation + derived-id fallback + CoW CDF capture + partition-aware cdc writes +
 DV-aware CDF inference; schema-evolved compaction fixes; the **narrow-int parquet write-corruption
@@ -1252,7 +1262,11 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   **Transport = ONE self-delimiting BLOB per row** (metadata bytes ++ value bytes), marker
   **`fabricator.variant`** — NOT the canonical struct: `ArrowAppender::FinalizeChild` walks the LOGICAL type's
   children (VARIANT = 4) against the internal-type appender (2) → a nested internal type crashes upstream
-  ("index 2 within vector of size 2"; upstream-PR candidate: use `extension_data->GetInternalType()` there);
+  ("index 2 within vector of size 2"; **FILED UPSTREAM 2026-07-25 as duckdb/duckdb#24157**, "Support VARIANT
+  over the Arrow interface (arrow.parquet.variant)" — use `extension_data->GetInternalType()` there. If it
+  lands, the leaf-blob transport below could in principle become the canonical struct, but do NOT plan on
+  that: the transport is also what makes EW's internal model the canonical `VariantType`, and Spark/kernel
+  interop is validated against the blob form);
   a LEAF internal type (the bool8/geoarrow shape) sidesteps it. EW: `"variant"` primitive ⇄ tagged blob
   (`SchemaConverter.VariantExtensionName`), `variantType` reader+writer feature at create + protocol upgrade
   on ADD COLUMN/SetSchema via the generalized `UpgradeProtocolForFeatures`/`RequiredSchemaFeatures` (replaced
