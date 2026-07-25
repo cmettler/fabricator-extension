@@ -88,14 +88,91 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | | Clustered columnstore tables (`mssql_default_table_type`) | ✅ (box; implicit on Fabric) |
 | **Diag** | Connection-pool diagnostics (`mssql_pool_stats`, `mssql_open/close/ping`) | ❌ |
 | | COPY to temp tables (`#t` / empty-schema syntax) | ❌ |
+| **Packaging** | Single-file distribution — one `.duckdb_extension` that unpacks itself, no env vars ([Install](#install)) | ✅ windows_amd64 + linux_amd64 |
+| | Signed extension / DuckDB community repository | ❌ (`allow_unsigned_extensions` required) |
 
 ✅ implemented & verified · ⚠️ partial / via SqlClient · ❌ not yet
 
+## Install
+
+fabricator ships as **one file** — a `fabricator.duckdb_extension` that carries the C++ extension and
+the .NET bridge inside it and unpacks them into DuckDB's own extension directory the first time it is
+loaded. There is nothing to unzip and no environment variable to set.
+
+There are no published downloads yet, and fabricator is not in the DuckDB community repository (its CI
+builds C/C++/Rust from source and cannot produce or host a .NET payload), so for now you build the
+artifact yourself — see the collapsed section at the end of this chapter.
+
+```sql
+-- DuckDB must be started with allow_unsigned_extensions (see below)
+LOAD '/path/to/fabricator.duckdb_extension';
+SELECT fabricator_version();
+```
+
+The first load takes about two seconds (unpacking); every later load takes about ten milliseconds,
+because it only checks a marker file and loads the already-extracted core. Nothing is written outside
+DuckDB's extension directory.
+
+**Pick the artifact matching your DuckDB build.** The inner extension is compiled against DuckDB's
+C++ internals, so it is tied to an exact DuckDB version and platform — `v1.5.5` / `windows_amd64`,
+`v1.5.5` / `linux_amd64`, and so on. A mismatch is refused immediately, with a message naming the
+version you are running, **before anything is written to disk**. Two flavours per platform:
+
+| flavour | requires | measured size |
+|---|---|---|
+| **standalone** | nothing — the .NET runtime is inside | 61 MB (`windows_amd64`) |
+| **standard** | .NET 8 or newer on the machine (found automatically; `FABRICATOR_DOTNET_ROOT` or `DOTNET_ROOT` override the search) | 40 MB (`linux_amd64`) |
+
+(Sizes are per platform as well as per flavour — the Linux core is larger than the Windows one, so
+the two figures are not a like-for-like comparison of the flavours.)
+
+**`allow_unsigned_extensions` is required** — fabricator is not signed by DuckDB, and this is a
+start-up option, not a `SET`:
+
+```bash
+duckdb -unsigned
+```
+```python
+duckdb.connect(config={"allow_unsigned_extensions": True})
+```
+```yaml
+# dbt profiles.yml (dbt-duckdb) — the artifact can be listed as an extension to load
+config_options:
+  allow_unsigned_extensions: true
+extensions:
+  - '/path/to/fabricator.duckdb_extension'
+```
+
+`INSTALL '/path/to/fabricator.duckdb_extension'` also works if you prefer DuckDB to copy the file into
+its extension directory first, after which a plain `LOAD fabricator` resolves it by name.
+
+<details>
+<summary>Building the artifact yourself, and the two-piece layout</summary>
+
+Build it with `scripts/pack-distribution.ps1` (see [Build](#build) for the prerequisites):
+
+```powershell
+./scripts/pack-distribution.ps1 -Sku Standalone -Rid win-x64
+# -> build/distribution/windows_amd64/fabricator.duckdb_extension
+```
+
+NativeAOT and the C++ core cannot cross-compile between operating systems, so each platform's two
+inputs are built on that platform; packing them is platform-neutral (`-CorePath`/`-ManagedPath` let
+one machine assemble another platform's artifact from them).
+
+The older **two-piece layout** still works and is what a plain source build produces: the
+`fabricator.duckdb_extension` loadable plus a `fabricator/` directory of managed assemblies, either
+beside the loadable or pointed to by `FABRICATOR_MANAGED_DIR`. The single file is that same pair,
+packed. After a first single-file load you can also `LOAD fabricator_core` directly — the extracted
+core is a normal two-piece install and the same binary answers to both names.
+
+Design and internals: [docs/distribution-installer.md](docs/distribution-installer.md).
+
+</details>
+
 ## Quick Start
 
-This extension is not (yet) in the DuckDB community repository — build it from source (see
-[Build](#build)), then load the unsigned extension. The managed bridge is published self-contained
-next to the extension (no .NET install required on the host).
+With the extension loaded ([Install](#install)):
 
 ```sql
 -- Connection string (a valid Microsoft.Data.SqlClient string)
@@ -935,20 +1012,23 @@ pwsh scripts/publish-managed.ps1     # self-contained publish next to the built 
 
 ### Extension
 
-Dependencies — one real git submodule + two gitignored manual shallow clones at pinned tags:
+Dependencies — two git submodules + two gitignored manual shallow clones at pinned tags:
 
 ```bash
-git submodule update --init engineered-wood             # the only real submodule (non-recursive)
-git clone --depth 1 --branch v1.5.4 https://github.com/duckdb/duckdb.git duckdb
+git submodule update --init engineered-wood DuckDB.ExtensionKit    # non-recursive, see below
+git clone --depth 1 --branch v1.5.5 https://github.com/duckdb/duckdb.git duckdb
 git clone --depth 1 --branch v1.5.3 https://github.com/duckdb/extension-ci-tools.git extension-ci-tools
 ```
 
 - **`engineered-wood`** — the pure-C# Delta/Parquet library (a git submodule pinned to the
   [`cmettler/engineered-wood`](https://github.com/cmettler/engineered-wood) fork), referenced in-tree by
   `Fabricator.Bridge`. Init NON-recursively (as above) to skip its ~½ GB nested `parquet-testing` corpus.
-- **`duckdb@v1.5.4`** + **`extension-ci-tools@v1.5.3`** — the DuckDB source + build tooling. These are
-  **gitignored manual clones**, NOT submodules (`.gitmodules` lists only `engineered-wood`), so they're
-  cloned explicitly at their pinned tags as shown.
+- **`DuckDB.ExtensionKit`** — the MIT NativeAOT extension toolkit
+  ([`Giorgi/DuckDB.ExtensionKit`](https://github.com/Giorgi/DuckDB.ExtensionKit)), pinned by SHA. Needed
+  ONLY to build the single-file distribution artifact; nothing else in the repo references it, so you can
+  skip it for a normal build.
+- **`duckdb@v1.5.5`** + **`extension-ci-tools@v1.5.3`** — the DuckDB source + build tooling. These are
+  **gitignored manual clones**, NOT submodules, so they're cloned explicitly at their pinned tags as shown.
 
 `httpfs` is linked unconditionally (for `s3://`), so it needs OpenSSL + curl from **vcpkg**:
 `vcpkg install openssl:x64-windows-static curl:x64-windows-static` (with `VCPKG_ROOT` set).
@@ -971,6 +1051,10 @@ cmake -G Ninja -DEXTENSION_STATIC_BUILD=1 `
   -S <repo>/duckdb -B <repo>/build/release
 cmake --build build/release --target fabricator_loadable_extension duckdb shell
 ```
+
+Add `-DOVERRIDE_GIT_DESCRIBE=v1.5.5` if you need the loadable to declare its DuckDB version for
+loading into an official DuckDB build (the shallow clone has no tag context, so it otherwise
+reports `v0.0.1` and the official engine rejects it).
 
 (`CLAUDE.md` has the full from-a-fresh-clone quickstart + prerequisites.)
 
