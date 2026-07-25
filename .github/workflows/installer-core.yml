@@ -91,13 +91,17 @@ jobs:
         env:
           EXPECTED_MINIMUM: 92
         run: |
-          passed=$(grep -oE 'Passed:[[:space:]]+[0-9]+' test-output.txt | grep -oE '[0-9]+' | head -1)
-          if [ -z "$passed" ]; then
+          # TOTAL, not Passed: two upgrade-in-use cases are Windows-only and report as SKIPPED on
+          # Linux (via Assert.SkipUnless — deliberately, so a vacuous early-return cannot be counted
+          # as coverage). Total therefore holds at 92 on both runners while Passed does not. Actual
+          # failures need no floor of their own: `dotnet test` already exits non-zero for those.
+          total=$(grep -oE 'Total:[[:space:]]+[0-9]+' test-output.txt | grep -oE '[0-9]+' | head -1)
+          if [ -z "$total" ]; then
             echo "::error::Could not parse a test count out of the dotnet test output."
             exit 1
           fi
-          echo "passed=$passed (floor $EXPECTED_MINIMUM)"
-          if [ "$passed" -lt "$EXPECTED_MINIMUM" ]; then
-            echo "::error::Only $passed tests ran; expected at least $EXPECTED_MINIMUM. Tests were lost or silently skipped."
+          echo "total=$total (floor $EXPECTED_MINIMUM)"
+          if [ "$total" -lt "$EXPECTED_MINIMUM" ]; then
+            echo "::error::Only $total tests were discovered; expected at least $EXPECTED_MINIMUM. Tests were lost."
             exit 1
           fi

@@ -355,14 +355,9 @@ public sealed class PayloadInstallerTests
     /// FILE_SHARE_DELETE, which forbids deleting it but PERMITS renaming it — so displacing the old
     /// core by rename lets an upgrade succeed while another session still has it loaded.
     /// </summary>
-    [Fact]
+    [WindowsOnlyFact("POSIX renames unconditionally, so there is nothing to distinguish.")]
     public void Ensure_Upgrade_SucceedsWhileTheOldCoreIsStillOpenLoaderStyle()
     {
-        if (!OperatingSystem.IsWindows())
-        {
-            return; // POSIX renames unconditionally; there is nothing to distinguish.
-        }
-
         using var fixture = new InstallFixture();
         InstallResult first = fixture.Install();
 
@@ -375,14 +370,9 @@ public sealed class PayloadInstallerTests
     }
 
     /// <summary>...and when even a rename is refused, the error must say what to do.</summary>
-    [Fact]
+    [WindowsOnlyFact("POSIX cannot refuse the rename, so the error path is unreachable.")]
     public void Ensure_Upgrade_ReportsAnInUseFileWhenItCannotBeDisplaced()
     {
-        if (!OperatingSystem.IsWindows())
-        {
-            return;
-        }
-
         using var fixture = new InstallFixture();
         InstallResult first = fixture.Install();
 
