@@ -58,9 +58,17 @@ env:
   # DuckDB's own public read-only vcpkg binary cache. Without it every run rebuilds OpenSSL from
   # source for the statically linked httpfs, which dominates the wall clock.
   VCPKG_BINARY_SOURCES: 'clear;http,https://vcpkg-cache.duckdb.org,read'
-  # The extension declares v0.0.1, so `git describe` on a shallow submodule cannot supply the real
-  # version and the artifact would be rejected by a stock DuckDB. Must match the duckdb pin.
-  DUCKDB_VERSION: v1.5.5
+
+# NOTE on OVERRIDE_GIT_DESCRIBE, deliberately NOT set for this job. It makes the build declare a real
+# DuckDB release version instead of v0.0.1, which a stock DuckDB requires before it will accept the
+# LOADABLE — so the packaging workflow will need it. But this job builds `unittest`, where the
+# extension is statically embedded and no version check applies, and setting it broke the run:
+# fabricator's own Load clones parquet_scan (src/fabricator/fabricator_delta_mfr.cpp), reaching it via
+# ExtensionHelper::AutoLoadExtension whose failure is swallowed, and with a real release version that
+# resolution took a path unavailable on a bare runner — so Load threw
+# "Function with name \"parquet_scan\" not found" and every bridge-dependent suite failed. Keeping the
+# configure identical to the documented local one (CLAUDE.md) is the point; this was the only flag
+# that differed.
 
 defaults:
   run:
@@ -160,7 +168,6 @@ jobs:
             -DENABLE_EXTENSION_AUTOLOADING=1 -DENABLE_EXTENSION_AUTOINSTALL=1 \
             -DENABLE_UNITTEST_CPP_TESTS=FALSE \
             -DCMAKE_BUILD_TYPE=Release \
-            -DOVERRIDE_GIT_DESCRIBE="$DUCKDB_VERSION" \
             -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" \
             -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }}
 
