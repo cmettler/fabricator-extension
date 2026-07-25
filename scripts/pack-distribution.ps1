@@ -54,7 +54,13 @@ param(
     # Also emit the two artifacts test/distribution/smoke_distribution.py uses to check the failure
     # paths: one whose manifest targets a different DuckDB version, and one with no payload at all.
     # They are per-platform (DuckDB checks the footer's platform first), hence siblings of the real one.
-    [switch]$WithNegatives
+    [switch]$WithNegatives,
+
+    # Keep the intermediate payload archive next to the artifact. It is NOT needed at runtime — the
+    # artifact carries its own copy of those bytes — so it is deleted by default rather than doubling
+    # the output size. Useful when auditing what went into a build: its SHA-256 is the value recorded
+    # in the artifact's manifest.
+    [switch]$KeepPayload
 )
 
 $ErrorActionPreference = 'Stop'
@@ -153,6 +159,7 @@ if (-not (Test-Path $metadataScript)) { throw "Not found: $metadataScript (clone
 if ($LASTEXITCODE -ne 0) { throw 'append_extension_metadata.py failed' }
 
 Remove-Item $combined -Force
+if (-not $KeepPayload) { Remove-Item $payload -Force -ErrorAction SilentlyContinue }
 $size = (Get-Item $artifact).Length
 
 # --- 6. optional negative artifacts for the smoke harness -------------------------------------
