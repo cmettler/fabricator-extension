@@ -105,6 +105,17 @@ jobs:
             10.0.x
 
       - name: Install vcpkg dependencies (OpenSSL + curl for the statically linked httpfs)
+        # CLASSIC mode, into vcpkg's global installed tree — which is what the build actually
+        # consumes: CMake's source dir is the duckdb submodule, which carries no vcpkg.json, so the
+        # toolchain file never enters manifest mode (verified locally: no build/release/vcpkg_installed
+        # exists, and $VCPKG_ROOT/installed/x64-windows-static does). This mirrors the documented dev
+        # setup in CLAUDE.md.
+        #
+        # The `cd` is the fix for the first run's failure: this repo root holds a vcpkg.json left over
+        # from the extension template (empty "dependencies", still named mssql-net-extension), and
+        # vcpkg detects manifest mode from the CURRENT DIRECTORY. From the repo root it therefore
+        # refused the package arguments outright — "In manifest mode, `vcpkg install` does not support
+        # individual package arguments" — and would have installed nothing had it accepted them.
         run: |
           # An `if`, not `[ ... ] && ...`: under -e the latter aborts the step on Linux, where the
           # test is simply false.
@@ -113,6 +124,7 @@ jobs:
           else
             vcpkg="$VCPKG_INSTALLATION_ROOT/vcpkg"
           fi
+          cd "$RUNNER_TEMP"   # a directory with no vcpkg.json => classic mode
           "$vcpkg" install "openssl:${{ matrix.triplet }}" "curl:${{ matrix.triplet }}"
 
       # Windows needs the C++ toolchain environment exported into the job; a plain shell cannot even
@@ -126,7 +138,15 @@ jobs:
         shell: cmd
         run: |
           for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do call "%%i\VC\Auxiliary\Build\vcvars64.bat"
-          set >> "%GITHUB_ENV%"
+          @rem Export ONLY the four variables the toolchain needs, not a blanket `set` dump: GITHUB_ENV
+          @rem is line-oriented, so any environment variable carrying a newline corrupts the whole
+          @rem file and every later step sees a broken environment.
+          @rem The redirection comes FIRST on each line on purpose — `echo VAR=%VAR%>>file` would be
+          @rem misparsed as a stream redirect when the value happens to end in a digit.
+          >>"%GITHUB_ENV%" echo PATH=%PATH%
+          >>"%GITHUB_ENV%" echo INCLUDE=%INCLUDE%
+          >>"%GITHUB_ENV%" echo LIB=%LIB%
+          >>"%GITHUB_ENV%" echo LIBPATH=%LIBPATH%
 
       - name: Configure
         run: |
