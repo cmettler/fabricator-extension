@@ -80,6 +80,22 @@ jobs:
             platform: windows_amd64
             triplet: x64-windows-static
             unittest: build/release/test/unittest.exe
+          # osx_arm64 is a DEMAND-driven target, not a deployment one: DuckDB's own user base skews
+          # heavily to Apple Silicon, and the capabilities such a user wants — Delta/Parquet on
+          # OneLake or S3, plus a SQL Server / Fabric Warehouse connection — are portable C#.
+          # Intel macs are deliberately absent (shrinking, and those runners are being retired).
+          #
+          # Its coverage is genuinely narrower than the other two and the docs say so: this tier plus
+          # the distribution smoke, but never the Tier 2 suites, because GitHub's hosted macOS
+          # runners cannot run containers, so SQL Server and MinIO are unavailable there. That costs
+          # less than it sounds: the platform-specific risk is the CLR bootstrap, hostfxr resolution,
+          # dlopen/dylib naming and path handling — all of which THIS tier exercises hard — whereas
+          # the SQL Server suites mostly re-test provider logic that is platform-agnostic once the
+          # bridge works. DAX/ADOMD on macOS is untested and stays unclaimed.
+          - os: macos-latest
+            platform: osx_arm64
+            triplet: arm64-osx
+            unittest: build/release/test/unittest
     runs-on: ${{ matrix.os }}
     name: ${{ matrix.platform }}
     # The DuckDB compile dominates (~22 min observed); bounded so a hang cannot burn the budget.
