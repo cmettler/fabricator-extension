@@ -1,0 +1,106 @@
+name: Build the fabricator extension
+description: >
+  Configures and builds the C++ extension against the pinned duckdb submodule and publishes the
+  managed bridge beside it, leaving a tree the sqllogictest suites can run against. Extracted so the
+  test tier and the (slower, service-dependent) integration tier share ONE build definition instead
+  of two copies that drift apart the first time a cmake flag changes.
+
+inputs:
+  triplet:
+    description: vcpkg triplet — x64-windows-static on Windows (static CRT, matching /MT), x64-linux on Linux.
+    required: true
+  platform:
+    description: DuckDB platform string recorded in the build (windows_amd64 / linux_amd64).
+    required: true
+  targets:
+    description: cmake targets to build, space separated.
+    required: false
+    default: unittest
+  managed-mode:
+    description: >
+      publish-managed.ps1 mode. Framework (~35 MB, resolves a provided .NET at load via DOTNET_ROOT,
+      which setup-dotnet exports) is right for CI; SelfContained (~250 MB) is for shipping.
+    required: false
+    default: Framework
+  override-git-describe:
+    description: >
+      Sets -DOVERRIDE_GIT_DESCRIBE so the build declares a real DuckDB release rather than v0.0.1.
+      REQUIRED when producing the loadable, which a stock DuckDB rejects on a version mismatch. Leave
+      EMPTY for test builds: with the extension statically embedded no version check applies, and
+      setting it made fabricator's own Load fail to resolve parquet_scan on a bare runner. See the
+      comment in extension.yml.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-dotnet@v4
+      with:
+        # 10 builds and runs the bridge; 8 is the deployment floor it also targets and supplies the
+        # runtime a framework-dependent publish resolves at load.
+        dotnet-version: |
+          8.0.x
+          10.0.x
+
+    - name: Install vcpkg dependencies (OpenSSL + curl for the statically linked httpfs)
+      shell: bash
+      env:
+        # DuckDB's public read-only binary cache; without it OpenSSL is rebuilt from source every run.
+        VCPKG_BINARY_SOURCES: 'clear;http,https://vcpkg-cache.duckdb.org,read'
+      run: |
+        # An `if`, not `[ ... ] && ...`: under -e the latter aborts the step on the platform where the
+        # test is false.
+        if [ "$RUNNER_OS" = 'Windows' ]; then
+          vcpkg="$VCPKG_INSTALLATION_ROOT/vcpkg.exe"
+        else
+          vcpkg="$VCPKG_INSTALLATION_ROOT/vcpkg"
+        fi
+        # CLASSIC mode, into vcpkg's global installed tree — what the build actually consumes, since
+        # no vcpkg.json exists in CMake's source dir (the duckdb submodule) or this repo. The `cd` is
+        # kept as a guard: vcpkg infers manifest mode from the CURRENT DIRECTORY, and a manifest
+        # reappearing at the repo root would make it refuse these package arguments outright.
+        cd "$RUNNER_TEMP"
+        "$vcpkg" install "openssl:${{ inputs.triplet }}" "curl:${{ inputs.triplet }}"
+
+    - name: Export the MSVC environment
+      if: runner.os == 'Windows'
+      shell: cmd
+      run: |
+        for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do call "%%i\VC\Auxiliary\Build\vcvars64.bat"
+        @rem Only the four variables the toolchain needs, never a blanket `set` dump: GITHUB_ENV is
+        @rem line-oriented, so one variable carrying a newline corrupts it for every later step.
+        @rem Redirection first on each line — `echo VAR=%VAR%>>file` is misparsed as a stream
+        @rem redirect when the value ends in a digit.
+        >>"%GITHUB_ENV%" echo PATH=%PATH%
+        >>"%GITHUB_ENV%" echo INCLUDE=%INCLUDE%
+        >>"%GITHUB_ENV%" echo LIB=%LIB%
+        >>"%GITHUB_ENV%" echo LIBPATH=%LIBPATH%
+
+    - name: Configure
+      shell: bash
+      run: |
+        extra=()
+        if [ -n "${{ inputs.override-git-describe }}" ]; then
+          extra+=(-DOVERRIDE_GIT_DESCRIBE="${{ inputs.override-git-describe }}")
+        fi
+        # GITHUB_WORKSPACE, not $PWD: under Git Bash on Windows $PWD is the MSYS form (/d/a/...) which
+        # CMake cannot read, while GITHUB_WORKSPACE is native on both runners.
+        cmake -G Ninja -S duckdb -B build/release \
+          -DEXTENSION_STATIC_BUILD=1 \
+          -DDUCKDB_EXTENSION_CONFIGS="$GITHUB_WORKSPACE/extension_config.cmake" \
+          -DDUCKDB_EXPLICIT_PLATFORM=${{ inputs.platform }} \
+          -DENABLE_EXTENSION_AUTOLOADING=1 -DENABLE_EXTENSION_AUTOINSTALL=1 \
+          -DENABLE_UNITTEST_CPP_TESTS=FALSE \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" \
+          -DVCPKG_TARGET_TRIPLET=${{ inputs.triplet }} \
+          "${extra[@]}"
+
+    - name: Build
+      shell: bash
+      run: cmake --build build/release --target ${{ inputs.targets }}
+
+    - name: Publish the managed bridge
+      shell: bash
+      run: pwsh -NoProfile -File scripts/publish-managed.ps1 -Mode ${{ inputs.managed-mode }}

@@ -1092,7 +1092,7 @@ dotnet/Fabricator.AnalysisServices/  Power BI / DAX (ADOMD) backend — PROVIDER
 engineered-wood/             in-tree submodule: pure-C# Delta/Parquet library (the delta provider's log layer)
 scripts/publish-managed.ps1  self-contained publish of the bridge + .NET runtime
 test/                        verify_*.test + mssqlcompat/ (regenerated from the native extension)
-CMakeLists.txt, Makefile, extension_config.cmake, vcpkg.json, CLAUDE.md
+CMakeLists.txt, Makefile, extension_config.cmake, CLAUDE.md
 ```
 
 ## License

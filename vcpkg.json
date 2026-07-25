@@ -1,6 +1,0 @@
-{
-  "name": "mssql-net-extension",
-  "version": "0.0.1",
-  "description": "DuckDB extension for Microsoft SQL Server via a CoreCLR-hosted C# bridge (Arrow interop)",
-  "dependencies": []
-}

@@ -114,16 +114,14 @@ jobs:
 
       - name: Install vcpkg dependencies (OpenSSL + curl for the statically linked httpfs)
         # CLASSIC mode, into vcpkg's global installed tree — which is what the build actually
-        # consumes: CMake's source dir is the duckdb submodule, which carries no vcpkg.json, so the
-        # toolchain file never enters manifest mode (verified locally: no build/release/vcpkg_installed
-        # exists, and $VCPKG_ROOT/installed/x64-windows-static does). This mirrors the documented dev
-        # setup in CLAUDE.md.
+        # consumes: no vcpkg.json exists in either CMake's source dir (the duckdb submodule) or this
+        # repo, so the toolchain file never enters manifest mode. Mirrors the dev setup in CLAUDE.md.
         #
-        # The `cd` is the fix for the first run's failure: this repo root holds a vcpkg.json left over
-        # from the extension template (empty "dependencies", still named mssql-net-extension), and
-        # vcpkg detects manifest mode from the CURRENT DIRECTORY. From the repo root it therefore
-        # refused the package arguments outright — "In manifest mode, `vcpkg install` does not support
-        # individual package arguments" — and would have installed nothing had it accepted them.
+        # The `cd` is kept deliberately even though the repo no longer has a manifest. vcpkg infers
+        # manifest mode from the CURRENT DIRECTORY, and a manifest reappearing at the repo root would
+        # otherwise break this step exactly as it did on the first run: "In manifest mode, `vcpkg
+        # install` does not support individual package arguments" — and had it accepted them it would
+        # have installed nothing, because that leftover manifest declared no dependencies.
         run: |
           # An `if`, not `[ ... ] && ...`: under -e the latter aborts the step on Linux, where the
           # test is simply false.
