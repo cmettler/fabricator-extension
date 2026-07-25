@@ -7,27 +7,24 @@
 # column mapping, native write/read, clustered optimize, ...).
 #
 # Derived rather than hardcoded, so a newly added hermetic suite is picked up automatically and
-# cannot silently sit outside CI. A suite qualifies when ALL THREE hold:
+# cannot silently sit outside CI. A suite qualifies when BOTH hold:
 #
 #   1. every `require-env` it declares is one CI can satisfy itself:
 #        FABRICATOR_DELTA_WRITE_DIR  — a scratch directory
 #        FABRICATOR_DELTA_DIR        — test/fixtures/delta_simple, committed to this repo
 #   2. every `require <extension>` it declares is statically linked into the test binary
-#      (extension_config.cmake: fabricator, json, icu, parquet, httpfs), and
-#   3. it does not ATTACH the `deltars` provider.
+#      (extension_config.cmake: fabricator, json, icu, parquet, httpfs).
 #
 # Rule 2 matters because a `require` for an unlinked extension makes the runner SKIP the file, and
 # CI asserts that nothing in this set skips — an unlinked requirement would otherwise become a
 # permanently green no-op.
 #
-# Rule 3 covers an UNDECLARED dependency: the delta-rs suites gate only on
-# FABRICATOR_DELTA_WRITE_DIR, but they also need `publish-managed.ps1 -IncludeDeltaRs` (DeltaLake.dll
-# plus ~240 MB of native delta-rs/delta-kernel libraries), which the default publish omits. Without
-# it they FAIL rather than skip (verified: `PROVIDER 'deltars'` errors at ATTACH), so they would turn
-# CI red for an environmental reason. Detecting the provider in the file body rather than matching
-# `verify_delta_rs*` keeps this self-maintaining. The cleaner long-term fix is for those suites to
-# declare the requirement themselves (a `require-env` of their own, as every other optional surface
-# in this repo does), after which this rule becomes dead weight and can go.
+# Rule 1 is what excludes the delta-rs suites, which need `publish-managed.ps1 -IncludeDeltaRs`
+# (DeltaLake.dll plus ~240 MB of native delta-rs/delta-kernel libraries) that the default publish
+# omits — without it they FAIL rather than skip, because `PROVIDER 'deltars'` errors at ATTACH. That
+# dependency used to be UNDECLARED, and this script excluded them by sniffing the provider out of the
+# file body; the suites now declare `require-env FABRICATOR_DELTARS` themselves, like every other
+# optional surface in this repo, so no special case is needed here.
 #
 # Usage:  scripts/list-hermetic-suites.sh > suites.txt
 #         build/release/test/unittest.exe --test-dir . -f suites.txt
@@ -58,11 +55,6 @@ for f in test/*.test; do
             *) qualifies=0 ;;
         esac
     done < <(grep -E '^require[[:space:]]+' "$f" 2>/dev/null | tr -d '\r' | awk '{print $2}')
-
-    # (3) the opt-in delta-rs native libraries.
-    if grep -qEi "PROVIDER[[:space:]]+'(deltars|delta-rs)'" "$f" 2>/dev/null; then
-        qualifies=0
-    fi
 
     # `if` rather than `[ ... ] && echo`: the latter leaves a non-zero status when the suite does
     # not qualify, and the LAST loop iteration's status becomes the script's exit code.

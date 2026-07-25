@@ -4924,6 +4924,8 @@ VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
   # S3/MinIO tests (docker compose stack must be up):
   export FABRICATOR_S3_ENDPOINT=localhost:9000          # gates verify_delta_catalog_s3
   export FABRICATOR_S3_SQL_ENDPOINT=minio:9000          # + MSSQL_TESTDB_DSN gates verify_mssql_s3_polybase
+  export FABRICATOR_DELTARS=1                           # gates the 7 verify_delta_rs_* suites; set ONLY when
+                                                        # publish-managed.ps1 -IncludeDeltaRs has actually run
   # run one test at a time (the runner concatenates multiple filters into one bad glob):
   build/release/test/unittest.exe --test-dir . "test/verify_delta_catalog_native_write.test"
   # trace the write path: prepend FABRICATOR_LOG_LEVEL=Debug (logs off by default)

@@ -11,6 +11,8 @@ require fabricator
 
 require-env FABRICATOR_DELTA_WRITE_DIR
 
+require-env FABRICATOR_DELTARS
+
 statement ok
 ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/dra' AS lake (TYPE fabricator, PROVIDER 'deltars');
 
