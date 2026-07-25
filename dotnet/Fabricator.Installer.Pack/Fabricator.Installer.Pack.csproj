@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Build-time CLI over Fabricator.Installer.Core: turns the built core + published managed dir +
+       the AOT library into one polyglot artifact. Exists so scripts/pack-distribution.ps1 stays pure
+       orchestration and the packing logic has exactly one implementation (the tested one). -->
+
+  <PropertyGroup>
+    <!-- Cleared, not overridden: the repo-wide net10.0;net8.0 would make `dotnet run` need -f. -->
+    <TargetFrameworks></TargetFrameworks>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>Fabricator.Installer.Pack</AssemblyName>
+    <RootNamespace>Fabricator.Installer.Pack</RootNamespace>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Fabricator.Installer.Core\Fabricator.Installer.Core.csproj" />
+  </ItemGroup>
+
+</Project>

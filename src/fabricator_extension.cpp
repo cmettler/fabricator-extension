@@ -713,4 +713,18 @@ extern "C" {
 DUCKDB_CPP_EXTENSION_ENTRY(fabricator, loader) {
 	duckdb::LoadInternal(loader);
 }
+
+// Second entry point for the SAME binary under the file name fabricator_core.duckdb_extension.
+//
+// DuckDB derives an extension's entry symbol AND its identity from the file name
+// (ExtensionHelper::GetExtensionName -> the first dot-segment; extension_load.cpp:593-607,633), and
+// ExtensionManager::BeginLoad takes a lock per extension NAME. The single-file distribution
+// (docs/distribution-installer.md) has an installer extension named "fabricator" chain-load the
+// extracted core during its own load, so the core MUST answer to a different name — a nested load of
+// "fabricator" from inside "fabricator" would block on its own load lock. Exporting both spellings
+// keeps one artifact serving both: the direct dev flow (LOAD 'fabricator.duckdb_extension') and the
+// distributed flow (extracted as fabricator_core.duckdb_extension).
+DUCKDB_CPP_EXTENSION_ENTRY(fabricator_core, loader) {
+	duckdb::LoadInternal(loader);
+}
 }

@@ -1,0 +1,51 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The NativeAOT installer shell: a DuckDB C-ABI extension whose whole job is to extract the
+       payload appended to its own file and chain-LOAD the real (CPP-ABI) fabricator core.
+       Deliberately near-logic-free — everything testable lives in Fabricator.Installer.Core. -->
+
+  <PropertyGroup>
+    <!-- Single-TFM: AOT publishes one native library. TargetFrameworks must be CLEARED, not just
+         overridden, or the repo-wide net10.0;net8.0 makes this a cross-targeting project and
+         `dotnet publish` refuses without -f. -->
+    <TargetFrameworks></TargetFrameworks>
+    <TargetFramework>net10.0</TargetFramework>
+    <RuntimeIdentifiers>win-x64;win-arm64;linux-x64;linux-arm64;osx-x64;osx-arm64</RuntimeIdentifiers>
+    <PublishAot>true</PublishAot>
+    <PlatformTarget>AnyCPU</PlatformTarget>
+    <AssemblyName>Fabricator.Installer</AssemblyName>
+    <RootNamespace>Fabricator.Installer</RootNamespace>
+
+    <!-- The extension identity users type: LOAD fabricator. The extracted core answers to
+         fabricator_core — a DIFFERENT name is required, see FabricatorInstallerExtension. -->
+    <ExtensionName>fabricator</ExtensionName>
+    <ExtensionVersion>v0.0.1</ExtensionVersion>
+    <!-- C_STRUCT ABI: the footer's version field carries the C API version, checked as
+         major==1 && minor<=host, so ONE installer binary spans DuckDB releases. DuckDB 1.5.5
+         exposes DUCKDB_EXTENSION_API_VERSION 1.2.0 (duckdb_extension.h:46-48). -->
+    <DuckDBVersion>v1.2.0</DuckDBVersion>
+    <AbiType>C_STRUCT</AbiType>
+
+    <!-- Overridable so a build machine can check the (MIT) kit out anywhere. -->
+    <DuckDBExtensionKitPath Condition="'$(DuckDBExtensionKitPath)' == ''">D:\repos\DuckDB.ExtensionKit</DuckDBExtensionKitPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <CompilerVisibleProperty Include="ExtensionName" />
+    <CompilerVisibleProperty Include="DuckDBVersion" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Fabricator.Installer.Core\Fabricator.Installer.Core.csproj" />
+    <ProjectReference Include="$(DuckDBExtensionKitPath)\DuckDB.ExtensionKit\DuckDB.ExtensionKit.csproj" />
+    <ProjectReference Include="$(DuckDBExtensionKitPath)\DuckDB.ExtensionKit.Generators\DuckDB.ExtensionKit.Generators.csproj"
+                      OutputItemType="Analyzer"
+                      ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+  <Target Name="CheckExtensionKit" BeforeTargets="ResolveProjectReferences">
+    <Error Condition="!Exists('$(DuckDBExtensionKitPath)\DuckDB.ExtensionKit\DuckDB.ExtensionKit.csproj')"
+           Text="DuckDB.ExtensionKit (MIT) not found at '$(DuckDBExtensionKitPath)'. Check it out and pass -p:DuckDBExtensionKitPath=&lt;path&gt;." />
+  </Target>
+
+</Project>

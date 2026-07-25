@@ -276,6 +276,109 @@ current code still uses the single-provider `fabricator` naming):
 ## Next up (open threads for future sessions)
 
 In-flight / planned refactors (all C#-only unless noted; tests stay green per slice):
+- **SINGLE-FILE DISTRIBUTION — BUILT AND WORKING ON WINDOWS (2026-07-25; phases 1-3 of 5 —
+  remaining: linux artifact, user docs, CI): [docs/distribution-installer.md](docs/distribution-installer.md)
+  §12 (spike) + §14 (Installer.Core) + §15 (AOT shell + packaging).** ONE 61 MB
+  `fabricator.duckdb_extension` now installs and runs itself: `LOAD` it into an EMPTY extension
+  directory with ZERO env vars → 1.2 s cold (extract + chain-load + CLR boot), **0.01 s warm**,
+  then `fabricator_version()`, managed calls and a Delta CTAS round trip all work
+  (`test/distribution/smoke_distribution.py`, 12 checks incl. both must-not-touch-disk rejections).
+  Build it with `scripts/pack-distribution.ps1` (core → managed publish → AOT publish → pack →
+  footer; each step skippable). Ship ONE
+  `fabricator.duckdb_extension` per (DuckDB version × platform × SKU): a **NativeAOT C#
+  installer extension** (on the MIT `DuckDB.ExtensionKit`, `D:\repos\DuckDB.ExtensionKit` —
+  C_STRUCT ABI ⇒ DuckDB-version-portable outer shell) carrying the real payload
+  (`fabricator_core.duckdb_extension` = today's CPP-ABI loadable with an added forwarding
+  `fabricator_core_duckdb_cpp_init` export, + the `fabricator/` managed dir, FDD ~20 MB or
+  self-contained ~100 MB SKU) as a **polyglot append** (lib + payload + index + the DuckDB
+  footer via `append_extension_metadata.py` — a plain file append, no resource compiler).
+  At every load: version/platform gate (`PRAGMA version/platform` vs manifest, friendly
+  error) → extract into `<extdir>/extensions/<ver>/<platform>/` (sha-marker idempotent,
+  lock + staging) → nested `duckdb_query("LOAD '<extdir>/fabricator_core…'")`. Zero env
+  vars: clr_host's default lookup is a hardcoded `fabricator/` next to the loaded module
+  (clr_host.cpp:345). Source-verified keystones: nested LOAD is lock-safe (per-extension
+  locks; we already autoload parquet during our own load), C_STRUCT footer checks the C API
+  semver not the DuckDB version, name-LOAD works without an `.info`. Why C# not C++: resource
+  embedding in C++ is 3 per-OS toolchain mechanisms (untestable off-platform, the macOS
+  problem); the C# extraction/packaging logic is ONE code path, unit-testable as plain xunit
+  anywhere — AOT only at publish (no cross-OS compile; per-OS machines still build+smoke).
+  `allow_unsigned_extensions` stays required (both loads; unchanged vs today).
+  **BUILT so far:** the spike validated every keystone on Windows against the OFFICIAL
+  `duckdb==1.5.5` wheel — a C_STRUCT AOT kit extension loads, discovers its own
+  `.duckdb_extension` path, reads a polyglot payload, and **chain-LOADs the CPP-ABI core, whose
+  CLR boots with zero env vars** (managed calls `hilbert_index`/`bucket` prove it, not just
+  `fabricator_version()`); a **138 MB artifact loads in 0.56 s** (R1 retired). Then
+  **`dotnet/Fabricator.Installer.Core`** (net10.0;net8.0, `IsAotCompatible`, **zero package refs**)
+  + `.Tests` — **91 tests green on both TFMs**: deterministic packer, polyglot writer/reader,
+  extdir resolution, compatibility gate, extractor, staging/lock/promote state machine; plus a
+  gated real-payload E2E (`FABRICATOR_E2E_CORE`/`_MANAGED`) that packs the built core + the 115 MB
+  managed dir in ~4 s and whose install tree **loads in the official wheel with no env vars**.
+  **Measured: the standalone artifact is 58 MB, not the estimated 90-110.**
+  **FOUR FINDINGS (details in §14):** (1) the extension-directory rule in the design was WRONG —
+  a custom `extension_directory` gets **NO `extensions/` component** (it exists only because the
+  DEFAULT base string is `~/.duckdb/extensions`), and the plural `extension_directories` LIST
+  setting is a second source; empirically pinned by watching where `INSTALL '<file>'` lands.
+  (2) A zip's DOS timestamp has no timezone — .NET encodes the wall-clock part verbatim (so a
+  fixed UTC epoch IS reproducible across build machines, which the payload-sha-as-marker scheme
+  requires) but reattaches the READER's local offset on read; pinned at the byte level.
+  (3) The payload must be packed at stream position 0 — zip offsets are stream-absolute, so an
+  archive written at an offset is unreadable through the payload window. (4) Windows
+  upgrade-in-use is largely SOLVED, not just reported: displaced files are RENAMED aside (the
+  loader opens images with `FILE_SHARE_DELETE`, so rename is permitted where delete is not), so
+  an upgrade succeeds while another session holds the old core loaded. Also **confirmed the
+  forwarding export is genuinely required**: the same bytes that load as
+  `fabricator.duckdb_extension` fail as `fabricator_core.duckdb_extension` (filename-derived
+  entry symbol) — hence `CoreFileName` is a manifest field so today's name can be produced.
+  **PHASE 3 (§15) added:** the core's **second entry point**
+  `DUCKDB_CPP_EXTENSION_ENTRY(fabricator_core, loader)` (same `LoadInternal`; one binary, two file
+  names), `dotnet/Fabricator.Installer` (the 2.9 MB NativeAOT shell — own-path discovery, gate,
+  install, chain-LOAD; ~60 lines of flow), `dotnet/Fabricator.Installer.Pack` (build-time CLI over
+  the Core so the ps1 is pure orchestration), `scripts/pack-distribution.ps1`, and
+  `test/distribution/smoke_distribution.py`. **THREE MORE FINDINGS:** (1) the distinct core name is
+  a HARD REQUIREMENT, not cosmetics — `BeginLoad` locks per extension NAME and a path-LOAD derives
+  the name from the FILENAME, so an installer named `fabricator` chain-loading a file that also
+  resolves to `fabricator` would block on its own load lock (this reordered the plan: the dual entry
+  symbol had to land BEFORE the shell). (2) **`duckdb_fetch_chunk` takes `duckdb_result` BY VALUE**
+  (a 48-byte struct) while the kit's mirror types it as a pointer — ABI-correct only where large
+  structs pass indirectly (Windows x64, AArch64), WRONG on x64 SysV (linux/macOS-x64) where it is
+  copied onto the stack; the shell re-types the function pointer so the compiler emits the right
+  convention per platform (found by reading duckdb.h, not by debugging Linux). (3) the shell
+  deliberately AVOIDS `duckdb_value_varchar`/`duckdb_row_count` (3 lines vs 40) because duckdb.h
+  marks them "scheduled for removal" and the installer is the version-PORTABLE half — their removal
+  would null the struct slot = a crash; also any deprecated accessor marks the result
+  `CAPI_RESULT_TYPE_DEPRECATED`, after which `duckdb_fetch_chunk` returns null, so mixing is
+  forbidden. **sqllogictest is the WRONG harness** for the distribution (our `unittest` embeds
+  fabricator statically → the chain-loaded core would collide with registered functions) — hence the
+  python harness against a stock wheel. Two build traps encoded in the scripts: an AOT project must
+  CLEAR the repo-wide `TargetFrameworks` (a single-value plural still counts as cross-targeting), and
+  `dotnet run` forwards an unrecognized `--nologo` to the program. **Loading BOTH spellings in one
+  process is unsupported** (hostfxr initializes once per process; the second module's CLR fails and
+  its global functions never register).
+  Phasing: spike ✅ → `Fabricator.Installer.Core` ✅ → AOT shell + `pack-distribution.ps1` +
+  the core dual entry symbol ✅ → linux artifact + user docs → CI matrix.
+- **NativeAOT BRIDGE SKU (design only, 2026-07-25 — nothing built):
+  [docs/aot-bridge.md](docs/aot-bridge.md).** An optional AOT-compiled variant of the
+  managed layer (Bridge + providers → ONE native lib, `NativeLib=Shared`) beside the CoreCLR
+  SKU — zero .NET prerequisite, est. 40–80 MB total. **Key audit finding: the ABI is already
+  AOT-shaped** (vtable of `[UnmanagedCallersOnly]` statics both directions) — only the
+  bootstrap changes: a `FabricatorBridgeInit` native export + clr_host mode 3 (managed dir
+  contains `Fabricator.Bridge.Native.<ext>` ⇒ plain dlopen/dlsym, no hostfxr). The complete
+  dynamic-code inventory is FIVE sites: BackendRegistry reflection discovery → a
+  **`Fabricator.Generators` Roslyn source generator** (`[FabricatorBackend]` attr → emitted
+  `CompiledBackends` factory in a HEAD project `Fabricator.Bridge.Native.csproj`, trim-rooted
+  by construction; reflection branch behind an AppContext feature switch ILC trims away);
+  the plugin ALC → **compile-time plugins** (reference + republish the head — the head IS the
+  plugin config; native-plugin C-ABI + a DAX CoreCLR sidecar noted as deferred);
+  `FormatError`'s `GetProperty("Number")` duck-type → `IBackend.GetErrorNumber(Exception)`
+  DIM; ~10 `JsonSerializer<T>` files (+ EW `ActionSerializer`) → one source-gen
+  `JsonSerializerContext`; Regex is AOT-fine as-is. **DAX/ADOMD stays CoreCLR-only** (the
+  original non-AOT reason — closed-source, not AOT-able); AOT SKU = SqlServer + Delta/EW
+  (**SqlClient AOT feasibility USER-VALIDATED 2026-07-25 on the 7.1 preview — the AOT SKU
+  targets 7.1+**, remaining work is the version bump + our-paths coverage via the suite;
+  Fluid must run interpreted). Gate = the existing SQL-level verify sweep (minus verify_dax)
+  against the native bridge. Endgame option noted: `NativeLib=Static` linked INTO the C++
+  loadable = literally one file, no trampoline (experimental, later). Composes with the
+  distribution installer (payload → core + one native lib, no .NET probing).
 - **`CREATE TABLE … WITH (…)` options + SQL Server EXTERNAL TABLES —
   [docs/create-table-with-options.md](docs/create-table-with-options.md). ALL FOUR SLICES DONE
   (2026-07-19): A (ABI v67) + C + D + B.** DuckDB v1.5.4 parses the clause (`CreateTableInfo::options`).

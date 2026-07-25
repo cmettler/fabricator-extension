@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <RootNamespace>Fabricator.Installer</RootNamespace>
+    <AssemblyName>Fabricator.Installer.Core</AssemblyName>
+    <!-- Referenced by the NativeAOT installer shell, so every construct here must survive ILC:
+         no reflection, no runtime codegen, JSON via source generation. The analyzers enforce it
+         at build time on the dev machine, long before a per-platform AOT publish. -->
+    <IsAotCompatible>true</IsAotCompatible>
+    <!-- Zero package references by design: BCL only (System.IO.Compression + System.Text.Json are
+         in the shared framework), so the AOT shell's dependency closure is just this assembly. -->
+    <Description>
+      All of the single-file-distribution logic: the deterministic payload packer, the polyglot
+      (library + payload + index) reader/writer, DuckDB extension-directory resolution, the
+      compatibility gate, and the staging/locking extraction state machine. Deliberately free of
+      DuckDB and AOT so it is unit-testable as plain .NET on any dev machine — that testability is
+      the whole reason the installer is C# rather than C++ (docs/distribution-installer.md §3).
+    </Description>
+  </PropertyGroup>
+
+</Project>
