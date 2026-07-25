@@ -1,0 +1,122 @@
+# Packaging tier: build the ONE-FILE artifact and prove it installs and runs itself.
+#
+# Produces `fabricator.duckdb_extension` per platform — the NativeAOT installer shell carrying the
+# CPP-ABI core plus the managed bridge as a polyglot append — and then smoke-tests it against a STOCK
+# DuckDB wheel: LOAD into an empty extension directory with ZERO environment variables, and check that
+# the bridge boots, managed calls work, and a Delta round trip succeeds. 12 checks, including the two
+# must-not-touch-disk rejections.
+#
+# TWO WAYS THIS TIER DIFFERS FROM extension.yml, both of which have already caused failures:
+#
+#   1. OVERRIDE_GIT_DESCRIBE is REQUIRED here and FORBIDDEN there. A stock DuckDB refuses a loadable
+#      whose declared version does not match its own, and `git describe` on a shallow submodule cannot
+#      supply it. In the test tier the extension is statically embedded so no check applies, and
+#      setting it broke fabricator's own Load (see the note in extension.yml).
+#   2. The smoke harness must run from OUTSIDE the repository. The repo root contains a `duckdb/`
+#      submodule directory, which shadows the `duckdb` python module and makes `import duckdb` resolve
+#      to a source tree with no extension support.
+#
+# macOS is deliberately absent for now: the AOT shell would need publishing there, and the one thing
+# that actually matters for a downloaded artifact on macOS — Gatekeeper refusing an unsigned dylib
+# carrying com.apple.quarantine — is something CI structurally cannot test, because a runner never
+# quarantines what it built itself. That needs a real Mac. There is also an open macOS defect
+# (verify_global_functions) that should be fixed before shipping a macOS artifact.
+
+name: distribution
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: distribution-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # ONE source of truth. These two must agree: the version stamped into the artifact's footer and the
+  # wheel the smoke test loads it into. A mismatch is precisely what the compatibility gate rejects,
+  # so deriving both from one variable removes the possibility of a confusing false failure.
+  DUCKDB_VERSION: v1.5.5
+  DUCKDB_WHEEL: 1.5.5
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  pack:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # SKU per platform, matching how the artifacts were validated by hand: a dev box should not
+          # need .NET installed (self-contained, ~61 MB), while Fabric notebooks already ship .NET 8,
+          # so the framework-dependent build is both smaller and the relevant one there (~40 MB).
+          - os: windows-latest
+            platform: windows_amd64
+            rid: win-x64
+            triplet: x64-windows-static
+            sku: Standalone
+            managed_mode: SelfContained
+          - os: ubuntu-latest
+            platform: linux_amd64
+            rid: linux-x64
+            triplet: x64-linux
+            sku: Standard
+            managed_mode: Framework
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.platform }} (${{ matrix.sku }})
+    timeout-minutes: 150
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: ./.github/actions/build-extension
+        with:
+          triplet: ${{ matrix.triplet }}
+          platform: ${{ matrix.platform }}
+          # The LOADABLE, not `unittest`: that is what gets embedded in the artifact.
+          targets: fabricator_loadable_extension
+          managed-mode: ${{ matrix.managed_mode }}
+          override-git-describe: ${{ env.DUCKDB_VERSION }}
+
+      - name: Pack the single-file artifact
+        # -SkipCore/-SkipManaged: the composite action already built both, with the SKU's managed mode.
+        # The script still does the AOT publish, the deterministic payload, the polyglot append and the
+        # DuckDB footer. -WithNegatives emits the failure-path artifacts the harness needs, as
+        # PER-PLATFORM siblings — a Windows negative on linux proves nothing, because DuckDB checks the
+        # footer's platform before any extension code runs (that produced two falsely-green passes once).
+        run: |
+          pwsh -NoProfile -File scripts/pack-distribution.ps1 \
+            -Sku ${{ matrix.sku }} \
+            -Rid ${{ matrix.rid }} \
+            -Platform ${{ matrix.platform }} \
+            -DuckDbVersion ${{ env.DUCKDB_VERSION }} \
+            -SkipCore -SkipManaged -WithNegatives
+
+      - name: Smoke-test against a stock DuckDB wheel
+        run: |
+          python -m pip install --quiet "duckdb==${DUCKDB_WHEEL}"
+          artifact="$GITHUB_WORKSPACE/build/distribution/${{ matrix.platform }}/fabricator.duckdb_extension"
+          ls -l "$artifact"
+          # cd OUT of the repository: the `duckdb/` submodule directory shadows the module otherwise.
+          cd "$RUNNER_TEMP"
+          python "$GITHUB_WORKSPACE/test/distribution/smoke_distribution.py" "$artifact"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fabricator-${{ matrix.platform }}-${{ matrix.sku }}
+          path: build/distribution/${{ matrix.platform }}/fabricator.duckdb_extension
+          if-no-files-found: error
+          # Compresses poorly (the payload is already a zip) and it is large, so keep it briefly.
+          retention-days: 14
