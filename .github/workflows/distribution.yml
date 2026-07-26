@@ -151,3 +151,88 @@ jobs:
           if-no-files-found: error
           # Compresses poorly (the payload is already a zip) and it is large, so keep it briefly.
           retention-days: 14
+
+  # ---------------------------------------------------------------------------------------------------
+  # Release: attach one archive per (platform x SKU) to a GitHub release. Tag pushes only — a dispatch
+  # still produces artifacts, it just does not publish anything.
+  #
+  # WHY ARCHIVES AND NOT THE BARE FILE. DuckDB derives an extension's entry symbol from its FILE NAME, so
+  # the thing a user loads must be named exactly `fabricator.duckdb_extension`. A release asset called
+  # `fabricator-v1.5.5-linux_amd64-Standard.duckdb_extension` would therefore FAIL to load after download
+  # (DuckDB would look for `fabricator-v1.5.5-linux_amd64-Standard_duckdb_cpp_init`), and asset names must
+  # be unique within a release, so the bare name cannot be reused across platforms either. Shipping a
+  # versioned ZIP resolves both: the ARCHIVE name distinguishes platform/SKU/DuckDB version (and hence the
+  # release line), while the file inside keeps the mandatory name. This is the concrete consequence of the
+  # "cannot rename the shipped file" constraint in CLAUDE.md "TWO CONCURRENT RELEASE LINES".
+  #
+  # Created as a DRAFT on purpose: publishing is outward-facing and irreversible-ish (people fetch it), so
+  # a human reviews the notes and assets and presses publish.
+  # ---------------------------------------------------------------------------------------------------
+  release:
+    name: release (draft)
+    needs: pack
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # required to create a release; the rest of this workflow stays read-only
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package each platform as a versioned archive
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          shopt -s nullglob
+          count=0
+          for d in artifacts/*/; do
+            name=$(basename "$d")   # fabricator-<duckdbversion>-<platform>-<sku>
+            if [ ! -f "$d/fabricator.duckdb_extension" ]; then
+              echo "::error::$d has no fabricator.duckdb_extension"; exit 1
+            fi
+            # -j would flatten; we are already zipping from inside the directory so the archive contains
+            # exactly one entry named fabricator.duckdb_extension.
+            (cd "$d" && zip -q -X "$GITHUB_WORKSPACE/release/$name.zip" fabricator.duckdb_extension)
+            count=$((count + 1))
+          done
+          if [ "$count" -eq 0 ]; then echo '::error::no artifacts were downloaded'; exit 1; fi
+          echo "packaged $count archive(s):"
+          ls -lh release
+
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          notes=$(cat <<'EOF'
+          Built against **DuckDB __DUCKDB_VERSION__**. An artifact only loads into that DuckDB version —
+          the version is recorded in the extension footer and checked before any extension code runs, so a
+          mismatch fails with a clear error rather than misbehaving.
+
+          Each asset is a ZIP containing a single file, `fabricator.duckdb_extension`. **Do not rename it**
+          — DuckDB derives the extension's entry symbol from the file name. Unzip it and load it:
+
+          ```sql
+          LOAD '/path/to/fabricator.duckdb_extension';
+          ```
+
+          `allow_unsigned_extensions` is required (unchanged from previous builds).
+
+          SKUs: **Standalone** ships the .NET runtime (no prerequisite); **Standard** is
+          framework-dependent and expects a provided .NET 8+ (the relevant SKU for Fabric notebooks,
+          which already have one).
+
+          macOS: the artifact is built and smoke-tested in CI, but it is **not code-signed or notarized**.
+          A browser download carries `com.apple.quarantine`, which Gatekeeper may refuse; clear it with
+          `xattr -d com.apple.quarantine fabricator.duckdb_extension`, or fetch with `curl`, which does not
+          set the attribute.
+          EOF
+          )
+          notes=${notes//__DUCKDB_VERSION__/$DUCKDB_VERSION}
+          gh release create "${{ github.ref_name }}" release/*.zip \
+            --repo "${{ github.repository }}" \
+            --title "fabricator ${{ github.ref_name }} — DuckDB ${DUCKDB_VERSION}" \
+            --notes "$notes" \
+            --draft

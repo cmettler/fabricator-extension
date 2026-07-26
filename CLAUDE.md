@@ -5140,18 +5140,26 @@ own gate re-checks version+platform against its manifest. So a 1.5.5 artifact lo
 DuckDB fails with a friendly error rather than misbehaving — the safety property holds; what is missing
 is only human-facing labelling.
 
-**Known gap, not yet fixed:** `distribution.yml` uploads `fabricator-<platform>-<sku>`, which encodes
-NEITHER the DuckDB version nor the line — two lines would produce colliding, indistinguishable names.
-Fix when the release job lands: put the DuckDB version (and/or the line) in the artifact name and the
-release tag, e.g. `fabricator-v1.5.5-linux_amd64-Standard`. Note also that `distribution.yml` fires on
-`v*` tags, so a shared tag namespace across both lines needs a scheme that keeps them apart (the DuckDB
-version is the natural discriminator, since the artifact is already one-per-DuckDB-version × platform ×
-SKU). Deliberately NOT invented here — decide it with the release job so tag, artifact and asset names
-are chosen together rather than drifting apart.
+**How this is now implemented (2026-07-26).** CI artifacts are
+`fabricator-<duckdbversion>-<platform>-<sku>` (e.g. `fabricator-v1.5.5-osx_arm64-Standalone`), and the
+`release` job in `distribution.yml` attaches ONE ZIP PER (platform × SKU) to a GitHub release.
 
-**Still to build:** a release job (attach `pack-distribution.ps1` output to a GitHub release), which is
-where the two-line naming above must be settled. The packaging tier itself EXISTS as `distribution.yml`
-(dispatch + `v*` tags) and is the one tier that DOES need `OVERRIDE_GIT_DESCRIBE`. **macOS Gatekeeper is
+**The release assets are ZIPs, and that is forced, not cosmetic.** An asset named
+`fabricator-v1.5.5-linux_amd64-Standard.duckdb_extension` would DOWNLOAD fine and then FAIL to load —
+DuckDB would derive the entry symbol `fabricator-v1.5.5-linux_amd64-Standard_duckdb_cpp_init` from the
+file name. And the bare name `fabricator.duckdb_extension` cannot be used for all three either, because
+asset names must be unique within a release. A versioned ZIP satisfies both: the ARCHIVE name
+distinguishes platform/SKU/DuckDB version (hence the line), the file inside keeps the mandatory name, and
+the release notes say "do not rename it".
+
+**Still yours to decide: the TAG scheme.** `distribution.yml` fires on `v*`, so both lines share one tag
+namespace and need a convention that keeps them apart — the DuckDB version is the natural discriminator
+(e.g. `v0.1.0-duckdb1.5.5` vs a main-line equivalent). Nothing in the workflow hardcodes it: the release
+title and notes derive the DuckDB version from the single `DUCKDB_VERSION` env var, and the tag is used
+verbatim. The release is created as a **DRAFT** so a human reviews assets and notes before publishing.
+UNTESTED end-to-end — it has never run, because that needs a real tag push.
+
+**Still to build:** nothing in the tiers themselves. **macOS Gatekeeper is
 a caveat CI structurally cannot cover**: a browser-downloaded `.duckdb_extension` carries
 `com.apple.quarantine`, which can refuse an unsigned dylib, while a runner never quarantines what it
 built. Needs a real Mac and an install-doc note.
