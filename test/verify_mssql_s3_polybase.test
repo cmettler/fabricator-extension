@@ -13,6 +13,14 @@ require fabricator
 
 require httpfs
 
+# §5c writes with `native_write true`, whose data files are produced by a host `COPY ... (FORMAT parquet)`
+# on a fresh connection — so this suite needs the parquet COPY function in the catalog. Declaring it here is
+# load-bearing on a BARE machine: without the directive nothing loads parquet, and the copy-function lookup
+# falls back to autoload-from-DISK, which finds nothing ("Copy Function with name \"parquet\" is not in the
+# catalog"). A developer box passes either way because it has parquet installed under ~/.duckdb — reproduce
+# the bare case with an empty USERPROFILE (see CLAUDE.md).
+require parquet
+
 require-env MSSQL_TESTDB_DSN
 
 require-env FABRICATOR_S3_ENDPOINT
