@@ -43,6 +43,26 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 target_link_libraries(${EXTENSION_NAME} ${CMAKE_DL_LIBS})
 target_link_libraries(${LOADABLE_EXTENSION_NAME} ${CMAKE_DL_LIBS})
 
+# macOS ONLY: export the SECOND entry point too.
+#
+# src/fabricator_extension.cpp defines two entries — `fabricator_duckdb_cpp_init` and
+# `fabricator_core_duckdb_cpp_init` — so ONE binary can be loaded under either file name (DuckDB derives
+# the entry symbol from the FILE NAME, and the single-file distribution needs the chain-loaded core to
+# answer to a different name than the installer that loads it; see the comment on the second entry).
+#
+# On Apple, DuckDB links loadable extensions with hidden visibility, -dead_strip and an explicit
+# ONE-symbol whitelist (duckdb/extension/extension_build_tools.cmake):
+#     set(WHITELIST "-Wl,-exported_symbol,_${NAME}_duckdb_cpp_init")
+# so only _fabricator_duckdb_cpp_init survives and the second entry is stripped — the core then fails to
+# load as fabricator_core.duckdb_extension with "did not contain the expected entrypoint function".
+# Linux (--gc-sections/--exclude-libs) and Windows (dllexport) both keep it, so macOS is the only
+# platform that needs this. ld64 accumulates repeated -exported_symbol flags, so this ADDS to DuckDB's
+# whitelist rather than replacing it. The leading underscore is the Mach-O C symbol prefix.
+if(APPLE)
+    target_link_options(${LOADABLE_EXTENSION_NAME} PRIVATE
+                        "-Wl,-exported_symbol,_${TARGET_NAME}_core_duckdb_cpp_init")
+endif()
+
 target_compile_definitions(${EXTENSION_NAME} PRIVATE FABRICATOR_VERSION="${FABRICATOR_EXTENSION_VERSION}")
 target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE FABRICATOR_VERSION="${FABRICATOR_EXTENSION_VERSION}")
 

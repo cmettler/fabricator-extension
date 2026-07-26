@@ -5100,6 +5100,21 @@ never actually declares, so a passing local run proves nothing about a fresh one
    had been produced correctly by hand many times, and the script was still broken for anyone starting
    from nothing.
 
+5. **The dual entry point — the keystone of the single-file distribution — was silently NOT EXPORTED on
+   macOS (FIXED).** Enabling osx_arm64 in the packaging tier produced a clean build, a clean AOT link and
+   a clean pack, then failed the smoke test: *"Extension … fabricator_core.duckdb_extension did not
+   contain the expected entrypoint function 'fabricator_core_duckdb_cpp_init'"*. Cause is UPSTREAM, in
+   `duckdb/extension/extension_build_tools.cmake`: on Apple a loadable extension is linked with hidden
+   visibility, `-dead_strip`, and an explicit ONE-symbol whitelist
+   `-Wl,-exported_symbol,_${NAME}_duckdb_cpp_init`. Our second entry is therefore stripped. Linux
+   (`--gc-sections`/`--exclude-libs,ALL`) and Windows (`dllexport`) both keep it, so macOS is the ONLY
+   platform where the one-binary-two-filenames trick fails — and it fails at LOAD time, not build time.
+   Fixed in our `CMakeLists.txt` with an APPLE-guarded extra
+   `-Wl,-exported_symbol,_fabricator_core_duckdb_cpp_init` (ld64 accumulates repeated `-exported_symbol`
+   flags, so it adds to DuckDB's whitelist; the leading underscore is the Mach-O C prefix). Worth
+   remembering as a general rule: **anything relying on an exported symbol other than the single blessed
+   entry point needs an explicit macOS whitelist entry.**
+
 ### TWO CONCURRENT RELEASE LINES — releases MUST be distinguishable (requirement, 2026-07-26)
 
 We will ship builds for BOTH lines at once: the current **`v1.5-variegata`** (DuckDB 1.5.x) and an
