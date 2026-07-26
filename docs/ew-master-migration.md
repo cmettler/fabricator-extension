@@ -4,6 +4,12 @@ Branch: `migrate/ew-clast-master` (off `main`). Status: **COMPLETE (2026-07-22) 
 `fabricator-patches` @ `7fecc2b` (pushed), 49/49 suites green, live OneLake/Spark validated.
 Remaining: merge this branch to `main` (user's call) + the Curt upstream bundle.**
 
+> **This is a SNAPSHOT of that migration, not the current patch set.** Two upstream bumps on 2026-07-26
+> shrank the patches from 8 to 4 by diff (four were reimplemented upstream), and the `0bfd020`
+> DeltaFilePruner-public patch named below was RETIRED and replaced by a real `DeltaTable.PlanFiles`
+> API. CLAUDE.md's "EW BUMP" + "`PlanFiles`" subsections are the live record; read this one for the
+> original migration's reasoning only.
+
 ## Compile-stage outcome (supersedes the dry-compile inventory below)
 
 The dry compile had been SHALLOW — the real build surfaced 8 causes, 3 of which needed **additive EW

@@ -311,7 +311,7 @@ internal static class DeltaReader
             var snap = unit is null
                 ? table.CurrentSnapshot
                 : await ResolveSnapshotAsync(table, unit, value ?? "", default).ConfigureAwait(false);
-            return await BuildNativeScanListAsync(fs, path, snap, prune, log, schemaOverride).ConfigureAwait(false);
+            return await BuildNativeScanListAsync(fs, path, table, snap, prune, log, schemaOverride).ConfigureAwait(false);
         }
         finally
         {
@@ -321,35 +321,46 @@ internal static class DeltaReader
 
     // The post-open core of ListNativeScanFilesAsync, callable against an ALREADY-OPEN table's snapshot —
     // the clustered-OPTIMIZE rewrite lists against the SAME snapshot its commit pins (expectedVersion), so
-    // a writer landing between two separate opens can't produce a spurious conflict.
+    // a writer landing between two separate opens can't produce a spurious conflict. `snap` is passed
+    // alongside `table` rather than defaulted from it precisely for that: it may be an AT-version snapshot.
     private static async Task<NativeScanList> BuildNativeScanListAsync(
-        EngineeredWood.IO.ITableFileSystem fs, string path, EngineeredWood.DeltaLake.Snapshot.Snapshot snap,
+        EngineeredWood.IO.ITableFileSystem fs, string path, DeltaTable table,
+        EngineeredWood.DeltaLake.Snapshot.Snapshot snap,
         Predicate? prune, ILogger log, EngineeredWood.DeltaLake.Schema.StructType? schemaOverride)
     {
+        // add.Path is the spec's URL-ENCODED table-relative path; decode it to the on-disk name.
+        static string FileUri(string root, string addPath) =>
+            root + "/" + EngineeredWood.DeltaLake.DeltaPath.Decode(addPath).Replace('\\', '/').TrimStart('/');
         {
             // schemaOverride: a buffered transaction's PENDING (ALTERed) schema — presence handling, mapping
             // maps and pruning key off it so a pending-added column reads as typed NULL from every committed
             // file (the same machinery as committed schema evolution; no stats => pruning stays superset-safe).
             var schemaForMaps = schemaOverride ?? snap.Schema;
             var root = ToReadableRoot(path);
-            // GLOBAL path-sorted ordinal over ALL active files (matches engineered-wood OrderedActiveFiles), then prune.
-            var ordered = new List<AddFile>(snap.ActiveFiles.Values);
-            ordered.Sort((a, b) => string.CompareOrdinal(a.Path, b.Path));
-            var pruner = prune is null ? null : new DeltaFilePruner(schemaForMaps, snap.Metadata.PartitionColumns);
+            // Planning — the path-sorted GLOBAL ordinal and the Delta-log file pruning — belongs to
+            // engineered-wood: the ordinal it hands back is the same one its own row-id encoder uses and its
+            // DML paths DECODE, so `(Ordinal << 40) | file_row_number` cannot drift from what the library
+            // means by a rowid. (We used to re-sort the active set and drive DeltaFilePruner by hand here,
+            // which agreed only by inspection.) schemaOverride rides through as the prune schema so a
+            // buffered transaction's PENDING (ALTERed) column names resolve; unresolvable => file kept.
+            var planned = table.PlanFiles(prune, snap, schemaOverride);
             var dvReader = new DeletionVectorReader(fs);
             var files = new List<NativeScanFile>();
-            string? anyUri = null;
-            int pruned = 0;
-            for (int ordinal = 0; ordinal < ordered.Count; ordinal++)
+            int pruned = snap.ActiveFiles.Count - planned.Count;
+            // AnyUri is PRE-prune BY CONTRACT — it is what the schema probe falls back to when every file
+            // pruned away, exactly the case where `planned` is empty. So take it from the active set, not
+            // from the plan. Path-sorted minimum rather than first-enumerated to keep it deterministic
+            // (it is the same file the old hand-rolled sort picked), in one pass instead of a second sort.
+            string? minPath = null;
+            foreach (var add in snap.ActiveFiles.Values)
             {
-                var add = ordered[ordinal];
-                var uri = root + "/" + EngineeredWood.DeltaLake.DeltaPath.Decode(add.Path).Replace('\\', '/').TrimStart('/');
-                anyUri ??= uri;
-                if (pruner is not null && !pruner.ShouldInclude(add, prune!))
-                {
-                    pruned++;
-                    continue;
-                }
+                if (minPath is null || string.CompareOrdinal(add.Path, minPath) < 0)
+                    minPath = add.Path;
+            }
+            string? anyUri = minPath is null ? null : FileUri(root, minPath);
+            foreach (var (add, ordinal) in planned)
+            {
+                var uri = FileUri(root, add.Path);
                 long[] dv = System.Array.Empty<long>();
                 if (add.DeletionVector is not null)
                 {
@@ -408,7 +419,7 @@ internal static class DeltaReader
                                && ArrowColumnMappingRename.HasNestedFields(schemaForMaps)
                 ? schemaForMaps : null;
             log.LogDebug("delta native list: {Path} v{Version} active={Active} scanned={Scanned} pruned={Pruned} colmap={Map}",
-                path, snap.Version, ordered.Count, files.Count, pruned, mode);
+                path, snap.Version, snap.ActiveFiles.Count, files.Count, pruned, mode);
             return new NativeScanList
             {
                 Version = snap.Version,
@@ -1526,7 +1537,7 @@ internal static class DeltaReader
         var snap = table.CurrentSnapshot;
         // List against the OPEN table's own snapshot (not a second open) so the commit's expectedVersion is
         // exactly the version the rewrite read — a concurrent commit conflicts cleanly instead of racing.
-        var listing = await BuildNativeScanListAsync(fs, path, snap, prune: null, DmlLog, schemaOverride: null)
+        var listing = await BuildNativeScanListAsync(fs, path, table, snap, prune: null, DmlLog, schemaOverride: null)
             .ConfigureAwait(false);
         if (listing.Files.Count == 0)
         {

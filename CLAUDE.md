@@ -115,17 +115,9 @@ The engineered-wood submodule pin moved from our long-lived fork lineage (`99e2c
 `fabricator-patches` branch** (7 commits, pushed to the cmettler fork, pin `7fecc2b`;
 `.gitmodules` `branch = fabricator-patches`). The strategy: fabricator-specific needs live as a
 SMALL upstreamable patch set ON TOP of clast master — never a fork again — so future EW bumps are
-merge-master-into-fabricator-patches + re-pin. What the patches carry: `DeltaFilePruner` public
-(**a replacement was proposed to Curt 2026-07-25 and is awaiting his call**: a `DeltaTable.PlanFiles(filter,
-snapshot, schema) -> IReadOnlyList<PlannedFile>` planning API instead of exposing the pruner class. The
-motivation is not encapsulation — it is that our one call site, `DeltaReader.BuildNativeScanListAsync`, also
-re-implements EW's PRIVATE `OrderedActiveFiles` ordering by hand, and that ordering defines the file ordinal
-in the transient rowid `(ordinal << 40) | position` which EW itself DECODES. Encoded by our copy, decoded by
-theirs, with nothing enforcing agreement; a planner that returns the ordinal deletes that hazard. The
-signature must carry three things or our call site cannot move: the PRE-prune global ordinal, an optional
-prune-schema override (we plan against a buffered txn's pending schema), and a caller-supplied snapshot (the
-clustered-OPTIMIZE rewrite lists against the same snapshot its commit pins). Deliberately NOT async and NOT
-DV-resolving — see the reply for why);
+merge-master-into-fabricator-patches + re-pin. What the patches carry: the **`DeltaTable.PlanFiles`
+planning API** (proposed to Curt 2026-07-25, endorsed, and BUILT by us 2026-07-26 — it REPLACED the
+earlier `DeltaFilePruner`-public patch, which is retired; full record in the `PlanFiles` subsection below);
 create-time `configuration`/`preAssignedSchema`/`materializedRowIds` params; rowid read-back
 `rowIdsOut` correlation + derived-id fallback + CoW CDF capture + partition-aware cdc writes +
 DV-aware CDF inference; schema-evolved compaction fixes; the **narrow-int parquet write-corruption
@@ -242,30 +234,54 @@ self-consistent) — assessed as NOT live for us (we make no `IArrowArray.Slice`
 offset-0 arrays) but a real trap removed, since `ArrowColumnMappingRename` faithfully preserves
 `data.Offset`; `6407c20` two decimal partition defects; `dc1e43b`/`8ef4a7c` `Take` now handles
 list/map/fixed-size-list. **Still NOT implemented upstream: the Delta `PlanFiles` API** — Curt endorsed the
-shape ("yes! This shape is nice") but `DeltaFilePruner` is still `internal` there, so our `0bfd020`
-visibility patch stays necessary until it lands. (The `PlanFiles`/`PlannedFile` hits in upstream are
-**Iceberg**'s pre-existing `TableScan.PlanFiles`, which is probably why the shape landed well — it asks
-Delta to gain the API Iceberg already has.)
+shape ("yes! This shape is nice") but `DeltaFilePruner` is still `internal` there. (The
+`PlanFiles`/`PlannedFile` hits in upstream are **Iceberg**'s pre-existing `TableScan.PlanFiles`, which is
+probably why the shape landed well — it asks Delta to gain the API Iceberg already has.) **We implemented
+it ourselves on 2026-07-26 — see the next subsection; the `0bfd020` visibility patch is now retired.**
 
-**AGREED NEXT EW INCREMENT (not started): implement `PlanFiles` OURSELVES** as a patch on top, then move
-`DeltaReader.BuildNativeScanListAsync` onto it and RETIRE the `0bfd020` pruner-visibility patch — trading a
-visibility hack for a real API Curt has already endorsed, and offering it upstream. The motivation is not
-encapsulation: our call site also re-implements EW's PRIVATE `OrderedActiveFiles` ordering by hand, and that
-ordering defines the file ordinal in the transient rowid `(ordinal << 40) | position` which EW itself DECODES
-— encoded by our copy, decoded by theirs, with nothing enforcing agreement. A planner that returns the ordinal
-deletes that hazard. The signature must carry three things or our call site cannot move: the **PRE-prune**
-global ordinal (a pruned file still consumes its position — the rowid domain is the full active set), an
-optional **prune-schema override** (we plan against a buffered txn's PENDING schema; correctness is fine
-either way since an unresolvable reference keeps the file, but after a pending RENAME a predicate on the new
-name prunes nothing without it), and a **caller-supplied snapshot** (clustered OPTIMIZE lists against the same
-snapshot its commit pins as `expectedVersion`, so a writer landing between two opens cannot manufacture a
-conflict). Deliberately NOT async and NOT DV-resolving — we take DV positions from the already-public
-`DeletionVectorReader` and push them into DuckDB as `file_row_number NOT IN (…)`. Do this as its OWN
-increment, never bundled with an upstream bump: one variable at a time is what made every failure legible.
+#### `PlanFiles` — DONE (2026-07-26, EW + Bridge): the pruner-visibility patch is RETIRED, replaced by a real API
 
-**Minor cruft to clear:** `test/EngineeredWood.DeltaLake.Table.Tests/MigrateRepro.cs` (+58) is a leftover
-scratch repro sitting in our EW patch diff. Delete it in its own commit — it is noise in anything we send
-upstream.
+`DeltaTable.PlanFiles(filter?, snapshot?, pruneSchema?) -> IReadOnlyList<PlannedFile>` (new
+`PlannedFile.cs`: a `readonly record struct (AddFile File, int Ordinal)`) returns the snapshot's
+active files **path-sorted, each carrying its ordinal, with provably-matchless files pruned out** —
+the Delta counterpart of Iceberg's `TableScan.PlanFiles`, in the shape Curt endorsed. Sync and NOT
+DV-resolving by design (everything it needs is already in the snapshot; resolving DVs means I/O,
+which we do ourselves from the returned `add`s). All three load-bearing parameters are there: the
+**PRE-prune** ordinal (pruning leaves GAPS, so two plans over one snapshot agree regardless of their
+filters — a filter must not change what a rowid means), the **prune-schema override** (a buffered
+txn's PENDING schema), and the **caller-supplied snapshot**.
+
+**Why it is a correctness fix, not tidying.** Our `DeltaReader.BuildNativeScanListAsync` re-sorted the
+active set and drove `DeltaFilePruner` by hand, so the ordinal in `(ordinal << 40) | file_row_number`
+was **encoded by our copy of the rule and decoded by EW's** (`ComputeDeletionVectorActionsAsync`,
+`ReadRowsByRowIdsAsync`), with nothing enforcing agreement — a THIRD site being EW's own encoder in
+`ReadWithTransientRowIdsAsync`. That method is now also on `PlanFiles`, so the planner is the single
+source of the ordering and the drift is structurally impossible. `0bfd020` (pruner `public`) is
+reverted — the class is `internal` again, matching upstream, with only a doc paragraph pointing at
+`PlanFiles`; `InternalsVisibleTo` already covered EW's own `NestedStatsPruningTests`.
+
+**One regression caught in review, worth remembering: `NativeScanList.AnyUri` is PRE-prune by
+contract** — it is the schema probe's fallback *when every file pruned away*, i.e. exactly when
+`PlanFiles` returns empty. Taking it from the plan silently broke that; it now comes from the active
+set directly (path-sorted minimum in one pass, so it is still the same file and still deterministic).
+A planner that returns only survivors cannot serve a pre-prune question.
+
+**Also fixed en route — our variant patch had re-broken the net472 test build.** Upstream's `8ac71a9`
+deliberately restored it, and `VariantTransportTests.cs:190` used an array range indexer (`blob[n..]`),
+which lowers to `RuntimeHelpers.GetSubArray` — absent on net472 (CS0656). Pre-existing (proven by
+building a pristine HEAD), invisible because the gates ran net10.0/net8.0. Now `System.Array.Copy`
+(`System.` qualified — bare `Array` is `Apache.Arrow.Array` in that file), and **Table.Tests runs 523
+on ALL THREE TFMs including net472**, which previously did not compile. Anything we send upstream has
+to build on the TFMs upstream declares.
+
+`PlanFilesTests` (7) pins the properties that justify the API: dense ordinals unfiltered + path-sorted
+order; the pre-prune ordinal survives a prune (a post-prune implementation would report 0 whenever one
+file survives); ordinals agree across filters; **an ordinal decoded from a rowid names the file that
+actually HOLDS the row** — asserted against file CONTENT (the add's recorded min/max must bracket the
+row's id, and the three id ranges are disjoint) rather than against another ordinal, because once EW's
+own encoder moved onto `PlanFiles` an ordinal-vs-ordinal check would only compare the API with itself;
+caller-supplied snapshot; the prune-schema override changing whether a reference resolves; no active
+files. Gates: EW Table.Tests **523** × {net10.0, net8.0, net472}.
 
 **Gates:** EW Table.Tests **517** (was 444) / DeltaLake 211 / Expressions 139 / the NEW `Core.Tests` **430**,
 all green; EW builds 0 warnings. Fabricator hermetic 53/53 @ **4152 (unchanged)** and service 42/42 @ 1227 —
@@ -5126,6 +5142,14 @@ are missing.
 - **VS 18 is NOT an absolute requirement** (correcting the reference bullet above): the local failure is
   a MIXED-toolset artifact — configure with VS 18's STL, link with VS 2022. CI compiles and links with
   one toolset and the runner image's own works fine.
+- **A path filter must list the SUBMODULE POINTER, or a pin bump runs no CI.** `extension.yml` listed
+  `.gitmodules` but not `engineered-wood`, so bumping the Delta engine — the highest-risk change we make
+  — matched nothing. Both 2026-07-26 bumps ran only because they happened to touch `dotnet/` too; the
+  test-deletion bump (`70528db`) ran nothing at all. A gitlink appears in the diff as that exact path, so
+  the pattern is `engineered-wood`, NOT `engineered-wood/**` (there are no files under it from the parent
+  repo's point of view). `duckdb` + `extension-ci-tools` are listed for the same reason — cheaper than
+  reasoning about whether a bump happens to co-edit `extension_config.cmake`. `DuckDB.ExtensionKit` is
+  deliberately absent: tier 1 never compiles it, only the dispatch-triggered packaging tier does.
 
 **Reproducing a bare runner locally — the single most useful trick here.** Point the profile at an
 empty directory so no extensions are installed on disk:
