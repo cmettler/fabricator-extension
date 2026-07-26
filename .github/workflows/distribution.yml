@@ -16,11 +16,18 @@
 #      submodule directory, which shadows the `duckdb` python module and makes `import duckdb` resolve
 #      to a source tree with no extension support.
 #
-# macOS is deliberately absent for now: the AOT shell would need publishing there, and the one thing
-# that actually matters for a downloaded artifact on macOS — Gatekeeper refusing an unsigned dylib
-# carrying com.apple.quarantine — is something CI structurally cannot test, because a runner never
-# quarantines what it built itself. That needs a real Mac. There is also an open macOS defect
-# (verify_global_functions) that should be fixed before shipping a macOS artifact.
+# macOS IS built here (the open osx_arm64 defect that used to block it is fixed and green in Tier 1), and
+# it runs exactly the same pack + smoke as the others — that is the part which "makes sense" to automate:
+# the AOT shell links, the polyglot artifact is assembled, and a STOCK DuckDB wheel loads it from an empty
+# extension directory with zero env vars.
+#
+# What CI structurally CANNOT cover on macOS, and is therefore NOT claimed by a green run here:
+#   * Gatekeeper. A runner never quarantines what it built itself, so `com.apple.quarantine` on a
+#     browser-downloaded artifact is only reproducible on a real Mac.
+#   * Code signing / notarization. Needs a paid Developer ID, and there is an open question whether a
+#     signed Mach-O even tolerates our polyglot append (codesign covers the file; DuckDB's footer must be
+#     the LAST bytes). Probe with an ad-hoc `codesign -s -` + `codesign --verify --strict` before buying
+#     anything — see the signing notes in CLAUDE.md.
 
 name: distribution
 
@@ -68,6 +75,15 @@ jobs:
             triplet: x64-linux
             sku: Standard
             managed_mode: Framework
+          # macOS takes the Standalone SKU for the same reason Windows does: it is a developer machine,
+          # not a Fabric notebook, so shipping the runtime beats requiring a .NET install. See the header
+          # for what a green macOS run does and does NOT prove (Gatekeeper and signing are out of scope).
+          - os: macos-latest
+            platform: osx_arm64
+            rid: osx-arm64
+            triplet: arm64-osx
+            sku: Standalone
+            managed_mode: SelfContained
     runs-on: ${{ matrix.os }}
     name: ${{ matrix.platform }} (${{ matrix.sku }})
     timeout-minutes: 150
@@ -91,17 +107,26 @@ jobs:
           override-git-describe: ${{ env.DUCKDB_VERSION }}
 
       - name: Pack the single-file artifact
+        # shell: pwsh, NOT the workflow default `bash`. On Windows the bash shell is Git Bash, whose PATH
+        # puts GNU coreutils ahead of the MSVC tools — so NativeAOT's `link @link.rsp` resolved to
+        # coreutils `link` (the hardlink utility: "extra operand ... Try 'link --help'") and the AOT
+        # publish failed before packing even started. We pass IlcUseEnvironmentalTools=true, which tells
+        # ILC to take the linker from PATH, so PATH ordering is load-bearing; pwsh inherits the PATH the
+        # build action exported from vcvars, with MSVC first. The step invokes a .ps1 either way, so the
+        # bash -> pwsh hop bought nothing. The `link` probe below makes a recurrence self-diagnosing.
+        shell: pwsh
         # -SkipCore/-SkipManaged: the composite action already built both, with the SKU's managed mode.
         # The script still does the AOT publish, the deterministic payload, the polyglot append and the
         # DuckDB footer. -WithNegatives emits the failure-path artifacts the harness needs, as
         # PER-PLATFORM siblings — a Windows negative on linux proves nothing, because DuckDB checks the
         # footer's platform before any extension code runs (that produced two falsely-green passes once).
         run: |
-          pwsh -NoProfile -File scripts/pack-distribution.ps1 \
-            -Sku ${{ matrix.sku }} \
-            -Rid ${{ matrix.rid }} \
-            -Platform ${{ matrix.platform }} \
-            -DuckDbVersion ${{ env.DUCKDB_VERSION }} \
+          if ($IsWindows) { "link resolves to: $((Get-Command link -ErrorAction SilentlyContinue).Source)" }
+          ./scripts/pack-distribution.ps1 `
+            -Sku ${{ matrix.sku }} `
+            -Rid ${{ matrix.rid }} `
+            -Platform ${{ matrix.platform }} `
+            -DuckDbVersion ${{ env.DUCKDB_VERSION }} `
             -SkipCore -SkipManaged -WithNegatives
 
       - name: Smoke-test against a stock DuckDB wheel
@@ -115,7 +140,13 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: fabricator-${{ matrix.platform }}-${{ matrix.sku }}
+          # The DuckDB version is IN the artifact name on purpose. We will ship two lines concurrently
+          # (v1.5-variegata and a future `main`), and the shipped FILE cannot carry a version — DuckDB
+          # derives an extension's entry symbol from its filename, so it must stay exactly
+          # `fabricator.duckdb_extension`. The distinguishing information therefore has to ride the
+          # container: this artifact name, and later the release tag + asset name. See CLAUDE.md
+          # "TWO CONCURRENT RELEASE LINES".
+          name: fabricator-${{ env.DUCKDB_VERSION }}-${{ matrix.platform }}-${{ matrix.sku }}
           path: build/distribution/${{ matrix.platform }}/fabricator.duckdb_extension
           if-no-files-found: error
           # Compresses poorly (the payload is already a zip) and it is large, so keep it briefly.

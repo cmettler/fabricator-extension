@@ -92,10 +92,16 @@ $shellName = if ($Rid -like 'win-*') { 'Fabricator.Installer.dll' }
              else { 'Fabricator.Installer.so' }
 # The platform segment ('x64') is present or absent depending on how the build was invoked, so probe
 # rather than assume: a Windows publish lands under bin/x64/Release, a WSL one under bin/Release.
-$shellLibrary = @(
-    (Join-Path $shellProject "bin/x64/Release/net10.0/$Rid/publish/$shellName"),
-    (Join-Path $shellProject "bin/Release/net10.0/$Rid/publish/$shellName")
-) | Where-Object { Test-Path $_ } | Select-Object -First 1
+# MUST be called AFTER the publish below, never before: on a clean machine the file does not exist yet,
+# so an up-front probe yields $null and the "not found" guard fires even though the publish succeeded.
+# (That is precisely how this passed for months on developer boxes — a PREVIOUS publish had left the
+# file there — and failed on the first clean CI runner.)
+function Resolve-ShellLibrary {
+    @(
+        (Join-Path $shellProject "bin/x64/Release/net10.0/$Rid/publish/$shellName"),
+        (Join-Path $shellProject "bin/Release/net10.0/$Rid/publish/$shellName")
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+}
 
 $artifact = Join-Path $OutputDirectory 'fabricator.duckdb_extension'
 $combined = Join-Path $OutputDirectory 'fabricator.combined'
@@ -128,6 +134,7 @@ if (-not $SkipShell) {
     & dotnet publish $shellProject -c Release -r $Rid -p:IlcUseEnvironmentalTools=true --nologo
     if ($LASTEXITCODE -ne 0) { throw 'dotnet publish (AOT) failed' }
 }
+$shellLibrary = Resolve-ShellLibrary   # resolve AFTER publishing — see the note on the function
 if (-not $shellLibrary) {
     throw "Installer shell ($shellName for $Rid) not found — publish it on a $Rid machine first: " +
           "dotnet publish dotnet/Fabricator.Installer -c Release -r $Rid"

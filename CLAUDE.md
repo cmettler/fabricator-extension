@@ -4955,10 +4955,11 @@ commits do not compile DuckDB:
 logs rather than the status tick. **Tier 2 green** (`30192508662`) — 42/42 / 1221, nothing skipped,
 `verify_mssql_s3_polybase` at its full 252. Both defects that the first CI runs surfaced (the macOS
 `ArrowProducer` use-after-free and the undeclared `require parquet`) are fixed and confirmed IN CI, not
-merely locally — a distinction this repo's history says to insist on. **`distribution.yml` remains the
-only tier never executed**, and it is the one whose failure modes the others structurally cannot reach:
-NativeAOT publish, the polyglot append, and the version gate against a stock DuckDB wheel (plus it is the
-only tier that REQUIRES `OVERRIDE_GIT_DESCRIBE` — the very flag that broke Tier 1 when set).
+merely locally — a distinction this repo's history says to insist on. **`distribution.yml` ran for the
+first time (`30193881119`) and FAILED on both platforms** — not in the exotic machinery it exists to
+cover (NativeAOT publish, the polyglot append, the version gate against a stock wheel) but in the pack
+script's own ordering: it probed for the installer shell before building it (finding 4 below). The build
+and the AOT publish both succeeded, so the tier is close, but it is NOT yet proven end-to-end.
 
 **Suite selection is DERIVED, never a hand-kept list** — `scripts/list-hermetic-suites.sh` and
 `scripts/list-service-suites.sh` classify by the `require-env`/`require` directives each suite
@@ -5017,9 +5018,11 @@ five suites that passed **only** because this machine happens to have
 `~/.duckdb/extensions/v1.5.5/windows_amd64/parquet.duckdb_extension`. (Beware `HOME` under Git Bash: it
 is `/z/`, NOT the Windows profile, so a bare `ls ~/.duckdb` misleads.)
 
-**Two latent bugs CI found in its first hours, both destruction-order, both invisible on Windows** —
-the pattern to expect from a new platform, and the reason a passing platform proves nothing about this
-class of defect:
+**Four defects CI found in its first hours — every one of them invisible on a developer box** (two
+destruction-order bugs that only a different allocator faults on, and two "works because of prior
+state" bugs that only a CLEAN machine reveals). The through-line: an environment that already has what
+you need — an installed extension, a previous build's output — silently satisfies a dependency the code
+never actually declares, so a passing local run proves nothing about a fresh one:
 1. **Aggregate state destructor = use-after-free (FIXED).** `PhysicalOperator::sink_state` is a
    BASE-class member while the bound aggregate expressions owning the `FunctionData` are derived
    members, so at plan teardown the bind data is already freed when the state destructor dereferences
@@ -5085,9 +5088,49 @@ class of defect:
    because it has parquet under `~/.duckdb`. Adding the directive does not change the derived
    classification (still 53 hermetic / 42 service; the classifier keys on `require-env`).
 
-**Still to build:** a release job (attach `pack-distribution.ps1` output to a GitHub release). The
-packaging tier itself EXISTS now as `distribution.yml` (dispatch + `v*` tags) but has never been run —
-its first run is unvalidated, and it is the one tier that DOES need `OVERRIDE_GIT_DESCRIBE`. **macOS Gatekeeper is
+4. **The packaging tier could never have worked on a clean machine — `pack-distribution.ps1` probed for
+   its own build output BEFORE producing it (FIXED).** `$shellLibrary` was resolved at the top of the
+   script, then the NativeAOT publish ran ~40 lines later; on a machine with no previous publish the
+   probe returned `$null` and the script threw *"Installer shell (Fabricator.Installer.so for linux-x64)
+   not found — publish it on a linux-x64 machine first"* immediately after that very publish printed
+   `Generating native code` and succeeded. Every prior run — mine, and the WSL linux build — passed only
+   because an earlier publish had left the file on disk. The probe is now a `Resolve-ShellLibrary`
+   function called AFTER the publish step. Both jobs fail identically, so it is one fix for both
+   platforms. This is the single best argument for having built the packaging tier at all: the artifact
+   had been produced correctly by hand many times, and the script was still broken for anyone starting
+   from nothing.
+
+### TWO CONCURRENT RELEASE LINES — releases MUST be distinguishable (requirement, 2026-07-26)
+
+We will ship builds for BOTH lines at once: the current **`v1.5-variegata`** (DuckDB 1.5.x) and an
+upcoming **`main`** tracking duckdb `main` (the next, unreleased version). A user must be able to tell
+which artifact belongs to which line, and must not be able to grab the wrong one by accident.
+
+**The constraint that decides the design: the shipped file CANNOT be renamed.** DuckDB derives an
+extension's entry symbol from its FILENAME (proved during the distribution work — the identical bytes
+that load as `fabricator.duckdb_extension` fail as `fabricator_core.duckdb_extension`), so the installer
+shell must stay exactly `fabricator.duckdb_extension`. A version can therefore never be encoded in the
+extension's own filename; it must ride the CONTAINER — release tag, release-asset grouping, artifact
+name, download directory.
+
+What already protects users, for free: the artifact footer records the DuckDB version
+(`OVERRIDE_GIT_DESCRIBE`), a stock DuckDB checks it BEFORE any extension code runs, and the installer's
+own gate re-checks version+platform against its manifest. So a 1.5.5 artifact loaded into a main-line
+DuckDB fails with a friendly error rather than misbehaving — the safety property holds; what is missing
+is only human-facing labelling.
+
+**Known gap, not yet fixed:** `distribution.yml` uploads `fabricator-<platform>-<sku>`, which encodes
+NEITHER the DuckDB version nor the line — two lines would produce colliding, indistinguishable names.
+Fix when the release job lands: put the DuckDB version (and/or the line) in the artifact name and the
+release tag, e.g. `fabricator-v1.5.5-linux_amd64-Standard`. Note also that `distribution.yml` fires on
+`v*` tags, so a shared tag namespace across both lines needs a scheme that keeps them apart (the DuckDB
+version is the natural discriminator, since the artifact is already one-per-DuckDB-version × platform ×
+SKU). Deliberately NOT invented here — decide it with the release job so tag, artifact and asset names
+are chosen together rather than drifting apart.
+
+**Still to build:** a release job (attach `pack-distribution.ps1` output to a GitHub release), which is
+where the two-line naming above must be settled. The packaging tier itself EXISTS as `distribution.yml`
+(dispatch + `v*` tags) and is the one tier that DOES need `OVERRIDE_GIT_DESCRIBE`. **macOS Gatekeeper is
 a caveat CI structurally cannot cover**: a browser-downloaded `.duckdb_extension` carries
 `com.apple.quarantine`, which can refuse an unsigned dylib, while a runner never quarantines what it
 built. Needs a real Mac and an install-doc note.
