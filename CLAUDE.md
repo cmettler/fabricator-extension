@@ -204,6 +204,56 @@ failures, ALL `DirectoryNotFoundException` on `parquet-testing/data` — the nes
 not init (115 failures, 115 mentions of that path); zero regressions. Plus the full fabricator hermetic +
 service sweeps.
 
+#### EW BUMP 2026-07-26 (second, same day) — clast master `8ef4a7c`: FOUR OF OUR PATCHES ARE NOW UPSTREAM; pin `4588594`
+
+Curt reimplemented four of the eight patches we were carrying, so **the patch set shrinks 8 → 4 by diff**
+(the commits stay in history — a merge does not remove them; the honest measure is
+`git diff upstream/master..HEAD`, which is also what a PR would show). This is the fork-avoidance strategy
+working exactly as intended.
+
+All **6 conflicts** sat precisely where upstream had reimplemented us, and every one was resolved by TAKING
+UPSTREAM: `ColumnChunkWriter` (`ee7ee02` → `6eff6c4`, and upstream's is BETTER — it guards on
+Int8/UInt8/Int16/UInt16 where ours widened every Int32-physical array and relied on the helper to no-op, and
+it uses the shared `ArrowCompute.Widen`); `CompactionExecutor` + `ColumnMappingRecursive` + `SchemaEvolution`
+(**comment-only** conflicts — the code was identical on both sides); `ValueWidener` (rewritten onto
+`ArrowCompute`); `CdfReader` (our DV-inference part → `ac9a003`, better factored with a shared
+`DeletionVectorReader`; upstream already carried the partition re-add too).
+
+**A trap worth remembering: `git checkout --theirs <file>` takes the whole FILE, not just the conflicted
+hunks** — so it silently discards our non-conflicting edits to that file. Before overwriting each one we
+verified that the ONLY commits touching it were the superseded ones; none is touched by `7fecc2b` (variant
+transport), `d8b041e` (row-level remap), `6ddfcc1` (create-time seams) or `0bfd020` (pruner public).
+
+**One deliberate behaviour change, settled empirically.** Upstream's `WidenBatch` returns
+`new Schema(fields, null)`; ours preserved `batch.Schema.Metadata` (the pre-merge base used `targetSchema`
+wholesale — the bug both sides fixed). We took upstream rather than carry a one-line permanent conflict
+point, and the suites decided it: `variant` at its full 144 is the case where schema-level metadata would
+bite, and it passes — the variant tag rides FIELD metadata, so schema-level metadata is unused on our paths.
+
+**BREAKING API, migrated in the same increment:** `04eaac4` consolidated four row-take implementations into
+**`EngineeredWood.Arrow.ArrowCompute`** and deleted `DeletionVectorFilter.TakeRowsPublic` (a seam that
+existed for us). Fabricator called it at two sites — `DeltaReader` (the merge-on-read post-image build) and
+`DeltaTxnBuffer` (the pending-delete exclusion) — now on `ArrowCompute.Take(IArrowArray, List<int>)`, same
+signature. `EngineeredWood.Core` reaches the Bridge transitively through `DeltaLake.Table`, so no new
+reference was needed. **This is a compile break, not a deprecation: it must land WITH the pin bump.**
+
+Also inherited: `72c128f` sliced Arrow columns wrote the WRONG ROWS (nulls right, values wrong,
+self-consistent) — assessed as NOT live for us (we make no `IArrowArray.Slice` calls and DuckDB hands us
+offset-0 arrays) but a real trap removed, since `ArrowColumnMappingRename` faithfully preserves
+`data.Offset`; `6407c20` two decimal partition defects; `dc1e43b`/`8ef4a7c` `Take` now handles
+list/map/fixed-size-list. **Still NOT implemented upstream: the Delta `PlanFiles` API** — Curt endorsed the
+shape ("yes! This shape is nice") but `DeltaFilePruner` is still `internal` there, so our `0bfd020`
+visibility patch stays necessary until it lands. (The `PlanFiles`/`PlannedFile` hits in upstream are
+**Iceberg**'s pre-existing `TableScan.PlanFiles`, which is probably why the shape landed well — it asks
+Delta to gain the API Iceberg already has.)
+
+**Gates:** EW Table.Tests **517** (was 444) / DeltaLake 211 / Expressions 139 / the NEW `Core.Tests` **430**,
+all green; EW builds 0 warnings. Fabricator hermetic 53/53 @ **4152 (unchanged)** and service 42/42 @ 1227 —
+the unchanged hermetic count being the signal that the bump is behaviour-neutral for everything we pin.
+Merged with a **fast-forward, never a force-push**: the release tag `v0.0.1-duckdb1.5.5` pins `253e834`, and
+orphaning that commit would make the tagged release unbuildable from source (`git submodule update` cannot
+reliably fetch an unreachable sha). Verified `253e834` is still an ancestor after the merge.
+
 ## Architecture (layered for reuse)
 
 Layered so a future **Power BI / DAX** connector reuses the same C++ core + managed bridge:

@@ -284,10 +284,10 @@ internal sealed class DeltaTxnBuffer
             var columns = new List<IArrowArray>(outCols);
             for (int c = 0; c < outCols; c++)
             {
+                // ArrowCompute.Take replaced DeletionVectorFilter.TakeRowsPublic (EW 04eaac4); same signature.
                 columns.Add(keep.Count == batch.Length
                     ? batch.Column(c)
-                    : EngineeredWood.DeltaLake.DeletionVectors.DeletionVectorFilter.TakeRowsPublic(
-                        batch.Column(c), keep));
+                    : EngineeredWood.Arrow.ArrowCompute.Take(batch.Column(c), keep));
             }
             yield return new RecordBatch(outSchema, columns, keep.Count);
         }

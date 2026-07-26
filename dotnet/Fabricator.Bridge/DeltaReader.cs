@@ -2097,8 +2097,10 @@ internal static class DeltaReader
                 var f = b.Schema.FieldsList[c];
                 preFields.Add(f);
                 preArrays.Add(b.Column(c));
+                // ArrowCompute.Take replaced DeletionVectorFilter.TakeRowsPublic (EW 04eaac4 consolidated
+                // four row-take implementations into one shared primitive); same signature.
                 postArrays.Add(setCols.TryGetValue(f.Name, out var upd)
-                    ? EngineeredWood.DeltaLake.DeletionVectors.DeletionVectorFilter.TakeRowsPublic(upd, takeIdx)
+                    ? EngineeredWood.Arrow.ArrowCompute.Take(upd, takeIdx)
                     : b.Column(c));
             }
             var userSchema = new Apache.Arrow.Schema(preFields, null);
