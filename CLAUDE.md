@@ -247,6 +247,26 @@ visibility patch stays necessary until it lands. (The `PlanFiles`/`PlannedFile` 
 **Iceberg**'s pre-existing `TableScan.PlanFiles`, which is probably why the shape landed well — it asks
 Delta to gain the API Iceberg already has.)
 
+**AGREED NEXT EW INCREMENT (not started): implement `PlanFiles` OURSELVES** as a patch on top, then move
+`DeltaReader.BuildNativeScanListAsync` onto it and RETIRE the `0bfd020` pruner-visibility patch — trading a
+visibility hack for a real API Curt has already endorsed, and offering it upstream. The motivation is not
+encapsulation: our call site also re-implements EW's PRIVATE `OrderedActiveFiles` ordering by hand, and that
+ordering defines the file ordinal in the transient rowid `(ordinal << 40) | position` which EW itself DECODES
+— encoded by our copy, decoded by theirs, with nothing enforcing agreement. A planner that returns the ordinal
+deletes that hazard. The signature must carry three things or our call site cannot move: the **PRE-prune**
+global ordinal (a pruned file still consumes its position — the rowid domain is the full active set), an
+optional **prune-schema override** (we plan against a buffered txn's PENDING schema; correctness is fine
+either way since an unresolvable reference keeps the file, but after a pending RENAME a predicate on the new
+name prunes nothing without it), and a **caller-supplied snapshot** (clustered OPTIMIZE lists against the same
+snapshot its commit pins as `expectedVersion`, so a writer landing between two opens cannot manufacture a
+conflict). Deliberately NOT async and NOT DV-resolving — we take DV positions from the already-public
+`DeletionVectorReader` and push them into DuckDB as `file_row_number NOT IN (…)`. Do this as its OWN
+increment, never bundled with an upstream bump: one variable at a time is what made every failure legible.
+
+**Minor cruft to clear:** `test/EngineeredWood.DeltaLake.Table.Tests/MigrateRepro.cs` (+58) is a leftover
+scratch repro sitting in our EW patch diff. Delete it in its own commit — it is noise in anything we send
+upstream.
+
 **Gates:** EW Table.Tests **517** (was 444) / DeltaLake 211 / Expressions 139 / the NEW `Core.Tests` **430**,
 all green; EW builds 0 warnings. Fabricator hermetic 53/53 @ **4152 (unchanged)** and service 42/42 @ 1227 —
 the unchanged hermetic count being the signal that the bump is behaviour-neutral for everything we pin.
@@ -5249,12 +5269,27 @@ asset names must be unique within a release. A versioned ZIP satisfies both: the
 distinguishes platform/SKU/DuckDB version (hence the line), the file inside keeps the mandatory name, and
 the release notes say "do not rename it".
 
-**Still yours to decide: the TAG scheme.** `distribution.yml` fires on `v*`, so both lines share one tag
-namespace and need a convention that keeps them apart — the DuckDB version is the natural discriminator
-(e.g. `v0.1.0-duckdb1.5.5` vs a main-line equivalent). Nothing in the workflow hardcodes it: the release
-title and notes derive the DuckDB version from the single `DUCKDB_VERSION` env var, and the tag is used
-verbatim. The release is created as a **DRAFT** so a human reviews assets and notes before publishing.
-UNTESTED end-to-end — it has never run, because that needs a real tag push.
+**TAG SCHEME — DECIDED + PROVEN END-TO-END (2026-07-26).** Format **`v<fabricator>-duckdb<duckdbversion>`**,
+first tag `v0.0.1-duckdb1.5.5`, with one rule that makes it safe: **never publish a bare `vX.Y.Z`.** SemVer
+reads the `-` suffix as a PRERELEASE, so a bare `v0.0.1` would sort ABOVE it; with the suffix always present,
+ordering within a line stays correct (`v0.1.0-duckdb1.5.5` > `v0.0.1-duckdb1.5.5`) and the two lines stay
+distinguishable in the one `v*` namespace the trigger requires. `+duckdb…` would be the semantically correct
+SemVer (build metadata) but `+` is %-encoded in URLs and most tooling IGNORES build metadata when comparing,
+so the two lines would compare EQUAL — not worth the purity. Use the real DuckDB version for the future line
+(`v0.0.1-duckdb1.6.0`), never `-duckdbmain`: a moving target makes a poor release identity. `0.0.1` because
+that is what the binary reports (`fabricator_version()` + the footer) — tagging a number the artifact does not
+claim mislabels the release against its own contents. Nothing in the workflow hardcodes the tag: title and
+notes derive the DuckDB version from the single `DUCKDB_VERSION` var; the tag is used verbatim.
+
+**Release status:** a **DRAFT** `v0.0.1-duckdb1.5.5` exists (3 platforms + the release job green, three
+versioned ZIPs at 40/60/62 MB, notes rendering correctly), built from `c2af48a`. **Unpublished — publishing
+is a human decision.** It was retagged from `0eadd00` onto `c2af48a` deliberately: the earlier tree lacked the
+first EW bump's two silent-corruption fixes (the UTF-16-vs-UTF-8 comparator that could make pruning SKIP a
+file containing matching rows, and stats truncation splitting a surrogate pair). Since `01994fb` it is ONE PIN
+BEHIND, but the second bump carries no confirmed correctness fix for our paths, so it is publishable on the
+merits — re-tag only if you want the currency. Deleting a draft + moving a tag is safe **while nothing has
+been published**; that is also why reusing the `v0.0.1` name was correct rather than bumping to `0.0.2` (no
+released bytes were being redefined).
 
 **Still to build:** nothing in the tiers themselves. **macOS Gatekeeper is
 a caveat CI structurally cannot cover**: a browser-downloaded `.duckdb_extension` carries
