@@ -183,14 +183,16 @@ if ($WithNegatives) {
         --duckdb-version 'v0.0.0' --platform $Platform --fabricator-version $FabricatorVersion | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'packing the version-mismatch artifact failed' }
     & python $metadataScript -l $wrongCombined -o (Join-Path $wrongDirectory 'fabricator.duckdb_extension') `
-        -n fabricator -p $Platform -dv $CApiVersion -ev 'v0.0.1' --abi-type C_STRUCT | Out-Null
+        -n fabricator -p $Platform -dv $CApiVersion -ev "v$($FabricatorVersion.TrimStart('v'))" `
+        --abi-type C_STRUCT | Out-Null
     Remove-Item $wrongCombined, (Join-Path $wrongDirectory 'payload.zip') -Force -ErrorAction SilentlyContinue
 
     # The bare shell with a footer and nothing appended: exercises "this carries no payload".
     $bareDirectory = Join-Path $OutputDirectory '_nopayload'
     New-Item -ItemType Directory -Force -Path $bareDirectory | Out-Null
     & python $metadataScript -l $shellLibrary -o (Join-Path $bareDirectory 'fabricator.duckdb_extension') `
-        -n fabricator -p $Platform -dv $CApiVersion -ev 'v0.0.1' --abi-type C_STRUCT | Out-Null
+        -n fabricator -p $Platform -dv $CApiVersion -ev "v$($FabricatorVersion.TrimStart('v'))" `
+        --abi-type C_STRUCT | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'packing the payload-less artifact failed' }
 
     Write-Host "negatives: $wrongDirectory, $bareDirectory"

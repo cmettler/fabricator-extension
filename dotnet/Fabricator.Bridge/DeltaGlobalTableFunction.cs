@@ -761,6 +761,61 @@ internal static class DeltaWriter
             : new List<WrittenDataFile>();
     }
 
+    /// <summary>
+    /// Rejects Arrow timestamp units that have no faithful Delta encoding. Delta timestamps are MICROSECOND,
+    /// and parquet has only MILLIS/MICROS/NANOS — so a SECOND-unit column would be stored unchanged under a
+    /// micros annotation and read back a million times too small, and a NANOSECOND column cannot be stored
+    /// without discarding its sub-microsecond digits. Millisecond is fine (MILLIS exists).
+    /// </summary>
+    /// <remarks>
+    /// engineered-wood refuses both at ITS write sites, but that guard CANNOT fire on our native_write path:
+    /// there the data files are produced by DuckDB's COPY and EW only ever sees the finished files
+    /// (CommitDataFilesAsync), never the Arrow batches. DuckDB's parquet writer DOES support NANOS, so
+    /// without this check a native_write would emit a NANOS-annotated file inside a table whose Delta schema
+    /// declares micros — readable by DuckDB, wrong for every other reader. Hence we check the schema on our
+    /// side of the boundary.
+    /// <para>
+    /// This is reachable, not theoretical: the SQL Server provider maps datetime2(7)/time(7) to Arrow
+    /// NANOSECOND (SqlArrowMapping), so `CREATE TABLE lake.s.t AS SELECT * FROM sqldb.dbo.&lt;datetime2(7)&gt;`
+    /// lands here. Like EW we REFUSE rather than round: which rounding is correct is the caller's decision.
+    /// </para>
+    /// </remarks>
+    internal static void EnsureTimestampUnitsWritable(Schema schema)
+    {
+        foreach (var f in schema.FieldsList)
+        {
+            var unit = FindUnsupportedTimestampUnit(f.DataType);
+            if (unit is null)
+            {
+                continue;
+            }
+            var why = unit == Apache.Arrow.Types.TimeUnit.Second
+                ? "parquet has no second-precision timestamp unit, so the values would be stored unchanged "
+                  + "under a microsecond annotation and read back a million times too small"
+                : "Delta timestamps are microsecond precision, so the sub-microsecond digits would be lost";
+            throw new System.NotSupportedException(
+                $"Column \"{f.Name}\" is an Arrow {unit} timestamp, which cannot be written to Delta: {why}. "
+                + "CAST it to a microsecond TIMESTAMP first, choosing the rounding yourself — e.g. "
+                + "CAST(ts AS TIMESTAMP). (SQL Server datetime2(7)/time(7) arrive as NANOSECOND.)");
+        }
+    }
+
+    // Recurses into struct/list/map: a nested nanosecond timestamp is just as unwritable as a top-level one.
+    private static Apache.Arrow.Types.TimeUnit? FindUnsupportedTimestampUnit(
+        Apache.Arrow.Types.IArrowType type) => type switch
+    {
+        Apache.Arrow.Types.TimestampType ts =>
+            ts.Unit is Apache.Arrow.Types.TimeUnit.Nanosecond or Apache.Arrow.Types.TimeUnit.Second
+                ? ts.Unit
+                : null,
+        StructType st => st.Fields.Select(x => FindUnsupportedTimestampUnit(x.DataType))
+                                  .FirstOrDefault(u => u is not null),
+        ListType lt => FindUnsupportedTimestampUnit(lt.ValueDataType),
+        MapType mt => FindUnsupportedTimestampUnit(mt.KeyField.DataType)
+                      ?? FindUnsupportedTimestampUnit(mt.ValueField.DataType),
+        _ => null,
+    };
+
     public static long? TryWriteStreaming(
         nint opener, string path, IArrowArrayStream data, DeltaWriteMode mode,
         bool deletionVectors, bool inCommitTimestamps, bool changeDataFeed, bool rowTracking,
@@ -771,6 +826,9 @@ internal static class DeltaWriter
         List<WrittenDataFile>? deferCommitTo = null,
         bool serializable = false, IReadOnlyList<string>? sortedBy = null)
     {
+        // The native path bypasses EW's own timestamp-unit guard entirely (DuckDB writes the files), so check
+        // here — before anything is written — rather than committing a spec-invalid file. See the helper.
+        EnsureTimestampUnitsWritable(data.Schema);
         var (result, rows) = TryWriteStreamingCoreAsync(opener, path, data, mode, deletionVectors,
             inCommitTimestamps, changeDataFeed, rowTracking, spec, columnMapping, pendingSchema,
             deferCommitTo, serializable, sortedBy).GetAwaiter().GetResult();

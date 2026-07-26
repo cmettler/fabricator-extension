@@ -157,6 +157,53 @@ parity both directions + Spark decoding codec-written variant. **Fork-era EW not
 are HISTORICAL** — they describe the retired fork lineage; the mechanisms survive but live in the
 fabricator-patches shapes above.
 
+#### EW BUMP 2026-07-26 — clast master `babdb00` merged (clean); two silent-corruption fixes inherited, one NEW fabricator-side guard required
+
+`git merge-tree` predicted clean and the merge was clean: 10 upstream commits, overlap with our patches in
+exactly 3 files (`DeltaTable.cs`, `SchemaConverter.cs`, `ColumnChunkWriter.cs`) and no conflicts — upstream's
+ColumnChunkWriter edit only threads the new `options.MaxLiteralGroups`, disjoint from our narrow-int widening.
+**Our patch set is still all 8 commits — none absorbed upstream yet**, including the narrow-int
+write-corruption fix (still an upstream candidate, alongside the `PlanFiles` proposal).
+
+**Two data-correctness fixes we INHERIT — both were silently wrong for us before:**
+- `525bf94` `LiteralValue.CompareTo` compared strings with `string.CompareOrdinal` = UTF-16 code UNITS, while
+  Parquet/Delta/Iceberg all define string min/max over UTF-8 BYTES. They disagree wherever a supplementary
+  character (≥U+10000, surrogate-encoded) meets U+E000..U+FFFF. That comparator is what our pushed filters
+  reach through `DeltaFilePruner`, so we could **skip a file containing matching rows** — silent missing data.
+  New `StringOrdering.cs`.
+- `937eac1` truncated string stats now cut on CODE POINT boundaries (previously could split a surrogate pair,
+  so we *wrote* invalid stats).
+
+**Timestamp precision hardening (`6cb60fa`/`adb920d`/`b8a3aa3`/`babdb00`) — a real behaviour change.** EW now
+REFUSES nanosecond and second Arrow timestamps at write instead of mislabelling them (a second-unit column
+read back a MILLION times too small; ns lost its sub-µs digits). Guards sit in `SchemaConverter`, two
+`DeltaTable` chokepoints, the parquet writer and partition-value formatting. **Reachable from fabricator:**
+`SqlArrowMapping` maps `datetime2(7)`/`time(7)` → Arrow NANOSECOND, so a SQL→Delta CTAS of such a column now
+errors. Our `WriteDataFilesAsync` seam is covered for free (upstream put a guard in that method, which is
+THEIRS — our patch only added a `materializedRowIds` parameter).
+
+**But the merge does NOT close the equivalent gap on our side, so we added `DeltaWriter.EnsureTimestampUnitsWritable`.**
+Under `native_write` the data files are produced by DuckDB's COPY and EW only ever sees the finished files
+(`CommitDataFilesAsync`), never the Arrow batches — so its guard *structurally cannot* fire there. DuckDB's
+parquet writer DOES support NANOS, so without our check we would emit a NANOS-annotated file inside a table
+whose Delta schema declares micros: readable by DuckDB, wrong for every other reader. The check recurses into
+struct/list/map, and is called from `TryWriteStreaming` (the native chokepoint) and `DeltaCatalog.BulkInsert`
+(so every INSERT/CTAS/COPY is checked once, early). Like EW we REFUSE rather than round — which rounding is
+right is the caller's call. Coverage added to `verify_granular_types` (24, was 18): the ns write is refused
+AND the documented `CAST(dt2_7 AS TIMESTAMP)` works (`.123456` — DuckDB truncates). That suite also gained the
+`require parquet` its new native_write section needs (finding-3 class: undeclared, it passes on a developer box
+and fails on a bare runner).
+
+**Parquet read perf + a follow-up** (`082aa63` fixed-length-list fast path, `68761d8` opt-in batching of
+bit-packed literal runs → new `ParquetReadOptions.MaxLiteralGroups`, `370493e` fixes batched NESTED reads,
+`8ac71a9` restores the net472 test build): all opt-in, no TFM/csproj changes, so our build and behaviour are
+untouched — available if we ever want them.
+
+**Gates:** EW Table.Tests 444 (was 421) / DeltaLake 210 / Expressions 139 green. EW Parquet.Tests shows 115
+failures, ALL `DirectoryNotFoundException` on `parquet-testing/data` — the nested corpus we deliberately do
+not init (115 failures, 115 mentions of that path); zero regressions. Plus the full fabricator hermetic +
+service sweeps.
+
 ## Architecture (layered for reuse)
 
 Layered so a future **Power BI / DAX** connector reuses the same C++ core + managed bridge:

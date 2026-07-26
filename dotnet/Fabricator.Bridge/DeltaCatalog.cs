@@ -1597,6 +1597,10 @@ public sealed class DeltaCatalog : IBackendCatalog
         _log.LogInformation("delta bulk {Schema}.{Table}: create={Create} replace={Replace} native_write={Native} partition_overwrite={PartOw}",
             schemaName, tableName, createTable, replace, _nativeWrite, partitionOverwrite);
         EnsureVariantWritable(data.Schema);
+        // Nanosecond / second Arrow timestamps have no faithful Delta encoding. EW rejects them at its own
+        // write sites, but the native_write path hands DuckDB the bytes and EW never sees the batches — so
+        // check here too, where EVERY write (INSERT / CTAS / COPY, codec or native) passes exactly once.
+        DeltaWriter.EnsureTimestampUnitsWritable(data.Schema);
         // CREATE TABLE AS ... WITH (key='value', ...): per-statement write tuning + per-table create-flag
         // overrides + delta.*/fabricator.* properties (Parse rejects unknown/guarded keys). Only a
         // create-shaped bulk carries options (the host passes them from the CTAS operator only).

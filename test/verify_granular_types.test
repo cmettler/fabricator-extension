@@ -1,10 +1,17 @@
 # name: test/verify_granular_types.test
-# description: granular read mapping — time(7)/datetime2(7) -> ns (7th digit preserved); scale<=6 µs; decimal (p,s); uniqueidentifier -> UUID (warehouse-support §3.4)
+# description: granular read mapping — time(7)/datetime2(7) -> ns (7th digit preserved); scale<=6 µs; decimal (p,s); uniqueidentifier -> UUID (warehouse-support §3.4). Also pins the SQL -> Delta consequence: a nanosecond column is REFUSED, and the documented µs cast works.
 # group: [fabricator]
 
 require fabricator
 
+# The Delta section below attaches a native_write catalog, whose data files are written by a host
+# COPY ... (FORMAT parquet) — so the parquet COPY function must be in the catalog. Undeclared, this passes
+# on a developer box (parquet sits in ~/.duckdb) and fails on a bare machine; see CLAUDE.md finding 3.
+require parquet
+
 require-env MSSQL_TESTDB_DSN
+
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 statement ok
 ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
@@ -32,6 +39,36 @@ query TTTTT
 SELECT dt2_7::VARCHAR, dt2_3::VARCHAR, t7::VARCHAR, dec1::VARCHAR, g::VARCHAR FROM db.dbo.gt;
 ----
 2024-01-02 12:34:56.1234567	2024-01-02 12:34:56.123	12:34:56.1234567	12345.6789	6f9619ff-8b86-d011-b42d-00c04fc964ff
+
+# ---- SQL Server -> Delta. datetime2(7)/time(7) arrive as Arrow NANOSECOND (above), and nanoseconds have
+#      no faithful Delta encoding: Delta timestamps are MICROSECOND, and parquet offers only
+#      MILLIS/MICROS/NANOS. So this write is REFUSED, naming the cast to apply, rather than dropping the
+#      7th digit behind the caller's back. On a native_write catalog the refusal has to come from OUR side:
+#      the data files are produced by DuckDB's COPY, so engineered-wood — which rejects these units at its
+#      own write sites — never sees the Arrow batches. Without the guard we would emit a NANOS-annotated
+#      parquet file inside a table whose Delta schema declares micros: readable by DuckDB, wrong for every
+#      other reader. This pipeline had no coverage before 2026-07-26. ----
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/gtlake' AS gtlake (TYPE fabricator, PROVIDER 'delta', READ_ONLY false, native_write true);
+
+statement error
+CREATE TABLE gtlake.main.ns_direct AS SELECT id, dt2_7 FROM db.dbo.gt;
+----
+cannot be written to Delta
+
+# The documented workaround, and the reason the refusal is not merely obstructive: cast to a microsecond
+# TIMESTAMP and the 7th digit is dropped BY THE CAST, where the caller can see it happen.
+statement ok
+CREATE TABLE gtlake.main.us_cast AS SELECT id, CAST(dt2_7 AS TIMESTAMP) AS ts FROM db.dbo.gt;
+
+query IT
+SELECT id, ts::VARCHAR FROM gtlake.main.us_cast;
+----
+1	2024-01-02 12:34:56.123456
+
+statement ok
+DETACH gtlake;
 
 statement ok
 SELECT fabricator_exec('db', 'DROP TABLE dbo.gt');

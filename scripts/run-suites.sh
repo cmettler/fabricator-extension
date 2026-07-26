@@ -46,7 +46,9 @@ case "$TIER" in
         SELECT_CMD=scripts/list-service-suites.sh
         # Floors measured 2026-07-25 against the compose stack: 42 suites / 1221 assertions, all green.
         : "${MIN_SUITES:=42}"
-        : "${MIN_ASSERTIONS:=1221}"
+        # 1227 since 2026-07-26: verify_granular_types gained 6 (the SQL datetime2(7) -> Delta refusal and
+        # the microsecond-cast workaround). Raised deliberately in the same commit, per the error text below.
+        : "${MIN_ASSERTIONS:=1227}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2
