@@ -33,6 +33,16 @@ on:
       - CMakeLists.txt
       - Makefile
       - .gitmodules
+      # Submodule POINTERS, not directory globs: a gitlink shows up in the diff as this exact path,
+      # and from this repo's point of view there are no files under it. Without these, bumping the
+      # Delta engine or DuckDB itself — the highest-risk changes we make — runs no CI at all.
+      # (Missing until 2026-07-26: the two engineered-wood bumps that day only ran because they
+      # happened to touch dotnet/ as well, and the test-deletion bump ran nothing.)
+      # DuckDB.ExtensionKit is deliberately absent: this tier never compiles it, only the
+      # dispatch-triggered packaging tier does.
+      - engineered-wood
+      - duckdb
+      - extension-ci-tools
       - .github/workflows/extension.yml
       - .github/actions/build-extension/**
   pull_request:
@@ -46,6 +56,9 @@ on:
       - CMakeLists.txt
       - Makefile
       - .gitmodules
+      - engineered-wood        # submodule pointers — see the note above
+      - duckdb
+      - extension-ci-tools
       - .github/workflows/extension.yml
       - .github/actions/build-extension/**
   workflow_dispatch:
