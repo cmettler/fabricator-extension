@@ -4950,6 +4950,16 @@ commits do not compile DuckDB:
 | 2 | `integration.yml` | the **42 service suites / 1221 assertions** via `docker/docker-compose.yml` (SQL Server 2025 + MinIO + generated certs + `provision.ps1`). linux only | schedule + dispatch |
 | — | manual | `verify_dax` (Power BI Desktop), live Fabric/OneLake (gitignored SP creds), the 7 deltars suites (`-IncludeDeltaRs`, ~240 MB) | by hand |
 
+**Proven-in-CI status (2026-07-26).** Tier 0 green. **Tier 1 green on ALL THREE platforms in ONE run**
+(`30192450794`, sha `124ad4f`) — each independently 53/53 suites / 4152 assertions, verified from the job
+logs rather than the status tick. **Tier 2 green** (`30192508662`) — 42/42 / 1221, nothing skipped,
+`verify_mssql_s3_polybase` at its full 252. Both defects that the first CI runs surfaced (the macOS
+`ArrowProducer` use-after-free and the undeclared `require parquet`) are fixed and confirmed IN CI, not
+merely locally — a distinction this repo's history says to insist on. **`distribution.yml` remains the
+only tier never executed**, and it is the one whose failure modes the others structurally cannot reach:
+NativeAOT publish, the polyglot append, and the version gate against a stock DuckDB wheel (plus it is the
+only tier that REQUIRES `OVERRIDE_GIT_DESCRIBE` — the very flag that broke Tier 1 when set).
+
 **Suite selection is DERIVED, never a hand-kept list** — `scripts/list-hermetic-suites.sh` and
 `scripts/list-service-suites.sh` classify by the `require-env`/`require` directives each suite
 declares, so a new suite cannot silently sit outside CI. The accounting is complete and checked:
