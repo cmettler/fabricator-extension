@@ -5015,12 +5015,57 @@ class of defect:
    members, so at plan teardown the bind data is already freed when the state destructor dereferences
    it. Deterministic ordering, allocator-dependent fault: Linux SIGSEGV, macOS SIGABRT, Windows silent.
    No destructor is registered now; `AggSessionHolder`'s `agg_close` reclaims.
-2. **`verify_global_functions` aborts on macOS** with `mutex lock failed: Invalid argument` at assertion
-   41 — under investigation via `.github/workflows/diagnose-macos.yml` (temporary; delete when fixed).
-   Assume latent, not macOS-specific, until proven otherwise.
+2. **OPEN — a late `ArrowProducer` stream release aborts on macOS.** `verify_global_functions` fails at
+   assertion 41 with `libc++abi: terminating due to uncaught exception of type std::system_error: mutex
+   lock failed: Invalid argument` (exit 134). Diagnosed via `.github/workflows/diagnose-macos.yml`
+   (TEMPORARY — delete it when this is fixed).
 
-**Still to build:** a packaging tier (`pack-distribution.ps1` + `test/distribution/smoke_distribution.py`
-per platform — needs `OVERRIDE_GIT_DESCRIBE`, unlike tier 1) and a release job. **macOS Gatekeeper is
+   **Minimal repro, two lines, aborts on its own:**
+   ```sql
+   SELECT squared FROM fabricator_seq(5) WHERE value > 3 ORDER BY squared;
+   ```
+   **lldb backtrace (the whole diagnosis in five frames):**
+   ```
+   #11 std::__1::mutex::lock()
+   #12 fabricator::ArrowProducer::Release(ArrowArrayStream*)      <- src/fabricator/arrow_produce.cpp:86
+   #13-18 <managed frames — C# calling back in>
+   #19 fabricator::ArrowStreamScan(...)
+   #20 duckdb::PhysicalTableScan::GetDataInternal
+   ```
+   So MANAGED code releases an Arrow stream mid-scan whose C++ `ArrowProducer` is already destroyed.
+   **Why only macOS reports it:** locking a destroyed-but-intact `std::mutex` is silent on glibc and
+   Windows; Apple's `pthread_mutex_lock` validates the signature, returns EINVAL, and `std::mutex::lock`
+   turns that into a throw. macOS is the only platform that DETECTS this — do not read it as a macOS bug.
+   Same lesson as bug 1: a passing platform proves nothing about a use-after-free.
+
+   **Ruled out (each looked like the answer — do not re-walk these):**
+   - the **args** stream: `Bootstrap.TableBind` disposes it inside the call
+     (`using var argStream = CArrowArrayStreamImporter.ImportArrayStream(args)`).
+   - the **filter-values** stream via `StaticTableFunction.Binding.Execute`: that is a PLAIN method, not
+     an async iterator, so its `scan.FilterValues?.Dispose()` runs eagerly while the producer is alive.
+     (Consumer-disposes is the convention: see also DaxCatalog "consumed + disposed", DeltaCatalog and
+     DeltaRsCatalog's `ReadFilterValues`.)
+   - a **double release of the same struct**: inconsistent with the trace. The first release sets
+     `stream->release = nullptr`, yet `Release` is seen executing and reaching the lock — so this is a
+     FIRST release arriving late.
+
+   **Prime suspect:** some producer's stream is released at GC/finalizer time (the earlier Windows
+   batch-mode crash showed exactly `ImportedArrowArrayStream.Finalize() -> Dispose()`), while the C++
+   owner's guarantee is only the call — `BuildFilterValues` (arrow_ingest.cpp) says so in as many words:
+   "The returned producer must outlive the scan_table call that consumes the stream." Note most
+   `ArrowProducer` call sites are STACK locals whose `Stream()` crosses the ABI, which is safe only for
+   consumers that release synchronously.
+
+   **Next step, deliberately not yet taken:** identify WHICH producer before changing any ownership —
+   tag `ArrowProducer` with its construction site and print it in `Release`, or set lldb breakpoints on
+   its ctor/dtor, in one more `diagnose-macos` cycle. Do NOT refactor the ABI lifetime contract on a
+   hypothesis; it cannot be verified locally on Windows, since macOS is the only platform that faults.
+   A cheap, universally-safe hardening (clear `stream->private_data` in `Release` so a stale second
+   release no-ops) is available but on current analysis is NOT expected to fix this case.
+
+**Still to build:** a release job (attach `pack-distribution.ps1` output to a GitHub release). The
+packaging tier itself EXISTS now as `distribution.yml` (dispatch + `v*` tags) but has never been run —
+its first run is unvalidated, and it is the one tier that DOES need `OVERRIDE_GIT_DESCRIBE`. **macOS Gatekeeper is
 a caveat CI structurally cannot cover**: a browser-downloaded `.duckdb_extension` carries
 `com.apple.quarantine`, which can refuse an unsigned dylib, while a runner never quarantines what it
 built. Needs a real Mac and an install-doc note.
