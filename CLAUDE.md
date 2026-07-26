@@ -4948,18 +4948,24 @@ commits do not compile DuckDB:
 | 0 | `installer-core.yml` | `Fabricator.Installer.Core.Tests`, 92 × {net8.0,net10.0} × {win,linux}. No C++, no vcpkg, no submodules (the closure is Installer.Core + xunit). ~2 min | push/PR |
 | 1 | `extension.yml` | build + the **53 hermetic suites / 4152 assertions** (scratch dir + in-repo fixtures only). 3 platforms | push/PR |
 | 2 | `integration.yml` | the **42 service suites / 1221 assertions** via `docker/docker-compose.yml` (SQL Server 2025 + MinIO + generated certs + `provision.ps1`). linux only | schedule + dispatch |
-| — | manual | `verify_dax` (Power BI Desktop), live Fabric/OneLake (gitignored SP creds), the 7 deltars suites (`-IncludeDeltaRs`, ~240 MB) | by hand |
+| 3 | `distribution.yml` | the single-file artifact per platform + the **12-check smoke against a STOCK DuckDB wheel** (`test/distribution/smoke_distribution.py`). 3 platforms; needs `OVERRIDE_GIT_DESCRIBE` (the one tier that does) | dispatch + `v*` tags |
+| — | manual | `verify_dax` (Power BI Desktop), live Fabric/OneLake (gitignored SP creds), the 7 deltars suites (`-IncludeDeltaRs`, ~240 MB), and on macOS: Gatekeeper/`com.apple.quarantine` + code signing | by hand |
 
 **Proven-in-CI status (2026-07-26).** Tier 0 green. **Tier 1 green on ALL THREE platforms in ONE run**
 (`30192450794`, sha `124ad4f`) — each independently 53/53 suites / 4152 assertions, verified from the job
 logs rather than the status tick. **Tier 2 green** (`30192508662`) — 42/42 / 1221, nothing skipped,
 `verify_mssql_s3_polybase` at its full 252. Both defects that the first CI runs surfaced (the macOS
 `ArrowProducer` use-after-free and the undeclared `require parquet`) are fixed and confirmed IN CI, not
-merely locally — a distinction this repo's history says to insist on. **`distribution.yml` ran for the
-first time (`30193881119`) and FAILED on both platforms** — not in the exotic machinery it exists to
-cover (NativeAOT publish, the polyglot append, the version gate against a stock wheel) but in the pack
-script's own ordering: it probed for the installer shell before building it (finding 4 below). The build
-and the AOT publish both succeeded, so the tier is close, but it is NOT yet proven end-to-end.
+merely locally — a distinction this repo's history says to insist on. **`distribution.yml` is now GREEN
+on all THREE platforms too** (`30195834247`): each packs the single-file artifact and passes all 12 smoke
+checks against a STOCK DuckDB wheel — cold LOAD, `['fabricator','fabricator_core']` both reporting
+loaded, a Delta round trip through the extracted core, the warm fast path, and both
+must-not-touch-disk rejections. Artifacts upload as `fabricator-v1.5.5-<platform>-<sku>`
+(windows_amd64 Standalone 62 MB / osx_arm64 Standalone 60 MB / linux_amd64 Standard 40 MB). **⇒ ALL FOUR
+TIERS ARE PROVEN IN CI.** It took three dispatches: the first run failed on both platforms for two
+DIFFERENT reasons and enabling macOS exposed a third defect (findings 4 and 5) — none of them in the
+exotic machinery the tier exists to cover, all of them in build-environment assumptions that a
+developer box silently satisfied.
 
 **Suite selection is DERIVED, never a hand-kept list** — `scripts/list-hermetic-suites.sh` and
 `scripts/list-service-suites.sh` classify by the `require-env`/`require` directives each suite
@@ -4972,11 +4978,11 @@ are missing.
 
 **Per-platform coverage is deliberately unequal — state it, never imply parity:**
 
-| | tier 1 | tier 2 | notes |
-|---|---|---|---|
-| `linux_amd64` | ✅ | ✅ | the Fabric deployment target |
-| `windows_amd64` | ✅ | (local only) | the development platform; DAX/ADOMD fully supported here |
-| `osx_arm64` | ✅ | ❌ impossible | hosted macOS runners **cannot run containers**, so SQL Server/MinIO are unreachable. Demand-driven (DuckDB's user base skews Apple Silicon); DAX untested |
+| | tier 1 | tier 2 | tier 3 | notes |
+|---|---|---|---|---|
+| `linux_amd64` | ✅ | ✅ | ✅ Standard | the Fabric deployment target |
+| `windows_amd64` | ✅ | (local only) | ✅ Standalone | the development platform; DAX/ADOMD fully supported here |
+| `osx_arm64` | ✅ | ❌ impossible | ✅ Standalone | hosted macOS runners **cannot run containers**, so SQL Server/MinIO are unreachable. Demand-driven (DuckDB's user base skews Apple Silicon); DAX untested. Gatekeeper + signing are also outside CI (a runner never quarantines what it built) |
 
 **Traps that cost real cycles — do not rediscover them:**
 - **A no-match sqllogictest filter exits ZERO** ("No tests ran"), and the filter is Catch-style, so a
