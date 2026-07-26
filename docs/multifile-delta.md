@@ -438,7 +438,10 @@ done as a standalone function) only if CPU-bound-local multi-lane Delta scans be
    catalog write/delete/update/decimal/time_travel/changes suites unregressed. **Logging (ILogger, C#-only):**
    `FabricatorLog` (off by default; `FABRICATOR_LOG_LEVEL`+`FABRICATOR_LOG_FILE` → a file sink; factory pluggable) traces
    the resolved snapshot version, the file list (active/scanned/pruned), and each per-file `read_parquet` SQL.
-   One local engineered-wood change: `DeltaFilePruner` made `public` (was `internal`). **Deferred within slice 1:**
+   SUPERSEDED 2026-07-26: the ordinal + the prune verdict now both come from engineered-wood's
+   `DeltaTable.PlanFiles`, so the "relative-path-sorted for rowid decode parity" requirement above is met BY
+   CONSTRUCTION rather than by our re-implementing the ordering. (The `DeltaFilePruner`-made-`public` change
+   this bullet used to describe is retired; the class is `internal` again.) **Deferred within slice 1:**
    very large DVs use a big `NOT IN` list (fine for typical DV cardinality; a bitmap/anti-join is a later opt).
 2. **Slice 2 (ABI, core-touching):** a **live-filter host-callback** so the per-file loop reads the outer
    scan's current (incl. dynamic/join) filters before each file → `read_parquet … WHERE` → dynamic file/

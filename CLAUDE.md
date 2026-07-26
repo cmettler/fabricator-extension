@@ -5100,6 +5100,14 @@ DIFFERENT reasons and enabling macOS exposed a third defect (findings 4 and 5) �
 exotic machinery the tier exists to cover, all of them in build-environment assumptions that a
 developer box silently satisfied.
 
+**Tier 1 has since stayed green across every pin bump and the `PlanFiles` work** — `01994fb` (second EW
+bump) and `5c28297` (`PlanFiles`) both green on all three platforms. A green tier-1 job is a stronger
+claim than it looks: `run-suites.sh` floors on 53 suites / 4152 assertions and fails on any SKIP, so the
+tick alone proves the counts without reading logs. **One CI gap was closed the same day**: the path
+filter listed `.gitmodules` but not the submodule POINTERS, so a pin bump ran NO CI at all (see the traps
+list). Note that fix is not self-proving — every commit since has also touched `dotnet/`, so it is only
+exercised the next time a pin moves on its own.
+
 **Suite selection is DERIVED, never a hand-kept list** — `scripts/list-hermetic-suites.sh` and
 `scripts/list-service-suites.sh` classify by the `require-env`/`require` directives each suite
 declares, so a new suite cannot silently sit outside CI. The accounting is complete and checked:
@@ -5305,15 +5313,20 @@ that is what the binary reports (`fabricator_version()` + the footer) — taggin
 claim mislabels the release against its own contents. Nothing in the workflow hardcodes the tag: title and
 notes derive the DuckDB version from the single `DUCKDB_VERSION` var; the tag is used verbatim.
 
-**Release status:** a **DRAFT** `v0.0.1-duckdb1.5.5` exists (3 platforms + the release job green, three
-versioned ZIPs at 40/60/62 MB, notes rendering correctly), built from `c2af48a`. **Unpublished — publishing
-is a human decision.** It was retagged from `0eadd00` onto `c2af48a` deliberately: the earlier tree lacked the
-first EW bump's two silent-corruption fixes (the UTF-16-vs-UTF-8 comparator that could make pruning SKIP a
-file containing matching rows, and stats truncation splitting a surrogate pair). Since `01994fb` it is ONE PIN
-BEHIND, but the second bump carries no confirmed correctness fix for our paths, so it is publishable on the
-merits — re-tag only if you want the currency. Deleting a draft + moving a tag is safe **while nothing has
-been published**; that is also why reusing the `v0.0.1` name was correct rather than bumping to `0.0.2` (no
-released bytes were being redefined).
+**Release status:** a **DRAFT** `v0.0.1-duckdb1.5.5` exists on **`5c28297`** (run `30219700379`: all three
+packs + the release job green), with three versioned ZIPs — `linux_amd64-Standard` 38.3 MB /
+`osx_arm64-Standalone` 57.2 MB / `windows_amd64-Standalone` 59.3 MB. (Those are the ZIP sizes; the raw
+`.duckdb_extension` inside each is a little larger — an earlier note here quoted 40/60/62 MB as ZIP sizes,
+which were really the raw ones.) **Unpublished — publishing is a human decision.**
+
+It has been retagged twice, each time forward onto a commit worth more: `0eadd00` → `c2af48a` (to pick up
+the first EW bump's two silent-corruption fixes — the UTF-16-vs-UTF-8 comparator that could make pruning
+SKIP a file containing matching rows, and stats truncation splitting a surrogate pair) → `5c28297` (the
+second EW bump, the ns/second timestamp guard, and `PlanFiles`). **Moving a tag + deleting a draft is safe
+only while nothing has been PUBLISHED** — no released bytes are being redefined — which is also why reusing
+`v0.0.1` is correct rather than bumping to `0.0.2`: the number matches what the binary reports
+(`fabricator_version()` + the footer), and tagging a number the artifact does not claim would mislabel it.
+The tag message records what each move gained, so the reasoning survives without this file.
 
 **Still to build:** nothing in the tiers themselves. **macOS Gatekeeper is
 a caveat CI structurally cannot cover**: a browser-downloaded `.duckdb_extension` carries
