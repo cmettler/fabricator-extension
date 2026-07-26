@@ -93,10 +93,15 @@ internal sealed class SqlServerProcedure : ICatalogTableFunction
         // A proc's EXEC isn't inline-wrappable, so DuckDB re-applies projection (by name) + filters above the scan.
         public bool SupportsPushdown => false;
 
-        public async IAsyncEnumerable<RecordBatch> Execute(
-            TableFunctionScan scan, [EnumeratorCancellation] CancellationToken ct = default)
+        // Dispose eagerly in a plain method, then delegate — see the lifetime note in StaticTableFunction.Execute.
+        public IAsyncEnumerable<RecordBatch> Execute(TableFunctionScan scan, CancellationToken ct = default)
         {
             scan.FilterValues?.Dispose(); // no pushdown
+            return Rows(ct);
+        }
+
+        private async IAsyncEnumerable<RecordBatch> Rows([EnumeratorCancellation] CancellationToken ct)
+        {
             // Supplied named args: the 1-row args batch's field names are the proc's parameter names.
             var argParams = new List<SqlParameter>();
             var assignments = new List<string>(); // @<paramName> = @p<c>

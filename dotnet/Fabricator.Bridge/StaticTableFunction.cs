@@ -41,6 +41,13 @@ public abstract class StaticTableFunction : ICatalogTableFunction
         public Schema OutputSchema => _fn.OutputSchema;
         public bool SupportsPushdown => _fn.SupportsPushdown;
 
+        // NOTE (lifetime, applies to every binding that ignores pushed filters): dispose FilterValues here,
+        // in a PLAIN method — never inside an `async IAsyncEnumerable` body. An async-iterator body does not
+        // run until the first MoveNext, and if the scan is torn down without a row being pulled it never runs
+        // at all, leaving the imported stream to the GC finalizer — a release at an unpredictable time. The
+        // host owns the underlying producer only for the duration of the scan (see
+        // ArrowStreamGlobalState::filter_value_producer), so a release after that is a use-after-free that
+        // only macOS reports (it validates the mutex signature; glibc/Windows corrupt silently).
         public IAsyncEnumerable<RecordBatch> Execute(TableFunctionScan scan, CancellationToken ct = default)
         {
             scan.FilterValues?.Dispose();

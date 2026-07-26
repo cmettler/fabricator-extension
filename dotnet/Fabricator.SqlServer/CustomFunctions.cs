@@ -657,10 +657,15 @@ internal sealed class CfColumnsFunction : ICatalogTableFunction
         public Schema OutputSchema { get; }
         public bool SupportsPushdown => false;
 
-        public async IAsyncEnumerable<RecordBatch> Execute(
-            TableFunctionScan scan, [EnumeratorCancellation] CancellationToken ct = default)
+        // Dispose eagerly in a plain method, then delegate — see the lifetime note in StaticTableFunction.Execute.
+        public IAsyncEnumerable<RecordBatch> Execute(TableFunctionScan scan, CancellationToken ct = default)
         {
             scan.FilterValues?.Dispose();
+            return Rows(ct);
+        }
+
+        private async IAsyncEnumerable<RecordBatch> Rows([EnumeratorCancellation] CancellationToken ct)
+        {
             await Task.CompletedTask; // synchronous generation; satisfies the async-iterator signature
             var arrays = new IArrowArray[_n];
             for (int i = 1; i <= _n; i++)
@@ -1152,10 +1157,17 @@ internal sealed class GfSeqFunction : ITableFunction
 
         public bool SupportsPushdown => false;
 
-        public async IAsyncEnumerable<RecordBatch> Execute(
-            TableFunctionScan scan, [EnumeratorCancellation] CancellationToken ct = default)
+        // Dispose eagerly in a plain method, then delegate — see the lifetime note in StaticTableFunction.Execute.
+        // (This is the exact shape that aborted on macOS: a deferred dispose released the host's filter-values
+        // producer during get_next, after InitGlobal had destroyed it.)
+        public IAsyncEnumerable<RecordBatch> Execute(TableFunctionScan scan, CancellationToken ct = default)
         {
             scan.FilterValues?.Dispose();
+            return Rows(ct);
+        }
+
+        private async IAsyncEnumerable<RecordBatch> Rows([EnumeratorCancellation] CancellationToken ct)
+        {
             await Task.CompletedTask;
             var value = new Int32Array.Builder().Reserve(_n);
             var squared = new Int32Array.Builder().Reserve(_n);
@@ -1197,10 +1209,15 @@ internal sealed class GfColumnsFunction : ITableFunction
         public Schema OutputSchema { get; }
         public bool SupportsPushdown => false;
 
-        public async IAsyncEnumerable<RecordBatch> Execute(
-            TableFunctionScan scan, [EnumeratorCancellation] CancellationToken ct = default)
+        // Dispose eagerly in a plain method, then delegate — see the lifetime note in StaticTableFunction.Execute.
+        public IAsyncEnumerable<RecordBatch> Execute(TableFunctionScan scan, CancellationToken ct = default)
         {
             scan.FilterValues?.Dispose();
+            return Rows(ct);
+        }
+
+        private async IAsyncEnumerable<RecordBatch> Rows([EnumeratorCancellation] CancellationToken ct)
+        {
             await Task.CompletedTask;
             var arrays = new IArrowArray[_n];
             for (int i = 1; i <= _n; i++) { var b = new Int32Array.Builder(); b.Append(i); arrays[i - 1] = b.Build(); }

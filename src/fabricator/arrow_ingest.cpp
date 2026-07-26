@@ -54,6 +54,17 @@ struct ArrowStreamGlobalState : public GlobalTableFunctionState {
 	//! Positions (in the result) of the rowid source columns.
 	vector<idx_t> rowid_source_pos;
 
+	//! The filter-constants producer whose Arrow stream was handed to the provider for THIS execution (null
+	//! when nothing was pushed). Owned here because the managed consumer may release that stream LAZILY: a C#
+	//! binding written as an async iterator disposes it on its first MoveNext, i.e. inside get_next — long
+	//! after InitGlobal returned. A producer scoped to the factory call is therefore released after it dies
+	//! (ArrowProducer::Stream() hands out a pointer INTO the object, and Release() locks its mutex ⇒
+	//! use-after-free). macOS is the only platform that faults on it: Apple's pthread_mutex_lock validates the
+	//! signature and returns EINVAL, which std::mutex::lock turns into a throw → abort; glibc and Windows lock
+	//! a destroyed mutex silently. Destroyed AFTER the destructor body below releases `stream` (a destructor
+	//! body runs before member destructors), so a dispose triggered BY that release still sees a live producer.
+	unique_ptr<fabricator::ArrowProducer> filter_value_producer;
+
 	~ArrowStreamGlobalState() override {
 		if (stream_initialized && stream.release) {
 			stream.release(&stream);
@@ -742,8 +753,10 @@ static string BuildScanSpec(const ArrowStreamBindData &bind_data, const vector<c
 }
 
 // Materializes the filter constants as a one-row Arrow batch (column i == value i),
-// so the provider can build a parameterized WHERE with exact types. The returned
-// producer must outlive the scan_table call that consumes the stream.
+// so the provider can build a parameterized WHERE with exact types. The returned producer must outlive the
+// CONSUMER's use of the stream, which outlasts the scan_table/table_execute call: the managed side may hold
+// the imported stream and release it lazily (see ArrowStreamGlobalState::filter_value_producer). Callers must
+// therefore keep it for the whole scan — never as a local scoped to the factory call.
 static unique_ptr<fabricator::ArrowProducer> BuildFilterValues(ClientContext &context, const vector<Value> &consts) {
 	vector<LogicalType> types;
 	vector<string> names;
@@ -838,7 +851,6 @@ unique_ptr<GlobalTableFunctionState> ArrowStreamInitGlobal(ClientContext &contex
 	// Catalog scans push the projected column list (and superset-safe filters) to the
 	// provider; raw queries fetch the full result (the SQL is user-supplied).
 	ArrowScanRequest request;
-	unique_ptr<fabricator::ArrowProducer> value_producer; // must outlive the factory() call
 	if (bind_data.push_projection) {
 		// Render the live runtime filters (static-erased + dynamic/join) for an exact-filter scan
 		// (filter_pushdown=true); empty for SQL/DAX/non-exact (input.filters null). This runs per execution,
@@ -851,8 +863,9 @@ unique_ptr<GlobalTableFunctionState> ArrowStreamInitGlobal(ClientContext &contex
 		string live_filter_json = SerializeLiveFilters(bind_data, input, filter_constants);
 		request.spec_json = BuildScanSpec(bind_data, input.column_ids, live_filter_sql, live_filter_json);
 		if (!filter_constants.empty()) {
-			value_producer = BuildFilterValues(context, filter_constants);
-			request.filter_values = value_producer->Stream();
+			// Owned by the scan's global state, NOT this frame — the consumer may release it lazily.
+			gstate->filter_value_producer = BuildFilterValues(context, filter_constants);
+			request.filter_values = gstate->filter_value_producer->Stream();
 		}
 	}
 	// Key this scan's connection to the active DuckDB transaction so a read inside an explicit transaction

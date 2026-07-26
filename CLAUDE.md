@@ -5015,53 +5015,65 @@ class of defect:
    members, so at plan teardown the bind data is already freed when the state destructor dereferences
    it. Deterministic ordering, allocator-dependent fault: Linux SIGSEGV, macOS SIGABRT, Windows silent.
    No destructor is registered now; `AggSessionHolder`'s `agg_close` reclaims.
-2. **OPEN — a late `ArrowProducer` stream release aborts on macOS.** `verify_global_functions` fails at
+2. **A late `ArrowProducer` stream release aborted on macOS (FIXED).** `verify_global_functions` died at
    assertion 41 with `libc++abi: terminating due to uncaught exception of type std::system_error: mutex
-   lock failed: Invalid argument` (exit 134). Diagnosed via `.github/workflows/diagnose-macos.yml`
-   (TEMPORARY — delete it when this is fixed).
-
-   **Minimal repro, two lines, aborts on its own:**
+   lock failed: Invalid argument` (exit 134). Two-line repro, which aborts on its own (NOT
+   state-dependent — the statement bisect and an isolated run both land here):
    ```sql
    SELECT squared FROM fabricator_seq(5) WHERE value > 3 ORDER BY squared;
    ```
-   **lldb backtrace (the whole diagnosis in five frames):**
-   ```
-   #11 std::__1::mutex::lock()
-   #12 fabricator::ArrowProducer::Release(ArrowArrayStream*)      <- src/fabricator/arrow_produce.cpp:86
-   #13-18 <managed frames — C# calling back in>
-   #19 fabricator::ArrowStreamScan(...)
-   #20 duckdb::PhysicalTableScan::GetDataInternal
-   ```
-   So MANAGED code releases an Arrow stream mid-scan whose C++ `ArrowProducer` is already destroyed.
-   **Why only macOS reports it:** locking a destroyed-but-intact `std::mutex` is silent on glibc and
-   Windows; Apple's `pthread_mutex_lock` validates the signature, returns EINVAL, and `std::mutex::lock`
-   turns that into a throw. macOS is the only platform that DETECTS this — do not read it as a macOS bug.
-   Same lesson as bug 1: a passing platform proves nothing about a use-after-free.
+   lldb (`-k`, not `-o` — see the traps list) put the whole diagnosis in five frames: `std::mutex::lock()`
+   ← `ArrowProducer::Release` ← six unsymbolized JIT frames ← `ArrowStreamScan` ←
+   `PhysicalTableScan::GetDataInternal`, on the MAIN thread's pipeline (so not a finalizer).
 
-   **Ruled out (each looked like the answer — do not re-walk these):**
-   - the **args** stream: `Bootstrap.TableBind` disposes it inside the call
-     (`using var argStream = CArrowArrayStreamImporter.ImportArrayStream(args)`).
-   - the **filter-values** stream via `StaticTableFunction.Binding.Execute`: that is a PLAIN method, not
-     an async iterator, so its `scan.FilterValues?.Dispose()` runs eagerly while the producer is alive.
-     (Consumer-disposes is the convention: see also DaxCatalog "consumed + disposed", DeltaCatalog and
-     DeltaRsCatalog's `ReadFilterValues`.)
-   - a **double release of the same struct**: inconsistent with the trace. The first release sets
-     `stream->release = nullptr`, yet `Release` is seen executing and reaching the lock — so this is a
-     FIRST release arriving late.
+   **Root cause needs BOTH halves, which is why it hid so well:**
+   - **C++:** `BuildFilterValues`' producer was a `unique_ptr` LOCAL to `ArrowStreamInitGlobal`, promising
+     only to "outlive the scan_table call". It dies when InitGlobal returns.
+   - **C#:** the binding's `Execute` was an `async IAsyncEnumerable`, so its `scan.FilterValues?.Dispose()`
+     did NOT run at call time — an async-iterator body starts at the first `MoveNextAsync`, i.e. inside
+     `get_next`, long after InitGlobal returned. `ArrowProducer::Stream()` hands out a pointer INTO the
+     object, so that release locks a destroyed `std::mutex`.
 
-   **Prime suspect:** some producer's stream is released at GC/finalizer time (the earlier Windows
-   batch-mode crash showed exactly `ImportedArrowArrayStream.Finalize() -> Dispose()`), while the C++
-   owner's guarantee is only the call — `BuildFilterValues` (arrow_ingest.cpp) says so in as many words:
-   "The returned producer must outlive the scan_table call that consumes the stream." Note most
-   `ArrowProducer` call sites are STACK locals whose `Stream()` crosses the ABI, which is safe only for
-   consumers that release synchronously.
+   **Why only macOS reported it:** Apple's `pthread_mutex_lock` validates the signature and returns
+   EINVAL, which `std::mutex::lock` turns into a throw; glibc and Windows lock a destroyed mutex
+   silently. Same lesson as bug 1 — a passing platform proves nothing about a use-after-free.
 
-   **Next step, deliberately not yet taken:** identify WHICH producer before changing any ownership —
-   tag `ArrowProducer` with its construction site and print it in `Release`, or set lldb breakpoints on
-   its ctor/dtor, in one more `diagnose-macos` cycle. Do NOT refactor the ABI lifetime contract on a
-   hypothesis; it cannot be verified locally on Windows, since macOS is the only platform that faults.
-   A cheap, universally-safe hardening (clear `stream->private_data` in `Release` so a stale second
-   release no-ops) is available but on current analysis is NOT expected to fix this case.
+   **The `WHERE` is load-bearing** (no predicate ⇒ no filter constants ⇒ no producer ⇒ no crash), and the
+   reason filter values exist at all for a function whose binding says `SupportsPushdown => false` is that
+   `BindingBoundTable` reports `true` for a global/custom function — that flag is the host's BY-NAME
+   projection mapping, not SQL pushdown (its doc says so). Reading the binding's flag instead of the
+   wrapper's is what made an earlier pass wrongly "rule out" the filter-values path; the other earlier
+   ruling-out was checking `StaticTableFunction.Execute` (a plain method — correct for THAT class) while
+   `fabricator_seq` is `GfSeqFunction`, which implements `ITableFunction` directly with an async iterator.
+
+   **Fix, in two layers:** the producer is now owned by `ArrowStreamGlobalState::filter_value_producer`,
+   so it lives for the whole scan; the destructor body releases `stream` BEFORE member destructors run
+   (a destructor body always does), so a dispose triggered by that release still sees a live producer.
+   And the four bindings that ignore pushed filters now dispose in a PLAIN method and delegate to a
+   private iterator (`GfSeqFunction`, `GfColumnsFunction`, `cf_columns`, `SqlServerProcedure`) — needed
+   independently, because an iterator that is never enumerated never disposes at all, leaving the release
+   to the GC finalizer. The contract note lives on `StaticTableFunction.Execute`, which already did it right.
+
+   **How it was found without a CI cycle, and the transferable technique:** a destruction-ORDER bug is
+   deterministic, so the non-faulting platform executes the same sequence and can be made to *detect* it.
+   A temporary out-of-band liveness registry in `ArrowProducer` (origin string + alive flag in a static
+   map, so `Release` never dereferences freed memory) printed
+   `LATE RELEASE (use-after-free) of producer … created at [BuildFilterValues]` **on Windows**, first try.
+   Then a **class sweep** with the diagnostic still armed over all 53 hermetic suites (4152 assertions)
+   came back with ZERO other late releases, so this was the only instance. Reach for this before paying
+   for a 20-minute remote debug cycle: you do not have to debug on the platform that faults.
+
+3. **Tier 2's first CI run found an undeclared parquet dependency — the same class as the six hermetic
+   suites, in the tier that had never run (FIXED).** All infrastructure came up green (build, TLS certs,
+   compose, provisioning); `verify_mssql_s3_polybase` then failed at line 267 — its ONLY
+   `native_write true` section, whose data files are written by a host `COPY … (FORMAT parquet)` — with
+   `Copy Function with name "parquet" is not in the catalog`. The suite never declared `require parquet`
+   (Tier 1's native-write suite does, line 12), so nothing loaded it and the copy-function lookup fell
+   back to autoload-from-DISK. **Reproduced locally in one shot with the empty-USERPROFILE trick** —
+   identical line and identical 117/116 assertion counts to CI — which is the proof that trick is worth
+   keeping: it turns a service-tier CI failure into a local edit loop. A developer box passes either way
+   because it has parquet under `~/.duckdb`. Adding the directive does not change the derived
+   classification (still 53 hermetic / 42 service; the classifier keys on `require-env`).
 
 **Still to build:** a release job (attach `pack-distribution.ps1` output to a GitHub release). The
 packaging tier itself EXISTS now as `distribution.yml` (dispatch + `v*` tags) but has never been run —
