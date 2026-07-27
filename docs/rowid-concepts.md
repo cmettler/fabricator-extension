@@ -66,6 +66,10 @@ code-grounded facts per codebase, so the adapter/upstream work doesn't mix them 
 > queried by name. The patch is safe against that fence by construction: it generates whichever name the
 > caller did not supply, so "both names present" still holds on every path.
 
+**Where the PLAN lives:** this file pins the concepts and the measured surface.
+[rowid-dml-seam.md](rowid-dml-seam.md) is the design + implementation plan for changing them (path-keyed
+EW DML, the optional STRUCT rowid, the prototype-revival mechanics, and what must be resolved first).
+
 ## What a USER can actually type — MEASURED 2026-07-27, settles a recurring confusion
 
 Run against a 3-file Delta table (`native_read true`, row tracking on by default), one row per commit.
