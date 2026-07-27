@@ -66,6 +66,33 @@ code-grounded facts per codebase, so the adapter/upstream work doesn't mix them 
 > queried by name. The patch is safe against that fence by construction: it generates whichever name the
 > caller did not supply, so "both names present" still holds on every path.
 
+## What a USER can actually type — MEASURED 2026-07-27, settles a recurring confusion
+
+Run against a 3-file Delta table (`native_read true`, row tracking on by default), one row per commit.
+This is the answer to "which of these names is a virtual column?" — a question that has come up three
+times, because `_metadata.row_id` is prominent in the CODE and in this document yet is **not a user
+surface at all**.
+
+| you type | works? | in `SELECT *`? | what you get |
+|---|---|---|---|
+| `rowid` | **YES** | no | the **TRANSIENT LOCATOR** `(fileOrdinal << 40) \| position`. DuckDB's own rowid name; the only user-facing name for it. |
+| `__delta_row_id` / `__delta_row_commit_version` | **YES** | no | the **STABLE row-tracking id** / commit version. These are the Delta MATERIALIZED (physical) column names AND our provider virtual-column names — the same string is both. |
+| `_metadata.row_id` | **NO** — `Binder Error: Referenced column "_metadata.row_id" not found` | — | nothing. INTERNAL ONLY: the wire name for the transient column between C++ and C# (`FetchRowIdColumns` → `virtual_rowid_columns` → the per-file SQL). The binder never exposes it. |
+
+Measured output, which also shows WHY the two are not interchangeable — stable ids follow COMMIT order,
+locator ordinals follow PATH-SORT order (uuid filenames), so they disagree on the same rows:
+
+```
+ id | __delta_row_id |          rowid | ordinal | position
+  0 |              0 |  2199023255552 |       2 |        0
+  1 |              1 |              0 |       0 |        0
+  2 |              2 |  1099511627776 |       1 |        0
+```
+
+⚠ **Reproduce this on a MULTI-FILE table or it proves nothing.** With one file the ordinal is 0, so
+`(0 << 40) | position` == `position` == the stable id for a fresh append — the two coincide exactly, and
+any mix-up is invisible. Every discriminating test in this area needs ≥ 2 files.
+
 ## The three concepts (keep separate!)
 
 1. **DuckDB's `rowid`** — a *binding concept*, not a representation. A catalog entry advertises rowid
