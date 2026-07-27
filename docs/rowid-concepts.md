@@ -7,6 +7,33 @@ and deleted).
 Purpose: pin the THREE distinct concepts that earlier analysis (mine) partially conflated, with
 code-grounded facts per codebase, so the adapter/upstream work doesn't mix them up again.
 
+> ## STATUS 2026-07-27 — the three-concept model still holds; every "what clast lacks" answer is OBSOLETE
+>
+> Re-verified against clast master `e28f70e` (grep, not memory). **The conceptual content below is
+> still correct and worth reading. The per-codebase FACTS about clast are not** — upstream absorbed the
+> whole area in its PR#4-parity landings and the 2026-07-26/27 commits:
+>
+> | the note says | today |
+> |---|---|
+> | clast has **no** transient locator, no `ByRowIds` API | it has the WHOLE surface: `ReadAllWithRowIdsAsync`, `DeleteByRowIdsAsync`, `UpdateByRowIdsAsync`, `DeleteByRowIdsViaVectorsAsync`, `ReadRowsByRowIdsAsync` |
+> | clast **hardcodes** the materialized name and ignores `materializedRowIdColumnName` (grep=0) | it READS the key at **8 sites** (`TryGetMaterializedColumnNames`); the hardcoded `RowIdColumnName` const is **vestigial — zero usages** |
+> | clast **refuses every** data-changing write on a row-tracking table | the fence is now CONDITIONAL: it refuses only when the table declares row tracking but NOT its materialized names, because without them a copy-on-write rewrite cannot preserve ids |
+> | rewrite-preservation is pr-4-only (our fork) | ported upstream, plus CoW change-data capture |
+>
+> **Consequences: §"Consequences for the adapter / upstream plan" items 1 and 2 are DONE.** No adapter
+> exposing a "position-consuming tail" is needed — clast exposes the rowid APIs directly — and the
+> config-key upstream item is resolved. Item 3 (naming cleanup: give our transient locator its own name
+> and free `_metadata.row_id` for the spec's stable virtual) is the only one left, and is still breaking
+> for queries using the current names. Of our patches only **`PlanFiles`** remains absent upstream.
+>
+> **What upstream does now, and why we still patch one line of it:** at create it GENERATES
+> `_row_id_<guid>` / `_row_commit_version_<guid>`, records them in `configuration`, and honors whatever
+> is recorded on every read/rewrite — spec-conformant, and the unconditional generation is what keeps the
+> fence above from ever tripping on its own tables. Our patch makes a **caller-supplied name win**, because
+> `__delta_row_id` is a name we SURFACE to users (concept 3 below), and a fresh GUID per table cannot be
+> queried by name. The patch is safe against that fence by construction: it generates whichever name the
+> caller did not supply, so "both names present" still holds on every path.
+
 ## The three concepts (keep separate!)
 
 1. **DuckDB's `rowid`** — a *binding concept*, not a representation. A catalog entry advertises rowid
@@ -37,12 +64,16 @@ code-grounded facts per codebase, so the adapter/upstream work doesn't mix them 
 
 ## Name matrix (code-verified)
 
-| concept | Delta spec / Spark | fabricator (DuckDB surface) | our EW fork | clast EW |
-|---|---|---|---|---|
-| DuckDB rowid binding | — | virtual `_metadata.row_id` (Delta) / physical PK cols (SQL) | — | — |
-| transient locator | `_metadata.row_index` (per-file position) | `_metadata.row_id` ⚠ misnomer | trailing `_metadata.row_id` col (ReadAllWithRowIdsAsync) ⚠ | **none** (no position-emitting reader, no ByRowIds API) |
-| stable id, physical col | name from `materializedRowIdColumnName` config | queryable virtuals `__delta_row_id`/`__delta_row_commit_version` | writes `__delta_row_id` (`RowTrackingWriter.RowIdColumn`), config-stamped | **hardcoded `_metadata.row_id`** (`RowTrackingConfig.RowIdColumnName`); the config key is NOT read (grep=0) ⚠ |
-| stable id, virtual | `_metadata.row_id` | (occupied by the locator) | — (fabricator surfaces it) | `VirtualRowIdColumn` const defined = `_metadata.row_id`; no read-side exposure found |
+The `clast EW` column below was captured 2026-07-21 and is **superseded** — see the corrected column.
+(The "our EW fork" column is fork-era history; the fork lineage is retired, our changes are a small
+patch set on clast master now.)
+
+| concept | Delta spec / Spark | fabricator (DuckDB surface) | our EW fork (retired) | clast EW @ 2026-07-21 | **clast EW @ e28f70e (verified 2026-07-27)** |
+|---|---|---|---|---|---|
+| DuckDB rowid binding | — | virtual `_metadata.row_id` (Delta) / physical PK cols (SQL) | — | — | — |
+| transient locator | `_metadata.row_index` (per-file position) | `_metadata.row_id` ⚠ misnomer | trailing `_metadata.row_id` col (ReadAllWithRowIdsAsync) ⚠ | none | **present** — `ReadAllWithRowIdsAsync` emits it as a trailing `VirtualRowIdColumn` (= `_metadata.row_id`, same misnomer), and the full `*ByRowIds*` DML surface consumes it |
+| stable id, physical col | name from `materializedRowIdColumnName` config | queryable virtuals `__delta_row_id`/`__delta_row_commit_version` | writes `__delta_row_id`, config-stamped | hardcoded `_metadata.row_id`; config key not read | **config-driven**: generates `_row_id_<guid>` at create, records it, reads it back via `TryGetMaterializedColumnNames` at 8 sites. `RowIdColumnName` const survives but is VESTIGIAL (0 usages) |
+| stable id, virtual | `_metadata.row_id` | (occupied by the locator) | — (fabricator surfaces it) | const defined, no read-side exposure | still no reader-facing virtual; the const now names the TRANSIENT column instead |
 
 ## Who USES what (the "what depends on it" answer, corrected)
 - **Transient locator = MUST for catalog DELETE/UPDATE** (+ the S3 external-table identity DML routed
@@ -53,7 +84,13 @@ code-grounded facts per codebase, so the adapter/upstream work doesn't mix them 
   fast path (file/row-group skipping via baseRowId ranges), update-stable ids for PolyBase/shortcut
   tables. It is NEVER the DML key — resolving id→(file,position) would only add work inside one statement.
 
-## clast: does it have a transient AND a physical? (the question)
+## clast: does it have a transient AND a physical? (the question — ANSWER BELOW IS SUPERSEDED, see STATUS)
+
+> **Answer today: YES to both.** Kept verbatim because the reasoning about *what would have to be true*
+> is still the right way to interrogate a Delta writer, and because the last bullet's watch-point is the
+> thing that turned out to matter — it is now resolved upstream, which is why our remaining patch there
+> is one line about NAME CHOICE rather than about conformance.
+
 - **Transient: NO.** No position/ordinal-emitting read anywhere; its predicate DELETE/UPDATE compute
   positions INTERNALLY (mask → matched indices → DV / rewrite) and never surface them. The position
   *machinery* exists one layer down — that's the adapter's target — but no locator API.
