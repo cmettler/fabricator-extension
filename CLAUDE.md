@@ -469,9 +469,15 @@ rowid column).
 **Predicate lowering + a MEASURED zero-read DELETE.** `MetadataPredicate` (self-contained) is wired at the head
 of `DeleteAsync(predicate)`: a physically-addressing predicate lowers to a `FileRowSelection`; one that MENTIONS
 `_metadata` but cannot lower is **rejected loudly** rather than handed to the row mask, which binds data columns
-only and would delete the wrong rows silently. The zero-data-reads claim is **measured** by a delegating
-`CountingFileSystem` asserting **0** data-parquet opens — without that instrument it would be a claim about
-intent. Data-column predicates are untouched (`TryLower` returns false; the guard no-ops).
+only and would delete the wrong rows silently. `UpdateAsync(predicate)` is **symmetric** (added after review
+caught that a DELETE-only guard left UPDATE passing `_metadata` straight to a data-column row mask — a live
+mis-evaluation hazard); `MatchedRowsUpdater` adapts the predicate surface's matched-rows-only updater onto the
+selection primitive. Data-column predicates are untouched (`TryLower` returns false; the guard no-ops).
+**The zero-data-reads claim is MEASURED and SCOPED — it holds in ONE configuration only**, and three tests
+pin the boundary rather than prose describing it: **DV on + CDF off ⇒ 0 data-parquet opens** (the real fast
+path); **DV on + CDF on ⇒ reads only the SELECTED file(s)** for change-feed content; **DV off ⇒ copy-on-write,
+reads AND rewrites the affected files — NOT a fast path**. In the lower two tiers the lowering still helps but
+differently in kind (it names files directly instead of evaluating a mask over pruning candidates).
 
 **Gates:** EW Table.Tests **571** × {net10.0, net8.0, net472} (was 555 pre-`_metadata`) / DeltaLake 217 /
 Expressions 139 / Core 430; fabricator hermetic **53/53 @ 4152** and service **42/42 @ 1227**, BOTH unchanged.

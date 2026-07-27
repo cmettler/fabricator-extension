@@ -2153,130 +2153,109 @@ internal static class DeltaReader
     }
 
     /// <summary>
-    /// Merge-on-read UPDATE composed from EW master's primitives (one atomic commit): union the matched
-    /// positions into each touched file's deletion vector (<c>ComputeDeletionVectorActionsAsync</c> —
-    /// remove+add pairs, no data rewrite), append the post-image rows as small new file(s)
-    /// (<c>WriteDataFilesAsync</c>, original row-tracking ids baked via <c>materializedRowIds</c> when the
-    /// table declares the column), capture CDF pre/post-images when enabled, and fuse everything via
-    /// <c>CommitDataFilesAsync(extraActions, expectedVersion)</c>. A concurrent commit aborts
-    /// (first-committer-wins) → the caller's retry-the-statement error.
+    /// Merge-on-read UPDATE: DV-mask the matched rows and append their post-images as small new file(s), one
+    /// atomic commit, no data rewrite — the cheap shape for a small update against a large file.
     /// </summary>
+    /// <remarks>
+    /// The composition itself (deletion-vector actions + post-image write with the ORIGINAL row-tracking ids
+    /// materialised + CDF pre/post capture + the fused commit) now lives in engineered-wood as
+    /// <c>UpdateBySelectionViaVectorsAsync</c> — it was assembled here by hand until that landed. What remains
+    /// is genuinely ours: decoding DuckDB's packed rowid into <c>(add.path, absolute position)</c>, and
+    /// substituting the SET values a host-side join produced. The KEYED updater overload is what makes that
+    /// possible — the values are not a function of the row's own content, so aligning them by emission order
+    /// would be wrong.
+    /// A concurrent commit aborts (first-committer-wins) → the caller's retry-the-statement error.
+    /// </remarks>
     private static async Task MergeOnReadUpdateAsync(
         DeltaTable table, RecordBatch updates, CancellationToken token)
     {
-        var snapshot = table.CurrentSnapshot;
-        var cfg = snapshot.Metadata.Configuration;
-
-        // rid → its row index in `updates`; SET columns by LOGICAL name (everything except the rowid col).
+        // The whole composition — DV-mask the old rows, append the post-images, capture CDF pre/post,
+        // preserve each row's ORIGINAL stable id, fuse into one commit — now lives in engineered-wood as
+        // UpdateBySelectionViaVectorsAsync. This method is reduced to what is genuinely OURS: decoding
+        // DuckDB's packed rowid into (add.path, absolute position) and substituting the SET values a
+        // host-side join produced.
         int ridIdx = -1;
         for (int c = 0; c < updates.ColumnCount; c++)
         {
-            if (updates.Schema.FieldsList[c].Name == "_metadata.row_id") { ridIdx = c; break; }
+            if (updates.Schema.FieldsList[c].Name
+                == EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.VirtualRowIdColumn)
+            {
+                ridIdx = c;
+                break;
+            }
         }
         if (ridIdx < 0 || updates.Column(ridIdx) is not Int64Array updRids)
         {
             throw new System.InvalidOperationException("merge-on-read UPDATE: updates batch has no rowid column.");
         }
-        var updIdxByRid = new Dictionary<long, int>(updates.Length);
+
+        var snapshot = table.CurrentSnapshot;
+        long posMask = (1L << RowIdPositionBits) - 1;
+        var pathByOrdinal = new Dictionary<int, string>(snapshot.ActiveFiles.Count);
+        foreach (var planned in table.PlanFiles(snapshot: snapshot))
+        {
+            pathByOrdinal[planned.Ordinal] = planned.File.Path;
+        }
+
+        // (add.path, absolute position) -> the row of `updates` holding that row's new values, plus the
+        // selection itself. Both fall out of one decode pass.
+        var updIndexByKey = new Dictionary<(string Path, long Pos), int>();
+        var selection = new Dictionary<string, IReadOnlyCollection<long>>(System.StringComparer.Ordinal);
         for (int i = 0; i < updates.Length; i++)
         {
-            if (!updRids.IsNull(i)) { updIdxByRid[updRids.GetValue(i)!.Value] = i; }
+            if (updRids.IsNull(i))
+                continue;
+            long rid = updRids.GetValue(i)!.Value;
+            int ordinal = (int)(rid >> RowIdPositionBits);
+            if (!pathByOrdinal.TryGetValue(ordinal, out var filePath))
+            {
+                throw new System.InvalidOperationException(
+                    $"merge-on-read UPDATE: row-id file ordinal {ordinal} does not name an active file of "
+                    + $"version {snapshot.Version} ({pathByOrdinal.Count} active) — the row identifiers were "
+                    + "captured against a different snapshot.");
+            }
+            long pos = rid & posMask;
+            updIndexByKey[(filePath, pos)] = i;
+            if (!selection.TryGetValue(filePath, out var set))
+            {
+                selection[filePath] = set = new HashSet<long>();
+            }
+            ((HashSet<long>)set).Add(pos);
         }
+        if (updIndexByKey.Count == 0)
+        {
+            return;
+        }
+
         var setCols = new Dictionary<string, IArrowArray>(System.StringComparer.Ordinal);
         for (int c = 0; c < updates.ColumnCount; c++)
         {
             if (c != ridIdx) { setCols[updates.Schema.FieldsList[c].Name] = updates.Column(c); }
         }
 
-        // The DV-delete half's input: the rows to mask, keyed by file path (see SelectionFromRowIds).
-        var updateSelection = SelectionFromRowIds(
-            table, snapshot, updIdxByRid.Keys, "merge-on-read UPDATE");
-
-        bool cdf = EngineeredWood.DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(cfg);
-
-        // Read back exactly the matched rows (logical names + a trailing _metadata.row_id column) at the
-        // current snapshot; build the pre-images (original values, for CDF) and post-images (SET columns
-        // substituted keyed by rowid) plus the rows' ORIGINAL stable ids for materialization.
-        var (matRowIdName, _) = EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig
-            .TryGetMaterializedColumnNames(cfg);
-        bool materialize = matRowIdName is not null
-            && EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(cfg);
-        var srcTracking = materialize ? new List<(long?[] Ids, long?[] Versions)>() : null;
-        var ridsPerBatch = new List<Int64Array>();
-        var preImages = new List<RecordBatch>();
-        var postImages = new List<RecordBatch>();
-        var matIds = new List<long>();
-        int batchIdx = 0;
-        await foreach (var b in table.ReadRowsByRowIdsAsync(
-                           updIdxByRid.Keys.ToList(), sourceRowTrackingOut: srcTracking,
-                           rowIdsOut: ridsPerBatch,
-                           cancellationToken: token).ConfigureAwait(false))
-        {
-            // The batch carries USER columns only; the rowid correlation key rides ridsPerBatch (aligned,
-            // appended before the yield).
-            var rids = ridsPerBatch[batchIdx];
-            var takeIdx = new List<int>(b.Length);
-            for (int i = 0; i < b.Length; i++)
-            {
-                long rid = rids.GetValue(i) ?? -1;
-                takeIdx.Add(updIdxByRid.TryGetValue(rid, out int u) ? u : -1);
-            }
-            int userCols = b.ColumnCount;
-            var preFields = new List<Field>(userCols);
-            var preArrays = new List<IArrowArray>(userCols);
-            var postArrays = new List<IArrowArray>(userCols);
-            for (int c = 0; c < userCols; c++)
-            {
-                var f = b.Schema.FieldsList[c];
-                preFields.Add(f);
-                preArrays.Add(b.Column(c));
-                // ArrowCompute.Take replaced DeletionVectorFilter.TakeRowsPublic (EW 04eaac4 consolidated
-                // four row-take implementations into one shared primitive); same signature.
-                postArrays.Add(setCols.TryGetValue(f.Name, out var upd)
-                    ? EngineeredWood.Arrow.ArrowCompute.Take(upd, takeIdx)
-                    : b.Column(c));
-            }
-            var userSchema = new Apache.Arrow.Schema(preFields, null);
-            preImages.Add(new RecordBatch(userSchema, preArrays, b.Length));
-            postImages.Add(new RecordBatch(userSchema, postArrays, b.Length));
-            if (materialize && srcTracking is not null && batchIdx < srcTracking.Count)
-            {
-                foreach (var id in srcTracking[batchIdx].Ids)
+        await table.UpdateBySelectionViaVectorsAsync(
+                new EngineeredWood.DeltaLake.Table.FileRowSelection(selection),
+                (filePath, matched, positions) =>
                 {
-                    if (id is null) { materialize = false; break; } // pre-tracking source — never a wrong id
-                    matIds.Add(id.Value);
-                }
-            }
-            batchIdx++;
-        }
-
-        // DV-delete the old rows (remove+add pairs, no rewrite) + write the post-image file(s).
-        var (dvActions, _) = await table.ComputeDeletionVectorActionsAsync(updateSelection, token)
-            .ConfigureAwait(false);
-        var files = await table.WriteDataFilesAsync(postImages, token,
-                materializedRowIds: materialize && matIds.Count > 0 ? matIds : null)
-            .ConfigureAwait(false);
-
-        var extra = new List<DeltaAction>(dvActions);
-        if (cdf)
-        {
-            // The plural form splits per partition (data-file convention) — one call per image batch
-            // serves unpartitioned AND partitioned CDF tables.
-            foreach (var pre in preImages)
-            {
-                extra.AddRange(await table.WriteChangeDataFilesAsync(
-                    pre, "update_preimage", token).ConfigureAwait(false));
-            }
-            foreach (var post in postImages)
-            {
-                extra.AddRange(await table.WriteChangeDataFilesAsync(
-                    post, "update_postimage", token).ConfigureAwait(false));
-            }
-        }
-
-        await table.CommitDataFilesAsync(files, DeltaWriteMode.Append,
-                cancellationToken: token, extraActions: extra, expectedVersion: snapshot.Version,
-                operation: "UPDATE")
+                    // Row-aligned index into `updates` for each matched row, keyed by its identity rather
+                    // than by emission order.
+                    var takeIdx = new List<int>(matched.Length);
+                    for (int i = 0; i < matched.Length; i++)
+                    {
+                        long pos = positions.GetValue(i)!.Value;
+                        takeIdx.Add(updIndexByKey.TryGetValue((filePath, pos), out int u) ? u : -1);
+                    }
+                    var columns = new IArrowArray[matched.ColumnCount];
+                    for (int c = 0; c < matched.ColumnCount; c++)
+                    {
+                        var f = matched.Schema.FieldsList[c];
+                        columns[c] = setCols.TryGetValue(f.Name, out var upd)
+                            ? EngineeredWood.Arrow.ArrowCompute.Take(upd, takeIdx)
+                            : matched.Column(c);
+                    }
+                    return new RecordBatch(matched.Schema, columns, matched.Length);
+                },
+                token)
             .ConfigureAwait(false);
     }
 }

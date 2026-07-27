@@ -422,12 +422,70 @@ the row mask, which binds data columns only and would mis-evaluate it — deleti
 data parquet files (log/checkpoint excluded) and the test asserts **0**. Without that instrument the claim
 would be a statement about intent.
 
+⚠ **But "zero-read" holds in ONE configuration only, and an earlier version of this section over-claimed it.**
+The routing (`DeleteBySelectionViaVectorsOrRewriteAsync`) and the CDF branch inside the DV path together give
+three tiers — each now pinned by its own test, so the boundary is measured rather than described:
+
+| table config | what a lowered DELETE does | test |
+|---|---|---|
+| DV on, CDF off | **zero data reads** — metadata-only commit. The real fast path. | `MetadataPredicateDelete_ReadsNoDataFiles` (asserts 0) |
+| DV on, CDF **on** | reads **only the selected file(s)** to capture change-feed content | `..._WithChangeDataFeed_ReadsOnlyTheSelectedFile` (asserts >0 but ≤2 of 3 files) |
+| DV **off** | **copy-on-write** — reads AND rewrites the affected files. NOT a fast path. | `..._WithoutDeletionVectors_IsCopyOnWrite_AndDoesReadData` (asserts >0) |
+
+The lowering still helps in the lower two tiers, but the saving is different in KIND: it names the files
+directly instead of evaluating a mask over pruning candidates. Only the top tier avoids data IO entirely.
+(The parked prototype's own note was more precise than my first write-up here — it stated the CDF caveat
+explicitly.)
+
 ### 6.4 What remains, precisely
 
 `ReadRowsByRowIdsAsync` is the last rowid-keyed API. It is the interesting one because it both TAKES rowids
 and EMITS them (`rowIdsOut`), alongside `sourceRowTrackingOut` — three out-params that the `_metadata` struct
 would replace with one column. Converting it finishes the unification; it also touches the Bridge's buffered
 UPDATE read-back and CDF delete capture, so it is its own increment.
+
+### 6.6 `UpdateBySelectionViaVectorsAsync` — the merge-on-read UPDATE EW lacked (2026-07-27)
+
+The most valuable thing built in this stretch, and the only one that adds a CAPABILITY rather than re-keying
+an existing one. Every prior UPDATE entry point in EW paid a full file rewrite, because Delta has no
+"row updated" bitmap — so the cheap shape (DV-mask the old rows, APPEND the post-images, one fused commit)
+existed only as a composition fabricator had worked out and was assembling by hand.
+
+A **LIFT, not a fresh implementation**: the four primitives and their ordering
+(`ComputeDeletionVectorActionsAsync` + `WriteDataFilesAsync(materializedRowIds:)` +
+`WriteChangeDataFilesAsync` + `CommitDataFilesAsync(extraActions:, expectedVersion:)`) were already proven by
+`update` 63 / `dv_default` 58 / `row_tracking_virtual` 299 and by live Fabric/Spark validation. What changed is
+where the semantics live; a consumer no longer has to know all four.
+
+**Why it matters beyond IO:** row tracking is PRESERVED — each moved row keeps its ORIGINAL stable id,
+materialised into the post-image file. Copy-on-write cannot offer that, because its rewrite re-derives ids for
+every row of the file it touches. An underivable id abandons materialisation for the WHOLE statement rather
+than baking a fresh, wrong one.
+
+**Two overloads, and the keyed one is load-bearing:**
+
+| form | updater sees | for |
+|---|---|---|
+| `updater(matched)` | the matched rows | a transform that is a FUNCTION of the row (`salary * 2`) |
+| `updater(filePath, matched, positions)` | + identity, row-aligned, ABSOLUTE | values from a host-side JOIN, keyed by `(file, position)` |
+
+The keyed form exists because fabricator's `MergeOnReadUpdateAsync` could not use the simple one: its values are
+not a function of row content, so aligning them by emission ORDER would be wrong. That is the same fragility
+this document criticises the parked prototype's `updater(matchBatch)` for — so the API needed both.
+
+⚠ **Invocation granularity differs from the copy-on-write sibling**, and a keyed caller must not assume
+otherwise: the merge-on-read updater is called once per SOURCE BATCH containing a match (possibly several times
+per file), whereas `UpdateBySelectionAsync`'s `rewriteFile` is called once per FILE with all its batches. Key by
+`(filePath, position)`; do not accumulate state per call.
+
+**Fabricator migrated onto it** (−26 lines net in the Bridge): what remains there is only what is genuinely
+ours — decoding DuckDB's packed rowid into `(add.path, absolute position)` and substituting the join's values.
+Gated targeted-first, as a re-key of the LIVE autocommit DV UPDATE path: `update` 63 / `dv_default` 58 /
+`row_tracking_virtual` 299 / `changes` 73, then hermetic 53/53 @ 4152.
+
+**Upstream: this is now the strongest candidate of the whole effort** — a capability EW genuinely lacks, proven
+in production against Spark, additive, and with no magic strings (unlike the predicate lowering, §D). Its
+necessity is demonstrated rather than argued: a real consumer needed it and is 26 lines lighter for it.
 
 ### 6.5 Fabricator migrated off the rowid UPDATE surface — and the packing RELOCATED
 
