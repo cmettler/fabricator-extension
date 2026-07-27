@@ -131,8 +131,9 @@ already occupied by the locator. Proof points: the transient decode (`rid >> Row
 structurally incompatible with a stable id (no ordinal, post-compaction ids exceed old ranges);
 `verify_delta_row_tracking_virtual.test` queries only `__delta_*` (42+11 hits, zero `_metadata.row_id`);
 the Spark-side stable-id validation (sparkprobe) queries `_metadata.row_id` on the SPARK surface, where
-the name does mean the stable id. ⚠ STALE DOC: `test/verify_delta_catalog_delete.test`'s header still
-describes the abandoned first design ("a stable _metadata.row_id surfaced as the DuckDB rowid") — fix it.
+the name does mean the stable id. (`test/verify_delta_catalog_delete.test`'s header described that
+abandoned design — FIXED 2026-07-27. It was wrong on a third count too: it claimed the rows are removed
+via deletion vectors, while the suite pins `deletion_vectors false` precisely to exercise copy-on-write.)
 
 ## Corrections to earlier analysis in this session (for the record)
 - I described clast's `_metadata.row_id` as "the stable **virtual** name like Spark". Half-right: on clast

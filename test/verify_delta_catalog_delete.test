@@ -1,9 +1,15 @@
 # name: test/verify_delta_catalog_delete.test
-# description: Delta folder-as-catalog DELETE — rowid-based via Delta row tracking (mirrors the SQL Server
-#              backend). Tables created by the catalog enable delta.enableRowTracking, so each row gets a
-#              stable _metadata.row_id surfaced as the DuckDB rowid (a VIRTUAL column, not in the user schema);
-#              DELETE FROM lake.t WHERE ... plans rowid-based, DuckDB applies the WHERE during its scan, and the
-#              rows are removed via deletion vectors. Set FABRICATOR_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
+# description: Delta folder-as-catalog DELETE — rowid-based, COPY-ON-WRITE (mirrors the SQL Server backend's
+#              rowid DML). The rowid is the TRANSIENT LOCATOR (fileOrdinal << 40) | file_row_number, minted at
+#              scan time and valid for one snapshot: a physical address, NOT an identity, surfaced as a VIRTUAL
+#              column (not in the user schema). DELETE FROM lake.t WHERE ... plans rowid-based, DuckDB applies
+#              the WHERE during its scan, and each affected file is REWRITTEN without the deleted rows.
+#              These ATTACHes pin `deletion_vectors false` deliberately — that is what keeps this suite on the
+#              copy-on-write path; the DV path is covered by verify_delta_catalog_dv / _dv_default.
+#              (The header used to describe the abandoned 2026-06-29 design — a STABLE row-tracking
+#              _metadata.row_id plus deletion vectors — which Fabric's OneLake converter could not read. See
+#              docs/rowid-concepts.md for why the transient locator still carries the spec's stable-id name.)
+#              Set FABRICATOR_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
 # group: [fabricator]
 
 require fabricator
