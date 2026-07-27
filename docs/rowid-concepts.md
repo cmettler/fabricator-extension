@@ -4,6 +4,16 @@ Working note, 2026-07-21 (moved from the engineered-wood submodule into `docs/` 
 one-time companions `DIVERGENCE.md` / `EW-ADAPTER-FEASIBILITY.md` / `RECONCILE.md` were fork-era
 migration analysis, superseded by the clast-master re-pin — see [ew-master-migration.md](ew-master-migration.md) —
 and deleted).
+
+> **Those three companions are UNRECOVERABLE** (checked 2026-07-27): zero commits in either repo's
+> history — they were untracked working files, so "deleted" means gone, not retrievable from git. Don't
+> spend time looking. In particular, any analysis of how a read should SURFACE row metadata (an
+> out-param vs an appended column vs generically-named metadata columns) is not there. The surviving
+> equivalent is upstream's `engineered-wood/doc/row-tracking-conformance-brief.md`: clast master strips
+> the hidden materialized columns so they never leak to a reader and exposes each survivor's resolved
+> id/version via **optional out-params**, where pr-4 (ours) appended a **trailing row-id column**. That
+> divergence is why our `__delta_row_id` is user-visible at all — we deliberately surface what upstream
+> deliberately hides — and therefore why it needs a stable, caller-chosen name.
 Purpose: pin the THREE distinct concepts that earlier analysis (mine) partially conflated, with
 code-grounded facts per codebase, so the adapter/upstream work doesn't mix them up again.
 
