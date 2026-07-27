@@ -389,9 +389,30 @@ have.
 **`CommitDataFilesAsync`'s `deletedPositionsByFileIndex` correctly STAYS index-keyed** — a different index
 space (our `0x780000+` pending eager files), which are in no snapshot, so no path can name them. Not a gap.
 
-**Still rowid-keyed** (separable second increment): `ReadRowsByRowIdsAsync` (harder — it also EMITS rowids
-via `rowIdsOut` for caller correlation, so a path key changes its OUTPUT shape too) and the autocommit
-`DeleteByRowIdsAsync` / `DeleteByRowIdsViaVectorsAsync` / `UpdateByRowIdsAsync`.
+**Same day, second slice — the AUTOCOMMIT DELETEs too:** `DeleteBySelectionViaVectorsAsync` (DV) and
+`DeleteBySelectionAsync` (copy-on-write) are now the cores; `DeleteByRowIdsViaVectorsAsync` /
+`DeleteByRowIdsAsync` are adapters. Both fabricator call sites decode via `PlanFiles` on our side
+(`DeltaReader.SelectionFromRowIds`), so the loud error covers the autocommit paths too, and increment 1's
+core was refactored onto a shared `ResolveSelection` (one mapping, one error shape). **Be honest about the
+value here: the hazard is WEAKER than the buffered case** — autocommit is scan-then-mutate in ONE statement
+against ONE snapshot, and `rowLevelRetry`'s reload re-validates through already-path-keyed `DeleteDvEdit`
+records, so there was no live silent-loss bug on these paths. The win is uniformity + removing a
+DuckDB-shaped 64-bit packing (and its ~8.4M-file ceiling) from a Delta library's public API.
+**Trap caught by reading, not by the compiler:** the copy-on-write loop probes the selected positions ONCE
+PER ROW (`targets.Contains(abs)`); the decode had always handed it a `HashSet<long>`, and passing the
+caller's `IReadOnlyCollection<long>` through compiles fine but silently binds those probes to **LINQ's O(n)
+`Contains`** → O(rows × selected). `ResolveSelection` materialises one `HashSet` per file and its doc says why.
+
+**The REMAINING blocker is not a file key — it is PER-ROW identity (verified 2026-07-27).**
+`UpdateByRowIdsAsync` and `ReadRowsByRowIdsAsync` carry packed rowids ACROSS the boundary per ROW:
+`UpdateByRowIdsCoreAsync`'s `rewriteFile` callback gets `rowIdsPerBatch` (an `Int64Array` of packed rowids
+per source row, for O(1) substitution), and the overload we actually use IGNORES the file-ordinal argument
+entirely; `ReadRowsByRowIdsAsync` fills `rowIdsOut` with packed rowids, its own comment explaining that
+"emission order alone cannot key a lookup". So path-keying only their INPUT would remove nothing. Converting
+them = replacing per-row identity with `(file_path, row_index)` — **exactly the parked `proto/metadata-dml`
+`_metadata` shape** — so it should be scheduled as the prototype revival, not as "two more overloads".
+Corollary: a §4 STRUCT rowid would not help either; it is the same problem one layer in.
+See [docs/rowid-dml-seam.md](docs/rowid-dml-seam.md) §3.2/§3.3.
 
 **Tests:** EW `FileRowSelectionTests` (6) — the two keyings name the same rows; a path-keyed delete removes
 exactly the selected rows across files; **the silent-loss case** (identifiers resolved against a snapshot an

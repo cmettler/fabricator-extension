@@ -84,10 +84,11 @@ proposal is exactly this shape.
 
 | API | keyed by | status |
 |---|---|---|
-| `ComputeDeletionVectorActionsAsync(positionsByOrdinal, …, resolveAgainst)` | ordinal | ✅ **DONE** — path-keyed overload is the core; the buffered DV DELETE flush and merge-on-read UPDATE both use it |
-| `RebaseDvDmlActionsAsync(… newPositionsByOrdinal …)` | ordinal | ✅ **DONE** — path-keyed overload is the core (Layer 3 (B) row-level remap across a concurrent rewrite) |
-| `ReadRowsByRowIdsAsync(rowIds, …)` | rowid (encodes ordinal) | ⬜ still rowid — buffered UPDATE read-back, CDF delete capture. Harder: it also EMITS rowids (`rowIdsOut`) for the caller to correlate against, so a path key changes its output shape too, not just its input |
-| `DeleteByRowIdsAsync` / `DeleteByRowIdsViaVectorsAsync` / `UpdateByRowIdsAsync` | rowid | ⬜ still rowid — the AUTOCOMMIT paths. They decode internally and feed `RemapRowLevelDeletesAsync`; a separable second increment |
+| `ComputeDeletionVectorActionsAsync(positionsByOrdinal, …, resolveAgainst)` | ordinal | ✅ **DONE** (§3.1) — path-keyed core; the buffered DV DELETE flush and merge-on-read UPDATE both use it |
+| `RebaseDvDmlActionsAsync(… newPositionsByOrdinal …)` | ordinal | ✅ **DONE** (§3.1) — path-keyed core (Layer 3 (B) row-level remap across a concurrent rewrite) |
+| `DeleteByRowIdsViaVectorsAsync` / `DeleteByRowIdsAsync` | rowid | ✅ **DONE** (§3.2) — new `DeleteBySelectionViaVectorsAsync` / `DeleteBySelectionAsync` are the cores; the rowid forms are adapters |
+| `UpdateByRowIdsAsync` (×3 overloads) | rowid | ⬜ **blocked on the per-row identity shape — see §3.3.** Not a file-key problem |
+| `ReadRowsByRowIdsAsync(rowIds, …)` | rowid | ⬜ **same blocker (§3.3)** — it EMITS packed rowids via `rowIdsOut` |
 | `CommitDataFilesAsync(… deletedPositionsByFileIndex …)` | **index into not-yet-committed written files** | ✅ **stays index-keyed, correctly** — a DIFFERENT index space (our `0x780000+` pending files). Those files are in no snapshot, so no path can name them. Not a gap. |
 
 ### 3.1 What landed (2026-07-27)
@@ -145,6 +146,52 @@ build on every TFM upstream declares, and only the net472 leg proves it.
 
 ---
 
+### 3.2 What landed next (2026-07-27, same day): the autocommit DELETEs
+
+`DeleteBySelectionViaVectorsAsync` (deletion-vector) and `DeleteBySelectionAsync` (copy-on-write) are now
+the cores; `DeleteByRowIdsViaVectorsAsync` / `DeleteByRowIdsAsync` are adapters that decode via
+`SelectionFromRowIds` and delegate. Both fabricator call sites (`DeltaReader`) decode on OUR side through
+`PlanFiles` and pass a selection, so the loud-error property extends to the autocommit paths.
+
+Increment 1's core was refactored onto a shared `ResolveSelection(selection, snapshot, op)`, so there is
+now ONE place that maps a selection to `AddFile`s and ONE error message shape.
+
+**Note the hazard here is genuinely weaker than in §3.1, and saying so matters:** the autocommit paths run
+scan-then-mutate inside ONE statement against ONE snapshot, and `rowLevelRetry`'s reload re-validates
+through the already-path-keyed `DeleteDvEdit` records. So there is no pin, no rebase of a stale selection,
+and therefore no live silent-loss bug on these paths. What this buys is uniformity plus the removal of a
+DuckDB-shaped 64-bit packing from a Delta library's public API — the V8 file-count ceiling does not apply
+to a caller that uses the selection form. It is cleanliness with a defensive edge, not a bug fix.
+
+**One trap worth keeping, caught only by reading rather than by the compiler:** the copy-on-write loop
+probes the selected positions ONCE PER ROW of the file it rewrites (`targets.Contains(abs)`). The decode
+had always handed it a `HashSet<long>`; passing the caller's `IReadOnlyCollection<long>` straight through
+compiles fine and silently binds those probes to **LINQ's O(n) `Contains`**, turning a rewrite into
+O(rows × selected). `ResolveSelection` therefore materialises one `HashSet` per file, and its doc comment
+says why so nobody "simplifies" it back.
+
+### 3.3 The real remaining blocker: PER-ROW identity, not a file key (VERIFIED 2026-07-27)
+
+`UpdateByRowIdsAsync` and `ReadRowsByRowIdsAsync` are **not** waiting on a path-keyed file key. Both carry
+per-row identity ACROSS the boundary as a packed rowid, and that — not the file key — is where the
+DuckDB-shaped encoding actually lives:
+
+- `UpdateByRowIdsCoreAsync`'s `rewriteFile` callback receives `rowIdsPerBatch`, an `Int64Array` of **packed
+  rowids per source row**, so the caller can substitute new values by O(1) lookup against a rowid-keyed
+  dictionary. The file-ordinal argument beside it is nearly vestigial: the overload fabricator actually
+  uses (`UpdateByRowIdsAsync(RecordBatch updates, …)`) **ignores it entirely** —
+  `(ordinal, sourceBatches, rowIdsPerBatch) => ApplyRowIdKeyedUpdates(…)`.
+- `ReadRowsByRowIdsAsync` fills `rowIdsOut` with packed rowids per returned row, and its own comment states
+  the reason: *"emission order alone cannot key a lookup."*
+
+So path-keying only their INPUT would remove nothing — the packing would still cross in the callback and
+the out-param. Converting them means replacing per-row identity with `(file_path, row_index)`, which is
+**exactly the parked prototype's `_metadata` shape** (§5). That reframes the remaining work: it is not
+"two more overloads", it is the prototype revival, and it should be scheduled as that.
+
+Corollary for §4: a STRUCT rowid would not help here either. The per-row identity is the same problem one
+layer in, and `_metadata` already solves it in a Delta-native, Spark-shaped vocabulary.
+
 ## 4. Optional second step: the STRUCT rowid (PROPOSED, weigh separately)
 
 Per V2/V3/V4 a `STRUCT(file_path VARCHAR, row_index BIGINT)` rowid is achievable — the machinery exists,
@@ -177,7 +224,38 @@ The design's read/selection half is already prototyped, on EW branch **`proto/me
 base. It proposes `ReadAllWithMetadataAsync` returning a Spark-shaped `_metadata` struct of `file_path` +
 absolute `row_index`.
 
-**Base drift: it sits on `45cced1`, which is 76 commits behind `fabricator-patches`.**
+**Base drift: it sits on `45cced1`, now 78 commits behind `fabricator-patches`.**
+
+### MEASURED conflict surface (2026-07-27) — cheaper than the park note's guess
+
+The park note said "real but bounded conflicts", written against a base long since moved and never
+re-checked. Measured with `git merge-tree` (no working tree touched), cherry-picking **in order**:
+
+| commit | prediction |
+|---|---|
+| `72f2d3d` (read + delete-by-selection) | `DeltaTable.cs` **AUTO-MERGES**. Sole conflict: add/add on `FileRowSelection.cs` — because §3.1 added that file already. Trivial (keep ours; it is the same record with fuller docs). |
+| `2780334` (update-by-selection + predicate lowering) | **ONE** content conflict in `DeltaTable.cs`. (Its reported `MetadataDmlTests.cs` modify/delete is an artifact of measuring it against a HEAD where `72f2d3d` has not landed; picking in order removes it.) |
+
+78 commits of drift largely MISSED the prototype because its additions are appended methods rather than
+edits to churned regions.
+
+⚠ **Two honest limits on that number.**
+
+1. `merge-tree` measures TEXTUAL conflicts only. The prototype's `DeleteAsync(selection)` "reuses the mask
+   path's tail verbatim" — and that tail has since gained row-level-concurrency `DeleteDvEdit` records and
+   the stable-id remap. A clean textual merge can still be SEMANTICALLY stale, which is precisely the
+   failure mode this repo has hit before (a merge that applied cleanly while quietly dropping a behaviour).
+   Budget review time for the merged DML tail, not just for conflict markers.
+2. **The revival should NOT take the prototype's DELETE half at all.** §3.1/§3.2 already landed
+   selection-keyed deletes, integrated with row-level concurrency and the remap — strictly ahead of the
+   prototype's. Taking both would produce duplicate entry points (`DeleteAsync(FileRowSelection)` vs
+   `DeleteBySelectionAsync`).
+
+⇒ **What the revival is actually FOR** is the part §3.3 identified and nothing landed yet:
+`ReadAllWithMetadataAsync`'s per-row `_metadata` (`file_path` + absolute `row_index`), the
+`UpdateAsync(selection, updater)` shape that consumes it, and `MetadataPredicate.TryLower` (the zero-read
+predicate DELETE). Cherry-picking is therefore the wrong verb — PORT those three, drop the delete half, and
+reconcile naming against `DeleteBySelectionAsync`.
 
 ```
 EW:          git switch -c rowid-cleanup fabricator-patches   # inherits ALL current patches,

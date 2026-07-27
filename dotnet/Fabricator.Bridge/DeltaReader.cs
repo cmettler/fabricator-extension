@@ -676,7 +676,9 @@ internal static class DeltaReader
             .ConfigureAwait(false);
         try
         {
-            long deleted = (await table.DeleteByRowIdsAsync(rowIds, token).ConfigureAwait(false)).RowsDeleted;
+            long deleted = (await table.DeleteBySelectionAsync(
+                    SelectionFromRowIds(table, table.CurrentSnapshot, rowIds, "copy-on-write DELETE"), token)
+                .ConfigureAwait(false)).RowsDeleted;
             DmlLog.LogInformation("delta delete-rewrite {Path}: deleted={Deleted} writer={Writer}",
                 path, deleted, writer is null ? "engineered-wood" : "native-duckdb");
             return deleted;
@@ -899,7 +901,9 @@ internal static class DeltaReader
         var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(), token).ConfigureAwait(false);
         try
         {
-            return (await table.DeleteByRowIdsViaVectorsAsync(rowIds, token, rowLevelRetry: rowLevelRetry)
+            return (await table.DeleteBySelectionViaVectorsAsync(
+                    SelectionFromRowIds(table, table.CurrentSnapshot, rowIds, "deletion-vector DELETE"),
+                    token, rowLevelRetry: rowLevelRetry)
                 .ConfigureAwait(false)).RowsDeleted;
         }
         catch (DeltaConflictException ex)
@@ -2022,6 +2026,46 @@ internal static class DeltaReader
     private const int RowIdPositionBits = 40;
 
     /// <summary>
+    /// Decodes transient rowids into the self-describing <c>(add.path -&gt; absolute positions)</c> key
+    /// engineered-wood's DML entry points prefer. The ordinal is OUR encoding, so WE own the decode;
+    /// <see cref="DeltaTable.PlanFiles"/> supplies the ordering, and it is the SAME planner that minted these
+    /// ordinals — natively in <c>BuildNativeScanListAsync</c>, and on the codec path inside EW's own
+    /// <c>ReadWithTransientRowIdsAsync</c>. Called UNFILTERED on purpose: the ordinal indexes the unfiltered
+    /// path-sorted active set, so an unfiltered plan is a superset of whatever a filtered scan emitted.
+    /// An ordinal that names no active file is a LOUD error — engineered-wood's ordinal-keyed forms would
+    /// merely skip it, which is indistinguishable from a file with nothing to change.
+    /// </summary>
+    private static FileRowSelection SelectionFromRowIds(
+        DeltaTable table, EngineeredWood.DeltaLake.Snapshot.Snapshot snapshot,
+        IReadOnlyCollection<long> rowIds, string op)
+    {
+        long posMask = (1L << RowIdPositionBits) - 1;
+        var pathByOrdinal = new Dictionary<int, string>(snapshot.ActiveFiles.Count);
+        foreach (var planned in table.PlanFiles(snapshot: snapshot))
+        {
+            pathByOrdinal[planned.Ordinal] = planned.File.Path;
+        }
+        var byFile = new Dictionary<string, IReadOnlyCollection<long>>(System.StringComparer.Ordinal);
+        foreach (long rid in rowIds)
+        {
+            int ordinal = (int)(rid >> RowIdPositionBits);
+            if (!pathByOrdinal.TryGetValue(ordinal, out var filePath))
+            {
+                throw new System.InvalidOperationException(
+                    $"{op}: row-id file ordinal {ordinal} does not name an active file of version "
+                    + $"{snapshot.Version} ({pathByOrdinal.Count} active) — the row identifiers were captured "
+                    + "against a different snapshot.");
+            }
+            if (!byFile.TryGetValue(filePath, out var set))
+            {
+                byFile[filePath] = set = new HashSet<long>();
+            }
+            ((HashSet<long>)set).Add(rid & posMask);
+        }
+        return new FileRowSelection(byFile);
+    }
+
+    /// <summary>
     /// Merge-on-read UPDATE composed from EW master's primitives (one atomic commit): union the matched
     /// positions into each touched file's deletion vector (<c>ComputeDeletionVectorActionsAsync</c> —
     /// remove+add pairs, no data rewrite), append the post-image rows as small new file(s)
@@ -2057,32 +2101,9 @@ internal static class DeltaReader
             if (c != ridIdx) { setCols[updates.Schema.FieldsList[c].Name] = updates.Column(c); }
         }
 
-        // Decode the rowids into (file path, absolute position) — the DV-delete half's input. The ordinal is
-        // OUR encoding, so the decode belongs here rather than inside engineered-wood; PlanFiles supplies the
-        // ordering, the same planner that minted these ordinals in BuildNativeScanListAsync.
-        long posMask = (1L << RowIdPositionBits) - 1;
-        var planByOrdinal = new Dictionary<int, string>(snapshot.ActiveFiles.Count);
-        foreach (var planned in table.PlanFiles(snapshot: snapshot))
-        {
-            planByOrdinal[planned.Ordinal] = planned.File.Path;
-        }
-        var positionsByFile = new Dictionary<string, IReadOnlyCollection<long>>(System.StringComparer.Ordinal);
-        foreach (var rid in updIdxByRid.Keys)
-        {
-            int ordinal = (int)(rid >> RowIdPositionBits);
-            if (!planByOrdinal.TryGetValue(ordinal, out var filePath))
-            {
-                throw new System.InvalidOperationException(
-                    $"merge-on-read UPDATE: row-id file ordinal {ordinal} does not name an active file of "
-                    + $"version {snapshot.Version} ({planByOrdinal.Count} active) — the row identifiers were "
-                    + "captured against a different snapshot.");
-            }
-            if (!positionsByFile.TryGetValue(filePath, out var set))
-            {
-                positionsByFile[filePath] = set = new HashSet<long>();
-            }
-            ((HashSet<long>)set).Add(rid & posMask);
-        }
+        // The DV-delete half's input: the rows to mask, keyed by file path (see SelectionFromRowIds).
+        var updateSelection = SelectionFromRowIds(
+            table, snapshot, updIdxByRid.Keys, "merge-on-read UPDATE");
 
         bool cdf = EngineeredWood.DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(cfg);
 
@@ -2143,8 +2164,7 @@ internal static class DeltaReader
         }
 
         // DV-delete the old rows (remove+add pairs, no rewrite) + write the post-image file(s).
-        var (dvActions, _) = await table.ComputeDeletionVectorActionsAsync(
-                new EngineeredWood.DeltaLake.Table.FileRowSelection(positionsByFile), token)
+        var (dvActions, _) = await table.ComputeDeletionVectorActionsAsync(updateSelection, token)
             .ConfigureAwait(false);
         var files = await table.WriteDataFilesAsync(postImages, token,
                 materializedRowIds: materialize && matIds.Count > 0 ? matIds : null)
