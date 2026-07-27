@@ -301,6 +301,13 @@ rewritten SOURCE FILE with that file's `partitionValues` — which ours omitted,
 `8e86061` fixes — and carries FIVE CDF tests where we had one (partitioned, whole-file, pre/post).
 Three blocks of ours were DELETED as redundant rather than merged.
 
+**The `configuration` collision was CONVERGENCE, not reimplementation** (checked, and it changes how to
+pitch this upstream): `git log -S` shows upstream added the parameter in **`d9a913a`, the CHECKPOINT
+commit** — Curt needed a way to set `delta.checkpoint.writeStatsAsJson` for his own tests — and upstream
+has NEVER had feature-derivation, so he did not remove it. Two people needed a `configuration` parameter
+for unrelated reasons and landed on the same name and position. That makes our derivation ADDITIVE rather
+than a disagreement about precedence, so it is a coherent thing to offer upstream.
+
 **Two `CreateAsync` differences were NOT taken — upstream's version is not equivalent despite the
 identical signature, and taking it wholesale would have broken us SILENTLY:**
 - **A `delta.enable*` property no longer ENABLES its feature upstream** (the boolean argument is the
@@ -308,7 +315,10 @@ identical signature, and taking it wholesale would have broken us SILENTLY:**
   property is the only route, and our Bridge sets exactly those keys in the config dict
   (`DeltaGlobalTableFunction.cs` ~499-509). A property recorded WITHOUT its writer feature declared is
   the metadata/protocol mismatch Spark rejects outright. Kept the derivation, wired to the declaration
-  so the two cannot come apart.
+  so the two cannot come apart. Note upstream's doc says the boolean "remains the source of truth", but
+  its default is FALSE and an omitted argument is indistinguishable from an explicit `false` — so under
+  that rule the property is simply UNREACHABLE for DV/row tracking, which reads as a gap rather than a
+  policy. Ours only ADDS an enabling route; it never overrides an argument that was explicitly true.
 - **Upstream ALWAYS overwrites the row-tracking materialized column names with a fresh
   `_row_id_<guid>`.** Ours lets a caller-supplied name win, and must: `__delta_row_id` is a
   USER-VISIBLE queryable column we advertise (`verify_delta_row_tracking_virtual`, 299), not an
