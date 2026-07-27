@@ -252,10 +252,47 @@ edits to churned regions.
    `DeleteBySelectionAsync`).
 
 ⇒ **What the revival is actually FOR** is the part §3.3 identified and nothing landed yet:
-`ReadAllWithMetadataAsync`'s per-row `_metadata` (`file_path` + absolute `row_index`), the
-`UpdateAsync(selection, updater)` shape that consumes it, and `MetadataPredicate.TryLower` (the zero-read
-predicate DELETE). Cherry-picking is therefore the wrong verb — PORT those three, drop the delete half, and
-reconcile naming against `DeleteBySelectionAsync`.
+`ReadAllWithMetadataAsync`'s per-row `_metadata`, the `UpdateAsync(selection, updater)` shape that consumes
+it, and `MetadataPredicate.TryLower` (the zero-read predicate DELETE). Cherry-picking is therefore the wrong
+verb — PORT those three, drop the delete half, and reconcile naming against `DeleteBySelectionAsync`.
+
+### 5.1 `_metadata` should carry FOUR members, not the prototype's two (decision, 2026-07-27)
+
+The prototype's struct is `file_path` + `row_index` — scoped to what a selection DELETE needs. It should
+also carry the STABLE identity, because that is what Spark's `_metadata` does for a row-tracking Delta
+table, and our own live Fabric/Spark validation has been querying exactly those names all along
+(`_metadata.row_id` ×22, `_metadata.row_commit_version` ×5, `_metadata.base_row_id` ×1 in CLAUDE.md).
+
+| member | role | nullable | notes |
+|---|---|---|---|
+| `file_path` | LOCATOR — the log `add.path`, URL-encoded as stored | no | the selection key |
+| `row_index` | LOCATOR — absolute physical position, counting DV-masked rows (Spark semantics) | no | the selection key |
+| `row_id` | STABLE identity | **yes** | only meaningful with row tracking on |
+| `row_commit_version` | STABLE identity | **yes** | ditto |
+
+**Why the ids must be nullable** (the three `COALESCE` cases in [rowid-concepts.md](rowid-concepts.md)):
+a file with NO materialized column (every fresh append — readers derive `baseRowId + position`); a per-row
+NULL inside a file rewritten from a source that PREDATED row tracking; and pre-enablement adds whose
+`baseRowId` is NULL. The locator members have no such case, so the nullability split is real, not defensive.
+
+**Why this is the shape worth porting.** One struct collapses THREE surfaces that are inconsistent today:
+
+1. EW's trailing `_metadata.row_id` column, which currently holds the **transient locator** under the
+   stable id's spec name — the fossil documented in rowid-concepts.md;
+2. EW's stable-id **out-params** (`sourceRowTrackingOut`, `strippedRowIdsOut`/`strippedVersionsOut`) — a
+   different mechanism for the sibling concept, verified 2026-07-27 to be upstream's, not ours;
+3. fabricator's SQL-reconstructed `__delta_row_id`/`__delta_row_commit_version` virtual columns
+   (`DeltaNativeReader.RowTrackingExpr`), which exist only because (1) took the name.
+
+It also FREES `_metadata.row_id` to mean the stable id, as spec and Spark do — the naming cleanup that
+rowid-concepts.md §"Consequences" item 3 has been carrying as the last open item.
+
+**Separable from the breaking rename.** Unifying EW's internals does NOT require renaming fabricator's
+user-visible `__delta_row_id`. Do the internal unification first; the query-breaking rename stays a
+separate, explicitly-scheduled decision.
+
+`base_row_id` is deliberately omitted: it is a per-FILE constant, so per-row it is redundant (Spark exposes
+it anyway; we can add it if an interop case ever wants byte-parity).
 
 ```
 EW:          git switch -c rowid-cleanup fabricator-patches   # inherits ALL current patches,
