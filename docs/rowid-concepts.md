@@ -5,15 +5,37 @@ one-time companions `DIVERGENCE.md` / `EW-ADAPTER-FEASIBILITY.md` / `RECONCILE.m
 migration analysis, superseded by the clast-master re-pin — see [ew-master-migration.md](ew-master-migration.md) —
 and deleted).
 
-> **Those three companions are UNRECOVERABLE** (checked 2026-07-27): zero commits in either repo's
-> history — they were untracked working files, so "deleted" means gone, not retrievable from git. Don't
-> spend time looking. In particular, any analysis of how a read should SURFACE row metadata (an
-> out-param vs an appended column vs generically-named metadata columns) is not there. The surviving
-> equivalent is upstream's `engineered-wood/doc/row-tracking-conformance-brief.md`: clast master strips
-> the hidden materialized columns so they never leak to a reader and exposes each survivor's resolved
-> id/version via **optional out-params**, where pr-4 (ours) appended a **trailing row-id column**. That
-> divergence is why our `__delta_row_id` is user-visible at all — we deliberately surface what upstream
-> deliberately hides — and therefore why it needs a stable, caller-chosen name.
+> **Those three companions are unrecoverable** (checked 2026-07-27): zero commits in either repo's
+> history — untracked working files, so "deleted" means gone. But they are NOT where the metadata-surface
+> analysis went:
+>
+> ### 👉 The `_metadata` proposal — EW branch `proto/metadata-dml` (pushed to the fork)
+> `PROPOSAL-metadata-dml.md` @ `0db9507`, prototype `72f2d3d` (read + delete-by-selection) + `2780334`
+> (update + symbolic lowering). **PARKED 2026-07-21**, not abandoned: Curt's PR#4-parity landing shipped
+> the rowid DML fabricator needed, so it stopped being load-bearing. `MetadataDmlTests` 11/11, full
+> DeltaLake.Table.Tests 339/339 at base `45cced1`.
+>
+> It proposes `ReadAllWithMetadataAsync` — a trailing `_metadata` STRUCT of `file_path` (the log
+> `add.path`) + `row_index` (the ABSOLUTE physical parquet index, Spark semantics: DV-masked rows excluded
+> from output but still counted) — plus `FileRowSelection` and `DeleteAsync(selection)` (**zero data reads**
+> on a non-CDF table: DV union + commit, vs O(active files) for a predicate delete), plus lowering of
+> `_metadata` predicate conjuncts onto that selection.
+>
+> **This is the real answer to the naming problem below**, and its own park note says so: it "retires the
+> fossil `_metadata.row_id`-as-transient-locator naming at the engine boundary" by giving the locator
+> Spark's vocabulary (`file_path`/`row_index`), which frees `_metadata.row_id` for the stable id. Reviving
+> it means rebasing over Curt's rowid landing — "real but bounded conflicts" per the note. Prefer this over
+> a bare rename: it fixes the names AND adds a capability.
+>
+> (Searching for this is genuinely hard, which is why this pointer exists: the API name appears in NO
+> current worktree, and a `git grep` over `git rev-list --all` MISSES it unless the rev list is uncapped —
+> the commits sit outside the first few hundred. `git log --all -S"WithMetadataAsync"` finds it.)
+>
+> Separately, the closest thing upstream has: `engineered-wood/doc/row-tracking-conformance-brief.md` —
+> clast master strips the hidden materialized columns so they never leak to a reader and exposes each
+> survivor's resolved id/version via **optional out-params**, where pr-4 (ours) appended a **trailing
+> row-id column**. That divergence is why our `__delta_row_id` is user-visible at all — we surface what
+> upstream hides — and therefore why it needs a stable, caller-chosen name.
 Purpose: pin the THREE distinct concepts that earlier analysis (mine) partially conflated, with
 code-grounded facts per codebase, so the adapter/upstream work doesn't mix them up again.
 
