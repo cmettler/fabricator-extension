@@ -70,6 +70,20 @@ code-grounded facts per codebase, so the adapter/upstream work doesn't mix them 
 [rowid-dml-seam.md](rowid-dml-seam.md) is the design + implementation plan for changing them (path-keyed
 EW DML, the optional STRUCT rowid, the prototype-revival mechanics, and what must be resolved first).
 
+> **2026-07-27 — the DV-DML boundary is now PATH-KEYED (built, green).** What §"Consequences" item 1 below
+> describes as future ("fabricator … decodes it to `(path, positions)`") is now what actually happens, and
+> it needed no new EW tail: the two deferred DV-DML entry points
+> (`ComputeDeletionVectorActionsAsync`, `RebaseDvDmlActionsAsync`) gained `FileRowSelection` overloads as
+> their CORE, the ordinal-keyed forms became thin adapters, and fabricator does the rowid→path decode
+> itself through `PlanFiles`. Two facts made this a correctness fix rather than tidying: the ordinal
+> round-trip was a **pure detour** (EW's first act was to convert back to paths), and an unresolvable
+> ordinal was **silently skipped** — so identifiers captured against the wrong snapshot deleted nothing
+> without an error. Details + the remaining rowid-keyed entry points: rowid-dml-seam.md §3.1.
+>
+> **The three concepts below are unaffected** — this changed how a row is ADDRESSED across one API
+> boundary, not what the transient locator or the stable id MEAN, and no user-visible name moved. Item 3
+> (the naming cleanup) is still open and still breaking.
+
 ## What a USER can actually type — MEASURED 2026-07-27, settles a recurring confusion
 
 Run against a 3-file Delta table (`native_read true`, row tracking on by default), one row per commit.

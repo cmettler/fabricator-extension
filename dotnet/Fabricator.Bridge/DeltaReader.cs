@@ -2057,15 +2057,29 @@ internal static class DeltaReader
             if (c != ridIdx) { setCols[updates.Schema.FieldsList[c].Name] = updates.Column(c); }
         }
 
-        // Decode the rowids into per-file-ordinal absolute positions (the DV-delete half's input).
+        // Decode the rowids into (file path, absolute position) — the DV-delete half's input. The ordinal is
+        // OUR encoding, so the decode belongs here rather than inside engineered-wood; PlanFiles supplies the
+        // ordering, the same planner that minted these ordinals in BuildNativeScanListAsync.
         long posMask = (1L << RowIdPositionBits) - 1;
-        var positionsByOrdinal = new Dictionary<int, IReadOnlyCollection<long>>();
+        var planByOrdinal = new Dictionary<int, string>(snapshot.ActiveFiles.Count);
+        foreach (var planned in table.PlanFiles(snapshot: snapshot))
+        {
+            planByOrdinal[planned.Ordinal] = planned.File.Path;
+        }
+        var positionsByFile = new Dictionary<string, IReadOnlyCollection<long>>(System.StringComparer.Ordinal);
         foreach (var rid in updIdxByRid.Keys)
         {
             int ordinal = (int)(rid >> RowIdPositionBits);
-            if (!positionsByOrdinal.TryGetValue(ordinal, out var set))
+            if (!planByOrdinal.TryGetValue(ordinal, out var filePath))
             {
-                positionsByOrdinal[ordinal] = set = new HashSet<long>();
+                throw new System.InvalidOperationException(
+                    $"merge-on-read UPDATE: row-id file ordinal {ordinal} does not name an active file of "
+                    + $"version {snapshot.Version} ({planByOrdinal.Count} active) — the row identifiers were "
+                    + "captured against a different snapshot.");
+            }
+            if (!positionsByFile.TryGetValue(filePath, out var set))
+            {
+                positionsByFile[filePath] = set = new HashSet<long>();
             }
             ((HashSet<long>)set).Add(rid & posMask);
         }
@@ -2129,7 +2143,8 @@ internal static class DeltaReader
         }
 
         // DV-delete the old rows (remove+add pairs, no rewrite) + write the post-image file(s).
-        var (dvActions, _) = await table.ComputeDeletionVectorActionsAsync(positionsByOrdinal, token)
+        var (dvActions, _) = await table.ComputeDeletionVectorActionsAsync(
+                new EngineeredWood.DeltaLake.Table.FileRowSelection(positionsByFile), token)
             .ConfigureAwait(false);
         var files = await table.WriteDataFilesAsync(postImages, token,
                 materializedRowIds: materialize && matIds.Count > 0 ? matIds : null)

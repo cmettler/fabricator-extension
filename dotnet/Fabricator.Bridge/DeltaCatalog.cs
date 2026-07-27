@@ -2537,6 +2537,26 @@ public sealed class DeltaCatalog : IBackendCatalog
     private const long PendingFileOrdinalBase = 0x780000;
     private const long RowIdPosMask = (1L << RowIdPositionBits) - 1;
 
+    /// <summary>
+    /// Ordinal → log <c>add.path</c> for one snapshot: the decode half of the transient row id, so that what
+    /// crosses into engineered-wood is a self-describing <see cref="FileRowSelection"/> rather than an integer
+    /// whose meaning depends on both sides reproducing the same sort against the same version.
+    /// <see cref="DeltaTable.PlanFiles"/> is deliberately the single source of the ordering — it is the same
+    /// planner the reader that MINTED these ordinals goes through (<c>BuildNativeScanListAsync</c>), so the
+    /// encode and decode cannot drift. Called unfiltered, so ordinals are dense and every active file appears.
+    /// </summary>
+    private static Dictionary<int, string> PathsByOrdinal(
+        DeltaTable table, EngineeredWood.DeltaLake.Snapshot.Snapshot snapshot)
+    {
+        var plan = table.PlanFiles(snapshot: snapshot);
+        var map = new Dictionary<int, string>(plan.Count);
+        foreach (var planned in plan)
+        {
+            map[planned.Ordinal] = planned.File.Path;
+        }
+        return map;
+    }
+
     // Eligibility for buffered (explicit-transaction) DML. Never silently non-atomic: an ineligible shape
     // ERRORS with the autocommit escape hatch instead of falling back to an immediate commit.
     private void EnsureBufferedDmlEligible(in DeltaReader.TxnDmlProfile p, string op, bool forUpdate)
@@ -3092,13 +3112,18 @@ public sealed class DeltaCatalog : IBackendCatalog
                         schemaOverride: pending.PendingDeltaSchema)
                     .ConfigureAwait(false));
             }
-            // Split the delete set: committed-file ordinals resolve against the PINNED snapshot
-            // (remove+add DV pairs); pending-file ordinals (0x780000+idx, this transaction's own eager
-            // files) become inline DVs BORN ON their adds at commit — the rows never reach any
-            // committed version.
-            var deletes = new Dictionary<int, IReadOnlyCollection<long>>(pending.DeletedByOrdinal.Count);
+            // Split the delete set: committed-file rows are handed to EW keyed BY PATH — the transient
+            // rowid's file ordinal is OUR encoding, so WE own the decode, and PlanFiles is the ONE
+            // ordinal->path dictionary, the same planner that minted those ordinals for the reader. That
+            // also makes a rowid that does not resolve a loud error here instead of a delete EW silently
+            // drops. Pending-file ordinals (0x780000+idx, this transaction's own eager files) stay INDEX
+            // keyed: those files are not in any snapshot, so no path can name them — they become inline DVs
+            // BORN ON their adds at commit, and their rows never reach a committed version.
+            var deletes = new Dictionary<string, IReadOnlyCollection<long>>(
+                pending.DeletedByOrdinal.Count, StringComparer.Ordinal);
             Dictionary<int, IReadOnlyCollection<long>>? pendingFileDeletes = null;
             long pendingRowsDeleted = 0;
+            Dictionary<int, string>? pinnedPaths = null;
             foreach (var kv in pending.DeletedByOrdinal)
             {
                 if (kv.Key >= PendingFileOrdinalBase)
@@ -3109,10 +3134,20 @@ public sealed class DeltaCatalog : IBackendCatalog
                 }
                 else
                 {
-                    deletes[kv.Key] = kv.Value;
+                    pinnedPaths ??= PathsByOrdinal(table, pinnedSnap);
+                    if (!pinnedPaths.TryGetValue(kv.Key, out var delPath))
+                    {
+                        throw new System.InvalidOperationException(
+                            $"delta buffered DML on '{tablePath}': row-id file ordinal {kv.Key} does not name "
+                            + $"an active file of the transaction's pinned version {pinned} "
+                            + $"({pinnedPaths.Count} active) — the row identifiers were captured against a "
+                            + "different snapshot.");
+                    }
+                    deletes[delPath] = kv.Value;
                 }
             }
-            var (dvActions, rowsDeleted) = await table.ComputeDeletionVectorActionsAsync(deletes,
+            var deleteSelection = new FileRowSelection(deletes);
+            var (dvActions, rowsDeleted) = await table.ComputeDeletionVectorActionsAsync(deleteSelection,
                     resolveAgainst: pinnedSnap, cancellationToken: token)
                 .ConfigureAwait(false);
             rowsDeleted += pendingRowsDeleted;
@@ -3180,7 +3215,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 {
                     try
                     {
-                        currentDv = await table.RebaseDvDmlActionsAsync(dvActions, deletes, pinnedSnap,
+                        currentDv = await table.RebaseDvDmlActionsAsync(dvActions, deleteSelection, pinnedSnap,
                                 table.CurrentSnapshot, cancellationToken: token)
                             .ConfigureAwait(false);
                     }

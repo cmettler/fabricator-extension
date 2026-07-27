@@ -1,11 +1,16 @@
 # Design: the DML row-identity seam, and how it evolves
 
-**Status: DESIGN, nothing built (2026-07-27).** Target: a future fabricator `main` branch pinned to
-duckdb `main`, once the `v1.5-variegata` line is stable. Companion to
-[rowid-concepts.md](rowid-concepts.md), which pins the CONCEPTS and the measured user surface; this doc
-is the PLAN.
+**Status (2026-07-27): §3's DV-DML half is BUILT and green** on `v1.5-variegata` — the deletion-vector
+DML boundary between fabricator and engineered-wood is now keyed by `(path, positions)`, not by a file
+ordinal. See §3.1 for exactly what landed and what did not. The rest (§4's STRUCT rowid, the remaining
+`*ByRowIds*` entry points) is still design. Companion to [rowid-concepts.md](rowid-concepts.md), which
+pins the CONCEPTS and the measured user surface; this doc is the PLAN.
 
-Everything below is marked **VERIFIED** (checked in source today, with the location), **PROPOSED**, or
+Note this did NOT need to wait for a fabricator `main` branch pinned to duckdb `main`: the translation
+is ours, on our side of the boundary, so it is independent of whatever eventually supersedes rowid DML.
+Only the questions in §7 are.
+
+Everything below is marked **VERIFIED** (checked in source, with the location), **PROPOSED**, or
 **UNKNOWN**. That distinction is the point of the document: this area has repeatedly produced confident
 statements that the code contradicted, including several of mine in the session that produced this file.
 
@@ -34,6 +39,8 @@ self-describing key — and we should own the translation.
 | V6 | **The transient locator and the stable id are NOT confused in code, only in names.** The buffered-UPDATE loop uses `rid` for the DV target (`rid >> RowIdPositionBits` → `DeletedByOrdinal`) and `srcTracking[..].Ids` for identity, in adjacent lines. | `dotnet/Fabricator.Bridge/DeltaCatalog.cs` ~2745-2765 |
 | V7 | **duckdb-mysql's remote pushdown**: a pure-remote DELETE (`WHERE i = 0`, `WHERE i >= 3 OR v = 20`, bare `DELETE FROM t`) becomes ONE remote SQL statement, visible as `MYSQL_QUERY` in EXPLAIN. Anything with `USING` is not pushed down — and duckdb-mysql has **no rowid fallback**, it simply errors ("DELETE syntax not supported"). | `duckdb/duckdb-mysql` `test/sql/remote_pushdown/remote_pushdown_delete.test` |
 | V8 | The packing limits: 40 bits position, leaving 23 signed bits of ordinal ⇒ **~8.4M files** and ~1.1T rows/file. | `RowIdPositionBits = 40`, EW `DeltaTable.cs` |
+| V9 | **The ordinal round-trip was a pure detour.** `RebaseDvDmlActionsAsync`'s FIRST act with `newPositionsByOrdinal` was to convert it to an `oursByPath` dictionary and use only that for the rest of the method — so the caller encoded path→ordinal and EW immediately decoded ordinal→path, with a lossy integer in between. `ComputeDeletionVectorActionsAsync` likewise used the ordinal for nothing but `ordered[ordinal]`. | EW `DeltaTable.cs`, both methods (pre-change) |
+| V10 | **An unresolvable ordinal was SILENTLY SKIPPED by both** — `if (ordinal < 0 \|\| ordinal >= ordered.Count) continue;` and `if (kvp.Key >= 0 && kvp.Key < fromOrdered.Count)`. So identifiers captured against the wrong snapshot did not fail; they deleted NOTHING, with no error. This is what makes the path key a correctness fix rather than tidying: a path that is not active is recognisably wrong. | same, pre-change |
 
 ### The consequence of V7 that reverses an earlier conclusion
 
@@ -50,7 +57,7 @@ UNBLOCK predicate-based Delta DML — a capability our own notes record as block
 
 ---
 
-## 3. The design (PROPOSED)
+## 3. The design (DV-DML half BUILT — see §3.1; the rest PROPOSED)
 
 EW ends up with **two entry points, neither of which knows anything about DuckDB**:
 
@@ -75,12 +82,66 @@ proposal is exactly this shape.
 
 ### The ordinal-keyed EW surface we would migrate
 
-| API | keyed by | note |
+| API | keyed by | status |
 |---|---|---|
-| `ComputeDeletionVectorActionsAsync(positionsByOrdinal, …, resolveAgainst)` | ordinal | the buffered DV DELETE flush |
-| `RebaseDvDmlActionsAsync(… newPositionsByOrdinal …)` | ordinal | Layer 3 (B) row-level remap across a concurrent rewrite |
-| `ReadRowsByRowIdsAsync(rowIds, …)` | rowid (encodes ordinal) | buffered UPDATE read-back, CDF delete capture |
-| `CommitDataFilesAsync(… deletedPositionsByFileIndex …)` | **index into not-yet-committed written files** | ⚠ a DIFFERENT index space (our `0x780000+` pending files). Those files are not in the snapshot, so path-keying does not reach it — it stays index-keyed. |
+| `ComputeDeletionVectorActionsAsync(positionsByOrdinal, …, resolveAgainst)` | ordinal | ✅ **DONE** — path-keyed overload is the core; the buffered DV DELETE flush and merge-on-read UPDATE both use it |
+| `RebaseDvDmlActionsAsync(… newPositionsByOrdinal …)` | ordinal | ✅ **DONE** — path-keyed overload is the core (Layer 3 (B) row-level remap across a concurrent rewrite) |
+| `ReadRowsByRowIdsAsync(rowIds, …)` | rowid (encodes ordinal) | ⬜ still rowid — buffered UPDATE read-back, CDF delete capture. Harder: it also EMITS rowids (`rowIdsOut`) for the caller to correlate against, so a path key changes its output shape too, not just its input |
+| `DeleteByRowIdsAsync` / `DeleteByRowIdsViaVectorsAsync` / `UpdateByRowIdsAsync` | rowid | ⬜ still rowid — the AUTOCOMMIT paths. They decode internally and feed `RemapRowLevelDeletesAsync`; a separable second increment |
+| `CommitDataFilesAsync(… deletedPositionsByFileIndex …)` | **index into not-yet-committed written files** | ✅ **stays index-keyed, correctly** — a DIFFERENT index space (our `0x780000+` pending files). Those files are in no snapshot, so no path can name them. Not a gap. |
+
+### 3.1 What landed (2026-07-27)
+
+**EW** — `FileRowSelection.cs` (taken from the parked prototype so the shape stays compatible with it:
+`IReadOnlyDictionary<string /*add.path*/, IReadOnlyCollection<long> /*absolute positions*/>`), plus
+path-keyed overloads of the two methods above. The path-keyed form is the CORE; the ordinal-keyed form
+is a thin adapter (`SelectionFromOrdinals`) that resolves and delegates, so there is one implementation.
+
+The two forms differ deliberately in strictness, which is the whole point of V10:
+
+- the **ordinal** adapter keeps SKIPPING an out-of-range ordinal — its historical contract, and upstream's
+  own tests depend on it (**11** call sites across `BufferedTransactionTests` / `ReadWithRowIdsTests` /
+  `SparkInteropTests`, which now also give the adapter free coverage);
+- the **path** core THROWS on a path that is not active in the resolved snapshot, and `RebaseDvDmlActionsAsync`
+  additionally throws if a selected path was not active in `from` — the snapshot the selection claims to
+  come from.
+
+**Bridge** — the buffered flush (`DeltaCatalog.FlushDmlTransaction`) and the merge-on-read UPDATE
+(`DeltaReader.MergeOnReadUpdateAsync`) now decode the rowid's ordinal to a path THEMSELVES, via
+`PlanFiles` (`PathsByOrdinal`), and pass a `FileRowSelection`. An ordinal that does not resolve is a loud
+error naming the version and the active-file count. The ordinal is *our* encoding of *our* rowid, so the
+decode belongs on our side.
+
+**The loop is now closed through one planner, on both read paths** (checked, not assumed): the native
+minting path is `BuildNativeScanListAsync` → `PlanFiles`, and the CODEC minting path is EW's
+`ReadWithTransientRowIdsAsync`, which `foreach (var (addFile, ordinal) in PlanFiles(filter, snapshot))`
+— it was moved onto `PlanFiles` by the earlier increment. So every ordinal that exists was produced by
+`PlanFiles`, and every ordinal that is consumed is resolved by `PlanFiles`. Encode and decode cannot drift.
+
+**And this is where the PRE-PRUNE ordinal contract earns its keep a second time.** The codec minting scan
+calls `PlanFiles(filter, …)` — pruning leaves GAPS — while the decode calls it UNFILTERED. That only works
+because the ordinal is an index into the *unfiltered* path-sorted set: the unfiltered plan is therefore a
+superset containing every ordinal any filtered plan could have emitted, so a selection resolves correctly
+no matter which predicate the scan that minted it happened to push. A post-prune (dense-per-filter)
+ordinal would make the decode depend on reproducing the scan's filter — which the DML side does not have.
+
+**Tests** — EW `FileRowSelectionTests` (6): the two keyings name the same rows; a path-keyed delete
+removes exactly the selected rows across files; **the silent-loss case** (identifiers resolved against a
+shrunk snapshot ⇒ ordinal form reports 0 rows deleted with no error, path form throws); unknown path;
+the row-level rebase composing with a concurrent same-file delete; a rebase selection naming a
+non-`from` file. Every fixture has **three files** per §6's trap.
+
+**Gate** — EW Table.Tests **555** × {net10.0, net8.0, net472} (was 549) / DeltaLake 217 / Expressions 139
+/ Core 430; fabricator `verify_delta_catalog_transactions` 941, `verify_delta_row_level_concurrency` 70,
+`verify_delta_row_tracking_virtual` 299, the full hermetic tier **53/53 @ 4152** and the service tier
+**42/42 @ 1227** — both the SAME counts as before the change, which is the signal that re-keying the
+DV-DML boundary is behaviour-neutral for everything pinned (a re-key that quietly dropped or mistargeted a
+row would move a count, not just fail a suite). The service tier is the one that matters most here:
+`verify_delta_catalog_s3` runs the buffered DML flush over S3, i.e. against the real `add.path` keys.
+
+**One trap re-learned:** `Dictionary.TryAdd` does not exist on **netstandard2.0**, so it broke the net472
+build only — the same class as the earlier `blob[n..]` range-indexer break. Anything offered upstream must
+build on every TFM upstream declares, and only the net472 leg proves it.
 
 ---
 
