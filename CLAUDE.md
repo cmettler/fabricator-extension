@@ -474,8 +474,22 @@ only and would delete the wrong rows silently. The zero-data-reads claim is **me
 intent. Data-column predicates are untouched (`TryLower` returns false; the guard no-ops).
 
 **Gates:** EW Table.Tests **571** × {net10.0, net8.0, net472} (was 555 pre-`_metadata`) / DeltaLake 217 /
-Expressions 139 / Core 430; fabricator hermetic **53/53 @ 4152** and service **42/42 @ 1227**, BOTH unchanged —
-the right result, since this is EW surface with **no fabricator consumer yet** (no ABI, no Bridge change).
+Expressions 139 / Core 430; fabricator hermetic **53/53 @ 4152** and service **42/42 @ 1227**, BOTH unchanged.
+
+**FABRICATOR IS MIGRATED OFF EW's ROWID UPDATE SURFACE (same day, no ABI change):** `DeltaReader`'s
+copy-on-write UPDATE calls `UpdateBySelectionAsync`, re-keying the DuckDB updates batch onto the `_metadata`
+struct (`ReKeyUpdatesOntoMetadata`; fills only the two LOCATOR members — EW resolves each row's own stable id
+from the file it rewrites, so passing ids would assert identity we do not own). ⚠ **Unlike the rest of this
+work it is NOT behaviour-neutral by construction** — it re-keys a LIVE path — so it was gated targeted-first
+(`update` 63 / `dv_default` 58 / `native_write` 147) before the full tiers, and the service tier matters
+because `verify_mssql_s3_polybase` is protocol 1.0 ⇒ DV off ⇒ exactly this copy-on-write path.
+**The packing did not vanish, it RELOCATED**: `(ordinal << 40) | position` now exists ONLY in fabricator's
+DuckDB adapter — where it belongs, since DuckDB's own `rowid` is a single BIGINT — and no longer in a Delta
+library's public API. That is §1's "we should own the translation", achieved. **`UpdateByRowIdsAsync` itself
+is NOT ours to delete**: upstream's public surface, exercised by upstream's `RowIdDmlTests` /
+`SparkInteropTests` / `PartitionedRewriteLayoutTests`; removing it would delete upstream tests and make the
+patch set LESS upstreamable. The `_metadata` READ surface still has no fabricator consumer — wiring that is
+really the §4 STRUCT-rowid question in disguise.
 
 **The LAST rowid-keyed API is `ReadRowsByRowIdsAsync`**, and it is the interesting one: it both TAKES rowids and
 EMITS them (`rowIdsOut`) beside `sourceRowTrackingOut`, so converting it collapses **three out-params into the

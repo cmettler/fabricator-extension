@@ -429,6 +429,39 @@ and EMITS them (`rowIdsOut`), alongside `sourceRowTrackingOut` — three out-par
 would replace with one column. Converting it finishes the unification; it also touches the Bridge's buffered
 UPDATE read-back and CDF delete capture, so it is its own increment.
 
-**Nothing in fabricator consumes any of §6 yet** — this is EW surface only, no ABI or Bridge change, and the
-extension's behaviour is unchanged (hermetic/service counts identical). Wiring it is a separate decision from
-building it.
+### 6.5 Fabricator migrated off the rowid UPDATE surface — and the packing RELOCATED
+
+`DeltaReader`'s copy-on-write UPDATE now calls `UpdateBySelectionAsync`, re-keying the DuckDB updates batch
+onto the `_metadata` struct via `ReKeyUpdatesOntoMetadata`. **Nothing of ours calls EW's rowid UPDATE surface
+any more.** It fills only the two LOCATOR members and leaves the ids null — correct rather than lazy: this
+addresses rows physically, and EW resolves each row's own stable id from the file it rewrites, so passing ids
+would assert identity we do not own. An unresolvable ordinal throws here too, so every DML path we drive now
+fails loudly on a stale identifier.
+
+**This answers "can we get rid of `UpdateByRowIdsAsync`?" precisely, and the answer has two halves:**
+
+- **Our dependence: gone** (one call site, migrated).
+- **The API itself: not ours to delete.** It is upstream's public surface, exercised by upstream's
+  `RowIdDmlTests` / `SparkInteropTests` / `PartitionedRewriteLayoutTests`. Removing it would mean deleting
+  upstream tests, growing our diff and making the patch set LESS upstreamable — the opposite of the
+  fork-avoidance strategy. Retiring it is Curt's call, sensibly after the `_metadata` pair proves itself.
+
+**And the packing does not vanish — it MOVES.** Fabricator must still mint a packed rowid because DuckDB's
+`rowid` is a single `BIGINT`; that encoding exists to satisfy DuckDB, not engineered-wood. So:
+
+| where `(ordinal << 40) \| position` lives | before | after |
+|---|---|---|
+| a Delta library's public API | yes | **no** |
+| fabricator's DuckDB adapter | yes | yes — unavoidable while `rowid` is a BIGINT |
+
+Which is exactly §1's goal ("we should own the translation"). Making it disappear altogether is §4's STRUCT
+rowid — still gated on measurement, and note §3.3 already showed a STRUCT rowid would NOT have solved the
+per-row identity problem that `_metadata` solved instead.
+
+⚠ Unlike everything else in §3/§6, this change is **not behaviour-neutral by construction** — it re-keys a
+live path. Gated accordingly: `verify_delta_catalog_update` 63 / `dv_default` 58 / `native_write` 147 at their
+pinned counts, then hermetic 53/53 @ 4152 and the service tier (whose `verify_mssql_s3_polybase` is protocol
+1.0, i.e. DV off, i.e. this very copy-on-write path).
+
+The `_metadata` READ surface still has no fabricator consumer — wiring that (so a scan carries the struct
+instead of a packed rowid) is a separate decision, and is really the §4 question in disguise.

@@ -2004,7 +2004,12 @@ internal static class DeltaReader
             }
             else
             {
-                await table.UpdateByRowIdsAsync(updates, cancellationToken: token)
+                // Copy-on-write, addressed by (add.path, absolute position) rather than by the packed rowid:
+                // we re-key the updates batch onto engineered-wood's `_metadata` struct, so nothing of ours
+                // depends on its rowid UPDATE surface. The packing stays where it belongs — on the DuckDB side
+                // of this method, because DuckDB's own rowid is a single BIGINT.
+                await table.UpdateBySelectionAsync(
+                        ReKeyUpdatesOntoMetadata(table, updates), cancellationToken: token)
                     .ConfigureAwait(false);
             }
             DmlLog.LogInformation("delta update-rewrite {Path}: rowids={RowIds} mode={Mode} writer={Writer}",
@@ -2024,6 +2029,88 @@ internal static class DeltaReader
     // The transient rowid's position width — (fileOrdinal << 40) | absolutePosition, matching
     // engineered-wood's ReadAllWithRowIdsAsync encoding.
     private const int RowIdPositionBits = 40;
+
+    /// <summary>
+    /// Replaces the transient-rowid column of a DuckDB UPDATE batch with engineered-wood's <c>_metadata</c>
+    /// struct, so the copy-on-write UPDATE is addressed by <c>(add.path, absolute position)</c> instead of by a
+    /// packed 64-bit id. The SET columns pass through untouched.
+    /// </summary>
+    /// <remarks>
+    /// Only the two LOCATOR members are filled — this addresses rows physically, and engineered-wood ignores the
+    /// identity members here (it resolves each row's own stable id from the file it rewrites). The packing is
+    /// decoded on THIS side because it exists to satisfy DuckDB, whose <c>rowid</c> is a single BIGINT; it is not
+    /// something a Delta library should have to know about.
+    /// </remarks>
+    private static RecordBatch ReKeyUpdatesOntoMetadata(DeltaTable table, RecordBatch updates)
+    {
+        int ridIdx = -1;
+        for (int c = 0; c < updates.ColumnCount; c++)
+        {
+            if (updates.Schema.FieldsList[c].Name == EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.VirtualRowIdColumn) { ridIdx = c; break; }
+        }
+        if (ridIdx < 0 || updates.Column(ridIdx) is not Int64Array rids)
+        {
+            throw new System.InvalidOperationException(
+                $"copy-on-write UPDATE: updates batch has no '{EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.VirtualRowIdColumn}' column.");
+        }
+
+        var snapshot = table.CurrentSnapshot;
+        var pathByOrdinal = new Dictionary<int, string>(snapshot.ActiveFiles.Count);
+        foreach (var planned in table.PlanFiles(snapshot: snapshot))
+        {
+            pathByOrdinal[planned.Ordinal] = planned.File.Path;
+        }
+
+        long posMask = (1L << RowIdPositionBits) - 1;
+        var pathB = new StringArray.Builder();
+        var idxB = new Int64Array.Builder();
+        var ridB = new Int64Array.Builder();
+        var verB = new Int64Array.Builder();
+        for (int i = 0; i < updates.Length; i++)
+        {
+            long rid = rids.GetValue(i)!.Value;
+            int ordinal = (int)(rid >> RowIdPositionBits);
+            if (!pathByOrdinal.TryGetValue(ordinal, out var filePath))
+            {
+                throw new System.InvalidOperationException(
+                    $"copy-on-write UPDATE: row-id file ordinal {ordinal} does not name an active file of "
+                    + $"version {snapshot.Version} ({pathByOrdinal.Count} active) — the row identifiers were "
+                    + "captured against a different snapshot.");
+            }
+            pathB.Append(filePath);
+            idxB.Append(rid & posMask);
+            ridB.AppendNull();
+            verB.AppendNull();
+        }
+
+        var metaType = new Apache.Arrow.Types.StructType(new List<Field>
+        {
+            new("file_path", Apache.Arrow.Types.StringType.Default, false),
+            new("row_index", Apache.Arrow.Types.Int64Type.Default, false),
+            new("row_id", Apache.Arrow.Types.Int64Type.Default, true),
+            new("row_commit_version", Apache.Arrow.Types.Int64Type.Default, true),
+        });
+        var metaArr = new StructArray(metaType, updates.Length,
+            new IArrowArray[] { pathB.Build(), idxB.Build(), ridB.Build(), verB.Build() },
+            ArrowBuffer.Empty, 0);
+
+        var fields = new List<Field>(updates.ColumnCount);
+        var arrays = new List<IArrowArray>(updates.ColumnCount);
+        for (int c = 0; c < updates.ColumnCount; c++)
+        {
+            if (c == ridIdx)
+            {
+                fields.Add(new Field(DeltaTable.MetadataColumnName, metaType, false));
+                arrays.Add(metaArr);
+            }
+            else
+            {
+                fields.Add(updates.Schema.FieldsList[c]);
+                arrays.Add(updates.Column(c));
+            }
+        }
+        return new RecordBatch(new Apache.Arrow.Schema(fields, null), arrays, updates.Length);
+    }
 
     /// <summary>
     /// Decodes transient rowids into the self-describing <c>(add.path -&gt; absolute positions)</c> key
