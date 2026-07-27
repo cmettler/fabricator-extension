@@ -87,8 +87,8 @@ proposal is exactly this shape.
 | `ComputeDeletionVectorActionsAsync(positionsByOrdinal, …, resolveAgainst)` | ordinal | ✅ **DONE** (§3.1) — path-keyed core; the buffered DV DELETE flush and merge-on-read UPDATE both use it |
 | `RebaseDvDmlActionsAsync(… newPositionsByOrdinal …)` | ordinal | ✅ **DONE** (§3.1) — path-keyed core (Layer 3 (B) row-level remap across a concurrent rewrite) |
 | `DeleteByRowIdsViaVectorsAsync` / `DeleteByRowIdsAsync` | rowid | ✅ **DONE** (§3.2) — new `DeleteBySelectionViaVectorsAsync` / `DeleteBySelectionAsync` are the cores; the rowid forms are adapters |
-| `UpdateByRowIdsAsync` (×3 overloads) | rowid | ⬜ **blocked on the per-row identity shape — see §3.3.** Not a file-key problem |
-| `ReadRowsByRowIdsAsync(rowIds, …)` | rowid | ⬜ **same blocker (§3.3)** — it EMITS packed rowids via `rowIdsOut` |
+| `UpdateByRowIdsAsync` (×3 overloads) | rowid | ✅ **DONE** (§6) — the core is `UpdateBySelectionCoreAsync` and hands the rewriter `(filePath, batches, positionsPerBatch)`; all three rowid overloads are re-packing adapters |
+| `ReadRowsByRowIdsAsync(rowIds, …)` | rowid | ⬜ **THE LAST ONE.** Takes rowids AND emits packed rowids (`rowIdsOut`) plus `sourceRowTrackingOut` — converting it means replacing those three out-params with the `_metadata` struct, which is the same unification (§6.1) |
 | `CommitDataFilesAsync(… deletedPositionsByFileIndex …)` | **index into not-yet-committed written files** | ✅ **stays index-keyed, correctly** — a DIFFERENT index space (our `0x780000+` pending files). Those files are in no snapshot, so no path can name them. Not a gap. |
 
 ### 3.1 What landed (2026-07-27)
@@ -370,3 +370,65 @@ branch.
 Tracking duckdb `main` means absorbing continuous upstream API churn — the 1.5 `ExtensionLoader` break is
 the precedent — and doubling CI minutes. The branch-naming convention already reserves `main` for this
 (see CLAUDE.md "BRANCH NAMING"); add it as a nightly allowed-to-fail branch rather than a gate.
+
+---
+
+## 6. The `_metadata` port — BUILT (2026-07-27)
+
+All three items §5 identified are in, and one of them turned out better than the plan expected.
+
+### 6.1 `ReadAllWithMetadataAsync` — the four-member struct
+
+Landed as §5.1 specified: `file_path` + `row_index` (non-null LOCATOR) and `row_id` +
+`row_commit_version` (nullable IDENTITY), shape fixed regardless of the table's row-tracking config so a
+consumer binds one schema.
+
+**Not a port of the prototype's implementation — deliberately.** That one hand-rolls its own parquet open,
+column-mapping rename and DV filter, and its own note conceded the cost ("full schema, no projection,
+partition columns not re-added"). But the current base already computes every member on the MAINTAINED read
+path: `ReadFileAsync`'s `strippedAbsPositionsOut` is `row_index`, `strippedRowIdsOut`/`strippedVersionsOut`
+are the two ids, and the path comes from the planned add. So the implementation is pure assembly (~25 lines)
+and inherits projection, column mapping, partition re-add, schema reconciliation and DV semantics for free.
+
+It also **consumes the out-params that were the second, inconsistent mechanism** — which is the unification
+this was for: the locator used to arrive as a column while its sibling identity arrived as out-params.
+
+### 6.2 The UPDATE core is path-keyed — §3.3's UPDATE half is CLOSED
+
+`UpdateBySelectionCoreAsync(selection, rewriteFile)` hands the rewriter
+`(filePath, sourceBatches, positionsPerBatch)` instead of `(fileOrdinal, …, rowIdsPerBatch)`. Two public
+entry points sit on it:
+
+- `UpdateBySelectionAsync(selection, rewriteFile)` — the primitive, identity as (path, position);
+- `UpdateBySelectionAsync(RecordBatch updates)` — **the round trip**: read with `ReadAllWithMetadataAsync`,
+  change values, hand the batch back. The caller writes NO substitution code and never sees an ordinal or a
+  packed rowid. It reuses the rowid-keyed substitution helper VERBATIM, because within one file a position
+  is already a unique key.
+
+All three `UpdateByRowIdsAsync` overloads became adapters that re-pack `(ordinal << 40) | position` for
+their existing rewriters, so nothing downstream changed — proven by the suite staying green at each step.
+
+Note the third overload (`RecordBatch updates` keyed by a rowid column) stays rowid-keyed BY CONTRACT: its
+input batch carries a rowid column, so re-packing is correct there rather than a compromise.
+
+### 6.3 Predicate lowering — and the zero-read DELETE is MEASURED
+
+`MetadataPredicate` is ported as-is (self-contained; only `Expressions` types + `FileRowSelection`) and
+wired at the head of `DeleteAsync(predicate)`: a predicate addressing rows only physically lowers to a
+selection, and one that MENTIONS `_metadata` but cannot lower is **rejected loudly** rather than handed to
+the row mask, which binds data columns only and would mis-evaluate it — deleting the wrong rows silently.
+
+**The zero-data-reads claim is measured, not asserted:** a delegating `CountingFileSystem` counts opens of
+data parquet files (log/checkpoint excluded) and the test asserts **0**. Without that instrument the claim
+would be a statement about intent.
+
+### 6.4 What remains, precisely
+
+`ReadRowsByRowIdsAsync` is the last rowid-keyed API. It is the interesting one because it both TAKES rowids
+and EMITS them (`rowIdsOut`), alongside `sourceRowTrackingOut` — three out-params that the `_metadata` struct
+would replace with one column. Converting it finishes the unification; it also touches the Bridge's buffered
+UPDATE read-back and CDF delete capture, so it is its own increment.
+
+**Nothing in fabricator consumes any of §6 yet** — this is EW surface only, no ABI or Bridge change, and the
+extension's behaviour is unchanged (hermetic/service counts identical). Wiring it is a separate decision from
+building it.

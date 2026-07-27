@@ -432,6 +432,56 @@ path-keyed selection is built from.
 only (same class as the earlier `blob[n..]` range-indexer break). Only the net472 leg proves a change is
 offerable upstream.
 
+#### THE `_metadata` SURFACE — BUILT (2026-07-27, EW-only, no ABI/Bridge change): one per-row identity column
+
+The parked `proto/metadata-dml` design is ported, in the shape the user settled: a trailing **`_metadata`
+STRUCT** with **FOUR** members, not the prototype's two — `file_path` + `row_index` (non-null **LOCATOR**, a
+physical address valid for this snapshot) and `row_id` + `row_commit_version` (**nullable IDENTITY**, durable
+across rewrites). That is Spark's own vocabulary for a row-tracking Delta table, which our live Fabric/Spark
+validation has been querying all along (`_metadata.row_id` ×22 in this file). Full record + what remains:
+[docs/rowid-dml-seam.md](docs/rowid-dml-seam.md) §5.1/§6.
+
+**Why one struct.** It collapses THREE surfaces that were inconsistent: EW's trailing column (which held the
+TRANSIENT locator under the stable id's spec name — the fossil), EW's stable-id **out-params**
+(`sourceRowTrackingOut`/`strippedRowIdsOut`/`strippedVersionsOut` — verified upstream's, not ours), and
+fabricator's SQL-reconstructed `__delta_row_id` virtuals, which exist only because the first took the name.
+The **nullability split is load-bearing, not defensive**: the locator always exists; the ids are NULL wherever
+underivable (a file predating row tracking, a row rewritten from one, an add with no `baseRowId`) — the
+existing `COALESCE` story expressed as a type. Shape is FIXED at four members even with row tracking off (ids
+all-null), so a consumer binds one schema whatever the table config (Spark varies its shape; we chose stability).
+
+**NOT a port of the prototype's reader — deliberately.** That hand-rolls its own parquet open, mapping rename
+and DV filter, and its own note conceded "full schema, no projection, partition columns not re-added". The
+current base computes every member on the MAINTAINED read path (`ReadFileAsync`'s `strippedAbsPositionsOut` =
+`row_index`, `strippedRowIdsOut`/`strippedVersionsOut` = the ids, path from the planned add), so
+`ReadAllWithMetadataAsync` is ~25 lines of pure assembly that inherits projection, column mapping, partition
+re-add, schema reconciliation and DV semantics for free.
+
+**UPDATE is now path-keyed — §3.3's UPDATE half is CLOSED.** `UpdateBySelectionCoreAsync` hands the rewriter
+`(filePath, sourceBatches, positionsPerBatch)` instead of `(fileOrdinal, …, rowIdsPerBatch)`. Two entry
+points: `UpdateBySelectionAsync(selection, rewriteFile)` and — the payoff —
+`UpdateBySelectionAsync(RecordBatch updates)`, a **round trip** (read with `_metadata`, change values, hand the
+batch back; no substitution code, no ordinal, no packed rowid) which reuses the rowid-keyed substitution helper
+VERBATIM because within one file a position is already a unique key. All three `UpdateByRowIdsAsync` overloads
+became re-packing adapters; the `RecordBatch`-keyed one stays rowid-keyed BY CONTRACT (its input carries a
+rowid column).
+
+**Predicate lowering + a MEASURED zero-read DELETE.** `MetadataPredicate` (self-contained) is wired at the head
+of `DeleteAsync(predicate)`: a physically-addressing predicate lowers to a `FileRowSelection`; one that MENTIONS
+`_metadata` but cannot lower is **rejected loudly** rather than handed to the row mask, which binds data columns
+only and would delete the wrong rows silently. The zero-data-reads claim is **measured** by a delegating
+`CountingFileSystem` asserting **0** data-parquet opens — without that instrument it would be a claim about
+intent. Data-column predicates are untouched (`TryLower` returns false; the guard no-ops).
+
+**Gates:** EW Table.Tests **571** × {net10.0, net8.0, net472} (was 555 pre-`_metadata`) / DeltaLake 217 /
+Expressions 139 / Core 430; fabricator hermetic **53/53 @ 4152** and service **42/42 @ 1227**, BOTH unchanged —
+the right result, since this is EW surface with **no fabricator consumer yet** (no ABI, no Bridge change).
+
+**The LAST rowid-keyed API is `ReadRowsByRowIdsAsync`**, and it is the interesting one: it both TAKES rowids and
+EMITS them (`rowIdsOut`) beside `sourceRowTrackingOut`, so converting it collapses **three out-params into the
+one struct** — finishing the unification. It reaches the Bridge's buffered UPDATE read-back and CDF delete
+capture, so it is its own increment, not a tail to sweep up.
+
 ## Architecture (layered for reuse)
 
 Layered so a future **Power BI / DAX** connector reuses the same C++ core + managed bridge:
