@@ -290,6 +290,55 @@ Merged with a **fast-forward, never a force-push**: the release tag `v0.0.1-duck
 orphaning that commit would make the tagged release unbuildable from source (`git submodule update` cannot
 reliably fetch an unreachable sha). Verified `253e834` is still an ancestor after the merge.
 
+#### EW BUMP 2026-07-27 — clast master `e28f70e`: COW CDF HANDED OFF UPSTREAM; two CreateAsync semantics we had to KEEP; pin `8aa7cfb`
+
+10 upstream commits, 2 conflicted files, **14 hunks**. Three more of our patches are reimplemented
+upstream and leave our diff: **CoW CDF capture** (`c9a29b1` — its own message says it is a port of
+PR #4's branches onto master's read path, i.e. our work, MEASURED against Spark 4.0.1 on a
+partitioned CDF table), the **partitioned-CDF lost-column fix** (`8e86061`), and **`configuration`
+on `CreateAsync`**. Upstream's CDF is BETTER than what it replaces: it writes each change file per
+rewritten SOURCE FILE with that file's `partitionValues` — which ours omitted, exactly the defect
+`8e86061` fixes — and carries FIVE CDF tests where we had one (partitioned, whole-file, pre/post).
+Three blocks of ours were DELETED as redundant rather than merged.
+
+**Two `CreateAsync` differences were NOT taken — upstream's version is not equivalent despite the
+identical signature, and taking it wholesale would have broken us SILENTLY:**
+- **A `delta.enable*` property no longer ENABLES its feature upstream** (the boolean argument is the
+  sole source of truth). But `inCommitTimestamps` and `changeDataFeed` have NO boolean argument, so a
+  property is the only route, and our Bridge sets exactly those keys in the config dict
+  (`DeltaGlobalTableFunction.cs` ~499-509). A property recorded WITHOUT its writer feature declared is
+  the metadata/protocol mismatch Spark rejects outright. Kept the derivation, wired to the declaration
+  so the two cannot come apart.
+- **Upstream ALWAYS overwrites the row-tracking materialized column names with a fresh
+  `_row_id_<guid>`.** Ours lets a caller-supplied name win, and must: `__delta_row_id` is a
+  USER-VISIBLE queryable column we advertise (`verify_delta_row_tracking_virtual`, 299), not an
+  internal name. A random per-table name would change what is written to disk and break those pins.
+
+Also kept: `preAssignedSchema`, `PlanFiles`, the variant transport, the buffered row-level remap.
+`PlanFiles` now threads the new `PreferTypedCheckpointStats` — otherwise the one path would quietly
+serve typed columns to a caller who set it false to force the JSON path (the documented escape hatch).
+
+**Inherited worth naming:** pruning from a checkpoint's **typed** stats (`9b8831c`; upstream measures
+~14× faster with ~100× less allocation over a 100,000-file checkpoint — `DeltaFileStats` now parses
+the JSON LAZILY, so a file answered from typed columns never touches its stats string), **checkpoints
+Spark could not read** + a `stats_parsed` nothing could use (`d9a913a` — note the new
+`CheckpointStatsMode` is `internal` and driven by `delta.checkpoint.writeStatsAsJson`/`...AsStruct`,
+BOTH defaulting true, so checkpoints now carry both forms and no Bridge change is needed; reach the
+keys via `fabricator_delta_set_tblproperties` if a strict reader ever needs JSON-only), **wide mark
+bounds wherever a DV is attached** (`71547af`), a **CoW rewrite writing the partition column into the
+file** (`54ba3e3`), and ORC/Avro/Lance fixes.
+
+**Gates:** EW Table.Tests **549** × {net10.0, net8.0, net472} (was 523) / DeltaLake **217** /
+Expressions 139 / Core 430 / Orc 235 / Avro 294. **The Bridge builds with NO change** (upstream kept
+`configuration`'s name and position). Fabricator hermetic 53/53 @ **4152 — the same count as before
+the merge**, which is the signal that a checkpoint-writer rewrite + a new pruning path + a CoW CDF
+reimplementation are all behaviour-neutral for everything we pin; service 42/42 @ 1227 with
+`verify_delta_catalog_s3` 161 and `verify_mssql_s3_polybase` 252 at full counts — the two that read
+these checkpoints back THROUGH SQL Server, which is where a checkpoint regression would surface (it
+has before: the snappy empty-payload bug once failed every read crossing an EW checkpoint).
+Fast-forward, never a force-push; verified `253e834`/`4588594`/`b06b782`/`e5d6f04` are all still
+ancestors, `e5d6f04` being the pin the current release tag depends on.
+
 ## Architecture (layered for reuse)
 
 Layered so a future **Power BI / DAX** connector reuses the same C++ core + managed bridge:
