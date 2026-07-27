@@ -502,6 +502,68 @@ EMITS them (`rowIdsOut`) beside `sourceRowTrackingOut`, so converting it collaps
 one struct** — finishing the unification. It reaches the Bridge's buffered UPDATE read-back and CDF delete
 capture, so it is its own increment, not a tail to sweep up.
 
+#### EW BUMP 2026-07-27 (second, same day) — clast master `b1de9d8`: TWO MORE PATCHES ABSORBED; Curt has published a TRIAGE of our PR
+
+14 upstream commits, **one** conflicted file (`DeltaTable.cs`, 13 hunks), pin → EW `5c5f99f`.
+
+**Both `CreateAsync` semantics the FIRST bump recorded as "deliberately KEPT" are now upstream:**
+- **`7df0b42`** absorbs the feature-derivation. Upstream now enables a feature from its `delta.enable*`
+  PROPERTY as well as its boolean argument — and **wider than ours**: `deletionVectors`, `rowTracking`,
+  `inCommitTimestamps`, `changeDataFeed`, **`icebergCompatV1/V2`** and **`columnMapping.mode`**, each
+  declared in the commit-0 protocol, with the same precedence we chose (argument beats property;
+  enablement is one-directional). It also fixes something worse than we knew: `delta.columnMapping.mode`
+  passed as a PROPERTY produced an **UNREADABLE table** — metadata claiming name-mapping over a schema
+  whose fields were never assigned physical names or ids.
+- **The materialized-NAME semantic too** — found in a DOC hunk, not in any commit subject: upstream's
+  `CreateAsync` doc now states "caller-supplied row-tracking materialized column names win". That is the
+  second thing we were carrying for `__delta_row_id`'s sake. **Lesson: read the doc hunks of a conflict,
+  not just the commit messages — an absorbed semantic can announce itself only there.**
+- **`9258706` is OUR projected-read fix, ported and CORRECTED** ("Ported from PR #4 commit `2007c39`"):
+  minus its "read one column the file does have so row counts survive" guard, which upstream MEASURED as
+  unnecessary — its reader takes the row count from the ROW GROUP, not from the columns returned.
+  ⚠ **Do NOT propagate that correction to our seam reader unverified**: `NativeParquetDataFileReader`
+  goes through DuckDB `read_parquet`, where an empty SELECT list is not valid SQL, so the measurement
+  does not transfer. Open question, not a known redundancy.
+
+**Resolution by class, not by reflex:** hunks 1–8 (the `CreateAsync` feature-declaration region) take
+UPSTREAM as a strict superset; 9–10 keep OURS (`preAssignedSchema` is still not upstream); 11 COMBINES
+(our positions-builder semantics + upstream's `.Reserve(length)`); 12–13 take UPSTREAM's corrected fix.
+**Merge hazard worth remembering: our `dvEnabled`/`rowTrackingOn` derivation sat OUTSIDE any conflict
+hunk, so git auto-merged it into a DUPLICATE declaration beside upstream's** (`CS0128` caught it).
+Conflict markers show where two sides DISAGREE textually — not where they have begun saying the same
+thing twice. Verified after resolving: all 8 of our patches still present, upstream's IcebergCompat /
+enable-property work arrived, `rowTrackingOn` gone to 0.
+
+**Inherited:** `d0b7bf8` (a union ANYWHERE in a nested subtree broke `MakeNullArray` — shapes this
+library itself writes via ORC), six parquet/delta PERF commits on paths we hammer (dictionary
+double-copy, oversized string dictionaries, constant-column discovery by hashing every row,
+high-cardinality analysis skipped, the CDF `_change_type` column appended row-at-a-time, the identity
+column built straight into its Arrow buffer), and `b1de9d8` (assemblies now strongly named, new
+`Clast.snk` + root `Directory.Build.props` — our build is unaffected, .NET Core does not enforce
+strong-name identity).
+
+**⭐ THE FIND: `doc/upstream-landing-notes.md` now carries Curt's OWN triage of our nine PR commits,
+"classified by who they serve, because that is the question that decides whether they land."** Read it
+before offering anything upstream — it is the roadmap written by the reviewer, and it revises what to
+lead with: he names the **buffered rebase remap** "the strongest non-Fabricator argument of this group:
+two public surfaces currently answer the same conflict differently"; he asks for **`VariantTransport` to
+be SPLIT** because variant **shredding on write** is "a general-purpose passenger worth separating";
+his gap 9 (public `DeltaFilePruner`) is **stale — we retired that ask for `PlanFiles`**; and he
+understands why we need `rowIdsOut` ("without it a caller cannot key returned rows back to the rowids it
+requested"). He also **independently confirms the PR #4 hazard** — "merging as-is would revert
+run-end-encoded definition levels, per-column dictionary control, `ArrowCompute.MakeNullArray`, the
+shared DV-reader reuse and the compaction builder `Reserve`" — which is the same finding as its diff
+reading −17150 lines. **And he records that "merge-on-read UPDATE is no longer on offer from upstream"**
+after the PR rewrite dropped it: it appears nowhere in his gap list, so our
+`UpdateBySelectionViaVectorsAsync` fills a hole he has flagged as unowned.
+**One thing to report back:** his new open-decision item says the codec seam's read path hands its
+projection to a host decoder, so "a host codec faces the schema-evolution problem itself, unstated" —
+we already intersect it (`NativeParquetDataFileReader`), which is evidence for that audit.
+
+**Gates:** EW Table.Tests **613** × {net10.0, net8.0, net472} (was 583, +30 upstream tests) / DeltaLake
+217 / Expressions 139 / Core **452** (was 430 — the union arms) / Orc **237** / Avro 294 passed **+ 7
+newly skipped** (new upstream skips, not failures); fabricator hermetic **53/53 @ 4152** unchanged.
+
 #### MERGE-ON-READ UPDATE MOVED INTO EW — `UpdateBySelectionViaVectorsAsync` (2026-07-27, no ABI change)
 
 **The only piece of the 2026-07-27 Delta work that adds a CAPABILITY rather than re-keying an existing one.**
