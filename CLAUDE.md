@@ -502,6 +502,48 @@ EMITS them (`rowIdsOut`) beside `sourceRowTrackingOut`, so converting it collaps
 one struct** — finishing the unification. It reaches the Bridge's buffered UPDATE read-back and CDF delete
 capture, so it is its own increment, not a tail to sweep up.
 
+#### MERGE-ON-READ UPDATE MOVED INTO EW — `UpdateBySelectionViaVectorsAsync` (2026-07-27, no ABI change)
+
+**The only piece of the 2026-07-27 Delta work that adds a CAPABILITY rather than re-keying an existing one.**
+Every prior UPDATE entry point in EW paid a FULL FILE REWRITE, because Delta has no "row updated" bitmap — so
+the cheap shape (DV-mask the old rows, APPEND their post-images, one fused commit) existed only as a
+composition fabricator had worked out and was assembling by hand in `MergeOnReadUpdateAsync`. Full record:
+[docs/rowid-dml-seam.md](docs/rowid-dml-seam.md) §6.6.
+
+A **LIFT, not a fresh implementation**: the four primitives and their ordering
+(`ComputeDeletionVectorActionsAsync` + `WriteDataFilesAsync(materializedRowIds:)` +
+`WriteChangeDataFilesAsync` + `CommitDataFilesAsync(extraActions:, expectedVersion:)`) were already proven by
+`update` 63 / `dv_default` 58 / `row_tracking_virtual` 299 and by live Fabric/Spark validation — what changed
+is where the semantics live. **Row tracking is PRESERVED** (each moved row keeps its ORIGINAL stable id,
+materialised into the post-image file — copy-on-write cannot, since its rewrite re-derives every row's id; an
+underivable id abandons materialisation for the WHOLE statement rather than baking a wrong one). CDF rides as
+the `update_preimage`/`update_postimage` pair. DV required + IcebergCompat refused, both clean errors NAMING
+the copy-on-write alternative — never a silent fallback, since the IO costs differ by orders of magnitude.
+
+**TWO overloads, and the KEYED one is load-bearing:** `updater(matched)` suits a transform that is a FUNCTION
+of the row (`salary * 2`); `updater(filePath, matched, positions)` suits values from a host-side JOIN, keyed by
+`(file, position)`. Fabricator could NOT use the simple form — its values come from a DuckDB join, so aligning
+them by EMISSION ORDER would be wrong (the same fragility the parked prototype's `updater(matchBatch)` has).
+So the keyed form is demonstrably necessary, not speculative.
+
+⚠ **INVOCATION GRANULARITY differs between the two selection UPDATE surfaces** (undocumented until this pass,
+and our own code was correct only by accident of keying): the merge-on-read updater fires once per SOURCE BATCH
+containing a match — possibly several times per file — while `UpdateBySelectionAsync`'s `rewriteFile` fires once
+per FILE with all its batches. **Key by `(filePath, position)`; never accumulate state per call.**
+
+**Bridge: `MergeOnReadUpdateAsync` delegates to it, −26 lines net.** What remains is only what is genuinely
+ours: decode DuckDB's packed rowid → `(add.path, absolute position)`, substitute the join's values. Gated
+targeted-first as a re-key of the LIVE autocommit DV UPDATE path (`update` 63 / `dv_default` 58 /
+`row_tracking_virtual` 299 / `changes` 73), then hermetic **53/53 @ 4152** + service **42/42 @ 1227**, both
+unchanged. EW Table.Tests **583** × {net10.0, net8.0, net472}.
+
+**UPSTREAM: this is the STRONGEST candidate of the whole seam effort** — a capability EW genuinely lacks, proven
+in production against Spark, additive, no magic strings (unlike the predicate lowering). Offer it ahead of the
+rest. **Process lesson recorded twice in one day:** a callback-carrying overload added to satisfy a caller gets
+tested "by proxy" through that caller and its OWN contract (row-alignment, absoluteness, granularity) stays
+unpinned — which is exactly what silently breaks a keyed consumer while every existing assertion stays green.
+Both times the gap was found by review, not by the suite.
+
 ## Architecture (layered for reuse)
 
 Layered so a future **Power BI / DAX** connector reuses the same C++ core + managed bridge:
