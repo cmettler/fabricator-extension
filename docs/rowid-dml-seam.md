@@ -159,6 +159,29 @@ branch.
   handed in the non-pure case, or whether the hook offers a predicate in a form we can consume. Read the
   duckdb `main` catalog/planner hooks before fixing `FileRowSelection` as the long-term seam — if the
   replacement hands providers a richer row identity, shaping toward that beats optimising either rowid.
+
+  **But the predicate MAPPING is not unknown — it exists and works** (checked 2026-07-27).
+  `DeltaFilterBuilder` (Bridge) already maps DuckDB's `FilterNode` → `EngineeredWood.Expressions.Predicate`
+  and drives Delta file pruning plus parquet row-group/bloom skipping in production. So if a hook hands us
+  a predicate, the translation is already built.
+
+  ⚠ **It CANNOT be reused for DML unchanged, and the reason is a one-line comment in the file:**
+  ```csharp
+  // AND: keep the pushable children (dropping unpushable ones still yields a superset).
+  ```
+  `BuildAnd` silently DROPS unmappable conjuncts. That is correct for a SCAN — DuckDB re-applies every
+  predicate above us, so a superset only costs I/O. For a **DELETE a superset deletes rows the user did
+  not ask for.** It is the same hazard that made predicate-delete unsafe in the first place (V1), reaching
+  us through the mapper rather than through the plan.
+
+  Note `BuildOr` is ALREADY all-or-nothing, for the mirror reason ("dropping a branch would narrow the
+  result → unsafe"). So the required discipline already exists in the file; it needs extending to `AND`.
+
+  ⇒ **Concrete work item, small and contained:** an EXACT mode on `DeltaFilterBuilder` where any
+  unmappable node yields `null` for the WHOLE predicate, and the caller falls back to the rowid path.
+  A flag turning `BuildAnd`'s drop into a bail-out. Do NOT let a DML caller use the superset builder.
+  (Related but distinct: the existing `exact_filter_pushdown` / `ExactFilterPushdown()` capability concerns
+  DuckDB ERASING filters so the native SQL must apply them exactly — a different layer, same instinct.)
 - Whether a selection DELETE should escape EW's `RejectRowTrackingWrite` (it moves no rows, so arguably
   yes) — an open question in the proposal itself.
 - The proposal's other open points: struct vs flat metadata columns; `numRecords`-less foreign tables;
