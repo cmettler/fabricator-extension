@@ -674,11 +674,19 @@ and the four hardcoded `"_metadata.row_id"` literals in `ExternalTableRouting` n
 rename, grep for string-keyed column lookups; a declared-schema/batch-schema disagreement is invisible across
 the C ABI and therefore invisible to almost every test.**
 
-**Kept deliberately: our derived-id fallback in `ReadRowsByRowIdsAsync`.** Upstream did NOT port it and says
-why, having MEASURED it: `ReadFileAsync` already resolves a row's stable id as the materialized value else
-`baseRowId + absolute position`, so `sourceRowTrackingOut` has never been null for a plain append. That
-measurement was taken in HIS tree; ours is cheap and behaviour-identical wherever the claim holds, so it stays
-as a noted candidate rather than a deletion.
+**~~Kept deliberately~~ — DELETED 2026-07-28: our derived-id fallback in `ReadRowsByRowIdsAsync` was DEAD
+CODE, verified in OUR tree rather than taken on trust.** Upstream declined to port it and said why, having
+measured it. We kept it as "cheap and behaviour-identical wherever the claim holds" — but the claim holds
+unconditionally here: `ReadFileAsync` (~line 7465) computes
+`id = mid ?? (BaseRowId is {} ab ? ab + thisBatchStart + i : null)` / `ver = mv ?? DefaultRowCommitVersion`,
+and its own doc says `strippedRowIdsOut` carries the per-row **RESOLVED** value. Our fallback re-applied that
+identical derivation to a value already through it, so a null there means the source genuinely predates row
+tracking and nothing remains to derive. **Worth checking before deleting rather than after**: had it been
+load-bearing, removal would have produced null stable ids SILENTLY, and the buffered UPDATE would then abandon
+materialization for the whole statement instead of preserving ids. ⇒ `ReadRowsByRowIdsAsync` is now
+**byte-identical to upstream's**, retiring one of the two methods that still differed (`RebaseDvDmlActionsAsync`
+is the remaining one). The reasoning lives HERE and deliberately not as a comment in `DeltaTable.cs` — a comment
+in the file that conflicts on every bump is a permanent conflict point for no behavioural gain.
 
 **Inherited worth naming:** **`2348d69`** — a span over a caller's Arrow buffer outliving its
 `NativeMemoryManager`, whose finalizer frees the native memory a span does not root. It took an
@@ -877,6 +885,35 @@ was re-keyed, and it is service-tier-only.
 got a silent blank, which reads exactly like a pass. Already recorded under CI; re-recording because it bit
 during a LIVE-path gate, where a false pass is worst. Always read the assertion COUNT, never the absence of a
 failure.
+
+**⭐ CURT WROTE US A MIGRATION GUIDE — `doc/upstream-landing-notes.md` is no longer the only doc to read.**
+A PR #4 comment (2026-07-28 03:05) plus a NEW **`doc/embedding-host-guide.md`** walk through what changed on
+OUR side, "in the order I'd tackle it": (1) the `_ew_row_address` rename + `TransientRowAddress`; (2)
+`PlanFiles` instead of a public pruner; (3) **stage work on a `DeltaTransaction` instead of driving the commit
+loop — "this is the big one"**; (4) the create-time/row-identity parameters; (5) the buffered rebase relocating
+rather than aborting; (6) a row-id bug; (7) the variant transport. **Items 1–5 were all already done on our
+side** when it arrived, and two of his open questions are now CLOSED: his offer to *"prioritize implementing"*
+the stable row-tracking id is moot (he built it in `9669796`), and item 6's question — did we write tables with
+DUPLICATE stable ids, because every staging call restarted its row-id reservation — is **no, twice over**: our
+flush makes exactly ONE `StageDataFilesAsync` call per transaction (his bug needed two staged appends) and
+everything before the move used a single `CommitDataFilesAsync`. Reply:
+[PR #4 comment](https://github.com/clast-project/engineered-wood/pull/4#issuecomment-5105893565).
+**His `>> 40` note was the one real actionable, and for us it is a correctness matter rather than style
+(fixed, parent `b1fe4c4`):** we carried **FOUR** copies of the split — `DeltaCatalog`, `DeltaReader`,
+`DeltaNativeReader`, `DeltaRowIdFilter` — one with a comment conceding it "MUST match engineered-wood's". It
+must, because the codec read path renames EW's `_ew_row_address` to `RowIdColumn` and passes ITS packed value
+straight through to DuckDB, so a moved `PositionBits` would silently mis-decode (wrong ordinal, wrong position,
+no error) — the same compile-clean-but-wrong shape as the variant marker rename and the `ArrowArrayFactory`
+namespace capture. All four now derive from `TransientRowAddress.PositionBits`, with decodes via
+`.FileOrdinal`/`.Position`. **Use his helpers for anything touching HIS column; our own DuckDB-side packing
+(`PendingOrdinalBase` and up) deliberately shares that space, so it follows the same split by construction.**
+**Item 7 is where I had answered the WRONG question and corrected it:** his version is MEASURED — the write
+direction already passes the codec seam untouched, and the read side can split blob → `(metadata, value)` →
+struct-of-binary in our `IDataFileReader`, with the library returning a canonical `VariantArray` we convert on
+our side. Accepted his Delta-typed `ComputeAddColumn`/`AddColumnAsync` overloads as the better ALTER fix (no
+marker in his wire contract), and told him about the **DuckDB PR the user filed to fix VARIANT over the Arrow C
+interface** before he spends the 30 lines — if `ArrowAppender::FinalizeChild` learns nested extension types the
+canonical struct crosses the ABI and most of the transport question dissolves, our marker included.
 
 **Historical (the note as first written, before the merge):** two commits landed past `fe74b0c`, both touching
 **`DeltaTable.cs`** — the file that had conflicted in every single bump:
