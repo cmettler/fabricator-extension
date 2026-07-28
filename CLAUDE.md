@@ -737,6 +737,13 @@ table written under the old name needs migration.
 **Chosen over making it configurable**: a `DeltaTableOptions` setting would have to reach `FromArrowSchema`
 (static, 8 call sites) for no behavioural gain — the value only has to be AGREED between a host and the library,
 and a neutral constant agrees as well as a threaded parameter.
+**⚠ A MARKER RENAME IS THE QUIET FORM OF THE STALE-BINARY TRAP.** The stale-binary note in "Build & test"
+covers C++ BEHAVIOUR changes; this was a change to a STRING that must match across the ABI, so a stale binary
+does not fail — it silently degrades the type (VARIANT → BLOB), and every variant operation then reports a
+plausible-looking conversion error. Cost real time: only `unittest` had been rebuilt, so probing in
+`duckdb.exe` looked like a code defect until CREATE and ALTER failing IDENTICALLY gave it away (a genuine
+ALTER-specific bug cannot break CREATE). **After such a rename rebuild ALL THREE — `unittest`, `shell`,
+`fabricator_loadable_extension` — and check MTIMES, not exit codes.** All three are current as of 2026-07-28.
 **⚠ The rename is a THREE-LAYER lockstep and needs a C++ REBUILD, not just a republish:** the same string is
 `VariantMarker.ExtensionName` (Bridge) and `kVariantExtensionName` (`fabricator_variant.cpp`), and the C++ one
 is the name registered in DuckDB's Arrow extension registry — it must match what crosses the ABI, so a stale
