@@ -2105,8 +2105,6 @@ internal static class DeltaReader
         long posMask = (1L << RowIdPositionBits) - 1;
         var pathB = new StringArray.Builder();
         var idxB = new Int64Array.Builder();
-        var ridB = new Int64Array.Builder();
-        var verB = new Int64Array.Builder();
         for (int i = 0; i < updates.Length; i++)
         {
             long rid = rids.GetValue(i)!.Value;
@@ -2120,29 +2118,23 @@ internal static class DeltaReader
             }
             pathB.Append(filePath);
             idxB.Append(rid & posMask);
-            ridB.AppendNull();
-            verB.AppendNull();
         }
 
-        var metaType = new Apache.Arrow.Types.StructType(new List<Field>
-        {
-            new("file_path", Apache.Arrow.Types.StringType.Default, false),
-            new("row_index", Apache.Arrow.Types.Int64Type.Default, false),
-            new("row_id", Apache.Arrow.Types.Int64Type.Default, true),
-            new("row_commit_version", Apache.Arrow.Types.Int64Type.Default, true),
-        });
-        var metaArr = new StructArray(metaType, updates.Length,
-            new IArrowArray[] { pathB.Build(), idxB.Build(), ridB.Build(), verB.Build() },
-            ArrowBuffer.Empty, 0);
-
-        var fields = new List<Field>(updates.ColumnCount);
-        var arrays = new List<IArrowArray>(updates.ColumnCount);
+        // The two LOCATOR columns, flat and dot-named — EW's `_metadata.*` convention, shared with the
+        // identity pair ReadAllWithRowTrackingAsync owns. We fill only the locator: EW resolves each row's own
+        // stable id from the file it rewrites, so supplying ids would assert identity we do not own.
+        var fields = new List<Field>(updates.ColumnCount + 1);
+        var arrays = new List<IArrowArray>(updates.ColumnCount + 1);
         for (int c = 0; c < updates.ColumnCount; c++)
         {
             if (c == ridIdx)
             {
-                fields.Add(new Field(DeltaTable.MetadataColumnName, metaType, false));
-                arrays.Add(metaArr);
+                fields.Add(new Field(
+                    DeltaTable.MetadataFilePathColumn, Apache.Arrow.Types.StringType.Default, false));
+                arrays.Add(pathB.Build());
+                fields.Add(new Field(
+                    DeltaTable.MetadataRowIndexColumn, Apache.Arrow.Types.Int64Type.Default, false));
+                arrays.Add(idxB.Build());
             }
             else
             {
