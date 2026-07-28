@@ -302,8 +302,26 @@ PR #4 open regardless: upstream's own notes reference it.
 3. Merge; resolve **by class** (take upstream where it reimplemented us — its version has been better
    every time; keep ours where it is genuinely absent upstream; combine where both improved one line).
 4. Watch for **auto-merged duplicates**: our code that sat OUTSIDE a conflict hunk can end up saying the
-   same thing twice beside upstream's. Markers show textual DISAGREEMENT, not redundancy.
-5. Verify both directions: our patches still present, upstream's new work arrived, superseded code gone.
-6. Gate: EW suites × all three TFMs, then fabricator hermetic + service. **Unchanged fabricator counts
+   same thing twice beside upstream's. Markers show textual DISAGREEMENT, not redundancy. Two kinds, and
+   the second is the dangerous one:
+   - a duplicate **declaration** → `CS0128`/`CS0111`, the compiler catches it (bump 3: `dvEnabled`);
+   - a duplicate **STATEMENT** → nothing catches it (bump 4: upstream moved the materialized-row-id
+     re-attach later in `WriteDataFilesAsync`, our old placement stayed, and the id column was appended
+     TWICE; `AddRowIdColumn` appends unconditionally, so every materialized file would carry two
+     identically-named `__delta_row_id` columns. **EW Table.Tests was 656/656 green with it present** —
+     a reader resolving by name gets a correct value from one of the two copies).
+5. **After taking a method wholesale from upstream, diff it against upstream's copy and require
+   byte-identity.** That is what found the duplicate above. Any surviving difference must be one you can
+   name — ours are `RebaseDvDmlActionsAsync` (path-keyed) and `ReadRowsByRowIdsAsync` (our derived-id
+   fallback, which upstream measured redundant in ITS tree and we keep as defensive).
+6. **On any upstream COLUMN-NAME rename, grep the Bridge for string-keyed column lookups.** The compiler
+   cannot see them, and the C ABI hides the mismatch: `ScanCodec` declares its stream schema with OUR
+   names while the batches carry EW's, and `arrow_ingest` reads the DECLARED schema then works
+   positionally — so DuckDB is unaffected and the hermetic tier passes. Bump 4's `_metadata.row_id` →
+   `_ew_row_address` rename surfaced in exactly ONE place, `ExternalTableRouting`'s
+   `b.Schema.GetFieldIndex` (service tier only). Fix at the source so declared and actual schemas agree,
+   and reference a constant rather than a literal.
+7. Verify both directions: our patches still present, upstream's new work arrived, superseded code gone.
+8. Gate: EW suites × all three TFMs, then fabricator hermetic + service. **Unchanged fabricator counts
    are the signal** that the bump is behaviour-neutral for what we pin.
-7. Verify every historically-pinned EW sha is still an ancestor — especially any a PUBLISHED release depends on.
+9. Verify every historically-pinned EW sha is still an ancestor — especially any a PUBLISHED release depends on.

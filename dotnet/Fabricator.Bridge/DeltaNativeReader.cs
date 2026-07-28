@@ -33,7 +33,9 @@ namespace Fabricator.Bridge;
 /// </summary>
 internal static class DeltaNativeReader
 {
-    private const string RowIdColumn = "_metadata.row_id";
+    // One source of truth for the DuckDB-facing virtual rowid name (see DeltaCatalog.RowIdColumn for why
+    // it is deliberately NOT engineered-wood's TransientRowAddress.ColumnName).
+    private const string RowIdColumn = DeltaCatalog.RowIdColumn;
     private const int RowIdPositionBits = 40;
 
     /// <summary>The STABLE row-tracking id virtual column (the Delta materialized-column name): per row

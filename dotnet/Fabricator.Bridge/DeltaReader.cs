@@ -358,7 +358,7 @@ internal static class DeltaReader
                     minPath = add.Path;
             }
             string? anyUri = minPath is null ? null : FileUri(root, minPath);
-            foreach (var (add, ordinal) in planned)
+            foreach (var (ordinal, add) in planned)
             {
                 var uri = FileUri(root, add.Path);
                 long[] dv = System.Array.Empty<long>();
@@ -609,9 +609,47 @@ internal static class DeltaReader
         }
     }
 
+    /// <summary>
+    /// Renames engineered-wood's trailing transient-address column to the name DuckDB binds.
+    /// </summary>
+    /// <remarks>
+    /// EW calls it <see cref="TransientRowAddress.ColumnName"/> (<c>_ew_row_address</c>) — deliberately, since
+    /// it is a snapshot-scoped ADDRESS, not Spark's stable <c>_metadata.row_id</c>; the two were the SAME
+    /// string until upstream separated them. DuckDB binds our virtual rowid under
+    /// <see cref="DeltaCatalog.RowIdColumn"/>, and <c>arrow_ingest</c> maps the returned columns to the
+    /// requested projection BY NAME, so the rename has to happen before the batch crosses the ABI — a
+    /// mismatch here does not fail loudly, it makes the rowid column simply not resolve.
+    /// </remarks>
+    private static RecordBatch RenameRowAddressToDuckDbRowId(RecordBatch batch)
+    {
+        int idx = -1;
+        for (int i = 0; i < batch.ColumnCount; i++)
+        {
+            if (batch.Schema.FieldsList[i].Name == TransientRowAddress.ColumnName) { idx = i; break; }
+        }
+        if (idx < 0)
+            return batch; // already renamed, or the caller did not ask for the address column
+
+        var fields = new List<Field>(batch.ColumnCount);
+        var columns = new IArrowArray[batch.ColumnCount];
+        for (int i = 0; i < batch.ColumnCount; i++)
+        {
+            var f = batch.Schema.FieldsList[i];
+            fields.Add(i == idx
+                ? new Field(DeltaCatalog.RowIdColumn, f.DataType, f.IsNullable, f.Metadata)
+                : f);
+            columns[i] = batch.Column(i);
+        }
+        var sb = new Apache.Arrow.Schema.Builder();
+        foreach (var f in fields)
+            sb.Field(f);
+        return new RecordBatch(sb.Build(), columns, batch.Length);
+    }
+
     /// <summary>Like <see cref="Stream"/> but each batch carries a trailing non-null Int64
-    /// <c>_metadata.row_id</c> column (the stable row-tracking id) — used to surface the DuckDB rowid for
-    /// UPDATE/DELETE. Requires the table to have row tracking enabled (see <see cref="IsRowTrackingEnabled"/>).</summary>
+    /// <c>_metadata.row_id</c> column (the TRANSIENT (file, position) address, renamed from
+    /// engineered-wood's <c>_ew_row_address</c> by <see cref="RenameRowAddressToDuckDbRowId"/>) — used to
+    /// surface the DuckDB rowid for UPDATE/DELETE.</summary>
     public static IAsyncEnumerable<RecordBatch> StreamWithRowIds(
         nint opener, string path, IReadOnlyList<string>? columns, Predicate? filter, CancellationToken ct)
     {
@@ -631,8 +669,9 @@ internal static class DeltaReader
         try
         {
             var nested = NestedMappedSchema(table.CurrentSnapshot);
-            await foreach (var batch in table.ReadAllWithRowIdsAsync(columns, filter, token).ConfigureAwait(false))
+            await foreach (var raw in table.ReadAllWithRowIdsAsync(columns, filter, token).ConfigureAwait(false))
             {
+                var batch = RenameRowAddressToDuckDbRowId(raw);
                 yield return nested is null
                     ? batch
                     : ArrowColumnMappingRename.RenameBatch(batch, nested, toPhysical: false);
@@ -842,14 +881,14 @@ internal static class DeltaReader
         nint opener, string path, IReadOnlyCollection<long> rowIds, CancellationToken ct,
         long? atVersion = null,
         List<(long?[] Ids, long?[] Versions)>? sourceTrackingOut = null,
-        List<Int64Array>? rowIdsOut = null)
+        List<long[]>? rowIdsOut = null)
         => BlockingEnumerable(ReadRowsByRowIdsAsync(opener, path, rowIds, atVersion, sourceTrackingOut,
                                                     rowIdsOut, ct));
 
     private static async IAsyncEnumerable<RecordBatch> ReadRowsByRowIdsAsync(
         nint opener, string path, IReadOnlyCollection<long> rowIds,
         long? atVersion, List<(long?[] Ids, long?[] Versions)>? sourceTrackingOut,
-        List<Int64Array>? rowIdsOut,
+        List<long[]>? rowIdsOut,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         // Cancel a slow buffered-UPDATE read-back of the matched rows over OneLake/S3 on interrupt.
@@ -858,9 +897,10 @@ internal static class DeltaReader
         var fs = TableFileSystems.Create(opener, path);
         await using var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(), token).ConfigureAwait(false);
         // NOTE (EW master): the yielded batches carry USER columns only — the rowid correlation key rides
-        // the rowIdsOut out-param (one row-aligned Int64Array per batch), not a trailing column.
+        // the rowIdsOut out-param (one row-aligned long[] per batch), not a trailing column — a plain
+        // value array, so the caller manages no Arrow buffer lifetime.
         await foreach (var batch in table.ReadRowsByRowIdsAsync(rowIds, atVersion, sourceTrackingOut,
-                                                                rowIdsOut, token)
+                                                                token, rowIdsOut)
                            .ConfigureAwait(false))
         {
             yield return batch;
@@ -1165,9 +1205,10 @@ internal static class DeltaReader
         {
             var snap = await ResolveSnapshotAsync(table, unit, value, token).ConfigureAwait(false);
             var nested = NestedMappedSchema(snap); // the AS-OF snapshot names the columns
-            await foreach (var batch in table.ReadAtVersionWithRowIdsAsync(snap.Version, columns, filter, token)
+            await foreach (var raw in table.ReadAtVersionWithRowIdsAsync(snap.Version, columns, filter, token)
                                .ConfigureAwait(false))
             {
+                var batch = RenameRowAddressToDuckDbRowId(raw);
                 yield return nested is null
                     ? batch
                     : ArrowColumnMappingRename.RenameBatch(batch, nested, toPhysical: false);
@@ -2046,19 +2087,19 @@ internal static class DeltaReader
         int ridIdx = -1;
         for (int c = 0; c < updates.ColumnCount; c++)
         {
-            if (updates.Schema.FieldsList[c].Name == EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.VirtualRowIdColumn) { ridIdx = c; break; }
+            if (updates.Schema.FieldsList[c].Name == DeltaCatalog.RowIdColumn) { ridIdx = c; break; }
         }
         if (ridIdx < 0 || updates.Column(ridIdx) is not Int64Array rids)
         {
             throw new System.InvalidOperationException(
-                $"copy-on-write UPDATE: updates batch has no '{EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.VirtualRowIdColumn}' column.");
+                $"copy-on-write UPDATE: updates batch has no '{DeltaCatalog.RowIdColumn}' column.");
         }
 
         var snapshot = table.CurrentSnapshot;
         var pathByOrdinal = new Dictionary<int, string>(snapshot.ActiveFiles.Count);
         foreach (var planned in table.PlanFiles(snapshot: snapshot))
         {
-            pathByOrdinal[planned.Ordinal] = planned.File.Path;
+            pathByOrdinal[planned.FileOrdinal] = planned.File.Path;
         }
 
         long posMask = (1L << RowIdPositionBits) - 1;
@@ -2130,7 +2171,7 @@ internal static class DeltaReader
         var pathByOrdinal = new Dictionary<int, string>(snapshot.ActiveFiles.Count);
         foreach (var planned in table.PlanFiles(snapshot: snapshot))
         {
-            pathByOrdinal[planned.Ordinal] = planned.File.Path;
+            pathByOrdinal[planned.FileOrdinal] = planned.File.Path;
         }
         var byFile = new Dictionary<string, IReadOnlyCollection<long>>(System.StringComparer.Ordinal);
         foreach (long rid in rowIds)
@@ -2178,7 +2219,7 @@ internal static class DeltaReader
         for (int c = 0; c < updates.ColumnCount; c++)
         {
             if (updates.Schema.FieldsList[c].Name
-                == EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.VirtualRowIdColumn)
+                == DeltaCatalog.RowIdColumn)
             {
                 ridIdx = c;
                 break;
@@ -2194,7 +2235,7 @@ internal static class DeltaReader
         var pathByOrdinal = new Dictionary<int, string>(snapshot.ActiveFiles.Count);
         foreach (var planned in table.PlanFiles(snapshot: snapshot))
         {
-            pathByOrdinal[planned.Ordinal] = planned.File.Path;
+            pathByOrdinal[planned.FileOrdinal] = planned.File.Path;
         }
 
         // (add.path, absolute position) -> the row of `updates` holding that row's new values, plus the

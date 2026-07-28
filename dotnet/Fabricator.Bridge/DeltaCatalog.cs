@@ -81,7 +81,12 @@ public sealed class DeltaCatalog : IBackendCatalog
     internal const string MainSchema = "main";
     // The stable row-tracking id surfaced as the DuckDB rowid for UPDATE/DELETE (a VIRTUAL column — not part
     // of the user schema). Matches EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.VirtualRowIdColumn.
-    private const string RowIdColumn = "_metadata.row_id";
+    // OUR DuckDB-facing virtual rowid column. Deliberately NOT engineered-wood's
+    // TransientRowAddress.ColumnName ("_ew_row_address"): the two were the same string until upstream
+    // separated them, because EW's trailing column carried a snapshot-scoped ADDRESS under Spark's name for
+    // the STABLE row id. This name is the one DuckDB binds (and the one _metadata.row_id means to Spark, which
+    // is what our virtual columns surface); EW's is an internal encoding we decode on this side.
+    internal const string RowIdColumn = "_metadata.row_id";
     // Transient rowid packing — MUST match engineered-wood's DeltaTable.RowIdPositionBits: (fileOrdinal << 40) |
     // rowPositionInFile. Used to recompute a row's rowid during the per-file UPDATE rewrite.
     private const int RowIdPositionBits = 40;
@@ -2552,7 +2557,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         var map = new Dictionary<int, string>(plan.Count);
         foreach (var planned in plan)
         {
-            map[planned.Ordinal] = planned.File.Path;
+            map[planned.FileOrdinal] = planned.File.Path;
         }
         return map;
     }
@@ -2732,7 +2737,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         // The rowids' ordinals are PINNED-version path-sort positions — read back AT that version so a
         // concurrent commuting append (which shifts the ordering) can never make us read the wrong files.
         int rbIdx = -1;
-        var ridsPerBatch = new List<Int64Array>();
+        var ridsPerBatch = new List<long[]>();
         foreach (var raw in DeltaReader.ReadRowsByRowIds(opener, path, updates.Keys, default,
                      atVersion: pending.PinnedVersion, sourceTrackingOut: srcTracking,
                      rowIdsOut: ridsPerBatch))
@@ -2753,7 +2758,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 var values = new List<object?>(batch.Length);
                 for (int i = 0; i < batch.Length; i++)
                 {
-                    long rid = rids.GetValue(i) ?? -1;
+                    long rid = i < rids.Length ? rids[i] : -1;
                     values.Add(updates.TryGetValue(rid, out var nv)
                         ? nv[slot]
                         : ArrowValueReader.ReadScalarDeep(batch.Column(c), i));
@@ -2764,8 +2769,11 @@ public sealed class DeltaCatalog : IBackendCatalog
             matched += batch.Length;
             for (int i = 0; i < batch.Length; i++)
             {
-                if (rids.GetValue(i) is { } rid)
+                // One entry per row of this batch by the seam's contract; the bounds check is the only guard
+                // needed now that the ids arrive as a plain long[] rather than a nullable Arrow array.
+                if (i < rids.Length)
                 {
+                    long rid = rids[i];
                     long ordinal = rid >> RowIdPositionBits;
                     if (!pending.DeletedByOrdinal.TryGetValue((int)ordinal, out var set))
                     {
@@ -2785,11 +2793,15 @@ public sealed class DeltaCatalog : IBackendCatalog
         // Every id resolvable => bake the originals; ANY unresolvable row (a pre-row-tracking source
         // file) => write the post-images WITHOUT materialized ids (fresh ids for the whole statement —
         // never a wrong or colliding id).
-        List<long>? stableIds = null;
+        // The seam's parameter is nullable per element (an entry it cannot derive is written as null, and the
+        // reader then falls back to baseRowId + position for that row alone). We deliberately do NOT use that:
+        // a partially-materialised statement would leave identity depending on which rows happened to resolve,
+        // so the gate below is all-or-nothing and the list handed over never contains a null.
+        List<long?>? stableIds = null;
         if (stableIdsRaw is not null && stableIdsRaw.Count == matched
             && stableIdsRaw.TrueForAll(x => x.HasValue))
         {
-            stableIds = stableIdsRaw.ConvertAll(x => x!.Value);
+            stableIds = stableIdsRaw;
         }
         pending.BatchSchema ??= userSchema;
         if (preImages is not null)
@@ -2910,13 +2922,13 @@ public sealed class DeltaCatalog : IBackendCatalog
     // (compaction / merge-on-read post-images), not a requirement for new rows.
     private bool TryEagerWriteBatches(nint opener, string tablePath, DeltaTxnBuffer.PendingAppends pending,
                                       IReadOnlyList<RecordBatch> batches, string tableName,
-                                      IReadOnlyList<long>? materializedRowIds = null)
+                                      IReadOnlyList<long?>? materializedRowIds = null)
         => TryEagerWriteBatchesAsync(opener, tablePath, pending, batches, tableName, materializedRowIds)
             .GetAwaiter().GetResult();
 
     private async Task<bool> TryEagerWriteBatchesAsync(nint opener, string tablePath, DeltaTxnBuffer.PendingAppends pending,
                                       IReadOnlyList<RecordBatch> batches, string tableName,
-                                      IReadOnlyList<long>? materializedRowIds)
+                                      IReadOnlyList<long?>? materializedRowIds)
     {
         if (pending.PendingCreate || batches.Count == 0)
         {

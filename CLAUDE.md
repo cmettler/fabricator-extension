@@ -521,9 +521,12 @@ capture, so it is its own increment, not a tail to sweep up.
 - **`9258706` is OUR projected-read fix, ported and CORRECTED** ("Ported from PR #4 commit `2007c39`"):
   minus its "read one column the file does have so row counts survive" guard, which upstream MEASURED as
   unnecessary — its reader takes the row count from the ROW GROUP, not from the columns returned.
-  ⚠ **Do NOT propagate that correction to our seam reader unverified**: `NativeParquetDataFileReader`
-  goes through DuckDB `read_parquet`, where an empty SELECT list is not valid SQL, so the measurement
-  does not transfer. Open question, not a known redundancy.
+  ⚠ **Do NOT propagate that correction to our seam reader** — and this is now MEASURED, not merely
+  suspected (2026-07-28): `SELECT FROM read_parquet(…)` is `Parser Error: SELECT clause without selection
+  list`, so a zero-column result set is NOT EXPRESSIBLE in DuckDB SQL. `NativeParquetDataFileReader` gets
+  its row counts from the returned batches, so our "read one column the file does have" guard is load-bearing
+  on this seam even though upstream's own reader (which takes the count from the ROW GROUP) does not need it.
+  Settled: a real divergence, not a redundancy.
 
 **Resolution by class, not by reflex:** hunks 1–8 (the `CreateAsync` feature-declaration region) take
 UPSTREAM as a strict superset; 9–10 keep OURS (`preAssignedSchema` is still not upstream); 11 COMBINES
@@ -598,6 +601,125 @@ ours: decode DuckDB's packed rowid → `(add.path, absolute position)`, substitu
 targeted-first as a re-key of the LIVE autocommit DV UPDATE path (`update` 63 / `dv_default` 58 /
 `row_tracking_virtual` 299 / `changes` 73), then hermetic **53/53 @ 4152** + service **42/42 @ 1227**, both
 unchanged. EW Table.Tests **583** × {net10.0, net8.0, net472}.
+
+#### EW BUMP 2026-07-28 — clast master `fe74b0c`: THREE MORE PATCHES ABSORBED, and the `_metadata.row_id` name is now FREE for our surface
+
+10 upstream commits, 4 conflicted files, **23 hunks** in `DeltaTable.cs`. Curt has worked through his own
+triage doc, so the upstream offer sequence collapses from seven items to three.
+
+**Three more of our patches are reimplemented upstream and leave our diff:**
+- **`88adb02` = `PlanFiles`**, whose message names it *"the alternative to making DeltaFilePruner public that
+  PR #4 proposed"*. He arrived at the SAME signature and BOTH extra parameters independently, including the
+  PRE-prune gapped-ordinal invariant pinned by a test that fails if you renumber survivors.
+- **`d7c9d73` = the buffered rebase remap** — *"Ported from PR #4 d8b041e, adapted to master"*, with 6 tests
+  where we had 3. This was item 2 of our offer sequence, the one he called the strongest non-Fabricator
+  argument of the group.
+- **`e20af70` = `preAssignedSchema` + `materializedRowIds` + `rowIdsOut`** — *"the last of PR #4's additive
+  seams, all three"*.
+
+**⭐ `72b3888` (BREAKING) renames the transient column `_metadata.row_id` → `_ew_row_address`** behind a new
+`TransientRowAddress` type owning the encoding and the pack/unpack helpers. He found the fossil we had
+documented, independently and by measurement ("a helper reading stable ids from that column returned 2^40 for
+the first row of file 1"), and his reason is the one that matters to us: *"When the read side eventually
+exposes real row-tracking ids, the only correct name for that column is `_metadata.row_id`, and it is
+occupied."* **That read side is our `ReadAllWithMetadataAsync`** — so he has cleared the runway for our
+`_metadata` surface rather than colliding with it, and our four-member struct now occupies a name upstream
+deliberately vacated.
+
+**Why we took HIS `PlanFiles` rather than keeping ours** (checked, not assumed): ours differed in exactly two
+ways, and the first is DEAD — our `filter is null or TruePredicate` short-circuit only avoided constructing
+the pruner, because `DeltaFilePruner.ShouldInclude` already short-circuits `TruePredicate` on its first line,
+and our Bridge never passes one (zero sites). The second is one test he lacks (empty table). Against that his
+has 11 tests to our 7 (DV-reported-not-resolved, unknown-column-keeps-every-file, after-dispose-throws) and a
+sharper doc on the `schemaOverride` trust boundary: a name mapped to the WRONG physical name reads another
+column's statistics and can prove `AlwaysFalse` for a file that does hold matching rows — silent data loss,
+which ours only implied. Cost of adopting: `PlannedFile` is `(int FileOrdinal, AddFile File)` — fields swapped
+AND renamed — so every deconstruction needed touching. The compiler caught all of them.
+
+**⚠ THE TRAP OF THIS BUMP — an auto-merged duplicate STATEMENT, which the compiler CANNOT catch.** The
+previous bump's trap was a duplicate *declaration* (`CS0128`). This one was a duplicate *statement*: upstream
+moved the materialized-row-id re-attach to AFTER the variant-annotation strip (its comment explains why — the
+column name comes from table metadata and is already physical, so passing it through the mapping would rename
+it), while our old placement sat in non-conflicting context. The merge kept both, so
+`WriteDataFilesAsync` appended the id column TWICE — `RowTrackingWriter.AddRowIdColumn` appends
+unconditionally, so every materialized data file would have carried two identically-named `__delta_row_id`
+columns. **EW Table.Tests ran 656/656 green WITH the duplicate present** — verified both ways — including
+upstream's brand-new `HostRowIdentityTests` and its two-partition-split case, because a reader resolving by
+name gets a correct value from one of the two copies. Silent, and invisible to both suites.
+**The habit that found it, worth keeping: after taking a method wholesale from upstream, diff it against
+upstream's copy and demand BYTE-IDENTITY.** `WriteDataFilesAsync` and `CreateAsync` are now identical to
+upstream's; the two methods that still differ (`RebaseDvDmlActionsAsync`, `ReadRowsByRowIdsAsync`) differ
+for reasons we can name. A one-line test asserting exactly ONE materialized id column is a cheap upstream offer.
+
+**Three breaking changes migrated.** (1) `RowTrackingConfig.VirtualRowIdColumn` is gone — and the three Bridge
+sites did NOT want its replacement: the rowid column in the updates batch is named by OUR DuckDB-facing
+constant, and the two strings were only ACCIDENTALLY equal until upstream separated them. Now
+`DeltaCatalog.RowIdColumn` (widened to `internal`, with the reasoning on it). (2) `PlannedFile` field order +
+name. (3) `rowIdsOut` is `List<long[]>` and moved after the cancellation token — his shape and the better one,
+since a plain value array leaves the caller no Arrow buffer lifetime to manage, which is exactly what
+`2348d69` argues for.
+
+**⚠ THE SECOND TRAP, and the one that justifies the service tier's existence: a COLUMN-NAME rename breaks
+STRING-KEYED lookups, and the C ABI MASKS the mismatch.** EW's `ReadAllWithRowIdsAsync` now emits
+`_ew_row_address`, but `DeltaCatalog.ScanCodec` DECLARES its stream schema with `RowIdColumn`
+(`_metadata.row_id`) — so the declared schema and the batch schemas disagreed. `arrow_ingest` reads the
+DECLARED schema and is positional thereafter, so **DuckDB never noticed and hermetic passed 53/53 @ 4152**.
+The only consumer that looks at a *batch's* schema in C# is `ExternalTableRouting`'s identity→rowid resolution
+(`b.Schema.GetFieldIndex`), which fails LOUDLY — so the break surfaced in exactly one suite,
+`verify_mssql_s3_polybase` (slice D, identity-keyed UPDATE on a detected external Delta table), which is
+service-tier-only. Fixed at the SOURCE — `DeltaReader.RenameRowAddressToDuckDbRowId` renames EW's column to
+DuckDB's at the boundary in both `StreamWithRowIds*` paths, so the declared and actual schemas agree again —
+and the four hardcoded `"_metadata.row_id"` literals in `ExternalTableRouting` now reference
+`DeltaCatalog.RowIdColumn` so the next rename cannot break it silently. **Lesson: after an upstream column
+rename, grep for string-keyed column lookups; a declared-schema/batch-schema disagreement is invisible across
+the C ABI and therefore invisible to almost every test.**
+
+**Kept deliberately: our derived-id fallback in `ReadRowsByRowIdsAsync`.** Upstream did NOT port it and says
+why, having MEASURED it: `ReadFileAsync` already resolves a row's stable id as the materialized value else
+`baseRowId + absolute position`, so `sourceRowTrackingOut` has never been null for a plain append. That
+measurement was taken in HIS tree; ours is cheap and behaviour-identical wherever the claim holds, so it stays
+as a noted candidate rather than a deletion.
+
+**Inherited worth naming:** **`2348d69`** — a span over a caller's Arrow buffer outliving its
+`NativeMemoryManager`, whose finalizer frees the native memory a span does not root. It took an
+`AccessViolationException` in CI *on a docs-only commit*, and the reason it is worth more than a one-line fix
+is that **the span still READS CORRECTLY after the free** (freed HGlobal pages stay mapped), so the common
+outcome is silent wrong data and the AV is the lucky case. He audited all 325 sites and drew the line by
+PROVENANCE, not by which code reads: EW builds every buffer it owns with `new ArrowBuffer(byte[])` (no
+`ArrowBuffer.Builder` anywhere in `src/`), so the whole read/decode path is managed-backed and safe by
+construction; only the write/analysis path receives caller arrays, and it is rooted at the OUTERMOST method
+that receives one. Also **`f1a64f5`** — a host-facing `Stage*` API on `DeltaTransaction` (`StageDataFiles`,
+`StageRowDeletesAsync`, `StageSchemaChange`, `StageChangeDataAsync`, `StageActions`) plus a public
+`DeltaTransaction.Snapshot`, which fixed a PRE-EXISTING row-id double-reservation bug (two staged appends of 3
+rows each both got `baseRowId=3`; the mark ended at 6 for 9 rows, and nothing failed at commit). **We are
+immune — we never touch `DeltaTransaction`** (verified) and our fused flush assigns every baseRowId in ONE
+`CommitDataFilesAsync`. That API is nonetheless an OPPORTUNITY: it could replace our hand-rolled ~200-line
+`FlushDmlTransaction` loop, whose invariants (re-rebase from the ORIGINAL actions on retry, pass
+`rowLevelDml` or silently get file-granularity conflicts) are exactly the ones he says are enforced by no type.
+And **`e86b5a6`** — `AddColumnAsync`/`ComputeAddColumn` overloads taking a Delta `StructField` directly, plus
+`CodecSeamValueBlindnessTests` MEASURING that the write path never inspects a column's values, so a host may
+present its own physical representation for a declared Delta type (the read direction is deliberately NOT
+symmetric and that asymmetry is asserted too).
+
+**A DECISION IS OPEN, and it is ours to make.** `e86b5a6` ends: *"Together with preAssignedSchema this is what
+PR #4's variant transport needs from the library: two overloads and a documented contract, instead of a new
+file, an Apache.Arrow.Operations reference, a public VariantTransportBlob option, and a marker string naming a
+specific downstream project. Whether that is enough is cmettler's call; the seam is now measured rather than
+inferred either way."* Taking it would retire our LARGEST remaining patch (`VariantTransport.cs` + its tests +
+the `DeltaTableOptions` option) by moving blob⇄`VariantArray` — and the shredding built on
+`Apache.Arrow.Operations` — to the Bridge, which also removes the one thing in our patch set that is least
+defensible upstream: a marker string naming `fabricator` inside a general-purpose library. Not done here; it
+is a scoped follow-up, not part of a pin bump.
+
+**We also ADDED one thing upstream will want:** a `StageRowDeletesAsync(FileRowSelection)` overload beside his
+ordinal-keyed one, both feeding the now selection-keyed core. His public API and its 11 test call sites are
+untouched; the composition of hunks 11–13 is the interesting part of this merge — we BOTH re-cored
+`ComputeDeletionVectorActionsAsync`, he to report `DeleteDvEdit`s + touched paths for `DeltaTransaction`, we to
+key it by path, and those compose (his internal core, our key).
+
+**What remains ours after this bump:** the `FileRowSelection` selection-DML (V9/V10), `ReadAllWithMetadataAsync`
++ `MetadataPredicate`, `UpdateBySelectionViaVectorsAsync`, and `VariantTransport` (pending the decision above).
+All four verified still absent upstream.
 
 **UPSTREAM: this is the STRONGEST candidate of the whole seam effort** — a capability EW genuinely lacks, proven
 in production against Spark, additive, no magic strings (unlike the predicate lowering). Offer it ahead of the

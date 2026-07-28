@@ -212,7 +212,7 @@ public static class ExternalTableRouting
                 rowIds.Append(rid);
             }
             var keySchema = new Schema(
-                new[] { new Field("_metadata.row_id", Int64Type.Default, nullable: false) }, null);
+                new[] { new Field(DeltaCatalog.RowIdColumn, Int64Type.Default, nullable: false) }, null);
             var batch = new RecordBatch(keySchema, new IArrowArray[] { rowIds.Build() }, map.Count);
             long n = catalog.ExecuteDelete("main", leaf, new InMemoryArrayStream(keySchema, new[] { batch }));
             catalog.CommitTransaction(); // autocommit DELETE commits directly; this is the parked-state backstop
@@ -278,7 +278,7 @@ public static class ExternalTableRouting
             {
                 fields.Add(schema.FieldsList[j]);
             }
-            fields.Add(new Field("_metadata.row_id", Int64Type.Default, nullable: true));
+            fields.Add(new Field(DeltaCatalog.RowIdColumn, Int64Type.Default, nullable: true));
             var outSchema = new Schema(fields, null);
             var outBatches = new List<RecordBatch>(batches.Count);
             foreach (var b in batches)
@@ -357,7 +357,7 @@ public static class ExternalTableRouting
         }
         var spec = new ScanSpec
         {
-            Columns = new List<string> { identityColumn, "_metadata.row_id" },
+            Columns = new List<string> { identityColumn, DeltaCatalog.RowIdColumn },
             Filter = new FilterNode { Op = "in", Col = identityColumn, Vals = vals },
         };
         var valueSchema = new Schema(valueFields, null);
@@ -370,7 +370,7 @@ public static class ExternalTableRouting
             using (b)
             {
                 int idIdx = b.Schema.GetFieldIndex(identityColumn);
-                int ridIdx = b.Schema.GetFieldIndex("_metadata.row_id");
+                int ridIdx = b.Schema.GetFieldIndex(DeltaCatalog.RowIdColumn);
                 if (idIdx < 0 || ridIdx < 0)
                 {
                     throw new InvalidOperationException(
