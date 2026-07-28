@@ -729,6 +729,11 @@ internal static class DeltaNativeReader
             "date" => "DATE",
             "timestamp" => "TIMESTAMPTZ",     // Delta timestamp is UTC-adjusted -> TIMESTAMP WITH TIME ZONE
             "timestamp_ntz" => "TIMESTAMP",
+            // A file predating an ADDed variant column backfills as a NULL VARIANT. Only reachable via ALTER
+            // TABLE ADD COLUMN v VARIANT — the added column is absent from every file written before it, and
+            // the cast target has to be the LOGICAL type, since the outer projection presents variant (the
+            // registered extension carries it across the ABI as the transport blob from there).
+            "variant" => "VARIANT",
             var dec when dec.StartsWith("decimal(", StringComparison.Ordinal) => dec.ToUpperInvariant(),
             var other => throw new NotSupportedException(
                 $"delta native read: no NULL-backfill type mapping for '{other}'."),

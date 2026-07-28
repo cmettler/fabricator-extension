@@ -324,3 +324,54 @@ statement error
 CREATE TABLE mapped.main.lv (id INTEGER, l VARIANT[]);
 ----
 TOP-LEVEL column
+
+# ---- ALTER TABLE ADD COLUMN of a VARIANT: the transport marker is what makes it a Delta `variant` ----
+# Worth pinning because we get this for free and by a route that is easy to lose. The ALTER path crosses the
+# new column as a single-field Arrow schema, so the ONLY thing distinguishing a variant from an ordinary blob
+# is the ew.variant_transport field-metadata marker (the transport is a LEAF binary — the storage type cannot
+# carry the distinction). SchemaConverter.FromArrowField checks that marker BEFORE the storage type, so the
+# metadata commit records `variant`. Without the marker the column would be Delta `binary` FOREVER — a
+# metadata commit is not revisable — and the failure would surface far away, as an insert that cannot convert
+# VARIANT to BLOB. NOTE duckdb_columns() reports BLOB for a variant column on either path: that is the
+# storage type, and the scan resolves the marker at bind, so it is not a signal about this.
+# Own catalog, so the section does not depend on which earlier ones are still attached.
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/varaddcat' AS addcat (TYPE fabricator, PROVIDER 'delta', column_mapping 'none', native_read true, native_write true);
+
+statement ok
+CREATE TABLE addcat.main.addv (id INTEGER);
+
+statement ok
+INSERT INTO addcat.main.addv VALUES (1);
+
+statement ok
+ALTER TABLE addcat.main.addv ADD COLUMN v VARIANT;
+
+# The pre-existing row reads NULL for the added column (schema evolution), the new one carries a real variant.
+statement ok
+INSERT INTO addcat.main.addv VALUES (2, {'a': 9, 'b': 'y'}::VARIANT);
+
+query II
+SELECT id, CAST((v).a AS VARCHAR) FROM addcat.main.addv ORDER BY id;
+----
+1	NULL
+2	9
+
+# Typed member access proves the column is a VARIANT rather than a blob that merely round-trips: a blob
+# cannot be extracted from ("Cannot extract field 'a' from expression ... not a struct, union, map, or json").
+query I
+SELECT CAST((v).b AS VARCHAR) FROM addcat.main.addv WHERE id = 2;
+----
+y
+
+# ... and the value survives a re-ATTACH, i.e. the DELTA SCHEMA says variant — not just this session's binding.
+statement ok
+DETACH addcat;
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/varaddcat' AS addcat2 (TYPE fabricator, PROVIDER 'delta', column_mapping 'none', native_read true, native_write true);
+
+query I
+SELECT CAST((v).a AS VARCHAR) FROM addcat2.main.addv WHERE id = 2;
+----
+9

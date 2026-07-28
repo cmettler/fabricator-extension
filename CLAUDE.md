@@ -742,11 +742,36 @@ and a neutral constant agrees as well as a threaded parameter.
 is the name registered in DuckDB's Arrow extension registry — it must match what crosses the ABI, so a stale
 `unittest`/loadable would mismatch a fresh bridge. Also updated `engineered-wood/doc/codec-seam-investigation.md`,
 which is HIS doc and referenced the old name.
-**Still to do from this decision:** take the FREE half of his offer (the `AddColumnAsync`/`ComputeAddColumn`
-`StructField` overloads — they unblock declaring `variant` on ALTER ADD COLUMN, which our Arrow-inferring path
-can only ever call `binary`; and `CodecSeamValueBlindnessTests` is a GUARANTEE we get for nothing), and offer
-the split he asked for — variant **shredding on write** as the general-purpose passenger, independent of where
-the transport lives.
+**HIS `StructField` OVERLOAD IS NOT NEEDED BY US — and checking that found a real bug (2026-07-28).** His
+premise, *"ADD COLUMN can only ever say Delta `binary`, permanently"*, holds for a host WITHOUT a marker
+mechanism — i.e. exactly the host we would have become had we moved the transport out. Under our marker,
+`ALTER TABLE … ADD COLUMN v VARIANT` already commits a Delta `variant`, because
+`SchemaConverter.FromArrowField` checks the marker BEFORE the storage type and the ALTER path crosses the new
+column as an ordinary single-field Arrow schema. So the overload buys us nothing — which is one more (small)
+argument for the placement we kept. `CodecSeamValueBlindnessTests` we take for free: it is a guarantee, not code.
+**But the capability was UNPINNED, and probing it hit `delta native read: no NULL-backfill type mapping for
+'variant'`** — `DeltaNativeReader.TypeText` renders `CAST(NULL AS <type>)` for a column absent from an older
+file and had no `variant` case (a deliberate throw from the nested-variant gating era). So the metadata commit
+and new rows worked while READING the table failed whenever any file predated the added column.
+`CAST(NULL AS VARIANT)` is valid DuckDB, so it is one line; now pinned by 13 assertions
+(`verify_delta_catalog_variant` **157**, was 144) including a re-ATTACH, which proves the DELTA SCHEMA says
+variant rather than just this session's binding. **Diagnostic trap worth remembering: `duckdb_columns()`
+reports BLOB for a variant column on BOTH the CREATE and ALTER paths** — that is the storage type and the scan
+resolves the marker at bind, so it is not a signal about this at all; reading it as one sent the first
+investigation down a false path.
+
+**THE SHREDDING SPLIT HE ASKED FOR — the right shape is now clear, and it is better than expected (not built).**
+He wants variant **shredding on write** separated as *"a general-purpose passenger worth separating"*. Key
+finding: **`EngineeredWood.Parquet` ALREADY references `Apache.Arrow.Operations`** — upstream's own project, so
+the package is an existing EW dependency and we only added it to `DeltaLake.Table`. That means the split lands
+in Parquet (where shredding belongs anyway — it is a physical-layout concern, the VariantShredding spec) and
+**adds no dependency anywhere**; and since EVERY Operations type `VariantTransport` uses is shredding
+(`ShredSchemaInferer`, `VariantShredder`, `ShredSchema`, `ShredType`, `ShreddedVariantArrayBuilder`,
+`GetLogicalVariantValue`), moving both directions there lets `DeltaLake.Table` DROP its Operations reference —
+removing the exact thing he objected to. Design note for when it is built: the primitive must take
+already-decoded `VariantValue`s, not a `VariantArray`, or our transport pays a SECOND decode (it decodes the
+blobs once already); a `Shred(VariantArray)` convenience overload on top is what makes it general for a caller
+holding a canonical array with no blob anywhere.
 **Gates:** variant **144** / native_write **147**; EW Table.Tests 678 ×3 TFMs / DeltaLake 217; hermetic
 **53/53 @ 4152** and service **42/42 @ 1227**, both unchanged.
 
