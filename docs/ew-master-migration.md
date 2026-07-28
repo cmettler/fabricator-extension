@@ -295,6 +295,53 @@ decays the moment he does. PR #4 went **48 commits behind** exactly that way, un
 deleting 17,150 lines of his own newer work. A branch generated on demand from the current
 `fabricator-patches` is current by construction and costs a couple of minutes to recreate.
 
+### Offer queue as of 2026-07-28 — five open, three to go
+
+All five are **draft**, each cut fresh off `upstream/master` per generate-never-maintain, and each
+**built and tested against PRISTINE upstream** (not merely against our tree) before opening:
+
+| PR | offer | validated |
+|---|---|---|
+| [#6](https://github.com/clast-project/engineered-wood/pull/6) | variant shredding, write direction (his gap 8) | Parquet builds; +7 tests × {net8.0, net472}; all 17 `Variant*` green |
+| [#7](https://github.com/clast-project/engineered-wood/pull/7) | `ReadAllWithMetadataAsync` — the `_metadata` locator | Table.Tests 643 × {net8.0, net472} |
+| [#8](https://github.com/clast-project/engineered-wood/pull/8) | `StartTransaction(snapshot)` | 640 × 2 TFMs; **mutant** (ignore the arg) fails 2/4 |
+| [#9](https://github.com/clast-project/engineered-wood/pull/9) | `StageAppTransaction` (idempotent-producer CAS) | 642 × 2 TFMs; **mutant** (drop the per-attempt check) fails exactly 1/6 |
+| [#10](https://github.com/clast-project/engineered-wood/pull/10) | `StageDataFilesAsync` + `SetOperation` | 642 × 2 TFMs; **mutant** (ignore the identity bypass) fails 1/6 |
+
+**Mutation-test every load-bearing claim ON THE OFFER BRANCH, not from our history.** It has paid for
+itself three times: it produced the sharpest line in each PR body (*which* test carries the weight), and
+on #10 a mutant **SURVIVED** — dropping `StatsWithLooseBounds` failed nothing, so the spec's
+`tightBounds=false` on a DV-bearing add was unpinned in OUR suite too (fixed both places, EW `7639414`).
+
+**Two integration findings that our tree HID** — the argument for splicing against pristine master rather
+than assuming portability: (1) upstream builds `latestSnapshot` only when `rowLevel || rowTrackingEnabled`,
+so #9's CAS had nothing to read on a plain append (surfaced as an NRE in the twin-producer test, not by
+review; `hasAppTransactions` now joins that condition and the PR flags it as his call); (2) upstream's
+`CommitDataFilesAsync` **already carries** the `identityValuesPreGenerated` bypass, so #10 argues literal
+parity rather than new policy — checked before proposing, and it reframed the whole PR.
+
+**Remaining three, in dependency order, with the prep cost measured:**
+1. **Read declaration + the ISOLATION GATE** — the delicate one, and the only offer that CHANGES his
+   semantics rather than adding beside them, in BOTH directions: under `serializable` his loop reconciles
+   row-level and admits the interleaving that level exists to forbid; under `write_serializable` his read
+   exemption is NARROWER than the level's definition (only reconciled paths are exempt, so a file merely
+   READ can be compacted away and abort us). Our suite caught both — `row_level_concurrency:162`
+   ("Query unexpectedly succeeded") and `transactions:537` (concurrentDeleteRead). **Prep:** upstream
+   already has `_readPredicates`, `ReadPredicates` and `Concurrency.ReadSet.Blind`, so only
+   `StageReadPredicate` / `StageWholeTableRead` / `ReadWholeTable` are missing; the gate itself is ~2 lines
+   (`rowLevel` gated on the level + `effectiveReads`). **BUT all 5 of `StagedReadSetAndIsolationTests` use
+   the PINNED overload (#8)** and 4 also use the read declaration — so either stack on #8 or apply the #9
+   trick (call `StartTransaction()` BEFORE the concurrent commit; the handle's own snapshot is then already
+   the pre-concurrent version, which is why #9 needed no dependency). Split it: the gate + its one test
+   (`DisjointRowDeletes_ReconcileUnderWriteSerializable_ButConflictUnderSerializable`) is separable from the
+   read-declaration API + its four.
+2. **`FileRowSelection`** — lead with `OrdinalKeyed_AfterAConcurrentRemoveRenumbersTheSet_DeletesTheWRONGRow`,
+   because silent WRONG DATA is the argument and neither a range check nor `TransientRowAddress` can catch
+   it. Pitch: "the address type is right; the DML boundary needs a key that fails loudly."
+3. **`UpdateBySelectionViaVectorsAsync`** — the one genuine CAPABILITY gain, and his own landing notes record
+   merge-on-read UPDATE as **unowned** upstream after the PR rewrite dropped it. Offer it last but flag that
+   status, since it is the only item filling a hole he has named.
+
 ### Why per-feature and not one draft
 
 He triages by **who each gap serves** (`doc/upstream-landing-notes.md` upstream) and lands the
