@@ -272,8 +272,11 @@ low for both is **one branch we keep, offers we generate.**
   `SchemaConverter.cs` (+50), `DeltaTableOptions.cs` (+15), and `DeltaFilePruner.cs` (+4, doc only).
 - **143 deletions total** — we are almost purely additive, which is what makes the patch set offerable.
 
-**Re-measured 2026-07-28 after the shredding split:** **20 files, +4696 / −143**, 25 non-merge commits
-ahead, **0 behind**. The split ADDED a shared file outside the Delta layer —
+**Re-measured 2026-07-28 after the shredding split AND the `9669796` bump:** **20 files, +4680 / −143**, 26
+non-merge commits ahead, **0 behind** — the insertion count went DOWN across a bump that added upstream code,
+because conforming `_metadata`'s locator to his flat shape deleted more of ours than it added (no struct type,
+no struct walking, no duplicated identity resolution). That is the shape of a patch set converging rather than
+accreting. The split ADDED a shared file outside the Delta layer —
 `EngineeredWood.Parquet/Parquet/Data/VariantShredding.cs` (+173) — and that is the point rather than a
 cost: it is the file Curt asked for (gap 8), it removed `Apache.Arrow.Operations` from
 `DeltaLake.Table`, and it is the most independently-offerable thing in the set, since it touches no

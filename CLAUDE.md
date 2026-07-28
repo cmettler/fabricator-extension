@@ -831,10 +831,55 @@ untouched; the composition of hunks 11–13 is the interesting part of this merg
 `ComputeDeletionVectorActionsAsync`, he to report `DeleteDvEdit`s + touched paths for `DeltaTransaction`, we to
 key it by path, and those compose (his internal core, our key).
 
-**⚠ UPSTREAM MOVED ON 2026-07-28 AND PART OF `_metadata` IS NOW HIS — read before offering that one
-(spotted while cutting the shredding offer; NOT yet merged into `fabricator-patches`).** Two commits landed
-past `fe74b0c`, both touching **`DeltaTable.cs`** — the file that has conflicted in every single bump — so
-they are the next bump's work:
+#### EW BUMP 2026-07-28 (second, same day) — clast master `9669796`: the FIRST CLEAN merge in four bumps, and `_metadata` CONFORMS to upstream's shape
+
+Spotted while cutting the shredding offer off a freshly fetched master, not by looking for it. `git merge-tree`
+predicted clean and delivered: **`DeltaTable.cs` did NOT conflict — the first bump where it didn't.** All 7 patch
+symbols present after; Table.Tests **696** × {net10.0, net8.0, net472} (was 678, +18 upstream tests) / DeltaLake
+**217**. **Inherited and worth naming: `519f695` makes `ReadFileAsync` ASK for the materialized row-tracking
+columns when the read PROJECTS** — and a partitioned read always projects, so ids were previously resolved off
+the wrong values. That reaches our codec read-back paths (`ReadRowsByRowIdsAsync`, the buffered-UPDATE
+pre-image), so it is a free correctness fix, same class as the `525bf94` comparator find.
+
+**`_metadata` NOW CONFORMS TO HIS SHAPE (user's call, and the right one).** His `9669796` emits the identity
+pair as **two FLAT columns whose NAMES are literally** `"_metadata.row_id"` / `"_metadata.row_commit_version"`
+(`RowTrackingConfig.RowIdColumnName`; dots INSIDE the name, not struct nesting). Ours was a four-member STRUCT
+carrying the same identity plus the locator — one namespace, two encodings. Now:
+`ReadAllWithMetadataAsync` appends **`_metadata.file_path` + `_metadata.row_index`, flat, both non-null**, and
+**no longer re-emits the identity pair** (his columns, his resolution — one concept, one owner; our copy was
+duplicating a resolution we do not own). `UpdateBySelectionAsync(RecordBatch)` reads the two flat columns
+instead of walking a struct; the Bridge's `ReKeyUpdatesOntoMetadata` builds them.
+**The signal that conforming was right rather than deferential: `MetadataPredicate` ALREADY used the flat
+dotted names** (`FilePathColumn = "_metadata.file_path"`), so the struct was the odd one out — and those
+constants are now the single source of the names, in EW and in the Bridge.
+**Nothing capability-level moved.** The locator is what the selection APIs consume: `UpdateBySelectionAsync`
+reads `file_path` + `row_index` and ignores identity entirely (a stable row id cannot say which file/position to
+DV-mask), and `FileRowSelection` is a `path → positions` dictionary with no Arrow shape at all.
+**Framing to keep for the offer:** these two columns are the **UNPACKED, spec-named form of
+`_ew_row_address`** — the same physical address, spelled as the file that HOLDS the row rather than as its
+ordinal in a path-sorted set — which is exactly what lets a DML boundary VALIDATE what it was handed (an
+inactive `add.path` is recognisably wrong; a stale ordinal is indistinguishable from a fresh one). Conforming
+turns the offer from a COMPETING shape into an EXTENSION of his convention, which is why it is now much more
+offerable than the struct was.
+**Two test changes are improvements, not translations:** the helper reads the locator from our surface and
+identity from his and **ASSERTS the two streams align row-for-row** (the only thing making a zip legitimate);
+and `WithoutRowTracking_ShapeIsUnchanged_AndTheIdsAreNull` became
+`WithoutRowTracking_TheLocatorStillWorks_AndTheIdentitySurfaceRefuses` — asserting his deliberate refusal beats
+asserting all-null ids, because "this table does not track identity" is the truth all-null columns would
+misstate. (His other adoptable refusal, on a user column colliding with a generated name, comes for free.)
+**Gates, targeted-first because the Bridge's copy-on-write UPDATE is a LIVE consumer:** `update` **63** /
+`dv_default` **58** / `native_write` **147** / `row_tracking_virtual` **299**, all exact; then hermetic
+**53/53 @ 4165** and service **42/42 @ 1227**, both unchanged. **The service tier matters specifically here** —
+`verify_mssql_s3_polybase` is protocol 1.0 ⇒ DVs off ⇒ UPDATE takes exactly the copy-on-write path whose input
+was re-keyed, and it is service-tier-only.
+**⚠ PROCESS TRAP RE-HIT: a no-match sqllogictest filter exits ZERO.** I ran
+`verify_delta_catalog_row_tracking_virtual` for a suite actually named `verify_delta_row_tracking_virtual` and
+got a silent blank, which reads exactly like a pass. Already recorded under CI; re-recording because it bit
+during a LIVE-path gate, where a false pass is worst. Always read the assertion COUNT, never the absence of a
+failure.
+
+**Historical (the note as first written, before the merge):** two commits landed past `fe74b0c`, both touching
+**`DeltaTable.cs`** — the file that had conflicted in every single bump:
 - **`9669796` overlaps `ReadAllWithMetadataAsync` on the IDENTITY half ONLY — and the overlap is in the two
   members our own consumer IGNORES, so the offer is in better shape than it first looks.** His new
   `ReadAllWithRowTrackingAsync`/`ReadAtVersionWithRowTrackingAsync` append **two FLAT top-level columns whose
@@ -861,12 +906,19 @@ they are the next bump's work:
   our partitioned row-tracking/MoR paths are the ones that would be exposed to it. Evaluate against our tree
   at the bump rather than assuming we are immune.
 
-**What remains ours after this bump:** the `FileRowSelection` selection-DML (V9/V10), `ReadAllWithMetadataAsync`
-+ `MetadataPredicate`, `UpdateBySelectionViaVectorsAsync`, `VariantTransport` (decision settled — KEPT, marker
-renamed), and — new on 2026-07-28 — `VariantShredding`'s write half in the parquet layer. All five verified
-still absent upstream. **The shredding split is the most independently offerable of them**: Curt asked for it
-by name (gap 8), it touches no Delta concept, and it removes the `Apache.Arrow.Operations` reference he
-objected to.
+**How that resolved (so the historical block is not mistaken for guidance): we CONFORMED to his flat shape.**
+The Spark-is-a-struct argument above is real but was outweighed — extending his convention makes the locator
+offerable where a competing struct would not be, and `MetadataPredicate` had been using the flat dotted names
+all along. See the bump subsection above for the as-built.
+
+**What remains ours after this bump:** the `FileRowSelection` selection-DML (V9/V10), `ReadAllWithMetadataAsync`'s
+**LOCATOR pair** (`_metadata.file_path` / `_metadata.row_index` — reshaped to his convention; the identity pair
+is now HIS) + `MetadataPredicate`, `UpdateBySelectionViaVectorsAsync`, `VariantTransport` (decision settled —
+KEPT, marker renamed), and `VariantShredding`'s write half in the parquet layer. All five verified still absent
+upstream. **Offerability order changed on 2026-07-28:** the shredding split went out as draft PR #6 (Curt asked
+for it by name, it touches no Delta concept, and it removes the `Apache.Arrow.Operations` reference he objected
+to); the **locator is now second**, because conforming turned it from a competing shape into a two-column
+extension of a convention he just established.
 
 #### THE BUFFERED FLUSH IS ON EW's `DeltaTransaction` — our OCC loop is GONE (2026-07-28, EW + Bridge, no ABI)
 
