@@ -15,7 +15,7 @@ namespace Fabricator.Bridge;
 /// <see cref="NativeParquetDataFileWriter"/>, completing the codec seam so copy-on-write rewrites,
 /// merge-on-read UPDATE reads and compaction all decode through the host engine. This is what preserves
 /// codec-specific representations the engineered-wood reader is blind to (the parquet VARIANT annotation
-/// round-trips as the registered <c>fabricator.variant</c> transport), and it inherits the native decode
+/// round-trips as the registered <c>ew.variant_transport</c> transport), and it inherits the native decode
 /// quality (shredded variants, all encodings) for free.
 ///
 /// <para>The contract requires batches in FILE ORDER (every consumer is position-keyed), so the query

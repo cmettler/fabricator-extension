@@ -2988,7 +2988,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             }
             if (VariantMarker.IsVariantArrowField(field))
             {
-                // A DuckDB VARIANT crosses the boundary as an fabricator.variant-tagged blob (the Delta
+                // A DuckDB VARIANT crosses the boundary as an ew.variant_transport-tagged blob (the Delta
                 // provider's transport). Mapping it to VARBINARY would silently store opaque variant bytes —
                 // reject instead (before the arrow extension existed this failed at export with a clean error).
                 throw new NotSupportedException(

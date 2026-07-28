@@ -1,6 +1,6 @@
 # name: test/verify_delta_catalog_variant.test
 # description: VARIANT columns on the Delta catalog (docs/variant-support.md). VARIANT crosses the C++<->C#
-#              Arrow boundary as the fabricator.variant single-blob transport (metadata||value) via the Arrow
+#              Arrow boundary as the ew.variant_transport single-blob transport (metadata||value) via the Arrow
 #              type extension registered at load; EW (clast master) models variant as the canonical
 #              arrow.parquet.variant internally and converts at its host boundary (VariantTransport, selected
 #              by DeltaTableOptions.VariantTransportBlob). BOTH byte paths work: the native seams (DuckDB's

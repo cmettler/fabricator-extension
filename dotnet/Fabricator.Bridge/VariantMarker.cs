@@ -5,8 +5,8 @@ using Apache.Arrow.Types;
 namespace Fabricator.Bridge;
 
 /// <summary>
-/// The <c>fabricator.variant</c> Arrow boundary discriminator — a PRIVATE transport marker (field metadata
-/// <c>ARROW:extension:name = fabricator.variant</c> on a BINARY column carrying one self-delimiting blob per
+/// The <c>ew.variant_transport</c> Arrow boundary discriminator — a PRIVATE transport marker (field metadata
+/// <c>ARROW:extension:name = ew.variant_transport</c> on a BINARY column carrying one self-delimiting blob per
 /// row: metadata bytes ++ value bytes). This is the C++↔C# crossing form the extension's ArrowTypeExtension
 /// registry (<c>fabricator_variant.cpp</c>) keys on; it is deliberately NOT the canonical
 /// <c>arrow.parquet.variant</c> struct extension (a nested internal type crashes DuckDB's
@@ -23,7 +23,7 @@ public static class VariantMarker
     public const string ExtensionNameKey = "ARROW:extension:name";
 
     /// <summary>The fabricator variant transport's extension name.</summary>
-    public const string ExtensionName = "fabricator.variant";
+    public const string ExtensionName = "ew.variant_transport";
 
     /// <summary>True when <paramref name="field"/> carries the fabricator variant transport marker.</summary>
     public static bool IsVariantArrowField(Field field) =>

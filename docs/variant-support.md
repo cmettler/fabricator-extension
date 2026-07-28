@@ -18,7 +18,7 @@ is the remaining step. See "AS BUILT" below; the design sections after it are th
    COPY sees real VARIANT with no cast in the SQL). The conversions delegate to the parquet extension's
    scalars via `FunctionBinder`+`ExpressionExecutor` (parquet is statically linked; no parquet internals
    linked): `variant_to_parquet_variant(v)` out, `variant_bytes_to_variant(blob)` in.
-2. **The transport is ONE self-delimiting BLOB per row (`fabricator.variant`), NOT the canonical
+2. **The transport is ONE self-delimiting BLOB per row (`ew.variant_transport`), NOT the canonical
    `arrow.parquet.variant` struct.** The value = parquet-variant metadata bytes immediately followed by the
    value bytes (the metadata header is self-delimiting — exactly the byte form `variant_bytes_to_variant`
    consumes). Reason: **upstream appender bug** — `ArrowAppender::Finalize`/`FinalizeChild` passes the
@@ -28,7 +28,7 @@ is the remaining step. See "AS BUILT" below; the design sections after it are th
    within vector of size 2". No built-in extension has a nested internal type (bool8/geoarrow/bignum are all
    leaves), so a LEAF internal type sidesteps the bug entirely. Upstream-PR candidate: `FinalizeChild` should
    use `append_data.extension_data->GetInternalType()` when set. The EW/C# marker is
-   `SchemaConverter.VariantExtensionName = "fabricator.variant"` (field metadata `ARROW:extension:name`).
+   `SchemaConverter.VariantExtensionName = "ew.variant_transport"` (field metadata `ARROW:extension:name`).
 
 Other findings from the build:
 - **NULL variant rows**: the parquet binary decoder rejects an empty metadata buffer outright (does not

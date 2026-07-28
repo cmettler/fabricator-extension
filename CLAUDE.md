@@ -124,7 +124,7 @@ DV-aware CDF inference; schema-evolved compaction fixes; the **narrow-int parque
 fix** (1-/2-byte Arrow arrays reinterpreted at the 4-byte physical width — silent corruption,
 pre-existing, upstream-candidate); pass-through source-field relabel fixes (WidenBatch/
 BackfillMissingColumns); and the **variant TRANSPORT** (`SchemaConverter.VariantTransportExtensionName
-= "fabricator.variant"`, `VariantTransport` blob⇄`VariantArray` at EW's host boundary,
+= "ew.variant_transport"`, `VariantTransport` blob⇄`VariantArray` at EW's host boundary,
 `DeltaTableOptions.VariantTransportBlob` — EW's INTERNAL model is now the canonical
 `arrow.parquet.variant` `VariantType`; the Bridge sets the option in `DeltaWriter.Options()` and
 converts advertised schemas via `VariantMarker.ToTransportSchema`). Bridge-side migration:
@@ -710,6 +710,45 @@ the `DeltaTableOptions` option) by moving blob⇄`VariantArray` — and the shre
 `Apache.Arrow.Operations` — to the Bridge, which also removes the one thing in our patch set that is least
 defensible upstream: a marker string naming `fabricator` inside a general-purpose library. Not done here; it
 is a scoped follow-up, not part of a pin bump.
+
+#### THE VARIANT-TRANSPORT DECISION — KEEP the transport, RENAME the marker (2026-07-28; EW + Bridge + C++)
+
+Curt's `e86b5a6` put it to us directly (*"whether that is enough is cmettler's call"*): retire our
+`VariantTransport` patch in favour of his `StructField` overloads + the measured codec-seam contract, moving
+blob⇄`VariantArray` to the Bridge. **Answer: no, and the reason is structural.** His framing — *"two overloads
+and a documented contract, instead of a new file, an Apache.Arrow.Operations reference, a public option, and a
+marker string"* — assumes the transport is ONE boundary. It is **five call sites**
+(`ComputeUpdateActionsAsync`, `ComputeWriteActionsAsync`, `WriteDataFilesAsync`, `RewriteRowsToNewFileAsync`,
+`ProcessFileBatchesAsync`), and the read-side one sits at the BOTTOM of a pipeline with **14 `ReadFileAsync`
+callers** — the plain reader, the predicate UPDATE, `ReadRowsByRowIdsAsync`, CDF capture, merge-on-read UPDATE,
+compaction. One gated conversion point is what keeps host-facing and EW-INTERNAL paths consistent across all of
+them; moving it out means converting at N boundaries (two of them a CALLBACK and an async STREAM nested inside
+EW operations) and guaranteeing no internal path sees the wrong form. **The failure mode is silent** — a variant
+column reads as a bare struct-of-binary — on the feature with our most extensive live validation.
+
+**What we DID instead kills the actual objection for one line.** His complaint is specific and narrow: *"a
+marker string naming a specific downstream project."* That string was ONE constant, so
+`SchemaConverter.VariantTransportExtensionName` is now **`ew.variant_transport`** — named for the library whose
+boundary form it is, mirroring the `_ew_` prefix upstream chose for `_ew_row_address`. No general-purpose
+library file mentions a downstream project any more, and the placement that makes 14 consumers correct is
+untouched. **Safe because the marker is BOUNDARY-ONLY**: in-memory Arrow field metadata, while the Delta schema
+records `variant` and the parquet file carries the canonical annotation — nothing persisted references it, so no
+table written under the old name needs migration.
+**Chosen over making it configurable**: a `DeltaTableOptions` setting would have to reach `FromArrowSchema`
+(static, 8 call sites) for no behavioural gain — the value only has to be AGREED between a host and the library,
+and a neutral constant agrees as well as a threaded parameter.
+**⚠ The rename is a THREE-LAYER lockstep and needs a C++ REBUILD, not just a republish:** the same string is
+`VariantMarker.ExtensionName` (Bridge) and `kVariantExtensionName` (`fabricator_variant.cpp`), and the C++ one
+is the name registered in DuckDB's Arrow extension registry — it must match what crosses the ABI, so a stale
+`unittest`/loadable would mismatch a fresh bridge. Also updated `engineered-wood/doc/codec-seam-investigation.md`,
+which is HIS doc and referenced the old name.
+**Still to do from this decision:** take the FREE half of his offer (the `AddColumnAsync`/`ComputeAddColumn`
+`StructField` overloads — they unblock declaring `variant` on ALTER ADD COLUMN, which our Arrow-inferring path
+can only ever call `binary`; and `CodecSeamValueBlindnessTests` is a GUARANTEE we get for nothing), and offer
+the split he asked for — variant **shredding on write** as the general-purpose passenger, independent of where
+the transport lives.
+**Gates:** variant **144** / native_write **147**; EW Table.Tests 678 ×3 TFMs / DeltaLake 217; hermetic
+**53/53 @ 4152** and service **42/42 @ 1227**, both unchanged.
 
 **We also ADDED one thing upstream will want:** a `StageRowDeletesAsync(FileRowSelection)` overload beside his
 ordinal-keyed one, both feeding the now selection-keyed core. His public API and its 11 test call sites are
@@ -1928,7 +1967,7 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   scan ingest, `FetchTableColumns` bind schema). Conversions = the parquet extension's scalars via
   `FunctionBinder`/`ExpressionExecutor` (`variant_to_parquet_variant` out / `variant_bytes_to_variant` in).
   **Transport = ONE self-delimiting BLOB per row** (metadata bytes ++ value bytes), marker
-  **`fabricator.variant`** — NOT the canonical struct: `ArrowAppender::FinalizeChild` walks the LOGICAL type's
+  **`ew.variant_transport`** — NOT the canonical struct: `ArrowAppender::FinalizeChild` walks the LOGICAL type's
   children (VARIANT = 4) against the internal-type appender (2) → a nested internal type crashes upstream
   ("index 2 within vector of size 2"; **FILED UPSTREAM 2026-07-25 as duckdb/duckdb#24157**, "Support VARIANT
   over the Arrow interface (arrow.parquet.variant)" — use `extension_data->GetInternalType()` there. If it
@@ -1983,7 +2022,7 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   the reader wraps back via `ParquetReadOptions.ExtensionRegistry`, round-trip tests in
   `VariantArrayRoundTripTests` — EW's known-issues "VARIANT not supported" note is STALE). The missing
   piece was Delta-layer glue: **`EngineeredWood.DeltaLake.Table/VariantTransport`** converts the
-  `fabricator.variant` blob transport ⇄ `VariantArray`/bare storage struct — write side in `WriteCoreAsync`'s
+  `ew.variant_transport` blob transport ⇄ `VariantArray`/bare storage struct — write side in `WriteCoreAsync`'s
   codec branch (replacing the gate; splits each blob via the self-delimiting metadata header), read side in
   `ProcessFileBatchesAsync` after the renames (struct→blob+tag; a host-reader blob passes through;
   **shredded files [typed_value child] → clean error** — reassembly needs a variant engine). Bridge:
@@ -5379,6 +5418,14 @@ VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
   `__std_unique_1` — newer STL vectorized-algorithm intrinsics that `duckdb_static.lib` references but the
   older vcruntime lacks. Run every cmake/ninja command inside that vcvars shell, e.g.
   `cmd /c '"…\18\…\vcvars64.bat" && cmake --build build/release --target <target>'`.
+  **⚠ That one-liner does NOT survive Git Bash quoting** (verified 2026-07-28, three variants failed: `cmd //c`
+  with escaped inner quotes → *"is not recognized as an internal or external command"*; a bare relative
+  `build_cpp.bat` → not found; and a `>nul` redirect inside → *"The system cannot find the path specified"*,
+  which looks like a MISSING VS install and is not). What works reliably: write a two-line `.bat`
+  (`call "…vcvars64.bat"` then the `cmake --build`) and invoke it by ABSOLUTE path — from PowerShell,
+  `cmd /c "D:\...\build_cpp.bat"`. A copy lives in the session scratchpad. **The tell that you did not actually
+  rebuild is the binary's mtime** — check `ls -l build/release/test/unittest.exe` rather than trusting exit 0,
+  since a failed `cmd` line still exits 0 through the pipe.
 - **Targets → binaries** (`EXTENSION_STATIC_BUILD=1` ⇒ the extension is statically embedded in BOTH exes
   *and* built loadable):
   - `shell` → `build/release/duckdb.exe` (interactive shell; **embeds** the extension).

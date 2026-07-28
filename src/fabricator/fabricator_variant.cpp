@@ -25,7 +25,7 @@ namespace {
 // internal type (the canonical struct<metadata,value>) crashes upstream ("index 2 within vector of size 2");
 // a LEAF internal type sidesteps that entirely (the shape arrow.bool8 / geoarrow.wkb already exercise).
 // Because this is NOT the canonical arrow.parquet.variant struct layout, the marker is our own name.
-constexpr const char *kVariantExtensionName = "fabricator.variant";
+constexpr const char *kVariantExtensionName = "ew.variant_transport";
 
 // Binds one of the parquet extension's variant conversion scalars over a single bound-reference arg and
 // executes it over `input` (count rows). The functions live in the system catalog (parquet is statically
@@ -151,7 +151,7 @@ void PopulateVariantSchema(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &ch
 	child.metadata = root_holder.metadata_info.back().get();
 }
 
-// Import schema: a field tagged fabricator.variant resolves to DuckDB VARIANT; the ArrowType carries the
+// Import schema: a field tagged ew.variant_transport resolves to DuckDB VARIANT; the ArrowType carries the
 // string/binary layout info so the physical parse (into the internal BLOB vector) still works.
 unique_ptr<ArrowType> GetVariantType(ClientContext &context, const ArrowSchema &schema,
                                      const ArrowSchemaMetadata &schema_metadata) {
@@ -165,7 +165,7 @@ unique_ptr<ArrowType> GetVariantType(ClientContext &context, const ArrowSchema &
 		                            make_uniq<ArrowStringInfo>(ArrowVariableSizeType::SUPER_SIZE));
 	}
 	throw InvalidInputException(
-	    "fabricator.variant expects a binary transport column (metadata||value), got format \"%s\"",
+	    "ew.variant_transport expects a binary transport column (metadata||value), got format \"%s\"",
 	    format.c_str());
 }
 

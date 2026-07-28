@@ -24,7 +24,7 @@ DeltaLake.Tests 210/210 green on the branch. Bridge-side (fabricator `d17db9a`):
 guide §1 (+ the UPDATE SQL-join substitution block deleted — EW's rewriteFile callback is the path;
 the `UpdateByRowIdsAsync(RecordBatch updates)` host-join overload is a follow-up), UPDATE loses
 `rowLevelRetry` (master CoW UPDATE aborts on conflict; DV DELETE keeps it), writer seam →
-IAsyncEnumerable (first-batch peek + stream), **`VariantMarker`** (Bridge-owned `fabricator.variant`
+IAsyncEnumerable (first-batch peek + stream), **`VariantMarker`** (Bridge-owned `ew.variant_transport`
 detector — master models variant as canonical `VariantType`, so the blob⇄struct TRANSPORT at the EW
 boundary is an OPEN follow-up; expect verify_delta_catalog_variant red), WriteChangeDataFileAsync →
 single CdcFile (buffered CDC on PARTITIONED tables re-guarded to autocommit — the fork's in-EW split
@@ -88,7 +88,7 @@ authorization) — adapted to master's architecture (the fork's INTERNAL represe
 was the blob with conversion at the parquet codec; master's internal representation stays the canonical
 `VariantArray` with conversion at the HOST boundary):
 
-- **EW `SchemaConverter`**: `VariantTransportExtensionName = "fabricator.variant"` +
+- **EW `SchemaConverter`**: `VariantTransportExtensionName = "ew.variant_transport"` +
   `IsVariantTransportField`; `FromArrowField` maps a marker-tagged BINARY → `variant` (top-level +
   struct-nested via the recursive field conversion; list/map inner markers rejected — the fork's
   degradation guard); `FilterArrowMetadata` also drops `ARROW:extension:*` (transport hints never
@@ -220,7 +220,7 @@ Everything else compiles as-is: rowid DML incl. `DeleteByRowIdsViaVectorsAsync`/
   `CommitDataFilesAsync(extraActions)` (the buffered path already composes this), or propose the additive
   `UpdateByRowIdsViaVectorsAsync` upstream (Curt invites it).
 - **Variant marker**: our C++ (`fabricator_variant.cpp`) + EW-fork keyed the Arrow extension name
-  `fabricator.variant`; master uses its own variant extension registry (`VariantExtensionDefinition`) +
+  `ew.variant_transport`; master uses its own variant extension registry (`VariantExtensionDefinition`) +
   `DeltaTableOptions.EmitVariantLogicalType`. Verify the extension NAME crossing the C ABI matches what the
   C++ registry expects — likely the first variant-suite failure to chase.
 - **Clustered OPTIMIZE / ZCube**: `CommitDataFilesAsync(dataChange:, clusteringProvider:)` + `Tags` compiled,

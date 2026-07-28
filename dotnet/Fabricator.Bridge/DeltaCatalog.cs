@@ -1501,7 +1501,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     }
 
     // ---- VARIANT gates ----
-    // A VARIANT column crosses the C ABI as the fabricator.variant LEAF-binary transport (one
+    // A VARIANT column crosses the C ABI as the ew.variant_transport LEAF-binary transport (one
     // metadata||value blob per row); EW models it canonically (arrow.parquet.variant) and converts at its
     // host boundary (VariantTransport, selected by DeltaTableOptions.VariantTransportBlob). Both byte
     // paths work — the native seams AND the EW codec, incl. codec rewrites. Only the placement/CDF
@@ -3638,7 +3638,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         {
             var field = setSlotField[j];
             updArrays.Add(BuildArray(field.DataType, updColVals[j]));
-            // Keep the field metadata: the fabricator.variant transport marker must ride the SET column.
+            // Keep the field metadata: the ew.variant_transport transport marker must ride the SET column.
             updFields.Add(new Field(field.Name, field.DataType, nullable: true, field.Metadata));
         }
         var updatesBatch = new RecordBatch(
@@ -3670,7 +3670,7 @@ public sealed class DeltaCatalog : IBackendCatalog
             case DoubleType: { var b = new DoubleArray.Builder(); foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append((double)v); } return b.Build(); }
             case Decimal128Type d: { var b = new Decimal128Array.Builder(d); foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append((decimal)v); } return b.Build(); }
             case StringType: { var b = new StringArray.Builder(); foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append((string)v); } return b.Build(); }
-            // BLOB — incl. the fabricator.variant transport (a VARIANT SET value crosses as its blob form).
+            // BLOB — incl. the ew.variant_transport transport (a VARIANT SET value crosses as its blob form).
             case BinaryType: { var b = new BinaryArray.Builder(); foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append(((byte[])v).AsSpan()); } return b.Build(); }
             case Date32Type: { var b = new Date32Array.Builder(); foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append(System.DateOnly.FromDateTime((System.DateTime)v)); } return b.Build(); }
             case TimestampType ts: { var b = new TimestampArray.Builder(ts); foreach (var v in values) { if (v is null) b.AppendNull(); else b.Append(v is System.DateTimeOffset dto ? dto : new System.DateTimeOffset(System.DateTime.SpecifyKind((System.DateTime)v, System.DateTimeKind.Utc))); } return b.Build(); }

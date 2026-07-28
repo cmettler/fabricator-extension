@@ -3,7 +3,7 @@
 //
 // DuckDB's VARIANT logical type has no Arrow C-data-interface representation (the exporter's default
 // branch throws "Unsupported Arrow type VARIANT" unless an Arrow type extension is registered for it).
-// RegisterFabricatorVariantExtension registers the `fabricator.variant` extension so VARIANT crosses EVERY
+// RegisterFabricatorVariantExtension registers the `ew.variant_transport` extension so VARIANT crosses EVERY
 // Arrow boundary in this process transparently as ONE self-delimiting binary value per row — the
 // parquet-variant metadata bytes immediately followed by the value bytes — tagged with
 // ARROW:extension:name. Export (bulk INSERT / CTAS / COPY appenders, host-query result streams,

@@ -401,7 +401,7 @@ internal static class DeltaWriter
                                               IDataFileReader? dataFileReader = null) => DeltaTableOptions.Default with
     {
         ParquetReadOptions = ReadOptions(),
-        // The C++↔C# Arrow boundary speaks the fabricator.variant LEAF-binary transport (one self-delimiting
+        // The C++↔C# Arrow boundary speaks the ew.variant_transport LEAF-binary transport (one self-delimiting
         // metadata++value blob per row) — the canonical arrow.parquet.variant struct extension crashes
         // DuckDB's ArrowAppender::FinalizeChild and collides with built-in handlers. EW's write side accepts
         // the transport unconditionally (marker-keyed); this selects it for the read pipeline too.

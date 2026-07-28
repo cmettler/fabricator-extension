@@ -515,7 +515,7 @@ internal static class DeltaReader
         var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options()).ConfigureAwait(false);
         try
         {
-            // Variant fields cross the C ABI in the fabricator.variant LEAF-binary transport form (EW
+            // Variant fields cross the C ABI in the ew.variant_transport LEAF-binary transport form (EW
             // master advertises the canonical VariantType) — align the bind schema with the batches.
             return VariantMarker.ToTransportSchema(table.ArrowSchema);
         }
