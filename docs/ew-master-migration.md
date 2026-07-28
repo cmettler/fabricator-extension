@@ -93,12 +93,18 @@ was the blob with conversion at the parquet codec; master's internal representat
   struct-nested via the recursive field conversion; list/map inner markers rejected — the fork's
   degradation guard); `FilterArrowMetadata` also drops `ARROW:extension:*` (transport hints never
   persist into the Delta schema — fork parity).
-- **EW `VariantTransport`** (ported, over master's `VariantArray` + `Apache.Arrow.Operations` 23.0.0
-  shredding toolkit — new Table.csproj package ref): `ToVariantArrays` (write ingress, marker-keyed —
-  a no-op for canonical input, so master's own hosts/tests are unaffected; shreds uniform columns via
-  `ShredSchemaInferer`/`VariantShredder`, SQL-null as storage validity) + `ToTransportBlobs` (read
-  egress: `VariantArray` incl. shredded reassembly via `GetLogicalVariantValue`, bare struct, and
+- **EW `VariantTransport`** (ported, over master's `VariantArray`): `ToVariantArrays` (write ingress,
+  marker-keyed — a no-op for canonical input, so master's own hosts/tests are unaffected) +
+  `ToTransportBlobs` (read egress: `VariantArray` incl. shredded input, bare struct, and
   seam-delivered blob passthrough with marker re-tagging).
+  **SHREDDING ITSELF IS NO LONGER HERE (2026-07-28 — Curt's gap 8, "a general-purpose passenger worth
+  separating"):** both directions moved to the parquet layer's public
+  `EngineeredWood.Parquet.Data.VariantShredding` (`TryShred` beside the pre-existing `Reassemble`), so
+  **`Apache.Arrow.Operations` is off `DeltaLake.Table` entirely** — and at zero net cost, because
+  `EngineeredWood.Parquet` already referenced it for shredded-read reassembly. `VariantTransport` now
+  decodes/encodes blobs only (`Apache.Arrow.Scalars` rides along with `Apache.Arrow` core) and delegates
+  the layout decision. Full record incl. the namespace-capture trap it exposed: CLAUDE.md
+  "THE SHREDDING SPLIT".
 - **EW `DeltaTableOptions.VariantTransportBlob`** (default false = canonical): selects the read
   direction; wired at the `ProcessFileBatchesAsync` coercion point (replaces `VariantColumnCoercion.
   Coerce` when set). The 4 write sites' CODEC branches call `ToVariantArrays` then re-apply the
@@ -257,12 +263,21 @@ low for both is **one branch we keep, offers we generate.**
 `git diff --shortstat upstream/master..HEAD` → **15 files, +3725 / −141**, 18 non-merge commits ahead,
 **0 behind**. The shape is what matters:
 
-- **~2,900 lines are NEW FILES + tests** (`FileRowSelection`, `MetadataPredicate`, `PlannedFile`,
-  `VariantTransport`, five test files). These have produced **zero conflicts across three bumps** —
-  a file upstream does not have cannot conflict.
-- Only **three shared source files** carry our edits: `DeltaTable.cs` (the bulk, and the ONLY conflicted
-  file in each of the three bumps), `SchemaConverter.cs` (+44), `DeltaTableOptions.cs` (+15).
-- **141 deletions total** — we are almost purely additive, which is what makes the patch set offerable.
+- **~3,100 lines are NEW FILES + tests** (`FileRowSelection`, `MetadataPredicate`, `VariantTransport`,
+  seven test files). These have produced **zero conflicts across four bumps** — a file upstream does not
+  have cannot conflict. (`PlannedFile` left this list at the fourth bump: we adopted upstream's
+  `PlanFiles` and deleted ours.)
+- Only **five shared source files** carry our edits: `DeltaTable.cs` (the bulk, and the ONLY conflicted
+  file in each of the four bumps), `DeltaTransaction.cs` (+171, the `Stage*` additions),
+  `SchemaConverter.cs` (+50), `DeltaTableOptions.cs` (+15), and `DeltaFilePruner.cs` (+4, doc only).
+- **143 deletions total** — we are almost purely additive, which is what makes the patch set offerable.
+
+**Re-measured 2026-07-28 after the shredding split:** **20 files, +4696 / −143**, 25 non-merge commits
+ahead, **0 behind**. The split ADDED a shared file outside the Delta layer —
+`EngineeredWood.Parquet/Parquet/Data/VariantShredding.cs` (+173) — and that is the point rather than a
+cost: it is the file Curt asked for (gap 8), it removed `Apache.Arrow.Operations` from
+`DeltaLake.Table`, and it is the most independently-offerable thing in the set, since it touches no
+Delta concept at all.
 
 ### The two branch roles
 

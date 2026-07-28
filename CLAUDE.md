@@ -766,21 +766,64 @@ variant rather than just this session's binding. **Diagnostic trap worth remembe
 reports BLOB for a variant column on BOTH the CREATE and ALTER paths** — that is the storage type and the scan
 resolves the marker at bind, so it is not a signal about this at all; reading it as one sent the first
 investigation down a false path.
+**Gates (marker rename):** variant **144** (pre-backfill-fix) / native_write **147**; EW Table.Tests 678 ×3
+TFMs / DeltaLake 217; hermetic **53/53 @ 4152** and service **42/42 @ 1227**, both unchanged.
 
-**THE SHREDDING SPLIT HE ASKED FOR — the right shape is now clear, and it is better than expected (not built).**
-He wants variant **shredding on write** separated as *"a general-purpose passenger worth separating"*. Key
-finding: **`EngineeredWood.Parquet` ALREADY references `Apache.Arrow.Operations`** — upstream's own project, so
-the package is an existing EW dependency and we only added it to `DeltaLake.Table`. That means the split lands
-in Parquet (where shredding belongs anyway — it is a physical-layout concern, the VariantShredding spec) and
-**adds no dependency anywhere**; and since EVERY Operations type `VariantTransport` uses is shredding
-(`ShredSchemaInferer`, `VariantShredder`, `ShredSchema`, `ShredType`, `ShreddedVariantArrayBuilder`,
-`GetLogicalVariantValue`), moving both directions there lets `DeltaLake.Table` DROP its Operations reference —
-removing the exact thing he objected to. Design note for when it is built: the primitive must take
-already-decoded `VariantValue`s, not a `VariantArray`, or our transport pays a SECOND decode (it decodes the
-blobs once already); a `Shred(VariantArray)` convenience overload on top is what makes it general for a caller
-holding a canonical array with no blob anywhere.
-**Gates:** variant **144** / native_write **147**; EW Table.Tests 678 ×3 TFMs / DeltaLake 217; hermetic
-**53/53 @ 4152** and service **42/42 @ 1227**, both unchanged.
+#### THE SHREDDING SPLIT — DONE (2026-07-28, EW-only, no Bridge/ABI change): gap 8's "general-purpose passenger", separated
+
+He asked for variant **shredding on write** to be separated as *"a general-purpose passenger worth
+separating"*, noting it "is also what drags in the new `Apache.Arrow.Operations` dependency on the Delta
+layer". Both halves are done and **the dependency half costs nothing**: `EngineeredWood.Parquet` ALREADY
+referenced Operations (upstream's own project) for shredded-read reassembly — we had only added it to
+`DeltaLake.Table` — so the split lands in Parquet, where shredding belongs anyway (a physical-layout
+concern, the VariantShredding spec), and **`Apache.Arrow.Operations` is now GONE from
+`EngineeredWood.DeltaLake.Table` with zero net dependency change across the repo.**
+**Verified, not assumed, that this is a real −1 and not a swap:** `Apache.Arrow.Scalars` — where
+`VariantValue`/`VariantReader`/`VariantBuilder` live — is a dependency of **`Apache.Arrow` itself**
+(checked in the nuspec), so the Delta layer keeps blob encode/decode with no package of its own.
+
+**The target class ALREADY EXISTED** — `EngineeredWood.Parquet.Data.VariantShredding`, `internal`, holding
+only `Reassemble` (the read half, used by `NestedAssembler`/`VariantNestedWrapper`). It is now `public` with
+the write half beside it, so the pair reads as one owner of the layout decision. Three shape decisions, each
+pinned by a test rather than described (`VariantShreddingTests`, 7):
+- **`TryShred` takes already-DECODED `VariantValue`s** + a separate SQL-null mask, NOT a `VariantArray`. A
+  host arriving with an encoded form must parse each row to decide anything, so passing the parsed values
+  keeps the decode at ONE per row; a `VariantArray`-only entry point would force it to encode a canonical
+  array and have us decode it again. `TryShred(VariantArray, out …)` is the convenience overload for a
+  caller that genuinely starts canonical (it uses `GetLogicalVariantValue`, so a shredded input re-shreds).
+- **It returns `false` rather than an unshredded array** when no schema applies — building one would
+  re-encode every row and discard bytes the caller already holds. Our transport then builds the unshredded
+  array from its ORIGINAL blobs, exactly as before.
+- **The null mask is a separate parameter** because SQL null-ness rides storage VALIDITY and is distinct
+  from a variant JSON null in the value bytes; conflating them changes what `IS NULL` means. One test
+  asserts both in a single column (masked row → `IsNull`, `VariantValue.Null` row → present value).
+
+**A bonus simplification on the read side:** `VariantTransport.ToTransportBlobs` no longer hand-rolls a
+per-row `GetLogicalVariantValue` + `VariantBuilder.Encode` loop for shredded input — it normalises through
+`Reassemble` and falls into the SAME metadata‖value concat the unshredded path already used, so two branches
+became one. The reassembly is followed by a **checked post-condition** (a surviving `typed_value` throws)
+because the concat would otherwise read the RAW `value` child, which is EMPTY for every shredded row — the
+silent-empty-variant trap `VariantShredding`'s own remarks warn about.
+
+**⚠ THE TRAP OF THIS CHANGE — MOVING CODE BETWEEN NAMESPACES CAN SILENTLY REBIND A TYPE NAME.** The moved
+`WithValidity` calls `ArrowArrayFactory.BuildArray`. In its old home that bound to
+**`Apache.Arrow.ArrowArrayFactory`** (handles struct); inside `namespace EngineeredWood.Parquet.Data` the
+same unqualified name binds to **that namespace's own internal `ArrowArrayFactory`** (`ArrowArrayBuilder.cs`),
+which throws `NotSupportedException: Cannot construct Arrow array for type 'struct'` — a type in the
+enclosing namespace beats an imported one. It COMPILED (same method name and signature shape) and failed only
+at runtime, and only on the SQL-null path, so only the null-mask test caught it. Both directions are now
+explicitly `Apache.Arrow.`-qualified with the reason on them, including the two surviving call sites in
+`VariantTransport` — those bind correctly today only because the Parquet type is `internal` and
+`DeltaLake.Table` is not in its `InternalsVisibleTo`, i.e. adding one later would silently rebind them.
+**Habit: after moving code into a different namespace, grep the moved block for unqualified type names and
+check whether the destination namespace declares any of them.** Same class as the marker rename — a
+compile-clean change that degrades behaviour rather than failing.
+**Gates:** EW Table.Tests **678** × {net10.0, net8.0, net472} and DeltaLake **217** — the SAME counts as
+before the split, which is the signal that relocating the shredder is behaviour-neutral for EW;
+`Parquet.Tests` +7 (`VariantShreddingTests`) with its `parquet-testing` corpus failures unchanged at **115**
+(the nested corpus we deliberately do not init — an unchanged failure COUNT is what proves no regression
+there, since the tier can never be green); fabricator variant **157** / native_write **147** and hermetic
+**53/53 @ 4165**, all exact.
 
 **We also ADDED one thing upstream will want:** a `StageRowDeletesAsync(FileRowSelection)` overload beside his
 ordinal-keyed one, both feeding the now selection-keyed core. His public API and its 11 test call sites are
@@ -789,8 +832,11 @@ untouched; the composition of hunks 11–13 is the interesting part of this merg
 key it by path, and those compose (his internal core, our key).
 
 **What remains ours after this bump:** the `FileRowSelection` selection-DML (V9/V10), `ReadAllWithMetadataAsync`
-+ `MetadataPredicate`, `UpdateBySelectionViaVectorsAsync`, and `VariantTransport` (pending the decision above).
-All four verified still absent upstream.
++ `MetadataPredicate`, `UpdateBySelectionViaVectorsAsync`, `VariantTransport` (decision settled — KEPT, marker
+renamed), and — new on 2026-07-28 — `VariantShredding`'s write half in the parquet layer. All five verified
+still absent upstream. **The shredding split is the most independently offerable of them**: Curt asked for it
+by name (gap 8), it touches no Delta concept, and it removes the `Apache.Arrow.Operations` reference he
+objected to.
 
 #### THE BUFFERED FLUSH IS ON EW's `DeltaTransaction` — our OCC loop is GONE (2026-07-28, EW + Bridge, no ABI)
 
