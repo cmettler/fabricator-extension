@@ -243,3 +243,67 @@ Everything else compiles as-is: rowid DML incl. `DeleteByRowIdsViaVectorsAsync`/
    clast-project), update CLAUDE.md (EW workflow section + status), retire stale notes.
 6. Post-migration: revisit `proto/metadata-dml` (the parked _metadata RFC) + the additive
    `UpdateByRowIdsViaVectorsAsync` proposal.
+
+---
+
+## Staying in sync with an ACTIVE upstream — the working model (2026-07-28)
+
+Both sides move now: Curt fixes general-purpose bugs and reimplements our patches; we add
+Fabricator-shaped seams. Three bumps in, each easier than the last, the model that keeps the burden
+low for both is **one branch we keep, offers we generate.**
+
+### Measured divergence (2026-07-28, after merging clast master `b1de9d8`)
+
+`git diff --shortstat upstream/master..HEAD` → **15 files, +3725 / −141**, 18 non-merge commits ahead,
+**0 behind**. The shape is what matters:
+
+- **~2,900 lines are NEW FILES + tests** (`FileRowSelection`, `MetadataPredicate`, `PlannedFile`,
+  `VariantTransport`, five test files). These have produced **zero conflicts across three bumps** —
+  a file upstream does not have cannot conflict.
+- Only **three shared source files** carry our edits: `DeltaTable.cs` (the bulk, and the ONLY conflicted
+  file in each of the three bumps), `SchemaConverter.cs` (+44), `DeltaTableOptions.cs` (+15).
+- **141 deletions total** — we are almost purely additive, which is what makes the patch set offerable.
+
+### The two branch roles
+
+| branch | purpose | lifecycle |
+|---|---|---|
+| `fabricator-patches` | what the submodule pin tracks; our integration branch | **permanent.** Merge `upstream/master` periodically. **NEVER rebase or force-push** — published release tags pin shas on it (`v0.0.1-duckdb1.5.5` → EW `8aa7cfb`), and orphaning one makes a downloadable release unbuildable from source. |
+| `offer/<feature>` | ONE upstream PR each: cut fresh off `upstream/master`, one curated commit | **disposable. Regenerate, never maintain.** |
+
+**Why offers are generated, not maintained** — this is the load-bearing decision. Curt lands our patches
+INDEPENDENTLY (three of eight by the second bump, two more by the third), so a long-lived offer branch
+decays the moment he does. PR #4 went **48 commits behind** exactly that way, until its diff read as
+deleting 17,150 lines of his own newer work. A branch generated on demand from the current
+`fabricator-patches` is current by construction and costs a couple of minutes to recreate.
+
+### Why per-feature and not one draft
+
+He triages by **who each gap serves** (`doc/upstream-landing-notes.md` upstream) and lands the
+general-purpose ones immediately. One omnibus PR forces all-or-nothing review; separate ones let him
+take what he wants now and leave the Fabricator-shaped seams — which is how he already behaves. Keep
+PR #4 open regardless: upstream's own notes reference it.
+
+### Two habits that keep OUR side cheap
+
+1. **Stay additive.** 141 deletions is the number to protect. A deletion in our diff turns an offer
+   into "I removed your API", the least upstreamable shape there is, and it becomes a permanent conflict
+   point against an active upstream.
+2. **Prefer a NEW FILE over editing `DeltaTable.cs`.** Every new file we added has cost zero merge
+   conflicts; `DeltaTable.cs` has been the single conflicted file in all three bumps. When a feature can
+   live beside it rather than inside it, that is worth real weight.
+
+### Bump checklist (what the three bumps converged on)
+
+1. `git fetch upstream` → read the commit SUBJECTS **and the doc hunks** — an absorbed semantic may
+   announce itself only in documentation (the caller-supplied materialized-name semantic did exactly that).
+2. `git merge-tree --write-tree --merge-base=$(git merge-base HEAD upstream/master) HEAD upstream/master`
+   to predict conflicts before touching the tree.
+3. Merge; resolve **by class** (take upstream where it reimplemented us — its version has been better
+   every time; keep ours where it is genuinely absent upstream; combine where both improved one line).
+4. Watch for **auto-merged duplicates**: our code that sat OUTSIDE a conflict hunk can end up saying the
+   same thing twice beside upstream's. Markers show textual DISAGREEMENT, not redundancy.
+5. Verify both directions: our patches still present, upstream's new work arrived, superseded code gone.
+6. Gate: EW suites × all three TFMs, then fabricator hermetic + service. **Unchanged fabricator counts
+   are the signal** that the bump is behaviour-neutral for what we pin.
+7. Verify every historically-pinned EW sha is still an ancestor — especially any a PUBLISHED release depends on.
