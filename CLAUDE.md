@@ -6092,20 +6092,31 @@ that is what the binary reports (`fabricator_version()` + the footer) — taggin
 claim mislabels the release against its own contents. Nothing in the workflow hardcodes the tag: title and
 notes derive the DuckDB version from the single `DUCKDB_VERSION` var; the tag is used verbatim.
 
-**Release status:** a **DRAFT** `v0.0.1-duckdb1.5.5` exists on **`5c28297`** (run `30219700379`: all three
-packs + the release job green), with three versioned ZIPs — `linux_amd64-Standard` 38.3 MB /
-`osx_arm64-Standalone` 57.2 MB / `windows_amd64-Standalone` 59.3 MB. (Those are the ZIP sizes; the raw
-`.duckdb_extension` inside each is a little larger — an earlier note here quoted 40/60/62 MB as ZIP sizes,
-which were really the raw ones.) **Unpublished — publishing is a human decision.**
+**Release status (CORRECTED 2026-07-28 — the note below used to say "DRAFT … unpublished" and was WRONG,
+which nearly caused a published release to be retagged):**
+- **`v0.0.1-duckdb1.5.5` is PUBLISHED** (`draft=false`), created 2026-07-27, pinning **`a8de094`** — NOT the
+  `5c28297` this note recorded; it was retagged again after that. Three ZIPs attached, 0 downloads:
+  `linux_amd64-Standard` 40.1 MB / `osx_arm64-Standalone` 60.0 MB / `windows_amd64-Standalone` 62.2 MB.
+- **`v0.0.2-duckdb1.5.5`** cut on 2026-07-28 at HEAD, +30 commits: both EW clast-master bumps, the variant
+  shredding split, the `_metadata` locator conformance, and the `TransientRowAddress` helper migration.
+**⚠ CHECK `draft` VIA THE API BEFORE TREATING A RELEASE AS MOVABLE — do not trust this file.** The retag rule
+below is real and still applies; what went stale was the FACT it was applied to. Once published, a tag move
+is not merely history-rewriting: the attached assets were built from the OLD commit, so moving the tag leaves
+a release whose **source tag and binaries disagree** — worse than a tag that is simply behind. 0 downloads is
+luck, not a guarantee. Ship newer code as a NEW tag instead.
 
-It has been retagged twice, each time forward onto a commit worth more: `0eadd00` → `c2af48a` (to pick up
-the first EW bump's two silent-corruption fixes — the UTF-16-vs-UTF-8 comparator that could make pruning
-SKIP a file containing matching rows, and stats truncation splitting a surrogate pair) → `5c28297` (the
-second EW bump, the ns/second timestamp guard, and `PlanFiles`). **Moving a tag + deleting a draft is safe
-only while nothing has been PUBLISHED** — no released bytes are being redefined — which is also why reusing
-`v0.0.1` is correct rather than bumping to `0.0.2`: the number matches what the binary reports
-(`fabricator_version()` + the footer), and tagging a number the artifact does not claim would mislabel it.
-The tag message records what each move gained, so the reasoning survives without this file.
+**The version number is NOT free to choose: it must match what the binary reports**, or the release is
+mislabelled against its own contents. That means bumping **BOTH** declarations, which are easy to miss:
+`CMakeLists.txt`'s `FABRICATOR_EXTENSION_VERSION` (→ the `FABRICATOR_VERSION` compile definition, i.e. what
+`fabricator_version()` returns) **and** `extension_config.cmake`'s `EXTENSION_VERSION` (→ the extension
+footer). `v0.0.2` was preceded by exactly that bump.
+
+Earlier moves, while it genuinely was a draft: `0eadd00` → `c2af48a` (to pick up the first EW bump's two
+silent-corruption fixes — the UTF-16-vs-UTF-8 comparator that could make pruning SKIP a file containing
+matching rows, and stats truncation splitting a surrogate pair) → `5c28297` (the second EW bump, the
+ns/second timestamp guard, and `PlanFiles`) → `a8de094`. Each tag message records what that move gained, so
+the reasoning survives without this file. **`distribution.yml`'s release job creates the release with
+`--draft`**, so a new tag yields a draft and publishing stays a human decision.
 
 **Still to build:** nothing in the tiers themselves. **macOS Gatekeeper is
 a caveat CI structurally cannot cover**: a browser-downloaded `.duckdb_extension` carries
