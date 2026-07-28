@@ -309,6 +309,7 @@ All five are **draft**, each cut fresh off `upstream/master` per generate-never-
 | [#10](https://github.com/clast-project/engineered-wood/pull/10) | `StageDataFilesAsync` + `SetOperation` | 642 × 2 TFMs; **mutant** (ignore the identity bypass) fails 1/6 |
 | [#12](https://github.com/clast-project/engineered-wood/pull/12) | **the isolation bound** on row-level reconciliation | 637 × 2 TFMs; **mutant** (ungate it) fails with *"No exception was thrown"* — upstream lets the second delete COMMIT under `Serializable` |
 | [#13](https://github.com/clast-project/engineered-wood/pull/13) | `StageReadPredicate` / `StageWholeTableRead` | 640 × 2 TFMs; **two** mutants, each killed by its own test (1:1, neither covering for the other) |
+| [#14](https://github.com/clast-project/engineered-wood/pull/14) | **`FileRowSelection`** — a DML key that fails loudly | 640 × 2 TFMs, and **all 636 of upstream's own tests pass through the rowid adapter**; **mutant** (loud error → silent skip) fails both path-keyed tests |
 
 **Mutation-test every load-bearing claim ON THE OFFER BRANCH, not from our history.** It has paid for
 itself three times: it produced the sharpest line in each PR body (*which* test carries the weight), and
@@ -349,7 +350,12 @@ hold up a correctness fix). Two remain, and the first needs SCOPING before it is
    with one file the ordinal is always 0, so a single-file fixture cannot fail these tests. And the intended
    ordinal in the wrong-row test must be **1, not 2**: removing ordinal 0 shifts old ordinal 2 INTO slot 1,
    so aiming at 2 goes out of range while aiming at 1 hits the wrong file.
-3. **`UpdateBySelectionViaVectorsAsync`** — the one genuine CAPABILITY gain, and his own landing notes record
+3. **`UpdateBySelectionViaVectorsAsync` — SCOPED, and deliberately SEQUENCED AFTER #14's verdict.** ~184 lines
+   (two overloads + core) and it TAKES a `FileRowSelection`, so its branch must stack on #14 rather than cut
+   from master. That is the real reason to wait rather than a context one: **#14 asks him to accept that key,
+   and building a new OPERATION on a key he has not judged means rebuilding it if he prefers a different
+   one.** When it goes: cut off `offer/file-row-selection`, say plainly in the body that it contains #14's
+   commit, and lead with the fact that it is the one genuine CAPABILITY gain — the one genuine CAPABILITY gain, and his own landing notes record
    merge-on-read UPDATE as **unowned** upstream after the PR rewrite dropped it. Offer it last but flag that
    status, since it is the only item filling a hole he has named.
 
