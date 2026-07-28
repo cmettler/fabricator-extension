@@ -59,7 +59,7 @@ DELETE FROM rl.main.t WHERE id = 6;
 statement error con1
 COMMIT;
 ----
-row-level conflict
+row level
 
 # con2's delete won; con1 rolled back — id 6 deleted exactly once
 query II
@@ -106,7 +106,7 @@ UPDATE rl.main.t SET s = 'B' WHERE id = 10;
 statement error con1
 COMMIT;
 ----
-row-level conflict
+row level
 
 # the first committer's value survives; no lost update
 query T
@@ -254,7 +254,7 @@ DELETE FROM rl.main.q WHERE id = 5;
 statement error con1
 COMMIT;
 ----
-row-level conflict
+row level
 
 # deleted exactly once (by the racer)
 query I

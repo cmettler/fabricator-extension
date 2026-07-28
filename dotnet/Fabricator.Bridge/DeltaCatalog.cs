@@ -3158,11 +3158,36 @@ public sealed class DeltaCatalog : IBackendCatalog
                     deletes[delPath] = kv.Value;
                 }
             }
-            var deleteSelection = new FileRowSelection(deletes);
-            var (dvActions, rowsDeleted) = await table.ComputeDeletionVectorActionsAsync(deleteSelection,
-                    resolveAgainst: pinnedSnap, cancellationToken: token)
-                .ConfigureAwait(false);
-            rowsDeleted += pendingRowsDeleted;
+            // The transaction is pinned to OUR snapshot, not the table's current one: the DV positions above
+            // are keyed by the pinned version's file ordinals and the ALTERs below are chained against its
+            // metadata, and what the commit has to be validated against is every commit that landed SINCE
+            // that version. From CurrentSnapshot that set would be empty and the validation vacuous.
+            var txn = table.StartTransaction(pinnedSnap,
+                tableSer
+                    ? EngineeredWood.DeltaLake.Table.IsolationLevel.Serializable
+                    : EngineeredWood.DeltaLake.Table.IsolationLevel.WriteSerializable);
+
+            // Appends. identityValuesPreGenerated: our eager identity path already put the values in the
+            // files, which is what lets an identity table accept externally written ones at all.
+            // deletedPositionsByFileIndex: rows this transaction inserted and then deleted — the add is born
+            // with an inline DV, so they never reach a committed version.
+            if (files.Count > 0)
+            {
+                await txn.StageDataFilesAsync(files, pendingFileDeletes,
+                        identityValuesPreGenerated: pending.PendingIdentityHwm.Count > 0,
+                        cancellationToken: token)
+                    .ConfigureAwait(false);
+            }
+
+            // Committed-file deletes. Staging (rather than computing the actions ourselves) is what hands the
+            // commit loop the per-file row edits it needs to reconcile row-by-row against a concurrent delete
+            // of DIFFERENT rows, and to relocate ours by stable id across a concurrent rewrite.
+            long rowsDeleted = pendingRowsDeleted;
+            if (deletes.Count > 0)
+            {
+                rowsDeleted += await txn.StageRowDeletesAsync(new FileRowSelection(deletes), token)
+                    .ConfigureAwait(false);
+            }
             // The buffered schema change (metaData + merged protocol upgrade) joins the SAME commit.
             // Eagerly-generated identity high-water marks compose INTO that metaData action (a commit
             // must not carry two metaData actions) — or form their own when there is no buffered ALTER.
@@ -3185,17 +3210,18 @@ public sealed class DeltaCatalog : IBackendCatalog
             // rebase passes, delete-delete/deleteRead already guaranteed our touched files are unchanged,
             // so the captured CDC content stays exact).
             baseExtra.AddRange(pending.PendingCdc);
-            // Application-transaction versions (idempotent appends): one `txn` action per app, committed
-            // ATOMICALLY with the fused commit; the CAS against the LATEST snapshot runs in the retry loop.
-            long nowMs = System.DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            if (baseExtra.Count > 0)
+            {
+                txn.StageActions(baseExtra);
+            }
+            // Application-transaction versions (idempotent appends): staged as a PAIR (version, expected
+            // previous) rather than as a hand-built `txn` action, because the compare-and-set has to be
+            // re-validated on every commit attempt. A twin producer running the same batch takes our version;
+            // the retry's read-set check then passes — a concurrent append invalidates nothing we read — so
+            // without the guard inside the loop the batch would commit a SECOND time.
             foreach (var kv in pending.AppTxnVersions)
             {
-                baseExtra.Add(new EngineeredWood.DeltaLake.Actions.TransactionId
-                {
-                    AppId = kv.Key,
-                    Version = kv.Value.Version,
-                    LastUpdated = nowMs,
-                });
+                txn.StageAppTransaction(kv.Key, kv.Value.Version, kv.Value.Expected);
             }
             int kinds = (pending.HasAppend ? 1 : 0) + (pending.HasDelete ? 1 : 0) + (pending.HasUpdate ? 1 : 0)
                         + (pending.HasAlter ? 1 : 0);
@@ -3205,112 +3231,39 @@ public sealed class DeltaCatalog : IBackendCatalog
                 : pending.HasAlter
                     ? (pending.AlterOps.Count == 1 ? pending.AlterOps.First() : "ALTER TABLE")
                     : "WRITE";
-            // Spark-style LOGICAL REBASE: a concurrent commit only aborts the transaction when it ACTUALLY
-            // conflicts — the checker passes commuting concurrent commits (our DV remove+add pairs still
-            // reference unchanged active files, and the commit re-derives row-id/identity high-water marks
-            // from the snapshot it lands on) and throws on a real conflict: metadata/protocol change,
-            // delete/delete on a file we modify, a concurrent delete of a file our READS consumed, or —
-            // per the isolation level — a concurrent append matching our read predicates (serializable:
-            // always; write_serializable, the Spark-default: only from non-blind-append commits). The loop
-            // covers a writer landing BETWEEN our validation and our commit: reopen at the new latest,
-            // re-validate, retry (bounded).
-            for (int attempt = 1; ; attempt++)
+            txn.SetOperation(operation);
+
+            // Read set: the predicates our in-transaction scans pushed (or a whole-table flag when nothing
+            // pushed). The commit loop uses them for the concurrentAppend check — under serializable always,
+            // under write_serializable only from non-blind-append commits.
+            foreach (var pred in pending.ReadPredicates)
             {
-                token.ThrowIfCancellationRequested(); // break OUT of the OCC/rebase retry loop on interrupt
-                // ROW-LEVEL CONCURRENCY (write_serializable): when the table advanced, re-target the DV
-                // remove+add pairs onto the LATEST snapshot — a concurrent DV swap of the same file
-                // re-unions when the touched rows are DISJOINT (Databricks-style; same-row / rewrite
-                // conflicts throw). Under serializable the strict file-level delete-delete check applies
-                // to the pinned-resolved pairs unchanged.
-                var currentDv = dvActions;
-                if (dvActions.Count > 0 && !tableSer && table.CurrentSnapshot.Version != pinned)
-                {
-                    try
-                    {
-                        currentDv = await table.RebaseDvDmlActionsAsync(dvActions, deleteSelection, pinnedSnap,
-                                table.CurrentSnapshot, cancellationToken: token)
-                            .ConfigureAwait(false);
-                    }
-                    catch (EngineeredWood.DeltaLake.DeltaConflictException ex)
-                    {
-                        throw new System.InvalidOperationException(
-                            $"delta transaction conflict on '{tablePath}': the table moved from version "
-                            + $"{pinned} to {table.CurrentSnapshot.Version} while the transaction was open and "
-                            + $"the concurrent changes do not commute ({ex.Message}) — the transaction is "
-                            + "rolled back; retry it.");
-                    }
-                }
-                var extra = new List<EngineeredWood.DeltaLake.Actions.DeltaAction>(baseExtra.Count + currentDv.Count);
-                extra.AddRange(baseExtra);
-                extra.AddRange(currentDv);
-                // Application-transaction CAS (idempotent appends): validated against the LATEST snapshot
-                // on every attempt — a retried batch whose first attempt actually landed finds the app's
-                // version already advanced and fails HERE instead of duplicating data.
-                foreach (var kv in pending.AppTxnVersions)
-                {
-                    long? current = table.CurrentSnapshot.AppTransactions.TryGetValue(kv.Key, out var appTxn)
-                        ? appTxn.Version
-                        : null;
-                    if (current != kv.Value.Expected)
-                    {
-                        throw new System.InvalidOperationException(
-                            $"delta transaction version conflict on '{tablePath}' for app '{kv.Key}': expected "
-                            + $"previous version {kv.Value.Expected?.ToString() ?? "<none>"}, found "
-                            + $"{current?.ToString() ?? "<none>"} — the batch was already committed or another "
-                            + "writer advanced it; the transaction is rolled back.");
-                    }
-                }
-                if (table.CurrentSnapshot.Version != pinned)
-                {
-                    _log.LogInformation(
-                        "delta txn {Txn} rebase-check {Path}: v{Pinned}->v{Latest} reads=[preds={Preds} whole={Whole}] serializable={Ser}",
-                        txnId, tablePath, pinned, table.CurrentSnapshot.Version,
-                        pending.ReadPredicates.Count, pending.ReadWholeTable, tableSer);
-                    try
-                    {
-                        await table.CheckLogicalRebaseAsync(pinnedSnap, extra,
-                                readPredicates: pending.ReadPredicates,
-                                readWholeTable: pending.ReadWholeTable,
-                                serializable: tableSer,
-                                rowLevelDml: !tableSer,
-                                cancellationToken: token)
-                            .ConfigureAwait(false);
-                    }
-                    catch (EngineeredWood.DeltaLake.DeltaConflictException ex)
-                    {
-                        throw new System.InvalidOperationException(
-                            $"delta transaction conflict on '{tablePath}': the table moved from version "
-                            + $"{pinned} to {table.CurrentSnapshot.Version} while the transaction was open and "
-                            + $"the concurrent changes do not commute ({ex.Message}) — the transaction is "
-                            + "rolled back; retry it.");
-                    }
-                    _log.LogInformation(
-                        "delta txn {Txn} rebase {Path}: pinned v{Pinned} -> committing on v{Latest} "
-                        + "(concurrent commits are non-conflicting appends)",
-                        txnId, tablePath, pinned, table.CurrentSnapshot.Version);
-                }
-                try
-                {
-                    long v = await table.CommitDataFilesAsync(files, DeltaWriteMode.Append, cancellationToken: token,
-                            extraActions: extra, expectedVersion: table.CurrentSnapshot.Version,
-                            operation: operation,
-                            identityValuesPreGenerated: pending.PendingIdentityHwm.Count > 0,
-                            deletedPositionsByFileIndex: pendingFileDeletes)
-                        .ConfigureAwait(false);
-                    _log.LogInformation(
-                        "delta txn {Txn} commit {Path}: v{Version} op={Op} (files={Files}, rows+={Rows}, rows-={Deleted})",
-                        txnId, tablePath, v, operation, files.Count, pending.Rows, rowsDeleted);
-                    return;
-                }
-                catch (EngineeredWood.DeltaLake.DeltaConflictException)
-                    when (attempt < DeltaWriter.MaxCommitAttempts)
-                {
-                    // Another writer took the version mid-flush — reopen at the new latest and re-validate.
-                    await table.DisposeAsync().ConfigureAwait(false);
-                    table = await EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(
-                            fs, DeltaWriter.Options(null, dataFileWriter), token)
-                        .ConfigureAwait(false);
-                }
+                txn.StageReadPredicate(pred);
+            }
+            if (pending.ReadWholeTable)
+            {
+                txn.StageWholeTableRead();
+            }
+
+            // ONE call replaces what used to be a hand-rolled OCC loop here: conflict-check the read set
+            // against every commit landed since the pin, rebase the deletion-vector pairs onto the latest
+            // snapshot (re-unioning a concurrent delete of DIFFERENT rows, relocating ours by stable id
+            // across a concurrent rewrite), re-derive row-id high-water marks, retry on a lost race, and
+            // re-check the idempotent-producer versions on each attempt. Those invariants — re-rebase from
+            // the ORIGINAL staged actions, never from a prior attempt's — are engineered-wood's to keep now.
+            try
+            {
+                long v = await txn.CommitAsync(token).ConfigureAwait(false);
+                _log.LogInformation(
+                    "delta txn {Txn} commit {Path}: v{Version} op={Op} (files={Files}, rows+={Rows}, rows-={Deleted})",
+                    txnId, tablePath, v, operation, files.Count, pending.Rows, rowsDeleted);
+            }
+            catch (EngineeredWood.DeltaLake.DeltaConflictException ex)
+            {
+                throw new System.InvalidOperationException(
+                    $"delta transaction conflict on '{tablePath}': the table moved from version {pinned} "
+                    + $"while the transaction was open and the concurrent changes do not commute "
+                    + $"({ex.Message}) — the transaction is rolled back; retry it.");
             }
         }
         finally

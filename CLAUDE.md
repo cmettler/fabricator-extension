@@ -721,6 +721,103 @@ key it by path, and those compose (his internal core, our key).
 + `MetadataPredicate`, `UpdateBySelectionViaVectorsAsync`, and `VariantTransport` (pending the decision above).
 All four verified still absent upstream.
 
+#### THE BUFFERED FLUSH IS ON EW's `DeltaTransaction` — our OCC loop is GONE (2026-07-28, EW + Bridge, no ABI)
+
+`DeltaCatalog.FlushDmlTransactionAsync` no longer hand-rolls the commit loop: it stages onto a
+`DeltaTransaction` and calls `CommitAsync()` ONCE. **234 → 187 lines, and `CheckLogicalRebaseAsync` /
+`RebaseDvDmlActionsAsync` now have ZERO Bridge callers** — the conflict check, the rebase, the retry, the
+row-level DV remap and the per-attempt idempotency guard are engineered-wood's to keep correct. That matters
+because upstream named the hazard itself: those invariants (re-rebase from the ORIGINAL staged actions, never
+from a prior attempt's; pass `rowLevelDml` or silently get file-granularity conflicts) are enforced by no type.
+
+**Four EW additions were required, each a real gap for a host that owns its data plane, each mutation-tested:**
+- **`StartTransaction(snapshot)`** — `StartTransaction()` pins `CurrentSnapshot`; our base is the version the
+  transaction READ (statements earlier, and we cannot hold the table open across ABI calls). From the latest
+  version the set of "commits landed since" is EMPTY, so the validation would be VACUOUS — not merely
+  mis-pinned. The ctor already took a snapshot; this is the 4th instance of a pattern upstream established
+  (`PlanFiles(snapshot:)`, `ComputeDeletionVectorActionsAsync(resolveAgainst:)`, `RebaseDvDmlActionsAsync(from:)`).
+  Mutant (ignore the argument) fails 2 of 4 tests.
+- **`StageAppTransaction(appId, version, expectedPrevious)`** — the idempotent-producer CAS must be
+  re-validated on EVERY attempt, which `StageActions` + a hand-built `TransactionId` cannot do; its own doc
+  rules itself out ("anything carrying snapshot-relative state belongs in a typed method"). The failure needs
+  two producers running one batch: ours loses the race, the retry's read-set check PASSES (a concurrent append
+  invalidates nothing we read), and the batch commits a SECOND time. Mutant (keep only the base pre-check,
+  drop the per-attempt one) fails exactly the twin-producer test — i.e. the check a caller *could* write for
+  itself is not the one that matters.
+- **`StageDataFilesAsync` + `SetOperation`** — `StageDataFiles` was a REDUCED peer of `CommitDataFilesAsync`,
+  missing `identityValuesPreGenerated` (so an identity table's appends could not be staged AT ALL),
+  `deletedPositionsByFileIndex` (the same-txn INSERT-then-DELETE inline DV, slice C3), and the operation name
+  (his inference yields `"WRITE"` for anything mixed; our suites pin `"TRANSACTION"`/`"UPDATE"`/`"ADD COLUMNS"`).
+  Kept ADDITIVE: his sync `StageDataFiles` is untouched, the new one is a sibling — async for the same reason
+  `StageRowDeletesAsync` is, because hiding rows means WRITING a vector, and that write is hoisted into
+  `BuildInlineDeletionVectorsAsync` so the action builder stays sync.
+- **`StageReadPredicate` / `StageWholeTableRead` + the isolation gate** — see below; the only place we changed
+  his semantics rather than extending them.
+
+**⚠ THE SEMANTIC FIND: row-level reconciliation ignored the isolation level, in BOTH directions.** Upstream's
+loop derives `rowLevel` purely from "are there DV edits", so (a) under **`serializable`** two deletes touching
+one file reconciled because their rows were disjoint — admitting exactly the interleaving that level exists to
+forbid, since there commit order IS the logical order; and (b) under **`write_serializable`** the read-check
+exemption was NARROWER than the level's definition — only the RECONCILED paths were exempt, so a file we
+merely READ and never touched could be compacted away by a concurrent writer and abort us, though no row we
+delete was invalidated. Ours had always been the full skip (reads don't serialize under WS — Databricks' WS
+matrix). Both halves now hang off ONE gate: `rowLevel` is true only under write_serializable. **Our suite
+caught both** (`row_level_concurrency:162` "Query unexpectedly succeeded" = (a); `transactions:537`
+concurrentDeleteRead = (b)) — the value of pinning both isolation levels rather than just the default.
+
+**Process notes worth keeping.** (1) A first attempt reworded EW's row-level conflict message to match ours
+and broke FOUR upstream tests that pin the substring `"row level"`; reverted, and OUR three `.test` pins moved
+to upstream's wording instead — aligning the two phrasings upstream uses for one condition
+(`RebaseDvDmlActionsAsync` says "row-level conflict on file", `ResolveRowLevelDeletesAsync` says "conflicts at
+row level") is something to SUGGEST, not impose. (2) **`immediate_transaction_mode` does NOT help the pin
+question** (asked + analysed): it controls when DuckDB starts ITS transaction, while our pin is per TABLE at
+first scan — at `BEGIN` we do not yet know which tables a transaction will touch, and resolving a version for
+every table in the catalog is the enumeration cost we avoid. (3) **Holding the `DeltaTable` open across ABI
+calls would be a real perf win** (N× snapshot construction per multi-statement transaction, worst on
+OneLake/S3) but the blocker is NOT statefulness: `DuckDbTableFileSystem` CAPTURES the per-call opener
+(`ClientContext*`), and the rollback path gets no opener at all — so the prerequisite is making the FS resolve
+`AmbientOpener.Current` lazily per call. Now purely optional, since the pinned-snapshot overload removed the
+need to hold anything open.
+
+**Still hand-rolled, by upstream's own constraint** ("append-shaped only: the overwrite family removes the
+active set, which is exactly what a rebase cannot re-derive"): `FlushCreateTransaction`, CREATE OR REPLACE,
+partition overwrite, and the pending-CREATE path (no table exists yet to open a transaction on).
+
+**Gates:** EW Table.Tests **678** × {net10.0, net8.0, net472} (was 656 after the bump); targeted-first
+`transactions` **941** / `txn_version` **51** / `row_level_concurrency` **70** — all three at their exact
+historical counts — then hermetic **53/53 @ 4152** and service **42/42 @ 1227**, both unchanged. For a rewrite
+of the buffered-DML commit path, unchanged counts across all five are the signal.
+
+#### `TransientRowAddress` does NOT retire the selection APIs — and here is the test that decides it
+
+Asked directly (2026-07-28) whether upstream's new address type makes our path-keyed `*BySelection*` surface
+redundant. It does not, but **the argument changed**: we neither eliminated ordinals nor should want to —
+`TransientRowAddress` makes them a documented first-class concept, and DuckDB's `rowid` genuinely IS one
+BIGINT, so a host must mint and decode a packed address regardless. What survives is narrower:
+
+> An ordinal is a fine **address** for a host to mint and decode. It is the wrong **key** for a library's DML
+> boundary to accept, because at that boundary a stale address is indistinguishable from a fresh one.
+
+Neither motivating defect is touched by the new type: the lossy round-trip is still there (the type names the
+integer in the middle), and so is the silent skip. **The cheap alternative — keep ordinals, make them strict —
+was evaluated and does NOT work**, which is now pinned rather than argued: our existing coverage only had the
+OUT-OF-RANGE case ("deletes nothing"), which a range check would catch. The new
+`OrdinalKeyed_AfterAConcurrentRemoveRenumbersTheSet_DeletesTheWRONGRow` does the case it cannot — a concurrent
+commit REMOVING an earlier file renumbers the path-sorted set, so a captured ordinal still EXISTS (nothing can
+reject it) and names a DIFFERENT file: the delete succeeds and removes **a row nobody selected**. Silent WRONG
+DATA, strictly worse than a silent no-op. (Construction gotcha: the intended ordinal must be **1**, not 2 —
+removing ordinal 0 shifts old ordinal 2 INTO slot 1, so aiming at 2 goes out of range while aiming at 1 hits
+the wrong file. The first draft got this backwards and the test failed, correctly.)
+Upstream's own doc supplies the argument: the address "says WHERE a row sits rather than promising an identity
+it cannot keep", and a concurrent append renumbers ordinals.
+**Shape to keep:** selection forms are the CORES, rowid forms are thin adapters retaining the historical
+leniency (upstream's callers + its 11 test call sites). `ReadRowsByRowIdsAsync` stays rowid-keyed and SHOULD —
+it carries per-ROW identity across the boundary (`rowIdsOut` beside `sourceRowTrackingOut`), so path-keying its
+input alone removes nothing; that is the `_metadata` question, not the selection one.
+**Upstream pitch, revised:** not "replace ordinals" (he just invested in the type) but "the address type is
+right; the DML boundary needs a key that fails loudly — here is a test where the ordinal form deletes the wrong
+row and neither a range check nor the new type can see it."
+
 **UPSTREAM: this is the STRONGEST candidate of the whole seam effort** — a capability EW genuinely lacks, proven
 in production against Spark, additive, no magic strings (unlike the predicate lowering). Offer it ahead of the
 rest. **Process lesson recorded twice in one day:** a callback-carrying overload added to satisfy a caller gets
