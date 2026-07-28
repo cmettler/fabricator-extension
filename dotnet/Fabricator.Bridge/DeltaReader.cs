@@ -2067,9 +2067,8 @@ internal static class DeltaReader
         }
     }
 
-    // The transient rowid's position width — (fileOrdinal << 40) | absolutePosition, matching
-    // engineered-wood's ReadAllWithRowIdsAsync encoding.
-    private const int RowIdPositionBits = 40;
+    // The split is engineered-wood's, not ours: TransientRowAddress owns the encoding its
+    // ReadAllWithRowIdsAsync emits, so we decode with its helpers rather than a copied literal.
 
     /// <summary>
     /// Replaces the transient-rowid column of a DuckDB UPDATE batch with engineered-wood's <c>_metadata</c>
@@ -2102,13 +2101,13 @@ internal static class DeltaReader
             pathByOrdinal[planned.FileOrdinal] = planned.File.Path;
         }
 
-        long posMask = (1L << RowIdPositionBits) - 1;
+        long posMask = (1L << TransientRowAddress.PositionBits) - 1;
         var pathB = new StringArray.Builder();
         var idxB = new Int64Array.Builder();
         for (int i = 0; i < updates.Length; i++)
         {
             long rid = rids.GetValue(i)!.Value;
-            int ordinal = (int)(rid >> RowIdPositionBits);
+            int ordinal = (int)(TransientRowAddress.FileOrdinal(rid));
             if (!pathByOrdinal.TryGetValue(ordinal, out var filePath))
             {
                 throw new System.InvalidOperationException(
@@ -2159,7 +2158,7 @@ internal static class DeltaReader
         DeltaTable table, EngineeredWood.DeltaLake.Snapshot.Snapshot snapshot,
         IReadOnlyCollection<long> rowIds, string op)
     {
-        long posMask = (1L << RowIdPositionBits) - 1;
+        long posMask = (1L << TransientRowAddress.PositionBits) - 1;
         var pathByOrdinal = new Dictionary<int, string>(snapshot.ActiveFiles.Count);
         foreach (var planned in table.PlanFiles(snapshot: snapshot))
         {
@@ -2168,7 +2167,7 @@ internal static class DeltaReader
         var byFile = new Dictionary<string, IReadOnlyCollection<long>>(System.StringComparer.Ordinal);
         foreach (long rid in rowIds)
         {
-            int ordinal = (int)(rid >> RowIdPositionBits);
+            int ordinal = (int)(TransientRowAddress.FileOrdinal(rid));
             if (!pathByOrdinal.TryGetValue(ordinal, out var filePath))
             {
                 throw new System.InvalidOperationException(
@@ -2223,7 +2222,7 @@ internal static class DeltaReader
         }
 
         var snapshot = table.CurrentSnapshot;
-        long posMask = (1L << RowIdPositionBits) - 1;
+        long posMask = (1L << TransientRowAddress.PositionBits) - 1;
         var pathByOrdinal = new Dictionary<int, string>(snapshot.ActiveFiles.Count);
         foreach (var planned in table.PlanFiles(snapshot: snapshot))
         {
@@ -2239,7 +2238,7 @@ internal static class DeltaReader
             if (updRids.IsNull(i))
                 continue;
             long rid = updRids.GetValue(i)!.Value;
-            int ordinal = (int)(rid >> RowIdPositionBits);
+            int ordinal = (int)(TransientRowAddress.FileOrdinal(rid));
             if (!pathByOrdinal.TryGetValue(ordinal, out var filePath))
             {
                 throw new System.InvalidOperationException(

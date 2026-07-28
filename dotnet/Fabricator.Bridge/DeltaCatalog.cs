@@ -87,9 +87,11 @@ public sealed class DeltaCatalog : IBackendCatalog
     // the STABLE row id. This name is the one DuckDB binds (and the one _metadata.row_id means to Spark, which
     // is what our virtual columns surface); EW's is an internal encoding we decode on this side.
     internal const string RowIdColumn = "_metadata.row_id";
-    // Transient rowid packing — MUST match engineered-wood's DeltaTable.RowIdPositionBits: (fileOrdinal << 40) |
-    // rowPositionInFile. Used to recompute a row's rowid during the per-file UPDATE rewrite.
-    private const int RowIdPositionBits = 40;
+    // Transient rowid packing. We do NOT define the split: engineered-wood's TransientRowAddress owns it, and
+    // we must agree with it rather than merely match a literal — the codec read path renames EW's
+    // `_ew_row_address` to RowIdColumn and passes ITS packed value straight through to DuckDB, so decoding
+    // with our own copy of "40" would silently mis-read if the split ever moved. Our own pending-file
+    // ordinals (PendingOrdinalBase and up) live in the same space for the same reason.
     private readonly string _root; // normalized (forward slashes), no trailing slash
     // For a OneLake root: the Fabric REST API credential (from the ATTACH'd azure SP secret) used to list
     // tables (and, for a schema-enabled lakehouse, an Entra SQL token). Null for local/S3/ADLS (glob discovery)
@@ -1222,7 +1224,7 @@ public sealed class DeltaCatalog : IBackendCatalog
             if (hasDeletes)
             {
                 stream = DeltaTxnBuffer.ExcludeDeleted(
-                    stream, pending!.DeletedByOrdinal, dropRowId: !wantRowId, RowIdPositionBits);
+                    stream, pending!.DeletedByOrdinal, dropRowId: !wantRowId, TransientRowAddress.PositionBits);
             }
         }
         else
@@ -2540,7 +2542,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     // Pending eagerly-written FILES enter the native per-file scan with ordinals 0x780000+idx (idx =
     // index into pending.Files) — same-transaction DELETEs of their rows key DeletedByOrdinal there.
     private const long PendingFileOrdinalBase = 0x780000;
-    private const long RowIdPosMask = (1L << RowIdPositionBits) - 1;
+    private const long RowIdPosMask = (1L << TransientRowAddress.PositionBits) - 1;
 
     /// <summary>
     /// Ordinal → log <c>add.path</c> for one snapshot: the decode half of the transient row id, so that what
@@ -2627,7 +2629,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         long added = 0;
         foreach (var rid in ids)
         {
-            long ordinal = rid >> RowIdPositionBits;
+            long ordinal = TransientRowAddress.FileOrdinal(rid);
             if (ordinal >= PendingOrdinalBase && ordinal < PendingFileOrdinalBase)
             {
                 // In-memory pending BATCH rows (identity-under-ALTER / iceberg fallbacks) — practically
@@ -2663,7 +2665,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 set = new HashSet<long>();
                 pending.DeletedByOrdinal[(int)ordinal] = set;
             }
-            if (set.Add(rid & RowIdPosMask))
+            if (set.Add(TransientRowAddress.Position(rid)))
             {
                 added++;
             }
@@ -2698,7 +2700,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         EnsureBufferedDmlEligible(profile, "UPDATE", forUpdate: true);
         foreach (var rid in updates.Keys)
         {
-            if ((rid >> RowIdPositionBits) >= PendingOrdinalBase)
+            if ((TransientRowAddress.FileOrdinal(rid)) >= PendingOrdinalBase)
             {
                 throw new System.NotSupportedException(
                     "delta: UPDATE of rows inserted in the same transaction is not supported yet — COMMIT "
@@ -2774,13 +2776,13 @@ public sealed class DeltaCatalog : IBackendCatalog
                 if (i < rids.Length)
                 {
                     long rid = rids[i];
-                    long ordinal = rid >> RowIdPositionBits;
+                    long ordinal = TransientRowAddress.FileOrdinal(rid);
                     if (!pending.DeletedByOrdinal.TryGetValue((int)ordinal, out var set))
                     {
                         set = new HashSet<long>();
                         pending.DeletedByOrdinal[(int)ordinal] = set;
                     }
-                    set.Add(rid & RowIdPosMask);
+                    set.Add(TransientRowAddress.Position(rid));
                     if (stableIdsRaw is not null)
                     {
                         var ids = srcTracking is not null && rbIdx < srcTracking.Count

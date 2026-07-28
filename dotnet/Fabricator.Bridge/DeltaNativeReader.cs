@@ -10,6 +10,7 @@ using System.Threading.Tasks;
 using Apache.Arrow;
 using Apache.Arrow.Ipc;
 using Apache.Arrow.Types;
+using EngineeredWood.DeltaLake.Table;
 using EngineeredWood.Expressions;
 using Microsoft.Extensions.Logging;
 using DeltaSchema = EngineeredWood.DeltaLake.Schema;
@@ -36,7 +37,6 @@ internal static class DeltaNativeReader
     // One source of truth for the DuckDB-facing virtual rowid name (see DeltaCatalog.RowIdColumn for why
     // it is deliberately NOT engineered-wood's TransientRowAddress.ColumnName).
     private const string RowIdColumn = DeltaCatalog.RowIdColumn;
-    private const int RowIdPositionBits = 40;
 
     /// <summary>The STABLE row-tracking id virtual column (the Delta materialized-column name): per row
     /// <c>COALESCE(materialized __delta_row_id, baseRowId + position)</c>. Advertised (and served) only on
@@ -365,7 +365,7 @@ internal static class DeltaNativeReader
             {
                 sb.Append(", ");
             }
-            sb.Append($"((CAST({f.Ordinal.ToString(CultureInfo.InvariantCulture)} AS BIGINT) << {RowIdPositionBits}) | file_row_number) AS {Quote(RowIdColumn)}");
+            sb.Append($"((CAST({f.Ordinal.ToString(CultureInfo.InvariantCulture)} AS BIGINT) << {TransientRowAddress.PositionBits}) | file_row_number) AS {Quote(RowIdColumn)}");
         }
         if (dataCols.Count == 0 && !wantRowId)
         {

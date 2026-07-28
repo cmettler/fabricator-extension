@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using EngineeredWood.DeltaLake.Table;
 
 namespace Fabricator.Bridge;
 
@@ -24,7 +25,9 @@ namespace Fabricator.Bridge;
 /// </summary>
 internal sealed class DeltaRowIdFilter
 {
-    private const int PositionBits = 40;
+    // The split is engineered-wood's TransientRowAddress, not ours: the values in the rowid column are
+    // EW-packed on the codec read path, so a copied literal here would silently mis-decode if it moved.
+    private const int PositionBits = TransientRowAddress.PositionBits;
     private const long PositionMask = (1L << PositionBits) - 1;
 
     private long _lo = long.MinValue;
