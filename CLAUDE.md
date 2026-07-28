@@ -831,6 +831,25 @@ untouched; the composition of hunks 11–13 is the interesting part of this merg
 `ComputeDeletionVectorActionsAsync`, he to report `DeleteDvEdit`s + touched paths for `DeltaTransaction`, we to
 key it by path, and those compose (his internal core, our key).
 
+**⚠ UPSTREAM MOVED ON 2026-07-28 AND PART OF `_metadata` IS NOW HIS — read before offering that one
+(spotted while cutting the shredding offer; NOT yet merged into `fabricator-patches`).** Two commits landed
+past `fe74b0c`, both touching **`DeltaTable.cs`** — the file that has conflicted in every single bump — so
+they are the next bump's work:
+- **`9669796` overlaps `ReadAllWithMetadataAsync` on the IDENTITY half, and DISAGREES on shape.** His new
+  `ReadAllWithRowTrackingAsync`/`ReadAtVersionWithRowTrackingAsync` append **two FLAT top-level columns**
+  `_metadata.row_id` + `_metadata.row_commit_version` (materialized value else `baseRowId + position` /
+  `defaultRowCommitVersion`, both nullable, appended AFTER the read pipeline so `ProcessFileBatchesAsync`'s
+  reconciliation never sees them). Ours is **ONE struct with FOUR members** — the same two identity members
+  PLUS the non-null LOCATOR pair (`file_path`, `row_index`). So the locator half is still only ours, and the
+  offer is no longer clean-additive: it now proposes a different SHAPE for columns upstream already emits.
+  Note he refuses a non-row-tracking table rather than serving all-null columns, and refuses a user column
+  colliding with a generated name — both worth adopting either way. He also names them for the FEATURE
+  deliberately (`…WithRowTracking` = durable IDENTITY vs `…WithRowIds` = snapshot-scoped ADDRESS), the same
+  distinction `72b3888` drew at the column level.
+- **`519f695` "a partitioned table's read never asked for the materialized row ids"** — a real bug fix, and
+  our partitioned row-tracking/MoR paths are the ones that would be exposed to it. Evaluate against our tree
+  at the bump rather than assuming we are immune.
+
 **What remains ours after this bump:** the `FileRowSelection` selection-DML (V9/V10), `ReadAllWithMetadataAsync`
 + `MetadataPredicate`, `UpdateBySelectionViaVectorsAsync`, `VariantTransport` (decision settled — KEPT, marker
 renamed), and — new on 2026-07-28 — `VariantShredding`'s write half in the parquet layer. All five verified
