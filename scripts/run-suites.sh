@@ -43,8 +43,11 @@ case "$TIER" in
         # establishes ONE snapshot pin per (statement, table) however many times it names the table. Raised in
         # the same commit, per the error text below. Note 4165 - 4152 = 13 of the gap predates this: the floor
         # had not been raised for verify_delta_catalog_variant's +13 (the CAST(NULL AS VARIANT) backfill fix).
+        # 4197 since 2026-07-29: verify_delta_rename lost 2 (the redundant PROVIDER alias 'deltalake' was
+        # REMOVED; its two positive assertions became one negative pin plus a no-catalog-left-behind pin).
+        # A floor LOWERED for a deliberate removal, which is the one legitimate reason to lower it.
         : "${MIN_SUITES:=54}"
-        : "${MIN_ASSERTIONS:=4199}"
+        : "${MIN_ASSERTIONS:=4197}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

@@ -1,7 +1,8 @@
 # Delta provider — transaction, concurrency & isolation semantics
 
-Reference for the **engineered-wood Delta provider** (`PROVIDER 'engineeredwooddelta'`, aliases
-`'delta'`/`'deltalake'`): how DuckDB transactions map onto Delta commits under every combination of
+Reference for the **engineered-wood Delta provider** (`PROVIDER 'engineeredwooddelta'`, or its one
+alias `'delta'` — the redundant `'deltalake'` was removed 2026-07-29): how DuckDB transactions map
+onto Delta commits under every combination of
 execution mode (autocommit vs explicit `BEGIN..COMMIT`), data path (EW codec vs `native_read` /
 `native_write`), and the `isolation_level` ATTACH option. The `deltars` provider is NOT covered —
 see the short note at the end.

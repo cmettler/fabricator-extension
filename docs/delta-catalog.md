@@ -339,7 +339,8 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      the format. A table written before these fixes stays broken on its version-0 `metaData`; write a FRESH
      table.
 1. **Folder-root `DeltaCatalog` + read — DONE (local; OneLake discovery caveat below).** `DeltaBackend` (3rd
-   `IBackend`, name `"delta"`/`"deltalake"`, registered explicitly in `BackendRegistry.Discover` since it lives
+   `IBackend`, name `"engineeredwooddelta"` + its one alias `"delta"` (the redundant `"deltalake"` was removed
+   2026-07-29), registered explicitly in `BackendRegistry.Discover` since it lives
    in the Bridge alongside `DeltaReader`) + `DeltaCatalog : IBackendCatalog` (read-only this slice; writes
    throw). `ATTACH '/lake' AS lake (TYPE fabricator, PROVIDER 'delta')` → tables = immediate subdirs with a
    `_delta_log/` (globbed `<root>/*/_delta_log/*.json`), flat `main` schema; columns via `DeltaReader.GetSchema`;

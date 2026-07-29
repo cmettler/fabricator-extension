@@ -28,7 +28,7 @@ public sealed class DeltaBackend : IBackend
 
     // `delta`/`deltalake` stay as aliases so existing ATTACHes keep working; the primary name distinguishes
     // this engineered-wood-backed provider from a future delta-rs production provider.
-    public IEnumerable<string> Aliases => new[] { "delta", "deltalake" };
+    public IEnumerable<string> Aliases => new[] { "delta" };
 
     // Session-level write tuning applied just before each CREATE/INSERT/CTAS/COPY, modeled as a JSON object so a
     // single setting carries several knobs (and is easy to extend). Keys: "compression" (snappy|zstd|gzip|brotli|

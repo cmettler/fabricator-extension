@@ -1,7 +1,11 @@
 # name: test/verify_delta_rename.test
 # description: The Delta provider's primary name is `engineeredwooddelta` (engineered-wood-backed), with `delta`
-#              and `deltalake` kept as aliases so existing ATTACHes keep working. All three resolve to the same
-#              backend. Set FABRICATOR_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
+#              kept as its ONE alias; both resolve to the same backend. The redundant second alias `deltalake`
+#              was REMOVED 2026-07-29 (a breaking removal, deliberately — one alias is enough, and the two
+#              names are about to mean different DEFAULTS rather than being interchangeable). Note `deltalake`
+#              survives in a DIFFERENT namespace that this does not touch: `WITH table_type='DELTALAKE'`, the
+#              Iceberg-style DDL option value (DeltaWithOptions), which is a table_type, not a PROVIDER.
+#              Set FABRICATOR_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
 # group: [fabricator]
 
 require fabricator
@@ -38,17 +42,16 @@ SELECT id FROM lb.main.t;
 statement ok
 DETACH lb;
 
-# Alias `deltalake`.
-statement ok
+# The removed alias is now an UNKNOWN provider — pinned so the removal cannot regress into a silent
+# resolution (BackendRegistry matches Name + Aliases case-insensitively, so a stray re-add would be invisible
+# without this).
+statement error
 ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/rn_deltalake' AS lc (TYPE fabricator, PROVIDER 'deltalake');
-
-statement ok
-CREATE TABLE lc.main.t AS SELECT 3 AS id;
-
-query I
-SELECT id FROM lc.main.t;
 ----
-3
+deltalake
 
-statement ok
+# ...and no catalog was left behind by the failed ATTACH.
+statement error
 DETACH lc;
+----
+lc
