@@ -6188,11 +6188,11 @@ which nearly caused a published release to be retagged):**
   helper migration. `distribution.yml` run **green on all three platforms** and the **DRAFT** release exists
   with its three ZIPs (linux_amd64-Standard 40.2 MB / osx_arm64-Standalone 60.1 MB /
   windows_amd64-Standalone 62.2 MB). Publishing is still a human decision.
-- ⚠ **OBSERVED 2026-07-29: the `v0.0.1-duckdb1.5.5` RELEASE object is no longer listed by the API** (a
-  `per_page=100` query returns only v0.0.2), though **its TAG still exists on the remote** at `a8de094`.
-  Nothing in this session deleted it — the tagging work only ADDED v0.0.2. Recorded as an observation, not a
-  diagnosis. Nothing is lost that matters: a release can be recreated from the surviving tag, and the tag is
-  what makes the source reproducible.
+- **`v0.0.1-duckdb1.5.5`'s RELEASE object was DELETED BY THE USER, deliberately (confirmed 2026-07-29)** — so
+  the API lists only v0.0.2. **Its TAG deliberately survives on the remote at `a8de094`**, which is the part
+  that matters: the tag is what keeps that release's source reproducible (`git submodule update` cannot
+  reliably fetch an unreachable sha, so an orphaned commit would make the tagged build unbuildable). Nothing
+  to investigate — do NOT "restore" it.
 **⚠ CHECK `draft` VIA THE API BEFORE TREATING A RELEASE AS MOVABLE — do not trust this file.** The retag rule
 below is real and still applies; what went stale was the FACT it was applied to. Once published, a tag move
 is not merely history-rewriting: the attached assets were built from the OLD commit, so moving the tag leaves
