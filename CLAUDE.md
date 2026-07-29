@@ -375,6 +375,32 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
       dereferences a dangling pointer — a use-after-free, not a staleness bug, and this box would probably
       not fault on it (same lesson as the macOS `ArrowProducer` release). Lifetime/disposal is resource
       hygiene; the opener is memory safety. Do the lazy `AmbientOpener` resolution FIRST.
+      **DONE (2026-07-30, `142b350`)**: the FS reads `AmbientOpener.Current` and keeps the constructor value
+      as a FALLBACK (the ambient is an `AsyncLocal` and reads 0 where the execution context did not flow;
+      there the captured pointer is still right because nothing outlives its call yet). Behaviour-preserving
+      — all 46 construction sites pass `Opener()`, which just returns the ambient. Also verified
+      `DuckDbRandomAccessFile` uses its opener ONLY in the ctor and stores just the host file handle, so the
+      FS was the ONLY lingering capture.
+  - **THREAD SAFETY OF A SHARED `DeltaTable` — CHECKED 2026-07-30, the cache IS viable.** Today every scan
+    opens its own table, so caching one per (txn, table) would share it across DuckDB's parallel scans. EW's
+    `DeltaTable` has mutable state (`_currentSnapshot`, `_disposed`) and **zero** locks/`Interlocked`. But all
+    **11** assignments to `_currentSnapshot` are in WRITE/commit paths or the explicit `RefreshAsync`
+    (ctor, `RefreshAsync`, `CommitMetadataOnlyAsync`, `SetClusteringColumnsAsync`, `Set`/`RemoveDomainMetadataAsync`,
+    `CommitOccAsync`, `CommitWriteAsync`, `CommitDataFilesAsync` ×2, `CompactAsync`) — **none in a read path**.
+    The helpers reads go through (`TransactionLog`, `DeletionVectorReader`, `CheckpointReader`) are STATELESS
+    (a readonly `_fs` only; a grep for "mutable private fields" hits method declarations — false positives,
+    don't be fooled). ⇒ concurrent READS of one shared table are safe; the cache must simply never be used
+    for a write/refresh, which the buffered design already satisfies (writes go through `DeltaTxnBuffer`
+    actions and the flush wants a fresh table anyway).
+  - **Remaining design points for whoever builds it:** (a) simplest storage is the EXISTING `SnapshotPinning`
+    per-txn structure keyed (txn, path) — `Release(txnId)` is already wired to commit/rollback, so it becomes
+    the disposal point for free (sync-over-async at one blocking point, per the convention); (b) the key must
+    carry the VERSION or be pinned-version-scoped, because a `DeltaTable` holds ONE `_currentSnapshot` while
+    `GetSchemaAt(v)`/`StreamAt(v)` need v's — inside a transaction the pin makes every read use one version,
+    which is what makes (txn, path) sufficient; (c) invalidate on the operations that BYPASS the buffer and
+    commit immediately (identity creates, DROP/OPTIMIZE/VACUUM, CREATE-OR-REPLACE, partition-overwrite),
+    since those advance the version under a held snapshot and a later read in the same transaction must see
+    its own committed write.
 - **SINGLE-FILE DISTRIBUTION — BUILT + validated live (phases 1–4 of 5; REMAINING: user-facing install
   docs + CI matrix — CI tier 3 exists).** ONE `fabricator.duckdb_extension` self-installs (extract +
   chain-load + CLR boot; ~2–3 s cold, 0.01–0.2 s warm; win 61 MB standalone / linux 40 MB standard —
