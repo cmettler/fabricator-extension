@@ -956,8 +956,34 @@ internal static class DeltaWriter
                 // FIELD_IDS keyed by the COPY's OUTPUT (physical) names — RECURSIVE for struct fields (the
                 // __duckdb_field_id sentinel), so nested columns carry their delta.columnMapping.id in the
                 // parquet. Partition columns are excluded (COPY PARTITION_BY leaves them out of the files).
-                fieldIdsSpec = BuildFieldIdsSpec(snapSchema,
-                    partCols.Count > 0 ? new HashSet<string>(partCols, System.StringComparer.Ordinal) : null);
+                //
+                // ...and so is any table column the STREAM does not carry. The COPY writes SELECT * of the
+                // stream, so FIELD_IDS must describe the STREAM, not the table: a partial-column
+                // `INSERT INTO t (a) VALUES (…)`, or an INSERT whose column list omits a column a buffered
+                // ALTER added, supplies fewer columns than the schema. Naming an absent one made the COPY fail
+                // to BIND ("Column name \"col-…\" specified in FIELD_IDS not found"), which also MASKED the real
+                // diagnostic — binding fails before the first batch is pulled, so the lazy NOT NULL validator
+                // above never ran and a partial INSERT omitting a NOT NULL column reported this instead of the
+                // constraint violation. Note statsSchema below already derives from data.Schema; this is the
+                // same rule applied to the other consumer.
+                var fieldIdsExclude = new HashSet<string>(System.StringComparer.Ordinal);
+                foreach (var pc in partCols)
+                {
+                    fieldIdsExclude.Add(pc);
+                }
+                var streamCols = new HashSet<string>(System.StringComparer.Ordinal);
+                foreach (var f in data.Schema.FieldsList)
+                {
+                    streamCols.Add(f.Name);
+                }
+                foreach (var f in snapSchema.Fields)
+                {
+                    if (!streamCols.Contains(f.Name))
+                    {
+                        fieldIdsExclude.Add(f.Name);
+                    }
+                }
+                fieldIdsSpec = BuildFieldIdsSpec(snapSchema, fieldIdsExclude.Count > 0 ? fieldIdsExclude : null);
                 // Stats in the Delta log are keyed by the PHYSICAL column names (spec) — type them from a
                 // physical-renamed copy of the write schema so BuildDeltaStats emits physical keys.
                 var physFields = new List<Field>(data.Schema.FieldsList.Count);
