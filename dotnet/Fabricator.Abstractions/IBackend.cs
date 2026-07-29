@@ -114,6 +114,33 @@ public interface IBackend
     /// provider parses the keys it knows. See docs/provider-extensibility.md §3.
     /// </summary>
     IBackendCatalog OpenCatalog(string connectionString, string optionsJson);
+
+    /// <summary>
+    /// Open a catalog, additionally told WHICH of this backend's names the user actually wrote in
+    /// <c>PROVIDER '…'</c> — <see cref="Name"/> or one of its <see cref="Aliases"/>, verbatim (empty when the
+    /// ATTACH named no provider and the default backend was used).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Exists because a name can select a <b>DEFAULT PROFILE</b>, not merely a spelling. The Delta backend uses
+    /// it that way: <c>PROVIDER 'delta'</c> defaults the native reader/writer ON (the hybrid production path,
+    /// DuckDB's parquet reader/writer with engineered-wood owning the <c>_delta_log</c>) while
+    /// <c>PROVIDER 'engineeredwooddelta'</c> defaults them OFF (pure engineered-wood). Both resolve to the same
+    /// <see cref="IBackend"/>; only the defaults differ, and an explicit ATTACH option still wins either way.
+    /// </para>
+    /// <para>
+    /// ⚠ A backend that behaves this way MUST document the name → profile mapping, because
+    /// <see cref="Aliases"/> then no longer means "interchangeable spelling" for it. Note the alias list is
+    /// still what the registry resolves on, so REMOVING a name from it silently changes which profile a user
+    /// gets — pin each name's profile in a test rather than trusting the list.
+    /// </para>
+    /// <para>
+    /// Default implementation ignores the name and delegates, so a backend for which every name means the same
+    /// thing (and every existing plugin) needs no change.
+    /// </para>
+    /// </remarks>
+    IBackendCatalog OpenCatalog(string connectionString, string optionsJson, string requestedProvider)
+        => OpenCatalog(connectionString, optionsJson);
 }
 
 /// <summary>

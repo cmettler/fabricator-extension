@@ -26,9 +26,36 @@ public sealed class DeltaBackend : IBackend
 {
     public string Name => "engineeredwooddelta";
 
-    // `delta`/`deltalake` stay as aliases so existing ATTACHes keep working; the primary name distinguishes
-    // this engineered-wood-backed provider from a future delta-rs production provider.
+    // `delta` is an alias for RESOLUTION only — the two names select different DEFAULT PROFILES (see
+    // NativeDefaultsFor). The primary name distinguishes this engineered-wood-backed provider from a future
+    // delta-rs production provider.
     public IEnumerable<string> Aliases => new[] { "delta" };
+
+    /// <summary>
+    /// The name → DEFAULT PROFILE table. Both names reach the same catalog; they differ only in what
+    /// <c>native_read</c> / <c>native_write</c> default to when the ATTACH does not say.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <c>PROVIDER 'delta'</c> ⇒ <b>native on</b>: DuckDB's parquet reader and writer move the bytes while
+    /// engineered-wood owns the <c>_delta_log</c>. This is the production path — it is the one with bounded-memory
+    /// streaming writes, and it is the ONLY one that can recluster a liquid-clustered table, because that rewrite's
+    /// global ORDER BY relies on DuckDB's SPILLING sort (engineered-wood has no external sort).
+    /// </para>
+    /// <para>
+    /// <c>PROVIDER 'engineeredwooddelta'</c> ⇒ <b>native off</b>: pure engineered-wood, its own parquet codec on
+    /// both sides. Keeps a single-dependency path for driver-level testing and for exercising the codec itself.
+    /// </para>
+    /// <para>
+    /// An explicit ATTACH option always wins, in either direction — <c>PROVIDER 'delta', native_write false</c>
+    /// and <c>PROVIDER 'engineeredwooddelta', native_read true</c> both do what they say. An ATTACH that names
+    /// NO provider (the default backend) gets the conservative profile, since nothing asked for the hybrid.
+    /// </para>
+    /// </remarks>
+    internal static (bool Read, bool Write) NativeDefaultsFor(string? requestedProvider) =>
+        string.Equals(requestedProvider?.Trim(), "delta", System.StringComparison.OrdinalIgnoreCase)
+            ? (true, true)
+            : (false, false);
 
     // Session-level write tuning applied just before each CREATE/INSERT/CTAS/COPY, modeled as a JSON object so a
     // single setting carries several knobs (and is easy to extend). Keys: "compression" (snappy|zstd|gzip|brotli|
@@ -69,8 +96,13 @@ public sealed class DeltaBackend : IBackend
         return baseConnString;
     }
 
+    // The two-argument form cannot know which name was written, so it takes the conservative profile. Reached
+    // only by a caller that predates the three-argument overload (the host always passes the name).
     public IBackendCatalog OpenCatalog(string connectionString, string optionsJson) =>
-        new DeltaCatalog(connectionString, optionsJson);
+        new DeltaCatalog(connectionString, optionsJson, (false, false));
+
+    public IBackendCatalog OpenCatalog(string connectionString, string optionsJson, string requestedProvider) =>
+        new DeltaCatalog(connectionString, optionsJson, NativeDefaultsFor(requestedProvider));
 }
 
 /// <summary>An ATTACH'd Delta folder catalog. Lazy: holds the root path; all FS access happens during metadata
@@ -189,7 +221,12 @@ public sealed class DeltaCatalog : IBackendCatalog
 
     public DeltaCatalog(string root) : this(root, "{}") { }
 
-    public DeltaCatalog(string root, string? optionsJson)
+    public DeltaCatalog(string root, string? optionsJson) : this(root, optionsJson, (false, false)) { }
+
+    /// <param name="nativeDefaults">What <c>native_read</c>/<c>native_write</c> default to when the ATTACH does
+    /// not say — chosen by the PROVIDER NAME the user wrote (see <see cref="DeltaBackend.NativeDefaultsFor"/>).
+    /// An explicit ATTACH option overrides either way.</param>
+    public DeltaCatalog(string root, string? optionsJson, (bool Read, bool Write) nativeDefaults)
     {
         var (clean, credential) = FabricLakehouse.Extract(root);
         (clean, _s3Credential) = S3CommitCredential.Extract(clean);
@@ -209,8 +246,8 @@ public sealed class DeltaCatalog : IBackendCatalog
         _defaultRowGroupSize = ParseIntOption(optionsJson, "row_group_size");
         _defaultBloomColumns = ParseListOption(optionsJson, "bloom_filter_columns");
         _mergeSchemaOnWrite = ParseBoolOption(optionsJson, "merge_schema");
-        _nativeRead = ParseBoolOption(optionsJson, "native_read");
-        _nativeWrite = ParseBoolOption(optionsJson, "native_write");
+        _nativeRead = ParseBoolOption(optionsJson, "native_read", nativeDefaults.Read);
+        _nativeWrite = ParseBoolOption(optionsJson, "native_write", nativeDefaults.Write);
         _columnMappingMode = ParseColumnMappingOption(optionsJson);
         _pushdownMode = ParsePushdownFiltersOption(optionsJson, _nativeRead);
         _copyDisposition = ParseStringOption(optionsJson, "copy_disposition");

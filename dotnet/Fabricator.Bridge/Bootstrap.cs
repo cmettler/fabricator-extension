@@ -139,7 +139,11 @@ public static unsafe class Bootstrap
             // NOTE: connStr may carry a password — never log it. Provider + options (schema_filter/… ) are safe.
             BridgeLog.LogDebug("abi open_catalog: provider={Provider} options={Options}",
                 string.IsNullOrEmpty(providerName) ? "(default)" : providerName, options);
-            var catalog = BackendRegistry.Resolve(providerName).OpenCatalog(connStr, options);
+            // The REQUESTED name is forwarded, not just used to resolve the backend: for the Delta backend the
+            // name selects a default PROFILE ('delta' = native hybrid, 'engineeredwooddelta' = pure EW), so
+            // dropping it here is what used to make that distinction unexpressible.
+            var catalog = BackendRegistry.Resolve(providerName)
+                .OpenCatalog(connStr, options, providerName ?? string.Empty);
             *outHandle = Handles.Alloc(catalog);
             return FabricatorStatus.Ok;
         }
