@@ -1009,11 +1009,56 @@ row level") is something to SUGGEST, not impose. (2) **`immediate_transaction_mo
 question** (asked + analysed): it controls when DuckDB starts ITS transaction, while our pin is per TABLE at
 first scan — at `BEGIN` we do not yet know which tables a transaction will touch, and resolving a version for
 every table in the catalog is the enumeration cost we avoid. (3) **Holding the `DeltaTable` open across ABI
-calls would be a real perf win** (N× snapshot construction per multi-statement transaction, worst on
-OneLake/S3) but the blocker is NOT statefulness: `DuckDbTableFileSystem` CAPTURES the per-call opener
-(`ClientContext*`), and the rollback path gets no opener at all — so the prerequisite is making the FS resolve
-`AmbientOpener.Current` lazily per call. Now purely optional, since the pinned-snapshot overload removed the
-need to hold anything open.
+calls would be a real perf win** but the blocker is NOT statefulness: `DuckDbTableFileSystem` CAPTURES the
+per-call opener (`ClientContext*`), and the rollback path gets no opener at all — so the prerequisite is making
+the FS resolve `AmbientOpener.Current` lazily per call. Not needed for CORRECTNESS since the pinned-snapshot
+overload, but **the cost is bigger than "N× per multi-statement transaction" — it is per TABLE REFERENCE per
+STATEMENT, and MEASURED (2026-07-29):**
+
+| statement (local codec catalog, `native_read` off = the default) | snapshot constructions |
+|---|---|
+| `SELECT sum(id) FROM t` (steady state) | **4** |
+| `SELECT … FROM t a JOIN t b` (self-join) | **8** |
+| three references to `t` in one statement | **12** |
+| `INSERT INTO t SELECT … FROM t a JOIN t b` (autocommit) | **10** (8 scan + 2 write) |
+| the same INSERT inside `BEGIN … COMMIT` | **13** |
+| any of the above with `native_read true` | **+1** (the shared version pin) |
+
+Dead linear at **4 per reference**, decomposed and confirmed as **2 `ScanTable` calls per reference** (the
+bind-time `spec == null` schema probe + the execution) **× 2 opens per call** (`GetSchema`/`GetSchemaAt`, then
+`Stream`/`StreamAt` on the codec path or the file listing on the native one). Method: every
+`DeltaTable.OpenAsync` is preceded by `TableFileSystems.Create`, so ONE temporary debug line there counts opens
+exactly; a second Delta table scanned between the statements under test delimits them in the log (its own opens
+show up under its own path). Probe reverted after measuring. Each open costs a `_delta_log` LIST — which
+`ExternalFileCache` does NOT serve (it caches file CONTENT ranges, not listings) — plus the commit/checkpoint
+reads and the replay CPU, so on OneLake/S3 the repeated listing dominates. **Only the resolved VERSION is
+shared** (`SnapshotPinning` caches a `long` per (txn, table), never a `DeltaTable`).
+
+⚠ **A CONSISTENCY GAP found by the same measurement, autocommit + codec only.** The version pin is consulted
+on the codec read path ONLY when `_txnBuffer.IsExplicit(scanTxn)` (`DeltaCatalog.cs` ~1171), so in AUTOCOMMIT
+`pinnedReadValue` is null and **each scan opens at LATEST independently** — the +1 pin open appears in the
+table above only for the `BEGIN` row, which is the empirical proof. Two references to one table can therefore
+straddle a concurrent commit (reference `a` reads v5, `b` v6): a self-join, `t UNION ALL t`, a correlated
+subquery re-scanning `t`, or `INSERT INTO t … FROM t JOIN t`. `native_read` is UNAFFECTED — it pins whenever
+`txn != 0` (~1434), autocommit included. The in-code comment "autocommit statements keep reading latest (a
+single codec statement is one snapshot anyway)" is true for ONE reference and false for two. **The gate is
+INHERITED, not decided — and it must STAY for DML, for a CAPABILITY reason, so do not "simplify" it away:**
+`MarkExplicit` (`7cf1f8a`, ABI v60) exists because the buffered DML path is strictly LESS CAPABLE than the
+direct per-statement one — it expresses a DELETE as buffered DV actions and CANNOT express a COPY-ON-WRITE
+rewrite, so a `deletion_vectors false` table (the protocol-1.0 PolyBase/SQL-Server-readable recipe) can only
+be deleted from directly; `EnsureBufferedDmlEligible`'s first guard still says exactly that ("run it in
+autocommit (copy-on-write)"). CDF capture was the SECOND such capability at the time (slice C2 later taught
+the buffered path eager `_change_data` files, so the residual CDF guard now covers only identity/IcebergCompat).
+Routing autocommit through the buffer would therefore have BROKEN working capabilities — it was never a cost
+optimization (in autocommit one statement is one commit either way, so there is nothing to win). **That
+reasoning is entirely about WRITES.** The codec READ pin was later written INSIDE that pre-existing
+explicit-only block (`20ec7d5`, "snapshot reads by default") and none of it applies to a read: the block is
+correctly explicit-only because read predicates feed a COMMIT-time conflict check, but the PIN rode along.
+**Fix sketch, and it need not cost an open:** the first codec scan already opens the table at latest, so
+recording its `CurrentSnapshot.Version` into `SnapshotPinning` closes the gap with ZERO extra IO (later
+references then read `AT` that version); dropping the `IsExplicit` gate instead would add a
+`ResolveVersionAsOf` open per statement — the opposite of the item above. Needs a version-out threaded from
+the stream helper. NOT built; no suite covers the interleaving, so a two-connection racer would be the gate.
 
 **Still hand-rolled, by upstream's own constraint** ("append-shaped only: the overwrite family removes the
 active set, which is exactly what a rebase cannot re-derive"): `FlushCreateTransaction`, CREATE OR REPLACE,
@@ -3465,6 +3510,31 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   live-validated (default COPY over an existing onelake file → new data, no `.tmp` leftover). NOTE:
   engineered-wood's Delta COMMIT rename deliberately stays on the exclusive-create-copy + delete
   emulation (it needs put-if-absent on the destination; a plain rename overwrites).)
+  **⚠ DO NOT set `USE_TMP_FILE` on our COPYs — it is ALREADY false on every write path, and setting it
+  explicitly BREAKS the partitioned one (analysed 2026-07-29).** The rule is NOT "true for local"
+  (`bind_copy.cpp:226-236`): remote prefix ⇒ false, else
+  `FileExists(target) && !per_thread_output && partition_cols.empty() && !is_stdout` — so the decisive
+  conjunct is that the target **already exists as a REGULAR file** (`FileExists` is `S_ISREG`-gated, so a
+  DIRECTORY target is false too). Every fabricator COPY is therefore already false: `RunCopy` and
+  `RunCopySql` write a fresh file (and this does not rest on reading the name generator — **Delta data
+  files are IMMUTABLE by protocol**, a rewrite writes a new file and tombstones the old, so an existing
+  target would itself be a bug), `RunCopyPartitioned` is forced false by `PARTITION_BY`,
+  `ExternalTableRouting`'s parquet append uses a fresh Guid, and our own `FORMAT delta` copy targets a
+  directory. And `user_set_use_tmp_file` combined with `PARTITION_BY` / `FILE_SIZE_BYTES` /
+  `PER_THREAD_OUTPUT` **THROWS** `NotImplementedException` (`bind_copy.cpp:205-213`), so a defensive
+  blanket `USE_TMP_FILE false` in `CopyTuning` would kill `RunCopyPartitioned` at bind.
+  **What actually protects us from half-written files is the COMMIT ORDER, not COPY:** data file first,
+  then the atomic `_delta_log` commit that references it — a partial data file is referenced by no `add`,
+  so it is an invisible orphan for VACUUM (the same mechanism that makes ROLLBACK safe for eager writes).
+  The one file whose atomicity matters is the commit JSON, and DuckDB's COPY never writes it (EW writes it
+  through `ITableFileSystem` with temp + rename/exclusive-create). **Fabric-notebook FUSE mount:**
+  `/lakehouse/default/…` is a genuine LOCAL path, so the same rule applies — tmp-file staging only on
+  overwrite of an existing file, which our Delta writes never do; fuse CAN leave a partial or
+  never-flushed data file (it buffers and flushes on close) but harmlessly, as an orphan. The real fuse
+  risk is the COMMIT put-if-absent (already recorded: single-writer only over fuse — use abfss/onelake for
+  concurrent writers), which `USE_TMP_FILE` does not touch either way. The tmp+rename branch IS live for a
+  USER's own `COPY … TO 'onelake://…/existing.parquet'` (why v64 exists); whether that rename behaves over
+  the FUSE mount is UNTESTED by us — nothing on a fabricator write path depends on it.
 - **Prior: v63** (v63 = **etag/mtime-backed cache validation on `onelake://`** —
   `onelake_open` gained `char **out_etag` (owned UTF-8, freed via free_error) + `int64 *out_modified_ms`
   outs: when the managed open DOES fetch properties (bare open, `known_size<0`) it returns the file's
