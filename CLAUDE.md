@@ -6097,8 +6097,16 @@ which nearly caused a published release to be retagged):**
 - **`v0.0.1-duckdb1.5.5` is PUBLISHED** (`draft=false`), created 2026-07-27, pinning **`a8de094`** — NOT the
   `5c28297` this note recorded; it was retagged again after that. Three ZIPs attached, 0 downloads:
   `linux_amd64-Standard` 40.1 MB / `osx_arm64-Standalone` 60.0 MB / `windows_amd64-Standalone` 62.2 MB.
-- **`v0.0.2-duckdb1.5.5`** cut on 2026-07-28 at HEAD, +30 commits: both EW clast-master bumps, the variant
-  shredding split, the `_metadata` locator conformance, and the `TransientRowAddress` helper migration.
+- **`v0.0.2-duckdb1.5.5`** cut on 2026-07-28 at `21e7be5`, +30 commits over v0.0.1: both EW clast-master
+  bumps, the variant shredding split, the `_metadata` locator conformance, and the `TransientRowAddress`
+  helper migration. `distribution.yml` run **green on all three platforms** and the **DRAFT** release exists
+  with its three ZIPs (linux_amd64-Standard 40.2 MB / osx_arm64-Standalone 60.1 MB /
+  windows_amd64-Standalone 62.2 MB). Publishing is still a human decision.
+- ⚠ **OBSERVED 2026-07-29: the `v0.0.1-duckdb1.5.5` RELEASE object is no longer listed by the API** (a
+  `per_page=100` query returns only v0.0.2), though **its TAG still exists on the remote** at `a8de094`.
+  Nothing in this session deleted it — the tagging work only ADDED v0.0.2. Recorded as an observation, not a
+  diagnosis. Nothing is lost that matters: a release can be recreated from the surviving tag, and the tag is
+  what makes the source reproducible.
 **⚠ CHECK `draft` VIA THE API BEFORE TREATING A RELEASE AS MOVABLE — do not trust this file.** The retag rule
 below is real and still applies; what went stale was the FACT it was applied to. Once published, a tag move
 is not merely history-rewriting: the attached assets were built from the OLD commit, so moving the tag leaves
