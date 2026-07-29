@@ -48,9 +48,9 @@ case "$TIER" in
         # A floor LOWERED for a deliberate removal, which is the one legitimate reason to lower it.
         # 4206 since 2026-07-29: verify_delta_clustered_optimize gained 9 (§8 pins that a clustering-declared
         # table on a catalog WITHOUT the native writer WARNS instead of silently bin-packing).
-        : "${MIN_SUITES:=54}"
-                # 4208 since 2026-07-29: verify_delta_catalog_transactions gained 2 (the ROLLBACK atomicity pin for
+        # 4208 since 2026-07-29: verify_delta_catalog_transactions gained 2 (the ROLLBACK atomicity pin for
         # the buffered identity append the native-write default exposed).
+        : "${MIN_SUITES:=54}"
         : "${MIN_ASSERTIONS:=4208}"
         ;;
     service)
@@ -138,6 +138,15 @@ failed=0
 assertions=0
 failures=''
 
+# Snapshot the fixtures' git state so the check at the end can attribute a change to THIS RUN rather
+# than to whatever the developer already had in progress. See the check for what it is guarding.
+fixtures_before=''
+have_git=0
+if command -v git >/dev/null 2>&1 && git rev-parse --git-dir >/dev/null 2>&1; then
+    have_git=1
+    fixtures_before=$(git status --porcelain --untracked-files=all -- test/fixtures 2>/dev/null)
+fi
+
 while read -r suite; do
     [ -z "$suite" ] && continue
     scratch=$(mktemp -d)
@@ -192,6 +201,25 @@ fi
 if [ "$ran" -ne "$expected" ]; then
     echo "ERROR: $ran of $expected suites ran." >&2
     exit 1
+fi
+
+# The in-repo fixtures are read-only reference data; a suite that writes into them dirties the working
+# tree and — as happened on 2026-07-29 — gets its droppings COMMITTED by the next `git add`. That leak
+# was invisible for a whole session: `verify_delta_catalog_constraints` attaches test/fixtures and
+# attempts INSERTs that must fail, which wrote nothing while the codec was the default and started
+# leaving one orphan .parquet per failed INSERT the moment `native_write` became it. Cheap to assert,
+# so assert it. Compared against the pre-run snapshot, so a developer's own in-progress fixture edit
+# is not reported as this run's doing. Skipped when git is unavailable or this is not a checkout.
+if [ "$have_git" -eq 1 ]; then
+    fixtures_after=$(git status --porcelain --untracked-files=all -- test/fixtures 2>/dev/null)
+    if [ "$fixtures_after" != "$fixtures_before" ]; then
+        echo "ERROR: this run modified test/fixtures — those are committed, read-only inputs." >&2
+        echo "  before:${fixtures_before:+$(printf '\n%s' "$fixtures_before")}" >&2
+        echo "  after :${fixtures_after:+$(printf '\n%s' "$fixtures_after")}" >&2
+        echo "       find the suite that writes there and point it at FABRICATOR_DELTA_WRITE_DIR" >&2
+        echo "       (or pin it to the codec engine, which writes nothing on a refused statement)." >&2
+        exit 1
+    fi
 fi
 
 # Floors on the SELECTED set (values set per tier at the top). Without these, a suite that quietly

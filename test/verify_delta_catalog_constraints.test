@@ -86,10 +86,16 @@ CREATE TABLE w.main.ctas AS SELECT i, s FROM w.main.t;
 statement ok
 INSERT INTO w.main.ctas VALUES (NULL, 'ok');
 
-# ---- (1c) NESTED constraints via the duckdb-delta fixture (Spark-declared struct-field nullability;
-#           error-only — a failing collect-path insert writes nothing, keeping the fixture pristine) ----
+# ---- (1c) NESTED constraints via the duckdb-delta fixture (Spark-declared struct-field nullability) ----
+# The fixture is COMMITTED, read-only reference data, and this section deliberately attempts writes that
+# must FAIL — so the engine is pinned to the CODEC, whose collect path holds batches in memory and writes
+# nothing when the check refuses. Under `native_write` (the default for PROVIDER 'delta' since 2026-07-29)
+# DuckDB's COPY creates the data file BEFORE the NOT NULL check refuses the statement, leaving one orphan
+# .parquet per failed INSERT inside test/fixtures — by-design orphans (rollback leaves them for VACUUM),
+# but here they land in the repository and eight of them were committed by mistake before this was caught.
+# The nullability check itself is engine-independent, and (1b) above already covers it under native_write.
 statement ok
-ATTACH 'test/fixtures' AS fx (TYPE fabricator, PROVIDER 'delta');
+ATTACH 'test/fixtures' AS fx (TYPE fabricator, PROVIDER 'engineeredwooddelta');
 
 query I
 SELECT count(*) FROM fx.main.null_constraints_structs;
