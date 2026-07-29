@@ -1,0 +1,215 @@
+# name: test/verify_delta_autocommit_pin.test
+# description: AUTOCOMMIT snapshot pinning on the CODEC read path (native_read off = the default). A statement
+#              that references one Delta table SEVERAL times (self-join, UNION ALL, a correlated re-scan,
+#              INSERT INTO t ... FROM t JOIN t) must read ONE version for all of them. It did not: the version
+#              pin was consulted only inside an explicit transaction, because it had been written inside the
+#              explicit-only read-set block (a gate that exists for the buffered-DML capability boundary and
+#              has nothing to do with reads), so each reference opened at LATEST independently and two of them
+#              could straddle a concurrent commit. The fix seeds the pin from the FIRST scan's own schema open
+#              (zero extra IO — that open already read the latest version) and drops the IsExplicit gate on
+#              READING the pin.
+#
+#              WHAT IS ASSERTED, and why this shape: the seeding branch runs at most ONCE per (txn, table)
+#              because ScanTable consults the pin before ScanCodec is called, so the number of "delta codec
+#              pin" log lines IS the sharing property -- exactly one however many times the statement names
+#              the table. Unfixed, the count is 0 (no pin at all in autocommit); with the pin seeded but not
+#              consulted, it is one PER ScanCodec call (4 for a self-join: a bind probe + an execution per
+#              reference). So == 1 distinguishes the fix from both failure modes.
+#              The remaining half -- that reading AT a pinned version yields that version's data -- is NOT
+#              re-proven here: it is the same GetSchemaAt/StreamAt machinery the explicit-transaction snapshot
+#              sections of verify_delta_catalog_transactions already cover. A concurrent commit cannot be
+#              scheduled BETWEEN two scans of one statement from sqllogictest, so an end-to-end racer for that
+#              interleaving would be flaky rather than load-bearing; it is deliberately not attempted.
+#              Set FABRICATOR_DELTA_WRITE_DIR (writable). Local FS, no service dependency.
+# group: [fabricator]
+
+require fabricator
+
+# §8 attaches a native_read/native_write catalog, whose CTAS writes and whose scan reads go through
+# read_parquet / COPY (FORMAT parquet). Declared at the TOP like every other suite that needs it — a `require`
+# further down is not the proven placement, and an undeclared dependency passes on a developer box (parquet is
+# statically linked into the test binaries) while failing on a bare runner.
+require parquet
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+# A plain codec catalog: native_read OFF, which is the default and the path that never pinned in autocommit.
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/apin' AS lake (TYPE fabricator, PROVIDER 'delta', READ_ONLY false);
+
+# One table per case, so each case's pin lines can be counted independently (duckdb_logs accumulates for the
+# whole session, and every autocommit statement is its own transaction => its own pin).
+statement ok
+CREATE TABLE lake.main.one AS SELECT i AS id, i * 2 AS v FROM range(6) tbl(i);
+
+statement ok
+CREATE TABLE lake.main.selfj AS SELECT i AS id, i * 2 AS v FROM range(6) tbl(i);
+
+statement ok
+CREATE TABLE lake.main.three AS SELECT i AS id, i * 2 AS v FROM range(6) tbl(i);
+
+statement ok
+CREATE TABLE lake.main.unio AS SELECT i AS id, i * 2 AS v FROM range(6) tbl(i);
+
+statement ok
+CREATE TABLE lake.main.corr AS SELECT i AS id, i * 2 AS v FROM range(6) tbl(i);
+
+statement ok
+CREATE TABLE lake.main.instgt AS SELECT i AS id, i * 2 AS v FROM range(6) tbl(i);
+
+statement ok
+CALL enable_logging(level := 'debug', storage := 'memory');
+
+# ---------------------------------------------------------------------------------------------------------
+# 1. A single reference still pins exactly once (the baseline: seeding happens, and only once even though the
+#    statement makes TWO ScanCodec calls -- the bind-time schema probe and the execution).
+# ---------------------------------------------------------------------------------------------------------
+query I
+SELECT sum(v) FROM lake.main.one;
+----
+30
+
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'Fabricator.Delta' AND message LIKE 'delta codec pin %/one -> v%';
+----
+1
+
+# ---------------------------------------------------------------------------------------------------------
+# 2. THE CASE THAT MOTIVATES THIS: a SELF-JOIN names the table twice (4 ScanCodec calls) and must pin ONCE,
+#    i.e. both sides read the same version. Unfixed this count is 0; seeded-but-not-shared it is 4.
+# ---------------------------------------------------------------------------------------------------------
+query I
+SELECT sum(a.v) FROM lake.main.selfj a JOIN lake.main.selfj b ON a.id = b.id;
+----
+30
+
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'Fabricator.Delta' AND message LIKE 'delta codec pin %/selfj -> v%';
+----
+1
+
+# ---------------------------------------------------------------------------------------------------------
+# 3. Three references, still one pin -- the property is per (transaction, table), not per reference.
+# ---------------------------------------------------------------------------------------------------------
+query I
+SELECT sum(a.v) FROM lake.main.three a
+  JOIN lake.main.three b ON a.id = b.id
+  JOIN lake.main.three c ON a.id = c.id;
+----
+30
+
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'Fabricator.Delta' AND message LIKE 'delta codec pin %/three -> v%';
+----
+1
+
+# ---------------------------------------------------------------------------------------------------------
+# 4. UNION ALL of the same table -- the same hazard without a join.
+# ---------------------------------------------------------------------------------------------------------
+query I
+SELECT sum(v) FROM (SELECT v FROM lake.main.unio UNION ALL SELECT v FROM lake.main.unio) u;
+----
+60
+
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'Fabricator.Delta' AND message LIKE 'delta codec pin %/unio -> v%';
+----
+1
+
+# ---------------------------------------------------------------------------------------------------------
+# 5. A correlated subquery re-scanning the same table.
+# ---------------------------------------------------------------------------------------------------------
+# v is 0,2,4,6,8,10; the min over the OTHER rows is 0 for every row except id=0 (whose min is 2), so all but
+# the first row qualify.
+query I
+SELECT count(*) FROM lake.main.corr a
+WHERE a.v > (SELECT min(b.v) FROM lake.main.corr b WHERE b.id <> a.id);
+----
+5
+
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'Fabricator.Delta' AND message LIKE 'delta codec pin %/corr -> v%';
+----
+1
+
+# ---------------------------------------------------------------------------------------------------------
+# 6. INSERT INTO t SELECT ... FROM t JOIN t -- the write form of the same hazard: the two read references must
+#    agree, and the pin must not disturb the write (the rows land, and a re-read sees them).
+# ---------------------------------------------------------------------------------------------------------
+statement ok
+INSERT INTO lake.main.instgt SELECT a.id + 100, a.v FROM lake.main.instgt a JOIN lake.main.instgt b ON a.id = b.id;
+
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'Fabricator.Delta' AND message LIKE 'delta codec pin %/instgt -> v%';
+----
+1
+
+query II
+SELECT count(*), sum(v) FROM lake.main.instgt;
+----
+12	60
+
+# The next statement is a new transaction, so it pins afresh AND sees the inserted rows (the pin must not
+# make a later statement read stale data).
+query I
+SELECT count(*) FROM lake.main.instgt WHERE id >= 100;
+----
+6
+
+# ---------------------------------------------------------------------------------------------------------
+# 7. The pin does not change what a statement READS: DML and a following read still compose normally, and an
+#    explicit AT overrides the pin (committed history, not the transaction's cut).
+# ---------------------------------------------------------------------------------------------------------
+statement ok
+DELETE FROM lake.main.one WHERE id < 2;
+
+query II
+SELECT count(*), sum(v) FROM lake.main.one;
+----
+4	28
+
+# v0 is the CTAS's CREATE commit (empty) and v1 its data write, so v1 is the pre-DELETE state: AT reads
+# committed history and is not redirected to the transaction's pinned cut.
+query I
+SELECT count(*) FROM lake.main.one AT (VERSION => 1);
+----
+6
+
+query I
+SELECT count(*) FROM lake.main.one AT (VERSION => 0);
+----
+0
+
+# ---------------------------------------------------------------------------------------------------------
+# 8. native_read is UNTOUCHED: it already pinned in autocommit through ResolveVersionAsOf, so it must emit NO
+#    "delta codec pin" lines (that message is the codec path's, and a native catalog never reaches it).
+# ---------------------------------------------------------------------------------------------------------
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/apin_native' AS nlake
+  (TYPE fabricator, PROVIDER 'delta', READ_ONLY false, native_read true, native_write true);
+
+statement ok
+CREATE TABLE nlake.main.nat AS SELECT i AS id, i * 2 AS v FROM range(6) tbl(i);
+
+query I
+SELECT sum(a.v) FROM nlake.main.nat a JOIN nlake.main.nat b ON a.id = b.id;
+----
+30
+
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'Fabricator.Delta' AND message LIKE 'delta codec pin %/nat -> v%';
+----
+0
+
+statement ok
+DETACH nlake;
+
+statement ok
+DETACH lake;

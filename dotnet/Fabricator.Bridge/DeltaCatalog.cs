@@ -1168,8 +1168,15 @@ public sealed class DeltaCatalog : IBackendCatalog
         // NOT visible mid-transaction; autocommit statements keep reading latest (a single codec statement
         // is one snapshot anyway). The buffer pin (DML/ALTER) has priority — same source, same value.
         long? pinnedRead = pendingScan?.PinnedVersion;
-        if (pinnedRead is null && scanTxn != 0 && _txnBuffer.IsExplicit(scanTxn))
+        if (pinnedRead is null && scanTxn != 0)
         {
+            // Deliberately NOT gated on IsExplicit: this only READS an existing pin, and in AUTOCOMMIT the
+            // pin is now seeded by the first codec scan's own schema open (ScanCodec) — so a SECOND reference
+            // to the same table in ONE statement (self-join, t UNION ALL t, a correlated re-scan,
+            // INSERT INTO t … FROM t JOIN t) reads the version the first one read instead of opening at
+            // latest independently and possibly straddling a concurrent commit. Reading the pin BEFORE the
+            // schema fetch matters: it makes the schema and the data come from the same version, which
+            // seeding alone would not guarantee if a concurrent ALTER landed in between.
             pinnedRead = SnapshotPinning.TryGetPinned(scanTxn, path);
         }
         string? pinnedReadValue = pinnedRead?.ToString(System.Globalization.CultureInfo.InvariantCulture);
@@ -1199,10 +1206,40 @@ public sealed class DeltaCatalog : IBackendCatalog
         // Pending buffered ALTER: advertise the PENDING schema. The engineered-wood read below knows only
         // the COMMITTED columns, so pending-only names are stripped from its projection and each batch is
         // RECONCILED to the advertised shape afterwards (added columns backfilled as typed NULLs).
-        var userSchema = pending?.PendingArrowSchema
-            ?? (pinnedReadValue is null
-                ? DeltaReader.GetSchema(opener, path)
-                : DeltaReader.GetSchemaAt(opener, path, "version", pinnedReadValue));
+        Schema userSchema;
+        if (pending?.PendingArrowSchema is { } pendingSchema)
+        {
+            userSchema = pendingSchema;
+        }
+        else if (pinnedReadValue is null)
+        {
+            // ZERO-IO SNAPSHOT PIN. This open reads the latest version anyway, so recording which version it
+            // saw costs nothing and every LATER reference to this table in the same statement/transaction then
+            // reads AT it (ScanTable consults the pin before calling us). Without it each reference opened at
+            // latest independently, so two references in ONE autocommit statement could straddle a concurrent
+            // commit — the codec path never pinned in autocommit because the pin was written inside the
+            // explicit-only read-set block (see docs + CLAUDE.md). Seeding from THIS open rather than from
+            // ResolveVersionAsOf is what keeps it free; that helper would open the log again.
+            // The explicit-transaction pin is instant-resolved (so a multi-table query gets ONE cut) and is
+            // already set by the time we are called — PinVersion's GetOrAdd therefore never overwrites it,
+            // and a concurrent seeder wins the race harmlessly (we then read at ITS version).
+            userSchema = DeltaReader.GetSchemaAndVersion(opener, path, out long latest);
+            long pinTxn = AmbientTransaction.Current;
+            if (pinTxn != 0)
+            {
+                pinnedReadValue = SnapshotPinning
+                    .PinVersion(pinTxn, path, _ => latest, System.DateTime.UtcNow)
+                    .ToString(System.Globalization.CultureInfo.InvariantCulture);
+                // Logged because this branch runs at most ONCE per (txn, table) — ScanTable consults the pin
+                // before calling us — so the line count IS the sharing assertion: one line however many times
+                // the statement references the table (verify_delta_autocommit_pin).
+                _log.LogDebug("delta codec pin {Path} -> v{Version}", path, pinnedReadValue);
+            }
+        }
+        else
+        {
+            userSchema = DeltaReader.GetSchemaAt(opener, path, "version", pinnedReadValue);
+        }
         var (projCols, projected) = ProjectFor(userSchema, spec);
         bool reconcile = pending?.PendingMetadata is not null;
         var renameRev = reconcile ? CommittedToPending(pending!) : null;

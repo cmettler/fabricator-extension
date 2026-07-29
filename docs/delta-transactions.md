@@ -79,9 +79,24 @@ because catalogs are touched lazily.
   §6).
 
 ### Autocommit
-- **Codec path:** a single statement is one snapshot by construction (one open of the table).
+- **Codec path:** the statement's FIRST scan pins the version it opened at, and every later reference
+  to that table in the same statement reads AT it. The pin is seeded from that scan's own schema open
+  (`GetSchemaAndVersion`), so it costs no extra `_delta_log` read; `ScanTable` then consults it before
+  fetching the schema, so schema and data come from one version even if a concurrent ALTER lands.
+  ⚠ **This was NOT true before 2026-07-29** — the pin was consulted only inside an explicit
+  transaction, because it had been written inside the explicit-only read-set block below (a gate that
+  exists for the buffered-DML *write* capability boundary and has nothing to do with reads). The
+  earlier claim here, "a single statement is one snapshot by construction (one open of the table)",
+  was false in both halves: a statement opens the table **twice per reference** (a bind-time schema
+  probe + the execution; measured), each at latest, so a statement naming one table more than once —
+  a self-join, `t UNION ALL t`, a correlated re-scan, `INSERT INTO t … FROM t JOIN t` — could read
+  two different versions if a writer committed in between. Pinned by
+  `verify_delta_autocommit_pin`, whose assertion is that exactly ONE pin is established per
+  (statement, table) however many times the statement names it.
 - **Native path:** `SnapshotPinning` fires per statement, giving a consistent cross-table cut for
-  multi-table joins within the statement.
+  multi-table joins within the statement. Unchanged — it always pinned in autocommit, resolving the
+  transaction's instant through `ResolveVersionAsOf` (which costs its own open; the codec seeding
+  above deliberately avoids that helper).
 
 ### Read-set tracking (feeds conflict detection, §6)
 In explicit transactions, `ScanTable` records each scan's **pushed predicate** (the built EW
@@ -326,7 +341,9 @@ invisible mid-transaction. **Classic Databricks/Spark: there is no multi-stateme
 all** — each SELECT is its own query with its own snapshot, so the second SELECT returns 101 under
 BOTH of their isolation levels (those govern write conflicts, not cross-query read stability; their
 multi-statement-transactions preview via UC coordinated commits is the exception). Same caveat for
-us in autocommit: without BEGIN we also re-resolve per statement (deliberate Spark parity).
+us in autocommit: without BEGIN we also re-resolve per statement (deliberate Spark parity) — but
+WITHIN one autocommit statement every reference to a table reads one version (§3), which is the
+guarantee a self-join needs and which Spark also gives per query.
 
 ### 10.2 Atomic multi-statement write + ROLLBACK — WE ARE STRONGER
 

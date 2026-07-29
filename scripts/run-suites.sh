@@ -39,8 +39,12 @@ case "$TIER" in
     hermetic)
         SELECT_CMD=scripts/list-hermetic-suites.sh
         # Floors measured 2026-07-25: 53 suites / 4152 assertions, all green.
-        : "${MIN_SUITES:=53}"
-        : "${MIN_ASSERTIONS:=4152}"
+        # 54 / 4199 since 2026-07-29: verify_delta_autocommit_pin (34) pins that an autocommit CODEC statement
+        # establishes ONE snapshot pin per (statement, table) however many times it names the table. Raised in
+        # the same commit, per the error text below. Note 4165 - 4152 = 13 of the gap predates this: the floor
+        # had not been raised for verify_delta_catalog_variant's +13 (the CAST(NULL AS VARIANT) backfill fix).
+        : "${MIN_SUITES:=54}"
+        : "${MIN_ASSERTIONS:=4199}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

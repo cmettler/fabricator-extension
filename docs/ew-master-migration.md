@@ -350,7 +350,33 @@ hold up a correctness fix). Two remain, and the first needs SCOPING before it is
    with one file the ordinal is always 0, so a single-file fixture cannot fail these tests. And the intended
    ordinal in the wrong-row test must be **1, not 2**: removing ordinal 0 shifts old ordinal 2 INTO slot 1,
    so aiming at 2 goes out of range while aiming at 1 hits the wrong file.
-3. **`UpdateBySelectionViaVectorsAsync` — SCOPED, and deliberately SEQUENCED AFTER #14's verdict.** ~184 lines
+3. **`UpdateBySelectionViaVectorsAsync` — BUILT AND HELD (2026-07-29): `offer/mor-update` @ `ae17594`, one
+   commit on top of `offer/file-row-selection`, NOT PUSHED.** Waiting on #14's verdict is about the KEY, not
+   about having the work ready — so it is built, gated and parked; pushing it is one command whenever he
+   rules. Gates: `MergeOnReadUpdateTests` (6) green on **net10.0, net8.0 AND net472**, Table.Tests **646** on
+   all three (upstream's own + #14's 6 + these 6), build 0 warnings, and **mutation-tested** — passing
+   `materializedRowIds: null` kills exactly `PreservesTheStableRowId` and no other test, so the capability
+   claim is load-bearing and isolated. Diff vs master: **+907/−25** across 4 files, of which #14 is
+   +250/−19; this commit alone is **+555/−6**.
+   **THREE findings from actually porting it, none of them in the scope note:**
+   - **The tests could NOT be ported.** Ours read through `ReadMetaAsync` → `ReadAllWithMetadataAsync`, which
+     is offer #7 and not on this branch. Rebuilt on upstream's OWN surfaces instead —
+     `ReadAllWithRowIdsAsync` + `PlanFiles` for the locator (`_ew_row_address` → ordinal → path) and
+     `ReadAllWithRowTrackingAsync` for identity — which is better for the offer anyway: it demonstrates the
+     feature against his API, not ours.
+   - **It needed ONE MORE re-key than the note said**, and this is the load-bearing discovery: our tree's
+     `ComputeDeletionVectorActionsAsync` is selection-keyed, but #14 deliberately left it ordinal-keyed
+     (#14 converts only the DELETE). A path-keyed UPDATE that converted its selection BACK to ordinals to
+     compute its mask would defeat its own argument, so the offer adds a `FileRowSelection` overload. Kept
+     strictly additive: upstream's body became a shared `ComputeDvActionsForFilesAsync` (everything after a
+     file is identified is independent of how it was named), the ordinal-keyed public signature and its
+     documented skip-out-of-range leniency are untouched, `DeltaTransaction` is untouched, and upstream's
+     **11 ordinal call sites** cover the old form unchanged.
+   - **One public API DROPPED from the offer:** our `WriteChangeDataFilesAsync` (public, partition-aware) was
+     verified BEHAVIOURALLY IDENTICAL to upstream's internal `WriteChangeDataFilesForAsync` — independent
+     convergence, like the `configuration` parameter — so the CDF capture calls HIS. His shape is better here
+     too: it takes the snapshot explicitly, which this path already holds.
+   **Historical scope note (what was expected before building):** ~184 lines
    (two overloads + core) and it TAKES a `FileRowSelection`, so its branch must stack on #14 rather than cut
    from master. That is the real reason to wait rather than a context one: **#14 asks him to accept that key,
    and building a new OPERATION on a key he has not judged means rebuilding it if he prefers a different

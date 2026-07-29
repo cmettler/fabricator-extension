@@ -553,6 +553,32 @@ internal static class DeltaReader
         }
     }
 
+    /// <summary>Like <see cref="GetSchema"/> but also reports the VERSION it read (the latest at this moment) —
+    /// from the SAME table open, so a scan can pin that version for every later reference to the table in the
+    /// same statement at <b>zero extra IO</b> (the alternative, <see cref="ResolveVersionAsOf"/>, costs its own
+    /// <c>_delta_log</c> open). Same reasoning as <see cref="GetSchemaAndRowTracking"/>: the value is already in
+    /// hand, so asking for it separately would be a second read of the log we just replayed.</summary>
+    public static Schema GetSchemaAndVersion(nint opener, string path, out long version)
+    {
+        var (schema, v) = GetSchemaAndVersionAsync(opener, path).GetAwaiter().GetResult();
+        version = v;
+        return schema;
+    }
+
+    private static async Task<(Schema Schema, long Version)> GetSchemaAndVersionAsync(nint opener, string path)
+    {
+        var fs = TableFileSystems.Create(opener, path);
+        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options()).ConfigureAwait(false);
+        try
+        {
+            return (VariantMarker.ToTransportSchema(table.ArrowSchema), table.CurrentSnapshot.Version);
+        }
+        finally
+        {
+            await table.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
     /// <summary>
     /// Streams the Delta table at <paramref name="path"/> lazily (one <see cref="RecordBatch"/> at a time, no
     /// materialization). <paramref name="columns"/> (null =&gt; all) is the projection — engineered-wood reads

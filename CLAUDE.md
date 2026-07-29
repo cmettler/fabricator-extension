@@ -1034,7 +1034,25 @@ show up under its own path). Probe reverted after measuring. Each open costs a `
 reads and the replay CPU, so on OneLake/S3 the repeated listing dominates. **Only the resolved VERSION is
 shared** (`SnapshotPinning` caches a `long` per (txn, table), never a `DeltaTable`).
 
-⚠ **A CONSISTENCY GAP found by the same measurement, autocommit + codec only.** The version pin is consulted
+**A CONSISTENCY GAP found by the same measurement — FIXED the same day (2026-07-29, C#-only, no ABI); the
+diagnosis is kept because it explains the shape.** Fix: the codec path's schema fetch already opens the table
+at latest, so `DeltaReader.GetSchemaAndVersion` (new; mirrors the existing `GetSchemaAndRowTracking`
+same-open pattern) reports the version it saw and `ScanCodec` seeds `SnapshotPinning` with it — **zero extra
+IO**, deliberately NOT via `ResolveVersionAsOf`, which would open the log again. `ScanTable`'s pin READ lost
+its `IsExplicit` gate so later references consume the seed; reading the pin BEFORE the schema fetch is
+load-bearing (it makes schema and data come from one version, which seeding alone would not guarantee if a
+concurrent ALTER landed). The explicit-transaction pin is instant-resolved and untouched — `PinVersion`'s
+`GetOrAdd` never overwrites it. **`verify_delta_autocommit_pin` (34)**: the seeding branch runs at most ONCE
+per (txn, table), so the "delta codec pin" log-line COUNT *is* the sharing property — exactly one however
+many times the statement names the table (self-join, three-way, `UNION ALL`, correlated re-scan,
+`INSERT INTO t … FROM t JOIN t`), plus a native_read catalog emitting none. **MUTATION-TESTED**: restoring
+the `IsExplicit` gate makes a SINGLE-reference statement log **2** (bind probe + execution each seeding
+independently) and the suite fails — so the assertion distinguishes all three states (0 = never pinned,
+2-per-reference = seeded but not shared, 1 = correct). Deliberately NOT attempted: an end-to-end racer for
+the interleaving itself — a concurrent commit cannot be scheduled BETWEEN two scans of one statement from
+sqllogictest, so it would be flaky rather than load-bearing; that reading AT a pinned version yields that
+version's data is already covered by the explicit-txn snapshot sections. **The diagnosis, for the record:**
+The version pin was consulted
 on the codec read path ONLY when `_txnBuffer.IsExplicit(scanTxn)` (`DeltaCatalog.cs` ~1171), so in AUTOCOMMIT
 `pinnedReadValue` is null and **each scan opens at LATEST independently** — the +1 pin open appears in the
 table above only for the `BEGIN` row, which is the empirical proof. Two references to one table can therefore
@@ -1053,12 +1071,10 @@ Routing autocommit through the buffer would therefore have BROKEN working capabi
 optimization (in autocommit one statement is one commit either way, so there is nothing to win). **That
 reasoning is entirely about WRITES.** The codec READ pin was later written INSIDE that pre-existing
 explicit-only block (`20ec7d5`, "snapshot reads by default") and none of it applies to a read: the block is
-correctly explicit-only because read predicates feed a COMMIT-time conflict check, but the PIN rode along.
-**Fix sketch, and it need not cost an open:** the first codec scan already opens the table at latest, so
-recording its `CurrentSnapshot.Version` into `SnapshotPinning` closes the gap with ZERO extra IO (later
-references then read `AT` that version); dropping the `IsExplicit` gate instead would add a
-`ResolveVersionAsOf` open per statement — the opposite of the item above. Needs a version-out threaded from
-the stream helper. NOT built; no suite covers the interleaving, so a two-connection racer would be the gate.
+correctly explicit-only because read predicates feed a COMMIT-time conflict check, but the PIN rode along. ⚠ Note what
+this means for any future "simplification": **dropping the `IsExplicit` gate from the DML side would be a
+capability regression** (autocommit DELETE on a `deletion_vectors false` table would lose copy-on-write), which
+is why the fix seeds the pin instead of touching that gate — only the pin's READ was ungated.
 
 **Still hand-rolled, by upstream's own constraint** ("append-shaped only: the overwrite family removes the
 active set, which is exactly what a rebase cannot re-derive"): `FlushCreateTransaction`, CREATE OR REPLACE,
