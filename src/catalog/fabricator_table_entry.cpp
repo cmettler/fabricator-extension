@@ -10,6 +10,8 @@
 #include "catalog/fabricator_metadata.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/common/column_index.hpp"
+#include "duckdb/common/serializer/deserializer.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/planner/tableref/bound_at_clause.hpp"
@@ -659,6 +661,91 @@ static vector<column_t> FabricatorScanRowIdColumns(ClientContext &context, optio
 	return result;
 }
 
+// Plan serialization for the catalog scan. REQUIRED FOR CORRECTNESS, not for persistence: DuckDB's
+// common-subplan optimizer (1.5.4+) deduplicates subplans by SERIALIZING each operator and hashing the
+// bytes, and `FunctionSerializer::Serialize` writes only the function name/arguments unless BOTH
+// callbacks are set — it does not throw, so a callback-less scan silently participates in dedup with a
+// signature that contains no table identity. `LogicalGet::Serialize` does write returned_types/names/
+// filters, and the optimizer canonicalizes table_index to 0 before hashing, so two scans of DIFFERENT
+// tables that happen to share a schema hashed IDENTICALLY: one was materialized as a CTE and both
+// consumers read the first table's rows. Silently wrong results, no error. `Equals` on the bind data was
+// always correct and never consulted — the optimizer compares bytes.
+//
+// So everything that makes two scans of ours semantically different has to appear here: the table
+// identity AND the pushed spec (a superset-safe WHERE, TOP n, ORDER BY, the time-travel AT clause),
+// since two scans of the same table with different pushdown must not collapse either. Scans that ARE
+// identical still dedup, which for a remote provider is a real win — one round trip, two consumers.
+static void FabricatorScanSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data_p,
+                                    const TableFunction &function) {
+	auto &bind_data = bind_data_p->Cast<fabricator::ArrowStreamBindData>();
+	if (!bind_data.table) {
+		// Only the catalog scan installs these callbacks, and it always has a backing entry. A raw
+		// table function reaching here would serialize to a table-less signature, which is the very
+		// collision this exists to prevent — so refuse instead. The optimizer catches the throw and
+		// leaves the operator out of dedup, which is the safe outcome.
+		throw SerializationException("fabricator_scan: cannot serialize a scan with no catalog table");
+	}
+	serializer.WriteProperty(100, "catalog", bind_data.table->schema.catalog.GetName());
+	serializer.WriteProperty(101, "schema", bind_data.table->schema.name);
+	serializer.WriteProperty(102, "table", bind_data.table->name);
+	// The pushed spec. `filter_json` references its constants by index, so both halves are needed for
+	// two differently-filtered scans of one table to differ.
+	serializer.WriteProperty(103, "filter_json", bind_data.filter_json);
+	serializer.WriteProperty(104, "filter_constants", bind_data.filter_constants);
+	serializer.WriteProperty(105, "native_filter_sql", bind_data.native_filter_sql);
+	serializer.WriteProperty(106, "top_n", bind_data.top_n);
+	serializer.WriteProperty(107, "order_by_json", bind_data.order_by_json);
+	serializer.WriteProperty(108, "at_unit", bind_data.at_unit);
+	serializer.WriteProperty(109, "at_value", bind_data.at_value);
+}
+
+// Rebuilds through the LIVE catalog entry rather than from serialized copies, so the schema, rowid
+// metadata and the stream factory (which captures the provider handle) all come from the catalog as
+// they would on a fresh bind — the same reason DuckDB's own TableScanDeserialize re-looks-up the entry.
+// Only the pushed spec is restored from the payload.
+//
+// NOTE this is currently UNREACHABLE, and it must still exist. `FunctionSerializer::Serialize` only
+// emits the bind data when `HasSerializationCallbacks()` holds, which requires BOTH callbacks — so
+// without this function the serialize half above would never run and the dedup collision would return.
+// But a full plan deserialization cannot reach it either: `LogicalGet::Deserialize` calls
+// `FunctionSerializer::DeserializeBase` UNCONDITIONALLY (before it looks at has_serialize), and that
+// resolves the function BY NAME against TABLE_FUNCTION_ENTRY. The catalog scan is not a registered
+// catalog function — it is handed out by GetScanFunction — so the lookup fails with "Failed to find
+// function fabricator_scan()". `PRAGMA verify_serializer` therefore does not work on a fabricator
+// catalog scan; that predates this change (DeserializeBase ran the same way when has_serialize was
+// false) and is unrelated to it. Making it work would mean registering a zero-arg `fabricator_scan`
+// catalog function, which would also make it user-callable — not done. Kept correct-if-reached so that
+// whenever that lookup does resolve, this rebuilds a working scan rather than a half-initialized one.
+static unique_ptr<FunctionData> FabricatorScanDeserialize(Deserializer &deserializer, TableFunction &function) {
+	auto catalog = deserializer.ReadProperty<string>(100, "catalog");
+	auto schema = deserializer.ReadProperty<string>(101, "schema");
+	auto table = deserializer.ReadProperty<string>(102, "table");
+
+	auto &context = deserializer.Get<ClientContext &>();
+	auto &catalog_entry = Catalog::GetEntry<TableCatalogEntry>(context, catalog, schema, table);
+	if (catalog_entry.type != CatalogType::TABLE_ENTRY) {
+		throw SerializationException("fabricator_scan: cannot find table for %s.%s", schema, table);
+	}
+	auto *fabricator_entry = dynamic_cast<FabricatorTableEntry *>(&catalog_entry);
+	if (!fabricator_entry) {
+		// Guard the cast: the name resolved to a table in some OTHER catalog type.
+		throw SerializationException("fabricator_scan: %s.%s is not a fabricator table", schema, table);
+	}
+
+	unique_ptr<FunctionData> bind_data;
+	function = fabricator_entry->GetScanFunction(context, bind_data);
+	auto &data = bind_data->Cast<fabricator::ArrowStreamBindData>();
+
+	deserializer.ReadProperty(103, "filter_json", data.filter_json);
+	deserializer.ReadProperty(104, "filter_constants", data.filter_constants);
+	deserializer.ReadProperty(105, "native_filter_sql", data.native_filter_sql);
+	deserializer.ReadProperty(106, "top_n", data.top_n);
+	deserializer.ReadProperty(107, "order_by_json", data.order_by_json);
+	deserializer.ReadProperty(108, "at_unit", data.at_unit);
+	deserializer.ReadProperty(109, "at_value", data.at_value);
+	return bind_data;
+}
+
 TableFunction FabricatorTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) {
 	return BuildScanFunction(context, bind_data, nullptr);
 }
@@ -738,6 +825,11 @@ TableFunction FabricatorTableEntry::BuildScanFunction(ClientContext &context, un
 
 	TableFunction function("fabricator_scan", {}, fabricator::ArrowStreamScan, nullptr, fabricator::ArrowStreamInitGlobal,
 	                       fabricator::ArrowStreamInitLocal);
+	// Both are required, and both must be set for EITHER to be used (FunctionSerializer keys off
+	// HasSerializationCallbacks()). Without them the common-subplan optimizer conflates two scans of
+	// different same-shaped tables — see FabricatorScanSerialize for the full mechanism.
+	function.serialize = FabricatorScanSerialize;
+	function.deserialize = FabricatorScanDeserialize;
 	function.projection_pushdown = true;
 	// Best-effort filter pushdown: the callback serializes superset-safe predicates
 	// and leaves them in place, so DuckDB still applies every filter (correctness).

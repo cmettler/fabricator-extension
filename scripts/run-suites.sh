@@ -56,8 +56,11 @@ case "$TIER" in
         # (10 -> 27) becoming the pin that each PROVIDER spelling selects its documented engine.
         # NOTE the floor is on RUNS, not distinct suites: 54 suites, 58 runs. A suite dropping out of the
         # tier still trips it, which is what the floor is for.
-        : "${MIN_SUITES:=58}"
-        : "${MIN_ASSERTIONS:=5290}"
+        # 59 runs / 5326 since 2026-07-29: verify_delta_subplan_dedup (36) pins that the catalog scan
+        # SERIALIZES its table identity, so DuckDB's common-subplan optimizer cannot conflate two scans of
+        # different same-shaped tables and silently return one table's rows for both.
+        : "${MIN_SUITES:=59}"
+        : "${MIN_ASSERTIONS:=5326}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

@@ -246,6 +246,37 @@ current code still uses the single-provider `fabricator` naming):
 ## Next up (open threads for future sessions)
 
 In-flight / planned refactors (all C#-only unless noted; tests stay green per slice):
+- **THE CATALOG SCAN MUST SERIALIZE ITS TABLE IDENTITY — FIXED (2026-07-29, silent wrong results).**
+  A table function that sets neither `serialize` nor `deserialize` still takes part in DuckDB's
+  **common-subplan optimizer** (1.5.4+), which dedups subplans by SERIALIZING each operator and hashing
+  the bytes. `FunctionSerializer::Serialize` writes only name+arguments in that case and **does not
+  throw**, so `fabricator_scan`'s signature carried NO table identity — ours lives in
+  `ArrowStreamBindData`. `LogicalGet::Serialize` does contribute returned_types/names/filters, and
+  `common_subplan_optimizer.cpp:120` canonicalizes `table_index` to 0 before hashing ⇒ **two scans of
+  DIFFERENT tables that share a schema hashed IDENTICALLY**, one was materialized as a CTE, and both
+  consumers read the FIRST table's rows. `ArrowStreamBindData::Equals` was correct all along and is
+  never consulted — the optimizer compares BYTES, not `FunctionData::Equals`. That is the whole trap.
+  - Found by reading **hugr-lab/mssql-extension#211** (same defect, same fix) and checking whether we
+    had it. We did, on **every provider** — one `FabricatorTableEntry` / one `fabricator_scan` serves
+    SQL Server, Delta and DAX; reproduced on the first two, and DAX reaches the identical path via
+    `DaxCatalog.ScanTable`. DAX was arguably the most exposed in practice: it is read-only and the
+    failing shapes are pure read shapes (a measure over table A vs table B).
+  - **Affected shapes** (all silent): identical aggregate subplans over two same-schema tables — a
+    `UNION ALL` of aggregates, or two scalar subqueries. **Unaffected:** joins / EXCEPT / INTERSECT /
+    plain unions of rows (bare gets are not materialized), differing column names or types (they ARE in
+    the signature), same-table-different-filter (the differing `Filter` child changes the subplan
+    signature — safe by plan shape, not by design), and every global/discovered function (their args
+    ride in `parameters`, which IS serialized).
+  - **Fix**: `FabricatorScanSerialize` writes catalog/schema/table **plus the pushed spec**
+    (`filter_json`+constants, `native_filter_sql`, `top_n`, `order_by_json`, `at_unit`/`at_value`) so
+    two differently-pushed scans of ONE table cannot collapse either; identical scans still dedup, which
+    for a remote provider is a real win. Gate `verify_delta_subplan_dedup` (36), mutation-tested.
+  - **`PRAGMA verify_serializer` does NOT work on a fabricator catalog scan, and never did.**
+    `LogicalGet::Deserialize` calls `FunctionSerializer::DeserializeBase` UNCONDITIONALLY (before it
+    checks has_serialize), resolving the function BY NAME against `TABLE_FUNCTION_ENTRY`; the catalog
+    scan is handed out by `GetScanFunction` and is not a registered catalog function ⇒ "Failed to find
+    function fabricator_scan()". So `FabricatorScanDeserialize` is UNREACHABLE — and must still exist,
+    because `Serialize` only emits bind data when BOTH callbacks are set. Do not "clean it up".
 - **THE DELTA NATIVE DEFAULTS FLIP — DONE (2026-07-29, behaviour-breaking for `PROVIDER 'delta'`).**
   `native_read`/`native_write` used to default **off** everywhere, so the production path was opt-in and
   the *tested* path was the pure-EW codec. Now **the provider NAME selects a default profile**

@@ -1,12 +1,12 @@
 # Tier 1: build the extension and run every suite that needs no external service.
 #
-# This is where the coverage is — 54 suites in 58 RUNS / 5290 assertions (measured 2026-07-29), the
+# This is where the coverage is — 55 suites in 59 RUNS / 5326 assertions (measured 2026-07-29), the
 # Delta catalog work: transactions (943), row tracking (299), column mapping (251), variant (157),
 # native write (147), clustered optimize (147), row-level concurrency (70)... None of it needs SQL
 # Server, MinIO, Power BI Desktop or live Fabric credentials, only a writable directory and the
 # fixtures committed to this repo.
 #
-# 58 runs from 54 suites because four of them — write / transactions / update / delete — run ONCE PER
+# 59 runs from 55 suites because four of them — write / transactions / update / delete — run ONCE PER
 # DELTA ENGINE. Since the provider NAME picks a default engine ('delta' = DuckDB moves the parquet
 # bytes, 'engineeredwooddelta' = engineered-wood's codec does), those four interpolate
 # ${DELTA_PROVIDER} and must come out identical either way; run-suites.sh drives both legs.

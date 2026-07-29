@@ -1,0 +1,140 @@
+# name: test/verify_delta_subplan_dedup.test
+# description: The catalog scan must SERIALIZE its table identity, or DuckDB's common-subplan optimizer
+#              conflates two scans of different tables and returns one table's rows for both — silently,
+#              with no error. DuckDB 1.5.4+ deduplicates subplans by serializing each operator and
+#              HASHING THE BYTES; `FunctionSerializer::Serialize` writes only the function name and
+#              arguments unless a table function sets BOTH `serialize` and `deserialize`, and it does not
+#              throw, so a callback-less scan still takes part in dedup with a signature carrying no
+#              table identity at all. `LogicalGet::Serialize` does contribute returned_types/names/
+#              filters, and common_subplan_optimizer canonicalizes table_index to 0 before hashing — so
+#              two DIFFERENT tables that share a schema hashed identically, one got materialized as a
+#              CTE, and both consumers read the first table.
+#
+#              `ArrowStreamBindData::Equals` was always correct and is never consulted: the optimizer
+#              compares serialized bytes, not FunctionData::Equals. That is the whole trap.
+#
+#              Same defect and same fix as hugr-lab/mssql-extension#211. Uses the Delta provider so this
+#              stays hermetic, but the scan (`fabricator_scan`) is shared by every provider — the bug
+#              reproduced identically on SQL Server, and this suite guards that code path for all of
+#              them. Set FABRICATOR_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
+# group: [fabricator]
+
+require fabricator
+
+require parquet
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/dedup' AS lake (TYPE fabricator, PROVIDER 'delta');
+
+# Two tables with an IDENTICAL schema — column names and types both match, which is what made their
+# signatures collide. Disjoint values, so reading the wrong table is unmistakable.
+statement ok
+CREATE TABLE lake.main.t1 AS SELECT * FROM (VALUES (1),(2)) v(c);
+
+statement ok
+CREATE TABLE lake.main.t2 AS SELECT * FROM (VALUES (8),(9)) v(c);
+
+# ---- (1) UNION ALL of identical aggregate subplans — the original repro ----
+# Before the fix this returned A|1 B|1: the B branch read T1's rows.
+query TI
+SELECT 'A' AS t, min(c) AS v FROM lake.main.t1
+UNION ALL
+SELECT 'B' AS t, min(c) AS v FROM lake.main.t2
+ORDER BY t;
+----
+A	1
+B	8
+
+# max as well as min, so the assertion cannot pass by coincidence of the values chosen.
+query TI
+SELECT 'A' AS t, max(c) AS v FROM lake.main.t1
+UNION ALL
+SELECT 'B' AS t, max(c) AS v FROM lake.main.t2
+ORDER BY t;
+----
+A	2
+B	9
+
+# ---- (2) Two scalar subqueries in one SELECT — the same collision, different shape ----
+# Before the fix: 3, 3 (t2's sum reported as t1's).
+query II
+SELECT (SELECT sum(c) FROM lake.main.t1) AS s1, (SELECT sum(c) FROM lake.main.t2) AS s2;
+----
+3	17
+
+# Three tables, to catch a fix that only distinguishes the FIRST pair.
+statement ok
+CREATE TABLE lake.main.t3 AS SELECT * FROM (VALUES (100),(200)) v(c);
+
+query III
+SELECT (SELECT sum(c) FROM lake.main.t1) AS s1,
+       (SELECT sum(c) FROM lake.main.t2) AS s2,
+       (SELECT sum(c) FROM lake.main.t3) AS s3;
+----
+3	17	300
+
+# ---- (3) Legitimate dedup must SURVIVE: two IDENTICAL scans should still collapse ----
+# The fix must make different scans distinguishable WITHOUT defeating the optimization — for a remote
+# provider, collapsing two identical scans into one round trip with two consumers is a real win. This
+# asserts the results stay correct; that they share one scan is the optimizer's business, not ours.
+query II
+SELECT (SELECT sum(c) FROM lake.main.t1) AS a, (SELECT sum(c) FROM lake.main.t1) AS b;
+----
+3	3
+
+query TI
+SELECT 'A' AS t, min(c) AS v FROM lake.main.t1
+UNION ALL
+SELECT 'B' AS t, min(c) AS v FROM lake.main.t1
+ORDER BY t;
+----
+A	1
+B	1
+
+# ---- (4) Same table, DIFFERENT pushed predicates must not collapse either ----
+# The pushed WHERE lives in the bind data too (`filter_json` + its constants, `native_filter_sql`), so
+# it is serialized for exactly this reason. This shape happened to be safe before the fix — the
+# differing Filter operator above the scan changed the subplan signature — but it is only safe by
+# accident of plan shape, and the serialized spec is what makes it safe on purpose.
+statement ok
+CREATE TABLE lake.main.f AS SELECT * FROM (VALUES (1),(2),(3),(8),(9)) v(x);
+
+query TI
+SELECT 'hi' AS k, count(*) AS n FROM lake.main.f WHERE x > 7
+UNION ALL
+SELECT 'lo' AS k, count(*) AS n FROM lake.main.f WHERE x < 4
+ORDER BY k;
+----
+hi	2
+lo	3
+
+query II
+SELECT (SELECT count(*) FROM lake.main.f WHERE x > 7) AS hi,
+       (SELECT count(*) FROM lake.main.f WHERE x < 4) AS lo;
+----
+2	3
+
+# ---- (5) Same table at DIFFERENT snapshots must not collapse ----
+# `at_unit`/`at_value` are bind-time constants held in the bind data, so they are serialized alongside
+# the table identity. Two time-travel scans of one table are otherwise byte-identical.
+statement ok
+INSERT INTO lake.main.t1 VALUES (50);
+
+query II
+SELECT (SELECT sum(c) FROM lake.main.t1 AT (VERSION => 1)) AS before_insert,
+       (SELECT sum(c) FROM lake.main.t1) AS after_insert;
+----
+3	53
+
+# ---- (6) Control: differing column NAMES were never affected ----
+# Names and types ARE part of LogicalGet's signature, so these never collided. Pinned so a future
+# change to what the signature covers cannot quietly narrow the guarantee to this case only.
+statement ok
+CREATE TABLE lake.main.d1 AS SELECT * FROM (VALUES (7)) v(other_name);
+
+query II
+SELECT (SELECT sum(c) FROM lake.main.t2) AS same_shape, (SELECT sum(other_name) FROM lake.main.d1) AS different_name;
+----
+17	7
