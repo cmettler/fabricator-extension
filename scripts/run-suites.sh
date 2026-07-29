@@ -46,8 +46,10 @@ case "$TIER" in
         # 4197 since 2026-07-29: verify_delta_rename lost 2 (the redundant PROVIDER alias 'deltalake' was
         # REMOVED; its two positive assertions became one negative pin plus a no-catalog-left-behind pin).
         # A floor LOWERED for a deliberate removal, which is the one legitimate reason to lower it.
+        # 4206 since 2026-07-29: verify_delta_clustered_optimize gained 9 (§8 pins that a clustering-declared
+        # table on a catalog WITHOUT the native writer WARNS instead of silently bin-packing).
         : "${MIN_SUITES:=54}"
-        : "${MIN_ASSERTIONS:=4197}"
+        : "${MIN_ASSERTIONS:=4206}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

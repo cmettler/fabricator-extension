@@ -1468,14 +1468,37 @@ internal static class DeltaReader
             // 2+ keys (Spark's range_partition_id shape, type-agnostic), plain ORDER BY for one — and COPYs the
             // clustered file; ONE dataChange=false commit swaps the active set, tagging add.clusteringProvider.
             // DuckDB's spilling sort does the reorder, so the rewrite streams (data never crosses the C ABI).
-            var clusterCols = writer is not null ? ResolveClusteringColumns(table) : null;
-            if (clusterCols is { Count: > 0 } && ClusteredRewriteEligible(table))
+            // Resolved UNCONDITIONALLY (metadata only, no IO) so a clustering-declared table that cannot be
+            // reclustered says so. Both fallbacks below are otherwise SILENT — the user asked for clustering
+            // and got bin-packing — and that matters more now that `delta` and `engineeredwooddelta` select
+            // different writer defaults, so the writer-absent case is reachable by ATTACH spelling alone.
+            var clusterCols = ResolveClusteringColumns(table);
+            if (clusterCols is { Count: > 0 })
             {
-                long? cv = await ClusteredRewriteAsync(fs, path, table, clusterCols, full, token).ConfigureAwait(false);
-                DmlLog.LogInformation("delta optimize {Path}: {Result} clustered by [{Cols}] full={Full}", path,
-                    cv.HasValue ? $"reclustered → v{cv.Value}" : "nothing to recluster",
-                    string.Join(",", clusterCols), full);
-                return 0;
+                string cols = string.Join(",", clusterCols);
+                if (writer is null)
+                {
+                    DmlLog.LogWarning(
+                        "delta optimize {Path}: table declares clustering by [{Cols}] but the NATIVE WRITER is "
+                        + "not enabled — bin-packing instead of reclustering. The recluster is one host query "
+                        + "whose global ORDER BY relies on DuckDB's spilling sort (engineered-wood has no "
+                        + "external sort), so it REQUIRES native_write.", path, cols);
+                }
+                else if (!ClusteredRewriteEligible(table))
+                {
+                    DmlLog.LogWarning(
+                        "delta optimize {Path}: table declares clustering by [{Cols}] but its shape is not served "
+                        + "by the clustered rewrite (identity/IcebergCompat, a variant column, or nested columns "
+                        + "under column mapping) — bin-packing instead of reclustering.", path, cols);
+                }
+                else
+                {
+                    long? cv = await ClusteredRewriteAsync(fs, path, table, clusterCols, full, token)
+                        .ConfigureAwait(false);
+                    DmlLog.LogInformation("delta optimize {Path}: {Result} clustered by [{Cols}] full={Full}", path,
+                        cv.HasValue ? $"reclustered → v{cv.Value}" : "nothing to recluster", cols, full);
+                    return 0;
+                }
             }
             var v = await table.CompactAsync(null, token).ConfigureAwait(false);
             DmlLog.LogInformation("delta optimize {Path}: {Result} writer={Writer}", path,

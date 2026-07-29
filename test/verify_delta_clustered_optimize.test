@@ -645,3 +645,53 @@ WHERE content LIKE '%"clusteringProvider"%';
 
 statement ok
 DETACH lake;
+
+# ---------------------------------------------------------------------------------------------------------
+# §8. A clustering-declared table on a catalog WITHOUT the native writer bin-packs — and now SAYS SO.
+#     The recluster is one host query whose global ORDER BY relies on DuckDB's spilling sort (engineered-wood
+#     has no external sort), so it cannot be served by the codec writer. That fallback was SILENT: the user
+#     asked for clustering via SORTED BY and got bin-packing with no diagnostic. It matters more now that the
+#     PROVIDER spelling alone can decide whether the native writer is on.
+# ---------------------------------------------------------------------------------------------------------
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/clustopt_codec' AS clake (TYPE fabricator, PROVIDER 'delta');
+
+# SORTED BY persists fabricator.sortedBy (and, unpartitioned, declares the delta.clustering domain), so this
+# table DOES declare clustering even though the catalog cannot recluster it.
+statement ok
+CREATE TABLE clake.main.cw SORTED BY (grp, id) AS
+  SELECT (i % 4) AS grp, i AS id FROM range(200) tbl(i);
+
+statement ok
+INSERT INTO clake.main.cw SELECT (i % 4), i + 1000 FROM range(200) tbl(i);
+
+statement ok
+CALL enable_logging(level := 'debug', storage := 'memory');
+
+# `fabricator_exec` is a SCALAR function — `CALL` fails with "Table Function ... does not exist".
+query I
+SELECT fabricator_exec('clake', 'OPTIMIZE main.cw');
+----
+0
+
+# the warning names the declared columns AND the requirement, rather than failing silently
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE message LIKE 'delta optimize %declares clustering by [grp,id]%REQUIRES native_write%';
+----
+1
+
+# it still compacted (bin-pack), and did NOT tag the adds as clustered — the fallback is real, not cosmetic
+query I
+SELECT count(*) FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/clustopt_codec/cw/_delta_log/*.json')
+WHERE content LIKE '%"clusteringProvider"%';
+----
+0
+
+query I
+SELECT count(*) FROM clake.main.cw;
+----
+400
+
+statement ok
+DETACH clake;
