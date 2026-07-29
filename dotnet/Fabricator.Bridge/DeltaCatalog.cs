@@ -1484,6 +1484,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     private IArrowArrayStream ScanNative(nint opener, string path, ScanSpec? spec, IReadOnlyList<object?> filterVals)
     {
         string? unit = null, value = null;
+        bool seedPinFromSchemaOpen = false;
         var pendingNative = spec?.At is null ? _txnBuffer.Get(AmbientTransaction.Current, path) : null;
         if (pendingNative is { PendingCreate: true })
         {
@@ -1507,10 +1508,26 @@ public sealed class DeltaCatalog : IBackendCatalog
             long txn = AmbientTransaction.Current;
             if (txn != 0)
             {
-                long v = SnapshotPinning.PinVersion(txn, path,
-                    inst => DeltaReader.ResolveVersionAsOf(opener, path, inst, _log), System.DateTime.UtcNow);
-                unit = "version";
-                value = v.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                // An EXISTING pin (a previous reference to this table in the same statement/transaction, or
+                // the instant-resolved explicit-transaction pin) is consulted FIRST — reading it before the
+                // schema fetch below is what makes schema and data come from ONE version, which seeding
+                // alone would not guarantee if a concurrent ALTER landed in between.
+                if (SnapshotPinning.TryGetPinned(txn, path) is { } already)
+                {
+                    unit = "version";
+                    value = already.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                }
+                else
+                {
+                    // No pin yet: DEFER to the schema fetch, which opens the table at latest anyway and can
+                    // report the version it saw. Resolving here instead (ResolveVersionAsOf) costs a WHOLE
+                    // extra DeltaTable open — its own _delta_log LIST, plus a timestamp->version scan of the
+                    // commit timestamps — and that redundant open was this path's measured "+1 snapshot
+                    // construction per statement" versus the codec (docs/ew-master-migration.md §Appendix).
+                    // The listing open below already resolves a version; this makes the pin FREE, exactly as
+                    // ScanCodec's GetSchemaAndVersion seeding does.
+                    seedPinFromSchemaOpen = true;
+                }
             }
         }
         Schema userSchema;
@@ -1521,6 +1538,20 @@ public sealed class DeltaCatalog : IBackendCatalog
         else if (pendingNative?.PendingArrowSchema is { } pendingArrow)
         {
             userSchema = pendingArrow; // pending buffered ALTER wins
+        }
+        else if (seedPinFromSchemaOpen)
+        {
+            // ZERO-IO SNAPSHOT PIN (native path). Same trick, same reason as the codec path's: record the
+            // version THIS open saw so every later reference in the statement/transaction reads AT it
+            // instead of opening at latest independently and possibly straddling a concurrent commit.
+            // PinVersion's GetOrAdd never overwrites, so a concurrent seeder wins harmlessly (we then read
+            // at ITS version, which is equally consistent).
+            userSchema = DeltaReader.GetSchemaAndVersion(opener, path, out long latest);
+            long pinTxn = AmbientTransaction.Current;
+            long pinned = SnapshotPinning.PinVersion(pinTxn, path, _ => latest, System.DateTime.UtcNow);
+            unit = "version";
+            value = pinned.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            _log.LogDebug("delta native pin {Path} -> v{Version}", path, value);
         }
         else
         {
@@ -2244,6 +2275,15 @@ public sealed class DeltaCatalog : IBackendCatalog
     public void CommitTransaction()
     {
         long txnId = AmbientTransaction.Current;
+        // Release the transaction's snapshot pins FIRST, and unconditionally — a READ-ONLY transaction has
+        // no buffered tables and returns just below, yet it pinned a version for every table it scanned.
+        // Nothing called Release before this, so the ONLY reclamation was InstantFor's panic
+        // `Txns.Clear()` at 4096 entries; since one autocommit statement is one transaction id, that
+        // threshold is reached routinely and the clear wipes the pins of transactions still IN FLIGHT.
+        // An explicit transaction whose pin vanished then re-captures a NEW instant on its next scan and
+        // starts seeing a concurrent writer's commits mid-transaction — snapshot isolation silently broken.
+        // Releasing per transaction makes the panic path unreachable in normal operation.
+        SnapshotPinning.Release(txnId);
         var tables = _txnBuffer.Remove(txnId);
         if (tables is null)
         {
@@ -2307,6 +2347,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     public void RollbackTransaction()
     {
         long txnId = AmbientTransaction.Current;
+        SnapshotPinning.Release(txnId); // see CommitTransaction — unconditional, before the early return
         var tables = _txnBuffer.Remove(txnId);
         if (tables is null)
         {

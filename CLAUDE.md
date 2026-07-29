@@ -316,6 +316,65 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   item — the autocommit pin gap this measurement exposed was FIXED the same day (252c1e6,
   `verify_delta_autocommit_pin` 34; semantics in [docs/delta-transactions.md](docs/delta-transactions.md)
   §3; full measurement in [docs/ew-master-migration.md](docs/ew-master-migration.md) §Appendix).
+  - **THE `+1` IS GONE (2026-07-29, C#-only).** The measurement's "native_read costs one MORE snapshot
+    construction than the codec" was the autocommit native path resolving its pin through
+    `ResolveVersionAsOf` — a WHOLE extra `DeltaTable` open (own `_delta_log` LIST) plus a
+    timestamp→version scan of the commit timestamps. `ScanNative` now consults an existing pin FIRST and
+    otherwise defers to the schema/listing open it was already doing (`GetSchemaAndVersion`, one open,
+    replacing the `GetSchema` it would have called) — the same zero-IO trick as `ScanCodec`. Explicit
+    transactions KEEP the instant-based resolve (all tables must pin to ONE instant, and a table first
+    touched late still has to resolve that same instant). Proof it is gone is by ABSENCE: the retired
+    helper logs unconditionally in BOTH its success and catch branches, so no `delta snapshot pin … as-of`
+    line ⇒ not called. New `delta native pin` line mirrors the codec's; `verify_delta_autocommit_pin` §11
+    pins the count at 1 for a self-join (mutation: 4 without the `TryGetPinned` check).
+  - **⚠ IF YOU MEASURE THIS AGAIN, mind which engine you are on.** The same `PROVIDER 'delta'` text
+    selected the CODEC before the defaults flip and selects NATIVE after it, so a comparison spanning that
+    change silently swaps the labels. That is how "the codec did more snapshot reads" was recalled; the
+    recorded table and a re-measurement both say the opposite.
+  - **`SnapshotPinning.Release` is now WIRED (2026-07-29) — it existed and was NEVER called.** The only
+    reclamation was `InstantFor`'s panic `Txns.Clear()` at 4096 entries, and since one autocommit statement
+    is one transaction id that threshold arrives routinely — wiping the pins of transactions still IN
+    FLIGHT, after which an explicit transaction re-captures a NEW instant on its next scan and starts
+    seeing a concurrent writer's commits mid-transaction (silent snapshot-isolation violation, not
+    reproducible on demand). `DeltaCatalog.CommitTransaction`/`RollbackTransaction` now Release
+    UNCONDITIONALLY, before their `tables is null` early return — a READ-ONLY transaction is exactly the
+    one that pins and had no other exit. No ABI/C++ change: both are `TransactionManager` overrides that
+    already call into C# for every transaction, reads included.
+  - **The remaining piece — actually HOLDING a `DeltaTable` open — is unblocked but NOT built.** Its two
+    prerequisites were checked: (1) **read-your-writes is unaffected**, because it is a `DeltaTxnBuffer`
+    OVERLAY property (pending files concatenated / pending deletes excluded / pending ALTER schema
+    advertised), not a snapshot property — a table pinned at the BASE version is exactly what the overlay
+    composes against; (2) **disposal had no hook at all** until the Release wiring above, and the 4096
+    `Clear()` would have dropped cached tables UNDISPOSED. Still to do: lazy `AmbientOpener.Current` in
+    `DuckDbTableFileSystem` (value-identical today — `Opener()` already just returns the ambient — so it
+    only becomes load-bearing once a table outlives its call), invalidation on the operations that
+    deliberately BYPASS the buffer (identity creates, DROP/OPTIMIZE/VACUUM, CREATE-OR-REPLACE,
+    partition-overwrite — they advance the version under a held snapshot), and `await DisposeAsync()` at
+    the release point.
+  - **WHERE TO PUT THE CACHE — evaluated 2026-07-29, use `ClientContextState`, NOT `function_info`.**
+    The storage mechanism itself is already solved and used everywhere: `Handles.Alloc` (a **Normal**
+    `GCHandle` → opaque `nint`; NOT `Pinned` — a reference type needs no pinning and it would block heap
+    compaction) + `Handles.Resolve<T>`, with a C++ RAII holder whose destructor calls an ABI release
+    (`InOutSessionHolder`→`inout_abort`, `AggSessionHolder`→`agg_close`, the catalog handle→`close_catalog`).
+    - **`TableFunction::function_info` is the WRONG shelf for a snapshot** (considered, rejected): it is a
+      `shared_ptr<TableFunctionInfo>` copied with the function into `LogicalGet.function`, and our catalog
+      scan builds its TableFunction FRESH per bind — so the lifetime is the PLAN, and plans are cached and
+      re-executed (`SupportStatementCache()` true). A cached snapshot there would be reused by a later
+      execution IN A DIFFERENT TRANSACTION. Wrong in both directions at once: spans transactions, yet a new
+      bind gets a new one so two statements never share. It IS correct for what we already use it for —
+      the aggregates' identity + atomic counter, which are version-independent.
+    - **`context.registered_state->GetOrCreate<T>(key)` is the right one.** `ClientContextState` is
+      DuckDB's first-class extension-state home and carries the lifecycle hooks this needs:
+      `TransactionBegin` / `TransactionCommit` / `TransactionRollback(…, error)` / `QueryEnd(context,
+      error)`. Per-CONNECTION storage with a destructor. Marginal gain over the
+      `FabricatorTransactionManager::CommitTransaction/RollbackTransaction` hook already used for
+      `SnapshotPinning.Release`: cleanup even when a transaction never ends cleanly, plus `TransactionBegin`,
+      which we have no other equivalent of.
+    - **The real blocker is the OPENER, and no handle plumbing fixes it.** `DuckDbTableFileSystem` captures
+      `nint _opener` = a `ClientContext*` valid only for THAT ABI call, so a cached `DeltaTable` used later
+      dereferences a dangling pointer — a use-after-free, not a staleness bug, and this box would probably
+      not fault on it (same lesson as the macOS `ArrowProducer` release). Lifetime/disposal is resource
+      hygiene; the opener is memory safety. Do the lazy `AmbientOpener` resolution FIRST.
 - **SINGLE-FILE DISTRIBUTION — BUILT + validated live (phases 1–4 of 5; REMAINING: user-facing install
   docs + CI matrix — CI tier 3 exists).** ONE `fabricator.duckdb_extension` self-installs (extract +
   chain-load + CLR boot; ~2–3 s cold, 0.01–0.2 s warm; win 61 MB standalone / linux 40 MB standard —

@@ -212,6 +212,177 @@ WHERE type = 'Fabricator.Delta' AND message LIKE 'delta codec pin %/nat -> v%';
 ----
 0
 
+# ---------------------------------------------------------------------------------------------------------
+# 9. AT x THE SHARED PIN. Dropping the IsExplicit gate made non-AT references SHARE one version; an explicit
+#    `AT (VERSION => n)` reference must stay INDEPENDENT of that, in BOTH directions:
+#      * it must not CONSUME the pin (else time travel would silently return the pinned version), and
+#      * it must not SEED the pin (else the inverse of the original bug: one time-travelled reference would
+#        drag every other reference in the statement back to that old version).
+#    Both hold by construction rather than by luck. Codec: ScanTable handles spec.At in a branch that RETURNS
+#    before either the pin read or ScanCodec's seeding. Native: an explicit precedence chain, AT first
+#    ("explicit AT > per-transaction pinned version > latest"), with PinVersion reachable only in the final
+#    else.
+#
+#    WHAT MUTATION TESTING ACTUALLY SHOWED about this section, recorded so its strength is not overstated:
+#      * the SEED direction is UNFALSIFIABLE on the codec path, not merely untested. Making the AT branch
+#        seed the pin changes NOTHING observable, because by the time it runs the pin already exists -- the
+#        explicit-transaction read-set block sits ABOVE it (~1141) and in autocommit another reference's bind
+#        probe seeds first -- so PinVersion's GetOrAdd is a no-op. Tried it in both orders, including an
+#        AT-first transaction. The property holds twice over; there is no assertion that could witness it.
+#      * the CONSUME direction for a BARE reference was already covered before this section existed: the
+#        `AT (VERSION => 1)` assertion in section 1 catches an AT scan that falls through to the pinned read
+#        (bypassing the early return fails THERE first).
+#    So what sections 9-10 genuinely add is (a) the SHAPES -- AT under a join, AT on both sides at different
+#    versions, AT in the middle of a transaction -- which would catch a regression that honours AT for a bare
+#    SELECT but not beneath a join, and (b) section 10, the only coverage of the native precedence CHAIN,
+#    where a reordering is a one-line mistake and is caught nowhere else (verified: reordering it fails 10
+#    while 1-9 all still pass).
+# ---------------------------------------------------------------------------------------------------------
+statement ok
+CREATE TABLE lake.main.atmix AS SELECT 1 AS id;
+
+statement ok
+INSERT INTO lake.main.atmix VALUES (2);
+
+statement ok
+INSERT INTO lake.main.atmix VALUES (3);
+
+# v0 = the CTAS's empty CREATE, v1 = its data write (1 row), then one row per INSERT.
+query I
+SELECT count(*) FROM fabricator_delta_snapshots('lake', 'atmix');
+----
+4
+
+# AT first, then latest: the AT reference must NOT seed the pin, so the second reference still reads latest.
+query II
+SELECT (SELECT count(*) FROM lake.main.atmix AT (VERSION => 1)) AS at_v1,
+       (SELECT count(*) FROM lake.main.atmix) AS latest;
+----
+1	3
+
+# Order reversed: the pin now EXISTS when the AT reference runs, and must not override it.
+query II
+SELECT (SELECT count(*) FROM lake.main.atmix) AS latest,
+       (SELECT count(*) FROM lake.main.atmix AT (VERSION => 1)) AS at_v1;
+----
+3	1
+
+# A self-join with AT on ONE side is two different table states BY REQUEST -- v1 holds {1}, latest {1,2,3}.
+query I
+SELECT a.id FROM lake.main.atmix AS a AT (VERSION => 1) JOIN lake.main.atmix AS b ON a.id = b.id;
+----
+1
+
+# AT on BOTH sides at DIFFERENT versions: neither is collapsed into the other (v2 = {1,2}, v3 = {1,2,3}).
+query I
+SELECT a.id FROM lake.main.atmix AS a AT (VERSION => 2) JOIN lake.main.atmix AS b AT (VERSION => 3) ON a.id = b.id
+ORDER BY a.id;
+----
+1
+2
+
+# Inside an EXPLICIT transaction the pin is instant-resolved at the first scan; an AT reference in the middle
+# must leave it intact, so the third read still sees the transaction's cut rather than the travelled version.
+statement ok
+BEGIN;
+
+query I
+SELECT count(*) FROM lake.main.atmix;
+----
+3
+
+query I
+SELECT count(*) FROM lake.main.atmix AT (VERSION => 1);
+----
+1
+
+query I
+SELECT count(*) FROM lake.main.atmix;
+----
+3
+
+statement ok
+COMMIT;
+
+# ---------------------------------------------------------------------------------------------------------
+# 10. The same interaction on the NATIVE read path, whose AT precedence is a chain rather than an early
+#     return -- a reordering of those branches would not be caught by section 9.
+# ---------------------------------------------------------------------------------------------------------
+statement ok
+CREATE TABLE nlake.main.natmix AS SELECT 1 AS id;
+
+statement ok
+INSERT INTO nlake.main.natmix VALUES (2);
+
+statement ok
+INSERT INTO nlake.main.natmix VALUES (3);
+
+query II
+SELECT (SELECT count(*) FROM nlake.main.natmix AT (VERSION => 1)) AS at_v1,
+       (SELECT count(*) FROM nlake.main.natmix) AS latest;
+----
+1	3
+
+query II
+SELECT (SELECT count(*) FROM nlake.main.natmix) AS latest,
+       (SELECT count(*) FROM nlake.main.natmix AT (VERSION => 1)) AS at_v1;
+----
+3	1
+
+query I
+SELECT a.id FROM nlake.main.natmix AS a AT (VERSION => 1) JOIN nlake.main.natmix AS b ON a.id = b.id;
+----
+1
+
+query I
+SELECT a.id FROM nlake.main.natmix AS a AT (VERSION => 2) JOIN nlake.main.natmix AS b AT (VERSION => 3) ON a.id = b.id
+ORDER BY a.id;
+----
+1
+2
+
+# ---------------------------------------------------------------------------------------------------------
+# 11. The NATIVE path's pin is SHARED too, and now costs nothing. It used to resolve through
+#     ResolveVersionAsOf -- a WHOLE extra DeltaTable open (its own _delta_log LIST plus a timestamp->version
+#     scan of the commit timestamps), which was this path's measured "+1 snapshot construction per statement"
+#     against the codec. It now consults an existing pin first and otherwise seeds from the schema/listing
+#     open it was already doing, exactly as ScanCodec does. Same assertion shape as sections 1-2: the branch
+#     runs at most ONCE per (txn, table), so the line COUNT is the sharing property. Its own table and a
+#     SINGLE statement, because every autocommit statement is its own transaction and therefore its own pin
+#     -- a total over several statements would be brittle rather than meaningful.
+# ---------------------------------------------------------------------------------------------------------
+statement ok
+CREATE TABLE nlake.main.npin AS SELECT i AS id, i * 2 AS v FROM range(6) tbl(i);
+
+query I
+SELECT sum(a.v) FROM nlake.main.npin a JOIN nlake.main.npin b ON a.id = b.id;
+----
+30
+
+# ONE line for a self-join (two references, four ScanNative calls). Per-reference resolution would give more;
+# no pin at all would give zero and lose the consistent cut this exists to provide.
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'Fabricator.Delta' AND message LIKE 'delta native pin %/npin -> v%';
+----
+1
+
+# And the codec's message is NOT emitted here -- the two paths seed their own pins, so a regression that
+# routed a native catalog through the codec seeding would show up as this count moving off zero.
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'Fabricator.Delta' AND message LIKE 'delta codec pin %/npin -> v%';
+----
+0
+
+# The retired resolver logged unconditionally in BOTH its success and catch branches, so the absence of its
+# message is proof the extra open is gone rather than merely quiet. Covers every table in this suite.
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'Fabricator.Delta' AND message LIKE 'delta snapshot pin:%as-of%';
+----
+0
+
 statement ok
 DETACH nlake;
 

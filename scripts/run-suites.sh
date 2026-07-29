@@ -59,8 +59,12 @@ case "$TIER" in
         # 59 runs / 5326 since 2026-07-29: verify_delta_subplan_dedup (36) pins that the catalog scan
         # SERIALIZES its table identity, so DuckDB's common-subplan optimizer cannot conflate two scans of
         # different same-shaped tables and silently return one table's rows for both.
+        # 5357 since 2026-07-29: verify_delta_autocommit_pin 34 -> 65. Sections 9-10 pin that an explicit AT
+        # stays INDEPENDENT of the shared pin (it must neither consume nor seed it) on both engines, and
+        # section 11 pins the NATIVE path's pin as shared-and-free after the redundant ResolveVersionAsOf
+        # open was removed.
         : "${MIN_SUITES:=59}"
-        : "${MIN_ASSERTIONS:=5326}"
+        : "${MIN_ASSERTIONS:=5357}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
