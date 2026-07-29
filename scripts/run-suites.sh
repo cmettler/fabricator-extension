@@ -62,10 +62,12 @@ case "$TIER" in
     service)
         SELECT_CMD=scripts/list-service-suites.sh
         # Floors measured 2026-07-25 against the compose stack: 42 suites / 1221 assertions, all green.
-        : "${MIN_SUITES:=42}"
         # 1227 since 2026-07-26: verify_granular_types gained 6 (the SQL datetime2(7) -> Delta refusal and
         # the microsecond-cast workaround). Raised deliberately in the same commit, per the error text below.
-        : "${MIN_ASSERTIONS:=1227}"
+        # 43 RUNS / 1388 since 2026-07-29: verify_delta_catalog_s3 runs a SECOND time on the codec engine
+        # (+161, the same count as its native leg). 42 suites, 43 runs — the floor is on RUNS.
+        : "${MIN_SUITES:=43}"
+        : "${MIN_ASSERTIONS:=1388}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2
@@ -135,34 +137,43 @@ fi
 
 # THE DOUBLED LEG. Since 2026-07-29 the PROVIDER NAME picks a default engine — 'delta' means DuckDB
 # reads and writes the parquet bytes while engineered-wood owns the log, 'engineeredwooddelta' means
-# EW's own codec does both. Most suites are pinned to whichever engine they are ABOUT. These four are
-# not about an engine at all: write / transaction / update / delete semantics must come out IDENTICAL
-# either way, so they interpolate ${DELTA_PROVIDER} and run once per engine. A divergence shows up as
-# a failure in exactly one leg, which names the engine for you.
+# EW's own codec does both. Most suites are pinned to whichever engine they are ABOUT. The ones listed
+# below are not about an engine at all, so they interpolate ${DELTA_PROVIDER} and run once per engine.
+# A divergence shows up as a failure in exactly one leg, which names the engine for you.
+#
+#   hermetic — write / transaction / update / delete semantics must come out IDENTICAL either way.
+#   service  — the S3 suite, because object storage is where the two engines' file handling has
+#              diverged most historically, and the flip moved the whole s3:// path onto the native
+#              engine. Without this leg the codec path over object storage has NO coverage at all.
 #
 # Each entry below is "<suite><TAB><provider>". Suites that do not interpolate the variable simply
 # ignore it, so the first leg can set it unconditionally.
-DOUBLED='test/verify_delta_catalog_write.test
+case "$TIER" in
+    hermetic)
+        DOUBLED='test/verify_delta_catalog_write.test
 test/verify_delta_catalog_transactions.test
 test/verify_delta_catalog_update.test
 test/verify_delta_catalog_delete.test'
+        ;;
+    service)
+        DOUBLED='test/verify_delta_catalog_s3.test'
+        ;;
+esac
 
 entries=$(printf '%s\n' "$suites" | sed 's/$/\tdelta/')
-if [ "$TIER" = 'hermetic' ]; then
-    while read -r d; do
-        [ -z "$d" ] && continue
-        # Guard against the doubled list drifting away from the selected set: a rename would
-        # otherwise silently drop the second leg while the run stayed green.
-        if ! printf '%s\n' "$suites" | grep -qxF "$d"; then
-            echo "ERROR: doubled-leg suite '$d' is not in the $TIER set (renamed or reclassified?)." >&2
-            exit 1
-        fi
-        entries="$entries
+while read -r d; do
+    [ -z "$d" ] && continue
+    # Guard against the doubled list drifting away from the selected set: a rename or a
+    # reclassification would otherwise silently drop the second leg while the run stayed green.
+    if ! printf '%s\n' "$suites" | grep -qxF "$d"; then
+        echo "ERROR: doubled-leg suite '$d' is not in the $TIER set (renamed or reclassified?)." >&2
+        exit 1
+    fi
+    entries="$entries
 $(printf '%s\tengineeredwooddelta' "$d")"
-    done <<EOF
+done <<EOF
 $DOUBLED
 EOF
-fi
 
 expected=$(printf '%s\n' "$entries" | wc -l | tr -d ' ')
 echo "Running $expected $TIER suite runs, one process each."

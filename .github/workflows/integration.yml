@@ -1,9 +1,14 @@
 # Tier 2: the suites that need real services — SQL Server 2025 and MinIO.
 #
-# 42 suites, the entire SQL Server provider surface plus the S3/PolyBase round trip: catalog and DML,
-# pushdown (filter/projection/limit/order-by/collation), scalar UDFs, TVFs, stored procedures,
-# table-in-out, custom functions and aggregates, secrets, server profiles, identity, columnstore,
-# time travel, and the full circle where SQL Server reads Delta tables we wrote to MinIO.
+# 42 suites in 43 RUNS, the entire SQL Server provider surface plus the S3/PolyBase round trip:
+# catalog and DML, pushdown (filter/projection/limit/order-by/collation), scalar UDFs, TVFs, stored
+# procedures, table-in-out, custom functions and aggregates, secrets, server profiles, identity,
+# columnstore, time travel, and the full circle where SQL Server reads Delta tables we wrote to MinIO.
+#
+# 43 runs from 42 suites because verify_delta_catalog_s3 runs ONCE PER DELTA ENGINE. The provider name
+# picks a default engine ('delta' = DuckDB moves the parquet bytes, 'engineeredwooddelta' = the EW
+# codec does), and object storage is where the two have diverged most in this project's history — so
+# the codec path over s3:// gets its own leg rather than inheriting the local suites' coverage.
 #
 # Reuses the SAME stack the dev machine uses — docker/docker-compose.yml, docker/certs/, and
 # docker/provision.ps1 — rather than reimplementing services as GitHub `services:` containers. One
@@ -13,8 +18,8 @@
 # runners cannot run containers at all, and the Windows runners cannot run Linux containers. Which is
 # why the per-platform coverage table in the docs shows this tier for linux only.
 #
-# NOT nightly-by-default cheap: a full DuckDB compile (~22 min) plus services plus 42 suites. Hence
-# schedule + manual dispatch, never per-push.
+# NOT nightly-by-default cheap: a full DuckDB compile (~22 min) plus services plus 43 suite runs.
+# Hence schedule + manual dispatch, never per-push.
 
 name: integration
 

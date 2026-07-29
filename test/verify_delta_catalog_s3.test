@@ -17,6 +17,20 @@ require parquet
 
 require-env FABRICATOR_S3_ENDPOINT
 
+# ENGINE-PARAMETERIZED: this suite runs TWICE, once per Delta engine. Object storage is where the two
+# engines' file handling has diverged most in this project's history — the phantom-commit ExistsAsync
+# glob, the s3 RemoveDirectory scheme-prefix failure, the zero-byte snappy payload that broke every
+# read crossing a checkpoint — so the codec path over s3:// needs its own coverage rather than
+# inheriting the local suites'. ${DELTA_PROVIDER} is 'delta' (DuckDB moves the parquet bytes) on one
+# leg and 'engineeredwooddelta' (pure EW codec) on the other; scripts/run-suites.sh drives both. The
+# one ATTACH that pins native_read/native_write explicitly is NOT parameterized — that section is
+# about the native path and stays on it in both legs.
+#
+# Both legs share the bucket prefixes ON PURPOSE: every table here is CREATE OR REPLACE'd (the suite's
+# own re-runnability contract), so the second leg also exercises replacing a table the OTHER engine
+# wrote — a real scenario for anyone who flips the flag on an existing catalog.
+require-env DELTA_PROVIDER
+
 # The test rig's MinIO serves a SELF-SIGNED cert (SQL Server trusts it via its CA mount; DuckDB's
 # curl-based httpfs verifies against the system store) — disable verification GLOBALLY (the transaction
 # flush runs on its own connection, which must inherit it).
@@ -31,7 +45,7 @@ CREATE SECRET minio_s3 (TYPE s3, KEY_ID 'miniouser', SECRET 'miniosecret123',
 
 # ---- ATTACH an s3:// Delta catalog root (READ_ONLY false: DuckDB auto-bumps remote ATTACHes) ----
 statement ok
-ATTACH 's3://fabricator/lake' AS s3lake (TYPE fabricator, PROVIDER 'delta', READ_ONLY false);
+ATTACH 's3://fabricator/lake' AS s3lake (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}', READ_ONLY false);
 
 # ---- CREATE + INSERT + read back ----
 statement ok
@@ -138,7 +152,7 @@ statement ok
 DETACH s3lake;
 
 statement ok
-ATTACH 's3://fabricator/lake' AS s3lake2 (TYPE fabricator, PROVIDER 'delta', READ_ONLY false);
+ATTACH 's3://fabricator/lake' AS s3lake2 (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}', READ_ONLY false);
 
 query I
 SELECT count(*) FROM s3lake2.main.t;
@@ -156,7 +170,7 @@ DETACH s3lake2;
 
 # ---- native_write + native_read catalog on S3: DuckDB's COPY writes, read_parquet reads ----
 statement ok
-ATTACH 's3://fabricator/lake' AS s3n (TYPE fabricator, PROVIDER 'delta', READ_ONLY false,
+ATTACH 's3://fabricator/lake' AS s3n (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}', READ_ONLY false,
                                     native_write true, native_read true);
 
 statement ok
@@ -194,7 +208,7 @@ DETACH s3n;
 # ---- Delta IDENTITY on S3 (the v53 generated-column marker): engine-assigned values, high-water
 # continuation across re-attach, and DROP TABLE (per-file fallback — httpfs has no S3 RemoveDirectory) ----
 statement ok
-ATTACH 's3://fabricator/lake' AS s3id (TYPE fabricator, PROVIDER 'delta', READ_ONLY false);
+ATTACH 's3://fabricator/lake' AS s3id (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}', READ_ONLY false);
 
 statement ok
 DROP TABLE IF EXISTS s3id.main.idt;
@@ -216,7 +230,7 @@ statement ok
 DETACH s3id;
 
 statement ok
-ATTACH 's3://fabricator/lake' AS s3id2 (TYPE fabricator, PROVIDER 'delta', READ_ONLY false);
+ATTACH 's3://fabricator/lake' AS s3id2 (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}', READ_ONLY false);
 
 statement ok
 INSERT INTO s3id2.main.idt (name) VALUES ('d');
@@ -234,7 +248,7 @@ statement ok
 DETACH s3id2;
 
 statement ok
-ATTACH 's3://fabricator/lake' AS s3id3 (TYPE fabricator, PROVIDER 'delta', READ_ONLY false);
+ATTACH 's3://fabricator/lake' AS s3id3 (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}', READ_ONLY false);
 
 query I
 SELECT count(*) FROM duckdb_tables() WHERE database_name = 's3id3' AND table_name = 'idt';
@@ -246,7 +260,7 @@ DETACH s3id3;
 
 # ---- Change Data Feed on S3: change files write to + read from the bucket (CoW capture path) ----
 statement ok
-ATTACH 's3://fabricator/lake-cdf' AS s3cdf (TYPE fabricator, PROVIDER 'delta', READ_ONLY false,
+ATTACH 's3://fabricator/lake-cdf' AS s3cdf (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}', READ_ONLY false,
                                           change_data_feed true, deletion_vectors false, column_mapping 'none');
 
 statement ok
@@ -324,7 +338,7 @@ US	1	100
 
 # the written table ATTACHes as a normal Delta catalog table
 statement ok
-ATTACH 's3://fabricator/copyfmt' AS s3cf (TYPE fabricator, PROVIDER 'delta');
+ATTACH 's3://fabricator/copyfmt' AS s3cf (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}');
 
 query I
 SELECT count(*) FROM s3cf.main.t1;
@@ -344,7 +358,7 @@ DETACH s3cf;
 # ============================================================================
 
 statement ok
-ATTACH 's3://fabricator/condsuite' AS ccs (TYPE fabricator, PROVIDER 'delta', SECRET minio_s3, READ_ONLY false);
+ATTACH 's3://fabricator/condsuite' AS ccs (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}', SECRET minio_s3, READ_ONLY false);
 
 statement ok
 CREATE OR REPLACE TABLE ccs.main.t AS SELECT i AS id, 'v' || i AS v FROM range(1, 101) r(i);
@@ -400,7 +414,7 @@ DETACH ccs;
 # ============================================================================
 
 statement ok
-ATTACH 's3://fabricator/condsuite' AS rns (TYPE fabricator, PROVIDER 'delta', SECRET minio_s3, READ_ONLY false);
+ATTACH 's3://fabricator/condsuite' AS rns (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}', SECRET minio_s3, READ_ONLY false);
 
 statement ok
 DROP TABLE IF EXISTS rns.main.rn_dst;
@@ -436,7 +450,7 @@ statement ok
 DETACH rns;
 
 statement ok
-ATTACH 's3://fabricator/condsuite' AS rns (TYPE fabricator, PROVIDER 'delta', SECRET minio_s3, READ_ONLY false);
+ATTACH 's3://fabricator/condsuite' AS rns (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}', SECRET minio_s3, READ_ONLY false);
 
 query I
 SELECT count(*) FROM rns.main.rn_dst;
