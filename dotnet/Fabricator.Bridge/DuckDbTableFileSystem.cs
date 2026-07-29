@@ -23,13 +23,46 @@ namespace Fabricator.Bridge;
 /// </summary>
 internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
 {
-    private readonly nint _opener;
+    private readonly nint _capturedOpener;
     private readonly string _root; // normalized (forward slashes), no trailing slash
 
     public DuckDbTableFileSystem(nint opener, string root)
     {
-        _opener = opener;
+        _capturedOpener = opener;
         _root = Normalize(root).TrimEnd('/');
+    }
+
+    /// <summary>
+    /// The host-FS opener to use for THIS call, preferring the one currently in scope over the one captured
+    /// at construction.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The opener is a <c>ClientContext*</c> that the host hands us per ABI call and that is only valid for
+    /// the duration of that call. Capturing it — which is what this class did — is therefore the reason a
+    /// <c>DeltaTable</c> cannot be held open ACROSS calls: the second call would drive IO through a dangling
+    /// pointer. That is a use-after-free rather than a staleness bug, and neither Windows nor glibc would
+    /// necessarily fault on it (the same asymmetry that let the late <c>ArrowProducer</c> release hide
+    /// everywhere except macOS).
+    /// </para>
+    /// <para>
+    /// Reading <see cref="AmbientOpener"/> first fixes that, because the host sets it on every crossing.
+    /// The captured value is kept as a FALLBACK rather than deleted: the ambient is an
+    /// <see cref="System.Threading.AsyncLocal{T}"/>, so it flows across <c>await</c> and pool-thread hops
+    /// but would read 0 in any context where the execution context did not flow, and there the captured
+    /// pointer is still the correct one because no object outlives its call today. So this is
+    /// behaviour-preserving now (within one call the two values are identical — every construction site
+    /// passes <c>Opener()</c>, which just returns the ambient) and becomes load-bearing the moment
+    /// something is cached.
+    /// </para>
+    /// </remarks>
+    private nint Opener
+    {
+        get
+        {
+            var current = AmbientOpener.Current;
+            return current != 0 ? current : _capturedOpener;
+        }
     }
 
     private static string Normalize(string p) => p.Replace('\\', '/');
@@ -56,7 +89,7 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
     {
         // DuckDB glob: <root>/<prefix>* (the Delta log is flat — _delta_log/*.json + checkpoint parquet).
         var pattern = _root + "/" + Normalize(prefix) + "*";
-        var json = HostFs.Glob(_opener, pattern);
+        var json = HostFs.Glob(Opener, pattern);
         foreach (var entry in ParseGlob(json))
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -85,7 +118,7 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
     public ValueTask<IRandomAccessFile> OpenReadAsync(string path, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return new ValueTask<IRandomAccessFile>(new DuckDbRandomAccessFile(_opener, Resolve(path)));
+        return new ValueTask<IRandomAccessFile>(new DuckDbRandomAccessFile(Opener, Resolve(path)));
     }
 
     public ValueTask<bool> ExistsAsync(string path, CancellationToken cancellationToken = default)
@@ -97,7 +130,7 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
         // opening for read (a HEAD on object stores) is existence-accurate on every backend.
         try
         {
-            nint file = HostFs.OpenRead(_opener, Resolve(path));
+            nint file = HostFs.OpenRead(Opener, Resolve(path));
             HostFs.Close(file);
             return new ValueTask<bool>(true);
         }
@@ -120,7 +153,7 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
             cancellationToken.ThrowIfCancellationRequested();
             try
             {
-                nint file = HostFs.OpenRead(_opener, Resolve(path));
+                nint file = HostFs.OpenRead(Opener, Resolve(path));
                 try
                 {
                     long size = HostFs.Size(file);
@@ -166,7 +199,7 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
         var parent = ParentDir(resolved);
         if (parent.Length > 0)
         {
-            HostFs.CreateDir(_opener, parent);
+            HostFs.CreateDir(Opener, parent);
         }
     }
 
@@ -179,9 +212,9 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
         nint file;
         if (overwrite)
         {
-            file = HostFs.OpenWrite(_opener, resolved);
+            file = HostFs.OpenWrite(Opener, resolved);
         }
-        else if (!HostFs.TryOpenWriteExclusive(_opener, resolved, out file))
+        else if (!HostFs.TryOpenWriteExclusive(Opener, resolved, out file))
         {
             // Contract: CreateAsync fails when the file exists and overwrite is false.
             throw new System.IO.IOException($"DuckDbTableFileSystem: file already exists: {path}");
@@ -200,7 +233,7 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
         cancellationToken.ThrowIfCancellationRequested();
         var src = Resolve(sourcePath);
         var dst = Resolve(targetPath);
-        nint bytesFile = HostFs.OpenRead(_opener, src);
+        nint bytesFile = HostFs.OpenRead(Opener, src);
         byte[] bytes;
         try
         {
@@ -220,7 +253,7 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
         }
 
         EnsureParentDir(dst);
-        if (!HostFs.TryOpenWriteExclusive(_opener, dst, out nint target))
+        if (!HostFs.TryOpenWriteExclusive(Opener, dst, out nint target))
         {
             return new ValueTask<bool>(false); // target exists => conflict; leave source for the caller to delete
         }
@@ -238,14 +271,14 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
         {
             HostFs.CloseWrite(target);
         }
-        HostFs.Remove(_opener, src); // the source temp is consumed by the (emulated) rename
+        HostFs.Remove(Opener, src); // the source temp is consumed by the (emulated) rename
         return new ValueTask<bool>(true);
     }
 
     public ValueTask DeleteAsync(string path, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        HostFs.Remove(_opener, Resolve(path));
+        HostFs.Remove(Opener, Resolve(path));
         return ValueTask.CompletedTask;
     }
 
@@ -255,7 +288,7 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
         cancellationToken.ThrowIfCancellationRequested();
         var resolved = Resolve(path);
         EnsureParentDir(resolved);
-        nint file = HostFs.OpenWrite(_opener, resolved);
+        nint file = HostFs.OpenWrite(Opener, resolved);
         try
         {
             if (data.Length > 0)
