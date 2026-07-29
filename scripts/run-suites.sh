@@ -63,8 +63,12 @@ case "$TIER" in
         # stays INDEPENDENT of the shared pin (it must neither consume nor seed it) on both engines, and
         # section 11 pins the NATIVE path's pin as shared-and-free after the redundant ResolveVersionAsOf
         # open was removed.
-        : "${MIN_SUITES:=59}"
-        : "${MIN_ASSERTIONS:=5357}"
+        # 60 runs / 5459 since 2026-07-30: verify_delta_mixed_engines (102) pins CROSS-ENGINE parquet
+        # compatibility — native_read/native_write are INDEPENDENT options, so besides the two symmetric
+        # profiles the provider names select there are two MIXED ones a user can ask for. Written by one
+        # engine, read back by the other, over the same table path.
+        : "${MIN_SUITES:=60}"
+        : "${MIN_ASSERTIONS:=5459}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

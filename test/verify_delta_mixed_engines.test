@@ -1,0 +1,210 @@
+# name: test/verify_delta_mixed_engines.test
+# description: CROSS-ENGINE parquet compatibility. `native_read` and `native_write` are INDEPENDENT ATTACH
+#              options, so besides the two symmetric profiles the provider names pick ('delta' = both on,
+#              'engineeredwooddelta' = both off) there are two MIXED configurations a user can ask for, and
+#              they were reachable but untested:
+#                * native_write + codec read — DuckDB's parquet writer produces the bytes, engineered-wood's
+#                  own reader decodes them.
+#                * codec write + native_read — engineered-wood's writer produces them, DuckDB decodes.
+#              This suite writes with ONE engine and reads back with the OTHER over the SAME table path (two
+#              ATTACHes of one root differing only in the flags), which is the direct form of the claim; a
+#              table that merely round-trips within one configuration would not prove interoperability.
+#
+#              WHY THIS IS WORTH PINNING even though nothing was broken when it was written: this exact seam
+#              has produced silent corruption before. The engineered-wood patch set carries a fix for 1- and
+#              2-byte Arrow arrays being reinterpreted at the 4-byte physical width (TINYINT/SMALLINT written
+#              as garbage), and another for a zero-byte snappy payload that strict decoders reject — found
+#              only because SQL Server read our files. A future EW bump or DuckDB writer change can
+#              reintroduce that class, and it would show up HERE first. The type matrix is chosen for that:
+#              narrow ints, DECIMAL on both sides of the precision-18 boundary (18 is where the physical
+#              encoding switches to fixed-length byte array), float and double, and nested STRUCT/LIST.
+#              Set FABRICATOR_DELTA_WRITE_DIR to a WRITABLE base path. Local FS, no service dependency.
+# group: [fabricator]
+
+require fabricator
+
+require parquet
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+# ---------------------------------------------------------------------------------------------------------
+# 1. DuckDB WRITES, the engineered-wood codec READS.
+# ---------------------------------------------------------------------------------------------------------
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/mix' AS dw
+  (TYPE fabricator, PROVIDER 'delta', native_write true, native_read false, READ_ONLY false);
+
+statement ok
+CREATE TABLE dw.main.m AS SELECT
+  i::TINYINT AS t1, (i*100)::SMALLINT AS t2, i::INTEGER AS i4, (i*10000000000)::BIGINT AS i8,
+  (i*1.25)::DECIMAL(9,2) AS d9, (i*1.25)::DECIMAL(28,4) AS d28,
+  (i*0.5)::FLOAT AS f4, (i*0.25)::DOUBLE AS f8,
+  ('s'||i)::VARCHAR AS s, (i%2=0)::BOOLEAN AS b,
+  DATE '2020-01-01' + i::INT AS dt, TIMESTAMP '2020-01-01 00:00:00' + INTERVAL (i) HOUR AS ts,
+  {'a': i, 'b': 's'||i} AS st, [i, i+1] AS li
+FROM range(1,6) r(i);
+
+# The bytes really were written by DuckDB — otherwise this suite would be testing nothing, since a
+# misrouted flag would silently make both sides the same engine.
+query I
+SELECT DISTINCT regexp_extract(created_by, '^[A-Za-z]+')
+FROM parquet_file_metadata('${FABRICATOR_DELTA_WRITE_DIR}/mix/m/*.parquet');
+----
+DuckDB
+
+# Read the SAME path back through the codec reader (native_read off on this attach).
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/mix' AS cr
+  (TYPE fabricator, PROVIDER 'engineeredwooddelta', READ_ONLY false);
+
+query IIIIII
+SELECT sum(t1), sum(t2), sum(i4), sum(i8), sum(d9), sum(d28) FROM cr.main.m;
+----
+15	1500	15	150000000000	18.75	18.7500
+
+query IIII
+SELECT round(sum(f4)::DOUBLE, 3), sum(f8), count(*) FILTER (b), sum(li[2]) FROM cr.main.m;
+----
+7.5	3.75	2	20
+
+query IIII
+SELECT string_agg(s, ',' ORDER BY i4), max(dt)::VARCHAR, max(ts)::VARCHAR, sum(st.a) FROM cr.main.m;
+----
+s1,s2,s3,s4,s5	2020-01-06	2020-01-01 05:00:00	15
+
+# Per-row, not just aggregates: an encoding-width bug can preserve a sum while scrambling individual rows
+# (two errors cancelling), and the narrow-int corruption this guards against was exactly a per-value fault.
+query IIIT
+SELECT t1, t2, d28, st.b FROM cr.main.m ORDER BY i4;
+----
+1	100	1.2500	s1
+2	200	2.5000	s2
+3	300	3.7500	s3
+4	400	5.0000	s4
+5	500	6.2500	s5
+
+statement ok
+DETACH cr;
+
+statement ok
+DETACH dw;
+
+# ---------------------------------------------------------------------------------------------------------
+# 2. The engineered-wood codec WRITES, DuckDB READS.
+# ---------------------------------------------------------------------------------------------------------
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/mix2' AS cw
+  (TYPE fabricator, PROVIDER 'engineeredwooddelta', READ_ONLY false);
+
+statement ok
+CREATE TABLE cw.main.m AS SELECT
+  i::TINYINT AS t1, (i*100)::SMALLINT AS t2, i::INTEGER AS i4, (i*10000000000)::BIGINT AS i8,
+  (i*1.25)::DECIMAL(9,2) AS d9, (i*1.25)::DECIMAL(28,4) AS d28,
+  (i*0.5)::FLOAT AS f4, (i*0.25)::DOUBLE AS f8,
+  ('s'||i)::VARCHAR AS s, (i%2=0)::BOOLEAN AS b,
+  DATE '2020-01-01' + i::INT AS dt, TIMESTAMP '2020-01-01 00:00:00' + INTERVAL (i) HOUR AS ts,
+  {'a': i, 'b': 's'||i} AS st, [i, i+1] AS li
+FROM range(1,6) r(i);
+
+query I
+SELECT DISTINCT regexp_extract(created_by, '^[A-Za-z]+')
+FROM parquet_file_metadata('${FABRICATOR_DELTA_WRITE_DIR}/mix2/m/*.parquet');
+----
+EngineeredWood
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/mix2' AS nr
+  (TYPE fabricator, PROVIDER 'delta', native_write false, native_read true, READ_ONLY false);
+
+query IIIIII
+SELECT sum(t1), sum(t2), sum(i4), sum(i8), sum(d9), sum(d28) FROM nr.main.m;
+----
+15	1500	15	150000000000	18.75	18.7500
+
+query IIII
+SELECT round(sum(f4)::DOUBLE, 3), sum(f8), count(*) FILTER (b), sum(li[2]) FROM nr.main.m;
+----
+7.5	3.75	2	20
+
+query IIII
+SELECT string_agg(s, ',' ORDER BY i4), max(dt)::VARCHAR, max(ts)::VARCHAR, sum(st.a) FROM nr.main.m;
+----
+s1,s2,s3,s4,s5	2020-01-06	2020-01-01 05:00:00	15
+
+query IIIT
+SELECT t1, t2, d28, st.b FROM nr.main.m ORDER BY i4;
+----
+1	100	1.2500	s1
+2	200	2.5000	s2
+3	300	3.7500	s3
+4	400	5.0000	s4
+5	500	6.2500	s5
+
+statement ok
+DETACH nr;
+
+statement ok
+DETACH cw;
+
+# ---------------------------------------------------------------------------------------------------------
+# 3. DML under each MIXED configuration. Deletion vectors and merge-on-read UPDATE are where the two
+#    engines' file handling differs most, and a DV written by one engine must be honoured by the other's
+#    reader: the DV is a separate file whose positions index into the data file's row order, so a
+#    disagreement about that order silently hides or reveals the WRONG rows rather than erroring.
+#    The sequence deliberately interleaves: append, DV delete, merge-on-read update, append again.
+# ---------------------------------------------------------------------------------------------------------
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/mixdml_a' AS a
+  (TYPE fabricator, PROVIDER 'delta', native_write true, native_read false, READ_ONLY false);
+
+statement ok
+CREATE TABLE a.main.t AS SELECT i AS id, i*2 AS v, 's'||i AS s FROM range(1,11) r(i);
+
+statement ok
+INSERT INTO a.main.t VALUES (11, 22, 's11');
+
+statement ok
+DELETE FROM a.main.t WHERE id % 3 = 0;
+
+statement ok
+UPDATE a.main.t SET v = v + 1000 WHERE id > 8;
+
+statement ok
+INSERT INTO a.main.t VALUES (12, 24, 's12');
+
+query IIIT
+SELECT count(*), sum(id), sum(v), string_agg(s, ',' ORDER BY id) FROM a.main.t;
+----
+9	60	2120	s1,s2,s4,s5,s7,s8,s10,s11,s12
+
+statement ok
+DETACH a;
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/mixdml_b' AS b
+  (TYPE fabricator, PROVIDER 'delta', native_write false, native_read true, READ_ONLY false);
+
+statement ok
+CREATE TABLE b.main.t AS SELECT i AS id, i*2 AS v, 's'||i AS s FROM range(1,11) r(i);
+
+statement ok
+INSERT INTO b.main.t VALUES (11, 22, 's11');
+
+statement ok
+DELETE FROM b.main.t WHERE id % 3 = 0;
+
+statement ok
+UPDATE b.main.t SET v = v + 1000 WHERE id > 8;
+
+statement ok
+INSERT INTO b.main.t VALUES (12, 24, 's12');
+
+# Identical to the other mixed configuration, which is the point — the flags select the byte path, never
+# the answer.
+query IIIT
+SELECT count(*), sum(id), sum(v), string_agg(s, ',' ORDER BY id) FROM b.main.t;
+----
+9	60	2120	s1,s2,s4,s5,s7,s8,s10,s11,s12
+
+statement ok
+DETACH b;
