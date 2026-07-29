@@ -50,8 +50,14 @@ case "$TIER" in
         # table on a catalog WITHOUT the native writer WARNS instead of silently bin-packing).
         # 4208 since 2026-07-29: verify_delta_catalog_transactions gained 2 (the ROLLBACK atomicity pin for
         # the buffered identity append the native-write default exposed).
-        : "${MIN_SUITES:=54}"
-        : "${MIN_ASSERTIONS:=4208}"
+        # 58 RUNS / 5290 since 2026-07-29, all measured: the four engine-parameterized suites each run a
+        # SECOND time on the codec engine (+1065 — write 31, transactions 943, update 63, delete 28, the
+        # counts identical to their native leg, which is the point), and verify_delta_rename gained 17
+        # (10 -> 27) becoming the pin that each PROVIDER spelling selects its documented engine.
+        # NOTE the floor is on RUNS, not distinct suites: 54 suites, 58 runs. A suite dropping out of the
+        # tier still trips it, which is what the floor is for.
+        : "${MIN_SUITES:=58}"
+        : "${MIN_ASSERTIONS:=5290}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
@@ -126,8 +132,40 @@ if [ -z "$suites" ]; then
     echo "ERROR: no $TIER suites selected — $SELECT_CMD is broken." >&2
     exit 1
 fi
-expected=$(printf '%s\n' "$suites" | wc -l | tr -d ' ')
-echo "Running $expected $TIER suites, one process each."
+
+# THE DOUBLED LEG. Since 2026-07-29 the PROVIDER NAME picks a default engine — 'delta' means DuckDB
+# reads and writes the parquet bytes while engineered-wood owns the log, 'engineeredwooddelta' means
+# EW's own codec does both. Most suites are pinned to whichever engine they are ABOUT. These four are
+# not about an engine at all: write / transaction / update / delete semantics must come out IDENTICAL
+# either way, so they interpolate ${DELTA_PROVIDER} and run once per engine. A divergence shows up as
+# a failure in exactly one leg, which names the engine for you.
+#
+# Each entry below is "<suite><TAB><provider>". Suites that do not interpolate the variable simply
+# ignore it, so the first leg can set it unconditionally.
+DOUBLED='test/verify_delta_catalog_write.test
+test/verify_delta_catalog_transactions.test
+test/verify_delta_catalog_update.test
+test/verify_delta_catalog_delete.test'
+
+entries=$(printf '%s\n' "$suites" | sed 's/$/\tdelta/')
+if [ "$TIER" = 'hermetic' ]; then
+    while read -r d; do
+        [ -z "$d" ] && continue
+        # Guard against the doubled list drifting away from the selected set: a rename would
+        # otherwise silently drop the second leg while the run stayed green.
+        if ! printf '%s\n' "$suites" | grep -qxF "$d"; then
+            echo "ERROR: doubled-leg suite '$d' is not in the $TIER set (renamed or reclassified?)." >&2
+            exit 1
+        fi
+        entries="$entries
+$(printf '%s\tengineeredwooddelta' "$d")"
+    done <<EOF
+$DOUBLED
+EOF
+fi
+
+expected=$(printf '%s\n' "$entries" | wc -l | tr -d ' ')
+echo "Running $expected $TIER suite runs, one process each."
 echo "  unittest: $UNITTEST"
 echo "  managed : $MANAGED"
 echo "  fixture : $FABRICATOR_DELTA_DIR"
@@ -147,10 +185,15 @@ if command -v git >/dev/null 2>&1 && git rev-parse --git-dir >/dev/null 2>&1; th
     fixtures_before=$(git status --porcelain --untracked-files=all -- test/fixtures 2>/dev/null)
 fi
 
-while read -r suite; do
+while IFS="$(printf '\t')" read -r suite provider; do
     [ -z "$suite" ] && continue
     scratch=$(mktemp -d)
     export FABRICATOR_DELTA_WRITE_DIR="$scratch"
+    export DELTA_PROVIDER="${provider:-delta}"
+
+    # Only label the non-default leg, so the common output stays as it was.
+    label="$suite"
+    [ "$DELTA_PROVIDER" != 'delta' ] && label="$suite [$DELTA_PROVIDER]"
 
     output=$("$UNITTEST" --test-dir . "$suite" 2>&1)
     status=$?
@@ -173,23 +216,23 @@ while read -r suite; do
     if [ -n "$reason" ]; then
         failed=$((failed + 1))
         failures="${failures}
-  $suite — $reason"
-        printf 'FAIL  %-58s %s\n' "$suite" "$reason"
+  $label — $reason"
+        printf 'FAIL  %-58s %s\n' "$label" "$reason"
         printf '%s\n' "$output" | tail -25
         echo "      (scratch kept for inspection: $scratch)"
     else
         ran=$((ran + 1))
         assertions=$((assertions + count))
-        printf 'ok    %-58s %6s assertions\n' "$suite" "$count"
+        printf 'ok    %-58s %6s assertions\n' "$label" "$count"
         rm -rf "$scratch"
     fi
 done <<EOF
-$suites
+$entries
 EOF
 
 echo
 echo "================================================================"
-echo "suites selected : $expected"
+echo "suite runs      : $expected"
 echo "suites passed   : $ran"
 echo "suites failed   : $failed"
 echo "assertions      : $assertions"
@@ -227,8 +270,9 @@ fi
 # would still hold, because `expected` shrank too. Floors rather than equalities, so adding suites and
 # assertions never breaks the build.
 if [ "$expected" -lt "$MIN_SUITES" ]; then
-    echo "ERROR: only $expected suites were SELECTED, floor is $MIN_SUITES. A suite likely gained a" >&2
-    echo "       require-env and silently left the $TIER set. Check $SELECT_CMD," >&2
+    echo "ERROR: only $expected suite RUNS were selected, floor is $MIN_SUITES. A suite likely gained a" >&2
+    echo "       require-env and silently left the $TIER set — or a doubled leg stopped being added." >&2
+    echo "       Check $SELECT_CMD and the DOUBLED list above," >&2
     echo "       and if the drop is intended, lower MIN_SUITES here in the same commit." >&2
     exit 1
 fi

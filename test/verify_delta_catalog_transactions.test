@@ -19,12 +19,20 @@ require parquet
 
 require-env FABRICATOR_DELTA_WRITE_DIR
 
+# ENGINE-PARAMETERIZED: this suite runs TWICE, once per Delta engine, because its subject — write /
+# transaction / update / delete semantics — must be IDENTICAL whichever engine moves the bytes.
+# ${DELTA_PROVIDER} is 'delta' (DuckDB reads+writes the parquet, EW owns the log) on one leg and
+# 'engineeredwooddelta' (pure EW codec) on the other; scripts/run-suites.sh drives both. ATTACHes that
+# pin native_read/native_write explicitly are NOT parameterized — those sections are about the native
+# path specifically and stay on it in both legs.
+require-env DELTA_PROVIDER
+
 # ============================================================================
 # 1. Codec catalog: atomic multi-INSERT + rollback (slice 1)
 # ============================================================================
 
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS lake (TYPE fabricator, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS lake (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}');
 
 statement ok
 CREATE TABLE lake.main.t (id INTEGER, name VARCHAR);
@@ -462,7 +470,7 @@ ALTER TABLE lake.main.t DROP COLUMN extra;
 #     appended row). Under the default write_serializable the same append passes (6a). ---
 
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS serlake (TYPE fabricator, PROVIDER 'delta', isolation_level 'serializable');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS serlake (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}', isolation_level 'serializable');
 
 statement ok con1
 BEGIN;
@@ -544,7 +552,7 @@ SELECT id, name FROM lake.main.t ORDER BY id;
 
 # the strict counterpart: under `serializable` the same shape still conflicts at file level
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS serlake2 (TYPE fabricator, PROVIDER 'delta', isolation_level 'serializable');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS serlake2 (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}', isolation_level 'serializable');
 
 statement ok
 INSERT INTO lake.main.t VALUES (901, 'ser'), (902, 'ser2');
@@ -631,7 +639,7 @@ DELETE FROM lake.main.t WHERE id = 600;
 # ============================================================================
 
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_cow' AS cowlake (TYPE fabricator, PROVIDER 'delta', deletion_vectors false);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_cow' AS cowlake (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}', deletion_vectors false);
 
 statement ok
 CREATE TABLE cowlake.main.c AS SELECT 1 AS i UNION ALL SELECT 2;
@@ -660,7 +668,7 @@ statement ok
 DETACH cowlake;
 
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_cdf' AS cdflake (TYPE fabricator, PROVIDER 'delta', change_data_feed true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_cdf' AS cdflake (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}', change_data_feed true);
 
 statement ok
 CREATE TABLE cdflake.main.f AS SELECT 1 AS i UNION ALL SELECT 2;
@@ -771,7 +779,7 @@ statement ok
 DETACH lake;
 
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS lake (TYPE fabricator, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS lake (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}');
 
 query I
 SELECT count(*) FROM lake.main.u;
@@ -944,7 +952,7 @@ DETACH rlake;
 # ============================================================================
 
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS alake (TYPE fabricator, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS alake (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}');
 
 query I
 SELECT count(*) FROM fabricator_delta_snapshots('alake', 'u');
@@ -986,7 +994,7 @@ DETACH alake;
 # ============================================================================
 
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS dlake (TYPE fabricator, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS dlake (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}');
 
 statement ok
 CREATE TABLE dlake.main.a (id INTEGER, name VARCHAR);
@@ -1248,7 +1256,7 @@ DETACH xlake;
 # ============================================================================
 
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS elake (TYPE fabricator, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS elake (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}');
 
 statement ok
 CREATE TABLE elake.main.r (id INTEGER, val VARCHAR);
@@ -1556,7 +1564,7 @@ DETACH elake;
 # ============================================================================
 
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS flake (TYPE fabricator, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS flake (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}');
 
 statement ok
 BEGIN;
@@ -1629,7 +1637,7 @@ DETACH flake;
 
 # Re-attach: the rolled-back table left NOTHING on storage.
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS flake2 (TYPE fabricator, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS flake2 (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}');
 
 query I
 SELECT count(*) FROM duckdb_tables() WHERE database_name = 'flake2' AND table_name = 'd';
@@ -2097,7 +2105,7 @@ DETACH eb;
 # ============================================================================
 
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_eagercodec' AS ec (TYPE fabricator, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_eagercodec' AS ec (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}');
 
 statement ok
 CREATE TABLE ec.main.ct (id INTEGER, v VARCHAR);
@@ -2222,7 +2230,7 @@ DETACH ec;
 # ============================================================================
 
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_cdf2' AS cf (TYPE fabricator, PROVIDER 'delta', change_data_feed true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_cdf2' AS cf (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}', change_data_feed true);
 
 statement ok
 CREATE TABLE cf.main.t (id INTEGER, v VARCHAR);
@@ -2320,7 +2328,7 @@ DETACH cf;
 
 # --- materialize_row_tracking: fresh appends need no physical __delta_row_id (baseRowId at commit) ---
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_mat' AS mt (TYPE fabricator, PROVIDER 'delta', row_tracking true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_mat' AS mt (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}', row_tracking true);
 
 statement ok
 CREATE TABLE mt.main.m (id INTEGER, v VARCHAR);
@@ -2363,7 +2371,7 @@ DETACH mt;
 
 # --- identity: values generated at STATEMENT time from the pinned/chained HWM ---
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_ident' AS idl (TYPE fabricator, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_ident' AS idl (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}');
 
 statement ok
 CREATE TABLE idl.main.t (id BIGINT AS (0), v VARCHAR);
@@ -2475,7 +2483,7 @@ DETACH idl;
 
 # column_mapping 'none': the pins below read the RAW parquet files by logical column name.
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_mat' AS mu (TYPE fabricator, PROVIDER 'delta', row_tracking true, column_mapping 'none');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_mat' AS mu (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}', row_tracking true, column_mapping 'none');
 
 statement ok
 CREATE TABLE mu.main.u (id INTEGER, v VARCHAR);
@@ -2528,7 +2536,7 @@ DETACH mu;
 # ============================================================================
 
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS vr (TYPE fabricator, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS vr (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}');
 
 statement ok
 CREATE TABLE vr.main.vrt (id INTEGER, v VARCHAR);
@@ -2590,7 +2598,7 @@ DETACH vr;
 # ============================================================================
 
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_selfdml' AS sd (TYPE fabricator, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_selfdml' AS sd (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}');
 
 statement ok
 CREATE TABLE sd.main.t (id INTEGER, v VARCHAR);
@@ -2735,7 +2743,7 @@ DETACH sdn;
 
 # CDF tables: same-txn DELETE rejected (the insert-cdc already captured the row)
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_cdf2' AS sdc (TYPE fabricator, PROVIDER 'delta', change_data_feed true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_cdf2' AS sdc (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}', change_data_feed true);
 
 statement ok
 BEGIN;
@@ -2760,7 +2768,7 @@ DETACH sdc;
 # ============================================================================
 
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_dbtswap' AS dw (TYPE fabricator, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_dbtswap' AS dw (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}');
 
 statement ok
 CREATE TABLE dw.main.m AS SELECT 1 AS id, 'old' AS v;
@@ -2934,7 +2942,7 @@ DETACH pc;
 # ============================================================================
 
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_ident2' AS ic (TYPE fabricator, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_ident2' AS ic (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}');
 
 statement ok
 BEGIN;

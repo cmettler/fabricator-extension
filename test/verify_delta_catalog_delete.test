@@ -18,8 +18,16 @@ require parquet
 
 require-env FABRICATOR_DELTA_WRITE_DIR
 
+# ENGINE-PARAMETERIZED: this suite runs TWICE, once per Delta engine, because its subject — write /
+# transaction / update / delete semantics — must be IDENTICAL whichever engine moves the bytes.
+# ${DELTA_PROVIDER} is 'delta' (DuckDB reads+writes the parquet, EW owns the log) on one leg and
+# 'engineeredwooddelta' (pure EW codec) on the other; scripts/run-suites.sh drives both. ATTACHes that
+# pin native_read/native_write explicitly are NOT parameterized — those sections are about the native
+# path specifically and stay on it in both legs.
+require-env DELTA_PROVIDER
+
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/catalogdel' AS lake (TYPE fabricator, PROVIDER 'delta', deletion_vectors false);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/catalogdel' AS lake (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}', deletion_vectors false);
 
 statement ok
 CREATE TABLE lake.main.t (id INTEGER, name VARCHAR);
@@ -68,7 +76,7 @@ statement ok
 DETACH lake;
 
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/catalogdel' AS lake2 (TYPE fabricator, PROVIDER 'delta', deletion_vectors false);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/catalogdel' AS lake2 (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}', deletion_vectors false);
 
 query IT
 SELECT id, name FROM lake2.main.t ORDER BY id;

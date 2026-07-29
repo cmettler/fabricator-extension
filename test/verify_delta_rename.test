@@ -1,10 +1,22 @@
 # name: test/verify_delta_rename.test
-# description: The Delta provider's primary name is `engineeredwooddelta` (engineered-wood-backed), with `delta`
-#              kept as its ONE alias; both resolve to the same backend. The redundant second alias `deltalake`
-#              was REMOVED 2026-07-29 (a breaking removal, deliberately — one alias is enough, and the two
-#              names are about to mean different DEFAULTS rather than being interchangeable). Note `deltalake`
-#              survives in a DIFFERENT namespace that this does not touch: `WITH table_type='DELTALAKE'`, the
-#              Iceberg-style DDL option value (DeltaWithOptions), which is a table_type, not a PROVIDER.
+# description: The Delta provider has TWO spellings, and since 2026-07-29 they are NOT interchangeable —
+#              the requested name selects a default ENGINE profile (DeltaBackend.NativeDefaultsFor):
+#              `delta` => native_read/native_write ON (DuckDB moves the parquet bytes, engineered-wood owns
+#              the log — the hybrid we ship), `engineeredwooddelta` => both OFF (engineered-wood's own codec
+#              moves the bytes too). This suite pins that mapping, because a provider name silently changing
+#              which engine writes a user's data is the worst outcome the flip can regress into.
+#
+#              It is pinned through the data files' OWN witness: a parquet writer stamps `created_by`, so
+#              WHO wrote the bytes is observable from SQL — `DuckDB version …` vs `EngineeredWood`. Matching
+#              only the leading token keeps this stable across DuckDB version bumps. EXPLAIN is NOT usable
+#              here (checked): native read lives INSIDE the C# scan rather than as a plan-level parquet
+#              node, so both engines show FABRICATOR_SCAN and the plans are indistinguishable.
+#
+#              The redundant third alias `deltalake` was REMOVED (breaking, deliberate — one alias is
+#              enough, and the two surviving names now mean different DEFAULTS). Pinned below so a stray
+#              re-add cannot pass unnoticed. Note `deltalake` survives in a DIFFERENT namespace that this
+#              does not touch: `WITH table_type='DELTALAKE'`, the Iceberg-style DDL option value
+#              (DeltaWithOptions), which is a table_type and not a PROVIDER.
 #              Set FABRICATOR_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
 # group: [fabricator]
 
@@ -14,7 +26,7 @@ require parquet
 
 require-env FABRICATOR_DELTA_WRITE_DIR
 
-# Primary name.
+# ---- `engineeredwooddelta` (the primary name) => the pure EW codec wrote the data file ----
 statement ok
 ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/rn_primary' AS la (TYPE fabricator, PROVIDER 'engineeredwooddelta');
 
@@ -26,10 +38,16 @@ SELECT id FROM la.main.t;
 ----
 1
 
+query I
+SELECT DISTINCT regexp_extract(created_by, '^[A-Za-z]+')
+FROM parquet_file_metadata('${FABRICATOR_DELTA_WRITE_DIR}/rn_primary/t/*.parquet');
+----
+EngineeredWood
+
 statement ok
 DETACH la;
 
-# Legacy alias `delta`.
+# ---- `delta` (the alias, and the name to use) => DuckDB's own parquet writer wrote it ----
 statement ok
 ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/rn_delta' AS lb (TYPE fabricator, PROVIDER 'delta');
 
@@ -41,12 +59,79 @@ SELECT id FROM lb.main.t;
 ----
 2
 
+query I
+SELECT DISTINCT regexp_extract(created_by, '^[A-Za-z]+')
+FROM parquet_file_metadata('${FABRICATOR_DELTA_WRITE_DIR}/rn_delta/t/*.parquet');
+----
+DuckDB
+
 statement ok
 DETACH lb;
 
-# The removed alias is now an UNKNOWN provider — pinned so the removal cannot regress into a silent
-# resolution (BackendRegistry matches Name + Aliases case-insensitively, so a stray re-add would be invisible
-# without this).
+# ---- An EXPLICIT option still wins over the name's default, on either spelling ----
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/rn_override' AS lo (TYPE fabricator, PROVIDER 'delta', native_write false);
+
+statement ok
+CREATE TABLE lo.main.t AS SELECT 3 AS id;
+
+query I
+SELECT id FROM lo.main.t;
+----
+3
+
+# The default name with native_write off is the codec writer — so the profile is a DEFAULT, not a lock.
+query I
+SELECT DISTINCT regexp_extract(created_by, '^[A-Za-z]+')
+FROM parquet_file_metadata('${FABRICATOR_DELTA_WRITE_DIR}/rn_override/t/*.parquet');
+----
+EngineeredWood
+
+statement ok
+DETACH lo;
+
+# ...and the inverse: the codec spelling with native_write on hands the bytes to DuckDB.
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/rn_override2' AS lo2 (TYPE fabricator, PROVIDER 'engineeredwooddelta', native_write true);
+
+statement ok
+CREATE TABLE lo2.main.t AS SELECT 4 AS id;
+
+query I
+SELECT DISTINCT regexp_extract(created_by, '^[A-Za-z]+')
+FROM parquet_file_metadata('${FABRICATOR_DELTA_WRITE_DIR}/rn_override2/t/*.parquet');
+----
+DuckDB
+
+statement ok
+DETACH lo2;
+
+# ---- Both spellings still resolve to the SAME backend: each reads the other's table ----
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/rn_primary' AS xa (TYPE fabricator, PROVIDER 'delta');
+
+query I
+SELECT id FROM xa.main.t;
+----
+1
+
+statement ok
+DETACH xa;
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/rn_delta' AS xb (TYPE fabricator, PROVIDER 'engineeredwooddelta');
+
+query I
+SELECT id FROM xb.main.t;
+----
+2
+
+statement ok
+DETACH xb;
+
+# ---- The removed alias is an UNKNOWN provider — pinned so the removal cannot regress into a silent
+#      resolution (BackendRegistry matches Name + Aliases case-insensitively, so a stray re-add would be
+#      invisible without this). ----
 statement error
 ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/rn_deltalake' AS lc (TYPE fabricator, PROVIDER 'deltalake');
 ----

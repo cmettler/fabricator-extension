@@ -12,9 +12,17 @@ require parquet
 
 require-env FABRICATOR_DELTA_WRITE_DIR
 
+# ENGINE-PARAMETERIZED: this suite runs TWICE, once per Delta engine, because its subject — write /
+# transaction / update / delete semantics — must be IDENTICAL whichever engine moves the bytes.
+# ${DELTA_PROVIDER} is 'delta' (DuckDB reads+writes the parquet, EW owns the log) on one leg and
+# 'engineeredwooddelta' (pure EW codec) on the other; scripts/run-suites.sh drives both. ATTACHes that
+# pin native_read/native_write explicitly are NOT parameterized — those sections are about the native
+# path specifically and stay on it in both legs.
+require-env DELTA_PROVIDER
+
 # ATTACH a fresh (empty) Delta catalog root — no tables discovered yet.
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/catalogw' AS lake (TYPE fabricator, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/catalogw' AS lake (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}');
 
 # CREATE TABLE — writes an empty Delta table (commit 0, schema only).
 statement ok
@@ -89,7 +97,7 @@ DETACH lake;
 # Re-ATTACH proves the commits are durable + standard Delta (re-discovered from _delta_log).
 # `squares` was dropped, so only `t` remains.
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/catalogw' AS lake2 (TYPE fabricator, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/catalogw' AS lake2 (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}');
 
 query T
 SELECT table_name FROM duckdb_tables() WHERE database_name = 'lake2' ORDER BY table_name;

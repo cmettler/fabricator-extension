@@ -12,6 +12,9 @@
 #   1. every `require-env` it declares is one CI can satisfy itself:
 #        FABRICATOR_DELTA_WRITE_DIR  — a scratch directory
 #        FABRICATOR_DELTA_DIR        — test/fixtures/delta_simple, committed to this repo
+#        DELTA_PROVIDER              — which Delta engine to run as; a constant string, not a
+#                                      dependency. run-suites.sh sets it, and runs the suites that
+#                                      declare it ONCE PER ENGINE (the doubled leg).
 #   2. every `require <extension>` it declares is statically linked into the test binary
 #      (extension_config.cmake: fabricator, json, icu, parquet, httpfs).
 #
@@ -32,7 +35,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 LINKED='fabricator json icu parquet httpfs'
-SATISFIABLE_ENV='FABRICATOR_DELTA_WRITE_DIR FABRICATOR_DELTA_DIR'
+SATISFIABLE_ENV='FABRICATOR_DELTA_WRITE_DIR FABRICATOR_DELTA_DIR DELTA_PROVIDER'
 
 for f in test/*.test; do
     qualifies=1
