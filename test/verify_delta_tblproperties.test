@@ -5,6 +5,8 @@
 
 require fabricator
 
+require parquet
+
 require-env FABRICATOR_DELTA_WRITE_DIR
 
 # ---- Slice 1: SET / READ / UNSET round-trip (metaData commit; kernel-valid) ----

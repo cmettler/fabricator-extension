@@ -9,6 +9,8 @@
 
 require fabricator
 
+require parquet
+
 require-env FABRICATOR_DELTA_WRITE_DIR
 
 # Create two Delta tables under <dir>/catalog/ via the write collector.

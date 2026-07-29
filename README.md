@@ -708,7 +708,15 @@ setting (see [Partitioning & write tuning](#partitioning--write-tuning)).
 `PROVIDER 'delta'` attaches a **Delta Lake** root as a read-write DuckDB catalog. Each subdirectory with a
 `_delta_log/` is a table; data I/O goes through DuckDB's `FileSystem` (so `azure`/`httpfs` + DuckDB secrets
 work), and the Delta log layer is the pure-C# [engineered-wood](https://github.com/cmettler/engineered-wood)
-library (an in-tree submodule). (Aliases: `deltalake`; the primary name is `engineeredwooddelta`.)
+library (an in-tree submodule).
+
+**The two spellings pick different defaults, and that is the only difference between them.**
+`PROVIDER 'delta'` — the name to use — defaults `native_read`/`native_write` **on**: DuckDB reads and
+writes the Parquet bytes, engineered-wood owns the log. `PROVIDER 'engineeredwooddelta'` defaults them
+**off**, so engineered-wood's own codec reads and writes the data files too — a pure-C# path, kept for
+the codec-specific surfaces (`bloom_filter_columns`) and for isolating a bug to one layer. Both
+spellings reach the same catalog implementation and accept the same options, so either default can be
+overridden explicitly (`PROVIDER 'delta', native_write false`).
 
 **Storage targets** — table *discovery* is supported on **local** filesystems (incl. the Fabric-notebook
 fuse mount), **S3** (via `httpfs`), and **Fabric OneLake** (the abfss endpoint). Discovery on a **generic,
@@ -861,7 +869,8 @@ Any of these can also be set **per table** with `CREATE TABLE … WITH (…)` (a
 |--------|---------|--------|
 | `deletion_vectors` | **`true`** | DV / merge-on-read DELETE+UPDATE (+ row tracking); bumps the table to reader v3 |
 | `column_mapping` | **`'name'`** | writer v7; metadata-only RENAME / DROP COLUMN; Fabric T-SQL-endpoint compatible |
-| `change_data_feed`, `in_commit_timestamps`, `row_tracking`, `native_read`, `native_write`, `schemas` | `false` / off | opt-in |
+| `native_read`, `native_write` | **from the PROVIDER name** | `PROVIDER 'delta'` ⇒ both **on** (DuckDB's Parquet reader/writer — the production path); `PROVIDER 'engineeredwooddelta'` ⇒ both **off** (pure-EW codec). Either is still settable explicitly on either spelling |
+| `change_data_feed`, `in_commit_timestamps`, `row_tracking`, `schemas` | `false` / off | opt-in |
 | `isolation_level` | `write_serializable` | Spark's default; `serializable` also serializes blind appends |
 | `compression` | `snappy` | + auto dictionary encoding + always-on min/max stats |
 

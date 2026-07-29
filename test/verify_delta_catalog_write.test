@@ -8,6 +8,8 @@
 
 require fabricator
 
+require parquet
+
 require-env FABRICATOR_DELTA_WRITE_DIR
 
 # ATTACH a fresh (empty) Delta catalog root — no tables discovered yet.

@@ -11,6 +11,8 @@
 
 require fabricator
 
+require parquet
+
 require-env FABRICATOR_DELTA_WRITE_DIR
 
 statement ok

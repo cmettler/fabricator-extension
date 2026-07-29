@@ -246,6 +246,37 @@ current code still uses the single-provider `fabricator` naming):
 ## Next up (open threads for future sessions)
 
 In-flight / planned refactors (all C#-only unless noted; tests stay green per slice):
+- **THE DELTA NATIVE DEFAULTS FLIP — DONE (2026-07-29, behaviour-breaking for `PROVIDER 'delta'`).**
+  `native_read`/`native_write` used to default **off** everywhere, so the production path was opt-in and
+  the *tested* path was the pure-EW codec. Now **the provider NAME selects a default profile**
+  (`DeltaBackend.NativeDefaultsFor`): **`PROVIDER 'delta'` ⇒ both ON** (DuckDB reads/writes the parquet
+  bytes, EW owns the log — the hybrid we actually ship), **`PROVIDER 'engineeredwooddelta'` ⇒ both OFF**
+  (pure codec). Explicit options still win on either spelling. The name reaches the backend through a
+  3-arg `IBackend.OpenCatalog` **default-implementation interface overload**, so SqlServer/DAX/deltars are
+  untouched — no ABI bump. The redundant alias `deltalake` was REMOVED in the same pass.
+  - **The flip found two real bugs that were unreachable while native was opt-in** — the whole point of
+    making the shipped path the default one: (1) `FIELD_IDS` described the whole table schema instead of
+    the STREAM, so a write whose stream omitted columns was REFUSED (`00f0475`); (2) a buffered append
+    **committed inside an EXPLICIT transaction** when the table had an IDENTITY column, so `ROLLBACK` left
+    the rows behind (`b9ed65e`). Bug 2's code comment defended the shortcut with an argument about append
+    *commutativity* — which says nothing about *atomicity*. Treat a comment justifying a shortcut on
+    concurrency grounds as unexamined for rollback.
+  - **The engines are NOT at parity and cannot be:** clustered/Z-order OPTIMIZE needs `native_write`
+    because the recluster's global ORDER BY uses DuckDB's **spilling** sort, and EW has no external sort.
+    A clustering-declared table on a codec catalog therefore **WARNs** rather than silently bin-packing
+    (`3a1c898`, `verify_delta_clustered_optimize` §8).
+  - **Suite strategy: split by intent, plus a doubled leg.** Each suite is pinned to the engine it is
+    *about* (`verify_delta_catalog_variant`, `_row_tracking_virtual`, `_autocommit_pin` → codec, since the
+    codec IS their subject); the core four (write/transactions/update/delete) run **twice**, once per
+    engine, via `${DELTA_PROVIDER}` interpolation driven by `run-suites.sh`. `verify_delta_rename` pins
+    that each spelling selects its documented engine, observed through the data files' own
+    `parquet_file_metadata(...).created_by` (`DuckDB version …` vs `EngineeredWood`) — a change to
+    `NativeDefaultsFor` or the alias table then fails loudly and names the consequence.
+  - **The flip put ~18 delta suites on DuckDB's parquet reader/writer, which they never declared.** They
+    passed locally only because this box has `~/.duckdb/extensions/…/parquet.duckdb_extension`; on a bare
+    runner they fail with *Copy Function with name "parquet" is not in the catalog*. `require parquet`
+    added to all 18 — same class as the tier-2 `verify_mssql_s3_polybase` finding, and again only the
+    empty-`USERPROFILE`/`HOME` trick shows it.
 - **Lazy-opener filesystem (perf, OPEN — measured 2026-07-29):** `DuckDbTableFileSystem` captures the
   per-call opener, so a `DeltaTable` cannot be held open across ABI calls — every table REFERENCE costs
   **4 snapshot constructions per statement** (2 ScanTable calls × 2 opens; self-join 8, dead linear;

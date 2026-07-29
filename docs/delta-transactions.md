@@ -39,9 +39,13 @@ is its own atomic Delta commit and deliberately does **not** roll back with a su
 
 ## 2. The three path settings — what changes transactionally
 
-ATTACH options `native_read` / `native_write` (both default **off**) select the *byte source* for
-data files; they do **not** change transaction semantics. The transaction machinery (buffer, pin,
-flush, rebase) is identical; only the mechanics of "get the rows onto storage / off storage"
+ATTACH options `native_read` / `native_write` select the *byte source* for data files; they do
+**not** change transaction semantics. **Their defaults come from the PROVIDER NAME** (since
+2026-07-29): `PROVIDER 'delta'` defaults **both on** (the native hybrid — the production path),
+`PROVIDER 'engineeredwooddelta'` defaults **both off** (the pure-EW codec path). Either option can
+still be set explicitly on any spelling, so `PROVIDER 'delta', native_write false` is the codec
+writer under the default name. The transaction machinery (buffer, pin, flush, rebase) is identical
+whichever way the flags land; only the mechanics of "get the rows onto storage / off storage"
 differ:
 
 | | **EW codec** (both off) | **`native_write`** | **`native_read`** |

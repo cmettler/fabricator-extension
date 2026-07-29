@@ -340,7 +340,11 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      table.
 1. **Folder-root `DeltaCatalog` + read — DONE (local; OneLake discovery caveat below).** `DeltaBackend` (3rd
    `IBackend`, name `"engineeredwooddelta"` + its one alias `"delta"` (the redundant `"deltalake"` was removed
-   2026-07-29), registered explicitly in `BackendRegistry.Discover` since it lives
+   2026-07-29). **The two spellings are not interchangeable any more**: the requested name selects a
+   default PROFILE via `DeltaBackend.NativeDefaultsFor` — `"delta"` ⇒ `native_read`/`native_write` both
+   **on**, `"engineeredwooddelta"` ⇒ both **off** — which is why the name reaches the backend at all (the
+   3-arg `IBackend.OpenCatalog` overload, a default-implementation interface method so the other backends
+   are untouched). Registered explicitly in `BackendRegistry.Discover` since it lives
    in the Bridge alongside `DeltaReader`) + `DeltaCatalog : IBackendCatalog` (read-only this slice; writes
    throw). `ATTACH '/lake' AS lake (TYPE fabricator, PROVIDER 'delta')` → tables = immediate subdirs with a
    `_delta_log/` (globbed `<root>/*/_delta_log/*.json`), flat `main` schema; columns via `DeltaReader.GetSchema`;
@@ -474,8 +478,9 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      DuckDB's single-statement atomic scan→delete never needs. Recommendation kept: transient rowid for DML;
      `row_tracking true` is a **write-side interop feature** for external readers, not a DML mechanism.
 
-     **NATIVE READ — DONE (opt-in `native_read true` ATTACH option, C#-only, NO ABI/C++; docs/multifile-delta.md
-     slice 1e).** A plain `SELECT … FROM lake.main.t` sources its bytes through **DuckDB's own parquet reader**
+     **NATIVE READ — DONE (`native_read true` ATTACH option, C#-only, NO ABI/C++; docs/multifile-delta.md
+     slice 1e).** *(It was opt-in when built; since 2026-07-29 `PROVIDER 'delta'` defaults it ON — see the
+     provider-profile note under slice 1 above.)* A plain `SELECT … FROM lake.main.t` sources its bytes through **DuckDB's own parquet reader**
      instead of engineered-wood's C# reader: `DeltaCatalog.ScanTable`'s plain-read branch runs
      `Host.Query("SELECT * FROM read_parquet([<exact active files>])")` (files via
      `DeltaReader.GetActiveFileUrisWithDv`; tuned decode + cross-file parallelism + `ExternalFileCache`, over
