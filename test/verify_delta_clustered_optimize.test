@@ -653,8 +653,11 @@ DETACH lake;
 #     asked for clustering via SORTED BY and got bin-packing with no diagnostic. It matters more now that the
 #     PROVIDER spelling alone can decide whether the native writer is on.
 # ---------------------------------------------------------------------------------------------------------
+# native_write false EXPLICITLY rather than by provider name: what this section observes is the WRITER being
+# absent, so it should keep testing that even if the name -> profile mapping changes.
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/clustopt_codec' AS clake (TYPE fabricator, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/clustopt_codec' AS clake
+  (TYPE fabricator, PROVIDER 'delta', native_read false, native_write false);
 
 # SORTED BY persists fabricator.sortedBy (and, unpartitioned, declares the delta.clustering domain), so this
 # table DOES declare clustering even though the catalog cannot recluster it.

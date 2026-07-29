@@ -180,8 +180,11 @@ SELECT id, v::VARCHAR FROM codecread.main.vt ORDER BY id;
 9	{'a': 1, 'b': x}
 
 # ---- pure codec path (no native flags): engineered-wood WRITES the annotated variant group too ----
+# PROVIDER 'engineeredwooddelta': these sections assert the EW CODEC's shredded parquet layout (typed_value
+# column counts). DuckDB's writer shreds differently, so the shape assertions only mean anything here.
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/varcodec' AS codecrw (TYPE fabricator, PROVIDER 'delta', column_mapping 'none');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/varcodec' AS codecrw
+  (TYPE fabricator, PROVIDER 'engineeredwooddelta', column_mapping 'none');
 
 statement ok
 CREATE TABLE codecrw.main.cvt (id INTEGER, v VARIANT);

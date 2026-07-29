@@ -415,8 +415,12 @@ SELECT __delta_row_id FROM lake2.main.nt;
 not found
 
 # a NON-native (codec) catalog does not advertise the virtual columns even on a row-tracking table
+# PROVIDER 'engineeredwooddelta': the point of this section is that a catalog WITHOUT the native reader does
+# not bind __delta_row_id at all. Under 'delta' the native reader binds them, which is correct behaviour and
+# would make this negative pin fail.
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/rtvirt' AS lake3 (TYPE fabricator, PROVIDER 'delta', READ_ONLY true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/rtvirt' AS lake3
+  (TYPE fabricator, PROVIDER 'engineeredwooddelta', READ_ONLY true);
 
 statement error
 SELECT __delta_row_id FROM lake3.main.rt;

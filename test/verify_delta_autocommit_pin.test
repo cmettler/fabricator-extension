@@ -34,8 +34,12 @@ require parquet
 require-env FABRICATOR_DELTA_WRITE_DIR
 
 # A plain codec catalog: native_read OFF, which is the default and the path that never pinned in autocommit.
+# PROVIDER 'engineeredwooddelta': this suite is ABOUT the codec read path's pin, so it names the pure-EW
+# engine rather than relying on a default. Under 'delta' the native reader pins via ResolveVersionAsOf and
+# the 'delta codec pin' line these assertions count is never emitted.
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/apin' AS lake (TYPE fabricator, PROVIDER 'delta', READ_ONLY false);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/apin' AS lake
+  (TYPE fabricator, PROVIDER 'engineeredwooddelta', READ_ONLY false);
 
 # One table per case, so each case's pin lines can be counted independently (duckdb_logs accumulates for the
 # whole session, and every autocommit statement is its own transaction => its own pin).
