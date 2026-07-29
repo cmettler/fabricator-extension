@@ -231,8 +231,27 @@ jobs:
           EOF
           )
           notes=${notes//__DUCKDB_VERSION__/$DUCKDB_VERSION}
-          gh release create "${{ github.ref_name }}" release/*.zip \
-            --repo "${{ github.repository }}" \
-            --title "fabricator ${{ github.ref_name }} — DuckDB ${DUCKDB_VERSION}" \
-            --notes "$notes" \
-            --draft
+          # IDEMPOTENT, because a re-cut is normal: while a release is still a DRAFT its tag may be moved
+          # onto a newer commit (CLAUDE.md records three such moves), and this workflow then re-runs for the
+          # SAME tag name. `gh release create` FAILS outright on an existing release, so the pack jobs would
+          # all succeed and only this final step would error — the most annoying possible place to fail.
+          # Updating in place also avoids deleting a draft just to rebuild its assets.
+          TAG="${{ github.ref_name }}"
+          TITLE="fabricator $TAG — DuckDB ${DUCKDB_VERSION}"
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "release $TAG exists — updating it in place"
+            # --clobber replaces same-named assets; names are <duckdbversion>-<platform>-<sku> and stable.
+            gh release upload "$TAG" release/*.zip --clobber --repo "${{ github.repository }}"
+            # Re-assert the title/notes AND that it is still a draft, so a re-cut cannot silently publish.
+            gh release edit "$TAG" \
+              --repo "${{ github.repository }}" \
+              --title "$TITLE" \
+              --notes "$notes" \
+              --draft=true
+          else
+            gh release create "$TAG" release/*.zip \
+              --repo "${{ github.repository }}" \
+              --title "$TITLE" \
+              --notes "$notes" \
+              --draft
+          fi
