@@ -2441,6 +2441,22 @@ INSERT INTO idl.main.t (v) VALUES ('doomed');
 statement ok
 ROLLBACK;
 
+# THE ATOMICITY PIN. A rolled-back buffered identity append must leave NO rows and NO commit. This is
+# what the native-write default exposed: an identity table cannot use the streaming writer (engineered-wood
+# generates the values), and the fallback used to commit immediately — justified by "append+append commute",
+# which is an argument about CONCURRENCY and says nothing about ROLLBACK. So the rows silently survived.
+# Asserted as a ROW COUNT and a COMMIT COUNT: the count(DISTINCT id) checks around this section would drift
+# by one in the same failure, but neither says "nothing was committed" outright.
+query I
+SELECT count(*) FROM idl.main.t;
+----
+7
+
+query I
+SELECT count(*) FROM fabricator_delta_snapshots('idl', 't');
+----
+4
+
 statement ok
 INSERT INTO idl.main.t (v) VALUES ('h');
 

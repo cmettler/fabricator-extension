@@ -1934,12 +1934,22 @@ public sealed class DeltaCatalog : IBackendCatalog
                         schemaName, tableName, deferredRows, txnId);
                     return deferredRows;
                 }
-                // Streaming not applicable (identity/iceberg fall back to the collect writer). With NO
-                // pending ALTER: commit immediately as before (append+append commute, pending appends
-                // stay correct). With a pending ALTER the data must NOT commit before the schema does —
-                // collect it under the buffer instead (below).
+                // Streaming not applicable (identity/iceberg fall back to the collect writer). What the
+                // fallback may do depends on the MODE, and the distinction is the one the old comment here
+                // got wrong: it justified committing immediately with "append+append commute", which is an
+                // argument about CONCURRENCY and says nothing about ROLLBACK.
+                //   * AUTOCOMMIT — committing now is fine and is the long-validated shape: the DuckDB
+                //     transaction commits at statement end regardless, so it is byte-identical.
+                //   * EXPLICIT BEGIN..COMMIT — it must NOT commit. A committed append cannot be undone, so
+                //     ROLLBACK would silently keep the rows. Collect under the buffer instead (below).
+                //     This was unreachable until `PROVIDER 'delta'` began defaulting native_write ON: with
+                //     it off, tryStream was false and every identity append already took the buffered path.
+                //     Caught by verify_delta_catalog_transactions' identity section (3 log commits mid-txn
+                //     where 2 are correct) and pinned there by a ROLLBACK assertion.
+                // A pending ALTER also forces collection, for a different reason: the data must not commit
+                // before the schema it was written against.
             }
-            if (!tryStream || pending.PendingMetadata is not null)
+            if (!tryStream || pending.PendingMetadata is not null || _txnBuffer.IsExplicit(txnId))
             {
                 var (bschema, bbatches, brows) = DeltaWriter.Materialize(data, default);
                 // Pending-created IDENTITY table: generate the engine values NOW from the parked

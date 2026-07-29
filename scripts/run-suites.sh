@@ -49,7 +49,9 @@ case "$TIER" in
         # 4206 since 2026-07-29: verify_delta_clustered_optimize gained 9 (§8 pins that a clustering-declared
         # table on a catalog WITHOUT the native writer WARNS instead of silently bin-packing).
         : "${MIN_SUITES:=54}"
-        : "${MIN_ASSERTIONS:=4206}"
+                # 4208 since 2026-07-29: verify_delta_catalog_transactions gained 2 (the ROLLBACK atomicity pin for
+        # the buffered identity append the native-write default exposed).
+        : "${MIN_ASSERTIONS:=4208}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
