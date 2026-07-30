@@ -1,9 +1,10 @@
 # Delta snapshot caching — holding a `DeltaTable` open across ABI calls
 
-**Status: NOT BUILT, and the full version is NOT RECOMMENDED on present evidence.** Two prerequisites are
-done and shipped; the cache itself is gated on a measurement nobody has taken. Read §7 before starting
-work — the recommendation changed once the design was examined, and the cheap version covers the path we
-actually ship.
+**Status: NOT BUILT. Gated on a measurement nobody has taken (§7).** Two prerequisites are done and shipped
+(§2). Read §4 and §7 before starting work: examining the design twice changed what it should be. Caching a
+live `DeltaTable` — the original idea, §6 — is NOT recommended and is not needed; the expensive artifact is
+the immutable `Snapshot`, and caching THAT (§5) serves both engines while dissolving the disposal, dangling-
+opener and thread-safety problems entirely.
 
 ---
 
@@ -167,54 +168,109 @@ key must carry the version, or be scoped by the pin, rather than meaning "the ta
 
 ---
 
-## 4. The decisive asymmetry: the native path needs no live table
+## 4. What is actually expensive, and therefore what to cache
 
-`DeltaNativeReader` has **zero** references to `DeltaTable`. Under `native_read` the scan needs exactly two
-things — the schema, and the file listing (`NativeScanList` from `DeltaReader.ListNativeScanFiles`) — and
-both are **plain immutable data**; DuckDB then reads the parquet itself.
+`DeltaTable.OpenAsync` is, in full:
 
-The codec path is different: its stream needs a live table to decode, for the whole duration of the
-enumeration.
+```csharp
+long latestVersion = await log.GetLatestVersionAsync(ct);                     // the _delta_log LIST
+var snapshot = await SnapshotBuilder.BuildAsync(log, checkpointReader, null, ct); // commit/checkpoint reads + replay
+ProtocolVersions.ValidateReadSupport(snapshot.Protocol);
+return new DeltaTable(fileSystem, options, snapshot);                        // a cheap holder
+```
 
-Since the native-defaults flip, `PROVIDER 'delta'` — the name users are told to use — is the **native**
-path. So the engine that ships is the one that does NOT need a live object cached.
+Every expensive thing — the listing, the commit and checkpoint reads, the replay CPU — exists to produce the
+**`Snapshot`**. The `DeltaTable` is a thin wrapper around it, and the filesystem is `opener` + a normalized
+root string.
+
+`Snapshot` (`EngineeredWood.DeltaLake/Snapshot/Snapshot.cs`) is **immutable**: `required … { get; init; }`
+properties over `IReadOnlyDictionary` collections (`ActiveFiles`, `AppTransactions`, `DomainMetadata`,
+`Tombstones`), plus `Version`, `Metadata`, `Protocol`, `Schema`, `ArrowSchema`.
+
+**So cache the `Snapshot`, keyed (txn, path, version) — not a `DeltaTable`, and not a `NativeScanList`.**
+
+### 4.1 Why NOT the `NativeScanList` (a flaw in an earlier draft of this doc)
+
+`ListNativeScanFiles(opener, path, unit, value, **prune**, log, schemaOverride)` returns a **post-prune**
+list: its `Files` are the survivors of best-effort Delta-log file pruning against the pushed predicate.
+Caching it per (txn, path, version) would hand one scan another scan's pruned file set — and a file set that
+is too SMALL means **silently missing rows**. Two aggregate subqueries over one table with different `WHERE`
+clauses is enough to hit it. Pruning and deletion-vector resolution are per-call work DOWNSTREAM of the
+snapshot; only the snapshot is cacheable.
 
 ---
 
-## 5. RECOMMENDED (if the measurement justifies anything): cache DATA, native only
+## 5. RECOMMENDED design: cache the immutable `Snapshot`, construct the table per call
 
-Cache the *outcome* rather than the resource: `(schema, NativeScanList, version)` keyed by (txn, path),
-stored in the existing `SnapshotPinning` per-txn structure, invalidated per §3.5.
+Per read: build the (cheap) filesystem, take the cached `Snapshot` for (txn, path, pinned version), wrap it
+in a fresh `DeltaTable`, then prune / resolve DVs / decode exactly as today.
 
-| | data cache (§5) | resource cache (§6) |
-|---|---|---|
-| disposal | none — plain data, GC handles it | sync-over-async at transaction end |
-| dangling opener | cannot happen | must be solved (done, §2) |
-| thread safety | immutable ⇒ trivially safe | rests on an unenforced EW invariant (§3.2) |
-| staleness | version key + §3.5 | version key + §3.5 |
-| covers | native only — **which is the default** | both engines |
-| touches | the two listing/schema entry points | 6 async iterators + ownership plumbing |
+This needs **one small additive engineered-wood patch**, because `OpenAsync`/`CreateAsync`/`OpenOrCreateAsync`
+are the only public factories and the snapshot-taking constructor is private:
 
-Three of the four failure modes disappear, and the one that remains — staleness — is the one the version key
-and the invalidation list already address.
+```csharp
+// engineered-wood, on fabricator-patches — additive, no behaviour change, upstreamable:
+public static DeltaTable FromSnapshot(ITableFileSystem fs, DeltaTableOptions options, Snapshot snapshot)
+    => new DeltaTable(fs, options, snapshot);
+```
+
+A legitimate entry point in its own right ("I already have the snapshot"), so it is a reasonable thing to
+offer upstream rather than carry indefinitely.
+
+**Why this dominates both alternatives:**
+
+| | cache `Snapshot` (§5) | cache `NativeScanList` | cache `DeltaTable` (§6) |
+|---|---|---|---|
+| captures the redundant cost | **all of it** (LIST + replay) | all of it | all of it |
+| correct under differing pushed predicates | **yes** — pruning stays per-call | **NO** — silently drops rows (§4.1) | yes |
+| serves which engines | **both** | native only | both |
+| disposal | none — immutable data, GC | none | sync-over-async at txn end |
+| dangling opener | cannot happen — fs per call | cannot happen | must be solved |
+| thread safety | **dissolves** — only immutable data is shared, each call gets its own table | trivial | rests on an unenforced EW invariant (§3.2) |
+| code shape | a lookup at the existing open sites | ditto | a lease + ownership flag threaded through 6 async iterators |
+| staleness | version key + §3.5 | version key + §3.5 | version key + §3.5 |
+
+The §3.2 thread-safety worry — that our safety rests on "no read path mutates `_currentSnapshot`", an EW
+invariant nobody enforces — **disappears** here: nothing mutable is shared, because each call still gets its
+own `DeltaTable`. That is the single biggest reason to prefer this shape. It also needs none of the
+async-iterator surgery §3.3 identified, since tables remain per-call and their `finally DisposeAsync` stays
+exactly as it is.
+
+### 5.1 Sketch
+
+1. EW: the `FromSnapshot` factory above.
+2. Bridge: a `SnapshotCache` beside `SnapshotPinning` (or inside its per-txn structure, so
+   `Release(txnId)` — already wired to commit and rollback — clears it for free). Key (txn, path, version);
+   value the `Snapshot`. No disposal needed.
+3. Bridge: at each `DeltaTable.OpenAsync` site that is a READ, consult the cache; on a miss, open as today
+   and populate from `table.CurrentSnapshot`. Writes and `RefreshAsync` never consult it.
+4. Invalidate per §3.5.
+
+### 5.2 What it does NOT cover
+
+Deletion-vector position resolution stays per-call (it reads the DV files). That is content IO rather than a
+listing, so unlike `_delta_log` LISTs it can be served by `ExternalFileCache` — measure before treating it as
+a problem, and note it would be a separate cache with a separate key.
 
 ---
 
-## 6. NOT RECOMMENDED: the resource cache (holding `DeltaTable` open)
+## 6. NOT RECOMMENDED: caching the `DeltaTable` itself
 
-Needed only for the CODEC path, which is no longer the default. Shape, if it is ever built anyway:
+The original proposal, kept for the record. Needed only if something must share a LIVE table across calls,
+which §5 shows is unnecessary: the expensive artifact is the snapshot, and wrapping it is free.
 
-1. A lease type that reports whether the table is OWNED (dispose in the iterator's `finally`) or BORROWED
-   (do not) — §3.3 identifies that unconditional `DisposeAsync` as the specific thing to change.
-2. Thread through the 6 schema/`Stream*` entry points in `DeltaReader`.
+Shape, if ever built anyway:
+
+1. A lease type reporting whether the table is OWNED (dispose in the iterator's `finally`) or BORROWED (do
+   not) — §3.3 identifies that unconditional `DisposeAsync` as the specific thing to change.
+2. Thread it through the 6 schema/`Stream*` entry points in `DeltaReader`.
 3. Store per (txn, path) in `SnapshotPinning`; dispose in `Release(txnId)`, sync-over-async at one blocking
    point per the codebase convention.
 4. Invalidate per §3.5.
 
 **Why not:** all four failure modes are silent — stale read, data race, leaked table, use-after-free — and
-they land in an area where this development box would not fault. The thread-safety argument depends on a
-submodule invariant nobody enforces (§3.2). The benefit accrues to the non-default engine. And the whole
-case rests on a count rather than a profile (§1.1).
+they land where this development box would not fault. It buys nothing over §5 while owning an EW invariant
+nobody enforces (§3.2).
 
 ---
 
@@ -224,7 +280,10 @@ case rests on a count rather than a profile (§1.1).
    opens, using the §1 method. If the redundant log reads are hundreds of milliseconds, §5 is worth it. If
    they are tens, close the item. This is roughly an hour of work and it settles a question that a multi-hour
    build would otherwise be defended by an operation count.
-2. **If it matters, build §5** — data cache, native only. Understandable in one sitting; the failure mode
-   reduces to staleness.
-3. **Leave §6 alone** unless the codec path becomes load-bearing again AND the EW invariant in §3.2 gains a
-   test upstream.
+2. **If it matters, build §5** — cache the immutable `Snapshot` per (txn, path, version), plus the small
+   additive `FromSnapshot` factory in engineered-wood. Understandable in one sitting, serves both engines, and
+   the only failure mode left is staleness, which the version key and the §3.5 invalidation list address.
+3. **Do not build §6** (caching a live `DeltaTable`). It buys nothing over §5 and costs a lease abstraction
+   threaded through 6 async iterators plus a dependency on an EW invariant nobody enforces (§3.2).
+4. **Do not cache the `NativeScanList`** (§4.1) — it is post-prune, so sharing it across scans with different
+   pushed predicates silently drops rows.

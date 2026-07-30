@@ -320,12 +320,15 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     wall-clock. The Fabric notebook's 305 s → 15 s came from two OTHER fixes, dominated by `HostFsGlob`'s
     open-per-matched-file (258 s → 2 s). Do not call this "the biggest remaining perf item" again without
     profiling it; that inference is what the doc's decision gate exists to stop.
-  - **If anything is built, cache DATA and not the resource.** `DeltaNativeReader` has ZERO references to
-    `DeltaTable`: under `native_read` — which the shipped `PROVIDER 'delta'` now selects — a scan needs only
-    the schema and the `NativeScanList`, both immutable plain data. That removes disposal, the dangling
-    opener and thread safety as concerns, leaving only staleness, which the version key already handles. The
-    live-`DeltaTable` cache is needed ONLY by the codec path (no longer the default) and its read-safety
-    rests on an EW invariant upstream never promised and no test enforces.
+  - **If anything is built, cache the immutable `Snapshot` — NOT a `DeltaTable`, NOT a `NativeScanList`.**
+    `DeltaTable.OpenAsync` is *entirely* "LIST the log, replay it into a `Snapshot`, wrap it in a cheap
+    holder", and `Snapshot` is init-only over `IReadOnlyDictionary`. So caching it per (txn, path, version)
+    captures ALL the redundant cost while every call still builds its own table — which dissolves disposal,
+    the dangling opener AND the thread-safety dependency on an unenforced EW invariant. Serves BOTH engines.
+    Needs one small additive EW patch (`FromSnapshot`, since the snapshot-taking ctor is private). Caching a
+    live `DeltaTable` buys nothing over this and costs a lease threaded through 6 async iterators. Caching a
+    `NativeScanList` is WRONG: it is post-prune, so sharing it between scans with different pushed predicates
+    silently DROPS ROWS.
   - **⚠ Two traps recorded in the doc:** there is NO intra-call shortcut (the `Stream*` methods are async
     ITERATORS, so the schema open completes and disposes BEFORE the stream open begins, in a different ABI
     call), and `TableFunction::function_info` is the WRONG shelf for cached state (its lifetime is the PLAN,
