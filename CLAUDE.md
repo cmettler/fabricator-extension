@@ -1116,9 +1116,30 @@ are missing.
 | `osx_arm64` | ✅ | ❌ impossible | ✅ Standalone | hosted macOS runners **cannot run containers**, so SQL Server/MinIO are unreachable. Demand-driven (DuckDB's user base skews Apple Silicon); DAX untested. Gatekeeper + signing are also outside CI (a runner never quarantines what it built) |
 
 **Traps that cost real cycles — do not rediscover them:**
+- **A NEGATIVE RESULT IS NOT A MEASUREMENT UNTIL THE METHOD IS SHOWN TO WORK.** The first two entries
+  below are this rule in one narrow form, and `run-suites.sh` institutionalises it (it asserts positive
+  facts — "All tests passed" present, nothing skipped, floors met — rather than trusting an exit status).
+  It applies identically to every AD-HOC probe, which is where it keeps being rediscovered; three separate
+  times on 2026-07-30 alone, each costing a wrong conclusion:
+  - **Zero/empty needs a POSITIVE CONTROL.** A missing tool, a typo'd pattern and a genuine absence all
+    produce the same `0`. (`strings` is NOT installed in this Git Bash — `strings <bin> | grep -c X`
+    silently yields 0 for every X. Use `grep -ac X <bin>`, and check a string that must NOT be there.)
+  - **A probe whose PRECONDITION failed is VOID, not evidence** — in either direction. An OPTIMIZE probe
+    asserted the concurrent compaction had committed, that assertion failed for an unrelated reason, and
+    the failure got read as "no compaction happened, so the code path was never exercised". It had been
+    committing all along.
+  - **Confirm the query answers the question you asked.** `max(operation)` over a string column returns
+    the ALPHABETICAL maximum, not the latest row's value.
+  - **Corollary, and the expensive one — to establish that code path A never reaches B, INSTRUMENT B.**
+    A backwards grep encodes the searcher's assumed call shape and returns a plausible but incomplete
+    enumeration: a regex requiring `…Async` cannot see `table.StartTransaction(...)`, which is exactly how
+    "our flush never reaches `CommitOccAsync`" got asserted — on an upstream PR — when the real chain is
+    `StartTransaction` → `txn.CommitAsync()` → `CommitTransactionAsync` → `CommitOccAsync`. Reading which
+    code emits an error message settles such questions in seconds; backwards tracing does not settle them
+    at all.
 - **A no-match sqllogictest filter exits ZERO** ("No tests ran"), and the filter is Catch-style, so a
   MID-pattern `*` matches nothing (`test/verify_x*.test` fails, `test/verify_x*` works). A green run
-  proves nothing without a positive assertion.
+  proves nothing without a positive assertion. (An instance of the rule above.)
 - **`unittest -f <list>` (batch mode) is unusable here**: one CLR per process means earlier suites'
   finalizers run during later ones — SIGSEGV at suite 41/53 inside Apache.Arrow's
   `ImportedArrowArrayStream` finalizer. One process per suite is not a style choice.
