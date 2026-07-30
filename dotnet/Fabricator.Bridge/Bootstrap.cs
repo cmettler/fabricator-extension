@@ -999,14 +999,18 @@ public static unsafe class Bootstrap
                 return FabricatorStatus.InvalidArgument;
             }
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
+            // ArrowSchemaExport, not CArrowSchemaExporter: a function taking NO arguments has a zero-field
+            // parameter schema, which Apache.Arrow cannot export at all (it throws ArgumentNullException on
+            // 'fields'). The host treats any failure here as "the function is stale" and silently drops it, so
+            // using the raw exporter makes every zero-argument function invisible. See ArrowSchemaExport.
             if (handle == 0) // global (connection-free) function — resolve by name (any kind), no catalog
             {
-                CArrowSchemaExporter.ExportSchema(GlobalFunctions.ParamSchema(f), outSchema);
+                ArrowSchemaExport.Export(GlobalFunctions.ParamSchema(f), outSchema);
                 return FabricatorStatus.Ok;
             }
             var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
-            CArrowSchemaExporter.ExportSchema(catalog.GetFunctionParamSchema(s, f), outSchema);
+            ArrowSchemaExport.Export(catalog.GetFunctionParamSchema(s, f), outSchema);
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)

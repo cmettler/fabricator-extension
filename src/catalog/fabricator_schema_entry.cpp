@@ -1136,6 +1136,17 @@ unique_ptr<FunctionData> FabricatorTableFunctionBind(ClientContext &context, Tab
 	auto bind_state = make_shared_ptr<TableBindState>();
 	bind_data->factory = [handle, schema_name, func_name, arg_types, arg_names, properties, marshal_args,
 	                      bind_state](const fabricator::ArrowScanRequest &, ArrowArrayStream &out) {
+		if (arg_types.empty()) {
+			// A function taking NO arguments: pass no stream at all rather than an empty one. `args` is
+			// nullable by contract, and an ARGUMENT-LESS Arrow batch cannot cross — a zero-field schema is
+			// unrepresentable in Apache.Arrow's C-interface importer AND exporter (it throws
+			// ArgumentNullException on 'fields'), so marshaling one fails the bind with an error that names
+			// nothing recognizable. Keeping this branch is what makes zero-argument table functions work,
+			// which is the shape a catalog-bound function that infers everything from its ATTACH wants.
+			bind_state->binding = fabricator::TableBind(handle, schema_name, func_name, nullptr, out,
+			                                          bind_state->supports_pushdown);
+			return;
+		}
 		ArrowArray array = marshal_args();
 		fabricator::ArrowProducer producer(arg_types, arg_names, properties);
 		producer.AddBatch(array);
