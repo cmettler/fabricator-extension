@@ -91,8 +91,12 @@ case "$TIER" in
         # custom table function — both `:=` and `=>` spellings, that the argument really crosses the ABI (an
         # unknown value yields NO rows rather than all of them), that a misspelled name is a clean BINDER error
         # rather than silently ignored, and that a named parameter is NOT positionally callable.
+        # 5573 since 2026-07-31: verify_global_functions gained 9 (63 -> 72) — the demo global fabricator_seq
+        # now has a MIXED signature (positional n + named start), which is the combination that can fail
+        # SILENTLY: the host marshals every declared parameter, substituting a typed NULL for an omitted named
+        # one, so an off-by-one there corrupts the POSITIONAL value rather than erroring.
         : "${MIN_SUITES:=62}"
-        : "${MIN_ASSERTIONS:=5564}"
+        : "${MIN_ASSERTIONS:=5573}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

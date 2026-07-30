@@ -360,9 +360,17 @@ Slices land independently, tests green per slice. Estimated shape, not a schedul
    - **SCALAR functions are NOT included, and cannot be**: DuckDB `ScalarFunction` has no named-parameter
      concept at all. So the shortcut scalars keep positional signatures, and
      `fabric_create_shortcut_ex(…, conflict_policy)` stays a real sibling rather than a workaround.
-   - Gate: `verify_delta_catalog_functions` §6 (both `:=` and `=>` spellings; that the value really crosses
+   - **Positional and named MIX freely**, and that is the combination worth testing rather than either alone:
+     the host marshals EVERY declared parameter, substituting a typed NULL for an omitted named one, so an
+     off-by-one there corrupts the POSITIONAL values instead of erroring. Verified live on
+     `fabric_run_notebook('nb', wait_seconds := 900, params_json := '{…}')` — named args supplied OUT of
+     declared order with the intervening `config_json` omitted — by reading the values back out of the
+     notebook (`p_text: "mixed-args", p_int: 99`), which a shift would have turned into defaults.
+   - Gates: `verify_delta_catalog_functions` §6 (both `:=` and `=>` spellings; that the value really crosses
      the ABI rather than being filtered above the scan; that a misspelled name is a clean binder error with
-     candidates rather than silently ignored; that a named parameter is not positionally callable).
+     candidates rather than silently ignored; that a named parameter is not positionally callable) and
+     `verify_global_functions` (the demo global `fabricator_seq(n, start := …)` now carries a MIXED signature,
+     so the global registration path is pinned hermetically too — live tests are not in CI).
 
 ## 8. Deferred / out of scope (recorded so they aren't re-litigated)
 

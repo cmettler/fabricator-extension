@@ -335,7 +335,12 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     code. **Scalars are excluded and unfixable**: DuckDB `ScalarFunction` has no named-parameter concept, so
     `fabric_create_shortcut_ex(…, conflict_policy)` remains a genuine sibling. Gate
     `verify_delta_catalog_functions` §6 (27) — both spellings, the value really crossing the ABI, a
-    misspelled name as a clean binder error, and no positional callability.
+    misspelled name as a clean binder error, and no positional callability. **Positional + named MIX freely**,
+    which is the case that fails SILENTLY if the NULL substitution is off by one (it would corrupt the
+    POSITIONAL value rather than error) — pinned hermetically by the demo global `fabricator_seq(n, start := …)`
+    in verify_global_functions (72), and verified live on
+    `fabric_run_notebook('nb', wait_seconds := 900, params_json := '{…}')` with the args out of declared order
+    and the intervening one omitted, read back from the notebook's own output.
   - Output shape rule (D4): typed flat columns + one raw-JSON column for polymorphic parts; **no STRUCT
     wrapping** (adding a column is additive for `SELECT *`; adding a struct FIELD changes a column's type
     and breaks bound views), no JSON-only. Every `table`-kind function also gets a dead `_each` sibling —

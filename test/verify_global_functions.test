@@ -113,6 +113,38 @@ SELECT squared FROM fabricator_seq(5) WHERE value > 3 ORDER BY squared;
 16
 25
 
+# MIXED positional + NAMED parameters. `start` is optional, which on a table function means a DuckDB NAMED
+# parameter (positional table arguments have no defaults), and the two kinds must work TOGETHER — a global
+# function's signature is built from one declared schema split on the `fabricator.named` tag.
+#
+# The mixed case is the one that can break silently: the host marshals EVERY declared parameter, substituting
+# a typed NULL for an omitted named one, so an off-by-one there would corrupt the POSITIONAL value too (the
+# rows below would start at the wrong number rather than erroring).
+query II
+SELECT value, squared FROM fabricator_seq(3, start := 10) ORDER BY value;
+----
+10	100
+11	121
+12	144
+
+# Omitting it falls back to the function's own default, and the positional argument still lands correctly.
+query I
+SELECT min(value) FROM fabricator_seq(3);
+----
+1
+
+# `=>` is the other DuckDB named-argument spelling.
+query I
+SELECT min(value) FROM fabricator_seq(2, start => 7);
+----
+7
+
+# The named parameter is not positionally callable — it is not in the positional signature.
+statement error
+SELECT * FROM fabricator_seq(3, 10);
+----
+<REGEX>:.*
+
 # ARG-DEPENDENT output schema: fabricator_columns(n) returns n columns c1..cn, resolved at bind from the arg.
 query III
 SELECT c1, c2, c3 FROM fabricator_columns(3);

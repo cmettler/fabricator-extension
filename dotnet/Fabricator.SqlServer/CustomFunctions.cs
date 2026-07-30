@@ -1156,17 +1156,41 @@ internal sealed class GfSeqFunction : ITableFunction
     public string Name => "fabricator_seq";
     public Schema Parameters => new(new[] { new Field("n", Int32Type.Default, nullable: true) }, metadata: null);
 
+    /// <summary>
+    /// <c>fabricator_seq(5, start := 10)</c> — an OPTIONAL argument, so this function has a MIXED signature
+    /// (one positional + one named). Named because DuckDB positional table arguments have no defaults.
+    /// </summary>
+    /// <remarks>
+    /// The mixed shape is the one worth demonstrating: the binding reads BY POSITION
+    /// (<see cref="Parameters"/> ++ <see cref="NamedParameters"/>), and an omitted named argument arrives as
+    /// NULL, so a bug in the host's NULL substitution would shift the POSITIONAL values too.
+    /// </remarks>
+    public Schema NamedParameters =>
+        new(new[] { new Field("start", Int32Type.Default, nullable: true) }, metadata: null);
+
     public IArrowTableFunctionBinding Bind(RecordBatch args)
     {
         var a = (Int32Array)args.Column(0);
         int n = args.Length > 0 && !a.IsNull(0) ? a.Values[0] : 0;
-        return new Binding(n);
+        // Position 1 is `start` (the first named parameter); NULL when the caller omitted it.
+        int start = 1;
+        if (args.ColumnCount > 1 && args.Column(1) is Int32Array s2 && args.Length > 0 && !s2.IsNull(0))
+        {
+            start = s2.Values[0];
+        }
+        return new Binding(n, start);
     }
 
     private sealed class Binding : IArrowTableFunctionBinding
     {
         private readonly int _n;
-        public Binding(int n) => _n = n;
+        private readonly int _start;
+
+        public Binding(int n, int start)
+        {
+            _n = n;
+            _start = start;
+        }
 
         public Schema OutputSchema => new(new[]
         {
@@ -1190,7 +1214,12 @@ internal sealed class GfSeqFunction : ITableFunction
             await Task.CompletedTask;
             var value = new Int32Array.Builder().Reserve(_n);
             var squared = new Int32Array.Builder().Reserve(_n);
-            for (int i = 1; i <= _n; i++) { value.Append(i); squared.Append(i * i); }
+            for (int k = 0; k < _n; k++)
+            {
+                int i = _start + k;
+                value.Append(i);
+                squared.Append(i * i);
+            }
             yield return new RecordBatch(OutputSchema, new IArrowArray[] { value.Build(), squared.Build() }, _n);
         }
 
