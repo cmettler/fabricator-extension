@@ -128,7 +128,7 @@ hardcodes the box answers. It becomes profile-parameterized:
 - **`TIMESTAMP` without time zone → `datetime2(scale)`, verbatim. No conversion, no DuckDB
   timezone involved.** Naive wall-clock both sides; DuckDB `TIMESTAMP` is µs = `datetime2(6)`
   exactly (so `datetime2(6)` is lossless on Fabric; box may use 7). The value path already hands SQL
-  a plain `DateTime` for the no-tz case ([ArrowValueReader.cs:49-51](../dotnet/Fabricator.SqlServer/ArrowValueReader.cs#L49-L51)).
+  a plain `DateTime` for the no-tz case ([ArrowValueReader.cs:49-51](../dotnet/Fabricator.Bridge/ArrowValueReader.cs#L49-L51)).
 - **`TIMESTAMPTZ` is an *instant*** — internally UTC µs, and it crosses Arrow as an instant. So
   `.UtcDateTime` is the stored value: `datetimeoffset(7)` where it exists, else UTC `datetime2(6)` on
   Fabric. **No session timezone is needed to store** (the Arrow `int64` is already the UTC epoch; the

@@ -386,9 +386,12 @@ AS SELECT …;
 
 ### Tests
 
-`test/verify_mssql_external_create.test` (same env gates): full auto-provision DDL → SQL reads back
-exactly; `data_source=` reuse path; PARQUET variant; guards (ICEBERG, replace, explicit txn, empty
-PARQUET create, missing secret).
+**Planned as `test/verify_mssql_external_create.test`; that file was never created.** <!-- check-docs:ignore --> The coverage it
+describes landed in **`test/verify_mssql_s3_polybase.test`** (252) instead, alongside the external-table
+reads it depends on — which is the right home, since the DDL is only meaningful against a provisioned
+external data source. What is covered there: full auto-provision DDL → SQL reads back exactly;
+`data_source=` reuse; the PARQUET variant; and the guards (ICEBERG, replace, explicit txn, empty PARQUET
+create, missing secret). The `WITH (...)` option parsing itself is `test/verify_with_options.test` (68).
 
 ---
 
@@ -397,7 +400,7 @@ PARQUET create, missing secret).
 1. **A** — ABI v67 + Delta options (self-contained; gate: `verify_with_options` + the regression list).
 2. **C** — detection + INSERT routing (no ABI; gate: extended `verify_mssql_s3_polybase` + SQL suites).
 3. **D** — identity-keyed UPDATE/DELETE (small once C exists; gate: the polybase DML sections).
-4. **B** — CETAS-analog DDL (gate: `verify_mssql_external_create` + polybase suite).
+4. **B** — CETAS-analog DDL (gate: `verify_with_options` + the polybase suite).
 
 Each slice ships independently; commit per slice (session convention).
 

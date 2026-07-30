@@ -223,7 +223,7 @@ ABI minimal. Both get parameter binding for free.
 - **Deferred:** parameter binding for the ambient `fabricator_scan` (it resolves a registered source by NAME —
   parameters belong on the scoped `host_query` path, which already binds them; a parameterized named source
   would be a separate, larger design); and the **full breaking rename** (removing the `fabricator_*` names;
-  the generic `fabricator_*`/`TYPE fabricator` names already exist as additive aliases — `verify_generic_names.test`).
+  the generic `fabricator_*`/`TYPE fabricator` names already existed as additive aliases at the time; that era's gate `verify_generic_names.test` was deleted by the rename, `2a26b7a`). <!-- check-docs:ignore -->
 
 ## Open / deferred
 

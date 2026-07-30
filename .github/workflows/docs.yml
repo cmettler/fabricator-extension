@@ -1,0 +1,52 @@
+# Documentation reference check — that every path, link and verify_* suite our markdown cites still exists,
+# and that every doc is reachable from CLAUDE.md's index.
+#
+# Its own tier because it shares nothing with the others: no compiler, no vcpkg, no service containers, and it
+# runs in seconds. Conversely the build tiers are path-filtered to skip documentation commits, so without this
+# workflow a docs-only change gets no CI at all — which is how five broken references accumulated (a doc
+# pointing at a DELETED doc, two at a test the rename removed, one at a test that never existed, one at a file
+# in the wrong project).
+#
+# Submodules ARE checked out, deliberately. The script can run without them, but then it cannot tell one of our
+# own broken paths from a legitimate reference into duckdb's tree, so it would silently skip both — a CI check
+# that is quietly weaker than the local one is the exact failure mode this repo keeps paying for. duckdb is
+# `shallow = true`, so the cost is a minute.
+
+name: docs
+
+on:
+  push:
+    branches: [v1.5-variegata]
+    paths:
+      - '**.md'
+      - scripts/check-docs.sh
+      - .github/workflows/docs.yml
+  pull_request:
+    branches: [v1.5-variegata]
+    paths:
+      - '**.md'
+      - scripts/check-docs.sh
+      - .github/workflows/docs.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  references:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # `true`, not `recursive` — see the note above, and CLAUDE.md on why recursive drags in
+          # engineered-wood's half-gigabyte parquet-testing corpus that nothing here reads.
+          submodules: true
+
+      - name: Check documentation references
+        shell: bash
+        run: scripts/check-docs.sh

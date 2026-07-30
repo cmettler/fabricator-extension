@@ -197,7 +197,7 @@ fixed to the fabricator-extension repo root):
   prototype, revisit post-migration), `fix/vacuum-dv-orphans` (`1ecf28d` — fork-only; master's vacuum is
   already better). Local-only: `reconcile/clast` (superseded, deletable).
 - fabricator `feat/delta-engine-contract` (`9b05f82`): parked — the IDeltaEngine seam is no longer needed
-  for this migration (name parity ⇒ direct retarget), but `docs/delta-engine-contract.md`'s per-op mapping
+  for this migration (name parity ⇒ direct retarget), but that branch's `delta-engine-contract.md` per-op mapping
   table is the verified inventory of all 37 EW methods the Bridge calls — useful as this migration's checklist.
 
 ## Dry-compile result (Bridge vs e48f449, net8.0): 7 errors, 3 root causes — tiny
@@ -1227,7 +1227,7 @@ misstate. (His other adoptable refusal, on a user column colliding with a genera
 `verify_mssql_s3_polybase` is protocol 1.0 ⇒ DVs off ⇒ UPDATE takes exactly the copy-on-write path whose input
 was re-keyed, and it is service-tier-only.
 **⚠ PROCESS TRAP RE-HIT: a no-match sqllogictest filter exits ZERO.** I ran
-`verify_delta_catalog_row_tracking_virtual` for a suite actually named `verify_delta_row_tracking_virtual` and
+`verify_delta_catalog_row_tracking_virtual` for a suite actually named `verify_delta_row_tracking_virtual` and <!-- check-docs:ignore (the wrong name IS the subject here) -->
 got a silent blank, which reads exactly like a pass. Already recorded under CI; re-recording because it bit
 during a LIVE-path gate, where a false pass is worst. Always read the assertion COUNT, never the absence of a
 failure.

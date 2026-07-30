@@ -176,7 +176,7 @@ current code still uses the single-provider `fabricator` naming):
   v17 → `BackendRegistry.Resolve`; ATTACH `PROVIDER` option + `scheme://` inference; clean unknown-provider
   error). The **generic names are now live as ADDITIVE ALIASES** (no breakage): `fabricator_query`/`fabricator_exec`/
   `fabricator_functions`/`fabricator_server_info` (+ the existing `fabricator_version`) and `ATTACH … (TYPE fabricator)`
-  (the storage extension is registered under both `fabricator` and `fabricator`) — `test/verify_generic_names.test`.
+  (the storage extension is registered under both `fabricator` and `fabricator`). Its gate, `test/verify_generic_names.test`, was DELETED by the rename (`2a26b7a`) together with the aliases it pinned — there is no such suite now. <!-- check-docs:ignore (naming it IS the point) -->
   The **breaking removal** of the `fabricator_*` names (+ catalog-type string `"fabricator"`, settings/secret/URI
   scheme rename, compat-corpus regen) remains the separate full-rename pass;
   (3) **connstr/auth → C# — DONE** (`build_connection_string` ABI v18: `fabricator_secret.cpp` reads the
@@ -1459,3 +1459,50 @@ are the granular type-conversion reference — original SQL type + precision/sca
 field metadata for precise + lossless round-trip, and Arrow extension names `arrow.bool8`/`arrow.uuid`/
 `arrow.json` to disambiguate same-storage types; see [docs/warehouse-support.md](docs/warehouse-support.md)
 §3.4 for the future type-mapping refinement), `ArrowSerializer` (POCO↔Arrow for Phase 3)
+
+## Documentation index (`docs/`) — with a STATUS per doc
+
+Every doc is listed here, and `scripts/check-docs.sh` FAILS if one is missing — an unreferenced doc is not
+wrong but it is undiscoverable, and undiscoverable is how a doc rots unnoticed. When this index was written
+(2026-07-30) **11 of 32 docs were unreachable from this file, and all five whose last substantive edit was the
+2026-07-15 rename were among them.**
+
+The **status** column is the part no script can produce. `check-docs.sh` verifies that every path, link and
+`verify_*` suite a doc cites still exists; it cannot tell whether the prose is still TRUE. `multifile-delta.md`
+is the standing example — every reference in it resolves, and its header still announces work the production
+path never adopted. Keep the status honest; a wrong status is worse than none.
+
+| doc | status |
+|---|---|
+| [abi-history.md](docs/abi-history.md) | **current** — per-version ABI records v16–v67. Read before touching an existing entry |
+| [aot-bridge.md](docs/aot-bridge.md) | **design only, nothing built** (2026-07-25) |
+| [cancellation.md](docs/cancellation.md) | **current** — the three cancellation tiers (ABI v65/v66) |
+| [create-table-with-options.md](docs/create-table-with-options.md) | **current** — all four `WITH (…)` slices shipped |
+| [custom-functions-design.md](docs/custom-functions-design.md) | **current** — the 4b–4h contract; §11.1 is the in-out design |
+| [dax-provider.md](docs/dax-provider.md) | **current** — read-only DAX/ADOMD provider, slices 1–6. Gate is MANUAL (needs Power BI Desktop) |
+| [dbt-hooks.md](docs/dbt-hooks.md) | **current** — validated box + Fabric |
+| [dbt-incremental.md](docs/dbt-incremental.md) | **current** — validated box + Fabric |
+| [delta-catalog.md](docs/delta-catalog.md) | **current** — the main Delta provider reference |
+| [delta-rs-provider.md](docs/delta-rs-provider.md) | **current but SECONDARY** — the delta-rs provider is opt-in (`-IncludeDeltaRs`, `FABRICATOR_DELTARS=1`); its 7 suites are outside CI |
+| [delta-snapshot-caching.md](docs/delta-snapshot-caching.md) | **design + decision gate; the cache is NOT built** and the full version is not recommended |
+| [delta-transactions.md](docs/delta-transactions.md) | **current** — buffered-DML semantics |
+| [distribution-installer.md](docs/distribution-installer.md) | **current** — single-file SKU, phases 1–4 of 5 |
+| [ew-master-migration.md](docs/ew-master-migration.md) | **current** — the EW pin journal. Read BEFORE the next EW bump |
+| [feature-history.md](docs/feature-history.md) | **archive** — as-built records moved verbatim out of this file. Historical by design |
+| [filesystem-bridge.md](docs/filesystem-bridge.md) | **current mechanism, untouched since the rename** — the v40 host-FS bridge is very much live (see the per-call opener fix, `142b350`) |
+| [global-functions.md](docs/global-functions.md) | **current** — all five load-time global kinds |
+| [host-query.md](docs/host-query.md) | **current** — incl. session-state inheritance + attached-catalog visibility (2026-07-30) |
+| [inout-collector-mode.md](docs/inout-collector-mode.md) | **current mechanism, untouched since the rename** — the collector path is live (`verify_collector`) |
+| [macros-and-sqlgen-functions.md](docs/macros-and-sqlgen-functions.md) | **current** — §1 global macros, §1.4 catalog-bound macros, §2 sqlgen |
+| [multifile-delta.md](docs/multifile-delta.md) | ⚠ **STALE HEADER.** Says "Phase-A slices BUILDING"; slice 1a shipped as the standalone `fabricator_delta_mfr_scan` (+ its suite) and the PRODUCTION catalog read path never adopted it. Treat as a design record, not a description of the shipped read path |
+| [native-delta-write.md](docs/native-delta-write.md) | ⚠ **PRE-DATES THE DEFAULTS FLIP (2026-07-29).** Its §2 table still says the default is engineered-wood everywhere, and it cites the `deltalake` alias the flip REMOVED. The mechanism description is sound; the defaults are not |
+| [parallel-partitioned-read.md](docs/parallel-partitioned-read.md) | **design only, nothing built** |
+| [plugin-system.md](docs/plugin-system.md) | **current** — default-context SPI; per-plugin ALC isolation deferred |
+| [provider-extensibility.md](docs/provider-extensibility.md) | **current** — the self-describing-provider surfaces |
+| [rowid-concepts.md](docs/rowid-concepts.md) | **current** — transient vs stable row identity |
+| [rowid-dml-seam.md](docs/rowid-dml-seam.md) | **current** — the DML seam after the EW re-pin |
+| [settings-architecture.md](docs/settings-architecture.md) | **current, refactor DONE** (settings v33/v34, ATTACH v37, secret fields v38) |
+| [transaction-concurrency.md](docs/transaction-concurrency.md) | **current** — per-DuckDB-transaction provider connections (ABI v35) |
+| [transactions.md](docs/transactions.md) | **current** — the three lazy levels, MARS, the one-writer rule |
+| [variant-support.md](docs/variant-support.md) | **current** — six passes, Spark + kernel validated |
+| [warehouse-support.md](docs/warehouse-support.md) | **current** — Fabric WH / Synapse / box profiles, slices 1–6 |
