@@ -246,6 +246,15 @@ current code still uses the single-provider `fabricator` naming):
 ## Next up (open threads for future sessions)
 
 In-flight / planned refactors (all C#-only unless noted; tests stay green per slice):
+- **README / a coherent OVERALL document — WANTED, NOT STARTED (user, 2026-07-30).** Everything under
+  `docs/` is **project memory**: written for whoever maintains this next, organised by the order things were
+  built, and dense with why-we-rejected-X. None of it is written for someone deciding whether to *use* the
+  extension. That is the gap — not missing content, missing an audience. What exists to build on: the
+  documentation index at the end of this file (every doc, with a status), and `scripts/check-docs.sh` +
+  `docs.yml`, which mean a new document's references cannot silently rot. **Do the two flagged-stale docs
+  first or as part of it** (`multifile-delta.md`'s "Phase-A slices BUILDING" header, and
+  `native-delta-write.md`'s pre-flip defaults table + the removed `deltalake` alias) — a user-facing overview
+  that draws on a doc whose defaults are wrong propagates the error to the audience least able to spot it.
 - **THE CATALOG SCAN MUST SERIALIZE ITS TABLE IDENTITY — FIXED (2026-07-29, silent wrong results).**
   A table function that sets neither `serialize` nor `deserialize` still takes part in DuckDB's
   **common-subplan optimizer** (1.5.4+), which dedups subplans by SERIALIZING each operator and hashing
