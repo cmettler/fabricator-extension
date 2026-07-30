@@ -6,6 +6,11 @@
 
 require fabricator
 
+# The session-state section sets TimeZone, which is an ICU-registered extension option — without ICU loaded
+# the SET fails. Same class as the undeclared `require parquet` findings: it passes on a box that happens to
+# resolve the extension from disk, and fails on a bare runner.
+require icu
+
 # Basic round-trip: a literal projection run on a fresh host connection.
 query II
 SELECT x, y FROM fabricator_host_query('SELECT 42 AS x, ''hi'' AS y');
@@ -72,3 +77,91 @@ statement error
 SELECT * FROM truly_unknown_table_xyz;
 ----
 does not exist
+
+# ---- SESSION STATE: the table function adopts the CALLER's search path + TimeZone ----
+# Without this the fresh connection starts at DuckDB's defaults, so `USE s; ... FROM t` failed INSIDE a host
+# query while the identical SQL worked one line earlier (measured: the inner search path was memory.main).
+# Note only SESSION-local state needs copying — global settings (threads, …) live on the DatabaseInstance and
+# the fresh connection already sees them.
+#
+# The C#-callable `host_query` SERVICE deliberately does NOT inherit, and that asymmetry is the design:
+# provider-generated SQL is code and must not depend on what the user last USEd (our sqlgen functions are
+# handed the ATTACH alias explicitly for exactly this reason). That negative is NOT asserted here, and the
+# reason is worth stating rather than leaving as a gap: it is not observable from SQL, because no provider
+# generates unqualified names in the first place (fabricator_delta_scan builds read_parquet() over ABSOLUTE
+# paths). Any test for it would have to contrive a caller that does, which would pin the contrivance rather
+# than the contract. The contract lives in docs/host-query.md ("Session state") and in the fact that the
+# service passes no HostQuerySession at all.
+
+statement ok
+CREATE SCHEMA hq_s;
+
+statement ok
+CREATE TABLE hq_s.t AS SELECT 42 AS a;
+
+# Baseline: before any USE, the DEFAULT search path is left alone (an empty capture must not force anything).
+query I
+SELECT * FROM fabricator_host_query('SELECT current_schema()');
+----
+main
+
+statement ok
+USE memory.hq_s;
+
+# The active catalog.schema is now visible inside the host query...
+query I
+SELECT * FROM fabricator_host_query('SELECT current_catalog() || ''.'' || current_schema()');
+----
+memory.hq_s
+
+# ...so an UNQUALIFIED name resolves there, which is the whole point.
+query I
+SELECT * FROM fabricator_host_query('SELECT a FROM t');
+----
+42
+
+# It tracks a LATER change rather than being captured once per session.
+statement ok
+USE memory.main;
+
+query I
+SELECT * FROM fabricator_host_query('SELECT current_schema()');
+----
+main
+
+statement error
+SELECT * FROM fabricator_host_query('SELECT a FROM t');
+----
+does not exist
+
+# TimeZone: inherited as a VALUE, not merely as a label. The rendered instant must match the outer session's —
+# asserting only current_setting() would pass even if the zone never reached the computation.
+statement ok
+SET TimeZone='America/New_York';
+
+query I
+SELECT * FROM fabricator_host_query('SELECT current_setting(''TimeZone'')');
+----
+America/New_York
+
+query I
+SELECT ('2024-01-15 12:00:00Z'::TIMESTAMPTZ)::VARCHAR;
+----
+2024-01-15 07:00:00-05
+
+query I
+SELECT * FROM fabricator_host_query('SELECT (''2024-01-15 12:00:00Z''::TIMESTAMPTZ)::VARCHAR');
+----
+2024-01-15 07:00:00-05
+
+# A different zone on the same instant — proves the value follows the caller rather than a cached first read.
+statement ok
+SET TimeZone='Asia/Tokyo';
+
+query I
+SELECT * FROM fabricator_host_query('SELECT (''2024-01-15 12:00:00Z''::TIMESTAMPTZ)::VARCHAR');
+----
+2024-01-15 21:00:00+09
+
+statement ok
+SET TimeZone='UTC';

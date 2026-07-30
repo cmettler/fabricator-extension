@@ -75,8 +75,13 @@ case "$TIER" in
         # assertion separating catalog-bound from the load-time global form), and KIND FILTERING in both
         # directions (the binder Cast<>s on the entry type without checking, so the wrong kind is an unchecked
         # bad cast rather than a clean error).
+        # 5537 since 2026-07-30: verify_host_query gained 16 (15 -> 31). The table function now adopts the
+        # CALLER's search path + TimeZone, so `USE s; SELECT … FROM fabricator_host_query('… FROM t')` resolves
+        # instead of failing against the fresh connection's default memory.main. TimeZone is asserted as a
+        # rendered VALUE, not just current_setting(), since the label alone would pass without reaching the
+        # computation. Suite count unchanged — the suite already existed.
         : "${MIN_SUITES:=61}"
-        : "${MIN_ASSERTIONS:=5521}"
+        : "${MIN_ASSERTIONS:=5537}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

@@ -30,6 +30,48 @@ extension's own uncommitted writes. (Same-transaction read-your-writes would mea
 the corruption path; explicitly out of scope.) Each call is naturally **thread-safe** (own connection, no
 shared mutable state); a small connection pool is a later optimization (create-per-call first).
 
+## Session state — the table function inherits, the C# service deliberately does NOT (2026-07-30)
+
+A fresh `ClientContext` starts at DuckDB's **defaults**, which is a second consequence of the above and was
+missed until measured. What is and is not carried over splits exactly along DuckDB's global/session line:
+**global** settings live on the `DatabaseInstance`, so the fresh connection already sees them (`threads` was
+observed identical); **session-local** state does not (search path and `TimeZone` were observed as
+`memory.main` and the machine default while the caller had `lake.main` and `America/New_York`).
+
+Untreated, that produced a genuinely surprising failure: `USE lake.main;` then
+`SELECT * FROM fabricator_host_query('SELECT count(*) FROM t')` failed with *"Table with name t does not
+exist! Did you mean lake.t?"* while the identical SQL worked one line earlier.
+
+**The table function `fabricator_host_query(sql)` now adopts the caller's search path + `TimeZone`.** That
+SQL is text the *user* wrote in their session, so unqualified names and timestamp rendering should mean what
+they mean there. Two implementation points worth keeping:
+
+- **Captured BY VALUE at bind, never as a `ClientContext *`.** The factory that opens the connection runs
+  later and can re-run per execution, so a stored context pointer is the same dangling-pointer bug that
+  commit `142b350` removed from the host-FS opener. `HostQueryBind` reads
+  `ClientData::catalog_search_path->GetSetPaths()` and `TryGetCurrentSetting("TimeZone")` into a
+  `HostQuerySession` the lambda owns.
+- **The search path is applied programmatically** (`CatalogSearchPath::Set(entries, SET_DIRECTLY)`), not by
+  emitting `USE <ident>` text, which would need identifier quoting to be safe. `TimeZone` cannot be: it is an
+  **ICU-registered extension option** (`icu_extension.cpp` `AddExtensionOption`), so there is no core
+  `set_local` to call and it goes through a real `SET` — with `Value::ToSQLString()` quoting the literal, and
+  a failure treated as non-fatal (a build without ICU has no such option, and refusing to run the caller's
+  query over that would be worse).
+
+**The C#-callable `host_query` service passes no session at all, on purpose.** Two independent reasons:
+practically, it runs on a managed thread off the global `DatabaseInstance` and there is **no calling
+`ClientContext`** to inherit from without new ambient machinery (the way `set_active_opener` supplies one for
+host-FS calls). On principle, provider-generated SQL is *code*: making it depend on whatever the user last
+`USE`d would be fragile, and the codebase already has the right answer elsewhere — sqlgen functions
+(`generate_table_sql`) are handed the ATTACH **alias** explicitly so they can qualify references without
+touching session state. Same distinction as a macro body, which binds in the caller's context: correct for
+user-written text, wrong for provider-declared text.
+
+That negative is **not asserted in the suite**, and the reason is worth recording rather than leaving as an
+apparent gap: it is not observable from SQL, because no provider generates unqualified names in the first
+place (`fabricator_delta_scan` builds `read_parquet()` over absolute paths). A test would have to contrive a
+caller that does, pinning the contrivance rather than the contract.
+
 ## ABI — additions to `FabricatorHostServices` (the reverse-direction struct)
 
 `FabricatorHostServices` already carries host→managed function pointers the managed side calls (the v40

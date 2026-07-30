@@ -12,7 +12,9 @@
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb.h" // C API: duckdb_arrow_scan + duckdb_connection (data-in via connection-scoped views)
 #include "duckdb/function/replacement_scan.hpp"
+#include "duckdb/catalog/catalog_search_path.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/client_data.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/logging/logger.hpp"
@@ -87,8 +89,19 @@ unique_ptr<FunctionData> HostQueryBind(ClientContext &context, TableFunctionBind
 	auto sql = input.inputs[0].GetValue<string>();
 	auto db = context.db; // shared_ptr<DatabaseInstance>; the fresh connection is opened on it per run
 	auto bind_data = make_uniq<fabricator::ArrowStreamBindData>();
-	bind_data->factory = [db, sql](const fabricator::ArrowScanRequest &, ArrowArrayStream &out) {
-		MakeHostQueryStream(*db, sql, nullptr, {}, out); // the table-function form takes no params/inputs
+	// Capture the caller's session state BY VALUE here, at bind, while `context` is definitely alive. The
+	// factory below runs later (and again per execution), so capturing `&context` would be a dangling pointer —
+	// the same bug class as the host-FS opener that commit 142b350 moved to per-call resolution.
+	HostQuerySession session;
+	session.search_path = ClientData::Get(context).catalog_search_path->GetSetPaths();
+	Value tz_value;
+	if (context.TryGetCurrentSetting("TimeZone", tz_value) && !tz_value.IsNull()) {
+		session.time_zone = tz_value.ToString();
+	}
+	bind_data->factory = [db, sql, session](const fabricator::ArrowScanRequest &, ArrowArrayStream &out) {
+		// the table-function form takes no params/inputs; it DOES inherit the caller's session (unlike the
+		// C#-callable host_query service — see docs/host-query.md).
+		MakeHostQueryStream(*db, sql, nullptr, {}, out, nullptr, &session);
 	};
 	fabricator::PopulateReturnSchema(context, *bind_data, return_types, names);
 	return std::move(bind_data);
@@ -98,10 +111,31 @@ unique_ptr<FunctionData> HostQueryBind(ClientContext &context, TableFunctionBind
 
 void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStream *params,
                          const vector<HostQueryInput> &inputs, ArrowArrayStream &out,
-                         shared_ptr<ClientContext> *out_context) {
+                         shared_ptr<ClientContext> *out_context, const HostQuerySession *session) {
 	auto conn = make_uniq<Connection>(db); // FRESH connection: own context/transaction (see header)
 	if (out_context) {
 		*out_context = conn->context; // for out-of-band interruption (host_query_interrupt, ABI v66)
+	}
+	// Adopt the caller's session state, when one was supplied (the table function supplies it; the C# host
+	// service deliberately does not — provider-generated SQL must not depend on what the user last USEd).
+	if (session) {
+		if (!session->search_path.empty()) {
+			// SET_DIRECTLY: install exactly the captured entries. Copying the resolved values avoids emitting
+			// `USE <ident>` text, which would need identifier quoting to be safe.
+			ClientData::Get(*conn->context)
+			    .catalog_search_path->Set(session->search_path, CatalogSetPathType::SET_DIRECTLY);
+		}
+		if (!session->time_zone.empty()) {
+			// TimeZone is an ICU-registered EXTENSION option (icu_extension.cpp AddExtensionOption), so there is
+			// no core set_local to call — it goes through the normal SET path. Value::ToSQLString() quotes and
+			// escapes the literal, so a hostile zone string cannot break out.
+			auto tz_result = conn->Query("SET TimeZone=" + Value(session->time_zone).ToSQLString());
+			if (tz_result->HasError()) {
+				// Non-fatal by design: the caller's query is what matters, and a build without ICU has no
+				// TimeZone option to set. Falling back to the fresh connection's default beats refusing to run.
+				tz_result.reset();
+			}
+		}
 	}
 	// Register each named Arrow input as a connection-scoped view (data-in). duckdb_arrow_scan reinterprets
 	// the opaque handle back to ArrowArrayStream* and creates a temp view; the stream is consumed + released
