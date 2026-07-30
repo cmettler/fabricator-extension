@@ -30,6 +30,51 @@ extension's own uncommitted writes. (Same-transaction read-your-writes would mea
 the corruption path; explicitly out of scope.) Each call is naturally **thread-safe** (own connection, no
 shared mutable state); a small connection pool is a later optimization (create-per-call first).
 
+### A host query DOES see attached catalogs — including our own (measured 2026-07-30)
+
+`ATTACH` registers with the `DatabaseManager`, which lives on the `DatabaseInstance` and is therefore shared
+by the fresh connection. So every attached catalog is reachable from inside a host query, **fabricator ones
+included** — a host query can scan a Delta or SQL Server table through our own provider. What the fresh
+connection does *not* inherit is the search path (see the next section); the catalog itself was always
+visible, which is why the pre-fix error read *"Table with name t does not exist! Did you mean `lake.t`?"* —
+the hint could only come from a catalog the fresh connection could see.
+
+Measured, with `lake` = a Delta catalog holding `t` with `sum(a) = 3`:
+
+| probe | result |
+|---|---|
+| `fabricator_host_query('SELECT sum(a) FROM lake.main.t')` | `3` — scans through the provider |
+| `… duckdb_databases() WHERE database_name='lake'` | the attachment is listed |
+| inside an outer `BEGIN` + uncommitted `INSERT … VALUES (100)` | outer session `103`, **host query `3`** |
+| after `COMMIT` | `103` |
+
+**Row 3 is the one that surprises people, and it is worth stating separately from the abstract rule above.**
+"No read-your-writes" sounds academic for plain DuckDB tables; seen through a fabricator catalog it looks like
+a bug: you INSERT, your own session reports 103, and a host query on the next line reports 3. It is not a bug
+— our Delta transaction buffer is keyed by transaction id, so a *different* transaction structurally cannot
+see the buffered actions. It is the fresh-connection rule and the buffered-DML design meeting, and it follows
+from the decision that makes host queries safe at all.
+
+**Re-entrancy into our own provider works, by machinery that already exists.** The fresh connection has its
+own `MetaTransaction`, so `global_transaction_id` differs and `set_active_txn` routes the nested scan to a
+**separate provider connection** — the same per-transaction-connection mechanism that makes `dbt --threads 4`
+work (docs/transaction-concurrency.md). Verified working in the table above.
+
+**⚠ A SQL-Server self-deadlock is possible in principle — PREDICTED, NOT OBSERVED.** Stated at that
+confidence deliberately. CLAUDE.md records that an uncommitted `ALTER`'s Sch-M lock blocks a *pooled*
+connection's read with `LCK_M_IS` until a 30 s timeout (found via `sys.dm_os_waiting_tasks` during the dbt
+incremental work). Compose that with re-entrancy: a host query issued *inside* a transaction that has already
+done DDL on a SQL Server table takes a **separate** provider connection, which can block on the outer
+transaction's own lock — and that lock cannot release, because the outer transaction is blocked waiting for
+the host query to return. That is a lock-wait cycle. Reproducing it needs SQL Server plus in-flight DDL and
+has not been attempted, so treat it as a hazard derived from a documented mechanism rather than a finding.
+The Delta path has no equivalent (it takes no server-side locks) and degrades to the invisible-writes
+behaviour above instead of blocking.
+
+Deliberately **not guarded in code**: a guard would have to answer "am I inside a transaction that has
+touched this catalog", which is substantial machinery for a hazard nobody has hit, and it would also forbid
+the legitimate read-only re-entrancy that the table above shows working.
+
 ## Session state — the table function inherits, the C# service deliberately does NOT (2026-07-30)
 
 A fresh `ClientContext` starts at DuckDB's **defaults**, which is a second consequence of the above and was
