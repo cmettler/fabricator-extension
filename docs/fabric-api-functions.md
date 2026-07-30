@@ -192,7 +192,7 @@ everything deliberately SKIPPED and why — is **§10**, so the curation cannot 
 | **P0 ✅** | `fabric_create_shortcut_json` | scalar → VARCHAR path | same | full 9-member target union as verbatim JSON (external targets need a `connectionId` anyway) |
 | **P0 ✅** | `fabric_drop_shortcut` | scalar → BOOLEAN | `DELETE …/shortcuts/{path}/{name}` | idempotent via `if_exists`; bare call 404s (verified) | |
 | **P0 ✅** | `fabric_list_shortcuts` | table | `GET …/items/{id}/shortcuts` (paged) | flattened + `target_json` (the D4 showcase); optional parent-path filter via `_ex` |
-| **P0** | `fabric_run_notebook` | table, blocking | `POST …/items/{id}/jobs/RunNotebook/instances` + instance polling | **user-elevated (2026-07-30)**: parameterized notebook runs from dbt hooks, returning final status **+ `exit_value`** (`mssparkutils.notebook.exit`) for conditional orchestration. SP execution already proven live on this tenant by `scratchpad/fabricnb`. See §5 |
+| **P0 ✅** | `fabric_run_notebook`/`_ex` | table, blocking | `POST …/items/{id}/jobs/RunNotebook/instances` + instance polling | **user-elevated (2026-07-30)**: parameterized notebook runs from dbt hooks, returning final status **+ `exit_value`** (`mssparkutils.notebook.exit`) for conditional orchestration. SP execution already proven live on this tenant by `scratchpad/fabricnb`. See §5 |
 | P1↑ (partly ✅) | `fabric_items_ex('Notebook')` / `fabric_notebook_definition` / **`fabric_notebook_parameters` BUILT** | table | `GET …/items?type=Notebook`; `POST …/notebooks/{id}/getDefinition` (LRO) | **notebook inspection, user-elevated above the rest of P1**: list; raw definition parts (ipynb/fabricGitSource, base64); and a convenience that parses the `parameters`-tagged cell into (name, default) rows — heuristic by nature (regex over `name = literal` lines), flagged as such |
 | P1 | `fabric_run_job` | table, blocking by default | `POST …/items/{id}/jobs/{jobType}/instances` + instance polling | the generic engine `fabric_run_notebook` is built on (any jobType, e.g. `Pipeline`); `execution_data_json` passthrough; `wait_seconds` 0 = fire-and-return |
 | P1 | `fabric_job_status` / `fabric_job_instances` / `fabric_cancel_job` | table / table / scalar | `GET` instance / `GET` list / `POST cancel` | status enum: NotStarted/InProgress/Completed/Failed/Cancelled/Deduped; `fabric_job_instances(item)` is run-history inspection |
@@ -376,8 +376,8 @@ Rows marked **RESOLVED** were settled by the slice-1 spike (§9b); the rest stil
 | throttling on name resolution | ListWorkspaces/ListItems are per-principal throttled | cache per instance; probe burst behavior |
 | 2.14.0 model gaps vs current REST | e.g. newer conflict policies | **RESOLVED for P0/P1** — every needed client/method/policy is in 2.14.0; NO bump needed (and 2.18.0 would not add `ExitValue` either) |
 | tableMaintenance is preview | may change shape | keep P1; pass-through `execution_data_json` in `_ex` as the stable escape hatch |
-| `exitValue` retrieval | **RESOLVED — CONFIRMED ABSENT from the SDK in 2.14.0 AND 2.18.0.** Raw-HTTP instance GET with `?beta=true` is the only route (whether the field then appears is still unverified — needs the blocked notebook) | raw GET, once a spike notebook exists |
-| notebook param typing | our JSON→`{value,type}` inference (int vs float) vs what the notebook cell expects; AND which of the two payload shapes RunNotebook honours | **BLOCKED on a human click** — SP cannot create the notebook; create `fabricator_api_spike` once in the portal, then `dotnet run live params` |
+| `exitValue` retrieval | **RESOLVED (partly)** — it is `properties.exitValue` on the NOTEBOOK-scoped GET only, and absent from the SDK model in 2.14.0/2.18.0. Returned NULL in every run despite the notebook calling `exit`, so it is best-effort | done (§9d) |
+| notebook param typing | **RESOLVED** — the `executionData.parameters` map IS honoured (types `string`/`int`/`float`/`bool` → `str`/`int`/`float`/`bool`); the top-level `parameters[]` array is silently ignored for notebooks | done (§9d) |
 | session reuse key | exact configuration key for high-concurrency session tagging unconfirmed | probe; matters for hook latency (cold Spark session ≈ minutes, so P0 targets the jupyter/python kernel in the spike notebook) |
 | `GetNotebookDefinition` is slow (20.5 s measured) | it is an LRO, so `fabric_notebook_definition`/`_parameters` are NOT cheap reads | document the cost; never call it per-row |
 | AOT SKU | generated serializers expected AOT-clean, unverified | existing aot-bridge.md verify item |
@@ -472,8 +472,9 @@ timeout_seconds)`, `fabric_list_shortcuts()` + `_ex(parent_path)`, `fabric_creat
 (`FabricApi/FabricInspectFunctions.cs`, built after the P0 live run and **since exercised live too** — see
 below): `fabric_workspaces()`,
 `fabric_items()`/`_ex(item_type)`, `fabric_lakehouses()`, `fabric_warehouses()`, `fabric_connections()`,
-and **`fabric_notebook_parameters(notebook)`** — the first piece of the elevated notebook work that needed
-no blocked prerequisite.
+**`fabric_run_notebook()`/`_ex`** (built once §9d settled the parameter shape, and proven end-to-end: a
+SQL call passing `{"p_text":"from-sql","p_int":42,…}` was READ BACK from the notebook's own output with
+correct Python types), and **`fabric_notebook_parameters(notebook)`**.
 
 Hermetic tier **62 runs / 5558 assertions green**; the whole P0 set exercised end-to-end against workspace
 `Test` / lakehouse `LH` (create → list → alter → drop → drop-again → refresh, self-cleaning).
@@ -536,6 +537,50 @@ zero-arg function must therefore be a TABLE function — which is why `fab_delta
   provider they are dead entries that error if called — pre-existing behaviour shared with SqlServer's
   custom table functions, not introduced here. Cosmetic noise in `duckdb_functions()`; suppressing it
   would need a host-side "no `_each`" registration variant.
+
+### Notebook parameters + exitValue — RESOLVED live (2026-07-30), and one lesson about method
+
+The `fabricator_api_spike` notebook was created interactively, then filled via `UpdateItemDefinition`
+(SP-allowed) and run repeatedly. **Precondition verified first**: the definition was read BACK and the
+`parameters` tag confirmed present on cell 0 (`round-trip cell[0] tags=[parameters]`) with the intended
+kernel — without that check a negative result would have been measuring our own upload.
+
+**What works:**
+
+| payload | result |
+|---|---|
+| `{"executionData":{"parameters":{"p_text":{"value":"hello","type":"string"}, …}}}` | **HONOURED** — the notebook observed `hello` / `7` / `true`, typed `str`/`int`/`float`/`bool` |
+| top-level `{"parameters":[{"name":…,"value":…,"type":"Text"}]}` | **ACCEPTED (202) BUT SILENTLY IGNORED** — the notebook saw its defaults |
+
+Both submit routes work for the honoured shape — the items-scoped
+`…/items/{id}/jobs/RunNotebook/instances` and the notebook-scoped
+`…/notebooks/{id}/jobs/execute/instances?jobType=RunNotebook`. So the legacy `executionData.parameters`
+MAP is the shape to send, and the generic top-level `parameters` array is not usable for notebooks
+(consistent with the API reference's own warning that it "is not broadly supported"). Type strings are
+`string` / `int` / `float` / `bool`.
+
+**`exitValue` is at `properties.exitValue`, and ONLY on the notebook-scoped GET** —
+`…/notebooks/{id}/jobs/execute/instances/{jobInstanceId}` (with or without `?beta=true`; the items-scoped
+Location URL never returns `properties` at all). That `properties` object is genuinely useful beyond the
+exit value: `compute` (`Jupyter`/`Spark`), and `computeDetails.monitoringInfo` carrying
+`executionSnapshotUrl` plus, on Spark, `sparkUiUrl` / `driverLogUrl` / `sparkJobDetailsUrl` — i.e. a
+diagnosis link for a failed run, surfaceable from SQL.
+
+**But exitValue came back `null` in EVERY run**, on both Jupyter and Spark compute, even though the
+notebook-side API demonstrably exists and is called (`hasattr(notebookutils.notebook,'exit')` → `true`,
+confirmed by having the notebook report it). So treat `exit_value` as **best-effort, frequently NULL** —
+a `fabric_run_notebook` must not promise it, and a flow needing a result should have the notebook write
+to a table or file. (Writing works: plain `open('/lakehouse/default/Files/…')` through the fuse mount
+succeeded, while `notebookutils.fs.put` wrote nothing on the python kernel — the mount is the reliable
+channel, and it requires the ipynb to declare a default lakehouse in `metadata.dependencies.lakehouse`.)
+
+**⚠ The method lesson, which cost two full rounds of live runs.** The first two attempts concluded
+"BOTH shapes are ignored" — WRONG. Both shapes were submitted in sequence and the notebook's result file
+was read ONCE afterwards, so the second (ignored) submission's output was attributed to both. A shared
+side-channel read after N experiments measures only the last one. The fix — clear the marker before each
+submission and read it per shape — is what produced the real answer. This is the repo's standing
+"a negative result is not a measurement until the method is shown to work" rule in a new disguise:
+here the method ran fine and the ATTRIBUTION was broken.
 
 ### Shortcut metadata is EVENTUALLY CONSISTENT — a real trap for scripted create/drop cycles
 

@@ -81,7 +81,8 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | **Fabric API** | `fabric_refresh_sql_endpoint()` — sync the lakehouse SQL analytics endpoint from SQL (the dbt unblocker) | ✅ OneLake attaches |
 | | OneLake **shortcut** create / alter / drop / list, incl. non-OneLake targets via JSON | ✅ OneLake attaches |
 | | Introspection: workspaces, items, lakehouses (+ SQL endpoint strings), warehouses, connections, notebook parameters | ✅ OneLake attaches |
-| | Notebook runs with parameters + `exitValue`, jobs, table maintenance (V-Order) | ⏳ designed, not built |
+| | **Parameterized notebook runs** (blocking, with status + portal snapshot link) | ✅ OneLake attaches |
+| | Generic jobs, table maintenance (V-Order); notebook `exitValue` | ⏳ designed / best-effort |
 | **Callable** | Discovered scalar UDFs → `db.schema.fn(args)` (vectorized over Arrow) | ✅ |
 | | Discovered table-valued functions → `SELECT * FROM db.schema.tvf(args)` (+ projection/filter pushdown) | ✅ |
 | | Discovered stored procedures → `SELECT * FROM db.schema.proc(name := val)` (named/optional + OUTPUT params) | ✅ |
@@ -685,6 +686,8 @@ credential, so it shows none of them.
 | `fabric_lakehouses()` | table | Lakehouses **with their SQL endpoint id, status and connection string** |
 | `fabric_warehouses()` | table | Warehouses with their T-SQL connection strings |
 | `fabric_connections()` | table | Cloud connections — the `id` an external shortcut target needs |
+| `fabric_run_notebook(notebook [, params_json])` | table | **Runs a notebook with parameters and blocks** until it finishes; one row of final state |
+| `fabric_run_notebook_ex(notebook, params_json, config_json, wait_seconds)` | table | Same, plus session/compute config and `wait_seconds := 0` to submit without waiting |
 | `fabric_notebook_parameters(notebook)` | table | Names/defaults from a notebook's `parameters`-tagged cell |
 
 **Refreshing the SQL endpoint after a Delta write** — the reason this exists. A table written through the
@@ -742,6 +745,28 @@ SELECT name, default_value, inferred_type FROM lake.dbo.fabric_notebook_paramete
 `parameters`, which is ordinary Python, so this reads simple top-level `name = literal` lines. No rows means
 the notebook has no tagged cell. It reads the notebook definition, which is a slow API (~20 s) — don't call
 it per row.
+
+**Running a notebook with parameters.** The notebook needs a cell tagged `parameters` (Fabric injects the
+overrides after it). Pass a plain JSON object; string/number/boolean values map to Fabric's parameter types
+automatically, and a `{"value": …, "type": "float"}` member overrides that inference:
+
+```sql
+SELECT status, exit_value, error_message
+FROM lake.dbo.fabric_run_notebook('load_dims', '{"run_date": "2026-07-30", "full_refresh": true}');
+```
+
+It blocks until the run finishes (default cap one hour; a cold Spark session alone takes minutes) and
+returns one row: `job_instance_id`, `status`, `start_time`, `end_time`, `exit_value`, `compute`,
+`snapshot_url`, `error_code`, `error_message`. `snapshot_url` opens the run in the portal — the thing you
+want when a run fails. Use `fabric_run_notebook_ex(…, 0)` for the last argument to submit without waiting.
+
+> `exit_value` (from `notebookutils.notebook.exit(...)`) is **best-effort and often NULL** — it came back
+> empty on every measured run, on both Python and Spark compute, even with the notebook-side API present
+> and called. Don't build control flow on it; have the notebook write its result to a table instead.
+
+> Parameters only reach a notebook via the shape this function sends. Fabric also *accepts* a generic
+> top-level parameter array and then silently ignores it, so hand-rolled REST calls can appear to work
+> while the notebook quietly runs on its defaults.
 
 Notes and limits:
 

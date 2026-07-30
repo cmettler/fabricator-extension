@@ -180,6 +180,173 @@ internal sealed class FabricApiClient
 
     internal static void Wrap(string what, Action body) => Wrap(what, () => { body(); return 0; });
 
+    // ---- notebook runs: raw HTTP, of necessity -------------------------------------------------------
+    //
+    // The SDK's RunOnDemandItemJob returns a bare Response (the instance id is only in the Location
+    // header) and its ItemJobInstance model carries no exitValue in 2.14.0 OR 2.18.0. The exit value and
+    // the monitoring links live at `properties.*` on the NOTEBOOK-scoped instance GET, which the SDK does
+    // not project — so this one flow is hand-rolled. Everything else goes through the SDK.
+
+    /// <summary>What a finished (or still-running) notebook job reports.</summary>
+    internal sealed record NotebookRunState(
+        string Status, string? StartTimeUtc, string? EndTimeUtc, string? ExitValue, string? Compute,
+        string? SnapshotUrl, string? ErrorCode, string? ErrorMessage);
+
+    private static readonly System.Net.Http.HttpClient Http = new() { Timeout = TimeSpan.FromMinutes(5) };
+
+    private async System.Threading.Tasks.Task<string> TokenAsync(CancellationToken ct)
+    {
+        var cred = _context.Credential ?? FabricCredentialResolver.AmbientChain();
+        // Always the ASYNC token path: the sync one deadlocks under the hostfxr-hosted CLR (the same rule
+        // FabricNotebookCredential documents for its own transport).
+        var token = await cred.GetTokenAsync(
+            new TokenRequestContext(new[] { "https://api.fabric.microsoft.com/.default" }), ct)
+            .ConfigureAwait(false);
+        return token.Token;
+    }
+
+    private async System.Threading.Tasks.Task<System.Net.Http.HttpResponseMessage> SendAsync(
+        System.Net.Http.HttpMethod method, string url, string? json, CancellationToken ct)
+    {
+        using var req = new System.Net.Http.HttpRequestMessage(method, url);
+        req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue(
+            "Bearer", await TokenAsync(ct).ConfigureAwait(false));
+        if (json is not null)
+        {
+            req.Content = new System.Net.Http.StringContent(json, System.Text.Encoding.UTF8, "application/json");
+        }
+        return await Http.SendAsync(req, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>Submits a RunNotebook job and returns its instance id (read from the Location header).</summary>
+    internal async System.Threading.Tasks.Task<string> SubmitNotebookRunAsync(
+        Guid workspaceId, Guid notebookId, string body, CancellationToken ct)
+    {
+        var url = $"https://api.fabric.microsoft.com/v1/workspaces/{workspaceId}/items/{notebookId}"
+                  + "/jobs/RunNotebook/instances";
+        using var resp = await SendAsync(System.Net.Http.HttpMethod.Post, url, body, ct).ConfigureAwait(false);
+        var text = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        if ((int)resp.StatusCode != 202)
+        {
+            throw new NotSupportedException($"fabric run_notebook: HTTP {(int)resp.StatusCode}: {Trim(text)}");
+        }
+        var location = resp.Headers.Location?.ToString() ?? string.Empty;
+        var id = location.Split('/')[^1].Split('?')[0];
+        if (!Guid.TryParse(id, out _))
+        {
+            throw new NotSupportedException(
+                $"fabric run_notebook: accepted but no job-instance id in the Location header ('{location}').");
+        }
+        return id;
+    }
+
+    /// <summary>
+    /// Polls until the job reaches a terminal state or <paramref name="waitSeconds"/> elapses (0 = return
+    /// immediately after submission). Reads the NOTEBOOK-scoped instance URL, the only one that returns the
+    /// <c>properties</c> object holding exitValue + the monitoring links.
+    /// </summary>
+    internal async System.Threading.Tasks.Task<NotebookRunState> PollNotebookRunAsync(
+        Guid workspaceId, Guid notebookId, string instanceId, long waitSeconds, CancellationToken ct)
+    {
+        // TWO urls, and the split is load-bearing. The ITEMS-scoped instance exists as soon as the job is
+        // accepted, so it is what we poll. The NOTEBOOK-scoped one is the only source of `properties`
+        // (exitValue + monitoring links) but its record is populated LATER — reading it straight after
+        // submission 404s with ItemNotFound / "No notebook execution state found in database for the
+        // runId", which is a timing artefact rather than a missing notebook.
+        var itemsUrl = $"https://api.fabric.microsoft.com/v1/workspaces/{workspaceId}/items/{notebookId}"
+                       + $"/jobs/instances/{instanceId}";
+        var notebookUrl = $"https://api.fabric.microsoft.com/v1/workspaces/{workspaceId}/notebooks/{notebookId}"
+                          + $"/jobs/execute/instances/{instanceId}";
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(waitSeconds <= 0 ? 0 : waitSeconds);
+        NotebookRunState state;
+        while (true)
+        {
+            state = await ReadInstanceAsync(itemsUrl, ct).ConfigureAwait(false);
+            bool running = state.Status is "NotStarted" or "InProgress";
+            if (!running || waitSeconds <= 0 || DateTimeOffset.UtcNow >= deadline)
+            {
+                break;
+            }
+            // 5 s: a notebook run is minutes-scale (a cold Spark session alone is minutes), so polling
+            // faster only burns request quota.
+            await System.Threading.Tasks.Task.Delay(TimeSpan.FromSeconds(5), ct).ConfigureAwait(false);
+        }
+        // Best-effort enrichment: never fail a completed run because the extended record is not there.
+        return await EnrichAsync(state, notebookUrl, ct).ConfigureAwait(false);
+    }
+
+    private async System.Threading.Tasks.Task<NotebookRunState> ReadInstanceAsync(
+        string url, CancellationToken ct)
+    {
+        using var resp = await SendAsync(System.Net.Http.HttpMethod.Get, url, null, ct).ConfigureAwait(false);
+        var text = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        if (!resp.IsSuccessStatusCode)
+        {
+            throw new NotSupportedException($"fabric run_notebook status: HTTP {(int)resp.StatusCode}: {Trim(text)}");
+        }
+        using var doc = System.Text.Json.JsonDocument.Parse(text);
+        var root = doc.RootElement;
+        string? errCode = null, errMsg = null;
+        if (root.TryGetProperty("failureReason", out var fr)
+            && fr.ValueKind == System.Text.Json.JsonValueKind.Object)
+        {
+            errCode = JsonStr(fr, "errorCode");
+            errMsg = JsonStr(fr, "message");
+        }
+        return new NotebookRunState(
+            JsonStr(root, "status") ?? "Unknown", JsonStr(root, "startTimeUtc"), JsonStr(root, "endTimeUtc"),
+            ExitValue: null, Compute: null, SnapshotUrl: null, errCode, errMsg);
+    }
+
+    /// <summary>
+    /// Adds <c>properties.*</c> (exitValue, compute, snapshot link) from the notebook-scoped instance when it
+    /// is available. Failure is SWALLOWED on purpose: these are diagnostics, and the extended record is
+    /// populated asynchronously — losing them must never turn a successful run into an error.
+    /// </summary>
+    private async System.Threading.Tasks.Task<NotebookRunState> EnrichAsync(
+        NotebookRunState state, string notebookUrl, CancellationToken ct)
+    {
+        try
+        {
+            using var resp = await SendAsync(System.Net.Http.HttpMethod.Get, notebookUrl, null, ct)
+                .ConfigureAwait(false);
+            if (!resp.IsSuccessStatusCode)
+            {
+                return state;
+            }
+            var text = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            using var doc = System.Text.Json.JsonDocument.Parse(text);
+            if (!doc.RootElement.TryGetProperty("properties", out var props)
+                || props.ValueKind != System.Text.Json.JsonValueKind.Object)
+            {
+                return state;
+            }
+            string? snapshot = null;
+            if (props.TryGetProperty("computeDetails", out var cd)
+                && cd.TryGetProperty("monitoringInfo", out var mi))
+            {
+                snapshot = JsonStr(mi, "executionSnapshotUrl");
+            }
+            return state with
+            {
+                ExitValue = JsonStr(props, "exitValue"),
+                Compute = JsonStr(props, "compute"),
+                SnapshotUrl = snapshot,
+            };
+        }
+        catch
+        {
+            return state;
+        }
+    }
+
+    private static string? JsonStr(System.Text.Json.JsonElement e, string name) =>
+        e.TryGetProperty(name, out var v) && v.ValueKind == System.Text.Json.JsonValueKind.String
+            ? v.GetString() : null;
+
+    private static string Trim(string s) =>
+        s.Replace('\n', ' ').Length > 400 ? s.Replace('\n', ' ')[..400] : s.Replace('\n', ' ');
+
     private static string Describe(RequestFailedException ex)
     {
         string code = ex.ErrorCode ?? "";

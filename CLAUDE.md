@@ -288,19 +288,38 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     internal; C++ passes **no args stream at all** for an argument-less table function (`args` was
     already nullable). Zero-arg SCALARS stay impossible by design — a scalar's arg batch is also how row
     COUNT crosses — so an argument-less function must be a TABLE function.
-  - Also BUILT (post-P0, SDK methods verified but not yet live-exercised as functions): the P2
-    introspection set `fabric_workspaces` / `fabric_items`+`_ex` / `fabric_lakehouses` (with the SQL
+  - **`fabric_run_notebook()`/`_ex` BUILT + proven end-to-end** (the elevated ask). Parameters ride
+    **`executionData.parameters`** `{name:{value,type}}` — LIVE-VERIFIED honoured; the generic top-level
+    `parameters[]` array is accepted with 202 and **SILENTLY IGNORED** for notebooks, so a hand-rolled REST
+    call looks like it works while the notebook runs on defaults. Proof was reading the values BACK from the
+    notebook's own output (`{"p_text":"from-sql","p_int":42,…}` with correct str/int/float/bool). Blocking by
+    default (cap 1 h; cold Spark ≈ minutes); `wait_seconds := 0` submits only. **`exitValue` lives at
+    `properties.exitValue` on the NOTEBOOK-scoped instance GET only** (absent from the SDK model in 2.14.0
+    AND 2.18.0) and came back **NULL in every run** on both computes despite the notebook API existing and
+    being called ⇒ documented best-effort, do NOT build control flow on it. That same `properties` carries
+    `compute` + `executionSnapshotUrl` (+ Spark UI/driver-log links) — a portal diagnosis link from SQL.
+    **Poll the ITEMS-scoped instance, enrich from the NOTEBOOK-scoped one**: the latter 404s
+    (`ItemNotFound` / "no notebook execution state found for the runId") for a while after submission, so
+    reading it first turns a healthy run into an error.
+  - Also BUILT: the P2 introspection set `fabric_workspaces` / `fabric_items`+`_ex` / `fabric_lakehouses` (with the SQL
     endpoint connstr — the bridge to a T-SQL ATTACH) / `fabric_warehouses` / `fabric_connections` /
     `fabric_notebook_parameters` (heuristic — parses the papermill `parameters`-tagged cell; 0 rows is a
-    legitimate "no tagged cell"; `GetNotebookDefinition` is an LRO, ~20 s, never per-row).
+    legitimate "no tagged cell"; `GetNotebookDefinition` is an LRO, ~20 s, never per-row). All live-verified.
   - **Live findings that change USAGE:** `status='NotRun'` from a refresh means **already in sync, NOT
     failure** (all 19 tables on `LH`; a hook asserting `='Success'` fails on a healthy refresh — assert
     `<>'Failure'`); `table_name` is **schema-qualified** on a schema-enabled lakehouse; the SP is refused
     (`PrincipalTypeNotSupported`/`FeatureNotAvailable`) for **ResetShortcutCache** and **notebook
-    CREATION** despite documented support — so `fabric_run_notebook`'s parameter-shape matrix is BLOCKED
-    on someone creating `fabricator_api_spike` in the portal once. **`fabric_connections()` returning 0 is
+    CREATION** despite documented support (notebook creation stays a one-time portal action;
+    `UpdateItemDefinition` IS allowed, which is how the spike notebook gets filled). **`fabric_connections()` returning 0 is
     identity scope, not absence**: connections carry their own role assignments, so an SP sees only its
     own — `LH` certainly has connections (its ADLS/S3 shortcuts require them) and the SP saw none.
+  - **⚠ EXPERIMENT-DESIGN trap that produced a WRONG answer twice.** The first two parameter runs concluded
+    "both payload shapes are ignored"; both shapes were submitted in sequence and the notebook's result file
+    read ONCE afterwards, so the second (genuinely ignored) shape's output was attributed to BOTH. A shared
+    side-channel read after N experiments measures only the last. Clearing the marker and reading PER shape
+    gave the real answer. The standing "a negative result is not a measurement" rule in a new disguise: the
+    method worked, the ATTRIBUTION was broken. Also re-learned: verify the precondition first — the
+    `parameters` cell tag was confirmed to survive the definition round-trip before trusting any of it.
   - **C# trap:** an Azure *extensible enum* has an implicit conversion FROM string, so
     `cond ? Policy.X : null` infers `string` and calls `op_Implicit(null)` → `ArgumentNullException` at
     run time. Annotate `(Policy?)null`. Finding it needed a stack trace the ABI does not carry, hence the

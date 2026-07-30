@@ -39,6 +39,10 @@ internal static class FabricApiFunctions
                                                      withPolicy: true));
         scalars.Add(new FabricCreateShortcutJsonFunction(api));
         scalars.Add(new FabricDropShortcutFunction(api));
+        // Parameterized notebook runs: parameters ride executionData.parameters, the shape live-verified to
+        // be honoured (the generic top-level array is accepted and silently ignored — docs §9d).
+        tables.Add(new FabricRunNotebookFunction(api, extended: false));
+        tables.Add(new FabricRunNotebookFunction(api, extended: true));
         // Read-only introspection: the identifiers the write functions above need (a connection GUID for an
         // external shortcut target, an endpoint connection string for a T-SQL ATTACH, a workspace/item name).
         FabricInspectFunctions.Register(tables, api);
