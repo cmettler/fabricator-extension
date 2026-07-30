@@ -30,6 +30,11 @@ name: mssql-fabricator
 services:
   sqlserver:
     image: mcr.microsoft.com/mssql/server:2025-latest
+    # Survive a host reboot. Without this the containers exit and STAY exited — which happened on
+    # 2026-07-30 (an overnight OS update rebooted the box) and surfaced only as the whole service tier
+    # failing at each suite's first ATTACH with 'error 258: server not found'. `unless-stopped` rather
+    # than `always`, so an explicit `docker compose stop` still means stopped.
+    restart: unless-stopped
     container_name: mssql-fabricator
     ports:
       - "1433:1433"
@@ -49,6 +54,11 @@ services:
 
   minio:
     image: minio/minio:latest
+    # Survive a host reboot. Without this the containers exit and STAY exited — which happened on
+    # 2026-07-30 (an overnight OS update rebooted the box) and surfaced only as the whole service tier
+    # failing at each suite's first ATTACH with 'error 258: server not found'. `unless-stopped` rather
+    # than `always`, so an explicit `docker compose stop` still means stopped.
+    restart: unless-stopped
     container_name: minio-fabricator
     ports:
       - "9000:9000"   # S3 API (HTTPS — certs auto-enable TLS)
