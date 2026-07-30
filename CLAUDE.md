@@ -246,15 +246,24 @@ current code still uses the single-provider `fabricator` naming):
 ## Next up (open threads for future sessions)
 
 In-flight / planned refactors (all C#-only unless noted; tests stay green per slice):
-- **README / a coherent OVERALL document — WANTED, NOT STARTED (user, 2026-07-30).** Everything under
-  `docs/` is **project memory**: written for whoever maintains this next, organised by the order things were
-  built, and dense with why-we-rejected-X. None of it is written for someone deciding whether to *use* the
-  extension. That is the gap — not missing content, missing an audience. What exists to build on: the
-  documentation index at the end of this file (every doc, with a status), and `scripts/check-docs.sh` +
-  `docs.yml`, which mean a new document's references cannot silently rot. **Do the two flagged-stale docs
-  first or as part of it** (`multifile-delta.md`'s "Phase-A slices BUILDING" header, and
-  `native-delta-write.md`'s pre-flip defaults table + the removed `deltalake` alias) — a user-facing overview
-  that draws on a doc whose defaults are wrong propagates the error to the audience least able to spot it.
+- **KEEP `README.md` IN SYNC — a standing rule, not a task (user, 2026-07-30).** `README.md` is the
+  **user-facing** surface; this file and `docs/` are project memory (organised by the order things were built,
+  dense with why-we-rejected-X, written for whoever maintains this next). **Whenever a change to CLAUDE.md or
+  `docs/` adds or alters something an extension USER can see — a function, a setting, an ATTACH option, a
+  behaviour, a gotcha — update `README.md` in the SAME commit.** It is not a separate deliverable and must
+  never be parked again.
+  - Why the rule exists: it had already drifted badly. When it was introduced (2026-07-30) the README had
+    **zero mentions** of provider macros (global, shipped 2026-07-24, *and* catalog-bound),
+    `fabricator_host_query`, `fabricator_delta_scan`, or SQL-generating table functions — four user-visible
+    capabilities with no user-facing documentation at all. Nothing was wrong in the README; it was simply
+    never updated alongside the internal docs, which is precisely what this rule prevents.
+  - **Run the README's SQL examples before committing them.** They are copy-pasted by users, so an untested
+    example is a defect shipped to the least-equipped audience. All examples added in that pass were executed
+    first.
+  - Two docs are flagged ⚠ in the documentation index because their prose is stale
+    (`multifile-delta.md`'s "Phase-A slices BUILDING" header; `native-delta-write.md`'s pre-flip defaults
+    table + the removed `deltalake` alias). **Do not source README content from either until they are fixed** —
+    a user-facing page repeating a wrong default propagates it to the audience least able to spot it.
 - **THE CATALOG SCAN MUST SERIALIZE ITS TABLE IDENTITY — FIXED (2026-07-29, silent wrong results).**
   A table function that sets neither `serialize` nor `deserialize` still takes part in DuckDB's
   **common-subplan optimizer** (1.5.4+), which dedups subplans by SERIALIZING each operator and hashing

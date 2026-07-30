@@ -73,6 +73,11 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | **Tx** | BEGIN / COMMIT / ROLLBACK (connection pinning, read-your-writes) | ✅ |
 | **Functions** | `fabricator_query`, `fabricator_exec`, `fabricator_refresh_cache`, `fabricator_invalidate_cache`, `fabricator_version` | ✅ |
 | | `fabricator_functions(catalog)` — list discovered routines | ✅ |
+| | `fabricator_delta_scan(path)` — read a Delta table by path, no ATTACH | ✅ |
+| | `fabricator_host_query(sql)` — run a query on DuckDB itself (inherits your search path + `TimeZone`) | ✅ |
+| **Macros** | Provider **global** macros — bare `fn(...)` / `FROM fn(...)`, every database, no ATTACH | ✅ |
+| | Provider **catalog-bound** macros → `db.schema.m(...)` (namespaced per catalog; expanded by the binder) | ✅ |
+| | **SQL-generating** table functions — the call is rewritten into SQL at bind time (`kind='table_sql'`) | ✅ |
 | **Callable** | Discovered scalar UDFs → `db.schema.fn(args)` (vectorized over Arrow) | ✅ |
 | | Discovered table-valued functions → `SELECT * FROM db.schema.tvf(args)` (+ projection/filter pushdown) | ✅ |
 | | Discovered stored procedures → `SELECT * FROM db.schema.proc(name := val)` (named/optional + OUTPUT params) | ✅ |
@@ -536,6 +541,24 @@ SELECT fabricator_exec('mssql', 'CREATE TABLE dbo.t2 (id INT)');
 SELECT * FROM mssql.dbo.t2;   -- visible immediately
 ```
 
+Three things about the automatic mode that are easy to trip over:
+
+- **The first argument must be an ATTACHED CATALOG.** Pass a connection string or a secret name and there is
+  no cached catalog to refresh, so the setting appears to do nothing. Only `fabricator_exec('<catalog>', …)`
+  triggers it.
+- **DDL detection is a keyword match**, so it over-triggers: a statement merely *containing* `CREATE`,
+  `DROP`, `ALTER`, `TRUNCATE`, `RENAME` or `EXEC` counts — including `UPDATE t SET created_at = …`. Harmless
+  on SQL Server (a metadata re-read), but on a Delta catalog over OneLake/S3 re-discovery re-lists the store,
+  so leave the setting off there and invalidate explicitly.
+- **Prefer the scoped form when you know what changed** — `fabricator_invalidate_cache('mssql', 'dbo', 't')`
+  (or a name regex) keeps the rest of the cache warm, where the automatic path re-discovers everything.
+
+Without the setting, one asymmetry is worth knowing: a table **created** out-of-band is invisible until you
+refresh, while a table **dropped** out-of-band is handled gracefully *only if you had not already read it in
+this session* (you get a clean "table does not exist"). If you had read it, the drop surfaces later as the
+server's own error — e.g. SQL Server `208: Invalid object name`. Refresh after out-of-band DDL and neither
+case arises.
+
 ### `fabricator_server_info(catalog) -> TABLE(property, value)`
 
 The detected server capability profile for an attached catalog (edition, version, collation, and the
@@ -547,6 +570,83 @@ derived flags: `supports_mars`, `has_nvarchar`, `has_datetimeoffset`, `max_datet
 
 Extension version (compatibility shim). `fabricator_managed_dir()` / `fabricator_test_scan('x')` are
 diagnostics for the CoreCLR + Arrow spine.
+
+### `fabricator_host_query(sql) -> TABLE`
+
+Run a query on **DuckDB itself** and stream the result back through the extension. Mostly an internal
+service — it is how the Delta provider reuses DuckDB's parquet reader — but it is callable, and useful for
+seeing what the bridge sees.
+
+```sql
+SELECT * FROM fabricator_host_query('SELECT 1 AS a, ''x'' AS b');
+```
+
+It runs on a **fresh connection**, which has two visible consequences. It **inherits your session's active
+catalog/schema and `TimeZone`**, so unqualified names and timestamps mean what they mean in your session:
+
+```sql
+USE lake.main;
+SELECT * FROM fabricator_host_query('SELECT count(*) FROM t');   -- resolves lake.main.t
+```
+
+But it runs in its **own transaction**, so it sees only *committed* data — inside a `BEGIN`, your own
+uncommitted `INSERT`s are invisible to it. That is deliberate (reusing the in-flight connection would corrupt
+the outer query), not a bug to work around.
+
+### `fabricator_delta_scan(path) -> TABLE`
+
+Read a Delta table **by path, with no ATTACH** — the quickest way to look at one:
+
+```sql
+SELECT * FROM fabricator_delta_scan('s3://bucket/lake/trips') LIMIT 10;
+SELECT * FROM fabricator_delta_scan('abfss://ws@onelake.dfs.fabric.microsoft.com/LH.Lakehouse/Tables/t');
+```
+
+Filesystem credentials come from DuckDB secrets exactly as for `read_parquet`. For a whole folder of tables,
+plus writes and DML, ATTACH the [Delta provider](#delta-lake-provider) instead.
+
+### Provider macros
+
+The provider ships DuckDB **macros** — SQL templates expanded by the binder, so nothing crosses into C# when
+they run. They come in two flavours.
+
+**Global**, under a bare name, available in every database with no ATTACH:
+
+```sql
+SELECT fabricator_bucket_of('alice', n := 16);          -- named parameter with a default
+SELECT fabricator_rowid_parts(rid);                     -- scalar -> struct
+SELECT * FROM fabricator_delta_head('/data/lake/t', n := 20);   -- a TABLE macro
+```
+
+**Catalog-bound**, resolved as `db.schema.name(...)`, so two attached catalogs can expose differently shaped
+helpers under the same short name:
+
+```sql
+ATTACH '/data/lake' AS lake (TYPE fabricator, PROVIDER 'delta');
+SELECT lake.main.fab_pct(25, 200);                 -- 12.5
+SELECT lake.main.fab_clamp(150, hi := 120);        -- 120
+SELECT * FROM lake.main.fab_numbers(5);            -- a TABLE macro
+```
+
+A catalog-bound macro is **not** callable under its bare name — that is the point of binding it to a schema.
+Both flavours appear in `duckdb_functions()` with `function_type` `macro` or `table_macro`.
+
+> One thing to know if you write your own: a schema gives **namespacing, not name resolution**. DuckDB expands
+> a macro in the *caller's* context, so an unqualified table reference inside a macro body resolves against
+> whatever catalog/schema the caller has active — not against the macro's own catalog. Keep bodies
+> self-contained (expressions, or queries over built-ins), and use a SQL-generating table function when the
+> body must reach into its own catalog's tables.
+
+### SQL-generating table functions
+
+Some provider functions **rewrite themselves into SQL at bind time** instead of returning rows over the
+bridge: the call disappears from the plan and what executes is a plain DuckDB query. Nothing crosses the
+bridge at execution, and the generated SQL keeps its own pushdown. They are used where the SQL *text* has to
+depend on the arguments (object names, `UNION` fan-out, a bind-time metadata lookup) — which a macro cannot
+do, since a macro substitutes arguments as expressions with its structure fixed at declaration time.
+
+They are called like any table function, and `fabricator_functions('db')` reports them as `kind='table_sql'`.
+Because the rewrite happens at bind, `EXPLAIN` shows the generated plan rather than a function call.
 
 ## Callable Functions
 
