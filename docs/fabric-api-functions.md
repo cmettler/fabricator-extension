@@ -1,8 +1,9 @@
 # Fabric REST API custom functions — design + as-built (P0 shipped, P1/P2 designed)
 
-> Status 2026-07-30: **P0 + P2-introspection BUILT and validated LIVE; P1 jobs / notebook-RUN still
-> design (blocked — see §9b).** §9c is the as-built record; §4's table marks what
-> is shipped. The research below is
+> Status 2026-07-30: **P0, parameterized notebook RUNS, and P2 introspection are BUILT and validated
+> LIVE; the generic job surface + table maintenance remain design.** §9c is the as-built record, §9d
+> settles how notebook parameters actually arrive, §10 sweeps the whole API with a verdict per area; §4's
+> table marks what is shipped. The research below is
 > file:line-verified against the working tree and the pinned SDK binary; treat the REST shapes as
 > verified against learn.microsoft.com on 2026-07-30 and re-check anything marked *spike*.
 > REST reference root: <https://learn.microsoft.com/en-us/rest/api/fabric/articles/> (LRO handling,
@@ -493,10 +494,21 @@ measured.
 
 A catalog-bound function that infers everything from its ATTACH wants to be called with **no arguments**.
 That was **impossible**, for a reason nothing surfaced: **Apache.Arrow 23.0.0 cannot represent an empty
-schema across the C data interface — in EITHER direction.** `CArrowSchemaExporter.ExportSchema(new
-Schema(no fields))` and `ExportType(new StructType(no fields))` both throw
-`ArgumentNullException(Parameter 'fields')`, and the importer fails the same way on a zero-column batch
-(verified with a one-field positive control, so this is the library, not the harness).
+schema across the C data interface — in EITHER direction.**
+
+Both ways of building the schema CONSTRUCT fine, so the object is not the problem and neither is a
+workaround — the throw is in the marshaling. Measured in both directions with a one-field round-trip as
+the positive control (so this is the library, not the harness):
+
+| operation on a 0-field schema | result |
+|---|---|
+| `new Schema(Array.Empty<Field>(), metadata: null)` | OK — `FieldsList.Count == 0` |
+| `new Schema.Builder().Build()` | OK — `FieldsList.Count == 0` |
+| `CArrowSchemaExporter.ExportSchema` | throws `ArgumentNullException(Parameter 'fields')` |
+| `CArrowSchemaExporter.ExportType(new StructType(empty))` | throws, identically |
+| `CArrowSchemaImporter.ImportSchema` on a hand-built empty struct | throws, identically |
+
+Those are the only two public export entry points, so there is no supported path.
 
 The failure mode is why it stayed hidden: `GetOrCreateScalarFunction`/`GetOrCreateTableFunction` treat ANY
 schema-fetch failure as "this discovered name is stale" and **silently erase the function**. So a
@@ -508,7 +520,9 @@ Fixed in two halves, both required:
 1. **Export** (`ArrowSchemaExport.Export`, used by `Bootstrap.GetFunctionParamSchema`): delegates to
    Apache.Arrow when there is ≥1 field, otherwise hand-builds the empty struct (`format="+s"`,
    `n_children=0`) through a layout mirror, since `CArrowSchema.release` is internal. Ownership follows
-   the C data interface — the consumer's `release` frees the format string and NULLs itself.
+   the C data interface — the consumer's `release` frees the format string and NULLs itself. This works
+   even though Apache.Arrow cannot IMPORT what it emits, because the consumer here is the C++ host, which
+   reads the schema with its own `ReadArrowSchema`.
 2. **Import avoided entirely** (`fabricator_schema_entry.cpp`, the table-bind factory): for an
    argument-less function the host now passes **no args stream at all** rather than an empty one. `args`
    was already nullable by contract, so this is the contract's intended shape — no ABI bump.
@@ -537,50 +551,6 @@ zero-arg function must therefore be a TABLE function — which is why `fab_delta
   provider they are dead entries that error if called — pre-existing behaviour shared with SqlServer's
   custom table functions, not introduced here. Cosmetic noise in `duckdb_functions()`; suppressing it
   would need a host-side "no `_each`" registration variant.
-
-### Notebook parameters + exitValue — RESOLVED live (2026-07-30), and one lesson about method
-
-The `fabricator_api_spike` notebook was created interactively, then filled via `UpdateItemDefinition`
-(SP-allowed) and run repeatedly. **Precondition verified first**: the definition was read BACK and the
-`parameters` tag confirmed present on cell 0 (`round-trip cell[0] tags=[parameters]`) with the intended
-kernel — without that check a negative result would have been measuring our own upload.
-
-**What works:**
-
-| payload | result |
-|---|---|
-| `{"executionData":{"parameters":{"p_text":{"value":"hello","type":"string"}, …}}}` | **HONOURED** — the notebook observed `hello` / `7` / `true`, typed `str`/`int`/`float`/`bool` |
-| top-level `{"parameters":[{"name":…,"value":…,"type":"Text"}]}` | **ACCEPTED (202) BUT SILENTLY IGNORED** — the notebook saw its defaults |
-
-Both submit routes work for the honoured shape — the items-scoped
-`…/items/{id}/jobs/RunNotebook/instances` and the notebook-scoped
-`…/notebooks/{id}/jobs/execute/instances?jobType=RunNotebook`. So the legacy `executionData.parameters`
-MAP is the shape to send, and the generic top-level `parameters` array is not usable for notebooks
-(consistent with the API reference's own warning that it "is not broadly supported"). Type strings are
-`string` / `int` / `float` / `bool`.
-
-**`exitValue` is at `properties.exitValue`, and ONLY on the notebook-scoped GET** —
-`…/notebooks/{id}/jobs/execute/instances/{jobInstanceId}` (with or without `?beta=true`; the items-scoped
-Location URL never returns `properties` at all). That `properties` object is genuinely useful beyond the
-exit value: `compute` (`Jupyter`/`Spark`), and `computeDetails.monitoringInfo` carrying
-`executionSnapshotUrl` plus, on Spark, `sparkUiUrl` / `driverLogUrl` / `sparkJobDetailsUrl` — i.e. a
-diagnosis link for a failed run, surfaceable from SQL.
-
-**But exitValue came back `null` in EVERY run**, on both Jupyter and Spark compute, even though the
-notebook-side API demonstrably exists and is called (`hasattr(notebookutils.notebook,'exit')` → `true`,
-confirmed by having the notebook report it). So treat `exit_value` as **best-effort, frequently NULL** —
-a `fabric_run_notebook` must not promise it, and a flow needing a result should have the notebook write
-to a table or file. (Writing works: plain `open('/lakehouse/default/Files/…')` through the fuse mount
-succeeded, while `notebookutils.fs.put` wrote nothing on the python kernel — the mount is the reliable
-channel, and it requires the ipynb to declare a default lakehouse in `metadata.dependencies.lakehouse`.)
-
-**⚠ The method lesson, which cost two full rounds of live runs.** The first two attempts concluded
-"BOTH shapes are ignored" — WRONG. Both shapes were submitted in sequence and the notebook's result file
-was read ONCE afterwards, so the second (ignored) submission's output was attributed to both. A shared
-side-channel read after N experiments measures only the last one. The fix — clear the marker before each
-submission and read it per shape — is what produced the real answer. This is the repo's standing
-"a negative result is not a measurement until the method is shown to work" rule in a new disguise:
-here the method ran fine and the ATTRIBUTION was broken.
 
 ### Shortcut metadata is EVENTUALLY CONSISTENT — a real trap for scripted create/drop cycles
 
@@ -632,6 +602,50 @@ Finding it needed a stack trace, which the ABI does not carry — the bridge's s
 type + message. Both `FabricApiClient.Wrap` and `FabricApiFunctions.Guarded` now append `StackTrace` for
 **unexpected** exceptions (ours already name their cause and pass through untouched). Worth keeping: a
 framework `ArgumentNullException` crossing this boundary is otherwise unlocatable.
+
+## 9d. Notebook parameters + exitValue — RESOLVED live (2026-07-30), and one lesson about method
+
+The `fabricator_api_spike` notebook was created interactively, then filled via `UpdateItemDefinition`
+(SP-allowed) and run repeatedly. **Precondition verified first**: the definition was read BACK and the
+`parameters` tag confirmed present on cell 0 (`round-trip cell[0] tags=[parameters]`) with the intended
+kernel — without that check a negative result would have been measuring our own upload.
+
+**What works:**
+
+| payload | result |
+|---|---|
+| `{"executionData":{"parameters":{"p_text":{"value":"hello","type":"string"}, …}}}` | **HONOURED** — the notebook observed `hello` / `7` / `true`, typed `str`/`int`/`float`/`bool` |
+| top-level `{"parameters":[{"name":…,"value":…,"type":"Text"}]}` | **ACCEPTED (202) BUT SILENTLY IGNORED** — the notebook saw its defaults |
+
+Both submit routes work for the honoured shape — the items-scoped
+`…/items/{id}/jobs/RunNotebook/instances` and the notebook-scoped
+`…/notebooks/{id}/jobs/execute/instances?jobType=RunNotebook`. So the legacy `executionData.parameters`
+MAP is the shape to send, and the generic top-level `parameters` array is not usable for notebooks
+(consistent with the API reference's own warning that it "is not broadly supported"). Type strings are
+`string` / `int` / `float` / `bool`.
+
+**`exitValue` is at `properties.exitValue`, and ONLY on the notebook-scoped GET** —
+`…/notebooks/{id}/jobs/execute/instances/{jobInstanceId}` (with or without `?beta=true`; the items-scoped
+Location URL never returns `properties` at all). That `properties` object is genuinely useful beyond the
+exit value: `compute` (`Jupyter`/`Spark`), and `computeDetails.monitoringInfo` carrying
+`executionSnapshotUrl` plus, on Spark, `sparkUiUrl` / `driverLogUrl` / `sparkJobDetailsUrl` — i.e. a
+diagnosis link for a failed run, surfaceable from SQL.
+
+**But exitValue came back `null` in EVERY run**, on both Jupyter and Spark compute, even though the
+notebook-side API demonstrably exists and is called (`hasattr(notebookutils.notebook,'exit')` → `true`,
+confirmed by having the notebook report it). So treat `exit_value` as **best-effort, frequently NULL** —
+a `fabric_run_notebook` must not promise it, and a flow needing a result should have the notebook write
+to a table or file. (Writing works: plain `open('/lakehouse/default/Files/…')` through the fuse mount
+succeeded, while `notebookutils.fs.put` wrote nothing on the python kernel — the mount is the reliable
+channel, and it requires the ipynb to declare a default lakehouse in `metadata.dependencies.lakehouse`.)
+
+**⚠ The method lesson, which cost two full rounds of live runs.** The first two attempts concluded
+"BOTH shapes are ignored" — WRONG. Both shapes were submitted in sequence and the notebook's result file
+was read ONCE afterwards, so the second (ignored) submission's output was attributed to both. A shared
+side-channel read after N experiments measures only the last one. The fix — clear the marker before each
+submission and read it per shape — is what produced the real answer. This is the repo's standing
+"a negative result is not a measurement until the method is shown to work" rule in a new disguise:
+here the method ran fine and the ATTRIBUTION was broken.
 
 ## 10. The full API sweep — every area, with a verdict
 
