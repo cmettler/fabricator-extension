@@ -605,7 +605,19 @@ Implemented and verified:
   aliases, arities 1/2/3); `fabricator_version()`; `fabricator_managed_dir()` / `fabricator_test_scan()` /
   `fabricator_server_info(catalog)` (diag — the latter surfaces the detected `ServerProfile`).
 - **Cache invalidation after DDL via `fabricator_exec`**: DDL detection in C# (`SqlDdl.MayChangeSchema`),
-  gated by `SET mssql_exec_invalidate_cache` (default false, Postgres-scanner parity).
+  gated by `SET mssql_exec_invalidate_cache` (default false, Postgres-scanner parity). **Default off ⇒ after
+  out-of-band DDL you must call `fabricator_refresh_cache(cat)` / `fabricator_invalidate_cache(cat[, regex])`
+  yourself** (both are SCALAR functions — `SELECT fabricator_refresh_cache('db')`, NOT `CALL`). Prefer the
+  scoped 2-arg invalidate when you know what you touched; the auto path runs a **full `RefreshCache`**.
+  Three conditions must ALL hold for the automatic refresh to fire, and the third is the one that surprises
+  (verified 2026-07-30): the setting is on, the SQL matches the heuristic, **and the first argument named an
+  ATTACHED CATALOG** — with a raw connstr or a secret name we own no cache for it (`owns == true`), so nothing
+  is refreshed and the call silently has no cache effect. Also note the detection is a plain **substring**
+  match over `CREATE/DROP/ALTER/TRUNCATE/RENAME/EXEC`, so `UPDATE t SET created_at = …` contains `CREATE` and
+  triggers a full re-discovery. Deliberate ("a false positive just refreshes") but NOT uniformly cheap: on a
+  Delta/OneLake catalog re-discovery is the expensive glob, not a metadata query. The setting is `mssql_`-
+  prefixed while the mechanism is provider-agnostic (`SqlDdl` lives in the Bridge, consulted on every
+  `ExecuteDml`).
 
 Compat suite: ~96/122 of the C++ mssql-extension tests pass (corpus regenerated from upstream via
 `scripts/gen_mssqlcompat_tests.sh`, lives in `test/mssqlcompat/`, gitignored). Remaining failures are
@@ -1426,6 +1438,17 @@ built. Needs a real Mac and an install-doc note.
   dropped out-of-band leaves no stale entry). Do NOT remove this to match
   `exec_invalidate_cache_setting.test`'s setting-OFF stale-cache footgun — it's a deliberate robustness
   difference, not a bug.
+  - **⚠ It is NARROWER than it sounds, and the wording above invites over-reading it (measured 2026-07-30).**
+    The self-heal is in the COLUMN FETCH, so it only covers an entry that has not been MATERIALIZED yet: the
+    name is in the discovered list, the fetch fails, the name + entry are evicted, and the caller sees a clean
+    `Catalog Error: Table with name X does not exist!` (which is what lets `CREATE … IF NOT EXISTS` work).
+    Once a table has been READ in the session, its entry is cached, so an out-of-band DROP is not noticed at
+    bind at all — the scan runs and fails with the provider's RAW error, observed as
+    `IO Error: Fabricator: scan_table failed: 208: Invalid object name 'dbo.x'`. Both orders were measured
+    against SQL Server; the difference is purely whether the entry was already materialized. So "a dropped
+    table leaves no stale entry" holds for the un-read case only. A rough edge rather than a designed
+    behaviour — nothing depends on the 208 text, and turning it into a clean catalog error would mean
+    classifying provider errors at scan time (an object-not-found probe on every scan failure).
 - **Catalog-entry evictions RETIRE, never destroy (2026-07-16 — use-after-free fix).** Every eviction of
   a materialized entry (`InvalidateEntryCache`/`InvalidateAllEntries` on rollback, `InvalidateMatching`,
   the ALTER re-key/eager-refresh, DropEntry, CREATE-OR-REPLACE re-adds, all self-heal evicts — and the
