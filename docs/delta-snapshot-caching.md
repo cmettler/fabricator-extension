@@ -215,7 +215,43 @@ public static DeltaTable FromSnapshot(ITableFileSystem fs, DeltaTableOptions opt
 ```
 
 A legitimate entry point in its own right ("I already have the snapshot"), so it is a reasonable thing to
-offer upstream rather than carry indefinitely.
+offer upstream rather than carry indefinitely. Full signature, following EW's own factory conventions
+(`fileSystem` first, the essential artifact second, `DeltaTableOptions? options = null` third as in
+`CreateAsync`; `Snapshot.Snapshot` qualified the way `CreateAsync` writes `Schema.StructType`):
+
+```csharp
+public static DeltaTable FromSnapshot(
+    ITableFileSystem fileSystem,
+    Snapshot.Snapshot snapshot,
+    DeltaTableOptions? options = null)
+{
+    ArgumentNullException.ThrowIfNull(fileSystem);
+    ArgumentNullException.ThrowIfNull(snapshot);
+    options ??= DeltaTableOptions.Default;
+    ProtocolVersions.ValidateReadSupport(snapshot.Protocol);   // free, and keeps the invariant local
+    return new DeltaTable(fileSystem, options, snapshot);
+}
+```
+
+- **Synchronous on purpose** — it does no IO, so `ValueTask<DeltaTable>` would be dishonest and would force
+  pointless awaits at every call site. Deliberately asymmetric with the other three factories.
+- **`snapshot` non-nullable** although the private ctor takes `Snapshot?`: a null would surface much later as
+  `CurrentSnapshot`'s "Table not initialized", far from the cause.
+- **`options` must be threaded through**, not defaulted away — the ctor derives
+  `_dataFileReadOptions = WithVariantExtension(options.ParquetReadOptions)`, so this is variant correctness,
+  not cosmetics. The Bridge passes `DeltaWriter.Options()` as it does today.
+
+### 5.0 A per-call `DeltaTable` is FREE, which is what makes this shape work
+
+`DeltaTable.Dispose()` and `DisposeAsync()` do nothing but set `_disposed = true` — no filesystem, no
+handles, nothing released. Combined with the cheap constructor, the ENTIRE cost of `OpenAsync` is the log
+replay. So building a fresh table around a cached snapshot on every call adds no measurable overhead, and
+there is no ownership question to model.
+
+The same fact WEAKENS one argument against §6, and it should be stated rather than quietly left standing: a
+leaked cached `DeltaTable` would be a GC-able object, not an OS-resource leak. The other three objections to
+§6 (stale read, data race, use-after-free) are untouched, and §5 still dominates on every other row of the
+table above.
 
 **Why this dominates both alternatives:**
 
