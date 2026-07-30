@@ -264,7 +264,51 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     (`multifile-delta.md`'s "Phase-A slices BUILDING" header; `native-delta-write.md`'s pre-flip defaults
     table + the removed `deltalake` alias). **Do not source README content from either until they are fixed** —
     a user-facing page repeating a wrong default propagates it to the audience least able to spot it.
-- **THE CATALOG SCAN MUST SERIALIZE ITS TABLE IDENTITY — FIXED (2026-07-29, silent wrong results).**
+- **FABRIC REST API FUNCTIONS — P0 BUILT + VALIDATED LIVE; P1/P2 designed (2026-07-30):
+  [docs/fabric-api-functions.md](docs/fabric-api-functions.md) (§9c = as-built, §10 = the full
+  API sweep with a verdict per area).** `fabric_*` functions over `Microsoft.Fabric.Api` (already a
+  Bridge PackageReference, 2.14.0 — no bump; the pinned dll carries every P0/P1 method).
+  **Shipped:** `fabric_refresh_sql_endpoint()`/`_ex`, `fabric_list_shortcuts()`/`_ex`,
+  `fabric_create_shortcut` / `_alter_` / `_json` / `fabric_drop_shortcut`, plus `fab_delta_info()`.
+  Catalog-bound on a **OneLake** Delta attach ONLY, inheriting workspace+lakehouse+credential from the
+  ATTACH (dbt runs OFF Fabric, so the ambient chain is useless there and a GLOBAL function has no route
+  to a DuckDB secret). Gate `verify_delta_catalog_functions` 21 (hermetic); hermetic tier 62/5558.
+  - **Enabling refactor, reusable: the Delta catalog now HOSTS catalog-bound functions** (all 7 ABI
+    members used to throw; FUNCTIONS metadata was the 1-column fallback). New Bridge pieces
+    `FunctionsMetadata` (the kind-6 stream built IN MEMORY — no SQL engine to `UNION ALL` through) and
+    `CatalogFunctionSet` (registry + the five members + the `__all__` schema sentinel), so DAX/deltars
+    can host functions by wiring the same two. C#-only, no ABI change.
+  - **⚠ ZERO-ARGUMENT FUNCTIONS WERE IMPOSSIBLE, AND FAILED SILENTLY — now fixed.** Apache.Arrow 23
+    cannot represent an EMPTY schema across the C interface in EITHER direction (export and import both
+    throw `ArgumentNullException('fields')`; verified with a positive control). The host treats a failed
+    schema fetch as "discovered name is stale" and **erases the function**, so the only symptom was the
+    Debug WARN `GetFunctionParamSchema failed: … 'fields'` that this file previously recorded as
+    "benign — global functions pass". It was not benign, it was this. Fix needs BOTH halves: C#
+    `ArrowSchemaExport` hand-builds the empty struct (`+s`, 0 children) since `CArrowSchema.release` is
+    internal; C++ passes **no args stream at all** for an argument-less table function (`args` was
+    already nullable). Zero-arg SCALARS stay impossible by design — a scalar's arg batch is also how row
+    COUNT crosses — so an argument-less function must be a TABLE function.
+  - Also BUILT (post-P0, SDK methods verified but not yet live-exercised as functions): the P2
+    introspection set `fabric_workspaces` / `fabric_items`+`_ex` / `fabric_lakehouses` (with the SQL
+    endpoint connstr — the bridge to a T-SQL ATTACH) / `fabric_warehouses` / `fabric_connections` /
+    `fabric_notebook_parameters` (heuristic — parses the papermill `parameters`-tagged cell; 0 rows is a
+    legitimate "no tagged cell"; `GetNotebookDefinition` is an LRO, ~20 s, never per-row).
+  - **Live findings that change USAGE:** `status='NotRun'` from a refresh means **already in sync, NOT
+    failure** (all 19 tables on `LH`; a hook asserting `='Success'` fails on a healthy refresh — assert
+    `<>'Failure'`); `table_name` is **schema-qualified** on a schema-enabled lakehouse; the SP is refused
+    (`PrincipalTypeNotSupported`/`FeatureNotAvailable`) for **ResetShortcutCache** and **notebook
+    CREATION** despite documented support — so `fabric_run_notebook`'s parameter-shape matrix is BLOCKED
+    on someone creating `fabricator_api_spike` in the portal once. **`fabric_connections()` returning 0 is
+    identity scope, not absence**: connections carry their own role assignments, so an SP sees only its
+    own — `LH` certainly has connections (its ADLS/S3 shortcuts require them) and the SP saw none.
+  - **C# trap:** an Azure *extensible enum* has an implicit conversion FROM string, so
+    `cond ? Policy.X : null` infers `string` and calls `op_Implicit(null)` → `ArgumentNullException` at
+    run time. Annotate `(Policy?)null`. Finding it needed a stack trace the ABI does not carry, hence the
+    `Wrap`/`Guarded` helpers that append `StackTrace` for UNEXPECTED exceptions only.
+  - Output shape rule (D4): typed flat columns + one raw-JSON column for polymorphic parts; **no STRUCT
+    wrapping** (adding a column is additive for `SELECT *`; adding a struct FIELD changes a column's type
+    and breaks bound views), no JSON-only. Every `table`-kind function also gets a dead `_each` sibling —
+    pre-existing host behaviour, shared with SqlServer's custom table functions.
   A table function that sets neither `serialize` nor `deserialize` still takes part in DuckDB's
   **common-subplan optimizer** (1.5.4+), which dedups subplans by SERIALIZING each operator and hashing
   the bytes. `FunctionSerializer::Serialize` writes only name+arguments in that case and **does not
@@ -1529,6 +1573,7 @@ path never adopted. Keep the status honest; a wrong status is worse than none.
 | [delta-transactions.md](docs/delta-transactions.md) | **current** — buffered-DML semantics |
 | [distribution-installer.md](docs/distribution-installer.md) | **current** — single-file SKU, phases 1–4 of 5 |
 | [ew-master-migration.md](docs/ew-master-migration.md) | **current** — the EW pin journal. Read BEFORE the next EW bump |
+| [fabric-api-functions.md](docs/fabric-api-functions.md) | **current — P0 BUILT + live-validated, P1/P2 design** (2026-07-30). §9b spike results, §9c as-built (incl. the zero-argument Arrow fix), §10 the full API sweep with a verdict per area |
 | [feature-history.md](docs/feature-history.md) | **archive** — as-built records moved verbatim out of this file. Historical by design |
 | [filesystem-bridge.md](docs/filesystem-bridge.md) | **current mechanism, untouched since the rename** — the v40 host-FS bridge is very much live (see the per-call opener fix, `142b350`) |
 | [global-functions.md](docs/global-functions.md) | **current** — all five load-time global kinds |

@@ -43,10 +43,14 @@ ATTACH '${FABRICATOR_DELTA_WRITE_DIR}' AS lake (TYPE fabricator, PROVIDER 'delta
 
 # ---- 1. the declarations arrived, typed by KIND (the parsed statement decides scalar vs table, not us) ----
 
+# Scoped to the macro TYPES on purpose. This provider also declares catalog-bound FUNCTIONS in the same
+# `fab_` namespace (verify_delta_catalog_functions.test), and they are a different mechanism entirely — their own
+# metadata kind, their own host registration path. Matching on the prefix alone would make this suite fail
+# whenever one is added, which says nothing about macros; that coexistence is asserted in the functions suite.
 query IIII
 SELECT function_name, function_type, schema_name, database_name
 FROM duckdb_functions()
-WHERE database_name = 'lake' AND function_name LIKE 'fab_%'
+WHERE database_name = 'lake' AND function_type IN ('macro', 'table_macro')
 ORDER BY function_name;
 ----
 fab_clamp	macro	main	lake
@@ -201,9 +205,11 @@ SELECT count(*) FROM lake.main.fab_numbers(3);
 ----
 3
 
-# Still enumerable after the refresh (the name list survived, and re-materialization works).
+# Still enumerable after the refresh (the name list survived, and re-materialization works). Counted by macro
+# TYPE, not by name prefix — see §1 on why the prefix is shared with catalog-bound functions.
 query I
-SELECT count(*) FROM duckdb_functions() WHERE database_name = 'lake' AND function_name LIKE 'fab_%';
+SELECT count(*) FROM duckdb_functions()
+WHERE database_name = 'lake' AND function_type IN ('macro', 'table_macro');
 ----
 3
 

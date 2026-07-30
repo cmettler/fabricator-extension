@@ -1,0 +1,127 @@
+# name: test/verify_delta_catalog_functions.test
+# description: CATALOG-BOUND CUSTOM FUNCTIONS ON THE DELTA CATALOG — the hosting mechanism, not any particular
+#              function. Until this landed, all seven of DeltaCatalog's function ABI members were
+#              `throw NoFunctions()` and the FUNCTIONS metadata kind fell through to a 1-column empty fallback,
+#              so the Delta provider could declare macros but not functions. docs/fabric-api-functions.md §2.
+#
+#              WHY IT IS WORTH A SUITE OF ITS OWN. The functions this unlocks (the Fabric REST API set) cannot be
+#              tested without a live tenant, so without this file the HOSTING would only ever be exercised by
+#              code that also needs credentials — meaning a regression in the hosting would look like a Fabric
+#              outage. Everything here is hermetic: one local Delta root, no service, no network.
+#
+#              WHAT IS ASSERTED, and the failure mode each catches:
+#                (§1) the declaration reaches DuckDB as a FUNCTION of the right type, in every discovered schema
+#                     (the kind-6 stream is built IN MEMORY here — this provider has no SQL engine to assemble a
+#                     discovery query with, which is exactly why FunctionsMetadata exists);
+#                (§2) it EXECUTES over the ABI and returns catalog context — the property the catalog-bound form
+#                     exists for, and the one a global function or a macro cannot provide;
+#                (§3) the bare name does NOT resolve — the single assertion separating catalog-bound from global.
+#                     Without it, a regression that registered these globally would pass every other section;
+#                (§4) NEGATIVE CONTROL: the Fabric REST functions are ABSENT on a non-OneLake root. They are
+#                     registered only when the root is OneLake, because off Fabric they have no workspace, no
+#                     item and no REST credential — advertising them would put functions in the catalog that can
+#                     only fail. A regression that registered them unconditionally is invisible without this;
+#                (§5) macros and functions COEXIST (they ride different metadata kinds and different host
+#                     registration paths, so one silently displacing the other is a real shape of bug);
+#                (§6) survives a cache refresh, like the macros do.
+# group: [fabricator]
+
+require fabricator
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+# An EMPTY root is enough: a declaration binds into the schemas the catalog discovers, and needs no table.
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}' AS lake (TYPE fabricator, PROVIDER 'delta');
+
+# ---- 1. the declaration arrived as a real table FUNCTION (not a macro) in the discovered schema ----
+
+query IIII
+SELECT function_name, function_type, schema_name, database_name
+FROM duckdb_functions()
+WHERE database_name = 'lake' AND function_name = 'fab_delta_info'
+ORDER BY function_name;
+----
+fab_delta_info	table	main	lake
+
+# ---- 2. it executes over the ABI and reports THIS catalog's context ----
+#
+# ZERO ARGUMENTS is the load-bearing part, not a convenience: it is the shape a function that infers everything
+# from its ATTACH needs, and it only works because an empty parameter schema is never marshaled as an Arrow batch
+# (Apache.Arrow can neither export nor import a zero-field schema — it throws ArgumentNullException on 'fields').
+# The host therefore passes NO args stream for an argument-less function, and the C# side exports the empty
+# parameter schema through ArrowSchemaExport. Break either half and this function silently DISAPPEARS from the
+# catalog, because the host treats a failed schema fetch as "the function is stale" and erases it.
+
+query I
+SELECT count(*) >= 4 FROM lake.main.fab_delta_info();
+----
+true
+
+# The root it reports is the ATTACH root after normalization (forward slashes, no trailing slash) — compared via
+# a normalizing expression rather than pasted, because the harness supplies a native path.
+query I
+SELECT value = replace(rtrim('${FABRICATOR_DELTA_WRITE_DIR}', '/'), '\', '/')
+FROM lake.main.fab_delta_info() WHERE property = 'root';
+----
+true
+
+# PROVIDER 'delta' selects the native (DuckDB parquet) engine on both legs, and this root is not OneLake — so the
+# function is reading real catalog state, not echoing constants.
+query II
+SELECT property, value FROM lake.main.fab_delta_info()
+WHERE property IN ('native_read', 'native_write', 'onelake') ORDER BY property;
+----
+native_read	true
+native_write	true
+onelake	false
+
+# ---- 3. the bare name must NOT resolve — this is what makes it catalog-BOUND ----
+
+statement error
+SELECT * FROM fab_delta_info();
+----
+<REGEX>:.*fab_delta_info.*
+
+# ---- 4. NEGATIVE CONTROL: the Fabric REST functions are absent on a non-OneLake root ----
+#
+# They are registered only for a OneLake root (DeltaCatalog.BuildFunctionSet). This root is local, so none of
+# them may appear — and the count form is deliberate: it fails loudly if ANY fabric_* function leaks in, whereas
+# probing one name by hand would miss the others.
+
+query I
+SELECT count(*) FROM duckdb_functions()
+WHERE database_name = 'lake' AND function_name LIKE 'fabric\_%' ESCAPE '\';
+----
+0
+
+# ---- 5. macros and functions coexist (different metadata kinds, different registration paths) ----
+
+query II
+SELECT
+  (SELECT count(*) FROM duckdb_functions()
+     WHERE database_name = 'lake' AND function_type IN ('macro', 'table_macro')) >= 3,
+  (SELECT count(*) FROM duckdb_functions()
+     WHERE database_name = 'lake' AND function_name = 'fab_delta_info') = 1;
+----
+true	true
+
+# A macro still expands correctly with functions registered alongside it.
+query R
+SELECT lake.main.fab_pct(25, 200);
+----
+12.5
+
+# ---- 6. a cache refresh re-discovers the function (re-runs the same declaration path) ----
+
+statement ok
+SELECT fabricator_refresh_cache('lake');
+
+query I
+SELECT value = replace(rtrim('${FABRICATOR_DELTA_WRITE_DIR}', '/'), '\', '/')
+FROM lake.main.fab_delta_info() WHERE property = 'root';
+----
+true
+
+statement ok
+DETACH lake;

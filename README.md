@@ -78,6 +78,10 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | **Macros** | Provider **global** macros — bare `fn(...)` / `FROM fn(...)`, every database, no ATTACH | ✅ |
 | | Provider **catalog-bound** macros → `db.schema.m(...)` (namespaced per catalog; expanded by the binder) | ✅ |
 | | **SQL-generating** table functions — the call is rewritten into SQL at bind time (`kind='table_sql'`) | ✅ |
+| **Fabric API** | `fabric_refresh_sql_endpoint()` — sync the lakehouse SQL analytics endpoint from SQL (the dbt unblocker) | ✅ OneLake attaches |
+| | OneLake **shortcut** create / alter / drop / list, incl. non-OneLake targets via JSON | ✅ OneLake attaches |
+| | Introspection: workspaces, items, lakehouses (+ SQL endpoint strings), warehouses, connections, notebook parameters | ✅ OneLake attaches |
+| | Notebook runs with parameters + `exitValue`, jobs, table maintenance (V-Order) | ⏳ designed, not built |
 | **Callable** | Discovered scalar UDFs → `db.schema.fn(args)` (vectorized over Arrow) | ✅ |
 | | Discovered table-valued functions → `SELECT * FROM db.schema.tvf(args)` (+ projection/filter pushdown) | ✅ |
 | | Discovered stored procedures → `SELECT * FROM db.schema.proc(name := val)` (named/optional + OUTPUT params) | ✅ |
@@ -647,6 +651,115 @@ do, since a macro substitutes arguments as expressions with its structure fixed 
 
 They are called like any table function, and `fabricator_functions('db')` reports them as `kind='table_sql'`.
 Because the rewrite happens at bind, `EXPLAIN` shows the generated plan rather than a function call.
+
+### Microsoft Fabric platform functions (OneLake attaches)
+
+When a Delta catalog is attached over **OneLake**, it additionally hosts functions that call the **Fabric
+REST API**, so platform operations Microsoft offers no T-SQL for can be driven from SQL. They are
+catalog-bound (`db.schema.fn(...)`) and **inherit the workspace, the lakehouse and the credential from the
+ATTACH** — which is why most of them take no arguments at all:
+
+```sql
+ATTACH 'abfss://MyWS@onelake.dfs.fabric.microsoft.com/MyLH.Lakehouse/Tables' AS lake
+  (TYPE fabricator, PROVIDER 'delta', SECRET fabric_sp, READ_ONLY false);
+
+-- What this attach resolved to (root, engine defaults, whether it is OneLake):
+SELECT * FROM lake.dbo.fab_delta_info();
+```
+
+They are registered **only** for a OneLake root — a local or S3 Delta attach has no workspace or REST
+credential, so it shows none of them.
+
+| function | kind | what it does |
+|---|---|---|
+| `fabric_refresh_sql_endpoint()` | table | Syncs the lakehouse's **SQL analytics endpoint** now; one row per table |
+| `fabric_refresh_sql_endpoint_ex(recreate, timeout_seconds)` | table | Same, with `recreateTables` / a timeout override (`NULL` = service default) |
+| `fabric_list_shortcuts()` / `_ex(parent_path)` | table | The lakehouse's OneLake shortcuts, optionally under one path |
+| `fabric_create_shortcut(path, name, target_workspace, target_item, target_path)` | scalar | Creates a shortcut to another OneLake item; returns its full path. Fails if the name exists |
+| `fabric_alter_shortcut(…same args…)` | scalar | Re-points an **existing** shortcut (fails if absent) |
+| `fabric_create_shortcut_ex(…same args…, conflict_policy)` | scalar | Same, with `Abort` / `GenerateUniqueName` / `CreateOrOverwrite` / `OverwriteOnly` — use `CreateOrOverwrite` for idempotent scripts |
+| `fabric_create_shortcut_json(path, name, target_json [, conflict_policy])` | scalar | Any target type (ADLS Gen2, S3, GCS, Blob, Dataverse, SharePoint) as the REST `target` object |
+| `fabric_drop_shortcut(path, name [, if_exists])` | scalar | Deletes a shortcut; `if_exists := true` returns `false` instead of erroring |
+| `fabric_workspaces()` | table | Every workspace this identity can see (id, name, type, capacity) |
+| `fabric_items()` / `_ex(item_type)` | table | Items in this workspace, optionally filtered (`'Notebook'`, `'Lakehouse'`, …) |
+| `fabric_lakehouses()` | table | Lakehouses **with their SQL endpoint id, status and connection string** |
+| `fabric_warehouses()` | table | Warehouses with their T-SQL connection strings |
+| `fabric_connections()` | table | Cloud connections — the `id` an external shortcut target needs |
+| `fabric_notebook_parameters(notebook)` | table | Names/defaults from a notebook's `parameters`-tagged cell |
+
+**Refreshing the SQL endpoint after a Delta write** — the reason this exists. A table written through the
+Delta provider is invisible to the lakehouse's T-SQL endpoint until Fabric's asynchronous detection notices
+it, which races any downstream T-SQL model:
+
+```sql
+SELECT table_name, status, error_message FROM lake.dbo.fabric_refresh_sql_endpoint();
+```
+
+> **`status = 'NotRun'` is normal and means "already in sync"** — not a failure. Check
+> `status <> 'Failure'` (or `error_code IS NULL`); asserting `status = 'Success'` fails on a healthy
+> refresh. On a schema-enabled lakehouse `table_name` is schema-qualified (`dbo.orders`).
+
+> **In dbt, this hook must be non-transactional.** Delta commits land at DuckDB `COMMIT`, so an
+> in-transaction post-hook would refresh *before* the table exists. Use
+> `post_hook: [{sql: "SELECT count(*) FROM lake.dbo.fabric_refresh_sql_endpoint()", transaction: false}]`,
+> or an `on-run-end` hook.
+
+**Shortcuts.** `target_workspace` / `target_item` accept a display name or a GUID, and `NULL` means "this
+catalog's own workspace / lakehouse":
+
+```sql
+SELECT lake.dbo.fabric_create_shortcut('Tables', 'ref_orders', NULL, NULL, 'Tables/orders');
+SELECT path, name, target_type, target_location, target_subpath FROM lake.dbo.fabric_list_shortcuts();
+SELECT lake.dbo.fabric_alter_shortcut('Tables', 'ref_orders', 'OtherWS', 'OtherLH', 'Tables/orders_v2');
+SELECT lake.dbo.fabric_drop_shortcut('Tables', 'ref_orders', true);
+```
+
+`fabric_list_shortcuts` flattens the stable target fields into typed columns (`target_type`,
+`target_workspace_id`, `target_item_id`, `target_path`, `target_location`, `target_subpath`,
+`target_connection_id`) and additionally returns `target_json` with the complete target object, so target
+types this build does not flatten are still readable. External targets need a pre-provisioned Fabric
+**cloud connection**, whose `connectionId` goes in `target_json`:
+
+```sql
+-- Find the connection first, then use its id as the target's connectionId.
+SELECT id, name, connection_type, path FROM lake.dbo.fabric_connections();
+
+SELECT lake.dbo.fabric_create_shortcut_json('Files/landing', 'partner',
+  '{"adlsGen2": {"location": "https://acct.dfs.core.windows.net",
+                 "subpath": "/container/data", "connectionId": "…"}}');
+```
+
+**Introspection.** Useful on its own, and the source of the identifiers the calls above need — for example
+attaching the lakehouse's T-SQL endpoint alongside the Delta catalog:
+
+```sql
+SELECT name, sql_endpoint_status, sql_endpoint_connection_string FROM lake.dbo.fabric_lakehouses();
+SELECT id, name FROM lake.dbo.fabric_items_ex('Notebook');
+SELECT name, default_value, inferred_type FROM lake.dbo.fabric_notebook_parameters('my_notebook');
+```
+
+`fabric_notebook_parameters` is best-effort: Fabric injects parameter overrides after the cell tagged
+`parameters`, which is ordinary Python, so this reads simple top-level `name = literal` lines. No rows means
+the notebook has no tagged cell. It reads the notebook definition, which is a slow API (~20 s) — don't call
+it per row.
+
+Notes and limits:
+
+- A shortcut to a Delta table becomes visible to *this* catalog only after
+  `SELECT fabricator_refresh_cache('lake')` — table discovery is cached.
+- **Shortcut metadata is eventually consistent on Fabric's side.** Re-creating a just-dropped name can
+  briefly fail with `EntityConflict` even though a listing already shows it gone. For idempotent scripts
+  prefer `fabric_create_shortcut_ex(path, name, …, 'CreateOrOverwrite')` over drop-then-create.
+- These calls take effect **immediately** and are not undone by a surrounding `ROLLBACK` (like Delta
+  `DROP`/`OPTIMIZE`).
+- Errors lead with Fabric's own error code, e.g. `EntityConflict`, `PrincipalTypeNotSupported`.
+- Some Fabric APIs reject **service principals** regardless of documented support (notably resetting the
+  shortcut cache and creating notebook items); those need a user identity.
+- `fabric_connections()` lists only connections the **calling identity** has a role on — a service
+  principal often sees none even where connection-backed shortcuts exist. Grant the SP access to the
+  connection before creating external shortcuts with it.
+- `duckdb_functions()` also lists an `<name>_each` sibling for each table function. That is the generic
+  per-row form and is not usable on this provider.
 
 ## Callable Functions
 

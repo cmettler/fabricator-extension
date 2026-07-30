@@ -329,7 +329,12 @@ public static class FabricLakehouse
 
     /// <summary>Parses <c>abfss://&lt;workspace&gt;@onelake.dfs.fabric.microsoft.com/&lt;lakehouse&gt;/…</c> into the
     /// workspace segment (before <c>@</c>) and the lakehouse segment (first path segment after the host).</summary>
-    private static (string Workspace, string Lakehouse) ParseOneLake(string root)
+    /// <remarks>
+    /// Either segment may be a display NAME or a GUID depending on how the user wrote the URI — resolution is the
+    /// caller's job (<see cref="ResolveLakehouseId"/> here, <c>FabricApiClient</c> for the REST functions, which
+    /// is why this is internal rather than private).
+    /// </remarks>
+    internal static (string Workspace, string Lakehouse) ParseOneLake(string root)
     {
         var path = root.Replace('\\', '/');
         int scheme = path.IndexOf("://", StringComparison.Ordinal);

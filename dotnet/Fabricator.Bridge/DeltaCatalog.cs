@@ -108,6 +108,16 @@ public sealed class DeltaBackend : IBackend
     /// </summary>
     public IEnumerable<CatalogMacroDefinition> CatalogMacros => DeclaredCatalogMacros;
 
+    // Catalog-bound custom FUNCTIONS (as opposed to the macros above): real C# that runs per call, marshaled
+    // over the ABI. Same `__all__` sentinel, same reason. Unlike the SQL-Server catalog these are not
+    // discovered from a server — the provider declares them — so the kind-6 stream is built in memory
+    // (see FunctionsMetadata).
+    //
+    // Deliberately NOT a static list: every function here exists BECAUSE it needs catalog context (the
+    // attach root, and on OneLake the workspace/item + credential resolved at ATTACH). A static registry
+    // would force that context into every call's arguments, which is precisely the ergonomics the
+    // catalog-bound form buys us. Built per catalog by DeltaCatalog.BuildFunctionSet.
+
     // The connstr IS the folder root. Data-file IO is via DuckDB FS secrets (the opener). An azure SP secret on
     // a OneLake ATTACH additionally authenticates the Fabric REST API used to list tables (the glob bug
     // workaround) — carry its fields to the catalog as a credential marker on the root (mirrors the DAX provider).
@@ -653,7 +663,12 @@ public sealed class DeltaCatalog : IBackendCatalog
         // catalog's schemas as db.schema.m(...). Local declarations — nothing here touches storage, which is
         // exactly why they ride their own metadata kind instead of a SQL discovery stream.
         MetadataKind.CatalogMacros => CatalogMacroMetadata.Stream(ExpandCatalogMacroSchemas()),
-        // No row-count/NDV stats surfaced, no functions.
+        // Provider-declared CATALOG-BOUND custom functions (schema_name, name, kind). Built IN MEMORY —
+        // unlike SqlServerCatalog, this provider has no SQL engine to assemble a discovery query with, and
+        // nothing here is discovered anyway: the set is what the provider declares. `__all__` expands across
+        // discovered schemas (lazily — an empty set costs no schema enumeration, which on OneLake is I/O).
+        MetadataKind.Functions => FunctionsMetadata.Stream(Functions.Declarations(SchemaNames)),
+        // No row-count/NDV stats surfaced.
         _ => EmptyStringTable("name"),
     };
 
@@ -4196,14 +4211,69 @@ public sealed class DeltaCatalog : IBackendCatalog
         return segments;
     }
 
-    public Schema GetFunctionParamSchema(string s, string f) => throw NoFunctions();
-    public Schema GetFunctionReturnSchema(string s, string f) => throw NoFunctions();
-    public IArrowArrayStream ExecuteScalar(string s, string f, IArrowArrayStream a) => throw NoFunctions();
-    public Schema GetFunctionOutputSchema(string s, string f, RecordBatch? a = null) => throw NoFunctions();
-    public IBoundTable TableBind(string s, string f, RecordBatch? a) => throw NoFunctions();
+    // ---- catalog-bound custom functions -------------------------------------------------------------
+    // The scalar + table kinds are hosted (see Functions); in-out and aggregates deliberately are not — no
+    // demand, and each would add a session lifetime to reason about. GenerateTableSql keeps the default
+    // interface throw: a sqlgen function must name tables in a SQL dialect this provider does not have.
+
+    /// <summary>
+    /// This catalog's catalog-bound custom functions. Lazily built so an ATTACH that never touches a function
+    /// pays nothing, and per CATALOG (not static) because a function may capture catalog context — the OneLake
+    /// workspace/item and credential resolved at ATTACH, which is what lets a Fabric-API function be called
+    /// with no arguments. See docs/fabric-api-functions.md.
+    /// </summary>
+    private CatalogFunctionSet Functions => _functions ??= BuildFunctionSet();
+    private CatalogFunctionSet? _functions;
+
+    private CatalogFunctionSet BuildFunctionSet()
+    {
+        var scalars = new List<ICatalogScalarFunction>();
+        var tables = new List<ICatalogTableFunction>
+        {
+            new DeltaCatalogInfoFunction(new[]
+            {
+                new KeyValuePair<string, string>("root", _root),
+                new KeyValuePair<string, string>("native_read", _nativeRead ? "true" : "false"),
+                new KeyValuePair<string, string>("native_write", _nativeWrite ? "true" : "false"),
+                new KeyValuePair<string, string>("onelake", FabricLakehouse.IsOneLake(_root) ? "true" : "false"),
+            }),
+        };
+        // Fabric REST API functions are registered ONLY on a OneLake root: off Fabric they have no workspace,
+        // no item and no REST credential, so advertising them would put functions in the catalog that can only
+        // fail. A local/S3 Delta attach therefore shows none of them — asserted as a negative control in
+        // test/verify_delta_catalog_functions.test.
+        if (FabricLakehouse.IsOneLake(_root))
+        {
+            FabricApiFunctions.Register(scalars, tables, new FabricApiContext(_root, _fabricCredential));
+        }
+        return new CatalogFunctionSet(scalars, tables);
+    }
+
+    public Schema GetFunctionParamSchema(string s, string f) =>
+        Functions.ParamSchema(s, f) ?? throw NoFunction(s, f);
+
+    public Schema GetFunctionReturnSchema(string s, string f) =>
+        Functions.ReturnSchema(s, f) ?? throw NoFunction(s, f);
+
+    public IArrowArrayStream ExecuteScalar(string s, string f, IArrowArrayStream a) =>
+        Functions.ExecuteScalar(s, f, a) ?? throw NoFunction(s, f);
+
+    public Schema GetFunctionOutputSchema(string s, string f, RecordBatch? a = null) =>
+        Functions.OutputSchema(s, f, a) ?? throw NoFunction(s, f);
+
+    public IBoundTable TableBind(string s, string f, RecordBatch? a) =>
+        Functions.TableBind(s, f, a) ?? throw NoFunction(s, f);
+
     public IArrowInOutBinding InOutBind(string s, string f, RecordBatch? a, Schema input) => throw NoFunctions();
     public IAggregateSession AggOpen(string s, string f) => throw NoFunctions();
+
     private static NotSupportedException NoFunctions() => new("delta provider: no catalog functions.");
+
+    // Names the function, because a lookup miss here means the host registered a declaration this catalog
+    // cannot serve — i.e. the declaration list and the registry disagree, which is a bug in OUR wiring, not
+    // user error. A bare "no catalog functions" would send the reader looking in the wrong place.
+    private static NotSupportedException NoFunction(string schema, string func) =>
+        new($"delta provider: no catalog function '{schema}.{func}'.");
 
     public void Dispose() { }
 

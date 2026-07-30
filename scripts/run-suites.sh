@@ -80,8 +80,15 @@ case "$TIER" in
         # instead of failing against the fresh connection's default memory.main. TimeZone is asserted as a
         # rendered VALUE, not just current_setting(), since the label alone would pass without reaching the
         # computation. Suite count unchanged — the suite already existed.
-        : "${MIN_SUITES:=61}"
-        : "${MIN_ASSERTIONS:=5537}"
+        # 62 runs / 5558 since 2026-07-30: verify_delta_catalog_functions (21) pins CATALOG-BOUND CUSTOM
+        # FUNCTIONS on the Delta catalog — until then all seven of its function ABI members threw and the
+        # FUNCTIONS metadata kind fell to a 1-column empty fallback. It also pins the ZERO-ARGUMENT shape, which
+        # needs BOTH halves of a real fix: an empty parameter schema is unrepresentable in Apache.Arrow's C
+        # interface (export AND import throw on 'fields'), so the host passes no args stream for an
+        # argument-less function and the bridge exports the empty schema itself. A regression in either half
+        # makes such a function silently VANISH rather than error, which is why it is asserted here.
+        : "${MIN_SUITES:=62}"
+        : "${MIN_ASSERTIONS:=5558}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
