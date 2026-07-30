@@ -62,6 +62,22 @@ vector<vector<string>> ReadStringTable(ArrowArrayStream &stream, idx_t expected_
 		if (!batch.release) {
 			break; // end of stream
 		}
+		// The column count is CHECKED before dereferencing children[], not assumed. A provider answering a
+		// metadata kind it does not implement returns some other shape — the Delta/DAX catalogs' `_ =>` arm is a
+		// ONE-column empty table, which is what a Delta catalog gives for FUNCTIONS — so reading children[1..]
+		// of that would be out of bounds. Checked per BATCH rather than on the schema on purpose: a zero-row
+		// stream carries nothing to read, so its width is immaterial, and several callers legitimately rely on
+		// that (DiscoverFunctions asks for 3 columns and a Delta catalog answers with 1 and no rows). Only a
+		// batch that actually HAS rows must be wide enough.
+		if (batch.length > 0 && batch.n_children < static_cast<int64_t>(expected_cols)) {
+			batch.release(&batch);
+			if (stream.release) {
+				stream.release(&stream);
+			}
+			throw IOException("fabricator: metadata batch has %lld columns, expected at least %llu",
+			                  static_cast<long long>(batch.n_children),
+			                  static_cast<unsigned long long>(expected_cols));
+		}
 		for (int64_t row = 0; row < batch.length; row++) {
 			for (idx_t c = 0; c < expected_cols; c++) {
 				result[c].push_back(GetUtf8(*batch.children[c], row));
@@ -142,6 +158,30 @@ vector<FabricatorFunctionInfo> DiscoverFunctions(FabricatorHandle handle) {
 		funcs.push_back({rows[0][i], rows[1][i], rows[2][i]});
 	}
 	return funcs;
+}
+
+vector<FabricatorMacroInfo> DiscoverCatalogMacros(FabricatorHandle handle) {
+	// Best-effort BY CONTRACT (see the header): declaring catalog macros is optional, and a provider that does
+	// not serve the kind answers with an error (SqlServerCatalog's default arm throws) or an unrelated empty
+	// table (the Delta/DAX catalogs' `_ =>` fallback). Swallowing here keeps every caller free of its own guard
+	// and matches how the GLOBAL macro registration degrades — a macro problem must never block an ATTACH.
+	vector<FabricatorMacroInfo> macros;
+	try {
+		ArrowArrayStream stream;
+		std::memset(&stream, 0, sizeof(stream));
+		fabricator::GetMetadata(handle, FABRICATOR_META_CATALOG_MACROS, "", "", stream);
+		// Columns: schema, name, create_sql.
+		auto rows = ReadStringTable(stream, 3);
+		for (idx_t i = 0; i < rows[0].size(); i++) {
+			if (rows[1][i].empty() || rows[2][i].empty()) {
+				continue; // a nameless or bodiless declaration cannot be bound to anything
+			}
+			macros.push_back({rows[0][i], rows[1][i], rows[2][i]});
+		}
+	} catch (std::exception &) {
+		macros.clear(); // partial reads are discarded — an all-or-nothing declaration set is easier to reason about
+	}
+	return macros;
 }
 
 void FetchFunctionParamSchema(ClientContext &context, FabricatorHandle handle, const string &schema_name,

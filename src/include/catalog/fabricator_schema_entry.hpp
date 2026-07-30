@@ -75,6 +75,15 @@ public:
 	//! external GROUP BY can spill it); otherwise the fast in-memory id-based mode (state lives in C#).
 	void AddAggregateFunction(const string &func_name, bool spillable);
 
+	//! Registers a provider-declared CATALOG-BOUND DuckDB macro: `create_sql` is one complete CREATE MACRO
+	//! statement, parsed lazily on first lookup by DuckDB's OWN parser and bound into THIS schema, so it
+	//! resolves as `db.schema.m(...)` (scalar) or `FROM db.schema.m(...)` (a `... AS TABLE` macro). Nothing
+	//! crosses the bridge when it runs — the binder expands it, which is what makes this the cheap way to
+	//! namespace a SCALAR helper per catalog (a catalog scalar FUNCTION marshals every call).
+	//! Unlike the global registration this OVERWRITES the parsed catalog/schema instead of rejecting a
+	//! qualified body. See docs/macros-and-sqlgen-functions.md §1.4.
+	void AddMacro(const string &macro_name, const string &create_sql);
+
 	//! Drops all cached table + function names and materialized entries (cache refresh).
 	void ClearTables();
 
@@ -133,6 +142,16 @@ private:
 	//! Materializes a custom aggregate (4h) as an AggregateFunctionCatalogEntry whose callbacks marshal
 	//! per-group int64 state ids + Arrow batches to the C# accumulator over the agg_* ABI.
 	optional_ptr<CatalogEntry> GetOrCreateAggregateFunction(ClientContext &context, const string &func_name);
+	//! Materializes a provider-declared catalog-bound macro as a ScalarMacroCatalogEntry (`CREATE MACRO x AS
+	//! expr`) or a TableMacroCatalogEntry (`... AS TABLE query`) — which of the two is decided by DuckDB's
+	//! parser, not by us.
+	//!
+	//! `want_table` FILTERS by that kind and is not optional: DuckDB reaches a macro through the plain
+	//! SCALAR_FUNCTION_ENTRY / TABLE_FUNCTION_ENTRY lookups and then `Cast<>`s on the entry's actual type
+	//! (bind_function_expression.cpp / bind_table_function.cpp), so handing an expression binder a TABLE macro
+	//! would be an unchecked bad cast. Returns nullptr for the wrong kind, i.e. "no such function" — which is
+	//! the truthful answer for that lookup.
+	optional_ptr<CatalogEntry> GetOrCreateMacro(ClientContext &context, const string &macro_name, bool want_table);
 
 	FabricatorHandle handle_;
 	case_insensitive_map_t<string> table_types_; // table name -> "BASE TABLE" | "VIEW"
@@ -143,11 +162,16 @@ private:
 	case_insensitive_set_t custom_inout_functions_;  // provider-authored custom table-in-out names (4g)
 	case_insensitive_set_t custom_collector_functions_; // provider-authored custom collector (pipeline-breaker) names
 	case_insensitive_map_t<bool> aggregate_functions_; // custom aggregate (UDAF) name -> spillable (4h)
+	case_insensitive_map_t<string> macros_;            // catalog-bound macro name -> its CREATE MACRO statement
 	mutex entry_lock_;
 	case_insensitive_map_t<unique_ptr<FabricatorTableEntry>> entries_;
 	case_insensitive_map_t<unique_ptr<ScalarFunctionCatalogEntry>> function_entries_;
 	case_insensitive_map_t<unique_ptr<TableFunctionCatalogEntry>> table_function_entries_;
 	case_insensitive_map_t<unique_ptr<AggregateFunctionCatalogEntry>> aggregate_function_entries_;
+	// Materialized macros. ONE map for both kinds, held as the CatalogEntry base because the parse decides
+	// whether an entry is a ScalarMacroCatalogEntry or a TableMacroCatalogEntry; the kind is recovered from
+	// `type` (MACRO_ENTRY vs TABLE_MACRO_ENTRY) rather than tracked separately.
+	case_insensitive_map_t<unique_ptr<CatalogEntry>> macro_entries_;
 	// GRAVEYARD: evicted entries are RETIRED here, never destroyed mid-session. The lookup paths hand out
 	// RAW pointers that DuckDB's binder holds ACROSS the entry_lock_ (bind -> plan -> execute), so a
 	// concurrent eviction (RollbackTransaction -> InvalidateAllEntries, an ALTER's re-key, a self-heal)

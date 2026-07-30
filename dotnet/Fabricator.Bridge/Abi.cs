@@ -371,6 +371,13 @@ public static class MetadataKind
     // enabling keys (delta.enable*, columnMapping.mode) are rejected — those need a protocol upgrade at
     // CREATE. Surfaced by fabricator_delta_set_tblproperties(catalog, 'schema.table', properties).
     public const int SetTblProperties = 14;
+    // Provider-declared CATALOG-BOUND DuckDB macros: three string columns (schema, name, create_sql), each
+    // create_sql one complete CREATE MACRO statement that the HOST parses with DuckDB's own parser and binds
+    // into the ATTACHed catalog's schema (resolved as db.schema.m(...)). Deliberately NOT a column on
+    // Functions: that stream is provider SQL executed on the SERVER, and a macro body is a purely local
+    // declaration that must not round-trip through it. Best-effort — a provider that does not serve this kind
+    // simply has no catalog macros. See docs/macros-and-sqlgen-functions.md §1.4.
+    public const int CatalogMacros = 15;
 }
 
 internal static class FabricatorStatus

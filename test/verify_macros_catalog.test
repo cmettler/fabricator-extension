@@ -1,0 +1,218 @@
+# name: test/verify_macros_catalog.test
+# description: CATALOG-BOUND provider-declared DuckDB MACROs (docs/macros-and-sqlgen-functions.md §1.4) — the
+#              attach-time counterpart of verify_macros.test's load-time global ones. The provider declares
+#              complete CREATE MACRO statements (IBackend.CatalogMacros) which the host binds into the ATTACHed
+#              catalog's schemas, so they resolve as db.schema.m(...) and NOT under a bare name.
+#
+#              WHY THIS EXISTS AT ALL. A schema buys NAMESPACING, and namespacing a SCALAR helper is the one
+#              shape nothing else in the stack serves cheaply: a SQL-generating function (§2) is table-valued
+#              only, and a catalog scalar FUNCTION marshals every call across the ABI, whereas a macro is
+#              expanded by the binder and crosses nothing at runtime. (The doc used to dismiss catalog macros
+#              wholesale on the grounds that §2 covers them — true for a table macro naming its own catalog,
+#              false for this case.)
+#
+#              WHAT IS ASSERTED, and why this shape. Three properties carry the feature and each has a
+#              distinct failure mode:
+#                (a) RESOLUTION through the catalog, for BOTH macro kinds. DuckDB reaches a macro by looking up
+#                    SCALAR_FUNCTION_ENTRY / TABLE_FUNCTION_ENTRY and then dispatching on the entry's ACTUAL
+#                    type, so the host hands macro entries out from those lookups. §2/§3.
+#                (b) The bare name must NOT resolve (§4). This is the ONE assertion that separates catalog-bound
+#                    from global: without it, a regression that accidentally registered these globally would
+#                    pass every other section here.
+#                (c) KIND FILTERING (§5). A scalar lookup must not return a table macro: the binder Cast<>s on
+#                    the entry type WITHOUT checking, so returning the wrong kind is an unchecked bad cast, not
+#                    a clean error. Both directions are pinned.
+#              Plus: the full CREATE MACRO grammar survives the catalog path (§3 named defaults), enumeration
+#              (§6 — macros must ride the SCALAR/TABLE_FUNCTION scans, because those are the only types
+#              duckdb_functions() asks for), and cache refresh (§7).
+#
+#              Hermetic: a Delta catalog over FABRICATOR_DELTA_WRITE_DIR. Deliberately NOT the SQL Server
+#              provider even though it declares one too — a macro body is a LOCAL declaration carried on its own
+#              metadata kind, never assembled into provider SQL, so it needs no server. That independence is
+#              itself part of the design and this suite running with no service proves it.
+# group: [fabricator]
+
+require fabricator
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+# The macros are declared per-provider and bound into every schema the catalog discovers, so an EMPTY root is
+# enough — no table needs to exist for a macro to resolve.
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}' AS lake (TYPE fabricator, PROVIDER 'delta');
+
+# ---- 1. the declarations arrived, typed by KIND (the parsed statement decides scalar vs table, not us) ----
+
+query IIII
+SELECT function_name, function_type, schema_name, database_name
+FROM duckdb_functions()
+WHERE database_name = 'lake' AND function_name LIKE 'fab_%'
+ORDER BY function_name;
+----
+fab_clamp	macro	main	lake
+fab_numbers	table_macro	main	lake
+fab_pct	macro	main	lake
+
+# ---- 2. a SCALAR macro resolves three-part and expands correctly ----
+
+query R
+SELECT lake.main.fab_pct(25, 200);
+----
+12.5
+
+# The body's own CASE guard survives expansion (a macro is a template — the expression is substituted, so this
+# is DuckDB evaluating the declared expression, not the provider computing anything).
+query R
+SELECT lake.main.fab_pct(5, 0);
+----
+NULL
+
+query R
+SELECT lake.main.fab_pct(5, NULL);
+----
+NULL
+
+# Expanded by the BINDER: it works per-row over a real relation with no bridge involvement.
+query IR
+SELECT i, lake.main.fab_pct(i, 4) AS pct FROM range(3) t(i) ORDER BY i;
+----
+0	0.0
+1	25.0
+2	50.0
+
+# ---- 3. the FULL CREATE MACRO grammar survives the catalog path (named parameter with a default) ----
+
+query I
+SELECT lake.main.fab_clamp(150);
+----
+100
+
+query I
+SELECT lake.main.fab_clamp(150, hi := 120);
+----
+120
+
+query I
+SELECT lake.main.fab_clamp(-5, lo := 10);
+----
+10
+
+# A defaulted parameter also accepts a POSITIONAL argument — verify_macros.test §1.3 found this for the global
+# form; pinned here so the catalog path cannot diverge from it.
+query I
+SELECT lake.main.fab_clamp(150, 0, 130);
+----
+130
+
+# ---- 4. THE defining property: catalog-bound means the BARE name does NOT resolve ----
+# Without this, a regression that registered these into the SYSTEM catalog would pass every other section.
+
+statement error
+SELECT fab_pct(25, 200);
+----
+Scalar Function with name fab_pct does not exist!
+
+statement error
+SELECT * FROM fab_numbers(3);
+----
+
+# Nor in another database's schema (the entry belongs to THIS catalog's schema entry, not to a global registry).
+statement error
+SELECT memory.main.fab_pct(1, 2);
+----
+
+# ---- 5. KIND FILTERING: a lookup must never be handed the other kind of macro ----
+# The binder Cast<>s on the entry's actual type without checking, so the host filters by kind and reports
+# not-found for a mismatch. An unfiltered implementation is an unchecked bad cast, which is why both
+# directions are pinned rather than just the one that happens to be easy to hit.
+
+statement error
+SELECT * FROM lake.main.fab_pct(1, 2);
+----
+Table Function with name fab_pct does not exist!
+
+statement error
+SELECT lake.main.fab_numbers(3);
+----
+table function
+
+# A name that was never declared is an ordinary not-found (the macro path adds no phantom entries).
+statement error
+SELECT lake.main.fab_not_declared(1);
+----
+does not exist
+
+# ---- 6. a TABLE macro (... AS TABLE <query>) resolves in a FROM clause ----
+
+query I
+SELECT count(*) FROM lake.main.fab_numbers(5);
+----
+5
+
+query I
+SELECT sum(n) FROM lake.main.fab_numbers(5);
+----
+10
+
+query I
+SELECT n FROM lake.main.fab_numbers(3) ORDER BY n;
+----
+0
+1
+2
+
+# It is a real relation: joinable, filterable, and composable with the scalar macro from the same schema.
+query IR
+SELECT a.n, lake.main.fab_pct(a.n, 10) AS pct
+FROM lake.main.fab_numbers(4) a
+WHERE a.n > 1
+ORDER BY a.n;
+----
+2	20.0
+3	30.0
+
+query I
+SELECT count(*) FROM lake.main.fab_numbers(4) a JOIN lake.main.fab_numbers(2) b ON a.n = b.n;
+----
+2
+
+# ---- 7. cache refresh keeps them: the declarations are re-read, and the entries are RETIRED not destroyed ----
+# (Eviction moves entries to the graveyard because the binder holds raw pointers across bind->plan->execute;
+# a destroying eviction was a use-after-free. See the CLAUDE.md catalog-eviction entry.)
+
+statement ok
+SELECT fabricator_invalidate_cache('lake');
+
+query R
+SELECT lake.main.fab_pct(1, 4);
+----
+25.0
+
+statement ok
+SELECT fabricator_refresh_cache('lake');
+
+query R
+SELECT lake.main.fab_pct(1, 4);
+----
+25.0
+
+query I
+SELECT count(*) FROM lake.main.fab_numbers(3);
+----
+3
+
+# Still enumerable after the refresh (the name list survived, and re-materialization works).
+query I
+SELECT count(*) FROM duckdb_functions() WHERE database_name = 'lake' AND function_name LIKE 'fab_%';
+----
+3
+
+# ---- 8. detaching removes them (they are catalog state, not process state — unlike the global ones) ----
+
+statement ok
+DETACH lake;
+
+statement error
+SELECT lake.main.fab_pct(1, 2);
+----
+lake

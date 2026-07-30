@@ -185,13 +185,118 @@ Demos now shipping (SQL Server provider = the always-present default, like `fabr
 
 #### Deliberately out of scope (deferred)
 
-- **Catalog-bound (attach-time) macros** — a `ScalarMacroCatalogEntry` inside
-  `FabricatorSchemaEntry` is mechanically possible (we already materialize function entries), but a
-  macro body referencing its own catalog would have to bake the ATTACH alias into parsed
-  expressions. The catalog-bound *SQL-generating* function (§2) covers that need better — the
-  generator is TOLD the alias.
 - Macro **removal/replacement** at runtime (they live in the system catalog for the process
   lifetime; `CREATE OR REPLACE` semantics across re-loads are a non-goal).
+
+### 1.4 Catalog-bound (attach-time) macros — BUILT 2026-07-30, no ABI bump
+
+Shipped after re-examining a deferral whose *rationale* turned out to be half wrong. The old entry deferred
+these on the grounds that "the catalog-bound SQL-generating function (§2) covers that need better — the
+generator is TOLD the alias". That is true for **one** of the two needs and false for the other, which is
+the half that got built. Both halves of the mechanism were source-verified before writing any code.
+
+**The binder half works, and by a pattern we already ship.** DuckDB resolves both macro kinds by looking
+up a *function* type and then dispatching on the entry's ACTUAL type, so a macro entry handed out by
+`FabricatorSchemaEntry::LookupEntry` is expanded normally:
+
+| kind | binder looks up | dispatches on |
+|---|---|---|
+| scalar | `SCALAR_FUNCTION_ENTRY` | `MACRO_ENTRY` → `BindMacro` (`bind_function_expression.cpp:85,164`) |
+| table | `TABLE_FUNCTION_ENTRY` | `TABLE_MACRO_ENTRY` → `BindTableMacro` (`bind_table_function.cpp:369,371`) |
+
+That is the SAME trick our custom aggregates already ride — `LookupEntry`'s `SCALAR_FUNCTION_ENTRY` branch
+must surface them because DuckDB shares one namespace across scalar/aggregate/macro — so this needs no new
+pattern. Ctors match what we already construct: `ScalarMacroCatalogEntry(Catalog &, SchemaCatalogEntry &,
+CreateMacroInfo &)`. And the table path goes through `GetCatalogEntry(catalog, schema, lookup)`, so a
+qualified `db.schema.m(…)` routes into our schema entry.
+
+**The resolution caveat is SHARPER than "bake the alias into parsed expressions".** Macro expansion
+captures no search path at all (verified, with a positive control — `SetSearchPath` does exist elsewhere
+in the tree, so the empty result is a real absence and not a mistyped pattern); `BindTableMacro` merely
+returns a `QueryNode` that the CALLING binder binds. So a schema buys **namespacing, not resolution
+scope**: a catalog-bound `CREATE MACRO recent() AS TABLE SELECT * FROM orders` resolves `orders` against
+the *caller's* search path. That is a silent-wrong-table shape, not an error.
+
+**Hence the split the old rationale missed — §2 is TABLE-valued only** (`bind_replace` → SubqueryRef):
+
+- a table macro that references its own catalog → **use sqlgen**, exactly as the old entry said. Unchanged.
+- a per-catalog **scalar** helper → sqlgen has no scalar analog at all, and the catalog-bound custom scalar
+  (4e, `ICatalogScalarFunction`) is **marshaled** — data crosses the ABI per call. A catalog-bound scalar
+  macro is expanded by the binder with **zero runtime crossing**. Nothing else in the stack offers that
+  combination, so "§2 covers it" was never true for this case.
+
+#### AS BUILT — and the one design decision that changed during the build
+
+The plan sketched here first said the macro body should ride a **trailing `body` column on the FUNCTIONS
+metadata stream**, mirroring what `list_global_functions` does. That was **wrong, and reading the producer
+is what settled it**: `SqlServerCatalog.FunctionsMetadataSql()` builds that stream as **T-SQL text executed
+on the server** (custom functions are appended as `UNION ALL SELECT '<schema>','<name>','kind',…`). Carrying
+macro bodies there would have embedded a multi-line `CREATE MACRO` statement in a T-SQL literal, shipped it
+to SQL Server, and read it back — for a declaration that is purely LOCAL. Worse, it would have made
+declaring a macro depend on **server reachability**, and it offers nothing at all to a provider with no SQL
+engine (the Delta catalog).
+
+So the body travels on **its own metadata kind**, `FABRICATOR_META_CATALOG_MACROS = 15` — three string
+columns (schema, name, create_sql). Adding a metadata kind is additive, so this is still **no ABI bump**, and
+the FUNCTIONS column layout is untouched (nothing else had to change, and `fabricator_functions()` is
+unaffected).
+
+What shipped:
+
+- **C#** — `CatalogMacroDefinition(SchemaName, Name, CreateSql)` in `Fabricator.Abstractions` +
+  `IBackend.CatalogMacros` (default empty, so every provider and plugin gets the surface for free);
+  `CatalogMacroMetadata.Stream(...)` in the Bridge builds the kind-15 table; the Delta and SQL Server
+  catalogs each answer the kind from their backend's declaration. The Delta declarations use an `__all__`
+  schema sentinel that `DeltaCatalog.ExpandCatalogMacroSchemas()` expands over the discovered schemas — a
+  Delta root's schemas are *folder names*, unknown until ATTACH, so a static declaration cannot name them.
+- **C++** — `DiscoverCatalogMacros` (`fabricator_metadata.cpp`, never throws: declaring macros is optional);
+  registration in **both** `LoadCatalog` and `RefreshCache`, gated on the schema having been registered, so
+  an ATTACH `schema_filter` gates macros exactly as it gates functions; `AddMacro` + `GetOrCreateMacro` on
+  `FabricatorSchemaEntry` with the **retire-never-destroy graveyard** on eviction; the `LookupEntry`
+  fallthroughs (scalar → aggregate → **macro**, and table function → **table macro**) plus direct
+  `MACRO_ENTRY`/`TABLE_MACRO_ENTRY` lookups; and both `Scan` overloads.
+- **The qualification rule INVERTS**, as predicted: the global path *rejects* a qualified body (§1.3, "force
+  main"), the catalog-bound path *overwrites* `info->catalog`/`info->schema` with the ATTACH alias and the
+  owning schema. Do not copy the global branch's validation into this path — it asserts the inverse
+  invariant. Nor `internal = true`: that marks a built-in, which is right for a load-time system-catalog
+  entry and wrong for a catalog one (no other catalog entry of ours sets it).
+
+Findings and deviations:
+
+- **`want_table` filtering is a correctness requirement, not tidiness.** The binder `Cast<>`s on the entry
+  type *without checking* (`bind_function_expression.cpp:164`), so returning a table macro from a scalar
+  lookup is an unchecked bad cast. `GetOrCreateMacro` therefore takes the wanted kind and returns nullptr
+  for a mismatch — i.e. "no such function", which is the truthful answer for that lookup. Both directions
+  are pinned (§5 of the suite). The mismatched entry is still cached, so the *matching* lookup does not
+  re-parse.
+- **Macros must be emitted by the SCALAR / TABLE_FUNCTION scans, not the MACRO ones.** `duckdb_functions()`
+  only ever scans `SCALAR_FUNCTION_ENTRY` / `TABLE_FUNCTION_ENTRY` / `PRAGMA_FUNCTION_ENTRY`
+  (`duckdb_functions.cpp:101-105`) and then switches on each entry's actual type (lines 806-826, which do
+  handle both macro types). Emitting them only under `MACRO_ENTRY` would resolve by name but never appear in
+  `duckdb_functions()` / `SHOW FUNCTIONS`.
+- **`GetOrCreateMacro` is the only `GetOrCreate*` here that makes NO bridge call** — a body is a declaration
+  already in hand, so materializing it is a local parse. `context` is used only for parser options and the
+  skip warning.
+- **A broken declaration is SKIPPED with a warning, never fatal** — the same contract §1.3 ships for the
+  global form, and it must be a skip rather than a throw because `Scan` materializes too: throwing there
+  would break enumeration of the whole schema, a far worse failure than one absent macro. The declaration is
+  also dropped so a broken body is not re-parsed on every lookup. Verified against three break modes
+  (unparseable body, a non-`CREATE MACRO` statement, and a declared-name/body-name mismatch): the ATTACH
+  succeeds, the good macros still work, and none of the broken ones enumerate.
+- **A latent out-of-bounds read in `ReadStringTable` surfaced and is fixed.** It reads the first N columns
+  without checking the batch width, and a provider answering a metadata kind it does not implement returns a
+  different shape — the Delta/DAX `_ =>` arm is a ONE-column empty table, which is exactly what a Delta
+  catalog gives for FUNCTIONS while `DiscoverFunctions` asks for three. That has always been an OOB read on
+  paper; it survives only because those fallbacks have zero rows, so the row loop never dereferences the
+  missing children. The check is now per BATCH and conditional on `length > 0`, which keeps that legitimate
+  reliance working while closing the real hazard. **An earlier attempt to validate the SCHEMA's width
+  instead broke every Delta ATTACH immediately** ("metadata stream has 1 columns, expected at least 3") —
+  a useful reminder that the lenient behaviour was load-bearing, not merely tolerated.
+
+Gate: **`test/verify_macros_catalog.test` (50)**, hermetic — a Delta catalog over an empty
+`FABRICATOR_DELTA_WRITE_DIR`, deliberately not the SQL Server provider even though it declares one too,
+because a macro needing no server is part of the design and a hermetic suite proves it. Hermetic tier
+60 runs/5471 → **61/5521**.
 
 ---
 

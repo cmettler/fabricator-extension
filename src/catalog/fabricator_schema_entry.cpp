@@ -47,6 +47,8 @@
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/parsed_data/create_aggregate_function_info.hpp"
+#include "duckdb/catalog/catalog_entry/scalar_macro_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/table_macro_catalog_entry.hpp"
 #include "duckdb/parser/parsed_data/create_macro_info.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
@@ -151,6 +153,13 @@ void FabricatorSchemaEntry::AddAggregateFunction(const string &func_name, bool s
 	RetireErase(aggregate_function_entries_, func_name, retired_entries_);
 }
 
+void FabricatorSchemaEntry::AddMacro(const string &macro_name, const string &create_sql) {
+	lock_guard<mutex> lock(entry_lock_);
+	macros_[macro_name] = create_sql;
+	// Drop any cached entry so a re-declared body is re-parsed (e.g. after a cache refresh).
+	RetireErase(macro_entries_, macro_name, retired_entries_);
+}
+
 void FabricatorSchemaEntry::ClearTables() {
 	lock_guard<mutex> lock(entry_lock_);
 	table_types_.clear();
@@ -162,8 +171,10 @@ void FabricatorSchemaEntry::ClearTables() {
 	custom_inout_functions_.clear();
 	custom_collector_functions_.clear();
 	aggregate_functions_.clear();
+	macros_.clear();
 	RetireAll(table_function_entries_, retired_entries_);
 	RetireAll(aggregate_function_entries_, retired_entries_);
+	RetireAll(macro_entries_, retired_entries_);
 }
 
 void FabricatorSchemaEntry::InvalidateEntryCache() {
@@ -174,6 +185,10 @@ void FabricatorSchemaEntry::InvalidateEntryCache() {
 	RetireAll(function_entries_, retired_entries_);
 	RetireAll(table_function_entries_, retired_entries_);
 	RetireAll(aggregate_function_entries_, retired_entries_);
+	// Macro bodies are declarations, not fetched server state, so re-parsing gains nothing — but the entries go
+	// too, because they are handed out as raw pointers under the same graveyard contract as the rest and it is
+	// cheaper to keep one rule than to reason about an exception.
+	RetireAll(macro_entries_, retired_entries_);
 }
 
 void FabricatorSchemaEntry::InvalidateMatching(const std::function<bool(const string &)> &matches) {
@@ -185,6 +200,7 @@ void FabricatorSchemaEntry::InvalidateMatching(const std::function<bool(const st
 	RetireMatching(function_entries_, matches, retired_entries_);
 	RetireMatching(table_function_entries_, matches, retired_entries_);
 	RetireMatching(aggregate_function_entries_, matches, retired_entries_);
+	RetireMatching(macro_entries_, matches, retired_entries_);
 }
 
 optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext &context, const string &table_name) {
@@ -939,6 +955,77 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateAggregateFunction(C
 	auto &ref = *entry;
 	aggregate_function_entries_[func_name] = std::move(entry);
 	return &ref;
+}
+
+optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateMacro(ClientContext &context, const string &macro_name,
+                                                                  bool want_table) {
+	// NOTE this is the one GetOrCreate* here that makes NO bridge call: a macro body is a declaration the
+	// provider already handed us at discovery, so materializing it is a local parse. `context` is used only for
+	// the parser options and the skip warning.
+	auto want_type = want_table ? CatalogType::TABLE_MACRO_ENTRY : CatalogType::MACRO_ENTRY;
+	lock_guard<mutex> lock(entry_lock_);
+	auto cached = macro_entries_.find(macro_name);
+	if (cached != macro_entries_.end()) {
+		// Filter by KIND, not just by name: a scalar lookup must not surface a table macro (see the header —
+		// the binder Cast<>s on the entry's actual type without checking).
+		return cached->second->type == want_type ? optional_ptr<CatalogEntry>(cached->second.get()) : nullptr;
+	}
+	auto decl = macros_.find(macro_name);
+	if (decl == macros_.end()) {
+		return nullptr;
+	}
+
+	unique_ptr<CatalogEntry> entry;
+	try {
+		// DuckDB's OWN parser owns the macro grammar — so named-parameter defaults, overload sets and
+		// `AS TABLE <query>` all work, and the parsed statement is what tells us which KIND this is. Same route
+		// as the global registration; only the qualification handling differs (below).
+		Parser parser(context.GetParserOptions());
+		parser.ParseQuery(decl->second);
+		if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::CREATE_STATEMENT) {
+			throw ParserException("expected a single CREATE MACRO statement");
+		}
+		auto &create = parser.statements[0]->Cast<CreateStatement>();
+		if (create.info->type != CatalogType::MACRO_ENTRY && create.info->type != CatalogType::TABLE_MACRO_ENTRY) {
+			throw ParserException("expected CREATE MACRO (scalar) or CREATE MACRO ... AS TABLE");
+		}
+		auto info = unique_ptr_cast<CreateInfo, CreateMacroInfo>(std::move(create.info));
+		// The declared name must agree with the discovered one: we cache under the DISCOVERED name and hand the
+		// entry straight to the binder, so a mismatch would leave one of the two names permanently unreachable.
+		if (!StringUtil::CIEquals(info->name, macro_name)) {
+			throw ParserException("declared macro name '%s' does not match the discovered name '%s'", info->name,
+			                      macro_name);
+		}
+		// QUALIFICATION IS OVERWRITTEN HERE — the OPPOSITE of the global registration, which rejects a qualified
+		// body because those land in the system catalog's main schema. A catalog-bound macro must carry THIS
+		// catalog's ATTACH alias (chosen by the user at ATTACH time, so a static declaration cannot state it) and
+		// this schema. Do not copy the global branch's validation into this path: it asserts the inverse.
+		info->catalog = catalog.GetName();
+		info->schema = name;
+		// NOT `internal`: that marks a system/built-in entry, which is right for the load-time global macros and
+		// wrong for a catalog entry (none of our other catalog entries set it either).
+		if (info->type == CatalogType::TABLE_MACRO_ENTRY) {
+			entry = make_uniq<TableMacroCatalogEntry>(catalog, *this, *info);
+		} else {
+			entry = make_uniq<ScalarMacroCatalogEntry>(catalog, *this, *info);
+		}
+	} catch (std::exception &ex) {
+		// SKIP, never block — the same contract the global macro registration ships with. Dropping the
+		// declaration also stops us re-parsing a broken body on every lookup; the call then fails with DuckDB's
+		// ordinary "function does not exist", and duckdb_functions()/Scan keeps working (a throw here would
+		// break enumeration of the whole schema, which is a far worse failure than one absent macro).
+		DUCKDB_LOG_WARNING(context, StringUtil::Format("fabricator: catalog macro '%s.%s' skipped: %s", name,
+		                                               macro_name, ex.what()));
+		macros_.erase(macro_name);
+		return nullptr;
+	}
+
+	auto &ref = *entry;
+	macro_entries_[macro_name] = std::move(entry);
+	// Parsed fine but it is the OTHER kind (a table macro reached through a scalar lookup, or vice versa): the
+	// entry is cached either way, so the matching lookup finds it without re-parsing, but THIS lookup reports
+	// not-found.
+	return ref.type == want_type ? optional_ptr<CatalogEntry>(&ref) : nullptr;
 }
 
 namespace {
@@ -2354,18 +2441,38 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::LookupEntry(CatalogTransaction
 	if (type == CatalogType::SCALAR_FUNCTION_ENTRY) {
 		// DuckDB stores scalar/aggregate/macro functions in one namespace and resolves a function call by
 		// looking up SCALAR_FUNCTION_ENTRY, then dispatching on the returned entry's actual type (see
-		// bind_function_expression.cpp). So a scalar lookup must also surface our custom aggregates.
+		// bind_function_expression.cpp: MACRO_ENTRY -> BindMacro, default -> BindAggregate). So a scalar lookup
+		// must also surface our custom aggregates AND our catalog-bound scalar macros — that one namespace is
+		// the entire reason a macro entry handed out here gets expanded correctly.
 		auto scalar = GetOrCreateScalarFunction(*transaction.context, lookup_info.GetEntryName());
 		if (scalar) {
 			return scalar;
 		}
-		return GetOrCreateAggregateFunction(*transaction.context, lookup_info.GetEntryName());
+		auto aggregate = GetOrCreateAggregateFunction(*transaction.context, lookup_info.GetEntryName());
+		if (aggregate) {
+			return aggregate;
+		}
+		return GetOrCreateMacro(*transaction.context, lookup_info.GetEntryName(), /*want_table=*/false);
 	}
 	if (type == CatalogType::AGGREGATE_FUNCTION_ENTRY) {
 		return GetOrCreateAggregateFunction(*transaction.context, lookup_info.GetEntryName());
 	}
 	if (type == CatalogType::TABLE_FUNCTION_ENTRY) {
-		return GetOrCreateTableFunction(*transaction.context, lookup_info.GetEntryName());
+		// Same shape on the table side: Binder::Bind(TableFunctionRef&) looks up TABLE_FUNCTION_ENTRY and then
+		// checks for TABLE_MACRO_ENTRY -> BindTableMacro (bind_table_function.cpp), so a `... AS TABLE` macro
+		// resolves through this lookup.
+		auto table_function = GetOrCreateTableFunction(*transaction.context, lookup_info.GetEntryName());
+		if (table_function) {
+			return table_function;
+		}
+		return GetOrCreateMacro(*transaction.context, lookup_info.GetEntryName(), /*want_table=*/true);
+	}
+	// Direct lookups by macro type (enumeration, and DuckDB paths that ask for the concrete type).
+	if (type == CatalogType::MACRO_ENTRY) {
+		return GetOrCreateMacro(*transaction.context, lookup_info.GetEntryName(), /*want_table=*/false);
+	}
+	if (type == CatalogType::TABLE_MACRO_ENTRY) {
+		return GetOrCreateMacro(*transaction.context, lookup_info.GetEntryName(), /*want_table=*/true);
 	}
 	return nullptr;
 }
@@ -2385,14 +2492,31 @@ void FabricatorSchemaEntry::Scan(ClientContext &context, CatalogType type,
 		// Snapshot the names: GetOrCreateScalarFunction locks entry_lock_ and may evict
 		// a stale entry, which would invalidate an iterator over scalar_functions_.
 		vector<string> names;
+		vector<string> macro_names;
 		{
 			lock_guard<mutex> lock(entry_lock_);
 			for (auto &fn : scalar_functions_) {
 				names.push_back(fn);
 			}
+			// Catalog-bound macros are reported by the SCALAR / TABLE_FUNCTION scans, NOT by MACRO_ENTRY ones:
+			// duckdb_functions() only ever scans SCALAR_FUNCTION_ENTRY / TABLE_FUNCTION_ENTRY /
+			// PRAGMA_FUNCTION_ENTRY and then switches on each entry's ACTUAL type (duckdb_functions.cpp:101-105
+			// and 806-826, which handle MACRO_ENTRY + TABLE_MACRO_ENTRY). Emitting them anywhere else would
+			// resolve by name but never appear in duckdb_functions() / SHOW FUNCTIONS.
+			for (auto &m : macros_) {
+				macro_names.push_back(m.first);
+			}
 		}
 		for (auto &fn : names) {
 			auto catalog_entry = GetOrCreateScalarFunction(context, fn);
+			if (catalog_entry) {
+				callback(*catalog_entry);
+			}
+		}
+		for (auto &m : macro_names) {
+			// want_table=false filters to the SCALAR macros; a table macro yields nullptr here and is reported
+			// by the TABLE_FUNCTION_ENTRY scan instead.
+			auto catalog_entry = GetOrCreateMacro(context, m, /*want_table=*/false);
 			if (catalog_entry) {
 				callback(*catalog_entry);
 			}
@@ -2417,8 +2541,12 @@ void FabricatorSchemaEntry::Scan(ClientContext &context, CatalogType type,
 	}
 	if (type == CatalogType::TABLE_FUNCTION_ENTRY) {
 		vector<string> names;
+		vector<string> macro_names;
 		{
 			lock_guard<mutex> lock(entry_lock_);
+			for (auto &m : macros_) {
+				macro_names.push_back(m.first); // filtered to TABLE macros below — see the scalar scan's note
+			}
 			for (auto &fn : table_functions_) {
 				names.push_back(fn.first);
 			}
@@ -2445,12 +2573,29 @@ void FabricatorSchemaEntry::Scan(ClientContext &context, CatalogType type,
 				callback(*catalog_entry);
 			}
 		}
+		for (auto &m : macro_names) {
+			auto catalog_entry = GetOrCreateMacro(context, m, /*want_table=*/true);
+			if (catalog_entry) {
+				callback(*catalog_entry);
+			}
+		}
 	}
 }
 
 void FabricatorSchemaEntry::Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) {
 	// No context available: only report already-materialized entries.
 	lock_guard<mutex> lock(entry_lock_);
+	// macro_entries_ holds both kinds (the parse decides which), so reporting is filtered by entry type. Note
+	// scalar macros are reported under SCALAR_FUNCTION_ENTRY and table macros under TABLE_FUNCTION_ENTRY, since
+	// those are the only types duckdb_functions() asks for — see the context-taking overload. ONE if-chain, so
+	// no type can be reported twice.
+	auto report_macros = [&](CatalogType macro_type) {
+		for (auto &entry : macro_entries_) {
+			if (entry.second->type == macro_type) {
+				callback(*entry.second);
+			}
+		}
+	};
 	if (type == CatalogType::TABLE_ENTRY) {
 		for (auto &entry : entries_) {
 			callback(*entry.second);
@@ -2459,6 +2604,7 @@ void FabricatorSchemaEntry::Scan(CatalogType type, const std::function<void(Cata
 		for (auto &entry : function_entries_) {
 			callback(*entry.second);
 		}
+		report_macros(CatalogType::MACRO_ENTRY);
 	} else if (type == CatalogType::AGGREGATE_FUNCTION_ENTRY) {
 		for (auto &entry : aggregate_function_entries_) {
 			callback(*entry.second);
@@ -2467,6 +2613,11 @@ void FabricatorSchemaEntry::Scan(CatalogType type, const std::function<void(Cata
 		for (auto &entry : table_function_entries_) {
 			callback(*entry.second);
 		}
+		report_macros(CatalogType::TABLE_MACRO_ENTRY);
+	} else if (type == CatalogType::MACRO_ENTRY) {
+		report_macros(CatalogType::MACRO_ENTRY);
+	} else if (type == CatalogType::TABLE_MACRO_ENTRY) {
+		report_macros(CatalogType::TABLE_MACRO_ENTRY);
 	}
 }
 

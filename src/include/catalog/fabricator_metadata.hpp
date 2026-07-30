@@ -52,6 +52,20 @@ struct FabricatorFunctionInfo {
 //! Discovers user functions/procedures across all schemas (kind per FabricatorFunctionInfo).
 vector<FabricatorFunctionInfo> DiscoverFunctions(FabricatorHandle handle);
 
+//! A provider-declared CATALOG-BOUND DuckDB macro: one complete CREATE MACRO statement to bind into
+//! `schema_name` of the attached catalog. The host parses `create_sql` with DuckDB's OWN parser (so the full
+//! macro grammar works) and OVERWRITES the parsed catalog/schema with this catalog's alias + schema_name — the
+//! opposite of the global registration, which rejects a qualified body outright.
+struct FabricatorMacroInfo {
+	string schema_name;
+	string name;
+	string create_sql;
+};
+
+//! Discovers provider-declared catalog-bound macros (FABRICATOR_META_CATALOG_MACROS). Never throws: a provider
+//! that does not serve the kind simply declares none, so the caller does not need its own guard.
+vector<FabricatorMacroInfo> DiscoverCatalogMacros(FabricatorHandle handle);
+
 //! Resolves a scalar function's parameter names + DuckDB types from the Arrow schema of
 //! its (zero-row) param-schema stream — reuses the C# type mapping, no duplicate logic.
 //! When out_named is given, it also reports per parameter whether it is a NAMED (vs positional) parameter,

@@ -377,6 +377,29 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   parses the full CREATE MACRO grammar; registered into the SYSTEM catalog at load; injection-free by
   construction. [docs/macros-and-sqlgen-functions.md](docs/macros-and-sqlgen-functions.md) §1;
   verify_macros 41 + verify_plugin 10. Full as-built record (moved verbatim from here): [docs/feature-history.md](docs/feature-history.md).
+  - **CATALOG-BOUND (attach-time) macros — DONE (2026-07-30, no ABI bump; new metadata kind 15).** Resolve
+    as `db.schema.m(…)`; the old "§2 covers it" dismissal was **half wrong** and that half is what got
+    built. Works by the pattern we already ship: a macro entry returned from `LookupEntry` is expanded
+    normally, because DuckDB looks up `SCALAR_FUNCTION_ENTRY`/`TABLE_FUNCTION_ENTRY` and then dispatches on
+    the entry's ACTUAL type — the same one-namespace fact that forces our scalar lookup to surface custom
+    aggregates. **A schema gives NAMESPACING, not resolution scope**: expansion captures no search path, so
+    an unqualified table reference in the body resolves in the CALLER's context (silent wrong table, not an
+    error) — so sqlgen (§2) really is the answer for a table macro naming its own catalog, but sqlgen is
+    TABLE-valued only, so it is NO answer for a per-catalog **scalar** helper, and the 4e custom scalar is
+    marshaled where a macro crosses nothing. Gate `verify_macros_catalog` 50 (hermetic); full record in
+    [docs/macros-and-sqlgen-functions.md](docs/macros-and-sqlgen-functions.md) §1.4.
+    **Three traps worth carrying forward:** (1) the body rides its **own metadata kind**, NOT a column on
+    the FUNCTIONS stream — that stream is built as **T-SQL executed on the server**, so a column there would
+    have shipped a local declaration to SQL Server and back and made declaring a macro depend on server
+    reachability (and offered nothing to the SQL-less Delta catalog); reading the producer is what caught
+    it. (2) `GetOrCreateMacro` MUST filter by wanted kind: the binder `Cast<>`s on the entry type without
+    checking, so handing a scalar lookup a table macro is an unchecked bad cast. (3) macros must be emitted
+    by the **SCALAR/TABLE_FUNCTION** `Scan`s, since those are the only types `duckdb_functions()` asks for
+    (it switches on the actual type itself). Also fixed en route: a latent OOB read in `ReadStringTable`
+    (asks for N columns, and a provider answering an unimplemented kind returns its 1-column `_ =>`
+    fallback — a Delta catalog does exactly that for FUNCTIONS, which asks for 3). The check is per BATCH
+    and only when `length > 0`; validating the SCHEMA's width instead **broke every Delta ATTACH**, so that
+    leniency is load-bearing, not merely tolerated.
 - **`hilbert_index` + `bucket` global scalars, declared scalar VOLATILITY, and the FULL LIQUID-CLUSTERING
   stack — ALL DONE, Spark-interop validated live BOTH directions** (writes to clustered tables; SORTED BY
   declares clustering; clustered OPTIMIZE incl. multi-file + partitioned partial recluster + ZCube

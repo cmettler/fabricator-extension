@@ -129,6 +129,17 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 			schema.AddAggregateFunction(func.name, /*spillable=*/true);
 		}
 	}
+	// Provider-declared CATALOG-BOUND macros. Their own metadata kind, NOT a column on the functions stream:
+	// that stream is provider SQL run on the server, and a macro body is a purely local declaration. Same
+	// schema rule as functions (only a schema registered above), so an ATTACH schema_filter gates macros too.
+	// DiscoverCatalogMacros never throws — declaring macros is optional.
+	for (auto &macro : DiscoverCatalogMacros(handle_)) {
+		auto sit = schemas_.find(macro.schema_name);
+		if (sit == schemas_.end()) {
+			continue;
+		}
+		sit->second->AddMacro(macro.name, macro.create_sql);
+	}
 }
 
 void FabricatorCatalog::InvalidateAllEntries() {
@@ -219,6 +230,17 @@ void FabricatorCatalog::RefreshCache(ClientContext &context) {
 			// Spillable variant: state serialized into DuckDB's blob so external GROUP BY can spill to disk.
 			schema.AddAggregateFunction(func.name, /*spillable=*/true);
 		}
+	}
+	// Provider-declared CATALOG-BOUND macros. Their own metadata kind, NOT a column on the functions stream:
+	// that stream is provider SQL run on the server, and a macro body is a purely local declaration. Same
+	// schema rule as functions (only a schema registered above), so an ATTACH schema_filter gates macros too.
+	// DiscoverCatalogMacros never throws — declaring macros is optional.
+	for (auto &macro : DiscoverCatalogMacros(handle_)) {
+		auto sit = schemas_.find(macro.schema_name);
+		if (sit == schemas_.end()) {
+			continue;
+		}
+		sit->second->AddMacro(macro.name, macro.create_sql);
 	}
 }
 

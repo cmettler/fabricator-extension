@@ -106,6 +106,8 @@ public sealed class SqlServerBackend : IBackend
     public IEnumerable<ISqlTableFunction> GlobalSqlTableFunctions => CustomFunctions.GlobalSqlTable;
     public IEnumerable<MacroDefinition> GlobalMacros => CustomFunctions.GlobalMacros;
 
+    public IEnumerable<CatalogMacroDefinition> CatalogMacros => CustomFunctions.CatalogMacros;
+
     public IBackendCatalog OpenCatalog(string connectionString, string optionsJson) =>
         new SqlServerCatalog(connectionString, optionsJson);
 
@@ -1411,6 +1413,12 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         MetadataKind.ServerInfo => ServerInfoStream(),
         // No provider virtual columns (the Delta catalog's stable row-tracking pair has no SQL analog).
         MetadataKind.VirtualColumns => EmptyStringTable("name", "type"),
+        // Provider-declared CATALOG-BOUND macros (schema, name, create_sql) — bound by the host into this
+        // catalog's schemas as db.schema.m(...). Note this deliberately does NOT go through
+        // FunctionsMetadataSql: a macro body is a local declaration, so embedding it in a T-SQL literal to send
+        // to the server and read back would be pure waste, and would make the declaration depend on server
+        // reachability. Gated by schema_filter host-side (a macro whose schema was not registered is dropped).
+        MetadataKind.CatalogMacros => CatalogMacroMetadata.Stream(CustomFunctions.CatalogMacros),
         _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "fabricator: unknown metadata kind"),
     };
 

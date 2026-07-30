@@ -74,6 +74,40 @@ public sealed class DeltaBackend : IBackend
             Description: "Delta write options as JSON (compression, row_group_size, bloom_filter_columns, partition_by, replace_where, merge_schema), applied to CREATE/INSERT/CTAS."),
     };
 
+    // CATALOG-BOUND macros: bound into every discovered schema of an attached catalog, so they resolve as
+    // db.<schema>.fab_*(…). Static because the declaration is a compile-time property of the provider, and
+    // read by DeltaCatalog.GetMetadata(CatalogMacros) — never assembled into SQL, so a Delta catalog (which has
+    // no SQL engine at all) can declare them, and declaring them touches no storage.
+    //
+    // Every body here is deliberately SELF-CONTAINED — pure expressions, or a query over a DuckDB built-in.
+    // That is not decoration: DuckDB captures no search path when it expands a macro, so an unqualified table
+    // reference would resolve against the CALLER's catalog/schema rather than this one. A body that must read
+    // its own catalog's tables belongs in an ISqlTableFunction, which is handed the ATTACH alias.
+    internal static readonly IReadOnlyList<CatalogMacroDefinition> DeclaredCatalogMacros = new[]
+    {
+        // Plain scalar. The case nothing else in the stack serves cheaply: a catalog-scoped SCALAR helper.
+        // sqlgen (ISqlTableFunction) is table-valued only, and a catalog scalar function (ICatalogScalarFunction)
+        // marshals every call across the ABI — this crosses NOTHING at runtime, the binder just expands it.
+        new CatalogMacroDefinition("__all__", "fab_pct",
+            "CREATE MACRO fab_pct(part, whole) AS "
+            + "CASE WHEN whole IS NULL OR whole = 0 THEN NULL ELSE round(100.0 * part / whole, 2) END"),
+        // Named parameter with a DEFAULT — proves the full CREATE MACRO grammar survives the catalog path, not
+        // just the simple form (and per §1.3, a defaulted parameter also accepts a POSITIONAL argument).
+        new CatalogMacroDefinition("__all__", "fab_clamp",
+            "CREATE MACRO fab_clamp(v, lo := 0, hi := 100) AS least(greatest(v, lo), hi)"),
+        // TABLE macro (AS TABLE …) — a different DuckDB catalog type (TABLE_MACRO_ENTRY) reached through the
+        // TABLE_FUNCTION_ENTRY lookup, so it exercises the other half of the host's dispatch.
+        new CatalogMacroDefinition("__all__", "fab_numbers",
+            "CREATE MACRO fab_numbers(n) AS TABLE SELECT i AS n FROM range(n) t(i)"),
+    };
+
+    /// <summary>
+    /// The provider's catalog macros. The declarations use the sentinel schema <c>__all__</c>, which
+    /// <see cref="DeltaCatalog"/> expands to every schema it discovered — a Delta root's schema names are not
+    /// known until ATTACH (they are folder names), so a static declaration cannot name them.
+    /// </summary>
+    public IEnumerable<CatalogMacroDefinition> CatalogMacros => DeclaredCatalogMacros;
+
     // The connstr IS the folder root. Data-file IO is via DuckDB FS secrets (the opener). An azure SP secret on
     // a OneLake ATTACH additionally authenticates the Fabric REST API used to list tables (the glob bug
     // workaround) — carry its fields to the catalog as a credential marker on the root (mirrors the DAX provider).
@@ -615,6 +649,10 @@ public sealed class DeltaCatalog : IBackendCatalog
         MetadataKind.ServerInfo => TwoColumn(
             "property", new[] { "exact_filter_pushdown" },
             "value", new[] { _pushdownMode == PushdownMode.Exact ? "true" : "false" }),
+        // Provider-declared CATALOG-BOUND macros (schema, name, create_sql), bound by the host into this
+        // catalog's schemas as db.schema.m(...). Local declarations — nothing here touches storage, which is
+        // exactly why they ride their own metadata kind instead of a SQL discovery stream.
+        MetadataKind.CatalogMacros => CatalogMacroMetadata.Stream(ExpandCatalogMacroSchemas()),
         // No row-count/NDV stats surfaced, no functions.
         _ => EmptyStringTable("name"),
     };
@@ -992,6 +1030,37 @@ public sealed class DeltaCatalog : IBackendCatalog
             return new List<string>(schemas);
         }
         return new[] { MainSchema };
+    }
+
+    /// <summary>
+    /// Resolves the provider's catalog-macro declarations against THIS catalog's discovered schemas, expanding
+    /// the <c>__all__</c> sentinel to one declaration per schema.
+    /// </summary>
+    /// <remarks>
+    /// A Delta root's schema names are folder names, not known until ATTACH, so a static declaration cannot
+    /// name them — hence the sentinel. A declaration naming a real schema is passed through untouched (and the
+    /// host drops any whose schema it did not register, which is what makes an ATTACH <c>schema_filter</c> gate
+    /// macros too).
+    /// </remarks>
+    private IReadOnlyList<CatalogMacroDefinition> ExpandCatalogMacroSchemas()
+    {
+        var declared = DeltaBackend.DeclaredCatalogMacros;
+        var outList = new List<CatalogMacroDefinition>();
+        IReadOnlyList<string>? schemas = null;
+        foreach (var m in declared)
+        {
+            if (!string.Equals(m.SchemaName, "__all__", System.StringComparison.Ordinal))
+            {
+                outList.Add(m);
+                continue;
+            }
+            schemas ??= SchemaNames();
+            foreach (var s in schemas)
+            {
+                outList.Add(m with { SchemaName = s });
+            }
+        }
+        return outList;
     }
 
     /// <summary>Discovers (schema, table) pairs. OneLake → the DFS-resolved list. Non-OneLake → globs the Delta

@@ -70,8 +70,13 @@ case "$TIER" in
         # 5471 since 2026-07-30: verify_delta_row_level_concurrency gained 12 (§10 pins that a row-level
         # DELETE under `serializable` still lands across a concurrent COMPACTION — it ABORTED before the
         # engineered-wood bump, and nothing covered it on either side).
-        : "${MIN_SUITES:=60}"
-        : "${MIN_ASSERTIONS:=5471}"
+        # 61 runs / 5521 since 2026-07-30: verify_macros_catalog (50) pins CATALOG-BOUND provider macros —
+        # resolution of both kinds through db.schema.m(...), that the BARE name does NOT resolve (the one
+        # assertion separating catalog-bound from the load-time global form), and KIND FILTERING in both
+        # directions (the binder Cast<>s on the entry type without checking, so the wrong kind is an unchecked
+        # bad cast rather than a clean error).
+        : "${MIN_SUITES:=61}"
+        : "${MIN_ASSERTIONS:=5521}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

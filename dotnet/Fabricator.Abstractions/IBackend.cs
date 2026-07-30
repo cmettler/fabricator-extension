@@ -87,6 +87,18 @@ public interface IBackend
     IEnumerable<MacroDefinition> GlobalMacros => System.Array.Empty<MacroDefinition>();
 
     /// <summary>
+    /// DuckDB MACROs the provider binds into each ATTACHed catalog's schemas — resolved as
+    /// <c>db.schema.m(...)</c> instead of a bare global name, so two attached catalogs may expose
+    /// differently-shaped helpers under the SAME short name. Same DDL-text mechanism as
+    /// <see cref="GlobalMacros"/> (DuckDB's own parser owns the grammar), but carried over its own metadata
+    /// kind rather than the provider's SQL discovery stream, so it costs no server round-trip. Empty by
+    /// default. Remember a schema buys NAMESPACING, not resolution scope — see
+    /// <see cref="CatalogMacroDefinition"/> for why a body referencing its own catalog wants
+    /// <see cref="ISqlTableFunction"/> instead.
+    /// </summary>
+    IEnumerable<CatalogMacroDefinition> CatalogMacros => System.Array.Empty<CatalogMacroDefinition>();
+
+    /// <summary>
     /// Builds a provider connection string from a secret's fields (the host reads the DuckDB secret and
     /// passes its key/values here). Keeps all provider connection-string / auth formatting in the backend —
     /// the C++ side has no knowledge of the provider's connstr dialect. The result is passed to

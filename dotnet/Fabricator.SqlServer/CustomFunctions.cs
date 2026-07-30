@@ -123,6 +123,25 @@ internal static class CustomFunctions
             + "SELECT * FROM fabricator_delta_scan(path) LIMIT n"),
     };
 
+    // CATALOG-BOUND macros: bound into the attached catalog's schemas, so they resolve as db.dbo.cm_*(…) rather
+    // than under a bare global name. The value is NAMESPACING — two attached servers can expose differently
+    // shaped helpers under the same short name — and it is the one shape nothing else here serves cheaply: a
+    // catalog SCALAR helper. ICatalogSqlTableFunction is table-valued only, and ICatalogScalarFunction marshals
+    // every call over the ABI; a macro is expanded by the binder and crosses nothing at runtime.
+    //
+    // Bodies are SELF-CONTAINED on purpose. DuckDB captures no search path when expanding a macro, so an
+    // unqualified table reference here would resolve against the CALLER's catalog/schema, not this one — a
+    // silently-wrong-table hazard. A body that must read this catalog's tables belongs in an
+    // ICatalogSqlTableFunction, which is handed the ATTACH alias (the only way to qualify such a reference,
+    // since the alias is chosen at ATTACH time).
+    public static readonly IReadOnlyList<CatalogMacroDefinition> CatalogMacros = new CatalogMacroDefinition[]
+    {
+        // Scalar, in the discovered `dbo` schema: db.dbo.cm_pct(part, whole).
+        new CatalogMacroDefinition("dbo", "cm_pct",
+            "CREATE MACRO cm_pct(part, whole) AS "
+            + "CASE WHEN whole IS NULL OR whole = 0 THEN NULL ELSE round(100.0 * part / whole, 2) END"),
+    };
+
     public static readonly IReadOnlyList<ICatalogScalarFunction> Scalar = new ICatalogScalarFunction[]
     {
         new CfAddFunction(),

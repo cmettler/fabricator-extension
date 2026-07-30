@@ -129,6 +129,17 @@ typedef enum {
 	                                    // arg1 = 'schema.table' ref, arg2 = JSON object of property->value
 	                                    // (null value = UNSET). fabricator_delta_set_tblproperties(...).
 	                                    // Additive, no ABI bump.
+	FABRICATOR_META_CATALOG_MACROS = 15, // provider-declared CATALOG-BOUND DuckDB macros: three string columns
+	                                    // (schema, name, create_sql) where create_sql is one complete CREATE
+	                                    // MACRO statement, parsed by DuckDB's OWN parser host-side. Bound into
+	                                    // the ATTACHed catalog's schema, so they resolve as db.schema.m(...).
+	                                    // Deliberately its own KIND rather than a column on _FUNCTIONS: that
+	                                    // stream is built as provider SQL and executed on the server (see
+	                                    // SqlServerCatalog.FunctionsMetadataSql), and a macro body is a purely
+	                                    // LOCAL declaration — it must not be embedded in a T-SQL literal, sent
+	                                    // to the server and read back, nor vanish when the server is
+	                                    // unreachable. Adding a kind is additive => no ABI bump. Fetch is
+	                                    // best-effort: a provider that does not serve it registers no macros.
 } FabricatorMetadataKind;
 
 // -----------------------------------------------------------------------------
