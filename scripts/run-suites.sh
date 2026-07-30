@@ -67,8 +67,11 @@ case "$TIER" in
         # compatibility — native_read/native_write are INDEPENDENT options, so besides the two symmetric
         # profiles the provider names select there are two MIXED ones a user can ask for. Written by one
         # engine, read back by the other, over the same table path.
+        # 5471 since 2026-07-30: verify_delta_row_level_concurrency gained 12 (§10 pins that a row-level
+        # DELETE under `serializable` still lands across a concurrent COMPACTION — it ABORTED before the
+        # engineered-wood bump, and nothing covered it on either side).
         : "${MIN_SUITES:=60}"
-        : "${MIN_ASSERTIONS:=5459}"
+        : "${MIN_ASSERTIONS:=5471}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

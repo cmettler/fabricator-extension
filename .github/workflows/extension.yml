@@ -1,8 +1,8 @@
 # Tier 1: build the extension and run every suite that needs no external service.
 #
-# This is where the coverage is — 56 suites in 60 RUNS / 5459 assertions (measured 2026-07-30), the
+# This is where the coverage is — 56 suites in 60 RUNS / 5471 assertions (measured 2026-07-30), the
 # Delta catalog work: transactions (943), row tracking (299), column mapping (251), variant (157),
-# native write (147), clustered optimize (147), row-level concurrency (70)... None of it needs SQL
+# native write (147), clustered optimize (147), row-level concurrency (82)... None of it needs SQL
 # Server, MinIO, Power BI Desktop or live Fabric credentials, only a writable directory and the
 # fixtures committed to this repo.
 #

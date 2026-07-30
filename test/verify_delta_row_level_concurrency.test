@@ -264,3 +264,62 @@ SELECT count(*) FROM rl.main.q;
 
 statement ok
 DETACH rl;
+
+# ---- 10. SERIALIZABLE + a concurrent COMPACTION: the row-level delete must still LAND. A compaction's
+#      removes and adds are dataChange=false — contents unchanged, already read-exempt at BOTH levels — so
+#      relocating rows across it by stable row id admits no interleaving `serializable` forbids. This
+#      ABORTED before the 2026-07-30 engineered-wood bump: our own patch gated row-level reconciliation on
+#      one bool (`isolationLevel != Serializable`), which took the remap-across-rewrite down together with
+#      the deletion-vector union it was meant to disable. Upstream's KeepOnlyDataPreservingResolutions
+#      narrows the RESOLUTION instead (dropping only paths a concurrent commit removed with
+#      dataChange=true), which keeps the compaction case. Nothing covered this, on either side. ----
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/rowlevel_ser' AS rs
+  (TYPE fabricator, PROVIDER 'delta', isolation_level 'serializable');
+
+# THREE files, so the compaction has real work: a single small file is a no-op and would make this pass
+# vacuously (the way the first probe of this scenario did).
+statement ok
+CREATE TABLE rs.main.t AS SELECT r AS id FROM range(1, 5) t(r);
+
+statement ok
+INSERT INTO rs.main.t SELECT r FROM range(5, 9) t(r);
+
+statement ok
+INSERT INTO rs.main.t SELECT r FROM range(9, 13) t(r);
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+DELETE FROM rs.main.t WHERE id = 1;
+
+# The racer compacts the table under the open transaction (dataChange=false removes + adds).
+statement ok con2
+SELECT fabricator_exec('rs', 'OPTIMIZE main.t');
+
+# The compaction really committed — asserted, because a no-op OPTIMIZE would leave nothing to rebase
+# across and the COMMIT below would then prove nothing.
+query T con2
+SELECT operation FROM fabricator_delta_snapshots('rs', 't') WHERE version = 4;
+----
+OPTIMIZE
+
+# The row-level delete rebases onto the compacted file and lands. Pre-bump this raised
+# "Concurrent commit 4 already removed '<uuid>.parquet', which this transaction also removes."
+statement ok con1
+COMMIT;
+
+query I con1
+SELECT count(*) FROM rs.main.t;
+----
+11
+
+# ...and id=1 specifically is the row that went.
+query I con1
+SELECT count(*) FROM rs.main.t WHERE id = 1;
+----
+0
+
+statement ok
+DETACH rs;
