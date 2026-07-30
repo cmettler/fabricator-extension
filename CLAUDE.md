@@ -401,6 +401,15 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     commit immediately (identity creates, DROP/OPTIMIZE/VACUUM, CREATE-OR-REPLACE, partition-overwrite),
     since those advance the version under a held snapshot and a later read in the same transaction must see
     its own committed write.
+  - **⚠ THERE IS NO INTRA-CALL SHORTCUT — do not try to "just pass the open table along" (checked 2026-07-30).**
+    It looks as though the 2 opens per `ScanTable` call could be collapsed to 1 without any cross-call
+    lifetime, by handing the schema step's table to the stream step. They cannot: `StreamAtImpl` (and its
+    siblings) are **async iterators**, so the table is opened at the first `MoveNextAsync` and disposed in the
+    iterator's `finally` — which means the schema open has already COMPLETED AND DISPOSED before the stream
+    open begins, and the stream's open happens in a LATER ABI call (`get_next`) than the schema's. So the two
+    opens are sequential and in different calls; a cache whose lifetime spans the statement is the ONLY way to
+    share them, and the lease has to tell each `Stream*` whether it OWNS the table (dispose in the `finally`)
+    or borrowed it (do not) — the iterator's unconditional `DisposeAsync` is the thing to change.
 - **SINGLE-FILE DISTRIBUTION — BUILT + validated live (phases 1–4 of 5; REMAINING: user-facing install
   docs + CI matrix — CI tier 3 exists).** ONE `fabricator.duckdb_extension` self-installs (extract +
   chain-load + CLR boot; ~2–3 s cold, 0.01–0.2 s warm; win 61 MB standalone / linux 40 MB standard —
