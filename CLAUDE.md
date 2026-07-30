@@ -308,108 +308,29 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     runner they fail with *Copy Function with name "parquet" is not in the catalog*. `require parquet`
     added to all 18 — same class as the tier-2 `verify_mssql_s3_polybase` finding, and again only the
     empty-`USERPROFILE`/`HOME` trick shows it.
-- **Lazy-opener filesystem (perf, OPEN — measured 2026-07-29):** `DuckDbTableFileSystem` captures the
-  per-call opener, so a `DeltaTable` cannot be held open across ABI calls — every table REFERENCE costs
-  **4 snapshot constructions per statement** (2 ScanTable calls × 2 opens; self-join 8, dead linear;
-  `_delta_log` LISTs are not served by ExternalFileCache, so OneLake/S3 pay most). Fix = resolve
-  `AmbientOpener.Current` lazily per call (the rollback path gets no opener at all). Not a correctness
-  item — the autocommit pin gap this measurement exposed was FIXED the same day (252c1e6,
-  `verify_delta_autocommit_pin` 34; semantics in [docs/delta-transactions.md](docs/delta-transactions.md)
-  §3; full measurement in [docs/ew-master-migration.md](docs/ew-master-migration.md) §Appendix).
-  - **THE `+1` IS GONE (2026-07-29, C#-only).** The measurement's "native_read costs one MORE snapshot
-    construction than the codec" was the autocommit native path resolving its pin through
-    `ResolveVersionAsOf` — a WHOLE extra `DeltaTable` open (own `_delta_log` LIST) plus a
-    timestamp→version scan of the commit timestamps. `ScanNative` now consults an existing pin FIRST and
-    otherwise defers to the schema/listing open it was already doing (`GetSchemaAndVersion`, one open,
-    replacing the `GetSchema` it would have called) — the same zero-IO trick as `ScanCodec`. Explicit
-    transactions KEEP the instant-based resolve (all tables must pin to ONE instant, and a table first
-    touched late still has to resolve that same instant). Proof it is gone is by ABSENCE: the retired
-    helper logs unconditionally in BOTH its success and catch branches, so no `delta snapshot pin … as-of`
-    line ⇒ not called. New `delta native pin` line mirrors the codec's; `verify_delta_autocommit_pin` §11
-    pins the count at 1 for a self-join (mutation: 4 without the `TryGetPinned` check).
-  - **⚠ IF YOU MEASURE THIS AGAIN, mind which engine you are on.** The same `PROVIDER 'delta'` text
-    selected the CODEC before the defaults flip and selects NATIVE after it, so a comparison spanning that
-    change silently swaps the labels. That is how "the codec did more snapshot reads" was recalled; the
-    recorded table and a re-measurement both say the opposite.
-  - **`SnapshotPinning.Release` is now WIRED (2026-07-29) — it existed and was NEVER called.** The only
-    reclamation was `InstantFor`'s panic `Txns.Clear()` at 4096 entries, and since one autocommit statement
-    is one transaction id that threshold arrives routinely — wiping the pins of transactions still IN
-    FLIGHT, after which an explicit transaction re-captures a NEW instant on its next scan and starts
-    seeing a concurrent writer's commits mid-transaction (silent snapshot-isolation violation, not
-    reproducible on demand). `DeltaCatalog.CommitTransaction`/`RollbackTransaction` now Release
-    UNCONDITIONALLY, before their `tables is null` early return — a READ-ONLY transaction is exactly the
-    one that pins and had no other exit. No ABI/C++ change: both are `TransactionManager` overrides that
-    already call into C# for every transaction, reads included.
-  - **The remaining piece — actually HOLDING a `DeltaTable` open — is unblocked but NOT built.** Its two
-    prerequisites were checked: (1) **read-your-writes is unaffected**, because it is a `DeltaTxnBuffer`
-    OVERLAY property (pending files concatenated / pending deletes excluded / pending ALTER schema
-    advertised), not a snapshot property — a table pinned at the BASE version is exactly what the overlay
-    composes against; (2) **disposal had no hook at all** until the Release wiring above, and the 4096
-    `Clear()` would have dropped cached tables UNDISPOSED. Still to do: lazy `AmbientOpener.Current` in
-    `DuckDbTableFileSystem` (value-identical today — `Opener()` already just returns the ambient — so it
-    only becomes load-bearing once a table outlives its call), invalidation on the operations that
-    deliberately BYPASS the buffer (identity creates, DROP/OPTIMIZE/VACUUM, CREATE-OR-REPLACE,
-    partition-overwrite — they advance the version under a held snapshot), and `await DisposeAsync()` at
-    the release point.
-  - **WHERE TO PUT THE CACHE — evaluated 2026-07-29, use `ClientContextState`, NOT `function_info`.**
-    The storage mechanism itself is already solved and used everywhere: `Handles.Alloc` (a **Normal**
-    `GCHandle` → opaque `nint`; NOT `Pinned` — a reference type needs no pinning and it would block heap
-    compaction) + `Handles.Resolve<T>`, with a C++ RAII holder whose destructor calls an ABI release
-    (`InOutSessionHolder`→`inout_abort`, `AggSessionHolder`→`agg_close`, the catalog handle→`close_catalog`).
-    - **`TableFunction::function_info` is the WRONG shelf for a snapshot** (considered, rejected): it is a
-      `shared_ptr<TableFunctionInfo>` copied with the function into `LogicalGet.function`, and our catalog
-      scan builds its TableFunction FRESH per bind — so the lifetime is the PLAN, and plans are cached and
-      re-executed (`SupportStatementCache()` true). A cached snapshot there would be reused by a later
-      execution IN A DIFFERENT TRANSACTION. Wrong in both directions at once: spans transactions, yet a new
-      bind gets a new one so two statements never share. It IS correct for what we already use it for —
-      the aggregates' identity + atomic counter, which are version-independent.
-    - **`context.registered_state->GetOrCreate<T>(key)` is the right one.** `ClientContextState` is
-      DuckDB's first-class extension-state home and carries the lifecycle hooks this needs:
-      `TransactionBegin` / `TransactionCommit` / `TransactionRollback(…, error)` / `QueryEnd(context,
-      error)`. Per-CONNECTION storage with a destructor. Marginal gain over the
-      `FabricatorTransactionManager::CommitTransaction/RollbackTransaction` hook already used for
-      `SnapshotPinning.Release`: cleanup even when a transaction never ends cleanly, plus `TransactionBegin`,
-      which we have no other equivalent of.
-    - **The real blocker is the OPENER, and no handle plumbing fixes it.** `DuckDbTableFileSystem` captures
-      `nint _opener` = a `ClientContext*` valid only for THAT ABI call, so a cached `DeltaTable` used later
-      dereferences a dangling pointer — a use-after-free, not a staleness bug, and this box would probably
-      not fault on it (same lesson as the macOS `ArrowProducer` release). Lifetime/disposal is resource
-      hygiene; the opener is memory safety. Do the lazy `AmbientOpener` resolution FIRST.
-      **DONE (2026-07-30, `142b350`)**: the FS reads `AmbientOpener.Current` and keeps the constructor value
-      as a FALLBACK (the ambient is an `AsyncLocal` and reads 0 where the execution context did not flow;
-      there the captured pointer is still right because nothing outlives its call yet). Behaviour-preserving
-      — all 46 construction sites pass `Opener()`, which just returns the ambient. Also verified
-      `DuckDbRandomAccessFile` uses its opener ONLY in the ctor and stores just the host file handle, so the
-      FS was the ONLY lingering capture.
-  - **THREAD SAFETY OF A SHARED `DeltaTable` — CHECKED 2026-07-30, the cache IS viable.** Today every scan
-    opens its own table, so caching one per (txn, table) would share it across DuckDB's parallel scans. EW's
-    `DeltaTable` has mutable state (`_currentSnapshot`, `_disposed`) and **zero** locks/`Interlocked`. But all
-    **11** assignments to `_currentSnapshot` are in WRITE/commit paths or the explicit `RefreshAsync`
-    (ctor, `RefreshAsync`, `CommitMetadataOnlyAsync`, `SetClusteringColumnsAsync`, `Set`/`RemoveDomainMetadataAsync`,
-    `CommitOccAsync`, `CommitWriteAsync`, `CommitDataFilesAsync` ×2, `CompactAsync`) — **none in a read path**.
-    The helpers reads go through (`TransactionLog`, `DeletionVectorReader`, `CheckpointReader`) are STATELESS
-    (a readonly `_fs` only; a grep for "mutable private fields" hits method declarations — false positives,
-    don't be fooled). ⇒ concurrent READS of one shared table are safe; the cache must simply never be used
-    for a write/refresh, which the buffered design already satisfies (writes go through `DeltaTxnBuffer`
-    actions and the flush wants a fresh table anyway).
-  - **Remaining design points for whoever builds it:** (a) simplest storage is the EXISTING `SnapshotPinning`
-    per-txn structure keyed (txn, path) — `Release(txnId)` is already wired to commit/rollback, so it becomes
-    the disposal point for free (sync-over-async at one blocking point, per the convention); (b) the key must
-    carry the VERSION or be pinned-version-scoped, because a `DeltaTable` holds ONE `_currentSnapshot` while
-    `GetSchemaAt(v)`/`StreamAt(v)` need v's — inside a transaction the pin makes every read use one version,
-    which is what makes (txn, path) sufficient; (c) invalidate on the operations that BYPASS the buffer and
-    commit immediately (identity creates, DROP/OPTIMIZE/VACUUM, CREATE-OR-REPLACE, partition-overwrite),
-    since those advance the version under a held snapshot and a later read in the same transaction must see
-    its own committed write.
-  - **⚠ THERE IS NO INTRA-CALL SHORTCUT — do not try to "just pass the open table along" (checked 2026-07-30).**
-    It looks as though the 2 opens per `ScanTable` call could be collapsed to 1 without any cross-call
-    lifetime, by handing the schema step's table to the stream step. They cannot: `StreamAtImpl` (and its
-    siblings) are **async iterators**, so the table is opened at the first `MoveNextAsync` and disposed in the
-    iterator's `finally` — which means the schema open has already COMPLETED AND DISPOSED before the stream
-    open begins, and the stream's open happens in a LATER ABI call (`get_next`) than the schema's. So the two
-    opens are sequential and in different calls; a cache whose lifetime spans the statement is the ONLY way to
-    share them, and the lease has to tell each `Stream*` whether it OWNS the table (dispose in the `finally`)
-    or borrowed it (do not) — the iterator's unconditional `DisposeAsync` is the thing to change.
+- **DELTA SNAPSHOT CACHING (perf) — PREREQUISITES DONE, the cache itself NOT BUILT and the full version
+  NOT RECOMMENDED. Full design + every finding: [docs/delta-snapshot-caching.md](docs/delta-snapshot-caching.md).**
+  Every table REFERENCE costs **4 snapshot constructions per statement**, dead linear in references
+  (self-join 8, three references 12), each a `_delta_log` LIST that `ExternalFileCache` does not serve — so
+  OneLake/S3 pay most. Shipped so far: `SnapshotPinning.Release` wired to commit/rollback (it was DEAD CODE,
+  and the 4096-entry panic `Clear()` it left as the only reclamation was silently breaking snapshot isolation
+  for in-flight transactions), and the host-FS opener now resolved PER CALL (`142b350`) — a cached table
+  holding a stale `ClientContext*` is a use-after-free, not staleness, and would not fault on this box.
+  - **The headline number is a COUNT, not a profile** — nobody has measured what the redundant opens cost in
+    wall-clock. The Fabric notebook's 305 s → 15 s came from two OTHER fixes, dominated by `HostFsGlob`'s
+    open-per-matched-file (258 s → 2 s). Do not call this "the biggest remaining perf item" again without
+    profiling it; that inference is what the doc's decision gate exists to stop.
+  - **If anything is built, cache DATA and not the resource.** `DeltaNativeReader` has ZERO references to
+    `DeltaTable`: under `native_read` — which the shipped `PROVIDER 'delta'` now selects — a scan needs only
+    the schema and the `NativeScanList`, both immutable plain data. That removes disposal, the dangling
+    opener and thread safety as concerns, leaving only staleness, which the version key already handles. The
+    live-`DeltaTable` cache is needed ONLY by the codec path (no longer the default) and its read-safety
+    rests on an EW invariant upstream never promised and no test enforces.
+  - **⚠ Two traps recorded in the doc:** there is NO intra-call shortcut (the `Stream*` methods are async
+    ITERATORS, so the schema open completes and disposes BEFORE the stream open begins, in a different ABI
+    call), and `TableFunction::function_info` is the WRONG shelf for cached state (its lifetime is the PLAN,
+    and plans are re-executed across transactions) — use `ClientContextState`/`registered_state`, or the
+    existing per-txn `SnapshotPinning` structure whose `Release` is already the disposal point.
 - **SINGLE-FILE DISTRIBUTION — BUILT + validated live (phases 1–4 of 5; REMAINING: user-facing install
   docs + CI matrix — CI tier 3 exists).** ONE `fabricator.duckdb_extension` self-installs (extract +
   chain-load + CLR boot; ~2–3 s cold, 0.01–0.2 s warm; win 61 MB standalone / linux 40 MB standard —
