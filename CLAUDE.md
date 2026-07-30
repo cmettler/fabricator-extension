@@ -324,6 +324,18 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     `cond ? Policy.X : null` infers `string` and calls `op_Implicit(null)` → `ArgumentNullException` at
     run time. Annotate `(Policy?)null`. Finding it needed a stack trace the ABI does not carry, hence the
     `Wrap`/`Guarded` helpers that append `StackTrace` for UNEXPECTED exceptions only.
+  - **NAMED PARAMETERS for custom TABLE functions — BUILT (2026-07-31), and it retired the `_ex` siblings.**
+    The `fabricator.named` field-metadata tag (already used by sqlgen) now drives plain table-function
+    registration on BOTH the catalog and global paths, so an optional argument is `recreate := true` and
+    `fabric_refresh_sql_endpoint` / `_list_shortcuts` / `_run_notebook` / `_items` are ONE function each again
+    instead of a plain+`_ex` pair. Authoring: `ITableFunction.NamedParameters` (default empty ⇒ nothing else
+    changes). **The binding still reads BY POSITION** — positions are `Parameters` ++ `NamedParameters` in
+    declared order and the host marshals EVERY declared parameter, substituting a typed NULL for an omitted
+    named one; that equivalence ("omitted" == "explicit NULL") is why collapsing `_ex` changed no binding
+    code. **Scalars are excluded and unfixable**: DuckDB `ScalarFunction` has no named-parameter concept, so
+    `fabric_create_shortcut_ex(…, conflict_policy)` remains a genuine sibling. Gate
+    `verify_delta_catalog_functions` §6 (27) — both spellings, the value really crossing the ABI, a
+    misspelled name as a clean binder error, and no positional callability.
   - Output shape rule (D4): typed flat columns + one raw-JSON column for polymorphic parts; **no STRUCT
     wrapping** (adding a column is additive for `SELECT *`; adding a struct FIELD changes a column's type
     and breaks bound views), no JSON-only. Every `table`-kind function also gets a dead `_each` sibling —

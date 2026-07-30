@@ -8,7 +8,7 @@ namespace Fabricator.Bridge;
 
 /// <summary>
 /// Read-only Fabric introspection: workspaces, items, lakehouses, warehouses, connections, and notebook
-/// inspection. All zero- or one-argument table functions, all pure reads.
+/// inspection. All pure reads; optional arguments are DuckDB NAMED parameters.
 /// </summary>
 /// <remarks>
 /// <para>These exist because the WRITE functions need identifiers a user otherwise has to hunt for in the
@@ -24,8 +24,7 @@ internal static class FabricInspectFunctions
     internal static void Register(List<ICatalogTableFunction> tables, FabricApiClient api)
     {
         tables.Add(new FabricWorkspacesFunction(api));
-        tables.Add(new FabricItemsFunction(api, extended: false));
-        tables.Add(new FabricItemsFunction(api, extended: true));
+        tables.Add(new FabricItemsFunction(api));
         tables.Add(new FabricLakehousesFunction(api));
         tables.Add(new FabricWarehousesFunction(api));
         tables.Add(new FabricConnectionsFunction(api));
@@ -48,6 +47,8 @@ internal abstract class FabricRowsFunction : ICatalogTableFunction
     public abstract string Name { get; }
 
     public virtual Schema Parameters { get; } = new Schema(System.Array.Empty<Field>(), null);
+
+    public virtual Schema NamedParameters { get; } = new Schema(System.Array.Empty<Field>(), null);
 
     protected abstract Schema Columns { get; }
 
@@ -122,22 +123,18 @@ internal sealed class FabricWorkspacesFunction : FabricRowsFunction
     }
 }
 
-/// <summary><c>fabric_items()</c> / <c>fabric_items_ex(item_type)</c> — items in this catalog's workspace.</summary>
+/// <summary><c>fabric_items([item_type := …])</c> — items in this catalog's workspace.</summary>
 internal sealed class FabricItemsFunction : FabricRowsFunction
 {
-    private readonly bool _extended;
-
-    internal FabricItemsFunction(FabricApiClient api, bool extended) : base(api)
+    internal FabricItemsFunction(FabricApiClient api) : base(api)
     {
-        _extended = extended;
-        Parameters = extended
-            ? new Schema(new[] { FabricApiFunctions.Str("item_type") }, null)
-            : new Schema(System.Array.Empty<Field>(), null);
     }
 
-    public override string Name => _extended ? "fabric_items_ex" : "fabric_items";
+    public override string Name => "fabric_items";
 
-    public override Schema Parameters { get; }
+    /// <summary><c>fabric_items(item_type := 'Notebook')</c> — unset lists every item type.</summary>
+    public override Schema NamedParameters { get; } =
+        new Schema(new[] { FabricApiFunctions.Str("item_type") }, null);
 
     protected override Schema Columns { get; } = new(new[]
     {
@@ -331,7 +328,7 @@ internal sealed class FabricNotebookParametersFunction : FabricRowsFunction
         if (string.IsNullOrWhiteSpace(arg))
         {
             throw new NotSupportedException(
-                "fabric_notebook_parameters: pass the notebook name or id (list them with fabric_items_ex('Notebook')).");
+                "fabric_notebook_parameters: pass the notebook name or id (list them with fabric_items(item_type := 'Notebook')).");
         }
         var ws = Api.WorkspaceId;
         var nb = Api.ResolveItem(arg, "Notebook");

@@ -87,8 +87,12 @@ case "$TIER" in
         # interface (export AND import throw on 'fields'), so the host passes no args stream for an
         # argument-less function and the bridge exports the empty schema itself. A regression in either half
         # makes such a function silently VANISH rather than error, which is why it is asserted here.
+        # 5564 since 2026-07-31: verify_delta_catalog_functions gained 6 (21 -> 27) for NAMED parameters on a
+        # custom table function — both `:=` and `=>` spellings, that the argument really crosses the ABI (an
+        # unknown value yields NO rows rather than all of them), that a misspelled name is a clean BINDER error
+        # rather than silently ignored, and that a named parameter is NOT positionally callable.
         : "${MIN_SUITES:=62}"
-        : "${MIN_ASSERTIONS:=5558}"
+        : "${MIN_ASSERTIONS:=5564}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

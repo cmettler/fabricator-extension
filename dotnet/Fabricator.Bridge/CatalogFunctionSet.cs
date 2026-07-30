@@ -90,7 +90,9 @@ public sealed class CatalogFunctionSet
     public Schema? ParamSchema(string schema, string func)
     {
         if (TryScalar(schema, func, out var s)) { return s.Parameters; }
-        if (TryTable(schema, func, out var t)) { return t.Parameters; }
+        // Positional ++ named, with the named ones TAGGED so the host registers them as DuckDB named
+        // parameters. Same channel and helper sqlgen functions use — there is only one tagging convention.
+        if (TryTable(schema, func, out var t)) { return SqlGen.ParamSchema(t.Parameters, t.NamedParameters); }
         return null;
     }
 

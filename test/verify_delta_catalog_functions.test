@@ -112,7 +112,49 @@ SELECT lake.main.fab_pct(25, 200);
 ----
 12.5
 
-# ---- 6. a cache refresh re-discovers the function (re-runs the same declaration path) ----
+# ---- 6. NAMED parameters — how an OPTIONAL argument is expressed ----
+#
+# DuckDB positional table arguments have no defaults, so without named parameters a function with N optional
+# knobs forces every caller to write fn(NULL, NULL, …) — which is exactly why the Fabric functions used to
+# ship an `_ex` sibling each. A parameter tagged `fabricator.named` in the parameter schema becomes a DuckDB
+# named parameter instead; the host splits on that tag and the binding still reads args BY POSITION
+# (Parameters ++ NamedParameters in declared order), with an omitted argument arriving as NULL.
+#
+# The zero-argument call above (§2) already proves the omitted case, since `property` is named-and-absent
+# there. These pin the supplied case, both spellings, and the rejection.
+
+query II
+SELECT * FROM lake.main.fab_delta_info(property => 'native_read');
+----
+native_read	true
+
+# `:=` and `=>` are both DuckDB named-argument spellings; a provider function must accept either.
+query I
+SELECT value FROM lake.main.fab_delta_info(property := 'onelake');
+----
+false
+
+# Filtering happened in the FUNCTION, not above it: an unknown property yields no rows rather than all of them
+# (i.e. the argument really crossed the ABI).
+query I
+SELECT count(*) FROM lake.main.fab_delta_info(property := 'no_such_property');
+----
+0
+
+# A misspelled named parameter must be a clean BINDER error listing candidates — not silently ignored, which
+# would run the unfiltered query and look like it worked.
+statement error
+SELECT * FROM lake.main.fab_delta_info(nope := 'x');
+----
+<REGEX>:.*Invalid named parameter.*nope.*
+
+# The named parameter must NOT be callable positionally: it is not in the positional signature at all.
+statement error
+SELECT * FROM lake.main.fab_delta_info('root');
+----
+<REGEX>:.*
+
+# ---- 7. a cache refresh re-discovers the function (re-runs the same declaration path) ----
 
 statement ok
 SELECT fabricator_refresh_cache('lake');

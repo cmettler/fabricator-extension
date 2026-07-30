@@ -2413,7 +2413,8 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         }
         if (CustomTable.TryGetValue(key, out var customTable))
         {
-            return customTable.Parameters;
+            // Positional ++ NAMED (tagged), so an optional argument can be written `fn(x, flag := true)`.
+            return SqlGen.ParamSchema(customTable.Parameters, customTable.NamedParameters);
         }
         if (CustomAgg.TryGetValue(key, out var customAgg))
         {

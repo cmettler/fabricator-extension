@@ -94,7 +94,9 @@ public static class GlobalFunctions
     public static Schema ParamSchema(string name)
     {
         if (ScalarMap.Value.TryGetValue(name, out var s)) { return s.Parameters; }
-        if (TableMap.Value.TryGetValue(name, out var t)) { return t.Parameters; }
+        // A table function may declare NAMED parameters too (optional args); they ride the same one-schema,
+        // tagged convention as sqlgen below, and the host splits on the tag.
+        if (TableMap.Value.TryGetValue(name, out var t)) { return SqlGen.ParamSchema(t.Parameters, t.NamedParameters); }
         // A SQL-generating table function declares BOTH positional and named parameters; they cross as one
         // schema with the named ones tagged (SqlGen.NamedParamKey) so the host can split them.
         if (SqlTableMap.Value.TryGetValue(name, out var sq))

@@ -31,7 +31,17 @@ internal sealed class DeltaCatalogInfoFunction : ICatalogTableFunction
 
     public Schema Parameters { get; } = new Schema(System.Array.Empty<Field>(), null);
 
-    public IArrowTableFunctionBinding Bind(RecordBatch args) => new Binding(_facts);
+    /// <summary>
+    /// <c>fab_delta_info(property := 'root')</c> — return just that property. Optional, hence a DuckDB NAMED
+    /// parameter: a positional one would force every caller to write <c>fab_delta_info(NULL)</c>.
+    /// </summary>
+    public Schema NamedParameters { get; } =
+        new Schema(new[] { new Field("property", StringType.Default, nullable: true) }, null);
+
+    // Position 0 is the first NamedParameters field (Parameters is empty here); an omitted named argument
+    // arrives as NULL.
+    public IArrowTableFunctionBinding Bind(RecordBatch args) =>
+        new Binding(_facts, FabricArgs.Str(args, 0));
 
     private sealed class Binding : FabricTableBinding
     {
@@ -42,8 +52,13 @@ internal sealed class DeltaCatalogInfoFunction : ICatalogTableFunction
         }, null);
 
         private readonly IReadOnlyList<KeyValuePair<string, string>> _facts;
+        private readonly string? _property;
 
-        internal Binding(IReadOnlyList<KeyValuePair<string, string>> facts) => _facts = facts;
+        internal Binding(IReadOnlyList<KeyValuePair<string, string>> facts, string? property)
+        {
+            _facts = facts;
+            _property = property;
+        }
 
         public override Schema OutputSchema => Columns;
 
@@ -51,12 +66,19 @@ internal sealed class DeltaCatalogInfoFunction : ICatalogTableFunction
         {
             var props = new StringArray.Builder();
             var values = new StringArray.Builder();
+            int n = 0;
             foreach (var kv in _facts)
             {
+                if (_property is not null
+                    && !string.Equals(kv.Key, _property, System.StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
                 props.Append(kv.Key);
                 values.Append(kv.Value);
+                n++;
             }
-            return One(Columns, new IArrowArray[] { props.Build(), values.Build() }, _facts.Count);
+            return One(Columns, new IArrowArray[] { props.Build(), values.Build() }, n);
         }
     }
 }

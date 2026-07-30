@@ -2,6 +2,7 @@
 //                         fabricator — schema catalog entry (impl)
 //===----------------------------------------------------------------------===//
 
+#include <algorithm>
 #include "catalog/fabricator_schema_entry.hpp"
 
 #include "fabricator/arrow_ingest.hpp"
@@ -1039,6 +1040,11 @@ struct FabricatorTableFunctionInfo : public TableFunctionInfo {
 	string func;
 	vector<LogicalType> arg_types;
 	vector<string> arg_names;
+	// Which declared parameters are DuckDB NAMED parameters (`fn(x, flag := true)`), parallel to arg_names.
+	// Empty (or all-false) => every parameter is positional, which is what a discovered TVF and every
+	// pre-named-parameter provider function look like. A provider tags them via `fabricator.named` in the
+	// parameter schema's field metadata — the same channel sqlgen functions already use.
+	vector<bool> arg_is_named;
 	bool is_proc = false;    // stored procedure (EXEC, no pushdown) vs TVF (FROM, pushdown)
 	// SQL-generating (`table_sql`, v68) functions only: the DuckDB ATTACH ALIAS of the catalog this entry
 	// belongs to (empty for a global function). Passed to generate_table_sql so a catalog-bound generator can
@@ -1099,6 +1105,41 @@ unique_ptr<FunctionData> FabricatorTableFunctionBind(ClientContext &context, Tab
 			arg_names.push_back(kv.first);
 			arg_types.push_back(declared);
 			arg_values.push_back(kv.second);
+		}
+	} else if (std::find(info.arg_is_named.begin(), info.arg_is_named.end(), true) != info.arg_is_named.end()) {
+		// MIXED positional + named (a provider-authored function with optional arguments). Marshal EVERY
+		// declared parameter in DECLARED ORDER, substituting a typed NULL for a named one the caller
+		// omitted. That keeps the managed side reading args BY POSITION exactly as it does for a purely
+		// positional function — an omitted optional argument and an explicit NULL are deliberately the same
+		// thing, which is the semantic a provider already has to implement for a nullable trailing argument.
+		idx_t positional_index = 0;
+		for (idx_t i = 0; i < info.arg_names.size(); i++) {
+			bool named = i < info.arg_is_named.size() && info.arg_is_named[i];
+			LogicalType declared = info.arg_types[i];
+			if (!named) {
+				Value v = positional_index < input.inputs.size() ? input.inputs[positional_index]
+				                                                 : Value(declared);
+				positional_index++;
+				// A SQLNULL-declared (ANY) parameter keeps the supplied value's RUNTIME type, as in the
+				// proc branch — coercing it would defeat the point of declaring ANY.
+				arg_types.push_back(declared.id() == LogicalTypeId::SQLNULL ? v.type() : declared);
+				arg_names.push_back(info.arg_names[i]);
+				arg_values.push_back(v);
+				continue;
+			}
+			auto supplied = input.named_parameters.find(info.arg_names[i]);
+			if (supplied != input.named_parameters.end()) {
+				arg_types.push_back(declared.id() == LogicalTypeId::SQLNULL ? supplied->second.type() : declared);
+				arg_names.push_back(info.arg_names[i]);
+				arg_values.push_back(supplied->second);
+			} else {
+				// Unsupplied. An ANY-declared parameter has no runtime type to borrow here, so carry the
+				// NULL as VARCHAR — the managed side only ever sees "absent" either way.
+				auto null_type = declared.id() == LogicalTypeId::SQLNULL ? LogicalType::VARCHAR : declared;
+				arg_types.push_back(null_type);
+				arg_names.push_back(info.arg_names[i]);
+				arg_values.push_back(Value(null_type));
+			}
 		}
 	} else {
 		arg_types = info.arg_types;
@@ -2087,21 +2128,38 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				// non-proc branch (projection + best-effort filter pushdown; the binding decides honoring).
 				vector<string> arg_names;
 				vector<LogicalType> arg_types;
+				vector<bool> arg_is_named;
 				try {
-					FetchFunctionParamSchema(context, nullptr, "", fn_name, arg_names, arg_types);
+					FetchFunctionParamSchema(context, nullptr, "", fn_name, arg_names, arg_types, &arg_is_named);
 				} catch (std::exception &) {
 					continue;
 				}
-				TableFunction tf(fn_name, arg_types, fabricator::ArrowStreamScan, FabricatorTableFunctionBind,
+				// Positional args only in the signature; a parameter tagged `fabricator.named` becomes a
+				// DuckDB named parameter instead, which is how a global function expresses an OPTIONAL
+				// argument (positional table arguments have no defaults). Same split as the catalog path.
+				vector<LogicalType> positional;
+				for (idx_t k = 0; k < arg_types.size(); k++) {
+					if (k >= arg_is_named.size() || !arg_is_named[k]) {
+						positional.push_back(arg_types[k]);
+					}
+				}
+				TableFunction tf(fn_name, positional, fabricator::ArrowStreamScan, FabricatorTableFunctionBind,
 				                 fabricator::ArrowStreamInitGlobal, fabricator::ArrowStreamInitLocal);
 				tf.projection_pushdown = true;
 				tf.pushdown_complex_filter = FabricatorComplexFilterPushdown;
+				for (idx_t k = 0; k < arg_names.size(); k++) {
+					if (k < arg_is_named.size() && arg_is_named[k]) {
+						auto t = arg_types[k].id() == LogicalTypeId::SQLNULL ? LogicalType::ANY : arg_types[k];
+						tf.named_parameters[arg_names[k]] = t;
+					}
+				}
 				auto fn_info = make_shared_ptr<FabricatorTableFunctionInfo>();
 				fn_info->handle = nullptr; // global marker
 				fn_info->schema = "";
 				fn_info->func = fn_name;
 				fn_info->arg_types = arg_types;
 				fn_info->arg_names = arg_names;
+				fn_info->arg_is_named = arg_is_named;
 				fn_info->is_proc = false;
 				// A byte-ordered-string reader (e.g. Delta/Parquet) can safely push string ordering + BETWEEN.
 				fn_info->string_order_pushable = string_order[i] == "1";
@@ -2214,8 +2272,9 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(Clien
 
 	vector<string> arg_names;
 	vector<LogicalType> arg_types;
+	vector<bool> arg_is_named;
 	try {
-		FetchFunctionParamSchema(context, handle_, name, func_name, arg_names, arg_types);
+		FetchFunctionParamSchema(context, handle_, name, func_name, arg_names, arg_types, &arg_is_named);
 	} catch (std::exception &) {
 		// Stale discovery (dropped out-of-band) — treat as not-found.
 		table_functions_.erase(func_name);
@@ -2226,7 +2285,18 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(Clien
 	// TVFs take positional arguments (called positionally in a FROM clause); stored procs
 	// take DuckDB named parameters (EXEC @name=val), so the caller supplies a subset and
 	// omitted optional params fall back to the proc's own DEFAULT.
-	vector<LogicalType> positional = is_proc ? vector<LogicalType>() : arg_types;
+	//
+	// A provider-authored function may ALSO declare named parameters (tagged `fabricator.named`) alongside
+	// its positional ones — that is how an OPTIONAL argument is expressed, since DuckDB positional table
+	// arguments have no defaults. A discovered TVF tags nothing, so it stays fully positional.
+	vector<LogicalType> positional;
+	if (!is_proc) {
+		for (idx_t i = 0; i < arg_types.size(); i++) {
+			if (i >= arg_is_named.size() || !arg_is_named[i]) {
+				positional.push_back(arg_types[i]);
+			}
+		}
+	}
 	TableFunction tf(func_name, positional, fabricator::ArrowStreamScan, FabricatorTableFunctionBind,
 	                 fabricator::ArrowStreamInitGlobal, fabricator::ArrowStreamInitLocal);
 	tf.projection_pushdown = true;
@@ -2239,6 +2309,14 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(Clien
 			tf.named_parameters[arg_names[i]] = t;
 		}
 	} else {
+		// A provider-declared NAMED parameter on a non-proc function: register it so `fn(x, flag := true)`
+		// binds. Same SQLNULL=>ANY marker rule as the proc branch above.
+		for (idx_t i = 0; i < arg_names.size(); i++) {
+			if (i < arg_is_named.size() && arg_is_named[i]) {
+				auto t = arg_types[i].id() == LogicalTypeId::SQLNULL ? LogicalType::ANY : arg_types[i];
+				tf.named_parameters[arg_names[i]] = t;
+			}
+		}
 		// Best-effort filter pushdown into the TVF (reuses the table scan's serializer; the
 		// predicates are left in the plan so DuckDB re-applies them — an over-approximation
 		// is safe). `SELECT <cols> FROM tvf(@args) WHERE <filter>` is emitted by C#. Procs
@@ -2251,6 +2329,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(Clien
 	fn_info->func = func_name;
 	fn_info->arg_types = arg_types;
 	fn_info->arg_names = arg_names;
+	fn_info->arg_is_named = arg_is_named;
 	fn_info->is_proc = is_proc;
 	tf.function_info = std::move(fn_info);
 

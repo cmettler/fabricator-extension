@@ -8,14 +8,13 @@ using Apache.Arrow.Types;
 namespace Fabricator.Bridge;
 
 /// <summary>
-/// <c>db.&lt;schema&gt;.fabric_run_notebook(notebook [, params_json])</c> and
-/// <c>_ex(notebook, params_json, config_json, wait_seconds)</c> — runs a Fabric notebook with parameters and,
-/// by default, BLOCKS until it finishes, returning one row of final state.
+/// <c>db.&lt;schema&gt;.fabric_run_notebook(notebook [, params_json := …] [, config_json := …]
+/// [, wait_seconds := …])</c> — runs a Fabric notebook with parameters and, by default, BLOCKS until it
+/// finishes, returning one row of final state.
 /// </summary>
 /// <remarks>
-/// <para>Blocking is the default because a dbt hook must not return before the work is done. <c>_ex</c>'s
-/// <c>wait_seconds := 0</c> submits and returns immediately (status <c>NotStarted</c>/<c>InProgress</c>) for
-/// callers that poll with <c>fabric_job_status</c> themselves.</para>
+/// <para>Blocking is the default because a dbt hook must not return before the work is done;
+/// <c>wait_seconds := 0</c> submits and returns immediately (status <c>NotStarted</c>/<c>InProgress</c>).</para>
 ///
 /// <para><b>Parameters ride <c>executionData.parameters</c>, which is the shape LIVE-VERIFIED to work</b> — the
 /// generic top-level <c>parameters</c> array is accepted with 202 and then SILENTLY IGNORED for notebooks
@@ -30,31 +29,27 @@ namespace Fabricator.Bridge;
 internal sealed class FabricRunNotebookFunction : ICatalogTableFunction
 {
     private readonly FabricApiClient _api;
-    private readonly bool _extended;
 
-    internal FabricRunNotebookFunction(FabricApiClient api, bool extended)
-    {
-        _api = api;
-        _extended = extended;
-        var fields = new List<Field>
-        {
-            FabricApiFunctions.Str("notebook"),
-            FabricApiFunctions.Str("params_json"),
-        };
-        if (extended)
-        {
-            fields.Add(FabricApiFunctions.Str("config_json"));
-            fields.Add(new Field("wait_seconds", Int64Type.Default, nullable: true));
-        }
-        Parameters = new Schema(fields, null);
-    }
+    internal FabricRunNotebookFunction(FabricApiClient api) => _api = api;
 
     public string SchemaName => CatalogFunctionSet.AllSchemas;
-    public string Name => _extended ? "fabric_run_notebook_ex" : "fabric_run_notebook";
+    public string Name => "fabric_run_notebook";
 
-    public Schema Parameters { get; }
+    /// <summary>The notebook is the only required argument.</summary>
+    public Schema Parameters { get; } = new Schema(new[] { FabricApiFunctions.Str("notebook") }, null);
 
-    public IArrowTableFunctionBinding Bind(RecordBatch args) => new Binding(_api, args, _extended);
+    /// <summary>
+    /// Everything else is optional:
+    /// <c>fabric_run_notebook('nb', params_json := '{…}', wait_seconds := 0)</c>.
+    /// </summary>
+    public Schema NamedParameters { get; } = new Schema(new[]
+    {
+        FabricApiFunctions.Str("params_json"),
+        FabricApiFunctions.Str("config_json"),
+        new Field("wait_seconds", Int64Type.Default, nullable: true),
+    }, null);
+
+    public IArrowTableFunctionBinding Bind(RecordBatch args) => new Binding(_api, args);
 
     private sealed class Binding : FabricTableBinding
     {
@@ -77,15 +72,17 @@ internal sealed class FabricRunNotebookFunction : ICatalogTableFunction
         private readonly string? _configJson;
         private readonly long _waitSeconds;
 
-        internal Binding(FabricApiClient api, RecordBatch args, bool extended)
+        internal Binding(FabricApiClient api, RecordBatch args)
         {
+            // Positions are Parameters ++ NamedParameters in declared order; an omitted named argument
+            // arrives as NULL, which is why every read below is null-tolerant.
             _api = api;
             _notebook = FabricArgs.Str(args, 0);
             _paramsJson = FabricArgs.Str(args, 1);
-            _configJson = extended ? FabricArgs.Str(args, 2) : null;
+            _configJson = FabricArgs.Str(args, 2);
             // Default cap: a cold Spark session alone can take minutes, so a short default would time out
             // on the very flows this exists for. 0 = fire and return.
-            _waitSeconds = extended ? FabricArgs.Int(args, 3) ?? 3600 : 3600;
+            _waitSeconds = FabricArgs.Int(args, 3) ?? 3600;
         }
 
         public override Schema OutputSchema => Columns;
@@ -98,7 +95,7 @@ internal sealed class FabricRunNotebookFunction : ICatalogTableFunction
             if (string.IsNullOrWhiteSpace(_notebook))
             {
                 throw new NotSupportedException(
-                    "fabric_run_notebook: pass the notebook name or id (list them with fabric_items_ex('Notebook')).");
+                    "fabric_run_notebook: pass the notebook name or id (list them with fabric_items(item_type := 'Notebook')).");
             }
             var ws = _api.WorkspaceId;
             var nb = _api.ResolveItem(_notebook, "Notebook");

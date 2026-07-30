@@ -88,7 +88,9 @@ with zero arguments.
   `SchemaNames()` exactly like `ExpandCatalogMacroSchemas` does for catalog macros (a declared schema
   must be discovered or C++ drops the function). **No C++ or ABI change** — the catalog machinery is
   provider-agnostic. Leave `InOutBind`/`AggOpen`/`GenerateTableSql` throwing.
-- **Gap 2 — custom scalar/table functions are positional-only.** Named parameters with defaults exist
+- **Gap 2 — custom scalar/table functions are positional-only. CLOSED for TABLE functions (2026-07-31);
+  see §7 slice 6. Still true for scalars, and unfixable there — DuckDB scalar functions have no named
+  parameters.** The original finding: Named parameters with defaults exist
   for sqlgen (`ISqlTableFunction.NamedParameters`, the `fabricator.named` tag), in-out/collector, and
   discovered procs — but the plain table/scalar registration ignores the tags
   (`src/catalog/fabricator_schema_entry.cpp` builds `TableFunction(positional)` for both catalog and
@@ -194,7 +196,7 @@ everything deliberately SKIPPED and why — is **§10**, so the curation cannot 
 | **P0 ✅** | `fabric_drop_shortcut` | scalar → BOOLEAN | `DELETE …/shortcuts/{path}/{name}` | idempotent via `if_exists`; bare call 404s (verified) | |
 | **P0 ✅** | `fabric_list_shortcuts` | table | `GET …/items/{id}/shortcuts` (paged) | flattened + `target_json` (the D4 showcase); optional parent-path filter via `_ex` |
 | **P0 ✅** | `fabric_run_notebook`/`_ex` | table, blocking | `POST …/items/{id}/jobs/RunNotebook/instances` + instance polling | **user-elevated (2026-07-30)**: parameterized notebook runs from dbt hooks, returning final status **+ `exit_value`** (`mssparkutils.notebook.exit`) for conditional orchestration. SP execution already proven live on this tenant by `scratchpad/fabricnb`. See §5 |
-| P1↑ (partly ✅) | `fabric_items_ex('Notebook')` / `fabric_notebook_definition` / **`fabric_notebook_parameters` BUILT** | table | `GET …/items?type=Notebook`; `POST …/notebooks/{id}/getDefinition` (LRO) | **notebook inspection, user-elevated above the rest of P1**: list; raw definition parts (ipynb/fabricGitSource, base64); and a convenience that parses the `parameters`-tagged cell into (name, default) rows — heuristic by nature (regex over `name = literal` lines), flagged as such |
+| P1↑ (partly ✅) | `fabric_items(item_type := 'Notebook')` / `fabric_notebook_definition` / **`fabric_notebook_parameters` BUILT** | table | `GET …/items?type=Notebook`; `POST …/notebooks/{id}/getDefinition` (LRO) | **notebook inspection, user-elevated above the rest of P1**: list; raw definition parts (ipynb/fabricGitSource, base64); and a convenience that parses the `parameters`-tagged cell into (name, default) rows — heuristic by nature (regex over `name = literal` lines), flagged as such |
 | P1 | `fabric_run_job` | table, blocking by default | `POST …/items/{id}/jobs/{jobType}/instances` + instance polling | the generic engine `fabric_run_notebook` is built on (any jobType, e.g. `Pipeline`); `execution_data_json` passthrough; `wait_seconds` 0 = fire-and-return |
 | P1 | `fabric_job_status` / `fabric_job_instances` / `fabric_cancel_job` | table / table / scalar | `GET` instance / `GET` list / `POST cancel` | status enum: NotStarted/InProgress/Completed/Failed/Cancelled/Deduped; `fabric_job_instances(item)` is run-history inspection |
 | P1 | `fabric_table_maintenance` | table, blocking | `POST …/lakehouses/{id}/jobs/tableMaintenance/instances` (preview) | **V-Order** optimize + zOrderBy + vacuum + purge DVs — the recluster our own OPTIMIZE cannot do (V-Order is proprietary); complementary, not competing |
@@ -344,10 +346,23 @@ Slices land independently, tests green per slice. Estimated shape, not a schedul
    (`fabric_run_job`/`fabric_job_status`/`fabric_job_instances`/`fabric_cancel_job` — thin exposure
    of the slice-3 engine), `fabric_table_maintenance`, `fabric_reset_shortcut_cache`.
 5. **P2.** Introspection set (workspaces/items/lakehouses incl. endpoint connstr, operation status).
-6. **Named-parameter slice (UX, independent).** Extend the `fabricator.named` machinery to custom
-   table/scalar functions (C++ registration + args marshaling; templates: the proc named-arg path and
-   the sqlgen tag split). Dissolves the `_ex` siblings into `recreate := true`-style calls. Benefits
-   every custom function, not just these.
+6. **Named-parameter slice — DONE (2026-07-31).** The `fabricator.named` tag now drives plain TABLE
+   function registration too (catalog AND global paths in `fabricator_schema_entry.cpp`), so an optional
+   argument is written `recreate := true` and the `_ex` siblings are RETIRED —
+   `fabric_refresh_sql_endpoint`, `fabric_list_shortcuts`, `fabric_run_notebook` and `fabric_items` are one
+   function each again. Authoring surface: `ITableFunction.NamedParameters` (default empty, so nothing
+   else changes).
+   - **The binding still reads arguments BY POSITION**, and the positions are `Parameters` ++
+     `NamedParameters` in declared order; the host marshals EVERY declared parameter, substituting a typed
+     NULL for an omitted named one. That is what makes the conversion free: an omitted optional argument
+     and an explicit NULL were already the same thing to a nullable trailing argument, so no binding code
+     changed when the `_ex` split collapsed.
+   - **SCALAR functions are NOT included, and cannot be**: DuckDB `ScalarFunction` has no named-parameter
+     concept at all. So the shortcut scalars keep positional signatures, and
+     `fabric_create_shortcut_ex(…, conflict_policy)` stays a real sibling rather than a workaround.
+   - Gate: `verify_delta_catalog_functions` §6 (both `:=` and `=>` spellings; that the value really crosses
+     the ABI rather than being filtered above the scan; that a misspelled name is a clean binder error with
+     candidates rather than silently ignored; that a named parameter is not positionally callable).
 
 ## 8. Deferred / out of scope (recorded so they aren't re-litigated)
 
@@ -571,7 +586,7 @@ not reflect it. This is also what `ResetShortcutCache` exists for — which this
 
 Exercised against workspace `Test` (2026-07-30): `fabric_workspaces()` → 1 (this SP sees only `Test`),
 `fabric_lakehouses()` → `LH` / `LH2` / `LH_no_schema` with endpoint status `Success` and a connection string
-each, `fabric_warehouses()` → 1, `fabric_items_ex('Notebook')` → 3, `fabric_notebook_parameters` → 0 rows
+each, `fabric_warehouses()` → 1, `fabric_items(item_type := 'Notebook')` → 3, `fabric_notebook_parameters` → 0 rows
 (no tagged cell — the legitimate answer). `default_schema` came back **NULL for `LH_no_schema`** and `dbo`
 for the other two, which matches what those lakehouses actually are, so the function is reading real state
 rather than echoing defaults.

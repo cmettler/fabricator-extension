@@ -24,6 +24,21 @@ public interface ITableFunction
     Schema Parameters { get; }
 
     /// <summary>
+    /// Optional arguments, callable as <c>fn(positional…, flag := true)</c>. Empty by default.
+    /// </summary>
+    /// <remarks>
+    /// <para>A NAMED parameter is how an OPTIONAL argument is expressed: DuckDB positional table arguments
+    /// have no defaults, so without this a function with three optional knobs forces every caller to write
+    /// <c>fn(NULL, NULL, NULL)</c>.</para>
+    /// <para><b>The binding still reads arguments BY POSITION</b>, and the positions are
+    /// <see cref="Parameters"/> followed by these, in declared order. An argument the caller omitted arrives
+    /// as NULL — deliberately indistinguishable from an explicit NULL, since that is the semantic a nullable
+    /// trailing argument already had. So adding a named parameter to an existing function does not disturb
+    /// how it reads the ones before it.</para>
+    /// </remarks>
+    Schema NamedParameters => new Schema(System.Array.Empty<Field>(), null);
+
+    /// <summary>
     /// Whether this function's source orders strings the same way DuckDB does (byte/binary) — so string
     /// ordering comparisons (<c>&lt;</c> <c>&gt;</c> …) and <c>BETWEEN</c> are superset-safe to push into it.
     /// Default <c>false</c> (conservative: a function whose filter is rendered to a collation-dependent engine

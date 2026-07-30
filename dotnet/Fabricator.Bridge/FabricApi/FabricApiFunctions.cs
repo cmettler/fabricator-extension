@@ -20,15 +20,12 @@ internal static class FabricApiFunctions
         // are throttled per principal.
         var api = new FabricApiClient(context);
 
-        // Each table function is registered TWICE: the zero-argument form (everything inferred from the ATTACH —
-        // the ergonomic point of the catalog-bound design) and an `_ex` sibling carrying the options. That split
-        // exists because custom table functions are POSITIONAL-only with no defaults (docs §2 Gap 2): a single
-        // signature with optional args would force `fabric_refresh_sql_endpoint(NULL, NULL)` on every caller.
-        // When the named-parameter slice lands, `_ex` collapses into `recreate := true` and can be retired.
-        tables.Add(new FabricRefreshSqlEndpointFunction(api, extended: false));
-        tables.Add(new FabricRefreshSqlEndpointFunction(api, extended: true));
-        tables.Add(new FabricListShortcutsFunction(api, extended: false));
-        tables.Add(new FabricListShortcutsFunction(api, extended: true));
+        // ONE registration per table function: its options are DuckDB NAMED parameters, so
+        // `fabric_refresh_sql_endpoint()` and `fabric_refresh_sql_endpoint(recreate := true)` are the same
+        // function. (This replaced an `_ex` sibling per function, which existed only because positional table
+        // arguments have no defaults — see the named-parameter support in fabricator_schema_entry.cpp.)
+        tables.Add(new FabricRefreshSqlEndpointFunction(api));
+        tables.Add(new FabricListShortcutsFunction(api));
         scalars.Add(new FabricCreateShortcutFunction(api, "fabric_create_shortcut", ShortcutMode.Create));
         scalars.Add(new FabricCreateShortcutFunction(api, "fabric_alter_shortcut", ShortcutMode.Alter));
         // `_ex` adds the conflict policy. Without it a OneLake-target caller could not reach
@@ -41,8 +38,7 @@ internal static class FabricApiFunctions
         scalars.Add(new FabricDropShortcutFunction(api));
         // Parameterized notebook runs: parameters ride executionData.parameters, the shape live-verified to
         // be honoured (the generic top-level array is accepted and silently ignored — docs §9d).
-        tables.Add(new FabricRunNotebookFunction(api, extended: false));
-        tables.Add(new FabricRunNotebookFunction(api, extended: true));
+        tables.Add(new FabricRunNotebookFunction(api));
         // Read-only introspection: the identifiers the write functions above need (a connection GUID for an
         // external shortcut target, an endpoint connection string for a T-SQL ATTACH, a workspace/item name).
         FabricInspectFunctions.Register(tables, api);
@@ -151,26 +147,20 @@ internal sealed class FabricRefreshSqlEndpointFunction : ICatalogTableFunction
 {
     private readonly FabricApiClient _api;
 
-    internal FabricRefreshSqlEndpointFunction(FabricApiClient api, bool extended)
-    {
-        _api = api;
-        Name = extended ? "fabric_refresh_sql_endpoint_ex" : "fabric_refresh_sql_endpoint";
-        // Zero-field for the plain form: the whole point is `lake.dbo.fabric_refresh_sql_endpoint()` with no
-        // arguments at all. That only works because an empty parameter schema never crosses as an Arrow batch —
-        // see ArrowSchemaExport and the host's argument-less TableBind branch.
-        Parameters = extended
-            ? new Schema(new[]
-            {
-                new Field("recreate", BooleanType.Default, nullable: true),
-                new Field("timeout_seconds", Int64Type.Default, nullable: true),
-            }, null)
-            : new Schema(System.Array.Empty<Field>(), null);
-    }
+    internal FabricRefreshSqlEndpointFunction(FabricApiClient api) => _api = api;
 
     public string SchemaName => CatalogFunctionSet.AllSchemas;
-    public string Name { get; }
+    public string Name => "fabric_refresh_sql_endpoint";
 
-    public Schema Parameters { get; }
+    /// <summary>No positional arguments — everything comes from the ATTACH.</summary>
+    public Schema Parameters { get; } = new Schema(System.Array.Empty<Field>(), null);
+
+    /// <summary>Both knobs are optional: <c>fabric_refresh_sql_endpoint(recreate := true)</c>.</summary>
+    public Schema NamedParameters { get; } = new Schema(new[]
+    {
+        new Field("recreate", BooleanType.Default, nullable: true),
+        new Field("timeout_seconds", Int64Type.Default, nullable: true),
+    }, null);
 
     public IArrowTableFunctionBinding Bind(RecordBatch args) => new Binding(_api, args);
 
@@ -459,19 +449,15 @@ internal sealed class FabricListShortcutsFunction : ICatalogTableFunction
 {
     private readonly FabricApiClient _api;
 
-    internal FabricListShortcutsFunction(FabricApiClient api, bool extended)
-    {
-        _api = api;
-        Name = extended ? "fabric_list_shortcuts_ex" : "fabric_list_shortcuts";
-        Parameters = extended
-            ? new Schema(new[] { FabricApiFunctions.Str("parent_path") }, null)
-            : new Schema(System.Array.Empty<Field>(), null);
-    }
+    internal FabricListShortcutsFunction(FabricApiClient api) => _api = api;
 
     public string SchemaName => CatalogFunctionSet.AllSchemas;
-    public string Name { get; }
+    public string Name => "fabric_list_shortcuts";
 
-    public Schema Parameters { get; }
+    public Schema Parameters { get; } = new Schema(System.Array.Empty<Field>(), null);
+
+    /// <summary><c>fabric_list_shortcuts(parent_path := 'Files')</c> — unset lists all.</summary>
+    public Schema NamedParameters { get; } = new Schema(new[] { FabricApiFunctions.Str("parent_path") }, null);
 
     public IArrowTableFunctionBinding Bind(RecordBatch args) => new Binding(_api, FabricArgs.Str(args, 0, 0));
 
