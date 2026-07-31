@@ -299,9 +299,44 @@ function reported carried the *whole* write: `CREATE TABLE`, `BULK INSERT` (862 
 working: **one tag per transaction attributes everything the model did, including the bulk load no query hint can
 reach.**
 
-Remaining unknown, and it is now small: `--threads N` uses several connections, so the pre-hook must run per
-model (which it naturally does) — worth confirming once in the dbt harness that a real dbt pre-hook lands in the
-model's transaction rather than its own.
+### 2.4c ⚠ RUN THROUGH dbt — the pre-hook DOES share the transaction, but the tag is NOT reliable at `--threads > 1`
+
+Measured in `dbt_mssql_test` (box target, dbt 1.11.11 / dbt-duckdb 1.10.1). The model body reads
+`SESSION_CONTEXT()` back out of the provider, so the model itself reports whether its own pre-hook reached it.
+
+**Single model, single hook statement: it works.** `hook_shares_model_transaction = true` — the tag the pre-hook
+set was visible to the model's body. So the mechanism is right and §2.4b's premise holds.
+
+**At `--threads 4` over four models it is not dependable.** Three consecutive runs of the same four models:
+
+| run | models | had a tag | tag matched THIS run | distinct connections |
+|---|---|---|---|---|
+| 1 | 4 | 4 | **4** | 3 |
+| 2 | 4 | 4 | **0** | 4 |
+| 3 | 4 | 4 | **0** | 4 |
+
+Every model saw *a* tag; in two of three runs **none of them was its own run's**. A two-hook variant also lost a
+per-model tag outright (`model_tag` NULL for one model) while only three connections served four models.
+
+**This is worse than no tag**: a stale value silently attributes a run's cost to a *previous* run rather than
+failing. So per-model — and even per-run — attribution via session context **must not be recommended for dbt**
+until it is understood.
+
+**The mechanism is NOT established, and I am not going to guess it as fact.** Two suspects, both checkable:
+pooled connections retaining context within one dbt process (though a control showed `sp_reset_connection` DOES
+clear it for plain pooled reads — three fresh reads returned `<none>`), and DuckDB transaction ids being reused
+within a run so `_txns` state is picked up by a later model. The second would be a genuine defect in our
+per-transaction connection keying and is worth a targeted look.
+
+**What to use instead, and it is immune by construction: `application_name`.** It is a connection-STRING
+property, so every connection a run opens carries it and it cannot go stale or be inherited from an earlier run
+— exactly the failure above. The cost is that it is fixed per secret/attach, so it gives **run**-level
+attribution, not per-model. Combined with `OPTION (LABEL)` for statement grain (§2.1), that is the combination
+this analysis actually ends up recommending for dbt.
+
+`fabricator_session_tag` remains correct **as specified and gated** — one transaction, one connection, verified
+by `verify_session_tag` — and is useful for scripted single-connection work. It is the dbt-at-concurrency case
+that it does not safely serve.
 
 ### 2.5 What Fabric tags on its own — MEASURED, unexpected
 

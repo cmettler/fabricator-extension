@@ -95,7 +95,7 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | | **Table-in-out**: `db.schema.fn_each(<input table>)` — apply a TVF (CROSS APPLY) or proc per input row | ✅ |
 | | — configurable isolation (consistent snapshot per call); per-row procs run in DuckDB's transaction | ✅ |
 | | **Custom C# aggregates** (UDAF) → `db.schema.agg(x)` in `GROUP BY` / parallel / `OVER(…)`; opt-in disk-spill (`SupportsSpill`) | ✅ |
-| **Monitoring** | `db.dbo.fabricator_session_tag(k, v)` — tag a transaction's connection so Fabric query insights can attribute its cost | ✅ |
+| **Monitoring** | `db.dbo.fabricator_session_tag(k, v)` — tag a transaction's connection so Fabric query insights can attribute its cost | ✅ (see dbt caveat) |
 | | `application_name` on the secret → `program_name` on every statement (run-level attribution) | ✅ |
 | | Load-time *global* functions (connection-free); proc multi-result-set / `INOUT` params | ❌ deferred |
 | **Warehouse** | Auto-detected server profile (edition / version / collation) + `fabricator_server_info()` | ✅ Fabric Warehouse validated |
@@ -608,8 +608,12 @@ FROM fabricator_query('db',
   joins an existing pinned connection or takes a throwaway one, and nothing is pinned yet when a pre-hook runs.
 - Key ≤ 128 bytes, value ≤ 8000 (the `sp_set_session_context` limits). Values are passed as parameters; the tag
   is also written into the statement text as a comment so it stays findable in the query history.
-- To attribute a whole **run** rather than a transaction, set `application_name` on the secret instead — it
-  surfaces as `program_name` on every statement, with no SQL changes. Details and the CU story:
+- ⚠ **Not reliable as a dbt pre-hook at `--threads > 1`.** Measured: the tag a model's own hook set was
+  frequently *not* what its body saw — a stale value from an earlier run, which silently mis-attributes cost.
+  It is dependable single-threaded, and within one explicit transaction generally.
+- To attribute a whole **run**, set `application_name` on the secret instead. It is a connection-string property,
+  so every connection the run opens carries it and it cannot go stale — and it needs no SQL changes. Combine it
+  with `OPTION (LABEL = '…')` for per-statement grain. Details and the CU story:
   [`docs/consumption-monitoring.md`](docs/consumption-monitoring.md).
 
 ### `fabricator_version() -> VARCHAR`
