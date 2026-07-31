@@ -1716,6 +1716,7 @@ path never adopted. Keep the status honest; a wrong status is worse than none.
 | [abi-history.md](docs/abi-history.md) | **current** — per-version ABI records v16–v67. Read before touching an existing entry |
 | [aot-bridge.md](docs/aot-bridge.md) | **design only, nothing built** (2026-07-25) |
 | [cancellation.md](docs/cancellation.md) | **current** — the three cancellation tiers (ABI v65/v66) |
+| [consumption-monitoring.md](docs/consumption-monitoring.md) | **analysis only, nothing built** (2026-07-31) — CU/consumption attribution for a dbt run. Query tagging is CONFIRMED live (`OPTION (LABEL)` on all 5 statement shapes, `Application Name`→`program_name`); records a live `application_name` DEFECT, and a REPORTED-not-confirmed Aug-2026 Warehouse metering change that would undercut per-model costing |
 | [create-table-with-options.md](docs/create-table-with-options.md) | **current** — all four `WITH (…)` slices shipped |
 | [custom-functions-design.md](docs/custom-functions-design.md) | **current** — the 4b–4h contract; §11.1 is the in-out design |
 | [dax-provider.md](docs/dax-provider.md) | **current** — read-only DAX/ADOMD provider, slices 1–6. Gate is MANUAL (needs Power BI Desktop) |
