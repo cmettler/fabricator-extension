@@ -381,7 +381,12 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
       (`UnsupportedOperationForSchemasEnabledLakehouse`; works on a flat one — our own discovery covers it
       anyway), and **a DuckDB table function cannot take a SUBQUERY argument** (`Binder Error: Table function
       cannot contain subqueries`) while a SCALAR can — so `fabric_job_status` needs a literal id.
-  - **SEMANTIC MODELS — ANALYSED, NOT BUILT (§9f).** The Fabric SDK **cannot refresh one at all** (probed with
+  - **SEMANTIC MODELS — BUILT + LIVE-VALIDATED the same day (§9f):** `fabric_semantic_models`,
+    `fabric_refresh_semantic_model` (ENHANCED refresh — live `Completed` with `refresh_type=ViaEnhancedApi`,
+    which is the PROOF the enhanced path was taken rather than a plain refresh), `fabric_semantic_model_refreshes`
+    (history showed `ViaEnhancedApi` / **`DirectLakeFraming`** / `WebModeling`). On the **Power BI REST**
+    surface — `FabricApi/FabricPowerBiRest.cs`, a `partial` half of `FabricApiClient` — because:
+  - **the Fabric SDK CANNOT refresh a semantic model (§9f).** The Fabric SDK **cannot refresh one at all** (probed with
     a zero control: `RefreshSemanticModel`/`EnhancedRefresh`/`RefreshSchedule` all 0; only CRUD + definition +
     `BindSemanticModelConnection`). Refresh lives in the **Power BI REST API**
     (`POST /v1.0/myorg/groups/{ws}/datasets/{id}/refreshes`) — a different HOST but the **same audience we
@@ -403,6 +408,14 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     `PrincipalTypeNotSupported`/`FeatureNotAvailable` — those are per-API principal-type limits no setting
     lifts. The XMLA route adds a third, CAPACITY-level gate (Semantic models workload → XMLA = Read Write). Split to keep: **REST for "refresh this model, tell me when done" (`fabric_*`), XMLA/TMSL through
     the DAX provider for per-table/partition control (`dax_*`)**.
+    - **Three traps the live run settled.** (1) The API treats a body of only `notifyOption` as a PLAIN refresh
+      AND rejects `notifyOption` for an SP — interacting rules, so we always send `type` (default `Full`) and
+      never `notifyOption`; `refresh_type` in the result is how you tell which path you got. (2) Power BI
+      reports IN-PROGRESS as **`status = "Unknown"`**, and a just-submitted request may be absent from the
+      history entirely — both mean "still running", so a naive `!= 'Completed'` poll exits immediately with a
+      misleading value. (3) The request id arrives ONLY in the `x-ms-request-id` header (the 202 has no body;
+      a `Location` tail is the fallback). Also: Power BI nests errors under `error.{code,message}` where Fabric
+      uses flat `errorCode`/`message`, hence a separate `PowerBiReadAsync` beside `Describe`.
   - Output shape rule (D4): typed flat columns + one raw-JSON column for polymorphic parts; **no STRUCT
     wrapping** (adding a column is additive for `SELECT *`; adding a struct FIELD changes a column's type
     and breaks bound views), no JSON-only. Every `table`-kind function also gets a dead `_each` sibling —

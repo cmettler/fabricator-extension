@@ -83,7 +83,8 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | | Introspection: workspaces, items, lakehouses (+ SQL endpoint strings), warehouses, connections, notebook parameters | ✅ OneLake attaches |
 | | **Parameterized notebook runs** (blocking, with status + portal snapshot link) | ✅ OneLake attaches |
 | | **Jobs**: table maintenance (V-Order/Z-order/vacuum), generic runner, status, history, cancel | ✅ OneLake attaches |
-| | Semantic-model refresh (Power BI REST / XMLA); notebook `exitValue` | ⏳ analysed / best-effort |
+| | **Semantic models**: list, enhanced refresh, refresh history (Power BI REST, same credential) | ✅ OneLake attaches |
+| | Notebook `exitValue`; per-partition refresh via XMLA/TMSL | ⏳ best-effort / DAX provider |
 | **Callable** | Discovered scalar UDFs → `db.schema.fn(args)` (vectorized over Arrow) | ✅ |
 | | Discovered table-valued functions → `SELECT * FROM db.schema.tvf(args)` (+ projection/filter pushdown) | ✅ |
 | | Discovered stored procedures → `SELECT * FROM db.schema.proc(name := val)` (named/optional + OUTPUT params) | ✅ |
@@ -704,6 +705,9 @@ SELECT * FROM lake.dbo.fabric_refresh_sql_endpoint(item := 'OtherLH'); -- a diff
 | `fabric_lakehouse_tables()` | table | Tables as **Fabric** sees them (flat lakehouses only — see below) |
 | `fabric_operation_status(operation_id)` | table | Generic long-running-operation status |
 | `fabric_reset_shortcut_cache()` | table | Clears the workspace's shortcut cache (**needs a user identity**) |
+| `fabric_semantic_models()` | table | The workspace's semantic models, incl. each lakehouse's and warehouse's default |
+| `fabric_refresh_semantic_model(model [, type := …] [, objects_json := …] [, commit_mode := …] [, timeout := …])` | table | **Refreshes a semantic model** (enhanced refresh) and blocks until it settles |
+| `fabric_semantic_model_refreshes(model [, top := …])` | table | That model's refresh history |
 
 **Refreshing the SQL endpoint after a Delta write** — the reason this exists. A table written through the
 Delta provider is invisible to the lakehouse's T-SQL endpoint until Fabric's asynchronous detection notices
@@ -769,6 +773,40 @@ SELECT job_type, status, start_time FROM lake.dbo.fabric_job_instances('my_noteb
 
 > A table function cannot take a **subquery** argument (`Binder Error: Table function cannot contain
 > subqueries`), so pass `job_instance_id` as a literal. The scalar `fabric_cancel_job` accepts one.
+
+**Semantic models — making a Delta write visible to Power BI.** Refreshing the SQL endpoint makes a new
+table visible to **T-SQL**; refreshing the semantic model is what makes the data visible to **Power BI**. Both
+a lakehouse and a warehouse have a *default* semantic model, named after the item itself:
+
+```sql
+SELECT name, is_refreshable FROM lake.dbo.fabric_semantic_models();
+
+SELECT status, refresh_type, error_message
+FROM lake.dbo.fabric_refresh_semantic_model('MyLakehouse');           -- the default model
+
+SELECT status, extended_status FROM lake.dbo.fabric_semantic_model_refreshes('MyLakehouse', top := 5);
+```
+
+It issues an **enhanced refresh**, so the full contract is available — `type` (`Full`, `ClearValues`,
+`Calculate`, `DataOnly`, `Automatic`, `Defragment`), `commit_mode` (`Transactional`/`PartialBatch`),
+`max_parallelism`, `retry_count`, `timeout` (`hh:mm:ss`), and per-object targeting:
+
+```sql
+SELECT status FROM lake.dbo.fabric_refresh_semantic_model('Sales',
+  type := 'Full', objects_json := '[{"table": "Orders", "partition": "2026"}]');
+```
+
+Notes:
+
+- Enhanced refresh needs **Fabric/Premium capacity**; on shared capacity the API accepts only a notification
+  option and caps refreshes at 8/day.
+- These calls go to the **Power BI REST API** rather than the Fabric API — a different host but the *same*
+  credential, so an ATTACH secret or ambient token that works for the functions above works here too. It does
+  require the tenant's *"Service principals can call Fabric public APIs"* setting for a service principal,
+  which is separate from any workspace role you granted.
+- Power BI reports a refresh still in flight as `status = 'Unknown'`; `wait_seconds := 0` submits without
+  waiting and you can poll with `fabric_semantic_model_refreshes`.
+- For per-partition sequencing beyond what this expresses, use XMLA/TMSL through the DAX provider.
 
 **Introspection.** Useful on its own, and the source of the identifiers the calls above need — for example
 attaching the lakehouse's T-SQL endpoint alongside the Delta catalog:

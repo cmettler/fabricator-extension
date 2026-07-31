@@ -1,8 +1,8 @@
 # Fabric REST API custom functions — design + as-built (P0 shipped, P1/P2 designed)
 
-> Status 2026-07-31: **P0, notebook runs, P1 jobs + table maintenance, and P2 introspection are all BUILT
-> and validated LIVE** (§9e). Semantic models are ANALYSED, not built (§9f) — refresh is not in the Fabric
-> SDK at all; it lives in the Power BI REST API, on an audience we already mint. §9c is the as-built record, §9d
+> Status 2026-07-31: **everything through P2 is BUILT and validated LIVE** — P0, notebook runs, jobs +
+> table maintenance (§9e), introspection, and now SEMANTIC MODELS incl. enhanced refresh (§9f). Refresh is
+> not in the Fabric SDK at all; it lives in the Power BI REST API, on an audience we already mint. §9c is the as-built record, §9d
 > settles how notebook parameters actually arrive, §10 sweeps the whole API with a verdict per area; §4's
 > table marks what is shipped. The research below is
 > file:line-verified against the working tree and the pinned SDK binary; treat the REST shapes as
@@ -790,7 +790,36 @@ both, and today we only offer the first.
   (For the XMLA/TMSL route there is a THIRD, capacity-level gate: the Semantic models workload's **XMLA
   endpoint must be Read Write**, and the SP needs workspace Member/Admin.)
 
-**Recommended shape when built** — three functions, in this order of value:
+### BUILT + LIVE-VALIDATED the same day (2026-07-31)
+
+All three shipped, on the Power BI REST surface (`FabricApi/FabricPowerBiRest.cs`, a `partial` half of
+`FabricApiClient`) with the functions in `FabricApi/FabricSemanticModelFunctions.cs`:
+
+| function | live result |
+|---|---|
+| `fabric_semantic_models([workspace :=])` | 5 models — `LH` (the lakehouse default), `Test Warehouse Model1`/`Model2`, `LH_semtest`, `hm`, all `is_refreshable` |
+| `fabric_refresh_semantic_model(model [, type :=] [, objects_json :=] [, commit_mode :=] [, max_parallelism :=] [, retry_count :=] [, timeout :=] [, wait_seconds :=] [, workspace :=])` | **`Completed`**, `refresh_type = ViaEnhancedApi` — so the ENHANCED path really was taken, not a plain refresh |
+| `fabric_semantic_model_refreshes(model [, top :=] [, workspace :=])` | history rows incl. `ViaEnhancedApi`, `DirectLakeFraming`, `WebModeling` |
+
+Three things the live run settled that the design could only assume:
+
+- **`refresh_type = ViaEnhancedApi` is the proof the body was right.** The API treats a request whose only
+  field is `notifyOption` as a PLAIN refresh, and rejects `notifyOption` outright for a service principal —
+  two rules that interact. Sending `type` (default `Full`) and NEVER `notifyOption` is the one combination
+  valid for both identity kinds, and the returned refresh_type is how you can tell which path you got.
+- **`DirectLakeFraming` appears in the history as its own refresh type**, which is the reframe mechanism named
+  explicitly — the thing that makes a Delta write visible to Power BI.
+- **Power BI reports IN-PROGRESS as `status = "Unknown"`**, not a distinct running state, and a just-submitted
+  request may not be in the history yet at all. The poll treats both as "still running"; a naive
+  `status != "Completed"` check would have exited immediately with a misleading value.
+
+Implementation notes worth keeping: the request id arrives ONLY in the `x-ms-request-id` header (the 202 has
+no body; a `Location` tail is the documented fallback, and absent both we say so rather than return a blank
+id), and Power BI nests its errors under `error.{code,message}` where Fabric uses flat `errorCode`/`message`
+— so the two surfaces need different error extraction, which is why `PowerBiReadAsync` exists next to
+`Describe`.
+
+**Original recommendation, kept for the record** — three functions, in this order of value:
 
 1. `fabric_refresh_semantic_model(model [, type :=] [, objects_json :=] [, commit_mode :=] [, max_parallelism :=] [, retry_count :=] [, timeout :=] [, wait_seconds :=] [, workspace :=])` → one row (`request_id`, `status`, `start_time`, `end_time`, `error_message`), blocking by default like the rest.
 2. `fabric_semantic_models([workspace :=])` → id, name, description — Fabric SDK, trivial, and the discovery half of (1).

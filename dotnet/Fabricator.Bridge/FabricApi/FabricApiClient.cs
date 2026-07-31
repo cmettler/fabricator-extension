@@ -32,7 +32,7 @@ internal sealed record FabricApiContext(string Root, TokenCredential? Credential
 /// <para>Resolution results are cached per instance, and the instance lives on the catalog: workspace/item
 /// listing is throttled per principal, and every function call would otherwise re-list.</para>
 /// </remarks>
-internal sealed class FabricApiClient
+internal sealed partial class FabricApiClient
 {
     private readonly FabricApiContext _context;
     private readonly Lazy<FabricClient> _client;
@@ -224,6 +224,7 @@ internal sealed class FabricApiClient
         string Status, string? StartTimeUtc, string? EndTimeUtc, string? ExitValue, string? Compute,
         string? SnapshotUrl, string? ErrorCode, string? ErrorMessage);
 
+    // Shared by BOTH surfaces (Fabric raw HTTP and the Power BI REST half in FabricPowerBiRest.cs).
     private static readonly System.Net.Http.HttpClient Http = new() { Timeout = TimeSpan.FromMinutes(5) };
 
     private async System.Threading.Tasks.Task<string> TokenAsync(CancellationToken ct)

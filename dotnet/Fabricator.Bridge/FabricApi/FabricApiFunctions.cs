@@ -42,6 +42,9 @@ internal static class FabricApiFunctions
         // Jobs: table maintenance (V-Order, which our own OPTIMIZE cannot produce), the generic runner, and
         // status/history/cancel. They share one submit+poll path.
         FabricJobFunctions.Register(scalars, tables, api);
+        // Semantic models: list + enhanced refresh + refresh history. On the POWER BI REST surface (the
+        // Fabric SDK cannot refresh one), but on the SAME token — so this needs no extra credential.
+        FabricSemanticModelFunctions.Register(tables, api);
         // Read-only introspection: the identifiers the write functions above need (a connection GUID for an
         // external shortcut target, an endpoint connection string for a T-SQL ATTACH, a workspace/item name).
         FabricInspectFunctions.Register(tables, api);
