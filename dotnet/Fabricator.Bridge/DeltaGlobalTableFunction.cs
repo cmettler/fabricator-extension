@@ -471,12 +471,19 @@ internal static class DeltaWriter
         }
     }
 
+    /// <param name="serializable">
+    /// The catalog's ATTACH isolation level. **No longer affects the created table's configuration** — see the
+    /// "NO AUTOMATIC delta.isolationLevel STAMP" note below. Still threaded through the write entry points so
+    /// removing it is a separate, purely mechanical change across ~6 signatures rather than a behaviour edit
+    /// buried in this one; it is inert until then.
+    /// </param>
     private static Dictionary<string, string>? CreateConfig(
         bool deletionVectors, bool rowTracking, bool inCommitTimestamps, bool changeDataFeed,
         bool serializable = false, IReadOnlyList<string>? sortedBy = null,
         IReadOnlyDictionary<string, string>? extraProperties = null)
     {
-        if (!deletionVectors && !rowTracking && !inCommitTimestamps && !changeDataFeed && !serializable
+        _ = serializable; // inert: the isolation level is no longer stamped into the table config
+        if (!deletionVectors && !rowTracking && !inCommitTimestamps && !changeDataFeed
             && sortedBy is not { Count: > 0 } && extraProperties is not { Count: > 0 })
         {
             return null;
@@ -487,21 +494,23 @@ internal static class DeltaWriter
             // CREATE ... SORTED BY (cols): persist the ordered-write spec so later appends re-apply it.
             config[SortedByKey] = SerializeSortedBy(sortedBy);
         }
-        if (serializable)
-        {
-            // Stamp the ATTACH isolation_level 'serializable' onto CREATEd tables so the table SELF-DECLARES
-            // its guarantee (all writers, us + Spark, then honor it uniformly). Serializable is ALSO the only
-            // value Fabric/OSS Spark's DDL validator accepts, so a stamped table stays fully manageable there.
-            //
-            // write_serializable is left ABSENT (no stamp). The old justification here — "matching Spark's
-            // minimal metadata" — was wrong twice over (measured 2026-07-31, Fabric Spark 4.1.1): Spark's own
-            // default is Serializable, not write_serializable, and Spark REJECTS 'WriteSerializable' as a
-            // property value. Leaving it absent is still right, but the real reasons are (a) a stamp would
-            // freeze a value Spark cannot later change via ALTER, and (b) absent = "each writer's own
-            // default", which is what a per-catalog knob means. Consequence to know: on an unstamped shared
-            // table we are WriteSerializable while Fabric Spark is Serializable. docs/delta-transactions.md §10.6.
-            config["delta.isolationLevel"] = "Serializable";
-        }
+        // NO AUTOMATIC delta.isolationLevel STAMP (removed 2026-08-01, together with the default flip).
+        //
+        // A CREATE used to bake the catalog's ATTACH isolation_level into the table as a property. That
+        // conflates two different things — the ATTACH option is a per-catalog BEHAVIOUR knob, the property is
+        // a DURABLE DECLARATION about the table — and the conflation has a sharp edge: because the table's
+        // property WINS over any catalog (PendingSerializable), a stamp makes an ephemeral attach-time choice
+        // permanent AND silently overrides a different catalog's explicit setting later. Measured directly:
+        // with the stamp in place, attaching the same path twice at two levels stopped honoring the second
+        // one, which is exactly the composition our own level-contrast suites rely on.
+        //
+        // Not stamping costs nothing in the common case, because the DEFAULT now matches Fabric Spark
+        // (Serializable) — silence already means cross-engine agreement. A user who deliberately runs
+        // write_serializable and wants every engine to honor it can say so explicitly and durably, with
+        // CREATE TABLE ... WITH ("delta.isolationLevel"='WriteSerializable') or
+        // fabricator_delta_set_tblproperties; Spark HONORS such a value even though its own DDL refuses to
+        // set it (measured 2026-07-31). That path is deliberate, visible in the SQL, and per-table.
+        // docs/delta-transactions.md §10.6a.
         if (deletionVectors)
         {
             config["delta.enableDeletionVectors"] = "true";

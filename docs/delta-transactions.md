@@ -240,7 +240,7 @@ DuckDB transaction aborts; retry the whole transaction.
 
 ### `isolation_level` ATTACH option
 
-| | `'write_serializable'` (**default** — *Databricks'* default, **not** Fabric Spark's; §10.6) | `'serializable'` |
+| | `'write_serializable'` (*Databricks'* default; ours until 2026-08-01 — §10.6) | `'serializable'` (**our default since 2026-08-01** — Fabric Spark's too) |
 |---|---|---|
 | Concurrent **blind appends** vs our reads | commute (feed inference/order may place them "before" our reads logically) | abort if they match our read predicates — commit order = logical order |
 | Append-only txn that *read* the table | blind OCC path (no read checks) — documented divergence: Spark would deleteRead-check it | first read pins the base version → routes through the checked flush |
@@ -316,6 +316,12 @@ to one where the guard rejected and retried.
 - **No lost writes, no corruption, ever** — across every run the landed versions were unique and
   contiguous and every `(writer, commit)` group was complete. The commit guard is *sound*: two writers
   never both took a version.
+- **The guard fires AND the retry works — observed end to end (2026-08-01).** A 10 × 15 run logged
+  `delta flush …: commit conflict — reopening at latest (attempt 1/16)` and that writer then **committed
+  successfully**: 150/150 rows, 150/150 groups, 1 OCC retry, 0 failures. This is the piece every earlier
+  run was missing, and it only became visible because that retry is now logged. (It also exposed a
+  harness bug worth avoiding: the run script's `grep -iE 'error|conflict'` counted the healthy retry line
+  as a writer failure, making a good run look broken.)
 - **Low contention never exercises the guard.** 32 commits across 4 processes produced **0** conflicts:
   each INSERT spends most of its ~1.7 s writing parquet, so the read-latest→write-commit windows rarely
   overlap. A green low-contention run therefore proves nothing about put-if-absent, which is exactly why
@@ -391,12 +397,31 @@ table — both observed failure modes are now fixed and the 150-commit shape tha
 clean. Retrying a failed statement is still sound advice for any OCC system, but it is no longer
 required to work around a known defect.
 
-**One UNRELATED observation, recorded because it was seen repeatedly and is NOT explained.** In several
-runs a single `duckdb.exe` finished all of its work — its last commit is in the log, and every commit
-landed — and then **failed to exit**, blocking the harness's `wait`. It happened both before and after
-these fixes, and on runs with no errors at all, so it is a teardown/shutdown issue on the
-OneLake+hosted-CLR path rather than anything to do with commits. Not investigated. If a concurrent
-OneLake workload ever appears to "hang at the end", start here rather than assuming a lost commit.
+### 8.2 The "teardown hang" — investigated, and it does NOT survive scrutiny
+
+An earlier revision of this section reported that a `duckdb.exe` "finished all its work and then failed
+to exit", on runs both with and without errors, and called it an unexplained teardown defect. Chasing it
+with `dotnet-stack` dissolved the claim. Recorded because the *investigation* is the useful part:
+
+- **The detector's first hit was a FALSE POSITIVE.** "A process alive with no commit-log activity for
+  40 s" also describes the harness's **verify** step — a plain `SELECT` whose OneLake table open writes
+  no commit lines and legitimately takes that long. Its stack (blocked in
+  `DeltaReader.GetSchemaAndVersion`) looked alarming; the query then returned the correct 48/48. *A
+  process blocked in a stack you don't like is not evidence of a hang — slow and stuck have identical
+  stacks.* The fix was to require the writer phase to still be in progress, not merely "quiet".
+- **The strays correlate with FAILING writers**, not with completion. They appeared after the runs that
+  hit the `_last_checkpoint` JSON error and the 412, and not after clean ones. On the fixed build, two
+  full 10 × 15 runs left no writer-phase stray.
+- **The last stray was self-inflicted.** Editing `iso_race.sh` *while it was running* corrupted the
+  harness: bash reads a script by byte offset, so the edit made it resume mid-token (`p: command not
+  found`) and relaunch work after the verify had already printed. The surviving process was doing real
+  work — its CPU time kept climbing — not deadlocked. **Never edit a running shell script.**
+
+**Conclusion: no evidence of an independent teardown defect on the current build.** The honest residual
+is narrower and worth keeping: when a writer *errors* during a OneLake commit, the process has been seen
+not to exit promptly. Both known causes of such errors are now fixed, so it no longer triggers here; if
+it resurfaces, capture stacks with `dotnet-stack report -p <pid>` before killing the process — that took
+the question from "unexplained" to "answered" in one reading.
 
 Two S3 findings worth remembering: a **conditional CopyObject is silently unguarded** on MinIO
 (AWS documents conditional writes for PutObject/CompleteMultipartUpload only) — the guard must be a
@@ -602,6 +627,49 @@ OSS Delta **knows** the enum value — it is the **table-property validator** th
 We do **not** block or rewrite a `WriteSerializable` stamp: the value is functional and honored
 cross-engine, so refusing it would remove a working capability to guard against a Spark **DDL**
 limitation that costs the user nothing at read or write time.
+
+### 10.6a What this changed (2026-08-01) — the default flipped, and the auto-stamp is GONE
+
+Consequence 1 above is a silent, engine-dependent weakening: on a table that declares nothing, the
+guarantee depended on which engine happened to write. Two changes.
+
+**1. The catalog default is now `serializable`** (was `write_serializable`), matching Fabric Spark, so
+silence now means agreement. Explicit `isolation_level 'write_serializable'` selects the old behaviour,
+and a table's own `delta.isolationLevel` still overrides the catalog either way.
+
+**⚠ Breaking, and the biggest practical effect is NOT the blind-append rule — it is that
+[row-level concurrency](#104-concurrent-dml-on-the-same-file--parity-row-level-concurrency-v1-2026-07-14)
+is a WriteSerializable-ONLY relaxation.** Under `serializable` the strict file-level checks apply, so
+concurrent disjoint-row DML on the same file conflicts where it used to compose. That is what three
+suites caught the moment the default moved. Single-writer behaviour is unchanged. **If you rely on
+concurrent DML composing, attach with `isolation_level 'write_serializable'`** — one option, same
+behaviour as before.
+
+**2. A CREATE no longer stamps `delta.isolationLevel` at all.** It used to bake the catalog's ATTACH
+level into the table. That conflates a per-catalog *behaviour knob* with a durable per-table
+*declaration*, and since the property **wins over any catalog** (§10.6, `PendingSerializable`), the
+stamp made an attach-time choice permanent and silently overrode a *different* catalog's explicit
+setting on the same table later. Measured directly: with the stamp in place, attaching one path twice
+at two levels stopped honouring the second — the exact composition our own level-contrast suites rely
+on. So the stamp was not merely redundant, it broke a working capability.
+
+Declaring a level is now explicit and per-table:
+
+```sql
+CREATE TABLE lake.main.t WITH ("delta.isolationLevel"='WriteSerializable') AS SELECT …;
+SELECT * FROM fabricator_delta_set_tblproperties('lake', 'main.t',
+                                                 '{"delta.isolationLevel":"WriteSerializable"}');
+```
+
+That is the spelling to use when another engine must honour the looser level, and it works: Fabric
+Spark refuses to *set* `WriteSerializable` via its own DDL but **honours** it when it is already on the
+table (both measured). Trade-off: such a table's level then cannot be changed *from* Spark — use
+`fabricator_delta_set_tblproperties`.
+
+Gate: `verify_delta_tblproperties` (58) pins the default itself, that neither level auto-stamps, and
+that the explicit `WITH` still lands in commit-0. It has to pin the default directly, because every
+other isolation assertion in the tree now states its level explicitly — otherwise a regression in the
+default would fail nothing.
 
 ### 10.7 Cross-TABLE atomicity — CAVEAT ON OUR SIDE
 

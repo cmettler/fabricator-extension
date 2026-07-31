@@ -1248,7 +1248,7 @@ Any of these can also be set **per table** with `CREATE TABLE … WITH (…)` (a
 | `column_mapping` | **`'name'`** | writer v7; metadata-only RENAME / DROP COLUMN; Fabric T-SQL-endpoint compatible |
 | `native_read`, `native_write` | **from the PROVIDER name** | `PROVIDER 'delta'` ⇒ both **on** (DuckDB's Parquet reader/writer — the production path); `PROVIDER 'engineeredwooddelta'` ⇒ both **off** (pure-EW codec). Either is still settable explicitly on either spelling |
 | `change_data_feed`, `in_commit_timestamps`, `row_tracking`, `schemas` | `false` / off | opt-in |
-| `isolation_level` | `write_serializable` | `serializable` also serializes blind appends. This is **Databricks'** default, not Fabric Spark's — Fabric Spark commits at `Serializable`, so on a shared table with no `delta.isolationLevel` property the two engines differ (we are the more permissive). Use `serializable` to match Fabric Spark |
+| `isolation_level` | **`serializable`** | Matches Fabric Spark, which commits at `Serializable` — so a table with no `delta.isolationLevel` property gets the same guarantee whichever engine writes it. **Changed 2026-08-01** (was `write_serializable`, Databricks' default, which made us the weaker writer on any undeclared table). ⚠ **Row-level concurrency needs `write_serializable`**: under `serializable` concurrent disjoint-row DML on one file conflicts instead of composing, so set `isolation_level 'write_serializable'` if you rely on it |
 | `compression` | `snappy` | + auto dictionary encoding + always-on min/max stats |
 
 So a **default** table is read by Spark, delta-kernel, and Fabric Spark + OneLake conversion (all

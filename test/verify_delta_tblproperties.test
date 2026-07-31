@@ -73,12 +73,13 @@ statement ok
 DETACH lake2;
 
 # ---- Slice 2: the TABLE's delta.isolationLevel OVERRIDES the catalog default ----
-# Both connections use a DEFAULT (write_serializable) catalog. With the table property = Serializable, a
-# concurrent blind append matching the transaction's read predicate is a REAL conflict — proving our writer
-# honors the TABLE property, not the catalog-wide default.
+# With the table property = Serializable, a concurrent blind append matching the transaction's read
+# predicate is a REAL conflict — proving our writer honors the TABLE property, not the catalog-wide level.
 
+# This slice proves the TABLE property overrides the CATALOG default, so the catalog must be the level the
+# property is NOT: explicitly write_serializable (the catalog default became 'serializable' on 2026-08-01).
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/iso' AS db (TYPE fabricator, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/iso' AS db (TYPE fabricator, PROVIDER 'delta', isolation_level 'write_serializable');
 
 statement ok
 CREATE TABLE db.main.t AS SELECT i AS id, 'x' AS name FROM range(10) t(i);
@@ -137,30 +138,33 @@ SELECT count(*) FROM db.main.t WHERE id = 3;
 statement ok
 DETACH db;
 
-# ---- Create-time stamp: ATTACH isolation_level 'serializable' -> created tables self-declare it ----
-# write_serializable is left ABSENT (no stamp). NOT because it is "the Spark default" (it is DATABRICKS'
-# default — Fabric Spark 4.1.1 commits at Serializable and REJECTS 'WriteSerializable' as a property value
-# outright; measured 2026-07-31, docs/delta-transactions.md §10.6), but because absent means "each writer
-# applies its own default" and a stamp would freeze a value Spark cannot change via ALTER.
-# 'Serializable' is stamped, and is also the only value Fabric Spark's DDL accepts -> stays manageable there.
+# ---- CREATE never stamps delta.isolationLevel automatically (changed 2026-08-01) ----
+# A CREATE used to bake the catalog's ATTACH isolation_level into the table. That conflated a per-catalog
+# BEHAVIOUR knob with a durable per-table DECLARATION, and because the property WINS over any catalog
+# (slice 2 above), the stamp made an attach-time choice permanent AND silently overrode a different
+# catalog's explicit setting on the same table later — which is precisely the composition slice 2 and
+# verify_delta_row_level_concurrency §6 depend on. Neither level stamps now; declaring a level is an
+# explicit, per-table act (WITH (...) at CREATE, or fabricator_delta_set_tblproperties).
+# docs/delta-transactions.md §10.6a.
 
+# the DEFAULT catalog (serializable) stamps NOTHING
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/serc' AS sc (TYPE fabricator, PROVIDER 'delta', isolation_level 'serializable');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/serc' AS sc (TYPE fabricator, PROVIDER 'delta');
 
 statement ok
 CREATE TABLE sc.main.t AS SELECT i AS id FROM range(3) t(i);
 
-query T
-SELECT value FROM fabricator_delta_tblproperties('sc', 'main.t') WHERE property = 'delta.isolationLevel';
+query I
+SELECT count(*) FROM fabricator_delta_tblproperties('sc', 'main.t') WHERE property = 'delta.isolationLevel';
 ----
-Serializable
+0
 
 statement ok
 DETACH sc;
 
-# a default (write_serializable) catalog leaves the property ABSENT
+# and NEITHER does an explicit write_serializable catalog — the ATTACH option stays a catalog behaviour
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/defc' AS dc (TYPE fabricator, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/defc' AS dc (TYPE fabricator, PROVIDER 'delta', isolation_level 'write_serializable');
 
 statement ok
 CREATE TABLE dc.main.t AS SELECT i AS id FROM range(3) t(i);
@@ -170,5 +174,73 @@ SELECT count(*) FROM fabricator_delta_tblproperties('dc', 'main.t') WHERE proper
 ----
 0
 
+# declaring it is EXPLICIT, and lands in commit-0 of that table (per-table, opt-in). This is the spelling
+# to use when another engine must honor the weaker level: Fabric Spark REFUSES to set WriteSerializable via
+# its own DDL but HONORS it when it is already on the table (both measured 2026-07-31).
+statement ok
+CREATE TABLE dc.main.ws WITH ("delta.isolationLevel"='WriteSerializable') AS SELECT 1 AS id;
+
+query T
+SELECT value FROM fabricator_delta_tblproperties('dc', 'main.ws') WHERE property = 'delta.isolationLevel';
+----
+WriteSerializable
+
+query I
+SELECT count(*) FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/defc/ws/_delta_log/00000000000000000000.json')
+WHERE content LIKE '%WriteSerializable%';
+----
+1
+
 statement ok
 DETACH dc;
+
+# ---- The CATALOG DEFAULT is serializable (changed 2026-08-01) ----
+# Pinned directly, because everything above now states its level EXPLICITLY — without this, a regression in
+# the default would not fail any test. The shape is slice 2's, minus the property and minus the ATTACH
+# option: a concurrent blind append MATCHING the transaction's read predicate must CONFLICT, which is the
+# serializable behaviour. Under the old write_serializable default the same shape committed.
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/defiso' AS dflt (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE dflt.main.t AS SELECT i AS id, 'x' AS name FROM range(10) t(i);
+
+# no property was stamped, so the level really does come from the catalog default
+query I
+SELECT count(*) FROM fabricator_delta_tblproperties('dflt', 'main.t') WHERE property = 'delta.isolationLevel';
+----
+0
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+DELETE FROM dflt.main.t WHERE id = 1;
+
+statement ok con2
+INSERT INTO dflt.main.t VALUES (1, 'dup');
+
+statement error con1
+COMMIT;
+----
+transaction conflict
+
+# and the looser level is still reachable per-table, overriding that default
+statement ok
+SELECT * FROM fabricator_delta_set_tblproperties('dflt', 'main.t', '{"delta.isolationLevel":"WriteSerializable"}');
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+DELETE FROM dflt.main.t WHERE id = 3;
+
+statement ok con2
+INSERT INTO dflt.main.t VALUES (3, 'dup2');
+
+statement ok con1
+COMMIT;
+
+statement ok
+DETACH dflt;

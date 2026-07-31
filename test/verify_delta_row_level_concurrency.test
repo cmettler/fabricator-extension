@@ -18,8 +18,11 @@ require parquet
 
 require-env FABRICATOR_DELTA_WRITE_DIR
 
+# Row-level concurrency is a WRITE_SERIALIZABLE-only relaxation, so this suite must DECLARE that level:
+# since 2026-08-01 the catalog default is 'serializable', under which the strict file-level checks apply
+# (§6 below pins exactly that contrast). Before the flip this line relied on the default being the loose one.
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/rowlevel' AS rl (TYPE fabricator, PROVIDER 'delta');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/rowlevel' AS rl (TYPE fabricator, PROVIDER 'delta', isolation_level 'write_serializable');
 
 # ONE file with rows 1..10 (single INSERT ⇒ single parquet) — every scenario below targets THIS file.
 statement ok

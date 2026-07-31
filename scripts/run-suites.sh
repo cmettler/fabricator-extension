@@ -101,8 +101,14 @@ case "$TIER" in
         # OVERWRITE, so a concurrent reader could see it at ZERO bytes and die in JsonDocument.Parse).
         # Pinned hermetically by writing the corrupt states directly — a live race only sometimes collides,
         # so it cannot serve as the gate.
+        # 5623 since 2026-08-01: verify_delta_tblproperties 42 -> 58, for the isolation-default FLIP
+        # (catalog default write_serializable -> serializable, matching Fabric Spark) and the removal of the
+        # automatic create-time delta.isolationLevel stamp. The added sections pin the DEFAULT itself — every
+        # other isolation assertion in the tree now states its level explicitly, so without this a regression
+        # in the default would fail nothing — plus that neither level auto-stamps and that an explicit
+        # WITH ("delta.isolationLevel"=...) still does.
         : "${MIN_SUITES:=63}"
-        : "${MIN_ASSERTIONS:=5607}"
+        : "${MIN_ASSERTIONS:=5623}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

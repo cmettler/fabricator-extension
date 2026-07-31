@@ -296,10 +296,15 @@ public sealed class DeltaCatalog : IBackendCatalog
         _pushdownMode = ParsePushdownFiltersOption(optionsJson, _nativeRead);
         _copyDisposition = ParseStringOption(optionsJson, "copy_disposition");
         var isolation = ParseStringOption(optionsJson, "isolation_level");
+        // DEFAULT = serializable (2026-08-01, behaviour-breaking). It used to be write_serializable on the
+        // belief that this matched Spark; MEASURED FALSE — Fabric Spark commits at Serializable, so the old
+        // default made US the weaker writer on any table that does not declare a level, and which engine
+        // wrote last silently decided the guarantee. Aligning removes that. Explicit options still win, and a
+        // table's own delta.isolationLevel still overrides the catalog (PendingSerializable).
         _serializable = isolation?.Replace("_", "").ToLowerInvariant() switch
         {
-            null or "" or "writeserializable" => false,
-            "serializable" => true,
+            null or "" or "serializable" => true,
+            "writeserializable" => false,
             _ => throw new System.ArgumentException(
                 $"delta: unknown isolation_level '{isolation}' — expected 'serializable' or 'write_serializable'."),
         };

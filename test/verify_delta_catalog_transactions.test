@@ -31,8 +31,11 @@ require-env DELTA_PROVIDER
 # 1. Codec catalog: atomic multi-INSERT + rollback (slice 1)
 # ============================================================================
 
+# isolation_level 'write_serializable' is EXPLICIT here: §6a/§6e assert WriteSerializable behaviours
+# (blind appends commute; row-level DV concurrency), and the catalog default became 'serializable' on
+# 2026-08-01. The serlake* catalogs below pin the serializable side of the same contrast.
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS lake (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS lake (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}', isolation_level 'write_serializable');
 
 statement ok
 CREATE TABLE lake.main.t (id INTEGER, name VARCHAR);
@@ -779,7 +782,7 @@ statement ok
 DETACH lake;
 
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS lake (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS lake (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}', isolation_level 'write_serializable');
 
 query I
 SELECT count(*) FROM lake.main.u;
@@ -2535,8 +2538,12 @@ DETACH mu;
 #     path-sort ordinals) can never make it read the wrong rows
 # ============================================================================
 
+# write_serializable EXPLICIT: this section asserts that concurrent blind appends COMMUTE with the
+# transaction, which is the WriteSerializable guarantee. The UPDATE's read-back records a WHOLE-TABLE read,
+# so under the (since 2026-08-01) serializable default ANY concurrent append is a conflict by definition —
+# that would test the isolation level rather than the ordinal-resolution behaviour this section is about.
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS vr (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}');
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS vr (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}', isolation_level 'write_serializable');
 
 statement ok
 CREATE TABLE vr.main.vrt (id INTEGER, v VARCHAR);

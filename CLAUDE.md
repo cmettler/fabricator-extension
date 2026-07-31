@@ -491,6 +491,27 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     scan is handed out by `GetScanFunction` and is not a registered catalog function ⇒ "Failed to find
     function fabricator_scan()". So `FabricatorScanDeserialize` is UNREACHABLE — and must still exist,
     because `Serialize` only emits bind data when BOTH callbacks are set. Do not "clean it up".
+- **THE DELTA ISOLATION DEFAULT FLIP — DONE (2026-08-01, behaviour-breaking for CONCURRENT writers).** The
+  catalog default is now **`serializable`** (was `write_serializable`), because the measurement below showed
+  the old default made us the WEAKER writer than Fabric Spark on any table that declares no level — so the
+  effective guarantee depended on which engine wrote. Single-writer behaviour is unchanged; concurrent
+  read-write transactions now conflict-abort against a matching blind append where they used to commute.
+  Explicit `isolation_level 'write_serializable'` restores the old behaviour, and a table's own
+  `delta.isolationLevel` still overrides the catalog.
+  - **⚠ The biggest practical effect is NOT the blind-append rule — ROW-LEVEL CONCURRENCY is a
+    WriteSerializable-ONLY relaxation**, so under the new default concurrent disjoint-row DML on one file
+    CONFLICTS where it used to compose. Three suites caught it the moment the default moved. Users who rely
+    on that must attach `isolation_level 'write_serializable'` (one option, old behaviour).
+  - **The automatic create-time stamp is GONE (not inverted — removed).** A CREATE used to bake the
+    catalog's ATTACH level into the table. That conflates a per-catalog BEHAVIOUR knob with a durable
+    per-table DECLARATION, and since the property WINS over any catalog, the stamp made an attach-time
+    choice permanent AND silently overrode a DIFFERENT catalog's explicit setting on the same table later —
+    measured: with the stamp in place, attaching one path twice at two levels stopped honoring the second,
+    which is exactly the composition our level-contrast suites rely on. Declaring a level is now explicit
+    and per-table (`WITH ("delta.isolationLevel"=…)` or `fabricator_delta_set_tblproperties`), and that is
+    the spelling to use when Spark must honor the looser level (it HONORS a stamped WriteSerializable even
+    though its DDL refuses to set it). `CreateConfig`'s `serializable` parameter is now inert — removing it
+    is a mechanical ~6-signature cleanup left for later, deliberately not mixed into a behaviour change.
 - **ISOLATION + ONELAKE MULTI-WRITER — MEASURED LIVE 2026-07-31; one bug FIXED, one gap OPEN. Full record:
   [docs/delta-transactions.md](docs/delta-transactions.md) §8.1 (multi-writer) + §10.6 (Spark isolation).**
   Two long-standing claims in this file were wrong, and both were beliefs never measured.
