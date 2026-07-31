@@ -768,17 +768,27 @@ both, and today we only offer the first.
 
 **Constraints to design around, all documented rather than guessed:**
 - **Enhanced refresh is NOT supported on shared capacity** (and shared capacity is limited to 8 refreshes/day,
-  body restricted to `notifyOption`). So the rich form requires Fabric/Premium capacity — which the Fabric
-  case always is, but the error must say so.
+  body restricted to `notifyOption`). So the rich form requires Fabric/Premium capacity — measured as
+  satisfied on this tenant (`isOnDedicatedCapacity: true`), but the error must still say so for others.
 - **`notifyOption` is not applicable to a service-principal call**, and an enhanced refresh requires at least
   one non-`notifyOption` field. So the SP path must send a real body and must NOT send `notifyOption` — the
   two rules interact, and getting it wrong yields a plain refresh instead of the requested one.
 - **Resolving a lakehouse's default semantic model is by NAME convention** (it carries the item's name), not
   by a documented link — `ListSemanticModels` has no "this is the default for item X" field. Any function
   doing the lookup should say so, and accept an explicit model name/GUID.
-- SP support for the Power BI REST surface is additionally gated by a **tenant setting** ("allow service
-  principals to use Power BI APIs"), which is a different switch from the Fabric-API one and has already
-  bitten this tenant twice on other endpoints. Probe before promising.
+- **SP access to the Power BI REST surface is a SEPARATE tenant setting from the Fabric-API one** — Admin
+  portal → **Tenant settings → Developer settings → "Service principals can call Fabric public APIs"**
+  (optionally scoped to a security group), and it is NOT the same thing as granting the SP a workspace role:
+  the tenant setting decides whether service principals may call these APIs at all, the workspace role decides
+  what this one may do to that workspace. Both must hold. **On THIS tenant it is already satisfied — MEASURED,
+  not assumed** (2026-07-31, `dotnet run live pbi`): as the same `fabric_sp`,
+  `GET /v1.0/myorg/groups` → **200** and `GET /groups/{ws}/datasets` → **200**. So semantic-model refresh needs
+  no admin change here. Two bonus facts from that probe: the workspace reports
+  `isOnDedicatedCapacity: true`, so the shared-capacity restriction on enhanced refresh **does not apply**, and
+  the datasets list confirms the name convention empirically — lakehouse `LH` has a model literally named
+  `LH`, alongside `Test Warehouse Model1`/`Model2`, `LH_semtest` and `hm`, every one `isRefreshable: true`.
+  (For the XMLA/TMSL route there is a THIRD, capacity-level gate: the Semantic models workload's **XMLA
+  endpoint must be Read Write**, and the SP needs workspace Member/Admin.)
 
 **Recommended shape when built** — three functions, in this order of value:
 

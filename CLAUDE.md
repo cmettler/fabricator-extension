@@ -391,8 +391,17 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     X" field), and refreshing it is what makes a Delta write visible to **Power BI**, the way
     `fabric_refresh_sql_endpoint` makes it visible to **T-SQL**. Constraints: enhanced refresh needs
     Fabric/Premium (unsupported on shared capacity, 8/day), `notifyOption` is invalid for an SP yet an
-    enhanced refresh needs a non-`notifyOption` body, and SP access is gated by a SEPARATE Power BI tenant
-    setting. Split to keep: **REST for "refresh this model, tell me when done" (`fabric_*`), XMLA/TMSL through
+    enhanced refresh needs a non-`notifyOption` body, and SP access rides a SEPARATE tenant setting
+    (Admin portal → Tenant settings → Developer settings → **"Service principals can call Fabric public
+    APIs"** — a DIFFERENT axis from granting the SP a workspace role, which is the confusion this invites: the
+    tenant setting says whether SPs may call the APIs at all, the workspace role says what this one may do
+    there; both must hold). **MEASURED as already satisfied on this tenant**: the same `fabric_sp` gets 200
+    from `GET /v1.0/myorg/groups` and `/groups/{ws}/datasets`, the workspace is `isOnDedicatedCapacity: true`
+    (so the shared-capacity enhanced-refresh restriction does not apply), and the model list confirms the name
+    convention — lakehouse `LH` has a model named `LH`, plus two `Test Warehouse Model*`, all
+    `isRefreshable: true`. So refresh needs NO admin change here. Note NEITHER gate explains
+    `PrincipalTypeNotSupported`/`FeatureNotAvailable` — those are per-API principal-type limits no setting
+    lifts. The XMLA route adds a third, CAPACITY-level gate (Semantic models workload → XMLA = Read Write). Split to keep: **REST for "refresh this model, tell me when done" (`fabric_*`), XMLA/TMSL through
     the DAX provider for per-table/partition control (`dax_*`)**.
   - Output shape rule (D4): typed flat columns + one raw-JSON column for polymorphic parts; **no STRUCT
     wrapping** (adding a column is additive for `SELECT *`; adding a struct FIELD changes a column's type
