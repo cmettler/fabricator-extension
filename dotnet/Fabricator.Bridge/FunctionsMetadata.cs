@@ -23,18 +23,34 @@ namespace Fabricator.Bridge;
 public static class FunctionsMetadata
 {
     /// <summary>One declaration row: which schema it binds into, its name, and its host registration kind.</summary>
+    /// <remarks>
+    /// <see cref="ParamCount"/> and <see cref="ReturnType"/> are NOT part of the three columns this class
+    /// streams — the host ignores them. They exist because the SQL-Server catalog assembles the SAME
+    /// declarations as a T-SQL <c>UNION ALL</c> against its discovered routines, whose shape is five columns
+    /// wide, so every branch must supply all five. Carrying them here is what lets ONE producer
+    /// (<see cref="CatalogFunctionSet.Declarations"/>) feed both the in-memory stream and that SQL.
+    /// </remarks>
     public readonly struct Declaration
     {
-        public Declaration(string schemaName, string name, string kind)
+        public Declaration(string schemaName, string name, string kind, int paramCount = 0,
+                           string returnType = "")
         {
             SchemaName = schemaName;
             Name = name;
             Kind = kind;
+            ParamCount = paramCount;
+            ReturnType = returnType;
         }
 
         public string SchemaName { get; }
         public string Name { get; }
         public string Kind { get; }
+
+        /// <summary>Declared argument count (positional ++ named), or the input-table width for in-out kinds.</summary>
+        public int ParamCount { get; }
+
+        /// <summary>Arrow type name of a scalar/aggregate result; empty for every other kind.</summary>
+        public string ReturnType { get; }
     }
 
     /// <summary>The Arrow schema of the kind-6 stream, in the host's column order.</summary>

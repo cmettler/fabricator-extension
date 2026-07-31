@@ -125,21 +125,32 @@ internal sealed class DaxCatalog : IBackendCatalog
         // Columns = a zero-row stream whose SCHEMA describes the table's columns (the no-describe approach;
         // real engine types). Model: EVALUATE TOPN(0,'T'); system: bare SELECT * FROM $SYSTEM.<dmv>.
         MetadataKind.Columns => DiscoverColumns(schema, table!),
-        // Functions (under the model schema): daxeval(expression) — table function evaluating an arbitrary
-        // DAX query; daxevaltable(<input>, expression := …) — a COLLECTOR (pipeline breaker): it buffers the
-        // WHOLE input and injects it as a DAX DATATABLE the expression references, so it needs all input
-        // before emitting (no single-chunk cap); daxeach(<input>, expression := …) — streaming per-row in-out.
-        MetadataKind.Functions => ThreeColumn(
-            "schema_name", new[] { _modelName, _modelName, _modelName },
-            "name", new[] { DaxEvalName, DaxEvalTableName, DaxEachName },
-            // daxeval is a 'proc' (not 'table') so its args register as NAMED parameters — it takes an
-            // optional `params` JSON arg alongside `expression`, which a positional table fn can't express.
-            // daxevaltable is a 'collector' (whole-table); daxeach is a streaming 'inout' (per-row).
-            "kind", new[] { "proc", "collector", "inout" }),
+        // Functions (under the model schema): the three BESPOKE ones, plus whatever the catalog's
+        // CatalogFunctionSet holds (the XMLA/TMSL refresh functions). The bespoke three keep their hand-written
+        // declarations because their kinds — 'proc', 'collector', 'inout' — are dispatched by name below rather
+        // than through the set; everything registered in the set declares itself.
+        MetadataKind.Functions => FunctionsMetadata.Stream(BespokeDeclarations()),
         MetadataKind.ServerInfo => EmptyStringTable("property", "value"),
         MetadataKind.VirtualColumns => EmptyStringTable("name", "type"),
         _ => EmptyStringTable("name"),
     };
+
+    // The three bespoke function declarations ++ the catalog function set's. daxeval is a 'proc' (not 'table')
+    // so its args register as NAMED parameters — it takes an optional `params` arg alongside `expression`, which
+    // a positional table fn cannot express; daxevaltable is a 'collector' (whole-table); daxeach is a streaming
+    // 'inout' (per-row).
+    private IEnumerable<FunctionsMetadata.Declaration> BespokeDeclarations()
+    {
+        yield return new FunctionsMetadata.Declaration(_modelName, DaxEvalName, "proc", 2);
+        yield return new FunctionsMetadata.Declaration(_modelName, DaxEvalTableName, "collector", 1);
+        yield return new FunctionsMetadata.Declaration(_modelName, DaxEachName, "inout", 1);
+        // The model schema is already known here, so nothing needs the __all__ sentinel — these declare
+        // themselves into the model's own schema, not into `system` (a DMV namespace).
+        foreach (var d in Functions.Declarations(() => new[] { _modelName }))
+        {
+            yield return d;
+        }
+    }
 
     private IArrowArrayStream DiscoverTables()
     {
@@ -329,6 +340,40 @@ internal sealed class DaxCatalog : IBackendCatalog
     /// never call <c>Read()</c> past end-of-data (ADOMD throws on it).
     /// </summary>
     private IArrowArrayStream ScanTableCore(string commandText) => StreamCommand(commandText, null);
+
+    /// <summary>
+    /// The Analysis Services DATABASE this catalog is bound to — what a TMSL command's <c>database</c> member
+    /// names. Note this is not always the model name: a workspace XMLA endpoint hosts many databases and the
+    /// model inside one can be named differently, so TMSL must use the database.
+    /// </summary>
+    internal string DatabaseName => string.IsNullOrEmpty(_catalog) ? _modelName : _catalog!;
+
+    /// <summary>
+    /// Runs a TMSL command (a JSON script) on a fresh connection. SYNCHRONOUS by nature — the XMLA endpoint does
+    /// not return until the operation completes, which is why the refresh functions need no polling.
+    /// </summary>
+    /// <remarks>
+    /// Cancellable through the same tier-3 mechanism as a scan: ADOMD has no async API, so a registration on the
+    /// calling operator's interrupt token trips <c>AdomdCommand.Cancel()</c> from a pool thread. That matters far
+    /// more here than for a scan — a full refresh can run for many minutes, and without this Ctrl+C would leave
+    /// the statement blocked until the engine finished.
+    /// </remarks>
+    internal void ExecuteTmsl(string tmsl, CancellationToken ct)
+    {
+        using var conn = OpenConnection();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = tmsl;
+        using var interrupt = new InterruptScope(AmbientOpener.Current);
+        using var reg = interrupt.Token.Register(static state =>
+        {
+            try { ((System.Data.IDbCommand)state!).Cancel(); } catch { /* cancellation must never fault */ }
+        }, cmd);
+        using var ctReg = ct.Register(static state =>
+        {
+            try { ((System.Data.IDbCommand)state!).Cancel(); } catch { }
+        }, cmd);
+        cmd.ExecuteNonQuery();
+    }
 
     /// <summary>Opens a fresh ADOMD connection bound to this catalog's model database.</summary>
     internal AdomdConnection OpenConnection()
@@ -533,6 +578,25 @@ internal sealed class DaxCatalog : IBackendCatalog
         }
     }
 
+    // ---- catalog-bound custom functions ---------------------------------------------------------------
+
+    /// <summary>
+    /// This catalog's C#-authored catalog-bound functions — currently the XMLA/TMSL refresh set. Built lazily
+    /// and per CATALOG (not static) because each function captures this catalog: the ADOMD connection and the
+    /// database it is bound to are what let <c>dax_refresh()</c> take no arguments at all.
+    /// </summary>
+    private CatalogFunctionSet Functions => _functions ??= new CatalogFunctionSet(tables: BuildTableFunctions());
+    private CatalogFunctionSet? _functions;
+
+    private List<ICatalogTableFunction> BuildTableFunctions()
+    {
+        var tables = new List<ICatalogTableFunction>();
+        // Declared in the MODEL schema explicitly rather than via the __all__ sentinel: the model name is
+        // already known here, and a refresh function has no business appearing in the `system` DMV namespace.
+        DaxRefreshFunctions.Register(tables, this, _modelName);
+        return tables;
+    }
+
     public Schema GetFunctionParamSchema(string schemaName, string functionName)
     {
         // daxeval takes `expression` (required) + an optional `params` JSON arg — both NAMED parameters
@@ -555,7 +619,8 @@ internal sealed class DaxCatalog : IBackendCatalog
         {
             return new Schema(new[] { new Field("expression", StringType.Default, nullable: false) }, null);
         }
-        throw new NotSupportedException($"dax provider: unknown function '{functionName}'");
+        return Functions.ParamSchema(schemaName, functionName)
+               ?? throw NoFunction(schemaName, functionName);
     }
 
     public Schema GetFunctionOutputSchema(string schemaName, string functionName, RecordBatch? args = null)
@@ -565,7 +630,8 @@ internal sealed class DaxCatalog : IBackendCatalog
             // arg-dependent: the DAX result's columns (resolved with any params bound).
             return ProbeSchema(DaxEvalExpression(args), DaxParams(args));
         }
-        throw new NotSupportedException($"dax provider: unknown function '{functionName}'");
+        return Functions.OutputSchema(schemaName, functionName, args)
+               ?? throw NoFunction(schemaName, functionName);
     }
 
     public IBoundTable TableBind(string schemaName, string functionName, RecordBatch? args)
@@ -574,14 +640,23 @@ internal sealed class DaxCatalog : IBackendCatalog
         {
             return new DaxEvalBoundTable(this, DaxEvalExpression(args), DaxParams(args));
         }
-        throw new NotSupportedException($"dax provider: unknown table function '{functionName}'");
+        return Functions.TableBind(schemaName, functionName, args)
+               ?? throw NoFunction(schemaName, functionName);
     }
 
     public Schema GetFunctionReturnSchema(string schemaName, string functionName)
-        => throw new NotSupportedException("dax provider: no scalar functions.");
+        => Functions.ReturnSchema(schemaName, functionName) ?? throw NoScalar();
 
     public IArrowArrayStream ExecuteScalar(string schemaName, string functionName, IArrowArrayStream args)
-        => throw new NotSupportedException("dax provider: no scalar functions.");
+        => Functions.ExecuteScalar(schemaName, functionName, args) ?? throw NoScalar();
+
+    private static NotSupportedException NoScalar() =>
+        new("dax provider: no scalar functions.");
+
+    // Names the function, because a miss here means the host registered a declaration this catalog cannot
+    // serve — the declaration list and the registry disagree, which is a bug in OUR wiring, not user error.
+    private static NotSupportedException NoFunction(string schema, string func) =>
+        new($"dax provider: no catalog function '{schema}.{func}'.");
 
     public IArrowInOutBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema)
     {
@@ -598,7 +673,8 @@ internal sealed class DaxCatalog : IBackendCatalog
         {
             return new DaxEachBinding(this, DaxEvalExpression(args), inputSchema);
         }
-        throw new NotSupportedException($"dax provider: unknown table-in-out function '{functionName}'");
+        return Functions.InOutBind(schemaName, functionName, args, inputSchema)
+               ?? throw NoFunction(schemaName, functionName);
     }
 
     /// <summary>A bound <c>daxeval(expression)</c> call: the output schema is resolved once (at bind, via a
@@ -632,7 +708,8 @@ internal sealed class DaxCatalog : IBackendCatalog
     }
 
     public IAggregateSession AggOpen(string schemaName, string functionName)
-        => throw new NotSupportedException("dax provider: no aggregate functions.");
+        => Functions.AggOpen(schemaName, functionName)
+           ?? throw new NotSupportedException("dax provider: no aggregate functions.");
 
     // ---- write paths: read-only provider --------------------------------------------------------------
 

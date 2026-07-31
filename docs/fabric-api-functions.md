@@ -197,7 +197,7 @@ everything deliberately SKIPPED and why — is **§10**, so the curation cannot 
 | **P0 ✅** | `fabric_drop_shortcut` | scalar → BOOLEAN | `DELETE …/shortcuts/{path}/{name}` | idempotent via `if_exists`; bare call 404s (verified) | |
 | **P0 ✅** | `fabric_list_shortcuts` | table | `GET …/items/{id}/shortcuts` (paged) | flattened + `target_json` (the D4 showcase); optional parent-path filter via `_ex` |
 | **P0 ✅** | `fabric_run_notebook`/`_ex` | table, blocking | `POST …/items/{id}/jobs/RunNotebook/instances` + instance polling | **user-elevated (2026-07-30)**: parameterized notebook runs from dbt hooks, returning final status **+ `exit_value`** (`mssparkutils.notebook.exit`) for conditional orchestration. SP execution already proven live on this tenant by `scratchpad/fabricnb`. See §5 |
-| P1↑ (partly ✅) | `fabric_items(item_type := 'Notebook')` / `fabric_notebook_definition` / **`fabric_notebook_parameters` BUILT** | table | `GET …/items?type=Notebook`; `POST …/notebooks/{id}/getDefinition` (LRO) | **notebook inspection, user-elevated above the rest of P1**: list; raw definition parts (ipynb/fabricGitSource, base64); and a convenience that parses the `parameters`-tagged cell into (name, default) rows — heuristic by nature (regex over `name = literal` lines), flagged as such |
+| P1↑ ✅ | `fabric_items(item_type := 'Notebook')` / **`fabric_notebook_parameters`** — both BUILT; `fabric_notebook_definition` **DROPPED**, see below | table | `GET …/items?type=Notebook`; `POST …/notebooks/{id}/getDefinition` (LRO) | **notebook inspection, user-elevated above the rest of P1**: list, plus a convenience that parses the `parameters`-tagged cell into (name, default) rows — heuristic by nature (regex over `name = literal` lines), flagged as such |
 | P1 | `fabric_run_job` | table, blocking by default | `POST …/items/{id}/jobs/{jobType}/instances` + instance polling | the generic engine `fabric_run_notebook` is built on (any jobType, e.g. `Pipeline`); `execution_data_json` passthrough; `wait_seconds` 0 = fire-and-return |
 | P1 | `fabric_job_status` / `fabric_job_instances` / `fabric_cancel_job` | table / table / scalar | `GET` instance / `GET` list / `POST cancel` | status enum: NotStarted/InProgress/Completed/Failed/Cancelled/Deduped; `fabric_job_instances(item)` is run-history inspection |
 | P1 | `fabric_table_maintenance` | table, blocking | `POST …/lakehouses/{id}/jobs/tableMaintenance/instances` (preview) | **V-Order** optimize + zOrderBy + vacuum + purge DVs — the recluster our own OPTIMIZE cannot do (V-Order is proprietary); complementary, not competing |
@@ -378,16 +378,19 @@ Slices land independently, tests green per slice. Estimated shape, not a schedul
 - **T-SQL DDL interception** (`CREATE SHORTCUT …` parsed out of `fabricator_exec` and translated to
   API calls) — the user's explicit "later stage". Note Microsoft may ship real T-SQL for shortcuts
   eventually; interception should mirror whatever grammar they choose, not invent one.
-- **Semantic-model refresh** — carrier decision pending (Job Scheduler vs Power BI enhanced refresh
-  API (different host + audience) vs XMLA/TMSL through the existing DAX provider, which needs no new
-  API surface at all).
+- ~~**Semantic-model refresh** — carrier decision pending~~ **RESOLVED, and BOTH carriers are built**:
+  Power BI REST enhanced refresh as `fabric_refresh_semantic_model` (§9f) and XMLA/TMSL as
+  `dax_refresh`/`_table`/`_partition` in the DAX provider (§9g). The Job Scheduler was never a
+  candidate once measured — the Fabric SDK cannot refresh a model at all.
 - **SqlServer-catalog binding** of these functions (Fabric Warehouse attaches) — needs a
-  `TokenCredential` path the mssql secret doesn't currently produce.
-- **deltars provider** hosting; **per-function plugin packaging**; everything marked skip/P3 in the
+  `TokenCredential` path the mssql secret doesn't currently produce. **This is now the largest
+  remaining gap in reach**: the whole set is catalog-bound on a OneLake Delta attach, so a dbt project
+  running against a Fabric *Warehouse* over T-SQL cannot call even `fabric_refresh_sql_endpoint`. It is
+  credential plumbing, not new API surface.
+- **deltars provider** hosting; **per-function plugin packaging**; everything marked skip in the
   §10 sweep (each with its recorded reason — don't re-litigate without new demand).
-- **Shared function-dispatch extraction** — the ~120-line `TryGetValue` dispatch block is now
-  hand-copied in SqlServer/DAX (and would be a third copy in Delta); worth extracting to the Bridge
-  when slice 2 touches it, but not a goal in itself.
+- ~~**Shared function-dispatch extraction**~~ **DONE (§9g)** — `CatalogFunctionSet` covers all six
+  catalog-bound kinds and SqlServer/DAX/Delta all dispatch through it.
 
 ## 9. Risks / verify-at-spike checklist
 
@@ -834,6 +837,149 @@ API does not express at all. The natural split is **REST for "refresh this model
 (`fabric_*`), XMLA/TMSL for "refresh exactly these partitions in this order" (`dax_*`)** — and the second one
 belongs in the DAX provider's namespace, not this one.
 
+## 9g. P3 — the promotion + platform surfaces, and the XMLA half (BUILT 2026-07-31)
+
+With P0–P2 shipped, the remaining §10 verdicts were either **P3 demand-driven** or **skip**. The P3 set was
+asked for and is now built; every **skip** stands, with its recorded reason. **Validation status is mixed and
+stated per function below** — the Fabric reads are wired and reviewed but NOT live-validated in this pass (the
+tenant has no git-connected workspace, no deployment pipeline and no mirrored database to exercise them
+against), and the XMLA functions sit behind a MANUAL gate by construction.
+
+### The SDK surface, measured first
+
+`dotnet run p3` in `scratchpad/fabricspike` dumps every public method of the relevant clients plus the model
+shapes, with a positive and a negative control (`FabricClient` present / `NoSuchClient` absent) so a filter typo
+cannot masquerade as "the API does not have this". Findings that shaped the functions:
+
+- **Git lives on `Core.Git`** and every call is an LRO the SDK BLOCKS on (`timeoutInMinutes`, default 60) —
+  `GetStatus`, `GetConnection`, `CommitToGit`, `UpdateFromGit`. So there is no submit-and-poll shape here and no
+  request id; a commit is simply a long statement.
+- **`WorkspaceConflictResolution(ConflictResolutionType, ConflictResolutionPolicy)`** — the type has exactly ONE
+  member (`Workspace`) and the policy two (`PreferRemote`, `PreferWorkspace`). Worth probing rather than
+  guessing: these are Azure *extensible enums*, so a wrong string compiles and reaches the service.
+- **`ListDataAccessRoles` returns `Response<DataAccessRoles>`, not a `PageableResponse`** — it carries its own
+  `ContinuationToken`, so it is the one read here that does not go through `WrapList`.
+- **Mirroring splits across two clients**: `MirroredDatabase.Items` (list/get) and `MirroredDatabase.Mirroring`
+  (`GetMirroringStatus`, `GetTablesMirroringStatus`, `StartMirroring`, `StopMirroring`).
+- **`TableMirroringMetrics.LastSyncDateTime` and `GitSyncDetails.LastSyncTime` are NON-nullable
+  `DateTimeOffset` on a NULLABLE parent** — so the null test must be on the parent. Written the other way it
+  would silently report the .NET epoch as a sync time.
+
+### What was built
+
+| function | kind | status |
+|---|---|---|
+| `fabric_git_status([workspace :=])` | table | wired; one row with NULL change columns when the workspace is clean, so "in sync" ≠ "not connected" |
+| `fabric_git_connection([workspace :=])` | table (1 row) | wired |
+| `fabric_git_commit([mode :=] [, comment :=] [, items_json :=] [, workspace_head :=] [, wait_seconds :=])` | table (1 row) | wired; `mode := 'Selective'` REQUIRES `items_json` and says so |
+| `fabric_git_update(remote_commit_hash [, conflict_resolution :=] [, allow_override :=] [, workspace_head :=])` | table (1 row) | wired; the hash is positional and required — see below |
+| `fabric_deployment_pipelines()` | table | wired |
+| `fabric_deployment_pipeline_stages(pipeline)` | table | wired |
+| `fabric_deployment_pipeline_items(pipeline, stage)` | table | wired |
+| `fabric_deploy(pipeline, source_stage, target_stage [, note :=] [, wait_seconds :=])` | table (1 row) | wired; whole-stage deploy only |
+| `fabric_deployment_pipeline_operations(pipeline)` | table | wired; same columns as `fabric_deploy`, so a submit and a history row read identically |
+| `fabric_capacities()` | table | wired |
+| `fabric_environments([workspace :=])` | table | wired — the name→id helper §10 anticipated for `fabric_run_notebook`'s `config_json` |
+| `fabric_data_access_roles([item :=] [, workspace :=])` | table | wired, READ only |
+| `fabric_mirrored_databases([workspace :=])` | table | wired |
+| `fabric_mirroring_status(database)` | table (1 row) | wired |
+| `fabric_mirrored_tables(database)` | table | wired |
+
+Design points worth keeping:
+
+- **`fabric_git_update`'s commit hash is REQUIRED and positional**, deliberately. "Update to whatever is on the
+  branch now" is how a promotion flow silently deploys an unreviewed commit; making the caller read the hash
+  from `fabric_git_status()` in the same script keeps the decision explicit. `workspace_head` is the API's
+  OPTIMISTIC CONCURRENCY token on both commit and update — supply it and a racing commit fails the statement
+  instead of overwriting.
+- **`wait_seconds` is the vocabulary everywhere, but these APIs only accept MINUTES.** The value is rounded UP
+  and floored at 1, because 0 would mean "give up immediately" rather than "do not wait" — a distinction these
+  endpoints cannot express at all, unlike the job APIs where `wait_seconds := 0` genuinely submits and returns.
+- **Stage resolution accepts a GUID, a display name, or an ORDER number**, tried in that sequence — so a stage
+  literally named "1" resolves to itself rather than to order 1. Positional reference ("promote 0 to 1") is how
+  people talk about stages, but name has to win or the naming is a trap.
+- **What is deliberately still out**, per area: git `Connect`/`Disconnect` and the credential calls (rule 1 —
+  they carry a PAT); pipeline/stage CRUD, role assignments and workspace-to-stage assignment; capacity ASSIGN
+  (the list only ever existed to feed it); environment PUBLISH (meaningless without the library-definition
+  writes rule 2 excludes); data-access-role WRITE (folder security policy from a SQL string); and
+  `StartMirroring`/`StopMirroring` — reconfiguring someone else's ingestion is not a transformation's business,
+  whereas *reading* whether it has caught up is exactly a data-path concern. Reading and advancing an existing
+  configuration is in; establishing or re-pointing one is not.
+- **`fabric_notebook_definition` is DROPPED, not deferred.** §4 listed it, and only
+  `fabric_notebook_parameters` was ever built (it reads the definition internally). Exposing the raw parts is
+  the base64-payload-in-SQL shape exclusion rule 2 exists to prevent, the call is a ~20 s LRO, and the parsed
+  parameter list is the part anyone actually wanted. Recorded here so the §4 row stops reading like unfinished
+  work.
+
+### The XMLA/TMSL half — `dax_*`, in the DAX provider (§9f's other side)
+
+§9f concluded the split: **REST for "refresh this model, tell me when it is done" (`fabric_*`), XMLA/TMSL for
+"refresh exactly these partitions in this order" (`dax_*`)**. The second half now exists, on a DAX attach:
+
+| function | notes |
+|---|---|
+| `dax_refresh([type :=] [, objects_json :=] [, max_parallelism :=])` | whole model, or exactly the tables/partitions in `objects_json` |
+| `dax_refresh_table(table [, type :=])` | the single-table convenience |
+| `dax_refresh_partition(table, partition [, type :=])` | **the operation REST cannot express at all** — the reason this exists |
+
+- **They are SYNCHRONOUS**, which is the sharpest practical difference from the REST path: the XMLA command
+  does not return until the refresh finishes, so there is no request id, no polling, and no "in-progress"
+  status to misread (contrast Power BI reporting in-progress as `status = "Unknown"`, §9f trap 2). A long
+  refresh is a long statement, cancellable through the same tier-3 `InterruptScope` mechanism as a DAX scan —
+  which matters more here than for a scan, since a full refresh runs for minutes.
+- **TMSL's type vocabulary is camelCase and NOT the REST one** (`full`/`clearValues`/`dataOnly`, vs REST's
+  `Full`/`ClearValues`/`DataOnly`). Both spellings are accepted case-insensitively — someone who copied a type
+  from `fabric_refresh_semantic_model` should not be punished — and an unknown value is REJECTED locally,
+  because the engine's own answer for a bad type is a generic XMLA parse failure.
+- **`maxParallelism` requires wrapping the refresh in a TMSL `sequence`**; there is no flat form.
+- **The command is built with `Utf8JsonWriter`, not string concatenation**, so a table or partition name
+  containing a quote cannot alter its structure. Names arrive straight from a SQL literal — same reason the SQL
+  side parameterizes.
+- **`refresh` is the ONLY TMSL verb exposed, on purpose.** The identical `ExecuteNonQuery` path would run
+  `createOrReplace` or `delete` just as happily, which would turn a documented read-only provider into an
+  arbitrary model-mutation surface reachable from any SQL string. There is deliberately **no generic
+  `dax_tmsl(command)` escape hatch**. Refresh moves DATA, which is what a post-Delta-write flow needs; model
+  authoring stays with the tools that own it.
+- **Enabling change:** `DaxCatalog` now hosts a `CatalogFunctionSet` (see below), so these are ordinary
+  catalog-bound table functions declared in the MODEL schema — not in `system`, which is a DMV namespace. The
+  three bespoke functions (`daxeval` / `daxevaltable` / `daxeach`) keep their hand-written declarations and are
+  still dispatched by name ahead of the set, since their kinds are `proc` / `collector` / `inout`.
+- **Validation: NOT live-validated.** `verify_dax` is a MANUAL gate needing Power BI Desktop or a live XMLA
+  endpoint, so the automated tiers cover none of this. What WAS verified offline: the provider still resolves
+  and reaches ADOMD's connection attempt (a bogus endpoint returns `AdomdConnectionException`, proving the
+  catalog constructs and the assembly loads after the rewiring), and the whole hermetic tier stayed green.
+
+### Housekeeping: ONE catalog-function registry, for all six kinds
+
+§8's last deferred item — "the ~120-line `TryGetValue` dispatch block is now hand-copied in SqlServer/DAX (and
+would be a third copy in Delta)" — is closed. `CatalogFunctionSet` was extended from two kinds to **all six**
+(scalar, table, `table_sql`, `inout`, `collector`, `aggregate`) and now owns the lookup, the ABI members and
+the declaration rows; SqlServer's six static dictionaries and DAX's hand-rolled dispatch are gone.
+
+- **The KIND STRINGS are the real prize.** The host's registration switch silently ignores a kind it does not
+  recognize, so a typo there does not fail — it makes a function quietly not exist. They are now written once,
+  and the `aggregate` vs `aggregate_spill` decision is made in one place.
+- **`FunctionsMetadata.Declaration` gained `ParamCount` + `ReturnType`.** They are not among the three columns
+  the host reads; they exist because the SQL-Server catalog assembles the same declarations as a T-SQL
+  `UNION ALL` against its discovered routines, whose shape is five columns wide, so every branch must supply
+  all five. Carrying them lets ONE producer feed both the in-memory stream and that SQL.
+- **The `__all__` sentinel is rejected LOUDLY on SqlServer** (`NoSchemaExpansion` throws, naming the reason):
+  its declarations name real schemas and its discovery stream is built as T-SQL with no catalog instance in
+  scope, so there is nothing to expand against. An empty list would have silently dropped such a function.
+- **What did NOT move into the set**: SqlServer's fallback to a DISCOVERED routine when a name is not a custom
+  function, and the in-out isolation wiring (the level is provider state). Both are genuinely
+  provider-specific, and each ABI member returns null for an unknown name precisely so a provider WITH
+  discovered routines can fall through while Delta and DAX can throw.
+- **`FabricRowBuilder`** replaced the per-function parallel-builder plumbing, which was becoming the place a
+  column-index slip could hide now that most reads mix strings with counts and timestamps. It is strict about
+  type on purpose: writing a string into a timestamp column throws rather than producing a column of NULLs that
+  looks like "the service returned nothing". `fab_delta_info` was moved onto it deliberately — it is the only
+  function on this path with a HERMETIC gate, so a regression in the shared builder now fails the offline tier
+  instead of surfacing only on a live tenant call.
+- **Gate: all ELEVEN service suites covering the six kinds green** (custom_functions 89, scalar_functions 26,
+  table_functions 33, stored_procs 24, custom_aggregates 58, table_inout 63, proc_inout 31, collector 40,
+  sqlgen_catalog 30, functions 13, inout_isolation 17), plus the hermetic tier at 62 suites / 5573 assertions.
+
 ## 10. The full API sweep — every area, with a verdict
 
 The complete Fabric REST surface (Core services + workload APIs), each with implement/defer/skip and
@@ -853,17 +999,17 @@ wrong; (3) **tenant-admin APIs are out entirely** — different consent model, d
 | area | operations (condensed) | verdict |
 |---|---|---|
 | Workspaces | list/get; create/update/delete; role assignments; assign to capacity | **P2 list/get** (`fabric_workspaces`). CRUD + roles + capacity assign: **skip** (rules 1+2 — IaC/portal territory) |
-| Capacities | list | **P3** — only feeds the capacity-assign flow we skip |
+| Capacities | list | **P3 ✅ BUILT** (`fabric_capacities`) — also answers "is this workspace on a Fabric capacity", which decides whether an enhanced semantic-model refresh is permitted at all. Capacity ASSIGN: **skip** |
 | Items (generic) | list/get; CRUD; get/updateDefinition; item connections | **P2 list/get** (`fabric_items`). Definition GET: **P1 for notebooks only** (§4). Generic CRUD/updateDefinition: **skip** (rule 2; `scratchpad/fabricnb` proves updateDefinition works SP-driven if ever needed) |
 | Job Scheduler | run on demand / cancel / get instance / list instances | **P0/P1** (§4/§5) |
 | Job Scheduler — item schedules | CRUD of cron/daily schedules | **skip for now** — in a dbt flow, dbt IS the scheduler; revisit only on demand |
 | Long Running Operations | get state / get result | **P2** (`fabric_operation_status`) — the generic peek for `wait_seconds => 0` flows |
 | OneLake Shortcuts | create / get / list / delete / reset cache | **P0/P1** (§4/§5) |
-| OneLake Data Access Security | list / create-or-update roles | read: **P3**. write: **skip** (rule 1 — folder-security policy from SQL) |
+| OneLake Data Access Security | list / create-or-update roles | read: **P3 ✅ BUILT** (`fabric_data_access_roles`) — role scoping is a common cause of "the table is there but I see no rows", and this is the only way to see one from SQL. Rule constraints are summarized as counts, not projected (§9g). write: **skip** (rule 1 — folder-security policy from SQL) |
 | External Data Shares | create / list / revoke | **skip** — cross-tenant sharing is an admin/governance act, not a data-flow step |
 | Connections | list / get; CRUD; supported types | **P2 LIST** (`fabric_connections` — the `connectionId` feeder for external shortcut targets). CRUD: **skip** (rule 1 — connection credentials) |
-| Deployment Pipelines | list / stages / deploy | **P3 demand-driven** (rule 2) |
-| Git | status / commit / update-from-git / connect | **P3 demand-driven** (rule 2) — `fabric_git_status`/`fabric_git_update` would serve promotion flows if users ask |
+| Deployment Pipelines | list / stages / deploy | **P3 ✅ BUILT** — `fabric_deployment_pipelines` / `_stages` / `_items` / `fabric_deploy` / `_operations`. Whole-stage deploy only; pipeline/stage CRUD + role assignment + workspace-to-stage assignment stay **skip** (§9g) |
+| Git | status / commit / update-from-git / connect | **P3 ✅ BUILT** — `fabric_git_status` / `_connection` / `_commit` / `_update`. `Connect`/`Disconnect` and the credential calls stay **skip** (rule 1 — they carry a PAT). Reading and advancing an existing connection is in; establishing one is not (§9g) |
 | Gateways | list / CRUD / members | **skip** — network infra admin |
 | Folders | CRUD | **skip** — workspace sub-folders, a portal-UI organization feature (items carry a `folderId`); invisible to OneLake paths, ATTACH and discovery. If ever wanted: a `folder_id` column on `fabric_items`, not a function |
 | Tags | list; apply/unapply on items | **skip** — centrally-defined governance labels for portal filtering/reporting (NOT Purview sensitivity labels); applying governance metadata from SQL is rule 1 territory |
@@ -883,8 +1029,8 @@ wrong; (3) **tenant-admin APIs are out entirely** — different consent model, d
 | Notebook | list; getDefinition; CRUD/updateDefinition | **P1 inspection** (list/definition/parameters, §4). Authoring: **skip** (rule 2) |
 | Warehouse | list/get; create/delete | **P2 list/get** (`fabric_warehouses` — connection string feeds a T-SQL ATTACH). CRUD: **skip** |
 | Data Pipeline | CRUD (execution rides Job Scheduler) | run: **P1** via `fabric_run_job`. CRUD: **skip** (rule 2) |
-| Semantic Model | list; CRUD/definition; refresh | refresh: **deferred decision** (§8 — Job Scheduler vs PBI enhanced refresh vs XMLA through our DAX provider). list: **P3** (the DAX provider already enumerates). CRUD: **skip** |
-| Environment | list/get; publish | **P3 helper** — name→id resolution for `fabric_run_notebook`'s `config_json.environment`; likely resolved inline rather than exposed |
+| Semantic Model | list; CRUD/definition; refresh | refresh: **✅ BUILT BOTH WAYS** — REST enhanced refresh as `fabric_refresh_semantic_model` (§9f) and TMSL/XMLA as `dax_refresh` / `_table` / `_partition` (§9g). list: **✅ BUILT** (`fabric_semantic_models`). CRUD: **skip** |
+| Environment | list/get; publish | **P3 ✅ BUILT** (`fabric_environments`) — exposed rather than resolved inline, because `publish_state` is itself worth reading: a notebook run against an environment still publishing does not get its libraries. PUBLISH: **skip** (meaningless without the library-definition writes rule 2 excludes) |
 | Spark (pools, workspace settings) | — | **skip** — compute infra admin |
-| Mirrored Database | CRUD, start/stop mirroring, status | **skip, but WATCH** — SQL-facing; revisit if mirrored sources enter our flows (e.g. `fabric_mirroring_status` before reading a mirrored table) |
+| Mirrored Database | CRUD, start/stop mirroring, status | **READS ✅ BUILT** (the WATCH fired) — `fabric_mirrored_databases` / `fabric_mirroring_status` / `fabric_mirrored_tables`; `last_sync_time`+latency let a model assert its source is caught up before reading it, and `onelake_tables_path` is a path a Delta ATTACH can point straight at. CRUD + start/stop: **skip** — reconfiguring someone else's ingestion is not a transformation's business |
 | Report, Dashboard, Dataflow, Eventstream, Eventhouse, KQL Database/Queryset, ML Model/Experiment, GraphQL API, SQL Database, Mounted Data Factory | — | **skip** — not in the DuckDB data path; nothing a SQL function adds over the portal/their own tooling |

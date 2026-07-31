@@ -271,6 +271,42 @@ the model table**. So the DMVs hand us everything to route a DAX model's table s
 have (SQL provider + the azure-SP token path). Direct Delta writes are a Lakehouse-only specialization, and
 automatic model/DDL sync is the speculative, high-blast-radius 20% — document it, don't build it yet.
 
+## XMLA/TMSL REFRESH — BUILT (2026-07-31), and the one TMSL verb we expose
+
+`dax_refresh([type :=] [, objects_json :=] [, max_parallelism :=])`, `dax_refresh_table(table [, type :=])` and
+`dax_refresh_partition(table, partition [, type :=])` — catalog-bound table functions on the MODEL schema of a
+DAX attach (`DaxRefreshFunctions.cs`). Full as-built record, including the SDK measurements behind it:
+[fabric-api-functions.md](fabric-api-functions.md) §9g.
+
+Why it lives here rather than on the Fabric REST side: the Power BI enhanced-refresh API answers "refresh this
+model, tell me when it is done" and **cannot address a partition at all**. TMSL over XMLA can, and this provider
+already holds an ADOMD connection on exactly the right token — so the split is REST = `fabric_*`,
+XMLA = `dax_*`, and `dax_refresh_partition` is the operation that only exists on this side.
+
+Four things a future editor needs to know:
+
+- **Synchronous.** The XMLA command does not return until the refresh completes — no request id, no polling,
+  no "in-progress" status to misread. It is cancellable through the same tier-3 `InterruptScope` mechanism as a
+  scan, which matters more here: a full refresh runs for minutes, and without it Ctrl+C would leave the
+  statement blocked until the engine finished.
+- **TMSL's type vocabulary is camelCase and is NOT the REST one** (`full`/`clearValues`/`dataOnly` vs
+  `Full`/`ClearValues`/`DataOnly`). Both are accepted case-insensitively; an unknown value is rejected locally,
+  because the engine's own answer for a bad type is a generic XMLA parse failure.
+- **`refresh` is the ONLY verb exposed, and deliberately so.** The identical `AdomdCommand.ExecuteNonQuery`
+  path would run `createOrReplace` or `delete` just as happily. Refresh moves DATA; exposing a generic
+  `dax_tmsl(command)` would turn a documented read-only provider into an arbitrary model-mutation surface
+  reachable from any SQL string — which is precisely the escape hatch the DEFERRED design below keeps
+  proposing, and the reason it stays deferred rather than being quietly smuggled in with refresh.
+- **NOT live-validated.** `verify_dax` is a manual gate (Power BI Desktop or a live XMLA endpoint). What was
+  verified offline: the provider still resolves and reaches ADOMD (a bogus endpoint gives
+  `AdomdConnectionException`, proving the catalog constructs after the `CatalogFunctionSet` rewiring) and the
+  hermetic tier stayed green. Treat the refresh path as reviewed-but-unexercised until someone runs it.
+
+Enabling change in the same pass: `DaxCatalog` now hosts a **`CatalogFunctionSet`**, so it can carry
+C#-authored catalog-bound functions of any of the six kinds instead of only its three hand-dispatched ones
+(`daxeval` / `daxevaltable` / `daxeach`, which keep their bespoke declarations and are still matched by name
+first). That is what any future `dax_*` function should plug into.
+
 ### TMDL model management — retrieve / apply a model definition (design idea, DEFERRED)
 
 The "sync the semantic model" piece above, fleshed out. The goal: read a model's **TMDL** (Tabular Model

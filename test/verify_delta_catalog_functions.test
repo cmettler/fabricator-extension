@@ -87,7 +87,9 @@ SELECT * FROM fab_delta_info();
 #
 # They are registered only for a OneLake root (DeltaCatalog.BuildFunctionSet). This root is local, so none of
 # them may appear — and the count form is deliberate: it fails loudly if ANY fabric_* function leaks in, whereas
-# probing one name by hand would miss the others.
+# probing one name by hand would miss the others. That generality is now doing real work: the set has grown to
+# ~40 functions across shortcuts, jobs, semantic models, git, deployment pipelines and platform reads, and this
+# one assertion guards every one of them against being registered where it cannot possibly work.
 
 query I
 SELECT count(*) FROM duckdb_functions()

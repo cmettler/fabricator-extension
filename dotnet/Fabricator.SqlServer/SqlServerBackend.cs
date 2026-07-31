@@ -360,47 +360,25 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // Provider-authored custom scalar functions, keyed "schema.name" (case-insensitive). Surfaced into
     // the catalog like discovered functions (see GetMetadata) but dispatched to C# (see ExecuteScalar /
     // GetFunctionParamSchema / GetFunctionReturnSchema) instead of generating SQL.
-    private static readonly IReadOnlyDictionary<string, ICatalogScalarFunction> CustomScalar =
-        CustomFunctions.Scalar.ToDictionary(f => $"{f.SchemaName}.{f.Name}", StringComparer.OrdinalIgnoreCase);
+    //
+    // ALL SIX catalog-bound kinds live in ONE CatalogFunctionSet (Fabricator.Bridge), which owns the lookup, the
+    // declaration rows and the kind strings. This used to be six hand-maintained dictionaries here plus a
+    // parallel copy of the same dispatch in every other provider; the set is the shared half, and what stays
+    // below it is only the part that IS SqlServer-specific — falling back to a DISCOVERED routine when a name is
+    // not a custom function. Kinds: scalar, table, table_sql, inout, collector, aggregate(_spill).
+    private static readonly CatalogFunctionSet CustomFunctionSet = new(
+        CustomFunctions.Scalar, CustomFunctions.Table, CustomFunctions.SqlTable, CustomFunctions.InOut,
+        CustomFunctions.Collector, CustomFunctions.Aggregate);
 
-    // Provider-authored custom table functions, keyed "schema.name" (case-insensitive). Surfaced like
-    // discovered TVFs but dispatched to C# (see TableBind / GetFunctionParamSchema / GetFunctionOutputSchema).
-    private static readonly IReadOnlyDictionary<string, ICatalogTableFunction> CustomTable =
-        CustomFunctions.Table.ToDictionary(f => $"{f.SchemaName}.{f.Name}", StringComparer.OrdinalIgnoreCase);
-
-    // Provider-authored SQL-GENERATING table functions (ICatalogSqlTableFunction), keyed "schema.name"
-    // (case-insensitive). Surfaced as `kind='table_sql'` (see FunctionsMetadataSql) so the C++ catalog
-    // registers a bind_replace-only table function: the call `db.schema.fn(args)` is REPLACED at bind time by
-    // the SQL this generator builds (GenerateTableSql, handed the catalog's ATTACH alias), so the referenced
-    // scans keep their own pushdown and NO data crosses the bridge at execution. Use for SQL whose TEXT
-    // depends on the args (dynamic object names, UNION fan-out, bind-time metadata lookups).
-    private static readonly IReadOnlyDictionary<string, ICatalogSqlTableFunction> CustomSqlTable =
-        CustomFunctions.SqlTable.ToDictionary(f => $"{f.SchemaName}.{f.Name}", StringComparer.OrdinalIgnoreCase);
-
-    // Provider-authored custom table-in-out functions (ICatalogInOutFunction), keyed "schema.name"
-    // (case-insensitive). Surfaced as `kind='inout'` (see FunctionsMetadataSql) so the C++ catalog registers
-    // them as a {TABLE}-param table function under the bare name, resolved by InOutBind on the streaming
-    // exchange (Bind(args, inputSchema) -> the per-call binding). The output is the binding's full declared
-    // schema (no input echo, unlike a discovered TVF's `_each`). Authors implement ICatalogInOutFunction (or its
-    // fixed-schema convenience base StaticInOutFunction) and write DoExchange.
-    private static readonly IReadOnlyDictionary<string, ICatalogInOutFunction> CustomInOut =
-        CustomFunctions.InOut.ToDictionary(f => $"{f.SchemaName}.{f.Name}", StringComparer.OrdinalIgnoreCase);
-
-    // Provider-authored custom COLLECTOR table-in-out functions (ICatalogCollectorTableFunction), keyed
-    // "schema.name" (case-insensitive). Surfaced as `kind='collector'` (see FunctionsMetadataSql) so the C++
-    // catalog registers them as a {TABLE}-param table function routed to the Sink+Source pipeline-breaker
-    // operator (NOT the streaming exchange). Resolved by InOutBind (which wraps the IArrowCollectorBinding in a
-    // CollectorInOutBinding so it flows through the shared inout_bind/inout_exchange_open marshaling). A
-    // collector sees ALL input before emitting (whole-table semantics) — no single-chunk cap.
-    private static readonly IReadOnlyDictionary<string, ICatalogCollectorTableFunction> CustomCollector =
-        CustomFunctions.Collector.ToDictionary(f => $"{f.SchemaName}.{f.Name}", StringComparer.OrdinalIgnoreCase);
-
-    // Provider-authored custom aggregate functions (UDAF), keyed "schema.name" (case-insensitive). Surfaced
-    // as `kind='aggregate'` (see FunctionsMetadataSql) so the C++ catalog registers them as an
-    // AggregateFunctionCatalogEntry; dispatched to C# (see AggOpen / GetFunctionParamSchema /
-    // GetFunctionReturnSchema). The function object is a singleton (CreateState() mints the per-group state).
-    private static readonly IReadOnlyDictionary<string, ICatalogAggregateFunction> CustomAgg =
-        CustomFunctions.Aggregate.ToDictionary(f => $"{f.SchemaName}.{f.Name}", StringComparer.OrdinalIgnoreCase);
+    // The set expands a CatalogFunctionSet.AllSchemas ("__all__") declaration across a catalog's discovered
+    // schemas. This provider's declarations name real schemas (dbo, …) and its discovery stream is built as
+    // T-SQL with no catalog instance in scope, so there is nothing to expand against — say so loudly rather
+    // than silently dropping such a function, which is the failure mode an empty list would produce.
+    private static IReadOnlyList<string> NoSchemaExpansion() =>
+        throw new NotSupportedException(
+            "fabricator: a SQL Server catalog function must declare a concrete SchemaName; the "
+            + "CatalogFunctionSet.AllSchemas sentinel is only supported by providers whose schemas are "
+            + "discovered at attach (Delta, DAX).");
 
     private readonly string _baseConnectionString;   // user connstr (no MARS); basis for the finalized string
     private readonly string? _accessToken;
@@ -1625,8 +1603,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // UNION ALL so the C++ catalog discovers + registers them uniformly (then dispatches custom ones to C#).
     private static string FunctionsMetadataSql()
     {
-        if (CustomScalar.Count == 0 && CustomTable.Count == 0 && CustomInOut.Count == 0 && CustomAgg.Count == 0 &&
-            CustomCollector.Count == 0 && CustomSqlTable.Count == 0)
+        if (CustomFunctionSet.IsEmpty)
         {
             return FunctionsSql;
         }
@@ -1635,43 +1612,14 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         // discovery callers sort themselves, so dropping the ordering here is harmless).
         int orderIdx = FunctionsSql.LastIndexOf(" ORDER BY ", StringComparison.Ordinal);
         var sb = new StringBuilder(orderIdx >= 0 ? FunctionsSql[..orderIdx] : FunctionsSql);
-        foreach (var f in CustomScalar.Values)
+        // One literal row per declaration, in the discovered stream's five-column shape
+        // (schema_name, name, kind, param_count, return_type). The host reads the first three; the last two
+        // exist because every UNION ALL branch must match the discovery query's arity.
+        foreach (var d in CustomFunctionSet.Declarations(NoSchemaExpansion))
         {
-            sb.Append(" UNION ALL SELECT '").Append(Esc(f.SchemaName)).Append("', '").Append(Esc(f.Name))
-              .Append("', 'scalar', ").Append(f.Parameters.FieldsList.Count).Append(", '")
-              .Append(Esc(f.Result.DataType.Name)).Append('\'');
-        }
-        foreach (var f in CustomTable.Values)
-        {
-            sb.Append(" UNION ALL SELECT '").Append(Esc(f.SchemaName)).Append("', '").Append(Esc(f.Name))
-              .Append("', 'table', ").Append(f.Parameters.FieldsList.Count).Append(", ''");
-        }
-        foreach (var f in CustomSqlTable.Values)
-        {
-            // param_count = positional + named (the host splits them by the per-field fabricator.named tag on
-            // the param schema); no return type — the generated SQL's plan decides the output columns.
-            sb.Append(" UNION ALL SELECT '").Append(Esc(f.SchemaName)).Append("', '").Append(Esc(f.Name))
-              .Append("', 'table_sql', ")
-              .Append(f.Parameters.FieldsList.Count + f.NamedParameters.FieldsList.Count).Append(", ''");
-        }
-        foreach (var f in CustomInOut.Values)
-        {
-            sb.Append(" UNION ALL SELECT '").Append(Esc(f.SchemaName)).Append("', '").Append(Esc(f.Name))
-              .Append("', 'inout', ").Append(f.InputSchema.FieldsList.Count).Append(", ''");
-        }
-        foreach (var f in CustomCollector.Values)
-        {
-            sb.Append(" UNION ALL SELECT '").Append(Esc(f.SchemaName)).Append("', '").Append(Esc(f.Name))
-              .Append("', 'collector', ").Append(f.InputSchema.FieldsList.Count).Append(", ''");
-        }
-        foreach (var f in CustomAgg.Values)
-        {
-            // 'aggregate' (fast in-memory id-based) vs 'aggregate_spill' (state serialized into DuckDB's blob
-            // so external GROUP BY can spill it) — the C++ side picks the callback set from this kind.
-            sb.Append(" UNION ALL SELECT '").Append(Esc(f.SchemaName)).Append("', '").Append(Esc(f.Name))
-              .Append(f.SupportsSpill ? "', 'aggregate_spill', " : "', 'aggregate', ")
-              .Append(f.Parameters.FieldsList.Count).Append(", '")
-              .Append(Esc(f.Result.DataType.Name)).Append('\'');
+            sb.Append(" UNION ALL SELECT '").Append(Esc(d.SchemaName)).Append("', '").Append(Esc(d.Name))
+              .Append("', '").Append(Esc(d.Kind)).Append("', ").Append(d.ParamCount).Append(", '")
+              .Append(Esc(d.ReturnType)).Append('\'');
         }
         return sb.ToString();
     }
@@ -2406,25 +2354,13 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     public Schema GetFunctionParamSchema(string schemaName, string functionName)
     {
-        var key = $"{schemaName}.{functionName}";
-        if (CustomScalar.TryGetValue(key, out var customScalar))
+        // A custom function of any kind answers from the set (which tags a table/sqlgen function's NAMED
+        // parameters, so an optional argument can be written `fn(x, flag := true)`); otherwise it is a
+        // discovered routine and its parameters come from INFORMATION_SCHEMA.
+        var custom = CustomFunctionSet.ParamSchema(schemaName, functionName);
+        if (custom is not null)
         {
-            return customScalar.Parameters;
-        }
-        if (CustomTable.TryGetValue(key, out var customTable))
-        {
-            // Positional ++ NAMED (tagged), so an optional argument can be written `fn(x, flag := true)`.
-            return SqlGen.ParamSchema(customTable.Parameters, customTable.NamedParameters);
-        }
-        if (CustomAgg.TryGetValue(key, out var customAgg))
-        {
-            return customAgg.Parameters;
-        }
-        if (CustomSqlTable.TryGetValue(key, out var customSqlTable))
-        {
-            // Positional ++ named (the latter tagged fabricator.named="1") in ONE schema — the host splits
-            // them when it registers the signature. See SqlGen.ParamSchema.
-            return SqlGen.ParamSchema(customSqlTable.Parameters, customSqlTable.NamedParameters);
+            return custom;
         }
         using var s = RoutineParamSchemaQuery(schemaName, functionName);
         return s.Schema;
@@ -2438,12 +2374,10 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     /// </summary>
     public string GenerateTableSql(string schemaName, string functionName, string catalogName, RecordBatch? args)
     {
-        if (!CustomSqlTable.TryGetValue($"{schemaName}.{functionName}", out var fn))
-        {
-            throw new NotSupportedException(
-                $"fabricator: no SQL-generating table function '{schemaName}.{functionName}'");
-        }
-        return SqlGen.Generate(fn, new SqlGenContext(catalogName, this), args);
+        return CustomFunctionSet.GenerateTableSql(schemaName, functionName,
+                                                  new SqlGenContext(catalogName, this), args)
+               ?? throw new NotSupportedException(
+                   $"fabricator: no SQL-generating table function '{schemaName}.{functionName}'");
     }
 
     // Zero-row Arrow stream of a routine's input parameters (typed-NULL SELECT reconstructed from
@@ -2472,15 +2406,12 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     public Schema GetFunctionReturnSchema(string schemaName, string functionName)
     {
-        if (CustomScalar.TryGetValue($"{schemaName}.{functionName}", out var custom))
+        // A pure custom scalar's field carries the CONSISTENT tag (constant folding) — see
+        // ScalarFunctionMetadata; discovered SQL UDFs below never tag (remote bodies stay VOLATILE).
+        var custom = CustomFunctionSet.ReturnSchema(schemaName, functionName);
+        if (custom is not null)
         {
-            // A pure custom scalar's field carries the CONSISTENT tag (constant folding) — see
-            // ScalarFunctionMetadata; discovered SQL UDFs below never tag (remote bodies stay VOLATILE).
-            return new Schema(new[] { ScalarFunctionMetadata.TagVolatility(custom.Result, custom) }, null);
-        }
-        if (CustomAgg.TryGetValue($"{schemaName}.{functionName}", out var customAgg))
-        {
-            return new Schema(new[] { customAgg.Result }, null);
+            return custom;
         }
         using var s = RoutineReturnSchemaQuery(schemaName, functionName);
         return s.Schema;
@@ -2503,7 +2434,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // dispatch for ExecuteScalar (created on demand — the wrapper just holds the catalog + name). Returns the
     // base IScalarFunction — execution needs only Invoke/Parameters/Result, not the catalog SchemaName.
     private IScalarFunction ResolveScalar(string schemaName, string functionName) =>
-        CustomScalar.TryGetValue($"{schemaName}.{functionName}", out var custom)
+        CustomFunctionSet.TryScalar(schemaName, functionName, out var custom)
             ? custom
             : new SqlServerScalarFunction(this, schemaName, functionName);
 
@@ -2638,13 +2569,13 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     public Schema GetFunctionOutputSchema(string schemaName, string functionName, RecordBatch? args = null)
     {
-        if (CustomTable.TryGetValue($"{schemaName}.{functionName}", out var customTable))
+        // A custom table function's output schema may depend on the constant args (bound per call, then the
+        // binding is discarded). `args` is null only for the in-out `_each` base-schema probe, which does not
+        // apply to a pure-C# table function; a static function ignores it.
+        var custom = CustomFunctionSet.OutputSchema(schemaName, functionName, args);
+        if (custom is not null)
         {
-            // The output schema may depend on the constant args (bound per call). `args` is null only for the
-            // in-out `_each` base-schema probe (which doesn't apply to a pure-C# table function); a static
-            // function ignores it.
-            using var binding = customTable.Bind(args!);
-            return binding.OutputSchema;
+            return custom;
         }
         // Custom in-out functions resolve their output schema through InOutBind (the exchange path), not here.
         // A discovered TVF (its result columns are in ROUTINE_COLUMNS) resolves its full output schema via
@@ -2668,9 +2599,10 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         // supportsPushdown = !is_proc (preserves the prior push_projection): a custom function maps its full
         // result by NAME (true); a discovered TVF pushes the projection into SQL (true); a stored proc is
         // projected positionally above the scan (false).
-        if (CustomTable.TryGetValue($"{schemaName}.{functionName}", out var custom))
+        var custom = CustomFunctionSet.TableBind(schemaName, functionName, args);
+        if (custom is not null)
         {
-            return new BindingBoundTable(custom.Bind(args!), supportsPushdown: true);
+            return custom;
         }
         if (FunctionOutputColumns(schemaName, functionName).Count > 0)
         {
@@ -2686,27 +2618,14 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // TVF has result columns in ROUTINE_COLUMNS, a proc doesn't.
     public IArrowInOutBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema)
     {
-        IArrowInOutBinding binding;
-        if (CustomCollector.TryGetValue($"{schemaName}.{functionName}", out var collector))
-        {
-            // A custom collector (pipeline breaker): wrap its IArrowCollectorBinding as an IArrowInOutBinding so
-            // it flows through the shared exchange marshaling. The C++ side registered it on the Sink+Source
-            // collector operator (kind='collector'), which feeds a NON-gated buffered input stream — so Collect
-            // reading all input before yielding (no sentinels) is safe.
-            binding = new CollectorInOutBinding(collector.Bind(args, inputSchema));
-        }
-        else if (CustomInOut.TryGetValue($"{schemaName}.{functionName}", out var custom))
-        {
-            binding = custom.Bind(args, inputSchema);
-        }
-        else if (FunctionOutputColumns(schemaName, functionName).Count > 0)
-        {
-            binding = new SqlServerTvfEach(this, schemaName, functionName, inputSchema);
-        }
-        else
-        {
-            binding = new SqlServerProcEach(this, schemaName, functionName, inputSchema);
-        }
+        // A custom COLLECTOR (pipeline breaker) is tried before a streaming in-out inside the set: the host
+        // registered it on the Sink+Source collector operator (kind='collector'), which feeds a NON-gated
+        // buffered input stream, so its Collect reading all input before yielding (no sentinels) is safe.
+        // Not a custom function ⇒ a discovered `_each`, classified as everywhere else.
+        var binding = CustomFunctionSet.InOutBind(schemaName, functionName, args, inputSchema)
+                      ?? (FunctionOutputColumns(schemaName, functionName).Count > 0
+                          ? new SqlServerTvfEach(this, schemaName, functionName, inputSchema)
+                          : (IArrowInOutBinding)new SqlServerProcEach(this, schemaName, functionName, inputSchema));
         // Resolve the SQL isolation for this in-out call and set it on the binding (if it honors isolation):
         // a SET mssql_isolation_level (pushed to the provider settings store) overrides this catalog's ATTACH
         // isolation_level default; pure-C# / proc bindings ignore it. Replaces the former C++
@@ -2721,15 +2640,12 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     // 4h custom aggregate (UDAF): open a session mapping DuckDB's per-group int64 state ids to live C#
     // accumulators (IAggregateFunction). Only provider-authored aggregates exist (SQL Server has no
-    // DuckDB-aggregate to discover), so this requires a registered CustomAgg entry.
-    public IAggregateSession AggOpen(string schemaName, string functionName)
-    {
-        if (CustomAgg.TryGetValue($"{schemaName}.{functionName}", out var fn))
-        {
-            return new AggregateSession(fn); // the session impl lives in Fabricator.Bridge (shared with globals)
-        }
-        throw new ArgumentException($"fabricator: '{schemaName}.{functionName}' is not a custom aggregate function");
-    }
+    // DuckDB-aggregate to discover), so this requires a registered aggregate in the custom function set.
+    public IAggregateSession AggOpen(string schemaName, string functionName) =>
+        // The session impl lives in Fabricator.Bridge (shared with connection-free global aggregates).
+        CustomFunctionSet.AggOpen(schemaName, functionName)
+        ?? throw new ArgumentException(
+            $"fabricator: '{schemaName}.{functionName}' is not a custom aggregate function");
 
     // (AggregateSession — the id->accumulator UDAF session — now lives in Fabricator.Bridge, shared by
     // catalog-bound aggregates (AggOpen above) and connection-free global aggregates.)

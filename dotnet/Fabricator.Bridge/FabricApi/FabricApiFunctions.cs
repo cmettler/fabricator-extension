@@ -48,6 +48,11 @@ internal static class FabricApiFunctions
         // Read-only introspection: the identifiers the write functions above need (a connection GUID for an
         // external shortcut target, an endpoint connection string for a T-SQL ATTACH, a workspace/item name).
         FabricInspectFunctions.Register(tables, api);
+        // P3: the promotion surfaces (git + deployment pipelines) and the remaining platform reads. Both were
+        // filed "demand-driven" in §10 and are here because they were asked for; their WRITE halves that carry
+        // credentials or item definitions stay excluded. See each file's remarks.
+        FabricPromotionFunctions.Register(tables, api);
+        FabricPlatformFunctions.Register(tables, api);
     }
 
     internal enum ShortcutMode
@@ -90,6 +95,14 @@ internal static class FabricApiFunctions
 
     // UTC microsecond timestamps: what DuckDB's TIMESTAMP maps to, so no lossy conversion at the boundary.
     internal static Field Ts(string name) => new(name, new TimestampType(Apache.Arrow.Types.TimeUnit.Microsecond, "UTC"), nullable: true);
+
+    /// <summary>A BIGINT column (byte/row counts, durations).</summary>
+    internal static Field Int64(string name) => new(name, Int64Type.Default, nullable: true);
+
+    /// <summary>An INTEGER column — used where the service itself models the value as 32-bit (a stage order).</summary>
+    internal static Field Int32(string name) => new(name, Int32Type.Default, nullable: true);
+
+    internal static Field Bool(string name) => new(name, BooleanType.Default, nullable: true);
 }
 
 /// <summary>
@@ -129,6 +142,16 @@ internal abstract class FabricTableBinding : IArrowTableFunctionBinding
         if (rows > 0)
         {
             yield return new RecordBatch(schema, columns, rows);
+        }
+    }
+
+    /// <summary>Yields <paramref name="batch"/> when it has rows; a null batch (no rows) yields nothing.</summary>
+    protected static async IAsyncEnumerable<RecordBatch> One(RecordBatch? batch)
+    {
+        await System.Threading.Tasks.Task.CompletedTask;
+        if (batch is not null)
+        {
+            yield return batch;
         }
     }
 }

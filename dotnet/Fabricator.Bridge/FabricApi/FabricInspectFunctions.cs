@@ -53,11 +53,11 @@ internal abstract class FabricRowsFunction : ICatalogTableFunction
     protected abstract Schema Columns { get; }
 
     /// <summary>
-    /// Appends rows to <paramref name="cols"/> (one builder per declared column). <paramref name="args"/> holds
-    /// every declared argument as a string, in declared order (<c>Parameters</c> ++ <c>NamedParameters</c>);
-    /// an omitted named argument is null.
+    /// Appends rows to <paramref name="row"/> (write each column by index, then <c>EndRow()</c>).
+    /// <paramref name="args"/> holds every declared argument as a string, in declared order
+    /// (<c>Parameters</c> ++ <c>NamedParameters</c>); an omitted named argument is null.
     /// </summary>
-    protected abstract int Fill(StringArray.Builder[] cols, string?[] args, CancellationToken ct);
+    protected abstract void Fill(FabricRowBuilder row, string?[] args, CancellationToken ct);
 
     /// <summary>
     /// Extracts the arguments HERE, while the batch is valid, rather than holding it.
@@ -92,18 +92,9 @@ internal abstract class FabricRowsFunction : ICatalogTableFunction
 
         protected override IAsyncEnumerable<RecordBatch> Rows(CancellationToken ct)
         {
-            var cols = new StringArray.Builder[_fn.Columns.FieldsList.Count];
-            for (int i = 0; i < cols.Length; i++)
-            {
-                cols[i] = new StringArray.Builder();
-            }
-            int n = _fn.Fill(cols, _args, ct);
-            var arrays = new IArrowArray[cols.Length];
-            for (int i = 0; i < cols.Length; i++)
-            {
-                arrays[i] = cols[i].Build();
-            }
-            return One(_fn.Columns, arrays, n);
+            var row = new FabricRowBuilder(_fn.Columns);
+            _fn.Fill(row, _args, ct);
+            return One(row.Build());
         }
     }
 }
@@ -126,19 +117,17 @@ internal sealed class FabricWorkspacesFunction : FabricRowsFunction
         FabricApiFunctions.Str("description"),
     }, null);
 
-    protected override int Fill(StringArray.Builder[] c, string?[] args, CancellationToken ct)
+    protected override void Fill(FabricRowBuilder row, string?[] args, CancellationToken ct)
     {
-        int n = 0;
         foreach (var w in FabricApiClient.WrapList("workspaces", () => Api.Client.Core.Workspaces.ListWorkspaces(cancellationToken: ct)))
         {
-            c[0].Append(w.Id.ToString());
-            c[1].Append(w.DisplayName);
-            c[2].Append(w.Type.ToString());
-            c[3].Append(w.CapacityId?.ToString());
-            c[4].Append(w.Description);
-            n++;
+            row.Str(0, w.Id.ToString());
+            row.Str(1, w.DisplayName);
+            row.Str(2, w.Type.ToString());
+            row.Str(3, w.CapacityId?.ToString());
+            row.Str(4, w.Description);
+            row.EndRow();
         }
-        return n;
     }
 }
 
@@ -169,20 +158,18 @@ internal sealed class FabricItemsFunction : FabricRowsFunction
         FabricApiFunctions.Str("description"),
     }, null);
 
-    protected override int Fill(StringArray.Builder[] c, string?[] args, CancellationToken ct)
+    protected override void Fill(FabricRowBuilder row, string?[] args, CancellationToken ct)
     {
         var ws = Api.ResolveWorkspace(args[1]);
-        int n = 0;
         foreach (var i in FabricApiClient.WrapList("items",
                      () => Api.Client.Core.Items.ListItems(ws, type: FabricShortcutPath.NullIfBlank(args[0]), cancellationToken: ct)))
         {
-            c[0].Append(i.Id?.ToString());
-            c[1].Append(i.DisplayName);
-            c[2].Append(i.Type.ToString());
-            c[3].Append(i.Description);
-            n++;
+            row.Str(0, i.Id?.ToString());
+            row.Str(1, i.DisplayName);
+            row.Str(2, i.Type.ToString());
+            row.Str(3, i.Description);
+            row.EndRow();
         }
-        return n;
     }
 }
 
@@ -213,27 +200,25 @@ internal sealed class FabricLakehousesFunction : FabricRowsFunction
         FabricApiFunctions.Str("sql_endpoint_connection_string"),
     }, null);
 
-    protected override int Fill(StringArray.Builder[] c, string?[] args, CancellationToken ct)
+    protected override void Fill(FabricRowBuilder row, string?[] args, CancellationToken ct)
     {
         var ws = Api.ResolveWorkspace(args[0]);
-        int n = 0;
         foreach (var lh in FabricApiClient.WrapList("lakehouses",
                      () => Api.Client.Lakehouse.Items.ListLakehouses(ws, cancellationToken: ct)))
         {
             var p = lh.Properties;
             var ep = p?.SqlEndpointProperties;
-            c[0].Append(lh.Id?.ToString());
-            c[1].Append(lh.DisplayName);
+            row.Str(0, lh.Id?.ToString());
+            row.Str(1, lh.DisplayName);
             // Present only on a schema-enabled lakehouse; NULL is the meaningful answer for a flat one.
-            c[2].Append(p?.DefaultSchema);
-            c[3].Append(p?.OneLakeTablesPath);
-            c[4].Append(p?.OneLakeFilesPath);
-            c[5].Append(ep?.Id);
-            c[6].Append(ep?.ProvisioningStatus.ToString());
-            c[7].Append(ep?.ConnectionString);
-            n++;
+            row.Str(2, p?.DefaultSchema);
+            row.Str(3, p?.OneLakeTablesPath);
+            row.Str(4, p?.OneLakeFilesPath);
+            row.Str(5, ep?.Id);
+            row.Str(6, ep?.ProvisioningStatus.ToString());
+            row.Str(7, ep?.ConnectionString);
+            row.EndRow();
         }
-        return n;
     }
 }
 
@@ -255,21 +240,19 @@ internal sealed class FabricWarehousesFunction : FabricRowsFunction
         FabricApiFunctions.Str("description"),
     }, null);
 
-    protected override int Fill(StringArray.Builder[] c, string?[] args, CancellationToken ct)
+    protected override void Fill(FabricRowBuilder row, string?[] args, CancellationToken ct)
     {
         var ws = Api.ResolveWorkspace(args[0]);
-        int n = 0;
         foreach (var wh in FabricApiClient.WrapList("warehouses",
                      () => Api.Client.Warehouse.Items.ListWarehouses(ws, cancellationToken: ct)))
         {
-            c[0].Append(wh.Id?.ToString());
-            c[1].Append(wh.DisplayName);
-            c[2].Append(wh.Properties?.ConnectionString);
-            c[3].Append(wh.Properties?.CollationType?.ToString());
-            c[4].Append(wh.Description);
-            n++;
+            row.Str(0, wh.Id?.ToString());
+            row.Str(1, wh.DisplayName);
+            row.Str(2, wh.Properties?.ConnectionString);
+            row.Str(3, wh.Properties?.CollationType?.ToString());
+            row.Str(4, wh.Description);
+            row.EndRow();
         }
-        return n;
     }
 }
 
@@ -299,22 +282,20 @@ internal sealed class FabricConnectionsFunction : FabricRowsFunction
         FabricApiFunctions.Str("credential_type"),
     }, null);
 
-    protected override int Fill(StringArray.Builder[] c, string?[] args, CancellationToken ct)
+    protected override void Fill(FabricRowBuilder row, string?[] args, CancellationToken ct)
     {
-        int n = 0;
         foreach (var conn in FabricApiClient.WrapList("connections",
                      () => Api.Client.Core.Connections.ListConnections(cancellationToken: ct)))
         {
             var d = conn.ConnectionDetails;
-            c[0].Append(conn.Id.ToString());
-            c[1].Append(conn.DisplayName);
-            c[2].Append(d?.Type);
-            c[3].Append(d?.Path);
-            c[4].Append(conn.PrivacyLevel?.ToString());
-            c[5].Append(conn.CredentialDetails?.CredentialType?.ToString());
-            n++;
+            row.Str(0, conn.Id.ToString());
+            row.Str(1, conn.DisplayName);
+            row.Str(2, d?.Type);
+            row.Str(3, d?.Path);
+            row.Str(4, conn.PrivacyLevel?.ToString());
+            row.Str(5, conn.CredentialDetails?.CredentialType?.ToString());
+            row.EndRow();
         }
-        return n;
     }
 }
 
@@ -352,7 +333,7 @@ internal sealed class FabricNotebookParametersFunction : FabricRowsFunction
         FabricApiFunctions.Str("inferred_type"),
     }, null);
 
-    protected override int Fill(StringArray.Builder[] c, string?[] args, CancellationToken ct)
+    protected override void Fill(FabricRowBuilder row, string?[] args, CancellationToken ct)
     {
         var arg = args[0];
         if (string.IsNullOrWhiteSpace(arg))
@@ -364,8 +345,6 @@ internal sealed class FabricNotebookParametersFunction : FabricRowsFunction
         var nb = Api.ResolveItem(arg, "Notebook", ws);
         var response = FabricApiClient.Wrap("notebook_definition",
             () => Api.Client.Notebook.Items.GetNotebookDefinition(ws, nb, format: "ipynb", cancellationToken: ct).Value);
-
-        int n = 0;
         // Note the type: the Notebook service has its OWN definition-part model, not Core's ItemDefinitionPart.
         var parts = response.Definition?.Parts
                     ?? (IList<Microsoft.Fabric.Api.Notebook.Models.NotebookDefinitionPart>)
@@ -390,14 +369,13 @@ internal sealed class FabricNotebookParametersFunction : FabricRowsFunction
                 }
                 foreach (var (name, value, type) in ParseAssignments(SourceOf(cell)))
                 {
-                    c[0].Append(name);
-                    c[1].Append(value);
-                    c[2].Append(type);
-                    n++;
+                    row.Str(0, name);
+                    row.Str(1, value);
+                    row.Str(2, type);
+                    row.EndRow();
                 }
             }
         }
-        return n;
     }
 
     private static bool IsParametersCell(JsonElement cell) =>

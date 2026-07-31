@@ -7,13 +7,19 @@ using Apache.Arrow.Ipc;
 namespace Fabricator.Bridge;
 
 /// <summary>
-/// A provider-agnostic holder + dispatcher for CATALOG-BOUND custom (C#-authored) functions.
+/// A provider-agnostic holder + dispatcher for CATALOG-BOUND custom (C#-authored) functions, across all six
+/// kinds the host can register: scalar, table, SQL-generating table, table-in-out, collector and aggregate.
 ///
-/// <para>Every backend that hosts catalog functions has to answer the same five ABI calls by looking a
-/// <c>"schema.name"</c> key up in a dictionary and delegating to Bridge helpers. The SQL-Server catalog does that
-/// inline, interleaved with its discovered-routine fallbacks (which are genuinely SqlServer-specific). A provider
-/// with NO discovered routines — Delta, DAX — needs only the lookup half, so it lives here instead of being
-/// hand-copied a third and fourth time.</para>
+/// <para>Every backend that hosts catalog functions has to answer the same ABI calls by looking a
+/// <c>"schema.name"</c> key up in a dictionary and delegating to Bridge helpers. The SQL-Server catalog used to
+/// do that inline in six separate dictionaries, interleaved with its discovered-routine fallbacks (which ARE
+/// genuinely SqlServer-specific and stay there); Delta and DAX need only the lookup half. So it lives here once,
+/// and the interleaving providers call into it rather than re-deriving it.</para>
+///
+/// <para><b>Why the KIND strings matter more than they look.</b> The host's registration switch silently ignores
+/// a kind it does not know (see <see cref="FunctionsMetadata"/>), so a typo there does not fail — it makes a
+/// function quietly not exist. Emitting every declaration from <see cref="Declarations"/> means those strings are
+/// written once, and the <c>aggregate</c> vs <c>aggregate_spill</c> choice is made in one place too.</para>
 ///
 /// <para><b>The <c>__all__</c> schema sentinel.</b> A Delta root's schema names are folder names, unknown until
 /// ATTACH, so a static declaration cannot name them (the same problem <see cref="CatalogMacroDefinition"/> has).
@@ -28,19 +34,65 @@ public sealed class CatalogFunctionSet
 
     private readonly Dictionary<string, ICatalogScalarFunction> _scalars;
     private readonly Dictionary<string, ICatalogTableFunction> _tables;
+    private readonly Dictionary<string, ICatalogSqlTableFunction> _sqlTables;
+    private readonly Dictionary<string, ICatalogInOutFunction> _inOut;
+    private readonly Dictionary<string, ICatalogCollectorTableFunction> _collectors;
+    private readonly Dictionary<string, ICatalogAggregateFunction> _aggregates;
 
     public CatalogFunctionSet(
         IEnumerable<ICatalogScalarFunction>? scalars = null,
-        IEnumerable<ICatalogTableFunction>? tables = null)
+        IEnumerable<ICatalogTableFunction>? tables = null,
+        IEnumerable<ICatalogSqlTableFunction>? sqlTables = null,
+        IEnumerable<ICatalogInOutFunction>? inOut = null,
+        IEnumerable<ICatalogCollectorTableFunction>? collectors = null,
+        IEnumerable<ICatalogAggregateFunction>? aggregates = null)
     {
-        _scalars = (scalars ?? Enumerable.Empty<ICatalogScalarFunction>())
-            .ToDictionary(f => Key(f.SchemaName, f.Name), StringComparer.OrdinalIgnoreCase);
-        _tables = (tables ?? Enumerable.Empty<ICatalogTableFunction>())
-            .ToDictionary(f => Key(f.SchemaName, f.Name), StringComparer.OrdinalIgnoreCase);
+        _scalars = Index(scalars);
+        _tables = Index(tables);
+        _sqlTables = Index(sqlTables);
+        _inOut = Index(inOut);
+        _collectors = Index(collectors);
+        _aggregates = Index(aggregates);
     }
 
+    // One indexer for all six: every catalog-bound interface carries SchemaName + Name, but they share no
+    // common base that declares both, so the key selectors are passed per kind by the callers below.
+    private static Dictionary<string, T> Index<T>(IEnumerable<T>? items) where T : class
+    {
+        var map = new Dictionary<string, T>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in items ?? Enumerable.Empty<T>())
+        {
+            map[Key(SchemaOf(item), NameOf(item))] = item;
+        }
+        return map;
+    }
+
+    private static string SchemaOf(object fn) => fn switch
+    {
+        ICatalogScalarFunction f => f.SchemaName,
+        ICatalogTableFunction f => f.SchemaName,
+        ICatalogSqlTableFunction f => f.SchemaName,
+        ICatalogInOutFunction f => f.SchemaName,
+        ICatalogCollectorTableFunction f => f.SchemaName,
+        ICatalogAggregateFunction f => f.SchemaName,
+        _ => throw new ArgumentException($"not a catalog-bound function: {fn.GetType().Name}"),
+    };
+
+    private static string NameOf(object fn) => fn switch
+    {
+        ICatalogScalarFunction f => f.Name,
+        ICatalogTableFunction f => f.Name,
+        ICatalogSqlTableFunction f => f.Name,
+        ICatalogInOutFunction f => f.Name,
+        ICatalogCollectorTableFunction f => f.Name,
+        ICatalogAggregateFunction f => f.Name,
+        _ => throw new ArgumentException($"not a catalog-bound function: {fn.GetType().Name}"),
+    };
+
     /// <summary>True when nothing is registered — lets a caller keep its old "no functions" behaviour cheaply.</summary>
-    public bool IsEmpty => _scalars.Count == 0 && _tables.Count == 0;
+    public bool IsEmpty =>
+        _scalars.Count == 0 && _tables.Count == 0 && _sqlTables.Count == 0 && _inOut.Count == 0
+        && _collectors.Count == 0 && _aggregates.Count == 0;
 
     private static string Key(string schema, string name) => $"{schema}.{name}";
 
@@ -57,21 +109,48 @@ public sealed class CatalogFunctionSet
         }
         var rows = new List<FunctionsMetadata.Declaration>();
         IReadOnlyList<string>? schemas = null;
-        void Emit(string declaredSchema, string name, string kind)
+        void Emit(string declaredSchema, string name, string kind, int paramCount, string returnType)
         {
             if (!string.Equals(declaredSchema, AllSchemas, StringComparison.Ordinal))
             {
-                rows.Add(new FunctionsMetadata.Declaration(declaredSchema, name, kind));
+                rows.Add(new FunctionsMetadata.Declaration(declaredSchema, name, kind, paramCount, returnType));
                 return;
             }
             schemas ??= schemaNames();
             foreach (var s in schemas)
             {
-                rows.Add(new FunctionsMetadata.Declaration(s, name, kind));
+                rows.Add(new FunctionsMetadata.Declaration(s, name, kind, paramCount, returnType));
             }
         }
-        foreach (var f in _scalars.Values) { Emit(f.SchemaName, f.Name, "scalar"); }
-        foreach (var f in _tables.Values) { Emit(f.SchemaName, f.Name, "table"); }
+        foreach (var f in _scalars.Values)
+        {
+            Emit(f.SchemaName, f.Name, "scalar", f.Parameters.FieldsList.Count, f.Result.DataType.Name);
+        }
+        foreach (var f in _tables.Values)
+        {
+            Emit(f.SchemaName, f.Name, "table", f.Parameters.FieldsList.Count, "");
+        }
+        foreach (var f in _sqlTables.Values)
+        {
+            // param_count = positional + named; the host splits them by the per-field fabricator.named tag.
+            Emit(f.SchemaName, f.Name, "table_sql",
+                 f.Parameters.FieldsList.Count + f.NamedParameters.FieldsList.Count, "");
+        }
+        foreach (var f in _inOut.Values)
+        {
+            Emit(f.SchemaName, f.Name, "inout", f.InputSchema.FieldsList.Count, "");
+        }
+        foreach (var f in _collectors.Values)
+        {
+            Emit(f.SchemaName, f.Name, "collector", f.InputSchema.FieldsList.Count, "");
+        }
+        foreach (var f in _aggregates.Values)
+        {
+            // 'aggregate' (fast in-memory id-based) vs 'aggregate_spill' (state serialized into DuckDB's blob
+            // so external GROUP BY can spill it) — the host picks the callback set from this kind.
+            Emit(f.SchemaName, f.Name, f.SupportsSpill ? "aggregate_spill" : "aggregate",
+                 f.Parameters.FieldsList.Count, f.Result.DataType.Name);
+        }
         return rows;
     }
 
@@ -84,23 +163,52 @@ public sealed class CatalogFunctionSet
     public bool TryTable(string schema, string func, out ICatalogTableFunction fn) =>
         TryGet(_tables, schema, func, out fn);
 
-    // ---- the five ABI members, as one-liners a hosting catalog can forward to -------------------------
+    public bool TrySqlTable(string schema, string func, out ICatalogSqlTableFunction fn) =>
+        TryGet(_sqlTables, schema, func, out fn);
 
-    /// <summary>Argument schema for either kind. Returns null when the name is not ours (caller decides).</summary>
+    public bool TryInOut(string schema, string func, out ICatalogInOutFunction fn) =>
+        TryGet(_inOut, schema, func, out fn);
+
+    public bool TryCollector(string schema, string func, out ICatalogCollectorTableFunction fn) =>
+        TryGet(_collectors, schema, func, out fn);
+
+    public bool TryAggregate(string schema, string func, out ICatalogAggregateFunction fn) =>
+        TryGet(_aggregates, schema, func, out fn);
+
+    // ---- the ABI members, as one-liners a hosting catalog can forward to ------------------------------
+    // Each returns null (or false) for a name this set does not hold, so a provider WITH discovered routines
+    // can fall through to them and a provider without can throw. The kind order matches what SqlServerBackend
+    // did inline, which only matters if one name were registered under two kinds — itself a bug.
+
+    /// <summary>Argument schema for any kind that has one. Returns null when the name is not ours.</summary>
     public Schema? ParamSchema(string schema, string func)
     {
         if (TryScalar(schema, func, out var s)) { return s.Parameters; }
         // Positional ++ named, with the named ones TAGGED so the host registers them as DuckDB named
         // parameters. Same channel and helper sqlgen functions use — there is only one tagging convention.
         if (TryTable(schema, func, out var t)) { return SqlGen.ParamSchema(t.Parameters, t.NamedParameters); }
+        if (TryAggregate(schema, func, out var a)) { return a.Parameters; }
+        if (TrySqlTable(schema, func, out var g)) { return SqlGen.ParamSchema(g.Parameters, g.NamedParameters); }
         return null;
     }
 
-    /// <summary>Scalar return field, carrying the volatility tag the host reads to allow constant folding.</summary>
-    public Schema? ReturnSchema(string schema, string func) =>
-        TryScalar(schema, func, out var fn)
-            ? new Schema(new[] { ScalarFunctionMetadata.TagVolatility(fn.Result, fn) }, null)
-            : null;
+    /// <summary>
+    /// Scalar return field, carrying the volatility tag the host reads to allow constant folding. An aggregate's
+    /// result is returned UNTAGGED — volatility is a scalar-only notion (a folded aggregate makes no sense), and
+    /// tagging it would advertise a property the host would then act on.
+    /// </summary>
+    public Schema? ReturnSchema(string schema, string func)
+    {
+        if (TryScalar(schema, func, out var fn))
+        {
+            return new Schema(new[] { ScalarFunctionMetadata.TagVolatility(fn.Result, fn) }, null);
+        }
+        if (TryAggregate(schema, func, out var agg))
+        {
+            return new Schema(new[] { agg.Result }, null);
+        }
+        return null;
+    }
 
     /// <summary>Runs a scalar over the argument stream. Consumes/disposes <paramref name="args"/>.</summary>
     public IArrowArrayStream? ExecuteScalar(string schema, string func, IArrowArrayStream args) =>
@@ -128,4 +236,34 @@ public sealed class CatalogFunctionSet
         TryTable(schema, func, out var fn)
             ? new BindingBoundTable(fn.Bind(args!), supportsPushdown: true)
             : null;
+
+    /// <summary>
+    /// The replacement SQL for a SQL-generating table function — the host parses it and substitutes it for the
+    /// call (bind_replace). BIND-time only and possibly repeated, so a generator must be deterministic and
+    /// side-effect-free. Null when the name is not ours.
+    /// </summary>
+    public string? GenerateTableSql(string schema, string func, SqlGenContext ctx, RecordBatch? args) =>
+        TrySqlTable(schema, func, out var fn) ? SqlGen.Generate(fn, ctx, args) : null;
+
+    /// <summary>
+    /// Binds an in-out call: a COLLECTOR first (it runs on the host's Sink+Source pipeline-breaker operator and
+    /// is wrapped so it flows through the shared exchange marshaling), else a streaming in-out. Null when the
+    /// name is not ours. A caller that honours isolation applies it to the returned binding itself — the level
+    /// is provider state, not something this set knows.
+    /// </summary>
+    public IArrowInOutBinding? InOutBind(string schema, string func, RecordBatch? args, Schema inputSchema)
+    {
+        if (TryCollector(schema, func, out var collector))
+        {
+            return new CollectorInOutBinding(collector.Bind(args, inputSchema));
+        }
+        return TryInOut(schema, func, out var fn) ? fn.Bind(args, inputSchema) : null;
+    }
+
+    /// <summary>
+    /// Opens an aggregate session mapping DuckDB's per-group int64 state ids to live C# accumulators. Null when
+    /// the name is not ours.
+    /// </summary>
+    public IAggregateSession? AggOpen(string schema, string func) =>
+        TryAggregate(schema, func, out var fn) ? new AggregateSession(fn) : null;
 }

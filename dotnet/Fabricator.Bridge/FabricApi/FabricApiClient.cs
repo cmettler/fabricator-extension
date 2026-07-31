@@ -153,6 +153,79 @@ internal sealed partial class FabricApiClient
         });
     }
 
+    /// <summary>Resolves a deployment pipeline by GUID or display name.</summary>
+    internal Guid ResolvePipeline(string? nameOrId, CancellationToken ct)
+    {
+        if (Blank(nameOrId))
+        {
+            throw new NotSupportedException(
+                "fabric: name the deployment pipeline (list them with fabric_deployment_pipelines()).");
+        }
+        if (Guid.TryParse(nameOrId, out var direct))
+        {
+            return direct;
+        }
+        return _idCache.GetOrAdd("pipeline:" + nameOrId, _ =>
+        {
+            foreach (var p in Client.Core.DeploymentPipelines.ListDeploymentPipelines(cancellationToken: ct))
+            {
+                if (string.Equals(p.DisplayName?.Trim(), nameOrId, StringComparison.OrdinalIgnoreCase))
+                {
+                    return p.Id;
+                }
+            }
+            throw new NotSupportedException($"fabric: deployment pipeline '{nameOrId}' not found.");
+        });
+    }
+
+    internal List<Microsoft.Fabric.Api.Core.Models.DeploymentPipelineStage> ListStages(
+        Guid pipelineId, CancellationToken ct) =>
+        WrapList("deployment_stages",
+                 () => Client.Core.DeploymentPipelines.ListDeploymentPipelineStages(
+                     pipelineId, cancellationToken: ct));
+
+    /// <summary>
+    /// Resolves a stage within a pipeline by GUID, display name, or ORDER number (0-based, as the API reports it).
+    /// </summary>
+    /// <remarks>
+    /// Order is accepted because stages are conventionally referred to positionally ("promote 0 to 1"), but NAME
+    /// is tried first — so a stage literally called "1" resolves to itself rather than to order 1. Worth knowing
+    /// if someone names stages numerically.
+    /// </remarks>
+    internal Guid ResolveStage(Guid pipelineId, string? nameOrIdOrOrder, CancellationToken ct)
+    {
+        if (Blank(nameOrIdOrOrder))
+        {
+            throw new NotSupportedException(
+                "fabric: name the stage (list them with fabric_deployment_pipeline_stages(<pipeline>)).");
+        }
+        if (Guid.TryParse(nameOrIdOrOrder, out var direct))
+        {
+            return direct;
+        }
+        var stages = ListStages(pipelineId, ct);
+        foreach (var s in stages)
+        {
+            if (string.Equals(s.DisplayName?.Trim(), nameOrIdOrOrder, StringComparison.OrdinalIgnoreCase))
+            {
+                return s.Id;
+            }
+        }
+        if (int.TryParse(nameOrIdOrOrder, out var order))
+        {
+            foreach (var s in stages)
+            {
+                if (s.Order == order)
+                {
+                    return s.Id;
+                }
+            }
+        }
+        throw new NotSupportedException(
+            $"fabric: stage '{nameOrIdOrOrder}' not found in pipeline {pipelineId} "
+            + $"(it has {stages.Count} stage(s)).");
+    }
+
     /// <summary>
     /// Runs <paramref name="body"/>, converting an Azure <see cref="RequestFailedException"/> into a message that
     /// leads with Fabric's own error code — the same reading experience as the provider-error-number prefixing the

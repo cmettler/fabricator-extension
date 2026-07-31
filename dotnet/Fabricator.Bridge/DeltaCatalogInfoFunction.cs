@@ -62,11 +62,17 @@ internal sealed class DeltaCatalogInfoFunction : ICatalogTableFunction
 
         public override Schema OutputSchema => Columns;
 
+        /// <remarks>
+        /// Built through <see cref="FabricRowBuilder"/> deliberately, even though two string columns need none of
+        /// its typing: this function is the only one on this path with a HERMETIC gate
+        /// (test/verify_delta_catalog_functions.test), and the builder is what every Fabric REST read now
+        /// produces its rows with. Routing this through it means a regression in the shared builder — including
+        /// the empty-result case, which §6 of that suite exercises — fails the offline tier instead of only
+        /// surfacing on a live tenant call.
+        /// </remarks>
         protected override IAsyncEnumerable<RecordBatch> Rows(CancellationToken ct)
         {
-            var props = new StringArray.Builder();
-            var values = new StringArray.Builder();
-            int n = 0;
+            var row = new FabricRowBuilder(Columns);
             foreach (var kv in _facts)
             {
                 if (_property is not null
@@ -74,11 +80,9 @@ internal sealed class DeltaCatalogInfoFunction : ICatalogTableFunction
                 {
                     continue;
                 }
-                props.Append(kv.Key);
-                values.Append(kv.Value);
-                n++;
+                row.Str(0, kv.Key).Str(1, kv.Value).EndRow();
             }
-            return One(Columns, new IArrowArray[] { props.Build(), values.Build() }, n);
+            return One(row.Build());
         }
     }
 }

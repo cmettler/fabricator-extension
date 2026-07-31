@@ -416,6 +416,47 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
       misleading value. (3) The request id arrives ONLY in the `x-ms-request-id` header (the 202 has no body;
       a `Location` tail is the fallback). Also: Power BI nests errors under `error.{code,message}` where Fabric
       uses flat `errorCode`/`message`, hence a separate `PowerBiReadAsync` beside `Describe`.
+  - **P3 + THE XMLA HALF + the dispatch extraction — BUILT 2026-07-31 (§9g), and this CLOSED every §8
+    deferral except one.** The remaining §10 verdicts were P3-demand-driven or skip; the P3 set is now built and
+    every **skip** stands with its reason. **Fabric P3 (15 functions, WIRED + reviewed but NOT live-validated —
+    the tenant has no git-connected workspace, no deployment pipeline and no mirrored DB to exercise):**
+    `fabric_git_status`/`_connection`/`_commit`/`_update`; `fabric_deployment_pipelines`/`_stages`/`_items`/
+    `fabric_deploy`/`_operations`; `fabric_capacities`; `fabric_environments`; `fabric_data_access_roles`;
+    `fabric_mirrored_databases`/`fabric_mirroring_status`/`fabric_mirrored_tables`.
+    **XMLA/TMSL (`dax_*`, the other side of the §9f split, on a DAX attach):** `dax_refresh` /
+    `dax_refresh_table` / `dax_refresh_partition` — the LAST is the operation REST cannot express at all.
+    - **Standing rules this pass produced.** (1) **`wait_seconds` is our vocabulary but git/deploy accept only
+      MINUTES** — rounded UP, floored at 1, because 0 there means "give up immediately", NOT "don't wait" (the
+      job APIs' `wait_seconds := 0` genuinely submits-and-returns; these cannot). (2) **A non-nullable
+      `DateTimeOffset` on a NULLABLE parent** (`GitSyncDetails.LastSyncTime`,
+      `TableMirroringMetrics.LastSyncDateTime`) must be null-tested on the PARENT — written the other way it
+      reports the .NET epoch as a sync time. (3) **`ListDataAccessRoles` returns `Response<T>` with its own
+      continuation token, NOT a `PageableResponse`** — the one read here that must not go through `WrapList`.
+      (4) `fabric_git_update`'s commit hash is **required and positional** on purpose: "update to whatever is on
+      the branch now" is how a promotion flow silently deploys an unreviewed commit. (5) Stage resolution takes
+      GUID → NAME → ORDER, in that order, so a stage literally named "1" wins over order 1.
+    - **XMLA specifics:** SYNCHRONOUS (no request id, no polling — the opposite of the REST path, and it means
+      no "Unknown"-status trap), TMSL types are **camelCase and NOT the REST vocabulary** (both accepted,
+      unknown rejected locally), `maxParallelism` needs a TMSL `sequence` wrapper, the command is built with
+      `Utf8JsonWriter` so a quoted table name cannot alter its structure, and **`refresh` is the ONLY verb
+      exposed** — no generic `dax_tmsl(command)`, since the same `ExecuteNonQuery` path would run
+      `createOrReplace`/`delete` and turn a read-only provider into arbitrary model mutation.
+    - **`fabric_notebook_definition` is DROPPED, not pending** (§4 had listed it): raw base64 parts in SQL is
+      the shape rule 2 exists to prevent, the call is a ~20 s LRO, and `fabric_notebook_parameters` is the part
+      anyone wanted.
+    - **HOUSEKEEPING DONE: ONE registry for all six catalog-bound kinds.** `CatalogFunctionSet` grew from
+      2 kinds to 6 (scalar/table/`table_sql`/`inout`/`collector`/`aggregate`) and owns the lookup, the ABI
+      members AND the declaration rows; **SqlServer's six static dictionaries and DAX's hand-rolled dispatch are
+      gone**. The prize is the KIND STRINGS: the host silently ignores an unknown kind, so a typo there makes a
+      function quietly not exist — now written once, `aggregate` vs `aggregate_spill` decided in one place.
+      `FunctionsMetadata.Declaration` gained `ParamCount`/`ReturnType` (not host-read columns — the SqlServer
+      catalog builds the same declarations as a five-column T-SQL `UNION ALL`, so one producer feeds both). The
+      `__all__` sentinel now throws LOUDLY on SqlServer rather than silently dropping such a function. What
+      stayed provider-specific: the fallback to a DISCOVERED routine, and the in-out isolation wiring. New
+      `FabricRowBuilder` replaced the per-function parallel-builder plumbing (strict about type: a string into a
+      timestamp column throws rather than yielding NULLs that look like "the service returned nothing");
+      `fab_delta_info` was moved onto it deliberately, because it is the only function on that path with a
+      HERMETIC gate. Gate: all **11** service suites over the six kinds green + hermetic 62/5573.
   - Output shape rule (D4): typed flat columns + one raw-JSON column for polymorphic parts; **no STRUCT
     wrapping** (adding a column is additive for `SELECT *`; adding a struct FIELD changes a column's type
     and breaks bound views), no JSON-only. Every `table`-kind function also gets a dead `_each` sibling —
@@ -615,7 +656,9 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   HWM — safer than Spark). verify identity(delta) 38. Full as-built record (moved verbatim from here): [docs/feature-history.md](docs/feature-history.md).
 - **DAX / ADOMD 2nd provider — DONE slices 1–6** (PBI Desktop + workspace XMLA + Fabric SP/ambient auth;
   scan pushdown + streaming to 10.5M rows; `system` DMV schema; `daxeval`/`daxevaltable`(collector)/
-  `daxeach`; the read-past-EOF ADOMD gotcha). Read-only. [docs/dax-provider.md](docs/dax-provider.md);
+  `daxeach`; the read-past-EOF ADOMD gotcha). Read-only **for DATA** — since 2026-07-31 it also hosts a
+  `CatalogFunctionSet` and the TMSL refresh trio (`dax_refresh`/`_table`/`_partition`), which move data
+  INTO a model; model AUTHORING stays out (no `dax_tmsl`). [docs/dax-provider.md](docs/dax-provider.md);
   verify_dax 29 (manual — needs PBI Desktop). Full as-built record (moved verbatim from here): [docs/feature-history.md](docs/feature-history.md).
 - **Multi-edition support (Fabric WH / Synapse / box) — DONE slices 1–6** (`ServerProfile`, MARS gating +
   connection mode, profile-driven type mapping, collation-gated ORDER BY pushdown, JSON/UUID/tz

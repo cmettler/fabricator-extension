@@ -84,7 +84,10 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | | **Parameterized notebook runs** (blocking, with status + portal snapshot link) | ✅ OneLake attaches |
 | | **Jobs**: table maintenance (V-Order/Z-order/vacuum), generic runner, status, history, cancel | ✅ OneLake attaches |
 | | **Semantic models**: list, enhanced refresh, refresh history (Power BI REST, same credential) | ✅ OneLake attaches |
-| | Notebook `exitValue`; per-partition refresh via XMLA/TMSL | ⏳ best-effort / DAX provider |
+| | **Git**: status, connection, commit, update-from-git; **deployment pipelines**: list, stages, items, deploy, history | ✅ OneLake attaches |
+| | Platform reads: capacities, Spark environments, OneLake data-access roles, mirrored-database status | ✅ OneLake attaches |
+| | **Per-table / per-partition semantic-model refresh** via XMLA/TMSL → `dax_refresh*` | ✅ DAX attaches |
+| | Notebook `exitValue` | ⏳ best-effort (always NULL in practice) |
 | **Callable** | Discovered scalar UDFs → `db.schema.fn(args)` (vectorized over Arrow) | ✅ |
 | | Discovered table-valued functions → `SELECT * FROM db.schema.tvf(args)` (+ projection/filter pushdown) | ✅ |
 | | Discovered stored procedures → `SELECT * FROM db.schema.proc(name := val)` (named/optional + OUTPUT params) | ✅ |
@@ -708,6 +711,19 @@ SELECT * FROM lake.dbo.fabric_refresh_sql_endpoint(item := 'OtherLH'); -- a diff
 | `fabric_semantic_models()` | table | The workspace's semantic models, incl. each lakehouse's and warehouse's default |
 | `fabric_refresh_semantic_model(model [, type := …] [, objects_json := …] [, commit_mode := …] [, timeout := …])` | table | **Refreshes a semantic model** (enhanced refresh) and blocks until it settles |
 | `fabric_semantic_model_refreshes(model [, top := …])` | table | That model's refresh history |
+| `fabric_git_status()` | table | Uncommitted/unpulled changes vs the connected branch, plus both heads. A clean workspace still returns one row (change columns NULL) |
+| `fabric_git_connection()` | table | Which repository/branch/directory the workspace is connected to, and its last sync |
+| `fabric_git_commit([mode := 'All'] [, comment := …] [, items_json := …] [, workspace_head := …])` | table | Commits the workspace to the branch. `mode := 'Selective'` needs `items_json` |
+| `fabric_git_update(remote_commit_hash [, conflict_resolution := …] [, allow_override := …])` | table | Pulls that commit into the workspace (`PreferRemote` / `PreferWorkspace`) |
+| `fabric_deployment_pipelines()` | table | Pipelines this identity can see |
+| `fabric_deployment_pipeline_stages(pipeline)` / `_items(pipeline, stage)` | table | A pipeline's stages (with the workspace assigned to each) / a stage's contents |
+| `fabric_deploy(pipeline, source_stage, target_stage [, note := …])` | table | Deploys one stage into the next and blocks; one row of operation state |
+| `fabric_deployment_pipeline_operations(pipeline)` | table | Deployment history — same columns as `fabric_deploy` |
+| `fabric_capacities()` | table | Capacities with SKU, region and state |
+| `fabric_environments([workspace := …])` | table | Spark environments + `publish_state` — the id `fabric_run_notebook`'s `config_json` needs |
+| `fabric_data_access_roles([item := …])` | table | OneLake data-access roles on an item (read only) |
+| `fabric_mirrored_databases([workspace := …])` | table | Mirrored databases, incl. `onelake_tables_path` (attachable directly) and the SQL endpoint |
+| `fabric_mirroring_status(database)` / `fabric_mirrored_tables(database)` | table | Whether replication is running / per-table state, rows, bytes and sync latency |
 
 **Refreshing the SQL endpoint after a Delta write** — the reason this exists. A table written through the
 Delta provider is invisible to the lakehouse's T-SQL endpoint until Fabric's asynchronous detection notices
@@ -806,7 +822,8 @@ Notes:
   which is separate from any workspace role you granted.
 - Power BI reports a refresh still in flight as `status = 'Unknown'`; `wait_seconds := 0` submits without
   waiting and you can poll with `fabric_semantic_model_refreshes`.
-- For per-partition sequencing beyond what this expresses, use XMLA/TMSL through the DAX provider.
+- For per-table or per-**partition** refresh, use `dax_refresh*` through the
+  [DAX provider](#power-bi--dax-provider) — the REST API cannot address a partition at all.
 
 **Introspection.** Useful on its own, and the source of the identifiers the calls above need — for example
 attaching the lakehouse's T-SQL endpoint alongside the Delta catalog:
@@ -1325,9 +1342,34 @@ SELECT * FROM m."Model".daxevaltable((SELECT * FROM ids), expression := 'EVALUAT
 SELECT * FROM m."Model".daxeach((SELECT region FROM regions), expression := 'EVALUATE …');
 ```
 
-Writes throw (semantic models are read-only through DAX); `BEGIN`/`COMMIT`/`ROLLBACK` are no-ops so a
-wrapping DuckDB transaction over read-only DAX doesn't fail. Full design + the DirectLake-passthrough /
-TMDL notes: [`docs/dax-provider.md`](docs/dax-provider.md).
+**Refreshing the model (XMLA/TMSL) — including a single partition**, which the Power BI REST API cannot
+express at all. `fabric_refresh_semantic_model` (above) answers *"refresh this model, tell me when it's
+done"*; these address individual tables and partitions:
+
+```sql
+SELECT * FROM m."Model".dax_refresh();                                  -- whole model, type 'full'
+SELECT * FROM m."Model".dax_refresh_table('Sales');
+SELECT * FROM m."Model".dax_refresh_partition('Sales', '2024');         -- REST cannot do this
+SELECT * FROM m."Model".dax_refresh(type := 'dataOnly', max_parallelism := 4,
+    objects_json := '[{"table":"Sales"},{"table":"Sales","partition":"2024"}]');
+```
+
+Each returns one row: `status`, `refresh_type`, `database`, `objects`, `duration_ms`.
+
+- **These are synchronous** — the XMLA command doesn't return until the refresh finishes, so there is no
+  request id and nothing to poll (unlike the REST path). A long refresh is a long statement; Ctrl+C cancels it.
+- `type` accepts TMSL's own spellings (`full`, `clearValues`, `calculate`, `dataOnly`, `automatic`, `add`,
+  `defragment`) **and** the REST vocabulary (`Full`, `ClearValues`, …), case-insensitively. An unknown value is
+  rejected up front rather than becoming an XMLA parse error.
+- `max_parallelism` wraps the refresh in a TMSL `sequence`, which is the only form that expresses it.
+- Requires the **read-write** XMLA endpoint (Fabric/Premium capacity, *Semantic models workload → XMLA
+  endpoint = Read Write*) and model-write permission.
+
+Data writes throw (a semantic model's tables are read-only through DAX), and `BEGIN`/`COMMIT`/`ROLLBACK` are
+no-ops so a wrapping DuckDB transaction over read-only DAX doesn't fail. Refresh is the **only** TMSL verb
+exposed — there is no generic `dax_tmsl(command)`, deliberately, since the same path would run
+`createOrReplace`/`delete` and turn a read-only provider into arbitrary model mutation. Full design + the
+DirectLake-passthrough / TMDL notes: [`docs/dax-provider.md`](docs/dax-provider.md).
 
 ## Build
 
