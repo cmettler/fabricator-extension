@@ -134,7 +134,87 @@ catalog scan path instead probes cheaply with `SELECT … WHERE 1 = 0` (17 ms) b
 is measured; that it comes from `fabricator_query` re-executing the statement to resolve its schema — having no
 describe available for arbitrary SQL — is inference and should be confirmed before acting on it.
 
-### 2.4 What Fabric tags on its own — MEASURED, unexpected
+### 2.4 Session context — the third vector, and the only one that can change MID-SESSION
+
+`sp_set_session_context` is **explicitly supported on Warehouse and the SQL analytics endpoint**, and
+Microsoft's own example B for it is literally *"Set and return a **client correlation ID**"* — so correlation is
+the documented intent, not a repurposing. Limits: key ≤ 128 bytes, value ≤ 8 000 bytes (`sql_variant`), 1 MB
+total per session, optional `@read_only` to freeze a key for the rest of the connection.
+
+Its appeal over the other two vectors is grain. `Application Name` is fixed when the connection opens, so it
+cannot distinguish models within a run unless each model gets its own connection; `OPTION (LABEL)` needs the
+statement text rewritten. Session context can be **re-set at any point on a live connection**, so in principle a
+dbt pre-hook could stamp the current model onto the pinned connection and every subsequent statement would
+inherit it, with no SQL rewriting at all.
+
+**MEASURED — it works, but only within one batch, and that caveat is the whole story:**
+
+| what was run | result |
+|---|---|
+| `EXEC sp_set_session_context 'dbt_model','…'` then a **separate** `SELECT SESSION_CONTEXT(…)`, inside an explicit `BEGIN`…`COMMIT` | **NULL** — the value was not visible |
+| both statements in **ONE batch** through a single `fabricator_query` | **the tag round-trips** (`spid` 52) |
+| `SET CONTEXT_INFO <binary>` + `CONVERT(varchar, CONTEXT_INFO())` in one batch | **the tag round-trips** |
+
+So the mechanism is fine on Fabric; what failed is that **two consecutive extension calls did not land on the
+same session**, even inside an explicit DuckDB transaction (the two probes reported different `@@SPID`s). Which
+connection each call takes needs its own investigation before anything is built on this — the ABI v36 work made
+`fabricator_exec` join the model's pinned connection, and a read-only transaction that has not yet pinned a
+write connection is the obvious suspect. **Until that is understood, session context is not a usable tag
+through this extension**: a tag that silently fails to stick is worse than no tag.
+
+**The two mechanisms are not interchangeable, and only one is monitoring-visible.** `SESSION_CONTEXT()` values
+appear in no `queryinsights` column — they are for in-session logic (row-level security is the canonical use),
+which is presumably also why Fabric's own `root_activity_id` (§2.5) is set that way and consumed by Fabric's
+pipeline rather than exposed to us. `SET CONTEXT_INFO` is the older, cruder mechanism — one unnamed
+`varbinary(128)` per session — but `exec_sessions_history` has a **`context_info` column**, and it joins to
+per-statement CPU cleanly:
+
+```
+SET CONTEXT_INFO '<tag>'  →  exec_sessions_history.context_info + .connection_id
+                          →  exec_requests_history.connection_id  →  allocated_cpu_time_ms per statement
+```
+
+`connection_id` is a `uniqueidentifier` present on both views, which matters: `session_id` (the spid) is reused
+over time, so joining on it alone is ambiguous across a day's history.
+
+**MEASURED — `context_info` really does land there, and the join really works.** A batch that set the tag and
+ran one labelled statement produced, after ~6 minutes:
+
+```
+session_id | context_info                       | label                  | cpu_ms
+        52 | 0x66616263692D31373835343838373830 | fabci-1785488780-work  |      0
+```
+
+`0x66616263692D…` is the ASCII of the tag, so the value survived intact and is reachable alongside the
+per-statement label and CPU.
+
+> **⚠ Trap, and it nearly produced a wrong conclusion.** `CONVERT(varchar(200), context_info)` yields the
+> **hex text** `0x6661…`, NOT the decoded string — so `WHERE CONVERT(varchar(200), s.context_info) LIKE 'mytag%'`
+> **never matches**. Compare binary to binary instead:
+> `WHERE s.context_info = CONVERT(varbinary(128), 'mytag')`. The row above was found only by the `label` arm of
+> the same `WHERE`; without that positive control the measurement would have read as "context_info is not
+> recorded", which is the opposite of the truth.
+
+Two limits on that route, both structural: it is **session-grained** (per-model attribution needs one session
+per model), and `exec_sessions_history` records **completed** sessions — so under ADO.NET pooling the row does
+not appear until the physical connection actually closes, which can be long after the work finished.
+
+**So the two session mechanisms split cleanly, and it is the opposite of what the naming suggests:**
+
+| | `sp_set_session_context` | `SET CONTEXT_INFO` |
+|---|---|---|
+| read back in-session | `SESSION_CONTEXT(N'key')` | `CONTEXT_INFO()` |
+| shape | many named keys, ≤8 KB each | ONE unnamed `varbinary(128)` |
+| documented for correlation ids | ✅ explicitly (example B) | ✗ |
+| **visible in `queryinsights`** | **✗ no column anywhere** | **✅ `exec_sessions_history.context_info`** |
+| what Fabric itself uses | ✅ `root_activity_id`, `fabric_submitter_name` | — |
+
+The modern, documented-for-correlation mechanism is the one monitoring cannot see; the crude legacy one is the
+one that shows up. `sp_set_session_context` is therefore for in-session logic (row-level security being its
+canonical use) — which is presumably also why Fabric consumes its own `root_activity_id` internally rather than
+exposing it to us.
+
+### 2.5 What Fabric tags on its own — MEASURED, unexpected
 
 Every session shows two statements we do **not** issue (grepped the whole repo to be sure):
 
@@ -249,6 +329,15 @@ is DuckDB SQL: the user never writes the T-SQL that reaches Fabric, so only the 
 > is clean — **`Application Name` covers everything a run does, `OPTION (LABEL)` adds per-statement grain to the
 > subset that is generated T-SQL** (scans, rowid UPDATE/DELETE, DDL, `fabricator_exec` text).
 
+**(b2) Investigate connection identity before betting on session context.** §2.4 shows a tag set by one
+extension call is not visible to the next, even inside an explicit transaction — the two calls reported
+different spids. That single fact decides between two designs: if consecutive calls in a DuckDB transaction can
+be made to share one session, then `SET CONTEXT_INFO` is a *better* per-model tag than a query label (no SQL
+rewriting, and it covers the bulk write), and a dbt pre-hook can drive it directly. If they cannot, the label
+setting in (b) is the only per-model route. **This is a cheap investigation with a large fork in the road behind
+it, so do it before (b).** Note it is also worth knowing for its own sake: it says something about our
+transaction/connection model that nothing currently documents.
+
 **(c) `fabricator_query_history()` — a convenience read (small).** A catalog-bound table function over
 `queryinsights.exec_requests_history` with sensible defaults (last N hours, this login, optional label filter).
 Pure sugar over SQL a user can already write, so build it only if the label work lands.
@@ -285,11 +374,16 @@ SELECT * FROM fabricator_query('wh',
     ORDER BY submit_time');
 ```
 
-**Two method notes, both of which cost a wrong answer during this analysis.** (1) A poll that breaks on the
-first non-empty result will happily return a *previous* run's rows when the filter includes a shared
-side-channel like `program_name` — filter on the run's own tag and keep waiting for it. (2) Ingestion latency is
-real and variable (observed anywhere from ~1 to ~12 minutes; documented as up to 15, and it grows with
-concurrency), so an empty result proves nothing until a positive control shows the mechanism working.
+**Method notes — each of these cost a wrong answer during this analysis, and they are the same rule in four
+disguises.** (1) A poll that breaks on the first non-empty result will happily return a *previous* run's rows
+when the filter includes a shared side-channel like `program_name` — filter on the run's own tag and keep waiting
+for it. (2) Ingestion latency is real and variable (observed ~1 to ~12 minutes; documented as up to 15, and it
+grows with concurrency), so an empty result proves nothing until a positive control shows the mechanism working.
+(3) Two failed CTAS attempts looked like "Fabric rejects `OPTION (LABEL)` on CTAS" and were actually unsupported
+source types — an **unlabelled control failing identically** is what isolated it. (4) The `context_info` filter
+silently never matched because of the hex conversion above, and only the label arm in the same `WHERE` revealed
+that the value *was* there. In every case the fix was the same: **assert a positive fact you already know to be
+true in the same query, so a zero can be distinguished from a broken probe.**
 
 All probe tables (`dbo.fabprobe_src` / `_ctas` / `_bulk` / `_plain`) were dropped afterwards; nothing was left
 on `Test Warehouse`. The history rows they produced remain readable for 30 days, which is itself convenient for
