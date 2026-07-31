@@ -793,7 +793,23 @@ Implemented and verified:
     false` still works (model commits first; non-atomic post-processing). Fabric **`CREATE INDEX` is
     unsupported** (`22424`) — a provider limitation no hook can avoid (the in-txn form then rolls the model
     back with it).
-  - **dbt incremental models — [docs/dbt-incremental.md](docs/dbt-incremental.md)** (validated box + Fabric).
+  - **⚠ FABRIC WAREHOUSE + dbt `table` models are BROKEN, and the cause is isolated (2026-07-31):
+  [docs/warehouse-support.md](docs/warehouse-support.md) §6.5.** A dbt table model fails at the swap with
+  `15225: No item by the name of '[dbo].[<model>__dbt_tmp]' could be found`; the same model passes on box, and a
+  HOOKLESS control failed identically (so it is unrelated to hooks/session tagging). Six-row isolation matrix in
+  the doc; the failing ingredient is exactly **a bulk load (SqlBulkCopy → Fabric's internal `COPY INTO`) into a
+  table CREATED in the same still-open transaction**. Everything else works: autocommit CTAS+rename, `sp_rename`
+  in a txn, plain CREATE+INSERT+rename on the pinned connection, and bulk INSERT into a COMMITTED table then
+  rename. Two presentations: the CTAS shape leaves the object readable but NOT renameable on its own pinned
+  connection (`exec [txn=9 own=False]`), and the create-then-bulk-insert shape makes the server ABORT the
+  transaction ("transaction is either not associated with the current connection or has been completed").
+  **NOT a regression in our code** — dbt-duckdb's `table` materialization now renames after a bulk create, which
+  is the one combination Fabric rejects; the earlier 4×200k Fabric validation only ever did CTAS, never a rename.
+  Three fix options are written up with their trade-offs (commit-the-CREATE = loses atomicity; INSERT batches =
+  loses throughput; detect-and-fail = must not break the CTAS half, which works) — **none applied, the trade-off
+  is the user's call**. New diagnostic in the same pass: the bulk path's own DDL is now logged
+  (`bulk ddl [txn=… own=…]`), which was previously invisible and is what made the diagnosis possible.
+- **dbt incremental models — [docs/dbt-incremental.md](docs/dbt-incremental.md)** (validated box + Fabric).
     Concurrent **incremental append** (`incremental_strategy='append'`) works at `--threads 4`, and
     **concurrent schema evolution** (`on_schema_change='append_new_columns'` → `ALTER ADD COLUMN`) now works
     at `--threads 4` too (~0.5s/model). It **used to deadlock** at `--threads > 1`: our `ALTER` evicted the

@@ -1179,6 +1179,11 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 create.CommandText = $"IF OBJECT_ID({objectLiteral}, 'U') IS NULL " +
                                      BuildCreateTable(qualified, data.Schema, Profile, null, null, null, sortColumns,
                                                       null, ResolveAddIdentity());
+                // Logged because it was previously invisible: the bulk path's DDL is issued inside SqlBulkCopy's
+                // own sequence, so a Debug trace showed only "bulk <table>: create=True" and not the statement.
+                // Diagnosing the Fabric in-transaction rename failure needed exactly this text.
+                Log.LogDebug("bulk ddl [txn={Txn} own={Own}]: {Sql}",
+                             AmbientTransaction.Current, owns, Trunc(create.CommandText));
                 create.ExecuteNonQuery();
             }
 

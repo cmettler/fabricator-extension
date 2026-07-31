@@ -408,6 +408,77 @@ point, not something we can fix by picking a default:
    relaxed to `is_string && !string_order_pushable`. `test/verify_collation_pushdown.test` (binary) +
    `test/verify_orderby_pushdown.test` (non-binary, explicit not-pushed proof).
 
+## 6.5 ⚠ FABRIC: a bulk load into a table CREATED in the same open transaction breaks it (measured 2026-07-31)
+
+**Symptom, as a user sees it:** a dbt `table` model against the Fabric Warehouse target fails at the swap with
+
+```
+alter_table failed: 15225: No item by the name of '[dbo].[<model>__dbt_tmp]' could be found in the
+current database 'Test Warehouse', given that @itemtype was input as '(null)'.
+```
+
+The identical model succeeds on box SQL Server. A **hookless control model failed identically**, which is what
+established that it has nothing to do with hooks, session tagging or any recent function work.
+
+### The isolation matrix
+
+Every row run through this extension against the live `Test Warehouse` (and box as the engine control):
+
+| sequence inside ONE transaction | Fabric | box |
+|---|---|---|
+| CTAS then rename, in **autocommit** (no explicit txn) | ✅ | ✅ |
+| CTAS (bulk create+write) then rename — **the dbt table-swap shape** | ❌ `15225` | ✅ |
+| `BEGIN TRAN; CREATE TABLE; EXEC sp_rename; COMMIT` as ONE T-SQL batch | ✅ | — |
+| pinned connection: plain `CREATE TABLE` + plain `INSERT` + `sp_rename`, separate round-trips | ✅ | — |
+| **bulk** INSERT into a table committed EARLIER, then rename | ✅ | — |
+| plain `CREATE TABLE` in-txn + **bulk** INSERT + rename | ❌ txn **aborted** | ✅ |
+
+### What that isolates
+
+Not the rename, not our transaction routing, and not Fabric's `sp_rename` in general — all three work in the rows
+above. The failing ingredient is exactly one thing: **a bulk load (`SqlBulkCopy`, which Fabric implements
+internally as `COPY INTO` — visible in `queryinsights`) targeting a table that was CREATED inside the same,
+still-open transaction.**
+
+It presents in two ways depending on shape, and the second is the more revealing:
+- **CTAS shape**: the load *succeeds* ("10 rows copied", and a `SELECT … WHERE 1=0` on the pinned connection sees
+  the table), but the object is then not resolvable by `sp_rename` **on that same pinned connection, in that same
+  transaction** — the log shows `exec [txn=9 own=False]`, i.e. the joined pinned connection.
+- **create-then-bulk-insert shape**: SqlClient reports *"The transaction is either not associated with the current
+  connection or has been completed"* — the server has **aborted the transaction** underneath us.
+
+So the object ends up in a state where it is readable but not renameable, and the transaction is unsound. The
+cause is on the Fabric side; our exposure is that INSERT/CTAS go through the bulk path.
+
+### Why this looks like a regression and is not one
+
+Nothing in our DDL or rename path changed. What changed is the SHAPE dbt asks for: dbt-duckdb's `table`
+materialization builds `<model>__dbt_tmp` and swaps it in, so it performs a **rename after a bulk create inside
+one transaction** — the one combination above that Fabric rejects. Earlier validation of the Fabric dbt target
+(4×200k concurrent CTAS, recorded in CLAUDE.md) exercised CTAS-in-a-transaction, which works; it never renamed.
+
+### Options, none applied — each trades something a user should choose
+
+1. **On a warehouse profile, commit the CREATE before bulking.** Restores dbt's swap; costs atomicity (a failed
+   load leaves an empty table behind). There is precedent for such a documented divergence — Delta identity
+   creates are already immediate.
+2. **On a warehouse profile inside an explicit transaction with `createTable`, fall back to parameterized INSERT
+   batches** instead of `SqlBulkCopy`. Keeps atomicity, loses bulk throughput on exactly the large models that
+   need it.
+3. **Detect and fail early with an actionable message.** Cheap, but it cannot simply reject the combination:
+   the CTAS half currently *works*, so erroring there would break behaviour people rely on. It would have to
+   track "tables created in this transaction" and fire only on the rename.
+
+Interim guidance for the Fabric Warehouse dbt target: use a materialization that does not swap (or run the model
+non-transactionally) until one of the above is chosen.
+
+### Diagnostic added in the same pass
+
+The bulk path's own DDL is now logged (`Fabricator.Sql`, `bulk ddl [txn=… own=…]: <sql>`). It was previously
+invisible — a Debug trace showed only `bulk <table>: create=True`, with the conditional
+`IF OBJECT_ID(…) IS NULL CREATE TABLE …` never printed — and that statement text is what this diagnosis needed.
+Reproduce with `FABRICATOR_LOG_LEVEL=Debug` + `FABRICATOR_LOG_FILE=…`.
+
 ## 7. Open decisions
 
 - **Naive-`datetime2` semantic:** RESOLVED — keep naive↔naive (validated under a non-UTC session zone, §3.1;
