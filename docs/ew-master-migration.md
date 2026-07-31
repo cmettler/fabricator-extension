@@ -302,7 +302,7 @@ All five are **draft**, each cut fresh off `upstream/master` per generate-never-
 
 | PR | offer | validated |
 |---|---|---|
-| [#6](https://github.com/clast-project/engineered-wood/pull/6) | variant shredding, write direction (his gap 8) | Parquet builds; +7 tests × {net8.0, net472}; all 17 `Variant*` green |
+| [#6](https://github.com/clast-project/engineered-wood/pull/6) — **MERGED 2026-07-31** (`6745de0`) | variant shredding, write direction (his gap 8) | Parquet builds; +7 tests × {net8.0, net472}; all 17 `Variant*` green |
 | [#7](https://github.com/clast-project/engineered-wood/pull/7) | `ReadAllWithMetadataAsync` — the `_metadata` locator | Table.Tests 643 × {net8.0, net472} |
 | [#8](https://github.com/clast-project/engineered-wood/pull/8) | `StartTransaction(snapshot)` | 640 × 2 TFMs; **mutant** (ignore the arg) fails 2/4 |
 | [#9](https://github.com/clast-project/engineered-wood/pull/9) | `StageAppTransaction` (idempotent-producer CAS) | 642 × 2 TFMs; **mutant** (drop the per-attempt check) fails exactly 1/6 |
@@ -436,6 +436,81 @@ PR #4 open regardless: upstream's own notes reference it.
 
 
 ---
+
+## PENDING BUMP — upstream landed ALL FIVE #15 slices in one day (measured 2026-07-31, NOT started)
+
+**Read this before touching the pin.** This is the largest bump of the five so far, and it lands squarely on
+the file our patch set is most concentrated in. Every number below is measured (`git merge-tree`, `git diff
+--stat`, public-name diffs, call-site greps with a zero control), not estimated.
+
+**Where we are:** pin `5272681` on `fabricator-patches`; merge-base with `upstream/master` is `7ab5d4f`.
+Upstream is **8 commits ahead**; we carry **39 commits** on top (`git cherry` counts 31 by patch-id).
+
+| upstream commit | slice / subject |
+|---|---|
+| `e314af5` #22 | slice 4 — `Stage*` / `Require*` / `Declare*` split (a precondition and an effect shared a prefix) |
+| `6f3033e` #21 | slice 5 — a transaction validating against the latest version validates nothing |
+| `c66a55e` #20 | slice 3 — an identity table's appends could not be staged |
+| `98407ea` #19 | slice 1 — eight read methods collapse into one |
+| `db45c82` #18 | slice 2 — four places could address the wrong file (the stale-ordinal sites) |
+| `8054040` #17 | shredded-variant output measured against Spark, DuckDB and pyarrow |
+| `f0fea65` #16 | shredding becomes a caller decision, one batch at a time |
+| `6745de0` #6 | **OUR variant-shredding PR, merged** (authored "Christoph") |
+
+Curt's decisions on #15, both in our favour: **open question 1 resolved** — `ReadAllAsync` /
+`ReadAtVersionAsync` STAY as thin wrappers (verified present in master, so our 4 call sites on them are
+safe); **open question 4 (the transaction-level exemption opt-in) DEFERRED** by him until slices 1–5 are in
+— so that thread is parked by upstream, not by us, and the measurement stays recorded in the issue body.
+Build order he published: **2, 1, then 5 and 3, with 4 whenever**. On our porting offer: *"I'll come back to
+your porting offer once there is a branch worth porting against."*
+
+### The cost, measured
+
+`git merge-tree --write-tree` (no working-tree change) reports **4 conflicts**:
+`DeltaTable.cs`, `DeltaTransaction.cs`, `Parquet/Data/VariantShredding.cs` (**modify/delete**), and
+`test/…/VariantShreddingTests.cs` (add/add). Churn on the same files — upstream **+1325** lines in
+`DeltaTable.cs` against our **+1165** in it; `DeltaTransaction.cs` +216 vs +188.
+
+**15 public `DeltaTable` methods removed, 6 added, and our Bridge calls 12 of the removed ones across 24
+call sites** (counted with a zero-control grep):
+
+| removed upstream | our call sites | successor |
+|---|---|---|
+| `DeleteByRowIdsAsync` 3, `DeleteByRowIdsViaVectorsAsync` 2, `DeleteBySelectionAsync` 1, `DeleteBySelectionViaVectorsAsync` 1 | 7 | `DeleteRowsAsync(RowSelection, RowDeleteMode, rowLevelRetry, …)` |
+| `UpdateByRowIdsAsync` 3, `UpdateBySelectionAsync` 1, `UpdateBySelectionViaVectorsAsync` 3 | 7 | `UpdateRowsAsync(RowSelection, rewriteFile, …)` |
+| `ReadAllWithRowIdsAsync` 3, `ReadAllWithRowTrackingAsync` 1, `ReadAtVersionWithRowIdsAsync` 1, `ReadRowsByRowIdsAsync` 3 | 8 | `ReadAsync(DeltaReadOptions)` + `ReadRowsAsync` + `GetReadSchema(DeltaReadOptions)` |
+| `WriteChangeDataFilesAsync` | 2 | **no direct successor — investigate** |
+
+`DeltaTransaction` likewise: `SetOperation`, `StageAppTransaction`, `StageReadPredicate`,
+`StageWholeTableRead` are gone; `RequireAppTransaction`, `DeclareRead`, `DeclareWholeTableRead` replace
+them. The rename encodes a real contract difference, so it is not purely mechanical: `Stage*` = an EFFECT
+(rebased and retried), `Require*` = a PRECONDITION (re-checked before EVERY attempt; violation throws
+`InvalidOperationException` and is NOT retried), `Declare*` = a DECLARATION (widens the read set, subject
+to isolation policy). Our buffered-DML code must land each call in the right one of the three.
+
+**Unaffected, and worth knowing before pricing the work:** `PlanFiles` SURVIVED as public API upstream, and
+`PlannedFile` took a **documentation-only** change — so our 8 `PlanFiles` call sites need nothing. The
+removals above are mostly overload consolidation rather than semantic change, which is what makes 24 call
+sites tractable.
+
+### Two traps specific to THIS bump
+
+1. **`git cherry` is useless here for finding redundant patches.** It reports 0 of our 31 as upstream — yet
+   the shredding work demonstrably IS upstream (#6 is ours, merged), because #16 then reworked it and the
+   patch-ids no longer match. Judge redundancy by READING, not by tooling. Concretely: the shredding patch
+   we still carry is the modify/delete conflict, and it should be **dropped, not merged** — that removes a
+   conflict rather than resolving one.
+2. **Do not entangle this with unrelated work.** The Fabric-API commits sitting unpushed when this was
+   measured have nothing to do with EW; a bump this size wants its own branch and its own sweep.
+
+### Suggested order when it is taken
+
+Drop the superseded shredding patch → merge `upstream/master` into `fabricator-patches` → migrate the 24
+Bridge call sites (Delete/Update first: they share `RowSelection`, which slice 2 introduced and slice 5
+consumes) → resolve `WriteChangeDataFilesAsync` → full `verify_delta_*` sweep. Then the standing rules from
+this doc apply unchanged: **diff any method taken wholesale against upstream and demand byte-identity** (the
+auto-merged duplicate-statement trap), **only the net472 leg proves a change offerable**, and **fast-forward
+the pin, never force-push** (release tags pin EW shas).
 
 ## Appendix — the CLAUDE.md journal (moved verbatim 2026-07-29)
 

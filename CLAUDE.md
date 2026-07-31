@@ -106,6 +106,22 @@ parity both directions + Spark decoding codec-written variant. **Fork-era EW not
 are HISTORICAL** — they describe the retired fork lineage; the mechanisms survive but live in the
 fabricator-patches shapes above.
 
+**⚠ A BUMP IS PENDING AND MEASURED, NOT STARTED (2026-07-31).** Upstream landed **all five #15 slices in
+one day** (#18–#22) plus the shredding rework (#16/#17) — and **our PR #6 is MERGED upstream**. Our pin is
+**8 commits behind**; a trial `merge-tree` gives **4 conflicts**, upstream rewrote **+1325** lines of
+`DeltaTable.cs` against our +1165 in the same file, and **15 public `DeltaTable` methods were removed of
+which our Bridge calls 12, across 24 call sites** (the read/DML overload families collapse into
+`ReadAsync(DeltaReadOptions)` / `DeleteRowsAsync(RowSelection…)` / `UpdateRowsAsync(RowSelection…)`;
+`DeltaTransaction`'s `Stage*` splits into `Stage*`/`Require*`/`Declare*` by RETRY CONTRACT, so those calls
+need re-classifying, not renaming). **`PlanFiles` survived** (doc-only change to `PlannedFile`), and Curt
+kept `ReadAllAsync`/`ReadAtVersionAsync` as wrappers, so those call sites are safe. He DEFERRED open
+question 4 (the transaction-level exemption opt-in) himself, and will return to our porting offer "once
+there is a branch worth porting against". Two traps: `git cherry` finds **0** redundant patches even though
+the shredding one IS upstream (#16 reworked it, so patch-ids differ) — judge by reading, and DROP that
+patch rather than merging it, which removes the modify/delete conflict; and this wants its own branch.
+Full measurement + suggested order: **[docs/ew-master-migration.md](docs/ew-master-migration.md) §PENDING
+BUMP.**
+
 **The bump-by-bump journal** (every EW pin move, `PlanFiles`, the path-keyed DV DML, the `_metadata`
 surface, the variant-transport decision + shredding split, the `DeltaTransaction` flush migration, and
 the `TransientRowAddress` analysis) **moved verbatim to
