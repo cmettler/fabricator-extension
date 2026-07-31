@@ -1530,8 +1530,17 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         MetadataKind.Columns => ExecuteMetadataQuery($"SELECT * FROM {Quote(Require(schema, table).schema)}." +
                                              $"{Quote(Require(schema, table).table)} WHERE 1 = 0"),
         MetadataKind.RowId => RowIdMetadata(Require(schema, table).schema, Require(schema, table).table),
-        MetadataKind.RowCount => ExecuteMetadataQuery(RowCountSql(Require(schema, table).schema, Require(schema, table).table)),
-        MetadataKind.ColumnNdv => ExecuteMetadataQuery(ColumnNdvSql(Require(schema, table).schema, Require(schema, table).table)),
+        // Both statistics reads are SKIPPED on a warehouse engine, for the same reason as the external-table
+        // probe above: Fabric/Synapse do not support sys.dm_db_partition_stats or sys.dm_db_stats_histogram
+        // ("DMV ... is not supported"), and on Fabric a failed statement ABORTS AN OPEN TRANSACTION — so an
+        // optional, best-effort statistics query was able to poison a user's transaction. Statistics are
+        // costing-only (never pruning), so returning "unknown" costs an optimizer hint and nothing else.
+        MetadataKind.RowCount => Profile.IsWarehouse
+            ? EmptyStringTable("n")
+            : ExecuteMetadataQuery(RowCountSql(Require(schema, table).schema, Require(schema, table).table)),
+        MetadataKind.ColumnNdv => Profile.IsWarehouse
+            ? EmptyStringTable("column_name", "ndv")
+            : ExecuteMetadataQuery(ColumnNdvSql(Require(schema, table).schema, Require(schema, table).table)),
         MetadataKind.Functions => _functionFilter is null
             ? ExecuteMetadataQuery(FunctionsMetadataSql())
             : FilteredFunctions(),
@@ -1972,6 +1981,21 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     private ExternalTableInfo? ProbeExternalTable(string schemaName, string tableName)
     {
+        // NEVER ISSUE THIS ON A WAREHOUSE ENGINE. Fabric/Synapse reject sys.external_file_formats outright
+        // (error 15871 "'external_file_formats' is not supported"), and on Fabric a statement that ERRORS
+        // inside an explicit transaction ABORTS THAT TRANSACTION. Because this probe's failure is swallowed
+        // as "treated as not external", the transaction was poisoned SILENTLY and the next real statement
+        // failed with a bewildering error instead — measured as dbt table models dying at their swap with
+        // `15225: No item by the name of '[dbo].[<model>__dbt_tmp]' could be found`, and as `208: Invalid
+        // object name` for a plain INSERT after a CREATE in the same transaction. A matched control (the same
+        // sequence with a SUCCEEDING probe) completed fine, which is what pinned the cause.
+        //
+        // Warehouse engines have no PolyBase-style external tables at all, so skipping is also correct on the
+        // merits — and saves a per-table round trip. See docs/warehouse-support.md §6.5.
+        if (Profile.IsWarehouse)
+        {
+            return null;
+        }
         // sys.external_tables → data source location + file format. LEFT JOIN: an external table without a
         // file format (RDBMS connectors) is detected but not routable. Profile-tolerant: an engine without
         // the catalog views (or without data virtualization) probes as "not external".
@@ -2264,7 +2288,8 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 }
                 cmd.CommandText = BuildCreateTable(qualified, columns, Profile, null, null, defaults, sortColumns,
                                                    identityColumns, ResolveAddIdentity());
-                Log.LogDebug("ddl create {Table}: {Sql}", qualified, Trunc(cmd.CommandText));
+                Log.LogDebug("ddl create [txn={Txn} own={Own}] {Table}: {Sql}",
+                            AmbientTransaction.Current, owns, qualified, Trunc(cmd.CommandText));
                 cmd.ExecuteNonQuery();
                 foreach (var alter in WarehouseConstraintAlters(qualified, tableName, columns, pk, uniqueGroups))
                 {
@@ -2281,7 +2306,8 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             cmd0.CommandText = ifNotExists
                 ? $"IF OBJECT_ID({ObjectLiteral(schemaName, tableName)}, 'U') IS NULL {create}"
                 : create;
-            Log.LogDebug("ddl create {Table}: {Sql}", qualified, Trunc(cmd0.CommandText));
+            Log.LogDebug("ddl create [txn={Txn} own={Own}] {Table}: {Sql}",
+                        AmbientTransaction.Current, owns, qualified, Trunc(cmd0.CommandText));
             cmd0.ExecuteNonQuery();
         }
         finally
@@ -2351,7 +2377,8 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     {
         string qualified = Quote(schemaName) + "." + Quote(tableName);
         bool ifFlag = (flags & AlterKind.FlagIfExists) != 0;
-        Log.LogDebug("ddl alter {Table}: kind={Kind} arg1={A1} arg2={A2}", qualified, alterKind, arg1, arg2);
+        Log.LogDebug("ddl alter [txn={Txn}] {Table}: kind={Kind} arg1={A1} arg2={A2}",
+                     AmbientTransaction.Current, qualified, alterKind, arg1, arg2);
         switch (alterKind)
         {
             case AlterKind.RenameTable:

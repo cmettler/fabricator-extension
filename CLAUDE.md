@@ -793,22 +793,33 @@ Implemented and verified:
     false` still works (model commits first; non-atomic post-processing). Fabric **`CREATE INDEX` is
     unsupported** (`22424`) — a provider limitation no hook can avoid (the in-txn form then rolls the model
     back with it).
-  - **⚠ FABRIC WAREHOUSE + dbt `table` models are BROKEN, and the cause is isolated (2026-07-31):
-  [docs/warehouse-support.md](docs/warehouse-support.md) §6.5.** A dbt table model fails at the swap with
-  `15225: No item by the name of '[dbo].[<model>__dbt_tmp]' could be found`; the same model passes on box, and a
-  HOOKLESS control failed identically (so it is unrelated to hooks/session tagging). Six-row isolation matrix in
-  the doc; the failing ingredient is exactly **a bulk load (SqlBulkCopy → Fabric's internal `COPY INTO`) into a
-  table CREATED in the same still-open transaction**. Everything else works: autocommit CTAS+rename, `sp_rename`
-  in a txn, plain CREATE+INSERT+rename on the pinned connection, and bulk INSERT into a COMMITTED table then
-  rename. Two presentations: the CTAS shape leaves the object readable but NOT renameable on its own pinned
-  connection (`exec [txn=9 own=False]`), and the create-then-bulk-insert shape makes the server ABORT the
-  transaction ("transaction is either not associated with the current connection or has been completed").
-  **NOT a regression in our code** — dbt-duckdb's `table` materialization now renames after a bulk create, which
-  is the one combination Fabric rejects; the earlier 4×200k Fabric validation only ever did CTAS, never a rename.
-  Three fix options are written up with their trade-offs (commit-the-CREATE = loses atomicity; INSERT batches =
-  loses throughput; detect-and-fail = must not break the CTAS half, which works) — **none applied, the trade-off
-  is the user's call**. New diagnostic in the same pass: the bulk path's own DDL is now logged
-  (`bulk ddl [txn=… own=…]`), which was previously invisible and is what made the diagnosis possible.
+  - **FABRIC WAREHOUSE + dbt `table` models — WAS BROKEN, ROOT-CAUSED AND FIXED (2026-07-31):
+  [docs/warehouse-support.md](docs/warehouse-support.md) §6.5.** Every dbt table model died at the swap with
+  `15225: No item by the name of '[dbo].[<model>__dbt_tmp]' could be found`; box was fine, and a HOOKLESS control
+  failed identically (so unrelated to the session-tag work). **Root cause: on Fabric a statement that ERRORS
+  inside an explicit transaction ABORTS it — and we were issuing, inside the user's transaction, statements we
+  KNEW fail there and then SWALLOWING the failure.** Two of them: `ProbeExternalTable`'s
+  `sys.external_file_formats` (a **PolyBase** view, box-only; Fabric answers `15871 'external_file_formats' is
+  not supported`), logged as the benign-looking "external-table probe failed … treated as not external"; and the
+  `RowCount`/`ColumnNdv` stats DMVs (`dm_db_partition_stats`, `dm_db_stats_histogram`, also unsupported). The
+  transaction was poisoned SILENTLY and the NEXT real statement failed confusingly (`15225`, or `208 Invalid
+  object name` for a plain INSERT after a CREATE in the same txn). **Fix: both are capability-gated on
+  `Profile.IsWarehouse` and never issued** — correct on the merits (a warehouse has no PolyBase external tables;
+  stats are costing-only, never pruning) and one fewer round trip per table. Verified: the Fabric dbt target
+  builds again (1 model, then 4 at `--threads 4`, plus a session-tag pre-hook model); box re-checked on the gated
+  paths (polybase 252, cardinality 4, column_ndv 6, server_profile 15, with_options_mssql 9).
+  - **THE STANDING RULE THIS ESTABLISHES: on a warehouse engine, never issue a statement whose failure you intend
+    to swallow.** A best-effort probe is free on box and DESTRUCTIVE on Fabric. Capability-gate on `ServerProfile`
+    instead of discovering support by try/catch.
+  - **A WRONG intermediate conclusion is recorded in §6.5 on purpose.** An earlier pass blamed "a bulk load into a
+    table created in the same transaction" because its tests varied TWO things at once (who issued the CREATE and
+    bulk-vs-plain insert); holding the CREATE constant showed the bulk was irrelevant — a plain INSERT failed too,
+    and a CREATE with NO insert failed as well.
+  - Diagnostics added, and they are what made this findable: the bulk path's own DDL is now logged
+    (`bulk ddl [txn=… own=…]` — previously only "bulk <table>: create=True", never the statement), and
+    `ddl create`/`ddl alter` now carry the txn id + whether the connection was pinned. The decisive datum was
+    `ddl create [txn=4 own=False]` followed by `exec [txn=4 own=False]` failing with 208 — same txn, same pinned
+    connection, so a different-connection explanation was ruled out.
 - **dbt incremental models — [docs/dbt-incremental.md](docs/dbt-incremental.md)** (validated box + Fabric).
     Concurrent **incremental append** (`incremental_strategy='append'`) works at `--threads 4`, and
     **concurrent schema evolution** (`on_schema_change='append_new_columns'` → `ALTER ADD COLUMN`) now works
