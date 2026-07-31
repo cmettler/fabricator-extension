@@ -95,6 +95,8 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | | **Table-in-out**: `db.schema.fn_each(<input table>)` — apply a TVF (CROSS APPLY) or proc per input row | ✅ |
 | | — configurable isolation (consistent snapshot per call); per-row procs run in DuckDB's transaction | ✅ |
 | | **Custom C# aggregates** (UDAF) → `db.schema.agg(x)` in `GROUP BY` / parallel / `OVER(…)`; opt-in disk-spill (`SupportsSpill`) | ✅ |
+| **Monitoring** | `db.dbo.fabricator_session_tag(k, v)` — tag a transaction's connection so Fabric query insights can attribute its cost | ✅ |
+| | `application_name` on the secret → `program_name` on every statement (run-level attribution) | ✅ |
 | | Load-time *global* functions (connection-free); proc multi-result-set / `INOUT` params | ❌ deferred |
 | **Warehouse** | Auto-detected server profile (edition / version / collation) + `fabricator_server_info()` | ✅ Fabric Warehouse validated |
 | | Connection mode: `mssql_mars` (auto per engine), pooled reads + SNAPSHOT writes when MARS off | ✅ |
@@ -575,6 +577,40 @@ The detected server capability profile for an attached catalog (edition, version
 derived flags: `supports_mars`, `has_nvarchar`, `has_datetimeoffset`, `max_datetime2_scale`,
 `has_native_json`, `is_utf8_collation`, `is_binary_collation`, `default_write_isolation`, …). See
 [Microsoft Fabric & Synapse](#microsoft-fabric--synapse-warehouse).
+
+### `db.dbo.fabricator_session_tag(key, value) -> TABLE` (SQL Server / Fabric)
+
+Tags the transaction's provider connection with a session-context key, so the statements it causes can be
+correlated afterwards — e.g. attributing a dbt run's cost in Fabric's
+[query insights](https://learn.microsoft.com/en-us/fabric/data-warehouse/query-insights). Returns one row:
+`connection_id`, `session_id`, `dist_statement_id`, `tag_key`, `tag_value`.
+
+```sql
+BEGIN;
+SELECT * FROM db.dbo.fabricator_session_tag('dbt_run_id', '7f3c…');   -- e.g. a dbt pre-hook
+CREATE OR REPLACE TABLE db.dbo.orders AS SELECT * FROM staged;        -- attributed to that tag
+COMMIT;
+```
+
+On a Fabric Warehouse, every statement of that transaction — including the bulk load — then shares one
+`connection_id`, so you can total its cost:
+
+```sql
+SELECT count(*) AS statements, SUM(allocated_cpu_time_ms) AS cpu_ms
+FROM fabricator_query('db',
+  'SELECT allocated_cpu_time_ms FROM queryinsights.exec_requests_history
+    WHERE connection_id = ''<the connection_id returned above>''');
+```
+
+- **Must be inside an explicit `BEGIN`…`COMMIT`.** In autocommit the connection it tags is released with that
+  statement, so the tag would apply to nothing — the function raises instead of silently doing nothing.
+- `SELECT fabricator_exec(…, 'EXEC sp_set_session_context …')` does **not** work as a substitute: a raw exec
+  joins an existing pinned connection or takes a throwaway one, and nothing is pinned yet when a pre-hook runs.
+- Key ≤ 128 bytes, value ≤ 8000 (the `sp_set_session_context` limits). Values are passed as parameters; the tag
+  is also written into the statement text as a comment so it stays findable in the query history.
+- To attribute a whole **run** rather than a transaction, set `application_name` on the secret instead — it
+  surfaces as `program_name` on every statement, with no SQL changes. Details and the CU story:
+  [`docs/consumption-monitoring.md`](docs/consumption-monitoring.md).
 
 ### `fabricator_version() -> VARCHAR`
 

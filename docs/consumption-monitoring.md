@@ -1,6 +1,7 @@
 # Consumption / CU monitoring on Fabric — what is reachable, and how to attribute it to a dbt run
 
-**Status: ANALYSIS, measured live 2026-07-31. Nothing built.** The question that prompted it: can a dbt run —
+**Status: analysis measured live 2026-07-31; TWO THINGS BUILT out of it** — the `application_name` fix (§2.2)
+and `db.dbo.fabricator_session_tag()` (§2.4b, gate `verify_session_tag`). The CU half remains analysis.** The question that prompted it: can a dbt run —
 a whole DAG, or one model — be monitored for consumption / CU cost, and can a Warehouse query be *tagged* so it
 can be found again in monitoring?
 
@@ -98,11 +99,11 @@ connection property tags every statement the run issues, including the ones the 
 partitions the history cleanly: `Core Microsoft SqlClient Data Provider` 114 statements (untagged sessions),
 `fabricator-attr-probe` 35, `fabbulk-…` 31.
 
-> **⚠ DEFECT FOUND: our `application_name` secret field is declared but never applied.**
-> `SqlServerBackend.SecretFields` declares `application_name`, and `BuildMssqlConnectionString` never emits it —
-> so `CREATE SECRET (TYPE mssql, …, application_name 'x')` accepts the value and silently drops it. That is why
-> the live `program_name` was the SqlClient default. Confirmed by reading the builder and by the measurement.
-> Fixing it is a two-line change and is the single cheapest step toward run attribution.
+> **⚠ DEFECT FOUND AND FIXED: our `application_name` secret field was declared but never applied.**
+> `SqlServerBackend.SecretFields` declares `application_name`, and `BuildMssqlConnectionString` never emitted it —
+> so `CREATE SECRET (TYPE mssql, …, application_name 'x')` accepted the value and silently dropped it. That is why
+> the live `program_name` above was the SqlClient default. Found by reading the builder after the measurement
+> disagreed with the declaration; now emitted.
 
 ### 2.3 One CTAS is SEVEN billable statements — MEASURED, and it reframes the cost question
 
@@ -253,14 +254,54 @@ covers the SqlBulkCopy write, and it reaches CU via `dist_statement_id`. Practic
 `SELECT fabricator_exec('mssql', 'EXEC sp_set_session_context ''dbt_model'', ''…''')`, and the model's own
 statements inherit the tag through the connection.
 
-**The same blocker still gates it, and it is now the ONE thing to test.** §2.4's measurement — a tag set by one
-extension call was invisible to the next — becomes a *correlation* problem rather than a visibility one: if the
-`EXEC` lands on a different connection than the work, the join attributes the wrong statements, silently. But
-that probe used a bare `BEGIN; exec; query;` in the shell, **not dbt's shape**, where a model materialises inside
-one transaction on a pinned write connection. So the mechanism is proven at the Fabric level and the open
-question is narrowly ours: *does a pre-hook's `fabricator_exec` share the connection with the model's writes?*
-Test that in the dbt harness before anything else here. Note also that `--threads N` uses several connections, so
-the EXEC must run per connection — which a pre-hook naturally does.
+### 2.4b Why `fabricator_exec` cannot do it, and what shipped instead — BUILT
+
+§2.4's "the tag did not stick" was not a fluke, and reading the code explains it exactly:
+**`fabricator_exec` runs `AmbientTransaction.JoinOnly`** — it joins the transaction's pinned connection *only if
+one already exists*, otherwise it takes a fresh connection it deliberately does **not** retain, because "nothing
+would ever commit it". And a provider connection is pinned lazily **on the first WRITE**. So at the moment a dbt
+`pre_hook` runs there is nothing to join: the tag lands on a pooled connection that is handed straight back, and
+the model's statements then run somewhere else. **A user-level wrapper is structurally incapable of tagging the
+connection the work will use** — only the extension can force the pin.
+
+Hence **`db.dbo.fabricator_session_tag(key, value)`** (`SqlServerSessionTag.cs`), a catalog-bound table function
+that goes through `BeginWrite()` *without* the join-only restriction — pinning the transaction's connection — then
+returns `connection_id`, `session_id`, `dist_statement_id` and the tag it set. Gate: `verify_session_tag`
+(25 assertions, service tier).
+
+Four design points, each forced by something measured:
+
+- **It refuses to run in autocommit.** There the pin is committed and released with that very statement, so the
+  tag would be set and instantly discarded. The error names the fix ("use a pre-hook on a transactional model").
+  A silent no-op is the failure this function exists to remove, so it must be loud.
+- **The values are parameters, and therefore the statement carries a comment.** A parameterized EXEC is recorded
+  as `EXEC sp_set_session_context @key, @value` with the **values absent** — measured — so §2.4a's
+  "self-bridging" property is LOST the moment you do the injection-safe thing. A caller that keeps the returned
+  `connection_id` does not care, but a dbt pre-hook discards its result set. So the function appends
+  `/* fabricator_session_tag key=value */`, which puts the tag back into `command` while the values stay
+  parameters; `*/` is defanged so a hostile value cannot escape the comment.
+- **`connection_id` is read from `sys.dm_exec_CONNECTIONS`, not `dm_exec_requests`.** The request-level view
+  describes the currently-executing request and intermittently had no row yet, so `MAX()` returned NULL and the
+  suite failed at a moving line about one run in three. The connection-level view always has a row for a live
+  session. (Box returns several rows per spid — MARS maps many logical connections onto one session; Fabric,
+  without MARS, returns one.) The id read is also wrapped: losing a *diagnostic* must not fail a tag that was
+  actually set.
+- **The ambient transaction id is captured at BIND and re-established at EXECUTE.** `AmbientTransaction` is an
+  `AsyncLocal`, and a table function's scan can run on a DuckDB worker thread where it reads 0 — measured as
+  roughly one call in six wrongly reporting "not in an explicit transaction", and worse, the tag would have gone
+  to a throwaway connection. Same fix `begin_bulk` already uses for its background consumer. **This is the
+  transferable lesson: any catalog function that must reach the transaction's connection has to capture the
+  ambient id at bind.**
+
+**Validated live on Fabric, end to end.** Tagging a transaction and then writing a model in it, the connection the
+function reported carried the *whole* write: `CREATE TABLE`, `BULK INSERT` (862 cpu_ms, 2000 rows), the internal
+`COPY INTO` (829 cpu_ms) and the metadata scans — 24 statements on one `connection_id`. That is the design
+working: **one tag per transaction attributes everything the model did, including the bulk load no query hint can
+reach.**
+
+Remaining unknown, and it is now small: `--threads N` uses several connections, so the pre-hook must run per
+model (which it naturally does) — worth confirming once in the dbt harness that a real dbt pre-hook lands in the
+model's transaction rather than its own.
 
 ### 2.5 What Fabric tags on its own — MEASURED, unexpected
 
@@ -361,29 +402,21 @@ Different workloads, different meters — a dbt project writing Delta to OneLake
 
 Ordered by value-per-effort. Nothing here is built.
 
-**(a) Fix `application_name` (tiny, do it regardless).** Emit the declared field into the connection string,
-and accept it as an ATTACH option too. Immediately gives run-level attribution via `program_name` with zero
-SQL changes, and it is a live defect in a documented surface either way.
+**(a) Fix `application_name` — DONE.** `BuildMssqlConnectionString` now emits the declared field, so
+`CREATE SECRET (TYPE mssql, …, application_name 'dbt:<run>')` gives run-level attribution via `program_name`
+with zero SQL changes. It was a live defect in a documented surface either way. (Accepting it as an ATTACH option
+too remains open.)
 
-**(b) A `mssql_query_label` setting (small, high value).** A provider setting whose value the extension appends
-as `OPTION (LABEL='…')` to the T-SQL it generates. dbt then labels per model with a pre-hook —
-`SET mssql_query_label = 'dbt:{{ this.name }}'` — and `queryinsights` becomes queryable per model. This is the
-piece that turns tagging from "possible in hand-written SQL" into "usable from dbt", because **a dbt model body
-is DuckDB SQL: the user never writes the T-SQL that reaches Fabric, so only the extension can attach the label.**
+**(b) A `mssql_query_label` setting — NOT NEEDED for the dbt case, and here is why.** The idea was to append
+`OPTION (LABEL='…')` to generated T-SQL because a dbt model body is DuckDB SQL and only the extension can attach
+a per-model label. §2.4b shipped a better answer: a session tag attributes **every** statement of the
+transaction, including the SqlBulkCopy load that a query hint cannot reach at all. A label is still the only way
+to distinguish statements *within* one connection, so keep this on the shelf for that case rather than deleting
+it — but it is no longer on the critical path.
 
-> **Scope limit, measured — and it is narrower than it first appears.** INSERT/CTAS through this extension use
-> **SqlBulkCopy**, which takes no query hint, so a *label* cannot cover the write. But the write is **not
-> invisible**: it is fully recorded and fully attributable by `program_name` (§2.4). So the division of labour
-> is clean — **`Application Name` covers everything a run does, `OPTION (LABEL)` adds per-statement grain to the
-> subset that is generated T-SQL** (scans, rowid UPDATE/DELETE, DDL, `fabricator_exec` text).
-
-**(b2) → PROMOTE TO FIRST: test connection identity in the dbt shape, because §2.4a may make (b) unnecessary.**
-A run UUID set via `sp_set_session_context` is self-bridging (§2.4a) — measured end to end, needing **no
-extension feature at all**: a dbt `pre_hook` calling `fabricator_exec` tags the connection, and the whole run
-(including the bulk write) attributes by `connection_id`. The single unknown is whether a pre-hook's exec and the
-model's writes share one connection. **One targeted test in `dbt_mssql_test` decides whether (b) is worth
-building**, and it is far cheaper than building it. If they share, this wins outright; if not, the label setting
-in (b) is the fallback and (a) still applies.
+**(b2) Connection identity — RESOLVED, and it produced the shipped function.** The answer was that
+`fabricator_exec` is join-only and cannot pin, so `fabricator_session_tag` exists to do it (§2.4b). One small
+follow-up remains: confirm in `dbt_mssql_test` that a real dbt pre-hook runs inside the model's transaction.
 
 **(c) `fabricator_query_history()` — a convenience read (small).** A catalog-bound table function over
 `queryinsights.exec_requests_history` with sensible defaults (last N hours, this login, optional label filter).

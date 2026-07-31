@@ -1,0 +1,168 @@
+# name: test/verify_session_tag.test
+# description: SESSION TAGGING — db.dbo.fabricator_session_tag(key, value) sets a session-context key on the
+#              transaction's PINNED provider connection, so a dbt run or model can be correlated afterwards to
+#              the statements it caused. docs/consumption-monitoring.md §2.4a.
+#
+#              WHY THIS NEEDS A FUNCTION AT ALL, which is the thing the suite really pins. The obvious spelling
+#              — SELECT fabricator_exec('db', 'EXEC sp_set_session_context …') — fails SILENTLY. fabricator_exec
+#              runs JoinOnly: it joins the transaction's pinned connection only if one ALREADY exists, else it
+#              takes a fresh connection it deliberately does not retain. A connection is pinned lazily on the
+#              first WRITE, so at the moment a pre-hook runs there is nothing to join, the tag lands on a pooled
+#              connection that is handed straight back, and every later statement runs somewhere else. This
+#              function goes through BeginWrite WITHOUT that restriction, pinning the connection — which is why
+#              §4 below (a tag set by one call, read by a DIFFERENT call) is the load-bearing assertion.
+#
+#              WHAT EACH SECTION CATCHES:
+#                (§1) declared + discoverable as a table function of the right type;
+#                (§2) AUTOCOMMIT IS REJECTED — in autocommit the pinned connection is committed and released with
+#                     this very statement, so the tag would be set and instantly discarded. A silent no-op is
+#                     exactly the failure this function exists to remove, so it must be a loud error;
+#                (§3) inside an explicit transaction it returns the monitoring keys (connection_id is a GUID —
+#                     session_id/spid is REUSED, so correlation must not depend on it);
+#                (§4) the tag is visible to a LATER, SEPARATE call in the same transaction (the pin held);
+#                (§5) two calls in one transaction report the SAME connection;
+#                (§6) argument validation, including the documented 128-byte key limit.
+#
+#              The monitoring half (queryinsights.exec_requests_history) is FABRIC-ONLY and cannot be asserted
+#              here — box SQL Server has no such views. Validated live instead; see the doc.
+# group: [fabricator]
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
+
+# ---- 1. the function is declared and discoverable as a TABLE function ----
+
+query IIII
+SELECT function_name, function_type, schema_name, database_name
+FROM duckdb_functions()
+WHERE database_name = 'db' AND function_name = 'fabricator_session_tag';
+----
+fabricator_session_tag	table	dbo	db
+
+# ---- 2. AUTOCOMMIT must be refused, with a message that names the fix ----
+#
+# Not a limitation being papered over: the pin this function creates is released when the implicit
+# per-statement transaction commits, so the tag could not apply to anything that follows.
+
+statement error
+SELECT * FROM db.dbo.fabricator_session_tag('dbt_run_id', 'nope');
+----
+<REGEX>:.*explicit transaction.*
+
+# ---- 3. inside an explicit transaction: the monitoring keys come back ----
+
+statement ok
+BEGIN;
+
+# connection_id is the key that joins queryinsights' two views, and it must be a GUID rather than the spid,
+# which is reused across sessions over time.
+query IIIT
+SELECT connection_id IS NOT NULL AS has_connection,
+       length(connection_id) = 36 AS looks_like_guid,
+       session_id > 0 AS has_spid,
+       tag_value
+FROM db.dbo.fabricator_session_tag('dbt_run_id', 'run-42');
+----
+true	true	true	run-42
+
+# ---- 4. THE LOAD-BEARING ASSERTION: a DIFFERENT call in the same transaction sees the tag ----
+#
+# This is what fails without the pin, and it fails by returning NULL rather than by erroring — so without this
+# assertion a regression would look like everything still working.
+
+query T
+SELECT v FROM fabricator_query('db', 'SELECT CAST(SESSION_CONTEXT(N''dbt_run_id'') AS varchar(64)) AS v');
+----
+run-42
+
+# A second key set later in the same transaction is also visible — the connection really is being reused, not
+# re-established per call.
+query T
+SELECT tag_value FROM db.dbo.fabricator_session_tag('dbt_model', 'orders');
+----
+orders
+
+query TT
+SELECT run, model FROM fabricator_query('db',
+  'SELECT CAST(SESSION_CONTEXT(N''dbt_run_id'') AS varchar(64)) AS run,
+          CAST(SESSION_CONTEXT(N''dbt_model'') AS varchar(64)) AS model');
+----
+run-42	orders
+
+# ---- 5. NOT ASSERTED HERE, and the reason is a finding in itself ----
+#
+# The tempting assertion — "a later scan runs on the connection the tag reported" — cannot be written as ONE
+# statement. Measured: a cross join of the tag function and a fabricator_query reading its own connection_id
+# returns DIFFERENT ids, because the execution order of two table functions within a single statement is not
+# guaranteed; the scan can run BEFORE the tag has pinned anything, and so takes a pooled connection. That is a
+# property of statement execution, not a defect in the tag.
+#
+# §4 above is the valid form of the same check, and a stronger one: it reads the tag back in a SEPARATE
+# statement, which is exactly how a dbt pre-hook and its model relate. Attempts to bridge the two with local
+# storage are also blocked — tagging marks the transaction as writing to `db`, and DuckDB permits a transaction
+# to write to only ONE attached database, so a temp table cannot hold the first value.
+
+statement ok
+COMMIT;
+
+# ---- 6. argument validation ----
+
+statement ok
+BEGIN;
+
+statement error
+SELECT * FROM db.dbo.fabricator_session_tag('', 'v');
+----
+<REGEX>:.*non-empty key.*
+
+# The documented sp_set_session_context limit is 128 bytes; rejecting locally names the limit instead of
+# surfacing a generic T-SQL error.
+statement error
+SELECT * FROM db.dbo.fabricator_session_tag(repeat('k', 200), 'v');
+----
+<REGEX>:.*128-byte.*
+
+statement ok
+COMMIT;
+
+# ---- 7. the tag is FINDABLE in monitoring, which parameterizing would otherwise prevent ----
+#
+# The values are passed as parameters, so Fabric records the statement as "EXEC sp_set_session_context
+# @key, @value" with the values ABSENT — measured. A caller that keeps the returned connection_id does not care,
+# but a dbt pre-hook discards its result set, so the function appends a sanitized comment carrying key=value.
+# That is what makes the tag recoverable from the query history alone.
+#
+# Asserted here on the LOCAL server through the PLAN CACHE (sys.dm_exec_query_stats + dm_exec_sql_text),
+# because queryinsights is Fabric-only — and because sys.dm_exec_requests for the current session shows the
+# LOOKUP's own text, not the preceding statement's, which is a trap worth naming.
+
+statement ok
+BEGIN;
+
+statement ok
+SELECT * FROM db.dbo.fabricator_session_tag('dbt_run_id', 'run-77');
+
+query I
+SELECT hits > 0 AS tag_in_command_text FROM fabricator_query('db',
+  'SELECT COUNT(*) AS hits FROM sys.dm_exec_query_stats qs
+     CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) t
+    WHERE t.text LIKE ''%fabricator_session_tag dbt_run_id=run-77%''');
+----
+true
+
+# The `*/` DEFANGING is deliberately NOT asserted here. It would have to be a negative assertion over the
+# server's PLAN CACHE, which is shared and long-lived: an earlier run of this very suite (or any other session)
+# that mentioned the sequence leaves it cached, so the assertion fails for reasons unrelated to the code under
+# test — observed while writing this. A flaky guard is worse than none. The behaviour is a pure string
+# transformation in CommentSafe and is covered by reading it; the positive assertion above is the part that
+# depends on the server at all.
+
+statement ok
+COMMIT;
+
+statement ok
+DETACH db;

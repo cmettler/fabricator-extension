@@ -105,8 +105,10 @@ case "$TIER" in
         # the microsecond-cast workaround). Raised deliberately in the same commit, per the error text below.
         # 43 RUNS / 1388 since 2026-07-29: verify_delta_catalog_s3 runs a SECOND time on the codec engine
         # (+161, the same count as its native leg). 42 suites, 43 runs — the floor is on RUNS.
-        : "${MIN_SUITES:=43}"
-        : "${MIN_ASSERTIONS:=1388}"
+        # 44 RUNS / 1413 since 2026-07-31: verify_session_tag (+25) — fabricator_session_tag, which needs a
+        # real server (it pins a provider connection and reads the session's own monitoring ids).
+        : "${MIN_SUITES:=44}"
+        : "${MIN_ASSERTIONS:=1413}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

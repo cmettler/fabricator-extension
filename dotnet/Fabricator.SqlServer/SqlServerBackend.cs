@@ -253,6 +253,18 @@ public sealed class SqlServerBackend : IBackend
           .Append(";Encrypt=").Append(encrypt ? "True" : "False")
           .Append(";TrustServerCertificate=True");
 
+        // application_name was DECLARED in SecretFields but never emitted here, so a secret carrying it was
+        // silently ignored. It is not cosmetic: SqlClient sends it as the session's program name, which Fabric
+        // records in queryinsights.exec_requests_history.program_name — making it the cheapest way to attribute
+        // every statement of a run (including the SqlBulkCopy load, which no query hint can reach). Without it
+        // every session reads "Core Microsoft SqlClient Data Provider" and runs are indistinguishable.
+        // See docs/consumption-monitoring.md §2.2.
+        var applicationName = Field("application_name");
+        if (applicationName.Length > 0)
+        {
+            cs.Append(";Application Name=").Append(QuoteConnValue(applicationName));
+        }
+
         var accessToken = Field("access_token");
         if (accessToken.Length > 0)
         {
@@ -710,6 +722,11 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     private readonly System.Collections.Concurrent.ConcurrentDictionary<long, TxnState> _txns = new();
 
+    // Per catalog, because the function pins THIS catalog's transaction connection. Lazy so a catalog that
+    // never calls it pays nothing.
+    private SqlServerSessionTagFunction SessionTag => _sessionTag ??= new SqlServerSessionTagFunction(this);
+    private SqlServerSessionTagFunction? _sessionTag;
+
     // Explicit user BEGIN..COMMIT transaction ids (v60 is_explicit; the ambient id is set by set_active_txn
     // right before begin_transaction). Consulted by the external-table INSERT routing: a storage-side write
     // commits its own Delta commit / parquet PUT and cannot roll back with the SQL catalog's transaction,
@@ -812,6 +829,133 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         var connection = OpenConnection();
         connection.Open();
         return (connection, null, true);
+    }
+
+    /// <summary>
+    /// Sets a session-context key on THIS transaction's pinned connection and returns the identifiers Fabric's
+    /// monitoring keys on. Backs <c>db.dbo.fabricator_session_tag(key, value)</c> — see
+    /// <see cref="SqlServerSessionTagFunction"/> for why it cannot be done with <c>fabricator_exec</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>The call goes through <see cref="BeginWrite"/> WITHOUT the join-only restriction, so it PINS the
+    /// transaction's connection (creating the <see cref="TxnState"/> if the transaction has not written yet).
+    /// That is the point: everything the transaction does afterwards reuses that connection, so the tag applies
+    /// to the actual work rather than to a pooled connection that was handed straight back.</para>
+    /// <para>Rejected outside an explicit transaction on purpose. In autocommit the pin is committed and released
+    /// with this very statement, so the tag would be set and discarded — a silent no-op, which is the failure
+    /// mode this whole function exists to eliminate.</para>
+    /// <para>Key and value are PARAMETERS, never interpolated: they are user text, and a correlation id is
+    /// exactly the sort of value someone eventually builds by string concatenation.</para>
+    /// </remarks>
+    internal RecordBatch SetSessionTag(string key, string? value)
+    {
+        long txnId = AmbientTransaction.Current;
+        if (txnId == 0 || !_explicitTxns.ContainsKey(txnId))
+        {
+            throw new NotSupportedException(
+                $"{SqlServerSessionTagFunction.FunctionName}: must be called inside an explicit transaction "
+                + "(BEGIN … COMMIT). In autocommit the connection it tags is released with this statement, so "
+                + "the tag would not apply to anything. In dbt, use a pre-hook on a transactional model.");
+        }
+        var (connection, transaction, owns) = BeginWrite();
+        try
+        {
+            using (var set = connection.CreateCommand())
+            {
+                set.Transaction = transaction;
+                // The values ride as PARAMETERS (they are user text), which has one consequence worth the
+                // trailing comment: a parameterized EXEC is recorded in queryinsights as
+                // "EXEC sp_set_session_context @key, @value" with the VALUES ABSENT, so the tag would be
+                // invisible to anyone searching the history for it — measured. A caller who keeps the returned
+                // connection_id does not care, but a dbt pre-hook discards its result set, so the tag has to be
+                // findable from the history alone. The comment puts it back in `command` while the actual
+                // parameters stay parameters; `*/` is stripped so a hostile value cannot escape the comment.
+                set.CommandText = "EXEC sp_set_session_context @key, @value "
+                                  + $"/* fabricator_session_tag {CommentSafe(key)}={CommentSafe(value)} */";
+                set.Parameters.Add(new SqlParameter("@key", System.Data.SqlDbType.NVarChar, 128) { Value = key });
+                set.Parameters.Add(new SqlParameter("@value", System.Data.SqlDbType.NVarChar, 4000)
+                {
+                    Value = (object?)value ?? DBNull.Value,
+                });
+                set.CommandTimeout = ResolveCommandTimeout();
+                set.ExecuteNonQuery();
+            }
+            // Read the ids back on the SAME connection. connection_id joins the two queryinsights views (and is
+            // a GUID, unlike the reusable spid); dist_statement_id is the Capacity Metrics "Operation Id".
+            //
+            // connection_id comes from sys.dm_exec_CONNECTIONS, not dm_exec_requests, and that choice fixed a
+            // real flakiness: the request-level view describes the CURRENTLY EXECUTING request, so it
+            // intermittently had no row yet and MAX() returned NULL — the suite failed at a moving line about
+            // one run in three. The connection-level view always has a row for a live session. (Note box SQL
+            // Server returns SEVERAL rows per spid because MARS maps multiple logical connections onto one
+            // session; Fabric, which has no MARS, returns one. MAX picks deterministically either way, and only
+            // Fabric has the monitoring views this id is for.) dist_statement_id stays request-level and is
+            // legitimately NULL when no distributed statement is in flight.
+            string? connectionId = null, distStatementId = null;
+            int sessionId = 0;
+            try
+            {
+                using var read = connection.CreateCommand();
+                read.Transaction = transaction;
+                read.CommandText =
+                    "SELECT @@SPID AS session_id, "
+                    + "(SELECT MAX(CONVERT(varchar(64), c.connection_id)) FROM sys.dm_exec_connections c "
+                    + "  WHERE c.session_id = @@SPID) AS connection_id, "
+                    + "(SELECT MAX(CONVERT(varchar(64), r.dist_statement_id)) FROM sys.dm_exec_requests r "
+                    + "  WHERE r.session_id = @@SPID) AS dist_statement_id";
+                read.CommandTimeout = ResolveCommandTimeout();
+                using var reader = read.ExecuteReader();
+                if (reader.Read())
+                {
+                    sessionId = reader.IsDBNull(0) ? 0 : Convert.ToInt32(reader.GetValue(0));
+                    connectionId = reader.IsDBNull(1) ? null : reader.GetString(1);
+                    distStatementId = reader.IsDBNull(2) ? null : reader.GetString(2);
+                }
+            }
+            catch (SqlException ex)
+            {
+                // The TAG is the point; these ids are diagnostics. Reading them needs VIEW SERVER STATE (or its
+                // Fabric equivalent), which a restricted principal may lack — losing the ids must not fail a tag
+                // that was actually set. The caller sees NULLs and can still correlate via the recorded comment.
+                Log.LogDebug(ex, "session_tag: could not read the session's monitoring ids");
+            }
+            Log.LogDebug("session_tag {Key}={Value} on connection {ConnectionId} (spid {Spid})",
+                         key, value, connectionId, sessionId);
+            return TagRow(connectionId, sessionId, distStatementId, key, value);
+        }
+        finally
+        {
+            // `owns` is false here by construction (an explicit transaction always yields the pinned
+            // connection), but honour the contract rather than assuming it.
+            if (owns)
+            {
+                connection.Dispose();
+            }
+        }
+    }
+
+    // Makes a value safe to embed in a /* … */ comment: only the comment terminator can escape it, and a
+    // newline would split the recorded command text awkwardly. Not a security boundary on its own — the values
+    // are still passed as parameters — but the comment must not be breakable.
+    private static string CommentSafe(string? value) =>
+        (value ?? "").Replace("*/", "* /").Replace('\r', ' ').Replace('\n', ' ');
+
+    private static RecordBatch TagRow(
+        string? connectionId, int sessionId, string? distStatementId, string key, string? value)
+    {
+        var cid = new StringArray.Builder();
+        var sid = new Int32Array.Builder();
+        var dsid = new StringArray.Builder();
+        var k = new StringArray.Builder();
+        var v = new StringArray.Builder();
+        cid.Append(connectionId);
+        sid.Append(sessionId);
+        dsid.Append(distStatementId);
+        k.Append(key);
+        v.Append(value);
+        return new RecordBatch(SqlServerSessionTagFunction.Columns,
+                               new IArrowArray[] { cid.Build(), sid.Build(), dsid.Build(), k.Build(), v.Build() },
+                               1);
     }
 
     public IArrowArrayStream ExecuteQuery(string sql) => ExecuteQuery(sql, null);
@@ -1603,10 +1747,8 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // UNION ALL so the C++ catalog discovers + registers them uniformly (then dispatches custom ones to C#).
     private static string FunctionsMetadataSql()
     {
-        if (CustomFunctionSet.IsEmpty)
-        {
-            return FunctionsSql;
-        }
+        // NOTE: no IsEmpty early-return — the bespoke session-tag row below is always appended, so the
+        // UNION ALL is always needed even when no custom functions are registered.
         static string Esc(string s) => s.Replace("'", "''");
         // FunctionsSql ends with ORDER BY; strip it so the UNION ALL is valid (the diagnostic /
         // discovery callers sort themselves, so dropping the ordering here is harmless).
@@ -1615,6 +1757,11 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         // One literal row per declaration, in the discovered stream's five-column shape
         // (schema_name, name, kind, param_count, return_type). The host reads the first three; the last two
         // exist because every UNION ALL branch must match the discovery query's arity.
+        // The bespoke session-tag function: always present on a SQL Server catalog, and NOT in
+        // CustomFunctionSet because it must capture the live catalog (it pins that catalog's connection),
+        // whereas the set is static. Same "match the name first" pattern the DAX provider uses for daxeval.
+        sb.Append(" UNION ALL SELECT 'dbo', '").Append(Esc(SqlServerSessionTagFunction.FunctionName))
+          .Append("', 'table', 2, ''");
         foreach (var d in CustomFunctionSet.Declarations(NoSchemaExpansion))
         {
             sb.Append(" UNION ALL SELECT '").Append(Esc(d.SchemaName)).Append("', '").Append(Esc(d.Name))
@@ -2357,6 +2504,10 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         // A custom function of any kind answers from the set (which tags a table/sqlgen function's NAMED
         // parameters, so an optional argument can be written `fn(x, flag := true)`); otherwise it is a
         // discovered routine and its parameters come from INFORMATION_SCHEMA.
+        if (SqlServerSessionTagFunction.Is(functionName))
+        {
+            return SessionTag.Parameters;
+        }
         var custom = CustomFunctionSet.ParamSchema(schemaName, functionName);
         if (custom is not null)
         {
@@ -2572,6 +2723,10 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         // A custom table function's output schema may depend on the constant args (bound per call, then the
         // binding is discarded). `args` is null only for the in-out `_each` base-schema probe, which does not
         // apply to a pure-C# table function; a static function ignores it.
+        if (SqlServerSessionTagFunction.Is(functionName))
+        {
+            return SqlServerSessionTagFunction.Columns;
+        }
         var custom = CustomFunctionSet.OutputSchema(schemaName, functionName, args);
         if (custom is not null)
         {
@@ -2599,6 +2754,10 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         // supportsPushdown = !is_proc (preserves the prior push_projection): a custom function maps its full
         // result by NAME (true); a discovered TVF pushes the projection into SQL (true); a stored proc is
         // projected positionally above the scan (false).
+        if (SqlServerSessionTagFunction.Is(functionName))
+        {
+            return new BindingBoundTable(SessionTag.Bind(args!), supportsPushdown: true);
+        }
         var custom = CustomFunctionSet.TableBind(schemaName, functionName, args);
         if (custom is not null)
         {
