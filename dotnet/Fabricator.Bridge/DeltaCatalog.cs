@@ -306,11 +306,19 @@ public sealed class DeltaCatalog : IBackendCatalog
     }
 
     // ATTACH option `isolation_level 'write_serializable'|'serializable'` (Spark's delta.isolationLevel):
-    // how explicit transactions treat CONCURRENT BLIND APPENDS at COMMIT. write_serializable (the default —
-    // Spark's default too) lets the COMMIT logically reorder before them (they pass the rebase even when
+    // how explicit transactions treat CONCURRENT BLIND APPENDS at COMMIT. write_serializable (the default)
+    // lets the COMMIT logically reorder before them (they pass the rebase even when
     // they match the transaction's reads); serializable makes commit order the logical order — a concurrent
     // append matching the transaction's read predicates conflict-aborts. All other checks (metadata /
     // protocol / delete-delete / delete-read) are identical at both levels.
+    //
+    // ⚠ write_serializable is DATABRICKS' default, NOT Spark's — this comment used to claim "Spark's default
+    // too" and that is MEASURED FALSE (2026-07-31, Fabric Spark 4.1.1): Fabric/OSS Spark records Serializable
+    // for its own commits, and its DDL validator REJECTS the value outright ("delta.isolationLevel must be
+    // Serializable") at CREATE and at ALTER SET TBLPROPERTIES. So on a shared table with the property ABSENT,
+    // we apply WriteSerializable while Fabric Spark applies Serializable — we are the more permissive of the
+    // two. ATTACH with isolation_level 'serializable' to match Fabric Spark. (A property we STAMP is still
+    // honored by Spark on read/write — it just cannot set it itself.) docs/delta-transactions.md §10.6.
     //
     // NOTE: this ATTACH option is now only the CREATE-TIME DEFAULT semantics reference. The EFFECTIVE
     // isolation for an EXISTING table's conflict check is the table's OWN delta.isolationLevel property
@@ -2473,7 +2481,13 @@ public sealed class DeltaCatalog : IBackendCatalog
             }
             catch (EngineeredWood.DeltaLake.DeltaConflictException) when (attempt < maxAttempts)
             {
-                // concurrent writer took the version — reopen + retry
+                // Concurrent writer took the version — reopen + retry. LOGGED (like the sibling retry in
+                // DeltaGlobalTableFunction.WriteAsync) because a silent retry makes multi-writer behaviour
+                // unobservable: a successful concurrent run and a run whose writers merely serialized look
+                // identical from the outside, so there is no way to tell whether the commit guard was ever
+                // exercised. This is the one signal that says the put-if-absent actually rejected a commit.
+                _log.LogWarning("delta flush {Path}: commit conflict — reopening at latest (attempt {Attempt}/{Max})",
+                    tablePath, attempt, maxAttempts);
             }
             finally
             {

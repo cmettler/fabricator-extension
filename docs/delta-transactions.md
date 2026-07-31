@@ -240,7 +240,7 @@ DuckDB transaction aborts; retry the whole transaction.
 
 ### `isolation_level` ATTACH option
 
-| | `'write_serializable'` (**default** — Spark's default) | `'serializable'` |
+| | `'write_serializable'` (**default** — *Databricks'* default, **not** Fabric Spark's; §10.6) | `'serializable'` |
 |---|---|---|
 | Concurrent **blind appends** vs our reads | commute (feed inference/order may place them "before" our reads logically) | abort if they match our read predicates — commit order = logical order |
 | Append-only txn that *read* the table | blind OCC path (no read checks) — documented divergence: Spark would deleteRead-check it | first read pins the base version → routes through the checked flush |
@@ -280,10 +280,123 @@ depends on the filesystem:
 | Storage | Commit guard | Verdict |
 |---|---|---|
 | Local POSIX | `O_EXCL` exclusive create | multi-process safe (validated: 4 processes × 200 rows → 800/800) |
-| OneLake / abfss (`onelake://`) | ADLS conditional create (`If-None-Match: *`) | multi-process / multi-engine safe |
+| OneLake / abfss (`onelake://`) | ADLS conditional create (`If-None-Match: *`) | multi-process safe for DATA (no lost writes measured), but a losing writer can surface an ERROR instead of retrying — see §8.1 |
 | Fabric fuse mount (`/lakehouse/default`) | `O_EXCL` over fuse — doubtful | treat as **single-writer** |
 | S3 plain ATTACH (httpfs) | **none** — httpfs never sends `If-None-Match` | documented **single-writer** |
 | S3 ATTACH **with an s3 `SECRET`** | real conditional PUT via the AWS SDK (`S3CommitFileSystem`: Get(temp) → Put(target, `If-None-Match:"*"`) → Delete(temp); 412 → conflict → OCC/rebase) | multi-process / multi-engine safe (validated on MinIO: 4 × 10 commits × 20 rows → 40/40, 800/800, across checkpoint boundaries) |
+
+### 8.1 OneLake multi-writer — MEASURED 2026-07-31 (it had only been INFERRED)
+
+Until this measurement the OneLake row above read "multi-process / multi-engine safe" with **no
+validation numbers**, while the local-POSIX and S3 rows carried real ones. That verdict was an
+inference from the `EXCLUSIVE_CREATE` probe (`docs/delta-catalog.md`) plus the fact that the conflict
+checker is storage-agnostic. Both halves of the inference were right; the conclusion was too strong.
+
+Harness: `scratchpad/iso_race.sh` — N `duckdb.exe` processes committing autocommit INSERTs to ONE
+OneLake table, each row tagged `(writer, commit)` so a lost write shows up as a **missing group**, not
+just a wrong total. Two things made it a measurement rather than a green tick: the per-commit log
+lines are a **positive control** that the log sink works (at `Warning` a conflict-free run leaves an
+empty log, which is indistinguishable from broken logging), and the flush's OCC retry is now **logged
+at all** — it used to be a silent `catch`, so a run where writers merely serialized looked identical
+to one where the guard rejected and retried.
+
+| writers × commits × rows | commits | result |
+|---|---|---|
+| 4 × 5 × 20 | 20 | 400/400 rows, 20/20 groups, versions v1–v20 unique+contiguous, 0 conflicts |
+| 4 × 8 × 20 | 32 | 640 rows, v1–v32 unique+contiguous, 0 conflicts |
+| 8 × 12 × 1 | 96 | **2 of 8 writers FAILED** (`_last_checkpoint` JSON parse) |
+| 8 × 12 × 1 | 96 | **1 of 8 FAILED** (same) |
+| 8 × 12 × 1 *(after fix 1)* | 96 | **1 of 8 FAILED** — raw Azure 412 `ConditionNotMet` out of `complete_bulk` |
+| 8 × 12 × 1 *(after fix 1)* | 96 | **96/96, v1–v96 contiguous, 0 failures** |
+| 10 × 15 × 1 *(after fix 1)* | 150 | **2 of 10 FAILED** — the 412 again, now WITH a stack trace |
+| 10 × 15 × 1 *(after fix 2)* | 150 | **150/150 commits, 0 failures, 0 × 412** |
+
+**What is now established:**
+
+- **No lost writes, no corruption, ever** — across every run the landed versions were unique and
+  contiguous and every `(writer, commit)` group was complete. The commit guard is *sound*: two writers
+  never both took a version.
+- **Low contention never exercises the guard.** 32 commits across 4 processes produced **0** conflicts:
+  each INSERT spends most of its ~1.7 s writing parquet, so the read-latest→write-commit windows rarely
+  overlap. A green low-contention run therefore proves nothing about put-if-absent, which is exactly why
+  the earlier "safe" verdict was unsupported. Contention has to be *forced* (many tiny commits).
+- **One real bug found and FIXED** (`CheckpointReader`): `_last_checkpoint` is updated by non-atomic
+  OVERWRITE (`UploadAsync(overwrite: true)`), so a concurrent reader could see it at **zero bytes** and
+  die in `JsonDocument.Parse` with *"The input does not contain any JSON tokens"* — a failed COMMIT
+  caused by an **advisory** file. Now treated as absent (spec-conformant: readers must fall back to
+  listing). Gate: `test/verify_delta_last_checkpoint.test` (34, hermetic, mutation-tested).
+- **The second failure — a raw `412 ConditionNotMet` — is now ROOT-CAUSED AND FIXED, and it turned out
+  to be the SAME root object as the first.** It escaped as a generic error (never became a
+  `DeltaConflictException`, so no retry) and the statement failed. Two hypotheses, in order:
+
+  **Hypothesis 1 (WRONG): the exists-conflict wasn't mapped.** `OneLakeDataLakeFileSystem.CreateAsync`
+  caught only 409 while `RenameAsync` beside it catches 409 **and** 412. `scratchpad/adlsprobe` settles
+  this *deterministically* — no race required, because an existing target is an existing target:
+
+  | operation against an EXISTING path (live OneLake, 2026-07-31) | result |
+  |---|---|
+  | conditional CREATE (`IfNoneMatch=*`) | `RequestFailedException` **409 `PathAlreadyExists`** |
+  | conditional RENAME onto existing destination | **409 `PathAlreadyExists`** |
+  | unconditional CREATE | succeeds (overwrites) |
+  | `UploadAsync(overwrite: true)` | succeeds — this is the non-atomic `_last_checkpoint` update |
+
+  So ADLS reports an exists-conflict as **409, never 412**; the 409-only catch was already sufficient
+  and that site cannot be the source. (Both catches keep the 412 for symmetry and for ADLS-compatible
+  endpoints, not because it is reachable there.) Crucially this *redirected* the search: a 412 means an
+  **ETag precondition** failed, so something had to be sending one.
+
+  **Hypothesis 2 (CORRECT), and it was read off a stack trace, not guessed.** With the log sink now
+  recording traces at `Debug`, the failure reproduced on the FIRST attempt (2 of 10 writers) and named
+  the site outright:
+
+  ```
+  Azure…BlobRestClient.DownloadAsync(… ifMatch, ifNoneMatch …)
+    ← BlobBaseClient.OpenReadInternal → LazyLoadingReadOnlyStream.ReadAsync
+    ← OneLakeDataLakeFileSystem.ReadAllBytesAsync
+    ← CheckpointReader.ReadLastCheckpointAsync
+    ← SnapshotBuilder.BuildAsync → DeltaTable.OpenAsync
+    ← DeltaCatalog.FlushDeferredFilesAsync
+  ```
+
+  `ReadAllBytesAsync` used `OpenReadAsync`, which returns Azure's **lazy `LazyLoadingReadOnlyStream`**:
+  it fetches the blob in successive RANGE requests and, to keep a multi-request read self-consistent,
+  **pins the ETag from the first response and sends `If-Match` on every later one**. `_last_checkpoint`
+  is overwritten in place by a concurrent writer's checkpoint → the read tears → **412**.
+
+  **So both multi-writer failures are the same root object by two mechanisms**: a non-atomically
+  overwritten `_last_checkpoint` read while it changes — once observed as *empty content* (fixed in
+  `CheckpointReader`'s parse guards), once as a *torn ranged read* (this). The parse guards could never
+  have caught the 412 because it is thrown by the filesystem read, before any parsing.
+
+  **Fix, in two layers.** (1) `ReadAllBytesAsync` now issues ONE unconditional request
+  (`ReadContentAsync`) — a single-request read cannot tear, so the precondition cannot arise, and
+  `ITableFileSystem` documents this method as being for *small* files, which have no use for a
+  resumable ranged stream. (2) `ReadLastCheckpointAsync` additionally treats **any** read failure as
+  "no hint" (cancellation excepted) — belt to that braces, for any store that can tear.
+
+  **The trap worth carrying forward: a client library can add a conditional header you never wrote.**
+  This doc previously asserted "no read path sends a precondition" — true of *our* code and false of
+  the behaviour, because `OpenRead` inserts `If-Match` internally. Grepping our source for `IfMatch`
+  therefore "proved" the wrong thing; only the trace showed it.
+
+  **Method notes.** The two techniques are complementary and both were needed: the *deterministic*
+  probe (ask the service what status it returns) cheaply FALSIFIED hypothesis 1 and redirected the
+  search, while the *instrumented repro* PINNED the site. The sink change is what made the second
+  possible — it previously logged exception type + message, naming *what* failed and never *where*.
+  Reproduce/regress with `ATTEMPTS=N bash scratchpad/hunt412.sh`.
+
+**Practical guidance.** The normal case never had a problem (dbt `--threads N` writes model-per-table,
+so writers don't contend on one table). For the hard case — many processes appending to *one* OneLake
+table — both observed failure modes are now fixed and the 150-commit shape that reproduced them runs
+clean. Retrying a failed statement is still sound advice for any OCC system, but it is no longer
+required to work around a known defect.
+
+**One UNRELATED observation, recorded because it was seen repeatedly and is NOT explained.** In several
+runs a single `duckdb.exe` finished all of its work — its last commit is in the log, and every commit
+landed — and then **failed to exit**, blocking the harness's `wait`. It happened both before and after
+these fixes, and on runs with no errors at all, so it is a teardown/shutdown issue on the
+OneLake+hosted-CLR path rather than anything to do with commits. Not investigated. If a concurrent
+OneLake workload ever appears to "hang at the end", start here rather than assuming a lost commit.
 
 Two S3 findings worth remembering: a **conditional CopyObject is silently unguarded** on MinIO
 (AWS documents conditional writes for PutObject/CompleteMultipartUpload only) — the guard must be a
@@ -433,17 +546,62 @@ why CREATE-OR-REPLACE / partition-overwrite are guarded inside our explicit tran
 concurrent blind append could logically reorder past the overwrite. `serializable` removes the
 artifact on both systems (the append aborts instead).
 
-### 10.6 `delta.isolationLevel` table property — GAP (ours is per-catalog)
+### 10.6 `delta.isolationLevel` table property — MEASURED against Fabric Spark (2026-07-31)
 
-```sql
--- set by a Databricks writer:
-ALTER TABLE t SET TBLPROPERTIES ('delta.isolationLevel' = 'Serializable');
-```
+This section previously said "**we do NOT read it**" and proposed honoring it as a cheap follow-up.
+That follow-up **shipped** (`PendingSerializable`): the table's own property wins, with the ATTACH
+option as the fallback for a property-less table. What follows replaces that stale text with a live
+measurement against **Fabric Spark 4.1.1 (Delta 4.x)**, workspace `Test` / lakehouse `LH`.
 
-Databricks/Spark honor this per table, from any cluster. We do NOT read it — our level comes from
-the `isolation_level` ATTACH option (per catalog). A table marked Serializable by Spark gets
-write_serializable treatment from us. Cheap follow-up: honor the property as the per-table default
-with the ATTACH option as override.
+**Method + controls** (probe: `sparkprobe isolation`; a rejection is only meaningful if a known-good
+property is accepted through the identical statement shape, and an acceptance only if a bad value is
+demonstrably rejected):
+
+| experiment | result |
+|---|---|
+| *control +* `delta.appendOnly='false'` at CREATE | **accepted** — the statement shape works |
+| *control −* `delta.isolationLevel='Bogus'` | **rejected**: `[DELTA_INVALID_ISOLATION_LEVEL] invalid isolation level 'Bogus'` |
+| *control −* `delta.appendOnly='notabool'` | **rejected**: `For input string: "notabool"` |
+| `delta.isolationLevel='Serializable'` at CREATE | **accepted**, stored, writes fine |
+| `delta.isolationLevel='WriteSerializable'` at CREATE | **REJECTED**: `requirement failed: delta.isolationLevel must be Serializable` |
+| `delta.isolationLevel='SnapshotIsolation'` at CREATE | **REJECTED**, same message |
+| `ALTER TABLE … SET TBLPROPERTIES ('delta.isolationLevel'='WriteSerializable')` | **REJECTED**: `Unsupported table change: requirement failed: …`; property stays absent |
+
+Note the two negative controls fail *differently*: `'Bogus'` does not parse as an isolation level at
+all, while `'WriteSerializable'` parses fine and then fails a `must be Serializable` requirement. So
+OSS Delta **knows** the enum value — it is the **table-property validator** that admits only
+`Serializable`. `WriteSerializable` as a table property is a **Databricks** feature.
+
+**Three consequences, in order of how likely they are to bite:**
+
+1. **Fabric Spark's own default is `Serializable`, not WriteSerializable.** `DESCRIBE HISTORY` on a
+   Spark-created, Spark-written table records `Serializable` for `CREATE OR REPLACE TABLE`, `WRITE`
+   (blind append) and `DELETE`. ⇒ our default (`write_serializable`) matches **Databricks**, and on a
+   shared table with the property **absent** the two engines apply **different** levels — ours the
+   more permissive (concurrent blind appends commute past our reads; Spark would abort). To make them
+   agree, either ATTACH with `isolation_level 'serializable'`, or stamp the property (see 3).
+   Every "write_serializable — Spark's default too" claim in this repo was wrong and is now corrected.
+2. **We never write `isolationLevel` into `commitInfo`**; Spark does. So in `DESCRIBE HISTORY` our
+   commits show a blank in that column (verified in the EW source — the field is simply not emitted —
+   and in the live history). Cosmetic: `commitInfo` is informational, but a Fabric user cannot tell
+   from history which level our commit used.
+3. **A `WriteSerializable` property WE stamp is not hostile to Spark — it is honored.** On a table we
+   created with `WITH ("delta.isolationLevel"='WriteSerializable')`, Fabric Spark read the data, read
+   the property back as `WriteSerializable`, INSERTed, DELETEd — all fine — and recorded
+   **`WriteSerializable`** as the level of *its own* commits. The evidence is an **A/B**: two tables
+   created by us in the same run, identical except for the property, then given the identical Spark
+   INSERT+DELETE. `DESCRIBE HISTORY` on the stamped one reports `WriteSerializable` for both Spark
+   commits; on the unstamped one, `Serializable`. The only input that differed was the property, so
+   Spark is reading it and committing at it. (In both, our own commits show a blank in that column —
+   consequence 2.) Two caveats: (a) such a table's isolation is no longer manageable **from Spark**
+   (its ALTER rejects every value except `Serializable`) — change it with
+   `fabricator_delta_set_tblproperties`; (b) this proves Spark *reads the value and commits at it*; a
+   full semantic proof (a conflict that commutes under WriteSerializable and aborts under
+   Serializable, driven from Spark) was **not** run.
+
+We do **not** block or rewrite a `WriteSerializable` stamp: the value is functional and honored
+cross-engine, so refusing it would remove a working capability to guard against a Spark **DDL**
+limitation that costs the user nothing at read or write time.
 
 ### 10.7 Cross-TABLE atomicity — CAVEAT ON OUR SIDE
 

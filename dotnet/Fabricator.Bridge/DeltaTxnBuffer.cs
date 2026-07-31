@@ -48,7 +48,8 @@ internal sealed class DeltaTxnBuffer
         public Dictionary<int, HashSet<long>> DeletedByOrdinal { get; } = new();
         public long? PinnedVersion;
         // The table's effective isolation (delta.isolationLevel): true = Serializable, false = WriteSerializable
-        // (the Spark default when the property is absent). Read once per (txn, table) and cached — the OCC
+        // (our catalog default when the property is absent — NOT "the Spark default", which is measured to be
+        // Serializable; see DeltaCatalog._serializable). Read once per (txn, table) and cached — the OCC
         // conflict check + row-level relaxation at flush honor the TABLE's property, not a catalog-wide flag.
         public bool? Serializable;
         public bool HasAppend;

@@ -491,6 +491,65 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     scan is handed out by `GetScanFunction` and is not a registered catalog function ⇒ "Failed to find
     function fabricator_scan()". So `FabricatorScanDeserialize` is UNREACHABLE — and must still exist,
     because `Serialize` only emits bind data when BOTH callbacks are set. Do not "clean it up".
+- **ISOLATION + ONELAKE MULTI-WRITER — MEASURED LIVE 2026-07-31; one bug FIXED, one gap OPEN. Full record:
+  [docs/delta-transactions.md](docs/delta-transactions.md) §8.1 (multi-writer) + §10.6 (Spark isolation).**
+  Two long-standing claims in this file were wrong, and both were beliefs never measured.
+  - **`write_serializable` is DATABRICKS' default, NOT Spark's** — every "Spark's default too" here was FALSE.
+    Fabric Spark 4.1.1 records **`Serializable`** for its own commits AND its DDL validator **REJECTS**
+    `delta.isolationLevel='WriteSerializable'` outright (`requirement failed: … must be Serializable`) at CREATE
+    *and* ALTER; `SnapshotIsolation` likewise; only `Serializable` is accepted. Controls both fired, and the two
+    negative controls fail DIFFERENTLY (`'Bogus'` doesn't parse at all) — so OSS Delta knows the enum and it is
+    the *table-property validator* that admits one value. **Consequence: on a shared table with the property
+    ABSENT we apply WriteSerializable while Fabric Spark applies Serializable — we are the more permissive.**
+    ATTACH `isolation_level 'serializable'` to match Fabric Spark. A `WriteSerializable` value WE stamp is
+    **honored** by Spark (it read, INSERTed, DELETEd, and recorded `WriteSerializable` for its own commits) — it
+    just can't SET it, so such a table's isolation is only manageable via `fabricator_delta_set_tblproperties`.
+    We deliberately do NOT block the stamp. Corrected in README + `DeltaCatalog`/`DeltaTxnBuffer`/
+    `DeltaGlobalTableFunction` comments + `verify_delta_tblproperties`.
+  - **OneLake multi-writer was "safe" by INFERENCE only** (its §8 row carried no numbers while local/S3 did).
+    Now measured: **no lost writes ever** (versions always unique+contiguous, all groups complete), but
+    **low contention never exercises the guard** — 32 commits over 4 processes produced ZERO conflicts, so a
+    green low-contention run proves nothing about put-if-absent. Forcing contention (8 writers × 12 tiny
+    commits) reproducibly broke writers.
+  - **BUG FIXED (EW `CheckpointReader`, on `fabricator-patches`): `_last_checkpoint` is an advisory HINT and was
+    treated as authoritative.** It is updated by NON-ATOMIC overwrite, so a concurrent reader can see it at
+    **zero bytes** → `JsonDocument.Parse` → *"The input does not contain any JSON tokens"* → a **failed COMMIT
+    caused by a file that carries no truth**. Now empty/invalid/field-less ⇒ treated as absent (fall back to
+    listing the log, which is what the Delta protocol requires). Gate `verify_delta_last_checkpoint` (34,
+    hermetic, MUTATION-TESTED); the live 8×12 shape went from 1–2 failures per run to **96/96 clean**.
+  - **SECOND BUG ROOT-CAUSED + FIXED — and it is the SAME root object as the first.** A raw Azure **412
+    `ConditionNotMet`** escaped `complete_bulk` (never became a `DeltaConflictException` ⇒ no retry ⇒ the
+    statement failed). Mechanism: `OneLakeDataLakeFileSystem.ReadAllBytesAsync` used `OpenReadAsync`, i.e.
+    Azure's **lazy `LazyLoadingReadOnlyStream`**, which fetches a blob in successive RANGE requests and
+    **pins the ETag, sending `If-Match` on the later ones** — so a `_last_checkpoint` overwritten in place
+    mid-read TEARS. Both multi-writer failures are therefore one root cause (that file being overwritten
+    non-atomically) by two mechanisms: *empty content* (the parse guards) and a *torn ranged read* (this);
+    the parse guards could never catch the 412, which is thrown by the READ, before parsing. Fixed in two
+    layers: `ReadAllBytesAsync` now does ONE unconditional `ReadContentAsync` (a single request cannot tear,
+    and `ITableFileSystem` documents the method as being for SMALL files), plus `ReadLastCheckpointAsync`
+    treats **any** read failure as "no hint" (cancellation excepted).
+    - **A WRONG hypothesis is recorded on purpose.** The obvious suspect was `CreateAsync` catching only 409
+      while `RenameAsync` catches 409|412. `scratchpad/adlsprobe` **falsified it deterministically** (no race
+      needed): on live OneLake a conditional CREATE and a conditional RENAME onto an existing path both raise
+      **409 `PathAlreadyExists`**, never 412 — so 409-only was already correct there. That falsification is
+      what redirected the search to "something is sending an ETag precondition".
+    - **⚠ THE TRAP: a client library can add a conditional header you never wrote.** Our source contains no
+      `IfMatch` on any read path, so grepping for it "proved" the wrong thing — `OpenRead` inserts it
+      internally. Only a stack trace showed this, which is why the log sink now appends the inner-exception
+      chain + full **stack trace at `Debug`** (it used to log type + message only: *what* failed, never
+      *where*). With that in place the failure reproduced on the FIRST attempt and named its own site.
+      Harness: `ATTEMPTS=N bash scratchpad/hunt412.sh`. Verified after the fix: the same 10×15 shape ran
+      **150/150 commits with zero 412s**.
+    - **UNEXPLAINED, unrelated, and seen repeatedly — do not mistake it for a lost commit:** in several runs a
+      single `duckdb.exe` finished ALL its work (last commit logged, every version landed) and then **did not
+      exit**, blocking the harness's `wait`. Observed both before and after these fixes and on runs with no
+      errors, so it is a teardown issue on the OneLake+hosted-CLR path. Not investigated.
+  - **Diagnostic gap closed en route:** the txn-buffer flush's OCC retry was a SILENT `catch`, so multi-writer
+    behaviour was unobservable — a run whose writers merely serialized looked exactly like one where the guard
+    rejected and retried. It now logs `delta flush …: commit conflict — reopening at latest (attempt n/16)`.
+  - **Method notes worth reusing:** at `Warning` level a conflict-free run leaves an EMPTY log, which is
+    indistinguishable from a broken sink ⇒ log at `Information` so the per-commit lines are a POSITIVE CONTROL;
+    and `rm *.log` does NOT match `*.fablog`, which silently mixed a previous run's counts into a later one.
 - **THE DELTA NATIVE DEFAULTS FLIP — DONE (2026-07-29, behaviour-breaking for `PROVIDER 'delta'`).**
   `native_read`/`native_write` used to default **off** everywhere, so the production path was opt-in and
   the *tested* path was the pure-EW codec. Now **the provider NAME selects a default profile**
@@ -1752,7 +1811,7 @@ path never adopted. Keep the status honest; a wrong status is worse than none.
 | [delta-catalog.md](docs/delta-catalog.md) | **current** — the main Delta provider reference |
 | [delta-rs-provider.md](docs/delta-rs-provider.md) | **current but SECONDARY** — the delta-rs provider is opt-in (`-IncludeDeltaRs`, `FABRICATOR_DELTARS=1`); its 7 suites are outside CI |
 | [delta-snapshot-caching.md](docs/delta-snapshot-caching.md) | **design + decision gate; the cache is NOT built** and the full version is not recommended |
-| [delta-transactions.md](docs/delta-transactions.md) | **current** — buffered-DML semantics |
+| [delta-transactions.md](docs/delta-transactions.md) | **current** — buffered-DML semantics. §8.1 = the MEASURED OneLake multi-writer result (2026-07-31; one bug fixed, one gap left OPEN); §10.6 = the MEASURED Fabric Spark isolation-property matrix, replacing a stale "we do NOT read it" |
 | [distribution-installer.md](docs/distribution-installer.md) | **current** — single-file SKU, phases 1–4 of 5 |
 | [ew-master-migration.md](docs/ew-master-migration.md) | **current** — the EW pin journal. Read BEFORE the next EW bump |
 | [fabric-api-functions.md](docs/fabric-api-functions.md) | **current — P0 BUILT + live-validated, P1/P2 design** (2026-07-30). §9b spike results, §9c as-built (incl. the zero-argument Arrow fix), §10 the full API sweep with a verdict per area |

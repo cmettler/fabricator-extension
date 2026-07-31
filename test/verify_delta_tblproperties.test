@@ -138,7 +138,11 @@ statement ok
 DETACH db;
 
 # ---- Create-time stamp: ATTACH isolation_level 'serializable' -> created tables self-declare it ----
-# (write_serializable is the Spark default -> left ABSENT, matching Spark's minimal metadata).
+# write_serializable is left ABSENT (no stamp). NOT because it is "the Spark default" (it is DATABRICKS'
+# default — Fabric Spark 4.1.1 commits at Serializable and REJECTS 'WriteSerializable' as a property value
+# outright; measured 2026-07-31, docs/delta-transactions.md §10.6), but because absent means "each writer
+# applies its own default" and a stamp would freeze a value Spark cannot change via ALTER.
+# 'Serializable' is stamped, and is also the only value Fabric Spark's DDL accepts -> stays manageable there.
 
 statement ok
 ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/serc' AS sc (TYPE fabricator, PROVIDER 'delta', isolation_level 'serializable');

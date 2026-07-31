@@ -1,0 +1,160 @@
+# name: test/verify_delta_last_checkpoint.test
+# description: _last_checkpoint is an OPTIMIZATION HINT — an empty/corrupt/incomplete one must fall back to
+#              listing _delta_log, not fail the read. Regression for a LIVE OneLake multi-writer failure.
+# group: [fabricator]
+
+require fabricator
+
+require parquet
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+# WHY THIS SUITE EXISTS — a measured production failure, not a hypothetical.
+#
+# `_delta_log/_last_checkpoint` is updated by OVERWRITE (CheckpointWriter -> WriteAllBytesAsync), and on
+# ADLS/object stores that is NOT atomic: there is a window in which the file EXISTS with ZERO bytes. A
+# concurrent writer opening the table inside that window used to hit JsonDocument.Parse(empty) and die with
+#   "The input does not contain any JSON tokens. Expected the input to start with a valid JSON token"
+# surfacing as a failed COMMIT with nothing pointing at a merely-advisory hint file.
+#
+# Measured live on Fabric OneLake 2026-07-31: 8 concurrent writers x 12 commits (checkpoint interval 10)
+# killed 2 of 8 writers on one run and 1 of 8 on the next. A single-writer run can NEVER reach it, which is
+# why it survived this long — and why the regression is pinned here HERMETICALLY (by writing the corrupt
+# states directly) instead of depending on a live race that only sometimes collides.
+#
+# The Delta protocol requires readers to cope with _last_checkpoint being absent OR unreadable by falling
+# back to listing the log, so tolerating it is spec-conformance, not a workaround.
+#
+# MUTATION-TESTED: with the empty/JsonException guards removed from CheckpointReader, sections 2 and 3 below
+# fail with that exact production error.
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/lcp' AS lake (TYPE fabricator, PROVIDER 'delta');
+
+# The checkpoint interval is a code-level option (DeltaTableOptions.CheckpointInterval = 10), NOT the
+# delta.checkpointInterval table property — so reaching a checkpoint takes 10 commits, it cannot be shortened
+# from SQL. commit 0 = CREATE, then 10 INSERTs => v10 is the checkpoint.
+statement ok
+CREATE TABLE lake.main.t AS SELECT 0 AS id;
+
+statement ok
+INSERT INTO lake.main.t VALUES (1);
+
+statement ok
+INSERT INTO lake.main.t VALUES (2);
+
+statement ok
+INSERT INTO lake.main.t VALUES (3);
+
+statement ok
+INSERT INTO lake.main.t VALUES (4);
+
+statement ok
+INSERT INTO lake.main.t VALUES (5);
+
+statement ok
+INSERT INTO lake.main.t VALUES (6);
+
+statement ok
+INSERT INTO lake.main.t VALUES (7);
+
+statement ok
+INSERT INTO lake.main.t VALUES (8);
+
+statement ok
+INSERT INTO lake.main.t VALUES (9);
+
+statement ok
+INSERT INTO lake.main.t VALUES (10);
+
+# ==== 1. PRECONDITION: a checkpoint really happened, so the rest of this suite is testing something ====
+# Without this the corruption sections below would pass trivially on a table that has no _last_checkpoint at
+# all (nothing to parse => nothing to tolerate).
+query I
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/lcp/t/_delta_log/*.checkpoint.parquet');
+----
+1
+
+query I
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/lcp/t/_delta_log/_last_checkpoint');
+----
+1
+
+# the hint points at v10 (and is the state the corruptions below replace)
+query I
+SELECT count(*) FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/lcp/t/_delta_log/_last_checkpoint')
+WHERE content LIKE '%"version":10%';
+----
+1
+
+# baseline: 11 rows, read THROUGH the checkpoint
+query I
+SELECT count(*) FROM lake.main.t;
+----
+11
+
+statement ok
+DETACH lake;
+
+# ==== 2. ZERO BYTES — the exact live failure (caught mid-overwrite) ====
+# A csv COPY of no rows with no header writes a genuinely 0-byte file.
+statement ok
+COPY (SELECT 1 AS x WHERE false) TO '${FABRICATOR_DELTA_WRITE_DIR}/lcp/t/_delta_log/_last_checkpoint' (FORMAT csv, HEADER false);
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/lcp' AS l2 (TYPE fabricator, PROVIDER 'delta');
+
+query I
+SELECT count(*) FROM l2.main.t;
+----
+11
+
+# the fallback is a full log replay, so the DATA must be exactly right — not merely "no exception"
+query II
+SELECT min(id), max(id) FROM l2.main.t;
+----
+0	10
+
+statement ok
+DETACH l2;
+
+# ==== 3. INVALID JSON — a longer prefix of a partial write ====
+statement ok
+COPY (SELECT 'not json at all' AS x) TO '${FABRICATOR_DELTA_WRITE_DIR}/lcp/t/_delta_log/_last_checkpoint' (FORMAT csv, HEADER false);
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/lcp' AS l3 (TYPE fabricator, PROVIDER 'delta');
+
+query I
+SELECT count(*) FROM l3.main.t;
+----
+11
+
+statement ok
+DETACH l3;
+
+# ==== 4. VALID JSON, REQUIRED FIELDS MISSING ====
+# A partial write can also land a syntactically complete object; the hint is unusable without version+size,
+# so it must fall back rather than throw on the missing field.
+statement ok
+COPY (SELECT '{}' AS x) TO '${FABRICATOR_DELTA_WRITE_DIR}/lcp/t/_delta_log/_last_checkpoint' (FORMAT csv, HEADER false);
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/lcp' AS l4 (TYPE fabricator, PROVIDER 'delta');
+
+query I
+SELECT count(*) FROM l4.main.t;
+----
+11
+
+# ==== 5. still WRITABLE with a corrupt hint (the failure was on the WRITE path) ====
+statement ok
+INSERT INTO l4.main.t VALUES (11);
+
+query II
+SELECT count(*), max(id) FROM l4.main.t;
+----
+12	11
+
+statement ok
+DETACH l4;

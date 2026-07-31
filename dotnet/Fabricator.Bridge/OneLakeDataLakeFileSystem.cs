@@ -157,13 +157,30 @@ internal sealed class OneLakeDataLakeFileSystem : ITableFileSystem
     public async ValueTask<bool> ExistsAsync(string path, CancellationToken cancellationToken = default)
         => (await File(path).ExistsAsync(cancellationToken).ConfigureAwait(false)).Value;
 
+    /// <summary>
+    /// Reads a whole small file in ONE request (<c>ReadContentAsync</c>).
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Deliberately not <c>OpenReadAsync</c>.</b> That returns Azure's lazy
+    /// <c>LazyLoadingReadOnlyStream</c>, which fetches the blob in successive RANGE requests and — to keep a
+    /// multi-request read self-consistent — pins the ETag from the first response and sends
+    /// <c>If-Match</c> on every later one. If the file is OVERWRITTEN between two of those requests, the read
+    /// fails with <b>412 ConditionNotMet</b>.</para>
+    /// <para>That is not hypothetical: <c>_delta_log/_last_checkpoint</c> is updated by non-atomic overwrite,
+    /// so a concurrent writer's checkpoint tears a reader's multi-range read. MEASURED live on Fabric OneLake
+    /// 2026-07-31 — 10 concurrent writers × 15 commits killed 2 of 10 with a raw 412 out of `commit_transaction`,
+    /// and the stack trace ran exactly `ReadAllBytesAsync` → `CheckpointReader.ReadLastCheckpointAsync` →
+    /// `DeltaTable.OpenAsync` → the flush. A one-request read cannot tear, so the condition cannot arise;
+    /// <c>ITableFileSystem</c> documents this method as being for small files (`_last_checkpoint`, commit JSON),
+    /// which is precisely the case that has no use for a resumable ranged stream.</para>
+    /// <para>The 412 is distinct from — and was masked by — the empty-content variant of the same race fixed in
+    /// <c>CheckpointReader</c>; both stem from that file being overwritten in place. docs/delta-transactions.md §8.1.</para>
+    /// </remarks>
     public async ValueTask<byte[]> ReadAllBytesAsync(string path, CancellationToken cancellationToken = default)
     {
         var file = File(path);
-        using Stream s = await file.OpenReadAsync(cancellationToken: cancellationToken).ConfigureAwait(false);
-        using var ms = new MemoryStream();
-        await s.CopyToAsync(ms, cancellationToken).ConfigureAwait(false);
-        return ms.ToArray();
+        var content = await file.ReadContentAsync(cancellationToken).ConfigureAwait(false);
+        return content.Value.Content.ToArray();
     }
 
     public async ValueTask<ISequentialFile> CreateAsync(
@@ -180,7 +197,17 @@ internal sealed class OneLakeDataLakeFileSystem : ITableFileSystem
         {
             await file.CreateAsync(options, cancellationToken).ConfigureAwait(false);
         }
-        catch (RequestFailedException ex) when (!overwrite && ex.Status == 409)
+        // MEASURED against live OneLake 2026-07-31 (scratchpad/adlsprobe — deterministic, no race needed):
+        // a conditional create (IfNoneMatch=*) on an EXISTING path raises **409 PathAlreadyExists**, and so
+        // does a conditional rename onto an existing destination. NOT 412. So 409 alone was already correct
+        // here, and the 412 is kept only for symmetry with RenameAsync below (which has always listed both)
+        // and for any ADLS-compatible endpoint that answers the precondition instead of the existence check.
+        //
+        // Do NOT read this as the fix for the raw `412 ConditionNotMet` seen once during that multi-writer
+        // measurement (docs/delta-transactions.md §8.1): the probe RULES THIS SITE OUT as its source, because
+        // this operation's exists-conflict is a 409. That 412's origin is still unidentified — a 412 means an
+        // ETag precondition failed, and no read path here sends one.
+        catch (RequestFailedException ex) when (!overwrite && (ex.Status == 409 || ex.Status == 412))
         {
             throw new IOException($"OneLakeDataLakeFileSystem: file already exists: {path}");
         }

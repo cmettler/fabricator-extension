@@ -95,8 +95,14 @@ case "$TIER" in
         # now has a MIXED signature (positional n + named start), which is the combination that can fail
         # SILENTLY: the host marshals every declared parameter, substituting a typed NULL for an omitted named
         # one, so an off-by-one there corrupts the POSITIONAL value rather than erroring.
-        : "${MIN_SUITES:=62}"
-        : "${MIN_ASSERTIONS:=5573}"
+        # 63 suites / 5607 since 2026-07-31: NEW verify_delta_last_checkpoint (34) — an empty/corrupt/
+        # field-less _last_checkpoint must fall back to listing _delta_log instead of failing the read.
+        # Regression for a LIVE OneLake multi-writer failure (the hint file is updated by non-atomic
+        # OVERWRITE, so a concurrent reader could see it at ZERO bytes and die in JsonDocument.Parse).
+        # Pinned hermetically by writing the corrupt states directly — a live race only sometimes collides,
+        # so it cannot serve as the gate.
+        : "${MIN_SUITES:=63}"
+        : "${MIN_ASSERTIONS:=5607}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

@@ -1134,6 +1134,7 @@ SELECT * FROM lake.main.t WHERE id > 10;          -- streaming scan + file/row-g
 | `native_write` / `native_read` — DuckDB's own Parquet reader/writer for data files (EW keeps the `_delta_log`) | ✅ |
 | VARIANT columns; `set_tblproperties` / `tblproperties`; `OPTIMIZE` / `VACUUM` maintenance | ✅ |
 | Concurrent writers: OCC retry (append/CTAS) + **row-level concurrency** (disjoint-row DML on DV tables); S3 multi-writer via a secret | ✅ |
+| Concurrent writers on **OneLake**, many processes appending to ONE table — no lost writes (measured: 96 concurrent commits, all landed), but a losing writer can occasionally surface an error rather than retrying transparently, so retry the statement | ⚠ |
 
 ```sql
 -- Time travel + history
@@ -1247,7 +1248,7 @@ Any of these can also be set **per table** with `CREATE TABLE … WITH (…)` (a
 | `column_mapping` | **`'name'`** | writer v7; metadata-only RENAME / DROP COLUMN; Fabric T-SQL-endpoint compatible |
 | `native_read`, `native_write` | **from the PROVIDER name** | `PROVIDER 'delta'` ⇒ both **on** (DuckDB's Parquet reader/writer — the production path); `PROVIDER 'engineeredwooddelta'` ⇒ both **off** (pure-EW codec). Either is still settable explicitly on either spelling |
 | `change_data_feed`, `in_commit_timestamps`, `row_tracking`, `schemas` | `false` / off | opt-in |
-| `isolation_level` | `write_serializable` | Spark's default; `serializable` also serializes blind appends |
+| `isolation_level` | `write_serializable` | `serializable` also serializes blind appends. This is **Databricks'** default, not Fabric Spark's — Fabric Spark commits at `Serializable`, so on a shared table with no `delta.isolationLevel` property the two engines differ (we are the more permissive). Use `serializable` to match Fabric Spark |
 | `compression` | `snappy` | + auto dictionary encoding + always-on min/max stats |
 
 So a **default** table is read by Spark, delta-kernel, and Fabric Spark + OneLake conversion (all

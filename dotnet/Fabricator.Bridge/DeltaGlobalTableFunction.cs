@@ -490,8 +490,16 @@ internal static class DeltaWriter
         if (serializable)
         {
             // Stamp the ATTACH isolation_level 'serializable' onto CREATEd tables so the table SELF-DECLARES
-            // its guarantee (all writers, us + Spark, then honor it uniformly). write_serializable is the
-            // Spark default => left ABSENT (no stamp), matching Spark's minimal metadata.
+            // its guarantee (all writers, us + Spark, then honor it uniformly). Serializable is ALSO the only
+            // value Fabric/OSS Spark's DDL validator accepts, so a stamped table stays fully manageable there.
+            //
+            // write_serializable is left ABSENT (no stamp). The old justification here — "matching Spark's
+            // minimal metadata" — was wrong twice over (measured 2026-07-31, Fabric Spark 4.1.1): Spark's own
+            // default is Serializable, not write_serializable, and Spark REJECTS 'WriteSerializable' as a
+            // property value. Leaving it absent is still right, but the real reasons are (a) a stamp would
+            // freeze a value Spark cannot later change via ALTER, and (b) absent = "each writer's own
+            // default", which is what a per-catalog knob means. Consequence to know: on an unstamped shared
+            // table we are WriteSerializable while Fabric Spark is Serializable. docs/delta-transactions.md §10.6.
             config["delta.isolationLevel"] = "Serializable";
         }
         if (deletionVectors)

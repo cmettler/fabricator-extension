@@ -170,6 +170,24 @@ internal sealed class FileLoggerProvider : ILoggerProvider
             if (exception is not null)
             {
                 sb.Append(" | ").Append(exception.GetType().Name).Append(": ").Append(exception.Message);
+                // At Debug/Trace ONLY, append the inner-exception chain and the STACK TRACE. The message alone
+                // names WHAT failed but never WHERE, and "which of our operations produced this provider error?"
+                // is the question that actually costs time: a OneLake commit conflict arrives as a generic Azure
+                // RequestFailedException, and identifying the call site by reading code instead of reading a
+                // trace is how a conditional-create status mapping stayed wrong (see
+                // OneLakeDataLakeFileSystem.CreateAsync). Kept off at Warning/Information so the normal sink
+                // stays one line per event.
+                if (_owner._min <= LogLevel.Debug)
+                {
+                    for (var inner = exception.InnerException; inner is not null; inner = inner.InnerException)
+                    {
+                        sb.Append("\n    caused by ").Append(inner.GetType().Name).Append(": ").Append(inner.Message);
+                    }
+                    if (exception.StackTrace is { Length: > 0 } trace)
+                    {
+                        sb.Append('\n').Append(trace);
+                    }
+                }
             }
             sb.Append('\n');
             _owner.Write(sb.ToString());
