@@ -103,7 +103,7 @@ internal sealed class FabricRunNotebookFunction : ICatalogTableFunction
             var ws = _api.ResolveWorkspace(_workspace);
             var nb = _api.ResolveItem(_notebook, "Notebook", ws);
 
-            var instanceId = await _api.SubmitNotebookRunAsync(ws, nb, BuildBody(), ct).ConfigureAwait(false);
+            var instanceId = await _api.SubmitItemJobAsync(ws, nb, "RunNotebook", BuildBody(), ct).ConfigureAwait(false);
             var state = await _api.PollNotebookRunAsync(ws, nb, instanceId, _waitSeconds, ct).ConfigureAwait(false);
 
             var id = new StringArray.Builder();

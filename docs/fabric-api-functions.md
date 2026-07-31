@@ -1,7 +1,8 @@
 # Fabric REST API custom functions — design + as-built (P0 shipped, P1/P2 designed)
 
-> Status 2026-07-30: **P0, parameterized notebook RUNS, and P2 introspection are BUILT and validated
-> LIVE; the generic job surface + table maintenance remain design.** §9c is the as-built record, §9d
+> Status 2026-07-31: **P0, notebook runs, P1 jobs + table maintenance, and P2 introspection are all BUILT
+> and validated LIVE** (§9e). Semantic models are ANALYSED, not built (§9f) — refresh is not in the Fabric
+> SDK at all; it lives in the Power BI REST API, on an audience we already mint. §9c is the as-built record, §9d
 > settles how notebook parameters actually arrive, §10 sweeps the whole API with a verdict per area; §4's
 > table marks what is shipped. The research below is
 > file:line-verified against the working tree and the pinned SDK binary; treat the REST shapes as
@@ -680,6 +681,119 @@ side-channel read after N experiments measures only the last one. The fix — cl
 submission and read it per shape — is what produced the real answer. This is the repo's standing
 "a negative result is not a measurement until the method is shown to work" rule in a new disguise:
 here the method ran fine and the ATTRIBUTION was broken.
+
+## 9e. Jobs, maintenance and introspection — BUILT (2026-07-31)
+
+Eight more functions, on one shared submit+poll path (`SubmitItemJobAsync` / `PollItemJobAsync`, generalized
+out of the notebook runner):
+
+| function | kind | verified |
+|---|---|---|
+| `fabric_table_maintenance(table [, schema :=] [, v_order :=] [, z_order_by :=] [, vacuum_retention :=] [, purge_deletion_vectors :=] [, wait_seconds :=] [, workspace :=] [, item :=])` | table, blocking | **LIVE — `Completed`** with `v_order := true` on `dbo.arrownet_ckpt`, and the table still read back correctly afterwards (18 rows) |
+| `fabric_run_job(item, job_type [, execution_data_json :=] [, wait_seconds :=] [, workspace :=] [, item_type :=])` | table | **LIVE** — submitted `RunNotebook` with `wait_seconds := 0` → `NotStarted` + instance id |
+| `fabric_job_status(item, job_instance_id [, workspace :=] [, item_type :=])` | table | **LIVE** — `Completed` |
+| `fabric_job_instances(item [, workspace :=] [, item_type :=])` | table | **LIVE** — 17 `RunNotebook`/`Completed` rows for the spike notebook |
+| `fabric_cancel_job(item, job_instance_id)` | scalar → BOOLEAN | **LIVE** — accepted |
+| `fabric_lakehouse_tables([workspace :=] [, item :=])` | table | **LIVE** — 5 rows on the FLAT lakehouse; see the limitation below |
+| `fabric_operation_status(operation_id)` | table | **LIVE** — clean `NotFound` for a bogus id |
+| `fabric_reset_shortcut_cache([workspace :=])` | table | **wired, success path UNTESTABLE here** — see below |
+
+**Why table maintenance is worth having next to our own OPTIMIZE**: **V-Order** is Microsoft's proprietary
+parquet layout optimization and we cannot produce it, so a table that Power BI or the SQL endpoint reads hot
+belongs in this job even though we compact perfectly well ourselves. It also offers Z-order, VACUUM and
+`REORG … APPLY (PURGE)` for deletion vectors. Following the API's own convention, an ABSENT settings object
+means "skip that part", so the defaults here do nothing rather than something surprising.
+
+### Findings
+
+- **`fabric_lakehouse_tables` is REFUSED on a schema-enabled lakehouse**:
+  `UnsupportedOperationForSchemasEnabledLakehouse` — *"The operation is not supported for Lakehouse with
+  schemas enabled."* The same call against the flat `LH_no_schema` returns its 5 tables, so this is Fabric's
+  limitation and not our wiring. Our own catalog discovery covers the schema-enabled case anyway.
+- **`Wrap` did NOT cover a paged read, and the first failure proved it.** `PageableResponse<T>` is lazy, so
+  the request happens during ENUMERATION — outside the try — and the refusal above arrived as a raw Azure dump
+  complete with a header list rather than our formatted message. Fixed by `WrapList`, which materializes
+  inside the guard; every paged read now uses it. Worth remembering as a shape: *a guard around a call that
+  returns a lazy sequence guards nothing.*
+- **A table function cannot take a SUBQUERY argument** — `Binder Error: Table function cannot contain
+  subqueries`. So `fabric_job_status(item, (SELECT job_instance_id FROM j))` is rejected while the SCALAR
+  `fabric_cancel_job(item, (SELECT …))` accepts it. Pass a literal, or keep the id in a variable. A DuckDB
+  rule, not ours, but it shapes how these compose.
+- **`fabric_reset_shortcut_cache` is implemented BLIND, deliberately, and is nonetheless proven wired**: the
+  SP is refused with `400 PrincipalTypeNotSupported` (as measured in §9b), so the SUCCESS path could not be
+  exercised — but the call reaches the service and returns the service's own error, which is everything except
+  the permission. Expected to work under a USER identity, and in particular under a Fabric notebook's AMBIENT
+  token, which is user-delegated rather than an SP. It is a TABLE function because a zero-argument SCALAR is
+  impossible (a scalar's argument batch is how row count crosses) and because returning a row lets it report
+  which workspace it acted on.
+
+## 9f. SEMANTIC MODELS — what exists, and where refresh actually lives (analysis, 2026-07-31, NOT built)
+
+Both a **Lakehouse** and a **Warehouse** get a **default semantic model**, and both are reachable with the
+credential we already hold. The question is which API surface serves them.
+
+**The Fabric SDK cannot refresh a semantic model at all.** Probed in the pinned 2.14.0 with a zero control:
+`RefreshSemanticModel` 0, `SemanticModelRefresh` 0, `EnhancedRefresh` 0, `RefreshSchedule` 0.
+`SemanticModel.ItemsClient` offers only CRUD, `GetSemanticModelDefinition`/`UpdateSemanticModelDefinition`,
+`ListSemanticModels`, and `BindSemanticModelConnection`. So:
+
+| capability | surface | availability for us |
+|---|---|---|
+| list / get models | `SemanticModel.Items.ListSemanticModels` (Fabric SDK) | **available now**, same client, no new auth |
+| model definition (TMDL/TMSL parts) | `GetSemanticModelDefinition` (LRO) | available now; base64 parts, same shape as the notebook definition |
+| rebind to another connection | `BindSemanticModelConnection` | available now |
+| **REFRESH** | **Power BI REST** `POST /v1.0/myorg/groups/{ws}/datasets/{id}/refreshes` | **different HOST, but the SAME audience we already mint** |
+| refresh history | Power BI REST `GET …/refreshes` | ditto |
+| per-table / per-partition refresh | **XMLA + TMSL** through the existing DAX provider | ditto (ADOMD is already wired) |
+
+**The auth story is already solved, which is the important part.** The Power BI REST API wants
+`Dataset.ReadWrite.All` on the **`https://analysis.windows.net/powerbi/api`** audience — and
+`FabricCredentialResolver.PowerBiScope` is exactly that constant, already used by the DAX provider
+(`DaxTokenAuth`). So the same `fabric_sp` secret and the same ambient notebook token serve semantic-model
+refresh with **no new scope, no new credential path** — only a second base URL. That is a strictly smaller
+change than the Fabric API integration was.
+
+**The enhanced-refresh body is expressive enough to be worth exposing properly** (not just a fire-and-forget):
+`type` (Full / ClearValues / Calculate / DataOnly / Automatic / Defragment), `commitMode`
+(Transactional / PartialBatch), `objects[{table, partition}]`, `applyRefreshPolicy`, `effectiveDate`,
+`maxParallelism`, `retryCount`, `timeout`. It returns **202 + `Location` + `x-ms-request-id`**, and status
+comes from `GET …/refreshes` — the same submit-then-poll shape `SubmitItemJobAsync`/`PollItemJobAsync`
+already implement, so the polling logic is reusable rather than new.
+
+**Why this matters right next to `fabric_refresh_sql_endpoint`:** after a Delta write there are TWO consumers
+to make current, and they are refreshed by different calls. `fabric_refresh_sql_endpoint` makes the table
+visible to **T-SQL**; refreshing the **semantic model** (a DirectLake reframe for a lakehouse/warehouse
+default model) is what makes the new data visible to **Power BI**. A dbt flow that ends in a report wants
+both, and today we only offer the first.
+
+**Constraints to design around, all documented rather than guessed:**
+- **Enhanced refresh is NOT supported on shared capacity** (and shared capacity is limited to 8 refreshes/day,
+  body restricted to `notifyOption`). So the rich form requires Fabric/Premium capacity — which the Fabric
+  case always is, but the error must say so.
+- **`notifyOption` is not applicable to a service-principal call**, and an enhanced refresh requires at least
+  one non-`notifyOption` field. So the SP path must send a real body and must NOT send `notifyOption` — the
+  two rules interact, and getting it wrong yields a plain refresh instead of the requested one.
+- **Resolving a lakehouse's default semantic model is by NAME convention** (it carries the item's name), not
+  by a documented link — `ListSemanticModels` has no "this is the default for item X" field. Any function
+  doing the lookup should say so, and accept an explicit model name/GUID.
+- SP support for the Power BI REST surface is additionally gated by a **tenant setting** ("allow service
+  principals to use Power BI APIs"), which is a different switch from the Fabric-API one and has already
+  bitten this tenant twice on other endpoints. Probe before promising.
+
+**Recommended shape when built** — three functions, in this order of value:
+
+1. `fabric_refresh_semantic_model(model [, type :=] [, objects_json :=] [, commit_mode :=] [, max_parallelism :=] [, retry_count :=] [, timeout :=] [, wait_seconds :=] [, workspace :=])` → one row (`request_id`, `status`, `start_time`, `end_time`, `error_message`), blocking by default like the rest.
+2. `fabric_semantic_models([workspace :=])` → id, name, description — Fabric SDK, trivial, and the discovery half of (1).
+3. `fabric_semantic_model_refreshes(model [, workspace :=] [, top :=])` → refresh history (`request_id`,
+   `refresh_type`, `status`, `extended_status`, times, error), for asserting in a hook that the LAST refresh
+   actually succeeded.
+
+**And the ADOMD/XMLA route stays the better answer for fine-grained work**, which is why (1) should not try to
+grow into it: the DAX provider already holds an ADOMD connection on the same token, so a TMSL `refresh`
+command there gives per-table/partition control, `sequence` batching, and the model-level operations the REST
+API does not express at all. The natural split is **REST for "refresh this model, tell me when it is done"
+(`fabric_*`), XMLA/TMSL for "refresh exactly these partitions in this order" (`dax_*`)** — and the second one
+belongs in the DAX provider's namespace, not this one.
 
 ## 10. The full API sweep — every area, with a verdict
 

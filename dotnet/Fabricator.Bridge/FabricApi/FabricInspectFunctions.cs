@@ -129,7 +129,7 @@ internal sealed class FabricWorkspacesFunction : FabricRowsFunction
     protected override int Fill(StringArray.Builder[] c, string?[] args, CancellationToken ct)
     {
         int n = 0;
-        foreach (var w in FabricApiClient.Wrap("workspaces", () => Api.Client.Core.Workspaces.ListWorkspaces(cancellationToken: ct)))
+        foreach (var w in FabricApiClient.WrapList("workspaces", () => Api.Client.Core.Workspaces.ListWorkspaces(cancellationToken: ct)))
         {
             c[0].Append(w.Id.ToString());
             c[1].Append(w.DisplayName);
@@ -173,7 +173,7 @@ internal sealed class FabricItemsFunction : FabricRowsFunction
     {
         var ws = Api.ResolveWorkspace(args[1]);
         int n = 0;
-        foreach (var i in FabricApiClient.Wrap("items",
+        foreach (var i in FabricApiClient.WrapList("items",
                      () => Api.Client.Core.Items.ListItems(ws, type: FabricShortcutPath.NullIfBlank(args[0]), cancellationToken: ct)))
         {
             c[0].Append(i.Id?.ToString());
@@ -217,7 +217,7 @@ internal sealed class FabricLakehousesFunction : FabricRowsFunction
     {
         var ws = Api.ResolveWorkspace(args[0]);
         int n = 0;
-        foreach (var lh in FabricApiClient.Wrap("lakehouses",
+        foreach (var lh in FabricApiClient.WrapList("lakehouses",
                      () => Api.Client.Lakehouse.Items.ListLakehouses(ws, cancellationToken: ct)))
         {
             var p = lh.Properties;
@@ -259,7 +259,7 @@ internal sealed class FabricWarehousesFunction : FabricRowsFunction
     {
         var ws = Api.ResolveWorkspace(args[0]);
         int n = 0;
-        foreach (var wh in FabricApiClient.Wrap("warehouses",
+        foreach (var wh in FabricApiClient.WrapList("warehouses",
                      () => Api.Client.Warehouse.Items.ListWarehouses(ws, cancellationToken: ct)))
         {
             c[0].Append(wh.Id?.ToString());
@@ -302,7 +302,7 @@ internal sealed class FabricConnectionsFunction : FabricRowsFunction
     protected override int Fill(StringArray.Builder[] c, string?[] args, CancellationToken ct)
     {
         int n = 0;
-        foreach (var conn in FabricApiClient.Wrap("connections",
+        foreach (var conn in FabricApiClient.WrapList("connections",
                      () => Api.Client.Core.Connections.ListConnections(cancellationToken: ct)))
         {
             var d = conn.ConnectionDetails;

@@ -39,6 +39,9 @@ internal static class FabricApiFunctions
         // Parameterized notebook runs: parameters ride executionData.parameters, the shape live-verified to
         // be honoured (the generic top-level array is accepted and silently ignored — docs §9d).
         tables.Add(new FabricRunNotebookFunction(api));
+        // Jobs: table maintenance (V-Order, which our own OPTIMIZE cannot produce), the generic runner, and
+        // status/history/cancel. They share one submit+poll path.
+        FabricJobFunctions.Register(scalars, tables, api);
         // Read-only introspection: the identifiers the write functions above need (a connection GUID for an
         // external shortcut target, an endpoint connection string for a T-SQL ATTACH, a workspace/item name).
         FabricInspectFunctions.Register(tables, api);

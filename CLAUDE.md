@@ -364,6 +364,36 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     → LH's 19 tables vs `(item := 'LH2')` → 0 through the same attach. `ResolveItem` gained an explicit
     `workspaceId` so a cross-workspace lookup does not silently search the attach's own workspace. The
     shortcut SCALARS are excluded (no named parameters) and always act on the ATTACHED item.
+  - **JOBS + MAINTENANCE + the last introspection — BUILT and live-validated (2026-07-31, §9e):**
+    `fabric_table_maintenance` (**V-Order**, which our OPTIMIZE cannot produce — complementary, not a
+    duplicate; live `Completed`, table re-read fine afterwards), `fabric_run_job` / `_job_status` /
+    `_job_instances` / `_cancel_job` (one shared submit+poll path generalized out of the notebook runner),
+    `fabric_lakehouse_tables`, `fabric_operation_status`, and `fabric_reset_shortcut_cache` — the last
+    implemented BLIND because the SP is refused (`PrincipalTypeNotSupported`), yet PROVEN WIRED: it reaches
+    the service and returns the service's own error, so only the permission is missing (expect it to work on
+    a notebook's AMBIENT user-delegated token).
+    - **⚠ `Wrap` did NOT cover a PAGED read, and the first live failure exposed it**: `PageableResponse<T>` is
+      lazy, so the request happens during ENUMERATION — outside the try — and the error arrived as a raw Azure
+      dump with a header list instead of our formatted message. Fixed by `WrapList` (materializes inside the
+      guard); all paged reads use it. General shape: *a guard around a call returning a lazy sequence guards
+      nothing.*
+    - Two API limits found: `fabric_lakehouse_tables` is REFUSED on a **schema-enabled** lakehouse
+      (`UnsupportedOperationForSchemasEnabledLakehouse`; works on a flat one — our own discovery covers it
+      anyway), and **a DuckDB table function cannot take a SUBQUERY argument** (`Binder Error: Table function
+      cannot contain subqueries`) while a SCALAR can — so `fabric_job_status` needs a literal id.
+  - **SEMANTIC MODELS — ANALYSED, NOT BUILT (§9f).** The Fabric SDK **cannot refresh one at all** (probed with
+    a zero control: `RefreshSemanticModel`/`EnhancedRefresh`/`RefreshSchedule` all 0; only CRUD + definition +
+    `BindSemanticModelConnection`). Refresh lives in the **Power BI REST API**
+    (`POST /v1.0/myorg/groups/{ws}/datasets/{id}/refreshes`) — a different HOST but the **same audience we
+    already mint**: `FabricCredentialResolver.PowerBiScope` is exactly the `powerbi/api` scope the DAX
+    provider uses, so the same `fabric_sp`/ambient token works with NO new credential path. Both a Lakehouse
+    and a Warehouse have a DEFAULT semantic model (resolved by NAME convention — there is no "default for item
+    X" field), and refreshing it is what makes a Delta write visible to **Power BI**, the way
+    `fabric_refresh_sql_endpoint` makes it visible to **T-SQL**. Constraints: enhanced refresh needs
+    Fabric/Premium (unsupported on shared capacity, 8/day), `notifyOption` is invalid for an SP yet an
+    enhanced refresh needs a non-`notifyOption` body, and SP access is gated by a SEPARATE Power BI tenant
+    setting. Split to keep: **REST for "refresh this model, tell me when done" (`fabric_*`), XMLA/TMSL through
+    the DAX provider for per-table/partition control (`dax_*`)**.
   - Output shape rule (D4): typed flat columns + one raw-JSON column for polymorphic parts; **no STRUCT
     wrapping** (adding a column is additive for `SELECT *`; adding a struct FIELD changes a column's type
     and breaks bound views), no JSON-only. Every `table`-kind function also gets a dead `_each` sibling —

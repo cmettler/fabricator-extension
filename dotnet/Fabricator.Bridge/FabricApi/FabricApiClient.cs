@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Threading;
 using Azure;
 using Azure.Core;
@@ -92,7 +93,8 @@ internal sealed class FabricApiClient
     /// <c>Notebook</c>), and <paramref name="workspaceId"/> the workspace to look in — pass it when the caller
     /// overrode the workspace, or a cross-workspace lookup would search the ATTACH's own.
     /// </summary>
-    internal Guid ResolveItem(string? nameOrId, string itemType, Guid? workspaceId = null)
+    internal Guid ResolveItem(string? nameOrId, string itemType, Guid? workspaceId = null,
+                              bool requireType = true)
     {
         var wanted = nameOrId;
         if (Blank(wanted))
@@ -113,16 +115,20 @@ internal sealed class FabricApiClient
             return direct;
         }
         var ws = workspaceId ?? ResolveWorkspace(null);
-        return _idCache.GetOrAdd($"item:{ws}:{itemType}:{trimmed}", _ =>
+        // requireType=false searches EVERY item type: the generic job functions take an item of any kind, and
+        // filtering by a guessed type would hide the item the caller actually named.
+        var typeFilter = requireType ? itemType : null;
+        return _idCache.GetOrAdd($"item:{ws}:{typeFilter ?? "*"}:{trimmed}", _ =>
         {
-            foreach (var i in Client.Core.Items.ListItems(ws, type: itemType))
+            foreach (var i in Client.Core.Items.ListItems(ws, type: typeFilter))
             {
                 if (string.Equals(i.DisplayName?.Trim(), trimmed, StringComparison.OrdinalIgnoreCase))
                 {
                     return i.Id ?? Guid.Empty;
                 }
             }
-            throw new NotSupportedException($"fabric: {itemType} '{trimmed}' not found in workspace {ws}.");
+            throw new NotSupportedException(
+                $"fabric: {(requireType ? itemType : "item")} '{trimmed}' not found in workspace {ws}.");
         });
     }
 
@@ -181,6 +187,27 @@ internal sealed class FabricApiClient
 
     internal static void Wrap(string what, Action body) => Wrap(what, () => { body(); return 0; });
 
+    /// <summary>
+    /// Runs a PAGED read and MATERIALIZES it inside the guard.
+    /// </summary>
+    /// <remarks>
+    /// <c>Wrap</c> alone is not enough for a pageable response: the SDK's <c>PageableResponse&lt;T&gt;</c> is
+    /// lazy, so the request happens during enumeration — OUTSIDE the try — and its exception escapes
+    /// unformatted, reaching the user as a raw Azure dump complete with a header list. Materializing here also
+    /// bounds the request to the guard's lifetime rather than the consumer's. Measured: a
+    /// schema-enabled-lakehouse ListTables refusal surfaced that way before this existed.
+    /// </remarks>
+    internal static List<T> WrapList<T>(string what, Func<IEnumerable<T>> body) =>
+        Wrap(what, () =>
+        {
+            var rows = new List<T>();
+            foreach (var row in body())
+            {
+                rows.Add(row);
+            }
+            return rows;
+        });
+
     // ---- notebook runs: raw HTTP, of necessity -------------------------------------------------------
     //
     // The SDK's RunOnDemandItemJob returns a bare Response (the instance id is only in the Location
@@ -188,8 +215,12 @@ internal sealed class FabricApiClient
     // the monitoring links live at `properties.*` on the NOTEBOOK-scoped instance GET, which the SDK does
     // not project — so this one flow is hand-rolled. Everything else goes through the SDK.
 
-    /// <summary>What a finished (or still-running) notebook job reports.</summary>
-    internal sealed record NotebookRunState(
+    /// <summary>
+    /// What a finished (or still-running) item job reports. <c>ExitValue</c>/<c>Compute</c>/<c>SnapshotUrl</c>
+    /// are notebook-only (they come from the notebook-scoped instance's <c>properties</c>) and stay null for
+    /// every other job type.
+    /// </summary>
+    internal sealed record JobRunState(
         string Status, string? StartTimeUtc, string? EndTimeUtc, string? ExitValue, string? Compute,
         string? SnapshotUrl, string? ErrorCode, string? ErrorMessage);
 
@@ -219,24 +250,27 @@ internal sealed class FabricApiClient
         return await Http.SendAsync(req, ct).ConfigureAwait(false);
     }
 
-    /// <summary>Submits a RunNotebook job and returns its instance id (read from the Location header).</summary>
-    internal async System.Threading.Tasks.Task<string> SubmitNotebookRunAsync(
-        Guid workspaceId, Guid notebookId, string body, CancellationToken ct)
+    /// <summary>
+    /// Submits an on-demand item job of <paramref name="jobType"/> and returns its instance id, which is only
+    /// available in the <c>Location</c> header (the 202 has no body).
+    /// </summary>
+    internal async System.Threading.Tasks.Task<string> SubmitItemJobAsync(
+        Guid workspaceId, Guid itemId, string jobType, string? body, CancellationToken ct)
     {
-        var url = $"https://api.fabric.microsoft.com/v1/workspaces/{workspaceId}/items/{notebookId}"
-                  + "/jobs/RunNotebook/instances";
+        var url = $"https://api.fabric.microsoft.com/v1/workspaces/{workspaceId}/items/{itemId}"
+                  + $"/jobs/{jobType}/instances";
         using var resp = await SendAsync(System.Net.Http.HttpMethod.Post, url, body, ct).ConfigureAwait(false);
         var text = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
         if ((int)resp.StatusCode != 202)
         {
-            throw new NotSupportedException($"fabric run_notebook: HTTP {(int)resp.StatusCode}: {Trim(text)}");
+            throw new NotSupportedException($"fabric run_job({jobType}): HTTP {(int)resp.StatusCode}: {Trim(text)}");
         }
         var location = resp.Headers.Location?.ToString() ?? string.Empty;
         var id = location.Split('/')[^1].Split('?')[0];
         if (!Guid.TryParse(id, out _))
         {
             throw new NotSupportedException(
-                $"fabric run_notebook: accepted but no job-instance id in the Location header ('{location}').");
+                $"fabric run_job({jobType}): accepted but no job-instance id in the Location header ('{location}').");
         }
         return id;
     }
@@ -246,20 +280,32 @@ internal sealed class FabricApiClient
     /// immediately after submission). Reads the NOTEBOOK-scoped instance URL, the only one that returns the
     /// <c>properties</c> object holding exitValue + the monitoring links.
     /// </summary>
-    internal async System.Threading.Tasks.Task<NotebookRunState> PollNotebookRunAsync(
+    internal async System.Threading.Tasks.Task<JobRunState> PollNotebookRunAsync(
         Guid workspaceId, Guid notebookId, string instanceId, long waitSeconds, CancellationToken ct)
     {
-        // TWO urls, and the split is load-bearing. The ITEMS-scoped instance exists as soon as the job is
-        // accepted, so it is what we poll. The NOTEBOOK-scoped one is the only source of `properties`
-        // (exitValue + monitoring links) but its record is populated LATER — reading it straight after
-        // submission 404s with ItemNotFound / "No notebook execution state found in database for the
-        // runId", which is a timing artefact rather than a missing notebook.
-        var itemsUrl = $"https://api.fabric.microsoft.com/v1/workspaces/{workspaceId}/items/{notebookId}"
-                       + $"/jobs/instances/{instanceId}";
+        var polled = await PollItemJobAsync(workspaceId, notebookId, instanceId, waitSeconds, ct)
+            .ConfigureAwait(false);
         var notebookUrl = $"https://api.fabric.microsoft.com/v1/workspaces/{workspaceId}/notebooks/{notebookId}"
                           + $"/jobs/execute/instances/{instanceId}";
+        // Best-effort enrichment: never fail a completed run because the extended record is not there yet.
+        return await EnrichAsync(polled, notebookUrl, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Polls any item job's ITEMS-scoped instance until terminal or <paramref name="waitSeconds"/> elapses
+    /// (0 = read once and return).
+    /// </summary>
+    internal async System.Threading.Tasks.Task<JobRunState> PollItemJobAsync(
+        Guid workspaceId, Guid itemId, string instanceId, long waitSeconds, CancellationToken ct)
+    {
+        // The ITEMS-scoped instance is what we poll because it exists as soon as the job is ACCEPTED. The
+        // notebook-scoped variant (the only source of `properties` — exitValue + monitoring links) is
+        // populated LATER: reading it straight after submission 404s with ItemNotFound / "No notebook
+        // execution state found in database for the runId", a timing artefact rather than a missing item.
+        var itemsUrl = $"https://api.fabric.microsoft.com/v1/workspaces/{workspaceId}/items/{itemId}"
+                       + $"/jobs/instances/{instanceId}";
         var deadline = DateTimeOffset.UtcNow.AddSeconds(waitSeconds <= 0 ? 0 : waitSeconds);
-        NotebookRunState state;
+        JobRunState state;
         while (true)
         {
             state = await ReadInstanceAsync(itemsUrl, ct).ConfigureAwait(false);
@@ -272,11 +318,17 @@ internal sealed class FabricApiClient
             // faster only burns request quota.
             await System.Threading.Tasks.Task.Delay(TimeSpan.FromSeconds(5), ct).ConfigureAwait(false);
         }
-        // Best-effort enrichment: never fail a completed run because the extended record is not there.
-        return await EnrichAsync(state, notebookUrl, ct).ConfigureAwait(false);
+        return state;
     }
 
-    private async System.Threading.Tasks.Task<NotebookRunState> ReadInstanceAsync(
+    /// <summary>Reads one item-job instance without polling.</summary>
+    internal System.Threading.Tasks.Task<JobRunState> GetItemJobAsync(
+        Guid workspaceId, Guid itemId, string instanceId, CancellationToken ct) =>
+        ReadInstanceAsync(
+            $"https://api.fabric.microsoft.com/v1/workspaces/{workspaceId}/items/{itemId}"
+            + $"/jobs/instances/{instanceId}", ct);
+
+    private async System.Threading.Tasks.Task<JobRunState> ReadInstanceAsync(
         string url, CancellationToken ct)
     {
         using var resp = await SendAsync(System.Net.Http.HttpMethod.Get, url, null, ct).ConfigureAwait(false);
@@ -294,7 +346,7 @@ internal sealed class FabricApiClient
             errCode = JsonStr(fr, "errorCode");
             errMsg = JsonStr(fr, "message");
         }
-        return new NotebookRunState(
+        return new JobRunState(
             JsonStr(root, "status") ?? "Unknown", JsonStr(root, "startTimeUtc"), JsonStr(root, "endTimeUtc"),
             ExitValue: null, Compute: null, SnapshotUrl: null, errCode, errMsg);
     }
@@ -304,8 +356,8 @@ internal sealed class FabricApiClient
     /// is available. Failure is SWALLOWED on purpose: these are diagnostics, and the extended record is
     /// populated asynchronously — losing them must never turn a successful run into an error.
     /// </summary>
-    private async System.Threading.Tasks.Task<NotebookRunState> EnrichAsync(
-        NotebookRunState state, string notebookUrl, CancellationToken ct)
+    private async System.Threading.Tasks.Task<JobRunState> EnrichAsync(
+        JobRunState state, string notebookUrl, CancellationToken ct)
     {
         try
         {

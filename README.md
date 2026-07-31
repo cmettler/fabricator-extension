@@ -82,7 +82,8 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | | OneLake **shortcut** create / alter / drop / list, incl. non-OneLake targets via JSON | ✅ OneLake attaches |
 | | Introspection: workspaces, items, lakehouses (+ SQL endpoint strings), warehouses, connections, notebook parameters | ✅ OneLake attaches |
 | | **Parameterized notebook runs** (blocking, with status + portal snapshot link) | ✅ OneLake attaches |
-| | Generic jobs, table maintenance (V-Order); notebook `exitValue` | ⏳ designed / best-effort |
+| | **Jobs**: table maintenance (V-Order/Z-order/vacuum), generic runner, status, history, cancel | ✅ OneLake attaches |
+| | Semantic-model refresh (Power BI REST / XMLA); notebook `exitValue` | ⏳ analysed / best-effort |
 | **Callable** | Discovered scalar UDFs → `db.schema.fn(args)` (vectorized over Arrow) | ✅ |
 | | Discovered table-valued functions → `SELECT * FROM db.schema.tvf(args)` (+ projection/filter pushdown) | ✅ |
 | | Discovered stored procedures → `SELECT * FROM db.schema.proc(name := val)` (named/optional + OUTPUT params) | ✅ |
@@ -696,6 +697,13 @@ SELECT * FROM lake.dbo.fabric_refresh_sql_endpoint(item := 'OtherLH'); -- a diff
 | `fabric_connections()` | table | Cloud connections — the `id` an external shortcut target needs |
 | `fabric_run_notebook(notebook [, params_json := …] [, config_json := …] [, wait_seconds := …] [, workspace := …])` | table | **Runs a notebook with parameters and blocks** until it finishes; one row of final state |
 | `fabric_notebook_parameters(notebook)` | table | Names/defaults from a notebook's `parameters`-tagged cell |
+| `fabric_table_maintenance(table [, schema := …] [, v_order := …] [, z_order_by := …] [, vacuum_retention := …] [, purge_deletion_vectors := …])` | table | Runs Fabric's maintenance job — **V-Order**, Z-order, VACUUM, purge deletion vectors |
+| `fabric_run_job(item, job_type [, execution_data_json := …] [, wait_seconds := …])` | table | Any on-demand item job (e.g. a pipeline); blocks unless `wait_seconds := 0` |
+| `fabric_job_status(item, job_instance_id)` / `fabric_job_instances(item)` | table | One job's state / that item's job history |
+| `fabric_cancel_job(item, job_instance_id)` | scalar | Requests cancellation |
+| `fabric_lakehouse_tables()` | table | Tables as **Fabric** sees them (flat lakehouses only — see below) |
+| `fabric_operation_status(operation_id)` | table | Generic long-running-operation status |
+| `fabric_reset_shortcut_cache()` | table | Clears the workspace's shortcut cache (**needs a user identity**) |
 
 **Refreshing the SQL endpoint after a Delta write** — the reason this exists. A table written through the
 Delta provider is invisible to the lakehouse's T-SQL endpoint until Fabric's asynchronous detection notices
@@ -738,6 +746,29 @@ SELECT lake.dbo.fabric_create_shortcut_json('Files/landing', 'partner',
   '{"adlsGen2": {"location": "https://acct.dfs.core.windows.net",
                  "subpath": "/container/data", "connectionId": "…"}}');
 ```
+
+**Table maintenance — the one optimize this extension cannot do itself.** **V-Order** is a proprietary
+parquet layout optimization, so a table that Power BI or the SQL endpoint reads hot is worth passing through
+Fabric's own maintenance job even though `OPTIMIZE` compacts it perfectly well here:
+
+```sql
+SELECT status, error_message FROM lake.dbo.fabric_table_maintenance(
+  'orders', schema := 'dbo', v_order := true, z_order_by := 'order_date,customer_id');
+```
+
+Omitting the optimize knobs skips optimization, and omitting `vacuum_retention` skips vacuum — that is the
+API's own convention, so a bare call does nothing rather than something surprising. `vacuum_retention` takes
+Fabric's `d:hh:mm:ss` form (e.g. `'7:01:00:00'`).
+
+Any other job type goes through the generic runner, and jobs can be watched or cancelled:
+
+```sql
+SELECT * FROM lake.dbo.fabric_run_job('nightly_pipeline', 'Pipeline', item_type := 'DataPipeline');
+SELECT job_type, status, start_time FROM lake.dbo.fabric_job_instances('my_notebook', item_type := 'Notebook');
+```
+
+> A table function cannot take a **subquery** argument (`Binder Error: Table function cannot contain
+> subqueries`), so pass `job_instance_id` as a literal. The scalar `fabric_cancel_job` accepts one.
 
 **Introspection.** Useful on its own, and the source of the identifiers the calls above need — for example
 attaching the lakehouse's T-SQL endpoint alongside the Delta catalog:
@@ -790,6 +821,11 @@ Notes and limits:
 - `fabric_connections()` lists only connections the **calling identity** has a role on — a service
   principal often sees none even where connection-backed shortcuts exist. Grant the SP access to the
   connection before creating external shortcuts with it.
+- `fabric_lakehouse_tables()` is **rejected by Fabric on a schema-enabled lakehouse**
+  (`UnsupportedOperationForSchemasEnabledLakehouse`); it works on a flat one. The extension's own catalog
+  lists a schema-enabled lakehouse's tables anyway.
+- `fabric_reset_shortcut_cache()` needs a **user identity** — a service principal is refused with
+  `PrincipalTypeNotSupported`. It is the remedy when a re-created shortcut name transiently conflicts.
 - `duckdb_functions()` also lists an `<name>_each` sibling for each table function. That is the generic
   per-row form and is not usable on this provider.
 
