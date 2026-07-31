@@ -209,10 +209,58 @@ not appear until the physical connection actually closes, which can be long afte
 | **visible in `queryinsights`** | **✗ no column anywhere** | **✅ `exec_sessions_history.context_info`** |
 | what Fabric itself uses | ✅ `root_activity_id`, `fabric_submitter_name` | — |
 
-The modern, documented-for-correlation mechanism is the one monitoring cannot see; the crude legacy one is the
-one that shows up. `sp_set_session_context` is therefore for in-session logic (row-level security being its
-canonical use) — which is presumably also why Fabric consumes its own `root_activity_id` internally rather than
-exposing it to us.
+The modern mechanism has no monitoring *column*; the crude legacy one does. **But that table understates
+`sp_set_session_context`, and the correction below is the most useful finding in this document.**
+
+### 2.4a A run UUID in session context is self-bridging — MEASURED end to end, and it needs no new machinery
+
+`SESSION_CONTEXT()` values are in no column, but **the `EXEC sp_set_session_context` call is itself a recorded
+statement, and `command` holds its full text** (`varchar(max)`). So setting a UUID *is* the monitoring-visible
+marker: find the EXEC by its UUID, take its `connection_id`, and every statement that session ran is attributed.
+No registry table, no label, no SQL rewriting — and because every key involved is a GUID, **spid reuse is
+irrelevant**, which was the point of choosing a UUID in the first place.
+
+Proven in three steps against the live Warehouse:
+
+1. **A session can read its own monitoring keys.** `sys.dm_exec_requests` is queryable, and
+   `SELECT connection_id, dist_statement_id FROM sys.dm_exec_requests WHERE session_id = @@SPID` returns them.
+   (`CONNECTIONPROPERTY('connection_id')` returns NULL on Fabric — not available.) `dist_statement_id` is
+   especially valuable: it is the Capacity Metrics **`Operation Id`**, i.e. the hop to CU seconds.
+2. **Those ids match what monitoring records.** Querying `exec_requests_history` by the `connection_id` a session
+   had read about itself returned **all ten** of that session's statements; querying by its `dist_statement_id`
+   returned exactly the right one, with the same `connection_id`. The id spaces are shared — an assumption that
+   had to be checked, since a DMV reporting different ids than the history would have broken the whole idea.
+3. **The end-to-end query works from the UUID alone.** No registry, no label:
+
+```sql
+WITH tagged AS (
+  SELECT DISTINCT connection_id
+  FROM queryinsights.exec_requests_history
+  WHERE command LIKE '%sp[_]set[_]session[_]context%<run-uuid>%')
+SELECT count(*) AS statements,
+       SUM(r.allocated_cpu_time_ms) AS total_cpu_ms,
+       SUM(CAST(r.data_scanned_remote_storage_mb AS decimal(18,3))) AS remote_mb
+FROM queryinsights.exec_requests_history r
+JOIN tagged t ON t.connection_id = r.connection_id;
+```
+
+which returned `statements = 10, total_cpu_ms = 21, remote_mb = 0.000` for the probe run — including the
+statements the extension issues on its own, which no query hint could have labelled.
+
+**Why this is the best of the three vectors.** It needs no statement rewriting (unlike `OPTION (LABEL)`), it can
+change mid-session so per-model grain is possible (unlike `Application Name`, fixed at connection open), it
+covers the SqlBulkCopy write, and it reaches CU via `dist_statement_id`. Practical shape: a dbt `pre_hook` runs
+`SELECT fabricator_exec('mssql', 'EXEC sp_set_session_context ''dbt_model'', ''…''')`, and the model's own
+statements inherit the tag through the connection.
+
+**The same blocker still gates it, and it is now the ONE thing to test.** §2.4's measurement — a tag set by one
+extension call was invisible to the next — becomes a *correlation* problem rather than a visibility one: if the
+`EXEC` lands on a different connection than the work, the join attributes the wrong statements, silently. But
+that probe used a bare `BEGIN; exec; query;` in the shell, **not dbt's shape**, where a model materialises inside
+one transaction on a pinned write connection. So the mechanism is proven at the Fabric level and the open
+question is narrowly ours: *does a pre-hook's `fabricator_exec` share the connection with the model's writes?*
+Test that in the dbt harness before anything else here. Note also that `--threads N` uses several connections, so
+the EXEC must run per connection — which a pre-hook naturally does.
 
 ### 2.5 What Fabric tags on its own — MEASURED, unexpected
 
@@ -329,14 +377,13 @@ is DuckDB SQL: the user never writes the T-SQL that reaches Fabric, so only the 
 > is clean — **`Application Name` covers everything a run does, `OPTION (LABEL)` adds per-statement grain to the
 > subset that is generated T-SQL** (scans, rowid UPDATE/DELETE, DDL, `fabricator_exec` text).
 
-**(b2) Investigate connection identity before betting on session context.** §2.4 shows a tag set by one
-extension call is not visible to the next, even inside an explicit transaction — the two calls reported
-different spids. That single fact decides between two designs: if consecutive calls in a DuckDB transaction can
-be made to share one session, then `SET CONTEXT_INFO` is a *better* per-model tag than a query label (no SQL
-rewriting, and it covers the bulk write), and a dbt pre-hook can drive it directly. If they cannot, the label
-setting in (b) is the only per-model route. **This is a cheap investigation with a large fork in the road behind
-it, so do it before (b).** Note it is also worth knowing for its own sake: it says something about our
-transaction/connection model that nothing currently documents.
+**(b2) → PROMOTE TO FIRST: test connection identity in the dbt shape, because §2.4a may make (b) unnecessary.**
+A run UUID set via `sp_set_session_context` is self-bridging (§2.4a) — measured end to end, needing **no
+extension feature at all**: a dbt `pre_hook` calling `fabricator_exec` tags the connection, and the whole run
+(including the bulk write) attributes by `connection_id`. The single unknown is whether a pre-hook's exec and the
+model's writes share one connection. **One targeted test in `dbt_mssql_test` decides whether (b) is worth
+building**, and it is far cheaper than building it. If they share, this wins outright; if not, the label setting
+in (b) is the fallback and (a) still applies.
 
 **(c) `fabricator_query_history()` — a convenience read (small).** A catalog-bound table function over
 `queryinsights.exec_requests_history` with sensible defaults (last N hours, this login, optional label filter).
