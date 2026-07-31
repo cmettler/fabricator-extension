@@ -671,21 +671,30 @@ SELECT * FROM lake.dbo.fab_delta_info();
 They are registered **only** for a OneLake root — a local or S3 Delta attach has no workspace or REST
 credential, so it shows none of them.
 
+Everything is optional except where noted, because the attach supplies the defaults. Where a function accepts
+`workspace :=` / `item :=`, those OVERRIDE the attached ones — so one attach can drive several lakehouses,
+which is the common case for a dbt project that writes to more than one:
+
+```sql
+SELECT * FROM lake.dbo.fabric_refresh_sql_endpoint();                  -- the attached lakehouse
+SELECT * FROM lake.dbo.fabric_refresh_sql_endpoint(item := 'OtherLH'); -- a different one
+```
+
 | function | kind | what it does |
 |---|---|---|
-| `fabric_refresh_sql_endpoint([recreate := …] [, timeout_seconds := …])` | table | Syncs the lakehouse's **SQL analytics endpoint** now; one row per table |
-| `fabric_list_shortcuts([parent_path := …])` | table | The lakehouse's OneLake shortcuts, optionally under one path |
+| `fabric_refresh_sql_endpoint([recreate := …] [, timeout_seconds := …] [, workspace := …] [, item := …])` | table | Syncs a lakehouse's **SQL analytics endpoint** now; one row per table |
+| `fabric_list_shortcuts([parent_path := …] [, workspace := …] [, item := …])` | table | A lakehouse's OneLake shortcuts, optionally under one path |
 | `fabric_create_shortcut(path, name, target_workspace, target_item, target_path)` | scalar | Creates a shortcut to another OneLake item; returns its full path. Fails if the name exists |
 | `fabric_alter_shortcut(…same args…)` | scalar | Re-points an **existing** shortcut (fails if absent) |
 | `fabric_create_shortcut_ex(…same args…, conflict_policy)` | scalar | Same, with `Abort` / `GenerateUniqueName` / `CreateOrOverwrite` / `OverwriteOnly` — use `CreateOrOverwrite` for idempotent scripts |
 | `fabric_create_shortcut_json(path, name, target_json [, conflict_policy])` | scalar | Any target type (ADLS Gen2, S3, GCS, Blob, Dataverse, SharePoint) as the REST `target` object |
 | `fabric_drop_shortcut(path, name [, if_exists])` | scalar | Deletes a shortcut; `if_exists := true` returns `false` instead of erroring |
 | `fabric_workspaces()` | table | Every workspace this identity can see (id, name, type, capacity) |
-| `fabric_items([item_type := …])` | table | Items in this workspace, optionally filtered (`'Notebook'`, `'Lakehouse'`, …) |
-| `fabric_lakehouses()` | table | Lakehouses **with their SQL endpoint id, status and connection string** |
-| `fabric_warehouses()` | table | Warehouses with their T-SQL connection strings |
+| `fabric_items([item_type := …] [, workspace := …])` | table | Items in a workspace, optionally filtered (`'Notebook'`, `'Lakehouse'`, …) |
+| `fabric_lakehouses([workspace := …])` | table | Lakehouses **with their SQL endpoint id, status and connection string** |
+| `fabric_warehouses([workspace := …])` | table | Warehouses with their T-SQL connection strings |
 | `fabric_connections()` | table | Cloud connections — the `id` an external shortcut target needs |
-| `fabric_run_notebook(notebook [, params_json := …] [, config_json := …] [, wait_seconds := …])` | table | **Runs a notebook with parameters and blocks** until it finishes; one row of final state |
+| `fabric_run_notebook(notebook [, params_json := …] [, config_json := …] [, wait_seconds := …] [, workspace := …])` | table | **Runs a notebook with parameters and blocks** until it finishes; one row of final state |
 | `fabric_notebook_parameters(notebook)` | table | Names/defaults from a notebook's `parameters`-tagged cell |
 
 **Refreshing the SQL endpoint after a Delta write** — the reason this exists. A table written through the

@@ -155,11 +155,17 @@ internal sealed class FabricRefreshSqlEndpointFunction : ICatalogTableFunction
     /// <summary>No positional arguments — everything comes from the ATTACH.</summary>
     public Schema Parameters { get; } = new Schema(System.Array.Empty<Field>(), null);
 
-    /// <summary>Both knobs are optional: <c>fabric_refresh_sql_endpoint(recreate := true)</c>.</summary>
+    /// <summary>
+    /// All optional: <c>fabric_refresh_sql_endpoint(recreate := true)</c>, and
+    /// <c>fabric_refresh_sql_endpoint(item := 'OtherLH')</c> to refresh a DIFFERENT lakehouse's endpoint than
+    /// the one this catalog is attached to — a dbt project commonly writes to several.
+    /// </summary>
     public Schema NamedParameters { get; } = new Schema(new[]
     {
         new Field("recreate", BooleanType.Default, nullable: true),
         new Field("timeout_seconds", Int64Type.Default, nullable: true),
+        FabricApiFunctions.Str("workspace"),
+        FabricApiFunctions.Str("item"),
     }, null);
 
     public IArrowTableFunctionBinding Bind(RecordBatch args) => new Binding(_api, args);
@@ -180,20 +186,25 @@ internal sealed class FabricRefreshSqlEndpointFunction : ICatalogTableFunction
         private readonly FabricApiClient _api;
         private readonly bool? _recreate;
         private readonly long? _timeoutSeconds;
+        private readonly string? _workspace;
+        private readonly string? _item;
 
         internal Binding(FabricApiClient api, RecordBatch args)
         {
             _api = api;
             _recreate = FabricArgs.Bool(args, 0);
             _timeoutSeconds = FabricArgs.Int(args, 1);
+            _workspace = FabricArgs.Str(args, 2);
+            _item = FabricArgs.Str(args, 3);
         }
 
         public override Schema OutputSchema => Columns;
 
         protected override IAsyncEnumerable<RecordBatch> Rows(CancellationToken ct)
         {
-            var ws = _api.WorkspaceId;
-            var lh = _api.ItemId;
+            // NULL falls back to the ATTACH's own workspace/lakehouse — the zero-argument case.
+            var ws = _api.ResolveWorkspace(_workspace);
+            var lh = _api.ResolveItem(_item, "Lakehouse", ws);
             var ep = _api.ResolveSqlEndpointId(ws, lh);
 
             Microsoft.Fabric.Api.SQLEndpoint.Models.SqlEndpointRefreshMetadataRequest? request = null;
@@ -456,10 +467,19 @@ internal sealed class FabricListShortcutsFunction : ICatalogTableFunction
 
     public Schema Parameters { get; } = new Schema(System.Array.Empty<Field>(), null);
 
-    /// <summary><c>fabric_list_shortcuts(parent_path := 'Files')</c> — unset lists all.</summary>
-    public Schema NamedParameters { get; } = new Schema(new[] { FabricApiFunctions.Str("parent_path") }, null);
+    /// <summary>
+    /// <c>fabric_list_shortcuts(parent_path := 'Files')</c> — unset lists all; <c>workspace</c>/<c>item</c>
+    /// read a different item than the attached one.
+    /// </summary>
+    public Schema NamedParameters { get; } = new Schema(new[]
+    {
+        FabricApiFunctions.Str("parent_path"),
+        FabricApiFunctions.Str("workspace"),
+        FabricApiFunctions.Str("item"),
+    }, null);
 
-    public IArrowTableFunctionBinding Bind(RecordBatch args) => new Binding(_api, FabricArgs.Str(args, 0, 0));
+    public IArrowTableFunctionBinding Bind(RecordBatch args) =>
+        new Binding(_api, FabricArgs.Str(args, 0), FabricArgs.Str(args, 1), FabricArgs.Str(args, 2));
 
     private sealed class Binding : FabricTableBinding
     {
@@ -479,19 +499,23 @@ internal sealed class FabricListShortcutsFunction : ICatalogTableFunction
 
         private readonly FabricApiClient _api;
         private readonly string? _parentPath;
+        private readonly string? _workspace;
+        private readonly string? _item;
 
-        internal Binding(FabricApiClient api, string? parentPath)
+        internal Binding(FabricApiClient api, string? parentPath, string? workspace, string? item)
         {
             _api = api;
             _parentPath = parentPath;
+            _workspace = workspace;
+            _item = item;
         }
 
         public override Schema OutputSchema => Columns;
 
         protected override IAsyncEnumerable<RecordBatch> Rows(CancellationToken ct)
         {
-            var ws = _api.WorkspaceId;
-            var item = _api.ItemId;
+            var ws = _api.ResolveWorkspace(_workspace);
+            var item = _api.ResolveItem(_item, "Lakehouse", ws);
             var paths = new StringArray.Builder();
             var names = new StringArray.Builder();
             var types = new StringArray.Builder();

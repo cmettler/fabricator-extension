@@ -87,11 +87,12 @@ internal sealed class FabricApiClient
     }
 
     /// <summary>
-    /// Resolves an item by GUID or display name within the ATTACH's workspace; null/empty ⇒ the item the root
-    /// names. <paramref name="itemType"/> is the Fabric item type to filter by (e.g. <c>Lakehouse</c>,
-    /// <c>Notebook</c>).
+    /// Resolves an item by GUID or display name; null/empty ⇒ the item the ATTACH root names.
+    /// <paramref name="itemType"/> is the Fabric item type to filter by (e.g. <c>Lakehouse</c>,
+    /// <c>Notebook</c>), and <paramref name="workspaceId"/> the workspace to look in — pass it when the caller
+    /// overrode the workspace, or a cross-workspace lookup would search the ATTACH's own.
     /// </summary>
-    internal Guid ResolveItem(string? nameOrId, string itemType)
+    internal Guid ResolveItem(string? nameOrId, string itemType, Guid? workspaceId = null)
     {
         var wanted = nameOrId;
         if (Blank(wanted))
@@ -111,7 +112,7 @@ internal sealed class FabricApiClient
         {
             return direct;
         }
-        var ws = ResolveWorkspace(null);
+        var ws = workspaceId ?? ResolveWorkspace(null);
         return _idCache.GetOrAdd($"item:{ws}:{itemType}:{trimmed}", _ =>
         {
             foreach (var i in Client.Core.Items.ListItems(ws, type: itemType))

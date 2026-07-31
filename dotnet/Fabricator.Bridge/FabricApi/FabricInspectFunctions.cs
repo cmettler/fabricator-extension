@@ -52,21 +52,40 @@ internal abstract class FabricRowsFunction : ICatalogTableFunction
 
     protected abstract Schema Columns { get; }
 
-    /// <summary>Appends rows to <paramref name="cols"/> (one builder per declared column).</summary>
-    protected abstract int Fill(StringArray.Builder[] cols, string? arg, CancellationToken ct);
+    /// <summary>
+    /// Appends rows to <paramref name="cols"/> (one builder per declared column). <paramref name="args"/> holds
+    /// every declared argument as a string, in declared order (<c>Parameters</c> ++ <c>NamedParameters</c>);
+    /// an omitted named argument is null.
+    /// </summary>
+    protected abstract int Fill(StringArray.Builder[] cols, string?[] args, CancellationToken ct);
 
-    public IArrowTableFunctionBinding Bind(RecordBatch args) =>
-        new Binding(this, FabricArgs.Str(args, 0, 0));
+    /// <summary>
+    /// Extracts the arguments HERE, while the batch is valid, rather than holding it.
+    /// </summary>
+    /// <remarks>
+    /// The args batch is imported from a stream the ABI handler disposes when <c>table_bind</c> returns, so a
+    /// binding that kept a reference would be reading freed Arrow buffers at execution time.
+    /// </remarks>
+    public IArrowTableFunctionBinding Bind(RecordBatch args)
+    {
+        int n = Parameters.FieldsList.Count + NamedParameters.FieldsList.Count;
+        var values = new string?[n];
+        for (int i = 0; i < n; i++)
+        {
+            values[i] = FabricArgs.Str(args, i, 0);
+        }
+        return new Binding(this, values);
+    }
 
     private sealed class Binding : FabricTableBinding
     {
         private readonly FabricRowsFunction _fn;
-        private readonly string? _arg;
+        private readonly string?[] _args;
 
-        internal Binding(FabricRowsFunction fn, string? arg)
+        internal Binding(FabricRowsFunction fn, string?[] args)
         {
             _fn = fn;
-            _arg = arg;
+            _args = args;
         }
 
         public override Schema OutputSchema => _fn.Columns;
@@ -78,7 +97,7 @@ internal abstract class FabricRowsFunction : ICatalogTableFunction
             {
                 cols[i] = new StringArray.Builder();
             }
-            int n = _fn.Fill(cols, _arg, ct);
+            int n = _fn.Fill(cols, _args, ct);
             var arrays = new IArrowArray[cols.Length];
             for (int i = 0; i < cols.Length; i++)
             {
@@ -107,7 +126,7 @@ internal sealed class FabricWorkspacesFunction : FabricRowsFunction
         FabricApiFunctions.Str("description"),
     }, null);
 
-    protected override int Fill(StringArray.Builder[] c, string? arg, CancellationToken ct)
+    protected override int Fill(StringArray.Builder[] c, string?[] args, CancellationToken ct)
     {
         int n = 0;
         foreach (var w in FabricApiClient.Wrap("workspaces", () => Api.Client.Core.Workspaces.ListWorkspaces(cancellationToken: ct)))
@@ -132,9 +151,15 @@ internal sealed class FabricItemsFunction : FabricRowsFunction
 
     public override string Name => "fabric_items";
 
-    /// <summary><c>fabric_items(item_type := 'Notebook')</c> — unset lists every item type.</summary>
-    public override Schema NamedParameters { get; } =
-        new Schema(new[] { FabricApiFunctions.Str("item_type") }, null);
+    /// <summary>
+    /// <c>fabric_items(item_type := 'Notebook', workspace := 'OtherWS')</c> — both optional; unset lists every
+    /// type in the ATTACH's own workspace.
+    /// </summary>
+    public override Schema NamedParameters { get; } = new Schema(new[]
+    {
+        FabricApiFunctions.Str("item_type"),
+        FabricApiFunctions.Str("workspace"),
+    }, null);
 
     protected override Schema Columns { get; } = new(new[]
     {
@@ -144,12 +169,12 @@ internal sealed class FabricItemsFunction : FabricRowsFunction
         FabricApiFunctions.Str("description"),
     }, null);
 
-    protected override int Fill(StringArray.Builder[] c, string? arg, CancellationToken ct)
+    protected override int Fill(StringArray.Builder[] c, string?[] args, CancellationToken ct)
     {
-        var ws = Api.WorkspaceId;
+        var ws = Api.ResolveWorkspace(args[1]);
         int n = 0;
         foreach (var i in FabricApiClient.Wrap("items",
-                     () => Api.Client.Core.Items.ListItems(ws, type: FabricShortcutPath.NullIfBlank(arg), cancellationToken: ct)))
+                     () => Api.Client.Core.Items.ListItems(ws, type: FabricShortcutPath.NullIfBlank(args[0]), cancellationToken: ct)))
         {
             c[0].Append(i.Id?.ToString());
             c[1].Append(i.DisplayName);
@@ -188,9 +213,9 @@ internal sealed class FabricLakehousesFunction : FabricRowsFunction
         FabricApiFunctions.Str("sql_endpoint_connection_string"),
     }, null);
 
-    protected override int Fill(StringArray.Builder[] c, string? arg, CancellationToken ct)
+    protected override int Fill(StringArray.Builder[] c, string?[] args, CancellationToken ct)
     {
-        var ws = Api.WorkspaceId;
+        var ws = Api.ResolveWorkspace(args[0]);
         int n = 0;
         foreach (var lh in FabricApiClient.Wrap("lakehouses",
                      () => Api.Client.Lakehouse.Items.ListLakehouses(ws, cancellationToken: ct)))
@@ -230,9 +255,9 @@ internal sealed class FabricWarehousesFunction : FabricRowsFunction
         FabricApiFunctions.Str("description"),
     }, null);
 
-    protected override int Fill(StringArray.Builder[] c, string? arg, CancellationToken ct)
+    protected override int Fill(StringArray.Builder[] c, string?[] args, CancellationToken ct)
     {
-        var ws = Api.WorkspaceId;
+        var ws = Api.ResolveWorkspace(args[0]);
         int n = 0;
         foreach (var wh in FabricApiClient.Wrap("warehouses",
                      () => Api.Client.Warehouse.Items.ListWarehouses(ws, cancellationToken: ct)))
@@ -274,7 +299,7 @@ internal sealed class FabricConnectionsFunction : FabricRowsFunction
         FabricApiFunctions.Str("credential_type"),
     }, null);
 
-    protected override int Fill(StringArray.Builder[] c, string? arg, CancellationToken ct)
+    protected override int Fill(StringArray.Builder[] c, string?[] args, CancellationToken ct)
     {
         int n = 0;
         foreach (var conn in FabricApiClient.Wrap("connections",
@@ -316,6 +341,10 @@ internal sealed class FabricNotebookParametersFunction : FabricRowsFunction
 
     public override Schema Parameters { get; } = new Schema(new[] { FabricApiFunctions.Str("notebook") }, null);
 
+    /// <summary><c>workspace := 'OtherWS'</c> — read a notebook in another workspace.</summary>
+    public override Schema NamedParameters { get; } =
+        new Schema(new[] { FabricApiFunctions.Str("workspace") }, null);
+
     protected override Schema Columns { get; } = new(new[]
     {
         FabricApiFunctions.Str("name"),
@@ -323,15 +352,16 @@ internal sealed class FabricNotebookParametersFunction : FabricRowsFunction
         FabricApiFunctions.Str("inferred_type"),
     }, null);
 
-    protected override int Fill(StringArray.Builder[] c, string? arg, CancellationToken ct)
+    protected override int Fill(StringArray.Builder[] c, string?[] args, CancellationToken ct)
     {
+        var arg = args[0];
         if (string.IsNullOrWhiteSpace(arg))
         {
             throw new NotSupportedException(
                 "fabric_notebook_parameters: pass the notebook name or id (list them with fabric_items(item_type := 'Notebook')).");
         }
-        var ws = Api.WorkspaceId;
-        var nb = Api.ResolveItem(arg, "Notebook");
+        var ws = Api.ResolveWorkspace(args[1]);
+        var nb = Api.ResolveItem(arg, "Notebook", ws);
         var response = FabricApiClient.Wrap("notebook_definition",
             () => Api.Client.Notebook.Items.GetNotebookDefinition(ws, nb, format: "ipynb", cancellationToken: ct).Value);
 

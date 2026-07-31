@@ -47,6 +47,7 @@ internal sealed class FabricRunNotebookFunction : ICatalogTableFunction
         FabricApiFunctions.Str("params_json"),
         FabricApiFunctions.Str("config_json"),
         new Field("wait_seconds", Int64Type.Default, nullable: true),
+        FabricApiFunctions.Str("workspace"),
     }, null);
 
     public IArrowTableFunctionBinding Bind(RecordBatch args) => new Binding(_api, args);
@@ -71,6 +72,7 @@ internal sealed class FabricRunNotebookFunction : ICatalogTableFunction
         private readonly string? _paramsJson;
         private readonly string? _configJson;
         private readonly long _waitSeconds;
+        private readonly string? _workspace;
 
         internal Binding(FabricApiClient api, RecordBatch args)
         {
@@ -83,6 +85,7 @@ internal sealed class FabricRunNotebookFunction : ICatalogTableFunction
             // Default cap: a cold Spark session alone can take minutes, so a short default would time out
             // on the very flows this exists for. 0 = fire and return.
             _waitSeconds = FabricArgs.Int(args, 3) ?? 3600;
+            _workspace = FabricArgs.Str(args, 4);
         }
 
         public override Schema OutputSchema => Columns;
@@ -97,8 +100,8 @@ internal sealed class FabricRunNotebookFunction : ICatalogTableFunction
                 throw new NotSupportedException(
                     "fabric_run_notebook: pass the notebook name or id (list them with fabric_items(item_type := 'Notebook')).");
             }
-            var ws = _api.WorkspaceId;
-            var nb = _api.ResolveItem(_notebook, "Notebook");
+            var ws = _api.ResolveWorkspace(_workspace);
+            var nb = _api.ResolveItem(_notebook, "Notebook", ws);
 
             var instanceId = await _api.SubmitNotebookRunAsync(ws, nb, BuildBody(), ct).ConfigureAwait(false);
             var state = await _api.PollNotebookRunAsync(ws, nb, instanceId, _waitSeconds, ct).ConfigureAwait(false);

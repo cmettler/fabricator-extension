@@ -357,6 +357,13 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     in verify_global_functions (72), and verified live on
     `fabric_run_notebook('nb', wait_seconds := 900, params_json := '{…}')` with the args out of declared order
     and the intervening one omitted, read back from the notebook's own output.
+  - **`workspace :=` / `item :=` OVERRIDES on every catalog-bound TABLE function (2026-07-31)** — expressible
+    only once named parameters existed. The attach still supplies the defaults (the zero-arg call is
+    unchanged), but ONE attach can now drive several lakehouses, which a dbt project writing to more than one
+    otherwise solves with a second ATTACH purely to refresh an endpoint. Live: `fabric_refresh_sql_endpoint()`
+    → LH's 19 tables vs `(item := 'LH2')` → 0 through the same attach. `ResolveItem` gained an explicit
+    `workspaceId` so a cross-workspace lookup does not silently search the attach's own workspace. The
+    shortcut SCALARS are excluded (no named parameters) and always act on the ATTACHED item.
   - Output shape rule (D4): typed flat columns + one raw-JSON column for polymorphic parts; **no STRUCT
     wrapping** (adding a column is additive for `SELECT *`; adding a struct FIELD changes a column's type
     and breaks bound views), no JSON-only. Every `table`-kind function also gets a dead `_each` sibling —

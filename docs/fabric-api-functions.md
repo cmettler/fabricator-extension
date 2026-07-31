@@ -503,6 +503,17 @@ correct Python types), and **`fabric_notebook_parameters(notebook)`**.
 Hermetic tier **62 runs / 5558 assertions green**; the whole P0 set exercised end-to-end against workspace
 `Test` / lakehouse `LH` (create → list → alter → drop → drop-again → refresh, self-cleaning).
 
+**Every catalog-bound TABLE function also takes `workspace :=` / `item :=` overrides** (2026-07-31, once
+named parameters existed to express them). The attach supplies the defaults, so the zero-argument call is
+unchanged; passing them retargets the SAME attach at another lakehouse or workspace — the common case for a
+dbt project writing to several lakehouses, which otherwise needs a second ATTACH purely to refresh an
+endpoint. `FabricApiClient.ResolveWorkspace/ResolveItem` already accepted an override, so this was
+declarations plus wiring; `ResolveItem` gained an explicit `workspaceId` so a cross-workspace lookup does not
+silently search the attach's own. Verified live: `fabric_refresh_sql_endpoint()` → LH's 19 tables,
+`(item := 'LH2')` → 0 (a different, empty lakehouse) through one attach; an unknown item errors naming both
+the item and the workspace. Scalars (the shortcut writers) are excluded — no named parameters there — so they
+always act on the ATTACHED item.
+
 Why the introspection set is worth its weight: the WRITE functions need identifiers a user otherwise hunts
 for in the portal — an external shortcut target needs a cloud connection's GUID (`fabric_connections`), a
 T-SQL ATTACH needs the endpoint connection string (`fabric_lakehouses`/`fabric_warehouses`), and a
