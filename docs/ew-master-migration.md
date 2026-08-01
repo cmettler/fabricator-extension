@@ -601,6 +601,53 @@ Everything else matched the measurement exactly: 8 commits, 4 conflicts, 30 hunk
 6 in `DeltaTransaction.cs`, and the hunks are the predicted overload consolidation
 (`Delete*`/`Update*`/`Read*` families → `DeleteRowsAsync`/`UpdateRowsAsync`/`ReadCoreAsync`).
 
+### SECOND ATTEMPT (2026-08-01) — merged, EW SRC BUILDS; the exact remaining mapping
+
+Branch `bump/upstream-2026-08`: `50839f0` (merge + conflicts resolved) → `f496526` (src builds on
+net10.0/net8.0/net472) → `9d616c9` (`ReadAllWithMetadataAsync` retired). **`fabricator-patches` is
+untouched and nothing is pushed.** What is left is the EW TEST project, then the Bridge.
+
+**FIVE auto-merge grafts were found in total, and every one differed from upstream by ONE LINE** — git
+welded our method's body into upstream's method of the same name, so they read as correct and compile
+or nearly compile. `StageRowDeletesAsync`, `BuildStagedAppendActionsAsync`, `DeleteRowsViaVectorsAsync`,
+`ComputeDvActionsWithEditsAsync`, `ComputeDeletionVectorActionsAsync`. Each was replaced with upstream's
+version WHOLESALE and diffed to byte-identity. **Never hand-merge these.** Also removed a duplicated
+block in `CommitTransactionAsync` that would have emitted every `txn` action TWICE.
+
+**The exemption is back as `DeltaTransaction.ExemptRowLevelFromWholeTableRead`** (default `false`),
+consumed by `CommitOccAsync` via a defaulted parameter. ⚠ **THE BRIDGE DOES NOT SET IT YET**, so as of
+`9d616c9` our shipped behaviour is DISABLED and `verify_delta_row_level_concurrency` §11 would fail.
+The wiring is one line in `DeltaCatalog`'s flush, beside the existing `DeclareRead` /
+`DeclareWholeTableRead` calls (~3483): `txn.ExemptRowLevelFromWholeTableRead = true;`. It was left until
+after the Bridge's 24 call sites because the Bridge cannot compile against the new EW API before then,
+and a flag wired into a non-building file is unverifiable.
+
+**`FileRowSelection` is deleted** in favour of upstream's `RowSelection`. The recorded "38 src sites"
+was wrong — it counted doc-comment mentions; there were NINE real occurrences. `RowSelection.ByPath`
+takes exactly the dictionary our record wrapped; `Paths` / `PositionsFor` / `TotalPositions` cover every
+use of `RowsByFile`.
+
+**The remaining test migration is NOT a sed**, and the compiler proves it: our `Update*` returned
+`(RowsUpdated, Version)` TUPLES while upstream's `UpdateRowsAsync` returns a plain `long` version, so
+every `var (rows, _) = await …` site needs `rows` obtained another way (`selection.TotalPositions` where
+the updater touches every selected row — check each, two sites in `MetadataColumnTests` at ~496 and
+~590). The mapping, all in `test/EngineeredWood.DeltaLake.Table.Tests`:
+
+| ours (gone) | upstream successor | note |
+|---|---|---|
+| `UpdateBySelectionAsync(sel, updater)` | `UpdateRowsAsync(sel, updater)` | returns `long`, not a tuple |
+| `UpdateBySelectionAsync(batch)` | `UpdateRowsAsync(batch)` | locator-carrying batch form |
+| `UpdateBySelectionViaVectorsAsync(…)` | `UpdateRowsAsync(…)` | upstream COLLAPSED MoR + CoW update into one entry point |
+| `DeleteBySelectionAsync(sel)` | `DeleteRowsAsync(sel, RowDeleteMode.CopyOnWrite)` | tuple return survives |
+| `DeleteByRowIdsViaVectorsAsync(ids)` | `DeleteRowsAsync(RowSelection.FromOrdinals(…, StaleAddressPolicy.Skip, …), RowDeleteMode.DeletionVector)` | needs the snapshot to resolve ordinals |
+| `DeleteByRowIdsAsync(ids)` | same, `RowDeleteMode.CopyOnWrite` | |
+| `ReadAllWithRowIdsAsync()` | `ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowAddress })` | |
+| `ReadAllWithRowTrackingAsync()` | `… DeltaRowMetadata.RowTracking` | |
+| `ReadAllWithMetadataAsync()` | `… DeltaRowMetadata.Locator` | DONE in `9d616c9` |
+
+One assertion also needs re-pointing: `MetadataColumnTests` ~637 asserts an error message names
+`UpdateBySelectionAsync` as the alternative; upstream's message names the read option instead.
+
 ### Suggested order when it is taken
 
 **Updated after the first attempt** — the ordering below still holds, with the `FileRowSelection` →
