@@ -1126,6 +1126,7 @@ SELECT * FROM lake.main.t WHERE id > 10;          -- streaming scan + file/row-g
 | Multi-schema: `schemas true` (local/S3 `<root>/<schema>/<table>`); schema-enabled OneLake lakehouses | ✅ |
 | Time travel: `FROM t AT (VERSION => n)` and `AT (TIMESTAMP => ts)` | ✅ |
 | Snapshots/history: `fabricator_delta_snapshots('<catalog>', '<schema.>table')` | ✅ |
+| **Exactly-once appends** (Delta application transactions / Spark `txnAppId`): `fabricator_delta_set_transaction_version` + `_get_transaction_version` | ✅ |
 | **Change Data Feed**: `change_data_feed true` + `fabricator_delta_changes('<catalog>', '<schema.>table', from[, to])` | ✅ |
 | **Partitioning**: native `CREATE TABLE … PARTITIONED BY (cols)` (or the `delta_write_options` setting) → Hive `col=value/` layout | ✅ |
 | **Write tuning**: compression / row-group size / bloom filters via ATTACH options, the `delta_write_options` setting, or per-table `WITH (…)` | ✅ |
@@ -1149,6 +1150,47 @@ SELECT _change_type, id, val, _commit_version, _commit_timestamp
   FROM fabricator_delta_changes('cdf', 'main.t', 0);     -- to omitted => latest
 -- insert/insert (v1), delete (v2): each row tagged with its commit version + timestamp (epoch ms)
 ```
+
+#### Exactly-once appends — Delta application transactions
+
+A producer that may be replayed (a retried job, a restarted stream) records how far it has got, and the
+record commits **atomically with the data**, so there is no window in which one exists without the other.
+This is Delta's `txn` action — the same mechanism as Spark's `txnAppId`/`txnVersion` and duckdb-delta's.
+
+`fabricator_delta_set_transaction_version(catalog, '<schema.>table', app_id, version [, expected_previous])`
+**parks** the version on the current transaction; at `COMMIT` it is compared-and-swapped against the
+latest snapshot. It therefore **requires an explicit `BEGIN … COMMIT`** — that is what makes the swap
+atomic with the write. Omit `expected_previous` to mean *"the table must record nothing for this
+producer yet"* (a first batch); pass it to chain batch to batch.
+
+```sql
+ATTACH '/lake/root' AS lake (TYPE fabricator, PROVIDER 'delta');
+CREATE TABLE lake.main.t (id INTEGER);
+
+BEGIN;
+CALL fabricator_delta_set_transaction_version('lake', 't', 'loader', 1);
+INSERT INTO lake.main.t VALUES (1), (2);
+COMMIT;                                   -- data + the txn action, one version
+
+SELECT * FROM fabricator_delta_get_transaction_version('lake', 't', 'loader');
+-- loader  1
+
+-- A REPLAY of that same batch fails the compare-and-set instead of duplicating the rows:
+BEGIN;
+CALL fabricator_delta_set_transaction_version('lake', 't', 'loader', 1);
+INSERT INTO lake.main.t VALUES (1), (2);
+COMMIT;                                   -- error: transaction version conflict … for 'loader'
+                                          -- the table still holds 2 rows
+
+-- The next batch states the version it expects to be at:
+BEGIN;
+CALL fabricator_delta_set_transaction_version('lake', 't', 'loader', 2, 1);
+INSERT INTO lake.main.t VALUES (3);
+COMMIT;
+```
+
+A failed swap is **not a conflict to retry** — retrying cannot make an already-committed batch
+un-commit. Read the recorded version back and decide whether the batch still needs writing.
 
 ### `COPY … TO` a Delta path (no ATTACH)
 
