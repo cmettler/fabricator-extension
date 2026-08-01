@@ -491,6 +491,41 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     scan is handed out by `GetScanFunction` and is not a registered catalog function ⇒ "Failed to find
     function fabricator_scan()". So `FabricatorScanDeserialize` is UNREACHABLE — and must still exist,
     because `Serialize` only emits bind data when BOTH callbacks are set. Do not "clean it up".
+- **⚠ CROSS-ENGINE GAP FOUND + MEASURED (2026-08-01), NOT YET FIXED: we never emit `commitInfo.isBlindAppend`,
+  so a Fabric Spark transaction ABORTS against our concurrent append whatever the table declares.** Full record:
+  [docs/delta-transactions.md](docs/delta-transactions.md) §10.6.
+  - Live A/B on Fabric Spark 4.1.1.5.5 / **Delta-Lake 4.2.0** (`ConflictChecker.scala` re-read at the `v4.2.0`
+    TAG — the Fabric build, not master): 200M-row table, Spark `DELETE … WHERE id % 7 = 3`, our append committed
+    inside the window. `Serializable` ⇒ Spark ABORTS (`DELTA_CONCURRENT_APPEND`, naming our v8). `WriteSerializable`
+    ⇒ Spark ABORTS TOO (naming our v23). Overlap PROVEN both times by Spark naming the concurrent version.
+  - Cause, from Delta's source: `blindAppendAddedFiles = if (commitInfo.flatMap(_.isBlindAppend).getOrElse(false))
+    addedFiles else Seq()`. An ABSENT flag = "not blind" ⇒ our appends land in `changedDataAddedFiles`, which is
+    checked under BOTH levels. Confirmed three ways: the source; our commitInfo on disk (operation/engineInfo/
+    operationParameters only); and Spark's `DESCRIBE HISTORY` showing `isBlindAppend` True for ITS blind append
+    and blank for ours.
+  - **UPSTREAM OFFER + the plan are WRITTEN DOWN**: [docs/ew-master-migration.md](docs/ew-master-migration.md)
+    §isBlindAppend. The `_last_checkpoint` tolerance fix (`14a74a9`) is engine-agnostic and spec-conformant —
+    a bug for every EW user, so it should be OFFERED UPSTREAM AS-IS (the host-side one-request read stays
+    ours). Upstream is 8 ahead = exactly the known pending bump (#6, #16–#22); **none of those touch isolation
+    or blind-append**, so neither item waits for it. And to settle the worry directly: **EW has NOT lost
+    WriteSerializable support** — `StartTransaction` still defaults to it and `ConflictChecker` still
+    implements the relaxation; what is missing is interop plumbing, not semantics.
+  - **The READING half is wrong too, in the OPPOSITE (unsafe) direction.** `ConflictChecker.IsBlindAppend`
+    INFERS blind-append from action shape ("only AddFiles"), so another engine's `INSERT … SELECT` from the
+    same table — only adds, but it READ — is treated as blind and we skip a check we owe. Correct shape:
+    CONSUME `commitInfo.isBlindAppend` when present, fall back to inference only when absent.
+  - **The fix must be TRUTHFUL:** Delta's definition is "the transaction READ NOTHING"
+    (`readPredicates.isEmpty && readFiles.isEmpty`), NOT "the commit contains only adds" — deriving it from
+    action shape would mark `INSERT … SELECT` from the same table as blind, and a wrong `true` makes other
+    engines SKIP a check they should run (the unsafe direction). The buffered txn already tracks a read set for
+    its own OCC check; derive it from there.
+  - **⚠ METHOD: this experiment was VOID FOUR TIMES and each void looked like a clean "no conflict".** The
+    window must be PROVEN (Spark naming the concurrent version, or `readVersion` ordering), never assumed. What
+    kept failing was OUR end — the append needed ~20 s (process start + CLR + ATTACH discovery), most of the
+    DELETE's life. What finally worked: PRE-ATTACH the writer so firing costs only the commit, and make the
+    DELETE genuinely expensive (a ~200-row delete finished in <17 s; `id % 7 = 3` rewrites nearly every file).
+    Re-creating the table did NOT help — the warmth that matters is the SPARK CLUSTER's, so whichever leg runs
+    second is fast; each level needs its own run in the cold first slot (`sparkprobe conflict <Level>`).
 - **THE DELTA ISOLATION DEFAULT FLIP — DONE (2026-08-01, behaviour-breaking for CONCURRENT writers).** The
   catalog default is now **`serializable`** (was `write_serializable`), because the measurement below showed
   the old default made us the WEAKER writer than Fabric Spark on any table that declares no level — so the

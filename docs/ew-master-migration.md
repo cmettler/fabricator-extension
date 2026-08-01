@@ -1543,3 +1543,84 @@ tested "by proxy" through that caller and its OWN contract (row-alignment, absol
 unpinned — which is exactly what silently breaks a keyed consumer while every existing assertion stays green.
 Both times the gap was found by review, not by the suite.
 
+
+---
+
+## isBlindAppend — an UPSTREAM OFFER and an OPEN FINDING (2026-08-01)
+
+Written down before the context that produced it is lost. Two separable items: a fix that is ready to
+offer, and a defect that is measured but not yet built.
+
+### 1. UPSTREAM OFFER (ready): `CheckpointReader` must tolerate an unreadable `_last_checkpoint`
+
+Committed on `fabricator-patches` as `14a74a9`. **Engine-agnostic, spec-conformant, and not
+fabricator-specific — this is a bug in EW for every user, so it should go upstream as-is.**
+
+`_last_checkpoint` is an optimization HINT: it only saves the reader from listing `_delta_log` to find
+the newest checkpoint, and the Delta protocol requires readers to fall back to that listing when it is
+absent **or unusable**. `ReadLastCheckpointAsync` handled only "absent", so anything else propagated to
+the caller — and the caller is frequently a COMMIT.
+
+Reachable because the file is updated by non-atomic OVERWRITE (`WriteAllBytesAsync` →
+`UploadAsync(overwrite: true)`), so a concurrent reader can observe it mid-change:
+
+| observed | old behaviour |
+|---|---|
+| zero bytes | `JsonDocument.Parse` → *"The input does not contain any JSON tokens"* |
+| truncated | `JsonException` |
+| valid JSON missing `version`/`size` | `KeyNotFoundException` |
+| the READ itself fails (ADLS 412 on a torn ranged read) | raw Azure exception |
+
+All four now mean "no hint". MEASURED on Fabric OneLake: 8 concurrent writers × 12 commits (checkpoint
+interval 10) killed 2 of 8, then 1 of 8; a 10 × 15 run reproduced the torn-read variant in 2 of 10.
+A single-writer run can never reach any of it. Gate:
+`test/verify_delta_last_checkpoint.test` (34, hermetic, mutation-tested) — it writes each corrupt state
+directly rather than depending on a race that only sometimes collides.
+
+The host-side half (read whole small files in ONE request instead of Azure's lazy ETag-pinned ranged
+stream) lives in the Bridge and is NOT part of the offer.
+
+### 2. OPEN FINDING (measured, NOT built): blind-append classification is wrong in BOTH directions
+
+Delta defines a blind append as *the transaction read nothing*
+(`readPredicates.isEmpty && readFiles.isEmpty`) and the WRITER declares it in
+`commitInfo.isBlindAppend`. EW does neither half the way the spec expects:
+
+| half | what EW does | direction of the error |
+|---|---|---|
+| **writing** | never emits `commitInfo.isBlindAppend` | **too strict** — other engines treat our appends as changed-data and check them under EVERY isolation level |
+| **reading** | `ConflictChecker.IsBlindAppend(actions)` INFERS it from "only AddFiles, no removes/metadata/protocol" | **too lenient** — an `INSERT … SELECT` from the same table produces only adds but DID read, so we may skip a check we owe |
+
+The writing half is measured end to end against Fabric Spark 4.1.1.5.5 / Delta-Lake 4.2.0 — a live A/B
+where Spark's `DELETE` aborted with `DELTA_CONCURRENT_APPEND` against our concurrent append under
+**both** `Serializable` and `WriteSerializable`, overlap proven each time by Spark naming our commit
+version. Delta's own code is why:
+
+```scala
+val blindAppendAddedFiles = if (commitInfo.flatMap(_.isBlindAppend).getOrElse(false)) addedFiles else Seq()
+```
+
+Full record + method notes: [delta-transactions.md](delta-transactions.md) §10.6.
+
+**Is a truthful emission possible?** Yes, if the writer knows whether the transaction read — and the
+buffered transaction does, since it already tracks a read set for its own OCC check. The rule that keeps
+it safe: emit `true` ONLY when no read is provable, otherwise OMIT. A wrong `true` makes other engines
+SKIP a check (unsafe); a missing flag only costs spurious aborts (safe, and is today's behaviour). So
+the change is monotone — it can only remove false conflicts, never create silent ones.
+
+The reading half should become: **consume `commitInfo.isBlindAppend` when present, fall back to the
+action-shape inference only when it is absent** (legacy commits, or writers that omit it — currently
+including us). That is both spec-correct and strictly less permissive than today.
+
+### 3. Upstream state at the time of writing
+
+`upstream/master` is **8 commits ahead** — `#6`, `#16`–`#22`, i.e. exactly the pending bump already
+recorded above (variant shredding + the five #15 slices). **None of them touch isolation, conflict
+checking, or blind-append handling**, so neither item here is at risk of colliding with that bump, and
+neither should wait for it. The two isolation-related upstream commits (`ffb89e5`,
+`1ba52a4` "row-level reconciliation ignored the isolation level") are **already in `fabricator-patches`**.
+
+To be explicit, because it was asked: **EW has NOT lost WriteSerializable support.**
+`StartTransaction`'s default is still `IsolationLevel.WriteSerializable`, and `ConflictChecker` still
+implements the relaxation (`examineAdds = isolation == Serializable || !concurrentIsBlindAppend`). What
+is missing is the interop plumbing in item 2, not the semantics.

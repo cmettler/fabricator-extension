@@ -618,11 +618,75 @@ OSS Delta **knows** the enum value — it is the **table-property validator** th
    INSERT+DELETE. `DESCRIBE HISTORY` on the stamped one reports `WriteSerializable` for both Spark
    commits; on the unstamped one, `Serializable`. The only input that differed was the property, so
    Spark is reading it and committing at it. (In both, our own commits show a blank in that column —
-   consequence 2.) Two caveats: (a) such a table's isolation is no longer manageable **from Spark**
-   (its ALTER rejects every value except `Serializable`) — change it with
-   `fabricator_delta_set_tblproperties`; (b) this proves Spark *reads the value and commits at it*; a
-   full semantic proof (a conflict that commutes under WriteSerializable and aborts under
-   Serializable, driven from Spark) was **not** run.
+   consequence 2.) Caveat: such a table's isolation is no longer manageable **from Spark** (its ALTER
+   rejects every value except `Serializable`) — change it with `fabricator_delta_set_tblproperties`.
+
+   **Does the level actually change Spark's conflict behaviour, or is it just recorded?** Two of the
+   three links are now established from primary sources; the third is inferred.
+
+   1. **The level materially changes conflict detection** — from Delta's own `ConflictChecker.scala`
+      (`delta-io/delta`, master):
+
+      ```scala
+      val addedFilesToCheckForConflicts = isolationLevel match {
+        case WriteSerializable if !currentTransactionInfo.metadataChanged =>
+          winningCommitSummary.changedDataAddedFiles              // blind appends EXCLUDED
+        case Serializable | WriteSerializable =>
+          winningCommitSummary.changedDataAddedFiles ++
+            winningCommitSummary.blindAppendAddedFiles            // blind appends INCLUDED
+        case SnapshotIsolation => Seq.empty
+      }
+      ```
+
+      So under WriteSerializable a concurrent **blind append** is exempt from the read-conflict check;
+      under Serializable it is checked. Exactly our own semantics (§6). The level is not decorative.
+   2. **The table property selects the level Spark commits at** — the A/B above: nothing but the
+      property differed, and the recorded level followed it.
+   3. **Measured end to end (2026-08-01), and the answer is a PROBLEM ON OUR SIDE.** A live A/B against
+      Fabric Spark 4.1.1.5.5 / **Delta-Lake 4.2.0** (`ConflictChecker.scala` re-read at the `v4.2.0`
+      tag — identical to master): a 200M-row table, Spark running `DELETE … WHERE id % 7 = 3`, our
+      writer committing an append inside the window.
+
+      | table's declared level | overlap proven | Spark's DELETE |
+      |---|---|---|
+      | `Serializable` | ✅ Spark named our commit (v8) | **ABORTED** — `DELTA_CONCURRENT_APPEND` |
+      | `WriteSerializable` | ✅ Spark named our commit (v23) | **ABORTED** — same error |
+
+      **Both abort.** The relaxation exists (link 1) and the property does select the level (link 2),
+      but it buys our appends nothing — because the exemption applies only to files from a commit
+      marked `isBlindAppend`, and **we never emit that field**:
+
+      ```scala
+      val isBlindAppendOption = commitInfo.flatMap(_.isBlindAppend)
+      val blindAppendAddedFiles = if (isBlindAppendOption.getOrElse(false)) addedFiles else Seq()
+      val changedDataAddedFiles = if (isBlindAppendOption.getOrElse(false)) Seq() else addedFiles
+      ```
+
+      `getOrElse(false)` — an absent flag means "not blind", so our appends land in
+      `changedDataAddedFiles`, which is checked under **both** levels. Confirmed from three sides: the
+      source above; our commitInfo on disk (`{"timestamp":…,"operation":"WRITE","engineInfo":
+      "EngineeredWood.DeltaLake","operationParameters":{}}` — no flag); and Spark's own
+      `DESCRIBE HISTORY`, where `isBlindAppend` reads `True` for its blind append and blank for ours.
+
+      ⇒ **A Spark transaction will abort against our concurrent append whatever the table declares.**
+      Setting `WriteSerializable` does not help in that direction. It remains correct for OUR writer's
+      own conflict checks and for Spark-vs-Spark concurrency.
+
+   **The fix is to emit `isBlindAppend` — and it must be TRUTHFUL, not convenient.** Delta's definition
+   is *the transaction read nothing* (`readPredicates.isEmpty && readFiles.isEmpty`), not "the commit
+   contains only adds". Deriving it from action shape would mark an `INSERT … SELECT` from the same
+   table as blind, and a wrong `true` makes OTHER engines **skip** a check they should run — the unsafe
+   direction. Our buffered transaction already tracks a read set for its own OCC check, so the
+   information exists; derive it from there. Not yet built.
+
+   **Method note, because this experiment was void FOUR times before it measured anything.** Each void
+   run looked like a clean result ("no conflict"). The window has to be *proven*, not assumed: the
+   verdict here is Spark naming the concurrent version in its own error, or `readVersion` ordering
+   showing our append landed between the DELETE's read and its commit. What kept failing was our end,
+   not Spark's — the append needed ~20 s (process start, CLR boot, ATTACH discovery), most of the
+   DELETE's lifetime. Fixes that finally worked: pre-attach the writer so firing costs only the commit
+   (~13 s), and make the DELETE genuinely expensive (`id % 7 = 3` rewrites nearly every file — minutes)
+   instead of a ~200-row delete that finished in under 17 s.
 
 We do **not** block or rewrite a `WriteSerializable` stamp: the value is functional and honored
 cross-engine, so refusing it would remove a working capability to guard against a Spark **DDL**
