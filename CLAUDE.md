@@ -75,7 +75,7 @@ SMALL upstreamable patch set ON TOP of clast master — never a fork again — s
 merge-upstream-into-fabricator-patches + re-pin. **⚠ That upstream branch is now
 `upstream/main`, NOT `master`** — upstream renamed it (`8caf8d8`) and the stale `upstream/master`
 remote-tracking ref still resolves, so a merge of it silently lands on an abandoned branch.
-**Current pin: `df4f918`** (the 2026-08-01 bump, §THE 2026-08-01 BUMP below). What the patches carry: the **`DeltaTable.PlanFiles`
+**Current pin: `9680315`** (the 2026-08-01 bump, §THE 2026-08-01 BUMP below). What the patches carry: the **`DeltaTable.PlanFiles`
 planning API** (proposed to Curt 2026-07-25, endorsed, and BUILT by us 2026-07-26 — it REPLACED the
 earlier `DeltaFilePruner`-public patch, which is retired; full record in the `PlanFiles` subsection below);
 create-time `configuration`/`preAssignedSchema`/`materializedRowIds` params; rowid read-back
@@ -168,6 +168,24 @@ Also: **#24 independently CONFIRMS our live isolation measurement** — delta-sp
 is what we found against Fabric Spark 4.1.1 by another route. It further found EW and Delta agree on the
 OUTCOME and disagree on the LABEL (Delta reports `ConcurrentAppend` where EW reports
 `ConcurrentDeleteRead`).
+
+**⚠ #36 came in on the same bump and carries TWO USER-VISIBLE behaviour changes** (*"a replay that skipped
+a version said nothing about it"* — the follow-on to #35). `SnapshotBuilder` used to apply whatever commits
+it happened to find, skipping a missing or unreadable version **in silence** (once via a literal
+`catch { /* Skip missing commits */ }`) while still labelling the result with the target version. Both
+replay paths now demand contiguous coverage and name the first hole.
+- **`AT (VERSION => n)` PAST THE END OF THE LOG now ERRORS** (*"Delta log is incomplete: version 3 is
+  missing or unreadable and no checkpoint covers it"*) where it used to return the **newest** snapshot under
+  the requested label — so a stale pin or an off-by-one silently got real rows for a version that does not
+  exist. **Measured, then pinned** (`verify_delta_catalog_time_travel` 48 → 49); nothing asserted either
+  answer before, so it could have flipped back unnoticed in either direction.
+- **A transient READ FAILURE of a commit is now a HOLE, not a skip** — worth watching on OneLake
+  specifically, because our measured multi-writer shape is exactly a world where another writer's commit
+  file is briefly unreadable (that is how the `_last_checkpoint` 412 was found). Correct, plausibly noisier.
+  Not yet exercised against live OneLake.
+- `ListCheckpointVersionsAsync` is deleted upstream, and his message says *"Confirmed absent from
+  fabricator before removing"* — checked, and true (only compiled EW DLLs match; no source call site).
+  **Upstream is checking our tree before removing API.**
 
 **The bump-by-bump journal** (every EW pin move, `PlanFiles`, the path-keyed DV DML, the `_metadata`
 surface, the variant-transport decision + shredding split, the `DeltaTransaction` flush migration, and

@@ -113,8 +113,13 @@ case "$TIER" in
         # was left unset — §11 is the section that fails. It drives a non-pushable DELETE (so the scan
         # declares the whole table) against a concurrent DELETE of a DIFFERENT row of a DIFFERENT file: with
         # the opt-in they compose, without it the declaration meets the concurrent commit and aborts.
+        # 5640 since 2026-08-01: verify_delta_catalog_time_travel 48 -> 49. Upstream EW #36 made an
+        # INCOMPLETE LOG REPLAY an error instead of a silence, which changes what AT (VERSION => n) does past
+        # the end of the log: it used to return the NEWEST snapshot under the requested label, so a stale pin
+        # or an off-by-one silently got real rows for a version that does not exist. Nothing pinned either
+        # answer before, so the behaviour could have flipped back unnoticed in whichever direction.
         : "${MIN_SUITES:=63}"
-        : "${MIN_ASSERTIONS:=5639}"
+        : "${MIN_ASSERTIONS:=5640}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
