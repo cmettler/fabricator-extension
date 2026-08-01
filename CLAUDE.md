@@ -1393,8 +1393,38 @@ VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
   net8-ONLY private root via `FABRICATOR_DOTNET_ROOT` (the "local .NET 10 beside global .NET 8" selector,
   inverted), `DOTNET_ROLL_FORWARD` respected, SC unchanged (the publish script CLEANS the output dir on a
   mode change — a stale hostfxr would flip the detection).
-- **LINUX (linux_amd64) BUILDS + FULL SUITES GREEN (WSL Ubuntu 22.04, gcc 11 — glibc 2.35 baseline runs on
-  Fabric's Azure Linux 3).** Build = same configure as Windows minus vcvars, plus
+- **⚠ SHIPPING A LINUX BUILD TO FABRIC BY HAND — THREE TRAPS, each hit for real on 2026-08-01, each costing
+  a Spark session. All three produce an artifact that looks fine locally and fails only on the far side.**
+  Scripts: `scratchpad/linux_sync_build.sh` (sync + build), `strip_linux.sh` (strip + footer + verify),
+  `glibc_check.sh`. **The through-line: derive every value from a KNOWN-GOOD ARTIFACT, never from reasoning
+  about what it should be, and verify the EFFECT rather than the tool's own success message.**
+  1. **`strip` DESTROYS the extension.** A loadable is an ELF with DuckDB's metadata footer appended AFTER
+     the image; `strip` rewrites the file and discards it. The ELF stays valid, nothing local complains, and
+     the only symptom is at LOAD: *"The file is not a DuckDB extension. The metadata at the end of the file
+     is invalid"*. Re-append with `extension-ci-tools/scripts/append_extension_metadata.py`. Worth doing —
+     697 MB → 28 MB.
+  2. **Its `--abi-type` DEFAULT (`C_STRUCT`) IS WRONG FOR US.** We use `DUCKDB_CPP_EXTENSION_ENTRY`, so it
+     must be `CPP`. Under `C_STRUCT` the `duckdb_version` field means the **C API** version, so encoding
+     `v1.5.5` yields *"built for DuckDB C API version 'v1.5.5', but we can only load ... 'v1.2.0' and
+     lower"* — an error that reads like a DuckDB version problem and is not one. Read the fields off a
+     shipped artifact instead: `tail -c 512 … ` gives `CPP | 0.0.2 | v1.5.5 | windows_amd64 | 4`. **That
+     also catches the extension version** — the stale linux tree encodes `0.0.1`, the current one is
+     `0.0.2`. Check ALL FOUR fields after re-appending; a `C_STRUCT` footer contains the same version
+     strings, so grepping for "some expected strings" passes while the artifact is unloadable.
+  3. **`publish-managed.ps1` reported `Framework, net8.0, linux-x64` while the output dir still held a
+     WINDOWS self-contained payload** (`hostfxr.dll`, `coreclr.dll`, `createdump.exe`). Uploaded to Linux it
+     surfaces as `Bootstrap.Initialize (0x80070057)` — an error pointing at CoreCLR hosting, not at "wrong
+     OS". Found by DIFFING against the known-good payload (313 files vs 178). **Verify by content**: no
+     Windows PE, and a file count matching the reference.
+  - **glibc: Fabric compute is Azure Linux 3.0, `ldd 2.38`, max exported `GLIBC_2.38` (measured on the
+    compute).** Building on Ubuntu 24.04 (glibc 2.39) is FINE — symbols bind to the oldest version that
+    provides them, and our build comes out needing exactly 2.38 — but that is a **zero-margin** result, so
+    one future dependency pulling a 2.39 symbol breaks Fabric loading with no other symptom. `glibc_check.sh`
+    gates it. (The older note below that 2.35 "runs on" Azure Linux 3 says 2.35 is SAFE; it does not mean
+    anything higher fails, and reading it that way sent this session down a wrong path.)
+- **LINUX (linux_amd64) BUILDS + FULL SUITES GREEN (WSL Ubuntu 22.04→24.04, gcc 11→13.3 — the toolchain and
+  `~/vcpkg` + the `~/sqlext` copied build tree SURVIVED the distro upgrade; `VCPKG_ROOT` is simply unset in a
+  non-login shell, which is not the same as vcpkg being absent).** Build = same configure as Windows minus vcvars, plus
   `-DOVERRIDE_GIT_DESCRIBE=v1.5.4` (no .git in the copied tree) + vcpkg toolchain with `x64-linux`
   (openssl+curl for httpfs); the C++ compiled with ZERO changes (the clr_host ifdefs held). Suites on
   linux + the apt `dotnet-runtime-8.0` (auto-probed at `/usr/lib/dotnet`, no env var): delta transactions
@@ -1430,8 +1460,36 @@ VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
   comparison. `dotnet run run` = update+run the existing notebook; `upload` = refresh the OneLake
   distribution (`LH/Files/fabricator_ext/`). **The MANAGED Tables area works through the fuse mount** —
   `ATTACH '/lakehouse/default/Tables' (TYPE fabricator, PROVIDER 'delta', schemas true)`: credential-free
-  read + CREATE + explicit-txn append on `tlake.dbo.*`, all sub-second per op (single-writer only: the
-  commit's O_EXCL put-if-absent is doubtful over fuse — concurrent writers should use abfss/onelake).
+  read + CREATE + explicit-txn append on `tlake.dbo.*`, all sub-second per op.
+  - **⚠ THE "single-writer only" CAVEAT THAT USED TO SIT HERE WAS WRONG, AND IT WAS AN INFERENCE — MEASURED
+    AND CORRECTED 2026-08-01.** It read: *"the commit's O_EXCL put-if-absent is doubtful over fuse —
+    concurrent writers should use abfss/onelake"*, i.e. it warned about SILENT LOST COMMITS on the path a
+    notebook user reaches for BY DEFAULT. **Three live runs, 16 writers × 20 single-row commits each: 960
+    attempted commits, 249 REAL collisions, ZERO lost writes** — every `(w,c)` group complete, versions
+    unique and contiguous, every run. The fuse `O_EXCL` put-if-absent IS atomic; the guard detects the
+    conflict correctly.
+  - **What was actually broken is the opposite failure, and it is now FIXED.** A losing writer died with a
+    RAW `EEXIST` instead of retrying (1 of 16 writers, reproducibly, in each of the first two runs), taking
+    its remaining commits with it. `HostFsOpenWrite` classifies a failed exclusive open by probing
+    `fs.FileExists(path)` — chosen deliberately over "fragile message matching" — and **on a fuse mount that
+    probe answers FALSE for a file another PROCESS created moments earlier**, because the kernel serves it
+    from a cached negative lookup. The `O_EXCL` open itself is correct (it reaches the driver); only the
+    follow-up `stat` is stale. So the conflict became a generic IO error, never a `DeltaConflictException`,
+    and the retry loop never saw it. **Not budget exhaustion** — instrumenting per-writer retry counts showed
+    the highest attempt reached across all writers was **4 of 16**, which is what ruled that out.
+    - Fix: check `errno == EEXIST` FIRST, from the structured `"errno"` field DuckDB serializes into the
+      exception (a JSON field, not prose — `"File exists"` is locale-dependent, the errno is not), keeping
+      the existence probe as the fallback for backends that raise no errno. ⚠ **It is coupled to DuckDB's
+      error-serialization format**: if that changes the check silently stops matching and behaviour reverts
+      to this bug, with the probe as the only oracle again.
+    - Verified: the same 16 × 20 shape after the fix — **90 collisions, 0 writers failed, 320/320 commits,
+      `TOTALS [(320,320)]`, `SHORT []`, zero EEXIST escapes.** A quiet run would have proven nothing, which
+      is why the harness reports `VOID_no_contention` when retries are 0.
+  - **Prefer abfss for concurrent writers on PERFORMANCE grounds, not correctness**: the same shape took
+    888 s on fuse vs 261 s on abfss, ~2.8× slower per commit.
+  - Harness: `scratchpad/fuse_race.py` via `dotnet run run` (⚠ a raw **Livy session has NO fuse mount** —
+    measured `fuse_default: False` — so this needs the RunNotebook path); results land in
+    `Files/fabricator_ext/fuse_race_result.json`, fetched with `dotnet run fetch <name>`.
   **PERF (measured per-step): the notebook's in-session work went ~305 s → ~15 s** via two fixes:
   (1) **local-root discovery fast path** (`DeltaCatalog.DiscoverTablePairs`): a root that
   `Directory.Exists` (fuse mount, any local dir) discovers via direct System.IO enumeration

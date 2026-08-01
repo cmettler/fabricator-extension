@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <string>
 #include <vector>
 
 namespace duckdb {
@@ -164,8 +165,28 @@ int32_t HostFsOpenWrite(FabricatorHandle opener, const char *path, int32_t exclu
 		return FABRICATOR_OK;
 	} catch (std::exception &e) {
 		// For an exclusive (put-if-absent) open, distinguish "already exists" (a commit conflict) from a real
-		// error by probing existence — robust across backends (no fragile message matching).
+		// error. TWO oracles, because neither covers every backend:
+		//
+		//   1. errno == EEXIST, read from the structured "errno" field DuckDB serializes into the exception.
+		//      This is the KERNEL's answer at open time and it is authoritative where it exists. Not prose —
+		//      a JSON field — so it is not the fragile message matching this deliberately avoids ("File
+		//      exists" is locale-dependent; the errno is not).
+		//   2. An existence probe, for backends that raise no errno (object stores).
+		//
+		// ⚠ THE PROBE ALONE IS NOT ENOUGH ON A FUSE MOUNT, measured on Fabric (2026-08-01): 16 writers x 20
+		// commits against /lakehouse/default/Tables, twice. The O_EXCL open correctly failed — it reaches the
+		// fuse driver — and the FileExists() that follows answered FALSE for a commit file another PROCESS
+		// had just created, because the kernel can serve it from a cached negative lookup. The conflict was
+		// then reported as a generic IO error, never became a DeltaConflictException, and the retry loop
+		// never saw it: one writer per run died outright (max retry attempt reached across all writers was
+		// 4 of 16, so this was never budget exhaustion). No data was lost either time — the guard itself is
+		// atomic on fuse — but a losing writer failed its statement instead of retrying.
 		if (exclusive) {
+			// EEXIST first: it is the cheaper and the more reliable of the two.
+			const char *what = e.what();
+			if (what && std::string(what).find("\"errno\":\"17\"") != std::string::npos) {
+				return FABRICATOR_ALREADY_EXISTS;
+			}
 			try {
 				auto *ctx = reinterpret_cast<ClientContext *>(opener);
 				auto &fs = FileSystem::GetFileSystem(*ctx);
