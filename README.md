@@ -1251,6 +1251,21 @@ Any of these can also be set **per table** with `CREATE TABLE … WITH (…)` (a
 | `isolation_level` | **`serializable`** | Matches Fabric Spark, which commits at `Serializable` — so a table with no `delta.isolationLevel` property gets the same guarantee whichever engine writes it. **Changed 2026-08-01** (was `write_serializable`, Databricks' default, which made us the weaker writer on any undeclared table). ⚠ **Row-level concurrency needs `write_serializable`**: under `serializable` concurrent disjoint-row DML on one file conflicts instead of composing, so set `isolation_level 'write_serializable'` if you rely on it |
 | `compression` | `snappy` | + auto dictionary encoding + always-on min/max stats |
 
+**Concurrent writers from another engine (Spark, Databricks, delta-rs).** A writer records in its commit
+whether its transaction read anything (`commitInfo.isBlindAppend`); under `write_serializable` a commit
+that declares it read nothing is exempt from our conflict check, which is what lets a pure append commit
+alongside your DELETE. We now **honour that declaration when it is present** and only guess from the
+commit's shape when it is absent — so a foreign `INSERT … SELECT` from the same table (which adds files
+but did read) is correctly treated as a conflict instead of being waved through. Two consequences worth
+knowing:
+
+- You may see a conflict where an older build silently allowed one. That is the check working; the
+  earlier behaviour could let a concurrent read-then-append go unvalidated.
+- **We do not yet emit the flag ourselves.** Other engines therefore treat *our* appends as
+  possibly-having-read and check them under every isolation level, so a Spark transaction can abort
+  against our concurrent append (`DELTA_CONCURRENT_APPEND`) even on a `write_serializable` table where it
+  would have committed against Spark's own blind append. Retry is the workaround; the fix is tracked.
+
 So a **default** table is read by Spark, delta-kernel, and Fabric Spark + OneLake conversion (all
 validated live) — but **not** by SQL Server's DELTA reader (**protocol 1.0 only**) or the Fabric T-SQL
 endpoint's id-mapping gate. For SQL-Server / PolyBase interop, create the table plain with

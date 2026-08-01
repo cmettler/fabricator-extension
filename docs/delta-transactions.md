@@ -669,8 +669,15 @@ OSS Delta **knows** the enum value — it is the **table-property validator** th
       `DESCRIBE HISTORY`, where `isBlindAppend` reads `True` for its blind append and blank for ours.
 
       ⇒ **A Spark transaction will abort against our concurrent append whatever the table declares.**
-      Setting `WriteSerializable` does not help in that direction. It remains correct for OUR writer's
-      own conflict checks and for Spark-vs-Spark concurrency.
+      Setting `WriteSerializable` does not help in that direction *while the flag is missing*. It remains
+      correct for OUR writer's own conflict checks and for Spark-vs-Spark concurrency — and it becomes
+      the level that DOES help once we emit the flag (see the table below).
+
+      **The mirror-image defect on the READING side is FIXED (2026-08-01).** We inferred another
+      engine's blind-append from action shape, which errs the UNSAFE way: an `INSERT … SELECT` from the
+      same table emits only adds yet plainly read, so we exempted a commit we should have checked.
+      `ConflictChecker` now consumes `commitInfo.isBlindAppend` when the writer declared it and infers
+      only when it is absent. Full record: [ew-master-migration.md](ew-master-migration.md) §isBlindAppend.
 
    **The fix is to emit `isBlindAppend` — and it must be TRUTHFUL, not convenient.** Delta's definition
    is *the transaction read nothing* (`readPredicates.isEmpty && readFiles.isEmpty`), not "the commit
@@ -678,6 +685,39 @@ OSS Delta **knows** the enum value — it is the **table-property validator** th
    table as blind, and a wrong `true` makes OTHER engines **skip** a check they should run — the unsafe
    direction. Our buffered transaction already tracks a read set for its own OCC check, so the
    information exists; derive it from there. Not yet built.
+
+   **⇒ HOW MUCH emitting it would actually buy, settled from the source (2026-08-01).** The same file's
+   isolation dispatch decides which list the predicate check even runs on:
+
+   ```scala
+   val addedFilesToCheckForConflicts = isolationLevel match {
+     case WriteSerializable if !currentTransactionInfo.metadataChanged =>
+       winningCommitSummary.changedDataAddedFiles                                   // empty if we declare blind
+     case Serializable | WriteSerializable =>
+       winningCommitSummary.changedDataAddedFiles ++ winningCommitSummary.blindAppendAddedFiles
+     case SnapshotIsolation => Seq.empty
+   }
+   val fileMatchingPartitionReadPredicates =
+     getFirstFileMatchingPartitionPredicates(addedFilesToCheckForConflicts)
+   ```
+
+   | table's level | today (no flag) | with a truthful `isBlindAppend: true` |
+   |---|---|---|
+   | `WriteSerializable` | our adds are `changedDataAddedFiles` ⇒ examined ⇒ **ABORT** (measured above) | list is EMPTY ⇒ **Spark COMMITS** |
+   | `Serializable` | examined ⇒ **ABORT** (measured above) | blind appends examined too, BY DESIGN ⇒ **still aborts, correctly** |
+
+   So the write half fixes the `WriteSerializable` case ONLY, and the `Serializable` abort is not a
+   defect at all — it is what the level means. Claim that scope, not "it fixes the interop aborts".
+
+   **This also retires a planned experiment.** The worry (from upstream PR #24) was that a whole-table
+   read declaration might conflict even with a blind append, which would have made the write half
+   worthless; the plan was to re-run the A/B with a prunable predicate to find out. The source shows the
+   question is malformed: on the `WriteSerializable` path the list handed to the predicate matcher is
+   already empty, so **predicates are never consulted** and how broad the reader's declaration was cannot
+   matter. The exemption is applied one step EARLIER than the predicate comparison, not dodged by it.
+   The experiment was therefore **not run**.
+
+   Still a PREDICTION, not a measurement: the live A/B must be re-run once the flag is emitted.
 
    **Method note, because this experiment was void FOUR times before it measured anything.** Each void
    run looked like a clean result ("no conflict"). The window has to be *proven*, not assumed: the

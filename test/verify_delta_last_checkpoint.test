@@ -25,8 +25,12 @@ require-env FABRICATOR_DELTA_WRITE_DIR
 # The Delta protocol requires readers to cope with _last_checkpoint being absent OR unreadable by falling
 # back to listing the log, so tolerating it is spec-conformance, not a workaround.
 #
-# MUTATION-TESTED: with the empty/JsonException guards removed from CheckpointReader, sections 2 and 3 below
-# fail with that exact production error.
+# MUTATION-TESTED: with the JsonException guard removed from CheckpointReader, sections 2 and 3 below fail
+# with that exact production error. Note the empty-content check in front of it is a FAST PATH, not the thing
+# that makes section 2 pass — Parse("") already raises JsonException — so removing that check alone changes
+# nothing here. Per-guard mutation testing lives with the EW-side suite
+# (EngineeredWood.DeltaLake.Tests/LastCheckpointToleranceTests), which can reach the guards directly; this
+# suite proves the tolerance end-to-end through a real ATTACH, which is the part EW cannot test.
 
 statement ok
 ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/lcp' AS lake (TYPE fabricator, PROVIDER 'delta');
@@ -158,3 +162,23 @@ SELECT count(*), max(id) FROM l4.main.t;
 
 statement ok
 DETACH l4;
+
+# ==== 6. VALID JSON THAT IS NOT AN OBJECT ====
+# Not a shape an interrupted overwrite plausibly leaves behind — the file is always written as an object — so
+# this is a COMPLETENESS case, and it is here because it was a real second bug. Reading the required fields
+# off the root assumed the root was an object, and TryGetProperty does not return false for a non-object: it
+# THROWS InvalidOperationException ("requires an element of type 'Object'"). So the hint could still fail the
+# caller through the very guard meant to stop that. Found by writing the EW-side suite for the upstream offer.
+statement ok
+COPY (SELECT '[1,2,3]' AS x) TO '${FABRICATOR_DELTA_WRITE_DIR}/lcp/t/_delta_log/_last_checkpoint' (FORMAT csv, HEADER false);
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/lcp' AS l6 (TYPE fabricator, PROVIDER 'delta');
+
+query II
+SELECT count(*), max(id) FROM l6.main.t;
+----
+12	11
+
+statement ok
+DETACH l6;

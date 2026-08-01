@@ -1574,11 +1574,39 @@ Reachable because the file is updated by non-atomic OVERWRITE (`WriteAllBytesAsy
 All four now mean "no hint". MEASURED on Fabric OneLake: 8 concurrent writers × 12 commits (checkpoint
 interval 10) killed 2 of 8, then 1 of 8; a 10 × 15 run reproduced the torn-read variant in 2 of 10.
 A single-writer run can never reach any of it. Gate:
-`test/verify_delta_last_checkpoint.test` (34, hermetic, mutation-tested) — it writes each corrupt state
+`test/verify_delta_last_checkpoint.test` (39, hermetic, mutation-tested) — it writes each corrupt state
 directly rather than depending on a race that only sometimes collides.
 
 The host-side half (read whole small files in ONE request instead of Azure's lazy ETag-pinned ranged
 stream) lives in the Bridge and is NOT part of the offer.
+
+**OFFERED 2026-08-01 — branch `offer/last-checkpoint` on the `cmettler/engineered-wood` fork**, one
+commit on top of `upstream/master` (`e314af5`). `CheckpointReader.cs` had not been touched upstream since
+our merge-base, so the cherry-pick was clean. Opening the PR is a manual step (`gh` is not installed on
+this box): https://github.com/cmettler/engineered-wood/pull/new/offer/last-checkpoint
+
+**Writing the offer changed the fix, which is the argument for writing offers properly.** Our evidence
+was a fabricator sqllogictest upstream cannot run, so the offer needed an EW-level suite
+(`LastCheckpointToleranceTests`, 11 cases). Two things fell out of writing it:
+
+- **A FIFTH unhandled shape, and a real second bug.** Valid JSON that is not an OBJECT (`[1,2,3]`) still
+  threw: the guard read the required fields off the root assuming it was one, and `TryGetProperty` does
+  not return `false` for a non-object — it throws `InvalidOperationException` ("requires an element of
+  type 'Object'"). So the hint could still fail a caller through the very guard meant to stop that.
+  Not a shape an interrupted overwrite plausibly leaves behind (the file is always written as an object),
+  which is exactly why only a completeness-driven suite would find it — ours tests plausible shapes.
+  Fixed with a `ValueKind` check, ported back to `fabricator-patches`, and pinned in our suite as §6.
+- **An over-claim in the original commit message, corrected.** Per-guard mutation testing shows
+  `data.Length == 0` kills NO test: `Parse("")` already raises `JsonException`, so the catch covers empty
+  too. The check stays as a deliberate fast path and is now documented as that rather than as
+  load-bearing. The other four guards each kill at least one test.
+
+**METHOD NOTE — the mutation run was VOID TWICE before it measured anything, both times looking clean.**
+First, CRLF: the `perl -0` patterns used `\n`, matched nothing, and reported all five mutants "passing",
+i.e. five runs of the unmodified baseline. Second, a mutant that did not COMPILE — with `--no-build` the
+test command happily re-ran the previous binary and again reported green. Both are the standing
+"a negative result is not a measurement" rule wearing new clothes, and both are cheap to prevent: assert
+the file actually changed (`cmp`), and assert the build SUCCEEDED, before believing any result.
 
 ### 2. OPEN FINDING (measured, NOT built): blind-append classification is wrong in BOTH directions
 
@@ -1588,8 +1616,8 @@ Delta defines a blind append as *the transaction read nothing*
 
 | half | what EW does | direction of the error |
 |---|---|---|
-| **writing** | never emits `commitInfo.isBlindAppend` | **too strict** — other engines treat our appends as changed-data and check them under EVERY isolation level |
-| **reading** | `ConflictChecker.IsBlindAppend(actions)` INFERS it from "only AddFiles, no removes/metadata/protocol" | **too lenient** — an `INSERT … SELECT` from the same table produces only adds but DID read, so we may skip a check we owe |
+| **writing** | never emits `commitInfo.isBlindAppend` | **too strict** — other engines treat our appends as changed-data and check them under EVERY isolation level. **STILL OPEN**; cleared to build, see §4a |
+| **reading** | `ConflictChecker.IsBlindAppend(actions)` INFERS it from "only AddFiles, no removes/metadata/protocol" | **too lenient** — an `INSERT … SELECT` from the same table produces only adds but DID read, so we may skip a check we owe. **FIXED 2026-08-01**, see below |
 
 The writing half is measured end to end against Fabric Spark 4.1.1.5.5 / Delta-Lake 4.2.0 — a live A/B
 where Spark's `DELETE` aborted with `DELTA_CONCURRENT_APPEND` against our concurrent append under
@@ -1608,9 +1636,31 @@ it safe: emit `true` ONLY when no read is provable, otherwise OMIT. A wrong `tru
 SKIP a check (unsafe); a missing flag only costs spurious aborts (safe, and is today's behaviour). So
 the change is monotone — it can only remove false conflicts, never create silent ones.
 
-The reading half should become: **consume `commitInfo.isBlindAppend` when present, fall back to the
-action-shape inference only when it is absent** (legacy commits, or writers that omit it — currently
-including us). That is both spec-correct and strictly less permissive than today.
+**The reading half is BUILT (2026-08-01, EW `fabricator-patches`):** `ConflictChecker.IsBlindAppend` now
+**consumes `commitInfo.isBlindAppend` when present** and falls back to the action-shape inference —
+renamed `InferBlindAppend`, unchanged — only when it is absent (legacy commits, or writers that omit it,
+which still includes us until the write half lands). A non-boolean value counts as absent: a declaration
+we cannot read is worth no more than one that was never made.
+
+Three things that pass for detail and are not:
+
+- **The declaration outranks the inference in BOTH directions**, and each direction has its own test. The
+  unsafe one is the point (`isBlindAppend: false` on an adds-only commit — the `INSERT … SELECT` shape —
+  must now be examined, where inference alone called it blind and skipped the check). The permissive one
+  matters too: a commit containing a remove but declaring `true` stays exempt, because the writer knows
+  what it read and we do not.
+- **Absent must keep meaning "infer", not "not blind".** Almost every commit in the wild omits the flag,
+  so defaulting a missing flag to `false` would start conflicting on ordinary concurrent appends — a
+  behaviour change dressed as a correctness fix. Pinned by its own test.
+- **The declaration has to SURVIVE the log round trip or the whole change is dead code.** The verdict
+  tests hand `ConflictChecker` a `CommitInfo` directly, which proves the decision and nothing about
+  reachability; the checker's real input comes from `TransactionLog.ReadCommitAsync`. So a round-trip
+  test writes a commit carrying the flag, reads it back, and asserts it is readable exactly the way the
+  checker reads it. It is — `CommitInfo.Values` keeps arbitrary keys as `JsonElement`, so no model change
+  was needed.
+
+Mutation-tested: replacing the consumption with the bare inference kills exactly the two direction tests.
+EW `ConflictCheckerTests` 16, DeltaLake.Table.Tests 727 on net472 + net8.0.
 
 ### 3. Upstream state at the time of writing
 
@@ -1655,7 +1705,72 @@ append. If a narrow read commits and a whole-table read aborts, the exemption is
 half is worth building; if both abort, the write half buys nothing against Spark and only the READING
 half (§2, the unsafe direction) is worth doing.
 
-**Recommended order, updated:** (1) offer the `_last_checkpoint` fix upstream — independent of all of
-this; (2) fix the READING half (consume the flag when present) — it closes the unsafe direction and its
-value does not depend on the caveat; (3) run the prunable-predicate check above; (4) build the WRITING
-half only if (3) says it pays.
+### 4a. THE CAVEAT IS RESOLVED — it does NOT apply at WriteSerializable, so the write half PAYS (2026-08-01)
+
+**Settled by reading Delta's source at the `v4.2.0` tag** (the Fabric build) rather than by a live run,
+because the source names which branch executes and the live A/B had already measured the
+flag-absent case. `ConflictChecker.scala`, verbatim:
+
+```scala
+val blindAppendAddedFiles: Seq[AddFile]   = if (isBlindAppendOption.getOrElse(false)) addedFiles else Seq()
+val changedDataAddedFiles: Seq[AddFile]   = if (isBlindAppendOption.getOrElse(false)) Seq() else addedFiles
+
+val addedFilesToCheckForConflicts = isolationLevel match {
+  case WriteSerializable if !currentTransactionInfo.metadataChanged =>
+    winningCommitSummary.changedDataAddedFiles
+  case Serializable | WriteSerializable =>
+    winningCommitSummary.changedDataAddedFiles ++ winningCommitSummary.blindAppendAddedFiles
+  case SnapshotIsolation => Seq.empty
+}
+val fileMatchingPartitionReadPredicates =
+  getFirstFileMatchingPartitionPredicates(addedFilesToCheckForConflicts)
+```
+
+**The predicate check never runs on a declared blind append at WriteSerializable.** The list handed to
+`getFirstFileMatchingPartitionPredicates` is EMPTY, so how broad the reader's declaration was — narrow
+predicate, whole-table, anything — cannot matter. The caveat imagined the exemption being dodged by a
+different check; it is not dodged, it is applied one step EARLIER than the predicate comparison.
+**⇒ the prunable-predicate experiment (item 3 of the old order) is MOOT and was not run: predicates are
+not consulted on that path at all.**
+
+What this predicts for the two levels we measured, and it matches both observations exactly:
+
+| table's level | our append today (no flag) | our append WITH a truthful `isBlindAppend: true` |
+|---|---|---|
+| `WriteSerializable` | `getOrElse(false)` ⇒ our adds land in `changedDataAddedFiles` ⇒ examined ⇒ **Spark ABORTS** (measured) | `changedDataAddedFiles` empty ⇒ nothing examined ⇒ **Spark COMMITS** |
+| `Serializable` | examined ⇒ **Spark ABORTS** (measured) | blind appends are examined too, BY DESIGN ⇒ **still aborts** |
+
+So the Serializable abort is CORRECT and unfixable by any flag — that is what the level means — while
+the WriteSerializable abort is ours to fix and is caused precisely by the missing flag. The write half
+pays, for `WriteSerializable` tables specifically, and the honest scope claim is that narrow one rather
+than "it fixes the interop aborts".
+
+Note this also means the write half's value is gated on a table DECLARING `WriteSerializable` — which
+Fabric Spark's DDL validator refuses to set (§10.6 of [delta-transactions.md](delta-transactions.md)),
+so in practice such a table is one WE stamped. Spark honours a stamped value; it just cannot write one.
+
+**Still to MEASURE after building it:** that Spark actually commits in the A/B once we emit the flag.
+The source says it must; the standing rule here is that a source-derived prediction is a prediction.
+
+**⚠ THE CRUX FOR WHOEVER BUILDS IT: the truth lives in the HOST, not in EW — so deriving the flag from
+EW's transaction state alone would emit a LIE, in the unsafe direction.** `DeltaTransaction` does track
+reads (`_readPredicates`, `_readWholeTable` via `StageWholeTableRead`, plus staged DELETE edits), which
+makes `!_readWholeTable && _readPredicates.Count == 0 && no removes staged` look like a ready-made
+blind-append test. It is not, and the field comments say why: those collections are *"left empty by the
+functional-predicate and append-only paths"*, and `StageWholeTableRead` is something **the host calls**.
+An `INSERT INTO t SELECT … FROM t` is executed by DuckDB — DuckDB reads the target and hands EW rows to
+append — so EW sees a transaction with no staged read and would conclude "blind" for the one shape the
+whole exercise is about. Emitting `true` there tells every other engine to SKIP a check it owes.
+
+So the write half is NOT a derivation inside EW; it needs the host to positively assert that the
+statement read nothing, and the safe default when nobody asserts is to OMIT the field (today's
+behaviour, which only costs spurious aborts). Concretely: an explicit declaration on the transaction
+(the `StageWholeTableRead` shape, inverted) that the Bridge sets from what it knows about the DuckDB
+plan, with EW's own read tracking as a veto rather than as the source of truth — a declaration can only
+be DOWNGRADED to "not blind" by staged reads, never upgraded to "blind" by their absence.
+
+**Recommended order, updated again:** (1) offer the `_last_checkpoint` fix upstream — DONE, branch
+`offer/last-checkpoint` on the fork; (2) fix the READING half — DONE, and it found that the writer's
+declaration must outrank our inference in BOTH directions; (3) the prunable-predicate check — MOOT, see
+above; (4) build the WRITING half — cleared to proceed, scoped as in the table above, with the live A/B
+re-run as its gate.

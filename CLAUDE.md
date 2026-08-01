@@ -491,9 +491,21 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     scan is handed out by `GetScanFunction` and is not a registered catalog function ⇒ "Failed to find
     function fabricator_scan()". So `FabricatorScanDeserialize` is UNREACHABLE — and must still exist,
     because `Serialize` only emits bind data when BOTH callbacks are set. Do not "clean it up".
-- **⚠ CROSS-ENGINE GAP FOUND + MEASURED (2026-08-01), NOT YET FIXED: we never emit `commitInfo.isBlindAppend`,
-  so a Fabric Spark transaction ABORTS against our concurrent append whatever the table declares.** Full record:
-  [docs/delta-transactions.md](docs/delta-transactions.md) §10.6.
+- **⚠ CROSS-ENGINE GAP MEASURED (2026-08-01). The READING half is now FIXED; the WRITING half is still
+  OPEN — we do not emit `commitInfo.isBlindAppend`, so a Fabric Spark transaction ABORTS against our
+  concurrent append whatever the table declares.** Full record:
+  [docs/delta-transactions.md](docs/delta-transactions.md) §10.6 +
+  [docs/ew-master-migration.md](docs/ew-master-migration.md) §isBlindAppend §4a.
+  - **THE WRITE HALF IS CLEARED TO BUILD, and its scope is narrower than "fixes the aborts".** The blocking
+    uncertainty was upstream PR #24's report that a whole-table read declaration conflicts even with a blind
+    append; **reading `ConflictChecker.scala` at the `v4.2.0` tag REFUTES that for WriteSerializable** — with
+    the flag set, `changedDataAddedFiles` is `Seq()`, and that EMPTY list is what the predicate check runs on,
+    so how broad the reader's declaration was cannot matter. It is applied one step EARLIER than the predicate
+    comparison, not dodged. ⇒ **the planned prunable-predicate experiment is MOOT and was not run.** Emitting
+    the flag would make Spark COMMIT on a `WriteSerializable` table and would change NOTHING on a
+    `Serializable` one (blind appends are examined there by design — that abort is correct). Both halves of
+    that prediction match the live A/B exactly. Since Fabric Spark's DDL refuses to SET `WriteSerializable`,
+    the tables this helps are ones WE stamped — Spark honours a stamped value, it just cannot write one.
   - Live A/B on Fabric Spark 4.1.1.5.5 / **Delta-Lake 4.2.0** (`ConflictChecker.scala` re-read at the `v4.2.0`
     TAG — the Fabric build, not master): 200M-row table, Spark `DELETE … WHERE id % 7 = 3`, our append committed
     inside the window. `Serializable` ⇒ Spark ABORTS (`DELTA_CONCURRENT_APPEND`, naming our v8). `WriteSerializable`
@@ -503,22 +515,43 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     checked under BOTH levels. Confirmed three ways: the source; our commitInfo on disk (operation/engineInfo/
     operationParameters only); and Spark's `DESCRIBE HISTORY` showing `isBlindAppend` True for ITS blind append
     and blank for ours.
-  - **UPSTREAM OFFER + the plan are WRITTEN DOWN**: [docs/ew-master-migration.md](docs/ew-master-migration.md)
-    §isBlindAppend. The `_last_checkpoint` tolerance fix (`14a74a9`) is engine-agnostic and spec-conformant —
-    a bug for every EW user, so it should be OFFERED UPSTREAM AS-IS (the host-side one-request read stays
-    ours). Upstream is 8 ahead = exactly the known pending bump (#6, #16–#22); **none of those touch isolation
-    or blind-append**, so neither item waits for it. And to settle the worry directly: **EW has NOT lost
-    WriteSerializable support** — `StartTransaction` still defaults to it and `ConflictChecker` still
+  - **UPSTREAM OFFER — SENT (2026-08-01), branch `offer/last-checkpoint` on the fork**, one commit on
+    `upstream/master`; opening the PR is a manual click (`gh` is not installed here). The `_last_checkpoint`
+    tolerance fix is engine-agnostic and spec-conformant — a bug for every EW user (the host-side one-request
+    read stays ours). Upstream is 8 ahead = exactly the known pending bump (#6, #16–#22); **none of those touch
+    isolation or blind-append**, so neither item waits for it. And to settle the worry directly: **EW has NOT
+    lost WriteSerializable support** — `StartTransaction` still defaults to it and `ConflictChecker` still
     implements the relaxation; what is missing is interop plumbing, not semantics.
-  - **The READING half is wrong too, in the OPPOSITE (unsafe) direction.** `ConflictChecker.IsBlindAppend`
-    INFERS blind-append from action shape ("only AddFiles"), so another engine's `INSERT … SELECT` from the
-    same table — only adds, but it READ — is treated as blind and we skip a check we owe. Correct shape:
-    CONSUME `commitInfo.isBlindAppend` when present, fall back to inference only when absent.
+    - **Writing the offer PROPERLY found a second bug**, because it needed an EW-level suite (upstream cannot
+      run our sqllogictest): valid JSON that is not an OBJECT still threw, since `TryGetProperty` raises
+      `InvalidOperationException` rather than returning false on a non-object root. Ported back; our suite is
+      39 (§6). It also corrected an over-claim — `data.Length == 0` kills no test (`Parse("")` already raises
+      `JsonException`), so it is documented as a fast path, not a load-bearing guard.
+  - **The READING half was wrong too, in the OPPOSITE (unsafe) direction — FIXED 2026-08-01 (EW-only).**
+    `ConflictChecker.IsBlindAppend` INFERRED blind-append from action shape ("only AddFiles"), so another
+    engine's `INSERT … SELECT` from the same table — only adds, but it READ — was treated as blind and we
+    skipped a check we owe. It now CONSUMES `commitInfo.isBlindAppend` when present and falls back to the
+    inference (`InferBlindAppend`, unchanged) only when absent; a non-boolean counts as absent. Three
+    non-obvious parts: the declaration outranks the inference in BOTH directions (each has a test); ABSENT
+    must keep meaning "infer", since almost every commit in the wild omits the flag and defaulting to
+    "not blind" would conflict on ordinary appends; and a **round-trip test** proves the flag survives
+    `TransactionLog.ReadCommitAsync` — without it the verdict tests would be pinning dead code. No model
+    change needed (`CommitInfo.Values` already keeps arbitrary keys). Mutation-tested; Table.Tests 727.
   - **The fix must be TRUTHFUL:** Delta's definition is "the transaction READ NOTHING"
     (`readPredicates.isEmpty && readFiles.isEmpty`), NOT "the commit contains only adds" — deriving it from
     action shape would mark `INSERT … SELECT` from the same table as blind, and a wrong `true` makes other
-    engines SKIP a check they should run (the unsafe direction). The buffered txn already tracks a read set for
-    its own OCC check; derive it from there.
+    engines SKIP a check they should run (the unsafe direction).
+    - **⚠ CORRECTION to the obvious plan (2026-08-01): "the buffered txn already tracks a read set, derive it
+      from there" is WRONG, and wrong in the unsafe direction.** `DeltaTransaction` does hold
+      `_readPredicates`/`_readWholeTable`/staged DELETE edits, so `no staged reads ⇒ blind` looks ready-made —
+      but those are *"left empty by the functional-predicate and append-only paths"* and `StageWholeTableRead`
+      is something **the HOST calls**. `INSERT INTO t SELECT … FROM t` is executed by DuckDB, which reads the
+      target and hands EW rows to append, so EW sees no staged read and would declare "blind" for precisely the
+      shape this is all about. **The truth lives in the host, not in EW.** The write half therefore needs an
+      explicit host assertion (the `StageWholeTableRead` shape, inverted) with EW's read tracking as a VETO
+      only — a declaration may be downgraded to "not blind" by staged reads, never upgraded to "blind" by their
+      absence — and OMITTING the field stays the default when nobody asserts (today's behaviour; costs only
+      spurious aborts).
   - **⚠ METHOD: this experiment was VOID FOUR TIMES and each void looked like a clean "no conflict".** The
     window must be PROVEN (Spark naming the concurrent version, or `readVersion` ordering), never assumed. What
     kept failing was OUR end — the append needed ~20 s (process start + CLR + ATTACH discovery), most of the
