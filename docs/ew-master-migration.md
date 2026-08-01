@@ -527,10 +527,35 @@ implemented here: today the declaration is honoured at both levels … if it is 
 an explicit per-transaction opt-in rather than an inference — a library must not claim on a host's
 behalf that it read less than it declared."* Our branch DOES implement it, as an inference, in the
 commit loop (`effectiveReads = rowLevel && isolation != Serializable ? reads with { WholeTable = false }
-: reads`), and `verify_delta_row_level_concurrency` (70) depends on it. **Decision for this bump: KEEP
-our behaviour and CORRECT upstream's doc on our branch** — adopting the opt-in is a semantic redesign
-and mixing it into a 36-hunk API migration is exactly the entanglement trap recorded above. Adopting it
-afterwards is the natural next upstream offer, and it is what Curt has already said he wants.
+: reads`), and `verify_delta_row_level_concurrency` (70) depends on it.
+
+**DECISION, revised — adopt the OPT-IN DURING the merge rather than preserving the inference.** The
+first call here was "keep our behaviour, redesign later", on entanglement grounds. That was too
+cautious once the size was checked: `rowLevel` is only `rowLevelDeletes is { Count: > 0 }`, so the
+opt-in is a field + a public property on `DeltaTransaction`, ONE condition in the commit loop
+(the inference becomes the PRECONDITION rather than the trigger:
+`_exemptRowLevel && rowLevel && isolation != Serializable`), and the Bridge setting it at the one flush
+site that gets the behaviour implicitly today.
+
+Three reasons it beats preserving the inference:
+
+- **It touches the most contested file ONCE.** `DeltaTable.cs` is where upstream wrote +1325 lines
+  against our +1165; resolving the hunk and then re-opening it for a redesign pays that cost twice.
+- **It converts a behavioural MODIFICATION into an ADDITIVE patch.** That is the difference that
+  matters for every future bump — and it removes this exact hazard, because a modification of
+  upstream's own lines is what makes "take upstream wholesale" compile, pass most suites, and silently
+  revert us. That nearly happened on the first attempt.
+- **It is what upstream ASKED FOR**, so it is offerable, and an absorbed patch is one we stop carrying.
+
+**The OFFER still has to wait for the bump to land**, per generate-never-maintain: an offer is cut off
+`upstream/master`, and writing it against the pre-bump API means writing against methods upstream has
+already replaced — the same mistake flagged for the isBlindAppend write half. Order: bump → opt-in
+during resolution → offer cut from the result.
+
+**Fallback, kept deliberately:** if upstream's restructured commit loop does not leave `effectiveReads`
+in a shape where the gate drops in cleanly, preserve the inference exactly as today and correct
+upstream's `DeclareWholeTableRead` remark on our branch so it describes what we actually do. Decide by
+reading the merged loop, not in advance.
 
 **3. Hunk-wise resolution is REQUIRED, not a matter of taste.** A plain `git checkout --theirs` on
 `DeltaTransaction.cs` looks equivalent and is not: it discards our changes that auto-merged OUTSIDE the
@@ -563,7 +588,9 @@ committable checkpoint before the Bridge is touched at all:
 
 1. Merge `upstream/master` into `bump/upstream-2026-08`; take the shredding delete and upstream's test
    file (finding 4); resolve `DeltaTransaction.cs` and `DeltaTable.cs` hunk-wise (finding 3), taking
-   upstream on every hunk EXCEPT preserving the row-level exemption (finding 2).
+   upstream on every hunk — including the row-level exemption one, which is then RE-ADDED as the
+   explicit opt-in rather than as our inference (finding 2, revised). Fallback if the restructured loop
+   fights it: preserve the inference and fix upstream's remark instead.
 2. Delete our `FileRowSelection` type and its duplicate `StageRowDeletesAsync` overload; migrate the
    38 EW `src/` + 5 EW test sites to `RowSelection` (finding 1).
 3. Correct upstream's `DeclareWholeTableRead` remark on our branch so it describes what we actually do.
