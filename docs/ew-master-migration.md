@@ -1752,22 +1752,32 @@ so in practice such a table is one WE stamped. Spark honours a stamped value; it
 **Still to MEASURE after building it:** that Spark actually commits in the A/B once we emit the flag.
 The source says it must; the standing rule here is that a source-derived prediction is a prediction.
 
-**⚠ THE CRUX FOR WHOEVER BUILDS IT: the truth lives in the HOST, not in EW — so deriving the flag from
-EW's transaction state alone would emit a LIE, in the unsafe direction.** `DeltaTransaction` does track
-reads (`_readPredicates`, `_readWholeTable` via `StageWholeTableRead`, plus staged DELETE edits), which
-makes `!_readWholeTable && _readPredicates.Count == 0 && no removes staged` look like a ready-made
-blind-append test. It is not, and the field comments say why: those collections are *"left empty by the
-functional-predicate and append-only paths"*, and `StageWholeTableRead` is something **the host calls**.
-An `INSERT INTO t SELECT … FROM t` is executed by DuckDB — DuckDB reads the target and hands EW rows to
-append — so EW sees a transaction with no staged read and would conclude "blind" for the one shape the
-whole exercise is about. Emitting `true` there tells every other engine to SKIP a check it owes.
+**⚠ THE CRUX FOR WHOEVER BUILDS IT — and it is an AUTOCOMMIT problem specifically, which is narrower and
+more fixable than "the host never tells EW".** The shape that decides the design is
+`INSERT INTO t SELECT … FROM t …` — an anti-join insert ("insert only rows not already there"), the
+standard dbt-incremental / dedupe pattern. It **reads the target**, so it is NOT a blind append, yet it
+emits **only AddFiles**, so any action-shape derivation calls it blind. It is therefore both the reason
+the reading half needed fixing and the trap the writing half must not fall into: a wrong `true` makes
+every other engine SKIP a `concurrentAppend` check it owes.
 
-So the write half is NOT a derivation inside EW; it needs the host to positively assert that the
-statement read nothing, and the safe default when nobody asserts is to OMIT the field (today's
-behaviour, which only costs spurious aborts). Concretely: an explicit declaration on the transaction
-(the `StageWholeTableRead` shape, inverted) that the Bridge sets from what it knows about the DuckDB
-plan, with EW's own read tracking as a veto rather than as the source of truth — a declaration can only
-be DOWNGRADED to "not blind" by staged reads, never upgraded to "blind" by their absence.
+Whether EW can see the read depends on the transaction, and this is the part worth checking before
+designing anything (measured 2026-08-01 by reading `DeltaCatalog.cs:1232`, whose scan-time recording is
+gated on `_txnBuffer.IsExplicit(scanTxn)`):
+
+| statement | recorded read set | can EW derive `isBlindAppend`? |
+|---|---|---|
+| `BEGIN; INSERT INTO t SELECT … FROM t …; COMMIT` | the scan stages a predicate, or `StageWholeTableRead` when nothing pushed | **yes, safely** — the read set is non-empty, so the anti-join case comes out "not blind" correctly |
+| autocommit `INSERT INTO t SELECT … FROM t …` | **none** — reads are only tracked inside an explicit transaction | **no** — indistinguishable from `INSERT … VALUES`, and deriving would emit the lie |
+
+So a derivation from `DeltaTransaction` state is legitimate for the **buffered/explicit** path and
+unsound for **autocommit**. Two workable designs, in preference order: extend the scan-time read
+recording to autocommit statements (it is the same call site, currently gated), which makes the
+derivation uniformly safe; or leave autocommit alone and OMIT the field there, which is today's
+behaviour and costs only spurious aborts.
+
+Whichever is chosen, keep the asymmetry: a declaration may be DOWNGRADED to "not blind" by staged reads,
+never UPGRADED to "blind" by their absence — because absence of evidence is exactly what the autocommit
+row above is.
 
 **Recommended order, updated again:** (1) offer the `_last_checkpoint` fix upstream — DONE, branch
 `offer/last-checkpoint` on the fork; (2) fix the READING half — DONE, and it found that the writer's

@@ -541,17 +541,18 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     (`readPredicates.isEmpty && readFiles.isEmpty`), NOT "the commit contains only adds" — deriving it from
     action shape would mark `INSERT … SELECT` from the same table as blind, and a wrong `true` makes other
     engines SKIP a check they should run (the unsafe direction).
-    - **⚠ CORRECTION to the obvious plan (2026-08-01): "the buffered txn already tracks a read set, derive it
-      from there" is WRONG, and wrong in the unsafe direction.** `DeltaTransaction` does hold
-      `_readPredicates`/`_readWholeTable`/staged DELETE edits, so `no staged reads ⇒ blind` looks ready-made —
-      but those are *"left empty by the functional-predicate and append-only paths"* and `StageWholeTableRead`
-      is something **the HOST calls**. `INSERT INTO t SELECT … FROM t` is executed by DuckDB, which reads the
-      target and hands EW rows to append, so EW sees no staged read and would declare "blind" for precisely the
-      shape this is all about. **The truth lives in the host, not in EW.** The write half therefore needs an
-      explicit host assertion (the `StageWholeTableRead` shape, inverted) with EW's read tracking as a VETO
-      only — a declaration may be downgraded to "not blind" by staged reads, never upgraded to "blind" by their
-      absence — and OMITTING the field stays the default when nobody asserts (today's behaviour; costs only
-      spurious aborts).
+    - **⚠ THE DECIDING SHAPE is `INSERT INTO t SELECT … FROM t …`** — an anti-join insert ("insert only rows
+      not already there"), i.e. the standard dbt-incremental/dedupe pattern, so the COMMON case not an exotic
+      one. It READS the target ⇒ not blind, yet emits **only AddFiles** ⇒ every action-shape derivation calls
+      it blind. That is both why the reading half needed fixing and the trap the writing half must avoid.
+    - **⚠ Whether we can derive the flag depends on AUTOCOMMIT vs EXPLICIT — measured, and it narrows the
+      problem** (`DeltaCatalog.cs:1232`, gated on `_txnBuffer.IsExplicit(scanTxn)`): inside `BEGIN…COMMIT` a
+      scan DOES stage a predicate / `StageWholeTableRead`, so EW's read set is non-empty and a derivation
+      would correctly say "not blind"; in **autocommit nothing is recorded at all**, so the anti-join insert
+      is indistinguishable from `INSERT … VALUES` and deriving would emit the lie. ⇒ derive on the
+      buffered/explicit path; for autocommit either extend the (same, currently-gated) scan-time recording, or
+      OMIT the field — today's behaviour, which costs only spurious aborts. Keep the asymmetry either way: a
+      declaration may be DOWNGRADED to "not blind" by staged reads, never UPGRADED to "blind" by their absence.
   - **⚠ METHOD: this experiment was VOID FOUR TIMES and each void looked like a clean "no conflict".** The
     window must be PROVEN (Spark naming the concurrent version, or `readVersion` ordering), never assumed. What
     kept failing was OUR end — the append needed ~20 s (process start + CLR + ATTACH discovery), most of the
