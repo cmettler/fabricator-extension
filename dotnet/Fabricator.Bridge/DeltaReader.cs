@@ -981,55 +981,106 @@ internal static class DeltaReader
         var snapshot = atVersion is { } v && v != table.CurrentSnapshot.Version
             ? await table.GetSnapshotAtVersionAsync(v, token).ConfigureAwait(false)
             : table.CurrentSnapshot;
+        // BOTH identities now arrive as COLUMNS, in one pass: the address under RowAddress and the stable
+        // id/commit version under RowTracking (EW's `sourceRowTrackingOut` out-param was retired upstream —
+        // the two surfaces DISAGREED about failure, and the column form is the one that complains).
+        // ⚠ Only ask for RowTracking when a caller wants it: on a table WITHOUT row tracking the ask is
+        // REFUSED (where the out-param quietly returned all-nulls), and that refusal is correct — it is a
+        // configuration mistake worth hearing about. Our one caller allocates sourceTrackingOut only under
+        // TxnDmlProfile.MaterializeRowIds, i.e. only when the table declares the materialized columns, so
+        // the two conditions line up. Keep them lined up.
+        var metadata = (rowIdsOut is null ? DeltaRowMetadata.None : DeltaRowMetadata.RowAddress)
+                       | (sourceTrackingOut is null ? DeltaRowMetadata.None : DeltaRowMetadata.RowTracking);
         await foreach (var batch in table.ReadRowsAsync(
                            SelectionFromRowIds(table, snapshot, rowIds, "row read-back",
                                                skipUnresolvable: true),
-                           sourceTrackingOut, token, snapshot,
-                           metadata: rowIdsOut is null
-                               ? DeltaRowMetadata.None : DeltaRowMetadata.RowAddress)
+                           new DeltaRowReadOptions { Metadata = metadata, ResolveAgainst = snapshot },
+                           token)
                            .ConfigureAwait(false))
         {
-            if (rowIdsOut is null)
+            if (metadata == DeltaRowMetadata.None)
             {
                 yield return batch;
                 continue;
             }
-            yield return StripRowAddress(batch, rowIdsOut);
+            yield return StripMetadata(batch, rowIdsOut, sourceTrackingOut);
         }
     }
 
     /// <summary>
-    /// Takes EW's trailing <c>_ew_row_address</c> column off a read-back batch, appending its values to
-    /// <paramref name="rowIdsOut"/> as one row-aligned array. Located BY NAME, not by position: a metadata
-    /// column's placement is EW's contract to change, and stripping the wrong column would silently drop a
-    /// user column and shift the rest.
+    /// Takes EW's appended metadata columns off a read-back batch — the transient address into
+    /// <paramref name="rowIdsOut"/>, the stable id/commit version into <paramref name="sourceTrackingOut"/>
+    /// — and returns the batch carrying USER COLUMNS ONLY. Every column is located BY NAME, not by position:
+    /// a metadata column's placement is EW's contract to change, and stripping the wrong one would silently
+    /// drop a user column and shift the rest.
+    /// <para>Stripping is not cosmetic. The buffered-UPDATE consumer indexes columns POSITIONALLY against
+    /// the pending schema, so a trailing metadata column shifts every index; and since #50 EW REFUSES a
+    /// write whose batch carries a column the table does not declare, forwarding one as a post-image would
+    /// now be an error rather than the silent extra parquet column it used to be.</para>
     /// </summary>
-    private static RecordBatch StripRowAddress(RecordBatch batch, List<long[]> rowIdsOut)
+    private static RecordBatch StripMetadata(
+        RecordBatch batch, List<long[]>? rowIdsOut,
+        List<(long?[] Ids, long?[] Versions)>? sourceTrackingOut)
     {
-        int idx = batch.Schema.GetFieldIndex(TransientRowAddress.ColumnName);
-        if (idx < 0)
+        var drop = new HashSet<int>();
+
+        if (rowIdsOut is not null)
         {
-            throw new System.InvalidOperationException(
-                $"row read-back: the '{TransientRowAddress.ColumnName}' metadata column is missing — it was "
-                + "requested via DeltaRowMetadata.RowAddress, so its absence means the read surface changed.");
+            var addresses = (Apache.Arrow.Int64Array)batch.Column(
+                RequireMetadataColumn(batch, TransientRowAddress.ColumnName, "RowAddress", drop));
+            var rids = new long[batch.Length];
+            for (int i = 0; i < batch.Length; i++)
+                rids[i] = addresses.GetValue(i)!.Value;
+            rowIdsOut.Add(rids);
         }
 
-        var addresses = (Apache.Arrow.Int64Array)batch.Column(idx);
-        var rids = new long[batch.Length];
-        for (int i = 0; i < batch.Length; i++)
-            rids[i] = addresses.GetValue(i)!.Value;
-        rowIdsOut.Add(rids);
+        if (sourceTrackingOut is not null)
+        {
+            const string prefix = EngineeredWood.DeltaLake.Table.DeltaMetadataColumns.DefaultPrefix;
+            var ids = (Apache.Arrow.Int64Array)batch.Column(RequireMetadataColumn(
+                batch, prefix + EngineeredWood.DeltaLake.Table.DeltaMetadataColumns.RowIdSuffix,
+                "RowTracking", drop));
+            var vers = (Apache.Arrow.Int64Array)batch.Column(RequireMetadataColumn(
+                batch, prefix + EngineeredWood.DeltaLake.Table.DeltaMetadataColumns.RowCommitVersionSuffix,
+                "RowTracking", drop));
+            // Nullable on purpose: a file predating row tracking on the table carries no baseRowId, so its
+            // rows have no derivable id. The consumer treats a null as "materialisation off for the whole
+            // statement" rather than inventing one, which would change row identity silently.
+            var idVals = new long?[batch.Length];
+            var verVals = new long?[batch.Length];
+            for (int i = 0; i < batch.Length; i++)
+            {
+                idVals[i] = ids.IsNull(i) ? null : ids.GetValue(i);
+                verVals[i] = vers.IsNull(i) ? null : vers.GetValue(i);
+            }
+            sourceTrackingOut.Add((idVals, verVals));
+        }
 
-        var fields = new List<Field>(batch.ColumnCount - 1);
-        var columns = new List<IArrowArray>(batch.ColumnCount - 1);
+        var fields = new List<Field>(batch.ColumnCount - drop.Count);
+        var columns = new List<IArrowArray>(batch.ColumnCount - drop.Count);
         for (int c = 0; c < batch.ColumnCount; c++)
         {
-            if (c == idx)
+            if (drop.Contains(c))
                 continue;
             fields.Add(batch.Schema.FieldsList[c]);
             columns.Add(batch.Column(c));
         }
         return new RecordBatch(new Apache.Arrow.Schema(fields, batch.Schema.Metadata), columns, batch.Length);
+    }
+
+    /// <summary>Resolves a requested metadata column by name and marks it for removal. Absent means the read
+    /// surface changed under us — we asked for the flag, so the column is owed.</summary>
+    private static int RequireMetadataColumn(RecordBatch batch, string name, string flag, HashSet<int> drop)
+    {
+        int idx = batch.Schema.GetFieldIndex(name);
+        if (idx < 0)
+        {
+            throw new System.InvalidOperationException(
+                $"row read-back: the '{name}' metadata column is missing — it was requested via "
+                + $"DeltaRowMetadata.{flag}, so its absence means the read surface changed.");
+        }
+        drop.Add(idx);
+        return idx;
     }
 
     // Sync facade over an async stream for the synchronous ABI callers: blocks once per pulled item

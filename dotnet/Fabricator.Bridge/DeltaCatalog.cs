@@ -3506,8 +3506,17 @@ public sealed class DeltaCatalog : IBackendCatalog
             // without the guard inside the loop the batch would commit a SECOND time.
             foreach (var kv in pending.AppTxnVersions)
             {
-                txn.RequireAppTransaction(kv.Key, kv.Value.Version, kv.Value.Expected,
-                    requireAbsent: kv.Value.Expected is null);
+                // BEHAVIOUR-PRESERVING mapping onto EW's precondition union. Our documented contract for
+                // fabricator_delta_set_transaction_version is "no expected version" == "this producer must
+                // have recorded NOTHING yet" — which is Absent, NOT the union's None. Getting that wrong is
+                // silent and costly: None writes UNCONDITIONALLY, so a replayed first batch would commit a
+                // second time and rewrite the recorded version with the same value, leaving nothing in the
+                // table to say it happened. (NotApplied — Delta-Spark's monotonic rule — is a plausible
+                // third mode to expose later, but it is a CONTRACT change and does not belong in a bump.)
+                txn.RequireAppTransaction(kv.Key, kv.Value.Version,
+                    kv.Value.Expected is { } expected
+                        ? EngineeredWood.DeltaLake.Table.AppTransactionPrecondition.Exactly(expected)
+                        : EngineeredWood.DeltaLake.Table.AppTransactionPrecondition.Absent);
             }
             int kinds = (pending.HasAppend ? 1 : 0) + (pending.HasDelete ? 1 : 0) + (pending.HasUpdate ? 1 : 0)
                         + (pending.HasAlter ? 1 : 0);

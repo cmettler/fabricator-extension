@@ -762,6 +762,111 @@ this doc apply unchanged: **diff any method taken wholesale against upstream and
 auto-merged duplicate-statement trap), **only the net472 leg proves a change offerable**, and **fast-forward
 the pin, never force-push** (release tags pin EW shas).
 
+## THE 2026-08-02 BUMP — DONE, pin `3b95599`. The cheapest bump so far, and it says why
+
+Eight upstream commits the day after the last one: **#40, #41, #43, #46, #48, #49, #50 — and #39, which is
+OURS, merged.** Five conflicted files, and every one of them sat exactly where one of our three superseded
+patches was. Nothing else conflicted at all.
+
+**That is the branch model paying out.** Three of the eight commits ARE our offers, taken and re-cut; the
+conflicts were the cost of having them absorbed, not of having diverged. Total hands-on resolution: three
+files taken wholesale, one property spliced back, two hunks merged by hand.
+
+| upstream | what it does to us |
+|---|---|
+| **#43** | `expectedPrevious`/`requireAbsent` → the `AppTransactionPrecondition` union (None/Absent/Exactly/NotApplied). **Supersedes our #37, subsumes #38.** One Bridge call site |
+| **#39 + #48** | `ReadRowsAsync` gains `DeltaRowReadOptions` and LOSES `sourceRowTrackingOut`. #39 is ours; #48 retired the out-param. One Bridge call site |
+| **#40** | `GetLatestVersionAsync` now counts CHECKPOINT versions, not only commits |
+| **#41** | four `_delta_log` walks per snapshot build → one |
+| **#46 + #49** | `DeltaTransaction` gets `AbortAsync`/`IAsyncDisposable`; the six auto-committing paths collect their own orphans |
+| **#50** | a write whose batch carries an UNDECLARED column is now refused |
+
+### Resolution, and the two hunks a `--theirs` would have broken
+
+Taken wholesale (upstream re-cut them better): `AppTransactionPreconditionException` + the precondition
+validation, and `ReadRowsAsync`. Kept and spliced back onto upstream's file:
+`DeltaTransaction.ExemptRowLevelFromWholeTableRead` (26 lines, 0 deletions).
+
+**Two were BOTH-SIDES changes, where picking either side loses something silently:**
+- `CommitOccAsync` — ours added `exemptRowLevelFromWholeTableRead`, upstream added the `written` ledger. It
+  now takes both. `--theirs` drops our isolation exemption; `--ours` drops #49's orphan collection.
+- `DeleteAsync` — ours added the `MetadataPredicate` lowering, upstream added `await using`. It now has
+  both. (The lowered route reaches `DeleteRowsAsync`, which owns its own ledger under #49, so it needs no
+  transaction of its own to clean up — worth stating, because the asymmetry looks like an oversight.)
+
+**⚠ And ONE hunk auto-merged WRONG without conflicting.** Our `requireAbsent && expectedPrevious` mutual-
+exclusion check was an addition relative to the merge base and upstream did not touch that exact text, so
+git kept it silently — referencing two parameters that no longer exist. The compiler caught it here, but it
+is the same auto-merge trap this doc already records, in a new place: **a conflict-free region inside a
+conflicted method is not evidence of anything.**
+
+### Our test that the TYPE SYSTEM retired
+
+`RequireAbsentAndExpectedPrevious_Together_IsRejected` pinned that asking for both throws an
+`ArgumentException`. With the union, the contradiction is UNREPRESENTABLE — no call can reach that throw.
+Deleted, with the reason in the file. **A test whose failure mode the type system has made impossible is
+not coverage; it would only assert that C# still has one parameter.** Distinguish this from deleting a test
+because it became inconvenient — the behaviours it guarded are pinned by Absent/Exactly upstream.
+
+### The migration the compiler could NOT have caught
+
+`kv.Value.Expected is null` had to map to **`Absent`, not the union's `None`.** Both compile. `None` writes
+UNCONDITIONALLY, so a replayed first batch of `fabricator_delta_set_transaction_version` would commit a
+SECOND time and rewrite the recorded version with the same value — leaving nothing in the table to say it
+happened. Same class as the last bump's `requireAbsent` finding, which is the point: **the precondition's
+default is the dangerous answer, and it is what an unthinking migration picks.**
+(`NotApplied` — Delta-Spark's monotonic rule — is a plausible third mode to expose later. It is a CONTRACT
+change and does not belong in a bump.)
+
+### `sourceRowTrackingOut`'s removal, and the mutation test that indicted the PAIRING
+
+The out-param became `DeltaRowMetadata.RowTracking`, so both identities now arrive as COLUMNS in one pass
+and `StripRowAddress` generalised to `StripMetadata`. Two things this had to get right:
+- **Ask for RowTracking only when a caller wants it.** On a table WITHOUT row tracking the column form is
+  REFUSED where the out-param quietly returned all-nulls (#48's whole argument). Our one caller allocates
+  `sourceTrackingOut` only under `TxnDmlProfile.MaterializeRowIds`, so the conditions line up — but that is
+  now LOAD-BEARING rather than incidental, and the code says so.
+- **Strip every metadata column.** The buffered-UPDATE consumer indexes positionally, and since #50 an
+  un-stripped column would be a REFUSED WRITE rather than the silent extra parquet column it used to be.
+
+**The mutation test is the part worth carrying forward.** The rewrite sits on identity preservation across
+an UPDATE, so a green suite was not enough. First attempt: mutate the stable-id read (`+1000`), run
+`verify_delta_catalog_materialize_rowtracking` — **the mutant SURVIVED.** The tempting reading is "this code
+is untested". It was the wrong suite. Instrumenting the branch with a hard throw settled it in one run:
+`materialize_rowtracking` and `compaction_rowtracking` never reach it; **`verify_delta_row_tracking_virtual`
+does** (line 70). Re-run there and the mutant dies at line 76, which asserts an updated row still carries
+its ORIGINAL `__delta_row_id`. ⇒ **a surviving mutant indicts the PAIRING of test and code, not the code**,
+and the suite whose NAME matches the feature was not the one that covers it.
+
+### #50 does not fire on us, checked structurally rather than by a green run
+
+The Bridge asks for metadata columns in exactly three places: two scan paths that rename the address to
+DuckDB's rowid and hand it to DuckDB, and the read-back, which strips. There is no route by which a
+metadata column reaches a write. (A green hermetic tier says the guard did not fire; the enumeration says
+it cannot.)
+
+### NOT taken, deliberately: `await using` on the buffered flush
+
+Our flush does `var txn = table.StartTransaction(...)` and the `finally` disposes only the TABLE, so
+deletion vectors written by a rebase attempt that then loses the conflict check are left behind. #49 makes
+collecting them safe — the ledger empties the instant the commit json is durable, closing the window #46
+opened where a landed-but-threw commit could delete live data. **But "rollback leaves invisible orphans for
+VACUUM" is documented behaviour, not a bug, and a bump is the wrong place for a behaviour change.**
+Follow-up. ⚠ Note the dependency: this idea was UNSAFE at #46 and is only safe at #49.
+
+### Gates
+
+EW Table.Tests **875/875 × {net10.0, net8.0, net472}**; fabricator hermetic **63/63 — 5640**; service
+**44/44 — 1424**. Both fabricator tiers at exactly their floors.
+
+**Harness gap found: the CLAUDE.md copy-paste block does not run the service tier.** It is missing
+`MSSQL_TESTDB_URI`, `MSSQL_TEST_PASS`, `MSSQL_BINCOLL_DSN` and `FABRICATOR_PLUGIN_DIR`; `run-suites.sh`
+names them and refuses to start, which is the good failure. The bad one is `FABRICATOR_PLUGIN_DIR`: it must
+be the **RID-qualified** `bin/Release/net10.0/win-x64`, and pointing it one level up at `net10.0` (which
+holds only the RID subdirectory) makes the suite fail with *"Scalar Function with name plug_greet does not
+exist"* — **indistinguishable from a plugin that loaded and failed to register.** The plugin SPI has no
+"found nothing to load" signal. Block corrected in CLAUDE.md.
+
 ## Appendix — the CLAUDE.md journal (moved verbatim 2026-07-29)
 
 > Moved VERBATIM out of `CLAUDE.md` on 2026-07-29 (conservative split — see the commit message).

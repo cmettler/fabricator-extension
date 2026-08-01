@@ -75,7 +75,7 @@ SMALL upstreamable patch set ON TOP of clast master — never a fork again — s
 merge-upstream-into-fabricator-patches + re-pin. **⚠ That upstream branch is now
 `upstream/main`, NOT `master`** — upstream renamed it (`8caf8d8`) and the stale `upstream/master`
 remote-tracking ref still resolves, so a merge of it silently lands on an abandoned branch.
-**Current pin: `9680315`** (the 2026-08-01 bump, §THE 2026-08-01 BUMP below). What the patches carry: the **`DeltaTable.PlanFiles`
+**Current pin: `3b95599`** (the 2026-08-02 bump, §THE 2026-08-02 BUMP below). What the patches carry: the **`DeltaTable.PlanFiles`
 planning API** (proposed to Curt 2026-07-25, endorsed, and BUILT by us 2026-07-26 — it REPLACED the
 earlier `DeltaFilePruner`-public patch, which is retired; full record in the `PlanFiles` subsection below);
 create-time `configuration`/`preAssignedSchema`/`materializedRowIds` params; rowid read-back
@@ -108,6 +108,33 @@ full counts (variant now 144), EW suites green, and the LIVE OneLake/Spark round
 parity both directions + Spark decoding codec-written variant. **Fork-era EW notes below this point
 are HISTORICAL** — they describe the retired fork lineage; the mechanisms survive but live in the
 fabricator-patches shapes above.
+
+### THE 2026-08-02 BUMP — DONE, pin `3b95599` (full record: [docs/ew-master-migration.md](docs/ew-master-migration.md) §THE 2026-08-02 BUMP)
+
+Eight upstream commits the day after the last bump — **#40, #41, #43, #46, #48, #49, #50, and #39 which is
+OURS, merged.** Five conflicted files, every one exactly where one of our three superseded patches sat;
+nothing else conflicted. Three of the eight ARE our offers taken and re-cut, so **the conflicts were the
+cost of being ABSORBED, not of having diverged** — the branch model paying out. Gates: EW Table.Tests
+**875/875 × {net10.0, net8.0, net472}**, hermetic **63/63 — 5640**, service **44/44 — 1424**.
+
+- **#43 supersedes our #37 and subsumes #38**: `expectedPrevious`/`requireAbsent` become the
+  `AppTransactionPrecondition` union. **⚠ `Expected is null` maps to `Absent`, NOT the union's `None`** —
+  both compile, and `None` writes unconditionally, so a replayed first batch of
+  `fabricator_delta_set_transaction_version` would commit TWICE and rewrite the recorded version with the
+  same value, leaving nothing in the table to say so. The default is the dangerous answer.
+- **#48 deleted `sourceRowTrackingOut`**; both row identities now arrive as COLUMNS via `DeltaRowMetadata`.
+  Ask for `RowTracking` ONLY when the table has it — the column form is REFUSED where the out-param quietly
+  returned nulls. Our gate is `TxnDmlProfile.MaterializeRowIds`; that alignment is now load-bearing.
+- **#50 refuses a write carrying an undeclared column.** It does not fire on us: the Bridge asks for
+  metadata columns in three places, two of which are scans feeding DuckDB and the third strips.
+- **#46 + #49 give `DeltaTransaction` `AbortAsync`/`IAsyncDisposable` and make the six auto-committing
+  paths collect their own orphans.** ⚠ **#49 also closed a data-destruction window #46 opened** (a commit
+  that landed but threw could have its live files deleted), so adopting `await using` on our buffered flush
+  is safe only from #49 onward — **deliberately NOT taken in this bump**, since "rollback leaves invisible
+  orphans for VACUUM" is documented behaviour and a bump is the wrong place to change behaviour.
+- **#41 cuts `_delta_log` walks per snapshot build from four to one** — which re-prices the
+  [delta-snapshot-caching](docs/delta-snapshot-caching.md) decision gate downward. Its "4 constructions per
+  statement" was 16 listings and is now 4; **any future measurement must be retaken against this pin.**
 
 ### THE 2026-08-01 BUMP — DONE, onto **`upstream/main`** (full record: [docs/ew-master-migration.md](docs/ew-master-migration.md) §THIRD ATTEMPT)
 
@@ -1624,6 +1651,17 @@ VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
   export FABRICATOR_S3_SQL_ENDPOINT=minio:9000          # + MSSQL_TESTDB_DSN gates verify_mssql_s3_polybase
   export FABRICATOR_DELTARS=1                           # gates the 7 verify_delta_rs_* suites; set ONLY when
                                                         # publish-managed.ps1 -IncludeDeltaRs has actually run
+  # ── the FULL service tier (scripts/run-suites.sh service) needs these FOUR MORE and refuses to start
+  #    without them. Added 2026-08-02: the block above ran individual suites but never the tier it looks
+  #    like it describes.
+  export MSSQL_BINCOLL_DSN='Server=localhost,1433;Database=BinCollTest;User Id=sa;Password=Arrow_Net_123!;TrustServerCertificate=true;Encrypt=true'
+  export MSSQL_TESTDB_URI='mssql://sa:Arrow_Net_123!@localhost:1433/TestDB?TrustServerCertificate=true&Encrypt=true'
+  export MSSQL_TEST_PASS='Arrow_Net_123!'
+  # ⚠ RID-QUALIFIED. Pointing this at .../net10.0 (which holds only the win-x64 subdir) makes
+  #   verify_plugin fail with "Scalar Function with name plug_greet does not exist" — INDISTINGUISHABLE
+  #   from a plugin that loaded and failed to register. The plugin SPI has no "found nothing to load"
+  #   signal. Build it first: dotnet build dotnet/Fabricator.SamplePlugin -c Release
+  export FABRICATOR_PLUGIN_DIR="$PWD/dotnet/Fabricator.SamplePlugin/bin/Release/net10.0/win-x64"
   # run one test at a time (the runner concatenates multiple filters into one bad glob):
   build/release/test/unittest.exe --test-dir . "test/verify_delta_catalog_native_write.test"
   # trace the write path: prepend FABRICATOR_LOG_LEVEL=Debug (logs off by default)
