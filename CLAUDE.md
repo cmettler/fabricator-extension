@@ -72,7 +72,10 @@ The engineered-wood submodule pin moved from our long-lived fork lineage (`99e2c
 `fabricator-patches` branch** (7 commits, pushed to the cmettler fork, pin `7fecc2b`;
 `.gitmodules` `branch = fabricator-patches`). The strategy: fabricator-specific needs live as a
 SMALL upstreamable patch set ON TOP of clast master — never a fork again — so future EW bumps are
-merge-master-into-fabricator-patches + re-pin. What the patches carry: the **`DeltaTable.PlanFiles`
+merge-upstream-into-fabricator-patches + re-pin. **⚠ That upstream branch is now
+`upstream/main`, NOT `master`** — upstream renamed it (`8caf8d8`) and the stale `upstream/master`
+remote-tracking ref still resolves, so a merge of it silently lands on an abandoned branch.
+**Current pin: `9680315`** (the 2026-08-01 bump, §THE 2026-08-01 BUMP below). What the patches carry: the **`DeltaTable.PlanFiles`
 planning API** (proposed to Curt 2026-07-25, endorsed, and BUILT by us 2026-07-26 — it REPLACED the
 earlier `DeltaFilePruner`-public patch, which is retired; full record in the `PlanFiles` subsection below);
 create-time `configuration`/`preAssignedSchema`/`materializedRowIds` params; rowid read-back
@@ -106,27 +109,89 @@ parity both directions + Spark decoding codec-written variant. **Fork-era EW not
 are HISTORICAL** — they describe the retired fork lineage; the mechanisms survive but live in the
 fabricator-patches shapes above.
 
-**⚠ A BUMP IS PENDING AND MEASURED, NOT STARTED (2026-07-31).** Upstream landed **all five #15 slices in
-one day** (#18–#22) plus the shredding rework (#16/#17) — and **our PR #6 is MERGED upstream**. Our pin is
-**8 commits behind**; a trial `merge-tree` gives **4 conflicts**, upstream rewrote **+1325** lines of
-`DeltaTable.cs` against our +1165 in the same file, and **15 public `DeltaTable` methods were removed of
-which our Bridge calls 12, across 24 call sites** (the read/DML overload families collapse into
-`ReadAsync(DeltaReadOptions)` / `DeleteRowsAsync(RowSelection…)` / `UpdateRowsAsync(RowSelection…)`;
-`DeltaTransaction`'s `Stage*` splits into `Stage*`/`Require*`/`Declare*` by RETRY CONTRACT, so those calls
-need re-classifying, not renaming). **`PlanFiles` survived** (doc-only change to `PlannedFile`), and Curt
-kept `ReadAllAsync`/`ReadAtVersionAsync` as wrappers, so those call sites are safe. He DEFERRED open
-question 4 (the transaction-level exemption opt-in) himself, and will return to our porting offer "once
-there is a branch worth porting against". Two traps: `git cherry` finds **0** redundant patches even though
-the shredding one IS upstream (#16 reworked it, so patch-ids differ) — judge by reading, and DROP that
-patch rather than merging it, which removes the modify/delete conflict; and this wants its own branch.
-Full measurement + suggested order: **[docs/ew-master-migration.md](docs/ew-master-migration.md) §PENDING
-BUMP.**
+### THE 2026-08-01 BUMP — DONE, onto **`upstream/main`** (full record: [docs/ew-master-migration.md](docs/ew-master-migration.md) §THIRD ATTEMPT)
+
+The pin moved from `7fecc2b` onto upstream's #15 slices (#18–#22) **plus the four commits that landed the
+same day** (#24, #25, #32, #33, #35). The mechanical part went as measured — the read/DML overload families
+collapsed into `ReadAsync(DeltaReadOptions)` / `DeleteRowsAsync(RowSelection, RowDeleteMode)` /
+`UpdateRowsAsync(RowSelection, …)`, and `DeltaTransaction`'s `Stage*` split into `Stage*`/`Require*`/
+`Declare*` **by RETRY CONTRACT**, so each call had to be re-classified rather than renamed
+(`StageReadPredicate`→`DeclareRead`, `StageWholeTableRead`→`DeclareWholeTableRead`,
+`StageAppTransaction`→`RequireAppTransaction`, `SetOperation`→the `Operation` property). Gates:
+EW Table.Tests **828/828 on net8.0 AND net472**, DeltaLake.Tests 248, hermetic **63/63 / 5639**.
+
+**Five things this cost real time, none of them in the measurement:**
+
+1. **`upstream/master` IS STALE — the live branch is `upstream/main`** (`8caf8d8` renamed it). A merge of
+   `master` lands on a branch upstream has moved off, and `upstream/HEAD -> upstream/master` still resolves
+   locally, which is what makes it quiet. **`git fetch upstream` and read `upstream/main`.**
+2. **The merge SILENTLY DROPPED one of our patches** — `UpdateBySelectionViaVectorsAsync`, the merge-on-read
+   UPDATE (upstream has NO DV mode for UPDATE; it always rewrites). Found by tripping over it, and the
+   reflex fix would have converted five MoR tests into copy-on-write tests. **Run the surface audit FIRST:**
+   diff the public surface of the pre-merge `DeltaTable` against the merged one, then classify each absent
+   method by whether it was in the MERGE BASE — that separates upstream's consolidation from our losses
+   (14 absent → 10 upstream's, 3 ours-with-a-successor, 1 lost). Command in the doc.
+3. **Building the Bridge is what finds the host's needs; reading the diff is not.** Two consolidations
+   dropped things only a caller notices → additive patches: a **`DeltaRowMetadata` parameter on
+   `ReadRowsAsync`** and `AppTransactionPreconditionException`.
+   - **⚠ And the first one was the WRONG SHAPE at first, which one question exposed.** I added a bespoke
+     `rowAddressesOut` out-param; `DeltaRowMetadata.RowAddress` had been a first-class metadata kind all
+     along, emitting exactly that packed address as a COLUMN on `ReadAsync`/`ReadChangesAsync`. The
+     address was never missing from the library — it was missing from ONE read, which already stood out by
+     carrying a bespoke `sourceRowTrackingOut` duplicating `DeltaRowMetadata.RowTracking`. **Standing rule:
+     before adding a parameter, read the enum/options type the neighbouring methods already accept.** The
+     out-param compiled, passed, and was defensible in isolation; it was wrong only relative to a
+     convention one file away.
+4. **A COMPILING Bridge is not a migrated one.** Upstream documents `RequireAppTransaction`'s
+   `expectedPrevious: null` as "do not check" where our `fabricator_delta_set_transaction_version` means
+   "must not exist yet" — a replayed first batch would have gone from a failed CAS to an unconditional
+   write, **duplicating data** on a user-facing exactly-once mechanism (fixed by an additive
+   `requireAbsent`). And our loud unresolvable-ordinal error is right for every DML path and WRONG for the
+   CDF read-back. Both survived the compiler; the suites caught them.
+5. **`ExemptRowLevelFromWholeTableRead` was wired LAST and nothing failed until it was.**
+   `verify_delta_row_level_concurrency` §11 was written before the migration for exactly that reason
+   (82 → 93). **`DeclareFilesRead` (#25) does NOT retire it** — declaring the files a scan touched drops the
+   APPEND rule, which is the phantom-row protection `serializable` (our default) exists for.
+
+**⚠ OUR `_last_checkpoint` OFFER WAS MERGED (#32) AND THEN CORRECTED TWICE — ours is retired, upstream's is
+in.** #33 found the `Exists` probe ran BEFORE the try (so the fix did not fix the case it was written for)
+and that guarding root kind + field PRESENCE misses field TYPE and the nested `v2Checkpoint`; one try/catch
+around the whole read-and-decode replaces all six guards. #35 is the important one: **the argument both
+fixes rested on — "a reader can always recover by listing the log" — was never implemented.** Nothing
+listed the log; `SnapshotBuilder` read a null hint as `replayFrom = 0`. Once Delta's metadata cleanup
+removes the subsumed commits, replay rebuilds nothing and the table is **UNREADABLE** (measured: *"Table
+has no metadata action"*), which is squarely the OneLake shape we were fixing for. **Standing lesson: a fix
+whose justification names a fallback must verify the fallback exists.**
+
+Also: **#24 independently CONFIRMS our live isolation measurement** — delta-spark 4.0.0 rejects
+`delta.isolationLevel='WriteSerializable'`; it is a Databricks extension and OSS Delta has one level, which
+is what we found against Fabric Spark 4.1.1 by another route. It further found EW and Delta agree on the
+OUTCOME and disagree on the LABEL (Delta reports `ConcurrentAppend` where EW reports
+`ConcurrentDeleteRead`).
+
+**⚠ #36 came in on the same bump and carries TWO USER-VISIBLE behaviour changes** (*"a replay that skipped
+a version said nothing about it"* — the follow-on to #35). `SnapshotBuilder` used to apply whatever commits
+it happened to find, skipping a missing or unreadable version **in silence** (once via a literal
+`catch { /* Skip missing commits */ }`) while still labelling the result with the target version. Both
+replay paths now demand contiguous coverage and name the first hole.
+- **`AT (VERSION => n)` PAST THE END OF THE LOG now ERRORS** (*"Delta log is incomplete: version 3 is
+  missing or unreadable and no checkpoint covers it"*) where it used to return the **newest** snapshot under
+  the requested label — so a stale pin or an off-by-one silently got real rows for a version that does not
+  exist. **Measured, then pinned** (`verify_delta_catalog_time_travel` 48 → 49); nothing asserted either
+  answer before, so it could have flipped back unnoticed in either direction.
+- **A transient READ FAILURE of a commit is now a HOLE, not a skip** — worth watching on OneLake
+  specifically, because our measured multi-writer shape is exactly a world where another writer's commit
+  file is briefly unreadable (that is how the `_last_checkpoint` 412 was found). Correct, plausibly noisier.
+  Not yet exercised against live OneLake.
+- `ListCheckpointVersionsAsync` is deleted upstream, and his message says *"Confirmed absent from
+  fabricator before removing"* — checked, and true (only compiled EW DLLs match; no source call site).
+  **Upstream is checking our tree before removing API.**
 
 **The bump-by-bump journal** (every EW pin move, `PlanFiles`, the path-keyed DV DML, the `_metadata`
 surface, the variant-transport decision + shredding split, the `DeltaTransaction` flush migration, and
 the `TransientRowAddress` analysis) **moved verbatim to
 [docs/ew-master-migration.md](docs/ew-master-migration.md) §Appendix — read it BEFORE the next EW bump
-or upstream offer.** Standing rules distilled there and still binding: merge upstream/master into
+or upstream offer.** Standing rules distilled there and still binding: merge `upstream/main` (NOT `master` — renamed) into
 fabricator-patches (fast-forward pins, NEVER force-push — release tags pin EW shas); after taking a
 method wholesale from upstream, diff it against upstream and demand byte-identity (the auto-merged
 duplicate-statement trap); only the net472 leg proves a change offerable; check `git log -S` before
@@ -515,13 +580,16 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     checked under BOTH levels. Confirmed three ways: the source; our commitInfo on disk (operation/engineInfo/
     operationParameters only); and Spark's `DESCRIBE HISTORY` showing `isBlindAppend` True for ITS blind append
     and blank for ours.
-  - **UPSTREAM OFFER — SENT (2026-08-01), branch `offer/last-checkpoint` on the fork**, one commit on
-    `upstream/master`; opening the PR is a manual click (`gh` is not installed here). The `_last_checkpoint`
-    tolerance fix is engine-agnostic and spec-conformant — a bug for every EW user (the host-side one-request
-    read stays ours). Upstream is 8 ahead = exactly the known pending bump (#6, #16–#22); **none of those touch
-    isolation or blind-append**, so neither item waits for it. And to settle the worry directly: **EW has NOT
-    lost WriteSerializable support** — `StartTransaction` still defaults to it and `ConflictChecker` still
-    implements the relaxation; what is missing is interop plumbing, not semantics.
+  - **UPSTREAM OFFER — MERGED as #32 (`12b0d39`), then CORRECTED TWICE by upstream; OURS IS RETIRED.**
+    #33 found the `Exists` probe ran BEFORE the `try` (so it did not fix the case it was written for) and
+    that guarding root kind + field PRESENCE misses field TYPE and the nested `v2Checkpoint`; one try/catch
+    around the whole read-and-decode replaces all six guards. #35 then found **the argument both fixes
+    rested on was never implemented** — nothing listed the log, so after Delta's metadata cleanup a
+    hint-less read makes the table UNREADABLE, not merely slow. Full account:
+    [docs/ew-master-migration.md](docs/ew-master-migration.md) §1. The host-side one-request read stays
+    ours. And to settle the worry directly: **EW has NOT lost WriteSerializable support** —
+    `StartTransaction` still defaults to it and `ConflictChecker` still implements the relaxation; what is
+    missing is interop plumbing, not semantics.
     - **Writing the offer PROPERLY found a second bug**, because it needed an EW-level suite (upstream cannot
       run our sqllogictest): valid JSON that is not an OBJECT still threw, since `TryGetProperty` raises
       `InvalidOperationException` rather than returning false on a non-object root. Ported back; our suite is
@@ -1240,7 +1308,8 @@ VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
   INSIDE the submodule working tree on `fabricator-patches`; the build uses the working tree, so
   day-to-day edits/commits there don't touch the parent's pin. Keep every EW change as an ADDITIVE,
   upstreamable commit on `fabricator-patches` (never fork-style divergence); to take a new upstream
-  EW, merge `upstream/master` into `fabricator-patches`, re-run the delta sweep, push, re-pin. To
+  EW, merge `upstream/main` into `fabricator-patches` (`master` is the STALE pre-rename name, and its
+  remote-tracking ref still resolves), re-run the delta sweep, push, re-pin. To
   RECORD a known-good EW version in fabricator: push EW to the fork FIRST (the pin must be
   fetchable — pushes still only on the user's explicit authorization), THEN bump the pointer
   (`git add engineered-wood && git commit`). (The old `D:\repos\engineered-wood` sibling is

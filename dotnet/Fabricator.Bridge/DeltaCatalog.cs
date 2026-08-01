@@ -3417,7 +3417,28 @@ public sealed class DeltaCatalog : IBackendCatalog
             // with an inline DV, so they never reach a committed version.
             if (files.Count > 0)
             {
-                await txn.StageDataFilesAsync(files, pendingFileDeletes,
+                // EW keys bornDeleted BY PATH now, so translate our pending-file INDEX here — where `files`
+                // exists — rather than keeping an index-keyed surface alive. An index that names no file in
+                // this call is a loud error: it would otherwise silently un-delete rows the statement
+                // deleted, which reads as data appearing from nowhere.
+                RowSelection? bornDeleted = null;
+                if (pendingFileDeletes is not null)
+                {
+                    var byPath = new Dictionary<string, IReadOnlyCollection<long>>(
+                        pendingFileDeletes.Count, StringComparer.Ordinal);
+                    foreach (var kv in pendingFileDeletes)
+                    {
+                        if (kv.Key < 0 || kv.Key >= files.Count)
+                        {
+                            throw new System.InvalidOperationException(
+                                $"delta flush: pending-file index {kv.Key} names no file of this commit "
+                                + $"({files.Count} written) — the born-deleted rows cannot be placed.");
+                        }
+                        byPath[files[kv.Key].RelativePath] = kv.Value;
+                    }
+                    bornDeleted = RowSelection.ByPath(byPath);
+                }
+                await txn.StageDataFilesAsync(files, bornDeleted,
                         identityValuesPreGenerated: pending.PendingIdentityHwm.Count > 0,
                         cancellationToken: token)
                     .ConfigureAwait(false);
@@ -3429,7 +3450,7 @@ public sealed class DeltaCatalog : IBackendCatalog
             long rowsDeleted = pendingRowsDeleted;
             if (deletes.Count > 0)
             {
-                rowsDeleted += await txn.StageRowDeletesAsync(new FileRowSelection(deletes), token)
+                rowsDeleted += await txn.StageRowDeletesAsync(RowSelection.ByPath(deletes), token)
                     .ConfigureAwait(false);
             }
             // The buffered schema change (metaData + merged protocol upgrade) joins the SAME commit.
@@ -3465,7 +3486,8 @@ public sealed class DeltaCatalog : IBackendCatalog
             // without the guard inside the loop the batch would commit a SECOND time.
             foreach (var kv in pending.AppTxnVersions)
             {
-                txn.StageAppTransaction(kv.Key, kv.Value.Version, kv.Value.Expected);
+                txn.RequireAppTransaction(kv.Key, kv.Value.Version, kv.Value.Expected,
+                    requireAbsent: kv.Value.Expected is null);
             }
             int kinds = (pending.HasAppend ? 1 : 0) + (pending.HasDelete ? 1 : 0) + (pending.HasUpdate ? 1 : 0)
                         + (pending.HasAlter ? 1 : 0);
@@ -3475,19 +3497,29 @@ public sealed class DeltaCatalog : IBackendCatalog
                 : pending.HasAlter
                     ? (pending.AlterOps.Count == 1 ? pending.AlterOps.First() : "ALTER TABLE")
                     : "WRITE";
-            txn.SetOperation(operation);
+            txn.Operation = operation;
 
             // Read set: the predicates our in-transaction scans pushed (or a whole-table flag when nothing
             // pushed). The commit loop uses them for the concurrentAppend check — under serializable always,
             // under write_serializable only from non-blind-append commits.
             foreach (var pred in pending.ReadPredicates)
             {
-                txn.StageReadPredicate(pred);
+                txn.DeclareRead(pred);
             }
             if (pending.ReadWholeTable)
             {
-                txn.StageWholeTableRead();
+                txn.DeclareWholeTableRead();
             }
+
+            // ROW-LEVEL DML is exempted from the whole-table read declaration — the opt-in that preserves
+            // what we shipped before the bump. A statement whose predicate did not push declares the whole
+            // table, and under write_serializable that declaration would meet a concurrent blind append and
+            // abort a DELETE/UPDATE that touches disjoint ROWS — the very composition the row-level path
+            // exists to allow. It is deliberately not the library default: only a host that resolved its own
+            // rows knows the declaration was a scan artefact rather than a real dependency. Under
+            // serializable the exemption does not apply at all (EW gates it on the level), which is why the
+            // isolation default flip does not silently widen it.
+            txn.ExemptRowLevelFromWholeTableRead = true;
 
             // ONE call replaces what used to be a hand-rolled OCC loop here: conflict-check the read set
             // against every commit landed since the pin, rebase the deletion-vector pairs onto the latest
@@ -3501,6 +3533,16 @@ public sealed class DeltaCatalog : IBackendCatalog
                 _log.LogInformation(
                     "delta txn {Txn} commit {Path}: v{Version} op={Op} (files={Files}, rows+={Rows}, rows-={Deleted})",
                     txnId, tablePath, v, operation, files.Count, pending.Rows, rowsDeleted);
+            }
+            catch (EngineeredWood.DeltaLake.Table.AppTransactionPreconditionException ex)
+            {
+                // The idempotent-producer CAS refused: this batch is already in the table. Reported in OUR
+                // documented vocabulary (fabricator_delta_set_transaction_version's contract) with EW's
+                // explanation kept, because the two say different useful things — ours names the mechanism
+                // the user invoked, EW's says why retrying is the wrong response. Identified by TYPE, not by
+                // message text: a string match here would relabel unrelated commit failures.
+                throw new System.InvalidOperationException(
+                    $"transaction version conflict on '{tablePath}' for app '{ex.AppId}': {ex.Message}");
             }
             catch (EngineeredWood.DeltaLake.DeltaConflictException ex)
             {

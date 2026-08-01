@@ -102,6 +102,15 @@ SELECT count(*) FROM lake.main.t AT (TIMESTAMP => '1999-01-01 00:00:00');
 ----
 No commit found
 
+# A VERSION PAST THE END OF THE LOG is an error, not the latest snapshot wearing the requested label.
+# Pinned because the old behaviour was to return the newest version SILENTLY — a caller asking for v99 of a
+# 3-version table got 3 rows and no indication it had not been given what it asked for, which is the shape a
+# stale pin or an off-by-one produces. Now the message names the first version it could not cover.
+statement error
+SELECT count(*) FROM lake.main.t AT (VERSION => 99);
+----
+Delta log is incomplete
+
 # Time travel survives detach/re-attach (reads the log, not in-memory state).
 statement ok
 DETACH lake;

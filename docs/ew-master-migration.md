@@ -503,8 +503,258 @@ sites tractable.
 2. **Do not entangle this with unrelated work.** The Fabric-API commits sitting unpushed when this was
    measured have nothing to do with EW; a bump this size wants its own branch and its own sweep.
 
+### FIRST ATTEMPT — started 2026-08-01, merge ABORTED deliberately; five findings that change the plan
+
+Branches exist and are the designated place to resume: **`bump/upstream-2026-08`** (EW, off
+`fabricator-patches` at `cbe5bb6`) and **`bump/ew-upstream-2026-08`** (parent, off `v1.5-variegata`).
+Both are EMPTY of commits — the merge was aborted once its true size was measured, because a
+half-resolved merge sitting in a submodule across a session boundary is the state most likely to be
+lost or half-repeated. Re-running `git merge upstream/master` reproduces the identical 4 conflicts;
+what was expensive was the DECISIONS below, not the mechanics.
+
+**1. The measurement UNDERCOUNTED: there is a second migration, roughly as large as the 24 call sites.**
+Upstream's `RowSelection` (slice 2, #18) is the successor to our `FileRowSelection`, and
+`FileRowSelection` is **GONE upstream** (`git grep` on `upstream/master` returns nothing). Ours is used
+at **38 sites in EW `src/`, 5 in EW tests, and 5 in the Bridge** — none of which the original table
+lists, because that table only counted removed `DeltaTable` METHODS. Budget for ~48 more edit sites.
+Upstream's type is a strict superset in capability (`ByPath` / `FromLocatorColumns` /
+`FromRowAddresses` / `Paths` / `PositionsFor`), so this is a rename-and-widen, not a redesign.
+
+**2. Upstream EXPLICITLY DECLINED our row-level read exemption, and said what it would take.** This is
+the one place where taking upstream wholesale silently REVERTS shipped behaviour of ours, so it is the
+hunk to be most careful with. `DeclareWholeTableRead`'s own remark upstream reads: *"It is NOT
+implemented here: today the declaration is honoured at both levels … if it is ever adopted it should be
+an explicit per-transaction opt-in rather than an inference — a library must not claim on a host's
+behalf that it read less than it declared."* Our branch DOES implement it, as an inference, in the
+commit loop (`effectiveReads = rowLevel && isolation != Serializable ? reads with { WholeTable = false }
+: reads`).
+
+**⚠ CORRECTION (measured 2026-08-01): the claim that `verify_delta_row_level_concurrency` depended on it
+was FALSE, and the suite has now been given the section that makes it true.** Mutation testing showed
+every one of §1–§10 passing with the exemption REMOVED *and* with it INVERTED (`WholeTable = true`
+forced) — with an env-gated tripwire throw proving the line is REACHED, so this was a real null result
+and not a skipped code path. Two structural reasons, both properties of the suite rather than of the
+feature: every scenario used a PUSHABLE predicate (`WHERE id = 2`), so the scan declares a PREDICATE and
+never sets `ReadWholeTable`, and the exemption only ever drops `WholeTable`; and the fixture is ONE
+file, so a racer can only touch a file the transaction also touched — which row-level resolution has
+already put in `resolvedPaths`, and the checker skips those BEFORE consulting reads at all. **That skip,
+not this exemption, is what makes §1–§9 compose** — a distinction worth keeping straight, because it is
+the one that makes concurrent disjoint-row DML work.
+
+**The exemption IS load-bearing, for a narrower case than advertised.** New §11 supplies what was
+missing — a table with THREE files, a NON-pushable predicate (`id % 100 = 2` ⇒ `StageWholeTableRead`),
+and a racer landing a `dataChange=true` remove on a DIFFERENT file (⇒ not in `resolvedPaths`). With the
+exemption the buffered COMMIT lands; with `effectiveReads = reads` it fails with a conflict, and the
+mutant fails at exactly that COMMIT and nowhere else. Suite 82 → 93.
+
+So the decision above stands, but now on evidence rather than on an assumed gate — and the offer is much
+stronger for it, since upstream's stated objection is partly that this is an inference *"a host cannot
+observe from the outside"*. §11 is precisely an outside observation of it.
+
+**DECISION, revised — adopt the OPT-IN DURING the merge rather than preserving the inference.** The
+first call here was "keep our behaviour, redesign later", on entanglement grounds. That was too
+cautious once the size was checked: `rowLevel` is only `rowLevelDeletes is { Count: > 0 }`, so the
+opt-in is a field + a public property on `DeltaTransaction`, ONE condition in the commit loop
+(the inference becomes the PRECONDITION rather than the trigger:
+`_exemptRowLevel && rowLevel && isolation != Serializable`), and the Bridge setting it at the one flush
+site that gets the behaviour implicitly today.
+
+Three reasons it beats preserving the inference:
+
+- **It touches the most contested file ONCE.** `DeltaTable.cs` is where upstream wrote +1325 lines
+  against our +1165; resolving the hunk and then re-opening it for a redesign pays that cost twice.
+- **It converts a behavioural MODIFICATION into an ADDITIVE patch.** That is the difference that
+  matters for every future bump — and it removes this exact hazard, because a modification of
+  upstream's own lines is what makes "take upstream wholesale" compile, pass most suites, and silently
+  revert us. That nearly happened on the first attempt.
+- **It is what upstream ASKED FOR**, so it is offerable, and an absorbed patch is one we stop carrying.
+
+**The OFFER still has to wait for the bump to land**, per generate-never-maintain: an offer is cut off
+`upstream/master`, and writing it against the pre-bump API means writing against methods upstream has
+already replaced — the same mistake flagged for the isBlindAppend write half. Order: bump → opt-in
+during resolution → offer cut from the result.
+
+**Fallback, kept deliberately:** if upstream's restructured commit loop does not leave `effectiveReads`
+in a shape where the gate drops in cleanly, preserve the inference exactly as today and correct
+upstream's `DeclareWholeTableRead` remark on our branch so it describes what we actually do. Decide by
+reading the merged loop, not in advance.
+
+**3. Hunk-wise resolution is REQUIRED, not a matter of taste.** A plain `git checkout --theirs` on
+`DeltaTransaction.cs` looks equivalent and is not: it discards our changes that auto-merged OUTSIDE the
+conflict regions. Verified by resolving hunk-wise, then diffing against the `--theirs` content — they
+differ, and the difference was real code of ours. Resolve with:
+`awk '/^<<<<<<< HEAD/{s=1;next} /^=======$/{if(s==1){s=2;next}} /^>>>>>>> upstream\/master/{s=0;next} s!=1{print}'`
+
+**4. Dropping the shredding patch is CONFIRMED safe, by measurement rather than by the commit subject.**
+Upstream did not delete the file, it MOVED it (`Parquet/Data/VariantShredding.cs` →
+`Parquet/VariantShredding.cs`, namespace `EngineeredWood.Parquet.Data` → `EngineeredWood.Parquet`) and
+its surface is a superset of ours (adds `InferSchema`/`Shred`). For the add/add test conflict, upstream
+has **11** tests to our **7** and **every one of our test names is present upstream** (`comm -23` on the
+method names returns empty) — so `--theirs` loses no coverage. Our `VariantTransport.cs` calls
+`VariantShredding.TryShred`/`.Reassemble` and will need the namespace updated.
+
+**5. `StageActions`' extra `operation` parameter is ours and UNUSED** — the Bridge's single call site
+(`DeltaCatalog.cs:3459`) passes one argument — so upstream's narrower `StageActions(actions)` can be
+taken without a shim.
+
+Everything else matched the measurement exactly: 8 commits, 4 conflicts, 30 hunks in `DeltaTable.cs`,
+6 in `DeltaTransaction.cs`, and the hunks are the predicted overload consolidation
+(`Delete*`/`Update*`/`Read*` families → `DeleteRowsAsync`/`UpdateRowsAsync`/`ReadCoreAsync`).
+
+### SECOND ATTEMPT (2026-08-01) — merged, EW SRC BUILDS; the exact remaining mapping
+
+Branch `bump/upstream-2026-08`: `50839f0` (merge + conflicts resolved) → `f496526` (src builds on
+net10.0/net8.0/net472) → `9d616c9` (`ReadAllWithMetadataAsync` retired). **`fabricator-patches` is
+untouched and nothing is pushed.** What is left is the EW TEST project, then the Bridge.
+
+**FIVE auto-merge grafts were found in total, and every one differed from upstream by ONE LINE** — git
+welded our method's body into upstream's method of the same name, so they read as correct and compile
+or nearly compile. `StageRowDeletesAsync`, `BuildStagedAppendActionsAsync`, `DeleteRowsViaVectorsAsync`,
+`ComputeDvActionsWithEditsAsync`, `ComputeDeletionVectorActionsAsync`. Each was replaced with upstream's
+version WHOLESALE and diffed to byte-identity. **Never hand-merge these.** Also removed a duplicated
+block in `CommitTransactionAsync` that would have emitted every `txn` action TWICE.
+
+**The exemption is back as `DeltaTransaction.ExemptRowLevelFromWholeTableRead`** (default `false`),
+consumed by `CommitOccAsync` via a defaulted parameter. ⚠ **THE BRIDGE DOES NOT SET IT YET**, so as of
+`9d616c9` our shipped behaviour is DISABLED and `verify_delta_row_level_concurrency` §11 would fail.
+The wiring is one line in `DeltaCatalog`'s flush, beside the existing `DeclareRead` /
+`DeclareWholeTableRead` calls (~3483): `txn.ExemptRowLevelFromWholeTableRead = true;`. It was left until
+after the Bridge's 24 call sites because the Bridge cannot compile against the new EW API before then,
+and a flag wired into a non-building file is unverifiable.
+
+**`FileRowSelection` is deleted** in favour of upstream's `RowSelection`. The recorded "38 src sites"
+was wrong — it counted doc-comment mentions; there were NINE real occurrences. `RowSelection.ByPath`
+takes exactly the dictionary our record wrapped; `Paths` / `PositionsFor` / `TotalPositions` cover every
+use of `RowsByFile`.
+
+**The remaining test migration is NOT a sed**, and the compiler proves it: our `Update*` returned
+`(RowsUpdated, Version)` TUPLES while upstream's `UpdateRowsAsync` returns a plain `long` version, so
+every `var (rows, _) = await …` site needs `rows` obtained another way (`selection.TotalPositions` where
+the updater touches every selected row — check each, two sites in `MetadataColumnTests` at ~496 and
+~590). The mapping, all in `test/EngineeredWood.DeltaLake.Table.Tests`:
+
+| ours (gone) | upstream successor | note |
+|---|---|---|
+| `UpdateBySelectionAsync(sel, updater)` | `UpdateRowsAsync(sel, updater)` | returns `long`, not a tuple |
+| `UpdateBySelectionAsync(batch)` | `UpdateRowsAsync(batch)` | locator-carrying batch form |
+| `UpdateBySelectionViaVectorsAsync(…)` | `UpdateRowsAsync(…)` | upstream COLLAPSED MoR + CoW update into one entry point |
+| `DeleteBySelectionAsync(sel)` | `DeleteRowsAsync(sel, RowDeleteMode.CopyOnWrite)` | tuple return survives |
+| `DeleteByRowIdsViaVectorsAsync(ids)` | `DeleteRowsAsync(RowSelection.FromOrdinals(…, StaleAddressPolicy.Skip, …), RowDeleteMode.DeletionVector)` | needs the snapshot to resolve ordinals |
+| `DeleteByRowIdsAsync(ids)` | same, `RowDeleteMode.CopyOnWrite` | |
+| `ReadAllWithRowIdsAsync()` | `ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowAddress })` | |
+| `ReadAllWithRowTrackingAsync()` | `… DeltaRowMetadata.RowTracking` | |
+| `ReadAllWithMetadataAsync()` | `… DeltaRowMetadata.Locator` | DONE in `9d616c9` |
+
+One assertion also needs re-pointing: `MetadataColumnTests` ~637 asserts an error message names
+`UpdateBySelectionAsync` as the alternative; upstream's message names the read option instead.
+
+### THIRD ATTEMPT — DONE (2026-08-01). What the plan below did NOT predict
+
+The bump is complete: EW `df4f918`, parent `597e97a` + the pin move. Everything in the order below
+happened roughly as written. Four things did not appear in it at all, and they are the reusable part.
+
+**1. `upstream/master` IS STALE — the branch is `upstream/main` now.** Upstream renamed it (`8caf8d8`,
+"ci: follow the branch rename from master to main"), so a merge of `upstream/master` lands on a branch
+upstream has moved off. The first merge here did exactly that and had to be extended by 12 commits
+(4 code) afterwards. **`git fetch upstream` then read `upstream/main`, and do not trust a `master`
+remote-tracking ref that still resolves.** `upstream/HEAD -> upstream/master` still points at the old
+name locally, which is what makes this quiet.
+
+**2. THE MERGE SILENTLY DROPPED ONE OF OUR PATCHES, and no test said so.** Conflict resolution took an
+upstream region wholesale that contained `UpdateBySelectionViaVectorsAsync` — our MERGE-ON-READ UPDATE.
+Upstream has no equivalent: `DELETE` has `RowDeleteMode.DeletionVector`, `UPDATE` always rewrites
+(`UpdateRowsCoreAsync` → `RewriteRowsToNewFileAsync`). It was found by TRIPPING over it — the MoR tests
+would not compile — and the reflex fix (point them at `UpdateRowsAsync`) would have converted five
+merge-on-read tests into copy-on-write tests. **The audit that should have run first:** diff the PUBLIC
+surface of the pre-merge `DeltaTable` against the merged one, then classify each absent method by
+whether it existed in the MERGE BASE. That separates upstream's consolidation from our losses in one
+pass — 14 absent, 10 upstream's, 3 ours-with-a-successor, 1 genuinely lost.
+
+```bash
+sig() { grep -oE '^ +public (async )?[A-Za-z0-9_<>,?\.\(\) ]+ [A-Za-z0-9_]+\(' \
+        | sed 's/.* \([A-Za-z0-9_]*\)($/\1/' | sort -u; }
+T=src/EngineeredWood.DeltaLake.Table/DeltaTable.cs
+git show <pre-merge-sha>:$T | sig > /tmp/ours.txt
+sig < $T > /tmp/now.txt
+comm -23 /tmp/ours.txt /tmp/now.txt          # then check each against the MERGE BASE
+```
+
+**3. BUILDING THE BRIDGE is what finds the host's needs — reading the diff is not.** Two upstream
+consolidations dropped things only a caller notices: `ReadRowsAsync` could no longer surface the
+transient address (the host's row identifiers ARE that address, and the method exposes no absolute
+position, so it cannot be reconstructed from outside), and the app-transaction precondition throws a
+bare `InvalidOperationException` that cannot be told from any other commit-time failure. Both are back
+as additive patches.
+
+> **⚠ THE FIRST FIX WAS THE WRONG SHAPE, and finding out took one question.** I added a bespoke
+> `rowAddressesOut` out-param, and assessed the resulting offer as the weakest of the three because
+> upstream's doc points callers at `DeltaRowMetadata.Locator` instead. Asked whether the locator might
+> already carry what we needed, I actually READ the enum — and **`DeltaRowMetadata.RowAddress` has been
+> a first-class metadata kind the whole time**, emitting exactly the packed address as a column. The
+> address was never missing from the library; it was missing from ONE read:
+>
+> | read | metadata support |
+> |---|---|
+> | `ReadAsync` | `DeltaReadOptions.Metadata` — all three kinds, as columns |
+> | `ReadChangesAsync` | `DeltaChangeReadOptions.Metadata` — same |
+> | `ReadRowsAsync` | **none** — instead `sourceRowTrackingOut`, a bespoke out-param DUPLICATING `DeltaRowMetadata.RowTracking` |
+>
+> So `ReadRowsAsync` was already the odd one out, and a second out-param beside the first made it
+> worse. Rewritten as the `DeltaRowMetadata` parameter the other two reads take (`f9d1827`), mirroring
+> `ReadCoreAsync`'s own helpers rather than a parallel path. That turned the weakest offer into the
+> strongest — a consistency fix upstream can motivate without reference to us, justified by the enum's
+> own words ("asking for two kinds costs ONE pass").
+>
+> **The lesson is narrow and repeatable: before adding a parameter, read the enum/options type the
+> neighbouring methods already accept.** The bespoke out-param compiled, passed, and was defensible in
+> isolation; it was only wrong relative to a convention sitting one file away.
+>
+> The Bridge adapts the column back to the out-param its own callers want, at the `ReadRowsByRowIds`
+> seam — its buffered-UPDATE consumer indexes columns positionally against the pending schema, so a
+> trailing metadata column would shift every index. Stripped BY NAME, never by position.
+
+**4. A COMPILING BRIDGE IS NOT A MIGRATED ONE.** Two behaviour changes survived the compiler and were
+caught only by the suites: upstream's `RequireAppTransaction` documents `expectedPrevious: null` as
+"do not check", where OUR `fabricator_delta_set_transaction_version` means "must not exist yet" — a
+replayed first batch would have gone from a failed CAS to an unconditional write, DUPLICATING DATA on a
+user-facing exactly-once mechanism (fixed with an additive `requireAbsent`); and `SelectionFromRowIds`
+is loud about an unresolvable ordinal, which is right for every DML path and wrong for the CDF
+read-back, whose caller legitimately passes rows of this transaction's own pending files.
+
+**And the reason the opt-in had a gate at all:** `ExemptRowLevelFromWholeTableRead` was wired LAST, and
+until it was, nothing failed. `verify_delta_row_level_concurrency` §11 was written BEFORE the migration
+for exactly that reason (82 → 93).
+
+**`DeclareFilesRead` (#25) does NOT retire our exemption — I suggested it might, and that was wrong.**
+The two solve different problems. Our whole-table declaration is made when a scan pushes NO predicate,
+i.e. it genuinely read every file; declaring those files instead would keep the delete/read rule and
+DROP the append rule, which is precisely the phantom-row protection `serializable` exists for — and
+`serializable` is our catalog default since 2026-08-01. Upstream says as much in #25's own message
+("it buys no protection against concurrent ADDS ... a host that also cares about phantom rows declares
+BOTH"). The exemption is narrower and correctly scoped: WriteSerializable only, row-level DML only.
+`DeclareFilesRead` remains available for a future scan that reads SOME files and wants precision.
+
 ### Suggested order when it is taken
 
+**Updated after the first attempt** — the ordering below still holds, with the `FileRowSelection` →
+`RowSelection` migration inserted BEFORE the Bridge call sites (the Bridge sites consume the type, so
+doing it the other way means touching them twice), and EW building + its own suites passing as a
+committable checkpoint before the Bridge is touched at all:
+
+1. Merge `upstream/master` into `bump/upstream-2026-08`; take the shredding delete and upstream's test
+   file (finding 4); resolve `DeltaTransaction.cs` and `DeltaTable.cs` hunk-wise (finding 3), taking
+   upstream on every hunk — including the row-level exemption one, which is then RE-ADDED as the
+   explicit opt-in rather than as our inference (finding 2, revised). Fallback if the restructured loop
+   fights it: preserve the inference and fix upstream's remark instead.
+2. Delete our `FileRowSelection` type and its duplicate `StageRowDeletesAsync` overload; migrate the
+   38 EW `src/` + 5 EW test sites to `RowSelection` (finding 1).
+3. Correct upstream's `DeclareWholeTableRead` remark on our branch so it describes what we actually do.
+4. **Checkpoint: EW builds and EW's own suites pass on net472 + net8.0 — commit the merge here.**
+   The Bridge is still broken at this point and that is fine; EW compiles standalone.
+5. Migrate the 24 Bridge call sites + its 5 `FileRowSelection` uses → resolve `WriteChangeDataFilesAsync`
+   → full `verify_delta_*` sweep → hermetic tier → fast-forward `fabricator-patches`, re-pin the parent.
+
+Original wording, kept because the dependency reasoning in it is still the right one:
 Drop the superseded shredding patch → merge `upstream/master` into `fabricator-patches` → migrate the 24
 Bridge call sites (Delete/Update first: they share `RowSelection`, which slice 2 introduced and slice 5
 consumes) → resolve `WriteChangeDataFilesAsync` → full `verify_delta_*` sweep. Then the standing rules from
@@ -1551,7 +1801,44 @@ Both times the gap was found by review, not by the suite.
 Written down before the context that produced it is lost. Two separable items: a fix that is ready to
 offer, and a defect that is measured but not yet built.
 
-### 1. UPSTREAM OFFER (ready): `CheckpointReader` must tolerate an unreadable `_last_checkpoint`
+### 1. UPSTREAM OFFER — **MERGED as #32, then CORRECTED TWICE (2026-08-01). Ours is retired.**
+
+> **Read this box before the account below it**, which describes the offer as it was WRITTEN. Upstream
+> merged it (`12b0d39`, #32) and then found two things wrong with it. Our copy on `fabricator-patches`
+> is gone — dropped at the `upstream/main` merge and replaced wholesale, byte-identical.
+>
+> **`b8d1452` (#33) — "a guard that starts one line late, and stops one level short".** Two defects in
+> what we shipped: (a) the `Exists` probe ran BEFORE the `try`, so a store that failed the EXISTENCE
+> check still failed the caller — the exact outcome the fix existed to remove. The probe is gone
+> entirely now (absence throws out of the read like any other unusable hint, and it saves a round-trip
+> per snapshot build). (b) Guarding root KIND and field PRESENCE covers neither field TYPE nor the
+> NESTED `v2Checkpoint`; seven shapes were measured still throwing, two of them the very
+> "`TryGetProperty` throws on a non-object" trap our own §6 comment named — one level down. One
+> try/catch around the whole read-and-decode subsumes all six guards and is 50 lines shorter. Our
+> `data.Length == 0` fast path went with them, on the strength of our own note that it killed no test.
+> **The lesson generalises: shape-by-shape guarding of a parse is the wrong instrument.** We enumerated
+> the shapes an interrupted overwrite plausibly leaves; the seam is `ITableFileSystem`, a PUBLIC one, so
+> a host can fail in ways this layer cannot enumerate — a better argument for the broad guard than the
+> one we gave.
+>
+> **`b50f6bb` (#35) — the argument we both rested on was not implemented.** #32 and #33 justify
+> returning null with "a reader can always recover by listing the log". **Nothing listed the log.**
+> `SnapshotBuilder` read a null hint as `replayFrom = 0`, and `TransactionLog.ListCheckpointVersionsAsync`
+> — the one method that could have found a checkpoint without the hint — had ZERO callers. That is not
+> merely slow: once Delta's metadata cleanup has removed the commits a checkpoint subsumes, the surviving
+> log carries no protocol or metadata action, so replaying it rebuilds nothing. Measured on three new
+> `SnapshotBuilder` tests against the previous code: all three fail with *"Table has no metadata
+> action"*. **The table is UNREADABLE, not silently short** — and OneLake, where we measured the original
+> failure, is exactly where cleanup runs. `FindLatestCheckpointAsync(maxVersion)` now backs the fallback,
+> including for a STALE hint (naming a deleted checkpoint) and one ABOVE a time-travel target.
+>
+> **Method note worth keeping: a fix whose justification names a fallback should verify the fallback
+> exists.** Both we and upstream asserted "the protocol requires readers to fall back to listing" and
+> neither checked that this code did. It is the same shape as the standing rule about instrumenting B to
+> prove A never reaches it.
+>
+> Our host-side half (read small files in ONE request rather than Azure's lazy ETag-pinned ranged
+> stream) is untouched by all of this and remains ours, as does `verify_delta_last_checkpoint`.
 
 Committed on `fabricator-patches` as `14a74a9`. **Engine-agnostic, spec-conformant, and not
 fabricator-specific — this is a bug in EW for every user, so it should go upstream as-is.**

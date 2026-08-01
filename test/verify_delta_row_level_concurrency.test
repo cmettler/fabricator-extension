@@ -328,6 +328,58 @@ statement ok
 DETACH rs;
 
 
+# ---- 11. THE WHOLE-TABLE READ EXEMPTION ITSELF (`effectiveReads`) ----
+# Every section above passes with that exemption REMOVED, and with it INVERTED — measured 2026-08-01 by
+# mutation, with an env-gated tripwire proving the line is reached rather than skipped. So until this
+# section existed, our most contentious divergence from upstream EW (which declined it deliberately, see
+# DeclareWholeTableRead's remarks there) had NO gate at all. Two structural reasons, both properties of
+# the sections above rather than of the feature:
+#   (a) they all use a PUSHABLE predicate (`WHERE id = 2`), so the scan declares a PREDICATE and never
+#       sets ReadWholeTable — and the exemption only ever drops WholeTable;
+#   (b) `t` is ONE file, so a racer can only ever touch a file this transaction also touched, which
+#       row-level resolution has already put in `resolvedPaths` and the checker skips BEFORE consulting
+#       reads at all. That skip — not this exemption — is what makes §1–§9 compose.
+#
+# So this needs a third table with THREE files, a NON-pushable predicate (⇒ StageWholeTableRead), and a
+# racer landing a dataChange=true remove on a DIFFERENT file (⇒ not in resolvedPaths).
+# MUTATION-TESTED: with `effectiveReads = reads`, the COMMIT below fails; with the exemption it lands.
+# Its own catalog because `rl` was detached at §10, and its own path because `t` above is single-file.
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/rowlevel_excl' AS rx (TYPE fabricator, PROVIDER 'delta', isolation_level 'write_serializable');
+
+statement ok
+CREATE TABLE rx.main.t AS SELECT r AS id, 'v' || r AS s FROM range(1, 11) t(r);
+
+statement ok
+INSERT INTO rx.main.t SELECT r AS id, 'v' || r AS s FROM range(11, 21) t(r);
+
+statement ok
+INSERT INTO rx.main.t SELECT r AS id, 'v' || r AS s FROM range(21, 31) t(r);
+
+statement ok con1
+BEGIN;
+
+# `id % 100` is NOT pushable, so the scan pushes nothing and the transaction declares a WHOLE-TABLE read.
+# It selects id = 2 only, which lives in the FIRST file.
+statement ok con1
+DELETE FROM rx.main.t WHERE id % 100 = 2;
+
+# The racer deletes from the SECOND file and commits. Its remove carries dataChange = true and its path is
+# NOT in con1's resolvedPaths, so §1's mechanism cannot cover this — only the exemption can.
+statement ok con2
+DELETE FROM rx.main.t WHERE id = 15;
+
+statement ok con1
+COMMIT;
+
+query II
+SELECT count(*), sum(id) FROM rx.main.t;
+----
+28	448
+
+statement ok
+DETACH rx;
+
 # ---- NOT COVERED HERE, deliberately: the AUTOCOMMIT path's row-level retry ----
 # `DeltaCatalog.ExecuteDelete` passes rowLevelRetry to the DV delete, and that flag only changes behaviour
 # when THAT statement's own commit hits a concurrent DV change. sqllogictest runs con1/con2 SEQUENTIALLY, so
