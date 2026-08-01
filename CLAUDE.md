@@ -132,8 +132,16 @@ EW Table.Tests **828/828 on net8.0 AND net472**, DeltaLake.Tests 248, hermetic *
    method by whether it was in the MERGE BASE — that separates upstream's consolidation from our losses
    (14 absent → 10 upstream's, 3 ours-with-a-successor, 1 lost). Command in the doc.
 3. **Building the Bridge is what finds the host's needs; reading the diff is not.** Two consolidations
-   dropped things only a caller notices → additive patches `rowAddressesOut` on `ReadRowsAsync` and
-   `AppTransactionPreconditionException`.
+   dropped things only a caller notices → additive patches: a **`DeltaRowMetadata` parameter on
+   `ReadRowsAsync`** and `AppTransactionPreconditionException`.
+   - **⚠ And the first one was the WRONG SHAPE at first, which one question exposed.** I added a bespoke
+     `rowAddressesOut` out-param; `DeltaRowMetadata.RowAddress` had been a first-class metadata kind all
+     along, emitting exactly that packed address as a COLUMN on `ReadAsync`/`ReadChangesAsync`. The
+     address was never missing from the library — it was missing from ONE read, which already stood out by
+     carrying a bespoke `sourceRowTrackingOut` duplicating `DeltaRowMetadata.RowTracking`. **Standing rule:
+     before adding a parameter, read the enum/options type the neighbouring methods already accept.** The
+     out-param compiled, passed, and was defensible in isolation; it was wrong only relative to a
+     convention one file away.
 4. **A COMPILING Bridge is not a migrated one.** Upstream documents `RequireAppTransaction`'s
    `expectedPrevious: null` as "do not check" where our `fabricator_delta_set_transaction_version` means
    "must not exist yet" — a replayed first batch would have gone from a failed CAS to an unconditional

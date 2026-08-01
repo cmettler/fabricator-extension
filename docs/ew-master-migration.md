@@ -680,11 +680,38 @@ comm -23 /tmp/ours.txt /tmp/now.txt          # then check each against the MERGE
 ```
 
 **3. BUILDING THE BRIDGE is what finds the host's needs — reading the diff is not.** Two upstream
-consolidations dropped things only a caller notices: `ReadRowsAsync` lost the transient-address
-out-param (the host's row identifiers ARE that address, and the method exposes no absolute position, so
-it cannot be reconstructed from outside), and the app-transaction precondition throws a bare
-`InvalidOperationException` that cannot be told from any other commit-time failure. Both are back as
-additive patches (`rowAddressesOut`, `AppTransactionPreconditionException`).
+consolidations dropped things only a caller notices: `ReadRowsAsync` could no longer surface the
+transient address (the host's row identifiers ARE that address, and the method exposes no absolute
+position, so it cannot be reconstructed from outside), and the app-transaction precondition throws a
+bare `InvalidOperationException` that cannot be told from any other commit-time failure. Both are back
+as additive patches.
+
+> **⚠ THE FIRST FIX WAS THE WRONG SHAPE, and finding out took one question.** I added a bespoke
+> `rowAddressesOut` out-param, and assessed the resulting offer as the weakest of the three because
+> upstream's doc points callers at `DeltaRowMetadata.Locator` instead. Asked whether the locator might
+> already carry what we needed, I actually READ the enum — and **`DeltaRowMetadata.RowAddress` has been
+> a first-class metadata kind the whole time**, emitting exactly the packed address as a column. The
+> address was never missing from the library; it was missing from ONE read:
+>
+> | read | metadata support |
+> |---|---|
+> | `ReadAsync` | `DeltaReadOptions.Metadata` — all three kinds, as columns |
+> | `ReadChangesAsync` | `DeltaChangeReadOptions.Metadata` — same |
+> | `ReadRowsAsync` | **none** — instead `sourceRowTrackingOut`, a bespoke out-param DUPLICATING `DeltaRowMetadata.RowTracking` |
+>
+> So `ReadRowsAsync` was already the odd one out, and a second out-param beside the first made it
+> worse. Rewritten as the `DeltaRowMetadata` parameter the other two reads take (`f9d1827`), mirroring
+> `ReadCoreAsync`'s own helpers rather than a parallel path. That turned the weakest offer into the
+> strongest — a consistency fix upstream can motivate without reference to us, justified by the enum's
+> own words ("asking for two kinds costs ONE pass").
+>
+> **The lesson is narrow and repeatable: before adding a parameter, read the enum/options type the
+> neighbouring methods already accept.** The bespoke out-param compiled, passed, and was defensible in
+> isolation; it was only wrong relative to a convention sitting one file away.
+>
+> The Bridge adapts the column back to the out-param its own callers want, at the `ReadRowsByRowIds`
+> seam — its buffered-UPDATE consumer indexes columns positionally against the pending schema, so a
+> trailing metadata column would shift every index. Stripped BY NAME, never by position.
 
 **4. A COMPILING BRIDGE IS NOT A MIGRATED ONE.** Two behaviour changes survived the compiler and were
 caught only by the suites: upstream's `RequireAppTransaction` documents `expectedPrevious: null` as

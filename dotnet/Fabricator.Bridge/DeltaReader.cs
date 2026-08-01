@@ -936,9 +936,13 @@ internal static class DeltaReader
         var token = interrupt.Token;
         var fs = TableFileSystems.Create(opener, path);
         await using var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(), token).ConfigureAwait(false);
-        // NOTE (EW master): the yielded batches carry USER columns only — the rowid correlation key rides
-        // the rowIdsOut out-param (one row-aligned long[] per batch), not a trailing column — a plain
-        // value array, so the caller manages no Arrow buffer lifetime.
+        // The correlation key crosses as EW's `_ew_row_address` METADATA COLUMN (DeltaRowMetadata.RowAddress
+        // — the same flag, names and semantics as its other reads), and is UNPACKED here into the
+        // out-param our callers want. Two reasons the adaptation lives at this seam rather than in them:
+        // the yielded batches keep carrying USER COLUMNS ONLY, which the buffered-UPDATE consumer depends on
+        // (it indexes columns positionally against the pending schema and reconciles against it, so a
+        // trailing metadata column would shift every index), and a plain long[] means no caller manages an
+        // Arrow buffer lifetime. Not requested ⇒ not asked for, so there is nothing to strip.
         // The rowids' ordinals are path-sort positions in the snapshot they were SCANNED against (a buffered
         // transaction's pinned version), so resolve there — against a moved CurrentSnapshot a concurrent
         // commuting append shifts the ordering and the ordinals name the wrong files.
@@ -948,11 +952,52 @@ internal static class DeltaReader
         await foreach (var batch in table.ReadRowsAsync(
                            SelectionFromRowIds(table, snapshot, rowIds, "row read-back",
                                                skipUnresolvable: true),
-                           sourceTrackingOut, token, snapshot, rowIdsOut)
+                           sourceTrackingOut, token, snapshot,
+                           metadata: rowIdsOut is null
+                               ? DeltaRowMetadata.None : DeltaRowMetadata.RowAddress)
                            .ConfigureAwait(false))
         {
-            yield return batch;
+            if (rowIdsOut is null)
+            {
+                yield return batch;
+                continue;
+            }
+            yield return StripRowAddress(batch, rowIdsOut);
         }
+    }
+
+    /// <summary>
+    /// Takes EW's trailing <c>_ew_row_address</c> column off a read-back batch, appending its values to
+    /// <paramref name="rowIdsOut"/> as one row-aligned array. Located BY NAME, not by position: a metadata
+    /// column's placement is EW's contract to change, and stripping the wrong column would silently drop a
+    /// user column and shift the rest.
+    /// </summary>
+    private static RecordBatch StripRowAddress(RecordBatch batch, List<long[]> rowIdsOut)
+    {
+        int idx = batch.Schema.GetFieldIndex(TransientRowAddress.ColumnName);
+        if (idx < 0)
+        {
+            throw new System.InvalidOperationException(
+                $"row read-back: the '{TransientRowAddress.ColumnName}' metadata column is missing — it was "
+                + "requested via DeltaRowMetadata.RowAddress, so its absence means the read surface changed.");
+        }
+
+        var addresses = (Apache.Arrow.Int64Array)batch.Column(idx);
+        var rids = new long[batch.Length];
+        for (int i = 0; i < batch.Length; i++)
+            rids[i] = addresses.GetValue(i)!.Value;
+        rowIdsOut.Add(rids);
+
+        var fields = new List<Field>(batch.ColumnCount - 1);
+        var columns = new List<IArrowArray>(batch.ColumnCount - 1);
+        for (int c = 0; c < batch.ColumnCount; c++)
+        {
+            if (c == idx)
+                continue;
+            fields.Add(batch.Schema.FieldsList[c]);
+            columns.Add(batch.Column(c));
+        }
+        return new RecordBatch(new Apache.Arrow.Schema(fields, batch.Schema.Metadata), columns, batch.Length);
     }
 
     // Sync facade over an async stream for the synchronous ABI callers: blocks once per pulled item
