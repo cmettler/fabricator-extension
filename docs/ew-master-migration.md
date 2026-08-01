@@ -648,6 +648,65 @@ the updater touches every selected row — check each, two sites in `MetadataCol
 One assertion also needs re-pointing: `MetadataColumnTests` ~637 asserts an error message names
 `UpdateBySelectionAsync` as the alternative; upstream's message names the read option instead.
 
+### THIRD ATTEMPT — DONE (2026-08-01). What the plan below did NOT predict
+
+The bump is complete: EW `df4f918`, parent `597e97a` + the pin move. Everything in the order below
+happened roughly as written. Four things did not appear in it at all, and they are the reusable part.
+
+**1. `upstream/master` IS STALE — the branch is `upstream/main` now.** Upstream renamed it (`8caf8d8`,
+"ci: follow the branch rename from master to main"), so a merge of `upstream/master` lands on a branch
+upstream has moved off. The first merge here did exactly that and had to be extended by 12 commits
+(4 code) afterwards. **`git fetch upstream` then read `upstream/main`, and do not trust a `master`
+remote-tracking ref that still resolves.** `upstream/HEAD -> upstream/master` still points at the old
+name locally, which is what makes this quiet.
+
+**2. THE MERGE SILENTLY DROPPED ONE OF OUR PATCHES, and no test said so.** Conflict resolution took an
+upstream region wholesale that contained `UpdateBySelectionViaVectorsAsync` — our MERGE-ON-READ UPDATE.
+Upstream has no equivalent: `DELETE` has `RowDeleteMode.DeletionVector`, `UPDATE` always rewrites
+(`UpdateRowsCoreAsync` → `RewriteRowsToNewFileAsync`). It was found by TRIPPING over it — the MoR tests
+would not compile — and the reflex fix (point them at `UpdateRowsAsync`) would have converted five
+merge-on-read tests into copy-on-write tests. **The audit that should have run first:** diff the PUBLIC
+surface of the pre-merge `DeltaTable` against the merged one, then classify each absent method by
+whether it existed in the MERGE BASE. That separates upstream's consolidation from our losses in one
+pass — 14 absent, 10 upstream's, 3 ours-with-a-successor, 1 genuinely lost.
+
+```bash
+sig() { grep -oE '^ +public (async )?[A-Za-z0-9_<>,?\.\(\) ]+ [A-Za-z0-9_]+\(' \
+        | sed 's/.* \([A-Za-z0-9_]*\)($/\1/' | sort -u; }
+T=src/EngineeredWood.DeltaLake.Table/DeltaTable.cs
+git show <pre-merge-sha>:$T | sig > /tmp/ours.txt
+sig < $T > /tmp/now.txt
+comm -23 /tmp/ours.txt /tmp/now.txt          # then check each against the MERGE BASE
+```
+
+**3. BUILDING THE BRIDGE is what finds the host's needs — reading the diff is not.** Two upstream
+consolidations dropped things only a caller notices: `ReadRowsAsync` lost the transient-address
+out-param (the host's row identifiers ARE that address, and the method exposes no absolute position, so
+it cannot be reconstructed from outside), and the app-transaction precondition throws a bare
+`InvalidOperationException` that cannot be told from any other commit-time failure. Both are back as
+additive patches (`rowAddressesOut`, `AppTransactionPreconditionException`).
+
+**4. A COMPILING BRIDGE IS NOT A MIGRATED ONE.** Two behaviour changes survived the compiler and were
+caught only by the suites: upstream's `RequireAppTransaction` documents `expectedPrevious: null` as
+"do not check", where OUR `fabricator_delta_set_transaction_version` means "must not exist yet" — a
+replayed first batch would have gone from a failed CAS to an unconditional write, DUPLICATING DATA on a
+user-facing exactly-once mechanism (fixed with an additive `requireAbsent`); and `SelectionFromRowIds`
+is loud about an unresolvable ordinal, which is right for every DML path and wrong for the CDF
+read-back, whose caller legitimately passes rows of this transaction's own pending files.
+
+**And the reason the opt-in had a gate at all:** `ExemptRowLevelFromWholeTableRead` was wired LAST, and
+until it was, nothing failed. `verify_delta_row_level_concurrency` §11 was written BEFORE the migration
+for exactly that reason (82 → 93).
+
+**`DeclareFilesRead` (#25) does NOT retire our exemption — I suggested it might, and that was wrong.**
+The two solve different problems. Our whole-table declaration is made when a scan pushes NO predicate,
+i.e. it genuinely read every file; declaring those files instead would keep the delete/read rule and
+DROP the append rule, which is precisely the phantom-row protection `serializable` exists for — and
+`serializable` is our catalog default since 2026-08-01. Upstream says as much in #25's own message
+("it buys no protection against concurrent ADDS ... a host that also cares about phantom rows declares
+BOTH"). The exemption is narrower and correctly scoped: WriteSerializable only, row-level DML only.
+`DeclareFilesRead` remains available for a future scan that reads SOME files and wants precision.
+
 ### Suggested order when it is taken
 
 **Updated after the first attempt** — the ordering below still holds, with the `FileRowSelection` →
@@ -1715,7 +1774,44 @@ Both times the gap was found by review, not by the suite.
 Written down before the context that produced it is lost. Two separable items: a fix that is ready to
 offer, and a defect that is measured but not yet built.
 
-### 1. UPSTREAM OFFER (ready): `CheckpointReader` must tolerate an unreadable `_last_checkpoint`
+### 1. UPSTREAM OFFER — **MERGED as #32, then CORRECTED TWICE (2026-08-01). Ours is retired.**
+
+> **Read this box before the account below it**, which describes the offer as it was WRITTEN. Upstream
+> merged it (`12b0d39`, #32) and then found two things wrong with it. Our copy on `fabricator-patches`
+> is gone — dropped at the `upstream/main` merge and replaced wholesale, byte-identical.
+>
+> **`b8d1452` (#33) — "a guard that starts one line late, and stops one level short".** Two defects in
+> what we shipped: (a) the `Exists` probe ran BEFORE the `try`, so a store that failed the EXISTENCE
+> check still failed the caller — the exact outcome the fix existed to remove. The probe is gone
+> entirely now (absence throws out of the read like any other unusable hint, and it saves a round-trip
+> per snapshot build). (b) Guarding root KIND and field PRESENCE covers neither field TYPE nor the
+> NESTED `v2Checkpoint`; seven shapes were measured still throwing, two of them the very
+> "`TryGetProperty` throws on a non-object" trap our own §6 comment named — one level down. One
+> try/catch around the whole read-and-decode subsumes all six guards and is 50 lines shorter. Our
+> `data.Length == 0` fast path went with them, on the strength of our own note that it killed no test.
+> **The lesson generalises: shape-by-shape guarding of a parse is the wrong instrument.** We enumerated
+> the shapes an interrupted overwrite plausibly leaves; the seam is `ITableFileSystem`, a PUBLIC one, so
+> a host can fail in ways this layer cannot enumerate — a better argument for the broad guard than the
+> one we gave.
+>
+> **`b50f6bb` (#35) — the argument we both rested on was not implemented.** #32 and #33 justify
+> returning null with "a reader can always recover by listing the log". **Nothing listed the log.**
+> `SnapshotBuilder` read a null hint as `replayFrom = 0`, and `TransactionLog.ListCheckpointVersionsAsync`
+> — the one method that could have found a checkpoint without the hint — had ZERO callers. That is not
+> merely slow: once Delta's metadata cleanup has removed the commits a checkpoint subsumes, the surviving
+> log carries no protocol or metadata action, so replaying it rebuilds nothing. Measured on three new
+> `SnapshotBuilder` tests against the previous code: all three fail with *"Table has no metadata
+> action"*. **The table is UNREADABLE, not silently short** — and OneLake, where we measured the original
+> failure, is exactly where cleanup runs. `FindLatestCheckpointAsync(maxVersion)` now backs the fallback,
+> including for a STALE hint (naming a deleted checkpoint) and one ABOVE a time-travel target.
+>
+> **Method note worth keeping: a fix whose justification names a fallback should verify the fallback
+> exists.** Both we and upstream asserted "the protocol requires readers to fall back to listing" and
+> neither checked that this code did. It is the same shape as the standing rule about instrumenting B to
+> prove A never reaches it.
+>
+> Our host-side half (read small files in ONE request rather than Azure's lazy ETag-pinned ranged
+> stream) is untouched by all of this and remains ours, as does `verify_delta_last_checkpoint`.
 
 Committed on `fabricator-patches` as `14a74a9`. **Engine-agnostic, spec-conformant, and not
 fabricator-specific — this is a bug in EW for every user, so it should go upstream as-is.**
