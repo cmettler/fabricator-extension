@@ -527,7 +527,29 @@ implemented here: today the declaration is honoured at both levels … if it is 
 an explicit per-transaction opt-in rather than an inference — a library must not claim on a host's
 behalf that it read less than it declared."* Our branch DOES implement it, as an inference, in the
 commit loop (`effectiveReads = rowLevel && isolation != Serializable ? reads with { WholeTable = false }
-: reads`), and `verify_delta_row_level_concurrency` (70) depends on it.
+: reads`).
+
+**⚠ CORRECTION (measured 2026-08-01): the claim that `verify_delta_row_level_concurrency` depended on it
+was FALSE, and the suite has now been given the section that makes it true.** Mutation testing showed
+every one of §1–§10 passing with the exemption REMOVED *and* with it INVERTED (`WholeTable = true`
+forced) — with an env-gated tripwire throw proving the line is REACHED, so this was a real null result
+and not a skipped code path. Two structural reasons, both properties of the suite rather than of the
+feature: every scenario used a PUSHABLE predicate (`WHERE id = 2`), so the scan declares a PREDICATE and
+never sets `ReadWholeTable`, and the exemption only ever drops `WholeTable`; and the fixture is ONE
+file, so a racer can only touch a file the transaction also touched — which row-level resolution has
+already put in `resolvedPaths`, and the checker skips those BEFORE consulting reads at all. **That skip,
+not this exemption, is what makes §1–§9 compose** — a distinction worth keeping straight, because it is
+the one that makes concurrent disjoint-row DML work.
+
+**The exemption IS load-bearing, for a narrower case than advertised.** New §11 supplies what was
+missing — a table with THREE files, a NON-pushable predicate (`id % 100 = 2` ⇒ `StageWholeTableRead`),
+and a racer landing a `dataChange=true` remove on a DIFFERENT file (⇒ not in `resolvedPaths`). With the
+exemption the buffered COMMIT lands; with `effectiveReads = reads` it fails with a conflict, and the
+mutant fails at exactly that COMMIT and nowhere else. Suite 82 → 93.
+
+So the decision above stands, but now on evidence rather than on an assumed gate — and the offer is much
+stronger for it, since upstream's stated objection is partly that this is an inference *"a host cannot
+observe from the outside"*. §11 is precisely an outside observation of it.
 
 **DECISION, revised — adopt the OPT-IN DURING the merge rather than preserving the inference.** The
 first call here was "keep our behaviour, redesign later", on entanglement grounds. That was too
