@@ -225,10 +225,18 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext
 	vector<LogicalType> types;
 	try {
 		FetchTableColumns(context, handle_, name, table_name, names, types);
-	} catch (std::exception &) {
+	} catch (fabricator::ObjectNotFoundException &) {
 		// The discovered name is stale — the table no longer exists on the server
 		// (e.g. dropped out-of-band via fabricator_exec). Treat it as not-found so
 		// CREATE TABLE IF NOT EXISTS / OR REPLACE see "absent" instead of an error.
+		//
+		// ONLY established absence lands here (the provider returned FABRICATOR_NOT_FOUND). This used to
+		// catch std::exception — every failure — so a table that merely could not be READ was erased from
+		// the catalog and reported as "does not exist": its data intact, its name gone from enumeration
+		// too, and the real cause (an incomplete Delta log naming the exact missing version, an expired
+		// credential, a transient outage) discarded one frame after the provider produced it. A user given
+		// "table does not exist" checks their spelling and their permissions; nothing about that search
+		// leads to a missing commit file.
 		table_types_.erase(table_name);
 		RetireErase(entries_, table_name, retired_entries_);
 		return nullptr;

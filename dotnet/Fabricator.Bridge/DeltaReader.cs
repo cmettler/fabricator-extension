@@ -535,6 +535,38 @@ internal static class DeltaReader
         return schema;
     }
 
+    /// <summary>
+    /// Whether a Delta table EXISTS at <paramref name="path"/> — by the same definition the engine uses
+    /// (<c>_delta_log</c> holds at least one commit), so the two cannot drift apart.
+    ///
+    /// <para>Deliberately NOT "can it be opened": a table whose log has a hole, whose credential expired, or
+    /// whose store is briefly unreachable EXISTS and must not be reported as absent. The host converts
+    /// absence into "this table is gone" — dropping the catalog entry and removing the name from
+    /// enumeration — so a wrong `true` here makes a table with intact data VANISH.</para>
+    ///
+    /// <para>Intended for the FAILURE path only. It costs a log listing, which is exactly the per-table cost
+    /// the OneLake enumeration work exists to avoid, so never call it to pre-check a fetch that is about to
+    /// happen anyway — call it after one has already failed, to classify why.</para>
+    /// </summary>
+    public static bool TableExists(nint opener, string path)
+        => TableExistsAsync(opener, path).GetAwaiter().GetResult();
+
+    private static async Task<bool> TableExistsAsync(nint opener, string path)
+    {
+        try
+        {
+            var fs = TableFileSystems.Create(opener, path);
+            var log = new EngineeredWood.DeltaLake.Log.TransactionLog(fs);
+            return await log.GetLatestVersionAsync().ConfigureAwait(false) >= 0;
+        }
+        catch (System.Exception)
+        {
+            // Could not even list the log. That is "unknown", and UNKNOWN IS NOT ABSENCE — answer "exists"
+            // so the caller keeps the original failure rather than erasing a table it cannot see.
+            return true;
+        }
+    }
+
     private static async Task<(Schema Schema, bool RowTracking)> GetSchemaAndRowTrackingAsync(nint opener, string path)
     {
         var fs = TableFileSystems.Create(opener, path);

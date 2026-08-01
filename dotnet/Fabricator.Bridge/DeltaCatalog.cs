@@ -712,7 +712,27 @@ public sealed class DeltaCatalog : IBackendCatalog
         {
             return pendingSchema;
         }
-        var schema = DeltaReader.GetSchemaAndRowTracking(Opener(), path, out bool rowTracking);
+        Schema schema;
+        bool rowTracking;
+        try
+        {
+            schema = DeltaReader.GetSchemaAndRowTracking(Opener(), path, out rowTracking);
+        }
+        catch (System.Exception ex)
+        {
+            // CLASSIFY the failure rather than let the host assume absence. It converts any column-fetch
+            // failure into "the table does not exist" — dropping the entry AND removing the name from
+            // enumeration — which is right after an out-of-band DROP and catastrophic otherwise: an
+            // incomplete log, an expired credential or a brief outage would make a table whose data is
+            // entirely intact disappear from the catalog. Absence is ESTABLISHED here (no commit in
+            // _delta_log, the engine's own definition); anything else keeps its real error, which for a
+            // holed log is engineered-wood naming the exact version it could not cover.
+            if (DeltaReader.TableExists(Opener(), path))
+            {
+                throw;
+            }
+            throw new ObjectNotFoundException("table", path, ex);
+        }
         _rowTrackingByPath[path] = rowTracking;
         return schema;
     }

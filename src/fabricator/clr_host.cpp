@@ -664,6 +664,20 @@ void GetMetadata(FabricatorHandle handle, int32_t kind, const std::string &arg1,
 	char *err = nullptr;
 	int32_t rc = vt.get_metadata(handle, kind, arg1.empty() ? nullptr : arg1.c_str(),
 	                             arg2.empty() ? nullptr : arg2.c_str(), &out, &err);
+	if (rc == FABRICATOR_NOT_FOUND) {
+		// ABSENCE, kept distinct from failure all the way to the catalog. The status has existed in abi.h
+		// since the beginning and was never produced or consumed; wiring it is what lets the entry
+		// materialization stop treating every unreadable table as a deleted one.
+		std::string message = "Fabricator: get_metadata failed";
+		if (err) {
+			message += ": ";
+			message += err;
+			if (vt.free_error) {
+				vt.free_error(err);
+			}
+		}
+		throw ObjectNotFoundException(message);
+	}
 	if (rc != FABRICATOR_OK) {
 		ThrowManagedError(vt, err, "Fabricator: get_metadata failed");
 	}

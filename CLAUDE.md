@@ -179,10 +179,15 @@ replay paths now demand contiguous coverage and name the first hole.
   the requested label — so a stale pin or an off-by-one silently got real rows for a version that does not
   exist. **Measured, then pinned** (`verify_delta_catalog_time_travel` 48 → 49); nothing asserted either
   answer before, so it could have flipped back unnoticed in either direction.
-- **A transient READ FAILURE of a commit is now a HOLE, not a skip** — worth watching on OneLake
-  specifically, because our measured multi-writer shape is exactly a world where another writer's commit
-  file is briefly unreadable (that is how the `_last_checkpoint` 412 was found). Correct, plausibly noisier.
-  Not yet exercised against live OneLake.
+- **A transient READ FAILURE of a commit is now a HOLE, not a skip.** **MEASURED LIVE on OneLake
+  (2026-08-01) — no spurious failures.** 16 writers × 20 commits: **19 OCC retries** (so the commit guard
+  was genuinely under test), 320/320 commits, 320 groups, no short groups, all writers clean, all exited on
+  their own. ⚠ **8 × 12 and 10 × 15 both produced ZERO retries that day** and are therefore NOT measurements
+  of this — the harness's own void condition ("must be > 0, else the writers serialized and the guard was
+  never under test"). Contention varies run to run; **check the retry count before believing a green.**
+  (The pre-fix "8 × 12 reproducibly broke writers" line elsewhere in the docs describes the state BEFORE the
+  `_last_checkpoint` and 412 fixes — the same table records 96/96 clean after them, so a clean 8 × 12 today
+  is the documented behaviour, not a lost baseline.)
 - `ListCheckpointVersionsAsync` is deleted upstream, and his message says *"Confirmed absent from
   fabricator before removing"* — checked, and true (only compiled EW DLLs match; no source call site).
   **Upstream is checking our tree before removing API.**
@@ -1917,6 +1922,34 @@ built. Needs a real Mac and an install-doc note.
     table leaves no stale entry" holds for the un-read case only. A rough edge rather than a designed
     behaviour — nothing depends on the 208 text, and turning it into a clean catalog error would mean
     classifying provider errors at scan time (an object-not-found probe on every scan failure).
+  - **⚠ IT USED TO INFER ABSENCE FROM ANY FAILURE — FIXED 2026-08-01 (no ABI bump).** `GetOrCreateEntry`
+    caught `std::exception` and read every one as "the table is gone", so a table that merely could not be
+    READ was **erased**: entry dropped, name removed from `table_types_` (so it left ENUMERATION too — `SHOW
+    TABLES` showed nothing), and the provider's real error discarded one frame after it was produced. A
+    Delta table with an incomplete log demonstrated it end to end: `fabricator_delta_scan` reported
+    engineered-wood naming the exact missing version, while the catalog path said *"Table with name t does
+    not exist!"* for a table whose data was entirely intact. Same for an expired credential or a brief
+    outage. A user told "does not exist" checks spelling and permissions; nothing in that search leads to a
+    missing commit file.
+    - **The fix is CLASSIFICATION, not removing the catch** (which is load-bearing — see above).
+      `FABRICATOR_NOT_FOUND = 3` had been in `abi.h` from the start, **never produced and never consumed**;
+      wiring it needed no version bump. C# gained `ObjectNotFoundException` → `Bootstrap.GetMetadata`
+      returns that status; C++ `GetMetadata` maps it to `fabricator::ObjectNotFoundException` (deriving from
+      `IOException`, so an UNCAUGHT one reads exactly as before); the catch narrowed to that type alone.
+    - **Each provider must ESTABLISH absence, never guess it.** Delta: no commit in `_delta_log`, i.e.
+      `GetLatestVersionAsync() >= 0` — the engine's OWN predicate, so the two cannot drift. SQL Server:
+      **error NUMBER 208**, not message text (note 208 also covers an object the principal cannot SEE —
+      SQL Server reports it identically on purpose — so treating it as absence preserves the prior
+      semantics exactly). Both classify ONLY on the failure path, so a healthy fetch costs nothing extra,
+      and both answer "exists" when the probe itself fails: **unknown is not absence**, and answering
+      otherwise would erase a table we merely cannot see.
+    - **⚠ THE PATH HAD NO COVERAGE AT ALL, and the service tier proved it by staying green while it was
+      broken** (44/44). Gate added: `verify_exec_invalidate_cache` §out-of-band drop (10 → 21). It must run
+      with `mssql_exec_invalidate_cache` **OFF** — with the auto-invalidate ON, which the rest of that suite
+      needs, the DROP refreshes the whole cache and the name leaves the discovered list, so the lookup
+      answers "does not exist" without ever fetching columns. Written that way first, the section passed
+      with the provider's absence detection DISABLED; mutation-testing is what caught it measuring the
+      wrong thing.
 - **Catalog-entry evictions RETIRE, never destroy (2026-07-16 — use-after-free fix).** Every eviction of
   a materialized entry (`InvalidateEntryCache`/`InvalidateAllEntries` on rollback, `InvalidateMatching`,
   the ALTER re-key/eager-refresh, DropEntry, CREATE-OR-REPLACE re-adds, all self-heal evicts — and the

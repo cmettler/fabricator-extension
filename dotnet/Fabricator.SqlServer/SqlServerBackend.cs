@@ -1527,8 +1527,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                                    : FilteredTables(),
         // Zero-row result whose Arrow schema describes the table's columns; the
         // C++ host reads that schema to learn the DuckDB column types.
-        MetadataKind.Columns => ExecuteMetadataQuery($"SELECT * FROM {Quote(Require(schema, table).schema)}." +
-                                             $"{Quote(Require(schema, table).table)} WHERE 1 = 0"),
+        MetadataKind.Columns => ColumnsMetadata(Require(schema, table).schema, Require(schema, table).table),
         MetadataKind.RowId => RowIdMetadata(Require(schema, table).schema, Require(schema, table).table),
         // Both statistics reads are SKIPPED on a warehouse engine, for the same reason as the external-table
         // probe above: Fabric/Synapse do not support sys.dm_db_partition_stats or sys.dm_db_stats_histogram
@@ -1557,6 +1556,39 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         MetadataKind.CatalogMacros => CatalogMacroMetadata.Stream(CustomFunctions.CatalogMacros),
         _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "fabricator: unknown metadata kind"),
     };
+
+    /// <summary>
+    /// The table's columns, as a zero-row stream whose Arrow schema is the answer — and, when the object is
+    /// gone, an <see cref="ObjectNotFoundException"/> rather than the raw provider error.
+    ///
+    /// <para>The host turns ABSENCE into "this table no longer exists": it drops the catalog entry and the
+    /// name, so <c>CREATE TABLE IF NOT EXISTS</c> / <c>OR REPLACE</c> behave correctly after a DROP issued
+    /// out of band (via <c>fabricator_exec</c>, or by another session). It used to infer that from ANY
+    /// failure here, which meant an unreadable table was erased just as readily as a deleted one; now the
+    /// provider has to say so, and this is where SQL Server says it.</para>
+    ///
+    /// <para>Established from the ERROR NUMBER, not the message: <b>208</b> is SQL Server's "Invalid object
+    /// name". Note it also covers an object the principal may not SEE — SQL Server reports 208 rather than a
+    /// permission error, deliberately, so as not to leak existence. Treating that as absence is exactly what
+    /// this path did before, so the semantics are unchanged; every OTHER error number now keeps its own
+    /// message instead of being reported as a missing table.</para>
+    /// </summary>
+    private IArrowArrayStream ColumnsMetadata(string schemaName, string tableName)
+    {
+        try
+        {
+            return ExecuteMetadataQuery(
+                $"SELECT * FROM {Quote(schemaName)}.{Quote(tableName)} WHERE 1 = 0");
+        }
+        catch (Microsoft.Data.SqlClient.SqlException ex) when (ex.Number == InvalidObjectNameError)
+        {
+            throw new ObjectNotFoundException("table", $"{schemaName}.{tableName}", ex);
+        }
+    }
+
+    /// <summary>SQL Server error 208, "Invalid object name" — the server's own statement that the object is
+    /// not there (or not visible to this principal, which it reports identically on purpose).</summary>
+    private const int InvalidObjectNameError = 208;
 
     // slice D: a detected external DELTA table with a Delta IDENTITY column advertises THAT column as its
     // rowid (an external table has no PK/UNIQUE/IDENTITY SQL-side, so RowIdSql finds nothing) — the scan

@@ -321,6 +321,15 @@ public static unsafe class Bootstrap
             CArrowArrayStreamExporter.ExportArrayStream(stream, outStream);
             return FabricatorStatus.Ok;
         }
+        catch (ObjectNotFoundException ex)
+        {
+            // ABSENCE, distinguished from failure. The host drops the catalog entry AND removes the name
+            // from enumeration on this status — right for a table dropped out-of-band, catastrophic for a
+            // table that merely could not be read (its data is intact and it would silently vanish). Only a
+            // provider that has ESTABLISHED absence throws this; everything else falls through below.
+            SetError(err, ex);
+            return FabricatorStatus.NotFound;
+        }
         catch (Exception ex)
         {
             SetError(err, ex);

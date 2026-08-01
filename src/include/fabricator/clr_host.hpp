@@ -13,6 +13,10 @@
 // Pull DuckDB's Arrow C struct definitions first (they are richer than abi.h's
 // and share the same include guards), so the whole project uses one definition.
 #include "duckdb/common/arrow/arrow.hpp"
+// ObjectNotFoundException derives from IOException so an UNCAUGHT one reads exactly as every other bridge
+// failure did before it existed — the type only adds a handle for the one caller that must tell absence
+// from unreadability. The header already depends on DuckDB (above), so this adds no new layering.
+#include "duckdb/common/exception.hpp"
 
 #include "fabricator/abi.h"
 
@@ -154,9 +158,24 @@ int64_t ExecuteDelete(FabricatorHandle handle, const std::string &schema, const 
 int64_t ExecuteUpdate(FabricatorHandle handle, const std::string &schema, const std::string &table, int32_t set_count,
                       ArrowArrayStream &data);
 
+// The provider reported FABRICATOR_NOT_FOUND: the object GENUINELY DOES NOT EXIST, as opposed to existing
+// and being unreadable. Derives from IOException so an uncaught one reads exactly as it did before.
+//
+// Catch it ONLY where absence has a distinct meaning — chiefly the catalog's entry materialization, which
+// turns absence into "this table is gone" (dropping the entry AND removing the name from enumeration) so
+// CREATE TABLE IF NOT EXISTS / OR REPLACE work after an out-of-band DROP. Catching every failure there
+// instead made a table with intact data vanish whenever its columns merely could not be READ — a holed
+// log, an expired credential, a brief outage — and reported it as "Table with name t does not exist!".
+class ObjectNotFoundException : public duckdb::IOException {
+public:
+	explicit ObjectNotFoundException(const std::string &msg) : duckdb::IOException(msg) {
+	}
+};
+
 // Discover provider metadata. `kind` is an FabricatorMetadataKind; `arg1`/`arg2`
 // are the schema/table name when the kind needs them (empty otherwise). Fills
 // `out` with the resulting Arrow stream. All provider catalog SQL lives in C#.
+// Throws ObjectNotFoundException when the provider reports the object as absent.
 void GetMetadata(FabricatorHandle handle, int32_t kind, const std::string &arg1, const std::string &arg2,
                  ArrowArrayStream &out);
 

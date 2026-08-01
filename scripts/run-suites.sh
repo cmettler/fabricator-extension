@@ -131,7 +131,14 @@ case "$TIER" in
         # 44 RUNS / 1413 since 2026-07-31: verify_session_tag (+25) — fabricator_session_tag, which needs a
         # real server (it pins a provider connection and reads the session's own monitoring ids).
         : "${MIN_SUITES:=44}"
-        : "${MIN_ASSERTIONS:=1413}"
+        # 1424 since 2026-08-01: verify_exec_invalidate_cache 10 -> 21, for the OUT-OF-BAND DROP path — the
+        # catalog's self-heal, documented in CLAUDE.md and until now covered by NOTHING. The service tier ran
+        # 44/44 green while that path was broken, which is why the section exists. It must run with
+        # mssql_exec_invalidate_cache OFF: with the auto-invalidate ON (as the rest of that suite needs) the
+        # DROP refreshes the whole cache and the name leaves the discovered list, so the lookup answers
+        # "does not exist" WITHOUT ever fetching columns — the section then passes with the provider's
+        # absence detection disabled, which is exactly what mutation-testing caught it doing.
+        : "${MIN_ASSERTIONS:=1424}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

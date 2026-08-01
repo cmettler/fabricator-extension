@@ -41,3 +41,65 @@ SELECT fabricator_exec('db', 'DROP TABLE dbo.exec_invalidate_test');
 
 statement ok
 DETACH db;
+
+# ============================================================================
+# OUT-OF-BAND DROP: the discovered name is stale, and the host must say
+# "does not exist" — not surface the provider's raw error.
+#
+# This path had NO coverage. The catalog materializes an entry by fetching the
+# table's columns, and a failure there is how it learns the table is gone: it
+# drops the entry AND the name so CREATE TABLE IF NOT EXISTS / OR REPLACE see
+# "absent". That inference used to be drawn from ANY failure, which erased a
+# table that merely could not be READ — and nothing failed when the behaviour
+# was narrowed to established absence, because nothing tested it.
+#
+# The table must be dropped AFTER the ATTACH that discovered it and BEFORE it is
+# ever read, so the entry is un-materialized: that is the only state in which
+# this path runs. A table already read in the session is cached and the scan
+# fails with the provider's error instead — a different, documented behaviour.
+# ============================================================================
+
+# ⚠ The auto-invalidate setting is ON above, and it MASKS this path completely: it makes the DROP below
+# refresh the whole cache, so the name leaves the discovered list and the lookup answers "does not exist"
+# without ever fetching columns. Mutation-testing caught that — with the provider's absence detection
+# DISABLED the section still passed, because it was measuring invalidation instead. Off for this section.
+statement ok
+SET mssql_exec_invalidate_cache = false;
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS oob (TYPE fabricator);
+
+statement ok
+CREATE OR REPLACE TABLE oob.dbo.oob_stale (id INTEGER);
+
+statement ok
+DETACH oob;
+
+# Fresh attach: discovery lists oob_stale, nothing is materialized yet.
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS oob (TYPE fabricator);
+
+statement ok
+SELECT fabricator_exec('oob', 'DROP TABLE dbo.oob_stale');
+
+# A clean catalog error naming the table — NOT "208: Invalid object name", which
+# is what a caller sees if the provider stops establishing absence.
+statement error
+SELECT count(*) FROM oob.dbo.oob_stale;
+----
+does not exist
+
+# ...and because it reads as absent, this creates rather than erroring.
+statement ok
+CREATE TABLE IF NOT EXISTS oob.dbo.oob_stale (id INTEGER);
+
+query I
+SELECT count(*) FROM oob.dbo.oob_stale;
+----
+0
+
+statement ok
+SELECT fabricator_exec('oob', 'DROP TABLE dbo.oob_stale');
+
+statement ok
+DETACH oob;
