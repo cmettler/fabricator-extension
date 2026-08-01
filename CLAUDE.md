@@ -502,6 +502,22 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     WriteSerializable-ONLY relaxation**, so under the new default concurrent disjoint-row DML on one file
     CONFLICTS where it used to compose. Three suites caught it the moment the default moved. Users who rely
     on that must attach `isolation_level 'write_serializable'` (one option, old behaviour).
+  - **The ATTACH option is now the FALLBACK EVERYWHERE — it was not.** "Table property wins, catalog default
+    applies only when the table is silent" held in the buffered path (`PendingSerializable`) but NOT in the
+    autocommit rowid DELETE, which read the catalog flag directly. So `delta.isolationLevel = Serializable`
+    + ATTACH `write_serializable` behaved INCONSISTENTLY on ONE table: strict inside BEGIN..COMMIT,
+    row-level-relaxed for a bare DELETE. Both now route through one `EffectiveSerializable`. The old defence
+    ("a single autocommit statement has no cross-statement reads to serialize, so it is only a resilience
+    knob") is true about the SEMANTICS and beside the point about the CONTRACT — a table that has DECLARED
+    Serializable must not be weakened by a local option.
+    - **NOT TEST-COVERED, which is why it survived:** `rowLevelRetry` only bites when that statement's own
+      commit races, and sqllogictest runs connections SEQUENTIALLY — a bare autocommit DELETE has no window
+      between its scan and its commit. Every row-level scenario drives the BUFFERED path instead. Exercising
+      it needs separate processes (`scratchpad/iso_race.sh`); the suite carries a note saying so rather than
+      pretending coverage.
+    - En route: `ExecuteDelete` now reads the table config ONCE and derives both `enableDeletionVectors` and
+      the isolation level (each helper opens the table separately, so adding the isolation read naively would
+      have cost a SECOND `_delta_log` LIST per DELETE on OneLake/S3).
   - **The automatic create-time stamp is GONE (not inverted — removed).** A CREATE used to bake the
     catalog's ATTACH level into the table. That conflates a per-catalog BEHAVIOUR knob with a durable
     per-table DECLARATION, and since the property WINS over any catalog, the stamp made an attach-time

@@ -334,21 +334,35 @@ public sealed class DeltaCatalog : IBackendCatalog
     // — where it matters — is honored per-table below).
     private readonly bool _serializable;
 
-    // The effective isolation for this transaction, read once and cached on the buffer (isolation is stable
-    // within a transaction): the TABLE's delta.isolationLevel property WINS; when the table doesn't declare
-    // one, the catalog's ATTACH isolation_level DEFAULT applies (backward-compatible — a property-less table
-    // follows the catalog default, and setting the property [fabricator_delta_set_tblproperties] makes the
-    // guarantee uniform across all writers). Used by the flush's OCC check + row-level relaxation.
+    /// <summary>
+    /// The effective isolation for <paramref name="path"/>: the TABLE's <c>delta.isolationLevel</c> property
+    /// WINS, and the catalog's ATTACH <c>isolation_level</c> is the DEFAULT used only when the table declares
+    /// nothing.
+    /// </summary>
+    /// <remarks>
+    /// That precedence is the whole point of Delta making isolation a TABLE property: the guarantee has to
+    /// hold whoever attaches the table and with whatever options, or it is worthless as a cross-engine
+    /// contract. This is the ONE place the rule is expressed — every isolation decision goes through here, so
+    /// there is no path on which an attach-time flag can outrank a table's declaration.
+    /// </remarks>
+    private bool EffectiveSerializable(string path)
+        => EffectiveSerializable(DeltaReader.GetTableProperties(Opener(), path));
+
+    /// <summary>As above, against an already-read configuration (one table open serving several properties).</summary>
+    private bool EffectiveSerializable(IReadOnlyDictionary<string, string> config)
+        => config.TryGetValue("delta.isolationLevel", out var lvl)
+            ? lvl.Replace("_", "").Equals("serializable", System.StringComparison.OrdinalIgnoreCase)
+            : _serializable; // property absent => the catalog's ATTACH isolation_level default
+
+    // As EffectiveSerializable, read once and cached on the buffer (isolation is stable within a
+    // transaction). Used by the flush's OCC check + row-level relaxation.
     private bool PendingSerializable(DeltaTxnBuffer.PendingAppends pending, string path)
     {
         if (pending.Serializable is { } cached)
         {
             return cached;
         }
-        var cfg = DeltaReader.GetTableProperties(Opener(), path);
-        bool ser = cfg.TryGetValue("delta.isolationLevel", out var lvl)
-            ? lvl.Replace("_", "").Equals("serializable", System.StringComparison.OrdinalIgnoreCase)
-            : _serializable; // property absent => the catalog's ATTACH isolation_level default
+        bool ser = EffectiveSerializable(path);
         pending.Serializable = ser;
         return ser;
     }
@@ -3642,14 +3656,28 @@ public sealed class DeltaCatalog : IBackendCatalog
         // copy-on-write. (Honors external DV tables regardless of this catalog's create-time flag.)
         // DV-mode delete writes no data file (just a new DV + remove/add) → native writer N/A; copy-on-write
         // rewrite honors native_write (DuckDB writes the survivor file).
-        bool dvMode = DeltaReader.IsDeletionVectorsEnabled(opener, path);
+        // ONE table open serving both properties. Reading them separately would open the table twice — on
+        // OneLake/S3 that is a second _delta_log LIST per DELETE, and adding the isolation read below is what
+        // made the difference visible.
+        var tableConfig = DeltaReader.GetTableProperties(opener, path);
+        bool dvMode = DeltaReader.IsDeletionVectorsEnabled(tableConfig);
         _log.LogInformation("delta delete {Schema}.{Table}: rows={Rows} mode={Mode} native_write={Native}",
             schemaName, tableName, ids.Count, dvMode ? "deletion-vector" : "copy-on-write",
             !dvMode && _nativeWrite);
         // rowLevelRetry: Databricks-style ROW-LEVEL CONCURRENCY (write_serializable only) — a concurrent
         // DV swap of the same file re-unions instead of conflicting when the touched rows are disjoint.
+        //
+        // Reads the TABLE's level (EffectiveSerializable), not the catalog flag. It used to read the catalog
+        // flag directly, which made this the ONE path where an attach-time option outranked a table's own
+        // declaration: `delta.isolationLevel = Serializable` + ATTACH write_serializable meant an explicit
+        // transaction was strict while a bare autocommit DELETE on the SAME table quietly took the row-level
+        // relaxation. The old justification — that a single autocommit statement has no cross-statement reads
+        // to serialize, so this is "only a resilience knob" — is true about the isolation semantics and beside
+        // the point about the contract: once a table has DECLARED Serializable, no local option should weaken
+        // it. Costs one property read per autocommit DELETE, on the DV path only.
         return dvMode
-            ? DeltaReader.DeleteByRowIdsViaVectors(opener, path, ids, default, rowLevelRetry: !_serializable)
+            ? DeltaReader.DeleteByRowIdsViaVectors(opener, path, ids, default,
+                                                   rowLevelRetry: !EffectiveSerializable(tableConfig))
             : DeltaReader.DeleteByRowIds(opener, path, ids, default, _nativeWrite, _nativeRead);
     }
 

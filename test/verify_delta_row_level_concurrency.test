@@ -326,3 +326,17 @@ SELECT count(*) FROM rs.main.t WHERE id = 1;
 
 statement ok
 DETACH rs;
+
+
+# ---- NOT COVERED HERE, deliberately: the AUTOCOMMIT path's row-level retry ----
+# `DeltaCatalog.ExecuteDelete` passes rowLevelRetry to the DV delete, and that flag only changes behaviour
+# when THAT statement's own commit hits a concurrent DV change. sqllogictest runs con1/con2 SEQUENTIALLY, so
+# a bare autocommit DELETE here can never race — there is no window between its scan and its commit for
+# another connection to act in. Every scenario above therefore drives the BUFFERED path (con1 BEGIN pins a
+# snapshot, con2 commits, con1's flush sees the change), which is a different code path.
+#
+# This is why nothing caught that the autocommit path read the CATALOG flag while the buffered path read the
+# TABLE property — the combination `delta.isolationLevel = Serializable` + ATTACH write_serializable was
+# strict inside BEGIN..COMMIT and relaxed for a bare DELETE on the same table. Both now route through
+# EffectiveSerializable (2026-08-01), but the fix is covered by REVIEW, not by this suite: exercising it
+# needs true concurrency (scratchpad/iso_race.sh's separate processes), not two connections in one process.

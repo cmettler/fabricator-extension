@@ -772,6 +772,15 @@ internal static class DeltaReader
     public static bool IsDeletionVectorsEnabled(nint opener, string path)
         => IsDeletionVectorsEnabledAsync(opener, path).GetAwaiter().GetResult();
 
+    /// <summary>
+    /// The same decision against an ALREADY-READ configuration, so a caller that needs several properties
+    /// pays for ONE table open instead of one per property (each of these helpers otherwise opens the table,
+    /// which on OneLake/S3 is a <c>_delta_log</c> LIST). The parse stays here, in one place.
+    /// </summary>
+    public static bool IsDeletionVectorsEnabled(IReadOnlyDictionary<string, string> config)
+        => config.TryGetValue("delta.enableDeletionVectors", out var v)
+           && string.Equals(v, "true", System.StringComparison.OrdinalIgnoreCase);
+
     private static async Task<bool> IsDeletionVectorsEnabledAsync(nint opener, string path)
     {
         var fs = TableFileSystems.Create(opener, path);

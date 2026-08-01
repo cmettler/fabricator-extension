@@ -671,6 +671,31 @@ that the explicit `WITH` still lands in commit-0. It has to pin the default dire
 other isolation assertion in the tree now states its level explicitly — otherwise a regression in the
 default would fail nothing.
 
+**3. The ATTACH option is now the fallback EVERYWHERE — it was not.** The precedence "table property
+wins, catalog is the default when the table is silent" held in the buffered/explicit-transaction path
+(`PendingSerializable`) but **not** in the autocommit rowid DELETE, which read the catalog flag
+directly. So `delta.isolationLevel = Serializable` + `ATTACH … isolation_level 'write_serializable'`
+behaved *inconsistently on one table*: strict inside `BEGIN..COMMIT`, row-level-relaxed for a bare
+`DELETE`. Both now route through one `EffectiveSerializable`, so no attach-time option can outrank a
+table's own declaration.
+
+The old defence was that a single autocommit statement has no cross-statement reads to serialize, so
+the flag is "only a resilience knob". That is true about the isolation *semantics* and beside the point
+about the *contract*: once a table declares Serializable, a local option must not weaken it.
+
+**Not covered by a test, and that is why it survived.** `rowLevelRetry` only changes behaviour when
+that statement's own commit hits a concurrent DV change, and sqllogittest runs connections
+**sequentially** — a bare autocommit DELETE has no window between its scan and its commit for another
+connection to act in. Every scenario in `verify_delta_row_level_concurrency` therefore drives the
+*buffered* path (con1 `BEGIN` pins, con2 commits, con1's flush sees it). Exercising the autocommit path
+needs true concurrency, i.e. separate processes (`scratchpad/iso_race.sh`), so the fix rests on review;
+the suite carries a note saying so rather than pretending coverage.
+
+While fixing it: `ExecuteDelete` now reads the table configuration **once** and derives both
+`enableDeletionVectors` and the isolation level from it. Each helper otherwise opens the table
+separately, so naively adding the isolation read would have cost a second `_delta_log` LIST per DELETE
+on OneLake/S3 — this is one open where there were already going to be two.
+
 ### 10.7 Cross-TABLE atomicity — CAVEAT ON OUR SIDE
 
 ```sql
