@@ -1624,3 +1624,38 @@ To be explicit, because it was asked: **EW has NOT lost WriteSerializable suppor
 `StartTransaction`'s default is still `IsolationLevel.WriteSerializable`, and `ConflictChecker` still
 implements the relaxation (`examineAdds = isolation == Serializable || !concurrentIsBlindAppend`). What
 is missing is the interop plumbing in item 2, not the semantics.
+
+### 4. Upstream PR #24 — TEST-ONLY (does not break us), but it changes the plan's risk
+
+`test(delta): "what does Spark do at WriteSerializable" has no answer — the level is not in OSS Delta`,
+merged upstream 2026-07-31. Adds `ConflictSemanticsInteropTests`; **no public API change, so the pin
+bump is unaffected and nothing of ours breaks.**
+
+Upstream independently reached our DDL finding (`requirement failed: delta.isolationLevel must be
+Serializable`) and concluded the question is unanswerable for OSS Delta. **Our measurement goes
+further and contradicts that framing** — the level cannot be SET from Spark, but a table can still
+CARRY it if another engine stamps it (we do), and Fabric Spark then reads it, commits at it, and
+records it in its own `commitInfo`. So the question is answerable, and §10.6 of
+[delta-transactions.md](delta-transactions.md) answers it. That is worth offering upstream alongside
+the `_last_checkpoint` fix.
+
+**⚠ The caveat that must be checked BEFORE building the isBlindAppend write half.** Upstream's tests
+report that *a whole-table read declaration conflicts even with a blind append that removes nothing*.
+If that holds in Delta 4.2.0, then a Spark statement whose predicate is non-prunable (exactly our
+`DELETE … WHERE id % 7 = 3`, and the common case) declares a whole-table read and will abort against a
+concurrent append **whether or not it is marked blind** — i.e. emitting `isBlindAppend` would NOT stop
+the aborts we measured, because the exemption is dodged by a different check
+(`checkForDeletedFilesAgainstCurrentTxnReadFiles` / the read-declaration path) rather than
+`checkForAddedFilesThatShouldHaveBeenReadByCurrentTxn`.
+
+This is READ FROM A SUMMARY OF UPSTREAM'S TESTS, NOT VERIFIED — do not act on it either way. The cheap
+check is to re-run `sparkprobe conflict WriteSerializable` with a PRUNABLE predicate (e.g.
+`WHERE id = <literal>`, which declares a narrow read) and see whether Spark still aborts against our
+append. If a narrow read commits and a whole-table read aborts, the exemption is real and the write
+half is worth building; if both abort, the write half buys nothing against Spark and only the READING
+half (§2, the unsafe direction) is worth doing.
+
+**Recommended order, updated:** (1) offer the `_last_checkpoint` fix upstream — independent of all of
+this; (2) fix the READING half (consume the flag when present) — it closes the unsafe direction and its
+value does not depend on the caveat; (3) run the prunable-predicate check above; (4) build the WRITING
+half only if (3) says it pays.
