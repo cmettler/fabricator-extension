@@ -503,8 +503,76 @@ sites tractable.
 2. **Do not entangle this with unrelated work.** The Fabric-API commits sitting unpushed when this was
    measured have nothing to do with EW; a bump this size wants its own branch and its own sweep.
 
+### FIRST ATTEMPT — started 2026-08-01, merge ABORTED deliberately; five findings that change the plan
+
+Branches exist and are the designated place to resume: **`bump/upstream-2026-08`** (EW, off
+`fabricator-patches` at `cbe5bb6`) and **`bump/ew-upstream-2026-08`** (parent, off `v1.5-variegata`).
+Both are EMPTY of commits — the merge was aborted once its true size was measured, because a
+half-resolved merge sitting in a submodule across a session boundary is the state most likely to be
+lost or half-repeated. Re-running `git merge upstream/master` reproduces the identical 4 conflicts;
+what was expensive was the DECISIONS below, not the mechanics.
+
+**1. The measurement UNDERCOUNTED: there is a second migration, roughly as large as the 24 call sites.**
+Upstream's `RowSelection` (slice 2, #18) is the successor to our `FileRowSelection`, and
+`FileRowSelection` is **GONE upstream** (`git grep` on `upstream/master` returns nothing). Ours is used
+at **38 sites in EW `src/`, 5 in EW tests, and 5 in the Bridge** — none of which the original table
+lists, because that table only counted removed `DeltaTable` METHODS. Budget for ~48 more edit sites.
+Upstream's type is a strict superset in capability (`ByPath` / `FromLocatorColumns` /
+`FromRowAddresses` / `Paths` / `PositionsFor`), so this is a rename-and-widen, not a redesign.
+
+**2. Upstream EXPLICITLY DECLINED our row-level read exemption, and said what it would take.** This is
+the one place where taking upstream wholesale silently REVERTS shipped behaviour of ours, so it is the
+hunk to be most careful with. `DeclareWholeTableRead`'s own remark upstream reads: *"It is NOT
+implemented here: today the declaration is honoured at both levels … if it is ever adopted it should be
+an explicit per-transaction opt-in rather than an inference — a library must not claim on a host's
+behalf that it read less than it declared."* Our branch DOES implement it, as an inference, in the
+commit loop (`effectiveReads = rowLevel && isolation != Serializable ? reads with { WholeTable = false }
+: reads`), and `verify_delta_row_level_concurrency` (70) depends on it. **Decision for this bump: KEEP
+our behaviour and CORRECT upstream's doc on our branch** — adopting the opt-in is a semantic redesign
+and mixing it into a 36-hunk API migration is exactly the entanglement trap recorded above. Adopting it
+afterwards is the natural next upstream offer, and it is what Curt has already said he wants.
+
+**3. Hunk-wise resolution is REQUIRED, not a matter of taste.** A plain `git checkout --theirs` on
+`DeltaTransaction.cs` looks equivalent and is not: it discards our changes that auto-merged OUTSIDE the
+conflict regions. Verified by resolving hunk-wise, then diffing against the `--theirs` content — they
+differ, and the difference was real code of ours. Resolve with:
+`awk '/^<<<<<<< HEAD/{s=1;next} /^=======$/{if(s==1){s=2;next}} /^>>>>>>> upstream\/master/{s=0;next} s!=1{print}'`
+
+**4. Dropping the shredding patch is CONFIRMED safe, by measurement rather than by the commit subject.**
+Upstream did not delete the file, it MOVED it (`Parquet/Data/VariantShredding.cs` →
+`Parquet/VariantShredding.cs`, namespace `EngineeredWood.Parquet.Data` → `EngineeredWood.Parquet`) and
+its surface is a superset of ours (adds `InferSchema`/`Shred`). For the add/add test conflict, upstream
+has **11** tests to our **7** and **every one of our test names is present upstream** (`comm -23` on the
+method names returns empty) — so `--theirs` loses no coverage. Our `VariantTransport.cs` calls
+`VariantShredding.TryShred`/`.Reassemble` and will need the namespace updated.
+
+**5. `StageActions`' extra `operation` parameter is ours and UNUSED** — the Bridge's single call site
+(`DeltaCatalog.cs:3459`) passes one argument — so upstream's narrower `StageActions(actions)` can be
+taken without a shim.
+
+Everything else matched the measurement exactly: 8 commits, 4 conflicts, 30 hunks in `DeltaTable.cs`,
+6 in `DeltaTransaction.cs`, and the hunks are the predicted overload consolidation
+(`Delete*`/`Update*`/`Read*` families → `DeleteRowsAsync`/`UpdateRowsAsync`/`ReadCoreAsync`).
+
 ### Suggested order when it is taken
 
+**Updated after the first attempt** — the ordering below still holds, with the `FileRowSelection` →
+`RowSelection` migration inserted BEFORE the Bridge call sites (the Bridge sites consume the type, so
+doing it the other way means touching them twice), and EW building + its own suites passing as a
+committable checkpoint before the Bridge is touched at all:
+
+1. Merge `upstream/master` into `bump/upstream-2026-08`; take the shredding delete and upstream's test
+   file (finding 4); resolve `DeltaTransaction.cs` and `DeltaTable.cs` hunk-wise (finding 3), taking
+   upstream on every hunk EXCEPT preserving the row-level exemption (finding 2).
+2. Delete our `FileRowSelection` type and its duplicate `StageRowDeletesAsync` overload; migrate the
+   38 EW `src/` + 5 EW test sites to `RowSelection` (finding 1).
+3. Correct upstream's `DeclareWholeTableRead` remark on our branch so it describes what we actually do.
+4. **Checkpoint: EW builds and EW's own suites pass on net472 + net8.0 — commit the merge here.**
+   The Bridge is still broken at this point and that is fine; EW compiles standalone.
+5. Migrate the 24 Bridge call sites + its 5 `FileRowSelection` uses → resolve `WriteChangeDataFilesAsync`
+   → full `verify_delta_*` sweep → hermetic tier → fast-forward `fabricator-patches`, re-pin the parent.
+
+Original wording, kept because the dependency reasoning in it is still the right one:
 Drop the superseded shredding patch → merge `upstream/master` into `fabricator-patches` → migrate the 24
 Bridge call sites (Delete/Update first: they share `RowSelection`, which slice 2 introduced and slice 5
 consumes) → resolve `WriteChangeDataFilesAsync` → full `verify_delta_*` sweep. Then the standing rules from
