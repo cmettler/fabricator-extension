@@ -107,8 +107,14 @@ case "$TIER" in
         # other isolation assertion in the tree now states its level explicitly, so without this a regression
         # in the default would fail nothing — plus that neither level auto-stamps and that an explicit
         # WITH ("delta.isolationLevel"=...) still does.
+        # 5639 since 2026-08-01: verify_delta_row_level_concurrency 82 -> 93 (§11). The EW bump made
+        # DeltaTransaction's whole-table-read exemption an explicit opt-in
+        # (ExemptRowLevelFromWholeTableRead) instead of unconditional behaviour, and NOTHING failed when it
+        # was left unset — §11 is the section that fails. It drives a non-pushable DELETE (so the scan
+        # declares the whole table) against a concurrent DELETE of a DIFFERENT row of a DIFFERENT file: with
+        # the opt-in they compose, without it the declaration meets the concurrent commit and aborts.
         : "${MIN_SUITES:=63}"
-        : "${MIN_ASSERTIONS:=5623}"
+        : "${MIN_ASSERTIONS:=5639}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

@@ -695,7 +695,11 @@ internal static class DeltaReader
         try
         {
             var nested = NestedMappedSchema(table.CurrentSnapshot);
-            await foreach (var raw in table.ReadAllWithRowIdsAsync(columns, filter, token).ConfigureAwait(false))
+            await foreach (var raw in table.ReadAsync(
+                new DeltaReadOptions
+                {
+                    Columns = columns, Filter = filter, Metadata = DeltaRowMetadata.RowAddress,
+                }, token).ConfigureAwait(false))
             {
                 var batch = RenameRowAddressToDuckDbRowId(raw);
                 yield return nested is null
@@ -741,8 +745,9 @@ internal static class DeltaReader
             .ConfigureAwait(false);
         try
         {
-            long deleted = (await table.DeleteBySelectionAsync(
-                    SelectionFromRowIds(table, table.CurrentSnapshot, rowIds, "copy-on-write DELETE"), token)
+            long deleted = (await table.DeleteRowsAsync(
+                    SelectionFromRowIds(table, table.CurrentSnapshot, rowIds, "copy-on-write DELETE"),
+                    RowDeleteMode.CopyOnWrite, cancellationToken: token)
                 .ConfigureAwait(false)).RowsDeleted;
             DmlLog.LogInformation("delta delete-rewrite {Path}: deleted={Deleted} writer={Writer}",
                 path, deleted, writer is null ? "engineered-wood" : "native-duckdb");
@@ -934,8 +939,16 @@ internal static class DeltaReader
         // NOTE (EW master): the yielded batches carry USER columns only — the rowid correlation key rides
         // the rowIdsOut out-param (one row-aligned long[] per batch), not a trailing column — a plain
         // value array, so the caller manages no Arrow buffer lifetime.
-        await foreach (var batch in table.ReadRowsByRowIdsAsync(rowIds, atVersion, sourceTrackingOut,
-                                                                token, rowIdsOut)
+        // The rowids' ordinals are path-sort positions in the snapshot they were SCANNED against (a buffered
+        // transaction's pinned version), so resolve there — against a moved CurrentSnapshot a concurrent
+        // commuting append shifts the ordering and the ordinals name the wrong files.
+        var snapshot = atVersion is { } v && v != table.CurrentSnapshot.Version
+            ? await table.GetSnapshotAtVersionAsync(v, token).ConfigureAwait(false)
+            : table.CurrentSnapshot;
+        await foreach (var batch in table.ReadRowsAsync(
+                           SelectionFromRowIds(table, snapshot, rowIds, "row read-back",
+                                               skipUnresolvable: true),
+                           sourceTrackingOut, token, snapshot, rowIdsOut)
                            .ConfigureAwait(false))
         {
             yield return batch;
@@ -976,9 +989,9 @@ internal static class DeltaReader
         var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(), token).ConfigureAwait(false);
         try
         {
-            return (await table.DeleteBySelectionViaVectorsAsync(
+            return (await table.DeleteRowsAsync(
                     SelectionFromRowIds(table, table.CurrentSnapshot, rowIds, "deletion-vector DELETE"),
-                    token, rowLevelRetry: rowLevelRetry)
+                    RowDeleteMode.DeletionVector, rowLevelRetry, token)
                 .ConfigureAwait(false)).RowsDeleted;
         }
         catch (DeltaConflictException ex)
@@ -1158,7 +1171,9 @@ internal static class DeltaReader
             // (CdfReader's rename is top-level) — apply the recursive rename; the CDF metadata columns
             // (_change_type/...) are not table columns and pass through untouched.
             var nested = NestedMappedSchema(table.CurrentSnapshot);
-            await foreach (var batch in table.ReadChangesAsync(fromVersion, end, ct).ConfigureAwait(false))
+            await foreach (var batch in table.ReadChangesAsync(
+                new DeltaChangeReadOptions { StartVersion = fromVersion, EndVersion = end }, ct)
+                .ConfigureAwait(false))
             {
                 yield return nested is null
                     ? batch
@@ -1240,8 +1255,12 @@ internal static class DeltaReader
         {
             var snap = await ResolveSnapshotAsync(table, unit, value, token).ConfigureAwait(false);
             var nested = NestedMappedSchema(snap); // the AS-OF snapshot names the columns
-            await foreach (var raw in table.ReadAtVersionWithRowIdsAsync(snap.Version, columns, filter, token)
-                               .ConfigureAwait(false))
+            await foreach (var raw in table.ReadAsync(
+                new DeltaReadOptions
+                {
+                    AtVersion = snap.Version, Columns = columns, Filter = filter,
+                    Metadata = DeltaRowMetadata.RowAddress,
+                }, token).ConfigureAwait(false))
             {
                 var batch = RenameRowAddressToDuckDbRowId(raw);
                 yield return nested is null
@@ -2107,7 +2126,7 @@ internal static class DeltaReader
                 // we re-key the updates batch onto engineered-wood's `_metadata` struct, so nothing of ours
                 // depends on its rowid UPDATE surface. The packing stays where it belongs — on the DuckDB side
                 // of this method, because DuckDB's own rowid is a single BIGINT.
-                await table.UpdateBySelectionAsync(
+                await table.UpdateRowsAsync(
                         ReKeyUpdatesOntoMetadata(table, updates), cancellationToken: token)
                     .ConfigureAwait(false);
             }
@@ -2187,10 +2206,10 @@ internal static class DeltaReader
             if (c == ridIdx)
             {
                 fields.Add(new Field(
-                    DeltaTable.MetadataFilePathColumn, Apache.Arrow.Types.StringType.Default, false));
+                    RowSelection.DefaultMetadataPrefix + RowSelection.FilePathColumnSuffix, Apache.Arrow.Types.StringType.Default, false));
                 arrays.Add(pathB.Build());
                 fields.Add(new Field(
-                    DeltaTable.MetadataRowIndexColumn, Apache.Arrow.Types.Int64Type.Default, false));
+                    RowSelection.DefaultMetadataPrefix + RowSelection.RowIndexColumnSuffix, Apache.Arrow.Types.Int64Type.Default, false));
                 arrays.Add(idxB.Build());
             }
             else
@@ -2212,9 +2231,14 @@ internal static class DeltaReader
     /// An ordinal that names no active file is a LOUD error — engineered-wood's ordinal-keyed forms would
     /// merely skip it, which is indistinguishable from a file with nothing to change.
     /// </summary>
-    private static FileRowSelection SelectionFromRowIds(
+    /// <param name="skipUnresolvable">Drop an ordinal that names no active file instead of reporting it.
+    /// ONLY for the read-back of committed row CONTENT, whose caller may legitimately pass rows of THIS
+    /// transaction's own pending files — those are in no committed snapshot by construction, and the caller
+    /// rejects or reroutes them itself right after. Every DML path leaves this false: there an unresolvable
+    /// ordinal means a delete or update silently going missing.</param>
+    private static RowSelection SelectionFromRowIds(
         DeltaTable table, EngineeredWood.DeltaLake.Snapshot.Snapshot snapshot,
-        IReadOnlyCollection<long> rowIds, string op)
+        IReadOnlyCollection<long> rowIds, string op, bool skipUnresolvable = false)
     {
         long posMask = (1L << TransientRowAddress.PositionBits) - 1;
         var pathByOrdinal = new Dictionary<int, string>(snapshot.ActiveFiles.Count);
@@ -2228,6 +2252,10 @@ internal static class DeltaReader
             int ordinal = (int)(TransientRowAddress.FileOrdinal(rid));
             if (!pathByOrdinal.TryGetValue(ordinal, out var filePath))
             {
+                if (skipUnresolvable)
+                {
+                    continue;
+                }
                 throw new System.InvalidOperationException(
                     $"{op}: row-id file ordinal {ordinal} does not name an active file of version "
                     + $"{snapshot.Version} ({pathByOrdinal.Count} active) — the row identifiers were captured "
@@ -2239,7 +2267,7 @@ internal static class DeltaReader
             }
             ((HashSet<long>)set).Add(rid & posMask);
         }
-        return new FileRowSelection(byFile);
+        return RowSelection.ByPath(byFile);
     }
 
     /// <summary>
@@ -2324,7 +2352,7 @@ internal static class DeltaReader
         }
 
         await table.UpdateBySelectionViaVectorsAsync(
-                new EngineeredWood.DeltaLake.Table.FileRowSelection(selection),
+                EngineeredWood.DeltaLake.Table.RowSelection.ByPath(selection),
                 (filePath, matched, positions) =>
                 {
                     // Row-aligned index into `updates` for each matched row, keyed by its identity rather
