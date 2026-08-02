@@ -120,6 +120,16 @@ public sealed class SqlServerBackend : IBackend
     public string BuildConnectionString(string secretType, IReadOnlyDictionary<string, string> fields,
                                         string baseConnString)
     {
+        // The Fabric REST credential rides a trailing marker, appended LAST because the access-token marker is
+        // defined as "everything after it is the token" — so this one is stripped FIRST in the catalog ctor.
+        // See SqlServerFabricCredential for why only a renewable principal is carried.
+        return SqlServerFabricCredential.Append(
+            BuildProviderConnectionString(secretType, fields, baseConnString), secretType, fields);
+    }
+
+    private string BuildProviderConnectionString(string secretType, IReadOnlyDictionary<string, string> fields,
+                                                 string baseConnString)
+    {
         // Dispatch by the DuckDB secret type the fields came from. Our own secret is a full connstr; a foreign
         // azure secret supplies only Entra auth, merged onto the ATTACH target. See docs/provider-extensibility.md §2.
         if (string.IsNullOrEmpty(secretType) || secretType.Equals("mssql", StringComparison.OrdinalIgnoreCase))
@@ -378,19 +388,102 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // parallel copy of the same dispatch in every other provider; the set is the shared half, and what stays
     // below it is only the part that IS SqlServer-specific — falling back to a DISCOVERED routine when a name is
     // not a custom function. Kinds: scalar, table, table_sql, inout, collector, aggregate(_spill).
+    // This is the ATTACH-INDEPENDENT half; lookups go through the per-catalog `Functions` property below, which
+    // is this set on a plain SQL Server and this set plus the fabric_* functions on a Fabric attach.
     private static readonly CatalogFunctionSet CustomFunctionSet = new(
         CustomFunctions.Scalar, CustomFunctions.Table, CustomFunctions.SqlTable, CustomFunctions.InOut,
         CustomFunctions.Collector, CustomFunctions.Aggregate);
 
-    // The set expands a CatalogFunctionSet.AllSchemas ("__all__") declaration across a catalog's discovered
-    // schemas. This provider's declarations name real schemas (dbo, …) and its discovery stream is built as
-    // T-SQL with no catalog instance in scope, so there is nothing to expand against — say so loudly rather
-    // than silently dropping such a function, which is the failure mode an empty list would produce.
-    private static IReadOnlyList<string> NoSchemaExpansion() =>
-        throw new NotSupportedException(
-            "fabricator: a SQL Server catalog function must declare a concrete SchemaName; the "
-            + "CatalogFunctionSet.AllSchemas sentinel is only supported by providers whose schemas are "
-            + "discovered at attach (Delta, DAX).");
+    /// <summary>
+    /// This catalog's catalog-bound custom functions: the static <see cref="CustomFunctionSet"/> on a plain
+    /// SQL Server, and that set PLUS the Fabric REST <c>fabric_*</c> functions when the attach targets Fabric.
+    /// Per catalog (not static) because the Fabric functions capture attach context — the workspace/item
+    /// defaults and the REST credential — exactly as they do on a OneLake Delta attach.
+    /// </summary>
+    /// <remarks>
+    /// Lazy, so an attach that never touches a function pays nothing; and the gate below reads only the
+    /// connection STRING, so nothing here costs a round trip at ATTACH.
+    /// </remarks>
+    private CatalogFunctionSet Functions => _functions ??= BuildFunctionSet();
+    private CatalogFunctionSet? _functions;
+
+    private CatalogFunctionSet BuildFunctionSet()
+    {
+        if (!IsFabricEndpoint(_baseConnectionString))
+        {
+            return CustomFunctionSet;
+        }
+        var scalars = new List<ICatalogScalarFunction>(CustomFunctions.Scalar);
+        var tables = new List<ICatalogTableFunction>(CustomFunctions.Table);
+        FabricApiFunctions.Register(
+            scalars, tables,
+            _fabricWorkspace.Length > 0 ? _fabricWorkspace : null,
+            _fabricItem.Length > 0 ? _fabricItem : null,
+            _fabricCredFields is null ? null : FabricCredentialResolver.Resolve(_fabricCredFields));
+        return new CatalogFunctionSet(scalars, tables, CustomFunctions.SqlTable, CustomFunctions.InOut,
+                                      CustomFunctions.Collector, CustomFunctions.Aggregate);
+    }
+
+    /// <summary>
+    /// Whether this connection targets <b>Fabric</b> — the gate for registering the <c>fabric_*</c> functions,
+    /// mirroring the Delta catalog's <c>IsOneLake</c> check: off Fabric they have no workspace, no item and no
+    /// REST endpoint, so advertising them would put functions in the catalog that can only fail.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ Deliberately NOT <c>ServerProfile.IsWarehouse</c>, which is the obvious-looking choice and is wrong:
+    /// <c>EngineEdition == 11</c> covers Fabric Warehouse, the Lakehouse SQL endpoint AND <b>Synapse
+    /// serverless</b>, so it would advertise Fabric functions on a Synapse attach. The host is what actually
+    /// identifies the platform. It also costs no connection — <c>IsWarehouse</c> would force profile detection
+    /// at ATTACH, turning function registration into a round trip.
+    /// </remarks>
+    internal static bool IsFabricEndpoint(string connectionString)
+    {
+        string host;
+        try
+        {
+            host = new SqlConnectionStringBuilder(connectionString).DataSource;
+        }
+        catch (Exception)
+        {
+            return false; // unparseable: SqlClient reports the real error at connect
+        }
+        // Strip a "tcp:" prefix and any ,port / \instance suffix before matching the domain.
+        int comma = host.IndexOfAny(new[] { ',', '\\' });
+        if (comma >= 0) host = host.Substring(0, comma);
+        host = host.Trim();
+        if (host.StartsWith("tcp:", StringComparison.OrdinalIgnoreCase)) host = host.Substring(4);
+        // Covers every Fabric SQL surface: <id>.datawarehouse.fabric.microsoft.com (Warehouse + Lakehouse SQL
+        // endpoint) and <id>.database.fabric.microsoft.com (Fabric SQL database). Matched on the domain SUFFIX
+        // rather than an exact middle segment so a new surface under the same domain is not silently excluded.
+        return host.EndsWith(".fabric.microsoft.com", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Expands a <see cref="CatalogFunctionSet.AllSchemas"/> ("__all__") declaration across this catalog's
+    /// schemas — the every-schema registration the <c>fabric_*</c> set uses, so <c>w.dbo.fabric_*</c> resolves
+    /// the same way it does on a Delta attach.
+    /// </summary>
+    /// <remarks>
+    /// <para>This USED to throw: the provider's own declarations all name a concrete schema, and the functions
+    /// stream is built as T-SQL with — at the time — no catalog instance in scope. Hosting the Fabric set here
+    /// gave the sentinel a real caller, so the enumeration is now implemented rather than refused.</para>
+    /// <para>Costs one extra metadata query, and ONLY when some declaration actually uses the sentinel: the
+    /// callback is invoked lazily by <c>Declarations</c> for exactly that reason, so a non-Fabric attach (whose
+    /// declarations all name a schema) never runs it. <c>schema_filter</c> is applied, so a function is not
+    /// declared in a schema the catalog does not surface.</para>
+    /// </remarks>
+    private IReadOnlyList<string> ExpandAllSchemas()
+    {
+        var names = new List<string>();
+        foreach (var row in ReadMetadataRows(SchemasSql, 1))
+        {
+            if (row[0] is { } name && (_schemaFilter is null || _schemaFilter.IsMatch(name)))
+            {
+                names.Add(name);
+            }
+        }
+        return names;
+    }
 
     private readonly string _baseConnectionString;   // user connstr (no MARS); basis for the finalized string
     private readonly string? _accessToken;
@@ -424,6 +517,16 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // connstr carries no credential AND the process runs on Fabric compute. Applied per connection open via
     // SqlConnection.AccessTokenCallback (so tokens refresh, unlike the static _accessToken).
     private readonly Fabricator.Bridge.FabricNotebookCredential? _fabricAmbientCredential;
+    // Fabric REST credential fields carried from the ATTACH secret (null ⇒ the ambient chain). Distinct from
+    // _accessToken / _fabricAmbientCredential above, which authenticate SQL: those are SQL-audience and cannot
+    // call the Fabric API. See SqlServerFabricCredential.
+    private readonly IReadOnlyDictionary<string, string>? _fabricCredFields;
+    // ATTACH options `workspace` / `item`: the Fabric workspace and item the catalog-bound fabric_* functions
+    // act on by default. A Fabric SQL connection string does not name either (its host is an opaque routing
+    // GUID), so unlike a OneLake Delta root there is nothing to derive them from — they are supplied, or the
+    // functions' `workspace :=` / `item :=` named parameters become required. See docs/fabric-api-functions.md §9h.
+    private readonly string _fabricWorkspace = "";
+    private readonly string _fabricItem = "";
 
     public SqlServerCatalog(string connectionString, string optionsJson)
     {
@@ -438,6 +541,10 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         {
             connectionString = ParseMssqlUri(connectionString);
         }
+
+        // The Fabric REST credential marker is stripped FIRST: the access-token marker below claims everything
+        // after itself as the token, so the two only compose in this order (SqlServerFabricCredential).
+        (connectionString, _fabricCredFields) = SqlServerFabricCredential.Extract(connectionString);
 
         int idx = connectionString.IndexOf(AccessTokenKeyword, StringComparison.OrdinalIgnoreCase);
         string connStr;
@@ -505,6 +612,8 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                     case "add_identity":
                         _addIdentityOnCreate = string.Equals(val, "true", StringComparison.OrdinalIgnoreCase) || val == "1";
                         break;
+                    case "workspace": _fabricWorkspace = val; break;
+                    case "item": _fabricItem = val; break;
                 }
             }
         }
@@ -1791,7 +1900,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     // Discovered SQL Server routines + the provider's custom scalar/table functions, appended via
     // UNION ALL so the C++ catalog discovers + registers them uniformly (then dispatches custom ones to C#).
-    private static string FunctionsMetadataSql()
+    private string FunctionsMetadataSql()
     {
         // NOTE: no IsEmpty early-return — the bespoke session-tag row below is always appended, so the
         // UNION ALL is always needed even when no custom functions are registered.
@@ -1803,12 +1912,13 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         // One literal row per declaration, in the discovered stream's five-column shape
         // (schema_name, name, kind, param_count, return_type). The host reads the first three; the last two
         // exist because every UNION ALL branch must match the discovery query's arity.
-        // The bespoke session-tag function: always present on a SQL Server catalog, and NOT in
-        // CustomFunctionSet because it must capture the live catalog (it pins that catalog's connection),
-        // whereas the set is static. Same "match the name first" pattern the DAX provider uses for daxeval.
+        // The bespoke session-tag function: always present on a SQL Server catalog, and NOT in the function set
+        // because it must capture the live catalog (it pins that catalog's CONNECTION), which the per-catalog
+        // Functions set still does not carry — it captures ATTACH context (Fabric workspace/item/credential),
+        // not a connection. Same "match the name first" pattern the DAX provider uses for daxeval.
         sb.Append(" UNION ALL SELECT 'dbo', '").Append(Esc(SqlServerSessionTagFunction.FunctionName))
           .Append("', 'table', 2, ''");
-        foreach (var d in CustomFunctionSet.Declarations(NoSchemaExpansion))
+        foreach (var d in Functions.Declarations(ExpandAllSchemas))
         {
             sb.Append(" UNION ALL SELECT '").Append(Esc(d.SchemaName)).Append("', '").Append(Esc(d.Name))
               .Append("', '").Append(Esc(d.Kind)).Append("', ").Append(d.ParamCount).Append(", '")
@@ -2575,7 +2685,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         {
             return SessionTag.Parameters;
         }
-        var custom = CustomFunctionSet.ParamSchema(schemaName, functionName);
+        var custom = Functions.ParamSchema(schemaName, functionName);
         if (custom is not null)
         {
             return custom;
@@ -2592,7 +2702,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     /// </summary>
     public string GenerateTableSql(string schemaName, string functionName, string catalogName, RecordBatch? args)
     {
-        return CustomFunctionSet.GenerateTableSql(schemaName, functionName,
+        return Functions.GenerateTableSql(schemaName, functionName,
                                                   new SqlGenContext(catalogName, this), args)
                ?? throw new NotSupportedException(
                    $"fabricator: no SQL-generating table function '{schemaName}.{functionName}'");
@@ -2626,7 +2736,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     {
         // A pure custom scalar's field carries the CONSISTENT tag (constant folding) — see
         // ScalarFunctionMetadata; discovered SQL UDFs below never tag (remote bodies stay VOLATILE).
-        var custom = CustomFunctionSet.ReturnSchema(schemaName, functionName);
+        var custom = Functions.ReturnSchema(schemaName, functionName);
         if (custom is not null)
         {
             return custom;
@@ -2652,7 +2762,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // dispatch for ExecuteScalar (created on demand — the wrapper just holds the catalog + name). Returns the
     // base IScalarFunction — execution needs only Invoke/Parameters/Result, not the catalog SchemaName.
     private IScalarFunction ResolveScalar(string schemaName, string functionName) =>
-        CustomFunctionSet.TryScalar(schemaName, functionName, out var custom)
+        Functions.TryScalar(schemaName, functionName, out var custom)
             ? custom
             : new SqlServerScalarFunction(this, schemaName, functionName);
 
@@ -2794,7 +2904,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         {
             return SqlServerSessionTagFunction.Columns;
         }
-        var custom = CustomFunctionSet.OutputSchema(schemaName, functionName, args);
+        var custom = Functions.OutputSchema(schemaName, functionName, args);
         if (custom is not null)
         {
             return custom;
@@ -2825,7 +2935,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         {
             return new BindingBoundTable(SessionTag.Bind(args!), supportsPushdown: true);
         }
-        var custom = CustomFunctionSet.TableBind(schemaName, functionName, args);
+        var custom = Functions.TableBind(schemaName, functionName, args);
         if (custom is not null)
         {
             return custom;
@@ -2848,7 +2958,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         // registered it on the Sink+Source collector operator (kind='collector'), which feeds a NON-gated
         // buffered input stream, so its Collect reading all input before yielding (no sentinels) is safe.
         // Not a custom function ⇒ a discovered `_each`, classified as everywhere else.
-        var binding = CustomFunctionSet.InOutBind(schemaName, functionName, args, inputSchema)
+        var binding = Functions.InOutBind(schemaName, functionName, args, inputSchema)
                       ?? (FunctionOutputColumns(schemaName, functionName).Count > 0
                           ? new SqlServerTvfEach(this, schemaName, functionName, inputSchema)
                           : (IArrowInOutBinding)new SqlServerProcEach(this, schemaName, functionName, inputSchema));
@@ -2869,7 +2979,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // DuckDB-aggregate to discover), so this requires a registered aggregate in the custom function set.
     public IAggregateSession AggOpen(string schemaName, string functionName) =>
         // The session impl lives in Fabricator.Bridge (shared with connection-free global aggregates).
-        CustomFunctionSet.AggOpen(schemaName, functionName)
+        Functions.AggOpen(schemaName, functionName)
         ?? throw new ArgumentException(
             $"fabricator: '{schemaName}.{functionName}' is not a custom aggregate function");
 

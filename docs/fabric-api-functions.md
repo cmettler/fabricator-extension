@@ -382,11 +382,14 @@ Slices land independently, tests green per slice. Estimated shape, not a schedul
   Power BI REST enhanced refresh as `fabric_refresh_semantic_model` (§9f) and XMLA/TMSL as
   `dax_refresh`/`_table`/`_partition` in the DAX provider (§9g). The Job Scheduler was never a
   candidate once measured — the Fabric SDK cannot refresh a model at all.
-- **SqlServer-catalog binding** of these functions (Fabric Warehouse attaches) — needs a
-  `TokenCredential` path the mssql secret doesn't currently produce. **This is now the largest
-  remaining gap in reach**: the whole set is catalog-bound on a OneLake Delta attach, so a dbt project
-  running against a Fabric *Warehouse* over T-SQL cannot call even `fabric_refresh_sql_endpoint`. It is
-  credential plumbing, not new API surface.
+- ~~**SqlServer-catalog binding** of these functions (Fabric Warehouse attaches) — the largest remaining gap
+  in reach; credential plumbing, not new API surface~~ **DONE + live-validated 2026-08-02 (§9h).** The
+  diagnosis was half right: the credential really was just plumbing (a connstr marker, no ABI change), but the
+  actual blocker was that the function context held a OneLake *root* and parsed workspace/item out of it —
+  a Fabric SQL connection string can supply neither, so the set was structurally unreachable from any other
+  provider. Defaults now come from `workspace`/`item` ATTACH options. Building it found two shipped bugs
+  (`fabric_lakehouses`/`fabric_warehouses` throwing on every call; every hand-rolled timestamp 1000× too
+  small) — see §9h.
 - **deltars provider** hosting; **per-function plugin packaging**; everything marked skip in the
   §10 sweep (each with its recorded reason — don't re-litigate without new demand).
 - ~~**Shared function-dispatch extraction**~~ **DONE (§9g)** — `CatalogFunctionSet` covers all six
@@ -966,6 +969,10 @@ the declaration rows; SqlServer's six static dictionaries and DAX's hand-rolled 
 - **The `__all__` sentinel is rejected LOUDLY on SqlServer** (`NoSchemaExpansion` throws, naming the reason):
   its declarations name real schemas and its discovery stream is built as T-SQL with no catalog instance in
   scope, so there is nothing to expand against. An empty list would have silently dropped such a function.
+  **⚠ SUPERSEDED by §9h (2026-08-02): the sentinel is now IMPLEMENTED there** (`ExpandAllSchemas`), because
+  hosting the Fabric set on a SQL Server catalog gave it a real caller. Throwing was the right answer while
+  nothing used it; the reasoning above ("no catalog instance in scope") was a fact about the call site, and
+  it stopped being true when `FunctionsMetadataSql` became an instance method.
 - **What did NOT move into the set**: SqlServer's fallback to a DISCOVERED routine when a name is not a custom
   function, and the in-out isolation wiring (the level is provider state). Both are genuinely
   provider-specific, and each ABI member returns null for an unknown name precisely so a provider WITH
@@ -978,7 +985,106 @@ the declaration rows; SqlServer's six static dictionaries and DAX's hand-rolled 
   instead of surfacing only on a live tenant call.
 - **Gate: all ELEVEN service suites covering the six kinds green** (custom_functions 89, scalar_functions 26,
   table_functions 33, stored_procs 24, custom_aggregates 58, table_inout 63, proc_inout 31, collector 40,
-  sqlgen_catalog 30, functions 13, inout_isolation 17), plus the hermetic tier at 62 suites / 5573 assertions.
+  sqlgen_catalog 30, functions 13 — now 15, see §9h, inout_isolation 17), plus the hermetic tier at 62 suites /
+  5573 assertions (now 63 / 5656).
+
+## 9h. The SQL SERVER catalog binding — BUILT + live-validated (2026-08-02), and it found two shipped bugs
+
+§8 called this *"the largest remaining gap in reach"*, and the framing was right: the whole `fabric_*` set was
+bound to a **OneLake Delta** attach, so a dbt project running against a Fabric **Warehouse** over T-SQL could
+not call even `fabric_refresh_sql_endpoint`. It is now hosted on a Fabric SQL attach too:
+
+```sql
+ATTACH 'Server=<endpoint>.datawarehouse.fabric.microsoft.com;Database=LH' AS w
+  (TYPE fabricator, SECRET fabric_sp, WORKSPACE 'Test', ITEM 'LH');
+
+SELECT * FROM w.dbo.fabric_refresh_sql_endpoint();      -- live: 19 tables, all NotRun (= in sync)
+```
+
+**No ABI change and no C++ change at all.** `fabricator_storage.cpp` already forwards every unrecognized ATTACH
+option into `options_json` verbatim, so `workspace`/`item` arrive at the catalog for free.
+
+### What actually blocked it, and what did not
+
+The gap was described as "credential plumbing". That was the smaller half. The real blocker was that
+`FabricApiContext` held the **OneLake ATTACH ROOT** — a Delta-provider concept — and derived workspace + item
+from it by parsing. A T-SQL attach has no root to parse, and a Fabric SQL connection string cannot supply one:
+its host is an opaque per-workspace routing GUID that names neither the workspace nor the item.
+
+- **Context is now `(Workspace, Item, Credential)`** and each provider supplies the pair however it knows it —
+  Delta parses its root once at registration, SQL Server reads the two ATTACH options. `Root` had exactly two
+  uses, both inside `FabricApiClient`, so the change was small; it is listed first because it is the one that
+  made the set reusable at all. Either may be null, which is not an error: the existing `workspace :=` /
+  `item :=` named parameters simply become required instead of optional, and the error says so.
+- **The credential rides a connection-string marker** (`;FabricatorFabricCred=`), the mechanism already proven
+  twice — `AccessTokenKeyword` here and `FabricatorDeltaCred` on the Delta side. **⚠ Order is load-bearing:**
+  the access-token marker is defined as *"everything after it is the token"*, so this one is appended AFTER it
+  and stripped BEFORE it. The other order silently folds this marker into the token and breaks SQL auth.
+- **⚠ A pre-minted `access_token` is deliberately NOT carried.** Its audience is `database.windows.net`;
+  Fabric REST needs `api.fabric.microsoft.com`. Forwarding it guarantees a 401 on the first call, whereas
+  carrying nothing falls through to the ambient chain, which genuinely works both on Fabric compute and off
+  it. Only a **renewable principal** is carried. (The Delta path does forward a static token and has the same
+  hazard — pre-existing, on a live-validated path, left alone rather than changed as a side effect.)
+- **`azure_tenant_id` was DECLARED in `SecretFields` from the beginning and consumed by nothing** (it exists
+  for parity with the C++ mssql secret). It is load-bearing now: SqlClient infers the tenant from the server it
+  connects to, and `ClientSecretCredential` cannot, so an mssql-secret service principal has no other tenant
+  source. An `azure` secret already speaks the right vocabulary and needs nothing new.
+- **⚠ The registration gate is the HOST, not `ServerProfile.IsWarehouse`.** `IsWarehouse` is the
+  obvious-looking choice and is wrong twice over: `EngineEdition == 11` covers Fabric Warehouse, the Lakehouse
+  SQL endpoint **and Synapse serverless**, so it would advertise Fabric functions on a Synapse attach; and it
+  forces profile detection, turning function registration into a connection round trip at ATTACH. The gate is
+  `host.EndsWith(".fabric.microsoft.com")`, which needs only the connection string.
+- **`__all__` is now implemented rather than refused** (superseding the §9g bullet). The callback is invoked
+  lazily and only when some declaration uses the sentinel, so a non-Fabric attach never runs the extra schema
+  query; `schema_filter` is applied, so a function is not declared into a schema the catalog does not surface.
+- Registration is per catalog and lazy, so an attach that never calls a function pays nothing. Note the set is
+  registered in **every** schema on both providers, so the visible count scales with schema count — measured
+  490 entries on `LH` = 70 names (40 functions + 30 dead `_each` siblings) × 7 schemas. Expected, not a defect.
+
+### ⚠ TWO SHIPPED BUGS THIS FOUND, both pre-existing, both invisible to their own live validation
+
+Neither is in the new code. Both were found by *calling* these functions on a fresh path, which is the point
+worth carrying forward: **a live validation that checks a call's status and ids is not a validation of its
+output columns.**
+
+1. **`fabric_lakehouses()` and `fabric_warehouses()` threw on EVERY call** —
+   `IndexOutOfRangeException`. The `workspace :=` override pass (§9g, 2026-07-31) added the `args[0]` read to
+   every catalog-bound table function but the `NamedParameters` **declaration** to all except these two, and
+   the base sizes the args array from the declared count. So the failure is total and immediate, not a wrong
+   default. It landed one day AFTER both were live-validated (§9c/§9e) and their only gate is live, so nothing
+   failed in between. An audit of all 21 `FabricRowsFunction` subclasses confirms these were the only two.
+2. **Every timestamp on the hand-rolled functions read as JANUARY 1970** — 15 sites across 5 files:
+   `fabric_refresh_sql_endpoint` (the flagship), all four job functions, the notebook runner, and both
+   semantic-model functions. Cause: `new TimestampArray.Builder()`, whose **parameterless constructor defaults
+   to MILLISECOND**, while the columns are declared MICROSECOND by `FabricApiFunctions.Ts`. Nothing anywhere
+   reports the mismatch — the array holds millisecond values, the schema says microseconds, and the host
+   faithfully reads the number it was given, 1000× too small.
+   - **It survived live validation of every affected function**, because each was checked for status and ids
+     and nobody looked at the times.
+   - **Functions on `FabricRowBuilder` were never affected**: it creates each builder FROM the declared field.
+     The fix gives the rest that same property — one `TsType` shared by `Ts()` and the new `TsBuilder()`, so
+     the declaration and the builder cannot drift again.
+   - Method note: Apache.Arrow 23 honours the unit correctly when told it (probed, all four units), so the
+     library was ruled out before the code was blamed; and the corrected values corroborate independently
+     (`2026-07-12/13/14` are exactly when those probe tables were created), rather than merely "looking bigger".
+
+### Gates
+
+- **`verify_functions` 13 → 15** (service tier): the negative control — a box SQL Server attach advertises no
+  `fabric_*`. Its companion assertion (`cf_*` count > 0) is the **positive control** and is the point of it:
+  a zero for `fabric_*` means "not advertised" only if something else IS advertised through the same path.
+  **Mutation-tested** — forcing `IsFabricEndpoint` to `true` kills the suite at exactly that line.
+- Live: the ATTACH above against workspace `Test` / lakehouse `LH`; `fabric_lakehouses()` (3 lakehouses with
+  their SQL endpoint connection strings) and `fabric_refresh_sql_endpoint()` (19 tables) both through it.
+- **Still ungated live**: everything that needs a real tenant. The positive path here is manual, like
+  `verify_dax` — only the negative control can run in CI.
+- Full tiers after the change: hermetic **63/63 — 5656**, service **44/44 — 1446** (1444 + the two new).
+
+### Still open
+
+`fabric_*` on a **non-Fabric** SQL Server remains deliberately unavailable, and the shortcut SCALARS still take
+no `workspace :=` / `item :=` (DuckDB `ScalarFunction` has no named-parameter concept — §9c), so on a SQL
+attach they always act on the ATTACH's own `item`.
 
 ## 10. The full API sweep — every area, with a verdict
 

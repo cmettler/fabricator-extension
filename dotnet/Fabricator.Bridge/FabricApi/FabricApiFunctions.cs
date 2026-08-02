@@ -8,11 +8,24 @@ using Microsoft.Fabric.Api.Core.Models;
 namespace Fabricator.Bridge;
 
 /// <summary>
-/// Registers the Fabric REST API functions onto a catalog. Called only for a OneLake root — see
-/// <c>DeltaCatalog.BuildFunctionSet</c> and docs/fabric-api-functions.md.
+/// Registers the Fabric REST API functions onto a catalog. Public (with a primitive signature) because the set
+/// is hosted by more than one provider: a OneLake Delta attach, which takes the workspace/item defaults from its
+/// root, and a Fabric SQL attach, which takes them from ATTACH options in another assembly. See
+/// <c>DeltaCatalog.BuildFunctionSet</c>, <c>SqlServerCatalog.BuildFunctionSet</c> and
+/// docs/fabric-api-functions.md §9h.
 /// </summary>
-internal static class FabricApiFunctions
+public static class FabricApiFunctions
 {
+    /// <param name="workspace">Default workspace (display name or GUID); null/empty ⇒ callers must pass
+    /// <c>workspace :=</c>.</param>
+    /// <param name="item">Default item (display name, <c>name.Type</c>, or GUID); null/empty ⇒ callers must
+    /// pass <c>item :=</c>.</param>
+    /// <param name="credential">Entra credential from the ATTACH secret; null ⇒ the ambient chain.</param>
+    public static void Register(
+        List<ICatalogScalarFunction> scalars, List<ICatalogTableFunction> tables,
+        string? workspace, string? item, Azure.Core.TokenCredential? credential)
+        => Register(scalars, tables, new FabricApiContext(workspace, item, credential));
+
     internal static void Register(
         List<ICatalogScalarFunction> scalars, List<ICatalogTableFunction> tables, FabricApiContext context)
     {
@@ -94,7 +107,27 @@ internal static class FabricApiFunctions
     }
 
     // UTC microsecond timestamps: what DuckDB's TIMESTAMP maps to, so no lossy conversion at the boundary.
-    internal static Field Ts(string name) => new(name, new TimestampType(Apache.Arrow.Types.TimeUnit.Microsecond, "UTC"), nullable: true);
+    /// <summary>The ONE timestamp type these functions use. Shared by the field declaration and the array
+    /// builder so the two cannot disagree — see <see cref="TsBuilder"/>.</summary>
+    internal static readonly TimestampType TsType = new(Apache.Arrow.Types.TimeUnit.Microsecond, "UTC");
+
+    internal static Field Ts(string name) => new(name, TsType, nullable: true);
+
+    /// <summary>
+    /// A builder for a <see cref="Ts"/> column. Use this, never the parameterless
+    /// <c>TimestampArray.Builder</c> constructor.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ The parameterless <c>TimestampArray.Builder()</c> defaults to <b>MILLISECOND</b> while these columns
+    /// are declared MICROSECOND, and nothing anywhere reports the mismatch: the array is built with millisecond
+    /// values, the schema says microseconds, and the host faithfully reads the number it was given. Every
+    /// timestamp then lands in <b>January 1970</b> — 1000× too small. That shipped on every hand-rolled
+    /// function here (refresh, jobs, notebook runs, semantic-model refreshes) and survived live validation of
+    /// all of them, because each run was checked for its status and ids and nobody looked at the times.
+    /// Functions built on <c>FabricRowBuilder</c> were never affected — it creates each builder FROM the
+    /// declared field, which is exactly the property this helper restores for the rest.
+    /// </remarks>
+    internal static TimestampArray.Builder TsBuilder() => new(TsType);
 
     /// <summary>A BIGINT column (byte/row counts, durations).</summary>
     internal static Field Int64(string name) => new(name, Int64Type.Default, nullable: true);
@@ -253,9 +286,9 @@ internal sealed class FabricRefreshSqlEndpointFunction : ICatalogTableFunction
 
             var names = new StringArray.Builder();
             var status = new StringArray.Builder();
-            var start = new TimestampArray.Builder();
-            var end = new TimestampArray.Builder();
-            var lastOk = new TimestampArray.Builder();
+            var start = FabricApiFunctions.TsBuilder();
+            var end = FabricApiFunctions.TsBuilder();
+            var lastOk = FabricApiFunctions.TsBuilder();
             var errCode = new StringArray.Builder();
             var errMsg = new StringArray.Builder();
             int n = 0;

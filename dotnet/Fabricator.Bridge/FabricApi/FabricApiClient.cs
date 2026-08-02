@@ -9,17 +9,25 @@ using Microsoft.Fabric.Api;
 namespace Fabricator.Bridge;
 
 /// <summary>
-/// What a catalog-bound Fabric-API function inherits from its ATTACH: the OneLake root it was attached at, and
-/// the credential resolved from the ATTACH secret (null ⇒ fall back to the ambient chain, which is how a
-/// credential-free ATTACH works on Fabric compute).
+/// What a catalog-bound Fabric-API function inherits from its ATTACH: the workspace and item it acts on by
+/// default, and the credential resolved from the ATTACH secret (null ⇒ fall back to the ambient chain, which is
+/// how a credential-free ATTACH works on Fabric compute). Either name may be a display name or a GUID, and
+/// either may be null — a null one is simply not a default, so the function's <c>workspace :=</c> /
+/// <c>item :=</c> named parameter becomes required rather than optional.
 /// </summary>
 /// <remarks>
-/// This is the whole reason these functions are catalog-bound rather than global: dbt runs OFF Fabric compute,
-/// where the ambient chain finds nothing, and a GLOBAL function has no route to a DuckDB secret (secrets are
-/// resolved host-side, and the host-FS opener covers storage only — not REST). The attach already carries the
-/// credential, so <c>lake.dbo.fabric_refresh_sql_endpoint()</c> needs no arguments at all.
+/// <para>This is the whole reason these functions are catalog-bound rather than global: dbt runs OFF Fabric
+/// compute, where the ambient chain finds nothing, and a GLOBAL function has no route to a DuckDB secret
+/// (secrets are resolved host-side, and the host-FS opener covers storage only — not REST). The attach already
+/// carries the credential, so <c>lake.dbo.fabric_refresh_sql_endpoint()</c> needs no arguments at all.</para>
+/// <para>The context is deliberately expressed as workspace+item rather than as the OneLake ATTACH ROOT it was
+/// originally parsed from. A root is a Delta-provider concept, and holding one here made the whole set
+/// unreachable from any other provider — which is what kept a dbt project on a Fabric <i>Warehouse</i> (a T-SQL
+/// attach, no OneLake root anywhere) from calling even <c>fabric_refresh_sql_endpoint</c>. Each provider now
+/// supplies the pair however it knows it: Delta parses its root, SQL Server takes
+/// <c>workspace</c>/<c>item</c> ATTACH options. See docs/fabric-api-functions.md §9h.</para>
 /// </remarks>
-internal sealed record FabricApiContext(string Root, TokenCredential? Credential);
+internal sealed record FabricApiContext(string? Workspace, string? Item, TokenCredential? Credential);
 
 /// <summary>
 /// Thin wrapper over <see cref="FabricClient"/>: credential handling, name-or-GUID resolution with a cache, and
@@ -50,24 +58,26 @@ internal sealed partial class FabricApiClient
 
     internal FabricClient Client => _client.Value;
 
-    /// <summary>The workspace named by the ATTACH root, as a GUID.</summary>
+    /// <summary>The workspace this catalog defaults to, as a GUID.</summary>
     internal Guid WorkspaceId => ResolveWorkspace(null);
 
-    /// <summary>The lakehouse item named by the ATTACH root, as a GUID.</summary>
+    /// <summary>The lakehouse item this catalog defaults to, as a GUID.</summary>
     internal Guid ItemId => ResolveItem(null, "Lakehouse");
 
     /// <summary>
-    /// Resolves a workspace by GUID or display name; <paramref name="nameOrId"/> null/empty ⇒ the one the ATTACH
-    /// root names (parsed by <see cref="FabricLakehouse.ParseOneLake"/>, which yields either a name or a GUID
-    /// depending on how the user wrote the abfss URI).
+    /// Resolves a workspace by GUID or display name; <paramref name="nameOrId"/> null/empty ⇒ the catalog's
+    /// default (<see cref="FabricApiContext.Workspace"/>), which is a name or a GUID depending on how the
+    /// ATTACH expressed it.
     /// </summary>
     internal Guid ResolveWorkspace(string? nameOrId)
     {
-        var wanted = Blank(nameOrId) ? FabricLakehouse.ParseOneLake(_context.Root).Workspace : nameOrId!;
+        var wanted = Blank(nameOrId) ? _context.Workspace : nameOrId!;
         if (Blank(wanted))
         {
             throw new NotSupportedException(
-                "fabric: could not determine the workspace from the ATTACH root — pass it explicitly.");
+                "fabric: this catalog has no default workspace — pass one, e.g. workspace := 'My workspace'. "
+                + "(A Delta attach takes it from the OneLake root; a SQL Server attach from the "
+                + "`workspace` ATTACH option.)");
         }
         if (Guid.TryParse(wanted, out var direct))
         {
@@ -88,7 +98,7 @@ internal sealed partial class FabricApiClient
     }
 
     /// <summary>
-    /// Resolves an item by GUID or display name; null/empty ⇒ the item the ATTACH root names.
+    /// Resolves an item by GUID or display name; null/empty ⇒ the catalog's default item.
     /// <paramref name="itemType"/> is the Fabric item type to filter by (e.g. <c>Lakehouse</c>,
     /// <c>Notebook</c>), and <paramref name="workspaceId"/> the workspace to look in — pass it when the caller
     /// overrode the workspace, or a cross-workspace lookup would search the ATTACH's own.
@@ -99,13 +109,16 @@ internal sealed partial class FabricApiClient
         var wanted = nameOrId;
         if (Blank(wanted))
         {
-            // The root's item segment is "<name>.Lakehouse" or a bare GUID — ResolveLakehouseId strips the suffix.
-            wanted = FabricLakehouse.ParseOneLake(_context.Root).Lakehouse;
+            // A Delta root's item segment is "<name>.Lakehouse" or a bare GUID; the ".<itemType>" suffix is
+            // stripped below, so the default is stored verbatim rather than pre-parsed.
+            wanted = _context.Item;
         }
         if (Blank(wanted))
         {
             throw new NotSupportedException(
-                $"fabric: could not determine the {itemType} from the ATTACH root — pass it explicitly.");
+                $"fabric: this catalog has no default {itemType} — pass one, e.g. item := 'My{itemType}'. "
+                + "(A Delta attach takes it from the OneLake root; a SQL Server attach from the "
+                + "`item` ATTACH option.)");
         }
         var trimmed = wanted!.EndsWith("." + itemType, StringComparison.OrdinalIgnoreCase)
             ? wanted[..^(itemType.Length + 1)]

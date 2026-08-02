@@ -188,6 +188,12 @@ internal sealed class FabricLakehousesFunction : FabricRowsFunction
 
     public override string Name => "fabric_lakehouses";
 
+    // Declared because Fill reads args[0]. Omitting it does not degrade to "no override" — the base sizes the
+    // args array from the DECLARED count, so a read of args[0] against an undeclared parameter is an
+    // IndexOutOfRangeException on EVERY call. See the note on FabricWarehousesFunction.
+    public override Schema NamedParameters { get; } =
+        new Schema(new[] { FabricApiFunctions.Str("workspace") }, null);
+
     protected override Schema Columns { get; } = new(new[]
     {
         FabricApiFunctions.Str("id"),
@@ -230,6 +236,14 @@ internal sealed class FabricWarehousesFunction : FabricRowsFunction
     }
 
     public override string Name => "fabric_warehouses";
+
+    // ⚠ THIS DECLARATION AND fabric_lakehouses' WERE MISSING, AND BOTH FUNCTIONS THREW ON EVERY CALL.
+    // The `workspace :=` override pass added the args[0] read to every catalog-bound table function but the
+    // declaration to all except these two, one day AFTER both had been live-validated — and their only gate is
+    // live, so nothing failed. Found while hosting this set on a SQL Server catalog. The failure mode is total
+    // and immediate (IndexOutOfRangeException, not a wrong default), so any live call re-proves it.
+    public override Schema NamedParameters { get; } =
+        new Schema(new[] { FabricApiFunctions.Str("workspace") }, null);
 
     protected override Schema Columns { get; } = new(new[]
     {

@@ -4519,7 +4519,12 @@ public sealed class DeltaCatalog : IBackendCatalog
         // test/verify_delta_catalog_functions.test.
         if (FabricLakehouse.IsOneLake(_root))
         {
-            FabricApiFunctions.Register(scalars, tables, new FabricApiContext(_root, _fabricCredential));
+            // The root names both defaults; parsed once here rather than inside the client, so the Fabric
+            // function set stays provider-agnostic and a SQL Server attach can supply the same pair from its
+            // `workspace`/`item` ATTACH options (docs/fabric-api-functions.md §9h).
+            var (workspace, lakehouse) = FabricLakehouse.ParseOneLake(_root);
+            FabricApiFunctions.Register(scalars, tables,
+                                        new FabricApiContext(workspace, lakehouse, _fabricCredential));
         }
         return new CatalogFunctionSet(scalars, tables);
     }

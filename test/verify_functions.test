@@ -36,5 +36,27 @@ SELECT fabricator_exec('fdb', 'DROP FUNCTION IF EXISTS dbo.vf_add');
 statement ok
 SELECT fabricator_exec('fdb', 'DROP FUNCTION IF EXISTS dbo.tvf_one');
 
+# ── The fabric_* set is NOT advertised on a non-Fabric SQL Server ────────────────────────────────
+# The catalog-bound Fabric REST functions are registered only when the attach targets Fabric (host
+# *.fabric.microsoft.com), mirroring the Delta catalog's IsOneLake gate: off Fabric they have no
+# workspace, no item and no REST endpoint, so advertising them would put functions in the catalog
+# that can only fail. See docs/fabric-api-functions.md §9h.
+#
+# The cf_* count on the next assertion is the POSITIVE CONTROL and is the point of it: a zero for
+# fabric_* proves "not advertised" only if some custom function IS advertised through the same
+# path. Without it this section would pass just as happily against a catalog that registered
+# nothing at all.
+query I
+SELECT count(*) > 0 FROM duckdb_functions()
+WHERE database_name = 'fdb' AND function_name LIKE 'cf\_%' ESCAPE '\';
+----
+true
+
+query I
+SELECT count(*) FROM duckdb_functions()
+WHERE database_name = 'fdb' AND function_name LIKE 'fabric\_%' ESCAPE '\';
+----
+0
+
 statement ok
 DETACH fdb;

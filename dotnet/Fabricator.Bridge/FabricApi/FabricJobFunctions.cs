@@ -42,8 +42,8 @@ internal static class FabricJobFunctions
     {
         var id = new StringArray.Builder();
         var status = new StringArray.Builder();
-        var start = new TimestampArray.Builder();
-        var end = new TimestampArray.Builder();
+        var start = FabricApiFunctions.TsBuilder();
+        var end = FabricApiFunctions.TsBuilder();
         var code = new StringArray.Builder();
         var message = new StringArray.Builder();
         id.Append(instanceId);
@@ -408,8 +408,8 @@ internal sealed class FabricJobInstancesFunction : ICatalogTableFunction
             var types = new StringArray.Builder();
             var invoke = new StringArray.Builder();
             var status = new StringArray.Builder();
-            var start = new TimestampArray.Builder();
-            var end = new TimestampArray.Builder();
+            var start = FabricApiFunctions.TsBuilder();
+            var end = FabricApiFunctions.TsBuilder();
             var code = new StringArray.Builder();
             var message = new StringArray.Builder();
             int n = 0;
@@ -599,8 +599,8 @@ internal sealed class FabricOperationStatusFunction : ICatalogTableFunction
             var id = new StringArray.Builder();
             var status = new StringArray.Builder();
             var pct = new Int32Array.Builder();
-            var created = new TimestampArray.Builder();
-            var updated = new TimestampArray.Builder();
+            var created = FabricApiFunctions.TsBuilder();
+            var updated = FabricApiFunctions.TsBuilder();
             var code = new StringArray.Builder();
             var message = new StringArray.Builder();
             id.Append(opId.ToString());

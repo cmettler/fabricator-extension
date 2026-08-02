@@ -108,8 +108,8 @@ internal sealed class FabricRunNotebookFunction : ICatalogTableFunction
 
             var id = new StringArray.Builder();
             var status = new StringArray.Builder();
-            var start = new TimestampArray.Builder();
-            var end = new TimestampArray.Builder();
+            var start = FabricApiFunctions.TsBuilder();
+            var end = FabricApiFunctions.TsBuilder();
             var exit = new StringArray.Builder();
             var compute = new StringArray.Builder();
             var snapshot = new StringArray.Builder();

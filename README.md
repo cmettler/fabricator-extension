@@ -78,14 +78,14 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | **Macros** | Provider **global** macros — bare `fn(...)` / `FROM fn(...)`, every database, no ATTACH | ✅ |
 | | Provider **catalog-bound** macros → `db.schema.m(...)` (namespaced per catalog; expanded by the binder) | ✅ |
 | | **SQL-generating** table functions — the call is rewritten into SQL at bind time (`kind='table_sql'`) | ✅ |
-| **Fabric API** | `fabric_refresh_sql_endpoint()` — sync the lakehouse SQL analytics endpoint from SQL (the dbt unblocker) | ✅ OneLake attaches |
-| | OneLake **shortcut** create / alter / drop / list, incl. non-OneLake targets via JSON | ✅ OneLake attaches |
-| | Introspection: workspaces, items, lakehouses (+ SQL endpoint strings), warehouses, connections, notebook parameters | ✅ OneLake attaches |
-| | **Parameterized notebook runs** (blocking, with status + portal snapshot link) | ✅ OneLake attaches |
-| | **Jobs**: table maintenance (V-Order/Z-order/vacuum), generic runner, status, history, cancel | ✅ OneLake attaches |
-| | **Semantic models**: list, enhanced refresh, refresh history (Power BI REST, same credential) | ✅ OneLake attaches |
-| | **Git**: status, connection, commit, update-from-git; **deployment pipelines**: list, stages, items, deploy, history | ✅ OneLake attaches |
-| | Platform reads: capacities, Spark environments, OneLake data-access roles, mirrored-database status | ✅ OneLake attaches |
+| **Fabric API** | `fabric_refresh_sql_endpoint()` — sync the lakehouse SQL analytics endpoint from SQL (the dbt unblocker) | ✅ OneLake + Fabric SQL attaches |
+| | OneLake **shortcut** create / alter / drop / list, incl. non-OneLake targets via JSON | ✅ OneLake + Fabric SQL attaches |
+| | Introspection: workspaces, items, lakehouses (+ SQL endpoint strings), warehouses, connections, notebook parameters | ✅ OneLake + Fabric SQL attaches |
+| | **Parameterized notebook runs** (blocking, with status + portal snapshot link) | ✅ OneLake + Fabric SQL attaches |
+| | **Jobs**: table maintenance (V-Order/Z-order/vacuum), generic runner, status, history, cancel | ✅ OneLake + Fabric SQL attaches |
+| | **Semantic models**: list, enhanced refresh, refresh history (Power BI REST, same credential) | ✅ OneLake + Fabric SQL attaches |
+| | **Git**: status, connection, commit, update-from-git; **deployment pipelines**: list, stages, items, deploy, history | ✅ OneLake + Fabric SQL attaches |
+| | Platform reads: capacities, Spark environments, OneLake data-access roles, mirrored-database status | ✅ OneLake + Fabric SQL attaches |
 | | **Per-table / per-partition semantic-model refresh** via XMLA/TMSL → `dax_refresh*` | ✅ DAX attaches |
 | | Notebook `exitValue` | ⏳ best-effort (always NULL in practice) |
 | **Callable** | Discovered scalar UDFs → `db.schema.fn(args)` (vectorized over Arrow) | ✅ |
@@ -220,6 +220,10 @@ ATTACH 'Server=...;Database=...' AS mssql
   (TYPE fabricator, schema_filter '^(dbo|sales)$', table_filter '^fact_');
 ```
 
+On a **Fabric** SQL endpoint the attach also accepts `WORKSPACE` / `ITEM`, which enable the `fabric_*`
+platform functions on that catalog — see
+[Microsoft Fabric platform functions](#microsoft-fabric-platform-functions-onelake-and-fabric-sql-attaches).
+
 ### Secrets
 
 ```sql
@@ -232,7 +236,10 @@ SELECT * FROM fabricator_query('sql1', 'SELECT 1');
 
 Secret field names mirror the native `mssql` extension for cross-compatibility:
 `host`, `port`, `database`, `user`, `password`, `use_encrypt`, `access_token`, `authentication`,
-`azure_secret`, `schema_filter`, `table_filter`, `application_name`.
+`azure_tenant_id`, `azure_secret`, `schema_filter`, `table_filter`, `application_name`.
+
+`azure_tenant_id` matters only for the Fabric platform functions: SqlClient infers the tenant from the server
+it connects to, but minting a Fabric API token cannot, so a service-principal secret needs it spelled out.
 
 ### Azure Entra ID (Microsoft Fabric SQL endpoints, which require Entra)
 
@@ -698,12 +705,12 @@ do, since a macro substitutes arguments as expressions with its structure fixed 
 They are called like any table function, and `fabricator_functions('db')` reports them as `kind='table_sql'`.
 Because the rewrite happens at bind, `EXPLAIN` shows the generated plan rather than a function call.
 
-### Microsoft Fabric platform functions (OneLake attaches)
+### Microsoft Fabric platform functions (OneLake and Fabric SQL attaches)
 
-When a Delta catalog is attached over **OneLake**, it additionally hosts functions that call the **Fabric
-REST API**, so platform operations Microsoft offers no T-SQL for can be driven from SQL. They are
-catalog-bound (`db.schema.fn(...)`) and **inherit the workspace, the lakehouse and the credential from the
-ATTACH** — which is why most of them take no arguments at all:
+When a catalog is attached over **OneLake** (Delta) or to a **Fabric SQL endpoint** (T-SQL), it additionally
+hosts functions that call the **Fabric REST API**, so platform operations Microsoft offers no T-SQL for can be
+driven from SQL. They are catalog-bound (`db.schema.fn(...)`) and **inherit the workspace, the item and the
+credential from the ATTACH** — which is why most of them take no arguments at all:
 
 ```sql
 ATTACH 'abfss://MyWS@onelake.dfs.fabric.microsoft.com/MyLH.Lakehouse/Tables' AS lake
@@ -713,8 +720,40 @@ ATTACH 'abfss://MyWS@onelake.dfs.fabric.microsoft.com/MyLH.Lakehouse/Tables' AS 
 SELECT * FROM lake.dbo.fab_delta_info();
 ```
 
-They are registered **only** for a OneLake root — a local or S3 Delta attach has no workspace or REST
-credential, so it shows none of them.
+They are registered **only** where there is a Fabric platform to talk to — a OneLake root, or a SQL attach
+whose server is `*.fabric.microsoft.com`. A local or S3 Delta attach, or a plain SQL Server, has no workspace
+and no REST endpoint, so it shows none of them.
+
+#### On a Fabric SQL attach (Warehouse or Lakehouse SQL endpoint)
+
+A T-SQL connection string does not name a workspace or an item — its host is an opaque per-workspace routing
+id — so give them as ATTACH options. This is what lets a dbt project running against a Fabric **Warehouse**
+refresh a lakehouse endpoint without a second, Delta-only attach:
+
+```sql
+CREATE SECRET fabric_sp (TYPE azure, PROVIDER service_principal,
+                         TENANT_ID '…', CLIENT_ID '…', CLIENT_SECRET '…');
+
+ATTACH 'Server=<endpoint>.datawarehouse.fabric.microsoft.com;Database=MyLH' AS w
+  (TYPE fabricator, SECRET fabric_sp, WORKSPACE 'MyWS', ITEM 'MyLH');
+
+SELECT table_name, status FROM w.dbo.fabric_refresh_sql_endpoint();
+```
+
+| ATTACH option | meaning |
+|---|---|
+| `WORKSPACE` | Default Fabric workspace — display name or GUID |
+| `ITEM` | Default item the functions act on — display name, `Name.Type`, or GUID. For `fabric_refresh_sql_endpoint` this is the **lakehouse** whose endpoint you want synced, which need not be the database you attached |
+
+Both are optional. Omit one and the functions that need it simply require their `workspace :=` / `item :=`
+argument instead of defaulting it.
+
+> **Credential:** use a service-principal or managed-identity secret. A pre-minted `ACCESS_TOKEN` secret
+> authenticates **SQL** but cannot be reused for the Fabric API — the two need different token audiences — so
+> with one of those the functions fall back to the ambient Azure credential chain (which is what works on
+> Fabric compute, and via `az login` / environment variables off it). On a `TYPE mssql` secret using
+> `authentication = 'Active Directory Service Principal'`, also set `azure_tenant_id`: SqlClient infers the
+> tenant from the server, but minting a Fabric token cannot.
 
 Everything is optional except where noted, because the attach supplies the defaults. Where a function accepts
 `workspace :=` / `item :=`, those OVERRIDE the attached ones — so one attach can drive several lakehouses,

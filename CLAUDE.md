@@ -560,6 +560,42 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
       timestamp column throws rather than yielding NULLs that look like "the service returned nothing");
       `fab_delta_info` was moved onto it deliberately, because it is the only function on that path with a
       HERMETIC gate. Gate: all **11** service suites over the six kinds green + hermetic 62/5573.
+  - **THE SQL SERVER BINDING — BUILT + LIVE-VALIDATED 2026-08-02 (§9h). This closes §8's "largest remaining
+    gap in reach", and building it found TWO SHIPPED BUGS.** The whole set was bound to a OneLake **Delta**
+    attach, so a dbt project on a Fabric **Warehouse** over T-SQL could not call even
+    `fabric_refresh_sql_endpoint`. Now: `ATTACH 'Server=<ep>.datawarehouse.fabric.microsoft.com;Database=LH'
+    AS w (TYPE fabricator, SECRET fabric_sp, WORKSPACE 'Test', ITEM 'LH')` → `w.dbo.fabric_refresh_sql_endpoint()`.
+    **No ABI and no C++ change** — `fabricator_storage.cpp` already forwards unknown ATTACH options as JSON.
+    - **The recorded diagnosis ("credential plumbing") was the SMALLER half.** The real blocker: the function
+      context held the OneLake **ROOT** and parsed workspace+item out of it. A Fabric SQL connstr supplies
+      neither (its host is an opaque per-workspace routing GUID), so the set was structurally unreachable from
+      any other provider. Context is now `(Workspace, Item, Credential)`, each provider supplying the pair its
+      own way. `Root` had exactly two uses, both in `FabricApiClient`.
+    - Credential rides a connstr marker (`;FabricatorFabricCred=`), the mechanism already proven by
+      `AccessTokenKeyword` + `FabricatorDeltaCred`. **⚠ ORDER IS LOAD-BEARING** — the access-token marker means
+      "everything after me is the token", so this one is appended AFTER and stripped BEFORE it.
+    - **⚠ A pre-minted `access_token` is deliberately NOT carried** (SQL audience ≠ `api.fabric.microsoft.com`
+      ⇒ guaranteed 401); carrying nothing falls through to the ambient chain, which works on and off Fabric.
+      **`azure_tenant_id` — declared in `SecretFields` since the beginning, consumed by nothing — is now
+      load-bearing**: SqlClient infers the tenant from the server, `ClientSecretCredential` cannot.
+    - **⚠ The gate is the HOST (`*.fabric.microsoft.com`), NOT `ServerProfile.IsWarehouse`** — `EngineEdition
+      == 11` also means **Synapse serverless**, and `IsWarehouse` would force profile detection (a connection)
+      at ATTACH just to decide registration.
+    - **⚠ BUG 1 (pre-existing): `fabric_lakehouses()` and `fabric_warehouses()` THREW ON EVERY CALL.** The
+      `workspace :=` pass added the `args[0]` read to every catalog-bound table function but the declaration to
+      all except these two; the base sizes the args array from the declared count ⇒ `IndexOutOfRangeException`,
+      total not partial. It landed one day AFTER both were live-validated, and their only gate is live.
+    - **⚠ BUG 2 (pre-existing): EVERY timestamp on the hand-rolled functions read as JANUARY 1970** — 15 sites
+      / 5 files incl. the flagship refresh, all four job functions, the notebook runner, both semantic-model
+      functions. `new TimestampArray.Builder()` **defaults to MILLISECOND** while the columns declare
+      MICROSECOND; nothing reports the mismatch, so the host faithfully reads a number 1000× too small. It
+      survived live validation of every affected function because each was checked for status/ids and **nobody
+      looked at the times**. Functions on `FabricRowBuilder` were immune (it builds FROM the declared field);
+      the fix gives the rest that property via one shared `TsType`/`TsBuilder()`.
+    - `__all__` is now IMPLEMENTED on SqlServer (`ExpandAllSchemas`, lazy + `schema_filter`-aware), superseding
+      §9g's "rejected loudly" — that was correct only while nothing used the sentinel.
+    - Gate `verify_functions` 13 → **15** (negative control + a `cf_*` POSITIVE control, mutation-tested); the
+      positive live path is manual, like `verify_dax`.
   - Output shape rule (D4): typed flat columns + one raw-JSON column for polymorphic parts; **no STRUCT
     wrapping** (adding a column is additive for `SELECT *`; adding a struct FIELD changes a column's type
     and breaks bound views), no JSON-only. Every `table`-kind function also gets a dead `_each` sibling —
@@ -1874,7 +1910,7 @@ exercised the next time a pin moves on its own.
 declares, so a new suite cannot silently sit outside CI. The accounting is complete and checked:
 **59 hermetic + 43 service + 11 excluded = 113 suite FILES** (2026-08-02), no overlap. ⚠ Suite FILES and
 suite RUNS differ and the floors are on RUNS: four hermetic suites and one service suite are
-engine-doubled, so 59 files ⇒ **63 runs / 5656 assertions** and 43 ⇒ **44 runs / 1444**. Recompute rather
+engine-doubled, so 59 files ⇒ **63 runs / 5656 assertions** and 43 ⇒ **44 runs / 1446**. Recompute rather
 than copy — the line here read `53 + 42 + 9 = 104` for a while after the counts had moved, which is what a
 hand-copied number does. `scripts/list-hermetic-suites.sh | wc -l` and its service twin are the source of
 truth; the 11 excluded are `verify_azure_secret`, `verify_dax`, `verify_delta_catalog_adls`,
@@ -2282,7 +2318,7 @@ path never adopted. Keep the status honest; a wrong status is worse than none.
 | [delta-transactions.md](docs/delta-transactions.md) | **current** — buffered-DML semantics. §8.1 = the MEASURED OneLake multi-writer result (2026-07-31; one bug fixed, one gap left OPEN); §10.6 = the MEASURED Fabric Spark isolation-property matrix, replacing a stale "we do NOT read it" |
 | [distribution-installer.md](docs/distribution-installer.md) | **current** — single-file SKU, phases 1–4 of 5 |
 | [ew-master-migration.md](docs/ew-master-migration.md) | **current** — the EW pin journal. Read BEFORE the next EW bump |
-| [fabric-api-functions.md](docs/fabric-api-functions.md) | **current — P0 BUILT + live-validated, P1/P2 design** (2026-07-30). §9b spike results, §9c as-built (incl. the zero-argument Arrow fix), §10 the full API sweep with a verdict per area |
+| [fabric-api-functions.md](docs/fabric-api-functions.md) | **current — the whole curated set is BUILT; P0/P1/P2 + semantic models + XMLA live-validated, P3 wired but NOT live** (no git-connected workspace / pipeline / mirrored DB on this tenant). §9b spike results, §9c as-built (incl. the zero-argument Arrow fix), §9h the SQL Server binding + the two shipped bugs it found, §10 the full API sweep with a verdict per area |
 | [feature-history.md](docs/feature-history.md) | **archive** — as-built records moved verbatim out of this file. Historical by design |
 | [filesystem-bridge.md](docs/filesystem-bridge.md) | **current mechanism, untouched since the rename** — the v40 host-FS bridge is very much live (see the per-call opener fix, `142b350`) |
 | [global-functions.md](docs/global-functions.md) | **current** — all five load-time global kinds |

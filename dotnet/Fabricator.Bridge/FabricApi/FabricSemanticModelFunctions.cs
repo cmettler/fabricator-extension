@@ -214,8 +214,8 @@ internal sealed class FabricRefreshSemanticModelFunction : ICatalogTableFunction
             var id = new StringArray.Builder();
             var status = new StringArray.Builder();
             var type = new StringArray.Builder();
-            var start = new TimestampArray.Builder();
-            var end = new TimestampArray.Builder();
+            var start = FabricApiFunctions.TsBuilder();
+            var end = FabricApiFunctions.TsBuilder();
             var error = new StringArray.Builder();
             id.Append(state.RequestId ?? requestId);
             status.Append(state.Status);
@@ -329,8 +329,8 @@ internal sealed class FabricSemanticModelRefreshesFunction : ICatalogTableFuncti
             var types = new StringArray.Builder();
             var status = new StringArray.Builder();
             var extended = new StringArray.Builder();
-            var start = new TimestampArray.Builder();
-            var end = new TimestampArray.Builder();
+            var start = FabricApiFunctions.TsBuilder();
+            var end = FabricApiFunctions.TsBuilder();
             var error = new StringArray.Builder();
             foreach (var r in history)
             {
