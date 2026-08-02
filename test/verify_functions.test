@@ -58,5 +58,42 @@ WHERE database_name = 'fdb' AND function_name LIKE 'fabric\_%' ESCAPE '\';
 ----
 0
 
+# ── THE PER-ROW `_each` FORM IS DECLARED BY THE PROVIDER, NOT INVENTED BY THE HOST ───────────────
+# The host used to synthesise `<name>_each` for EVERY table-kind function of EVERY provider. That made
+# a SQL-Server semantic (CROSS APPLY / per-row EXEC) the host's business, and produced entries that
+# could only fail wherever there is nothing to apply per row — 30 dead siblings on a Fabric attach,
+# all advertised in duckdb_functions(). SqlServerBackend's discovery SQL now emits them itself.
+statement ok
+SELECT fabricator_exec('fdb', 'CREATE OR ALTER FUNCTION dbo.tf_each_probe(@n INT) RETURNS TABLE AS RETURN (SELECT @n AS v)');
+
+statement ok
+SELECT fabricator_refresh_cache('fdb');
+
+# Declared as an ordinary in-out function alongside the routine itself.
+query TT
+SELECT name, kind FROM fabricator_functions('fdb') WHERE name LIKE 'tf_each_probe%' ORDER BY name;
+----
+tf_each_probe	table
+tf_each_probe_each	inout
+
+# …and it still APPLIES the routine once per input row.
+query II
+SELECT n, v FROM fdb.dbo.tf_each_probe_each((SELECT * FROM (VALUES (7),(9)) t(n))) ORDER BY n;
+----
+7	7
+9	9
+
+# NO DEAD SIBLINGS. A C#-authored custom table function has nothing to apply per input row, so it must
+# get no `_each` at all. The cf_* count above is the positive control for this one: those functions ARE
+# registered, so a zero here means "not synthesised" rather than "nothing loaded".
+query I
+SELECT count(*) FROM duckdb_functions()
+WHERE database_name = 'fdb' AND function_name LIKE 'cf%\_each' ESCAPE '\';
+----
+0
+
+statement ok
+SELECT fabricator_exec('fdb', 'DROP FUNCTION IF EXISTS dbo.tf_each_probe');
+
 statement ok
 DETACH fdb;

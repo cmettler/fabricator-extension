@@ -120,13 +120,12 @@ void FabricatorSchemaEntry::AddTableFunction(const string &func_name, bool is_pr
 	lock_guard<mutex> lock(entry_lock_);
 	table_functions_[func_name] = is_proc;
 	RetireErase(table_function_entries_, func_name, retired_entries_);
-	// A discovered TVF or stored proc also gets a synthetic table-in-out alias `<name>_each` that applies
-	// it once per input row (4g): a TVF via SQL-Server CROSS APPLY, a proc via per-row EXEC (the managed
-	// side picks by object kind). Both echo the input columns + the function's output columns; a proc's
-	// per-row EXECs run in DuckDB's transaction (commit/rollback driven by DuckDB).
-	string each = func_name + "_each";
-	inout_functions_[each] = func_name;
-	RetireErase(table_function_entries_, each, retired_entries_);
+	// NOTE: the host used to invent a `<name>_each` table-in-out alias here for EVERY table-kind function of
+	// EVERY provider. That made a SQL-Server semantic (CROSS APPLY / per-row EXEC) the host's business and
+	// produced entries that could only fail wherever there is nothing to apply per row — 30 dead siblings on a
+	// Fabric attach alone, all of them advertised in duckdb_functions(). A provider that wants a per-row form
+	// now DECLARES it, as an ordinary `inout` function under whatever name it likes (SqlServerBackend's
+	// FunctionsSql emits `<routine>_each`), and it arrives through AddInOutFunction like any other.
 }
 
 void FabricatorSchemaEntry::AddSqlTableFunction(const string &func_name) {
@@ -168,7 +167,6 @@ void FabricatorSchemaEntry::ClearTables() {
 	scalar_functions_.clear();
 	RetireAll(function_entries_, retired_entries_);
 	table_functions_.clear();
-	inout_functions_.clear();
 	custom_inout_functions_.clear();
 	custom_collector_functions_.clear();
 	aggregate_functions_.clear();
@@ -2371,12 +2369,6 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(Clien
 		if (custom_collector_functions_.find(func_name) != custom_collector_functions_.end()) {
 			return GetOrCreateCustomCollectorFunction(context, func_name);
 		}
-		// Else maybe the synthetic in-out alias `<base>_each` (a real same-named function would
-		// have matched above, so it wins over the alias).
-		auto each_it = inout_functions_.find(func_name);
-		if (each_it != inout_functions_.end()) {
-			return GetOrCreateInOutFunction(context, func_name, each_it->second);
-		}
 		return nullptr;
 	}
 	bool is_proc = kind_it->second;
@@ -2496,60 +2488,6 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateSqlTableFunction(Cl
 	return &ref;
 }
 
-// Build the in-out catalog entry for the synthetic alias `<base>_each` — a `{LogicalType::TABLE}`
-// table function that applies the discovered TVF `base_func` once per input row (4g). DuckDB
-// forbids a TABLE-parameter overload from coexisting with the scalar-arg scan form under one name
-// (bind_table_function.cpp), so the in-out form is exposed as a sibling entry under its own name;
-// the scan form keeps the bare TVF name. Caller holds entry_lock_.
-optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateInOutFunction(ClientContext &context,
-                                                                         const string &each_name,
-                                                                         const string &base_func) {
-	vector<string> arg_names;
-	vector<LogicalType> arg_types;
-	try {
-		FetchFunctionParamSchema(context, handle_, name, base_func, arg_names, arg_types);
-	} catch (std::exception &) {
-		// Stale discovery (base TVF dropped out-of-band) — treat as not-found, evicting both
-		// the alias and the base so the next lookup re-discovers.
-		inout_functions_.erase(each_name);
-		RetireErase(table_function_entries_, each_name, retired_entries_);
-		table_functions_.erase(base_func);
-		RetireErase(table_function_entries_, base_func, retired_entries_);
-		return nullptr;
-	}
-	if (arg_types.empty()) {
-		return nullptr; // a no-arg TVF has nothing to apply per input row
-	}
-
-	// Every `_each` form (discovered TVF AND stored proc) streams on the Phase 6 exchange operator (gate + two
-	// pull streams, no per-chunk materialization). The managed InOutBind classifies the base object: a TVF
-	// CROSS APPLYs on a read-only connection (SqlServerTvfEach); a proc EXECs per input row on DuckDB's pinned
-	// write transaction (SqlServerProcEach). The retired 4g push operator (FabricatorInOut*) is now unused.
-	TableFunction inout(each_name, {LogicalType::TABLE}, nullptr, FabricatorExchangeBind, FabricatorExchangeInitGlobal,
-	                    FabricatorExchangeInitLocal);
-	inout.in_out_function = FabricatorExchangeFunction;
-	auto fn_info = make_shared_ptr<FabricatorTableFunctionInfo>();
-	fn_info->handle = handle_;
-	fn_info->schema = name;
-	fn_info->func = base_func; // the CROSS APPLY target is the real SQL Server TVF, not the alias
-	fn_info->arg_types = arg_types;
-	fn_info->arg_names = arg_names;
-	fn_info->is_proc = false;
-	inout.function_info = std::move(fn_info);
-
-	CreateTableFunctionInfo info(std::move(inout));
-	info.catalog = catalog.GetName();
-	info.schema = name;
-	auto entry = make_uniq<TableFunctionCatalogEntry>(catalog, *this, info);
-	auto &ref = *entry;
-	table_function_entries_[each_name] = std::move(entry);
-	return &ref;
-}
-
-// Build the catalog entry for a provider-authored custom table-in-out (4g) — a `{LogicalType::TABLE}`
-// table function under the bare name, dispatched to C# (no SQL object, no scalar-arg scan form). Reuses
-// the same operator callbacks as the `_each` path; only the bind differs (full output schema, no input
-// echo). Caller holds entry_lock_.
 optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateCustomInOutFunction(ClientContext &context,
                                                                               const string &func_name) {
 	// Phase 6: custom C# in-out runs on the streaming exchange operator (gate + two pull streams, no
@@ -2756,11 +2694,8 @@ void FabricatorSchemaEntry::Scan(ClientContext &context, CatalogType type,
 			for (auto &fn : table_functions_) {
 				names.push_back(fn.first);
 			}
-			// The synthetic `<name>_each` table-in-out aliases + custom in-out functions are catalog
-			// functions too.
-			for (auto &fn : inout_functions_) {
-				names.push_back(fn.first);
-			}
+			// Provider-declared in-out functions (incl. a provider's per-row `<routine>_each` form) are
+			// catalog functions too.
 			for (auto &fn : custom_inout_functions_) {
 				names.push_back(fn);
 			}

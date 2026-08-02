@@ -1940,7 +1940,19 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         "WHERE p.object_id = o.object_id AND p.parameter_id = 0), '') AS return_type " +
         "FROM sys.objects o JOIN sys.schemas s ON o.schema_id = s.schema_id " +
         "WHERE o.type IN ('FN','FS','IF','TF','FT','P','PC') AND o.is_ms_shipped = 0 " +
-        "ORDER BY s.name, o.name";
+        // THIS PROVIDER'S per-row form. A discovered TVF or proc also gets `<name>_each`, which applies it
+        // ONCE PER INPUT ROW — a TVF via CROSS APPLY, a proc via a per-row EXEC. It is declared HERE, as an
+        // ordinary in-out function, because it is a SQL-Server semantic: the host used to invent a `_each`
+        // alias for every table-kind function of every provider, which produced entries that could only fail
+        // on providers with nothing to apply per row (30 dead siblings on a Fabric attach alone).
+        // Only routines that TAKE parameters get one — there is nothing to apply per input row otherwise.
+        "UNION ALL " +
+        "SELECT s.name AS schema_name, o.name + '_each' AS name, 'inout' AS kind, 0 AS param_count, " +
+        "'' AS return_type " +
+        "FROM sys.objects o JOIN sys.schemas s ON o.schema_id = s.schema_id " +
+        "WHERE o.type IN ('IF','TF','FT','P','PC') AND o.is_ms_shipped = 0 " +
+        "AND EXISTS (SELECT 1 FROM sys.parameters p WHERE p.object_id = o.object_id AND p.parameter_id > 0) " +
+        "ORDER BY schema_name, name";
 
     // Per-column distinct-value estimate (NDV) from existing statistics — (column,
     // ndv) rows. Derived from the leading-column histogram of each stats object:
@@ -2676,6 +2688,17 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         return result;
     }
 
+    /// <summary>
+    /// Suffix of the per-row form of a discovered routine. A PROVIDER convention, not a host one: the host no
+    /// longer synthesises these, so stripping the suffix to find the underlying routine is this class's job.
+    /// </summary>
+    internal const string EachSuffix = "_each";
+
+    private static string StripEach(string functionName) =>
+        functionName.EndsWith(EachSuffix, StringComparison.OrdinalIgnoreCase)
+            ? functionName.Substring(0, functionName.Length - EachSuffix.Length)
+            : functionName;
+
     public Schema GetFunctionParamSchema(string schemaName, string functionName)
     {
         // A custom function of any kind answers from the set (which tags a table/sqlgen function's NAMED
@@ -2684,6 +2707,14 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         if (SqlServerSessionTagFunction.Is(functionName))
         {
             return SessionTag.Parameters;
+        }
+        // The per-row form declares exactly one parameter: the INPUT TABLE. Its per-row argument values come
+        // from the input's COLUMNS, not from constant args, so there is nothing else to declare — and
+        // answering here keeps its signature coming from a declaration like every other function's, instead of
+        // the host special-casing a name it no longer knows about.
+        if (functionName.EndsWith(EachSuffix, StringComparison.OrdinalIgnoreCase))
+        {
+            return new Schema(new[] { Params.TableInput("input") }, metadata: null);
         }
         var custom = Functions.ParamSchema(schemaName, functionName);
         if (custom is not null)
@@ -2958,10 +2989,14 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         // registered it on the Sink+Source collector operator (kind='collector'), which feeds a NON-gated
         // buffered input stream, so its Collect reading all input before yielding (no sentinels) is safe.
         // Not a custom function ⇒ a discovered `_each`, classified as everywhere else.
+        // Not a custom function => this provider's per-row form, `<routine>_each`. THIS CLASS strips the
+        // suffix, because THIS CLASS chose it: the host used to resolve the alias and hand us the base name,
+        // which is exactly the coupling that made a SQL-Server semantic the host's business.
+        var routine = StripEach(functionName);
         var binding = Functions.InOutBind(schemaName, functionName, args, inputSchema)
-                      ?? (FunctionOutputColumns(schemaName, functionName).Count > 0
-                          ? new SqlServerTvfEach(this, schemaName, functionName, inputSchema)
-                          : (IArrowInOutBinding)new SqlServerProcEach(this, schemaName, functionName, inputSchema));
+                      ?? (FunctionOutputColumns(schemaName, routine).Count > 0
+                          ? new SqlServerTvfEach(this, schemaName, routine, inputSchema)
+                          : (IArrowInOutBinding)new SqlServerProcEach(this, schemaName, routine, inputSchema));
         // Resolve the SQL isolation for this in-out call and set it on the binding (if it honors isolation):
         // a SET mssql_isolation_level (pushed to the provider settings store) overrides this catalog's ATTACH
         // isolation_level default; pure-C# / proc bindings ignore it. Replaces the former C++
