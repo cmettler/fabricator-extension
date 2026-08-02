@@ -413,7 +413,24 @@ input batch carries a rowid column, so re-packing is correct there rather than a
 
 ### 6.3 Predicate lowering — and the zero-read DELETE is MEASURED
 
-`MetadataPredicate` is ported as-is (self-contained; only `Expressions` types + `FileRowSelection`) and
+> **⚠ REMOVED 2026-08-02 (EW `141bd98`). This section is a HISTORICAL record — `MetadataPredicate`,
+> `MatchedRowsUpdater` and `DeleteBySelectionViaVectorsOrRewriteAsync` are gone from the patch set, the
+> seven tests below with them, and `DeleteAsync`/`UpdateAsync` are back to upstream's exact shape.**
+>
+> Not because it was wrong — the hazard it guards is real and still present in upstream's API — but
+> because **fabricator can never reach it**, and structurally so: the lowering exists to PRODUCE a
+> `RowSelection`, and DuckDB's rowid is our key, so the Bridge already holds the selection before EW sees
+> the statement. Measured: zero Bridge references, and its two call sites are entry points we never call
+> (our DML goes through `DeleteRowsAsync(RowSelection)` / `UpdateRowsAsync` /
+> `UpdateBySelectionViaVectorsAsync`). Patch set 1133 → 867 added lines; EW Table.Tests 875 → 868 on all
+> three TFMs, exactly the seven removed.
+>
+> **The zero-read tiers below are therefore about a path fabricator does not take.** They are kept because
+> the MEASUREMENT is still the reference for what a lowered DELETE costs, and because the file is a
+> candidate to OFFER upstream — where it serves every host except the one proposing it. Removal does not
+> foreclose that: `offer/*` branches cut fresh off `upstream/main`, and git history keeps the file.
+
+`MetadataPredicate` was ported as-is (self-contained; only `Expressions` types + `FileRowSelection`) and
 wired at the head of `DeleteAsync(predicate)`: a predicate addressing rows only physically lowers to a
 selection, and one that MENTIONS `_metadata` but cannot lower is **rejected loudly** rather than handed to
 the row mask, which binds data columns only and would mis-evaluate it — deleting the wrong rows silently.

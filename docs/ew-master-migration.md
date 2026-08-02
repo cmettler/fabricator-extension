@@ -871,10 +871,43 @@ Gate: `verify_delta_txn_version` §9 (51 → **65**), mutation-tested — revert
 positive control, so the later zero cannot be read as "never written", and its comment says the delete must
 exceed the inline threshold or the section passes while testing nothing. Hermetic floor 5640 → **5654**.
 
+### `MetadataPredicate` REMOVED the same day (EW `141bd98`) — the patch set is 1133 → 867
+
+The predicate lowering (`_metadata.file_path` + `_metadata.row_index` → a `RowSelection`, and a loud refusal
+for a `_metadata` predicate that cannot lower) is gone, with `MatchedRowsUpdater`,
+`DeleteBySelectionViaVectorsOrRewriteAsync` and its seven tests. `DeleteAsync`/`UpdateAsync` return to
+upstream's exact shape.
+
+**Not because it was wrong — because we can never reach it, structurally.** The lowering exists to PRODUCE
+a `RowSelection`, and DuckDB's rowid IS our key, so the Bridge holds the selection before EW sees the
+statement; routing a predicate through it could only hand back what we started with. Measured: zero Bridge
+references, and its two call sites are entry points we never call (our DML goes through
+`DeleteRowsAsync(RowSelection)` / `UpdateRowsAsync` / `UpdateBySelectionViaVectorsAsync`).
+`Expressions.Predicate` IS used by the Bridge — for scan pushdown and the read-set declaration only.
+
+⚠ **The deciding question was WHICH `_metadata` columns it lowers, and it is TWO of the four**:
+`file_path` and `row_index` — NOT `row_id`, NOT `row_commit_version`. Physical address only, which is
+exactly what a DuckDB rowid already decodes to. **Had it lowered the STABLE id the answer would flip**: a
+`DELETE WHERE _metadata.row_id IN (…)` cannot be resolved to `(path, position)` without reading, so that
+lowering WOULD give a rowid-keyed host something it cannot derive. It does not exist, and such a predicate
+is refused outright by `ThrowIfReferencesMetadata` — so even the hypothetical future need points AWAY.
+
+- **Tests: seven removed, the rest MIGRATED not deleted.** The other `MetadataColumnTests` uses were
+  `MetadataPredicate.FilePathColumn` / `.RowIndexColumn` as COLUMN-NAME CONSTANTS, not the lowering →
+  repointed at `DeltaMetadataColumns`, which is where the names belong. 875 → **868** on all three TFMs,
+  exactly the seven, nothing collateral.
+- **Removal does NOT foreclose the offer**, and arguably strengthens it: `offer/*` branches cut fresh off
+  `upstream/main` and git history keeps the file, while "we do not use this ourselves" is the honest lead
+  for a reviewer who triages by WHO EACH GAP SERVES. The hazard is real and still present upstream.
+- Historical description of the feature (measurement tiers included) survives in
+  [rowid-dml-seam.md](rowid-dml-seam.md) §6.3, flagged as removed.
+
 ### Gates
 
-EW Table.Tests **875/875 × {net10.0, net8.0, net472}**; fabricator hermetic **63/63 — 5640**; service
-**44/44 — 1424**. Both fabricator tiers at exactly their floors.
+EW Table.Tests **875/875 × {net10.0, net8.0, net472}** at the bump, **868/868** after the
+`MetadataPredicate` removal; fabricator hermetic **63/63 — 5640** at the bump and **5654** after the
+`await using` gate; service **44/44 — 1424**, then **1444** with the S3 attach warning. Every tier at
+exactly its floor at each step.
 
 **Harness gap found: the CLAUDE.md copy-paste block does not run the service tier.** It is missing
 `MSSQL_TESTDB_URI`, `MSSQL_TEST_PASS`, `MSSQL_BINCOLL_DSN` and `FABRICATOR_PLUGIN_DIR`; `run-suites.sh`

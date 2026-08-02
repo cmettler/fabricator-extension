@@ -75,7 +75,13 @@ SMALL upstreamable patch set ON TOP of clast master — never a fork again — s
 merge-upstream-into-fabricator-patches + re-pin. **⚠ That upstream branch is now
 `upstream/main`, NOT `master`** — upstream renamed it (`8caf8d8`) and the stale `upstream/master`
 remote-tracking ref still resolves, so a merge of it silently lands on an abandoned branch.
-**Current pin: `3b95599`** (the 2026-08-02 bump, §THE 2026-08-02 BUMP below). What the patches carry: the **`DeltaTable.PlanFiles`
+**Current pin: `141bd98`** (the 2026-08-02 bump + the `MetadataPredicate` removal, §THE 2026-08-02 BUMP
+below). **Patch set MEASURED 2026-08-02 after that removal: +867 / −44 lines across 8 files**, of which the
+variant transport is ~44% (`VariantTransport.cs` 322 + `SchemaConverter` 47 + `DeltaTableOptions` 15 +
+csproj 5) and `DeltaTable.cs` 409 the other block. **`MetadataPredicate` (182 lines) is GONE** — the
+predicate lowering was unreachable from a rowid-keyed host (its job is to PRODUCE the `RowSelection` we
+already hold), so it cost divergence for a path we can never take; removing it does not foreclose OFFERING
+it, since `offer/*` branches cut off `upstream/main` and history keeps the file. What the patches carry: the **`DeltaTable.PlanFiles`
 planning API** (proposed to Curt 2026-07-25, endorsed, and BUILT by us 2026-07-26 — it REPLACED the
 earlier `DeltaFilePruner`-public patch, which is retired; full record in the `PlanFiles` subsection below);
 create-time `configuration`/`preAssignedSchema`/`materializedRowIds` params; rowid read-back
