@@ -35,6 +35,8 @@ wheels/
 
 # Local credentials / connection recipes — contain live secrets, never commit.
 /fabric.md
+/adls_account.txt
+/adls_secret.sql
 
 # dbt-duckdb harnesses — the SOURCE (dbt_project.yml, models/, macros/, plugins/, seeds/,
 # snapshots/, pyproject.toml, uv.lock, profiles.example.yml) is tracked; SECRETS + generated

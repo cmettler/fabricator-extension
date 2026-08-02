@@ -175,7 +175,7 @@ internal sealed class FileLoggerProvider : ILoggerProvider
                 // is the question that actually costs time: a OneLake commit conflict arrives as a generic Azure
                 // RequestFailedException, and identifying the call site by reading code instead of reading a
                 // trace is how a conditional-create status mapping stayed wrong (see
-                // OneLakeDataLakeFileSystem.CreateAsync). Kept off at Warning/Information so the normal sink
+                // AdlsGen2TableFileSystem.CreateAsync). Kept off at Warning/Information so the normal sink
                 // stays one line per event.
                 if (_owner._min <= LogLevel.Debug)
                 {

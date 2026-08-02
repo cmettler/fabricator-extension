@@ -14,32 +14,38 @@ using EngineeredWood.IO;
 namespace Fabricator.Bridge;
 
 /// <summary>
-/// An <see cref="ITableFileSystem"/> (engineered-wood) for <b>OneLake</b> (Microsoft Fabric) that does all IO
-/// through the <b>Azure DataLake SDK directly</b> (<see cref="DataLakeFileSystemClient"/>), bypassing DuckDB's
-/// azure extension entirely. This escapes the duckdb-azure OneLake gaps (the mid-path-wildcard glob bug PR #174,
-/// and <c>MoveFile</c>/<c>RemoveDirectory</c> being unimplemented on the DFS endpoint) — most importantly
-/// <see cref="RenameAsync"/> here is a <b>true atomic ADLS rename</b> (put-if-absent via <c>IfNoneMatch=*</c>),
-/// the Delta-commit primitive, instead of the copy+exclusive-create emulation the host-FS path needs.
+/// An <see cref="ITableFileSystem"/> (engineered-wood) for <b>ADLS Gen2</b> — Fabric OneLake and plain storage
+/// accounts alike — that does all IO through the <b>Azure DataLake SDK directly</b>
+/// (<see cref="DataLakeFileSystemClient"/>), bypassing DuckDB's azure extension entirely. This escapes the
+/// duckdb-azure DFS gaps (the OneLake mid-path-wildcard glob bug PR #174, and <c>MoveFile</c>/
+/// <c>RemoveDirectory</c> being unimplemented) — most importantly <see cref="RenameAsync"/> here is a
+/// <b>true atomic ADLS rename</b> (put-if-absent via <c>IfNoneMatch=*</c>), the Delta-commit primitive,
+/// instead of the copy+exclusive-create emulation the host-FS path needs.
 ///
-/// <para>Selected for OneLake roots by <see cref="TableFileSystems.Create"/> when a Fabric credential is present
-/// (<see cref="AmbientOneLakeCredential"/>); local / S3 / plain-ADLS roots keep <see cref="DuckDbTableFileSystem"/>
-/// (DuckDB's FileSystem + secrets). The credential is the one resolved by <see cref="FabricCredentialResolver"/>
-/// from the ATTACH'd azure secret (or the Fabric managed/workspace identity).</para>
+/// <para><b>Nothing here was ever OneLake-specific</b> — the endpoint host has always been parsed out of the
+/// <c>abfss://</c> path (<see cref="ParseAbfss"/>), so the class served any DFS account and only the SELECTOR
+/// said otherwise. It was renamed from <c>OneLakeDataLakeFileSystem</c> when plain ADLS Gen2 accounts started
+/// routing through it; the name had become the only thing claiming a restriction the code did not have.</para>
+///
+/// <para>Selected for <c>abfss://</c> roots by <see cref="TableFileSystems.Create"/> when a storage credential
+/// is present (<see cref="AmbientAdlsCredential"/>); local / S3 roots keep <see cref="DuckDbTableFileSystem"/>
+/// (DuckDB's FileSystem + secrets). The credential is either Entra (OneLake, a service principal, a Fabric
+/// workspace identity) or a shared key — see <see cref="AdlsCredential"/>.</para>
 ///
 /// <para>Paths are root-relative (matching <see cref="DuckDbTableFileSystem"/>): <see cref="ListAsync"/> returns
 /// paths relative to the table root, and they are re-resolved against it. All operations use the <b>async</b>
 /// DataLake APIs — the sync ones use <c>HttpClient.Send</c>, which hangs under the hostfxr-hosted CLR (the same
-/// gotcha documented across the Bridge's OneLake IO).</para>
+/// gotcha documented across the Bridge's ADLS IO).</para>
 /// </summary>
-internal sealed class OneLakeDataLakeFileSystem : ITableFileSystem
+internal sealed class AdlsGen2TableFileSystem : ITableFileSystem
 {
     private readonly DataLakeFileSystemClient _fs;
     private readonly string _rootUnderFs; // path of the table root within the filesystem (e.g. "lh.Lakehouse/Tables/t")
 
-    public OneLakeDataLakeFileSystem(string rootAbfss, TokenCredential credential)
+    public AdlsGen2TableFileSystem(string rootAbfss, AdlsCredential credential)
     {
         var (host, fileSystem, pathUnderFs) = ParseAbfss(rootAbfss);
-        _fs = new DataLakeFileSystemClient(new Uri($"https://{host}/{fileSystem}"), credential);
+        _fs = credential.CreateFileSystemClient(host, fileSystem);
         _rootUnderFs = pathUnderFs.TrimEnd('/');
     }
 
@@ -209,7 +215,7 @@ internal sealed class OneLakeDataLakeFileSystem : ITableFileSystem
         // ETag precondition failed, and no read path here sends one.
         catch (RequestFailedException ex) when (!overwrite && (ex.Status == 409 || ex.Status == 412))
         {
-            throw new IOException($"OneLakeDataLakeFileSystem: file already exists: {path}");
+            throw new IOException($"AdlsGen2TableFileSystem: file already exists: {path}");
         }
         return new OneLakeSequentialFile(file);
     }
@@ -284,7 +290,7 @@ internal sealed class OneLakeRandomAccessFile : IRandomAccessFile
             int n = await content.ReadAsync(owner.Array.AsMemory(total, len - total), cancellationToken).ConfigureAwait(false);
             if (n == 0)
             {
-                throw new IOException($"OneLakeDataLakeFileSystem: short read ({total}/{len}) at offset {range.Offset}");
+                throw new IOException($"AdlsGen2TableFileSystem: short read ({total}/{len}) at offset {range.Offset}");
             }
             total += n;
         }

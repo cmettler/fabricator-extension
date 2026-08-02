@@ -46,7 +46,7 @@ public sealed class DeltaGlobalTableFunction : ITableFunction
         // read the Delta table's schema now (no data read). This is a connection-free global reader with no
         // Fabric credential, so clear any left on this (reused) execution thread by a prior catalog op → the FS
         // factory uses the host-FS (duckdb-azure) path, not the direct-SDK OneLake filesystem.
-        AmbientOneLakeCredential.Current = null;
+        AmbientAdlsCredential.Current = null;
         var schema = DeltaReader.GetSchema(AmbientOpener.Current, path);
         return new DeltaBinding(path, schema);
     }
@@ -75,7 +75,7 @@ public sealed class DeltaGlobalTableFunction : ITableFunction
             // Capture the opener (this operator's ClientContext) NOW — it stays valid for the whole execution,
             // so the lazy stream below can read files through it as the host pulls batches (no materialization).
             // Connection-free global reader → clear any stale Fabric credential (host-FS path, see Bind).
-            AmbientOneLakeCredential.Current = null;
+            AmbientAdlsCredential.Current = null;
             var opener = AmbientOpener.Current;
             var spec = scan.Spec;
             // Push the FILTER for file + row-group skipping (doesn't change the result schema). Read the filter
@@ -151,7 +151,7 @@ public sealed class DeltaNativeScanFunction : ITableFunction
         var path = ((StringArray)args.Column(0)).GetString(0)
                    ?? throw new System.ArgumentException("fabricator_delta_native_scan: path must not be NULL");
         // Connection-free global reader → clear any stale Fabric credential (host-FS path for the log read).
-        AmbientOneLakeCredential.Current = null;
+        AmbientAdlsCredential.Current = null;
         var opener = AmbientOpener.Current;
         var schema = DeltaReader.GetSchema(opener, path);              // engineered-wood: the log → schema
         var files = DeltaReader.GetActiveFileUris(opener, path);      // engineered-wood: the exact active file set
@@ -260,7 +260,7 @@ public sealed class DeltaWriteDemoFunction : ITableFunction
         public IAsyncEnumerable<RecordBatch> Execute(TableFunctionScan scan, CancellationToken ct = default)
         {
             // Write synchronously while the opener (captured now) is valid, then yield the result row.
-            AmbientOneLakeCredential.Current = null; // connection-free global writer → host-FS path
+            AmbientAdlsCredential.Current = null; // connection-free global writer → host-FS path
             var (version, rows) = WriteDemoTable(AmbientOpener.Current, _path, ct);
             var batch = new RecordBatch(_schema, new IArrowArray[]
             {
@@ -1450,7 +1450,7 @@ public sealed class DeltaWriteCollectorFunction : ICollectorTableFunction
             IAsyncEnumerable<RecordBatch> allInput, [EnumeratorCancellation] CancellationToken ct = default)
         {
             // Capture the opener at entry (the operator set it before pulling); valid for the whole write.
-            AmbientOneLakeCredential.Current = null; // connection-free global collector → host-FS path
+            AmbientAdlsCredential.Current = null; // connection-free global collector → host-FS path
             var opener = AmbientOpener.Current;
 
             // Copy the input out of its (transient) Arrow buffers via an IPC round-trip, since the operator frees

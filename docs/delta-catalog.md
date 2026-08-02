@@ -17,8 +17,18 @@ Two Delta providers are emerging — keep them distinct:
 A mid-path-wildcard glob (`<root>/*/_delta_log/…`) throws `type must be string, but is null` recursing a OneLake
 listing, so a OneLake root discovers its tables via the **Fabric REST API** instead of `HostFs.Glob`
 (`FabricLakehouse`, Bridge): `TablesClient.ListTables(workspaceId, lakehouseId)` (`Microsoft.Fabric.Api` 2.14.0)
-returns each `Table { Name, Location, Format }`. **Local / S3 / plain-ADLS roots keep the glob** —
+returns each `Table { Name, Location, Format }`. **Local and S3 roots keep the glob**;
 `DeltaCatalog.DiscoverTables` branches on `FabricLakehouse.IsOneLake(_root)` (host contains `onelake.`).
+
+> **⚠ Updated 2026-08-02 — "plain ADLS keeps the glob" is no longer true, and the sentence it appeared in
+> conflated two questions.** A plain (non-OneLake) ADLS Gen2 account now discovers via an Azure DataLake
+> **directory walk** (`AdlsTableDiscovery`) when the ATTACH names an azure secret. The predicate was split:
+> `AdlsPath.IsAdlsGen2` decides the TRANSPORT (filesystem, directory ops, commit primitive — every abfss
+> root, OneLake included), `FabricLakehouse.IsOneLake` decides the CATALOG (Unity Catalog discovery, the
+> schema-enabled flag, the `fabric_*` functions). Note the glob *does* work on a plain account — the
+> duckdb-azure mid-path-wildcard bug below is OneLake-specific — so this is a cost change (O(tables) rather
+> than O(commit files)), not a correctness fix. What WAS a correctness fix is the commit guard and
+> `RENAME`/`DROP`, which the host-FS path cannot serve: [delta-transactions.md](delta-transactions.md) §8.4.
 Workspace + lakehouse are parsed from `abfss://<ws>@onelake…/<lh>[.Lakehouse]/Tables`: GUID segments are used
 directly, display names are resolved via `WorkspacesClient`/`ItemsClient`. Auth = a `TokenCredential` minted from
 the **ATTACH'd azure SP secret** — `ATTACH '…OneLake…/Tables' (TYPE fabricator, PROVIDER 'delta', SECRET <azure_sp>,
@@ -355,7 +365,8 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
    **OneLake table discovery uses the Fabric REST API** (the DuckDB azure glob can't recurse a OneLake
    `_delta_log` tree — duckdb-azure #174 — `<root>/*/_delta_log/…` throws `type must be string, but is null`).
    `DeltaCatalog.DiscoverTables` branches on `FabricLakehouse.IsOneLake(_root)`: OneLake →
-   `TablesClient.ListTables`; **local / S3 / plain ADLS keep the glob**. See the "OneLake table discovery" note
+   `TablesClient.ListTables`; **local / S3 keep the glob** (plain ADLS moved to a DFS directory walk on
+   2026-08-02 — see the ⚠ note under "OneLake table discovery"). See the "OneLake table discovery" note
    near the top of this doc for auth (the ATTACH'd azure SP secret) + workspace/lakehouse resolution. Live Fabric
    validation pending.
 2. **Write arbitrary data — DONE, both the function form AND the catalog (streaming) form.**

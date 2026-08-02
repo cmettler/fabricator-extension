@@ -8,6 +8,7 @@
 #include "fabricator/clr_host.hpp"
 #include "catalog/fabricator_catalog.hpp"
 #include "catalog/fabricator_schema_entry.hpp"
+#include "fabricator_secret.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/value.hpp"
@@ -320,7 +321,17 @@ static unique_ptr<GlobalFunctionData> CopyToInitGlobal(ClientContext &context, F
 		// FORMAT delta: open the per-execution transient catalog rooted at the target's parent directory.
 		// Owned by the gstate (closed at finalize; rolled back + closed by the destructor on failure).
 		fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context));
-		handle = fabricator::OpenCatalog(bind_data.catalog_name, "delta", bind_data.options_json);
+		// A COPY has no SECRET clause, but it opens a REAL catalog and needs the same credential an ATTACH
+		// would carry: without one the provider silently falls back to the host filesystem, which on
+		// abfss:// cannot commit atomically and cannot rename or remove a directory at all. Resolve the
+		// azure secret whose SCOPE covers the target (azure secrets scope to abfss:// by default, so this
+		// normally needs no user action) and hand its fields over on the connection string exactly as the
+		// named-secret ATTACH path does. No match => unchanged => the previous host-FS behaviour.
+		string root = bind_data.catalog_name;
+		if (StringUtil::StartsWith(StringUtil::Lower(root), "abfss://")) {
+			root = BuildConnectionStringFromScopedSecret(context, root, "azure", "delta");
+		}
+		handle = fabricator::OpenCatalog(root, "delta", bind_data.options_json);
 		gstate->owned_catalog = handle;
 		fabricator::SetActiveTxn(handle, gstate->txn_id);
 	}

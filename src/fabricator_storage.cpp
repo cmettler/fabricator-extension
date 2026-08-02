@@ -168,6 +168,13 @@ static unique_ptr<Catalog> FabricatorAttach(optional_ptr<StorageExtensionInfo> s
 		// server/database come from it. provider is the resolved PROVIDER option (which backend interprets it).
 		connection_string = BuildConnectionStringFromSecret(context, secret_name, info.path, provider);
 	} else {
+		// NOTE: an abfss:// ATTACH with no SECRET named is deliberately NOT auto-resolved here, even though
+		// the COPY path does exactly that (fabricator_copy.cpp). The difference is that COPY knows its
+		// provider is 'delta'; here `provider` may be EMPTY (no PROVIDER option, inferred later from the
+		// scheme), and an empty provider resolves to the DEFAULT backend, whose azure branch merges the
+		// fields into a SQL Server connection string — it would turn the abfss path into a mangled connstr
+		// and break an attach that currently works. Auto-resolution here needs provider dispatch settled
+		// first; until then the remedy is the explicit SECRET, and the attach warns when it is missing.
 		connection_string = info.path;
 	}
 	if (connection_string.empty()) {

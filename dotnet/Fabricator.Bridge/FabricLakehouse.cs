@@ -55,20 +55,29 @@ public static class FabricLakehouse
         return root + CredMarker + b64;
     }
 
-    /// <summary>Splits a connection string into the bare root path and an optional Fabric API credential.</summary>
-    public static (string Root, TokenCredential? Credential) Extract(string connectionString)
+    /// <summary>Splits a connection string into the bare root path, an optional Fabric REST API credential, and
+    /// the ADLS Gen2 STORAGE credential.</summary>
+    /// <remarks>
+    /// The two are separate because they are not interchangeable. The Fabric REST + Unity-Catalog endpoints need
+    /// an Entra token and nothing else will do; storage IO also accepts a shared key, which is how a plain ADLS
+    /// Gen2 account is normally handed out. So a shared-key attach yields <c>Credential == null</c> (there is no
+    /// Fabric catalog to talk to — and <see cref="IsOneLake"/> is false for such a root anyway, so nothing asks)
+    /// while <c>Storage</c> is populated and does all the IO.
+    /// </remarks>
+    public static (string Root, TokenCredential? Credential, AdlsCredential? Storage) Extract(string connectionString)
     {
         int idx = connectionString.IndexOf(CredMarker, StringComparison.OrdinalIgnoreCase);
         if (idx < 0)
         {
-            return (connectionString, null);
+            return (connectionString, null, null);
         }
         var root = connectionString.Substring(0, idx);
         var b64 = connectionString.Substring(idx + CredMarker.Length);
         var fields = JsonSerializer.Deserialize<Dictionary<string, string>>(
                          Encoding.UTF8.GetString(Convert.FromBase64String(b64)))
                      ?? new Dictionary<string, string>();
-        return (root, BuildCredential(fields));
+        var storage = AdlsCredential.FromFields(fields, entraOnly: IsOneLake(root));
+        return (root, storage.Token, storage);
     }
 
     // Delegates to the shared resolver (SP / managed_identity / DefaultAzureCredential) — one credential model
@@ -147,12 +156,13 @@ public static class FabricLakehouse
     /// <summary>DROP a OneLake table folder (recursive DFS delete) using SP fields — for the delta-rs provider,
     /// which holds the SP creds as strings, not a <see cref="TokenCredential"/>.</summary>
     public static void DeleteOneLakeDirectory(string abfssDir, string? tenantId, string? clientId, string? clientSecret) =>
-        DeleteDirectory(abfssDir, MintCredential(tenantId, clientId, clientSecret));
+        DeleteDirectory(abfssDir, AdlsCredential.FromToken(MintCredential(tenantId, clientId, clientSecret)));
 
     /// <summary>RENAME a OneLake table folder (atomic DFS rename) using SP fields.</summary>
     public static void RenameOneLakeDirectory(string abfssSrc, string abfssDest,
                                               string? tenantId, string? clientId, string? clientSecret) =>
-        RenameDirectory(abfssSrc, abfssDest, MintCredential(tenantId, clientId, clientSecret));
+        RenameDirectory(abfssSrc, abfssDest,
+                        AdlsCredential.FromToken(MintCredential(tenantId, clientId, clientSecret)));
 
     public static (bool SchemaEnabled, Guid WorkspaceId, Guid LakehouseId, List<(string Schema, string Table)> Tables)
         ResolveOneLakeTables(string root, string? tenantId, string? clientId, string? clientSecret)
@@ -277,12 +287,11 @@ public static class FabricLakehouse
     /// folder) via the DFS endpoint — DuckDB's azure FileSystem has no RemoveDirectory. Idempotent (no error if
     /// the directory is already gone), so it satisfies DROP TABLE IF EXISTS. Async API (see
     /// <see cref="ListChildDirectories"/> for why sync hangs under the CLR).</summary>
-    public static void DeleteDirectory(string abfssDir, TokenCredential? credential)
+    public static void DeleteDirectory(string abfssDir, AdlsCredential? credential)
     {
-        var cred = credential ?? FabricCredentialResolver.AmbientChain();
+        var cred = credential ?? AdlsCredential.FromToken(FabricCredentialResolver.AmbientChain());
         var (host, fileSystem, pathUnderFs) = ParseAbfss(abfssDir.Replace('\\', '/').TrimEnd('/'));
-        var dirClient = new DataLakeDirectoryClient(
-            new Uri($"https://{host}/{fileSystem}/{pathUnderFs}"), cred);
+        var dirClient = cred.CreateDirectoryClient(host, fileSystem, pathUnderFs);
         dirClient.DeleteIfExistsAsync().GetAwaiter().GetResult(); // directory delete on DFS is recursive
     }
 
@@ -292,13 +301,12 @@ public static class FabricLakehouse
     /// A Delta table's <c>_delta_log</c> uses table-relative paths, so moving the whole folder preserves the
     /// table. Src and dest are in the same filesystem (workspace). Async API (sync hangs under the CLR — see
     /// <see cref="ListChildDirectories"/>).</summary>
-    public static void RenameDirectory(string abfssSrc, string abfssDest, TokenCredential? credential)
+    public static void RenameDirectory(string abfssSrc, string abfssDest, AdlsCredential? credential)
     {
-        var cred = credential ?? FabricCredentialResolver.AmbientChain();
+        var cred = credential ?? AdlsCredential.FromToken(FabricCredentialResolver.AmbientChain());
         var (host, fileSystem, srcPath) = ParseAbfss(abfssSrc.Replace('\\', '/').TrimEnd('/'));
         var (_, _, destPath) = ParseAbfss(abfssDest.Replace('\\', '/').TrimEnd('/'));
-        var dirClient = new DataLakeDirectoryClient(
-            new Uri($"https://{host}/{fileSystem}/{srcPath}"), cred);
+        var dirClient = cred.CreateDirectoryClient(host, fileSystem, srcPath);
         // destinationPath = the new path WITHIN the same filesystem, WITHOUT the filesystem prefix. OneLake
         // validates that the leading segment is the item ("<name>.Lakehouse"); prefixing the workspace
         // (filesystem) makes it the leading segment and OneLake rejects it ("item type extension is missing").

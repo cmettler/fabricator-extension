@@ -329,6 +329,8 @@ depends on the filesystem:
 |---|---|---|
 | Local POSIX | `O_EXCL` exclusive create | multi-process safe (validated: 4 processes × 200 rows → 800/800) |
 | OneLake / abfss (`onelake://`) | ADLS conditional create (`If-None-Match: *`) | multi-process safe for DATA (no lost writes measured), but a losing writer can surface an ERROR instead of retrying — see §8.1 |
+| Plain ADLS Gen2 `abfss://` **with an azure `SECRET` NAMED** | the SAME ADLS conditional create — a credentialed abfss root now takes the direct-SDK filesystem, which is what OneLake always took | **MEASURED 2026-08-02 (§8.4): 6 writers × 8 commits ⇒ 48/48, zero losses, commit versions fully interleaved across writers so contention was real** |
+| Plain ADLS Gen2 `abfss://` with **no named secret** | **none that holds** — duckdb-azure's `ExclusiveCreate` is a client-side existence CHECK, so it races | **MEASURED 2026-08-02 (§8.4): 41 of 48 landed, six of the seven losses SILENT.** Single-writer only; RENAME/DROP also unavailable |
 | Fabric fuse mount (`/lakehouse/default`) | `O_EXCL` over fuse — doubtful | treat as **single-writer** |
 | S3 plain ATTACH (httpfs) | **none** — httpfs never sends `If-None-Match` | **MEASURED 2026-08-02 (§8.3): 6 writers × 8 commits ⇒ 8 of 48 landed, 40 SILENTLY LOST, zero errors.** Single-writer, and the "guarded" alternative needs the secret NAMED in the ATTACH |
 | S3 ATTACH **with an s3 `SECRET`** | real conditional PUT via the AWS SDK (`S3CommitFileSystem`: Get(temp) → Put(target, `If-None-Match:"*"`) → Delete(temp); 412 → conflict → OCC/rebase) | multi-process / multi-engine safe (validated on MinIO: 4 × 10 commits × 20 rows → 40/40, 800/800, across checkpoint boundaries) |
@@ -549,6 +551,103 @@ and the fix is one option.
 - Gate: `verify_delta_catalog_s3` §11 (161 → **171**), **two mutants killed in opposite directions by ONE
   assertion** — suppressing the warning yields 0, ignoring `access_mode` yields 2 (the AUTOMATIC attach
   warns too). The second is what proves the new C++ plumbing is READ rather than merely forwarded.
+
+### 8.4 Plain (non-OneLake) ADLS Gen2 — MEASURED 2026-08-02, and the probe said it was FINE
+
+Support for a plain ADLS Gen2 storage account (`abfss://<fs>@<account>.dfs.core.windows.net/…`, as opposed
+to Fabric OneLake) started from the reasonable-looking position that it already worked: on a live account,
+ATTACH, discovery, CTAS, INSERT, DELETE, DROP and both directions of parquet IO through duckdb-azure all
+succeeded on the first try. Two things did not, and only one of them announced itself.
+
+**Defect 1 — RENAME TABLE was impossible.** `AzureDfsStorageFileSystem: MoveFile is not implemented!`. Loud,
+but easy to under-rate: a dbt table model's swap is two renames, so *every re-deploy* of a table model
+against such an account failed. This is the same gap OneLake had, and OneLake had a fix — the DFS-native
+atomic directory rename — that was gated on `IsOneLake` and therefore unreachable for any other account.
+
+**Defect 2 — the commit guard did not hold, and a capability probe SAID IT DID.**
+`fabricator_fs_write_probe` reports `exclusive_create_existing_fails = true` on abfss, with duckdb-azure's
+own message *"ExclusiveCreate specified while file already exists"*. That is a genuine throw and a correct
+single-threaded answer. It is also a **client-side existence check**, so two writers at the same Delta
+version both pass it, both create, and one silently wins — plus their appends can collide, which is where
+the one non-silent symptom came from:
+
+| ATTACH shape | attempted | commit files | rows | missing groups | writer errors |
+|---|---|---|---|---|---|
+| no named secret (host-FS commit) | 48 | 42 | 41 | **7** | 1 (`InvalidFlushPosition`) |
+| `SECRET adls_kv` (direct-SDK commit) | 48 | 48 | 48 | **0** | 0 |
+
+Six of the seven losses raised nothing at all. The seventh surfaced as Azure
+*"InvalidFlushPosition … the uploaded data is not contiguous"* — an error that reads like a transient upload
+fault rather than "your commit was overwritten", so even the loud case misdirects. Harness:
+`scratchpad/adls_race.sh` (`W`/`C`/`NAMED`).
+
+**The lesson is specifically about probes.** §8.3's S3 case was detectable by capability probe — httpfs
+overwrites on `EXCLUSIVE_CREATE`, so the probe fails and the answer is visible without concurrency. Here the
+probe PASSES and the implementation is still unsafe, because "throws on an existing file" and "is atomic"
+are different claims and only the second one matters for a commit. **A capability probe can rule a backend
+OUT; it cannot rule one IN.** Only a concurrent run distinguishes a conditional PUT from a check.
+
+**The fix is one mechanism for both defects**: split the discriminator that had conflated transport with
+catalog. `AdlsPath.IsAdlsGen2` (is this the ADLS Gen2 DFS transport?) now selects the filesystem, the
+directory ops and the commit primitive; `FabricLakehouse.IsOneLake` (is this a Fabric lakehouse?) keeps
+selecting only what is genuinely Fabric — Unity Catalog discovery, the schema-enabled flag, the `fabric_*`
+functions. The direct-SDK filesystem was never OneLake-specific; it had always parsed its endpoint host out
+of the `abfss://` path, so *only the gate* said otherwise (it was renamed `OneLakeDataLakeFileSystem` →
+`AdlsGen2TableFileSystem` to stop the name claiming a restriction the code did not have).
+
+**Credentials gained a shape, and that is the only genuinely new code.** Everything ADLS-facing assumed an
+Entra `TokenCredential`. A plain account commonly ships as an account key or a storage connection string,
+which no Entra path can consume — hence `AdlsCredential` (token *or* shared key). Note the asymmetry, since
+it is easy to state backwards: **a plain ADLS account accepts BOTH** (Entra via RBAC is fully supported
+there and is the better practice); **OneLake is Entra-ONLY**. So the credential shape follows the SECRET,
+not the kind of account, with one guard — `entraOnly` — so that an azure secret carrying a
+`connection_string` cannot silently downgrade a Fabric attach to key auth OneLake would reject. An
+explicitly configured service principal outranks key material for the same reason in reverse.
+
+**Naming the secret is load-bearing, exactly as on S3.** The credential reaches the catalog only via the
+marker `BuildConnectionString` appends, and that runs only when the ATTACH NAMES a secret. An azure secret
+merely in scope authenticates duckdb-azure's DATA IO — so the unguarded configuration reads, writes and
+passes every single-writer test. Hence the attach-time warning (§8.3's, generalized to both backends).
+
+**`COPY … TO 'abfss://…' (FORMAT delta)` is routed through the direct-SDK filesystem too** — and this was
+initially got WRONG, in a way worth recording. The first pass shipped it on the host-FS path and justified
+that as acceptable ("no `SECRET` clause, one statement, one commit"). But "has no SECRET clause" described
+the plumbing, not a constraint: with `FORMAT delta` we build the catalog ourselves and we know the target is
+abfss, so we can resolve a credential exactly as the `onelake://` FileSystem already does. **A limitation
+that is really an unimplemented case should not be written up as a design trade-off.**
+
+The resolution rule is a **scope match**, not a name: a DuckDB secret's scope IS a path prefix, so a secret
+that matches was declared for this location, and `azure` secrets scope to `abfss://` by default — the common
+case needs no user action. There is deliberately **no "any secret of this type" fallback** (the `onelake://`
+FileSystem has one only because that scheme matches no azure secret's default scope): guessing among
+accounts is how a write lands somewhere the user did not intend. New helper
+`BuildConnectionStringFromScopedSecret` (C++), best-effort by contract — any failure means "no credential",
+never a failed statement.
+
+⚠ **The same auto-resolution was deliberately NOT applied to ATTACH,** and the reason is a hazard found while
+trying: at that point in `fabricator_storage.cpp` the `provider` may be EMPTY (no `PROVIDER` option — it is
+inferred later from the scheme), and an empty provider resolves to the DEFAULT backend, whose azure branch
+merges the fields into a **SQL Server** connection string. That would mangle the abfss path and break an
+attach that currently works. COPY is safe because its provider is hardcoded `"delta"`. Auto-resolving at
+ATTACH needs provider dispatch settled first; until then the remedy there stays the explicit `SECRET`, which
+the attach warning names.
+
+Also unchanged: `fabricator_delta_scan` (a GLOBAL function, no catalog, therefore no credential) still reads
+through the host filesystem. That is a read — the commit guard does not apply — so it is a dependency on
+duckdb-azure, not a correctness gap.
+
+**The filesystem choice is invisible from SQL**, which is why a `Fabricator.Delta.Fs` debug line now names it
+per table open. That log plus a negative control is how the COPY routing was actually verified (azure secret
+in scope ⇒ `AdlsGen2TableFileSystem`; no secret at all ⇒ `DuckDbTableFileSystem`) — the suite's COPY section
+can only assert the round trip, and says so.
+
+Gate: `test/verify_delta_catalog_adls.test` (52 assertions, manual/live-account tier — outside both CI tiers
+by construction, since its `require-env`s are not in the service tier's provided list). The RENAME section is
+mutation-tested: reverting the gate to `IsOneLake` kills it at exactly that line with the original
+`MoveFile is not implemented` error. ⚠ The DISCOVERY section is deliberately documented as pinning the
+outcome and **not** the mechanism — the host glob also answers correctly on a plain account (unlike OneLake,
+where duckdb-azure's mid-path wildcard is broken), so swapping the DFS-SDK walk back for the glob does not
+fail it.
 
 ---
 

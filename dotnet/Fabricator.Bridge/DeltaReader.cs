@@ -498,7 +498,7 @@ internal static class DeltaReader
         if (p.StartsWith("abfss://", StringComparison.OrdinalIgnoreCase)
             && p.Contains("onelake", StringComparison.OrdinalIgnoreCase))
         {
-            var (_, fsName, under) = OneLakeDataLakeFileSystem.ParseAbfss(p);
+            var (_, fsName, under) = AdlsGen2TableFileSystem.ParseAbfss(p);
             return "onelake://" + fsName + "/" + under;
         }
         return p;

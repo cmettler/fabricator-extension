@@ -703,6 +703,69 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     the spelling to use when Spark must honor the looser level (it HONORS a stamped WriteSerializable even
     though its DDL refuses to set it). `CreateConfig`'s `serializable` parameter is now inert — removing it
     is a mechanical ~6-signature cleanup left for later, deliberately not mixed into a behaviour change.
+- **PLAIN (non-OneLake) ADLS Gen2 SUPPORT — BUILT + LIVE-VALIDATED 2026-08-02. Full record:
+  [docs/delta-transactions.md](docs/delta-transactions.md) §8.4; gate `test/verify_delta_catalog_adls.test`
+  (52, manual/live-account tier).** A Delta catalog on `abfss://<fs>@<account>.dfs.core.windows.net/…` —
+  a plain storage account, not a Fabric lakehouse. It LOOKED like it already worked (attach, discovery,
+  CTAS, INSERT, DELETE, DROP and both parquet directions through duckdb-azure all passed first try); two
+  things did not.
+  - **The core insight: TRANSPORT and CATALOG had been conflated in one predicate.** `IsOneLake` was
+    answering both "how do we do IO here" and "is there a Fabric catalog to ask". Split into
+    **`AdlsPath.IsAdlsGen2`** (the ADLS Gen2 DFS transport — selects the filesystem, the directory ops and
+    the commit primitive) and **`FabricLakehouse.IsOneLake`** (a Fabric lakehouse — keeps Unity Catalog
+    discovery, the schema-enabled flag, the `fabric_*` functions). **Every OneLake root is an ADLS root;
+    the converse is false.** The direct-SDK filesystem was NEVER OneLake-specific — it always parsed its
+    endpoint host out of the `abfss://` path — so only the gate said otherwise; renamed
+    `OneLakeDataLakeFileSystem` → `AdlsGen2TableFileSystem` so the name stops claiming a restriction the
+    code does not have. **OneLake behaviour is unchanged** (re-validated live: 21 tables via UC REST, and a
+    full CTAS/INSERT/DELETE/DROP round trip).
+  - **⚠ A CAPABILITY PROBE CAN RULE A BACKEND OUT; IT CANNOT RULE ONE IN.** `fabricator_fs_write_probe`
+    reports duckdb-azure's `EXCLUSIVE_CREATE` as WORKING on abfss (it really does throw on an existing
+    file) — and it is a **client-side existence check**, so it races. Measured, 6 writers × 8 commits:
+    unguarded **41 of 48 landed, six of the seven losses silent**; with the secret NAMED **48/48** with
+    commit versions fully interleaved across writers (so contention was real). Note this is the OPPOSITE
+    detectability from the S3 case (§8.3), where the probe fails and no concurrency is needed to see it.
+  - **RENAME TABLE was impossible** (`AzureDfsStorageFileSystem: MoveFile is not implemented!`) — which
+    breaks a dbt table model on EVERY re-deploy, since its swap is two renames. One mechanism fixes this
+    and the commit race together: a credentialed abfss root now takes the DFS-native ops OneLake always
+    took (`UseAdlsDirectoryOps`). Mutation-tested — reverting the gate to `IsOneLake` kills the suite at
+    exactly that line with the original error.
+  - **New: `AdlsCredential` (Entra token OR shared key).** Everything ADLS-facing had assumed a
+    `TokenCredential`; a plain account commonly ships as an account key or a storage connection string.
+    **⚠ State the asymmetry the right way round: a plain ADLS account accepts BOTH** (Entra via RBAC is
+    fully supported there and is the better practice) — **OneLake is Entra-ONLY.** So the shape follows the
+    SECRET, not the kind of account, with an `entraOnly` guard so a secret carrying a `connection_string`
+    cannot silently downgrade a Fabric attach to key auth OneLake would reject, and an explicitly
+    configured service principal outranking key material for the same reason in reverse.
+  - **Naming the secret is load-bearing, exactly as on S3** — the credential reaches us only via the marker
+    `BuildConnectionString` appends, which runs only when the ATTACH NAMES a secret; an azure secret merely
+    in scope still authenticates duckdb-azure's DATA IO, so the unsafe shape reads, writes and passes every
+    single-writer test. The S3 attach warning was generalized to cover it (`WarnIfUnguardedRemoteWrite`).
+  - Discovery for such a root walks DFS DIRECTORIES (`AdlsTableDiscovery`) — there is no Unity Catalog for
+    a storage account. The host glob also works here (unlike OneLake, where duckdb-azure's mid-path
+    wildcard is broken), so this is O(tables) vs O(commit files), not a correctness fix — and the suite
+    says so rather than implying it pins the mechanism.
+  - **No new URI scheme, and `onelake://` is untouched**: duckdb-azure handles `abfss://` parquet READ and
+    WRITE (both measured), so native_read/native_write need no VFS of ours. `onelake://` stays Fabric-only.
+  - **`COPY … TO 'abfss://…' (FORMAT delta)` routes through our filesystem too — and the first pass got this
+    WRONG and wrote the mistake up as a trade-off.** It shipped on the host-FS path justified as "no `SECRET`
+    clause, one statement, one commit". But *"has no SECRET clause"* described the PLUMBING, not a
+    constraint: with `FORMAT delta` we build the catalog ourselves and know the target is abfss, so we can
+    resolve a credential exactly as the `onelake://` FS already does. **A limitation that is really an
+    unimplemented case must not be documented as a design decision** — that is how a gap becomes permanent.
+    Fixed by `BuildConnectionStringFromScopedSecret` (C++): a SCOPE match, not a name (a DuckDB secret's
+    scope IS a path prefix, and azure secrets cover `abfss://` by default, so the common case needs no user
+    action), with **no "any secret of this type" fallback** — guessing among accounts is how a write lands
+    somewhere unintended. Note this ALSO fixes it for OneLake, where a COPY had the same gap.
+    - ⚠ **Deliberately NOT applied to ATTACH, because trying it surfaced a hazard**: in
+      `fabricator_storage.cpp` the `provider` may be EMPTY (no `PROVIDER` option — inferred later from the
+      scheme), and an empty provider resolves to the DEFAULT backend, whose azure branch merges the fields
+      into a **SQL Server** connstr — mangling the abfss path and breaking an attach that works today. COPY
+      is safe only because its provider is hardcoded `"delta"`.
+    - ⚠ **The filesystem choice is INVISIBLE from SQL**, so a `Fabricator.Delta.Fs` Debug line now names it
+      per table open. That log + a negative control is what actually verified the routing (secret in scope ⇒
+      `AdlsGen2TableFileSystem`; no secret ⇒ `DuckDbTableFileSystem`); the suite's COPY section can only
+      assert the round trip and says so rather than implying it pins the route.
 - **ISOLATION + ONELAKE MULTI-WRITER — MEASURED LIVE 2026-07-31; one bug FIXED, one gap OPEN. Full record:
   [docs/delta-transactions.md](docs/delta-transactions.md) §8.1 (multi-writer) + §10.6 (Spark isolation).**
   Two long-standing claims in this file were wrong, and both were beliefs never measured.
@@ -1751,7 +1814,13 @@ exercised the next time a pin moves on its own.
 **Suite selection is DERIVED, never a hand-kept list** — `scripts/list-hermetic-suites.sh` and
 `scripts/list-service-suites.sh` classify by the `require-env`/`require` directives each suite
 declares, so a new suite cannot silently sit outside CI. The accounting is complete and checked:
-**53 + 42 + 9 excluded = 104**, no overlap. `scripts/run-suites.sh <hermetic|service>` runs them ONE
+**59 hermetic + 43 service + 10 excluded = 112 suite FILES** (2026-08-02), no overlap. ⚠ Suite FILES and
+suite RUNS differ and the floors are on RUNS: four hermetic suites and one service suite are
+engine-doubled, so 59 files ⇒ **63 runs / 5656 assertions** and 43 ⇒ **44 runs / 1444**. Recompute rather
+than copy — the line here read `53 + 42 + 9 = 104` for a while after the counts had moved, which is what a
+hand-copied number does. `scripts/list-hermetic-suites.sh | wc -l` and its service twin are the source of
+truth; the 10 excluded are `verify_azure_secret`, `verify_dax`, `verify_delta_catalog_adls` and the seven
+`verify_delta_rs_*`. `scripts/run-suites.sh <hermetic|service>` runs them ONE
 PROCESS PER SUITE with a fresh scratch dir, and asserts what `unittest` will not: nothing SKIPPED, the
 runner never says "No tests ran", and floors on the selected suite/assertion counts. The hermetic tier
 CLEARS the service env vars (proving hermeticity); the service tier DEMANDS them and names any that

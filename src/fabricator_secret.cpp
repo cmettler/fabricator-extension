@@ -198,4 +198,35 @@ string BuildConnectionStringFromSecret(ClientContext &context, const string &sec
 	return fabricator::BuildConnectionString(backend_provider, secret_type, json, base_connstr);
 }
 
+string BuildConnectionStringFromScopedSecret(ClientContext &context, const string &path,
+                                             const string &secret_type, const string &provider) {
+	// Best-effort by contract: any failure here means "no credential", never a failed statement. The caller
+	// still has the host filesystem, so degrading is strictly better than refusing to run.
+	try {
+		auto &secret_manager = SecretManager::Get(context);
+		auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+		auto match = secret_manager.LookupSecret(transaction, path, secret_type);
+		if (!match.HasMatch()) {
+			return path;
+		}
+		const auto &kv = static_cast<const KeyValueSecret &>(match.GetSecret());
+		string json = "{";
+		bool first = true;
+		for (auto &field : kv.secret_map) {
+			if (field.second.IsNull()) {
+				continue;
+			}
+			if (!first) {
+				json += ",";
+			}
+			first = false;
+			json += "\"" + EscapeJson(field.first) + "\":\"" + EscapeJson(field.second.ToString()) + "\"";
+		}
+		json += "}";
+		return fabricator::BuildConnectionString(provider, secret_type, json, path);
+	} catch (...) {
+		return path;
+	}
+}
+
 } // namespace duckdb

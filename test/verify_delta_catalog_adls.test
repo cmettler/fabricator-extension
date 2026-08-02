@@ -1,0 +1,292 @@
+# name: test/verify_delta_catalog_adls.test
+# description: The engineered-wood Delta folder-catalog on a PLAIN (non-OneLake) ADLS Gen2 account —
+#              abfss://<filesystem>@<account>.dfs.core.windows.net/<path>. Same abfss transport as Fabric
+#              OneLake, DIFFERENT catalog: there is no Unity Catalog REST service for a storage account, so
+#              tables are discovered by walking DFS directories. Covers attach + CTAS + read, discovery
+#              (flat and two-level `schemas`), RENAME TABLE, UPDATE/DELETE, DROP, and the attach-time
+#              unguarded-write warning.
+#
+#              MANUAL / live-account tier: needs a real ADLS Gen2 account, so it is outside both CI tiers
+#              by construction (its require-envs are not in the service tier's PROVIDED list, which is what
+#              scripts/list-service-suites.sh keys on). Run it with:
+#                 FABRICATOR_ADLS_ROOT='abfss://<fs>@<acct>.dfs.core.windows.net/fabtest'
+#                 FABRICATOR_ADLS_CONNSTR='DefaultEndpointsProtocol=https;AccountName=...;AccountKey=...'
+#
+#              Re-runnable against a persistent account: every table is CREATE OR REPLACE'd and the DDL
+#              sections clean up after themselves.
+# group: [fabricator]
+
+require fabricator
+
+require parquet
+
+# duckdb-azure IS a real dependency here — the Delta LOG goes through our direct Azure DataLake SDK
+# filesystem, but native_read/native_write (the default for PROVIDER 'delta') move parquet bytes with
+# DuckDB's own reader/writer over abfss://. Both directions were measured working on a plain account,
+# unlike OneLake where duckdb-azure's gaps forced the onelake:// VFS.
+#
+# It is deliberately NOT declared as `require azure`: the test binary reports version v0.0.1, so it can
+# never load a versioned extension from the local repo and the directive would make this suite ALWAYS
+# SKIP — a green run that tested nothing (the same reason verify_azure_secret sits outside both CI
+# tiers). Autoloading resolves it at first use instead. On a machine without the azure extension the
+# suite FAILS rather than skipping, which for a manual live-account suite is the honest outcome.
+
+require-env FABRICATOR_ADLS_ROOT
+
+require-env FABRICATOR_ADLS_CONNSTR
+
+# ----------------------------------------------------------------------------
+# 0. The secret. ONE azure secret serves BOTH consumers — duckdb-azure resolves it from the secret manager
+#    for data IO (its default scope already covers abfss://), and NAMING it on the ATTACH is what hands its
+#    fields to us for the log/commit path. Naming is not a formality: see §6.
+# ----------------------------------------------------------------------------
+
+# Autoloading is what supplies the azure extension (see the note above on why `require azure` cannot be
+# used here). It must be enabled EXPLICITLY: the unittest binary starts with it off, and a secret TYPE does
+# not trigger autoload the way a file path does — so without these two the very first statement fails with
+# "Secret type 'azure' not found" long before any IO.
+statement ok
+SET autoinstall_known_extensions = true;
+
+statement ok
+SET autoload_known_extensions = true;
+
+statement ok
+LOAD azure;
+
+statement ok
+CREATE OR REPLACE SECRET adls_test (TYPE azure, PROVIDER config,
+                                    CONNECTION_STRING '${FABRICATOR_ADLS_CONNSTR}');
+
+statement ok
+ATTACH '${FABRICATOR_ADLS_ROOT}/lake' AS adls
+  (TYPE fabricator, PROVIDER 'delta', SECRET adls_test, READ_ONLY false);
+
+# ----------------------------------------------------------------------------
+# 1. CREATE + read back
+# ----------------------------------------------------------------------------
+
+statement ok
+CREATE OR REPLACE TABLE adls.main.trips AS
+SELECT i AS id, i * 2 AS fare, 'r' || (i % 3)::VARCHAR AS route FROM range(10) t(i);
+
+query III
+SELECT count(*), sum(fare), count(DISTINCT route) FROM adls.main.trips;
+----
+10	90	3
+
+# projection + filter still answer correctly through the abfss scan
+query II
+SELECT id, fare FROM adls.main.trips WHERE route = 'r1' ORDER BY id;
+----
+1	2
+4	8
+7	14
+
+# ----------------------------------------------------------------------------
+# 2. DISCOVERY — the OneLake/ADLS split in one assertion.
+#
+#    A Fabric lakehouse enumerates through the Unity Catalog REST API; a storage account has no such
+#    service, so a fresh ATTACH must find the table with no help from any catalog service.
+#
+#    ⚠ What this section pins is the OUTCOME, not the MECHANISM. Both discovery paths — the DFS-SDK
+#    directory walk (AdlsTableDiscovery, taken when a secret is named) and the host glob (the fallback) —
+#    answer correctly on a plain ADLS account, so replacing one with the other does NOT fail here; the
+#    mutant survives. It is asserted anyway because the mechanism it does not distinguish is a performance
+#    choice, while "a re-attach can find its tables" is the correctness property. Do not read a green §2
+#    as evidence that the SDK walk ran.
+# ----------------------------------------------------------------------------
+
+statement ok
+ATTACH '${FABRICATOR_ADLS_ROOT}/lake' AS adls2
+  (TYPE fabricator, PROVIDER 'delta', SECRET adls_test, READ_ONLY false);
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'adls2' AND table_name = 'trips';
+----
+1
+
+query I
+SELECT count(*) FROM adls2.main.trips;
+----
+10
+
+statement ok
+DETACH adls2;
+
+# ----------------------------------------------------------------------------
+# 3. RENAME TABLE — the operation that was IMPOSSIBLE before the direct-SDK routing.
+#
+#    On the host-FS path this fails with `AzureDfsStorageFileSystem: MoveFile is not implemented!`, which
+#    breaks a dbt table model on every re-deploy (the swap is two renames). It works here because a
+#    credentialed abfss root now takes the DFS-native atomic directory rename, exactly as OneLake always
+#    did — the capability was never Fabric-specific, only the gate was.
+# ----------------------------------------------------------------------------
+
+statement ok
+ALTER TABLE adls.main.trips RENAME TO trips_renamed;
+
+query II
+SELECT count(*), sum(fare) FROM adls.main.trips_renamed;
+----
+10	90
+
+# the old name is gone, not merely shadowed
+statement error
+SELECT * FROM adls.main.trips;
+----
+
+statement ok
+ALTER TABLE adls.main.trips_renamed RENAME TO trips;
+
+# ----------------------------------------------------------------------------
+# 4. UPDATE / DELETE (deletion-vector DML over abfss)
+# ----------------------------------------------------------------------------
+
+statement ok
+UPDATE adls.main.trips SET fare = 100 WHERE id = 0;
+
+query II
+SELECT fare, count(*) FROM adls.main.trips WHERE id = 0 GROUP BY fare;
+----
+100	1
+
+statement ok
+DELETE FROM adls.main.trips WHERE id >= 8;
+
+query II
+SELECT count(*), sum(fare) FROM adls.main.trips;
+----
+8	156
+
+# ----------------------------------------------------------------------------
+# 5. `schemas true` — the two-level <root>/<schema>/<table> layout, discovered the same way
+# ----------------------------------------------------------------------------
+
+statement ok
+ATTACH '${FABRICATOR_ADLS_ROOT}/schemalake' AS adlss
+  (TYPE fabricator, PROVIDER 'delta', SECRET adls_test, schemas true, READ_ONLY false);
+
+statement ok
+CREATE SCHEMA IF NOT EXISTS adlss.sales;
+
+statement ok
+CREATE OR REPLACE TABLE adlss.sales.orders AS SELECT i AS id FROM range(4) t(i);
+
+statement ok
+DETACH adlss;
+
+statement ok
+ATTACH '${FABRICATOR_ADLS_ROOT}/schemalake' AS adlss2
+  (TYPE fabricator, PROVIDER 'delta', SECRET adls_test, schemas true, READ_ONLY false);
+
+query II
+SELECT schema_name, table_name FROM duckdb_tables()
+WHERE database_name = 'adlss2' AND table_name = 'orders';
+----
+sales	orders
+
+query I
+SELECT count(*) FROM adlss2.sales.orders;
+----
+4
+
+statement ok
+DROP TABLE adlss2.sales.orders;
+
+statement ok
+DETACH adlss2;
+
+# ----------------------------------------------------------------------------
+# 6. ATTACH-TIME WARNING: abfss:// opened READ_WRITE with NO NAMED SECRET.
+#
+#    MEASURED, 6 writers x 8 commits on a live account: 41 of 48 commits landed, and six of the seven
+#    losses raised no error at all (the seventh surfaced as an Azure `InvalidFlushPosition`, which reads
+#    like an unrelated upload fault). The same shape with the secret NAMED: 48/48, with the writers'
+#    commit versions fully interleaved, so contention was real and the guard held.
+#
+#    The cause is subtle enough to be worth pinning: `fabricator_fs_write_probe` reports duckdb-azure's
+#    EXCLUSIVE_CREATE as WORKING — it does throw on an existing file — because it is a client-side
+#    existence CHECK. Single-threaded that is indistinguishable from a conditional PUT; concurrently two
+#    writers both pass the check. A capability probe cannot see this; only a race can.
+#
+#    Gated on READ_WRITE and not on "not read-only": an AUTOMATIC remote attach is bumped to read-only by
+#    DuckDB and can never reach the commit path, so warning about it would train the warning away.
+# ----------------------------------------------------------------------------
+
+statement ok
+CALL enable_logging(level := 'debug', storage := 'memory');
+
+# unguarded: no SECRET named, so no credential reaches us -> host-FS commit -> unsafe
+statement ok
+ATTACH '${FABRICATOR_ADLS_ROOT}/lake' AS wunguarded (TYPE fabricator, PROVIDER 'delta', READ_ONLY false);
+
+# control: same root, secret NAMED, guard present -> silent
+statement ok
+ATTACH '${FABRICATOR_ADLS_ROOT}/lake' AS wguarded
+  (TYPE fabricator, PROVIDER 'delta', SECRET adls_test, READ_ONLY false);
+
+# control: AUTOMATIC (no READ_ONLY clause) -> read-only, no warning owed
+statement ok
+ATTACH '${FABRICATOR_ADLS_ROOT}/lake' AS wauto (TYPE fabricator, PROVIDER 'delta');
+
+# exactly ONE warning, naming the remedy
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE message LIKE '%abfss root attached READ_WRITE with no named SECRET%'
+  AND message LIKE '%Add SECRET <name> to the ATTACH%';
+----
+1
+
+# the AUTOMATIC attach really is read-only — the reason it is exempt
+statement error
+CREATE TABLE wauto.main.nope (id INTEGER);
+----
+
+statement ok
+DETACH wunguarded;
+
+statement ok
+DETACH wguarded;
+
+statement ok
+DETACH wauto;
+
+# ----------------------------------------------------------------------------
+# 7. COPY … TO '<path>' (FORMAT delta) — routed through OUR filesystem too.
+#
+#    A COPY has no SECRET clause, but it opens a REAL Delta catalog (transient, rooted at the target's
+#    parent), so it needs the same credential an ATTACH carries — without one it silently drops to the host
+#    filesystem, whose commit is not atomic on abfss. It now resolves the azure secret whose SCOPE covers the
+#    target (azure secrets scope to abfss:// by default) and passes its fields on the connection string
+#    exactly as a named-secret ATTACH does.
+#
+#    ⚠ The FILESYSTEM CHOICE IS NOT VISIBLE FROM SQL, so this section can only assert the round trip. That
+#    the routing actually changed was established out of band, from the `Fabricator.Delta.Fs` debug log with
+#    a negative control: azure secret in scope => AdlsGen2TableFileSystem, no secret at all =>
+#    DuckDbTableFileSystem. Do not read a green section here as proof of the route.
+# ----------------------------------------------------------------------------
+
+statement ok
+COPY (SELECT i AS id, i * 7 AS v FROM range(4) t(i))
+  TO '${FABRICATOR_ADLS_ROOT}/copied/ct' (FORMAT delta);
+
+query II
+SELECT count(*), sum(v) FROM fabricator_delta_scan('${FABRICATOR_ADLS_ROOT}/copied/ct');
+----
+4	42
+
+# ----------------------------------------------------------------------------
+# 8. DROP TABLE — the DFS-native recursive delete (DuckDB's azure FileSystem has no RemoveDirectory)
+# ----------------------------------------------------------------------------
+
+statement ok
+DROP TABLE adls.main.trips;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'adls' AND table_name = 'trips';
+----
+0
+
+statement ok
+DETACH adls;

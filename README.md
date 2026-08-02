@@ -1095,14 +1095,17 @@ spellings reach the same catalog implementation and accept the same options, so 
 overridden explicitly (`PROVIDER 'delta', native_write false`).
 
 **Storage targets** — table *discovery* is supported on **local** filesystems (incl. the Fabric-notebook
-fuse mount), **S3** (via `httpfs`), and **Fabric OneLake** (the abfss endpoint). Discovery on a **generic,
-non-OneLake ADLS** container is *not* supported: DuckDB's `azure` glob can't recurse a mid-path
-`…/*/_delta_log/*.json` tree ([duckdb-azure #174](https://github.com/duckdb/duckdb-azure)), which is exactly
-why OneLake takes a different route (below). Local uses `System.IO` enumeration, S3 the host-FS glob, and
-**OneLake the Fabric [Unity Catalog REST API](https://learn.microsoft.com/fabric/onelake/onelake-unity-catalog)**
-(`onelake.table.fabric.microsoft.com/…/unity-catalog`) — so OneLake carries a REST dependency: it resolves
-the workspace/lakehouse name→GUID + the schema-enabled flag via the Fabric API, then lists tables from the
-UC endpoint. Data reads/writes + `DROP` still go through the OneLake DFS endpoint.
+fuse mount), **S3** (via `httpfs`), **Fabric OneLake**, and **plain ADLS Gen2 storage accounts** — the last
+two both over `abfss://`. How each one finds its tables differs:
+
+| Root | Discovery |
+|---|---|
+| Local (incl. fuse mount) | `System.IO` directory enumeration |
+| `s3://` | host-FS glob (`httpfs`) |
+| **Fabric OneLake** | the Fabric [Unity Catalog REST API](https://learn.microsoft.com/fabric/onelake/onelake-unity-catalog) — resolves workspace/lakehouse name→GUID + the schema-enabled flag via the Fabric API, then lists tables from the UC endpoint |
+| **Plain ADLS Gen2** | an Azure DataLake **directory walk** — a storage account has no Unity Catalog, so the table list comes from the filesystem |
+
+Data reads/writes and `DROP`/`RENAME` go through the ADLS DFS endpoint for both abfss shapes.
 
 ```sql
 -- Local / S3 folder catalog
@@ -1113,8 +1116,34 @@ ATTACH '/lake/root' AS lake (TYPE fabricator, PROVIDER 'delta');
 ATTACH 'abfss://Workspace@onelake.dfs.fabric.microsoft.com/LH.Lakehouse/Tables'
   AS lake (TYPE fabricator, PROVIDER 'delta', SECRET fabric_sp, READ_ONLY false);
 
+-- Plain ADLS Gen2 storage account. Entra (a service principal, as above) works here too and is the
+-- better practice; a shared key / storage connection string is also accepted — OneLake is the one that
+-- requires Entra.
+CREATE SECRET adls (TYPE azure, PROVIDER config,
+                    CONNECTION_STRING 'DefaultEndpointsProtocol=https;AccountName=…;AccountKey=…');
+
+ATTACH 'abfss://myfilesystem@myaccount.dfs.core.windows.net/lake'
+  AS lake (TYPE fabricator, PROVIDER 'delta', SECRET adls, READ_ONLY false);
+
 SELECT * FROM lake.main.t WHERE id > 10;          -- streaming scan + file/row-group filter pushdown
 ```
+
+> ### ⚠ Writing to `abfss://` concurrently: NAME the secret (same rule as `s3://`)
+>
+> Without a `SECRET` clause the catalog still authenticates, reads and writes — DuckDB's `azure`
+> extension picks up any azure secret in scope for the data files — but the Delta **commit guard** is
+> not in effect, because the credential reaches the catalog only via the secret the ATTACH *names*.
+> DuckDB-azure's exclusive-create is a client-side existence check rather than a conditional PUT, so
+> concurrent writers **lose commits silently**: a measured 6-writer × 8-commit run landed **41 of 48**,
+> with six of the seven losses raising no error at all. Naming the secret landed **48/48**.
+> `RENAME TABLE` and `DROP TABLE` also require the named secret (Azure's `MoveFile`/`RemoveDirectory` are
+> unimplemented in DuckDB's azure filesystem). The extension emits a warning at ATTACH time for the
+> unsafe shape. Single-writer, append-only use is unaffected either way.
+>
+> `COPY … TO 'abfss://…' (FORMAT delta)` has no `SECRET` clause, but it does **not** need one: it opens a
+> Delta catalog of its own and picks up the `azure` secret whose *scope* covers the target path (azure
+> secrets cover `abfss://` by default), so it gets the same guarded write path as a named-secret ATTACH.
+> With no matching secret it falls back to the host filesystem, as before.
 
 > ### ⚠ Writing to `s3://` concurrently: NAME the secret
 >

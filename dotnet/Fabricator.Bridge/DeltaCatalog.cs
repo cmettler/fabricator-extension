@@ -124,8 +124,13 @@ public sealed class DeltaBackend : IBackend
     public string BuildConnectionString(
         string secretType, IReadOnlyDictionary<string, string> fields, string baseConnString)
     {
+        // ANY abfss:// root, not just OneLake. The fields carry the STORAGE credential, which is what selects
+        // the direct-SDK filesystem — and with it the only commit primitive that is actually atomic on ADLS
+        // (duckdb-azure's ExclusiveCreate is a client-side existence check; measured losing 7 of 48 concurrent
+        // commits, mostly silently). On a OneLake root the same fields additionally authenticate the Fabric
+        // REST + Unity-Catalog endpoints used to enumerate tables.
         if (secretType.Equals("azure", System.StringComparison.OrdinalIgnoreCase)
-            && FabricLakehouse.IsOneLake(baseConnString))
+            && AdlsPath.IsAdlsGen2(baseConnString))
         {
             return FabricLakehouse.AppendCredMarker(baseConnString, fields);
         }
@@ -173,6 +178,12 @@ public sealed class DeltaCatalog : IBackendCatalog
     // tables (and, for a schema-enabled lakehouse, an Entra SQL token). Null for local/S3/ADLS (glob discovery)
     // or when no secret was supplied.
     private readonly Azure.Core.TokenCredential? _fabricCredential;
+    // For an abfss:// root ATTACHed with an azure SECRET: the STORAGE credential (Entra token OR shared key).
+    // Distinct from _fabricCredential above, which is the Entra-only REST/Unity-Catalog credential and is null
+    // for a shared-key account. Non-null => IO takes the direct-SDK AdlsGen2TableFileSystem, whose commit
+    // rename is a real conditional PUT; null => the host-FS path, where the commit guard does NOT hold
+    // (measured — see WarnIfUnguardedRemoteWrite).
+    private readonly AdlsCredential? _adlsCredential;
     // For an s3:// root ATTACHed with an s3 SECRET: the commit-rename conditional-PUT credential
     // (multi-writer safety). Null => host-FS rename (single-writer, the documented httpfs caveat).
     private readonly S3CommitCredential? _s3Credential;
@@ -272,10 +283,11 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// An explicit ATTACH option overrides either way.</param>
     public DeltaCatalog(string root, string? optionsJson, (bool Read, bool Write) nativeDefaults)
     {
-        var (clean, credential) = FabricLakehouse.Extract(root);
+        var (clean, credential, storage) = FabricLakehouse.Extract(root);
         (clean, _s3Credential) = S3CommitCredential.Extract(clean);
         _root = Normalize(clean).TrimEnd('/');
         _fabricCredential = credential;
+        _adlsCredential = storage;
         // Deletion vectors are the DEFAULT DML mode (the modern Delta standard: DELETE marks rows in a DV bitmap
         // instead of rewriting the whole file — cheap, and it preserves row-tracking ids/versions for free).
         // Opt OUT with `deletion_vectors false` for the maximally-compatible plain copy-on-write table (minReader
@@ -308,39 +320,61 @@ public sealed class DeltaCatalog : IBackendCatalog
             _ => throw new System.ArgumentException(
                 $"delta: unknown isolation_level '{isolation}' — expected 'serializable' or 'write_serializable'."),
         };
-        WarnIfUnguardedS3Write(ParseStringOption(optionsJson, "access_mode"));
+        WarnIfUnguardedRemoteWrite(ParseStringOption(optionsJson, "access_mode"));
     }
 
     /// <summary>
-    /// Warns when an <c>s3://</c> root is attached READ_WRITE with no NAMED secret — the configuration that
-    /// loses concurrent commits SILENTLY (MEASURED: 6 writers × 8 commits ⇒ 8 of 48 landed, 40 lost, zero
-    /// errors; the same shape with the secret named ⇒ 48/48. docs/delta-transactions.md §8.3).
+    /// Warns when a remote root — <c>s3://</c> or <c>abfss://</c> — is attached READ_WRITE with no NAMED
+    /// secret, the configuration that loses concurrent commits SILENTLY. Both are MEASURED, not inferred:
+    /// s3 at 6 writers × 8 commits landed 8 of 48 with zero errors (§8.3); abfss at the same shape landed 41
+    /// of 48, six of the seven losses silent and one surfacing as an unrelated-looking Azure
+    /// <c>InvalidFlushPosition</c> (§8.4). Naming the secret ⇒ 48/48 on both.
     ///
     /// <para><b>Why a warning is worth its noise here.</b> The unsafe configuration authenticates, writes,
-    /// reads and passes every single-writer test — httpfs uses the ambient s3 secret for DATA IO, and only
-    /// the COMMIT guard is missing, because <see cref="S3CommitCredential"/>'s marker rides on the secret the
-    /// ATTACH NAMES. So nothing about the setup looks wrong, the remedy is one option, and the failure is
-    /// invisible. That asymmetry — silent, severe, one-line fix — is the case a warning exists for.</para>
+    /// reads and passes every single-writer test — the host filesystem (httpfs / duckdb-azure) uses the
+    /// ambient secret for DATA IO, and only the COMMIT guard is missing, because the credential marker rides
+    /// on the secret the ATTACH NAMES. So nothing about the setup looks wrong, the remedy is one option, and
+    /// the failure is invisible. That asymmetry — silent, severe, one-line fix — is the case a warning exists
+    /// for.</para>
+    ///
+    /// <para>The two backends fail for DIFFERENT reasons and it is worth keeping both in mind: httpfs cannot
+    /// send <c>If-None-Match</c> at all, while duckdb-azure's <c>ExclusiveCreate</c> looks correct
+    /// single-threadedly (<c>fabricator_fs_write_probe</c> reports it throwing on an existing file) and is a
+    /// client-side existence CHECK, so it races. A capability probe cannot distinguish those; only a
+    /// concurrent run can.</para>
     ///
     /// <para>Gated on READ_WRITE specifically, not on "not read-only": a remote root under
     /// <c>AUTOMATIC</c> may be bumped to read-only by DuckDB, and warning about a catalog that will never
     /// write is how a real warning gets trained away. Asking for write access is the deliberate act.</para>
     /// </summary>
-    private void WarnIfUnguardedS3Write(string? accessMode)
+    private void WarnIfUnguardedRemoteWrite(string? accessMode)
     {
-        if (_s3Credential is not null
-            || !S3CommitFileSystem.IsS3(_root)
-            || !string.Equals(accessMode, "read_write", System.StringComparison.OrdinalIgnoreCase))
+        if (!string.Equals(accessMode, "read_write", System.StringComparison.OrdinalIgnoreCase))
         {
             return;
         }
-        _log.LogWarning(
-            "delta attach {Root}: s3 root attached READ_WRITE with no named SECRET — the commit guard is "
-            + "OFF, so concurrent writers LOSE COMMITS SILENTLY (httpfs cannot send If-None-Match; a "
-            + "measured 6-writer run landed 8 of 48 commits with no error). Single-writer use is unaffected. "
-            + "Add SECRET <name> to the ATTACH to route commits through the conditional-PUT path — an s3 "
-            + "secret merely being in scope is NOT enough, since only the NAMED one reaches the commit path.",
-            _root);
+        if (_s3Credential is null && S3CommitFileSystem.IsS3(_root))
+        {
+            _log.LogWarning(
+                "delta attach {Root}: s3 root attached READ_WRITE with no named SECRET — the commit guard is "
+                + "OFF, so concurrent writers LOSE COMMITS SILENTLY (httpfs cannot send If-None-Match; a "
+                + "measured 6-writer run landed 8 of 48 commits with no error). Single-writer use is unaffected. "
+                + "Add SECRET <name> to the ATTACH to route commits through the conditional-PUT path — an s3 "
+                + "secret merely being in scope is NOT enough, since only the NAMED one reaches the commit path.",
+                _root);
+        }
+        else if (_adlsCredential is null && AdlsPath.IsAdlsGen2(_root))
+        {
+            _log.LogWarning(
+                "delta attach {Root}: abfss root attached READ_WRITE with no named SECRET — the commit guard is "
+                + "OFF, so concurrent writers LOSE COMMITS SILENTLY (duckdb-azure's ExclusiveCreate is a "
+                + "client-side existence check, not a conditional PUT; a measured 6-writer run landed 41 of 48 "
+                + "commits, six losses with no error). Table RENAME and DROP are also unavailable on that path "
+                + "(MoveFile/RemoveDirectory are unimplemented there). Single-writer append-only use is "
+                + "unaffected. Add SECRET <name> to the ATTACH to route IO through the Azure DataLake SDK — an "
+                + "azure secret merely being in scope is NOT enough, since only the NAMED one reaches us.",
+                _root);
+        }
     }
 
     // ATTACH option `isolation_level 'write_serializable'|'serializable'` (Spark's delta.isolationLevel):
@@ -406,18 +440,28 @@ public sealed class DeltaCatalog : IBackendCatalog
     private readonly string? _copyDisposition;
 
     /// <summary>Returns the host-FS opener for this thread and, in the same breath, publishes this catalog's
-    /// Fabric credential to <see cref="AmbientOneLakeCredential"/> so the filesystem factory
-    /// (<see cref="TableFileSystems.Create"/>) picks the direct-SDK <see cref="OneLakeDataLakeFileSystem"/> for
-    /// OneLake roots (bypassing duckdb-azure). For a non-OneLake catalog <c>_fabricCredential</c> is null → the
-    /// factory falls back to <see cref="DuckDbTableFileSystem"/> (unchanged behavior). Setting it every time also
+    /// storage credential to <see cref="AmbientAdlsCredential"/> so the filesystem factory
+    /// (<see cref="TableFileSystems.Create"/>) picks the direct-SDK <see cref="AdlsGen2TableFileSystem"/> for
+    /// <c>abfss://</c> roots (bypassing duckdb-azure). Without a credential — no secret NAMED on the ATTACH —
+    /// it is null and the factory falls back to <see cref="DuckDbTableFileSystem"/>. Setting it every time also
     /// clears any stale credential left on a reused execution thread by another catalog. The bulk write path runs
     /// on a background thread, so <c>BulkSession</c> re-establishes both ambients there.</summary>
     private nint Opener()
     {
-        AmbientOneLakeCredential.Current = _fabricCredential;
+        AmbientAdlsCredential.Current = _adlsCredential;
         AmbientS3Credential.Current = _s3Credential;
         return AmbientOpener.Current;
     }
+
+    /// <summary>True when DIRECTORY operations (recursive DROP, table RENAME) go through the ADLS Gen2 DFS SDK
+    /// instead of the host filesystem. Requires an <c>abfss://</c> root AND a storage credential.</summary>
+    /// <remarks>
+    /// Not an optimization — DuckDB's azure FileSystem implements NEITHER of these
+    /// (<c>AzureDfsStorageFileSystem: MoveFile is not implemented!</c>, and no <c>RemoveDirectory</c> at all),
+    /// so without this a plain ADLS catalog cannot rename a table, which is what a dbt table model does on
+    /// every re-deploy. Previously gated on <c>IsOneLake</c>, which is why only Fabric had working DDL.
+    /// </remarks>
+    private bool UseAdlsDirectoryOps => _adlsCredential is not null && AdlsPath.IsAdlsGen2(_root);
 
     /// <summary>True when this catalog uses the two-level <c>&lt;root&gt;/&lt;schema&gt;/&lt;table&gt;</c> layout:
     /// a schema-enabled OneLake lakehouse, OR a non-OneLake root with the <c>schemas true</c> ATTACH option.
@@ -1176,6 +1220,14 @@ public sealed class DeltaCatalog : IBackendCatalog
                 pairs.Add((s, t));
             }
             return pairs;
+        }
+
+        // Plain (non-OneLake) ADLS Gen2 with a credential: walk DFS DIRECTORIES through the SDK. There is no
+        // Unity Catalog to ask — that is a Fabric service — so the list comes from the filesystem either way;
+        // this shape is O(tables) where the glob below is O(commit files). See AdlsTableDiscovery.
+        if (_adlsCredential is not null && AdlsPath.IsAdlsGen2(_root))
+        {
+            return AdlsTableDiscovery.Discover(_root, _adlsCredential, _schemas, MainSchema);
         }
 
         // PLAIN LOCAL root (incl. the Fabric notebook fuse mount /lakehouse/default/Tables): discover via
@@ -3711,11 +3763,13 @@ public sealed class DeltaCatalog : IBackendCatalog
             return;
         }
         ThrowIfPendingAppends(TablePath(schemaName, tableName), "DROP TABLE");
-        _log.LogInformation("delta drop table {Schema}.{Table} (onelake={OneLake})",
-            schemaName, tableName, FabricLakehouse.IsOneLake(_root));
-        if (FabricLakehouse.IsOneLake(_root))
+        _log.LogInformation("delta drop table {Schema}.{Table} (adls={Adls})",
+            schemaName, tableName, UseAdlsDirectoryOps);
+        // Any credentialed abfss:// root (OneLake included) takes the DFS-native recursive delete: DuckDB's
+        // azure FileSystem implements no RemoveDirectory at all, so the host-FS path below cannot serve it.
+        if (UseAdlsDirectoryOps)
         {
-            FabricLakehouse.DeleteDirectory(TablePath(schemaName, tableName), _fabricCredential);
+            FabricLakehouse.DeleteDirectory(TablePath(schemaName, tableName), _adlsCredential);
             return;
         }
         if (!HostFs.CanRemoveDir)
@@ -4203,9 +4257,9 @@ public sealed class DeltaCatalog : IBackendCatalog
         var opener = Opener();
         if (pending.Files.Count > 0)
         {
-            if (FabricLakehouse.IsOneLake(_root))
+            if (UseAdlsDirectoryOps)
             {
-                FabricLakehouse.RenameDirectory(oldPath, newPath, _fabricCredential);
+                FabricLakehouse.RenameDirectory(oldPath, newPath, _adlsCredential);
             }
             else if (_s3Credential is not null && S3CommitFileSystem.IsS3(_root))
             {
@@ -4371,13 +4425,14 @@ public sealed class DeltaCatalog : IBackendCatalog
                 string newName = a1 ?? throw new System.InvalidOperationException(
                     "delta RENAME TABLE requires a new table name.");
                 // The table folder (incl. _delta_log) is moved; the schema is unchanged (RENAME TABLE renames
-                // within the same schema). OneLake → DFS atomic rename (Azure MoveFile is unimplemented);
-                // SECRET-routed s3:// → SDK server-side CopyObject rename (httpfs has no MoveFile; no data
-                // crosses the client); local → the host FS move (FileSystem::MoveFile, atomic). Secretless
-                // s3:// still throws cleanly (attach with a SECRET for rename support).
-                if (FabricLakehouse.IsOneLake(_root))
+                // within the same schema). SECRET-routed abfss:// (OneLake or a plain ADLS Gen2 account) → DFS
+                // atomic rename (Azure MoveFile is unimplemented); SECRET-routed s3:// → SDK server-side
+                // CopyObject rename (httpfs has no MoveFile; no data crosses the client); local → the host FS
+                // move (FileSystem::MoveFile, atomic). A secretless abfss:// / s3:// still throws cleanly
+                // (attach with a SECRET for rename support).
+                if (UseAdlsDirectoryOps)
                 {
-                    FabricLakehouse.RenameDirectory(TablePath(s, t), TablePath(s, newName), _fabricCredential);
+                    FabricLakehouse.RenameDirectory(TablePath(s, t), TablePath(s, newName), _adlsCredential);
                 }
                 else if (_s3Credential is not null && S3CommitFileSystem.IsS3(_root))
                 {

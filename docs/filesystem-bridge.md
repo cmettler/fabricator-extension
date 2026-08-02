@@ -230,8 +230,11 @@ explicitly** to the filesystem instance (as we already do for DAX `DaxTokenAuth`
    three assemblies; local Delta suite unregressed; DAX loads cleanly. **Caveat (unchanged):** the MSI/workspace-
    identity path must still be **verified in a live Fabric notebook** — `DefaultAzureCredential` should pick up the
    MSI endpoint, but that is assumption, not yet tested. This is the shared entry point step 2's OneLake FS consumes.
-2. **`OneLakeDataLakeFileSystem : ITableFileSystem` — DONE + LIVE-VALIDATED on Fabric (2026-07-02).** A full
-   read/write filesystem on `Azure.Storage.Files.DataLake` (`dotnet/Fabricator.Bridge/OneLakeDataLakeFileSystem.cs`):
+2. **`AdlsGen2TableFileSystem : ITableFileSystem` — DONE + LIVE-VALIDATED on Fabric (2026-07-02).** A full
+   read/write filesystem on `Azure.Storage.Files.DataLake`
+   (`dotnet/Fabricator.Bridge/AdlsGen2TableFileSystem.cs`; named `OneLakeDataLakeFileSystem` until 2026-08-02,
+   when plain ADLS Gen2 accounts started routing through it too — it had always parsed its endpoint host out
+   of the `abfss://` path, so only the SELECTOR was OneLake-specific):
    `ListAsync` (GetPaths, 404→empty), `OpenReadAsync`/`ReadAllBytesAsync` (range GET + OpenRead), `CreateAsync`
    (put-if-absent via `DataLakePathCreateOptions.Conditions IfNoneMatch=*`), **`RenameAsync` = a TRUE atomic ADLS
    rename** (`DataLakeFileClient.RenameAsync` with `IfNoneMatch=*` → 409/412 ⇒ false = the Delta commit-conflict

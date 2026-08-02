@@ -76,7 +76,7 @@ public sealed record S3CommitCredential(
 
 /// <summary>The S3 commit credential in effect on this flow (null = none) — read by
 /// <see cref="TableFileSystems.Create"/> to wrap <c>s3://</c> roots with
-/// <see cref="S3CommitFileSystem"/>. Mirrors <see cref="AmbientOneLakeCredential"/>: published by
+/// <see cref="S3CommitFileSystem"/>. Mirrors <see cref="AmbientAdlsCredential"/>: published by
 /// <c>DeltaCatalog.Opener()</c> immediately before catalog work (unconditionally, so a reused execution
 /// thread never carries another catalog's stale credential).</summary>
 public static class AmbientS3Credential

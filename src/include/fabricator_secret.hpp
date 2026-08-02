@@ -31,4 +31,21 @@ string BuildConnectionStringFromSecret(ClientContext &context, const string &sec
 //! True if a secret with this name exists (any type — our own or a foreign one reused for auth).
 bool IsKnownSecret(ClientContext &context, const string &secret_name);
 
+//! Same as BuildConnectionStringFromSecret, but finds the secret by SCOPE MATCH against `path` instead of by
+//! name, and returns `path` UNCHANGED when nothing matches (a missing credential is not an error here — the
+//! caller can still work through the host filesystem).
+//!
+//! This exists because naming a secret is not always possible. `COPY … TO '<path>' (FORMAT delta)` has no
+//! SECRET clause at all, yet it opens a real Delta catalog and needs the same credential an ATTACH would get
+//! — without one it silently drops to the host filesystem, which on abfss cannot commit atomically. Scope
+//! matching is the right resolution rule for that: a DuckDB secret's scope IS a path prefix, so a secret that
+//! matches was declared for this location. `azure` secrets scope to `abfss://` by default, so the common
+//! case resolves with no user action.
+//!
+//! Deliberately NO "any secret of this type" fallback (unlike the onelake:// FileSystem, which needs one
+//! because that scheme matches no azure secret's default scope): guessing among several accounts is how a
+//! write lands somewhere the user did not intend.
+string BuildConnectionStringFromScopedSecret(ClientContext &context, const string &path,
+                                             const string &secret_type, const string &provider);
+
 } // namespace duckdb
