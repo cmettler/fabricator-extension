@@ -902,6 +902,41 @@ is refused outright by `ThrowIfReferencesMetadata` — so even the hypothetical 
 - Historical description of the feature (measurement tiers included) survives in
   [rowid-dml-seam.md](rowid-dml-seam.md) §6.3, flagged as removed.
 
+### Upstream #52 + #53 taken the same day (pin `d9d204b`) — and the merge was CLEAN
+
+The last two of the uncommitted-file set #46/#47/#49 opened. **Zero conflicts**, which is the
+`MetadataPredicate` removal paying off within the hour: our `DeltaTable.cs` footprint is what had been
+colliding with upstream's edits there, and dropping 190 lines of it removed the overlap.
+
+**#53 — a rebased delete kept every losing attempt's deletion vector. A free win on a path WE drive.**
+Our buffered flush stages `DeleteDvEdit`s through `txn.StageRowDeletesAsync`, and EW's commit loop rebases
+exactly those on a collision, writing fresh `.bin` files each attempt. A FAILING run collected them via the
+ledger; a SUCCEEDING one did not — the commit empties the ledger wholesale, correctly protecting the
+winner's files and in the same motion forgetting every earlier attempt's. So a fabricator buffered DELETE
+that hit contention and then succeeded leaked one vector per losing attempt.
+- ⚠ **Our suites could not have found this, and neither could our multi-writer races.** sqllogictest runs
+  connections SEQUENTIALLY, so every row-level scenario we test has no window between scan and commit —
+  the same gap already recorded for the autocommit `rowLevelRetry` path. And the fuse/abfss races are no
+  help despite their 90 and 19 REAL retries: those were APPEND commits, with no deletion vectors at all.
+  Worth stating because reaching for those numbers here would be the wrong evidence for the right claim.
+
+**#52 — `DiscardDataFilesAsync(files, ct)`, additive, nothing consumes it yet.** A VERB for reclaiming
+files that `WriteDataFilesAsync` wrote and no version will ever name. Upstream chose a verb over a disposal
+deliberately: the write is meant to outlive the call and may be committed by a later unrelated one, so only
+the HOST knows the commit is not coming.
+- **It is the tool for the orphan class `await using` deliberately did NOT cover** — our eagerly-written
+  DATA files, which EW's provenance rule excludes precisely because the host wrote them. Adopting it would
+  narrow §7 of [delta-transactions.md](delta-transactions.md) a second time, from "invisible orphans for
+  VACUUM" to "reclaimed at rollback", which is a documented-behaviour change and therefore NOT part of a
+  bump. Tracked as a follow-up.
+- ⚠ Its guard, when we do adopt it: it **REFUSES a file the table references**, checked against a FRESHLY
+  READ log rather than the cached snapshot (the commit that made them live may have come from another
+  handle), validate-then-apply so a list with one committed file does not half-delete the rest.
+
+Surface audit clean; EW Table.Tests 868 → **877** × {net10.0, net8.0, net472} (+9 upstream); Bridge builds
+unchanged; fabricator hermetic **63/63 — 5654**, service **44/44 — 1444**. Patch set unchanged at
+**+867 / −44 across 8 files**.
+
 ### Gates
 
 EW Table.Tests **875/875 × {net10.0, net8.0, net472}** at the bump, **868/868** after the
