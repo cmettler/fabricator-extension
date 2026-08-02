@@ -85,9 +85,31 @@ void FabricatorTransactionManager::RollbackTransaction(Transaction &transaction)
 	}
 	try {
 		fabricator::SetActiveTxn(handle_, txn_id);
-		fabricator::RollbackTransaction(handle_);
+		// Host-FS opener for a Delta-catalog ROLLBACK. Rollback USED TO DO NO IO, so it never set one — and
+		// that was not merely a gap: whatever `AmbientOpener.Current` held here belonged to an earlier call,
+		// i.e. a STALE ClientContext*, which is a use-after-free rather than staleness if anything dereferences
+		// it. Since the buffered rollback now DISCARDS its eagerly-written data files (EW #52's
+		// DiscardDataFilesAsync) it needs a live one, and for the same reason the COMMIT path does: deleting
+		// through DuckDB's FileSystem resolves SECRETs (s3:// / az:// / onelake://), and the secret manager
+		// requires an ACTIVE transaction. The caller's is already gone by the time TransactionManager gets
+		// here — and unlike CommitTransaction, this override is handed NO ClientContext at all, so there is
+		// nothing to restore to afterwards and the opener is cleared to 0 instead of left dangling.
+		Connection rollback_conn(db.GetDatabase());
+		rollback_conn.BeginTransaction();
+		fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(rollback_conn.context.get()));
+		try {
+			fabricator::RollbackTransaction(handle_);
+		} catch (...) {
+		}
+		// Clear BEFORE the connection dies: a handle to a destroyed context is the very hazard above.
+		fabricator::SetActiveOpener(0);
+		rollback_conn.Rollback();
 	} catch (...) {
 		// best-effort: never throw out of rollback
+		try {
+			fabricator::SetActiveOpener(0);
+		} catch (...) {
+		}
 	}
 	// Discard any catalog entry that an ALTER's eager re-fetch cached from this now-undone (uncommitted)
 	// schema, so the next access re-fetches the committed state. Best-effort; never throw out of rollback.

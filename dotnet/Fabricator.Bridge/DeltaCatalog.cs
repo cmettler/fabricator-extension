@@ -2506,8 +2506,14 @@ public sealed class DeltaCatalog : IBackendCatalog
         }
     }
 
-    // Discards the transaction's buffers. Streamed-but-uncommitted parquet files remain as INVISIBLE
-    // orphans (never referenced by any commit) — vacuum's job, exactly Spark's rollback shape.
+    // Discards the transaction's buffers AND reclaims the eagerly-written data files they named.
+    //
+    // Not committing was always the rollback — a file no version references changes nothing a reader sees —
+    // so this was never a correctness gap, only a reclamation one: those bytes used to sit on storage until
+    // VACUUM's retention horizon, billed the whole time. EW #52's DiscardDataFilesAsync is the verb for it,
+    // and it has to be a verb rather than a disposal: WriteDataFilesAsync hands back a plain list and keeps
+    // no handle, because a write is ALLOWED to outlive its call and be committed by a later one. Only the
+    // host knows the commit is not coming, and here it does.
     public void RollbackTransaction()
     {
         long txnId = AmbientTransaction.Current;
@@ -2519,9 +2525,58 @@ public sealed class DeltaCatalog : IBackendCatalog
         }
         foreach (var kv in tables)
         {
-            _log.LogInformation("delta txn {Txn} rollback {Path}: discarded {Rows} buffered row(s), {Files} orphan file(s)",
-                txnId, kv.Key, kv.Value.Rows, kv.Value.Files.Count);
+            int reclaimed = DiscardBufferedFiles(kv.Key, kv.Value);
+            _log.LogInformation(
+                "delta txn {Txn} rollback {Path}: discarded {Rows} buffered row(s), reclaimed {Reclaimed} of "
+                + "{Files} written file(s)",
+                txnId, kv.Key, kv.Value.Rows, reclaimed, kv.Value.Files.Count);
             DeltaTxnBuffer.DisposeBatches(kv.Value);
+        }
+    }
+
+    /// <summary>
+    /// Deletes the data files a rolled-back table buffer wrote. Returns how many were handed to EW for
+    /// deletion — 0 when there was nothing to reclaim, or when the attempt failed.
+    ///
+    /// <para><b>Never throws.</b> Rollback is already the failure path; an exception here would replace the
+    /// user's real error with a cleanup error, and leaving an orphan behind is exactly the status quo this
+    /// improves on — strictly no worse than before. That is also EW's own posture in
+    /// <c>DeltaTransaction.AbortAsync</c>.</para>
+    ///
+    /// <para><b>⚠ The throw it most plausibly swallows is a REFERENCED file.</b> DiscardDataFilesAsync
+    /// refuses a file the table names, read from a FRESH log rather than a cached snapshot, and validates
+    /// the whole list before deleting any of it — so a mistake costs nothing and reclaims nothing. Ours are
+    /// uncommitted by construction, but the immediate-by-design operations (identity creates, CREATE OR
+    /// REPLACE, partition overwrite) commit inside the transaction, so treating "referenced" as impossible
+    /// would be an assumption about a list we do not fully own. Let EW decide and log what it says.</para>
+    /// </summary>
+    private int DiscardBufferedFiles(string tablePath, DeltaTxnBuffer.PendingAppends pending)
+    {
+        if (pending.Files.Count == 0)
+        {
+            return 0;
+        }
+        try
+        {
+            var fs = TableFileSystems.Create(Opener(), tablePath);
+            var table = DeltaTable.OpenAsync(fs, DeltaWriter.Options()).GetAwaiter().GetResult();
+            try
+            {
+                table.DiscardDataFilesAsync(pending.Files).GetAwaiter().GetResult();
+                return pending.Files.Count;
+            }
+            finally
+            {
+                table.DisposeAsync().GetAwaiter().GetResult();
+            }
+        }
+        catch (System.Exception ex)
+        {
+            _log.LogWarning(
+                "delta rollback {Path}: could not reclaim {Files} written file(s) ({Reason}) — they remain as "
+                + "invisible orphans for VACUUM, which is the behaviour that predates this cleanup",
+                tablePath, pending.Files.Count, ex.Message);
+            return 0;
         }
     }
 

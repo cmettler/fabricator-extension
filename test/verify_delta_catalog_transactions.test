@@ -1960,8 +1960,15 @@ SELECT score FROM eag.main.et WHERE id = 3;
 ----
 NULL
 
-# ROLLBACK of an eager UPDATE: the post-image file stays as an invisible orphan,
-# data + log unchanged (vacuum's job — Spark's rollback shape)
+# ROLLBACK of an eager UPDATE: data + log unchanged, and since 2026-08-02 the post-image file the
+# statement eagerly wrote is RECLAIMED rather than left for vacuum (EW #52's DiscardDataFilesAsync).
+# Not committing was always the rollback — a file no version names changes nothing a reader sees — so
+# this is a reclamation change, not a correctness one.
+#
+# ⚠ The parquet count BEFORE the rollback is the positive control. Without it a post-rollback count of 4
+# proves nothing: it is also what a statement that never wrote its post-image would leave, and this very
+# section asserted only the "before" side for a year, which is why the behaviour could change under it
+# in silence.
 statement ok
 BEGIN;
 
@@ -1985,6 +1992,12 @@ query I
 SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_native/et/_delta_log/*.json');
 ----
 4
+
+# the eagerly-written post-image is GONE — 4 before the rollback, 3 after
+query I
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_native/et/*.parquet');
+----
+3
 
 statement ok
 DETACH eag;

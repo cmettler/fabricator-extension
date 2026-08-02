@@ -896,14 +896,22 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
 - **dbt DAX→Delta pipeline — DONE + validated live** (`dbt_dax_test/`, gitignored; plain-DAX model bodies
   via the custom `dax_table` materialization). Full as-built record (moved verbatim from here): [docs/feature-history.md](docs/feature-history.md).
 - **Eager-write DeltaTxnBuffer — ALL SLICES DONE (A, B, C1–C3, D + edge lifts).** Data files always land
-  on storage at statement time; the buffer holds ACTIONS; rollback = invisible orphans for VACUUM **for
-  those DATA files — but since 2026-08-02 NOT for what EW's own writers stage during the FLUSH.** The
-  flush's transaction is `await using`, so a flush that does not commit takes back e.g. the deletion
-  vector a buffered DELETE staged (`StageRowDeletesAsync` writes it before the commit is judged). The
-  split is by WHO WROTE THE FILE: EW's provenance rule never collects a host-written file, and our data
-  files predate that transaction. ⚠ Safe only from EW #49 — at #46 the same line would have deleted
-  COMMITTED data. Measured (a small delete's vector is INLINE, so the orphan only reproduces above the
-  1 KB threshold); gate verify_delta_txn_version §9 (65), mutation-tested. Incl.
+  on storage at statement time; the buffer holds ACTIONS. **"Rollback = invisible orphans for VACUUM" is
+  now HISTORICAL — as of 2026-08-02 a ROLLBACK RECLAIMS the bytes, via two mechanisms with different
+  owners** (full record: [docs/delta-transactions.md](docs/delta-transactions.md) §7):
+  (a) the flush's transaction is `await using`, so a flush that does not commit takes back what EW's OWN
+  writers staged — e.g. the deletion vector of a buffered DELETE (`StageRowDeletesAsync` writes it before
+  the commit is judged). ⚠ Safe only from EW #49; at #46 the same line would have deleted COMMITTED data.
+  Measured — a small delete's vector is INLINE, so the orphan only reproduces above the 1 KB roaring
+  threshold. Gate verify_delta_txn_version §9 (65).
+  (b) `RollbackTransaction` calls EW #52's **`DiscardDataFilesAsync`** on the eagerly-written DATA files,
+  the class (a) structurally could not touch — EW's provenance rule never collects a host-written file, so
+  the host has to name them. ⚠ This needed a C++ fix first: `FabricatorTransactionManager::
+  RollbackTransaction` **never set an opener**, so it held a STALE `ClientContext*` — harmless while
+  rollback did no IO, a use-after-free the moment it does any. It now takes its own short-lived connection
+  like the commit path, and clears the opener to 0 (there is no caller context to restore). Never throws:
+  a failed discard logs and leaves the orphan, i.e. the old behaviour. Gate
+  verify_delta_catalog_transactions 943 → 944, mutation-tested. Both gates mutation-tested. Incl.
   S3 multi-writer conditional-PUT commits (SECRET-routed), the dbt table-swap RENAME fix, buffered
   IDENTITY/CDF/same-txn-DML, and the partitioned×native_read partition-column bug fix. Gate
   verify_delta_catalog_transactions (now 941); semantics [docs/delta-transactions.md](docs/delta-transactions.md).

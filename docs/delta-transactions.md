@@ -265,8 +265,38 @@ any `_delta_log` entry (a rolled-back CTAS leaves parquet in a `_delta_log`-less
 not a table to any reader; a same-name re-create works). Cleanup is `VACUUM`'s job — the exact
 shape of Spark's OptimisticTransaction rollback.
 
-**⚠ NARROWED 2026-08-02, and the distinction is by WHO WROTE THE FILE, not by when.** The statement
-above is still exactly true of the eagerly-written **data** files. It is no longer true of what
+**⚠⚠ NARROWED TWICE ON 2026-08-02, AND THE SECOND TIME LEAVES ALMOST NOTHING OF IT.** The paragraph above
+is now HISTORICAL: since EW #52, `ROLLBACK` also **reclaims the eagerly-written DATA files** — the class the
+first narrowing explicitly could not touch. What stays true of it: not committing IS the rollback, atomically
+and for free; the reclamation is about the BYTES, which used to sit on storage until VACUUM's retention
+horizon, billed the whole time.
+- **It had to be a VERB, not a disposal.** `WriteDataFilesAsync` returns a plain list and keeps no handle ON
+  PURPOSE — a write may outlive its call and be committed by a later, unrelated one, so only the HOST knows
+  the commit is not coming. Ours does: `DeltaCatalog.RollbackTransaction` hands EW exactly the
+  `pending.Files` it wrote.
+- **⚠ It needed a C++ fix first, and that is the interesting part.**
+  `FabricatorTransactionManager::RollbackTransaction` **never called `SetActiveOpener`** — unlike the commit
+  path directly above it. Harmless while rollback did no IO, but `AmbientOpener.Current` there held whatever
+  an earlier call left: a **stale `ClientContext*`**, which this repo already records as a use-after-free
+  rather than staleness. Rollback now takes its OWN short-lived connection + opener, for the same reason
+  commit does — deleting through DuckDB's FileSystem resolves SECRETs and the secret manager demands an
+  active transaction. Unlike `CommitTransaction`, this override is handed **no `ClientContext`**, so there is
+  nothing to restore to and the opener is cleared to `0` BEFORE the connection dies.
+- **Never throws.** Rollback is already the failure path; a cleanup error must not replace the user's real
+  one, and a failed discard logs and leaves the orphan — exactly the old behaviour, so strictly no worse.
+  The throw it most plausibly swallows is EW REFUSING a file the table references (checked against a freshly
+  read log, validate-then-apply). Ours are uncommitted by construction, but the immediate-by-design
+  operations (identity creates, CREATE OR REPLACE, partition overwrite) commit INSIDE the transaction, so
+  treating "referenced" as impossible would be an assumption about a list we do not fully own.
+- **Gate**: `verify_delta_catalog_transactions` 943 → **944**, mutation-tested. ⚠ That section had asserted
+  the parquet count only BEFORE the rollback for a year, so the behaviour could change under it in silence
+  and its comment ("stays as an invisible orphan") went false without a single test noticing. The
+  before-count is now documented as the positive control: a post-rollback count of 4 is also what a
+  statement that never wrote its post-image would leave. Hermetic floor 5654 → 5656 (+2 — doubled suite).
+
+The FIRST narrowing follows, kept because the provenance rule it describes is still what separates the two
+mechanisms: EW's ledger collects what EW's OWN writers made, `DiscardDataFilesAsync` collects what the HOST
+names. The statement above is still exactly true of the eagerly-written **data** files. It is no longer true of what
 engineered-wood's own writers put on storage during the FLUSH — above all the **deletion vector a
 buffered DELETE stages**, since `StageRowDeletesAsync` writes the vector before the commit is judged.
 The flush's transaction is now `await using`, so a flush that does not commit takes those back (EW

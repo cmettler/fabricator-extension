@@ -123,7 +123,12 @@ case "$TIER" in
         # left a stray deletion_vector_*.bin forever. The section needs a delete LARGER than the 1 KB roaring
         # inline threshold, or the vector rides inside the commit json and there is no file to leak.
         : "${MIN_SUITES:=63}"
-        : "${MIN_ASSERTIONS:=5654}"
+        # 5656 since 2026-08-02: verify_delta_catalog_transactions 943 -> 944 — ROLLBACK now RECLAIMS the
+        # data files the transaction eagerly wrote (EW #52's DiscardDataFilesAsync) instead of leaving them
+        # for VACUUM. +2, not +1: that suite is one of the DOUBLED ones below, so an assertion added to it
+        # counts once per engine. The section had asserted the parquet count only BEFORE the rollback for a
+        # year, which is exactly why the behaviour could change under it in silence.
+        : "${MIN_ASSERTIONS:=5656}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
