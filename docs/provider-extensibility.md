@@ -98,6 +98,26 @@ all `mssql`-specific.
 extension just reads them from the attach options map at attach time. So the refactor is "**pass the map to
 C#**," not "register declarations."
 
+### 3.1 `access_mode` — the one SYNTHETIC option (2026-08-02, no ABI change)
+
+Everything else in `options_json` is a key the user typed. **`access_mode` is not**: DuckDB's
+`READ_ONLY` / `READ_WRITE` is an ATTACH **keyword** parsed into `AttachOptions.access_mode`, so it never
+appears in `options.options` and a provider could not otherwise see whether it is allowed to write. It is
+now forwarded as the enum's lowercase name — `read_only` / `read_write` / `automatic` / `undefined`.
+
+- **`automatic` is passed through as itself, NOT resolved.** What it resolves to is DuckDB's business, and
+  it is path-dependent: a remote root (`s3://`, `abfss://`) is bumped to read-only, a local one is not. A
+  provider that needs the resolved answer should treat `automatic` as "ask DuckDB", never as a synonym.
+- **First consumer**, and the reason it exists: the Delta catalog warns at attach time about an `s3://`
+  root opened `read_write` with no NAMED secret — the configuration that loses concurrent commits silently
+  ([delta-transactions.md](delta-transactions.md) §8.3). It deliberately does NOT warn on `automatic`,
+  because such a catalog can never reach the unguarded commit path.
+- **No ABI bump**: `options_json` is a free-form string, so adding a key is additive. A provider that does
+  not read it is unaffected — and every existing one ignores unknown keys already.
+- ⚠ **A synthetic key can collide with a user's.** `access_mode` is appended LAST, so an ATTACH option
+  literally spelled `access_mode` would produce a duplicate JSON key. No provider defines one today; if one
+  ever does, the synthetic name is the one to change (it has no user-facing spelling to preserve).
+
 **Refactor:**
 - Extend `open_catalog` to carry the **full ATTACH options map** (today it gets only the connstr); C# parses
   the ones it knows. (Signature change → ABI bump.)

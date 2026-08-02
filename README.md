@@ -1116,6 +1116,29 @@ ATTACH 'abfss://Workspace@onelake.dfs.fabric.microsoft.com/LH.Lakehouse/Tables'
 SELECT * FROM lake.main.t WHERE id > 10;          -- streaming scan + file/row-group filter pushdown
 ```
 
+> ### ⚠ Writing to `s3://` concurrently: NAME the secret
+>
+> ```sql
+> -- SAFE for concurrent writers: the secret is NAMED, so commits use a conditional PUT
+> ATTACH 's3://bucket/lake' AS lake (TYPE fabricator, PROVIDER 'delta', SECRET my_s3, READ_ONLY false);
+>
+> -- UNSAFE: no SECRET clause. Reads and writes work; CONCURRENT writers lose commits SILENTLY.
+> ATTACH 's3://bucket/lake' AS lake (TYPE fabricator, PROVIDER 'delta', READ_ONLY false);
+> ```
+>
+> Delta's commit needs a put-if-absent, and **httpfs cannot send one on S3** — two writers at the same
+> version both succeed and the later silently overwrites the earlier. Naming an `s3` secret in the ATTACH
+> routes commits through a real conditional `PutObject` (`If-None-Match: "*"`) instead.
+>
+> **Having a secret in scope is not enough** — only the one the ATTACH *names* reaches the commit path,
+> while DuckDB uses the ambient secret for data IO either way. So the unsafe form authenticates, reads,
+> writes and passes every single-writer test. Measured on MinIO: 6 writers × 8 commits landed **8 of 48**
+> with no error; the same run with the secret named landed 48/48.
+>
+> The attach warns when you get this wrong (`SELECT message FROM duckdb_logs` after
+> `CALL enable_logging(level := 'debug', storage := 'memory')`). Single-writer use is unaffected, and a
+> read-only attach needs nothing — this is only about concurrent writers.
+
 | Feature | Status |
 |---------|--------|
 | Discover tables — local (`System.IO`), S3 (host-FS glob), OneLake (Fabric Unity Catalog REST API) | ✅ (generic non-OneLake ADLS not supported — duckdb-azure glob #174) |

@@ -499,8 +499,26 @@ argued.
   named "rename", one implemented and unguarded, the other unimplemented.
 
 **Fix for a user: name the secret** — `ATTACH 's3://…' AS lake (TYPE fabricator, PROVIDER 'delta',
-SECRET my_s3, READ_ONLY false)`. Worth considering, and not built: WARN at attach time when an `s3://`
-root is attached writable with no named secret, since the failure is silent and the remedy is one option.
+SECRET my_s3, READ_ONLY false)`.
+
+**And since 2026-08-02 the attach WARNS when you have not** (`duckdb_logs`, category `Fabricator.Delta`),
+naming the remedy and the fact that a secret merely being in scope is not enough. Justified by the
+asymmetry rather than by taste: the failure is silent, severe and invisible to every single-writer test,
+and the fix is one option.
+- **It needed one piece of plumbing.** `READ_ONLY` is a DuckDB ATTACH KEYWORD, not a member of
+  `options.options`, so no provider could see it. `fabricator_storage.cpp` now forwards a SYNTHETIC
+  `"access_mode"` (`read_only` / `read_write` / `automatic` / `undefined`) in the options JSON — no ABI
+  change, the JSON is already free-form, and "am I allowed to write here?" is a fair provider question.
+  `AUTOMATIC` is passed through as itself rather than resolved: what it resolves to is DuckDB's business.
+- **⚠ The gate is `read_write` SPECIFICALLY, and that is a measured decision, not caution.** An
+  `s3://` attach with no `READ_ONLY` clause is **bumped to read-only by DuckDB** — measured, a `CREATE`
+  against it fails with *"attached in read-only mode"*. So `READ_ONLY false` is the ONLY route to a
+  writable S3 catalog, which gives the warning complete coverage of the dangerous shape with no false
+  positives. Warning on `AUTOMATIC` too would fire on catalogs that can never reach the unguarded commit
+  path, which is how a real warning gets trained away.
+- Gate: `verify_delta_catalog_s3` §11 (161 → **171**), **two mutants killed in opposite directions by ONE
+  assertion** — suppressing the warning yields 0, ignoring `access_mode` yields 2 (the AUTOMATIC attach
+  warns too). The second is what proves the new C++ plumbing is READ rather than merely forwarded.
 
 ---
 

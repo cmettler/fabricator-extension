@@ -142,7 +142,15 @@ case "$TIER" in
         # DROP refreshes the whole cache and the name leaves the discovered list, so the lookup answers
         # "does not exist" WITHOUT ever fetching columns — the section then passes with the provider's
         # absence detection disabled, which is exactly what mutation-testing caught it doing.
-        : "${MIN_ASSERTIONS:=1424}"
+        # 1444 since 2026-08-02: verify_delta_catalog_s3 161 -> 171, §11 — the attach-time warning for an
+        # s3:// root opened READ_WRITE with no NAMED secret. MEASURED first: that shape loses 40 of 48
+        # concurrent commits SILENTLY (§8.3). Two mutants, killed in opposite directions by ONE assertion —
+        # suppressing the warning gives 0, ignoring access_mode gives 2 (the AUTOMATIC attach warns too),
+        # which is what proves the new C++ access_mode plumbing is read rather than merely forwarded.
+        # ⚠ +20, not +10: verify_delta_catalog_s3 is THE DOUBLED SUITE of this tier (see DOUBLED below), so
+        # every assertion added to it counts ONCE PER ENGINE. A floor of 1434 was set first from the
+        # standalone 161 -> 171 delta and would have silently tolerated a 10-assertion regression.
+        : "${MIN_ASSERTIONS:=1444}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

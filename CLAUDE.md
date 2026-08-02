@@ -1632,7 +1632,14 @@ VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
   `RenameAsync`, and the host-FS one emulates put-if-absent with `EXCLUSIVE_CREATE`, which
   `fabricator_fs_write_probe` shows is unguarded on s3 (both creates succeed; the later overwrites). Do NOT
   read the secretless `ALTER TABLE … RENAME` error as the commit path — that is `fs_move_dir`, a different
-  operation. Harness `scratchpad/s3_race.sh`. Other S3 caveats: `DROP EXTERNAL TABLE IF EXISTS` is not T-SQL (use
+  operation. Harness `scratchpad/s3_race.sh`. **The ATTACH now WARNS on that shape** (gate
+  `verify_delta_catalog_s3` §11, 161 → 171, two mutants killed in opposite directions), which needed a new
+  SYNTHETIC ATTACH option: **`access_mode`** (`read_only`/`read_write`/`automatic`/`undefined`) forwarded by
+  `fabricator_storage.cpp` into the options JSON, because `READ_ONLY` is a DuckDB ATTACH KEYWORD that no
+  provider could otherwise see — no ABI change, the JSON is free-form. ⚠ The warning is gated on
+  `read_write` specifically because **an s3 attach with NO `READ_ONLY` clause is bumped to READ-ONLY by
+  DuckDB** (measured), so `READ_ONLY false` is the only route to a writable S3 catalog — complete coverage,
+  no false positives. Other S3 caveats: `DROP EXTERNAL TABLE IF EXISTS` is not T-SQL (use
   `IF OBJECT_ID(...) IS NOT NULL DROP EXTERNAL TABLE ...`). **Committed-table RENAME TABLE on S3 — DONE
   (2026-07-17, C#-only) for SECRET-routed attaches:** `S3CommitFileSystem.RenameDirectory` renames the whole
   table folder SERVER-SIDE via the SDK (ListObjectsV2 → `CopyObject` per key — unconditional copies are fine,

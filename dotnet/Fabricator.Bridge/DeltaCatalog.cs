@@ -308,6 +308,39 @@ public sealed class DeltaCatalog : IBackendCatalog
             _ => throw new System.ArgumentException(
                 $"delta: unknown isolation_level '{isolation}' — expected 'serializable' or 'write_serializable'."),
         };
+        WarnIfUnguardedS3Write(ParseStringOption(optionsJson, "access_mode"));
+    }
+
+    /// <summary>
+    /// Warns when an <c>s3://</c> root is attached READ_WRITE with no NAMED secret — the configuration that
+    /// loses concurrent commits SILENTLY (MEASURED: 6 writers × 8 commits ⇒ 8 of 48 landed, 40 lost, zero
+    /// errors; the same shape with the secret named ⇒ 48/48. docs/delta-transactions.md §8.3).
+    ///
+    /// <para><b>Why a warning is worth its noise here.</b> The unsafe configuration authenticates, writes,
+    /// reads and passes every single-writer test — httpfs uses the ambient s3 secret for DATA IO, and only
+    /// the COMMIT guard is missing, because <see cref="S3CommitCredential"/>'s marker rides on the secret the
+    /// ATTACH NAMES. So nothing about the setup looks wrong, the remedy is one option, and the failure is
+    /// invisible. That asymmetry — silent, severe, one-line fix — is the case a warning exists for.</para>
+    ///
+    /// <para>Gated on READ_WRITE specifically, not on "not read-only": a remote root under
+    /// <c>AUTOMATIC</c> may be bumped to read-only by DuckDB, and warning about a catalog that will never
+    /// write is how a real warning gets trained away. Asking for write access is the deliberate act.</para>
+    /// </summary>
+    private void WarnIfUnguardedS3Write(string? accessMode)
+    {
+        if (_s3Credential is not null
+            || !S3CommitFileSystem.IsS3(_root)
+            || !string.Equals(accessMode, "read_write", System.StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+        _log.LogWarning(
+            "delta attach {Root}: s3 root attached READ_WRITE with no named SECRET — the commit guard is "
+            + "OFF, so concurrent writers LOSE COMMITS SILENTLY (httpfs cannot send If-None-Match; a "
+            + "measured 6-writer run landed 8 of 48 commits with no error). Single-writer use is unaffected. "
+            + "Add SECRET <name> to the ATTACH to route commits through the conditional-PUT path — an s3 "
+            + "secret merely being in scope is NOT enough, since only the NAMED one reaches the commit path.",
+            _root);
     }
 
     // ATTACH option `isolation_level 'write_serializable'|'serializable'` (Spark's delta.isolationLevel):

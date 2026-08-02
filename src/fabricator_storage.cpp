@@ -135,6 +135,30 @@ static unique_ptr<Catalog> FabricatorAttach(optional_ptr<StorageExtensionInfo> s
 		options_body += "\"" + EscapeJsonOption(lower) + "\":\"" + EscapeJsonOption(it->second.ToString()) + "\"";
 		it = options.options.erase(it);
 	}
+	// SYNTHETIC option, not one the user wrote: DuckDB's READ_ONLY / READ_WRITE is an ATTACH KEYWORD, so it
+	// never appears in options.options and a provider could not see it. Forwarded because "am I allowed to
+	// write here?" is a legitimate provider question — the Delta catalog uses it to warn, at attach time,
+	// about an s3:// root opened READ_WRITE with no named SECRET, which silently loses concurrent commits
+	// (docs/delta-transactions.md §8.3). Emitted as the enum's lowercase name so the contract is stable;
+	// AUTOMATIC is passed through as itself rather than resolved, since what it RESOLVES to is DuckDB's
+	// business and a provider must not second-guess it.
+	if (!options_body.empty()) {
+		options_body += ",";
+	}
+	switch (options.access_mode) {
+	case AccessMode::READ_ONLY:
+		options_body += "\"access_mode\":\"read_only\"";
+		break;
+	case AccessMode::READ_WRITE:
+		options_body += "\"access_mode\":\"read_write\"";
+		break;
+	case AccessMode::AUTOMATIC:
+		options_body += "\"access_mode\":\"automatic\"";
+		break;
+	default:
+		options_body += "\"access_mode\":\"undefined\"";
+		break;
+	}
 	string options_json = "{" + options_body + "}";
 
 	string connection_string;

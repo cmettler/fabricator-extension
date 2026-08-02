@@ -476,3 +476,66 @@ DROP TABLE rns.main.rn_src2;
 
 statement ok
 DETACH rns;
+
+# ----------------------------------------------------------------------------
+# 11. ATTACH-TIME WARNING: s3:// opened READ_WRITE with NO NAMED SECRET
+#
+# That configuration loses concurrent commits SILENTLY — MEASURED at 6 writers
+# x 8 commits: 8 of 48 landed, 40 lost, zero errors; the same shape with the
+# secret NAMED landed 48/48 (docs/delta-transactions.md §8.3). It is worth a
+# warning precisely because nothing about it looks wrong: httpfs uses the
+# ambient secret for DATA IO, so it authenticates, writes, reads and passes
+# every single-writer test — only the COMMIT guard is missing, because the
+# credential marker rides on the secret the ATTACH NAMES.
+#
+# Gated on READ_WRITE and not on "not read-only" ON PURPOSE, and the third
+# attach below is why that is not merely conservative: DuckDB BUMPS a remote
+# s3:// attach to read-only under AUTOMATIC (measured — a CREATE against it
+# fails with "attached in read-only mode"), so an AUTOMATIC catalog can never
+# reach the unguarded commit path and warning about it would train the warning
+# away for nothing.
+# ----------------------------------------------------------------------------
+
+statement ok
+CALL enable_logging(level := 'debug', storage := 'memory');
+
+statement ok
+ATTACH 's3://fabricator/warnprobe' AS wunguarded (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}', READ_ONLY false);
+
+# the NAMED-secret attach is the control: same root shape, guard present, silent
+statement ok
+ATTACH 's3://fabricator/warnprobe' AS wguarded (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}', SECRET minio_s3, READ_ONLY false);
+
+# AUTOMATIC (no READ_ONLY clause) — DuckDB makes it read-only, so no warning is owed
+statement ok
+ATTACH 's3://fabricator/warnprobe' AS wauto (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}');
+
+# exactly ONE warning, naming the remedy
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE message LIKE '%s3 root attached READ_WRITE with no named SECRET%'
+  AND message LIKE '%Add SECRET <name> to the ATTACH%';
+----
+1
+
+# and it named the UNGUARDED root, not one of the other two
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE message LIKE '%delta attach s3://fabricator/warnprobe%no named SECRET%';
+----
+1
+
+# the AUTOMATIC attach really is read-only — the reason it is exempt
+statement error
+CREATE TABLE wauto.main.nope (id INTEGER);
+----
+read-only mode
+
+statement ok
+DETACH wunguarded;
+
+statement ok
+DETACH wguarded;
+
+statement ok
+DETACH wauto;
