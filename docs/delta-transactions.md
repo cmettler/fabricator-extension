@@ -265,6 +265,24 @@ any `_delta_log` entry (a rolled-back CTAS leaves parquet in a `_delta_log`-less
 not a table to any reader; a same-name re-create works). Cleanup is `VACUUM`'s job — the exact
 shape of Spark's OptimisticTransaction rollback.
 
+**⚠ NARROWED 2026-08-02, and the distinction is by WHO WROTE THE FILE, not by when.** The statement
+above is still exactly true of the eagerly-written **data** files. It is no longer true of what
+engineered-wood's own writers put on storage during the FLUSH — above all the **deletion vector a
+buffered DELETE stages**, since `StageRowDeletesAsync` writes the vector before the commit is judged.
+The flush's transaction is now `await using`, so a flush that does not commit takes those back (EW
+#46's `WrittenFileLedger` + #49). EW's provenance rule never collects a host-written file, which is
+what keeps the two halves apart — our data files are written before that transaction exists.
+- **MEASURED both ways**, because the obvious probe is void: a *small* delete stores its vector
+  INLINE in the commit json (below a 1 KB roaring-bitmap threshold), so there is no file to leak and
+  the orphan does not reproduce. At 500k rows it does — a stray `deletion_vector_*.bin` that
+  survived the refused commit forever. Gate: `verify_delta_txn_version` §9 (51 → 65), whose delete is
+  sized above the threshold on purpose and which asserts ZERO vectors *before* the refused flush so a
+  later zero cannot be read as "never written".
+- **⚠ Do not backport the `await using` past EW #49.** #46 introduced the ledger, but `CommitOccAsync`
+  refreshed the snapshot AFTER the commit json was durable and inside the same `try`, so a commit that
+  LANDED and then threw still named its live files — disposal would have deleted committed data. #49
+  empties the ledger the instant `WriteCommitAsync` returns.
+
 Not undone by ROLLBACK (because they were immediate): DROP, OPTIMIZE/VACUUM, CREATE OR REPLACE,
 RENAME TABLE of a *committed* table, nested RENAME FIELD, and the path-targeted `COPY (FORMAT
 delta)`. The C++ side calls `InvalidateAllEntries()` on rollback so no stale schema survives a
@@ -282,7 +300,7 @@ depends on the filesystem:
 | Local POSIX | `O_EXCL` exclusive create | multi-process safe (validated: 4 processes × 200 rows → 800/800) |
 | OneLake / abfss (`onelake://`) | ADLS conditional create (`If-None-Match: *`) | multi-process safe for DATA (no lost writes measured), but a losing writer can surface an ERROR instead of retrying — see §8.1 |
 | Fabric fuse mount (`/lakehouse/default`) | `O_EXCL` over fuse — doubtful | treat as **single-writer** |
-| S3 plain ATTACH (httpfs) | **none** — httpfs never sends `If-None-Match` | documented **single-writer** |
+| S3 plain ATTACH (httpfs) | **none** — httpfs never sends `If-None-Match` | **MEASURED 2026-08-02 (§8.3): 6 writers × 8 commits ⇒ 8 of 48 landed, 40 SILENTLY LOST, zero errors.** Single-writer, and the "guarded" alternative needs the secret NAMED in the ATTACH |
 | S3 ATTACH **with an s3 `SECRET`** | real conditional PUT via the AWS SDK (`S3CommitFileSystem`: Get(temp) → Put(target, `If-None-Match:"*"`) → Delete(temp); 412 → conflict → OCC/rebase) | multi-process / multi-engine safe (validated on MinIO: 4 × 10 commits × 20 rows → 40/40, 800/800, across checkpoint boundaries) |
 
 ### 8.1 OneLake multi-writer — MEASURED 2026-07-31 (it had only been INFERRED)
@@ -441,6 +459,48 @@ inside the explicit transaction — the flush compare-and-swaps against the late
 `AppTransactions` on every retry attempt and emits the spec `txn` action atomically with the fused
 commit; a duplicate retry fails the CAS ("transaction version conflict") instead of duplicating
 data. Read the committed high-water mark with `fabricator_delta_get_transaction_version(…)`.
+
+### 8.3 S3 without a NAMED secret — MEASURED 2026-08-02 (it had only been INFERRED), and it is worse than the caveat said
+
+The "S3 plain ATTACH" row above carried no numbers for a year while the local-POSIX and secret-routed
+S3 rows carried real ones — the same gap §8.1 found for OneLake, where the inference turned out to be
+WRONG. Here it was right, and understated.
+
+**A/B, one option apart, `scratchpad/s3_race.sh` (6 `duckdb.exe` processes × 8 autocommit INSERTs into
+one MinIO Delta table, each row tagged `(writer, commit)`):**
+
+| ATTACH | attempted | commit files | rows | distinct groups |
+|---|---|---|---|---|
+| no `SECRET` clause | 48 | **8** | 8 | 8 |
+| `… , SECRET minio_s3, …` | 48 | **48** | 48 | 48 |
+
+**40 of 48 commits silently lost, and NOT ONE WRITER REPORTED AN ERROR.** The guarded control is the
+positive control: same harness, same contention, so the harness is not what produced the zeros.
+
+**⚠ THE SHARPENING THAT MATTERS, and the caveat's wording hides it: the guard is opt-in PER ATTACH, and
+having an s3 secret in scope is NOT enough.** `BuildConnectionString` appends the credential marker only
+for the secret the ATTACH NAMES; `TableFileSystems.Create` then wraps the root in `S3CommitFileSystem`
+(real `PutObject` + `If-None-Match:"*"`). Without the clause the catalog falls back to
+`DuckDbTableFileSystem` — while httpfs happily uses the very same ambient secret for DATA IO. So the
+unsafe configuration **authenticates, writes, reads and passes every single-writer test**, and looks
+correctly configured to anyone who created a secret. Measured directly: an unnamed-secret ATTACH does
+its CTAS fine and then fails `ALTER TABLE … RENAME` with *"S3FileSystem: MoveFile is not implemented"* —
+the documented secretless signature.
+
+**Why the loss is SILENT rather than an error, which is the part worth understanding.** EW's commit is
+`WriteCommitAsync` → `_fs.RenameAsync(temp, target)`, and `DuckDbTableFileSystem.RenameAsync` does NOT
+call MoveFile — it emulates put-if-absent by creating the TARGET with **`EXCLUSIVE_CREATE`** and copying
+the bytes in. `fabricator_fs_write_probe` on `s3://` reports
+*"EXCLUSIVE_CREATE on an existing file SUCCEEDED — NO put-if-absent guard"*, so both writers' creates
+succeed, the later one overwrites, and neither sees a failure. Every link is now measured rather than
+argued.
+- ⚠ **The `ALTER TABLE` failure above is a DIFFERENT operation** (`fs_move_dir`, a directory rename) and
+  reading it as the commit path suggests secretless commits fail LOUDLY. They do not. Two operations
+  named "rename", one implemented and unguarded, the other unimplemented.
+
+**Fix for a user: name the secret** — `ATTACH 's3://…' AS lake (TYPE fabricator, PROVIDER 'delta',
+SECRET my_s3, READ_ONLY false)`. Worth considering, and not built: WARN at attach time when an `s3://`
+root is attached writable with no named secret, since the failure is silent and the remedy is one option.
 
 ---
 

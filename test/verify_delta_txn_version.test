@@ -207,3 +207,76 @@ query TI
 SELECT * FROM fabricator_delta_get_transaction_version('lake2', 't', 'loader');
 ----
 loader	2
+
+# ----------------------------------------------------------------------------
+# 9. A REFUSED flush takes back the deletion vector it wrote (EW #46 + #49)
+#
+# StageRowDeletesAsync writes the vector at STAGING time, so it is on storage
+# before the app-transaction precondition is judged. Until the flush's
+# transaction became `await using`, a refused commit left it behind forever —
+# MEASURED: the same shape produced a stray deletion_vector_*.bin.
+#
+# Scoped deliberately to what EW's OWN writers produced. Our eagerly-written
+# DATA files are written before that transaction exists and EW's provenance
+# rule never collects a host-written file, so "rollback leaves invisible
+# orphans for VACUUM" still describes them — §5's ROLLBACK above is unchanged.
+#
+# The delete must exceed the 1 KB roaring-bitmap inline threshold or the vector
+# rides INSIDE the commit json and there is no file to leak — a smaller delete
+# passes this section while testing nothing.
+# ----------------------------------------------------------------------------
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txnorph' AS orph (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE orph.main.t (id INTEGER) WITH (deletion_vectors=true);
+
+statement ok
+INSERT INTO orph.main.t SELECT * FROM range(20000);
+
+statement ok
+BEGIN;
+
+statement ok
+CALL fabricator_delta_set_transaction_version('orph', 't', 'loader', 5);
+
+statement ok
+INSERT INTO orph.main.t VALUES (999999);
+
+statement ok
+COMMIT;
+
+# positive control: no vector on disk yet, so a later 0 means "collected", not
+# "never written".
+query I
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txnorph/t/deletion_vector_*.bin');
+----
+0
+
+statement ok
+BEGIN;
+
+statement ok
+DELETE FROM orph.main.t WHERE id % 3 = 0;
+
+# the SAME version again, with the Absent precondition — refused at commit
+statement ok
+CALL fabricator_delta_set_transaction_version('orph', 't', 'loader', 5);
+
+statement error
+COMMIT;
+----
+transaction version conflict
+
+# the vector staged by the refused flush is GONE
+query I
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txnorph/t/deletion_vector_*.bin');
+----
+0
+
+# and the DELETE did not land
+query I
+SELECT count(*) FROM orph.main.t;
+----
+20001

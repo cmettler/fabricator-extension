@@ -118,8 +118,12 @@ case "$TIER" in
         # the end of the log: it used to return the NEWEST snapshot under the requested label, so a stale pin
         # or an off-by-one silently got real rows for a version that does not exist. Nothing pinned either
         # answer before, so the behaviour could have flipped back unnoticed in whichever direction.
+        # 5654 since 2026-08-02: verify_delta_txn_version 51 -> 65, §9 — a REFUSED flush now takes back the
+        # deletion vector it staged (EW #46's ledger + #49's fix). MEASURED before the change: the same shape
+        # left a stray deletion_vector_*.bin forever. The section needs a delete LARGER than the 1 KB roaring
+        # inline threshold, or the vector rides inside the commit json and there is no file to leak.
         : "${MIN_SUITES:=63}"
-        : "${MIN_ASSERTIONS:=5640}"
+        : "${MIN_ASSERTIONS:=5654}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

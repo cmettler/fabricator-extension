@@ -845,14 +845,31 @@ DuckDB's rowid and hand it to DuckDB, and the read-back, which strips. There is 
 metadata column reaches a write. (A green hermetic tier says the guard did not fire; the enumeration says
 it cannot.)
 
-### NOT taken, deliberately: `await using` on the buffered flush
+### `await using` on the buffered flush — deferred out of the bump, then TAKEN as its own change (same day)
 
-Our flush does `var txn = table.StartTransaction(...)` and the `finally` disposes only the TABLE, so
-deletion vectors written by a rebase attempt that then loses the conflict check are left behind. #49 makes
-collecting them safe — the ledger empties the instant the commit json is durable, closing the window #46
-opened where a landed-but-threw commit could delete live data. **But "rollback leaves invisible orphans for
-VACUUM" is documented behaviour, not a bug, and a bump is the wrong place for a behaviour change.**
-Follow-up. ⚠ Note the dependency: this idea was UNSAFE at #46 and is only safe at #49.
+Held back from the bump on purpose ("rollback leaves invisible orphans for VACUUM" is documented
+behaviour, and a bump is the wrong place to change behaviour), then done separately. ⚠ The dependency is
+real: this line was UNSAFE at #46 — `CommitOccAsync` refreshed the snapshot AFTER the commit json was
+durable and inside the same `try`, so a commit that LANDED and then threw still named its live files and
+disposal would have deleted committed data. #49 empties the ledger the instant `WriteCommitAsync` returns.
+
+**What it collects is narrower than "orphans", and the split is by WHO WROTE THE FILE.** Our eagerly-written
+DATA files are written before the flush's transaction exists, and EW's provenance rule never collects a
+host-written file — so §7 of [delta-transactions.md](delta-transactions.md) still describes them exactly.
+What is collected is what EW's own writers stage during the flush, above all the **deletion vector of a
+buffered DELETE**: `StageRowDeletesAsync` writes it before the precondition is judged.
+
+**⚠ THE FIRST PROBE SAID THERE WAS NOTHING TO COLLECT, AND IT WAS VOID.** 100 rows, `DELETE … WHERE
+id % 3 = 0`, refused commit: zero `.bin` files before and after — which reads as "this change is
+pointless". EW stores a vector **INLINE in the commit json** below a 1 KB roaring-bitmap threshold, so a
+small delete has no file to leak. At 500k rows the orphan appears and survives forever. **A cleanup whose
+target is size-conditional cannot be probed at a convenient size** — the same "negative result is not a
+measurement" rule, wearing the threshold as its disguise.
+
+Gate: `verify_delta_txn_version` §9 (51 → **65**), mutation-tested — reverting to `var` fails exactly the
+"the vector is GONE" assertion and nothing else. It asserts ZERO vectors BEFORE the refused flush as a
+positive control, so the later zero cannot be read as "never written", and its comment says the delete must
+exceed the inline threshold or the section passes while testing nothing. Hermetic floor 5640 → **5654**.
 
 ### Gates
 

@@ -3426,7 +3426,21 @@ public sealed class DeltaCatalog : IBackendCatalog
             // are keyed by the pinned version's file ordinals and the ALTERs below are chained against its
             // metadata, and what the commit has to be validated against is every commit that landed SINCE
             // that version. From CurrentSnapshot that set would be empty and the validation vacuous.
-            var txn = table.StartTransaction(pinnedSnap,
+            //
+            // `await using`: a flush that does NOT commit takes back what EW's own writers put on storage
+            // during it. MEASURED: a buffered DELETE whose commit is then refused left a
+            // `deletion_vector_*.bin` behind — StageRowDeletesAsync writes the vector at STAGING time, so it
+            // is on disk before the precondition is judged. Our own eagerly-written DATA files are NOT
+            // affected and must not be: they are written before this transaction exists and EW's provenance
+            // rule never collects a host-written file, so "rollback leaves invisible orphans for VACUUM"
+            // still describes them exactly.
+            // ⚠ Safe only from EW #49 onward. #46 introduced the ledger, but CommitOccAsync refreshed the
+            // snapshot AFTER the commit json was durable and inside the same try, so a commit that LANDED
+            // and then threw still named its live files — disposal would have deleted committed data. #49
+            // empties the ledger the instant WriteCommitAsync returns. Do not backport this line.
+            // Disposal order: declared inside the try, so it runs BEFORE the finally disposes the table —
+            // the cleanup needs the table's filesystem. (EW deliberately tolerates the reverse order too.)
+            await using var txn = table.StartTransaction(pinnedSnap,
                 tableSer
                     ? EngineeredWood.DeltaLake.Table.IsolationLevel.Serializable
                     : EngineeredWood.DeltaLake.Table.IsolationLevel.WriteSerializable);

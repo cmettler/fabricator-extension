@@ -890,7 +890,14 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
 - **dbt DAX→Delta pipeline — DONE + validated live** (`dbt_dax_test/`, gitignored; plain-DAX model bodies
   via the custom `dax_table` materialization). Full as-built record (moved verbatim from here): [docs/feature-history.md](docs/feature-history.md).
 - **Eager-write DeltaTxnBuffer — ALL SLICES DONE (A, B, C1–C3, D + edge lifts).** Data files always land
-  on storage at statement time; the buffer holds ACTIONS; rollback = invisible orphans for VACUUM. Incl.
+  on storage at statement time; the buffer holds ACTIONS; rollback = invisible orphans for VACUUM **for
+  those DATA files — but since 2026-08-02 NOT for what EW's own writers stage during the FLUSH.** The
+  flush's transaction is `await using`, so a flush that does not commit takes back e.g. the deletion
+  vector a buffered DELETE staged (`StageRowDeletesAsync` writes it before the commit is judged). The
+  split is by WHO WROTE THE FILE: EW's provenance rule never collects a host-written file, and our data
+  files predate that transaction. ⚠ Safe only from EW #49 — at #46 the same line would have deleted
+  COMMITTED data. Measured (a small delete's vector is INLINE, so the orphan only reproduces above the
+  1 KB threshold); gate verify_delta_txn_version §9 (65), mutation-tested. Incl.
   S3 multi-writer conditional-PUT commits (SECRET-routed), the dbt table-swap RENAME fix, buffered
   IDENTITY/CDF/same-txn-DML, and the partitioned×native_read partition-column bug fix. Gate
   verify_delta_catalog_transactions (now 941); semantics [docs/delta-transactions.md](docs/delta-transactions.md).
@@ -1615,8 +1622,17 @@ VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
   httpfs' S3 `RemoveDirectory` re-lists keys WITHOUT the scheme prefix and fails its own remove ("URL
   needs to start with s3://"), so `DeltaCatalog.DropTable` catches the failure and deletes glob(`/**`)
   file-by-file + the zero-byte directory-marker keys (`RemoveFile` IS implemented for s3). S3 caveats
-  (documented): no put-if-absent on httpfs S3 (single-writer without a SECRET; `fabricator_fs_write_probe`
-  shows EXCLUSIVE_CREATE unguarded); `DROP EXTERNAL TABLE IF EXISTS` is not T-SQL (use
+  **MEASURED 2026-08-02 (was an inference, and it UNDERSTATED the problem — full A/B:
+  [docs/delta-transactions.md](docs/delta-transactions.md) §8.3): an s3 ATTACH that does not NAME a secret
+  loses commits SILENTLY — 6 writers × 8 commits ⇒ 8 of 48 landed, 40 lost, ZERO errors; the same shape with
+  `SECRET minio_s3` named ⇒ 48/48.** ⚠ **Having a secret in scope is NOT enough** — the marker
+  `BuildConnectionString` appends (and hence `S3CommitFileSystem`'s real conditional PUT) rides on the secret
+  the ATTACH NAMES, while httpfs uses the same ambient secret for DATA IO, so the unsafe configuration
+  authenticates, writes, reads and passes every single-writer test. Silent because EW's commit is
+  `RenameAsync`, and the host-FS one emulates put-if-absent with `EXCLUSIVE_CREATE`, which
+  `fabricator_fs_write_probe` shows is unguarded on s3 (both creates succeed; the later overwrites). Do NOT
+  read the secretless `ALTER TABLE … RENAME` error as the commit path — that is `fs_move_dir`, a different
+  operation. Harness `scratchpad/s3_race.sh`. Other S3 caveats: `DROP EXTERNAL TABLE IF EXISTS` is not T-SQL (use
   `IF OBJECT_ID(...) IS NOT NULL DROP EXTERNAL TABLE ...`). **Committed-table RENAME TABLE on S3 — DONE
   (2026-07-17, C#-only) for SECRET-routed attaches:** `S3CommitFileSystem.RenameDirectory` renames the whole
   table folder SERVER-SIDE via the SDK (ListObjectsV2 → `CopyObject` per key — unconditional copies are fine,
