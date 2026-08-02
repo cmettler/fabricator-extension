@@ -1656,9 +1656,10 @@ VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
      must be `CPP`. Under `C_STRUCT` the `duckdb_version` field means the **C API** version, so encoding
      `v1.5.5` yields *"built for DuckDB C API version 'v1.5.5', but we can only load ... 'v1.2.0' and
      lower"* — an error that reads like a DuckDB version problem and is not one. Read the fields off a
-     shipped artifact instead: `tail -c 512 … ` gives `CPP | 0.0.2 | v1.5.5 | windows_amd64 | 4`. **That
-     also catches the extension version** — the stale linux tree encodes `0.0.1`, the current one is
-     `0.0.2`. Check ALL FOUR fields after re-appending; a `C_STRUCT` footer contains the same version
+     shipped artifact instead: `tail -c 512 … ` gives e.g. `CPP | 0.0.2 | v1.5.5 | windows_amd64 | 4`. **That
+     also catches the extension version** — the stale linux tree encoded `0.0.1` against `0.0.2` at the time.
+     Read the CURRENT version off `CMakeLists.txt` rather than this line (it is `0.0.3` as of 2026-08-03);
+     the point is to compare, not the literal. Check ALL FOUR fields after re-appending; a `C_STRUCT` footer contains the same version
      strings, so grepping for "some expected strings" passes while the artifact is unloadable.
   3. **`publish-managed.ps1` reported `Framework, net8.0, linux-x64` while the output dir still held a
      WINDOWS self-contained payload** (`hostfxr.dll`, `coreclr.dll`, `createdump.exe`). Uploaded to Linux it
@@ -2263,6 +2264,17 @@ mislabelled against its own contents. That means bumping **BOTH** declarations, 
 `CMakeLists.txt`'s `FABRICATOR_EXTENSION_VERSION` (→ the `FABRICATOR_VERSION` compile definition, i.e. what
 `fabricator_version()` returns) **and** `extension_config.cmake`'s `EXTENSION_VERSION` (→ the extension
 footer). `v0.0.2` was preceded by exactly that bump.
+
+- **THE SOURCE VERSION IS NOW `0.0.3`** (bumped 2026-08-03; both declarations). **No tag or release has been
+  cut for it** — the bump only makes the tree ready for one. Verified the way this section demands rather
+  than by reading the build files: `fabricator_version()` returns `0.0.3`, and the rebuilt loadable's footer
+  reads `CPP | 0.0.3 | v1.5.5 | windows_amd64 | 4` (all four fields, per the strip/append trap above).
+  The define has exactly ONE consumer (`fabricator_extension.cpp` returning it), and no suite pins the
+  literal — `verify_names` and the distribution smoke both assert only `IS NOT NULL` — so the bump cannot
+  change behaviour elsewhere.
+  - Content since `v0.0.2` (`21e7be5`): the ADLS Gen2 support + PolyBase circle + external-table write-back,
+    the Fabric SQL catalog binding (§9h) and the two bugs it found, Fabric SDK 2.18, zero-argument scalars,
+    the unified parameter protocol, and the provider-declared `_each`.
 
 Earlier moves, while it genuinely was a draft: `0eadd00` → `c2af48a` (to pick up the first EW bump's two
 silent-corruption fixes — the UTF-16-vs-UTF-8 comparator that could make pruning SKIP a file containing

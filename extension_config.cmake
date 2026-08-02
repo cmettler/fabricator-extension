@@ -3,7 +3,7 @@
 # in this repo (DuckDB otherwise derives the version via `git describe`).
 duckdb_extension_load(fabricator
     SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}
-    EXTENSION_VERSION "0.0.2"
+    EXTENSION_VERSION "0.0.3"
     LOAD_TESTS
 )
 
