@@ -1398,12 +1398,22 @@ public sealed class DeltaWriteCollectorFunction : ICollectorTableFunction
 {
     public string Name => "fabricator_delta_write";
 
-    // The actual input schema is supplied to Bind; this declared schema is only discovery metadata (the operator
-    // registers a {TABLE} param that accepts any input).
-    public Schema InputSchema { get; } = new Schema(System.Array.Empty<Field>(), metadata: null);
-
-    public Schema Parameters { get; } =
-        new Schema(new[] { new Field("path", StringType.Default, nullable: false) }, metadata: null);
+    /// <summary>
+    /// The call signature: the input table (any columns — the operator accepts anything, so none are declared)
+    /// followed by the destination path as a NAMED parameter, which is how it is written:
+    /// <c>fabricator_delta_write(&lt;input&gt;, path := '…')</c>.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ <c>path</c> MUST carry <see cref="Params.Named"/>. Before the unified protocol, a collector's
+    /// <c>Parameters</c> meant "named cost args" by convention and the host tagged them all as named; now an
+    /// unflagged field means POSITIONAL, so leaving it bare silently turns <c>path := '…'</c> into a binder
+    /// error. `verify_delta_write` line 44 is what catches it.
+    /// </remarks>
+    public Schema Parameters { get; } = new Schema(new[]
+    {
+        Params.TableInput("input"),
+        Params.Named("path", StringType.Default),
+    }, metadata: null);
 
     public IArrowCollectorBinding Bind(RecordBatch? args, Schema inputSchema)
     {

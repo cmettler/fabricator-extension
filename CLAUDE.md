@@ -609,8 +609,33 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     a CONCRETE subclass yields only the positional half.
   - **⚠ Do NOT script structural edits to C#.** A brace-matching insertion loop ran away (no damage — it never
     reached its write). A single-pass anchored insertion with an explicit class→interface map is the safe form.
-  - Gates: hermetic **63/63 — 5664** and service **44/44 — 1446**, both IDENTICAL to pre-refactor — which is
-    the behaviour-preservation claim.
+  - **POSITIONAL and/or NAMED constant args now work on an IN-OUT / COLLECTOR too, not just named** (user
+    requirement, 2026-08-02). The old bind marshalled `input.named_parameters` ALONE, which was fine only
+    while cost args were named BY CONVENTION; the moment one could be declared positional, the signature
+    accepted `f((SELECT …), 3)` and the 3 was **silently dropped before reaching C#** — a half-offered
+    capability, worse than refusing it. `FabricatorMarshalInOutArgs` now walks the DECLARED order:
+    TABLE_INPUT consumes its reserved slot and emits nothing (DuckDB pushes a placeholder Value for the
+    subquery, so skipping the slot would shift every later positional), POSITIONAL takes the next
+    `input.inputs` value, NAMED takes the supplied value or a typed NULL. Demo + gate: the global
+    `fabricator_mix(<input>, factor, bias := k)`.
+    - ⚠ **A named parameter must not be a DuckDB RESERVED WORD** — the demo first used `offset :=` and the
+      call was a *parser* error, which reads as a broken function rather than a bad name.
+  - **⚠ TWO DEFECTS THAT BOTH TIERS COULD NOT SEE, found by reading `duckdb_functions()` directly.** (1) With
+    the input table a declared parameter but the host still tagging every declared parameter as named, `input`
+    LEAKED into in-out/collector signatures as `input := STRUCT(…)`; an extra OPTIONAL named parameter breaks
+    no call, so nothing failed. (2) For in-out/collector the OLD `Parameters` meant *named cost args*, so
+    unflagged fields silently became POSITIONAL and `fabricator_delta_write(…, path := '…')` stopped binding.
+    Both are now gated by asserting the SIGNATURE itself (verify_global_functions), which is the only thing
+    that can catch "accepts an argument the implementation never receives".
+  - **⚠ Apache.Arrow 23 cannot even CONSTRUCT `new StructType(empty)`** — `ArgumentNullException('fields')` on
+    a non-null EMPTY list, so the message names the wrong problem. It fires in a STATIC FIELD INITIALIZER,
+    taking down `CustomFunctions` and, through `ListGlobalFunctions`, silently dropping every global function
+    registered after it — the visible symptom was an unrelated table function "not existing". Hence
+    `Params.TableInput` uses a scalar placeholder when no columns are declared. This extends the known
+    zero-field hostility one step earlier than export/import.
+  - Gates: hermetic **63/63 — 5685** and service **44/44 — 1446**. The protocol refactor alone was
+    5664/1446 — IDENTICAL to pre-refactor, which is the behaviour-preservation claim; +21 is the new
+    signature/mixed-arg coverage.
   - **THE SQL SERVER BINDING — BUILT + LIVE-VALIDATED 2026-08-02 (§9h). This closes §8's "largest remaining
     gap in reach", and building it found TWO SHIPPED BUGS.** The whole set was bound to a OneLake **Delta**
     attach, so a dbt project on a Fabric **Warehouse** over T-SQL could not call even

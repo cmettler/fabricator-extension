@@ -1273,6 +1273,95 @@ unique_ptr<TableRef> FabricatorParseGeneratedSelect(const string &sql, const Par
 }
 
 // Build the DuckDB signature of a SQL-generating table function from its ONE declared parameter schema:
+// Marshals an in-out / collector call's CONSTANT arguments in DECLARED ORDER, so the managed side reads them
+// by position exactly as it does for a table function. Walks the declared parameters:
+//   TABLE_INPUT — consumes its slot in `input.inputs` and emits NOTHING. DuckDB reserves a positional slot for
+//                 the subquery and pushes a placeholder Value into it (bind_table_function.cpp), so the slot
+//                 must be consumed or every following positional would read one argument too early.
+//   POSITIONAL  — takes the next value from `input.inputs`.
+//   NAMED       — takes the supplied value, or a typed NULL when the caller omitted it (the same
+//                 "omitted == explicit NULL" equivalence the table path uses).
+//
+// ⚠ This replaced a loop over `input.named_parameters` ALONE. That was correct only while an in-out's cost args
+// were named BY CONVENTION; once the unified protocol let one be declared positional, the signature accepted
+// `f((SELECT …), 3)` while the 3 was silently DROPPED before reaching C# — a half-offered capability, which is
+// worse than not offering it at all.
+static void FabricatorMarshalInOutArgs(const FabricatorTableFunctionInfo &info, TableFunctionBindInput &input,
+                                       vector<string> &arg_names, vector<LogicalType> &arg_types,
+                                       vector<Value> &arg_values) {
+	idx_t positional_index = 0;
+	for (idx_t i = 0; i < info.arg_names.size(); i++) {
+		auto style = i < info.arg_styles.size() ? info.arg_styles[i] : FabricatorParamStyle::POSITIONAL;
+		if (style == FabricatorParamStyle::TABLE_INPUT) {
+			positional_index++; // consume the subquery's reserved slot; the table itself is not an arg value
+			continue;
+		}
+		const LogicalType &declared = info.arg_types[i];
+		if (style == FabricatorParamStyle::NAMED) {
+			Value v(declared);
+			for (auto &kv : input.named_parameters) {
+				if (StringUtil::CIEquals(info.arg_names[i], kv.first)) {
+					v = kv.second;
+					break;
+				}
+			}
+			arg_names.push_back(info.arg_names[i]);
+			arg_types.push_back(declared);
+			arg_values.push_back(std::move(v));
+			continue;
+		}
+		Value v = positional_index < input.inputs.size() ? input.inputs[positional_index] : Value(declared);
+		positional_index++;
+		arg_names.push_back(info.arg_names[i]);
+		arg_types.push_back(declared.id() == LogicalTypeId::SQLNULL ? v.type() : declared);
+		arg_values.push_back(std::move(v));
+	}
+	// A provider that declared nothing (every discovered `_each`) still gets the historical behavior: any
+	// named parameter DuckDB accepted is passed through, so an undeclared-but-bound arg is not lost.
+	if (info.arg_names.empty()) {
+		for (auto &kv : input.named_parameters) {
+			arg_names.push_back(kv.first);
+			arg_types.push_back(kv.second.type());
+			arg_values.push_back(kv.second);
+		}
+	}
+}
+
+// Builds an in-out / collector signature FROM the declared parameter STYLES: the table input becomes the
+// {LogicalType::TABLE} argument at its declared position, named parameters become DuckDB named parameters,
+// and any remaining positional parameter keeps its slot. DuckDB gives the subquery its own argument slot
+// (bind_table_function.cpp pushes a placeholder value for it), so a table input BETWEEN positionals keeps the
+// following positions at their natural index.
+//
+// ⚠ This exists because the alternative — "every declared parameter is a named cost arg" — silently leaked the
+// table-input field into the signature as `input := STRUCT(...)` the moment the input table became a parameter
+// like any other. Nothing failed: an extra OPTIONAL named parameter breaks no existing call, so both tiers
+// stayed green while the advertised signature was wrong.
+// `named_any_for_null` maps a SQLNULL-declared named parameter to ANY — what the COLLECTOR path has always
+// done and the in-out path has not. Kept as a flag rather than unified, because changing it would alter how a
+// NullType cost arg (the daxeach params bag) binds, which is not this refactor's business.
+static void FabricatorBuildInOutSignature(const vector<string> &names, const vector<LogicalType> &types,
+                                          const vector<FabricatorParamStyle> &styles, TableFunction &tf,
+                                          bool named_any_for_null = false) {
+	for (idx_t i = 0; i < names.size(); i++) {
+		auto style = i < styles.size() ? styles[i] : FabricatorParamStyle::POSITIONAL;
+		switch (style) {
+		case FabricatorParamStyle::TABLE_INPUT:
+			// The DECLARED type (a struct of the expected input columns) is ours alone: DuckDB only ever
+			// accepts LogicalType::TABLE here, so any column-level check would be a bind-time one of our own.
+			tf.arguments.push_back(LogicalType::TABLE);
+			break;
+		case FabricatorParamStyle::NAMED:
+			tf.named_parameters[names[i]] =
+			    (named_any_for_null && types[i].id() == LogicalTypeId::SQLNULL) ? LogicalType::ANY : types[i];
+			break;
+		default:
+			tf.arguments.push_back(types[i]);
+			break;
+		}
+	}
+}
+
 // positional fields first, then the NAMED ones (tagged fabricator.param_style="named", split by `styles`). A
 // SQLNULL-declared parameter is the "accept any value" marker (registered as ANY so DuckDB passes the literal
 // UNCAST and its runtime type survives). Shared by the global (load-time) and catalog (attach-time) paths.
@@ -1496,25 +1585,13 @@ unique_ptr<FunctionData> FabricatorExchangeBind(ClientContext &context, TableFun
 	std::memset(&input_schema, 0, sizeof(input_schema));
 	ArrowConverter::ToArrowSchema(&input_schema, bind_data->input_types, bind_data->input_names, props);
 
-	// Marshal the SUPPLIED constant args (named parameters) into a 1-row Arrow stream for inout_bind — e.g.
-	// daxevaltable(<input>, expression := 'EVALUATE …'). A custom in-out with no declared args, and every
-	// discovered `_each` (which declares no named parameters — its per-row arg values come from input
-	// columns), supplies none => args stays null (unchanged behavior). Mirrors the table-function bind.
+	// Marshal the constant args into a 1-row Arrow stream for inout_bind — e.g.
+	// daxevaltable(<input>, expression := 'EVALUATE …'), or a POSITIONAL cost arg. A function with no declared
+	// args supplies none => args stays null (unchanged behavior).
 	vector<LogicalType> arg_types;
 	vector<string> arg_names;
 	vector<Value> arg_values;
-	for (auto &kv : input.named_parameters) {
-		LogicalType declared = kv.second.type();
-		for (idx_t i = 0; i < info.arg_names.size(); i++) {
-			if (StringUtil::CIEquals(info.arg_names[i], kv.first)) {
-				declared = info.arg_types[i];
-				break;
-			}
-		}
-		arg_names.push_back(kv.first);
-		arg_types.push_back(declared);
-		arg_values.push_back(kv.second);
-	}
+	FabricatorMarshalInOutArgs(info, input, arg_names, arg_types, arg_values);
 	fabricator::ArrowProducer arg_producer(arg_types, arg_names, props);
 	ArrowArrayStream *args_ptr = nullptr;
 	if (!arg_values.empty()) {
@@ -1825,23 +1902,12 @@ unique_ptr<FunctionData> FabricatorCollectorBind(ClientContext &context, TableFu
 	std::memset(&input_schema, 0, sizeof(input_schema));
 	ArrowConverter::ToArrowSchema(&input_schema, holder.input_types, holder.input_names, props);
 
-	// Marshal supplied constant args (named parameters) into a 1-row Arrow stream (else null). Same as the
-	// streaming exchange bind.
+	// Marshal the constant args (positional and/or named) into a 1-row Arrow stream (else null). Same helper as
+	// the streaming exchange bind — see FabricatorMarshalInOutArgs.
 	vector<LogicalType> arg_types;
 	vector<string> arg_names;
 	vector<Value> arg_values;
-	for (auto &kv : input.named_parameters) {
-		LogicalType declared = kv.second.type();
-		for (idx_t i = 0; i < info.arg_names.size(); i++) {
-			if (StringUtil::CIEquals(info.arg_names[i], kv.first)) {
-				declared = info.arg_types[i];
-				break;
-			}
-		}
-		arg_names.push_back(kv.first);
-		arg_types.push_back(declared);
-		arg_values.push_back(kv.second);
-	}
+	FabricatorMarshalInOutArgs(info, input, arg_names, arg_types, arg_values);
 	fabricator::ArrowProducer arg_producer(arg_types, arg_names, props);
 	ArrowArrayStream *args_ptr = nullptr;
 	if (!arg_values.empty()) {
@@ -2120,7 +2186,7 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				// (in-out) or Sink+Source (collector) operator, with handle = 0 so the bind resolves the binding
 				// against the C# global registry by name (mirrors GetOrCreateCustomInOut/CollectorFunction).
 				bool is_collector = kind == "collector";
-				TableFunction tf(fn_name, {LogicalType::TABLE}, nullptr,
+				TableFunction tf(fn_name, {}, nullptr,
 				                  is_collector ? FabricatorCollectorBind : FabricatorExchangeBind,
 				                  is_collector ? FabricatorCollectorInitGlobal : FabricatorExchangeInitGlobal,
 				                  is_collector ? FabricatorCollectorInitLocal : FabricatorExchangeInitLocal);
@@ -2131,19 +2197,22 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				fn_info->func = fn_name;
 				fn_info->is_proc = false;
 				try {
-					// Constant "cost" args as NAMED parameters (coexist with the single {TABLE} overload); none
-					// for a no-arg in-out/collector. SQLNULL sentinel => ANY (an "accept any value" param bag).
+					// Signature from the declared styles — the table input is a declared parameter, and constant
+					// "cost" args are NAMED so they coexist with it (SQLNULL sentinel => ANY).
 					vector<string> arg_names;
 					vector<LogicalType> arg_types;
-					FetchFunctionParamSchema(context, nullptr, "", fn_name, arg_names, arg_types);
-					for (idx_t k = 0; k < arg_names.size(); k++) {
-						auto t = arg_types[k].id() == LogicalTypeId::SQLNULL ? LogicalType::ANY : arg_types[k];
-						tf.named_parameters[arg_names[k]] = t;
-					}
+					vector<FabricatorParamStyle> arg_styles;
+					FetchFunctionParamSchema(context, nullptr, "", fn_name, arg_names, arg_types, &arg_styles);
+					FabricatorBuildInOutSignature(arg_names, arg_types, arg_styles, tf,
+					                              /*named_any_for_null=*/true);
 					fn_info->arg_names = std::move(arg_names);
 					fn_info->arg_types = std::move(arg_types);
+					fn_info->arg_styles = std::move(arg_styles);
 				} catch (std::exception &) {
 					// no cost args
+				}
+				if (tf.arguments.empty()) {
+					tf.arguments.push_back(LogicalType::TABLE);
 				}
 				tf.function_info = std::move(fn_info);
 				loader.RegisterFunction(tf);
@@ -2485,7 +2554,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateCustomInOutFunction
                                                                               const string &func_name) {
 	// Phase 6: custom C# in-out runs on the streaming exchange operator (gate + two pull streams, no
 	// per-chunk materialization). Discovered-TVF `_each` + procs stay on the push model for now.
-	TableFunction inout(func_name, {LogicalType::TABLE}, nullptr, FabricatorExchangeBind, FabricatorExchangeInitGlobal,
+	TableFunction inout(func_name, {}, nullptr, FabricatorExchangeBind, FabricatorExchangeInitGlobal,
 	                    FabricatorExchangeInitLocal);
 	inout.in_out_function = FabricatorExchangeFunction;
 	auto fn_info = make_shared_ptr<FabricatorTableFunctionInfo>();
@@ -2493,21 +2562,24 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateCustomInOutFunction
 	fn_info->schema = name;
 	fn_info->func = func_name;
 	fn_info->is_proc = false;
-	// Constant "cost" args (e.g. the DAX expression for daxevaltable / daxeach) are declared as NAMED
-	// parameters so they can coexist with the single {LogicalType::TABLE} overload (a scalar arg can't —
-	// bind_table_function.cpp). Best-effort: a custom in-out with no args (a pure-C# in-out like cf_tag, or
-	// any provider returning an empty param schema) declares none, preserving existing behavior.
+	// The signature comes from the DECLARED parameter styles: the table input is one of them now, so it is no
+	// longer hardcoded here. Constant "cost" args (e.g. the DAX expression for daxevaltable / daxeach) are
+	// declared NAMED so they coexist with the TABLE argument (a positional scalar arg would too, per the
+	// binder, but the single-overload rule still applies — bind_table_function.cpp).
 	try {
 		vector<string> arg_names;
 		vector<LogicalType> arg_types;
-		FetchFunctionParamSchema(context, handle_, name, func_name, arg_names, arg_types);
-		for (idx_t i = 0; i < arg_names.size(); i++) {
-			inout.named_parameters[arg_names[i]] = arg_types[i];
-		}
+		vector<FabricatorParamStyle> arg_styles;
+		FetchFunctionParamSchema(context, handle_, name, func_name, arg_names, arg_types, &arg_styles);
+		FabricatorBuildInOutSignature(arg_names, arg_types, arg_styles, inout);
 		fn_info->arg_names = std::move(arg_names);
 		fn_info->arg_types = std::move(arg_types);
+		fn_info->arg_styles = std::move(arg_styles);
 	} catch (std::exception &) {
-		// no cost args for this in-out function
+		// Unresolvable param schema: fall back to the bare table-input form so the function stays callable.
+	}
+	if (inout.arguments.empty()) {
+		inout.arguments.push_back(LogicalType::TABLE);
 	}
 	inout.function_info = std::move(fn_info);
 
@@ -2527,7 +2599,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateCustomInOutFunction
 // Caller holds entry_lock_.
 optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateCustomCollectorFunction(ClientContext &context,
                                                                                   const string &func_name) {
-	TableFunction collector(func_name, {LogicalType::TABLE}, nullptr, FabricatorCollectorBind,
+	TableFunction collector(func_name, {}, nullptr, FabricatorCollectorBind,
 	                        FabricatorCollectorInitGlobal, FabricatorCollectorInitLocal);
 	collector.in_out_function = FabricatorCollectorFunction;
 	auto fn_info = make_shared_ptr<FabricatorTableFunctionInfo>();
@@ -2535,20 +2607,22 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateCustomCollectorFunc
 	fn_info->schema = name;
 	fn_info->func = func_name;
 	fn_info->is_proc = false;
-	// Constant "cost" args declared as NAMED parameters (coexist with the single {TABLE} overload). A collector
-	// with no args (the cf_collect demo) declares none.
+	// Signature from the declared styles (see FabricatorBuildInOutSignature): the table input is a declared
+	// parameter now, and constant "cost" args are NAMED so they coexist with it.
 	try {
 		vector<string> arg_names;
 		vector<LogicalType> arg_types;
-		FetchFunctionParamSchema(context, handle_, name, func_name, arg_names, arg_types);
-		for (idx_t i = 0; i < arg_names.size(); i++) {
-			auto t = arg_types[i].id() == LogicalTypeId::SQLNULL ? LogicalType::ANY : arg_types[i];
-			collector.named_parameters[arg_names[i]] = t;
-		}
+		vector<FabricatorParamStyle> arg_styles;
+		FetchFunctionParamSchema(context, handle_, name, func_name, arg_names, arg_types, &arg_styles);
+		FabricatorBuildInOutSignature(arg_names, arg_types, arg_styles, collector, /*named_any_for_null=*/true);
 		fn_info->arg_names = std::move(arg_names);
 		fn_info->arg_types = std::move(arg_types);
+		fn_info->arg_styles = std::move(arg_styles);
 	} catch (std::exception &) {
-		// no cost args for this collector
+		// Unresolvable param schema: fall back to the bare table-input form so the function stays callable.
+	}
+	if (collector.arguments.empty()) {
+		collector.arguments.push_back(LogicalType::TABLE);
 	}
 	collector.function_info = std::move(fn_info);
 

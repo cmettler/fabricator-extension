@@ -39,8 +39,9 @@ public enum ParamStyle
 /// positional table argument — a name there would be a lie. It may sit BETWEEN positionals: DuckDB pushes a
 /// placeholder value for the subquery slot (<c>parameters.emplace_back()</c>), so following positions keep
 /// their natural index.</para>
-/// <para><b>Type of a table-input field.</b> Ignored today. Declare it as a <see cref="StructType"/> of the
-/// expected input columns: it costs nothing now and is the only shape that leaves call-site validation
+/// <para><b>Type of a table-input field.</b> Ignored today — DuckDB only ever accepts
+/// <c>LogicalType::TABLE</c> there, so validating the input's COLUMNS would be a bind-time check of our own.
+/// Declare the expected columns anyway: they cost nothing now and are the only shape that leaves that check
 /// reachable without changing the protocol again. Do NOT use <see cref="NullType"/> — that is already the
 /// "accept any value" sentinel for scalar arguments and the two would be indistinguishable.</para>
 /// </remarks>
@@ -68,16 +69,13 @@ public static class Params
     /// binder discards any name written at the call site, so <c>input := (SELECT …)</c> is NOT a way to pass
     /// it. The name exists for diagnostics and error messages. "input" is the convention.</param>
     /// <remarks>
-    /// ⚠ A <see cref="StructType"/> with zero fields is legal and is exactly what the no-columns form
-    /// produces, so "columns not declared" and "declared as empty" are INDISTINGUISHABLE. That is harmless
-    /// while the type is ignored; if call-site validation is ever turned on, empty must be read as
-    /// "unvalidated", never as "must have no columns".
+    /// ⚠ Declaring NO columns yields a scalar placeholder type, not an empty struct — Apache.Arrow cannot
+    /// build one (see <c>TableInputType</c>). So "columns not declared" and "declared as empty" are
+    /// INDISTINGUISHABLE. Harmless while the type is ignored; if call-site validation is ever turned on,
+    /// absent columns must be read as "unvalidated", never as "must have no columns".
     /// </remarks>
     public static Field TableInput(string name, Schema? columns = null) =>
-        new(name,
-            new StructType(columns?.FieldsList ?? (IReadOnlyList<Field>)System.Array.Empty<Field>()),
-            nullable: true,
-            Meta(TableValue));
+        new(name, TableInputType(columns?.FieldsList), nullable: true, Meta(TableValue));
 
     /// <summary>
     /// The input table of a table-in-out function, declaring its columns inline — the shape to prefer when
@@ -85,7 +83,7 @@ public static class Params
     /// held their input columns as one).
     /// </summary>
     public static Field TableInput(string name, params Field[] columns) =>
-        new(name, new StructType(columns), nullable: true, Meta(TableValue));
+        new(name, TableInputType(columns), nullable: true, Meta(TableValue));
 
     /// <summary>Re-flags an existing field as a named parameter, preserving its name and type.</summary>
     public static Field AsNamed(Field field) => Named(field.Name, field.DataType);
@@ -116,6 +114,21 @@ public static class Params
         }
         return new Schema(fields, metadata: null);
     }
+
+    /// <summary>
+    /// The carrier type for a table-input field: a struct of the declared columns, or — when none are
+    /// declared — a scalar PLACEHOLDER.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ Apache.Arrow (23.0.0) cannot even CONSTRUCT <c>new StructType(empty)</c>: it raises
+    /// <c>ArgumentNullException(Parameter 'fields')</c> on a perfectly non-null EMPTY list, so the message
+    /// names the wrong problem. That is the same zero-field hostility as the schema export/import limit, one
+    /// step earlier than documented — it fires in a static field initializer, taking the whole type down and
+    /// (via ListGlobalFunctions) silently dropping every global function registered after it. Hence the
+    /// placeholder. The type is ignored either way; the STYLE flag is what is authoritative.
+    /// </remarks>
+    private static IArrowType TableInputType(IReadOnlyList<Field>? columns) =>
+        columns is { Count: > 0 } ? new StructType(columns) : BooleanType.Default;
 
     /// <summary>The style of a declared field.</summary>
     public static ParamStyle StyleOf(Field field)

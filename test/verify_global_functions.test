@@ -234,3 +234,57 @@ query I
 SELECT count(DISTINCT fabricator_batch_seq()) FROM range(3);
 ----
 3
+
+# ── DECLARED SIGNATURE of an in-out / collector ──────────────────────────────────────────────────
+# The advertised signature must be the TABLE argument plus the function's DECLARED named cost args —
+# and nothing else.
+#
+# WHY THIS IS PINNED. Making the input table a declared parameter (the unified param protocol) while
+# the host still treated EVERY declared parameter as a named cost arg leaked the table-input field
+# into the signature as `input := STRUCT(n INTEGER)`, next to the real TABLE argument. BOTH TIERS
+# STAYED GREEN: an extra OPTIONAL named parameter breaks no existing call, so nothing executable
+# changed — only what the function claims to accept. No behavioural assertion can catch that; it has
+# to be read off duckdb_functions() directly.
+#
+# fabricator_tag / fabricator_collect_sum take NO cost args => the TABLE argument alone.
+# fabricator_delta_write takes one, and it must appear as NAMED (`path := '…'`), not positional:
+# before the protocol a collector's Parameters meant "named cost args" by convention, so an
+# unflagged field silently became POSITIONAL and `path := '…'` stopped binding.
+query III
+SELECT function_name, parameters::VARCHAR, parameter_types::VARCHAR FROM duckdb_functions()
+WHERE function_name IN ('fabricator_tag', 'fabricator_collect_sum', 'fabricator_delta_write')
+ORDER BY function_name;
+----
+fabricator_collect_sum	[col0]	[TABLE]
+fabricator_delta_write	[col0, path]	[TABLE, VARCHAR]
+fabricator_tag	[col0]	[TABLE]
+
+# ── MIXED SIGNATURE: table input + POSITIONAL + NAMED ────────────────────────────────────────────
+# fabricator_mix(<input>, factor, bias := k) -> n * factor + bias. The arithmetic is incidental; the
+# point is that all three parameter styles coexist in ONE declaration and all three ARRIVE.
+#
+# Positional constant args on an in-out were previously impossible BY OMISSION: the bind marshalled
+# only named parameters, so DuckDB would happily accept `f((SELECT …), 3)` and the 3 would be
+# dropped before reaching C#. A signature that accepts an argument the implementation never receives
+# is worse than one that rejects it, and nothing in the behavioural suites could see the difference.
+query II
+SELECT parameters::VARCHAR, parameter_types::VARCHAR FROM duckdb_functions()
+WHERE function_name = 'fabricator_mix';
+----
+[col0, col1, bias]	[TABLE, INTEGER, INTEGER]
+
+# Both supplied: the POSITIONAL factor and the NAMED bias each reach the binding.
+query II
+SELECT n, value FROM fabricator_mix((SELECT * FROM (VALUES (1),(2),(5)) v(n)), 3, bias := 10) ORDER BY n;
+----
+1	13
+2	16
+5	25
+
+# Named omitted => a typed NULL arrives and the author's default applies; the POSITIONAL one must be
+# unaffected, which is the case that breaks if the omitted-named substitution shifts positions.
+query II
+SELECT n, value FROM fabricator_mix((SELECT * FROM (VALUES (1),(2)) v(n)), 3) ORDER BY n;
+----
+1	3
+2	6

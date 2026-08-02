@@ -45,6 +45,8 @@ internal static class CustomFunctions
     public static readonly IReadOnlyList<IInOutFunction> GlobalInOut = new IInOutFunction[]
     {
         new GfTagFunction(),
+        // Mixed signature: table input + POSITIONAL + NAMED in one declaration (see GfMixFunction).
+        new GfMixFunction(),
     };
 
     // Connection-free GLOBAL collector (pipeline-breaker) functions — bare fn(<input>), no ATTACH.
@@ -930,6 +932,90 @@ internal sealed class GfTagFunction : IInOutFunction
                     yield return new RecordBatch(OutputSchema, new IArrowArray[] { nb.Build(), sq.Build() }, rows);
                 }
                 yield return InOutExchange.EmptyBatch(OutputSchema); // per-input sentinel (NEED_MORE_INPUT)
+            }
+        }
+
+        public void Dispose() { }
+    }
+}
+
+// GLOBAL in-out proving a MIXED signature: fabricator_mix(<table of n>, factor, bias := k) -> (n, value)
+// where value = n * factor + bias. The point is the SIGNATURE, not the arithmetic: a table input, a
+// POSITIONAL constant arg and a NAMED one in a single declaration.
+//
+// ⚠ Positional constant args on an in-out were previously impossible by omission — the bind marshalled ONLY
+// named parameters, so a positional one would have been accepted by the binder and then silently dropped
+// before reaching C#. The unified protocol makes it declarable and FabricatorMarshalInOutArgs makes it
+// arrive; this function is what keeps both true.
+internal sealed class GfMixFunction : IInOutFunction
+{
+    public string Name => "fabricator_mix";
+
+    public Schema Parameters => new(new[]
+    {
+        Params.TableInput("input", new Field("n", Int32Type.Default, nullable: true)),
+        Params.Positional("factor", Int32Type.Default),
+        // NOT "offset": a named parameter whose name is a DuckDB reserved word cannot be written
+        // unquoted at the call site (`offset := 10` is a parser error), which makes the function
+        // look broken rather than mis-named.
+        Params.Named("bias", Int32Type.Default),
+    }, metadata: null);
+
+    public IArrowInOutBinding Bind(RecordBatch? args, Schema inputSchema)
+    {
+        // Read BY POSITION over the declared order, skipping the table input (it carries no value). An
+        // omitted named argument arrives as a typed NULL, which is the documented "omitted == explicit NULL".
+        int factor = ReadInt(args, "factor") ?? 1;
+        int bias = ReadInt(args, "bias") ?? 0;
+        return new Binding(factor, bias);
+    }
+
+    private static int? ReadInt(RecordBatch? args, string name)
+    {
+        if (args is null) { return null; }
+        for (int i = 0; i < args.ColumnCount; i++)
+        {
+            if (string.Equals(args.Schema.FieldsList[i].Name, name, System.StringComparison.OrdinalIgnoreCase)
+                && args.Column(i) is Int32Array a && a.Length > 0 && !a.IsNull(0))
+            {
+                return a.Values[0];
+            }
+        }
+        return null;
+    }
+
+    private sealed class Binding : IArrowInOutBinding
+    {
+        private readonly int _factor;
+        private readonly int _offset;
+
+        public Binding(int factor, int offset) { _factor = factor; _offset = offset; }
+
+        public Schema OutputSchema => new(new[]
+        {
+            new Field("n", Int32Type.Default, nullable: true),
+            new Field("value", Int32Type.Default, nullable: true),
+        }, metadata: null);
+
+        public async IAsyncEnumerable<RecordBatch> DoExchange(
+            IAsyncEnumerable<RecordBatch> input, [EnumeratorCancellation] CancellationToken ct = default)
+        {
+            await foreach (var chunk in input.WithCancellation(ct))
+            {
+                using (chunk)
+                {
+                    var n = (Int32Array)chunk.Column(0);
+                    int rows = chunk.Length;
+                    var nb = new Int32Array.Builder().Reserve(rows);
+                    var vb = new Int32Array.Builder().Reserve(rows);
+                    for (int i = 0; i < rows; i++)
+                    {
+                        if (n.IsNull(i)) { nb.AppendNull(); vb.AppendNull(); }
+                        else { nb.Append(n.Values[i]); vb.Append(n.Values[i] * _factor + _offset); }
+                    }
+                    yield return new RecordBatch(OutputSchema, new IArrowArray[] { nb.Build(), vb.Build() }, rows);
+                }
+                yield return InOutExchange.EmptyBatch(OutputSchema); // per-input sentinel
             }
         }
 
