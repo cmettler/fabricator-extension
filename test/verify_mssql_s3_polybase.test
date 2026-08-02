@@ -161,7 +161,18 @@ ORDER BY id;
 6	600	city0
 8	800	city2
 
-# ---- 5. negative pin: a DV-default table (reader v3) is NOT readable by SQL Server's 1.0 reader ----
+# ---- 5. negative pin: a DV-DEFAULT table is NOT readable by SQL Server's 1.0 reader ----
+#
+# ⚠ This section proves the OUTCOME, not the CAUSE, and the comment here used to claim the cause ("reader
+# v3"). It is wrong: a DV-default attach also turns COLUMN MAPPING on, and the mapping check fires first,
+# so what this actually observes is 19725 — the same error §6 below attributes to mapping. Measured
+# separately (on ADLS and S3 alike): mapping on => 19725; deletion vectors DECLARED but never materialized
+# => reads FINE; a DV MATERIALIZED by a DELETE => 19726. The `statement error` below carries no expected
+# text, so it cannot tell those apart and passes either way.
+#
+# The isolated pins live in test/verify_mssql_adls_polybase.test §5, which varies one flag at a time and
+# also shows that CREATE OR REPLACE does NOT clear a materialized DV (only a real DROP does). Left as-is
+# here rather than re-pointed: tightening a CI-tier assertion needs its own measurement on THIS backend.
 statement ok
 ATTACH 's3://fabricator/polybase-dv' AS dvlake (TYPE fabricator, PROVIDER 'delta', READ_ONLY false);
 

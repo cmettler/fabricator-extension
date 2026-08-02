@@ -1650,6 +1650,28 @@ VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
   mount at `/var/opt/mssql/security/ca-certificates`). Bring-up: certs → compose up → provision
   (docker/README.md). Connstr needs `TrustServerCertificate=true;Encrypt=true`. `sqlcmd` v18 in-container:
   `docker exec mssql-fabricator /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Arrow_Net_123!' -C`.
+- **ADLS Gen2 / SQL Server data virtualization — BUILT + LIVE-VALIDATED 2026-08-02. Gate
+  `test/verify_mssql_adls_polybase.test` (71, manual/live-account tier).** The abfss analogue of the S3
+  PolyBase circle below: our Delta provider CTASes a protocol-1.0 table to an Azure storage account, then
+  `fabricator_exec` provisions MASTER KEY + DATABASE SCOPED CREDENTIAL + EXTERNAL DATA SOURCE + EXTERNAL
+  FILE FORMAT, and SQL Server reads it through `OPENROWSET(FORMAT='DELTA')` **and** a `CREATE EXTERNAL
+  TABLE` that our catalog then scans as an ordinary table. Manual tier by necessity — **there is no usable
+  ADLS Gen2 emulator** (Azurite does not serve the DFS endpoint), so it runs against a real account and
+  cannot join either CI tier.
+  - **⚠ `abfss://` IS NOT A VALID SQL SERVER LOCATION** (`46548: contains an unsupported ...`) — and that is
+    precisely the scheme everyone writes, including our own ATTACH two lines earlier. SQL Server wants
+    **`adls://<fs>@<acct>.dfs.core.windows.net`** (DFS) or **`abs://<fs>@<acct>.blob.core.windows.net`**
+    (blob); both MEASURED working, with the `BULK` path container-relative and the leading `/` optional.
+    Pinned, because the failure is at DDL time with an error that does not name the alternatives.
+  - **The credential is a SAS, not the account key**: `IDENTITY = 'SHARED ACCESS SIGNATURE'`. Read+list at
+    container scope is enough and is all the test grants — the engine reading our table has no business
+    writing to it. Minted from the account key by `scratchpad/adlsgen2probe sas <fs>` (no leading `?`).
+  - Env split mirrors the S3 suite's two endpoints, for the same reason (SQL Server addresses the account
+    by a different scheme AND a container-relative path than we do): `FABRICATOR_ADLS_SQL_LOCATION` +
+    `FABRICATOR_ADLS_SQL_PREFIX` beside `FABRICATOR_ADLS_ROOT`/`_CONNSTR`, plus `FABRICATOR_ADLS_SAS`.
+  - **A dropped EXTERNAL TABLE does NOT delete the underlying data** (user, 2026-08-02) — which is what
+    makes this suite re-runnable, and means storage cleanup is a separate, storage-side act.
+  - This pass is also what CORRECTED the DV/column-mapping conflation recorded under the S3 entry below.
 - **S3 / MinIO / SQL Server data virtualization (2026-07-10).** `httpfs` is now statically linked
   (`extension_config.cmake` — out-of-tree pin `duckdb-httpfs @ 827222fb` since the 1.5.5 bump, always
   the sha DuckDB's own CI
@@ -1687,9 +1709,21 @@ VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
   → `CREATE EXTERNAL TABLE` + read back through the ATTACHed catalog as a normal scan (DuckDB →
   fabricator → SQL Server → S3 delta reader → MinIO → table written by our Delta provider). **SQL Server's
   DELTA reader = Delta protocol 1.0 ONLY** — the interop table MUST be written `deletion_vectors false,
-  column_mapping 'none'`: a DV-default reader-v3 table errors, and a NAME-mapped table is rejected with
-  the SPECIFIC error `19725: Column mapping is not enabled` (the reader recognizes the feature but gates
-  it off — both pinned; same finding class as the Fabric T-SQL endpoint). Copy-on-write DELETE/UPDATE on
+  column_mapping 'none'`.
+  - **⚠ CORRECTED 2026-08-02 — this used to read "a DV-default reader-v3 table errors", which CONFLATED TWO
+    INDEPENDENT REFUSALS and is wrong in a way that misdiagnoses.** A DV-default attach also turns column
+    mapping on, so the MAPPING error fires first and gets read as the DV error. Measured separately, and
+    IDENTICALLY on ADLS and S3: column mapping `'id'`/`'name'` ⇒ **19725 'Column mapping is not enabled'**;
+    deletion vectors DECLARED but none written ⇒ **READS FINE** (the protocol bump alone is tolerated);
+    a deletion vector MATERIALIZED by a DELETE ⇒ **19726 'Feature Deletion Vectors is not supported'**.
+    So a table can read today and start failing at its first DELETE, with no config change.
+  - **⚠ AND IT DOES NOT HEAL: `CREATE OR REPLACE` over a table that has ever materialized a DV leaves it
+    UNREADABLE** (still 19726) — the replace is a new version in the SAME log, which still carries
+    deletion-vector references. **The recovery is a real `DROP TABLE` + CREATE**, verified. So the interop
+    contract is not "write it with the flags off" but "never let a DV materialize on this table". Found by
+    RE-RUNNING the suite: the "declared but not materialized" assertion passed on a clean account and failed
+    on the second run — a one-shot suite would never have seen it.
+  (Same finding class as the Fabric T-SQL endpoint.) Copy-on-write DELETE/UPDATE on
   the plain table KEEP it SQL-Server-readable (plain remove+add stays protocol 1.0 — OPENROWSET reads the
   post-DML state exactly; pinned), so the full DML lifecycle works for SQL-Server-facing tables — just on
   the CoW path instead of DVs. Partitioned delta: the external table reads the partition column as NULL, OPENROWSET
@@ -1814,13 +1848,13 @@ exercised the next time a pin moves on its own.
 **Suite selection is DERIVED, never a hand-kept list** — `scripts/list-hermetic-suites.sh` and
 `scripts/list-service-suites.sh` classify by the `require-env`/`require` directives each suite
 declares, so a new suite cannot silently sit outside CI. The accounting is complete and checked:
-**59 hermetic + 43 service + 10 excluded = 112 suite FILES** (2026-08-02), no overlap. ⚠ Suite FILES and
+**59 hermetic + 43 service + 11 excluded = 113 suite FILES** (2026-08-02), no overlap. ⚠ Suite FILES and
 suite RUNS differ and the floors are on RUNS: four hermetic suites and one service suite are
 engine-doubled, so 59 files ⇒ **63 runs / 5656 assertions** and 43 ⇒ **44 runs / 1444**. Recompute rather
 than copy — the line here read `53 + 42 + 9 = 104` for a while after the counts had moved, which is what a
 hand-copied number does. `scripts/list-hermetic-suites.sh | wc -l` and its service twin are the source of
-truth; the 10 excluded are `verify_azure_secret`, `verify_dax`, `verify_delta_catalog_adls` and the seven
-`verify_delta_rs_*`. `scripts/run-suites.sh <hermetic|service>` runs them ONE
+truth; the 11 excluded are `verify_azure_secret`, `verify_dax`, `verify_delta_catalog_adls`,
+`verify_mssql_adls_polybase` and the seven `verify_delta_rs_*`. `scripts/run-suites.sh <hermetic|service>` runs them ONE
 PROCESS PER SUITE with a fresh scratch dir, and asserts what `unittest` will not: nothing SKIPPED, the
 runner never says "No tests ran", and floors on the selected suite/assertion counts. The hermetic tier
 CLEARS the service env vars (proving hermeticity); the service tier DEMANDS them and names any that

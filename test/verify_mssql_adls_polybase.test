@@ -1,0 +1,284 @@
+# name: test/verify_mssql_adls_polybase.test
+# description: The full circle over ADLS Gen2 — DuckDB -> fabricator -> a Delta table on an Azure storage
+#              account -> SQL Server's data-virtualization reader -> back through our mssql provider. The
+#              abfss analogue of verify_mssql_s3_polybase: our Delta provider CTASes a protocol-1.0 table to
+#              ADLS, then `fabricator_exec` provisions MASTER KEY + DATABASE SCOPED CREDENTIAL (SAS) +
+#              EXTERNAL DATA SOURCE + EXTERNAL FILE FORMAT, and SQL Server reads it via OPENROWSET and a
+#              CREATE EXTERNAL TABLE that our catalog then scans as an ordinary table.
+#
+#              MANUAL / live-account tier, and unavoidably so: there is no usable ADLS Gen2 emulator
+#              (Azurite does not serve the DFS endpoint SQL Server needs), so this runs against a real
+#              storage account and is outside both CI tiers by construction.
+#
+#              Run with (the SAS is minted from the account key — scratchpad/adlsgen2probe `sas <fs>`):
+#                 MSSQL_TESTDB_DSN='Server=...;Database=TestDB;...'
+#                 FABRICATOR_ADLS_ROOT='abfss://<fs>@<acct>.dfs.core.windows.net/<prefix>'
+#                 FABRICATOR_ADLS_CONNSTR='DefaultEndpointsProtocol=https;AccountName=...;AccountKey=...'
+#                 FABRICATOR_ADLS_SQL_LOCATION='adls://<fs>@<acct>.dfs.core.windows.net'
+#                 FABRICATOR_ADLS_SQL_PREFIX='<prefix>'      # the same prefix, container-relative
+#                 FABRICATOR_ADLS_SAS='sv=...&sr=c&sp=rl&sig=...'   # no leading '?'
+#
+#              The LOCATION/PREFIX split mirrors the S3 suite's two endpoints: SQL Server addresses the
+#              account by a DIFFERENT scheme and a container-relative path than we do.
+# group: [fabricator]
+
+require fabricator
+
+require parquet
+
+# duckdb-azure supplies the parquet IO for the WRITE side. Not declared as `require azure` because the test
+# binary reports v0.0.1 and can never load a versioned extension, which would make this suite ALWAYS SKIP —
+# see the same note in verify_delta_catalog_adls.test.
+
+require-env MSSQL_TESTDB_DSN
+
+require-env FABRICATOR_ADLS_ROOT
+
+require-env FABRICATOR_ADLS_CONNSTR
+
+require-env FABRICATOR_ADLS_SQL_LOCATION
+
+require-env FABRICATOR_ADLS_SQL_PREFIX
+
+require-env FABRICATOR_ADLS_SAS
+
+statement ok
+SET autoinstall_known_extensions = true;
+
+statement ok
+SET autoload_known_extensions = true;
+
+statement ok
+LOAD azure;
+
+statement ok
+CREATE OR REPLACE SECRET adls_pb (TYPE azure, PROVIDER config,
+                                  CONNECTION_STRING '${FABRICATOR_ADLS_CONNSTR}');
+
+# ----------------------------------------------------------------------------
+# 1. OUR SIDE: write a Delta table SQL Server can actually read.
+#
+#    SQL Server's DELTA reader implements Delta protocol 1.0 only, so the interop table must be written
+#    `deletion_vectors false, column_mapping 'none'`. Both of those are ON by default in this provider
+#    (DV is the modern default and it brings column mapping with it), so this is a deliberate opt-out,
+#    not a formality — §5 pins exactly what each one costs.
+# ----------------------------------------------------------------------------
+
+statement ok
+ATTACH '${FABRICATOR_ADLS_ROOT}' AS pb
+  (TYPE fabricator, PROVIDER 'delta', SECRET adls_pb, READ_ONLY false,
+   deletion_vectors false, column_mapping 'none');
+
+statement ok
+CREATE OR REPLACE TABLE pb.main.trips AS
+SELECT i AS id, (i * 1.5)::DOUBLE AS amount, 'city' || (i % 3)::VARCHAR AS city FROM range(6) t(i);
+
+query IR
+SELECT count(*), sum(amount) FROM pb.main.trips;
+----
+6	22.5
+
+# ----------------------------------------------------------------------------
+# 2. SQL SERVER SIDE: provision the external-data plumbing through fabricator_exec.
+#
+#    The credential is a SHARED ACCESS SIGNATURE, not the account key: that is the identity SQL Server
+#    accepts for Azure storage. A read+list container SAS is enough, and deliberately all it is given —
+#    the engine reading our table has no business writing to it.
+# ----------------------------------------------------------------------------
+
+statement ok
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}',
+  'IF NOT EXISTS (SELECT * FROM sys.symmetric_keys WHERE name = ''##MS_DatabaseMasterKey##'')
+     CREATE MASTER KEY ENCRYPTION BY PASSWORD = ''Arrow_Net_123!''');
+
+statement ok
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}',
+  'IF EXISTS (SELECT * FROM sys.external_tables WHERE name = ''adls_delta_trips'')
+     DROP EXTERNAL TABLE dbo.adls_delta_trips');
+
+statement ok
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}',
+  'IF EXISTS (SELECT * FROM sys.external_data_sources WHERE name = ''adls_ds'')
+     DROP EXTERNAL DATA SOURCE adls_ds');
+
+statement ok
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}',
+  'IF EXISTS (SELECT * FROM sys.database_scoped_credentials WHERE name = ''adls_dc'')
+     DROP DATABASE SCOPED CREDENTIAL adls_dc');
+
+statement ok
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}',
+  'CREATE DATABASE SCOPED CREDENTIAL adls_dc
+     WITH IDENTITY = ''SHARED ACCESS SIGNATURE'', SECRET = ''${FABRICATOR_ADLS_SAS}''');
+
+statement ok
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}',
+  'CREATE EXTERNAL DATA SOURCE adls_ds
+     WITH (LOCATION = ''${FABRICATOR_ADLS_SQL_LOCATION}'', CREDENTIAL = adls_dc)');
+
+statement ok
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}',
+  'IF NOT EXISTS (SELECT * FROM sys.external_file_formats WHERE name = ''DeltaFileFormat'')
+     CREATE EXTERNAL FILE FORMAT DeltaFileFormat WITH (FORMAT_TYPE = DELTA)');
+
+# ----------------------------------------------------------------------------
+# 3. OPENROWSET(FORMAT='DELTA') — SQL Server reads what our provider wrote, row for row
+# ----------------------------------------------------------------------------
+
+query IRT
+SELECT * FROM fabricator_query('${MSSQL_TESTDB_DSN}',
+  'SELECT id, amount, city FROM OPENROWSET(BULK ''${FABRICATOR_ADLS_SQL_PREFIX}/trips'',
+     FORMAT = ''DELTA'', DATA_SOURCE = ''adls_ds'') AS r ORDER BY id');
+----
+0	0.0	city0
+1	1.5	city1
+2	3.0	city2
+3	4.5	city0
+4	6.0	city1
+5	7.5	city2
+
+# ----------------------------------------------------------------------------
+# 4. CREATE EXTERNAL TABLE, then read it back through the ATTACHed catalog — an ordinary table scan whose
+#    bytes came from Azure via SQL Server. This is the full loop closing.
+# ----------------------------------------------------------------------------
+
+statement ok
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}',
+  'CREATE EXTERNAL TABLE dbo.adls_delta_trips (id BIGINT, amount FLOAT, city NVARCHAR(100))
+     WITH (LOCATION = ''${FABRICATOR_ADLS_SQL_PREFIX}/trips'', DATA_SOURCE = adls_ds,
+           FILE_FORMAT = DeltaFileFormat)');
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS sqlsrv (TYPE fabricator);
+
+query IRT
+SELECT id, amount, city FROM sqlsrv.dbo.adls_delta_trips ORDER BY id;
+----
+0	0.0	city0
+1	1.5	city1
+2	3.0	city2
+3	4.5	city0
+4	6.0	city1
+5	7.5	city2
+
+# ----------------------------------------------------------------------------
+# 5. THE PROTOCOL LIMITS, each pinned to its OWN cause.
+#
+#    ⚠ These were originally recorded (for S3) as one blanket rule — "a DV-default reader-v3 table errors".
+#    That conflated two independent refusals, and it is wrong in a way that matters: a DV-default attach
+#    ALSO turns column mapping on, so the mapping error fires first and gets read as the DV error. Measured
+#    separately, on BOTH ADLS and S3:
+#
+#      column mapping 'id' or 'name'          -> 19725 'Column mapping is not enabled'
+#      deletion vectors DECLARED, none written -> READS FINE (the protocol bump alone is tolerated)
+#      deletion vectors MATERIALIZED (a DELETE) -> 19726 'Feature Deletion Vectors is not supported'
+#
+#    So the practical rule is unchanged (write the interop table with both off) but the DIAGNOSIS is not:
+#    a table that reads today can start failing at the first DELETE, with no schema or config change.
+# ----------------------------------------------------------------------------
+
+statement ok
+ATTACH '${FABRICATOR_ADLS_ROOT}' AS nm
+  (TYPE fabricator, PROVIDER 'delta', SECRET adls_pb, READ_ONLY false,
+   deletion_vectors false, column_mapping 'name');
+
+statement ok
+CREATE OR REPLACE TABLE nm.main.nmtrips AS SELECT i AS id FROM range(3) t(i);
+
+statement error
+SELECT * FROM fabricator_query('${MSSQL_TESTDB_DSN}',
+  'SELECT COUNT(*) AS c FROM OPENROWSET(BULK ''${FABRICATOR_ADLS_SQL_PREFIX}/nmtrips'',
+     FORMAT = ''DELTA'', DATA_SOURCE = ''adls_ds'') AS r');
+----
+19725
+
+statement ok
+ATTACH '${FABRICATOR_ADLS_ROOT}' AS dv
+  (TYPE fabricator, PROVIDER 'delta', SECRET adls_pb, READ_ONLY false,
+   deletion_vectors true, column_mapping 'none');
+
+# DROP + CREATE, deliberately NOT `CREATE OR REPLACE` — and the last two assertions of this section are why.
+statement ok
+DROP TABLE IF EXISTS dv.main.dvtrips;
+
+statement ok
+CREATE TABLE dv.main.dvtrips AS SELECT i AS id FROM range(3) t(i);
+
+# DV DECLARED but not yet materialized: readable. This is the assertion that keeps the two causes apart —
+# without it, the error below could still be blamed on the protocol version.
+query I
+SELECT * FROM fabricator_query('${MSSQL_TESTDB_DSN}',
+  'SELECT COUNT(*) AS c FROM OPENROWSET(BULK ''${FABRICATOR_ADLS_SQL_PREFIX}/dvtrips'',
+     FORMAT = ''DELTA'', DATA_SOURCE = ''adls_ds'') AS r');
+----
+3
+
+statement ok
+DELETE FROM dv.main.dvtrips WHERE id = 1;
+
+statement error
+SELECT * FROM fabricator_query('${MSSQL_TESTDB_DSN}',
+  'SELECT COUNT(*) AS c FROM OPENROWSET(BULK ''${FABRICATOR_ADLS_SQL_PREFIX}/dvtrips'',
+     FORMAT = ''DELTA'', DATA_SOURCE = ''adls_ds'') AS r');
+----
+19726
+
+# ⚠ AND IT DOES NOT HEAL. `CREATE OR REPLACE` over a table that has ever materialized a deletion vector
+# leaves it UNREADABLE to SQL Server — the replace is a new version in the same log, and the log still
+# carries deletion-vector references. Found by re-running this suite: the "declared but not materialized"
+# assertion above passed on a clean account and failed on the second run, because the table it recreated
+# was the previous run's DV table.
+#
+# Practical consequence, and it is not obvious: a table that goes wrong once cannot be repaired by
+# rewriting it. The interop contract is not merely "write it with the flags off" — it is "never let a
+# deletion vector materialize on this table", and the recovery is a real DROP.
+statement ok
+CREATE OR REPLACE TABLE dv.main.dvtrips AS SELECT i AS id FROM range(3) t(i);
+
+statement error
+SELECT * FROM fabricator_query('${MSSQL_TESTDB_DSN}',
+  'SELECT COUNT(*) AS c FROM OPENROWSET(BULK ''${FABRICATOR_ADLS_SQL_PREFIX}/dvtrips'',
+     FORMAT = ''DELTA'', DATA_SOURCE = ''adls_ds'') AS r');
+----
+19726
+
+# DROP + CREATE is the remedy: a genuinely new log, and SQL Server reads it again.
+statement ok
+DROP TABLE dv.main.dvtrips;
+
+statement ok
+CREATE TABLE dv.main.dvtrips AS SELECT i AS id FROM range(3) t(i);
+
+query I
+SELECT * FROM fabricator_query('${MSSQL_TESTDB_DSN}',
+  'SELECT COUNT(*) AS c FROM OPENROWSET(BULK ''${FABRICATOR_ADLS_SQL_PREFIX}/dvtrips'',
+     FORMAT = ''DELTA'', DATA_SOURCE = ''adls_ds'') AS r');
+----
+3
+
+# ----------------------------------------------------------------------------
+# 6. THE SCHEME TRAP: `abfss://` is NOT a valid LOCATION for SQL Server.
+#
+#    Worth pinning because abfss:// is exactly what everyone writes — it is the scheme Spark, Databricks and
+#    this extension all use, and the one in FABRICATOR_ADLS_ROOT two dozen lines above. SQL Server wants
+#    `adls://` (the DFS endpoint) or `abs://` (the blob endpoint) and refuses abfss outright.
+# ----------------------------------------------------------------------------
+
+statement error
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}',
+  'CREATE EXTERNAL DATA SOURCE adls_bad WITH (LOCATION = ''${FABRICATOR_ADLS_ROOT}'', CREDENTIAL = adls_dc)');
+----
+46548
+
+# ----------------------------------------------------------------------------
+# 7. Teardown — the external objects only; the Delta tables stay for re-runs (every CREATE is OR REPLACE).
+# ----------------------------------------------------------------------------
+
+statement ok
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'DROP EXTERNAL TABLE dbo.adls_delta_trips');
+
+statement ok
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'DROP EXTERNAL DATA SOURCE adls_ds');
+
+statement ok
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'DROP DATABASE SCOPED CREDENTIAL adls_dc');

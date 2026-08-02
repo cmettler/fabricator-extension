@@ -1367,6 +1367,38 @@ endpoint's id-mapping gate. For SQL-Server / PolyBase interop, create the table 
 that yields a minReader-1 / minWriter-2 table every reader accepts. Full design:
 [`docs/delta-catalog.md`](docs/delta-catalog.md).
 
+Two details about that rule are easy to get wrong, and both are measured:
+
+- The two flags fail **differently**. Column mapping is refused outright (`19725`). Deletion vectors are
+  tolerated while merely *declared* — the table reads fine — and refused (`19726`) only once a `DELETE`
+  actually materializes one. So an interop table can pass every test and then break at its first delete.
+- **`CREATE OR REPLACE` does not repair it.** Once a deletion vector has existed, the replace is a new
+  version in the same log and SQL Server still refuses. Recovery is a real `DROP TABLE` + create.
+
+### SQL Server reading our Delta from Azure (ADLS Gen2)
+
+SQL Server 2025 reads Delta on Azure storage the same way it reads it on S3, so a table this extension
+writes to ADLS Gen2 can be queried straight from T-SQL:
+
+```sql
+-- LOCATION uses adls:// (DFS) or abs:// (blob). NOT abfss:// — SQL Server rejects that scheme (46548),
+-- even though it is what this extension, Spark and Databricks all write.
+CREATE DATABASE SCOPED CREDENTIAL adls_dc
+  WITH IDENTITY = 'SHARED ACCESS SIGNATURE', SECRET = 'sv=...&sr=c&sp=rl&sig=...';  -- no leading '?'
+
+CREATE EXTERNAL DATA SOURCE adls_ds
+  WITH (LOCATION = 'adls://myfilesystem@myaccount.dfs.core.windows.net', CREDENTIAL = adls_dc);
+
+CREATE EXTERNAL FILE FORMAT DeltaFileFormat WITH (FORMAT_TYPE = DELTA);
+
+SELECT * FROM OPENROWSET(BULK 'lake/trips', FORMAT = 'DELTA', DATA_SOURCE = 'adls_ds') AS r;
+```
+
+The credential is a **shared access signature**, not the account key; read+list at container scope is
+enough. `BULK` is container-relative (the leading `/` is optional). A `CREATE EXTERNAL TABLE` over the same
+location can then be read back through an ATTACHed `fabricator` catalog as an ordinary table — and dropping
+that external table removes only the metadata, never the data.
+
 ### Liquid clustering (SORTED BY, bucket, hilbert_index)
 
 Delta tables can be **ordered-on-write** and **clustered on OPTIMIZE** for tight per-file min/max (data
