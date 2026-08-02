@@ -48,6 +48,11 @@ internal static class FabricSemanticModelFunctions
 /// </summary>
 internal sealed class FabricSemanticModelsFunction : ICatalogTableFunction
 {
+    // The canonical signature: ONE schema, each field flagged with its style. Explicit so this class
+    // may keep declaring the two halves separately (a local shorthand); consumers see the combination.
+    Apache.Arrow.Schema Fabricator.Bridge.ITableFunction.Parameters =>
+        Fabricator.Bridge.Params.Combine(Parameters, NamedParameters);
+
     private readonly FabricApiClient _api;
 
     internal FabricSemanticModelsFunction(FabricApiClient api) => _api = api;
@@ -131,6 +136,11 @@ internal sealed class FabricSemanticModelsFunction : ICatalogTableFunction
 /// </remarks>
 internal sealed class FabricRefreshSemanticModelFunction : ICatalogTableFunction
 {
+    // The canonical signature: ONE schema, each field flagged with its style. Explicit so this class
+    // may keep declaring the two halves separately (a local shorthand); consumers see the combination.
+    Apache.Arrow.Schema Fabricator.Bridge.ITableFunction.Parameters =>
+        Fabricator.Bridge.Params.Combine(Parameters, NamedParameters);
+
     private readonly FabricApiClient _api;
 
     internal FabricRefreshSemanticModelFunction(FabricApiClient api) => _api = api;
@@ -266,6 +276,11 @@ internal sealed class FabricRefreshSemanticModelFunction : ICatalogTableFunction
 /// </remarks>
 internal sealed class FabricSemanticModelRefreshesFunction : ICatalogTableFunction
 {
+    // The canonical signature: ONE schema, each field flagged with its style. Explicit so this class
+    // may keep declaring the two halves separately (a local shorthand); consumers see the combination.
+    Apache.Arrow.Schema Fabricator.Bridge.ITableFunction.Parameters =>
+        Fabricator.Bridge.Params.Combine(Parameters, NamedParameters);
+
     private readonly FabricApiClient _api;
 
     internal FabricSemanticModelRefreshesFunction(FabricApiClient api) => _api = api;

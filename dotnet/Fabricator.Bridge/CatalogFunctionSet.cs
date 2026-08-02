@@ -128,21 +128,19 @@ public sealed class CatalogFunctionSet
         }
         foreach (var f in _tables.Values)
         {
-            Emit(f.SchemaName, f.Name, "table", f.Parameters.FieldsList.Count, "");
+            Emit(f.SchemaName, f.Name, "table", Params.DeclaredCount(f.Parameters), "");
         }
         foreach (var f in _sqlTables.Values)
         {
-            // param_count = positional + named; the host splits them by the per-field fabricator.named tag.
-            Emit(f.SchemaName, f.Name, "table_sql",
-                 f.Parameters.FieldsList.Count + f.NamedParameters.FieldsList.Count, "");
+            Emit(f.SchemaName, f.Name, "table_sql", Params.DeclaredCount(f.Parameters), "");
         }
         foreach (var f in _inOut.Values)
         {
-            Emit(f.SchemaName, f.Name, "inout", f.InputSchema.FieldsList.Count, "");
+            Emit(f.SchemaName, f.Name, "inout", Params.DeclaredCount(f.Parameters), "");
         }
         foreach (var f in _collectors.Values)
         {
-            Emit(f.SchemaName, f.Name, "collector", f.InputSchema.FieldsList.Count, "");
+            Emit(f.SchemaName, f.Name, "collector", Params.DeclaredCount(f.Parameters), "");
         }
         foreach (var f in _aggregates.Values)
         {
@@ -184,11 +182,10 @@ public sealed class CatalogFunctionSet
     public Schema? ParamSchema(string schema, string func)
     {
         if (TryScalar(schema, func, out var s)) { return s.Parameters; }
-        // Positional ++ named, with the named ones TAGGED so the host registers them as DuckDB named
-        // parameters. Same channel and helper sqlgen functions use — there is only one tagging convention.
-        if (TryTable(schema, func, out var t)) { return SqlGen.ParamSchema(t.Parameters, t.NamedParameters); }
+        // ONE schema per function, each field already carrying its style — nothing to combine here any more.
+        if (TryTable(schema, func, out var t)) { return t.Parameters; }
         if (TryAggregate(schema, func, out var a)) { return a.Parameters; }
-        if (TrySqlTable(schema, func, out var g)) { return SqlGen.ParamSchema(g.Parameters, g.NamedParameters); }
+        if (TrySqlTable(schema, func, out var g)) { return g.Parameters; }
         return null;
     }
 

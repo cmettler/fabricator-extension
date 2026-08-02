@@ -46,9 +46,22 @@ internal abstract class FabricRowsFunction : ICatalogTableFunction
 
     public abstract string Name { get; }
 
+    /// <summary>Positional parameters (rare here — most of these functions take only named overrides).</summary>
     public virtual Schema Parameters { get; } = new Schema(System.Array.Empty<Field>(), null);
 
+    /// <summary>Named parameters — e.g. the <c>workspace :=</c> / <c>item :=</c> overrides.</summary>
     public virtual Schema NamedParameters { get; } = new Schema(System.Array.Empty<Field>(), null);
+
+    /// <summary>
+    /// The canonical signature crossing the boundary: ONE schema, each field flagged with its style.
+    /// </summary>
+    /// <remarks>
+    /// Implemented EXPLICITLY so the ~25 subclasses can keep declaring the two halves separately — a local
+    /// authoring shorthand — while every consumer sees the single flagged schema the protocol defines.
+    /// ⚠ The consequence: reading <c>Parameters</c> off a CONCRETE subclass yields only the positional half.
+    /// Read it through <see cref="ITableFunction"/>, which is how the registry stores these anyway.
+    /// </remarks>
+    Schema ITableFunction.Parameters => Params.Combine(Parameters, NamedParameters);
 
     protected abstract Schema Columns { get; }
 

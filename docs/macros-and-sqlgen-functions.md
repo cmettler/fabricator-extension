@@ -348,7 +348,7 @@ public interface ISqlTableFunction
     /// (accept any runtime type), same as the existing table-bind convention.</summary>
     Schema Parameters { get; }
     /// <summary>Optional named constants (e.g. by_name := true), with the field's type.</summary>
-    Schema NamedParameters => EmptySchema;
+    // (named parameters are fields of Parameters tagged via Params.Named — one schema, see ParamStyle.cs)
     /// <summary>args = ONE 1-row batch: positional fields first (declared order), then the
     /// SUPPLIED named params by field name. Return exactly one SELECT statement.</summary>
     string GenerateSql(RecordBatch args);
@@ -362,7 +362,7 @@ public interface ICatalogSqlTableFunction
     string SchemaName { get; }
     string Name { get; }
     Schema Parameters { get; }
-    Schema NamedParameters => EmptySchema;
+    // (named parameters are fields of Parameters tagged via Params.Named — one schema, see ParamStyle.cs)
     string GenerateSql(string catalogName, RecordBatch args);
 }
 ```

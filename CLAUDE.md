@@ -386,7 +386,9 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
 - **FABRIC REST API FUNCTIONS — P0 BUILT + VALIDATED LIVE; P1/P2 designed (2026-07-30):
   [docs/fabric-api-functions.md](docs/fabric-api-functions.md) (§9c = as-built, §10 = the full
   API sweep with a verdict per area).** `fabric_*` functions over `Microsoft.Fabric.Api` (already a
-  Bridge PackageReference, 2.14.0 — no bump; the pinned dll carries every P0/P1 method).
+  Bridge PackageReference, **2.18.0** since 2026-08-02 — bumped to track latest, forced by nothing and
+  changing nothing; §9i re-probed the two absences the design rests on, `ExitValue` and semantic-model
+  refresh, WITH controls, and both still hold).
   **Shipped:** `fabric_refresh_sql_endpoint()`/`_ex`, `fabric_list_shortcuts()`/`_ex`,
   `fabric_create_shortcut` / `_alter_` / `_json` / `fabric_drop_shortcut`, plus `fab_delta_info()`.
   Catalog-bound on a **OneLake** Delta attach ONLY, inheriting workspace+lakehouse+credential from the
@@ -405,8 +407,24 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     "benign — global functions pass". It was not benign, it was this. Fix needs BOTH halves: C#
     `ArrowSchemaExport` hand-builds the empty struct (`+s`, 0 children) since `CArrowSchema.release` is
     internal; C++ passes **no args stream at all** for an argument-less table function (`args` was
-    already nullable). Zero-arg SCALARS stay impossible by design — a scalar's arg batch is also how row
-    COUNT crosses — so an argument-less function must be a TABLE function.
+    already nullable).
+    - **⚠ CORRECTED 2026-08-02 — "zero-arg SCALARS stay impossible by design, because a scalar's arg batch
+      is also how row COUNT crosses" WAS WRONG, and zero-arg scalars now WORK.** The stated reason does not
+      hold: a 0-column Arrow array carries its length perfectly well, and **exporting** one succeeds
+      (measured; a 0-column/5-row `RecordBatch` reports `Length=5`). The obstacle was never the count — it
+      is the same zero-FIELD **schema** limit as above, whose *import* half was simply never addressed
+      because a zero-argument TABLE function does not need it (the host sends no args stream at all, so
+      nothing is imported). A SCALAR's arg batch crosses the other way, so it does.
+    - Fix: for a zero-parameter scalar the host marshals **one throwaway BOOLEAN column** of `row_count`
+      rows (`BuildFabricatorScalarFunction`). No ABI change, no C# change — a zero-argument function reads
+      only `RecordBatch.Length`, and `GlobalFunctions.ExecuteScalar` never validated column count.
+      `ExpressionExecutor` sets the argument chunk's cardinality OUTSIDE the children loop
+      (`execute_function.cpp`), so `args.size()` is the true row count even with no columns.
+    - Gate: `verify_global_functions` 72 → **80**, via the demo `fabricator_batch_seq()` (returns the row's
+      1-based position, so the DISTINCT count pins PER-ROW invocation — a constant-valued zero-arg function
+      would prove the count crossed but not that). **Mutation-tested**, and the mutant is instructive: with
+      the fix reverted the function still **REGISTERS** fine (registration only needs the param-schema
+      export, already fixed) and fails only at CALL time — so a registration-only test would have missed it.
   - **`fabric_run_notebook()`/`_ex` BUILT + proven end-to-end** (the elevated ask). Parameters ride
     **`executionData.parameters`** `{name:{value,type}}` — LIVE-VERIFIED honoured; the generic top-level
     `parameters[]` array is accepted with 202 and **SILENTLY IGNORED** for notebooks, so a hand-rolled REST
@@ -447,10 +465,11 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     The `fabricator.named` field-metadata tag (already used by sqlgen) now drives plain table-function
     registration on BOTH the catalog and global paths, so an optional argument is `recreate := true` and
     `fabric_refresh_sql_endpoint` / `_list_shortcuts` / `_run_notebook` / `_items` are ONE function each again
-    instead of a plain+`_ex` pair. Authoring: `ITableFunction.NamedParameters` (default empty ⇒ nothing else
-    changes). **The binding still reads BY POSITION** — positions are `Parameters` ++ `NamedParameters` in
-    declared order and the host marshals EVERY declared parameter, substituting a typed NULL for an omitted
-    named one; that equivalence ("omitted" == "explicit NULL") is why collapsing `_ex` changed no binding
+    instead of a plain+`_ex` pair. Authoring: **⚠ SUPERSEDED 2026-08-02 by the UNIFIED PARAM PROTOCOL below —
+    `NamedParameters` no longer exists**; a named parameter is a field of the ONE `Parameters` schema tagged
+    `fabricator.param_style="named"`. **The binding still reads BY POSITION** — position is simply that
+    schema's field order, and the host marshals EVERY declared parameter, substituting a typed NULL for an
+    omitted named one; that equivalence ("omitted" == "explicit NULL") is why collapsing `_ex` changed no binding
     code. **Scalars are excluded and unfixable**: DuckDB `ScalarFunction` has no named-parameter concept, so
     `fabric_create_shortcut_ex(…, conflict_policy)` remains a genuine sibling. Gate
     `verify_delta_catalog_functions` §6 (27) — both spellings, the value really crossing the ABI, a
@@ -560,6 +579,38 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
       timestamp column throws rather than yielding NULLs that look like "the service returned nothing");
       `fab_delta_info` was moved onto it deliberately, because it is the only function on that path with a
       HERMETIC gate. Gate: all **11** service suites over the six kinds green + hermetic 62/5573.
+- **THE UNIFIED PARAMETER PROTOCOL — DONE 2026-08-02 (behaviour-preserving; no ABI bump).** A function now
+  declares **ONE parameter schema** whose every field carries its STYLE in Arrow field metadata
+  (`fabricator.param_style` = `named` | `table`; ABSENT ⇒ positional). This replaced a split
+  `Parameters` + `NamedParameters` pair plus a third `InputSchema` on the in-out/collector kinds.
+  `dotnet/Fabricator.Abstractions/ParamStyle.cs` (`ParamStyle` / `Params`) is the whole protocol; C++ reads it
+  as `FabricatorParamStyle` (`FetchFunctionParamSchema`'s `out_styles`, replacing `vector<bool> arg_is_named`).
+  - **Why**: the split forced every consumer to reconstruct one ordering rule ("positions are `Parameters` ++
+    `NamedParameters`"), and a host that got the NULL substitution off by one would corrupt a POSITIONAL value
+    rather than error. With one schema, position IS declaration order and that bug cannot be written.
+  - **⚠ BOTH ordering rules are DuckDB's, not ours** — verified in `bind_table_function.cpp`: *"Unnamed
+    parameters cannot come after named parameters"* and *"Table function can have at most one subquery
+    parameter"*. `Params.Validate` moves those from CALL time to DECLARATION time. Named on a SCALAR is a
+    declaration ERROR (DuckDB `ScalarFunction` has no named-parameter concept), never silently ignored.
+  - **⚠ A table input is POSITIONAL-ONLY, and that is forced**: the binder's named-parameter path sets the
+    argument name and the subquery branch then ignores it, so `f(t := (SELECT …))` silently binds as THE
+    positional table arg. It MAY sit between positionals — DuckDB pushes a placeholder for the subquery slot
+    (`parameters.emplace_back()`), so later positions keep their index. Its declared `StructType` is carried
+    for US only: DuckDB registers `{LogicalType::TABLE}` and never sees it, so any schema validation is a
+    BIND-TIME check of our own (not built).
+  - `param_count` is **derived** (`Params.DeclaredCount`), excluding the table input so the number keeps
+    meaning "arguments you pass a value for". It is not host-read at all (registration reads 3 columns) but IS
+    user-visible via `fabricator_functions()`. Retired: `SqlGen.ParamSchema` + the `fabricator.named` tag.
+  - **⚠ THE COMPILER FINDS ALMOST NONE OF THIS.** Removing an interface member leaves `override`s of a
+    BASE-CLASS member compiling happily as DEAD CODE — ~25 declarations would have silently stopped being
+    read. The gate is a GREP (zero live `fabricator.named`), not a green build. 18 classes that hold the two
+    halves apart keep their shorthand via an EXPLICIT interface implementation
+    (`Schema ITableFunction.Parameters => Params.Combine(...)`); consequence to know: reading `Parameters` off
+    a CONCRETE subclass yields only the positional half.
+  - **⚠ Do NOT script structural edits to C#.** A brace-matching insertion loop ran away (no damage — it never
+    reached its write). A single-pass anchored insertion with an explicit class→interface map is the safe form.
+  - Gates: hermetic **63/63 — 5664** and service **44/44 — 1446**, both IDENTICAL to pre-refactor — which is
+    the behaviour-preservation claim.
   - **THE SQL SERVER BINDING — BUILT + LIVE-VALIDATED 2026-08-02 (§9h). This closes §8's "largest remaining
     gap in reach", and building it found TWO SHIPPED BUGS.** The whole set was bound to a OneLake **Delta**
     attach, so a dbt project on a Fabric **Warehouse** over T-SQL could not call even
@@ -1910,7 +1961,7 @@ exercised the next time a pin moves on its own.
 declares, so a new suite cannot silently sit outside CI. The accounting is complete and checked:
 **59 hermetic + 43 service + 11 excluded = 113 suite FILES** (2026-08-02), no overlap. ⚠ Suite FILES and
 suite RUNS differ and the floors are on RUNS: four hermetic suites and one service suite are
-engine-doubled, so 59 files ⇒ **63 runs / 5656 assertions** and 43 ⇒ **44 runs / 1446**. Recompute rather
+engine-doubled, so 59 files ⇒ **63 runs / 5664 assertions** and 43 ⇒ **44 runs / 1446**. Recompute rather
 than copy — the line here read `53 + 42 + 9 = 104` for a while after the counts had moved, which is what a
 hand-copied number does. `scripts/list-hermetic-suites.sh | wc -l` and its service twin are the source of
 truth; the 11 excluded are `verify_azure_secret`, `verify_dax`, `verify_delta_catalog_adls`,

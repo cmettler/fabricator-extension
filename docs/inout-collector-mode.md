@@ -9,7 +9,7 @@
 > `kind`. Reuses the v28 exchange ABI verbatim (no bump).
 >
 > **As-built notes** (where the build refined the sketch below):
-> - **C# author API** (`Fabricator.Bridge`): `IArrowCollectorTableFunction` (`SchemaName`/`Name`/`InputSchema`/
+> - **C# author API** (`Fabricator.Bridge`): `IArrowCollectorTableFunction` (`SchemaName`/`Name`/`Parameters`/
 >   `Bind(args, inputSchema)`) + `IArrowCollectorBinding` (`OutputSchema` + `Collect(allInput, ct)`), plus a
 >   `StaticCollectorFunction` fixed-schema base. A public `CollectorInOutBinding` adapter wraps an
 >   `IArrowCollectorBinding` as an `IArrowInOutBinding` (`DoExchange = Collect`) so it flows through the existing

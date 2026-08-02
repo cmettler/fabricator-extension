@@ -11,35 +11,10 @@ namespace Fabricator.Bridge;
 /// </summary>
 public static class SqlGen
 {
-    /// <summary>
-    /// Field-metadata marker on a parameter field: <c>"1"</c> = this is a NAMED parameter, not positional.
-    /// A <c>table_sql</c> function's <c>get_function_param_schema</c> returns positional fields followed by
-    /// named ones, distinguished by this tag — the same field-metadata channel the volatility signal uses
-    /// (<see cref="ScalarFunctionMetadata.VolatileKey"/>), so no extra ABI entry is needed. The host splits
-    /// them when it registers the DuckDB signature (positional <c>arguments</c> vs <c>named_parameters</c>).
-    /// </summary>
-    public const string NamedParamKey = "fabricator.named";
-
-    /// <summary>Positional fields ++ named fields tagged with <see cref="NamedParamKey"/> — the single
-    /// parameter schema the host reads to register a SQL-generating table function's signature.</summary>
-    public static Schema ParamSchema(Schema positional, Schema named)
-    {
-        var fields = new List<Field>(positional.FieldsList);
-        foreach (var f in named.FieldsList)
-        {
-            var metadata = new Dictionary<string, string>();
-            if (f.Metadata is not null)
-            {
-                foreach (var kv in f.Metadata)
-                {
-                    metadata[kv.Key] = kv.Value;
-                }
-            }
-            metadata[NamedParamKey] = "1";
-            fields.Add(new Field(f.Name, f.DataType, f.IsNullable, metadata));
-        }
-        return new Schema(fields, metadata: null);
-    }
+    // The old `fabricator.named` tag and the ParamSchema(positional, named) combiner lived here. Both are
+    // retired: a function now declares ONE parameter schema whose fields carry their own style
+    // (Params / fabricator.param_style), so there is nothing left to combine and no second tagging
+    // convention to keep in step.
 
     /// <summary>Generate for a GLOBAL (connection-free) SQL-generating table function.</summary>
     public static string Generate(ISqlTableFunction fn, RecordBatch? args)

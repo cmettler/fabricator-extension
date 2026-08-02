@@ -198,3 +198,39 @@ query I
 SELECT fabricator_product(x::BIGINT) FROM (VALUES (NULL),(NULL)) v(x);
 ----
 NULL
+
+# ── ZERO-ARGUMENT SCALAR ─────────────────────────────────────────────────────────────────────────
+# fabricator_batch_seq() takes NO arguments. This was long recorded as impossible, on the reasoning
+# that "a scalar's arg batch is also how the row COUNT crosses" — which is wrong: a 0-column Arrow
+# array carries its length perfectly well, and exporting one works. The real obstacle is narrower and
+# purely a library limit: Apache.Arrow 23 cannot represent a zero-FIELD SCHEMA across the C interface
+# in EITHER direction. The host therefore marshals one throwaway column (BuildFabricatorScalarFunction);
+# the managed side reads only its declared parameters — none — and answers per ROW.
+#
+# Registered with a genuinely empty signature (not a one-arg function called with a default).
+query II
+SELECT function_name, parameters FROM duckdb_functions() WHERE function_name = 'fabricator_batch_seq';
+----
+fabricator_batch_seq	[]
+
+# The load-bearing assertion: invoked ONCE PER ROW with the right count. A constant-valued zero-arg
+# function would prove the count crossed (the host fills N result rows) but NOT per-row invocation, so
+# this one returns the row's position and the DISTINCT count is what pins it. 5 rows => 5 distinct, 1..5.
+query IIII
+SELECT count(*), count(DISTINCT fabricator_batch_seq()), min(fabricator_batch_seq()), max(fabricator_batch_seq())
+FROM range(5);
+----
+5	5	1	5
+
+# Single row — the degenerate case (a 1-row batch with zero columns).
+query I
+SELECT fabricator_batch_seq();
+----
+1
+
+# It is VOLATILE (the default for a declared-impure function), so it is not folded to one literal
+# across rows — which is precisely what the DISTINCT assertion above would fail on.
+query I
+SELECT count(DISTINCT fabricator_batch_seq()) FROM range(3);
+----
+3

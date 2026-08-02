@@ -46,14 +46,20 @@ public interface IInOutFunction
     /// <summary>Function name. Catalog: <c>SELECT * FROM db.schema.Name(&lt;input&gt;)</c>; global: the bare name.</summary>
     string Name { get; }
 
-    /// <summary>The declared input-table columns — used for discovery metadata; the actual input schema is
-    /// passed to <see cref="Bind"/>.</summary>
-    Schema InputSchema { get; }
-
-    /// <summary>Constant "cost" args declared as NAMED parameters (e.g. <c>path := '…'</c>), default none.
-    /// Supplied values arrive in <see cref="Bind"/>'s <c>args</c> (a 1-row batch whose field names are the
-    /// parameter names).</summary>
-    Schema Parameters => new Schema(System.Array.Empty<Field>(), metadata: null);
+    /// <summary>
+    /// The call signature, including the INPUT TABLE itself: one schema whose fields carry their style in
+    /// metadata — build them with <see cref="Params"/>. An in-out function declares exactly one
+    /// <see cref="Params.TableInput"/> field plus any constant "cost" args (typically
+    /// <see cref="Params.Named"/>, e.g. <c>path := '…'</c>), whose supplied values arrive in
+    /// <see cref="Bind"/>'s <c>args</c>.
+    /// </summary>
+    /// <remarks>
+    /// The table input used to be a separate <c>InputSchema</c> member. It is a parameter like any other —
+    /// it occupies a positional slot in DuckDB's own binder — and keeping it apart meant a third schema that
+    /// nothing but a display column ever read. Declaring it here is also what lets a provider register an
+    /// in-out function under any name it likes, instead of the host synthesising one.
+    /// </remarks>
+    Schema Parameters { get; }
 
     /// <summary>Binds one call: <paramref name="args"/> (nullable) are the constant "cost" args (1-row batch);
     /// <paramref name="inputSchema"/> is the actual input table's schema. Returns the per-call binding.</summary>

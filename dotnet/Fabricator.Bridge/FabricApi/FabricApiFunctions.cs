@@ -207,6 +207,11 @@ internal abstract class FabricTableBinding : IArrowTableFunctionBinding
 /// </remarks>
 internal sealed class FabricRefreshSqlEndpointFunction : ICatalogTableFunction
 {
+    // The canonical signature: ONE schema, each field flagged with its style. Explicit so this class
+    // may keep declaring the two halves separately (a local shorthand); consumers see the combination.
+    Apache.Arrow.Schema Fabricator.Bridge.ITableFunction.Parameters =>
+        Fabricator.Bridge.Params.Combine(Parameters, NamedParameters);
+
     private readonly FabricApiClient _api;
 
     internal FabricRefreshSqlEndpointFunction(FabricApiClient api) => _api = api;
@@ -520,6 +525,11 @@ internal sealed class FabricDropShortcutFunction : ICatalogScalarFunction
 /// </remarks>
 internal sealed class FabricListShortcutsFunction : ICatalogTableFunction
 {
+    // The canonical signature: ONE schema, each field flagged with its style. Explicit so this class
+    // may keep declaring the two halves separately (a local shorthand); consumers see the combination.
+    Apache.Arrow.Schema Fabricator.Bridge.ITableFunction.Parameters =>
+        Fabricator.Bridge.Params.Combine(Parameters, NamedParameters);
+
     private readonly FabricApiClient _api;
 
     internal FabricListShortcutsFunction(FabricApiClient api) => _api = api;

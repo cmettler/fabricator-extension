@@ -35,6 +35,9 @@ internal static class CustomFunctions
         // high-cardinality keys: materialize `bucket(8, col)` as a column, PARTITION BY it, and prune with
         // `WHERE bucket_col = bucket(8, <literal>)` (CONSISTENT => the constant side folds at plan time).
         new Fabricator.Bridge.BucketFunction(),
+        // fabricator_batch_seq() — takes NO ARGUMENTS, which is the point: it is the gate for zero-argument
+        // scalars, previously recorded as impossible. See BatchSeqFunction and verify_global_functions §.
+        new Fabricator.Bridge.BatchSeqFunction(),
     };
 
     // Connection-free GLOBAL table-in-out (streaming exchange) functions — bare fn(<input>), no ATTACH.
@@ -891,7 +894,13 @@ internal sealed class CfRenderFunction : IScalarFunction
 internal sealed class GfTagFunction : IInOutFunction
 {
     public string Name => "fabricator_tag";
-    public Schema InputSchema => new(new[] { new Field("n", Int32Type.Default, nullable: true) }, metadata: null);
+
+    // The declared signature, in the target authoring shape: the input table IS a parameter, so it is one
+    // field flagged as the table input rather than a schema of its own.
+    public Schema Parameters => new(new[]
+    {
+        Params.TableInput("input", new Field("n", Int32Type.Default, nullable: true)),
+    }, metadata: null);
     public IArrowInOutBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding();
 
     private sealed class Binding : IArrowInOutBinding
@@ -935,7 +944,11 @@ internal sealed class GfTagFunction : IInOutFunction
 internal sealed class GfCollectSumFunction : ICollectorTableFunction
 {
     public string Name => "fabricator_collect_sum";
-    public Schema InputSchema => new(new[] { new Field("n", Int32Type.Default, nullable: true) }, metadata: null);
+
+    public Schema Parameters => new(new[]
+    {
+        Params.TableInput("input", new Field("n", Int32Type.Default, nullable: true)),
+    }, metadata: null);
     public IArrowCollectorBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding();
 
     private sealed class Binding : IArrowCollectorBinding
@@ -990,6 +1003,11 @@ internal sealed class GfCollectSumFunction : ICollectorTableFunction
 // would forfeit by streaming every row through C#). See docs/macros-and-sqlgen-functions.md §2.
 internal sealed class CfUnionByPatternFunction : ICatalogSqlTableFunction
 {
+    // The canonical signature: ONE schema, each field flagged with its style. Explicit so this class
+    // may keep declaring the two halves separately (a local shorthand); consumers see the combination.
+    Apache.Arrow.Schema Fabricator.Bridge.ICatalogSqlTableFunction.Parameters =>
+        Fabricator.Bridge.Params.Combine(Parameters, NamedParameters);
+
     public string SchemaName => "dbo";
     public string Name => "cf_union_by_pattern";
 
@@ -1068,6 +1086,11 @@ internal sealed class CfUnionByPatternFunction : ICatalogSqlTableFunction
 // See docs/macros-and-sqlgen-functions.md §2.
 internal sealed class GfDeltaUnionFunction : ISqlTableFunction
 {
+    // The canonical signature: ONE schema, each field flagged with its style. Explicit so this class
+    // may keep declaring the two halves separately (a local shorthand); consumers see the combination.
+    Apache.Arrow.Schema Fabricator.Bridge.ISqlTableFunction.Parameters =>
+        Fabricator.Bridge.Params.Combine(Parameters, NamedParameters);
+
     public string Name => "fabricator_delta_union";
 
     public Schema Parameters => new(new[]
@@ -1114,6 +1137,11 @@ internal sealed class GfDeltaUnionFunction : ISqlTableFunction
 // declaration anywhere (the plan decides). Also the cheapest end-to-end pin of the bind_replace path.
 internal sealed class GfSqlSeqFunction : ISqlTableFunction
 {
+    // The canonical signature: ONE schema, each field flagged with its style. Explicit so this class
+    // may keep declaring the two halves separately (a local shorthand); consumers see the combination.
+    Apache.Arrow.Schema Fabricator.Bridge.ISqlTableFunction.Parameters =>
+        Fabricator.Bridge.Params.Combine(Parameters, NamedParameters);
+
     public string Name => "fabricator_sql_seq";
 
     public Schema Parameters => new(new[]
@@ -1153,6 +1181,11 @@ internal sealed class GfSqlSeqFunction : ISqlTableFunction
 // table-session path (handle-0 table_bind). See docs/global-functions.md.
 internal sealed class GfSeqFunction : ITableFunction
 {
+    // The canonical signature: ONE schema, each field flagged with its style. Explicit so this class
+    // may keep declaring the two halves separately (a local shorthand); consumers see the combination.
+    Apache.Arrow.Schema Fabricator.Bridge.ITableFunction.Parameters =>
+        Fabricator.Bridge.Params.Combine(Parameters, NamedParameters);
+
     public string Name => "fabricator_seq";
     public Schema Parameters => new(new[] { new Field("n", Int32Type.Default, nullable: true) }, metadata: null);
 

@@ -1,7 +1,12 @@
-# Fabric REST API custom functions — design + as-built (P0 shipped, P1/P2 designed)
+# Fabric REST API custom functions — design + as-built (the whole curated set is BUILT)
 
-> Status 2026-07-31: **everything through P2 is BUILT and validated LIVE** — P0, notebook runs, jobs +
-> table maintenance (§9e), introspection, and now SEMANTIC MODELS incl. enhanced refresh (§9f). Refresh is
+> Status 2026-08-02: **the entire curated set is BUILT.** P0, notebook runs, jobs + table maintenance
+> (§9e), introspection, semantic models incl. enhanced refresh (§9f), P3 promotion/platform + the XMLA half
+> (§9g), and the SQL Server catalog binding (§9h) — all shipped. **Live-validated:** everything through P2,
+> semantic models, XMLA, and §9h. **NOT live-validated: the 15 P3 functions** (§9g) — this tenant has no
+> git-connected workspace, no deployment pipeline and no mirrored database, so they are wired and reviewed
+> but unexercised. **SDK pin: `Microsoft.Fabric.Api` 2.18.0** (bumped from 2.14.0 on 2026-08-02 — §9i).
+> Refresh is
 > not in the Fabric SDK at all; it lives in the Power BI REST API, on an audience we already mint. §9c is the as-built record, §9d
 > settles how notebook parameters actually arrive, §10 sweeps the whole API with a verdict per area; §4's
 > table marks what is shipped. The research below is
@@ -38,13 +43,14 @@ wrapping, decides the shapes (scalar vs table, parameter and output encoding), a
 
 ## 2. What already exists (research findings, verified)
 
-**The SDK is already shipped.** `Microsoft.Fabric.Api` **2.14.0** is a `Fabricator.Bridge`
+**The SDK is already shipped.** `Microsoft.Fabric.Api` (**2.18.0** since 2026-08-02; this section was
+researched against 2.14.0 and its findings re-verified on the new pin — §9i) is a `Fabricator.Bridge`
 PackageReference and is used in production code today:
 [FabricLakehouse.cs](../dotnet/Fabricator.Bridge/FabricLakehouse.cs) calls `GetLakehouse` (schema-enabled
 flag + `sqlEndpointProperties`), `WorkspacesClient.ListWorkspaces` and `ItemsClient.ListItems`
 (name→GUID resolution), and `TablesClient.ListTables` (the Unity-Catalog alternative is raw HTTP in the
 same file). Dependencies are lean (netstandard2.0; Azure.Core + DiagnosticSource + IdentityModel.Tokens.Jwt
-— all already in our closure). **The pinned 2.14.0 dll already contains everything P0/P1 needs** —
+— all already in our closure). **The pinned dll already contains everything P0/P1 needs** —
 byte-probed with positive (`GetLakehouse` 2) and negative (nonsense string 0) controls:
 `RefreshSqlEndpointMetadata` 2, `TableSyncStatus` 1, `CreateShortcut`/`DeleteShortcut`/`ListShortcuts`/
 `ResetShortcutCache` 2 each, `ShortcutConflictPolicy` + `CreateOrOverwrite` present,
@@ -405,7 +411,7 @@ Rows marked **RESOLVED** were settled by the slice-1 spike (§9b); the rest stil
 | refresh latency makes a blocking hook painful | **RESOLVED (partly)**: 7.5 s on `LH` — a blocking hook is fine. Unknown on a large/cold endpoint; still worth surfacing elapsed time | re-measure after a bulk create |
 | `refreshMetadata` semantics on schema-enabled lakehouses | statuses are `tableName`-keyed; schema qualification unclear | STILL OPEN — `LH` is schema-enabled but the run returned before new tables existed to inspect; re-check with a fresh table |
 | throttling on name resolution | ListWorkspaces/ListItems are per-principal throttled | cache per instance; probe burst behavior |
-| 2.14.0 model gaps vs current REST | e.g. newer conflict policies | **RESOLVED for P0/P1** — every needed client/method/policy is in 2.14.0; NO bump needed (and 2.18.0 would not add `ExitValue` either) |
+| SDK model gaps vs current REST | e.g. newer conflict policies | **RESOLVED** — every needed client/method/policy was already in 2.14.0, so no bump was ever forced; the pin moved to **2.18.0** on 2026-08-02 to track latest, and it changes nothing here (§9i) |
 | tableMaintenance is preview | may change shape | keep P1; pass-through `execution_data_json` in `_ex` as the stable escape hatch |
 | `exitValue` retrieval | **RESOLVED (partly)** — it is `properties.exitValue` on the NOTEBOOK-scoped GET only, and absent from the SDK model in 2.14.0/2.18.0. Returned NULL in every run despite the notebook calling `exit`, so it is best-effort | done (§9d) |
 | notebook param typing | **RESOLVED** — the `executionData.parameters` map IS honoured (types `string`/`int`/`float`/`bool` → `str`/`int`/`float`/`bool`); the top-level `parameters[]` array is silently ignored for notebooks | done (§9d) |
@@ -568,9 +574,24 @@ Fixed in two halves, both required:
    argument-less function the host now passes **no args stream at all** rather than an empty one. `args`
    was already nullable by contract, so this is the contract's intended shape — no ABI bump.
 
-**Zero-argument SCALAR functions remain impossible** and that is not worth fixing: a scalar's argument
-batch is also how the host conveys the ROW COUNT, so "no columns, N rows" has nowhere to live. Any
-zero-arg function must therefore be a TABLE function — which is why `fab_delta_info()` is one.
+**⚠ CORRECTED 2026-08-02 — this section used to end "zero-argument SCALAR functions remain impossible,
+and that is not worth fixing: a scalar's argument batch is also how the host conveys the ROW COUNT, so
+'no columns, N rows' has nowhere to live." THAT REASON IS WRONG, and zero-argument scalars now work.**
+A 0-column Arrow array carries its length perfectly well — a 0-column, 5-row `RecordBatch` reports
+`Length=5`, and EXPORTING it succeeds (both measured). "No columns, N rows" has exactly the place the
+Arrow spec gives it. The obstacle was only ever the zero-FIELD SCHEMA above, whose IMPORT half went
+unfixed because a zero-argument TABLE function never needs it: the host sends no args stream, so nothing
+is imported. A scalar's arg batch travels the other way, so it does.
+
+The fix is a **throwaway column**: for a zero-parameter scalar the host marshals one BOOLEAN column of
+`row_count` rows. No ABI change and no managed change — a zero-argument function reads only
+`RecordBatch.Length`, and the scalar dispatch never validated column count. Gate:
+`verify_global_functions` (72 → 80) via the demo `fabricator_batch_seq()`, mutation-tested. The mutant is
+worth knowing: with the fix reverted the function still REGISTERS (registration needs only the
+param-schema export, which was already fixed) and fails at CALL time — so a registration-only assertion
+would not have caught it.
+
+`fab_delta_info()` is still a TABLE function, but now by CHOICE (it returns rows), not by necessity.
 
 ### Live findings that change how these functions must be USED
 
@@ -729,9 +750,9 @@ means "skip that part", so the defaults here do nothing rather than something su
   SP is refused with `400 PrincipalTypeNotSupported` (as measured in §9b), so the SUCCESS path could not be
   exercised — but the call reaches the service and returns the service's own error, which is everything except
   the permission. Expected to work under a USER identity, and in particular under a Fabric notebook's AMBIENT
-  token, which is user-delegated rather than an SP. It is a TABLE function because a zero-argument SCALAR is
-  impossible (a scalar's argument batch is how row count crosses) and because returning a row lets it report
-  which workspace it acted on.
+  token, which is user-delegated rather than an SP. It is a TABLE function because returning a row lets it
+  report which workspace it acted on. (It also used to cite "a zero-argument SCALAR is impossible" — obsolete
+  as of 2026-08-02, see §9c; the returns-a-row reason stands on its own.)
 
 ## 9f. SEMANTIC MODELS — what exists, and where refresh actually lives (analysis, 2026-07-31, NOT built)
 
@@ -986,7 +1007,7 @@ the declaration rows; SqlServer's six static dictionaries and DAX's hand-rolled 
 - **Gate: all ELEVEN service suites covering the six kinds green** (custom_functions 89, scalar_functions 26,
   table_functions 33, stored_procs 24, custom_aggregates 58, table_inout 63, proc_inout 31, collector 40,
   sqlgen_catalog 30, functions 13 — now 15, see §9h, inout_isolation 17), plus the hermetic tier at 62 suites /
-  5573 assertions (now 63 / 5656).
+  5573 assertions (now 63 / 5664).
 
 ## 9h. The SQL SERVER catalog binding — BUILT + live-validated (2026-08-02), and it found two shipped bugs
 
@@ -1079,6 +1100,7 @@ output columns.**
 - **Still ungated live**: everything that needs a real tenant. The positive path here is manual, like
   `verify_dax` — only the negative control can run in CI.
 - Full tiers after the change: hermetic **63/63 — 5656**, service **44/44 — 1446** (1444 + the two new).
+  (Hermetic is **5664** as of the zero-argument-scalar work later the same day — §9c.)
 
 ### Still open
 
@@ -1086,10 +1108,34 @@ output columns.**
 no `workspace :=` / `item :=` (DuckDB `ScalarFunction` has no named-parameter concept — §9c), so on a SQL
 attach they always act on the ATTACH's own `item`.
 
+## 9i. SDK pin 2.14.0 → 2.18.0 (2026-08-02)
+
+Bumped to track latest. **Nothing was forced by it and nothing changed because of it** — recorded so the
+next reader does not have to re-derive that.
+
+- Compiles clean on `net10.0` and `net8.0`, no source change anywhere; four minor versions with no break
+  in the surface we use.
+- **The two absences the design RESTS on were re-probed on 2.18.0, with controls**, because both are
+  statements about "the pinned dll" and the pin moved:
+  - **`exitValue` / `ExitValue` — still absent** ⇒ the raw-HTTP call in `FabricApiClient` stays necessary
+    (§9d); a bump does not retire it.
+  - **`RefreshSemanticModel` / `EnhancedRefresh` / `RefreshSchedule` — still all absent** ⇒ semantic-model
+    refresh stays on the **Power BI REST** surface (§9f). This is the one that would have silently
+    invalidated a whole design decision had it changed.
+  - Controls: `RefreshSqlEndpointMetadata` (positive, 2 hits) and a nonsense symbol (negative, 0). Without
+    those, four zeros are equally consistent with "probed the wrong file".
+- Live re-verified on the new pin through a Fabric SQL attach, across all three surfaces the set spans:
+  Fabric core (`fabric_warehouses`, `fabric_items` 20, `fabric_capacities` 2), OneLake
+  (`fabric_list_shortcuts` 4), and Power BI REST (`fabric_semantic_models` 5), plus the `item :=` override.
+- The deployed assembly was checked (`FileVersion` = 2.18.0.0), not just the csproj — a publish that
+  silently kept the old dll is the failure this catches.
+
 ## 10. The full API sweep — every area, with a verdict
 
 The complete Fabric REST surface (Core services + workload APIs), each with implement/defer/skip and
-the reason. **Every group below was presence-verified in the pinned 2.14.0 dll** (namespace/operation
+the reason. **Every group below was presence-verified in the then-pinned 2.14.0 dll** (the pin is now
+2.18.0; the two verdict-bearing absences — `ExitValue` and semantic-model refresh — were re-probed on it
+with controls and both still hold, §9i) (namespace/operation
 string probe with positive + negative controls, 2026-07-30) — so nothing here depends on a package
 bump. Two client-class names did not match first-guess casing (`SQLEndpoint` namespace, the LRO
 client); the *operations* are verified present, exact names resolve at the spike.

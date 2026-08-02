@@ -94,6 +94,11 @@ internal static class FabricJobFunctions
 /// </remarks>
 internal sealed class FabricTableMaintenanceFunction : ICatalogTableFunction
 {
+    // The canonical signature: ONE schema, each field flagged with its style. Explicit so this class
+    // may keep declaring the two halves separately (a local shorthand); consumers see the combination.
+    Apache.Arrow.Schema Fabricator.Bridge.ITableFunction.Parameters =>
+        Fabricator.Bridge.Params.Combine(Parameters, NamedParameters);
+
     private readonly FabricApiClient _api;
 
     internal FabricTableMaintenanceFunction(FabricApiClient api) => _api = api;
@@ -212,6 +217,11 @@ internal sealed class FabricTableMaintenanceFunction : ICatalogTableFunction
 /// </remarks>
 internal sealed class FabricRunJobFunction : ICatalogTableFunction
 {
+    // The canonical signature: ONE schema, each field flagged with its style. Explicit so this class
+    // may keep declaring the two halves separately (a local shorthand); consumers see the combination.
+    Apache.Arrow.Schema Fabricator.Bridge.ITableFunction.Parameters =>
+        Fabricator.Bridge.Params.Combine(Parameters, NamedParameters);
+
     private readonly FabricApiClient _api;
 
     internal FabricRunJobFunction(FabricApiClient api) => _api = api;
@@ -286,6 +296,11 @@ internal sealed class FabricRunJobFunction : ICatalogTableFunction
 /// <summary><c>fabric_job_status(item, job_instance_id [, workspace := …] [, item_type := …])</c>.</summary>
 internal sealed class FabricJobStatusFunction : ICatalogTableFunction
 {
+    // The canonical signature: ONE schema, each field flagged with its style. Explicit so this class
+    // may keep declaring the two halves separately (a local shorthand); consumers see the combination.
+    Apache.Arrow.Schema Fabricator.Bridge.ITableFunction.Parameters =>
+        Fabricator.Bridge.Params.Combine(Parameters, NamedParameters);
+
     private readonly FabricApiClient _api;
 
     internal FabricJobStatusFunction(FabricApiClient api) => _api = api;
@@ -349,6 +364,11 @@ internal sealed class FabricJobStatusFunction : ICatalogTableFunction
 /// </summary>
 internal sealed class FabricJobInstancesFunction : ICatalogTableFunction
 {
+    // The canonical signature: ONE schema, each field flagged with its style. Explicit so this class
+    // may keep declaring the two halves separately (a local shorthand); consumers see the combination.
+    Apache.Arrow.Schema Fabricator.Bridge.ITableFunction.Parameters =>
+        Fabricator.Bridge.Params.Combine(Parameters, NamedParameters);
+
     private readonly FabricApiClient _api;
 
     internal FabricJobInstancesFunction(FabricApiClient api) => _api = api;
@@ -498,6 +518,11 @@ internal sealed class FabricCancelJobFunction : ICatalogScalarFunction
 /// </remarks>
 internal sealed class FabricResetShortcutCacheFunction : ICatalogTableFunction
 {
+    // The canonical signature: ONE schema, each field flagged with its style. Explicit so this class
+    // may keep declaring the two halves separately (a local shorthand); consumers see the combination.
+    Apache.Arrow.Schema Fabricator.Bridge.ITableFunction.Parameters =>
+        Fabricator.Bridge.Params.Combine(Parameters, NamedParameters);
+
     private readonly FabricApiClient _api;
 
     internal FabricResetShortcutCacheFunction(FabricApiClient api) => _api = api;
@@ -630,6 +655,11 @@ internal sealed class FabricOperationStatusFunction : ICatalogTableFunction
 /// </remarks>
 internal sealed class FabricLakehouseTablesFunction : ICatalogTableFunction
 {
+    // The canonical signature: ONE schema, each field flagged with its style. Explicit so this class
+    // may keep declaring the two halves separately (a local shorthand); consumers see the combination.
+    Apache.Arrow.Schema Fabricator.Bridge.ITableFunction.Parameters =>
+        Fabricator.Bridge.Params.Combine(Parameters, NamedParameters);
+
     private readonly FabricApiClient _api;
 
     internal FabricLakehouseTablesFunction(FabricApiClient api) => _api = api;

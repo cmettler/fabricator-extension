@@ -20,23 +20,20 @@ public interface ITableFunction
     /// <summary>Function name. Catalog: <c>SELECT * FROM db.schema.Name(args)</c>; global: the bare name.</summary>
     string Name { get; }
 
-    /// <summary>The argument fields, in positional order (names + Arrow types) — the call signature.</summary>
-    Schema Parameters { get; }
-
     /// <summary>
-    /// Optional arguments, callable as <c>fn(positional…, flag := true)</c>. Empty by default.
+    /// The call signature: ONE schema whose fields are the parameters in declared order. A field's STYLE —
+    /// positional (the default) or named — rides its metadata; build them with <see cref="Params"/>.
     /// </summary>
     /// <remarks>
     /// <para>A NAMED parameter is how an OPTIONAL argument is expressed: DuckDB positional table arguments
-    /// have no defaults, so without this a function with three optional knobs forces every caller to write
-    /// <c>fn(NULL, NULL, NULL)</c>.</para>
-    /// <para><b>The binding still reads arguments BY POSITION</b>, and the positions are
-    /// <see cref="Parameters"/> followed by these, in declared order. An argument the caller omitted arrives
-    /// as NULL — deliberately indistinguishable from an explicit NULL, since that is the semantic a nullable
-    /// trailing argument already had. So adding a named parameter to an existing function does not disturb
-    /// how it reads the ones before it.</para>
+    /// have no defaults, so without one a function with three optional knobs forces every caller to write
+    /// <c>fn(NULL, NULL, NULL)</c>. Named parameters must come LAST — DuckDB's own rule, checked at
+    /// declaration time by <see cref="Params.Validate"/>.</para>
+    /// <para><b>The binding reads arguments BY POSITION</b>, and position is simply this schema's field
+    /// order. An argument the caller omitted arrives as NULL — deliberately indistinguishable from an
+    /// explicit NULL, since that is the semantic a nullable trailing argument already had.</para>
     /// </remarks>
-    Schema NamedParameters => new Schema(System.Array.Empty<Field>(), null);
+    Schema Parameters { get; }
 
     /// <summary>
     /// Whether this function's source orders strings the same way DuckDB does (byte/binary) — so string

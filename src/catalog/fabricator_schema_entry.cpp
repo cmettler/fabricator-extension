@@ -335,13 +335,46 @@ static ScalarFunction BuildFabricatorScalarFunction(FabricatorHandle handle, con
 		// the value UNCAST, so the runtime type (a STRUCT, a VARCHAR, …) is what must be appended. For a
 		// concrete-typed param DuckDB has already cast to the declared type, so this equals the signature.
 		auto actual_types = args.GetTypes();
+		auto marshal_names = arg_names;
+
+		// ── ZERO-ARGUMENT SCALAR: send one throwaway column ──────────────────────────────────────────
+		// Apache.Arrow (23.0.0) cannot represent a zero-FIELD schema across the C interface in EITHER
+		// direction — export AND import both raise ArgumentNullException('fields'); measured with positive
+		// controls. `ArrowSchemaExport` hand-builds the empty struct for the EXPORT half, which is all a
+		// zero-argument TABLE function needs (the host simply passes no args stream). A SCALAR's arg batch
+		// crosses the OTHER way, so a 0-column batch would fail on IMPORT inside the bridge.
+		//
+		// Nothing about the row COUNT is the problem — a 0-column Arrow array carries its length perfectly
+		// well, and exporting one works. (An older note here claimed zero-argument scalars were impossible
+		// "because the arg batch is also how row count crosses". That reason was wrong; it is purely the
+		// SCHEMA that cannot cross.) So marshal one throwaway column of `row_count` rows. The managed side
+		// reads only its DECLARED parameters — none — and takes the count from the batch length, so it needs
+		// no knowledge of this column.
+		const bool zero_arg = actual_types.empty();
+		if (zero_arg) {
+			actual_types.push_back(LogicalType::BOOLEAN);
+			marshal_names.push_back("__fabricator_rows");
+		}
+
 		auto properties = fabricator::BoundaryClientProperties(ctx);
 		auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(ctx, actual_types);
 		ArrowAppender appender(actual_types, row_count, properties, extension_types);
-		appender.Append(args, 0, row_count, row_count);
+		if (zero_arg) {
+			// `args` has no columns to append from; build the placeholder. DuckDB sets the cardinality of the
+			// argument chunk even when it has no columns (execute_function.cpp — SetCardinality is outside the
+			// children loop), so `row_count` above is the true row count.
+			DataChunk rows;
+			rows.Initialize(Allocator::Get(ctx), actual_types, MaxValue<idx_t>(row_count, 1));
+			rows.data[0].Reference(Value::BOOLEAN(false));
+			rows.data[0].Flatten(row_count);
+			rows.SetCardinality(row_count);
+			appender.Append(rows, 0, row_count, row_count);
+		} else {
+			appender.Append(args, 0, row_count, row_count);
+		}
 		ArrowArray array = appender.Finalize();
 
-		fabricator::ArrowProducer producer(actual_types, arg_names, properties);
+		fabricator::ArrowProducer producer(actual_types, marshal_names, properties);
 		producer.AddBatch(array);
 		producer.Finish();
 
@@ -1048,11 +1081,10 @@ struct FabricatorTableFunctionInfo : public TableFunctionInfo {
 	string func;
 	vector<LogicalType> arg_types;
 	vector<string> arg_names;
-	// Which declared parameters are DuckDB NAMED parameters (`fn(x, flag := true)`), parallel to arg_names.
-	// Empty (or all-false) => every parameter is positional, which is what a discovered TVF and every
-	// pre-named-parameter provider function look like. A provider tags them via `fabricator.named` in the
-	// parameter schema's field metadata — the same channel sqlgen functions already use.
-	vector<bool> arg_is_named;
+	// Each declared parameter's STYLE, parallel to arg_names. Empty (or all POSITIONAL) is what a discovered
+	// TVF and every pre-named-parameter provider function look like. The provider tags them via
+	// `fabricator.param_style` in the parameter schema's field metadata — ONE schema carries all styles.
+	vector<FabricatorParamStyle> arg_styles;
 	bool is_proc = false;    // stored procedure (EXEC, no pushdown) vs TVF (FROM, pushdown)
 	// SQL-generating (`table_sql`, v68) functions only: the DuckDB ATTACH ALIAS of the catalog this entry
 	// belongs to (empty for a global function). Passed to generate_table_sql so a catalog-bound generator can
@@ -1114,7 +1146,8 @@ unique_ptr<FunctionData> FabricatorTableFunctionBind(ClientContext &context, Tab
 			arg_types.push_back(declared);
 			arg_values.push_back(kv.second);
 		}
-	} else if (std::find(info.arg_is_named.begin(), info.arg_is_named.end(), true) != info.arg_is_named.end()) {
+	} else if (std::find(info.arg_styles.begin(), info.arg_styles.end(), FabricatorParamStyle::NAMED) !=
+	           info.arg_styles.end()) {
 		// MIXED positional + named (a provider-authored function with optional arguments). Marshal EVERY
 		// declared parameter in DECLARED ORDER, substituting a typed NULL for a named one the caller
 		// omitted. That keeps the managed side reading args BY POSITION exactly as it does for a purely
@@ -1122,7 +1155,7 @@ unique_ptr<FunctionData> FabricatorTableFunctionBind(ClientContext &context, Tab
 		// thing, which is the semantic a provider already has to implement for a nullable trailing argument.
 		idx_t positional_index = 0;
 		for (idx_t i = 0; i < info.arg_names.size(); i++) {
-			bool named = i < info.arg_is_named.size() && info.arg_is_named[i];
+			bool named = i < info.arg_styles.size() && info.arg_styles[i] == FabricatorParamStyle::NAMED;
 			LogicalType declared = info.arg_types[i];
 			if (!named) {
 				Value v = positional_index < input.inputs.size() ? input.inputs[positional_index]
@@ -1240,15 +1273,16 @@ unique_ptr<TableRef> FabricatorParseGeneratedSelect(const string &sql, const Par
 }
 
 // Build the DuckDB signature of a SQL-generating table function from its ONE declared parameter schema:
-// positional fields first, then the NAMED ones (tagged fabricator.named="1", split by `is_named`). A
+// positional fields first, then the NAMED ones (tagged fabricator.param_style="named", split by `styles`). A
 // SQLNULL-declared parameter is the "accept any value" marker (registered as ANY so DuckDB passes the literal
 // UNCAST and its runtime type survives). Shared by the global (load-time) and catalog (attach-time) paths.
 void FabricatorBuildSqlGenSignature(const vector<string> &all_names, const vector<LogicalType> &all_types,
-                                    const vector<bool> &is_named, TableFunction &tf, vector<string> &arg_names,
+                                    const vector<FabricatorParamStyle> &styles, TableFunction &tf,
+                                    vector<string> &arg_names,
                                     vector<LogicalType> &arg_types) {
 	for (idx_t k = 0; k < all_names.size(); k++) {
 		auto type = all_types[k].id() == LogicalTypeId::SQLNULL ? LogicalType::ANY : all_types[k];
-		if (k < is_named.size() && is_named[k]) {
+		if (k < styles.size() && styles[k] == FabricatorParamStyle::NAMED) {
 			tf.named_parameters[all_names[k]] = type;
 		} else {
 			arg_names.push_back(all_names[k]);
@@ -2136,18 +2170,18 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				// non-proc branch (projection + best-effort filter pushdown; the binding decides honoring).
 				vector<string> arg_names;
 				vector<LogicalType> arg_types;
-				vector<bool> arg_is_named;
+				vector<FabricatorParamStyle> arg_styles;
 				try {
-					FetchFunctionParamSchema(context, nullptr, "", fn_name, arg_names, arg_types, &arg_is_named);
+					FetchFunctionParamSchema(context, nullptr, "", fn_name, arg_names, arg_types, &arg_styles);
 				} catch (std::exception &) {
 					continue;
 				}
-				// Positional args only in the signature; a parameter tagged `fabricator.named` becomes a
+				// Positional args only in the signature; a parameter tagged `fabricator.param_style=named` becomes a
 				// DuckDB named parameter instead, which is how a global function expresses an OPTIONAL
 				// argument (positional table arguments have no defaults). Same split as the catalog path.
 				vector<LogicalType> positional;
 				for (idx_t k = 0; k < arg_types.size(); k++) {
-					if (k >= arg_is_named.size() || !arg_is_named[k]) {
+					if (k >= arg_styles.size() || arg_styles[k] != FabricatorParamStyle::NAMED) {
 						positional.push_back(arg_types[k]);
 					}
 				}
@@ -2156,7 +2190,7 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				tf.projection_pushdown = true;
 				tf.pushdown_complex_filter = FabricatorComplexFilterPushdown;
 				for (idx_t k = 0; k < arg_names.size(); k++) {
-					if (k < arg_is_named.size() && arg_is_named[k]) {
+					if (k < arg_styles.size() && arg_styles[k] == FabricatorParamStyle::NAMED) {
 						auto t = arg_types[k].id() == LogicalTypeId::SQLNULL ? LogicalType::ANY : arg_types[k];
 						tf.named_parameters[arg_names[k]] = t;
 					}
@@ -2167,7 +2201,7 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				fn_info->func = fn_name;
 				fn_info->arg_types = arg_types;
 				fn_info->arg_names = arg_names;
-				fn_info->arg_is_named = arg_is_named;
+				fn_info->arg_styles = arg_styles;
 				fn_info->is_proc = false;
 				// A byte-ordered-string reader (e.g. Delta/Parquet) can safely push string ordering + BETWEEN.
 				fn_info->string_order_pushable = string_order[i] == "1";
@@ -2179,18 +2213,18 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				// handle = 0 so generate_table_sql resolves the generator against the C# global registry.
 				vector<string> all_names;
 				vector<LogicalType> all_types;
-				vector<bool> is_named;
+				vector<FabricatorParamStyle> styles;
 				try {
-					FetchFunctionParamSchema(context, nullptr, "", fn_name, all_names, all_types, &is_named);
+					FetchFunctionParamSchema(context, nullptr, "", fn_name, all_names, all_types, &styles);
 				} catch (std::exception &) {
 					continue;
 				}
 				// One declared schema carries both kinds: POSITIONAL fields, then NAMED ones tagged
-				// fabricator.named="1" (SqlGen.ParamSchema) — split them into the DuckDB signature.
+				// fabricator.param_style="named" — split them into the DuckDB signature.
 				vector<string> arg_names;
 				vector<LogicalType> arg_types;
 				TableFunction tf(fn_name, {}, nullptr, nullptr);
-				FabricatorBuildSqlGenSignature(all_names, all_types, is_named, tf, arg_names, arg_types);
+				FabricatorBuildSqlGenSignature(all_names, all_types, styles, tf, arg_names, arg_types);
 				tf.bind_replace = FabricatorSqlGenBindReplace;
 				auto fn_info = make_shared_ptr<FabricatorTableFunctionInfo>();
 				fn_info->handle = nullptr; // global marker
@@ -2280,9 +2314,9 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(Clien
 
 	vector<string> arg_names;
 	vector<LogicalType> arg_types;
-	vector<bool> arg_is_named;
+	vector<FabricatorParamStyle> arg_styles;
 	try {
-		FetchFunctionParamSchema(context, handle_, name, func_name, arg_names, arg_types, &arg_is_named);
+		FetchFunctionParamSchema(context, handle_, name, func_name, arg_names, arg_types, &arg_styles);
 	} catch (std::exception &) {
 		// Stale discovery (dropped out-of-band) — treat as not-found.
 		table_functions_.erase(func_name);
@@ -2294,13 +2328,13 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(Clien
 	// take DuckDB named parameters (EXEC @name=val), so the caller supplies a subset and
 	// omitted optional params fall back to the proc's own DEFAULT.
 	//
-	// A provider-authored function may ALSO declare named parameters (tagged `fabricator.named`) alongside
+	// A provider-authored function may ALSO declare named parameters (tagged `fabricator.param_style`) alongside
 	// its positional ones — that is how an OPTIONAL argument is expressed, since DuckDB positional table
 	// arguments have no defaults. A discovered TVF tags nothing, so it stays fully positional.
 	vector<LogicalType> positional;
 	if (!is_proc) {
 		for (idx_t i = 0; i < arg_types.size(); i++) {
-			if (i >= arg_is_named.size() || !arg_is_named[i]) {
+			if (i >= arg_styles.size() || arg_styles[i] != FabricatorParamStyle::NAMED) {
 				positional.push_back(arg_types[i]);
 			}
 		}
@@ -2320,7 +2354,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(Clien
 		// A provider-declared NAMED parameter on a non-proc function: register it so `fn(x, flag := true)`
 		// binds. Same SQLNULL=>ANY marker rule as the proc branch above.
 		for (idx_t i = 0; i < arg_names.size(); i++) {
-			if (i < arg_is_named.size() && arg_is_named[i]) {
+			if (i < arg_styles.size() && arg_styles[i] == FabricatorParamStyle::NAMED) {
 				auto t = arg_types[i].id() == LogicalTypeId::SQLNULL ? LogicalType::ANY : arg_types[i];
 				tf.named_parameters[arg_names[i]] = t;
 			}
@@ -2337,7 +2371,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(Clien
 	fn_info->func = func_name;
 	fn_info->arg_types = arg_types;
 	fn_info->arg_names = arg_names;
-	fn_info->arg_is_named = arg_is_named;
+	fn_info->arg_styles = arg_styles;
 	fn_info->is_proc = is_proc;
 	tf.function_info = std::move(fn_info);
 
@@ -2359,9 +2393,9 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateSqlTableFunction(Cl
                                                                            const string &func_name) {
 	vector<string> all_names;
 	vector<LogicalType> all_types;
-	vector<bool> is_named;
+	vector<FabricatorParamStyle> styles;
 	try {
-		FetchFunctionParamSchema(context, handle_, name, func_name, all_names, all_types, &is_named);
+		FetchFunctionParamSchema(context, handle_, name, func_name, all_names, all_types, &styles);
 	} catch (std::exception &) {
 		// Stale discovery (the provider no longer declares it) — treat as not-found, like the other paths.
 		sql_table_functions_.erase(func_name);
@@ -2372,7 +2406,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateSqlTableFunction(Cl
 	vector<string> arg_names;
 	vector<LogicalType> arg_types;
 	TableFunction tf(func_name, {}, nullptr, nullptr);
-	FabricatorBuildSqlGenSignature(all_names, all_types, is_named, tf, arg_names, arg_types);
+	FabricatorBuildSqlGenSignature(all_names, all_types, styles, tf, arg_names, arg_types);
 	tf.bind_replace = FabricatorSqlGenBindReplace;
 	auto fn_info = make_shared_ptr<FabricatorTableFunctionInfo>();
 	fn_info->handle = handle_;

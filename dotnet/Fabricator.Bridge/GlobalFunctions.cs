@@ -94,15 +94,10 @@ public static class GlobalFunctions
     public static Schema ParamSchema(string name)
     {
         if (ScalarMap.Value.TryGetValue(name, out var s)) { return s.Parameters; }
-        // A table function may declare NAMED parameters too (optional args); they ride the same one-schema,
-        // tagged convention as sqlgen below, and the host splits on the tag.
-        if (TableMap.Value.TryGetValue(name, out var t)) { return SqlGen.ParamSchema(t.Parameters, t.NamedParameters); }
-        // A SQL-generating table function declares BOTH positional and named parameters; they cross as one
-        // schema with the named ones tagged (SqlGen.NamedParamKey) so the host can split them.
-        if (SqlTableMap.Value.TryGetValue(name, out var sq))
-        {
-            return SqlGen.ParamSchema(sq.Parameters, sq.NamedParameters);
-        }
+        // Every kind declares ONE schema whose fields already carry their style, so there is nothing to
+        // combine: positional, named and table-input all arrive tagged and the host splits on the tag.
+        if (TableMap.Value.TryGetValue(name, out var t)) { return t.Parameters; }
+        if (SqlTableMap.Value.TryGetValue(name, out var sq)) { return sq.Parameters; }
         if (AggregateMap.Value.TryGetValue(name, out var a)) { return a.Parameters; }
         // In-out / collector cost args are declared as NAMED parameters (e.g. path := '…'); default empty.
         if (InOutMap.Value.TryGetValue(name, out var io)) { return io.Parameters; }

@@ -83,6 +83,13 @@ already anticipated it — "the existing `execute_scalar` with a handle-less mar
 
 ## C# authoring (provider declares; Bridge unions)
 
+> **A scalar may declare ZERO parameters** (since 2026-08-02). `Parameters` = an empty `Schema`; the
+> function is invoked once per row and reads the count from `RecordBatch.Length`. Demo + gate:
+> `BatchSeqFunction` / `fabricator_batch_seq()` in `verify_global_functions`. This was previously
+> documented as impossible — the recorded reason ("a scalar's arg batch is how row count crosses") was
+> wrong; see [fabric-api-functions.md](fabric-api-functions.md) §9c for what actually blocked it and the
+> throwaway-column fix. Nothing is required of the author: the host handles it.
+
 - **Interface (extract a shared base, don't duplicate)** (`Fabricator.Bridge`): `SchemaName` is the *only*
   catalog-specific member, so factor it out — a global scalar is just a scalar without a catalog binding:
   ```csharp
@@ -149,13 +156,13 @@ public interface ITableFunction {                               // global table 
 public interface ICatalogTableFunction : ITableFunction { string SchemaName { get; } }   // was IArrowTableFunction
 
 public interface IInOutFunction {                               // global in-out (streaming exchange)
-    string Name { get; } Schema InputSchema { get; }
+    string Name { get; } Schema Parameters { get; }   // incl. the Params.TableInput field
     IArrowInOutBinding Bind(RecordBatch? args, Schema inputSchema);
 }
 public interface ICatalogInOutFunction : IInOutFunction { string SchemaName { get; } }   // was IArrowInOutFunction
 
 public interface ICollectorTableFunction {                      // global collector (pipeline breaker)
-    string Name { get; } Schema InputSchema { get; }
+    string Name { get; } Schema Parameters { get; }   // incl. the Params.TableInput field
     IArrowCollectorBinding Bind(RecordBatch? args, Schema inputSchema);
 }
 public interface ICatalogCollectorTableFunction : ICollectorTableFunction { string SchemaName { get; } }  // was IArrowCollectorTableFunction

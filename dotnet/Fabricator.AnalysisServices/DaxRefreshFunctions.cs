@@ -174,6 +174,11 @@ internal static class DaxRefreshFunctions
 /// </summary>
 internal abstract class DaxRefreshBase : ICatalogTableFunction
 {
+    // The canonical signature: ONE schema, each field flagged with its style. Explicit so this class
+    // may keep declaring the two halves separately (a local shorthand); consumers see the combination.
+    Apache.Arrow.Schema Fabricator.Bridge.ITableFunction.Parameters =>
+        Fabricator.Bridge.Params.Combine(Parameters, NamedParameters);
+
     protected DaxRefreshBase(DaxCatalog catalog, string schemaName)
     {
         Catalog = catalog;

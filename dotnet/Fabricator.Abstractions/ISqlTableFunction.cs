@@ -34,16 +34,13 @@ public interface ISqlTableFunction
     string Name { get; }
 
     /// <summary>
-    /// The positional argument fields (names + Arrow types) — the call signature. A <c>NullType</c>-typed field
-    /// is the ANY sentinel: DuckDB passes the value UNCAST and its runtime type is preserved (the convention
-    /// shared with the table/in-out bind paths — e.g. an "accept a STRUCT or a JSON string" parameter).
+    /// The call signature: ONE schema whose fields are the parameters in declared order, each carrying its
+    /// style (positional by default, or <see cref="Params.Named"/>) in metadata. A <c>NullType</c>-typed
+    /// field is the ANY sentinel: DuckDB passes the value UNCAST and its runtime type is preserved (the
+    /// convention shared with the table/in-out bind paths — e.g. an "accept a STRUCT or a JSON string"
+    /// parameter). Only SUPPLIED named parameters reach <see cref="GenerateSql"/>.
     /// </summary>
     Schema Parameters { get; }
-
-    /// <summary>Optional NAMED parameters (<c>fn(x, by_name := true)</c>), with their Arrow types. Only the
-    /// SUPPLIED ones reach <see cref="GenerateSql"/>; a named parameter is how an optional argument is
-    /// expressed (there is no positional-default mechanism for table functions).</summary>
-    Schema NamedParameters => new Schema(System.Array.Empty<Field>(), metadata: null);
 
     /// <summary>
     /// Generates the replacement SQL for one call. <paramref name="args"/> is a single (1-row) batch: the
@@ -81,11 +78,8 @@ public interface ICatalogSqlTableFunction
     /// <summary>Function name, resolved as <c>db.SchemaName.Name(args)</c>.</summary>
     string Name { get; }
 
-    /// <summary>The positional argument fields — see <see cref="ISqlTableFunction.Parameters"/>.</summary>
+    /// <summary>The call signature — see <see cref="ISqlTableFunction.Parameters"/>.</summary>
     Schema Parameters { get; }
-
-    /// <summary>Optional named parameters — see <see cref="ISqlTableFunction.NamedParameters"/>.</summary>
-    Schema NamedParameters => new Schema(System.Array.Empty<Field>(), metadata: null);
 
     /// <summary>
     /// Generates the replacement SQL for one call. <paramref name="ctx"/> carries the catalog's ATTACH alias and

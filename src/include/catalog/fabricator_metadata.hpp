@@ -66,14 +66,27 @@ struct FabricatorMacroInfo {
 //! that does not serve the kind simply declares none, so the caller does not need its own guard.
 vector<FabricatorMacroInfo> DiscoverCatalogMacros(FabricatorHandle handle);
 
+//! How a declared parameter is passed at the call site. Read from the parameter FIELD's metadata
+//! (`fabricator.param_style`); ABSENT => POSITIONAL, so an unflagged schema behaves as it always did.
+//! Mirrors the managed `ParamStyle` (dotnet/Fabricator.Abstractions/ParamStyle.cs) — keep the two in step.
+enum class FabricatorParamStyle : uint8_t {
+	//! An ordinary positional argument.
+	POSITIONAL,
+	//! A DuckDB named parameter — `f(x := 1)`. Must follow every positional/table parameter (DuckDB's own
+	//! rule: "Unnamed parameters cannot come after named parameters").
+	NAMED,
+	//! The input TABLE of a table-in-out function. At most one, positional; DuckDB gives the subquery its own
+	//! argument slot (bind_table_function.cpp pushes a placeholder value), so following positions keep their
+	//! natural index.
+	TABLE_INPUT,
+};
+
 //! Resolves a scalar function's parameter names + DuckDB types from the Arrow schema of
 //! its (zero-row) param-schema stream — reuses the C# type mapping, no duplicate logic.
-//! When out_named is given, it also reports per parameter whether it is a NAMED (vs positional) parameter,
-//! read from the parameter FIELD's metadata (fabricator.named = "1"). Only SQL-generating (`table_sql`)
-//! functions declare both kinds; absent => positional, so every other function is unaffected.
+//! When out_styles is given, it also reports each parameter's style (see FabricatorParamStyle).
 void FetchFunctionParamSchema(ClientContext &context, FabricatorHandle handle, const string &schema_name,
                               const string &func_name, vector<string> &names, vector<LogicalType> &types,
-                              vector<bool> *out_named = nullptr);
+                              vector<FabricatorParamStyle> *out_styles = nullptr);
 
 //! Resolves a scalar function's return type from its (single-field) return-schema stream. When
 //! out_volatile is given it also reads the volatility signal riding the result FIELD's metadata

@@ -186,22 +186,27 @@ vector<FabricatorMacroInfo> DiscoverCatalogMacros(FabricatorHandle handle) {
 
 void FetchFunctionParamSchema(ClientContext &context, FabricatorHandle handle, const string &schema_name,
                               const string &func_name, vector<string> &names, vector<LogicalType> &types,
-                              vector<bool> *out_named) {
+                              vector<FabricatorParamStyle> *out_styles) {
 	ArrowSchema schema {};
 	fabricator::GetFunctionParamSchema(handle, schema_name, func_name, schema);
-	if (out_named) {
-		// Which parameters are NAMED rides each parameter FIELD's metadata (the same C-ABI channel as the
-		// volatility signal above): fabricator.named = "1". Only SQL-generating (`table_sql`) functions
-		// declare both kinds; absent => positional, so every other function is unaffected. Read BEFORE
+	if (out_styles) {
+		// A parameter's STYLE rides its FIELD metadata (the same C-ABI channel as the volatility signal
+		// above): fabricator.param_style = "named" | "table". Absent => positional. ONE schema per function
+		// carries all three kinds, so there is no second schema to align this against. Read BEFORE
 		// ReadArrowSchema consumes the struct.
-		out_named->clear();
+		out_styles->clear();
 		for (int64_t c = 0; c < schema.n_children; c++) {
-			bool named = false;
+			auto style = FabricatorParamStyle::POSITIONAL;
 			if (schema.children[c] && schema.children[c]->metadata) {
 				ArrowSchemaMetadata field_metadata(schema.children[c]->metadata);
-				named = field_metadata.GetOption("fabricator.named") == "1";
+				auto value = field_metadata.GetOption("fabricator.param_style");
+				if (value == "named") {
+					style = FabricatorParamStyle::NAMED;
+				} else if (value == "table") {
+					style = FabricatorParamStyle::TABLE_INPUT;
+				}
 			}
-			out_named->push_back(named);
+			out_styles->push_back(style);
 		}
 	}
 	fabricator::ReadArrowSchema(context, schema, types, names);

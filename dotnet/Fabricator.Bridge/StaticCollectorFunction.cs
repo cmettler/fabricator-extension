@@ -25,6 +25,16 @@ public abstract class StaticCollectorFunction : ICatalogCollectorTableFunction
     /// <summary>The declared input-table columns.</summary>
     public abstract Schema InputSchema { get; }
 
+    /// <summary>Optional constant "cost" args, declared as named parameters (e.g. <c>path := '…'</c>).</summary>
+    public virtual Schema NamedParameters { get; } = new Schema(System.Array.Empty<Field>(), metadata: null);
+
+    /// <summary>
+    /// The canonical signature: the input table as a <see cref="Params.TableInput"/> field, then any named
+    /// cost args. Composed here so a subclass keeps declaring the two halves it cares about.
+    /// </summary>
+    public Schema Parameters => Params.Combine(
+        new Schema(new[] { Params.TableInput("input", InputSchema) }, metadata: null), NamedParameters);
+
     /// <summary>The fixed output columns.</summary>
     public abstract Schema OutputSchema { get; }
 

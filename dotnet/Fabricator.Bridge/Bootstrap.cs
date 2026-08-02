@@ -1390,7 +1390,7 @@ public static unsafe class Bootstrap
                 kind.Append("inout");
                 stringOrder.Append("0");
                 body.Append(string.Empty);
-                paramCount.Append(fn.InputSchema.FieldsList.Count);
+                paramCount.Append(Params.DeclaredCount(fn.Parameters));
                 returnType.Append(string.Empty);
                 rows++;
             }
@@ -1400,7 +1400,7 @@ public static unsafe class Bootstrap
                 kind.Append("collector");
                 stringOrder.Append("0");
                 body.Append(string.Empty);
-                paramCount.Append(fn.InputSchema.FieldsList.Count);
+                paramCount.Append(Params.DeclaredCount(fn.Parameters));
                 returnType.Append(string.Empty);
                 rows++;
             }
@@ -1426,14 +1426,14 @@ public static unsafe class Bootstrap
             }
             // SQL-GENERATING table functions (v68): registered with bind_replace only — the call is rewritten
             // into generated SQL at bind time. param_count is POSITIONAL + NAMED (the host splits them by the
-            // per-field fabricator.named tag on the param schema); no return type (the plan decides it).
+            // per-field fabricator.param_style tag on the param schema); no return type (the plan decides it).
             foreach (var fn in GlobalFunctions.AllSqlTables())
             {
                 name.Append(fn.Name);
                 kind.Append("table_sql");
                 stringOrder.Append("0");
                 body.Append(string.Empty);
-                paramCount.Append(fn.Parameters.FieldsList.Count + fn.NamedParameters.FieldsList.Count);
+                paramCount.Append(Params.DeclaredCount(fn.Parameters));
                 returnType.Append(string.Empty);
                 rows++;
             }
