@@ -33,22 +33,55 @@ public static class ExternalTableRouting
     public static bool CanRoute => Host.CanQuery;
 
     /// <summary>
-    /// Composes the client-side table URI from the SQL-side EXTERNAL DATA SOURCE location
-    /// (<c>s3://host[:port]/</c> — host discarded, see class remarks) + the external table's LOCATION
-    /// (<c>/bucket/path/table</c>). Null when the data source is not <c>s3://</c> (not routable).
+    /// Composes the client-side table URI from the SQL-side EXTERNAL DATA SOURCE location + the external
+    /// table's LOCATION. Null when the data source is not a scheme we can write (not routable).
     /// </summary>
-    public static string? ComposeS3Uri(string? dataSourceLocation, string? tableLocation)
+    /// <remarks>
+    /// <para>Two schemes, and they compose DIFFERENTLY, which is the whole reason this is one function
+    /// rather than a prefix test:</para>
+    /// <list type="bullet">
+    ///   <item><c>s3://host[:port]/</c> — the host is SQL Server's network view and is DISCARDED; the
+    ///     table LOCATION already carries <c>/bucket/path</c>, so the client URI is
+    ///     <c>s3://bucket/path</c> and the DuckDB s3 secret's ENDPOINT is authoritative (the
+    ///     FABRICATOR_S3_ENDPOINT vs FABRICATOR_S3_SQL_ENDPOINT split).</item>
+    ///   <item><c>adls://&lt;fs&gt;@&lt;acct&gt;.dfs.core.windows.net</c> — the authority is NOT discarded:
+    ///     it names the filesystem and the real endpoint, and the table LOCATION is only the path WITHIN
+    ///     that filesystem. So the client URI is the authority re-spelled as
+    ///     <c>abfss://&lt;fs&gt;@&lt;acct&gt;…/&lt;location&gt;</c> — the same account, addressed by the
+    ///     scheme our filesystem understands. (SQL Server rejects <c>abfss://</c> as a LOCATION and we
+    ///     reject <c>adls://</c> as a root; the two never agree on a spelling, only on an account.)</item>
+    /// </list>
+    /// <para><b><c>abs://</c> (the blob endpoint) is deliberately NOT routed.</b> It names the same account
+    /// through <c>.blob.core.windows.net</c>, and turning that into a DFS endpoint means rewriting the host
+    /// — safe for the public cloud and wrong for sovereign clouds, private endpoints and any custom DNS. A
+    /// clean "not routable" beats a guessed hostname that writes somewhere unintended; use an
+    /// <c>adls://</c> data source for a writable external table. It stays fully READABLE either way.</para>
+    /// </remarks>
+    public static string? ComposeStorageUri(string? dataSourceLocation, string? tableLocation)
     {
         if (string.IsNullOrWhiteSpace(dataSourceLocation) || string.IsNullOrWhiteSpace(tableLocation))
         {
             return null;
         }
-        if (!dataSourceLocation!.TrimStart().StartsWith("s3://", StringComparison.OrdinalIgnoreCase))
+        var src = dataSourceLocation!.Trim();
+        var rel = tableLocation!.Replace('\\', '/').Trim('/');
+        if (rel.Length == 0)
         {
             return null;
         }
-        var rel = tableLocation!.Replace('\\', '/').Trim('/');
-        return rel.Length == 0 ? null : "s3://" + rel;
+        if (src.StartsWith("s3://", StringComparison.OrdinalIgnoreCase))
+        {
+            return "s3://" + rel;
+        }
+        const string adls = "adls://";
+        if (src.StartsWith(adls, StringComparison.OrdinalIgnoreCase))
+        {
+            var authority = src.Substring(adls.Length).TrimEnd('/');
+            // Require <filesystem>@<host>: without the '@' this is not an addressable ADLS Gen2 endpoint and
+            // we would silently build a nonsense abfss URI.
+            return authority.Contains('@') ? "abfss://" + authority + "/" + rel : null;
+        }
+        return null;
     }
 
     /// <summary>
@@ -62,13 +95,7 @@ public static class ExternalTableRouting
     public static long AppendDelta(string tableUri, IArrowArrayStream data, bool checkConstraints, long txnId)
     {
         var uri = tableUri.TrimEnd('/');
-        int slash = uri.LastIndexOf('/');
-        if (slash <= "s3://".Length)
-        {
-            throw new ArgumentException($"external delta table URI '{tableUri}' has no parent folder.");
-        }
-        string root = uri.Substring(0, slash);
-        string leaf = uri.Substring(slash + 1);
+        var (root, leaf) = SplitTable(uri);
         Log.LogInformation("external delta append: {Uri} (root={Root}, table={Leaf})", uri, root, leaf);
         var catalog = BackendRegistry.Resolve("delta").OpenCatalog(root, "{\"native_write\":\"true\"}");
         try
@@ -441,15 +468,25 @@ public static class ExternalTableRouting
         }
     }
 
+    /// <summary>Splits <c>&lt;root&gt;/&lt;table&gt;</c>, rejecting a URI with no parent folder.</summary>
+    /// <remarks>
+    /// The check is on the SHAPE of what remains, not on a scheme's length: the old form
+    /// (<c>slash &lt;= "s3://".Length</c>) hardcoded s3's prefix and would wave through
+    /// <c>abfss://fs@host</c> — whose last slash sits inside <c>://</c> — producing the root <c>abfss:/</c>
+    /// and a "table" named after the host. Requiring the root to still be a scheme + non-empty authority
+    /// catches that for every scheme.
+    /// </remarks>
     private static (string Root, string Leaf) SplitTable(string tableUri)
     {
         var uri = tableUri.TrimEnd('/');
         int slash = uri.LastIndexOf('/');
-        if (slash <= "s3://".Length)
+        string root = slash < 0 ? string.Empty : uri.Substring(0, slash);
+        int scheme = root.IndexOf("://", StringComparison.Ordinal);
+        if (slash < 0 || scheme < 0 || root.Length <= scheme + 3)
         {
             throw new ArgumentException($"external delta table URI '{tableUri}' has no parent folder.");
         }
-        return (uri.Substring(0, slash), uri.Substring(slash + 1));
+        return (root, uri.Substring(slash + 1));
     }
 
     /// <summary>

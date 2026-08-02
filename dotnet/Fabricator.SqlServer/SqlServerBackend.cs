@@ -1247,7 +1247,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 keys.Dispose();
                 throw;
             }
-            return ExternalTableRouting.DeleteByIdentity(extDel.S3Uri!, delIdCol, keys, AmbientTransaction.Current);
+            return ExternalTableRouting.DeleteByIdentity(extDel.StorageUri!, delIdCol, keys, AmbientTransaction.Current);
         }
         // Cancel a long rowid DELETE (many chunked batches) on query interrupt. The opener is fresh here (the
         // modify operator's Finalize calls FabricatorSetActiveTxn -> SetActiveOpener). See docs/cancellation.md.
@@ -1350,7 +1350,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 data.Dispose();
                 throw;
             }
-            return ExternalTableRouting.UpdateByIdentity(extUpd.S3Uri!, updIdCol, setColumnCount, data);
+            return ExternalTableRouting.UpdateByIdentity(extUpd.StorageUri!, updIdCol, setColumnCount, data);
         }
         // Cancel a long rowid UPDATE (one statement per matched row) on query interrupt. Opener is fresh (the
         // modify Finalize's FabricatorSetActiveTxn -> SetActiveOpener). See docs/cancellation.md.
@@ -1996,7 +1996,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     private sealed record ExternalTableInfo(string? TableLocation, string? DataSourceLocation, string? FormatType,
                                             string? IdentityColumn)
     {
-        public string? S3Uri => ExternalTableRouting.ComposeS3Uri(DataSourceLocation, TableLocation);
+        public string? StorageUri => ExternalTableRouting.ComposeStorageUri(DataSourceLocation, TableLocation);
         public bool IsDelta => string.Equals((FormatType ?? "").Trim(), "DELTA", StringComparison.OrdinalIgnoreCase);
     }
 
@@ -2045,7 +2045,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 // slice D: a Delta IDENTITY column on the target enables identity-keyed UPDATE/DELETE —
                 // it becomes the entry's rowid (a real, PolyBase-readable data column). One `_delta_log`
                 // open, cached with the probe.
-                if (info.IsDelta && info.S3Uri is { } uri)
+                if (info.IsDelta && info.StorageUri is { } uri)
                 {
                     info = info with { IdentityColumn = ExternalTableRouting.FindDeltaIdentityColumn(uri) };
                 }
@@ -2086,10 +2086,13 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 + "(its own Delta commit / parquet file) and cannot roll back with an explicit "
                 + "transaction — COMMIT first (autocommit only).");
         }
-        var uri = ExternalTableRouting.ComposeS3Uri(ext.DataSourceLocation, ext.TableLocation)
+        var uri = ExternalTableRouting.ComposeStorageUri(ext.DataSourceLocation, ext.TableLocation)
             ?? throw new NotSupportedException(
                 $"external table {schemaName}.{tableName} over data source location "
-                + $"'{ext.DataSourceLocation}' is not routable (s3:// data sources only).");
+                + $"'{ext.DataSourceLocation}' is not routable — writable external tables need an "
+                + "s3:// or adls:// data source. (abs:// names the same ADLS account through the blob "
+                + "endpoint; deriving its DFS host would be a guess, so use adls:// to write. Reads work "
+                + "on either.)");
         if (!ExternalTableRouting.CanRoute)
         {
             throw new NotSupportedException(

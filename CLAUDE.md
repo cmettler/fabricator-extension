@@ -705,7 +705,7 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     is a mechanical ~6-signature cleanup left for later, deliberately not mixed into a behaviour change.
 - **PLAIN (non-OneLake) ADLS Gen2 SUPPORT — BUILT + LIVE-VALIDATED 2026-08-02. Full record:
   [docs/delta-transactions.md](docs/delta-transactions.md) §8.4; gate `test/verify_delta_catalog_adls.test`
-  (52, manual/live-account tier).** A Delta catalog on `abfss://<fs>@<account>.dfs.core.windows.net/…` —
+  (140, manual/live-account tier).** A Delta catalog on `abfss://<fs>@<account>.dfs.core.windows.net/…` —
   a plain storage account, not a Fabric lakehouse. It LOOKED like it already worked (attach, discovery,
   CTAS, INSERT, DELETE, DROP and both parquet directions through duckdb-azure all passed first try); two
   things did not.
@@ -912,10 +912,12 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   loadable = literally one file, no trampoline (experimental, later). Composes with the
   distribution installer (payload → core + one native lib, no .NET probing).
 - **`CREATE TABLE … WITH (…)` options + SQL Server EXTERNAL TABLES — ALL FOUR SLICES DONE (ABI v67).**
-  WITH write-tuning/CREATE-flag-overrides/TBLPROPERTIES on Delta; S3 external-table INSERT/identity-keyed
-  UPDATE+DELETE routing to storage; the CETAS-analog `WITH (location=…, table_type=…)` DDL.
+  WITH write-tuning/CREATE-flag-overrides/TBLPROPERTIES on Delta; external-table INSERT/identity-keyed
+  UPDATE+DELETE routing to storage — **`s3://` AND (since 2026-08-02) `adls://`**, see the ADLS Gen2
+  data-virtualization entry for why that took two gates and not one; the CETAS-analog
+  `WITH (location=…, table_type=…)` DDL.
   [docs/create-table-with-options.md](docs/create-table-with-options.md); gates verify_with_options 68 +
-  verify_mssql_s3_polybase 252. Full as-built record (moved verbatim from here): [docs/feature-history.md](docs/feature-history.md).
+  verify_mssql_s3_polybase 252 + verify_mssql_adls_polybase 140. Full as-built record (moved verbatim from here): [docs/feature-history.md](docs/feature-history.md).
 - **SQL-GENERATING TABLE FUNCTIONS — DONE (ABI v68 `generate_table_sql`, global + catalog-bound).** The
   call DISAPPEARS at bind (`bind_replace` → SubqueryRef); arg-dependent schema + full pushdown for free.
   Rule: fixed SQL text + varying VALUES ⇒ macro; SQL TEXT depends on args ⇒ sqlgen.
@@ -1651,7 +1653,7 @@ VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
   (docker/README.md). Connstr needs `TrustServerCertificate=true;Encrypt=true`. `sqlcmd` v18 in-container:
   `docker exec mssql-fabricator /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Arrow_Net_123!' -C`.
 - **ADLS Gen2 / SQL Server data virtualization — BUILT + LIVE-VALIDATED 2026-08-02. Gate
-  `test/verify_mssql_adls_polybase.test` (71, manual/live-account tier).** The abfss analogue of the S3
+  `test/verify_mssql_adls_polybase.test` (140, manual/live-account tier).** The abfss analogue of the S3
   PolyBase circle below: our Delta provider CTASes a protocol-1.0 table to an Azure storage account, then
   `fabricator_exec` provisions MASTER KEY + DATABASE SCOPED CREDENTIAL + EXTERNAL DATA SOURCE + EXTERNAL
   FILE FORMAT, and SQL Server reads it through `OPENROWSET(FORMAT='DELTA')` **and** a `CREATE EXTERNAL
@@ -1670,7 +1672,29 @@ VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
     by a different scheme AND a container-relative path than we do): `FABRICATOR_ADLS_SQL_LOCATION` +
     `FABRICATOR_ADLS_SQL_PREFIX` beside `FABRICATOR_ADLS_ROOT`/`_CONNSTR`, plus `FABRICATOR_ADLS_SAS`.
   - **A dropped EXTERNAL TABLE does NOT delete the underlying data** (user, 2026-08-02) — which is what
-    makes this suite re-runnable, and means storage cleanup is a separate, storage-side act.
+    makes this suite re-runnable, and means storage cleanup is a separate, storage-side act. Its
+    DEPENDENCY CHAIN does bite though: table → data source → credential, refused in that order (33165 /
+    33164), so SETUP must clear the whole chain, not just teardown — a run that dies mid-suite leaves it.
+  - **WRITE-BACK (slice C/D) now works on ADLS too — it did NOT, and it failed in a MISLEADING PLACE.**
+    Identity-keyed UPDATE/DELETE and routed INSERT through a SQL Server external table were gated on
+    `ComposeS3Uri`, which returns null for any non-s3 data source. **Two gates, not one**: the write
+    routing AND the identity discovery (`if (info.IsDelta && info.S3Uri is { } uri)`), and the identity one
+    fires FIRST — so the symptom was not "not routable" but *"UPDATE/DELETE requires a table with a primary
+    key or unique index"*, a message about the SQL side that says nothing about the real cause. Generalized
+    to `ComposeStorageUri`. Live: UPDATE, DELETE, routed INSERT, and both engines agreeing on the final
+    state; mutation-tested (removing the adls arm reproduces the original binder error at that exact line).
+    - **⚠ The two schemes COMPOSE DIFFERENTLY, which is why it is one function and not a prefix test.**
+      `s3://` DISCARDS the data-source host (SQL Server's network view; the table LOCATION already carries
+      `/bucket/path`). `adls://` KEEPS the authority — it names the filesystem and the real endpoint — and
+      the LOCATION is only the path within it, so the client URI is that authority re-spelled `abfss://`.
+    - **`abs://` is deliberately NOT routable for WRITES** (reads are fine): deriving a DFS host from
+      `.blob.core.windows.net` is right for the public cloud and wrong for sovereign clouds, private
+      endpoints and custom DNS. A clean "not routable" beats a guessed hostname that writes elsewhere.
+    - En route: `SplitTable`'s parent-folder guard was `slash <= "s3://".Length` — a hardcoded scheme
+      length that would wave through `abfss://fs@host` (whose last slash sits inside `://`), yielding the
+      root `abfss:/` and a "table" named after the host. Now checks the SHAPE of what remains.
+    - The routed INSERT's identity value is **engine-assigned**: an explicitly supplied value is ignored
+      and the row continues the table's own high-water mark (pinned — the suite inserts 99 and gets 5).
   - This pass is also what CORRECTED the DV/column-mapping conflation recorded under the S3 entry below.
 - **S3 / MinIO / SQL Server data virtualization (2026-07-10).** `httpfs` is now statically linked
   (`extension_config.cmake` — out-of-tree pin `duckdb-httpfs @ 827222fb` since the 1.5.5 bump, always

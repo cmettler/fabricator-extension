@@ -91,10 +91,19 @@ SELECT fabricator_exec('${MSSQL_TESTDB_DSN}',
   'IF NOT EXISTS (SELECT * FROM sys.symmetric_keys WHERE name = ''##MS_DatabaseMasterKey##'')
      CREATE MASTER KEY ENCRYPTION BY PASSWORD = ''Arrow_Net_123!''');
 
+# Drop EVERY external table over this data source before the data source itself: SQL Server refuses with
+# 33165 while any still references it, and it refuses the CREDENTIAL (33164) while the data source does.
+# The dependency chain is table -> data source -> credential, and a run that dies mid-suite leaves the
+# whole chain behind — so setup must clear it, not just teardown.
 statement ok
 SELECT fabricator_exec('${MSSQL_TESTDB_DSN}',
   'IF EXISTS (SELECT * FROM sys.external_tables WHERE name = ''adls_delta_trips'')
      DROP EXTERNAL TABLE dbo.adls_delta_trips');
+
+statement ok
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}',
+  'IF EXISTS (SELECT * FROM sys.external_tables WHERE name = ''adls_iddml'')
+     DROP EXTERNAL TABLE dbo.adls_iddml');
 
 statement ok
 SELECT fabricator_exec('${MSSQL_TESTDB_DSN}',
@@ -257,6 +266,105 @@ SELECT * FROM fabricator_query('${MSSQL_TESTDB_DSN}',
 3
 
 # ----------------------------------------------------------------------------
+# 5b. WRITE-BACK through the external table: identity-keyed UPDATE/DELETE + routed INSERT.
+#
+#     SQL Server external tables are READ-ONLY to SQL Server itself, so these DML statements are served by
+#     writing DIRECTLY to the storage the table points at, while SQL Server keeps serving the reads. The
+#     Delta IDENTITY column is what makes UPDATE/DELETE possible at all: the external table has no
+#     PK/UNIQUE SQL-side, but an engine-assigned identity column is a real, PolyBase-readable data column,
+#     so it becomes the entry's rowid and bridges the two rowid domains (identity values are
+#     snapshot-independent, so the two sides never have to agree on a version).
+#
+#     ⚠ This did NOT work on ADLS until 2026-08-02, and it failed EARLIER than expected. Both the identity
+#     discovery and the write routing were gated on a `ComposeS3Uri` that returned null for any non-s3 data
+#     source, so the first symptom was not "not routable" but a binder error claiming the table had no
+#     primary key — a message that describes the SQL side and says nothing about the real cause. The two
+#     schemes also COMPOSE DIFFERENTLY, which is why one function now handles both: s3 DISCARDS the data
+#     source host (the table LOCATION already carries /bucket/path), while adls KEEPS the authority (it
+#     names the filesystem and endpoint) and the LOCATION is only the path within it.
+#
+#     Every statement below reads back THROUGH SQL Server, so each also re-pins that copy-on-write DML
+#     leaves the table protocol-1.0 readable.
+# ----------------------------------------------------------------------------
+
+statement ok
+DROP TABLE IF EXISTS pb.main.iddml;
+
+statement ok
+CREATE TABLE pb.main.iddml (id BIGINT AS (0), name VARCHAR, val INTEGER);
+
+statement ok
+INSERT INTO pb.main.iddml (name, val) VALUES ('a', 1), ('b', 2), ('c', 3), ('d', 4);
+
+statement ok
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}',
+  'IF OBJECT_ID(''dbo.adls_iddml'') IS NOT NULL DROP EXTERNAL TABLE dbo.adls_iddml');
+
+statement ok
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}',
+  'CREATE EXTERNAL TABLE dbo.adls_iddml (id BIGINT, name VARCHAR(20), val INT)
+     WITH (LOCATION = ''${FABRICATOR_ADLS_SQL_PREFIX}/iddml'', DATA_SOURCE = adls_ds,
+           FILE_FORMAT = DeltaFileFormat)');
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS sqldml (TYPE fabricator);
+
+query ITI
+SELECT id, name, val FROM sqldml.dbo.adls_iddml ORDER BY id;
+----
+1	a	1
+2	b	2
+3	c	3
+4	d	4
+
+# UPDATE: scanned through SQL Server, resolved back to a Delta rowid, applied on the storage side
+statement ok
+UPDATE sqldml.dbo.adls_iddml SET val = 99 WHERE name = 'b';
+
+query ITI
+SELECT id, name, val FROM sqldml.dbo.adls_iddml ORDER BY id;
+----
+1	a	1
+2	b	99
+3	c	3
+4	d	4
+
+statement ok
+DELETE FROM sqldml.dbo.adls_iddml WHERE name = 'c';
+
+query ITI
+SELECT id, name, val FROM sqldml.dbo.adls_iddml ORDER BY id;
+----
+1	a	1
+2	b	99
+4	d	4
+
+# INSERT routes to storage as its own Delta commit. The identity value is ENGINE-ASSIGNED: the 99 supplied
+# here is ignored and the row lands as id=5, continuing the table's own high-water mark.
+statement ok
+INSERT INTO sqldml.dbo.adls_iddml (id, name, val) VALUES (99, 'e', 5);
+
+query ITI
+SELECT id, name, val FROM sqldml.dbo.adls_iddml ORDER BY id;
+----
+1	a	1
+2	b	99
+4	d	4
+5	e	5
+
+# ...and the Delta side agrees exactly — the same table read by the other engine, no version negotiation.
+query ITI
+SELECT id, name, val FROM pb.main.iddml ORDER BY id;
+----
+1	a	1
+2	b	99
+4	d	4
+5	e	5
+
+statement ok
+DETACH sqldml;
+
+# ----------------------------------------------------------------------------
 # 6. THE SCHEME TRAP: `abfss://` is NOT a valid LOCATION for SQL Server.
 #
 #    Worth pinning because abfss:// is exactly what everyone writes — it is the scheme Spark, Databricks and
@@ -276,6 +384,9 @@ SELECT fabricator_exec('${MSSQL_TESTDB_DSN}',
 
 statement ok
 SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'DROP EXTERNAL TABLE dbo.adls_delta_trips');
+
+statement ok
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'DROP EXTERNAL TABLE dbo.adls_iddml');
 
 statement ok
 SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'DROP EXTERNAL DATA SOURCE adls_ds');

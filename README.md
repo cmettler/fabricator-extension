@@ -1399,6 +1399,26 @@ enough. `BULK` is container-relative (the leading `/` is optional). A `CREATE EX
 location can then be read back through an ATTACHed `fabricator` catalog as an ordinary table — and dropping
 that external table removes only the metadata, never the data.
 
+**Writing through the external table.** SQL Server external tables are read-only to SQL Server itself, but
+this extension serves `INSERT`/`UPDATE`/`DELETE` against one by writing directly to the storage it points
+at, while SQL Server keeps serving the reads. `UPDATE`/`DELETE` need a row identity, and an external table
+has no SQL-side key — so give the Delta table an **identity column** (`id BIGINT AS (0)`), which is a real,
+readable data column and becomes the rowid:
+
+```sql
+CREATE TABLE lake.main.iddml (id BIGINT AS (0), name VARCHAR, val INTEGER);  -- on the Delta catalog
+-- ...create the external table over it, then through the ATTACHed SQL Server catalog:
+UPDATE sqldb.dbo.adls_iddml SET val = 99 WHERE name = 'b';
+DELETE FROM sqldb.dbo.adls_iddml WHERE name = 'c';
+INSERT INTO sqldb.dbo.adls_iddml (name, val) VALUES ('e', 5);   -- identity is engine-assigned
+```
+
+Works over `s3://` and `adls://` data sources. **`abs://` is readable but not writable** — it reaches the
+same account through the blob endpoint, and deriving the DFS host from it would be a guess that is wrong
+for sovereign clouds, private endpoints and custom DNS, so it reports "not routable" instead. Use an
+`adls://` data source when you want to write. Supplying a value for the identity column on `INSERT` is
+ignored; the engine assigns the next one.
+
 ### Liquid clustering (SORTED BY, bucket, hilbert_index)
 
 Delta tables can be **ordered-on-write** and **clustered on OPTIMIZE** for tight per-file min/max (data
