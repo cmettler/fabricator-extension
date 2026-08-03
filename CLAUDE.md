@@ -76,9 +76,79 @@ merge-upstream-into-fabricator-patches + re-pin. **⚠ That upstream branch is n
 `upstream/main`, NOT `master`** — upstream renamed it (`8caf8d8`) and the stale `upstream/master`
 remote-tracking ref still resolves, so a merge of it silently lands on an abandoned branch.
 **Current pin: `d9d204b`** (the 2026-08-02 bump, the `MetadataPredicate` removal, and upstream #52+#53,
-§THE 2026-08-02 BUMP below). **Patch set MEASURED 2026-08-02 after that removal: +867 / −44 lines across 8 files**, of which the
-variant transport is ~44% (`VariantTransport.cs` 322 + `SchemaConverter` 47 + `DeltaTableOptions` 15 +
-csproj 5) and `DeltaTable.cs` 409 the other block. **`MetadataPredicate` (182 lines) is GONE** — the
+§THE 2026-08-02 BUMP below). **Patch set MEASURED 2026-08-03: +649 / −44 lines across 8 files**, of which the
+variant transport is now ~60% (`VariantTransport.cs` 322 + `SchemaConverter` 47 + `DeltaTableOptions` 15 +
+csproj 5) and `DeltaTable.cs` 229 changed lines the other block.
+- **⚠ THE MERGE-ON-READ UPDATE LEFT EW (2026-08-03) — the audit's "DO NOT MOVE IT TO THE BRIDGE" verdict was
+  WRONG and is reversed. Full record: [docs/ew-master-migration.md](docs/ew-master-migration.md) §THE
+  `*BySelection*` QUESTION.** `UpdateBySelectionViaVectorsAsync` + `BuildInlineDeletionVectorsAsync` (218 lines)
+  are GONE; the Bridge now COMPOSES the same effect from PUBLIC, UPSTREAM API —
+  `ReadRowsAsync(RowSelection, …)` + `WriteDataFilesAsync(…, materializedRowIds:)` +
+  `DeltaTransaction.StageRowDeletesAsync`/`StageDataFilesAsync`/`StageChangeDataAsync` + `CommitAsync`. The
+  error to not repeat: the audit asked whether the METHOD BODY could be RELOCATED (which does need EW's
+  `internal` DV core) instead of whether the EFFECT could be COMPOSED — and `StageRowDeletesAsync` is a PUBLIC
+  door onto exactly that core. The **buffered path already did it this way**, so autocommit was the outlier.
+  Gains, because the retired method CAS'd on `expectedVersion`: the OCC retry loop was *disabled* by that
+  argument, no DV edits were recorded (⇒ **no row-level reconciliation on this path at all**), and the table's
+  own `delta.isolationLevel` was ignored — now honoured via a shared `DeltaReader.EffectiveSerializable` that
+  `DeltaCatalog` delegates to, resolved from the config the path already reads (no extra `_delta_log` LIST).
+  ⚠ The concurrency gain is a MECHANISM claim, NOT measured — see the substrate finding below.
+  **`WriteChangeDataFilesAsync` (45 lines) STAYS for now**: the buffered CDF path needs it. ⚠ A grep of EW alone
+  called it self-contained; **the second consumer was in the Bridge — grep both trees.**
+  - **`StageChangeDataAsync` does not fit the buffered path** (asked 2026-08-03): it is a method ON
+    `DeltaTransaction` and the buffered path has none at statement time (created at FLUSH,
+    `DeltaCatalog.cs:3653`); and deferring the call to flush would hold the pre/post-image ROWS in memory until
+    COMMIT, which eager CDC capture (slice C2) exists to avoid. It also RETURNS NOTHING — `StageInternal` files
+    the actions into that transaction — while we need the `CdcFile` list back to park on `pending.PendingCdc`.
+    - **⚠ A THIRD REASON RECORDED HERE WAS FALSE, exposed by asking "would an OCC retry rewrite the CDF
+      parquets?" (answer: NO).** It claimed an early transaction "fights the flush's OCC retry, which reopens at
+      latest". **`FlushDmlTransactionAsync` has NO retry loop** — the retry is inside `txn.CommitAsync`, which
+      re-rebases from the ORIGINAL staged actions and never re-runs staging (`DeltaCatalog.cs:3777`). The false
+      reason described a hand-rolled loop that moved into EW, and came from mistaking the OTHER retry loop
+      (`:2720`, around `CommitDataFilesAsync`) for the flush's. ⇒ an early-created, long-lived transaction per
+      (txn, table) COULD use `StageChangeDataAsync`; that is an ARCHITECTURAL change (one open EW transaction per
+      table for the DuckDB transaction's life, each pinning a snapshot, all aborted on ROLLBACK), not an
+      impossibility. **Frame the offer as "the smallest change that preserves the current architecture."**
+  - ⚠ **And EW's own autocommit DML does NOT use `StageChangeDataAsync` either** — `DeleteRowsAsync`/
+    `UpdateRowsAsync`/appends call the internal `ChangeDataFeed.CdfWriter.WriteAsync` DIRECTLY (7 sites) and fuse
+    the actions into their own commit; `StageChangeDataAsync` is HOST-facing (its only in-EW use is its own body,
+    `DeltaTransaction.cs:499`). The one autocommit path using it is OURS. Don't state those as one mechanism.
+  - **THE OFFER: make the internal PLURAL public — upstream already HAS it.**
+    `WriteChangeDataFilesForAsync` (`DeltaTable.cs:5760`, `internal`) IS the partition-splitting plural and is what
+    `StageChangeDataAsync` calls, so **our 45 lines are essentially a public duplicate of it**. Blocker on exposing
+    it verbatim: its trailing `WrittenFileLedger?` param is an `internal` type ⇒ offer a public overload WITHOUT it
+    (that ledger is abort-time orphan reclamation, which a buffer-parking caller has no use for). Bonus: it already
+    takes `rowIds`/`rowCommitVersions` — the CDF identity our feed currently leaves NULL. **This supersedes an
+    earlier recommendation here to make `PartitionUtils` public**, which would have worked but duplicated ~25 lines
+    of split + logical→physical re-key in the Bridge. ⚠ **Do not hand-roll the split** — the risk is Delta's
+    partition-value STRING ENCODING matching what EW writes for data files; the Bridge only ever READS those values
+    from `RETURN_STATS.partition_keys`, never formats them.
+  Gates: hermetic **63/63 — 5686** (byte-identical to pre-change ⇒ behaviour-preserving), EW Table.Tests
+  **877 → 872** (exactly the 5 tests of the retired member). **`RowUpdateMode` is SOLVED BY REMOVAL and is OFF the
+  offer list** — no divergence left for it to retire and no need for it, so do NOT bring it; spending credibility on
+  a request we do not need weakens the ones we do.
+- **⚠ LOCAL WINDOWS ROOTS ARE NOT MULTI-WRITER SAFE — measured 2026-08-03, INDEPENDENT of the above, found while
+  trying to measure it ([docs/delta-transactions.md](docs/delta-transactions.md) §8.5).**
+  `fabricator_fs_write_probe` on `D:\` reports `EXCLUSIVE_CREATE` **succeeding on an existing file** AND
+  `MoveFile` **overwriting** its target ⇒ neither commit primitive is conditional. Measured: 6 writers × 3
+  autocommit INSERTs × 50 rows ⇒ **400 of 900 rows landed, 500 silently lost, every writer exited 0** — the
+  secretless-S3 shape. Second symptom on the same cause: a concurrent reader parses a commit **mid-write**
+  (`BytePositionInLine: 9` is the length of `{"remove"`), so a log re-read fails with torn JSON rather than a
+  conflict. The §8 table's "Local POSIX" row was never wrong — `O_EXCL` is a POSIX guarantee — but nothing said
+  anything about Windows and "local" reads as covering it. **Consequence: a local Windows root cannot host any
+  multi-writer experiment** (the substrate swamps both legs of an A/B); use OneLake/abfss, S3 with a NAMED
+  secret, or WSL. Single-writer behaviour is unaffected (the whole hermetic tier is green).
+  - **⚠ AND `fabricator_fs_write_probe` HAS A FALSE-POSITIVE MODE — FOUND, NOT FIXED (§8.5a).** Aimed at a path
+    whose parent does not exist, `exclusive_create_existing_fails` reports **`true` ("put-if-absent works")**
+    because the exclusive open threw for a MISSING DIRECTORY — the verdict is recorded as "it threw"
+    (`fabricator_fs_spike.cpp:534`) without checking that the file exists at all. It fails in the UNSAFE
+    direction. `create_directory` and `file_exists` likewise report `ok=true` while their own detail says they
+    failed (`run()` records ok = "did not throw", and those two RETURN a failure message instead of throwing).
+    Fix is small (gate the verdict on `FileExists`, make the two steps throw on their invariant) and was
+    deliberately NOT taken in a C#-only pass. **Found by running the README example verbatim** — the
+    "run the README's SQL before committing it" rule paying for itself. Until fixed: confirm `create_directory`
+    and `write_create` are both `true` before believing the verdict.
+**`MetadataPredicate` (182 lines) is GONE** — the
 predicate lowering was unreachable from a rowid-keyed host (its job is to PRODUCE the `RowSelection` we
 already hold), so it cost divergence for a path we can never take; removing it does not foreclose OFFERING
 it, since `offer/*` branches cut off `upstream/main` and history keeps the file. What the patches carry: the **`DeltaTable.PlanFiles`
@@ -185,6 +255,26 @@ EW Table.Tests **828/828 on net8.0 AND net472**, DeltaLake.Tests 248, hermetic *
    `verify_delta_row_level_concurrency` §11 was written before the migration for exactly that reason
    (82 → 93). **`DeclareFilesRead` (#25) does NOT retire it** — declaring the files a scan touched drops the
    APPEND rule, which is the phantom-row protection `serializable` (our default) exists for.
+   - **⚠ AND `DeclareWholeTableRead` DOES NOT REPLACE IT EITHER — that one is UPSTREAM and ours NARROWS it**
+     (upstream's own doc calls the narrowing a downstream proposal it has not implemented). They are a pair.
+     **OFFER OUR PROPERTY AS-IS**: it is NOT an API inconsistency but a **DEPARTURE** from Delta's
+     `concurrentDeleteRead` rule (honoured at BOTH levels by Delta and EW; Spark gates only `concurrentAppend` on
+     the level), and it is already the *"explicit per-transaction opt-in rather than an inference"* shape upstream
+     said it would require. **A `DeclareWholeTableRead(forAppends:, forRemoves:)` "facet split" was proposed here
+     and is RETRACTED** (2026-08-03): writing the call site showed we cannot make the judgment it hands us
+     (`ReadWholeTable` is set by ANY unfiltered scan, `DeltaCatalog.cs:1412`), and `forRemoves: false` is precisely
+     the *"claim on a host's behalf that it read less than it declared"* upstream objected to. It was the reframe
+     pass's own caveat violated — a semantics request dressed as an inconsistency.
+   - **⚠ OVER-BROAD OPT-IN IN WHAT WE SHIP (reasoned, NOT measured, untested) — but INERT UNDER OUR DEFAULT.**
+     The Bridge sets the opt-in **UNCONDITIONALLY** (`DeltaCatalog.cs:3775`) while the departure is justified by
+     ROW-LOCALITY. EW's gate is three-way (`DeltaTable.cs:2404`):
+     `exempt && rowLevel && isolationLevel != Serializable` — and since the 2026-08-01 flip our default IS
+     `serializable`, so the flag is **ignored by default**; do not call this broken out of the box. It bites only
+     on `write_serializable` (ATTACH option or table property) plus a txn staging DV deletes, where
+     `BEGIN; SELECT avg(x) FROM t; DELETE FROM t WHERE x > 42; COMMIT;` gets exempted although the row-level
+     validation covers only the REMOVED rows, not a threshold derived from a whole-table read. Fixing it needs
+     provenance on `ReadWholeTable` (DML's own scan vs an arbitrary SELECT), which the buffer lacks today — a
+     behaviour change with its own test, deliberately not folded into the merge-on-read work.
 
 **⚠ OUR `_last_checkpoint` OFFER WAS MERGED (#32) AND THEN CORRECTED TWICE — ours is retired, upstream's is
 in.** #33 found the `Exists` probe ran BEFORE the try (so the fix did not fix the case it was written for)
@@ -1380,6 +1470,16 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   IDENTITY/CDF/same-txn-DML, and the partitioned×native_read partition-column bug fix. Gate
   verify_delta_catalog_transactions (now 941); semantics [docs/delta-transactions.md](docs/delta-transactions.md).
   Still immediate by design: identity creates, DROP/OPTIMIZE/VACUUM, CREATE-OR-REPLACE/partition-overwrite.
+  - **⚠ `BEGIN; CREATE; INSERT; COMMIT` LANDS AS TWO VERSIONS, NOT ONE — measured 2026-08-03
+    ([docs/delta-transactions.md](docs/delta-transactions.md) §7.1).** v0 = `protocol`+`metaData` (an EMPTY table),
+    v1 = the data; `FlushCreateTransactionAsync` calls `DeltaWriter.Create` UNCONDITIONALLY before writing, so both
+    of its branches do this. Consequences: a concurrent reader can observe the empty table, and **a v1 failure
+    leaves an empty committed table behind a transaction the user saw fail** — the inverse of every other flush
+    path (reasoned from the measured shape, not itself measured). **Not a protocol limit** — Delta permits
+    `protocol`+`metaData`+`add` in v0 — but an EW API-shape one: `StartTransaction` is an INSTANCE method needing
+    `OpenAsync`, so "a transaction that creates the table" is inexpressible, and `CreateAsync` writes v0 at once.
+    Fixing it needs an upstream static/factory transaction form, not something the Bridge can compose. It had
+    existed only as the inline comment *"v0 create + v1 write — today's flush shape"*.
   Full as-built record (moved verbatim from here): [docs/feature-history.md](docs/feature-history.md).
 - **Fabric-notebook AMBIENT AUTH — DONE + validated live.** All three providers work with ZERO
   credentials on Fabric compute via `FabricNotebookCredential` (the trident token service; per-scope

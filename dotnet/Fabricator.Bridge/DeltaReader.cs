@@ -989,13 +989,40 @@ internal static class DeltaReader
         // configuration mistake worth hearing about. Our one caller allocates sourceTrackingOut only under
         // TxnDmlProfile.MaterializeRowIds, i.e. only when the table declares the materialized columns, so
         // the two conditions line up. Keep them lined up.
+        await foreach (var batch in ReadSelectedRowsAsync(table, snapshot,
+                           SelectionFromRowIds(table, snapshot, rowIds, "row read-back",
+                                               skipUnresolvable: true),
+                           sourceTrackingOut, rowIdsOut, token).ConfigureAwait(false))
+        {
+            yield return batch;
+        }
+    }
+
+    /// <summary>
+    /// The scoped read-back itself, on an ALREADY-OPEN table and an already-built selection: reads only the
+    /// selected rows, resolving their addresses against <paramref name="snapshot"/>, and yields batches
+    /// carrying USER COLUMNS ONLY with the requested identities lifted into the out-params.
+    /// </summary>
+    /// <remarks>
+    /// Shared by the buffered-UPDATE read-back (which decodes rowids first) and the autocommit merge-on-read
+    /// UPDATE (which already holds the selection it is about to stage). Both correlate by the returned rowid,
+    /// never by position — batching and deletion-vector filtering each break positional correspondence.
+    /// <para>⚠ <paramref name="sourceTrackingOut"/> is what asks for <see cref="DeltaRowMetadata.RowTracking"/>,
+    /// and that ask is REFUSED on a table without row tracking. Allocate it only when the table declares the
+    /// materialized columns; the refusal is correct, and silence there would be the configuration mistake.</para>
+    /// </remarks>
+    private static async IAsyncEnumerable<RecordBatch> ReadSelectedRowsAsync(
+        DeltaTable table, EngineeredWood.DeltaLake.Snapshot.Snapshot snapshot, RowSelection selection,
+        List<(long?[] Ids, long?[] Versions)>? sourceTrackingOut,
+        List<long[]>? rowIdsOut,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
         var metadata = (rowIdsOut is null ? DeltaRowMetadata.None : DeltaRowMetadata.RowAddress)
                        | (sourceTrackingOut is null ? DeltaRowMetadata.None : DeltaRowMetadata.RowTracking);
         await foreach (var batch in table.ReadRowsAsync(
-                           SelectionFromRowIds(table, snapshot, rowIds, "row read-back",
-                                               skipUnresolvable: true),
+                           selection,
                            new DeltaRowReadOptions { Metadata = metadata, ResolveAgainst = snapshot },
-                           token)
+                           ct)
                            .ConfigureAwait(false))
         {
             if (metadata == DeltaRowMetadata.None)
@@ -2207,13 +2234,30 @@ internal static class DeltaReader
     /// Arrow types). EW rewrites only the files containing a matched row, substituting the SET columns keyed
     /// by rowid (type-agnostic; structs included) — no substitution code host-side. Opens with the standard
     /// write options (path_in_schema).</summary>
+    /// <param name="catalogSerializable">The catalog's ATTACH <c>isolation_level</c> default, used ONLY when the
+    /// table declares no <c>delta.isolationLevel</c> of its own. Passed rather than read here so the merge-on-read
+    /// path costs no extra <c>_delta_log</c> read: it resolves the precedence against the configuration it
+    /// already has in hand (<see cref="EffectiveSerializable"/>).</param>
     public static void UpdateByRowIds(nint opener, string path, RecordBatch updates, CancellationToken ct,
-        bool nativeWrite = false, bool nativeRead = false)
-        => UpdateByRowIdsAsync(opener, path, updates, ct, nativeWrite, nativeRead)
+        bool nativeWrite = false, bool nativeRead = false, bool catalogSerializable = false)
+        => UpdateByRowIdsAsync(opener, path, updates, ct, nativeWrite, nativeRead, catalogSerializable)
             .GetAwaiter().GetResult();
 
+    /// <summary>
+    /// The effective isolation for a table: its own <c>delta.isolationLevel</c> property WINS, and
+    /// <paramref name="catalogDefault"/> (the ATTACH <c>isolation_level</c>) applies only when the table
+    /// declares nothing. The ONE expression of that precedence — <c>DeltaCatalog</c> delegates here — because a
+    /// table that has DECLARED a level must not be weakened by a local attach-time option, whichever path
+    /// happens to be asking.
+    /// </summary>
+    internal static bool EffectiveSerializable(
+        IReadOnlyDictionary<string, string> config, bool catalogDefault)
+        => config.TryGetValue("delta.isolationLevel", out var lvl)
+            ? lvl.Replace("_", "").Equals("serializable", System.StringComparison.OrdinalIgnoreCase)
+            : catalogDefault;
+
     private static async Task UpdateByRowIdsAsync(nint opener, string path, RecordBatch updates,
-        CancellationToken ct, bool nativeWrite, bool nativeRead)
+        CancellationToken ct, bool nativeWrite, bool nativeRead, bool catalogSerializable)
     {
         using var interrupt = new InterruptScope(opener, ct);
         var token = interrupt.Token;
@@ -2244,9 +2288,12 @@ internal static class DeltaReader
             var cfg = table.CurrentSnapshot.Metadata.Configuration;
             bool mor = EngineeredWood.DeltaLake.DeletionVectors.DeletionVectorConfig.IsEnabled(cfg)
                        && !table.IsIcebergCompat;
+            // One table open serving both: the DV mode above and the isolation level below come from the SAME
+            // configuration read, so honouring the table's declaration costs no extra _delta_log LIST.
+            bool serializable = EffectiveSerializable(cfg, catalogSerializable);
             if (mor)
             {
-                await MergeOnReadUpdateAsync(table, updates, token).ConfigureAwait(false);
+                await MergeOnReadUpdateAsync(table, updates, serializable, token).ConfigureAwait(false);
             }
             else
             {
@@ -2403,23 +2450,41 @@ internal static class DeltaReader
     /// atomic commit, no data rewrite — the cheap shape for a small update against a large file.
     /// </summary>
     /// <remarks>
-    /// The composition itself (deletion-vector actions + post-image write with the ORIGINAL row-tracking ids
-    /// materialised + CDF pre/post capture + the fused commit) now lives in engineered-wood as
-    /// <c>UpdateBySelectionViaVectorsAsync</c> — it was assembled here by hand until that landed. What remains
-    /// is genuinely ours: decoding DuckDB's packed rowid into <c>(add.path, absolute position)</c>, and
-    /// substituting the SET values a host-side join produced. The KEYED updater overload is what makes that
-    /// possible — the values are not a function of the row's own content, so aligning them by emission order
-    /// would be wrong.
-    /// A concurrent commit aborts (first-committer-wins) → the caller's retry-the-statement error.
+    /// <para><b>Composed from engineered-wood's PUBLIC primitives</b>: <see cref="DeltaTable.ReadRowsAsync"/>
+    /// for the selection-scoped read-back, <see cref="DeltaTable.WriteDataFilesAsync"/> for the post-images
+    /// (carrying each row's ORIGINAL stable id through <c>materializedRowIds</c>), and a
+    /// <see cref="DeltaTransaction"/> to fuse the deletion-vector mask, the append and the CDF pair into ONE
+    /// version. This is the SAME composition the buffered/explicit path already performs; autocommit used to
+    /// call a bespoke engineered-wood entry point instead, and that divergence is what this removes.</para>
+    /// <para><b>Three things the transaction buys that the previous shape could not.</b> It committed through
+    /// <c>CommitDataFilesAsync(expectedVersion:)</c> — a bare compare-and-set, so ANY concurrent commit failed
+    /// the statement even when it touched nothing we did; the OCC retry loop is disabled outright whenever
+    /// <c>expectedVersion</c> is set; and no per-file deletion-vector edits were recorded, so there was no
+    /// row-level reconciliation on this path AT ALL. Staging the mask through
+    /// <see cref="DeltaTransaction.StageRowDeletesAsync"/> records those edits.
+    /// <para>⚠ That is a MECHANISM claim, not a measured one, and the distinction matters. It rests on this
+    /// path now making the SAME staging calls the buffered path makes — which
+    /// <c>verify_delta_row_level_concurrency</c> §3/§5/§8 do cover — NOT on an observation of two autocommit
+    /// UPDATEs composing. Such an observation is out of reach in-process (sqllogictest runs its connections
+    /// sequentially, so a bare autocommit statement has no window between its scan and its commit; that suite's
+    /// closing note says so) and was ALSO out of reach on the Windows local root it was attempted on, because
+    /// that substrate has no put-if-absent at all: <c>fabricator_fs_write_probe</c> reports
+    /// <c>EXCLUSIVE_CREATE</c> succeeding on an existing file AND <c>MoveFile</c> overwriting its target, and a
+    /// 6-writer INSERT control on it lost 500 of 900 rows with every writer exiting 0. Measuring the gain needs
+    /// a substrate whose commit is genuinely conditional (OneLake/abfss, S3 with a NAMED secret, POSIX local) —
+    /// harness in <c>scratchpad/mor_update_race.sh</c>, which is an A/B against the pre-change build precisely
+    /// so that a green leg cannot be mistaken for a measurement.</para></para>
+    /// <para><b>The isolation level is the TABLE's</b>, resolved by the caller. A merge-on-read UPDATE on a
+    /// table declaring <c>Serializable</c> must not be quietly relaxed to write-serializable just because that
+    /// is engineered-wood's <see cref="DeltaTable.StartTransaction(IsolationLevel)"/> default — the same
+    /// contract rule that the autocommit DELETE path already follows.</para>
+    /// <para>What remains genuinely ours: decoding DuckDB's packed rowid, and substituting the SET values a
+    /// host-side join produced. Correlation is by ROWID on BOTH sides — never by emission order, since
+    /// batching and deletion-vector filtering each break positional correspondence.</para>
     /// </remarks>
     private static async Task MergeOnReadUpdateAsync(
-        DeltaTable table, RecordBatch updates, CancellationToken token)
+        DeltaTable table, RecordBatch updates, bool serializable, CancellationToken token)
     {
-        // The whole composition — DV-mask the old rows, append the post-images, capture CDF pre/post,
-        // preserve each row's ORIGINAL stable id, fuse into one commit — now lives in engineered-wood as
-        // UpdateBySelectionViaVectorsAsync. This method is reduced to what is genuinely OURS: decoding
-        // DuckDB's packed rowid into (add.path, absolute position) and substituting the SET values a
-        // host-side join produced.
         int ridIdx = -1;
         for (int c = 0; c < updates.ColumnCount; c++)
         {
@@ -2436,42 +2501,24 @@ internal static class DeltaReader
         }
 
         var snapshot = table.CurrentSnapshot;
-        long posMask = (1L << TransientRowAddress.PositionBits) - 1;
-        var pathByOrdinal = new Dictionary<int, string>(snapshot.ActiveFiles.Count);
-        foreach (var planned in table.PlanFiles(snapshot: snapshot))
-        {
-            pathByOrdinal[planned.FileOrdinal] = planned.File.Path;
-        }
+        var cfg = snapshot.Metadata.Configuration;
 
-        // (add.path, absolute position) -> the row of `updates` holding that row's new values, plus the
-        // selection itself. Both fall out of one decode pass.
-        var updIndexByKey = new Dictionary<(string Path, long Pos), int>();
-        var selection = new Dictionary<string, IReadOnlyCollection<long>>(System.StringComparer.Ordinal);
+        // rowid -> the row of `updates` holding that row's new values. The rowid is the correlation key on
+        // BOTH sides: the read-back hands it back per row (DeltaRowMetadata.RowAddress), so nothing here
+        // depends on the order rows are emitted in.
+        var updRowByRid = new Dictionary<long, int>(updates.Length);
         for (int i = 0; i < updates.Length; i++)
         {
-            if (updRids.IsNull(i))
-                continue;
-            long rid = updRids.GetValue(i)!.Value;
-            int ordinal = (int)(TransientRowAddress.FileOrdinal(rid));
-            if (!pathByOrdinal.TryGetValue(ordinal, out var filePath))
-            {
-                throw new System.InvalidOperationException(
-                    $"merge-on-read UPDATE: row-id file ordinal {ordinal} does not name an active file of "
-                    + $"version {snapshot.Version} ({pathByOrdinal.Count} active) — the row identifiers were "
-                    + "captured against a different snapshot.");
-            }
-            long pos = rid & posMask;
-            updIndexByKey[(filePath, pos)] = i;
-            if (!selection.TryGetValue(filePath, out var set))
-            {
-                selection[filePath] = set = new HashSet<long>();
-            }
-            ((HashSet<long>)set).Add(pos);
+            if (!updRids.IsNull(i)) { updRowByRid[updRids.GetValue(i)!.Value] = i; }
         }
-        if (updIndexByKey.Count == 0)
+        if (updRowByRid.Count == 0)
         {
             return;
         }
+
+        // The rows to mask — and the SAME object the transaction stages below, so the positions the read
+        // resolved and the positions the commit validates cannot drift apart.
+        var selection = SelectionFromRowIds(table, snapshot, updRowByRid.Keys, "merge-on-read UPDATE");
 
         var setCols = new Dictionary<string, IArrowArray>(System.StringComparer.Ordinal);
         for (int c = 0; c < updates.ColumnCount; c++)
@@ -2479,29 +2526,106 @@ internal static class DeltaReader
             if (c != ridIdx) { setCols[updates.Schema.FieldsList[c].Name] = updates.Column(c); }
         }
 
-        await table.UpdateBySelectionViaVectorsAsync(
-                EngineeredWood.DeltaLake.Table.RowSelection.ByPath(selection),
-                (filePath, matched, positions) =>
+        // Materialized row tracking: the post-images must carry their ORIGINAL stable ids, so a row's identity
+        // survives the UPDATE (Spark's reference behaviour). ⚠ Ask for RowTracking ONLY when the table declares
+        // the materialized columns — on a table without row tracking the ask is REFUSED, and correctly so.
+        var (matRowId, matRowVer) = EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig
+            .TryGetMaterializedColumnNames(cfg);
+        bool materialize = EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(cfg)
+                           && matRowId is not null && matRowVer is not null;
+        bool cdfEnabled = EngineeredWood.DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(cfg);
+
+        var preImages = cdfEnabled ? new List<RecordBatch>() : null;
+        var postImages = new List<RecordBatch>();
+        // Flat across every batch, in emission order — that is how WriteDataFilesAsync consumes it.
+        var stableIdsRaw = materialize ? new List<long?>() : null;
+
+        // Scoped read-back of ONLY the selected rows, with their identities as columns. Not a whole-table
+        // read: ReadRowsAsync resolves the selection against the pinned snapshot and touches just its files.
+        var ridsPerBatch = new List<long[]>();
+        var srcTracking = materialize ? new List<(long?[] Ids, long?[] Versions)>() : null;
+        int bi = -1;
+        await foreach (var batch in ReadSelectedRowsAsync(table, snapshot, selection,
+                           sourceTrackingOut: srcTracking, rowIdsOut: ridsPerBatch, ct: token)
+                           .ConfigureAwait(false))
+        {
+            bi++;
+            var rids = ridsPerBatch[bi];
+            // Row-aligned index into `updates` for each row of this batch, keyed by ROWID.
+            var takeIdx = new List<int>(batch.Length);
+            for (int i = 0; i < batch.Length; i++)
+            {
+                takeIdx.Add(i < rids.Length && updRowByRid.TryGetValue(rids[i], out int u) ? u : -1);
+            }
+            var columns = new IArrowArray[batch.ColumnCount];
+            for (int c = 0; c < batch.ColumnCount; c++)
+            {
+                var f = batch.Schema.FieldsList[c];
+                columns[c] = setCols.TryGetValue(f.Name, out var upd)
+                    ? EngineeredWood.Arrow.ArrowCompute.Take(upd, takeIdx)
+                    : batch.Column(c);
+            }
+            preImages?.Add(batch);
+            postImages.Add(new RecordBatch(batch.Schema, columns, batch.Length));
+
+            if (stableIdsRaw is not null)
+            {
+                var ids = srcTracking is not null && bi < srcTracking.Count ? srcTracking[bi].Ids : null;
+                for (int i = 0; i < batch.Length; i++)
                 {
-                    // Row-aligned index into `updates` for each matched row, keyed by its identity rather
-                    // than by emission order.
-                    var takeIdx = new List<int>(matched.Length);
-                    for (int i = 0; i < matched.Length; i++)
-                    {
-                        long pos = positions.GetValue(i)!.Value;
-                        takeIdx.Add(updIndexByKey.TryGetValue((filePath, pos), out int u) ? u : -1);
-                    }
-                    var columns = new IArrowArray[matched.ColumnCount];
-                    for (int c = 0; c < matched.ColumnCount; c++)
-                    {
-                        var f = matched.Schema.FieldsList[c];
-                        columns[c] = setCols.TryGetValue(f.Name, out var upd)
-                            ? EngineeredWood.Arrow.ArrowCompute.Take(upd, takeIdx)
-                            : matched.Column(c);
-                    }
-                    return new RecordBatch(matched.Schema, columns, matched.Length);
-                },
-                token)
+                    stableIdsRaw.Add(ids is not null && i < ids.Length ? ids[i] : null);
+                }
+            }
+        }
+        if (postImages.Count == 0)
+        {
+            return;
+        }
+
+        // All-or-nothing, deliberately: a partially materialized statement would leave row identity depending
+        // on which rows happened to resolve. ANY unresolvable id (a source file predating row tracking) writes
+        // the whole statement's post-images with FRESH ids rather than a mix.
+        List<long?>? stableIds = stableIdsRaw is not null && stableIdsRaw.TrueForAll(x => x.HasValue)
+            ? stableIdsRaw
+            : null;
+
+        // Post-images become data files NOW (invisible until a commit references them), carrying the original
+        // ids. An abort therefore leaves them as orphans for VACUUM — the same eager-write contract the
+        // buffered path documents.
+        var written = await table.WriteDataFilesAsync(postImages, token, materializedRowIds: stableIds)
             .ConfigureAwait(false);
+
+        // ONE version: the deletion-vector mask, the post-image append and the CDF pair. Based on the PINNED
+        // snapshot — the parameterless StartTransaction would make the commit's validation vacuous, since it
+        // would ask what landed since the version it just read.
+        await using var txn = table.StartTransaction(
+            snapshot, serializable ? IsolationLevel.Serializable : IsolationLevel.WriteSerializable);
+        txn.Operation = "UPDATE";
+        await txn.StageRowDeletesAsync(selection, token).ConfigureAwait(false);
+        await txn.StageDataFilesAsync(written, cancellationToken: token).ConfigureAwait(false);
+        if (preImages is not null)
+        {
+            // ⚠ rowIds/rowCommitVersions are deliberately NOT supplied, which leaves the staged change rows
+            // with NULL ids on the feed. That is what BOTH previous paths did — the retired engineered-wood
+            // entry point and the buffered one — so passing them here would be a behaviour change riding along
+            // in a refactor whose gates exist to prove equivalence. Supplying them is a real improvement on a
+            // row-tracking table (a `cdc` action has no baseRowId, so the change file is the only place a
+            // change row's identity can live) and the ids are already in hand as `stableIdsRaw` — but it is its
+            // own change, with its own gate, keyed PER BATCH since StageChangeDataAsync takes one id per row of
+            // the single batch it is handed.
+            foreach (var pre in preImages)
+            {
+                await txn.StageChangeDataAsync(pre,
+                        EngineeredWood.DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage, token)
+                    .ConfigureAwait(false);
+            }
+            foreach (var post in postImages)
+            {
+                await txn.StageChangeDataAsync(post,
+                        EngineeredWood.DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage, token)
+                    .ConfigureAwait(false);
+            }
+        }
+        await txn.CommitAsync(token).ConfigureAwait(false);
     }
 }

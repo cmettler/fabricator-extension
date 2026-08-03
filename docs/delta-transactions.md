@@ -318,6 +318,37 @@ RENAME TABLE of a *committed* table, nested RENAME FIELD, and the path-targeted 
 delta)`. The C++ side calls `InvalidateAllEntries()` on rollback so no stale schema survives a
 rolled-back ALTER.
 
+### 7.1 ⚠ `BEGIN; CREATE; INSERT; COMMIT` lands as TWO versions, not one — MEASURED 2026-08-03
+
+Recorded because it existed only as an inline comment (*"v0 create + v1 write — today's flush shape"*,
+`DeltaCatalog.cs`) and nowhere else. Surfaced by a design question — *why can't a `DeltaTransaction` contain the
+CREATE?* — which is the right question, because the Delta protocol permits exactly that: **version 0 may carry
+`protocol` + `metaData` + `add` actions in one commit.**
+
+Measured (`BEGIN; CREATE TABLE t1(…); INSERT … 100 rows; COMMIT;` on a local root):
+
+```
+_delta_log/00000000000000000000.json  →  commitInfo, protocol, metaData      ← no `add`: an EMPTY table
+_delta_log/00000000000000000001.json  →  the 100 rows
+```
+
+`FlushCreateTransactionAsync` calls `DeltaWriter.Create(...)` **unconditionally** and only then writes the data, so
+both of its branches produce two versions — the eager-CTAS branch via `CommitDataFilesAsync`, the parked-batches
+branch via `DeltaWriter.Write`.
+
+| | consequence |
+|---|---|
+| single writer | harmless — a millisecond window, correct end state |
+| concurrent reader (Spark, delta-rs) | can observe an existing **EMPTY** table mid-flush |
+| the v1 write FAILS | **an empty committed table is left behind by a transaction the user saw fail** — the inverse of every other flush path, where a failure leaves nothing. Reasoned from the measured shape, NOT itself measured (injecting the failure was not attempted) |
+
+**Why it is this way, and what would fix it.** Not a protocol limit and not a decision — an EW API-shape limit:
+`StartTransaction` is an INSTANCE method on `DeltaTable`, and `DeltaTable.OpenAsync` reads `_delta_log`, so there is
+no way to express "a transaction that creates the table". `CreateAsync`/`DeltaWriter.Create` write v0 immediately.
+A fix needs a static/factory transaction form (or a `CreateAsync` that accepts the actions to fuse into v0) —
+i.e. an upstream capability, not something the Bridge can compose. Until then the two-version shape stands, and it
+is the one place the buffer's "all-or-nothing at COMMIT" promise is weaker than everywhere else.
+
 ---
 
 ## 8. Multi-writer safety by storage backend
@@ -328,6 +359,7 @@ depends on the filesystem:
 | Storage | Commit guard | Verdict |
 |---|---|---|
 | Local POSIX | `O_EXCL` exclusive create | multi-process safe (validated: 4 processes × 200 rows → 800/800) |
+| **Local WINDOWS (`D:\…`, DuckDB's `LocalFileSystem`)** | **NONE THAT HOLDS** — `fabricator_fs_write_probe` reports `EXCLUSIVE_CREATE` **SUCCEEDING on an existing file** ("NO put-if-absent guard") *and* `MoveFile` **overwriting** its target, so neither primitive is conditional | **MEASURED 2026-08-03 (§8.5): 6 writers × 3 INSERTs × 50 rows ⇒ 400 of 900 rows landed, 500 SILENTLY LOST, every writer exited 0.** Single-writer only |
 | OneLake / abfss (`onelake://`) | ADLS conditional create (`If-None-Match: *`) | multi-process safe for DATA (no lost writes measured), but a losing writer can surface an ERROR instead of retrying — see §8.1 |
 | Plain ADLS Gen2 `abfss://` **with an azure `SECRET` NAMED** | the SAME ADLS conditional create — a credentialed abfss root now takes the direct-SDK filesystem, which is what OneLake always took | **MEASURED 2026-08-02 (§8.4): 6 writers × 8 commits ⇒ 48/48, zero losses, commit versions fully interleaved across writers so contention was real** |
 | Plain ADLS Gen2 `abfss://` with **no named secret** | **none that holds** — duckdb-azure's `ExclusiveCreate` is a client-side existence CHECK, so it races | **MEASURED 2026-08-02 (§8.4): 41 of 48 landed, six of the seven losses SILENT.** Single-writer only; RENAME/DROP also unavailable |
@@ -648,6 +680,83 @@ mutation-tested: reverting the gate to `IsOneLake` kills it at exactly that line
 outcome and **not** the mechanism — the host glob also answers correctly on a plain account (unlike OneLake,
 where duckdb-azure's mid-path wildcard is broken), so swapping the DFS-SDK walk back for the glob does not
 fail it.
+
+---
+
+### 8.5 Local WINDOWS — MEASURED 2026-08-03, and it is NOT safe (found incidentally)
+
+Found while trying to measure something else entirely (the autocommit merge-on-read UPDATE's new row-level
+reconciliation, [ew-master-migration.md](ew-master-migration.md) §THE `*BySelection*` QUESTION). It is
+**independent of that change** and applies to every writer on a local Windows Delta root.
+
+**The row above was never wrong — it says "Local POSIX" — but nothing said anything about Windows, and "local"
+reads as covering it.** The `O_EXCL` guarantee is a POSIX one; DuckDB's `LocalFileSystem` on Windows does not
+deliver it here.
+
+`SELECT * FROM fabricator_fs_write_probe('D:/…')` on this box:
+
+| step | ok | detail |
+|---|---|---|
+| `exclusive_create_existing_fails` | **false** | `EXCLUSIVE_CREATE` on an existing file **SUCCEEDED** — NO put-if-absent guard (unsafe for commits) |
+| `move_overwrite_behavior` | true | `MoveFile` **OVERWROTE** the existing target ⇒ NOT a put-if-absent primitive either |
+
+So **neither** commit primitive is conditional, and the measurement agrees with the probe: 6 concurrent
+`duckdb.exe` writers × 3 autocommit INSERTs × 50 rows against one local table ⇒ **400 of 900 rows landed, 500
+silently lost, one writer's rows missing ENTIRELY, and every writer exited 0.** Same shape as the secretless S3
+row (§8.3) and the unnamed-secret ADLS row (§8.4): no error, no retry, just absence.
+
+**A second, louder symptom on the same root: TORN READS.** A concurrent writer that re-reads the log (a
+merge-on-read UPDATE does, on every OCC attempt) parses a commit file *mid-write* and fails with
+`'w' is an invalid start of a value` or `Expected end of string … BytePositionInLine: 9` — and **9 is exactly the
+length of `{"remove"`**, which is what identified it as a truncated commit rather than a conflict. Because the
+target file is created and then written into, rather than published atomically, a partial commit is *observable*.
+Under load the table can be left where even `get_metadata` fails.
+
+**Why this was never caught:** §8.1's harness and the fuse-race harness both check that COMMITTED groups are
+complete and versions unique — i.e. whether the WINNER is unique. Neither checks whether a concurrent READER can
+observe a partial commit, and the INSERT path re-reads the log less than the UPDATE path does, so INSERT-only
+runs fail silently (lost rows) while UPDATE runs fail loudly (torn JSON). One root cause, two symptoms.
+
+⚠ **Consequence for harness design: a local Windows root cannot host ANY multi-writer experiment** — the
+substrate's own losses and torn reads swamp whatever is under test, in *both* legs of an A/B. Use OneLake/abfss,
+S3 with a NAMED secret, or POSIX local (WSL). `scratchpad/mor_update_race.sh` carries that warning at the top.
+**Check the probe before believing a multi-writer result**, exactly as §8.4 concluded for the opposite reason
+(there the probe was too OPTIMISTIC; here it is correct and was simply never run on this platform).
+
+**Not investigated:** whether this is a DuckDB `LocalFileSystem` limitation (no `CREATE_NEW` / no
+`FILE_FLAG_OPEN_REPARSE`-style exclusive create on Windows) or something in our own `HostFsOpenWrite` mapping.
+Fixing it would mean a conditional-create path for Windows plus write-temp-then-atomic-publish; neither is
+attempted here, and single-writer behaviour — every suite in the hermetic tier — is unaffected.
+
+#### 8.5a ⚠ `fabricator_fs_write_probe` HAS A FALSE-POSITIVE MODE — FOUND, **NOT FIXED** (2026-08-03)
+
+Found by running the README example verbatim (the standing "run the README's SQL before committing it" rule
+paying for itself). **Point the probe at a path whose parent does not exist and the one cell that matters reports
+the guard as WORKING:**
+
+```
+create_directory                | true  | CreateDirectory did not create the directory      <-- ok=true, message says otherwise
+write_create                    | false | threw: ... The system cannot find the path specified
+file_exists                     | true  | FileExists=false (unexpected)                     <-- ok=true, message says otherwise
+exclusive_create_existing_fails | true  | EXCLUSIVE_CREATE on an existing file threw (put-if-absent works): ... cannot find the path
+```
+
+`exclusive_create_existing_fails` is recorded as `threw` (`fabricator_fs_spike.cpp:534`) **without checking its
+precondition — that `f1` exists at all.** With `write_create` failed, the exclusive open throws because the
+DIRECTORY is missing, and the probe reads that as the put-if-absent guard firing. This is the
+"a probe whose PRECONDITION failed is VOID, not evidence" rule violated *inside the diagnostic that exists to
+supply the evidence* — and it fails in the UNSAFE direction, reporting safe.
+
+Two neighbouring cells have the same shape for a different reason: `run()` records `ok = did not throw`, while
+`create_directory` and `file_exists` *return a message* on failure instead of throwing, so both report `ok=true`
+with a detail that says they failed.
+
+**The fix is small and deliberately not taken here** (this pass is C#-only; touching this file needs a full C++
+rebuild, and mixing that into a behaviour-preserving refactor is how a clean bisect gets lost): gate the
+exclusive-create verdict on `fs.FileExists(f1)` and record a VOID result when the precondition is absent; and make
+`create_directory`/`file_exists` throw on their own invariant so `run()`'s `ok` means something. Until then, the
+README block and §8.5 both say to confirm `create_directory` and `write_create` are `true` before reading the
+verdict.
 
 ---
 

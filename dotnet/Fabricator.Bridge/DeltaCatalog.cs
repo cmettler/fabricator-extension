@@ -415,11 +415,12 @@ public sealed class DeltaCatalog : IBackendCatalog
     private bool EffectiveSerializable(string path)
         => EffectiveSerializable(DeltaReader.GetTableProperties(Opener(), path));
 
-    /// <summary>As above, against an already-read configuration (one table open serving several properties).</summary>
+    /// <summary>As above, against an already-read configuration (one table open serving several properties).
+    /// The rule itself lives in <see cref="DeltaReader.EffectiveSerializable"/> so that the merge-on-read UPDATE
+    /// — which resolves it from the configuration it already holds, inside the reader — cannot express it
+    /// differently. Property absent => the catalog's ATTACH <c>isolation_level</c> default.</summary>
     private bool EffectiveSerializable(IReadOnlyDictionary<string, string> config)
-        => config.TryGetValue("delta.isolationLevel", out var lvl)
-            ? lvl.Replace("_", "").Equals("serializable", System.StringComparison.OrdinalIgnoreCase)
-            : _serializable; // property absent => the catalog's ATTACH isolation_level default
+        => DeltaReader.EffectiveSerializable(config, _serializable);
 
     // As EffectiveSerializable, read once and cached on the buffer (isolation is stable within a
     // transaction). Used by the flush's OCC check + row-level relaxation.
@@ -4197,7 +4198,10 @@ public sealed class DeltaCatalog : IBackendCatalog
         }
         var updatesBatch = new RecordBatch(
             new Apache.Arrow.Schema(updFields, null), updArrays, updates.Count);
-        DeltaReader.UpdateByRowIds(opener, path, updatesBatch, default, _nativeWrite, _nativeRead);
+        // The catalog's ATTACH default only — the TABLE's own delta.isolationLevel outranks it, resolved inside
+        // from the configuration the update path already reads (no extra _delta_log LIST).
+        DeltaReader.UpdateByRowIds(opener, path, updatesBatch, default, _nativeWrite, _nativeRead,
+                                   catalogSerializable: _serializable);
 
         _log.LogInformation("delta update {Schema}.{Table}: rows={Rows} set_cols={SetCols} native_write={Native}",
             schemaName, tableName, updates.Count, setColNames.Count, _nativeWrite);
