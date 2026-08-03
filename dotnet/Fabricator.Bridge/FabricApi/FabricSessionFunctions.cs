@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using Apache.Arrow;
 using Microsoft.Fabric.Api.Spark.Models;
@@ -13,8 +14,8 @@ using SparkTimeUnit = Microsoft.Fabric.Api.Spark.Models.TimeUnit;
 namespace Fabricator.Bridge;
 
 /// <summary>
-/// Spark/Livy session monitoring: <c>fabric.sessions([workspace := …])</c> — what is running right now, and
-/// what recently ran, on the workspace's Spark compute.
+/// Spark/Livy session monitoring: <c>fabric.sessions([workspace := …] [, all_workspaces := …])</c> — what is
+/// running right now, and what recently ran, on Spark compute.
 /// </summary>
 /// <remarks>
 /// <para><b>What this adds over <c>job_instances</c> — measured, not assumed (2026-08-03, 115 sessions).</b>
@@ -59,10 +60,21 @@ namespace Fabricator.Bridge;
 /// populated on all 115.</b> The principal is identified, just not named — so filter and group by
 /// <c>submitter_id</c>. Both are kept: the name is what a human wants, and its absence may be specific to
 /// service-principal submissions.</para>
-/// <para><b>Scope.</b> The call is WORKSPACE-scoped, so one request covers every Spark item — no fan-out, no
-/// O(items) throttling risk. The SDK also exposes item-scoped overloads (notebook / lakehouse / Spark job
-/// definition); they are deliberately not wired, because <c>WHERE item_name = …</c> over one cheap request is
-/// both simpler and strictly more expressive than a parameter that would force the caller to name an item.</para>
+/// <para><b>Scope.</b> The underlying call is WORKSPACE-scoped, so ONE request covers every Spark item in a
+/// workspace — there is no per-item fan-out and no O(items) throttling risk. The SDK also exposes item-scoped
+/// overloads (notebook / lakehouse / Spark job definition); they are deliberately not wired, because
+/// <c>WHERE item_name = …</c> over one cheap request is both simpler and strictly more expressive than a
+/// parameter that would force the caller to name an item.</para>
+/// <para><b><c>all_workspaces := true</c> fans out across WORKSPACES</b> — one listing plus one request per
+/// workspace, with <c>workspace_name</c>/<c>workspace_id</c> appended so rows are attributable. That is a
+/// different axis from the job fan-out (which enumerates ITEMS inside one workspace) and is opt-in for the same
+/// reason: O(workspaces) requests against a per-principal throttle. It is mutually exclusive with
+/// <c>workspace :=</c>, which would be a contradiction.</para>
+/// <para><b>⚠ THE MULTI-WORKSPACE AGGREGATION IS UNVERIFIED.</b> The test tenant exposes exactly ONE workspace
+/// to this identity, so a fan-out result is indistinguishable from the single-workspace result and nothing here
+/// proves rows from several workspaces are combined, attributed or paged correctly. What IS verified is that the
+/// fan-out code path executes and populates the two new columns from the LISTING. A second workspace is the only
+/// thing that would settle the rest — do not read a green single-workspace run as coverage.</para>
 /// <para><b>⚠ Live cell OUTPUT is not available and cannot be added here.</b> The model carries
 /// <c>spark_application_id</c> and <c>resource_uri</c>, which are POINTERS to where logs live; the entire
 /// Fabric SDK assembly contains no method that fetches driver or executor logs. Diagnosis therefore still ends
@@ -123,6 +135,10 @@ internal static class FabricSessionFunctions
         public Schema NamedParameters { get; } = new Schema(new[]
         {
             FabricApiFunctions.Str("workspace"),
+            // A REAL BooleanType, read with FabricArgs.Bool. Safe here because this binding reads its args
+            // individually; the "a BOOLEAN named parameter silently reads as NULL" hazard recorded in CLAUDE.md
+            // is specific to FabricRowsFunction, which funnels every argument through FabricArgs.Str.
+            FabricApiFunctions.Bool("all_workspaces"),
         }, null);
 
         public IArrowTableFunctionBinding Bind(RecordBatch args) => new Binding(_api, args);
@@ -189,23 +205,73 @@ internal static class FabricSessionFunctions
                 FabricApiFunctions.Str("capacity_id"),
                 FabricApiFunctions.Str("submitter_id"),
                 FabricApiFunctions.Str("resource_uri"),
+                // Appended, not prepended (D4 keeps `SELECT *` additive). Required for all_workspaces to be
+                // usable — without them the rows of several workspaces are indistinguishable.
+                FabricApiFunctions.Str("workspace_name"),
+                FabricApiFunctions.Str("workspace_id"),
             }, null);
 
             private readonly FabricApiClient _api;
             private readonly string? _workspace;
+            private readonly bool _allWorkspaces;
 
             internal Binding(FabricApiClient api, RecordBatch args)
             {
                 _api = api;
                 _workspace = FabricArgs.Str(args, 0);
+                _allWorkspaces = FabricArgs.Bool(args, 1) == true;
             }
 
             public override Schema OutputSchema => Columns;
 
             protected override IAsyncEnumerable<RecordBatch> Rows(CancellationToken ct)
             {
-                var ws = _api.ResolveWorkspace(_workspace);
                 var row = new FabricRowBuilder(Columns);
+                if (!_allWorkspaces)
+                {
+                    // `workspace_name` echoes what the caller/attach supplied rather than being resolved: the
+                    // same rule as job_instances' item_name — do not pay for a listing to restate what the
+                    // caller already knows. It is therefore NULL when the default was a GUID.
+                    var one = _api.ResolveWorkspace(_workspace);
+                    AppendWorkspace(row, one, NameOrNull(_workspace), ct);
+                    return One(row.Build());
+                }
+                if (!string.IsNullOrWhiteSpace(_workspace))
+                {
+                    throw new NotSupportedException(
+                        "sessions: pass either workspace := '<name or id>' or all_workspaces := true, not both — "
+                        + "naming one workspace and asking for every workspace are contradictory.");
+                }
+                // FAN-OUT across every workspace this identity can see: one listing, then ONE
+                // ListLivySessions per workspace. O(workspaces) requests against a per-principal throttle, so
+                // it is opt-in. Not capped, for the same reason as the job fan-out: a silent cap would
+                // under-report while looking complete.
+                foreach (var (id, name) in FabricApiClient.WrapList("workspaces",
+                             () => _api.Client.Core.Workspaces.ListWorkspaces(cancellationToken: ct))
+                         .Select(w => (w.Id, w.DisplayName?.Trim())))
+                {
+                    AppendWorkspace(row, id, name, ct);
+                }
+                return One(row.Build());
+            }
+
+            /// <summary>The workspace value as a NAME, or null when it is a GUID (or absent).</summary>
+            private static string? NameOrNull(string? workspace)
+                => string.IsNullOrWhiteSpace(workspace) || Guid.TryParse(workspace, out _) ? null : workspace;
+
+            /// <summary>
+            /// Appends every Livy session of ONE workspace.
+            /// </summary>
+            /// <remarks>
+            /// A failure here fails the WHOLE statement rather than skipping the workspace, deliberately: a
+            /// partial monitoring answer that looks complete is worse than an error. ⚠ That choice is
+            /// UNVALIDATED for the interesting case — the test tenant exposes a single workspace to this
+            /// identity, so a per-workspace permission failure has never been observed. If it turns out that
+            /// seeing a workspace without being able to list its sessions is common, the right answer is an
+            /// `error` COLUMN (so nothing is silent and nothing is fatal), not a silent skip.
+            /// </remarks>
+            private void AppendWorkspace(FabricRowBuilder row, Guid ws, string? workspaceName, CancellationToken ct)
+            {
                 // WrapList, not a bare foreach: PageableResponse<T> is LAZY, so the request happens during
                 // enumeration — outside any try around the call itself. See FabricApiClient.WrapList.
                 foreach (var s in FabricApiClient.WrapList("sessions",
@@ -254,9 +320,10 @@ internal static class FabricSessionFunctions
                        .Str(31, s.CapacityId?.ToString())
                        .Str(32, s.Submitter?.Id.ToString())
                        .Str(33, s.LivySessionItemResourceUri)
+                       .Str(34, workspaceName)
+                       .Str(35, ws.ToString())
                        .EndRow();
                 }
-                return One(row.Build());
             }
         }
     }

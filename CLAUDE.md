@@ -881,13 +881,32 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
       complete is worse). Cost is stated in the error, not hidden.
     - **⚠ A job instance's `StartTimeUtc`/`EndTimeUtc` are ISO STRINGS** (a Livy session's are `DateTimeOffset`)
       ⇒ `FabricRowBuilder.Iso`, not `.Ts`. The compiler catches it. Binding moved to `FabricRowBuilder` (10 cols).
+    - **THE SECOND AXIS — `sessions(all_workspaces := true)` — ALSO DONE (2026-08-03).** The job fan-out
+      enumerates ITEMS inside one workspace; this enumerates WORKSPACES (one `ListWorkspaces` + one
+      `ListLivySessions` each) and appends `workspace_name`/`workspace_id`. Mutually exclusive with
+      `workspace :=` (errors — naming one workspace and asking for all is contradictory). `all_workspaces` is a
+      REAL `BooleanType` read via `FabricArgs.Bool`, safe because this binding reads args individually — the
+      "BOOLEAN named parameter silently reads NULL" hazard is specific to `FabricRowsFunction`.
+      - **⚠ THE MULTI-WORKSPACE AGGREGATION IS UNVERIFIED — the tenant exposes exactly ONE workspace to this SP**,
+        so a fan-out result is INDISTINGUISHABLE from the single-workspace one. Do not read a green run as
+        coverage; a second workspace is the only thing that settles combining/attribution/paging.
+      - **What IS proven is that the fan-out PATH executes, via a constructed discriminator** rather than a row
+        count: attach by a **GUID** root so the single-workspace default carries no name ⇒ `sessions()` gives
+        `workspace_name = NULL` while `sessions(all_workspaces := true)` gives `Test`, which could ONLY come from
+        `ListWorkspaces`. (Hence `workspace_name` is NULL in single mode on a GUID default — same rule as the job
+        fan-out's `item_name`: echo what the caller knows, never pay for a listing to restate it.)
+      - A per-workspace failure fails the WHOLE statement (consistent with the item fan-out). **Unvalidated for
+        the interesting case** — "can see a workspace but cannot list its sessions" has never been observed here.
+        If that proves common the answer is an `error` COLUMN, not a silent skip.
     - **§9m carries the FAN-OUT VERDICT for every other candidate.** The deciding pattern: fan out when the
       per-item call is a cheap LIST; REFUSE when it is a long-running definition read. So
-      `semantic_model_refreshes` (over `semantic_models()`) is the strongest remaining, then
-      `mirroring_status`/`mirrored_tables`, `data_access_roles`, the deployment-pipeline trio, `list_shortcuts`;
-      `git_status`/`sessions` would fan out over WORKSPACES (a different, tenant-wide axis); and
-      `notebook_parameters` + `variables` are **NO** — each is a ~20 s LRO, so fanning out multiplies a
-      multi-minute operation behind a call site that looks cheap.
+      `semantic_model_refreshes` (over `semantic_models()`) — **dropped from the recommendation by the user
+      2026-08-03: not needed** — then `mirroring_status`/`mirrored_tables`, `data_access_roles`, the
+      deployment-pipeline trio, `list_shortcuts`; **`git_status` over WORKSPACES is DEFERRED (user, 2026-08-03)
+      until a git-connected workspace exists to test against** — writing it blind would ship an untested
+      promotion surface, the same reason P3 is "wired but NOT live"; and `notebook_parameters` + `variables` are
+      **NO** — each is a ~20 s LRO, so fanning out multiplies a multi-minute operation behind a call site that
+      looks cheap.
   - **THE `fabric` SCHEMA — DONE 2026-08-03 (BREAKING, no aliases), §9l.** `dbo.fabric_sessions()` →
     **`fabric.sessions()`**: one dedicated schema, the `fabric_` prefix dropped from all **51** functions.
     C#-only — no ABI, no C++ change. Why: the `__all__` sentinel declares each function once PER DISCOVERED
@@ -1006,10 +1025,23 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     skipped a check we owe. It now CONSUMES `commitInfo.isBlindAppend` when present and falls back to the
     inference (`InferBlindAppend`, unchanged) only when absent; a non-boolean counts as absent. Three
     non-obvious parts: the declaration outranks the inference in BOTH directions (each has a test); ABSENT
-    must keep meaning "infer", since almost every commit in the wild omits the flag and defaulting to
+    keeps meaning "infer", since almost every commit in the wild omits the flag and defaulting to
     "not blind" would conflict on ordinary appends; and a **round-trip test** proves the flag survives
     `TransactionLog.ReadCommitAsync` — without it the verdict tests would be pinning dead code. No model
     change needed (`CommitInfo.Values` already keeps arbitrary keys). Mutation-tested; Table.Tests 727.
+    - **⚠ "FIXED" MEANS FIXED FOR *DECLARED* COMMITS ONLY — we still DIVERGE FROM DELTA on the absent case, in
+      the weaker direction (established 2026-08-03 by re-reading `ConflictChecker.scala` at `v4.2.0`).** Delta is
+      `isBlindAppendOption.getOrElse(false)`: **absent ⇒ NOT blind**, so those adds stay in
+      `changedDataAddedFiles` and ARE examined even under WriteSerializable. Delta even computes
+      `onlyAddFiles = actions.collect{case f: FileAction => f}.forall(_.isInstanceOf[AddFile])` and **pointedly
+      does NOT use it** for blind-append — so our fallback is precisely the inference Delta declined to make.
+      Ours is a deliberate back-compat choice (EW emits no flag itself, so `getOrElse(false)` would make
+      ordinary EW-to-EW concurrent appends start conflicting), NOT a claim of parity. Do not describe the
+      reading half as "matching Delta".
+    - Second, smaller divergence: Delta's WriteSerializable branch is guarded by
+      `!currentTransactionInfo.metadataChanged`, so a metadata change in OUR OWN transaction re-examines blind
+      appends. EW's `examineAdds = isolation == Serializable || !concurrentIsBlindAppend` has no such guard.
+      Not investigated; note it before offering the reading half upstream as "Delta-equivalent".
   - **The fix must be TRUTHFUL:** Delta's definition is "the transaction READ NOTHING"
     (`readPredicates.isEmpty && readFiles.isEmpty`), NOT "the commit contains only adds" — deriving it from
     action shape would mark `INSERT … SELECT` from the same table as blind, and a wrong `true` makes other

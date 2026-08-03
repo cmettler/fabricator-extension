@@ -1544,7 +1544,7 @@ The substitution is not `s/fabric_//g`. Three classes of token had to be separat
 Gates: hermetic **63/63 — 5686**; live end-to-end on the tenant (`fabric` beside `dbo`/`dbt`, 51 functions ×1
 each, a table function, a named-parameter call, a scalar, and the DDL refusal).
 
-## 9m. JOB-INSTANCE FAN-OUT (2026-08-03, breaking on one parameter)
+## 9m. FAN-OUT: job instances over ITEMS, sessions over WORKSPACES (2026-08-03)
 
 `fabric.job_instances([item := …] [, workspace := …] [, item_type := …])`. Omitting `item` fans out across every
 item of `item_type`, one `ListItemJobInstances` call per item, with `item_name`/`item_id` appended to the output
@@ -1592,7 +1592,8 @@ Every remaining per-item/per-object function, judged on whether the fan-out is w
 | `deployment_pipeline_stages/_items/_operations(pipeline)` | `deployment_pipelines()` | **good** — promotion state across pipelines |
 | `list_shortcuts()` | `lakehouses()` | **useful** — shortcuts are per-lakehouse and easy to lose track of |
 | `lakehouse_tables()` | `lakehouses()` | marginal — our own discovery already covers tables, and it is refused on schema-enabled lakehouses |
-| `git_status()` / `sessions()` | `workspaces()` | **different axis** — these are already workspace-scoped, so the fan-out is CROSS-WORKSPACE. Highest value for a tenant-wide view, highest blast radius |
+| `sessions()` | `workspaces()` | **BUILT** — `all_workspaces := true`, see below |
+| `git_status()` | `workspaces()` | **DEFERRED** (user, 2026-08-03) until a git-connected workspace exists to test against. Writing it blind would ship an untested promotion surface |
 | `notebook_parameters(notebook)` | `items(type:='Notebook')` | **NO** — each call is a ~20 s definition LRO; fanning out multiplies a long-running operation |
 | `variables(lib)` / `variable_value_sets(lib)` | `variable_libraries()` | **NO** — same reason: definition reads are LROs (13 steps took 7m39s) |
 | `job_status`, `operation_status` | — | **NO** — they identify one instance by id; there is nothing to enumerate |
@@ -1600,6 +1601,39 @@ Every remaining per-item/per-object function, judged on whether the fan-out is w
 The pattern that decides it: fan out when the per-item call is a cheap LIST, refuse when it is a long-running
 definition read. The LRO ones would turn a monitoring query into a multi-minute one, and the cost would be
 invisible at the call site.
+
+### The WORKSPACE axis — `sessions(all_workspaces := true)`
+
+The job fan-out enumerates ITEMS inside one workspace. This is the other axis: one `ListWorkspaces` plus one
+`ListLivySessions` per workspace, with `workspace_name`/`workspace_id` APPENDED. Mutually exclusive with
+`workspace :=` (naming one workspace and asking for all of them is a contradiction, and it errors).
+
+Opt-in for the same reason and refusing a cap for the same reason as the item fan-out. `all_workspaces` is a
+**real BOOLEAN** parameter, which is safe here only because this binding reads its arguments individually — the
+"a BOOLEAN named parameter silently reads as NULL" hazard applies to `FabricRowsFunction`, which funnels every
+argument through `FabricArgs.Str`.
+
+**⚠ THE MULTI-WORKSPACE AGGREGATION IS UNVERIFIED, and the reason is the positive-control problem.** The test
+tenant exposes exactly ONE workspace to this identity, so a fan-out result is indistinguishable from the
+single-workspace result: nothing observed proves rows from several workspaces are combined, attributed or paged
+correctly. Do not read a green single-workspace run as coverage.
+
+**What IS verified is that the fan-out path executes**, via a deliberately constructed discriminator rather than
+a row count. Attaching by a **GUID** root makes the single-workspace default carry no name, so:
+
+| call | `workspace_name` | proves |
+|---|---|---|
+| `sessions()` | `NULL` | the default was echoed, not resolved (no listing) |
+| `sessions(all_workspaces := true)` | `Test` | the name could ONLY come from `ListWorkspaces` ⇒ the listing ran |
+
+`workspace_name` is therefore NULL in single mode when the default is a GUID — deliberately, following the same
+rule as the job fan-out's `item_name`: echo what the caller already knows, never pay for a listing to restate it.
+
+**One choice left open on purpose.** A per-workspace failure fails the WHOLE statement (consistent with the item
+fan-out: a partial monitoring answer that looks complete is worse than an error). That is **unvalidated for the
+interesting case** — with one visible workspace, "can see a workspace but cannot list its sessions" has never
+been observed. If that turns out to be common, the right answer is an `error` COLUMN so nothing is silent and
+nothing is fatal, not a silent skip.
 
 ## 9n. ATTACH OPTIONS: inferred, and RENAMED to `API_WORKSPACE` / `API_ITEM` (2026-08-03, breaking)
 

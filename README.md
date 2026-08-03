@@ -813,7 +813,7 @@ SELECT * FROM lake.fabric.refresh_sql_endpoint(item := 'OtherLH'); -- a differen
 | `job_status(item, job_instance_id [, workspace := …] [, item_type := …])` | table | One job instance's state |
 | `job_instances([item := …] [, workspace := …] [, item_type := …])` | table | Job history for one item, **or fanned out across every item of a type** (`item_type := 'Notebook'`). Rows carry `item_name`/`item_id` |
 | `cancel_job(item, job_instance_id)` | scalar | Requests cancellation |
-| `sessions([workspace := …])` | table | **What is running on Spark right now** — every Livy session in the workspace, with queued vs running time. One request, no item argument |
+| `sessions([workspace := …] [, all_workspaces := …])` | table | **What is running on Spark right now** — every Livy session in the workspace, with queued vs running time. One request, no item argument. `all_workspaces := true` covers every workspace you can see |
 | `lakehouse_tables()` | table | Tables as **Fabric** sees them (flat lakehouses only — see below) |
 | `operation_status(operation_id)` | table | Generic long-running-operation status |
 | `reset_shortcut_cache()` | table | Clears the workspace's shortcut cache (**needs a user identity**) |
@@ -1000,6 +1000,18 @@ FROM lake.fabric.sessions() GROUP BY 1 ORDER BY runs DESC;
 It reports one row per Livy session with the Spark-level detail no job instance carries — queued time separate
 from running time, the runtime version, the attempt number and `spark_application_id` — and `job_instance_id`
 joins it back to `job_instances`.
+
+**Across every workspace you can see**, `all_workspaces := true` adds `workspace_name`/`workspace_id`:
+
+```sql
+SELECT workspace_name, item_name, state, round(running_seconds) AS running_s
+FROM lake.fabric.sessions(all_workspaces := true)
+WHERE state = 'InProgress'
+ORDER BY running_seconds DESC;
+```
+
+That costs one request per workspace, so it is opt-in rather than the default, and it cannot be combined with
+`workspace :=`.
 
 > **Three gotchas, all measured.** ① The **same** work is labelled differently in the two surfaces: as a session
 > it is `job_type = 'JupyterSession'`, `state = 'Succeeded'`; as a job instance it is `job_type = 'RunNotebook'`,
