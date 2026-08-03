@@ -1986,6 +1986,97 @@ Both times the gap was found by review, not by the suite.
 
 ---
 
+## FULL PATCH-SET AUDIT vs `upstream/main` = `v0.2.0` = `a99cc41` (2026-08-03)
+
+Our pin `d9d204b` on `fabricator-patches`. **Only 2 upstream commits behind** (`#58` CI, `#59` docs — both
+non-functional, so a bump gains nothing but is free).
+
+**⚠ Read the diff with `--stat=200` or no `--stat` at all. A `| tail -N` on `git diff --stat` silently drops
+the head of the file list, and doing exactly that in this session produced a confident, wrong claim that
+`DeltaTable.cs` had been absorbed upstream.** It has not.
+
+Totals: **19 files, +3389/−47** — of which **9 production files, +868/−45**; the remaining 10 are tests.
+
+### Every production file, with a verdict
+
+| file | +/− | what it is | verdict |
+|---|---|---|---|
+| `Concurrency/ConflictChecker.cs` | +42 | `IsBlindAppend` consumes `commitInfo.isBlindAppend`; old logic renamed `InferBlindAppend` | **OFFER** — general correctness, see §isBlindAppend |
+| `DeltaTable.cs` | +409/−38 | 3 new members + 2 modified (below) | **SPLIT** — see below |
+| `VariantTransport.cs` | +322 | whole file, `internal static class VariantTransport` | **KEEP OURS** — temporary, DuckDB #24157 |
+| `Schema/SchemaConverter.cs` | +50 | `VariantTransportExtensionName = "ew.variant_transport"`, `IsVariantTransportField` | **KEEP OURS** — variant transport |
+| `DeltaTransaction.cs` | +26 | `ExemptRowLevelFromWholeTableRead` | **OFFERABLE** — see caution below |
+| `DeltaTableOptions.cs` | +15 | `VariantTransportBlob` | **KEEP OURS** — variant transport |
+| `EngineeredWood.DeltaLake.Table.csproj` | +5 | **a COMMENT ONLY** (why Apache.Arrow suffices, why the shredding toolkit is deliberately not referenced). No PackageReference change | **OFFER or DROP** — free either way |
+| `DeltaFilePruner.cs` | +4 | **a doc comment ONLY** (`<para>` saying callers reach it via `PlanFiles`) | **OFFER or DROP** — free either way |
+| `doc/codec-seam-investigation.md` | +2/−2 | doc text | trivial |
+
+So ~**392 of the 868 lines (45%) are the variant transport** (322 + 50 + 15 + 5), which is ours by design.
+Another **9 lines are pure comments** in two files. The real negotiable surface is `DeltaTable.cs` (409) plus
+`ConflictChecker` (42) plus `DeltaTransaction` (26).
+
+### `DeltaTable.cs` — NEW vs MODIFIED, established by grepping `upstream/main`
+
+| member | in main? | notes |
+|---|---|---|
+| `UpdateBySelectionViaVectorsAsync` (public, ×2 overloads) | **NO — ours** | the merge-on-read UPDATE |
+| `WriteChangeDataFilesAsync` (public) | **NO — ours** | CDF file writing |
+| `BuildInlineDeletionVectorsAsync` (internal) | **NO — ours** | inline DV construction |
+| `UpdateAsync` | yes (16 hits) | we MODIFIED it |
+| `RebaseDvDmlActionsAsync` | yes (3 hits) | we MODIFIED it (the buffered-DML-through-OPTIMIZE remap) |
+
+## THE `*BySelection*` QUESTION — CONFIRMED ABSENT FROM MAIN, BUT **DO NOT MOVE IT TO THE BRIDGE**
+
+**The hypothesis is right:** `git grep BySelection upstream/main -- 'src/**/*.cs'` returns **nothing**.
+`UpdateBySelectionViaVectorsAsync` exists only on our branch (one method name, **two overloads** — not a family
+of functions). Upstream has **no deletion-vector mode for UPDATE at all**: its `UpdateRowsAsync` always
+rewrites.
+
+It is **live**, not dead code: `Fabricator.Bridge/DeltaReader.cs:2482` calls it from `MergeOnReadUpdateAsync`.
+
+### Why moving it into the Bridge is the wrong direction — three concrete blockers
+
+1. **Its core dependency is `internal`.** `ComputeDvActionsWithEditsAsync` (`DeltaTable.cs:5934`) is declared
+   `internal` and returns `(Actions, Edits, TouchedPaths, RowsDeleted)` from a `RowSelection` — it *is* the
+   merge-on-read computation. It is **shared**: `DeleteRowsAsync` calls it (5918) and `DeltaTransaction` calls it
+   (`DeltaTransaction.cs:442`). Moving the UPDATE to the Bridge therefore requires either
+   **(a)** making that public — which *grows* our patch surface at the worst possible place, a public API
+   commitment on EW's DV core, or **(b)** reimplementing DV encode/merge in the Bridge, which would then drift
+   from EW's own DELETE path. This codebase has already been burned by DV/CoW divergence.
+2. **Two more members are unreachable.** `ActiveFilesByPath` is `internal static` (5563); `HonorWriterFeatures`
+   (4272) and `StaleSelectionPath` (6342) are `private static`. The latter two are trivial (a writer-feature
+   guard and an exception factory) but the first is not free.
+   Already reachable and fine: `WriteDataFilesAsync` / `WriteChangeDataFilesAsync` / `UpdateRowsAsync` (public),
+   `ProtocolVersions.ValidateWriteSupport` and `RowTrackingConfig.TryGetMaterializedColumnNames` (public static).
+3. **It would REVERSE a deliberate consolidation.** `DeltaReader.cs:2408` records that the Bridge assembled this
+   by hand *until the EW method landed*, and collapsing it was a simplification. Undoing that re-creates the
+   code we already decided to delete.
+
+### The right move instead: offer it upstream as the missing half of EW's OWN symmetry
+
+This is not a fabricator-specific concept — it is a **gap in EW's own API**, and the vocabulary for it already
+exists upstream:
+
+- main has `RowDeleteMode { DeletionVector, CopyOnWrite }` (`RowDeleteMode.cs:10`) and
+  `DeleteRowsAsync(RowSelection, RowDeleteMode)`.
+- main's `UpdateRowsAsync(RowSelection, rewriteFile, ct)` (`DeltaTable.cs:6343`) has **no mode parameter** — it
+  always copy-on-writes.
+
+So the offer is `UpdateRowsAsync(…, RowUpdateMode)` mirroring `RowDeleteMode`, implemented with the DV machinery
+EW already owns. That is framed in Curt's own pattern rather than ours, it makes DELETE and UPDATE symmetric,
+and if accepted it takes the largest negotiable block of our divergence toward zero **and** removes the
+`internal`-access problem entirely, because the code stays where its dependencies live.
+
+**Ordering note:** offer `ConflictChecker` first — it is 42 self-contained lines with 7 tests and no API
+surface. The `RowUpdateMode` offer is a public API addition and will want discussion.
+
+### `ExemptRowLevelFromWholeTableRead` — offerable, with a caution
+
+`DeltaTransaction.cs` +26. Per the §2026-08-01 record it was wired LAST and nothing failed until it was;
+`DeclareFilesRead` (#25) does **not** retire it, because declaring the files a scan touched drops the APPEND
+rule, which is the phantom-row protection `serializable` exists for. Offer it only with that reasoning attached
+— on its own it looks like a way to weaken isolation.
+
 ## isBlindAppend — an UPSTREAM OFFER and an OPEN FINDING (2026-08-01)
 
 Written down before the context that produced it is lost. Two separable items: a fix that is ready to
@@ -2261,3 +2352,66 @@ row above is.
 declaration must outrank our inference in BOTH directions; (3) the prunable-predicate check — MOOT, see
 above; (4) build the WRITING half — cleared to proceed, scoped as in the table above, with the live A/B
 re-run as its gate.
+### 2b. THE READING HALF AS SHIPPED — and it does **NOT** match Delta (established 2026-08-03)
+
+The reading half is on `fabricator-patches` (`ConflictChecker.cs` +42) and is the piece being offered upstream.
+Recorded here in full because the earlier note called it "FIXED" without qualifying what it fixes.
+
+**What it does.** `IsBlindAppend(actions)` now scans for a `CommitInfo` carrying `isBlindAppend`; if the value is
+an actual JSON boolean it is returned. Otherwise it falls through to `InferBlindAppend(actions)` — the previous
+logic, renamed and byte-unchanged ("at least one add, and no remove/metadata/protocol").
+
+**Three decisions, none symmetric:**
+
+| case | behaviour | why |
+|---|---|---|
+| flag PRESENT | believed, in **both** directions | a declaration outranks any inference — including a declared `false` on an adds-only commit, which is the read-then-append case |
+| flag ABSENT | fall back to the inference | almost every writer in the wild omits it (**EW included**), so "not blind" would conflict on ordinary appends |
+| flag NON-BOOLEAN | treated as absent | a hint we cannot read is no better than one that is not there |
+
+**How EW consumes the verdict** (unchanged by us):
+`bool examineAdds = isolation == IsolationLevel.Serializable || !concurrentIsBlindAppend;`
+
+**⚠ TWO DIVERGENCES FROM DELTA — do NOT describe this as "matching Delta".** Read from
+`delta-io/delta` `ConflictChecker.scala` at the **`v4.2.0`** tag:
+
+1. **The ABSENT case, and ours is the WEAKER one.** Delta is
+   `val blindAppendAddedFiles = if (isBlindAppendOption.getOrElse(false)) addedFiles else Seq()` — **absent means
+   NOT blind**, so those adds stay in `changedDataAddedFiles` and ARE examined even under WriteSerializable.
+   Delta even computes the same shape predicate we infer from —
+   `val onlyAddFiles = actions.collect { case f: FileAction => f }.forall(_.isInstanceOf[AddFile])` — and
+   **pointedly does not use it** for blind-append. So our fallback is precisely the inference Delta declined to
+   make. Ours is a deliberate back-compat choice, not parity: EW emits no flag itself, so `getOrElse(false)`
+   would make ordinary EW-to-EW concurrent appends start conflicting.
+   ⇒ **"FIXED" means fixed for DECLARED commits only.** The undeclared case is exactly as permissive as before.
+2. **The metadata guard (uninvestigated).** Delta's WriteSerializable branch is
+   `case WriteSerializable if !currentTransactionInfo.metadataChanged => winningCommitSummary.changedDataAddedFiles`,
+   falling through to `changedDataAddedFiles ++ blindAppendAddedFiles` otherwise — so a metadata change in **our
+   own** transaction re-examines blind appends. EW's `examineAdds` has no such condition. Not investigated; do
+   not claim equivalence before it is.
+
+**Delta's full usage, for reference:**
+```scala
+val addedFilesToCheckForConflicts = isolationLevel match {
+  case WriteSerializable if !currentTransactionInfo.metadataChanged =>
+    winningCommitSummary.changedDataAddedFiles
+  case Serializable | WriteSerializable =>
+    winningCommitSummary.changedDataAddedFiles ++ winningCommitSummary.blindAppendAddedFiles
+  case SnapshotIsolation => Seq.empty
+}
+```
+
+**Tests (7, in `ConflictCheckerTests.cs` +157):** `DeclaredNotBlind_OnAddsOnlyCommit_Conflicts_WriteSerializable`,
+`DeclaredBlind_Passes_WriteSerializable`, `DeclaredBlind_OutranksInference_WhenCommitAlsoRemoves`,
+`DeclaredBlind_StillConflicts_Serializable`, `AbsentFlag_FallsBackToInference`, `MalformedFlag_FallsBackToInference`,
+`IsBlindAppend_SurvivesTheLogRoundTrip`. **The last is load-bearing**: without it the six verdict tests could all
+pass while pinning dead code, because nothing would establish that a real commit's flag reaches the checker.
+
+**The WRITING half is still absent — verified by grep, not memory:** `isBlindAppend` appears nowhere in our EW
+tree outside `ConflictChecker`. We read the flag and never emit one, which is why Fabric Spark aborts against our
+concurrent appends (absent ⇒ not blind in Delta, so our adds land in `changedDataAddedFiles` under both levels).
+
+**When offering upstream, offer BOTH shapes and let Curt choose:** (1) as we run it — believe the flag, fall back
+to the inference (backwards-compatible); (2) Delta parity — believe the flag, absent means not blind (safer, but
+changes conflict behaviour for every flag-less writer, so it wants a release note).
+
