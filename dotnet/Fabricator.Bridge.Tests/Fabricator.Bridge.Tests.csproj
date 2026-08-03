@@ -1,0 +1,46 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>Fabricator.Bridge.Tests</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <!-- Runs on both TFMs (inherited): net8.0 is the deployment floor, net10.0 the default. -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" Version="6.0.4" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <!--
+    ⚠ THERE IS NO ProjectReference TO Fabricator.Bridge, AND ADDING ONE WOULD BREAK THIS TIER.
+
+    Fabricator.Bridge project-references engineered-wood (a git SUBMODULE), plus Apache.Arrow, the
+    Fabric SDK, SqlClient, the AWS and Azure SDKs. Referencing it here would make these tests require an
+    initialised submodule and a large restore — and tier 0's whole point is that it runs with no C++, no
+    vcpkg and no submodules, in about two minutes.
+
+    So this project COMPILES SELECTED BRIDGE SOURCE FILES directly. The admission rule is the
+    constraint that keeps the tier cheap:
+
+        a Bridge file belongs here only if its closure is the .NET base class library.
+
+    That is a feature, not a workaround. It rewards keeping decision logic — parsing, resolution,
+    rendering — free of the Arrow/SDK boundary, which is exactly what makes it testable. A file that
+    cannot be admitted is telling you it has business logic entangled with I/O.
+
+    To test something new: if it is already BCL-only, link it below. If it is not, extract the
+    decidable part into a file that is (FabricVariableLibraryFormat.cs was split out of
+    FabricVariableFunctions.cs for precisely this reason), and link that.
+  -->
+  <ItemGroup>
+    <Compile Include="..\Fabricator.Bridge\FabricApi\FabricVariableLibraryFormat.cs"
+             Link="Linked\FabricVariableLibraryFormat.cs" />
+  </ItemGroup>
+
+</Project>

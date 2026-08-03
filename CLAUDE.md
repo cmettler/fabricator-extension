@@ -743,12 +743,22 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
       normalizing belongs on read) fixed by re-serializing through a `Utf8JsonWriter`. **The offline round trip
       was blind to it because `ToJsonString()` emits compact JSON — the harness was reading back its own
       formatting convention. A round trip only tests the shapes you generate.**
-    - Coverage: 56 offline format checks (write→read round trip + the pretty-printed case), 2 mutants killed, and
-      the live lifecycle incl. three negative controls (unknown value set, undeclared override, mistyped value)
-      each erroring with the library left unchanged. **No committed gate for the decoder** — the harness is an
-      ad-hoc console project compiling `FabricVariableLibraryFormat.cs` directly, which is why that file is kept
-      free of Arrow/SDK/bridge dependencies; a `Fabricator.Bridge.Tests` project in tier 0 is the obvious home if
-      we want it durable (not taken). The live script is manual, like `verify_dax`.
+    - Coverage: the live lifecycle incl. three negative controls (unknown value set, undeclared override,
+      mistyped value) each erroring with the library left unchanged — plus **`dotnet/Fabricator.Bridge.Tests`,
+      THE FIRST TEST PROJECT FOR BRIDGE LOGIC** (2026-08-03): 47 cases × {net10.0, net8.0} in ~100 ms over the
+      format, incl. the write→read round trip, the pretty-printed case, and a named test per documentation
+      contradiction. **Mutation-tested with three mutants, each killed at exactly its own tests** (folder
+      spelling → 6; the docs' `value: String` → 4, incl. Integer; `Render`→`GetRawText` → 2).
+      - **⚠ It has NO `ProjectReference` to `Fabricator.Bridge`, and adding one would BREAK TIER 0** — the Bridge
+        project-references **engineered-wood (a submodule)** plus Arrow/Fabric SDK/SqlClient/AWS/Azure, and tier
+        0's defining property is needing no C++, no vcpkg and no submodules. It **compiles selected Bridge source
+        files directly**, admission rule: *a file belongs there only if its closure is the BCL*. A forcing
+        function, not a workaround — it rewards keeping parsing/resolution/rendering out of the Arrow/SDK
+        boundary, which is why `FabricVariableLibraryFormat.cs` was split out in the first place.
+      - **⚠ NOT WIRED INTO CI (deliberate, user-directed).** `installer-core.yml` names
+        `Fabricator.Installer.Core.Tests` explicitly and was left untouched, so nothing runs these on a push —
+        `dotnet test dotnet/Fabricator.Bridge.Tests` locally only. **The tier-0 row in the CI table below does
+        NOT cover them.**
   - Output shape rule (D4): typed flat columns + one raw-JSON column for polymorphic parts; **no STRUCT
     wrapping** (adding a column is additive for `SELECT *`; adding a struct FIELD changes a column's type
     and breaks bound views), no JSON-only. Every `table`-kind function also gets a dead `_each` sibling —
@@ -2030,6 +2040,7 @@ commits do not compile DuckDB:
 | tier | workflow | what | trigger |
 |---|---|---|---|
 | 0 | `installer-core.yml` | `Fabricator.Installer.Core.Tests`, 92 × {net8.0,net10.0} × {win,linux}. No C++, no vcpkg, no submodules (the closure is Installer.Core + xunit). ~2 min | push/PR |
+| — | (not wired) | **`Fabricator.Bridge.Tests`** — 47 × {net8.0,net10.0}, the variable-library format. Tier-0-SHAPED (BCL-only closure, no submodule) but **deliberately absent from every workflow**: run `dotnet test dotnet/Fabricator.Bridge.Tests` by hand. Wiring it is a one-line addition to `installer-core.yml`, left undone on purpose | by hand |
 | 1 | `extension.yml` | build + the **53 hermetic suites / 4152 assertions** (scratch dir + in-repo fixtures only). 3 platforms | push/PR |
 | 2 | `integration.yml` | the **42 service suites / 1221 assertions** via `docker/docker-compose.yml` (SQL Server 2025 + MinIO + generated certs + `provision.ps1`). linux only | schedule + dispatch |
 | 3 | `distribution.yml` | the single-file artifact per platform + the **12-check smoke against a STOCK DuckDB wheel** (`test/distribution/smoke_distribution.py`). 3 platforms; needs `OVERRIDE_GIT_DESCRIBE` (the one tier that does) | dispatch + `v*` tags |

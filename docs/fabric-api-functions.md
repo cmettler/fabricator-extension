@@ -1284,18 +1284,41 @@ several variables in one write, and remember each `fabric_variable()` call in a 
 definition read (step 8's two columns were two reads). This is the price of "no cache across calls"; it is the
 right default for configuration, but it is not cheap.
 
-### Verified offline
+### Verified offline — `dotnet/Fabricator.Bridge.Tests`, the format's committed gate
 
-56 checks over the format, including a **write → read round trip** (build documents with the write helpers,
-decode them with the reader) which is what proves the two halves agree, plus the pretty-printed-input case
-above. Mutation-tested twice — removing the path-separator normalization, and believing the docs'
-`value: String` for overrides — each killing exactly the assertions written for it.
+**47 test cases × {net10.0, net8.0}, ~100 ms.** Includes a **write → read round trip** (build documents with
+the write helpers, decode them with the reader), which is what proves the two halves agree rather than each
+being self-consistent — and, separately, the pretty-printed-storage case, because *the round trip is
+structurally blind to formatting defects*: it serializes compactly, so it reads back its own convention. Each
+of the four documentation contradictions has a named test, so a future "simplification" that trusts the docs
+fails here and says which page misled it.
 
-**No committed gate exists for the format decoder.** The harness is an ad-hoc console project that compiles
-`FabricVariableLibraryFormat.cs` directly (which is why that file is deliberately free of Arrow, SDK and
-bridge dependencies — the separation is what makes it exercisable at all). A `Fabricator.Bridge.Tests` project
-in tier 0 is the obvious home if we want it durable; that is a structural decision, not taken here. The live
-script is the only end-to-end gate, and it is manual — like `verify_dax`.
+**Mutation-tested, three mutants, each killed at exactly the tests written for it:**
+
+| mutant | killed |
+|---|---|
+| accept only the `valueSets` folder spelling | 6, incl. both `valueSet/…` theory cases and the "reads every value set" control |
+| override `value` read as String only (what the docs say) | 4, incl. the Integer case |
+| `Render` back to `GetRawText()` | 2, the pretty-printed and object-value tests |
+
+**⚠ THE PROJECT HAS NO `ProjectReference` TO `Fabricator.Bridge`, AND ADDING ONE WOULD BREAK TIER 0.** The
+Bridge project-references **engineered-wood, a git submodule**, plus Arrow, the Fabric SDK, SqlClient and the
+AWS/Azure SDKs — and tier 0 exists precisely because it needs no C++, no vcpkg and no submodules. So the test
+project **compiles selected Bridge source files directly**, with one admission rule:
+
+> a Bridge file belongs in that project only if its closure is the .NET base class library.
+
+That is a forcing function, not a workaround: it rewards keeping decision logic (parsing, resolution,
+rendering) out of the Arrow/SDK boundary, which is exactly what makes it testable. `FabricVariableLibraryFormat.cs`
+was split out of `FabricVariableFunctions.cs` for this reason. A file that cannot be admitted is telling you
+its logic is entangled with I/O.
+
+**⚠ It is NOT wired into CI (deliberate, 2026-08-03).** `installer-core.yml` names
+`Fabricator.Installer.Core.Tests` explicitly and was left alone, so nothing runs these on a push — they are a
+local `dotnet test dotnet/Fabricator.Bridge.Tests` only. Do not read the tier-0 row in CLAUDE.md's CI table as
+covering them.
+
+The end-to-end path remains gated only by the manual live script, like `verify_dax`.
 
 ## 10. The full API sweep — every area, with a verdict
 
