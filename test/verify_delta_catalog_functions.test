@@ -86,14 +86,27 @@ SELECT * FROM fab_delta_info();
 # ---- 4. NEGATIVE CONTROL: the Fabric REST functions are absent on a non-OneLake root ----
 #
 # They are registered only for a OneLake root (DeltaCatalog.BuildFunctionSet). This root is local, so none of
-# them may appear — and the count form is deliberate: it fails loudly if ANY fabric_* function leaks in, whereas
-# probing one name by hand would miss the others. That generality is now doing real work: the set has grown to
-# ~40 functions across shortcuts, jobs, semantic models, git, deployment pipelines and platform reads, and this
-# one assertion guards every one of them against being registered where it cannot possibly work.
-
+# them may appear — and the count form is deliberate: it fails loudly if ANY of them leaks in, whereas probing
+# one name by hand would miss the others. That generality is doing real work: the set is ~51 functions across
+# shortcuts, jobs, semantic models, git, deployment pipelines, variable libraries, sessions and platform reads,
+# and this one assertion guards every one of them against being registered where it cannot possibly work.
+#
+# ⚠ KEYED ON THE SCHEMA, NOT ON A NAME PREFIX. This used to read `function_name LIKE 'fabric\_%'`, which was
+# correct while the functions were named fabric_*; once they moved into the `fabric` SCHEMA and dropped the
+# prefix, that pattern matched NOTHING WHETHER OR NOT THE SET WAS REGISTERED — a tripwire that looks armed and
+# is not. Do not reintroduce a name-prefix form here.
 query I
 SELECT count(*) FROM duckdb_functions()
-WHERE database_name = 'lake' AND function_name LIKE 'fabric\_%' ESCAPE '\';
+WHERE database_name = 'lake' AND schema_name = 'fabric';
+----
+0
+
+# And the SCHEMA itself must not be advertised. This is the sharper assertion of the two, because the schema
+# declaration IS the gate: the host silently DROPS a declared function whose schema it did not register, so if
+# CatalogSchemaNames ever stopped gating on IsOneLake, the functions above would appear here.
+query I
+SELECT count(*) FROM information_schema.schemata
+WHERE catalog_name = 'lake' AND schema_name = 'fabric';
 ----
 0
 

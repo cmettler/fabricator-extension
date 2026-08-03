@@ -732,7 +732,9 @@ public sealed class DeltaCatalog : IBackendCatalog
 
     public IArrowArrayStream GetMetadata(int kind, string? schema, string? table) => kind switch
     {
-        MetadataKind.Schemas => SingleColumn("schema_name", SchemaNames()),
+        // CatalogSchemaNames, not SchemaNames: the advertised set includes the `fabric` function namespace on a
+        // OneLake root. See CatalogSchemaNames for why the two lists must stay separate.
+        MetadataKind.Schemas => SingleColumn("schema_name", CatalogSchemaNames()),
         MetadataKind.Tables => DiscoverTables(),
         // Columns = a zero-row stream whose SCHEMA describes the table's columns (engineered-wood's Delta schema).
         MetadataKind.Columns => new InMemoryArrayStream(
@@ -1169,6 +1171,72 @@ public sealed class DeltaCatalog : IBackendCatalog
             return new List<string>(schemas);
         }
         return new[] { MainSchema };
+    }
+
+    /// <summary>
+    /// The schemas this catalog ADVERTISES: the discovered DATA schemas plus, on a OneLake root, the
+    /// <c>fabric</c> function namespace.
+    /// </summary>
+    /// <remarks>
+    /// <para>Deliberately distinct from <see cref="SchemaNames"/>, and the split is load-bearing in BOTH
+    /// directions:</para>
+    /// <list type="bullet">
+    ///   <item>The host drops a declared function whose schema it did not register
+    ///   (<c>FabricatorCatalog::LoadCatalog</c>), so WITHOUT this the entire Fabric function set would silently
+    ///   cease to exist — no error, just ~50 missing functions.</item>
+    ///   <item>Conversely <see cref="SchemaNames"/> must NOT include it, because that list is what the
+    ///   <c>__all__</c> sentinel expands over: adding <c>fabric</c> there would re-declare the provider's
+    ///   macros and <c>fab_delta_info</c> inside it, which is the per-schema duplication that moving the Fabric
+    ///   functions out of <c>__all__</c> exists to remove.</item>
+    /// </list>
+    /// <para>Gated on the SAME condition as the registration in <see cref="BuildFunctionSet"/> — a local or S3
+    /// Delta attach registers no Fabric functions and so must advertise no <c>fabric</c> schema, or it would
+    /// gain a permanently empty one.</para>
+    /// </remarks>
+    /// <summary>
+    /// Refuses DDL that would put a TABLE into the <c>fabric</c> function namespace.
+    /// </summary>
+    /// <remarks>
+    /// <para>The schema is synthetic — declared by this provider to host functions, backed by no storage — but
+    /// the host cannot know that and will happily route <c>CREATE TABLE cat.fabric.t</c> here, which would
+    /// create a real Delta table in a <c>fabric/</c> folder. Nothing would break immediately; the damage is that
+    /// on the next ATTACH <c>fabric</c> is ALSO discovered as a data schema, so a namespace deliberately
+    /// separated from the user's tables quietly stops being separate, and the folder now has to be cleaned up by
+    /// hand.</para>
+    /// <para>Refusing costs one comparison and names the fix. It applies only where the synthetic schema exists
+    /// (a OneLake root) — elsewhere <c>fabric</c> is an ordinary name a user is entitled to use for their own
+    /// data, and forbidding it there would be inventing a reserved word.</para>
+    /// </remarks>
+    private void RejectFunctionSchemaDdl(string schemaName, string what)
+    {
+        if (FabricLakehouse.IsOneLake(_root)
+            && string.Equals(schemaName, FabricApiFunctions.SchemaName, System.StringComparison.OrdinalIgnoreCase))
+        {
+            throw new System.NotSupportedException(
+                $"{what}: '{FabricApiFunctions.SchemaName}' is this catalog's Fabric FUNCTION namespace, not a "
+                + "storage schema — it holds no tables and is backed by no folder. Create the table in a data "
+                + "schema instead.");
+        }
+    }
+
+    private IReadOnlyList<string> CatalogSchemaNames()
+    {
+        var data = SchemaNames();
+        if (!FabricLakehouse.IsOneLake(_root))
+        {
+            return data;
+        }
+        var all = new List<string>(data.Count + 1);
+        all.AddRange(data);
+        // Defensive: a DATA schema literally called "fabric" would otherwise be listed twice, and a duplicate
+        // schema name is a host-side ensure_schema collision rather than a merge. Case-INSENSITIVE on purpose:
+        // DuckDB resolves schema names that way, so a lakehouse schema named "Fabric" collides just as hard
+        // (and this matches RejectFunctionSchemaDdl and the SqlServer side, which must agree on the answer).
+        if (!all.Contains(FabricApiFunctions.SchemaName, System.StringComparer.OrdinalIgnoreCase))
+        {
+            all.Add(FabricApiFunctions.SchemaName);
+        }
+        return all;
     }
 
     /// <summary>
@@ -2407,6 +2475,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                             IReadOnlyList<string>? partitionColumns, IReadOnlyList<string>? sortColumns,
                             IReadOnlyList<string>? identityColumns, string? optionsJson)
     {
+        RejectFunctionSchemaDdl(schemaName, $"CREATE TABLE {tableName}");
         // Commit 0 itself is metadata-only, but a variant table is unusable without the native paths — fail
         // the CREATE up front with the actionable ATTACH-option error rather than at the first INSERT/SELECT.
         EnsureVariantWritable(columns);

@@ -60,7 +60,7 @@ internal static class FabricPromotionFunctions
 }
 
 /// <summary>
-/// <c>fabric_git_status()</c> — the workspace's uncommitted/unpulled changes against its connected git branch.
+/// <c>fabric.git_status()</c> — the workspace's uncommitted/unpulled changes against its connected git branch.
 /// </summary>
 /// <remarks>
 /// The two heads (<c>workspace_head</c>, <c>remote_commit_hash</c>) are repeated on every change row rather than
@@ -74,7 +74,7 @@ internal sealed class FabricGitStatusFunction : FabricRowsFunction
     {
     }
 
-    public override string Name => "fabric_git_status";
+    public override string Name => "git_status";
 
     public override Schema NamedParameters { get; } =
         new Schema(new[] { FabricApiFunctions.Str("workspace") }, null);
@@ -125,7 +125,7 @@ internal sealed class FabricGitStatusFunction : FabricRowsFunction
     }
 }
 
-/// <summary><c>fabric_git_connection()</c> — which repository/branch the workspace is connected to, and when it
+/// <summary><c>fabric.git_connection()</c> — which repository/branch the workspace is connected to, and when it
 /// last synced.</summary>
 internal sealed class FabricGitConnectionFunction : FabricRowsFunction
 {
@@ -133,7 +133,7 @@ internal sealed class FabricGitConnectionFunction : FabricRowsFunction
     {
     }
 
-    public override string Name => "fabric_git_connection";
+    public override string Name => "git_connection";
 
     public override Schema NamedParameters { get; } =
         new Schema(new[] { FabricApiFunctions.Str("workspace") }, null);
@@ -167,12 +167,12 @@ internal sealed class FabricGitConnectionFunction : FabricRowsFunction
 }
 
 /// <summary>
-/// <c>fabric_git_commit([mode := 'All'] [, comment := …] [, items_json := …] [, workspace_head := …])</c> —
+/// <c>fabric.git_commit([mode := 'All'] [, comment := …] [, items_json := …] [, workspace_head := …])</c> —
 /// commits the workspace's changes to the connected branch.
 /// </summary>
 /// <remarks>
 /// <c>workspace_head</c> is the API's OPTIMISTIC CONCURRENCY token: supplying the head you read from
-/// <c>fabric_git_status()</c> makes the commit fail rather than overwrite if someone else committed in between.
+/// <c>fabric.git_status()</c> makes the commit fail rather than overwrite if someone else committed in between.
 /// Omitting it commits unconditionally, which is why it is worth exposing at all.
 /// </remarks>
 internal sealed class FabricGitCommitFunction : FabricRowsFunction
@@ -181,7 +181,7 @@ internal sealed class FabricGitCommitFunction : FabricRowsFunction
     {
     }
 
-    public override string Name => "fabric_git_commit";
+    public override string Name => "git_commit";
 
     public override Schema NamedParameters { get; } = new Schema(new[]
     {
@@ -221,8 +221,8 @@ internal sealed class FabricGitCommitFunction : FabricRowsFunction
         if (mode == CommitMode.Selective && ids.Count == 0)
         {
             throw new NotSupportedException(
-                "fabric_git_commit: mode := 'Selective' needs items_json, e.g. "
-                + "items_json := '[\"<object-id>\", …]' (read the ids from fabric_git_status()).");
+                "git_commit: mode := 'Selective' needs items_json, e.g. "
+                + "items_json := '[\"<object-id>\", …]' (read the ids from git_status()).");
         }
         FabricApiClient.Wrap("git_commit", () => Api.Client.Core.Git.CommitToGit(
             ws, request, cancellationToken: ct,
@@ -249,7 +249,7 @@ internal sealed class FabricGitCommitFunction : FabricRowsFunction
         {
             return CommitMode.Selective;
         }
-        throw new NotSupportedException($"fabric_git_commit: mode must be 'All' or 'Selective', not '{mode}'.");
+        throw new NotSupportedException($"git_commit: mode must be 'All' or 'Selective', not '{mode}'.");
     }
 
     /// <summary>
@@ -266,7 +266,7 @@ internal sealed class FabricGitCommitFunction : FabricRowsFunction
         using var doc = JsonDocument.Parse(json!);
         if (doc.RootElement.ValueKind != JsonValueKind.Array)
         {
-            throw new NotSupportedException("fabric_git_commit: items_json must be a JSON array.");
+            throw new NotSupportedException("git_commit: items_json must be a JSON array.");
         }
         foreach (var e in doc.RootElement.EnumerateArray())
         {
@@ -289,7 +289,7 @@ internal sealed class FabricGitCommitFunction : FabricRowsFunction
             if (id.ObjectId is null && id.LogicalId is null)
             {
                 throw new NotSupportedException(
-                    "fabric_git_commit: each items_json element must be an item GUID, or an object with "
+                    "git_commit: each items_json element must be an item GUID, or an object with "
                     + "\"object_id\" or \"logical_id\".");
             }
             result.Add(id);
@@ -299,12 +299,12 @@ internal sealed class FabricGitCommitFunction : FabricRowsFunction
 }
 
 /// <summary>
-/// <c>fabric_git_update(remote_commit_hash [, conflict_resolution := 'PreferRemote'] [, allow_override := …])</c>
+/// <c>fabric.git_update(remote_commit_hash [, conflict_resolution := 'PreferRemote'] [, allow_override := …])</c>
 /// — pulls the branch's content into the workspace.
 /// </summary>
 /// <remarks>
 /// The hash is REQUIRED and positional on purpose: updating to "whatever is on the branch now" is how a promotion
-/// flow silently deploys a commit nobody reviewed. Read it from <c>fabric_git_status()</c> in the same script.
+/// flow silently deploys a commit nobody reviewed. Read it from <c>fabric.git_status()</c> in the same script.
 /// </remarks>
 internal sealed class FabricGitUpdateFunction : FabricRowsFunction
 {
@@ -312,7 +312,7 @@ internal sealed class FabricGitUpdateFunction : FabricRowsFunction
     {
     }
 
-    public override string Name => "fabric_git_update";
+    public override string Name => "git_update";
 
     public override Schema Parameters { get; } =
         new Schema(new[] { FabricApiFunctions.Str("remote_commit_hash") }, null);
@@ -338,8 +338,8 @@ internal sealed class FabricGitUpdateFunction : FabricRowsFunction
         if (string.IsNullOrWhiteSpace(args[0]))
         {
             throw new NotSupportedException(
-                "fabric_git_update: pass the remote commit hash to update to "
-                + "(read it from fabric_git_status().remote_commit_hash).");
+                "git_update: pass the remote commit hash to update to "
+                + "(read it from git_status().remote_commit_hash).");
         }
         var ws = Api.ResolveWorkspace(args[5]);
         var request = new UpdateFromGitRequest(args[0]!);
@@ -373,18 +373,18 @@ internal sealed class FabricGitUpdateFunction : FabricRowsFunction
             return ConflictResolutionPolicy.PreferWorkspace;
         }
         throw new NotSupportedException(
-            $"fabric_git_update: conflict_resolution must be 'PreferRemote' or 'PreferWorkspace', not '{value}'.");
+            $"git_update: conflict_resolution must be 'PreferRemote' or 'PreferWorkspace', not '{value}'.");
     }
 }
 
-/// <summary><c>fabric_deployment_pipelines()</c> — the pipelines this identity can see.</summary>
+/// <summary><c>fabric.deployment_pipelines()</c> — the pipelines this identity can see.</summary>
 internal sealed class FabricDeploymentPipelinesFunction : FabricRowsFunction
 {
     internal FabricDeploymentPipelinesFunction(FabricApiClient api) : base(api)
     {
     }
 
-    public override string Name => "fabric_deployment_pipelines";
+    public override string Name => "deployment_pipelines";
 
     protected override Schema Columns { get; } = new(new[]
     {
@@ -403,7 +403,7 @@ internal sealed class FabricDeploymentPipelinesFunction : FabricRowsFunction
     }
 }
 
-/// <summary><c>fabric_deployment_pipeline_stages(pipeline)</c> — a pipeline's stages, in order, with the
+/// <summary><c>fabric.deployment_pipeline_stages(pipeline)</c> — a pipeline's stages, in order, with the
 /// workspace assigned to each.</summary>
 internal sealed class FabricDeploymentStagesFunction : FabricRowsFunction
 {
@@ -411,7 +411,7 @@ internal sealed class FabricDeploymentStagesFunction : FabricRowsFunction
     {
     }
 
-    public override string Name => "fabric_deployment_pipeline_stages";
+    public override string Name => "deployment_pipeline_stages";
 
     public override Schema Parameters { get; } =
         new Schema(new[] { FabricApiFunctions.Str("pipeline") }, null);
@@ -444,7 +444,7 @@ internal sealed class FabricDeploymentStagesFunction : FabricRowsFunction
     }
 }
 
-/// <summary><c>fabric_deployment_pipeline_items(pipeline, stage)</c> — what a stage contains, and when each item
+/// <summary><c>fabric.deployment_pipeline_items(pipeline, stage)</c> — what a stage contains, and when each item
 /// was last deployed.</summary>
 internal sealed class FabricDeploymentStageItemsFunction : FabricRowsFunction
 {
@@ -452,7 +452,7 @@ internal sealed class FabricDeploymentStageItemsFunction : FabricRowsFunction
     {
     }
 
-    public override string Name => "fabric_deployment_pipeline_items";
+    public override string Name => "deployment_pipeline_items";
 
     public override Schema Parameters { get; } = new Schema(new[]
     {
@@ -490,7 +490,7 @@ internal sealed class FabricDeploymentStageItemsFunction : FabricRowsFunction
 }
 
 /// <summary>
-/// <c>fabric_deploy(pipeline, source_stage, target_stage [, note := …] [, wait_seconds := …])</c> — deploys one
+/// <c>fabric.deploy(pipeline, source_stage, target_stage [, note := …] [, wait_seconds := …])</c> — deploys one
 /// stage's content into the next.
 /// </summary>
 /// <remarks>
@@ -505,7 +505,7 @@ internal sealed class FabricDeployFunction : FabricRowsFunction
     {
     }
 
-    public override string Name => "fabric_deploy";
+    public override string Name => "deploy";
 
     public override Schema Parameters { get; } = new Schema(new[]
     {
@@ -542,7 +542,7 @@ internal sealed class FabricDeployFunction : FabricRowsFunction
     }
 }
 
-/// <summary><c>fabric_deployment_pipeline_operations(pipeline)</c> — deployment history, newest first, for
+/// <summary><c>fabric.deployment_pipeline_operations(pipeline)</c> — deployment history, newest first, for
 /// asserting that the last deploy actually succeeded.</summary>
 internal sealed class FabricDeploymentOperationsFunction : FabricRowsFunction
 {
@@ -550,12 +550,12 @@ internal sealed class FabricDeploymentOperationsFunction : FabricRowsFunction
     {
     }
 
-    public override string Name => "fabric_deployment_pipeline_operations";
+    public override string Name => "deployment_pipeline_operations";
 
     public override Schema Parameters { get; } =
         new Schema(new[] { FabricApiFunctions.Str("pipeline") }, null);
 
-    /// <summary>Shared with <c>fabric_deploy</c> so a submitted deploy and a history row read identically.</summary>
+    /// <summary>Shared with <c>deploy</c> so a submitted deploy and a history row read identically.</summary>
     internal static Schema OperationColumns { get; } = new(new[]
     {
         FabricApiFunctions.Str("operation_id"),

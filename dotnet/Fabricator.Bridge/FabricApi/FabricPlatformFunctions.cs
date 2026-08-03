@@ -16,7 +16,7 @@ namespace Fabricator.Bridge;
 /// 2 excludes; a data-access role WRITE is folder security policy from a SQL string (rule 1); and
 /// starting/stopping mirroring reconfigures someone else's ingestion pipeline, which is not something a
 /// transformation should do as a side effect.</para>
-/// <para>Mirroring is the one area §10 filed as "skip, but WATCH", naming <c>fabric_mirroring_status</c> as what
+/// <para>Mirroring is the one area §10 filed as "skip, but WATCH", naming <c>mirroring_status</c> as what
 /// would justify revisiting it — a mirrored table is only trustworthy once its replication has caught up, so
 /// checking that before reading it is exactly a data-path concern.</para>
 /// </remarks>
@@ -33,7 +33,7 @@ internal static class FabricPlatformFunctions
     }
 }
 
-/// <summary><c>fabric_capacities()</c> — the capacities this identity can see, with SKU and region.</summary>
+/// <summary><c>fabric.capacities()</c> — the capacities this identity can see, with SKU and region.</summary>
 /// <remarks>
 /// Useful on its own for answering "is the workspace I am writing to on a Fabric capacity" — which decides
 /// whether an enhanced semantic-model refresh is even permitted (shared capacity cannot run one).
@@ -44,7 +44,7 @@ internal sealed class FabricCapacitiesFunction : FabricRowsFunction
     {
     }
 
-    public override string Name => "fabric_capacities";
+    public override string Name => "capacities";
 
     protected override Schema Columns { get; } = new(new[]
     {
@@ -71,10 +71,10 @@ internal sealed class FabricCapacitiesFunction : FabricRowsFunction
 }
 
 /// <summary>
-/// <c>fabric_environments()</c> — the workspace's Spark environments and their publish state.
+/// <c>fabric.environments()</c> — the workspace's Spark environments and their publish state.
 /// </summary>
 /// <remarks>
-/// This is the name→id helper §10 anticipated: <c>fabric_run_notebook</c>'s <c>config_json</c> can pin an
+/// This is the name→id helper §10 anticipated: <c>run_notebook</c>'s <c>config_json</c> can pin an
 /// environment, and the id is otherwise only visible in the portal URL. <c>publish_state</c> matters because a
 /// notebook run against an environment whose publish is still <c>Running</c> does not get the libraries it
 /// expects.
@@ -85,7 +85,7 @@ internal sealed class FabricEnvironmentsFunction : FabricRowsFunction
     {
     }
 
-    public override string Name => "fabric_environments";
+    public override string Name => "environments";
 
     public override Schema NamedParameters { get; } =
         new Schema(new[] { FabricApiFunctions.Str("workspace") }, null);
@@ -121,7 +121,7 @@ internal sealed class FabricEnvironmentsFunction : FabricRowsFunction
 }
 
 /// <summary>
-/// <c>fabric_data_access_roles([item := …])</c> — the OneLake data-access roles defined on an item.
+/// <c>fabric.data_access_roles([item := …])</c> — the OneLake data-access roles defined on an item.
 /// </summary>
 /// <remarks>
 /// <para>READ only (rule 1). Reading matters for a very practical reason: OneLake role scoping is a common cause
@@ -138,7 +138,7 @@ internal sealed class FabricDataAccessRolesFunction : FabricRowsFunction
     {
     }
 
-    public override string Name => "fabric_data_access_roles";
+    public override string Name => "data_access_roles";
 
     public override Schema NamedParameters { get; } = new Schema(new[]
     {
@@ -179,7 +179,7 @@ internal sealed class FabricDataAccessRolesFunction : FabricRowsFunction
     }
 }
 
-/// <summary><c>fabric_mirrored_databases()</c> — the workspace's mirrored databases and where their Delta tables
+/// <summary><c>fabric.mirrored_databases()</c> — the workspace's mirrored databases and where their Delta tables
 /// land in OneLake.</summary>
 /// <remarks>
 /// <c>onelake_tables_path</c> is the actionable column: it is the path a Delta <c>ATTACH</c> can point at to read
@@ -191,7 +191,7 @@ internal sealed class FabricMirroredDatabasesFunction : FabricRowsFunction
     {
     }
 
-    public override string Name => "fabric_mirrored_databases";
+    public override string Name => "mirrored_databases";
 
     public override Schema NamedParameters { get; } =
         new Schema(new[] { FabricApiFunctions.Str("workspace") }, null);
@@ -226,14 +226,14 @@ internal sealed class FabricMirroredDatabasesFunction : FabricRowsFunction
     }
 }
 
-/// <summary><c>fabric_mirroring_status(database)</c> — whether a mirrored database is actually replicating.</summary>
+/// <summary><c>fabric.mirroring_status(database)</c> — whether a mirrored database is actually replicating.</summary>
 internal sealed class FabricMirroringStatusFunction : FabricRowsFunction
 {
     internal FabricMirroringStatusFunction(FabricApiClient api) : base(api)
     {
     }
 
-    public override string Name => "fabric_mirroring_status";
+    public override string Name => "mirroring_status";
 
     public override Schema Parameters { get; } =
         new Schema(new[] { FabricApiFunctions.Str("database") }, null);
@@ -262,7 +262,7 @@ internal sealed class FabricMirroringStatusFunction : FabricRowsFunction
 }
 
 /// <summary>
-/// <c>fabric_mirrored_tables(database)</c> — per-table replication state and freshness.
+/// <c>fabric.mirrored_tables(database)</c> — per-table replication state and freshness.
 /// </summary>
 /// <remarks>
 /// <c>last_sync_time</c> and <c>last_sync_latency_seconds</c> are why this is worth having in SQL: they let a
@@ -274,7 +274,7 @@ internal sealed class FabricMirroredTablesFunction : FabricRowsFunction
     {
     }
 
-    public override string Name => "fabric_mirrored_tables";
+    public override string Name => "mirrored_tables";
 
     public override Schema Parameters { get; } =
         new Schema(new[] { FabricApiFunctions.Str("database") }, null);

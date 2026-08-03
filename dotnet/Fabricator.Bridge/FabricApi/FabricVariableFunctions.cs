@@ -20,7 +20,7 @@ namespace Fabricator.Bridge;
 /// <c>VariableLibraryProperties.ActiveValueSetName</c>; every value lives inside the item's DEFINITION as
 /// base64 parts. So resolution is ours: decode <c>variables.json</c> for the defaults, decode
 /// <c>valueSets/&lt;name&gt;.json</c> for the sparse overrides, overlay by name. Same shape as
-/// <c>fabric_notebook_parameters</c>. The format itself lives in <see cref="VariableLibraryFormat"/>.</para>
+/// <c>notebook_parameters</c>. The format itself lives in <see cref="VariableLibraryFormat"/>.</para>
 /// <para><b>⚠ Reading the definition is a LONG-RUNNING OPERATION</b> (the SDK method takes
 /// <c>timeoutInMinutes</c>), like <c>GetNotebookDefinition</c>. Every function here reads it at most once per
 /// call, and <see cref="FabricVariableFunction"/> deduplicates by library across an argument batch.</para>
@@ -65,7 +65,7 @@ internal static class VariableLibraryReader
         if (string.IsNullOrWhiteSpace(library))
         {
             throw new NotSupportedException(
-                "fabric variables: name the variable library (list them with fabric_variable_libraries()).");
+                "fabric variables: name the variable library (list them with variable_libraries()).");
         }
         var ws = api.ResolveWorkspace(workspace);
         var id = api.ResolveItem(library, FabricVariableFunctions.ItemType, ws);
@@ -93,11 +93,11 @@ internal static class VariableLibraryReader
 }
 
 // ---------------------------------------------------------------------------------------------------
-// fabric_variable_libraries() — the cheap listing.
+// variable_libraries() — the cheap listing.
 // ---------------------------------------------------------------------------------------------------
 
 /// <summary>
-/// <c>fabric_variable_libraries()</c> — the variable libraries in this catalog's workspace, with the value set
+/// <c>fabric.variable_libraries()</c> — the variable libraries in this catalog's workspace, with the value set
 /// each one currently has active.
 /// </summary>
 /// <remarks>Cheap: a plain list, no definition read. The active value set comes straight off the item's
@@ -108,7 +108,7 @@ internal sealed class FabricVariableLibrariesFunction : FabricRowsFunction
     {
     }
 
-    public override string Name => "fabric_variable_libraries";
+    public override string Name => "variable_libraries";
 
     /// <summary><c>workspace := 'OtherWS'</c> — list another workspace's libraries.</summary>
     public override Schema NamedParameters { get; } =
@@ -142,16 +142,16 @@ internal sealed class FabricVariableLibrariesFunction : FabricRowsFunction
 }
 
 // ---------------------------------------------------------------------------------------------------
-// fabric_variables(library [, value_set := …]) — the workhorse.
+// variables(library [, value_set := …]) — the workhorse.
 // ---------------------------------------------------------------------------------------------------
 
 /// <summary>
-/// <c>fabric_variables(library [, value_set := 'prod'] [, workspace := …])</c> — one row per variable, resolved
+/// <c>fabric.variables(library [, value_set := 'prod'] [, workspace := …])</c> — one row per variable, resolved
 /// against the active value set (or the one named).
 /// </summary>
 /// <remarks>
 /// <para><b>Not cheap</b>: reads the item definition, a long-running operation. Never call it per row — that is
-/// what <c>fabric_variable()</c> is for.</para>
+/// what <c>fabric.variable()</c> is for.</para>
 /// <para><c>value</c> is the value as text; <c>value_json</c> is the same value as JSON (a String variable's is
 /// quoted, so it stays parseable). For an <c>ItemReference</c> both carry the object, so
 /// <c>value_json -&gt;&gt; 'itemId'</c> gets the id.</para>
@@ -162,7 +162,7 @@ internal sealed class FabricVariablesFunction : FabricRowsFunction
     {
     }
 
-    public override string Name => "fabric_variables";
+    public override string Name => "variables";
 
     public override Schema Parameters { get; } =
         new Schema(new[] { FabricApiFunctions.Str("library") }, null);
@@ -202,15 +202,15 @@ internal sealed class FabricVariablesFunction : FabricRowsFunction
 }
 
 // ---------------------------------------------------------------------------------------------------
-// fabric_variable_value_sets(library) — which environments this library defines.
+// variable_value_sets(library) — which environments this library defines.
 // ---------------------------------------------------------------------------------------------------
 
 /// <summary>
-/// <c>fabric_variable_value_sets(library [, workspace := …])</c> — the alternative value sets, in the library's
+/// <c>fabric.variable_value_sets(library [, workspace := …])</c> — the alternative value sets, in the library's
 /// declared order, flagging which is active.
 /// </summary>
 /// <remarks>
-/// <para>Reads the definition (an LRO), same cost as <c>fabric_variables</c>.</para>
+/// <para>Reads the definition (an LRO), same cost as <c>variables</c>.</para>
 /// <para>The DEFAULT value set has no file under <c>valueSets/</c> — it is <c>variables.json</c> itself — so it
 /// is not a row here. A library with no alternatives returns zero rows, which is legitimate.</para>
 /// </remarks>
@@ -220,7 +220,7 @@ internal sealed class FabricVariableValueSetsFunction : FabricRowsFunction
     {
     }
 
-    public override string Name => "fabric_variable_value_sets";
+    public override string Name => "variable_value_sets";
 
     public override Schema Parameters { get; } =
         new Schema(new[] { FabricApiFunctions.Str("library") }, null);
@@ -249,17 +249,17 @@ internal sealed class FabricVariableValueSetsFunction : FabricRowsFunction
 }
 
 // ---------------------------------------------------------------------------------------------------
-// fabric_variable(library, name) — the scalar, for use as an argument.
+// variable(library, name) — the scalar, for use as an argument.
 // ---------------------------------------------------------------------------------------------------
 
 /// <summary>
-/// <c>fabric_variable(library, name)</c> — one variable's value, resolved against the active value set, as text.
+/// <c>fabric.variable(library, name)</c> — one variable's value, resolved against the active value set, as text.
 /// </summary>
 /// <remarks>
 /// <para><b>Declared CONSISTENT (<see cref="IsVolatile"/> = false), and that is load-bearing.</b> The default
 /// for a scalar here is VOLATILE, and a volatile function is never constant-folded — so with the default this
 /// would run once per row of whatever it was selected over. As CONSISTENT,
-/// <c>SELECT fabric_variable('cfg','x') FROM big_table</c> folds to a literal in the optimizer
+/// <c>SELECT variable('cfg','x') FROM big_table</c> folds to a literal in the optimizer
 /// (<c>BoundFunctionExpression::IsFoldable</c> is exactly <c>stability != VOLATILE</c>) and the definition is
 /// read ONCE. Used as a table-function argument it is evaluated once regardless: the binder calls
 /// <c>EvaluateScalar</c> at bind time, with <c>allow_unfoldable</c> set.</para>
@@ -268,13 +268,13 @@ internal sealed class FabricVariableValueSetsFunction : FabricRowsFunction
 /// unexpected.</para>
 /// <para><b>Cost.</b> One definition read (an LRO) per distinct library in the argument batch — so the
 /// ordinary constant-argument call is one read, and even
-/// <c>SELECT fabric_variable('cfg', name) FROM t</c> (a shape <c>fabric_variables()</c> serves better) does not
+/// <c>SELECT variable('cfg', name) FROM t</c> (a shape <c>fabric.variables()</c> serves better) does not
 /// read once per row. There is deliberately no cache ACROSS calls: that needs a staleness policy, and this is
 /// configuration people expect to be able to change.</para>
 /// <para><b>The active value set is the only one reachable here, on purpose.</b> A variable name is not bound
 /// to a value set — the library has exactly one active set at a time, and that is what every other consumer
 /// (a notebook, a pipeline) resolves through. Reading a DIFFERENT set is an inspection need, served by
-/// <c>fabric_variables(…, value_set := …)</c>; it cannot be offered here because DuckDB scalar functions have
+/// <c>fabric.variables(…, value_set := …)</c>; it cannot be offered here because DuckDB scalar functions have
 /// no named parameters and match arity exactly, so a third positional argument would break the two-argument
 /// call this exists for.</para>
 /// <para>For the same reason there is no <c>workspace :=</c> override: this always reads the attach's
@@ -286,8 +286,8 @@ internal sealed class FabricVariableFunction : ICatalogScalarFunction
 
     internal FabricVariableFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => CatalogFunctionSet.AllSchemas;
-    public string Name => "fabric_variable";
+    public string SchemaName => FabricApiFunctions.SchemaName;
+    public string Name => "variable";
 
     public Schema Parameters { get; } = new Schema(new[]
     {
@@ -329,7 +329,7 @@ internal sealed class FabricVariableFunction : ICatalogScalarFunction
             if (!values.TryGetValue(name!, out var value))
             {
                 throw new NotSupportedException(
-                    $"fabric_variable: '{library}' declares no variable named '{name}' "
+                    $"variable: '{library}' declares no variable named '{name}' "
                     + $"(it has: {(values.Count == 0 ? "none" : string.Join(", ", values.Keys.OrderBy(k => k)))}).");
             }
             b.Append(value);

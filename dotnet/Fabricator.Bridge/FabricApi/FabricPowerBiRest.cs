@@ -141,7 +141,7 @@ internal sealed partial class FabricApiClient
         }
         throw new NotSupportedException(
             $"powerbi: semantic model '{nameOrId}' not found in workspace {workspaceId} "
-            + "(list them with fabric_semantic_models()).");
+            + "(list them with semantic_models()).");
     }
 
     /// <summary>

@@ -43,8 +43,8 @@ SELECT fabricator_exec('fdb', 'DROP FUNCTION IF EXISTS dbo.tvf_one');
 # that can only fail. See docs/fabric-api-functions.md §9h.
 #
 # The cf_* count on the next assertion is the POSITIVE CONTROL and is the point of it: a zero for
-# fabric_* proves "not advertised" only if some custom function IS advertised through the same
-# path. Without it this section would pass just as happily against a catalog that registered
+# the Fabric set proves "not advertised" only if some custom function IS advertised through the
+# same path. Without it this section would pass just as happily against a catalog that registered
 # nothing at all.
 query I
 SELECT count(*) > 0 FROM duckdb_functions()
@@ -52,9 +52,14 @@ WHERE database_name = 'fdb' AND function_name LIKE 'cf\_%' ESCAPE '\';
 ----
 true
 
+# ⚠ KEYED ON THE SCHEMA, NOT ON A NAME PREFIX. This read `function_name LIKE 'fabric\_%'` while the
+# functions were named fabric_*; once they moved into the `fabric` SCHEMA and dropped the prefix,
+# that pattern matched NOTHING whether or not the set was registered — vacuously green. The schema
+# is also the truer assertion: SqlServerBackend.SchemasMetadata only unions the synthetic name in on
+# a Fabric endpoint, and without it the host drops every declared function silently.
 query I
 SELECT count(*) FROM duckdb_functions()
-WHERE database_name = 'fdb' AND function_name LIKE 'fabric\_%' ESCAPE '\';
+WHERE database_name = 'fdb' AND schema_name = 'fabric';
 ----
 0
 

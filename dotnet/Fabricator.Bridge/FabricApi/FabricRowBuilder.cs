@@ -23,11 +23,13 @@ internal sealed class FabricRowBuilder
 {
     private readonly Schema _schema;
     private readonly IArrowArrayBuilder<IArrowArray>[] _builders;
+    private readonly int[] _appended;
 
     internal FabricRowBuilder(Schema schema)
     {
         _schema = schema;
         _builders = new IArrowArrayBuilder<IArrowArray>[schema.FieldsList.Count];
+        _appended = new int[schema.FieldsList.Count];
         for (int i = 0; i < _builders.Length; i++)
         {
             _builders[i] = Create(schema.FieldsList[i]);
@@ -43,14 +45,32 @@ internal sealed class FabricRowBuilder
         ArrowTypeId.Int64 => new Int64Array.Builder(),
         ArrowTypeId.Int32 => new Int32Array.Builder(),
         ArrowTypeId.Boolean => new BooleanArray.Builder(),
+        ArrowTypeId.Double => new DoubleArray.Builder(),
         ArrowTypeId.Timestamp => new TimestampArray.Builder((TimestampType)f.DataType),
         _ => throw new NotSupportedException(
             $"fabric: column '{f.Name}' has type {f.DataType.Name}, which FabricRowBuilder does not build."),
     };
 
     /// <summary>Marks one row complete. Call after writing every column.</summary>
+    /// <remarks>
+    /// Verifies that EVERY column received exactly one value for this row, and names the ones that did not.
+    /// Without this a skipped column is nearly silent: its builder ends up shorter than the others, and what
+    /// surfaces is a length mismatch deep in <see cref="RecordBatch"/> construction — or, if two columns are
+    /// skipped in different rows, a batch that builds fine with values shifted into the wrong rows. Since
+    /// column identity here is a bare INDEX, that off-by-one is the mistake this class exists to prevent, so
+    /// it is worth catching at the row that caused it rather than at Build.
+    /// </remarks>
     internal FabricRowBuilder EndRow()
     {
+        for (int i = 0; i < _appended.Length; i++)
+        {
+            if (_appended[i] != Rows + 1)
+            {
+                throw new InvalidOperationException(
+                    $"fabric: row {Rows} wrote {_appended[i] - Rows} values to column {i} " +
+                    $"('{_schema.FieldsList[i].Name}'); each column takes exactly one value per row.");
+            }
+        }
         Rows++;
         return this;
     }
@@ -73,6 +93,14 @@ internal sealed class FabricRowBuilder
             var i32 = (Int32Array.Builder)b;
             if (value.HasValue) { i32.Append((int)value.Value); } else { i32.AppendNull(); }
         }
+        return this;
+    }
+
+    /// <summary>A DOUBLE column — for a measure the service reports as a real number (a duration in seconds).</summary>
+    internal FabricRowBuilder Dbl(int col, double? value)
+    {
+        var b = (DoubleArray.Builder)Expect(col, ArrowTypeId.Double);
+        if (value.HasValue) { b.Append(value.Value); } else { b.AppendNull(); }
         return this;
     }
 
@@ -115,6 +143,9 @@ internal sealed class FabricRowBuilder
             throw new InvalidOperationException(
                 $"fabric: column '{_schema.FieldsList[col].Name}' is {actual}, written as {allowed[0]}.");
         }
+        // Every append routes through here exactly once (Iso delegates to Ts), so this is the one place the
+        // per-column count can be maintained for EndRow's check.
+        _appended[col]++;
         return _builders[col];
     }
 

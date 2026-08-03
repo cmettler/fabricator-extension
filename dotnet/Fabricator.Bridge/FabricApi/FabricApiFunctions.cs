@@ -16,6 +16,34 @@ namespace Fabricator.Bridge;
 /// </summary>
 public static class FabricApiFunctions
 {
+    /// <summary>
+    /// The schema every function in this set lives in: <c>&lt;catalog&gt;.fabric.&lt;name&gt;</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>A dedicated schema rather than the <c>__all__</c> sentinel</b>, which is what these used to use.
+    /// Three reasons, in order of how much they matter:</para>
+    /// <list type="number">
+    ///   <item>The sentinel advertises every function once PER DISCOVERED SCHEMA, so on a schema-enabled
+    ///   lakehouse with <c>dbo</c> and <c>dbt</c> each of these appeared TWICE in <c>duckdb_functions()</c> —
+    ///   ~50 functions rendered as ~100 entries. One schema means one entry each.</item>
+    ///   <item><c>fabric.sessions()</c> says what it is; the old <c>dbo.fabric&#95;sessions()</c> encoded the
+    ///   grouping in a NAME PREFIX because there was nowhere else to put it, and put API surface in the schema
+    ///   the user's own TABLES live in.</item>
+    ///   <item>It separates namespaces that were only ever conflated by accident: <c>dbo</c> is a DATA schema
+    ///   the provider discovered from storage, <c>fabric</c> is a function namespace the provider declares.</item>
+    /// </list>
+    /// <para><b>⚠ The name must be declared PROVIDER-SIDE as a schema, or every function here silently
+    /// vanishes.</b> <c>FabricatorCatalog::LoadCatalog</c> skips a declared function whose schema it did not
+    /// discover (<c>if (sit == schemas_.end()) continue;</c>) — deliberately, because that is how the ATTACH
+    /// <c>schema_filter</c> reaches functions. So each hosting catalog must add this name to the schema
+    /// metadata it answers, and ONLY when this set is actually registered. See
+    /// <c>DeltaCatalog.CatalogSchemaNames</c> and <c>SqlServerBackend.SchemasMetadata</c>.</para>
+    /// <para><b>⚠ It must NOT join the <c>__all__</c> expansion list.</b> That list means "every DATA schema",
+    /// and feeding this name into it would declare the provider's <c>__all__</c> macros and
+    /// <c>fab_delta_info</c> inside <c>fabric</c> too — the duplication this change exists to remove.</para>
+    /// </remarks>
+    public const string SchemaName = "fabric";
+
     /// <param name="workspace">Default workspace (display name or GUID); null/empty ⇒ callers must pass
     /// <c>workspace :=</c>.</param>
     /// <param name="item">Default item (display name, <c>name.Type</c>, or GUID); null/empty ⇒ callers must
@@ -34,18 +62,18 @@ public static class FabricApiFunctions
         var api = new FabricApiClient(context);
 
         // ONE registration per table function: its options are DuckDB NAMED parameters, so
-        // `fabric_refresh_sql_endpoint()` and `fabric_refresh_sql_endpoint(recreate := true)` are the same
+        // `refresh_sql_endpoint()` and `refresh_sql_endpoint(recreate := true)` are the same
         // function. (This replaced an `_ex` sibling per function, which existed only because positional table
         // arguments have no defaults — see the named-parameter support in fabricator_schema_entry.cpp.)
         tables.Add(new FabricRefreshSqlEndpointFunction(api));
         tables.Add(new FabricListShortcutsFunction(api));
-        scalars.Add(new FabricCreateShortcutFunction(api, "fabric_create_shortcut", ShortcutMode.Create));
-        scalars.Add(new FabricCreateShortcutFunction(api, "fabric_alter_shortcut", ShortcutMode.Alter));
+        scalars.Add(new FabricCreateShortcutFunction(api, "create_shortcut", ShortcutMode.Create));
+        scalars.Add(new FabricCreateShortcutFunction(api, "alter_shortcut", ShortcutMode.Alter));
         // `_ex` adds the conflict policy. Without it a OneLake-target caller could not reach
         // CreateOrOverwrite / GenerateUniqueName at all (only the JSON variant took a policy), and
         // CreateOrOverwrite is the right shape for an IDEMPOTENT script: Fabric's shortcut metadata is
         // eventually consistent, so drop-then-create can transiently 409 on the name it just removed.
-        scalars.Add(new FabricCreateShortcutFunction(api, "fabric_create_shortcut_ex", ShortcutMode.Create,
+        scalars.Add(new FabricCreateShortcutFunction(api, "create_shortcut_ex", ShortcutMode.Create,
                                                      withPolicy: true));
         scalars.Add(new FabricCreateShortcutJsonFunction(api));
         scalars.Add(new FabricDropShortcutFunction(api));
@@ -71,6 +99,12 @@ public static class FabricApiFunctions
         // read its target from the library instead of hardcoding it. Reading VALUES means reading the item
         // DEFINITION (an LRO) — there is no effective-value API.
         FabricVariableFunctions.Register(scalars, tables, api);
+        // Spark/Livy session monitoring. Complements the job functions rather than overlapping them: this is
+        // the SPARK-level detail (queued vs running time, runtime version, attempt) that a job instance does
+        // not carry, and job instances cover item kinds that never produce a Livy session. Workspace-scoped, so
+        // one request — no fan-out, and no item argument. (The two DO join on job_instance_id — measured; see
+        // FabricSessionFunctions for the two claims the live data falsified.)
+        FabricSessionFunctions.Register(tables, api);
     }
 
     internal enum ShortcutMode
@@ -141,6 +175,9 @@ public static class FabricApiFunctions
     internal static Field Int32(string name) => new(name, Int32Type.Default, nullable: true);
 
     internal static Field Bool(string name) => new(name, BooleanType.Default, nullable: true);
+
+    /// <summary>A DOUBLE column — where the service reports a real-valued measure (a duration in seconds).</summary>
+    internal static Field Dbl(string name) => new(name, DoubleType.Default, nullable: true);
 }
 
 /// <summary>
@@ -195,11 +232,11 @@ internal abstract class FabricTableBinding : IArrowTableFunctionBinding
 }
 
 // ---------------------------------------------------------------------------------------------------
-// fabric_refresh_sql_endpoint() — THE dbt unblocker.
+// refresh_sql_endpoint() — THE dbt unblocker.
 // ---------------------------------------------------------------------------------------------------
 
 /// <summary>
-/// <c>db.&lt;schema&gt;.fabric_refresh_sql_endpoint([recreate [, timeout_seconds]])</c> — forces the lakehouse's
+/// <c>db.fabric.refresh_sql_endpoint([recreate [, timeout_seconds]])</c> — forces the lakehouse's
 /// SQL analytics endpoint to sync its metadata NOW, returning one row per table with its sync status.
 /// </summary>
 /// <remarks>
@@ -221,15 +258,15 @@ internal sealed class FabricRefreshSqlEndpointFunction : ICatalogTableFunction
 
     internal FabricRefreshSqlEndpointFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => CatalogFunctionSet.AllSchemas;
-    public string Name => "fabric_refresh_sql_endpoint";
+    public string SchemaName => FabricApiFunctions.SchemaName;
+    public string Name => "refresh_sql_endpoint";
 
     /// <summary>No positional arguments — everything comes from the ATTACH.</summary>
     public Schema Parameters { get; } = new Schema(System.Array.Empty<Field>(), null);
 
     /// <summary>
-    /// All optional: <c>fabric_refresh_sql_endpoint(recreate := true)</c>, and
-    /// <c>fabric_refresh_sql_endpoint(item := 'OtherLH')</c> to refresh a DIFFERENT lakehouse's endpoint than
+    /// All optional: <c>fabric.refresh_sql_endpoint(recreate := true)</c>, and
+    /// <c>fabric.refresh_sql_endpoint(item := 'OtherLH')</c> to refresh a DIFFERENT lakehouse's endpoint than
     /// the one this catalog is attached to — a dbt project commonly writes to several.
     /// </summary>
     public Schema NamedParameters { get; } = new Schema(new[]
@@ -328,14 +365,14 @@ internal sealed class FabricRefreshSqlEndpointFunction : ICatalogTableFunction
 // ---------------------------------------------------------------------------------------------------
 
 /// <summary>
-/// <c>fabric_create_shortcut(path, name, target_workspace, target_item, target_path)</c> and its
-/// <c>fabric_alter_shortcut</c> twin — a OneLake-internal shortcut, the case that needs no pre-provisioned
+/// <c>fabric.create_shortcut(path, name, target_workspace, target_item, target_path)</c> and its
+/// <c>alter_shortcut</c> twin — a OneLake-internal shortcut, the case that needs no pre-provisioned
 /// connection. External targets go through <see cref="FabricCreateShortcutJsonFunction"/>.
 /// </summary>
 /// <remarks>
 /// Returns the created shortcut's full path. <c>target_workspace</c>/<c>target_item</c> accept a display name or
 /// a GUID, and NULL means "this catalog's own workspace / lakehouse" — so a same-lakehouse shortcut is
-/// <c>fabric_create_shortcut('Tables', 'ref', NULL, NULL, 'Tables/orders')</c>.
+/// <c>fabric.create_shortcut('Tables', 'ref', NULL, NULL, 'Tables/orders')</c>.
 /// </remarks>
 internal sealed class FabricCreateShortcutFunction : ICatalogScalarFunction
 {
@@ -365,7 +402,7 @@ internal sealed class FabricCreateShortcutFunction : ICatalogScalarFunction
         Parameters = new Schema(fields, null);
     }
 
-    public string SchemaName => CatalogFunctionSet.AllSchemas;
+    public string SchemaName => FabricApiFunctions.SchemaName;
     public string Name { get; }
 
     public Schema Parameters { get; }
@@ -426,13 +463,13 @@ internal sealed class FabricCreateShortcutFunction : ICatalogScalarFunction
 }
 
 /// <summary>
-/// <c>fabric_create_shortcut_json(path, name, target_json [, conflict_policy])</c> — the full target union as the
+/// <c>fabric.create_shortcut_json(path, name, target_json [, conflict_policy])</c> — the full target union as the
 /// REST <c>target</c> object verbatim, e.g.
 /// <c>'{"adlsGen2":{"location":"https://acct.dfs.core.windows.net","subpath":"/c/d","connectionId":"…"}}'</c>.
 /// </summary>
 /// <remarks>
 /// Deliberately a JSON passthrough rather than eight flattened sibling functions: every external target needs a
-/// pre-provisioned <c>connectionId</c> anyway (see <c>fabric_connections</c>), and Microsoft documents that
+/// pre-provisioned <c>connectionId</c> anyway (see <c>connections</c>), and Microsoft documents that
 /// target types get ADDED over time — a passthrough survives that, a flattened signature per member does not.
 /// </remarks>
 internal sealed class FabricCreateShortcutJsonFunction : ICatalogScalarFunction
@@ -441,8 +478,8 @@ internal sealed class FabricCreateShortcutJsonFunction : ICatalogScalarFunction
 
     internal FabricCreateShortcutJsonFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => CatalogFunctionSet.AllSchemas;
-    public string Name => "fabric_create_shortcut_json";
+    public string SchemaName => FabricApiFunctions.SchemaName;
+    public string Name => "create_shortcut_json";
 
     public Schema Parameters { get; } = new Schema(new[]
     {
@@ -470,7 +507,7 @@ internal sealed class FabricCreateShortcutJsonFunction : ICatalogScalarFunction
     });
 }
 
-/// <summary><c>fabric_drop_shortcut(path, name [, if_exists])</c> → true when it was removed.</summary>
+/// <summary><c>fabric.drop_shortcut(path, name [, if_exists])</c> → true when it was removed.</summary>
 /// <remarks>
 /// Fabric 404s (<c>EntityNotFound</c>/<c>ShortcutNotFound</c>) on a missing shortcut — verified live — so the
 /// default is to fail loudly, and <c>if_exists := true</c> turns that single case into <c>false</c>. Any other
@@ -482,8 +519,8 @@ internal sealed class FabricDropShortcutFunction : ICatalogScalarFunction
 
     internal FabricDropShortcutFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => CatalogFunctionSet.AllSchemas;
-    public string Name => "fabric_drop_shortcut";
+    public string SchemaName => FabricApiFunctions.SchemaName;
+    public string Name => "drop_shortcut";
 
     public Schema Parameters { get; } = new Schema(new[]
     {
@@ -520,7 +557,7 @@ internal sealed class FabricDropShortcutFunction : ICatalogScalarFunction
 }
 
 /// <summary>
-/// <c>fabric_list_shortcuts([parent_path])</c> — the shortcuts of this catalog's lakehouse.
+/// <c>fabric.list_shortcuts([parent_path])</c> — the shortcuts of this catalog's lakehouse.
 /// </summary>
 /// <remarks>
 /// The output shape is the design rule from docs §D4 in miniature: stable fields as TYPED columns (flattened one
@@ -539,13 +576,13 @@ internal sealed class FabricListShortcutsFunction : ICatalogTableFunction
 
     internal FabricListShortcutsFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => CatalogFunctionSet.AllSchemas;
-    public string Name => "fabric_list_shortcuts";
+    public string SchemaName => FabricApiFunctions.SchemaName;
+    public string Name => "list_shortcuts";
 
     public Schema Parameters { get; } = new Schema(System.Array.Empty<Field>(), null);
 
     /// <summary>
-    /// <c>fabric_list_shortcuts(parent_path := 'Files')</c> — unset lists all; <c>workspace</c>/<c>item</c>
+    /// <c>fabric.list_shortcuts(parent_path := 'Files')</c> — unset lists all; <c>workspace</c>/<c>item</c>
     /// read a different item than the attached one.
     /// </summary>
     public Schema NamedParameters { get; } = new Schema(new[]

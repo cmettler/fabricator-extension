@@ -14,14 +14,14 @@ namespace Fabricator.Bridge;
 // ---------------------------------------------------------------------------------------------------
 // Variable-library WRITES.
 //
-// These are SCALARS, matching fabric_create_shortcut / fabric_drop_shortcut rather than the table-valued
+// These are SCALARS, matching create_shortcut / drop_shortcut rather than the table-valued
 // readers. Two reasons: a write wants typed positional arguments (FabricRowsFunction stringifies every
 // argument, so a BOOLEAN named parameter would silently read as NULL — the exact class of half-offered
 // capability this codebase keeps finding), and a scalar is what a setup script embeds.
 //
 // ⚠ EVERY function here must stay VOLATILE (the default — never set IsVolatile => false). A CONSISTENT
 // function is constant-folded at plan time, which for a write means it may run at bind, run once for a
-// hundred rows, or be elided entirely. The read-side fabric_variable() is CONSISTENT precisely because it
+// hundred rows, or be elided entirely. The read-side variable() is CONSISTENT precisely because it
 // is pure; these are its opposite.
 // ---------------------------------------------------------------------------------------------------
 
@@ -34,12 +34,12 @@ namespace Fabricator.Bridge;
 /// mutation here therefore reads all parts, replaces one, and sends them all back — that round trip is not
 /// defensive, it is the only correct way to change one variable.</para>
 /// <para><b>⚠ There is no ETag or If-Match on this API</b>, so the read-modify-write is LAST-WRITER-WINS:
-/// two concurrent <c>fabric_set_variable</c> calls against one library can lose one of the two changes. Set
-/// variables from one place, or use <c>fabric_set_variables_json</c>, which writes the whole document in a
+/// two concurrent <c>set_variable</c> calls against one library can lose one of the two changes. Set
+/// variables from one place, or use <c>set_variables_json</c>, which writes the whole document in a
 /// single call and so cannot interleave with itself.</para>
-/// <para><b>Cost</b>: both halves are long-running operations, so one <c>fabric_set_variable</c> is two LROs.
+/// <para><b>Cost</b>: both halves are long-running operations, so one <c>set_variable</c> is two LROs.
 /// Declaring several variables one call at a time is correspondingly slow;
-/// <c>fabric_set_variables_json</c> exists for that.</para>
+/// <c>set_variables_json</c> exists for that.</para>
 /// </remarks>
 internal static class VariableLibraryWriter
 {
@@ -143,7 +143,7 @@ internal static class VariableLibraryWriter
         if (string.IsNullOrWhiteSpace(library))
         {
             throw new NotSupportedException(
-                "fabric variables: name the variable library (list them with fabric_variable_libraries()).");
+                "fabric variables: name the variable library (list them with variable_libraries()).");
         }
         var ws = api.ResolveWorkspace(null);
         return (ws, api.ResolveItem(library, FabricVariableFunctions.ItemType, ws));
@@ -153,7 +153,7 @@ internal static class VariableLibraryWriter
 // ---------------------------------------------------------------------------------------------------
 
 /// <summary>
-/// <c>fabric_create_variable_library(name, description)</c> — creates an empty variable library, returning
+/// <c>fabric.create_variable_library(name, description)</c> — creates an empty variable library, returning
 /// its id. Pass NULL for no description.
 /// </summary>
 /// <remarks>
@@ -167,8 +167,8 @@ internal sealed class FabricCreateVariableLibraryFunction : ICatalogScalarFuncti
 
     internal FabricCreateVariableLibraryFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => CatalogFunctionSet.AllSchemas;
-    public string Name => "fabric_create_variable_library";
+    public string SchemaName => FabricApiFunctions.SchemaName;
+    public string Name => "create_variable_library";
 
     public Schema Parameters { get; } = new Schema(new[]
     {
@@ -186,7 +186,7 @@ internal sealed class FabricCreateVariableLibraryFunction : ICatalogScalarFuncti
         {
             var name = FabricArgs.Str(args, 0, row)
                        ?? throw new NotSupportedException(
-                           "fabric_create_variable_library: 'name' must not be NULL.");
+                           "create_variable_library: 'name' must not be NULL.");
             var request = new CreateVariableLibraryRequest(name);
             var description = FabricArgs.Str(args, 1, row);
             if (!string.IsNullOrEmpty(description))
@@ -204,7 +204,7 @@ internal sealed class FabricCreateVariableLibraryFunction : ICatalogScalarFuncti
 // ---------------------------------------------------------------------------------------------------
 
 /// <summary>
-/// <c>fabric_set_variable(library, name, type, value)</c> — declares a variable or replaces its DEFAULT value.
+/// <c>fabric.set_variable(library, name, type, value)</c> — declares a variable or replaces its DEFAULT value.
 /// Returns <c>'created'</c> or <c>'updated'</c>.
 /// </summary>
 /// <remarks>
@@ -222,8 +222,8 @@ internal sealed class FabricSetVariableFunction : ICatalogScalarFunction
 
     internal FabricSetVariableFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => CatalogFunctionSet.AllSchemas;
-    public string Name => "fabric_set_variable";
+    public string SchemaName => FabricApiFunctions.SchemaName;
+    public string Name => "set_variable";
 
     public Schema Parameters { get; } = new Schema(new[]
     {
@@ -242,10 +242,10 @@ internal sealed class FabricSetVariableFunction : ICatalogScalarFunction
         {
             var (ws, id) = VariableLibraryWriter.Resolve(_api, FabricArgs.Str(args, 0, row));
             var name = FabricArgs.Str(args, 1, row)
-                       ?? throw new NotSupportedException("fabric_set_variable: 'name' must not be NULL.");
+                       ?? throw new NotSupportedException("set_variable: 'name' must not be NULL.");
             var type = FabricArgs.Str(args, 2, row)
                        ?? throw new NotSupportedException(
-                           "fabric_set_variable: 'type' must not be NULL (e.g. 'String', 'Integer', 'ItemReference').");
+                           "set_variable: 'type' must not be NULL (e.g. 'String', 'Integer', 'ItemReference').");
             var value = VariableLibraryFormat.ValueFor(type, FabricArgs.Str(args, 3, row));
 
             var parts = VariableLibraryWriter.GetParts(_api, ws, id, CancellationToken.None);
@@ -263,7 +263,7 @@ internal sealed class FabricSetVariableFunction : ICatalogScalarFunction
 // ---------------------------------------------------------------------------------------------------
 
 /// <summary>
-/// <c>fabric_set_variables_json(library, variables_json)</c> — replaces the library's whole default variable
+/// <c>fabric.set_variables_json(library, variables_json)</c> — replaces the library's whole default variable
 /// set in ONE write. Returns the number of variables written.
 /// </summary>
 /// <remarks>
@@ -283,8 +283,8 @@ internal sealed class FabricSetVariablesJsonFunction : ICatalogScalarFunction
 
     internal FabricSetVariablesJsonFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => CatalogFunctionSet.AllSchemas;
-    public string Name => "fabric_set_variables_json";
+    public string SchemaName => FabricApiFunctions.SchemaName;
+    public string Name => "set_variables_json";
 
     public Schema Parameters { get; } = new Schema(new[]
     {
@@ -302,7 +302,7 @@ internal sealed class FabricSetVariablesJsonFunction : ICatalogScalarFunction
             var (ws, id) = VariableLibraryWriter.Resolve(_api, FabricArgs.Str(args, 0, row));
             var json = FabricArgs.Str(args, 1, row)
                        ?? throw new NotSupportedException(
-                           "fabric_set_variables_json: 'variables_json' must not be NULL.");
+                           "set_variables_json: 'variables_json' must not be NULL.");
             var doc = BuildVariablesDoc(json);
 
             var parts = VariableLibraryWriter.GetParts(_api, ws, id, CancellationToken.None);
@@ -323,14 +323,14 @@ internal sealed class FabricSetVariablesJsonFunction : ICatalogScalarFunction
         }
         catch (JsonException ex)
         {
-            throw new NotSupportedException($"fabric_set_variables_json: not valid JSON — {ex.Message}");
+            throw new NotSupportedException($"set_variables_json: not valid JSON — {ex.Message}");
         }
         var array = parsed switch
         {
             JsonArray a => a,
             JsonObject o when o["variables"] is JsonArray inner => inner,
             _ => throw new NotSupportedException(
-                "fabric_set_variables_json: expected a JSON array of variables, or an object with a "
+                "set_variables_json: expected a JSON array of variables, or an object with a "
                 + "'variables' array."),
         };
         var doc = VariableLibraryFormat.NewVariablesDoc();
@@ -339,18 +339,18 @@ internal sealed class FabricSetVariablesJsonFunction : ICatalogScalarFunction
             if (node is not JsonObject entry)
             {
                 throw new NotSupportedException(
-                    "fabric_set_variables_json: every element must be an object with name/type/value.");
+                    "set_variables_json: every element must be an object with name/type/value.");
             }
             var name = entry["name"]?.GetValue<string>()
                        ?? throw new NotSupportedException(
-                           "fabric_set_variables_json: an element is missing 'name'.");
+                           "set_variables_json: an element is missing 'name'.");
             var type = entry["type"]?.GetValue<string>()
                        ?? throw new NotSupportedException(
-                           $"fabric_set_variables_json: variable '{name}' is missing 'type'.");
+                           $"set_variables_json: variable '{name}' is missing 'type'.");
             if (entry["value"] is null)
             {
                 throw new NotSupportedException(
-                    $"fabric_set_variables_json: variable '{name}' is missing 'value'.");
+                    $"set_variables_json: variable '{name}' is missing 'value'.");
             }
             VariableLibraryFormat.UpsertVariable(
                 doc, name, type, entry["value"]!.DeepClone(), entry["note"]?.GetValue<string>());
@@ -362,7 +362,7 @@ internal sealed class FabricSetVariablesJsonFunction : ICatalogScalarFunction
 // ---------------------------------------------------------------------------------------------------
 
 /// <summary>
-/// <c>fabric_set_variable_override(library, value_set, name, value)</c> — sets a variable's value in an
+/// <c>fabric.set_variable_override(library, value_set, name, value)</c> — sets a variable's value in an
 /// alternative value set, creating the set if it does not exist. Returns <c>'created'</c> or <c>'updated'</c>.
 /// </summary>
 /// <remarks>
@@ -378,8 +378,8 @@ internal sealed class FabricSetVariableOverrideFunction : ICatalogScalarFunction
 
     internal FabricSetVariableOverrideFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => CatalogFunctionSet.AllSchemas;
-    public string Name => "fabric_set_variable_override";
+    public string SchemaName => FabricApiFunctions.SchemaName;
+    public string Name => "set_variable_override";
 
     public Schema Parameters { get; } = new Schema(new[]
     {
@@ -399,10 +399,10 @@ internal sealed class FabricSetVariableOverrideFunction : ICatalogScalarFunction
             var (ws, id) = VariableLibraryWriter.Resolve(_api, FabricArgs.Str(args, 0, row));
             var set = FabricArgs.Str(args, 1, row)
                       ?? throw new NotSupportedException(
-                          "fabric_set_variable_override: 'value_set' must not be NULL.");
+                          "set_variable_override: 'value_set' must not be NULL.");
             var name = FabricArgs.Str(args, 2, row)
                        ?? throw new NotSupportedException(
-                           "fabric_set_variable_override: 'name' must not be NULL.");
+                           "set_variable_override: 'name' must not be NULL.");
 
             var parts = VariableLibraryWriter.GetParts(_api, ws, id, CancellationToken.None);
             var variables = VariableLibraryWriter.PartObject(
@@ -411,8 +411,8 @@ internal sealed class FabricSetVariableOverrideFunction : ICatalogScalarFunction
             if (!VariableLibraryFormat.HasVariable(variables, name))
             {
                 throw new NotSupportedException(
-                    $"fabric_set_variable_override: '{name}' is not declared in this library — declare it "
-                    + "first with fabric_set_variable(), otherwise the override would never resolve.");
+                    $"set_variable_override: '{name}' is not declared in this library — declare it "
+                    + "first with set_variable(), otherwise the override would never resolve.");
             }
             var value = VariableLibraryFormat.ValueFor(type, FabricArgs.Str(args, 3, row));
 
@@ -430,7 +430,7 @@ internal sealed class FabricSetVariableOverrideFunction : ICatalogScalarFunction
 // ---------------------------------------------------------------------------------------------------
 
 /// <summary>
-/// <c>fabric_set_active_value_set(library, value_set)</c> — switches which value set the library resolves
+/// <c>fabric.set_active_value_set(library, value_set)</c> — switches which value set the library resolves
 /// through. Returns true.
 /// </summary>
 /// <remarks>
@@ -443,8 +443,8 @@ internal sealed class FabricSetActiveValueSetFunction : ICatalogScalarFunction
 
     internal FabricSetActiveValueSetFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => CatalogFunctionSet.AllSchemas;
-    public string Name => "fabric_set_active_value_set";
+    public string SchemaName => FabricApiFunctions.SchemaName;
+    public string Name => "set_active_value_set";
 
     public Schema Parameters { get; } = new Schema(new[]
     {
@@ -462,7 +462,7 @@ internal sealed class FabricSetActiveValueSetFunction : ICatalogScalarFunction
             var (ws, id) = VariableLibraryWriter.Resolve(_api, FabricArgs.Str(args, 0, row));
             var set = FabricArgs.Str(args, 1, row)
                       ?? throw new NotSupportedException(
-                          "fabric_set_active_value_set: 'value_set' must not be NULL.");
+                          "set_active_value_set: 'value_set' must not be NULL.");
             var request = new UpdateVariableLibraryRequest { Properties = new VariableLibraryProperties(set) };
             FabricApiClient.Wrap("set_active_value_set",
                 () => _api.Client.VariableLibrary.Items.UpdateVariableLibrary(ws, id, request));
@@ -475,7 +475,7 @@ internal sealed class FabricSetActiveValueSetFunction : ICatalogScalarFunction
 // ---------------------------------------------------------------------------------------------------
 
 /// <summary>
-/// <c>fabric_drop_variable_library(library, if_exists)</c> — deletes the library. Returns whether it was
+/// <c>fabric.drop_variable_library(library, if_exists)</c> — deletes the library. Returns whether it was
 /// there.
 /// </summary>
 internal sealed class FabricDropVariableLibraryFunction : ICatalogScalarFunction
@@ -484,8 +484,8 @@ internal sealed class FabricDropVariableLibraryFunction : ICatalogScalarFunction
 
     internal FabricDropVariableLibraryFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => CatalogFunctionSet.AllSchemas;
-    public string Name => "fabric_drop_variable_library";
+    public string SchemaName => FabricApiFunctions.SchemaName;
+    public string Name => "drop_variable_library";
 
     public Schema Parameters { get; } = new Schema(new[]
     {
@@ -507,7 +507,7 @@ internal sealed class FabricDropVariableLibraryFunction : ICatalogScalarFunction
             // "swallow anything".
             if (string.IsNullOrWhiteSpace(library))
             {
-                throw new NotSupportedException("fabric_drop_variable_library: 'library' must not be NULL.");
+                throw new NotSupportedException("drop_variable_library: 'library' must not be NULL.");
             }
             Guid ws, id;
             try

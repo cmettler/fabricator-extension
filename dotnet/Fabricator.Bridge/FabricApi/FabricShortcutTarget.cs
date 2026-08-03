@@ -6,8 +6,8 @@ namespace Fabricator.Bridge;
 
 /// <summary>
 /// Maps a shortcut target between the REST JSON union and the SDK model, in both directions:
-/// JSON → <see cref="CreatableShortcutTarget"/> for <c>fabric_create_shortcut_json</c>, and
-/// <see cref="Target"/> → flat columns + raw JSON for <c>fabric_list_shortcuts</c>.
+/// JSON → <see cref="CreatableShortcutTarget"/> for <c>create_shortcut_json</c>, and
+/// <see cref="Target"/> → flat columns + raw JSON for <c>list_shortcuts</c>.
 /// </summary>
 /// <remarks>
 /// Hand-mapped rather than fed to <c>JsonSerializer</c>: the SDK models are Azure.Core-generated with
@@ -217,7 +217,7 @@ internal static class FabricShortcutTarget
         var s = Str(o, name) ?? throw new NotSupportedException(
             $"fabric shortcut: target is missing '{name}'"
             + (name == "connectionId"
-                ? " — an external target needs a pre-provisioned cloud connection; list them with fabric_connections()."
+                ? " — an external target needs a pre-provisioned cloud connection; list them with connections()."
                 : "."));
         return System.Guid.TryParse(s, out var g)
             ? g
@@ -230,8 +230,8 @@ internal static class FabricShortcutPath
 {
     /// <summary>
     /// Drops surrounding slashes. Needed because the service RETURNS <c>/Files/staging</c> but ACCEPTS
-    /// <c>Files</c> — verified live — so without this, piping <c>fabric_list_shortcuts</c> into
-    /// <c>fabric_drop_shortcut</c> would 404.
+    /// <c>Files</c> — verified live — so without this, piping <c>list_shortcuts</c> into
+    /// <c>drop_shortcut</c> would 404.
     /// </summary>
     internal static string Strip(string? path) => (path ?? string.Empty).Trim('/');
 

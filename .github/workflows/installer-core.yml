@@ -7,8 +7,10 @@
 #   Fabricator.Installer.Core.Tests  the single-file-distribution logic (the payload packer, the
 #                                    polyglot reader/writer, DuckDB extension-directory resolution,
 #                                    the compatibility gate, the staging/locking extractor)
-#   Fabricator.Bridge.Tests          BRIDGE logic whose closure is the base class library — today
-#                                    the Fabric variable-library definition format
+#   Fabricator.Bridge.Tests          BRIDGE logic whose closure is the base class library — today the Fabric
+#                                    variable-library definition format and the Fabric SQL endpoint host
+#                                    derivation (an UNDOCUMENTED base32 encoding, so the case that most needs
+#                                    offline tests: it must return null, never a wrong workspace id)
 #
 # ⚠ The workflow is still called `installer-core` for a HISTORICAL reason and nothing more: renaming
 # it would rename every status check. Read it as "tier 0", not as "the installer".
@@ -173,9 +175,9 @@ jobs:
       # A floor, not an equality — adding tests must not break CI, losing them must.
       - name: Assert the suite actually ran
         env:
-          # 47 cases today (theories expand). Nothing here is platform-skipped, so Total is the same
-          # on both runners.
-          EXPECTED_MINIMUM: 47
+          # 85 cases today (theories expand): the variable-library format plus the Fabric SQL endpoint
+          # host/connstr derivation. Nothing here is platform-skipped, so Total is the same on both runners.
+          EXPECTED_MINIMUM: 85
         run: |
           total=$(grep -oE 'Total:[[:space:]]+[0-9]+' bridge-test-output.txt | grep -oE '[0-9]+' | head -1)
           if [ -z "$total" ]; then

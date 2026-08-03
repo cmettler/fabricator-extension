@@ -19,11 +19,11 @@ namespace Fabricator.Bridge;
 /// <para>This is the whole reason these functions are catalog-bound rather than global: dbt runs OFF Fabric
 /// compute, where the ambient chain finds nothing, and a GLOBAL function has no route to a DuckDB secret
 /// (secrets are resolved host-side, and the host-FS opener covers storage only — not REST). The attach already
-/// carries the credential, so <c>lake.dbo.fabric_refresh_sql_endpoint()</c> needs no arguments at all.</para>
+/// carries the credential, so <c>lake.fabric.refresh_sql_endpoint()</c> needs no arguments at all.</para>
 /// <para>The context is deliberately expressed as workspace+item rather than as the OneLake ATTACH ROOT it was
 /// originally parsed from. A root is a Delta-provider concept, and holding one here made the whole set
 /// unreachable from any other provider — which is what kept a dbt project on a Fabric <i>Warehouse</i> (a T-SQL
-/// attach, no OneLake root anywhere) from calling even <c>fabric_refresh_sql_endpoint</c>. Each provider now
+/// attach, no OneLake root anywhere) from calling even <c>refresh_sql_endpoint</c>. Each provider now
 /// supplies the pair however it knows it: Delta parses its root, SQL Server takes
 /// <c>workspace</c>/<c>item</c> ATTACH options. See docs/fabric-api-functions.md §9h.</para>
 /// </remarks>
@@ -76,8 +76,8 @@ internal sealed partial class FabricApiClient
         {
             throw new NotSupportedException(
                 "fabric: this catalog has no default workspace — pass one, e.g. workspace := 'My workspace'. "
-                + "(A Delta attach takes it from the OneLake root; a SQL Server attach from the "
-                + "`workspace` ATTACH option.)");
+                + "(A Delta attach takes it from the OneLake root's container; a Fabric SQL attach decodes it "
+                + "from the endpoint host, or takes the `API_WORKSPACE` ATTACH option when that fails.)");
         }
         if (Guid.TryParse(wanted, out var direct))
         {
@@ -172,7 +172,7 @@ internal sealed partial class FabricApiClient
         if (Blank(nameOrId))
         {
             throw new NotSupportedException(
-                "fabric: name the deployment pipeline (list them with fabric_deployment_pipelines()).");
+                "fabric: name the deployment pipeline (list them with deployment_pipelines()).");
         }
         if (Guid.TryParse(nameOrId, out var direct))
         {
@@ -210,7 +210,7 @@ internal sealed partial class FabricApiClient
         if (Blank(nameOrIdOrOrder))
         {
             throw new NotSupportedException(
-                "fabric: name the stage (list them with fabric_deployment_pipeline_stages(<pipeline>)).");
+                "fabric: name the stage (list them with deployment_pipeline_stages(<pipeline>)).");
         }
         if (Guid.TryParse(nameOrIdOrOrder, out var direct))
         {

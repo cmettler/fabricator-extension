@@ -14,7 +14,7 @@ namespace Fabricator.AnalysisServices;
 /// <c>dax_refresh_table</c> and <c>dax_refresh_partition</c>.
 /// </summary>
 /// <remarks>
-/// <para><b>Why these exist next to <c>fabric_refresh_semantic_model</c>, which already refreshes a model.</b>
+/// <para><b>Why these exist next to <c>fabric.refresh_semantic_model</c>, which already refreshes a model.</b>
 /// The Power BI REST enhanced-refresh API answers "refresh this model and tell me when it is done"; it cannot
 /// express per-partition work, and its <c>objects</c> list is submitted as one asynchronous request you then
 /// poll. TMSL over the XMLA endpoint is the other half: it addresses individual TABLES and PARTITIONS, and
@@ -46,7 +46,7 @@ internal static class DaxRefreshFunctions
     /// <summary>
     /// Maps a user-supplied refresh type onto the TMSL spelling, which is <b>camelCase</b> and NOT the same
     /// vocabulary as the Power BI REST API's (<c>Full</c>, <c>ClearValues</c>, …). Accepting either spelling
-    /// case-insensitively means a user who copied a type from <c>fabric_refresh_semantic_model</c> is not
+    /// case-insensitively means a user who copied a type from <c>fabric.refresh_semantic_model</c> is not
     /// punished for it — and an unknown value is REJECTED rather than passed through, because the engine's own
     /// error for a bad type is a generic XMLA parse failure.
     /// </summary>

@@ -13,9 +13,9 @@ namespace Fabricator.Bridge;
 /// <remarks>
 /// <para>These exist because the WRITE functions need identifiers a user otherwise has to hunt for in the
 /// portal: an external shortcut target requires a pre-provisioned cloud connection's GUID
-/// (<c>fabric_connections</c>), a T-SQL ATTACH needs the endpoint connection string
-/// (<c>fabric_lakehouses</c>/<c>fabric_warehouses</c>), and a cross-workspace shortcut needs the target's name
-/// or id (<c>fabric_workspaces</c>/<c>fabric_items</c>).</para>
+/// (<c>connections</c>), a T-SQL ATTACH needs the endpoint connection string
+/// (<c>lakehouses</c>/<c>warehouses</c>), and a cross-workspace shortcut needs the target's name
+/// or id (<c>workspaces</c>/<c>items</c>).</para>
 /// <para>Item CRUD, definition WRITES, git and the tenant-admin surface are deliberately absent — see
 /// docs/fabric-api-functions.md §10 for the verdict on every area of the API.</para>
 /// </remarks>
@@ -42,7 +42,7 @@ internal abstract class FabricRowsFunction : ICatalogTableFunction
 
     protected FabricApiClient Api { get; }
 
-    public string SchemaName => CatalogFunctionSet.AllSchemas;
+    public string SchemaName => FabricApiFunctions.SchemaName;
 
     public abstract string Name { get; }
 
@@ -112,14 +112,14 @@ internal abstract class FabricRowsFunction : ICatalogTableFunction
     }
 }
 
-/// <summary><c>fabric_workspaces()</c> — every workspace this identity can see.</summary>
+/// <summary><c>fabric.workspaces()</c> — every workspace this identity can see.</summary>
 internal sealed class FabricWorkspacesFunction : FabricRowsFunction
 {
     internal FabricWorkspacesFunction(FabricApiClient api) : base(api)
     {
     }
 
-    public override string Name => "fabric_workspaces";
+    public override string Name => "workspaces";
 
     protected override Schema Columns { get; } = new(new[]
     {
@@ -144,17 +144,17 @@ internal sealed class FabricWorkspacesFunction : FabricRowsFunction
     }
 }
 
-/// <summary><c>fabric_items([item_type := …])</c> — items in this catalog's workspace.</summary>
+/// <summary><c>fabric.items([item_type := …])</c> — items in this catalog's workspace.</summary>
 internal sealed class FabricItemsFunction : FabricRowsFunction
 {
     internal FabricItemsFunction(FabricApiClient api) : base(api)
     {
     }
 
-    public override string Name => "fabric_items";
+    public override string Name => "items";
 
     /// <summary>
-    /// <c>fabric_items(item_type := 'Notebook', workspace := 'OtherWS')</c> — both optional; unset lists every
+    /// <c>fabric.items(item_type := 'Notebook', workspace := 'OtherWS')</c> — both optional; unset lists every
     /// type in the ATTACH's own workspace.
     /// </summary>
     public override Schema NamedParameters { get; } = new Schema(new[]
@@ -187,7 +187,7 @@ internal sealed class FabricItemsFunction : FabricRowsFunction
 }
 
 /// <summary>
-/// <c>fabric_lakehouses()</c> — the workspace's lakehouses WITH their SQL analytics endpoint details.
+/// <c>fabric.lakehouses()</c> — the workspace's lakehouses WITH their SQL analytics endpoint details.
 /// </summary>
 /// <remarks>
 /// <c>sql_endpoint_connection_string</c> is the value a T-SQL <c>ATTACH</c> needs, so this is the bridge
@@ -199,7 +199,7 @@ internal sealed class FabricLakehousesFunction : FabricRowsFunction
     {
     }
 
-    public override string Name => "fabric_lakehouses";
+    public override string Name => "lakehouses";
 
     // Declared because Fill reads args[0]. Omitting it does not degrade to "no override" — the base sizes the
     // args array from the DECLARED count, so a read of args[0] against an undeclared parameter is an
@@ -241,16 +241,16 @@ internal sealed class FabricLakehousesFunction : FabricRowsFunction
     }
 }
 
-/// <summary><c>fabric_warehouses()</c> — the workspace's warehouses + their T-SQL connection strings.</summary>
+/// <summary><c>fabric.warehouses()</c> — the workspace's warehouses + their T-SQL connection strings.</summary>
 internal sealed class FabricWarehousesFunction : FabricRowsFunction
 {
     internal FabricWarehousesFunction(FabricApiClient api) : base(api)
     {
     }
 
-    public override string Name => "fabric_warehouses";
+    public override string Name => "warehouses";
 
-    // ⚠ THIS DECLARATION AND fabric_lakehouses' WERE MISSING, AND BOTH FUNCTIONS THREW ON EVERY CALL.
+    // ⚠ THIS DECLARATION AND lakehouses' WERE MISSING, AND BOTH FUNCTIONS THREW ON EVERY CALL.
     // The `workspace :=` override pass added the args[0] read to every catalog-bound table function but the
     // declaration to all except these two, one day AFTER both had been live-validated — and their only gate is
     // live, so nothing failed. Found while hosting this set on a SQL Server catalog. The failure mode is total
@@ -284,7 +284,7 @@ internal sealed class FabricWarehousesFunction : FabricRowsFunction
 }
 
 /// <summary>
-/// <c>fabric_connections()</c> — the cloud connections this identity can see, with the GUID an external
+/// <c>fabric.connections()</c> — the cloud connections this identity can see, with the GUID an external
 /// shortcut target needs.
 /// </summary>
 /// <remarks>
@@ -297,7 +297,7 @@ internal sealed class FabricConnectionsFunction : FabricRowsFunction
     {
     }
 
-    public override string Name => "fabric_connections";
+    public override string Name => "connections";
 
     protected override Schema Columns { get; } = new(new[]
     {
@@ -327,7 +327,7 @@ internal sealed class FabricConnectionsFunction : FabricRowsFunction
 }
 
 /// <summary>
-/// <c>fabric_notebook_parameters(notebook)</c> — the (name, default) pairs declared in a notebook's
+/// <c>fabric.notebook_parameters(notebook)</c> — the (name, default) pairs declared in a notebook's
 /// <c>parameters</c>-tagged cell, so a parameterized run can be written against what the notebook accepts.
 /// </summary>
 /// <remarks>
@@ -345,7 +345,7 @@ internal sealed class FabricNotebookParametersFunction : FabricRowsFunction
     {
     }
 
-    public override string Name => "fabric_notebook_parameters";
+    public override string Name => "notebook_parameters";
 
     public override Schema Parameters { get; } = new Schema(new[] { FabricApiFunctions.Str("notebook") }, null);
 
@@ -366,7 +366,7 @@ internal sealed class FabricNotebookParametersFunction : FabricRowsFunction
         if (string.IsNullOrWhiteSpace(arg))
         {
             throw new NotSupportedException(
-                "fabric_notebook_parameters: pass the notebook name or id (list them with fabric_items(item_type := 'Notebook')).");
+                "notebook_parameters: pass the notebook name or id (list them with items(item_type := 'Notebook')).");
         }
         var ws = Api.ResolveWorkspace(args[1]);
         var nb = Api.ResolveItem(arg, "Notebook", ws);
@@ -501,7 +501,7 @@ internal sealed class FabricNotebookParametersFunction : FabricRowsFunction
 
     /// <summary>
     /// The Fabric parameter type a literal would map to. Reported rather than assumed — a caller passing
-    /// <c>fabric_run_notebook</c> a JSON object still decides the type itself.
+    /// <c>run_notebook</c> a JSON object still decides the type itself.
     /// </summary>
     private static string InferType(string value)
     {

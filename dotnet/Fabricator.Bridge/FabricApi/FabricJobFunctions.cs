@@ -77,7 +77,7 @@ internal static class FabricJobFunctions
 }
 
 /// <summary>
-/// <c>fabric_table_maintenance(table [, schema := …] [, v_order := …] [, z_order_by := …]
+/// <c>fabric.table_maintenance(table [, schema := …] [, v_order := …] [, z_order_by := …]
 /// [, vacuum_retention := …] [, purge_deletion_vectors := …] [, wait_seconds := …] [, workspace := …]
 /// [, item := …])</c> — runs Fabric's lakehouse table-maintenance job and blocks until it finishes.
 /// </summary>
@@ -90,7 +90,7 @@ internal static class FabricJobFunctions
 /// <c>vacuum_retention</c> skips vacuum — that is the API's own convention (an absent settings object means
 /// "do not do this part"), so the defaults here do nothing rather than something surprising.</para>
 /// <para><b>Preview API.</b> Its shape may change; <c>execution_data_json</c> on
-/// <c>fabric_run_job</c> is the escape hatch if it does.</para>
+/// <c>run_job</c> is the escape hatch if it does.</para>
 /// </remarks>
 internal sealed class FabricTableMaintenanceFunction : ICatalogTableFunction
 {
@@ -103,8 +103,8 @@ internal sealed class FabricTableMaintenanceFunction : ICatalogTableFunction
 
     internal FabricTableMaintenanceFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => CatalogFunctionSet.AllSchemas;
-    public string Name => "fabric_table_maintenance";
+    public string SchemaName => FabricApiFunctions.SchemaName;
+    public string Name => "table_maintenance";
 
     public Schema Parameters { get; } = new Schema(new[] { FabricApiFunctions.Str("table") }, null);
 
@@ -158,7 +158,7 @@ internal sealed class FabricTableMaintenanceFunction : ICatalogTableFunction
         {
             if (string.IsNullOrWhiteSpace(_table))
             {
-                throw new NotSupportedException("fabric_table_maintenance: 'table' must not be NULL.");
+                throw new NotSupportedException("table_maintenance: 'table' must not be NULL.");
             }
             var ws = _api.ResolveWorkspace(_workspace);
             var lh = _api.ResolveItem(_item, "Lakehouse", ws);
@@ -207,7 +207,7 @@ internal sealed class FabricTableMaintenanceFunction : ICatalogTableFunction
 }
 
 /// <summary>
-/// <c>fabric_run_job(item, job_type [, execution_data_json := …] [, wait_seconds := …] [, workspace := …])</c>
+/// <c>fabric.run_job(item, job_type [, execution_data_json := …] [, wait_seconds := …] [, workspace := …])</c>
 /// — the generic on-demand job runner behind the specialized ones.
 /// </summary>
 /// <remarks>
@@ -226,8 +226,8 @@ internal sealed class FabricRunJobFunction : ICatalogTableFunction
 
     internal FabricRunJobFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => CatalogFunctionSet.AllSchemas;
-    public string Name => "fabric_run_job";
+    public string SchemaName => FabricApiFunctions.SchemaName;
+    public string Name => "run_job";
 
     public Schema Parameters { get; } = new Schema(new[]
     {
@@ -275,7 +275,7 @@ internal sealed class FabricRunJobFunction : ICatalogTableFunction
         {
             if (string.IsNullOrWhiteSpace(_item) || string.IsNullOrWhiteSpace(_jobType))
             {
-                throw new NotSupportedException("fabric_run_job: 'item' and 'job_type' must not be NULL.");
+                throw new NotSupportedException("run_job: 'item' and 'job_type' must not be NULL.");
             }
             var ws = _api.ResolveWorkspace(_workspace);
             // item_type narrows the name lookup; a GUID needs none, which is why it is optional.
@@ -293,7 +293,7 @@ internal sealed class FabricRunJobFunction : ICatalogTableFunction
     }
 }
 
-/// <summary><c>fabric_job_status(item, job_instance_id [, workspace := …] [, item_type := …])</c>.</summary>
+/// <summary><c>fabric.job_status(item, job_instance_id [, workspace := …] [, item_type := …])</c>.</summary>
 internal sealed class FabricJobStatusFunction : ICatalogTableFunction
 {
     // The canonical signature: ONE schema, each field flagged with its style. Explicit so this class
@@ -305,8 +305,8 @@ internal sealed class FabricJobStatusFunction : ICatalogTableFunction
 
     internal FabricJobStatusFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => CatalogFunctionSet.AllSchemas;
-    public string Name => "fabric_job_status";
+    public string SchemaName => FabricApiFunctions.SchemaName;
+    public string Name => "job_status";
 
     public Schema Parameters { get; } = new Schema(new[]
     {
@@ -349,7 +349,7 @@ internal sealed class FabricJobStatusFunction : ICatalogTableFunction
             if (string.IsNullOrWhiteSpace(_item) || string.IsNullOrWhiteSpace(_instanceId))
             {
                 throw new NotSupportedException(
-                    "fabric_job_status: 'item' and 'job_instance_id' must not be NULL.");
+                    "job_status: 'item' and 'job_instance_id' must not be NULL.");
             }
             var ws = _api.ResolveWorkspace(_workspace);
             var id = _api.ResolveItem(_item, _itemType ?? "Lakehouse", ws, requireType: _itemType is not null);
@@ -360,8 +360,22 @@ internal sealed class FabricJobStatusFunction : ICatalogTableFunction
 }
 
 /// <summary>
-/// <c>fabric_job_instances(item [, workspace := …] [, item_type := …])</c> — that item's job history.
+/// <c>fabric.job_instances([item := …] [, workspace := …] [, item_type := …])</c> — job history for one item,
+/// or FANNED OUT across every item of a type.
 /// </summary>
+/// <remarks>
+/// <para><b>⚠ <c>item</c> moved from POSITIONAL to NAMED (2026-08-03, breaking).</b>
+/// <c>job_instances('nb')</c> is now <c>job_instances(item := 'nb')</c>. It had to: DuckDB arity is fixed, so a
+/// positional parameter cannot be omitted, and omitting it is exactly what the fan-out needs. Shipped in the same
+/// breaking window as the <c>fabric</c> schema move so callers migrate once rather than twice.</para>
+/// <para><b>Why fan-out belongs here and not in <c>fabric.sessions()</c>.</b> Sessions are already
+/// workspace-scoped in ONE request, but they only cover Spark. Job instances cover every item kind — Pipeline,
+/// Dataflow, TableMaintenance, notebook runs — and the API is per-item, so the only way to ask "what has run in
+/// this workspace" is to enumerate items and ask each. That is O(items) requests against a per-principal
+/// throttle, which is why it is opt-in behind <c>item_type</c> and never the default.</para>
+/// <para><b>It is deliberately NOT capped.</b> A default `max_items` would under-report while looking complete —
+/// the silent-truncation failure mode. If a type has 500 items, the caller pays for 500 items.</para>
+/// </remarks>
 internal sealed class FabricJobInstancesFunction : ICatalogTableFunction
 {
     // The canonical signature: ONE schema, each field flagged with its style. Explicit so this class
@@ -373,13 +387,15 @@ internal sealed class FabricJobInstancesFunction : ICatalogTableFunction
 
     internal FabricJobInstancesFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => CatalogFunctionSet.AllSchemas;
-    public string Name => "fabric_job_instances";
+    public string SchemaName => FabricApiFunctions.SchemaName;
+    public string Name => "job_instances";
 
-    public Schema Parameters { get; } = new Schema(new[] { FabricApiFunctions.Str("item") }, null);
+    /// <summary>No positionals: <c>item</c> must be omittable for the fan-out, and only a NAMED parameter can be.</summary>
+    public Schema Parameters { get; } = new Schema(System.Array.Empty<Field>(), null);
 
     public Schema NamedParameters { get; } = new Schema(new[]
     {
+        FabricApiFunctions.Str("item"),
         FabricApiFunctions.Str("workspace"),
         FabricApiFunctions.Str("item_type"),
     }, null);
@@ -388,6 +404,9 @@ internal sealed class FabricJobInstancesFunction : ICatalogTableFunction
 
     private sealed class Binding : FabricTableBinding
     {
+        // `item_name`/`item_id` are APPENDED, not prepended: the D4 rule is that adding a column stays additive
+        // for `SELECT *`, which prepending would break for anything reading by position. They are required for
+        // the fan-out to be usable at all — without them the rows of 40 notebooks are indistinguishable.
         private static readonly Schema Columns = new(new[]
         {
             FabricApiFunctions.Str("job_instance_id"),
@@ -398,6 +417,8 @@ internal sealed class FabricJobInstancesFunction : ICatalogTableFunction
             FabricApiFunctions.Ts("end_time"),
             FabricApiFunctions.Str("error_code"),
             FabricApiFunctions.Str("error_message"),
+            FabricApiFunctions.Str("item_name"),
+            FabricApiFunctions.Str("item_id"),
         }, null);
 
         private readonly FabricApiClient _api;
@@ -417,45 +438,83 @@ internal sealed class FabricJobInstancesFunction : ICatalogTableFunction
 
         protected override IAsyncEnumerable<RecordBatch> Rows(CancellationToken ct)
         {
-            if (string.IsNullOrWhiteSpace(_item))
-            {
-                throw new NotSupportedException("fabric_job_instances: 'item' must not be NULL.");
-            }
             var ws = _api.ResolveWorkspace(_workspace);
-            var id = _api.ResolveItem(_item, _itemType ?? "Lakehouse", ws, requireType: _itemType is not null);
-
-            var ids = new StringArray.Builder();
-            var types = new StringArray.Builder();
-            var invoke = new StringArray.Builder();
-            var status = new StringArray.Builder();
-            var start = FabricApiFunctions.TsBuilder();
-            var end = FabricApiFunctions.TsBuilder();
-            var code = new StringArray.Builder();
-            var message = new StringArray.Builder();
-            int n = 0;
-            foreach (var j in FabricApiClient.WrapList("job_instances",
-                         () => _api.Client.Core.JobScheduler.ListItemJobInstances(ws, id, cancellationToken: ct)))
+            var row = new FabricRowBuilder(Columns);
+            if (!string.IsNullOrWhiteSpace(_item))
             {
-                ids.Append(j.Id?.ToString());
-                types.Append(j.JobType);
-                invoke.Append(j.InvokeType?.ToString());
-                status.Append(j.Status?.ToString());
-                FabricJobFunctions.AppendTs(start, j.StartTimeUtc);
-                FabricJobFunctions.AppendTs(end, j.EndTimeUtc);
-                code.Append(j.FailureReason?.ErrorCode);
-                message.Append(j.FailureReason?.Message);
-                n++;
+                // Single item — the original behaviour. `item_name` echoes what the CALLER passed (which may be
+                // a GUID): resolving the display name back would cost an extra listing for a column the caller
+                // already knows. In fan-out mode below it is the service's own DisplayName.
+                var id = _api.ResolveItem(_item, _itemType ?? "Lakehouse", ws,
+                                          requireType: _itemType is not null);
+                Append(row, ws, id, _item!, ct);
+                return One(row.Build());
             }
-            return One(Columns, new IArrowArray[]
+            if (string.IsNullOrWhiteSpace(_itemType))
             {
-                ids.Build(), types.Build(), invoke.Build(), status.Build(), start.Build(), end.Build(),
-                code.Build(), message.Build(),
-            }, n);
+                throw new NotSupportedException(
+                    "job_instances: pass item := '<name or id>' for one item, or item_type := '<type>' to fan "
+                    + "out across every item of that type (e.g. 'Notebook', 'DataPipeline'). Omitting BOTH is "
+                    + "refused on purpose: it would issue one API call per item in the workspace, unbounded and "
+                    + "throttled per principal. List the types with fabric.items().");
+            }
+            // FAN-OUT: one listing to enumerate the items, then ONE job-instance call PER ITEM. That is O(items)
+            // requests against a per-principal throttle, so it is opt-in via item_type rather than the default,
+            // and it is not capped — a silent cap would under-report while looking complete.
+            foreach (var (id, name) in ItemsOfType(ws, _itemType!, ct))
+            {
+                Append(row, ws, id, name, ct);
+            }
+            return One(row.Build());
+        }
+
+        /// <summary>The (id, display name) pairs of every item of one type in the workspace.</summary>
+        /// <remarks>
+        /// Materialized before the per-item calls rather than streamed: <c>PageableResponse&lt;T&gt;</c> is lazy,
+        /// so enumerating it while also issuing the inner request per row would interleave two paged reads on one
+        /// client. WrapList already materializes inside the error guard, which is what makes that safe here.
+        /// </remarks>
+        private List<(Guid Id, string Name)> ItemsOfType(Guid ws, string itemType, CancellationToken ct)
+        {
+            var items = new List<(Guid, string)>();
+            foreach (var i in FabricApiClient.WrapList("items",
+                         () => _api.Client.Core.Items.ListItems(ws, type: itemType, cancellationToken: ct)))
+            {
+                if (i.Id is { } id)
+                {
+                    items.Add((id, i.DisplayName?.Trim() ?? id.ToString()));
+                }
+            }
+            return items;
+        }
+
+        private void Append(FabricRowBuilder row, Guid ws, Guid itemId, string itemName, CancellationToken ct)
+        {
+            foreach (var j in FabricApiClient.WrapList("job_instances",
+                         () => _api.Client.Core.JobScheduler.ListItemJobInstances(ws, itemId, cancellationToken: ct)))
+            {
+                row.Str(0, j.Id?.ToString())
+                   .Str(1, j.JobType)
+                   .Str(2, j.InvokeType?.ToString())
+                   // ⚠ `Completed`, not `Succeeded` — fabric.sessions() reports the SAME work with the other
+                   // vocabulary. See FabricSessionFunctions.
+                   .Str(3, j.Status?.ToString())
+                   // Iso, not Ts: the service reports these as ISO STRINGS on a job instance (unlike a Livy
+                   // session, where they are DateTimeOffset). An absent one is a legitimate NULL — a job that
+                   // never started has no start time.
+                   .Iso(4, j.StartTimeUtc)
+                   .Iso(5, j.EndTimeUtc)
+                   .Str(6, j.FailureReason?.ErrorCode)
+                   .Str(7, j.FailureReason?.Message)
+                   .Str(8, itemName)
+                   .Str(9, itemId.ToString())
+                   .EndRow();
+            }
         }
     }
 }
 
-/// <summary><c>fabric_cancel_job(item, job_instance_id)</c> → true when the cancel was accepted.</summary>
+/// <summary><c>fabric.cancel_job(item, job_instance_id)</c> → true when the cancel was accepted.</summary>
 /// <remarks>
 /// A scalar, so positional-only (DuckDB scalar functions have no named parameters) and it always acts on the
 /// ATTACHED workspace. Cancelling is a request, not a guarantee: a job already finishing may still complete.
@@ -466,8 +525,8 @@ internal sealed class FabricCancelJobFunction : ICatalogScalarFunction
 
     internal FabricCancelJobFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => CatalogFunctionSet.AllSchemas;
-    public string Name => "fabric_cancel_job";
+    public string SchemaName => FabricApiFunctions.SchemaName;
+    public string Name => "cancel_job";
 
     public Schema Parameters { get; } = new Schema(new[]
     {
@@ -484,12 +543,12 @@ internal sealed class FabricCancelJobFunction : ICatalogScalarFunction
         for (int row = 0; row < args.Length; row++)
         {
             string item = FabricArgs.Str(args, 0, row)
-                ?? throw new NotSupportedException("fabric_cancel_job: 'item' must not be NULL.");
+                ?? throw new NotSupportedException("cancel_job: 'item' must not be NULL.");
             string instance = FabricArgs.Str(args, 1, row)
-                ?? throw new NotSupportedException("fabric_cancel_job: 'job_instance_id' must not be NULL.");
+                ?? throw new NotSupportedException("cancel_job: 'job_instance_id' must not be NULL.");
             if (!Guid.TryParse(instance, out var instanceId))
             {
-                throw new NotSupportedException($"fabric_cancel_job: '{instance}' is not a job-instance GUID.");
+                throw new NotSupportedException($"cancel_job: '{instance}' is not a job-instance GUID.");
             }
             var id = _api.ResolveItem(item, "Lakehouse", ws, requireType: false);
             FabricApiClient.Wrap("cancel_job",
@@ -501,7 +560,7 @@ internal sealed class FabricCancelJobFunction : ICatalogScalarFunction
 }
 
 /// <summary>
-/// <c>fabric_reset_shortcut_cache([workspace := …])</c> — clears the workspace's OneLake shortcut cache.
+/// <c>fabric.reset_shortcut_cache([workspace := …])</c> — clears the workspace's OneLake shortcut cache.
 /// </summary>
 /// <remarks>
 /// <para><b>NOT TESTED, and knowingly so.</b> This tenant's SERVICE PRINCIPAL is refused with
@@ -527,8 +586,8 @@ internal sealed class FabricResetShortcutCacheFunction : ICatalogTableFunction
 
     internal FabricResetShortcutCacheFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => CatalogFunctionSet.AllSchemas;
-    public string Name => "fabric_reset_shortcut_cache";
+    public string SchemaName => FabricApiFunctions.SchemaName;
+    public string Name => "reset_shortcut_cache";
 
     public Schema Parameters { get; } = new Schema(System.Array.Empty<Field>(), null);
 
@@ -571,7 +630,7 @@ internal sealed class FabricResetShortcutCacheFunction : ICatalogTableFunction
 }
 
 /// <summary>
-/// <c>fabric_operation_status(operation_id)</c> — the generic long-running-operation peek, for a call that
+/// <c>fabric.operation_status(operation_id)</c> — the generic long-running-operation peek, for a call that
 /// was submitted without waiting.
 /// </summary>
 internal sealed class FabricOperationStatusFunction : ICatalogTableFunction
@@ -580,8 +639,8 @@ internal sealed class FabricOperationStatusFunction : ICatalogTableFunction
 
     internal FabricOperationStatusFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => CatalogFunctionSet.AllSchemas;
-    public string Name => "fabric_operation_status";
+    public string SchemaName => FabricApiFunctions.SchemaName;
+    public string Name => "operation_status";
 
     public Schema Parameters { get; } = new Schema(new[] { FabricApiFunctions.Str("operation_id") }, null);
 
@@ -616,7 +675,7 @@ internal sealed class FabricOperationStatusFunction : ICatalogTableFunction
             if (!Guid.TryParse(_operationId, out var opId))
             {
                 throw new NotSupportedException(
-                    $"fabric_operation_status: '{_operationId}' is not an operation GUID.");
+                    $"operation_status: '{_operationId}' is not an operation GUID.");
             }
             var state = FabricApiClient.Wrap("operation_status",
                 () => _api.Client.Core.LongRunning.GetOperationState(opId, cancellationToken: ct).Value);
@@ -645,7 +704,7 @@ internal sealed class FabricOperationStatusFunction : ICatalogTableFunction
 }
 
 /// <summary>
-/// <c>fabric_lakehouse_tables([workspace := …] [, item := …])</c> — the lakehouse's tables as FABRIC sees
+/// <c>fabric.lakehouse_tables([workspace := …] [, item := …])</c> — the lakehouse's tables as FABRIC sees
 /// them (name, type, format, OneLake location).
 /// </summary>
 /// <remarks>
@@ -664,8 +723,8 @@ internal sealed class FabricLakehouseTablesFunction : ICatalogTableFunction
 
     internal FabricLakehouseTablesFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => CatalogFunctionSet.AllSchemas;
-    public string Name => "fabric_lakehouse_tables";
+    public string SchemaName => FabricApiFunctions.SchemaName;
+    public string Name => "lakehouse_tables";
 
     public Schema Parameters { get; } = new Schema(System.Array.Empty<Field>(), null);
 

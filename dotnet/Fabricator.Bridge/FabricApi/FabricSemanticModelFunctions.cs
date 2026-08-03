@@ -12,7 +12,7 @@ namespace Fabricator.Bridge;
 /// </summary>
 /// <remarks>
 /// <para><b>Why this completes the picture.</b> After a Delta write there are TWO consumers to make current
-/// and they need different calls: <c>fabric_refresh_sql_endpoint</c> makes the table visible to <b>T-SQL</b>,
+/// and they need different calls: <c>refresh_sql_endpoint</c> makes the table visible to <b>T-SQL</b>,
 /// and refreshing the semantic model makes the data visible to <b>Power BI</b>. A dbt flow ending in a report
 /// wants both.</para>
 ///
@@ -43,7 +43,7 @@ internal static class FabricSemanticModelFunctions
 }
 
 /// <summary>
-/// <c>fabric_semantic_models([workspace := …])</c> — the workspace's semantic models, including each
+/// <c>fabric.semantic_models([workspace := …])</c> — the workspace's semantic models, including each
 /// lakehouse's and warehouse's default one.
 /// </summary>
 internal sealed class FabricSemanticModelsFunction : ICatalogTableFunction
@@ -57,8 +57,8 @@ internal sealed class FabricSemanticModelsFunction : ICatalogTableFunction
 
     internal FabricSemanticModelsFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => CatalogFunctionSet.AllSchemas;
-    public string Name => "fabric_semantic_models";
+    public string SchemaName => FabricApiFunctions.SchemaName;
+    public string Name => "semantic_models";
 
     public Schema Parameters { get; } = new Schema(System.Array.Empty<Field>(), null);
 
@@ -96,7 +96,7 @@ internal sealed class FabricSemanticModelsFunction : ICatalogTableFunction
             var ws = _api.ResolveWorkspace(_workspace);
             // The POWER BI listing, not the Fabric one: it is the surface that also reports isRefreshable,
             // and it is the same surface the refresh below acts on — so a model listed here is one that can
-            // be passed straight to fabric_refresh_semantic_model.
+            // be passed straight to refresh_semantic_model.
             var models = await _api.ListDatasetsAsync(ws, ct).ConfigureAwait(false);
             var ids = new StringArray.Builder();
             var names = new StringArray.Builder();
@@ -118,14 +118,14 @@ internal sealed class FabricSemanticModelsFunction : ICatalogTableFunction
 }
 
 /// <summary>
-/// <c>fabric_refresh_semantic_model(model [, type := …] [, objects_json := …] [, commit_mode := …]
+/// <c>fabric.refresh_semantic_model(model [, type := …] [, objects_json := …] [, commit_mode := …]
 /// [, max_parallelism := …] [, retry_count := …] [, timeout := …] [, wait_seconds := …]
 /// [, workspace := …])</c> — triggers an ENHANCED refresh and blocks until it settles.
 /// </summary>
 /// <remarks>
 /// <para>Blocking by default for the same reason as the rest: a dbt hook must not return before the work is
 /// done. <c>wait_seconds := 0</c> submits and returns the request id for later polling with
-/// <c>fabric_semantic_model_refreshes</c>.</para>
+/// <c>semantic_model_refreshes</c>.</para>
 /// <para><b>An enhanced refresh is requested by sending a body at all</b> — the API treats a request whose
 /// only field is <c>notifyOption</c> as a plain refresh. It also rejects <c>notifyOption</c> for a
 /// service-principal caller. Those two rules interact, so this NEVER sends <c>notifyOption</c> and always
@@ -145,8 +145,8 @@ internal sealed class FabricRefreshSemanticModelFunction : ICatalogTableFunction
 
     internal FabricRefreshSemanticModelFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => CatalogFunctionSet.AllSchemas;
-    public string Name => "fabric_refresh_semantic_model";
+    public string SchemaName => FabricApiFunctions.SchemaName;
+    public string Name => "refresh_semantic_model";
 
     public Schema Parameters { get; } = new Schema(new[] { FabricApiFunctions.Str("model") }, null);
 
@@ -211,8 +211,8 @@ internal sealed class FabricRefreshSemanticModelFunction : ICatalogTableFunction
             if (string.IsNullOrWhiteSpace(_model))
             {
                 throw new NotSupportedException(
-                    "fabric_refresh_semantic_model: pass the model name or id "
-                    + "(list them with fabric_semantic_models()).");
+                    "refresh_semantic_model: pass the model name or id "
+                    + "(list them with semantic_models()).");
             }
             var ws = _api.ResolveWorkspace(_workspace);
             var modelId = await _api.ResolveDatasetAsync(ws, _model!, ct).ConfigureAwait(false);
@@ -251,7 +251,7 @@ internal sealed class FabricRefreshSemanticModelFunction : ICatalogTableFunction
                 if (objects.ValueKind != JsonValueKind.Array)
                 {
                     throw new NotSupportedException(
-                        "fabric_refresh_semantic_model: objects_json must be a JSON ARRAY, e.g. "
+                        "refresh_semantic_model: objects_json must be a JSON ARRAY, e.g. "
                         + "'[{\"table\":\"Sales\",\"partition\":\"2026\"}]'.");
                 }
                 body["objects"] = objects;
@@ -266,7 +266,7 @@ internal sealed class FabricRefreshSemanticModelFunction : ICatalogTableFunction
 }
 
 /// <summary>
-/// <c>fabric_semantic_model_refreshes(model [, top := …] [, workspace := …])</c> — that model's refresh
+/// <c>fabric.semantic_model_refreshes(model [, top := …] [, workspace := …])</c> — that model's refresh
 /// history, newest first.
 /// </summary>
 /// <remarks>
@@ -285,8 +285,8 @@ internal sealed class FabricSemanticModelRefreshesFunction : ICatalogTableFuncti
 
     internal FabricSemanticModelRefreshesFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => CatalogFunctionSet.AllSchemas;
-    public string Name => "fabric_semantic_model_refreshes";
+    public string SchemaName => FabricApiFunctions.SchemaName;
+    public string Name => "semantic_model_refreshes";
 
     public Schema Parameters { get; } = new Schema(new[] { FabricApiFunctions.Str("model") }, null);
 
@@ -334,7 +334,7 @@ internal sealed class FabricSemanticModelRefreshesFunction : ICatalogTableFuncti
         {
             if (string.IsNullOrWhiteSpace(_model))
             {
-                throw new NotSupportedException("fabric_semantic_model_refreshes: 'model' must not be NULL.");
+                throw new NotSupportedException("semantic_model_refreshes: 'model' must not be NULL.");
             }
             var ws = _api.ResolveWorkspace(_workspace);
             var modelId = await _api.ResolveDatasetAsync(ws, _model!, ct).ConfigureAwait(false);

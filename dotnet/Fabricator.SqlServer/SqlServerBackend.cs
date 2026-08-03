@@ -416,16 +416,55 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         var scalars = new List<ICatalogScalarFunction>(CustomFunctions.Scalar);
         var tables = new List<ICatalogTableFunction>(CustomFunctions.Table);
         FabricApiFunctions.Register(
-            scalars, tables,
-            _fabricWorkspace.Length > 0 ? _fabricWorkspace : null,
-            _fabricItem.Length > 0 ? _fabricItem : null,
+            scalars, tables, ResolveApiWorkspace(), ResolveApiItem(),
             _fabricCredFields is null ? null : FabricCredentialResolver.Resolve(_fabricCredFields));
         return new CatalogFunctionSet(scalars, tables, CustomFunctions.SqlTable, CustomFunctions.InOut,
                                       CustomFunctions.Collector, CustomFunctions.Aggregate);
     }
 
     /// <summary>
-    /// Whether this connection targets <b>Fabric</b> — the gate for registering the <c>fabric_*</c> functions,
+    /// The workspace the <c>fabric.*</c> functions default to: the <c>API_WORKSPACE</c> option if given, else
+    /// the workspace id ENCODED IN THE ENDPOINT HOST, else null (the functions then demand
+    /// <c>workspace :=</c> per call and say so).
+    /// </summary>
+    /// <remarks>
+    /// <para>The inference is what makes <c>API_WORKSPACE</c> optional. It is a pure string decode — no
+    /// connection and no REST call — so it costs nothing at ATTACH, which is the constraint the whole
+    /// registration path is built around (see <see cref="IsFabricEndpoint"/>).</para>
+    /// <para><b>⚠ It returns null rather than guessing.</b> The host encoding is undocumented, so a future
+    /// change must degrade to "tell me the workspace", never to "use the wrong workspace" — a wrong id would
+    /// aim REST calls at a different workspace that the identity may well have access to. The enumerate-and-
+    /// match fallback (list workspaces, compare each item's endpoint connection string against this host) is
+    /// deliberately NOT implemented here: it costs O(workspaces × items) REST calls at ATTACH to replace an
+    /// error message with a slow success. It belongs behind an explicit opt-in if anyone wants it.</para>
+    /// </remarks>
+    private string? ResolveApiWorkspace()
+    {
+        if (_fabricWorkspace.Length > 0)
+        {
+            return _fabricWorkspace;
+        }
+        var host = FabricSqlEndpointHost.ServerFromConnectionString(_baseConnectionString);
+        return FabricSqlEndpointHost.WorkspaceIdFromHost(host)?.ToString();
+    }
+
+    /// <summary>
+    /// The item the <c>fabric.*</c> functions default to: the <c>API_ITEM</c> option if given, else the
+    /// connection string's <c>Database</c>.
+    /// </summary>
+    /// <remarks>
+    /// On a Fabric SQL endpoint the database IS the item — a lakehouse or warehouse of that name — so the
+    /// default is exact rather than a heuristic. Overriding it is the interesting case and stays supported:
+    /// <c>API_ITEM</c> (or a per-call <c>item :=</c>) points the functions at a DIFFERENT item from the one you
+    /// query, which is how a project attached to a Warehouse refreshes a Lakehouse's SQL endpoint.
+    /// </remarks>
+    private string? ResolveApiItem()
+        => _fabricItem.Length > 0
+               ? _fabricItem
+               : FabricSqlEndpointHost.DatabaseFromConnectionString(_baseConnectionString);
+
+    /// <summary>
+    /// Whether this connection targets <b>Fabric</b> — the gate for registering the <c>fabric.*</c> functions,
     /// mirroring the Delta catalog's <c>IsOneLake</c> check: off Fabric they have no workspace, no item and no
     /// REST endpoint, so advertising them would put functions in the catalog that can only fail.
     /// </summary>
@@ -612,8 +651,32 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                     case "add_identity":
                         _addIdentityOnCreate = string.Equals(val, "true", StringComparison.OrdinalIgnoreCase) || val == "1";
                         break;
-                    case "workspace": _fabricWorkspace = val; break;
-                    case "item": _fabricItem = val; break;
+                    // API_WORKSPACE / API_ITEM: the workspace and item the `fabric.*` REST functions act on.
+                    // ⚠ NAMED FOR THE API, NOT FOR THE ATTACH, and that distinction is the point. They do NOT
+                    // change what you attached — the SQL catalog still comes from the connection string's
+                    // Database. Two attaches differing only in API_ITEM expose IDENTICAL tables; the option is
+                    // invisible until a fabric.* function runs. The earlier names (`WORKSPACE`/`ITEM`) read as
+                    // if they selected the attach target, which is what made them confusing.
+                    // Both are OPTIONAL: omitted, they are inferred from the connection string (see
+                    // ResolveApiWorkspace / ResolveApiItem). Supplying one is an OVERRIDE, which is a real
+                    // feature — one attach can drive a different lakehouse's endpoint.
+                    case "api_workspace": _fabricWorkspace = val; break;
+                    case "api_item": _fabricItem = val; break;
+                    // ⚠ THE OLD NAMES MUST FAIL LOUDLY, NOT BE IGNORED. Unknown ATTACH keys are dropped for
+                    // forward-compat (see the comment above), so leaving `workspace`/`item` unhandled would
+                    // make an existing script SILENTLY change behaviour: the option is discarded and the
+                    // functions fall back to the inferred defaults, which for `item` is the connstr's Database
+                    // — a DIFFERENT item, with no error. Since the point of these options is to target another
+                    // item, that silent switch would redirect a refresh at the wrong lakehouse. Erroring turns
+                    // a wrong-target bug into a one-line edit.
+                    case "workspace":
+                    case "item":
+                        throw new NotSupportedException(
+                            $"ATTACH option '{prop.Name}' was renamed to 'api_{prop.Name.ToLowerInvariant()}' "
+                            + "— it scopes the fabric.* REST FUNCTIONS, not the attach itself (the catalog still "
+                            + "comes from the connection string's Database). Both are now OPTIONAL: the "
+                            + "workspace is decoded from the endpoint host and the item defaults to Database, so "
+                            + "you may simply drop it unless you are deliberately targeting a different item.");
                 }
             }
         }
@@ -1630,7 +1693,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         // schema_filter/table_filter (ATTACH options) are applied here so discovery sees only matches —
         // the provider owns its filtering (the C++ core no longer knows these option names). No filter set =>
         // stream the query directly (no materialization).
-        MetadataKind.Schemas => _schemaFilter is null ? ExecuteMetadataQuery(SchemasSql) : FilteredSchemas(),
+        MetadataKind.Schemas => SchemasMetadata(),
         MetadataKind.Tables => _schemaFilter is null && _tableFilter is null
                                    ? ExecuteMetadataQuery(TablesSql)
                                    : FilteredTables(),
@@ -1780,19 +1843,51 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         return rows;
     }
 
-    // schema_filter applied: only schema names matching the icase regex (substring) are returned.
-    private IArrowArrayStream FilteredSchemas()
+    /// <summary>
+    /// The advertised schemas: the server's own, optionally <c>schema_filter</c>ed (icase regex, substring),
+    /// plus the synthetic
+    /// <c>fabric</c> FUNCTION namespace on a Fabric endpoint.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>⚠ Without the synthetic name the whole Fabric function set silently disappears.</b> The host
+    /// drops a declared function whose schema it did not register
+    /// (<c>FabricatorCatalog::LoadCatalog</c>) — no error, just ~50 missing functions — and <c>fabric</c> is not
+    /// a real SQL schema, so <c>sys.schemas</c> will never return it.</para>
+    /// <para><b>It is deliberately NOT subject to <c>schema_filter</c></b>, matching
+    /// <c>DeltaCatalog.CatalogSchemaNames</c> (which appends it after the already-filtered list). That filter
+    /// scopes DATA discovery; silently removing the entire Fabric API because someone narrowed which tables they
+    /// wanted would be a surprising coupling, and <c>function_filter</c> is the option that exists for functions.
+    /// </para>
+    /// <para>The no-filter, non-Fabric case still STREAMS the query with no materialization — the common path is
+    /// unchanged.</para>
+    /// </remarks>
+    private IArrowArrayStream SchemasMetadata()
     {
+        bool addFunctionSchema = IsFabricEndpoint(_baseConnectionString);
+        if (_schemaFilter is null && !addFunctionSchema)
+        {
+            return ExecuteMetadataQuery(SchemasSql);
+        }
         var schema = new Schema(new[] { new Field("name", StringType.Default, nullable: false) }, metadata: null);
         var names = new StringArray.Builder();
         int n = 0;
+        bool haveFunctionSchema = false;
         foreach (var row in ReadMetadataRows(SchemasSql, 1))
         {
-            if (row[0] is { } name && _schemaFilter!.IsMatch(name))
+            if (row[0] is { } name && (_schemaFilter is null || _schemaFilter.IsMatch(name)))
             {
                 names.Append(name);
                 n++;
+                haveFunctionSchema |= string.Equals(name, FabricApiFunctions.SchemaName,
+                                                    StringComparison.OrdinalIgnoreCase);
             }
+        }
+        // A real SQL schema actually NAMED "fabric" already covers it; appending would advertise a duplicate,
+        // which the host's ensure_schema treats as a collision rather than a merge.
+        if (addFunctionSchema && !haveFunctionSchema)
+        {
+            names.Append(FabricApiFunctions.SchemaName);
+            n++;
         }
         var batch = new RecordBatch(schema, new IArrowArray[] { names.Build() }, n);
         return new InMemoryArrayStream(schema, new[] { batch });

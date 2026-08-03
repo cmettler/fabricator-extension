@@ -8,7 +8,7 @@ using Apache.Arrow.Types;
 namespace Fabricator.Bridge;
 
 /// <summary>
-/// <c>db.&lt;schema&gt;.fabric_run_notebook(notebook [, params_json := …] [, config_json := …]
+/// <c>db.fabric.run_notebook(notebook [, params_json := …] [, config_json := …]
 /// [, wait_seconds := …])</c> — runs a Fabric notebook with parameters and, by default, BLOCKS until it
 /// finishes, returning one row of final state.
 /// </summary>
@@ -37,15 +37,15 @@ internal sealed class FabricRunNotebookFunction : ICatalogTableFunction
 
     internal FabricRunNotebookFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => CatalogFunctionSet.AllSchemas;
-    public string Name => "fabric_run_notebook";
+    public string SchemaName => FabricApiFunctions.SchemaName;
+    public string Name => "run_notebook";
 
     /// <summary>The notebook is the only required argument.</summary>
     public Schema Parameters { get; } = new Schema(new[] { FabricApiFunctions.Str("notebook") }, null);
 
     /// <summary>
     /// Everything else is optional:
-    /// <c>fabric_run_notebook('nb', params_json := '{…}', wait_seconds := 0)</c>.
+    /// <c>fabric.run_notebook('nb', params_json := '{…}', wait_seconds := 0)</c>.
     /// </summary>
     public Schema NamedParameters { get; } = new Schema(new[]
     {
@@ -103,7 +103,7 @@ internal sealed class FabricRunNotebookFunction : ICatalogTableFunction
             if (string.IsNullOrWhiteSpace(_notebook))
             {
                 throw new NotSupportedException(
-                    "fabric_run_notebook: pass the notebook name or id (list them with fabric_items(item_type := 'Notebook')).");
+                    "run_notebook: pass the notebook name or id (list them with items(item_type := 'Notebook')).");
             }
             var ws = _api.ResolveWorkspace(_workspace);
             var nb = _api.ResolveItem(_notebook, "Notebook", ws);
@@ -195,7 +195,7 @@ internal sealed class FabricRunNotebookFunction : ICatalogTableFunction
                     JsonValueKind.Number when m.Value.TryGetInt64(out var l) => Wrap(l, "int"),
                     JsonValueKind.Number => Wrap(m.Value.GetDouble(), "float"),
                     _ => throw new NotSupportedException(
-                        $"fabric_run_notebook: parameter '{m.Name}' must be a string, number, boolean, or a "
+                        $"run_notebook: parameter '{m.Name}' must be a string, number, boolean, or a "
                         + "{\"value\":…,\"type\":…} object (Fabric notebook parameters have no array/object type)."),
                 };
             }
@@ -214,12 +214,12 @@ internal sealed class FabricRunNotebookFunction : ICatalogTableFunction
             }
             catch (JsonException ex)
             {
-                throw new NotSupportedException($"fabric_run_notebook: {argName} is not valid JSON — {ex.Message}");
+                throw new NotSupportedException($"run_notebook: {argName} is not valid JSON — {ex.Message}");
             }
             if (doc.RootElement.ValueKind != JsonValueKind.Object)
             {
                 doc.Dispose();
-                throw new NotSupportedException($"fabric_run_notebook: {argName} must be a JSON object.");
+                throw new NotSupportedException($"run_notebook: {argName} must be a JSON object.");
             }
             return doc;
         }

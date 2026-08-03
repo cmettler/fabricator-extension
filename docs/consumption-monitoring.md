@@ -374,10 +374,10 @@ two ends joined in SQL.
 
 Constraints on that path, in descending severity:
 
-1. **A service principal usually cannot see capacity data — MEASURED here.** `fabric_capacities()` (live,
+1. **A service principal usually cannot see capacity data — MEASURED here.** `fabric.capacities()` (live,
    newly built) returned two capacities: `Premium Per User - Reserved` (PP3) and a Trial (`FT1`). The `Test`
    workspace's own `capacity_id` (`763ce0dd-…`) is **not either of them** — the SP cannot see the capacity it is
-   running on. Same shape as the `fabric_connections()`-returns-0 finding: capacities carry their own role
+   running on. Same shape as the `fabric.connections()`-returns-0 finding: capacities carry their own role
    assignments. So a dbt-run cost monitor driven by an SP will be blocked by *permission*, not by wiring.
 2. **The Capacity Metrics app must be installed, and its workspace shared.** This tenant's SP sees exactly
    **1 workspace**, and no metrics-app workspace among them — so the CU half could not be validated here at all.
@@ -422,7 +422,7 @@ Different workloads, different meters — a dbt project writing Delta to OneLake
 
 - **`OneLake Compute`** — charged for all OneLake reads and writes, so our Delta provider's traffic lands here.
   There is no per-statement view equivalent to `queryinsights`.
-- **Spark / notebook runs** — `fabric_job_instances(item)` (already shipped) gives run history with status and
+- **Spark / notebook runs** — `fabric.job_instances(item)` (already shipped) gives run history with status and
   timings; Spark's own monitoring gives resource usage. A notebook's CU shows in the metrics app as its own
   operation.
 - **Workspace monitoring (opt-in)** creates an Eventhouse + read-only KQL database in the workspace, with
@@ -504,7 +504,7 @@ All probe tables (`dbo.fabprobe_src` / `_ctas` / `_bulk` / `_plain`) were droppe
 on `Test Warehouse`. The history rows they produced remain readable for 30 days, which is itself convenient for
 re-reading these measurements without re-running them.
 
-**One live-validation side effect worth recording:** `fabric_capacities()` — built in the previous pass and
+**One live-validation side effect worth recording:** `fabric.capacities()` — built in the previous pass and
 listed there as wired-but-unvalidated — was exercised for real here and works (§3, constraint 1). It also
 produced the finding that the SP cannot see its own workspace's capacity, which no amount of code review would
 have revealed.

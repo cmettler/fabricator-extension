@@ -78,7 +78,7 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | **Macros** | Provider **global** macros — bare `fn(...)` / `FROM fn(...)`, every database, no ATTACH | ✅ |
 | | Provider **catalog-bound** macros → `db.schema.m(...)` (namespaced per catalog; expanded by the binder) | ✅ |
 | | **SQL-generating** table functions — the call is rewritten into SQL at bind time (`kind='table_sql'`) | ✅ |
-| **Fabric API** | `fabric_refresh_sql_endpoint()` — sync the lakehouse SQL analytics endpoint from SQL (the dbt unblocker) | ✅ OneLake + Fabric SQL attaches |
+| **Fabric API** | `refresh_sql_endpoint()` — sync the lakehouse SQL analytics endpoint from SQL (the dbt unblocker) | ✅ OneLake + Fabric SQL attaches |
 | | OneLake **shortcut** create / alter / drop / list, incl. non-OneLake targets via JSON | ✅ OneLake + Fabric SQL attaches |
 | | Introspection: workspaces, items, lakehouses (+ SQL endpoint strings), warehouses, connections, notebook parameters | ✅ OneLake + Fabric SQL attaches |
 | | **Parameterized notebook runs** (blocking, with status + portal snapshot link) | ✅ OneLake + Fabric SQL attaches |
@@ -220,8 +220,9 @@ ATTACH 'Server=...;Database=...' AS mssql
   (TYPE fabricator, schema_filter '^(dbo|sales)$', table_filter '^fact_');
 ```
 
-On a **Fabric** SQL endpoint the attach also accepts `WORKSPACE` / `ITEM`, which enable the `fabric_*`
-platform functions on that catalog — see
+On a **Fabric** SQL endpoint the catalog also gains a `fabric` schema of platform functions, which need no
+extra options (they derive the workspace and item from the connection string; `API_WORKSPACE` / `API_ITEM`
+override them) — see
 [Microsoft Fabric platform functions](#microsoft-fabric-platform-functions-onelake-and-fabric-sql-attaches).
 
 ### Secrets
@@ -709,44 +710,71 @@ Because the rewrite happens at bind, `EXPLAIN` shows the generated plan rather t
 
 When a catalog is attached over **OneLake** (Delta) or to a **Fabric SQL endpoint** (T-SQL), it additionally
 hosts functions that call the **Fabric REST API**, so platform operations Microsoft offers no T-SQL for can be
-driven from SQL. They are catalog-bound (`db.schema.fn(...)`) and **inherit the workspace, the item and the
-credential from the ATTACH** — which is why most of them take no arguments at all:
+driven from SQL. They **inherit the workspace, the item and the credential from the ATTACH** — which is why
+most of them take no arguments at all.
+
+**They live in a dedicated `fabric` schema on the attached catalog:** `<catalog>.fabric.<name>`.
 
 ```sql
 ATTACH 'abfss://MyWS@onelake.dfs.fabric.microsoft.com/MyLH.Lakehouse/Tables' AS lake
   (TYPE fabricator, PROVIDER 'delta', SECRET fabric_sp, READ_ONLY false);
 
--- What this attach resolved to (root, engine defaults, whether it is OneLake):
+SELECT table_name, status FROM lake.fabric.refresh_sql_endpoint();
+SELECT * FROM lake.fabric.sessions();
+
+-- What this attach resolved to (root, engine defaults, whether it is OneLake). Note this one is NOT
+-- a Fabric REST function — it describes the Delta catalog itself, so it lives in the data schema:
 SELECT * FROM lake.dbo.fab_delta_info();
 ```
 
+That schema is a **function namespace, not storage**: it holds no tables, is backed by no folder, and
+`CREATE TABLE <catalog>.fabric.t` is refused rather than quietly creating a `fabric/` directory next to your
+data. It appears beside the data schemas (`dbo`, `dbt`, …) and only where the functions themselves are
+registered.
+
 They are registered **only** where there is a Fabric platform to talk to — a OneLake root, or a SQL attach
 whose server is `*.fabric.microsoft.com`. A local or S3 Delta attach, or a plain SQL Server, has no workspace
-and no REST endpoint, so it shows none of them.
+and no REST endpoint, so it has no `fabric` schema at all.
 
 #### On a Fabric SQL attach (Warehouse or Lakehouse SQL endpoint)
 
-A T-SQL connection string does not name a workspace or an item — its host is an opaque per-workspace routing
-id — so give them as ATTACH options. This is what lets a dbt project running against a Fabric **Warehouse**
-refresh a lakehouse endpoint without a second, Delta-only attach:
+**Usually nothing extra is needed** — the workspace and item are derived from the connection string itself:
 
 ```sql
 CREATE SECRET fabric_sp (TYPE azure, PROVIDER service_principal,
                          TENANT_ID '…', CLIENT_ID '…', CLIENT_SECRET '…');
 
 ATTACH 'Server=<endpoint>.datawarehouse.fabric.microsoft.com;Database=MyLH' AS w
-  (TYPE fabricator, SECRET fabric_sp, WORKSPACE 'MyWS', ITEM 'MyLH');
+  (TYPE fabricator, SECRET fabric_sp);
 
-SELECT table_name, status FROM w.dbo.fabric_refresh_sql_endpoint();
+SELECT table_name, status FROM w.fabric.refresh_sql_endpoint();
 ```
+
+The **item** comes from `Database` (on a Fabric SQL endpoint the database *is* the lakehouse or warehouse), and
+the **workspace** is decoded from the endpoint host, which encodes it. Override either only when you want the
+functions to act on something other than what you attached:
 
 | ATTACH option | meaning |
 |---|---|
-| `WORKSPACE` | Default Fabric workspace — display name or GUID |
-| `ITEM` | Default item the functions act on — display name, `Name.Type`, or GUID. For `fabric_refresh_sql_endpoint` this is the **lakehouse** whose endpoint you want synced, which need not be the database you attached |
+| `API_WORKSPACE` | Workspace the `fabric.*` functions target — display name or GUID. Default: decoded from the endpoint host |
+| `API_ITEM` | Item the `fabric.*` functions target — display name, `Name.Type`, or GUID. Default: the connection string's `Database` |
 
-Both are optional. Omit one and the functions that need it simply require their `workspace :=` / `item :=`
-argument instead of defaulting it.
+> **These options scope the FUNCTIONS, not the attach** — hence the `API_` prefix. They do **not** change what
+> you queried: with `Database=MyLH, API_ITEM 'OtherLH'`, `w.dbo.orders` still reads **MyLH** while
+> `w.fabric.refresh_sql_endpoint()` syncs **OtherLH**. That is the point — it lets a dbt project attached to a
+> Fabric **Warehouse** refresh a *lakehouse* endpoint without a second, Delta-only attach.
+>
+> The earlier names `WORKSPACE` / `ITEM` are **rejected with a migration message** rather than ignored, because
+> silently dropping them would retarget the functions at the `Database` default without saying so.
+
+**On a OneLake (Delta) attach neither option exists or is needed** — the root names both:
+`abfss://<workspace>@onelake.dfs.fabric.microsoft.com/<item>.Lakehouse/Tables`. Both segments accept a **GUID**
+as well as a name, and a GUID costs no lookup:
+
+```sql
+ATTACH 'abfss://<workspaceId>@onelake.dfs.fabric.microsoft.com/<itemId>/Tables' AS lake
+  (TYPE fabricator, PROVIDER 'delta', SECRET fabric_sp, READ_ONLY false);
+```
 
 > **Credential:** use a service-principal or managed-identity secret. A pre-minted `ACCESS_TOKEN` secret
 > authenticates **SQL** but cannot be reused for the Fabric API — the two need different token audiences — so
@@ -760,66 +788,68 @@ Everything is optional except where noted, because the attach supplies the defau
 which is the common case for a dbt project that writes to more than one:
 
 ```sql
-SELECT * FROM lake.dbo.fabric_refresh_sql_endpoint();                  -- the attached lakehouse
-SELECT * FROM lake.dbo.fabric_refresh_sql_endpoint(item := 'OtherLH'); -- a different one
+SELECT * FROM lake.fabric.refresh_sql_endpoint();                  -- the attached lakehouse
+SELECT * FROM lake.fabric.refresh_sql_endpoint(item := 'OtherLH'); -- a different one
 ```
 
 | function | kind | what it does |
 |---|---|---|
-| `fabric_refresh_sql_endpoint([recreate := …] [, timeout_seconds := …] [, workspace := …] [, item := …])` | table | Syncs a lakehouse's **SQL analytics endpoint** now; one row per table |
-| `fabric_list_shortcuts([parent_path := …] [, workspace := …] [, item := …])` | table | A lakehouse's OneLake shortcuts, optionally under one path |
-| `fabric_create_shortcut(path, name, target_workspace, target_item, target_path)` | scalar | Creates a shortcut to another OneLake item; returns its full path. Fails if the name exists |
-| `fabric_alter_shortcut(…same args…)` | scalar | Re-points an **existing** shortcut (fails if absent) |
-| `fabric_create_shortcut_ex(…same args…, conflict_policy)` | scalar | Same, with `Abort` / `GenerateUniqueName` / `CreateOrOverwrite` / `OverwriteOnly` — use `CreateOrOverwrite` for idempotent scripts |
-| `fabric_create_shortcut_json(path, name, target_json [, conflict_policy])` | scalar | Any target type (ADLS Gen2, S3, GCS, Blob, Dataverse, SharePoint) as the REST `target` object |
-| `fabric_drop_shortcut(path, name [, if_exists])` | scalar | Deletes a shortcut; `if_exists := true` returns `false` instead of erroring |
-| `fabric_workspaces()` | table | Every workspace this identity can see (id, name, type, capacity) |
-| `fabric_items([item_type := …] [, workspace := …])` | table | Items in a workspace, optionally filtered (`'Notebook'`, `'Lakehouse'`, …) |
-| `fabric_lakehouses([workspace := …])` | table | Lakehouses **with their SQL endpoint id, status and connection string** |
-| `fabric_warehouses([workspace := …])` | table | Warehouses with their T-SQL connection strings |
-| `fabric_connections()` | table | Cloud connections — the `id` an external shortcut target needs |
-| `fabric_run_notebook(notebook [, params_json := …] [, config_json := …] [, wait_seconds := …] [, workspace := …])` | table | **Runs a notebook with parameters and blocks** until it finishes; one row of final state |
-| `fabric_notebook_parameters(notebook)` | table | Names/defaults from a notebook's `parameters`-tagged cell |
-| `fabric_table_maintenance(table [, schema := …] [, v_order := …] [, z_order_by := …] [, vacuum_retention := …] [, purge_deletion_vectors := …])` | table | Runs Fabric's maintenance job — **V-Order**, Z-order, VACUUM, purge deletion vectors |
-| `fabric_run_job(item, job_type [, execution_data_json := …] [, wait_seconds := …])` | table | Any on-demand item job (e.g. a pipeline); blocks unless `wait_seconds := 0` |
-| `fabric_job_status(item, job_instance_id)` / `fabric_job_instances(item)` | table | One job's state / that item's job history |
-| `fabric_cancel_job(item, job_instance_id)` | scalar | Requests cancellation |
-| `fabric_lakehouse_tables()` | table | Tables as **Fabric** sees them (flat lakehouses only — see below) |
-| `fabric_operation_status(operation_id)` | table | Generic long-running-operation status |
-| `fabric_reset_shortcut_cache()` | table | Clears the workspace's shortcut cache (**needs a user identity**) |
-| `fabric_semantic_models()` | table | The workspace's semantic models, incl. each lakehouse's and warehouse's default |
-| `fabric_refresh_semantic_model(model [, type := …] [, objects_json := …] [, commit_mode := …] [, timeout := …])` | table | **Refreshes a semantic model** (enhanced refresh) and blocks until it settles |
-| `fabric_semantic_model_refreshes(model [, top := …])` | table | That model's refresh history |
-| `fabric_git_status()` | table | Uncommitted/unpulled changes vs the connected branch, plus both heads. A clean workspace still returns one row (change columns NULL) |
-| `fabric_git_connection()` | table | Which repository/branch/directory the workspace is connected to, and its last sync |
-| `fabric_git_commit([mode := 'All'] [, comment := …] [, items_json := …] [, workspace_head := …])` | table | Commits the workspace to the branch. `mode := 'Selective'` needs `items_json` |
-| `fabric_git_update(remote_commit_hash [, conflict_resolution := …] [, allow_override := …])` | table | Pulls that commit into the workspace (`PreferRemote` / `PreferWorkspace`) |
-| `fabric_deployment_pipelines()` | table | Pipelines this identity can see |
-| `fabric_deployment_pipeline_stages(pipeline)` / `_items(pipeline, stage)` | table | A pipeline's stages (with the workspace assigned to each) / a stage's contents |
-| `fabric_deploy(pipeline, source_stage, target_stage [, note := …])` | table | Deploys one stage into the next and blocks; one row of operation state |
-| `fabric_deployment_pipeline_operations(pipeline)` | table | Deployment history — same columns as `fabric_deploy` |
-| `fabric_capacities()` | table | Capacities with SKU, region and state |
-| `fabric_environments([workspace := …])` | table | Spark environments + `publish_state` — the id `fabric_run_notebook`'s `config_json` needs |
-| `fabric_data_access_roles([item := …])` | table | OneLake data-access roles on an item (read only) |
-| `fabric_mirrored_databases([workspace := …])` | table | Mirrored databases, incl. `onelake_tables_path` (attachable directly) and the SQL endpoint |
-| `fabric_mirroring_status(database)` / `fabric_mirrored_tables(database)` | table | Whether replication is running / per-table state, rows, bytes and sync latency |
-| `fabric_variable_libraries([workspace := …])` | table | Variable libraries and which value set each has active |
-| `fabric_variables(library [, value_set := …] [, workspace := …])` | table | One row per variable, resolved against the active value set (or the one named) |
-| `fabric_variable_value_sets(library [, workspace := …])` | table | The library's alternative value sets, in declared order, flagging the active one |
-| `fabric_variable(library, name)` | scalar | One variable's value through the **active** value set — usable as an argument to the functions above |
-| `fabric_create_variable_library(name, description)` | scalar | Creates an empty library; returns its id. **Refused for a service principal** — see below |
-| `fabric_set_variable(library, name, type, value)` | scalar | Declares a variable or replaces its default value; returns `'created'`/`'updated'` |
-| `fabric_set_variables_json(library, variables_json)` | scalar | **Replaces** the whole default set in one write; returns the count. Use this to declare several at once |
-| `fabric_set_variable_override(library, value_set, name, value)` | scalar | Sets a value in an alternative set, creating the set if needed. Type comes from the declaration |
-| `fabric_set_active_value_set(library, value_set)` | scalar | Switches which value set the library resolves through |
-| `fabric_drop_variable_library(library [, if_exists])` | scalar | Deletes the library |
+| `refresh_sql_endpoint([recreate := …] [, timeout_seconds := …] [, workspace := …] [, item := …])` | table | Syncs a lakehouse's **SQL analytics endpoint** now; one row per table |
+| `list_shortcuts([parent_path := …] [, workspace := …] [, item := …])` | table | A lakehouse's OneLake shortcuts, optionally under one path |
+| `create_shortcut(path, name, target_workspace, target_item, target_path)` | scalar | Creates a shortcut to another OneLake item; returns its full path. Fails if the name exists |
+| `alter_shortcut(…same args…)` | scalar | Re-points an **existing** shortcut (fails if absent) |
+| `create_shortcut_ex(…same args…, conflict_policy)` | scalar | Same, with `Abort` / `GenerateUniqueName` / `CreateOrOverwrite` / `OverwriteOnly` — use `CreateOrOverwrite` for idempotent scripts |
+| `create_shortcut_json(path, name, target_json [, conflict_policy])` | scalar | Any target type (ADLS Gen2, S3, GCS, Blob, Dataverse, SharePoint) as the REST `target` object |
+| `drop_shortcut(path, name [, if_exists])` | scalar | Deletes a shortcut; `if_exists := true` returns `false` instead of erroring |
+| `workspaces()` | table | Every workspace this identity can see (id, name, type, capacity) |
+| `items([item_type := …] [, workspace := …])` | table | Items in a workspace, optionally filtered (`'Notebook'`, `'Lakehouse'`, …) |
+| `lakehouses([workspace := …])` | table | Lakehouses **with their SQL endpoint id, status and connection string** |
+| `warehouses([workspace := …])` | table | Warehouses with their T-SQL connection strings |
+| `connections()` | table | Cloud connections — the `id` an external shortcut target needs |
+| `run_notebook(notebook [, params_json := …] [, config_json := …] [, wait_seconds := …] [, workspace := …])` | table | **Runs a notebook with parameters and blocks** until it finishes; one row of final state |
+| `notebook_parameters(notebook)` | table | Names/defaults from a notebook's `parameters`-tagged cell |
+| `table_maintenance(table [, schema := …] [, v_order := …] [, z_order_by := …] [, vacuum_retention := …] [, purge_deletion_vectors := …])` | table | Runs Fabric's maintenance job — **V-Order**, Z-order, VACUUM, purge deletion vectors |
+| `run_job(item, job_type [, execution_data_json := …] [, wait_seconds := …])` | table | Any on-demand item job (e.g. a pipeline); blocks unless `wait_seconds := 0` |
+| `job_status(item, job_instance_id [, workspace := …] [, item_type := …])` | table | One job instance's state |
+| `job_instances([item := …] [, workspace := …] [, item_type := …])` | table | Job history for one item, **or fanned out across every item of a type** (`item_type := 'Notebook'`). Rows carry `item_name`/`item_id` |
+| `cancel_job(item, job_instance_id)` | scalar | Requests cancellation |
+| `sessions([workspace := …])` | table | **What is running on Spark right now** — every Livy session in the workspace, with queued vs running time. One request, no item argument |
+| `lakehouse_tables()` | table | Tables as **Fabric** sees them (flat lakehouses only — see below) |
+| `operation_status(operation_id)` | table | Generic long-running-operation status |
+| `reset_shortcut_cache()` | table | Clears the workspace's shortcut cache (**needs a user identity**) |
+| `semantic_models()` | table | The workspace's semantic models, incl. each lakehouse's and warehouse's default |
+| `refresh_semantic_model(model [, type := …] [, objects_json := …] [, commit_mode := …] [, timeout := …])` | table | **Refreshes a semantic model** (enhanced refresh) and blocks until it settles |
+| `semantic_model_refreshes(model [, top := …])` | table | That model's refresh history |
+| `git_status()` | table | Uncommitted/unpulled changes vs the connected branch, plus both heads. A clean workspace still returns one row (change columns NULL) |
+| `git_connection()` | table | Which repository/branch/directory the workspace is connected to, and its last sync |
+| `git_commit([mode := 'All'] [, comment := …] [, items_json := …] [, workspace_head := …])` | table | Commits the workspace to the branch. `mode := 'Selective'` needs `items_json` |
+| `git_update(remote_commit_hash [, conflict_resolution := …] [, allow_override := …])` | table | Pulls that commit into the workspace (`PreferRemote` / `PreferWorkspace`) |
+| `deployment_pipelines()` | table | Pipelines this identity can see |
+| `deployment_pipeline_stages(pipeline)` / `_items(pipeline, stage)` | table | A pipeline's stages (with the workspace assigned to each) / a stage's contents |
+| `deploy(pipeline, source_stage, target_stage [, note := …])` | table | Deploys one stage into the next and blocks; one row of operation state |
+| `deployment_pipeline_operations(pipeline)` | table | Deployment history — same columns as `deploy` |
+| `capacities()` | table | Capacities with SKU, region and state |
+| `environments([workspace := …])` | table | Spark environments + `publish_state` — the id `run_notebook`'s `config_json` needs |
+| `data_access_roles([item := …])` | table | OneLake data-access roles on an item (read only) |
+| `mirrored_databases([workspace := …])` | table | Mirrored databases, incl. `onelake_tables_path` (attachable directly) and the SQL endpoint |
+| `mirroring_status(database)` / `mirrored_tables(database)` | table | Whether replication is running / per-table state, rows, bytes and sync latency |
+| `variable_libraries([workspace := …])` | table | Variable libraries and which value set each has active |
+| `variables(library [, value_set := …] [, workspace := …])` | table | One row per variable, resolved against the active value set (or the one named) |
+| `variable_value_sets(library [, workspace := …])` | table | The library's alternative value sets, in declared order, flagging the active one |
+| `variable(library, name)` | scalar | One variable's value through the **active** value set — usable as an argument to the functions above |
+| `create_variable_library(name, description)` | scalar | Creates an empty library; returns its id. **Refused for a service principal** — see below |
+| `set_variable(library, name, type, value)` | scalar | Declares a variable or replaces its default value; returns `'created'`/`'updated'` |
+| `set_variables_json(library, variables_json)` | scalar | **Replaces** the whole default set in one write; returns the count. Use this to declare several at once |
+| `set_variable_override(library, value_set, name, value)` | scalar | Sets a value in an alternative set, creating the set if needed. Type comes from the declaration |
+| `set_active_value_set(library, value_set)` | scalar | Switches which value set the library resolves through |
+| `drop_variable_library(library [, if_exists])` | scalar | Deletes the library |
 
 **Refreshing the SQL endpoint after a Delta write** — the reason this exists. A table written through the
 Delta provider is invisible to the lakehouse's T-SQL endpoint until Fabric's asynchronous detection notices
 it, which races any downstream T-SQL model:
 
 ```sql
-SELECT table_name, status, error_message FROM lake.dbo.fabric_refresh_sql_endpoint();
+SELECT table_name, status, error_message FROM lake.fabric.refresh_sql_endpoint();
 ```
 
 > **`status = 'NotRun'` is normal and means "already in sync"** — not a failure. Check
@@ -828,20 +858,20 @@ SELECT table_name, status, error_message FROM lake.dbo.fabric_refresh_sql_endpoi
 
 > **In dbt, this hook must be non-transactional.** Delta commits land at DuckDB `COMMIT`, so an
 > in-transaction post-hook would refresh *before* the table exists. Use
-> `post_hook: [{sql: "SELECT count(*) FROM lake.dbo.fabric_refresh_sql_endpoint()", transaction: false}]`,
+> `post_hook: [{sql: "SELECT count(*) FROM lake.fabric.refresh_sql_endpoint()", transaction: false}]`,
 > or an `on-run-end` hook.
 
 **Shortcuts.** `target_workspace` / `target_item` accept a display name or a GUID, and `NULL` means "this
 catalog's own workspace / lakehouse":
 
 ```sql
-SELECT lake.dbo.fabric_create_shortcut('Tables', 'ref_orders', NULL, NULL, 'Tables/orders');
-SELECT path, name, target_type, target_location, target_subpath FROM lake.dbo.fabric_list_shortcuts();
-SELECT lake.dbo.fabric_alter_shortcut('Tables', 'ref_orders', 'OtherWS', 'OtherLH', 'Tables/orders_v2');
-SELECT lake.dbo.fabric_drop_shortcut('Tables', 'ref_orders', true);
+SELECT lake.fabric.create_shortcut('Tables', 'ref_orders', NULL, NULL, 'Tables/orders');
+SELECT path, name, target_type, target_location, target_subpath FROM lake.fabric.list_shortcuts();
+SELECT lake.fabric.alter_shortcut('Tables', 'ref_orders', 'OtherWS', 'OtherLH', 'Tables/orders_v2');
+SELECT lake.fabric.drop_shortcut('Tables', 'ref_orders', true);
 ```
 
-`fabric_list_shortcuts` flattens the stable target fields into typed columns (`target_type`,
+`list_shortcuts` flattens the stable target fields into typed columns (`target_type`,
 `target_workspace_id`, `target_item_id`, `target_path`, `target_location`, `target_subpath`,
 `target_connection_id`) and additionally returns `target_json` with the complete target object, so target
 types this build does not flatten are still readable. External targets need a pre-provisioned Fabric
@@ -849,9 +879,9 @@ types this build does not flatten are still readable. External targets need a pr
 
 ```sql
 -- Find the connection first, then use its id as the target's connectionId.
-SELECT id, name, connection_type, path FROM lake.dbo.fabric_connections();
+SELECT id, name, connection_type, path FROM lake.fabric.connections();
 
-SELECT lake.dbo.fabric_create_shortcut_json('Files/landing', 'partner',
+SELECT lake.fabric.create_shortcut_json('Files/landing', 'partner',
   '{"adlsGen2": {"location": "https://acct.dfs.core.windows.net",
                  "subpath": "/container/data", "connectionId": "…"}}');
 ```
@@ -862,12 +892,12 @@ deployment pipeline flips per stage. Reading it from SQL means a model does not 
 lakehouse it writes to:
 
 ```sql
-SELECT name, active_value_set FROM lake.dbo.fabric_variable_libraries();
+SELECT name, active_value_set FROM lake.fabric.variable_libraries();
 
 SELECT name, type, value, is_overridden, value_set
-FROM lake.dbo.fabric_variables('app_config') ORDER BY name;
+FROM lake.fabric.variables('app_config') ORDER BY name;
 
-SELECT name, is_active, override_count FROM lake.dbo.fabric_variable_value_sets('app_config');
+SELECT name, is_active, override_count FROM lake.fabric.variable_value_sets('app_config');
 ```
 
 `value` is the value as text and `value_json` is the same value as JSON (a string's is quoted, so it stays
@@ -876,11 +906,11 @@ the `item :=` / `workspace :=` overrides above take — so the scalar feeds them
 
 ```sql
 -- Refresh whichever lakehouse the active value set points at.
-SELECT count(*) FROM lake.dbo.fabric_refresh_sql_endpoint(
-  item := lake.dbo.fabric_variable('app_config', 'target_lakehouse') ->> 'itemId');
+SELECT count(*) FROM lake.fabric.refresh_sql_endpoint(
+  item := lake.fabric.variable('app_config', 'target_lakehouse') ->> 'itemId');
 ```
 
-> `fabric_variable` is a **pure** function, so a constant call folds to a literal once per statement rather
+> `variable` is a **pure** function, so a constant call folds to a literal once per statement rather
 > than running per row. The flip side: a *prepared* statement bakes the value into its cached plan and will
 > not see a later change to the library.
 
@@ -889,7 +919,7 @@ so one bulk write is much faster than one call per variable, and it is the only 
 write losing your change:
 
 ```sql
-SELECT lake.dbo.fabric_set_variables_json('app_config', '[
+SELECT lake.fabric.set_variables_json('app_config', '[
   {"name": "env_name",   "type": "String",  "value": "dev"},
   {"name": "batch_size", "type": "Integer", "value": 500},
   {"name": "target_lakehouse", "type": "ItemReference",
@@ -897,9 +927,9 @@ SELECT lake.dbo.fabric_set_variables_json('app_config', '[
 ]');
 
 -- One variable at a time, then a prod override and a switch.
-SELECT lake.dbo.fabric_set_variable('app_config', 'retries', 'Integer', '3');
-SELECT lake.dbo.fabric_set_variable_override('app_config', 'prod', 'batch_size', '50000');
-SELECT lake.dbo.fabric_set_active_value_set('app_config', 'prod');
+SELECT lake.fabric.set_variable('app_config', 'retries', 'Integer', '3');
+SELECT lake.fabric.set_variable_override('app_config', 'prod', 'batch_size', '50000');
+SELECT lake.fabric.set_active_value_set('app_config', 'prod');
 ```
 
 `type` decides how `value` is rendered, so `'500'` with `type := 'Integer'` stores `500` while
@@ -907,20 +937,20 @@ SELECT lake.dbo.fabric_set_active_value_set('app_config', 'prod');
 takes **no** type: the declaration owns it. Overriding a variable that is not declared is refused too,
 because such an override would never resolve.
 
-> **⚠ Creating a library needs a user identity.** `fabric_create_variable_library` returns
+> **⚠ Creating a library needs a user identity.** `create_variable_library` returns
 > `FeatureNotAvailable` for a service principal — despite Microsoft documenting these APIs as SP-supported,
 > and despite the error naming the wrong cause (the feature *is* available; creation is what is refused).
 > Create the library once in the portal; every other function here works fine with an SP.
 
 > **Not cheap.** Reading or writing a definition is a long-running operation — tens of seconds. Prefer
-> `fabric_set_variables_json`, and note that two `fabric_variable()` calls in one SELECT list are two reads.
+> `set_variables_json`, and note that two `variable()` calls in one SELECT list are two reads.
 
 **Table maintenance — the one optimize this extension cannot do itself.** **V-Order** is a proprietary
 parquet layout optimization, so a table that Power BI or the SQL endpoint reads hot is worth passing through
 Fabric's own maintenance job even though `OPTIMIZE` compacts it perfectly well here:
 
 ```sql
-SELECT status, error_message FROM lake.dbo.fabric_table_maintenance(
+SELECT status, error_message FROM lake.fabric.table_maintenance(
   'orders', schema := 'dbo', v_order := true, z_order_by := 'order_date,customer_id');
 ```
 
@@ -931,24 +961,69 @@ Fabric's `d:hh:mm:ss` form (e.g. `'7:01:00:00'`).
 Any other job type goes through the generic runner, and jobs can be watched or cancelled:
 
 ```sql
-SELECT * FROM lake.dbo.fabric_run_job('nightly_pipeline', 'Pipeline', item_type := 'DataPipeline');
-SELECT job_type, status, start_time FROM lake.dbo.fabric_job_instances('my_notebook', item_type := 'Notebook');
+SELECT * FROM lake.fabric.run_job('nightly_pipeline', 'Pipeline', item_type := 'DataPipeline');
+
+-- one item's history
+SELECT job_type, status, start_time
+FROM lake.fabric.job_instances(item := 'my_notebook', item_type := 'Notebook');
+
+-- or FAN OUT: every notebook in the workspace, in one query
+SELECT item_name, status, count(*) AS runs
+FROM lake.fabric.job_instances(item_type := 'Notebook')
+GROUP BY 1, 2 ORDER BY runs DESC;
 ```
 
+> **Fan-out costs one API call per item.** Omitting `item` fans out across the items of `item_type`; omitting
+> **both** is refused rather than sweeping the whole workspace, because that is unbounded and the API is throttled
+> per principal. There is no `max_items` cap on purpose — a cap would under-report while looking complete.
+> `item` is a **named** parameter (`item := 'x'`), which is what makes omitting it possible.
+
 > A table function cannot take a **subquery** argument (`Binder Error: Table function cannot contain
-> subqueries`), so pass `job_instance_id` as a literal. The scalar `fabric_cancel_job` accepts one.
+> subqueries`), so pass `job_instance_id` as a literal. The scalar `cancel_job` accepts one.
+
+**Spark sessions — what is running right now.** `job_instances` needs an item and answers "what jobs has
+*this thing* run". `sessions()` takes no item at all and answers "what is on the Spark compute", which is
+the question the portal makes tedious:
+
+```sql
+-- anything still going, longest-running first
+SELECT operation_name, item_name, state, round(running_seconds) AS running_s, submitter_id
+FROM lake.fabric.sessions()
+WHERE state <> 'Succeeded'
+ORDER BY running_seconds DESC;
+
+-- where the compute actually went
+SELECT operation_name, count(*) AS runs, round(avg(running_seconds), 1) AS avg_s
+FROM lake.fabric.sessions() GROUP BY 1 ORDER BY runs DESC;
+```
+
+It reports one row per Livy session with the Spark-level detail no job instance carries — queued time separate
+from running time, the runtime version, the attempt number and `spark_application_id` — and `job_instance_id`
+joins it back to `job_instances`.
+
+> **Three gotchas, all measured.** ① The **same** work is labelled differently in the two surfaces: as a session
+> it is `job_type = 'JupyterSession'`, `state = 'Succeeded'`; as a job instance it is `job_type = 'RunNotebook'`,
+> `status = 'Completed'`. A predicate carried across matches nothing. ② `item_type` arrives **lower-case**
+> (`notebook`) while `job_type` and `state` are PascalCase, and one state value contains a **space** —
+> `'Not Started'`, not `'NotStarted'`. Use `lower()` and match defensively. ③ `submitter` (the display name) came
+> back empty on every row while `submitter_id` was always populated — group by the id.
+>
+> **The Spark allocation columns** (`driver_cores`, `executor_cores`, `num_executors`, …) are populated only for
+> a session that actually has an allocation. A **Python** notebook run (`runtime_version = 'jupyter1.0'`) has
+> none, so they read NULL — that is the workload, not a broken column. Live cell output is not available from
+> the API at all: `spark_application_id` and `resource_uri` are pointers to the portal.
 
 **Semantic models — making a Delta write visible to Power BI.** Refreshing the SQL endpoint makes a new
 table visible to **T-SQL**; refreshing the semantic model is what makes the data visible to **Power BI**. Both
 a lakehouse and a warehouse have a *default* semantic model, named after the item itself:
 
 ```sql
-SELECT name, is_refreshable FROM lake.dbo.fabric_semantic_models();
+SELECT name, is_refreshable FROM lake.fabric.semantic_models();
 
 SELECT status, refresh_type, error_message
-FROM lake.dbo.fabric_refresh_semantic_model('MyLakehouse');           -- the default model
+FROM lake.fabric.refresh_semantic_model('MyLakehouse');           -- the default model
 
-SELECT status, extended_status FROM lake.dbo.fabric_semantic_model_refreshes('MyLakehouse', top := 5);
+SELECT status, extended_status FROM lake.fabric.semantic_model_refreshes('MyLakehouse', top := 5);
 ```
 
 It issues an **enhanced refresh**, so the full contract is available — `type` (`Full`, `ClearValues`,
@@ -956,7 +1031,7 @@ It issues an **enhanced refresh**, so the full contract is available — `type` 
 `max_parallelism`, `retry_count`, `timeout` (`hh:mm:ss`), and per-object targeting:
 
 ```sql
-SELECT status FROM lake.dbo.fabric_refresh_semantic_model('Sales',
+SELECT status FROM lake.fabric.refresh_semantic_model('Sales',
   type := 'Full', objects_json := '[{"table": "Orders", "partition": "2026"}]');
 ```
 
@@ -969,7 +1044,7 @@ Notes:
   require the tenant's *"Service principals can call Fabric public APIs"* setting for a service principal,
   which is separate from any workspace role you granted.
 - Power BI reports a refresh still in flight as `status = 'Unknown'`; `wait_seconds := 0` submits without
-  waiting and you can poll with `fabric_semantic_model_refreshes`.
+  waiting and you can poll with `semantic_model_refreshes`.
 - For per-table or per-**partition** refresh, use `dax_refresh*` through the
   [DAX provider](#power-bi--dax-provider) — the REST API cannot address a partition at all.
 
@@ -977,12 +1052,12 @@ Notes:
 attaching the lakehouse's T-SQL endpoint alongside the Delta catalog:
 
 ```sql
-SELECT name, sql_endpoint_status, sql_endpoint_connection_string FROM lake.dbo.fabric_lakehouses();
-SELECT id, name FROM lake.dbo.fabric_items(item_type := 'Notebook');
-SELECT name, default_value, inferred_type FROM lake.dbo.fabric_notebook_parameters('my_notebook');
+SELECT name, sql_endpoint_status, sql_endpoint_connection_string FROM lake.fabric.lakehouses();
+SELECT id, name FROM lake.fabric.items(item_type := 'Notebook');
+SELECT name, default_value, inferred_type FROM lake.fabric.notebook_parameters('my_notebook');
 ```
 
-`fabric_notebook_parameters` is best-effort: Fabric injects parameter overrides after the cell tagged
+`notebook_parameters` is best-effort: Fabric injects parameter overrides after the cell tagged
 `parameters`, which is ordinary Python, so this reads simple top-level `name = literal` lines. No rows means
 the notebook has no tagged cell. It reads the notebook definition, which is a slow API (~20 s) — don't call
 it per row.
@@ -993,7 +1068,7 @@ automatically, and a `{"value": …, "type": "float"}` member overrides that inf
 
 ```sql
 SELECT status, exit_value, error_message
-FROM lake.dbo.fabric_run_notebook('load_dims', '{"run_date": "2026-07-30", "full_refresh": true}');
+FROM lake.fabric.run_notebook('load_dims', '{"run_date": "2026-07-30", "full_refresh": true}');
 ```
 
 It blocks until the run finishes (default cap one hour; a cold Spark session alone takes minutes) and
@@ -1015,19 +1090,19 @@ Notes and limits:
   `SELECT fabricator_refresh_cache('lake')` — table discovery is cached.
 - **Shortcut metadata is eventually consistent on Fabric's side.** Re-creating a just-dropped name can
   briefly fail with `EntityConflict` even though a listing already shows it gone. For idempotent scripts
-  prefer `fabric_create_shortcut_ex(path, name, …, 'CreateOrOverwrite')` over drop-then-create.
+  prefer `create_shortcut_ex(path, name, …, 'CreateOrOverwrite')` over drop-then-create.
 - These calls take effect **immediately** and are not undone by a surrounding `ROLLBACK` (like Delta
   `DROP`/`OPTIMIZE`).
 - Errors lead with Fabric's own error code, e.g. `EntityConflict`, `PrincipalTypeNotSupported`.
 - Some Fabric APIs reject **service principals** regardless of documented support (notably resetting the
   shortcut cache and creating notebook items); those need a user identity.
-- `fabric_connections()` lists only connections the **calling identity** has a role on — a service
+- `connections()` lists only connections the **calling identity** has a role on — a service
   principal often sees none even where connection-backed shortcuts exist. Grant the SP access to the
   connection before creating external shortcuts with it.
-- `fabric_lakehouse_tables()` is **rejected by Fabric on a schema-enabled lakehouse**
+- `lakehouse_tables()` is **rejected by Fabric on a schema-enabled lakehouse**
   (`UnsupportedOperationForSchemasEnabledLakehouse`); it works on a flat one. The extension's own catalog
   lists a schema-enabled lakehouse's tables anyway.
-- `fabric_reset_shortcut_cache()` needs a **user identity** — a service principal is refused with
+- `reset_shortcut_cache()` needs a **user identity** — a service principal is refused with
   `PrincipalTypeNotSupported`. It is the remedy when a re-created shortcut name transiently conflicts.
 - `duckdb_functions()` also lists an `<name>_each` sibling for each table function. That is the generic
   per-row form and is not usable on this provider.
@@ -1653,7 +1728,7 @@ SELECT * FROM m."Model".daxeach((SELECT region FROM regions), expression := 'EVA
 ```
 
 **Refreshing the model (XMLA/TMSL) — including a single partition**, which the Power BI REST API cannot
-express at all. `fabric_refresh_semantic_model` (above) answers *"refresh this model, tell me when it's
+express at all. `refresh_semantic_model` (above) answers *"refresh this model, tell me when it's
 done"*; these address individual tables and partitions:
 
 ```sql

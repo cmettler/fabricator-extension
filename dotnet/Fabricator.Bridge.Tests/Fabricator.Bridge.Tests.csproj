@@ -41,6 +41,15 @@
   <ItemGroup>
     <Compile Include="..\Fabricator.Bridge\FabricApi\FabricVariableLibraryFormat.cs"
              Link="Linked\FabricVariableLibraryFormat.cs" />
+    <!--
+      The Fabric SQL endpoint host/connstr derivation. Admissible because its closure is the BCL (it hand-rolls
+      both the base32 decode — the BCL has none — and the connection-string parse, rather than reaching for
+      SqlConnectionStringBuilder, precisely so it can be tested here). It is also the code that most NEEDS
+      offline tests: it decodes an UNDOCUMENTED host encoding observed on one tenant, and its required
+      behaviour on anything unexpected is to return null rather than a plausible-looking wrong workspace id.
+    -->
+    <Compile Include="..\Fabricator.Bridge\FabricApi\FabricSqlEndpointHost.cs"
+             Link="Linked\FabricSqlEndpointHost.cs" />
   </ItemGroup>
 
 </Project>
