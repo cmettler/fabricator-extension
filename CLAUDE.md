@@ -755,10 +755,19 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
         files directly**, admission rule: *a file belongs there only if its closure is the BCL*. A forcing
         function, not a workaround — it rewards keeping parsing/resolution/rendering out of the Arrow/SDK
         boundary, which is why `FabricVariableLibraryFormat.cs` was split out in the first place.
-      - **⚠ NOT WIRED INTO CI (deliberate, user-directed).** `installer-core.yml` names
-        `Fabricator.Installer.Core.Tests` explicitly and was left untouched, so nothing runs these on a push —
-        `dotnet test dotnet/Fabricator.Bridge.Tests` locally only. **The tier-0 row in the CI table below does
-        NOT cover them.**
+      - **WIRED INTO TIER 0** as a SECOND JOB (`bridge`) in `installer-core.yml`, floor 47, both TFMs × both
+        OSes. Three things about that wiring are deliberate and easy to undo by accident:
+        - **A separate job, not another step** — the count tripwire reads the FIRST `Total:` in its output file
+          (`head -1`), so a second `dotnet test` piped into the same file would leave this project's floor
+          silently unchecked. A tripwire that looks armed and is not.
+        - **The path filter lists `dotnet/Fabricator.Bridge/**`, not the individual linked file** — filtering the
+          one file would silently stop covering the next one someone links, the same failure as the
+          submodule-pointer omission (a filter that misses the change the gate exists to guard).
+        - **Both OSes**, because the format code normalises PATH SEPARATORS and asserts on CRLF in stored JSON;
+          pinning that on one platform is how an accidental `Path.DirectorySeparatorChar` /
+          `Environment.NewLine` dependency hides.
+        ⚠ The workflow is still NAMED `installer-core` for a historical reason only (renaming it renames every
+        status check) — read it as "tier 0", not "the installer".
   - Output shape rule (D4): typed flat columns + one raw-JSON column for polymorphic parts; **no STRUCT
     wrapping** (adding a column is additive for `SELECT *`; adding a struct FIELD changes a column's type
     and breaks bound views), no JSON-only. Every `table`-kind function also gets a dead `_each` sibling —
@@ -2039,8 +2048,7 @@ commits do not compile DuckDB:
 
 | tier | workflow | what | trigger |
 |---|---|---|---|
-| 0 | `installer-core.yml` | `Fabricator.Installer.Core.Tests`, 92 × {net8.0,net10.0} × {win,linux}. No C++, no vcpkg, no submodules (the closure is Installer.Core + xunit). ~2 min | push/PR |
-| — | (not wired) | **`Fabricator.Bridge.Tests`** — 47 × {net8.0,net10.0}, the variable-library format. Tier-0-SHAPED (BCL-only closure, no submodule) but **deliberately absent from every workflow**: run `dotnet test dotnet/Fabricator.Bridge.Tests` by hand. Wiring it is a one-line addition to `installer-core.yml`, left undone on purpose | by hand |
+| 0 | `installer-core.yml` — **TWO jobs** | job `test`: `Fabricator.Installer.Core.Tests`, floor **92**. job `bridge`: `Fabricator.Bridge.Tests`, floor **47** (the variable-library format). Both × {net8.0,net10.0} × {win,linux}. No C++, no vcpkg, **no submodules**. ~2 min | push/PR |
 | 1 | `extension.yml` | build + the **53 hermetic suites / 4152 assertions** (scratch dir + in-repo fixtures only). 3 platforms | push/PR |
 | 2 | `integration.yml` | the **42 service suites / 1221 assertions** via `docker/docker-compose.yml` (SQL Server 2025 + MinIO + generated certs + `provision.ps1`). linux only | schedule + dispatch |
 | 3 | `distribution.yml` | the single-file artifact per platform + the **12-check smoke against a STOCK DuckDB wheel** (`test/distribution/smoke_distribution.py`). 3 platforms; needs `OVERRIDE_GIT_DESCRIBE` (the one tier that does) | dispatch + `v*` tags |

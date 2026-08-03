@@ -1313,10 +1313,11 @@ rendering) out of the Arrow/SDK boundary, which is exactly what makes it testabl
 was split out of `FabricVariableFunctions.cs` for this reason. A file that cannot be admitted is telling you
 its logic is entangled with I/O.
 
-**⚠ It is NOT wired into CI (deliberate, 2026-08-03).** `installer-core.yml` names
-`Fabricator.Installer.Core.Tests` explicitly and was left alone, so nothing runs these on a push — they are a
-local `dotnet test dotnet/Fabricator.Bridge.Tests` only. Do not read the tier-0 row in CLAUDE.md's CI table as
-covering them.
+**Wired into TIER 0** as a second job (`bridge`) in `installer-core.yml` — floor 47, both TFMs × both OSes,
+no submodules. It is a separate JOB rather than another step because the count tripwire reads the first
+`Total:` in its output file, so a second `dotnet test` into the same file would leave the floor silently
+unchecked; and the path filter covers `dotnet/Fabricator.Bridge/**` rather than the single linked file, so it
+cannot stop covering a newly linked one.
 
 The end-to-end path remains gated only by the manual live script, like `verify_dax`.
 

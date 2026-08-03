@@ -1,25 +1,47 @@
-# Tier 0 of this repo's CI: the single-file-distribution logic, unit tested as plain .NET.
+# Tier 0 of this repo's CI: the pure-.NET logic that needs no toolchain to test.
 #
 # Deliberately the FIRST workflow, because it is the cheapest useful one — no C++ toolchain, no
-# vcpkg, no .NET publish, no SQL Server, no MinIO, no submodules. Two minutes, and it covers the
-# newest and least battle-worn code in the repo (the payload packer, the polyglot reader/writer,
-# DuckDB extension-directory resolution, the compatibility gate, the staging/locking extractor).
+# vcpkg, no .NET publish, no SQL Server, no MinIO, no submodules. Two minutes.
 #
-# The other tiers, when they land:
-#   Tier 1  build + the 54 delta suites that need only a writable directory, + pack + smoke  (~40 min/platform)
-#   Tier 2  the 38 SQL Server suites + 3 S3/PolyBase ones, via docker/docker-compose.yml      (scheduled)
-#   Tier 3  DAX (needs Power BI Desktop) and live Fabric/OneLake — NOT automatable, manual gates
+# TWO projects now, one job each:
+#   Fabricator.Installer.Core.Tests  the single-file-distribution logic (the payload packer, the
+#                                    polyglot reader/writer, DuckDB extension-directory resolution,
+#                                    the compatibility gate, the staging/locking extractor)
+#   Fabricator.Bridge.Tests          BRIDGE logic whose closure is the base class library — today
+#                                    the Fabric variable-library definition format
+#
+# ⚠ The workflow is still called `installer-core` for a HISTORICAL reason and nothing more: renaming
+# it would rename every status check. Read it as "tier 0", not as "the installer".
+#
+# ⚠ The admission rule for the Bridge project is what keeps this tier cheap, and it is load-bearing:
+# it compiles selected Bridge SOURCE FILES rather than referencing Fabricator.Bridge, because that
+# project references engineered-wood (a SUBMODULE) plus Arrow, the Fabric SDK, SqlClient and the
+# AWS/Azure SDKs. A ProjectReference would drag all of that in and destroy the property this tier
+# exists for. See the csproj, which says so at the point someone would be tempted to "fix" it.
+#
+# The other tiers:
+#   Tier 1  build + the hermetic suites, 3 platforms                                    (push/PR)
+#   Tier 2  the service suites via docker/docker-compose.yml                            (scheduled)
+#   Tier 3  the single-file artifact + smoke against a stock DuckDB wheel               (dispatch/tags)
+#   manual  DAX (needs Power BI Desktop), live Fabric/OneLake, the deltars suites
 #
 # See CLAUDE.md; the branch is v1.5-variegata, mirroring DuckDB's 1.5 release line.
 
 name: installer-core
 
 on:
+  # ⚠ `dotnet/Fabricator.Bridge/**` is listed — NOT just the one file the Bridge tests currently
+  # link. Filtering on the individual linked file would silently stop covering the next one someone
+  # links, which is the same failure as the submodule-pointer omission recorded in CLAUDE.md: a
+  # path filter that misses the very change the gate exists to guard. Tier 0 is two minutes, so
+  # running it for any Bridge edit is the cheap side of that trade.
   push:
     branches: [v1.5-variegata]
     paths:
       - dotnet/Fabricator.Installer.Core/**
       - dotnet/Fabricator.Installer.Core.Tests/**
+      - dotnet/Fabricator.Bridge/**
+      - dotnet/Fabricator.Bridge.Tests/**
       - dotnet/Directory.Build.props
       - .github/workflows/installer-core.yml
   pull_request:
@@ -27,6 +49,8 @@ on:
     paths:
       - dotnet/Fabricator.Installer.Core/**
       - dotnet/Fabricator.Installer.Core.Tests/**
+      - dotnet/Fabricator.Bridge/**
+      - dotnet/Fabricator.Bridge.Tests/**
       - dotnet/Directory.Build.props
       - .github/workflows/installer-core.yml
   workflow_dispatch:
@@ -96,6 +120,64 @@ jobs:
           # as coverage). Total therefore holds at 92 on both runners while Passed does not. Actual
           # failures need no floor of their own: `dotnet test` already exits non-zero for those.
           total=$(grep -oE 'Total:[[:space:]]+[0-9]+' test-output.txt | grep -oE '[0-9]+' | head -1)
+          if [ -z "$total" ]; then
+            echo "::error::Could not parse a test count out of the dotnet test output."
+            exit 1
+          fi
+          echo "total=$total (floor $EXPECTED_MINIMUM)"
+          if [ "$total" -lt "$EXPECTED_MINIMUM" ]; then
+            echo "::error::Only $total tests were discovered; expected at least $EXPECTED_MINIMUM. Tests were lost."
+            exit 1
+          fi
+
+  # A SEPARATE job, not another step in `test`, and that is forced rather than tidy: the count
+  # tripwire reads the FIRST `Total:` in its output file (`head -1`), so a second `dotnet test`
+  # piped into the same file would leave this project's floor silently unchecked — a tripwire that
+  # looks armed and is not.
+  bridge:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        tfm: [net8.0, net10.0]
+    runs-on: ${{ matrix.os }}
+    # Both OSes on purpose. The format code under test normalises PATH SEPARATORS (Fabric's own docs
+    # spell the value-set folder with a backslash) and asserts on CRLF in stored JSON; pinning that
+    # behaviour on one platform only is how an accidental Path.DirectorySeparatorChar or
+    # Environment.NewLine dependency would hide. Both TFMs because net8.0 is the deployment floor.
+    name: bridge / ${{ matrix.os }} / ${{ matrix.tfm }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # NO SUBMODULES, and this project is designed so that holds: it compiles BCL-only Bridge
+          # source files instead of referencing Fabricator.Bridge (which references engineered-wood).
+          # If this ever has to become `true`, the admission rule has been broken — fix the reference,
+          # not this line.
+          submodules: false
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Test
+        run: |
+          dotnet test dotnet/Fabricator.Bridge.Tests \
+            -c Release -f ${{ matrix.tfm }} --nologo \
+            | tee bridge-test-output.txt
+
+      # Same rationale as the installer floor above: `dotnet test` exits 0 for a project that builds
+      # and runs FEWER tests than it used to, so the green check alone does not prove coverage held.
+      # A floor, not an equality — adding tests must not break CI, losing them must.
+      - name: Assert the suite actually ran
+        env:
+          # 47 cases today (theories expand). Nothing here is platform-skipped, so Total is the same
+          # on both runners.
+          EXPECTED_MINIMUM: 47
+        run: |
+          total=$(grep -oE 'Total:[[:space:]]+[0-9]+' bridge-test-output.txt | grep -oE '[0-9]+' | head -1)
           if [ -z "$total" ]; then
             echo "::error::Could not parse a test count out of the dotnet test output."
             exit 1
