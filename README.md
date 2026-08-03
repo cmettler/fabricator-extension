@@ -803,6 +803,16 @@ SELECT * FROM lake.dbo.fabric_refresh_sql_endpoint(item := 'OtherLH'); -- a diff
 | `fabric_data_access_roles([item := …])` | table | OneLake data-access roles on an item (read only) |
 | `fabric_mirrored_databases([workspace := …])` | table | Mirrored databases, incl. `onelake_tables_path` (attachable directly) and the SQL endpoint |
 | `fabric_mirroring_status(database)` / `fabric_mirrored_tables(database)` | table | Whether replication is running / per-table state, rows, bytes and sync latency |
+| `fabric_variable_libraries([workspace := …])` | table | Variable libraries and which value set each has active |
+| `fabric_variables(library [, value_set := …] [, workspace := …])` | table | One row per variable, resolved against the active value set (or the one named) |
+| `fabric_variable_value_sets(library [, workspace := …])` | table | The library's alternative value sets, in declared order, flagging the active one |
+| `fabric_variable(library, name)` | scalar | One variable's value through the **active** value set — usable as an argument to the functions above |
+| `fabric_create_variable_library(name, description)` | scalar | Creates an empty library; returns its id. **Refused for a service principal** — see below |
+| `fabric_set_variable(library, name, type, value)` | scalar | Declares a variable or replaces its default value; returns `'created'`/`'updated'` |
+| `fabric_set_variables_json(library, variables_json)` | scalar | **Replaces** the whole default set in one write; returns the count. Use this to declare several at once |
+| `fabric_set_variable_override(library, value_set, name, value)` | scalar | Sets a value in an alternative set, creating the set if needed. Type comes from the declaration |
+| `fabric_set_active_value_set(library, value_set)` | scalar | Switches which value set the library resolves through |
+| `fabric_drop_variable_library(library [, if_exists])` | scalar | Deletes the library |
 
 **Refreshing the SQL endpoint after a Delta write** — the reason this exists. A table written through the
 Delta provider is invisible to the lakehouse's T-SQL endpoint until Fabric's asynchronous detection notices
@@ -845,6 +855,65 @@ SELECT lake.dbo.fabric_create_shortcut_json('Files/landing', 'partner',
   '{"adlsGen2": {"location": "https://acct.dfs.core.windows.net",
                  "subpath": "/container/data", "connectionId": "…"}}');
 ```
+
+**Variable libraries — per-environment configuration, read from SQL.** A Fabric *variable library* holds
+named values plus alternative **value sets** (dev/test/prod), with exactly one active at a time — which a
+deployment pipeline flips per stage. Reading it from SQL means a model does not have to hardcode which
+lakehouse it writes to:
+
+```sql
+SELECT name, active_value_set FROM lake.dbo.fabric_variable_libraries();
+
+SELECT name, type, value, is_overridden, value_set
+FROM lake.dbo.fabric_variables('app_config') ORDER BY name;
+
+SELECT name, is_active, override_count FROM lake.dbo.fabric_variable_value_sets('app_config');
+```
+
+`value` is the value as text and `value_json` is the same value as JSON (a string's is quoted, so it stays
+parseable). An **`ItemReference`** variable carries `{"workspaceId": …, "itemId": …}`, which is exactly what
+the `item :=` / `workspace :=` overrides above take — so the scalar feeds them directly:
+
+```sql
+-- Refresh whichever lakehouse the active value set points at.
+SELECT count(*) FROM lake.dbo.fabric_refresh_sql_endpoint(
+  item := lake.dbo.fabric_variable('app_config', 'target_lakehouse') ->> 'itemId');
+```
+
+> `fabric_variable` is a **pure** function, so a constant call folds to a literal once per statement rather
+> than running per row. The flip side: a *prepared* statement bakes the value into its cached plan and will
+> not see a later change to the library.
+
+Writing works too. Declare several at once — each call is a read-modify-write of the whole item definition,
+so one bulk write is much faster than one call per variable, and it is the only form immune to a concurrent
+write losing your change:
+
+```sql
+SELECT lake.dbo.fabric_set_variables_json('app_config', '[
+  {"name": "env_name",   "type": "String",  "value": "dev"},
+  {"name": "batch_size", "type": "Integer", "value": 500},
+  {"name": "target_lakehouse", "type": "ItemReference",
+   "value": {"workspaceId": "…", "itemId": "…"}}
+]');
+
+-- One variable at a time, then a prod override and a switch.
+SELECT lake.dbo.fabric_set_variable('app_config', 'retries', 'Integer', '3');
+SELECT lake.dbo.fabric_set_variable_override('app_config', 'prod', 'batch_size', '50000');
+SELECT lake.dbo.fabric_set_active_value_set('app_config', 'prod');
+```
+
+`type` decides how `value` is rendered, so `'500'` with `type := 'Integer'` stores `500` while
+`type := 'String'` stores `"500"` — a wrong type here is refused rather than silently stored. An override
+takes **no** type: the declaration owns it. Overriding a variable that is not declared is refused too,
+because such an override would never resolve.
+
+> **⚠ Creating a library needs a user identity.** `fabric_create_variable_library` returns
+> `FeatureNotAvailable` for a service principal — despite Microsoft documenting these APIs as SP-supported,
+> and despite the error naming the wrong cause (the feature *is* available; creation is what is refused).
+> Create the library once in the portal; every other function here works fine with an SP.
+
+> **Not cheap.** Reading or writing a definition is a long-running operation — tens of seconds. Prefer
+> `fabric_set_variables_json`, and note that two `fabric_variable()` calls in one SELECT list are two reads.
 
 **Table maintenance — the one optimize this extension cannot do itself.** **V-Order** is a proprietary
 parquet layout optimization, so a table that Power BI or the SQL endpoint reads hot is worth passing through

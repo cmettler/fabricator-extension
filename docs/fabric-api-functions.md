@@ -1130,6 +1130,173 @@ next reader does not have to re-derive that.
 - The deployed assembly was checked (`FileVersion` = 2.18.0.0), not just the csproj — a publish that
   silently kept the old dll is the failure this catches.
 
+## 9j. VARIABLE LIBRARIES — BUILT + LIVE-VALIDATED (2026-08-03). One defect found live; CREATION is refused for an SP
+
+Ten functions over `FabricClient.VariableLibrary.Items`, which the pinned 2.18.0 SDK already carries (no new
+dependency). A variable library is Fabric's per-environment configuration item: a default value set plus
+alternative sets, with exactly ONE active at a time, flipped per stage by a deployment pipeline.
+
+**Why it belongs here rather than being one more wrapped API:** an `ItemReference` variable stores exactly a
+`{workspaceId, itemId}` pair, which is what our own `workspace :=` / `item :=` overrides consume. So a dbt
+project can read its target lakehouse from the library instead of hardcoding it, and
+`fabric_refresh_sql_endpoint(item := fabric_variable('cfg','target') ->> 'itemId')` composes.
+
+### The shape that decides the design
+
+**There is no effective-value API.** The typed model stops at `VariableLibraryProperties.ActiveValueSetName`;
+every value lives in the item DEFINITION as base64 parts. Resolution is ours: decode `variables.json` for the
+defaults, decode `valueSets/<name>.json` for the sparse overrides, overlay by name. Same shape as
+`fabric_notebook_parameters`.
+
+**⚠ `GetVariableLibraryDefinition` is a LONG-RUNNING OPERATION** (it takes `timeoutInMinutes`, default 60),
+like `GetNotebookDefinition`. Every read here costs one; every per-variable write costs TWO (see below).
+
+**⚠ The definition API is WHOLE-DOCUMENT.** `UpdateVariableLibraryDefinition` replaces every part, so a write
+that sends only the part it changed **deletes the value sets and the settings**. Every setter therefore reads
+all parts, replaces one, and sends them all back. **⚠ And there is no ETag/If-Match**, so that read-modify-write
+is LAST-WRITER-WINS — two concurrent `fabric_set_variable` calls on one library can lose one change.
+`fabric_set_variables_json` exists as the single-call declarative alternative that cannot interleave with
+itself.
+
+### The functions
+
+| | kind | |
+|---|---|---|
+| `fabric_variable_libraries([workspace := …])` | table | cheap list + `active_value_set` |
+| `fabric_variables(library [, value_set := …] [, workspace := …])` | table | resolved rows: `name, type, value, value_json, is_overridden, value_set, note` |
+| `fabric_variable_value_sets(library [, workspace := …])` | table | sets in declared order, which is active |
+| `fabric_variable(library, name)` | scalar | one value through the ACTIVE set |
+| `fabric_create_variable_library(name, description)` | scalar | → new id |
+| `fabric_set_variable(library, name, type, value)` | scalar | declare/replace a default |
+| `fabric_set_variables_json(library, variables_json)` | scalar | replace the whole default set in ONE write |
+| `fabric_set_variable_override(library, value_set, name, value)` | scalar | override in a set, creating it |
+| `fabric_set_active_value_set(library, value_set)` | scalar | properties update — cheap, not a definition write |
+| `fabric_drop_variable_library(library, if_exists)` | scalar | |
+
+**Writes are SCALARS, matching the shortcut CRUD**, for a reason worth keeping: `FabricRowsFunction`
+stringifies every argument, so a BOOLEAN named parameter on a table function would silently read as NULL —
+the half-offered-capability class this codebase keeps finding. Scalars take typed positional arguments.
+
+**⚠ Every write function must stay VOLATILE (the default).** A CONSISTENT function is constant-folded at plan
+time, which for a write means it may run at bind, run once for a hundred rows, or be elided. The read-side
+`fabric_variable` is the opposite case — see below.
+
+### `fabric_variable` is declared CONSISTENT, and that is load-bearing
+
+Our scalar default is VOLATILE (`IScalarFunction.IsVolatile => true`; an absent `fabricator.volatile` tag
+reads as volatile in `fabricator_metadata.cpp`). Left at the default, `fabric_variable` would run **once per
+row** of whatever it was selected over, each row an LRO. Declared CONSISTENT:
+
+- `SELECT fabric_variable('cfg','x') FROM big_table` folds to a literal in the optimizer —
+  `BoundFunctionExpression::IsFoldable()` is exactly `stability != VOLATILE`.
+- As a table-function argument it is evaluated once **regardless** of volatility: `bind_table_function.cpp`
+  checks only `IsScalar()` and then calls `EvaluateScalar(..., allow_unfoldable: true)` at bind.
+- Consequence to document: folding is plan-time, so a PREPARED statement bakes the value into its cached plan
+  and will not see a later change. Right for configuration, surprising if unexpected.
+- The varying-argument shape (`fabric_variable('cfg', name) FROM t`) still can't fold, so the implementation
+  dedupes by library within the argument batch: one definition read per distinct library, not per row. There
+  is deliberately no cache ACROSS calls — that needs a staleness policy, and this is configuration people
+  expect to be able to change.
+
+**A value set is not reachable from the scalar, on purpose.** A variable name is not bound to a value set; the
+library has one active set and that is what every other consumer resolves through. Reading a different set is
+inspection, served by `fabric_variables(…, value_set := …)`. It cannot be offered on the scalar anyway —
+DuckDB scalars have no named parameters and match arity exactly, so a third positional argument would break
+the two-argument call.
+
+### ⚠ Microsoft's own pages contradict themselves in four places
+
+Each of these is a silent-wrong-answer if guessed, and each is pinned by the offline harness:
+
+1. **The value-set folder is spelled BOTH ways** — the parts table says `valueSets\valueSetName.json`, the
+   payload example says `valueSet/valueSet1.json`. We READ either (and normalize `\`), WRITE plural.
+2. **`type` casing is not stable** — the same example has `"String"` and lowercase `"boolean"`. Types are
+   passed through VERBATIM and matched case-insensitively; no closed enum, because…
+3. **…the REST page's type table omits `Guid` and `ConnectionReference`**, which the concept page lists. Any
+   closed list would reject a legitimate type. An unrecognized type parses as JSON, falling back to a string;
+   the service validates against the real type, which is the backstop that makes leniency safe.
+4. **`VariableOverride.value` is typed `String` in the schema table, and that is wrong.** An `ItemReference`
+   override is an object — and mutation-testing showed it is wrong for **Integer** too, so it is wrong for
+   every non-string type, not merely the advanced ones. Overrides keep the raw `JsonElement`.
+
+Also: variable names are **not case sensitive**, so both the read overlay and the write upsert match that way
+— an upsert that didn't would append a second entry under different casing and invalidate the library.
+
+### ⚠ CREATION is refused for a service principal; everything else is allowed
+
+**`CreateVariableLibrary` → `FeatureNotAvailable`** (with a request id) for our `fabric_sp`, which **directly
+contradicts the documentation**: *"The variable library REST APIs support service principals."* Same pattern
+as `ResetShortcutCache` (documented as supported, refused in practice) and the same error code this tenant
+returns for notebook creation.
+
+**The scope is now settled, not inferred.** An empty library created by another identity, then driven entirely
+by the SP: the feature is plainly available on the tenant, and `UpdateVariableLibraryDefinition`,
+`UpdateVariableLibrary`, `GetVariableLibraryDefinition` and `ListVariableLibraries` are all permitted. So the
+refusal is **principal-scoped and specific to creation**, exactly as with notebooks (`UpdateItemDefinition` is
+allowed there too). ⇒ **creating the library is a one-time human/portal action; everything after it automates.**
+`fabric_create_variable_library` stays shipped and is proven WIRED in the `fabric_reset_shortcut_cache` sense —
+it reaches the service and returns the service's own error.
+
+⚠ Note the error code **misreports the cause**: `FeatureNotAvailable` reads as "the tenant does not have this",
+which is false here. Do not diagnose it from the message.
+
+### Verified LIVE (workspace `Test`, 2026-08-03)
+
+Full lifecycle through `scratchpad/varlib_live2.sql`, against a library created outside the SP:
+
+- **Bulk declare** (`fabric_set_variables_json`, 5 variables) then read back with **types intact**: `500` and
+  `1.1` and `true` unquoted, `"dev"` quoted, the `ItemReference` an object, the `note` carried.
+- **Per-variable `fabric_set_variable`** returned `created` and the count went 5 → 6 — i.e. its whole-document
+  read-modify-write **preserved** the other five, which is the failure mode that would silently destroy a
+  library.
+- **`fabric_set_variable_override`** created a `prod` set implicitly; `fabric_variable_value_sets` then showed
+  it with `override_count = 2`, proving `variables.json` and the settings survived every definition write.
+- **Resolution**: explicit `value_set := 'prod'` overrode exactly the two variables and left four at their
+  defaults with `is_overridden = false`; `batch_size` came back `50000` **unquoted**, so the override went in
+  typed from the DECLARATION rather than as a string.
+- **`fabric_set_active_value_set('prod')`** then made the no-argument read and the scalar both resolve to
+  `prod` / `50000`.
+- **The point of the feature**: `fabric_variable(…,'target_lakehouse') ->> 'itemId'` equals `LH`'s real item id.
+- **Three negative controls all errored** rather than answering plausibly — unknown value set (naming the known
+  ones), an override of an undeclared variable, and `'not-a-number'` for an Integer — and the library was
+  **unchanged (still 6)** afterwards, so a rejected write does not partially apply.
+
+### ⚠ The defect live validation found: stored formatting leaked into the value
+
+An object-valued variable came back as
+`{\r\n        "workspaceId": "…",\r\n        "itemId": "…"\r\n      }` — literal newlines and indentation
+inside a SQL column. Cause: **`JsonElement.GetRawText()` returns the raw SOURCE SPAN**, so however the document
+was formatted is what the caller receives. Fixed by re-serializing through a `Utf8JsonWriter`
+(`VariableLibraryFormat.Compact`), verified live on the same stored document (102 chars, no CR/LF, still
+resolves).
+
+Two things make this worth recording. It is a **read-side** bug, not an artifact of our writer — the portal, a
+git sync, or any other producer may pretty-print, so normalizing belongs on read. And **the offline round trip
+could not catch it**, because `ToJsonString()` emits compact JSON: the harness was writing and reading its own
+formatting convention. A round trip only tests the shapes you generate. A pretty-printed-input check is now in
+the harness.
+
+### ⚠ Cost, measured
+
+The full 13-step script took **7m39s** for roughly 15 definition operations — so a read is tens of seconds and
+a per-variable write (GET + PUT, both LROs) is worse. Consequences: use `fabric_set_variables_json` to declare
+several variables in one write, and remember each `fabric_variable()` call in a SELECT list is its own
+definition read (step 8's two columns were two reads). This is the price of "no cache across calls"; it is the
+right default for configuration, but it is not cheap.
+
+### Verified offline
+
+56 checks over the format, including a **write → read round trip** (build documents with the write helpers,
+decode them with the reader) which is what proves the two halves agree, plus the pretty-printed-input case
+above. Mutation-tested twice — removing the path-separator normalization, and believing the docs'
+`value: String` for overrides — each killing exactly the assertions written for it.
+
+**No committed gate exists for the format decoder.** The harness is an ad-hoc console project that compiles
+`FabricVariableLibraryFormat.cs` directly (which is why that file is deliberately free of Arrow, SDK and
+bridge dependencies — the separation is what makes it exercisable at all). A `Fabricator.Bridge.Tests` project
+in tier 0 is the obvious home if we want it durable; that is a structural decision, not taken here. The live
+script is the only end-to-end gate, and it is manual — like `verify_dax`.
+
 ## 10. The full API sweep — every area, with a verdict
 
 The complete Fabric REST surface (Core services + workload APIs), each with implement/defer/skip and

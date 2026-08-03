@@ -66,6 +66,11 @@ public static class FabricApiFunctions
         // credentials or item definitions stay excluded. See each file's remarks.
         FabricPromotionFunctions.Register(tables, api);
         FabricPlatformFunctions.Register(tables, api);
+        // Variable libraries: per-environment configuration. An ItemReference variable holds exactly the
+        // {workspaceId, itemId} pair the `workspace :=` / `item :=` overrides above consume, so a project can
+        // read its target from the library instead of hardcoding it. Reading VALUES means reading the item
+        // DEFINITION (an LRO) — there is no effective-value API.
+        FabricVariableFunctions.Register(scalars, tables, api);
     }
 
     internal enum ShortcutMode

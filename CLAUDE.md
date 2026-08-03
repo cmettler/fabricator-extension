@@ -696,6 +696,59 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
       §9g's "rejected loudly" — that was correct only while nothing used the sentinel.
     - Gate `verify_functions` 13 → **15** (negative control + a `cf_*` POSITIVE control, mutation-tested); the
       positive live path is manual, like `verify_dax`.
+  - **VARIABLE LIBRARIES — 10 functions BUILT + LIVE-VALIDATED end to end (2026-08-03), §9j.** Fabric's
+    per-environment config item (default value set + alternative sets, exactly one ACTIVE, flipped per stage by
+    a deployment pipeline). Reads: `fabric_variable_libraries` / `fabric_variables(lib, value_set := …)` /
+    `fabric_variable_value_sets` / the scalar `fabric_variable(lib, name)`. Writes:
+    `fabric_create_variable_library` / `fabric_set_variable` / `fabric_set_variables_json` /
+    `fabric_set_variable_override` / `fabric_set_active_value_set` / `fabric_drop_variable_library`. No new
+    dependency — the pinned 2.18.0 SDK already carries `FabricClient.VariableLibrary.Items`.
+    - **Why it earns its place: an `ItemReference` variable stores exactly `{workspaceId, itemId}`, which is what
+      our own `workspace :=` / `item :=` overrides consume.** Proven live:
+      `fabric_refresh_sql_endpoint(item := fabric_variable('cfg','target') ->> 'itemId')` refreshed the real
+      lakehouse's 21 tables. So a dbt project reads its target from the library instead of hardcoding it.
+    - **⚠ There is NO effective-value API** — the typed model stops at `ActiveValueSetName` and every value lives
+      in the item DEFINITION as base64 parts, so resolution is ours (decode `variables.json`, overlay
+      `valueSets/<name>.json` by name). Same shape as `fabric_notebook_parameters`.
+    - **⚠ The definition API is WHOLE-DOCUMENT and has no ETag.** A write that sends only the part it changed
+      DELETES the value sets and settings, so every setter reads all parts and writes all parts back — and that
+      read-modify-write is LAST-WRITER-WINS. `fabric_set_variables_json` is the single-call declarative
+      alternative (it also REPLACES, so an omitted variable is removed).
+    - **⚠ Reads and writes are LONG-RUNNING OPERATIONS: the 13-step live script took 7m39s** for ~15 definition
+      operations. Two `fabric_variable()` calls in one SELECT list are two reads — the "no cache across calls"
+      decision is right for configuration but not cheap.
+    - **`fabric_variable` is declared CONSISTENT and that is load-bearing** — our scalar default is VOLATILE, and
+      a volatile function is never folded, so the default would cost one LRO PER ROW.
+      `BoundFunctionExpression::IsFoldable()` is exactly `stability != VOLATILE`. (As a table-function argument
+      it is evaluated once regardless: `bind_table_function.cpp` checks only `IsScalar()` then calls
+      `EvaluateScalar(…, allow_unfoldable: true)` at bind.) Consequence: a PREPARED statement bakes the value in.
+      Conversely **every WRITE function must stay VOLATILE** or it may run at bind, once for N rows, or be elided.
+    - **⚠ CREATION is refused for a service principal** (`FeatureNotAvailable`), contradicting the docs' *"the
+      variable library REST APIs support service principals"* — same as `ResetShortcutCache`, same error code as
+      notebook creation. **Scope settled by measurement, not inference:** a library created by another identity
+      is then fully driveable by the SP (definition GET/PUT, properties update, list all permitted) ⇒ principal-
+      scoped and specific to creation, exactly like notebooks. **The error names the wrong cause** — the feature
+      IS available. So creating the library is a one-time human action; everything after automates.
+    - **⚠ Microsoft's docs contradict themselves in FOUR places, each a silent wrong answer if guessed**: the
+      value-set folder is spelled both `valueSets\…` and `valueSet/…` (we read either + normalize `\`, write
+      plural); `type` casing is unstable (`"String"` beside `"boolean"`) so types pass through VERBATIM; the REST
+      page's type table OMITS `Guid` and `ConnectionReference` (so no closed enum — an unknown type parses as
+      JSON, falling back to string, with the service as the validating backstop); and **`VariableOverride.value`
+      is typed `String` and that is wrong** — mutation-testing showed it breaks **Integer** too, not just the
+      object types. Variable names are NOT case sensitive, so both the read overlay and the write upsert match
+      that way (otherwise an upsert appends a second entry and invalidates the library).
+    - **⚠ THE DEFECT LIVE VALIDATION FOUND, and why the offline test could not:**
+      `JsonElement.GetRawText()` returns the raw SOURCE SPAN, so a pretty-printed object value arrived in a SQL
+      column as `{\r\n        "workspaceId": …}`. It is a READ-side bug (the portal or a git sync may indent, so
+      normalizing belongs on read) fixed by re-serializing through a `Utf8JsonWriter`. **The offline round trip
+      was blind to it because `ToJsonString()` emits compact JSON — the harness was reading back its own
+      formatting convention. A round trip only tests the shapes you generate.**
+    - Coverage: 56 offline format checks (write→read round trip + the pretty-printed case), 2 mutants killed, and
+      the live lifecycle incl. three negative controls (unknown value set, undeclared override, mistyped value)
+      each erroring with the library left unchanged. **No committed gate for the decoder** — the harness is an
+      ad-hoc console project compiling `FabricVariableLibraryFormat.cs` directly, which is why that file is kept
+      free of Arrow/SDK/bridge dependencies; a `Fabricator.Bridge.Tests` project in tier 0 is the obvious home if
+      we want it durable (not taken). The live script is manual, like `verify_dax`.
   - Output shape rule (D4): typed flat columns + one raw-JSON column for polymorphic parts; **no STRUCT
     wrapping** (adding a column is additive for `SELECT *`; adding a struct FIELD changes a column's type
     and breaks bound views), no JSON-only. Every `table`-kind function also gets a dead `_each` sibling —
