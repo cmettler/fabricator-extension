@@ -2263,52 +2263,18 @@ useful column is "what upstream inconsistency does this reveal?", not "+N lines"
 
 ---
 
-## THE SUPERSEDED VERDICT (kept for the reasoning, NOT for the conclusion)
+### The superseded `*BySelection*` verdict — one paragraph, because only the lesson survives
 
-## THE `*BySelection*` QUESTION — CONFIRMED ABSENT FROM MAIN, BUT **DO NOT MOVE IT TO THE BRIDGE**
+An earlier audit concluded **"do not move the merge-on-read UPDATE to the Bridge"**, on three blockers
+(`ComputeDvActionsWithEditsAsync` is `internal` and shared; `ActiveFilesByPath`/`HonorWriterFeatures`/
+`StaleSelectionPath` unreachable; it would reverse a consolidation) and proposed offering
+`UpdateRowsAsync(…, RowUpdateMode)` upstream instead. **All three blockers were wrong and the offer is
+withdrawn** — see the top of this section for what was actually done and why.
 
-**The hypothesis is right:** `git grep BySelection upstream/main -- 'src/**/*.cs'` returns **nothing**.
-`UpdateBySelectionViaVectorsAsync` exists only on our branch (one method name, **two overloads** — not a family
-of functions). Upstream has **no deletion-vector mode for UPDATE at all**: its `UpdateRowsAsync` always
-rewrites.
-
-It is **live**, not dead code: `Fabricator.Bridge/DeltaReader.cs:2482` calls it from `MergeOnReadUpdateAsync`.
-
-### Why moving it into the Bridge is the wrong direction — three concrete blockers
-
-1. **Its core dependency is `internal`.** `ComputeDvActionsWithEditsAsync` (`DeltaTable.cs:5934`) is declared
-   `internal` and returns `(Actions, Edits, TouchedPaths, RowsDeleted)` from a `RowSelection` — it *is* the
-   merge-on-read computation. It is **shared**: `DeleteRowsAsync` calls it (5918) and `DeltaTransaction` calls it
-   (`DeltaTransaction.cs:442`). Moving the UPDATE to the Bridge therefore requires either
-   **(a)** making that public — which *grows* our patch surface at the worst possible place, a public API
-   commitment on EW's DV core, or **(b)** reimplementing DV encode/merge in the Bridge, which would then drift
-   from EW's own DELETE path. This codebase has already been burned by DV/CoW divergence.
-2. **Two more members are unreachable.** `ActiveFilesByPath` is `internal static` (5563); `HonorWriterFeatures`
-   (4272) and `StaleSelectionPath` (6342) are `private static`. The latter two are trivial (a writer-feature
-   guard and an exception factory) but the first is not free.
-   Already reachable and fine: `WriteDataFilesAsync` / `WriteChangeDataFilesAsync` / `UpdateRowsAsync` (public),
-   `ProtocolVersions.ValidateWriteSupport` and `RowTrackingConfig.TryGetMaterializedColumnNames` (public static).
-3. **It would REVERSE a deliberate consolidation.** `DeltaReader.cs:2408` records that the Bridge assembled this
-   by hand *until the EW method landed*, and collapsing it was a simplification. Undoing that re-creates the
-   code we already decided to delete.
-
-### The right move instead: offer it upstream as the missing half of EW's OWN symmetry
-
-This is not a fabricator-specific concept — it is a **gap in EW's own API**, and the vocabulary for it already
-exists upstream:
-
-- main has `RowDeleteMode { DeletionVector, CopyOnWrite }` (`RowDeleteMode.cs:10`) and
-  `DeleteRowsAsync(RowSelection, RowDeleteMode)`.
-- main's `UpdateRowsAsync(RowSelection, rewriteFile, ct)` (`DeltaTable.cs:6343`) has **no mode parameter** — it
-  always copy-on-writes.
-
-So the offer is `UpdateRowsAsync(…, RowUpdateMode)` mirroring `RowDeleteMode`, implemented with the DV machinery
-EW already owns. That is framed in Curt's own pattern rather than ours, it makes DELETE and UPDATE symmetric,
-and if accepted it takes the largest negotiable block of our divergence toward zero **and** removes the
-`internal`-access problem entirely, because the code stays where its dependencies live.
-
-**Ordering note:** offer `ConflictChecker` first — it is 42 self-contained lines with 7 tests and no API
-surface. The `RowUpdateMode` offer is a public API addition and will want discussion.
+**The lesson, which is the only durable part:** it asked whether the METHOD BODY could be RELOCATED (which does
+need the internal callees) instead of whether the EFFECT could be COMPOSED from the public seams. Ask the second
+question first. `StageRowDeletesAsync` was a public door onto the very `internal` method the audit called a
+blocker.
 
 ### ⚠⚠ `ExemptRowLevelFromWholeTableRead` — THE FACET SPLIT IS **RETRACTED**; OFFER THE PROPERTY AS-IS (2026-08-03)
 
@@ -2374,34 +2340,14 @@ was not folded into the merge-on-read work.
 
 ---
 
-### The facet-split argument (RETRACTED — kept as the worked example)
+### The retracted facet-split argument — kept to two lines
 
-**The root cause is that `ReadSet.WholeTable` CONFLATES two facets the same record already models separately:**
-
-```csharp
-public IReadOnlyList<Predicate> Predicates   // a concurrent ADD matching one → conflict
-public ISet<string> Files                    // a concurrent REMOVE of one → conflict
-public bool WholeTable                       // ← BOTH: every add AND every remove
-```
-
-What the host actually needs to say is **"every add is relevant to me"** (no predicate pushed, so it cannot
-honestly claim less — the phantom protection `serializable` exists for) **but "only the files I touched matter for
-removes"** (row-level write validation already proved those rows undisturbed). One boolean cannot express that,
-so our patch adds a MODE flag whose meaning depends on the isolation level AND on whether row-level deletes were
-staged — which is why it "looks like a way to weaken isolation".
-
-**It is a two-line change upstream, because `WholeTable` is read in exactly two places, one per facet:**
-
-```csharp
-WasRead(...)  =>  reads.WholeTable || reads.Files.Contains(path);   // the REMOVE facet
-Matches(...)  =>  if (reads.WholeTable) return true;  …             // the ADD facet
-```
-
-⇒ offer `DeclareWholeTableRead(forAppends: true, forRemoves: false)` (or a second verb) rather than our boolean.
-Strictly better: the host merely states what it read PER FACET — no mention of row-level DML, no isolation-level
-gating, nothing that reads as "please relax my guarantees". It also explains why **`DeclareFilesRead` cannot
-substitute**: it fills the `Files` facet but leaves `Predicates` EMPTY, silently dropping append protection; with
-split facets the honest declaration is whole-table-for-adds PLUS files-for-removes.
+It proposed `DeclareWholeTableRead(forAppends:, forRemoves:)`, on the grounds that `ReadSet.WholeTable` conflates
+two facets the same record models separately (`Predicates` drives the ADD check, `Files` the REMOVE check) and is
+read in exactly two places, so splitting it is a two-line upstream change. **Retracted** for the three reasons at
+the top of this section — chiefly that `forRemoves: false` asserts something about the READ set that is really a
+claim about the WRITE path, which is the *"a library must not claim on a host's behalf that it read less than it
+declared"* objection upstream had already written down.
 
 ### The as-shipped property — offerable as-is, with a caution
 
