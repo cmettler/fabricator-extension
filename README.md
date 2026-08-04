@@ -1457,6 +1457,14 @@ SELECT _change_type, id, val, _commit_version, _commit_timestamp
 -- insert/insert (v1), delete (v2): each row tagged with its commit version + timestamp (epoch ms)
 ```
 
+> **Caveat if you also use `row_tracking true` and read the feed from another engine.** An `INSERT` run
+> inside an explicit `BEGIN … COMMIT` writes a `_change_data` file whose row-id columns are **NULL**, where
+> the same `INSERT` in autocommit records no change file at all and a reader derives real row ids from the
+> data file. The rows, change types, commit versions and timestamps are identical either way — and
+> `fabricator_delta_changes` never projects row identity — so this is invisible through DuckDB and matters
+> only to a reader that consumes the row-identity columns a change file carries. Measured, being fixed;
+> details in [docs/delta-transaction-hoist.md](docs/delta-transaction-hoist.md) §6.
+
 #### Exactly-once appends — Delta application transactions
 
 A producer that may be replayed (a retried job, a restarted stream) records how far it has got, and the

@@ -1,7 +1,11 @@
 # Hoisting the EW `DeltaTransaction` to statement time
 
-> **Status: PLAN, nothing built.** Decided 2026-08-04 (user). Supersedes the "one open EW transaction
-> per table is an ARCHITECTURAL change" framing in `CLAUDE.md` — it is smaller than that, see §1.
+> **Status: slices 1a + 1b+2 BUILT (2026-08-04); slices 3–5 are still PLAN.** Decided 2026-08-04 (user).
+> Supersedes the "one open EW transaction per table is an ARCHITECTURAL change" framing in `CLAUDE.md` —
+> it is smaller than that, see §1. Built so far: the buffer entry owns the EW table + transaction
+> (`0bfdd8c`), CDF stages into it at statement time (`86cb374`), and our 45-line EW
+> `WriteChangeDataFilesAsync` is deleted — **the `WriteChangeDataFilesForAsync` upstream offer is now
+> RETIRED, as §2 predicted.** §6 is the defect that settling slice 2's mutation question exposed.
 
 ## 1. What this actually is — a HOIST, not an adoption
 
@@ -197,27 +201,80 @@ Consequences, both of which matter beyond slice 1a:
      `pending.HeldTxn is not null`, which is the honest signal ("something staged into a transaction").
      This is the one part of the slice that fails SILENTLY if missed, so gate it with a CDF-only buffered
      statement (a buffered INSERT on a CDF table, which writes its cdc counterpart and nothing else).
-   - **Scope note: retiring our 45-line `WriteChangeDataFilesAsync` is an ENGINEERED-WOOD change**, so the
-     slice spans the submodule and needs EW Table.Tests × {net10.0, net8.0, net472} alongside the two
-     fabricator tiers. Keep the EW deletion as its own commit on `fabricator-patches` so the pin move is
-     reviewable.
-   - **A CAPABILITY GAIN, not just a deletion: this slice can close the CDF row-identity gap.**
-     `StageChangeDataAsync` takes `rowIds` + `rowCommitVersions`, and our feed leaves identity NULL
-     today. A `cdc` action has no `baseRowId`, so the change file is the only place a change row's
-     identity can live. ⚠ Two traps in one signature: omitting `rowIds` silently yields NULL ids (no
-     error), and omitting `rowCommitVersions` defaults every row to the COMMITTING version — correct for
-     a post-image, **wrong for a pre-image**. So the pre-image call must pass the version each row was
-     last changed in, which is what a `DeltaRowMetadata.RowTracking` read reports.
-3. **Data files + row deletes stage at statement time** (`StageDataFilesAsync` /
-   `StageRowDeletesAsync`). The buffer KEEPS its `Files` / `DeletedByOrdinal` copies — they feed
-   read-your-writes. Gate: transactions 944, update 63, delete 28, row-level concurrency 93.
-4. **Schema changes + conflict declarations** (`StageSchemaChange`, `DeclareRead`,
-   `DeclareWholeTableRead`, `RequireAppTransaction`) move to the statement that causes them. Gate:
-   nested_alter 100, txn_version 65, row-level concurrency 93.
+     - **⚠ SETTLED 2026-08-04 — THE MUTANT IS UNOBSERVABLE, SO THERE IS NO GATE. The change stays, honestly
+       labelled DEFENSIVE.** Reverting the disjunct leaves `verify_delta_catalog_changes` (73) and
+       `verify_delta_catalog_transactions` (944) green, and that is CORRECT rather than a coverage hole:
+       `CdfReader` is all-or-nothing PER VERSION (`if (cdcFiles.Count > 0)` … `else` infer from add/remove),
+       so a dropped insert-`cdc` simply hands the version back to inference, which reports the same rows,
+       types, versions and timestamps. The one column that WOULD differ — row identity — is not projected by
+       `fabricator_delta_changes` at all, so no SQL query can tell the two apart. A gate written anyway would
+       have passed for a reason unrelated to what it claimed to check.
+       - It is still the right change: it becomes observable the moment identity is passed (§6) or exposed,
+         and "the actions I staged reach the commit" is not a property to leave resting on inference.
+   - **Scope note: retiring our 45-line `WriteChangeDataFilesAsync` is an ENGINEERED-WOOD change** — DONE
+     2026-08-04, its own commit on `fabricator-patches` plus the pin move. It was a **pure addition** in the
+     diff against `upstream/main` (plus one stray blank line, deleted with it), so the removal restores
+     upstream byte-for-byte in that region and drops `DeltaTable.cs` divergence **183 → 137** lines.
+     EW Table.Tests **868 × {net10.0, net8.0, net472}** — the pin's recorded count, UNCHANGED, which is the
+     proof nothing covered the method: upstream's public singular `WriteChangeDataFileAsync` has seven test
+     references, our public plural had **zero**, in EW or the Bridge.
+   - **A CAPABILITY GAIN, not just a deletion: this slice can close the CDF row-identity gap** — and
+     measuring the routing mutation showed the gap is **worse than "identity is NULL"**: it is a DIVERGENCE
+     between our own two paths, and the cheap-looking fix is unsafe. See §6.
+3. ~~**Data files + row deletes stage at statement time**~~ — **⚠ BLOCKED, BOTH HALVES, against today's EW
+   API. Established 2026-08-04 by reading the callee before writing the slice** (the rule that has paid
+   every time on this work). The buffer's per-transaction MERGE — `Files` as one list, `DeletedByOrdinal` as
+   one dictionary — is doing load-bearing work that `DeltaTransaction` does not do:
+   - **Adds cannot move, because of BORN-DELETED rows.** `bornDeleted` is a PARAMETER of the
+     `StageDataFilesAsync` call, so it must be known when the add is staged. But a row inserted by statement
+     1 and deleted by statement 3 of the same transaction is exactly what it encodes (ordinal
+     `PendingFileOrdinalBase + idx`, `DeltaCatalog.cs:3654`) — the add is born with an inline DV so those
+     rows never reach a committed version. Staging statement 1's add immediately forecloses statement 3.
+     There is no later route either: `StageRowDeletesAsync` resolves paths through
+     `ActiveFilesByPath(_baseSnapshot)` and **throws `StaleSelectionPath` for a path the base snapshot does
+     not hold** — which a file staged by this very transaction never is.
+   - **Deletes cannot move either, because DV computation does not see staged actions.**
+     `ComputeDvActionsWithEditsAsync` reads `addFile.DeletionVector` from the BASE snapshot only. Two
+     `StageRowDeletesAsync` calls naming the same committed file — two DELETEs in one transaction, or a
+     DELETE and an UPDATE — would each compute from the base DV, so the second's vector omits the first's
+     rows and **the first delete's rows come back**, plus two remove/add pairs for one path. Today they are
+     merged into one call by `DeletedByOrdinal`.
+   - ✅ **One thing that is NOT a blocker, so do not "fix" it:** multiple `StageDataFilesAsync` calls on one
+     transaction are explicitly supported — `DeltaTransaction._nextRowId` exists precisely so two staged
+     appends do not reserve the same stable row ids. The obstacle is the born-deleted parameter, not
+     repetition.
+   - ⇒ Moving either half needs a NEW EW surface (a DV edit against a file staged in the same transaction,
+     which is also what would let the two accumulate). **That is worth noting against the hoist's own
+     premise:** the hoist existed to REMOVE an upstream ask, and slice 3 would create one. Do not open that
+     conversation to buy statement-time staging whose only gain is bookkeeping symmetry — the flush already
+     produces one atomic commit per table, which is the property that matters.
+4. **Conflict declarations** (`DeclareRead`, `DeclareWholeTableRead`, `RequireAppTransaction`) move to the
+   statement that causes them. These are SETS — idempotent, order-free, no cross-statement merge — so they
+   are the one part of slices 3–4 that is genuinely unblocked. **`StageSchemaChange` must NOT come with
+   them:** a commit may carry only ONE `metaData` action, and the flush deliberately FUSES the eager identity
+   high-water mark INTO the buffered ALTER's metaData (`BuildIdentityMetadataAction`, `:3758`) or synthesises
+   one when there is no ALTER — a per-statement stage would produce two. Gate: txn_version 65, row-level
+   concurrency 93.
+   - Value is honestly small (declarations already reach the same transaction), so this is a tidiness slice.
+     Weigh it against slice 5, which is the one with user-visible consequence.
 5. **CREATE becomes immediate; `FlushCreateTransactionAsync` + `PendingCreate` deleted; best-effort drop
    on rollback.** The behaviour-changing slice. Gate: the transactions suite WITH its rollback
    assertions rewritten, plus a new assertion that a rollback of a created table leaves no table when
    the drop succeeds and names the orphan when it does not.
+
+### 4.2 WHERE THE HOIST STANDS — the prize is banked, and the rest is smaller than the slicing implies
+
+Worth stating plainly so nobody reads slices 3–5 as remaining value:
+
+| slice | state |
+|---|---|
+| 1a, 1b+2 | **DONE.** Statement-time transaction; CDF stages into it; our EW duplicate deleted; the upstream offer retired; one fewer `_delta_log` LIST per buffered CDF statement |
+| 3 | **BLOCKED** on EW surfaces, both halves — and unblocking it would CREATE an upstream ask, which is the opposite of the point |
+| 4 | declarations only; genuinely possible, honestly low value. `StageSchemaChange` excluded (one `metaData` per commit) |
+| 5 | the behaviour change (CREATE immediate + best-effort rollback drop). Independent of 3 and 4, and the only one a USER can see |
+
+⇒ **Slice 5 is the next one worth doing, and it does not depend on 3 or 4.** The reason the original order put
+it last was blast radius, not prerequisites.
 
 ## 5. Open questions to settle IN slice 1, not by guessing
 
@@ -234,3 +291,46 @@ Consequences, both of which matter beyond slice 1a:
 - **A read-only transaction must not create one.** `HasAny` deliberately excludes reads so a read-only
   entry does not trip pending-changes guards; the holder must follow that rule or every SELECT inside a
   transaction opens and aborts an EW transaction.
+
+## 6. The CDF row-identity gap, as MEASURED — and why the cheap fix is wrong
+
+Found 2026-08-04 while settling the routing mutation, i.e. by chasing a question about a *test*, not about
+CDF. Recorded as [known-limitations.md](known-limitations.md) 1.7. All of this is direct `_delta_log` +
+change-parquet inspection on a `change_data_feed true, row_tracking true` catalog, not reasoning.
+
+**The finding is a DIVERGENCE between our own two write paths for the same statement:**
+
+| path | commit contains | feed identity comes from |
+|---|---|---|
+| autocommit `INSERT` | `add` only, **`cdc=0`** | INFERENCE — `add.baseRowId + position`, `add.defaultRowCommitVersion` ⇒ **real ids** |
+| buffered `INSERT` (inside `BEGIN…COMMIT`) | `add` **+ `cdc`** | the `cdc` file, whose `__delta_row_id` / `__delta_row_commit_version` are **NULL** |
+
+Measured directly, one table, four versions in sequence: `CREATE` ⇒ v0; autocommit `INSERT` ⇒ v1 `cdc=0`;
+autocommit `INSERT` ⇒ v2 `cdc=0`; `BEGIN; INSERT; COMMIT` ⇒ v3 **`cdc=1`**. Rows were already present before
+the buffered one, so it is **path-determined, not a first-insert special case** — that ordering is what makes
+the experiment discriminating rather than two separate runs would have been. The buffered file's identity columns read NULL beside an `add` carrying `baseRowId:0`,
+`defaultRowCommitVersion:1`. So writing the change file **destroys** identity that inference would have
+recovered, and the buffered path is strictly worse than autocommit for the same logical statement. This
+predates the hoist entirely; the hoist only changes which code writes the file.
+
+**⚠ THE OBVIOUS FIX — "stop writing a `cdc` file for a blind append, let inference do it, like Delta's own
+writers" — IS UNSAFE, and the reason is the all-or-nothing rule.** `CdfReader` chooses per VERSION, and a
+buffered transaction FUSES statements into ONE commit. Measured: `BEGIN; INSERT; DELETE; COMMIT` on a CDF
+table yields a single version carrying `cdc=2, add=2, remove=1`. Drop the insert's `cdc` from that commit
+and the delete's `cdc` still suppresses inference for the whole version ⇒ **the inserted row would vanish
+from the feed, silently.** ⚠ That last step is DEDUCED from two measured facts (the fused commit shape, and
+`CdfReader`'s per-version branch read in source) — the shortcut was never built, so the loss was never
+observed. Stated as a prediction, not a measurement. The saving (one less parquet, correct ids for free) is
+real for an ISOLATED append and becomes data loss as soon as the transaction contains anything else, which
+is common.
+
+⇒ **The fix is to pass `rowIds` + `rowCommitVersions` to `StageChangeDataAsync`, unconditionally.** Two traps
+in that one signature: omitting `rowIds` silently yields NULL ids with no error (this bug), and omitting
+`rowCommitVersions` defaults every row to the COMMITTING version — right for a post-image, **wrong for a
+pre-image**, so the pre-image call must pass the version each row was last changed in, which is what a
+`DeltaRowMetadata.RowTracking` read reports. Not built; it is a fidelity fix with its own gate, deliberately
+not folded into a slice whose claim is behaviour preservation.
+- ⚠ **Any gate for it must assert the PARQUET, not the SQL.** `fabricator_delta_changes` projects only
+  `id, val, _change_type, _commit_version, _commit_timestamp` — no identity column — so a SQL-level
+  assertion cannot see the bug or its fix. Read `__delta_row_id` out of `_change_data/*.parquet` with
+  `read_parquet`, which is how it was found.

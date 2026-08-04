@@ -142,10 +142,16 @@ if that is impossible, and then **make our amendments clear IN THE CODE**.
   OURS-BY-DESIGN]` + why + what retires it). `DeltaTable.cs` alone has **27 unmarked hunks**; today "is this ours?"
   is answerable only by `git diff upstream/main`. Marking needs nobody's agreement and turns the eventual
   fork-vs-upstream decision into a grep.
-- **Offer order** (probability × independence): (1) public overload of `WriteChangeDataFilesForAsync` — ~5 lines,
-  zero behaviour change, blocks nothing; (2) `ConflictChecker` isBlindAppend — 42 lines, internal, 7 tests, but
-  present BOTH shapes; (3) `ExemptRowLevelFromWholeTableRead` — **only after the §2.2 fix**, and pitched as a
-  DEPARTURE not an inconsistency; (4) a transaction that can CREATE a table — a design conversation. **Never**
+- **Offer order** (probability × independence): ~~(1) public overload of `WriteChangeDataFilesForAsync`~~ —
+  **RETIRED 2026-08-04, NEVER SENT, and this is the branch model working rather than a change of mind.** The
+  hoist made `StageChangeDataAsync` callable at statement time, so our 45-line public duplicate is DELETED and
+  there is nothing left for the overload to serve. The lesson generalises: an offer that exists to work around
+  our OWN architecture should be re-derived after each architectural slice, because the cheapest way to retire
+  a patch is to stop needing it — cf. `RowUpdateMode`, solved by removal. Full record:
+  [docs/delta-transaction-hoist.md](docs/delta-transaction-hoist.md) §2. So the live list is:
+  (1) `ConflictChecker` isBlindAppend — 42 lines, internal, 7 tests, but
+  present BOTH shapes; (2) `ExemptRowLevelFromWholeTableRead` — **only after the §2.2 fix**, and pitched as a
+  DEPARTURE not an inconsistency; (3) a transaction that can CREATE a table — a design conversation. **Never**
   offer the variant transport.
 - **Decision gate:** drop the branch for a `PackageReference` when the patch set is variant-transport-only AND
   #24157 is fixed. Until then the branch is correct, not a failure.
@@ -160,10 +166,13 @@ SMALL upstreamable patch set ON TOP of clast master — never a fork again — s
 merge-upstream-into-fabricator-patches + re-pin. **⚠ That upstream branch is now
 `upstream/main`, NOT `master`** — upstream renamed it (`8caf8d8`) and the stale `upstream/master`
 remote-tracking ref still resolves, so a merge of it silently lands on an abandoned branch.
-**Current pin: `d9d204b`** (the 2026-08-02 bump, the `MetadataPredicate` removal, and upstream #52+#53,
-§THE 2026-08-02 BUMP below). **Patch set MEASURED 2026-08-04: +221 / −34 lines across FOUR files** —
-`DeltaTable.cs` 183, `ConflictChecker` 42, `DeltaTransaction` 26, `DeltaFilePruner` 4. (It was +867 across 8 on
-2026-08-03; the variant transport was ~60% of that and has since left entirely — §THE UPSTREAM STRATEGY.)
+**Current pin: `3794fe4`** (the variant-transport removal in both directions, then the
+`WriteChangeDataFilesAsync` deletion the hoist enabled; ⚠ the line here read `d9d204b` for two commits after
+that stopped being true — **`git ls-tree HEAD engineered-wood` is the authority, this prose is not**).
+**Patch set MEASURED 2026-08-04 (re-measured after the CDF deletion, `git diff upstream/main --stat -- src/`):
++175 / −34 lines across FOUR files** — `DeltaTable.cs` 137, `ConflictChecker` 42, `DeltaTransaction` 26,
+`DeltaFilePruner` 4. (It was +221 before that deletion, and +867 across 8 files on 2026-08-03; the variant
+transport was ~60% of that and has since left entirely — §THE UPSTREAM STRATEGY.)
 - **⚠ THE MERGE-ON-READ UPDATE LEFT EW (2026-08-03) — the audit's "DO NOT MOVE IT TO THE BRIDGE" verdict was
   WRONG and is reversed. Full record: [docs/ew-master-migration.md](docs/ew-master-migration.md) §THE
   `*BySelection*` QUESTION.** `UpdateBySelectionViaVectorsAsync` + `BuildInlineDeletionVectorsAsync` (218 lines)
@@ -178,9 +187,18 @@ remote-tracking ref still resolves, so a merge of it silently lands on an abando
   own `delta.isolationLevel` was ignored — now honoured via a shared `DeltaReader.EffectiveSerializable` that
   `DeltaCatalog` delegates to, resolved from the config the path already reads (no extra `_delta_log` LIST).
   ⚠ The concurrency gain is a MECHANISM claim, NOT measured — see the substrate finding below.
-  **`WriteChangeDataFilesAsync` (45 lines) STAYS for now**: the buffered CDF path needs it. ⚠ A grep of EW alone
-  called it self-contained; **the second consumer was in the Bridge — grep both trees.**
-  - **`StageChangeDataAsync` does not fit the buffered path** (asked 2026-08-03): it is a method ON
+  ~~**`WriteChangeDataFilesAsync` (45 lines) STAYS for now**~~: **DELETED 2026-08-04 by the hoist** — the
+  buffered CDF path now calls `StageChangeDataAsync` at statement time, so its second consumer is gone.
+  ⚠ The grep lesson still stands, and applied at deletion time too: a grep of EW alone called it
+  self-contained; **the second consumer was in the Bridge — grep both trees.**
+  - **`StageChangeDataAsync` does not fit the buffered path** (asked 2026-08-03) — ⚠ **SUPERSEDED
+    2026-08-04: it fits, and all three reasons below were CONSEQUENCES OF OUR OWN BUFFERING rather than
+    properties of the API.** The hoist created the transaction at statement time, which dissolved reason 1;
+    reason 2 was backwards (`StageChangeDataAsync` writes the parquet IMMEDIATELY, so rows were never going
+    to be held — and the hoist holds LESS, since `PendingCdc` is gone); reason 3 dissolved with the parking
+    structure it names. Kept verbatim because the SHAPE of the error is the reusable part: three defensible
+    objections, each true about the code as it stood, none about the API.
+    [docs/delta-transaction-hoist.md](docs/delta-transaction-hoist.md) §2. Original text: it is a method ON
     `DeltaTransaction` and the buffered path has none at statement time (created at FLUSH,
     `DeltaCatalog.cs:3653`); and deferring the call to flush would hold the pre/post-image ROWS in memory until
     COMMIT, which eager CDC capture (slice C2) exists to avoid. It also RETURNS NOTHING — `StageInternal` files
@@ -198,16 +216,19 @@ remote-tracking ref still resolves, so a merge of it silently lands on an abando
     `UpdateRowsAsync`/appends call the internal `ChangeDataFeed.CdfWriter.WriteAsync` DIRECTLY (7 sites) and fuse
     the actions into their own commit; `StageChangeDataAsync` is HOST-facing (its only in-EW use is its own body,
     `DeltaTransaction.cs:499`). The one autocommit path using it is OURS. Don't state those as one mechanism.
-  - **THE OFFER: make the internal PLURAL public — upstream already HAS it.**
-    `WriteChangeDataFilesForAsync` (`DeltaTable.cs:5760`, `internal`) IS the partition-splitting plural and is what
-    `StageChangeDataAsync` calls, so **our 45 lines are essentially a public duplicate of it**. Blocker on exposing
-    it verbatim: its trailing `WrittenFileLedger?` param is an `internal` type ⇒ offer a public overload WITHOUT it
-    (that ledger is abort-time orphan reclamation, which a buffer-parking caller has no use for). Bonus: it already
-    takes `rowIds`/`rowCommitVersions` — the CDF identity our feed currently leaves NULL. **This supersedes an
-    earlier recommendation here to make `PartitionUtils` public**, which would have worked but duplicated ~25 lines
-    of split + logical→physical re-key in the Bridge. ⚠ **Do not hand-roll the split** — the risk is Delta's
-    partition-value STRING ENCODING matching what EW writes for data files; the Bridge only ever READS those values
-    from `RETURN_STATS.partition_keys`, never formats them.
+  - ~~**THE OFFER: make the internal PLURAL public — upstream already HAS it.**~~ **RETIRED 2026-08-04, NEVER
+    SENT — the hoist deleted the thing it existed to serve.** `WriteChangeDataFilesForAsync`
+    (`internal`) IS the partition-splitting plural that `StageChangeDataAsync` calls, so our 45 lines were a
+    public duplicate of it; the offer was to expose a public overload without its `internal WrittenFileLedger?`
+    param. With CDF staging into a statement-time transaction, the Bridge calls `StageChangeDataAsync` directly
+    and **our duplicate is gone** (see the hoist entry under "Next up"). Nothing about the offer was wrong — it
+    stopped being needed, which is the cheapest way to retire a patch and the same outcome as `RowUpdateMode`.
+    Two facts from it are still live and worth keeping: it takes `rowIds`/`rowCommitVersions`, i.e. **the CDF
+    identity our feed still leaves NULL** (now MEASURED and worse than "NULL" — the buffered and autocommit
+    paths DIVERGE, [docs/delta-transaction-hoist.md](docs/delta-transaction-hoist.md) §6); and ⚠ **do not
+    hand-roll the partition split** — the risk is Delta's partition-value STRING ENCODING matching what EW
+    writes for data files, and the Bridge only ever READS those values from `RETURN_STATS.partition_keys`,
+    never formats them. (This had already superseded an earlier recommendation to make `PartitionUtils` public.)
   Gates: hermetic **63/63 — 5686** (byte-identical to pre-change ⇒ behaviour-preserving), EW Table.Tests
   **877 → 872** (exactly the 5 tests of the retired member). **`RowUpdateMode` is SOLVED BY REMOVAL and is OFF the
   offer list** — no divergence left for it to retire and no need for it, so do NOT bring it; spending credibility on
@@ -2985,7 +3006,7 @@ path never adopted. Keep the status honest; a wrong status is worse than none.
 | [delta-catalog.md](docs/delta-catalog.md) | **current** — the main Delta provider reference |
 | [delta-rs-provider.md](docs/delta-rs-provider.md) | **current but SECONDARY** — the delta-rs provider is opt-in (`-IncludeDeltaRs`, `FABRICATOR_DELTARS=1`); its 7 suites are outside CI |
 | [delta-snapshot-caching.md](docs/delta-snapshot-caching.md) | **design + decision gate; the cache is NOT built** and the full version is not recommended |
-| [delta-transaction-hoist.md](docs/delta-transaction-hoist.md) | **PLAN, nothing built** (2026-08-04, user-decided) — hoist EW's `DeltaTransaction` from flush time to STATEMENT time. ⚠ It is a HOIST, not an adoption: the flush already calls `StartTransaction`, and the read-your-writes overlay stays ours because `DeltaTransaction.Snapshot` is the BASE snapshot. Main prize is that `StageChangeDataAsync` becomes callable, which RETIRES the `WriteChangeDataFilesForAsync` upstream offer — so do NOT send that offer before deciding this |
+| [delta-transaction-hoist.md](docs/delta-transaction-hoist.md) | **slices 1a + 1b+2 BUILT, slices 3–5 still PLAN** (2026-08-04, user-decided) — hoist EW's `DeltaTransaction` from flush time to STATEMENT time. ⚠ It is a HOIST, not an adoption: the flush already calls `StartTransaction`, and the read-your-writes overlay stays ours because `DeltaTransaction.Snapshot` is the BASE snapshot. The main prize is BANKED — `StageChangeDataAsync` is now called at statement time, our 45-line EW duplicate is deleted, and the `WriteChangeDataFilesForAsync` offer is **RETIRED, never sent**. §6 is the CDF row-identity DIVERGENCE that settling slice 2's mutation question exposed (buffered append writes NULL ids where autocommit yields real ones) — with the reason the cheap fix silently loses rows. ⚠ §4.1 slice 3 is **BLOCKED, both halves** (born-deleted rows are a PARAMETER of `StageDataFilesAsync`; DV computation reads only the base snapshot) and unblocking it would CREATE an upstream ask — so **slice 5 is the next one worth doing and depends on neither 3 nor 4** (§4.2) |
 | [delta-transactions.md](docs/delta-transactions.md) | **current** — buffered-DML semantics. §8.1 = the MEASURED OneLake multi-writer result (2026-07-31; one bug fixed, one gap left OPEN); §10.6 = the MEASURED Fabric Spark isolation-property matrix, replacing a stale "we do NOT read it" |
 | [distribution-installer.md](docs/distribution-installer.md) | **current** — single-file SKU, phases 1–4 of 5 |
 | [ew-master-migration.md](docs/ew-master-migration.md) | **current** — the EW pin journal. Read BEFORE the next EW bump. §FULL PATCH-SET AUDIT (2026-08-03) is the file-by-file verdict against `v0.2.0` with a KEEP/OFFER/DROP per file; §THE `*BySelection*` QUESTION records why the merge-on-read UPDATE must NOT move into the Bridge and what to offer instead; §2b is the ConflictChecker reading half incl. the two ways it DIVERGES from Delta |
