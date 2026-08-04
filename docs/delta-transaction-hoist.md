@@ -118,14 +118,39 @@ Only the second half can change behaviour, so they must not land together.
 - **1b — move the creation point to the first operation that needs one.** Then, and only then, the
   behaviour question arises (a transaction alive across statements). Gate 1b on its own.
 
+**⚠ THE ABORT LEDGER IS EXPLICIT, NOT AMBIENT — so the hoist buys NO free orphan reclamation.** A first
+version of the 1a comment claimed that a transaction created before the flush's `WriteDataFilesAsync`
+would collect those files into its abort ledger. **False, and checked rather than reasoned:**
+`WriteDataFilesAsync(batches, ct, schemaOverride, identityValuesPreGenerated, materializedRowIds)` has no
+`written:` parameter at all, and the ledger is threaded EXPLICITLY by the callers that opt in (which is
+what `StageChangeDataAsync` does via `written: _written`). `StartTransaction` is likewise only
+`new DeltaTransaction(this, snapshot, level)` — it registers nothing on the table and installs no ambient
+state.
+
+Consequences, both of which matter beyond slice 1a:
+
+- Creating the transaction earlier *within one call* is a genuine no-op. The reason 1a does not do it is
+  **discipline** — byte-identity is the claim, and "looks free" is not "is free" — not a mechanism.
+- **A file written straight through the table is never reclaimed by an abort, at any slice.** That is why
+  `DiscardDataFilesAsync` exists as a separate verb and why `RollbackTransaction` calls it independently.
+  Do not plan a later slice on the assumption that holding a transaction makes our eagerly-written data
+  files self-cleaning; only what EW's own writers stage (a deletion vector, a CDF file) comes back.
+
 1. **Hoist creation AND make the flush use it.** A per-(txnId, tablePath) holder whose transaction is
    created **lazily on the first operation that NEEDS one** — a DV delete, schema change, CDF write or
    app-txn requirement, i.e. exactly the condition at `DeltaCatalog.cs:2592` — so the plain-append fast
    path (`FlushDeferredFiles`, which uses no transaction and has its own OCC retry) is left exactly as
    it is. `FlushDmlTransaction` then uses the HELD transaction instead of calling `StartTransaction`
    itself. Staging all still happens at flush time. Gate: hermetic + service byte-identical to
-   `7ac6662`. Net effect on IO should be **one fewer** table open per flushed table, not one more —
-   assert that rather than assume it.
+   `7ac6662`.
+   - ⚠ **The "one fewer table open" wording above was wrong for 1a as built, and would have been
+     reported as a gain that does not exist.** It was written for a version of slice 1 that hoisted
+     creation and flush-usage together. **1a is IO-NEUTRAL**: the flush opens the table exactly once, as
+     before — the only change is that the buffer entry owns it, so it is disposed by
+     `CommitTransaction`'s per-table `finally` instead of the flush's own. The "one fewer" framing was
+     about avoiding a REGRESSION (a holder that opens while the flush also opens), not achieving a
+     reduction. A real reduction only arrives at 1b, when statement-time work reuses the held table
+     instead of opening its own.
 2. **CDF onto `StageChangeDataAsync`**, now safe because there is only ever one transaction per table.
    Retires `WriteChangeDataFilesAsync` (45 lines) and the upstream offer. Gate:
    `verify_delta_catalog_changes` + the CDF sections of the transactions suite.

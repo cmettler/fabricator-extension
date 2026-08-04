@@ -110,6 +110,23 @@ internal sealed class DeltaTxnBuffer
         public Dictionary<string, (long Version, long? Expected)> AppTxnVersions { get; } =
             new(System.StringComparer.Ordinal);
 
+        // ---- The EW transaction machinery, OWNED BY THIS ENTRY rather than by the flush's scope ----
+        // (hoist slice 1a — docs/delta-transaction-hoist.md). The flush used to open the table and
+        // `await using` the transaction inside one method, so both died with the call. Parking them here
+        // moves their LIFETIME to the (DuckDB txn, table) pair, which is the prerequisite for staging at
+        // statement time instead of at COMMIT.
+        //
+        // ⚠ Holding a DeltaTable across ABI calls is only safe because of 142b350: the host-FS opener is a
+        // ClientContext* valid for ONE call, and DuckDbTableFileSystem now reads AmbientOpener.Current
+        // first rather than the value captured at construction. That fix's own comment predicted this
+        // ("becomes load-bearing the moment something is cached"). All three ITableFileSystem
+        // implementations were checked; see the doc's feasibility table.
+        //
+        // ⚠ DISPOSE txn BEFORE table — the transaction's cleanup needs the table's filesystem. The flush
+        // expressed that by declaring the `await using` inside the try; here it is DisposeHeld's ordering.
+        public EngineeredWood.DeltaLake.Table.DeltaTable? HeldTable;
+        public EngineeredWood.DeltaLake.Table.DeltaTransaction? HeldTxn;
+
         public bool HasAny => Rows > 0 || DeletedByOrdinal.Count > 0 || PendingMetadata is not null
                               || PendingCreate || AppTxnVersions.Count > 0;
 

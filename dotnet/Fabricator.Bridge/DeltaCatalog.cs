@@ -2627,6 +2627,10 @@ public sealed class DeltaCatalog : IBackendCatalog
             }
             finally
             {
+                // Held table/transaction first: disposing the transaction is the ABORT that reclaims what
+                // EW staged during a flush that did not commit, and this finally is the only path that runs
+                // when the flush THREW — which is exactly what the flush's `await using` used to cover.
+                DisposeHeld(pending);
                 DeltaTxnBuffer.DisposeBatches(pending);
             }
         }
@@ -2651,6 +2655,12 @@ public sealed class DeltaCatalog : IBackendCatalog
         }
         foreach (var kv in tables)
         {
+            // Abort + release the held EW transaction/table before reclaiming our own eagerly-written files:
+            // the abort takes back what EW's OWN writers staged (a deletion vector, a CDF file), which is a
+            // disjoint set from the host-written data files DiscardBufferedFiles names. In slice 1a nothing
+            // is held on this path — the flush is the only creator and it never ran — so this is inert here
+            // and becomes load-bearing at 1b.
+            DisposeHeld(kv.Value);
             int reclaimed = DiscardBufferedFiles(kv.Key, kv.Value);
             _log.LogInformation(
                 "delta txn {Txn} rollback {Path}: discarded {Rows} buffered row(s), reclaimed {Reclaimed} of "
@@ -3579,13 +3589,13 @@ public sealed class DeltaCatalog : IBackendCatalog
         // catalog-wide flag — so our OCC check + row-level relaxation conform to the guarantee the table
         // advertises, uniform with Spark. Absent property => WriteSerializable (Spark's default).
         bool tableSer = PendingSerializable(pending, tablePath);
-        var fs = TableFileSystems.Create(opener, tablePath);
-        var dataFileWriter = _nativeWrite && NativeParquetDataFileWriter.Available
-            ? new NativeParquetDataFileWriter(tablePath)
-            : null;
-        var table = await EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(fs, DeltaWriter.Options(null, dataFileWriter), token)
-            .ConfigureAwait(false);
-        try
+        // The table is now owned by the BUFFER ENTRY, not by this method's scope (hoist slice 1a) — so it is
+        // NOT disposed in a finally here; CommitTransaction's per-table finally does it, which is also what
+        // preserves the abort-on-exception this method used to get from `await using`.
+        var table = await EnsureHeldTableAsync(opener, tablePath, pending, token).ConfigureAwait(false);
+        // The bare block is what used to be `try { … } finally { table.DisposeAsync(); }`. Kept as a block
+        // ON PURPOSE: removing it would re-indent ~200 lines and bury a 6-line behavioural change in an
+        // unreviewable diff. It carries no semantics and can be flattened in a later cosmetic pass.
         {
             long pinned = pending.PinnedVersion!.Value;
             // The transaction's changes were computed against the PINNED snapshot: DV positions are keyed
@@ -3658,10 +3668,18 @@ public sealed class DeltaCatalog : IBackendCatalog
             // empties the ledger the instant WriteCommitAsync returns. Do not backport this line.
             // Disposal order: declared inside the try, so it runs BEFORE the finally disposes the table —
             // the cleanup needs the table's filesystem. (EW deliberately tolerates the reverse order too.)
-            await using var txn = table.StartTransaction(pinnedSnap,
-                tableSer
-                    ? EngineeredWood.DeltaLake.Table.IsolationLevel.Serializable
-                    : EngineeredWood.DeltaLake.Table.IsolationLevel.WriteSerializable);
+            // Created HERE, at exactly the point the `await using` used to be. Moving it earlier LOOKS free —
+            // StartTransaction(pinnedSnap, isolation) is only `new DeltaTransaction(this, snapshot, level)`,
+            // it registers nothing on the table and installs no ambient state, and both arguments are already
+            // resolved above — but "looks free" is not "is free", and slice 1a's whole claim is byte-identity.
+            // Moving it is slice 1b's business, with its own gate.
+            //
+            // ⚠ Do NOT expect the hoist to reclaim our eagerly-written data files on abort. EW's abort ledger
+            // is passed EXPLICITLY (`written:`, as StageChangeDataAsync does) and WriteDataFilesAsync has no
+            // such parameter, so a live transaction never collects a file written straight through the table.
+            // That is exactly why DiscardDataFilesAsync is a separate verb and why RollbackTransaction calls
+            // it independently: reclaiming OUR files stays OUR job at every slice.
+            var txn = EnsureHeldTxn(pending, table, pinnedSnap, tableSer);
 
             // Appends. identityValuesPreGenerated: our eager identity path already put the values in the
             // files, which is what lets an identity table accept externally written ones at all.
@@ -3813,9 +3831,79 @@ public sealed class DeltaCatalog : IBackendCatalog
                     + $"({ex.Message}) — the transaction is rolled back; retry it.");
             }
         }
-        finally
+    }
+
+    /// <summary>
+    /// Opens this (DuckDB txn, table) pair's <see cref="EngineeredWood.DeltaLake.Table.DeltaTable"/> once and
+    /// parks it on the buffer entry (hoist slice 1a). Idempotent: a second call returns the held one.
+    /// </summary>
+    private async Task<EngineeredWood.DeltaLake.Table.DeltaTable> EnsureHeldTableAsync(
+        nint opener, string tablePath, DeltaTxnBuffer.PendingAppends pending,
+        System.Threading.CancellationToken token)
+    {
+        if (pending.HeldTable is { } held)
         {
-            await table.DisposeAsync().ConfigureAwait(false);
+            return held;
+        }
+        var fs = TableFileSystems.Create(opener, tablePath);
+        var dataFileWriter = _nativeWrite && NativeParquetDataFileWriter.Available
+            ? new NativeParquetDataFileWriter(tablePath)
+            : null;
+        pending.HeldTable = await EngineeredWood.DeltaLake.Table.DeltaTable
+            .OpenAsync(fs, DeltaWriter.Options(null, dataFileWriter), token).ConfigureAwait(false);
+        return pending.HeldTable;
+    }
+
+    /// <summary>
+    /// Starts this (DuckDB txn, table) pair's EW transaction once and parks it on the buffer entry
+    /// (hoist slice 1a). Idempotent. The isolation and base snapshot are fixed at the FIRST call, which is
+    /// the point of the hoist: every later statement stages into the same transaction against the same base.
+    /// </summary>
+    private static EngineeredWood.DeltaLake.Table.DeltaTransaction EnsureHeldTxn(
+        DeltaTxnBuffer.PendingAppends pending, EngineeredWood.DeltaLake.Table.DeltaTable table,
+        EngineeredWood.DeltaLake.Snapshot.Snapshot pinnedSnap, bool tableSer)
+        => pending.HeldTxn ??= table.StartTransaction(pinnedSnap,
+            tableSer
+                ? EngineeredWood.DeltaLake.Table.IsolationLevel.Serializable
+                : EngineeredWood.DeltaLake.Table.IsolationLevel.WriteSerializable);
+
+    /// <summary>
+    /// Disposes the buffer entry's held EW transaction and table, <b>transaction first</b> — its cleanup needs
+    /// the table's filesystem. Runs on EVERY exit from a (DuckDB txn, table)'s life: commit, rollback, and an
+    /// exception out of the flush.
+    ///
+    /// <para>Disposing the transaction is what ABORTS it, which is the reclamation the flush used to get from
+    /// <c>await using</c>: a flush that does not commit takes back what EW's own writers staged during it —
+    /// measured, a buffered DELETE whose commit is refused otherwise leaves a <c>deletion_vector_*.bin</c>,
+    /// because <c>StageRowDeletesAsync</c> writes the vector at STAGING time, before the precondition is
+    /// judged. After a SUCCESSFUL commit the abort is a no-op (EW #49 empties the ledger the instant the
+    /// commit json is durable) — which is also why this is only safe from #49 onward.</para>
+    ///
+    /// <para><b>Never throws.</b> This runs in a finally, on the path where the caller may already be
+    /// carrying the user's real error; a cleanup failure must not replace it.</para>
+    /// </summary>
+    private void DisposeHeld(DeltaTxnBuffer.PendingAppends pending)
+    {
+        var txn = pending.HeldTxn;
+        var table = pending.HeldTable;
+        pending.HeldTxn = null;
+        pending.HeldTable = null;
+        if (txn is not null)
+        {
+            try { txn.DisposeAsync().GetAwaiter().GetResult(); }
+            catch (System.Exception ex)
+            {
+                _log.LogWarning("delta held transaction dispose failed ({Reason}) — staged files may remain "
+                                + "as orphans for VACUUM", ex.Message);
+            }
+        }
+        if (table is not null)
+        {
+            try { table.DisposeAsync().GetAwaiter().GetResult(); }
+            catch (System.Exception ex)
+            {
+                _log.LogWarning("delta held table dispose failed ({Reason})", ex.Message);
+            }
         }
     }
 
