@@ -2343,6 +2343,54 @@ existing invariant. More sites, but no dialect anywhere else moves.
 `VariantTransport.CanonicalStream`/`HasTransportField` were written and compiled clean; re-add them when the
 write half is done properly rather than leaving them unused.
 
+#### THE WRITE HALF — a ready-to-execute plan (enumerated 2026-08-04, nothing started)
+
+Line numbers are as of `5f531d6`; re-grep to confirm before editing
+(`grep -n "DeltaWriter.Create(\|DeltaWriter.Write(\|WriteDataFilesAsync(\|WriteChangeDataFilesAsync(\|StageChangeDataAsync(\|table.WriteAsync(\|OverwritePartitionsAsync(\|DynamicOverwriteAsync(" dotnet/Fabricator.Bridge/*.cs | grep -v NativeParquet`).
+
+**The rule at every site: convert ONLY what is handed to engineered-wood, and change no dialect anywhere else.**
+Batches → `VariantTransport.ToCanonical(batch)`. Standalone schemas → `VariantMarker.ToCanonicalSchema(schema)`
+(re-add both helpers; they compiled clean).
+
+| # | site | what to convert | note |
+|---|---|---|---|
+| 1 | `DeltaCatalog.cs:2353` `DeltaWriter.Write(… schema, batches …)` | both | source is `Materialize(data)` at `:2352`, so still transport |
+| 2 | `DeltaCatalog.cs:2526` `DeltaWriter.Create(… columns …)` | schema | `columns` comes from the DDL in transport form |
+| 3 | `DeltaCatalog.cs:2612` `DeltaWriter.Write(… pending.BatchSchema!, pending.Batches …)` | both | |
+| 4 | `DeltaCatalog.cs:3352` `WriteChangeDataFilesAsync(b, …)` | batch | buffered CDC rows |
+| 5 | `DeltaCatalog.cs:3449` `WriteDataFilesAsync(toWrite, …)` | batches | |
+| 6 | `DeltaCatalog.cs:3492` `DeltaWriter.Create(… createSchema …)` | schema | derives from `PendingArrowSchema` (TRANSPORT — it serves binds; leave the field alone) |
+| 7 | `DeltaCatalog.cs:3525` `t2.WriteDataFilesAsync(pending.Batches, …)` | batches | |
+| 8 | `DeltaCatalog.cs:3540` `DeltaWriter.Write(… pending.BatchSchema!, pending.Batches …)` | both | |
+| 9 | `DeltaCatalog.cs:3597` `WriteDataFilesAsync(pending.Batches, …)` | batches | |
+| 10 | `DeltaGlobalTableFunction.cs:659/661/662` `OverwritePartitionsAsync` / `DynamicOverwriteAsync` / `WriteAsync` | batches | all three take the same `batches` — convert once above the ternary |
+| 11 | `DeltaReader.cs:2604` `WriteDataFilesAsync(postImages, …)` | batches | post-images built from transport read-back + transport SET values |
+| 12 | `DeltaReader.cs:2627/2633` `StageChangeDataAsync(pre/post, …)` | batches | |
+| 13 | `ExternalTableRouting.cs:273` `Materialize(data)` | batches + schema | a separate ingest path; does not pass `BulkInsert` |
+
+**LEAVE ALONE — these must stay TRANSPORT:** `DeltaWriter.TryStreamCreateFiles` (`:2160`) and the `native_write`
+stream generally (it feeds DuckDB's COPY — this is precisely what killed the funnel);
+`DeltaCatalog.Materialize` at `:2180`/`:2270` where the result populates `PendingArrowSchema` (bind dialect);
+`NativeParquetDataFileWriter` (already converts canonical→blob for the COPY — do NOT double-convert);
+`ReadSelectedRowsAsync` (transport, matching the SET columns it is substituted into).
+
+**Order, with a gate at each step so a bisect stays clean:**
+1. Re-add the two helpers. Build only.
+2. Sites 1–13, EW's `ToVariantArrays` STILL PRESENT (it is marker-keyed and a no-op for canonical input, so
+   double conversion is harmless). Gate: `verify_delta_catalog_variant` = 157, then full hermetic = 63/63 / 5686.
+   **This is the green intermediate — do not skip it**, it is what separates "my conversions are right" from
+   "the deletion broke something".
+3. Delete EW's `VariantTransport.cs` entirely + revert the `SchemaConverter` patch (+50) + the 4
+   `ToVariantArrays` call sites + `IsVariantField`. Adapt EW's `VariantTransportTests.cs` (the remaining tests
+   are transport-WRITE tests and will have nothing to test — expect ~868 from 871). Gate: hermetic again + EW
+   Table.Tests on BOTH TFMs.
+4. Then the patch set should read **~256 insertions** (469 − 213), all upstreamable.
+
+**⚠ ABORT CONDITION:** if step 2's hermetic run fails anywhere other than a variant suite, revert whole rather
+than patch forward — the funnel attempt's lesson is that a wrong dialect boundary produces errors that name
+neither variants nor engineered-wood (`INTERNAL Error: Attempted to access index 2 within vector of size 2`),
+so a confusing failure is evidence of a design error, not of a missing conversion.
+
 **Two honest qualifications.** (1) The lines MOVE rather than vanish: a reduced version (one layout, not four)
 lands in the Bridge — call it 150–200 lines of ours, not zero work. (2) **One unknown remains:** our
 `ToTransportBlobs` also handles a *seam-delivered blob*, which may be our own concept (from the `IDataFileReader`
