@@ -65,6 +65,29 @@ single-blocking-point wrappers or sync-native and must be LEFT ALONE. Do NOT tre
 `.GetAwaiter().GetResult()` grep count as remaining work. Adopt the wrapper→core shape for NEW code.
 Full record (moved verbatim from here): [docs/ew-master-migration.md](docs/ew-master-migration.md).
 
+### THE UPSTREAM STRATEGY (user goal, 2026-08-04 — full plan: [docs/ew-master-migration.md](docs/ew-master-migration.md) §THE STRATEGY)
+
+Goal: run on **ORIGINAL upstream engineered-wood** with our needs met by high-probability PRs; maintain our own only
+if that is impossible, and then **make our amendments clear IN THE CODE**.
+- **⚠ ZERO-PATCH IS GATED ON DuckDB, NOT ON UPSTREAM'S APPETITE.** 392 of the 649 production lines (60%) are the
+  **variant transport**, which exists only because DuckDB cannot carry a nested VARIANT across the C data interface
+  (duckdb/duckdb#24157). Upstream would rightly decline another project's workaround ⇒ a plain `PackageReference` is
+  unreachable until #24157 is fixed. **Do not chase it with more PRs.** Realistic target: patch set ==
+  variant transport ONLY (~257 of 649 lines are upstreamable).
+- **Sequencing: offering and building are NOT sequential** — the branch model does both, proved by the 2026-08-02
+  bump (three of eight upstream commits were our own offers coming back re-cut). Stay on `fabricator-patches` and
+  keep building. **Pull ONE thing forward: MARK the amendments** (`// [FABRICATOR-PATCH: OFFER-READY | OFFERED #n |
+  OURS-BY-DESIGN]` + why + what retires it). `DeltaTable.cs` alone has **27 unmarked hunks**; today "is this ours?"
+  is answerable only by `git diff upstream/main`. Marking needs nobody's agreement and turns the eventual
+  fork-vs-upstream decision into a grep.
+- **Offer order** (probability × independence): (1) public overload of `WriteChangeDataFilesForAsync` — ~5 lines,
+  zero behaviour change, blocks nothing; (2) `ConflictChecker` isBlindAppend — 42 lines, internal, 7 tests, but
+  present BOTH shapes; (3) `ExemptRowLevelFromWholeTableRead` — **only after the §2.2 fix**, and pitched as a
+  DEPARTURE not an inconsistency; (4) a transaction that can CREATE a table — a design conversation. **Never**
+  offer the variant transport.
+- **Decision gate:** drop the branch for a `PackageReference` when the patch set is variant-transport-only AND
+  #24157 is fixed. Until then the branch is correct, not a failure.
+
 ### THE EW CLAST-MASTER RE-PIN (2026-07-22 — the current engine; full record: [docs/ew-master-migration.md](docs/ew-master-migration.md))
 
 The engineered-wood submodule pin moved from our long-lived fork lineage (`99e2c3a`) onto

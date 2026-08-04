@@ -2232,6 +2232,64 @@ spending credibility on a request we do not need weakens the ones we do.
 overlays a transaction's own uncommitted actions, which is a genuine new CAPABILITY rather than an inconsistency,
 and the precondition for replacing the buffer with a long-lived transaction.
 
+### THE STRATEGY — how the fork-vs-upstream question actually resolves (2026-08-04)
+
+**The goal** (user, 2026-08-04): run on ORIGINAL upstream engineered-wood, with our needs met by PRs that have a
+high probability of being merged. Only if that proves impossible do we maintain our own — and then **it must be
+clear IN THE CODE what our amendments are.**
+
+**⚠ ZERO-PATCH IS NOT REACHABLE, AND THE BLOCKER IS NOT UPSTREAM'S APPETITE — IT IS DuckDB.** Of the 649
+production lines, **392 (60%) are the variant transport** (`VariantTransport.cs` 322 + `SchemaConverter` 50 +
+`DeltaTableOptions` 15 + csproj 5). It exists solely because DuckDB cannot carry a nested VARIANT across the C data
+interface (duckdb/duckdb#24157), and upstream would be right to decline a workaround for another project's bug. So
+a `PackageReference` to unmodified upstream is gated on **DuckDB #24157**, not on Curt. Do not chase it as though
+more PRs would get us there.
+
+**⇒ The realistic target is: patch set == variant transport ONLY.** ~257 lines of the current 649 are
+upstreamable; the rest waits on DuckDB. That target is achievable and worth aiming at, because it makes every
+future bump a merge of ONE self-contained file rather than a negotiation.
+
+**Answering "stick with the branch and fix features, then clean up / decide?" — yes, with ONE thing pulled
+forward.** Offering and building are NOT sequential: the branch model already handles both at once, and the
+2026-08-02 bump proved it (three of eight upstream commits were our own offers coming back, re-cut). So keep
+building on `fabricator-patches`. But do the MARKING now, because it is cheap, needs nobody's agreement, and it is
+the thing that makes the eventual decision mechanical instead of archaeological.
+
+#### Step 1 (do first, no upstream dependency): make the amendments SELF-DESCRIBING
+
+Today the only way to answer "is this ours?" is `git diff upstream/main`. `DeltaTable.cs` alone carries **27
+hunks**, largest 45 lines and a long tail of 25/17/14/10/8/8/7 — invisible at the point of use. Mark each with a
+greppable comment carrying a STATUS, so `git grep FABRICATOR-PATCH` enumerates the whole divergence:
+
+```csharp
+// [FABRICATOR-PATCH: OFFER-READY] why it exists; what would retire it
+// [FABRICATOR-PATCH: OFFERED #123]
+// [FABRICATOR-PATCH: OURS-BY-DESIGN] expires with duckdb/duckdb#24157
+```
+
+Three categories are enough: **OFFER-READY**, **OFFERED #n**, **OURS-BY-DESIGN** (+ its expiry condition). The
+prize is that a bump can enumerate our amendments without a diff, and a reader sees provenance where the code is.
+
+#### Step 2 (in parallel): offer, ordered by probability × independence
+
+| # | offer | ask | why this order |
+|---|---|---|---|
+| 1 | **public overload of `WriteChangeDataFilesForAsync`** | ~5 lines (visibility; drop the `internal`-typed `WrittenFileLedger?`) | ZERO behaviour change, names an inconsistency in their own API, and blocks nothing on our side — the ideal first PR |
+| 2 | **`ConflictChecker`** — consume `commitInfo.isBlindAppend` | 42 lines, `internal` class, 7 tests, no API surface | correctness, but it DOES change behaviour ⇒ present both shapes (believe-flag-then-infer vs Delta parity) and let upstream choose |
+| 3 | **`ExemptRowLevelFromWholeTableRead`** | 26 lines | **only after §2.2 is fixed** — offering an opt-in we apply more widely than we justify is how credibility goes. And it is a DEPARTURE from Delta, not an inconsistency: pitch it as one |
+| 4 | a transaction that can CREATE a table | new API | a design conversation, not a PR ([delta-transactions.md](delta-transactions.md) §7.1) |
+| — | variant transport | — | **never offer.** OURS-BY-DESIGN |
+
+#### Step 3: the decision gate, so "decide later" has a trigger
+
+Drop the branch for a `PackageReference` when **both** hold: the patch set is variant-transport-only, AND DuckDB
+#24157 is fixed (or the transport is otherwise retired). Until then the branch is the correct answer, not a
+failure — and with Step 1 done, "what is ours" is a grep rather than an investigation.
+
+⚠ **What NOT to do while waiting:** do not let the patch set grow unmarked, and do not batch offers into one large
+PR. Every offer above is independently mergeable, and the 2026-08-02 experience says small independent offers come
+back re-cut and improved, which is the outcome we want.
+
 ### THE REFRAME PASS — do this BEFORE writing any upstream PR
 
 Two of the three live offers above are not what we originally intended to send, and both improved the same way:
