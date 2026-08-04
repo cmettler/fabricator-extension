@@ -2325,6 +2325,28 @@ VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
   mount at `/var/opt/mssql/security/ca-certificates`). Bring-up: certs → compose up → provision
   (docker/README.md). Connstr needs `TrustServerCertificate=true;Encrypt=true`. `sqlcmd` v18 in-container:
   `docker exec mssql-fabricator /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Arrow_Net_123!' -C`.
+  - **⚠ THE MinIO BUCKET MUST BE CLEANED PERIODICALLY — the S3 suite gets MONOTONICALLY SLOWER, and it is
+    the whole cost of the service tier. MEASURED 2026-08-04.** One leg of `verify_delta_catalog_s3` against
+    a bucket holding **12,195 objects** (2,002 of them under its own `lake/` root) **did not finish in
+    600 s**; the same leg against a freshly emptied bucket took **128 s** for its full 171 assertions. So
+    ≥4.7×, and the true ratio is unknown because the dirty run never completed. Since the tier runs that
+    suite TWICE (engine-doubled), it dominates the tier's wall clock — this is what made the tier look hung
+    earlier that day.
+    - **Mechanism: the suite is re-runnable by design via `CREATE OR REPLACE`, which adds a version with
+      removes and RECLAIMS NOTHING.** One run leaves 35 objects (16 `lake/`, 11 `copyfmt`, 8 `condsuite`),
+      so growth is ~16/run under `lake/` and the observed 2,002 is roughly 125 accumulated runs. Nothing is
+      wrong with the suite; the rig just has no reclamation.
+    - Clean with `docker exec minio-fabricator sh -c 'mc alias set l https://localhost:9000 miniouser
+      miniosecret123 --insecure && mc rm --recursive --force --insecure l/fabricator'` (⚠ **https +
+      `--insecure`** — the stack is TLS-only, and `http://` silently reports 0 objects, which reads as an
+      empty bucket rather than a failed connection). Everything in there is regenerable: every suite
+      self-provisions, and `dbtlake` — 5,891 objects, nearly half — belongs to dbt runs that are in NEITHER
+      CI tier. A `VACUUM` at the end of the suite would make it self-maintaining; not built.
+    - **⚠ Do NOT bake the clean into provisioning unconditionally: dirty state has DIAGNOSTIC value.** The
+      PolyBase deletion-vector finding below (a table that has ever materialized a DV stays unreadable
+      through `CREATE OR REPLACE`) was found precisely by RE-RUNNING — the assertion passed on a clean
+      account and failed on the second run. A green tier on a freshly cleaned bucket is therefore weaker
+      evidence for those particular assertions than a green one on a dirty bucket.
 - **ADLS Gen2 / SQL Server data virtualization — BUILT + LIVE-VALIDATED 2026-08-02. Gate
   `test/verify_mssql_adls_polybase.test` (140, manual/live-account tier).** The abfss analogue of the S3
   PolyBase circle below: our Delta provider CTASes a protocol-1.0 table to an Azure storage account, then
