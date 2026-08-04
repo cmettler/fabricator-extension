@@ -80,6 +80,44 @@ reviewing it. They change the order, so read them before starting.**
   (txn, table) — paid on OneLake/S3. A slice whose gate is "byte-identical assertions" would have
   passed while shipping that.
 
+### 4.0 FEASIBILITY IS CONFIRMED — the groundwork already exists
+
+The biggest unknown was whether a `DeltaTable` can be held across ABI calls at all. **It can, and the fix
+that made it possible is already in** (`142b350`): the host-FS opener is a `ClientContext*` valid only for
+the duration of one ABI call, so `DuckDbTableFileSystem` capturing it was *"the reason a `DeltaTable`
+cannot be held open ACROSS calls"* — a use-after-free, not a staleness bug. It now reads
+`AmbientOpener.Current` first and keeps the captured value only as a fallback, and its own comment says
+the change *"becomes load-bearing the moment something is cached."* This is that moment.
+
+Checked all three `ITableFileSystem` implementations, because one exception would sink the design:
+
+| implementation | opener |
+|---|---|
+| `DuckDbTableFileSystem` | reads `AmbientOpener.Current` per call, captured value as fallback ✅ |
+| `AdlsGen2TableFileSystem` | none at all — SDK credentials ✅ |
+| `S3CommitFileSystem` | reads `AmbientOpener.Current` dynamically, delegates the rest to the opener-safe inner FS ✅ |
+
+### 4.1 Slice 1 SPLITS — separate "who owns the transaction" from "when is it created"
+
+Only the second half can change behaviour, so they must not land together.
+
+- **1a — ownership refactor, behaviour-identical BY CONSTRUCTION.** Extract the flush's
+  `TableFileSystems.Create` → `OpenAsync` → `StartTransaction` sequence into an
+  `EnsureHeldTransaction(...)` that parks the (table, transaction, pinnedSnap) triple on the buffer entry,
+  and have `FlushDmlTransactionAsync` obtain it from there. Still CALLED from the flush, at the same
+  moment as today, so nothing observable moves. **Two constraints that must survive the move, both
+  currently expressed by the flush's scoping:**
+  - **DISPOSAL ORDER is load-bearing.** `await using var txn` is declared INSIDE the try so it runs
+    BEFORE the `finally` disposes the table — the transaction's cleanup needs the table's filesystem.
+    Moving disposal to commit/rollback must keep txn-then-table.
+  - **`await using` is what ABORTS a flush that does not commit**, reclaiming what EW's own writers
+    staged — measured: a buffered DELETE whose commit is refused otherwise leaves a
+    `deletion_vector_*.bin`, because `StageRowDeletesAsync` writes the vector at STAGING time, before the
+    precondition is judged. Whatever replaces the `await using` must abort on every non-committing path,
+    including an exception out of the flush. ⚠ Safe only from EW #49 — do not reintroduce it any earlier.
+- **1b — move the creation point to the first operation that needs one.** Then, and only then, the
+  behaviour question arises (a transaction alive across statements). Gate 1b on its own.
+
 1. **Hoist creation AND make the flush use it.** A per-(txnId, tablePath) holder whose transaction is
    created **lazily on the first operation that NEEDS one** — a DV delete, schema change, CDF write or
    app-txn requirement, i.e. exactly the condition at `DeltaCatalog.cs:2592` — so the plain-append fast
