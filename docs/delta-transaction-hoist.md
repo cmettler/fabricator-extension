@@ -282,6 +282,28 @@ Consequences, both of which matter beyond slice 1a:
    - ⚠ **The two halves cannot land separately.** Making the create immediate WITHOUT the rollback drop
      ships the regression with no mitigation, so §3's accepted trade only holds if both are in one commit —
      which is also why the suite rewrite belongs to that same commit rather than a follow-up.
+   - **Three things inside `FlushCreateTransactionAsync` that the immediate create must ACCOUNT FOR, not
+     merely relocate** (read 2026-08-04; each would have surfaced mid-implementation):
+     - **IDENTITY high-water marks cannot ride commit-0 any more, and that is FINE — it makes the two paths
+       uniform.** Today `BakeIdentityMarks(PendingArrowSchema, PendingIdentityHwm)` puts the transaction's
+       FINAL chained marks into the create's own schema, which is only possible because the create is
+       deferred until every statement has generated its values. With an immediate create, v0 carries the
+       base marks and the flush's `metaData` action updates them — **exactly what already happens for a
+       table the transaction did not create** (`BuildIdentityMetadataAction`, `:3758`). So the change is
+       "stop special-casing", not "lose a guarantee". ⚠ But it IS observable: v0 of a created identity table
+       would no longer show the final mark.
+     - **`preAssignedSchema` / `PendingDeltaSchema` may become unnecessary — check, do not assume.** It
+       exists because eagerly-streamed CTAS files are written against a pre-assigned column-mapping schema
+       (physical names are random GUIDs) that the deferred create must then REUSE rather than re-assign.
+       An immediate create assigns that schema FIRST and the streaming path reads it off the table, which
+       inverts the dependency. The ordering holds — `FabricatorPhysicalCreateTableAs` creates before
+       `begin_bulk` — so the table exists before the first batch.
+     - **The concurrent-create guard MOVES AND IMPROVES.** `TableExists(tablePath)` at flush turns a
+       concurrent create into a clean *"rolled back; retry it"* at COMMIT. With an immediate create the race
+       is decided by commit-0 itself, i.e. by the put-if-absent primitive, at the CREATE statement — earlier
+       and by the storage layer rather than by a TOCTOU check. ⚠ On a backend where that primitive is not
+       conditional ([delta-transactions.md](delta-transactions.md) §8.5 — a local Windows root) it is
+       therefore WEAKER than today's explicit probe, which is a genuine trade to state rather than a pure win.
 
 ### 4.2 WHERE THE HOIST STANDS — the prize is banked, and the rest is smaller than the slicing implies
 
