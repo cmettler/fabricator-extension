@@ -562,6 +562,31 @@ current code still uses the single-provider `fabricator` naming):
 ## Next up (open threads for future sessions)
 
 In-flight / planned refactors (all C#-only unless noted; tests stay green per slice):
+- **`MERGE INTO` — A MUST-HAVE (user, 2026-08-04). NOTHING BUILT. `ON CONFLICT` is DEFERRED (same user
+  decision).** ⚠ **MEASURED: neither reaches us at all** — DuckDB refuses both at BIND on the catalog type:
+  `Not implemented Error: Database type "fabricator" does not support MERGE INTO or ON CONFLICT`. So this is
+  a DuckDB-level gate affecting **every** provider (Delta, SQL Server, DAX), not a provider gap, and there is
+  no translation to inspect. Reproduce with four statements: attach a Delta catalog, CTAS a target and a
+  source, `MERGE INTO … WHEN MATCHED THEN UPDATE … WHEN NOT MATCHED THEN INSERT …`. The failing statement
+  aborts cleanly (target unchanged, no stray version).
+  - **First job is to FIND THE HOOK** that check consults (binder / `Catalog` virtual) — the error text is the
+    handle. Until that is read, everything below is a sketch.
+  - **⚠ The two providers want DIFFERENT implementations, and conflating them would waste the work.**
+    SQL Server has NATIVE T-SQL `MERGE`, so the prize there is generating ONE server-side statement — but a
+    DuckDB MERGE's SOURCE is a DuckDB relation, so a pushdown needs the source to be server-side too;
+    otherwise it degrades to per-row DML on the pinned connection (correct, slow). Delta has no native merge:
+    compose it from update + delete + insert, which **already lands as ONE atomic commit per table** via the
+    buffered flush — so the Delta half may be mostly free once the hook exists.
+  - **What the hand-written equivalent already gives us, and the bar to beat:** UPDATE (matched) + INSERT
+    (unmatched) inside one `BEGIN … COMMIT` is atomic per table AND produces a correct change feed. It also
+    dodges the two same-transaction hazards by construction, since matched/not-matched are disjoint —
+    ⚠ but a MERGE implementation must PRESERVE that property, because `UPDATE of rows inserted in the same
+    transaction` is refused on any table and `DELETE of rows inserted in the same transaction` is refused on a
+    CDF table. A merge that re-reads its own inserts would trip both.
+  - **`ON CONFLICT` is deferred for a REASON worth keeping**: SQL Server's nearest mechanism is
+    `IGNORE_DUP_KEY = ON`, an option on a UNIQUE INDEX — index-level, not statement-level, so it can express
+    only `DO NOTHING`, only where the index was created that way. It cannot express `DO UPDATE` at all, so it
+    is not a translation target; treat the two features as independent despite DuckDB refusing them together.
 - **TIMESTAMP BOUNDS FOR `fabricator_delta_changes` — AGREED, NOT BUILT (user, 2026-08-04). ⚠ C++-TOUCHING**
   (two `TableFunction` overloads at `fabricator_extension.cpp:627`), so it needs the full rebuild, not just a
   managed republish. Ours is `BIGINT`-only today — `(catalog, '<schema.>table', from [, to])` — while Delta's
