@@ -1414,10 +1414,10 @@ SELECT * FROM lake.main.t WHERE id > 10;          -- streaming scan + file/row-g
 > nothing behind. What is exposed is a *storage* failure during the write (permissions, disk full,
 > network).
 >
-> **⚠ Recover with `CREATE OR REPLACE TABLE … AS SELECT` — a plain re-run does NOT work.** Measured: once
-> the table exists, `CREATE TABLE t AS SELECT …` **silently does nothing** — no error, no rows written, exit
-> 0 (DuckDB's own tables raise *"Table with name t already exists!"*; ours does not — a known bug).
-> `CREATE TABLE IF NOT EXISTS` likewise leaves the empty table. Only `CREATE OR REPLACE` overwrites it.
+> **⚠ Recover with `CREATE OR REPLACE TABLE … AS SELECT` (or `DROP TABLE` then create) — a plain re-run
+> does not.** Once the table exists, a plain `CREATE TABLE t AS SELECT …` is refused with
+> *"Table with name t already exists!"*, and `CREATE TABLE IF NOT EXISTS` leaves the empty table by
+> definition. Only `CREATE OR REPLACE` overwrites it.
 >
 > This is a Delta-writer API limitation, not a Delta format one — the format allows a single commit that
 > both creates the table and adds data.

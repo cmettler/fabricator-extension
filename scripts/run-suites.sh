@@ -128,7 +128,16 @@ case "$TIER" in
         # for VACUUM. +2, not +1: that suite is one of the DOUBLED ones below, so an assertion added to it
         # counts once per engine. The section had asserted the parquet count only BEFORE the rollback for a
         # year, which is exactly why the behaviour could change under it in silence.
-        : "${MIN_ASSERTIONS:=5656}"
+        # 5710 since 2026-08-04: verify_delta_catalog_write 31 -> 43 for the CREATE-over-an-existing-table
+        # refusal — the shared C++ CreateTable never checked ERROR_ON_CONFLICT, so a plain CTAS wrote no rows
+        # and kept the OLD data (exit 0, no error) and a plain CREATE silently ignored its DECLARED SCHEMA.
+        # ⚠ +24, not +12: verify_delta_catalog_write is one of the four DOUBLED suites, so each assertion
+        # counts once per engine — a floor of 5668 from the standalone delta would have tolerated a
+        # 12-assertion regression, the same trap the s3 note records on the service tier.
+        # ⚠ 5686 - 5656 = 30 of this gap PREDATES the change: the floor was not raised for the unified
+        # parameter protocol's coverage (verify_global_functions + the signature/mixed-arg pins). Closed here
+        # rather than left, since a floor 30 below the actual silently tolerates a regression that large.
+        : "${MIN_ASSERTIONS:=5710}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
@@ -155,7 +164,19 @@ case "$TIER" in
         # ⚠ +20, not +10: verify_delta_catalog_s3 is THE DOUBLED SUITE of this tier (see DOUBLED below), so
         # every assertion added to it counts ONCE PER ENGINE. A floor of 1434 was set first from the
         # standalone 161 -> 171 delta and would have silently tolerated a 10-assertion regression.
-        : "${MIN_ASSERTIONS:=1444}"
+        # 1465 since 2026-08-04: verify_ctas_text_type 8 -> 15 — the SQL Server half of the CREATE-conflict
+        # fix. SQL Server was never in the DANGEROUS half of that defect (its own CREATE TABLE rejects a
+        # duplicate, so no write was lost); what changed is that the user gets the ordinary catalog error
+        # instead of the raw provider 2714. Asserted on this tier because SQL Server SHARES the fixed C++
+        # path with Delta, where the same gap discarded the write silently.
+        # ⚠ 1458 - 1444 = 14 of this gap PREDATES the change (the unified parameter protocol pass raised the
+        # actual and not the floor). Closed here for the same reason as the hermetic one.
+        # ⚠ The floor is the MEASURED tier total (1465), not 1458 + the standalone delta. Both numbers in the
+        # first draft of this note were ARITHMETIC rather than measured and both were wrong: the suite was 8
+        # assertions, not 6 (I counted the statements I had added instead of running the suite before changing
+        # it), so a floor of 1467 tripped the tripwire on a perfectly green 44/44 run and cost a re-run to
+        # explain. Measure the BEFORE count while you still can, or take the floor from a green tier run.
+        : "${MIN_ASSERTIONS:=1465}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

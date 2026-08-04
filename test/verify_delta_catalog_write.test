@@ -111,3 +111,73 @@ SELECT count(*) FROM lake2.main.t;
 
 statement ok
 DETACH lake2;
+
+# ── A plain CREATE over an EXISTING table must be REFUSED ────────────────────────────────────────
+# Regression gate. Nothing upstream of us enforces this for an attached catalog — DuckDB's binder
+# leaves the conflict to the catalog — so before FabricatorSchemaEntry::CreateTable handled
+# ERROR_ON_CONFLICT, a plain create reached the provider as an ordinary create and Delta's
+# OpenOrCreateAsync just OPENED the existing table. Both shapes below then SUCCEEDED while doing
+# nothing: a CTAS wrote no rows and kept the old data (so a user re-running it believing it had
+# replaced the data silently kept the stale rows), and a plain CREATE had its DECLARED SCHEMA
+# ignored. Exit 0, no warning, no log line. The four cases are asserted together because the fix is
+# one conflict-action check: getting it wrong in the other direction breaks OR REPLACE / IF NOT
+# EXISTS, which are the shapes users reach for once the plain one errors.
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/catalogw' AS lake3 (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}');
+
+# `t` exists on storage and has NOT been read through this attach — the entry is not materialized,
+# so the check must consult the DISCOVERED name list, not just the cached entries.
+statement error
+CREATE TABLE lake3.main.t AS SELECT * FROM range(99) v(id);
+----
+Table with name "t" already exists!
+
+# The refusal is a REFUSAL, not a partial write: the old data is untouched.
+query I
+SELECT count(*) FROM lake3.main.t;
+----
+4
+
+# Same for a plain CREATE naming a completely different schema (the shape whose old behaviour
+# silently discarded the declared columns).
+statement error
+CREATE TABLE lake3.main.t (a INTEGER, b VARCHAR);
+----
+Table with name "t" already exists!
+
+query T
+SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns()
+WHERE database_name = 'lake3' AND table_name = 't';
+----
+id,name
+
+# IF NOT EXISTS still no-ops silently (IGNORE_ON_CONFLICT is forwarded to the provider).
+statement ok
+CREATE TABLE IF NOT EXISTS lake3.main.t AS SELECT * FROM range(3) v(id);
+
+query I
+SELECT count(*) FROM lake3.main.t;
+----
+4
+
+# OR REPLACE still replaces (REPLACE_ON_CONFLICT drops first).
+statement ok
+CREATE OR REPLACE TABLE lake3.main.t AS SELECT * FROM range(6) v(id);
+
+query I
+SELECT count(*) FROM lake3.main.t;
+----
+6
+
+# A create of a name that genuinely does not exist is unaffected — the positive control, without
+# which every assertion above would pass on a CreateTable that refuses everything.
+statement ok
+CREATE TABLE lake3.main.freshly AS SELECT * FROM range(7) v(id);
+
+query I
+SELECT count(*) FROM lake3.main.freshly;
+----
+7
+
+statement ok
+DETACH lake3;

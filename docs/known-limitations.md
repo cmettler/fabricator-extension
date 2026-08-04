@@ -25,15 +25,63 @@ means the suites genuinely ran. Anything they cover works on the substrates they
 | 1.3 | Same shape on **`abfss://` with no NAMED secret** | 41 of 48 landed, six of the seven losses silent (§8.4) |
 | 1.4 | **`fabricator_fs_write_probe` can report the commit guard as WORKING when it tested nothing** — it fails in the UNSAFE direction | Aimed at a path whose parent does not exist, `exclusive_create_existing_fails` reads `true` ("put-if-absent works") because the exclusive open threw for a MISSING DIRECTORY. Confirm `create_directory` and `write_create` are both `true` before believing the verdict. §8.5a |
 | 1.5 | **A CREATE-plus-data is NOT atomic — it lands as TWO versions, in a transaction AND in plain autocommit.** v0 = `protocol`+`metaData` (an EMPTY table), v1 = the data. So a concurrent reader can observe the empty table, and **a failure of the data write leaves an empty committed table behind a statement the user saw fail** | `_delta_log` inspected directly for both shapes: `BEGIN; CREATE; INSERT; COMMIT` (via `FlushCreateTransactionAsync`) and a plain **autocommit `CREATE TABLE … AS SELECT`** (via `DeltaWriter.WriteAsync` → `OpenOrCreateAsync` then `table.WriteAsync`). §7.1. Not a protocol limit — Delta permits `protocol`+`metaData`+`add` in v0 — but an engineered-wood API-shape one: `StartTransaction` and `CommitDataFilesAsync` are both INSTANCE methods, so "a transaction that creates its table" is inexpressible |
-| 1.6 | **A plain `CREATE TABLE t AS SELECT …` over an EXISTING table is a SILENT NO-OP** — no error, no rows written, exit 0 — where DuckDB's own catalog raises *"Table with name t already exists!"*. So 1.5's orphan is not recoverable by re-running the statement, and a user who re-runs a CTAS believing it replaced the data gets the OLD data with no warning | MEASURED with a positive control: over a 10-row Delta table, `CREATE TABLE … AS SELECT range(2)` left **10 rows** and exit 0, while `CREATE TABLE memtbl AS SELECT 2` over DuckDB's own `memtbl` errored correctly. `CREATE OR REPLACE TABLE … AS SELECT` works (4 rows). **Root cause**: `FabricatorSchemaEntry::CreateTable` handles `REPLACE_ON_CONFLICT` (drops first) and `IGNORE_ON_CONFLICT` (forwards the flag) but **never checks `ERROR_ON_CONFLICT`**, so a plain CREATE is passed to the provider as an ordinary create and Delta's `OpenOrCreateAsync` just opens the existing table. In the SHARED C++ layer ⇒ **scope beyond Delta is UNVERIFIED** (SQL Server / DAX not tested). NOT FIXED |
-| 1.7 | **`CREATE TABLE IF NOT EXISTS t AS SELECT …` also leaves 1.5's empty table** — correct per its own semantics, but it means neither non-`REPLACE` spelling recovers | Follows from 1.6; the working recovery is `CREATE OR REPLACE` |
+| 1.6 | **`CREATE TABLE IF NOT EXISTS t AS SELECT …` leaves 1.5's empty table** — correct per its own semantics, but it means the `IF NOT EXISTS` spelling never recovers the orphan | The working recoveries are `CREATE OR REPLACE TABLE … AS SELECT` and a `DROP TABLE` + CREATE. A **plain** `CREATE TABLE … AS SELECT` no longer keeps the old data silently — it now ERRORS (see the note below), so it does not recover the orphan either, but it says so |
 
-**On 1.5/1.6 — what protects you today, and it is structural rather than luck.** Every REACHABLE failure fires
+**On 1.5 — what protects you today, and it is structural rather than luck.** Every REACHABLE failure fires
 BEFORE v0, because the Arrow→Delta **schema conversion is a precondition of the create** (`OpenOrCreateAsync` cannot
 be called without a Delta schema). Two measured, both leaving NO table behind: a `TIMESTAMP_NS` column and an
 `INTERVAL` column. What remains exposed is a failure of the DATA write or its commit — storage error, permission,
 disk full, network — which has no compensation. **That residue is reasoned, not measured**; injecting it was not
 attempted. A commit CONFLICT is handled properly by the retry loop.
+
+**⚠ The orphan is UNCONDITIONAL once v0 lands, and we do NOT compensate.** Both paths put the create outside
+the guarded region (autocommit's `OpenOrCreateAsync` precedes its `try`; the buffered flush's
+`DeltaWriter.Create` precedes its own) and both `finally` blocks only DISPOSE. Only a commit CONFLICT is
+handled, by retrying. `RollbackTransaction` reclaims DATA FILES and cannot help — `DiscardBufferedFiles`
+opens the table to do its work, so it presupposes the table exists. **A version-checked delete is not the
+fix**: measured 2026-08-04, deleting v0 under a concurrent v1 makes the table unreadable (*"Delta log is
+incomplete: version 0 is missing …"*), and deleting the whole FOLDER destroys the other writer's data
+irreversibly. ⚠ The objection is AUTHORITY, not atomicity — `DROP TABLE` is the same unconditional recursive
+folder delete and we ship it, so "a recursive delete can partially complete" rules nothing out. What separates
+them is consent: DROP destroys a table the USER NAMED, with the user present, and re-running it finishes a
+partial one; the compensation would infer destruction from a failure WE caused, with a third-party victim who
+ran only an `INSERT`. The safe primitive is deleting the files you WROTE by name (`DiscardDataFilesAsync`,
+which refuses anything a fresh log references) — that needs no authority beyond our own write — and it is
+available only after the write-files-first reordering, when the folder is not yet a table. Detail + the reorder's real scope: [delta-transactions.md](delta-transactions.md) §7.1.
+
+**FIXED 2026-08-04, and it was BROADER than the row that used to sit here — the shared C++ layer never
+checked `ERROR_ON_CONFLICT` at all.** A plain create reached the provider as an ordinary create, so
+`FabricatorSchemaEntry::CreateTable` handled `REPLACE_ON_CONFLICT` (drop first) and `IGNORE_ON_CONFLICT`
+(forward the flag) and passed everything else straight through. On Delta, `OpenOrCreateAsync` then simply
+OPENED the existing table, so **both** spellings succeeded while doing nothing:
+
+- `CREATE TABLE t AS SELECT …` — no rows written, exit 0, the OLD data kept. Measured with a positive
+  control: over a 10-row table, `… AS SELECT range(2)` left **10 rows**, while the same shape on DuckDB's
+  own catalog errored.
+- `CREATE TABLE t (a INTEGER, b VARCHAR)` — no error, and the **declared schema silently ignored** (the
+  table kept its original columns). This half was NOT in the original write-up; it surfaced only from
+  running both shapes rather than reasoning about the CTAS one.
+
+Now refused with DuckDB's own `CatalogException::EntryAlreadyExists`, so the message and its structured
+`ENTRY_ALREADY_EXISTS` extra-info match every other DuckDB catalog. `OR REPLACE` and `IF NOT EXISTS` are
+untouched. Gates `verify_delta_catalog_write` (+12, engine-doubled) and `verify_ctas_text_type` (+8),
+both mutation-tested.
+
+**⚠ THE MECHANISM IS NOT WHAT IT LOOKS LIKE, and the two symptoms have DIFFERENT OWNERS.** `PhysicalPlanGenerator::CreatePlan(LogicalCreateTable &)` (`duckdb/src/execution/physical_plan/plan_create_table.cpp:37`) probes for an existing entry and, when one is found and the conflict action is not REPLACE, routes the statement to a bare `PhysicalCreateTable` — **discarding the child plan, i.e. the SELECT.** Proven directly: `EXPLAIN CREATE TABLE IF NOT EXISTS m AS SELECT * FROM range(1000000)` over an existing table prints a physical plan of `CREATE_TABLE` alone, with no scan in it. So **"no rows written" was DuckDB's plan downgrade, not the provider swallowing a write** — the write was never planned. Only "no error" was ours: `PhysicalCreateTable` calls `schema.CreateTable(...)`, which is the check that was missing.
+
+Two consequences worth keeping. **`mode = Overwrite` was never even reached in the broken shape** — `overwrite = createTable || replace` (`DeltaCatalog.cs:2039`) lives on the `begin_bulk` path under `FabricatorPhysicalCreateTableAs`, and the downgrade bypasses that operator entirely; so it is not merely "correct given DuckDB should have rejected first", it is off the path. And **one check covers BOTH the plain CREATE and the CTAS** not by luck but by DuckDB's design: it delegates the conflict decision to the catalog and funnels both spellings into the operator that asks the catalog.
+
+**The scope question that row left open is now SETTLED, and the answer is not uniform.** SQL Server was
+never in the dangerous half — its own `CREATE TABLE` rejects a duplicate, so no write was ever lost there;
+the user simply got the raw provider error (`2714: There is already an object named …`), which reads as a
+SQL Server problem rather than an ordinary catalog conflict. It now reports the catalog error like Delta.
+**DAX is structurally exempt** — its provider refuses CREATE outright. So the silent data-keeping was
+Delta-only, while the confusing message was shared; one fix covers both.
+
+The existence oracle is `GetOrCreateEntry`, deliberately, not a bare `table_types_` lookup: a table can
+exist without being in the discovered name list, because an ATTACH `table_filter` bounds ENUMERATION only
+and that path fetches by name. Pinned by the gate creating its conflict against a table that exists on
+storage and has NOT been read through the attach.
 
 **Where concurrent writers DO work, measured** (each number from its own run — do not merge them):
 

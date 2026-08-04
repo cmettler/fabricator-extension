@@ -1569,18 +1569,45 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
       Delta schema). Measured: a `TIMESTAMP_NS` column and an `INTERVAL` column both refuse with NO table created.
       The residue is a DATA-write/commit failure (storage, permission, disk full, network), which has no
       compensation — `WriteAsync`'s `finally` only disposes; a commit CONFLICT is retried, other failures are not.
-    - **⚠ AND A SEPARATE, BIGGER BUG FOUND WHILE DOCUMENTING THIS (2026-08-04, NOT FIXED): a plain
-      `CREATE TABLE t AS SELECT` over an EXISTING table is a SILENT NO-OP** — no error, no rows written, exit 0 —
-      where DuckDB's own catalog raises *"Table with name t already exists!"*. Measured with a positive control
-      (10-row Delta table + a CTAS of 2 rows ⇒ still 10 rows; the same shape on DuckDB's own table errored).
-      `CREATE OR REPLACE TABLE … AS SELECT` works. So a user who re-runs a CTAS believing it replaced the data
-      keeps the OLD data silently, and the empty-table orphan is recoverable ONLY via `OR REPLACE` or a DROP.
-      **Root cause is in the SHARED C++ layer**: `FabricatorSchemaEntry::CreateTable` handles
-      `REPLACE_ON_CONFLICT` (drops first) and `IGNORE_ON_CONFLICT` (forwards the flag) but **never checks
-      `ERROR_ON_CONFLICT`**, so a plain CREATE reaches the provider as an ordinary create and Delta's
-      `OpenOrCreateAsync` just opens the existing table. ⚠ **Scope beyond Delta is UNVERIFIED** — SQL Server and
-      DAX share the path, untested. This also settles why `mode = Overwrite` for `createTable` is NOT itself the
-      bug: it is correct GIVEN that DuckDB was supposed to have rejected the conflict first.
+    - **⚠ A SEPARATE, BIGGER BUG WAS FOUND WHILE DOCUMENTING THIS AND IS NOW FIXED (2026-08-04): the shared
+      C++ layer NEVER CHECKED `ERROR_ON_CONFLICT`**, so a plain create reached the provider as an ordinary create
+      — `FabricatorSchemaEntry::CreateTable` handled `REPLACE_ON_CONFLICT` (drop first) and `IGNORE_ON_CONFLICT`
+      (forward the flag) and passed everything else through. On Delta, `OpenOrCreateAsync` then just OPENED the
+      existing table, so **two** shapes succeeded while doing nothing: `CREATE TABLE t AS SELECT` wrote no rows and
+      kept the OLD data (measured with a positive control — 10-row table + a CTAS of 2 rows ⇒ still 10 rows, exit 0;
+      the same shape on DuckDB's own table errored), and **`CREATE TABLE t (a INTEGER, b VARCHAR)` silently IGNORED
+      THE DECLARED SCHEMA**. ⚠ That second half was NOT in the original write-up — it surfaced only from running both
+      shapes instead of reasoning about the CTAS one, which is the same lesson as the mode-`Overwrite` correction
+      below. Now refused with DuckDB's own `CatalogException::EntryAlreadyExists`, so both the message and its
+      structured `ENTRY_ALREADY_EXISTS` extra-info match every other DuckDB catalog; `OR REPLACE` / `IF NOT EXISTS`
+      untouched. Gates `verify_delta_catalog_write` (+12, engine-doubled) + `verify_ctas_text_type` (+8), both
+      mutation-tested (the mutant dies at the first assertion with *"Query unexpectedly succeeded"*).
+      - **⚠ THE SCOPE QUESTION IS SETTLED AND THE ANSWER IS NOT UNIFORM** — this file previously recorded it as
+        UNVERIFIED. **SQL Server was never in the dangerous half**: its own `CREATE TABLE` rejects a duplicate, so
+        no write was ever lost; the user just got the raw provider error (`2714: There is already an object named
+        …`), which reads as a SQL Server problem rather than an ordinary catalog conflict. **DAX is structurally
+        exempt** (its provider refuses CREATE outright). So the silent data-keeping was Delta-ONLY while the
+        confusing message was SHARED — one fix covers both, and the gate spans both tiers because they share the
+        code path, not because they shared the symptom.
+      - The existence oracle is **`GetOrCreateEntry`, not a bare `table_types_` lookup**: a table can exist without
+        being in the discovered name list, because an ATTACH `table_filter` bounds ENUMERATION only and that path
+        fetches BY NAME. Pinned by making the gate's conflict against a table that exists on storage and has NOT
+        been read through the attach. It is also the call the successful create already makes, so the
+        materialization cost is paid only on the conflict path.
+      - **⚠ THE MECHANISM IS NOT WHAT IT LOOKS LIKE — the two symptoms have DIFFERENT OWNERS, and an earlier
+        write-up of this (mine) attributed both to Delta.** `PhysicalPlanGenerator::CreatePlan(LogicalCreateTable&)`
+        (`duckdb/src/execution/physical_plan/plan_create_table.cpp:37`) probes for an existing entry and, finding
+        one with a non-REPLACE conflict action, routes the statement to a bare `PhysicalCreateTable` — **DISCARDING
+        THE CHILD PLAN, i.e. the SELECT.** Proven directly rather than read: `EXPLAIN CREATE TABLE IF NOT EXISTS m
+        AS SELECT * FROM range(1000000)` over an existing table prints a physical plan of `CREATE_TABLE` ALONE,
+        no scan in it. So **"no rows written" was DuckDB's plan downgrade, not the provider swallowing a write** —
+        the write was never planned; only "no error" was ours.
+      - Two consequences. **`mode = Overwrite` was never REACHED in the broken shape**: `overwrite = createTable ||
+        replace` (`DeltaCatalog.cs:2039`) sits on the `begin_bulk` path under `FabricatorPhysicalCreateTableAs`, and
+        the downgrade bypasses that operator entirely — so it is not merely "correct given DuckDB should have
+        rejected the conflict first" (the weaker claim recorded here before), it is OFF THE PATH. And **one check
+        covers BOTH the plain CREATE and the CTAS** by DuckDB's design, not by luck: it delegates the conflict
+        decision to the catalog and funnels both spellings into the operator that asks the catalog.
     - **Not a protocol limit** — Delta permits `protocol`+`metaData`+`add` in v0 — but an EW API-shape one, and
       THREE doors are locked the same way: `StartTransaction` is an INSTANCE method needing `OpenAsync`,
       `CreateAsync` writes v0 at once, and `CommitDataFilesAsync` (whose `extraActions` could carry
@@ -1589,8 +1616,38 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     - **A cheap improvement that needs NO upstream change, NOT built:** reorder the autocommit CTAS to write the
       data files FIRST and create+commit after — the shape `TryStreamCreateFiles` already implements for the
       buffered path. A data-write failure would then precede any commit; the residual window shrinks to two
-      adjacent log writes. It does NOT reduce the version count, needs the host-query native writer, and is
-      non-partitioned-only today.
+      adjacent log writes. It does NOT reduce the version count and needs the host-query native writer.
+      - **⚠ THIS LINE USED TO SAY "and is non-partitioned-only today". THAT WAS WRONG** — the restriction is
+        `TryWriteStreamingCoreAsync`'s, NOT `TryStreamCreateFiles`', which partitions via `RunCopyPartitioned`
+        (one DuckDB `COPY … PARTITION_BY`). MEASURED: a buffered partitioned CTAS writes through DuckDB into a
+        Hive layout with `_delta_log` untouched until the flush, and a partitioned CTAS works on BOTH engines
+        today (`created_by` = `DuckDB version …` on `PROVIDER 'delta'`, `EngineeredWood` on the codec — the
+        `verify_delta_rename` technique). So the reorder would cover partitioned CTAS too; it is not a
+        simple-case-only mitigation, which makes it worth more than this note claimed. What it would NOT cover
+        is the CODEC provider (no DuckDB writer to stage with) ⇒ it would make the engines DIVERGE on failure
+        semantics where today they agree. Say so in the slice that takes it.
+    - **⚠ THE ORPHAN IS UNCONDITIONAL ONCE v0 LANDS AND WE DO NOT COMPENSATE — and a version-checked delete is
+      NOT the fix (measured 2026-08-04).** Both paths put the create OUTSIDE the guarded region and both
+      `finally` blocks only DISPOSE; only a commit CONFLICT is retried. `RollbackTransaction` cannot help — it
+      reclaims DATA FILES, and `DiscardBufferedFiles` OPENS the table to do so, presupposing it exists.
+      "Check the version, delete if still 0" races any writer committing v1 in the window (a plain INSERT from
+      another connection — `dbt --threads N` is a fleet of them — or a foreign engine): deleting just
+      `…0.json` leaves the table UNREADABLE (measured error names the missing version) though recoverable by
+      hand, while deleting the whole FOLDER destroys the other writer's data irreversibly AND is the worse
+      scope because a recursive delete is atomic on NO backend here (on S3 `DropTable` goes file-by-file), so
+      it can partially complete and leave a log referencing removed files. **⚠ BUT THE OBJECTION IS AUTHORITY,
+      NOT ATOMICITY, and the first draft of this note led with atomicity — which does not survive one
+      comparison: `DROP TABLE` is the SAME unconditional recursive folder delete** (`DeltaCatalog.DropTable` →
+      `HostFs.RemoveDir`, S3 per-file fallback swallowing per-object errors) **and we ship it.** The separator
+      is CONSENT: DROP destroys a table the USER NAMED with the user present, and re-running it finishes a
+      partial one (losing a concurrent writer's rows IS what DROP means — no Delta engine has a transactional
+      DROP); the compensation would infer destruction from a failure WE caused, on a path the user asked us to
+      CREATE, with a third-party victim who ran only an INSERT and nobody to notice. **The safe primitive is
+      deleting the files you WROTE by name** (`DiscardDataFilesAsync` refuses anything a FRESH log references —
+      needing no authority beyond our own write, which is the real reason it is acceptable) — and it is
+      legitimate only AFTER the reorder above, when the folder is not yet a table (nothing is discoverable at a
+      path with no `_delta_log`; a competing CREATE races on commit-0, a put-if-absent, not on our bytes).
+      Full record: [docs/delta-transactions.md](docs/delta-transactions.md) §7.1.
     - **⚠ Temp-name-then-rename does NOT fix the version count** (the temp table still gets v0 then v1) — it only
       hides both from readers of the final name. And it costs an O(bytes) commit on S3 (rename = ListObjectsV2 +
       CopyObject per key + DeleteObjects) and LOSES the conditional create: today two concurrent `CREATE TABLE t`

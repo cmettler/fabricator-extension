@@ -2877,6 +2877,33 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::CreateTable(CatalogTransaction
 
 	bool replace = base.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT;
 	bool if_not_exists = base.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT;
+
+	// A plain CREATE TABLE must REFUSE an existing name. DuckDB delegates that decision to the catalog, so
+	// with this check absent the create reached the provider as an ordinary create and each provider
+	// answered in its own way — SQL Server raised its own 2714 (loud, but a provider error rather than a
+	// catalog one), while the Delta provider's OpenOrCreateAsync simply OPENED the existing table, making
+	//     CREATE TABLE t AS SELECT …        -- no rows written, exit 0, the OLD data kept
+	//     CREATE TABLE t (a INT, b VARCHAR) -- no error, the DECLARED SCHEMA silently ignored
+	// succeed while doing nothing.
+	//
+	// Note WHY a CTAS reaches this function at all, because it is not obvious and it explains the missing
+	// rows: PhysicalPlanGenerator::CreatePlan(LogicalCreateTable &) probes for an existing entry and, on a
+	// hit with a non-REPLACE conflict action, plans a bare PhysicalCreateTable and DISCARDS THE CHILD PLAN
+	// (the SELECT). So "no rows written" was DuckDB's plan downgrade, not the provider swallowing a write —
+	// the write was never planned, and the begin_bulk path (where mode = Overwrite lives) is never entered
+	// in this shape. Only "no error" was ours. That same downgrade is why ONE check here covers both
+	// spellings. REPLACE (drops first) and IGNORE (forwarded to the provider) keep their own handling
+	// below, so only ERROR_ON_CONFLICT is decided here.
+	//
+	// GetOrCreateEntry is the existence oracle rather than a bare table_types_ lookup, because a table can
+	// exist without being in the discovered name list: an ATTACH `table_filter` bounds ENUMERATION only, and
+	// that path fetches by name. It costs nothing extra either way — the CreatePlan probe above resolves
+	// through this same function, so on the conflict path the entry is already cached, and a non-conflicting
+	// create pays only a table_types_ miss.
+	if (base.on_conflict == OnCreateConflict::ERROR_ON_CONFLICT && GetOrCreateEntry(context, base.table)) {
+		throw CatalogException::EntryAlreadyExists(CatalogType::TABLE_ENTRY, base.table);
+	}
+
 	if (replace) {
 		fabricator::DropTable(handle_, name, base.table, /*if_exists=*/true);
 	}

@@ -31,5 +31,44 @@ varchar	64
 statement ok
 DROP TABLE db.dbo.ctas_text_type_test;
 
+# A plain CREATE over an EXISTING table is refused by the CATALOG, with DuckDB's own message.
+# The shared C++ FabricatorSchemaEntry::CreateTable used not to check ERROR_ON_CONFLICT at all, so the
+# create reached the provider as an ordinary create. SQL Server was never in the DANGEROUS half of that
+# defect -- its own CREATE TABLE rejects a duplicate, so no data was ever lost here -- but the user got
+# the raw provider error ("2714: There is already an object named ..."), which reads as a SQL Server
+# problem rather than the ordinary catalog conflict every other DuckDB catalog reports. Asserted on this
+# tier because SQL Server SHARES the fixed code path with Delta, where the same gap silently discarded
+# the write; if the check is ever removed, both tiers say so.
+# Re-runnable: this tier's SQL Server database is SHARED and PERSISTENT, and a suite that aborts
+# mid-section (a real failure, or a mutation test) leaves its table behind — after which the CREATE below
+# hits the leftover and fails a `statement ok`, i.e. the suite reports a defect it does not have. Found
+# exactly that way: the mutant run aborted at the `statement error` and the next full tier run failed here.
+statement ok
+DROP TABLE IF EXISTS db.dbo.ctas_conflict;
+
+statement ok
+CREATE TABLE db.dbo.ctas_conflict AS SELECT * FROM range(5) v(id);
+
+statement error
+CREATE TABLE db.dbo.ctas_conflict AS SELECT * FROM range(2) v(id);
+----
+Table with name "ctas_conflict" already exists!
+
+query I
+SELECT count(*) FROM db.dbo.ctas_conflict;
+----
+5
+
+statement ok
+CREATE OR REPLACE TABLE db.dbo.ctas_conflict AS SELECT * FROM range(3) v(id);
+
+query I
+SELECT count(*) FROM db.dbo.ctas_conflict;
+----
+3
+
+statement ok
+DROP TABLE db.dbo.ctas_conflict;
+
 statement ok
 DETACH db;
