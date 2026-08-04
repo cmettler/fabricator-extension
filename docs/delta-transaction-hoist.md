@@ -257,10 +257,31 @@ Consequences, both of which matter beyond slice 1a:
    concurrency 93.
    - Value is honestly small (declarations already reach the same transaction), so this is a tidiness slice.
      Weigh it against slice 5, which is the one with user-visible consequence.
-5. **CREATE becomes immediate; `FlushCreateTransactionAsync` + `PendingCreate` deleted; best-effort drop
-   on rollback.** The behaviour-changing slice. Gate: the transactions suite WITH its rollback
-   assertions rewritten, plus a new assertion that a rollback of a created table leaves no table when
-   the drop succeeds and names the orphan when it does not.
+5. **CREATE becomes immediate; best-effort drop on rollback.** The behaviour-changing slice. Gate: the
+   transactions suite WITH its rollback assertions rewritten, plus a new assertion that a rollback of a
+   created table leaves no table when the drop succeeds and names the orphan when it does not.
+   - **⚠ ITS VALUE IS UNDERSTATED ABOVE, AND THE UNDERSTATEMENT MATTERS: slice 5 LIFTS TWO SHIPPED
+     REFUSALS.** Surveyed 2026-08-04 (17 `PendingCreate` sites). Because the table does not exist on
+     storage, `DeltaCatalog.cs:3092` and `:3184` throw **`NotSupportedException`** — *"DELETE/UPDATE on a
+     table created in the same transaction is not supported yet"* — so
+     `BEGIN; CREATE TABLE t AS SELECT …; DELETE FROM t WHERE …; COMMIT;` fails today. An immediate create
+     makes both ordinary DML. It also un-gates the **streaming native write** for such a table
+     (`tryStream` at `:2232` and `TryWriteStreamingCoreAsync` at `:3445` both bail on `PendingCreate`) and
+     lets the CDF capability probe run (`:2222`, which cannot probe a table that is not there). So this is
+     not "a cost we accepted for tidiness" — it is a capability slice whose PRICE is the accepted v0
+     visibility. Weigh it that way when deciding order.
+   - **⚠ `PendingCreate` must NOT be deleted — it CHANGES MEANING**, and that reframing is what makes the
+     slice safe. It currently means *"the create has not happened yet"*; afterwards it means *"this
+     transaction created this table"*, which ROLLBACK still needs in order to know what it may drop. So the
+     17 sites split in two, and each must be classified before it is touched:
+     - **(a) "not on storage yet" ⇒ delete or simplify:** `ScanPendingCreated` and its two callers
+       (`:1473`, `:1777`) — reads go through the normal path once the table exists; the write-path gates
+       (`:2222`, `:2232`, `:2278`, `:3445`); the DML refusals (`:3092`, `:3184`); and the DROP / RENAME /
+       ALTER special cases for an uncommitted table (`:3944`, `:4437`, `:4502`, `:4551`).
+     - **(b) "we created it" ⇒ keep:** the rollback drop, and `IF NOT EXISTS` (`:2779`).
+   - ⚠ **The two halves cannot land separately.** Making the create immediate WITHOUT the rollback drop
+     ships the regression with no mitigation, so §3's accepted trade only holds if both are in one commit —
+     which is also why the suite rewrite belongs to that same commit rather than a follow-up.
 
 ### 4.2 WHERE THE HOIST STANDS — the prize is banked, and the rest is smaller than the slicing implies
 
