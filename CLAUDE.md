@@ -562,6 +562,29 @@ current code still uses the single-provider `fabricator` naming):
 ## Next up (open threads for future sessions)
 
 In-flight / planned refactors (all C#-only unless noted; tests stay green per slice):
+- **TIMESTAMP BOUNDS FOR `fabricator_delta_changes` — AGREED, NOT BUILT (user, 2026-08-04). ⚠ C++-TOUCHING**
+  (two `TableFunction` overloads at `fabricator_extension.cpp:627`), so it needs the full rebuild, not just a
+  managed republish. Ours is `BIGINT`-only today — `(catalog, '<schema.>table', from [, to])` — while Delta's
+  `table_changes(table, start [, end])` accepts EITHER, and `table_changes_by_path` for a path. We already own
+  the machinery: `DeltaReader.ResolveVersionAsOf`, which `AT (TIMESTAMP => …)` uses.
+  - **⚠ DO NOT COPY DELTA'S DUAL-TYPING.** Verified in `DeltaTableValueFunctions.scala` at `v4.0.0`: ONE
+    argument position carries both meanings and the LITERAL'S TYPE selects (`toDeltaOption("starting", …)` →
+    integer/long ⇒ `startingVersion`, string/timestamp ⇒ `startingTimestamp`). So `table_changes('t', '0')`
+    means "since the epoch", not "since version 0" — a wrong answer with no error. Declare overloads on a real
+    `LogicalType::TIMESTAMP` (a quoted number then cannot drift in), or use named parameters, which we support
+    and their TVF grammar does not.
+  - `ChangesBind` currently encodes the bounds as a `"from:to"` STRING (`Abi.cs:349`), so it needs a marker
+    distinguishing version from timestamp bounds; resolve in C# with the SAME helper the AT clause uses so the
+    two surfaces cannot drift.
+  - **⚠ Pin the boundary semantics explicitly** — Delta's `startingTimestamp` means *the first version at or
+    after* that instant, and an off-by-one there is invisible in a small test. Gate in
+    `verify_delta_catalog_changes`: a timestamp bound returning the SAME rows as the equivalent version bound,
+    plus a bound before v0 and one after the last commit.
+  - Context for why it came up: a `cdc` action carries no `baseRowId`, which is why the row-identity gap in
+    [docs/delta-transaction-hoist.md](docs/delta-transaction-hoist.md) §6 is unrecoverable — but note that gap
+    is in `__delta_row_commit_version` (row identity, file-supplied), NOT in `_commit_version` (the feed's own
+    column, stamped by the reader from the version it replays). **Range filtering is therefore unaffected by
+    it**, and conflating the two is the easy mistake here.
 - **KEEP `README.md` IN SYNC — a standing rule, not a task (user, 2026-07-30).** `README.md` is the
   **user-facing** surface; this file and `docs/` are project memory (organised by the order things were built,
   dense with why-we-rejected-X, written for whoever maintains this next). **Whenever a change to CLAUDE.md or
