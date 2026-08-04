@@ -2589,8 +2589,14 @@ public sealed class DeltaCatalog : IBackendCatalog
                 {
                     FlushCreateTransaction(opener, kv.Key, txnId, pending);
                 }
+                // ⚠ `pending.HeldTxn is not null` REPLACED `pending.PendingCdc.Count > 0` (hoist 1b): CDF
+                // actions now go straight into the transaction at statement time, so the parked list is
+                // always empty and a CDF-ONLY statement (a buffered INSERT on a CDF table, which writes a
+                // cdc counterpart and nothing else) would fall through to the plain-append path below and
+                // LOSE its cdc actions with no error. The held transaction is the honest signal: it exists
+                // exactly when something staged into one.
                 else if (pending.DeletedByOrdinal.Count > 0 || pending.PendingMetadata is not null
-                         || pending.AppTxnVersions.Count > 0 || pending.PendingCdc.Count > 0
+                         || pending.AppTxnVersions.Count > 0 || pending.HeldTxn is not null
                          || pending.PendingIdentityHwm.Count > 0
                          || (pending.HasReads && pending.PinnedVersion is not null
                              && (pending.Files.Count > 0 || pending.Batches.Count > 0)
@@ -3343,39 +3349,56 @@ public sealed class DeltaCatalog : IBackendCatalog
                                IEnumerable<RecordBatch> rows, string changeType)
         => WriteCdcFilesAsync(opener, tablePath, pending, rows, changeType).GetAwaiter().GetResult();
 
-    private static async Task WriteCdcFilesAsync(nint opener, string tablePath, DeltaTxnBuffer.PendingAppends pending,
+    private async Task WriteCdcFilesAsync(nint opener, string tablePath, DeltaTxnBuffer.PendingAppends pending,
                                IEnumerable<RecordBatch> rows, string changeType)
     {
         // Cancel a slow buffered-statement CDC write on interrupt (opener fresh from the DML operator).
         using var interrupt = new InterruptScope(opener);
         var token = interrupt.Token;
-        // rows may be a STREAMING source (the DELETE read-back) — one batch in flight; the table is
-        // opened lazily on the first non-empty batch so an empty statement never touches storage.
-        EngineeredWood.DeltaLake.Table.DeltaTable? table = null;
-        try
+        // rows may be a STREAMING source (the DELETE read-back) — one batch in flight; the table and the
+        // transaction are obtained lazily on the first non-empty batch, so an empty statement still never
+        // touches storage. This is where the hoist pays for itself: the table used to be OPENED AND DISPOSED
+        // here, per buffered CDF statement, which cost one _delta_log LIST each time; now it is the pair's
+        // held table.
+        //
+        // StageChangeDataAsync writes the _change_data parquet IMMEDIATELY (eager capture is unchanged — the
+        // rows are in hand exactly here) and files the cdc actions into the transaction, replacing the parked
+        // pending.PendingCdc list. Sharing the held table is safe even though it carries the native
+        // data-file writer and this path used to pass DeltaWriter.Options(): CdfWriter.WriteAsync writes via
+        // fs.CreateAsync and never consults _options.DataFileWriter, so change files are EW-codec written
+        // either way.
+        EngineeredWood.DeltaLake.Table.DeltaTransaction? txn = null;
+        foreach (var b in rows)
         {
-            foreach (var b in rows)
+            if (b.Length == 0)
             {
-                if (b.Length == 0)
-                {
-                    continue;
-                }
-                table ??= await EngineeredWood.DeltaLake.Table.DeltaTable
-                    .OpenAsync(TableFileSystems.Create(opener, tablePath), DeltaWriter.Options(), token)
-                    .ConfigureAwait(false);
-                pending.PendingCdc.AddRange(await table
-                    .WriteChangeDataFilesAsync(VariantTransport.ToCanonical(b), changeType, token)
-                    .ConfigureAwait(false));
+                continue;
             }
-        }
-        finally
-        {
-            if (table is not null)
+            if (txn is null)
             {
-                await table.DisposeAsync().ConfigureAwait(false);
+                var table = await EnsureHeldTableAsync(opener, tablePath, pending, token).ConfigureAwait(false);
+                pending.PinnedVersion ??= table.CurrentSnapshot.Version;
+                var pinnedSnap = await ResolvePinnedSnapshotAsync(
+                    table, pending.PinnedVersion.Value, token).ConfigureAwait(false);
+                txn = EnsureHeldTxn(pending, table, pinnedSnap, PendingSerializable(pending, tablePath));
             }
+            await txn.StageChangeDataAsync(VariantTransport.ToCanonical(b), changeType, token)
+                .ConfigureAwait(false);
         }
     }
+
+    /// <summary>
+    /// The snapshot a buffered transaction's work was computed against: deletion-vector positions are keyed by
+    /// ITS path-sorted file ordinals and ALTERs are chained against ITS metadata. Resolved explicitly rather
+    /// than taken from <c>CurrentSnapshot</c>, which a concurrent writer may have advanced — and against which
+    /// the commit's validation would be vacuous.
+    /// </summary>
+    private static async Task<EngineeredWood.DeltaLake.Snapshot.Snapshot> ResolvePinnedSnapshotAsync(
+        EngineeredWood.DeltaLake.Table.DeltaTable table, long pinned,
+        System.Threading.CancellationToken token)
+        => table.CurrentSnapshot.Version == pinned
+            ? table.CurrentSnapshot
+            : await table.GetSnapshotAtVersionAsync(pinned, token).ConfigureAwait(false);
 
     // Streams the read-back, disposing each source batch once the consumer has moved past it
     // (the finally runs when the consumer pulls the next item; enumerator disposal covers early
@@ -3602,9 +3625,7 @@ public sealed class DeltaCatalog : IBackendCatalog
             // by ITS path-sorted file ordinals, ALTERs chained against ITS metadata. Resolve it explicitly
             // (a concurrent writer may have advanced the table) — the rebase check below decides whether
             // committing on top of the newer snapshot is safe.
-            var pinnedSnap = table.CurrentSnapshot.Version == pinned
-                ? table.CurrentSnapshot
-                : await table.GetSnapshotAtVersionAsync(pinned, token).ConfigureAwait(false);
+            var pinnedSnap = await ResolvePinnedSnapshotAsync(table, pinned, token).ConfigureAwait(false);
             var files = new List<EngineeredWood.DeltaLake.Table.WrittenDataFile>(pending.Files);
             if (pending.Batches.Count > 0)
             {
@@ -3740,11 +3761,11 @@ public sealed class DeltaCatalog : IBackendCatalog
             {
                 baseExtra.Add(meta);
             }
-            // slice C2: the eagerly-written _change_data files join the fused commit (cdc actions carry
-            // DataChange=false — concurrent readers' dataChange checks ignore them; rebase safety: if the
-            // rebase passes, delete-delete/deleteRead already guaranteed our touched files are unchanged,
-            // so the captured CDC content stays exact).
-            baseExtra.AddRange(pending.PendingCdc);
+            // slice C2 + hoist 1b: the eagerly-written _change_data files are ALREADY in this transaction —
+            // WriteCdcFilesAsync staged them at statement time via StageChangeDataAsync, so there is no
+            // parked list to append here. (cdc actions carry DataChange=false — concurrent readers'
+            // dataChange checks ignore them; rebase safety: if the rebase passes, delete-delete/deleteRead
+            // already guaranteed our touched files are unchanged, so the captured CDC content stays exact.)
             if (baseExtra.Count > 0)
             {
                 txn.StageActions(baseExtra);
