@@ -176,7 +176,7 @@ case "$TIER" in
         # assertions, not 6 (I counted the statements I had added instead of running the suite before changing
         # it), so a floor of 1467 tripped the tripwire on a perfectly green 44/44 run and cost a re-run to
         # explain. Measure the BEFORE count while you still can, or take the floor from a green tier run.
-        : "${MIN_ASSERTIONS:=1465}"
+        : "${MIN_ASSERTIONS:=1477}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

@@ -142,6 +142,37 @@ INSERT INTO s3lake.main.t VALUES (99, 'doomed', 0.0);
 statement ok
 ROLLBACK;
 
+# ROLLBACK of a table CREATED in the transaction, ON AN OBJECT STORE (hoist slice 5). The create is
+# immediate now, so the rollback performs a real recursive delete — and on s3 that means httpfs'
+# RemoveDirectory FAILS its own per-file remove ("URL needs to start with s3://") and the provider-side
+# per-file fallback is what actually removes the objects. That fallback is reachable only from a real
+# object store, so this is the one place the remote half of the rollback drop can be observed at all:
+# the hermetic tier exercises a local root, where RemoveDirectory simply works.
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE s3lake.main.rbdrop AS SELECT i AS id FROM range(1, 51) r(i);
+
+# POSITIVE CONTROL: the table really is on the store mid-transaction, so the 0 below measures a deletion
+# rather than a prefix that never existed (a glob on a missing prefix also returns 0).
+query I
+SELECT count(*) > 0 FROM glob('s3://fabricator/lake/rbdrop/**');
+----
+true
+
+statement ok
+ROLLBACK;
+
+statement error
+SELECT id FROM s3lake.main.rbdrop;
+----
+
+query I
+SELECT count(*) FROM glob('s3://fabricator/lake/rbdrop/**');
+----
+0
+
 query I
 SELECT count(*) FROM s3lake.main.t;
 ----
