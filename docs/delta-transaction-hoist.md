@@ -417,6 +417,32 @@ in that one signature: omitting `rowIds` silently yields NULL ids with no error 
 pre-image**, so the pre-image call must pass the version each row was last changed in, which is what a
 `DeltaRowMetadata.RowTracking` read reports. Not built; it is a fidelity fix with its own gate, deliberately
 not folded into a slice whose claim is behaviour preservation.
+**⚠ WHO CAN ACTUALLY SEE THIS — verified 2026-08-04, and the answer LOWERS the priority.** Two questions
+were open: does Spark compute the identity from `baseRowId` when our column is NULL, and does it surface the
+column at all. Both now answered, and they point opposite ways:
+
+- **Spark CANNOT recover it — there is nothing to recover from.** A `cdc` action carries only
+  `path` / `partitionValues` / `size` / `dataChange` / `tags` (`Actions/CdcFile.cs`) — **no `baseRowId`, no
+  `defaultRowCommitVersion`**. Inference works only because it reads the DATA file through its `AddFile`,
+  which has both (`add.BaseRowId + position`). So once a change file exists for a version, that file is the
+  ONLY carrier of identity, and a NULL there is unrecoverable rather than merely absent. This is the reason
+  the fix has no cheap alternative.
+- **But Delta does not EXPOSE the column, so no Spark consumer sees the NULL today.** From
+  `CDCReader.scala` at `v4.0.0`: `cdcReadSchema(deltaSchema)` is the LOGICAL schema plus exactly
+  `_change_type`, `_commit_version`, `_commit_timestamp`. The materialized row-tracking columns are hidden
+  physical columns named through the configuration keys — deliberately not logical schema fields — so they
+  cannot arrive that way, and the file has no `_metadata` handling either.
+  ⚠ Scope of that check: ONE file at ONE tag, read for absence. It is good evidence, not a proof that no
+  Databricks or future path projects them; a live `table_changes()` on a row-tracking + CDF table would settle
+  it outright and has NOT been run.
+
+⇒ **The defect is REAL in the bytes and currently LATENT in every shipping consumer**: Spark's
+`table_changes()` does not project identity, and neither does our own `fabricator_delta_changes`. Note the
+irony — EW's `CdfReader` *can* emit them (`EmitRowTracking` / `EmittedRowIdName`) and `StageChangeDataAsync`
+*can* accept them, so the capability exists at both ends and nothing in between asks. It becomes observable
+the moment anyone projects identity on a change feed, which is also when the wrong bytes would be believed.
+So: fix it, but as a fidelity task, not as a live-impact one — and do NOT describe it as user-visible today.
+
 - ⚠ **Any gate for it must assert the PARQUET, not the SQL.** `fabricator_delta_changes` projects only
   `id, val, _change_type, _commit_version, _commit_timestamp` — no identity column — so a SQL-level
   assertion cannot see the bug or its fix. Read `__delta_row_id` out of `_change_data/*.parquet` with
