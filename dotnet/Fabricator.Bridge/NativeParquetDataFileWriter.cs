@@ -66,6 +66,14 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
             // ArrowAppender crashes on a nested extension type. Applied to the PEEKED batch too, because its
             // schema is what the COPY is built from — converting only the stream would describe the file with
             // a variant struct and then feed it blobs.
+            //
+            // ⚠ This depends on EW's `EmitVariantLogicalType` staying TRUE (its default; nothing of ours sets
+            // it). With it FALSE, EW's own StripAnnotation runs BEFORE the writer branch and flattens the
+            // VariantArray to a bare struct<metadata,value>, which is then indistinguishable from an ordinary
+            // struct — so this conversion would silently not fire and the COPY would write a struct column
+            // instead of a parquet VARIANT. Detecting that needs the DELTA schema, which is exactly the
+            // four-layout problem the Bridge-side conversion exists to avoid; so if that option is ever set,
+            // the fix is to pass the target's Delta schema in here, not to guess from the Arrow type.
             first = VariantTransport.ToTransport(e.Current);
         }
         catch

@@ -193,7 +193,9 @@ public static class ExternalTableRouting
         try
         {
             var schema = DeltaReader.GetSchema(AmbientOpener.Current, tableUri);
-            var ew = EngineeredWood.DeltaLake.Schema.SchemaConverter.FromArrowSchema(schema);
+            // GetSchema returns the TRANSPORT dialect (it is a bind schema) — canonicalise for EW's converter.
+            var ew = EngineeredWood.DeltaLake.Schema.SchemaConverter.FromArrowSchema(
+                VariantMarker.ToCanonicalSchema(schema));
             foreach (var f in ew.Fields)
             {
                 if (EngineeredWood.DeltaLake.Schema.IdentityColumn.GetConfig(f) is not null)

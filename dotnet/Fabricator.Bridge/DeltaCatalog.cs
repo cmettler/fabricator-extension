@@ -1660,7 +1660,10 @@ public sealed class DeltaCatalog : IBackendCatalog
             // same log-authoritative rule the committed native reader applies; paths never parsed).
             var partCols = pending.CreatePartitionColumns ?? (IReadOnlyList<string>)System.Array.Empty<string>();
             var deltaSchema = pending.PendingDeltaSchema
-                ?? EngineeredWood.DeltaLake.Schema.SchemaConverter.FromArrowSchema(pending.PendingArrowSchema!);
+                // PendingArrowSchema is the TRANSPORT dialect (it serves bind schemas) — canonicalise before
+                // handing it to EW's converter, which knows only the canonical VariantType.
+                ?? EngineeredWood.DeltaLake.Schema.SchemaConverter.FromArrowSchema(
+                       VariantMarker.ToCanonicalSchema(pending.PendingArrowSchema!));
             var logToPhys = pending.PendingDeltaSchema is { } m0
                 ? EngineeredWood.DeltaLake.Schema.ColumnMapping.BuildLogicalToPhysicalMap(m0, _columnMappingMode)
                 : null;
@@ -2274,7 +2277,8 @@ public sealed class DeltaCatalog : IBackendCatalog
                 // + bakes the final marks into commit-0.
                 if (pending.PendingCreate && pending.PendingArrowSchema is { } pcArrow)
                 {
-                    var pcDelta = EngineeredWood.DeltaLake.Schema.SchemaConverter.FromArrowSchema(pcArrow);
+                    var pcDelta = EngineeredWood.DeltaLake.Schema.SchemaConverter.FromArrowSchema(
+                        VariantMarker.ToCanonicalSchema(pcArrow));
                     bool hasIdentity = false;
                     foreach (var pf in pcDelta.Fields)
                     {
@@ -3349,7 +3353,8 @@ public sealed class DeltaCatalog : IBackendCatalog
                 table ??= await EngineeredWood.DeltaLake.Table.DeltaTable
                     .OpenAsync(TableFileSystems.Create(opener, tablePath), DeltaWriter.Options(), token)
                     .ConfigureAwait(false);
-                pending.PendingCdc.AddRange(await table.WriteChangeDataFilesAsync(b, changeType, token)
+                pending.PendingCdc.AddRange(await table
+                    .WriteChangeDataFilesAsync(VariantTransport.ToCanonical(b), changeType, token)
                     .ConfigureAwait(false));
             }
         }
@@ -3446,7 +3451,8 @@ public sealed class DeltaCatalog : IBackendCatalog
             }
             DeltaNullability.ValidateBatches(toWrite,
                 pending.PendingDeltaSchema ?? table.CurrentSnapshot.Schema, tableName);
-            pending.Files.AddRange(await table.WriteDataFilesAsync(toWrite, token,
+            pending.Files.AddRange(await table.WriteDataFilesAsync(
+                    VariantTransport.ToCanonical(toWrite), token,
                     schemaOverride: pending.PendingDeltaSchema,
                     identityValuesPreGenerated: identity,
                     materializedRowIds: materializedRowIds)
@@ -3522,7 +3528,8 @@ public sealed class DeltaCatalog : IBackendCatalog
                     // identityValuesPreGenerated: the batches carry values generated at statement time
                     // against the chained marks; regenerating here (the committing writer's default)
                     // would double-consume the mark and diverge from read-your-writes.
-                    all.AddRange(await t2.WriteDataFilesAsync(pending.Batches, token,
+                    all.AddRange(await t2.WriteDataFilesAsync(
+                            VariantTransport.ToCanonical(pending.Batches), token,
                             identityValuesPreGenerated: pending.PendingIdentityHwm.Count > 0)
                         .ConfigureAwait(false));
                 }
@@ -3594,7 +3601,8 @@ public sealed class DeltaCatalog : IBackendCatalog
                 DeltaNullability.ValidateBatches(pending.Batches,
                     pending.PendingDeltaSchema ?? pinnedSnap.Schema,
                     tablePath.Substring(tablePath.LastIndexOf('/') + 1));
-                files.AddRange(await table.WriteDataFilesAsync(pending.Batches, token,
+                files.AddRange(await table.WriteDataFilesAsync(
+                        VariantTransport.ToCanonical(pending.Batches), token,
                         schemaOverride: pending.PendingDeltaSchema)
                     .ConfigureAwait(false));
             }
@@ -4364,6 +4372,13 @@ public sealed class DeltaCatalog : IBackendCatalog
 
     public void AlterTable(int k, string s, string t, string? a1, string? a2, Field? c, int f)
     {
+        // VARIANT: `c` arrives from the C ABI in TRANSPORT form (a BINARY field carrying the
+        // ew.variant_transport marker), and every consumer of it below hands it to engineered-wood. Convert
+        // once, here, at the boundary. This is the path the variant suite pins for ADD COLUMN: the marker is
+        // the ONLY discriminator (the transport is a leaf binary, so the storage type cannot carry it), and a
+        // field that reaches EW unconverted records Delta `binary` FOREVER — a metaData commit is not
+        // revisable, and the failure would surface far away as an insert that cannot convert VARIANT to BLOB.
+        c = c is null ? null : VariantMarker.ToCanonicalField(c);
         // Explicit transaction (slice 3): schema-evolution ALTERs buffer — the metaData (+ protocol)
         // action fuses into the transaction's ONE commit; reads/binds overlay the pending schema; ROLLBACK
         // discards it. Buffered kinds: ADD/RENAME/DROP COLUMN + nested ADD/DROP FIELD. Nested RENAME FIELD

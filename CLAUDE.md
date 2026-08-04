@@ -1,4 +1,4 @@
-# CLAUDE.md — project knowledge for `fabricator`
+﻿# CLAUDE.md — project knowledge for `fabricator`
 
 > Canonical project memory. Maintained in the repo (not in per-user agent memory) so it's
 > easy to edit and shared across machines. Keep this current as the implementation evolves.
@@ -69,44 +69,73 @@ Full record (moved verbatim from here): [docs/ew-master-migration.md](docs/ew-ma
 
 Goal: run on **ORIGINAL upstream engineered-wood** with our needs met by high-probability PRs; maintain our own only
 if that is impossible, and then **make our amendments clear IN THE CODE**.
-- **THE VARIANT TRANSPORT CAN LEAVE EW — VERIFIED 2026-08-04 (3 checks, one compile-proven), which supersedes an
-  earlier note here saying zero-patch was "gated on DuckDB #24157".** 392 of the 649 lines (60%) are the transport,
-  and it is OURS-BY-DESIGN (never offer it) — but it does not have to live in EW. The patch **replaces** upstream's
-  `VariantColumnCoercion.Coerce` instead of running after it, which is why it must normalise FOUR layouts
-  (canonical / shredded / bare struct from an unannotated file / seam blob) keyed off the Delta schema. Let `Coerce`
-  run unpatched and convert **canonical ⇄ blob in the BRIDGE at the DuckDB boundary** — one layout each way. The
-  C-interface crash is irrelevant: EW hands us in-process .NET objects, so we can hold a canonical `VariantArray`
-  and flatten it only on export. Checks: ONE read exit (`DeltaTable.cs:7796`; CDF never touches variant handling);
-  the Bridge can convert BOTH ways (compile-proven — `Apache.Arrow.Scalars.Variant` types + `VariantShredding`,
-  which is EW's but `public static` and transitively referenced; ⚠ the `ArrowArrayFactory` collision that file warns
-  about does NOT apply to the Bridge); and all four write sites are documented "no-op for canonical input" so they
-  can be deleted. ⇒ **target is ZERO EW patch, not "variant transport only", and it does NOT wait on DuckDB.**
-  - **READ HALF DONE (2026-08-04): patch set 649 → 469.** `Fabricator.Bridge/VariantTransport.cs` owns
-    canonical⇄blob and applies it at **THREE** boundaries — the 5 `DeltaReader` read exits (canonical→blob), the
-    native-read seam (blob→canonical), and **`NativeParquetDataFileWriter`** (canonical→blob). ⚠ **The third was
-    not in the plan; the variant suite caught it** at the OPTIMIZE section — the native writer feeds DuckDB's
-    `COPY`, so it needs flattening too, **including the PEEKED batch whose schema builds the COPY** (converting
-    only the stream would describe the file with a variant struct and then feed it blobs). Removed from EW:
-    `ToTransportBlobs`, the `VariantTransportBlob` flag, and the read branch (now upstream's single
-    `VariantColumnCoercion.Coerce` line, byte-identical). `VariantTransport.cs` 322 → 163. EW Table.Tests
-    872 → **871** × both TFMs (one read-direction test deleted; the shredding round-trip ADAPTED to read back
-    canonically rather than deleted — its subject is still EW's). Gates: hermetic **63/63 — 5686**, variant 157.
-  - **WRITE HALF STILL IN EW (~213 lines: `ToVariantArrays` 163 + `SchemaConverter` 50).**
-    ⚠ **Worse failure mode than the read half:** without the `SchemaConverter` patch, a blob that slips through
-    maps to Delta **`binary`** — a CREATE/CTAS would record the wrong type durably and SILENTLY (an INSERT into an
-    existing variant table would more likely error).
-    - **⚠ THE INGEST-FUNNEL DESIGN WAS BUILT AND REVERTED (2026-08-04) — do not retry it.** Canonicalising once at
-      `BulkInsert` looks right (its comment says *"EVERY write … passes exactly once"*) but **that stream has TWO
-      SINKS WITH OPPOSITE NEEDS**: the codec path wants CANONICAL, while `native_write` hands the SAME stream back
-      to DuckDB's `COPY` (`DeltaWriter.TryStreamCreateFiles`) which needs the TRANSPORT blob. Symptom:
-      `complete_bulk failed: … INTERNAL Error: Attempted to access index 2 within vector of size 2` — the COPY, and
-      nothing naming variants. Second confirmation: the txn buffer holds **two dialects** on purpose
-      (`PendingArrowSchema` TRANSPORT for binds, `BatchSchema` matching the batches), so the funnel needed FOUR
-      compensating conversions (`:2172`, `:2188`, the UPDATE's `userSchema`, the immediate create) — needing that
-      many to keep one funnel honest is the signal it is in the wrong place. **⇒ retry at the ~13 EW CALL SITES**
-      (`DeltaWriter.Write` ×3, `Create` ×2, `WriteDataFilesAsync` ×4, `WriteChangeDataFilesAsync`,
-      `StageChangeDataAsync` ×2, `table.WriteAsync`, `ExternalTableRouting`), each converting only what it hands
-      EW so no dialect elsewhere moves. Reverted whole; variant suite re-verified at 157.
+- **THE VARIANT TRANSPORT HAS LEFT EW — DONE 2026-08-04, BOTH DIRECTIONS. Patch set 867 → **221 insertions
+  across 4 files**, with ZERO variant divergence.** It was 60% of the patch and is OURS-BY-DESIGN (never offer
+  it) — it just did not have to live in EW. The patch **replaced** upstream's `VariantColumnCoercion.Coerce`
+  instead of running after it, which is why it had to normalise FOUR layouts (canonical / shredded / bare struct
+  from an unannotated file / seam blob) keyed off the Delta schema. Letting `Coerce` run UNPATCHED and converting
+  **canonical ⇄ blob in the BRIDGE** is one layout each way, detected by Arrow TYPE rather than by consulting the
+  Delta schema. The C-interface crash never applied at that seam: EW hands us in-process .NET objects, so we hold
+  a canonical `VariantArray` and flatten only on export. **This also supersedes an earlier note saying zero-patch
+  was "gated on DuckDB #24157" — it never was.** What remains in EW: `ConflictChecker` 42 (offer-ready),
+  `DeltaTable` 183, `DeltaTransaction` 26, `DeltaFilePruner` 4.
+  - **READ half:** `Fabricator.Bridge/VariantTransport.cs` owns canonical⇄blob at **THREE** boundaries — the 5
+    `DeltaReader` read exits (canonical→blob), the native-read seam (blob→canonical), and
+    **`NativeParquetDataFileWriter`** (canonical→blob). ⚠ **The third was not in the plan; the variant suite
+    caught it** at the OPTIMIZE section — the native writer feeds DuckDB's `COPY`, so it needs flattening too,
+    **including the PEEKED batch whose schema builds the COPY** (converting only the stream would describe the
+    file with a variant struct and then feed it blobs).
+  - **WRITE half:** new `VariantMarker.ToCanonicalSchema`/`ToCanonicalField` + a list overload of
+    `ToCanonical`. **Three FUNNELS** (`DeltaWriter.WriteAsync` schema+batches — which also covers the
+    `OverwritePartitions`/`DynamicOverwrite`/`WriteAsync` trio inside it; `DeltaWriter.CreateAsync` schema;
+    `DeltaCatalog.AlterTable`'s `Field?`, covering ADD COLUMN/FIELD buffered *and* immediate) plus per-site
+    conversions for the CDF/`WriteDataFiles`/`UpdateRows`/`StageChangeData` calls, and **SCHEMA-ONLY** conversion
+    where the STREAM must stay transport for DuckDB's COPY (`TryStreamCreateFiles`, `TryWriteStreamingCoreAsync`,
+    the four `FromArrowSchema` calls).
+    - **⚠ ONE funnel is right at `DeltaWriter.WriteAsync` and was WRONG at `BulkInsert`** — the difference is
+      SINK COUNT, not depth. `WriteAsync` has one sink: its `native_write` variant reaches DuckDB's COPY
+      *through* EW (`NativeParquetDataFileWriter` flattens back itself). **The ingest-funnel design was built and
+      REVERTED — do not retry it**: that stream has TWO sinks with opposite needs (codec wants canonical,
+      `native_write` hands the SAME stream back to `COPY` via `TryStreamCreateFiles`, wanting the blob). Symptom
+      `complete_bulk failed: … INTERNAL Error: Attempted to access index 2 within vector of size 2` — the COPY,
+      naming neither variants nor EW. It needed FOUR compensating conversions; needing that many to keep one
+      funnel honest is the signal it is in the wrong place.
+    - **⚠ THE 13-SITE ENUMERATION IN THE PLAN WAS INCOMPLETE, and the missed ones were the dangerous kind.** A
+      grep of the CALLEE side (`OpenOrCreateAsync|SetSchemaAsync|AddColumnAsync|AddFieldAsync|ComputeAdd*|
+      MergeSchemaAsync|Write*Async|Stage*Async|UpdateRowsAsync|ToDeltaField`) found **four more**: the STREAMING
+      native-write path's `OpenOrCreateAsync` and its **two** `SetSchemaAsync(data.Schema)`, plus the
+      copy-on-write `UpdateRowsAsync`. Three of the four hand EW a SCHEMA — the durable-corruption class below.
+      **Enumerate by grepping the callee, never by listing call sites from memory.**
+    - **⚠ The failure mode, restated because it is the worst in the variant surface:** with the `SchemaConverter`
+      patch gone, a transport-marked field reaching EW maps to Delta **`binary`**, and a `metaData` commit is not
+      revisable — a CREATE/CTAS/ADD COLUMN would record the wrong type DURABLY and SILENTLY, surfacing far away
+      as an insert that cannot convert VARIANT to BLOB.
+    - **⚠ The green intermediate CANNOT prove completeness** (the EW patch is still there to cover a missed
+      site) — it separates "my conversions are right" from "the deletion broke something". Only the
+      patch-removed run tests completeness. Both were run: variant **157** each time.
+    - **⚠ Each of the four EW codec sites carried a SECOND `StripAnnotation`** that existed ONLY to undo the
+      annotation `ToVariantArrays` re-introduced (upstream already strips on `physicalBatch` before the writer
+      branch). The revert deletes both lines. **Read the surrounding upstream hunk, not just the line you added.**
+    - **⚠ Latent, noted in `NativeParquetDataFileWriter`:** the canonical→transport conversion assumes
+      `EmitVariantLogicalType` stays TRUE (its default; nothing of ours sets it). With it FALSE, EW's own
+      `StripAnnotation` flattens the `VariantArray` to a bare struct BEFORE our writer sees it — indistinguishable
+      from an ordinary struct — so the conversion would silently not fire and the COPY would write a struct
+      instead of a parquet VARIANT. Unreachable today; the fix would be to pass the Delta schema in.
+    - **One site the plan listed that must NOT be converted:** `ExternalTableRouting.cs`'s `Materialize(data)` —
+      its batches go back INTO `DeltaCatalog.ExecuteUpdate`, the same dialect boundary as the C ABI. Only that
+      file's `FromArrowSchema` needed the wrap.
+  - ⚠ **The marker string is still `ew.variant_transport`, and the name now LIES** — engineered-wood knows
+    nothing about it; the constant is `VariantMarker.ExtensionName`, ours alone. Renaming it is safe in principle
+    (it is an in-memory discriminator that never persists — the Delta schema records `variant` and the parquet
+    file carries the canonical annotation) but it must change in LOCKSTEP with the C++ ArrowTypeExtension
+    registration in `src/fabricator/fabricator_variant.cpp`, so it is a C++-touching rename, deliberately not
+    bundled into this pass.
+  - Gates: EW Table.Tests **868 × {net10.0, net8.0, net472}** (871 − exactly the 3 deleted transport tests; the
+    one whose SUBJECT is EW's — shred-on-write/reassemble-on-read — is already covered by upstream's own
+    `Interop/VariantShreddingInteropTests`, so adapting it would have duplicated upstream rather than preserved
+    ours), hermetic **63/63 — 5686** AND service **44/44 — 1458**, both byte-identical to baseline, variant **157**. ⚠ Runtime cost is one extra
+    materialisation per batch on variant tables — UNMEASURED; and the live Spark/kernel round trip has NOT been
+    re-run since.
 - **Sequencing: offering and building are NOT sequential** — the branch model does both, proved by the 2026-08-02
   bump (three of eight upstream commits were our own offers coming back re-cut). Stay on `fabricator-patches` and
   keep building. **Pull ONE thing forward: MARK the amendments** (`// [FABRICATOR-PATCH: OFFER-READY | OFFERED #n |
@@ -132,9 +161,9 @@ merge-upstream-into-fabricator-patches + re-pin. **⚠ That upstream branch is n
 `upstream/main`, NOT `master`** — upstream renamed it (`8caf8d8`) and the stale `upstream/master`
 remote-tracking ref still resolves, so a merge of it silently lands on an abandoned branch.
 **Current pin: `d9d204b`** (the 2026-08-02 bump, the `MetadataPredicate` removal, and upstream #52+#53,
-§THE 2026-08-02 BUMP below). **Patch set MEASURED 2026-08-03: +649 / −44 lines across 8 files**, of which the
-variant transport is now ~60% (`VariantTransport.cs` 322 + `SchemaConverter` 47 + `DeltaTableOptions` 15 +
-csproj 5) and `DeltaTable.cs` 229 changed lines the other block.
+§THE 2026-08-02 BUMP below). **Patch set MEASURED 2026-08-04: +221 / −34 lines across FOUR files** —
+`DeltaTable.cs` 183, `ConflictChecker` 42, `DeltaTransaction` 26, `DeltaFilePruner` 4. (It was +867 across 8 on
+2026-08-03; the variant transport was ~60% of that and has since left entirely — §THE UPSTREAM STRATEGY.)
 - **⚠ THE MERGE-ON-READ UPDATE LEFT EW (2026-08-03) — the audit's "DO NOT MOVE IT TO THE BRIDGE" verdict was
   WRONG and is reversed. Full record: [docs/ew-master-migration.md](docs/ew-master-migration.md) §THE
   `*BySelection*` QUESTION.** `UpdateBySelectionViaVectorsAsync` + `BuildInlineDeletionVectorsAsync` (218 lines)

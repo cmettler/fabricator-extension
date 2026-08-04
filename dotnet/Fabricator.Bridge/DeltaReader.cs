@@ -2310,8 +2310,11 @@ internal static class DeltaReader
                 // we re-key the updates batch onto engineered-wood's `_metadata` struct, so nothing of ours
                 // depends on its rowid UPDATE surface. The packing stays where it belongs — on the DuckDB side
                 // of this method, because DuckDB's own rowid is a single BIGINT.
+                // VARIANT: the re-key passes the SET value columns through unchanged, so it works in either
+                // dialect — but what it RETURNS goes to engineered-wood, hence canonical.
                 await table.UpdateRowsAsync(
-                        ReKeyUpdatesOntoMetadata(table, updates), cancellationToken: token)
+                        VariantTransport.ToCanonical(ReKeyUpdatesOntoMetadata(table, updates)),
+                        cancellationToken: token)
                     .ConfigureAwait(false);
             }
             DmlLog.LogInformation("delta update-rewrite {Path}: rowids={RowIds} mode={Mode} writer={Writer}",
@@ -2601,7 +2604,14 @@ internal static class DeltaReader
         // Post-images become data files NOW (invisible until a commit references them), carrying the original
         // ids. An abort therefore leaves them as orphans for VACUUM — the same eager-write contract the
         // buffered path documents.
-        var written = await table.WriteDataFilesAsync(postImages, token, materializedRowIds: stableIds)
+        // VARIANT: everything from here down hands batches to engineered-wood (the data files and the CDF
+        // pair), so canonicalise once. The images were built from a TRANSPORT read-back plus transport SET
+        // values, which is why ReadSelectedRowsAsync above must stay in the transport dialect — the two have
+        // to agree before the substitution, and only the EW-facing side converts.
+        var ewPost = VariantTransport.ToCanonical(postImages);
+        var ewPre = preImages is null ? null : VariantTransport.ToCanonical(preImages);
+
+        var written = await table.WriteDataFilesAsync(ewPost, token, materializedRowIds: stableIds)
             .ConfigureAwait(false);
 
         // ONE version: the deletion-vector mask, the post-image append and the CDF pair. Based on the PINNED
@@ -2612,7 +2622,7 @@ internal static class DeltaReader
         txn.Operation = "UPDATE";
         await txn.StageRowDeletesAsync(selection, token).ConfigureAwait(false);
         await txn.StageDataFilesAsync(written, cancellationToken: token).ConfigureAwait(false);
-        if (preImages is not null)
+        if (ewPre is not null)
         {
             // ⚠ rowIds/rowCommitVersions are deliberately NOT supplied, which leaves the staged change rows
             // with NULL ids on the feed. That is what BOTH previous paths did — the retired engineered-wood
@@ -2622,13 +2632,13 @@ internal static class DeltaReader
             // change row's identity can live) and the ids are already in hand as `stableIdsRaw` — but it is its
             // own change, with its own gate, keyed PER BATCH since StageChangeDataAsync takes one id per row of
             // the single batch it is handed.
-            foreach (var pre in preImages)
+            foreach (var pre in ewPre)
             {
                 await txn.StageChangeDataAsync(pre,
                         EngineeredWood.DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage, token)
                     .ConfigureAwait(false);
             }
-            foreach (var post in postImages)
+            foreach (var post in ewPost)
             {
                 await txn.StageChangeDataAsync(post,
                         EngineeredWood.DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage, token)

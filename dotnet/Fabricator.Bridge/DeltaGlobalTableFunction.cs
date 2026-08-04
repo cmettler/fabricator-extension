@@ -1,4 +1,4 @@
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
@@ -592,6 +592,13 @@ internal static class DeltaWriter
         var dataFileWriter = nativeWrite && NativeParquetDataFileWriter.Available
             ? new NativeParquetDataFileWriter(path, spec)
             : null;
+        // VARIANT: everything below this line is engineered-wood's, so hand it the CANONICAL form and keep the
+        // transport entirely on our side of the seam. One funnel is safe here — unlike at bulk ingest, which
+        // has two sinks with opposite needs — because the native_write path reaches DuckDB's COPY THROUGH EW
+        // (via NativeParquetDataFileWriter, which flattens back to transport itself), so there is no second
+        // consumer of these batches expecting the blob form. No-op unless a column is actually a variant.
+        schema = VariantMarker.ToCanonicalSchema(schema);
+        batches = VariantTransport.ToCanonical(batches);
         long totalRows = 0;
         foreach (var b in batches) { totalRows += b.Length; }
         Log.LogInformation(
@@ -715,7 +722,11 @@ internal static class DeltaWriter
         IReadOnlyList<string> copyPartCols = partitionColumns ?? System.Array.Empty<string>();
         if (columnMapping != EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None)
         {
-            var delta = EngineeredWood.DeltaLake.Schema.SchemaConverter.FromArrowSchema(data.Schema);
+            // VARIANT: only the SCHEMA is canonicalised here. The STREAM stays in transport form because it
+            // feeds DuckDB's COPY (which is what maps ew.variant_transport to a real parquet VARIANT) — this
+            // is exactly the split that a single funnel at ingest could not express.
+            var delta = EngineeredWood.DeltaLake.Schema.SchemaConverter.FromArrowSchema(
+                VariantMarker.ToCanonicalSchema(data.Schema));
             var (mapped, _) = EngineeredWood.DeltaLake.Schema.ColumnMapping.AssignColumnMapping(delta);
             assignedSchema = mapped;
             // Same physical layout the open-table streaming path emits: recursive physical rename +
@@ -888,11 +899,18 @@ internal static class DeltaWriter
 
         var writableRoot = DeltaReader.ToReadableRoot(path);
         var fs = TableFileSystems.Create(opener, path);
+        // VARIANT: this path splits the two dialects, so the schema and the stream go separate ways. Every
+        // EW-facing SCHEMA below is `ewSchema` (canonical VariantType — what its SchemaConverter understands
+        // and what makes the metaData record `variant`); the STREAM stays in transport form all the way to
+        // DuckDB's COPY, which is what turns ew.variant_transport into a real parquet VARIANT. `data` is
+        // rewrapped below but only by pass-throughs that preserve the fields, so computing this once is safe;
+        // the PHYSICAL-renamed copies (copySource/statsSchema) are COPY's business and stay transport.
+        var ewSchema = VariantMarker.ToCanonicalSchema(data.Schema);
         // Pass columnMapping so a NEW table is created WITH the mode (an existing table keeps its own mode). Only
         // id mode reaches here as a mapping table (name mode stays on the codec path, gated by the caller) — an
         // id-mode table's data files carry field_ids, which the external commit + native reader both handle.
         var table = await DeltaTable.OpenOrCreateAsync(
-            fs, data.Schema, Options(spec),
+            fs, ewSchema, Options(spec),
             partitionColumns: spec?.PartitionColumns,   // set on a partitioned CTAS create; ignored for an INSERT
             configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, serializable, sortedBy, spec?.CreateProperties),
             columnMappingMode: columnMapping,
@@ -931,7 +949,7 @@ internal static class DeltaWriter
                    != EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None
                 && !SameLogicalColumns(table.ArrowSchema, data.Schema))
             {
-                await table.SetSchemaAsync(data.Schema, default).ConfigureAwait(false);
+                await table.SetSchemaAsync(ewSchema, default).ConfigureAwait(false);
             }
             // NOT NULL enforcement on the streamed APPEND: wrap the input with the per-batch validator
             // (lazy — a later fallback `return null` leaves the stream unconsumed for the collect path,
@@ -1027,7 +1045,7 @@ internal static class DeltaWriter
                 {
                     // CREATE OR REPLACE / CTAS-replace / schema_mode=overwrite: adopt the incoming schema
                     // (metadata-only, no-op if identical), then the commit's removes drop the old files.
-                    await table.SetSchemaAsync(data.Schema, default).ConfigureAwait(false);
+                    await table.SetSchemaAsync(ewSchema, default).ConfigureAwait(false);
                 }
                 // (a schema-changing mapping REPLACE already adopted the new schema above, so the maps
                 // match; nothing further to do here)
@@ -1322,6 +1340,11 @@ internal static class DeltaWriter
     {
         Log.LogInformation("delta create {Path}: cols={Cols} spec=[{Spec}]", path, schema.FieldsList.Count,
             DescribeSpec(spec, deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed));
+        // VARIANT: the schema below crosses into engineered-wood, whose SchemaConverter recognises the
+        // canonical VariantType and knows nothing of our transport marker. Getting this wrong is the WORST
+        // failure in the whole variant surface: a marker that reaches EW unconverted maps to Delta `binary`,
+        // and a metaData commit is not revisable — the table would record the wrong type durably and silently.
+        schema = VariantMarker.ToCanonicalSchema(schema);
         for (int attempt = 1; ; attempt++)
         {
             var fs = TableFileSystems.Create(opener, path);

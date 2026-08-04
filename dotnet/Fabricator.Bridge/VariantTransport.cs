@@ -150,6 +150,30 @@ internal static class VariantTransport
     }
 
     /// <summary>
+    /// <see cref="ToCanonical(RecordBatch)"/> over a batch list, returning the SAME instance when nothing
+    /// carried a transport column — so a non-variant write allocates nothing and the identity is preserved
+    /// for callers that compare (e.g. a pending buffer's batches).
+    /// </summary>
+    internal static IReadOnlyList<RecordBatch> ToCanonical(IReadOnlyList<RecordBatch> batches)
+    {
+        List<RecordBatch>? converted = null;
+        for (int i = 0; i < batches.Count; i++)
+        {
+            var b = ToCanonical(batches[i]);
+            if (!ReferenceEquals(b, batches[i]) && converted is null)
+            {
+                converted = new List<RecordBatch>(batches.Count);
+                for (int j = 0; j < i; j++)
+                {
+                    converted.Add(batches[j]);
+                }
+            }
+            converted?.Add(b);
+        }
+        return converted ?? batches;
+    }
+
+    /// <summary>
     /// Reduces a possibly-SHREDDED variant to the canonical <c>(metadata, value)</c> storage struct. The
     /// parquet reader reassembles shredding when it wraps an annotated file, but a variant that arrived
     /// shredded — ours or a foreign writer's — must be merged before its halves can be concatenated.
