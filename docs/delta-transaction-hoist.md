@@ -116,7 +116,25 @@ Only the second half can change behaviour, so they must not land together.
     precondition is judged. Whatever replaces the `await using` must abort on every non-committing path,
     including an exception out of the flush. ⚠ Safe only from EW #49 — do not reintroduce it any earlier.
 - **1b — move the creation point to the first operation that needs one.** Then, and only then, the
-  behaviour question arises (a transaction alive across statements). Gate 1b on its own.
+  behaviour question arises (a transaction alive across statements).
+  - **⚠ 1b ALONE IS VACUOUS AND SHOULD MERGE WITH SLICE 2** (established 2026-08-04, after 1a landed).
+    Creating the transaction earlier buys nothing while every `Stage*` still happens at flush time — the
+    only observable difference is that an object exists sooner. The reason they were separated (CDF in a
+    held transaction while data files went to the flush's own ⇒ two commits per table) **was dissolved by
+    1a**: the held transaction IS the flush's transaction now, so statement-time CDF and flush-time data
+    files fuse into one commit. Do 1b+2 as one slice.
+
+**THE SAFETY PROOF FOR THE WHOLE HOIST — holding a table across statements does NOT weaken conflict
+validation.** This was the open worry, since the flush's own comment says basing the transaction on
+`CurrentSnapshot` would make validation *"vacuous"*, and a long-held table's `CurrentSnapshot` is stale by
+construction. It does not matter: **`CommitOccAsync` writes OPTIMISTICALLY at `baseSnapshot.Version + 1`
+and re-reads the latest only when that conditional write throws `DeltaConflictException`.** Conflict
+detection is therefore driven by the put-if-absent commit primitive plus `transaction.BaseSnapshot` (our
+pin) — nothing in the commit path consults `table.CurrentSnapshot`. So a table opened at statement time and
+held to COMMIT validates exactly as one opened at COMMIT.
+- ⚠ Unchanged pre-existing caveat: where the commit primitive is NOT conditional — a local Windows root
+  ([delta-transactions.md](delta-transactions.md) §8.5) — concurrent writers lose commits regardless. The
+  hoist neither causes nor fixes that.
 
 **⚠ THE ABORT LEDGER IS EXPLICIT, NOT AMBIENT — so the hoist buys NO free orphan reclamation.** A first
 version of the 1a comment claimed that a transaction created before the flush's `WriteDataFilesAsync`
