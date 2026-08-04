@@ -1,6 +1,6 @@
 # Hoisting the EW `DeltaTransaction` to statement time
 
-> **Status: slices 1a + 1b+2 BUILT (2026-08-04); slices 3–5 are still PLAN.** Decided 2026-08-04 (user).
+> **Status: slices 1a, 1b+2 and 5 BUILT (2026-08-04); slice 3 is BLOCKED and slice 4 is optional.** Decided 2026-08-04 (user).
 > Supersedes the "one open EW transaction per table is an ARCHITECTURAL change" framing in `CLAUDE.md` —
 > it is smaller than that, see §1. Built so far: the buffer entry owns the EW table + transaction
 > (`0bfdd8c`), CDF stages into it at statement time (`86cb374`), and our 45-line EW
@@ -318,6 +318,50 @@ Worth stating plainly so nobody reads slices 3–5 as remaining value:
 
 ⇒ **Slice 5 is the next one worth doing, and it does not depend on 3 or 4.** The reason the original order put
 it last was blast radius, not prerequisites.
+
+### 4.3 SLICE 5 AS BUILT (2026-08-04) — six things the design got wrong or under-specified
+
+Gate: `verify_delta_catalog_transactions` **944 → 965**. Every correction below came from RUNNING it, not
+from review; the design in §4.1 was already the product of two reading passes.
+
+1. **⚠ THE CREATE FOR A CTAS DOES NOT GO THROUGH `DeltaCatalog.CreateTable` — it happens inside
+   `begin_bulk` with `create=true`.** The design (and a `CLAUDE.md` line about
+   `FabricatorPhysicalCreateTableAs` creating before `begin_bulk`) assumed one entry point, so the ownership
+   mark was set in `CreateTable` alone and never fired for a CTAS. **Diagnosed by the ABSENCE of the log line
+   the change adds**, next to a `delta bulk … create=True` — a positive control that cost nothing to build
+   and settled in one run what reading had got wrong. Symptom: three versions instead of two
+   (`:1687`), because the bulk created the table AND committed its data immediately, and the later INSERT
+   flushed separately. The immediate create is therefore performed in BOTH places, schema-only in the bulk.
+2. **⚠ THE SILENT-CORRUPTION GUARD IS `createdHere` NEUTRALISING `overwrite`.** A CTAS arrives with
+   `createTable=true`, which makes `mode = Overwrite`, which makes the write NON-bufferable (`bufferable`
+   requires Append) — so `BEGIN; CREATE TABLE t AS SELECT …; ROLLBACK` would COMMIT its data immediately.
+   **Every existing suite would still have passed**: they assert the ROWS, and the rows are right. A table
+   this transaction just created is empty, so there is nothing to overwrite.
+3. **⚠ THE DROP GUARD'S ORDER AND CONDITION ARE BOTH LOAD-BEARING.** A first version removed the buffer
+   entry UNCONDITIONALLY and BEFORE `ThrowIfPendingAppends`, which made `BEGIN; DELETE …; DROP TABLE …;`
+   SUCCEED — the guard found nothing left to complain about. Caught by `:339`, which exists for that shape.
+   CREATE+DROP still cancels out for the buffer, but the real drop must now actually run.
+4. **⚠ THE "TWO REFUSALS LIFTED" CLAIM WAS AN OVER-CLAIM — it is ALTER and DELETE, not UPDATE.** Removing
+   the create-specific refusals exposes the INDEPENDENT "UPDATE of rows inserted in the same transaction"
+   limitation, and every row of a table created in this transaction was necessarily inserted in it, so UPDATE
+   still fails — with a different message. DELETE composes because a pending file's add is born with an
+   inline deletion vector; UPDATE has no such path. Pinned as a `statement error` with a comment saying which
+   guard fires and why, so the next reader does not take it for slice 5 not working.
+5. **⚠ TWO BACKEND-SPECIFIC OPERATIONS HAD TO BE EXTRACTED, NOT REIMPLEMENTED** — `RemoveTableFolder` and
+   `RenameTableFolder`, each with three branches (ADLS DFS / host-FS / S3 SDK). A hand-rolled
+   `HostFs.RemoveDir` in the rollback path would have "worked" on a local root and left an orphan table on
+   **every remote one** — Azure's `MoveFile` is unimplemented and httpfs' S3 `RemoveDirectory` fails its own
+   per-file remove. This is the class of bug a local-only test tier cannot see.
+6. **⚠ RENAMING A CREATED TABLE NEEDS THE BUFFER RE-KEYED AND THE HELD TABLE DISPOSED** — the dbt table
+   materialization (`CREATE …__dbt_tmp AS …; RENAME m → …__dbt_backup; RENAME …__dbt_tmp → m`), caught at
+   `:2872`. The folder rename is now ordinary, but the buffer is keyed BY PATH and holds the rows plus the
+   ownership mark (lose it: the flush writes nothing and the rollback drops nothing), and the held EW
+   table/transaction were opened against the OLD path.
+
+**⚠ And one test-quality trap worth carrying: TWO ROLLBACK-DROP ASSERTIONS PASSED VACUOUSLY.** They globbed
+`txn_flush2/...` where the attach root is `txn_codec/...`, and a glob on a path that never existed returns 0
+— the same answer as a successful deletion. 965 green assertions, two measuring nothing. Both now carry a
+POSITIVE CONTROL asserting the folder is non-empty mid-transaction, so the 0 afterwards measures a deletion.
 
 ## 5. Open questions to settle IN slice 1, not by guessing
 

@@ -1713,7 +1713,13 @@ SELECT * FROM flake2.main.f;
 ----
 
 # ============================================================================
-# 27. Guards on pending-created tables: ALTER + DML rejected with clear errors
+# 27. A table CREATED in this transaction is an ORDINARY table (hoist slice 5)
+#
+# This section INVERTED. It used to assert that ALTER and DML on such a table were REFUSED
+# ("created in the same transaction" NotSupportedException) because the table existed only in the
+# buffer — there was nothing on storage to alter or to build a deletion vector against. The create
+# is immediate now, so both work, and lifting those two refusals is the capability this slice buys.
+# The price is section 29's rollback behaviour.
 # ============================================================================
 
 statement ok
@@ -1722,10 +1728,17 @@ BEGIN;
 statement ok
 CREATE TABLE flake2.main.g (x INTEGER);
 
-statement error
+# ALTER of a table created in this transaction: was NotSupportedException.
+statement ok
 ALTER TABLE flake2.main.g ADD COLUMN y INTEGER;
+
+statement ok
+INSERT INTO flake2.main.g VALUES (1, 10);
+
+query II
+SELECT x, y FROM flake2.main.g;
 ----
-created in the same transaction
+1	10
 
 statement ok
 ROLLBACK;
@@ -1737,15 +1750,95 @@ statement ok
 CREATE TABLE flake2.main.g (x INTEGER);
 
 statement ok
-INSERT INTO flake2.main.g VALUES (1);
+INSERT INTO flake2.main.g VALUES (1), (2);
+
+# DELETE of a row in a table created in this transaction: was NotSupportedException.
+statement ok
+DELETE FROM flake2.main.g WHERE x = 1;
+
+query I
+SELECT x FROM flake2.main.g;
+----
+2
+
+statement ok
+COMMIT;
+
+query I
+SELECT x FROM flake2.main.g;
+----
+2
+
+statement ok
+DROP TABLE flake2.main.g;
+
+# ⚠ UPDATE is STILL refused, and by a DIFFERENT guard — read the message. Slice 5 removed the
+# create-specific refusal, but every row of a table created in this transaction was necessarily
+# INSERTED in it, so the independent "UPDATE of rows inserted in the same transaction" limitation
+# (which applies to any table's pending files, created or not) catches it instead. DELETE composes
+# because a pending file's add is born with an inline deletion vector; UPDATE has no such path.
+# ⇒ slice 5 lifts the ALTER and DELETE refusals; it does NOT make UPDATE work on a created table.
+#
+# In its OWN transaction on purpose: a failed statement aborts the DuckDB transaction, so the
+# ROLLBACK below is what actually runs — and it must take the created table with it, which is the
+# next assertion and also section 29's subject.
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE flake2.main.gu (x INTEGER);
+
+statement ok
+INSERT INTO flake2.main.gu VALUES (1);
 
 statement error
-DELETE FROM flake2.main.g WHERE x = 1;
+UPDATE flake2.main.gu SET x = 99 WHERE x = 1;
 ----
-created in the same transaction
+rows inserted in the same transaction
 
 statement ok
 ROLLBACK;
+
+statement error
+SELECT x FROM flake2.main.gu;
+----
+
+# ⚠ THE ROLLBACK-DROP GATE — the other half of hoist slice 5, and it must assert STORAGE, not just the
+# catalog. The create is immediate, so a rolled-back CREATE has really put a table on disk; the catalog
+# error above would also pass if the folder were merely orphaned (the discovered name list is rebuilt
+# from storage, but a stale cache would hide it). The folder itself must be gone.
+query I
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_codec/gu/_delta_log/*.json');
+----
+0
+
+# And the same for a table that had eagerly-written DATA files, not just a bare schema — the rollback
+# reclaims the files AND removes the folder, in that order (the reclamation opens the table).
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE flake2.main.gr AS SELECT i AS id FROM range(1, 101) r(i);
+
+# POSITIVE CONTROL, and it is not optional: a glob on a path that never existed ALSO returns 0, which is
+# how the first version of these two assertions passed while pointing at the wrong attach root
+# (txn_flush2 instead of txn_codec) — 964 green assertions, two of them measuring nothing.
+query I
+SELECT count(*) > 0 FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_codec/gr/**');
+----
+true
+
+statement ok
+ROLLBACK;
+
+statement error
+SELECT id FROM flake2.main.gr;
+----
+
+query I
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_codec/gr/**');
+----
+0
 
 # ============================================================================
 # 28. Empty buffered CREATE + partitioned CTAS-in-transaction
@@ -2022,11 +2115,22 @@ SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_native/bt/*.parquet
 ----
 1
 
-# ...but NO _delta_log exists yet (nothing committed)
+# ...and since hoist slice 5 the CREATE is on storage too: exactly ONE commit (v0 = protocol+metaData,
+# an EMPTY table). This assertion used to demand 0 and is the most explicit statement of the trade
+# §3 of docs/delta-transaction-hoist.md accepts: a concurrent session can see the empty table for the
+# transaction's life. The DATA is still uncommitted — that is the next assertion, and it is what makes
+# this a visibility change rather than an atomicity one.
 query I
 SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_native/bt/_delta_log/*.json');
 ----
-0
+1
+
+# The one commit that exists is the CREATE and nothing else — exactly one version in the log, so the
+# streamed parquet above is referenced by no commit yet.
+query I
+SELECT count(*) FROM fabricator_delta_snapshots('eb', 'bt');
+----
+1
 
 # read-your-writes serves from the streamed file (physical->logical rename through the
 # pre-assigned mapping schema; default column_mapping is 'name')
@@ -2902,7 +3006,9 @@ CREATE TABLE pc.main.pt PARTITIONED BY (region) AS
   SELECT i AS id, CASE i % 3 WHEN 0 THEN 'US' WHEN 1 THEN 'EU' ELSE 'APAC' END AS region
   FROM range(1, 301) r(i);
 
-# streamed: Hive partition dirs on storage, NO _delta_log yet
+# streamed: Hive partition dirs on storage, and (hoist slice 5) the CREATE's v0 in the log — but no
+# commit referencing the data. Same accepted trade as section 28: visibility of an EMPTY table, not
+# early publication of rows.
 query I
 SELECT count(*) > 0 FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_partctas/pt/*/*.parquet');
 ----
@@ -2911,7 +3017,12 @@ true
 query I
 SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_partctas/pt/_delta_log/*.json');
 ----
-0
+1
+
+query I
+SELECT count(*) FROM fabricator_delta_snapshots('pc', 'pt');
+----
+1
 
 # read-your-writes INCLUDING the partition column (typed literals from partitionValues)
 query I
@@ -2970,11 +3081,15 @@ BEGIN;
 statement ok
 CREATE TABLE ic.main.t (id BIGINT AS (0), v VARCHAR);
 
-# nothing on storage before COMMIT (the identity create is now transactional)
+# The identity create is IMMEDIATE since hoist slice 5 (v0 on storage), so what this section pins is no
+# longer "nothing before COMMIT" but that the identity VALUES still come out right — see below. ⚠ One
+# consequence is deliberate and observable: v0 no longer carries the transaction's FINAL high-water mark
+# (the deferred create used to bake it in); the marks now ride the flush's metaData action, exactly as
+# they do for a table the transaction did not create.
 query I
 SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_ident2/t/_delta_log/*.json');
 ----
-0
+1
 
 statement ok
 INSERT INTO ic.main.t (v) VALUES ('a'), ('b');

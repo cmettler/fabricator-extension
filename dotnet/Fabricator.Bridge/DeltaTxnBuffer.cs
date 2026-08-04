@@ -73,26 +73,27 @@ internal sealed class DeltaTxnBuffer
         public Dictionary<string, string> RenameMap { get; } = new(StringComparer.Ordinal);
         public HashSet<string> AlterOps { get; } = new(StringComparer.Ordinal);
 
-        // ---- Buffered CREATE TABLE / CTAS (slice 4, explicit transactions only) ----
-        // The table exists ONLY in this buffer until COMMIT: nothing touches the _delta_log before the
-        // flush (DuckDB's rollback callback has no opener, so rollback can only DISCARD — a written
-        // commit-0 could never be cleaned up). PendingArrowSchema doubles as the table's schema; the flush
-        // creates the table + writes all buffered rows (today's CTAS commit shape: v0 CREATE + one WRITE).
-        public bool PendingCreate;
-        public IReadOnlyList<string>? CreatePartitionColumns;
-        // SORTED BY columns of a pending CREATE/CTAS — persisted (fabricator.sortedBy) by the flush's create.
-        public IReadOnlyList<string>? CreateSortColumns;
-        // CREATE ... WITH (...) options of a pending CREATE/CTAS — the flush's create resolves its effective
-        // create flags (deletion_vectors/column_mapping/...) + delta.*/fabricator.* properties from them.
-        public DeltaWithOptions? CreateOptions;
+        // ---- CREATE TABLE / CTAS inside an explicit transaction (hoist slice 5) ----
+        // ⚠ THIS FLAG CHANGED MEANING. It was `PendingCreate` — "the create has not happened yet", the
+        // table existing ONLY in this buffer until the flush created it. The create is now IMMEDIATE (the
+        // same path an autocommit CREATE takes), so what the buffer needs to remember is the opposite fact:
+        // that THIS transaction is the one that created the table, which is the only thing entitling
+        // ROLLBACK to drop it. Everything else the deferred create carried (the parked schema, partition and
+        // sort columns, WITH options, the pre-assigned column-mapping schema) went with it — the table
+        // itself now holds all of that.
+        //
+        // The trade, accepted deliberately (docs/delta-transaction-hoist.md §3): v0 is visible to other
+        // sessions for the transaction's life, and a ROLLBACK whose drop fails leaves an empty table behind.
+        // What it buys: DELETE/UPDATE on a table created in the same transaction (both used to throw
+        // NotSupportedException), the streaming native write for such a table, and the CDF probe.
+        public bool CreatedInTxn;
 
-        // ---- Eager CDC capture (slice C2, CDF tables in explicit transactions) ----
+        // ---- CDF capture (CDF tables in explicit transactions) ----
         // _change_data files are written at STATEMENT time (the rows are in hand: appended batches,
-        // read-back deleted rows, update pre/post images) and their CdcFile actions park here — they
-        // fuse into the transaction's ONE commit at flush. Because a commit carrying ANY cdc action is
+        // read-back deleted rows, update pre/post images) and — since hoist slice 1b+2 — their actions are
+        // staged straight into HeldTxn rather than parked here. Because a commit carrying ANY cdc action is
         // read cdc-ONLY by the CDF reader (inference disabled), EVERY buffered statement on a CDF table
         // writes its cdc counterpart, inserts included. CdfEnabled caches the per-(txn, table) probe.
-        public List<EngineeredWood.DeltaLake.Actions.CdcFile> PendingCdc { get; } = new();
         public bool? CdfEnabled;
 
         // ---- Eager identity appends (chained high-water marks) ----
@@ -127,8 +128,12 @@ internal sealed class DeltaTxnBuffer
         public EngineeredWood.DeltaLake.Table.DeltaTable? HeldTable;
         public EngineeredWood.DeltaLake.Table.DeltaTransaction? HeldTxn;
 
+        // CreatedInTxn counts as "something pending" for the same reason PendingCreate did, but for a
+        // DIFFERENT effect: not "there is a create to perform" but "there is a table this transaction owns",
+        // which ROLLBACK must reach in order to drop it. Drop it from this list and a CREATE-only
+        // transaction's rollback would find no entry and silently leave the table behind.
         public bool HasAny => Rows > 0 || DeletedByOrdinal.Count > 0 || PendingMetadata is not null
-                              || PendingCreate || AppTxnVersions.Count > 0;
+                              || CreatedInTxn || AppTxnVersions.Count > 0;
 
         // ---- READ SET (Spark ConflictChecker parity, for the logical rebase at COMMIT) ----
         // The PUSHED predicate of every in-transaction scan of this table — a superset of the rows the

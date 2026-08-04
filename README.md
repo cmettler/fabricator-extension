@@ -1465,6 +1465,37 @@ SELECT _change_type, id, val, _commit_version, _commit_timestamp
 > only to a reader that consumes the row-identity columns a change file carries. Measured, being fixed;
 > details in [docs/delta-transaction-hoist.md](docs/delta-transaction-hoist.md) §6.
 
+#### `CREATE TABLE` inside a transaction — what is and is not atomic
+
+A `CREATE TABLE` (or CTAS) inside `BEGIN … COMMIT` **creates the table immediately**; only its DATA waits
+for `COMMIT`. Two consequences worth knowing before you rely on either:
+
+```sql
+BEGIN;
+CREATE TABLE lake.main.t AS SELECT * FROM lake.main.src;  -- table exists NOW, empty; rows are buffered
+DELETE FROM lake.main.t WHERE id < 0;                     -- works (used to be refused)
+COMMIT;                                                   -- the rows land as ONE commit
+
+-- ALTER works too, but schema changes must come BEFORE the transaction's data statements:
+BEGIN;
+CREATE TABLE lake.main.u (id INTEGER);
+ALTER TABLE lake.main.u ADD COLUMN note VARCHAR;          -- works (used to be refused)
+INSERT INTO lake.main.u VALUES (1, 'hi');
+COMMIT;
+```
+
+- ✅ **You can now ALTER and DELETE a table your own transaction created.** Both previously failed with
+  *"not supported yet — COMMIT the CREATE first"*.
+- ⚠ Two independent rules still apply, and their messages name them: an `ALTER` must precede the
+  transaction's data statements (*"ALTER TABLE after buffered data changes"* — so it cannot follow a CTAS,
+  which is itself a data statement), and **`UPDATE` on such a table still fails**, because every one of its
+  rows was inserted in the same transaction and updating not-yet-committed rows is a separate limitation.
+- ⚠ **Another session can see the table, empty, until you commit** — and a `ROLLBACK` drops it on a
+  best-effort basis. If that drop fails (a permission or network error) an **empty table is left behind**;
+  the reason is logged with the path. Set `FABRICATOR_LOG_LEVEL=Information` to see it.
+
+Rationale and the full trade-off: [docs/delta-transaction-hoist.md](docs/delta-transaction-hoist.md) §3.
+
 #### Exactly-once appends — Delta application transactions
 
 A producer that may be replayed (a retried job, a restarted stream) records how far it has got, and the

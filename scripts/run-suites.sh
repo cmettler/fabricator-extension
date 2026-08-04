@@ -137,7 +137,7 @@ case "$TIER" in
         # ⚠ 5686 - 5656 = 30 of this gap PREDATES the change: the floor was not raised for the unified
         # parameter protocol's coverage (verify_global_functions + the signature/mixed-arg pins). Closed here
         # rather than left, since a floor 30 below the actual silently tolerates a regression that large.
-        : "${MIN_ASSERTIONS:=5710}"
+        : "${MIN_ASSERTIONS:=5752}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

@@ -977,11 +977,6 @@ public sealed class DeltaCatalog : IBackendCatalog
                 + "version is compared-and-swapped atomically with the transaction's commit.");
         }
         var pending = _txnBuffer.GetOrCreate(txnId, path);
-        if (pending.PendingCreate)
-        {
-            throw new System.NotSupportedException(
-                "delta set transaction version: not supported on a table created in the same transaction.");
-        }
         // Pin the transaction's base version (like any read) so the flush has a rebase base even for an
         // otherwise append-only transaction.
         pending.PinnedVersion ??= SnapshotPinning.TryGetPinned(txnId, path)
@@ -1419,9 +1414,8 @@ public sealed class DeltaCatalog : IBackendCatalog
             // instant (SnapshotPinning, per txn) and each table resolves it to a version on first touch —
             // every scan in the transaction then reads that consistent cut (the codec branch below routes
             // through the AT-version streams; the native path already did). Also the rebase base for the
-            // COMMIT conflict check. A table CREATED in this transaction has nothing on storage to pin
-            // (it is served from the buffer).
-            if (!readPending.PendingCreate)
+            // COMMIT conflict check. Since hoist slice 5 a table created in
+            // this transaction is on storage like any other, so there is no create case to exclude.
             {
                 readPending.PinnedVersion ??= SnapshotPinning.TryGetPinned(scanTxn, path)
                     ?? SnapshotPinning.PinVersion(scanTxn, path,
@@ -1470,11 +1464,6 @@ public sealed class DeltaCatalog : IBackendCatalog
 
         // Read-your-writes: overlay this transaction's buffered changes onto the scan.
         var pendingScan = _txnBuffer.Get(AmbientTransaction.Current, path);
-        if (pendingScan is { PendingCreate: true })
-        {
-            // Table created in THIS transaction: it exists only in the buffer (no _delta_log yet).
-            return ScanPendingCreated(path, pendingScan, spec);
-        }
         if (pendingScan is { Files.Count: > 0 })
         {
             // native_write catalog read mid-transaction: the buffered appends are STREAMED FILES (not
@@ -1645,64 +1634,6 @@ public sealed class DeltaCatalog : IBackendCatalog
     // data is already on storage, read back via the host's read_parquet and renamed physical->logical
     // through the pre-assigned mapping schema). Synthetic rowids for the count(*)/DML-plan paths; DML
     // against pending rows is rejected with its own clear error.
-    private IArrowArrayStream ScanPendingCreated(string path, DeltaTxnBuffer.PendingAppends pending,
-                                                 ScanSpec? spec)
-    {
-        var (_, projected) = ProjectFor(pending.PendingArrowSchema!, spec);
-        bool wantRowId = spec?.Columns is { } cols && cols.Contains(RowIdColumn);
-        var outSchema = wantRowId ? SchemaWithRowId(projected) : projected;
-        var stream = DeltaTxnBuffer.ProjectPending(pending, outSchema, RowIdColumn, PendingRowIdOrdinal);
-        if (pending.Files.Count > 0)
-        {
-            string root = DeltaReader.ToReadableRoot(path);
-            // Partitioned pending CTAS: the data files EXCLUDE the partition columns — render each
-            // file's partitionValues (physical-keyed under mapping) as typed literals, per file (the
-            // same log-authoritative rule the committed native reader applies; paths never parsed).
-            var partCols = pending.CreatePartitionColumns ?? (IReadOnlyList<string>)System.Array.Empty<string>();
-            var deltaSchema = pending.PendingDeltaSchema
-                // PendingArrowSchema is the TRANSPORT dialect (it serves bind schemas) — canonicalise before
-                // handing it to EW's converter, which knows only the canonical VariantType.
-                ?? EngineeredWood.DeltaLake.Schema.SchemaConverter.FromArrowSchema(
-                       VariantMarker.ToCanonicalSchema(pending.PendingArrowSchema!));
-            var logToPhys = pending.PendingDeltaSchema is { } m0
-                ? EngineeredWood.DeltaLake.Schema.ColumnMapping.BuildLogicalToPhysicalMap(m0, _columnMappingMode)
-                : null;
-            var selects = new List<string>(pending.Files.Count);
-            foreach (var f in pending.Files)
-            {
-                var sel = new System.Text.StringBuilder("SELECT *");
-                foreach (var pc in partCols)
-                {
-                    var dfield = deltaSchema.Fields.FirstOrDefault(x =>
-                        string.Equals(x.Name, pc, System.StringComparison.OrdinalIgnoreCase));
-                    string typeText = dfield is not null ? DeltaNativeReader.TypeText(dfield.Type) : "VARCHAR";
-                    string stored = logToPhys is not null && logToPhys.TryGetValue(pc, out var pp) ? pp : pc;
-                    string? pv = DeltaNativeReader.LookupPartitionValue(f.PartitionValues, pc, stored);
-                    sel.Append(pv is null
-                        ? $", CAST(NULL AS {typeText}) AS \"{pc}\""
-                        : $", CAST('{pv.Replace("'", "''")}' AS {typeText}) AS \"{pc}\"");
-                }
-                sel.Append(" FROM read_parquet('")
-                   .Append((root + "/" + f.RelativePath).Replace("'", "''"))
-                   .Append("')");
-                selects.Add(sel.ToString());
-            }
-            var sql = string.Join(" UNION ALL ", selects);
-            var source = Host.Query(sql);
-            if (pending.PendingDeltaSchema is { } assigned)
-            {
-                // The files carry PHYSICAL column names (mapping pre-assigned at the eager write).
-                source = ArrowColumnMappingRename.Wrap(source, assigned, toPhysical: false);
-            }
-            var raw = DeltaTxnBuffer.AsEnumerable(source);
-            stream = DeltaTxnBuffer.Concat(
-                DeltaTxnBuffer.ProjectStream(raw, outSchema, RowIdColumn, PendingRowIdOrdinal + 1), stream);
-        }
-        return new AsyncEnumerableArrowStream(outSchema, WithExactFilter(outSchema, stream, spec));
-    }
-
-    // True when the table exists COMMITTED on storage (its _delta_log opens). Routes CREATE/CTAS between
-    // the buffered (fresh table) and immediate (existing table => OpenOrCreate no-op) paths.
     private bool TableExists(string path)
     {
         try
@@ -1774,11 +1705,6 @@ public sealed class DeltaCatalog : IBackendCatalog
         string? unit = null, value = null;
         bool seedPinFromSchemaOpen = false;
         var pendingNative = spec?.At is null ? _txnBuffer.Get(AmbientTransaction.Current, path) : null;
-        if (pendingNative is { PendingCreate: true })
-        {
-            // Table created in THIS transaction: nothing on storage to list — serve from the buffer.
-            return ScanPendingCreated(path, pendingNative, spec);
-        }
         if (spec?.At is { } at)
         {
             unit = at.Unit;
@@ -2036,7 +1962,42 @@ public sealed class DeltaCatalog : IBackendCatalog
         var flags = EffectiveCreateFlags(withOpts);
         // Data mode: schema_mode=overwrite forces a full replace (adopt the source schema); CREATE/CTAS/REPLACE
         // also overwrite; otherwise it's an append (INSERT / COPY create_table=false / schema_mode=merge).
-        bool overwrite = createTable || replace || spec?.SchemaMode == DeltaSchemaMode.Overwrite;
+        //
+        // ⚠ HOIST SLICE 5 — THE ONE PLACE THIS CHANGE COULD HAVE CORRUPTED SILENTLY, and the place a WRONG
+        // ASSUMPTION was caught. A CTAS arrives here with createTable=true, which used to mean "the table is
+        // not there yet". Since the create is now IMMEDIATE the table IS there (empty, at v0), and an
+        // Overwrite mode would make the write NON-BUFFERABLE below (`bufferable` requires Append) — so
+        // `BEGIN; CREATE TABLE t AS SELECT …; …; ROLLBACK` would COMMIT its data immediately, breaking the
+        // transaction's atomicity while every existing suite still passed (they assert the ROWS, and the rows
+        // are right). A table this transaction just created is empty, so there is nothing for an overwrite to
+        // replace: it is the append it actually is.
+        //
+        // ⚠ AND THE CREATE FOR A **CTAS** HAPPENS HERE, NOT IN CreateTable — measured, after assuming
+        // otherwise. A bare `CREATE TABLE t (cols)` goes through DeltaCatalog.CreateTable; a CTAS reaches this
+        // method with create=true and lets `OpenOrCreateAsync` do the creating, so CreateTable's ownership
+        // mark never fires for it. The symptom was three versions instead of two
+        // (verify_delta_catalog_transactions:1687): create + an IMMEDIATE overwrite commit + the later
+        // INSERT's flush. So the immediate create is performed here too — schema only — and the data then
+        // buffers like any append.
+        bool createdHere = _txnBuffer.Get(txnId, tablePath) is { CreatedInTxn: true };
+        if (!createdHere && createTable && !replace && !partitionOverwrite
+            && _txnBuffer.IsExplicit(txnId) && !TableExists(tablePath))
+        {
+            DeltaWriter.Create(opener, tablePath, data.Schema, default,
+                               deletionVectors: flags.DeletionVectors,
+                               inCommitTimestamps: flags.InCommitTimestamps,
+                               changeDataFeed: flags.ChangeDataFeed,
+                               rowTracking: flags.RowTracking,
+                               spec: spec, columnMapping: flags.ColumnMapping,
+                               serializable: _serializable, sortedBy: sortColumns);
+            _txnBuffer.GetOrCreate(txnId, tablePath).CreatedInTxn = true;
+            createdHere = true;
+            _log.LogInformation(
+                "delta txn {Txn} created {Schema}.{Table} for CTAS (rollback will drop it)",
+                txnId, schemaName, tableName);
+        }
+        bool overwrite = (createTable && !createdHere) || replace
+                         || spec?.SchemaMode == DeltaSchemaMode.Overwrite;
         var mode = overwrite ? DeltaWriteMode.Overwrite : DeltaWriteMode.Append;
         // replace_where (atomic partition-overwrite) is an APPEND-time concept — for a full (re)write, drop it.
         if (overwrite && spec?.ReplaceWhere is not null)
@@ -2141,61 +2102,11 @@ public sealed class DeltaCatalog : IBackendCatalog
             }
         }
 
-        // Explicit transaction (slice 4): a FRESH-table CTAS buffers — the CREATE parks on the buffer, the
-        // data collects as pending batches, and the flush creates + writes at COMMIT (nothing touches the
-        // _delta_log before then; ROLLBACK discards everything, no storage cleanup needed). CREATE OR
-        // REPLACE and CTAS over an existing table stay immediate (replace semantics are snapshot-coupled).
-        if (_txnBuffer.IsExplicit(txnId) && createTable && !replace && !partitionOverwrite
-            && !TableExists(tablePath))
-        {
-            var pendingC = _txnBuffer.GetOrCreate(txnId, tablePath);
-            if (!pendingC.HasAny)
-            {
-                // Eager-write plan, slice B: on a native_write catalog the CTAS data STREAMS to parquet
-                // files at statement time (no _delta_log touched — the flush's CREATE reuses the
-                // pre-assigned column-mapping schema and one commit references the files; ROLLBACK
-                // leaves orphans in a log-less folder, not a table to any reader). Bounded memory for a
-                // huge CTAS inside BEGIN..COMMIT. Partitioned CTAS streams too (COPY PARTITION_BY; the
-                // read-back renders each file's partitionValues as typed literals).
-                if (_nativeWrite)
-                {
-                    var ctasSchema = data.Schema;
-                    var cfiles = DeltaWriter.TryStreamCreateFiles(
-                        opener, tablePath, data, flags.ColumnMapping, out var sRows, out var assigned,
-                        partitionColumns, spec);
-                    if (cfiles is not null)
-                    {
-                        pendingC.PendingCreate = true;
-                        pendingC.PendingArrowSchema = ctasSchema;
-                        pendingC.PendingDeltaSchema = assigned; // mapping pre-assignment (null when 'none')
-                        pendingC.CreatePartitionColumns = partitionColumns;
-                        pendingC.CreateSortColumns = sortColumns; // SORTED BY persists at the flush's create
-                        pendingC.CreateOptions = withOpts;        // WITH flags/properties apply at the flush's create
-                        pendingC.HasAppend = true;
-                        pendingC.Files.AddRange(cfiles);
-                        pendingC.Rows += sRows;
-                        _log.LogInformation(
-                            "delta bulk {Schema}.{Table}: buffered CREATE + {Rows} row(s) for txn {Txn} (CTAS, streamed files)",
-                            schemaName, tableName, sRows, txnId);
-                        return sRows;
-                    }
-                }
-                var (cschema, cbatches, crows) = DeltaWriter.Materialize(data, default);
-                pendingC.PendingCreate = true;
-                pendingC.PendingArrowSchema = cschema;
-                pendingC.CreatePartitionColumns = partitionColumns;
-                pendingC.CreateSortColumns = sortColumns; // SORTED BY persists at the flush's create
-                pendingC.CreateOptions = withOpts;        // WITH flags/properties apply at the flush's create
-                pendingC.HasAppend = true;
-                pendingC.BatchSchema ??= cschema;
-                pendingC.Batches.AddRange(cbatches);
-                pendingC.Rows += crows;
-                _log.LogInformation(
-                    "delta bulk {Schema}.{Table}: buffered CREATE + {Rows} row(s) for txn {Txn} (CTAS)",
-                    schemaName, tableName, crows, txnId);
-                return crows;
-            }
-        }
+        // ⚠ HOIST SLICE 5: the buffered-CTAS branch that stood here is GONE. It parked the CREATE on
+        // the buffer and had the flush create the table and write the rows at COMMIT. The create is now
+        // immediate (DeltaCatalog.CreateTable), so by the time a CTAS reaches this method the table
+        // already exists at v0 and its data is an ordinary buffered APPEND — handled by the block below,
+        // which is why this one had nothing left to do. `createdHere` above is what keeps it an append.
 
         // Explicit-transaction append buffering: a PLAIN append parks its data (files on the streaming
         // path, materialized batches on the collect path) and the Delta commit happens at COMMIT — one
@@ -2219,7 +2130,7 @@ public sealed class DeltaCatalog : IBackendCatalog
             // DML would otherwise vanish from the feed). Probed once per (txn, table); partitioned CDF
             // stays on inference (its appends commit cdc-less and its DML is rejected, so commits are
             // never mixed). Insert-cdc needs the batches in hand -> CDF appends skip the streamed path.
-            if (_txnBuffer.IsExplicit(txnId) && !pending.PendingCreate && pending.CdfEnabled is null)
+            if (_txnBuffer.IsExplicit(txnId) && pending.CdfEnabled is null)
             {
                 var prof = DeltaReader.GetTxnDmlProfile(opener, tablePath);
                 pending.CdfEnabled = prof.CdfEnabled && prof.SupportsExternalCommit;
@@ -2229,7 +2140,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 }
             }
             bool cdfAppend = pending.CdfEnabled == true;
-            bool tryStream = _nativeWrite && !pending.PendingCreate && !cdfAppend;
+            bool tryStream = _nativeWrite && !cdfAppend;
             if (tryStream)
             {
                 // Eager-write plan, slice A: a PENDING BUFFERED ALTER streams too — the pending schema
@@ -2271,35 +2182,14 @@ public sealed class DeltaCatalog : IBackendCatalog
             if (!tryStream || pending.PendingMetadata is not null || _txnBuffer.IsExplicit(txnId))
             {
                 var (bschema, bbatches, brows) = DeltaWriter.Materialize(data, default);
-                // Pending-created IDENTITY table: generate the engine values NOW from the parked
-                // schema's identity metadata (marks chain across the transaction's statements) —
-                // read-your-writes shows the real ids, and the flush writes the pre-generated batches
-                // + bakes the final marks into commit-0.
-                if (pending.PendingCreate && pending.PendingArrowSchema is { } pcArrow)
-                {
-                    var pcDelta = EngineeredWood.DeltaLake.Schema.SchemaConverter.FromArrowSchema(
-                        VariantMarker.ToCanonicalSchema(pcArrow));
-                    bool hasIdentity = false;
-                    foreach (var pf in pcDelta.Fields)
-                    {
-                        if (EngineeredWood.DeltaLake.Schema.IdentityColumn.GetConfig(pf) is not null)
-                        {
-                            hasIdentity = true;
-                            break;
-                        }
-                    }
-                    if (hasIdentity)
-                    {
-                        var (genBatches, marks) = EngineeredWood.DeltaLake.Table.DeltaTable
-                            .GenerateIdentityValuesForSchema(pcDelta, bbatches,
-                                pending.PendingIdentityHwm.Count > 0 ? pending.PendingIdentityHwm : null);
-                        bbatches = new List<RecordBatch>(genBatches);
-                        foreach (var kv in marks)
-                        {
-                            pending.PendingIdentityHwm[kv.Key] = kv.Value;
-                        }
-                    }
-                }
+                // ⚠ HOIST SLICE 5 deleted the pending-created IDENTITY pre-generation that stood here. It
+                // generated values from the PARKED create schema and chained the marks so the flush could
+                // bake the final high-water marks into commit-0 — only possible while the create waited for
+                // the whole transaction. With an immediate create the table's own schema is authoritative and
+                // an identity table created in this transaction takes the SAME path as one that already
+                // existed: engineered-wood generates the values on the write and the flush's metaData action
+                // carries the marks (BuildIdentityMetadataAction). This is "stop special-casing", not a lost
+                // guarantee — but it IS observable: v0 of such a table no longer shows the final mark.
                 if (cdfAppend)
                 {
                     WriteCdcFiles(opener, tablePath, pending, bbatches, "insert");
@@ -2496,21 +2386,19 @@ public sealed class DeltaCatalog : IBackendCatalog
                 + "CREATE TABLE AS, or SET delta_write_options for later INSERTs.");
         }
         var flags = EffectiveCreateFlags(withOpts);
-        // identityColumns metadata is attached BEFORE the buffer gate so a BUFFERED identity create
-        // parks the marked schema — INSERTs into the pending table then generate values at statement
-        // time from it (chained marks), and the flush bakes the final high-water marks into commit-0.
         columns = WithIdentityMetadata(columns, identityColumns);
-        // Explicit transaction (slice 4): a FRESH-table CREATE buffers — the table exists only in the
-        // transaction buffer until COMMIT (nothing touches the _delta_log; ROLLBACK discards).
-        // CREATE over an EXISTING table stays immediate (OpenOrCreate no-op, today's semantics).
+        // ⚠ HOIST SLICE 5: a CREATE inside an explicit transaction is now IMMEDIATE — it takes the very
+        // same path an autocommit CREATE takes, below. The buffered form is gone (it used to park the
+        // schema here and have the flush create the table at COMMIT). The transaction records only that it
+        // OWNS the table, so ROLLBACK may drop it; see DeltaTxnBuffer.PendingAppends.CreatedInTxn for the
+        // trade this accepts and what it buys.
+        //
+        // ⚠ THE ORDER IS LOAD-BEARING: the mark is set only AFTER the create below has actually landed.
+        // Setting it first would let a FAILED create leave a transaction believing it owns a table it never
+        // made, and ROLLBACK would then drop whatever happens to be at that path — someone else's table.
         long createTxn = AmbientTransaction.Current;
-        if (_txnBuffer.IsExplicit(createTxn)
-            && !TableExists(TablePath(schemaName, tableName)))
-        {
-            BufferCreateTable(createTxn, TablePath(schemaName, tableName), schemaName, tableName,
-                              columns, ifNotExists, partitionColumns, sortColumns, withOpts);
-            return;
-        }
+        bool markCreated = _txnBuffer.IsExplicit(createTxn)
+                           && !TableExists(TablePath(schemaName, tableName));
         ThrowIfPendingAppends(TablePath(schemaName, tableName), "CREATE (OR REPLACE) TABLE");
         // sortColumns (native SORTED BY): persisted as fabricator.sortedBy — every append then re-applies
         // the ORDER BY (see BulkInsert), keeping the table's files in the clustered layout.
@@ -2536,6 +2424,13 @@ public sealed class DeltaCatalog : IBackendCatalog
                                                      withOpts),
                               columnMapping: flags.ColumnMapping, serializable: _serializable,
                               sortedBy: sortColumns);
+        if (markCreated)
+        {
+            // The create landed, so the transaction now owns this table and ROLLBACK may drop it.
+            _txnBuffer.GetOrCreate(createTxn, TablePath(schemaName, tableName)).CreatedInTxn = true;
+            _log.LogInformation("delta txn {Txn} created {Schema}.{Table} (rollback will drop it)",
+                createTxn, schemaName, tableName);
+        }
     }
 
     /// <summary>CREATE SCHEMA. In <c>schemas</c> mode (non-OneLake) it materializes the <c>&lt;root&gt;/&lt;schema&gt;/</c>
@@ -2585,17 +2480,16 @@ public sealed class DeltaCatalog : IBackendCatalog
             var pending = kv.Value;
             try
             {
-                if (pending.PendingCreate)
-                {
-                    FlushCreateTransaction(opener, kv.Key, txnId, pending);
-                }
                 // ⚠ `pending.HeldTxn is not null` REPLACED `pending.PendingCdc.Count > 0` (hoist 1b): CDF
                 // actions now go straight into the transaction at statement time, so the parked list is
                 // always empty and a CDF-ONLY statement (a buffered INSERT on a CDF table, which writes a
                 // cdc counterpart and nothing else) would fall through to the plain-append path below and
                 // LOSE its cdc actions with no error. The held transaction is the honest signal: it exists
                 // exactly when something staged into one.
-                else if (pending.DeletedByOrdinal.Count > 0 || pending.PendingMetadata is not null
+                //
+                // The `PendingCreate` branch that used to precede this one is gone with hoist slice 5: a
+                // created table is on storage from its CREATE, so its data is ordinary buffered work.
+                if (pending.DeletedByOrdinal.Count > 0 || pending.PendingMetadata is not null
                          || pending.AppTxnVersions.Count > 0 || pending.HeldTxn is not null
                          || pending.PendingIdentityHwm.Count > 0
                          || (pending.HasReads && pending.PinnedVersion is not null
@@ -2673,6 +2567,51 @@ public sealed class DeltaCatalog : IBackendCatalog
                 + "{Files} written file(s)",
                 txnId, kv.Key, kv.Value.Rows, reclaimed, kv.Value.Files.Count);
             DeltaTxnBuffer.DisposeBatches(kv.Value);
+            // ⚠ HOIST SLICE 5's OTHER HALF, and it must not ship without it: the create is immediate now, so
+            // a rolled-back CREATE has already put a table on storage. Dropping it is BEST EFFORT by design
+            // — rollback is the failure path, and a throw here would replace the user's real error with a
+            // cleanup error. A failure therefore leaves an EMPTY table behind and says so, loudly enough to
+            // be actionable, because "the rollback silently left a table" is the one outcome nobody could
+            // diagnose. This is the accepted regression in docs/delta-transaction-hoist.md §3.
+            //
+            // ⚠ Ordering: AFTER the file reclamation above, because DiscardBufferedFiles OPENS the table to
+            // do its work — dropping first would make it fail on every rolled-back created table.
+            if (kv.Value.CreatedInTxn)
+            {
+                DropCreatedOnRollback(txnId, kv.Key);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Drops a table this transaction CREATED, on ROLLBACK. Best effort: never throws.
+    ///
+    /// <para>Unlike the autocommit-CTAS orphan refused in
+    /// <c>docs/delta-transactions.md</c> §7.1, the authority to destroy is present here — the user typed
+    /// ROLLBACK, and the table exists only because this same transaction created it moments ago. That is the
+    /// distinction, not atomicity: <c>DROP TABLE</c> is the same unconditional recursive folder delete and we
+    /// ship it.</para>
+    ///
+    /// <para>⚠ It can still lose a concurrent writer's rows — another session may have INSERTed into the
+    /// table while it was visible. That window is the accepted price of the immediate create (§3), and it is
+    /// the reason this logs what it did rather than staying quiet.</para>
+    /// </summary>
+    private void DropCreatedOnRollback(long txnId, string path)
+    {
+        try
+        {
+            RemoveTableFolder(path);
+            _log.LogInformation("delta txn {Txn} rollback {Path}: dropped the table this transaction created",
+                txnId, path);
+        }
+        catch (System.Exception ex)
+        {
+            // Name the residue explicitly. An empty committed table nobody asked for is confusing precisely
+            // because nothing else in the session mentions it.
+            _log.LogWarning(ex,
+                "delta txn {Txn} rollback {Path}: could not drop the table this transaction created — an "
+                + "EMPTY table is left at that path; drop it manually",
+                txnId, path);
         }
     }
 
@@ -2769,30 +2708,6 @@ public sealed class DeltaCatalog : IBackendCatalog
     // (+ protocol upgrade) actions and the new schema; nothing is committed until the transaction's fused
     // flush. Requires NO buffered data changes yet (add columns BEFORE the data statements — writes then
     // run schema-overridden; changing the schema under already-buffered rows/post-images is unsupported).
-    private void BufferCreateTable(long txnId, string path, string schemaName, string tableName,
-                                   Schema columns, bool ifNotExists, IReadOnlyList<string>? partitionColumns,
-                                   IReadOnlyList<string>? sortColumns, DeltaWithOptions? withOpts)
-    {
-        var pending = _txnBuffer.GetOrCreate(txnId, path);
-        if (pending.HasAny)
-        {
-            if (pending.PendingCreate && ifNotExists)
-            {
-                return; // CREATE TABLE IF NOT EXISTS over the transaction's own pending create — no-op
-            }
-            throw new System.NotSupportedException(
-                "delta: CREATE TABLE over a table with uncommitted buffered changes in this transaction is "
-                + "not supported — COMMIT first.");
-        }
-        pending.PendingCreate = true;
-        pending.PendingArrowSchema = columns;
-        pending.CreatePartitionColumns = partitionColumns;
-        pending.CreateSortColumns = sortColumns;
-        pending.CreateOptions = withOpts; // WITH flags/properties apply at the flush's create
-        _log.LogInformation("delta txn {Txn} buffer create {Schema}.{Table}: cols={Cols}",
-            txnId, schemaName, tableName, columns.FieldsList.Count);
-    }
-
     // Shared start of every buffered schema change: guard the order rule (ALTERs before the transaction's
     // data statements — buffered rows/post-images were built under the pre-ALTER schema) and pin the base.
     private DeltaTxnBuffer.PendingAppends BeginSchemaChange(long txnId, string path,
@@ -3089,12 +3004,6 @@ public sealed class DeltaCatalog : IBackendCatalog
     private long BufferDeleteRows(long txnId, string path, string schemaName, string tableName,
                                   IReadOnlyCollection<long> ids, bool forUpdate)
     {
-        if (_txnBuffer.Get(txnId, path) is { PendingCreate: true })
-        {
-            throw new System.NotSupportedException(
-                $"delta: {(forUpdate ? "UPDATE" : "DELETE")} on a table created in the same transaction is "
-                + "not supported yet — COMMIT the CREATE first.");
-        }
         var delOpener = Opener();
         var profile = DeltaReader.GetTxnDmlProfile(delOpener, path);
         EnsureBufferedDmlEligible(profile, forUpdate ? "UPDATE" : "DELETE", forUpdate);
@@ -3181,12 +3090,6 @@ public sealed class DeltaCatalog : IBackendCatalog
     private long BufferUpdateRows(long txnId, string path, string schemaName, string tableName,
                                   Dictionary<long, object?[]> updates, int[] setSlotByColumn, Schema userSchema)
     {
-        if (_txnBuffer.Get(txnId, path) is { PendingCreate: true })
-        {
-            throw new System.NotSupportedException(
-                "delta: UPDATE on a table created in the same transaction is not supported yet — COMMIT "
-                + "the CREATE first.");
-        }
         var opener = Opener();
         var profile = DeltaReader.GetTxnDmlProfile(opener, path);
         EnsureBufferedDmlEligible(profile, "UPDATE", forUpdate: true);
@@ -3442,7 +3345,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                                       IReadOnlyList<RecordBatch> batches, string tableName,
                                       IReadOnlyList<long?>? materializedRowIds)
     {
-        if (pending.PendingCreate || batches.Count == 0)
+        if (batches.Count == 0)
         {
             return false;
         }
@@ -3502,94 +3405,6 @@ public sealed class DeltaCatalog : IBackendCatalog
     // today's autocommit CTAS commit shape (v0 CREATE TABLE + ONE WRITE for all buffered rows; single-
     // commit CTAS = an engineered-wood follow-up). A concurrent same-name create conflict-aborts (commit
     // 0's put-if-absent is the arbiter — the pre-check just gives the clear error).
-    private void FlushCreateTransaction(nint opener, string tablePath, long txnId,
-                                        DeltaTxnBuffer.PendingAppends pending)
-        => FlushCreateTransactionAsync(opener, tablePath, txnId, pending).GetAwaiter().GetResult();
-
-    private async Task FlushCreateTransactionAsync(nint opener, string tablePath, long txnId,
-                                        DeltaTxnBuffer.PendingAppends pending)
-    {
-        // Cancel the create-commit phase on interrupt — safe (degrades to rollback; the table is never on
-        // storage until the commit lands). Opener fresh from CommitTransaction. See docs/cancellation.md.
-        using var interrupt = new InterruptScope(opener);
-        var token = interrupt.Token;
-        if (TableExists(tablePath))
-        {
-            throw new System.InvalidOperationException(
-                $"delta transaction conflict on '{tablePath}': the table was created concurrently while "
-                + "the transaction was open — the transaction is rolled back; retry it.");
-        }
-        // Buffered identity create: commit-0's schema carries the FINAL chained high-water marks — the
-        // transaction's pre-generated values are already consumed as of the table's first version.
-        var createSchema = pending.PendingIdentityHwm.Count > 0
-            ? BakeIdentityMarks(pending.PendingArrowSchema!, pending.PendingIdentityHwm)
-            : pending.PendingArrowSchema!;
-        // The parked CREATE ... WITH (...) options: create-flag overrides + properties + write tuning
-        // (tuning applies to the flush's data-file writes below; the eagerly-streamed files already got it).
-        var flags = EffectiveCreateFlags(pending.CreateOptions);
-        var flushSpec = ApplyWithOptions(ResolveWriteSpec(null, null), pending.CreateOptions);
-        DeltaWriter.Create(opener, tablePath, createSchema, token,
-                           deletionVectors: flags.DeletionVectors,
-                           inCommitTimestamps: flags.InCommitTimestamps,
-                           changeDataFeed: flags.ChangeDataFeed,
-                           rowTracking: flags.RowTracking,
-                           spec: ApplyWithOptions(
-                               ResolveWriteSpec(pending.CreatePartitionColumns, schemaModeArg: null),
-                               pending.CreateOptions),
-                           columnMapping: flags.ColumnMapping,
-                           // slice B: an eagerly-streamed CTAS's files were written against THIS
-                           // pre-assigned mapping schema — the create must reuse it, never re-assign
-                           // (physical names are random GUIDs).
-                           preAssignedSchema: pending.PendingDeltaSchema,
-                           sortedBy: pending.CreateSortColumns);
-        long v = 0;
-        if (pending.Files.Count > 0 || (pending.Batches.Count > 0 && pending.PendingIdentityHwm.Count > 0))
-        {
-            // Eagerly-streamed CTAS files (+ any later collected batches) reference the fresh table in
-            // ONE write commit (v0 create + v1 write — today's flush shape).
-            var fs2 = TableFileSystems.Create(opener, tablePath);
-            var w2 = _nativeWrite && NativeParquetDataFileWriter.Available
-                ? new NativeParquetDataFileWriter(tablePath, flushSpec)
-                : null;
-            var t2 = await EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(fs2, DeltaWriter.Options(flushSpec, w2), token)
-                .ConfigureAwait(false);
-            try
-            {
-                var all = new List<EngineeredWood.DeltaLake.Table.WrittenDataFile>(pending.Files);
-                if (pending.Batches.Count > 0)
-                {
-                    // identityValuesPreGenerated: the batches carry values generated at statement time
-                    // against the chained marks; regenerating here (the committing writer's default)
-                    // would double-consume the mark and diverge from read-your-writes.
-                    all.AddRange(await t2.WriteDataFilesAsync(
-                            VariantTransport.ToCanonical(pending.Batches), token,
-                            identityValuesPreGenerated: pending.PendingIdentityHwm.Count > 0)
-                        .ConfigureAwait(false));
-                }
-                v = await t2.CommitDataFilesAsync(all, DeltaWriteMode.Append, cancellationToken: token,
-                        identityValuesPreGenerated: pending.PendingIdentityHwm.Count > 0)
-                    .ConfigureAwait(false);
-            }
-            finally
-            {
-                await t2.DisposeAsync().ConfigureAwait(false);
-            }
-        }
-        else if (pending.Batches.Count > 0)
-        {
-            v = DeltaWriter.Write(opener, tablePath, pending.BatchSchema!, pending.Batches,
-                                  DeltaWriteMode.Append, token,
-                                  deletionVectors: flags.DeletionVectors,
-                                  inCommitTimestamps: flags.InCommitTimestamps,
-                                  changeDataFeed: flags.ChangeDataFeed,
-                                  rowTracking: flags.RowTracking,
-                                  spec: flushSpec, nativeWrite: _nativeWrite,
-                                  columnMapping: flags.ColumnMapping, serializable: _serializable);
-        }
-        _log.LogInformation("delta txn {Txn} commit-create {Path}: v{Version} ({Rows} buffered row(s))",
-            txnId, tablePath, v, pending.Rows);
-    }
-
     // COMMIT flush for a transaction with buffered DML: validate the pinned base version (conflict-ABORT —
     // first-committer-wins snapshot isolation), write the buffered batches as data files (no commit), compute
     // the deletion-vector actions, and commit EVERYTHING as one atomic Delta commit. No retry — the DV
@@ -3941,22 +3756,42 @@ public sealed class DeltaCatalog : IBackendCatalog
     {
         _sortedByCache.TryRemove(TablePath(schemaName, tableName), out _);
         long dropTxn = AmbientTransaction.Current;
-        if (_txnBuffer.Get(dropTxn, TablePath(schemaName, tableName)) is { PendingCreate: true })
+        // CREATE + DROP inside one transaction still CANCELS OUT for the buffer — but the table IS on storage
+        // now (hoist slice 5), so unlike before, the real drop below must actually run. Discard this
+        // transaction's buffered work for it (that work targeted a table that is going away; its eagerly
+        // written files live inside the folder the drop removes) and clear the ownership mark so ROLLBACK does
+        // not try to drop it a second time.
+        //
+        // ⚠ THE ORDER AND THE CONDITION ARE BOTH LOAD-BEARING, and getting either wrong is silent. A first
+        // version removed the entry UNCONDITIONALLY and BEFORE the guard, which made
+        // `BEGIN; DELETE …; DROP TABLE …;` SUCCEED — the guard found nothing left to complain about. Caught by
+        // verify_delta_catalog_transactions:339, which exists for exactly that shape.
+        if (_txnBuffer.Get(dropTxn, TablePath(schemaName, tableName)) is { CreatedInTxn: true } created)
         {
-            // CREATE + DROP inside one transaction cancels out — nothing ever touched storage.
+            DisposeHeld(created);
+            DeltaTxnBuffer.DisposeBatches(created);
             _txnBuffer.RemoveTable(dropTxn, TablePath(schemaName, tableName));
-            _log.LogInformation("delta txn {Txn} drop pending-created {Schema}.{Table}: buffer discarded",
-                dropTxn, schemaName, tableName);
-            return;
         }
         ThrowIfPendingAppends(TablePath(schemaName, tableName), "DROP TABLE");
         _log.LogInformation("delta drop table {Schema}.{Table} (adls={Adls})",
             schemaName, tableName, UseAdlsDirectoryOps);
         // Any credentialed abfss:// root (OneLake included) takes the DFS-native recursive delete: DuckDB's
         // azure FileSystem implements no RemoveDirectory at all, so the host-FS path below cannot serve it.
+        RemoveTableFolder(TablePath(schemaName, tableName));
+    }
+
+    // The backend-specific recursive delete of a table folder, SHARED by DROP TABLE and by the rollback of a
+    // table this transaction created (hoist slice 5). Extracted rather than duplicated because two of the
+    // three branches are the ones that matter remotely: without them a rolled-back created table would fail
+    // to drop on precisely OneLake/abfss (DuckDB's azure FileSystem implements no RemoveDirectory at all) and
+    // on S3 (httpfs' RemoveDirectory re-lists keys WITHOUT the scheme prefix and fails its own per-file
+    // remove). A hand-rolled HostFs.RemoveDir in the rollback path would have "worked" on a local root and
+    // left an orphan table on every remote one.
+    private void RemoveTableFolder(string path)
+    {
         if (UseAdlsDirectoryOps)
         {
-            FabricLakehouse.DeleteDirectory(TablePath(schemaName, tableName), _adlsCredential);
+            FabricLakehouse.DeleteDirectory(path, _adlsCredential);
             return;
         }
         if (!HostFs.CanRemoveDir)
@@ -3965,18 +3800,16 @@ public sealed class DeltaCatalog : IBackendCatalog
         }
         try
         {
-            HostFs.RemoveDir(Opener(), TablePath(schemaName, tableName));
+            HostFs.RemoveDir(Opener(), path);
         }
         catch (System.Exception ex)
         {
-            // httpfs' S3 RemoveDirectory re-lists keys WITHOUT the scheme prefix and then fails its own
-            // per-file remove ("URL needs to start with s3://") — fall back to a provider-side recursive
-            // delete: glob every object under the table prefix and remove them file-by-file (object-store
-            // directories are implicit, and RemoveFile IS implemented for s3).
-            _log.LogInformation(
-                "delta drop {Schema}.{Table}: RemoveDirectory failed ({Err}) — per-file fallback",
-                schemaName, tableName, ex.Message);
-            RemoveDirByFiles(TablePath(schemaName, tableName));
+            // Fall back to a provider-side recursive delete: glob every object under the table prefix and
+            // remove them file-by-file (object-store directories are implicit, and RemoveFile IS implemented
+            // for s3).
+            _log.LogInformation("delta drop {Path}: RemoveDirectory failed ({Err}) — per-file fallback",
+                path, ex.Message);
+            RemoveDirByFiles(path);
         }
     }
 
@@ -4415,6 +4248,27 @@ public sealed class DeltaCatalog : IBackendCatalog
     // where the FS supports it, per-file copy+delete otherwise: object stores) and re-key the buffer.
     // The flush then creates the table at the FINAL path. Codec pending-creates park batches (no files)
     // — pure re-key.
+    // The backend-specific rename of a table folder, SHARED by ALTER TABLE RENAME and by the rename of a
+    // table this transaction CREATED (hoist slice 5) — extracted for the same reason as RemoveTableFolder:
+    // duplicating it would have given the created-table path the local-only branch and silently failed to
+    // move anything on OneLake/abfss (Azure MoveFile is unimplemented) or S3 (httpfs has no MoveFile).
+    private void RenameTableFolder(string oldPath, string newPath)
+    {
+        if (UseAdlsDirectoryOps)
+        {
+            FabricLakehouse.RenameDirectory(oldPath, newPath, _adlsCredential);
+        }
+        else if (_s3Credential is not null && S3CommitFileSystem.IsS3(_root))
+        {
+            S3CommitFileSystem.RenameDirectory(oldPath, newPath, _s3Credential);
+        }
+        else
+        {
+            HostFs.MoveDir(Opener(), oldPath, newPath);
+        }
+        _sortedByCache.TryRemove(newPath, out _);
+    }
+
     // Object-store fallback for a directory move (no MoveDir on S3): copy each of the transaction's eager
     // files to the new path and delete the source. The per-file IO is the sole async step.
     private static void MoveFilesByCopy(nint opener, string oldPath, string newPath,
@@ -4432,51 +4286,6 @@ public sealed class DeltaCatalog : IBackendCatalog
             await dst.WriteAllBytesAsync(wf.RelativePath, bytes).ConfigureAwait(false);
             await src.DeleteAsync(wf.RelativePath).ConfigureAwait(false);
         }
-    }
-
-    private void RenamePendingCreated(long txnId, string schemaName, string tableName, string newName,
-                                      DeltaTxnBuffer.PendingAppends pending)
-    {
-        string oldPath = TablePath(schemaName, tableName);
-        string newPath = TablePath(schemaName, newName);
-        if (_txnBuffer.HasPending(txnId, newPath) || TableExists(newPath))
-        {
-            throw new System.InvalidOperationException(
-                $"delta RENAME TABLE: target '{schemaName}.{newName}' already exists.");
-        }
-        var opener = Opener();
-        if (pending.Files.Count > 0)
-        {
-            if (UseAdlsDirectoryOps)
-            {
-                FabricLakehouse.RenameDirectory(oldPath, newPath, _adlsCredential);
-            }
-            else if (_s3Credential is not null && S3CommitFileSystem.IsS3(_root))
-            {
-                // SECRET-routed s3://: server-side CopyObject rename (no bytes through the client).
-                S3CommitFileSystem.RenameDirectory(oldPath, newPath, _s3Credential);
-            }
-            else
-            {
-                try
-                {
-                    HostFs.MoveDir(opener, oldPath, newPath);
-                }
-                catch
-                {
-                    // Object store without directory move (secretless S3): the folder holds ONLY this
-                    // transaction's eager files — copy each and delete the source through the host FS.
-                    MoveFilesByCopy(opener, oldPath, newPath, pending.Files);
-                }
-            }
-        }
-        if (!_txnBuffer.RenameTable(txnId, oldPath, newPath))
-        {
-            throw new System.InvalidOperationException(
-                $"delta RENAME TABLE: could not re-key the pending table '{schemaName}.{tableName}'.");
-        }
-        _log.LogInformation("delta txn {Txn} rename pending-created {Old} -> {New} ({Files} file(s) moved)",
-            txnId, oldPath, newPath, pending.Files.Count);
     }
 
     public void AlterTable(int k, string s, string t, string? a1, string? a2, Field? c, int f)
@@ -4499,12 +4308,6 @@ public sealed class DeltaCatalog : IBackendCatalog
                 || k == AlterKind.AddField || k == AlterKind.DropField))
         {
             var alterPath = TablePath(s, t);
-            if (_txnBuffer.Get(alterTxn, alterPath) is { PendingCreate: true })
-            {
-                throw new System.NotSupportedException(
-                    "delta: ALTER of a table created in the same transaction is not supported — declare the "
-                    + "full schema in CREATE, or COMMIT first.");
-            }
             switch (k)
             {
                 case AlterKind.AddColumn:
@@ -4542,17 +4345,42 @@ public sealed class DeltaCatalog : IBackendCatalog
                     return;
             }
         }
-        // RENAME TABLE of a table CREATED in this transaction (dbt's table materialization: CREATE
-        // <model>__dbt_tmp AS …; ALTER <model> RENAME TO <model>__dbt_backup; ALTER <model>__dbt_tmp
-        // RENAME TO <model>; COMMIT): the table exists only in the buffer, so the rename re-keys the
-        // buffer entry and moves any eagerly-written files to the new folder — the flush then creates
-        // the table at its FINAL path.
+        // RENAME TABLE of a table CREATED in this transaction — dbt's table materialization, and the shape
+        // that caught this slice's last gap (verify_delta_catalog_transactions:2872):
+        //   BEGIN; CREATE <model>__dbt_tmp AS …;
+        //          ALTER <model> RENAME TO <model>__dbt_backup;
+        //          ALTER <model>__dbt_tmp RENAME TO <model>; COMMIT
+        // The dedicated buffer-only path this replaces re-keyed the entry and moved the eagerly-written
+        // files, because the table was not on storage. It IS on storage now, so the rename below is the
+        // ORDINARY folder rename — but two things still have to happen here, and both are silent if missed:
+        //   1. the buffer entry must be RE-KEYED, since it is keyed by path and holds this statement's
+        //      buffered rows plus the CreatedInTxn ownership mark. Lose it and the flush writes nothing and
+        //      the rollback drops nothing;
+        //   2. the held EW table/transaction must be DISPOSED first — they were opened against the OLD path
+        //      and their filesystem would keep writing there after the folder moved.
+        // The pending-appends guard must therefore be SKIPPED for this case (buffered rows are expected);
+        // it still applies to every other ALTER and to a table this transaction did not create.
         if (k == AlterKind.RenameTable
-            && _txnBuffer.Get(alterTxn, TablePath(s, t)) is { PendingCreate: true } pendingRen)
+            && _txnBuffer.Get(alterTxn, TablePath(s, t)) is { CreatedInTxn: true } renCreated)
         {
             string renTo = a1 ?? throw new System.InvalidOperationException(
                 "delta RENAME TABLE requires a new table name.");
-            RenamePendingCreated(alterTxn, s, t, renTo, pendingRen);
+            string renNew = TablePath(s, renTo);
+            if (_txnBuffer.HasPending(alterTxn, renNew) || TableExists(renNew))
+            {
+                throw new System.InvalidOperationException(
+                    $"delta RENAME TABLE: '{renTo}' already exists.");
+            }
+            DisposeHeld(renCreated);
+            RenameTableFolder(TablePath(s, t), renNew);
+            if (!_txnBuffer.RenameTable(alterTxn, TablePath(s, t), renNew))
+            {
+                throw new System.InvalidOperationException(
+                    $"delta RENAME TABLE: the transaction's buffer entry for '{t}' could not be re-keyed.");
+            }
+            _sortedByCache.TryRemove(TablePath(s, t), out _);
+            _log.LogInformation("delta txn {Txn} rename created table {Old} -> {New}",
+                alterTxn, TablePath(s, t), renNew);
             return;
         }
         ThrowIfPendingAppends(TablePath(s, t), "ALTER TABLE");
@@ -4627,18 +4455,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 // CopyObject rename (httpfs has no MoveFile; no data crosses the client); local → the host FS
                 // move (FileSystem::MoveFile, atomic). A secretless abfss:// / s3:// still throws cleanly
                 // (attach with a SECRET for rename support).
-                if (UseAdlsDirectoryOps)
-                {
-                    FabricLakehouse.RenameDirectory(TablePath(s, t), TablePath(s, newName), _adlsCredential);
-                }
-                else if (_s3Credential is not null && S3CommitFileSystem.IsS3(_root))
-                {
-                    S3CommitFileSystem.RenameDirectory(TablePath(s, t), TablePath(s, newName), _s3Credential);
-                }
-                else
-                {
-                    HostFs.MoveDir(Opener(), TablePath(s, t), TablePath(s, newName));
-                }
+                RenameTableFolder(TablePath(s, t), TablePath(s, newName));
                 _sortedByCache.TryRemove(TablePath(s, t), out _);
                 _sortedByCache.TryRemove(TablePath(s, newName), out _);
                 return;
