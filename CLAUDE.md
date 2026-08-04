@@ -69,11 +69,20 @@ Full record (moved verbatim from here): [docs/ew-master-migration.md](docs/ew-ma
 
 Goal: run on **ORIGINAL upstream engineered-wood** with our needs met by high-probability PRs; maintain our own only
 if that is impossible, and then **make our amendments clear IN THE CODE**.
-- **⚠ ZERO-PATCH IS GATED ON DuckDB, NOT ON UPSTREAM'S APPETITE.** 392 of the 649 production lines (60%) are the
-  **variant transport**, which exists only because DuckDB cannot carry a nested VARIANT across the C data interface
-  (duckdb/duckdb#24157). Upstream would rightly decline another project's workaround ⇒ a plain `PackageReference` is
-  unreachable until #24157 is fixed. **Do not chase it with more PRs.** Realistic target: patch set ==
-  variant transport ONLY (~257 of 649 lines are upstreamable).
+- **THE VARIANT TRANSPORT CAN LEAVE EW — VERIFIED 2026-08-04 (3 checks, one compile-proven), which supersedes an
+  earlier note here saying zero-patch was "gated on DuckDB #24157".** 392 of the 649 lines (60%) are the transport,
+  and it is OURS-BY-DESIGN (never offer it) — but it does not have to live in EW. The patch **replaces** upstream's
+  `VariantColumnCoercion.Coerce` instead of running after it, which is why it must normalise FOUR layouts
+  (canonical / shredded / bare struct from an unannotated file / seam blob) keyed off the Delta schema. Let `Coerce`
+  run unpatched and convert **canonical ⇄ blob in the BRIDGE at the DuckDB boundary** — one layout each way. The
+  C-interface crash is irrelevant: EW hands us in-process .NET objects, so we can hold a canonical `VariantArray`
+  and flatten it only on export. Checks: ONE read exit (`DeltaTable.cs:7796`; CDF never touches variant handling);
+  the Bridge can convert BOTH ways (compile-proven — `Apache.Arrow.Scalars.Variant` types + `VariantShredding`,
+  which is EW's but `public static` and transitively referenced; ⚠ the `ArrowArrayFactory` collision that file warns
+  about does NOT apply to the Bridge); and all four write sites are documented "no-op for canonical input" so they
+  can be deleted. ⇒ **target is ZERO EW patch, not "variant transport only", and it does NOT wait on DuckDB.**
+  ⚠ Two qualifications: the lines MOVE (≈150–200 land in the Bridge, one layout instead of four), and our
+  `ToTransportBlobs` also handles a *seam-delivered blob* that `Coerce` may not know — **check that first.**
 - **Sequencing: offering and building are NOT sequential** — the branch model does both, proved by the 2026-08-02
   bump (three of eight upstream commits were our own offers coming back re-cut). Stay on `fabricator-patches` and
   keep building. **Pull ONE thing forward: MARK the amendments** (`// [FABRICATOR-PATCH: OFFER-READY | OFFERED #n |

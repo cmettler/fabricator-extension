@@ -2238,16 +2238,48 @@ and the precondition for replacing the buffer with a long-lived transaction.
 high probability of being merged. Only if that proves impossible do we maintain our own — and then **it must be
 clear IN THE CODE what our amendments are.**
 
-**⚠ ZERO-PATCH IS NOT REACHABLE, AND THE BLOCKER IS NOT UPSTREAM'S APPETITE — IT IS DuckDB.** Of the 649
-production lines, **392 (60%) are the variant transport** (`VariantTransport.cs` 322 + `SchemaConverter` 50 +
-`DeltaTableOptions` 15 + csproj 5). It exists solely because DuckDB cannot carry a nested VARIANT across the C data
-interface (duckdb/duckdb#24157), and upstream would be right to decline a workaround for another project's bug. So
-a `PackageReference` to unmodified upstream is gated on **DuckDB #24157**, not on Curt. Do not chase it as though
-more PRs would get us there.
+**The variant transport is 392 of the 649 production lines (60%)** — `VariantTransport.cs` 322 +
+`SchemaConverter` 50 + `DeltaTableOptions` 15 + csproj 5 — and exists only because DuckDB cannot carry a nested
+VARIANT across the C data interface (duckdb/duckdb#24157). Upstream would be right to decline a workaround for
+another project's bug, so it is **OURS-BY-DESIGN** and must never be offered.
 
-**⇒ The realistic target is: patch set == variant transport ONLY.** ~257 lines of the current 649 are
-upstreamable; the rest waits on DuckDB. That target is achievable and worth aiming at, because it makes every
-future bump a merge of ONE self-contained file rather than a negotiation.
+**⚠ BUT IT DOES NOT HAVE TO LIVE IN EW — VERIFIED 2026-08-04, and this supersedes an earlier claim in this section
+that a `PackageReference` was "gated on DuckDB #24157, not on Curt".** That framing was wrong: the transport is a
+BOUNDARY conversion, and the boundary that matters is ours, not EW's.
+
+The patch's real cost is that it **replaces** upstream's variant handling rather than running after it:
+
+```csharp
+cleanResult = _options.VariantTransportBlob
+    ? VariantTransport.ToTransportBlobs(cleanResult, snapshot.Schema)   // ours — normalises FOUR layouts
+    : VariantColumnCoercion.Coerce(cleanResult, expectedSchema);        // upstream's — same normalisation
+```
+
+Hence the 322 lines: it must handle canonical `VariantArray`, **shredded**, bare struct-of-binary (an unannotated
+file from Spark 4.0.x) and a seam-delivered blob, keyed off the DELTA schema because an unannotated variant is
+indistinguishable from a real struct at the Arrow level. **Upstream's `Coerce` already does that normalisation** —
+to canonical. So: let it run unpatched, and convert **canonical ⇄ blob in the Bridge at the DuckDB boundary**. One
+layout in, one out.
+
+**The C-interface crash is irrelevant to this** — EW hands the Bridge RecordBatches as in-process .NET objects; the
+crash only occurs on export to DuckDB, so the Bridge can hold a canonical `VariantArray` and flatten it late.
+
+**Three checks, all passed (2026-08-04):**
+
+| | result |
+|---|---|
+| a single read exit? | ✅ ONE site (`DeltaTable.cs:7796`, inside `ProcessFileBatchesAsync`). `ReadChangesAsync` (CDF) does not touch variant handling at all — a pre-existing EW gap, unaffected by the move |
+| can the Bridge convert both ways? | ✅ **COMPILE-PROVEN** both directions. `VariantArray.Builder`/`VariantReader`/`VariantValue` are `Apache.Arrow.Scalars.Variant`; `VariantShredding` is EW's but `public static` and transitively referenced via the `DeltaLake.Table` ProjectReference. ⚠ The `ArrowArrayFactory` collision `VariantTransport.cs` warns about does NOT apply to the Bridge — it has no `InternalsVisibleTo` on `EngineeredWood.Parquet` |
+| write sites interceptable? | ✅ all four are documented **"no-op for canonical input"**, so handing EW canonical arrays lets them be DELETED |
+
+**⇒ Revised target: patch set == the ~257 upstreamable lines, and then ZERO — without waiting on DuckDB.**
+
+**Two honest qualifications.** (1) The lines MOVE rather than vanish: a reduced version (one layout, not four)
+lands in the Bridge — call it 150–200 lines of ours, not zero work. (2) **One unknown remains:** our
+`ToTransportBlobs` also handles a *seam-delivered blob*, which may be our own concept (from the `IDataFileReader`
+seam) that `Coerce` does not know. That is the one place this could still bite; check it first when implementing.
+Runtime cost is one extra materialisation per batch on variant tables (build canonical, flatten) — performance,
+not correctness. Gate: the 144-assertion variant suite, ideally plus a re-run of the live Spark/kernel round trip.
 
 **Answering "stick with the branch and fix features, then clean up / decide?" — yes, with ONE thing pulled
 forward.** Offering and building are NOT sequential: the branch model already handles both at once, and the
