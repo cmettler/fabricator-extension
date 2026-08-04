@@ -2307,14 +2307,41 @@ EW Table.Tests 872 → **871** × {net10.0, net472}.
 **Gates:** hermetic **63/63 — 5686** after the wiring (identical to baseline), variant suite **157**.
 
 **STILL IN EW — the WRITE half, ~213 lines:** `VariantTransport.ToVariantArrays` + its helpers (163) and the
-`SchemaConverter` marker support (50). Moving it needs the conversion at ~4 host-side points —
-`BulkInsert(IArrowArrayStream)` (a genuine funnel: its own comment says *"EVERY write (INSERT / CTAS / COPY,
-codec or native) passes exactly once"*), the UPDATE path's SET columns, the buffered-CDC rows, and a
-`ToCanonicalSchema` inverse for create-time schemas.
+`SchemaConverter` marker support (50).
+
 ⚠ **Its failure mode is worse than the read half's**: with the `SchemaConverter` patch gone, a blob column that
 slips through maps to Delta **`binary`**, so a CREATE/CTAS would record the wrong type DURABLY and silently. An
-INSERT into an existing variant table would more likely error on the type mismatch. Deliberately left as its own
-change with its own gate rather than rushed alongside the read half.
+INSERT into an existing variant table would more likely error on the type mismatch.
+
+#### ⚠ ATTEMPTED AND REVERTED (2026-08-04): the ingest funnel does NOT work. Read this before retrying.
+
+The obvious design — canonicalise once at `BulkInsert(IArrowArrayStream data, …)`, whose own comment says
+*"EVERY write (INSERT / CTAS / COPY, codec or native) passes exactly once"* — was built, and it fails for a
+reason that comment does not reveal:
+
+**That stream has TWO SINKS WITH OPPOSITE DIALECT NEEDS.** The codec path materialises it for
+engineered-wood (wants CANONICAL); the `native_write` path hands the SAME stream straight BACK to DuckDB's
+`COPY` via `DeltaWriter.TryStreamCreateFiles` (wants TRANSPORT — the leaf blob is the only form DuckDB can
+carry). Canonicalising at ingest serves the first and breaks the second. Observed as
+`complete_bulk failed: host host_query failed: INTERNAL Error: Attempted to access index 2 within vector of
+size 2` — i.e. the COPY, not engineered-wood, and not an error that names variants at all.
+
+**A second symptom confirms the diagnosis**: the txn buffer deliberately holds **two dialects** —
+`PendingArrowSchema` is TRANSPORT (it serves BIND schemas, which cross the C ABI) while `BatchSchema` matches
+the batches. Changing the ingest dialect therefore cascades: `PendingArrowSchema` assignments at `:2172` and
+`:2188` had to be converted BACK to transport, and the UPDATE path's `userSchema` (used to BUILD post-images)
+had to be converted FORWARD. Needing four compensating conversions to keep one funnel honest is the signal that
+the funnel is in the wrong place.
+
+**⇒ Retry it at the ENGINEERED-WOOD CALL SITES, not at ingest** — ~13 local conversions (`DeltaWriter.Write`
+×3, `DeltaWriter.Create` ×2, `WriteDataFilesAsync` ×4, `WriteChangeDataFilesAsync`, `StageChangeDataAsync` ×2,
+`table.WriteAsync`, plus `ExternalTableRouting`), each converting only what it hands EW and changing no
+existing invariant. More sites, but no dialect anywhere else moves.
+
+**What was kept from the attempt:** nothing in code — it was reverted whole and the variant suite re-verified at
+157. `VariantMarker.ToCanonicalSchema` (the schema inverse, ~90 lines) and
+`VariantTransport.CanonicalStream`/`HasTransportField` were written and compiled clean; re-add them when the
+write half is done properly rather than leaving them unused.
 
 **Two honest qualifications.** (1) The lines MOVE rather than vanish: a reduced version (one layout, not four)
 lands in the Bridge — call it 150–200 lines of ours, not zero work. (2) **One unknown remains:** our

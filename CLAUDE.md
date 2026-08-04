@@ -91,12 +91,22 @@ if that is impossible, and then **make our amendments clear IN THE CODE**.
     `VariantColumnCoercion.Coerce` line, byte-identical). `VariantTransport.cs` 322 → 163. EW Table.Tests
     872 → **871** × both TFMs (one read-direction test deleted; the shredding round-trip ADAPTED to read back
     canonically rather than deleted — its subject is still EW's). Gates: hermetic **63/63 — 5686**, variant 157.
-  - **WRITE HALF STILL IN EW (~213 lines: `ToVariantArrays` 163 + `SchemaConverter` 50).** Needs the conversion
-    at ~4 host points — `BulkInsert(IArrowArrayStream)` (a real funnel: *"EVERY write … passes exactly once"*),
-    the UPDATE SET columns, buffered-CDC rows, and a `ToCanonicalSchema` inverse for create schemas.
+  - **WRITE HALF STILL IN EW (~213 lines: `ToVariantArrays` 163 + `SchemaConverter` 50).**
     ⚠ **Worse failure mode than the read half:** without the `SchemaConverter` patch, a blob that slips through
     maps to Delta **`binary`** — a CREATE/CTAS would record the wrong type durably and SILENTLY (an INSERT into an
-    existing variant table would more likely error). Left as its own change with its own gate.
+    existing variant table would more likely error).
+    - **⚠ THE INGEST-FUNNEL DESIGN WAS BUILT AND REVERTED (2026-08-04) — do not retry it.** Canonicalising once at
+      `BulkInsert` looks right (its comment says *"EVERY write … passes exactly once"*) but **that stream has TWO
+      SINKS WITH OPPOSITE NEEDS**: the codec path wants CANONICAL, while `native_write` hands the SAME stream back
+      to DuckDB's `COPY` (`DeltaWriter.TryStreamCreateFiles`) which needs the TRANSPORT blob. Symptom:
+      `complete_bulk failed: … INTERNAL Error: Attempted to access index 2 within vector of size 2` — the COPY, and
+      nothing naming variants. Second confirmation: the txn buffer holds **two dialects** on purpose
+      (`PendingArrowSchema` TRANSPORT for binds, `BatchSchema` matching the batches), so the funnel needed FOUR
+      compensating conversions (`:2172`, `:2188`, the UPDATE's `userSchema`, the immediate create) — needing that
+      many to keep one funnel honest is the signal it is in the wrong place. **⇒ retry at the ~13 EW CALL SITES**
+      (`DeltaWriter.Write` ×3, `Create` ×2, `WriteDataFilesAsync` ×4, `WriteChangeDataFilesAsync`,
+      `StageChangeDataAsync` ×2, `table.WriteAsync`, `ExternalTableRouting`), each converting only what it hands
+      EW so no dialect elsewhere moves. Reverted whole; variant suite re-verified at 157.
 - **Sequencing: offering and building are NOT sequential** — the branch model does both, proved by the 2026-08-02
   bump (three of eight upstream commits were our own offers coming back re-cut). Stay on `fabricator-patches` and
   keep building. **Pull ONE thing forward: MARK the amendments** (`// [FABRICATOR-PATCH: OFFER-READY | OFFERED #n |
