@@ -91,6 +91,20 @@ reviewing it. They change the order, so read them before starting.**
 2. **CDF onto `StageChangeDataAsync`**, now safe because there is only ever one transaction per table.
    Retires `WriteChangeDataFilesAsync` (45 lines) and the upstream offer. Gate:
    `verify_delta_catalog_changes` + the CDF sections of the transactions suite.
+   - **⚠ It does NOT mean buffering CDF ROWS** (asked 2026-08-04, and the answer is the reverse).
+     `StageChangeDataAsync(rows, changeType, …)` writes the `_change_data` parquet IMMEDIATELY
+     (`WriteChangeDataFilesForAsync`) and only then files the small `cdc` actions via `StageInternal`. So
+     rows are eager in both designs — today via our own 45-line writer, after via EW's — and the hoist
+     actually holds LESS, because `pending.PendingCdc` goes away. The `CLAUDE.md` objection this retires
+     is the mirror image of the worry: it argued against DEFERRING the call to flush precisely because
+     that would hold the pre/post-images until COMMIT.
+   - **A CAPABILITY GAIN, not just a deletion: this slice can close the CDF row-identity gap.**
+     `StageChangeDataAsync` takes `rowIds` + `rowCommitVersions`, and our feed leaves identity NULL
+     today. A `cdc` action has no `baseRowId`, so the change file is the only place a change row's
+     identity can live. ⚠ Two traps in one signature: omitting `rowIds` silently yields NULL ids (no
+     error), and omitting `rowCommitVersions` defaults every row to the COMMITTING version — correct for
+     a post-image, **wrong for a pre-image**. So the pre-image call must pass the version each row was
+     last changed in, which is what a `DeltaRowMetadata.RowTracking` read reports.
 3. **Data files + row deletes stage at statement time** (`StageDataFilesAsync` /
    `StageRowDeletesAsync`). The buffer KEEPS its `Files` / `DeletedByOrdinal` copies — they feed
    read-your-writes. Gate: transactions 944, update 63, delete 28, row-level concurrency 93.
