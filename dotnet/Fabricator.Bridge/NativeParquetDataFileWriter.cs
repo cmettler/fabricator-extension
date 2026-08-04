@@ -61,7 +61,12 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
             {
                 throw new InvalidOperationException("native delta write: no batches to write");
             }
-            first = e.Current;
+            // Canonical VariantArray -> the ew.variant_transport leaf blob before anything reaches DuckDB:
+            // engineered-wood now hands us its canonical form (VariantColumnCoercion, unpatched), and DuckDB's
+            // ArrowAppender crashes on a nested extension type. Applied to the PEEKED batch too, because its
+            // schema is what the COPY is built from — converting only the stream would describe the file with
+            // a variant struct and then feed it blobs.
+            first = VariantTransport.ToTransport(e.Current);
         }
         catch
         {
@@ -81,10 +86,10 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
     {
         try
         {
-            yield return first;
+            yield return first; // already converted by the caller (its schema drives the COPY)
             while (await rest.MoveNextAsync().ConfigureAwait(false))
             {
-                yield return rest.Current;
+                yield return VariantTransport.ToTransport(rest.Current);
             }
         }
         finally

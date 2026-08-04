@@ -656,9 +656,12 @@ internal static class DeltaReader
             var nested = NestedMappedSchema(table.CurrentSnapshot);
             await foreach (var batch in table.ReadAllAsync(columns, filter, token).ConfigureAwait(false))
             {
-                yield return nested is null
+                var mapped = nested is null
                     ? batch
                     : ArrowColumnMappingRename.RenameBatch(batch, nested, toPhysical: false);
+                // Canonical VariantArray -> the ew.variant_transport leaf blob the C ABI carries. EW emits
+                // canonical now (VariantColumnCoercion, UNPATCHED); flattening at the boundary is ours.
+                yield return VariantTransport.ToTransport(mapped);
             }
         }
         finally
@@ -734,9 +737,10 @@ internal static class DeltaReader
                 }, token).ConfigureAwait(false))
             {
                 var batch = RenameRowAddressToDuckDbRowId(raw);
-                yield return nested is null
+                var mapped = nested is null
                     ? batch
                     : ArrowColumnMappingRename.RenameBatch(batch, nested, toPhysical: false);
+                yield return VariantTransport.ToTransport(mapped); // canonical -> ew.variant_transport blob
             }
         }
         finally
@@ -1025,12 +1029,15 @@ internal static class DeltaReader
                            ct)
                            .ConfigureAwait(false))
         {
+            // Transport form, like every other read exit: the buffered-UPDATE consumer substitutes SET values
+            // that arrive from DuckDB as ew.variant_transport blobs (DeltaCatalog keeps the marker on them),
+            // so a canonical read-back column would not match its replacement.
             if (metadata == DeltaRowMetadata.None)
             {
-                yield return batch;
+                yield return VariantTransport.ToTransport(batch);
                 continue;
             }
-            yield return StripMetadata(batch, rowIdsOut, sourceTrackingOut);
+            yield return VariantTransport.ToTransport(StripMetadata(batch, rowIdsOut, sourceTrackingOut));
         }
     }
 
@@ -1207,9 +1214,10 @@ internal static class DeltaReader
             await foreach (var batch in table.ReadAtVersionAsync(snap.Version, columns, filter, token)
                                .ConfigureAwait(false))
             {
-                yield return nested is null
+                var mapped = nested is null
                     ? batch
                     : ArrowColumnMappingRename.RenameBatch(batch, nested, toPhysical: false);
+                yield return VariantTransport.ToTransport(mapped);
             }
         }
         finally
@@ -1418,9 +1426,10 @@ internal static class DeltaReader
                 }, token).ConfigureAwait(false))
             {
                 var batch = RenameRowAddressToDuckDbRowId(raw);
-                yield return nested is null
+                var mapped = nested is null
                     ? batch
                     : ArrowColumnMappingRename.RenameBatch(batch, nested, toPhysical: false);
+                yield return VariantTransport.ToTransport(mapped); // canonical -> ew.variant_transport blob
             }
         }
         finally

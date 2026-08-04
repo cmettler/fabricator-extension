@@ -72,7 +72,12 @@ internal sealed class NativeParquetDataFileReader : IDataFileReader
             {
                 break;
             }
-            yield return rb;
+            // DuckDB hands a VARIANT column across as the ew.variant_transport LEAF BLOB (the type extension
+            // in fabricator_variant.cpp), but engineered-wood's read pipeline expects the physical layout the
+            // Delta spec requires: VariantColumnCoercion THROWS on a BinaryArray whose schema says variant.
+            // Converting here is what lets that coercion stay UNPATCHED — the seam is ours, so the adaptation
+            // belongs on this side of it.
+            yield return VariantTransport.ToCanonical(rb);
         }
     }
 

@@ -81,8 +81,22 @@ if that is impossible, and then **make our amendments clear IN THE CODE**.
   which is EW's but `public static` and transitively referenced; ⚠ the `ArrowArrayFactory` collision that file warns
   about does NOT apply to the Bridge); and all four write sites are documented "no-op for canonical input" so they
   can be deleted. ⇒ **target is ZERO EW patch, not "variant transport only", and it does NOT wait on DuckDB.**
-  ⚠ Two qualifications: the lines MOVE (≈150–200 land in the Bridge, one layout instead of four), and our
-  `ToTransportBlobs` also handles a *seam-delivered blob* that `Coerce` may not know — **check that first.**
+  - **READ HALF DONE (2026-08-04): patch set 649 → 469.** `Fabricator.Bridge/VariantTransport.cs` owns
+    canonical⇄blob and applies it at **THREE** boundaries — the 5 `DeltaReader` read exits (canonical→blob), the
+    native-read seam (blob→canonical), and **`NativeParquetDataFileWriter`** (canonical→blob). ⚠ **The third was
+    not in the plan; the variant suite caught it** at the OPTIMIZE section — the native writer feeds DuckDB's
+    `COPY`, so it needs flattening too, **including the PEEKED batch whose schema builds the COPY** (converting
+    only the stream would describe the file with a variant struct and then feed it blobs). Removed from EW:
+    `ToTransportBlobs`, the `VariantTransportBlob` flag, and the read branch (now upstream's single
+    `VariantColumnCoercion.Coerce` line, byte-identical). `VariantTransport.cs` 322 → 163. EW Table.Tests
+    872 → **871** × both TFMs (one read-direction test deleted; the shredding round-trip ADAPTED to read back
+    canonically rather than deleted — its subject is still EW's). Gates: hermetic **63/63 — 5686**, variant 157.
+  - **WRITE HALF STILL IN EW (~213 lines: `ToVariantArrays` 163 + `SchemaConverter` 50).** Needs the conversion
+    at ~4 host points — `BulkInsert(IArrowArrayStream)` (a real funnel: *"EVERY write … passes exactly once"*),
+    the UPDATE SET columns, buffered-CDC rows, and a `ToCanonicalSchema` inverse for create schemas.
+    ⚠ **Worse failure mode than the read half:** without the `SchemaConverter` patch, a blob that slips through
+    maps to Delta **`binary`** — a CREATE/CTAS would record the wrong type durably and SILENTLY (an INSERT into an
+    existing variant table would more likely error). Left as its own change with its own gate.
 - **Sequencing: offering and building are NOT sequential** — the branch model does both, proved by the 2026-08-02
   bump (three of eight upstream commits were our own offers coming back re-cut). Stay on `fabricator-patches` and
   keep building. **Pull ONE thing forward: MARK the amendments** (`// [FABRICATOR-PATCH: OFFER-READY | OFFERED #n |

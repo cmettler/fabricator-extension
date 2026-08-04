@@ -2274,6 +2274,48 @@ crash only occurs on export to DuckDB, so the Bridge can hold a canonical `Varia
 
 **⇒ Revised target: patch set == the ~257 upstreamable lines, and then ZERO — without waiting on DuckDB.**
 
+#### DONE: the READ half has moved (2026-08-04). 649 → 469 insertions.
+
+Built and gated. The Bridge now owns the canonical⇄blob conversion in
+`Fabricator.Bridge/VariantTransport.cs` (~330 lines, one layout each way instead of four) and applies it at
+**three** boundaries — not the two originally planned:
+
+| boundary | direction |
+|---|---|
+| the 5 data-read exits in `DeltaReader` | canonical → transport blob |
+| `NativeParquetDataFileReader` (native-read seam → EW) | blob → canonical |
+| **`NativeParquetDataFileWriter`** (EW → DuckDB's COPY) | canonical → transport blob |
+
+**⚠ The third was NOT in the plan and the suite is what caught it.** `verify_delta_catalog_variant` failed at
+the OPTIMIZE section: the native writer hands EW's batches to DuckDB's `COPY`, so with EW now producing
+canonical arrays that path needed flattening too — **including the PEEKED first batch**, whose schema is what
+the COPY is built from. Converting only the stream would have described the file with a variant struct and then
+fed it blobs.
+
+**Removed from EW:** `ToTransportBlobs` (~160 lines) — dead the moment `VariantTransportBlob` stopped being set,
+so the deletion was mechanical — plus the `DeltaTableOptions.VariantTransportBlob` flag (15) and the read-side
+branch in `ProcessFileBatchesAsync`, which reverts to upstream's single `VariantColumnCoercion.Coerce` line
+byte-for-byte. `VariantTransport.cs` 322 → **163** (write direction only).
+
+**Test moves:** EW's `CanonicalWritten_ReadsBackAsTransportBlobs` is deleted (it tested the removed read
+direction; the end-to-end is covered by our 157-assertion suite), and
+`TransportRoundTrip_UniformColumnShredsAndReassembles` was **adapted rather than deleted** — its real subject is
+that a uniform column SHREDS on write and REASSEMBLES on read, which is still this library's concern, so it now
+reads back canonically and asserts the `value` child plus `typed_value` being absent (proving reassembly ran).
+EW Table.Tests 872 → **871** × {net10.0, net472}.
+
+**Gates:** hermetic **63/63 — 5686** after the wiring (identical to baseline), variant suite **157**.
+
+**STILL IN EW — the WRITE half, ~213 lines:** `VariantTransport.ToVariantArrays` + its helpers (163) and the
+`SchemaConverter` marker support (50). Moving it needs the conversion at ~4 host-side points —
+`BulkInsert(IArrowArrayStream)` (a genuine funnel: its own comment says *"EVERY write (INSERT / CTAS / COPY,
+codec or native) passes exactly once"*), the UPDATE path's SET columns, the buffered-CDC rows, and a
+`ToCanonicalSchema` inverse for create-time schemas.
+⚠ **Its failure mode is worse than the read half's**: with the `SchemaConverter` patch gone, a blob column that
+slips through maps to Delta **`binary`**, so a CREATE/CTAS would record the wrong type DURABLY and silently. An
+INSERT into an existing variant table would more likely error on the type mismatch. Deliberately left as its own
+change with its own gate rather than rushed alongside the read half.
+
 **Two honest qualifications.** (1) The lines MOVE rather than vanish: a reduced version (one layout, not four)
 lands in the Bridge — call it 150–200 lines of ours, not zero work. (2) **One unknown remains:** our
 `ToTransportBlobs` also handles a *seam-delivered blob*, which may be our own concept (from the `IDataFileReader`
