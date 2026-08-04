@@ -179,6 +179,28 @@ Consequences, both of which matter beyond slice 1a:
      actually holds LESS, because `pending.PendingCdc` goes away. The `CLAUDE.md` objection this retires
      is the mirror image of the worry: it argued against DEFERRING the call to flush precisely because
      that would hold the pre/post-images until COMMIT.
+   - **✅ SHARING THE HELD TABLE IS SAFE — checked 2026-08-04, and it was the last open risk.** The CDF
+     path opens its OWN table with `DeltaWriter.Options()`, i.e. WITHOUT the native data-file writer, while
+     the held table carries one (the flush's `WriteDataFilesAsync` needs it). That looked like it would
+     silently reroute `_change_data` parquet through DuckDB's COPY. It does not:
+     `WriteChangeDataFilesForAsync` delegates to `ChangeDataFeed.CdfWriter.WriteAsync`, which writes via
+     `fs.CreateAsync` and **never consults `_options.DataFileWriter`**. Change files are always EW-codec
+     written. So the CDF path's plain options were never load-bearing for the CDF write itself.
+   - **⚠ THE IO WIN OF 1b LIVES HERE, and it is per STATEMENT:** `WriteCdcFilesAsync` opens and disposes
+     its own `DeltaTable` on the first non-empty batch of EVERY buffered CDF statement. Reusing the held
+     table removes one table open (one `_delta_log` LIST) per such statement — the reduction that slice 1a
+     was wrongly credited with.
+   - **⚠ THE FLUSH ROUTING CONDITION MUST CHANGE WITH IT** (`DeltaCatalog.cs:2593`). It currently routes a
+     table to `FlushDmlTransaction` when `pending.PendingCdc.Count > 0`, among others. Once CDF actions go
+     straight into the transaction, `PendingCdc` is empty and a CDF-only statement would fall through to
+     the plain-append path — losing the cdc actions entirely, silently. Replace that disjunct with
+     `pending.HeldTxn is not null`, which is the honest signal ("something staged into a transaction").
+     This is the one part of the slice that fails SILENTLY if missed, so gate it with a CDF-only buffered
+     statement (a buffered INSERT on a CDF table, which writes its cdc counterpart and nothing else).
+   - **Scope note: retiring our 45-line `WriteChangeDataFilesAsync` is an ENGINEERED-WOOD change**, so the
+     slice spans the submodule and needs EW Table.Tests × {net10.0, net8.0, net472} alongside the two
+     fabricator tiers. Keep the EW deletion as its own commit on `fabricator-patches` so the pin move is
+     reviewable.
    - **A CAPABILITY GAIN, not just a deletion: this slice can close the CDF row-identity gap.**
      `StageChangeDataAsync` takes `rowIds` + `rowCommitVersions`, and our feed leaves identity NULL
      today. A `cdc` action has no `baseRowId`, so the change file is the only place a change row's
