@@ -1,4 +1,4 @@
-# Delta provider — transaction, concurrency & isolation semantics
+﻿# Delta provider — transaction, concurrency & isolation semantics
 
 Reference for the **engineered-wood Delta provider** (`PROVIDER 'engineeredwooddelta'`, or its one
 alias `'delta'` — the redundant `'deltalake'` was removed 2026-07-29): how DuckDB transactions map
@@ -318,7 +318,7 @@ RENAME TABLE of a *committed* table, nested RENAME FIELD, and the path-targeted 
 delta)`. The C++ side calls `InvalidateAllEntries()` on rollback so no stale schema survives a
 rolled-back ALTER.
 
-### 7.1 ⚠ `BEGIN; CREATE; INSERT; COMMIT` lands as TWO versions, not one — MEASURED 2026-08-03
+### 7.1 ⚠ A CREATE-plus-data lands as TWO versions, not one — in a TRANSACTION **and IN AUTOCOMMIT** — MEASURED 2026-08-03, scope corrected 2026-08-04
 
 Recorded because it existed only as an inline comment (*"v0 create + v1 write — today's flush shape"*,
 `DeltaCatalog.cs`) and nowhere else. Surfaced by a design question — *why can't a `DeltaTransaction` contain the
@@ -335,6 +335,48 @@ _delta_log/00000000000000000001.json  →  the 100 rows
 `FlushCreateTransactionAsync` calls `DeltaWriter.Create(...)` **unconditionally** and only then writes the data, so
 both of its branches produce two versions — the eager-CTAS branch via `CommitDataFilesAsync`, the parked-batches
 branch via `DeltaWriter.Write`.
+
+**⚠ SCOPE CORRECTION (2026-08-04): this is NOT a buffered-transaction property, and describing it as one — which
+this section did — hid the common case.** A plain **autocommit `CREATE TABLE … AS SELECT`** produces the identical
+two commits, by a different path: `DeltaWriter.WriteAsync` calls `OpenOrCreateAsync` (which commits v0 for a new
+table) before `table.WriteAsync` (v1). Measured the same way:
+
+```
+00000000000000000000.json  →  commitInfo operation=CREATE TABLE, protocol, metaData   ← an EMPTY table
+00000000000000000001.json  →  commitInfo operation=WRITE, add numRecords=5, domainMetadata
+```
+
+So the consequence table below applies to EVERY create-with-data, and the statement it most often applies to is a
+one-line CTAS with no `BEGIN` in sight.
+
+**What protects you today: every REACHABLE failure fires BEFORE v0, and that is structural rather than luck.** The
+Arrow→Delta **schema conversion is a precondition of the create** — `OpenOrCreateAsync` cannot be called without a
+Delta schema — so a schema-level rejection necessarily precedes it. Two measured, both leaving NO table behind: a
+`TIMESTAMP_NS` column (refused at `complete_bulk`) and an `INTERVAL` column (*"Cannot convert Arrow type interval to
+Delta type"*). What remains exposed is a failure of the DATA write or its commit — storage error, permission, disk
+full, network — for which there is no compensation (`WriteAsync`'s `finally` only disposes the table; a commit
+CONFLICT is handled by the retry loop, other failures are not). Still not measured.
+
+**⚠ AND RE-RUNNING DOES NOT RECOVER — a plain `CREATE TABLE t AS SELECT` over an EXISTING table is a SILENT NO-OP.**
+Measured 2026-08-04 with a positive control: over a 10-row Delta table, `CREATE TABLE … AS SELECT range(2)` left
+**10 rows** and exit 0 with no error, while the same statement over DuckDB's own in-memory table raised
+*"Table with name memtbl already exists!"*. `CREATE OR REPLACE TABLE … AS SELECT` works. So the orphan above is
+recoverable ONLY via `OR REPLACE` (or an explicit DROP) — and, independently of orphans, a user who re-runs a CTAS
+believing it replaced the data silently keeps the OLD data.
+
+**Root cause, in the SHARED C++ layer:** `FabricatorSchemaEntry::CreateTable` handles `REPLACE_ON_CONFLICT` (drops
+first) and `IGNORE_ON_CONFLICT` (forwards `if_not_exists`) but **never checks `ERROR_ON_CONFLICT`** — so a plain
+CREATE reaches the provider as an ordinary create, and Delta's `OpenOrCreateAsync` simply opens the existing table.
+This also explains why `mode = Overwrite` for `createTable` is not itself wrong: it is correct GIVEN that DuckDB was
+supposed to have rejected the conflict already. ⚠ **Scope beyond the Delta provider is UNVERIFIED** (SQL Server and
+DAX share this C++ path but were not tested). NOT FIXED.
+
+**A cheap improvement that does NOT need upstream, not built:** reorder the autocommit CTAS to write the data files
+FIRST and create+commit afterwards — the shape `TryStreamCreateFiles` already implements for the buffered path (it
+writes parquet into a log-less folder and the flush creates after). A data-write failure would then precede any
+commit, leaving nothing behind, and the only remaining window is between two adjacent log writes with no data
+movement in between. It would NOT reduce the version count, and it needs the host-query native writer and is
+non-partitioned-only today, so it would not cover every CTAS.
 
 | | consequence |
 |---|---|

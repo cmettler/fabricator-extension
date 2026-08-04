@@ -1,4 +1,4 @@
-# Known limitations and unverified claims
+﻿# Known limitations and unverified claims
 
 **Purpose.** One place that answers *"what does not work, and what have we claimed without proving?"* Written
 because those answers were scattered across four documents and a commit message, which made the state
@@ -24,7 +24,16 @@ means the suites genuinely ran. Anything they cover works on the substrates they
 | 1.2 | Same shape on **`s3://` with no NAMED secret** | 8 of 48 commits landed, 40 silently lost ([delta-transactions.md](delta-transactions.md) §8.3) |
 | 1.3 | Same shape on **`abfss://` with no NAMED secret** | 41 of 48 landed, six of the seven losses silent (§8.4) |
 | 1.4 | **`fabricator_fs_write_probe` can report the commit guard as WORKING when it tested nothing** — it fails in the UNSAFE direction | Aimed at a path whose parent does not exist, `exclusive_create_existing_fails` reads `true` ("put-if-absent works") because the exclusive open threw for a MISSING DIRECTORY. Confirm `create_directory` and `write_create` are both `true` before believing the verdict. §8.5a |
-| 1.5 | **`BEGIN; CREATE; INSERT; COMMIT` lands as TWO versions, not one** — v0 `protocol`+`metaData` (an empty table), v1 the data. A concurrent reader can see the empty table, and **a v1 failure leaves an empty committed table behind a transaction the user saw fail** | `_delta_log` inspected directly. §7.1. Not a protocol limit (Delta permits `protocol`+`metaData`+`add` in v0) but an engineered-wood API-shape one |
+| 1.5 | **A CREATE-plus-data is NOT atomic — it lands as TWO versions, in a transaction AND in plain autocommit.** v0 = `protocol`+`metaData` (an EMPTY table), v1 = the data. So a concurrent reader can observe the empty table, and **a failure of the data write leaves an empty committed table behind a statement the user saw fail** | `_delta_log` inspected directly for both shapes: `BEGIN; CREATE; INSERT; COMMIT` (via `FlushCreateTransactionAsync`) and a plain **autocommit `CREATE TABLE … AS SELECT`** (via `DeltaWriter.WriteAsync` → `OpenOrCreateAsync` then `table.WriteAsync`). §7.1. Not a protocol limit — Delta permits `protocol`+`metaData`+`add` in v0 — but an engineered-wood API-shape one: `StartTransaction` and `CommitDataFilesAsync` are both INSTANCE methods, so "a transaction that creates its table" is inexpressible |
+| 1.6 | **A plain `CREATE TABLE t AS SELECT …` over an EXISTING table is a SILENT NO-OP** — no error, no rows written, exit 0 — where DuckDB's own catalog raises *"Table with name t already exists!"*. So 1.5's orphan is not recoverable by re-running the statement, and a user who re-runs a CTAS believing it replaced the data gets the OLD data with no warning | MEASURED with a positive control: over a 10-row Delta table, `CREATE TABLE … AS SELECT range(2)` left **10 rows** and exit 0, while `CREATE TABLE memtbl AS SELECT 2` over DuckDB's own `memtbl` errored correctly. `CREATE OR REPLACE TABLE … AS SELECT` works (4 rows). **Root cause**: `FabricatorSchemaEntry::CreateTable` handles `REPLACE_ON_CONFLICT` (drops first) and `IGNORE_ON_CONFLICT` (forwards the flag) but **never checks `ERROR_ON_CONFLICT`**, so a plain CREATE is passed to the provider as an ordinary create and Delta's `OpenOrCreateAsync` just opens the existing table. In the SHARED C++ layer ⇒ **scope beyond Delta is UNVERIFIED** (SQL Server / DAX not tested). NOT FIXED |
+| 1.7 | **`CREATE TABLE IF NOT EXISTS t AS SELECT …` also leaves 1.5's empty table** — correct per its own semantics, but it means neither non-`REPLACE` spelling recovers | Follows from 1.6; the working recovery is `CREATE OR REPLACE` |
+
+**On 1.5/1.6 — what protects you today, and it is structural rather than luck.** Every REACHABLE failure fires
+BEFORE v0, because the Arrow→Delta **schema conversion is a precondition of the create** (`OpenOrCreateAsync` cannot
+be called without a Delta schema). Two measured, both leaving NO table behind: a `TIMESTAMP_NS` column and an
+`INTERVAL` column. What remains exposed is a failure of the DATA write or its commit — storage error, permission,
+disk full, network — which has no compensation. **That residue is reasoned, not measured**; injecting it was not
+attempted. A commit CONFLICT is handled properly by the retry loop.
 
 **Where concurrent writers DO work, measured** (each number from its own run — do not merge them):
 

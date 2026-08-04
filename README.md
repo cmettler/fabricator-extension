@@ -1,4 +1,4 @@
-# fabricator — DuckDB ⇄ SQL Server via a C# (CoreCLR) Arrow bridge
+﻿# fabricator — DuckDB ⇄ SQL Server via a C# (CoreCLR) Arrow bridge
 
 A DuckDB extension that connects to **Microsoft SQL Server** by hosting a C# layer (via **CoreCLR**)
 **in-process** and exchanging data + metadata as **Apache Arrow** over the Arrow C Stream Interface
@@ -1394,6 +1394,33 @@ SELECT * FROM lake.main.t WHERE id > 10;          -- streaming scan + file/row-g
 > everything the test suite covers runs this way. For concurrent writers use OneLake/`abfss://` or
 > `s3://` with a named secret (above), or a POSIX filesystem — Linux/macOS local paths get a real `O_EXCL`
 > and are multi-process safe.
+
+> ### ⚠ Creating a table AND filling it is two commits, not one
+>
+> `CREATE TABLE t AS SELECT …` writes **two** Delta versions — v0 the schema (an *empty* table), v1 the
+> rows — and so does `BEGIN; CREATE TABLE t (…); INSERT …; COMMIT;`. There is no way to ask for one.
+>
+> ```
+> t/_delta_log/00000000000000000000.json   commitInfo operation=CREATE TABLE, protocol, metaData
+> t/_delta_log/00000000000000000001.json   commitInfo operation=WRITE, add
+> ```
+>
+> Two things follow. A **concurrent reader** (Spark, delta-rs) can open the table between the commits and
+> see it *empty*. And if the data write **fails**, the empty table stays — a statement you saw fail has
+> still created something.
+>
+> In practice the failures you are likely to hit are refused *before* the table is created, because the
+> schema must convert to Delta types first — e.g. a `TIMESTAMP_NS` or `INTERVAL` column errors and leaves
+> nothing behind. What is exposed is a *storage* failure during the write (permissions, disk full,
+> network).
+>
+> **⚠ Recover with `CREATE OR REPLACE TABLE … AS SELECT` — a plain re-run does NOT work.** Measured: once
+> the table exists, `CREATE TABLE t AS SELECT …` **silently does nothing** — no error, no rows written, exit
+> 0 (DuckDB's own tables raise *"Table with name t already exists!"*; ours does not — a known bug).
+> `CREATE TABLE IF NOT EXISTS` likewise leaves the empty table. Only `CREATE OR REPLACE` overwrites it.
+>
+> This is a Delta-writer API limitation, not a Delta format one — the format allows a single commit that
+> both creates the table and adds data.
 
 | Feature | Status |
 |---------|--------|

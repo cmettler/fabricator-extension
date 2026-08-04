@@ -1555,16 +1555,47 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   IDENTITY/CDF/same-txn-DML, and the partitioned×native_read partition-column bug fix. Gate
   verify_delta_catalog_transactions (now 941); semantics [docs/delta-transactions.md](docs/delta-transactions.md).
   Still immediate by design: identity creates, DROP/OPTIMIZE/VACUUM, CREATE-OR-REPLACE/partition-overwrite.
-  - **⚠ `BEGIN; CREATE; INSERT; COMMIT` LANDS AS TWO VERSIONS, NOT ONE — measured 2026-08-03
-    ([docs/delta-transactions.md](docs/delta-transactions.md) §7.1).** v0 = `protocol`+`metaData` (an EMPTY table),
-    v1 = the data; `FlushCreateTransactionAsync` calls `DeltaWriter.Create` UNCONDITIONALLY before writing, so both
-    of its branches do this. Consequences: a concurrent reader can observe the empty table, and **a v1 failure
-    leaves an empty committed table behind a transaction the user saw fail** — the inverse of every other flush
-    path (reasoned from the measured shape, not itself measured). **Not a protocol limit** — Delta permits
-    `protocol`+`metaData`+`add` in v0 — but an EW API-shape one: `StartTransaction` is an INSTANCE method needing
-    `OpenAsync`, so "a transaction that creates the table" is inexpressible, and `CreateAsync` writes v0 at once.
-    Fixing it needs an upstream static/factory transaction form, not something the Bridge can compose. It had
-    existed only as the inline comment *"v0 create + v1 write — today's flush shape"*.
+  - **⚠ A CREATE-PLUS-DATA IS NOT ATOMIC — TWO VERSIONS, AND IN PLAIN AUTOCOMMIT TOO, NOT JUST IN A TRANSACTION**
+    (measured 2026-08-03; **scope corrected 2026-08-04** — [docs/delta-transactions.md](docs/delta-transactions.md)
+    §7.1, [docs/known-limitations.md](docs/known-limitations.md) 1.5/1.6). v0 = `protocol`+`metaData` (an EMPTY
+    table), v1 = the data. **⚠ This was recorded here and in §7.1 as a BUFFERED-FLUSH property, which hid the common
+    case**: a plain autocommit `CREATE TABLE … AS SELECT` produces the identical two commits by a DIFFERENT path
+    (`DeltaWriter.WriteAsync` → `OpenOrCreateAsync` commits v0, then `table.WriteAsync` v1), so the statement it
+    most often applies to has no `BEGIN` in sight. Consequences: a concurrent reader can observe the empty table,
+    and **a data-write failure leaves an empty committed table behind a statement the user saw fail** — the inverse
+    of every other flush path (reasoned from the measured shape, not itself measured).
+    - **What protects it today is STRUCTURAL, not luck: every reachable failure fires BEFORE v0**, because the
+      Arrow→Delta schema conversion is a PRECONDITION of the create (`OpenOrCreateAsync` cannot be called without a
+      Delta schema). Measured: a `TIMESTAMP_NS` column and an `INTERVAL` column both refuse with NO table created.
+      The residue is a DATA-write/commit failure (storage, permission, disk full, network), which has no
+      compensation — `WriteAsync`'s `finally` only disposes; a commit CONFLICT is retried, other failures are not.
+    - **⚠ AND A SEPARATE, BIGGER BUG FOUND WHILE DOCUMENTING THIS (2026-08-04, NOT FIXED): a plain
+      `CREATE TABLE t AS SELECT` over an EXISTING table is a SILENT NO-OP** — no error, no rows written, exit 0 —
+      where DuckDB's own catalog raises *"Table with name t already exists!"*. Measured with a positive control
+      (10-row Delta table + a CTAS of 2 rows ⇒ still 10 rows; the same shape on DuckDB's own table errored).
+      `CREATE OR REPLACE TABLE … AS SELECT` works. So a user who re-runs a CTAS believing it replaced the data
+      keeps the OLD data silently, and the empty-table orphan is recoverable ONLY via `OR REPLACE` or a DROP.
+      **Root cause is in the SHARED C++ layer**: `FabricatorSchemaEntry::CreateTable` handles
+      `REPLACE_ON_CONFLICT` (drops first) and `IGNORE_ON_CONFLICT` (forwards the flag) but **never checks
+      `ERROR_ON_CONFLICT`**, so a plain CREATE reaches the provider as an ordinary create and Delta's
+      `OpenOrCreateAsync` just opens the existing table. ⚠ **Scope beyond Delta is UNVERIFIED** — SQL Server and
+      DAX share the path, untested. This also settles why `mode = Overwrite` for `createTable` is NOT itself the
+      bug: it is correct GIVEN that DuckDB was supposed to have rejected the conflict first.
+    - **Not a protocol limit** — Delta permits `protocol`+`metaData`+`add` in v0 — but an EW API-shape one, and
+      THREE doors are locked the same way: `StartTransaction` is an INSTANCE method needing `OpenAsync`,
+      `CreateAsync` writes v0 at once, and `CommitDataFilesAsync` (whose `extraActions` could carry
+      metaData+protocol) is ALSO an instance method. So a transaction that creates its table is inexpressible;
+      fixing it needs an upstream static/factory form.
+    - **A cheap improvement that needs NO upstream change, NOT built:** reorder the autocommit CTAS to write the
+      data files FIRST and create+commit after — the shape `TryStreamCreateFiles` already implements for the
+      buffered path. A data-write failure would then precede any commit; the residual window shrinks to two
+      adjacent log writes. It does NOT reduce the version count, needs the host-query native writer, and is
+      non-partitioned-only today.
+    - **⚠ Temp-name-then-rename does NOT fix the version count** (the temp table still gets v0 then v1) — it only
+      hides both from readers of the final name. And it costs an O(bytes) commit on S3 (rename = ListObjectsV2 +
+      CopyObject per key + DeleteObjects) and LOSES the conditional create: today two concurrent `CREATE TABLE t`
+      race on commit-0, a put-if-absent, while a rename is unconditional on the backends where §8.5 applies —
+      so the second rename would silently destroy the first table. Assessed and REJECTED 2026-08-04.
   Full as-built record (moved verbatim from here): [docs/feature-history.md](docs/feature-history.md).
 - **Fabric-notebook AMBIENT AUTH — DONE + validated live.** All three providers work with ZERO
   credentials on Fabric compute via `FabricNotebookCredential` (the trident token service; per-scope
