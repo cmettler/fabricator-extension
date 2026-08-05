@@ -81,5 +81,41 @@ SELECT id, name, amt FROM lake2.main.t ORDER BY id;
 4	a4	41
 5	a5	51
 
+# ==============================================================================================
+# SET <col> = DEFAULT is REFUSED — and this is a regression gate for silent data corruption, not a
+# note about a missing feature. The operator reads each SET value out of the child chunk at the
+# position the bound expression names; a DEFAULT contributes NO column to the binder's projection, so
+# reading positions 0..n-1 instead (which is what this used to do) shifts every SET value after the
+# DEFAULT by one. Measured before the fix, on the very shape below but with all-BIGINT columns: the
+# statement SUCCEEDED and committed a = 5, b = <rowid> where the correct answer is a = 99, b = 5.
+# Where the shifted types happen to differ it was an INTERNAL error that fatally invalidated the
+# database instead. Either way nothing said the update was wrong.
+statement ok
+CREATE TABLE lake2.main.defcol (a BIGINT DEFAULT 99, b BIGINT, c INTEGER);
+
+statement ok
+INSERT INTO lake2.main.defcol VALUES (1, 2, 3);
+
+statement error
+UPDATE lake2.main.defcol SET a = DEFAULT, b = 5;
+----
+SET a = DEFAULT is not supported
+
+# The refused statement changed nothing.
+query III
+SELECT a, b, c FROM lake2.main.defcol;
+----
+1	2	3
+
+# An ordinary multi-column UPDATE on the same table still works — this is the positive control that
+# says the check above rejects the DEFAULT specifically and not every multi-assignment update.
+statement ok
+UPDATE lake2.main.defcol SET a = 99, b = 5;
+
+query III
+SELECT a, b, c FROM lake2.main.defcol;
+----
+99	5	3
+
 statement ok
 DETACH lake2;

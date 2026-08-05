@@ -20,6 +20,15 @@ struct FabricatorInsertTarget {
 	//! INSERT ... RETURNING: the operator emits the inserted rows (all table
 	//! columns) via OUTPUT INSERTED.* instead of a single rows-affected count.
 	bool returning = false;
+	//! MERGE with >=2 mutating actions: mark the statement's transaction BUFFERED at execution time, even in
+	//! autocommit. Load-bearing for CORRECTNESS, not just atomicity — every action of a merge consumes rowids
+	//! captured from ONE join scan, so if the actions commit separately a copy-on-write DELETE renumbers the
+	//! rows a later action already addressed and that action hits the WRONG ROW (measured: two conditional
+	//! deletes destroyed a row that should have survived). Buffering stages every action against one pinned
+	//! snapshot, so positions cannot shift, and fuses them into one commit.
+	//! Set at EXECUTION time (GetGlobalSinkState), never at plan time: a prepared statement's physical plan is
+	//! reused across transactions, so a plan-time mark would apply to the first transaction only.
+	bool force_buffered = false;
 };
 
 //! Physical INSERT into SQL Server. Streams input chunks to the bridge as Arrow

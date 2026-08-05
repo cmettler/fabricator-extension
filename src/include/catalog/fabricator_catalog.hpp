@@ -116,6 +116,11 @@ public:
 	                             PhysicalOperator &plan) override;
 	PhysicalOperator &PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
 	                             PhysicalOperator &plan) override;
+	//! MERGE INTO — and, since the binder rewrites `INSERT ... ON CONFLICT` into a MERGE, that too. The base
+	//! Catalog's body is the "does not support MERGE INTO or ON CONFLICT" throw, so overriding it is the
+	//! whole gate. See src/catalog/fabricator_merge_into.cpp.
+	PhysicalOperator &PlanMergeInto(ClientContext &context, PhysicalPlanGenerator &planner, LogicalMergeInto &op,
+	                                PhysicalOperator &plan) override;
 
 	DatabaseSize GetDatabaseSize(ClientContext &context) override;
 	bool InMemory() override;

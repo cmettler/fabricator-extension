@@ -2977,9 +2977,17 @@ public sealed class DeltaCatalog : IBackendCatalog
     {
         if (!p.DvEnabled)
         {
+            // ⚠ Do NOT say "run it in autocommit" here. Since MERGE landed, buffering is ALSO forced for a
+            // merge carrying two or more UPDATE/DELETE actions EVEN IN AUTOCOMMIT — because those actions share
+            // one scan's row addresses and a copy-on-write delete would renumber the rows the other action
+            // already addressed. So this message is reachable on a statement that IS in autocommit, where
+            // advising autocommit is both wrong and baffling. State the requirement; name both ways out.
             throw new System.NotSupportedException(
-                $"delta: {op} inside an explicit transaction requires deletion vectors on the table (this "
-                + "table has them disabled) — run it in autocommit (copy-on-write), or COMMIT first.");
+                $"delta: {op} requires deletion vectors on the table when it is buffered (this table has them "
+                + "disabled). It is buffered inside an explicit transaction, and for a MERGE carrying more than "
+                + "one UPDATE/DELETE action — two such actions cannot be applied one at a time without risking "
+                + "the wrong row. Enable deletion vectors on the table, or use at most one UPDATE/DELETE action "
+                + "per merge outside a transaction.");
         }
         if (p.CdfEnabled && !p.SupportsExternalCommit)
         {

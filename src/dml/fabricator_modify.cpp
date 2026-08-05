@@ -29,6 +29,7 @@ public:
 				types.push_back(target.set_types[i]);
 			}
 			set_count = target.set_columns.size();
+			set_child_indices = target.set_child_indices;
 		}
 		for (idx_t i = 0; i < target.rowid_columns.size(); i++) {
 			names.push_back(target.rowid_columns[i]);
@@ -45,8 +46,11 @@ public:
 	vector<string> names;
 	idx_t set_count = 0;
 	idx_t key_count = 0;
-	//! DELETE: the rowid's position in the child chunk (INVALID_INDEX = last column — the UPDATE
-	//! contract, whose binder-built projection puts the rowid last).
+	//! UPDATE: the child-chunk position of each SET value (see FabricatorModifyTarget). Empty on the
+	//! DELETE path.
+	vector<idx_t> set_child_indices;
+	//! The rowid's position in the child chunk (INVALID_INDEX = last column — a plain UPDATE's
+	//! binder-built projection puts the rowid last).
 	idx_t rowid_child_index = DConstants::INVALID_INDEX;
 	ClientProperties properties;
 	unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>> extension_types;
@@ -57,6 +61,24 @@ public:
 };
 
 class FabricatorModifyLocalState : public LocalSinkState {};
+
+// A MERGE with >=2 mutating actions must run BUFFERED even in autocommit, and this is a CORRECTNESS
+// requirement rather than an atomicity nicety. Every action consumes rowids captured from the merge's ONE
+// join scan; if the actions commit separately, a copy-on-write DELETE removes a row and RENUMBERS every
+// later row, so a subsequent action's captured (fileOrdinal, position) names a DIFFERENT row. Measured
+// before this: two conditional deletes on a one-file table deleted a row that should have survived and
+// left the one that should have gone. Marking the transaction buffered stages every action against ONE
+// pinned snapshot, so no action can renumber another's targets, and fuses them into one commit.
+//
+// Called from GetGlobalSinkState — i.e. at EXECUTION time, and BEFORE any action does provider work.
+// PhysicalMergeInto builds every action's global sink state up front, so whichever action runs first sets
+// the flag and the rest observe it (the INSERT's own begin_bulk therefore sees it and buffers too).
+// Deliberately NOT done at plan time: a prepared statement's physical plan is reused across transactions.
+static void FabricatorForceBufferedTxn(FabricatorHandle handle, ClientContext &context) {
+	FabricatorSetActiveTxn(handle, context);
+	fabricator::BeginTransaction(handle, /*is_explicit=*/true);
+}
+
 
 // References the rowid column's key vector(s) into `out` starting at out_offset.
 static void ReferenceKeyColumns(DataChunk &out, idx_t out_offset, DataChunk &src, idx_t rowid_col, idx_t key_count) {
@@ -74,15 +96,19 @@ static void ReferenceKeyColumns(DataChunk &out, idx_t out_offset, DataChunk &src
 // and enqueues it on the producer.
 static void AppendModifyBatch(FabricatorModifyGlobalState &gstate, DataChunk &chunk, bool is_update) {
 	// DELETE carries the rowid's actual child-chunk position (a mark-join plan's chunk ends with the
-	// BOOLEAN mark, not the rowid); UPDATE keeps the last-column contract (binder projection).
+	// BOOLEAN mark, not the rowid); a plain UPDATE keeps the last-column contract (binder projection).
 	idx_t rowid_col = gstate.rowid_child_index != DConstants::INVALID_INDEX ? gstate.rowid_child_index
 	                                                                        : chunk.ColumnCount() - 1;
 	DataChunk produce;
 	produce.InitializeEmpty(gstate.types);
 	produce.SetCardinality(chunk.size());
 	if (is_update) {
+		// Each SET value is read from the position the BOUND_REF named, NOT from `j`: a `SET x = DEFAULT`
+		// puts no column in the projection (so everything after it shifts), and a MERGE's UPDATE action
+		// shares one projection with every other action.
+		D_ASSERT(gstate.set_child_indices.size() == gstate.set_count);
 		for (idx_t j = 0; j < gstate.set_count; j++) {
-			produce.data[j].Reference(chunk.data[j]);
+			produce.data[j].Reference(chunk.data[gstate.set_child_indices[j]]);
 		}
 	}
 	ReferenceKeyColumns(produce, gstate.set_count, chunk, rowid_col, gstate.key_count);
@@ -118,6 +144,9 @@ FabricatorPhysicalDelete::FabricatorPhysicalDelete(PhysicalPlan &plan, vector<Lo
 }
 
 unique_ptr<GlobalSinkState> FabricatorPhysicalDelete::GetGlobalSinkState(ClientContext &context) const {
+	if (target_.force_buffered) {
+		FabricatorForceBufferedTxn(handle_, context);
+	}
 	return make_uniq<FabricatorModifyGlobalState>(context, target_, /*is_update=*/false);
 }
 unique_ptr<LocalSinkState> FabricatorPhysicalDelete::GetLocalSinkState(ExecutionContext &context) const {
@@ -160,6 +189,9 @@ FabricatorPhysicalUpdate::FabricatorPhysicalUpdate(PhysicalPlan &plan, vector<Lo
 }
 
 unique_ptr<GlobalSinkState> FabricatorPhysicalUpdate::GetGlobalSinkState(ClientContext &context) const {
+	if (target_.force_buffered) {
+		FabricatorForceBufferedTxn(handle_, context);
+	}
 	return make_uniq<FabricatorModifyGlobalState>(context, target_, /*is_update=*/true);
 }
 unique_ptr<LocalSinkState> FabricatorPhysicalUpdate::GetLocalSinkState(ExecutionContext &context) const {

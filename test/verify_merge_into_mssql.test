@@ -1,0 +1,216 @@
+# name: test/verify_merge_into_mssql.test
+# description: MERGE INTO against the SQL Server provider — the companion to verify_merge_into.test (Delta).
+#              MERGE is planned once, in the shared C++ layer (FabricatorCatalog::PlanMergeInto), and each action
+#              is lowered to the SAME rowid UPDATE / DELETE / INSERT operator the standalone statement uses. So
+#              the thing this suite adds over the Delta one is that the lowering is genuinely provider-agnostic:
+#              here the rowid is a PK column carried in the chunk and the actions become parameterized T-SQL on
+#              the pinned connection, not Delta log actions. It also covers the one refusal Delta CANNOT reach —
+#              a table with no row identity at all, which on Delta is impossible (every table has a virtual
+#              rowid) but on SQL Server is just a table with no PK / unique index / IDENTITY.
+#              NOTE: MERGE here is per-row DML on the pinned connection, NOT a server-side T-SQL MERGE.
+# group: [fabricator]
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
+
+statement ok
+DROP TABLE IF EXISTS db.dbo.fabricator_mtgt;
+
+statement ok
+DROP TABLE IF EXISTS db.dbo.fabricator_msrc;
+
+statement ok
+CREATE TABLE db.dbo.fabricator_mtgt (id INTEGER PRIMARY KEY, v INTEGER, tag VARCHAR(10));
+
+statement ok
+INSERT INTO db.dbo.fabricator_mtgt SELECT i, i * 10, 'old' FROM range(1, 6) AS r(i);
+
+statement ok
+CREATE TABLE db.dbo.fabricator_msrc (id INTEGER PRIMARY KEY, v INTEGER);
+
+statement ok
+INSERT INTO db.dbo.fabricator_msrc SELECT i, i * 100 FROM range(3, 9) AS r(i);
+
+# ==============================================================================================
+# 1. All three outcomes at once, plus a conditional DELETE — the four-action shape. Everything runs
+#    inside ONE DuckDB transaction, so every action lands on the same pinned provider connection.
+# ==============================================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+MERGE INTO db.dbo.fabricator_mtgt AS t USING db.dbo.fabricator_msrc AS s ON t.id = s.id
+  WHEN MATCHED AND s.id = 3 THEN DELETE
+  WHEN MATCHED THEN UPDATE SET v = s.v, tag = 'upd'
+  WHEN NOT MATCHED THEN INSERT (id, v, tag) VALUES (s.id, s.v, 'ins');
+
+statement ok
+COMMIT;
+
+query IIT
+SELECT id, v, tag FROM db.dbo.fabricator_mtgt ORDER BY id;
+----
+1	10	old
+2	20	old
+4	400	upd
+5	500	upd
+6	600	ins
+7	700	ins
+8	800	ins
+
+# ==============================================================================================
+# 2. ROLLBACK undoes the whole merge — the update, the delete AND the insert.
+# ==============================================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+MERGE INTO db.dbo.fabricator_mtgt AS t USING (VALUES (1, 111), (99, 999)) AS s(id, v) ON t.id = s.id
+  WHEN MATCHED THEN UPDATE SET v = s.v, tag = 'rb'
+  WHEN NOT MATCHED THEN INSERT (id, v, tag) VALUES (s.id, s.v, 'rb');
+
+statement ok
+ROLLBACK;
+
+query IIT
+SELECT id, v, tag FROM db.dbo.fabricator_mtgt ORDER BY id;
+----
+1	10	old
+2	20	old
+4	400	upd
+5	500	upd
+6	600	ins
+7	700	ins
+8	800	ins
+
+# ==============================================================================================
+# 3. WHEN NOT MATCHED BY SOURCE — the clause that makes the binder add a `source_marker` column, so
+#    the classification has to distinguish "no source row" from "no target row".
+# ==============================================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+MERGE INTO db.dbo.fabricator_mtgt AS t USING (VALUES (4, 44), (5, 55)) AS s(id, v) ON t.id = s.id
+  WHEN MATCHED THEN UPDATE SET v = s.v
+  WHEN NOT MATCHED BY SOURCE THEN UPDATE SET tag = 'nosrc';
+
+statement ok
+COMMIT;
+
+query IIT
+SELECT id, v, tag FROM db.dbo.fabricator_mtgt ORDER BY id;
+----
+1	10	nosrc
+2	20	nosrc
+4	44	upd
+5	55	upd
+6	600	nosrc
+7	700	nosrc
+8	800	nosrc
+
+# ==============================================================================================
+# 4. NO ROW IDENTITY => a clean refusal, and this is the case the guard in PlanMergeInto exists for.
+#    The merge below has ONLY an INSERT action, so it never reaches the UPDATE/DELETE target builder
+#    that would otherwise complain. DuckDB decides matched-vs-not by testing the rowid column for
+#    NULL, and with no rowid the binder leaves row_id_start pointing one past the end of the chunk —
+#    an out-of-bounds read at execution. Refusing at plan time is what turns that into a message.
+#    The table is created through fabricator_exec so it genuinely has no PK, UNIQUE or IDENTITY.
+# ==============================================================================================
+
+statement ok
+SELECT fabricator_exec('db', 'IF OBJECT_ID(''dbo.fabricator_mnorow'') IS NOT NULL DROP TABLE dbo.fabricator_mnorow; CREATE TABLE dbo.fabricator_mnorow (a INT, b INT)');
+
+statement ok
+SELECT fabricator_exec('db', 'INSERT INTO dbo.fabricator_mnorow VALUES (1, 1)');
+
+statement ok
+SELECT fabricator_refresh_cache('db');
+
+# Positive control: the table is readable, so the refusal below is about row identity and not about a
+# table that failed to appear.
+query II
+SELECT a, b FROM db.dbo.fabricator_mnorow;
+----
+1	1
+
+statement error
+MERGE INTO db.dbo.fabricator_mnorow AS t USING (VALUES (2, 2)) AS s(a, b) ON t.a = s.a
+  WHEN NOT MATCHED THEN INSERT (a, b) VALUES (s.a, s.b);
+----
+MERGE INTO requires a table with a primary key or unique index
+
+# Nothing was written by the refused statement.
+query I
+SELECT count(*) FROM db.dbo.fabricator_mnorow;
+----
+1
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE dbo.fabricator_mnorow');
+
+# ==============================================================================================
+# 5. A COMPOUND rowid. A composite PK reaches the operators as ONE struct-typed rowid column, which
+#    ReferenceKeyColumns destructures into its key vectors — so this is the one row-identity shape the
+#    Delta suite structurally CANNOT cover (a Delta table's rowid is always a single virtual BIGINT).
+#    Both the UPDATE and the DELETE action have to resolve their keys through that struct.
+#    NOTE both key columns are INTEGER on purpose: our VARCHAR maps to nvarchar(max), which SQL Server
+#    refuses as an index key column (error 1919) — the documented length-aware-VARCHAR gap, unrelated
+#    to merges.
+# ==============================================================================================
+
+statement ok
+DROP TABLE IF EXISTS db.dbo.fabricator_mck;
+
+statement ok
+CREATE TABLE db.dbo.fabricator_mck (k1 INTEGER NOT NULL, k2 INTEGER NOT NULL, v INTEGER, PRIMARY KEY (k1, k2));
+
+statement ok
+INSERT INTO db.dbo.fabricator_mck VALUES (1, 1, 10), (1, 2, 20), (2, 1, 30);
+
+statement ok
+BEGIN;
+
+statement ok
+MERGE INTO db.dbo.fabricator_mck AS t USING (VALUES (1, 2, 999), (2, 1, 888), (9, 9, 777)) AS s(k1, k2, v)
+  ON t.k1 = s.k1 AND t.k2 = s.k2
+  WHEN MATCHED AND s.k1 = 2 THEN DELETE
+  WHEN MATCHED THEN UPDATE SET v = s.v
+  WHEN NOT MATCHED THEN INSERT (k1, k2, v) VALUES (s.k1, s.k2, s.v);
+
+statement ok
+COMMIT;
+
+# (1,1) untouched, (1,2) updated, (2,1) deleted, (9,9) inserted — all keyed through the struct rowid.
+query III
+SELECT k1, k2, v FROM db.dbo.fabricator_mck ORDER BY k1, k2;
+----
+1	1	10
+1	2	999
+9	9	777
+
+statement ok
+DROP TABLE IF EXISTS db.dbo.fabricator_mck;
+
+# ==============================================================================================
+# 6. MERGE ... RETURNING is refused rather than silently dropping the returning list.
+# ==============================================================================================
+
+statement error
+MERGE INTO db.dbo.fabricator_mtgt AS t USING (VALUES (1, 1)) AS s(id, v) ON t.id = s.id
+  WHEN MATCHED THEN UPDATE SET v = s.v RETURNING *;
+----
+MERGE INTO ... RETURNING is not supported
+
+statement ok
+DROP TABLE IF EXISTS db.dbo.fabricator_mtgt;
+
+statement ok
+DROP TABLE IF EXISTS db.dbo.fabricator_msrc;

@@ -1,0 +1,590 @@
+# name: test/verify_merge_into.test
+# description: MERGE INTO on a fabricator catalog (Delta). FabricatorCatalog::PlanMergeInto lowers each merge
+#              action to the SAME rowid operator the standalone statement uses, so this suite is about the
+#              LOWERING: that DuckDB's matched / not-matched-by-target / not-matched-by-source classification
+#              reaches the right operator, and that a MULTI-ACTION merge is FUSED into one commit.
+#              ⛔ THE FUSION IS A CORRECTNESS REQUIREMENT, NOT AN ATOMICITY NICETY, and §11 is the regression
+#              gate that says so: a merge's actions all address rows located by ONE join scan, so applying
+#              them one commit at a time let a copy-on-write DELETE renumber the rows a later action had
+#              already addressed — measured DESTROYING a row that should have survived. Any new merge test
+#              that matters must put several affected rows in ONE FILE with the delete FIRST; with a row per
+#              file the rewrite renumbers nothing and the test proves nothing (that is exactly how both tiers
+#              stayed green through the bug). Set FABRICATOR_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
+# group: [fabricator]
+
+require fabricator
+
+require parquet
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+# ENGINE-PARAMETERIZED (see verify_delta_catalog_update.test): a MERGE is composed of exactly the
+# update / delete / insert paths that suite doubles, so its outcome must be identical whichever engine
+# moves the bytes. A divergence fails in one leg and names the engine.
+require-env DELTA_PROVIDER
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/mergeinto' AS lake (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}');
+
+# ==============================================================================================
+# 1. The basic shape: WHEN MATCHED THEN UPDATE + WHEN NOT MATCHED THEN INSERT.
+#    The three outcomes must be disjoint and complete — rows only in the target are UNTOUCHED (not
+#    deleted), rows in both are updated, rows only in the source are inserted.
+# ==============================================================================================
+
+statement ok
+CREATE TABLE lake.main.t (id BIGINT, v BIGINT, tag VARCHAR);
+
+statement ok
+INSERT INTO lake.main.t SELECT i, i * 10, 'old' FROM range(1, 6) AS r(i);
+
+statement ok
+CREATE TABLE lake.main.src (id BIGINT, v BIGINT);
+
+statement ok
+INSERT INTO lake.main.src SELECT i, i * 100 FROM range(3, 9) AS r(i);
+
+statement ok
+MERGE INTO lake.main.t USING lake.main.src ON t.id = src.id
+  WHEN MATCHED THEN UPDATE SET v = src.v, tag = 'upd'
+  WHEN NOT MATCHED THEN INSERT (id, v, tag) VALUES (src.id, src.v, 'ins');
+
+query III
+SELECT id, v, tag FROM lake.main.t ORDER BY id;
+----
+1	10	old
+2	20	old
+3	300	upd
+4	400	upd
+5	500	upd
+6	600	ins
+7	700	ins
+8	800	ins
+
+# ==============================================================================================
+# 2. FOUR actions at once, including WHEN NOT MATCHED BY SOURCE — which is the clause that makes the
+#    binder push a `source_marker` column, so it exercises a DIFFERENT classification path than §1
+#    (marker NULL => no source row, rowid NULL => no target row, neither => match).
+#    NOTE this shape is one DuckLake REFUSES ("only supports a single UPDATE/DELETE action"): it has
+#    two matched update/delete actions plus a not-matched-by-source update. We serve it because each
+#    action gets its own operator and the Delta buffer fuses their actions at COMMIT.
+# ==============================================================================================
+
+statement ok
+CREATE TABLE lake.main.t4 (id BIGINT, v BIGINT);
+
+statement ok
+INSERT INTO lake.main.t4 SELECT i, i * 10 FROM range(1, 6) AS r(i);
+
+statement ok
+BEGIN;
+
+statement ok
+MERGE INTO lake.main.t4 USING lake.main.src ON t4.id = src.id
+  WHEN MATCHED AND src.id = 3 THEN DELETE
+  WHEN MATCHED THEN UPDATE SET v = src.v
+  WHEN NOT MATCHED THEN INSERT (id, v) VALUES (src.id, src.v)
+  WHEN NOT MATCHED BY SOURCE THEN UPDATE SET v = -1;
+
+statement ok
+COMMIT;
+
+# id 3 deleted; 4,5 updated from the source; 6,7,8 inserted; 1,2 have no source row => -1.
+query II
+SELECT id, v FROM lake.main.t4 ORDER BY id;
+----
+1	-1
+2	-1
+4	400
+5	500
+6	600
+7	700
+8	800
+
+# ==============================================================================================
+# 3. ATOMICITY. A merge is several DML operators, so how many Delta commits it produces is decided by
+#    the transaction, not by the statement. Inside BEGIN..COMMIT the buffer fuses them into ONE.
+#    The baseline is asserted FIRST so that a change in how many commits a CREATE+INSERT costs fails
+#    on its own line instead of silently shifting the number this section is really about.
+# ==============================================================================================
+
+statement ok
+CREATE TABLE lake.main.atomic (id BIGINT, v BIGINT);
+
+statement ok
+INSERT INTO lake.main.atomic SELECT i, i * 10 FROM range(1, 4) AS r(i);
+
+query I
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/mergeinto/atomic/_delta_log/*.json');
+----
+2
+
+statement ok
+BEGIN;
+
+statement ok
+MERGE INTO lake.main.atomic USING (VALUES (2, 222), (9, 999)) s(id, v) ON atomic.id = s.id
+  WHEN MATCHED THEN UPDATE SET v = s.v
+  WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v);
+
+statement ok
+COMMIT;
+
+# ONE commit for the whole merge — the update's actions and the insert's data files land together.
+query I
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/mergeinto/atomic/_delta_log/*.json');
+----
+3
+
+query II
+SELECT id, v FROM lake.main.atomic ORDER BY id;
+----
+1	10
+2	222
+3	30
+9	999
+
+# ==============================================================================================
+# 3b. A MULTI-ACTION MERGE IS ATOMIC IN AUTOCOMMIT TOO — because it is FORCED to buffer, and that is a
+#     CORRECTNESS mechanism rather than a convenience. Committing a merge one action at a time is
+#     unsound: every action consumes rowids captured from the merge's ONE join scan, so a copy-on-write
+#     DELETE that commits early RENUMBERS the rows a later action already addressed. §11 is the
+#     regression gate for the data loss that caused; this section pins the mechanism that prevents it.
+#     PlanMergeInto marks the statement's transaction buffered whenever it plans >= 2 mutating actions,
+#     so the commit count here is baseline + 1, exactly as in the explicit form above.
+# ==============================================================================================
+
+statement ok
+CREATE TABLE lake.main.auto (id BIGINT, v BIGINT);
+
+statement ok
+INSERT INTO lake.main.auto SELECT i, i * 10 FROM range(1, 4) AS r(i);
+
+query I
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/mergeinto/auto/_delta_log/*.json');
+----
+2
+
+statement ok
+MERGE INTO lake.main.auto USING (VALUES (2, 222), (9, 999)) s(id, v) ON auto.id = s.id
+  WHEN MATCHED THEN UPDATE SET v = s.v
+  WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v);
+
+# TWO commits — and that is CORRECT, not a regression. This merge carries ONE row-addressing action
+# (the UPDATE); the INSERT addresses no existing rows and cannot renumber anything, so there is nothing
+# to protect against and the merge is NOT forced to buffer. It therefore keeps the ordinary
+# per-statement Delta behaviour: the update commits, then the insert. Wrap it in BEGIN..COMMIT (as §3
+# does) to fuse it. §11's positive control is the other half of this: counting the INSERT too would
+# have made this merge require deletion vectors, refusing the commonest shape of all on a non-DV table.
+query I
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/mergeinto/auto/_delta_log/*.json');
+----
+4
+
+query II
+SELECT id, v FROM lake.main.auto ORDER BY id;
+----
+1	10
+2	222
+3	30
+9	999
+
+# A SINGLE-action merge keeps the direct per-statement path: one action is one commit either way, and
+# there is no second action whose addresses could be invalidated, so nothing needs buffering.
+statement ok
+CREATE TABLE lake.main.auto1 (id BIGINT, v BIGINT);
+
+statement ok
+INSERT INTO lake.main.auto1 SELECT i, i * 10 FROM range(1, 4) AS r(i);
+
+statement ok
+MERGE INTO lake.main.auto1 USING (VALUES (2, 222)) s(id, v) ON auto1.id = s.id
+  WHEN MATCHED THEN UPDATE SET v = s.v;
+
+query II
+SELECT id, v FROM lake.main.auto1 ORDER BY id;
+----
+1	10
+2	222
+3	30
+
+# ==============================================================================================
+# 4. ROLLBACK. Nothing the merge did may survive — neither the update's deletion vector nor the
+#    insert's eagerly written data files.
+# ==============================================================================================
+
+statement ok
+CREATE TABLE lake.main.rb (id BIGINT, v BIGINT);
+
+statement ok
+INSERT INTO lake.main.rb SELECT i, i * 10 FROM range(1, 4) AS r(i);
+
+statement ok
+BEGIN;
+
+statement ok
+MERGE INTO lake.main.rb USING (VALUES (2, 222), (9, 999)) s(id, v) ON rb.id = s.id
+  WHEN MATCHED THEN UPDATE SET v = s.v
+  WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v);
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT id, v FROM lake.main.rb ORDER BY id;
+----
+1	10
+2	20
+3	30
+
+# ==============================================================================================
+# 5. THE CHANGE FEED OF A FUSED MERGE. This is the assertion that most needs to exist: the update and
+#    the insert are separate operators whose actions are fused into one commit, so a wrong composition
+#    would show up here as a missing pre-image, a duplicated row, or rows spread over two versions.
+#    All three rows must carry the SAME _commit_version.
+# ==============================================================================================
+
+statement ok
+CREATE TABLE lake.main.cdf WITH (change_data_feed=true) AS SELECT i AS id, i * 10 AS v FROM range(1, 6) AS r(i);
+
+statement ok
+BEGIN;
+
+statement ok
+MERGE INTO lake.main.cdf USING (VALUES (3, 300), (9, 900)) s(id, v) ON cdf.id = s.id
+  WHEN MATCHED THEN UPDATE SET v = s.v
+  WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v);
+
+statement ok
+COMMIT;
+
+query IIII
+SELECT _change_type, id, v, _commit_version
+FROM fabricator_delta_changes('lake', 'main.cdf', 2) ORDER BY _change_type, id;
+----
+insert	9	900	2
+update_postimage	3	300	2
+update_preimage	3	30	2
+
+# ==============================================================================================
+# 6. WHEN MATCHED THEN DO NOTHING — handled entirely inside PhysicalMergeInto (no operator), so the
+#    matched rows must be left alone while the not-matched insert still happens.
+# ==============================================================================================
+
+statement ok
+CREATE TABLE lake.main.nothing (id BIGINT, v BIGINT);
+
+statement ok
+INSERT INTO lake.main.nothing SELECT i, i * 10 FROM range(1, 4) AS r(i);
+
+statement ok
+MERGE INTO lake.main.nothing USING (VALUES (2, 222), (9, 999)) s(id, v) ON nothing.id = s.id
+  WHEN MATCHED THEN DO NOTHING
+  WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v);
+
+query II
+SELECT id, v FROM lake.main.nothing ORDER BY id;
+----
+1	10
+2	20
+3	30
+9	999
+
+# ==============================================================================================
+# 7. THE ERROR ACTION aborts the statement with the user's own message, and leaves the table alone.
+# ==============================================================================================
+
+statement ok
+CREATE TABLE lake.main.errt (id BIGINT, v BIGINT);
+
+statement ok
+INSERT INTO lake.main.errt SELECT i, i * 10 FROM range(1, 4) AS r(i);
+
+statement error
+MERGE INTO lake.main.errt USING (VALUES (2, 222)) s(id, v) ON errt.id = s.id
+  WHEN MATCHED THEN ERROR 'refusing to touch id ' || s.id;
+----
+refusing to touch id 2
+
+query II
+SELECT id, v FROM lake.main.errt ORDER BY id;
+----
+1	10
+2	20
+3	30
+
+# ==============================================================================================
+# 8. INSERT WITHOUT A COLUMN LIST (by position). This exercises the column_index_map remap in
+#    PlanMergeInto: with no list every physical column must be filled from the source in table order.
+# ==============================================================================================
+
+statement ok
+MERGE INTO lake.main.nothing USING (VALUES (77, 770)) s(id, v) ON nothing.id = s.id
+  WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v);
+
+query II
+SELECT id, v FROM lake.main.nothing WHERE id = 77;
+----
+77	770
+
+# ==============================================================================================
+# 9. REFUSALS. MERGE ... RETURNING is not implemented; it must say so rather than silently drop the
+#    returning list.
+# ==============================================================================================
+
+statement error
+MERGE INTO lake.main.nothing USING (VALUES (1, 1)) s(id, v) ON nothing.id = s.id
+  WHEN MATCHED THEN UPDATE SET v = s.v RETURNING *;
+----
+MERGE INTO ... RETURNING is not supported
+
+# ==============================================================================================
+# 10. ON CONFLICT. Since DuckDB 1.5.x the binder REWRITES `INSERT ... ON CONFLICT` into a MERGE, so it
+#     reaches PlanMergeInto too — which is why one override lifted the shared "does not support MERGE
+#     INTO or ON CONFLICT" refusal. It still does not WORK here, and the reason is upstream of the
+#     merge: FabricatorTableEntry::GetStorageInfo reports no indexes, so DuckDB finds no uniqueness to
+#     conflict on. On Delta that refusal is CORRECT rather than a gap — Delta enforces no unique
+#     constraint on user columns, so there is genuinely nothing to conflict against. Pinned so that if
+#     GetStorageInfo ever starts reporting a key, this reads as a deliberate change and not a surprise.
+# ==============================================================================================
+
+statement error
+INSERT INTO lake.main.nothing VALUES (2, 222) ON CONFLICT (id) DO UPDATE SET v = excluded.v;
+----
+not referenced by a UNIQUE/PRIMARY KEY CONSTRAINT or INDEX
+
+statement error
+INSERT INTO lake.main.nothing VALUES (2, 222) ON CONFLICT DO NOTHING;
+----
+There are no UNIQUE/PRIMARY KEY constraints that refer to this table
+
+# ==============================================================================================
+# 11. REGRESSION GATE FOR SILENT DATA DESTRUCTION. This is the shape that was measured DESTROYING a
+#     row before a multi-action merge was forced to buffer, so it is the most load-bearing section
+#     here. On a ONE-FILE `deletion_vectors=false` table (1,10)(2,20)(3,30)(4,40), conditional deletes
+#     of id1 and id3 left survivors **2 and 3** — id3 was NOT deleted and **id4 WAS DESTROYED**,
+#     exit 0, no warning. Cause: the two actions shared one scan's row addresses while committing
+#     separately, and the copy-on-write delete of id1 renumbered every row after it, so the second
+#     delete's captured position named id4. SINGLE-FILE is what makes it bite — with one row per file
+#     the rewrite renumbers nothing, which is why every earlier test of this passed.
+#     Now the merge is forced to buffer, and buffering requires deletion vectors, so this table
+#     REFUSES the statement. Asserted as: a clean error, then the table intact.
+# ==============================================================================================
+
+statement ok
+CREATE TABLE lake.main.nodv WITH (deletion_vectors=false) AS SELECT i AS id, i * 10 AS v FROM range(1, 5) AS r(i);
+
+statement error
+MERGE INTO lake.main.nodv USING (VALUES (1, 0), (3, 0)) s(id, v) ON nodv.id = s.id
+  WHEN MATCHED AND s.id = 1 THEN DELETE
+  WHEN MATCHED AND s.id = 3 THEN DELETE;
+----
+requires deletion vectors on the table
+
+# NOTHING was destroyed — all four rows, original values. Before the fix this read `2, 3`.
+query II
+SELECT id, v FROM lake.main.nodv ORDER BY id;
+----
+1	10
+2	20
+3	30
+4	40
+
+# The update variant of the same hazard (a delete positioned BEFORE an updated row silently lost the
+# update) is refused by the same mechanism.
+statement error
+MERGE INTO lake.main.nodv USING (VALUES (1, 0), (3, 333)) s(id, v) ON nodv.id = s.id
+  WHEN MATCHED AND s.id = 1 THEN DELETE
+  WHEN MATCHED THEN UPDATE SET v = s.v;
+----
+requires deletion vectors on the table
+
+query II
+SELECT id, v FROM lake.main.nodv ORDER BY id;
+----
+1	10
+2	20
+3	30
+4	40
+
+# POSITIVE CONTROL — the refusal must be about BUFFERING, not about non-DV tables being unwritable.
+# A SINGLE-action merge on the very same table still works: one action cannot invalidate another.
+statement ok
+MERGE INTO lake.main.nodv USING (VALUES (2, 0)) s(id, v) ON nodv.id = s.id
+  WHEN MATCHED THEN DELETE;
+
+query II
+SELECT id, v FROM lake.main.nodv ORDER BY id;
+----
+1	10
+3	30
+4	40
+
+# ==============================================================================================
+# 11b. THE SAME DESTROYER SHAPE ON A DELETION-VECTOR TABLE (the DEFAULT) must produce the RIGHT answer
+#      AND fuse into one commit. Two things could regress independently — the result, and whether it
+#      fused — so both are asserted: a correct result reached by three separate commits would mean the
+#      unsound mechanism is still running and merely got lucky on this data.
+# ==============================================================================================
+
+statement ok
+CREATE TABLE lake.main.dvok (id BIGINT, v BIGINT);
+
+statement ok
+INSERT INTO lake.main.dvok SELECT i, i * 10 FROM range(1, 5) AS r(i);
+
+query I
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/mergeinto/dvok/_delta_log/*.json');
+----
+2
+
+statement ok
+MERGE INTO lake.main.dvok USING (VALUES (1, 0), (3, 0)) s(id, v) ON dvok.id = s.id
+  WHEN MATCHED AND s.id = 1 THEN DELETE
+  WHEN MATCHED AND s.id = 3 THEN DELETE;
+
+query II
+SELECT id, v FROM lake.main.dvok ORDER BY id;
+----
+2	20
+4	40
+
+query I
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/mergeinto/dvok/_delta_log/*.json');
+----
+3
+
+# ==============================================================================================
+# 12. THE CHANGE FEED, BOTH SIDES OF THE BOUNDARY. A merge with TWO row-addressing actions is fused, so
+#     its whole change set lands at ONE version; a merge with ONE is not, so its rows SPLIT across two.
+#     Both are pinned, because the boundary is the thing that can regress in either direction: widening
+#     it back to "any two mutating actions" would refuse the common shape on a non-DV table (§11), and
+#     narrowing it further would let the two-action shape apply its actions one at a time again — the
+#     unsound behaviour that destroyed a row.
+# ==============================================================================================
+
+statement ok
+CREATE TABLE lake.main.cdftwo WITH (change_data_feed=true) AS SELECT i AS id, i * 10 AS v FROM range(1, 6) AS r(i);
+
+statement ok
+MERGE INTO lake.main.cdftwo USING (VALUES (2, 0), (3, 300), (9, 900)) s(id, v) ON cdftwo.id = s.id
+  WHEN MATCHED AND s.id = 2 THEN DELETE
+  WHEN MATCHED THEN UPDATE SET v = s.v
+  WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v);
+
+# TWO row-addressing actions (DELETE + UPDATE) => fused => every row at version 2, including the insert's.
+query IIII
+SELECT _change_type, id, v, _commit_version
+FROM fabricator_delta_changes('lake', 'main.cdftwo', 2) ORDER BY _commit_version, _change_type, id;
+----
+delete	2	20	2
+insert	9	900	2
+update_postimage	3	300	2
+update_preimage	3	30	2
+
+query I
+SELECT count(DISTINCT _commit_version) FROM fabricator_delta_changes('lake', 'main.cdftwo', 2);
+----
+1
+
+statement ok
+CREATE TABLE lake.main.cdfone WITH (change_data_feed=true) AS SELECT i AS id, i * 10 AS v FROM range(1, 6) AS r(i);
+
+statement ok
+MERGE INTO lake.main.cdfone USING (VALUES (3, 300), (9, 900)) s(id, v) ON cdfone.id = s.id
+  WHEN MATCHED THEN UPDATE SET v = s.v
+  WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v);
+
+# ONE row-addressing action => NOT fused => the update pair at version 2, the insert at version 3. A
+# consumer reading version-by-version therefore sees this merge as two change sets. Wrap it in
+# BEGIN..COMMIT to get one.
+query IIII
+SELECT _change_type, id, v, _commit_version
+FROM fabricator_delta_changes('lake', 'main.cdfone', 2) ORDER BY _commit_version, _change_type, id;
+----
+update_postimage	3	300	2
+update_preimage	3	30	2
+insert	9	900	3
+
+query I
+SELECT count(DISTINCT _commit_version) FROM fabricator_delta_changes('lake', 'main.cdfone', 2);
+----
+2
+
+# ==============================================================================================
+# 13. `commitInfo.operation` — an INTEROP contract, so pinned. A FUSED merge (>= 2 row-addressing
+#     actions) is ONE commit named **TRANSACTION**, in autocommit as well as inside BEGIN..COMMIT. So
+#     another engine's `DESCRIBE HISTORY` reports TRANSACTION for such a merge and **never `MERGE`** — a
+#     consumer keying on the operation string will not match us.
+#     Asserted per VERSION, never as an aggregate: `max(operation)` over a string column returns the
+#     ALPHABETICAL maximum, which would silently answer a different question.
+# ==============================================================================================
+
+statement ok
+CREATE TABLE lake.main.oplbl (id BIGINT, v BIGINT);
+
+statement ok
+INSERT INTO lake.main.oplbl SELECT i, i * 10 FROM range(1, 6) AS r(i);
+
+statement ok
+BEGIN;
+
+statement ok
+MERGE INTO lake.main.oplbl USING (VALUES (2, 0), (3, 333), (9, 999)) s(id, v) ON oplbl.id = s.id
+  WHEN MATCHED AND s.id = 2 THEN DELETE
+  WHEN MATCHED THEN UPDATE SET v = s.v
+  WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v);
+
+statement ok
+COMMIT;
+
+query IT
+SELECT version, operation FROM fabricator_delta_snapshots('lake', 'main.oplbl') ORDER BY version;
+----
+0	CREATE TABLE
+1	WRITE
+2	TRANSACTION
+
+statement ok
+CREATE TABLE lake.main.oplbla (id BIGINT, v BIGINT);
+
+statement ok
+INSERT INTO lake.main.oplbla SELECT i, i * 10 FROM range(1, 6) AS r(i);
+
+statement ok
+MERGE INTO lake.main.oplbla USING (VALUES (2, 0), (3, 333), (9, 999)) s(id, v) ON oplbla.id = s.id
+  WHEN MATCHED AND s.id = 2 THEN DELETE
+  WHEN MATCHED THEN UPDATE SET v = s.v
+  WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v);
+
+# The SAME single TRANSACTION commit in AUTOCOMMIT, because two row-addressing actions force the fusion
+# either way. The label is what a foreign reader keys on, so it is asserted rather than inferred from
+# the commit count.
+query IT
+SELECT version, operation FROM fabricator_delta_snapshots('lake', 'main.oplbla') ORDER BY version;
+----
+0	CREATE TABLE
+1	WRITE
+2	TRANSACTION
+
+statement ok
+CREATE TABLE lake.main.oplbl1 (id BIGINT, v BIGINT);
+
+statement ok
+INSERT INTO lake.main.oplbl1 SELECT i, i * 10 FROM range(1, 6) AS r(i);
+
+statement ok
+MERGE INTO lake.main.oplbl1 USING (VALUES (3, 333), (9, 999)) s(id, v) ON oplbl1.id = s.id
+  WHEN MATCHED THEN UPDATE SET v = s.v
+  WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v);
+
+# ONE row-addressing action, autocommit: NOT fused, so each action commits under its OWN operation.
+# This is the other side of the boundary — and the reason a consumer cannot rely on seeing TRANSACTION
+# for every merge, only for one carrying two or more UPDATE/DELETE actions.
+query IT
+SELECT version, operation FROM fabricator_delta_snapshots('lake', 'main.oplbl1') ORDER BY version;
+----
+0	CREATE TABLE
+1	WRITE
+2	UPDATE
+3	WRITE

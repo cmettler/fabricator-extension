@@ -562,47 +562,209 @@ current code still uses the single-provider `fabricator` naming):
 ## Next up (open threads for future sessions)
 
 In-flight / planned refactors (all C#-only unless noted; tests stay green per slice):
-- **`MERGE INTO` — A MUST-HAVE (user, 2026-08-04). NOTHING BUILT. `ON CONFLICT` is DEFERRED (same user
-  decision).** ⚠ **MEASURED: neither reaches us at all** — DuckDB refuses both at BIND on the catalog type:
-  `Not implemented Error: Database type "fabricator" does not support MERGE INTO or ON CONFLICT`. So this is
-  a DuckDB-level gate affecting **every** provider (Delta, SQL Server, DAX), not a provider gap, and there is
-  no translation to inspect. Reproduce with four statements: attach a Delta catalog, CTAS a target and a
-  source, `MERGE INTO … WHEN MATCHED THEN UPDATE … WHEN NOT MATCHED THEN INSERT …`. The failing statement
-  aborts cleanly (target unchanged, no stray version).
-  - **✅ THE HOOK IS FOUND, AND THE OUTLOOK IS GOOD: `Catalog::PlanMergeInto`**
-    (`duckdb/src/execution/physical_plan/plan_merge_into.cpp:120`) is a **virtual whose default body is that
-    throw**. A custom catalog only has to OVERRIDE it. ⚠ **It exists in 1.5.5 — this does NOT need duckdb
-    `main`** (the guess that it might was reasonable and is wrong).
-  - **⚠ AND DuckDB'S OWN MERGE PLAN IS ALREADY ROW-ID BASED — exactly the mode to hope for.** The
-    `DuckCatalog` implementation directly above the throw builds a `PhysicalMergeInto` from
-    **`op.row_id_start`** + `op.source_marker`, planning each action through `PlanMergeIntoAction`. And
-    `MergeActionType::MERGE_UPDATE` carries **`update_is_del_and_insert`**, so an update can be expressed as
-    delete+insert — which is what Delta copy-on-write wants anyway. So the translation we would want DuckDB to
-    do is the translation it already does; the work is slotting our existing rowid UPDATE/DELETE/INSERT
-    operators into that shape, not inventing a lowering.
-  - **⚠ NOT a template: `D:\repos\airport` has NO merge support** (checked — only `ON CONFLICT` refusals in
-    `airport_insert.cpp` / `airport_schema_entry.cpp`). Its rowid work is the UPDATE/DELETE path we already
-    share, so there is nothing to port. **DuckDB's own `DuckCatalog::PlanMergeInto` is the reference
-    implementation**, and it is in-tree — read that rather than hunting for a third-party example.
-  - Still unchecked: what `PlanMergeIntoAction` actually emits and whether our physical operators slot in
-    unchanged; the `FIXME` about disabling parallelism with multiple INSERTs; and **what DuckLake does**
-    (user-raised — it reportedly has merge LIMITATIONS, so its restrictions may be the interesting part).
-  - **⚠ The two providers want DIFFERENT implementations, and conflating them would waste the work.**
-    SQL Server has NATIVE T-SQL `MERGE`, so the prize there is generating ONE server-side statement — but a
-    DuckDB MERGE's SOURCE is a DuckDB relation, so a pushdown needs the source to be server-side too;
-    otherwise it degrades to per-row DML on the pinned connection (correct, slow). Delta has no native merge:
-    compose it from update + delete + insert, which **already lands as ONE atomic commit per table** via the
-    buffered flush — so the Delta half may be mostly free once the hook exists.
-  - **What the hand-written equivalent already gives us, and the bar to beat:** UPDATE (matched) + INSERT
-    (unmatched) inside one `BEGIN … COMMIT` is atomic per table AND produces a correct change feed. It also
-    dodges the two same-transaction hazards by construction, since matched/not-matched are disjoint —
-    ⚠ but a MERGE implementation must PRESERVE that property, because `UPDATE of rows inserted in the same
-    transaction` is refused on any table and `DELETE of rows inserted in the same transaction` is refused on a
-    CDF table. A merge that re-reads its own inserts would trip both.
-  - **`ON CONFLICT` is deferred for a REASON worth keeping**: SQL Server's nearest mechanism is
-    `IGNORE_DUP_KEY = ON`, an option on a UNIQUE INDEX — index-level, not statement-level, so it can express
-    only `DO NOTHING`, only where the index was created that way. It cannot express `DO UPDATE` at all, so it
-    is not a translation target; treat the two features as independent despite DuckDB refusing them together.
+- **`MERGE INTO` — BUILT + GATED 2026-08-05 (C++-only, no ABI bump). ⚠ It SHIPPED A SILENT-DATA-DESTRUCTION
+  BUG FOR HALF A DAY BEFORE THE FIX, and the shape of that miss is the most reusable thing here.**
+  - **⛔ THE BUG, MEASURED (found by the user asking "can we actually do a delete update insert in these
+    order? i think we are in trouble" — the answer was yes, we were).** Delta × `deletion_vectors=false` ×
+    AUTOCOMMIT × ≥2 mutating actions: a later action addressed the **WRONG ROW**. Every action consumes rowids
+    captured from the merge's ONE join scan, but each action committed separately — and a **copy-on-write
+    DELETE removes a row, shifting every LATER row's position down one**, so a subsequent action's captured
+    `(fileOrdinal, position)` named a different row. On a one-file table `(1,10)(2,20)(3,30)(4,40)` with
+    conditional deletes of id1 and id3 the survivors were **`2, 3`** — id3 NOT deleted, **id4 DESTROYED**,
+    exit 0. The update variant silently lost the update instead.
+    - **⚠ WHY EVERY TEST MISSED IT, which is the transferable part: the hazard needs the rows in ONE FILE.**
+      With a row per file a copy-on-write rewrite renumbers nothing, so all four of my earlier
+      multi-action/multi-file probes were correct — and both tiers were GREEN through the bug. It is strictly
+      positional (corrupt iff the deleted row precedes the other action's target), so even a single-file test
+      passes if the delete happens to sit last. **A merge test that does not put several affected rows in one
+      file, with the delete FIRST, tests nothing about this.**
+    - **⚠ AND THE GREEN TIERS WERE THE TRAP.** 65/65 and 45/45 were reported as evidence the feature was
+      finished. They were evidence only that the shapes I had imagined worked. The user's question was worth
+      more than the whole suite run.
+  - **THE FIX: a merge carrying ≥2 `UPDATE`/`DELETE` actions is FORCED TO BUFFER, even in autocommit.**
+    `PlanMergeInto` counts them and sets `force_buffered` on each target; each operator's `GetGlobalSinkState`
+    then calls `BeginTransaction(handle, is_explicit=true)`. Both actions stage against ONE pinned snapshot ⇒
+    neither can renumber the other's targets ⇒ one commit.
+    - **⚠ THE MARK MUST HAPPEN AT EXECUTION TIME, NOT PLAN TIME.** A prepared statement's physical plan is
+      reused across transactions, so a plan-time mark would apply to the first one only. `GetGlobalSinkState`
+      is the right hook because `PhysicalMergeInto` builds every action's global sink state UP FRONT, before
+      any action does provider work — so whichever action runs first sets it and the rest observe it,
+      including the INSERT's own `begin_bulk`, which therefore buffers instead of committing on its own.
+    - **⚠ THE COUNT EXCLUDES `INSERT`, AND MY FIRST VERSION GOT THIS WRONG — user-caught, via DuckLake's own
+      docs.** Counting every MUTATING action was measured to REFUSE the single most common merge shape,
+      `WHEN MATCHED THEN UPDATE` + `WHEN NOT MATCHED THEN INSERT`, on a non-DV table where it had always been
+      correct and was never unsafe. An `INSERT` addresses no existing rows, so it can neither renumber another
+      action's targets nor hold targets of its own — and it commits LAST regardless (it is the one action that
+      always routes through the transaction buffer, as the instrumented log shows). So the broad count bought
+      no safety and cost the common case. **The hazard needs TWO ROW-ADDRESSING actions, nothing less.**
+      - **This is the boundary DuckLake documents** ("MERGE INTO with DuckLake only supports a single
+        UPDATE/DELETE action currently", https://ducklake.select/docs/stable/duckdb/usage/upserting) — arrived
+        at independently, which is some evidence it is the real fault line. **We are STRICTLY more capable:
+        DuckLake REFUSES two such actions outright; we SERVE them by fusing, and refuse only when the table
+        cannot be buffered at all.** ⚠ So the earlier note here claiming we are "more permissive than DuckLake"
+        because we accept 4-action merges is still true, but for a narrower reason than it implied: what we add
+        is fusion, not permissiveness about the hazard.
+    - **ONE row-addressing action keeps the direct path** — nothing to collide with — so a non-DV table loses
+      no capability. Asserted as a POSITIVE CONTROL, since otherwise the §11 refusal would pass equally if
+      non-DV tables had simply become unwritable.
+    - **⚠ NO ABI BUMP, by REUSING `BeginTransaction(isExplicit)` — whose real meaning is "the USER opened a
+      transaction", not "buffer this statement". That overload HAD a measured cost, and fixing it is the second
+      narrowing this feature needed.** On SQL Server that entry also gates three EXTERNAL-TABLE guards, so a
+      2-action merge into an identity-equipped SQL Server external table was **refused** by the pre-existing
+      *"storage-side DML … cannot roll back with an explicit transaction"* check — MEASURED, after first
+      probing a table with no row identity and getting a different error, which nearly recorded the wrong
+      conclusion in both directions.
+      - **THE FIX, and it is the right scoping rather than a workaround: force only where row identity is
+        POSITIONAL** — `rowid_actions >= 2 && entry.HasVirtualRowId()`. The hazard is one action RENUMBERING
+        rows another addressed, which requires a TRANSIENT (file, position) rowid, i.e. a provider VIRTUAL
+        rowid as Delta's `_metadata.row_id` is. Where the rowid is real KEY COLUMNS (SQL Server's PK / unique
+        index / IDENTITY) it is a VALUE, stable under any rewrite — measured immune to both corrupting shapes —
+        so forcing bought nothing there and only cost the external-table capability. **Provider-agnostic: it
+        names an identity KIND, not a provider**, which is why it belongs in the shared layer.
+    - **TRADE-OFF ACCEPTED:** a merge with one `UPDATE`/`DELETE` plus an `INSERT` is therefore NOT fused, so in
+      autocommit it is two commits — correct but not atomic, i.e. the pre-existing Delta per-statement
+      divergence. `BEGIN … COMMIT` still fuses it. That is the right way round: refusing the common shape on a
+      non-DV table to buy atomicity would trade a capability for a guarantee nobody asked for.
+    - **⚠ "TWO COMMITS" IS NOT THE SMELL — "TWO OPERATIONS ADDRESSING PRE-EXISTING ROWS" IS.** Worth stating
+      because I had been using the commit count as the diagnostic, and a user question about CTAS showed it does
+      not discriminate. MEASURED, same session: `CREATE TABLE … AS SELECT` is **2 commits** (`CREATE TABLE` then
+      `WRITE`) in autocommit **AND inside an explicit transaction** — so its two-ness is NOT caused by the
+      autocommit/buffered decision and forcing the buffer cannot fix it (it is limitation 1.5: EW's
+      `OpenOrCreateAsync` commits v0 before any transaction on that table can exist). Yet a CTAS has NO hazard —
+      a new table has no pre-existing rows to renumber. Conversely `CREATE OR REPLACE … AS SELECT` over an
+      existing table is **1 commit** (a single `WRITE`), i.e. two operations fused with no forcing at all. So
+      commit count tracks neither risk nor atomicity reliably.
+      - **The audit that follows from the right smell:** MERGE is the ONLY statement DuckDB plans as multiple
+        DML operators sharing ONE scan's row addresses, and `INSERT … ON CONFLICT` is the same mechanism (the
+        binder rewrites it into a MERGE) which we already refuse. So the exposure was unique to MERGE rather
+        than one member of a class we have patched only partially — checkable, and checked.
+  - **Scope of the original hazard, all measured:** `deletion_vectors` defaults ON and a **DV delete PRESERVES
+    positions**, so the default was always safe (all four position combinations verified). An EXPLICIT
+    transaction already refused the non-DV path. **SQL Server is IMMUNE** — its rowid is a PK VALUE, stable
+    under any rewrite (verified with both corrupting shapes). So the blast radius was exactly Delta × non-DV ×
+    autocommit × ≥2 actions.
+  - **⚠ The hazard was NOT two actions touching one row.** `PhysicalMergeInto` removes each row from the
+    candidate set as an action claims it, so actions are row-DISJOINT by construction, and the existing
+    same-transaction guards ("cannot delete rows inserted in this transaction") key on the ordinal's
+    pending-vs-committed RANGE — a different axis. The hazard was one action RENUMBERING rows another had
+    already addressed, which no guard covered and none of that family would have caught.
+  - Gates: `verify_merge_into.test` **209 × 2 engine legs** (hermetic, ENGINE-DOUBLED) + `verify_merge_into_mssql.test`
+    **106** (service). §11 is the destruction regression gate (refusal + table bit-for-bit intact + the
+    single-action positive control), §11b the same shape on a DV table asserting BOTH the right answer and the
+    fusion — a correct result reached by three commits would mean the unsound mechanism is still running and
+    merely got lucky. **Mutation-tested**: disabling the forcing reproduces `2, 3` exactly and kills the suite.
+  - **⚠ `ON CONFLICT` came along for free ARCHITECTURALLY and still does NOT work — for a reason upstream of
+    the merge (see below).** One override,
+  `FabricatorCatalog::PlanMergeInto` (`src/catalog/fabricator_merge_into.cpp`), lifted the shared refusal
+  `Database type "fabricator" does not support MERGE INTO or ON CONFLICT` for **every** provider at once.
+  Measured working on Delta AND SQL Server: matched UPDATE, matched conditional DELETE, not-matched INSERT
+  (with and without a column list), `WHEN NOT MATCHED BY SOURCE`, `DO NOTHING`, the `ERROR` action, and
+  ROLLBACK. Gates: `verify_merge_into.test` **130 × 2 engine legs** (hermetic, ENGINE-DOUBLED — a merge is
+  composed of exactly the update/delete/insert paths that list already doubles) + `verify_merge_into_mssql.test`
+  **90** (service).
+  - **THE LOWERING IS DuckDB'S, NOT OURS — that is the whole reason this was small.** Each action becomes the
+    same `Logical{Update,Delete,Insert}` the standalone statement produces, routed through our OWN
+    `PlanUpdate`/`PlanDelete`/`PlanInsert`. So MERGE INHERITS every property of our rowid DML rather than
+    re-deriving it: provider dispatch, the buffered-transaction fusion, the change feed, identity handling.
+  - **⚠ DuckLake IS the reference, NOT `DuckCatalog` — and the earlier note here saying otherwise cost time.**
+    `ducklake/src/storage/ducklake_merge_into.cpp` is a CUSTOM catalog doing exactly this (synthesize the
+    logical op, call its own `Plan*`), which is our situation; `DuckCatalog` plans against its own storage. **We
+    are MORE permissive than DuckLake on two axes**, both measured: it refuses more than ONE update-or-delete
+    action total (*"MERGE INTO with DuckLake only supports a single UPDATE/DELETE action currently"*) while we
+    serve DELETE + UPDATE + INSERT + NOT-MATCHED-BY-SOURCE in one statement, because each action gets its own
+    operator and the buffer fuses their actions at COMMIT. (Both of us refuse RETURNING.)
+  - **⚠ `PhysicalMergeInto` drives the sub-operators as MANUAL SINKS** — it calls
+    `GetGlobalSinkState`/`GetLocalSinkState`/`Sink`/`Combine`/`Finalize` directly on sliced chunks, never as a
+    pipeline. Ours are already self-contained sinks (our `PlanInsert` already accepted a null child), so they
+    slotted in unchanged. **`parallel` MUST be false and that is load-bearing, not caution**: every action
+    shares ONE global sink state, and `FabricatorPhysicalInsert` streams into a single bulk session whose
+    `PushBatch` takes no lock — documented as safe only because `ParallelSink()` is false. DuckLake passes
+    `true` because its operators are parallel-safe; ours are not.
+  - **⚠ THE ONE REAL CODE CHANGE WAS WHERE AN UPDATE READS ITS SET VALUES, AND IT FIXED A LIVE CORRUPTION BUG.**
+    `AppendModifyBatch` read them POSITIONALLY from chunk `0..n-1`, which is right only because a plain
+    UPDATE's binder projection happens to put them there. Two things break it: a MERGE's UPDATE action shares
+    ONE projection with every other action (arbitrary positions), and **`SET x = DEFAULT` contributes NO
+    projection column, shifting every later SET value by one**. The second was already shipping. **Measured on
+    `(a BIGINT DEFAULT 99, b BIGINT, c INTEGER)`: `SET a = DEFAULT, b = 5` SUCCEEDED and committed `a=5, b=0`**
+    (b got the rowid) where correct is `a=99, b=5`; where the shifted types differ instead it raised an
+    INTERNAL error and **fatally invalidated the database**. Now `FabricatorModifyTarget.set_child_indices`
+    carries the BOUND_REF position per SET column (upstream `PhysicalUpdate` reads them the same way), shared by
+    both paths via `FabricatorFillUpdateSetColumns` so they cannot drift; `SET = DEFAULT` is REFUSED rather
+    than guessed (evaluating it needs the bound defaults in the operator — a feature, deliberately not smuggled
+    into a MERGE change). Gate in `verify_delta_catalog_update.test` (63 → 73), mutation-tested: reverting to
+    the positional read kills BOTH merge suites at their FIRST merge statement.
+  - **⚠ THE `!HasRowId()` GUARD IS REQUIRED FOR *EVERY* MERGE, INCLUDING AN INSERT-ONLY ONE.** DuckDB decides
+    matched-vs-not by testing the rowid column for NULL, so with no rowid `BindRowIdColumns` appends nothing and
+    `row_id_start` points ONE PAST the chunk's width. `ComputeMatches` reads `chunk.data[row_id_index]`
+    unconditionally. An insert-only merge never reaches `FabricatorBuildModifyTarget`'s own check, so without
+    this guard it is an out-of-bounds read — **mutation-tested: `INTERNAL Error: Attempted to access index 2
+    within vector of size 2`, then the database is FATALLY INVALIDATED.** Refuse at plan time, where it can
+    still be a message.
+  - **⚠ ATOMICITY IS THE TRANSACTION'S, NOT THE STATEMENT'S — measured both ways, and autocommit is NOT atomic.**
+    A merge is several DML operators, so on Delta an **autocommit `MERGE` produces ONE COMMIT PER ACTION**
+    (measured: baseline 2 → 4; three actions ⇒ three commits) while `BEGIN; MERGE; COMMIT;` fuses them into
+    **ONE** (2 → 3). The DATA is correct either way; only atomicity differs. **The change feed of the fused
+    form is exact** — an `update_preimage`/`update_postimage` pair plus the `insert`, all at one version (this
+    was the stated priority) — while the autocommit one is SPLIT across versions. Same per-statement-commit
+    divergence the rest of the Delta provider has; every number is pinned (`verify_merge_into.test`
+    §3 / §3b / §5 / §12) so a change reads as deliberate.
+    - **⚠ THE MECHANISM IS NOT "ONE `DeltaTransaction` PER ACTION" — INSTRUMENTED, because the obvious guess is
+      wrong in both directions.** There are exactly TWO `StartTransaction` sites in the Bridge.
+      **EXPLICIT: ONE shared transaction** — `pending.HeldTxn ??= table.StartTransaction(...)`
+      (`DeltaCatalog.cs:3701`), keyed per DuckDB-transaction × table, so every action stages into it and one
+      `CommitAsync` writes one version. **AUTOCOMMIT: three commits by THREE DIFFERENT mechanisms** — the DV
+      DELETE commits directly with **no `DeltaTransaction` at all**, the merge-on-read UPDATE creates its OWN
+      short-lived one (`DeltaReader.cs:2620`, `await using`), and the INSERT **still routes through the txn
+      buffer** (autocommit has an implicit DuckDB transaction — the log shows `buffered … for txn 12`) so it is
+      flushed LAST, after the delete and update have already committed. So the intermediate states an observer
+      can see are delete → delete+update → all three, and the INSERT commits last despite its bulk session
+      being opened FIRST at merge init.
+    - **⚠ INTEROP: `commitInfo.operation` is `TRANSACTION` for a fused merge, and NOTHING we write ever says
+      `MERGE`.** Autocommit labels each action instead (`DELETE`/`UPDATE`/`WRITE`). Measured via
+      `fabricator_delta_snapshots` (identical on BOTH engines) and pinned per VERSION in §13 — never as an
+      aggregate, since `max(operation)` over a string column returns the ALPHABETICAL maximum. A foreign
+      consumer keying on `operation = 'MERGE'` will not match us.
+  - **⚠ AND THE MODES DIFFER IN CAPABILITY, OPPOSITE TO THE ATOMICITY TRADE-OFF: a merge with an UPDATE/DELETE
+    action WORKS in autocommit on a `deletion_vectors=false` table and is REFUSED inside a transaction.** The
+    buffered path requires DVs; the autocommit path rewrites copy-on-write and does not. So wrapping a working
+    merge in `BEGIN` to gain atomicity can COST the statement (*"… requires deletion vectors on the table … run
+    it in autocommit (copy-on-write), or COMMIT first"*, table left unchanged). Inherited from the plain
+    statements rather than MERGE-specific — which is the lowering working as designed — and it bites only where
+    DVs were switched off. Pinned in BOTH directions with a positive control (§11).
+  - **The same-transaction hazards do NOT bite, and the reason is structural.** `UPDATE of rows inserted in the
+    same transaction` is refused on any table, `DELETE of rows inserted in the same transaction` on a CDF table
+    — but both guards are **PER-ROW, keyed on the rowid's FILE ORDINAL** (`>= PendingOrdinalBase`), not on the
+    mere presence of pending appends. A merge's matched rows come from the pre-merge snapshot, so they carry
+    committed ordinals. ⇒ **MERGE does not need hoist slice 3.**
+  - **STILL OPEN — the SQL Server half is CORRECT BUT NOT OPTIMISED.** Actions run as per-row DML on the pinned
+    connection, NOT as a server-side T-SQL `MERGE`. Generating one server-side statement needs the SOURCE to be
+    server-side too, and a DuckDB MERGE's source is a DuckDB relation (the README example merges a DuckDB temp
+    table INTO SQL Server, which is exactly the shape that cannot be pushed down). A pushdown would have to
+    detect "source and target are both in this catalog" and fall back otherwise.
+  - **⚠ `ON CONFLICT` IS NOT AN INDEPENDENT FEATURE — THIS FILE SAID IT WAS, AND THAT WAS WRONG.** Since 1.5.x
+    the binder **REWRITES `INSERT … ON CONFLICT` into a MERGE** (`Binder::Bind(InsertStatement&)` →
+    `GenerateMergeInto`, `bind_insert.cpp:541`), which is why ONE message covered both features and ONE
+    override lifted both. It still does not WORK, for a reason upstream of the merge: `GenerateMergeInto` keys
+    the join on a UNIQUE/PK constraint and `FabricatorTableEntry::GetStorageInfo` returns an EMPTY
+    `TableStorageInfo`, so DuckDB finds no uniqueness. Measured: with a target ⇒ *"The specified columns as
+    conflict target are not referenced by a UNIQUE/PRIMARY KEY CONSTRAINT or INDEX"*; without ⇒ *"There are no
+    UNIQUE/PRIMARY KEY constraints that refer to this table"*. **On Delta that refusal is semantically CORRECT**
+    — Delta enforces no unique constraint on user columns, so there is nothing to conflict against and
+    "fixing" it would claim a guarantee the format lacks. On SQL Server a real PK/unique index exists, so the
+    remaining work is `GetStorageInfo`, NOT the merge hook. Pinned by `verify_merge_into.test` §10.
+    - The old deferral rationale is **right about T-SQL and irrelevant to the path DuckDB takes**: SQL Server's
+      `IGNORE_DUP_KEY = ON` is an option on a UNIQUE INDEX, so it expresses only `DO NOTHING` and only where the
+      index was built that way. That matters for a *native* pushdown; through the merge rewrite ON CONFLICT
+      needs no server feature at all.
+  - `update_is_del_and_insert` is ignored: the merge binder hardcodes it FALSE (`bind_merge_into.cpp:87`) and we
+    do not override `BindUpdateConstraints`, so nothing sets it — and our UPDATE operator owns that choice
+    anyway (Delta copy-on-write already rewrites).
+  - **⚠ A C++ TRAP worth remembering: do NOT declare `namespace fabricator` INSIDE `namespace duckdb`.** The
+    extension's generic core is the GLOBAL `::fabricator`; a nested `duckdb::fabricator` shadows it for every
+    TU that includes the header, so every existing `fabricator::PartitionColumnsArg` /
+    `BoundaryClientProperties` call fails to compile with *"is not a member of duckdb::fabricator"*. Hence the
+    two shared helpers are `FabricatorBuildModifyTarget` / `FabricatorFillUpdateSetColumns`, in `duckdb`
+    directly.
 - **TIMESTAMP BOUNDS FOR `fabricator_delta_changes` — AGREED, NOT BUILT (user, 2026-08-04). ⚠ C++-TOUCHING**
   (two `TableFunction` overloads at `fabricator_extension.cpp:627`), so it needs the full rebuild, not just a
   managed republish. Ours is `BIGINT`-only today — `(catalog, '<schema.>table', from [, to])` — while Delta's
@@ -1827,7 +1989,10 @@ Implemented and verified:
   **live** (point-in-time correct — a post-timestamp INSERT is invisible AS OF the earlier instant — and the
   ≥4-digit truncation confirmed, no 22440).
 - **DML**: INSERT (+ INSERT…SELECT, + RETURNING via `OUTPUT INSERTED.*`), UPDATE, DELETE (rowid-based,
-  parameterized). INSERT/CTAS/COPY use a **streaming bulk path** (see below).
+  parameterized), and **MERGE INTO** (every action kind; lowered to those same rowid operators — see the
+  as-built entry in "Next up"). INSERT/CTAS/COPY use a **streaming bulk path** (see below).
+  Not supported: `UPDATE … SET col = DEFAULT` (refused), `INSERT … ON CONFLICT` (refused at bind — no
+  unique constraint is advertised), `MERGE … RETURNING`.
 - **DDL**: CREATE/DROP TABLE, CREATE/DROP SCHEMA, ALTER TABLE (rename table/column, add/drop column,
   change type, SET/DROP NOT NULL, SET/DROP literal DEFAULT); PRIMARY KEY/UNIQUE/literal DEFAULT on CREATE.
   **On a warehouse profile (Fabric/Synapse) PK/UNIQUE are emitted as `NONCLUSTERED NOT ENFORCED` via a

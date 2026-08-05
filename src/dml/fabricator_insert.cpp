@@ -67,6 +67,13 @@ FabricatorPhysicalInsert::FabricatorPhysicalInsert(PhysicalPlan &plan, vector<Lo
 }
 
 unique_ptr<GlobalSinkState> FabricatorPhysicalInsert::GetGlobalSinkState(ClientContext &context) const {
+	// MERGE with >=2 mutating actions: mark the transaction buffered BEFORE begin_bulk below, so the bulk
+	// defers its files to the fused commit instead of committing on its own. See the note on
+	// FabricatorForceBufferedTxn in fabricator_modify.cpp for why this is a correctness requirement.
+	if (target_.force_buffered) {
+		FabricatorSetActiveTxn(handle_, context);
+		fabricator::BeginTransaction(handle_, /*is_explicit=*/true);
+	}
 	auto gstate = make_uniq<FabricatorInsertGlobalSinkState>(context, target_);
 	if (!target_.returning) {
 		// Stream rows to the provider as they are sinked (bounded memory) rather than

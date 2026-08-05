@@ -60,6 +60,9 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | | Statistics → optimizer: cardinality + per-column NDV | ✅ (NDV only; min/max intentionally not reported) |
 | **Write** | INSERT, INSERT…SELECT, INSERT…RETURNING (`OUTPUT INSERTED.*`) | ✅ |
 | | UPDATE / DELETE (rowid-based, parameterized) | ✅ |
+| | `MERGE INTO` — all actions incl. `NOT MATCHED BY SOURCE`, `DO NOTHING`, `ERROR` | ✅ (needs a rowid; 2+ `UPDATE`/`DELETE` actions are fused and need deletion vectors on Delta; no `RETURNING`) |
+| | `UPDATE … SET col = DEFAULT` | ❌ (write the value explicitly) |
+| | `INSERT … ON CONFLICT` | ❌ (no unique constraint is advertised — use `MERGE INTO`) |
 | | CREATE TABLE AS / COPY TO (streaming bulk via `SqlBulkCopy`) | ✅ |
 | | Bounded-memory streaming bulk write (INSERT/CTAS/COPY) | ✅ |
 | | CHECK/FK constraint enforcement on INSERT | ✅ (`SqlBulkCopyOptions.CheckConstraints`; COPY/CTAS skip for speed) |
@@ -428,6 +431,63 @@ violation fails just like a classic INSERT (CTAS/COPY skip constraint checking f
 `IDENTITY` columns are preserved when the source supplies them (`KeepIdentity`) and auto-generated
 otherwise. UPDATE/DELETE require a primary key or unique index (otherwise use `fabricator_exec`); they do
 not support RETURNING.
+
+`UPDATE … SET col = DEFAULT` is not supported — write the default value explicitly.
+
+### MERGE INTO
+
+`MERGE INTO` works on every provider that supports UPDATE/DELETE (SQL Server and Delta), including
+`WHEN NOT MATCHED BY SOURCE`, per-action `AND` conditions, `DO NOTHING` and `ERROR`:
+
+```sql
+BEGIN;
+MERGE INTO mssql.dbo.target AS t USING staging AS s ON t.id = s.id
+  WHEN MATCHED AND s.deleted THEN DELETE
+  WHEN MATCHED               THEN UPDATE SET name = s.name
+  WHEN NOT MATCHED           THEN INSERT (id, name) VALUES (s.id, s.name);
+COMMIT;
+```
+
+Each action is executed by the same rowid machinery as the standalone statement, so the same
+requirements apply: **the target needs a primary key or unique index** (row identity is how DuckDB tells
+a matched row from an unmatched one, so this holds even for a merge whose only action is an INSERT), and
+`MERGE … RETURNING` is not supported.
+
+**On Delta, a merge carrying two or more `UPDATE`/`DELETE` actions is FUSED into one commit — in autocommit
+as well as inside a transaction — and that is a correctness mechanism, not a convenience.** Those actions all
+address rows located by one scan of the join, so applying them one commit at a time is unsound: a
+copy-on-write delete renumbers the rows the other action already located. Such a merge is therefore always
+staged against a single snapshot.
+
+The rule counts `UPDATE`/`DELETE` actions only, because an `INSERT` addresses no existing rows:
+
+| merge shape | fused? | on a `deletion_vectors=false` target |
+|---|---|---|
+| one `UPDATE`/`DELETE` (± an `INSERT`) | no — one commit per action | works (copy-on-write) |
+| two or more `UPDATE`/`DELETE` actions | **yes, one commit** | **refused** |
+
+The refusal is the price of the guarantee: fusing requires deletion vectors, so on a table created with
+`deletion_vectors=false` a merge with two such actions reports *"requires deletion vectors on the table when
+it is buffered … Enable deletion vectors on the table, or use at most one UPDATE/DELETE action per merge
+outside a transaction."* Deletion vectors are on by default, so this only affects tables that switched them
+off — typically for readers that cannot consume them, such as SQL Server's external-table Delta reader.
+
+*(DuckLake draws the same line and stops there — it [refuses two such actions
+outright](https://ducklake.select/docs/stable/duckdb/usage/upserting). We serve them by fusing, and refuse
+only when the table cannot be buffered at all.)*
+
+⚠ **A fused merge reports `operation = 'TRANSACTION'`, never `'MERGE'`.** Another engine's
+`DESCRIBE HISTORY` will not match on `MERGE`. Wrap any merge in `BEGIN … COMMIT` if you want it atomic
+regardless of how many actions it carries.
+
+On SQL Server the actions run as per-row DML on the transaction's pinned connection (this is *not*
+translated into a server-side T-SQL `MERGE`), so an explicit transaction is likewise what makes the
+statement atomic.
+
+`INSERT … ON CONFLICT` is **not supported**. DuckDB lowers it to a MERGE keyed on a unique constraint,
+and fabricator tables advertise no indexes, so it fails at bind with *"no UNIQUE/PRIMARY KEY constraints
+that refer to this table"*. On Delta that is also semantically right — Delta enforces no uniqueness on
+user columns, so there is nothing to conflict against. Use `MERGE INTO` instead.
 
 ## CREATE TABLE AS / COPY TO
 
@@ -1495,6 +1555,34 @@ COMMIT;
   the reason is logged with the path. Set `FABRICATOR_LOG_LEVEL=Information` to see it.
 
 Rationale and the full trade-off: [docs/delta-transaction-hoist.md](docs/delta-transaction-hoist.md) §3.
+
+#### `MERGE INTO` on Delta — one commit per transaction, not per statement
+
+A `MERGE` is several DML operators, so the transaction — not the statement — decides how many Delta
+versions it produces:
+
+```sql
+BEGIN;
+MERGE INTO lake.main.t USING src ON t.id = src.id
+  WHEN MATCHED     THEN UPDATE SET v = src.v
+  WHEN NOT MATCHED THEN INSERT (id, v) VALUES (src.id, src.v);
+COMMIT;                                  -- ONE commit; the change feed reports it at ONE version
+```
+
+- ⚠ **In autocommit the same `MERGE` produces one commit per action** (measured: two, or three with a
+  delete), so a concurrent reader can observe the update without the insert. The final data is correct
+  either way — only atomicity differs. This is the same per-statement-commit divergence the rest of the
+  Delta provider has.
+- The change feed of a fused merge is exact: matched rows appear as an
+  `update_preimage`/`update_postimage` pair and inserted rows as `insert`, all at the single version. In
+  autocommit the same rows are **split across versions** (the update pair at one, the insert at the next),
+  so a consumer processing version-by-version cannot see the merge as one change set.
+- ⚠ In autocommit the **INSERT action commits LAST**, after the delete and update — it is the only action
+  that routes through the transaction buffer, so it is flushed at statement end. The visible intermediate
+  states are therefore "delete applied", then "delete + update applied", then all three.
+- `WHEN MATCHED THEN UPDATE` on rows **this same transaction inserted** is refused, as it is for a plain
+  `UPDATE` — but a merge does not hit that: matched and not-matched rows are disjoint by construction, and
+  the guard keys on the rowid's file ordinal, so matched rows carry committed ordinals.
 
 #### Exactly-once appends — Delta application transactions
 

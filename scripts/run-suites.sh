@@ -122,7 +122,7 @@ case "$TIER" in
         # deletion vector it staged (EW #46's ledger + #49's fix). MEASURED before the change: the same shape
         # left a stray deletion_vector_*.bin forever. The section needs a delete LARGER than the 1 KB roaring
         # inline threshold, or the vector rides inside the commit json and there is no file to leak.
-        : "${MIN_SUITES:=63}"
+        : "${MIN_SUITES:=65}"
         # 5656 since 2026-08-02: verify_delta_catalog_transactions 943 -> 944 — ROLLBACK now RECLAIMS the
         # data files the transaction eagerly wrote (EW #52's DiscardDataFilesAsync) instead of leaving them
         # for VACUUM. +2, not +1: that suite is one of the DOUBLED ones below, so an assertion added to it
@@ -137,7 +137,40 @@ case "$TIER" in
         # ⚠ 5686 - 5656 = 30 of this gap PREDATES the change: the floor was not raised for the unified
         # parameter protocol's coverage (verify_global_functions + the signature/mixed-arg pins). Closed here
         # rather than left, since a floor 30 below the actual silently tolerates a regression that large.
-        : "${MIN_ASSERTIONS:=5752}"
+        # 65 runs / 6032 since 2026-08-05, taken from a green tier run (never computed): MERGE INTO landed, so
+        # verify_merge_into (130) joins the DOUBLED list below — it is composed of exactly the update/delete/
+        # insert paths those suites double, so a divergence must fail in one leg and name the engine. That is
+        # +2 RUNS and +260 assertions; the remaining +20 is verify_delta_catalog_update 63 -> 73 (also doubled),
+        # which gained the `SET col = DEFAULT` refusal. That last one is a CORRUPTION regression gate, not a
+        # feature note: the operator used to read SET values by ORDINAL, and a DEFAULT contributes no
+        # projection column, so it committed a shifted row (measured a=5,b=<rowid> for a correct a=99,b=5) or
+        # fatally invalidated the database when the shifted types differed.
+        # 6172 since 2026-08-05, from a green tier run: verify_merge_into 130 -> 200 (+70, doubled = +140).
+        # The additions are the two places autocommit and an explicit transaction genuinely DIVERGE, both
+        # measured: a merge carrying an UPDATE/DELETE action WORKS in autocommit on a table with deletion
+        # vectors DISABLED and is REFUSED inside a transaction (the buffered path requires them — so reaching
+        # for BEGIN to get atomicity can cost the statement, which is the opposite direction from the
+        # atomicity trade-off and is pinned in BOTH directions with a positive control); and the change feed
+        # of an autocommit merge is SPLIT across versions where the fused one reports a single version.
+        # Plus the commitInfo.operation labels, which are an INTEROP contract: a fused merge commits as
+        # TRANSACTION, never MERGE, so a consumer keying on the operation string will not match us.
+        # 6190 since 2026-08-05, from a green tier run: verify_merge_into 200 -> 209 (+9, doubled = +18) when a
+        # MULTI-ACTION merge became FORCED-BUFFERED. That was not a feature — it fixed SILENT DATA DESTRUCTION.
+        # A merge's actions all address rows located by ONE join scan, and while they committed separately a
+        # copy-on-write DELETE renumbered the rows a later action had already addressed: measured on a ONE-FILE
+        # non-DV table, two conditional deletes left the wrong survivors and DESTROYED a row. §11 is that
+        # regression gate (refusal + table intact + a single-action positive control), §11b the same shape on a
+        # DV table asserting the answer AND the fusion. ⚠ Both tiers were GREEN THROUGH the bug, because every
+        # earlier test put the affected rows in SEPARATE FILES where a rewrite renumbers nothing — so a floor
+        # rise here is worth little unless the new assertions are single-file with the delete FIRST.
+        # 6250 since 2026-08-05, from a green tier run: verify_merge_into 209 -> 239 after the forcing rule was
+        # NARROWED TWICE. It now fires only when a merge carries >= 2 UPDATE/DELETE actions AND the table's row
+        # identity is POSITIONAL (HasVirtualRowId()). Both narrowings removed a REFUSED CAPABILITY that bought no
+        # safety: counting INSERT too refused the commonest shape (UPDATE+INSERT) on a non-DV table, and forcing
+        # on SQL Server refused a 2-action merge into an identity EXTERNAL table. The added assertions pin BOTH
+        # sides of each boundary, which is the point — a guard wider than its hazard fails as a lost capability,
+        # which nothing complains about.
+        : "${MIN_ASSERTIONS:=6250}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
@@ -148,7 +181,7 @@ case "$TIER" in
         # (+161, the same count as its native leg). 42 suites, 43 runs — the floor is on RUNS.
         # 44 RUNS / 1413 since 2026-07-31: verify_session_tag (+25) — fabricator_session_tag, which needs a
         # real server (it pins a provider connection and reads the session's own monitoring ids).
-        : "${MIN_SUITES:=44}"
+        : "${MIN_SUITES:=45}"
         # 1424 since 2026-08-01: verify_exec_invalidate_cache 10 -> 21, for the OUT-OF-BAND DROP path — the
         # catalog's self-heal, documented in CLAUDE.md and until now covered by NOTHING. The service tier ran
         # 44/44 green while that path was broken, which is why the section exists. It must run with
@@ -176,7 +209,13 @@ case "$TIER" in
         # assertions, not 6 (I counted the statements I had added instead of running the suite before changing
         # it), so a floor of 1467 tripped the tripwire on a perfectly green 44/44 run and cost a re-run to
         # explain. Measure the BEFORE count while you still can, or take the floor from a green tier run.
-        : "${MIN_ASSERTIONS:=1477}"
+        # 45 runs / 1583 since 2026-08-05, from a green tier run: verify_merge_into_mssql (106) is the
+        # SQL Server half of MERGE INTO. It is the companion to the hermetic verify_merge_into and covers the
+        # two things Delta structurally cannot: a COMPOUND rowid (a composite PK arrives as ONE struct-typed
+        # column that ReferenceKeyColumns destructures — a Delta rowid is always a single virtual BIGINT), and
+        # a table with NO row identity at all, which is the shape the !HasRowId() guard exists for (without it
+        # an insert-only merge reads one past the chunk's width and fatally invalidates the database).
+        : "${MIN_ASSERTIONS:=1583}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2
@@ -262,7 +301,8 @@ case "$TIER" in
         DOUBLED='test/verify_delta_catalog_write.test
 test/verify_delta_catalog_transactions.test
 test/verify_delta_catalog_update.test
-test/verify_delta_catalog_delete.test'
+test/verify_delta_catalog_delete.test
+test/verify_merge_into.test'
         ;;
     service)
         DOUBLED='test/verify_delta_catalog_s3.test'

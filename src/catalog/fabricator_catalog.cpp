@@ -397,7 +397,7 @@ PhysicalOperator &FabricatorCatalog::PlanInsert(ClientContext &context, Physical
 	}
 	return insert;
 }
-static FabricatorModifyTarget BuildModifyTarget(LogicalOperator &, TableCatalogEntry &table) {
+FabricatorModifyTarget FabricatorBuildModifyTarget(TableCatalogEntry &table) {
 	auto &entry = table.Cast<FabricatorTableEntry>();
 	if (!entry.HasRowId()) {
 		throw BinderException(
@@ -437,7 +437,7 @@ PhysicalOperator &FabricatorCatalog::PlanDelete(ClientContext &context, Physical
 	if (op.return_chunk) {
 		throw NotImplementedException("fabricator: DELETE ... RETURNING is not supported yet");
 	}
-	auto target = BuildModifyTarget(op, op.table);
+	auto target = FabricatorBuildModifyTarget(op.table);
 	// The rowid's position in the child chunk comes from the bound row-identifier expression — NOT
 	// "the last column": a mark-join DELETE (WHERE x [NOT] IN (subquery)) feeds the raw FILTER output
 	// [cols..., rowid, mark] into the sink, so the last column is the BOOLEAN mark.
@@ -451,21 +451,52 @@ PhysicalOperator &FabricatorCatalog::PlanDelete(ClientContext &context, Physical
 	return del;
 }
 
+// Fills the SET half of an UPDATE target: which columns are assigned, and WHERE in the child chunk each
+// assigned value lives. Shared by a plain UPDATE and a MERGE's WHEN MATCHED THEN UPDATE, because the
+// position rule is identical for both — it is whatever the bound expression says, never the ordinal.
+void FabricatorFillUpdateSetColumns(TableCatalogEntry &table, const vector<PhysicalIndex> &columns,
+                                    const vector<unique_ptr<Expression>> &expressions,
+                                    FabricatorModifyTarget &target) {
+	D_ASSERT(columns.size() == expressions.size());
+	auto names = table.GetColumns().GetColumnNames();
+	vector<LogicalType> types;
+	for (auto &col : table.GetColumns().Logical()) {
+		types.push_back(col.Type());
+	}
+	for (idx_t i = 0; i < columns.size(); i++) {
+		auto &expr = *expressions[i];
+		const auto &col_name = names[columns[i].index];
+		if (expr.GetExpressionType() == ExpressionType::VALUE_DEFAULT) {
+			// Upstream's PhysicalUpdate evaluates the column's bound default here. We do not carry the
+			// defaults into the operator, and reading the ordinal instead is what USED to happen: a DEFAULT
+			// contributes no projection column, so every later SET value silently shifted one position
+			// (measured: an INTERNAL error + a fatally invalidated database when the shifted types differ,
+			// and WRONG DATA committed with exit 0 when they coincide). Refuse instead.
+			throw NotImplementedException(
+			    "fabricator: UPDATE ... SET %s = DEFAULT is not supported — write the default value "
+			    "explicitly",
+			    col_name);
+		}
+		if (expr.GetExpressionType() != ExpressionType::BOUND_REF) {
+			// The binder always emits a reference into its own projection (Binder::BindUpdateSet), and the
+			// column-binding resolver rewrites it to a BOUND_REF before physical planning. Anything else
+			// would mean reading an unrelated column as this one's new value.
+			throw NotImplementedException("fabricator: unsupported UPDATE assignment for column %s (%s)", col_name,
+			                              expr.ToString());
+		}
+		target.set_columns.push_back(col_name);
+		target.set_types.push_back(types[columns[i].index]);
+		target.set_child_indices.push_back(expr.Cast<BoundReferenceExpression>().index);
+	}
+}
+
 PhysicalOperator &FabricatorCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner,
                                               LogicalUpdate &op, PhysicalOperator &plan) {
 	if (op.return_chunk) {
 		throw NotImplementedException("fabricator: UPDATE ... RETURNING is not supported yet");
 	}
-	auto target = BuildModifyTarget(op, op.table);
-	auto names = op.table.GetColumns().GetColumnNames();
-	vector<LogicalType> types;
-	for (auto &col : op.table.GetColumns().Logical()) {
-		types.push_back(col.Type());
-	}
-	for (auto &physical_index : op.columns) {
-		target.set_columns.push_back(names[physical_index.index]);
-		target.set_types.push_back(types[physical_index.index]);
-	}
+	auto target = FabricatorBuildModifyTarget(op.table);
+	FabricatorFillUpdateSetColumns(op.table, op.columns, op.expressions, target);
 	vector<LogicalType> result_types {LogicalType::BIGINT};
 	auto &upd = planner.Make<FabricatorPhysicalUpdate>(std::move(result_types), op.estimated_cardinality,
 	                                                 std::move(target), handle_);
