@@ -569,8 +569,24 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   no translation to inspect. Reproduce with four statements: attach a Delta catalog, CTAS a target and a
   source, `MERGE INTO … WHEN MATCHED THEN UPDATE … WHEN NOT MATCHED THEN INSERT …`. The failing statement
   aborts cleanly (target unchanged, no stray version).
-  - **First job is to FIND THE HOOK** that check consults (binder / `Catalog` virtual) — the error text is the
-    handle. Until that is read, everything below is a sketch.
+  - **✅ THE HOOK IS FOUND, AND THE OUTLOOK IS GOOD: `Catalog::PlanMergeInto`**
+    (`duckdb/src/execution/physical_plan/plan_merge_into.cpp:120`) is a **virtual whose default body is that
+    throw**. A custom catalog only has to OVERRIDE it. ⚠ **It exists in 1.5.5 — this does NOT need duckdb
+    `main`** (the guess that it might was reasonable and is wrong).
+  - **⚠ AND DuckDB'S OWN MERGE PLAN IS ALREADY ROW-ID BASED — exactly the mode to hope for.** The
+    `DuckCatalog` implementation directly above the throw builds a `PhysicalMergeInto` from
+    **`op.row_id_start`** + `op.source_marker`, planning each action through `PlanMergeIntoAction`. And
+    `MergeActionType::MERGE_UPDATE` carries **`update_is_del_and_insert`**, so an update can be expressed as
+    delete+insert — which is what Delta copy-on-write wants anyway. So the translation we would want DuckDB to
+    do is the translation it already does; the work is slotting our existing rowid UPDATE/DELETE/INSERT
+    operators into that shape, not inventing a lowering.
+  - **⚠ NOT a template: `D:\repos\airport` has NO merge support** (checked — only `ON CONFLICT` refusals in
+    `airport_insert.cpp` / `airport_schema_entry.cpp`). Its rowid work is the UPDATE/DELETE path we already
+    share, so there is nothing to port. **DuckDB's own `DuckCatalog::PlanMergeInto` is the reference
+    implementation**, and it is in-tree — read that rather than hunting for a third-party example.
+  - Still unchecked: what `PlanMergeIntoAction` actually emits and whether our physical operators slot in
+    unchanged; the `FIXME` about disabling parallelism with multiple INSERTs; and **what DuckLake does**
+    (user-raised — it reportedly has merge LIMITATIONS, so its restrictions may be the interesting part).
   - **⚠ The two providers want DIFFERENT implementations, and conflating them would waste the work.**
     SQL Server has NATIVE T-SQL `MERGE`, so the prize there is generating ONE server-side statement — but a
     DuckDB MERGE's SOURCE is a DuckDB relation, so a pushdown needs the source to be server-side too;
