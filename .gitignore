@@ -63,3 +63,6 @@ dax_secret.sql
 docker/certs/*.crt
 docker/certs/*.key
 docker/certs/openssl.cnf
+
+# Fabricator debug logs (FABRICATOR_LOG_FILE)
+*.fablog
