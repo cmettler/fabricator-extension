@@ -107,20 +107,36 @@ with `union_by_name` alone, `file_row_number` alone, and `hive_partitioning => f
 controls, no failure. **The error therefore comes from something our generated SQL adds**, and writing it up
 as upstream would have been a false report.
 
-### The lead, for whoever picks this up
+### Narrowed further, and the first hypothesis was WRONG
 
-`hive_partitioning` is **auto-detected** from the paths, so on a partitioned table `read_parquet` produces a
-partition column of its own — while our projection *also* produces that column from the bound per-file
-metadata input. A name collision between the two is the obvious suspect, and the control above showing
-`hive_partitioning => false` succeeding is the reason to think so.
+The lead recorded here first was a name collision: `hive_partitioning` is auto-detected from the paths, so
+`read_parquet` emits a partition column of its own while our projection emits the same one from the bound
+metadata input. **Tested: `hive_partitioning => false` does NOT fix it.** (It was kept anyway — it is a real
+guard, since any `x=y` directory anywhere in a table's path would otherwise inject a phantom column — but it
+is not the cause.)
 
-If that is the cause, the fix is small: pass `hive_partitioning => false` in the batched form (we never want
-DuckDB's path-derived values — the Delta log's `partitionValues` is the authoritative source, because paths
-are opaque) and take partition columns from the metadata input alone. That would lift the gate on
-partitioned tables entirely.
+What IS ruled out, each checked against the stock 1.5.5 wheel over the exact failing files, with a real
+decode rather than a `count(*)`:
 
-**Until it is isolated, the gate stays and its comment must say "cause not established", not blame
-upstream.** A wrong attribution in a code comment is worse than none: it stops the next person looking.
+| candidate | verdict |
+|---|---|
+| `read_parquet` itself — `union_by_name` × `hive_partitioning=false` × `filename` × `file_row_number`, every combination | all fine |
+| hive auto-detection colliding with our projected column | **refuted** — `hive_partitioning => false` still fails |
+| the SQL SHAPE — the byte-identical statement with `__fab_f` as an inline `VALUES` CTE | **fine, returns the right 20 rows** |
+
+⇒ the failure is in the **bound metadata Arrow input** (`MetaStream`), not in DuckDB. The one thing that
+distinguishes a partitioned scan there is the extra `p<i>` VARCHAR column beside `fn`/`ord` — a 3-column
+input where the working non-partitioned one has 2, and where the deletion-vector input (2 columns, also with
+a string column) is fine.
+
+**Next step: dump what `MetaStream` actually exports before theorising again.** Two hypotheses have now died
+here, both of which looked obvious.
+
+⚠ Also observed once: the unittest process **SEGFAULTED** rather than raising, so this is not a containable
+failure. Treat the gate as load-bearing.
+
+**The gate stays and its comment says "cause narrowed, not found" — it must not blame upstream.** A wrong
+attribution in a code comment is worse than none: it stops the next person looking.
 
 ---
 

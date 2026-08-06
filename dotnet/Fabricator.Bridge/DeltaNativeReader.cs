@@ -493,20 +493,22 @@ internal static class DeltaNativeReader
             }
             if (listing.PartitionColumns.Count > 0)
             {
-                // ⚠ CAUSE NOT ESTABLISHED — do NOT blame upstream here. Reading a partitioned table through this
-                // form raised `INTERNAL Error: Information loss on integer cast: value 4294967296 outside of
-                // target range [0, 4294967295]` (2^32, i.e. something cast to uint32). This comment previously
-                // attributed it to a DuckDB assertion in `union_by_name` + a virtual column over a hive layout;
-                // that was checked against stock 1.5.5 and is FALSE — the minimal form works, as do
-                // union_by_name alone, file_row_number alone, and hive_partitioning => false. So the error comes
-                // from something OUR SQL adds.
-                // The lead (docs/duckdb-upstream-issues.md §2): hive_partitioning is AUTO-DETECTED from the
-                // paths, so read_parquet emits a partition column of its own while our projection emits the same
-                // column from the bound metadata input — a name collision. If that is it, the fix is to pass
-                // `hive_partitioning => false` (the Delta log's partitionValues is the authoritative source; paths
-                // are opaque and never parsed) and lift this gate entirely.
-                // Gated on the table HAVING partition columns rather than on one being REQUESTED, because hive
-                // detection fires from the paths alone.
+                // ⚠ GATED, CAUSE NARROWED BUT NOT FOUND — do not lift this without reproducing first.
+                // A partitioned scan through this form raises `INTERNAL Error: Information loss on integer cast:
+                // value 4294967296 outside of target range [0, 4294967295]` (2^32 → uint32), and in one run the
+                // unittest process SEGFAULTED rather than erroring, so it is not a containable failure.
+                // RULED OUT by bisecting the generated SQL against the STOCK duckdb 1.5.5 wheel
+                // (docs/duckdb-upstream-issues.md §2), each with a real decode:
+                //   • read_parquet itself — union_by_name / hive_partitioning=false / filename / file_row_number
+                //     in every combination over these exact files: all fine;
+                //   • hive auto-detection colliding with our projected partition column — the first hypothesis;
+                //     `hive_partitioning => false` does NOT fix it, so that was wrong;
+                //   • the SQL SHAPE — the byte-identical statement with __fab_f as an inline VALUES CTE
+                //     instead of the bound input returns the right 20 rows.
+                // ⇒ it is the BOUND METADATA INPUT (MetaStream). The only thing that distinguishes a partitioned
+                // scan there is the extra "p<i>" VARCHAR column beside fn/ord — a 3-column input where the
+                // working non-partitioned one has 2, and where the DV input (also 2, also with a string column)
+                // is fine. Dump what MetaStream actually exports before theorising further.
                 return null;
             }
             bool nameMapped = listing.LogicalToPhysical is not null || listing.MappedSchema is not null;
@@ -633,7 +635,13 @@ internal static class DeltaNativeReader
             }
             sb.Append(" FROM (SELECT ").Append(string.Join(", ", inner))
               .Append(" FROM read_parquet([").Append(string.Join(", ", files.Select(f => Literal(f.Uri))))
-              .Append("], union_by_name => true, filename => true, file_row_number => true) __fab_rp");
+              // hive_partitioning is OFF deliberately, and it is a correctness guard rather than the fix it was
+              // first tried as (it does NOT cure the partitioned-table failure gated above). DuckDB AUTO-DETECTS
+              // hive layout from the paths, so any directory of the form `x=y` anywhere in a table's path would
+              // inject a phantom column into the scan. The Delta log's partitionValues is the authoritative
+              // source — paths are opaque here and are never parsed.
+              .Append("], union_by_name => true, hive_partitioning => false, filename => true, "
+                     + "file_row_number => true) __fab_rp");
             if (needsMeta)
             {
                 // INNER join on the exact URI string we listed — `filename` was verified to echo it verbatim.

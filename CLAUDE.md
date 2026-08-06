@@ -2017,10 +2017,15 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
       hive layout; **checked against the stock 1.5.5 wheel and that is FALSE** — the minimal form works, as do
       `union_by_name` alone, `file_row_number` alone, and `hive_partitioning => false` (four controls, no
       failure). So it comes from something OUR SQL adds, and filing it upstream would have been a false report.
-      **The lead:** hive partitioning is AUTO-DETECTED, so `read_parquet` emits a partition column of its own
-      while our projection emits the same one from the bound metadata input — a name collision. If so the fix is
-      `hive_partitioning => false` (the log's `partitionValues` is authoritative; paths are opaque) and the gate
-      lifts entirely. Full record: [docs/duckdb-upstream-issues.md](docs/duckdb-upstream-issues.md) §2.
+      **And the follow-up hypothesis died too:** the suspected hive-column name collision is REFUTED —
+      `hive_partitioning => false` does not fix it (kept anyway as a real guard: any `x=y` directory in a table's
+      path would otherwise inject a phantom column). What IS ruled out, each with a real decode on the stock
+      wheel: `read_parquet` in every option combination, hive detection, and **the SQL shape — the
+      byte-identical statement with the metadata as an inline `VALUES` CTE returns the right rows.** ⇒ it is our
+      **bound metadata Arrow input** (`MetaStream`), whose only partitioned-scan difference is a third `p<i>`
+      VARCHAR column beside `fn`/`ord`. **Next step: dump what MetaStream exports — two obvious-looking
+      hypotheses have now died.** ⚠ One run SEGFAULTED rather than erroring, so the gate is load-bearing. Full
+      record: [docs/duckdb-upstream-issues.md](docs/duckdb-upstream-issues.md) §2.
     - It gives up the DV's PRUNABLE BOUND (one WHERE cannot carry a per-file range). Deliberate, and the evidence
       is already in `DvRangeCondition`: its own A/B found that bound "demonstrably works and does not show up in
       wall time". ⚠ Re-measure on REMOTE storage with a mostly-deleted file before calling it free there.
