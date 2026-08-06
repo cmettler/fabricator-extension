@@ -586,6 +586,36 @@ current code still uses the single-provider `fabricator` naming):
 ## Next up (open threads for future sessions)
 
 In-flight / planned refactors (all C#-only unless noted; tests stay green per slice):
+- **THE WRITE-OPTIONS REVISIT — AGREED, NOT STARTED (user, 2026-08-06). Where each parquet knob BELONGS, not
+  just whether it is plumbed.** Triggered by the measured gap below, but the user's ask is deliberately wider:
+  it is a surface question, so decide the surface before finishing the plumbing.
+  - **(1) EVERY parquet option must be expressible in `CREATE TABLE … WITH (…)`, INCLUDING bloom-filter
+    columns for the EW codec.** Today `WITH (parquet_compression=…, parquet_row_group_size=…,
+    parquet_bloom_filter_columns=…)` is the DuckLake-parity set gated by `verify_with_options`; confirm each
+    reaches BOTH engines (⚠ the codec and native paths take different routes — see the void measurement below)
+    and add whatever is missing.
+  - **(2) Bloom-filter columns are NOT wanted as an ATTACH default (user, explicit).** They are a per-TABLE
+    property — which columns you probe — so a catalog-wide default is the wrong shape and should not be added
+    even though the spec can carry one.
+  - **(3) Re-examine the `SET` parameters and MOVE what belongs per-table into `WITH`.** `delta_write_options`
+    is one JSON blob mixing genuinely session-scoped things (compression as a storage-cost policy) with
+    per-table ones (partitioning, `replace_where`, `schema_mode`). Decide each knob's home rather than
+    accepting the current split, and keep an escape for the per-statement case.
+  - **(4) The plumbing gap that started this, MEASURED (2026-08-06):** `ResolveWriteSpec` lives on the
+    `DeltaCatalog` INSTANCE while ~30 EW opens sit in the STATIC `DeltaReader` and pass no spec, so
+    merge-on-read post-images, copy-on-write DELETE/UPDATE rewrites and **OPTIMIZE's compaction output** are
+    written at snappy / 122880 / no-bloom whatever the user configured. **OPTIMIZE is the one that stings** —
+    it rewrites the MAJORITY of a table's bytes, so it actively undoes the setting it was configured for.
+    ⚠ Reading the session setting from inside `DeltaReader` is NOT the fix: it would miss the per-catalog
+    ATTACH defaults, which is exactly the half a dbt user sets once. Thread the catalog's open-options
+    through instead — **the SAME structural change the `native_read` item in the streaming audit needs, so do
+    them together.**
+  - **⚠ A MEASUREMENT HERE WAS VOID AND IS NOT AN ANSWER:** `SET delta_write_options='{"compression":"zstd"}'`
+    on `PROVIDER 'delta'` produced SNAPPY data files, but under `native_write` DuckDB's COPY writes them and
+    EW's `ParquetWriteOptions` never apply — while `verify_with_options` proves the per-table
+    `WITH (parquet_compression=…)` DOES work on that path. So the session setting may simply not reach the
+    native COPY (a fourth gap) or the two option routes may legitimately differ. **UNVERIFIED — settle it
+    before designing the surface**, because it decides whether `SET` and `WITH` are even equivalent today.
 - **THE STREAMING/BUFFERING AUDIT — AGREED, NOT STARTED (user, 2026-08-06). A whole-codebase pass over EVERY
   path that holds batches, `Materialize` first.** The UPDATE work (grouped flush → unboxed input) kept turning
   up buffering that nobody had decided on, so the remaining ones get looked at deliberately rather than one at
@@ -620,6 +650,21 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   - Ladder to price each site against: **retain = 0 copies** (if the audit clears it),
     **`ArrowCompute.Take` = 1 copy** (new buffers, type-agnostic incl. nested/extension — what
     `ParseUpdateStream` now uses), **IPC round-trip = 2 copies + serialization**.
+  - **⚠ THE BUFFERED READ-BACK SILENTLY IGNORES THE CATALOG'S `native_read` — MEASURED, and it is a defect in
+    its own right, not just a batching curiosity (user: "this should be cleaned up as well").**
+    `ReadRowsByRowIdsAsync` opens with a bare `DeltaWriter.Options()` (`DeltaReader.cs:974`), passing **no
+    `dataFileReader`**, so a buffered UPDATE's read-back takes the EW CODEC reader even on a
+    `PROVIDER 'delta'` catalog where the user's `native_read` is on. Two consequences: it is the wrong engine
+    for what the attach asked for, and **the codec reader yields ONE BATCH PER ROW GROUP** where DuckDB's
+    `read_parquet` yields 2048-row vectors — measured 30 flushes vs 1 on a 60k-row UPDATE, and a 300k-row
+    control giving exactly 3 batches at the 122880 default. That is what makes the UPDATE grouped flush inert
+    on that path, and it means the buffered read-back materialises a whole row group at a time on the path a
+    dbt `BEGIN…COMMIT` model takes.
+    - Fix = pass the catalog's reader (and writer, and write spec) into that open — **the SAME structural
+      change the write-options revisit needs for the spec, so do them together.** Then re-measure the grouped
+      flush on the buffered path; it should start behaving like autocommit.
+    - ⚠ Sweep the other bare `DeltaWriter.Options()` opens in `DeltaReader` for the same question — the
+      grep is ~30 sites and this one was found by accident, not by looking.
   - Other paths the audit must cover, not only `Materialize`: `pending.Batches` (the buffered park),
     `BulkSession`'s bounded channel (already streaming — confirm, do not assume), the CDF capture,
     `DeltaWriter.Write`'s batch list, `ArrowDataReader`, and the collector/in-out sessions. The
@@ -1862,10 +1907,18 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     buffered 1** — the buffered read-back hands over all 60,000 rows as ONE batch (confirmed independently by
     the post-image file count, 30 files vs 1, since `WriteDataFilesAsync` writes one file per input batch).
     So on the buffered path the group IS the statement and the grouping changes nothing. The autocommit
-    numbers below are real; do not generalise them. **The MECHANISM is unexplained** — both paths reach the
-    same `DeltaTable.ReadRowsAsync` through the same `ReadSelectedRowsAsync`, `BlockingEnumerable` is a lazy
-    pass-through (checked, it does not collect), and the differences that remain are `atVersion` /
-    `skipUnresolvable` / `ReconcileBatch`. Handed to the streaming audit rather than guessed at.
+    numbers below are real; do not generalise them.
+    - **⚠ MECHANISM — MEASURED, and it is NOT autocommit-vs-buffered at all: it is WHICH READER is in play.**
+      Same autocommit UPDATE, same shape, threshold 1: `native_read true` ⇒ **30** flushes,
+      `native_read false` ⇒ **1**. DuckDB's `read_parquet` yields standard 2048-row vectors; engineered-wood's
+      codec reader yields **one batch per ROW GROUP** — pinned by a 300k-row control giving exactly **3**
+      batches at the 122880 default. And the buffered read-back opens with a bare `DeltaWriter.Options()`,
+      passing **no `dataFileReader`** (`DeltaReader.cs:974`), so it takes the codec reader ALWAYS — see the
+      `native_read` entry in the streaming audit, which is the real defect here.
+    - The candidates an earlier pass listed are all RETIRED: `BlockingEnumerable` was correctly cleared (it is
+      a lazy pass-through), and `atVersion` / `skipUnresolvable` / `ReconcileBatch` were all wrong. **The
+      answer was in the OPTIONS passed at open, not in the enumeration** — which is the reusable lesson: when
+      two callers of one method behave differently, diff what they CONSTRUCT it with before diffing the call.
   - **⚠ MEASURED, and the headline is not the one this was built for.** On the shape that favours it most
     (600k rows × 16 VARCHAR, UPDATE every row, SET one column): **managed heap peak 327 → 171 MB** and now
     bounded by the GROUP rather than by the statement — but **process peak working set only 614 → 548 MB**.
