@@ -2075,6 +2075,17 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
       explicit `DROP VIEW IF EXISTS` once the query has been drained. The drop is what makes uniqueness
       affordable — without it the catalog would accumulate one view per scan instead of one stale one. Verified:
       the failing configuration returns correct results, and the leaked-view count is **0**.
+    - **⚠ AND THE WRITE PATH HAD THE SAME BUG, WORSE — `NativeParquetDataFileWriter` (fixed in the same pass).**
+      Its `__fabricator_delta_write_src` is the identical fixed-name binding, and it is hit by CONCURRENT WRITERS
+      rather than a tuning knob. **MEASURED: six concurrent Delta writers in ONE process — exactly the
+      `dbt run --threads N` shape, on `PROVIDER 'delta'` where `native_write` is the DEFAULT — and FIVE OF THE
+      SIX FAILED** (*"failed to register input view '__fabricator_delta_write_src'"*), leaving their tables
+      absent. After the fix: 0 errors, all six at their full row count, 0 leaked views. ⚠ Note CLAUDE.md records
+      a dbt `--threads 4` lakehouse run as PASS=4/4 — that predates the native-write default flip, so do not
+      read it as coverage of this.
+    - The shared plumbing is now `BoundInput.NextName` / `BoundInput.Drop`
+      (`dotnet/Fabricator.Bridge/SingleScanArrowStream.cs`), so any future bound input gets both halves by
+      construction rather than by remembering.
     - **⚠ TWO OF MY THREE TESTS HERE PROVED NOTHING, and the user named the second.** A join of two DV tables
       returned right answers — but a hash join materialises one side before probing, so the scans never overlap.
       A `UNION ALL` with `threads=8` also passed — and the user pointed out a union CAN produce concurrent
