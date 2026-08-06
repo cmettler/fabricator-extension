@@ -477,11 +477,17 @@ internal static class DeltaNativeReader
         /// not show up in wall time" (2.17 s vs 2.21 s on 10M rows with 9M deleted), because marshalling and
         /// hashing the vector dominates either way. Expect that to change where I/O dominates instead — remote
         /// storage with a mostly-deleted file is the shape to re-measure before assuming this is free there.</para>
-        /// <para>⚠ The row-tracking virtual columns are the one shape that CANNOT come here, and the reason is
-        /// structural rather than a gate: a materialized <c>__delta_row_id</c> is not column-mapped, so it has no
-        /// field id to key by, and a DuckDB <c>map</c> cannot mix INTEGER and VARCHAR keys. The derived form
-        /// (<c>baseRowId + file_row_number</c>) would be expressible but the per-file materialized OVERRIDE would
-        /// not, and honouring it is not optional — so those stay on the per-file loop.</para>
+        /// <para>⚠ <b>THE ROW-TRACKING GATE'S REASON IS STALE — RE-DERIVE IT BEFORE TRUSTING IT.</b> It was
+        /// written as structural: <i>"a materialized <c>__delta_row_id</c> is not column-mapped, so it has no
+        /// field id to key by, and a DuckDB <c>map</c> cannot mix INTEGER and VARCHAR keys"</i>. Every clause of
+        /// that is about the field-id <c>schema</c> map — which this form NO LONGER USES: it switched to
+        /// <c>union_by_name</c>, which resolves columns by NAME and needs no field ids. Under that, a
+        /// materialized <c>__delta_row_id</c> is just another column read by name, and <c>baseRowId</c> already
+        /// arrives on the bound metadata input this form binds for the rowid — so
+        /// <c>COALESCE(materialized, baseRowId + file_row_number)</c> looks EXPRESSIBLE here. The gate was not
+        /// revisited when the mechanism under it changed, which is the "a stale justification stops the next
+        /// person looking" failure this codebase keeps recording. It stays only because lifting it is untested,
+        /// NOT because it is known to be impossible.</para>
         /// </summary>
         private static BatchPlan? TryFullForm(
             DeltaReader.NativeScanList listing, IReadOnlyList<string> dataCols, bool wantRowId, string? where,
