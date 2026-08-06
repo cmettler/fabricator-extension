@@ -2022,6 +2022,11 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
       virtual-column combination was pronounced fine on a multi-file `count(*)` — which DuckDB answers without
       building the full mapping. Forcing a real decode reproduced the assertion immediately. **A parquet
       aggregate the footer can answer is not a read; never use one as a control here.**
+    - **Gates for the full form: hermetic 67/67 — 6513 AND service 45/45 — 1583, both IDENTICAL to the narrow
+      version's counts** ⇒ every answer unchanged while the rowid and DV shapes moved onto the batched path. The
+      service leg is the load-bearing one here: `verify_delta_catalog_s3` (177 × 2 engine legs) is the only place
+      the batched `read_parquet([…])` — now with two bound Arrow inputs and MATERIALIZED CTEs — runs against
+      **`s3://`** URIs rather than local paths.
     - New: `SingleScanArrowStream` wraps each bound input so a SECOND scan THROWS. Without it, a re-scan of the
       single-use DV view returns zero rows and silently resurrects deleted rows; `MATERIALIZED` is what makes the
       single scan true today, and this makes a future planner change fail instead of corrupting an answer.
