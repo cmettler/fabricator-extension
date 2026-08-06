@@ -31,6 +31,35 @@ namespace Fabricator.Bridge;
 /// FILE pruning (skip a file whose stats can't match) + early-stop. It keeps <c>filter_pushdown = false</c>
 /// (superset-safe; DuckDB re-applies every predicate above the scan), so a partial WHERE only forfeits pruning.
 /// Dynamic (join) filter pushdown at this decision point is a later slice (a live-filter host callback).</para>
+///
+/// <para>⚠ THE LOOP IS EXPENSIVE, AND THE ALTERNATIVE IS NOW KNOWN TO BE EXPRESSIBLE — measured 2026-08-06.
+/// One <c>Host.Query</c> PER FILE costs ~8 ms of overhead each: on a 50-file / 1M-row table the marginal scan
+/// time is 412 ms (289 ms at prefetch 16) where DuckDB reading the same files in ONE plan does the work in
+/// 31 ms — <b>13x</b>. It scales with FILE COUNT, and dbt makes file count grow (every incremental run appends
+/// one), so an un-compacted table pays ~1.6 s of pure overhead per scan at 200 files however few rows it
+/// returns. Attributed: ~1.60 ms is a SECOND host query per file (<see cref="ProbeFileNodes"/> via
+/// <see cref="ResolveFileMapping"/>) and ~2.45 ms the data query; the rest is Arrow import, unisolated.</para>
+///
+/// <para>What makes the single call viable is <c>read_parquet</c>'s <c>schema</c> parameter, whose semantics
+/// were pinned by experiment (the DuckDB docs are thin and two plausible guesses were wrong):
+/// <c>schema = map { &lt;identifier&gt;: {'name': …, 'type': …, 'default_value': …} }</c>, where the identifier is
+/// the MAP KEY, not a struct field. An INTEGER key switches the reader to <c>BY_FIELD_ID</c>
+/// (<c>parquet_multi_file_info.cpp</c>), a VARCHAR key matches by name. Verified in one call over a file list:
+/// a column ABSENT from an older file arrives as its <c>default_value</c> (schema evolution), a column stored
+/// under DIFFERENT physical names in different files is matched by field id (id-mode column mapping — the
+/// probe's whole reason to exist), <c>type</c> casts per file (which is how DuckLake does column-type
+/// evolution), and <c>filename</c> + <c>file_row_number</c> still compose — so the deletion vector becomes ONE
+/// bound input anti-joined on <c>(filename, pos)</c>.</para>
+///
+/// <para>So the probe is removable rather than merely batchable, and the loop collapses for the common case.
+/// What a single call still CANNOT express, and therefore keeps a per-branch <c>UNION ALL</c> or this loop:
+/// partition literals (<c>schema</c> is REFUSED together with <c>hive_partitioning</c>) and per-file
+/// <c>baseRowId</c> row-tracking expressions. ⚠ And a <c>UNION ALL</c> route carries a SILENT hazard: DuckDB
+/// unions STRUCT interiors BY NAME, filling absent fields with NULL, so two files whose struct children carry
+/// different physical names yield one merged struct with both and half the values NULL — no error. The
+/// per-batch <see cref="ArrowColumnMappingRename"/> runs too late to repair that, so any union path must
+/// normalise struct child names IN SQL per branch, and needs a gate covering an id-mode table with a renamed
+/// NESTED field read across old and new files (nothing covers that today).</para>
 /// </summary>
 internal static class DeltaNativeReader
 {
