@@ -304,3 +304,60 @@ DETACH lake;
 
 statement ok
 DETACH lake2;
+
+# ---- WRITE TUNING MUST REACH THE FILES A *TRANSACTION* WRITES, NOT ONLY THE BULK PATH ----
+# ⚠ It did not. Every open of an engineered-wood table in the Bridge passed NO write spec except the one
+# in the eager-write helper, so the (DuckDB txn, table) pair's HELD table — which writes the CDF change
+# files and any batches the flush parks — fell back to snappy / 122880 rows / no bloom filters while the
+# same table's CTAS files honoured the setting. MEASURED before the fix: data ZSTD, change files SNAPPY,
+# in one table. A user setting zstd for storage cost silently got snappy on everything a transaction wrote.
+# The CODEC engine is required, not incidental: under native_write DuckDB's COPY writes the data files, so
+# engineered-wood's ParquetWriteOptions never apply and this assertion would pass for the wrong reason.
+statement ok
+SET delta_write_options = '{"compression":"zstd"}';
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/optspec' AS lake9
+  (TYPE fabricator, PROVIDER 'engineeredwooddelta', change_data_feed true);
+
+statement ok
+CREATE TABLE lake9.main.t AS SELECT i AS id, i * 2 AS a FROM range(1, 2001) AS r(i);
+
+# POSITIVE CONTROL: the bulk path always honoured the setting. If this ever reads SNAPPY the test below
+# proves nothing, because both halves would simply be following the same (wrong) default.
+query I
+SELECT DISTINCT compression FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optspec/t/*.parquet')
+WHERE compression <> '';
+----
+ZSTD
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE lake9.main.t SET a = a + 1 WHERE id <= 100;
+
+statement ok
+COMMIT;
+
+# THE ASSERTION: the change files the HELD table wrote carry the configured codec too.
+query I
+SELECT DISTINCT compression
+FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optspec/t/_change_data/*.parquet')
+WHERE compression <> '';
+----
+ZSTD
+
+# The feed itself is still correct — a write-options change must not alter what the UPDATE recorded.
+query II
+SELECT _change_type, count(*) FROM fabricator_delta_changes('lake9', 'main.t', 2)
+WHERE _change_type LIKE 'update_%' GROUP BY 1 ORDER BY 1;
+----
+update_postimage	100
+update_preimage	100
+
+statement ok
+RESET delta_write_options;
+
+statement ok
+DETACH lake9;

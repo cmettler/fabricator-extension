@@ -3438,14 +3438,14 @@ public sealed class DeltaCatalog : IBackendCatalog
         // Cancel a slow buffered-statement eager data-file write on interrupt (opener fresh from the DML operator).
         using var interrupt = new InterruptScope(opener);
         var token = interrupt.Token;
-        var fs = TableFileSystems.Create(opener, tablePath);
-        var writer = _nativeWrite && NativeParquetDataFileWriter.Available
-            ? new NativeParquetDataFileWriter(tablePath)
-            : null;
-        var table = await EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(
-                fs, DeltaWriter.Options(ResolveWriteSpec(null, null), writer), token)
-            .ConfigureAwait(false);
-        try
+        // The (DuckDB txn, table) pair's HELD table, not a fresh open. This used to open — and dispose — its
+        // own, i.e. one extra `_delta_log` LIST per eager write, which the grouped UPDATE turned into one per
+        // GROUP (cheap locally, not on OneLake/S3, and the reason UpdateGroupBytes defaults to 64 MiB rather
+        // than 16). Reusing the held table is only correct because EnsureHeldTableAsync now opens with the
+        // SAME write spec this call site used to pass; before that fix the two differed in compression /
+        // row-group size / bloom filters, so the swap would have silently dropped the user's write tuning
+        // from the eager path instead of adding it to the held one.
+        var table = await EnsureHeldTableAsync(opener, tablePath, pending, token).ConfigureAwait(false);
         {
             IReadOnlyList<RecordBatch> toWrite = batches;
             bool identity = false;
@@ -3481,10 +3481,9 @@ public sealed class DeltaCatalog : IBackendCatalog
                 .ConfigureAwait(false));
             return true;
         }
-        finally
-        {
-            await table.DisposeAsync().ConfigureAwait(false);
-        }
+        // No dispose: the held table belongs to the buffer entry and is released with it (commit, rollback,
+        // or any other exit from the pair's life) — disposing it here would pull the table out from under the
+        // held transaction and every later statement of this DuckDB transaction.
     }
 
     // COMMIT flush for a transaction-CREATED table: nothing touched the _delta_log before now. Uses
@@ -3775,8 +3774,14 @@ public sealed class DeltaCatalog : IBackendCatalog
         var dataFileWriter = _nativeWrite && NativeParquetDataFileWriter.Available
             ? new NativeParquetDataFileWriter(tablePath)
             : null;
+        // ⚠ THE WRITE SPEC IS LOAD-BEARING HERE AND USED TO BE OMITTED, which made every file this table
+        // writes — the CDF change files, and the parked batches the flush writes — silently ignore the user's
+        // `delta_write_options` (compression / row_group_size / bloom_filter_columns) and fall back to
+        // snappy / 122880 / none. MEASURED on the codec engine with compression 'zstd': the CTAS data files
+        // came out ZSTD and the change files SNAPPY, in the same table.
         pending.HeldTable = await EngineeredWood.DeltaLake.Table.DeltaTable
-            .OpenAsync(fs, DeltaWriter.Options(null, dataFileWriter), token).ConfigureAwait(false);
+            .OpenAsync(fs, DeltaWriter.Options(ResolveWriteSpec(null, null), dataFileWriter), token)
+            .ConfigureAwait(false);
         return pending.HeldTable;
     }
 

@@ -1856,6 +1856,16 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     become N data files whether they arrive in one call or a hundred. The file count of an UPDATE's post-images
     is therefore its BATCH count and no size target touches it. Measured: a 5000-row UPDATE adds 3 files, 50k
     adds 25, 200k adds 98 — i.e. ~2048 rows per batch.
+  - **⚠ IT IS INERT ON THE BUFFERED PATH, and this entry claimed otherwise until it was measured
+    (2026-08-06).** A group boundary can only fall BETWEEN read-back batches, and the two paths batch
+    differently. Same table, same 60k-row UPDATE, threshold forced to 1 byte: **autocommit 30 group flushes,
+    buffered 1** — the buffered read-back hands over all 60,000 rows as ONE batch (confirmed independently by
+    the post-image file count, 30 files vs 1, since `WriteDataFilesAsync` writes one file per input batch).
+    So on the buffered path the group IS the statement and the grouping changes nothing. The autocommit
+    numbers below are real; do not generalise them. **The MECHANISM is unexplained** — both paths reach the
+    same `DeltaTable.ReadRowsAsync` through the same `ReadSelectedRowsAsync`, `BlockingEnumerable` is a lazy
+    pass-through (checked, it does not collect), and the differences that remain are `atVersion` /
+    `skipUnresolvable` / `ReconcileBatch`. Handed to the streaming audit rather than guessed at.
   - **⚠ MEASURED, and the headline is not the one this was built for.** On the shape that favours it most
     (600k rows × 16 VARCHAR, UPDATE every row, SET one column): **managed heap peak 327 → 171 MB** and now
     bounded by the GROUP rather than by the statement — but **process peak working set only 614 → 548 MB**.
@@ -1925,11 +1935,37 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     loudly rather than silently splitting identity.
   - Also trimmed: `ridsPerBatch` / `srcTracking` are now drained per batch (their producer only appends, never
     reads them back), so they no longer accumulate across the statement either.
-  - **64 MiB rather than 16 MiB** (which measured marginally better, 152 MB heap) because the BUFFERED path's
-    per-group write **opens the table**, i.e. one `_delta_log` LIST per group — cheap locally, not on
-    OneLake/S3. Removable: the pair already holds an open table (`EnsureHeldTableAsync`) that
-    `TryEagerWriteBatches` predates and could use. The CDF writes already use the held pair, so they cost
-    nothing extra per group.
+  - **64 MiB rather than 16 MiB** (which measured marginally better, 152 MB heap) because the buffered path's
+    per-group write used to **open the table** — one `_delta_log` LIST per group, cheap locally and not on
+    OneLake/S3. **FIXED 2026-08-06: `TryEagerWriteBatches` now reuses the pair's HELD table**
+    (`EnsureHeldTableAsync`) instead of opening and disposing its own, so an eager write costs no log read at
+    all. It no longer disposes the table either — that belongs to the buffer entry and pulling it out from
+    under the held transaction would break every later statement of the DuckDB transaction.
+    - **⚠ THE SWAP WAS NOT THE PURE PERF CHANGE IT LOOKED LIKE, AND DOING IT FIRST WOULD HAVE BROKEN A
+      USER-FACING FEATURE.** `TryEagerWriteBatches` was the ONLY open in the whole Bridge passing a WRITE SPEC
+      (`ResolveWriteSpec`); the held table passed none. Reusing it would have made the eager path lose the
+      user's `delta_write_options` rather than making the held one honour them. So the spec was added to
+      `EnsureHeldTableAsync` FIRST — which fixed a real defect in its own right (below) and only then made
+      the swap equivalent.
+  - **⚠ THE DEFECT THAT FOUND: WRITE TUNING REACHED THE BULK PATH AND ALMOST NOTHING ELSE (fixed for the
+    buffered surface 2026-08-06, still open elsewhere).** `delta_write_options`
+    (`compression` / `row_group_size` / `bloom_filter_columns`) is resolved by `ResolveWriteSpec`, which
+    returns **null** when nothing is configured — so the divergence is invisible until a user sets something,
+    which is why nothing caught it. MEASURED per file on the codec engine with `compression 'zstd'`: the CTAS
+    files came out **ZSTD** and, in the SAME table, the CDF change files **SNAPPY** and the merge-on-read
+    UPDATE's post-image file **SNAPPY**. A table therefore accumulates MIXED compression, and on an
+    incrementally-updated dbt model most bytes would silently be snappy.
+    - **⚠ The codec engine is required to see any of this**: under `native_write` (the `PROVIDER 'delta'`
+      default) DuckDB's COPY writes the data files and EW's `ParquetWriteOptions` never apply — a first
+      attempt at this measurement on `PROVIDER 'delta'` returned SNAPPY for everything and was VOID, not an
+      answer. The gate pins the codec engine for the same reason and carries a positive control.
+    - Fixed here: `EnsureHeldTableAsync` now passes the spec, so the CDF change files and any batches the
+      flush parks honour it. **STILL OPEN and measured, for the audit:** every other EW open in
+      `DeltaReader` passes no spec — the merge-on-read UPDATE post-images, the copy-on-write DELETE/UPDATE
+      rewrites, and OPTIMIZE's compaction output. Those need the spec plumbed from the catalog into a static
+      reader, which is more than a one-line change.
+    - Gate `verify_with_options` 68 → **82**, mutation-tested (reverting the spec on `EnsureHeldTableAsync`
+      fails at exactly the CDF assertion with `SNAPPY`).
   - **⚠ GATE: `verify_delta_update_grouped.test` (72), and it needs the runner to FORCE the threshold.** No
     hermetic suite comes within two orders of magnitude of 64 MiB, so without this the grouped path ships with
     ZERO coverage; `run-suites.sh` gives this ONE suite `FABRICATOR_DELTA_UPDATE_GROUP_BYTES=1` and `unset`s it
