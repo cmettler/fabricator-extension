@@ -505,10 +505,15 @@ internal static class DeltaNativeReader
                 //     `hive_partitioning => false` does NOT fix it, so that was wrong;
                 //   • the SQL SHAPE — the byte-identical statement with __fab_f as an inline VALUES CTE
                 //     instead of the bound input returns the right 20 rows.
-                // ⇒ it is the BOUND METADATA INPUT (MetaStream). The only thing that distinguishes a partitioned
-                // scan there is the extra "p<i>" VARCHAR column beside fn/ord — a 3-column input where the
-                // working non-partitioned one has 2, and where the DV input (also 2, also with a string column)
-                // is fine. Dump what MetaStream actually exports before theorising further.
+                // ⇒ FOUND, and it is NOT ABOUT PARTITIONS AT ALL: a bound Arrow input carrying a SECOND
+                // VARCHAR COLUMN breaks. Isolated by instrumenting the export (the batch is well-formed — 3
+                // columns, right length, no nulls, right types) and then holding the column COUNT fixed while
+                // changing only the third column's TYPE: with "p0" as Int64 the identical query RUNS. So
+                // (VARCHAR, BIGINT) is fine — which is why the deletion-vector input works — and
+                // (VARCHAR, BIGINT, VARCHAR) is not. Partitioning is merely the only shape that needs a second
+                // string today. See docs/duckdb-upstream-issues.md §2 — it is a defect in the host input-binding
+                // path, general to any managed component using Host.Query(sql, inputs), and it is what the
+                // partition gate is really standing in for.
                 return null;
             }
             bool nameMapped = listing.LogicalToPhysical is not null || listing.MappedSchema is not null;

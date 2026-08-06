@@ -82,9 +82,10 @@ says so badly.
 
 ---
 
-## 2. `Information loss on integer cast: value 4294967296` — NOT reproducible upstream, so NOT ours to file
+## 2. `Information loss on integer cast: value 4294967296` — OURS, root cause found, NOT to file
 
-**Status: our bug or an interaction, not a DuckDB one. Do not file.**
+**Status: our bug, in the host input-binding path. Isolated: a bound Arrow input with a SECOND VARCHAR
+column breaks. Do not file upstream.**
 
 Reading a partitioned Delta table through the batched path raised:
 
@@ -124,13 +125,31 @@ decode rather than a `count(*)`:
 | hive auto-detection colliding with our projected column | **refuted** — `hive_partitioning => false` still fails |
 | the SQL SHAPE — the byte-identical statement with `__fab_f` as an inline `VALUES` CTE | **fine, returns the right 20 rows** |
 
-⇒ the failure is in the **bound metadata Arrow input** (`MetaStream`), not in DuckDB. The one thing that
-distinguishes a partitioned scan there is the extra `p<i>` VARCHAR column beside `fn`/`ord` — a 3-column
-input where the working non-partitioned one has 2, and where the deletion-vector input (2 columns, also with
-a string column) is fine.
+### FOUND — and it has nothing to do with partitions
 
-**Next step: dump what `MetaStream` actually exports before theorising again.** Two hypotheses have now died
-here, both of which looked obvious.
+**A bound Arrow input carrying a SECOND `VARCHAR` column breaks.** Two steps got there, and the first is the
+one that mattered: instrumenting the export rather than theorising a third time.
+
+1. **The batch is well-formed.** Logged at construction: 3 columns, length 12 for 12 files, every array the
+   same length, no nulls, types `utf8 / int64 / utf8`. So the producer is not at fault.
+2. **Hold the column COUNT fixed, change only the third column's TYPE.** With `p0` built as `Int64` instead of
+   `StringArray` — same 3 columns, same rows, same SQL — the identical query **runs**.
+
+So `(VARCHAR, BIGINT)` is fine, which is exactly why the deletion-vector input `(fn, pos)` works, and
+`(VARCHAR, BIGINT, VARCHAR)` is not. Partitioning is simply the only shape that needs a second string column
+today; it was never a partition bug.
+
+⚠ **This is a defect in the host input-binding path** (`Host.Query(sql, inputs)` → the C ABI → the
+connection-scoped view), so it is **general to any managed component that binds an Arrow input**, not
+specific to the Delta reader. `4294967296` = `2^32` reaching a `uint32` cast is consistent with a string
+column's DATA buffer being read where its OFFSETS buffer was expected — that is a hypothesis, and the last
+two hypotheses here both died, so verify it before acting on it.
+
+**The shipped inputs are safe only by accident**: both carry at most one string column. Any future input with
+two would hit this.
+
+Next step is the C++ side — `arrow_ingest` / the input-view registration — with a minimal two-string input,
+not another Delta table.
 
 ⚠ Also observed once: the unittest process **SEGFAULTED** rather than raising, so this is not a containable
 failure. Treat the gate as load-bearing.

@@ -2017,7 +2017,19 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
       hive layout; **checked against the stock 1.5.5 wheel and that is FALSE** — the minimal form works, as do
       `union_by_name` alone, `file_row_number` alone, and `hive_partitioning => false` (four controls, no
       failure). So it comes from something OUR SQL adds, and filing it upstream would have been a false report.
-      **And the follow-up hypothesis died too:** the suspected hive-column name collision is REFUTED —
+      **⚠ ROOT CAUSE FOUND 2026-08-06, AND IT IS NOT A PARTITION BUG: a bound Arrow input carrying a SECOND
+      `VARCHAR` COLUMN breaks.** Isolated in two steps, the first being the one that mattered — INSTRUMENT the
+      export instead of theorising a third time. (1) The batch is well-formed (3 columns, length 12 for 12 files,
+      arrays consistent, no nulls, `utf8/int64/utf8`) ⇒ not the producer. (2) Hold the column COUNT fixed and
+      change only the third column's TYPE: with `p0` as `Int64` the identical query RUNS. So `(VARCHAR, BIGINT)`
+      is fine — which is exactly why the DV input `(fn, pos)` works — and `(VARCHAR, BIGINT, VARCHAR)` is not.
+      **⚠ It is a defect in the HOST INPUT-BINDING path (`Host.Query(sql, inputs)` → C ABI → the
+      connection-scoped view), so it is GENERAL to any managed component binding an Arrow input, not a Delta
+      thing — and the shipped inputs are safe only BY ACCIDENT, both carrying at most one string column.** Next
+      step is the C++ side (`arrow_ingest` / the input-view registration) with a minimal two-string input, NOT
+      another Delta table. `2^32` reaching a `uint32` cast is consistent with a string column's DATA buffer being
+      read where its OFFSETS buffer was expected — a hypothesis, and two have already died here.
+      **The dead hypotheses, kept because each looked obvious:** the suspected hive-column name collision is REFUTED —
       `hive_partitioning => false` does not fix it (kept anyway as a real guard: any `x=y` directory in a table's
       path would otherwise inject a phantom column). What IS ruled out, each with a real decode on the stock
       wheel: `read_parquet` in every option combination, hive detection, and **the SQL shape — the
