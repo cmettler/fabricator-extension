@@ -1,0 +1,72 @@
+# dbt-duckdb profile for the MERGE-on-Delta-on-S3 harness.
+#
+# NO LIVE CREDENTIALS HERE — these are the docker rig's test-only MinIO keys
+# (docker/docker-compose.yml), the same ones the committed verify_delta_catalog_s3 suite uses.
+#
+# Two targets that differ in ONE field, so the transaction question is answerable by A/B:
+#   s3            -> dbt's normal behaviour: a real BEGIN before the model statement, COMMIT after.
+#   s3_autocommit -> disable_transactions: true, which makes dbt-duckdb pass auto_begin=False
+#                    (adapters/duckdb/connections.py:128) so every statement runs in autocommit.
+# They use SEPARATE S3 prefixes and SEPARATE local duckdb files so neither run can contaminate the other.
+dbt_merge_s3_test:
+  target: s3
+  outputs:
+    s3:
+      type: duckdb
+      path: 'dbt_merge_s3.duckdb'
+      schema: main
+      threads: 1
+      config_options:
+        allow_unsigned_extensions: true
+      extensions:
+        - '../build/release/extension/fabricator/fabricator.duckdb_extension'
+      secrets:
+        - type: s3
+          name: minio_s3
+          key_id: miniouser
+          secret: miniosecret123
+          endpoint: 'localhost:9000'
+          url_style: path
+          region: us-east-1
+          use_ssl: true
+      module_paths:
+        - 'plugins'
+      plugins:
+        - module: s3_delta_attach
+          config:
+            path: 's3://fabricator/dbtmerge'
+            alias: lake
+            provider: delta
+            secret: minio_s3
+            curl_insecure: true
+
+    s3_autocommit:
+      type: duckdb
+      path: 'dbt_merge_s3_ac.duckdb'
+      schema: main
+      threads: 1
+      # THE ONE DIFFERENCE. Target-level, not per-model — see the analysis in README.md.
+      disable_transactions: true
+      config_options:
+        allow_unsigned_extensions: true
+      extensions:
+        - '../build/release/extension/fabricator/fabricator.duckdb_extension'
+      secrets:
+        - type: s3
+          name: minio_s3
+          key_id: miniouser
+          secret: miniosecret123
+          endpoint: 'localhost:9000'
+          url_style: path
+          region: us-east-1
+          use_ssl: true
+      module_paths:
+        - 'plugins'
+      plugins:
+        - module: s3_delta_attach
+          config:
+            path: 's3://fabricator/dbtmergeac'
+            alias: lake
+            provider: delta
+            secret: minio_s3
+            curl_insecure: true

@@ -1,0 +1,22 @@
+name: 'dbt_merge_s3_test'
+version: '1.0'
+config-version: 2
+profile: 'dbt_merge_s3_test'
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+
+flags:
+  send_anonymous_usage_stats: false
+
+models:
+  dbt_merge_s3_test:
+    # Every model lives in the attached Delta-on-S3 catalog.
+    +database: lake
+    # NO +schema HERE, AND THAT IS LOAD-BEARING. dbt's default generate_schema_name appends a custom
+    # schema to the target one, so `+schema: main` yields `main_main` — and a FLAT Delta root exposes
+    # exactly one schema, `main`. A flat catalog accepts a write under any schema name (dropping the
+    # qualifier: lake.main_main.t lands at <root>/t/) but cannot resolve that name on a later attach, so
+    # dbt sees no existing relation every run and an incremental model silently re-CREATEs (overwrites)
+    # instead of merging. Measured: batch-1 rows vanished, exit 0, "OK created ... incremental model".
+    +materialized: table
