@@ -267,12 +267,17 @@ internal static class DeltaNativeReader
 
     // The per-file SELECT (ordinal folded into the rowid expression); file_row_number is read but only surfaces
     // as _metadata.row_id (and drives the DV exclusion) — never as an output column.
+    /// <param name="dvView">Name of a bound Arrow input carrying this file's deletion-vector positions, or
+    /// null to always inline them as literals. See <see cref="DvCondition"/> — a caller that passes a name
+    /// MUST bind that input whenever <see cref="BindDv"/> is true for the file, and the two decisions read
+    /// the same predicate so they cannot drift.</param>
     private static string FileSql(IReadOnlyList<string> dataCols, bool wantRowId, string? where,
                                   DeltaReader.NativeScanFile f, FileMapping fm,
                                   DeltaSchema.StructType? tableSchema,
                                   IReadOnlyList<string>? partitionCols = null,
                                   string? rowIdCond = null,
-                                  string? innerCond = null)
+                                  string? innerCond = null,
+                                  string? dvView = null)
     {
         // Per-column projection over THIS file's actual layout:
         //   • column mapping: alias the stored PHYSICAL name to the logical one; a mapped STRUCT whose shape
@@ -387,7 +392,14 @@ internal static class DeltaNativeReader
         }
         if (f.Dv.Length > 0)
         {
-            conds.Add($"file_row_number NOT IN ({string.Join(",", f.Dv.Select(p => p.ToString(CultureInfo.InvariantCulture)))})");
+            conds.Add(DvCondition(f.Dv, dvView));
+            // ...plus a PRUNABLE bound on the same vector. Exactness comes from the condition above; this
+            // conjunct exists purely so DuckDB's parquet reader can skip whole row groups (see
+            // DvRangeCondition).
+            if (DvRangeCondition(f.Dv, f.NumRecords) is { } dvRange)
+            {
+                conds.Add(dvRange);
+            }
         }
         if (conds.Count > 0)
         {
@@ -396,13 +408,177 @@ internal static class DeltaNativeReader
         return sb.ToString();
     }
 
+    /// <summary>
+    /// The name of the connection-scoped Arrow input a per-file SELECT anti-joins its deletion vector from.
+    /// One input per QUERY: the streaming scan issues one <see cref="Host.Query(string)"/> per file, so this
+    /// view is scanned exactly once and a single-use Arrow stream is safe. (<see cref="FullTableSql"/> unions
+    /// many files into ONE query and therefore does NOT use it — see its remarks.)
+    /// </summary>
+    internal const string DvViewName = "__fab_dv";
+
+    /// <summary>
+    /// Deletion vectors at or below this many positions stay an inline <c>file_row_number NOT IN (…)</c>
+    /// literal list; above it they are bound as an Arrow input and anti-joined.
+    /// <para>The value is DuckDB'S OWN <c>IN</c>-rewrite boundary, not a number of ours.
+    /// <c>InClauseRewriter::VisitReplace</c> (<c>src/optimizer/in_clause_rewriter.cpp</c>) keeps
+    /// <c>children.size() &lt; 6</c> — i.e. up to 4 values beside the LHS — as a plain conjunction of
+    /// <c>&lt;&gt;</c> comparisons, and from 5 values up materialises a <c>ColumnDataCollection</c> and a MARK
+    /// JOIN. So below the boundary the predicate really is just an expression (no join, no collection, and no
+    /// Arrow input to marshal per file), while at or above it DuckDB builds a join anyway — at which point
+    /// handing it a bound input is strictly better, because it skips parsing and evaluating N literals to get
+    /// there. ⚠ That 6 is HARDCODED upstream with no setting to tune it (checked <c>src/main/settings/</c> and
+    /// <c>config.hpp</c>), so a future DuckDB bump could move it silently; this is the constant to re-check.</para>
+    /// <para>⚠ An earlier version of this comment justified a much larger threshold (256) on the grounds that
+    /// the inline form stays row-group-prunable where an anti-join does not. That was WRONG twice over: the
+    /// rewrite above makes any list of 5+ values a mark join, exactly as opaque as our anti-join; and a NOT IN
+    /// over scattered positions could hardly prune a row group anyway (the prunable predicate nearby is
+    /// <c>rowIdCond</c>, a positive range). Kept as a note because the number looked principled and was not.</para>
+    /// <para>Why the inlining had to go at all — the cost is in CONSTRUCTION, not evaluation, since the rewrite
+    /// is a planner pass that runs only after the text has been parsed and bound into one
+    /// <c>BoundConstantExpression</c> per deleted row and then <c>TryEvaluateScalar</c>'d one value at a time.
+    /// MEASURED on a 200k-row table, scanning after deleting N rows: N=0 → 1 s/68 MB, 10k → 5 s/85 MB,
+    /// 100k → 42 s/196 MB, 199k → 68 s/301 MB, i.e. ~0.4 ms and ~1.2 KB PER DELETED ROW. The control is
+    /// decisive: the SAME 100k rows deleted copy-on-write (no DV at all) scanned in 1 s/66 MB, so the
+    /// predicate and not the deletion was 42x the cost. With the anti-join, 199k scans in 1.1 s/93 MB — FLAT
+    /// in vector size and indistinguishable from the no-DV control. It matters because the cost was paid by
+    /// EVERY read until an OPTIMIZE rewrote the files, so an incrementally-merged table got slower every run.</para>
+    /// </summary>
+    private const int DvLiteralMax = 4;
+
+    /// <summary>True when <paramref name="dv"/> is large enough to bind as an Arrow input rather than inline.
+    /// The SQL builder and the input binder BOTH call this, so the condition and the binding cannot diverge —
+    /// a mismatch would either reference an unbound view (a loud error) or, far worse, bind nothing and
+    /// silently resurrect deleted rows.</summary>
+    private static bool BindDv(long[] dv) => dv.Length > DvLiteralMax;
+
+    /// <summary>The DV exclusion predicate: an anti-join against the bound input for a large vector, else the
+    /// inline literal list.</summary>
+    private static string DvCondition(long[] dv, string? dvView) =>
+        dvView is not null && BindDv(dv)
+            ? $"NOT EXISTS (SELECT 1 FROM {dvView} d WHERE d.pos = file_row_number)"
+            : $"file_row_number NOT IN ({string.Join(",", dv.Select(p => p.ToString(CultureInfo.InvariantCulture)))})";
+
+    /// <summary>
+    /// A PRUNABLE bound on the surviving positions, derived from the deletion vector — emitted ALONGSIDE
+    /// <see cref="DvCondition"/>, never instead of it.
+    /// <para>Why it is needed at all: only a predicate on the RAW <c>file_row_number</c> column can skip row
+    /// groups. DuckDB synthesizes exact per-row-group min/max for it — <c>ParquetColumnSchema::Stats</c> has an
+    /// explicit <c>FILE_ROW_NUMBER</c> branch computing them from the row-group row offsets — but neither of
+    /// the exact forms is visible to that: our <c>NOT EXISTS</c> becomes an anti-join ABOVE the scan, and the
+    /// inline <c>NOT IN</c> becomes a mark join too as soon as it has 5+ values
+    /// (<see cref="DvLiteralMax"/>). So without this conjunct a deletion vector prunes NOTHING, and the file
+    /// is read in full however much of it is deleted.</para>
+    /// <para>It is SUPERSET-SAFE by construction: it excludes only leading/trailing positions that are ENTIRELY
+    /// covered by the vector, so it can never drop a surviving row. Exactness stays with the anti-join, which
+    /// means a bug here degrades pruning rather than corrupting results — the right way round.</para>
+    /// <para>Shape it serves is the common one: a contiguous delete (a merge that removed a batch, or
+    /// <c>DELETE … WHERE id &lt;= N</c>) collapses to one <c>&gt;=</c> / <c>&lt;=</c>. A scattered vector yields
+    /// no usable bound and this returns null rather than emitting a no-op conjunct.</para>
+    /// <para>IT DEMONSTRABLY WORKS, AND IT DOES NOT SHOW UP IN WALL TIME — both halves verified, because each
+    /// alone invites the wrong conclusion. Read from <c>EXPLAIN ANALYZE</c> on a 1M-row / 9-row-group file with
+    /// a contiguous 900k prefix deleted: the scan operator carries <c>Filters: file_row_number&gt;=900000</c> and
+    /// emits <b>100,000 rows</b>, against <b>1,000,000</b> (the whole file) with the conjunct removed — a 10x
+    /// cut in scan output, so the predicate really is pushed into <c>READ_PARQUET</c>. The same <c>EXPLAIN</c>
+    /// confirms the exact form is a <c>HASH_JOIN / RIGHT_ANTI</c> above the scan, i.e. invisible to pruning,
+    /// which is why this conjunct has to exist separately.</para>
+    /// <para>Yet a controlled A/B on the SAME table (10M rows x 4 cols, contiguous 9M deleted, bound on vs off,
+    /// 3 runs) timed 2.17s vs 2.21s best — no difference. Both results are real: the scan is not the bottleneck
+    /// at that shape, because marshalling and hashing a multi-million-position vector dominates and is paid
+    /// identically either way. Expect the win to appear where I/O dominates instead (remote storage) or where
+    /// the vector is small relative to the file.</para>
+    /// <para>⚠ TWO MEASUREMENT TRAPS, both fallen into here in sequence. (1) An earlier comparison showing
+    /// 2.23s vs 3.33s was CONFOUNDED — it put a contiguous vector against a SCATTERED one, measuring DV shape
+    /// (1M probes vs 10M), not pruning. (2) The clean timing A/B then said "no benefit", which is true about
+    /// TIME and false about EFFECT. Only the PLAN settles what the SQL does; timing can only say whether it
+    /// mattered. If this ever needs re-justifying, read the scan cardinality in EXPLAIN ANALYZE, do not
+    /// re-time it.</para>
+    /// <para>The upper bound needs the file's row count, which the add action's stats supply and external
+    /// writers may omit — hence <paramref name="numRecords"/> is nullable and only the lower bound is emitted
+    /// when it is unknown. ⚠ <c>lo &gt; hi</c> means the file is entirely deleted and should not be read at
+    /// all; that is a planning-time skip (the listing still carries such files today) and is deliberately not
+    /// smuggled in here.</para>
+    /// </summary>
+    private static string? DvRangeCondition(long[] dv, long? numRecords)
+    {
+        if (dv.Length == 0)
+        {
+            return null;
+        }
+        // dv is sorted ascending. Walk the dense prefix: the first position NOT present is the smallest
+        // surviving one. `<=` rather than `==` so a duplicated position cannot stall the walk.
+        long lo = 0;
+        for (int i = 0; i < dv.Length && dv[i] <= lo; i++)
+        {
+            if (dv[i] == lo)
+            {
+                lo++;
+            }
+        }
+        var conds = new List<string>(2);
+        if (lo > 0)
+        {
+            conds.Add($"file_row_number >= {lo.ToString(CultureInfo.InvariantCulture)}");
+        }
+        if (numRecords is { } n && n > 0)
+        {
+            long hi = n - 1;
+            for (int j = dv.Length - 1; j >= 0 && dv[j] >= hi; j--)
+            {
+                if (dv[j] == hi)
+                {
+                    hi--;
+                }
+            }
+            if (hi < n - 1)
+            {
+                conds.Add($"file_row_number <= {hi.ToString(CultureInfo.InvariantCulture)}");
+            }
+        }
+        return conds.Count == 0 ? null : string.Join(" AND ", conds);
+    }
+
+    /// <summary>This file's deletion-vector positions as a one-column Arrow stream for
+    /// <see cref="Host.Query(string, IReadOnlyList{ValueTuple{string, IArrowArrayStream}})"/>.
+    /// <para>⚠ The column is NON-NULLABLE by construction and that matters: we chose <c>NOT EXISTS</c> over
+    /// <c>NOT IN (SELECT …)</c> precisely because a single NULL position in an IN-subquery makes the predicate
+    /// NULL for every row and silently returns an EMPTY table. NOT EXISTS is null-safe regardless, so the two
+    /// defences are independent.</para></summary>
+    private static IArrowArrayStream DvStream(long[] dv)
+    {
+        var builder = new Int64Array.Builder();
+        builder.Reserve(dv.Length);
+        foreach (var pos in dv)
+        {
+            builder.Append(pos);
+        }
+        var schema = new Schema(new[] { new Field("pos", Int64Type.Default, nullable: false) }, null);
+        return new InMemoryArrayStream(
+            schema, new[] { new RecordBatch(schema, new IArrowArray[] { builder.Build() }, dv.Length) });
+    }
+
+    /// <summary>Runs a per-file SELECT, binding the file's deletion vector as an Arrow input when it is large
+    /// enough that inlining it would be pathological (<see cref="DvLiteralMax"/>).</summary>
+    private static IArrowArrayStream QueryFile(string sql, DeltaReader.NativeScanFile f)
+        => BindDv(f.Dv)
+            ? Host.Query(sql, new (string, IArrowArrayStream)[] { (DvViewName, DvStream(f.Dv)) })
+            : Host.Query(sql);
+
     /// <summary>The WHOLE table as one SQL text: the per-file SELECTs (logical names, DV exclusion, column
     /// mapping, schema-evolution backfill, partition literals, row-tracking expressions for
     /// <see cref="RowTrackingIdColumn"/>/<see cref="RowTrackingVersionColumn"/> entries in
     /// <paramref name="dataCols"/>) joined by UNION ALL. Serves the clustered-OPTIMIZE rewrite, which needs a
     /// single query it can ORDER BY globally (DuckDB's spilling sort) and feed straight into a COPY —
     /// zero boundary crossings for the data. NOT usable for nested MAPPED columns (the per-batch
-    /// <see cref="ArrowColumnMappingRename"/> has no hook inside one SQL statement — callers gate).</summary>
+    /// <see cref="ArrowColumnMappingRename"/> has no hook inside one SQL statement — callers gate).
+    /// <para>⚠ This form passes NO <c>dvView</c>, so it still INLINES deletion-vector positions as literals
+    /// and keeps the cost characterised on <see cref="DvLiteralMax"/> (~0.4 ms + ~1.2 KB per deleted row).
+    /// That is deliberate, not an oversight: it unions many files into ONE query, so a single bound input
+    /// would be scanned once per branch and a single-use Arrow stream would be EXHAUSTED after the first —
+    /// silently contributing no exclusions, i.e. resurrecting deleted rows. Fixing it needs the vector bound
+    /// as one <c>(ordinal, pos)</c> input wrapped in a <c>WITH … AS MATERIALIZED</c> CTE (verified supported
+    /// on 1.5.5) so it is evaluated exactly once, with each branch anti-joining its own ordinal, plus the
+    /// input threaded through this method's caller (the clustered-OPTIMIZE rewrite, DeltaReader). Its blast
+    /// radius is bounded to that one rewrite path rather than every scan.</para></summary>
     internal static string FullTableSql(DeltaReader.NativeScanList listing, IReadOnlyList<string> dataCols)
     {
         var parts = new List<string>(listing.Files.Count);
@@ -508,9 +684,9 @@ internal static class DeltaNativeReader
                             var sql = FileSql(dataCols, wantRowId, where, file,
                                               fm, listing.TableSchema,
                                               listing.PartitionColumns, rowIdFilter?.PositionCondition(file.Ordinal),
-                                              trackingCond);
+                                              trackingCond, dvView: DvViewName);
                             Log.LogDebug("delta native file: {Sql}", sql);
-                            using var s = Host.Query(sql);
+                            using var s = QueryFile(sql, file);
                             while (true)
                             {
                                 var b = await s.ReadNextRecordBatchAsync(ct).ConfigureAwait(false);

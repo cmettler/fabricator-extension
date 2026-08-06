@@ -118,3 +118,146 @@ SELECT max(num_rows) FROM parquet_file_metadata('${FABRICATOR_DELTA_WRITE_DIR}/m
 
 statement ok
 DETACH mor;
+
+# ==============================================================================================
+# LARGE DELETION VECTORS — the read path must not inline positions as SQL literals.
+#
+# A deletion vector used to be rendered into the generated read_parquet SQL as
+# `file_row_number NOT IN (<one integer literal per deleted row>)`. MEASURED on a 200k-row table,
+# scanning after deleting N rows: N=10k took 5s/85MB, 100k took 42s/196MB, 199k took 68s/301MB —
+# ~0.4ms and ~1.2KB PER DELETED ROW. The control was decisive: the SAME 100k rows deleted
+# copy-on-write (no DV at all) scanned in 1s/66MB, so the predicate and not the deletion was 42x the
+# cost. It is paid by EVERY read until an OPTIMIZE rewrites the files, so an incrementally-merged
+# table got slower every run. Above a small threshold the vector is now bound as an Arrow input and
+# excluded with NOT EXISTS, which DuckDB hash-builds once (measured 1.1s/93MB at 199k — flat, and
+# indistinguishable from the no-DV control).
+#
+# ⚠ WHY THIS SECTION EXISTS AT ALL: every other deletion-vector assertion in this repo deletes a
+# handful of rows, i.e. stays BELOW the inline threshold, so the bound-input path is invisible to
+# them — they pass whether or not it works. These deletes are deliberately large enough to cross it.
+# The danger is silent: an exclusion that contributes nothing RESURRECTS deleted rows, so every
+# expectation below is arithmetic over the survivors rather than a smoke check.
+# ==============================================================================================
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/bigdv' AS bigdv (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE bigdv.main.t AS SELECT i::BIGINT AS id, (i*10)::BIGINT AS v FROM range(1, 20001) r(i);
+
+# CONTIGUOUS vector well above the threshold.
+statement ok
+DELETE FROM bigdv.main.t WHERE id <= 5000;
+
+query III
+SELECT count(*), min(id), max(id) FROM bigdv.main.t;
+----
+15000	5001	20000
+
+# Sum over the survivors: a wrong exclusion set changes this even when the COUNT happens to match.
+query I
+SELECT sum(v) FROM bigdv.main.t;
+----
+1875075000
+
+# A pushed filter and a large vector in the same scan — both are applied by the one inner query, so
+# this pins that they compose.
+query III
+SELECT count(*), min(id), max(id) FROM bigdv.main.t WHERE id > 10000 AND id <= 15000;
+----
+5000	10001	15000
+
+# rowid-addressed DML THROUGH a large vector, then read back: the exclusion coexists with a rowid
+# condition rather than replacing it.
+statement ok
+UPDATE bigdv.main.t SET v = -1 WHERE id = 12345;
+
+query I
+SELECT v FROM bigdv.main.t WHERE id = 12345;
+----
+-1
+
+statement ok
+DELETE FROM bigdv.main.t WHERE id = 12346;
+
+query II
+SELECT count(*), sum(CASE WHEN id = 12346 THEN 1 ELSE 0 END) FROM bigdv.main.t;
+----
+14999	0
+
+# SCATTERED positions — the shape no range-collapse could serve, so it exercises the anti-join itself
+# rather than a contiguous special case.
+statement ok
+CREATE TABLE bigdv.main.scat AS SELECT i::BIGINT AS id FROM range(1, 20001) r(i);
+
+statement ok
+DELETE FROM bigdv.main.scat WHERE id % 3 = 0;
+
+query II
+SELECT count(*), sum(CASE WHEN id % 3 = 0 THEN 1 ELSE 0 END) FROM bigdv.main.scat;
+----
+13334	0
+
+statement ok
+DETACH bigdv;
+
+# ----------------------------------------------------------------------------------------------
+# SEVERAL FILES, EACH CARRYING A LARGE DELETION VECTOR — and this shape is the point.
+#
+# The streaming scan issues ONE query per data file, each binding its OWN single-use Arrow input, so
+# every vector is scanned exactly once. A regression that bound ONE SHARED input across files would be
+# INVISIBLE on a single-file table (the shape of every other assertion here, since a CTAS writes one
+# file): the first file would consume the stream and every later file would silently contribute NO
+# exclusions, resurrecting its deleted rows. Hence three separate INSERTs — three files — with one
+# DELETE spanning all of them, and totals that can only hold if all three vectors applied.
+# ----------------------------------------------------------------------------------------------
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/mfdv' AS mfdv (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE mfdv.main.t (id BIGINT);
+
+statement ok
+INSERT INTO mfdv.main.t SELECT i::BIGINT FROM range(1, 10001) r(i);
+
+statement ok
+INSERT INTO mfdv.main.t SELECT i::BIGINT FROM range(10001, 20001) r(i);
+
+statement ok
+INSERT INTO mfdv.main.t SELECT i::BIGINT FROM range(20001, 30001) r(i);
+
+# Three data files, one per INSERT — the precondition for everything below. Asserted rather than
+# assumed: if the writer ever coalesced these into one file the section would still pass while having
+# stopped testing the multi-file case.
+query I
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/mfdv/t/*.parquet');
+----
+3
+
+# One DELETE spanning all three files => each gets its own vector of 5000 positions, all above the
+# inline threshold, all bound as separate inputs.
+statement ok
+DELETE FROM mfdv.main.t WHERE id % 2 = 0;
+
+query II
+SELECT count(*), sum(CASE WHEN id % 2 = 0 THEN 1 ELSE 0 END) FROM mfdv.main.t;
+----
+15000	0
+
+# The SUM is the load-bearing assertion: a count could survive one file's exclusions going missing if
+# another over-excluded, but the sum of the odd numbers 1..29999 pins the exact surviving SET.
+query I
+SELECT sum(id) FROM mfdv.main.t;
+----
+225000000
+
+# Per-file totals: 5000 survivors in EACH file's id range, so no single file's vector was skipped.
+query III
+SELECT count(*) FILTER (WHERE id <= 10000), count(*) FILTER (WHERE id > 10000 AND id <= 20000),
+       count(*) FILTER (WHERE id > 20000) FROM mfdv.main.t;
+----
+5000	5000	5000
+
+statement ok
+DETACH mfdv;

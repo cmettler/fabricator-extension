@@ -170,7 +170,7 @@ case "$TIER" in
         # on SQL Server refused a 2-action merge into an identity EXTERNAL table. The added assertions pin BOTH
         # sides of each boundary, which is the point — a guard wider than its hazard fails as a lost capability,
         # which nothing complains about.
-        : "${MIN_ASSERTIONS:=6250}"
+        : "${MIN_ASSERTIONS:=6284}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
