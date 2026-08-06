@@ -445,10 +445,12 @@ internal static class DeltaNativeReader
         /// in <c>WITH … AS MATERIALIZED</c> CTEs so each single-use stream is scanned exactly once. Covers EVERY
         /// file of the scan, deletion vectors included, so there is no loop left.
         /// <para><b>⚠ IT USES <c>union_by_name</c>, NOT THE <c>schema</c> MAP, AND THAT IS FORCED BY A DuckDB
-        /// BUG.</b> The obvious route is a field-id-keyed map, because <c>filename</c> / <c>file_row_number</c>
-        /// compose with an INTEGER-keyed map and FAIL with a VARCHAR-keyed one. But MEASURED: a field-id-keyed map
-        /// plus a virtual column raises <c>INTERNAL Error: No default expression in FieldId Map</c> whenever the
-        /// FILE contains a column that has no field id — and a materialized <c>__delta_row_id</c> is exactly that
+        /// BUG</b> (reproduced on stock 1.5.5 with controls — docs/duckdb-upstream-issues.md §1; the assertion
+        /// INVALIDATES THE DATABASE, so it is not a containable error). The obvious route is a field-id-keyed map,
+        /// because <c>filename</c> / <c>file_row_number</c> compose with an INTEGER-keyed map and FAIL with a
+        /// VARCHAR-keyed one. But a field-id-keyed map plus <c>file_row_number</c> (specifically —
+        /// <c>filename</c> is unaffected) raises <c>INTERNAL Error: No default expression in FieldId Map</c>
+        /// whenever the FILE contains a column that has no field id — and a materialized <c>__delta_row_id</c> is exactly that
         /// (row-tracking columns are not column-mapped, so they carry none). Row tracking is ON by default for
         /// tables we create, and every merge-on-read post-image file has that column, so the field-id route is
         /// unusable on the DEFAULT table shape. The same file reads fine with the map and NO virtual columns,
@@ -491,11 +493,20 @@ internal static class DeltaNativeReader
             }
             if (listing.PartitionColumns.Count > 0)
             {
-                // ⚠ A SECOND DuckDB assertion, measured: `union_by_name` + a virtual column over a HIVE-layout
-                // file list raises `INTERNAL Error: Information loss on integer cast: value 4294967296 outside of
-                // target range [0, 4294967295]` (2^32 — a virtual-column id sentinel meeting the auto-detected
-                // hive partition column). Gated on the table having ANY partition column, not on one being
-                // REQUESTED, because hive detection is automatic and fires from the paths alone.
+                // ⚠ CAUSE NOT ESTABLISHED — do NOT blame upstream here. Reading a partitioned table through this
+                // form raised `INTERNAL Error: Information loss on integer cast: value 4294967296 outside of
+                // target range [0, 4294967295]` (2^32, i.e. something cast to uint32). This comment previously
+                // attributed it to a DuckDB assertion in `union_by_name` + a virtual column over a hive layout;
+                // that was checked against stock 1.5.5 and is FALSE — the minimal form works, as do
+                // union_by_name alone, file_row_number alone, and hive_partitioning => false. So the error comes
+                // from something OUR SQL adds.
+                // The lead (docs/duckdb-upstream-issues.md §2): hive_partitioning is AUTO-DETECTED from the
+                // paths, so read_parquet emits a partition column of its own while our projection emits the same
+                // column from the bound metadata input — a name collision. If that is it, the fix is to pass
+                // `hive_partitioning => false` (the Delta log's partitionValues is the authoritative source; paths
+                // are opaque and never parsed) and lift this gate entirely.
+                // Gated on the table HAVING partition columns rather than on one being REQUESTED, because hive
+                // detection fires from the paths alone.
                 return null;
             }
             bool nameMapped = listing.LogicalToPhysical is not null || listing.MappedSchema is not null;

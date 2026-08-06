@@ -2001,17 +2001,26 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
       **`INTERNAL Error: No default expression in FieldId Map`** whenever the FILE contains a column with no field
       id, and a materialized `__delta_row_id` is exactly that (row-tracking columns are not column-mapped). Row
       tracking is ON by default and every merge-on-read post-image file has that column, so the field-id route is
-      unusable on the DEFAULT table shape. The same file reads fine with the map and no virtual columns ⇒ an
-      upstream assertion, worth reporting. So the full form uses **`union_by_name => true`** plus an explicit
+      unusable on the DEFAULT table shape. The same file reads fine with the map and no virtual columns, and with
+      `filename` instead of `file_row_number` ⇒ an upstream assertion. **REPRODUCED on the stock 1.5.5 wheel with
+      four controls, and it INVALIDATES THE DATABASE** (the next unrelated query returns *"FATAL Error: … database
+      has been invalidated"*), so it is not a containable error — write-up ready to file in
+      [docs/duckdb-upstream-issues.md](docs/duckdb-upstream-issues.md) §1. So the full form uses **`union_by_name => true`** plus an explicit
       physical→logical alias projection, which needs no field ids at all.
     - **⚠ `union_by_name` CANNOT PRODUCE A COLUMN NO FILE IN THE LIST CARRIES** — binder error, and PRUNING makes
       it routine (Delta-log pruning dropped the only file holding a newly-ADDed column, so `WHERE extra IS NULL`
       broke). Fixed by ONE `parquet_schema([… whole list …])` query per scan resolving which stored names exist,
       with the rest emitted as `CAST(NULL AS …)`. One query per SCAN, never per file.
-    - **⚠ A SECOND DuckDB ASSERTION gates partitioned tables:** `union_by_name` + a virtual column over a HIVE
-      layout raises `INTERNAL Error: Information loss on integer cast: value 4294967296 outside of target range`
-      (2^32 — a virtual-column sentinel meeting the auto-detected hive column). Gated on the table HAVING
-      partition columns, not on one being requested, because hive detection fires from the paths alone.
+    - **⚠ PARTITIONED TABLES ARE GATED BUT THE CAUSE IS NOT ESTABLISHED, AND THIS ENTRY BLAMED UPSTREAM
+      WRONGLY.** Reading one raised `INTERNAL Error: Information loss on integer cast: value 4294967296` (2^32).
+      It was recorded here and in the code as a DuckDB assertion in `union_by_name` + a virtual column over a
+      hive layout; **checked against the stock 1.5.5 wheel and that is FALSE** — the minimal form works, as do
+      `union_by_name` alone, `file_row_number` alone, and `hive_partitioning => false` (four controls, no
+      failure). So it comes from something OUR SQL adds, and filing it upstream would have been a false report.
+      **The lead:** hive partitioning is AUTO-DETECTED, so `read_parquet` emits a partition column of its own
+      while our projection emits the same one from the bound metadata input — a name collision. If so the fix is
+      `hive_partitioning => false` (the log's `partitionValues` is authoritative; paths are opaque) and the gate
+      lifts entirely. Full record: [docs/duckdb-upstream-issues.md](docs/duckdb-upstream-issues.md) §2.
     - It gives up the DV's PRUNABLE BOUND (one WHERE cannot carry a per-file range). Deliberate, and the evidence
       is already in `DvRangeCondition`: its own A/B found that bound "demonstrably works and does not show up in
       wall time". ⚠ Re-measure on REMOTE storage with a mostly-deleted file before calling it free there.
@@ -3670,6 +3679,7 @@ path never adopted. Keep the status honest; a wrong status is worse than none.
 | [delta-snapshot-caching.md](docs/delta-snapshot-caching.md) | **design + decision gate; the cache is NOT built** and the full version is not recommended |
 | [delta-transaction-hoist.md](docs/delta-transaction-hoist.md) | **slices 1a, 1b+2 and 5 BUILT; slice 3 BLOCKED, slice 4 optional** (2026-08-04, user-decided). **Slice 5 makes a CREATE inside a transaction IMMEDIATE**, which LIFTS the ALTER and DELETE refusals on a same-transaction-created table (not UPDATE — §4.3.4) and makes ROLLBACK drop it best-effort; the price is that v0 is visible for the transaction's life. §4.3 lists the six things the design got wrong, incl. that a **CTAS creates inside `begin_bulk`, not via `CreateTable`** — hoist EW's `DeltaTransaction` from flush time to STATEMENT time. ⚠ It is a HOIST, not an adoption: the flush already calls `StartTransaction`, and the read-your-writes overlay stays ours because `DeltaTransaction.Snapshot` is the BASE snapshot. The main prize is BANKED — `StageChangeDataAsync` is now called at statement time, our 45-line EW duplicate is deleted, and the `WriteChangeDataFilesForAsync` offer is **RETIRED, never sent**. §6 is the CDF row-identity DIVERGENCE that settling slice 2's mutation question exposed (buffered append writes NULL ids where autocommit yields real ones) — with the reason the cheap fix silently loses rows. ⚠ §4.1 slice 3 is **BLOCKED, both halves** (born-deleted rows are a PARAMETER of `StageDataFilesAsync`; DV computation reads only the base snapshot) and unblocking it would CREATE an upstream ask — so **slice 5 is the next one worth doing and depends on neither 3 nor 4** (§4.2) |
 | [delta-transactions.md](docs/delta-transactions.md) | **current** — buffered-DML semantics. §8.1 = the MEASURED OneLake multi-writer result (2026-07-31; one bug fixed, one gap left OPEN); §10.6 = the MEASURED Fabric Spark isolation-property matrix, replacing a stale "we do NOT read it" |
+| [duckdb-upstream-issues.md](docs/duckdb-upstream-issues.md) | **current** — DuckDB bugs found from here, reproduced on the STOCK wheel with controls. §1 is ready to file (a `read_parquet` assertion that INVALIDATES the database); §2 is the counter-example the file exists to enforce — a finding that looked upstream, did not reproduce, and must NOT be filed |
 | [distribution-installer.md](docs/distribution-installer.md) | **current** — single-file SKU, phases 1–4 of 5 |
 | [ew-master-migration.md](docs/ew-master-migration.md) | **current** — the EW pin journal. Read BEFORE the next EW bump. §FULL PATCH-SET AUDIT (2026-08-03) is the file-by-file verdict against `v0.2.0` with a KEEP/OFFER/DROP per file; §THE `*BySelection*` QUESTION records why the merge-on-read UPDATE must NOT move into the Bridge and what to offer instead; §2b is the ConflictChecker reading half incl. the two ways it DIVERGES from Delta |
 | [fabric-api-functions.md](docs/fabric-api-functions.md) | **current — the whole curated set is BUILT; P0/P1/P2 + semantic models + XMLA live-validated, P3 wired but NOT live** (no git-connected workspace / pipeline / mirrored DB on this tenant). §9b spike results, §9c as-built (incl. the zero-argument Arrow fix), §9h the SQL Server binding + the two shipped bugs it found, §9j variable libraries, §9k Spark sessions, §9l the `fabric` SCHEMA move, §9m job-instance fan-out + the fan-out verdict per remaining function, §9n the inferred/renamed ATTACH options + the endpoint-host encoding, §10 the full API sweep with a verdict per area |
