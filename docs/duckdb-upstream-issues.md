@@ -148,8 +148,25 @@ two hypotheses here both died, so verify it before acting on it.
 **The shipped inputs are safe only by accident**: both carry at most one string column. Any future input with
 two would hit this.
 
-Next step is the C++ side — `arrow_ingest` / the input-view registration — with a minimal two-string input,
-not another Delta table.
+### Where the boundary is, and one experiment-design warning
+
+The input is registered with **`duckdb_arrow_scan(conn, name, stream)`** — DuckDB's own C API, not our
+`arrow_ingest` (`MakeHostQueryStream`, `src/fabricator_host_query.cpp:141`). So the failure is at the Arrow
+C-interface import boundary: either our C# export of the second string column, or DuckDB's import of it.
+DuckDB reads multi-string Arrow tables constantly, which argues for the export side — but that is an
+argument, not a measurement, and two arguments have already died on this bug.
+
+⚠ **The obvious next experiment is a trap, and it caught me.** "Make the third column a CONSTANT string and
+see if it still fails" returns the *correct* answer when it passes — which is indistinguishable from the
+query having fallen back to the per-file loop, since the gates route partition columns there anyway. It is
+the `count(*)` trap in a new costume: **the control has to be able to tell a real run from a skipped one.**
+Use a value that makes a genuine full-form run produce a *wrong* answer (the `Int64` variant returned 0 where
+the fallback returns 10, which is why that one was informative), or assert on the emitted SQL from the
+`Fabricator.Delta.Native` debug log rather than on the result.
+
+Next step: a minimal two-string Arrow input through `Host.Query(sql, inputs)` — not another Delta table —
+with the emitted SQL confirmed in the log, then the same shape through pyarrow + `duckdb_arrow_scan` on the
+stock wheel to settle export-vs-import in one step.
 
 ⚠ Also observed once: the unittest process **SEGFAULTED** rather than raising, so this is not a containable
 failure. Treat the gate as load-bearing.
