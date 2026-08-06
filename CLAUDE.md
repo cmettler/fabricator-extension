@@ -2083,6 +2083,17 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
       absent. After the fix: 0 errors, all six at their full row count, 0 leaked views. ⚠ Note CLAUDE.md records
       a dbt `--threads 4` lakehouse run as PASS=4/4 — that predates the native-write default flip, so do not
       read it as coverage of this.
+    - **⚠ THEN SWEPT, and there were THREE MORE fixed names — five sites in total, not two.** The two found by
+      tripping over them were not the whole class: `HostBatchFilter` (`__fabricator_scan_batch`, every pushed
+      batch filter), `ExternalTableRouting` (`__fabricator_external_insert`, every routed external-table
+      INSERT) and `DeltaCatalog.SortStream` (`__fabricator_sort_input`, every SORTED BY write) had the same
+      shape. All now take per-call names. **Do the grep, do not fix only what bit you** —
+      `grep -rn "(string, IArrowArrayStream)\[\]" dotnet/` finds them all.
+    - **⚠ `SortStream`'s DROP IS OWED and deliberately NOT faked**: it returns a LAZY stream, so the view must
+      outlive the call and no point in that method knows the caller has finished draining. It needs a stream
+      wrapper that drops on Dispose, unlike the COPY/filter sites whose queries materialize before returning.
+      Until then a sorted write leaves one view per call in the catalog — **the RACE is fixed there, the LEAK is
+      not.**
     - The shared plumbing is now `BoundInput.NextName` / `BoundInput.Drop`
       (`dotnet/Fabricator.Bridge/SingleScanArrowStream.cs`), so any future bound input gets both halves by
       construction rather than by remembering.

@@ -1118,7 +1118,13 @@ public sealed class DeltaCatalog : IBackendCatalog
     // (channel backpressure feeds the sort; the sorted stream feeds whichever write path runs next).
     private static IArrowArrayStream SortStream(IArrowArrayStream data, IReadOnlyList<string> cols)
     {
-        var sb = new System.Text.StringBuilder("SELECT * FROM __fabricator_sort_input ORDER BY ");
+        // Unique per call — see BoundInput (a fixed name races concurrent host queries). ⚠ The DROP is OWED
+        // and not done here: this returns a LAZY stream, so the view must outlive the call and there is no
+        // point at which this method knows the caller has finished draining. It needs a stream wrapper that
+        // drops on Dispose — unlike the COPY/filter sites, whose queries materialize before returning. Until
+        // then a sorted write leaves one view per call in the catalog (the RACE is fixed; the LEAK is not).
+        string sortInput = BoundInput.NextName("__fabricator_sort_input");
+        var sb = new System.Text.StringBuilder("SELECT * FROM \"" + sortInput + "\" ORDER BY ");
         for (int i = 0; i < cols.Count; i++)
         {
             if (i > 0)
@@ -1128,7 +1134,7 @@ public sealed class DeltaCatalog : IBackendCatalog
             sb.Append('"').Append(cols[i].Replace("\"", "\"\"")).Append('"');
         }
         return Host.Query(sb.ToString(),
-            new (string, IArrowArrayStream)[] { ("__fabricator_sort_input", data) });
+            new (string, IArrowArrayStream)[] { (sortInput, data) });
     }
 
     /// <summary>The catalog's schemas: the lakehouse schemas for a schema-enabled OneLake lakehouse; for a
