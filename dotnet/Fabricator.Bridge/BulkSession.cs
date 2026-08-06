@@ -148,7 +148,13 @@ internal sealed class BulkSession
         _channel.Writer.TryComplete();
         try
         {
-            return _consumer.GetAwaiter().GetResult();
+            long rows = _consumer.GetAwaiter().GetResult();
+            // The streaming-write claim, checkable: this path is a bounded channel (capacity 8) feeding a
+            // consumer, so heap here must NOT scale with rows. It is the provider-agnostic bulk seam — every
+            // INSERT / CTAS / COPY on every backend ends here — which makes it the one mark worth comparing
+            // across backends and across row counts.
+            MemoryProbe.Mark("bulk: load complete", rows);
+            return rows;
         }
         finally
         {

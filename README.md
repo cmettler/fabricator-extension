@@ -1312,6 +1312,46 @@ setting (see [Partitioning & write tuning](#partitioning--write-tuning)).
 | `mssql_order_pushdown` | Accepted | No-op — TopN is pushed automatically when safe (always-on, not gated) |
 | `mssql_copy_tablock`, `mssql_copy_flush_rows`, `mssql_ctas_use_bcp`, `mssql_convert_varchar_max`, `mssql_catalog_cache_ttl` | Accepted | No-op |
 
+## Diagnostic logging
+
+Logging is **off by default** and configured by environment variables, not by `SET` — the bridge boots before
+any session exists.
+
+| Variable | Meaning |
+|---|---|
+| `FABRICATOR_LOG_LEVEL` | `Trace` \| `Debug` \| `Information` \| `Warning` \| `Error`. Unset ⇒ off |
+| `FABRICATOR_LOG_FILE` | Write to this file as well as forwarding to DuckDB's `duckdb_logs` |
+
+Categories, so you can grep for the layer you care about:
+
+| Category | At level | What it shows |
+|---|---|---|
+| `Fabricator.Bridge` | `Debug` | Every **failed** managed↔native crossing, plus `open_catalog` / `get_metadata`. Connection strings are never logged |
+| `Fabricator.Sql` | `Debug` | Every T-SQL statement: scans with the pushed projection/WHERE/TOP/ORDER BY, connection routing, DML, DDL, bulk |
+| `Fabricator.Delta`, `Fabricator.Delta.Write`, `Fabricator.Delta.Fs` | `Information` | Scan mode, active/scanned/pruned file counts, the resolved snapshot version, which filesystem a table opened with, and per-commit lines during a transaction flush |
+| `Fabricator.Memory` | `Debug` | Memory marks on the **row-scaling** paths — UPDATE, DELETE, bulk write, OPTIMIZE, transaction flush |
+
+`Fabricator.Memory` is the one to reach for when a large statement uses more memory than you expect:
+
+```bash
+FABRICATOR_LOG_LEVEL=Debug FABRICATOR_LOG_FILE=/tmp/fab.log duckdb -unsigned < big_update.sql
+grep -o 'mem delta update.*' /tmp/fab.log
+# mem delta update: set values parsed (BOXED): ws=138MB heap=47MB alloc=58MB rows=400000
+# mem delta update: arrow batch rebuilt:       ws=155MB heap=66MB alloc=78MB rows=400000
+# mem delta update mor: rowid map built:       ws=168MB heap=79MB alloc=90MB rows=400000
+# mem delta update mor: group flushed:         ws=241MB heap=101MB alloc=213MB rows=400000
+# mem delta update mor: committed:             ws=242MB heap=94MB alloc=250MB rows=400000
+```
+
+Reading them: **`heap`** is the extension's own managed memory and drops as soon as it releases something;
+**`ws`** is the whole process, so it includes DuckDB's side of the statement and it lags, because the OS does
+not reclaim pages when the garbage collector frees objects. **`alloc`** is cumulative, so the *difference*
+between two marks is how much a stage allocated even if it kept none of it — a stage with a small `heap` and a
+large `alloc` step is copying data, not holding it.
+
+Enabling `Debug` also logs every T-SQL statement, which is verbose on a busy session; prefer
+`FABRICATOR_LOG_FILE` over the `duckdb_logs` table for anything long-running.
+
 ## Differences from the native `mssql` extension
 
 - **Transport:** C# (`Microsoft.Data.SqlClient`) in-process via CoreCLR, **not** native TDS. So:

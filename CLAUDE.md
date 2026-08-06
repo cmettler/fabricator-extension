@@ -57,6 +57,30 @@ native_filter / active·scanned·pruned files / resolved snapshot version). Logg
 suites unaffected). It immediately surfaced a pre-existing caught load-time `GetFunctionParamSchema` null-`fields`
 WARN (benign — global functions pass).
 
+**`Fabricator.Memory` — MEMORY MARKS ON THE HEAVY PATHS (2026-08-06, additive, off by default).**
+`MemoryProbe.Mark(where, rows)` (`dotnet/Fabricator.Bridge/MemoryProbe.cs`, public so any backend assembly can
+use it) logs `ws=` / `heap=` / `alloc=` / `rows=` at named points in the row-scaling paths. Enable with
+`FABRICATOR_LOG_LEVEL=Debug`; grep the `Fabricator.Memory` category. **Why it is shipped rather than a
+throwaway probe: the UPDATE grouping was built against a plausible story about where the memory went and the
+story was WRONG** (it halved the heap and moved the process peak ~11%, because the dominant term was upstream
+of the code being changed) — that was only findable by marking the working set along the path, so the marks stay.
+- **⚠ Read `ws` and `heap` TOGETHER — they answer different questions, and reporting one as the other is the
+  mistake this exists to prevent.** `heap` is what OUR allocations control and responds immediately to dropped
+  references; `ws` includes DuckDB's own side of the statement and LAGS, because the OS does not take pages back
+  when the GC frees objects. A change that halves `heap` and barely moves `ws` has bounded our share, not the
+  statement's. `alloc` is CUMULATIVE, so its DELTA between two marks is the churn a stage caused whether or not
+  it retained anything — a small heap with a huge alloc delta is a COPYING problem, not a retention one.
+- Marks today: `delta update: set values parsed (BOXED)` / `arrow batch rebuilt`; `delta update mor: rowid map
+  built` / `group flushed` / `committed`; `delta buffered update: group flushed`; `delta delete: deletion vector
+  committed` (the **no-boxing DML floor**, i.e. the control to compare an UPDATE against) / `copy-on-write
+  rewrite done`; `delta bulk: streamed to files, actions parked` / `batches PARKED until commit`;
+  `delta flush: begin`; `bulk: load complete` (the provider-agnostic bulk seam — every INSERT/CTAS/COPY on every
+  backend ends there, so it is the one mark worth comparing ACROSS backends); `mssql delete|update: rowid DML
+  complete`.
+- **⚠ Gated on `ILogger.IsEnabled` and it must stay that way** — `Environment.WorkingSet` queries OS process
+  counters, and some marks sit in per-group loops. Never compute the values before the check. Verified: hermetic
+  **66/66 — 6367** with the marks in, and an UPDATE with logging off is unchanged (3.25 s best of 5).
+
 ### Sync-over-async cleanup — DONE (convention: sync ABI wrapper blocks ONCE on an async core)
 
 The Delta bridge is FULLY converted (DeltaReader/DeltaWriter/DeltaCatalog/DeltaGlobalTableFunction);

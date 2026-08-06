@@ -2160,6 +2160,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 if (deferred is not null)
                 {
                     pending.Rows += deferredRows;
+                    MemoryProbe.Mark("delta bulk: streamed to files, actions parked", pending.Rows);
                     _log.LogInformation("delta bulk {Schema}.{Table}: buffered {Rows} row(s) for txn {Txn} (streamed files)",
                         schemaName, tableName, deferredRows, txnId);
                     return deferredRows;
@@ -2213,6 +2214,10 @@ public sealed class DeltaCatalog : IBackendCatalog
                 pending.BatchSchema ??= bschema;
                 pending.Batches.AddRange(bbatches);
                 pending.Rows += brows;
+                // The one buffered-INSERT branch that RETAINS batches until COMMIT (identity/iceberg, or a
+                // pending ALTER). Every other branch parks actions only, so this mark is where an explicit
+                // transaction's memory actually grows with rows.
+                MemoryProbe.Mark("delta bulk: batches PARKED until commit", pending.Rows);
                 _log.LogInformation("delta bulk {Schema}.{Table}: buffered {Rows} row(s) for txn {Txn} (collected batches)",
                     schemaName, tableName, brows, txnId);
                 return brows;
@@ -3242,6 +3247,9 @@ public sealed class DeltaCatalog : IBackendCatalog
             preGroup?.Clear();
             idGroup?.Clear();
             groupAccum = 0;
+            // Should be FLAT across groups. A climbing heap here means something is still retaining them —
+            // and note the park branch above retains by design, so check `eager` before calling it a leak.
+            MemoryProbe.Mark("delta buffered update: group flushed", matched);
         }
 
         // The rowids' ordinals are PINNED-version path-sort positions — read back AT that version so a
@@ -3499,6 +3507,10 @@ public sealed class DeltaCatalog : IBackendCatalog
         // Opener fresh from CommitTransaction. See docs/cancellation.md.
         using var interrupt = new InterruptScope(opener);
         var token = interrupt.Token;
+        // The high-water mark of a whole explicit transaction: everything every statement parked is still
+        // held here. pending.Batches is the term to watch — the eager-write paths leave only ACTIONS behind,
+        // so a large heap at this mark means some statement fell back to parking its batches.
+        MemoryProbe.Mark("delta flush: begin", pending.Rows);
         // Effective isolation = the TABLE's delta.isolationLevel property (cached on the buffer), NOT the
         // catalog-wide flag — so our OCC check + row-level relaxation conform to the guarantee the table
         // advertises, uniform with Spark. Absent property => WriteSerializable (Spark's default).
@@ -4196,6 +4208,12 @@ public sealed class DeltaCatalog : IBackendCatalog
         //    pass-through rows/columns move by reference. Struct SET on COLUMN-MAPPING tables still works:
         //    the rewrite applies EW's recursive ToPhysical, so the logical-named substituted struct lands
         //    in the spec nested layout.
+        // ⚠ THE MARK THAT MATTERS MOST IN THE WHOLE UPDATE PATH. This is the point the `updates` dictionary
+        // is complete, and it is where a 1M-row UPDATE has ALREADY spent more than the read-back and write
+        // will: measured 250 MB over an equivalent DELETE for ONE set column, +98 MB per additional column
+        // (~98 bytes per 8-byte value). Compare it against the marks in MergeOnReadUpdateAsync before
+        // concluding anything about where a large UPDATE's memory goes.
+        MemoryProbe.Mark("delta update: set values parsed (BOXED)", updates.Count);
         var ridBuilder = new Int64Array.Builder();
         var updColVals = new List<object?>[setColNames.Count];
         for (int j = 0; j < setColNames.Count; j++)
@@ -4226,6 +4244,7 @@ public sealed class DeltaCatalog : IBackendCatalog
             new Apache.Arrow.Schema(updFields, null), updArrays, updates.Count);
         // The catalog's ATTACH default only — the TABLE's own delta.isolationLevel outranks it, resolved inside
         // from the configuration the update path already reads (no extra _delta_log LIST).
+        MemoryProbe.Mark("delta update: arrow batch rebuilt", updates.Count);
         DeltaReader.UpdateByRowIds(opener, path, updatesBatch, default, _nativeWrite, _nativeRead,
                                    catalogSerializable: _serializable);
 

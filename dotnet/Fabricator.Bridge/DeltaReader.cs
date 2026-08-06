@@ -787,6 +787,7 @@ internal static class DeltaReader
                 .ConfigureAwait(false)).RowsDeleted;
             DmlLog.LogInformation("delta delete-rewrite {Path}: deleted={Deleted} writer={Writer}",
                 path, deleted, writer is null ? "engineered-wood" : "native-duckdb");
+            MemoryProbe.Mark("delta delete: copy-on-write rewrite done", deleted);
             return deleted;
         }
         catch (DeltaConflictException)
@@ -1162,10 +1163,15 @@ internal static class DeltaReader
         var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(), token).ConfigureAwait(false);
         try
         {
-            return (await table.DeleteRowsAsync(
+            long deleted = (await table.DeleteRowsAsync(
                     SelectionFromRowIds(table, table.CurrentSnapshot, rowIds, "deletion-vector DELETE"),
                     RowDeleteMode.DeletionVector, rowLevelRetry, token)
                 .ConfigureAwait(false)).RowsDeleted;
+            // The no-boxing DML floor, and therefore the control to compare an UPDATE against: this path
+            // carries ROWIDS ONLY across the seam. Measured 204 MB for 1M rows where the equivalent
+            // one-column UPDATE took 454 MB.
+            MemoryProbe.Mark("delta delete: deletion vector committed", deleted);
+            return deleted;
         }
         catch (DeltaConflictException ex)
         {
@@ -1707,6 +1713,7 @@ internal static class DeltaReader
             DmlLog.LogInformation("delta optimize {Path}: {Result} writer={Writer}", path,
                 v.HasValue ? $"compacted → v{v.Value}" : "nothing to compact",
                 writer is null ? "engineered-wood" : "native-duckdb");
+            MemoryProbe.Mark("delta optimize: compaction done");
             return 0;
         }
         finally
@@ -2618,6 +2625,7 @@ internal static class DeltaReader
 
         // The rows to mask — and the SAME object the transaction stages below, so the positions the read
         // resolved and the positions the commit validates cannot drift apart.
+        MemoryProbe.Mark("delta update mor: rowid map built", updRowByRid.Count);
         var selection = SelectionFromRowIds(table, snapshot, updRowByRid.Keys, "merge-on-read UPDATE");
 
         var setCols = new Dictionary<string, IArrowArray>(System.StringComparer.Ordinal);
@@ -2744,6 +2752,8 @@ internal static class DeltaReader
             preGroup?.Clear();
             idGroup?.Clear();
             groupAccum = 0;
+            // The mark that shows the grouping working: heap should be FLAT across these, not climbing.
+            MemoryProbe.Mark("delta update mor: group flushed", matched);
         }
 
         // Scoped read-back of ONLY the selected rows, with their identities as columns. Not a whole-table
@@ -2811,6 +2821,7 @@ internal static class DeltaReader
         await txn.StageRowDeletesAsync(selection, token).ConfigureAwait(false);
         await txn.StageDataFilesAsync(written, cancellationToken: token).ConfigureAwait(false);
         await txn.CommitAsync(token).ConfigureAwait(false);
+        MemoryProbe.Mark("delta update mor: committed", matched);
     }
 
     /// <summary>

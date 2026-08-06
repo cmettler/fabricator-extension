@@ -1486,6 +1486,9 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             }
         }
         Flush();
+        // Row-scaling: this path issues per-row parameterized DML on the pinned connection, so heap must
+        // NOT grow with rows. The rowid keys ARE materialized upstream, which is what the mark checks.
+        Fabricator.Bridge.MemoryProbe.Mark("mssql delete: rowid DML complete", total);
         return total;
         }
         finally
@@ -1569,6 +1572,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 Log.LogDebug("dml {Schema}.{Table}: {Sql}", schemaName, tableName, Trunc(cmd.CommandText));
             total += cmd.ExecuteNonQueryAsync(token).GetAwaiter().GetResult();
         }
+        Fabricator.Bridge.MemoryProbe.Mark("mssql update: rowid DML complete", total);
         return total;
         }
         finally
