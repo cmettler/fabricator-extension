@@ -119,3 +119,54 @@ SELECT a, b, c FROM lake2.main.defcol;
 
 statement ok
 DETACH lake2;
+
+# ---- A ROWID MATCHED MORE THAN ONCE: the UPDATE seam DEDUPLICATES, last write wins ----
+# `UPDATE … FROM src` whose join matches one target row several times sends that row's rowid down the
+# seam once per match. The seam keeps ONE value per rowid — which is why the rows are not duplicated and
+# why the reported count is the number of distinct rows, not of matches.
+# ⚠ This had NO coverage, and it is precisely what the Arrow-native parse had to preserve: the old shape
+# deduplicated implicitly through a dictionary assignment, the new one appends every match and compacts to
+# each rowid's LAST ordinal. Break that and the failure is either a DUPLICATED ROW or a lost update, both
+# silent.
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/updup' AS lake3 (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}');
+
+statement ok
+CREATE TABLE lake3.main.t AS SELECT i AS id, 0 AS a FROM range(1, 4) AS r(i);
+
+statement ok
+CREATE TEMP TABLE src (id BIGINT, v BIGINT);
+
+# id 1 and id 3 match TWICE, id 2 once.
+statement ok
+INSERT INTO src VALUES (1, 10), (1, 20), (2, 30), (3, 40), (3, 50);
+
+statement ok
+UPDATE lake3.main.t SET a = src.v FROM src WHERE lake3.main.t.id = src.id;
+
+# THE LOAD-BEARING ASSERTION: still three rows, one per id. A seam that stopped deduplicating would
+# produce five, or five post-images against three deleted rows.
+query II
+SELECT count(*), count(DISTINCT id) FROM lake3.main.t;
+----
+3	3
+
+# Each row took ONE of the values offered for its id — asserted as membership rather than as a specific
+# value, because which match arrives last is the join's business and not a guarantee we should pin.
+query I
+SELECT count(*) FROM lake3.main.t
+WHERE (id = 1 AND a IN (10, 20)) OR (id = 2 AND a = 30) OR (id = 3 AND a IN (40, 50));
+----
+3
+
+# And no row kept its pre-update value: every matched row was actually written.
+query I
+SELECT count(*) FROM lake3.main.t WHERE a = 0;
+----
+0
+
+statement ok
+DROP TABLE src;
+
+statement ok
+DETACH lake3;

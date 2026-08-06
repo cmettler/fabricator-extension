@@ -3101,12 +3101,12 @@ public sealed class DeltaCatalog : IBackendCatalog
     // read back with the SET values substituted) join the pending append batches — both flush in
     // the ONE fused commit. Rows inserted in the same transaction are rejected (later slice).
     private long BufferUpdateRows(long txnId, string path, string schemaName, string tableName,
-                                  Dictionary<long, object?[]> updates, int[] setSlotByColumn, Schema userSchema)
+                                  UpdateInput updates, int[] setSlotByColumn, Schema userSchema)
     {
         var opener = Opener();
         var profile = DeltaReader.GetTxnDmlProfile(opener, path);
         EnsureBufferedDmlEligible(profile, "UPDATE", forUpdate: true);
-        foreach (var rid in updates.Keys)
+        foreach (var rid in updates.RowByRid.Keys)
         {
             if ((TransientRowAddress.FileOrdinal(rid)) >= PendingOrdinalBase)
             {
@@ -3257,7 +3257,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         // Both out-lists are drained per batch (their producer only ever appends, never reads them back), so
         // the rowids and source tracking do not accumulate across the statement either.
         var ridsPerBatch = new List<long[]>();
-        foreach (var raw in DeltaReader.ReadRowsByRowIds(opener, path, updates.Keys, default,
+        foreach (var raw in DeltaReader.ReadRowsByRowIds(opener, path, updates.RowByRid.Keys, default,
                      atVersion: pending.PinnedVersion, sourceTrackingOut: srcTracking,
                      rowIdsOut: ridsPerBatch))
         {
@@ -3280,8 +3280,10 @@ public sealed class DeltaCatalog : IBackendCatalog
                 for (int i = 0; i < batch.Length; i++)
                 {
                     long rid = i < rids.Length ? rids[i] : -1;
-                    values.Add(updates.TryGetValue(rid, out var nv)
-                        ? nv[slot]
+                    // The SET value now comes out of the parsed Arrow batch rather than a retained box; the
+                    // read is the same ReadScalarDeep call, one row at a time, nothing held.
+                    values.Add(updates.RowByRid.TryGetValue(rid, out int ur)
+                        ? updates.Value(ur, slot)
                         : ArrowValueReader.ReadScalarDeep(batch.Column(c), i));
                 }
                 newCols[c] = BuildArray(fields[c].DataType, values);
@@ -4092,53 +4094,137 @@ public sealed class DeltaCatalog : IBackendCatalog
     // Drains the UPDATE stream — SET-column values (cols 0..setColumnCount-1, named by the target column) plus
     // the transient _metadata.row_id (last column) — into (SET column names, rowid -> new SET values). The stream
     // consumption is the sole async step of ExecuteUpdate, isolated here so the rewrite logic stays synchronous.
-    private static (List<string> SetColNames, Dictionary<long, object?[]> Updates) ParseUpdateStream(
-        IArrowArrayStream data, int setColumnCount)
+    /// <summary>
+    /// The drained UPDATE stream, held in ARROW form: one batch of <c>[SET columns …, rowid]</c> carrying each
+    /// surviving row exactly once, plus the rowid → row map both consumers correlate by.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>This used to be a <c>Dictionary&lt;long, object?[]&gt;</c> of BOXED values, and that was the
+    /// UPDATE's single largest memory term.</b> Measured at 1M rows on one table: a DELETE, which carries
+    /// rowids and no SET values, peaks at 204 MB; the same rows through a one-SET-column UPDATE peaked at
+    /// 454 MB and a three-column one at 651 MB — i.e. ~98 MB per additional SET column per 1M rows, or
+    /// ~98 BYTES to carry an 8-byte value. That is a boxed <c>long</c> (24 B) plus an <c>object?[]</c> per row
+    /// (~32 B) plus a dictionary entry plus a second copy into a <c>List&lt;object?&gt;</c> before
+    /// <c>BuildArray</c> rebuilt it as Arrow anyway.</para>
+    /// <para><b>⚠ The incoming chunks CANNOT simply be retained</b> — <c>DeltaWriter.Materialize</c> does a full
+    /// Arrow IPC round-trip for exactly this reason ("the source batches may be freed after consumption"), and
+    /// the old <c>ReadScalarDeep</c> here was documented as deep-copying because the batch is disposed right
+    /// after. So each chunk is copied ONCE into independent buffers with
+    /// <see cref="EngineeredWood.Arrow.ArrowCompute.Take(RecordBatch, Schema, System.Collections.Generic.List{int})"/>,
+    /// and the copies are joined with <see cref="ArrowArrayConcatenator"/> at the end.</para>
+    /// <para><b>Dedupe is preserved and is not cosmetic:</b> the old dictionary assignment was last-write-wins,
+    /// reachable through <c>UPDATE … FROM other</c> whose join matches one target row twice, and it also sets
+    /// the statement's REPORTED row count. Appends cannot overwrite, so every row is appended, the map keeps
+    /// each rowid's LAST ordinal, and one final <c>Take</c> compacts to the survivors.</para>
+    /// </remarks>
+    private sealed class UpdateInput : System.IDisposable
+    {
+        internal List<string> SetColNames = new();
+        /// <summary>SET columns 0..n-1 then the rowid — the incoming layout, one row per surviving rowid.</summary>
+        internal RecordBatch? Values;
+        /// <summary>rowid → its row in <see cref="Values"/>.</summary>
+        internal Dictionary<long, int> RowByRid = new();
+        internal int Count => RowByRid.Count;
+
+        /// <summary>One SET value, boxed on demand. Same call the old parse made eagerly for every value of
+        /// every row — the difference is that nothing retains the result.</summary>
+        internal object? Value(int row, int setSlot)
+            => ArrowValueReader.ReadScalarDeep(Values!.Column(setSlot), row);
+
+        public void Dispose() => Values?.Dispose();
+    }
+
+    private static UpdateInput ParseUpdateStream(IArrowArrayStream data, int setColumnCount)
         => ParseUpdateStreamAsync(data, setColumnCount).GetAwaiter().GetResult();
 
-    private static async Task<(List<string> SetColNames, Dictionary<long, object?[]> Updates)> ParseUpdateStreamAsync(
+    private static async Task<UpdateInput> ParseUpdateStreamAsync(
         IArrowArrayStream data, int setColumnCount)
     {
-        var setColNames = new List<string>();
-        var updates = new Dictionary<long, object?[]>();
-        using (data)
+        var input = new UpdateInput();
+        var copies = new List<RecordBatch>();
+        var rids = new List<long>();
+        // rowid -> its ordinal across the concatenated copies; last occurrence wins, as the old dictionary did.
+        var ordinalByRid = new Dictionary<long, int>();
+        Schema? schema = null;
+        try
         {
-            RecordBatch? b;
-            while ((b = await data.ReadNextRecordBatchAsync().ConfigureAwait(false)) is not null)
+            using (data)
             {
-                using (b)
+                RecordBatch? b;
+                while ((b = await data.ReadNextRecordBatchAsync().ConfigureAwait(false)) is not null)
                 {
-                    if (b.Length == 0)
+                    using (b)
                     {
-                        continue;
-                    }
-                    if (setColNames.Count == 0)
-                    {
-                        for (int j = 0; j < setColumnCount; j++)
-                        {
-                            setColNames.Add(b.Schema.FieldsList[j].Name);
-                        }
-                    }
-                    var ridArr = (Int64Array)b.Column(setColumnCount);
-                    for (int i = 0; i < b.Length; i++)
-                    {
-                        if (ridArr.GetValue(i) is not { } rid)
+                        if (b.Length == 0)
                         {
                             continue;
                         }
-                        var vals = new object?[setColumnCount];
-                        for (int j = 0; j < setColumnCount; j++)
+                        if (input.SetColNames.Count == 0)
                         {
-                            // Deep variant: a STRUCT SET value becomes a Dictionary (deep-copied — the batch
-                            // is disposed after this loop).
-                            vals[j] = ArrowValueReader.ReadScalarDeep(b.Column(j), i);
+                            for (int j = 0; j < setColumnCount; j++)
+                            {
+                                input.SetColNames.Add(b.Schema.FieldsList[j].Name);
+                            }
+                            schema = b.Schema;
                         }
-                        updates[rid] = vals;
+                        var ridArr = (Int64Array)b.Column(setColumnCount);
+                        // Rows whose rowid is NULL are dropped, exactly as the old `continue` did — so the copy
+                        // is a Take of the surviving positions rather than of the whole chunk.
+                        var keep = new List<int>(b.Length);
+                        for (int i = 0; i < b.Length; i++)
+                        {
+                            if (ridArr.GetValue(i) is not { } rid)
+                            {
+                                continue;
+                            }
+                            ordinalByRid[rid] = rids.Count;
+                            rids.Add(rid);
+                            keep.Add(i);
+                        }
+                        if (keep.Count > 0)
+                        {
+                            // The independent copy. Take allocates new buffers, so this survives the chunk's
+                            // disposal on the next line — which retaining `b` itself would not.
+                            copies.Add(EngineeredWood.Arrow.ArrowCompute.Take(b, b.Schema, keep));
+                        }
                     }
                 }
             }
+            if (copies.Count == 0 || schema is null)
+            {
+                return input;
+            }
+
+            // Compact to the surviving rows: the ordinals of the LAST occurrence of each rowid, and the map
+            // the consumers correlate by is built over the compacted positions.
+            var survivors = new List<int>(ordinalByRid.Count);
+            foreach (var kv in ordinalByRid)
+            {
+                input.RowByRid[kv.Key] = survivors.Count;
+                survivors.Add(kv.Value);
+            }
+
+            var columns = new IArrowArray[schema.FieldsList.Count];
+            for (int c = 0; c < columns.Length; c++)
+            {
+                var slices = new IArrowArray[copies.Count];
+                for (int k = 0; k < copies.Count; k++)
+                {
+                    slices[k] = copies[k].Column(c);
+                }
+                var joined = copies.Count == 1 ? slices[0] : ArrowArrayConcatenator.Concatenate(slices);
+                columns[c] = EngineeredWood.Arrow.ArrowCompute.Take(joined, survivors);
+            }
+            input.Values = new RecordBatch(schema, columns, survivors.Count);
+            return input;
         }
-        return (setColNames, updates);
+        finally
+        {
+            foreach (var c in copies)
+            {
+                c.Dispose();
+            }
+        }
     }
 
     public long ExecuteUpdate(string schemaName, string tableName, int setColumnCount, IArrowArrayStream data)
@@ -4146,9 +4232,12 @@ public sealed class DeltaCatalog : IBackendCatalog
         var opener = Opener();
         var path = TablePath(schemaName, tableName);
 
-        // 1. Parse the update stream: rowid -> new SET values (aligned to the SET column order). The stream
-        // drain is the sole async step, isolated in the helper so the rewrite logic below stays synchronous.
-        var (setColNames, updates) = ParseUpdateStream(data, setColumnCount);
+        // 1. Parse the update stream into ARROW: one compacted batch of [SET columns…, rowid] plus the
+        // rowid -> row map. The stream drain is the sole async step, isolated in the helper so the rewrite
+        // logic below stays synchronous. Disposed at the end of the statement — see UpdateInput for why the
+        // incoming chunks are copied rather than retained.
+        using var updates = ParseUpdateStream(data, setColumnCount);
+        var setColNames = updates.SetColNames;
         if (updates.Count == 0)
         {
             return 0;
@@ -4184,9 +4273,10 @@ public sealed class DeltaCatalog : IBackendCatalog
             {
                 continue;
             }
-            foreach (var kv in updates)
+            for (int r = 0; r < updates.Count; r++)
             {
-                DeltaNullability.ValidateSetValue(kv.Value[j], targetField, tableName);
+                // Boxed for the duration of the check only — the value is not retained anywhere.
+                DeltaNullability.ValidateSetValue(updates.Value(r, j), targetField, tableName);
             }
         }
 
@@ -4208,35 +4298,31 @@ public sealed class DeltaCatalog : IBackendCatalog
         //    pass-through rows/columns move by reference. Struct SET on COLUMN-MAPPING tables still works:
         //    the rewrite applies EW's recursive ToPhysical, so the logical-named substituted struct lands
         //    in the spec nested layout.
-        // ⚠ THE MARK THAT MATTERS MOST IN THE WHOLE UPDATE PATH. This is the point the `updates` dictionary
-        // is complete, and it is where a 1M-row UPDATE has ALREADY spent more than the read-back and write
-        // will: measured 250 MB over an equivalent DELETE for ONE set column, +98 MB per additional column
-        // (~98 bytes per 8-byte value). Compare it against the marks in MergeOnReadUpdateAsync before
-        // concluding anything about where a large UPDATE's memory goes.
-        MemoryProbe.Mark("delta update: set values parsed (BOXED)", updates.Count);
-        var ridBuilder = new Int64Array.Builder();
-        var updColVals = new List<object?>[setColNames.Count];
-        for (int j = 0; j < setColNames.Count; j++)
-        {
-            updColVals[j] = new List<object?>(updates.Count);
-        }
-        foreach (var kv in updates)
-        {
-            ridBuilder.Append(kv.Key);
-            for (int j = 0; j < setColNames.Count; j++)
-            {
-                updColVals[j].Add(kv.Value[j]);
-            }
-        }
+        MemoryProbe.Mark("delta update: set values parsed", updates.Count);
         var updFields = new List<Field>(setColNames.Count + 1)
         {
             new Field(RowIdColumn, Int64Type.Default, nullable: false),
         };
-        var updArrays = new List<IArrowArray>(setColNames.Count + 1) { ridBuilder.Build() };
+        // The rowid column IS the parsed batch's last column, already compacted to the surviving rows and in
+        // the order RowByRid indexes — so it is reused rather than rebuilt. Only its FIELD is restated (the
+        // name the consumers look it up by); an array carries no name of its own.
+        var updArrays = new List<IArrowArray>(setColNames.Count + 1)
+        {
+            updates.Values!.Column(setColNames.Count),
+        };
         for (int j = 0; j < setColNames.Count; j++)
         {
             var field = setSlotField[j];
-            updArrays.Add(BuildArray(field.DataType, updColVals[j]));
+            // ⚠ ONE column's values are boxed at a time and dropped before the next, rather than every value
+            // of every row being boxed up front and held. BuildArray's TARGET-TYPE conversion is preserved
+            // exactly — an incoming array of a different width or unit is still converted through the boxed
+            // value — which is why the incoming Arrow column is not simply handed through here.
+            var vals = new List<object?>(updates.Count);
+            for (int r = 0; r < updates.Count; r++)
+            {
+                vals.Add(updates.Value(r, j));
+            }
+            updArrays.Add(BuildArray(field.DataType, vals));
             // Keep the field metadata: the ew.variant_transport transport marker must ride the SET column.
             updFields.Add(new Field(field.Name, field.DataType, nullable: true, field.Metadata));
         }

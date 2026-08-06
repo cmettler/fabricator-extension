@@ -1843,18 +1843,36 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
       ~250 MB → ~50 MB for the one-column case. It is a DML-SEAM change (`ParseUpdateStream` /
       `ExecuteUpdate` / `BufferUpdateRows`), not a Delta one; `ExternalTableRouting` also calls
       `ExecuteUpdate`, so check that path too.
-      - **⚠ THREE CONSTRAINTS FOUND WHILE SCOPING IT, all of which make the naive version wrong.**
-        (1) **`EngineeredWood.Arrow.ArrowCompute` has `Take` but NO Concat**, so "retain the incoming batches
-        and gather across them" needs a new helper or a per-batch append; the incoming stream is ~2048-row
-        chunks, so a 1M-row UPDATE is ~500 batches and a single-batch special case buys nothing.
-        (2) **`updates[rid] = vals` DEDUPLICATES by rowid, last-write-wins** — reachable via
+      - **⚠ THE CONSTRAINTS FOUND WHILE SCOPING IT, all of which make the naive version wrong.**
+        (1) **⚠ THE INCOMING BATCHES CANNOT BE RETAINED — this is the one that decides the design, and it is
+        already established in this codebase.** `DeltaWriter.Materialize` does a full Arrow **IPC round-trip**
+        (write every batch to a `MemoryStream`, read them back) precisely because *"the source batches may be
+        freed after consumption"*; and `ParseUpdateStream`'s own `ReadScalarDeep` is documented as deep-copying
+        because *"the batch is disposed after this loop"*. So "keep the chunks and address rows inside them" is
+        a use-after-free, not an optimisation. The cheap independent copy is
+        `ArrowCompute.Take(batch, schema, identityIndices)`, which allocates new buffers.
+        (2) **⚠ A CLAIM RECORDED HERE WAS FALSE AND IS CORRECTED: `Apache.Arrow.ArrowArrayConcatenator.Concatenate`
+        EXISTS and is public** (engineered-wood uses it in six places, e.g. `DeltaTable.cs:6509`,
+        `LanceFileReader`, `VortexFileReader`). The earlier note said there was no Concat — that came from
+        reading `EngineeredWood.Arrow.ArrowCompute`'s surface, which has `Take`/`Widen`/`MakeNullArray` and no
+        concat, and generalising from ONE class to the whole Arrow surface. It is the same backwards-search
+        error the tier-1 notes warn about: **a grep that finds nothing has only established where you looked.**
+        With Concat available, the per-chunk copies can be joined into one array per column and the design does
+        NOT need a bespoke gather helper.
+        (3) **`updates[rid] = vals` DEDUPLICATES by rowid, last-write-wins** — reachable via
         `UPDATE … FROM other` whose join matches a target row twice — and it also sets the statement's
-        REPORTED row count. Builders cannot overwrite an earlier append, so the replacement has to append
-        everything, keep rowid → LAST ordinal, and compact with one `Take` at the end.
-        (3) **⚠ The boxing is currently also doing a TYPE CONVERSION**: `BuildArray(field.DataType, values)`
+        REPORTED row count. Appends cannot overwrite, so the replacement must append everything, keep
+        rowid → LAST ordinal, and compact with one `Take` at the end.
+        (4) **⚠ The boxing is currently also doing a TYPE CONVERSION**: `BuildArray(field.DataType, values)`
         rebuilds each SET column at the TARGET column's type, so an incoming array of a different width or
         unit is silently converted through the boxed value. Reusing the incoming Arrow array directly changes
-        that behaviour — the conversion has to be kept explicitly, or the seam must guarantee the types match.
+        that behaviour. Cheapest faithful answer: reuse Arrow only where the incoming type EQUALS the target
+        type, and keep the boxed rebuild for that column otherwise — behaviour-preserving where it matters and
+        free in the common case.
+      - **Shape that follows from (1)–(4):** per chunk, `Take` an independent compact copy and record
+        rid → packed (chunk, row); at the end `Concatenate` per column and apply ONE `Take` with the surviving
+        ordinals — which yields `updatesBatch` DIRECTLY, so `ExecuteUpdate` stops rebuilding it and
+        `BufferUpdateRows` reads its values from that batch instead of from boxes.
   - **⚠ THE ALL-OR-NOTHING ROW-ID RULE HAD TO MOVE EARLIER, and that is the one semantic consequence.** A
     group is written before the later groups' ids are known, so "every selected row resolved a stable id" can
     no longer be decided after the read-back. It is now decided BEFORE it, from the files: the read-back yields
