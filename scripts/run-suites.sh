@@ -126,7 +126,7 @@ case "$TIER" in
         # FLUSH. It is the one suite the runner gives a forced env var (see the case below), because the
         # grouping's threshold is 64 MiB of Arrow data and nothing else here comes near it Ã¢ÂÂ without this
         # suite the grouped path has NO coverage at all, at either tier.
-        : "${MIN_SUITES:=66}"
+        : "${MIN_SUITES:=67}"
         # 5656 since 2026-08-02: verify_delta_catalog_transactions 943 -> 944 Ã¢ÂÂ ROLLBACK now RECLAIMS the
         # data files the transaction eagerly wrote (EW #52's DiscardDataFilesAsync) instead of leaving them
         # for VACUUM. +2, not +1: that suite is one of the DOUBLED ones below, so an assertion added to it
@@ -210,7 +210,7 @@ case "$TIER" in
         # The section pins the codec engine deliberately: under native_write DuckDB's COPY writes the data
         # files, so EW's ParquetWriteOptions never apply and the assertion would pass for the wrong reason.
         # Mutation-tested — reverting the spec on EnsureHeldTableAsync fails at exactly the CDF assertion.
-        : "${MIN_ASSERTIONS:=6403}"
+        : "${MIN_ASSERTIONS:=6513}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
@@ -408,6 +408,20 @@ while IFS="$(printf '\t')" read -r suite provider; do
     case "$suite" in
         *verify_delta_update_grouped.test) export FABRICATOR_DELTA_UPDATE_GROUP_BYTES=1 ;;
         *) unset FABRICATOR_DELTA_UPDATE_GROUP_BYTES ;;
+    esac
+
+    # THE BATCHED NATIVE DELTA READ likewise needs its threshold forced, for the mirror-image reason.
+    # DeltaNativeReader.BatchPlan collapses a scan's deletion-vector-free files into ONE read_parquet from
+    # 2 files up, so the shipped default IS exercised by every other delta suite here; what would go
+    # untested is the batched path on a ONE-file scan, which is the shape most suites actually build. This
+    # suite Ã¢ÂÂ and only this one Ã¢ÂÂ runs at 1, so every scan in it batches whatever is expressible, and
+    # its gated sections (deletion vectors, rowid DML, partition columns, row tracking, id-mode mapping)
+    # exercise the fallback in the same process. The unset is load-bearing the same way as above, with an
+    # extra edge: a stray 0 in the developer's shell DISABLES batching everywhere, so a green run would be
+    # testing only the old per-file loop while looking like full coverage.
+    case "$suite" in
+        *verify_delta_batched_read.test) export FABRICATOR_DELTA_BATCH_MIN_FILES=1 ;;
+        *) unset FABRICATOR_DELTA_BATCH_MIN_FILES ;;
     esac
 
     output=$("$UNITTEST" --test-dir . "$suite" 2>&1)

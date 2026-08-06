@@ -1312,6 +1312,27 @@ setting (see [Partitioning & write tuning](#partitioning--write-tuning)).
 | `mssql_order_pushdown` | Accepted | No-op — TopN is pushed automatically when safe (always-on, not gated) |
 | `mssql_copy_tablock`, `mssql_copy_flush_rows`, `mssql_ctas_use_bcp`, `mssql_convert_varchar_max`, `mssql_catalog_cache_ttl` | Accepted | No-op |
 
+### Delta read tuning
+
+The Delta provider's native read path (`native_read`, on by default for `PROVIDER 'delta'`) is tuned by
+environment variables rather than `SET`, because they are read below the session:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `FABRICATOR_DELTA_BATCH_MIN_FILES` | `2` | From this many files up, a scan reads its **deletion-vector-free** files in ONE `read_parquet([…])` instead of one query per file. `0` disables batching (every file gets its own query); `1` batches even a single-file scan |
+| `FABRICATOR_DELTA_PREFETCH` | `1` | How many per-file queries run concurrently. `1` is sequential; higher values overlap cloud I/O, which is where they pay |
+
+Batching matters most on a **fragmented** table — the shape an incremental dbt model grows, since every run
+appends a file. It removes roughly 1.5–2 ms of per-file overhead, so on 200 files × 100 rows a scan goes from
+0.46 s to 0.09 s, while on a table where decoding dominates the difference is proportionally smaller. Results
+are identical either way; if you ever need to check that, run the same query with
+`FABRICATOR_DELTA_BATCH_MIN_FILES=0`.
+
+Files that carry a deletion vector keep their own query on purpose: it lets the reader bound the surviving row
+positions and skip whole parquet row groups, which a single combined query cannot express. A few other shapes
+also stay per-file and need no action from you — `UPDATE`/`DELETE` (they need a per-row position), partition
+columns, the `__delta_row_id` / `__delta_row_commit_version` columns, and tables using `column_mapping 'id'`.
+
 ## Diagnostic logging
 
 Logging is **off by default** and configured by environment variables, not by `SET` — the bridge boots before

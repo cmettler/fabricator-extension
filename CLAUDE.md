@@ -1888,6 +1888,110 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   INSERTs re-apply the ORDER BY via a host-side spilling sort. verify_delta_sorted_by 30. Full as-built record (moved verbatim from here): [docs/feature-history.md](docs/feature-history.md).
 - **dbt DAX→Delta pipeline — DONE + validated live** (`dbt_dax_test/`, gitignored; plain-DAX model bodies
   via the custom `dax_table` materialization). Full as-built record (moved verbatim from here): [docs/feature-history.md](docs/feature-history.md).
+- **THE BATCHED NATIVE DELTA READ — DONE 2026-08-06 (C#-only, no ABI). One `read_parquet([f1, f2, …],
+  schema = map {…})` replaces the per-file host query for the files it can cover** (`DeltaNativeReader.BatchPlan`);
+  everything else keeps the existing loop, file by file. Threshold `FABRICATOR_DELTA_BATCH_MIN_FILES`, default 2,
+  `0` disables. Gates: hermetic **67/67 — 6513** (the pre-change tier was 66/6403 and every shared suite kept its
+  exact assertion count ⇒ behaviour-preserving), new suite `verify_delta_batched_read` **110**, and
+  service **45/45 — 1583** — which matters beyond regression coverage: `verify_delta_catalog_s3`
+  (177 × 2 engine legs) is the only leg that puts the batched `read_parquet([…])` on **`s3://`** URIs
+  rather than local paths.
+  - **MEASURED, both legs run through our own scan with the env var flipped** (the only honest A/B, see below):
+    **200 files × 100 rows 0.464 s → 0.090 s (5.2x)**; 200 files × 20k rows 0.794 → 0.493; 50 files × 20k rows
+    0.211 → 0.123. That is **~1.5–1.9 ms of overhead removed per file**, consistent across all three, so the
+    RELATIVE win tracks how FRAGMENTED the table is rather than how big — i.e. it lands on the dbt-incremental
+    shape (every run appends a file) that motivated it.
+  - **⚠ A 13x FIGURE THIS FILE'S PREDECESSOR NOTE CARRIED IS WITHDRAWN — IT WAS CONFOUNDED, and the confound is
+    architectural rather than a slip.** It put our scan (412 ms) against DuckDB reading the same files in ONE
+    plan (31 ms). That plan AGGREGATES IN PLACE; our scan must hand every row back across the Arrow boundary for
+    DuckDB to aggregate above it. So 31 ms was a FLOOR no batching can reach, not an alternative — and the
+    residual after batching is exactly that hand-back, which is inherent to the native-read design. **Lesson in
+    one line: a comparison against a plan that does not carry your data is not a comparison.**
+    - ⚠ **The replacement measurement nearly repeated the mistake in a new disguise.** The first batched-vs-plain
+      timing said `schema` cost 10x (21 ms vs 2 ms) — because the probe's `count(s)` was answered from parquet
+      NULL COUNTS without decoding the column at all. With a real decode forced (`sum(length(s))`), `schema`
+      costs **nothing measurable**: 18–27 ms with the map vs 21–33 ms hand-aliased. **A parquet aggregate that
+      the footer can answer is not a read.**
+    - ⚠ **And an attribution I nearly wrote up was wrong too**: `SELECT … LIMIT 0` costs 19 ms where the same
+      scan costs 274 ms, which I read as "the Delta log replay is cheap, so the residual is elsewhere". `LIMIT 0`
+      never executes the scan, so it measures nothing about it. The snapshot-construction cost is still
+      unmeasured here — do NOT cite this work as evidence either way for
+      [delta-snapshot-caching](docs/delta-snapshot-caching.md).
+  - **THE `schema` PARAMETER'S SEMANTICS, pinned by experiment because the docs are thin and several plausible
+    readings are wrong.** `schema = map { <key>: {'name': …, 'type': …, 'default_value': …} }`: the **MAP KEY is
+    the identifier** (VARCHAR ⇒ match by name, INTEGER ⇒ `BY_FIELD_ID`), **`'name'` is the OUTPUT name** — so it
+    performs the physical→logical rename for us — `'type'` casts per file, a column ABSENT from a file arrives as
+    `default_value` (**that is the schema-evolution backfill, and it is what makes the per-file footer probe
+    unnecessary** — the probe was ~1.6 ms of the per-file cost), and a column present in the file but absent from
+    the map is IGNORED (the post-`DROP COLUMN` read). A non-NULL default really lands, not just NULL.
+  - **⚠ FOUR MEASURED LIMITS, and they are what shape the gates. Two fail LOUDLY and two SILENTLY.**
+    1. **`filename` / `file_row_number` compose with an INTEGER-keyed map and FAIL with a VARCHAR-keyed one** —
+       `Invalid Input Error: … column "2147483645" … could not be found`, i.e. the virtual column's sentinel id
+       resolved by NAME. Since every shape needing a row position (the transient rowid, a deletion vector, a
+       derived row-tracking id) needs `file_row_number`, **that single incompatibility is why the batch covers
+       plain scans only.**
+    2. **An INTEGER-keyed map over a file with NO parquet field ids is `INTERNAL Error: No default expression in
+       FieldId Map`** (a DuckDB assertion, so also a candidate to report upstream). Name mode does not require a
+       writer to stamp field ids, so field-id keys are not a free substitute for case 1.
+    3. **`schema` is REFUSED together with `hive_partitioning`** (`Binder Error`), so partition literals cannot
+       ride along — they need a `filename` join, which needs case 1's field-id keys.
+    4. **⚠ STRUCT INTERIORS ARE MATCHED BY NAME AND THEN CAST — the silent one.** Children `(a, b)` where one
+       file renamed only `b`: the batch returned **`{'a': 20, 'b': NULL}`**, the value DROPPED, exit 0. FULLY
+       disjoint children DO error (*STRUCT to STRUCT cast must have at least one matching member*), so **partial
+       overlap is the dangerous shape and partial overlap is exactly what one rename produces.**
+  - **⚠ ITEM 3 OF THE STANDING LIST IS NOW MEASURED, AND IT IS A DIFFERENT HAZARD FROM CASE 4 ABOVE — worse.**
+    A `UNION ALL` route (which `FullTableSql` uses for the clustered-OPTIMIZE rewrite) merges struct interiors BY
+    NAME and NULL-fills what a branch lacks, so the same two files yield ONE struct carrying **both** names with
+    half the values NULL: `{'a':…,'b':…,'col-b':NULL}` / `{'a':…,'b':NULL,'col-b':…}`. The output TYPE is wrong
+    too, not just the values. So the two routes are unsafe in different ways and neither can be fixed by the
+    per-batch `ArrowColumnMappingRename`, which runs after the SQL. `FullTableSql`'s doc now records this at the
+    gate that protects it.
+  - **THE GATES, and one of them must NOT be described as tested.** Batched: plain scans, incl. the zero-column
+    `COUNT(*)` shape (its own branch, no map at all — nothing is read, so mapping/evolution/types cannot matter).
+    Per-file: the transient rowid / DML, any file carrying a **deletion vector** (decided PER FILE, so a
+    merge-heavy table still collapses its clean files and the DV file keeps its prunable position bound),
+    partition columns, the row-tracking virtual columns, a rowid/tracking fast-path filter, variant, and
+    `column_mapping 'id'`.
+    - **⚠ THE ID-MODE GATE IS A *CONTRACT* GATE AND NO TEST CAN KILL IT — a mutant with it removed passes the
+      whole suite, and I nearly wrote it up as mutation-tested.** The batch resolves by NAME while id mode's
+      contract is that a reader matches by FIELD ID and the stored name is not authoritative (a legacy
+      engineered-wood id file stores LOGICAL names under its field ids; an external writer may do either) — so a
+      name-keyed map meeting such a file silently yields an ALL-NULL column, or case 4's dropped members.
+      **MEASURED why no test reproduces it: an id-mode table taken through a nested RENAME *and* a top-level
+      RENAME has all four of its files storing BYTE-IDENTICAL physical names** — in id mode too, `physicalName` is
+      assigned once at column creation. Keep the gate because name-matching a table whose contract is id-matching
+      is unsound for files WE DID NOT WRITE, and say exactly that rather than implying a bug was reproduced.
+    - **⚠ AND THE DEFAULT COLUMN-MAPPING MODE IS `name`, NOT `id`** — measured off the `metaData` of a plain
+      `PROVIDER 'delta'` create. `verify_delta_catalog_column_mapping`'s own header says *"DEFAULT = 'id'"* and is
+      STALE. It matters here and not academically: were `id` the default, the gate above would disable batching
+      for nearly every table and this feature would be inert out of the box.
+  - **WHAT RETIRES THE ID-MODE GATE, concretely: duckdb/duckdb #24407** — *"extend the `schema` option to support
+    NESTED schema definitions"* (Tishj), **OPEN against `main`** as of 2026-08-06. Declaring a struct's children
+    with their own identifiers is precisely what lets one declared type describe files of two vintages. ⚠ It
+    targets `main`, so it lands on the FUTURE line, not `v1.5-variegata` — the gate stands here regardless.
+  - **⚠ ONE REAL CODE REQUIREMENT WAS FOUND BY RUNNING THE SUITES, NOT BY READING.** `schema` renames the TOP
+    level only, so a mapped struct's interior arrives PHYSICAL — and a pushed struct-member predicate then fails
+    to bind (`Binder Error: Could not find key "b" in struct`, caught by `verify_delta_catalog_nested_alter`,
+    which is also the reason the per-file path has `RebuildExpr`). Fixed by `LogicalStructExpr`: ONE `struct_pack`
+    rebuild serves every file, because name mode's physical names are file-independent. Note the two suites that
+    caught it reported PARTIAL assertion counts while broken (26 and 156, vs 100 and 251 when passing) — an
+    aborted suite's count is not a coverage number.
+  - **Mutation-tested, each mutant killed at its own section**: removing the struct rebuild dies at the
+    struct-member predicate (§3, the binder error above); removing the DV split dies at §4 with the exact
+    resurrection (**300 rows where 290 survive** — the 10 deleted rows back). The id-mode mutant SURVIVES, per
+    the note above.
+  - **⚠ The suite is run at `FABRICATOR_DELTA_BATCH_MIN_FILES=1` by `run-suites.sh`, and the reason is the MIRROR
+    IMAGE of the UPDATE-grouping case.** Here the shipped default (2) IS exercised by every other delta suite, so
+    what would go untested is the batched path on a ONE-file scan — the shape most suites actually build. The
+    `unset` for every other suite is load-bearing in an extra direction too: a stray `0` in a developer's shell
+    DISABLES batching everywhere, so a green tier would be testing only the old loop while looking complete.
+  - **STILL OPEN, in the order the win would arrive:** (1) the rowid / DV / partition / row-tracking shapes, all
+    of which need `filename`-keyed per-file metadata joined in SQL — **`filename` was verified to echo the exact
+    string passed in the list**, so the join key is stable, but a mismatch would silently DROP that file's rows,
+    so it needs a `LEFT JOIN` + an `error()` on an unmatched file rather than an inner join; (2) id mode, once
+    #24407 lands; (3) `FullTableSql`'s inlined DV literals (unchanged — still the documented
+    `WITH … AS MATERIALIZED` fix). And the residual per-row cost is the Arrow hand-back, which no batching
+    touches.
 - **THE UPDATE POST-IMAGE GROUPED FLUSH — DONE 2026-08-06 (C#-only, no ABI). ⚠ IT DOES NOT FIX "UPDATE
   MEMORY", AND THE MEASUREMENT SAYING SO IS THE MOST USEFUL THING HERE.** Both UPDATE paths
   (`DeltaReader.MergeOnReadUpdateAsync` autocommit, `DeltaCatalog.BufferUpdateRows` buffered) used to

@@ -32,34 +32,29 @@ namespace Fabricator.Bridge;
 /// (superset-safe; DuckDB re-applies every predicate above the scan), so a partial WHERE only forfeits pruning.
 /// Dynamic (join) filter pushdown at this decision point is a later slice (a live-filter host callback).</para>
 ///
-/// <para>⚠ THE LOOP IS EXPENSIVE, AND THE ALTERNATIVE IS NOW KNOWN TO BE EXPRESSIBLE — measured 2026-08-06.
-/// One <c>Host.Query</c> PER FILE costs ~8 ms of overhead each: on a 50-file / 1M-row table the marginal scan
-/// time is 412 ms (289 ms at prefetch 16) where DuckDB reading the same files in ONE plan does the work in
-/// 31 ms — <b>13x</b>. It scales with FILE COUNT, and dbt makes file count grow (every incremental run appends
-/// one), so an un-compacted table pays ~1.6 s of pure overhead per scan at 200 files however few rows it
-/// returns. Attributed: ~1.60 ms is a SECOND host query per file (<see cref="ProbeFileNodes"/> via
-/// <see cref="ResolveFileMapping"/>) and ~2.45 ms the data query; the rest is Arrow import, unisolated.</para>
+/// <para><b>THE PER-FILE LOOP IS NOT THE ONLY PATH ANY MORE (2026-08-06).</b> One <c>Host.Query</c> per file
+/// costs real fixed overhead, and it scales with FILE COUNT — which dbt grows, since every incremental run
+/// appends one — so <see cref="BatchPlan"/> collapses the files it can into ONE
+/// <c>read_parquet([f1, f2, …], schema = map {…})</c> and leaves the rest here. MEASURED, same rows and same
+/// answers either way (<c>FABRICATOR_DELTA_BATCH_MIN_FILES=0</c> disables it, which is how both legs were
+/// timed): <b>200 files x 100 rows: 0.464 s → 0.090 s (5.2x)</b>; 200 files x 20k rows:
+/// 0.794 s → 0.493 s; 50 files x 20k rows: 0.211 s → 0.123 s. Consistently <b>~1.5–1.9 ms of overhead removed
+/// per file</b>, which is why the relative win tracks how FRAGMENTED the table is rather than how big it is —
+/// the fragmented-small-file shape is the dbt-incremental one this exists for.</para>
 ///
-/// <para>What makes the single call viable is <c>read_parquet</c>'s <c>schema</c> parameter, whose semantics
-/// were pinned by experiment (the DuckDB docs are thin and two plausible guesses were wrong):
-/// <c>schema = map { &lt;identifier&gt;: {'name': …, 'type': …, 'default_value': …} }</c>, where the identifier is
-/// the MAP KEY, not a struct field. An INTEGER key switches the reader to <c>BY_FIELD_ID</c>
-/// (<c>parquet_multi_file_info.cpp</c>), a VARCHAR key matches by name. Verified in one call over a file list:
-/// a column ABSENT from an older file arrives as its <c>default_value</c> (schema evolution), a column stored
-/// under DIFFERENT physical names in different files is matched by field id (id-mode column mapping — the
-/// probe's whole reason to exist), <c>type</c> casts per file (which is how DuckLake does column-type
-/// evolution), and <c>filename</c> + <c>file_row_number</c> still compose — so the deletion vector becomes ONE
-/// bound input anti-joined on <c>(filename, pos)</c>.</para>
+/// <para>⚠ <b>A 13x figure previously recorded here was CONFOUNDED and is withdrawn.</b> It compared our scan
+/// (412 ms) against DuckDB reading the same files in one plan (31 ms) — but that plan AGGREGATES in place,
+/// while we must hand every row back across the Arrow boundary for DuckDB to aggregate above the scan. It was
+/// a floor no batching can reach, not an alternative. The honest comparison is our own scan with batching on
+/// vs off, above. (A second version of the same mistake nearly replaced it: the first batched-vs-plain timing
+/// said <c>schema</c> cost 10x, because the probe query's <c>count(s)</c> was answered from parquet null counts
+/// without decoding anything. With a real decode forced, <c>schema</c> costs NOTHING measurable — 18–27 ms vs
+/// 21–33 ms hand-aliased.)</para>
 ///
-/// <para>So the probe is removable rather than merely batchable, and the loop collapses for the common case.
-/// What a single call still CANNOT express, and therefore keeps a per-branch <c>UNION ALL</c> or this loop:
-/// partition literals (<c>schema</c> is REFUSED together with <c>hive_partitioning</c>) and per-file
-/// <c>baseRowId</c> row-tracking expressions. ⚠ And a <c>UNION ALL</c> route carries a SILENT hazard: DuckDB
-/// unions STRUCT interiors BY NAME, filling absent fields with NULL, so two files whose struct children carry
-/// different physical names yield one merged struct with both and half the values NULL — no error. The
-/// per-batch <see cref="ArrowColumnMappingRename"/> runs too late to repair that, so any union path must
-/// normalise struct child names IN SQL per branch, and needs a gate covering an id-mode table with a renamed
-/// NESTED field read across old and new files (nothing covers that today).</para>
+/// <para>The loop still owns every shape a single call cannot express — the transient rowid, deletion vectors,
+/// partition literals, per-file <c>baseRowId</c> row tracking, per-file pruning predicates, and id-mode column
+/// mapping. Each of those is a numbered, measured case on <see cref="BatchPlan"/>; read them there before
+/// widening the gate, because two of them fail SILENTLY rather than loudly.</para>
 /// </summary>
 internal static class DeltaNativeReader
 {
@@ -182,17 +177,295 @@ internal static class DeltaNativeReader
                 listing = WithFiles(listing, kept);
             }
         }
-        var schema = ProbeSchema(listing, userSchema, dataCols, wantRowId);
+        // Collapse the DV-free files into ONE read_parquet([…]) where that is expressible (see BatchPlan.Build);
+        // whatever is left keeps the per-file loop unchanged.
+        var batch = BatchPlan.Build(listing, dataCols, wantRowId, where, rowIdFilter, trackingFilter);
+        var loopFiles = batch?.LoopFiles ?? listing.Files;
+        var schema = ProbeSchema(listing, userSchema, dataCols, wantRowId, batch);
         int prefetch = Prefetch();
 
         Log.LogInformation(
-            "delta native scan {Path}: v{Version} files={Files} cols=[{Cols}] rowid={RowId} where=[{Where}] prefetch={Prefetch} colmap={Map}",
-            path, listing.Version, listing.Files.Count, string.Join(",", dataCols), wantRowId, where ?? "", prefetch,
+            "delta native scan {Path}: v{Version} files={Files} batched={Batched} cols=[{Cols}] rowid={RowId} where=[{Where}] prefetch={Prefetch} colmap={Map}",
+            path, listing.Version, listing.Files.Count, batch?.Files.Count ?? 0, string.Join(",", dataCols),
+            wantRowId, where ?? "", prefetch,
             listing.LogicalToPhysical is not null ? "name" : listing.LogicalToFieldId is not null ? "id" : "none");
 
         return new AsyncEnumerableArrowStream(
-            schema, StreamFiles(listing, dataCols, wantRowId, where, prefetch, rowIdFilter, trackingFilter));
+            schema,
+            StreamFiles(listing, loopFiles, batch, dataCols, wantRowId, where, prefetch, rowIdFilter, trackingFilter));
     }
+
+    /// <summary>
+    /// ONE <c>read_parquet([f1, f2, …])</c> standing in for the per-file loop over the files it covers — the
+    /// answer to the ~8 ms-per-file host-query overhead documented on this class. MEASURED on a 50-file /
+    /// 1M-row / 4-column table, warm, summing every column (so nothing is answered from footer metadata):
+    /// <b>0.211 s through the per-file loop vs 0.021 s batched — 10x</b>, and the <c>schema</c> parameter
+    /// itself costs nothing (18–27 ms batched with the map vs 21–33 ms for a plain multi-file read aliased by
+    /// hand, i.e. indistinguishable).
+    /// <para>⚠ The naive version of that comparison said <c>schema</c> was 10x SLOWER than a plain read (21 ms
+    /// vs 2 ms). It was measuring nothing: the probe query's <c>count(s)</c> was answered from parquet null
+    /// counts without decoding the column. Force a real decode (<c>sum(length(s))</c>) before believing any
+    /// number here.</para>
+    /// <para><b>What makes it expressible is <c>read_parquet</c>'s <c>schema</c> parameter</b>, whose semantics
+    /// were pinned by experiment (the docs are thin and several plausible readings are wrong) —
+    /// <c>schema = map { &lt;key&gt;: {'name': …, 'type': …, 'default_value': …} }</c>:
+    /// the MAP KEY is the identifier (VARCHAR ⇒ match by name, INTEGER ⇒ <c>BY_FIELD_ID</c>), <c>'name'</c> is
+    /// the OUTPUT name — so it performs the physical→logical rename for us — <c>'type'</c> casts per file, a
+    /// column absent from a file arrives as <c>default_value</c> (that is the schema-evolution backfill, and it
+    /// makes the per-file footer probe unnecessary), and a column present in the file but absent from the map is
+    /// ignored (that is the post-DROP-COLUMN read).</para>
+    /// <para><b>⚠ The gates below are not caution, they are measured limits.</b> Each one is a shape where a
+    /// single call is either refused or — worse — silently wrong:</para>
+    /// <list type="number">
+    /// <item><b>Virtual columns force field-id keys.</b> <c>filename</c> / <c>file_row_number</c> compose with
+    /// an INTEGER-keyed map but FAIL with a VARCHAR-keyed one (<c>Invalid Input Error: … column "2147483645" …
+    /// could not be found</c> — the virtual column's sentinel id resolved by name). Everything needing a
+    /// position (the transient rowid, a deletion vector, a derived row-tracking id) needs
+    /// <c>file_row_number</c>, so those shapes stay on the loop here. And field-id keys are not a free
+    /// substitute: a file carrying NO parquet field ids raises <c>INTERNAL Error: No default expression in
+    /// FieldId Map</c>, and name mode does not require a writer to stamp them.</item>
+    /// <item><b>ID-mode column mapping is a CONTRACT gate, and the honest statement of it is narrower than it
+    /// first looks.</b> This path resolves columns by NAME (the map key), while id mode's contract is that a
+    /// reader matches by FIELD ID and the stored name is <i>not</i> authoritative — a legacy engineered-wood
+    /// id-mode file stores LOGICAL names under its field ids where a current one stores <c>col-&lt;guid&gt;</c>,
+    /// and an external writer is free to do either. A name-keyed map meeting such a file finds nothing and hands
+    /// back <c>default_value</c>: a silently ALL-NULL column, or for a struct interior a partial-overlap cast
+    /// that DROPS the members it did not match. Both measured directly on <c>read_parquet</c> — children (a, b)
+    /// with only b renamed gave <c>{'a': 20, 'b': NULL}</c>, no error; fully disjoint children DO error
+    /// (<i>STRUCT to STRUCT cast must have at least one matching member</i>), so partial overlap is the
+    /// dangerous shape and partial overlap is what one rename produces.
+    /// <para>⚠ <b>But OUR OWN writers never produce the divergence, so no test here can kill this gate, and it
+    /// must not be described as if one did.</b> MEASURED: an id-mode table taken through a nested RENAME and then
+    /// a top-level RENAME has all four of its files storing BYTE-IDENTICAL physical names — the physicalName is
+    /// assigned once at column creation in id mode exactly as in name mode. A mutant with this gate removed
+    /// therefore passes the whole suite. It is kept because name-matching a table whose contract is
+    /// id-matching is unsound for files we did not write, not because a reachable bug was reproduced.</para>
+    /// NAME mode needs no such gate: there the physical name IS authoritative and stable across renames, which
+    /// is the reason the mode exists.</item>
+    /// <item><b>Partition values are per file and absent from the data files</b>, so a single call would
+    /// backfill them as <c>default_value</c> NULL. Reaching them needs a <c>filename</c> join, which needs case
+    /// 1's field-id keys.</item>
+    /// <item><b>A per-file predicate cannot be expressed</b> — the deletion vector's prunable bound, the rowid's
+    /// position range, the row-tracking condition. Those are pruning, not correctness (DuckDB re-applies every
+    /// predicate above the scan), but forfeiting them is the opposite of the point, so a scan that has one keeps
+    /// the loop. The deletion vector is the one that is decided PER FILE: DV-carrying files go to the loop and
+    /// keep their bound while the rest batch, so a merge-heavy table still collapses its clean files.</item>
+    /// </list>
+    /// <para><b>What retires case 2 (and it is a concrete upstream change, not a hope):</b> duckdb/duckdb
+    /// <b>#24407</b> — "extend the <c>schema</c> option to support NESTED schema definitions", by Tishj, OPEN
+    /// against <c>main</c> as of 2026-08-06. Declaring a struct's children with their own identifiers is exactly
+    /// what makes one declared type describe files of two vintages, so id mode + structs becomes expressible
+    /// and the silent NULL-fill above stops being reachable. It targets <c>main</c>, so it lands on the future
+    /// line, not <c>v1.5-variegata</c> — the gate stands here regardless.</para>
+    /// <para>⚠ One exposure shared with the loop rather than introduced here: the batch CASTs to the CURRENT
+    /// Delta type while the loop reads each file's stored type as-is, so a type-WIDENED table can advertise one
+    /// type and stream another. That is already true of the loop across vintages (<c>typeWidening</c> is
+    /// untested, see CLAUDE.md); a mixed batch+loop scan does not make it worse, but it is the shape to check
+    /// first if widening is ever wired up.</para>
+    /// </summary>
+    internal sealed class BatchPlan
+    {
+        internal BatchPlan(string sql, IReadOnlyList<DeltaReader.NativeScanFile> files,
+                           IReadOnlyList<DeltaReader.NativeScanFile> loopFiles)
+        {
+            Sql = sql;
+            Files = files;
+            LoopFiles = loopFiles;
+        }
+
+        /// <summary>The single query covering <see cref="Files"/>.</summary>
+        internal string Sql { get; }
+
+        /// <summary>The files the one query reads.</summary>
+        internal IReadOnlyList<DeltaReader.NativeScanFile> Files { get; }
+
+        /// <summary>The files that still need their own per-file query (they carry a deletion vector).</summary>
+        internal IReadOnlyList<DeltaReader.NativeScanFile> LoopFiles { get; }
+
+        /// <summary>Files below this count are not worth batching — kept on the proven per-file path.
+        /// <c>FABRICATOR_DELTA_BATCH_MIN_FILES=0</c> disables batching entirely (which is how a suite pins the
+        /// per-file pruning behaviour), and 1 forces it wherever it is expressible.</summary>
+        private static int MinFiles()
+        {
+            var text = Environment.GetEnvironmentVariable("FABRICATOR_DELTA_BATCH_MIN_FILES");
+            return !string.IsNullOrWhiteSpace(text) && int.TryParse(text, NumberStyles.Integer,
+                                                                    CultureInfo.InvariantCulture, out var n) && n >= 0
+                ? n
+                : 2;
+        }
+
+        /// <summary>Returns the plan, or null when this scan's shape is not expressible as one call (every
+        /// reason is a numbered case in the class remarks).</summary>
+        internal static BatchPlan? Build(
+            DeltaReader.NativeScanList listing, IReadOnlyList<string> dataCols, bool wantRowId, string? where,
+            DeltaRowIdFilter? rowIdFilter, DeltaRowTrackingFilter? trackingFilter)
+        {
+            int min = MinFiles();
+            if (min == 0 || listing.Files.Count == 0)
+            {
+                return null;
+            }
+            // Case 1 + 4: anything needing file_row_number, or carrying a per-file predicate.
+            if (wantRowId || rowIdFilter is not null || trackingFilter is not null)
+            {
+                return null;
+            }
+            foreach (var c in dataCols)
+            {
+                if (string.Equals(c, RowTrackingIdColumn, StringComparison.Ordinal)
+                    || string.Equals(c, RowTrackingVersionColumn, StringComparison.Ordinal))
+                {
+                    return null; // case 1: a derived stable id is baseRowId + file_row_number
+                }
+            }
+            // The DV-free files batch; the rest keep the loop (and their prunable bound — case 4).
+            var batchFiles = new List<DeltaReader.NativeScanFile>(listing.Files.Count);
+            var loopFiles = new List<DeltaReader.NativeScanFile>();
+            foreach (var f in listing.Files)
+            {
+                (f.Dv.Length == 0 ? batchFiles : loopFiles).Add(f);
+            }
+            if (batchFiles.Count < min)
+            {
+                return null;
+            }
+
+            string source = "read_parquet([" + string.Join(", ", batchFiles.Select(f => Literal(f.Uri))) + "]";
+            var sb = new StringBuilder("SELECT ");
+            if (dataCols.Count == 0)
+            {
+                // The zero-column shape (COUNT(*)): no column is read, so mapping / evolution / types cannot
+                // matter and no schema map is needed — which also means id mode and partition columns are
+                // irrelevant here. A filter would have to bind a column the projection does not name, so
+                // require none (DuckDB projects a filtered column anyway, making this unreachable in practice).
+                if (where is not null)
+                {
+                    return null;
+                }
+                sb.Append("1 FROM ").Append(source).Append(')');
+                return new BatchPlan(sb.ToString(), batchFiles, loopFiles);
+            }
+
+            if (listing.TableSchema is null || listing.LogicalToFieldId is not null)
+            {
+                return null; // case 2: no schema to declare, or id-mode column mapping
+            }
+            // Whether to key the map by the PHYSICAL name at all. PhysicalName reads field metadata without
+            // regard to the table's mapping MODE, so this is what stops a table whose mode is 'none' but whose
+            // schema still carries physicalName metadata from being keyed physically against files that store
+            // logical names — which would read as an all-NULL column with no error. The listing's own two maps
+            // are the mode evidence (LogicalToPhysical is top-level-only and null when no top-level name
+            // differs, so MappedSchema has to be consulted too for a table where only a NESTED name does).
+            bool nameMapped = listing.LogicalToPhysical is not null || listing.MappedSchema is not null;
+            var entries = new List<string>(dataCols.Count);
+            var inner = new List<string>(dataCols.Count);
+            bool needsInner = false;
+            foreach (var c in dataCols)
+            {
+                if (listing.PartitionColumns.Count > 0 && ContainsName(listing.PartitionColumns, c))
+                {
+                    return null; // case 3
+                }
+                var field = FindField(listing.TableSchema, c);
+                if (field is null)
+                {
+                    return null; // unknown column: let the loop's own resolution answer for it
+                }
+                string stored = nameMapped ? PhysicalName(field) : field.Name;
+                string type;
+                try
+                {
+                    type = PhysicalTypeText(field.Type, nameMapped);
+                }
+                catch (NotSupportedException)
+                {
+                    return null; // no CAST-target rendering (variant, or a type we do not map) — loop it
+                }
+                entries.Add($"{Literal(stored)}: {{'name': {Literal(c)}, 'type': {Literal(type)}, "
+                            + "'default_value': NULL}");
+                // `schema` renames only the TOP level, so a mapped struct's interior arrives physical. Rebuild it
+                // with logical member names in SQL — not for cosmetics: a pushed struct-member predicate
+                // (`(s).b IS NULL`) binds against this projection, and without the rebuild it fails to bind
+                // (`Could not find key "b" in struct`, caught by verify_delta_catalog_nested_alter). Same reason
+                // the per-file path has RebuildExpr. No presence check is needed here — the declared type already
+                // NULL-fills members a file predates.
+                var rebuilt = nameMapped ? LogicalStructExpr(field.Type, Quote(c)) : null;
+                inner.Add(rebuilt is null ? Quote(c) : $"{rebuilt} AS {Quote(c)}");
+                needsInner |= rebuilt is not null;
+            }
+            string projection = string.Join(", ", dataCols.Select(Quote));
+            string scan = source + ", schema = map {" + string.Join(", ", entries) + "})";
+            // The WHERE goes ABOVE the rebuild so it binds logical names at every level (the per-file path's
+            // outer-WHERE contract).
+            sb.Append(projection).Append(" FROM ")
+              .Append(needsInner ? $"(SELECT {string.Join(", ", inner)} FROM {scan})" : scan);
+            if (!string.IsNullOrEmpty(where))
+            {
+                sb.Append(" WHERE ").Append(where);
+            }
+            return new BatchPlan(sb.ToString(), batchFiles, loopFiles);
+        }
+
+        private static string Literal(string s) => "'" + s.Replace("'", "''") + "'";
+    }
+
+    // The PHYSICAL (in-file) name of a top-level or nested field under NAME-mode column mapping: the declared
+    // physicalName, else the logical name (no mapping). Deliberately does NOT consult field ids — BatchPlan
+    // gates id mode out precisely because that answer is per-file.
+    private static string PhysicalName(DeltaSchema.StructField field)
+        => field.Metadata is { } md
+           && md.TryGetValue(DeltaSchema.ColumnMapping.PhysicalNameKey, out var phys)
+           && !string.IsNullOrEmpty(phys)
+            ? phys
+            : field.Name;
+
+    // Rebuilds a mapped struct with LOGICAL member names for the batched read, or null when nothing at any depth
+    // needs renaming (so the caller can skip the wrapping projection entirely). The physical-name lookup is the
+    // schema's declared physicalName, which is FILE-INDEPENDENT in name mode — that is the whole reason one
+    // expression can serve every file here where the per-file path needs a per-file FileMapping. The CASE keeps a
+    // NULL struct NULL (struct_pack alone would materialize a non-NULL struct of NULLs). List/map element structs
+    // pass through with physical interiors, exactly as RebuildExpr leaves them: no struct-member predicate can
+    // reach inside a list/map, and ArrowColumnMappingRename fixes the names per batch.
+    private static string? LogicalStructExpr(DeltaSchema.DeltaDataType type, string src)
+    {
+        if (type is not DeltaSchema.StructType st || st.Fields.Count == 0)
+        {
+            return null;
+        }
+        var parts = new List<string>(st.Fields.Count);
+        bool changed = false;
+        foreach (var ch in st.Fields)
+        {
+            string phys = PhysicalName(ch);
+            changed |= !string.Equals(phys, ch.Name, StringComparison.Ordinal);
+            string childSrc = $"({src}).{Quote(phys)}";
+            var nested = LogicalStructExpr(ch.Type, childSrc);
+            changed |= nested is not null;
+            parts.Add($"{Quote(ch.Name)} := {nested ?? childSrc}");
+        }
+        return changed
+            ? $"CASE WHEN {src} IS NULL THEN NULL ELSE struct_pack({string.Join(", ", parts)}) END"
+            : null;
+    }
+
+    // TypeText's sibling for the batched read's CAST target: struct member names are the PHYSICAL ones, because
+    // `schema` matches a struct's interior BY NAME against what the file stores and only the top level is
+    // renamed by 'name'. Nested logical names are restored per batch by ArrowColumnMappingRename, exactly as on
+    // the per-file path (which likewise projects physical struct children and renames afterwards).
+    private static string PhysicalTypeText(DeltaSchema.DeltaDataType type, bool nameMapped) => type switch
+    {
+        DeltaSchema.StructType st => "STRUCT(" + string.Join(
+            ", ", st.Fields.Select(f =>
+                $"{Quote(nameMapped ? PhysicalName(f) : f.Name)} {PhysicalTypeText(f.Type, nameMapped)}")) + ")",
+        DeltaSchema.ArrayType at => PhysicalTypeText(at.ElementType, nameMapped) + "[]",
+        DeltaSchema.MapType mt =>
+            $"MAP({PhysicalTypeText(mt.KeyType, nameMapped)}, {PhysicalTypeText(mt.ValueType, nameMapped)})",
+        // A variant column's logical type is the registered extension type, not a CAST target the parquet
+        // reader can be handed — refuse rather than guess (BatchPlan falls back to the per-file path).
+        DeltaSchema.PrimitiveType { TypeName: "variant" } => throw new NotSupportedException(
+            "delta native batched read: variant columns are read per file."),
+        _ => TypeText(type),
+    };
 
     // Merges the transaction's pending-DELETEd positions into the per-file DV exclusion lists (positions
     // keyed by the same pinned-snapshot global ordinal the listing carries).
@@ -623,6 +896,15 @@ internal static class DeltaNativeReader
     /// single query it can ORDER BY globally (DuckDB's spilling sort) and feed straight into a COPY —
     /// zero boundary crossings for the data. NOT usable for nested MAPPED columns (the per-batch
     /// <see cref="ArrowColumnMappingRename"/> has no hook inside one SQL statement — callers gate).
+    /// <para>⚠ That gate is load-bearing and the failure is SILENT — MEASURED 2026-08-06. <c>UNION ALL</c> merges
+    /// STRUCT INTERIORS BY NAME and NULL-fills what a branch lacks, so two files storing a struct child under
+    /// different physical names yield ONE struct carrying BOTH names with half the values NULL, and no error:
+    /// on children (a, b) where one file renamed only b, the union produced
+    /// <c>{'a': …, 'b': …, 'col-b': NULL}</c> / <c>{'a': …, 'b': NULL, 'col-b': …}</c>. Note this is the union's
+    /// OWN hazard, distinct from (and worse than) the cast-based one <see cref="BatchPlan"/> documents: the
+    /// output TYPE is wrong too. Any future union route must normalise struct child names IN SQL per branch —
+    /// which for NAME mode is what <see cref="LogicalStructExpr"/> already does, since physical names there are
+    /// file-independent; for ID mode it needs upstream #24407.</para>
     /// <para>⚠ This form passes NO <c>dvView</c>, so it still INLINES deletion-vector positions as literals
     /// and keeps the cost characterised on <see cref="DvLiteralMax"/> (~0.4 ms + ~1.2 KB per deleted row).
     /// That is deliberate, not an oversight: it unions many files into ONE query, so a single bound input
@@ -647,8 +929,18 @@ internal static class DeltaNativeReader
     // Advertises the EXACT read_parquet output schema (probed via LIMIT 0 over any active file), so the streamed
     // batches match by type. With no files, derives it from the user schema (+ the rowid field).
     private static Schema ProbeSchema(DeltaReader.NativeScanList listing, Schema userSchema,
-                                      IReadOnlyList<string> dataCols, bool wantRowId)
+                                      IReadOnlyList<string> dataCols, bool wantRowId, BatchPlan? batch)
     {
+        if (batch is not null)
+        {
+            // Probe the BATCH's own SQL: it is the one query that must agree with the advertised schema, and
+            // probing it costs no footer read (the whole point of the `schema` map) where the per-file probe
+            // below pays ResolveFileMapping.
+            using var bs = Host.Query(batch.Sql + " LIMIT 0");
+            return listing.MappedSchema is { } bms
+                ? ArrowColumnMappingRename.RenameSchema(bs.Schema, bms, toPhysical: false)
+                : bs.Schema;
+        }
         if (listing.AnyUri is { } probe)
         {
             var probeFile = new DeltaReader.NativeScanFile(0, probe, System.Array.Empty<long>());
@@ -686,11 +978,12 @@ internal static class DeltaNativeReader
     }
 
     private static async IAsyncEnumerable<RecordBatch> StreamFiles(
-        DeltaReader.NativeScanList listing, IReadOnlyList<string> dataCols, bool wantRowId, string? where,
+        DeltaReader.NativeScanList listing, IReadOnlyList<DeltaReader.NativeScanFile> loopFiles,
+        BatchPlan? batch, IReadOnlyList<string> dataCols, bool wantRowId, string? where,
         int prefetch, DeltaRowIdFilter? rowIdFilter = null, DeltaRowTrackingFilter? trackingFilter = null,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
-        if (listing.Files.Count == 0)
+        if (loopFiles.Count == 0 && batch is null)
         {
             yield break;
         }
@@ -703,13 +996,51 @@ internal static class DeltaNativeReader
             SingleWriter = prefetch == 1,
         });
         var writer = channel.Writer;
+        // Drains one query's batches into the channel, restoring nested logical names on the way (the top level
+        // is already logical — the per-file SELECT aliases it, the batch's `schema` map renames it).
+        async Task DrainAsync(IArrowArrayStream stream)
+        {
+            using var s = stream;
+            while (true)
+            {
+                var b = await s.ReadNextRecordBatchAsync(ct).ConfigureAwait(false);
+                if (b is null)
+                {
+                    break;
+                }
+                if (listing.MappedSchema is { } ms)
+                {
+                    b = ArrowColumnMappingRename.RenameBatch(b, ms, toPhysical: false);
+                }
+                await writer.WriteAsync(b, ct).ConfigureAwait(false);
+            }
+        }
+
         var pump = Task.Run(async () =>
         {
             using var sem = new SemaphoreSlim(prefetch);
-            var tasks = new List<Task>(listing.Files.Count);
+            var tasks = new List<Task>(loopFiles.Count + 1);
             try
             {
-                foreach (var f in listing.Files)
+                if (batch is not null)
+                {
+                    // The batched files as ONE query, alongside (not before) the loop's — it takes a prefetch
+                    // slot like any other unit of work, so a table with both kinds still overlaps them.
+                    await sem.WaitAsync(ct).ConfigureAwait(false);
+                    Log.LogDebug("delta native batch: {Sql}", batch.Sql);
+                    tasks.Add(Task.Run(async () =>
+                    {
+                        try
+                        {
+                            await DrainAsync(Host.Query(batch.Sql)).ConfigureAwait(false);
+                        }
+                        finally
+                        {
+                            sem.Release();
+                        }
+                    }, ct));
+                }
+                foreach (var f in loopFiles)
                 {
                     await sem.WaitAsync(ct).ConfigureAwait(false);
                     var file = f;
@@ -739,22 +1070,7 @@ internal static class DeltaNativeReader
                                               listing.PartitionColumns, rowIdFilter?.PositionCondition(file.Ordinal),
                                               trackingCond, dvView: DvViewName);
                             Log.LogDebug("delta native file: {Sql}", sql);
-                            using var s = QueryFile(sql, file);
-                            while (true)
-                            {
-                                var b = await s.ReadNextRecordBatchAsync(ct).ConfigureAwait(false);
-                                if (b is null)
-                                {
-                                    break;
-                                }
-                                // Nested mapped fields: rename physical struct-child names back to logical
-                                // (zero-copy type-tree rewrap; top level already logical via the SELECT alias).
-                                if (listing.MappedSchema is { } ms)
-                                {
-                                    b = ArrowColumnMappingRename.RenameBatch(b, ms, toPhysical: false);
-                                }
-                                await writer.WriteAsync(b, ct).ConfigureAwait(false);
-                            }
+                            await DrainAsync(QueryFile(sql, file)).ConfigureAwait(false);
                         }
                         finally
                         {

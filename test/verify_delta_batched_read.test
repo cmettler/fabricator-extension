@@ -1,0 +1,331 @@
+# name: test/verify_delta_batched_read.test
+# description: The BATCHED native Delta read (DeltaNativeReader.BatchPlan) — the DV-free files of a scan collapse
+#              into ONE read_parquet([...], schema = map {...}) instead of one host query per file, which is worth
+#              ~1.5-1.9 ms of overhead per file (200 files x 100 rows: 0.464 s -> 0.090 s). This suite is run with
+#              FABRICATOR_DELTA_BATCH_MIN_FILES=1 by scripts/run-suites.sh so even a one-file scan takes the batched
+#              path — at the shipped default (2) most of it would silently test the per-file loop instead. Pins the
+#              answers the batch must reproduce (schema evolution, name-mode column mapping incl. a RENAMEd NESTED
+#              field, a pushed struct-member predicate, COUNT(*)) AND that every gated shape still works: deletion
+#              vectors, the transient rowid / DML, partition columns, row-tracking virtual columns, id-mode mapping.
+#              Set FABRICATOR_DELTA_WRITE_DIR. Local FS.
+# group: [fabricator]
+
+require fabricator
+
+require parquet
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+# ============================================================================
+# 1. MANY FILES, ONE QUERY — the equivalence the whole feature rests on.
+#    Six separate INSERTs => six data files, all deletion-vector-free => all batched.
+# ============================================================================
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/br' AS b (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE b.main.many AS SELECT i::BIGINT AS id, (i % 7)::INTEGER AS k, ('v' || i)::VARCHAR AS s FROM range(100) r(i);
+
+statement ok
+INSERT INTO b.main.many SELECT i::BIGINT, (i % 7)::INTEGER, ('v' || i)::VARCHAR FROM range(100, 200) r(i);
+
+statement ok
+INSERT INTO b.main.many SELECT i::BIGINT, (i % 7)::INTEGER, ('v' || i)::VARCHAR FROM range(200, 300) r(i);
+
+statement ok
+INSERT INTO b.main.many SELECT i::BIGINT, (i % 7)::INTEGER, ('v' || i)::VARCHAR FROM range(300, 400) r(i);
+
+statement ok
+INSERT INTO b.main.many SELECT i::BIGINT, (i % 7)::INTEGER, ('v' || i)::VARCHAR FROM range(400, 500) r(i);
+
+statement ok
+INSERT INTO b.main.many SELECT i::BIGINT, (i % 7)::INTEGER, ('v' || i)::VARCHAR FROM range(500, 600) r(i);
+
+# Six files, so this really is the multi-file shape and not a one-file scan wearing its clothes.
+query I
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/br/many/*.parquet');
+----
+6
+
+query IIII
+SELECT count(*), sum(id), sum(k), count(DISTINCT s) FROM b.main.many;
+----
+600	179700	1795	600
+
+# Every row exactly once — a batch that read a file twice, or dropped one, shows up here and nowhere else.
+query I
+SELECT count(*) FROM (SELECT id FROM b.main.many GROUP BY id HAVING count(*) <> 1);
+----
+0
+
+# The zero-column shape (COUNT(*)) takes its own branch: no schema map at all, since no column is read.
+query I
+SELECT count(*) FROM b.main.many;
+----
+600
+
+# A pushed filter binds LOGICAL names above the batch (the map's 'name' has already renamed them).
+query II
+SELECT count(*), sum(id) FROM b.main.many WHERE k = 3 AND id > 100;
+----
+72	25164
+
+query IT
+SELECT id, s FROM b.main.many WHERE id IN (0, 250, 599) ORDER BY id;
+----
+0	v0
+250	v250
+599	v599
+
+# ============================================================================
+# 2. SCHEMA EVOLUTION ACROSS VINTAGES — `schema`'s default_value IS the backfill,
+#    which is what makes the per-file footer probe unnecessary.
+# ============================================================================
+
+statement ok
+ALTER TABLE b.main.many ADD COLUMN extra BIGINT;
+
+statement ok
+INSERT INTO b.main.many SELECT i::BIGINT, 1, 'new', (i * 10)::BIGINT FROM range(600, 620) r(i);
+
+# The five pre-ALTER files have no `extra` column at all; they must read as NULL, not fail to bind.
+query III
+SELECT count(*), count(extra), sum(extra) FROM b.main.many;
+----
+620	20	121900
+
+query I
+SELECT count(*) FROM b.main.many WHERE extra IS NULL;
+----
+600
+
+# ============================================================================
+# 3. NAME-MODE COLUMN MAPPING WITH A NESTED STRUCT, INCLUDING A RENAMED MEMBER.
+#    This is the case the batch gets right only because it rebuilds the struct with
+#    LOGICAL member names in SQL: `schema` renames the TOP level only, so without the
+#    rebuild a pushed struct-member predicate cannot bind (Binder Error: Could not find
+#    key "..." in struct) and the advertised interior is physical.
+#    Safe in NAME mode precisely because a rename changes the logical name and never the
+#    physical one, so old and new files agree — id mode is gated off instead (section 7).
+# ============================================================================
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/brnm' AS nm (TYPE fabricator, PROVIDER 'delta', column_mapping 'name');
+
+statement ok
+CREATE TABLE nm.main.nested AS SELECT 1 AS id, {'a': 10, 'b': 11} AS s;
+
+statement ok
+INSERT INTO nm.main.nested VALUES (2, {'a': 20, 'b': 21});
+
+statement ok
+INSERT INTO nm.main.nested VALUES (3, {'a': 30, 'b': 31});
+
+# The parquet really does store physical names — otherwise this section proves nothing about mapping.
+query I
+SELECT count(*) FROM parquet_schema('${FABRICATOR_DELTA_WRITE_DIR}/brnm/nested/*.parquet') WHERE name IN ('id', 's', 'a', 'b');
+----
+0
+
+query III
+SELECT id, (s).a, (s).b FROM nm.main.nested ORDER BY id;
+----
+1	10	11
+2	20	21
+3	30	31
+
+# A pushed struct-member predicate over the batch: it binds the rebuilt LOGICAL interior.
+query I
+SELECT id FROM nm.main.nested WHERE (s).b = 21;
+----
+2
+
+query I
+SELECT count(*) FROM nm.main.nested WHERE (s).b IS NULL;
+----
+0
+
+# RENAME the nested member, then append — old and new files now disagree on the LOGICAL name while agreeing
+# on the physical one. Every row must still read under the new name.
+statement ok
+ALTER TABLE nm.main.nested RENAME COLUMN s.b TO renamed;
+
+statement ok
+INSERT INTO nm.main.nested VALUES (4, {'a': 40, 'renamed': 41});
+
+query III
+SELECT id, (s).a, (s).renamed FROM nm.main.nested ORDER BY id;
+----
+1	10	11
+2	20	21
+3	30	31
+4	40	41
+
+query I
+SELECT id FROM nm.main.nested WHERE (s).renamed = 31;
+----
+3
+
+# ============================================================================
+# 4. DELETION VECTORS — decided PER FILE: the DV-carrying file keeps its own query (and
+#    its prunable bound), the clean files batch. If the split were dropped the deleted
+#    rows would come back, so this is the section that catches it.
+# ============================================================================
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/brdv' AS dv (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE dv.main.t AS SELECT i::BIGINT AS id FROM range(100) r(i);
+
+statement ok
+INSERT INTO dv.main.t SELECT i::BIGINT FROM range(100, 200) r(i);
+
+statement ok
+INSERT INTO dv.main.t SELECT i::BIGINT FROM range(200, 300) r(i);
+
+# Deletes only inside the FIRST file, so the scan is genuinely mixed: one DV file + two clean ones.
+statement ok
+DELETE FROM dv.main.t WHERE id < 10;
+
+query II
+SELECT count(*), sum(id) FROM dv.main.t;
+----
+290	44805
+
+query I
+SELECT count(*) FROM dv.main.t WHERE id < 10;
+----
+0
+
+query I
+SELECT min(id) FROM dv.main.t;
+----
+10
+
+# A second delete, this time spanning files, so more than one file leaves the batch.
+statement ok
+DELETE FROM dv.main.t WHERE id % 50 = 0;
+
+query II
+SELECT count(*), sum(id) FROM dv.main.t;
+----
+285	44055
+
+query I
+SELECT count(*) FROM dv.main.t WHERE id % 50 = 0;
+----
+0
+
+# ============================================================================
+# 5. THE TRANSIENT ROWID AND DML — gated off the batch (it needs file_row_number, which
+#    a name-keyed `schema` map refuses). Asserted because a gate that silently made DML
+#    wrong would otherwise look exactly like a gate that works.
+# ============================================================================
+
+statement ok
+UPDATE dv.main.t SET id = id + 100000 WHERE id = 11;
+
+query I
+SELECT count(*) FROM dv.main.t WHERE id = 100011;
+----
+1
+
+query I
+SELECT count(*) FROM dv.main.t WHERE id = 11;
+----
+0
+
+statement ok
+DELETE FROM dv.main.t WHERE id = 100011;
+
+query II
+SELECT count(*), sum(id) FROM dv.main.t;
+----
+284	44044
+
+# ============================================================================
+# 6. PARTITION COLUMNS AND ROW-TRACKING VIRTUAL COLUMNS — both gated (their values are
+#    per file and absent from / derived outside the data files).
+# ============================================================================
+
+statement ok
+CREATE TABLE b.main.parts (id BIGINT, p VARCHAR) PARTITIONED BY (p);
+
+statement ok
+INSERT INTO b.main.parts SELECT i::BIGINT, 'p' || (i % 3) FROM range(30) r(i);
+
+statement ok
+INSERT INTO b.main.parts SELECT i::BIGINT, 'p' || (i % 3) FROM range(30, 60) r(i);
+
+query IT
+SELECT count(*), p FROM b.main.parts GROUP BY p ORDER BY p;
+----
+20	p0
+20	p1
+20	p2
+
+query II
+SELECT count(*), sum(id) FROM b.main.parts WHERE p = 'p1';
+----
+20	590
+
+# Row tracking is on by default for tables we create; the stable id is derived per file from baseRowId.
+query II
+SELECT count(*), count(DISTINCT __delta_row_id) FROM b.main.many;
+----
+620	620
+
+query I
+SELECT count(*) FROM b.main.many WHERE __delta_row_id IS NULL;
+----
+0
+
+# ============================================================================
+# 7. ID-MODE COLUMN MAPPING — gated off the batch, and this section is a POSITIVE CONTROL
+#    only: it cannot kill the gate and does not pretend to. The batch resolves columns by
+#    NAME while id mode's contract is that the reader matches by FIELD ID, so a legacy
+#    engineered-wood file (LOGICAL names under its field ids) or any external writer that
+#    names differently would silently read NULL. But MEASURED: our own writers keep the
+#    physical name byte-identical across renames in id mode too, so no table this suite can
+#    build exhibits the divergence — a mutant with the gate removed passes everything here.
+#    The gate is a contract gate. Retired upstream by duckdb/duckdb#24407 (nested `schema`
+#    definitions), which targets main.
+# ============================================================================
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/brid' AS im (TYPE fabricator, PROVIDER 'delta', column_mapping 'id');
+
+statement ok
+CREATE TABLE im.main.t AS SELECT 1 AS id, {'a': 10, 'b': 11} AS s;
+
+statement ok
+INSERT INTO im.main.t VALUES (2, {'a': 20, 'b': 21});
+
+statement ok
+ALTER TABLE im.main.t RENAME COLUMN s.b TO renamed;
+
+statement ok
+INSERT INTO im.main.t VALUES (3, {'a': 30, 'renamed': 31});
+
+# The value under the renamed member must survive in EVERY vintage (the per-file loop resolves each file's
+# field ids to its own stored names, which is what id mode asks of a reader).
+query III
+SELECT id, (s).a, (s).renamed FROM im.main.t ORDER BY id;
+----
+1	10	11
+2	20	21
+3	30	31
+
+# Flat id-mode columns are unaffected by that hazard and read across vintages as usual.
+statement ok
+ALTER TABLE im.main.t RENAME COLUMN id TO ident;
+
+statement ok
+INSERT INTO im.main.t VALUES (4, {'a': 40, 'renamed': 41});
+
+query II
+SELECT count(*), sum(ident) FROM im.main.t;
+----
+4	10
