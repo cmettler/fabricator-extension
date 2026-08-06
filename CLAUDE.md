@@ -586,6 +586,44 @@ current code still uses the single-provider `fabricator` naming):
 ## Next up (open threads for future sessions)
 
 In-flight / planned refactors (all C#-only unless noted; tests stay green per slice):
+- **THE STREAMING/BUFFERING AUDIT — AGREED, NOT STARTED (user, 2026-08-06). A whole-codebase pass over EVERY
+  path that holds batches, `Materialize` first.** The UPDATE work (grouped flush → unboxed input) kept turning
+  up buffering that nobody had decided on, so the remaining ones get looked at deliberately rather than one at
+  a time when they hurt.
+  - **⚠ THE SHAPE THE USER WANTS, and it is a standing rule for new code, not just this audit:
+    `IAsyncEnumerable` consumed with `await foreach`, with the STATE HELD BY THE CODE THAT YIELDS THE BATCHES
+    and released once everything has been yielded.** So the producer owns its resources for exactly the
+    enumeration's life (an iterator's `finally` / `await using` is the release point), and no consumer
+    accumulates a list to keep something alive. Where a consumer genuinely needs the whole set at once (EW's
+    `WriteAsync` commits over all batches), that requirement must be stated at the seam rather than met by a
+    silent collect upstream.
+  - **`Materialize` is the first subject, and the finding that opens the audit is that its JUSTIFICATION
+    LOOKS FALSE for our streams.** `DeltaWriter.Materialize` (`DeltaGlobalTableFunction.cs:1375`) does a full
+    Arrow **IPC round-trip** — write every batch into a `MemoryStream`, read them back — to get independent
+    retained batches, documented as needed because *"the source batches may be freed after consumption"*.
+    But `fabricator::ArrowProducer::GetNext` (`src/fabricator/arrow_produce.cpp:69`) does
+    `*out = batches_.front(); batches_.pop();` with the comment *"ownership transfers to the consumer"*, and
+    `Release` frees only the batches STILL QUEUED — never one already yielded. Every managed-facing stream is
+    an `ArrowProducer` (insert / ctas / modify / copy), so a consumed batch is owned by C# and valid until C#
+    disposes it. ⇒ the copy may be unnecessary, and it is the most expensive kind: two passes plus
+    serialization, with the serialized `MemoryStream` and the decoded batches alive at once. Three call sites,
+    all collect-path fallbacks (`DeltaCatalog.cs:2185` buffered INSERT for identity/iceberg/pending-ALTER,
+    `:2251` the non-streamable bulk write, `ExternalTableRouting.cs:275`) — i.e. exactly where a buffered
+    INSERT's memory grows with rows, which the `delta bulk: batches PARKED until commit` mark now measures.
+  - **⚠ DO NOT JUST DELETE IT, and green suites will NOT settle it.** The doc line arrived with the
+    2026-07-15 rename commit, i.e. moved verbatim, so its origin is older and may record a real incident with
+    a stream that is not an `ArrowProducer`. And a use-after-free here is SILENT on Windows and Linux — that
+    is exactly how the `ArrowProducer::Release` mutex bug hid until macOS CI ran. The verification is the
+    technique that caught THAT one: an out-of-band liveness registry on the C++ `ArrowArray` releases,
+    asserting no release fires for a batch C# still holds, run across the collect-path suites. A positive
+    answer on this machine, not an absence of symptoms.
+  - Ladder to price each site against: **retain = 0 copies** (if the audit clears it),
+    **`ArrowCompute.Take` = 1 copy** (new buffers, type-agnostic incl. nested/extension — what
+    `ParseUpdateStream` now uses), **IPC round-trip = 2 copies + serialization**.
+  - Other paths the audit must cover, not only `Materialize`: `pending.Batches` (the buffered park),
+    `BulkSession`'s bounded channel (already streaming — confirm, do not assume), the CDF capture,
+    `DeltaWriter.Write`'s batch list, `ArrowDataReader`, and the collector/in-out sessions. The
+    `Fabricator.Memory` marks exist to make each one answerable rather than arguable.
 - **`MERGE INTO` — BUILT + GATED 2026-08-05 (C++-only, no ABI bump). ⚠ It SHIPPED A SILENT-DATA-DESTRUCTION
   BUG FOR HALF A DAY BEFORE THE FIX, and the shape of that miss is the most reusable thing here.**
   - **⛔ THE BUG, MEASURED (found by the user asking "can we actually do a delete update insert in these
