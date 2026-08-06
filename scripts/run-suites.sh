@@ -170,7 +170,20 @@ case "$TIER" in
         # on SQL Server refused a 2-action merge into an identity EXTERNAL table. The added assertions pin BOTH
         # sides of each boundary, which is the point — a guard wider than its hazard fails as a lost capability,
         # which nothing complains about.
-        : "${MIN_ASSERTIONS:=6284}"
+        # 6295 since 2026-08-06, from a green tier run: verify_delta_catalog_dv_default 58 -> 103 for the
+        # deletion-vector read path. The vector used to be inlined into the generated SQL as one integer
+        # literal per deleted row — MEASURED ~0.4ms and ~1.2KB PER DELETED ROW (a 200k-row table with 199k
+        # deleted took 68.3s/301MB to scan; the same rows deleted copy-on-write took 1s/66MB), paid by EVERY
+        # read until an OPTIMIZE, so an incrementally-merged table got slower every run. It is now bound as an
+        # Arrow input and excluded with NOT EXISTS: 1.1s/93MB, flat in vector size.
+        # The added assertions exist because the pre-existing DV coverage COULD NOT SEE ANY OF IT: every other
+        # DV assertion in the repo deletes a handful of rows, i.e. stays below the inline threshold, and would
+        # pass whether or not the bound path works. So they use deliberately LARGE deletes, a MULTI-FILE
+        # section (each file binds its own single-use stream — a regression to one shared stream is invisible
+        # with a single file, and would silently resurrect the later files' deleted rows), and a
+        # FULLY-DELETED-FILE section (such a file is now skipped from the listing; skipping one that still has
+        # live rows loses them silently, so every surviving row is asserted).
+        : "${MIN_ASSERTIONS:=6295}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

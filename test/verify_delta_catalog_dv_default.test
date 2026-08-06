@@ -261,3 +261,42 @@ SELECT count(*) FILTER (WHERE id <= 10000), count(*) FILTER (WHERE id > 10000 AN
 
 statement ok
 DETACH mfdv;
+
+# ----------------------------------------------------------------------------------------------
+# FULLY-DELETED FILE — a merge-on-read UPDATE of a WHOLE file DV-deletes every one of its rows and
+# appends the post-images beside it, so the original becomes dead weight that the scan used to open
+# and then exclude row by row. It is now skipped from the listing when the add's stats give a row
+# count and the vector covers all of it.
+#
+# The skip itself is not observable from SQL, so what is pinned here is the thing that would break if
+# it were WRONG: skipping a file that still has live rows loses them silently. Hence a full-table
+# UPDATE (which produces exactly this shape) followed by assertions over every surviving row.
+# ----------------------------------------------------------------------------------------------
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/deadfile' AS deadfile (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE deadfile.main.t AS SELECT i::BIGINT AS id, (i*10)::BIGINT AS v FROM range(1, 20001) r(i);
+
+statement ok
+UPDATE deadfile.main.t SET v = v + 1;
+
+# Every row present and every value updated: a wrongly-skipped file shows up as missing rows, and a
+# wrongly-KEPT dead file would show up as duplicates.
+query III
+SELECT count(*), sum(CASE WHEN v = id*10+1 THEN 0 ELSE 1 END), count(DISTINCT id) FROM deadfile.main.t;
+----
+20000	0	20000
+
+# A second full-table UPDATE stacks the shape — the previous post-image files become dead in turn.
+statement ok
+UPDATE deadfile.main.t SET v = v + 1;
+
+query III
+SELECT count(*), sum(CASE WHEN v = id*10+2 THEN 0 ELSE 1 END), count(DISTINCT id) FROM deadfile.main.t;
+----
+20000	0	20000
+
+statement ok
+DETACH deadfile;

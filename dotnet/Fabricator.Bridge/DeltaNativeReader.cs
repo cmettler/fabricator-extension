@@ -123,6 +123,24 @@ internal static class DeltaNativeReader
             // exactly that version).
             listing = WithPendingDeletes(listing, pendingDeletes);
         }
+        // A file whose deletion vector covers EVERY one of its rows contributes nothing, so skip it rather
+        // than open it and exclude all of its rows one by one. This is not a corner case: a merge-on-read
+        // UPDATE of a whole file DV-deletes all of it and appends the post-images beside it, so a full-table
+        // UPDATE leaves exactly this shape behind and EVERY later scan paid to read the dead file.
+        // Placed AFTER the pending-delete merge on purpose — a file can be finished off by deletes buffered in
+        // THIS transaction, and read-your-writes must see that.
+        // ⚠ Trusts stats.numRecords (see DvRangeCondition for why that is the standard assumption and what it
+        // costs if a writer lies). Skipped only when the count is KNOWN: an add without stats is always read.
+        if (listing.Files.Count > 0)
+        {
+            var live = listing.Files.Where(f => f.NumRecords is not { } n || n <= 0 || f.Dv.Length < n).ToList();
+            if (live.Count != listing.Files.Count)
+            {
+                Log.LogInformation("delta native fully-deleted skip {Path}: files {Before} -> {After}",
+                                   path, listing.Files.Count, live.Count);
+                listing = WithFiles(listing, live);
+            }
+        }
         if (rowIdFilter is not null)
         {
             // Exact file selection by the rowid's ordinal half — no stats, no I/O; applies uniformly to
@@ -468,9 +486,15 @@ internal static class DeltaNativeReader
     /// inline <c>NOT IN</c> becomes a mark join too as soon as it has 5+ values
     /// (<see cref="DvLiteralMax"/>). So without this conjunct a deletion vector prunes NOTHING, and the file
     /// is read in full however much of it is deleted.</para>
-    /// <para>It is SUPERSET-SAFE by construction: it excludes only leading/trailing positions that are ENTIRELY
-    /// covered by the vector, so it can never drop a surviving row. Exactness stays with the anti-join, which
-    /// means a bug here degrades pruning rather than corrupting results — the right way round.</para>
+    /// <para>It excludes only leading/trailing positions ENTIRELY covered by the vector, so it cannot drop a
+    /// surviving row, and exactness stays with the anti-join — a bug here degrades pruning rather than
+    /// corrupting results. ⚠ THAT HOLDS UNCONDITIONALLY FOR THE LOWER BOUND ONLY, which is derived from the
+    /// vector alone. The UPPER bound needs to know where the file ENDS, so it trusts
+    /// <paramref name="numRecords"/> = the add action's <c>stats.numRecords</c>: if a non-conforming writer
+    /// UNDERSTATED it, rows past the claimed end could be excluded while still live. That is the same trust
+    /// every Delta engine places in that field (it is what answers <c>count(*)</c> without touching data) and
+    /// the same this reader already places on it for row-tracking derived-id ranges — but it is an assumption,
+    /// not a construction, and it is why the bound is omitted entirely when stats are absent.</para>
     /// <para>Shape it serves is the common one: a contiguous delete (a merge that removed a batch, or
     /// <c>DELETE … WHERE id &lt;= N</c>) collapses to one <c>&gt;=</c> / <c>&lt;=</c>. A scattered vector yields
     /// no usable bound and this returns null rather than emitting a no-op conjunct.</para>
