@@ -1805,8 +1805,32 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     spent BEFORE the read-back begins (253 MB at 1M × 3 cols).** That is DuckDB's own side of the statement
     plus, on ours, `DeltaCatalog.ExecuteUpdate`'s `Dictionary<long, object?[]>` of **BOXED** SET values, the
     Arrow batch rebuilt from it, and `updRowByRid` — all three complete before any provider work starts, all
-    three scaling with MATCHED rows. **NEXT FIX: keep the SET values in Arrow form per input chunk instead of
-    boxing them** (`updRowByRid` becomes rowid → (batch, row)). That is a DML-seam change, not a Delta one.
+    three scaling with MATCHED rows.
+    - **⚠ NOW MEASURED, not inferred, and the SLOPE is what makes it conclusive (2026-08-06).** One table,
+      1M rows, every row touched, three statements differing only in how many SET values cross the seam:
+      **DELETE (rowids only, no boxes) 204 MB / 1.7 s** — the floor; **UPDATE 1 SET column 454 MB / 5.5 s**
+      (+250 MB); **UPDATE 3 SET columns 651 MB / 5.6 s** (+447 MB). So **~98 MB per ADDITIONAL SET column per
+      1M rows ≈ 98 BYTES PER 8-BYTE BIGINT VALUE**, a ~12× representation overhead, and the first column costs
+      more (~250 MB) because it carries the per-ROW costs too (the `object?[]` header + the dictionary entry).
+      The DELETE floor is the control that makes this OURS rather than DuckDB's: same rows, same table, same
+      scan, no SET values. Note the TIME gap as well — 3.2× for the same rows.
+    - **NEXT FIX: keep the SET values in ARROW form instead of boxing them** — `ParseUpdateStream` builds
+      Arrow columns directly from the incoming chunks and `updRowByRid` becomes rowid → ordinal. Expected
+      ~250 MB → ~50 MB for the one-column case. It is a DML-SEAM change (`ParseUpdateStream` /
+      `ExecuteUpdate` / `BufferUpdateRows`), not a Delta one; `ExternalTableRouting` also calls
+      `ExecuteUpdate`, so check that path too.
+      - **⚠ THREE CONSTRAINTS FOUND WHILE SCOPING IT, all of which make the naive version wrong.**
+        (1) **`EngineeredWood.Arrow.ArrowCompute` has `Take` but NO Concat**, so "retain the incoming batches
+        and gather across them" needs a new helper or a per-batch append; the incoming stream is ~2048-row
+        chunks, so a 1M-row UPDATE is ~500 batches and a single-batch special case buys nothing.
+        (2) **`updates[rid] = vals` DEDUPLICATES by rowid, last-write-wins** — reachable via
+        `UPDATE … FROM other` whose join matches a target row twice — and it also sets the statement's
+        REPORTED row count. Builders cannot overwrite an earlier append, so the replacement has to append
+        everything, keep rowid → LAST ordinal, and compact with one `Take` at the end.
+        (3) **⚠ The boxing is currently also doing a TYPE CONVERSION**: `BuildArray(field.DataType, values)`
+        rebuilds each SET column at the TARGET column's type, so an incoming array of a different width or
+        unit is silently converted through the boxed value. Reusing the incoming Arrow array directly changes
+        that behaviour — the conversion has to be kept explicitly, or the seam must guarantee the types match.
   - **⚠ THE ALL-OR-NOTHING ROW-ID RULE HAD TO MOVE EARLIER, and that is the one semantic consequence.** A
     group is written before the later groups' ids are known, so "every selected row resolved a stable id" can
     no longer be decided after the read-back. It is now decided BEFORE it, from the files: the read-back yields
