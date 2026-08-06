@@ -505,27 +505,33 @@ internal static class DeltaNativeReader
             }
             if (listing.PartitionColumns.Count > 0)
             {
-                // ⚠ GATED, CAUSE NARROWED BUT NOT FOUND — do not lift this without reproducing first.
-                // A partitioned scan through this form raises `INTERNAL Error: Information loss on integer cast:
-                // value 4294967296 outside of target range [0, 4294967295]` (2^32 → uint32), and in one run the
-                // unittest process SEGFAULTED rather than erroring, so it is not a containable failure.
-                // RULED OUT by bisecting the generated SQL against the STOCK duckdb 1.5.5 wheel
-                // (docs/duckdb-upstream-issues.md §2), each with a real decode:
-                //   • read_parquet itself — union_by_name / hive_partitioning=false / filename / file_row_number
-                //     in every combination over these exact files: all fine;
-                //   • hive auto-detection colliding with our projected partition column — the first hypothesis;
-                //     `hive_partitioning => false` does NOT fix it, so that was wrong;
-                //   • the SQL SHAPE — the byte-identical statement with __fab_f as an inline VALUES CTE
-                //     instead of the bound input returns the right 20 rows.
-                // ⇒ FOUND, and it is NOT ABOUT PARTITIONS AT ALL: a bound Arrow input carrying a SECOND
-                // VARCHAR COLUMN breaks. Isolated by instrumenting the export (the batch is well-formed — 3
-                // columns, right length, no nulls, right types) and then holding the column COUNT fixed while
-                // changing only the third column's TYPE: with "p0" as Int64 the identical query RUNS. So
-                // (VARCHAR, BIGINT) is fine — which is why the deletion-vector input works — and
-                // (VARCHAR, BIGINT, VARCHAR) is not. Partitioning is merely the only shape that needs a second
-                // string today. See docs/duckdb-upstream-issues.md §2 — it is a defect in the host input-binding
-                // path, general to any managed component using Host.Query(sql, inputs), and it is what the
-                // partition gate is really standing in for.
+                // ⚠ GATED. The trigger is now REPRODUCIBLE AND MINIMAL, but the owning side is still open,
+                // so this stays. See docs/duckdb-upstream-issues.md §2 for the full record.
+                //
+                // TRIGGER: a bound host-query Arrow input carrying a column that DuckDB's projection PRUNES.
+                // Reproduced with no Delta, no parquet and no CTE — bind (utf8, int64, utf8) and select only
+                // columns 0 and 2 — and the process dies INSIDE host_query (instrumented: the managed side
+                // reaches the call and never returns). A partitioned scan hits it because the per-file input
+                // carries `ord` for the transient rowid, which a scan that wants no rowid does not read.
+                //
+                // RULED OUT, each measured rather than argued:
+                //   • the SHAPE of the input — (VARCHAR, BIGINT, VARCHAR) round-trips perfectly when every
+                //     column is read, as do ss / sss / is / iss;
+                //   • the SQL — the whole failing statement (MATERIALIZED CTE + union_by_name + filename +
+                //     file_row_number + join + pushed filter) runs correctly when no column is pruned;
+                //   • OUR CLEANUP — leaking the input allocations instead of freeing them changes nothing;
+                //   • the SingleScanArrowStream guard — bypassing it changes nothing;
+                //   • hive auto-detection (`hive_partitioning => false` does not fix it; kept as a real guard
+                //     against an `x=y` directory injecting a phantom column).
+                //
+                // ⚠ NOT ESTABLISHED, and do NOT record it as upstream: the pyarrow control on the stock 1.5.5
+                // wheel passes the same pruning, but Python's `register` does not go through the C API's
+                // `duckdb_arrow_scan`, so it does not exercise this code path. It is either DuckDB's C-API
+                // arrow scan or Apache.Arrow C#'s export; nothing here separates them yet.
+                //
+                // The cheap mitigation if this is ever urgent is to emit ONLY the columns the generated SQL
+                // references (here: drop `ord` when no rowid is wanted) — but that leaves the landmine armed
+                // for the next bound input with an unused column, so it is not a substitute for the answer.
                 return null;
             }
             bool nameMapped = listing.LogicalToPhysical is not null || listing.MappedSchema is not null;

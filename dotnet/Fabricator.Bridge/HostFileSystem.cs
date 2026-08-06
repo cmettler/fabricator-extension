@@ -395,8 +395,11 @@ internal static unsafe class HostFs
                 // again via CArrowArrayStream.Free would double-free the exporter state -> NRE).
                 Marshal.FreeHGlobal((nint)paramStream);
             }
-            // Free the marshaling arrays + the input-stream allocations. The stream CONTENT was consumed +
-            // released by DuckDB during the (materializing) query; we free only our allocations.
+            // Free the marshaling arrays + the input-stream allocations. The host MOVED each input stream into
+            // storage it owns (fabricator_host_query.cpp's OwnedArrowInputs) and zeroed our copy, so `release`
+            // here is null and Free() is a plain deallocation. ⚠ That move is REQUIRED, not an optimisation:
+            // host_query is STREAMING, so the bound views are still unscanned when this runs — leaving them
+            // pointed at these allocations was a use-after-free (garbage string offsets / SEGFAULT).
             if (namePtrs != null)
             {
                 for (int i = 0; i < n; i++)

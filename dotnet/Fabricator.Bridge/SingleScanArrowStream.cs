@@ -66,6 +66,45 @@ internal static class BoundInput
     private static readonly ILogger Log = FabricatorLog.CreateLogger("Fabricator.Bridge");
     private static long _seq;
 
+    /// <summary>Wraps a LAZY host-query result so its bound-input views are dropped when the CALLER disposes
+    /// it — the only moment a lazy producer can know draining is over. Sites whose query materializes before
+    /// returning should just call <see cref="Drop"/> in a <c>finally</c> instead.
+    /// <para>⚠ Not merely tidiness: <c>duckdb_arrow_scan</c> creates a CATALOG-level (non-temporary) view, so
+    /// it outlives the connection AND the stream that owns the input's storage. Left behind, it is a view
+    /// pointing at freed memory that any later query naming it would scan.</para></summary>
+    internal static IArrowArrayStream WrapDrop(IArrowArrayStream inner, params string[] names)
+        => new DropViewsOnDisposeStream(inner, names);
+
+    private sealed class DropViewsOnDisposeStream : IArrowArrayStream
+    {
+        private readonly IArrowArrayStream _inner;
+        private readonly string[] _names;
+        private bool _dropped;
+
+        internal DropViewsOnDisposeStream(IArrowArrayStream inner, string[] names)
+        {
+            _inner = inner;
+            _names = names;
+        }
+
+        public Schema Schema => _inner.Schema;
+
+        public ValueTask<RecordBatch?> ReadNextRecordBatchAsync(CancellationToken cancellationToken = default)
+            => _inner.ReadNextRecordBatchAsync(cancellationToken);
+
+        public void Dispose()
+        {
+            // Inner FIRST: that releases the host-side result and with it the adopted input streams, so the
+            // view is dead before it is dropped rather than after.
+            _inner.Dispose();
+            if (!_dropped)
+            {
+                _dropped = true;
+                Drop(_names);
+            }
+        }
+    }
+
     /// <summary>A name no concurrent host query can be using.</summary>
     internal static string NextName(string prefix)
         => prefix + "_" + System.Threading.Interlocked.Increment(ref _seq)

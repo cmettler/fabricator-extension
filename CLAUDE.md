@@ -2011,33 +2011,57 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
       it routine (Delta-log pruning dropped the only file holding a newly-ADDed column, so `WHERE extra IS NULL`
       broke). Fixed by ONE `parquet_schema([… whole list …])` query per scan resolving which stored names exist,
       with the rest emitted as `CAST(NULL AS …)`. One query per SCAN, never per file.
-    - **⚠ PARTITIONED TABLES ARE GATED BUT THE CAUSE IS NOT ESTABLISHED, AND THIS ENTRY BLAMED UPSTREAM
-      WRONGLY.** Reading one raised `INTERNAL Error: Information loss on integer cast: value 4294967296` (2^32).
-      It was recorded here and in the code as a DuckDB assertion in `union_by_name` + a virtual column over a
-      hive layout; **checked against the stock 1.5.5 wheel and that is FALSE** — the minimal form works, as do
-      `union_by_name` alone, `file_row_number` alone, and `hive_partitioning => false` (four controls, no
-      failure). So it comes from something OUR SQL adds, and filing it upstream would have been a false report.
-      **⚠ ROOT CAUSE FOUND 2026-08-06, AND IT IS NOT A PARTITION BUG: a bound Arrow input carrying a SECOND
-      `VARCHAR` COLUMN breaks.** Isolated in two steps, the first being the one that mattered — INSTRUMENT the
-      export instead of theorising a third time. (1) The batch is well-formed (3 columns, length 12 for 12 files,
-      arrays consistent, no nulls, `utf8/int64/utf8`) ⇒ not the producer. (2) Hold the column COUNT fixed and
-      change only the third column's TYPE: with `p0` as `Int64` the identical query RUNS. So `(VARCHAR, BIGINT)`
-      is fine — which is exactly why the DV input `(fn, pos)` works — and `(VARCHAR, BIGINT, VARCHAR)` is not.
-      **⚠ It is a defect in the HOST INPUT-BINDING path (`Host.Query(sql, inputs)` → C ABI → the
-      connection-scoped view), so it is GENERAL to any managed component binding an Arrow input, not a Delta
-      thing — and the shipped inputs are safe only BY ACCIDENT, both carrying at most one string column.** Next
-      step is the C++ side (`arrow_ingest` / the input-view registration) with a minimal two-string input, NOT
-      another Delta table. `2^32` reaching a `uint32` cast is consistent with a string column's DATA buffer being
-      read where its OFFSETS buffer was expected — a hypothesis, and two have already died here.
-      **The dead hypotheses, kept because each looked obvious:** the suspected hive-column name collision is REFUTED —
-      `hive_partitioning => false` does not fix it (kept anyway as a real guard: any `x=y` directory in a table's
-      path would otherwise inject a phantom column). What IS ruled out, each with a real decode on the stock
-      wheel: `read_parquet` in every option combination, hive detection, and **the SQL shape — the
-      byte-identical statement with the metadata as an inline `VALUES` CTE returns the right rows.** ⇒ it is our
-      **bound metadata Arrow input** (`MetaStream`), whose only partitioned-scan difference is a third `p<i>`
-      VARCHAR column beside `fn`/`ord`. **Next step: dump what MetaStream exports — two obvious-looking
-      hypotheses have now died.** ⚠ One run SEGFAULTED rather than erroring, so the gate is load-bearing. Full
-      record: [docs/duckdb-upstream-issues.md](docs/duckdb-upstream-issues.md) §2.
+    - **⚠ PARTITIONED SCANS STAY GATED, BUT THE TRIGGER IS NOW MINIMAL AND REPRODUCIBLE: a bound host-query
+      Arrow input carrying a column that DuckDB's projection PRUNES.** Bind `(utf8, int64, utf8)` and select
+      only columns 0 and 2 — no Delta, no parquet, no CTE — and the process dies INSIDE `host_query`
+      (instrumented: the managed side enters the call and never returns), as either the `4294967296` assertion
+      or an outright SEGFAULT. A partitioned scan hits it because the per-file input carries `ord` for the
+      transient rowid and a scan wanting no rowid never reads it. Full record:
+      [docs/duckdb-upstream-issues.md](docs/duckdb-upstream-issues.md) §2.
+      - **⚠ OWNERSHIP IS NOT ESTABLISHED — do not write this down as ours OR as upstream.** A pyarrow
+        `RecordBatchReader` on the stock 1.5.5 wheel survives the same pruning, which LOOKS like it convicts our
+        export and does not: **Python's `register` does not go through the C API's `duckdb_arrow_scan`**, so the
+        control exercises a different path from the one that dies. To settle it, drive `duckdb_arrow_scan`
+        directly with two producers — an Apache.Arrow C# export and a hand-built C struct of the same shape —
+        and see which crashes.
+      - **⚠ THE ERROR TEXT NAMES THE WRONG SUBSYSTEM.** `2^32` comes from `ColumnDataAllocator`'s CHECKED
+        `NumericCast<uint32_t>` on an allocation SIZE, because `SetVectorString`'s `UnsafeNumericCast` is
+        UNCHECKED in Release and lets a garbage string length through silently. Read it as "something made a
+        string length absurd", never as an allocator or cast bug.
+      - **RULED OUT, each measured**: the input's column SHAPE (all-columns `sis`/`ss`/`sss`/`is`/`iss` all
+        round-trip perfectly — so **"a second VARCHAR column breaks", recorded here yesterday as the ANSWER, is
+        REFUTED**; its evidence was timing luck, and the "0 rows instead of 10" beside it was just integers
+        failing a `p='p1'` filter); the SQL (the whole failing statement runs correctly when nothing is pruned);
+        OUR CLEANUP (leaking the input allocations changes nothing); the `SingleScanArrowStream` guard
+        (bypassing it changes nothing); and hive auto-detection (`hive_partitioning => false` does not fix it —
+        kept anyway as a real guard against an `x=y` directory injecting a phantom column).
+      - **A SEPARATE REAL BUG WAS FOUND AND FIXED ON THE WAY (ours, C++-only, no ABI) — and it is NOT this
+        one.** `MakeHostQueryStream` gave `duckdb_arrow_scan` the CALLER's `ArrowArrayStream *` — which DuckDB
+        stores as a RAW POINTER in the view — and then ran `conn->SendQuery`, a STREAMING result, so the managed
+        `finally` released and freed that storage before a row was fetched. The comment above the loop said the
+        stream was "consumed + released during the (materializing) query" while the next LINE OF CODE said
+        `// streaming (lazy Fetch)`. Fixed by `OwnedArrowInputs`: each input is MOVED (struct copy + zero the
+        source, the C-data-interface move) into storage owned by the `HostQueryStream` and declared as its FIRST
+        member, so it outlives the result and connection that scan it; zeroing also makes the managed cleanup
+        inert. ⚠ **The §2 crash is unchanged with it in** — it is a latent hazard the investigation surfaced,
+        not the answer, and it hid the same way (a `WITH … AS MATERIALIZED` CTE drains the input during
+        `SendQuery`'s first chunk push, so almost every shape was safe by PLAN ACCIDENT).
+      - **`BoundInput.Drop` is therefore CORRECTNESS, not tidiness**: `duckdb_arrow_scan` creates a
+        CATALOG-level (non-temporary) view, so it outlives both the connection and the stream owning the input's
+        storage. The one lazy-stream site, `DeltaCatalog.SortStream`, now defers its drop to Dispose via the new
+        `BoundInput.WrapDrop` — closing the leak that entry previously recorded as owed.
+      - **⚠ METHOD, and it is the transferable part: STOP BISECTING THE QUERY, GET A STACK TRACE.** Three
+        hypotheses came from bisecting SQL and all three died. Running the statement outside sqllogictest
+        printed `0xC0000005 at Interop+Kernel32.LocalAlloc ← HostFs.Query`, and checkpoint logging then placed
+        the death inside `host_query`. Two throwaway tools made that reachable: an env-var UN-GATE so the
+        failure could be provoked on demand, and a temporary global table function
+        `fabricator_probe_input(sql, shape, vals)` binding an arbitrary hand-built Arrow batch under a name
+        substituted into arbitrary SQL — which exonerated marshalling, shape, SQL, cleanup and the scan guard in
+        minutes each. **Build the probe that isolates ONE variable instead of re-running the composite.**
+      - ⚠ And the control that looked decisive was worthless: "the byte-identical statement with the metadata as
+        an inline `VALUES` CTE returns the right rows" — an inline CTE has NO bound input, so it changed the
+        very variable under test while appearing to hold everything constant. Same shape as the pyarrow caveat
+        above and as the `count(*)`-is-not-a-read trap.
     - It gives up the DV's PRUNABLE BOUND (one WHERE cannot carry a per-file range). Deliberate, and the evidence
       is already in `DvRangeCondition`: its own A/B found that bound "demonstrably works and does not show up in
       wall time". ⚠ Re-measure on REMOTE storage with a mostly-deleted file before calling it free there.

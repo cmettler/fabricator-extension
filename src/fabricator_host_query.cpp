@@ -33,7 +33,44 @@ namespace {
 // is for synchronous hand-off within a call), this is drained ASYNCHRONOUSLY by the consuming scan, so it
 // owns its Connection + result and frees them on release. The fresh Connection has its own ClientContext /
 // transaction — the in-flight context is non-reentrant, so reusing it would corrupt the outer query.
+// Owns MOVED-IN copies of the caller's input ArrowArrayStreams.
+//
+// ⚠ This is load-bearing, not tidiness. `duckdb_arrow_scan` stores the RAW POINTER it is given inside the
+// view it creates (`Value::POINTER((uintptr_t)input)`) and the query below is STREAMING — `SendQuery` returns
+// as soon as the first chunk is ready, so the arrow scan is generally NOT consumed by the time this function
+// returns. The caller's struct is a managed allocation whose cleanup runs the moment the ABI call returns, so
+// leaving the view pointed at it is a use-after-free: the scan later dereferences freed memory and reads
+// garbage string offsets (observed as `INTERNAL Error: Information loss on integer cast: value 4294967296`,
+// i.e. a ~4 GB string length, and as an outright SEGFAULT).
+//
+// Adopting also performs the C-data-interface MOVE — the source struct is zeroed, so its `release` is null and
+// the caller's own cleanup becomes a plain deallocation that cannot double-release the exporter.
+struct OwnedArrowInputs {
+	vector<unique_ptr<ArrowArrayStream>> streams;
+
+	ArrowArrayStream *Adopt(ArrowArrayStream *src) {
+		auto owned = make_uniq<ArrowArrayStream>();
+		*owned = *src;                     // copy callbacks + private_data
+		std::memset(src, 0, sizeof(*src)); // ...and take ownership: the caller must not release it
+		auto *raw = owned.get();
+		streams.push_back(std::move(owned));
+		return raw;
+	}
+
+	~OwnedArrowInputs() {
+		// Releases only what the query did not consume (a consumed stream nulls its own release).
+		for (auto &s : streams) {
+			if (s && s->release) {
+				s->release(s.get());
+			}
+		}
+	}
+};
+
 struct HostQueryStream {
+	// FIRST member on purpose: members are destroyed in reverse declaration order, so the adopted input
+	// streams outlive the result/connection that scans them.
+	unique_ptr<OwnedArrowInputs> inputs;
 	unique_ptr<Connection> conn;
 	unique_ptr<PreparedStatement> prepared; // kept alive for the param path (the streaming result references it)
 	unique_ptr<QueryResult> result;         // a StreamQueryResult — fetched lazily (bounded memory)
@@ -138,11 +175,13 @@ void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStre
 		}
 	}
 	// Register each named Arrow input as a connection-scoped view (data-in). duckdb_arrow_scan reinterprets
-	// the opaque handle back to ArrowArrayStream* and creates a temp view; the stream is consumed + released
-	// by DuckDB during the (materializing) query below.
+	// the opaque handle back to ArrowArrayStream* and creates a view over it. We ADOPT each stream first (see
+	// OwnedArrowInputs): the view keeps the RAW POINTER and the query below is LAZY, so the caller's own
+	// allocation must not be what it points at. On any throw below, the local holder releases them.
+	auto owned_inputs = make_uniq<OwnedArrowInputs>();
 	for (auto &in : inputs) {
 		auto rc = duckdb_arrow_scan(reinterpret_cast<duckdb_connection>(conn.get()), in.name.c_str(),
-		                            reinterpret_cast<duckdb_arrow_stream>(in.stream));
+		                            reinterpret_cast<duckdb_arrow_stream>(owned_inputs->Adopt(in.stream)));
 		if (rc != DuckDBSuccess) {
 			throw IOException("fabricator_host_query: failed to register input view '" + in.name + "'");
 		}
@@ -172,6 +211,7 @@ void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStre
 		throw IOException("fabricator_host_query: " + result->GetError());
 	}
 	auto *st = new HostQueryStream();
+	st->inputs = std::move(owned_inputs); // the views reference these; they outlive `result` (see the struct)
 	st->conn = std::move(conn);
 	st->prepared = std::move(prepared);
 	st->types = result->types;
