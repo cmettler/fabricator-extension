@@ -267,12 +267,14 @@ internal static class DeltaNativeReader
     {
         internal BatchPlan(string sql, IReadOnlyList<DeltaReader.NativeScanFile> files,
                            IReadOnlyList<DeltaReader.NativeScanFile> loopFiles,
-                           Func<IReadOnlyList<(string, IArrowArrayStream)>>? inputs = null)
+                           Func<IReadOnlyList<(string, IArrowArrayStream)>>? inputs = null,
+                           IReadOnlyList<string>? viewNames = null)
         {
             Sql = sql;
             Files = files;
             LoopFiles = loopFiles;
             Inputs = inputs;
+            ViewNames = viewNames ?? System.Array.Empty<string>();
         }
 
         /// <summary>The single query covering <see cref="Files"/>.</summary>
@@ -288,6 +290,10 @@ internal static class DeltaNativeReader
         /// null when it references none. A FACTORY rather than a list because each is single-use: the schema
         /// probe runs the same SQL with <c>LIMIT 0</c> and must not consume the streams the real scan needs.</summary>
         internal Func<IReadOnlyList<(string, IArrowArrayStream)>>? Inputs { get; }
+
+        /// <summary>The bound-input view names this plan registers, dropped once its query has been drained
+        /// (they are NOT temporary views — see <see cref="NextViewName"/>).</summary>
+        internal IReadOnlyList<string> ViewNames { get; }
 
         /// <summary>Runs this plan, binding its inputs.</summary>
         internal IArrowArrayStream Query(string? suffix = null)
@@ -616,16 +622,18 @@ internal static class DeltaNativeReader
                           + $"AS {Quote(RowIdColumn)}");
             }
 
+            string metaView = NextViewName(MetaViewName);
+            string dvView = NextViewName(DvViewName);
             var ctes = new List<string>(2);
             if (needsMeta)
             {
                 // MATERIALIZED is load-bearing, not a hint: the view is a single-use stream, so a second scan
                 // would silently contribute nothing (SingleScanArrowStream turns that into an error).
-                ctes.Add($"__fab_f AS MATERIALIZED (SELECT * FROM {MetaViewName})");
+                ctes.Add($"__fab_f AS MATERIALIZED (SELECT * FROM {Quote(metaView)})");
             }
             if (anyDv)
             {
-                ctes.Add($"__fab_d AS MATERIALIZED (SELECT * FROM {DvViewName})");
+                ctes.Add($"__fab_d AS MATERIALIZED (SELECT * FROM {Quote(dvView)})");
             }
 
             var sb = new StringBuilder();
@@ -674,17 +682,21 @@ internal static class DeltaNativeReader
                     var list = new List<(string, IArrowArrayStream)>(2);
                     if (needsMeta)
                     {
-                        list.Add((MetaViewName,
-                                  new SingleScanArrowStream(MetaStream(files, partCols, listing), MetaViewName)));
+                        list.Add((metaView,
+                                  new SingleScanArrowStream(MetaStream(files, partCols, listing), metaView)));
                     }
                     if (anyDv)
                     {
-                        list.Add((DvViewName, new SingleScanArrowStream(FileDvStream(files), DvViewName)));
+                        list.Add((dvView, new SingleScanArrowStream(FileDvStream(files), dvView)));
                     }
                     return list;
                 };
             }
-            return new BatchPlan(sb.ToString(), files, System.Array.Empty<DeltaReader.NativeScanFile>(), inputs);
+            var viewNames = new List<string>(2);
+            if (needsMeta) { viewNames.Add(metaView); }
+            if (anyDv) { viewNames.Add(dvView); }
+            return new BatchPlan(sb.ToString(), files, System.Array.Empty<DeltaReader.NativeScanFile>(), inputs,
+                                 viewNames);
         }
 
         private static string Literal(string s) => "'" + s.Replace("'", "''") + "'";
@@ -1151,6 +1163,48 @@ internal static class DeltaNativeReader
     internal const string DvViewName = "__fab_dv";
 
     /// <summary>
+    /// A per-QUERY unique name for a bound input view. ⚠ Load-bearing, not hygiene: DuckDB's
+    /// <c>duckdb_arrow_scan</c> registers the input with <c>CreateView(name, replace: true, temporary: FALSE)</c>
+    /// — a CATALOG-level view, shared by every connection on the database and silently replacing any existing
+    /// one — and it must stay alive until the streaming result has been fully fetched. Two host queries binding
+    /// the same name therefore race over the whole fetch. MEASURED with two shipped, documented settings
+    /// (<c>FABRICATOR_DELTA_PREFETCH=8</c> + <c>FABRICATOR_DELTA_BATCH_MIN_FILES=0</c>, so each deletion-vector
+    /// file gets its own concurrent query): every scan failed with
+    /// <c>failed to register input view '__fab_dv'</c>. That is the LOUD outcome; the same race can also let one
+    /// query's view be replaced by another's stream, which is silent wrong rows.
+    /// </summary>
+    private static long _viewSeq;
+
+    private static string NextViewName(string prefix)
+        => prefix + "_" + System.Threading.Interlocked.Increment(ref _viewSeq).ToString(CultureInfo.InvariantCulture);
+
+    /// <summary>Drops the bound-input views once their query has been fully drained. Needed because the view is
+    /// NOT temporary: it outlives the connection that made it and shows up in the user's <c>duckdb_views()</c>
+    /// (measured). With one shared name that was a single stale entry; with per-query names it would accumulate
+    /// one per scan, so dropping is what makes uniqueness affordable. Best-effort — a failure here must never
+    /// fail the scan, which already produced its rows.</summary>
+    private static void DropViews(IReadOnlyList<string> names)
+    {
+        if (names.Count == 0)
+        {
+            return;
+        }
+        try
+        {
+            var sb = new StringBuilder();
+            foreach (var n in names)
+            {
+                sb.Append("DROP VIEW IF EXISTS ").Append(Quote(n)).Append("; ");
+            }
+            using var _ = Host.Query(sb.ToString());
+        }
+        catch (Exception ex)
+        {
+            Log.LogDebug("delta native: dropping bound-input views failed ({Msg})", ex.Message);
+        }
+    }
+
+    /// <summary>
     /// Deletion vectors at or below this many positions stay an inline <c>file_row_number NOT IN (…)</c>
     /// literal list; above it they are bound as an Arrow input and anti-joined.
     /// <para>The value is DuckDB'S OWN <c>IN</c>-rewrite boundary, not a number of ours.
@@ -1298,9 +1352,10 @@ internal static class DeltaNativeReader
 
     /// <summary>Runs a per-file SELECT, binding the file's deletion vector as an Arrow input when it is large
     /// enough that inlining it would be pathological (<see cref="DvLiteralMax"/>).</summary>
-    private static IArrowArrayStream QueryFile(string sql, DeltaReader.NativeScanFile f)
+    private static IArrowArrayStream QueryFile(string sql, DeltaReader.NativeScanFile f, string dvView)
         => BindDv(f.Dv)
-            ? Host.Query(sql, new (string, IArrowArrayStream)[] { (DvViewName, DvStream(f.Dv)) })
+            ? Host.Query(sql, new (string, IArrowArrayStream)[]
+                              { (dvView, new SingleScanArrowStream(DvStream(f.Dv), dvView)) })
             : Host.Query(sql);
 
     /// <summary>The WHOLE table as one SQL text: the per-file SELECTs (logical names, DV exclusion, column
@@ -1351,6 +1406,7 @@ internal static class DeltaNativeReader
             // probing it costs no footer read (the whole point of the `schema` map) where the per-file probe
             // below pays ResolveFileMapping.
             using var bs = batch.Query(" LIMIT 0");
+            DropViews(batch.ViewNames);
             return listing.MappedSchema is { } bms
                 ? ArrowColumnMappingRename.RenameSchema(bs.Schema, bms, toPhysical: false)
                 : bs.Schema;
@@ -1450,6 +1506,7 @@ internal static class DeltaNativeReader
                         }
                         finally
                         {
+                            DropViews(batch.ViewNames);
                             sem.Release();
                         }
                     }, ct));
@@ -1479,12 +1536,23 @@ internal static class DeltaNativeReader
                                     return;
                                 }
                             }
+                            var dvView = NextViewName(DvViewName);
                             var sql = FileSql(dataCols, wantRowId, where, file,
                                               fm, listing.TableSchema,
                                               listing.PartitionColumns, rowIdFilter?.PositionCondition(file.Ordinal),
-                                              trackingCond, dvView: DvViewName);
+                                              trackingCond, dvView: dvView);
                             Log.LogDebug("delta native file: {Sql}", sql);
-                            await DrainAsync(QueryFile(sql, file)).ConfigureAwait(false);
+                            try
+                            {
+                                await DrainAsync(QueryFile(sql, file, dvView)).ConfigureAwait(false);
+                            }
+                            finally
+                            {
+                                if (BindDv(file.Dv))
+                                {
+                                    DropViews(new[] { dvView });
+                                }
+                            }
                         }
                         finally
                         {

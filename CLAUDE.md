@@ -2056,6 +2056,32 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     - New: `SingleScanArrowStream` wraps each bound input so a SECOND scan THROWS. Without it, a re-scan of the
       single-use DV view returns zero rows and silently resurrects deleted rows; `MATERIALIZED` is what makes the
       single scan true today, and this makes a future planner change fail instead of corrupting an answer.
+  - **⚠ THE BOUND-INPUT VIEW WAS A GLOBAL, CATALOG-LEVEL NAME — FIXED 2026-08-06, and it was a SHIPPED bug
+    reachable from two documented settings.** Found by the user asking whether the DV view could collide when
+    joining several Delta tables, or whether it is session-scoped. It is not session-scoped: DuckDB's
+    `duckdb_arrow_scan` registers the input with **`CreateView(name, replace: true, temporary: FALSE)`**
+    (`duckdb/src/main/capi/arrow-c.cpp` → `Ingest`), i.e. a CATALOG-level view shared by every connection on the
+    database, silently replacing any existing one — and it must stay alive until the STREAMING result is fully
+    fetched, so two host queries binding one name race over the whole fetch.
+    - **MEASURED with `FABRICATOR_DELTA_PREFETCH=8` + `FABRICATOR_DELTA_BATCH_MIN_FILES=0`** (both shipped and
+      documented, so each DV file gets its own concurrent query): **every scan of a deletion-vector table failed**
+      with *"failed to register input view '__fab_dv'"*. That is the LOUD outcome; the same race can instead let
+      one query's view be REPLACED by another's stream, which is silent wrong rows.
+    - **It also LEAKED**: because the view is not temporary it outlived its connection and showed up in the
+      user's own `duckdb_views()` (measured — `__fab_dv` sitting there after a plain DELETE + SELECT, next to a
+      pre-existing `__fabricator_delta_write_src` from the write path, which has the same shape and is NOT fixed
+      here).
+    - Fix: **per-query unique names** (`__fab_dv_<n>` / `__fab_files_<n>`, an interlocked counter) plus an
+      explicit `DROP VIEW IF EXISTS` once the query has been drained. The drop is what makes uniqueness
+      affordable — without it the catalog would accumulate one view per scan instead of one stale one. Verified:
+      the failing configuration returns correct results, and the leaked-view count is **0**.
+    - **⚠ TWO OF MY THREE TESTS HERE PROVED NOTHING, and the user named the second.** A join of two DV tables
+      returned right answers — but a hash join materialises one side before probing, so the scans never overlap.
+      A `UNION ALL` with `threads=8` also passed — and the user pointed out a union CAN produce concurrent
+      queries, which is right: **`PhysicalUnion::BuildPipelines` may run branch pipelines SEQUENTIALLY**, a fact
+      already recorded in this file from the 4g premature-finish bug. So a green union test is a scheduling
+      accident. Only forcing concurrency through our own prefetch knob reproduced it. **When testing a race, do
+      not accept a passing shape until you have shown that shape actually overlaps.**
   - **⚠ THE GATED SHAPES SHOULD GO TO A `UNION ALL`, NOT TO THE LOOP — MEASURED 2026-08-06 after the user asked
     "why didn't you choose the union instead of the looping part?", and the answer is that they were right and I
     had not measured it.** Marginal cost per file on one 200-file table: **single `read_parquet([…], schema=…)`
