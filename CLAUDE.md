@@ -2865,6 +2865,16 @@ are missing.
 - **`unittest -f <list>` (batch mode) is unusable here**: one CLR per process means earlier suites'
   finalizers run during later ones — SIGSEGV at suite 41/53 inside Apache.Arrow's
   `ImportedArrowArrayStream` finalizer. One process per suite is not a style choice.
+- **⚠ NEVER EDIT A SHELL SCRIPT WHILE A BACKGROUND JOB IS EXECUTING IT — it kills the RUN, and the error
+  blames the FILE.** bash reads a script INCREMENTALLY, so inserting lines shifts the byte offsets under
+  the already-running shell and it resumes mid-token. Symptoms are a syntax error at a line that is
+  perfectly valid (`syntax error near unexpected token 'elif'`) or a fragment executed as a command
+  (`st: command not found`) — and `bash -n` on the file afterwards passes, which is what makes it read as
+  corruption rather than as a self-inflicted race. It cost TWO full tier runs on 2026-08-05, the second
+  one AFTER this lesson had already been learned and written down in the session, so treat it as a hard
+  rule rather than a caution: while `run-suites.sh` is running, edit NOTHING it reads — least of all its
+  own floors, which is exactly when the temptation arises (the measured number has just landed).
+  Test SOURCES are safe to edit mid-run; the runner and anything it sources are not.
 - **`git update-index --chmod=+x` is required for CI scripts.** `core.fileMode=false` on Windows means
   a local `chmod +x` is never recorded, and Linux then refuses to execute (exit 126).
 - **`.gitattributes` forces `*.sh` to LF.** With `core.autocrlf=true` a checkout would give the scripts
