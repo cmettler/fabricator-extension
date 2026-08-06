@@ -3125,32 +3125,140 @@ public sealed class DeltaCatalog : IBackendCatalog
                 + "transaction — COMMIT the ALTER first.");
         }
         long matched = 0;
-        var postImages = new List<RecordBatch>();
-        var preImages = profile.CdfEnabled ? new List<RecordBatch>() : null;
+        // ── GROUPED FLUSH: the read-back streams, it is not accumulated ────────────────────────────────
+        // Post-images used to pile up for the WHOLE statement before anything was written (~474 MB for a
+        // 1M-row UPDATE, and the pre-images on top of that on a CDF table). Now a group's worth becomes data
+        // files — and its CDF pair change files — as soon as it is big enough, and only the WrittenDataFile /
+        // CdcFile actions park on the buffer. Still exactly ONE commit at flush.
+        //
+        // ⚠ FILE LAYOUT IS UNCHANGED BY CONSTRUCTION: WriteDataFilesAsync writes one parquet file per (input
+        // batch × partition), so N read-back batches yield N data files however they are grouped.
+        //
+        // ⚠ THE ALL-OR-NOTHING ROW-ID RULE MUST BE DECIDED BEFORE READING, because a group is written before
+        // the later groups' ids are known. TxnDmlProfile.AllFilesRowTracked answers it for free in the probe
+        // this method already does — and it is trusted ONLY when the read-back's pinned version is the one it
+        // describes, since a different version has a different file set. Where it cannot be established the
+        // threshold is DISABLED and the statement buffers whole, exactly as it did before: a legacy table
+        // (files predating row tracking) keeps its old behaviour rather than acquiring new semantics from a
+        // memory fix.
+        bool idsPreResolved = profile.MaterializeRowIds && profile.AllFilesRowTracked
+                              && pending.PinnedVersion == profile.Version;
+        long groupBytes = !profile.MaterializeRowIds || idsPreResolved
+            ? DeltaReader.UpdateGroupBytes
+            : long.MaxValue;
+
+        var postGroup = new List<RecordBatch>();
+        var preGroup = profile.CdfEnabled ? new List<RecordBatch>() : null;
         // Materialized row tracking (implied by row tracking — the table declares the materialized
         // columns): the post-image rows must carry their ORIGINAL stable ids in the declared
         // __delta_row_id column (identity preserved across the UPDATE — Spark's reference behavior).
         // Resolved BY THE READ-BACK per row: the source file's materialized value where present (a
         // compacted / CoW-rewritten source — the post-OPTIMIZE case) else baseRowId + position.
-        List<long?>? stableIdsRaw = null;
+        List<long?>? idGroup = null;
         List<(long?[] Ids, long?[] Versions)>? srcTracking = null;
         if (profile.MaterializeRowIds)
         {
-            stableIdsRaw = new List<long?>();
+            idGroup = new List<long?>();
             srcTracking = new List<(long?[] Ids, long?[] Versions)>();
         }
+        long groupAccum = 0;
+        bool idsUnresolvable = false;
+        bool wroteWithIds = false;
+        // Null until the first flush decides it; false pins the whole statement to the batch park (the
+        // verdict depends on table capabilities, not on the batches, so it cannot differ between groups).
+        bool? eager = null;
+        pending.BatchSchema ??= userSchema;
+
+        void FlushGroup()
+        {
+            if (postGroup.Count == 0)
+            {
+                return;
+            }
+            // Every id resolvable => bake the originals; ANY unresolvable row (a pre-row-tracking source
+            // file) => write the post-images WITHOUT materialized ids (fresh ids for the whole statement —
+            // never a wrong or colliding id).
+            // The seam's parameter is nullable per element (an entry it cannot derive is written as null, and
+            // the reader then falls back to baseRowId + position for that row alone). We deliberately do NOT
+            // use that: a partially-materialised statement would leave identity depending on which rows
+            // happened to resolve, so the gate is all-or-nothing and the list handed over never has a null.
+            List<long?>? stableIds = null;
+            if (idGroup is not null && !idsUnresolvable)
+            {
+                stableIds = new List<long?>(idGroup);
+                wroteWithIds = true;
+            }
+            else if (wroteWithIds)
+            {
+                // Unreachable unless AllFilesRowTracked lied about the pinned version's files. Loud, because
+                // the alternative is a statement whose earlier rows kept their identity and whose later rows
+                // silently did not.
+                throw new System.InvalidOperationException(
+                    "delta: buffered UPDATE hit an unresolvable row id after post-images had already been "
+                    + "written with their original ids — the pinned snapshot's files disagree about row "
+                    + "tracking.");
+            }
+
+            if (preGroup is not null)
+            {
+                // slice C2: eager CDC capture — pre-images (committed values, read back above) + the
+                // post-images built from the SET substitution, exactly the autocommit merge-on-read pair.
+                // Both go through the pair's HELD table and transaction, so a group costs no extra open.
+                WriteCdcFiles(opener, path, pending, preGroup, "update_preimage");
+                WriteCdcFiles(opener, path, pending, postGroup, "update_postimage");
+            }
+            // Eager post-image write (eager-write plan, slices A + C1): the post-image rows become a
+            // parquet file NOW — the merge-on-read shape with a deferred commit — and only the
+            // WrittenDataFile action parks on the buffer. Native_write AND codec catalogs both (the codec
+            // writes via EW's own writer). The pending-FILES read overlay (ScanNative routing) serves
+            // read-your-writes; ROLLBACK reclaims the bytes via DiscardDataFilesAsync. NOT NULL is
+            // validated inside the helper (the flush only validates Batches).
+            // ⚠ This OPENS THE TABLE per call, so grouping costs one extra _delta_log LIST per group. Cheap
+            // next to the read-back it bounds, and removable: the pair already holds an open table
+            // (EnsureHeldTableAsync) that this helper predates and could use instead.
+            eager = TryEagerWriteBatches(opener, path, pending, postGroup, tableName,
+                                         materializedRowIds: stableIds);
+            if (eager == true)
+            {
+                foreach (var b in postGroup)
+                {
+                    b.Dispose();
+                }
+            }
+            else if (stableIds is not null)
+            {
+                // A materialize post-image MUST carry its original ids — the batch-park flush path cannot
+                // bake them, so an eager-write failure here is a hard error, not a fallback.
+                throw new System.NotSupportedException(
+                    "delta: UPDATE inside an explicit transaction on a materialized-row-tracking table "
+                    + "could not write its post-images eagerly — run it in autocommit.");
+            }
+            else
+            {
+                // Parked, not written: memory is then unbounded for this table shape exactly as before.
+                pending.Batches.AddRange(postGroup);
+            }
+            postGroup.Clear();
+            preGroup?.Clear();
+            idGroup?.Clear();
+            groupAccum = 0;
+        }
+
         // The rowids' ordinals are PINNED-version path-sort positions — read back AT that version so a
         // concurrent commuting append (which shifts the ordering) can never make us read the wrong files.
-        int rbIdx = -1;
+        // Both out-lists are drained per batch (their producer only ever appends, never reads them back), so
+        // the rowids and source tracking do not accumulate across the statement either.
         var ridsPerBatch = new List<long[]>();
         foreach (var raw in DeltaReader.ReadRowsByRowIds(opener, path, updates.Keys, default,
                      atVersion: pending.PinnedVersion, sourceTrackingOut: srcTracking,
                      rowIdsOut: ridsPerBatch))
         {
-            rbIdx++;
             var batch = readTarget is null ? raw : ReconcileBatch(raw, readTarget, CommittedToPending(pending));
-            preImages?.Add(batch);
-            var rids = ridsPerBatch[rbIdx];
+            var rids = ridsPerBatch[ridsPerBatch.Count - 1];
+            ridsPerBatch.Clear();
+            var srcIds = srcTracking is { Count: > 0 } ? srcTracking[srcTracking.Count - 1].Ids : null;
+            srcTracking?.Clear();
+            preGroup?.Add(batch);
             var newCols = new IArrowArray[fields.Count];
             for (int c = 0; c < fields.Count; c++)
             {
@@ -3170,8 +3278,10 @@ public sealed class DeltaCatalog : IBackendCatalog
                 }
                 newCols[c] = BuildArray(fields[c].DataType, values);
             }
-            postImages.Add(new RecordBatch(userSchema, newCols, batch.Length));
+            var post = new RecordBatch(userSchema, newCols, batch.Length);
+            postGroup.Add(post);
             matched += batch.Length;
+            groupAccum += DeltaReader.ApproxBatchBytes(batch) + DeltaReader.ApproxBatchBytes(post);
             for (int i = 0; i < batch.Length; i++)
             {
                 // One entry per row of this batch by the seam's contract; the bounds check is the only guard
@@ -3186,64 +3296,22 @@ public sealed class DeltaCatalog : IBackendCatalog
                         pending.DeletedByOrdinal[(int)ordinal] = set;
                     }
                     set.Add(TransientRowAddress.Position(rid));
-                    if (stableIdsRaw is not null)
+                    if (idGroup is not null)
                     {
-                        var ids = srcTracking is not null && rbIdx < srcTracking.Count
-                            ? srcTracking[rbIdx].Ids : null;
-                        stableIdsRaw.Add(ids is not null && i < ids.Length ? ids[i] : null);
+                        long? id = srcIds is not null && i < srcIds.Length ? srcIds[i] : null;
+                        if (id is null) { idsUnresolvable = true; }
+                        idGroup.Add(id);
                     }
                 }
             }
-        }
-        // Every id resolvable => bake the originals; ANY unresolvable row (a pre-row-tracking source
-        // file) => write the post-images WITHOUT materialized ids (fresh ids for the whole statement —
-        // never a wrong or colliding id).
-        // The seam's parameter is nullable per element (an entry it cannot derive is written as null, and the
-        // reader then falls back to baseRowId + position for that row alone). We deliberately do NOT use that:
-        // a partially-materialised statement would leave identity depending on which rows happened to resolve,
-        // so the gate below is all-or-nothing and the list handed over never contains a null.
-        List<long?>? stableIds = null;
-        if (stableIdsRaw is not null && stableIdsRaw.Count == matched
-            && stableIdsRaw.TrueForAll(x => x.HasValue))
-        {
-            stableIds = stableIdsRaw;
-        }
-        pending.BatchSchema ??= userSchema;
-        if (preImages is not null)
-        {
-            // slice C2: eager CDC capture — pre-images (committed values, read back above) + the
-            // post-images built from the SET substitution, exactly the autocommit merge-on-read pair.
-            WriteCdcFiles(opener, path, pending, preImages, "update_preimage");
-            WriteCdcFiles(opener, path, pending, postImages, "update_postimage");
-        }
-        // Eager post-image write (eager-write plan, slices A + C1): the post-image rows become a
-        // parquet file NOW — the merge-on-read shape with a deferred commit — and only the
-        // WrittenDataFile action parks on the buffer, so a large UPDATE no longer holds its post-images
-        // in memory until COMMIT. Native_write AND codec catalogs both (the codec writes via EW's own
-        // writer; buffered-UPDATE eligibility already guarantees SupportsExternalDataFileCommit + not
-        // materialized row tracking). The pending-FILES read overlay (ScanNative routing) serves
-        // read-your-writes; ROLLBACK leaves the file as an invisible orphan (vacuum's job). NOT NULL is
-        // validated inside the helper (the flush only validates Batches).
-        if (TryEagerWriteBatches(opener, path, pending, postImages, tableName,
-                                 materializedRowIds: stableIds))
-        {
-            foreach (var b in postImages)
+            // Once a group has parked rather than written, grouping buys nothing — keep accumulating so the
+            // park path stays byte-identical to what it always did.
+            if (groupAccum >= groupBytes && eager != false)
             {
-                b.Dispose();
+                FlushGroup();
             }
         }
-        else if (stableIds is not null)
-        {
-            // A materialize post-image MUST carry its original ids — the batch-park flush path cannot
-            // bake them, so an eager-write failure here is a hard error, not a fallback.
-            throw new System.NotSupportedException(
-                "delta: UPDATE inside an explicit transaction on a materialized-row-tracking table "
-                + "could not write its post-images eagerly — run it in autocommit.");
-        }
-        else
-        {
-            pending.Batches.AddRange(postImages);
-        }
+        FlushGroup();
         pending.Rows += matched;
         pending.HasUpdate = true;
         _log.LogInformation("delta txn {Txn} buffer update {Schema}.{Table}: rows={Rows} pinned=v{Pin}",

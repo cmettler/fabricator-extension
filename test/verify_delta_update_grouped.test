@@ -1,0 +1,207 @@
+# name: test/verify_delta_update_grouped.test
+# description: The UPDATE post-image GROUPED FLUSH — a large UPDATE writes its post-images (and, on a CDF
+#              table, its change files) in groups as the read-back streams, instead of accumulating every
+#              batch first. This suite exists because the grouping is INVISIBLE at hermetic scale: the
+#              default threshold is 64 MiB of Arrow data (DeltaReader.UpdateGroupBytes) and no suite here
+#              comes within two orders of magnitude of it, so the grouped path would otherwise ship with
+#              ZERO coverage. run-suites.sh therefore runs THIS suite — and only this suite — with
+#              FABRICATOR_DELTA_UPDATE_GROUP_BYTES=1, which makes every read-back batch its own group.
+#              Everything asserted below is a property the grouping must NOT change: the rows, the ONE
+#              commit per statement, the exactness of the change feed across group boundaries, and the
+#              preservation of stable row ids (whose all-or-nothing rule now has to be decided BEFORE the
+#              first group is written). Set FABRICATOR_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
+# group: [fabricator]
+
+require fabricator
+
+require parquet
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+# 6000 rows is deliberate, not arbitrary: the read-back yields ~2048 rows per batch, so this spans THREE
+# batches and therefore three groups. A few-hundred-row table would take the single-group path and this
+# whole file would assert nothing about grouping.
+
+# ---- 1. autocommit merge-on-read across several groups ----
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/grp' AS lake (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE lake.main.t AS SELECT i AS id, i * 2 AS a, 'p' || i AS b FROM range(1, 6001) AS r(i);
+
+query I
+SELECT max(version) FROM fabricator_delta_snapshots('lake', 't');
+----
+1
+
+statement ok
+UPDATE lake.main.t SET a = a + 1 WHERE id > 0;
+
+# Every row updated exactly once — a group boundary must not skip or double-apply a row.
+query III
+SELECT count(*), sum(a), count(DISTINCT id) FROM lake.main.t;
+----
+6000	36012000	6000
+
+query III
+SELECT id, a, b FROM lake.main.t WHERE id IN (1, 2049, 4097, 6000) ORDER BY id;
+----
+1	3	p1
+2049	4099	p2049
+4097	8195	p4097
+6000	12001	p6000
+
+# ⚠ THE LOAD-BEARING ASSERTION: ONE new version, not one per group. Grouping changes WHEN data files are
+# written, never how many times the statement commits.
+query I
+SELECT max(version) FROM fabricator_delta_snapshots('lake', 't');
+----
+2
+
+# A partial update, so the deletion-vector mask is a strict subset spanning group boundaries.
+statement ok
+UPDATE lake.main.t SET b = 'q' WHERE id % 3 = 0;
+
+query II
+SELECT count(*), count(DISTINCT b) FROM lake.main.t WHERE b = 'q';
+----
+2000	1
+
+query I
+SELECT count(*) FROM lake.main.t;
+----
+6000
+
+query I
+SELECT max(version) FROM fabricator_delta_snapshots('lake', 't');
+----
+3
+
+statement ok
+DETACH lake;
+
+# ---- 2. inside an EXPLICIT transaction: the buffered path groups too, and still fuses ONE commit ----
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/grpx' AS lake2 (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE lake2.main.t AS SELECT i AS id, i AS a FROM range(1, 6001) AS r(i);
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE lake2.main.t SET a = a * 10 WHERE id > 0;
+
+# Read-your-writes across group boundaries: the pending files serve the mid-transaction read.
+query II
+SELECT count(*), sum(a) FROM lake2.main.t;
+----
+6000	180030000
+
+statement ok
+COMMIT;
+
+query II
+SELECT count(*), sum(a) FROM lake2.main.t;
+----
+6000	180030000
+
+# CREATE (v0) + data (v1) + the fused UPDATE (v2) — the buffered UPDATE's groups are ONE commit.
+query I
+SELECT max(version) FROM fabricator_delta_snapshots('lake2', 't');
+----
+2
+
+# ROLLBACK of a grouped UPDATE discards every group's work.
+statement ok
+BEGIN;
+
+statement ok
+UPDATE lake2.main.t SET a = -1 WHERE id > 0;
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT count(*), sum(a) FROM lake2.main.t WHERE a = -1;
+----
+0	NULL
+
+query II
+SELECT count(*), sum(a) FROM lake2.main.t;
+----
+6000	180030000
+
+statement ok
+DETACH lake2;
+
+# ---- 3. CDF: the pre/post-image pair must be exact ACROSS group boundaries ----
+# Each group stages its own pre-images then its own post-images, so a mis-paired group would show up as a
+# feed whose images do not line up row for row.
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/grpcdf' AS lake3 (TYPE fabricator, PROVIDER 'delta', change_data_feed true);
+
+statement ok
+CREATE TABLE lake3.main.t AS SELECT i AS id, i AS a FROM range(1, 6001) AS r(i);
+
+statement ok
+UPDATE lake3.main.t SET a = a + 100 WHERE id > 0;
+
+# One pre-image and one post-image per updated row, all at the SAME version.
+query III
+SELECT _change_type, count(*), count(DISTINCT _commit_version)
+FROM fabricator_delta_changes('lake3', 'main.t', 2)
+WHERE _change_type LIKE 'update_%'
+GROUP BY _change_type ORDER BY _change_type;
+----
+update_postimage	6000	1
+update_preimage	6000	1
+
+# The pair joins row for row with exactly the applied delta — nothing lost or duplicated at a boundary.
+query II
+SELECT count(*), sum(post.a - pre.a)
+FROM (SELECT id, a FROM fabricator_delta_changes('lake3', 'main.t', 2) WHERE _change_type = 'update_preimage') pre
+JOIN (SELECT id, a FROM fabricator_delta_changes('lake3', 'main.t', 2) WHERE _change_type = 'update_postimage') post
+  USING (id);
+----
+6000	600000
+
+statement ok
+DETACH lake3;
+
+# ---- 4. row tracking: stable ids survive a grouped UPDATE ----
+# The all-or-nothing id rule is now decided BEFORE the read-back (from the selected files' baseRowId),
+# because a group is written before the later groups' ids are known. If that decision were wrong, the
+# post-images of some groups would carry fresh ids and the id set would no longer be the original one.
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/grprt' AS lake4 (TYPE fabricator, PROVIDER 'delta', row_tracking true);
+
+statement ok
+CREATE TABLE lake4.main.t AS SELECT i AS id, i AS a FROM range(1, 6001) AS r(i);
+
+# The ids before the update, as a set.
+query III
+SELECT count(*), count(DISTINCT __delta_row_id), sum(__delta_row_id) FROM lake4.main.t;
+----
+6000	6000	17997000
+
+statement ok
+UPDATE lake4.main.t SET a = a + 7 WHERE id > 0;
+
+# IDENTICAL id set afterwards — every row kept its own id through its group's write.
+query III
+SELECT count(*), count(DISTINCT __delta_row_id), sum(__delta_row_id) FROM lake4.main.t;
+----
+6000	6000	17997000
+
+# And each id still points at the same logical row.
+query II
+SELECT id, a FROM lake4.main.t WHERE __delta_row_id IN (0, 2048, 5999) ORDER BY id;
+----
+1	8
+2049	2056
+6000	6007
+
+statement ok
+DETACH lake4;

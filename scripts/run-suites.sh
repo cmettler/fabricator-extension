@@ -122,7 +122,11 @@ case "$TIER" in
         # deletion vector it staged (EW #46's ledger + #49's fix). MEASURED before the change: the same shape
         # left a stray deletion_vector_*.bin forever. The section needs a delete LARGER than the 1 KB roaring
         # inline threshold, or the vector rides inside the commit json and there is no file to leak.
-        : "${MIN_SUITES:=65}"
+        # 66 runs since 2026-08-06: verify_delta_update_grouped (72) pins the UPDATE post-image GROUPED
+        # FLUSH. It is the one suite the runner gives a forced env var (see the case below), because the
+        # grouping's threshold is 64 MiB of Arrow data and nothing else here comes near it — without this
+        # suite the grouped path has NO coverage at all, at either tier.
+        : "${MIN_SUITES:=66}"
         # 5656 since 2026-08-02: verify_delta_catalog_transactions 943 -> 944 — ROLLBACK now RECLAIMS the
         # data files the transaction eagerly wrote (EW #52's DiscardDataFilesAsync) instead of leaving them
         # for VACUUM. +2, not +1: that suite is one of the DOUBLED ones below, so an assertion added to it
@@ -183,7 +187,16 @@ case "$TIER" in
         # with a single file, and would silently resurrect the later files' deleted rows), and a
         # FULLY-DELETED-FILE section (such a file is now skipped from the listing; skipping one that still has
         # live rows loses them silently, so every surviving row is asserted).
-        : "${MIN_ASSERTIONS:=6295}"
+        # 6367 since 2026-08-06: verify_delta_update_grouped (72) — a large UPDATE now writes its post-images
+        # in GROUPS as the read-back streams instead of accumulating every batch first (managed-heap peak
+        # 327 -> 171 MB on 600k x 16 cols; the process peak barely moves, because the UPDATE's dominant term
+        # is the BOXED SET-value dictionary built before any provider work — see DeltaReader.UpdateGroupBytes).
+        # The suite updates 6000 rows on purpose: the read-back yields ~2048 rows per batch, so it spans three
+        # groups. Mutation-tested — not clearing the per-group id list dies at the FIRST grouped UPDATE
+        # ("materializedRowIds must carry one entry per row"), and not clearing the per-group pre-images
+        # survives 51 assertions before the CDF section catches 12144 pre-images for 6000 rows. That second
+        # mutant is why the CDF section exists: sections 1 and 2 pass with it in place.
+        : "${MIN_ASSERTIONS:=6367}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
@@ -367,6 +380,21 @@ while IFS="$(printf '\t')" read -r suite provider; do
     # Only label the non-default leg, so the common output stays as it was.
     label="$suite"
     [ "$DELTA_PROVIDER" != 'delta' ] && label="$suite [$DELTA_PROVIDER]"
+
+    # THE UPDATE POST-IMAGE GROUPING NEEDS ITS THRESHOLD FORCED, or it ships with ZERO coverage.
+    # DeltaReader.UpdateGroupBytes defaults to 64 MiB of Arrow data before an UPDATE's post-images are
+    # written and dropped; no hermetic suite comes within two orders of magnitude of that, so every
+    # statement here takes the single-group path and the grouped one is never entered. This suite — and
+    # ONLY this suite — runs with the threshold at a single byte, making each read-back batch its own
+    # group; its assertions are properties the grouping must not change, and it passes identically with
+    # the default threshold (that equivalence is the point).
+    # The unset is load-bearing in the other direction: without it a value already exported in the
+    # developer's shell would silently group EVERY suite, so a run would not be testing the shipped
+    # default.
+    case "$suite" in
+        *verify_delta_update_grouped.test) export FABRICATOR_DELTA_UPDATE_GROUP_BYTES=1 ;;
+        *) unset FABRICATOR_DELTA_UPDATE_GROUP_BYTES ;;
+    esac
 
     output=$("$UNITTEST" --test-dir . "$suite" 2>&1)
     status=$?

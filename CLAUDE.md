@@ -1781,6 +1781,65 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   INSERTs re-apply the ORDER BY via a host-side spilling sort. verify_delta_sorted_by 30. Full as-built record (moved verbatim from here): [docs/feature-history.md](docs/feature-history.md).
 - **dbt DAX→Delta pipeline — DONE + validated live** (`dbt_dax_test/`, gitignored; plain-DAX model bodies
   via the custom `dax_table` materialization). Full as-built record (moved verbatim from here): [docs/feature-history.md](docs/feature-history.md).
+- **THE UPDATE POST-IMAGE GROUPED FLUSH — DONE 2026-08-06 (C#-only, no ABI). ⚠ IT DOES NOT FIX "UPDATE
+  MEMORY", AND THE MEASUREMENT SAYING SO IS THE MOST USEFUL THING HERE.** Both UPDATE paths
+  (`DeltaReader.MergeOnReadUpdateAsync` autocommit, `DeltaCatalog.BufferUpdateRows` buffered) used to
+  accumulate EVERY post-image batch — and every pre-image on a CDF table — before writing anything. They now
+  write a group's worth as the read-back streams and keep only the `WrittenDataFile`/`CdcFile` actions. Still
+  exactly ONE commit. Threshold `DeltaReader.UpdateGroupBytes`, 64 MiB of Arrow data, env-overridable via
+  `FABRICATOR_DELTA_UPDATE_GROUP_BYTES`.
+  - **⚠ FILE LAYOUT IS UNCHANGED BY CONSTRUCTION, which is what makes the grouping free rather than a
+    trade-off** — and it is worth knowing independently: `WriteDataFilesAsync` writes **one parquet file per
+    (input batch × partition)** (`DeltaTable.cs:5053`, a `foreach` over the batches), so N read-back batches
+    become N data files whether they arrive in one call or a hundred. The file count of an UPDATE's post-images
+    is therefore its BATCH count and no size target touches it. Measured: a 5000-row UPDATE adds 3 files, 50k
+    adds 25, 200k adds 98 — i.e. ~2048 rows per batch.
+  - **⚠ MEASURED, and the headline is not the one this was built for.** On the shape that favours it most
+    (600k rows × 16 VARCHAR, UPDATE every row, SET one column): **managed heap peak 327 → 171 MB** and now
+    bounded by the GROUP rather than by the statement — but **process peak working set only 614 → 548 MB**.
+    Time is flat (9.3 → 9.6 s; **71 flushes is as fast as 5**, so flush count costs nothing measurable). On a
+    NARROW table the grouping does not fire at all: 1M rows × 3 columns accumulates ~50 MB of read-back, under
+    the threshold, and peak is **identical either way (449 MB)** — so the earlier "~474 MB per 1M matched rows"
+    figure was never mostly this.
+  - **⚠ THE ACTUAL DOMINANT TERM, found by instrumenting the working set through the path: ~180 MB is already
+    spent BEFORE the read-back begins (253 MB at 1M × 3 cols).** That is DuckDB's own side of the statement
+    plus, on ours, `DeltaCatalog.ExecuteUpdate`'s `Dictionary<long, object?[]>` of **BOXED** SET values, the
+    Arrow batch rebuilt from it, and `updRowByRid` — all three complete before any provider work starts, all
+    three scaling with MATCHED rows. **NEXT FIX: keep the SET values in Arrow form per input chunk instead of
+    boxing them** (`updRowByRid` becomes rowid → (batch, row)). That is a DML-seam change, not a Delta one.
+  - **⚠ THE ALL-OR-NOTHING ROW-ID RULE HAD TO MOVE EARLIER, and that is the one semantic consequence.** A
+    group is written before the later groups' ids are known, so "every selected row resolved a stable id" can
+    no longer be decided after the read-back. It is now decided BEFORE it, from the files: the read-back yields
+    a null id only where the row's file has no `baseRowId` AND no materialized value, and a writer that
+    materializes ids also stamps `baseRowId` (the spec requires one on every `add` of a row-tracking table), so
+    "every selected file has a baseRowId" is the same condition — a dictionary lookup per selected path
+    (`snapshot.ActiveFiles`), no extra IO. Autocommit checks the SELECTION's paths; the buffered path uses the
+    new `TxnDmlProfile.AllFilesRowTracked` (computed in the probe it already does) and trusts it ONLY when the
+    pinned version IS the version it describes. **Where it cannot be established the threshold is DISABLED and
+    the statement buffers whole, byte-identically to before** — a legacy table keeps its old behaviour instead
+    of acquiring new semantics from a memory fix. A null appearing after a group was written WITH ids throws
+    loudly rather than silently splitting identity.
+  - Also trimmed: `ridsPerBatch` / `srcTracking` are now drained per batch (their producer only appends, never
+    reads them back), so they no longer accumulate across the statement either.
+  - **64 MiB rather than 16 MiB** (which measured marginally better, 152 MB heap) because the BUFFERED path's
+    per-group write **opens the table**, i.e. one `_delta_log` LIST per group — cheap locally, not on
+    OneLake/S3. Removable: the pair already holds an open table (`EnsureHeldTableAsync`) that
+    `TryEagerWriteBatches` predates and could use. The CDF writes already use the held pair, so they cost
+    nothing extra per group.
+  - **⚠ GATE: `verify_delta_update_grouped.test` (72), and it needs the runner to FORCE the threshold.** No
+    hermetic suite comes within two orders of magnitude of 64 MiB, so without this the grouped path ships with
+    ZERO coverage; `run-suites.sh` gives this ONE suite `FABRICATOR_DELTA_UPDATE_GROUP_BYTES=1` and `unset`s it
+    for every other (load-bearing in both directions — a value left in the developer's shell would otherwise
+    group every suite and the shipped default would go untested). It updates **6000 rows on purpose** (~2048 per
+    batch ⇒ three groups) and asserts the ONE commit per statement, read-your-writes + ROLLBACK on the buffered
+    path, the CDF pair joining row-for-row across group boundaries, and stable ids surviving. It passes
+    IDENTICALLY with the default threshold — that equivalence is the point. **Mutation-tested with two mutants,
+    each killed at its own section**: not clearing the per-group id list dies at the FIRST grouped UPDATE
+    (*"materializedRowIds must carry one entry per row"*), and not clearing the per-group pre-images **survives
+    51 assertions** before the CDF section catches **12144 pre-images for 6000 rows** — which is precisely why
+    that section exists.
+  - Gates: hermetic **66/66 — 6367**; the three engine-doubled delta suites also re-run with
+    `GROUP_BYTES=1` at identical assertion counts.
 - **Eager-write DeltaTxnBuffer — ALL SLICES DONE (A, B, C1–C3, D + edge lifts).** Data files always land
   on storage at statement time; the buffer holds ACTIONS. **"Rollback = invisible orphans for VACUUM" is
   now HISTORICAL — as of 2026-08-02 a ROLLBACK RECLAIMS the bytes, via two mechanisms with different

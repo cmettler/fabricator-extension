@@ -843,10 +843,16 @@ internal static class DeltaReader
     /// plus the current version (the pin fallback when no scan pinned the transaction yet).
     /// <paramref name="MaterializeRowIds"/> = the table declares
     /// <c>delta.rowTracking.materializedRowIdColumnName</c> (implied by row tracking on our created tables) —
-    /// UPDATE post-images then bake each row's ORIGINAL stable id into that column.</summary>
+    /// UPDATE post-images then bake each row's ORIGINAL stable id into that column.
+    /// <para><paramref name="AllFilesRowTracked"/> = every ACTIVE file at <paramref name="Version"/> carries a
+    /// <c>baseRowId</c>, so a read-back of any of them resolves a stable id for every row. It is what lets a
+    /// buffered UPDATE decide the statement-wide all-or-nothing id rule BEFORE reading, which is the
+    /// precondition for writing its post-images in groups instead of accumulating them
+    /// (see <c>UpdateGroupBytes</c>). ⚠ It describes <paramref name="Version"/> and nothing else — a consumer
+    /// reading back at a DIFFERENT pinned version must not trust it, because the file set differs.</para></summary>
     public readonly record struct TxnDmlProfile(
         bool DvEnabled, bool CdfEnabled, bool SupportsExternalCommit, long Version, bool Partitioned,
-        bool MaterializeRowIds);
+        bool MaterializeRowIds, bool AllFilesRowTracked);
 
     /// <summary>The active files' baseRowIds in transient-rowid ordinal order (see
     /// <see cref="DeltaTable.OrderedActiveBaseRowIds"/>) — resolves a matched row's ORIGINAL stable id
@@ -889,10 +895,15 @@ internal static class DeltaReader
             bool matIds = cfg is not null
                 && cfg.TryGetValue("delta.rowTracking.materializedRowIdColumnName", out var m)
                 && !string.IsNullOrEmpty(m);
+            bool allTracked = true;
+            foreach (var add in table.CurrentSnapshot.ActiveFiles.Values)
+            {
+                if (add.BaseRowId is null) { allTracked = false; break; }
+            }
             return new TxnDmlProfile(dv, cdf, table.SupportsExternalDataFileCommit,
                                      table.CurrentSnapshot.Version,
                                      table.CurrentSnapshot.Metadata.PartitionColumns.Count > 0,
-                                     matIds);
+                                     matIds, allTracked);
         }
         finally
         {
@@ -2135,6 +2146,83 @@ internal static class DeltaReader
         }
     }
 
+    /// <summary>
+    /// How many bytes of Arrow data an UPDATE's read-back may hold before its post-images are written out and
+    /// the batches dropped. Overridable via <c>FABRICATOR_DELTA_UPDATE_GROUP_BYTES</c> — set it absurdly high
+    /// to reproduce the pre-grouping behaviour, which is how the A/B for this was measured.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>This is a pure MEMORY bound with no effect on file layout</b>, which is why it needs no size
+    /// policy of its own and why it can be picked freely: <see cref="DeltaTable.WriteDataFilesAsync"/> writes
+    /// ONE parquet file per (input batch × partition), so N read-back batches become N data files whether they
+    /// arrive in one call or in a hundred. Do NOT reach for <c>delta.targetFileSize</c> here — it would read
+    /// as if the grouping were sizing files, which it is not.</para>
+    /// <para>The accounting deliberately DOUBLE-COUNTS a buffer shared between a pre-image and its post-image
+    /// (an unchanged column is aliased, not copied), so the estimate errs high and the group flushes early.</para>
+    /// <para><b>⚠ MEASURED, AND THE HEADLINE IS NOT THE ONE THIS WAS BUILT FOR (2026-08-06).</b> On the shape
+    /// that favours it most — 600k rows × 16 VARCHAR columns, UPDATE every row, SET one column — the MANAGED
+    /// HEAP peak falls <b>327 → 171 MB</b> (and is now bounded by the group rather than by the statement, which
+    /// is the durable property), while the PROCESS peak working set falls only <b>614 → 548 MB</b>. Time is
+    /// flat (9.3 s → 9.6 s; 71 flushes is as fast as 5, so flush count costs nothing measurable). On a NARROW
+    /// table the grouping does not fire at all: 1M rows × 3 columns accumulates only ~50 MB of read-back, well
+    /// under the threshold, and peak is identical either way (449 MB).</para>
+    /// <para><b>⚠ So the UPDATE's dominant memory term is NOT this, and a caller must not read the grouping as
+    /// "UPDATE memory is fixed".</b> Instrumenting the working set through the path put <b>~180 MB already
+    /// spent before the read-back begins</b> (1M × 3 columns: 253 MB) — that is DuckDB's own side of the
+    /// statement plus, on our side, <c>DeltaCatalog.ExecuteUpdate</c>'s <c>Dictionary&lt;long, object?[]&gt;</c>
+    /// of BOXED SET values, the Arrow batch rebuilt from it, and <c>updRowByRid</c>. All three scale with
+    /// matched rows and are complete before any provider work starts. Fixing THAT means keeping the SET values
+    /// in Arrow form per input chunk instead of boxing them — a change to the DML seam, not to this file.</para>
+    /// <para>64 MiB rather than 16 MiB (which measured marginally better, 152 MB heap) because the BUFFERED
+    /// path's per-group write opens the table, i.e. one <c>_delta_log</c> LIST per group — cheap locally,
+    /// not on OneLake/S3. 5 flushes buys nearly all of the 16-MiB benefit at a quarter of the opens.</para>
+    /// </remarks>
+    internal static readonly long UpdateGroupBytes = ResolveEnvBytes(
+        "FABRICATOR_DELTA_UPDATE_GROUP_BYTES", 64L * 1024 * 1024);
+
+    private static long ResolveEnvBytes(string name, long fallback)
+        => long.TryParse(System.Environment.GetEnvironmentVariable(name),
+                         NumberStyles.Integer, CultureInfo.InvariantCulture, out long v) && v > 0
+            ? v
+            : fallback;
+
+    /// <summary>
+    /// A batch's approximate in-memory footprint: every buffer of every array, all nesting levels. Used only
+    /// to decide when an accumulating group is big enough to write, so an over-estimate is harmless (it
+    /// flushes sooner) — shared buffers are counted once per array that references them.
+    /// </summary>
+    internal static long ApproxBatchBytes(RecordBatch batch)
+    {
+        long total = 0;
+        for (int c = 0; c < batch.ColumnCount; c++)
+        {
+            total += ApproxArrayBytes(batch.Column(c).Data);
+        }
+        return total;
+    }
+
+    private static long ApproxArrayBytes(ArrayData? data)
+    {
+        if (data is null)
+        {
+            return 0;
+        }
+        long total = 0;
+        foreach (var buf in data.Buffers)
+        {
+            total += buf.Length;
+        }
+        if (data.Children is not null)
+        {
+            foreach (var child in data.Children)
+            {
+                total += ApproxArrayBytes(child);
+            }
+        }
+        total += ApproxArrayBytes(data.Dictionary);
+        return total;
+    }
+
     /// <summary>The clustered rewrite's per-file size target: the <c>delta.targetFileSize</c> table property
     /// (Databricks; plain bytes or a b/kb/mb/gb suffix), else 128 MiB — engineered-wood's own
     /// <c>CompactionOptions.TargetFileSize</c> default, so clustered and bin-pack OPTIMIZE aim alike.</summary>
@@ -2547,22 +2635,132 @@ internal static class DeltaReader
                            && matRowId is not null && matRowVer is not null;
         bool cdfEnabled = EngineeredWood.DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(cfg);
 
-        var preImages = cdfEnabled ? new List<RecordBatch>() : null;
-        var postImages = new List<RecordBatch>();
-        // Flat across every batch, in emission order — that is how WriteDataFilesAsync consumes it.
-        var stableIdsRaw = materialize ? new List<long?>() : null;
+        // ── GROUPED FLUSH: the read-back streams, it is not accumulated ────────────────────────────────
+        // A group of read-back batches becomes data files (and, on a CDF table, its change files) as soon as
+        // it is big enough, and only the returned WrittenDataFile metadata is kept. Peak memory therefore
+        // tracks the GROUP rather than the statement — it was ~474 MB for a 1M-row UPDATE, which is the whole
+        // reason this shape exists. Still exactly ONE commit.
+        //
+        // ⚠ FILE LAYOUT IS UNCHANGED BY CONSTRUCTION, which is what makes the grouping free rather than a
+        // trade: WriteDataFilesAsync writes one parquet file per (input batch × partition), so N read-back
+        // batches yield N data files whether they arrive in one call or in G calls. See UpdateGroupBytes.
+        //
+        // ⚠ The transaction is created BEFORE the read-back — it HAS to be, because StageChangeDataAsync is a
+        // method on it and each group's CDF pair is staged as that group is written. It is still based on the
+        // PINNED snapshot, so the commit's validation is unchanged; the only difference is that it stays open
+        // across the read-back, holding a pin it already held. (Nothing re-opens the table in between, so
+        // WriteDataFilesAsync' own CurrentSnapshot read is the same snapshot for every group.)
+        await using var txn = table.StartTransaction(
+            snapshot, serializable ? IsolationLevel.Serializable : IsolationLevel.WriteSerializable);
+        txn.Operation = "UPDATE";
+
+        // ⚠ THE ALL-OR-NOTHING ROW-ID RULE NOW HAS TO BE DECIDED UP FRONT, BECAUSE A GROUP IS WRITTEN BEFORE
+        // THE LATER GROUPS' IDS ARE KNOWN — and the rule is statement-wide (a partially materialised statement
+        // would leave identity depending on which rows happened to resolve). The read-back yields a null id
+        // only for a row whose file carries no baseRowId AND no materialized value; a writer that materializes
+        // ids also stamps baseRowId (the spec requires one on every `add` of a row-tracking table), so
+        // "every selected file has a baseRowId" is the same condition, and it is a dictionary lookup per
+        // selected path with no extra IO.
+        // Where it can NOT be established the group threshold is DISABLED, so that statement buffers whole and
+        // behaves exactly as it did before — a legacy shape keeps its old behaviour instead of acquiring new
+        // semantics from a memory fix.
+        bool idsPreResolved = materialize && AllSelectedFilesRowTracked(snapshot, selection);
+        long groupBytes = !materialize || idsPreResolved ? UpdateGroupBytes : long.MaxValue;
+
+        var preGroup = cdfEnabled ? new List<RecordBatch>() : null;
+        var postGroup = new List<RecordBatch>();
+        // Flat across the GROUP's batches, in emission order — that is how WriteDataFilesAsync consumes it.
+        var idGroup = materialize ? new List<long?>() : null;
+        var written = new List<WrittenDataFile>();
+        long groupAccum = 0;
+        long matched = 0;
+        bool idsUnresolvable = false;
+        bool wroteWithIds = false;
+
+        async System.Threading.Tasks.Task FlushGroupAsync()
+        {
+            if (postGroup.Count == 0)
+            {
+                return;
+            }
+            // VARIANT: everything below hands batches to engineered-wood (the data files and the CDF pair), so
+            // canonicalise here. The images were built from a TRANSPORT read-back plus transport SET values,
+            // which is why ReadSelectedRowsAsync must stay in the transport dialect — the two have to agree
+            // before the substitution, and only the EW-facing side converts.
+            var ewPost = VariantTransport.ToCanonical(postGroup);
+            var ewPre = preGroup is null ? null : VariantTransport.ToCanonical(preGroup);
+
+            List<long?>? ids = null;
+            if (idGroup is not null && !idsUnresolvable)
+            {
+                ids = new List<long?>(idGroup);
+                wroteWithIds = true;
+            }
+            else if (wroteWithIds)
+            {
+                // Unreachable unless the spec invariant the up-front decision rests on is violated (a file
+                // carrying materialized ids but no baseRowId). Loud, because the alternative is a statement
+                // whose earlier rows kept their identity and whose later rows silently did not.
+                throw new System.InvalidOperationException(
+                    "merge-on-read UPDATE: a row-id became unresolvable after post-images had already been "
+                    + "written with their original ids — the selection's files disagree about row tracking.");
+            }
+
+            // Post-images become data files NOW (invisible until the commit references them). An abort
+            // therefore leaves them as orphans for VACUUM — the same eager-write contract the buffered path
+            // documents.
+            written.AddRange(await table.WriteDataFilesAsync(ewPost, token, materializedRowIds: ids)
+                .ConfigureAwait(false));
+
+            if (ewPre is not null)
+            {
+                // ⚠ rowIds/rowCommitVersions are deliberately NOT supplied, which leaves the staged change
+                // rows with NULL ids on the feed. That is what BOTH previous paths did — the retired
+                // engineered-wood entry point and the buffered one — so passing them here would be a behaviour
+                // change riding along in a refactor whose gates exist to prove equivalence. Supplying them is
+                // a real improvement on a row-tracking table (a `cdc` action has no baseRowId, so the change
+                // file is the only place a change row's identity can live) and the ids are in hand as
+                // `idGroup` — but it is its own change, with its own gate.
+                // Pre-images then post-images WITHIN the group, so a single-group statement stages them in
+                // exactly the order it always did.
+                foreach (var pre in ewPre)
+                {
+                    await txn.StageChangeDataAsync(pre,
+                            EngineeredWood.DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage, token)
+                        .ConfigureAwait(false);
+                }
+                foreach (var post in ewPost)
+                {
+                    await txn.StageChangeDataAsync(post,
+                            EngineeredWood.DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage, token)
+                        .ConfigureAwait(false);
+                }
+            }
+
+            // Drop the references — this is the point of the whole shape. Not Dispose(): an unchanged column
+            // is ALIASED from the pre-image into the post-image, so disposing both would release one buffer
+            // twice.
+            postGroup.Clear();
+            preGroup?.Clear();
+            idGroup?.Clear();
+            groupAccum = 0;
+        }
 
         // Scoped read-back of ONLY the selected rows, with their identities as columns. Not a whole-table
         // read: ReadRowsAsync resolves the selection against the pinned snapshot and touches just its files.
+        // Both out-lists are drained per batch (their producer only ever appends, never reads them back), so
+        // the rowids and source tracking do not accumulate across the statement either.
         var ridsPerBatch = new List<long[]>();
         var srcTracking = materialize ? new List<(long?[] Ids, long?[] Versions)>() : null;
-        int bi = -1;
         await foreach (var batch in ReadSelectedRowsAsync(table, snapshot, selection,
                            sourceTrackingOut: srcTracking, rowIdsOut: ridsPerBatch, ct: token)
                            .ConfigureAwait(false))
         {
-            bi++;
-            var rids = ridsPerBatch[bi];
+            var rids = ridsPerBatch[ridsPerBatch.Count - 1];
+            ridsPerBatch.Clear();
+            var srcIds = srcTracking is { Count: > 0 } ? srcTracking[srcTracking.Count - 1].Ids : null;
+            srcTracking?.Clear();
+
             // Row-aligned index into `updates` for each row of this batch, keyed by ROWID.
             var takeIdx = new List<int>(batch.Length);
             for (int i = 0; i < batch.Length; i++)
@@ -2577,74 +2775,59 @@ internal static class DeltaReader
                     ? EngineeredWood.Arrow.ArrowCompute.Take(upd, takeIdx)
                     : batch.Column(c);
             }
-            preImages?.Add(batch);
-            postImages.Add(new RecordBatch(batch.Schema, columns, batch.Length));
+            var post = new RecordBatch(batch.Schema, columns, batch.Length);
+            preGroup?.Add(batch);
+            postGroup.Add(post);
+            matched += batch.Length;
+            groupAccum += ApproxBatchBytes(batch) + ApproxBatchBytes(post);
 
-            if (stableIdsRaw is not null)
+            if (idGroup is not null)
             {
-                var ids = srcTracking is not null && bi < srcTracking.Count ? srcTracking[bi].Ids : null;
                 for (int i = 0; i < batch.Length; i++)
                 {
-                    stableIdsRaw.Add(ids is not null && i < ids.Length ? ids[i] : null);
+                    long? id = srcIds is not null && i < srcIds.Length ? srcIds[i] : null;
+                    if (id is null) { idsUnresolvable = true; }
+                    idGroup.Add(id);
                 }
             }
+
+            if (groupAccum >= groupBytes)
+            {
+                await FlushGroupAsync().ConfigureAwait(false);
+            }
         }
-        if (postImages.Count == 0)
+        await FlushGroupAsync().ConfigureAwait(false);
+
+        if (matched == 0)
         {
+            // Nothing selected resolved to a row. Leaving via `await using` ABORTS the transaction, which has
+            // staged nothing, so this is the same no-op the early return always was.
             return;
         }
-
-        // All-or-nothing, deliberately: a partially materialized statement would leave row identity depending
-        // on which rows happened to resolve. ANY unresolvable id (a source file predating row tracking) writes
-        // the whole statement's post-images with FRESH ids rather than a mix.
-        List<long?>? stableIds = stableIdsRaw is not null && stableIdsRaw.TrueForAll(x => x.HasValue)
-            ? stableIdsRaw
-            : null;
-
-        // Post-images become data files NOW (invisible until a commit references them), carrying the original
-        // ids. An abort therefore leaves them as orphans for VACUUM — the same eager-write contract the
-        // buffered path documents.
-        // VARIANT: everything from here down hands batches to engineered-wood (the data files and the CDF
-        // pair), so canonicalise once. The images were built from a TRANSPORT read-back plus transport SET
-        // values, which is why ReadSelectedRowsAsync above must stay in the transport dialect — the two have
-        // to agree before the substitution, and only the EW-facing side converts.
-        var ewPost = VariantTransport.ToCanonical(postImages);
-        var ewPre = preImages is null ? null : VariantTransport.ToCanonical(preImages);
-
-        var written = await table.WriteDataFilesAsync(ewPost, token, materializedRowIds: stableIds)
-            .ConfigureAwait(false);
 
         // ONE version: the deletion-vector mask, the post-image append and the CDF pair. Based on the PINNED
         // snapshot — the parameterless StartTransaction would make the commit's validation vacuous, since it
         // would ask what landed since the version it just read.
-        await using var txn = table.StartTransaction(
-            snapshot, serializable ? IsolationLevel.Serializable : IsolationLevel.WriteSerializable);
-        txn.Operation = "UPDATE";
         await txn.StageRowDeletesAsync(selection, token).ConfigureAwait(false);
         await txn.StageDataFilesAsync(written, cancellationToken: token).ConfigureAwait(false);
-        if (ewPre is not null)
+        await txn.CommitAsync(token).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Whether every data file the selection names carries a <c>baseRowId</c> — i.e. whether the read-back is
+    /// guaranteed to resolve a stable id for every selected row, decidable WITHOUT reading anything.
+    /// A path the snapshot does not know counts as untracked: unknown is not "yes".
+    /// </summary>
+    private static bool AllSelectedFilesRowTracked(
+        EngineeredWood.DeltaLake.Snapshot.Snapshot snapshot, RowSelection selection)
+    {
+        foreach (var path in selection.Paths)
         {
-            // ⚠ rowIds/rowCommitVersions are deliberately NOT supplied, which leaves the staged change rows
-            // with NULL ids on the feed. That is what BOTH previous paths did — the retired engineered-wood
-            // entry point and the buffered one — so passing them here would be a behaviour change riding along
-            // in a refactor whose gates exist to prove equivalence. Supplying them is a real improvement on a
-            // row-tracking table (a `cdc` action has no baseRowId, so the change file is the only place a
-            // change row's identity can live) and the ids are already in hand as `stableIdsRaw` — but it is its
-            // own change, with its own gate, keyed PER BATCH since StageChangeDataAsync takes one id per row of
-            // the single batch it is handed.
-            foreach (var pre in ewPre)
+            if (!snapshot.ActiveFiles.TryGetValue(path, out var add) || add.BaseRowId is null)
             {
-                await txn.StageChangeDataAsync(pre,
-                        EngineeredWood.DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage, token)
-                    .ConfigureAwait(false);
-            }
-            foreach (var post in ewPost)
-            {
-                await txn.StageChangeDataAsync(post,
-                        EngineeredWood.DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage, token)
-                    .ConfigureAwait(false);
+                return false;
             }
         }
-        await txn.CommitAsync(token).ConfigureAwait(false);
+        return true;
     }
 }
