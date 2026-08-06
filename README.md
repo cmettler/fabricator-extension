@@ -1319,7 +1319,7 @@ environment variables rather than `SET`, because they are read below the session
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `FABRICATOR_DELTA_BATCH_MIN_FILES` | `2` | From this many files up, a scan reads its **deletion-vector-free** files in ONE `read_parquet([…])` instead of one query per file. `0` disables batching (every file gets its own query); `1` batches even a single-file scan |
+| `FABRICATOR_DELTA_BATCH_MIN_FILES` | `2` | From this many files up, a scan reads its files in ONE `read_parquet([…])` instead of one query per file. `0` disables batching (every file gets its own query); `1` batches even a single-file scan |
 | `FABRICATOR_DELTA_PREFETCH` | `1` | How many per-file queries run concurrently. `1` is sequential; higher values overlap cloud I/O, which is where they pay |
 
 Batching matters most on a **fragmented** table — the shape an incremental dbt model grows, since every run
@@ -1328,10 +1328,15 @@ appends a file. It removes roughly 1.5–2 ms of per-file overhead, so on 200 fi
 are identical either way; if you ever need to check that, run the same query with
 `FABRICATOR_DELTA_BATCH_MIN_FILES=0`.
 
-Files that carry a deletion vector keep their own query on purpose: it lets the reader bound the surviving row
-positions and skip whole parquet row groups, which a single combined query cannot express. A few other shapes
-also stay per-file and need no action from you — `UPDATE`/`DELETE` (they need a per-row position), partition
-columns, the `__delta_row_id` / `__delta_row_commit_version` columns, and tables using `column_mapping 'id'`.
+Deleted rows and `UPDATE`/`DELETE` are batched too: the deletion vectors of every file cross as ONE bound
+input and are excluded by a single anti-join. Measured on 100 files that all carry a deletion vector,
+0.42 s → 0.15 s. The trade is that a combined query cannot carry a per-file row-position bound, so it loses
+some parquet row-group skipping on a heavily-deleted file — which measured as no wall-clock difference
+locally, but is worth re-checking on remote storage.
+
+Some shapes still read file by file and need no action from you: partitioned tables, nested (`STRUCT`) columns
+when the row identity is also wanted, the `__delta_row_id` / `__delta_row_commit_version` columns, and tables
+using `column_mapping 'id'`. Two of those are DuckDB limitations rather than ours.
 
 ## Diagnostic logging
 

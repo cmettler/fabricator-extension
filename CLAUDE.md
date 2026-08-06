@@ -1985,13 +1985,75 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     what would go untested is the batched path on a ONE-file scan — the shape most suites actually build. The
     `unset` for every other suite is load-bearing in an extra direction too: a stray `0` in a developer's shell
     DISABLES batching everywhere, so a green tier would be testing only the old loop while looking complete.
-  - **STILL OPEN, in the order the win would arrive:** (1) the rowid / DV / partition / row-tracking shapes, all
-    of which need `filename`-keyed per-file metadata joined in SQL — **`filename` was verified to echo the exact
-    string passed in the list**, so the join key is stable, but a mismatch would silently DROP that file's rows,
-    so it needs a `LEFT JOIN` + an `error()` on an unmatched file rather than an inner join; (2) id mode, once
-    #24407 lands; (3) `FullTableSql`'s inlined DV literals (unchanged — still the documented
-    `WITH … AS MATERIALIZED` fix). And the residual per-row cost is the Arrow hand-back, which no batching
-    touches.
+  - **THE FULL FORM — DONE, and it is what the original ask actually was.** The first pass shipped a NARROW
+    version that batched only plain scans and gated off the rowid and the deletion vectors — i.e. it gated off
+    the substance ("composes with filename+file_row_number so the DV becomes ONE input keyed (filename,pos)")
+    and reported the easy half as the feature. The user caught it: *"you actually implemented nothing I thought
+    you were implementing."* **Do not narrow a deliverable and report it as done** — the facts needed for the
+    real form were already measured in the same session and I took the small branch anyway.
+    - Now: ONE query covers EVERY file, with the deletion vectors of all files bound as a single
+      `(filename, pos)` Arrow input anti-joined once, and the per-file global ordinal bound as a second input
+      joined on `filename`, so `_metadata.row_id` = `(ord << 40) | file_row_number` is expressible ⇒ **UPDATE /
+      DELETE scans batch too.** Both inputs sit in `WITH … AS MATERIALIZED` CTEs. MEASURED on 100 files that ALL
+      carry a deletion vector: **0.416 s → 0.145 s (~2.8x)**, identical answers.
+    - **⚠ IT DOES NOT USE THE `schema` MAP, AND THAT IS FORCED BY A DuckDB ASSERTION BUG.** Field-id keys are the
+      only kind that composes with the virtual columns — but a field-id-keyed map plus a virtual column raises
+      **`INTERNAL Error: No default expression in FieldId Map`** whenever the FILE contains a column with no field
+      id, and a materialized `__delta_row_id` is exactly that (row-tracking columns are not column-mapped). Row
+      tracking is ON by default and every merge-on-read post-image file has that column, so the field-id route is
+      unusable on the DEFAULT table shape. The same file reads fine with the map and no virtual columns ⇒ an
+      upstream assertion, worth reporting. So the full form uses **`union_by_name => true`** plus an explicit
+      physical→logical alias projection, which needs no field ids at all.
+    - **⚠ `union_by_name` CANNOT PRODUCE A COLUMN NO FILE IN THE LIST CARRIES** — binder error, and PRUNING makes
+      it routine (Delta-log pruning dropped the only file holding a newly-ADDed column, so `WHERE extra IS NULL`
+      broke). Fixed by ONE `parquet_schema([… whole list …])` query per scan resolving which stored names exist,
+      with the rest emitted as `CAST(NULL AS …)`. One query per SCAN, never per file.
+    - **⚠ A SECOND DuckDB ASSERTION gates partitioned tables:** `union_by_name` + a virtual column over a HIVE
+      layout raises `INTERNAL Error: Information loss on integer cast: value 4294967296 outside of target range`
+      (2^32 — a virtual-column sentinel meeting the auto-detected hive column). Gated on the table HAVING
+      partition columns, not on one being requested, because hive detection fires from the paths alone.
+    - It gives up the DV's PRUNABLE BOUND (one WHERE cannot carry a per-file range). Deliberate, and the evidence
+      is already in `DvRangeCondition`: its own A/B found that bound "demonstrably works and does not show up in
+      wall time". ⚠ Re-measure on REMOTE storage with a mostly-deleted file before calling it free there.
+    - Still per-file: partitioned tables, `column_mapping 'id'`, the row-tracking virtual columns (a materialized
+      id has no field id AND `union_by_name` cannot declare one), nested STRUCT columns in the full form (the
+      plain `schema`-map form still handles those), and any scan with a rowid/tracking fast-path filter.
+    - **⚠ A `count(*)` CONTROL PRODUCED A FALSE "IT WORKS" FOR THE THIRD TIME IN ONE SESSION.** The field-id +
+      virtual-column combination was pronounced fine on a multi-file `count(*)` — which DuckDB answers without
+      building the full mapping. Forcing a real decode reproduced the assertion immediately. **A parquet
+      aggregate the footer can answer is not a read; never use one as a control here.**
+    - New: `SingleScanArrowStream` wraps each bound input so a SECOND scan THROWS. Without it, a re-scan of the
+      single-use DV view returns zero rows and silently resurrects deleted rows; `MATERIALIZED` is what makes the
+      single scan true today, and this makes a future planner change fail instead of corrupting an answer.
+  - **⚠ THE GATED SHAPES SHOULD GO TO A `UNION ALL`, NOT TO THE LOOP — MEASURED 2026-08-06 after the user asked
+    "why didn't you choose the union instead of the looping part?", and the answer is that they were right and I
+    had not measured it.** Marginal cost per file on one 200-file table: **single `read_parquet([…], schema=…)`
+    ~0.2 ms / `UNION ALL` of per-file SELECTs ~0.4 ms / one host query per file ~1.9 ms** (40 files: 0.012 s vs
+    0.025 s; 200 files: 0.042 s vs 0.124 s — the union−single gap is ~0.4 ms per branch, roughly linear; all
+    three return the identical checksum). So the loop is ~4x worse than a union for shapes the single call cannot
+    express, and only the DV one was actually BLOCKED (on the `FullTableSql` literal-inlining problem below).
+    Rowid, partition literals and row tracking were not blocked at all.
+    - **A union does NOT lose per-file pruning, so `BatchPlan`'s case 4 is true of the single call and FALSE of a
+      union.** Established from the PLAN, not from timing (the trap `DvRangeCondition` records): with one branch
+      carrying `file_row_number >= 4000`, its `READ_PARQUET` shows `Filters: file_row_number>=4000` and emits
+      **1,000 of 5,000** rows while the sibling branch emits all 5,000.
+    - **⚠ Two things to settle BEFORE building it, either of which shrinks the win.** (a) A union keeps the
+      per-file FOOTER PROBE (`ResolveFileMapping`) that `schema`'s `default_value` is what removed — so the
+      ~0.4 ms/file above is the QUERY cost only and the probe is on top, possibly the larger term. Isolate it
+      first. (b) `FullTableSql`'s "NOT usable for nested MAPPED columns" gate looks OVER-BROAD on inspection: in
+      name mode `StructShapeDiffers` is true for every file (stored != logical for every mapped child), so every
+      branch rebuilds to LOGICAL names and they agree; where names stay physical they do so in every branch. The
+      hazard needs branches to DISAGREE, which a shared table schema makes hard to arrange. Establish that rather
+      than assume it — the measured union hazard above is real, it just may not be reachable here.
+  - **STILL OPEN, in the order the win would arrive:** (1) the gated shapes via the union above; (2) id mode,
+    once #24407 lands; (3) `FullTableSql`'s inlined DV literals — still the documented `WITH … AS MATERIALIZED`
+    fix, and now a PREREQUISITE of (1) rather than a separate cleanup, since the DV files are what a union of the
+    gated shapes has to carry. A `filename`-keyed metadata join was the route recommended here first; the union
+    supersedes it (per-branch constants need no join at all), but the finding that made it plausible stands and
+    is worth keeping: **`filename` echoes the EXACT string passed in the list**, so it is a stable join key —
+    with the caveat that a mismatch would silently DROP that file's rows, so any such join needs a `LEFT JOIN`
+    plus an `error()` on an unmatched file. And the residual per-row cost is the Arrow hand-back, which no
+    batching of any shape touches.
 - **THE UPDATE POST-IMAGE GROUPED FLUSH — DONE 2026-08-06 (C#-only, no ABI). ⚠ IT DOES NOT FIX "UPDATE
   MEMORY", AND THE MEASUREMENT SAYING SO IS THE MOST USEFUL THING HERE.** Both UPDATE paths
   (`DeltaReader.MergeOnReadUpdateAsync` autocommit, `DeltaCatalog.BufferUpdateRows` buffered) used to

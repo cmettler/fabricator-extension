@@ -1,6 +1,6 @@
 # name: test/verify_delta_batched_read.test
-# description: The BATCHED native Delta read (DeltaNativeReader.BatchPlan) — the DV-free files of a scan collapse
-#              into ONE read_parquet([...], schema = map {...}) instead of one host query per file, which is worth
+# description: The BATCHED native Delta read (DeltaNativeReader.BatchPlan) — the files of a scan collapse
+#              into ONE query instead of one host query per file, which is worth
 #              ~1.5-1.9 ms of overhead per file (200 files x 100 rows: 0.464 s -> 0.090 s). This suite is run with
 #              FABRICATOR_DELTA_BATCH_MIN_FILES=1 by scripts/run-suites.sh so even a one-file scan takes the batched
 #              path — at the shipped default (2) most of it would silently test the per-file loop instead. Pins the
@@ -168,9 +168,11 @@ SELECT id FROM nm.main.nested WHERE (s).renamed = 31;
 3
 
 # ============================================================================
-# 4. DELETION VECTORS — decided PER FILE: the DV-carrying file keeps its own query (and
-#    its prunable bound), the clean files batch. If the split were dropped the deleted
-#    rows would come back, so this is the section that catches it.
+# 4. DELETION VECTORS — batched: every file's vector crosses as ONE bound (filename, pos)
+#    input, excluded by a single anti-join inside the one query. If that input were lost,
+#    or scanned twice (it is single-use), the deleted rows would come back, so this is the
+#    section that catches it. The plain fallback form instead SPLITS DV files off to the
+#    per-file loop, and this section covers that route too.
 # ============================================================================
 
 statement ok

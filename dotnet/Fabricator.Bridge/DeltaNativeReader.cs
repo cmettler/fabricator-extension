@@ -266,11 +266,13 @@ internal static class DeltaNativeReader
     internal sealed class BatchPlan
     {
         internal BatchPlan(string sql, IReadOnlyList<DeltaReader.NativeScanFile> files,
-                           IReadOnlyList<DeltaReader.NativeScanFile> loopFiles)
+                           IReadOnlyList<DeltaReader.NativeScanFile> loopFiles,
+                           Func<IReadOnlyList<(string, IArrowArrayStream)>>? inputs = null)
         {
             Sql = sql;
             Files = files;
             LoopFiles = loopFiles;
+            Inputs = inputs;
         }
 
         /// <summary>The single query covering <see cref="Files"/>.</summary>
@@ -279,8 +281,20 @@ internal static class DeltaNativeReader
         /// <summary>The files the one query reads.</summary>
         internal IReadOnlyList<DeltaReader.NativeScanFile> Files { get; }
 
-        /// <summary>The files that still need their own per-file query (they carry a deletion vector).</summary>
+        /// <summary>The files that still need their own per-file query.</summary>
         internal IReadOnlyList<DeltaReader.NativeScanFile> LoopFiles { get; }
+
+        /// <summary>Builds the bound Arrow inputs the SQL references (deletion vectors, per-file metadata), or
+        /// null when it references none. A FACTORY rather than a list because each is single-use: the schema
+        /// probe runs the same SQL with <c>LIMIT 0</c> and must not consume the streams the real scan needs.</summary>
+        internal Func<IReadOnlyList<(string, IArrowArrayStream)>>? Inputs { get; }
+
+        /// <summary>Runs this plan, binding its inputs.</summary>
+        internal IArrowArrayStream Query(string? suffix = null)
+        {
+            string sql = suffix is null ? Sql : Sql + suffix;
+            return Inputs is null ? Host.Query(sql) : Host.Query(sql, Inputs());
+        }
 
         /// <summary>Files below this count are not worth batching — kept on the proven per-file path.
         /// <c>FABRICATOR_DELTA_BATCH_MIN_FILES=0</c> disables batching entirely (which is how a suite pins the
@@ -305,18 +319,36 @@ internal static class DeltaNativeReader
             {
                 return null;
             }
-            // Case 1 + 4: anything needing file_row_number, or carrying a per-file predicate.
-            if (wantRowId || rowIdFilter is not null || trackingFilter is not null)
+            // A per-file PREDICATE is the one thing neither form can carry (its whole value is per-file row-group
+            // pruning, and one call has one WHERE).
+            if (rowIdFilter is not null || trackingFilter is not null)
             {
                 return null;
             }
+            bool wantsTracking = false;
             foreach (var c in dataCols)
             {
                 if (string.Equals(c, RowTrackingIdColumn, StringComparison.Ordinal)
                     || string.Equals(c, RowTrackingVersionColumn, StringComparison.Ordinal))
                 {
-                    return null; // case 1: a derived stable id is baseRowId + file_row_number
+                    wantsTracking = true;
                 }
+            }
+            if (listing.Files.Count >= min)
+            {
+                // The FULL form first: field-id keys, so `filename` + `file_row_number` compose and the rowid,
+                // the deletion vectors and the partition values all fit in ONE call. It covers every file,
+                // deletion vectors included.
+                var full = TryFullForm(listing, dataCols, wantRowId, where, wantsTracking);
+                if (full is not null)
+                {
+                    return full;
+                }
+            }
+            // Fall back to the PLAIN form, which cannot express any of that (see case 1) but needs no field ids.
+            if (wantRowId || wantsTracking)
+            {
+                return null;
             }
             // The DV-free files batch; the rest keep the loop (and their prunable bound — case 4).
             var batchFiles = new List<DeltaReader.NativeScanFile>(listing.Files.Count);
@@ -406,7 +438,365 @@ internal static class DeltaNativeReader
             return new BatchPlan(sb.ToString(), batchFiles, loopFiles);
         }
 
+        /// <summary>
+        /// The FULL single-call form: <c>read_parquet([…], schema = map {&lt;field id&gt;: …}, filename => true,
+        /// file_row_number => true)</c> with the deletion vectors bound as ONE <c>(filename, pos)</c> input and
+        /// the per-file constants (global ordinal for the rowid, partition values) as a second one, both wrapped
+        /// in <c>WITH … AS MATERIALIZED</c> CTEs so each single-use stream is scanned exactly once. Covers EVERY
+        /// file of the scan, deletion vectors included, so there is no loop left.
+        /// <para><b>⚠ IT USES <c>union_by_name</c>, NOT THE <c>schema</c> MAP, AND THAT IS FORCED BY A DuckDB
+        /// BUG.</b> The obvious route is a field-id-keyed map, because <c>filename</c> / <c>file_row_number</c>
+        /// compose with an INTEGER-keyed map and FAIL with a VARCHAR-keyed one. But MEASURED: a field-id-keyed map
+        /// plus a virtual column raises <c>INTERNAL Error: No default expression in FieldId Map</c> whenever the
+        /// FILE contains a column that has no field id — and a materialized <c>__delta_row_id</c> is exactly that
+        /// (row-tracking columns are not column-mapped, so they carry none). Row tracking is ON by default for
+        /// tables we create, and every merge-on-read post-image file has that column, so the field-id route is
+        /// unusable on the DEFAULT table shape. The same file reads fine with the map and NO virtual columns,
+        /// which is what makes it an upstream assertion bug rather than a contract.</para>
+        /// <para>So instead: <c>union_by_name => true</c> (which NULL-fills a column an older file predates — the
+        /// schema-evolution backfill the map's <c>default_value</c> would have given) plus an explicit
+        /// physical→logical alias projection. That needs no field ids, so there is nothing to probe and no
+        /// assertion to trip. It works because a NAME-mode physical name is FILE-INDEPENDENT; id mode is gated
+        /// off for the same reason as everywhere else.</para>
+        /// <para>⚠ The price is nested columns: <c>union_by_name</c> MERGES struct interiors rather than
+        /// declaring them, so a member no file carries cannot be projected at all (where the map's declared type
+        /// would have NULL-filled it). Struct-typed columns therefore stay on the plain form or the loop — which
+        /// is also what keeps the measured union struct hazard out of reach here.</para>
+        /// <para><b>⚠ It gives up the deletion vector's PRUNABLE BOUND</b>, which the per-file path emits
+        /// alongside the exact anti-join so DuckDB can skip whole row groups — one WHERE cannot carry a
+        /// per-file range. That is a deliberate trade and the evidence is already in
+        /// <see cref="DvRangeCondition"/>: its own controlled A/B found the bound "demonstrably works and does
+        /// not show up in wall time" (2.17 s vs 2.21 s on 10M rows with 9M deleted), because marshalling and
+        /// hashing the vector dominates either way. Expect that to change where I/O dominates instead — remote
+        /// storage with a mostly-deleted file is the shape to re-measure before assuming this is free there.</para>
+        /// <para>⚠ The row-tracking virtual columns are the one shape that CANNOT come here, and the reason is
+        /// structural rather than a gate: a materialized <c>__delta_row_id</c> is not column-mapped, so it has no
+        /// field id to key by, and a DuckDB <c>map</c> cannot mix INTEGER and VARCHAR keys. The derived form
+        /// (<c>baseRowId + file_row_number</c>) would be expressible but the per-file materialized OVERRIDE would
+        /// not, and honouring it is not optional — so those stay on the per-file loop.</para>
+        /// </summary>
+        private static BatchPlan? TryFullForm(
+            DeltaReader.NativeScanList listing, IReadOnlyList<string> dataCols, bool wantRowId, string? where,
+            bool wantsTracking)
+        {
+            if (wantsTracking || dataCols.Count == 0 || listing.TableSchema is null)
+            {
+                return null;
+            }
+            // ID mode + a struct is the measured silent-loss case (a struct interior is matched by NAME and cast,
+            // and only in id mode can a file's stored child names differ) — see case 2 in the class remarks.
+            if (listing.LogicalToFieldId is not null)
+            {
+                return null; // id mode: a file's stored names are its own vintage's — case 2
+            }
+            if (listing.PartitionColumns.Count > 0)
+            {
+                // ⚠ A SECOND DuckDB assertion, measured: `union_by_name` + a virtual column over a HIVE-layout
+                // file list raises `INTERNAL Error: Information loss on integer cast: value 4294967296 outside of
+                // target range [0, 4294967295]` (2^32 — a virtual-column id sentinel meeting the auto-detected
+                // hive partition column). Gated on the table having ANY partition column, not on one being
+                // REQUESTED, because hive detection is automatic and fires from the paths alone.
+                return null;
+            }
+            bool nameMapped = listing.LogicalToPhysical is not null || listing.MappedSchema is not null;
+
+            var partitionCols = new List<string>();
+            var entries = new List<string>(dataCols.Count);
+            var inner = new List<string>(dataCols.Count + 2);
+            var wanted = new List<(string Logical, string Stored, DeltaSchema.StructField Field)>(dataCols.Count);
+            foreach (var c in dataCols)
+            {
+                var field = FindField(listing.TableSchema, c);
+                if (field is null)
+                {
+                    return null;
+                }
+                if (listing.PartitionColumns.Count > 0 && ContainsName(listing.PartitionColumns, c))
+                {
+                    // Absent from the data files: the value comes from the bound per-file input, CAST to the
+                    // column's declared type (the input carries every partition value as VARCHAR, since one
+                    // Arrow column cannot hold several columns' types).
+                    string type0;
+                    try
+                    {
+                        type0 = TypeText(field.Type);
+                    }
+                    catch (NotSupportedException)
+                    {
+                        return null;
+                    }
+                    inner.Add($"CAST(__fab_f.{Quote("p" + partitionCols.Count)} AS {type0}) AS {Quote(c)}");
+                    partitionCols.Add(c);
+                    continue;
+                }
+                if (ContainsStructAnywhere(field.Type))
+                {
+                    // union_by_name merges struct interiors instead of declaring them, so a member no file
+                    // carries is unprojectable. The plain `schema`-map form handles nested columns; this one
+                    // does not pretend to.
+                    return null;
+                }
+                string stored = nameMapped ? PhysicalName(field) : field.Name;
+                entries.Add(stored);
+                wanted.Add((c, stored, field));
+            }
+            if (entries.Count == 0)
+            {
+                return null; // every requested column was a partition column: nothing to read from the files
+            }
+            var files = listing.Files;
+            // ⚠ ONE presence query for the whole scan, and it is REQUIRED, not an optimisation.
+            // union_by_name can only produce a column that SOME file in the list carries; a column absent from
+            // every one of them is a BINDER ERROR ("Referenced column ... not found in FROM clause"). That is not
+            // an edge case: Delta-log pruning routinely drops the only file holding a newly-ADDed column, which
+            // is how `WHERE extra IS NULL` broke on a table whose other six files predate `extra`. So the
+            // columns present across the LIST are resolved up front and the rest become typed NULLs — the
+            // backfill the `schema` map's default_value would have given. parquet_schema takes the whole list, so
+            // this is one query per scan, never one per file.
+            var present = PresentNames(files);
+            if (present is null)
+            {
+                return null;
+            }
+            foreach (var w in wanted)
+            {
+                string expr;
+                if (present.Contains(w.Stored))
+                {
+                    expr = string.Equals(w.Stored, w.Logical, StringComparison.Ordinal)
+                        ? Quote(w.Logical) : $"{Quote(w.Stored)} AS {Quote(w.Logical)}";
+                }
+                else
+                {
+                    string t;
+                    try
+                    {
+                        t = TypeText(w.Field.Type);
+                    }
+                    catch (NotSupportedException)
+                    {
+                        return null;
+                    }
+                    expr = $"CAST(NULL AS {t}) AS {Quote(w.Logical)}";
+                }
+                inner.Add(expr);
+            }
+
+            bool anyDv = false;
+            foreach (var f in files)
+            {
+                if (f.Dv.Length > 0)
+                {
+                    anyDv = true;
+                    break;
+                }
+            }
+            bool needsMeta = wantRowId || partitionCols.Count > 0;
+            if (wantRowId)
+            {
+                inner.Add($"((__fab_f.ord << {TransientRowAddress.PositionBits}) | __fab_rp.file_row_number) "
+                          + $"AS {Quote(RowIdColumn)}");
+            }
+
+            var ctes = new List<string>(2);
+            if (needsMeta)
+            {
+                // MATERIALIZED is load-bearing, not a hint: the view is a single-use stream, so a second scan
+                // would silently contribute nothing (SingleScanArrowStream turns that into an error).
+                ctes.Add($"__fab_f AS MATERIALIZED (SELECT * FROM {MetaViewName})");
+            }
+            if (anyDv)
+            {
+                ctes.Add($"__fab_d AS MATERIALIZED (SELECT * FROM {DvViewName})");
+            }
+
+            var sb = new StringBuilder();
+            if (ctes.Count > 0)
+            {
+                sb.Append("WITH ").Append(string.Join(", ", ctes)).Append(' ');
+            }
+            sb.Append("SELECT ").Append(string.Join(", ", dataCols.Select(Quote)));
+            if (wantRowId)
+            {
+                sb.Append(", ").Append(Quote(RowIdColumn));
+            }
+            sb.Append(" FROM (SELECT ").Append(string.Join(", ", inner))
+              .Append(" FROM read_parquet([").Append(string.Join(", ", files.Select(f => Literal(f.Uri))))
+              .Append("], union_by_name => true, filename => true, file_row_number => true) __fab_rp");
+            if (needsMeta)
+            {
+                // INNER join on the exact URI string we listed — `filename` was verified to echo it verbatim.
+                sb.Append(" JOIN __fab_f ON __fab_f.fn = __fab_rp.filename");
+            }
+            if (anyDv)
+            {
+                // NOT EXISTS, never NOT IN (SELECT …): one NULL position in an IN-subquery makes the predicate
+                // NULL for every row and returns an EMPTY table.
+                sb.Append(" WHERE NOT EXISTS (SELECT 1 FROM __fab_d WHERE __fab_d.fn = __fab_rp.filename")
+                  .Append(" AND __fab_d.pos = __fab_rp.file_row_number)");
+            }
+            sb.Append(')');
+            if (!string.IsNullOrEmpty(where))
+            {
+                sb.Append(" WHERE ").Append(where);
+            }
+
+            var partCols = partitionCols;
+            Func<IReadOnlyList<(string, IArrowArrayStream)>>? inputs = null;
+            if (needsMeta || anyDv)
+            {
+                inputs = () =>
+                {
+                    var list = new List<(string, IArrowArrayStream)>(2);
+                    if (needsMeta)
+                    {
+                        list.Add((MetaViewName,
+                                  new SingleScanArrowStream(MetaStream(files, partCols, listing), MetaViewName)));
+                    }
+                    if (anyDv)
+                    {
+                        list.Add((DvViewName, new SingleScanArrowStream(FileDvStream(files), DvViewName)));
+                    }
+                    return list;
+                };
+            }
+            return new BatchPlan(sb.ToString(), files, System.Array.Empty<DeltaReader.NativeScanFile>(), inputs);
+        }
+
         private static string Literal(string s) => "'" + s.Replace("'", "''") + "'";
+    }
+
+    /// <summary>The name of the bound per-file constants input (global ordinal, partition values) the FULL
+    /// batched form joins on <c>filename</c>. Sibling of <see cref="DvViewName"/>.</summary>
+    internal const string MetaViewName = "__fab_files";
+
+
+    // The set of stored column names present in AT LEAST ONE of these files, from a single parquet_schema over
+    // the whole list. Null when the query fails (fall back rather than guess at presence).
+    private static HashSet<string>? PresentNames(IReadOnlyList<DeltaReader.NativeScanFile> files)
+    {
+        var sb = new StringBuilder("SELECT DISTINCT name FROM parquet_schema([");
+        for (int i = 0; i < files.Count; i++)
+        {
+            if (i > 0)
+            {
+                sb.Append(", ");
+            }
+            sb.Append("'").Append(files[i].Uri.Replace("'", "''")).Append("'");
+        }
+        sb.Append("])");
+        try
+        {
+            var names = new HashSet<string>(StringComparer.Ordinal);
+            using var s = Host.Query(sb.ToString());
+            while (true)
+            {
+                var batch = s.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+                if (batch is null)
+                {
+                    break;
+                }
+                using (batch)
+                {
+                    var col = (StringArray)batch.Column(0);
+                    for (int i = 0; i < batch.Length; i++)
+                    {
+                        if (col.GetString(i) is { } n)
+                        {
+                            names.Add(n);
+                        }
+                    }
+                }
+            }
+            return names;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static bool ContainsStructAnywhere(DeltaSchema.DeltaDataType type) => type switch
+    {
+        DeltaSchema.StructType => true,
+        DeltaSchema.ArrayType at => ContainsStructAnywhere(at.ElementType),
+        DeltaSchema.MapType mt => ContainsStructAnywhere(mt.KeyType) || ContainsStructAnywhere(mt.ValueType),
+        _ => false,
+    };
+
+    /// <summary>Every file's deletion-vector positions as ONE <c>(fn, pos)</c> stream — the single-input form the
+    /// batched read anti-joins, replacing the per-file inline literal list whose cost is characterised on
+    /// <see cref="DvLiteralMax"/> (~0.4 ms and ~1.2 KB per deleted row). Columns are NON-NULLABLE by
+    /// construction.</summary>
+    private static IArrowArrayStream FileDvStream(IReadOnlyList<DeltaReader.NativeScanFile> files)
+    {
+        var fn = new StringArray.Builder();
+        var pos = new Int64Array.Builder();
+        long n = 0;
+        foreach (var f in files)
+        {
+            foreach (var p in f.Dv)
+            {
+                fn.Append(f.Uri);
+                pos.Append(p);
+                n++;
+            }
+        }
+        var schema = new Schema(new[]
+        {
+            new Field("fn", StringType.Default, nullable: false),
+            new Field("pos", Int64Type.Default, nullable: false),
+        }, null);
+        return new InMemoryArrayStream(
+            schema, new[] { new RecordBatch(schema, new IArrowArray[] { fn.Build(), pos.Build() }, (int)n) });
+    }
+
+    /// <summary>The per-file constants the batched read joins on <c>filename</c>: the global ordinal (which the
+    /// transient rowid folds in) and each requested partition column's raw value as VARCHAR, cast to the column's
+    /// declared type in SQL. One row per file, so the join is 1:1 and cannot duplicate rows.</summary>
+    private static IArrowArrayStream MetaStream(
+        IReadOnlyList<DeltaReader.NativeScanFile> files, IReadOnlyList<string> partitionCols,
+        DeltaReader.NativeScanList listing)
+    {
+        var fn = new StringArray.Builder();
+        var ord = new Int64Array.Builder();
+        var parts = new StringArray.Builder[partitionCols.Count];
+        for (int i = 0; i < parts.Length; i++)
+        {
+            parts[i] = new StringArray.Builder();
+        }
+        foreach (var f in files)
+        {
+            fn.Append(f.Uri);
+            ord.Append(f.Ordinal);
+            for (int i = 0; i < parts.Length; i++)
+            {
+                var field = FindField(listing.TableSchema, partitionCols[i]);
+                string stored = field is not null ? PhysicalName(field) : partitionCols[i];
+                var v = LookupPartitionValue(f.PartitionValues, partitionCols[i], stored);
+                if (v is null)
+                {
+                    parts[i].AppendNull();
+                }
+                else
+                {
+                    parts[i].Append(v);
+                }
+            }
+        }
+        var fields = new List<Field>(2 + parts.Length)
+        {
+            new Field("fn", StringType.Default, nullable: false),
+            new Field("ord", Int64Type.Default, nullable: false),
+        };
+        var arrays = new List<IArrowArray>(2 + parts.Length) { fn.Build(), ord.Build() };
+        for (int i = 0; i < parts.Length; i++)
+        {
+            fields.Add(new Field("p" + i.ToString(CultureInfo.InvariantCulture), StringType.Default, nullable: true));
+            arrays.Add(parts[i].Build());
+        }
+        var schema = new Schema(fields, null);
+        return new InMemoryArrayStream(schema, new[] { new RecordBatch(schema, arrays, files.Count) });
     }
 
     // The PHYSICAL (in-file) name of a top-level or nested field under NAME-mode column mapping: the declared
@@ -936,7 +1326,7 @@ internal static class DeltaNativeReader
             // Probe the BATCH's own SQL: it is the one query that must agree with the advertised schema, and
             // probing it costs no footer read (the whole point of the `schema` map) where the per-file probe
             // below pays ResolveFileMapping.
-            using var bs = Host.Query(batch.Sql + " LIMIT 0");
+            using var bs = batch.Query(" LIMIT 0");
             return listing.MappedSchema is { } bms
                 ? ArrowColumnMappingRename.RenameSchema(bs.Schema, bms, toPhysical: false)
                 : bs.Schema;
@@ -1032,7 +1422,7 @@ internal static class DeltaNativeReader
                     {
                         try
                         {
-                            await DrainAsync(Host.Query(batch.Sql)).ConfigureAwait(false);
+                            await DrainAsync(batch.Query()).ConfigureAwait(false);
                         }
                         finally
                         {
