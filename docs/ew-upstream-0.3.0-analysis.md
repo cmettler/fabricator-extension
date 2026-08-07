@@ -446,8 +446,31 @@ retracted for being a semantics request in disguise. This one is not: the two su
 | EW Table.Tests | **832 × {net10.0, net8.0, net472}** | only the net472 leg proves a change offerable |
 | EW DeltaLake.Tests | **364 × 3 TFMs** | the isBlindAppend patch's own gate, mutation-tested |
 
-⚠ The hermetic tier CANNOT reach `S3CommitFileSystem` at all, so the service leg was not optional here — it
-was the only evidence that the replaced commit primitive works against a real object store.
+⚠ The hermetic tier CANNOT reach `S3CommitFileSystem` at all — the branch is
+`if (s3 is not null && path.StartsWith("s3://"))`, and every hermetic table is a local scratch path while
+`run-suites.sh hermetic` CLEARS the service env vars to prove hermeticity. So the branch is unreachable by
+construction, not merely uncovered.
+
+**⚠ AND THE CI TIERS ARE NOT THE WHOLE STORY — user-caught. `AdlsGen2TableFileSystem` is reached by NEITHER
+tier, and its rewrite changed MECHANISM (a conditional RENAME became a conditional UPLOAD with
+`IfNoneMatch=*`) where S3's only changed shape.** Both live legs were therefore run on the 0.3.0 branch,
+and in each case the assertion count is NOT the evidence — the routing log is:
+
+| live leg | result | the evidence that it exercised the new primitive |
+|---|---|---|
+| plain ADLS Gen2 (`verify_delta_catalog_adls`) | **55**, passed | `AdlsGen2TableFileSystem` selected **53×**, **8 commits** written |
+| Fabric OneLake (round trip: CTAS → INSERT → DV DELETE → fused txn → DROP) | all five steps arithmetically correct | `AdlsGen2TableFileSystem` **37×** with **0** fallbacks, `onelake://` **9×**, commits at v1/v2/v4, **0** errors/conflicts |
+
+**The OneLake run also VERIFIES THE TWO-SCHEME SPLIT on 0.3.0**, which is the part worth knowing: the
+**LOG** commits over `abfss://` through our direct-SDK filesystem (⇒ straight through the new
+`TryWriteAllBytesAsync`), while the **DATA** parquet moves over the `onelake://` VFS to DuckDB's own
+reader/writer. Two different transports in one statement, both green.
+
+⚠ Why this mattered more than the S3 leg: CLAUDE.md records a MEASURED live finding that a conditional
+create on an EXISTING OneLake path answers **409 PathAlreadyExists, not 412**. Had `UploadAsync` with
+`IfNoneMatch` answered with anything my catch does not list, the exception would ESCAPE instead of
+returning `false` — a hard commit failure with no OCC retry, which is the exact shape of the raw-412 bug
+already in the record. A compile and a green hermetic tier say nothing about that.
 
 ⚠ §4's numbers are STILL not re-taken, and deliberately: they are confounded by #86 (DML tables never
 checkpoint), so measuring before that is understood would produce another figure needing withdrawal.
