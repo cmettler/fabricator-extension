@@ -1359,8 +1359,22 @@ lossy for non-ASCII text; the automatic rule exists to avoid exactly that.
 
 ### Parquet write options (Delta)
 
-Settable per table with `CREATE TABLE ... WITH (...)`, per session with `SET delta_write_options`, or as an
-ATTACH default — same names on all three, most specific wins.
+Settable per statement with `CREATE TABLE ... AS SELECT ... WITH (...)`, per session with
+`SET delta_write_options`, or as an ATTACH default — same names on all three, most specific wins.
+
+⚠ **`WITH` tuning applies to that statement's write only — it is NOT a table property and is NOT persisted.**
+A later `INSERT` writes at the session/ATTACH setting, or the engine default if neither is set:
+
+```sql
+CREATE TABLE t WITH (parquet_compression='zstd') AS SELECT ...;  -- this file: ZSTD
+INSERT INTO t SELECT ...;                                        -- this file: SNAPPY (the default)
+```
+
+So for a table that should keep a setting across every write, put it on the ATTACH or in
+`SET delta_write_options`, not in `WITH`. For the same reason a bare `CREATE TABLE ... WITH (<tuning>)` with
+no `AS SELECT` is refused — there is no write for it to apply to. (Table *features* in `WITH` — `deletion_vectors`,
+`column_mapping`, `row_tracking`, `change_data_feed`, and `delta.*` / `fabricator.*` properties — ARE persisted;
+it is only the parquet write tuning that is per-statement.)
 
 | option | engines |
 |---|---|

@@ -647,6 +647,19 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     - Escape hatches already exist: `mssql_default_varchar_length` (bounds whichever type is chosen) and
       `mssql_ctas_text_type` (replaces the type outright). What is genuinely missing is only the PER-TABLE
       form of these — the (3) item below.
+  - **⚠ `WITH` PARQUET TUNING IS PER-STATEMENT, NOT PER-TABLE — MEASURED 2026-08-07 (user-raised), and the
+    README said the opposite until then.** `CREATE TABLE t WITH (parquet_compression='zstd') AS SELECT …`
+    writes ZSTD; a later plain `INSERT INTO t` writes **SNAPPY**. Nothing persists the tuning — only the table
+    FEATURES (`deletion_vectors` / `column_mapping` / `row_tracking` / `change_data_feed` / `delta.*` /
+    `fabricator.*`) are written into the table config. That is also why a bare `CREATE TABLE … WITH (<tuning>)`
+    with no `AS SELECT` is refused: there is no write for it to apply to.
+    - **THE DESIGN QUESTION FOR (3), now sharpened:** should tuning be PERSISTED (e.g. as
+      `fabricator.parquet.compression` table properties, so every later write inherits it) rather than being
+      a per-statement knob? That is what "table property" implies to a user coming from Iceberg/DuckLake, and
+      it is the difference between configuring a dbt model ONCE and re-stating it on every incremental run.
+      ⚠ Note it would also change OPTIMIZE and the rewrite paths — which now honour the CATALOG's spec (fixed
+      this session) — to honour the TABLE's instead, which is arguably more correct still. Not built; decide it
+      as part of (3) rather than bolting persistence onto the existing keys.
   - **(3) Re-examine the `SET` parameters and MOVE what belongs per-table into `WITH`.** `delta_write_options`
     is one JSON blob mixing genuinely session-scoped things (compression as a storage-cost policy) with
     per-table ones (partitioning, `replace_where`, `schema_mode`). Decide each knob's home rather than
