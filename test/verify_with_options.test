@@ -361,3 +361,72 @@ RESET delta_write_options;
 
 statement ok
 DETACH lake9;
+
+# ============================================================================
+# THE REWRITE PATHS HONOUR THE WRITE SPEC — the merge-on-read UPDATE's post-image file and OPTIMIZE's
+# compaction output. Both are written by DeltaReader, which is STATIC, while ResolveWriteSpec lives on the
+# catalog INSTANCE — so for a long time they silently used engineered-wood's defaults and a table
+# accumulated MIXED compression. OPTIMIZE is the one that stings: it rewrites the MAJORITY of a table's
+# bytes, so it actively undid the setting it was configured for.
+# ⚠ Pinned on the NATIVE engine deliberately. Under native_write the file is written by DuckDB's COPY, not
+# by engineered-wood, so threading the spec into the EW open was necessary and NOT sufficient — the spec
+# also has to reach NativeParquetDataFileWriter's COPY options. A codec-only gate would have passed while
+# the shipped default path was still wrong.
+# ============================================================================
+
+statement ok
+SET delta_write_options='{"compression":"zstd"}';
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/optrw' AS rw (TYPE fabricator, PROVIDER 'delta', native_read true, native_write true);
+
+statement ok
+CREATE TABLE rw.main.t AS SELECT i::BIGINT AS id, ('v'||i)::VARCHAR AS s FROM range(2000) r(i);
+
+# Control: the statement's own write already honoured the setting before any of this.
+query I
+SELECT count(*) FROM (SELECT DISTINCT compression FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optrw/t/*.parquet')) WHERE compression <> 'ZSTD';
+----
+0
+
+# The merge-on-read UPDATE writes a post-image file.
+statement ok
+UPDATE rw.main.t SET s='u' WHERE id % 500 = 0;
+
+query I
+SELECT count(*) FROM (SELECT DISTINCT compression FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optrw/t/*.parquet')) WHERE compression <> 'ZSTD';
+----
+0
+
+statement ok
+INSERT INTO rw.main.t SELECT i::BIGINT, ('v'||i)::VARCHAR FROM range(2000,3000) r(i);
+
+statement ok
+INSERT INTO rw.main.t SELECT i::BIGINT, ('v'||i)::VARCHAR FROM range(3000,4000) r(i);
+
+# OPTIMIZE compacts them into a new file.
+statement ok
+SELECT fabricator_exec('rw', 'OPTIMIZE main.t');
+
+query I
+SELECT count(*) FROM (SELECT DISTINCT compression FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optrw/t/*.parquet')) WHERE compression <> 'ZSTD';
+----
+0
+
+# POSITIVE CONTROL: the assertions above are only meaningful if that query can see files at all and would
+# report a non-ZSTD one. Both halves, so a broken path expression cannot make them pass vacuously.
+query I
+SELECT count(*) > 0 FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optrw/t/*.parquet');
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT DISTINCT compression FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optrw/t/*.parquet')) WHERE compression <> 'SNAPPY';
+----
+1
+
+statement ok
+RESET delta_write_options;
+
+statement ok
+DETACH rw;

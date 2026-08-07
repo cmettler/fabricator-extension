@@ -3043,7 +3043,7 @@ public sealed class DeltaCatalog : IBackendCatalog
             // only — no trailing rowid to drop.)
             WriteCdcFiles(delOpener, path, pending,
                 DisposeAfterUse(DeltaReader.ReadRowsByRowIds(delOpener, path, ids, default,
-                    atVersion: pending.PinnedVersion)),
+                    atVersion: pending.PinnedVersion, nativeRead: _nativeRead)),
                 "delete");
         }
         long added = 0;
@@ -3265,7 +3265,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         var ridsPerBatch = new List<long[]>();
         foreach (var raw in DeltaReader.ReadRowsByRowIds(opener, path, updates.RowByRid.Keys, default,
                      atVersion: pending.PinnedVersion, sourceTrackingOut: srcTracking,
-                     rowIdsOut: ridsPerBatch))
+                     rowIdsOut: ridsPerBatch, nativeRead: _nativeRead))
         {
             var batch = readTarget is null ? raw : ReconcileBatch(raw, readTarget, CommittedToPending(pending));
             var rids = ridsPerBatch[ridsPerBatch.Count - 1];
@@ -4026,7 +4026,8 @@ public sealed class DeltaCatalog : IBackendCatalog
         return dvMode
             ? DeltaReader.DeleteByRowIdsViaVectors(opener, path, ids, default,
                                                    rowLevelRetry: !EffectiveSerializable(tableConfig))
-            : DeltaReader.DeleteByRowIds(opener, path, ids, default, _nativeWrite, _nativeRead);
+            : DeltaReader.DeleteByRowIds(opener, path, ids, default, _nativeWrite, _nativeRead,
+                                         ResolveWriteSpec(null, null));
     }
 
     public IArrowArrayStream ExecuteQuery(string sql) => throw Unsupported("raw query");
@@ -4063,7 +4064,8 @@ public sealed class DeltaCatalog : IBackendCatalog
                     && string.Equals(tokens[2], "FULL", System.StringComparison.OrdinalIgnoreCase);
                 _log.LogInformation("delta exec OPTIMIZE {Schema}.{Table} native_write={Native} full={Full}",
                     schema, table, _nativeWrite, fullRecluster);
-                return DeltaReader.Optimize(opener, path, default, _nativeWrite, _nativeRead, fullRecluster);
+                return DeltaReader.Optimize(opener, path, default, _nativeWrite, _nativeRead, fullRecluster,
+                                            ResolveWriteSpec(null, null));
             }
             case "VACUUM":
             {
@@ -4343,7 +4345,8 @@ public sealed class DeltaCatalog : IBackendCatalog
         // from the configuration the update path already reads (no extra _delta_log LIST).
         MemoryProbe.Mark("delta update: arrow batch rebuilt", updates.Count);
         DeltaReader.UpdateByRowIds(opener, path, updatesBatch, default, _nativeWrite, _nativeRead,
-                                   catalogSerializable: _serializable);
+                                   catalogSerializable: _serializable,
+                                   spec: ResolveWriteSpec(null, null));
 
         _log.LogInformation("delta update {Schema}.{Table}: rows={Rows} set_cols={SetCols} native_write={Native}",
             schemaName, tableName, updates.Count, setColNames.Count, _nativeWrite);

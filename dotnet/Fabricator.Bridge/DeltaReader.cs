@@ -751,12 +751,18 @@ internal static class DeltaReader
 
     /// <summary>Deletes the rows whose transient <c>_metadata.row_id</c> is in <paramref name="rowIds"/>
     /// (deletion vectors). Returns the number of rows deleted.</summary>
+    /// <param name="spec">The catalog's resolved write tuning (compression / row-group size / bloom columns).
+    /// ⚠ REQUIRED for correctness of the user's configuration, not decoration: a rewrite that omits it writes
+    /// the file at engineered-wood's defaults, so a table accumulates MIXED settings — measured before this was
+    /// threaded (CTAS zstd, rewrite snappy). See the write-options entry in CLAUDE.md.</param>
     public static long DeleteByRowIds(nint opener, string path, IReadOnlyCollection<long> rowIds,
-                                      CancellationToken ct, bool nativeWrite = false, bool nativeRead = false)
-        => DeleteByRowIdsAsync(opener, path, rowIds, ct, nativeWrite, nativeRead).GetAwaiter().GetResult();
+                                      CancellationToken ct, bool nativeWrite = false, bool nativeRead = false,
+                                      DeltaWriteSpec? spec = null)
+        => DeleteByRowIdsAsync(opener, path, rowIds, ct, nativeWrite, nativeRead, spec).GetAwaiter().GetResult();
 
     private static async Task<long> DeleteByRowIdsAsync(nint opener, string path, IReadOnlyCollection<long> rowIds,
-                                      CancellationToken ct, bool nativeWrite, bool nativeRead)
+                                      CancellationToken ct, bool nativeWrite, bool nativeRead,
+                                      DeltaWriteSpec? spec = null)
     {
         // Cancel a long copy-on-write/DV rewrite (OneLake/S3) on query interrupt — the opener is fresh (the
         // modify operator's Finalize set it via FabricatorSetActiveTxn). See docs/cancellation.md.
@@ -771,12 +777,12 @@ internal static class DeltaReader
         // read + drop-positions in one host SQL — was dropped upstream); it still selects the affected files,
         // computes stats, and commits remove(old)+add(new).
         var writer = nativeWrite && NativeParquetDataFileWriter.Available
-            ? new NativeParquetDataFileWriter(path)
+            ? new NativeParquetDataFileWriter(path, spec)
             : null;
         var fileReader = nativeRead && NativeParquetDataFileReader.Available
             ? new NativeParquetDataFileReader(path)
             : null;
-        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(dataFileWriter: writer,
+        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(spec, dataFileWriter: writer,
                                                                  dataFileReader: fileReader), token)
             .ConfigureAwait(false);
         try
@@ -965,25 +971,36 @@ internal static class DeltaReader
     /// row's ORIGINAL stable id/commit version (materialized source value else baseRowId + position) —
     /// plain value arrays; each batch's entry is appended BEFORE that batch is yielded, and the list is
     /// complete only once the enumeration finishes.</summary>
+    /// <param name="nativeRead">The CATALOG's engine choice. ⚠ This was hardcoded off, so a buffered UPDATE's
+    /// read-back took the engineered-wood CODEC reader even on a <c>PROVIDER 'delta'</c> catalog whose
+    /// <c>native_read</c> is on — the wrong engine for what the ATTACH asked for. It also changes BATCHING: the
+    /// codec reader yields ONE BATCH PER ROW GROUP where <c>read_parquet</c> yields 2048-row vectors, which is
+    /// what made the UPDATE grouped flush inert on this path (measured 30 flushes vs 1 on a 60k-row
+    /// UPDATE).</param>
     public static IEnumerable<RecordBatch> ReadRowsByRowIds(
         nint opener, string path, IReadOnlyCollection<long> rowIds, CancellationToken ct,
         long? atVersion = null,
         List<(long?[] Ids, long?[] Versions)>? sourceTrackingOut = null,
-        List<long[]>? rowIdsOut = null)
+        List<long[]>? rowIdsOut = null,
+        bool nativeRead = false)
         => BlockingEnumerable(ReadRowsByRowIdsAsync(opener, path, rowIds, atVersion, sourceTrackingOut,
-                                                    rowIdsOut, ct));
+                                                    rowIdsOut, nativeRead, ct));
 
     private static async IAsyncEnumerable<RecordBatch> ReadRowsByRowIdsAsync(
         nint opener, string path, IReadOnlyCollection<long> rowIds,
         long? atVersion, List<(long?[] Ids, long?[] Versions)>? sourceTrackingOut,
-        List<long[]>? rowIdsOut,
+        List<long[]>? rowIdsOut, bool nativeRead = false,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         // Cancel a slow buffered-UPDATE read-back of the matched rows over OneLake/S3 on interrupt.
         using var interrupt = new InterruptScope(opener, ct);
         var token = interrupt.Token;
         var fs = TableFileSystems.Create(opener, path);
-        await using var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(), token).ConfigureAwait(false);
+        var readBackReader = nativeRead && NativeParquetDataFileReader.Available
+            ? new NativeParquetDataFileReader(path)
+            : null;
+        await using var table = await DeltaTable
+            .OpenAsync(fs, DeltaWriter.Options(dataFileReader: readBackReader), token).ConfigureAwait(false);
         // The correlation key crosses as EW's `_ew_row_address` METADATA COLUMN (DeltaRowMetadata.RowAddress
         // — the same flag, names and semantics as its other reads), and is UNPACKED here into the
         // out-param our callers want. Two reasons the adaptation lives at this seam rather than in them:
@@ -1645,12 +1662,15 @@ internal static class DeltaReader
     /// EXCLUDING deletion-vector-deleted rows (so it also materializes DV deletions). Returns 0 (not row-affecting).
     /// Compaction re-assigns row-tracking baseRowIds (stable-id preservation across compaction needs materialized
     /// row-id columns — a separate slice); the DATA is correct.</summary>
+    /// <param name="spec">The catalog's resolved write tuning. ⚠ This is the site where omitting it hurt
+    /// most: compaction rewrites the MAJORITY of a table's bytes, so it actively undid the setting it was
+    /// configured for (measured: every pre-OPTIMIZE file zstd, the compacted output snappy).</param>
     public static long Optimize(nint opener, string path, CancellationToken ct, bool nativeWrite = false,
-                                bool nativeRead = false, bool full = false)
-        => OptimizeAsync(opener, path, ct, nativeWrite, nativeRead, full).GetAwaiter().GetResult();
+                                bool nativeRead = false, bool full = false, DeltaWriteSpec? spec = null)
+        => OptimizeAsync(opener, path, ct, nativeWrite, nativeRead, full, spec).GetAwaiter().GetResult();
 
     private static async Task<long> OptimizeAsync(nint opener, string path, CancellationToken ct,
-                                bool nativeWrite, bool nativeRead, bool full)
+                                bool nativeWrite, bool nativeRead, bool full, DeltaWriteSpec? spec = null)
     {
         // OPTIMIZE (compaction) rewrites many files — cancel a slow one on interrupt (opener set fresh by
         // fabricator_exec). See docs/cancellation.md.
@@ -1662,12 +1682,12 @@ internal static class DeltaReader
         // native_read => the compaction READ half decodes the candidate files through read_parquet too
         // (the IDataFileReader seam) — with the writer, compaction preserves the variant annotation.
         var writer = nativeWrite && NativeParquetDataFileWriter.Available
-            ? new NativeParquetDataFileWriter(path)
+            ? new NativeParquetDataFileWriter(path, spec)
             : null;
         var fileReader = nativeRead && NativeParquetDataFileReader.Available
             ? new NativeParquetDataFileReader(path)
             : null;
-        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(dataFileWriter: writer, dataFileReader: fileReader), token)
+        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(spec, dataFileWriter: writer, dataFileReader: fileReader), token)
             .ConfigureAwait(false);
         try
         {
@@ -2342,9 +2362,13 @@ internal static class DeltaReader
     /// table declares no <c>delta.isolationLevel</c> of its own. Passed rather than read here so the merge-on-read
     /// path costs no extra <c>_delta_log</c> read: it resolves the precedence against the configuration it
     /// already has in hand (<see cref="EffectiveSerializable"/>).</param>
+    /// <param name="spec">The catalog's resolved write tuning — the merge-on-read POST-IMAGE file and the
+    /// copy-on-write rewrite are both written here, and both came out at engineered-wood's defaults before this
+    /// was threaded.</param>
     public static void UpdateByRowIds(nint opener, string path, RecordBatch updates, CancellationToken ct,
-        bool nativeWrite = false, bool nativeRead = false, bool catalogSerializable = false)
-        => UpdateByRowIdsAsync(opener, path, updates, ct, nativeWrite, nativeRead, catalogSerializable)
+        bool nativeWrite = false, bool nativeRead = false, bool catalogSerializable = false,
+        DeltaWriteSpec? spec = null)
+        => UpdateByRowIdsAsync(opener, path, updates, ct, nativeWrite, nativeRead, catalogSerializable, spec)
             .GetAwaiter().GetResult();
 
     /// <summary>
@@ -2361,7 +2385,8 @@ internal static class DeltaReader
             : catalogDefault;
 
     private static async Task UpdateByRowIdsAsync(nint opener, string path, RecordBatch updates,
-        CancellationToken ct, bool nativeWrite, bool nativeRead, bool catalogSerializable)
+        CancellationToken ct, bool nativeWrite, bool nativeRead, bool catalogSerializable,
+        DeltaWriteSpec? spec = null)
     {
         using var interrupt = new InterruptScope(opener, ct);
         var token = interrupt.Token;
@@ -2373,13 +2398,13 @@ internal static class DeltaReader
         // NOTE (EW master): the CoW UPDATE has no row-level retry (the fork's rowLevelRetry rebase is
         // gone) — a concurrent commit aborts with DeltaConflictException → the retry-the-statement error.
         var writer = nativeWrite && NativeParquetDataFileWriter.Available
-            ? new NativeParquetDataFileWriter(path)
+            ? new NativeParquetDataFileWriter(path, spec)
             : null;
         var fileReader = nativeRead && NativeParquetDataFileReader.Available
             ? new NativeParquetDataFileReader(path)
             : null;
         var table = await DeltaTable.OpenAsync(fs,
-                DeltaWriter.Options(dataFileWriter: writer, dataFileReader: fileReader), token)
+                DeltaWriter.Options(spec, dataFileWriter: writer, dataFileReader: fileReader), token)
             .ConfigureAwait(false);
         try
         {

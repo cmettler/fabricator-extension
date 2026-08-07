@@ -601,15 +601,25 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     is one JSON blob mixing genuinely session-scoped things (compression as a storage-cost policy) with
     per-table ones (partitioning, `replace_where`, `schema_mode`). Decide each knob's home rather than
     accepting the current split, and keep an escape for the per-statement case.
-  - **(4) The plumbing gap that started this, MEASURED (2026-08-06):** `ResolveWriteSpec` lives on the
-    `DeltaCatalog` INSTANCE while ~30 EW opens sit in the STATIC `DeltaReader` and pass no spec, so
-    merge-on-read post-images, copy-on-write DELETE/UPDATE rewrites and **OPTIMIZE's compaction output** are
-    written at snappy / 122880 / no-bloom whatever the user configured. **OPTIMIZE is the one that stings** —
-    it rewrites the MAJORITY of a table's bytes, so it actively undoes the setting it was configured for.
-    ⚠ Reading the session setting from inside `DeltaReader` is NOT the fix: it would miss the per-catalog
-    ATTACH defaults, which is exactly the half a dbt user sets once. Thread the catalog's open-options
-    through instead — **the SAME structural change the `native_read` item in the streaming audit needs, so do
-    them together.**
+  - **(4) THE PLUMBING GAP IS FIXED (2026-08-07), and fixing it needed TWO changes where the write-up assumed
+    one.** `ResolveWriteSpec` lives on the `DeltaCatalog` INSTANCE while the rewrite paths sit in the STATIC
+    `DeltaReader`, so merge-on-read post-images, copy-on-write DELETE/UPDATE rewrites and **OPTIMIZE's
+    compaction output** were written at engineered-wood's defaults whatever the user configured. Now threaded:
+    `DeleteByRowIds` / `UpdateByRowIds` / `Optimize` take a `DeltaWriteSpec?` and the catalog passes
+    `ResolveWriteSpec(...)`; `ReadRowsByRowIds` takes the catalog's `native_read` (the streaming-audit item —
+    done together, as this entry predicted it should be).
+    - **⚠ THREADING THE SPEC INTO THE EW OPEN WAS NECESSARY AND NOT SUFFICIENT — measured, and the first
+      re-measurement still showed SNAPPY.** Under `native_write` (the `PROVIDER 'delta'` DEFAULT) the file is
+      written by **DuckDB's COPY** via `NativeParquetDataFileWriter`, so EW's `ParquetWriteOptions` never
+      apply; the spec also had to reach that writer's COPY options. It already accepted a `spec` — the three
+      `DeltaReader` sites simply constructed it without one. **Re-measuring after the "fix" is what caught
+      this**; the EW-only change would have shipped as done.
+    - MEASURED, native engine, `SET delta_write_options='{"compression":"zstd"}'`: before, CTAS **ZSTD** but
+      the UPDATE post-image **SNAPPY** and OPTIMIZE's compaction output **SNAPPY**; after, **zero SNAPPY
+      chunks anywhere**. Gate `verify_with_options` 82 → **96**, mutation-tested (dropping the spec from
+      `NativeParquetDataFileWriter` dies at exactly the post-image assertion). ⚠ The gate is pinned on the
+      **NATIVE** engine on purpose — a codec-only gate would have passed while the shipped default path was
+      still wrong.
   - **⚠ THAT VOID MEASUREMENT IS NOW SETTLED (2026-08-07), AND ITS SUSPICION WAS WRONG — the "fourth gap" does
     not exist.** It had read: *"`SET delta_write_options='{"compression":"zstd"}'` on `PROVIDER 'delta'` produced
     SNAPPY data files … so the session setting may simply not reach the native COPY"*. **It does reach it.**
@@ -658,8 +668,9 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   - Ladder to price each site against: **retain = 0 copies** (if the audit clears it),
     **`ArrowCompute.Take` = 1 copy** (new buffers, type-agnostic incl. nested/extension — what
     `ParseUpdateStream` now uses), **IPC round-trip = 2 copies + serialization**.
-  - **⚠ THE BUFFERED READ-BACK SILENTLY IGNORES THE CATALOG'S `native_read` — MEASURED, and it is a defect in
-    its own right, not just a batching curiosity (user: "this should be cleaned up as well").**
+  - **⚠ THE BUFFERED READ-BACK SILENTLY IGNORED THE CATALOG'S `native_read` — FIXED 2026-08-07 by giving
+    `ReadRowsByRowIds` the catalog's flag (both call sites are in `DeltaCatalog`, so it was bounded). Original
+    finding, kept because the reasoning is what generalises:**
     `ReadRowsByRowIdsAsync` opens with a bare `DeltaWriter.Options()` (`DeltaReader.cs:974`), passing **no
     `dataFileReader`**, so a buffered UPDATE's read-back takes the EW CODEC reader even on a
     `PROVIDER 'delta'` catalog where the user's `native_read` is on. Two consequences: it is the wrong engine
