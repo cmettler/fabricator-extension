@@ -1334,9 +1334,12 @@ input and are excluded by a single anti-join. Measured on 100 files that all car
 some parquet row-group skipping on a heavily-deleted file — which measured as no wall-clock difference
 locally, but is worth re-checking on remote storage.
 
-Some shapes still read file by file and need no action from you: partitioned tables, nested (`STRUCT`) columns
-when the row identity is also wanted, the `__delta_row_id` / `__delta_row_commit_version` columns, and tables
-using `column_mapping 'id'`. Two of those are DuckDB limitations rather than ours.
+Partitioned tables are batched as well — the partition value is not stored in the data files, so it travels
+alongside them and is applied in the same query.
+
+Some shapes still read file by file and need no action from you: nested (`STRUCT`) columns when the row
+identity is also wanted, the `__delta_row_id` / `__delta_row_commit_version` columns, and tables using
+`column_mapping 'id'`. The last is a DuckDB limitation rather than ours.
 
 ## Diagnostic logging
 

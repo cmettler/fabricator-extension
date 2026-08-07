@@ -248,8 +248,15 @@ SELECT count(*), sum(id) FROM dv.main.t;
 284	44044
 
 # ============================================================================
-# 6. PARTITION COLUMNS AND ROW-TRACKING VIRTUAL COLUMNS — both gated (their values are
-#    per file and absent from / derived outside the data files).
+# 6. PARTITION COLUMNS — batched. The partition value is absent from the data files, so it rides the
+#    bound per-file input and is CAST in SQL. This was gated off the batch until 2026-08-07: a bound
+#    input carrying a column DuckDB's projection PRUNES makes the scan ask for a NON-PREFIX column set,
+#    which SEGFAULTS upstream (test/repro/duckdb_arrow_scan_nonprefix.c). The fix is structural — the
+#    global ordinal is emitted ONLY when the rowid expression reads it — so every bound column is read
+#    and the bug is unreachable by construction.
+#    ⚠ The FILTERED query below is the regression gate: an unfiltered partitioned scan reads every
+#    bound column anyway and passed even while the bug was live. It only crashed once a pushed filter
+#    let DuckDB prune the ordinal. A partition test without a WHERE tests nothing about this.
 # ============================================================================
 
 statement ok
@@ -261,19 +268,66 @@ INSERT INTO b.main.parts SELECT i::BIGINT, 'p' || (i % 3) FROM range(30) r(i);
 statement ok
 INSERT INTO b.main.parts SELECT i::BIGINT, 'p' || (i % 3) FROM range(30, 60) r(i);
 
-query IT
-SELECT count(*), p FROM b.main.parts GROUP BY p ORDER BY p;
+query II
+SELECT count(*), sum(id) FROM b.main.parts;
 ----
-20	p0
-20	p1
-20	p2
+60	1770
 
+query TI
+SELECT p, count(*) FROM b.main.parts GROUP BY p ORDER BY p;
+----
+p0	20
+p1	20
+p2	20
+
+# THE REGRESSION SHAPE: a pushed filter on the partition column. With the ordinal still bound but
+# unread, this segfaulted the process.
 query II
 SELECT count(*), sum(id) FROM b.main.parts WHERE p = 'p1';
 ----
 20	590
 
-# Row tracking is on by default for tables we create; the stable id is derived per file from baseRowId.
+# Same hazard with the filter on a DATA column instead, so the pruning does not depend on which
+# column the predicate names.
+query II
+SELECT count(*), sum(id) FROM b.main.parts WHERE id > 40;
+----
+19	950
+
+query I
+SELECT count(*) FROM b.main.parts WHERE id > 40 AND p = 'p2';
+----
+7
+
+# Partition values must survive projection in every combination — id alone, p alone, and both.
+query I
+SELECT count(DISTINCT p) FROM b.main.parts;
+----
+3
+
+# The rowid path reads the ordinal, so this is the OTHER side of the same switch: DML over a
+# partitioned table exercises the input WITH the ordinal emitted.
+statement ok
+UPDATE b.main.parts SET id = id + 1000 WHERE id = 5;
+
+query I
+SELECT count(*) FROM b.main.parts WHERE id = 1005;
+----
+1
+
+statement ok
+DELETE FROM b.main.parts WHERE id = 1005;
+
+query III
+SELECT count(*), sum(id), count(DISTINCT p) FROM b.main.parts;
+----
+59	1765	3
+
+# ============================================================================
+# 6b. ROW-TRACKING VIRTUAL COLUMNS — still gated off the batch (derived per file from baseRowId, not
+#     stored). Asserted so a gate that silently produced wrong ids would not look like a gate that works.
+# ============================================================================
+
 query II
 SELECT count(*), count(DISTINCT __delta_row_id) FROM b.main.many;
 ----

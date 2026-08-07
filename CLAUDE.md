@@ -2011,32 +2011,46 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
       it routine (Delta-log pruning dropped the only file holding a newly-ADDed column, so `WHERE extra IS NULL`
       broke). Fixed by ONE `parquet_schema([… whole list …])` query per scan resolving which stored names exist,
       with the rest emitted as `CAST(NULL AS …)`. One query per SCAN, never per file.
-    - **⚠ PARTITIONED SCANS STAY GATED ON A CONFIRMED UPSTREAM DuckDB BUG — `duckdb_arrow_scan` + a
-      projection that is NOT A PREFIX of the bound stream's columns SEGFAULTS.** `SELECT a0, a2` over a
-      3-column input dies; `SELECT a0, a1` is fine. Non-deterministically it instead corrupts a string length
-      into the `4294967296` assertion and INVALIDATES THE DATABASE. **Reproduced on plain v1.5.5 with no
-      extensions and no fabricator code** — `test/repro/duckdb_arrow_scan_nonprefix.c`, ~110 lines of pure C
-      with two passing positive controls, ready to file. Full record:
-      [docs/duckdb-upstream-issues.md](docs/duckdb-upstream-issues.md) §2. A partitioned scan hits it because
-      the per-file input carries `ord` for the transient rowid and a scan wanting no rowid prunes it.
-      - **⚠ HOW OWNERSHIP WAS ESTABLISHED, because the obvious control got it BACKWARDS.** A pyarrow
-        `RecordBatchReader` on the stock wheel survives the same pruning — which looks like it convicts OUR
-        export and does not: **Python's `register` never goes through `duckdb_arrow_scan`**, so it does not
-        exercise the path. What settled it was **swapping the PRODUCER while holding the CALL SITE fixed**:
-        feeding `duckdb_arrow_scan` a DuckDB-produced stream (`ArrowAppender` output) crashes identically to an
-        Apache.Arrow C#-produced one. Producer-independent ⇒ the consumer owns it. Only then was the
-        standalone C repro written, so the report carries no third-party code. **A control that changes the
-        mechanism under test is not a control** — same shape as the `count(*)`-is-not-a-read trap.
+    - **PARTITIONED TABLES ARE BATCHED (2026-08-07) — the gate is gone, replaced by an INVARIANT.** They were
+      gated on a **confirmed upstream DuckDB bug**: `duckdb_arrow_scan` + a projection that is NOT A PREFIX of
+      the bound stream's columns SEGFAULTS (`SELECT a0, a2` over a 3-column input dies; `SELECT a0, a1` is
+      fine), or non-deterministically corrupts a string length into the `4294967296` assertion and INVALIDATES
+      THE DATABASE. **Reproduced on plain v1.5.5 with no extensions and no fabricator code** —
+      `test/repro/duckdb_arrow_scan_nonprefix.c`, ~110 lines of pure C with two passing positive controls,
+      ready to file. Full record: [docs/duckdb-upstream-issues.md](docs/duckdb-upstream-issues.md) §2.
+      - **THE FIX IS STRUCTURAL, and it is now a standing rule for every bound host-query input: EVERY COLUMN
+        MUST BE READ BY THE GENERATED SQL.** `MetaStream` takes `withOrdinal` — the per-file global ordinal is
+        emitted only when the rowid expression reads it — so the consumed set always equals the produced set and
+        the bug is unreachable BY CONSTRUCTION. A partitioned scan tripped it because that ordinal is dead
+        weight when no rowid is wanted. **Add a bound column only together with the SQL that reads it.**
+      - **⚠ WRAPPING THE QUERY DOES NOT WORK — measured, because it is the obvious first guess (and was the
+        user's).** A subquery, a plain CTE and even a **MATERIALIZED** CTE all still crash: projection pushdown
+        goes straight through every one. That is exactly why the real query still died despite already being
+        `WITH … AS MATERIALIZED (SELECT * FROM <view>)`. The only variants that survive are the ones where the
+        skipped column stays REFERENCED (`ORDER BY a1` inside, `WHERE a1 IS NOT NULL`) — i.e. the scan is asked
+        for the full set. Do not rely on a stray reference either: constant folding or a provably-true predicate
+        can drop it again.
+      - **⚠ THE GATE IS THE *FILTERED* QUERY, and mutation-testing proves it: an unfiltered partitioned scan
+        reads every bound column anyway and passed happily while the bug was live.** With `withOrdinal` forced
+        true, `verify_delta_batched_read` survives **89 assertions** and dies at exactly
+        `WHERE p = 'p1'`. A partition test without a WHERE tests nothing about this.
       - **⚠ THE ERROR TEXT NAMES THE WRONG SUBSYSTEM.** `2^32` comes from `ColumnDataAllocator`'s CHECKED
         `NumericCast<uint32_t>` on an allocation SIZE, because `SetVectorString`'s `UnsafeNumericCast` is
         UNCHECKED in Release and lets a garbage string length through silently. Read it as "something made a
         string length absurd", never as an allocator or cast bug.
-      - **THREE HYPOTHESES DIED, all from bisecting the QUERY rather than the mechanism**, and the third had
-        been recorded HERE AS THE ANSWER: hive-column collision (`hive_partitioning => false` does not fix it —
-        kept anyway as a real guard against an `x=y` directory injecting a phantom column); a `union_by_name` +
-        virtual-column assertion (does not reproduce); and **"a bound input with a second VARCHAR column
-        breaks"** — REFUTED, `(utf8, int64, utf8)` round-trips perfectly when every column is read, and the
-        evidence for it ("with `p0` as `Int64` the query runs") was timing luck.
+      - **⚠ HOW OWNERSHIP WAS ESTABLISHED, because the obvious control got it BACKWARDS.** A pyarrow
+        `RecordBatchReader` on the stock wheel survives the same pruning — which looks like it convicts OUR
+        export and does not: **Python's `register` never goes through `duckdb_arrow_scan`**. What settled it was
+        **swapping the PRODUCER while holding the CALL SITE fixed**: feeding `duckdb_arrow_scan` a
+        DuckDB-produced stream (`ArrowAppender` output) crashes identically to an Apache.Arrow C#-produced one.
+        Producer-independent ⇒ the consumer owns it. **A control that changes the mechanism under test is not a
+        control** — same shape as the `count(*)`-is-not-a-read trap.
+      - **THREE HYPOTHESES DIED FIRST, all from bisecting the QUERY rather than the mechanism**, and the third
+        had been recorded HERE AS THE ANSWER: hive-column collision (`hive_partitioning => false` does not fix
+        it — kept anyway as a real guard against an `x=y` directory injecting a phantom column); a
+        `union_by_name` + virtual-column assertion (does not reproduce on the stock wheel); and **"a bound input
+        with a second VARCHAR column breaks"** — REFUTED, `(utf8, int64, utf8)` round-trips perfectly when every
+        column is read, and the evidence for it ("with `p0` as `Int64` the query runs") was timing luck.
       - **A SEPARATE REAL BUG OF OURS WAS FOUND ON THE WAY AND FIXED (C++-only, no ABI) — and it is NOT this
         one.** `MakeHostQueryStream` gave `duckdb_arrow_scan` the CALLER's `ArrowArrayStream *` — which DuckDB
         stores as a RAW POINTER in the view — then ran `conn->SendQuery`, a STREAMING result, so the managed
@@ -2066,9 +2080,11 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     - It gives up the DV's PRUNABLE BOUND (one WHERE cannot carry a per-file range). Deliberate, and the evidence
       is already in `DvRangeCondition`: its own A/B found that bound "demonstrably works and does not show up in
       wall time". ⚠ Re-measure on REMOTE storage with a mostly-deleted file before calling it free there.
-    - Still per-file: partitioned tables, `column_mapping 'id'`, the row-tracking virtual columns (a materialized
-      id has no field id AND `union_by_name` cannot declare one), nested STRUCT columns in the full form (the
-      plain `schema`-map form still handles those), and any scan with a rowid/tracking fast-path filter.
+    - Still per-file: `column_mapping 'id'`, the row-tracking virtual columns (a materialized id has no field id
+      AND `union_by_name` cannot declare one — but ⚠ that reason went STALE when the form switched to
+      `union_by_name`, see the class remarks), nested STRUCT columns in the full form (the plain `schema`-map
+      form still handles those), and any scan with a rowid/tracking fast-path filter. **Partitioned tables came
+      OFF this list 2026-08-07** — see the upstream-bug entry above.
     - **⚠ A `count(*)` CONTROL PRODUCED A FALSE "IT WORKS" FOR THE THIRD TIME IN ONE SESSION.** The field-id +
       virtual-column combination was pronounced fine on a multi-file `count(*)` — which DuckDB answers without
       building the full mapping. Forcing a real decode reproduced the assertion immediately. **A parquet
@@ -2149,7 +2165,9 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
       branch rebuilds to LOGICAL names and they agree; where names stay physical they do so in every branch. The
       hazard needs branches to DISAGREE, which a shared table schema makes hard to arrange. Establish that rather
       than assume it — the measured union hazard above is real, it just may not be reachable here.
-  - **STILL OPEN, in the order the win would arrive:** (1) the gated shapes via the union above; (2) id mode,
+  - **STILL OPEN, in the order the win would arrive:** (0) ⚠ **partitioned tables are DONE — off the loop since
+    2026-08-07**, so the remaining gated set is smaller than the union item below assumes; (1) the gated shapes
+    via the union above; (2) id mode,
     once #24407 lands; (3) `FullTableSql`'s inlined DV literals — still the documented `WITH … AS MATERIALIZED`
     fix, and now a PREREQUISITE of (1) rather than a separate cleanup, since the DV files are what a union of the
     gated shapes has to carry. A `filename`-keyed metadata join was the route recommended here first; the union

@@ -477,6 +477,16 @@ internal static class DeltaNativeReader
         /// not show up in wall time" (2.17 s vs 2.21 s on 10M rows with 9M deleted), because marshalling and
         /// hashing the vector dominates either way. Expect that to change where I/O dominates instead — remote
         /// storage with a mostly-deleted file is the shape to re-measure before assuming this is free there.</para>
+        /// <para><b>⚠ EVERY COLUMN OF A BOUND INPUT MUST BE READ BY THIS SQL — a correctness invariant.</b> A
+        /// bound input carrying a column DuckDB's projection PRUNES makes the scan ask for a NON-PREFIX column
+        /// set, which SEGFAULTS (confirmed upstream bug; repro <c>test/repro/duckdb_arrow_scan_nonprefix.c</c>,
+        /// docs/duckdb-upstream-issues.md §2). That is why <see cref="MetaStream"/> takes
+        /// <c>withOrdinal</c>: <c>ord</c> is emitted only when the rowid expression reads it. Partitioned
+        /// tables were gated off this form until that was understood — they are supported now, and stay
+        /// supported only as long as the invariant holds. ⚠ Do NOT try to fix a future unread column by
+        /// wrapping the query: a subquery, a plain CTE and even a MATERIALIZED one all still crash (measured —
+        /// projection pushdown goes straight through). Add a bound column only together with the SQL that
+        /// reads it.</para>
         /// <para>⚠ <b>THE ROW-TRACKING GATE'S REASON IS STALE — RE-DERIVE IT BEFORE TRUSTING IT.</b> It was
         /// written as structural: <i>"a materialized <c>__delta_row_id</c> is not column-mapped, so it has no
         /// field id to key by, and a DuckDB <c>map</c> cannot mix INTEGER and VARCHAR keys"</i>. Every clause of
@@ -502,29 +512,6 @@ internal static class DeltaNativeReader
             if (listing.LogicalToFieldId is not null)
             {
                 return null; // id mode: a file's stored names are its own vintage's — case 2
-            }
-            if (listing.PartitionColumns.Count > 0)
-            {
-                // ⚠ GATED ON A CONFIRMED UPSTREAM DuckDB BUG, reproduced on plain v1.5.5 with no
-                // fabricator code in it: test/repro/duckdb_arrow_scan_nonprefix.c, written up in
-                // docs/duckdb-upstream-issues.md §2.
-                //
-                // duckdb_arrow_scan + a projection that is NOT A PREFIX of the bound stream's columns
-                // SEGFAULTS (or, non-deterministically, corrupts a string length into the `4294967296`
-                // assertion and invalidates the database). `SELECT a0, a2` over a 3-column input dies;
-                // `SELECT a0, a1` is fine. Producer-independent — a DuckDB-produced stream crashes exactly
-                // like an Apache.Arrow C#-produced one, which is how ownership was established.
-                //
-                // A partitioned scan hits it because the per-file input carries `ord` (the global file
-                // ordinal, for the transient rowid) and a scan wanting no rowid prunes it. The cheap
-                // mitigation is to emit only the columns the generated SQL references — but that leaves the
-                // landmine armed for the next bound input with an unused column, so the gate stays until
-                // upstream lands a fix.
-                //
-                // ⚠ `hive_partitioning => false` above is NOT part of this and must not be removed with the
-                // gate: it is a real guard, since any `x=y` directory in a table's path would otherwise
-                // inject a phantom column.
-                return null;
             }
             bool nameMapped = listing.LogicalToPhysical is not null || listing.MappedSchema is not null;
 
@@ -652,8 +639,8 @@ internal static class DeltaNativeReader
             }
             sb.Append(" FROM (SELECT ").Append(string.Join(", ", inner))
               .Append(" FROM read_parquet([").Append(string.Join(", ", files.Select(f => Literal(f.Uri))))
-              // hive_partitioning is OFF deliberately, and it is a correctness guard rather than the fix it was
-              // first tried as (it does NOT cure the partitioned-table failure gated above). DuckDB AUTO-DETECTS
+              // hive_partitioning is OFF deliberately, and it is a correctness guard rather than the workaround
+              // it was first tried as (it does NOT cure the upstream non-prefix crash). DuckDB AUTO-DETECTS
               // hive layout from the paths, so any directory of the form `x=y` anywhere in a table's path would
               // inject a phantom column into the scan. The Delta log's partitionValues is the authoritative
               // source — paths are opaque here and are never parsed.
@@ -687,7 +674,8 @@ internal static class DeltaNativeReader
                     if (needsMeta)
                     {
                         list.Add((metaView,
-                                  new SingleScanArrowStream(MetaStream(files, partCols, listing), metaView)));
+                                  new SingleScanArrowStream(
+                                      MetaStream(files, partCols, listing, withOrdinal: wantRowId), metaView)));
                     }
                     if (anyDv)
                     {
@@ -793,10 +781,20 @@ internal static class DeltaNativeReader
 
     /// <summary>The per-file constants the batched read joins on <c>filename</c>: the global ordinal (which the
     /// transient rowid folds in) and each requested partition column's raw value as VARCHAR, cast to the column's
-    /// declared type in SQL. One row per file, so the join is 1:1 and cannot duplicate rows.</summary>
+    /// declared type in SQL. One row per file, so the join is 1:1 and cannot duplicate rows.
+    /// <para>⚠ <b>EVERY COLUMN HERE MUST BE READ BY THE GENERATED SQL — that is a CORRECTNESS invariant, not
+    /// tidiness.</b> A bound input carrying a column DuckDB's projection PRUNES makes the scan ask for a
+    /// NON-PREFIX column set, which SEGFAULTS (or corrupts a string length into an assertion that invalidates
+    /// the database): confirmed upstream bug, repro in
+    /// <c>test/repro/duckdb_arrow_scan_nonprefix.c</c>, docs/duckdb-upstream-issues.md §2. Hence
+    /// <paramref name="withOrdinal"/> — <c>ord</c> is emitted only when the rowid expression reads it, so the
+    /// consumed set always equals the produced set and the bug is unreachable BY CONSTRUCTION rather than by
+    /// luck. ⚠ Wrapping the query in a subquery or even a MATERIALIZED CTE does NOT help (measured — projection
+    /// pushdown goes straight through), so do not "fix" a future column that way. Add a column here only
+    /// together with the SQL that reads it.</para></summary>
     private static IArrowArrayStream MetaStream(
         IReadOnlyList<DeltaReader.NativeScanFile> files, IReadOnlyList<string> partitionCols,
-        DeltaReader.NativeScanList listing)
+        DeltaReader.NativeScanList listing, bool withOrdinal)
     {
         var fn = new StringArray.Builder();
         var ord = new Int64Array.Builder();
@@ -827,9 +825,13 @@ internal static class DeltaNativeReader
         var fields = new List<Field>(2 + parts.Length)
         {
             new Field("fn", StringType.Default, nullable: false),
-            new Field("ord", Int64Type.Default, nullable: false),
         };
-        var arrays = new List<IArrowArray>(2 + parts.Length) { fn.Build(), ord.Build() };
+        var arrays = new List<IArrowArray>(2 + parts.Length) { fn.Build() };
+        if (withOrdinal)
+        {
+            fields.Add(new Field("ord", Int64Type.Default, nullable: false));
+            arrays.Add(ord.Build());
+        }
         for (int i = 0; i < parts.Length; i++)
         {
             fields.Add(new Field("p" + i.ToString(CultureInfo.InvariantCulture), StringType.Default, nullable: true));

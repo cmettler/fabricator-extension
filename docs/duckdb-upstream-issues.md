@@ -179,12 +179,19 @@ full set. ⇒ the reliable mitigation is not a wrapper but **making the stream's
 set**: bind only the columns the generated SQL actually reads. (Relying on a stray reference to survive the
 optimizer is not a mitigation — constant-folding or a provably-true predicate can drop it again.)
 
-### What it costs us until upstream fixes it
+### What it costs us
 
-`DeltaNativeReader.BatchPlan` gates **partitioned** tables off the batched read, because the per-file bound
-input carries `ord` (the global file ordinal, for the transient rowid) which a scan wanting no rowid prunes.
-The cheap mitigation is to emit only the columns the generated SQL references, but that leaves the landmine
-armed for the next bound input with an unused column, so the gate stays.
+Not a gate any more, but a **standing invariant**: every column of a bound host-query input must be read by
+the generated SQL. `DeltaNativeReader.MetaStream` therefore takes `withOrdinal` — the per-file global ordinal
+is emitted only when the rowid expression reads it — so the consumed set always equals the produced set and
+the bug is unreachable by construction rather than by luck. Partitioned tables were gated off the batched read
+until that was understood; they are batched now.
+
+⚠ The cheap-looking alternative (leave the column bound, wrap the query) does **not** work — see the table
+above. And a future bound input that adds a column without the SQL to read it re-arms this immediately, which
+is why the invariant is stated on `MetaStream` itself and gated by a *filtered* partition query in
+`verify_delta_batched_read` §6: an unfiltered partitioned scan reads every bound column anyway and passed
+happily while the bug was live.
 
 ---
 
