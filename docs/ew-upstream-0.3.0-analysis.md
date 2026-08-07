@@ -17,19 +17,24 @@ Issue **#65** → PR **#83** (`09248de`, *"the log layer cannot commit — OCC a
 so the OCC core moved DOWN into the log layer to make `EngineeredWood.DeltaLake` a standalone logging engine
 and `ConflictChecker` *"a pure function of its inputs — no I/O, no snapshot mutation."*
 
-**Moved DOWN and made PUBLIC:**
+**Moved DOWN and made PUBLIC** (verified against the `upstream/main` tree, not inferred from commit subjects):
 
-| type | from | to |
-|---|---|---|
-| `ConflictChecker`, `ConflictResult`, `ConflictType` | `.Table.Concurrency` | `…DeltaLake.Concurrency` |
-| `ReadSet` | `.Table` | `…DeltaLake.Concurrency` |
-| `IsolationLevel` | `.Table` | `…DeltaLake` (`[TypeForwardedTo]` left behind) |
-| `PartitionUtils.BuildPartitionPath` | `.Table.Partitioning` | `…DeltaLake` |
+| type | from | to | accessibility |
+|---|---|---|---|
+| `ConflictChecker`, `ConflictResult`, `ConflictType` | `.Table.Concurrency` | `…DeltaLake.Concurrency` | **public** |
+| `ReadSet` | `.Table` | `…DeltaLake.Concurrency` (in `ConflictChecker.cs`) | **public** |
+| `IsolationLevel` | `.Table` | `…DeltaLake` | **public** |
+| `DeltaFilePruner` | `.Table` | `…DeltaLake` | **public** |
+| `BuildPartitionPath` | `.Table.Partitioning/PartitionUtils` | `…DeltaLake/DeltaPath` | **public** |
 
-Moved but still `internal`: `DeltaFilePruner`, `DeltaFileStats`, `DeltaFileStatsAccessor` → `…DeltaLake`.
+⚠ **Two corrections to this doc's first draft, both of which were guesses from diffstats.**
+`DeltaFilePruner` is `public sealed class` — NOT "moved but still internal". And `PartitionUtils` did
+**not** move and is still `internal` in `.Table`; what became public is the one METHOD we cared about, on a
+different type (`DeltaPath.BuildPartitionPath`). Read the tree, not the commit list.
 
 New public API in `…DeltaLake.Log`: **`LogCommitter`**, plus `LogCommitRequest` / `LogCommitResult` /
-`LogCommitOptions` / `ICommitRebaseHandler` / `RecomputeRebaseHandler` / `LogVersions`.
+`LogCommitOptions` / `ICommitRebaseHandler` / `CommitRebase` / `CommitRebaseContext` /
+`RecomputeRebaseHandler` / `LogVersions`.
 
 ### ⚠ THE MERGE HAZARD, and it is the one that already bit us once
 
@@ -53,6 +58,83 @@ assemblies against the merged one, then classify each absent member by whether i
 separates upstream's consolidation from our losses. Do not trust a clean `git merge`.
 
 ---
+
+## 1a. THE FINDING THAT CHANGES THE PLAN — upstream built the public seam our patch set exists to reach
+
+Read `LogCommitter`'s own summary: *"a caller with a data plane of its own — its own parquet, its own
+statistics, its own deletion vectors — can use this without bringing one along."* That is a description of
+fabricator. Three public members carry our two live needs, and neither needs a patch:
+
+1. **`LogCommitRequest.Reads` is a caller-supplied `ReadSet`**, and `ReadSet.WholeTable` is `{ get; init; }`.
+   Our `ExemptRowLevelFromWholeTableRead` patch is, in its entirety, `reads with { WholeTable = false }`
+   applied just before `ConflictChecker.Check`. A caller that BUILDS the read set states that directly. The
+   patch exists only because `DeltaTable` built the read set from `DeltaTransaction`'s declarations and gave
+   the host no way in — ⇒ **it is a plumbing patch, not a semantics one, and the plumbing is now public.**
+   - ⚠ This also **retracts the offer**, not just the patch. CLAUDE.md lists it as offer (2) —
+     *"`ExemptRowLevelFromWholeTableRead`, pitched as a DEPARTURE not an inconsistency"*. There is nothing
+     left to ask for: upstream did not adopt our flag, it removed the need for one. Same outcome as
+     `RowUpdateMode` and the `WriteChangeDataFilesForAsync` overload — **the cheapest way to retire a patch
+     is to stop needing it**, and that is now three for three.
+2. **`ICommitRebaseHandler.RebaseAsync` returns `CommitRebase(Actions, RowLevelResolvedPaths)`.** That second
+   field is exactly the argument `ConflictChecker.Check` takes for row-level DV reconciliation. So the
+   concurrent row-level DML story — rebase each staged delete's DV onto the concurrent one, then tell the
+   checker those paths are settled — is expressible through the public interface. It is the piece I expected
+   to be missing and it is there.
+3. **`ConflictChecker` is public and documented as a pure function** — so its verdicts are unit-testable from
+   our side, and a divergence between what we think we declared and what the checker sees stops being
+   arguable.
+
+**⚠ THIS IS A READING OF THE API SURFACE, NOT A BUILD.** This project's own standing rule:
+*building the Bridge is what finds the host's needs; reading the diff is not.* Every claim above is that
+these needs are EXPRESSIBLE, not that they are met. Specifically unestablished:
+- Whether committing through `LogCommitter` means bypassing `DeltaTransaction`'s staging
+  (`StageRowDeletesAsync` / `StageDataFilesAsync` / `StageChangeDataAsync`) — which is where our actions
+  come from today — or whether `DeltaTransaction` itself now routes through it and exposes the request.
+- Whether the DV computation a row-level rebase needs is reachable from outside (`StageRowDeletesAsync` is
+  the public door onto EW's internal DV core today; a `LogCommitter`-only route may not have one).
+- The **whole `DeltaTable.cs` half of our patch set**, which is NOT about concurrency at all — see §1b.
+
+## 1b. What our 4 patched files actually contain — because the summary "row-level DML + isBlindAppend" is incomplete
+
+Measured hunk by hunk against the merge base, not recalled:
+
+| file | lines | what it is | does §1a retire it? |
+|---|---|---|---|
+| `ConflictChecker.cs` | 42 | the isBlindAppend READING half | **no — still needed, see §1c** |
+| `DeltaTransaction.cs` | 26 | `ExemptRowLevelFromWholeTableRead` (a property + its doc) | **likely yes** — §1a.1 |
+| `DeltaFilePruner.cs` | 4 | a doc paragraph pointing at `PlanFiles` | **yes, trivially** — the type is public now |
+| `DeltaTable.cs` | 137 | **six unrelated things, mostly NOT concurrency** | **unknown — the real work** |
+
+`DeltaTable.cs` breaks down as: the `ExemptRowLevelFromWholeTableRead` plumbing (~40 lines, the other end of
+the `DeltaTransaction` property); create-time **`configuration`** and **`preAssignedSchema`** params (a
+buffered-transaction CTAS has already written data files against assigned physical names, so re-assignment
+would orphan them); `WriteDataFilesAsync`'s **`materializedRowIds` / `deletionVectorsByFileIndex` /
+`identityValuesPreGenerated`**; the **path-keyed `FileRowSelection`** docs and the ordinal-keyed
+`RebaseDvDmlActionsAsync` compatibility overload; a `UpdateAsync` overload carrying `readPredicates`; and a
+copyright header.
+
+⇒ **Roughly half of `DeltaTable.cs` is host-plumbing on the WRITE path, not OCC.** Those are the ones §1a says
+nothing about, and they are what a fresh-branch refactor has to answer: does the public commit layer let us
+supply pre-assigned schemas, materialized row ids and pre-computed DVs, or do those still need `DeltaTable`?
+
+## 1c. isBlindAppend — STILL not upstream, and upstream's own doc comment is the argument for the offer
+
+Verified in the tree, not assumed: `ConflictChecker.IsBlindAppend(actions)` at `upstream/main` is the pure
+**inference** — *"at least one add, and no remove, metadata, or protocol action"*. It never reads
+`commitInfo.isBlindAppend`. So our 42-line patch is live, and the file moving to a public namespace makes the
+offer CLEANER rather than obsolete.
+
+⚠ Upstream's doc comment on it says the inference is *"the reader-side inference the protocol relies on."*
+Our own reading of Delta at the `v4.2.0` tag says otherwise, and the discrepancy is the offer: Delta is
+`isBlindAppendOption.getOrElse(false)` — the flag, defaulting to NOT blind — and it **computes
+`onlyAddFiles` and pointedly does not use it** for this decision. The inference errs in the UNSAFE direction
+(an `INSERT INTO t SELECT … FROM t` emits only adds and plainly read the table), which is the dbt-incremental
+anti-join shape, i.e. the common case.
+
+Note our patch is deliberately NOT Delta-equivalent either: we fall back to the inference when the flag is
+ABSENT, because EW emits no flag itself and `getOrElse(false)` would make ordinary EW-to-EW concurrent
+appends start conflicting. Offer it as what it is — believe a declaration when one is made — and say that the
+fallback is a back-compat choice, not parity.
 
 ## 2. Every commit since the pin, with what it means for us
 
@@ -85,12 +167,16 @@ The user's instruction for this bump: **early version, no back-compat needed —
 overlaying, especially where an upstream feature can replace our own implementation.** Candidates, in
 descending order of confidence, all UNVERIFIED:
 
-1. **Our `ConflictChecker` isBlindAppend patch (offer 1, 42 lines).** The file moved and is now public. Either
-   upstream took an equivalent, or our patch re-cuts onto a public type — which would also make the offer
-   trivial to send. **Check `git log -S` before assuming upstream reimplemented us** (it may be convergence,
-   the ew-master-migration rule).
-2. **`PartitionUtils.BuildPartitionPath` is PUBLIC.** CLAUDE.md currently says *"do not hand-roll the partition
-   split"* and records that a request to make `PartitionUtils` public was superseded. It is now public anyway,
+0. **RESOLVED, see §1a/§1c — these two were the top of this list and are now measured, not candidates.**
+   `ExemptRowLevelFromWholeTableRead` (both halves, ~66 lines) is retired by `LogCommitRequest.Reads`, and the
+   OFFER is withdrawn with it. `DeltaFilePruner`'s 4 lines are retired by the type going public. The
+   isBlindAppend patch is NOT retired: upstream still infers.
+1. ~~**Our `ConflictChecker` isBlindAppend patch (offer 1, 42 lines).**~~ **Checked — upstream did NOT take an
+   equivalent** (`IsBlindAppend` is the bare action-shape inference at `fa9b556`). The patch re-cuts onto a
+   public type, which makes the offer easier to send, and §1c has the argument.
+2. **`BuildPartitionPath` is PUBLIC — on `DeltaPath`, not `PartitionUtils`.** CLAUDE.md currently says *"do not
+   hand-roll the partition split"* and records that a request to make `PartitionUtils` public was superseded.
+   The METHOD is public anyway,
    and #77 measured EW's encoding as Spark-matching. Anywhere we avoided partition-path work for this reason
    is unblocked.
 3. **Error codes (#78/#80).** We classify provider failures by NUMBER on SQL Server and by predicate on Delta
@@ -121,16 +207,46 @@ measured.** Everything below was taken against pin `3794fe4` and must be RE-TAKE
 
 ---
 
-## 5. Suggested order
+## 5. The approach: a FRESH branch off upstream, not a merge (decided 2026-08-07, user)
 
-1. Fetch + read the four PRs whose subjects promise behaviour change (#87, #83, #76, #73). Read the DOC hunks,
-   not just the subjects (ew-master-migration rule).
-2. `git merge upstream/main` into `fabricator-patches` — **`upstream/main`, never `master`** (renamed; the
-   stale ref still resolves and lands on an abandoned branch).
-3. **Surface audit before building anything.** Classify every absent member against the merge base.
-4. Re-cut the two patches whose files moved; decide per patch whether it is still needed at all.
-5. Build the Bridge — *building is what finds the host's needs; reading the diff is not.*
-6. Gates: EW Table.Tests × {net10.0, net8.0, net472} (only the net472 leg proves a change offerable), then
-   hermetic (67/67 — 6689) and service (45/45 — 1640).
+**Do not `git merge upstream/main` into `fabricator-patches`. Branch `fabricator-patches-v2` off
+`upstream/main` (`fa9b556`) and re-derive.** The reasoning, in order of weight:
+
+1. **A merge asks the wrong question.** It asks "how do our 175 lines re-apply onto the refactor?" — which is
+   how the 2026-08-01 bump silently kept a patch it should have retired and silently lost one it needed. A
+   fresh branch asks *"what, if anything, does the host still need?"* — and §1a says the honest answer may be
+   **one patch** (isBlindAppend), which is an OFFER rather than a need.
+2. **The delete/modify hazard disappears** rather than being carefully navigated. Two of four patched files no
+   longer exist at the path we patch; a merge can resolve either as "deleted by them" (patch silently gone) or
+   as "modified by us" (patch silently resurrected at a dead path). Neither is detectable from a clean merge.
+3. **It matches the user's instruction for this bump** — early version, no back-compat, prefer a clean refactor
+   over overlaying, especially where an upstream feature can replace our own implementation. §1a is exactly
+   that case.
+
+The cost is real and worth stating: the fresh branch loses the 60-commit history that records WHY each patch
+exists. Mitigation — `fabricator-patches` is not deleted, so `git log -S` still answers "did we once need
+this?", and every retired patch's reasoning is in CLAUDE.md and these docs already.
+
+### Order
+
+1. **Read the four behaviour-changing PRs** (#87, #83, #76, #73) — the DOC hunks, not the subjects.
+   #87 matters most: we `catch (DeltaConflictException)` in the OCC retry loops and it now covers two
+   different failures behind one type.
+2. `git checkout -b fabricator-patches-v2 upstream/main`. Nothing of ours on it yet.
+3. **Build the Bridge against bare upstream and let the COMPILER enumerate the needs.** This is the step that
+   replaces the surface audit, and it is strictly better: an audit lists what moved, a build lists what we
+   cannot express. Expect the §1b write-path params to be most of the errors.
+4. **For each error, ask "public API or patch?" in that order** — `LogCommitter` / `LogCommitRequest` /
+   `ICommitRebaseHandler` / `DeltaFilePruner` / `DeltaPath` first. Only what survives that question becomes a
+   patch, and each one gets its `// [FABRICATOR-PATCH: …]` marker at birth, with what would retire it.
+5. **Then, and only then, the concurrency question the user actually wants answered:** what does *proper*
+   concurrent row-level DML + WriteSerializable need, given `ReadSet` is ours to build and
+   `CommitRebase.RowLevelResolvedPaths` exists? That is a design pass, not a port — and it is the one place
+   where we should consider changing OUR side rather than EW's, since the two things our current
+   implementation gets wrong (the unconditional exemption at `DeltaCatalog.cs:3775`, and the missing
+   provenance on `ReadWholeTable`) are both host-side.
+6. Gates: EW Table.Tests × {net10.0, net8.0, net472} (only net472 proves a change offerable), then hermetic
+   (67/67 — 6689) and service (45/45 — 1678).
 7. Re-take §4's numbers.
-8. Only then re-pin, and push EW to the fork BEFORE bumping the pointer (the pin must be fetchable).
+8. Push EW to the fork BEFORE bumping the pointer (the pin must be fetchable), then re-pin and update
+   `.gitmodules`' `branch =`.
