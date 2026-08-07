@@ -507,6 +507,68 @@ deliberately never collects a host-written file (a DV DELETE re-adds an EXISTING
 data). ⇒ two ledgers because there are two writers, which is the eager-write design working, not an
 artefact.
 
+## 4c. CHECKED AGAINST DELTA OSS `master` (2026-08-07, user-asked) — three divergences, all PERMISSIVE
+
+Read `spark/src/main/scala/org/apache/spark/sql/delta/ConflictChecker.scala` at **master**, not the
+`v4.2.0` tag this project read before. Nothing we do is a protocol violation — the conflict rules are
+engine policy, not the Delta protocol — but all three departures lean the SAME way: we permit commits
+Delta would conflict. State them as departures, never as parity.
+
+### (1) The ABSENT flag — known, deliberate, still permissive
+
+```scala
+val blindAppendAddedFiles: Seq[AddFile] = if (isBlindAppendOption.getOrElse(false)) { addedFiles } else { Seq() }
+val changedDataAddedFiles: Seq[AddFile] = if (isBlindAppendOption.getOrElse(false)) { Seq() } else { addedFiles }
+```
+`getOrElse(false)` — **absent ⇒ NOT blind**, unchanged from v4.2.0. Our patch falls back to the INFERENCE,
+which can answer "blind". So an adds-only commit from a writer that emits no flag is exempted by us and
+examined by Delta. Deliberate (EW emits no flag itself, so `getOrElse(false)` would make ordinary EW-to-EW
+appends conflict) and now gated by `AbsentFlag_FallsBackToInference` — but it is the permissive direction,
+and #88 lists exactly this as an open decision upstream. **Do not settle it unilaterally.**
+
+### (2) ⚠ THE `metadataChanged` GUARD IS MISSING, and this is the one to fix
+
+```scala
+val addedFilesToCheckForConflicts = isolationLevel match {
+  case WriteSerializable if !currentTransactionInfo.metadataChanged =>
+    winningCommitSummary.changedDataAddedFiles
+  case Serializable | WriteSerializable =>
+    winningCommitSummary.changedDataAddedFiles ++ winningCommitSummary.blindAppendAddedFiles
+  ...
+```
+Delta's WriteSerializable relaxation applies **only when OUR OWN transaction did not change metadata**;
+a metadata-changing transaction re-examines blind appends. EW's condition is
+`examineAdds = isolation == Serializable || !concurrentIsBlindAppend` — **no such guard**.
+
+⇒ a fabricator transaction that runs at `write_serializable` AND carries a buffered ALTER (our
+`pending.HasAlter` path fuses schema changes into the same commit) exempts concurrent blind appends where
+Delta would examine them. CLAUDE.md already flagged this as "not investigated"; it is now CONFIRMED against
+master and it is a second independent permissive divergence. It belongs in the #88 conversation, because
+"read the flag" and "guard the relaxation" are the same paragraph of Delta's logic.
+
+### (3) `readWholeTable` + ANY remove ⇒ conflict, with NO isolation gate — which confirms today's move is a DEPARTURE
+
+```scala
+if (winningCommitSummary.removedFiles.nonEmpty && currentTransactionInfo.readWholeTable) {
+  throw DeltaErrors.concurrentDeleteReadException(...)
+}
+```
+`checkForDeletedFilesAgainstCurrentTxnReadFiles` has **no isolation-level branch at all**, while
+`checkForAddedFilesThatShouldHaveBeenReadByCurrentTxn` does. So Delta gates **concurrentAppend** on the
+isolation level and **never** gates concurrentDeleteRead.
+
+Our §4a.2 change withholds the whole-table declaration for a row-level DML at write_serializable, which
+makes this check not fire. That is exactly the departure CLAUDE.md describes — *"a DEPARTURE from Delta's
+`concurrentDeleteRead` rule, not an API inconsistency"* — and master confirms the characterisation
+precisely. **Moving it from an EW patch into the host changed WHERE the decision is made, not WHETHER we
+depart.** OSS Delta has no row-level-concurrency notion to appeal to (that is a Databricks feature), so
+there is no upstream rule that sanctions it; the justification remains ours and rests on the row-level
+write validation having already proven the removed rows were undisturbed.
+
+**⇒ For the #88 offer:** present the read half as *"believe a declaration when one is made"*, and say
+plainly that our absent-case fallback and the missing `metadataChanged` guard are NOT Delta-equivalent.
+Claiming parity would be false in two places and would be caught.
+
 ## 5. The approach: a FRESH branch off upstream, not a merge (decided 2026-08-07, user)
 
 **Do not `git merge upstream/main` into `fabricator-patches`. Branch `fabricator-patches-v2` off
