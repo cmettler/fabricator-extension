@@ -385,3 +385,76 @@ query II
 SELECT count(*), sum(ident) FROM im.main.t;
 ----
 4	10
+
+# ============================================================================
+# 8. THE TRANSIENT ROWID IS A VALUE, NOT A POSITION — multi-row-group files, several threads.
+#    rowid = (file ordinal << 40) | file_row_number. The halves have DIFFERENT granularity: the ordinal
+#    is per FILE (it rides the bound input and is JOINed on `filename`, never zipped positionally),
+#    while file_row_number is the row's physical position inside its own parquet file, which DuckDB
+#    derives from the footer's row-group offsets. Neither depends on the order rows are EMITTED — and
+#    DuckDB guarantees no such order — so the mapping must not move with the thread count.
+#    Pinned because the whole rowid DML path rests on it and a regression would be silent: rows would
+#    still come back, just addressed wrongly.
+#    ⚠ Do NOT pin a literal checksum here. The rowid is TRANSIENT by design: the file ordinal follows
+#    listing order over UUID-named files, so it legitimately differs between two creations of the same
+#    logical table (measured — two distinct checksums across three runs). The invariant is
+#    thread-count invariance WITHIN one database, which is what this compares.
+# ============================================================================
+
+statement ok
+SET delta_write_options='{"row_group_size":2048}';
+
+statement ok
+CREATE TABLE b.main.rg AS SELECT i::BIGINT AS id, ('v'||i)::VARCHAR AS s FROM range(20000) r(i);
+
+statement ok
+INSERT INTO b.main.rg SELECT i::BIGINT, ('v'||i)::VARCHAR FROM range(20000, 40000) r(i);
+
+statement ok
+SET threads=1;
+
+query II
+SELECT count(*), count(DISTINCT rowid) FROM b.main.rg;
+----
+40000	40000
+
+# Capture the id -> rowid mapping single-threaded. The checksum is over the PAIR: counting distinct
+# rowids alone would pass even with every one attached to the wrong row.
+statement ok
+CREATE TEMP TABLE ck AS SELECT sum(hash(id::VARCHAR||':'||rowid::VARCHAR)) AS c FROM b.main.rg;
+
+statement ok
+SET threads=8;
+
+query I
+SELECT (SELECT c FROM ck) = (SELECT sum(hash(id::VARCHAR||':'||rowid::VARCHAR)) FROM b.main.rg);
+----
+true
+
+statement ok
+SET threads=4;
+
+query I
+SELECT (SELECT c FROM ck) = (SELECT sum(hash(id::VARCHAR||':'||rowid::VARCHAR)) FROM b.main.rg);
+----
+true
+
+# And DML addressed by that rowid must hit exactly the predicate's rows, under threads.
+statement ok
+UPDATE b.main.rg SET s = 'HIT' WHERE id % 4999 = 0;
+
+query I
+SELECT count(*) FROM b.main.rg WHERE (s = 'HIT') <> (id % 4999 = 0);
+----
+0
+
+statement ok
+DELETE FROM b.main.rg WHERE s = 'HIT';
+
+query II
+SELECT count(*), count(*) FILTER (WHERE s <> 'v'||id) FROM b.main.rg;
+----
+39991	0
+
+statement ok
+RESET delta_write_options;

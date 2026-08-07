@@ -210,7 +210,7 @@ case "$TIER" in
         # The section pins the codec engine deliberately: under native_write DuckDB's COPY writes the data
         # files, so EW's ParquetWriteOptions never apply and the assertion would pass for the wrong reason.
         # Mutation-tested — reverting the spec on EnsureHeldTableAsync fails at exactly the CDF assertion.
-        : "${MIN_ASSERTIONS:=6525}"
+        : "${MIN_ASSERTIONS:=6542}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

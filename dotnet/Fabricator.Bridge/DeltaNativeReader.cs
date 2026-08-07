@@ -481,7 +481,7 @@ internal static class DeltaNativeReader
         /// bound input carrying a column DuckDB's projection PRUNES makes the scan ask for a NON-PREFIX column
         /// set, which SEGFAULTS (confirmed upstream bug; repro <c>test/repro/duckdb_arrow_scan_nonprefix.c</c>,
         /// docs/duckdb-upstream-issues.md §2). That is why <see cref="MetaStream"/> takes
-        /// <c>withOrdinal</c>: <c>ord</c> is emitted only when the rowid expression reads it. Partitioned
+        /// <c>withFileOrdinal</c>: <c>file_ord</c> is emitted only when the rowid expression reads it. Partitioned
         /// tables were gated off this form until that was understood — they are supported now, and stay
         /// supported only as long as the invariant holds. ⚠ Do NOT try to fix a future unread column by
         /// wrapping the query: a subquery, a plain CTE and even a MATERIALIZED one all still crash (measured —
@@ -609,7 +609,7 @@ internal static class DeltaNativeReader
             bool needsMeta = wantRowId || partitionCols.Count > 0;
             if (wantRowId)
             {
-                inner.Add($"((__fab_f.ord << {TransientRowAddress.PositionBits}) | __fab_rp.file_row_number) "
+                inner.Add($"((__fab_f.file_ord << {TransientRowAddress.PositionBits}) | __fab_rp.file_row_number) "
                           + $"AS {Quote(RowIdColumn)}");
             }
 
@@ -675,7 +675,7 @@ internal static class DeltaNativeReader
                     {
                         list.Add((metaView,
                                   new SingleScanArrowStream(
-                                      MetaStream(files, partCols, listing, withOrdinal: wantRowId), metaView)));
+                                      MetaStream(files, partCols, listing, withFileOrdinal: wantRowId), metaView)));
                     }
                     if (anyDv)
                     {
@@ -779,22 +779,28 @@ internal static class DeltaNativeReader
             schema, new[] { new RecordBatch(schema, new IArrowArray[] { fn.Build(), pos.Build() }, (int)n) });
     }
 
-    /// <summary>The per-file constants the batched read joins on <c>filename</c>: the global ordinal (which the
+    /// <summary>The per-file constants the batched read joins on <c>filename</c>: the file's ordinal (which the
     /// transient rowid folds in) and each requested partition column's raw value as VARCHAR, cast to the column's
     /// declared type in SQL. One row per file, so the join is 1:1 and cannot duplicate rows.
+    /// <para>⚠ <c>file_ord</c> is the FILE's index in the scan's list — <b>one value per file, not per row</b>.
+    /// It is nothing like SQL's <c>WITH ORDINALITY</c>, which numbers rows AS THEY ARE EMITTED and would be
+    /// nondeterministic under a parallel multi-row-group scan. The only per-row half of the rowid is
+    /// <c>file_row_number</c>, which DuckDB derives from the parquet footer's row-group offsets, so neither
+    /// half depends on emission order (DuckDB guarantees none). And the ordinal is attached by a JOIN on
+    /// <c>filename</c>, never zipped positionally, so it cannot land on the wrong file.</para>
     /// <para>⚠ <b>EVERY COLUMN HERE MUST BE READ BY THE GENERATED SQL — that is a CORRECTNESS invariant, not
     /// tidiness.</b> A bound input carrying a column DuckDB's projection PRUNES makes the scan ask for a
     /// NON-PREFIX column set, which SEGFAULTS (or corrupts a string length into an assertion that invalidates
     /// the database): confirmed upstream bug, repro in
     /// <c>test/repro/duckdb_arrow_scan_nonprefix.c</c>, docs/duckdb-upstream-issues.md §2. Hence
-    /// <paramref name="withOrdinal"/> — <c>ord</c> is emitted only when the rowid expression reads it, so the
+    /// <paramref name="withFileOrdinal"/> — <c>file_ord</c> is emitted only when the rowid expression reads it, so the
     /// consumed set always equals the produced set and the bug is unreachable BY CONSTRUCTION rather than by
     /// luck. ⚠ Wrapping the query in a subquery or even a MATERIALIZED CTE does NOT help (measured — projection
     /// pushdown goes straight through), so do not "fix" a future column that way. Add a column here only
     /// together with the SQL that reads it.</para></summary>
     private static IArrowArrayStream MetaStream(
         IReadOnlyList<DeltaReader.NativeScanFile> files, IReadOnlyList<string> partitionCols,
-        DeltaReader.NativeScanList listing, bool withOrdinal)
+        DeltaReader.NativeScanList listing, bool withFileOrdinal)
     {
         var fn = new StringArray.Builder();
         var ord = new Int64Array.Builder();
@@ -827,9 +833,9 @@ internal static class DeltaNativeReader
             new Field("fn", StringType.Default, nullable: false),
         };
         var arrays = new List<IArrowArray>(2 + parts.Length) { fn.Build() };
-        if (withOrdinal)
+        if (withFileOrdinal)
         {
-            fields.Add(new Field("ord", Int64Type.Default, nullable: false));
+            fields.Add(new Field("file_ord", Int64Type.Default, nullable: false));
             arrays.Add(ord.Build());
         }
         for (int i = 0; i < parts.Length; i++)

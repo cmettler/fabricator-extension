@@ -2019,10 +2019,25 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
       `test/repro/duckdb_arrow_scan_nonprefix.c`, ~110 lines of pure C with two passing positive controls,
       ready to file. Full record: [docs/duckdb-upstream-issues.md](docs/duckdb-upstream-issues.md) §2.
       - **THE FIX IS STRUCTURAL, and it is now a standing rule for every bound host-query input: EVERY COLUMN
-        MUST BE READ BY THE GENERATED SQL.** `MetaStream` takes `withOrdinal` — the per-file global ordinal is
+        MUST BE READ BY THE GENERATED SQL.** `MetaStream` takes `withFileOrdinal` — the per-file ordinal is
         emitted only when the rowid expression reads it — so the consumed set always equals the produced set and
         the bug is unreachable BY CONSTRUCTION. A partitioned scan tripped it because that ordinal is dead
         weight when no rowid is wanted. **Add a bound column only together with the SQL that reads it.**
+      - **⚠ `file_ord` IS NOT `WITH ORDINALITY`, and the old names (`withOrdinal` / `ord`) invited exactly that
+        reading — renamed 2026-08-07 after they did.** `rowid = (file_ord << 40) | file_row_number`, and the two
+        halves have DIFFERENT granularity: `file_ord` is the FILE's index in the scan's list, **one value per
+        file**, attached by a JOIN on `filename` (never zipped positionally); `file_row_number` is the row's
+        physical position inside its own parquet file, which DuckDB derives from the FOOTER's row-group offsets.
+        So neither half depends on emission order — which matters because **DuckDB guarantees no row order**, and
+        a `WITH ORDINALITY`-style running counter WOULD be nondeterministic under a parallel multi-row-group
+        scan. MEASURED on 2 files × 10 row groups / 40k rows: the id→rowid checksum is identical at threads 1, 8
+        and 4, identical between the batched path and the per-file loop, and a threaded UPDATE hit exactly its 9
+        predicate rows with 0 mismatches. Gate: `verify_delta_batched_read` §8.
+      - **⚠ AND THE ROWID IS *TRANSIENT ACROSS CREATIONS*, which that gate had to be rewritten to respect.** A
+        first version pinned a literal checksum and was FLAKY: `file_ord` follows listing order over UUID-named
+        data files, so two creations of the same logical table legitimately produce different rowids (measured:
+        two distinct checksums over three runs). Stable WITHIN a scan — all DML needs, since the rowid is
+        captured and consumed inside one statement — but never pin one across runs.
       - **⚠ WRAPPING THE QUERY DOES NOT WORK — measured, because it is the obvious first guess (and was the
         user's).** A subquery, a plain CTE and even a **MATERIALIZED** CTE all still crash: projection pushdown
         goes straight through every one. That is exactly why the real query still died despite already being
