@@ -505,33 +505,25 @@ internal static class DeltaNativeReader
             }
             if (listing.PartitionColumns.Count > 0)
             {
-                // ⚠ GATED. The trigger is now REPRODUCIBLE AND MINIMAL, but the owning side is still open,
-                // so this stays. See docs/duckdb-upstream-issues.md §2 for the full record.
+                // ⚠ GATED ON A CONFIRMED UPSTREAM DuckDB BUG, reproduced on plain v1.5.5 with no
+                // fabricator code in it: test/repro/duckdb_arrow_scan_nonprefix.c, written up in
+                // docs/duckdb-upstream-issues.md §2.
                 //
-                // TRIGGER: a bound host-query Arrow input carrying a column that DuckDB's projection PRUNES.
-                // Reproduced with no Delta, no parquet and no CTE — bind (utf8, int64, utf8) and select only
-                // columns 0 and 2 — and the process dies INSIDE host_query (instrumented: the managed side
-                // reaches the call and never returns). A partitioned scan hits it because the per-file input
-                // carries `ord` for the transient rowid, which a scan that wants no rowid does not read.
+                // duckdb_arrow_scan + a projection that is NOT A PREFIX of the bound stream's columns
+                // SEGFAULTS (or, non-deterministically, corrupts a string length into the `4294967296`
+                // assertion and invalidates the database). `SELECT a0, a2` over a 3-column input dies;
+                // `SELECT a0, a1` is fine. Producer-independent — a DuckDB-produced stream crashes exactly
+                // like an Apache.Arrow C#-produced one, which is how ownership was established.
                 //
-                // RULED OUT, each measured rather than argued:
-                //   • the SHAPE of the input — (VARCHAR, BIGINT, VARCHAR) round-trips perfectly when every
-                //     column is read, as do ss / sss / is / iss;
-                //   • the SQL — the whole failing statement (MATERIALIZED CTE + union_by_name + filename +
-                //     file_row_number + join + pushed filter) runs correctly when no column is pruned;
-                //   • OUR CLEANUP — leaking the input allocations instead of freeing them changes nothing;
-                //   • the SingleScanArrowStream guard — bypassing it changes nothing;
-                //   • hive auto-detection (`hive_partitioning => false` does not fix it; kept as a real guard
-                //     against an `x=y` directory injecting a phantom column).
+                // A partitioned scan hits it because the per-file input carries `ord` (the global file
+                // ordinal, for the transient rowid) and a scan wanting no rowid prunes it. The cheap
+                // mitigation is to emit only the columns the generated SQL references — but that leaves the
+                // landmine armed for the next bound input with an unused column, so the gate stays until
+                // upstream lands a fix.
                 //
-                // ⚠ NOT ESTABLISHED, and do NOT record it as upstream: the pyarrow control on the stock 1.5.5
-                // wheel passes the same pruning, but Python's `register` does not go through the C API's
-                // `duckdb_arrow_scan`, so it does not exercise this code path. It is either DuckDB's C-API
-                // arrow scan or Apache.Arrow C#'s export; nothing here separates them yet.
-                //
-                // The cheap mitigation if this is ever urgent is to emit ONLY the columns the generated SQL
-                // references (here: drop `ord` when no rowid is wanted) — but that leaves the landmine armed
-                // for the next bound input with an unused column, so it is not a substitute for the answer.
+                // ⚠ `hive_partitioning => false` above is NOT part of this and must not be removed with the
+                // gate: it is a real guard, since any `x=y` directory in a table's path would otherwise
+                // inject a phantom column.
                 return null;
             }
             bool nameMapped = listing.LogicalToPhysical is not null || listing.MappedSchema is not null;

@@ -82,96 +82,88 @@ says so badly.
 
 ---
 
-## 2. `Information loss on integer cast: value 4294967296` — trigger found, OWNER STILL OPEN, do not file
+## 2. `duckdb_arrow_scan` + a NON-PREFIX projection = SEGFAULT
 
-**Status: reproducible in four lines with no Delta, no parquet and no CTE. The trigger is a bound host-query
-Arrow input carrying a column that DuckDB's projection PRUNES. Whether the defect is in DuckDB's C-API arrow
-scan or in Apache.Arrow C#'s export is NOT established — so this must not be filed, and must not be written
-down as "ours" either.** The partition gate in `DeltaNativeReader.BatchPlan` stands on this.
+**Status: reproduced on plain DuckDB v1.5.5 — no extensions, no fabricator code, a hand-built C Arrow struct,
+two passing positive controls. Ready to file.** This is what the `DeltaNativeReader.BatchPlan` partition gate
+stands on.
 
-Reading a partitioned Delta table through the batched path raised, non-deterministically, either
+Register a 3-column Arrow stream with `duckdb_arrow_scan` and select a subset of its columns that is **not a
+prefix** — i.e. skip a column that has a projected column after it — and the process **segfaults**.
+
+```
+duckdb v1.5.5
+positive controls:
+  SELECT a0, a1, a2 FROM v           ... ok, 2 rows
+  SELECT a0, a1 FROM v               ... ok, 2 rows     <- prefix, fine
+subject (non-prefix projection):
+  SELECT a0, a2 FROM v               ... Segmentation fault
+```
+
+`SELECT a1, a2` (skipping column 0) crashes the same way. The rule is exactly *the projected column set must be
+a prefix of the stream's columns*.
+
+**Repro: [test/repro/duckdb_arrow_scan_nonprefix.c](../test/repro/duckdb_arrow_scan_nonprefix.c)** — pure C,
+public C API only, ~110 lines, self-contained. The Arrow array is hand-built, so **no producer library is
+involved**: this is not an Arrow-implementation bug. Build against a static DuckDB with `-DDUCKDB_STATIC_BUILD`
+(the file's header comment carries the exact `cl` line used here).
+
+### It also surfaces as a corrupted string length rather than a crash
+
+Non-deterministically the same shape instead raises
 
 ```
 INTERNAL Error: Information loss on integer cast: value 4294967296 outside of target range [0, 4294967295]
 ```
 
-or an outright **SEGFAULT** (`0xC0000005`).
+and then **invalidates the database**, as §1 does. `4294967296` is `2^32`, and the only *checked* `uint32_t`
+casts on this path are in **`ColumnDataAllocator`** — so the value is an **allocation size**, not an offset:
+`SetVectorString` narrows `offsets[i+1] - offsets[i]` with `UnsafeNumericCast`, unchecked in Release, so a
+garbage length passes silently and only throws when a `ColumnDataCollection` tries to size a block for it.
+Worth stating in the issue, because the message points at the allocator while the fault is reading a column's
+buffers at the wrong index.
 
-### The minimal repro
+### How ownership was established — and the control that nearly got it wrong
 
-Bind an Arrow batch of `(a0 utf8, a1 int64, a2 utf8)` as a host-query input and run `SELECT a0, a2 FROM
-<view>` — i.e. read columns 0 and 2 and let DuckDB prune column 1. The process dies inside `host_query`.
-Instrumented on the managed side: the call is entered and never returns. Reading **all three** columns is
-fine, as is every all-columns shape tried (`ss`, `sss`, `is`, `iss`, `sis`).
+Diagnosed from a partitioned Delta scan whose bound per-file metadata input carries a global-ordinal column
+that a scan wanting no rowid never reads. The sequence matters, because two controls were misleading:
 
-A partitioned Delta scan hits it because the per-file metadata input carries `ord` (the global file ordinal,
-for the transient rowid) and a scan that wants no rowid never reads it.
+1. **A pyarrow `RecordBatchReader` on the stock wheel survives the same pruning.** That looks like it convicts
+   the *producer* — and it does not: **Python's `register` does not go through `duckdb_arrow_scan`**, so it
+   never exercises this path. A control that changes the mechanism under test is not a control.
+2. Swapping the producer while holding the call site fixed is what settled it: feeding `duckdb_arrow_scan` a
+   **DuckDB-produced** stream (`ArrowAppender` output) crashes identically to an Apache.Arrow C#-produced one.
+   Producer-independent ⇒ the consumer owns it.
+3. Only then was the standalone C repro written, so the report carries no third-party code at all.
 
-### The error text named the wrong subsystem, and that is what made it slow
+Three earlier hypotheses died on the way, all from bisecting the *query* rather than the mechanism: a hive
+column collision (`hive_partitioning => false` does not fix it), a `union_by_name` + virtual-column assertion
+(does not reproduce), and "a bound input with a second VARCHAR column breaks" (refuted — `(utf8, int64, utf8)`
+round-trips perfectly when every column is read; the evidence for it was timing luck).
 
-`4294967296` is `2^32`. Grepping DuckDB for the message lands on `NumericCast`, and the only *checked*
-`uint32_t` casts on this path are in **`ColumnDataAllocator`** — so the value is an **allocation size**, not
-an offset. `SetVectorString` narrows `offsets[i+1] - offsets[i]` with `UnsafeNumericCast`, which in a
-**Release** build is an unchecked `static_cast`, so a garbage length passes silently and only blows up two
-layers later when a `ColumnDataCollection` tries to size a block for it. Read the number as "something made a
-string length absurd", never as an allocator or cast bug.
+### A separate real bug of OURS was found on the way, and fixed
 
-### Ruled out, each measured rather than argued
+`MakeHostQueryStream` handed `duckdb_arrow_scan` the **caller's** `ArrowArrayStream *` — which DuckDB stores as
+a raw pointer inside the view it creates — and then ran the SQL with `conn->SendQuery`, a **streaming** result.
+The comment above that loop claimed the stream was "consumed + released by DuckDB during the (materializing)
+query"; the next line of code said `// streaming (lazy Fetch)`. Both were in the file and only one was true, so
+the managed caller's `finally` released and freed storage the view still pointed at. Fixed by
+`OwnedArrowInputs`: each input is **moved** (struct copy + zero the source) into storage owned by the
+`HostQueryStream`, declared as its FIRST member so it outlives the result and connection that scan it.
 
-| candidate | verdict |
-|---|---|
-| the input's column SHAPE — "a second VARCHAR column breaks" | **refuted.** `(VARCHAR, BIGINT, VARCHAR)` round-trips perfectly when all columns are read. The earlier evidence for this ("with `p0` as `Int64` the query runs") was timing luck, and the "0 rows instead of 10" beside it was just integers failing a `p = 'p1'` filter, not corruption. |
-| the SQL | the entire failing statement — MATERIALIZED CTE, `union_by_name`, `filename`, `file_row_number`, join, pushed filter — runs and returns the right rows when nothing is pruned. |
-| our cleanup of the input allocations | **leaking them instead of freeing changes nothing.** |
-| `SingleScanArrowStream`'s second-scan guard | bypassing it changes nothing. |
-| hive auto-detection colliding with our projected partition column | `hive_partitioning => false` does not fix it. (Kept anyway as a real guard: any `x=y` directory in a table's path would otherwise inject a phantom column.) |
-| a DuckDB assertion in `union_by_name` + a virtual column over a hive layout | does not reproduce on the stock 1.5.5 wheel — four controls with real decodes. Filing that would have been a false report. |
+⚠ **That is not this bug** — the crash is unchanged with the fix in. It is a latent hazard the investigation
+surfaced, and it hid the same way: a `WITH … AS MATERIALIZED` CTE is fully materialised during `SendQuery`'s
+first chunk push, so nearly every shape drained the input before the ABI call returned, by plan accident.
 
-### ⚠ Why the stock-wheel control does NOT settle ownership
+Related, and the reason `BoundInput.Drop` is correctness rather than tidiness: `duckdb_arrow_scan` creates a
+**catalog-level (non-temporary)** view, so it outlives both the connection and the stream owning the storage.
 
-A pyarrow `RecordBatchReader` registered on a stock 1.5.5 wheel survives the same pruning. That looks like it
-convicts our export — and it does not, because **Python's `register` does not go through the C API's
-`duckdb_arrow_scan`**; it binds a Python object through its own factory. So the control exercises a different
-path from the one that dies. This is the same mistake as the SQL-shape control below, in a new costume: a
-control that changes the mechanism under test is not a control.
+### What it costs us until upstream fixes it
 
-**To settle it, the next experiment must drive `duckdb_arrow_scan` itself** — a tiny C (or C#) harness linking
-`duckdb.dll`, exporting one Apache.Arrow C# batch of `(utf8, int64, utf8)` and one hand-built C struct of the
-same shape, then running `SELECT a0, a2` against each. Same call, two producers: whichever crashes owns it.
-
-### A separate, real bug WAS found and fixed on the way (ours, C++ only, no ABI)
-
-`MakeHostQueryStream` handed `duckdb_arrow_scan` the **caller's** `ArrowArrayStream *` — which DuckDB stores
-as a raw pointer inside the view it creates — and then ran the SQL with `conn->SendQuery`, a **streaming**
-result. The comment above that loop claimed the stream was "consumed + released by DuckDB during the
-(materializing) query"; the next line of code said `// streaming (lazy Fetch)`. Both were in the file and only
-one was true, so the managed caller's `finally` released and freed storage the view still pointed at. Fixed by
-`OwnedArrowInputs`: each input is **moved** (struct copy + zero the source — the C-data-interface move) into
-storage owned by the `HostQueryStream`, declared as its FIRST member so it outlives the result and connection
-that scan it; zeroing the source also makes the managed cleanup inert (`release` is null ⇒ no double-release).
-
-⚠ **This did not fix §2** — the crash is unchanged with it in — so it is a genuine latent hazard that the
-investigation happened to surface, not the answer. It masked itself the same way: a `WITH … AS MATERIALIZED`
-CTE is fully materialised during `SendQuery`'s first chunk push, so nearly every shape drained the input
-before the ABI call returned, by plan accident.
-
-Related: because `duckdb_arrow_scan` creates a **catalog-level (non-temporary)** view, it outlives both the
-connection and the stream owning the input's storage — so `BoundInput.Drop` is correctness, not tidiness, and
-the one lazy-stream site (`DeltaCatalog.SortStream`) now defers its drop to Dispose via `BoundInput.WrapDrop`.
-
-### What actually made progress: stop bisecting the query, get a stack trace
-
-Three hypotheses came from bisecting SQL and all three died. Running the failing statement outside
-sqllogictest printed `0xC0000005 at Interop+Kernel32.LocalAlloc ← Fabricator.Bridge.HostFs.Query`, and
-checkpoint logging then placed the death inside `host_query`. Two throwaway tools made that reachable and are
-the reusable part: an env-var un-gate so the failure could be provoked on demand, and a temporary global table
-function `fabricator_probe_input(sql, shape, vals)` binding an arbitrary hand-built Arrow batch under a name
-substituted into arbitrary SQL — which exonerated marshalling, column shape, the query, our cleanup and the
-scan guard in minutes each. **Build the probe that isolates one variable instead of re-running the composite.**
-
-⚠ And note the control that looked decisive and was worthless: "the byte-identical statement with the metadata
-as an inline `VALUES` CTE returns the right rows" — an inline CTE has no bound input, so it changed the very
-variable under test while appearing to hold everything constant.
+`DeltaNativeReader.BatchPlan` gates **partitioned** tables off the batched read, because the per-file bound
+input carries `ord` (the global file ordinal, for the transient rowid) which a scan wanting no rowid prunes.
+The cheap mitigation is to emit only the columns the generated SQL references, but that leaves the landmine
+armed for the next bound input with an unused column, so the gate stays.
 
 ---
 
