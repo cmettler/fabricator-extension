@@ -136,6 +136,90 @@ ABSENT, because EW emits no flag itself and `getOrElse(false)` would make ordina
 appends start conflicting. Offer it as what it is — believe a declaration when one is made — and say that the
 fallback is a back-compat choice, not parity.
 
+## 1d. TWO CHANGES THE COMMIT LIST DOES NOT MENTION, both of which land on limitations we documented as ours to live with
+
+Found in `src/Directory.Build.props`' `PackageReleaseNotes`, not in any commit subject. **Read the release
+notes of a pre-1.0 dependency; the subjects do not carry the breaking changes.**
+
+### (a) `ITableFileSystem.RenameAsync` is REMOVED, replaced by `TryWriteAllBytesAsync` — and the contract is
+the exact hazard we measured
+
+> *"Atomically writes the entire contents of a small file only if the file does not already exist. Returns
+> true when the file was created, or false when an existing file was left unchanged. … The atomicity is
+> LOAD-BEARING … An implementation that writes unconditionally, or that checks existence and then writes, lets
+> two concurrent writers both believe they won; the loser's commit silently overwrites the winner's and the
+> table loses whatever that version recorded. **There is no error path for this.**"*
+
+That paragraph describes, precisely, three failures this project measured and wrote up as substrate problems:
+local Windows (`EXCLUSIVE_CREATE` succeeds on an existing file AND `MoveFile` overwrites ⇒ 400 of 900 rows
+landed, every writer exit 0); secretless S3 (8 of 48 commits landed, 40 lost silently); unguarded abfss
+(41 of 48). ⇒ **the commit primitive stops being two operations we hope compose and becomes ONE method with a
+`bool` return**, per filesystem, with the requirement stated.
+
+**This is a REQUIRED implementation, not an opportunity** — it is 3 of our types
+(`AdlsGen2TableFileSystem`, `DuckDbTableFileSystem`, `S3CommitFileSystem`) and the first thing the compiler
+asks for. And the honest implementation is where it gets interesting: **`DuckDbTableFileSystem` cannot satisfy
+this contract on the backends we measured**, because it routes through DuckDB's `FileSystem` whose
+`EXCLUSIVE_CREATE` is non-conditional on local Windows and on S3. That is not a regression — it is the
+existing silent hazard becoming a contract we can fail loudly against instead of a footnote in
+[known-limitations.md](known-limitations.md). Decide deliberately: refuse the write, or route those roots to a
+filesystem that can (the S3/ADLS ones already do).
+
+### (b) `DeltaTable.CreateOrReplaceAsync` — the static factory that retires limitation 1.5/1.6
+
+> *"publishes protocol, metadata, removes and initial data in one commit, creating a table with data or
+> atomically replacing an existing one while preserving its history."*
+
+CLAUDE.md and [delta-transactions.md](delta-transactions.md) §7.1 record that a CREATE-plus-data is **two
+versions** (v0 empty, v1 data) *in plain autocommit as well as in a transaction*, that a concurrent reader can
+therefore observe the empty table, that a data-write failure leaves an empty committed table behind a
+statement the user saw fail, and that fixing it needs **"an upstream static/factory form"** because all three
+doors were instance methods on an already-created table. `CreateOrReplaceAsync` is `public static`. ⇒ the
+door is open, and the compensation analysis we could not act on (§7.1's version-checked-delete-races-a-writer
+problem) is moot if the empty version is never published.
+
+⚠ Not yet verified: whether it accepts the pre-assigned schema and materialized row ids our buffered CTAS
+needs (§1b), which is precisely the patch family this would have to subsume to be a net win.
+
+## 1e. THE MEASUREMENT — the Bridge compiled against bare `fa9b556`, and the total need is SIX errors
+
+Branch `fabricator-patches-v2` off `upstream/main`, no patches, `dotnet build Fabricator.Bridge -f net10.0`.
+
+**Layer 1 — 3 × CS0535**, all the same new obligation: `ITableFileSystem.TryWriteAllBytesAsync` on
+`AdlsGen2TableFileSystem`, `DuckDbTableFileSystem`, `S3CommitFileSystem` (§1d(a)).
+
+**⚠ LAYER 1 IS NOT THE ANSWER, AND READING IT AS ONE WAS THE FIRST MISTAKE HERE.** CS0535 is a
+DECLARATION-level error, and Roslyn does not bind method BODIES while declaration errors are present. So the
+first build's tidy "3 errors, all one member" was the compiler having stopped before it looked at any of our
+code. Caught by a positive control — `DeltaCatalog.cs:4058` sets `ExemptRowLevelFromWholeTableRead`, which I
+had already verified is absent upstream, so its silence was proof the enumeration was incomplete rather than
+proof the code was fine. **Stub the declaration errors and build again.**
+
+**Layer 2 — 3 errors, and only ONE is patch-shaped:**
+
+| error | what it is | verdict |
+|---|---|---|
+| `DeltaTransaction` has no `ExemptRowLevelFromWholeTableRead` (`DeltaCatalog.cs:4058`) | our patch | **re-express via `LogCommitRequest.Reads`** — §1a.1 |
+| `EngineeredWood.DeltaLake.Table.IsolationLevel` does not exist ×2 (`:4130`, `:4131`) | the type moved namespace | a `using` change, not a patch |
+
+**⚠ AND "0 errors" WAS REPORTED ONCE ON THE WAY, FALSELY** — a `sed` in the capture pipeline swallowed the
+lines while the build was plainly failing. The same positive control caught it, one turn after catching the
+first one. Two different zero-traps in one enumeration, both from trusting a filtered count over the artifact:
+`ls` the DLL, or read the raw tail.
+
+**Why the number is so small: five of the six members our `DeltaTable.cs` patch added are ALREADY UPSTREAM.**
+Checked by name against `upstream/main` — `PlanFiles`, `preAssignedSchema`, `materializedRowIds`,
+`identityValuesPreGenerated`, `RebaseDvDmlActionsAsync` all present; only `deletionVectorsByFileIndex` is
+absent and nothing of ours calls it. ⇒ §1b's worry that "half of `DeltaTable.cs` is write-path plumbing the
+public commit layer says nothing about" is **answered, and answered better than by the commit layer**:
+upstream absorbed those patches directly. The branch model paying out again.
+
+**⚠ WHAT THE COMPILER CANNOT SEE, and it is the whole remaining risk.** A green build says our calls RESOLVE,
+not that they still MEAN what they meant. Everything in §2's behaviour-change column compiles silently:
+#87 (`DeltaConflictException` now covers two different failures behind one type — we catch it in the OCC retry
+loops), #76 (the two version APIs contradicted each other), #73 and #60 (the perf/replay changes that
+invalidate §4's numbers). Those need reading and gates, not a build.
+
 ## 2. Every commit since the pin, with what it means for us
 
 Newest first. **"Impact" is a first read from the subject line and the diffstat — NOT verified against our
