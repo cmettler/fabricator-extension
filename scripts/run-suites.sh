@@ -210,7 +210,7 @@ case "$TIER" in
         # The section pins the codec engine deliberately: under native_write DuckDB's COPY writes the data
         # files, so EW's ParquetWriteOptions never apply and the assertion would pass for the wrong reason.
         # Mutation-tested — reverting the spec on EnsureHeldTableAsync fails at exactly the CDF assertion.
-        : "${MIN_ASSERTIONS:=6661}"
+        : "${MIN_ASSERTIONS:=6689}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
@@ -249,13 +249,13 @@ case "$TIER" in
         # assertions, not 6 (I counted the statements I had added instead of running the suite before changing
         # it), so a floor of 1467 tripped the tripwire on a perfectly green 44/44 run and cost a re-run to
         # explain. Measure the BEFORE count while you still can, or take the floor from a green tier run.
-        # 45 runs / 1583 since 2026-08-05, from a green tier run: verify_merge_into_mssql (106) is the
+        # 45 runs / 1608 since 2026-08-07, from a green tier run: verify_merge_into_mssql (106) is the
         # SQL Server half of MERGE INTO. It is the companion to the hermetic verify_merge_into and covers the
         # two things Delta structurally cannot: a COMPOUND rowid (a composite PK arrives as ONE struct-typed
         # column that ReferenceKeyColumns destructures Ã¢ÂÂ a Delta rowid is always a single virtual BIGINT), and
         # a table with NO row identity at all, which is the shape the !HasRowId() guard exists for (without it
         # an insert-only merge reads one past the chunk's width and fatally invalidates the database).
-        : "${MIN_ASSERTIONS:=1583}"
+        : "${MIN_ASSERTIONS:=1608}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

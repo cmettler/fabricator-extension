@@ -203,6 +203,60 @@ public class DeltaParquetPropertiesTests
     }
 
     [Fact]
+    public void Compression_level_and_bloom_fpp_round_trip()
+    {
+        var back = ParquetTuning.Parse(
+            new ParquetTuning(CompressionLevel: 19, BloomFilterFpp: 0.001).Render());
+        Assert.Equal(19, back.CompressionLevel);
+        Assert.Equal(0.001, back.BloomFilterFpp);
+    }
+
+    [Fact]
+    public void Bloom_fpp_round_trips_through_scientific_notation()
+    {
+        // "R" renders 0.000001 as "1E-06", which the SQL suite really does write, so the read side must
+        // accept an exponent. (It also has to survive DuckDB's own parser on the COPY, which the SQL gate
+        // covers — this is the persisted half.)
+        var rendered = new ParquetTuning(BloomFilterFpp: 0.000001).Render();
+        Assert.Equal(0.000001, ParquetTuning.Parse(rendered).BloomFilterFpp);
+    }
+
+    [Fact]
+    public void Bloom_fpp_renders_round_trippably_not_as_a_float_artefact()
+    {
+        // "R" rather than the default format: 0.001 must not come back as 0.0010000000000000000208, which
+        // would still PARSE but would make the stored property unreadable to a human and unstable across
+        // a re-render.
+        Assert.Equal("0.001", new ParquetTuning(BloomFilterFpp: 0.001).Render()["fabricator.parquet.bloom_filter_false_positive_ratio"]);
+    }
+
+    [Theory]
+    [InlineData("0")]
+    [InlineData("1")]
+    [InlineData("-0.5")]
+    [InlineData("1.5")]
+    [InlineData("half")]
+    public void Bloom_fpp_outside_zero_to_one_is_refused(string value)
+    {
+        // Both ends refused rather than clamped: 0 asks for a filter with no false positives (impossible),
+        // 1 for one that matches everything (useless, and still costs bytes to write and read).
+        var ex = Assert.Throws<ArgumentException>(() => ParquetTuning.Parse(
+            Cfg(("fabricator.parquet.bloom_filter_false_positive_ratio", value))));
+        Assert.Contains("bloom_filter_false_positive_ratio", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Bloom_fpp_uses_the_invariant_culture()
+    {
+        // A stored property must not be read differently on a machine whose locale uses a decimal comma —
+        // a "0,3" would otherwise parse as 3 on some hosts and be refused on others.
+        Assert.Equal(0.3, ParquetTuning.Parse(
+            Cfg(("fabricator.parquet.bloom_filter_false_positive_ratio", "0.3"))).BloomFilterFpp);
+        Assert.Throws<ArgumentException>(() => ParquetTuning.Parse(
+            Cfg(("fabricator.parquet.bloom_filter_false_positive_ratio", "0,3"))));
+    }
+
+    [Fact]
     public void Unknown_compression_and_version_names_pass_through_here()
     {
         // ⚠ Deliberate: this file does not own those vocabularies (the codec enum and the parquet-version enum

@@ -68,3 +68,110 @@ RESET mssql_default_varchar_length;
 
 statement ok
 DETACH db;
+
+# ============================================================================
+# THE UTF-8-COLLATION LEG — a DuckDB VARCHAR maps to SQL VARCHAR, not NVARCHAR.
+#
+# The type is chosen PER CONNECTION from the database's COLLATION, with no setting involved:
+#     IsUtf8Collation ? VARCHAR : HasNVarchar ? NVARCHAR : VARCHAR
+# so the same dbt project writes NVARCHAR to a legacy-collation SQL Server, VARCHAR to a UTF-8 one, and
+# VARCHAR to Fabric (which has no NVARCHAR at all). That is exactly why no `unicode`/NVARCHAR WITH option
+# was built — the behaviour already existed, and a knob would only have added a way to get it wrong
+# (forcing VARCHAR on a legacy collation is silently lossy for non-ASCII).
+#
+# ⚠ THIS LEG WAS DOCUMENTED AS UNGATEABLE — "the rig has no UTF-8-collation database" — AND THAT WAS
+# WRONG. `BinCollTest` is Latin1_General_100_BIN2_UTF8 (provisioned to reproduce Fabric Warehouse's
+# default collation, which is binary AND UTF-8), and `IsUtf8Collation` is a plain `_UTF8` suffix test, so
+# it has qualified all along. The half a new-database user depends on was one ATTACH away from covered.
+# ============================================================================
+
+require-env MSSQL_BINCOLL_DSN
+
+statement ok
+ATTACH '${MSSQL_BINCOLL_DSN}' AS bc (TYPE fabricator);
+
+# POSITIVE CONTROL: this database really is UTF-8-collated. Without it the VARCHAR assertion below would
+# pass equally on a server that had simply lost NVARCHAR support, which is a different bug.
+query T
+SELECT value FROM fabricator_server_info('bc') WHERE property = 'is_utf8_collation';
+----
+true
+
+statement ok
+DROP TABLE IF EXISTS bc.dbo.dvl_utf8;
+
+# No setting in play — the collation alone decides. Contrast with the very first assertion in this file,
+# which gets `nvarchar` from the SAME extension against the SAME server on a non-UTF-8 database.
+statement ok
+CREATE TABLE bc.dbo.dvl_utf8 (id INTEGER, label VARCHAR);
+
+query TI
+SELECT * FROM fabricator_query('bc',
+  'SELECT CAST(DATA_TYPE AS VARCHAR(32)), CHARACTER_MAXIMUM_LENGTH FROM INFORMATION_SCHEMA.COLUMNS
+   WHERE TABLE_NAME = ''dvl_utf8'' AND COLUMN_NAME = ''label''');
+----
+varchar	-1
+
+statement ok
+DROP TABLE bc.dbo.dvl_utf8;
+
+# The length setting bounds whichever type the collation chose — it does not re-decide the type.
+statement ok
+SET mssql_default_varchar_length = 120;
+
+statement ok
+CREATE TABLE bc.dbo.dvl_utf8 (id INTEGER, label VARCHAR);
+
+query TI
+SELECT * FROM fabricator_query('bc',
+  'SELECT CAST(DATA_TYPE AS VARCHAR(32)), CHARACTER_MAXIMUM_LENGTH FROM INFORMATION_SCHEMA.COLUMNS
+   WHERE TABLE_NAME = ''dvl_utf8'' AND COLUMN_NAME = ''label''');
+----
+varchar	120
+
+statement ok
+DROP TABLE bc.dbo.dvl_utf8;
+
+# The escape hatch works in the OTHER direction too: keep NVARCHAR on a UTF-8 database (a migration
+# needs this, and it is the reason the whole-type override exists alongside the length).
+statement ok
+SET mssql_ctas_text_type = 'NVARCHAR(80)';
+
+statement ok
+CREATE TABLE bc.dbo.dvl_utf8 (id INTEGER, label VARCHAR);
+
+query TI
+SELECT * FROM fabricator_query('bc',
+  'SELECT CAST(DATA_TYPE AS VARCHAR(32)), CHARACTER_MAXIMUM_LENGTH FROM INFORMATION_SCHEMA.COLUMNS
+   WHERE TABLE_NAME = ''dvl_utf8'' AND COLUMN_NAME = ''label''');
+----
+nvarchar	80
+
+statement ok
+DROP TABLE bc.dbo.dvl_utf8;
+
+statement ok
+RESET mssql_ctas_text_type;
+
+statement ok
+RESET mssql_default_varchar_length;
+
+# Round trip: non-ASCII survives the VARCHAR mapping, which is the whole reason a UTF-8 collation makes
+# VARCHAR safe. On a legacy collation this is exactly what would be lost, so it is the assertion that
+# justifies the rule rather than merely restating it.
+statement ok
+CREATE TABLE bc.dbo.dvl_utf8 (id INTEGER, label VARCHAR);
+
+statement ok
+INSERT INTO bc.dbo.dvl_utf8 VALUES (1, 'Grüße — 日本語 — Ω');
+
+query IT
+SELECT id, label FROM bc.dbo.dvl_utf8;
+----
+1	Grüße — 日本語 — Ω
+
+statement ok
+DROP TABLE bc.dbo.dvl_utf8;
+
+statement ok
+DETACH bc;

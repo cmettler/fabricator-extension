@@ -621,10 +621,48 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
       and the README says so. It is accepted-and-ignored on native rather than refused, which is a small
       inconsistency with the "never silently ignore" rule elsewhere — harmless, because DuckDB blooms those
       columns anyway; tighten it only if the rule is ever made absolute.
-    - **STILL OPEN from (1):** `compression_level` is unexposed (EW has `CompressionLevel` /
-      `CustomCompressionLevel`, DuckDB has `COMPRESSION_LEVEL` — a two-engine option), and
-      `bloom_filter_false_positive_ratio` is unexposed on BOTH, where the engines also DISAGREE on the default
-      (DuckDB 0.01, EW 0.05) — worth stating in any doc that claims the two engines write equivalent files.
+    - **STILL OPEN from (1) — CLOSED 2026-08-07: `compression_level` and `bloom_filter_false_positive_ratio`
+      are BUILT, on all three surfaces, and BOTH are two-engine.** `parquet_compression_level` → native
+      `COMPRESSION_LEVEL`, EW **`CustomCompressionLevel`** (NOT `CompressionLevel`: DuckDB's is a NATIVE codec
+      level and so is that one, while EW's `CompressionLevel` is a coarse `BlockCompressionLevel` ENUM —
+      mapping to it would silently reinterpret the number as one of a handful of presets).
+      `parquet_bloom_filter_false_positive_ratio` → native `BLOOM_FILTER_FALSE_POSITIVE_RATIO`, EW
+      `BloomFilterFpp`. Both persist as `fabricator.parquet.*`.
+      - ⚠ The **DEFAULTS DIFFER and are deliberately NOT normalised** (DuckDB 0.01, EW 0.05), so an unset
+        option does NOT make the two engines write equivalent files — normalising would silently change the
+        codec engine's behaviour for a user who asked for nothing. Pinned so any doc claiming equivalence has
+        to reckon with it.
+      - **The gates read the FILE, never the option**, because parquet records the CODEC and not the level:
+        same data compressed at level 1 vs 19 (native 35808 → 28532 bytes; codec 25745 → 25332), and bloom
+        bytes at fpp 0.3 vs 1e-6 (**544 → 8224**). ⚠ The bloom cardinality is chosen so DuckDB actually WRITES
+        a filter — it abandons dictionary encoding AND bloom filters past `dictionary_size_limit` distinct
+        values, and a first attempt at 50 000 distinct values produced two filter-less files and a vacuously
+        equal comparison.
+      - Both ends of the fpp range are REFUSED rather than clamped: 0 asks for a filter with no false
+        positives (impossible) and 1 for one that matches everything (useless, and still costs bytes).
+    - **⚠ A SHIPPED BUG THIS PASS FOUND: `parquet_bloom_filter_columns` WAS A SILENT NO-OP ON THE DEFAULT
+      TABLE SHAPE (found 2026-08-07, now REFUSED).** engineered-wood matches the list against the PARQUET
+      path (`HasBloomFilter(pathInSchema)`), and on a **column-mapped** table that path is the PHYSICAL name
+      (`col-e090d9ee…`), never the logical one. MEASURED: **0 of 10 column chunks got a filter with mapping
+      on, 10 of 10 with it off.** Column mapping is the DEFAULT, so the option did nothing for almost
+      everyone.
+      - **Nothing caught it because NO SUITE HAD EVER ASSERTED THAT A BLOOM FILTER WAS WRITTEN.** The option
+        was accepted, the statement succeeded, and `verify_with_options` checked only that. It was found by
+        adding the fpp gate — i.e. by writing a test that reads the FILE — which is the same lesson the rest
+        of this surface keeps producing: *a "the statement succeeded" test cannot distinguish a working write
+        option from one that never reached the writer.*
+      - **REFUSED rather than fixed, and the bound is real:** the physical names are assigned by the CREATE
+        itself and engineered-wood takes `ParquetWriteOptions` AT OPEN, so translating logical → physical
+        needs either a two-phase open or an EW-side resolution against the Delta schema. A loud error naming
+        the one-word workaround (`column_mapping='none'`) beats a knob that writes nothing. **The real fix is
+        an upstream-shaped ask and is the right thing to do later.**
+      - **⚠ Only the `WITH` layer refuses.** A `SET delta_write_options` bloom list spans every table in the
+        session (some mapped, some not) and a PERSISTED one is a declaration another engine may read —
+        failing either would punish writes that never asked for anything here. Consistent with the
+        ignore/refuse split above.
+      - Gate `verify_with_options` §9c, **mutation-tested** (dropping the guard makes the refusal assertion
+        fail), with the `column_mapping='none'` leg as the POSITIVE CONTROL — otherwise the refusal would pass
+        equally if bloom filters had simply stopped working everywhere.
   - **(1-original) EVERY parquet option must be expressible in `CREATE TABLE … WITH (…)`, INCLUDING bloom-filter
     columns for the EW codec.** Today `WITH (parquet_compression=…, parquet_row_group_size=…,
     parquet_bloom_filter_columns=…)` is the DuckLake-parity set gated by `verify_with_options`; confirm each
@@ -640,10 +678,20 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     `IsUtf8Collation ? VARCHAR : HasNVarchar ? NVARCHAR : VARCHAR`. All three targets land correctly with NO
     setting. **Check whether an ask is already satisfied before designing an option for it** — a redundant knob
     would have added a way to get it WRONG (forcing VARCHAR on a legacy collation is silently lossy).
-    - Gated for the prod shape: `verify_default_varchar_length` asserts `nvarchar/-1` with no override on the
-      docker box's default collation. **⚠ The UTF-8-collation ⇒ VARCHAR leg is NOT gated** — the rig has no
-      UTF-8-collation database and Fabric is live-only. Adding one (`Latin1_General_100_CI_AS_SC_UTF8`) to
-      `docker/provision.ps1` would close it; it is the half a new-database user depends on.
+    - **BOTH legs are now gated (2026-08-07), and the reason the second one was not is that a claim here was
+      FALSE.** `verify_default_varchar_length` asserts `nvarchar/-1` on the docker box's default collation
+      AND `varchar/-1` on a UTF-8 one (8 → 44 assertions). ⚠ This entry used to read *"the UTF-8-collation ⇒
+      VARCHAR leg is NOT gated — the rig has no UTF-8-collation database"*, and recommended provisioning one.
+      **The rig has had one all along**: `BinCollTest` is `Latin1_General_100_BIN2_UTF8` (provisioned to
+      reproduce Fabric Warehouse's default collation, which is binary AND UTF-8) and `IsUtf8Collation` is a
+      plain `_UTF8` SUFFIX test, so it qualified from the start. The half a new-database user depends on was
+      one ATTACH away from covered, and the write-up said it was impossible. **Check the rig before recording
+      a gap as unclosable.**
+      - The section carries a POSITIVE CONTROL (`is_utf8_collation` really is true on that attach) — without
+        it the VARCHAR assertion would pass equally on a server that had merely lost NVARCHAR support, which
+        is a different bug — plus a non-ASCII ROUND TRIP, which is the assertion that JUSTIFIES the rule
+        rather than restating it, and the `mssql_ctas_text_type` escape in the OTHER direction (keeping
+        NVARCHAR on a UTF-8 database, which a migration needs).
     - Escape hatches already exist: `mssql_default_varchar_length` (bounds whichever type is chosen) and
       `mssql_ctas_text_type` (replaces the type outright). What is genuinely missing is only the PER-TABLE
       form of these — the (3) item below.
@@ -722,6 +770,33 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     is one JSON blob mixing genuinely session-scoped things (compression as a storage-cost policy) with
     per-table ones (partitioning, `replace_where`, `schema_mode`). Decide each knob's home rather than
     accepting the current split, and keep an escape for the per-statement case.
+  - **(3b) THE SQL SERVER PER-TABLE `WITH` FORMS — SCOPED 2026-08-07, DELIBERATELY NOT STARTED. Two things
+    must be decided BEFORE any code, and both were found by reading the call sites rather than by planning.**
+    The ask (user, 2026-08-07) is per-table forms of `mssql_default_table_type` (clustered columnstore /
+    heap), `mssql_default_varchar_length`, and the text type — i.e. `CREATE TABLE … WITH (table_type=…,
+    varchar_length=…, text_type=…)`.
+    - **⚠ OBSTACLE 1 — `table_type` IS ALREADY TAKEN ON THIS PROVIDER, and means something else.**
+      `SqlServerBackend.ParseWithOptions` uses it for the EXTERNAL-table CETAS analog, where the only legal
+      values are `DELTA` / `PARQUET` and `location` is REQUIRED. The columnstore/heap vocabulary is a
+      different axis entirely (how a REGULAR table is stored). The values are disjoint, so overloading the
+      one key is expressible — `DELTA|PARQUET` ⇒ external (needs `location`), `CLUSTERED COLUMNSTORE|CCI|
+      HEAP|ROWSTORE` ⇒ regular (must NOT have `location`) — and it keeps the per-table name matching the
+      SETTING it mirrors (`mssql_default_table_type`), which is the argument for doing it that way. But it is
+      a SURFACE decision, not a mechanical addition, and `location` stops being unconditionally required.
+    - **⚠ OBSTACLE 2 — THE SETTINGS ARE READ FROM A GLOBAL STORE INSIDE THE TYPE MAPPER, which is the same
+      shape as the Delta write-spec gap one level worse.** `mssql_ctas_text_type` and
+      `mssql_default_varchar_length` are read by `ProviderSettingsStore.Instance` calls INSIDE
+      `MapArrowToSqlType` (`SqlServerBackend.cs:3617` / `:3633`), and `mssql_default_table_type` inside the
+      CCI branch (`:3412`) — none of which takes a per-statement context. A per-table override therefore has
+      to be THREADED through the whole DDL-generation chain into a shared type mapper used by every path, not
+      just parsed. Exactly the work `ResolveWriteSpec`'s `tablePath` parameter was, and the reason that one is
+      REQUIRED rather than optional applies here too: a site that forgets it silently falls back to the global
+      setting.
+    - **⚠ AND ONE THIRD OF THE ORIGINAL ASK IS ALREADY ANSWERED — do not build it.** The `unicode`/NVARCHAR
+      flag is unnecessary: `MapArrowToSqlType` already resolves the text type per connection from the
+      COLLATION (`IsUtf8Collation ? VARCHAR : HasNVarchar ? NVARCHAR : VARCHAR`), so prod SQL Server gets
+      NVARCHAR, a UTF-8 database gets VARCHAR and Fabric gets VARCHAR, with no setting. **Now gated on BOTH
+      legs** — see the `verify_default_varchar_length` note above.
   - **(4) THE PLUMBING GAP IS FIXED (2026-08-07), and fixing it needed TWO changes where the write-up assumed
     one.** `ResolveWriteSpec` lives on the `DeltaCatalog` INSTANCE while the rewrite paths sit in the STATIC
     `DeltaReader`, so merge-on-read post-images, copy-on-write DELETE/UPDATE rewrites and **OPTIMIZE's
@@ -3603,6 +3678,21 @@ are missing.
 - **`unittest -f <list>` (batch mode) is unusable here**: one CLR per process means earlier suites'
   finalizers run during later ones — SIGSEGV at suite 41/53 inside Apache.Arrow's
   `ImportedArrowArrayStream` finalizer. One process per suite is not a style choice.
+- **⚠ A TIMED-OUT FOREGROUND RUN LEAVES THE WHOLE PROCESS TREE ALIVE, and the orphan silently CORRUPTS the
+  next run. Cost two service-tier runs on 2026-08-07.** The service tier takes LONGER THAN THE 10-MINUTE
+  tool cap, so running it in the foreground always ends in a timeout — which kills the SHELL and nothing
+  else. `run-suites.sh` and its `unittest` child keep going, invisibly, and the re-run then executes
+  CONCURRENTLY with the orphan against the SAME SQL Server databases and the SAME MinIO bucket. Both runs
+  are then meaningless: the suites are re-runnable but NOT concurrency-safe with each other (they
+  `CREATE OR REPLACE` the same table names).
+  - The tell is not in the log — it looked like one run merely stalled at suite 14 for ten minutes. What
+    identified it was `Get-CimInstance Win32_Process -Filter "Name='unittest.exe'"`: **TWO** processes, on
+    two different suites, under two different `run-suites.sh` trees.
+  - **Always start the service tier with `run_in_background: true`**, and before starting one, check that no
+    `unittest.exe` / `run-suites.sh` is already running. Kill by walking the tree
+    (`Get-CimInstance Win32_Process … CommandLine -like '*run-suites.sh*'`), not by killing the shell.
+  - ⚠ It also means a timed-out run must never be treated as "no result" — it is a RUNNING result, and the
+    numbers from anything started next to it are void.
 - **⚠ NEVER EDIT A SHELL SCRIPT WHILE A BACKGROUND JOB IS EXECUTING IT — it kills the RUN, and the error
   blames the FILE.** bash reads a script INCREMENTALLY, so inserting lines shifts the byte offsets under
   the already-running shell and it resumes mid-token. Symptoms are a syntax error at a line that is

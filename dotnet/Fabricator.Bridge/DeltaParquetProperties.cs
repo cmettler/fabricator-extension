@@ -49,7 +49,9 @@ internal sealed record ParquetTuning(
     long? DictionarySizeLimit = null,
     long? RowGroupsPerFile = null,
     long? FileSizeBytes = null,
-    IReadOnlyList<string>? BloomFilterColumns = null)
+    IReadOnlyList<string>? BloomFilterColumns = null,
+    int? CompressionLevel = null,
+    double? BloomFilterFpp = null)
 {
     /// <summary>The <c>fabricator.parquet.</c> namespace. Under <c>fabricator.*</c> rather than <c>delta.*</c>
     /// because these are OUR keys: a foreign engine must be free to ignore them, and writing an unrecognised
@@ -64,13 +66,16 @@ internal sealed record ParquetTuning(
     public const string RowGroupsPerFileKey = Prefix + "row_groups_per_file";
     public const string FileSizeBytesKey = Prefix + "file_size_bytes";
     public const string BloomFilterColumnsKey = Prefix + "bloom_filter_columns";
+    public const string CompressionLevelKey = Prefix + "compression_level";
+    public const string BloomFilterFppKey = Prefix + "bloom_filter_false_positive_ratio";
 
     /// <summary>True when the table declares no parquet tuning at all — the common case, and the one that must
     /// cost nothing (no spec is materialized for it).</summary>
     public bool IsEmpty
         => Compression is null && RowGroupSize is null && RowGroupSizeBytes is null && ParquetVersion is null
            && DictionarySizeLimit is null && RowGroupsPerFile is null && FileSizeBytes is null
-           && BloomFilterColumns is not { Count: > 0 };
+           && BloomFilterColumns is not { Count: > 0 } && CompressionLevel is null
+           && BloomFilterFpp is null;
 
     /// <summary>Renders the declared knobs as Delta configuration entries (absent knobs are omitted, never
     /// written as an empty string — an empty value would read back as a declaration of "" rather than as
@@ -86,6 +91,9 @@ internal sealed record ParquetTuning(
         if (RowGroupsPerFile is { } rgpf) { d[RowGroupsPerFileKey] = rgpf.ToString(CultureInfo.InvariantCulture); }
         if (FileSizeBytes is { } fsb) { d[FileSizeBytesKey] = fsb.ToString(CultureInfo.InvariantCulture); }
         if (BloomFilterColumns is { Count: > 0 } bloom) { d[BloomFilterColumnsKey] = string.Join(",", bloom); }
+        if (CompressionLevel is { } cl) { d[CompressionLevelKey] = cl.ToString(CultureInfo.InvariantCulture); }
+        // "R" round-trips exactly, so 0.001 does not come back as 0.0010000000000000000208.
+        if (BloomFilterFpp is { } fpp) { d[BloomFilterFppKey] = fpp.ToString("R", CultureInfo.InvariantCulture); }
         return d;
     }
 
@@ -105,7 +113,9 @@ internal sealed record ParquetTuning(
             DictionarySizeLimit: ParseLong(config, DictionarySizeLimitKey),
             RowGroupsPerFile: ParseLong(config, RowGroupsPerFileKey),
             FileSizeBytes: ParseLong(config, FileSizeBytesKey),
-            BloomFilterColumns: ParseList(config, BloomFilterColumnsKey));
+            BloomFilterColumns: ParseList(config, BloomFilterColumnsKey),
+            CompressionLevel: (int?)ParseLong(config, CompressionLevelKey),
+            BloomFilterFpp: ParseFpp(config, BloomFilterFppKey));
     }
 
     private static string? Get(IReadOnlyDictionary<string, string> config, string key)
@@ -131,6 +141,22 @@ internal sealed record ParquetTuning(
             throw new ArgumentException(
                 $"Delta table property \"{key}\" has the value '{s}', which is not a positive whole number. "
                 + "Fix it with fabricator_delta_set_tblproperties, or unset it.");
+        }
+        return v;
+    }
+
+    /// <summary>A probability in (0, 1) — see the WITH-side parser for why both ends are refused rather
+    /// than clamped. Invariant culture: a stored value must not be read differently on a machine whose
+    /// locale uses a decimal comma.</summary>
+    private static double? ParseFpp(IReadOnlyDictionary<string, string> config, string key)
+    {
+        if (Get(config, key) is not { } s) { return null; }
+        if (!double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out var v)
+            || !(v > 0) || !(v < 1))
+        {
+            throw new ArgumentException(
+                $"Delta table property \"{key}\" has the value '{s}', which is not a false-positive rate "
+                + "between 0 and 1 (exclusive). Fix it with fabricator_delta_set_tblproperties, or unset it.");
         }
         return v;
     }

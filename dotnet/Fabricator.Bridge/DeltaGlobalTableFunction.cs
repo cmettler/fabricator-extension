@@ -349,7 +349,13 @@ internal sealed record DeltaWriteSpec(
     DeltaParquetVersion ParquetVersion = DeltaParquetVersion.Default, // native PARQUET_VERSION <-> EW DataPageVersion
     long? RowGroupsPerFile = null,       // native ROW_GROUPS_PER_FILE — native only
     long? DictionarySizeLimit = null,    // native DICTIONARY_SIZE_LIMIT — native only, see the note below
-    long? FileSizeBytes = null);         // native FILE_SIZE_BYTES — native only
+    long? FileSizeBytes = null,          // native FILE_SIZE_BYTES — native only
+    // ⚠ These two are expressible on BOTH engines and the engines DISAGREE on the bloom default
+    // (DuckDB 0.01, engineered-wood 0.05), so leaving one unset does NOT make the two write equivalent
+    // files. Each engine keeps its own default when unset — normalising would silently change the codec
+    // engine's behaviour for a user who never asked for anything.
+    int? CompressionLevel = null,        // native COMPRESSION_LEVEL <-> EW CustomCompressionLevel
+    double? BloomFilterFpp = null);      // native BLOOM_FILTER_FALSE_POSITIVE_RATIO <-> EW BloomFilterFpp
 
 /// <summary>Parquet format version for the data files (DuckDB's <c>PARQUET_VERSION</c>; engineered-wood's
 /// <c>DataPageVersion</c>). <see cref="Default"/> means "leave each engine on its own default", which is NOT
@@ -443,6 +449,13 @@ internal static class DeltaWriter
                 _ => EngineeredWood.Parquet.DataPageVersion.V2, // EW's own default
             },
             Compression = spec?.Compression ?? EngineeredWood.Compression.CompressionCodec.Snappy,
+            // CustomCompressionLevel, not CompressionLevel: DuckDB's COMPRESSION_LEVEL is a NATIVE codec
+            // level (zstd 1-22, gzip 1-9) and so is this one, which the options record documents as
+            // overriding the coarse BlockCompressionLevel enum. Mapping to the enum instead would silently
+            // reinterpret the number as one of a handful of presets.
+            CustomCompressionLevel = spec?.CompressionLevel,
+            // Unset keeps EW's own 0.05 — see the spec's note on the engines disagreeing here.
+            BloomFilterFpp = spec?.BloomFilterFpp ?? 0.05,
             BloomFilterColumns = spec?.BloomFilterColumns is { Count: > 0 } bloom
                 ? new HashSet<string>(bloom, System.StringComparer.Ordinal)
                 : null,

@@ -1399,8 +1399,16 @@ apply to.
 | `parquet_row_group_size` (rows) | both |
 | `parquet_row_group_size_bytes` | both — ⚠ DuckDB requires `SET preserve_insertion_order=false` |
 | `parquet_version` (`V1`/`V2`) | both |
-| `parquet_bloom_filter_columns` | engineered-wood codec only |
+| `parquet_bloom_filter_columns` | engineered-wood codec only — ⚠ and only with `column_mapping='none'`, see below |
+| `parquet_compression_level` | both — the valid range is the codec's (zstd 1–22, gzip 1–9) |
+| `parquet_bloom_filter_false_positive_ratio` | both — ⚠ the engines' DEFAULTS differ (DuckDB 0.01, engineered-wood 0.05) |
 | `parquet_dictionary_size_limit` (distinct values) | `native_write` only |
+
+⚠ `parquet_bloom_filter_columns` names **logical** columns, but a column-mapped table stores **physical**
+names (`col-<uuid>`) in its parquet files, so the filter would never be built. Column mapping is on by
+default, so the option is **refused** there rather than silently doing nothing — pair it with
+`column_mapping='none'` in the same `WITH`. (On `native_write` the option is accepted and ignored regardless:
+DuckDB picks the bloom columns itself, by cardinality, using `parquet_dictionary_size_limit` as the cutoff.)
 
 ⚠ Because `parquet_row_group_size_bytes` needs `preserve_insertion_order=false`, **persisting it means every
 later native-engine write to that table needs that session flag too** — a plain `INSERT` naming no options

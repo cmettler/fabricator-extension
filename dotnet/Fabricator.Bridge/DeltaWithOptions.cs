@@ -51,6 +51,15 @@ internal sealed record DeltaWithOptions
 
     /// <summary>Parquet format version (DuckDB <c>PARQUET_VERSION</c>, EW <c>DataPageVersion</c>).</summary>
     public DeltaParquetVersion ParquetVersion { get; init; } = DeltaParquetVersion.Default;
+
+    /// <summary>Native codec level (DuckDB <c>COMPRESSION_LEVEL</c> / engineered-wood
+    /// <c>CustomCompressionLevel</c>). The valid range is the CODEC's, not ours — zstd 1–22, gzip 1–9 — so
+    /// the engine validates it and we do not duplicate the table.</summary>
+    public int? CompressionLevel { get; init; }
+
+    /// <summary>Bloom-filter target false-positive rate. ⚠ The engines DISAGREE on the default (DuckDB 0.01,
+    /// engineered-wood 0.05), so leaving it unset does not make the two write equivalent files.</summary>
+    public double? BloomFilterFpp { get; init; }
     public IReadOnlyList<string>? BloomFilterColumns { get; init; }
 
     public bool? DeletionVectors { get; init; }
@@ -67,6 +76,7 @@ internal sealed record DeltaWithOptions
                                   || RowGroupSizeBytes is not null || RowGroupsPerFile is not null
                                   || DictionarySizeLimit is not null || FileSizeBytes is not null
                                   || ParquetVersion != DeltaParquetVersion.Default
+                                  || CompressionLevel is not null || BloomFilterFpp is not null
                                   || BloomFilterColumns is not null;
 
     public bool HasCreateFlagOverride => DeletionVectors is not null || ColumnMapping is not null
@@ -84,6 +94,8 @@ internal sealed record DeltaWithOptions
         string? compression = null;
         int? rowGroup = null;
         long? rowGroupBytes = null, rowGroupsPerFile = null, dictLimit = null, fileBytes = null;
+        int? compressionLevel = null;
+        double? bloomFpp = null;
         DeltaParquetVersion parquetVersion = DeltaParquetVersion.Default;
         IReadOnlyList<string>? bloom = null;
         bool? dv = null, rt = null, cdf = null, ict = null;
@@ -126,6 +138,14 @@ internal sealed record DeltaWithOptions
                 case "parquet_file_size_bytes":
                 case "file_size_bytes":
                     fileBytes = ParseLongValue(key, value);
+                    break;
+                case "parquet_compression_level":
+                case "compression_level":
+                    compressionLevel = (int)ParseLongValue(key, value);
+                    break;
+                case "parquet_bloom_filter_false_positive_ratio":
+                case "bloom_filter_false_positive_ratio":
+                    bloomFpp = ParseFppValue(key, value);
                     break;
                 case "parquet_version":
                     parquetVersion = value.Trim().ToLowerInvariant() switch
@@ -204,7 +224,8 @@ internal sealed record DeltaWithOptions
                         $"unknown CREATE TABLE WITH option '{key}' for the delta provider (supported: "
                         + "parquet_compression, parquet_row_group_size, parquet_row_group_size_bytes, "
                         + "parquet_row_groups_per_file, parquet_dictionary_size_limit, "
-                        + "parquet_file_size_bytes, parquet_version, parquet_bloom_filter_columns, "
+                        + "parquet_file_size_bytes, parquet_version, parquet_compression_level, "
+                        + "parquet_bloom_filter_false_positive_ratio, parquet_bloom_filter_columns, "
                         + "deletion_vectors, column_mapping, row_tracking, change_data_feed, "
                         + "in_commit_timestamps, table_type, format, and quoted delta.*/fabricator.* "
                         + "table properties).");
@@ -218,6 +239,8 @@ internal sealed record DeltaWithOptions
             RowGroupsPerFile = rowGroupsPerFile,
             DictionarySizeLimit = dictLimit,
             FileSizeBytes = fileBytes,
+            CompressionLevel = compressionLevel,
+            BloomFilterFpp = bloomFpp,
             ParquetVersion = parquetVersion,
             BloomFilterColumns = bloom,
             DeletionVectors = dv,
@@ -304,6 +327,16 @@ internal sealed record DeltaWithOptions
                          System.Globalization.CultureInfo.InvariantCulture, out var v) && v >= 0
             ? v
             : throw new ArgumentException($"WITH {key}: expected a non-negative integer, got '{value}'.");
+
+    /// <summary>A probability in (0, 1). ⚠ Both ends are REFUSED rather than clamped: 0 asks for a
+    /// zero-false-positive filter (impossible — DuckDB's own binder rejects it) and 1 asks for a filter that
+    /// matches everything, i.e. a silently useless one that still costs bytes to write and read.</summary>
+    private static double ParseFppValue(string key, string value)
+        => double.TryParse(value, System.Globalization.NumberStyles.Float,
+                           System.Globalization.CultureInfo.InvariantCulture, out var v) && v > 0 && v < 1
+            ? v
+            : throw new ArgumentException(
+                $"WITH {key}: expected a false-positive rate between 0 and 1 (exclusive), got '{value}'.");
 
     private static int ParseIntValue(string key, string value)
     {

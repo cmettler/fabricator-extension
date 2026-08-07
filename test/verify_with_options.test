@@ -774,3 +774,162 @@ SELECT count(*) FROM lakec2.main.rgb;
 
 statement ok
 DETACH lakec2;
+
+# ============================================================================
+# 9. compression_level + bloom_filter_false_positive_ratio — the last two unexposed parquet knobs, and
+#    both are TWO-ENGINE.
+#
+#    ⚠ Every assertion here reads the FILE, not the option. A "the statement succeeded" test would pass
+#    for an option that never reached either writer, which is exactly how parquet_bloom_filter_columns
+#    managed to do nothing on the default table shape for months (see §9c).
+# ============================================================================
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/optlvl' AS lv (TYPE fabricator, PROVIDER 'delta');
+
+# ---- 9a. compression_level — the oracle is BYTES WRITTEN ----
+# Deliberately not "the metadata says 19": parquet records the CODEC, never the level, so the only way to
+# see the level is to compress the same data twice and compare. Same source, same codec, level 1 vs 19.
+
+statement ok
+CREATE OR REPLACE TABLE lv.main.lo WITH (parquet_compression='zstd', parquet_compression_level=1) AS SELECT (i%977)::BIGINT AS id, repeat('abcdefgh', 20) AS s FROM range(400000) r(i);
+
+statement ok
+CREATE OR REPLACE TABLE lv.main.hi WITH (parquet_compression='zstd', parquet_compression_level=19) AS SELECT (i%977)::BIGINT AS id, repeat('abcdefgh', 20) AS s FROM range(400000) r(i);
+
+query I
+SELECT CASE WHEN (SELECT sum(total_compressed_size) FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlvl/hi/*.parquet'))
+             < (SELECT sum(total_compressed_size) FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlvl/lo/*.parquet'))
+       THEN 1 ELSE 0 END;
+----
+1
+
+# Both are really ZSTD — so the size difference is the LEVEL and not a silently different codec.
+query I
+SELECT count(*) FROM (
+  SELECT DISTINCT compression FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlvl/lo/*.parquet')
+  UNION SELECT DISTINCT compression FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlvl/hi/*.parquet')
+) WHERE compression <> 'ZSTD';
+----
+0
+
+# It persists like the rest of the tuning.
+query II
+SELECT property, value FROM fabricator_delta_tblproperties('lv', 'main.hi')
+WHERE property = 'fabricator.parquet.compression_level';
+----
+fabricator.parquet.compression_level	19
+
+# The valid range belongs to the CODEC (zstd 1-22, gzip 1-9), so the engine validates it rather than us
+# duplicating the table — but it must be an ERROR, not a silent clamp.
+statement error
+CREATE OR REPLACE TABLE lv.main.bad WITH (parquet_compression='zstd', parquet_compression_level=99) AS SELECT 1 AS id;
+----
+<REGEX>:.*(ompression|evel).*
+
+# ---- 9b. bloom_filter_false_positive_ratio — the oracle is BLOOM FILTER BYTES ----
+# ⚠ The cardinality is chosen so DuckDB actually WRITES a filter: it abandons dictionary encoding AND
+# bloom filters past dictionary_size_limit distinct values, so a high-cardinality column would give two
+# filter-less files and a vacuously equal comparison.
+
+statement ok
+CREATE OR REPLACE TABLE lv.main.b1 WITH (parquet_bloom_filter_false_positive_ratio=0.3) AS SELECT (i%500)::BIGINT AS id FROM range(200000) r(i);
+
+statement ok
+CREATE OR REPLACE TABLE lv.main.b2 WITH (parquet_bloom_filter_false_positive_ratio=0.000001) AS SELECT (i%500)::BIGINT AS id FROM range(200000) r(i);
+
+# POSITIVE CONTROL first: a filter exists at all. Without it, "b2 > b1" could be NULL > NULL. Asserted as
+# "at least one" rather than an exact count — the file/row-group split is not what this section is about.
+query I
+SELECT CASE WHEN count(*) > 0 THEN 1 ELSE 0 END
+FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlvl/b1/*.parquet') WHERE bloom_filter_offset IS NOT NULL;
+----
+1
+
+query I
+SELECT CASE WHEN (SELECT sum(bloom_filter_length) FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlvl/b2/*.parquet'))
+             > (SELECT sum(bloom_filter_length) FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlvl/b1/*.parquet'))
+       THEN 1 ELSE 0 END;
+----
+1
+
+query II
+SELECT property, value FROM fabricator_delta_tblproperties('lv', 'main.b1')
+WHERE property = 'fabricator.parquet.bloom_filter_false_positive_ratio';
+----
+fabricator.parquet.bloom_filter_false_positive_ratio	0.3
+
+# A rate must be a probability. BOTH ends are refused rather than clamped: 0 asks for a filter with no
+# false positives (impossible) and 1 for one that matches everything (useless, and still costs bytes).
+statement error
+CREATE OR REPLACE TABLE lv.main.bad WITH (parquet_bloom_filter_false_positive_ratio=0) AS SELECT 1 AS id;
+----
+between 0 and 1
+
+statement error
+CREATE OR REPLACE TABLE lv.main.bad WITH (parquet_bloom_filter_false_positive_ratio=1) AS SELECT 1 AS id;
+----
+between 0 and 1
+
+# ---- 9c. ⚠ parquet_bloom_filter_columns UNDER COLUMN MAPPING — was a SILENT NO-OP, now refused ----
+# engineered-wood matches the list against the PARQUET path, and on a column-mapped table that path is the
+# PHYSICAL name (`col-<uuid>`), never the logical one. MEASURED before the guard: 0 of 10 column chunks got
+# a filter with mapping on, 10 of 10 with it off. Column mapping is the DEFAULT, so the option did nothing
+# on the shape almost everyone has — and nothing caught it because no suite asserted a filter was written.
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/optlvlc' AS lvc (TYPE fabricator, PROVIDER 'engineeredwooddelta');
+
+statement error
+CREATE OR REPLACE TABLE lvc.main.mapped WITH (parquet_bloom_filter_columns='id') AS SELECT (i%500)::BIGINT AS id FROM range(20000) r(i);
+----
+column mapping
+
+# THE POSITIVE CONTROL, and it is what makes the refusal a guard rather than a blanket ban: with mapping
+# off the option works, and the filter is really in the file.
+statement ok
+CREATE OR REPLACE TABLE lvc.main.nomap WITH (column_mapping='none', parquet_bloom_filter_columns='id') AS SELECT (i%500)::BIGINT AS id FROM range(20000) r(i);
+
+query I
+SELECT CASE WHEN count(*) FILTER (WHERE bloom_filter_offset IS NOT NULL) = count(*) AND count(*) > 0
+       THEN 1 ELSE 0 END
+FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlvlc/nomap/*.parquet');
+----
+1
+
+# ...and the columns really are stored under their LOGICAL names there, which is the mechanism the guard
+# is about rather than an incidental difference.
+query T
+SELECT DISTINCT path_in_schema FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlvlc/nomap/*.parquet');
+----
+id
+
+statement ok
+DETACH lvc;
+
+# ---- 9d. Both options reach the CODEC engine too ----
+# ⚠ The bloom DEFAULTS DIFFER between the engines (DuckDB 0.01, engineered-wood 0.05), so an unset option
+# does NOT make the two write equivalent files. Each keeps its own default; only an explicit value aligns
+# them. Pinned here so any doc claiming equivalence has to reckon with it.
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/optlvlc2' AS lvc2 (TYPE fabricator, PROVIDER 'engineeredwooddelta');
+
+statement ok
+CREATE OR REPLACE TABLE lvc2.main.lo WITH (parquet_compression='zstd', parquet_compression_level=1) AS SELECT (i%977)::BIGINT AS id, repeat('abcdefgh', 20) AS s FROM range(300000) r(i);
+
+statement ok
+CREATE OR REPLACE TABLE lvc2.main.hi WITH (parquet_compression='zstd', parquet_compression_level=19) AS SELECT (i%977)::BIGINT AS id, repeat('abcdefgh', 20) AS s FROM range(300000) r(i);
+
+query I
+SELECT CASE WHEN (SELECT sum(total_compressed_size) FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlvlc2/hi/*.parquet'))
+             < (SELECT sum(total_compressed_size) FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlvlc2/lo/*.parquet'))
+       THEN 1 ELSE 0 END;
+----
+1
+
+statement ok
+DETACH lvc2;
+
+statement ok
+DETACH lv;

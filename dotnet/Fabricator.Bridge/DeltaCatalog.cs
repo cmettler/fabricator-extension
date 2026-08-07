@@ -221,6 +221,8 @@ public sealed class DeltaCatalog : IBackendCatalog
     private readonly long? _defaultDictionarySizeLimit;
     private readonly long? _defaultFileSizeBytes;
     private readonly DeltaParquetVersion _defaultParquetVersion;
+    private readonly int? _defaultCompressionLevel;
+    private readonly double? _defaultBloomFilterFpp;
     // ATTACH option `merge_schema true`: an append whose incoming data has columns absent from the table
     // auto-evolves the schema (nullable AddColumn) before writing. Overridable per statement via the
     // delta_write_options setting's "merge_schema". (replace_where is per-statement only — the setting.)
@@ -310,6 +312,8 @@ public sealed class DeltaCatalog : IBackendCatalog
         _defaultRowGroupsPerFile = ParseLongOption(optionsJson, "row_groups_per_file");
         _defaultDictionarySizeLimit = ParseLongOption(optionsJson, "dictionary_size_limit");
         _defaultFileSizeBytes = ParseLongOption(optionsJson, "file_size_bytes");
+        _defaultCompressionLevel = (int?)ParseLongOption(optionsJson, "compression_level");
+        _defaultBloomFilterFpp = ParseDoubleOption(optionsJson, "bloom_filter_false_positive_ratio");
         _defaultParquetVersion = ParseParquetVersion(ParseStringOption(optionsJson, "parquet_version"))
                                  ?? DeltaParquetVersion.Default;
         _mergeSchemaOnWrite = ParseBoolOption(optionsJson, "merge_schema");
@@ -636,6 +640,19 @@ public sealed class DeltaCatalog : IBackendCatalog
         return spec;
     }
 
+    /// <summary>Reads a DOUBLE option (the bloom false-positive rate). ⚠ Parsed with the invariant culture
+    /// like every other option here — a machine-readable JSON/ATTACH value must not depend on the host's
+    /// decimal separator.</summary>
+    private static double? ParseDoubleOption(string? optionsJson, string key)
+    {
+        var s = ParseStringOption(optionsJson, key);
+        return double.TryParse(s, System.Globalization.NumberStyles.Float,
+                               System.Globalization.CultureInfo.InvariantCulture, out var v)
+               && v > 0 && v < 1
+            ? v
+            : (double?)null;
+    }
+
     private static long? ParseLongOption(string? optionsJson, string key)
     {
         var s = ParseStringOption(optionsJson, key);
@@ -744,6 +761,8 @@ public sealed class DeltaCatalog : IBackendCatalog
         long? dictLimit = _defaultDictionarySizeLimit;
         long? fileBytes = _defaultFileSizeBytes;
         var parquetVersion = _defaultParquetVersion;
+        int? compressionLevel = _defaultCompressionLevel;
+        double? bloomFpp = _defaultBloomFilterFpp;
         IReadOnlyList<string>? settingPartition = null;
         IReadOnlyDictionary<string, string>? replaceWhere = null;
         // schema_mode precedence: per-catalog merge_schema default < delta_write_options (merge_schema / schema_mode)
@@ -759,6 +778,8 @@ public sealed class DeltaCatalog : IBackendCatalog
             rowGroupsPerFile = ParseLongOption(sessionJson, "row_groups_per_file") ?? rowGroupsPerFile;
             dictLimit = ParseLongOption(sessionJson, "dictionary_size_limit") ?? dictLimit;
             fileBytes = ParseLongOption(sessionJson, "file_size_bytes") ?? fileBytes;
+            compressionLevel = (int?)ParseLongOption(sessionJson, "compression_level") ?? compressionLevel;
+            bloomFpp = ParseDoubleOption(sessionJson, "bloom_filter_false_positive_ratio") ?? bloomFpp;
             parquetVersion = ParseParquetVersion(ParseStringOption(sessionJson, "parquet_version"))
                              ?? parquetVersion;
             bloom = ParseListOption(sessionJson, "bloom_filter_columns") ?? bloom;
@@ -790,6 +811,8 @@ public sealed class DeltaCatalog : IBackendCatalog
                 rowGroupBytes = persisted.RowGroupSizeBytes ?? rowGroupBytes;
                 parquetVersion = ParseParquetVersion(persisted.ParquetVersion) ?? parquetVersion;
                 bloom = persisted.BloomFilterColumns ?? bloom;
+                compressionLevel = persisted.CompressionLevel ?? compressionLevel;
+                bloomFpp = persisted.BloomFilterFpp ?? bloomFpp;
                 // Native-only, and unhonourable by the codec: DuckDB's DICTIONARY_SIZE_LIMIT is a cap on
                 // DISTINCT VALUES while engineered-wood's DictionaryPageSizeLimit is BYTES, so there is nothing
                 // to map it onto.
@@ -823,7 +846,8 @@ public sealed class DeltaCatalog : IBackendCatalog
         if (codec is null && rowGroup is null && bloom is null && (partition is null || partition.Count == 0)
             && (replaceWhere is null || replaceWhere.Count == 0) && schemaMode == DeltaSchemaMode.None
             && rowGroupBytes is null && rowGroupsPerFile is null && dictLimit is null && fileBytes is null
-            && parquetVersion == DeltaParquetVersion.Default)
+            && parquetVersion == DeltaParquetVersion.Default && compressionLevel is null
+            && bloomFpp is null)
         {
             return null;
         }
@@ -835,6 +859,8 @@ public sealed class DeltaCatalog : IBackendCatalog
             DictionarySizeLimit = dictLimit,
             FileSizeBytes = fileBytes,
             ParquetVersion = parquetVersion,
+            CompressionLevel = compressionLevel,
+            BloomFilterFpp = bloomFpp,
         });
     }
 
@@ -2510,6 +2536,29 @@ public sealed class DeltaCatalog : IBackendCatalog
         }
         if (w.BloomFilterColumns is { } bloom)
         {
+            // ⚠ REFUSE UNDER COLUMN MAPPING — this option SILENTLY DID NOTHING on the DEFAULT table shape
+            // until 2026-08-07, and nothing caught it because no suite ever asserted that a bloom filter was
+            // written at all. engineered-wood matches BloomFilterColumns against the PARQUET path, and on a
+            // column-mapped table that path is the PHYSICAL name (`col-e090d9ee…`), never the logical one —
+            // measured: 0 of 10 column chunks got a filter with mapping on, 10 of 10 with it off.
+            //
+            // Refusing rather than fixing is deliberate and bounded: the physical names are assigned by the
+            // CREATE itself, and engineered-wood takes ParquetWriteOptions AT OPEN, so translating them needs
+            // either a two-phase open or an EW-side resolution against the Delta schema. Until then a loud
+            // error with the one-word workaround beats a knob that writes nothing.
+            //
+            // Only the WITH layer is refused. A `SET delta_write_options` bloom list spans every table in the
+            // session (some mapped, some not), and a PERSISTED one is a declaration a different engine may
+            // read — failing either would punish writes that never asked for anything here. Those two are
+            // logged instead, at Debug, by the persisted layer's drop reporting.
+            if (EffectiveCreateFlags(w).ColumnMapping
+                != EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None)
+            {
+                throw new System.ArgumentException(
+                    "parquet_bloom_filter_columns names LOGICAL columns, but this table uses column mapping, "
+                    + "where the parquet files store PHYSICAL names — the filter would never be built. Add "
+                    + "column_mapping='none' to the same WITH clause, or drop the option.");
+            }
             spec = spec with { BloomFilterColumns = bloom };
         }
         if (w.RowGroupSizeBytes is { } rgb)
@@ -2531,6 +2580,14 @@ public sealed class DeltaCatalog : IBackendCatalog
         if (w.ParquetVersion != DeltaParquetVersion.Default)
         {
             spec = spec with { ParquetVersion = w.ParquetVersion };
+        }
+        if (w.CompressionLevel is { } clevel)
+        {
+            spec = spec with { CompressionLevel = clevel };
+        }
+        if (w.BloomFilterFpp is { } wfpp)
+        {
+            spec = spec with { BloomFilterFpp = wfpp };
         }
         // ── PERSIST the statement's own parquet tuning as table properties, so a later plain INSERT, a
         // merge-on-read post-image, a copy-on-write rewrite and OPTIMIZE's compaction all keep writing the
@@ -2558,6 +2615,8 @@ public sealed class DeltaCatalog : IBackendCatalog
                 _ => null,
             },
             DictionarySizeLimit: w.DictionarySizeLimit,
+            CompressionLevel: w.CompressionLevel,
+            BloomFilterFpp: w.BloomFilterFpp,
             RowGroupsPerFile: w.RowGroupsPerFile,
             FileSizeBytes: w.FileSizeBytes,
             BloomFilterColumns: w.BloomFilterColumns);

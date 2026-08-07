@@ -166,6 +166,15 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
         {
             s += ", FILE_SIZE_BYTES " + fileBytes.ToString(CultureInfo.InvariantCulture);
         }
+        if (spec.CompressionLevel is { } clevel)
+        {
+            s += ", COMPRESSION_LEVEL " + clevel.ToString(CultureInfo.InvariantCulture);
+        }
+        if (spec.BloomFilterFpp is { } fpp)
+        {
+            // Invariant culture matters: a decimal comma would make this a SYNTAX error, not a wrong value.
+            s += ", BLOOM_FILTER_FALSE_POSITIVE_RATIO " + fpp.ToString("R", CultureInfo.InvariantCulture);
+        }
         if (spec.ParquetVersion != DeltaParquetVersion.Default)
         {
             s += ", PARQUET_VERSION " + (spec.ParquetVersion == DeltaParquetVersion.V1 ? "V1" : "V2");
