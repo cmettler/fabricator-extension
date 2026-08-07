@@ -4,6 +4,8 @@
 
 #include "fabricator/clr_host.hpp"
 
+#include "fabricator/arrow_produce.hpp"
+
 #include "duckdb/common/exception.hpp"
 
 #include <cstdint>
@@ -1395,6 +1397,11 @@ void PushBatch(FabricatorHandle session, ArrowArray &batch) {
 	if (!vt.push_batch) {
 		throw duckdb::IOException("Fabricator: bridge does not provide push_batch");
 	}
+	// The batch is about to become the MANAGED side's property (the ABI contract: the managed side
+	// consumes/releases every ArrowArray passed in). Record the handover so any later free can be
+	// attributed — this is the path that feeds DeltaWriter.Materialize, whose IPC copy was justified by
+	// "the source batches may be freed after consumption". No-op unless FABRICATOR_ARROW_LIVENESS is set.
+	ArrowLiveness::Track(batch, "PushBatch");
 	char *err = nullptr;
 	int32_t rc = vt.push_batch(session, &batch, &err);
 	if (rc != FABRICATOR_OK) {

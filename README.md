@@ -1314,13 +1314,16 @@ setting (see [Partitioning & write tuning](#partitioning--write-tuning)).
 
 ### Delta read tuning
 
-The Delta provider's native read path (`native_read`, on by default for `PROVIDER 'delta'`) is tuned by
-environment variables rather than `SET`, because they are read below the session:
+A few Delta knobs are environment variables rather than `SET`, because they are read below the session. The
+first two tune the native read path (`native_read`, on by default for `PROVIDER 'delta'`); the last two are
+diagnostics you should never need:
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `FABRICATOR_DELTA_BATCH_MIN_FILES` | `2` | From this many files up, a scan reads its files in ONE `read_parquet([…])` instead of one query per file. `0` disables batching (every file gets its own query); `1` batches even a single-file scan |
 | `FABRICATOR_DELTA_PREFETCH` | `1` | How many per-file queries run concurrently. `1` is sequential; higher values overlap cloud I/O, which is where they pay |
+| `FABRICATOR_MATERIALIZE_COPY` | unset | Set to `1` to restore the pre-2026-08-07 Arrow IPC copy on the buffered WRITE path. Diagnostic only — the copy costs roughly twice the peak memory (measured 427 MB vs 232 MB on a 1.5M-row partitioned `INSERT`) and buys nothing |
+| `FABRICATOR_ARROW_LIVENESS` | unset | `1` prints a batch-ownership audit at exit (how many Arrow batches crossed to the managed side, how many were freed, and by whom); `2` additionally prints every handover and free. For diagnosing a suspected Arrow lifetime bug; costs nothing when unset |
 
 Batching matters most on a **fragmented** table — the shape an incremental dbt model grows, since every run
 appends a file. It removes roughly 1.5–2 ms of per-file overhead, so on 200 files × 100 rows a scan goes from

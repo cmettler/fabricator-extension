@@ -755,10 +755,10 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     so it actively undoes the setting it was configured for"* is CONFIRMED rather than inferred, and it is not a
     codec-only defect. Cause is unchanged: `ResolveWriteSpec` lives on the `DeltaCatalog` INSTANCE while ~33
     bare `DeltaWriter.Options()` opens sit in the STATIC `DeltaReader` and pass no spec.
-- **THE STREAMING/BUFFERING AUDIT — AGREED, NOT STARTED (user, 2026-08-06). A whole-codebase pass over EVERY
-  path that holds batches, `Materialize` first.** The UPDATE work (grouped flush → unboxed input) kept turning
-  up buffering that nobody had decided on, so the remaining ones get looked at deliberately rather than one at
-  a time when they hurt.
+- **THE STREAMING/BUFFERING AUDIT — STARTED 2026-08-07; `Materialize` DONE, the rest still open. A
+  whole-codebase pass over EVERY path that holds batches.** The UPDATE work (grouped flush → unboxed input)
+  kept turning up buffering that nobody had decided on, so the remaining ones get looked at deliberately
+  rather than one at a time when they hurt.
   - **⚠ THE SHAPE THE USER WANTS, and it is a standing rule for new code, not just this audit:
     `IAsyncEnumerable` consumed with `await foreach`, with the STATE HELD BY THE CODE THAT YIELDS THE BATCHES
     and released once everything has been yielded.** So the producer owns its resources for exactly the
@@ -766,27 +766,59 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     accumulates a list to keep something alive. Where a consumer genuinely needs the whole set at once (EW's
     `WriteAsync` commits over all batches), that requirement must be stated at the seam rather than met by a
     silent collect upstream.
-  - **`Materialize` is the first subject, and the finding that opens the audit is that its JUSTIFICATION
-    LOOKS FALSE for our streams.** `DeltaWriter.Materialize` (`DeltaGlobalTableFunction.cs:1375`) does a full
-    Arrow **IPC round-trip** — write every batch into a `MemoryStream`, read them back — to get independent
-    retained batches, documented as needed because *"the source batches may be freed after consumption"*.
-    But `fabricator::ArrowProducer::GetNext` (`src/fabricator/arrow_produce.cpp:69`) does
-    `*out = batches_.front(); batches_.pop();` with the comment *"ownership transfers to the consumer"*, and
-    `Release` frees only the batches STILL QUEUED — never one already yielded. Every managed-facing stream is
-    an `ArrowProducer` (insert / ctas / modify / copy), so a consumed batch is owned by C# and valid until C#
-    disposes it. ⇒ the copy may be unnecessary, and it is the most expensive kind: two passes plus
-    serialization, with the serialized `MemoryStream` and the decoded batches alive at once. Three call sites,
-    all collect-path fallbacks (`DeltaCatalog.cs:2185` buffered INSERT for identity/iceberg/pending-ALTER,
-    `:2251` the non-streamable bulk write, `ExternalTableRouting.cs:275`) — i.e. exactly where a buffered
-    INSERT's memory grows with rows, which the `delta bulk: batches PARKED until commit` mark now measures.
-  - **⚠ DO NOT JUST DELETE IT, and green suites will NOT settle it.** The doc line arrived with the
-    2026-07-15 rename commit, i.e. moved verbatim, so its origin is older and may record a real incident with
-    a stream that is not an `ArrowProducer`. And a use-after-free here is SILENT on Windows and Linux — that
-    is exactly how the `ArrowProducer::Release` mutex bug hid until macOS CI ran. The verification is the
-    technique that caught THAT one: an out-of-band liveness registry on the C++ `ArrowArray` releases,
-    asserting no release fires for a batch C# still holds, run across the collect-path suites. A positive
-    answer on this machine, not an absence of symptoms.
-  - Ladder to price each site against: **retain = 0 copies** (if the audit clears it),
+  - **`Materialize`'S IPC COPY IS GONE — DONE 2026-08-07 (C++ + C#, no ABI). MEASURED: peak working set
+    427 MB → 232 MB (−46%) on a 1.5M-row partitioned collect-path INSERT, time flat (8.8 s → 8.6 s),
+    byte-identical data.** `DeltaWriter.Materialize` used to write every batch into a `MemoryStream` and read
+    them back, documented as needed because *"the source batches may be freed after consumption"*. It now
+    RETAINS them; `FABRICATOR_MATERIALIZE_COPY=1` restores the old path.
+    - **The justification was false, and the Arrow C data interface is why**: a consumed `ArrowArray` is the
+      CONSUMER's property. Our own producer implements exactly that (`ArrowProducer::GetNext` moves the batch
+      out of its queue — *"ownership transfers to the consumer"* — and `Release` frees only what is STILL
+      QUEUED), and `PushBatch`'s array is imported by `CArrowArrayImporter.ImportRecordBatch`, which takes
+      ownership. `ChannelArrowStream` disposes nothing it has yielded; `BulkSession`'s drain disposes only what
+      is still IN the channel.
+    - **⚠ NONE OF THAT SETTLED IT, DELIBERATELY — the verification is the reusable part.** A use-after-free
+      here is SILENT on Windows and Linux (exactly how the `ArrowProducer::Release` mutex bug hid until macOS
+      CI ran it), so green suites and correct data prove nothing. New **`ArrowLiveness`**
+      (`src/fabricator/arrow_produce.cpp`, `FABRICATOR_ARROW_LIVENESS=1|2`, off by default) INTERPOSES the
+      release callback of every batch handed to the managed side — the standard C-data-interface wrap: stash
+      the original callback + `private_data`, restore them before delegating — and ATTRIBUTES each free.
+      - **COUNTING (level 1), swept over the hermetic suites: 1292 batches handed out, `released_by_producer=0`,
+        `double_released=0`, zero suites with a bad verdict.** A `ProducerFreeScope` thread-local marks
+        `ArrowProducer::Release`/the destructor, so a free fired from OUR side is distinguishable from the
+        consumer disposing what it owns.
+      - **⚠ COUNTING ALONE CANNOT ANSWER THE QUESTION, which is why there is a level 2.** "Released once" is
+        equally true of a batch freed BEFORE the write read it. At level 2 the consumer prints its own markers
+        to the same stderr, so the interleaving decides. MEASURED: all three handouts, then `materialize
+        retained 3 batches`, then `write BEGIN` … `write END`, and only THEN the three releases. Nothing is
+        freed while the write is reading.
+      - Reproduce: `FABRICATOR_ARROW_LIVENESS=2` on a partitioned codec INSERT (the collect path); or the
+        level-1 sweep, `for s in $(./scripts/list-hermetic-suites.sh); do unittest --test-dir . "$s"; done |
+        grep handed_out`.
+    - **⚠ THE INSTRUMENTATION WAS FIRST PUT IN THE WRONG PLACE, and a zero nearly read as a clean result.**
+      `ArrowProducer::GetNext` is NOT the path that feeds `Materialize` — a bulk write goes through
+      `PushBatch` into the C# channel, and the producer's queue serves only `RETURNING`/modify/function args.
+      The first armed run reported `handed_out=0`, which is indistinguishable from "nothing was freed". The
+      positive control (does the registry print at all?) is what caught it. **Instrument the seam the data
+      actually crosses, and never accept a zero without one.**
+    - **⚠ THE CONTROL RUN FOUND A SECOND THING: THE OLD PATH LEFT THE ORIGINALS UNRELEASED.** With
+      `FABRICATOR_MATERIALIZE_COPY=1` the counters read `handed_out=3 released=0` — the source batches are
+      never deterministically freed, so peak memory held the ORIGINALS, the serialized `MemoryStream` AND the
+      decoded copies at once. That is most of the 195 MB the change gives back. (`released=0` is at `atexit`;
+      a finalizer may reclaim them eventually — the claim is that release was not DETERMINISTIC, not that they
+      leaked forever.) In retain mode the releases fire after `write END`, i.e. EW's `WriteAsync` disposes the
+      batches it was given — so retaining also makes the disposal deterministic.
+    - ⚠ Across the sweep `released` (776) is well below `handed_out` (1292), so ~40% of handed-out batches are
+      not deterministically released on OTHER paths either. Not chased here; it is a lead for the rest of the
+      audit, not a defect anyone has demonstrated.
+    - **⚠ Empty batches are still SKIPPED and that is load-bearing** — engineered-wood writes one parquet file
+      per input batch, so passing a zero-row batch through would commit an empty data file.
+    - Gate: the whole hermetic tier at **67/67 — 6661, IDENTICAL to the pre-change counts**, which is the
+      behaviour-preservation claim; plus the liveness sweep above. The registry SHIPS (env-gated, like the
+      `Fabricator.Memory` marks and for the same reason): the removal rests on a measurement taken on ONE
+      platform, so a macOS or foreign-producer surprise should be one environment variable away from being
+      isolated rather than a rebuild.
+  - Ladder to price each remaining site against: **retain = 0 copies** (what `Materialize` now does),
     **`ArrowCompute.Take` = 1 copy** (new buffers, type-agnostic incl. nested/extension — what
     `ParseUpdateStream` now uses), **IPC round-trip = 2 copies + serialization**.
   - **⚠ THE BUFFERED READ-BACK SILENTLY IGNORED THE CATALOG'S `native_read` — FIXED 2026-08-07 by giving

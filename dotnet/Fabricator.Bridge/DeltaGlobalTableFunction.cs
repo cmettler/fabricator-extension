@@ -603,9 +603,16 @@ internal static class DeltaWriter
                              EngineeredWood.DeltaLake.Schema.ColumnMappingMode columnMapping =
                                  EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None,
                              bool serializable = false, IReadOnlyList<string>? sortedBy = null)
-        => WriteAsync(opener, path, schema, batches, mode, ct, deletionVectors, inCommitTimestamps,
+    {
+        // Liveness probe markers (level 2 only): the write is what READS the retained batches, so a release
+        // printed between these two lines would be the use-after-free the IPC copy used to guard against.
+        LivenessMark($"write BEGIN reading {batches.Count} retained batch(es)");
+        long version = WriteAsync(opener, path, schema, batches, mode, ct, deletionVectors, inCommitTimestamps,
                       changeDataFeed, rowTracking, spec, nativeWrite, columnMapping, serializable, sortedBy)
             .GetAwaiter().GetResult();
+        LivenessMark("write END");
+        return version;
+    }
 
     private static async Task<long> WriteAsync(nint opener, string path, Schema schema,
                              IReadOnlyList<RecordBatch> batches,
@@ -1399,17 +1406,85 @@ internal static class DeltaWriter
         }
     }
 
-    /// <summary>Materializes a (possibly streamed) Arrow stream into independent in-memory batches via an Arrow
-    /// IPC round-trip — the source batches may be freed after consumption, and engineered-wood's WriteAsync
-    /// needs them retained for one commit. Returns the schema, batches, and total row count.</summary>
+    /// <summary>Collects a (possibly streamed) Arrow stream into in-memory batches that stay valid after the
+    /// stream is released — engineered-wood's <c>WriteAsync</c> needs them all retained for one commit.
+    /// Returns the schema, batches, and total row count.</summary>
+    /// <remarks>
+    /// <para><b>⚠ THE COPY IS OPT-IN AND OFF BY DEFAULT SINCE 2026-08-07.</b> The batches are now RETAINED
+    /// as they arrive; set <c>FABRICATOR_MATERIALIZE_COPY=1</c> to restore the old Arrow IPC round trip.</para>
+    ///
+    /// <para><b>Why the copy was there, and why it is not needed.</b> It was documented as necessary because
+    /// "the source batches may be freed after consumption". That is not true of any stream that reaches
+    /// here: the Arrow C data interface makes a consumed <c>ArrowArray</c> the CONSUMER's property, and our
+    /// own producer implements exactly that — <c>ArrowProducer::GetNext</c> moves the batch out of its queue
+    /// ("ownership transfers to the consumer") and <c>Release</c> frees only what is STILL QUEUED. So the
+    /// import owns its buffers and they live until it is disposed.</para>
+    ///
+    /// <para><b>⚠ It was NOT settled by reading that code, deliberately.</b> A use-after-free here is SILENT
+    /// on Windows and Linux — which is how the <c>ArrowProducer::Release</c> mutex bug hid until macOS CI ran
+    /// it — so green suites prove nothing. It was settled by an out-of-band liveness registry
+    /// (<c>ArrowLiveness</c>, <c>FABRICATOR_ARROW_LIVENESS=1</c>) that interposes every handed-out batch's
+    /// release callback and ATTRIBUTES the free: producer-side (the bug) versus consumer-side (correct).
+    /// Measured across the collect-path suites: every handed-out batch released exactly once, zero
+    /// producer-side releases, zero double releases.</para>
+    ///
+    /// <para>Cost removed: the IPC form was TWO copies plus serialization, with the serialized
+    /// <c>MemoryStream</c> and the decoded batches alive simultaneously — on the buffered-INSERT path, where
+    /// memory already grows with rows.</para>
+    ///
+    /// <para><b>⚠ Empty batches are still SKIPPED and that is load-bearing</b> — engineered-wood writes one
+    /// parquet file per input batch, so passing a zero-row batch through would commit an empty data file.</para>
+    /// </remarks>
     public static (Schema Schema, List<RecordBatch> Batches, long Rows) Materialize(
         IArrowArrayStream stream, CancellationToken ct)
         => MaterializeAsync(stream, ct).GetAwaiter().GetResult();
+
+    /// <summary>Set <c>FABRICATOR_MATERIALIZE_COPY=1</c> to restore the pre-2026-08-07 Arrow IPC round trip.
+    /// Kept as an escape hatch rather than deleted: the removal rests on a liveness measurement taken on ONE
+    /// platform, and a macOS/other-producer surprise should be one environment variable away from being
+    /// isolated, not a rebuild.</summary>
+    private static readonly bool MaterializeCopy =
+        Environment.GetEnvironmentVariable("FABRICATOR_MATERIALIZE_COPY") == "1";
+
+    /// <summary>Level 2 of the liveness probe (<c>FABRICATOR_ARROW_LIVENESS=2</c>): the consumer prints its
+    /// own markers to the SAME stderr the C++ registry prints handouts/releases to, so the INTERLEAVING
+    /// answers the only question that matters — is a batch released before or after the write reads it?
+    /// Counting alone cannot tell those apart.</summary>
+    internal static readonly bool LivenessVerbose =
+        Environment.GetEnvironmentVariable("FABRICATOR_ARROW_LIVENESS") == "2";
+
+    internal static void LivenessMark(string what)
+    {
+        if (LivenessVerbose)
+        {
+            Console.Error.WriteLine("FABRICATOR-LIVENESS: consumer " + what);
+            Console.Error.Flush();
+        }
+    }
 
     private static async Task<(Schema Schema, List<RecordBatch> Batches, long Rows)> MaterializeAsync(
         IArrowArrayStream stream, CancellationToken ct)
     {
         var schema = stream.Schema;
+        if (!MaterializeCopy)
+        {
+            var retained = new List<RecordBatch>();
+            long retainedRows = 0;
+            RecordBatch? batch;
+            while ((batch = await stream.ReadNextRecordBatchAsync(ct).ConfigureAwait(false)) is not null)
+            {
+                if (batch.Length == 0)
+                {
+                    batch.Dispose(); // see the remark: an empty batch would become an empty parquet file
+                    continue;
+                }
+                retained.Add(batch);
+                retainedRows += batch.Length;
+            }
+            LivenessMark($"materialize retained {retained.Count} batch(es), {retainedRows} row(s)");
+            return (schema, retained, retainedRows);
+        }
+
         var ms = new MemoryStream();
         long rows = 0;
         using (var w = new ArrowStreamWriter(ms, schema, leaveOpen: true))
