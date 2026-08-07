@@ -255,7 +255,13 @@ case "$TIER" in
         # column that ReferenceKeyColumns destructures Ã¢ÂÂ a Delta rowid is always a single virtual BIGINT), and
         # a table with NO row identity at all, which is the shape the !HasRowId() guard exists for (without it
         # an insert-only merge reads one past the chunk's width and fatally invalidates the database).
-        : "${MIN_ASSERTIONS:=1640}"
+        # 45 runs / 1678 since 2026-08-07: verify_delta_catalog_s3 gained a 19-assertion TEARDOWN (both engine
+        # legs, so +38) that OPTIMIZEs and VACUUMs the tables it leaves in the persistent MinIO bucket. It is
+        # cleanup with assertions, not coverage: the added queries prove the tables are still readable and
+        # INTACT after the VACUUM, so a vacuum that removed a live file fails HERE rather than in some later
+        # run. See the section header in that suite for what it bounds (data files) and what it does not
+        # (the log, which engineered-wood never cleans and which this makes grow slightly FASTER).
+        : "${MIN_ASSERTIONS:=1678}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

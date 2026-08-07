@@ -6,7 +6,11 @@
 #              read_parquet over s3://). Uses the docker/docker-compose.yml MinIO (bucket `fabricator`,
 #              test-only creds; HTTPS via the self-signed cert — httpfs does not pin the CA).
 #              Re-runnable against a persistent bucket: every table is CREATE OR REPLACE'd (DROP TABLE
-#              is exercised at the end — httpfs implements s3 file deletion for the recursive dir-remove).
+#              is exercised mid-suite — httpfs implements s3 file deletion for the recursive dir-remove),
+#              and the suite OPTIMIZE+VACUUMs what it leaves so the rig stops degrading run over run.
+#              ⚠ That bounds the DATA files only — engineered-wood never deletes a superseded COMMIT file,
+#              so the log still grows and periodically emptying the bucket remains the maintenance step.
+#              See the teardown section at the bottom for the measurements.
 # group: [fabricator]
 
 require fabricator
@@ -570,3 +574,97 @@ DETACH wguarded;
 
 statement ok
 DETACH wauto;
+
+# ============================================================================
+# TEARDOWN — OPTIMIZE + VACUUM the tables this suite leaves behind, so the rig stops degrading.
+#
+# WHY (measured 2026-08-07): the suite is re-runnable against a PERSISTENT bucket, so every run adds
+# to what the last one left. After ~125 runs `lake/t` held 148 commit files and a heap of orphaned data
+# files, and a `count(*)` on that 4-ROW table cost 2.61 s warm against a 1.18 s fresh copy. The suite runs
+# ~180 assertions twice, so that overhead is minutes per tier run — which is what made the service tier
+# look hung.
+#
+# ⚠ WHAT THIS BOUNDS, AND WHAT IT DOES NOT — do not read it as "the rig is now self-maintaining":
+#   • DATA files: BOUNDED. `CREATE OR REPLACE` orphans the previous version's files and nothing reclaimed
+#     them. VACUUM does, and it is the bigger half — measured 3.54 s -> 2.06 s on `lake/t`.
+#   • LOG files: NOT bounded, and this makes them grow FASTER. engineered-wood writes a checkpoint every
+#     10 versions and NEVER deletes a commit the checkpoint subsumes — there is no log cleanup in it at
+#     all (`delta.logRetentionDuration` appears only in doc comments and is never read). OPTIMIZE and
+#     VACUUM each ADD a commit, so this trades ~10 extra commits per run for the reclaimed data.
+#     Measured directly: `lake/t` went 148 -> 151 log files across one OPTIMIZE + VACUUM.
+#   ⇒ periodically emptying the bucket is STILL the maintenance step (see CLAUDE.md); this only stops the
+#     larger, faster-growing half.
+#
+# ⚠ WHY NOT `DROP TABLE`, which would bound both: the two ENGINE LEGS deliberately SHARE these prefixes so
+# the second leg replaces a table the OTHER engine wrote — a real scenario for anyone flipping the flag on
+# an existing catalog, and stated as intentional in this file's header. A per-leg drop would delete that
+# coverage. Cleanup that bounds the log has to live OUTSIDE the suite, after both legs.
+#
+# ⚠ `RETAIN 0 HOURS` is a TEST-RIG setting. It ignores the retention horizon that protects a concurrent
+# reader holding an older snapshot; on a real table use the default (7 days) or a considered value.
+# ============================================================================
+
+statement ok
+ATTACH 's3://fabricator/lake' AS clean1 (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}',
+                                         SECRET minio_s3, READ_ONLY false);
+
+statement ok
+SELECT fabricator_exec('clean1', 'OPTIMIZE main.t');
+
+statement ok
+SELECT fabricator_exec('clean1', 'VACUUM main.t RETAIN 0 HOURS');
+
+statement ok
+SELECT fabricator_exec('clean1', 'OPTIMIZE main.nt');
+
+statement ok
+SELECT fabricator_exec('clean1', 'VACUUM main.nt RETAIN 0 HOURS');
+
+# The tables are still READABLE and INTACT afterwards — the assertion that makes this teardown safe rather
+# than merely quiet. A VACUUM that removed a live file would surface here, not in some later run.
+query II
+SELECT count(*), sum(id) FROM clean1.main.t;
+----
+4	20
+
+query I
+SELECT count(*) FROM clean1.main.nt;
+----
+990
+
+statement ok
+DETACH clean1;
+
+statement ok
+ATTACH 's3://fabricator/condsuite' AS clean2 (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}',
+                                              SECRET minio_s3, READ_ONLY false);
+
+statement ok
+SELECT fabricator_exec('clean2', 'OPTIMIZE main.t');
+
+statement ok
+SELECT fabricator_exec('clean2', 'VACUUM main.t RETAIN 0 HOURS');
+
+statement ok
+DETACH clean2;
+
+# ⚠ copyfmt is attached READ-ONLY above (an s3 ATTACH with no READ_ONLY clause is auto-bumped by DuckDB),
+# so the teardown needs its own writable attach — OPTIMIZE and VACUUM both COMMIT.
+statement ok
+ATTACH 's3://fabricator/copyfmt' AS clean3 (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}',
+                                            SECRET minio_s3, READ_ONLY false);
+
+statement ok
+SELECT fabricator_exec('clean3', 'OPTIMIZE main.t1');
+
+statement ok
+SELECT fabricator_exec('clean3', 'VACUUM main.t1 RETAIN 0 HOURS');
+
+statement ok
+SELECT fabricator_exec('clean3', 'OPTIMIZE main.pt');
+
+statement ok
+SELECT fabricator_exec('clean3', 'VACUUM main.pt RETAIN 0 HOURS');
+
+statement ok
+DETACH clean3;
