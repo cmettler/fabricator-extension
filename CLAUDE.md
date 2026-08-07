@@ -623,6 +623,20 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   - **(2) Bloom-filter columns are NOT wanted as an ATTACH default (user, explicit).** They are a per-TABLE
     property — which columns you probe — so a catalog-wide default is the wrong shape and should not be added
     even though the spec can carry one.
+  - **⚠ THE SQL SERVER `unicode`/NVARCHAR WITH OPTION WAS SCOPED AND THEN NOT BUILT — because the behaviour
+    the user wanted ALREADY EXISTS (2026-08-07).** The ask was "same DuckDB code writes to prod SQL Server
+    (default collation, NVARCHAR) and to Fabric (VARCHAR only), and new SQL Server databases should default to
+    VARCHAR + UTF-8". `MapArrowToSqlType` already resolves exactly that, per connection, from the COLLATION:
+    `IsUtf8Collation ? VARCHAR : HasNVarchar ? NVARCHAR : VARCHAR`. All three targets land correctly with NO
+    setting. **Check whether an ask is already satisfied before designing an option for it** — a redundant knob
+    would have added a way to get it WRONG (forcing VARCHAR on a legacy collation is silently lossy).
+    - Gated for the prod shape: `verify_default_varchar_length` asserts `nvarchar/-1` with no override on the
+      docker box's default collation. **⚠ The UTF-8-collation ⇒ VARCHAR leg is NOT gated** — the rig has no
+      UTF-8-collation database and Fabric is live-only. Adding one (`Latin1_General_100_CI_AS_SC_UTF8`) to
+      `docker/provision.ps1` would close it; it is the half a new-database user depends on.
+    - Escape hatches already exist: `mssql_default_varchar_length` (bounds whichever type is chosen) and
+      `mssql_ctas_text_type` (replaces the type outright). What is genuinely missing is only the PER-TABLE
+      form of these — the (3) item below.
   - **(3) Re-examine the `SET` parameters and MOVE what belongs per-table into `WITH`.** `delta_write_options`
     is one JSON blob mixing genuinely session-scoped things (compression as a storage-cost policy) with
     per-table ones (partitioning, `replace_where`, `schema_mode`). Decide each knob's home rather than

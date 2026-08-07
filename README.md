@@ -1337,6 +1337,26 @@ locally, but is worth re-checking on remote storage.
 Partitioned tables are batched as well — the partition value is not stored in the data files, so it travels
 alongside them and is applied in the same query.
 
+### Text columns on SQL Server: VARCHAR vs NVARCHAR
+
+A DuckDB `VARCHAR` is UTF-8. Which SQL Server type that becomes is decided **per connection, from the
+database's collation** — so the same DuckDB code writes correctly to a legacy-collation server, a UTF-8
+server, and Fabric without a per-target setting:
+
+| target | column type | why |
+|---|---|---|
+| SQL Server, default (non-UTF-8) collation | `NVARCHAR` | `VARCHAR` there is a single-byte codepage — Unicode would be **lossy** |
+| SQL Server, UTF-8 collation (e.g. `Latin1_General_100_CI_AS_SC_UTF8`) | `VARCHAR` | holds full Unicode, at roughly half the storage |
+| Fabric Warehouse / SQL endpoint | `VARCHAR` | it is UTF-8, and the only option |
+
+`CHAR`/`NCHAR` follow the same choice. So pointing an existing project at a new UTF-8 database is enough to
+move it to `VARCHAR` — nothing in the model changes.
+
+To override, either bound the length with `SET mssql_default_varchar_length = 200` (applies to whichever
+type is chosen), or replace the type outright with `SET mssql_ctas_text_type = 'NVARCHAR(200)'` — e.g. to
+keep `NVARCHAR` on a UTF-8 database during a migration. ⚠ Forcing `VARCHAR` on a non-UTF-8 collation is
+lossy for non-ASCII text; the automatic rule exists to avoid exactly that.
+
 ### Parquet write options (Delta)
 
 Settable per table with `CREATE TABLE ... WITH (...)`, per session with `SET delta_write_options`, or as an
