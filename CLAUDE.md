@@ -175,7 +175,28 @@ if that is impossible, and then **make our amendments clear IN THE CODE**.
   [docs/delta-transaction-hoist.md](docs/delta-transaction-hoist.md) §2. So the live list is:
   (1) `ConflictChecker` isBlindAppend — 42 lines, internal, 7 tests, but
   present BOTH shapes; (2) `ExemptRowLevelFromWholeTableRead` — **only after the §2.2 fix**, and pitched as a
-  DEPARTURE not an inconsistency; (3) a transaction that can CREATE a table — a design conversation. **Never**
+  DEPARTURE not an inconsistency; (3) a transaction that can CREATE a table — a design conversation; and
+  **(4) LOG CLEANUP — CONFIRMED ABSENT 2026-08-07 BY A CONTROLLED EXPERIMENT, and worth offering because it
+  is a plain SPEC GAP rather than a fabricator-shaped need.** engineered-wood accepts and stores
+  `delta.logRetentionDuration`, never reads it, and never deletes a commit a checkpoint subsumes.
+  - **THE MEASUREMENT (this is what settles it — the two greps below do not):** two local tables, 26 commits
+    each, two checkpoints each; one with `delta.logRetentionDuration = 'interval 1 seconds'`, one with the
+    property unset. **28 commit JSONs vs 27** — the difference being only the extra `set_tblproperties`
+    commit. With a one-second horizon and a checkpoint at v20, an implemented cleanup would have reclaimed
+    ~20 files. Nothing was reclaimed, and the property changed nothing.
+  - Corroborating, and the stronger of the two static reads: **`IntervalParser`'s ONLY call site is
+    `DeltaTable.DeletedFileRetention`**, which reads `delta.deletedFileRetentionDuration` — the VACUUM knob
+    for DATA files. The parser whose doc comment names `logRetentionDuration` is wired only to the other one.
+  - ⚠ **MY FIRST TWO ARGUMENTS FOR THIS WERE BOTH INADEQUATE, and the sequence is the point.** (a) A
+    BACKWARDS GREP for `Cleanup*` / `DeleteAsync`-on-a-log-path — the very search pattern this file records as
+    having produced a wrong "we never reach `CommitOccAsync`" conclusion; a cleanup under an unguessed name
+    would not appear. (b) Observing `lake/t` go 148 → 151 across an OPTIMIZE + VACUUM — which **does not
+    discriminate**, because Delta's default retention is 30 DAYS and every file in the rig is minutes old, so
+    a correct implementation would have done nothing either. Only forcing the horizon to one second separates
+    the hypotheses. **A negative result needs a control that would have produced a positive.**
+  - Cost, MEASURED: ~10 ms per dead commit file per scan on S3, so an hourly dbt model adds ~90 s of pure
+    metadata to every scan after a year. The offer needs nothing of ours, is self-contained, and is what the
+    spec already says should happen — the three properties that make an offer land. **Never**
   offer the variant transport.
 - **Decision gate:** drop the branch for a `PackageReference` when the patch set is variant-transport-only AND
   #24157 is fixed. Until then the branch is correct, not a failure.
@@ -3431,7 +3452,10 @@ VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
       table still costs 7.2 s with ~151 commits and ONE file, while the 148-commit `lake/t` costs 2.6 s. Those
       two disagree by ~3×, so log length alone does not explain the residual (the OPTIMIZE commit carries 150
       REMOVE actions, which replay is not free). Establish that before optimising for it.
-    - **⚠ ENGINEERED-WOOD NEVER DELETES A SUPERSEDED COMMIT FILE — there is no log cleanup at all.** It writes
+    - **⚠ ENGINEERED-WOOD NEVER DELETES A SUPERSEDED COMMIT FILE — CONFIRMED by forcing
+      `delta.logRetentionDuration` to one second and finding 28 commit JSONs still there past two
+      checkpoints (see the offer list for the experiment and for the two weaker arguments it replaced).**
+      It writes
       a checkpoint every 10 versions (`DeltaTableOptions.CheckpointInterval`) and keeps every commit the
       checkpoint subsumes. Verified: the ONLY `DeleteAsync` on a log path is the temp-file cleanup after a
       failed conditional rename; no `Cleanup*` method exists; and **`delta.logRetentionDuration` appears ONLY
