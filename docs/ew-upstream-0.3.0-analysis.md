@@ -464,6 +464,32 @@ retracted for being a semantics request in disguise. This one is not: the two su
   patch covers our path" but **"EW expects a buffered host to use this and we don't"** — a divergence from the
   intended shape that nobody chose. Settle it in Phase C.
 
+### 4a.5 THE TWO OFFERS ARE OPEN AS DRAFTS (2026-08-07)
+
+| PR | branch | issue |
+|---|---|---|
+| [clast-project/engineered-wood#90](https://github.com/clast-project/engineered-wood/pull/90) | `offer/dml-checkpoint` | **Closes #86** |
+| [clast-project/engineered-wood#91](https://github.com/clast-project/engineered-wood/pull/91) | `offer/blind-append-declaration` | **Addresses #88**, decision 2 of 4 |
+
+Each is cut off `upstream/main` with ONE change and its tests — never off `fabricator-patches-v2`, which
+carries both — following the `offer/*` convention already in the fork (13 prior branches).
+
+**⚠ THE INTERNAL MARKERS MUST BE STRIPPED, and this is the step easiest to forget.** Both branches were
+verified to contain **zero** `FABRICATOR` references: the `[FABRICATOR-PATCH: OFFER-READY]` tags and
+host-specific wording ("the row-level path our host takes") are OUR bookkeeping and read as noise
+upstream. Both were also built and tested STANDALONE off upstream — a patch that only compiles in our
+tree is not an offer.
+
+**Each PR states what it deliberately omits**, rather than leaving a reviewer to find the gaps: #91 lists
+the three parts of #88 it does not do (writing the flag, unifying the two inferences, the
+`metadataChanged` guard); #90 flags that `delta.checkpointInterval` is still ignored.
+
+**⚠ #91 explicitly DECLINES to settle upstream's open question.** #88 lists "absent ⇒ infer" vs "absent ⇒
+not blind" as undecided. Ours picks permissive with a stated reason, says plainly that this is
+back-compat and **NOT parity with Delta**, and pins it with a named test so switching is one line with a
+failing test already pointing at it. Shipping a fait accompli on someone else's open design question is
+how an offer gets rejected on grounds that have nothing to do with its merits.
+
 ### 4a.4 PHASE B — ALL GATES GREEN
 
 | gate | result | what it proves |
