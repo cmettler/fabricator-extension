@@ -273,7 +273,28 @@ would not."* Our patch is one of its four decisions. The rest:
 Upstream also draws a distinction ours does not: *"a recorded `false` should be trusted absolutely, while a
 recorded `true` is a claim by another writer."*
 
-### #86 — DML-written tables NEVER CHECKPOINT, and it revises two of this session's findings
+### #86 — DML-written tables NEVER CHECKPOINT — **FIXED 2026-08-07, and it is our second patch**
+
+**Implemented on `fabricator-patches-v2` (`d3a1301`), marked `[FABRICATOR-PATCH: OFFER-READY — #86]`.**
+The whole change is **one line**: `CommitOccAsync` passed `WriteCheckpointOnInterval = false`, and that
+loop has SIX callers, so flipping it covers every path at once. `LogCommitRequest`'s default is already
+`true` — this simply stops opting out. The condition and the ordering are `LogCommitter`'s own, identical
+to the batch path that already set it, so no new mechanism is introduced.
+
+MEASURED after: all three write paths produce 3 checkpoints on 26 commits — autocommit DML, DML inside an
+explicit transaction, and the batch append — each with a `_last_checkpoint`, where the first two produced
+**0** before.
+
+⚠ **No public `CheckpointAsync()` was added, although upstream's issue proposes one.** The condition is
+`version % CheckpointInterval == 0` on the ABSOLUTE version, so an existing under-checkpointed table
+SELF-HEALS within one interval; an uncalled public API would be divergence for nothing. If a host ever
+needs to force one out-of-band, that is when to add it — and it is upstream's item 3, so ask there first.
+
+Gate `DmlCheckpointTests` (3), mutation-tested: restoring `= false` kills exactly the two DML cases and
+leaves the batch-append POSITIVE CONTROL passing — which is what distinguishes "the DML loop is broken"
+from "checkpointing is broken generally".
+
+Original finding, kept because the consequence chain is the argument for the fix:
 
 *"CheckpointInterval is honoured by two commit paths out of twelve."* Honoured: `WriteAsync`,
 `CommitDataFilesAsync`. **Not honoured: `DeltaTransaction.CommitAsync`, every delete, every update,
@@ -350,7 +371,13 @@ measured.** Everything below was taken against pin `3794fe4` and must be RE-TAKE
 
 ---
 
-## 4a. PHASE A — DONE. The patch set is 4 files / +175 → **ONE file / +45**, and it is offer-ready
+## 4a. PHASE A — DONE. The patch set is 4 files / +175 → **2 files / +69**, and both are offer-ready
+
+⚠ The bump itself reduced it to **ONE file / +45** (the isBlindAppend read half). The second patch is the
+#86 checkpoint fix, added deliberately AFTER the bump was green — see §2a. Keeping them separate is the
+point: Phase A's claim is "behaviour-preserving, hermetic identical at 6689", and #86 CHANGES behaviour
+(checkpoints and `_last_checkpoint` start appearing), so folding it in would have destroyed the
+attribution that made a red tier diagnosable.
 
 Branch `fabricator-patches-v2` off `fa9b556`. What it took, in full:
 
