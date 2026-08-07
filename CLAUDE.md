@@ -3410,6 +3410,46 @@ VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
       removes and RECLAIMS NOTHING.** One run leaves 35 objects (16 `lake/`, 11 `copyfmt`, 8 `condsuite`),
       so growth is ~16/run under `lake/` and the observed 2,002 is roughly 125 accumulated runs. Nothing is
       wrong with the suite; the rig just has no reclamation.
+  - **⚠ WHY THE S3 SUITE GETS SLOWER — MEASURED 2026-08-07, and the dominant term is ACTIVE DATA FILES, not
+    the log and not `CREATE OR REPLACE`. Two priors of mine were wrong before the numbers arrived.**
+    - **WRONG PRIOR 1: "ATTACH discovery dominates, because an S3 root globs `*/_delta_log/*.json` and is
+      O(total commit files)."** It is O(commit files) — but MEASURED, **ATTACH costs 0.143 s** against the
+      accumulated bucket. Discovery is not the problem at this scale.
+    - **WRONG PRIOR 2: "it is the log length."** Real but SECONDARY. Same 4-row table, same data, warm:
+      a 2-commit copy scans in **1.18 s**, the 148-commit original in **2.61 s** ⇒ ~10 ms per dead commit.
+    - **THE DOMINANT TERM, isolated by a control that moves the two variables in OPPOSITE directions:**
+      a table built by 150 single-row INSERTs (150 commits, 150 ACTIVE data files) scans in **19.8 s**;
+      after `OPTIMIZE` — which makes the log LONGER by another commit while collapsing the files to one —
+      it scans in **7.2 s, twice** (−64%). ⇒ ~85 ms per ACTIVE FILE against S3, roughly 8× the per-dead-commit
+      cost. **The lever is OPTIMIZE, and it works.**
+    - **⚠ MY FIRST SLOPE MEASUREMENT WAS CONFOUNDED AND I NEARLY PUBLISHED IT.** Timing scans at 10 / 60 / 150
+      commits gave a beautifully linear ~115 ms per commit — but every one of those commits also ADDED A DATA
+      FILE, so the "per commit" slope was really per-file. The `OPTIMIZE` control is what separated them, and
+      it is the same discipline this file keeps recording: **a slope over a variable you did not isolate is a
+      slope over something else.**
+    - **⚠ THE RESIDUAL IS NOT FULLY ATTRIBUTED — do not quote it as a log-length constant.** After OPTIMIZE the
+      table still costs 7.2 s with ~151 commits and ONE file, while the 148-commit `lake/t` costs 2.6 s. Those
+      two disagree by ~3×, so log length alone does not explain the residual (the OPTIMIZE commit carries 150
+      REMOVE actions, which replay is not free). Establish that before optimising for it.
+    - **⚠ ENGINEERED-WOOD NEVER DELETES A SUPERSEDED COMMIT FILE — there is no log cleanup at all.** It writes
+      a checkpoint every 10 versions (`DeltaTableOptions.CheckpointInterval`) and keeps every commit the
+      checkpoint subsumes. Verified: the ONLY `DeleteAsync` on a log path is the temp-file cleanup after a
+      failed conditional rename; no `Cleanup*` method exists; and **`delta.logRetentionDuration` appears ONLY
+      in doc comments and is never READ**. So `_delta_log` grows monotonically for the life of a table.
+      - ⚠ `VacuumExecutor` itself says log files are *"governed by `delta.logRetentionDuration` and log
+        cleanup, not by vacuum"* — naming a mechanism that does not exist. Same shape as the `_last_checkpoint`
+        saga (#35): **a justification that names a fallback must verify the fallback exists.**
+      - Consequence beyond the rig: a dbt incremental model commits once per run, so the log grows without
+        bound. At the measured ~10 ms per dead commit an hourly model would add ~90 s of pure metadata to
+        every scan after a year — while the far larger per-file term is what makes it hurt sooner. This is a
+        product issue, not a test-rig annoyance.
+    - **What this means for the rig, in order of payoff:** run `OPTIMIZE` (and then `VACUUM`) on the S3 suite's
+      tables, or empty the bucket — the documented maintenance step. `table_filter` on the ATTACH bounds
+      ENUMERATION only and would not have helped here, since discovery was never the cost.
+    - **⚠ It also re-prices [delta-snapshot-caching](docs/delta-snapshot-caching.md) DOWNWARD again.** That
+      gate's headline is a COUNT (4 snapshot constructions per table reference) that was never profiled;
+      these numbers say the per-statement metadata floor on S3 is ~1.2 s for a 2-commit table, and that the
+      thing worth attacking first is file COUNT, which caching a snapshot does not touch.
     - Clean with `docker exec minio-fabricator sh -c 'mc alias set l https://localhost:9000 miniouser
       miniosecret123 --insecure && mc rm --recursive --force --insecure l/fabricator'` (⚠ **https +
       `--insecure`** — the stack is TLS-only, and `http://` silently reports 0 objects, which reads as an
