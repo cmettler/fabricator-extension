@@ -430,3 +430,86 @@ RESET delta_write_options;
 
 statement ok
 DETACH rw;
+
+# ============================================================================
+# FURTHER PARQUET WRITE OPTIONS (2026-08-07): parquet_row_group_size_bytes, parquet_version,
+# parquet_dictionary_size_limit — and the two that are REFUSED.
+# ⚠ parquet_row_groups_per_file / parquet_file_size_bytes are refused on EVERY engine, and that is a
+# CORRECTNESS refusal rather than a missing feature. MEASURED: DuckDB's COPY treats the target as a
+# DIRECTORY under either option and writes <name>.parquet/data_0.parquet into it, while the Delta log
+# records <name>.parquet as the data file — the commit SUCCEEDS and the table is silently corrupt. This
+# section is what stops them being "enabled" later without teaching the writer to register every file.
+# ============================================================================
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/optmore' AS mo (TYPE fabricator, PROVIDER 'delta', native_read true, native_write true);
+
+statement ok
+CREATE TABLE mo.main.v1 WITH (parquet_version='V1') AS SELECT i::BIGINT AS id FROM range(1000) r(i);
+
+query I
+SELECT count(*) FROM mo.main.v1;
+----
+1000
+
+statement ok
+CREATE TABLE mo.main.dict WITH (parquet_dictionary_size_limit=8) AS SELECT (i%5000)::BIGINT AS id FROM range(5000) r(i);
+
+query I
+SELECT count(*) FROM mo.main.dict;
+----
+5000
+
+# ONE data file per table — the property the refusals below protect.
+query I
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/optmore/dict/*.parquet');
+----
+1
+
+statement error
+CREATE TABLE mo.main.rot WITH (parquet_file_size_bytes=32768) AS SELECT i::BIGINT AS id FROM range(1000) r(i);
+----
+is not supported
+
+statement error
+CREATE TABLE mo.main.rot2 WITH (parquet_row_groups_per_file=1) AS SELECT i::BIGINT AS id FROM range(1000) r(i);
+----
+is not supported
+
+# ...including on a PARTITIONED table, where our side would have coped (that write already targets a
+# directory and registers one `add` per file) — DuckDB refuses the combination itself.
+statement ok
+CREATE TABLE mo.main.rotp (id BIGINT, p VARCHAR) PARTITIONED BY (p);
+
+statement error
+SET delta_write_options='{"file_size_bytes":65536}';
+INSERT INTO mo.main.rotp SELECT i::BIGINT, 'p'||(i%3) FROM range(1000) r(i);
+----
+is not supported
+
+statement ok
+RESET delta_write_options;
+
+# The codec engine takes the SHARED knobs (row_group_size_bytes -> RowGroupMaxBytes,
+# parquet_version -> DataPageVersion) and refuses the native-only one rather than dropping it.
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/optmorec' AS moc (TYPE fabricator, PROVIDER 'engineeredwooddelta');
+
+statement ok
+CREATE TABLE moc.main.shared WITH (parquet_row_group_size_bytes=65536, parquet_version='V1') AS SELECT i::BIGINT AS id FROM range(1000) r(i);
+
+query I
+SELECT count(*) FROM moc.main.shared;
+----
+1000
+
+statement error
+CREATE TABLE moc.main.bad WITH (parquet_dictionary_size_limit=8) AS SELECT 1 AS id;
+----
+only supported with native_write
+
+statement ok
+DETACH moc;
+
+statement ok
+DETACH mo;

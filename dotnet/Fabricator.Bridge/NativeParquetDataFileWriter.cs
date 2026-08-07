@@ -112,6 +112,29 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
     // Renders the resolved write tuning as native COPY options. COMPRESSION/ROW_GROUP_SIZE are DuckDB parquet
     // COPY options; bloom-filter COLUMNS are an EW-codec-only knob (DuckDB's writer blooms dictionary-encoded
     // columns automatically — WRITE_BLOOM_FILTER true is always set), so BloomFilterColumns is not rendered.
+    /// <summary>Refuses the file-ROTATING options on the single-file COPY. ⚠ CORRECTNESS, not a capability
+    /// gap: MEASURED, with FILE_SIZE_BYTES or ROW_GROUPS_PER_FILE DuckDB treats the target as a DIRECTORY and
+    /// writes <c>&lt;name&gt;.parquet/data_0.parquet</c> into it, while the Delta `add` records
+    /// <c>&lt;name&gt;.parquet</c> — the commit SUCCEEDS and the table's data file is a directory.
+    /// The PARTITIONED copy is unaffected and does NOT call this: it already targets a directory root and
+    /// <see cref="ReadFileStats"/> already builds one CopiedFile per RETURN_STATS row, so extra files are
+    /// registered as their own `add` actions.</summary>
+    private static void RejectRotatingOnSingleFile(DeltaWriteSpec? spec)
+    {
+        string? rotating =
+            spec?.RowGroupsPerFile is not null ? "parquet_row_groups_per_file"
+            : spec?.FileSizeBytes is not null ? "parquet_file_size_bytes"
+            : null;
+        if (rotating is not null)
+        {
+            throw new System.ArgumentException(
+                $"{rotating} splits the output across several files, which a Delta `add` action cannot name "
+                + "(the commit would record a directory as a data file). It IS supported on a PARTITIONED "
+                + "table, whose write already targets a directory — partition the table, or use "
+                + "parquet_row_group_size / parquet_row_group_size_bytes instead.");
+        }
+    }
+
     internal static string CopyTuning(DeltaWriteSpec? spec)
     {
         if (spec is null)
@@ -126,6 +149,26 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
         if (spec.RowGroupSize is { } rows)
         {
             s += ", ROW_GROUP_SIZE " + rows.ToString(CultureInfo.InvariantCulture);
+        }
+        if (spec.RowGroupSizeBytes is { } rgBytes)
+        {
+            s += ", ROW_GROUP_SIZE_BYTES " + rgBytes.ToString(CultureInfo.InvariantCulture);
+        }
+        if (spec.RowGroupsPerFile is { } rgPer)
+        {
+            s += ", ROW_GROUPS_PER_FILE " + rgPer.ToString(CultureInfo.InvariantCulture);
+        }
+        if (spec.DictionarySizeLimit is { } dict)
+        {
+            s += ", DICTIONARY_SIZE_LIMIT " + dict.ToString(CultureInfo.InvariantCulture);
+        }
+        if (spec.FileSizeBytes is { } fileBytes)
+        {
+            s += ", FILE_SIZE_BYTES " + fileBytes.ToString(CultureInfo.InvariantCulture);
+        }
+        if (spec.ParquetVersion != DeltaParquetVersion.Default)
+        {
+            s += ", PARQUET_VERSION " + (spec.ParquetVersion == DeltaParquetVersion.V1 ? "V1" : "V2");
         }
         return s;
     }

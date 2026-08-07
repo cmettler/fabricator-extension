@@ -589,7 +589,33 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
 - **THE WRITE-OPTIONS REVISIT — AGREED, NOT STARTED (user, 2026-08-06). Where each parquet knob BELONGS, not
   just whether it is plumbed.** Triggered by the measured gap below, but the user's ask is deliberately wider:
   it is a surface question, so decide the surface before finishing the plumbing.
-  - **(1) EVERY parquet option must be expressible in `CREATE TABLE … WITH (…)`, INCLUDING bloom-filter
+  - **(1) PARTLY DONE 2026-08-07 — five more parquet options, on all three surfaces (`WITH` / `SET` /
+    ATTACH), same precedence.** Added `parquet_row_group_size_bytes` (→ native `ROW_GROUP_SIZE_BYTES`, EW
+    `RowGroupMaxBytes`), `parquet_version` V1/V2 (→ native `PARQUET_VERSION`, EW `DataPageVersion`), and
+    `parquet_dictionary_size_limit` (native only). Gate `verify_with_options` 96 → **113**.
+    - **⚠ `dictionary_size_limit` IS NOT EW's `DictionaryPageSizeLimit` — mapping them would have been
+      silently wrong.** DuckDB's is a cap on DISTINCT VALUES; EW's is BYTES. DuckDB's byte-valued knob is a
+      SEPARATE option (`string_dictionary_page_size_limit`). Hence native-only, with the reason in the error.
+    - **⚠ THE TWO FILE-ROTATING OPTIONS ARE REFUSED, and each path has its OWN measured reason.** Native +
+      NOT partitioned: DuckDB writes `<name>.parquet/data_0.parquet` while the Delta `add` records
+      `<name>.parquet` — **the commit SUCCEEDS and the data file is a directory (silent corruption)**. Native
+      + PARTITIONED: DuckDB refuses outright (*"Can't combine file rotation (e.g., ROW_GROUPS_PER_FILE) and
+      PARTITION_BY for COPY"*) — worth recording because **OUR side would have coped**: `RunCopyPartitioned`
+      already targets a directory and `ReadFileStats` already registers one `add` per `RETURN_STATS` row, so
+      when upstream lifts that limit only the refusal has to go. Codec: no equivalent.
+    - **⚠ `spec.PartitionColumns` IS NOT "this write is partitioned"** — it carries the STATEMENT's
+      `PARTITIONED BY`, so an INSERT into an existing partitioned table has it EMPTY. Gating on it refused a
+      valid write (measured). The table's partitioning is only known further down, in the writer.
+    - **⚠ `dataFileWriter == null` IS NOT "the codec engine" either** — a native CTAS writes through DuckDB's
+      COPY on a separate route and still opens EW with no writer, so that inference refused valid options on
+      the DEFAULT provider (measured). Read the catalog's `_nativeWrite`.
+    - ⚠ `ROW_GROUP_SIZE_BYTES` needs `SET preserve_insertion_order=false` (DuckDB binder). We deliberately do
+      NOT set that on our COPY connection — it would silently break `SORTED BY` writes; DuckDB's error surfaces.
+    - **STILL OPEN from (1):** bloom-filter columns for the EW codec are expressible, but on `native_write`
+      DuckDB has no PER-COLUMN bloom option at all (`WRITE_BLOOM_FILTER true` is hardcoded), so
+      `parquet_bloom_filter_columns` is silently codec-only — the shape to fix is `write_bloom_filter` +
+      `bloom_filter_false_positive_ratio` on the native path. `compression_level` is also still unexposed.
+  - **(1-original) EVERY parquet option must be expressible in `CREATE TABLE … WITH (…)`, INCLUDING bloom-filter
     columns for the EW codec.** Today `WITH (parquet_compression=…, parquet_row_group_size=…,
     parquet_bloom_filter_columns=…)` is the DuckLake-parity set gated by `verify_with_options`; confirm each
     reaches BOTH engines (⚠ the codec and native paths take different routes — see the void measurement below)

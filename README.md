@@ -1337,6 +1337,26 @@ locally, but is worth re-checking on remote storage.
 Partitioned tables are batched as well — the partition value is not stored in the data files, so it travels
 alongside them and is applied in the same query.
 
+### Parquet write options (Delta)
+
+Settable per table with `CREATE TABLE ... WITH (...)`, per session with `SET delta_write_options`, or as an
+ATTACH default — same names on all three, most specific wins.
+
+| option | engines |
+|---|---|
+| `parquet_compression` | both |
+| `parquet_row_group_size` (rows) | both |
+| `parquet_row_group_size_bytes` | both — ⚠ DuckDB requires `SET preserve_insertion_order=false` |
+| `parquet_version` (`V1`/`V2`) | both |
+| `parquet_bloom_filter_columns` | engineered-wood codec only |
+| `parquet_dictionary_size_limit` (distinct values) | `native_write` only |
+
+`parquet_row_groups_per_file` and `parquet_file_size_bytes` are **recognised but refused**: DuckDB cannot
+rotate files together with `PARTITION_BY`, and without partitioning it writes a directory where a Delta
+`add` action must name a single file. Use the row-group options to control file layout instead.
+
+An option an engine cannot honour is always an error, never silently ignored.
+
 The stable row-tracking columns (`__delta_row_id`, `__delta_row_commit_version`) are batched too, including
 tables where some files store those values and others derive them.
 

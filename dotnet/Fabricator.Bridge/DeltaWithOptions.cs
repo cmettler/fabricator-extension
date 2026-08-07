@@ -33,6 +33,24 @@ internal sealed record DeltaWithOptions
 {
     public string? Compression { get; init; }
     public int? RowGroupSize { get; init; }
+
+    /// <summary>Target BYTES per row group — DuckDB <c>ROW_GROUP_SIZE_BYTES</c>, EW <c>RowGroupMaxBytes</c>.</summary>
+    public long? RowGroupSizeBytes { get; init; }
+
+    /// <summary>Start a new file after this many row groups (DuckDB <c>ROW_GROUPS_PER_FILE</c>). Native only.</summary>
+    public long? RowGroupsPerFile { get; init; }
+
+    /// <summary>Max DISTINCT VALUES per dictionary (DuckDB <c>DICTIONARY_SIZE_LIMIT</c>). Native only — ⚠ NOT
+    /// EW's <c>DictionaryPageSizeLimit</c>, which is a BYTE limit (DuckDB spells that
+    /// <c>string_dictionary_page_size_limit</c>).</summary>
+    public long? DictionarySizeLimit { get; init; }
+
+    /// <summary>Roll to a new data file once one reaches this many bytes (DuckDB <c>FILE_SIZE_BYTES</c>).
+    /// Native only.</summary>
+    public long? FileSizeBytes { get; init; }
+
+    /// <summary>Parquet format version (DuckDB <c>PARQUET_VERSION</c>, EW <c>DataPageVersion</c>).</summary>
+    public DeltaParquetVersion ParquetVersion { get; init; } = DeltaParquetVersion.Default;
     public IReadOnlyList<string>? BloomFilterColumns { get; init; }
 
     public bool? DeletionVectors { get; init; }
@@ -46,6 +64,9 @@ internal sealed record DeltaWithOptions
     public IReadOnlyDictionary<string, string>? Properties { get; init; }
 
     public bool HasWriteTuning => Compression is not null || RowGroupSize is not null
+                                  || RowGroupSizeBytes is not null || RowGroupsPerFile is not null
+                                  || DictionarySizeLimit is not null || FileSizeBytes is not null
+                                  || ParquetVersion != DeltaParquetVersion.Default
                                   || BloomFilterColumns is not null;
 
     public bool HasCreateFlagOverride => DeletionVectors is not null || ColumnMapping is not null
@@ -62,6 +83,8 @@ internal sealed record DeltaWithOptions
         }
         string? compression = null;
         int? rowGroup = null;
+        long? rowGroupBytes = null, rowGroupsPerFile = null, dictLimit = null, fileBytes = null;
+        DeltaParquetVersion parquetVersion = DeltaParquetVersion.Default;
         IReadOnlyList<string>? bloom = null;
         bool? dv = null, rt = null, cdf = null, ict = null;
         EngineeredWood.DeltaLake.Schema.ColumnMappingMode? cm = null;
@@ -87,6 +110,31 @@ internal sealed record DeltaWithOptions
                 case "parquet_bloom_filter_columns":
                 case "bloom_filter_columns":
                     bloom = SplitList(value);
+                    break;
+                case "parquet_row_group_size_bytes":
+                case "row_group_size_bytes":
+                    rowGroupBytes = ParseLongValue(key, value);
+                    break;
+                case "parquet_row_groups_per_file":
+                case "row_groups_per_file":
+                    rowGroupsPerFile = ParseLongValue(key, value);
+                    break;
+                case "parquet_dictionary_size_limit":
+                case "dictionary_size_limit":
+                    dictLimit = ParseLongValue(key, value);
+                    break;
+                case "parquet_file_size_bytes":
+                case "file_size_bytes":
+                    fileBytes = ParseLongValue(key, value);
+                    break;
+                case "parquet_version":
+                    parquetVersion = value.Trim().ToLowerInvariant() switch
+                    {
+                        "v1" or "1" => DeltaParquetVersion.V1,
+                        "v2" or "2" => DeltaParquetVersion.V2,
+                        _ => throw new ArgumentException(
+                            $"WITH parquet_version: unknown version '{value}' (expected 'V1' or 'V2')."),
+                    };
                     break;
                 case "deletion_vectors":
                     dv = ParseBoolValue(key, value);
@@ -154,7 +202,9 @@ internal sealed record DeltaWithOptions
                     }
                     throw new ArgumentException(
                         $"unknown CREATE TABLE WITH option '{key}' for the delta provider (supported: "
-                        + "parquet_compression, parquet_row_group_size, parquet_bloom_filter_columns, "
+                        + "parquet_compression, parquet_row_group_size, parquet_row_group_size_bytes, "
+                        + "parquet_row_groups_per_file, parquet_dictionary_size_limit, "
+                        + "parquet_file_size_bytes, parquet_version, parquet_bloom_filter_columns, "
                         + "deletion_vectors, column_mapping, row_tracking, change_data_feed, "
                         + "in_commit_timestamps, table_type, format, and quoted delta.*/fabricator.* "
                         + "table properties).");
@@ -164,6 +214,11 @@ internal sealed record DeltaWithOptions
         {
             Compression = compression,
             RowGroupSize = rowGroup,
+            RowGroupSizeBytes = rowGroupBytes,
+            RowGroupsPerFile = rowGroupsPerFile,
+            DictionarySizeLimit = dictLimit,
+            FileSizeBytes = fileBytes,
+            ParquetVersion = parquetVersion,
             BloomFilterColumns = bloom,
             DeletionVectors = dv,
             ColumnMapping = cm,
@@ -243,6 +298,12 @@ internal sealed record DeltaWithOptions
         "false" or "f" or "0" => false,
         _ => throw new ArgumentException($"WITH {key}: expected a boolean (true/false), got '{value}'."),
     };
+
+    private static long ParseLongValue(string key, string value)
+        => long.TryParse(value, System.Globalization.NumberStyles.Integer,
+                         System.Globalization.CultureInfo.InvariantCulture, out var v) && v >= 0
+            ? v
+            : throw new ArgumentException($"WITH {key}: expected a non-negative integer, got '{value}'.");
 
     private static int ParseIntValue(string key, string value)
     {

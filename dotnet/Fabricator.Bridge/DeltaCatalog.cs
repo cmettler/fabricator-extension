@@ -216,6 +216,11 @@ public sealed class DeltaCatalog : IBackendCatalog
     private readonly string? _defaultCompression;
     private readonly int? _defaultRowGroupSize;
     private readonly IReadOnlyList<string>? _defaultBloomColumns;
+    private readonly long? _defaultRowGroupSizeBytes;
+    private readonly long? _defaultRowGroupsPerFile;
+    private readonly long? _defaultDictionarySizeLimit;
+    private readonly long? _defaultFileSizeBytes;
+    private readonly DeltaParquetVersion _defaultParquetVersion;
     // ATTACH option `merge_schema true`: an append whose incoming data has columns absent from the table
     // auto-evolves the schema (nullable AddColumn) before writing. Overridable per statement via the
     // delta_write_options setting's "merge_schema". (replace_where is per-statement only — the setting.)
@@ -301,6 +306,12 @@ public sealed class DeltaCatalog : IBackendCatalog
         _defaultCompression = ParseStringOption(optionsJson, "compression");
         _defaultRowGroupSize = ParseIntOption(optionsJson, "row_group_size");
         _defaultBloomColumns = ParseListOption(optionsJson, "bloom_filter_columns");
+        _defaultRowGroupSizeBytes = ParseLongOption(optionsJson, "row_group_size_bytes");
+        _defaultRowGroupsPerFile = ParseLongOption(optionsJson, "row_groups_per_file");
+        _defaultDictionarySizeLimit = ParseLongOption(optionsJson, "dictionary_size_limit");
+        _defaultFileSizeBytes = ParseLongOption(optionsJson, "file_size_bytes");
+        _defaultParquetVersion = ParseParquetVersion(ParseStringOption(optionsJson, "parquet_version"))
+                                 ?? DeltaParquetVersion.Default;
         _mergeSchemaOnWrite = ParseBoolOption(optionsJson, "merge_schema");
         _nativeRead = ParseBoolOption(optionsJson, "native_read", nativeDefaults.Read);
         _nativeWrite = ParseBoolOption(optionsJson, "native_write", nativeDefaults.Write);
@@ -576,6 +587,75 @@ public sealed class DeltaCatalog : IBackendCatalog
         return int.TryParse(s, out var v) ? v : (int?)null;
     }
 
+    /// <summary>Refuses a write option the CONFIGURED ENGINE cannot honour. ⚠ The engine must be read from
+    /// the catalog's own <c>native_write</c>, NOT inferred from whether an <c>IDataFileWriter</c> was passed:
+    /// a native CTAS writes its files through DuckDB's COPY on a separate route and still opens
+    /// engineered-wood with no writer, so that inference refuses valid options on the DEFAULT provider
+    /// (measured — it did exactly that). Refusing beats accepting-and-dropping: a write option that silently
+    /// does nothing leaves the user believing the file was written as asked.</summary>
+    private DeltaWriteSpec? ValidateSpecForEngine(DeltaWriteSpec? spec)
+    {
+        if (spec is null)
+        {
+            return spec;
+        }
+        // ⚠ FILE-ROTATING OPTIONS ARE REFUSED ON EVERY PATH, and each path has its OWN measured reason —
+        // this is not one guess applied three times:
+        //   • native, NOT partitioned — DuckDB treats the target as a DIRECTORY and writes
+        //     `<name>.parquet/data_0.parquet` into it while the Delta `add` records `<name>.parquet`. The
+        //     commit SUCCEEDS and the table's data file is a directory: SILENT CORRUPTION.
+        //   • native, PARTITIONED — DuckDB refuses outright: "Can't combine file rotation (e.g.,
+        //     ROW_GROUPS_PER_FILE) and PARTITION_BY for COPY". (Worth stating because the partitioned write
+        //     ALREADY targets a directory and ReadFileStats already registers one `add` per RETURN_STATS row,
+        //     so our side would have coped — the limit is upstream's, not ours.)
+        //   • engineered-wood codec — no equivalent at all.
+        // ⇒ there is no path on which these can be honoured today. Refusing beats accepting-and-dropping: a
+        // write option that silently does nothing leaves the user believing the file was written as asked.
+        if (spec.RowGroupsPerFile is not null || spec.FileSizeBytes is not null)
+        {
+            throw new System.ArgumentException(
+                (spec.RowGroupsPerFile is not null ? "parquet_row_groups_per_file" : "parquet_file_size_bytes")
+                + " is not supported: DuckDB cannot rotate files together with PARTITION_BY, and without "
+                + "partitioning it writes a DIRECTORY where a Delta `add` action must name one file. Use "
+                + "parquet_row_group_size / parquet_row_group_size_bytes to control row-group size instead.");
+        }
+        if (_nativeWrite)
+        {
+            return spec;
+        }
+        // Engine-specific: no engineered-wood equivalent, so refuse rather than accept-and-drop — a write
+        // option that silently does nothing leaves the user believing the file was written as asked.
+        if (spec.DictionarySizeLimit is not null)
+        {
+            throw new System.ArgumentException(
+                "parquet_dictionary_size_limit is only supported with native_write (DuckDB's parquet "
+                + "writer); this catalog uses the engineered-wood codec, which has no equivalent (its "
+                + "DictionaryPageSizeLimit is a BYTE limit, not a distinct-value cap). Attach with "
+                + "PROVIDER 'delta' (native_write is its default), or drop the option.");
+        }
+        return spec;
+    }
+
+    private static long? ParseLongOption(string? optionsJson, string key)
+    {
+        var s = ParseStringOption(optionsJson, key);
+        return long.TryParse(s, out var v) ? v : (long?)null;
+    }
+
+    /// <summary>Parses a PARQUET_VERSION option value; null when absent so the caller keeps its fallback.
+    /// ⚠ An unrecognised value THROWS rather than falling back to a default — a silently ignored write option
+    /// is the failure mode this whole surface exists to avoid.</summary>
+    private static DeltaParquetVersion? ParseParquetVersion(string? value)
+        => string.IsNullOrWhiteSpace(value)
+            ? null
+            : value.Trim().ToLowerInvariant() switch
+            {
+                "v1" or "1" => DeltaParquetVersion.V1,
+                "v2" or "2" => DeltaParquetVersion.V2,
+                _ => throw new System.ArgumentException(
+                    $"parquet_version: unknown version '{value}' (expected 'V1' or 'V2')."),
+            };
+
     /// <summary>Reads a list ATTACH option — a JSON array OR a comma-separated string (null if absent/empty).</summary>
     private static IReadOnlyList<string>? ParseListOption(string? optionsJson, string key)
     {
@@ -648,16 +728,30 @@ public sealed class DeltaCatalog : IBackendCatalog
         string? compression = _defaultCompression;
         int? rowGroup = _defaultRowGroupSize;
         IReadOnlyList<string>? bloom = _defaultBloomColumns;
+        // The further parquet knobs, same precedence chain as the three above: ATTACH default <
+        // delta_write_options < the per-table WITH (applied by ApplyWithOptions).
+        long? rowGroupBytes = _defaultRowGroupSizeBytes;
+        long? rowGroupsPerFile = _defaultRowGroupsPerFile;
+        long? dictLimit = _defaultDictionarySizeLimit;
+        long? fileBytes = _defaultFileSizeBytes;
+        var parquetVersion = _defaultParquetVersion;
         IReadOnlyList<string>? settingPartition = null;
         IReadOnlyDictionary<string, string>? replaceWhere = null;
         // schema_mode precedence: per-catalog merge_schema default < delta_write_options (merge_schema / schema_mode)
         // < the per-statement COPY SCHEMA_MODE arg.
         var schemaMode = _mergeSchemaOnWrite ? DeltaSchemaMode.Merge : DeltaSchemaMode.None;
+        // (the engine check runs on the assembled spec at the end — see ValidateSpecForEngine)
 
         if (!string.IsNullOrWhiteSpace(sessionJson))
         {
             compression = ParseStringOption(sessionJson, "compression") ?? compression;
             rowGroup = ParseIntOption(sessionJson, "row_group_size") ?? rowGroup;
+            rowGroupBytes = ParseLongOption(sessionJson, "row_group_size_bytes") ?? rowGroupBytes;
+            rowGroupsPerFile = ParseLongOption(sessionJson, "row_groups_per_file") ?? rowGroupsPerFile;
+            dictLimit = ParseLongOption(sessionJson, "dictionary_size_limit") ?? dictLimit;
+            fileBytes = ParseLongOption(sessionJson, "file_size_bytes") ?? fileBytes;
+            parquetVersion = ParseParquetVersion(ParseStringOption(sessionJson, "parquet_version"))
+                             ?? parquetVersion;
             bloom = ParseListOption(sessionJson, "bloom_filter_columns") ?? bloom;
             settingPartition = ParseListOption(sessionJson, "partition_by");
             replaceWhere = ParseMapOption(sessionJson, "replace_where"); // partition col -> value (per-statement)
@@ -670,11 +764,21 @@ public sealed class DeltaCatalog : IBackendCatalog
         var codec = ParseCompression(compression);
 
         if (codec is null && rowGroup is null && bloom is null && (partition is null || partition.Count == 0)
-            && (replaceWhere is null || replaceWhere.Count == 0) && schemaMode == DeltaSchemaMode.None)
+            && (replaceWhere is null || replaceWhere.Count == 0) && schemaMode == DeltaSchemaMode.None
+            && rowGroupBytes is null && rowGroupsPerFile is null && dictLimit is null && fileBytes is null
+            && parquetVersion == DeltaParquetVersion.Default)
         {
             return null;
         }
-        return new DeltaWriteSpec(codec, rowGroup, bloom, partition, replaceWhere, schemaMode);
+        return ValidateSpecForEngine(new DeltaWriteSpec(codec, rowGroup, bloom, partition, replaceWhere,
+                                                        schemaMode)
+        {
+            RowGroupSizeBytes = rowGroupBytes,
+            RowGroupsPerFile = rowGroupsPerFile,
+            DictionarySizeLimit = dictLimit,
+            FileSizeBytes = fileBytes,
+            ParquetVersion = parquetVersion,
+        });
     }
 
     /// <summary>Maps a SCHEMA_MODE string (case-insensitive) to <see cref="DeltaSchemaMode"/>; unknown => None.</summary>
@@ -2282,7 +2386,7 @@ public sealed class DeltaCatalog : IBackendCatalog
 
     /// <summary>Overlays the WITH clause's write tuning + delta.*/fabricator.* properties onto the resolved
     /// write spec (WITH wins per key — the strongest layer above delta_write_options and the ATTACH defaults).</summary>
-    private static DeltaWriteSpec? ApplyWithOptions(DeltaWriteSpec? spec, DeltaWithOptions? w)
+    private DeltaWriteSpec? ApplyWithOptions(DeltaWriteSpec? spec, DeltaWithOptions? w)
     {
         if (w is null || (!w.HasWriteTuning && w.Properties is not { Count: > 0 }))
         {
@@ -2307,11 +2411,31 @@ public sealed class DeltaCatalog : IBackendCatalog
         {
             spec = spec with { BloomFilterColumns = bloom };
         }
+        if (w.RowGroupSizeBytes is { } rgb)
+        {
+            spec = spec with { RowGroupSizeBytes = rgb };
+        }
+        if (w.RowGroupsPerFile is { } rgpf)
+        {
+            spec = spec with { RowGroupsPerFile = rgpf };
+        }
+        if (w.DictionarySizeLimit is { } dsl)
+        {
+            spec = spec with { DictionarySizeLimit = dsl };
+        }
+        if (w.FileSizeBytes is { } fsb)
+        {
+            spec = spec with { FileSizeBytes = fsb };
+        }
+        if (w.ParquetVersion != DeltaParquetVersion.Default)
+        {
+            spec = spec with { ParquetVersion = w.ParquetVersion };
+        }
         if (w.Properties is { Count: > 0 } props)
         {
             spec = spec with { CreateProperties = props };
         }
-        return spec;
+        return ValidateSpecForEngine(spec);
     }
 
     /// <summary>Creates an empty Delta table (commit 0 with the schema). Idempotent (OpenOrCreate), so

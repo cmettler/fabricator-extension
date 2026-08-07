@@ -340,7 +340,27 @@ internal sealed record DeltaWriteSpec(
     // CREATE TABLE ... WITH (...) delta.*/fabricator.* property keys (original case), merged into the
     // CREATE's table configuration LAST (a WITH property wins over a derived key). Create-time only —
     // ignored when the write doesn't create the table.
-    IReadOnlyDictionary<string, string>? CreateProperties = null);
+    IReadOnlyDictionary<string, string>? CreateProperties = null,
+    // ---- further parquet write tuning (2026-08-07) ----
+    // ⚠ Only the first two are expressible on BOTH engines. The rest are DuckDB COPY options with no
+    // engineered-wood equivalent, so DeltaWriter.Options REFUSES them on the codec engine rather than
+    // accepting and dropping them — an option that silently does nothing is worse than one that errors.
+    long? RowGroupSizeBytes = null,      // native ROW_GROUP_SIZE_BYTES  <-> EW RowGroupMaxBytes
+    DeltaParquetVersion ParquetVersion = DeltaParquetVersion.Default, // native PARQUET_VERSION <-> EW DataPageVersion
+    long? RowGroupsPerFile = null,       // native ROW_GROUPS_PER_FILE — native only
+    long? DictionarySizeLimit = null,    // native DICTIONARY_SIZE_LIMIT — native only, see the note below
+    long? FileSizeBytes = null);         // native FILE_SIZE_BYTES — native only
+
+/// <summary>Parquet format version for the data files (DuckDB's <c>PARQUET_VERSION</c>; engineered-wood's
+/// <c>DataPageVersion</c>). <see cref="Default"/> means "leave each engine on its own default", which is NOT
+/// the same value on both — DuckDB writes V1 pages, engineered-wood writes V2 — so an unset option must not be
+/// rendered rather than being normalised to one of them.</summary>
+internal enum DeltaParquetVersion
+{
+    Default = 0,
+    V1,
+    V2,
+}
 
 /// <summary>
 /// Writes a Delta Lake table via engineered-wood through the host FileSystem (the <see cref="DuckDbTableFileSystem"/>
@@ -412,6 +432,16 @@ internal static class DeltaWriter
         {
             OmitPathInSchema = false, // REQUIRED field — standard readers (DuckDB/arrow-rs/Fabric) reject without it
             RowGroupMaxRows = spec?.RowGroupSize ?? 122880, // default = DuckDB's row-group size
+            // ⚠ EW's own default is 128 MiB; DuckDB's ROW_GROUP_SIZE_BYTES default is row_group_size * 1024.
+            // Leave EW on its default when unset rather than importing DuckDB's — an unset option must not
+            // silently change the codec engine's behaviour.
+            RowGroupMaxBytes = spec?.RowGroupSizeBytes ?? (128L * 1024 * 1024),
+            DataPageVersion = spec?.ParquetVersion switch
+            {
+                DeltaParquetVersion.V1 => EngineeredWood.Parquet.DataPageVersion.V1,
+                DeltaParquetVersion.V2 => EngineeredWood.Parquet.DataPageVersion.V2,
+                _ => EngineeredWood.Parquet.DataPageVersion.V2, // EW's own default
+            },
             Compression = spec?.Compression ?? EngineeredWood.Compression.CompressionCodec.Snappy,
             BloomFilterColumns = spec?.BloomFilterColumns is { Count: > 0 } bloom
                 ? new HashSet<string>(bloom, System.StringComparer.Ordinal)
