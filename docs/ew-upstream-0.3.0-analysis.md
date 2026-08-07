@@ -285,6 +285,25 @@ MEASURED after: all three write paths produce 3 checkpoints on 26 commits — au
 explicit transaction, and the batch append — each with a `_last_checkpoint`, where the first two produced
 **0** before.
 
+**MEASURED WHAT IT BUYS (2026-08-07), and the two legs disagree in a way that is itself the lesson.** Same
+table, same 81 commits, only the checkpoint objects differ — timed with them present, then again after
+deleting the 8 checkpoint parquets and `_last_checkpoint`:
+
+| transport | with checkpoints | without | delta |
+|---|---|---|---|
+| **MinIO / localhost** | 2708 / 2714 / 2787 ms | 3112 / 2952 / 2989 ms | **≈275 ms (9%), ranges disjoint** |
+| **local filesystem** | 368 / 341 / 328 ms | 360 / 325 / 406 ms | **VOID — ranges overlap** |
+
+≈3.8 ms per commit skipped on localhost MinIO. ⚠ **The local leg is VOID, not negative**: ~300 ms of
+process start and CLR boot dominates and local JSON reads cost nothing, so that measurement cannot see the
+variable under test. **Checkpoints are an object-store optimisation and a local A/B will never show one** —
+worth knowing before someone repeats the local run and concludes the fix is worthless.
+
+⚠ Both numbers are a FLOOR: the saving is one round trip per skipped commit file, so it scales with real
+object-store latency (this is localhost) and with commit count. And holding the commit count fixed
+UNDERSTATES it, because the compounding half is that without checkpoints the log can never be cleaned
+either — so on a DML-only table the count itself grows without bound.
+
 ⚠ **No public `CheckpointAsync()` was added, although upstream's issue proposes one.** The condition is
 `version % CheckpointInterval == 0` on the ABSOLUTE version, so an existing under-checkpointed table
 SELF-HEALS within one interval; an uncalled public API would be divergence for nothing. If a host ever
