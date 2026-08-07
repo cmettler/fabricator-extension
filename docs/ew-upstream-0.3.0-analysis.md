@@ -596,6 +596,44 @@ described window. We are protected today, but INDIRECTLY: `DiscardDataFilesAsync
 refuses anything it references. That is a re-read per rollback where a callback would be exact.
 Only reachable by constructing the request ourselves ⇒ Phase C, not free.
 
+### 4b.6 RESUMING 4b — the concrete plan, so it is not re-derived
+
+**Do 4b.2 FIRST, and this ordering is not arbitrary.** 4b.2 is a *behaviour change already shipped* in the
+0.3.0 pin (pushed, all tiers green) that nothing tests in either direction; 4b.1 is a cleanup that changes
+nothing a user sees. Verifying what we already shipped outranks tidying what we already have.
+
+**4b.2 — append vs a concurrent metadata change.** The test shape, which needs care because sqllogictest
+runs connections SEQUENTIALLY and the window has to be opened deliberately:
+
+```
+con1: BEGIN; INSERT INTO t VALUES (…);      -- pins the base snapshot, writes files eagerly, commits nothing
+con2: SELECT fabricator_delta_set_tblproperties('cat', 'main.t', '{"custom.k":"v"}');   -- lands a metaData
+con1: COMMIT;                                -- ← does this now conflict where it used to succeed?
+```
+The buffered path is REQUIRED: an autocommit INSERT has no window between pinning and committing. Assert
+BOTH directions — that the metadata change is what causes it (a control run without con2 must commit) —
+and pin whichever answer is real rather than the one expected. ⚠ Upstream's own note says a host depending
+on the old permissiveness should ask for *"a public opt-out on the request rather than a quiet revert"*, so
+if this turns out to break a real shape, the ask is upstream-shaped, not a local patch.
+
+**4b.1 — the deletion is ~25 lines and is BLOCKED on the diagnostic, not on the code.** Three options, in
+preference order:
+1. **Offer upstream an attempt/conflict callback on `LogCommitRequest`** (it already carries
+   `OnCommitDurable`, so the shape is established and the change is small), then delete our loop and log
+   from the callback. Matches the "prefer upstream" stance and is the only option that keeps both
+   properties.
+2. Delete the loop and accept losing the signal. ⚠ **This breaks a documented METHOD, not just a log line**:
+   [delta-transactions.md](delta-transactions.md) §8.1 uses the retry COUNT to declare a multi-writer run
+   non-void, so without it a run whose writers merely serialized is indistinguishable from one where the
+   commit guard fired.
+3. Keep it, with a comment saying it is deliberately redundant and why. The only cost is 16 × 16 attempts
+   under extreme contention — which nothing has ever hit.
+**Until (1) lands, (3) is the correct state and the loop should NOT be deleted.** Leaving it there is not
+an oversight; deleting it without a replacement signal would be.
+
+**4b.3 (`OnCommitDurable`) is Phase C**, not 4b: it needs us to construct `LogCommitRequest` ourselves,
+which is the `LogCommitter` architectural decision.
+
 ### 4b.4 ❌ READ-YOUR-WRITES IS **NOT** SIMPLIFIABLE, and this is the firm answer
 
 `DeltaTransaction.Snapshot => _baseSnapshot` is unchanged at 0.3.0, and the class doc still says
