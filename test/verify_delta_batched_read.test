@@ -324,8 +324,16 @@ SELECT count(*), sum(id), count(DISTINCT p) FROM b.main.parts;
 59	1765	3
 
 # ============================================================================
-# 6b. ROW-TRACKING VIRTUAL COLUMNS — still gated off the batch (derived per file from baseRowId, not
-#     stored). Asserted so a gate that silently produced wrong ids would not look like a gate that works.
+# 6b. ROW-TRACKING VIRTUAL COLUMNS — batched since 2026-08-07. They were gated on a reason that had gone
+#     STALE: it was entirely about the field-id `schema` map (a materialized __delta_row_id is not
+#     column-mapped, so it has no field id to key by), and this form abandoned that map for
+#     `union_by_name` long before. Under name resolution the materialized column is just another column,
+#     and baseRowId / defaultRowCommitVersion are per-FILE constants that ride the metadata input like
+#     file_ord — so COALESCE(materialized, baseRowId + file_row_number) is expressible in one query.
+#     ⚠ The mixed case below is the one that matters: an UPDATE writes a post-image file that
+#     MATERIALIZES ids, so the scan spans files that store the column and files that do not.
+#     union_by_name NULL-fills the latter, which is exactly the COALESCE's fallthrough — a test on a
+#     table where every file agrees would pass without exercising that at all.
 # ============================================================================
 
 query II
@@ -337,6 +345,46 @@ query I
 SELECT count(*) FROM b.main.many WHERE __delta_row_id IS NULL;
 ----
 0
+
+statement ok
+CREATE TABLE b.main.trk AS SELECT i::BIGINT AS id FROM range(100) r(i);
+
+statement ok
+INSERT INTO b.main.trk SELECT i::BIGINT FROM range(100, 200) r(i);
+
+# Derived-only so far: every file carries baseRowId, none stores the materialized column.
+query IIII
+SELECT count(*), count(DISTINCT __delta_row_id), min(__delta_row_id), max(__delta_row_id) FROM b.main.trk;
+----
+200	200	0	199
+
+# Two appends => two commit versions, and the version column reads its own per-file constant.
+query I
+SELECT count(DISTINCT __delta_row_commit_version) FROM b.main.trk;
+----
+2
+
+# NOW the mixed case: the post-image file materializes the ids of the rows it rewrites.
+statement ok
+UPDATE b.main.trk SET id = id + 10000 WHERE id % 37 = 0;
+
+query III
+SELECT count(*), count(DISTINCT __delta_row_id), count(*) FILTER (WHERE __delta_row_id IS NULL) FROM b.main.trk;
+----
+200	200	0
+
+# The whole point of materializing: a rewritten row KEEPS its original stable id. Six rows moved
+# (i % 37 = 0 over 0..199), and their ids must still fall in the original 0..199 range rather than
+# being re-derived from the new file's position.
+query II
+SELECT count(*), max(__delta_row_id) FROM b.main.trk WHERE id >= 10000;
+----
+6	185
+
+query II
+SELECT min(__delta_row_id), max(__delta_row_id) FROM b.main.trk;
+----
+0	199
 
 # ============================================================================
 # 7. ID-MODE COLUMN MAPPING — gated off the batch, and this section is a POSITIVE CONTROL
@@ -458,3 +506,76 @@ SELECT count(*), count(*) FILTER (WHERE s <> 'v'||id) FROM b.main.rg;
 
 statement ok
 RESET delta_write_options;
+
+# ============================================================================
+# 9. NO BOUND-INPUT VIEW IS LEFT BEHIND. Every Arrow input we hand the host is registered by
+#    duckdb_arrow_scan as a CATALOG-level (NOT temporary) view, so it outlives the connection AND the
+#    stream that owns its storage — a stale one is a view pointing at freed memory, not just clutter.
+#    BoundInput gives each a unique name and drops it after use; nothing else enforces that, which is
+#    why this section exists. Covers the scan-side inputs (deletion vectors, per-file metadata), the
+#    native-write COPY source, and the SORTED BY sort input — the last being the only site whose drop
+#    is deferred to stream Dispose rather than a finally.
+# ============================================================================
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/brv' AS lv (TYPE fabricator, PROVIDER 'delta');
+
+# POSITIVE CONTROL FIRST: prove the pattern below can actually match. A LIKE/ESCAPE that quietly
+# matches nothing would make every assertion here pass for the wrong reason.
+statement ok
+CREATE VIEW __fab_control AS SELECT 1;
+
+query I
+SELECT count(*) FROM duckdb_views() WHERE view_name LIKE '\_\_fab%' ESCAPE '\';
+----
+1
+
+statement ok
+DROP VIEW __fab_control;
+
+statement ok
+CREATE TABLE lv.main.t AS SELECT i::BIGINT AS id, ('v'||i)::VARCHAR AS s FROM range(500) r(i);
+
+statement ok
+INSERT INTO lv.main.t SELECT i::BIGINT, ('v'||i)::VARCHAR FROM range(500, 1000) r(i);
+
+# A deletion vector, so a scan binds the DV input.
+statement ok
+DELETE FROM lv.main.t WHERE id % 100 = 0;
+
+query I
+SELECT count(*) FROM lv.main.t;
+----
+990
+
+# A pushed filter (HostBatchFilter binds its own input on some paths).
+query I
+SELECT count(*) FROM lv.main.t WHERE id > 400 AND s <> 'x';
+----
+594
+
+# A rowid scan, so the per-file metadata input is bound with the file ordinal.
+statement ok
+UPDATE lv.main.t SET s = 'u' WHERE id = 7;
+
+# A SORTED BY write — the sort input's drop is deferred to Dispose, so it is the one that would leak
+# if the wrapper were removed.
+statement ok
+CREATE TABLE lv.main.srt AS SELECT i::BIGINT AS id FROM range(200) r(i);
+
+statement ok
+ALTER TABLE lv.main.srt SET SORTED BY (id);
+
+statement ok
+INSERT INTO lv.main.srt SELECT i::BIGINT FROM range(200, 400) r(i);
+
+query I
+SELECT count(*) FROM lv.main.srt;
+----
+400
+
+# After all of that, the catalog must hold none of ours.
+query I
+SELECT count(*) FROM duckdb_views() WHERE view_name LIKE '\_\_fab%' ESCAPE '\';
+----
+0

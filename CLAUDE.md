@@ -610,12 +610,20 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     ATTACH defaults, which is exactly the half a dbt user sets once. Thread the catalog's open-options
     through instead — **the SAME structural change the `native_read` item in the streaming audit needs, so do
     them together.**
-  - **⚠ A MEASUREMENT HERE WAS VOID AND IS NOT AN ANSWER:** `SET delta_write_options='{"compression":"zstd"}'`
-    on `PROVIDER 'delta'` produced SNAPPY data files, but under `native_write` DuckDB's COPY writes them and
-    EW's `ParquetWriteOptions` never apply — while `verify_with_options` proves the per-table
-    `WITH (parquet_compression=…)` DOES work on that path. So the session setting may simply not reach the
-    native COPY (a fourth gap) or the two option routes may legitimately differ. **UNVERIFIED — settle it
-    before designing the surface**, because it decides whether `SET` and `WITH` are even equivalent today.
+  - **⚠ THAT VOID MEASUREMENT IS NOW SETTLED (2026-08-07), AND ITS SUSPICION WAS WRONG — the "fourth gap" does
+    not exist.** It had read: *"`SET delta_write_options='{"compression":"zstd"}'` on `PROVIDER 'delta'` produced
+    SNAPPY data files … so the session setting may simply not reach the native COPY"*. **It does reach it.**
+    MEASURED per file: with that SET, a CTAS on `PROVIDER 'delta'` (native COPY) writes **ZSTD**, as does the
+    per-table `WITH (parquet_compression='zstd')` and as does the codec engine. `SET` and `WITH` ARE equivalent
+    on the statement's own write, so the surface question can be decided on merits rather than on plumbing.
+  - **⚠ THE REAL AXIS IS *WHICH WRITE*, NOT `SET`-vs-`WITH` — and it is now MEASURED ON THE NATIVE ENGINE, not
+    just reasoned or seen on the codec.** With the SET in force on `PROVIDER 'delta'`: CTAS/INSERT files
+    **ZSTD**, the merge-on-read UPDATE's post-image file **SNAPPY**, and **OPTIMIZE's compaction output
+    SNAPPY** (before: 6 ZSTD chunks and zero SNAPPY; after: the same 6 plus 4 SNAPPY, the compacted file). So
+    this file's prediction that *"OPTIMIZE is the one that stings — it rewrites the MAJORITY of a table's bytes,
+    so it actively undoes the setting it was configured for"* is CONFIRMED rather than inferred, and it is not a
+    codec-only defect. Cause is unchanged: `ResolveWriteSpec` lives on the `DeltaCatalog` INSTANCE while ~33
+    bare `DeltaWriter.Options()` opens sit in the STATIC `DeltaReader` and pass no spec.
 - **THE STREAMING/BUFFERING AUDIT — AGREED, NOT STARTED (user, 2026-08-06). A whole-codebase pass over EVERY
   path that holds batches, `Materialize` first.** The UPDATE work (grouped flush → unboxed input) kept turning
   up buffering that nobody had decided on, so the remaining ones get looked at deliberately rather than one at
@@ -2095,11 +2103,22 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     - It gives up the DV's PRUNABLE BOUND (one WHERE cannot carry a per-file range). Deliberate, and the evidence
       is already in `DvRangeCondition`: its own A/B found that bound "demonstrably works and does not show up in
       wall time". ⚠ Re-measure on REMOTE storage with a mostly-deleted file before calling it free there.
-    - Still per-file: `column_mapping 'id'`, the row-tracking virtual columns (a materialized id has no field id
-      AND `union_by_name` cannot declare one — but ⚠ that reason went STALE when the form switched to
-      `union_by_name`, see the class remarks), nested STRUCT columns in the full form (the plain `schema`-map
-      form still handles those), and any scan with a rowid/tracking fast-path filter. **Partitioned tables came
-      OFF this list 2026-08-07** — see the upstream-bug entry above.
+    - Still per-file: `column_mapping 'id'`, nested STRUCT columns in the full form (the plain `schema`-map form
+      still handles those), and any scan with a rowid/tracking fast-path filter (its whole value is per-file
+      row-group pruning, and one call has one WHERE). **Partitioned tables AND the row-tracking virtual columns
+      both came OFF this list on 2026-08-07.**
+      - **THE ROW-TRACKING LIFT WAS PURE STALENESS — no new mechanism, just a gate nobody re-derived.** Its
+        stated reason (*"a materialized `__delta_row_id` is not column-mapped, so it has no field id to key by,
+        and a DuckDB `map` cannot mix INTEGER and VARCHAR keys"*) is entirely about the field-id `schema` map
+        that this form ABANDONED for `union_by_name`. Under name resolution the materialized column is just
+        another column, and `baseRowId`/`defaultRowCommitVersion` are per-FILE constants that ride the metadata
+        input like `file_ord` ⇒ `COALESCE(materialized, baseRowId + file_row_number)` in one query.
+      - **⚠ THE CASE THAT MATTERS IS A *MIXED* TABLE, and a test on a uniform one proves nothing.** An UPDATE's
+        post-image file MATERIALIZES ids while the untouched files derive them, so the scan spans both;
+        `union_by_name` NULL-fills the files that lack the column, which is exactly the COALESCE's fallthrough.
+        MEASURED: 200 rows / 200 distinct ids / 0 NULLs, the 6 rewritten rows KEEPING their original ids
+        (max 185, range still 0–199), with `batched=4` in the log as the positive control that the batched path
+        was actually taken. Gate: `verify_delta_batched_read` §6b.
     - **⚠ A `count(*)` CONTROL PRODUCED A FALSE "IT WORKS" FOR THE THIRD TIME IN ONE SESSION.** The field-id +
       virtual-column combination was pronounced fine on a multi-file `count(*)` — which DuckDB answers without
       building the full mapping. Forcing a real decode reproduced the assertion immediately. **A parquet

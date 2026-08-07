@@ -1337,9 +1337,12 @@ locally, but is worth re-checking on remote storage.
 Partitioned tables are batched as well — the partition value is not stored in the data files, so it travels
 alongside them and is applied in the same query.
 
+The stable row-tracking columns (`__delta_row_id`, `__delta_row_commit_version`) are batched too, including
+tables where some files store those values and others derive them.
+
 Some shapes still read file by file and need no action from you: nested (`STRUCT`) columns when the row
-identity is also wanted, the `__delta_row_id` / `__delta_row_commit_version` columns, and tables using
-`column_mapping 'id'`. The last is a DuckDB limitation rather than ours.
+identity is also wanted, and tables using `column_mapping 'id'` — the latter a DuckDB limitation rather than
+ours.
 
 ## Diagnostic logging
 

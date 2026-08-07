@@ -345,7 +345,7 @@ internal static class DeltaNativeReader
                 // The FULL form first: field-id keys, so `filename` + `file_row_number` compose and the rowid,
                 // the deletion vectors and the partition values all fit in ONE call. It covers every file,
                 // deletion vectors included.
-                var full = TryFullForm(listing, dataCols, wantRowId, where, wantsTracking);
+                var full = TryFullForm(listing, dataCols, wantRowId, where);
                 if (full is not null)
                 {
                     return full;
@@ -487,23 +487,25 @@ internal static class DeltaNativeReader
         /// wrapping the query: a subquery, a plain CTE and even a MATERIALIZED one all still crash (measured —
         /// projection pushdown goes straight through). Add a bound column only together with the SQL that
         /// reads it.</para>
-        /// <para>⚠ <b>THE ROW-TRACKING GATE'S REASON IS STALE — RE-DERIVE IT BEFORE TRUSTING IT.</b> It was
-        /// written as structural: <i>"a materialized <c>__delta_row_id</c> is not column-mapped, so it has no
-        /// field id to key by, and a DuckDB <c>map</c> cannot mix INTEGER and VARCHAR keys"</i>. Every clause of
-        /// that is about the field-id <c>schema</c> map — which this form NO LONGER USES: it switched to
-        /// <c>union_by_name</c>, which resolves columns by NAME and needs no field ids. Under that, a
-        /// materialized <c>__delta_row_id</c> is just another column read by name, and <c>baseRowId</c> already
-        /// arrives on the bound metadata input this form binds for the rowid — so
-        /// <c>COALESCE(materialized, baseRowId + file_row_number)</c> looks EXPRESSIBLE here. The gate was not
+        /// <para><b>ROW TRACKING IS SERVED HERE (lifted 2026-08-07)</b> —
+        /// <c>COALESCE(materialized, baseRowId + file_row_number)</c> for the id, the per-file
+        /// <c>defaultRowCommitVersion</c> for the version, with both constants riding the metadata input like
+        /// <c>file_ord</c>. It had been gated on a reason that went stale: <i>"a materialized
+        /// <c>__delta_row_id</c> is not column-mapped, so it has no field id to key by, and a DuckDB
+        /// <c>map</c> cannot mix INTEGER and VARCHAR keys"</i> — every clause of which is about the field-id
+        /// <c>schema</c> map this form ABANDONED when it moved to <c>union_by_name</c>. The gate was simply not
         /// revisited when the mechanism under it changed, which is the "a stale justification stops the next
-        /// person looking" failure this codebase keeps recording. It stays only because lifting it is untested,
-        /// NOT because it is known to be impossible.</para>
+        /// person looking" failure this codebase keeps recording. ⚠ What makes it work is that the materialized
+        /// column is stored under its LITERAL name, so one <c>present</c> lookup answers it for the whole list,
+        /// and <c>union_by_name</c> NULL-fills the files that lack it — which is exactly the COALESCE's
+        /// fallthrough for a scan that MIXES materialized and derived files (an UPDATE's post-image file
+        /// materializes; the untouched files do not). A rowid/tracking fast-path FILTER is still excluded, one
+        /// gate earlier: its whole value is per-file row-group pruning, and one call has one WHERE.</para>
         /// </summary>
         private static BatchPlan? TryFullForm(
-            DeltaReader.NativeScanList listing, IReadOnlyList<string> dataCols, bool wantRowId, string? where,
-            bool wantsTracking)
+            DeltaReader.NativeScanList listing, IReadOnlyList<string> dataCols, bool wantRowId, string? where)
         {
-            if (wantsTracking || dataCols.Count == 0 || listing.TableSchema is null)
+            if (dataCols.Count == 0 || listing.TableSchema is null)
             {
                 return null;
             }
@@ -519,8 +521,19 @@ internal static class DeltaNativeReader
             var entries = new List<string>(dataCols.Count);
             var inner = new List<string>(dataCols.Count + 2);
             var wanted = new List<(string Logical, string Stored, DeltaSchema.StructField Field)>(dataCols.Count);
+            var trackingCols = new List<string>(2);
             foreach (var c in dataCols)
             {
+                if (string.Equals(c, RowTrackingIdColumn, StringComparison.Ordinal)
+                    || string.Equals(c, RowTrackingVersionColumn, StringComparison.Ordinal))
+                {
+                    // Virtual: not in the table schema at all. Its expression needs `present` (is the
+                    // materialized column stored in ANY file of this list?), which is resolved after this loop,
+                    // so only the name is recorded here. `inner` is order-insensitive — the outer SELECT names
+                    // its columns — so appending them later is free.
+                    trackingCols.Add(c);
+                    continue;
+                }
                 var field = FindField(listing.TableSchema, c);
                 if (field is null)
                 {
@@ -555,7 +568,7 @@ internal static class DeltaNativeReader
                 entries.Add(stored);
                 wanted.Add((c, stored, field));
             }
-            if (entries.Count == 0)
+            if (entries.Count == 0 && trackingCols.Count == 0)
             {
                 return null; // every requested column was a partition column: nothing to read from the files
             }
@@ -606,7 +619,30 @@ internal static class DeltaNativeReader
                     break;
                 }
             }
-            bool needsMeta = wantRowId || partitionCols.Count > 0;
+            // The row-tracking virtual columns, expressed exactly as the per-file path does (see RowTrackingExpr)
+            // but with the per-file constants arriving on the bound input instead of being inlined:
+            //   __delta_row_id             = COALESCE(materialized, baseRowId + file_row_number)
+            //   __delta_row_commit_version = COALESCE(materialized, defaultRowCommitVersion)
+            // ⚠ Two things make the batched form work where the per-file one needed a footer probe. (a) The
+            // materialized column is stored under its LITERAL name (materialized columns are not column-mapped),
+            // so one `present` lookup over the whole list answers it — and `union_by_name` NULL-fills the files
+            // that lack it, which is precisely the COALESCE's fallthrough. (b) baseRowId / commitVersion are
+            // per-FILE constants, so they ride the metadata input like `file_ord`. A file with neither reads
+            // NULL, same as before.
+            bool wantTrackId = ContainsName(trackingCols, RowTrackingIdColumn);
+            bool wantTrackVersion = ContainsName(trackingCols, RowTrackingVersionColumn);
+            foreach (var c in trackingCols)
+            {
+                bool isId = string.Equals(c, RowTrackingIdColumn, StringComparison.Ordinal);
+                string derived = isId
+                    ? "(__fab_f.base_row_id + __fab_rp.file_row_number)"
+                    : "__fab_f.commit_version";
+                string expr = present.Contains(c)
+                    ? $"COALESCE(__fab_rp.{Quote(c)}, {derived})"
+                    : derived;
+                inner.Add($"{expr} AS {Quote(c)}");
+            }
+            bool needsMeta = wantRowId || partitionCols.Count > 0 || trackingCols.Count > 0;
             if (wantRowId)
             {
                 inner.Add($"((__fab_f.file_ord << {TransientRowAddress.PositionBits}) | __fab_rp.file_row_number) "
@@ -675,7 +711,10 @@ internal static class DeltaNativeReader
                     {
                         list.Add((metaView,
                                   new SingleScanArrowStream(
-                                      MetaStream(files, partCols, listing, withFileOrdinal: wantRowId), metaView)));
+                                      MetaStream(files, partCols, listing, withFileOrdinal: wantRowId,
+                                                 withBaseRowId: wantTrackId,
+                                                 withCommitVersion: wantTrackVersion),
+                                      metaView)));
                     }
                     if (anyDv)
                     {
@@ -800,10 +839,13 @@ internal static class DeltaNativeReader
     /// together with the SQL that reads it.</para></summary>
     private static IArrowArrayStream MetaStream(
         IReadOnlyList<DeltaReader.NativeScanFile> files, IReadOnlyList<string> partitionCols,
-        DeltaReader.NativeScanList listing, bool withFileOrdinal)
+        DeltaReader.NativeScanList listing, bool withFileOrdinal, bool withBaseRowId = false,
+        bool withCommitVersion = false)
     {
         var fn = new StringArray.Builder();
         var ord = new Int64Array.Builder();
+        var baseRowId = new Int64Array.Builder();
+        var commitVersion = new Int64Array.Builder();
         var parts = new StringArray.Builder[partitionCols.Count];
         for (int i = 0; i < parts.Length; i++)
         {
@@ -813,6 +855,22 @@ internal static class DeltaNativeReader
         {
             fn.Append(f.Uri);
             ord.Append(f.Ordinal);
+            if (f.BaseRowId is { } brid)
+            {
+                baseRowId.Append(brid);
+            }
+            else
+            {
+                baseRowId.AppendNull();
+            }
+            if (f.CommitVersion is { } cv)
+            {
+                commitVersion.Append(cv);
+            }
+            else
+            {
+                commitVersion.AppendNull();
+            }
             for (int i = 0; i < parts.Length; i++)
             {
                 var field = FindField(listing.TableSchema, partitionCols[i]);
@@ -837,6 +895,19 @@ internal static class DeltaNativeReader
         {
             fields.Add(new Field("file_ord", Int64Type.Default, nullable: false));
             arrays.Add(ord.Build());
+        }
+        // ⚠ Each of these is emitted ONLY when the generated SQL reads it — the bound-input invariant (an
+        // unread column makes DuckDB ask the scan for a non-prefix column set, which segfaults). Nullable
+        // because a file may carry no row tracking at all, which is the NULL the COALESCE falls through to.
+        if (withBaseRowId)
+        {
+            fields.Add(new Field("base_row_id", Int64Type.Default, nullable: true));
+            arrays.Add(baseRowId.Build());
+        }
+        if (withCommitVersion)
+        {
+            fields.Add(new Field("commit_version", Int64Type.Default, nullable: true));
+            arrays.Add(commitVersion.Build());
         }
         for (int i = 0; i < parts.Length; i++)
         {
