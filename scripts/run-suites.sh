@@ -210,7 +210,17 @@ case "$TIER" in
         # The section pins the codec engine deliberately: under native_write DuckDB's COPY writes the data
         # files, so EW's ParquetWriteOptions never apply and the assertion would pass for the wrong reason.
         # Mutation-tested — reverting the spec on EnsureHeldTableAsync fails at exactly the CDF assertion.
-        : "${MIN_ASSERTIONS:=6689}"
+        # 6801 since 2026-08-07: verify_delta_catalog_transactions 965 -> 1021 (x2 legs), §41 — a concurrent
+        # METADATA change vs an open buffered transaction. The two buffered paths answer differently and the
+        # difference is where the commit's base snapshot comes from: the APPEND flush opens the table fresh at
+        # COMMIT so the concurrent range is empty and it commits; the DML path holds a transaction pinned at
+        # STATEMENT time so the range is non-empty and it conflicts. The append half is the one worth a gate —
+        # docs/delta-snapshot-caching.md proposes caching the Snapshot per (txn, path, version), and serving
+        # the flush's open from such a cache would give it a stale base and start conflicting every append
+        # that races a property edit. Mutation-tested with two mutants, each killed at its own assertion:
+        # dropping the second property edit makes the COMMIT unexpectedly succeed, and moving the first one
+        # outside con1's window breaks the version ladder that proves the window was open at all.
+        : "${MIN_ASSERTIONS:=6801}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

@@ -2087,6 +2087,20 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     live `DeltaTable` buys nothing over this and costs a lease threaded through 6 async iterators. Caching a
     `NativeScanList` is WRONG: it is post-prune, so sharing it between scans with different pushed predicates
     silently DROPS ROWS.
+  - **⚠ A CORRECTNESS CONSTRAINT, MEASURED 2026-08-07 while settling a different question — THE COMMIT PATHS
+    MUST NEVER BE SERVED FROM THE CACHE** ([docs/delta-snapshot-caching.md](docs/delta-snapshot-caching.md)
+    §3.5a). `FlushDeferredFilesAsync` opens the table FRESH at COMMIT, and that is load-bearing rather than
+    incidental: Delta conflicts on a concurrent **metaData** UNCONDITIONALLY (reads are not consulted, so
+    even a blind append is examined), and the rule can only fire over the commits between the commit's BASE
+    version and the version attempted. A fresh base makes that range EMPTY. Serve the flush's open from a
+    cache and every append racing a property or schema edit — ours, a Spark job, an OPTIMIZE — starts
+    FAILING where it commits today. MEASURED both ways on both engines: a buffered `INSERT` whose window
+    contains a `fabricator_delta_set_tblproperties` commits, while a buffered `DELETE` — whose held
+    `DeltaTransaction` IS pinned at statement time — conflicts with *"Concurrent commit N changed the table
+    metadata."* Same table, same isolation, same edit; only the base differs. **This is a different failure
+    from the staleness the invalidation list guards** — a correct answer replaced by a refusal — and it is
+    the kind a change framed as "pure performance" ships without anyone looking. Gate
+    `verify_delta_catalog_transactions` §41 (965 → 1021 per leg, mutation-tested with two mutants).
   - **⚠ Two traps recorded in the doc:** there is NO intra-call shortcut (the `Stream*` methods are async
     ITERATORS, so the schema open completes and disposes BEFORE the stream open begins, in a different ABI
     call), and `TableFunction::function_info` is the WRONG shelf for cached state (its lifetime is the PLAN,
@@ -3676,8 +3690,8 @@ commits do not compile DuckDB:
 | tier | workflow | what | trigger |
 |---|---|---|---|
 | 0 | `installer-core.yml` — **TWO jobs** | job `test`: `Fabricator.Installer.Core.Tests`, floor **92**. job `bridge`: `Fabricator.Bridge.Tests`, floor **106** (the variable-library format, the Fabric SQL endpoint-host derivation, and the persisted Delta parquet tuning). Both × {net8.0,net10.0} × {win,linux}. No C++, no vcpkg, **no submodules**. ~2 min | push/PR |
-| 1 | `extension.yml` | build + the hermetic tier, **67 runs / 6689 assertions** as of 2026-08-07 (scratch dir + in-repo fixtures only). 3 platforms | push/PR |
-| 2 | `integration.yml` | the service tier, **45 runs / 1640 assertions** as of 2026-08-07, via `docker/docker-compose.yml` (SQL Server 2025 + MinIO + generated certs + `provision.ps1`). linux only | schedule + dispatch |
+| 1 | `extension.yml` | build + the hermetic tier, **67 runs / 6801 assertions** as of 2026-08-07 (scratch dir + in-repo fixtures only). 3 platforms | push/PR |
+| 2 | `integration.yml` | the service tier, **45 runs / 1678 assertions** as of 2026-08-07, via `docker/docker-compose.yml` (SQL Server 2025 + MinIO + generated certs + `provision.ps1`). linux only | schedule + dispatch |
 | 3 | `distribution.yml` | the single-file artifact per platform + the **12-check smoke against a STOCK DuckDB wheel** (`test/distribution/smoke_distribution.py`). 3 platforms; needs `OVERRIDE_GIT_DESCRIBE` (the one tier that does) | dispatch + `v*` tags |
 | — | manual | `verify_dax` (Power BI Desktop), live Fabric/OneLake (gitignored SP creds), the 7 deltars suites (`-IncludeDeltaRs`, ~240 MB), and on macOS: Gatekeeper/`com.apple.quarantine` + code signing | by hand |
 
@@ -3710,7 +3724,7 @@ exercised the next time a pin moves on its own.
 declares, so a new suite cannot silently sit outside CI. The accounting is complete and checked:
 **62 hermetic + 44 service + 11 excluded = 117 suite FILES** (recomputed 2026-08-07), no overlap. ⚠ Suite
 FILES and suite RUNS differ and the floors are on RUNS: five hermetic suites and one service suite are
-engine-doubled, so 62 files ⇒ **67 runs / 6689 assertions** and 44 ⇒ **45 runs / 1640**. Recompute rather
+engine-doubled, so 62 files ⇒ **67 runs / 6801 assertions** and 44 ⇒ **45 runs / 1678**. Recompute rather
 than copy — the line here read `53 + 42 + 9 = 104` for a while after the counts had moved, and then
 `59 + 43 + 11 = 113` for a while after THAT, which is what a hand-copied number does. The one-liner:
 `H=$(./scripts/list-hermetic-suites.sh | wc -l); S=$(./scripts/list-service-suites.sh | wc -l);
@@ -4157,7 +4171,7 @@ path never adopted. Keep the status honest; a wrong status is worse than none.
 | [delta-transactions.md](docs/delta-transactions.md) | **current** — buffered-DML semantics. §8.1 = the MEASURED OneLake multi-writer result (2026-07-31; one bug fixed, one gap left OPEN); §10.6 = the MEASURED Fabric Spark isolation-property matrix, replacing a stale "we do NOT read it" |
 | [duckdb-upstream-issues.md](docs/duckdb-upstream-issues.md) | **current** — DuckDB bugs found from here, reproduced on the STOCK wheel with controls. §1 is ready to file (a `read_parquet` assertion that INVALIDATES the database); §2 is the counter-example the file exists to enforce — a finding that looked upstream, did not reproduce, and must NOT be filed |
 | [distribution-installer.md](docs/distribution-installer.md) | **current** — single-file SKU, phases 1–4 of 5 |
-| [ew-upstream-0.3.0-analysis.md](docs/ew-upstream-0.3.0-analysis.md) | **ANALYSIS ONLY — nothing merged, nothing re-pinned** (2026-08-07). Pre-flight for the v0.3.0 bump (15 commits, pin `3794fe4` → `fa9b556`), bigger than any since the clast-master re-pin because upstream extracted the OCC core out of `DeltaTable` (issue #65 / PR #83). ⚠ TWO of our four patched files were DELETED from `.Table` and moved — the delete/modify shape that silently dropped a patch in the 2026-08-01 bump. Also lists the numbers this bump INVALIDATES |
+| [ew-upstream-0.3.0-analysis.md](docs/ew-upstream-0.3.0-analysis.md) | **current — the bump is DONE, and this is now its record rather than a pre-flight** (2026-08-07). Upstream extracted the OCC core out of `DeltaTable` (issue #65 / PR #83), so the patch set was re-cut on a FRESH branch off upstream rather than merged: **4 files / +175 → 2 files / +69**, both offer-ready and open as drafts. §4a.1 is the finding that matters most (0.3.0 turned a latent commit unsafety into a WRONG ANSWER on local Windows); §4b is CLOSED and got two of its five answers wrong by reasoning instead of measuring — read the box at its head before trusting any "✅ delete this" in a similar analysis |
 | [ew-master-migration.md](docs/ew-master-migration.md) | **current** — the EW pin journal. Read BEFORE the next EW bump. §FULL PATCH-SET AUDIT (2026-08-03) is the file-by-file verdict against `v0.2.0` with a KEEP/OFFER/DROP per file; §THE `*BySelection*` QUESTION records why the merge-on-read UPDATE must NOT move into the Bridge and what to offer instead; §2b is the ConflictChecker reading half incl. the two ways it DIVERGES from Delta |
 | [fabric-api-functions.md](docs/fabric-api-functions.md) | **current — the whole curated set is BUILT; P0/P1/P2 + semantic models + XMLA live-validated, P3 wired but NOT live** (no git-connected workspace / pipeline / mirrored DB on this tenant). §9b spike results, §9c as-built (incl. the zero-argument Arrow fix), §9h the SQL Server binding + the two shipped bugs it found, §9j variable libraries, §9k Spark sessions, §9l the `fabric` SCHEMA move, §9m job-instance fan-out + the fan-out verdict per remaining function, §9n the inferred/renamed ATTACH options + the endpoint-host encoding, §10 the full API sweep with a verdict per area |
 | [feature-history.md](docs/feature-history.md) | **archive** — as-built records moved verbatim out of this file. Historical by design |

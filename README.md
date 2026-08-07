@@ -1801,6 +1801,36 @@ COMMIT;
 A failed swap is **not a conflict to retry** — retrying cannot make an already-committed batch
 un-commit. Read the recorded version back and decide whether the batch still needs writing.
 
+> ### ⚠ Editing table properties while a write transaction is open can abort it
+>
+> Delta treats a concurrent metadata change as a conflict **unconditionally** — it does not matter what your
+> transaction read. So a property or schema edit landing while a transaction is open can abort it:
+>
+> ```sql
+> -- connection 1
+> BEGIN;
+> DELETE FROM lake.main.t WHERE id = 2;
+>
+> -- connection 2, before connection 1 commits
+> SELECT * FROM fabricator_delta_set_tblproperties('lake', 'main.t', '{"custom.k":"v"}');
+>
+> -- connection 1
+> COMMIT;
+> -- TransactionContext Error: Failed to commit: Fabricator: commit_transaction failed: delta transaction
+> --   conflict on '<path>': the table moved from version 1 while the transaction was open and the
+> --   concurrent changes do not commute (Concurrent commit 2 changed the table metadata.)
+> --   -- the transaction is rolled back; retry it.
+> ```
+>
+> The transaction is rolled back whole, so retrying it is safe and is the fix. Better still, do property
+> and schema edits outside your write windows.
+>
+> **A plain `INSERT` is not affected** — an append's commit is planned against the table as it stands at
+> `COMMIT`, so the property edit is simply an earlier version and the append lands on top of it. The same
+> holds for `ALTER TABLE … ADD COLUMN`: rows written before the column exists read it as `NULL`, which is
+> what Delta schema evolution means. It is `UPDATE` / `DELETE` inside `BEGIN … COMMIT` that hold a pinned
+> snapshot and can therefore be invalidated.
+
 ### `COPY … TO` a Delta path (no ATTACH)
 
 `COPY … TO '<path>' (FORMAT delta, …)` writes a Delta table to **any path** — local, `s3://`, `onelake://`,

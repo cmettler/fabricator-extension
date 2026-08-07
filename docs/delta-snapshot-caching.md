@@ -160,6 +160,26 @@ the version under a held snapshot and a later read in the same transaction must 
 This list is a **maintenance liability**: it has to stay in sync as new immediate operations are added, and
 missing one produces a silent stale read.
 
+### 3.5a ⚠ THE COMMIT PATHS MUST NEVER BE SERVED FROM THE CACHE — a stale base turns a working append into a conflict
+
+Measured 2026-08-07, and this is a CORRECTNESS constraint on a design otherwise framed as pure performance.
+
+`DeltaCatalog.FlushDeferredFilesAsync` opens the table FRESH at COMMIT (and again on every retry), so the
+base snapshot it hands `CommitDataFilesAsync` is always the latest version. That is not incidental. Delta's
+conflict checker examines the commits between the base version and the version being attempted, and a
+concurrent **metaData** action conflicts UNCONDITIONALLY — reads are not consulted, so even a blind append is
+examined. With a latest base that range is EMPTY and the append commits; with a base cached from earlier in
+the transaction the range contains the property edit and **the append is refused**.
+
+MEASURED both ways on both engine legs (`verify_delta_catalog_transactions` §41): a buffered `INSERT` whose
+window contains a `fabricator_delta_set_tblproperties` commits, while a buffered `DELETE` — whose held
+`DeltaTransaction` IS pinned at statement time — conflicts with *"Concurrent commit N changed the table
+metadata."* Same table, same isolation, same property edit; the only difference is where the base came from.
+
+So the cache is for READS. The invalidation list above is about staleness; this is a different failure and a
+worse one — a correct answer replaced by a refusal, on every append that races a property edit (ours, a Spark
+job, an OPTIMIZE writing clustering metadata), i.e. exactly the `dbt run` shape. §41 exists to catch it.
+
 ### 3.6 The key must be pinned-version-scoped
 
 A `DeltaTable` holds ONE `_currentSnapshot`, while `GetSchemaAt(v)` / `StreamAt(v)` need v's. Inside a

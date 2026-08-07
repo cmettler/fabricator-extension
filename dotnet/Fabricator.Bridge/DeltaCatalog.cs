@@ -3026,6 +3026,16 @@ public sealed class DeltaCatalog : IBackendCatalog
             }
             catch (EngineeredWood.DeltaLake.DeltaConflictException) when (attempt < maxAttempts)
             {
+                // ⚠ THIS LOOP IS NOT REDUNDANT WITH EW's OWN, AND THE DIFFERENCE IS THE REOPEN.
+                // CommitDataFilesAsync retries internally (LogCommitRequest.MaxAttempts + a rebase handler),
+                // but it holds its BaseSnapshot FIXED and re-runs the conflict check over the same widening
+                // range — so a concurrent metaData, which conflicts UNCONDITIONALLY whatever the transaction
+                // read, is permanent inside it. Reopening is what clears it: the next attempt's base is past
+                // the metadata commit, so the range is empty and this append (which read nothing) lands.
+                // Delete this and a property or schema edit arriving between our open and our write turns a
+                // currently successful append into a hard failure. See docs/ew-upstream-0.3.0-analysis.md
+                // §4b.1 — and §4b.2 for why the same edit arriving EARLIER never reaches the check at all.
+                //
                 // Concurrent writer took the version — reopen + retry. LOGGED (like the sibling retry in
                 // DeltaGlobalTableFunction.WriteAsync) because a silent retry makes multi-writer behaviour
                 // unobservable: a successful concurrent run and a run whose writers merely serialized look

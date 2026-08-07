@@ -3165,3 +3165,172 @@ SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_ident2/doomed/_delt
 
 statement ok
 DETACH ic;
+
+# ============================================================================
+# 41. A CONCURRENT METADATA CHANGE vs an open buffered transaction — the two
+#     buffered paths answer DIFFERENTLY, and the difference is WHERE THE
+#     COMMIT'S BASE SNAPSHOT COMES FROM
+# ============================================================================
+#
+# Delta conflicts on a concurrent metaData action UNCONDITIONALLY — reads are not consulted, so even a
+# blind append is examined (ConflictChecker rule 1; Delta OSS is identical, docs/ew-upstream-0.3.0-analysis.md
+# §4c). That rule can only fire over the commits between the COMMIT's BASE version and the version it
+# attempts, so what decides the answer here is not the isolation level and not what the statement read —
+# it is which of our two buffered paths the transaction took:
+#
+#   APPEND  → DeltaCatalog.FlushDeferredFilesAsync OPENS THE TABLE FRESH at COMMIT (and again on every
+#             retry), so its base IS the latest version and the concurrent range is EMPTY. Nothing to
+#             examine ⇒ the append commits. The metadata change is simply an earlier version.
+#   DML     → the pair's HELD DeltaTransaction was created at STATEMENT time (the hoist), so its base
+#             snapshot predates the metadata commit and the range is non-empty ⇒ CONFLICT.
+#
+# ⚠ THE APPEND HALF IS A LOAD-BEARING FACT, NOT A HAPPY ACCIDENT, and it is one line from being lost:
+# docs/delta-snapshot-caching.md proposes caching the immutable Snapshot per (txn, path, version) to save
+# the redundant _delta_log listings. If the flush's fresh open were ever served from such a cache it would
+# inherit a STALE base, and every append racing a property edit — ours, a Spark job, an OPTIMIZE — would
+# start conflicting where it commits today. That is what this section exists to catch.
+#
+# ⚠ Neither half is NEW at the engineered-wood 0.3.0 pin, which is the question that produced this test.
+# Upstream's release note flags that CommitDataFilesAsync "used to retry straight through a concurrent
+# schema change" and now applies the checker — but that change cannot reach us on the path it landed on,
+# because we never hand that method a stale base. And the DML half is unchanged: the pre-bump
+# ConflictChecker carried the identical unconditional metadata rule at the identical place.
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_mdconflict' AS mdc (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}');
+
+statement ok
+CREATE TABLE mdc.main.t AS SELECT r AS id FROM range(1, 11) t(r);
+
+# --- A. buffered APPEND ---
+
+# CONTROL: the same shape with no concurrent metadata change, so the pass below cannot be read as
+# "buffered appends happen to work".
+statement ok con1
+BEGIN;
+
+statement ok con1
+INSERT INTO mdc.main.t VALUES (100);
+
+statement ok con1
+COMMIT;
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+INSERT INTO mdc.main.t VALUES (200);
+
+# lands a metaData INSIDE con1's window — con1 has already written its data file and pinned its snapshot
+statement ok con2
+SELECT * FROM fabricator_delta_set_tblproperties('mdc', 'main.t', '{"custom.a":"1"}');
+
+statement ok con1
+COMMIT;
+
+query I
+SELECT count(*) FROM mdc.main.t;
+----
+12
+
+# --- B. buffered DML (a held DeltaTransaction, base pinned at statement time) ---
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+DELETE FROM mdc.main.t WHERE id = 1;
+
+statement ok con1
+COMMIT;
+
+query I
+SELECT count(*) FROM mdc.main.t;
+----
+11
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+DELETE FROM mdc.main.t WHERE id = 2;
+
+statement ok con2
+SELECT * FROM fabricator_delta_set_tblproperties('mdc', 'main.t', '{"custom.b":"2"}');
+
+# The message names the RULE rather than the version, so this assertion survives a section being added
+# above it — the ORDERING is pinned by the version ladder below instead, which is the stronger check.
+statement error con1
+COMMIT;
+----
+changed the table metadata
+
+# rolled back whole: the row the DELETE targeted is still there
+query I
+SELECT count(*) FROM mdc.main.t;
+----
+11
+
+query I
+SELECT count(*) FROM mdc.main.t WHERE id = 2;
+----
+1
+
+# THE POSITIVE CONTROL FOR BOTH HALVES, in one query. v3 before v4 is the proof that the append's window
+# was genuinely open (without it, A passes equally if the property edit had merely landed after the
+# COMMIT); and v6 being LAST proves the refused DML wrote nothing at all — a conflict that still committed
+# something would be a worse bug than the one this pins.
+query II
+SELECT version, operation FROM fabricator_delta_snapshots('mdc', 'main.t') ORDER BY version;
+----
+0	CREATE TABLE
+1	WRITE
+2	WRITE
+3	SET TBLPROPERTIES
+4	WRITE
+5	DELETE
+6	SET TBLPROPERTIES
+
+# --- C. the case upstream's note is ACTUALLY about: a concurrent SCHEMA change ---
+#
+# The comment on CommitDataFilesAsync says this path "used to retry straight through a concurrent schema
+# change and commit files against a schema that had moved". Ours still does — not by retrying, but because
+# the fresh open means the moved schema is already our base, so the check never runs. Worth pinning the
+# OUTCOME rather than trusting that argument: the eagerly-written file predates the new column, and what
+# makes that safe is Delta's own semantics — a data file missing a column added since reads as NULL, which
+# is what schema evolution means. ⚠ That reasoning covers ADD COLUMN and is UNEXAMINED for a type change.
+
+statement ok
+CREATE TABLE mdc.main.t2 AS SELECT r AS id FROM range(1, 4) t(r);
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+INSERT INTO mdc.main.t2 VALUES (100);
+
+statement ok con2
+ALTER TABLE mdc.main.t2 ADD COLUMN extra VARCHAR;
+
+statement ok con1
+COMMIT;
+
+# the pre-change file's rows AND the row committed after it both read the new column as NULL
+query II
+SELECT id, extra FROM mdc.main.t2 ORDER BY id;
+----
+1	NULL
+2	NULL
+3	NULL
+100	NULL
+
+query II
+SELECT version, operation FROM fabricator_delta_snapshots('mdc', 'main.t2') ORDER BY version;
+----
+0	CREATE TABLE
+1	WRITE
+2	ADD COLUMNS
+3	WRITE
+
+statement ok
+DETACH mdc;

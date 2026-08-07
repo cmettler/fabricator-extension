@@ -483,15 +483,21 @@ retracted for being a semantics request in disguise. This one is not: the two su
   patch covers our path" but **"EW expects a buffered host to use this and we don't"** — a divergence from the
   intended shape that nobody chose. Settle it in Phase C.
 
-### 4a.5 THE TWO OFFERS ARE OPEN AS DRAFTS (2026-08-07)
+### 4a.5 THE OFFERS (2026-08-07) — two open as drafts, a third built and not yet pushed
 
 | PR | branch | issue |
 |---|---|---|
 | [clast-project/engineered-wood#90](https://github.com/clast-project/engineered-wood/pull/90) | `offer/dml-checkpoint` | **Closes #86** |
 | [clast-project/engineered-wood#91](https://github.com/clast-project/engineered-wood/pull/91) | `offer/blind-append-declaration` | **Addresses #88**, decision 2 of 4 |
+| *(not pushed — local only)* | `offer/commit-retry-signal` | `LogCommitRequest.OnRetry`, §4b.1 |
 
 Each is cut off `upstream/main` with ONE change and its tests — never off `fabricator-patches-v2`, which
-carries both — following the `offer/*` convention already in the fork (13 prior branches).
+carries the first two — following the `offer/*` convention already in the fork (13 prior branches).
+
+**⚠ The third is the clearest case for the convention, because we do NOT consume it.** It exists for a host
+with no outer retry loop of its own; we have one and it already logs. Putting it on the pin would grow the
+patch set to 4 files / +109 for an API nobody in this tree calls, so it stays off — and building it against
+BARE upstream (360/360 × 3 TFMs) is what proves it needs none of our other patches.
 
 **⚠ THE INTERNAL MARKERS MUST BE STRIPPED, and this is the step easiest to forget.** Both branches were
 verified to contain **zero** `FABRICATOR` references: the `[FABRICATOR-PATCH: OFFER-READY]` tags and
@@ -547,10 +553,54 @@ already in the record. A compile and a green hermetic tier say nothing about tha
 ⚠ §4's numbers are STILL not re-taken, and deliberately: they are confounded by #86 (DML tables never
 checkpoint), so measuring before that is understood would produce another figure needing withdrawal.
 
-## 4b. CAN 0.3.0 SIMPLIFY OUR BUFFERING / READ-YOUR-WRITES? — analysed 2026-08-07 (user-asked). One real
-deletion, one hazard, and a firm NO on the part everyone assumes
+## 4b. CAN 0.3.0 SIMPLIFY OUR BUFFERING / READ-YOUR-WRITES? — analysed AND MEASURED 2026-08-07 (user-asked).
+CLOSED: **nothing to delete**, one flagged hazard that does not reach us, and a firm NO on the part everyone assumes
 
-### 4b.1 ✅ DELETE our outer OCC retry loop — `CommitDataFilesAsync` now retries internally, and better
+> ⚠ **The analysis got TWO of its five answers wrong, and both in the same direction — by reasoning about
+> what the code should do instead of running it.** 4b.1 opened "✅ DELETE our outer OCC retry loop"; the loop
+> is load-bearing. 4b.2 predicted our appends would start conflicting; they do not, and the same fact
+> explains both. What survives is the measurement and the gate — the deletion was never made and the
+> imagined regression was never real. Kept in full, with the corrections in place, because "one commit base
+> is freshly opened and the other is pinned at statement time" is the fact everything here turns on and it
+> is not visible from either method signature.
+
+### 4b.1 ❌ DO **NOT** DELETE our outer OCC retry loop — the offer is BUILT, the deletion is REFUSED, and the second reason is the real one
+
+> **RESOLVED 2026-08-07.** The ✅ below was written before 4b.2 was measured, and 4b.2 changed the answer.
+> **Option (1) is DONE — `LogCommitRequest.OnRetry` is built, tested and offer-ready** (`CommitRetryInfo`
+> carrying the lost version, the latest version, and the attempt index; mutation-tested — moving the
+> invocation above the verdict throw kills the "a conflict is not a retry" test).
+> **⚠ It lives on `offer/commit-retry-signal`, cut off `upstream/main`, and is deliberately NOT on the pin**
+> — we do not consume it (our own loop already logs), so carrying it would grow the patch set from 2 files /
+> +69 to 4 / +109 for an API nobody here calls. That is the `offer/*` convention doing its job: 360/360 ×
+> {net10.0, net8.0, net472} against BARE upstream, which is also the only build that proves it applies
+> without our patches. **But taking it and deleting our loop is now REFUSED**, because the diagnostic was
+> never the only thing the loop does:
+>
+> **⚠ THE OUTER LOOP REOPENS; THE INNER ONE DOES NOT — and that is a behaviour difference, not a
+> duplication.** `LogCommitter` holds `BaseSnapshot` FIXED across its attempts and re-runs the checker over
+> the same widening range, so a concurrent **metaData** — which conflicts unconditionally (§4b.2) — is
+> permanent within it. Our loop catches the exception and OPENS THE TABLE AGAIN, so the next attempt's base
+> is past the metadata commit and the append succeeds. Deleting the loop would therefore turn a currently
+> successful append into a hard failure whenever a property or schema edit lands in the window between our
+> open and our write. Narrow window, real behaviour. Source-established (`catch (DeltaConflictException)`
+> → reopen → retry), not measured — the window is microseconds and cannot be opened from SQL.
+>
+> ⇒ **the loop stays, and now carries a comment saying why.** The 16 × 16 "multiplicative" objection below
+> still stands on paper and has never been observed; it is the price of the recovery. The `OnRetry` offer is
+> still worth sending — it is what a host with no outer loop of its own needs — it just no longer unblocks a
+> deletion here.
+>
+> **⚠ AND BE HONEST ABOUT WHAT THE REOPEN IS.** Upstream's own comment on that hunk says the opt-out it
+> would accept *"reopens a real hole, so it should be asked for rather than offered"* — and a reopen-and-
+> recommit is that opt-out, taken locally without asking. What we keep is therefore a deliberate
+> permissiveness, not an accident: an append whose files were written against the pre-change schema can be
+> committed into the post-change table. Its blast radius is bounded by the window (our open → our write) and
+> by Delta's own semantics for the common case — a file missing a column added since reads as NULL, which is
+> what schema evolution means. It is NOT bounded for a type change. Nobody has measured that; the honest
+> statement is "narrow window, benign for ADD COLUMN, unexamined for the rest."
+
+`DeltaCatalog.FlushDeferredFilesAsync` (`:3016`) is a hand-rolled `for (attempt = 1; ; attempt++)` with
 
 `DeltaCatalog.FlushDeferredFilesAsync` (`:3016`) is a hand-rolled `for (attempt = 1; ; attempt++)` with
 `maxAttempts = 16` that REOPENS the table and re-commits on `DeltaConflictException`. Upstream's
@@ -570,19 +620,50 @@ logger. **So the deletion must come with a replacement signal**, or we lose the 
 distinguishes a real concurrency test from a vacuous one — offering an `OnConflict`/attempt callback on
 `LogCommitRequest` is the natural upstream ask, and it is small.
 
-### 4b.2 ⚠ A BEHAVIOUR CHANGE ON THAT PATH THAT MAY BITE US — upstream flags it themselves
+### 4b.2 ✅ MEASURED 2026-08-07 — THE BEHAVIOUR CHANGE DOES NOT REACH US, and the reason is a structural fact worth gating
 
-The same hunk carries upstream's own note: this path *"used to retry straight through a concurrent schema
-change and commit files against a schema that had moved"*, and now the checker's metadata/protocol rule
-applies. Their words: *"if a host turns out to depend on the old permissiveness — a producer appending
-through this while another process edits table properties will now see conflicts it did not before — the
-fix is a public opt-out on the request rather than a quiet revert."*
+Upstream's own note on the `CommitDataFilesAsync` hunk: this path *"used to retry straight through a
+concurrent schema change and commit files against a schema that had moved"*, and now the checker's
+metadata/protocol rule applies — *"if a host turns out to depend on the old permissiveness … the fix is a
+public opt-out on the request rather than a quiet revert."*
 
-**Our flush is exactly such an append.** A dbt run appending while anything edits table properties (our own
-`fabricator_delta_set_tblproperties`, a Spark job, an OPTIMIZE writing clustering metadata) can now conflict
-where it silently succeeded. **Untested — no suite covers append-vs-metadata-change concurrency**, and the
-old behaviour was a real hole, so this is a correctness IMPROVEMENT we should verify rather than a
-regression to fear.
+**This section previously read "our flush is exactly such an append" and predicted a new conflict. THAT WAS
+WRONG, and it was wrong about which path our append takes.** Measured on both engine legs
+(`verify_delta_catalog_transactions` §41):
+
+| buffered path | where the COMMIT's base snapshot comes from | concurrent metadata change ⇒ |
+|---|---|---|
+| **APPEND** (`FlushDeferredFilesAsync`) | a FRESH `DeltaTable.OpenAsync` at COMMIT, and again on every retry | **commits** — the concurrent range is EMPTY |
+| **DML** (the pair's held `DeltaTransaction`) | pinned at STATEMENT time by the hoist | **conflicts** — *"Concurrent commit N changed the table metadata."* |
+
+(`CommitDataFilesAsync` sets `BaseSnapshot = CurrentSnapshot` and `Reads = ReadSet.Blind`, so our reopen is
+exactly what moves the base — and being blind, metadata/protocol is the ONLY rule that can touch that path.)
+
+The rule can only fire over the commits between the COMMIT's BASE version and the version it attempts. Our
+flush's base IS the latest version, so there is nothing for the new rule to examine — the property edit is
+simply an earlier version. Version ladder from the measurement, which is the proof the window was genuinely
+open rather than the edit having landed late: `3 SET TBLPROPERTIES` then `4 WRITE`, the append's own commit.
+
+**⚠ And the DML half is NOT new either — this is the question that produced the test.** The pre-bump
+`ConflictChecker` (`git show 3794fe4:src/EngineeredWood.DeltaLake.Table/Concurrency/ConflictChecker.cs`, <!-- check-docs:ignore (a path at the OLD pin — it moved namespaces at 0.3.0, so its absence at HEAD is the point) -->
+lines 121-127) carried the identical unconditional metadata rule at the identical place, and the DML commit routed through
+it then as it does now. Source-established, not measured — re-measuring it would mean building the Bridge
+against the old pin, which it no longer compiles against.
+
+**And the SCHEMA case — the one upstream's comment is really about — is measured too, on both engines.** A
+buffered `INSERT` racing an `ALTER TABLE … ADD COLUMN` commits (`2 ADD COLUMNS` then `3 WRITE`) and the data
+is right: the eagerly-written file predates the column, and every row reads it as NULL, which is what Delta
+schema evolution means. ⚠ That argument covers ADD COLUMN and is **unexamined for a type change** — say it
+that way rather than "concurrent schema changes are safe".
+
+**⇒ nothing to do, and no opt-out to ask upstream for.** What came out of it instead is a gate, because the
+append half is one line from being lost: [delta-snapshot-caching.md](delta-snapshot-caching.md) proposes
+caching the immutable `Snapshot` per (txn, path, version) to kill the redundant `_delta_log` listings, and
+**serving the flush's open from such a cache would hand it a STALE base** — at which point every append
+racing a property edit (ours, a Spark job, an OPTIMIZE writing clustering metadata) starts conflicting. That
+hazard is not mentioned in the caching design and is exactly the kind of thing a "pure performance" change
+gets away with silently. §41 pins both halves, mutation-tested with two mutants killed at their own
+assertions.
 
 ### 4b.3 `LogCommitRequest.OnCommitDurable` — a precise guard for a hazard we currently handle by re-reading
 
@@ -601,6 +682,15 @@ Only reachable by constructing the request ourselves ⇒ Phase C, not free.
 **Do 4b.2 FIRST, and this ordering is not arbitrary.** 4b.2 is a *behaviour change already shipped* in the
 0.3.0 pin (pushed, all tiers green) that nothing tests in either direction; 4b.1 is a cleanup that changes
 nothing a user sees. Verifying what we already shipped outranks tidying what we already have.
+
+> **✅ 4b.2 IS DONE (2026-08-07)** — answer in §4b.2 above: the change does not reach us, and the prediction
+> written here was wrong about which path our append takes. Gate `verify_delta_catalog_transactions` §41,
+> 965 → 1000 per leg. **The plan below is kept verbatim because the SHAPE was right even though the
+> hypothesis was not** — the buffered path really is required, the control really was load-bearing, and
+> "pin whichever answer is real rather than the one expected" is what made the wrong prediction cheap.
+> ⚠ One correction it earns: the shape as written (`INSERT`) exercises the APPEND path, which turned out to
+> be the half that does NOT conflict. The DML half needed a `DELETE`, and only running both showed that the
+> two paths differ at all.
 
 **4b.2 — append vs a concurrent metadata change.** The test shape, which needs care because sqllogictest
 runs connections SEQUENTIALLY and the window has to be opened deliberately:
@@ -633,6 +723,13 @@ an oversight; deleting it without a replacement signal would be.
 
 **4b.3 (`OnCommitDurable`) is Phase C**, not 4b: it needs us to construct `LogCommitRequest` ourselves,
 which is the `LogCommitter` architectural decision.
+
+> **✅ 4b IS CLOSED (2026-08-07).** 4b.2 measured and gated (§41, 965 → 1021 per leg); 4b.1's offer BUILT and
+> its local deletion REFUSED with a reason better than the one that blocked it; 4b.3/4b.4/4b.5 unchanged.
+> **The one thing to carry forward is a WARNING, not a task**: the append's immunity in 4b.2 and the loop's
+> recovery in 4b.1 are the SAME fact — our commit base is always freshly opened — so any change that makes a
+> commit reuse an older snapshot breaks both at once. That is precisely what
+> [delta-snapshot-caching.md](delta-snapshot-caching.md) proposes, and §3.5a there now says so.
 
 ### 4b.4 ❌ READ-YOUR-WRITES IS **NOT** SIMPLIFIABLE, and this is the firm answer
 
