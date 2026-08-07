@@ -672,14 +672,26 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
         threaded INTO spec resolution — the same shape as the catalog-spec threading done on 2026-08-07, one
         level further down. The catalog already reads a table's config for other reasons (`ExecuteDelete` reads
         it once for `enableDeletionVectors` + isolation), so the read exists; it is the plumbing that does not.
+      - **ALL KEYS PERSIST, INCLUDING THE NATIVE-ONLY ONES; the reading ENGINE applies the subset it can
+        honour and ignores the rest (user, 2026-08-07).** ⚠ This is a DELIBERATE departure from the
+        "never silently ignore a write option" rule the rest of this surface follows, and the distinction is
+        the point rather than an exception to it:
+        - a `WITH` / `SET` option is an **ACTIVE REQUEST in THIS statement** — "write it this way, now". If the
+          engine cannot, the user's intent is unmet and the statement must FAIL. That is why the rotating
+          options and native-only `dictionary_size_limit` are refused there.
+        - a persisted property is a **DECLARATION ABOUT THE TABLE** — "this is how this table prefers to be
+          written", set once, by whoever created it. A later writer may legitimately be a different engine, and
+          failing there would make the table UNWRITABLE by the codec engine merely because someone once set a
+          native-only knob. Apply what fits, ignore what does not.
+        ⇒ persist every key; at write time intersect the table's declaration with the engine's capabilities.
+        A `Fabricator.Delta` Debug line naming what was dropped and why is the right observability (the choice
+        is invisible from SQL otherwise) — NOT a warning, since ignoring here is correct rather than degraded.
       - **⚠ It changes what the existing keys MEAN, so it is a surface change, not an additive one** — hence
-        it belongs in this revisit rather than being bolted onto the keys. Two things to settle with it: which
-        keys persist (compression / row_group_size / bloom columns clearly; `parquet_version` probably; the
-        native-only ones arguably not, since a persisted property that only one engine can honour re-creates the
-        accept-and-drop problem on the other), and whether `fabricator_delta_set_tblproperties` should be able
-        to change them after the fact (it can already write arbitrary `fabricator.*` keys, so the answer is
-        probably yes by construction — which means the reader must tolerate a hand-set garbage value and say so
-        loudly rather than fall back silently).
+        it belongs in this revisit rather than being bolted onto the keys. Still to settle:
+        `fabricator_delta_set_tblproperties` can already write arbitrary `fabricator.*` keys, so someone WILL
+        hand-set a garbage value — the reader must say so loudly rather than fall back silently. Note that is
+        NOT in tension with the paragraph above: ignoring a WELL-FORMED option this engine cannot honour is
+        correct; swallowing an UNPARSEABLE one is not.
   - **(3) Re-examine the `SET` parameters and MOVE what belongs per-table into `WITH`.** `delta_write_options`
     is one JSON blob mixing genuinely session-scoped things (compression as a storage-cost policy) with
     per-table ones (partitioning, `replace_where`, `schema_mode`). Decide each knob's home rather than
