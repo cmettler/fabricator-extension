@@ -437,6 +437,21 @@ retracted for being a semantics request in disguise. This one is not: the two su
   patch covers our path" but **"EW expects a buffered host to use this and we don't"** — a divergence from the
   intended shape that nobody chose. Settle it in Phase C.
 
+### 4a.4 PHASE B — ALL GATES GREEN
+
+| gate | result | what it proves |
+|---|---|---|
+| hermetic | **67/67 — 6689**, run TWICE | identical to pre-bump ⇒ behaviour-preserving |
+| service | **45/45 — 1678** | `verify_delta_catalog_s3` 196 × 2 legs is the ONLY place the new `TryWriteAllBytesAsync` meets real `s3://` through `S3CommitFileSystem` — the commit primitive I replaced |
+| EW Table.Tests | **832 × {net10.0, net8.0, net472}** | only the net472 leg proves a change offerable |
+| EW DeltaLake.Tests | **364 × 3 TFMs** | the isBlindAppend patch's own gate, mutation-tested |
+
+⚠ The hermetic tier CANNOT reach `S3CommitFileSystem` at all, so the service leg was not optional here — it
+was the only evidence that the replaced commit primitive works against a real object store.
+
+⚠ §4's numbers are STILL not re-taken, and deliberately: they are confounded by #86 (DML tables never
+checkpoint), so measuring before that is understood would produce another figure needing withdrawal.
+
 ## 4b. CAN 0.3.0 SIMPLIFY OUR BUFFERING / READ-YOUR-WRITES? — analysed 2026-08-07 (user-asked). One real
 deletion, one hazard, and a firm NO on the part everyone assumes
 
