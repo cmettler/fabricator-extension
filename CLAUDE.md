@@ -653,13 +653,33 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     FEATURES (`deletion_vectors` / `column_mapping` / `row_tracking` / `change_data_feed` / `delta.*` /
     `fabricator.*`) are written into the table config. That is also why a bare `CREATE TABLE … WITH (<tuning>)`
     with no `AS SELECT` is refused: there is no write for it to apply to.
-    - **THE DESIGN QUESTION FOR (3), now sharpened:** should tuning be PERSISTED (e.g. as
-      `fabricator.parquet.compression` table properties, so every later write inherits it) rather than being
-      a per-statement knob? That is what "table property" implies to a user coming from Iceberg/DuckLake, and
-      it is the difference between configuring a dbt model ONCE and re-stating it on every incremental run.
-      ⚠ Note it would also change OPTIMIZE and the rewrite paths — which now honour the CATALOG's spec (fixed
-      this session) — to honour the TABLE's instead, which is arguably more correct still. Not built; decide it
-      as part of (3) rather than bolting persistence onto the existing keys.
+    - **DECIDED, NOT BUILT (user, 2026-08-07): PERSIST THE PARQUET TUNING LIKE THE OTHER `delta.*` OPTIONS,
+      AND RE-READ IT ON OPEN.** A `CREATE TABLE … WITH (parquet_compression='zstd') AS …` should write
+      `fabricator.parquet.compression` into the table CONFIG, and EVERY later write to that table — INSERT,
+      merge-on-read post-image, copy-on-write rewrite, OPTIMIZE compaction — should read it back and honour it.
+      Rationale: "table property" implies persistence to anyone coming from Iceberg/DuckLake; it is the
+      difference between configuring a dbt model ONCE and re-stating it on every incremental run; and a table
+      written zstd should STAY zstd when compacted regardless of which catalog happens to run the OPTIMIZE.
+      - **PRECEDENCE (decide once, apply everywhere): statement `WITH` > TABLE PROPERTY > `SET
+        delta_write_options` > ATTACH default.** The table property outranks the session setting deliberately —
+        it is a property OF THE TABLE, so a stray `SET` must not silently change a table's storage format;
+        the per-statement `WITH` remains the escape hatch. ⚠ This SUPERSEDES the ordering the current code
+        implements (ATTACH < SET < WITH, with no table layer).
+      - **⚠ THE STRUCTURAL OBSTACLE, and it is the whole job:** `ResolveWriteSpec` is TABLE-AGNOSTIC — it takes
+        partition columns and a schema mode, and knows nothing about which table is being written. The table's
+        config is only available where the table is OPENED, and EW takes `ParquetWriteOptions` as part of
+        `DeltaTableOptions` AT OPEN, so it cannot be layered on afterwards. So this needs the table's config
+        threaded INTO spec resolution — the same shape as the catalog-spec threading done on 2026-08-07, one
+        level further down. The catalog already reads a table's config for other reasons (`ExecuteDelete` reads
+        it once for `enableDeletionVectors` + isolation), so the read exists; it is the plumbing that does not.
+      - **⚠ It changes what the existing keys MEAN, so it is a surface change, not an additive one** — hence
+        it belongs in this revisit rather than being bolted onto the keys. Two things to settle with it: which
+        keys persist (compression / row_group_size / bloom columns clearly; `parquet_version` probably; the
+        native-only ones arguably not, since a persisted property that only one engine can honour re-creates the
+        accept-and-drop problem on the other), and whether `fabricator_delta_set_tblproperties` should be able
+        to change them after the fact (it can already write arbitrary `fabricator.*` keys, so the answer is
+        probably yes by construction — which means the reader must tolerate a hand-set garbage value and say so
+        loudly rather than fall back silently).
   - **(3) Re-examine the `SET` parameters and MOVE what belongs per-table into `WITH`.** `delta_write_options`
     is one JSON blob mixing genuinely session-scoped things (compression as a storage-cost policy) with
     per-table ones (partitioning, `replace_where`, `schema_mode`). Decide each knob's home rather than
