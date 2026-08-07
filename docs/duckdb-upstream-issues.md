@@ -158,6 +158,27 @@ first chunk push, so nearly every shape drained the input before the ABI call re
 Related, and the reason `BoundInput.Drop` is correctness rather than tidiness: `duckdb_arrow_scan` creates a
 **catalog-level (non-temporary)** view, so it outlives both the connection and the stream owning the storage.
 
+### ⚠ Wrapping the scan does NOT work — measured, because it is the obvious first guess
+
+A subquery, a plain CTE and even a **MATERIALIZED** CTE all still crash: projection pushdown goes straight
+through every one of them. That is exactly why the real query that first exposed this still died despite
+already being written as `WITH … AS MATERIALIZED (SELECT * FROM <view>)`.
+
+| variant | result |
+|---|---|
+| `SELECT a0, a2 FROM v` | crash |
+| `SELECT a0, a2 FROM (SELECT * FROM v) t` | crash |
+| `WITH t AS (SELECT * FROM v) SELECT a0, a2 FROM t` | crash |
+| `WITH t AS MATERIALIZED (SELECT * FROM v) SELECT a0, a2 FROM t` | crash |
+| `… FROM (SELECT * FROM v OFFSET 0) t` / `LIMIT 100` / `UNION ALL` / `a1+0 AS a1` | crash |
+| `… FROM (SELECT * FROM v ORDER BY a1) t` | **ok** |
+| `SELECT a0, a2 FROM (SELECT * FROM v) t WHERE t.a1 IS NOT NULL` | **ok** |
+
+The two that work are the two where the skipped column is still **referenced**, so the scan is asked for the
+full set. ⇒ the reliable mitigation is not a wrapper but **making the stream's columns equal the consumed
+set**: bind only the columns the generated SQL actually reads. (Relying on a stray reference to survive the
+optimizer is not a mitigation — constant-folding or a provably-true predicate can drop it again.)
+
 ### What it costs us until upstream fixes it
 
 `DeltaNativeReader.BatchPlan` gates **partitioned** tables off the batched read, because the per-file bound
