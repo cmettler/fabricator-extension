@@ -4042,20 +4042,41 @@ public sealed class DeltaCatalog : IBackendCatalog
             {
                 txn.DeclareRead(pred);
             }
-            if (pending.ReadWholeTable)
+            // ⚠ THE WHOLE-TABLE READ DECLARATION IS WITHHELD FOR A ROW-LEVEL DML AT WRITE_SERIALIZABLE, and
+            // this replaces a 66-line engineered-wood patch (`ExemptRowLevelFromWholeTableRead`, across
+            // DeltaTransaction and DeltaTable) that is GONE as of the 0.3.0 bump. Same behaviour, no
+            // divergence — and the patch turns out to have been in the wrong place all along.
+            //
+            // The patch made the LIBRARY ignore a declaration we had just made. But whether our whole-table
+            // flag is a real read dependency or a scan artefact is OUR knowledge, not EW's — which is exactly
+            // the objection upstream raised when it declined the feature ("a library must not decide on a
+            // host's behalf that it read less than it declared"). Upstream was right. Withholding a
+            // declaration we do not mean needs no patch at all; asking EW to disbelieve one does.
+            //
+            // WHY IT MATTERS: a row-level DELETE/UPDATE whose predicate does not push (`WHERE id % 100 = 2`)
+            // would otherwise declare the whole table, and under write_serializable that meets a concurrent
+            // dataChange=true remove of a file this transaction never touched — aborting a statement whose
+            // rows are disjoint, which is the composition the row-level path exists to allow. The row-level
+            // write validation has already proven no row being removed was disturbed. Predicates staged via
+            // DeclareRead are KEPT regardless: a declared predicate IS a real read dependency, and dropping
+            // it would admit a concurrent append into a range that was read.
+            //
+            // THE GATE IS EW's OWN, REPRODUCED: `exempt && rowLevel && isolationLevel != Serializable`.
+            // `deletes.Count > 0` is `rowLevel` (it is what stages the DV edits above), and `!tableSer` is
+            // the level. Serializable keeps the full read set — making commit order the logical order is the
+            // whole point of that level — so the isolation default flip does not silently widen this.
+            //
+            // ⚠ STILL OVER-BROAD, unchanged from the patch and now visible where it can be fixed:
+            // `ReadWholeTable` is set by ANY unfiltered scan, so `BEGIN; SELECT avg(x) FROM t; DELETE FROM t
+            // WHERE x > 42; COMMIT;` is covered although the row-level validation only covers the REMOVED
+            // rows. Fixing it needs PROVENANCE on the flag (a DML's own scan vs an arbitrary SELECT), which
+            // the buffer does not carry today. That is a behaviour change with its own test, and it now
+            // belongs to code we own rather than to a patch on someone else's library.
+            bool rowLevelDml = deletes.Count > 0;
+            if (pending.ReadWholeTable && !(rowLevelDml && !tableSer))
             {
                 txn.DeclareWholeTableRead();
             }
-
-            // ROW-LEVEL DML is exempted from the whole-table read declaration — the opt-in that preserves
-            // what we shipped before the bump. A statement whose predicate did not push declares the whole
-            // table, and under write_serializable that declaration would meet a concurrent blind append and
-            // abort a DELETE/UPDATE that touches disjoint ROWS — the very composition the row-level path
-            // exists to allow. It is deliberately not the library default: only a host that resolved its own
-            // rows knows the declaration was a scan artefact rather than a real dependency. Under
-            // serializable the exemption does not apply at all (EW gates it on the level), which is why the
-            // isolation default flip does not silently widen it.
-            txn.ExemptRowLevelFromWholeTableRead = true;
 
             // ONE call replaces what used to be a hand-rolled OCC loop here: conflict-check the read set
             // against every commit landed since the pin, rebase the deletion-vector pairs onto the latest
@@ -4127,8 +4148,8 @@ public sealed class DeltaCatalog : IBackendCatalog
         EngineeredWood.DeltaLake.Snapshot.Snapshot pinnedSnap, bool tableSer)
         => pending.HeldTxn ??= table.StartTransaction(pinnedSnap,
             tableSer
-                ? EngineeredWood.DeltaLake.Table.IsolationLevel.Serializable
-                : EngineeredWood.DeltaLake.Table.IsolationLevel.WriteSerializable);
+                ? EngineeredWood.DeltaLake.IsolationLevel.Serializable
+                : EngineeredWood.DeltaLake.IsolationLevel.WriteSerializable);
 
     /// <summary>
     /// Disposes the buffer entry's held EW transaction and table, <b>transaction first</b> — its cleanup needs

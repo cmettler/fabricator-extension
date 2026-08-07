@@ -245,25 +245,31 @@ internal sealed class S3CommitFileSystem : ITableFileSystem
 
     private string Key(string path) => _prefix + path.Replace('\\', '/').TrimStart('/');
 
-    /// <summary>The put-if-absent commit rename (see the class doc). False on 412 = a concurrent writer
-    /// claimed the target version — engineered-wood surfaces it as <c>DeltaConflictException</c> and the
-    /// OCC/rebase machinery takes over.</summary>
-    public async ValueTask<bool> RenameAsync(string sourcePath, string targetPath,
-                                             CancellationToken cancellationToken = default)
+    /// <summary>
+    /// The put-if-absent commit primitive (see the class doc): ONE conditional PUT, <c>IfNoneMatch: *</c>.
+    /// False on 412 = a concurrent writer claimed the target version — engineered-wood surfaces it as
+    /// <c>DeltaConflictException</c> and the OCC/rebase machinery takes over.
+    ///
+    /// <para>Replaced <c>RenameAsync</c> at engineered-wood 0.3.0, which removed it from
+    /// <c>ITableFileSystem</c> in favour of this. The conditional PUT was always the load-bearing half here —
+    /// the old shape wrote a temp object, GOT it back, PUT it conditionally and DELETEd the temp, so this is
+    /// **one request per commit instead of three** with the atomicity unchanged. Nothing else on this
+    /// filesystem regresses: the directory rename the dbt table swap needs is a separate method
+    /// (<c>RenameDirectory</c>) and is untouched.</para>
+    /// </summary>
+    public async ValueTask<bool> TryWriteAllBytesAsync(string path, ReadOnlyMemory<byte> data,
+                                                      CancellationToken cancellationToken = default)
     {
         var c = _client.Value;
-        string source = Key(sourcePath);
-        string target = Key(targetPath);
-        using var got = await c.GetObjectAsync(_bucket, source, cancellationToken).ConfigureAwait(false);
-        using var buffer = new MemoryStream();
-        await got.ResponseStream.CopyToAsync(buffer, cancellationToken).ConfigureAwait(false);
+        using var buffer = new MemoryStream(data.Length);
+        await buffer.WriteAsync(data, cancellationToken).ConfigureAwait(false);
         buffer.Position = 0;
         try
         {
             await c.PutObjectAsync(new PutObjectRequest
             {
                 BucketName = _bucket,
-                Key = target,
+                Key = Key(path),
                 InputStream = buffer,
                 IfNoneMatch = "*",
             }, cancellationToken).ConfigureAwait(false);
@@ -271,14 +277,6 @@ internal sealed class S3CommitFileSystem : ITableFileSystem
         catch (AmazonS3Exception ex) when (ex.StatusCode == HttpStatusCode.PreconditionFailed)
         {
             return false;
-        }
-        // Target committed; the temp is best-effort cleanup (a leftover temp is an invisible orphan).
-        try
-        {
-            await c.DeleteObjectAsync(_bucket, source, cancellationToken).ConfigureAwait(false);
-        }
-        catch
-        {
         }
         return true;
     }

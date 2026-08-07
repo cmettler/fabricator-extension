@@ -220,20 +220,35 @@ internal sealed class AdlsGen2TableFileSystem : ITableFileSystem
         return new OneLakeSequentialFile(file);
     }
 
-    public async ValueTask<bool> RenameAsync(
-        string sourcePath, string targetPath, CancellationToken cancellationToken = default)
+    /// <summary>
+    /// The put-if-absent commit primitive (the whole reason for this filesystem): a conditional upload with
+    /// <c>IfNoneMatch=*</c>, so a target that already exists returns false — the Delta commit-conflict signal
+    /// engineered-wood maps to <c>DeltaConflictException</c> — instead of overwriting.
+    ///
+    /// <para>Replaced <c>RenameAsync</c> at engineered-wood 0.3.0, which removed it from
+    /// <c>ITableFileSystem</c> in favour of this. The atomicity is the same guarantee via the same condition,
+    /// applied to the write itself rather than to a rename of a temp file, so the commit costs one request
+    /// instead of three. ⚠ The 409 arm is the one that actually fires: MEASURED against live OneLake
+    /// (2026-07-31, scratchpad/adlsprobe, deterministic — no race needed) a conditional create on an EXISTING
+    /// path raises <b>409 PathAlreadyExists</b>, not 412. The 412 is kept for any ADLS-compatible endpoint
+    /// that answers the precondition instead of the existence check.</para>
+    /// </summary>
+    public async ValueTask<bool> TryWriteAllBytesAsync(
+        string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
     {
-        // A TRUE atomic ADLS rename (the whole reason for this filesystem): put-if-absent via IfNoneMatch=*
-        // on the destination, so a conflicting target returns false (the Delta commit-conflict signal
-        // engineered-wood maps to DeltaConflictException) instead of overwriting.
-        var src = File(sourcePath);
+        var file = File(path);
+        using var ms = new MemoryStream(data.Length);
+        await ms.WriteAsync(data, cancellationToken).ConfigureAwait(false);
+        ms.Position = 0;
         try
         {
-            await src.RenameAsync(
-                destinationPath: Resolve(targetPath),
-                destinationFileSystem: _fs.Name,
-                destinationConditions: new DataLakeRequestConditions { IfNoneMatch = ETag.All },
-                cancellationToken: cancellationToken).ConfigureAwait(false);
+            await file.UploadAsync(
+                ms,
+                new DataLakeFileUploadOptions
+                {
+                    Conditions = new DataLakeRequestConditions { IfNoneMatch = ETag.All },
+                },
+                cancellationToken).ConfigureAwait(false);
             return true;
         }
         catch (RequestFailedException ex) when (ex.Status == 409 || ex.Status == 412)

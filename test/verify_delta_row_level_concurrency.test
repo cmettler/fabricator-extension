@@ -342,7 +342,15 @@ DETACH rs;
 #
 # So this needs a third table with THREE files, a NON-pushable predicate (⇒ StageWholeTableRead), and a
 # racer landing a dataChange=true remove on a DIFFERENT file (⇒ not in resolvedPaths).
-# MUTATION-TESTED: with `effectiveReads = reads`, the COMMIT below fails; with the exemption it lands.
+#
+# ⚠ THE MECHANISM MOVED AT THE engineered-wood 0.3.0 BUMP, and this section is what caught it. It used to
+# be an EW patch (`ExemptRowLevelFromWholeTableRead`, 66 lines) making the LIBRARY ignore a whole-table
+# declaration the host had just made; it is now the host simply NOT MAKING that declaration for a row-level
+# DML at write_serializable (DeltaCatalog's `DeclareWholeTableRead` call). Same behaviour, no divergence —
+# and the right place, since whether our flag is a real dependency or a scan artefact is the HOST's
+# knowledge, which is precisely why upstream declined to implement the exemption.
+# MUTATION-TESTED, against the new mechanism: declaring unconditionally makes the COMMIT below fail with
+# `ConcurrentDeleteRead ... which this transaction read`; withholding it lands.
 # Its own catalog because `rl` was detached at §10, and its own path because `t` above is single-file.
 statement ok
 ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/rowlevel_excl' AS rx (TYPE fabricator, PROVIDER 'delta', isolation_level 'write_serializable');

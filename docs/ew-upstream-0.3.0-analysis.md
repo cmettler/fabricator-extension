@@ -245,6 +245,65 @@ code.** Each one needs checking before it is believed.
 
 ---
 
+## 2a. ⚠ THE ISSUE TRACKER — read it, the commits do not carry the plan (user-prompted, 2026-08-07)
+
+I analysed 15 commits, the release notes and the public API and never opened
+<https://github.com/clast-project/engineered-wood/issues>. The user did, and four open issues change our
+conclusions. **Upstream's tracker states intent; the commit log only states what already happened.**
+
+### #88 — our isBlindAppend patch is upstream's own filed issue, and it asks for THREE things we do not do
+
+*"the blind-append exemption is inferred from a commit's actions, and the inference forgives commits Spark
+would not."* Our patch is one of its four decisions. The rest:
+
+1. **WRITE the flag**, sourced from `LogCommitRequest` (blind read set + no planned removes). ⇒ this is the
+   **cross-engine gap CLAUDE.md carries as OPEN** — *"we do not emit `commitInfo.isBlindAppend`, so a Fabric
+   Spark transaction ABORTS against our concurrent append"*, measured live on Fabric Spark 4.1.1. It is now
+   cheap for exactly the reason §1a gives: `LogCommitRequest` carries the read set. **Our write-half work and
+   upstream's issue are the same work** — do not build it privately.
+2. **TWO divergent inferences**, confirmed by reading both: `ConflictChecker.IsBlindAppend` requires
+   `hasAdd`; the one inside `CheckLogicalRebaseAsync` (`DeltaTable.cs:7513`) starts `blindAppend = true` and
+   clears only on remove/metadata/protocol, so an **EMPTY commit counts as blind** there. We reach only the
+   first, but an offer should unify them.
+3. **"Absent" is explicitly UNDECIDED upstream** — the issue lists both "trust the inference (permissive,
+   current)" and "treat as not-blind (conservative)". Our patch picks the first and has the measured reason
+   (EW emits no flag itself, so `getOrElse(false)` would make ordinary EW-to-EW concurrent appends start
+   conflicting). ⇒ we have a stake in that decision and should say so rather than ship a fait accompli.
+
+Upstream also draws a distinction ours does not: *"a recorded `false` should be trusted absolutely, while a
+recorded `true` is a claim by another writer."*
+
+### #86 — DML-written tables NEVER CHECKPOINT, and it revises two of this session's findings
+
+*"CheckpointInterval is honoured by two commit paths out of twelve."* Honoured: `WriteAsync`,
+`CommitDataFilesAsync`. **Not honoured: `DeltaTransaction.CommitAsync`, every delete, every update,
+`CompactAsync`/OPTIMIZE, every schema change** — i.e. our entire write surface beyond a plain append.
+
+**MEASURED on our side**, same table shape, 26 commits each: 24 INSERTs ⇒ **3 checkpoints**; 24 DELETEs ⇒
+**0 checkpoints**.
+
+- **It revises the S3 slowness analysis.** The measured ~10 ms per dead commit is a cost only because there
+  is no checkpoint to resume from. ⚠ And the **unattributed 3× residual** compared two tables without ever
+  checking their checkpoint state — that is the variable I did not control, the same confound shape caught
+  earlier the same day with the per-commit/per-file slope. **Do not quote that residual until it is retaken
+  with checkpoint presence held constant.**
+- **It revises the log-cleanup offer (4).** "engineered-wood never deletes a superseded commit" is true but
+  incomplete: cleanup DEPENDS on checkpoints, and a DML-written table has none — so even a correct cleanup
+  could reclaim nothing on our tables. The two compound, and #86 is the one to fix first.
+
+### #54 — a live risk in what this session COMMITTED
+
+*"VACUUM collects every sidecar directory it does not know about, starting with `_delta_index`."* The S3
+suite teardown added today runs `VACUUM … RETAIN 0 HOURS`. Harmless on the rig (nothing there writes
+sidecars) — but it must not be recommended to users, and any table with a sidecar index is exposed.
+
+### #85 / #84 — the partition-path opportunity is NOT as clean as §3.2 says
+
+§3.2 reads #77 as retiring the "do not hand-roll the partition split" warning. #85 says that ground truth is
+a **macOS-only measurement and Spark disagrees with itself on Windows**, and #84 says partition values
+containing `< > |` or a trailing space **cannot be written on Windows at all**. ⇒ `DeltaPath.BuildPartitionPath`
+being public does not mean the encoding question is settled. Treat §3.2 as downgraded.
+
 ## 3. What this could RETIRE or IMPROVE on our side
 
 The user's instruction for this bump: **early version, no back-compat needed — prefer a clean refactor over
@@ -290,6 +349,93 @@ measured.** Everything below was taken against pin `3794fe4` and must be RE-TAKE
 - The [delta-snapshot-caching](delta-snapshot-caching.md) decision gate, which #41 already re-priced once.
 
 ---
+
+## 4a. PHASE A — DONE. The patch set is 4 files / +175 → **ONE file / +45**, and it is offer-ready
+
+Branch `fabricator-patches-v2` off `fa9b556`. What it took, in full:
+
+| change | kind |
+|---|---|
+| `IsolationLevel` namespace, 2 sites | mechanical |
+| `TryWriteAllBytesAsync` on 3 filesystems, replacing `RenameAsync` | required by 0.3.0 |
+| the whole-table exemption moved OUT of EW into the host | **patch retired** |
+| isBlindAppend re-cut onto the public `ConflictChecker` | **the one remaining patch** |
+
+The surviving patch carries `// [FABRICATOR-PATCH: OFFER-READY]` naming what retires it — the marking
+convention CLAUDE.md has wanted since the upstream-strategy entry, now cheap because there is one of them.
+
+### ⚠ 4a.1 THE FINDING THAT MATTERS MOST: 0.3.0 turned a latent commit unsafety into a WRONG ANSWER
+
+`verify_delta_row_level_concurrency` §1 failed at the **first** scenario after the bump: a buffered DELETE
+committed **v2 on top of a concurrent autocommit DELETE's v2**, silently resurrecting the row the other
+statement had removed. Both statements reported success.
+
+Cause, from the debug log rather than from reading: pre-0.3.0, `TransactionLog.WriteCommitAsync` began with
+`if (await _fs.ExistsAsync(targetPath)) throw` before its write-to-temp-then-rename. **0.3.0 deleted that
+probe** — correctly, since a check-then-write is not a commit guarantee — leaving the entire guarantee on
+`TryWriteAllBytesAsync`. Our `DuckDbTableFileSystem` implements it with DuckDB's `EXCLUSIVE_CREATE`, which a
+local **Windows** root does not honour (measured long ago, docs/delta-transactions.md §8.5).
+
+So the property was ALWAYS broken; what changed is that EW stopped compensating for it. And because
+sqllogictest runs connections SEQUENTIALLY, the deleted probe had been enough to make every one of these
+suites pass — **the old code was correct only for the case with no race, which is the case a test harness
+produces.**
+
+Restored as an explicit, labelled approximation inside `DuckDbTableFileSystem.TryWriteAllBytesAsync` (the
+probe moved from EW into the one layer that can still see the path). It is pre-bump behaviour exactly:
+correct when the writers are ordered, racy when they are not, and NOT a satisfaction of upstream's contract.
+It is not paid where it would hurt — a SECRET-named s3 or abfss attach commits through
+`S3CommitFileSystem` / `AdlsGen2TableFileSystem`, which have real conditional writes and never reach it.
+
+**The honest end state is Phase D:** make that method REFUSE rather than approximate, behind a per-backend
+capability probe rather than a platform guess. Upstream now states the contract, which makes the refusal
+defensible where before it would have looked like gratuitous strictness.
+
+### 4a.2 The exemption did not need re-cutting — it needed MOVING, and upstream's objection was right
+
+The 66-line `ExemptRowLevelFromWholeTableRead` patch made the LIBRARY ignore a whole-table declaration the
+host had just made. It is now the host **not making the declaration**: `DeltaCatalog` skips
+`DeclareWholeTableRead()` when the flush stages row-level deletes at `write_serializable` — EW's own gate
+(`exempt && rowLevel && isolationLevel != Serializable`) reproduced on our side of the line.
+
+Identical behaviour, zero divergence, and it lands exactly where upstream said it belonged when it declined
+the feature: *"a library must not decide on a host's behalf that it read less than it declared."* Whether our
+whole-table flag is a real dependency or a scan artefact is the HOST's knowledge. **We were asking EW to
+disbelieve a declaration when we should have been not making it.**
+
+⇒ **offer (2) is withdrawn, and this is the third patch retired by ceasing to need it** (after `RowUpdateMode`
+and the `WriteChangeDataFilesForAsync` overload). The known over-breadth is unchanged and now sits in code we
+own, where the provenance fix can actually live.
+
+Gate: `verify_delta_row_level_concurrency` **93**, and §11's mutation note was rewritten against the new
+mechanism — the old one named a variable (`effectiveReads`) that no longer exists.
+
+### 4a.3 `CheckLogicalRebaseAsync` — upstream ALREADY implements our exemption, on the other surface
+
+Found by asking whether that method is useful to us elsewhere. Its signature carries
+**`bool rowLevelDml = false`**, documented as: *"Read-set checks … run UNLESS `rowLevelDml` — row-level mode
+replaces them with the row-granular validation the rebase already performed."*
+
+That is our exemption's argument, and **broader**: ours dropped only the `WholeTable` facet, this drops the
+read-set checks entirely for a row-level DML.
+
+⇒ **upstream DECLINED these semantics on the transaction surface while shipping them as a public parameter on
+the buffered surface.** That makes the offer a genuine INCONSISTENCY argument rather than a semantics request
+— which matters, because CLAUDE.md records an earlier attempt to pitch this as an inconsistency being
+retracted for being a semantics request in disguise. This one is not: the two surfaces disagree, and
+`CheckLogicalRebaseAsync` is the one we agree with.
+
+**Two other uses, one real and one to avoid:**
+- **Fail-fast on the eager-write buffer (real).** Our buffered flush writes data files at STATEMENT time and
+  learns of a conflict only at COMMIT, so a doomed `BEGIN … COMMIT` writes every byte and then relies on
+  `DiscardDataFilesAsync` to reclaim them. This method is cheap (reads the commits since base, no data IO)
+  and could surface the doom earlier. ⚠ It THROWS rather than returning a verdict, and a conflict at
+  statement k need not be one at commit (the loop may rebase past it) — so the honest use is a DIAGNOSTIC or
+  a warning, never an early hard abort, which would kill transactions that would have committed.
+- ⚠ **And the framing to keep:** EW's own comment calls this "what the buffered caller re-validates with",
+  and we do not call it — we route through `DeltaTransaction.CommitAsync`. The useful reading is not "so our
+  patch covers our path" but **"EW expects a buffered host to use this and we don't"** — a divergence from the
+  intended shape that nobody chose. Settle it in Phase C.
 
 ## 5. The approach: a FRESH branch off upstream, not a merge (decided 2026-08-07, user)
 

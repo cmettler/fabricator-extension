@@ -124,19 +124,29 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
     public ValueTask<bool> ExistsAsync(string path, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        // NOT a glob probe: DuckDB's S3 (httpfs) glob ECHOES a wildcard-free path back without checking
-        // the object store, so a literal glob reported every path as existing — which made engineered-wood's
-        // commit-0 existence pre-check throw a phantom DeltaConflictException on S3/MinIO. Probing by
-        // opening for read (a HEAD on object stores) is existence-accurate on every backend.
+        return new ValueTask<bool>(ResolvedExists(Resolve(path)));
+    }
+
+    /// <summary>
+    /// Existence of an ALREADY-RESOLVED path. Shared by <see cref="ExistsAsync"/> and the commit primitive,
+    /// which holds a resolved path already and must not resolve it twice.
+    ///
+    /// <para>NOT a glob probe: DuckDB's S3 (httpfs) glob ECHOES a wildcard-free path back without checking
+    /// the object store, so a literal glob reported every path as existing — which made engineered-wood's
+    /// commit-0 existence pre-check throw a phantom DeltaConflictException on S3/MinIO. Probing by opening
+    /// for read (a HEAD on object stores) is existence-accurate on every backend.</para>
+    /// </summary>
+    private bool ResolvedExists(string resolved)
+    {
         try
         {
-            nint file = HostFs.OpenRead(Opener, Resolve(path));
+            nint file = HostFs.OpenRead(Opener, resolved);
             HostFs.Close(file);
-            return new ValueTask<bool>(true);
+            return true;
         }
         catch
         {
-            return new ValueTask<bool>(false);
+            return false;
         }
     }
 
@@ -222,48 +232,78 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
         return new ValueTask<ISequentialFile>(new DuckDbSequentialFile(file));
     }
 
-    public ValueTask<bool> RenameAsync(
-        string sourcePath, string targetPath, CancellationToken cancellationToken = default)
+    /// <summary>
+    /// The put-if-absent commit primitive, via DuckDB's <c>EXCLUSIVE_CREATE</c>. False = the target exists,
+    /// which is the commit-conflict signal engineered-wood maps to <c>DeltaConflictException</c>.
+    ///
+    /// <para>Replaced <c>RenameAsync</c> at engineered-wood 0.3.0, which removed it from
+    /// <c>ITableFileSystem</c> in favour of this. Strictly simpler here: the old shape wrote a temp file,
+    /// read it back, exclusively created the target, copied the bytes in and deleted the temp — this writes
+    /// the bytes it was handed. Behaviour is otherwise UNCHANGED, deliberately: a bump is the wrong place to
+    /// change behaviour.</para>
+    ///
+    /// <para>⚠ <b>THIS IMPLEMENTATION DOES NOT MEET THE CONTRACT ON EVERY BACKEND, AND THAT IS A KNOWN,
+    /// MEASURED GAP RATHER THAN AN OVERSIGHT.</b> Upstream now states the requirement in
+    /// <c>ITableFileSystem.TryWriteAllBytesAsync</c>: the create must be atomic, because "an implementation
+    /// that writes unconditionally, or that checks existence and then writes, lets two concurrent writers
+    /// both believe they won; the loser's commit silently overwrites the winner's". <c>EXCLUSIVE_CREATE</c>
+    /// honours that on POSIX and on OneLake/ADLS, and MEASURABLY DOES NOT on a local <b>Windows</b> root
+    /// (<c>fabricator_fs_write_probe</c> reports it succeeding on an existing file) nor on <c>s3://</c>
+    /// through httpfs. Consequences measured and recorded in docs/delta-transactions.md §8.5 and §8.3:
+    /// 6 writers × 3 INSERTs on a Windows root landed 400 of 900 rows with every writer exiting 0; a
+    /// secretless s3 attach landed 8 of 48 commits.</para>
+    ///
+    /// <para>Those two roots are why <see cref="S3CommitFileSystem"/> and
+    /// <see cref="AdlsGen2TableFileSystem"/> exist — a SECRET-named s3 or abfss attach never reaches this
+    /// method for a commit. What remains exposed is a local Windows root and a secretless s3 attach (the
+    /// latter already warns at ATTACH). Making this method REFUSE rather than silently approximate is the
+    /// right end state and is deliberately not done here: it is a behaviour change, it needs a per-backend
+    /// capability probe rather than a platform guess, and it belongs in its own slice with its own gate.</para>
+    /// </summary>
+    public ValueTask<bool> TryWriteAllBytesAsync(
+        string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
     {
-        // DuckDB's FileSystem has no atomic-no-overwrite MoveFile (it overwrites on local, and is NOT
-        // implemented on Azure DFS). So emulate the put-if-absent rename that Delta's commit relies on:
-        // create the TARGET with EXCLUSIVE_CREATE (the put-if-absent primitive, honored on OneLake/ADLS + POSIX)
-        // and copy the source bytes in; if the target already exists, return false (the commit-conflict signal
-        // engineered-wood maps to DeltaConflictException) WITHOUT touching the source (the caller deletes it).
         cancellationToken.ThrowIfCancellationRequested();
-        var src = Resolve(sourcePath);
-        var dst = Resolve(targetPath);
-        nint bytesFile = HostFs.OpenRead(Opener, src);
-        byte[] bytes;
-        try
-        {
-            long size = HostFs.Size(bytesFile);
-            bytes = new byte[size];
-            if (size > 0)
-            {
-                fixed (byte* bp = bytes)
-                {
-                    HostFs.Read(bytesFile, bp, size, 0);
-                }
-            }
-        }
-        finally
-        {
-            HostFs.Close(bytesFile);
-        }
-
+        var dst = Resolve(path);
         EnsureParentDir(dst);
+        // ⚠ THE EXISTENCE PROBE IS LOAD-BEARING AND IT IS NOT ATOMIC — see the remarks above.
+        //
+        // It is here because engineered-wood 0.3.0 DELETED the equivalent probe from its own
+        // TransactionLog.WriteCommitAsync (which read `if (await _fs.ExistsAsync(targetPath)) throw` before
+        // renaming) on the correct grounds that a check-then-write is not a commit guarantee. That left the
+        // whole guarantee resting on TryOpenWriteExclusive, which a local WINDOWS root does not honour — so
+        // the bump turned a latent unsafety into an immediate wrong ANSWER: verify_delta_row_level_concurrency
+        // §1 had a buffered DELETE commit v2 ON TOP of a concurrent autocommit DELETE's v2, silently
+        // resurrecting the row the other statement removed.
+        //
+        // So this restores the PRE-BUMP semantics exactly, at the layer that can still see the path: correct
+        // whenever the two writers are ordered (which is every sqllogictest, every single-process host, and
+        // the overwhelming majority of real use), racy when they are not. It is an APPROXIMATION and is
+        // labelled as one; it must not be read as satisfying the contract.
+        //
+        // Cost is one probe per commit. It is not paid where it would hurt: a SECRET-named s3 or abfss attach
+        // commits through S3CommitFileSystem / AdlsGen2TableFileSystem, which have a real conditional write
+        // and never reach this method. What pays is a local root (a stat) and a secretless remote attach —
+        // which already warns at ATTACH that it is not multi-writer safe.
+        //
+        // ⚠ The probe is an OPEN-FOR-READ, matching ExistsAsync above, NOT a glob: DuckDB's S3 glob echoes a
+        // wildcard-free path back without consulting the store, which would report every commit path as
+        // already existing and turn every commit into a phantom conflict.
+        if (ResolvedExists(dst))
+        {
+            return new ValueTask<bool>(false); // target exists => commit conflict
+        }
         if (!HostFs.TryOpenWriteExclusive(Opener, dst, out nint target))
         {
-            return new ValueTask<bool>(false); // target exists => conflict; leave source for the caller to delete
+            return new ValueTask<bool>(false); // target exists => commit conflict
         }
         try
         {
-            if (bytes.Length > 0)
+            if (!data.IsEmpty)
             {
-                fixed (byte* bp = bytes)
+                fixed (byte* bp = data.Span)
                 {
-                    HostFs.WriteBytes(target, bp, bytes.Length);
+                    HostFs.WriteBytes(target, bp, data.Length);
                 }
             }
         }
@@ -271,7 +311,6 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
         {
             HostFs.CloseWrite(target);
         }
-        HostFs.Remove(Opener, src); // the source temp is consumed by the (emulated) rename
         return new ValueTask<bool>(true);
     }
 
