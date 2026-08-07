@@ -716,11 +716,20 @@ public sealed class DeltaCatalog : IBackendCatalog
         };
     }
 
-    /// <summary>Resolves the effective write tuning for one write: the per-catalog ATTACH defaults overlaid with the
-    /// session <c>delta_write_options</c> JSON setting (setting wins per key). Partition columns come from
+    /// <summary>Resolves the effective write tuning for one write against ONE TABLE. Precedence, lowest first:
+    /// <b>ATTACH defaults &lt; <c>SET delta_write_options</c> &lt; the table's persisted
+    /// <c>fabricator.parquet.*</c> properties &lt; the statement's <c>WITH</c></b> (the last applied by
+    /// <c>ApplyWithOptions</c> on the returned spec). Partition columns come from
     /// <paramref name="nativePartitionColumns"/> (a native <c>PARTITIONED BY</c> clause) when present, else the
     /// setting's <c>partition_by</c>. Returns null only when nothing is specified (=> engineered-wood defaults).</summary>
-    private DeltaWriteSpec? ResolveWriteSpec(IReadOnlyList<string>? nativePartitionColumns, string? schemaModeArg)
+    /// <param name="tablePath">The table being written, or null where there genuinely is no table yet (a CREATE
+    /// resolving the spec that will CREATE it). ⚠ REQUIRED — not optional — deliberately: this method used to be
+    /// table-AGNOSTIC, and the persisted layer is invisible from its result, so a call site that forgot to say
+    /// which table would silently write at the wrong settings. Making the compiler ask the question is the whole
+    /// mechanism; the same omission on the rewrite paths is what let OPTIMIZE undo its own configuration for
+    /// months.</param>
+    private DeltaWriteSpec? ResolveWriteSpec(IReadOnlyList<string>? nativePartitionColumns, string? schemaModeArg,
+                                             string? tablePath)
     {
         var sessionJson = ProviderSettingsStore.Instance.GetString(
             DeltaBackendName, DeltaBackend.WriteOptionsSetting);
@@ -759,6 +768,54 @@ public sealed class DeltaCatalog : IBackendCatalog
             else if (ParseBoolOption(sessionJson, "merge_schema")) { schemaMode = DeltaSchemaMode.Merge; }
         }
         if (!string.IsNullOrWhiteSpace(schemaModeArg)) { schemaMode = ParseSchemaMode(schemaModeArg); }
+
+        // ── The PERSISTED layer: the table's own fabricator.parquet.* declaration, which OUTRANKS the session
+        // setting. That ordering is deliberate rather than incidental: the property is a property OF THE TABLE,
+        // so a stray `SET delta_write_options` in someone's session must not silently change a table's storage
+        // format; the per-statement WITH stays the escape hatch above it. Only the FILE-FORMAT knobs are read —
+        // partitioning/replace_where/schema_mode are statement semantics and are never persisted.
+        if (tablePath is not null)
+        {
+            var persisted = ParquetTuning.Parse(TableConfig(Opener(), tablePath));
+            if (!persisted.IsEmpty)
+            {
+                // ⚠ APPLY WHAT FITS, IGNORE THE REST — do NOT route this through ValidateSpecForEngine, which
+                // THROWS. A declaration made once by whoever created the table may name a knob THIS engine
+                // cannot honour, and failing would make the table unwritable by the codec engine because
+                // someone once set a native-only option. (An unparseable value is different and still throws —
+                // ParquetTuning.Parse raises it above.) See DeltaParquetProperties for the full distinction.
+                var dropped = new List<string>();
+                compression = persisted.Compression ?? compression;
+                rowGroup = persisted.RowGroupSize ?? rowGroup;
+                rowGroupBytes = persisted.RowGroupSizeBytes ?? rowGroupBytes;
+                parquetVersion = ParseParquetVersion(persisted.ParquetVersion) ?? parquetVersion;
+                bloom = persisted.BloomFilterColumns ?? bloom;
+                // Native-only, and unhonourable by the codec: DuckDB's DICTIONARY_SIZE_LIMIT is a cap on
+                // DISTINCT VALUES while engineered-wood's DictionaryPageSizeLimit is BYTES, so there is nothing
+                // to map it onto.
+                if (persisted.DictionarySizeLimit is { } dsl)
+                {
+                    if (_nativeWrite) { dictLimit = dsl; }
+                    else { dropped.Add(ParquetTuning.DictionarySizeLimitKey); }
+                }
+                // The two file-ROTATING knobs cannot be honoured on ANY path today (DuckDB refuses them with
+                // PARTITION_BY, and without it writes a directory where a Delta `add` must name one file), so a
+                // persisted one is always dropped. Persisting it is still right: the declaration outlives the
+                // limitation, and when upstream lifts it the property starts being honoured with no migration.
+                if (persisted.RowGroupsPerFile is not null) { dropped.Add(ParquetTuning.RowGroupsPerFileKey); }
+                if (persisted.FileSizeBytes is not null) { dropped.Add(ParquetTuning.FileSizeBytesKey); }
+                if (dropped.Count > 0)
+                {
+                    // Debug, not Warning: ignoring here is CORRECT rather than degraded. It is still logged
+                    // because the choice is otherwise invisible from SQL.
+                    _log.LogDebug(
+                        "delta write {Path}: table declares {Count} parquet propert(ies) this engine cannot "
+                        + "honour ({Keys}) — ignored (engine: {Engine})",
+                        tablePath, dropped.Count, string.Join(", ", dropped),
+                        _nativeWrite ? "native_write" : "engineered-wood codec");
+                }
+            }
+        }
 
         var partition = nativePartitionColumns is { Count: > 0 } ? nativePartitionColumns : settingPartition;
         var codec = ParseCompression(compression);
@@ -1178,7 +1235,9 @@ public sealed class DeltaCatalog : IBackendCatalog
             throw new System.ArgumentException("delta set tblproperties: no properties given.");
         }
         long version = DeltaReader.SetTableProperties(Opener(), path, updates);
-        _sortedByCache.TryRemove(path, out _); // fabricator.sortedBy may have changed — re-read on next append
+        // Any config-derived property may have changed — fabricator.sortedBy AND the fabricator.parquet.*
+        // tuning both come from here, so one eviction covers both.
+        _tableConfigCache.TryRemove(path, out _);
         _log.LogInformation("delta set tblproperties {Path}: {Count} propertie(s) -> v{Version}",
             path, updates.Count, version);
         var keys = updates.Select(u => u.Key).ToArray();
@@ -1186,17 +1245,41 @@ public sealed class DeltaCatalog : IBackendCatalog
         return TwoColumn("property", keys, "value", vals);
     }
 
-    // fabricator.sortedBy per table path, read ONCE per catalog instance (an extra table open per append
-    // otherwise); invalidated on set_tblproperties / DROP / RENAME through this catalog. A property changed
-    // by ANOTHER writer takes effect here on re-attach — acceptable: the ordering is advisory LAYOUT, never
-    // correctness.
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, IReadOnlyList<string>?>
-        _sortedByCache = new();
+    // The table's WHOLE Delta configuration per table path, read ONCE per catalog instance (every read is a
+    // `_delta_log` LIST — an extra table open per append otherwise); invalidated on set_tblproperties / DROP /
+    // RENAME through this catalog. ⚠ ONE cache for every config-derived property (fabricator.sortedBy AND the
+    // fabricator.parquet.* tuning) on purpose: two caches would mean two opens per append and two sets of
+    // invalidation sites to keep in sync. A property changed by ANOTHER writer takes effect here on re-attach —
+    // acceptable for BOTH consumers, and for the same reason: each governs advisory LAYOUT / storage format,
+    // never correctness. Nothing keyed on this may ever decide what a query RETURNS.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<
+        string, IReadOnlyDictionary<string, string>?> _tableConfigCache = new();
+
+    /// <summary>The table's Delta configuration, cached per path. ⚠ A MISS IS NEVER CACHED, and that is
+    /// correctness rather than thrift: the spec for a write is resolved BEFORE the write runs, so a CTAS asks
+    /// for the configuration of a table that does not exist yet. Caching that "absent" would make the CREATE's
+    /// own persisted declaration invisible to every later statement in the session — measured exactly that way
+    /// (the property landed in the table, and the next plain INSERT still wrote SNAPPY). Note it would have
+    /// silently broken <c>fabricator.sortedBy</c> too, which shares this cache and never used to be read on a
+    /// create path: an ordered table would have quietly stopped ordering its appends.</summary>
+    private IReadOnlyDictionary<string, string>? TableConfig(nint opener, string path)
+    {
+        if (_tableConfigCache.TryGetValue(path, out var cached))
+        {
+            return cached;
+        }
+        var cfg = DeltaReader.GetTableConfigAll(opener, path);
+        if (cfg is not null)
+        {
+            _tableConfigCache[path] = cfg;
+        }
+        return cfg;
+    }
 
     private IReadOnlyList<string>? SortedByFromConfig(nint opener, string path, Schema schema)
     {
-        var cols = _sortedByCache.GetOrAdd(path, p =>
-            DeltaWriter.ParseSortedBy(DeltaReader.GetTableConfig(opener, p, DeltaWriter.SortedByKey)));
+        var cols = DeltaWriter.ParseSortedBy(
+            TableConfig(opener, path) is { } cfg && cfg.TryGetValue(DeltaWriter.SortedByKey, out var v) ? v : null);
         if (cols is not { Count: > 0 })
         {
             return null;
@@ -2068,7 +2151,25 @@ public sealed class DeltaCatalog : IBackendCatalog
         // OpenOrCreateAsync applies them at creation and an existing table keeps its metadata partitioning.
         // WITH keys overlay the resolved spec LAST (precedence: WITH > delta_write_options > ATTACH defaults),
         // and the create-flag overrides resolve against the catalog defaults.
-        var spec = ApplyWithOptions(ResolveWriteSpec(partitionColumns, schemaMode), withOpts);
+        // ⚠ THE PERSISTED DECLARATION IS READ ON EVERY WRITE, INCLUDING A CREATE OR REPLACE — measured, and
+        // the opposite (treat a replace as "redefines the table, inherit nothing") is WORSE in exactly the way
+        // this feature exists to fix. A `CREATE OR REPLACE` does NOT re-create the Delta table: the log
+        // continues and the metaData commit copies the configuration forward, so the table still DECLARES its
+        // tuning afterwards. Inheriting nothing would therefore write the replace's files at the engine default
+        // INTO a table declared zstd, and the next plain INSERT — which does read the declaration — would flip
+        // back: mixed compression produced by one statement.
+        //
+        // ⚠ The corollary is a real limitation, pinned in verify_with_options and documented in the README: a
+        // REPLACE cannot CHANGE the declaration (its WITH applies to that statement's write only), because
+        // create-time configuration is applied at v0 and engineered-wood's OpenOrCreateAsync returns early for
+        // an existing table. That is not specific to the parquet keys — it is equally true of every create flag
+        // (deletion_vectors / column_mapping / row_tracking / change_data_feed) and of the `delta.*` WITH
+        // properties beside them. `fabricator_delta_set_tblproperties` is what changes a declaration.
+        //
+        // A brand-new table needs no special case: it does not exist, so the read finds nothing — and a MISS IS
+        // NOT CACHED (see TableConfig), which is what makes the CREATE's own declaration visible to the very
+        // next statement.
+        var spec = ApplyWithOptions(ResolveWriteSpec(partitionColumns, schemaMode, tablePath), withOpts);
         var flags = EffectiveCreateFlags(withOpts);
         // Data mode: schema_mode=overwrite forces a full replace (adopt the source schema); CREATE/CTAS/REPLACE
         // also overwrite; otherwise it's an append (INSERT / COPY create_table=false / schema_mode=merge).
@@ -2208,7 +2309,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                     schemaName, tableName,
                     persisted is null ? "" : string.Join(",", persisted), string.Join(",", sortColumns));
                 DeltaReader.SetSortedBy(opener, tablePath, sortColumns, default);
-                _sortedByCache.TryRemove(tablePath, out _);
+                _tableConfigCache.TryRemove(tablePath, out _);
             }
         }
 
@@ -2431,8 +2532,46 @@ public sealed class DeltaCatalog : IBackendCatalog
         {
             spec = spec with { ParquetVersion = w.ParquetVersion };
         }
-        if (w.Properties is { Count: > 0 } props)
+        // ── PERSIST the statement's own parquet tuning as table properties, so a later plain INSERT, a
+        // merge-on-read post-image, a copy-on-write rewrite and OPTIMIZE's compaction all keep writing the
+        // format the table was created with — whichever catalog happens to run them.
+        //
+        // ⚠ ONLY WHAT THIS STATEMENT'S `WITH` DECLARED, never the fully-resolved spec. Persisting the resolved
+        // value would turn a session `SET delta_write_options` into a permanent property of the table, which is
+        // exactly what the precedence rule (property OUTRANKS setting) exists to prevent — a stray SET must not
+        // silently change a table's storage format, still less durably. The WITH is the explicit, user-authored,
+        // per-table layer, so it is the one that persists.
+        //
+        // ⚠ EVERY declared key persists, INCLUDING ones this engine cannot honour (see DeltaParquetProperties):
+        // the reading engine intersects with its own capabilities. Note the keys ride `CreateProperties`, whose
+        // only consumer is `CreateConfig` at creation — engineered-wood's OpenOrCreateAsync returns early on an
+        // existing table and ignores the configuration entirely — so this is create-only by construction, the
+        // same lifecycle as the `delta.*` properties it sits beside, and a plain INSERT cannot rewrite it.
+        var tuning = new ParquetTuning(
+            Compression: w.Compression,
+            RowGroupSize: w.RowGroupSize,
+            RowGroupSizeBytes: w.RowGroupSizeBytes,
+            ParquetVersion: w.ParquetVersion switch
+            {
+                DeltaParquetVersion.V1 => "V1",
+                DeltaParquetVersion.V2 => "V2",
+                _ => null,
+            },
+            DictionarySizeLimit: w.DictionarySizeLimit,
+            RowGroupsPerFile: w.RowGroupsPerFile,
+            FileSizeBytes: w.FileSizeBytes,
+            BloomFilterColumns: w.BloomFilterColumns);
+        if (w.Properties is { Count: > 0 } || !tuning.IsEmpty)
         {
+            var props = new Dictionary<string, string>(System.StringComparer.Ordinal);
+            foreach (var kv in tuning.Render()) { props[kv.Key] = kv.Value; }
+            // An explicit `WITH ("fabricator.parquet.compression"='…')` wins over the same value derived from
+            // `WITH (parquet_compression='…')` — the raw property spelling is the more specific request, and
+            // this way the two spellings cannot disagree about which one landed.
+            if (w.Properties is { Count: > 0 } declared)
+            {
+                foreach (var kv in declared) { props[kv.Key] = kv.Value; }
+            }
             spec = spec with { CreateProperties = props };
         }
         return ValidateSpecForEngine(spec);
@@ -2555,8 +2694,12 @@ public sealed class DeltaCatalog : IBackendCatalog
                               inCommitTimestamps: flags.InCommitTimestamps,
                               changeDataFeed: flags.ChangeDataFeed,
                               rowTracking: flags.RowTracking,
-                              spec: ApplyWithOptions(ResolveWriteSpec(partitionColumns, schemaModeArg: null),
-                                                     withOpts),
+                              // tablePath: null — the table does not exist yet, so there is no persisted
+                              // declaration to read. A CREATE OR REPLACE deliberately does NOT inherit the
+                              // replaced table's tuning either: the statement defines the new table.
+                              spec: ApplyWithOptions(
+                                  ResolveWriteSpec(partitionColumns, schemaModeArg: null, tablePath: null),
+                                  withOpts),
                               columnMapping: flags.ColumnMapping, serializable: _serializable,
                               sortedBy: sortColumns);
         if (markCreated)
@@ -2654,7 +2797,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                         inCommitTimestamps: _inCommitTimestampsOnCreate,
                         changeDataFeed: _changeDataFeedOnCreate,
                         rowTracking: _rowTrackingOnCreate,
-                        spec: ResolveWriteSpec(null, null), nativeWrite: _nativeWrite,
+                        spec: ResolveWriteSpec(null, null, kv.Key), nativeWrite: _nativeWrite,
                         columnMapping: _columnMappingMode, serializable: _serializable);
                     _log.LogInformation("delta txn {Txn} commit {Path}: v{Version} ({Rows} buffered row(s))",
                         txnId, kv.Key, v, pending.Rows);
@@ -3910,7 +4053,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         // snappy / 122880 / none. MEASURED on the codec engine with compression 'zstd': the CTAS data files
         // came out ZSTD and the change files SNAPPY, in the same table.
         pending.HeldTable = await EngineeredWood.DeltaLake.Table.DeltaTable
-            .OpenAsync(fs, DeltaWriter.Options(ResolveWriteSpec(null, null), dataFileWriter), token)
+            .OpenAsync(fs, DeltaWriter.Options(ResolveWriteSpec(null, null, tablePath), dataFileWriter), token)
             .ConfigureAwait(false);
         return pending.HeldTable;
     }
@@ -3979,7 +4122,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// <paramref name="ifExists"/> is satisfied either way.</summary>
     public void DropTable(string schemaName, string tableName, bool ifExists)
     {
-        _sortedByCache.TryRemove(TablePath(schemaName, tableName), out _);
+        _tableConfigCache.TryRemove(TablePath(schemaName, tableName), out _);
         long dropTxn = AmbientTransaction.Current;
         // CREATE + DROP inside one transaction still CANCELS OUT for the buffer — but the table IS on storage
         // now (hoist slice 5), so unlike before, the real drop below must actually run. Discard this
@@ -4151,7 +4294,7 @@ public sealed class DeltaCatalog : IBackendCatalog
             ? DeltaReader.DeleteByRowIdsViaVectors(opener, path, ids, default,
                                                    rowLevelRetry: !EffectiveSerializable(tableConfig))
             : DeltaReader.DeleteByRowIds(opener, path, ids, default, _nativeWrite, _nativeRead,
-                                         ResolveWriteSpec(null, null));
+                                         ResolveWriteSpec(null, null, path));
     }
 
     public IArrowArrayStream ExecuteQuery(string sql) => throw Unsupported("raw query");
@@ -4189,7 +4332,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 _log.LogInformation("delta exec OPTIMIZE {Schema}.{Table} native_write={Native} full={Full}",
                     schema, table, _nativeWrite, fullRecluster);
                 return DeltaReader.Optimize(opener, path, default, _nativeWrite, _nativeRead, fullRecluster,
-                                            ResolveWriteSpec(null, null));
+                                            ResolveWriteSpec(null, null, path));
             }
             case "VACUUM":
             {
@@ -4470,7 +4613,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         MemoryProbe.Mark("delta update: arrow batch rebuilt", updates.Count);
         DeltaReader.UpdateByRowIds(opener, path, updatesBatch, default, _nativeWrite, _nativeRead,
                                    catalogSerializable: _serializable,
-                                   spec: ResolveWriteSpec(null, null));
+                                   spec: ResolveWriteSpec(null, null, path));
 
         _log.LogInformation("delta update {Schema}.{Table}: rows={Rows} set_cols={SetCols} native_write={Native}",
             schemaName, tableName, updates.Count, setColNames.Count, _nativeWrite);
@@ -4585,7 +4728,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         {
             HostFs.MoveDir(Opener(), oldPath, newPath);
         }
-        _sortedByCache.TryRemove(newPath, out _);
+        _tableConfigCache.TryRemove(newPath, out _);
     }
 
     // Object-store fallback for a directory move (no MoveDir on S3): copy each of the transaction's eager
@@ -4697,7 +4840,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 throw new System.InvalidOperationException(
                     $"delta RENAME TABLE: the transaction's buffer entry for '{t}' could not be re-keyed.");
             }
-            _sortedByCache.TryRemove(TablePath(s, t), out _);
+            _tableConfigCache.TryRemove(TablePath(s, t), out _);
             _log.LogInformation("delta txn {Txn} rename created table {Old} -> {New}",
                 alterTxn, TablePath(s, t), renNew);
             return;
@@ -4775,8 +4918,8 @@ public sealed class DeltaCatalog : IBackendCatalog
                 // move (FileSystem::MoveFile, atomic). A secretless abfss:// / s3:// still throws cleanly
                 // (attach with a SECRET for rename support).
                 RenameTableFolder(TablePath(s, t), TablePath(s, newName));
-                _sortedByCache.TryRemove(TablePath(s, t), out _);
-                _sortedByCache.TryRemove(TablePath(s, newName), out _);
+                _tableConfigCache.TryRemove(TablePath(s, t), out _);
+                _tableConfigCache.TryRemove(TablePath(s, newName), out _);
                 return;
             }
             case AlterKind.SetSortedBy:
@@ -4790,7 +4933,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                     ? []
                     : System.Text.Json.JsonSerializer.Deserialize<List<string>>(a1!) ?? [];
                 DeltaReader.SetSortedBy(Opener(), TablePath(s, t), sortCols, default);
-                _sortedByCache.TryRemove(TablePath(s, t), out _); // the property changed — re-read on next append
+                _tableConfigCache.TryRemove(TablePath(s, t), out _); // the config changed — re-read on next write
                 return;
             }
             case AlterKind.SetPartitionedBy:

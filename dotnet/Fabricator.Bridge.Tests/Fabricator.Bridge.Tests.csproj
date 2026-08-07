@@ -50,6 +50,16 @@
     -->
     <Compile Include="..\Fabricator.Bridge\FabricApi\FabricSqlEndpointHost.cs"
              Link="Linked\FabricSqlEndpointHost.cs" />
+    <!--
+      The persisted Delta parquet tuning (the fabricator.parquet.* table properties). Admissible because the
+      compression name and parquet version stay STRINGS in it — their enums live on the engine side — which is
+      what keeps its closure the BCL. Worth testing here rather than only through SQL: the round trip is what
+      guarantees a property written by a CREATE is read back as the same tuning, and the malformed-value cases
+      can be reached from SQL only via fabricator_delta_set_tblproperties, so each would otherwise cost a
+      service-tier round trip to cover.
+    -->
+    <Compile Include="..\Fabricator.Bridge\DeltaParquetProperties.cs"
+             Link="Linked\DeltaParquetProperties.cs" />
   </ItemGroup>
 
 </Project>

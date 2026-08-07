@@ -922,16 +922,23 @@ internal static class DeltaReader
     /// append-shaped implicit create has nothing to read). E.g. the <c>fabricator.sortedBy</c>
     /// ordered-write spec an append re-applies.</summary>
     public static string? GetTableConfig(nint opener, string path, string key)
-        => GetTableConfigAsync(opener, path, key).GetAwaiter().GetResult();
+        => GetTableConfigAll(opener, path) is { } cfg && cfg.TryGetValue(key, out var v) ? v : null;
 
-    private static async Task<string?> GetTableConfigAsync(nint opener, string path, string key)
+    /// <summary>Reads a table's WHOLE configuration map in ONE open — null when the TABLE is absent (an
+    /// append-shaped implicit create has nothing to read). ⚠ Prefer this over repeated
+    /// <see cref="GetTableConfig"/> calls: each open is a <c>_delta_log</c> LIST, cheap locally and NOT on
+    /// OneLake/S3, so asking for two keys separately doubles a remote round trip. The catalog reads it once
+    /// per table path and caches (see <c>_tableConfigCache</c>).</summary>
+    public static IReadOnlyDictionary<string, string>? GetTableConfigAll(nint opener, string path)
+        => GetTableConfigAllAsync(opener, path).GetAwaiter().GetResult();
+
+    private static async Task<IReadOnlyDictionary<string, string>?> GetTableConfigAllAsync(nint opener, string path)
     {
         try
         {
             var fs = TableFileSystems.Create(opener, path);
             await using var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options()).ConfigureAwait(false);
-            var cfg = table.CurrentSnapshot.Metadata.Configuration;
-            return cfg is not null && cfg.TryGetValue(key, out var v) ? v : null;
+            return table.CurrentSnapshot.Metadata.Configuration;
         }
         catch
         {

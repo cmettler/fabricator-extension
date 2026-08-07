@@ -513,3 +513,264 @@ DETACH moc;
 
 statement ok
 DETACH mo;
+
+# ============================================================================
+# 8. PERSISTED PARQUET TUNING — the fabricator.parquet.* table properties.
+#
+#    Before this, a WITH was PER-STATEMENT: `CREATE TABLE t WITH (parquet_compression='zstd') AS …` wrote
+#    ZSTD and a later plain `INSERT INTO t` wrote SNAPPY, so a table accumulated MIXED compression and an
+#    incrementally-built dbt model was mostly snappy whatever it was configured for. OPTIMIZE was the worst
+#    case: it rewrites the MAJORITY of a table's bytes, so it actively undid the setting it was configured for.
+#
+#    ⚠ PIN THE ENGINE: this section runs on `lake` (native_write). A codec-only gate would pass while the
+#    SHIPPED DEFAULT path stayed broken — the same trap that hid the rewrite-path gap.
+# ============================================================================
+
+# `lake` was detached by section 3; re-attach it with the SAME options (native_read/native_write).
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/optlake' AS lake (TYPE fabricator, PROVIDER 'delta', native_read true, native_write true);
+
+statement ok
+CREATE OR REPLACE TABLE lake.main.persist WITH (parquet_compression='zstd') AS SELECT i::BIGINT AS id FROM range(2000) r(i);
+
+query II
+SELECT property, value FROM fabricator_delta_tblproperties('lake', 'main.persist')
+WHERE property LIKE 'fabricator.parquet.%' ORDER BY property;
+----
+fabricator.parquet.compression	zstd
+
+# The whole point: a PLAIN INSERT, naming no options at all, follows the table's declaration. Asserted as
+# "zero non-ZSTD chunks" rather than "some ZSTD exists" — the latter passes on the CTAS's own files while
+# the INSERT writes snappy beside them, which is precisely the bug.
+statement ok
+INSERT INTO lake.main.persist SELECT i::BIGINT FROM range(2000, 4000) r(i);
+
+query I
+SELECT count(*) FROM (SELECT DISTINCT compression FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlake/persist/*.parquet')) WHERE compression <> 'ZSTD';
+----
+0
+
+# ...and so does the merge-on-read UPDATE's post-image file.
+statement ok
+UPDATE lake.main.persist SET id = id + 1000000 WHERE id % 97 = 0;
+
+query I
+SELECT count(*) FROM (SELECT DISTINCT compression FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlake/persist/*.parquet')) WHERE compression <> 'ZSTD';
+----
+0
+
+# ...and OPTIMIZE's compaction output, the site that stings most.
+statement ok
+SELECT fabricator_exec('lake', 'OPTIMIZE main.persist');
+
+query I
+SELECT count(*) FROM (SELECT DISTINCT compression FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlake/persist/*.parquet')) WHERE compression <> 'ZSTD';
+----
+0
+
+# POSITIVE CONTROL for every "zero non-ZSTD" assertion above: the files exist and really are ZSTD. Without
+# this, a wrong glob path would satisfy all four by matching nothing.
+query I
+SELECT count(*) FROM (SELECT DISTINCT compression FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlake/persist/*.parquet')) WHERE compression = 'ZSTD';
+----
+1
+
+query I
+SELECT count(*) FROM lake.main.persist;
+----
+4000
+
+# ---- 8b. PRECEDENCE: the table property OUTRANKS the session setting ----
+# Deliberate, not incidental: the property is a property OF THE TABLE, so a stray `SET delta_write_options`
+# in someone's session must not silently change a table's storage format.
+
+statement ok
+SET delta_write_options='{"compression":"gzip"}';
+
+statement ok
+INSERT INTO lake.main.persist SELECT i::BIGINT FROM range(4000, 4500) r(i);
+
+query I
+SELECT count(*) FROM (SELECT DISTINCT compression FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlake/persist/*.parquet')) WHERE compression = 'GZIP';
+----
+0
+
+# The setting is NOT inert — it governs a table that declares nothing. (Without this the assertion above
+# would pass equally if `delta_write_options` had simply stopped working.)
+statement ok
+CREATE OR REPLACE TABLE lake.main.nodecl AS SELECT i::BIGINT AS id FROM range(1000) r(i);
+
+query I
+SELECT count(*) FROM (SELECT DISTINCT compression FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlake/nodecl/*.parquet')) WHERE compression = 'GZIP';
+----
+1
+
+statement ok
+RESET delta_write_options;
+
+# ---- 8c. A CREATE OR REPLACE INHERITS the declaration ----
+# ⚠ Measured, and the opposite ("a replace redefines the table, inherit nothing") is worse in exactly the way
+# this feature exists to fix: a REPLACE does NOT re-create the Delta table (the log continues and the metaData
+# commit copies the configuration forward), so the table still DECLARES zstd afterwards. Inheriting nothing
+# would write the replace's files at the engine default INTO a zstd-declared table, and the next plain INSERT
+# would flip back — mixed compression from ONE statement.
+#
+# ⚠ The corollary is a real limitation: a REPLACE cannot CHANGE the declaration (its WITH applies to that
+# statement's write only), because create-time configuration is applied at v0. Not specific to these keys —
+# equally true of every create flag and of the delta.* properties. set_tblproperties is what changes it.
+
+statement ok
+CREATE OR REPLACE TABLE lake.main.persist AS SELECT i::BIGINT AS id FROM range(100) r(i);
+
+query II
+SELECT property, value FROM fabricator_delta_tblproperties('lake', 'main.persist')
+WHERE property LIKE 'fabricator.parquet.%' ORDER BY property;
+----
+fabricator.parquet.compression	zstd
+
+statement ok
+INSERT INTO lake.main.persist SELECT i::BIGINT FROM range(100, 200) r(i);
+
+query I
+SELECT count(*) FROM (SELECT DISTINCT compression FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlake/persist/*.parquet')) WHERE compression <> 'ZSTD';
+----
+0
+
+# ---- 8d. EVERY declared key persists, including a native-only one ----
+
+statement ok
+CREATE OR REPLACE TABLE lake.main.allkeys WITH (parquet_compression='zstd', parquet_row_group_size=4096, parquet_version='V2', parquet_dictionary_size_limit=512) AS SELECT i::BIGINT AS id FROM range(100) r(i);
+
+query II
+SELECT property, value FROM fabricator_delta_tblproperties('lake', 'main.allkeys')
+WHERE property LIKE 'fabricator.parquet.%' ORDER BY property;
+----
+fabricator.parquet.compression	zstd
+fabricator.parquet.dictionary_size_limit	512
+fabricator.parquet.row_group_size	4096
+fabricator.parquet.version	V2
+
+# ---- 8e. THE IGNORE/REFUSE SPLIT — the one deliberate departure from "never silently ignore" ----
+# A WITH/SET option is an ACTIVE REQUEST in THIS statement ("write it this way, now"), so an engine that
+# cannot honour it must FAIL. A persisted property is a DECLARATION ABOUT THE TABLE, read later by a writer
+# that may legitimately be a DIFFERENT ENGINE — failing there would make the table UNWRITABLE by the codec
+# engine merely because someone once set a native-only knob. So: apply what fits, ignore the rest.
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/optlake' AS lakec (TYPE fabricator, PROVIDER 'engineeredwooddelta');
+
+# The codec engine writes into a table declaring the native-only dictionary_size_limit: IGNORED, not refused.
+statement ok
+INSERT INTO lakec.main.allkeys SELECT i::BIGINT FROM range(100, 200) r(i);
+
+query I
+SELECT count(*) FROM lakec.main.allkeys;
+----
+200
+
+# ...and the keys it CAN honour are still honoured on that same write — so "ignored" means the one key, not
+# the whole declaration. Both engines wrote files here, and none is snappy.
+query I
+SELECT count(*) FROM (SELECT DISTINCT compression FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlake/allkeys/*.parquet')) WHERE compression <> 'ZSTD';
+----
+0
+
+# THE CONTRAST, on the same engine and the same key: as a STATEMENT option it is REFUSED.
+statement error
+CREATE OR REPLACE TABLE lakec.main.stmt WITH (parquet_dictionary_size_limit=512) AS SELECT 1 AS id;
+----
+only supported with native_write
+
+statement ok
+DETACH lakec;
+
+# ---- 8f. A MALFORMED persisted value is REFUSED, unlike a merely unhonourable one ----
+# set_tblproperties writes arbitrary fabricator.* keys, so someone will hand-set garbage. Ignoring a
+# well-formed option this engine cannot honour is correct; swallowing an UNPARSEABLE one is not.
+
+statement ok
+SELECT count(*) FROM fabricator_delta_set_tblproperties('lake', 'main.allkeys', '{"fabricator.parquet.row_group_size":"lots"}');
+
+statement error
+INSERT INTO lake.main.allkeys SELECT 999::BIGINT;
+----
+is not a positive whole number
+
+# The error names the offending KEY — the value may have been set long ago from another session, so "some
+# property is wrong" would leave the user grepping their table.
+statement error
+INSERT INTO lake.main.allkeys SELECT 999::BIGINT;
+----
+fabricator.parquet.row_group_size
+
+# ...and it is recoverable from SQL, which is what makes refusing acceptable rather than a trap.
+statement ok
+SELECT count(*) FROM fabricator_delta_set_tblproperties('lake', 'main.allkeys', '{"fabricator.parquet.row_group_size":"4096"}');
+
+statement ok
+INSERT INTO lake.main.allkeys SELECT 999::BIGINT;
+
+query I
+SELECT count(*) FROM lake.main.allkeys;
+----
+201
+
+# ---- 8g. ⚠ PERSISTING row_group_size_bytes MAKES EVERY LATER NATIVE WRITE NEED preserve_insertion_order ----
+# Found by writing this suite, and it is the one persisted key with a session prerequisite. DuckDB's binder
+# refuses ROW_GROUP_SIZE_BYTES while preserving insertion order — which is fine for a per-statement option
+# (the user sets the flag in the same breath) and becomes a PROPERTY OF THE TABLE once persisted: a plain
+# INSERT that names nothing now fails until the session opts out. We deliberately do NOT set the flag on our
+# own COPY connection — it would silently break SORTED BY writes — so DuckDB's error surfaces, which is the
+# right outcome but is worth pinning so a future change cannot quietly start swallowing it.
+
+statement ok
+SET preserve_insertion_order=false;
+
+statement ok
+CREATE OR REPLACE TABLE lake.main.rgb WITH (parquet_row_group_size_bytes=1048576) AS SELECT i::BIGINT AS id FROM range(100) r(i);
+
+statement ok
+RESET preserve_insertion_order;
+
+query II
+SELECT property, value FROM fabricator_delta_tblproperties('lake', 'main.rgb')
+WHERE property LIKE 'fabricator.parquet.%' ORDER BY property;
+----
+fabricator.parquet.row_group_size_bytes	1048576
+
+# The trap itself: a plain INSERT naming no options inherits the declaration and hits DuckDB's binder.
+statement error
+INSERT INTO lake.main.rgb SELECT 999::BIGINT;
+----
+preserve_insertion_order
+
+# ...and the documented escape works.
+statement ok
+SET preserve_insertion_order=false;
+
+statement ok
+INSERT INTO lake.main.rgb SELECT 999::BIGINT;
+
+statement ok
+RESET preserve_insertion_order;
+
+query I
+SELECT count(*) FROM lake.main.rgb;
+----
+101
+
+# The CODEC engine has no such constraint — it maps the key to RowGroupMaxBytes with no DuckDB binder
+# involved — so the same declaration is written without any session flag.
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/optlake' AS lakec2 (TYPE fabricator, PROVIDER 'engineeredwooddelta');
+
+statement ok
+INSERT INTO lakec2.main.rgb SELECT 1000::BIGINT;
+
+query I
+SELECT count(*) FROM lakec2.main.rgb;
+----
+102
+
+statement ok
+DETACH lakec2;

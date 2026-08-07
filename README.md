@@ -1360,21 +1360,35 @@ lossy for non-ASCII text; the automatic rule exists to avoid exactly that.
 ### Parquet write options (Delta)
 
 Settable per statement with `CREATE TABLE ... AS SELECT ... WITH (...)`, per session with
-`SET delta_write_options`, or as an ATTACH default — same names on all three, most specific wins.
+`SET delta_write_options`, or as an ATTACH default — same names on all three.
 
-⚠ **`WITH` tuning applies to that statement's write only — it is NOT a table property and is NOT persisted.**
-A later `INSERT` writes at the session/ATTACH setting, or the engine default if neither is set:
+**A `WITH` on a `CREATE` is PERSISTED as a table property, and every later write to that table honours it** —
+a plain `INSERT`, an `UPDATE`'s post-image file, a copy-on-write rewrite, and `OPTIMIZE`'s compaction output,
+whichever catalog or session runs them:
 
 ```sql
-CREATE TABLE t WITH (parquet_compression='zstd') AS SELECT ...;  -- this file: ZSTD
-INSERT INTO t SELECT ...;                                        -- this file: SNAPPY (the default)
+CREATE TABLE t WITH (parquet_compression='zstd') AS SELECT ...;  -- ZSTD, and t now DECLARES zstd
+INSERT INTO t SELECT ...;                                        -- ZSTD (reads the declaration)
+SELECT fabricator_exec('lake', 'OPTIMIZE main.t');               -- ZSTD (so compaction cannot undo it)
 ```
 
-So for a table that should keep a setting across every write, put it on the ATTACH or in
-`SET delta_write_options`, not in `WITH`. For the same reason a bare `CREATE TABLE ... WITH (<tuning>)` with
-no `AS SELECT` is refused — there is no write for it to apply to. (Table *features* in `WITH` — `deletion_vectors`,
-`column_mapping`, `row_tracking`, `change_data_feed`, and `delta.*` / `fabricator.*` properties — ARE persisted;
-it is only the parquet write tuning that is per-statement.)
+That is what makes it worth configuring a dbt model once instead of re-stating the tuning on every
+incremental run — and it means a table written zstd stays zstd when someone else compacts it. The keys are
+stored in the Delta table configuration as `fabricator.parquet.*`, visible via
+`fabricator_delta_tblproperties`.
+
+**Precedence, lowest first: ATTACH default < `SET delta_write_options` < the table's property < the
+statement's `WITH`.** The property outranks the session setting deliberately — it is a property *of the
+table*, so a stray `SET` in someone's session must not silently change a table's storage format; `WITH`
+remains the per-statement escape hatch.
+
+⚠ A `CREATE OR REPLACE` **inherits** the declaration and cannot **change** it: its `WITH` applies to that
+statement's write only. (Same as every create flag — `deletion_vectors` and friends are also fixed at
+creation.) To change a declaration, use
+`SELECT * FROM fabricator_delta_set_tblproperties('lake', 'main.t',
+'{"fabricator.parquet.compression":"gzip"}')` (a table function, so it needs the `FROM`).
+A bare `CREATE TABLE ... WITH (<tuning>)` with no `AS SELECT` is still refused — there is no write for it to
+apply to.
 
 | option | engines |
 |---|---|
@@ -1385,11 +1399,22 @@ it is only the parquet write tuning that is per-statement.)
 | `parquet_bloom_filter_columns` | engineered-wood codec only |
 | `parquet_dictionary_size_limit` (distinct values) | `native_write` only |
 
-`parquet_row_groups_per_file` and `parquet_file_size_bytes` are **recognised but refused**: DuckDB cannot
-rotate files together with `PARTITION_BY`, and without partitioning it writes a directory where a Delta
-`add` action must name a single file. Use the row-group options to control file layout instead.
+⚠ Because `parquet_row_group_size_bytes` needs `preserve_insertion_order=false`, **persisting it means every
+later native-engine write to that table needs that session flag too** — a plain `INSERT` naming no options
+will otherwise fail with DuckDB's binder error. (The engineered-wood codec has no such requirement.) We do not
+set the flag for you: doing so would silently break `SORTED BY` writes.
 
-An option an engine cannot honour is always an error, never silently ignored.
+`parquet_row_groups_per_file` and `parquet_file_size_bytes` are **recognised but refused** as statement
+options: DuckDB cannot rotate files together with `PARTITION_BY`, and without partitioning it writes a
+directory where a Delta `add` action must name a single file. Use the row-group options instead.
+
+**Requested vs declared — the one place an option is ignored rather than refused.** A `WITH`/`SET` option is
+a request in *this* statement, so an engine that cannot honour it fails. A persisted property is a
+declaration *about the table*, and the next writer may legitimately be a different engine — so it applies
+what it can and ignores the rest, rather than making the table unwritable because someone once set a
+native-only knob. Concretely: `WITH (parquet_dictionary_size_limit=…)` on a codec catalog is an error, while
+a table *declaring* it is written happily by the codec engine (that one key ignored, the others honoured).
+A property whose value is *malformed* is always an error — that is a mistake, not a capability gap.
 
 The stable row-tracking columns (`__delta_row_id`, `__delta_row_commit_version`) are batched too, including
 tables where some files store those values and others derive them.

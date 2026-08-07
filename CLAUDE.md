@@ -647,51 +647,77 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     - Escape hatches already exist: `mssql_default_varchar_length` (bounds whichever type is chosen) and
       `mssql_ctas_text_type` (replaces the type outright). What is genuinely missing is only the PER-TABLE
       form of these — the (3) item below.
-  - **⚠ `WITH` PARQUET TUNING IS PER-STATEMENT, NOT PER-TABLE — MEASURED 2026-08-07 (user-raised), and the
-    README said the opposite until then.** `CREATE TABLE t WITH (parquet_compression='zstd') AS SELECT …`
-    writes ZSTD; a later plain `INSERT INTO t` writes **SNAPPY**. Nothing persists the tuning — only the table
-    FEATURES (`deletion_vectors` / `column_mapping` / `row_tracking` / `change_data_feed` / `delta.*` /
-    `fabricator.*`) are written into the table config. That is also why a bare `CREATE TABLE … WITH (<tuning>)`
-    with no `AS SELECT` is refused: there is no write for it to apply to.
-    - **DECIDED, NOT BUILT (user, 2026-08-07): PERSIST THE PARQUET TUNING LIKE THE OTHER `delta.*` OPTIONS,
-      AND RE-READ IT ON OPEN.** A `CREATE TABLE … WITH (parquet_compression='zstd') AS …` should write
-      `fabricator.parquet.compression` into the table CONFIG, and EVERY later write to that table — INSERT,
-      merge-on-read post-image, copy-on-write rewrite, OPTIMIZE compaction — should read it back and honour it.
-      Rationale: "table property" implies persistence to anyone coming from Iceberg/DuckLake; it is the
-      difference between configuring a dbt model ONCE and re-stating it on every incremental run; and a table
-      written zstd should STAY zstd when compacted regardless of which catalog happens to run the OPTIMIZE.
-      - **PRECEDENCE (decide once, apply everywhere): statement `WITH` > TABLE PROPERTY > `SET
-        delta_write_options` > ATTACH default.** The table property outranks the session setting deliberately —
-        it is a property OF THE TABLE, so a stray `SET` must not silently change a table's storage format;
-        the per-statement `WITH` remains the escape hatch. ⚠ This SUPERSEDES the ordering the current code
-        implements (ATTACH < SET < WITH, with no table layer).
-      - **⚠ THE STRUCTURAL OBSTACLE, and it is the whole job:** `ResolveWriteSpec` is TABLE-AGNOSTIC — it takes
-        partition columns and a schema mode, and knows nothing about which table is being written. The table's
-        config is only available where the table is OPENED, and EW takes `ParquetWriteOptions` as part of
-        `DeltaTableOptions` AT OPEN, so it cannot be layered on afterwards. So this needs the table's config
-        threaded INTO spec resolution — the same shape as the catalog-spec threading done on 2026-08-07, one
-        level further down. The catalog already reads a table's config for other reasons (`ExecuteDelete` reads
-        it once for `enableDeletionVectors` + isolation), so the read exists; it is the plumbing that does not.
-      - **ALL KEYS PERSIST, INCLUDING THE NATIVE-ONLY ONES; the reading ENGINE applies the subset it can
-        honour and ignores the rest (user, 2026-08-07).** ⚠ This is a DELIBERATE departure from the
-        "never silently ignore a write option" rule the rest of this surface follows, and the distinction is
-        the point rather than an exception to it:
-        - a `WITH` / `SET` option is an **ACTIVE REQUEST in THIS statement** — "write it this way, now". If the
-          engine cannot, the user's intent is unmet and the statement must FAIL. That is why the rotating
-          options and native-only `dictionary_size_limit` are refused there.
-        - a persisted property is a **DECLARATION ABOUT THE TABLE** — "this is how this table prefers to be
-          written", set once, by whoever created it. A later writer may legitimately be a different engine, and
-          failing there would make the table UNWRITABLE by the codec engine merely because someone once set a
-          native-only knob. Apply what fits, ignore what does not.
-        ⇒ persist every key; at write time intersect the table's declaration with the engine's capabilities.
-        A `Fabricator.Delta` Debug line naming what was dropped and why is the right observability (the choice
-        is invisible from SQL otherwise) — NOT a warning, since ignoring here is correct rather than degraded.
-      - **⚠ It changes what the existing keys MEAN, so it is a surface change, not an additive one** — hence
-        it belongs in this revisit rather than being bolted onto the keys. Still to settle:
-        `fabricator_delta_set_tblproperties` can already write arbitrary `fabricator.*` keys, so someone WILL
-        hand-set a garbage value — the reader must say so loudly rather than fall back silently. Note that is
-        NOT in tension with the paragraph above: ignoring a WELL-FORMED option this engine cannot honour is
-        correct; swallowing an UNPARSEABLE one is not.
+  - **(2b) THE PARQUET TUNING IS NOW PERSISTED AS TABLE PROPERTIES — BUILT + GATED 2026-08-07 (C#-only, no
+    ABI).** A `CREATE … WITH (parquet_compression='zstd') AS …` writes `fabricator.parquet.compression` into
+    the Delta table CONFIG, and every later write to that table reads it back: plain INSERT, merge-on-read
+    post-image, copy-on-write rewrite, and **OPTIMIZE's compaction output** — whichever catalog or session runs
+    them. New BCL-only format file `dotnet/Fabricator.Bridge/DeltaParquetProperties.cs` (`ParquetTuning`), keys
+    `fabricator.parquet.{compression,row_group_size,row_group_size_bytes,version,dictionary_size_limit,
+    row_groups_per_file,file_size_bytes,bloom_filter_columns}`.
+    - **The problem it fixes, measured before:** `CREATE TABLE t WITH (parquet_compression='zstd') AS …` wrote
+      ZSTD and a later plain `INSERT INTO t` wrote **SNAPPY**, so a table accumulated MIXED compression; on an
+      incrementally-built dbt model most bytes were snappy whatever it was configured for, and OPTIMIZE — which
+      rewrites the MAJORITY of a table's bytes — actively undid the setting it was configured for.
+    - **PRECEDENCE, as decided: ATTACH < `SET delta_write_options` < TABLE PROPERTY < statement `WITH`.** The
+      property outranks the session setting deliberately — a stray `SET` must not silently change a table's
+      storage format. Implemented as a fourth layer inside `ResolveWriteSpec`, which now takes a REQUIRED
+      `tablePath` (the structural obstacle this entry predicted): required rather than optional so the compiler
+      forces every present and future call site to answer "which table?" — the same omission on the rewrite
+      paths is what let OPTIMIZE undo its own configuration for months.
+    - **⚠ ONLY THE STATEMENT'S OWN `WITH` PERSISTS, never the resolved spec.** Persisting the resolved value
+      would turn a session `SET` into a permanent property of the table — exactly what the precedence rule
+      exists to prevent, and durably. The keys ride `CreateProperties`, whose only consumer is `CreateConfig`
+      at creation (EW's `OpenOrCreateAsync` returns early for an existing table and ignores `configuration`
+      entirely), so it is create-only BY CONSTRUCTION and a plain INSERT cannot rewrite it.
+    - **⚠ THE BUG THAT ONLY MEASUREMENT FOUND, and it would have silently broken `fabricator.sortedBy` too.**
+      The write spec is resolved BEFORE the write runs, so a CTAS asks for the config of a table that does not
+      exist yet. Caching that MISS made the CREATE's own declaration invisible to every later statement in the
+      session — the property landed in the table and the next plain INSERT still wrote SNAPPY. Fix: **a miss is
+      never cached.** The collateral damage is the instructive part: this pass UNIFIED `_sortedByCache` into one
+      `_tableConfigCache` (one open per table instead of two, one set of invalidation sites), and `sortedBy` had
+      never been read on a create path — so caching the miss would have made an ordered table quietly stop
+      ordering its appends. **Unifying two caches inherits the WORST staleness behaviour of either consumer.**
+    - **⚠ A `CREATE OR REPLACE` INHERITS the declaration and CANNOT CHANGE it — measured, and the intuitive
+      answer is the wrong one.** My first version treated a replace as "redefines the table, inherit nothing".
+      But a REPLACE does NOT re-create the Delta table: the log continues and the metaData commit COPIES the
+      configuration forward (measured — a replace with a different schema emits `CHANGE COLUMNS` and the
+      `fabricator.parquet.*` keys survive it). So inheriting nothing writes the replace's files at the engine
+      default INTO a zstd-declared table, and the next plain INSERT flips back — **mixed compression produced by
+      one statement**, the exact disease. Now it inherits. The corollary is a real limitation, pinned and in the
+      README: a REPLACE's `WITH` applies to that statement's write only, because create-time configuration is
+      applied at v0. That is NOT specific to these keys — it is equally true of every create flag
+      (`deletion_vectors` / `column_mapping` / `row_tracking` / `change_data_feed`) and of the `delta.*` WITH
+      properties beside them. `fabricator_delta_set_tblproperties` is what changes a declaration.
+    - **THE IGNORE/REFUSE SPLIT, as decided and now built.** A `WITH`/`SET` option is an ACTIVE REQUEST in THIS
+      statement ⇒ an engine that cannot honour it FAILS (`ValidateSpecForEngine`, unchanged). A persisted
+      property is a DECLARATION ABOUT THE TABLE, read later by a possibly DIFFERENT engine ⇒ apply what fits,
+      ignore the rest, `Fabricator.Delta` **Debug** line naming what was dropped (not a Warning — ignoring here
+      is correct rather than degraded, and the choice is invisible from SQL otherwise). The persisted layer
+      deliberately does NOT route through `ValidateSpecForEngine`. Verified both directions on ONE key and ONE
+      engine, which is what makes it a demonstration rather than two unrelated assertions:
+      `WITH (parquet_dictionary_size_limit=…)` on a codec catalog ERRORS, while the codec engine writes happily
+      into a table DECLARING it (that key ignored, the compression still honoured).
+    - **A MALFORMED persisted value THROWS, naming the key** — `set_tblproperties` writes arbitrary
+      `fabricator.*` keys so someone will hand-set garbage, and swallowing an UNPARSEABLE value is a different
+      case from ignoring a well-formed-but-unhonourable one. Recoverable from SQL (re-set the key), which is
+      what makes refusing acceptable rather than a trap.
+    - **⚠ PERSISTING `row_group_size_bytes` HAS A SESSION PREREQUISITE — found by writing the suite, and it is
+      the one key that changes character when persisted.** DuckDB's binder refuses `ROW_GROUP_SIZE_BYTES` while
+      preserving insertion order. As a per-statement option that is fine (the user sets the flag in the same
+      breath); persisted, it means **a plain INSERT naming nothing now fails** until the session sets
+      `preserve_insertion_order=false`. We deliberately do NOT set it on our COPY connection — it would silently
+      break `SORTED BY` writes — so DuckDB's error surfaces. The codec engine has no such constraint. Pinned
+      (§8g) so a future change cannot start swallowing it.
+    - **⚠ `dictionary_size_limit` is still NOT mappable to EW's `DictionaryPageSizeLimit`** — DuckDB's is a cap
+      on DISTINCT VALUES, EW's is BYTES — so it stays native-only in BOTH layers. The two file-ROTATING keys
+      persist but can be honoured on NO path today; persisting them is still right (the declaration outlives the
+      limitation, and when upstream lifts it they start being honoured with no migration).
+    - Gates: `verify_with_options` 113 → **171** (§8–§8g), pinned on the **NATIVE** engine because a codec-only
+      gate would pass while the shipped default path stayed broken; hermetic **67/67 — 6661**. Tier-0
+      `Fabricator.Bridge.Tests` 85 → **106** (the format round trip + every malformed case, offline — those are
+      reachable from SQL only through `set_tblproperties`, one service round trip each). **Mutation-tested with
+      two mutants, both killed at the same assertion** — the plain-INSERT one, which is the whole feature:
+      caching the miss, and never reading the persisted layer at all.
   - **(3) Re-examine the `SET` parameters and MOVE what belongs per-table into `WITH`.** `delta_write_options`
     is one JSON blob mixing genuinely session-scoped things (compression as a storage-cost policy) with
     per-table ones (partitioning, `replace_where`, `schema_mode`). Decide each knob's home rather than
@@ -3464,7 +3490,7 @@ commits do not compile DuckDB:
 
 | tier | workflow | what | trigger |
 |---|---|---|---|
-| 0 | `installer-core.yml` — **TWO jobs** | job `test`: `Fabricator.Installer.Core.Tests`, floor **92**. job `bridge`: `Fabricator.Bridge.Tests`, floor **85** (the variable-library format + the Fabric SQL endpoint-host derivation). Both × {net8.0,net10.0} × {win,linux}. No C++, no vcpkg, **no submodules**. ~2 min | push/PR |
+| 0 | `installer-core.yml` — **TWO jobs** | job `test`: `Fabricator.Installer.Core.Tests`, floor **92**. job `bridge`: `Fabricator.Bridge.Tests`, floor **106** (the variable-library format, the Fabric SQL endpoint-host derivation, and the persisted Delta parquet tuning). Both × {net8.0,net10.0} × {win,linux}. No C++, no vcpkg, **no submodules**. ~2 min | push/PR |
 | 1 | `extension.yml` | build + the **53 hermetic suites / 4152 assertions** (scratch dir + in-repo fixtures only). 3 platforms | push/PR |
 | 2 | `integration.yml` | the **42 service suites / 1221 assertions** via `docker/docker-compose.yml` (SQL Server 2025 + MinIO + generated certs + `provision.ps1`). linux only | schedule + dispatch |
 | 3 | `distribution.yml` | the single-file artifact per platform + the **12-check smoke against a STOCK DuckDB wheel** (`test/distribution/smoke_distribution.py`). 3 platforms; needs `OVERRIDE_GIT_DESCRIBE` (the one tier that does) | dispatch + `v*` tags |
