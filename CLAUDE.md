@@ -611,10 +611,20 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
       the DEFAULT provider (measured). Read the catalog's `_nativeWrite`.
     - ⚠ `ROW_GROUP_SIZE_BYTES` needs `SET preserve_insertion_order=false` (DuckDB binder). We deliberately do
       NOT set that on our COPY connection — it would silently break `SORTED BY` writes; DuckDB's error surfaces.
-    - **STILL OPEN from (1):** bloom-filter columns for the EW codec are expressible, but on `native_write`
-      DuckDB has no PER-COLUMN bloom option at all (`WRITE_BLOOM_FILTER true` is hardcoded), so
-      `parquet_bloom_filter_columns` is silently codec-only — the shape to fix is `write_bloom_filter` +
-      `bloom_filter_false_positive_ratio` on the native path. `compression_level` is also still unexposed.
+    - **⚠ BLOOM FILTERS ON THE NATIVE PATH NEED NOTHING — a note here previously said to build
+      `write_bloom_filter` + `bloom_filter_false_positive_ratio`, and that was WRONG (corrected 2026-08-07,
+      user-prompted).** DuckDB enables bloom filters by DEFAULT, we always pass `WRITE_BLOOM_FILTER true`, and
+      its writer picks the COLUMNS itself — per-column selection is not a DuckDB concept because the decision
+      is per column on cardinality: `parquet_extension.cpp:75` — *"After how many distinct values should we
+      abandon dictionary compression AND BLOOM FILTERS?"* — i.e. the cutoff IS `dictionary_size_limit`, the
+      knob added in this same pass. So `parquet_bloom_filter_columns` is codec-only by nature, not by a gap,
+      and the README says so. It is accepted-and-ignored on native rather than refused, which is a small
+      inconsistency with the "never silently ignore" rule elsewhere — harmless, because DuckDB blooms those
+      columns anyway; tighten it only if the rule is ever made absolute.
+    - **STILL OPEN from (1):** `compression_level` is unexposed (EW has `CompressionLevel` /
+      `CustomCompressionLevel`, DuckDB has `COMPRESSION_LEVEL` — a two-engine option), and
+      `bloom_filter_false_positive_ratio` is unexposed on BOTH, where the engines also DISAGREE on the default
+      (DuckDB 0.01, EW 0.05) — worth stating in any doc that claims the two engines write equivalent files.
   - **(1-original) EVERY parquet option must be expressible in `CREATE TABLE … WITH (…)`, INCLUDING bloom-filter
     columns for the EW codec.** Today `WITH (parquet_compression=…, parquet_row_group_size=…,
     parquet_bloom_filter_columns=…)` is the DuckLake-parity set gated by `verify_with_options`; confirm each
