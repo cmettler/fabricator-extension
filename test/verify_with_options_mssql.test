@@ -59,5 +59,160 @@ CREATE TABLE db.dbo.with_opts_rejected (id INTEGER)
 ----
 use CREATE TABLE ... AS
 
+
+# ============================================================================
+# PER-TABLE FORMS OF THE SESSION SETTINGS (2026-08-07).
+#
+# `table_type` now carries TWO disjoint vocabularies and the VALUE picks the branch:
+#   DELTA | PARQUET                                  -> external table, `location` REQUIRED (above)
+#   CLUSTERED COLUMNSTORE | CCI | HEAP | ROWSTORE    -> an ORDINARY table's storage form
+# plus `varchar_length` and `text_type`, the per-table forms of mssql_default_varchar_length and
+# mssql_ctas_text_type.
+#
+# ⚠ Sharing one key is deliberate, not a collision: the two value sets do not overlap, so a value
+# determines its own branch, and `location`'s presence corroborates it. The alternative — a second key
+# meaning the same thing as `mssql_default_table_type` — would be the confusing option.
+# ============================================================================
+
+statement ok
+DROP TABLE IF EXISTS db.dbo.wo_len;
+
+# varchar_length BOUNDS whichever type the collation chose; it does not re-decide the type. On this
+# (non-UTF-8) database that is NVARCHAR — the collation rule is pinned in verify_default_varchar_length.
+statement ok
+CREATE TABLE db.dbo.wo_len (id INTEGER, label VARCHAR) WITH (varchar_length=200);
+
+query TI
+SELECT * FROM fabricator_query('db',
+  'SELECT CAST(DATA_TYPE AS VARCHAR(32)), CHARACTER_MAXIMUM_LENGTH FROM INFORMATION_SCHEMA.COLUMNS
+   WHERE TABLE_NAME = ''wo_len'' AND COLUMN_NAME = ''label''');
+----
+nvarchar	200
+
+statement ok
+DROP TABLE db.dbo.wo_len;
+
+# text_type REPLACES the type outright — including forcing VARCHAR on a collation that would have chosen
+# NVARCHAR, which is what a migration needs.
+statement ok
+CREATE TABLE db.dbo.wo_len (id INTEGER, label VARCHAR) WITH (text_type='VARCHAR(37)');
+
+query TI
+SELECT * FROM fabricator_query('db',
+  'SELECT CAST(DATA_TYPE AS VARCHAR(32)), CHARACTER_MAXIMUM_LENGTH FROM INFORMATION_SCHEMA.COLUMNS
+   WHERE TABLE_NAME = ''wo_len'' AND COLUMN_NAME = ''label''');
+----
+varchar	37
+
+statement ok
+DROP TABLE db.dbo.wo_len;
+
+# The per-table form OUTRANKS the session setting — same precedence rule as the Delta write tuning.
+statement ok
+SET mssql_default_varchar_length = 10;
+
+statement ok
+CREATE TABLE db.dbo.wo_len (id INTEGER, label VARCHAR) WITH (varchar_length=250);
+
+query TI
+SELECT * FROM fabricator_query('db',
+  'SELECT CAST(DATA_TYPE AS VARCHAR(32)), CHARACTER_MAXIMUM_LENGTH FROM INFORMATION_SCHEMA.COLUMNS
+   WHERE TABLE_NAME = ''wo_len'' AND COLUMN_NAME = ''label''');
+----
+nvarchar	250
+
+statement ok
+RESET mssql_default_varchar_length;
+
+statement ok
+DROP TABLE db.dbo.wo_len;
+
+# ---- table_type on an ORDINARY table ----
+
+statement ok
+DROP TABLE IF EXISTS db.dbo.wo_cs;
+
+statement ok
+CREATE TABLE db.dbo.wo_cs (id INTEGER, label VARCHAR) WITH (table_type='clustered columnstore');
+
+query T
+SELECT * FROM fabricator_query('db',
+  'SELECT CAST(type_desc AS VARCHAR(32)) FROM sys.indexes WHERE object_id = OBJECT_ID(''dbo.wo_cs'')');
+----
+CLUSTERED COLUMNSTORE
+
+statement ok
+DROP TABLE db.dbo.wo_cs;
+
+# THE OPT-OUT, which is the reason a per-table form is worth having at all: with the SESSION default set to
+# columnstore, an explicit HEAP must win. A test that only checked the positive direction would pass with the
+# per-table value ignored entirely.
+statement ok
+SET mssql_default_table_type = 'clustered columnstore';
+
+statement ok
+CREATE TABLE db.dbo.wo_cs (id INTEGER) WITH (table_type='HEAP');
+
+query T
+SELECT * FROM fabricator_query('db',
+  'SELECT CAST(type_desc AS VARCHAR(32)) FROM sys.indexes WHERE object_id = OBJECT_ID(''dbo.wo_cs'')');
+----
+HEAP
+
+statement ok
+DROP TABLE db.dbo.wo_cs;
+
+# POSITIVE CONTROL for that opt-out: the session default really was in force, so "HEAP" above is the WITH
+# winning rather than the setting having quietly stopped working.
+statement ok
+CREATE TABLE db.dbo.wo_cs (id INTEGER);
+
+query T
+SELECT * FROM fabricator_query('db',
+  'SELECT CAST(type_desc AS VARCHAR(32)) FROM sys.indexes WHERE object_id = OBJECT_ID(''dbo.wo_cs'')');
+----
+CLUSTERED COLUMNSTORE
+
+statement ok
+RESET mssql_default_table_type;
+
+statement ok
+DROP TABLE db.dbo.wo_cs;
+
+# ---- the branch guards ----
+
+# An EXTERNAL value without location: the error must point at location, not at the value.
+statement error
+CREATE TABLE db.dbo.wo_bad (id INTEGER) WITH (table_type='DELTA');
+----
+location='s3://<sql-endpoint>/<bucket>/<path>' is required with it
+
+# An unknown value lands in the REGULAR branch (not silently treated as external), and the message offers
+# both vocabularies.
+statement error
+CREATE TABLE db.dbo.wo_bad (id INTEGER) WITH (table_type='NONSENSE');
+----
+CLUSTERED COLUMNSTORE / CCI / HEAP / ROWSTORE
+
+# External-only keys without location are refused rather than ignored.
+statement error
+CREATE TABLE db.dbo.wo_bad (id INTEGER) WITH (data_source='ds');
+----
+describe an external table
+
+# ...and the text options are refused on an EXTERNAL table, where they could do nothing (its column types
+# come from the storage files).
+statement error
+CREATE TABLE db.dbo.wo_bad
+  WITH (location='s3://minio:9000/bucket/t', table_type='DELTA', data_source='ds', varchar_length=50)
+  AS SELECT 1 AS id;
+----
+not to an external table
+
+statement error
+CREATE TABLE db.dbo.wo_bad (id INTEGER) WITH (varchar_length=0);
+----
+expected a positive integer
+
 statement ok
 DETACH db;

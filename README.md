@@ -1360,6 +1360,20 @@ type is chosen), or replace the type outright with `SET mssql_ctas_text_type = '
 keep `NVARCHAR` on a UTF-8 database during a migration. ⚠ Forcing `VARCHAR` on a non-UTF-8 collation is
 lossy for non-ASCII text; the automatic rule exists to avoid exactly that.
 
+Both have a **per-table form** in `CREATE TABLE … WITH (…)`, which outranks the session setting:
+
+```sql
+CREATE TABLE db.dbo.t (id INTEGER, label VARCHAR) WITH (varchar_length=200);      -- NVARCHAR(200)
+CREATE TABLE db.dbo.t (id INTEGER, label VARCHAR) WITH (text_type='VARCHAR(37)'); -- VARCHAR(37)
+CREATE TABLE db.dbo.t (id INTEGER) WITH (table_type='clustered columnstore');     -- CCI (box/Azure)
+CREATE TABLE db.dbo.t (id INTEGER) WITH (table_type='HEAP');                      -- opt OUT of a CCI default
+```
+
+`table_type` carries two disjoint vocabularies and the value picks which: `CLUSTERED COLUMNSTORE` / `CCI` /
+`HEAP` / `ROWSTORE` describe an ordinary table's storage, while `DELTA` / `PARQUET` describe an S3 external
+table and require `location` (see the data-virtualization section). `varchar_length` / `text_type` are
+refused on an external table — its column types come from the storage files.
+
 ### Parquet write options (Delta)
 
 Settable per statement with `CREATE TABLE ... AS SELECT ... WITH (...)`, per session with

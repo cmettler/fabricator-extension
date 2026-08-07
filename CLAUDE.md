@@ -770,33 +770,44 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     is one JSON blob mixing genuinely session-scoped things (compression as a storage-cost policy) with
     per-table ones (partitioning, `replace_where`, `schema_mode`). Decide each knob's home rather than
     accepting the current split, and keep an escape for the per-statement case.
-  - **(3b) THE SQL SERVER PER-TABLE `WITH` FORMS — SCOPED 2026-08-07, DELIBERATELY NOT STARTED. Two things
-    must be decided BEFORE any code, and both were found by reading the call sites rather than by planning.**
-    The ask (user, 2026-08-07) is per-table forms of `mssql_default_table_type` (clustered columnstore /
-    heap), `mssql_default_varchar_length`, and the text type — i.e. `CREATE TABLE … WITH (table_type=…,
-    varchar_length=…, text_type=…)`.
-    - **⚠ OBSTACLE 1 — `table_type` IS ALREADY TAKEN ON THIS PROVIDER, and means something else.**
-      `SqlServerBackend.ParseWithOptions` uses it for the EXTERNAL-table CETAS analog, where the only legal
-      values are `DELTA` / `PARQUET` and `location` is REQUIRED. The columnstore/heap vocabulary is a
-      different axis entirely (how a REGULAR table is stored). The values are disjoint, so overloading the
-      one key is expressible — `DELTA|PARQUET` ⇒ external (needs `location`), `CLUSTERED COLUMNSTORE|CCI|
-      HEAP|ROWSTORE` ⇒ regular (must NOT have `location`) — and it keeps the per-table name matching the
-      SETTING it mirrors (`mssql_default_table_type`), which is the argument for doing it that way. But it is
-      a SURFACE decision, not a mechanical addition, and `location` stops being unconditionally required.
-    - **⚠ OBSTACLE 2 — THE SETTINGS ARE READ FROM A GLOBAL STORE INSIDE THE TYPE MAPPER, which is the same
-      shape as the Delta write-spec gap one level worse.** `mssql_ctas_text_type` and
-      `mssql_default_varchar_length` are read by `ProviderSettingsStore.Instance` calls INSIDE
-      `MapArrowToSqlType` (`SqlServerBackend.cs:3617` / `:3633`), and `mssql_default_table_type` inside the
-      CCI branch (`:3412`) — none of which takes a per-statement context. A per-table override therefore has
-      to be THREADED through the whole DDL-generation chain into a shared type mapper used by every path, not
-      just parsed. Exactly the work `ResolveWriteSpec`'s `tablePath` parameter was, and the reason that one is
-      REQUIRED rather than optional applies here too: a site that forgets it silently falls back to the global
-      setting.
-    - **⚠ AND ONE THIRD OF THE ORIGINAL ASK IS ALREADY ANSWERED — do not build it.** The `unicode`/NVARCHAR
-      flag is unnecessary: `MapArrowToSqlType` already resolves the text type per connection from the
-      COLLATION (`IsUtf8Collation ? VARCHAR : HasNVarchar ? NVARCHAR : VARCHAR`), so prod SQL Server gets
-      NVARCHAR, a UTF-8 database gets VARCHAR and Fabric gets VARCHAR, with no setting. **Now gated on BOTH
-      legs** — see the `verify_default_varchar_length` note above.
+  - **(3b) THE SQL SERVER PER-TABLE `WITH` FORMS — BUILT + GATED 2026-08-07 (C#-only, no ABI).**
+    `CREATE TABLE … WITH (table_type=…, varchar_length=…, text_type=…)`: the per-table forms of
+    `mssql_default_table_type`, `mssql_default_varchar_length` and `mssql_ctas_text_type`. The per-table value
+    OUTRANKS the session setting, same precedence rule as the Delta write tuning.
+    - **⚠ I FIRST WROTE THIS UP AS BLOCKED ON TWO OBSTACLES AND BOTH WERE OVERSTATED — the user challenged
+      the first one ("why does table_type collide? it depends on location") and was right, which is why the
+      correction is recorded rather than quietly fixed.**
+      - **"`table_type` COLLIDES" — IT DOES NOT.** It already meant `DELTA`/`PARQUET` for the external-table
+        CETAS analog, and I called adding `CLUSTERED COLUMNSTORE`/`HEAP` a collision needing a design
+        decision. The two vocabularies are DISJOINT, so a value determines its own branch; and `location`
+        corroborates it (an external `WITH` has always REQUIRED `location`, so a `WITH` without one is
+        currently an ERROR — the regular branch is purely additive and can shadow nothing). Sharing the key
+        is the BETTER option, because it keeps the per-table spelling equal to the setting it mirrors.
+      - **"IT NEEDS THREADING THROUGH THE WHOLE DDL CHAIN INTO A SHARED TYPE MAPPER" — it needed ONE optional
+        parameter.** `optionsJson` was ALREADY in scope at both create paths, `BuildCreateTable` has three
+        call sites, and `MapArrowToSqlType` takes two optional overrides that DEFAULT to the old
+        session-store reads — so the ALTER paths, which carry no `WITH`, are untouched by construction.
+      - The generalisable bit: **both objections came from reading a method SIGNATURE and inferring the
+        blast radius, instead of counting the call sites.** The same shortcut produced the "we never reach
+        `CommitOccAsync`" error already recorded in this file.
+    - **The branch rule, and the one asymmetry in it:** `location` present ⇒ external (so a missing/foreign
+      `table_type` errors AGAINST the external vocabulary); otherwise the value picks the branch. An ordinary
+      table needs no `table_type` at all — `WITH (varchar_length=200)` alone is valid — which is why
+      "`location` is present" ALSO forces the external branch rather than `table_type` alone. An unknown value
+      falls to the REGULAR branch, so a typo reads as "not a valid storage form" and offers both vocabularies
+      rather than being silently treated as external.
+    - `varchar_length` / `text_type` are REFUSED on an external table: its column types come from the storage
+      files, so accepting them would do nothing — the failure mode this whole surface exists to prevent.
+    - **⚠ THE GATE'S LOAD-BEARING ASSERTION IS THE OPT-OUT, NOT THE POSITIVE.** With the SESSION default set
+      to columnstore, `WITH (table_type='HEAP')` must win — a test that only checked "columnstore produces a
+      columnstore index" passes with the per-table value ignored entirely. It carries a POSITIVE CONTROL that
+      the session default really was in force. Gate `verify_with_options_mssql` 9 → **41**,
+      **mutation-tested** (dropping `with?.TableType ??` kills it at exactly the HEAP assertion).
+    - **⚠ One third of the original ask was already satisfied and was NOT built.** The `unicode`/NVARCHAR flag
+      is unnecessary: `MapArrowToSqlType` resolves the text type per connection from the COLLATION
+      (`IsUtf8Collation ? VARCHAR : HasNVarchar ? NVARCHAR : VARCHAR`), so prod SQL Server gets NVARCHAR, a
+      UTF-8 database gets VARCHAR and Fabric gets VARCHAR, with no setting. Now gated on BOTH legs — see the
+      `verify_default_varchar_length` note above. `text_type` remains the escape hatch in either direction.
   - **(4) THE PLUMBING GAP IS FIXED (2026-08-07), and fixing it needed TWO changes where the write-up assumed
     one.** `ResolveWriteSpec` lives on the `DeltaCatalog` INSTANCE while the rewrite paths sit in the STATIC
     `DeltaReader`, so merge-on-read post-images, copy-on-write DELETE/UPDATE rewrites and **OPTIMIZE's
@@ -3598,8 +3609,8 @@ commits do not compile DuckDB:
 | tier | workflow | what | trigger |
 |---|---|---|---|
 | 0 | `installer-core.yml` — **TWO jobs** | job `test`: `Fabricator.Installer.Core.Tests`, floor **92**. job `bridge`: `Fabricator.Bridge.Tests`, floor **106** (the variable-library format, the Fabric SQL endpoint-host derivation, and the persisted Delta parquet tuning). Both × {net8.0,net10.0} × {win,linux}. No C++, no vcpkg, **no submodules**. ~2 min | push/PR |
-| 1 | `extension.yml` | build + the **53 hermetic suites / 4152 assertions** (scratch dir + in-repo fixtures only). 3 platforms | push/PR |
-| 2 | `integration.yml` | the **42 service suites / 1221 assertions** via `docker/docker-compose.yml` (SQL Server 2025 + MinIO + generated certs + `provision.ps1`). linux only | schedule + dispatch |
+| 1 | `extension.yml` | build + the hermetic tier, **67 runs / 6689 assertions** as of 2026-08-07 (scratch dir + in-repo fixtures only). 3 platforms | push/PR |
+| 2 | `integration.yml` | the service tier, **45 runs / 1640 assertions** as of 2026-08-07, via `docker/docker-compose.yml` (SQL Server 2025 + MinIO + generated certs + `provision.ps1`). linux only | schedule + dispatch |
 | 3 | `distribution.yml` | the single-file artifact per platform + the **12-check smoke against a STOCK DuckDB wheel** (`test/distribution/smoke_distribution.py`). 3 platforms; needs `OVERRIDE_GIT_DESCRIBE` (the one tier that does) | dispatch + `v*` tags |
 | — | manual | `verify_dax` (Power BI Desktop), live Fabric/OneLake (gitignored SP creds), the 7 deltars suites (`-IncludeDeltaRs`, ~240 MB), and on macOS: Gatekeeper/`com.apple.quarantine` + code signing | by hand |
 
@@ -3621,7 +3632,7 @@ developer box silently satisfied.
 
 **Tier 1 has since stayed green across every pin bump and the `PlanFiles` work** — `01994fb` (second EW
 bump) and `5c28297` (`PlanFiles`) both green on all three platforms. A green tier-1 job is a stronger
-claim than it looks: `run-suites.sh` floors on 53 suites / 4152 assertions and fails on any SKIP, so the
+claim than it looks: `run-suites.sh` floors on the run/assertion counts and fails on any SKIP, so the
 tick alone proves the counts without reading logs. **One CI gap was closed the same day**: the path
 filter listed `.gitmodules` but not the submodule POINTERS, so a pin bump ran NO CI at all (see the traps
 list). Note that fix is not self-proving — every commit since has also touched `dotnet/`, so it is only
@@ -3630,11 +3641,13 @@ exercised the next time a pin moves on its own.
 **Suite selection is DERIVED, never a hand-kept list** — `scripts/list-hermetic-suites.sh` and
 `scripts/list-service-suites.sh` classify by the `require-env`/`require` directives each suite
 declares, so a new suite cannot silently sit outside CI. The accounting is complete and checked:
-**59 hermetic + 43 service + 11 excluded = 113 suite FILES** (2026-08-02), no overlap. ⚠ Suite FILES and
-suite RUNS differ and the floors are on RUNS: four hermetic suites and one service suite are
-engine-doubled, so 59 files ⇒ **63 runs / 5685 assertions** and 43 ⇒ **44 runs / 1458**. Recompute rather
-than copy — the line here read `53 + 42 + 9 = 104` for a while after the counts had moved, which is what a
-hand-copied number does. `scripts/list-hermetic-suites.sh | wc -l` and its service twin are the source of
+**62 hermetic + 44 service + 11 excluded = 117 suite FILES** (recomputed 2026-08-07), no overlap. ⚠ Suite
+FILES and suite RUNS differ and the floors are on RUNS: five hermetic suites and one service suite are
+engine-doubled, so 62 files ⇒ **67 runs / 6689 assertions** and 44 ⇒ **45 runs / 1640**. Recompute rather
+than copy — the line here read `53 + 42 + 9 = 104` for a while after the counts had moved, and then
+`59 + 43 + 11 = 113` for a while after THAT, which is what a hand-copied number does. The one-liner:
+`H=$(./scripts/list-hermetic-suites.sh | wc -l); S=$(./scripts/list-service-suites.sh | wc -l);
+T=$(ls test/verify_*.test | wc -l); echo "$H + $S + $((T-H-S)) = $T"`. `scripts/list-hermetic-suites.sh | wc -l` and its service twin are the source of
 truth; the 11 excluded are `verify_azure_secret`, `verify_dax`, `verify_delta_catalog_adls`,
 `verify_mssql_adls_polybase` and the seven `verify_delta_rs_*`. `scripts/run-suites.sh <hermetic|service>` runs them ONE
 PROCESS PER SUITE with a fresh scratch dir, and asserts what `unittest` will not: nothing SKIPPED, the

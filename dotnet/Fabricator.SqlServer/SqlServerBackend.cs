@@ -1280,7 +1280,8 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         }
         // CETAS-analog (slice B): CREATE TABLE ... WITH (location=..., table_type=...) AS ... — the data is
         // written client-side to S3 (Delta/parquet), then the EXTERNAL TABLE is provisioned over it.
-        if (ParseWithOptions(optionsJson) is { } extCreate)
+        var withOpts = ParseWithOptions(optionsJson);
+        if (withOpts is { External: { } extCreate })
         {
             if (!createTable)
             {
@@ -1350,7 +1351,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 // the auto surrogate key is engine-generated and absent from the SELECT, so the bulk copy skips it.
                 create.CommandText = $"IF OBJECT_ID({objectLiteral}, 'U') IS NULL " +
                                      BuildCreateTable(qualified, data.Schema, Profile, null, null, null, sortColumns,
-                                                      null, ResolveAddIdentity());
+                                                      null, ResolveAddIdentity(), withOpts);
                 // Logged because it was previously invisible: the bulk path's DDL is issued inside SqlBulkCopy's
                 // own sequence, so a Debug trace showed only "bulk <table>: create=True" and not the statement.
                 // Diagnosing the Fabric in-transaction rename failure needed exactly this text.
@@ -2341,13 +2342,42 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     private sealed record ExternalCreateSpec(string Location, string TableType, string DataSource,
                                              string? FileFormat);
 
-    private static ExternalCreateSpec? ParseWithOptions(string? optionsJson)
+    /// <summary>Everything a SQL Server <c>CREATE TABLE … WITH (…)</c> can say. Two disjoint shapes share the
+    /// key <c>table_type</c>, and its VALUE decides which:
+    /// <list type="bullet">
+    /// <item><c>DELTA</c> / <c>PARQUET</c> — the EXTERNAL-table CETAS analog. Needs <c>location</c> +
+    /// <c>data_source</c>; carried in <see cref="External"/>.</item>
+    /// <item><c>CLUSTERED COLUMNSTORE</c> / <c>CCI</c> / <c>HEAP</c> / <c>ROWSTORE</c> — the storage form of an
+    /// ORDINARY table, i.e. the per-table form of <c>mssql_default_table_type</c>. Must NOT carry
+    /// <c>location</c>.</item>
+    /// </list>
+    /// Sharing the key is deliberate rather than a collision: the two vocabularies do not overlap, so a value
+    /// determines its own branch and <c>location</c> corroborates it. Keeping the per-table spelling equal to
+    /// the SETTING it mirrors beats inventing a second key that means the same thing.</summary>
+    private sealed record SqlServerWithOptions(
+        ExternalCreateSpec? External = null,
+        string? TableType = null,      // regular-table storage form (per-table mssql_default_table_type)
+        long? VarcharLength = null,    // per-table mssql_default_varchar_length
+        string? TextType = null);      // per-table mssql_ctas_text_type
+
+    /// <summary>The EXTERNAL values of <c>table_type</c>. Anything else falls to the regular branch, so a typo
+    /// surfaces as "not a valid storage form" rather than being silently treated as external.</summary>
+    private static bool IsExternalTableType(string v) => v is "DELTA" or "PARQUET";
+
+    /// <summary>The ORDINARY-table storage forms. The same vocabulary <c>mssql_default_table_type</c> accepts,
+    /// so the per-table and per-session spellings cannot drift.</summary>
+    private static bool IsRegularTableType(string v)
+        => v is "CLUSTERED COLUMNSTORE" or "COLUMNSTORE" or "CCI" or "HEAP" or "ROWSTORE";
+
+    private static SqlServerWithOptions? ParseWithOptions(string? optionsJson)
     {
         if (string.IsNullOrEmpty(optionsJson))
         {
             return null;
         }
         string? location = null, tableType = null, dataSource = null, fileFormat = null;
+        string? textType = null;
+        long? varcharLength = null;
         using (var doc = System.Text.Json.JsonDocument.Parse(optionsJson))
         {
             foreach (var p in doc.RootElement.EnumerateObject())
@@ -2376,6 +2406,17 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                     case "file_format":
                         fileFormat = value;
                         break;
+                    case "varchar_length":
+                        varcharLength = long.TryParse(value, System.Globalization.NumberStyles.Integer,
+                                                      System.Globalization.CultureInfo.InvariantCulture,
+                                                      out var vl) && vl > 0
+                            ? vl
+                            : throw new NotSupportedException(
+                                $"WITH varchar_length: expected a positive integer, got '{value}'.");
+                        break;
+                    case "text_type":
+                        textType = value.Trim();
+                        break;
                     case "secret":
                         throw new NotSupportedException(
                             "WITH secret: credential auto-provisioning is not supported yet — pre-provision "
@@ -2384,29 +2425,64 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                     default:
                         throw new NotSupportedException(
                             $"unknown CREATE TABLE WITH option '{p.Name}' for the SQL Server provider "
-                            + "(supported: location, table_type, data_source, file_format).");
+                            + "(supported: table_type, varchar_length, text_type, and for an external "
+                            + "table location, data_source, file_format).");
                 }
             }
         }
-        if (location is null)
+        // WHICH SHAPE IS THIS? The table_type VALUE decides, and `location` corroborates. Note an ordinary
+        // table needs no table_type at all — `WITH (varchar_length=200)` alone is valid — which is why
+        // "location is present" also forces the external branch rather than table_type alone.
+        bool external = location is not null || (tableType is not null && IsExternalTableType(tableType));
+        if (external)
+        {
+            if (location is null)
+            {
+                throw new NotSupportedException(
+                    $"WITH table_type='{tableType}' describes an S3 external table — "
+                    + "location='s3://<sql-endpoint>/<bucket>/<path>' is required with it.");
+            }
+            if (tableType is null || !IsExternalTableType(tableType))
+            {
+                throw new NotSupportedException(
+                    $"WITH table_type: '{tableType ?? "<missing>"}' is not supported alongside location "
+                    + "(DELTA or PARQUET; ICEBERG has no writer). WITHOUT location, table_type instead "
+                    + "selects an ordinary table's storage: CLUSTERED COLUMNSTORE or HEAP.");
+            }
+            if (string.IsNullOrWhiteSpace(dataSource))
+            {
+                throw new NotSupportedException(
+                    "WITH data_source: required — the name of a pre-provisioned EXTERNAL DATA SOURCE over "
+                    + "the location's endpoint (credentials never cross this path).");
+            }
+            // varchar_length / text_type describe how OUR CREATE TABLE spells a column type. An external
+            // table's columns come from the storage files, so accepting them here would do nothing — and a
+            // write option that silently does nothing is the failure this whole surface is built to avoid.
+            if (varcharLength is not null || textType is not null)
+            {
+                throw new NotSupportedException(
+                    "WITH varchar_length / text_type apply to an ordinary CREATE TABLE, not to an external "
+                    + "table (its column types follow the storage files).");
+            }
+            return new SqlServerWithOptions(
+                External: new ExternalCreateSpec(location, tableType!, dataSource!, fileFormat));
+        }
+
+        if (tableType is not null && !IsRegularTableType(tableType))
         {
             throw new NotSupportedException(
-                "the SQL Server provider's WITH options describe an S3 external table — "
-                + "location='s3://<sql-endpoint>/<bucket>/<path>' is required.");
+                $"WITH table_type: '{tableType}' is not supported (CLUSTERED COLUMNSTORE / CCI / HEAP / "
+                + "ROWSTORE for an ordinary table; DELTA or PARQUET together with location for an "
+                + "external one).");
         }
-        if (tableType is not ("DELTA" or "PARQUET"))
+        if (dataSource is not null || fileFormat is not null)
         {
             throw new NotSupportedException(
-                $"WITH table_type: '{tableType ?? "<missing>"}' is not supported (DELTA or PARQUET; "
-                + "ICEBERG has no writer).");
+                "WITH data_source / file_format describe an external table — pass location and "
+                + "table_type='DELTA' (or 'PARQUET') with them.");
         }
-        if (string.IsNullOrWhiteSpace(dataSource))
-        {
-            throw new NotSupportedException(
-                "WITH data_source: required — the name of a pre-provisioned EXTERNAL DATA SOURCE over the "
-                + "location's endpoint (credentials never cross this path).");
-        }
-        return new ExternalCreateSpec(location, tableType!, dataSource!, fileFormat);
+        return new SqlServerWithOptions(TableType: tableType, VarcharLength: varcharLength,
+                                        TextType: textType);
     }
 
     // Splits the SQL-visible location (s3://<host>/<bucket>/<path>) into the CLIENT-side URI
@@ -2483,7 +2559,8 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         // CETAS-analog, empty-CREATE shape (slice B): commit-0 Delta table + external table. The identity
         // marker rides through to the Delta create (declared plain BIGINT SQL-side — external tables can't
         // carry IDENTITY and don't need to), making the table slice-D DML-capable from birth.
-        if (ParseWithOptions(optionsJson) is { } extCreate)
+        var withOpts = ParseWithOptions(optionsJson);
+        if (withOpts is { External: { } extCreate })
         {
             if (extCreate.TableType != "DELTA")
             {
@@ -2543,7 +2620,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                     }
                 }
                 cmd.CommandText = BuildCreateTable(qualified, columns, Profile, null, null, defaults, sortColumns,
-                                                   identityColumns, ResolveAddIdentity());
+                                                   identityColumns, ResolveAddIdentity(), withOpts);
                 Log.LogDebug("ddl create [txn={Txn} own={Own}] {Table}: {Sql}",
                             AmbientTransaction.Current, owns, qualified, Trunc(cmd.CommandText));
                 cmd.ExecuteNonQuery();
@@ -2556,7 +2633,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             }
 
             string create = BuildCreateTable(qualified, columns, Profile, primaryKey, uniques, defaults, sortColumns,
-                                              identityColumns, ResolveAddIdentity());
+                                              identityColumns, ResolveAddIdentity(), withOpts);
             using var cmd0 = connection.CreateCommand();
             cmd0.Transaction = transaction;
             cmd0.CommandText = ifNotExists
@@ -3353,7 +3430,8 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     private static string BuildCreateTable(string qualified, Schema schema, ServerProfile profile, string? primaryKey,
                                            string? uniques, string? defaults,
                                            IReadOnlyList<string>? clusterColumns = null,
-                                           IReadOnlyList<string>? identityColumns = null, bool addIdentity = false)
+                                           IReadOnlyList<string>? identityColumns = null, bool addIdentity = false,
+                                           SqlServerWithOptions? with = null)
     {
         var defaultMap = ParseDefaults(defaults);
         // Columns marked IDENTITY (a DuckDB GENERATED-column marker), matched by name (case-insensitive).
@@ -3390,7 +3468,8 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                     $"Column '{field.Name}' is a DuckDB VARIANT — not supported by the SQL Server provider "
                     + "(cast it to JSON/VARCHAR first, e.g. v::JSON).");
             }
-            sb.Append(Quote(field.Name)).Append(' ').Append(MapArrowToSqlType(field.DataType, profile))
+            sb.Append(Quote(field.Name)).Append(' ')
+              .Append(MapArrowToSqlType(field.DataType, profile, with?.TextType, with?.VarcharLength))
               .Append(field.IsNullable ? " NULL" : " NOT NULL");
             if (defaultMap.TryGetValue(i, out var defaultValue))
             {
@@ -3407,9 +3486,13 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         // emit an inline INDEX … CLUSTERED COLUMNSTORE so the table is columnstore. Fabric/Synapse tables
         // are columnstore implicitly and reject an inline INDEX, so it is a no-op there (IsWarehouse gate).
         // When the clustered index IS the columnstore, PK/UNIQUE must be NONCLUSTERED.
+        // The per-table WITH (table_type=...) outranks the session default. An explicit HEAP/ROWSTORE is
+        // therefore a real OPT-OUT, not merely "unset" — which is the whole point of having it per table when
+        // the session default is columnstore.
         bool cci = !profile.IsWarehouse &&
-                   IsClusteredColumnstore(ProviderSettingsStore.Instance.GetString(SqlServerBackend.ProviderName,
-                                                                                   "mssql_default_table_type"));
+                   IsClusteredColumnstore(with?.TableType
+                       ?? ProviderSettingsStore.Instance.GetString(SqlServerBackend.ProviderName,
+                                                                   "mssql_default_table_type"));
         if (cci)
         {
             sb.Append(", INDEX ").Append(Quote(ColumnstoreIndexName(qualified))).Append(" CLUSTERED COLUMNSTORE");
@@ -3576,7 +3659,15 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     //  - datetime2/time fractional scale: 7 (box) vs 6 (Fabric).
     //  - timestamptz: DATETIMEOFFSET where it exists, else UTC DATETIME2 (Fabric has no DATETIMEOFFSET).
     // Box SQL Server (HasNVarchar, HasDatetimeOffset, scale 7) reproduces the previous fixed mapping exactly.
-    private static string MapArrowToSqlType(IArrowType type, ServerProfile profile)
+    /// <param name="textTypeOverride">The statement's <c>WITH (text_type=…)</c>, if any. Null keeps the old
+    /// behaviour exactly — read <c>mssql_ctas_text_type</c> from the session store.</param>
+    /// <param name="varcharLengthOverride">The statement's <c>WITH (varchar_length=…)</c>, if any. Null keeps
+    /// reading <c>mssql_default_varchar_length</c>.</param>
+    /// <remarks>⚠ Both are OPTIONAL and default to the session settings ON PURPOSE: this mapper serves the
+    /// ALTER paths too, and an ALTER carries no <c>WITH</c>. Only the CREATE path passes them.</remarks>
+    private static string MapArrowToSqlType(IArrowType type, ServerProfile profile,
+                                            string? textTypeOverride = null,
+                                            long? varcharLengthOverride = null)
     {
         int scale = profile.MaxDateTime2Scale;
         switch (type.TypeId)
@@ -3614,7 +3705,11 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 // mssql_ctas_text_type: explicit whole-type override wins. Read from the provider settings
                 // store (see docs/settings-architecture.md) — no per-method ABI param. Now also applies to
                 // CTAS/COPY (the bulk-create path shares this mapper), not just explicit CREATE TABLE.
-                var textType = ProviderSettingsStore.Instance.GetString(SqlServerBackend.ProviderName, "mssql_ctas_text_type");
+                // The per-statement WITH (text_type=...) outranks the session setting, on the same reasoning
+                // as the Delta write tuning: the more specific layer wins, and a stray SET must not silently
+                // override what a statement asked for by name.
+                var textType = textTypeOverride
+                    ?? ProviderSettingsStore.Instance.GetString(SqlServerBackend.ProviderName, "mssql_ctas_text_type");
                 if (!string.IsNullOrWhiteSpace(textType))
                 {
                     return textType!;
@@ -3630,7 +3725,8 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                                 : "VARCHAR";
                 // mssql_default_varchar_length bounds every text column (unset => MAX). Read straight from
                 // the provider settings store (see docs/settings-architecture.md) — no per-method ABI param.
-                long? len = ProviderSettingsStore.Instance.GetLong(SqlServerBackend.ProviderName, "mssql_default_varchar_length");
+                long? len = varcharLengthOverride
+                    ?? ProviderSettingsStore.Instance.GetLong(SqlServerBackend.ProviderName, "mssql_default_varchar_length");
                 return len is long n && n > 0 ? $"{baseType}({n})" : $"{baseType}(MAX)";
         }
     }
