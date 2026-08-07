@@ -437,6 +437,76 @@ retracted for being a semantics request in disguise. This one is not: the two su
   patch covers our path" but **"EW expects a buffered host to use this and we don't"** — a divergence from the
   intended shape that nobody chose. Settle it in Phase C.
 
+## 4b. CAN 0.3.0 SIMPLIFY OUR BUFFERING / READ-YOUR-WRITES? — analysed 2026-08-07 (user-asked). One real
+deletion, one hazard, and a firm NO on the part everyone assumes
+
+### 4b.1 ✅ DELETE our outer OCC retry loop — `CommitDataFilesAsync` now retries internally, and better
+
+`DeltaCatalog.FlushDeferredFilesAsync` (`:3016`) is a hand-rolled `for (attempt = 1; ; attempt++)` with
+`maxAttempts = 16` that REOPENS the table and re-commits on `DeltaConflictException`. Upstream's
+`CommitDataFilesAsync` now builds a `LogCommitRequest` with **`MaxAttempts = 16`** and
+**`Rebase = new RecomputeRebaseHandler(BuildActionsAsync)`**.
+
+⇒ ours is **redundant AND multiplicative** — 16 outer × 16 inner is up to 256 attempts — and it is the
+WORSE loop: a blind reopen-and-recommit against EW's re-derivation of the actions against the version that
+actually landed.
+
+**⚠ But it is not a free deletion, and the reason is recorded in its own comment.** The loop exists partly
+to LOG: *"a silent retry makes multi-writer behaviour unobservable — a successful concurrent run and a run
+whose writers merely serialized look identical from the outside."* That diagnostic was added after the
+OneLake multi-writer investigation and is what proved the commit guard was ever exercised (docs/
+delta-transactions.md §8.1 relies on the retry COUNT to declare a run non-void). `LogCommitter` takes no
+logger. **So the deletion must come with a replacement signal**, or we lose the one instrument that
+distinguishes a real concurrency test from a vacuous one — offering an `OnConflict`/attempt callback on
+`LogCommitRequest` is the natural upstream ask, and it is small.
+
+### 4b.2 ⚠ A BEHAVIOUR CHANGE ON THAT PATH THAT MAY BITE US — upstream flags it themselves
+
+The same hunk carries upstream's own note: this path *"used to retry straight through a concurrent schema
+change and commit files against a schema that had moved"*, and now the checker's metadata/protocol rule
+applies. Their words: *"if a host turns out to depend on the old permissiveness — a producer appending
+through this while another process edits table properties will now see conflicts it did not before — the
+fix is a public opt-out on the request rather than a quiet revert."*
+
+**Our flush is exactly such an append.** A dbt run appending while anything edits table properties (our own
+`fabricator_delta_set_tblproperties`, a Spark job, an OPTIMIZE writing clustering metadata) can now conflict
+where it silently succeeded. **Untested — no suite covers append-vs-metadata-change concurrency**, and the
+old behaviour was a real hole, so this is a correctness IMPROVEMENT we should verify rather than a
+regression to fear.
+
+### 4b.3 `LogCommitRequest.OnCommitDurable` — a precise guard for a hazard we currently handle by re-reading
+
+*"Invoked THE INSTANT the commit is durable … a caller holding a list of files to clean up on failure must
+forget them here … a cancellation between the write and the refresh would otherwise surface as a failed
+commit whose cleanup deletes live data."*
+
+That names our exact structure: `DiscardBufferedFiles` reclaims `pending.Files` on rollback, and our flush
+runs under an `InterruptScope` — so a Ctrl+C landing between the log write and the return is precisely the
+described window. We are protected today, but INDIRECTLY: `DiscardDataFilesAsync` re-reads a FRESH log and
+refuses anything it references. That is a re-read per rollback where a callback would be exact.
+Only reachable by constructing the request ourselves ⇒ Phase C, not free.
+
+### 4b.4 ❌ READ-YOUR-WRITES IS **NOT** SIMPLIFIABLE, and this is the firm answer
+
+`DeltaTransaction.Snapshot => _baseSnapshot` is unchanged at 0.3.0, and the class doc still says
+*"nothing is visible until the commit, but the bytes are there."* Upstream exposes **no** transaction-visible
+snapshot, no pending-state read surface, nothing that overlays uncommitted actions onto a scan.
+
+So the whole overlay stack stays ours by design, not by accident: the virtual-table composition in
+`DeltaCatalog.ScanCodec` / the native reader's pending inputs / `ScanPendingCreated`, the pending-ordinal
+encoding (`0x780000+idx`), the RENAME overlay map, `PendingArrowSchema`. **Do not go looking for an upstream
+replacement — it does not exist, and the reason is structural**: EW commits at COMMIT, and a host that wants
+statement-level visibility of its own uncommitted work has to build that visibility itself. `DeltaTxnBuffer`
+is 402 lines and none of them are duplicating library code.
+
+### 4b.5 ❌ The two file ledgers are inherently SPLIT — not a duplication to collapse
+
+EW's `WrittenFileLedger` (`transaction.Written`) collects what **EW's own writers** produced; our
+`pending.Files` + `DiscardDataFilesAsync` reclaim what the **HOST** wrote eagerly. EW's provenance rule
+deliberately never collects a host-written file (a DV DELETE re-adds an EXISTING parquet that is live table
+data). ⇒ two ledgers because there are two writers, which is the eager-write design working, not an
+artefact.
+
 ## 5. The approach: a FRESH branch off upstream, not a merge (decided 2026-08-07, user)
 
 **Do not `git merge upstream/main` into `fabricator-patches`. Branch `fabricator-patches-v2` off
