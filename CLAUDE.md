@@ -1912,7 +1912,10 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     is a mechanical ~6-signature cleanup left for later, deliberately not mixed into a behaviour change.
 - **PLAIN (non-OneLake) ADLS Gen2 SUPPORT — BUILT + LIVE-VALIDATED 2026-08-02. Full record:
   [docs/delta-transactions.md](docs/delta-transactions.md) §8.4; gate `test/verify_delta_catalog_adls.test`
-  (140, manual/live-account tier).** A Delta catalog on `abfss://<fs>@<account>.dfs.core.windows.net/…` —
+  (**55**, manual/live-account tier — ⚠ this line read **140** until 2026-08-07, a number transcribed from
+  the `verify_mssql_adls_polybase` gate beside it. The suite has said 55 since the commit that added it
+  (`33eb3e1`) and has never changed. Caught by RUNNING it and disbelieving the shortfall; a wrong gate
+  number is worse than none, because the next person reads a green 55 as a suite that aborted).** A Delta catalog on `abfss://<fs>@<account>.dfs.core.windows.net/…` —
   a plain storage account, not a Fabric lakehouse. It LOOKED like it already worked (attach, discovery,
   CTAS, INSERT, DELETE, DROP and both parquet directions through duckdb-azure all passed first try); two
   things did not.
