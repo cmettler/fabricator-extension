@@ -237,13 +237,23 @@ SMALL upstreamable patch set ON TOP of clast master — never a fork again — s
 merge-upstream-into-fabricator-patches + re-pin. **⚠ That upstream branch is now
 `upstream/main`, NOT `master`** — upstream renamed it (`8caf8d8`) and the stale `upstream/master`
 remote-tracking ref still resolves, so a merge of it silently lands on an abandoned branch.
-**Current pin: `3794fe4`** (the variant-transport removal in both directions, then the
-`WriteChangeDataFilesAsync` deletion the hoist enabled; ⚠ the line here read `d9d204b` for two commits after
-that stopped being true — **`git ls-tree HEAD engineered-wood` is the authority, this prose is not**).
-**Patch set MEASURED 2026-08-04 (re-measured after the CDF deletion, `git diff upstream/main --stat -- src/`):
-+175 / −34 lines across FOUR files** — `DeltaTable.cs` 137, `ConflictChecker` 42, `DeltaTransaction` 26,
-`DeltaFilePruner` 4. (It was +221 before that deletion, and +867 across 8 files on 2026-08-03; the variant
-transport was ~60% of that and has since left entirely — §THE UPSTREAM STRATEGY.)
+**Current pin: `618f3dc`** (⚠ the line here has twice gone stale —
+**`git ls-tree HEAD engineered-wood` is the authority, this prose is not**).
+**Patch set MEASURED 2026-08-08 (`git diff upstream/main --shortstat -- src/`): +399 / −26 across FIVE
+files** — `DeltaTable.cs` 64, `VacuumExecutor` 72, `ConflictChecker` 48, `LogCleanup` 202 (new),
+`LogCommitter` 13. It was 4 files / +175 on 2026-08-04 and +867 across 8 on 2026-08-03; the variant
+transport was ~60% of that and has left entirely (§THE UPSTREAM STRATEGY).
+- **⚠ THE PATCH SET GREW ON PURPOSE, and every new line is OFFER-READY rather than divergence.** Three of
+  the five files are the 2026-08-08 work, each open upstream as a draft the same day it was written:
+  [#92](https://github.com/clast-project/engineered-wood/pull/92) `VacuumExecutor` (**fixes #54**),
+  [#93](https://github.com/clast-project/engineered-wood/pull/93) `LogCleanup` + `LogCommitter`
+  (`delta.logRetentionDuration`), [#94](https://github.com/clast-project/engineered-wood/pull/94) the
+  `DeltaTable` checkpoint-interval hunk. With #90/#91 that is **five drafts covering the whole patch set** —
+  i.e. if all land, the branch retires. That is the branch model's stated goal, not an accident of timing.
+- **⚠ Two of the three are things WE NEED, which is what makes them offerable rather than favours to ask.**
+  The vacuum rule is REQUIRED by our own recursion fix (without it VACUUM deletes other engines' sidecars);
+  `checkpointInterval` is a property we advertise in the `WITH` surface. `logRetentionDuration` is the one
+  that is purely a spec gap — and it is the one upstream's own comments already point at.
 - **⚠ THE MERGE-ON-READ UPDATE LEFT EW (2026-08-03) — the audit's "DO NOT MOVE IT TO THE BRIDGE" verdict was
   WRONG and is reversed. Full record: [docs/ew-master-migration.md](docs/ew-master-migration.md) §THE
   `*BySelection*` QUESTION.** `UpdateBySelectionViaVectorsAsync` + `BuildInlineDeletionVectorsAsync` (218 lines)
@@ -640,6 +650,17 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   ignoring it worse than not accepting it: a table declaring 100 got ten times the checkpoint objects its
   owner asked for. `DeltaTable` now resolves the interval from `snapshot.Metadata.Configuration`, falling
   back to the code-level `DeltaTableOptions.CheckpointInterval`.
+  - **⚠ THE FIRST VERSION FIXED ONLY ONE OF TWO TRIGGERS, and every test here passed anyway — found by
+    CUTTING THE UPSTREAM OFFER (2026-08-08).** `DeltaTable` checkpoints from two independent places: the
+    commit loop's `LogCommitOptions`, and `CommitWriteAsync`'s own `_options.CheckpointInterval` check.
+    Resolving the property inside the `LogCommitOptions` initialiser covered the first and missed the
+    second — and since every path THIS host takes goes through the committer, `verify_delta_tblproperties`
+    and the EW tests were all green while the batch write path silently kept ignoring the property.
+    Honoured on some writes and not others is harder to notice than ignored everywhere. Now resolved ONCE
+    into a `_checkpointInterval` field so the two cannot drift.
+    - **The generalisable bit: porting a change to a tree that does NOT share this host's call shape is a
+      completeness test.** The identical three tests failed on bare upstream. Nothing about reading our own
+      diff would have shown it, because our own callers are not a representative sample of the API's.
   - **⚠ `CheckpointInterval = 0` remains an ABSOLUTE caller override** — it means "never checkpoint", and a
     table property must not switch it back on or a host that owns checkpointing on its own schedule starts
     racing one it did not ask for. Its own test.

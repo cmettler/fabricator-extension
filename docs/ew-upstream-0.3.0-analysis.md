@@ -576,12 +576,16 @@ retracted for being a semantics request in disguise. This one is not: the two su
 |---|---|---|---|
 | [engineered-wood#90](https://github.com/clast-project/engineered-wood/pull/90) | `offer/dml-checkpoint` | **YES** — we need it | draft, **Closes #86** |
 | [engineered-wood#91](https://github.com/clast-project/engineered-wood/pull/91) | `offer/blind-append-declaration` | **YES** — we need it | draft, **Addresses #88**, decision 2 of 4 |
-| — | `offer/commit-retry-signal` | **NO** | **built, NOT pushed, NOT recommended** — see below |
+| — | `offer/vacuum-hidden-names` | **YES** — our recursion fix requires it | ready, not pushed, **Closes #54** |
+| — | `offer/log-retention` | **YES** | ready, not pushed, offer-list item 4 |
+| — | `offer/checkpoint-interval` | **YES** — we advertise it in `WITH` | ready, not pushed |
+| — | ~~`offer/commit-retry-signal`~~ | **NO** | **DELETED 2026-08-08 (user)** — see below |
 
 Each is cut off `upstream/main` with ONE change and its tests — never off `fabricator-patches-v2`, which
 carries the first two — following the `offer/*` convention already in the fork (13 prior branches).
 
-**⚠ THE THIRD IS AN ORPHAN AND SHOULD NOT BE SENT — read this before treating it as pending work.**
+**⚠ THE RETRY SIGNAL WAS AN ORPHAN AND THE BRANCH IS NOW DELETED (user, 2026-08-08). Kept here as the
+record of WHY, so it is not re-derived.**
 `LogCommitRequest.OnRetry` (a callback reporting a commit retry the loop recovered from) is **not a fix**;
 nothing is broken, and it adds observability a host without its own retry loop would want. **We are not such
 a host.** It was built as §4b.1's unblocker — the plan said deleting our outer OCC retry loop required a
@@ -595,14 +599,12 @@ do NOT bring it; spending credibility on a request we do not need weakens the on
 of our divergence and we consume none of it, and #90/#91 are pending review, so a third weaker PR competes
 with the two that matter.
 
-**What it is NOT:** it is not on `fabricator-patches-v2`, so the patch set stays **2 files / +69** and nothing
-we build contains it. Moving it off the working branch is the whole reason it lives on its own — carrying it
-would have made the pin 4 files / +109 for an API no caller in this tree touches.
+**It never reached `fabricator-patches-v2`**, so the pin never carried it and nothing we build contains it.
 
 **What would revive it:** taking §4b.3 / Phase C (constructing `LogCommitRequest` ourselves to reach
 `OnCommitDurable`), at which point we would want the retry signal in the same breath and the two go upstream
-as a motivated pair. Absent that, **deleting the branch loses nothing** — the design is described here well
-enough to re-derive in an afternoon.
+as a motivated pair. The branch is gone; the design is described here well enough to re-derive in an
+afternoon, which is why deleting it lost nothing.
 
 **⚠ THE INTERNAL MARKERS MUST BE STRIPPED, and this is the step easiest to forget.** Both branches were
 verified to contain **zero** `FABRICATOR` references: the `[FABRICATOR-PATCH: OFFER-READY]` tags and
@@ -699,9 +701,9 @@ CLOSED: **nothing to delete**, one flagged hazard that does not reach us, and a 
 > **⚠ AND IT IS AN ORPHAN — built, then made pointless by this very reversal. It is NOT on the pin and is
 > NOT being offered** (§4a.5 has the full reasoning): we do not consume it, our own loop already logs, and
 > carrying it would grow the patch set from 2 files / +69 to 4 / +109 for an API nobody here calls. It sits
-> on `offer/commit-retry-signal` off `upstream/main`, green at 360/360 × {net10.0, net8.0, net472} against
-> BARE upstream. **Taking it and deleting our loop is REFUSED**, because the diagnostic was never the only
-> thing the loop does:
+> on a throwaway branch off `upstream/main`, green at 360/360 × {net10.0, net8.0, net472} against BARE
+> upstream — **since DELETED (user, 2026-08-08)**. **Taking it and deleting our loop is REFUSED**, because
+> the diagnostic was never the only thing the loop does:
 >
 > **⚠ THE OUTER LOOP REOPENS; THE INNER ONE DOES NOT — and that is a behaviour difference, not a
 > duplication.** `LogCommitter` holds `BaseSnapshot` FIXED across its attempts and re-runs the checker over
